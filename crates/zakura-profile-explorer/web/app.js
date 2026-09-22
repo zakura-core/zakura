@@ -7,6 +7,7 @@ let selected = '', loading = false;
 async function api(path) { const response = await fetch(path); if (!response.ok) throw Error(await response.text()); return response.json(); }
 function note(message) { $('notice').textContent = message; $('notice').hidden = !message; }
 function quality(row) {
+  if (row.exclusion_reason) return 'Timing excluded';
   if (!row.outcome) return 'Unfinished';
   if (row.expired) return 'Detail expired';
   if (row.dropped) return `Truncated · ${number(row.dropped)} omitted`;
@@ -19,14 +20,14 @@ function table(target, rows) {
   const host = $(target); host.replaceChildren();
   if (!rows.length) { host.append(el('div','No matching recorded requests.', 'empty')); return; }
   const wrap = el('div',null,'table-wrap'), t = el('table'), head = el('tr');
-  for (const title of ['Block','Hash','Observed','Transactions','Elapsed','Evidence']) head.append(el('th',title));
+  for (const title of ['Block','Hash','Observed','Transactions','Verifier response','Evidence']) head.append(el('th',title));
   const thead = el('thead'); thead.append(head); t.append(thead); const body = el('tbody');
   for (const row of rows) {
     const tr = el('tr'), link = el('a',row.height == null ? 'Unknown height' : number(row.height)); link.href = `#${row.run}/${row.attempt}`;
     link.addEventListener('click', e => { e.preventDefault(); openDetail(row.run,row.attempt).catch(e=>note(e.message)); });
     const first = el('td'); first.append(link); tr.append(first);
     const duration = row.end_us == null ? null : row.end_us-row.start_us;
-    tr.append(el('td',row.hash ? `${row.hash.slice(0,12)}…` : '—','hash'),el('td', row.utc_ms ? new Date(row.utc_ms).toLocaleString() : 'Unknown'),el('td',number(row.transactions)),el('td',duration == null ? 'Pending' : ms(duration),duration >= 500000 ? 'slow' : ''),el('td',quality(row)));
+    tr.append(el('td',row.hash ? `${row.hash.slice(0,12)}…` : '—','hash'),el('td', row.utc_ms ? new Date(row.utc_ms).toLocaleString() : 'Unknown'),el('td',number(row.transactions)),el('td',row.exclusion_reason ? 'Excluded' : duration == null ? 'Pending' : ms(duration),duration >= 500000 ? 'slow' : ''),el('td',quality(row)));
     body.append(tr);
   }
   t.append(body);wrap.append(t);host.append(wrap);
@@ -45,6 +46,7 @@ async function refresh() {
     if (run && !nodeFresh) notices.push('This node is no longer sending observations.');
     if (run && (run.dropped || run.sequence_gaps || run.transport_dropped)) notices.push(`Collection loss: ${number(run.dropped)} producer drops, ${number(run.sequence_gaps)} missing sequences, ${number(run.transport_dropped)} transport drops. Counts may overlap.`);
     if (health?.errors) notices.push(`${number(health.errors)} collector errors. Detail may be incomplete.`);
+    if (data.excluded_timings) notices.push(`${number(data.excluded_timings)} recordings excluded from timing statistics because of known measurement interference.`);
     note(notices.join(' '));
     const used = health ? `${(health.used / 1e9).toFixed(2)} / ${(health.budget / 1e9).toFixed(0)} GB` : 'Unavailable';
     const stats = [[number(data.counts.captured),'Requests captured · last 24h'],[number(data.counts.success),'Accepted or checked · last 24h'],[number(data.counts.sealed_detail),'Sealed detail · last 24h'],[used,'Profiler storage · excludes chain state']];
@@ -58,10 +60,17 @@ async function refresh() {
 async function openDetail(run,attempt) {
   if(selected!==run){selected=run;await refresh();}
   const data=await api(`/api/attempt/${run}/${attempt}`), row=data.summary;
-  $('detail').hidden=false; $('detail-title').textContent=`Block ${number(row.height)} · attempt ${attempt}`;
+  $('detail').hidden=false; $('detail-title').textContent=`Block ${number(row.height)}`;
   $('detail-meta').textContent=`${row.hash} · ${row.outcome || 'unfinished'} · ${quality(row)} · run ${row.run}`;
   history.replaceState(null,'',`#${run}/${attempt}`);
   $('boundary').textContent=data.boundary;
+  $('detail-warning').hidden=!row.exclusion_reason;
+  $('detail-warning').textContent=row.exclusion_reason ? `Timing excluded from rankings and percentiles. ${row.exclusion_reason} Raw intervals are preserved below and include this interference.` : '';
+  const timing=data.timing, formatTime=value=>value==null?'Pending':ms(value);
+  const metrics=row.exclusion_reason
+    ? [['Excluded','Processing time'],[formatTime(timing.recorded_elapsed_us),'Raw recorded elapsed · includes interference']]
+    : [[formatTime(timing.recorded_elapsed_us),'Total recorded time'],[formatTime(timing.verifier_elapsed_us),'Verifier response'],[formatTime(timing.after_response_us),'Recorded work after response']];
+  $('detail-timing').replaceChildren(...metrics.map(([value,label])=>{const box=el('div',null,'stat');box.append(el('b',value),el('span',label));return box;}));
   $('trace').href=`/api/trace/${run}/${attempt}`; $('raw').href=`/api/attempt/${run}/${attempt}`;
   const spans=[...data.spans].sort((a,b)=>a.start_us-b.start_us), start=row.start_us || 0;
   const end=Math.max(row.end_us||start,...spans.map(s=>s.end_us)), duration=Math.max(end-start,1);

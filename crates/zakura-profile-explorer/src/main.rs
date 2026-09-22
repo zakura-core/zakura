@@ -47,6 +47,17 @@ enum Command {
         #[arg(long)]
         run: Option<String>,
     },
+    /// Exclude a known contaminated recording from timing statistics, retaining its evidence.
+    Exclude {
+        #[arg(long)]
+        store: PathBuf,
+        #[arg(long)]
+        run: String,
+        #[arg(long)]
+        attempt: u64,
+        #[arg(long)]
+        reason: String,
+    },
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
@@ -83,6 +94,12 @@ async fn main() -> Result<()> {
             );
             Ok(())
         }
+        Command::Exclude {
+            store,
+            run,
+            attempt,
+            reason,
+        } => store::exclude_timing(&store, &run, attempt, &reason),
     }
 }
 

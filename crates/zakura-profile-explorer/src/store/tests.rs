@@ -82,6 +82,10 @@ fn late_detail_seals_after_response_and_survives_restart() -> Result<()> {
     let result = Reader::open(temp.path())?.detail(RUN, 1)?;
     assert_eq!(result["complete"], true);
     assert_eq!(result["spans"][0]["end_us"], 800000);
+    assert_eq!(result["timing"]["recorded_elapsed_us"], 799900);
+    assert_eq!(result["timing"]["verifier_elapsed_us"], 700000);
+    assert_eq!(result["timing"]["after_response_us"], 99900);
+    assert_eq!(result["timing"]["valid"], true);
     drop(store);
     let _reopened = Store::open(temp.path(), 16_000_000)?;
     assert_eq!(Reader::open(temp.path())?.detail(RUN, 1)?["complete"], true);
@@ -352,6 +356,111 @@ fn receive_batch_can_publish_a_full_chunk_and_recover_a_failed_commit() -> Resul
             .query_row("SELECT sequence FROM runs WHERE id=?", [RUN], |r| r
                 .get::<_, i64>(0))?,
         i64::try_from(sequence)?
+    );
+    Ok(())
+}
+
+fn recording(attempt: u64, hash: u8, start_us: u64, duration_us: u64) -> Event {
+    Event::Finish {
+        attempt,
+        start_us,
+        end_us: start_us + duration_us,
+        block: Block {
+            hash: [hash; 32],
+            ..block()
+        },
+        outcome: Outcome::Success,
+        dropped: 0,
+    }
+}
+
+#[test]
+fn search_returns_latest_across_runs_without_merging_forks() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let mut store = Store::open(temp.path(), 16_000_000)?;
+    let old = metadata();
+    let mut new = metadata();
+    let next_run = "22222222222222222222222222222222";
+    if let Frame::Run { run, .. } = &mut new {
+        run.id = next_run.into();
+        run.utc_start_ms += 10_000;
+    }
+    store.ingest(old)?;
+    store.ingest(event(1, recording(100, 1, 100, 900_000)))?;
+    store.ingest(new)?;
+    for (sequence, data) in [
+        (1, recording(1, 1, 100, 500_000)),
+        // The same millisecond still has a deterministic latest request.
+        (2, recording(2, 1, 101, 100_000)),
+        (3, recording(3, 2, 102, 600_000)),
+    ] {
+        store.ingest(Frame::Event {
+            schema: SCHEMA_VERSION,
+            run_id: next_run.into(),
+            sequence,
+            data,
+        })?;
+    }
+    let reader = Reader::open(temp.path())?;
+    let search = reader.search("42")?;
+    assert_eq!(search.as_array().unwrap().len(), 2);
+    assert!(search
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|r| r["run"] == next_run));
+    let hash_search = reader.search(&"01".repeat(32))?;
+    assert_eq!(hash_search.as_array().unwrap().len(), 1);
+    assert_eq!(hash_search[0]["attempt"], 2);
+    let home = reader.home(Some(next_run), "semantic")?;
+    assert_eq!(home["latest"].as_array().unwrap().len(), 2);
+    assert_eq!(home["outliers"].as_array().unwrap().len(), 1);
+    assert_eq!(home["outliers"][0]["attempt"], 3);
+    assert_eq!(home["timing_blocks"], 2);
+    assert_eq!(home["latency"]["p50_us"], 100_000);
+    // Original evidence remains addressable even though searches prefer the newer run.
+    assert_eq!(reader.detail(RUN, 100)?["summary"]["end_us"], 900_100);
+    Ok(())
+}
+
+#[test]
+fn excluded_timing_preserves_raw_evidence_and_cannot_resurface_old_outlier() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let mut store = Store::open(temp.path(), 16_000_000)?;
+    store.ingest(metadata())?;
+    store.ingest(event(1, recording(1, 1, 100, 900_000)))?;
+    store.ingest(event(2, recording(2, 1, 200, 332_618_525)))?;
+    store.ingest(event(3, recording(3, 2, 300, 600_000)))?;
+    // Annotation works with the collector open. Missing records and empty reasons fail.
+    assert!(exclude_timing(temp.path(), RUN, 99, "test").is_err());
+    assert!(exclude_timing(temp.path(), RUN, 2, " ").is_err());
+    exclude_timing(temp.path(), RUN, 2, "Operator paused the node")?;
+    drop(store);
+    let store = Store::open(temp.path(), 16_000_000)?;
+    let reader = Reader::open(temp.path())?;
+    let home = reader.home(Some(RUN), "semantic")?;
+    assert_eq!(home["outliers"].as_array().unwrap().len(), 1);
+    assert_eq!(home["outliers"][0]["attempt"], 3);
+    assert_eq!(home["timing_blocks"], 1);
+    assert_eq!(home["excluded_timings"], 1);
+    assert_eq!(home["latency"]["p99_us"], 600_000);
+    let search = reader.search(&"01".repeat(32))?;
+    assert_eq!(search.as_array().unwrap().len(), 1);
+    assert_eq!(search[0]["attempt"], 2);
+    assert_eq!(search[0]["exclusion_reason"], "Operator paused the node");
+    let detail = reader.detail(RUN, 2)?;
+    assert_eq!(detail["timing"]["valid"], false);
+    assert_eq!(detail["timing"]["recorded_elapsed_us"], 332_618_525);
+    assert_eq!(detail["summary"]["end_us"], 332_618_725);
+    store
+        .db
+        .execute("DELETE FROM attempts WHERE run=? AND attempt=2", [RUN])?;
+    assert_eq!(
+        store
+            .db
+            .query_row("SELECT count(*) FROM timing_exclusions", [], |r| r
+                .get::<_, i64>(0))?,
+        0
     );
     Ok(())
 }

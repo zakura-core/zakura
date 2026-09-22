@@ -1,6 +1,8 @@
 # Block profile explorer
 
-This is an opt-in recorder, a local collector, and a read-only explorer. The homepage shows the latest ten accepted blocks and the twenty slowest successful requests of at least 500 ms from the last 24 hours. Each process run and verification route is separate. Errors and unfinished requests have their own list.
+This is an opt-in recorder, a local collector, and a read-only explorer. The homepage shows the latest ten accepted blocks and the twenty slowest successful requests of at least 500 ms from the last 24 hours. Each process run and verification route is separate. Session lists and latency percentiles use only the newest request per block hash within that session and route. Search shows only the newest recording per block hash across sessions and routes, with the request counter breaking ties within a run. Different block hashes at the same height remain separate. Errors and unfinished requests have their own list. Older recordings remain available through saved links and raw exports until normal pruning.
+
+The block header shows total recorded time from router entry through the last retained span, alongside verifier response time and work after that response. These are elapsed intervals, not sums of overlapping spans or CPU time. Missing or expired spans can understate the total. The internal attempt number is a process-local counter of verification requests, not a retry count for a block.
 
 The timeline answers where elapsed time went. Linux CPU sampling adds a zoomable flamegraph of process activity during that interval. Parallel spans overlap. Shared batches and other blocks can appear in process samples, so neither view claims an exact allocation of CPU milliseconds to one block.
 
@@ -54,6 +56,18 @@ New semantic recordings split finalization into in-memory chain/fork updates, fi
 The node holds at most 1,024 active attempt contexts, 16,384 detail events, and 2,048 summary events. Each attempt admits at most 256 spans, with transaction/worker detail limited to 128 so it cannot consume the entire phase budget. Producers use nonblocking queues and never serialize or write files. An exporter thread sends bounded Unix datagrams. A missing collector loses evidence without delaying verification.
 
 Root completion is self-contained and separate from detail. A seal is emitted when the last worker/context owner finishes. The collector compares the seal's expected count with retained spans. Queue drops, transport gaps, interrupted attempts, truncation, expired chunks, and collector failures stay visible. A context handoff that cannot acquire the existing transaction registry immediately is omitted and counted as run-level loss.
+
+## Known measurement interference
+
+Do not reject recordings just because they are slow. When operator logs prove a capture was contaminated, such as a deliberate process pause, annotate the exact recording locally with a reason. The collector must have opened the store with this version first to install the additive catalog table.
+
+```sh
+sudo -u zakura-profile zakura-profile-explorer exclude \
+  --store /srv/zakura-profile/data --run RUN_ID --attempt REQUEST_ID \
+  --reason "Operator paused the node during this recording"
+```
+
+This command can run while collection continues. It preserves every measured interval. Excluded recordings stay findable with an explicit warning and raw times, but never enter slowest-block rankings or latency percentiles. A newer excluded recording does not cause an older measurement to reappear. Capture counts still describe raw requests, while daily JSON reports expose `timing_blocks` and `excluded_timings` separately. Profile JSON and Perfetto exports carry the reason. Annotations are pruned with their summaries. The public explorer remains read-only.
 
 ## Storage
 

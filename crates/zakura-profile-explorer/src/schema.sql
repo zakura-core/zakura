@@ -24,6 +24,12 @@ CREATE INDEX IF NOT EXISTS recent ON attempts(run,mode,outcome,utc_ms DESC);
 CREATE INDEX IF NOT EXISTS slow ON attempts(run,mode,outcome,end_us-start_us DESC);
 CREATE INDEX IF NOT EXISTS hashes ON attempts(hash);
 CREATE INDEX IF NOT EXISTS heights ON attempts(height);
+CREATE INDEX IF NOT EXISTS recordings ON attempts(hash,utc_ms DESC,run DESC,attempt DESC);
+CREATE TABLE IF NOT EXISTS timing_exclusions (
+ run TEXT NOT NULL, attempt INTEGER NOT NULL, reason TEXT NOT NULL, created_ms INTEGER NOT NULL,
+ PRIMARY KEY(run,attempt),
+ FOREIGN KEY(run,attempt) REFERENCES attempts(run,attempt) ON DELETE CASCADE
+);
 CREATE TABLE IF NOT EXISTS chunks (
  id TEXT PRIMARY KEY, bytes INTEGER NOT NULL, created_ms INTEGER NOT NULL,
  deleting INTEGER NOT NULL DEFAULT 0

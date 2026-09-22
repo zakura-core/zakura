@@ -531,6 +531,26 @@ pub(crate) struct Reader {
     db: Connection,
     path: PathBuf,
 }
+
+/// Annotate an existing recording without rewriting measurements or interrupting collection.
+/// This is an operator-only write, never exposed through the HTTP API.
+pub(crate) fn exclude_timing(path: &Path, run: &str, attempt: u64, reason: &str) -> Result<()> {
+    ensure!(valid_id(run) && attempt > 0, "invalid recording");
+    ensure!(
+        !reason.trim().is_empty() && reason.len() <= 500,
+        "reason must be 1 to 500 bytes"
+    );
+    let db =
+        Connection::open_with_flags(path.join("index.sqlite"), OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+    db.busy_timeout(Duration::from_secs(4))?;
+    db.execute_batch("PRAGMA foreign_keys=ON; PRAGMA synchronous=FULL;")?;
+    db.execute(
+        "INSERT INTO timing_exclusions(run,attempt,reason,created_ms) VALUES(?,?,?,?) ON CONFLICT(run,attempt) DO UPDATE SET reason=excluded.reason,created_ms=excluded.created_ms",
+        params![run,integer(attempt)?,reason.trim(),integer(now_ms())?],
+    )?;
+    Ok(())
+}
+
 impl Reader {
     pub(crate) fn open(path: &Path) -> Result<Self> {
         let db = Connection::open_with_flags(
@@ -569,15 +589,29 @@ impl Reader {
                 .unwrap_or("")
         });
         let since = now_ms().saturating_sub(DAY_MS);
-        let latest = self.rows(&format!("{COLUMNS} WHERE run=?1 AND mode=?2 AND outcome='success' AND utc_ms>=?3 AND NOT EXISTS (SELECT 1 FROM attempts b WHERE b.run=a.run AND b.hash=a.hash AND b.mode=a.mode AND b.outcome='success' AND b.attempt<a.attempt) ORDER BY utc_ms DESC LIMIT 10"),run,mode,0)?;
-        let outliers = self.rows(&format!("{COLUMNS} WHERE run=?1 AND mode=?2 AND outcome='success' AND utc_ms>=?3 AND end_us-start_us>=500000 ORDER BY end_us-start_us DESC LIMIT 20"),run,mode,since)?;
-        let failures = self.rows(&format!("{COLUMNS} WHERE run=?1 AND mode=?2 AND utc_ms>=?3 AND (outcome IS NULL OR outcome IN ('failed','abandoned')) ORDER BY utc_ms DESC LIMIT 20"),run,mode,since)?;
+        let cohort = format!(
+            "run=?1 AND mode=?2 AND outcome='success' AND utc_ms>=?3 AND {LATEST_IN_SESSION}"
+        );
+        let timings = format!("{cohort} AND {VALID_TIMING}");
+        let latest = self.rows(
+            &format!("{COLUMNS} WHERE {cohort} ORDER BY utc_ms DESC,attempt DESC LIMIT 10"),
+            run,
+            mode,
+            0,
+        )?;
+        let outliers = self.rows(&format!("{COLUMNS} WHERE {timings} AND end_us-start_us>=500000 ORDER BY end_us-start_us DESC LIMIT 20"),run,mode,since)?;
+        let failures = self.rows(&format!("{COLUMNS} WHERE run=?1 AND mode=?2 AND utc_ms>=?3 AND (outcome IS NULL OR outcome IN ('failed','abandoned')) AND {LATEST_IN_SESSION} ORDER BY utc_ms DESC,attempt DESC LIMIT 20"),run,mode,since)?;
         let counts: Value = self.db.query_row("SELECT count(*),coalesce(sum(outcome='success'),0),coalesce(sum(expected_spans IS NOT NULL AND expected_spans=received_spans AND dropped=0 AND expired=0),0),min(utc_ms),max(utc_ms) FROM attempts WHERE run=? AND mode=? AND utc_ms>=?", params![run,mode,integer(since)?], |r| Ok(json!({"captured":r.get::<_,i64>(0)?,"success":r.get::<_,i64>(1)?,"sealed_detail":r.get::<_,i64>(2)?,"first_ms":r.get::<_,Option<i64>>(3)?,"last_ms":r.get::<_,Option<i64>>(4)?})))?;
-        let accepted = counts["success"].as_i64().unwrap_or(0);
+        let accepted: i64 = self.db.query_row(
+            &format!("SELECT count(*) FROM attempts a WHERE {timings}"),
+            params![run, mode, integer(since)?],
+            |r| r.get(0),
+        )?;
+        let excluded: i64 = self.db.query_row("SELECT count(*) FROM attempts a JOIN timing_exclusions e USING(run,attempt) WHERE run=? AND mode=? AND utc_ms>=?",params![run,mode,integer(since)?],|r|r.get(0))?;
         let mut latency = serde_json::Map::new();
         for (label, percent) in [("p50_us", 50), ("p95_us", 95), ("p99_us", 99)] {
             let value: Option<i64> = if accepted > 0 {
-                self.db.query_row("SELECT end_us-start_us FROM attempts WHERE run=? AND mode=? AND outcome='success' AND utc_ms>=? ORDER BY end_us-start_us LIMIT 1 OFFSET ?",params![run,mode,integer(since)?,(accepted-1)*percent/100],|r|r.get(0)).optional()?
+                self.db.query_row(&format!("SELECT end_us-start_us FROM attempts a WHERE {timings} ORDER BY end_us-start_us LIMIT 1 OFFSET ?4"),params![run,mode,integer(since)?,(accepted-1)*percent/100],|r|r.get(0)).optional()?
             } else {
                 None
             };
@@ -586,7 +620,7 @@ impl Reader {
         let cpu:Value = self.db.query_row("SELECT count(*),coalesce(sum(samples),0),min(start_us),max(end_us) FROM cpu WHERE run=? AND end_us>=coalesce((SELECT (? - utc_ms)*1000 FROM runs WHERE id=?),0)",params![run,integer(since)?,run],|r|Ok(json!({"captures":r.get::<_,i64>(0)?,"samples":r.get::<_,i64>(1)?,"first_us":r.get::<_,Option<i64>>(2)?,"last_us":r.get::<_,Option<i64>>(3)?,"scope":"process"})))?;
         let health = self.db.query_row("SELECT updated_ms,errors,budget,used,discarded_spans FROM status WHERE id=1", [], |r| Ok(json!({"updated_ms":r.get::<_,i64>(0)?,"errors":r.get::<_,i64>(1)?,"budget":r.get::<_,i64>(2)?,"used":r.get::<_,i64>(3)?,"discarded_spans":r.get::<_,i64>(4)?}))).optional()?;
         Ok(
-            json!({"generated_ms":now_ms(),"run":run,"mode":mode,"runs":runs,"latest":latest,"outliers":outliers,"failures":failures,"counts":counts,"health":health,"cpu":cpu,"latency":latency}),
+            json!({"generated_ms":now_ms(),"run":run,"mode":mode,"runs":runs,"latest":latest,"outliers":outliers,"failures":failures,"counts":counts,"timing_blocks":accepted,"excluded_timings":excluded,"health":health,"cpu":cpu,"latency":latency}),
         )
     }
     pub(crate) fn detail(&self, run: &str, attempt: u64) -> Result<Value> {
@@ -649,8 +683,28 @@ impl Reader {
             && summary["expired"] == false
             && summary["dropped"] == 0
             && summary["expected_spans"].as_u64() == Some(u64::try_from(spans.len())?);
+        let recorded_end = spans
+            .iter()
+            .filter_map(|span| match span {
+                Event::Span { end_us, .. } => Some(*end_us),
+                _ => None,
+            })
+            .chain(summary["end_us"].as_u64())
+            .max();
+        let elapsed = |end: Option<u64>| {
+            summary["start_us"]
+                .as_u64()
+                .zip(end)
+                .map(|(start, end)| end.saturating_sub(start))
+        };
+        let timing = json!({
+            "recorded_elapsed_us":elapsed(recorded_end),
+            "verifier_elapsed_us":elapsed(summary["end_us"].as_u64()),
+            "after_response_us":summary["end_us"].as_u64().zip(recorded_end).map(|(response,end)|end.saturating_sub(response)),
+            "valid":summary["exclusion_reason"].is_null(),
+        });
         Ok(
-            json!({"summary":summary,"spans":spans,"complete":complete,"missing_chunks":missing,"cpu":cpu,"boundary":"router entry to caller result; caller readiness, network and ingress are outside this interval"}),
+            json!({"summary":summary,"spans":spans,"complete":complete,"missing_chunks":missing,"cpu":cpu,"timing":timing,"boundary":"Verifier request measures router entry to caller result. Total recorded time extends through the last recorded work, including finalization after the response. Caller readiness, network and ingress are outside both intervals. Missing detail can leave the total understated."}),
         )
     }
     pub(crate) fn search(&self, query: &str) -> Result<Value> {
@@ -664,7 +718,7 @@ impl Reader {
         let rows: Vec<Value> = self
             .db
             .prepare(&format!(
-                "{COLUMNS} WHERE hash=? OR height=? ORDER BY utc_ms DESC LIMIT 50"
+                "{COLUMNS} WHERE (hash=? OR height=?) AND NOT EXISTS (SELECT 1 FROM attempts b WHERE b.hash=a.hash AND (b.utc_ms,b.run,b.attempt)>(a.utc_ms,a.run,a.attempt)) ORDER BY utc_ms DESC,run DESC,attempt DESC LIMIT 50"
             ))?
             .query_map(params![hash, height], row)?
             .collect::<rusqlite::Result<_>>()?;
@@ -672,10 +726,15 @@ impl Reader {
     }
 }
 
-const COLUMNS: &str = "SELECT run,attempt,hash,height,mode,transactions,start_us,end_us,utc_ms,outcome,dropped,expected_spans,received_spans,expired FROM attempts a";
+// Choose the newest request before filtering its outcome or timing validity, so an old
+// success cannot resurface as a slow block after a newer recording replaces it.
+const LATEST_IN_SESSION: &str = "NOT EXISTS (SELECT 1 FROM attempts b WHERE b.run=a.run AND b.hash=a.hash AND b.mode=a.mode AND (b.utc_ms,b.attempt)>(a.utc_ms,a.attempt))";
+const VALID_TIMING: &str =
+    "NOT EXISTS (SELECT 1 FROM timing_exclusions e WHERE e.run=a.run AND e.attempt=a.attempt)";
+const COLUMNS: &str = "SELECT run,attempt,hash,height,mode,transactions,start_us,end_us,utc_ms,outcome,dropped,expected_spans,received_spans,expired,(SELECT reason FROM timing_exclusions e WHERE e.run=a.run AND e.attempt=a.attempt) FROM attempts a";
 fn row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Value> {
     Ok(
-        json!({"run":r.get::<_,String>(0)?,"attempt":r.get::<_,i64>(1)?,"hash":r.get::<_,Option<String>>(2)?,"height":r.get::<_,Option<u32>>(3)?,"mode":r.get::<_,Option<String>>(4)?,"transactions":r.get::<_,Option<u32>>(5)?,"start_us":r.get::<_,Option<i64>>(6)?,"end_us":r.get::<_,Option<i64>>(7)?,"utc_ms":r.get::<_,Option<i64>>(8)?,"outcome":r.get::<_,Option<String>>(9)?,"dropped":r.get::<_,i64>(10)?,"expected_spans":r.get::<_,Option<i64>>(11)?,"received_spans":r.get::<_,i64>(12)?,"expired":r.get::<_,bool>(13)?}),
+        json!({"run":r.get::<_,String>(0)?,"attempt":r.get::<_,i64>(1)?,"hash":r.get::<_,Option<String>>(2)?,"height":r.get::<_,Option<u32>>(3)?,"mode":r.get::<_,Option<String>>(4)?,"transactions":r.get::<_,Option<u32>>(5)?,"start_us":r.get::<_,Option<i64>>(6)?,"end_us":r.get::<_,Option<i64>>(7)?,"utc_ms":r.get::<_,Option<i64>>(8)?,"outcome":r.get::<_,Option<String>>(9)?,"dropped":r.get::<_,i64>(10)?,"expected_spans":r.get::<_,Option<i64>>(11)?,"received_spans":r.get::<_,i64>(12)?,"expired":r.get::<_,bool>(13)?,"exclusion_reason":r.get::<_,Option<String>>(14)?}),
     )
 }
 

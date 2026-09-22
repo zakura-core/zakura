@@ -102,6 +102,7 @@ function renderTimeline(spans,row,start,duration) {
   if(finalization)collect(finalization.span);
   const transactionDetail=spans.filter(s=>transactionStages.has(s.stage)&&!finalizationIds.has(s.span));
   const transactionIds=new Set(transactionDetail.map(s=>s.span));
+  const transactionEntry=transactions||transactionDetail[0];
   function lane(span,tag='div',label=span.stage.replaceAll('_',' ')) {
     const line=el(tag,null,`lane${span.root?' root':''}`),track=el('div',null,'lane-bar'),bar=el('div',null,'bar');
     bar.style.left=`${Math.max(0,(span.start_us-start)/duration*100)}%`;bar.style.width=`${Math.max(0,(span.end_us-span.start_us)/duration*100)}%`;
@@ -110,10 +111,15 @@ function renderTimeline(spans,row,start,duration) {
   }
   if(row.end_us!=null)host.append(lane({stage:'Verifier request',start_us:start,end_us:row.end_us,root:true}));
   for(const span of spans){
-    if(finalizationIds.has(span.span)||(transactions&&transactionIds.has(span.span)))continue;
-    if(span===transactions){
+    if(finalizationIds.has(span.span)||(transactionIds.has(span.span)&&span!==transactionEntry))continue;
+    if(span===transactionEntry){
       const group=el('details',null,'timeline-group transactions'),body=el('div',null,'timeline-children');
-      group.append(lane(span,'summary',`Transactions (${number(row.transactions)})`));
+      if(transactions)group.append(lane(span,'summary',`Transactions (${number(row.transactions)})`));
+      else{
+        const summary=el('summary',null,'lane');
+        summary.append(el('span',`Transactions (${number(row.transactions)})`,'lane-name'),el('span','Group timing not recorded','muted'));
+        group.append(summary);
+      }
       if(transactionDetail.length)body.append(...transactionDetail.map(s=>lane(s)));else body.append(el('p','No individual transaction timings were retained.','muted'));
       group.append(body);host.append(group);
     }else if(span===finalization){

@@ -380,7 +380,7 @@ def sha256_file(path: Path) -> str:
 
 def resolve_sha(config: Config) -> str:
     policy = config.policy
-    run(["git", "fetch", "--prune", policy.remote, policy.branch], cwd=config.paths.repo_dir)
+    run(["git", "fetch", "--prune", "--tags", policy.remote, policy.branch], cwd=config.paths.repo_dir)
     result = run(
         ["git", "rev-parse", "--verify", "FETCH_HEAD^{commit}"],
         cwd=config.paths.repo_dir,
@@ -415,9 +415,13 @@ def build_binary(config: Config, sha: str) -> Path:
     target = cached_binary(config, sha)
     meta = target.with_suffix(".json")
     features = build_features(config, sha)
+    describe = run(
+        ["git", "describe", "--always", "--tags", "--match", "v*.*.*", sha],
+        cwd=config.paths.repo_dir, capture=True,
+    ).stdout.strip()
     if binary_runnable(target) and meta.exists():
         metadata = json.loads(meta.read_text(encoding="utf-8"))
-        if metadata.get("features", []) == features:
+        if metadata.get("features", []) == features and metadata.get("git_describe") == describe:
             log(config, f"build-cache-hit sha={sha} features={features}")
             return target
 
@@ -445,6 +449,7 @@ def build_binary(config: Config, sha: str) -> Path:
                     "sha": sha,
                     "binary_sha256": sha256_file(target),
                     "features": features,
+                    "git_describe": describe,
                     "built_at": utc_stamp(),
                 },
                 indent=2,

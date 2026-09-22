@@ -65,6 +65,10 @@ class ContinuousSyncTests(unittest.TestCase):
                 with self.subTest(ref=ref):
                     config = make_config(root, policy=sync.Policy(branch=ref))
                     self.assertEqual(sync.resolve_sha(config), expected)
+            self.assertEqual(
+                git("describe", "--tags", "--exact-match", release_sha, cwd=root / "repo"),
+                "v1.5.0-rc0",
+            )
             with self.assertRaises(sync.ControllerError):
                 sync.resolve_sha(make_config(root, policy=sync.Policy(branch="missing")))
 
@@ -92,8 +96,11 @@ class ContinuousSyncTests(unittest.TestCase):
             target.write_bytes(b"default binary")
             target.with_suffix(".json").write_text(json.dumps({"sha": sha}))
             commands = []
+            describe = "v1.5.0-rc0"
 
             def command(args, **kwargs):
+                if args[:2] == ["git", "describe"]:
+                    return subprocess.CompletedProcess(args, 0, describe)
                 commands.append(args)
                 if args[:2] == ["cargo", "build"]:
                     built = kwargs["cwd"] / "target/release/zakurad"
@@ -113,6 +120,11 @@ class ContinuousSyncTests(unittest.TestCase):
                 commands.clear()
                 self.assertEqual(sync.build_binary(config, sha), target)
                 self.assertEqual(commands, [])
+                describe = "v1.5.0-rc1"
+                self.assertEqual(sync.build_binary(config, sha), target)
+                self.assertTrue(any(args[:2] == ["cargo", "build"] for args in commands))
+                self.assertEqual(json.loads(target.with_suffix(".json").read_text())["git_describe"],
+                                 describe)
 
     def test_retention_archive_failure_reports_halt_during_disk_recovery(self):
         for restarting in (False, True):

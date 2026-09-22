@@ -44,22 +44,23 @@
 //!                             └─ RangeUnavailable ─▶ local retry
 //! ```
 //!
-//! A disallowed/unknown stream-6 type or a malformed payload surfaces as a
-//! `MalformedMessage` misbehavior + a protocol reject from the routine's
-//! decode-error path, rather than a pre-decode guard reject silently dropping the
-//! signal (see BS1).
+//! The transport rejects an undeclared stream-6 type, any flag bit, or a payload
+//! outside its rule's bounds from the frame header (`BLOCK_SYNC_MESSAGE_RULES`),
+//! and disconnects the peer. A malformed payload that passes the header check
+//! surfaces as a `MalformedMessage` misbehavior + a protocol reject from the
+//! routine's decode-error path (see BS1).
 
 use crate::zakura::SessionGuard;
 
 use super::wire::MAX_BS_MESSAGE_BYTES;
 
 pub(super) fn block_sync_guard() -> SessionGuard {
-    // The transport already applies the per-connection count bucket and frame
-    // cap; this guard adds the same payload cap the codec enforces. Type
-    // validity is left to the decode stage on purpose: a disallowed or unknown
-    // stream-6 type must surface as a `MalformedMessage` misbehavior + protocol
-    // reject from the routine's decode-error path (see BS1), rather than a
-    // pre-decode guard reject dropping that signal. The block-sync byte budget
+    // The transport already applies the per-connection count bucket and the
+    // stream's message rules (type, flags, and per-type payload bounds); this
+    // guard adds the same payload cap the codec enforces. Payload validity is
+    // left to the decode stage: a malformed body must surface as a
+    // `MalformedMessage` misbehavior + protocol reject from the routine's
+    // decode-error path (see BS1). The block-sync byte budget
     // likewise stays in the routine's reserve/reorder accounting so existing
     // request/retry accounting is not double-counted.
     SessionGuard::oversize_only(MAX_BS_MESSAGE_BYTES as u32)

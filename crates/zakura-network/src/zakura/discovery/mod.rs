@@ -5,8 +5,11 @@ mod dialer;
 mod pipe;
 mod protocol;
 mod redial;
+#[cfg(test)]
+mod regulation_tests;
 mod runtime;
 mod service;
+mod serving;
 mod trace;
 
 #[cfg(any(test, feature = "zakura-testkit"))]

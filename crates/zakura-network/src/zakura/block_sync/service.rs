@@ -1,9 +1,9 @@
 use super::{config::*, events::*, peer_registry::SessionAdmission, wire::*, *};
 use crate::zakura::{
-    handle_pipe_exit, spawn_supervised_pipe, FramedRecv, FramedSend, OrderedSendError, Peer,
-    PeerStreamSession, Service, ServicePeerSnapshot, SessionDemand, SessionOpening, SessionPolicy,
-    SinkReject, Stream, StreamMode, ZakuraBlockSyncCandidateState, ZakuraConnId, ZakuraPeerId,
-    FRAME_HEADER_BYTES,
+    handle_pipe_exit, spawn_supervised_pipe, FramedRecv, FramedSend, MessageRule, OrderedSendError,
+    Peer, PeerStreamSession, Service, ServicePeerSnapshot, SessionDemand, SessionOpening,
+    SessionPolicy, SinkReject, Stream, StreamMode, ZakuraBlockSyncCandidateState, ZakuraConnId,
+    ZakuraPeerId, FRAME_HEADER_BYTES,
 };
 use std::{
     sync::atomic::{AtomicU64, Ordering},
@@ -32,6 +32,13 @@ const BLOCK_SYNC_SERVICE_STREAMS: [Stream; 1] = [Stream {
 /// Service-declared streams for native block sync.
 pub(crate) fn block_sync_streams() -> &'static [Stream] {
     &BLOCK_SYNC_SERVICE_STREAMS
+}
+
+/// Return the message rules for one block-sync stream.
+pub(crate) fn block_sync_message_rules(stream: Stream) -> Option<&'static [MessageRule]> {
+    block_sync_streams()
+        .contains(&stream)
+        .then_some(BLOCK_SYNC_MESSAGE_RULES.as_slice())
 }
 
 /// Cloneable typed stream-6 sender.
@@ -453,6 +460,10 @@ impl Service for BlockSyncService {
 
     fn streams(&self) -> &[Stream] {
         block_sync_streams()
+    }
+
+    fn message_rules(&self, stream: Stream) -> Option<&'static [MessageRule]> {
+        block_sync_message_rules(stream)
     }
 
     fn session_policy(&self) -> SessionPolicy {

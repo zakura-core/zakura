@@ -50,9 +50,13 @@ The service does not declare membership a second time. The transport waits for
 data, requests, and events before handing their receive/send handles to the
 service. It does not wait for a lookup request.
 
-The service uses `message_types()`, `message_payload_limits()`, and
-`stream_queue_depths()` to specify each stream's traffic and bounds. The protocol
-defines message assignments; peers do not negotiate individual message types.
+The service uses `message_rules()` and `stream_queue_depths()` to specify each
+stream's traffic and bounds. A message rule names one message type, its role
+(announcement, request, or response), and its payload bounds. The transport
+rejects an undeclared type, any flag bit, or an out-of-bounds length from the
+frame header, before it reads the payload. A service without rules keeps the
+stream cap as its only bound. The protocol defines message assignments; peers do
+not negotiate individual message types.
 The service routes outgoing messages to the appropriate sender.
 
 `stream_write_policy()` sets each persistent stream's write deadline. The default

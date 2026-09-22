@@ -27,6 +27,7 @@ mod regulation;
 pub mod testkit;
 mod trace;
 pub mod transport;
+mod wire_codec;
 
 pub use block_sync::*;
 pub use discovery::*;
@@ -42,6 +43,7 @@ pub use trace::{
     LEGACY_REQUEST_TABLE, QUEUE_SEND_TABLE, RATELIMIT_TABLE, STREAM_TABLE,
 };
 pub use transport::*;
+pub use wire_codec::WireError;
 
 #[cfg(any(test, feature = "zakura-testkit"))]
 pub(crate) use handler::run_native_initiator_handshake_without_trace as run_native_initiator_handshake;

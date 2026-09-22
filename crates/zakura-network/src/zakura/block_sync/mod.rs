@@ -6,12 +6,11 @@
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
-    io::{self, Cursor, Read, Write},
+    io::Cursor,
     sync::{Arc, Mutex as StdMutex},
     time::{Duration, Instant},
 };
 
-use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::{
@@ -22,12 +21,12 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use zakura_chain::{
     block,
-    serialization::{SerializationError, ZcashDeserialize, ZcashSerialize},
+    serialization::{ZcashDeserialize, ZcashSerialize},
 };
 
 use super::{
-    trace::block_sync_trace as bs_trace, Frame, ServicePeerDirection, ServicePeerLimits,
-    ZakuraPeerId, ZakuraTrace,
+    trace::block_sync_trace as bs_trace, Frame, MessageRule, PayloadLen, ServicePeerDirection,
+    ServicePeerLimits, ZakuraPeerId, ZakuraTrace,
 };
 
 mod admission;
@@ -73,16 +72,16 @@ pub use events::{
 };
 pub use reactor::spawn_block_sync_reactor;
 pub use request::BlockSizeEstimate;
-#[cfg(test)]
-pub(crate) use service::block_sync_streams;
 pub use service::BlockSyncPeerSession;
 pub(crate) use service::BlockSyncService;
 #[cfg(test)]
 pub(crate) use service::MAX_BS_FRAME_BYTES;
+#[cfg(test)]
+pub(crate) use service::{block_sync_message_rules, block_sync_streams};
 pub use state::{BlockSyncFrontiers, BlockSyncHandle, BlockSyncStartup};
 pub use wire::{
-    BlockSyncMessage, MAX_BS_BLOCKS_PER_REQUEST, MAX_BS_MESSAGE_BYTES, MSG_BS_BLOCK,
-    MSG_BS_BLOCKS_DONE, MSG_BS_GET_BLOCKS, MSG_BS_RANGE_UNAVAILABLE, MSG_BS_STATUS,
+    BlockSyncMessage, BLOCK_SYNC_MESSAGE_RULES, MAX_BS_BLOCKS_PER_REQUEST, MAX_BS_MESSAGE_BYTES,
+    MSG_BS_BLOCK, MSG_BS_BLOCKS_DONE, MSG_BS_GET_BLOCKS, MSG_BS_RANGE_UNAVAILABLE, MSG_BS_STATUS,
     ZAKURA_BLOCK_SYNC_STREAM_VERSION, ZAKURA_CAP_BLOCK_SYNC, ZAKURA_STREAM_BLOCK_SYNC,
 };
 

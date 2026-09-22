@@ -1,4 +1,5 @@
 mod retention;
+mod wire_conformance;
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
@@ -1788,45 +1789,12 @@ fn codec_round_trips_block_near_max_block_bytes() {
 }
 
 #[test]
-fn codec_rejects_malformed_discriminator_and_truncated_payload() {
-    assert!(matches!(
-        BlockSyncMessage::decode(&[99]),
-        Err(BlockSyncWireError::UnknownMessageType(99))
-    ));
-
-    assert!(matches!(
-        BlockSyncMessage::decode(&[MSG_BS_GET_BLOCKS, 1, 0]),
-        Err(BlockSyncWireError::Io(_))
-    ));
-}
-
-#[test]
-fn codec_classifies_payloads_above_old_raw_stream6_cap() {
-    let old_max_bs_message_bytes =
-        usize::try_from(block::MAX_BLOCK_BYTES).expect("max block bytes fits in usize") + 1;
-    let payload = vec![99; old_max_bs_message_bytes + 1];
-
-    assert!(payload.len() <= MAX_BS_MESSAGE_BYTES);
-    assert!(matches!(
-        BlockSyncMessage::decode(&payload),
-        Err(BlockSyncWireError::UnknownMessageType(99))
-    ));
-}
-
-#[test]
-fn codec_rejects_oversized_frame_and_oversized_block() {
-    let oversized_payload = vec![0; MAX_BS_MESSAGE_BYTES + 1];
-    assert!(matches!(
-        BlockSyncMessage::decode(&oversized_payload),
-        Err(BlockSyncWireError::OversizedPayload { .. })
-    ));
-
+fn codec_rejects_an_oversized_block_on_encode() {
     let oversized_block =
         Arc::new(zakura_chain::block::tests::generate::oversized_multi_transaction_block());
     assert!(matches!(
         BlockSyncMessage::Block(oversized_block).encode(),
         Err(BlockSyncWireError::OversizedBlock { .. })
-            | Err(BlockSyncWireError::OversizedPayload { .. })
     ));
 }
 
@@ -1884,45 +1852,6 @@ fn codec_rejects_count_and_returned_over_cap() {
         }
         .encode(),
         Err(BlockSyncWireError::BlockCountLimit { .. })
-    ));
-}
-
-#[test]
-fn frame_decode_rejects_mismatched_unknown_flags_and_trailing_payload() {
-    let frame = Frame {
-        message_type: u16::from(MSG_BS_GET_BLOCKS),
-        flags: 1,
-        payload: BlockSyncMessage::GetBlocks {
-            start_height: block::Height(1),
-            count: 1,
-        }
-        .encode()
-        .expect("message encodes"),
-    };
-    assert!(matches!(
-        BlockSyncMessage::decode_frame(frame),
-        Err(BlockSyncWireError::UnsupportedFlags(1))
-    ));
-
-    let mut payload = BlockSyncMessage::Status(status())
-        .encode()
-        .expect("message encodes");
-    payload.push(0);
-    assert!(matches!(
-        BlockSyncMessage::decode(&payload),
-        Err(BlockSyncWireError::TrailingBytes)
-    ));
-
-    let frame = Frame {
-        message_type: u16::from(MSG_BS_BLOCK),
-        flags: 0,
-        payload: BlockSyncMessage::Status(status())
-            .encode()
-            .expect("message encodes"),
-    };
-    assert!(matches!(
-        BlockSyncMessage::decode_frame(frame),
-        Err(BlockSyncWireError::MismatchedFrameMessageType { .. })
     ));
 }
 

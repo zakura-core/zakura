@@ -12,7 +12,7 @@ use std::{
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
-use super::{CloseCause, FramedRecv, FramedSend};
+use super::{CloseCause, FramedRecv, FramedSend, MessageRule};
 use crate::{
     zakura::{ServicePeerDirection, ZakuraConnId, ZakuraPeerId},
     BoxError,
@@ -405,18 +405,13 @@ pub trait Service: fmt::Debug + Send + Sync + 'static {
     /// Advance its version whenever the session layout changes.
     fn streams(&self) -> &[Stream];
 
-    /// Payload size limits for this stream, as `(message_type, maximum_bytes)` pairs.
+    /// Message rules for this stream, checked from each frame header.
     ///
-    /// The reader checks these limits before allocating a payload. Limits exclude
-    /// the frame header and may only tighten the stream's existing cap. Unlisted
-    /// message types keep that cap; message validity is checked by the codec.
-    fn message_payload_limits(&self, _stream: Stream) -> &'static [(u16, usize)] {
-        &[]
-    }
-
-    /// Optional message types accepted on this role. The transport rejects an
-    /// unlisted type from its header, before allocating or reading its payload.
-    fn message_types(&self, _stream: Stream) -> Option<&'static [u16]> {
+    /// The reader rejects an undeclared type, any flag bit, or a payload outside
+    /// the rule's bounds before it allocates the payload. A rule's maximum only
+    /// tightens the stream's frame cap. Request-stream readers admit only the
+    /// role they expect. `None` admits any type and flags up to the stream cap.
+    fn message_rules(&self, _stream: Stream) -> Option<&'static [MessageRule]> {
         None
     }
 

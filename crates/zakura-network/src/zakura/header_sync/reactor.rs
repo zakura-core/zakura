@@ -2065,7 +2065,6 @@ impl HeaderSyncReactor {
         if let Some(active) = self.peer_work_queue.active_owner(owner.into()).cloned() {
             self.emit_request_terminal(&active, retry.terminal);
         }
-        self.cancel_owned_request(source, owner.into());
         self.peer_work_queue.remove_owner(owner.into());
         let peer = self
             .peer_state
@@ -2790,7 +2789,6 @@ impl HeaderSyncReactor {
                     self.request_deadlines
                         .insert(peer.clone(), Instant::now() + self.startup.request_timeout);
                 } else {
-                    session.cancel_request(request_id);
                     self.peer_work_queue.remove_unstarted(&peer);
                 }
                 metrics::counter!("sync.header.target.requested").increment(1);
@@ -3325,7 +3323,6 @@ impl HeaderSyncReactor {
                 .assign(task.owner, wire_owner, selected_context.clone())
                 .is_err()
             {
-                session.cancel_request(request_id);
                 self.peer_work_queue.cancel_request_reservation(&peer);
                 return;
             }
@@ -3365,7 +3362,6 @@ impl HeaderSyncReactor {
                     selected_context.episode,
                 )
             {
-                session.cancel_request(request_id);
                 self.peer_work_queue.cancel_request_reservation(&peer);
                 self.retry_vct_repair(
                     wire_owner,
@@ -3446,7 +3442,6 @@ impl HeaderSyncReactor {
         for active in self.peer_work_queue.retire_obsolete_active(snapshot) {
             self.request_deadlines.remove(&active.peer);
             self.emit_request_terminal(&active, HeaderRequestTerminal::SnapshotObsolete);
-            self.cancel_active_request(&active);
         }
         self.peer_work_queue.publish_phase_metrics();
     }
@@ -4964,7 +4959,6 @@ impl HeaderSyncReactor {
         let owned = self.peer_work_queue.owned_header_count(peer);
         if let Some(active) = self.peer_work_queue.remove(peer) {
             self.emit_request_terminal(&active, terminal_outcome);
-            self.cancel_active_request(&active);
         }
         let released = reserved.saturating_add(owned);
         if released != 0 {
@@ -4980,9 +4974,7 @@ impl HeaderSyncReactor {
     #[cfg(test)]
     fn clear_peer_work_for_test(&mut self, peer: &ZakuraPeerId) {
         self.request_deadlines.remove(peer);
-        if let Some(active) = self.peer_work_queue.remove(peer) {
-            self.cancel_active_request(&active);
-        }
+        self.peer_work_queue.remove(peer);
         self.peer_work_queue.publish_phase_metrics();
     }
 
@@ -5027,33 +5019,6 @@ impl HeaderSyncReactor {
             );
             row.insert(hs_trace::OUTCOME.into(), terminal_outcome.label().into());
         });
-    }
-
-    fn cancel_active_request(&self, active: &ActiveHeaderRequest) {
-        let Some(state) = self.peer_state.get(&active.peer) else {
-            return;
-        };
-        if state.session.session_id() == active.owner.session_id() {
-            state.session.cancel_request(active.request_id);
-        }
-    }
-
-    fn cancel_owned_request(
-        &self,
-        source: zakura_header_chain::SourceId,
-        owner: zakura_header_chain::HeaderSyncWorkOwner,
-    ) {
-        let Some(state) = self.peer_state.iter().find_map(|(peer, state)| {
-            (state.session.session_id() == owner.session_id()
-                && source_id_from_peer(peer) == source)
-                .then_some(state)
-        }) else {
-            return;
-        };
-        let Some(request_id) = HeaderSyncRequestId::new(owner.request_id().get()) else {
-            return;
-        };
-        state.session.cancel_request(request_id);
     }
 
     fn handle_typed_failure(

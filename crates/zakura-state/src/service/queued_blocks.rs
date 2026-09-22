@@ -481,16 +481,28 @@ impl SentHashes {
     /// Rejected or evicted blocks must be eligible for redelivery without removing
     /// outputs that an in-flight sibling still supplies to `AwaitUtxo` requests.
     pub fn remove(&mut self, hash: &block::Hash) {
-        let Some(outpoints) = self.sent.remove(hash) else {
-            return;
-        };
+        self.remove_many(std::slice::from_ref(hash));
+    }
 
-        Self::release_outputs(&mut self.known_utxos, &outpoints);
-
-        self.curr_buf.retain(|(h, _)| h != hash);
-        for buf in &mut self.bufs {
-            buf.retain(|(h, _)| h != hash);
+    /// Removes blocks and releases their outputs, scanning batch buffers only once.
+    pub fn remove_many(&mut self, hashes: &[block::Hash]) {
+        let previous_len = self.sent.len();
+        for hash in hashes {
+            if let Some(outpoints) = self.sent.remove(hash) {
+                Self::release_outputs(&mut self.known_utxos, &outpoints);
+            }
         }
+
+        if self.sent.len() == previous_len {
+            return;
+        }
+
+        self.curr_buf
+            .retain(|(hash, _)| self.sent.contains_key(hash));
+        self.bufs.retain_mut(|buf| {
+            buf.retain(|(hash, _)| self.sent.contains_key(hash));
+            !buf.is_empty()
+        });
     }
 
     fn release_outputs(

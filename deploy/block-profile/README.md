@@ -93,7 +93,13 @@ The explorer binds to IPv4 localhost and requires a localhost Host header. Reach
 ssh -N -L 8787:127.0.0.1:8787 operator@PROFILE_HOST
 ```
 
-Do not put an unauthenticated public proxy in front of it. The web API has no capture, delete, or pin controls. Reports are stored locally and never sent to Slack or email.
+The web API has no capture, delete, or pin controls. Reports are stored locally and never sent to Slack or email.
+
+### Optional public trial
+
+When the operator explicitly requests public access, `public-nginx.conf` exposes the read-only explorer on HTTP port 80 of a dedicated trial host. Anyone with its address can view and download retained profiles, including node/build metadata and decoded CPU stacks. This configuration has no authentication or TLS. Keep SSH forwarding for private sessions, and configure a domain and TLS for a longer-lived public service.
+
+Install Ubuntu's `nginx` package, then use `public-nginx.conf` as `/etc/nginx/nginx.conf` only on the dedicated host. Install `public-nginx.service.conf` as `/etc/systemd/system/nginx.service.d/profile.conf`, run `nginx -t`, reload systemd, and start nginx. Keep the explorer on localhost. The proxy permits only its known GET/HEAD endpoints, rewrites the upstream Host header, and bounds requests, connections, and resources. It cannot serve the profile filesystem, node RPC, or metrics. Stop nginx at the beginning of the session's orderly shutdown.
 
 ## DigitalOcean sessions
 

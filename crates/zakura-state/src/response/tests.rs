@@ -52,16 +52,16 @@ fn state_from_chain(network: &Network, blocks: &[Arc<Block>]) -> NonFinalizedSta
 }
 
 /// Receives the next block hash, failing if none arrives promptly.
-async fn recv_hash(rx: &mut mpsc::Receiver<(block::Hash, Arc<Block>)>) -> block::Hash {
+async fn recv_hash(rx: &mut mpsc::Receiver<super::NonFinalizedBlock>) -> block::Hash {
     tokio::time::timeout(Duration::from_secs(10), rx.recv())
         .await
         .expect("listener should send a block before timing out")
         .expect("listener channel should stay open")
-        .0
+        .hash
 }
 
 /// Asserts the listener doesn't send any more blocks within a short window.
-async fn assert_idle(rx: &mut mpsc::Receiver<(block::Hash, Arc<Block>)>) {
+async fn assert_idle(rx: &mut mpsc::Receiver<super::NonFinalizedBlock>) {
     assert!(
         tokio::time::timeout(Duration::from_millis(200), rx.recv())
             .await
@@ -148,4 +148,33 @@ async fn sends_only_new_blocks_on_update() {
     tx.send(extended).expect("listener should still be running");
     assert_eq!(recv_hash(&mut received).await, hashes[3]);
     assert_idle(&mut received).await;
+}
+
+#[tokio::test]
+async fn listener_preserves_source_receipts() {
+    let _init_guard = zakura_test::init();
+    let network = Network::Mainnet;
+    let blocks = fake_chain(&network, 2);
+    let finalized = FinalizedState::new(&Config::ephemeral(), &network).unwrap();
+    finalized.set_finalized_value_pool(ValueBalance::<NonNegative>::fake_populated_pool());
+    let mut state = NonFinalizedState::new(&network);
+    let mut root = blocks[0].clone().prepare();
+    root.receipt_order = Some(2);
+    state.commit_new_chain(root, &finalized).unwrap();
+    let mut child = blocks[1].clone().prepare();
+    child.receipt_order = Some(1);
+    state.commit_block(child, &finalized).unwrap();
+    let (_sender, receiver) = watch::channel(state.clone());
+    let mut received =
+        NonFinalizedBlocksListener::spawn(WatchReceiver::new(receiver), HashSet::new()).unwrap();
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        for (block, expected) in [(&blocks[0], 2), (&blocks[1], 1)] {
+            let received = received.recv().await.unwrap();
+            assert_eq!(received.hash, block.hash());
+            assert_eq!(received.receipt_order, Some(expected));
+        }
+    })
+    .await
+    .expect("receipt metadata should arrive before timeout");
 }

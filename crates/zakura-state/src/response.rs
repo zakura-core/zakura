@@ -263,11 +263,18 @@ const NON_FINALIZED_STATE_CHANGE_BUFFER_SIZE: usize = 2 * MAX_BLOCK_REORG_HEIGHT
 
 /// A listener for changes in the non-finalized state.
 #[derive(Clone, Debug)]
-pub struct NonFinalizedBlocksListener(
-    pub  Arc<
-        tokio::sync::mpsc::Receiver<(zakura_chain::block::Hash, Arc<zakura_chain::block::Block>)>,
-    >,
-);
+pub struct NonFinalizedBlocksListener(pub Arc<tokio::sync::mpsc::Receiver<NonFinalizedBlock>>);
+
+/// A validated block with its primary verifier's optional receipt order.
+#[derive(Clone, Debug)]
+pub struct NonFinalizedBlock {
+    /// Block hash.
+    pub hash: block::Hash,
+    /// Complete block.
+    pub block: Arc<Block>,
+    /// Process-local order, absent for restored blocks or older primaries.
+    pub receipt_order: Option<u64>,
+}
 
 impl NonFinalizedBlocksListener {
     /// Sends the blocks in `non_finalized_state` that satisfy `take_cond` to
@@ -280,10 +287,10 @@ impl NonFinalizedBlocksListener {
     ///
     /// Returns an error if the receiver has been dropped.
     async fn take_and_send_blocks<'a>(
-        sender: &tokio::sync::mpsc::Sender<(block::Hash, Arc<Block>)>,
+        sender: &tokio::sync::mpsc::Sender<NonFinalizedBlock>,
         non_finalized_state: &'a NonFinalizedState,
         take_cond: impl Fn(&&ContextuallyVerifiedBlock) -> bool + Copy + 'a,
-    ) -> Result<(), tokio::sync::mpsc::error::SendError<(block::Hash, Arc<Block>)>> {
+    ) -> Result<(), tokio::sync::mpsc::error::SendError<NonFinalizedBlock>> {
         let new_blocks = non_finalized_state
             .chain_iter()
             .flat_map(move |chain| {
@@ -295,7 +302,11 @@ impl NonFinalizedBlocksListener {
                 blocks.reverse();
                 blocks
             })
-            .map(|cv_block| (cv_block.hash, cv_block.block.clone()));
+            .map(|cv_block| NonFinalizedBlock {
+                hash: cv_block.hash,
+                block: cv_block.block.clone(),
+                receipt_order: cv_block.receipt_order,
+            });
 
         for new_block_with_hash in new_blocks {
             sender.send(new_block_with_hash).await?;
@@ -391,10 +402,7 @@ impl NonFinalizedBlocksListener {
     /// # Panics
     ///
     /// If the `Arc` has more than one strong reference, this will panic.
-    pub fn unwrap(
-        self,
-    ) -> tokio::sync::mpsc::Receiver<(zakura_chain::block::Hash, Arc<zakura_chain::block::Block>)>
-    {
+    pub fn unwrap(self) -> tokio::sync::mpsc::Receiver<NonFinalizedBlock> {
         Arc::try_unwrap(self.0).unwrap()
     }
 }

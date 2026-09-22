@@ -8,8 +8,8 @@ use std::{
 use thiserror::Error;
 
 use super::{
-    Frame, Peer, Service, SessionDemand, SessionPolicy, SinkReject, Stream, StreamMode,
-    StreamWritePolicy,
+    Frame, MessageRule, Peer, Service, SessionDemand, SessionPolicy, SinkReject, Stream,
+    StreamMode, StreamWritePolicy,
 };
 use crate::zakura::{ServicePeerDirection, ZakuraConnId, ZakuraPeerId};
 
@@ -201,20 +201,14 @@ impl ServiceRegistry {
             .map(|index| Arc::clone(&self.services[*index]))
     }
 
-    /// Local message limits supplied by the service that owns this stream.
-    pub(crate) fn message_payload_limits(&self, stream: Stream) -> &'static [(u16, usize)] {
-        self.service_for_kind(stream.kind)
-            .map(|service| service.message_payload_limits(stream))
-            .unwrap_or(&[])
+    /// Message rules supplied by the service that owns this stream.
+    pub(crate) fn message_rules(&self, stream: Stream) -> Option<&'static [MessageRule]> {
+        self.service_for_kind(stream.kind)?.message_rules(stream)
     }
 
     pub(crate) fn stream_queue_depths(&self, stream: Stream) -> Option<(usize, usize)> {
         self.service_for_kind(stream.kind)?
             .stream_queue_depths(stream)
-    }
-
-    pub(crate) fn message_types(&self, stream: Stream) -> Option<&'static [u16]> {
-        self.service_for_kind(stream.kind)?.message_types(stream)
     }
 
     /// Lookup the declared stream for `kind`.

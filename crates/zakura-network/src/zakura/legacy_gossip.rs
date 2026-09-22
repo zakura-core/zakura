@@ -40,10 +40,10 @@ use crate::{
 
 use super::trace::BlockBodySource;
 use super::{
-    spawn_supervised_peer_task, BoxRunFuture, Frame, FramedSend, OrderedSendError, Peer,
-    RequestResponseService, Service as ZakuraService, ServicePeerDirection, SessionDemand,
-    SessionOpening, SessionPolicy, SinkReject, Stream, StreamMode, ZakuraConnId, ZakuraPeerHandle,
-    ZakuraPeerId, ZakuraSupervisorHandle, ZakuraTrace, FRAME_HEADER_BYTES,
+    spawn_supervised_peer_task, BoxRunFuture, Frame, FramedSend, MessageRule, OrderedSendError,
+    PayloadLen, Peer, RequestResponseService, Service as ZakuraService, ServicePeerDirection,
+    SessionDemand, SessionOpening, SessionPolicy, SinkReject, Stream, StreamMode, ZakuraConnId,
+    ZakuraPeerHandle, ZakuraPeerId, ZakuraSupervisorHandle, ZakuraTrace, FRAME_HEADER_BYTES,
     LOCAL_MAX_CONTROL_FRAME_BYTES, ZAKURA_CAP_LEGACY_GOSSIP,
 };
 
@@ -155,6 +155,93 @@ const LEGACY_GOSSIP_SERVICE_STREAMS: [Stream; 2] = [
         mode: StreamMode::RequestResponse,
     },
 ];
+
+/// Largest legacy inventory list: a 3-byte CompactSize count plus the maximum
+/// number of 68-byte (witnessed) inventory entries.
+const MAX_TX_INV_LIST_BYTES: usize = 3 + 25_000 * 68;
+/// Largest block-hash list: a 3-byte CompactSize count plus 25,000 hashes.
+const MAX_HASH_LIST_BYTES: usize = 3 + 25_000 * 32;
+/// Largest block locator: a 1-byte count, up to 101 hashes, and a stop hash.
+const MAX_BLOCK_LOCATOR_BYTES: usize = 1 + 101 * 32 + 32;
+
+/// Stream-2 gossip rules.
+pub const LEGACY_GOSSIP_MESSAGE_RULES: [MessageRule; 2] = [
+    MessageRule::announcement(MSG_ADVERTISE_BLOCK, PayloadLen::exact(32)),
+    // A non-empty list holds at least one 36-byte legacy inventory entry.
+    MessageRule::announcement(
+        MSG_ADVERTISE_TX_IDS,
+        PayloadLen::between(1 + 36, MAX_TX_INV_LIST_BYTES),
+    ),
+];
+
+/// Stream-3 request and response rules.
+///
+/// Every response repeats the 8-byte request id. Chunked and list responses
+/// add at least one byte after it.
+pub const LEGACY_REQUEST_MESSAGE_RULES: [MessageRule; 16] = [
+    MessageRule::request(
+        MSG_REQUEST_BLOCKS_BY_HASH,
+        PayloadLen::between(1, MAX_HASH_LIST_BYTES),
+    ),
+    MessageRule::request(
+        MSG_REQUEST_TRANSACTIONS_BY_ID,
+        PayloadLen::between(1, MAX_TX_INV_LIST_BYTES),
+    ),
+    MessageRule::request(
+        MSG_REQUEST_FIND_BLOCKS,
+        PayloadLen::between(1 + 32, MAX_BLOCK_LOCATOR_BYTES),
+    ),
+    MessageRule::request(
+        MSG_REQUEST_FIND_HEADERS,
+        PayloadLen::between(1 + 32, MAX_BLOCK_LOCATOR_BYTES),
+    ),
+    MessageRule::request(MSG_REQUEST_MEMPOOL_TRANSACTION_IDS, PayloadLen::exact(0)),
+    MessageRule::request(MSG_REQUEST_PING, PayloadLen::exact(0)),
+    MessageRule::request(MSG_REQUEST_PUSH_TRANSACTION, PayloadLen::at_least(1)),
+    MessageRule::response(
+        MSG_RESPONSE_BLOCK,
+        PayloadLen::at_least(RESPONSE_CHUNK_HEADER_BYTES),
+    ),
+    MessageRule::response(
+        MSG_RESPONSE_TRANSACTION,
+        PayloadLen::at_least(RESPONSE_CHUNK_HEADER_BYTES),
+    ),
+    MessageRule::response(
+        MSG_RESPONSE_MISSING_BLOCKS,
+        PayloadLen::at_least(REQUEST_ID_BYTES + 1),
+    ),
+    MessageRule::response(
+        MSG_RESPONSE_MISSING_TRANSACTIONS,
+        PayloadLen::at_least(REQUEST_ID_BYTES + 1),
+    ),
+    MessageRule::response(
+        MSG_RESPONSE_BLOCK_HASHES,
+        PayloadLen::at_least(REQUEST_ID_BYTES + 1),
+    ),
+    MessageRule::response(
+        MSG_RESPONSE_BLOCK_HEADERS,
+        PayloadLen::at_least(REQUEST_ID_BYTES + 1),
+    ),
+    MessageRule::response(
+        MSG_RESPONSE_TRANSACTION_IDS,
+        PayloadLen::at_least(REQUEST_ID_BYTES + 1),
+    ),
+    MessageRule::response(MSG_RESPONSE_PONG, PayloadLen::exact(REQUEST_ID_BYTES)),
+    MessageRule::response(MSG_RESPONSE_NIL, PayloadLen::exact(REQUEST_ID_BYTES)),
+];
+
+/// Return the legacy message rules for one of its streams.
+pub(crate) fn legacy_message_rules(stream: Stream) -> Option<&'static [MessageRule]> {
+    match stream {
+        stream if stream == LEGACY_GOSSIP_SERVICE_STREAMS[0] => {
+            Some(LEGACY_GOSSIP_MESSAGE_RULES.as_slice())
+        }
+        stream if stream == LEGACY_GOSSIP_SERVICE_STREAMS[1] => {
+            Some(LEGACY_REQUEST_MESSAGE_RULES.as_slice())
+        }
+        _ => None,
+    }
+}
 
 /// Service-declared streams for legacy gossip compatibility.
 pub(crate) fn legacy_gossip_streams() -> &'static [Stream] {
@@ -2542,6 +2629,10 @@ impl ZakuraService for LegacyGossipSink {
 
     fn streams(&self) -> &[Stream] {
         legacy_gossip_streams()
+    }
+
+    fn message_rules(&self, stream: Stream) -> Option<&'static [MessageRule]> {
+        legacy_message_rules(stream)
     }
 
     fn session_policy(&self) -> SessionPolicy {

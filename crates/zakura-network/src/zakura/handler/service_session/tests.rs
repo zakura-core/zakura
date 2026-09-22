@@ -1,5 +1,5 @@
 use super::*;
-use crate::zakura::testkit::LocalEndpointFactory;
+use crate::zakura::{testkit::LocalEndpointFactory, PayloadLen};
 use tokio_util::task::AbortOnDropHandle;
 
 const DATA: Stream = Stream {
@@ -1010,8 +1010,7 @@ async fn duplicate_pair_offers_leave_capacity_for_other_peers() -> Result<(), Bo
             read_frame(
                 &mut data_recv,
                 DATA.frame_cap,
-                &[],
-                None,
+                FrameFilter::new(None, InboundReader::Persistent),
                 TEST_TIMEOUT,
                 Some(TEST_TIMEOUT),
             )
@@ -1084,8 +1083,7 @@ async fn paired_replacement_during_cleanup_preserves_the_connection() -> Result<
         read_frame(
             &mut new_data_recv,
             DATA.frame_cap,
-            &[],
-            None,
+            FrameFilter::new(None, InboundReader::Persistent),
             TEST_TIMEOUT,
             Some(TEST_TIMEOUT)
         )
@@ -1116,8 +1114,7 @@ fn raw_worker_context(client: &Endpoint, slots: Arc<Semaphore>) -> StreamWorkerC
         _permit: slots.try_acquire_owned().unwrap(),
         limits: local.clamp(&local.initial_limits()),
         inbound_frame_cap: DATA.frame_cap,
-        message_payload_limits: &[],
-        message_types: None,
+        message_rules: None,
         queue_depths: None,
         write_policy: StreamWritePolicy::UntilCancelled,
         session_resources: None,
@@ -1209,7 +1206,7 @@ async fn paired_request_reader_close_interrupts_a_blocked_write() -> Result<(), 
 }
 
 #[tokio::test]
-async fn request_response_allowlists_reject_headers_before_payloads() -> Result<(), BoxError> {
+async fn request_response_rules_split_request_and_response_readers() -> Result<(), BoxError> {
     let _guard = zakura_test::init();
     let (router, client, connection, remote) = raw_connection().await?;
     let stream = Stream {
@@ -1217,18 +1214,26 @@ async fn request_response_allowlists_reject_headers_before_payloads() -> Result<
         mode: StreamMode::RequestResponse,
         ..DATA
     };
-    let mut header = Vec::new();
-    header.extend_from_slice(&u16::MAX.to_le_bytes());
-    header.extend_from_slice(&0u16.to_le_bytes());
-    header.extend_from_slice(&1024u32.to_le_bytes());
+    let header = |message_type: u16| {
+        let mut header = Vec::new();
+        header.extend_from_slice(&message_type.to_le_bytes());
+        header.extend_from_slice(&0u16.to_le_bytes());
+        header.extend_from_slice(&1024u32.to_le_bytes());
+        header
+    };
+    // A response type is not a request: the request reader rejects it.
     let (mut peer_send, _peer_recv) = connection.open_bi().await?;
-    peer_send.write_all(&header).await?;
+    peer_send.write_all(&header(LEGACY_RESPONSE_PONG)).await?;
     let (send, recv) = timeout(TEST_TIMEOUT, remote.accept_bi()).await??;
     let mut context = raw_worker_context(&client, Arc::new(Semaphore::new(1)));
-    context.message_types = Some(&[LEGACY_REQUEST_PING, LEGACY_RESPONSE_PONG]);
+    const RULES: [MessageRule; 2] = [
+        MessageRule::request(LEGACY_REQUEST_PING, PayloadLen::exact(0)),
+        MessageRule::response(LEGACY_RESPONSE_PONG, PayloadLen::exact(8)),
+    ];
+    context.message_rules = Some(&RULES);
     let cancel = context.connection_token.clone();
     let limits = context.limits;
-    let types = context.message_types;
+    let rules = context.message_rules;
     let prelude = StreamPrelude {
         magic: STREAM_PRELUDE_MAGIC,
         stream_kind: stream.kind,
@@ -1254,8 +1259,7 @@ async fn request_response_allowlists_reject_headers_before_payloads() -> Result<
         &connection,
         limits,
         stream,
-        &[],
-        types,
+        rules,
         42,
         LEGACY_REQUEST_PING,
         0,
@@ -1267,14 +1271,14 @@ async fn request_response_allowlists_reject_headers_before_payloads() -> Result<
         let request = read_frame(
             &mut recv,
             stream.frame_cap,
-            &[],
-            types,
+            FrameFilter::new(rules, InboundReader::RequestStream),
             TEST_TIMEOUT,
             Some(TEST_TIMEOUT),
         )
         .await?;
         assert_eq!(request.message_type, LEGACY_REQUEST_PING);
-        send.write_all(&header).await?;
+        // A request type is not a response: the response reader rejects it.
+        send.write_all(&header(LEGACY_REQUEST_PING)).await?;
         Ok::<_, BoxError>((send, recv))
     };
     let (result, held_stream) = tokio::join!(timeout(Duration::from_secs(2), response), responder);
@@ -1282,7 +1286,7 @@ async fn request_response_allowlists_reject_headers_before_payloads() -> Result<
     assert!(
         matches!(result.expect("the response header is rejected before its absent payload"),
             Err(OutboundRequestError::Fatal(error))
-                if matches!(error.downcast_ref::<ZakuraHandlerError>(), Some(ZakuraHandlerError::InvalidMessageType(u16::MAX)))
+                if matches!(error.downcast_ref::<ZakuraHandlerError>(), Some(ZakuraHandlerError::FrameRejected { message_type: LEGACY_REQUEST_PING, reason: FrameRejection::UnknownMessageType, .. }))
         )
     );
     connection.close(0u32.into(), b"done");
@@ -1734,8 +1738,7 @@ async fn application_receive_half_or_sender_clone_keeps_session_alive() -> Resul
                     read_frame(
                         &mut peer_recv,
                         DATA.frame_cap,
-                        &[],
-                        None,
+                        FrameFilter::new(None, InboundReader::Persistent),
                         TEST_TIMEOUT,
                         Some(TEST_TIMEOUT)
                     )
@@ -1800,8 +1803,7 @@ async fn abandoned_application_drains_queued_writes_before_retirement() -> Resul
                 read_frame(
                     &mut peer_recv,
                     DATA.frame_cap,
-                    &[],
-                    None,
+                    FrameFilter::new(None, InboundReader::Persistent),
                     TEST_TIMEOUT,
                     Some(TEST_TIMEOUT)
                 )

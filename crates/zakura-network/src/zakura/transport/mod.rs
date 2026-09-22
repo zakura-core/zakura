@@ -7,6 +7,7 @@ mod clock;
 mod frame;
 mod guard;
 mod io;
+mod message_rule;
 mod pipe;
 mod registry;
 mod service;
@@ -25,6 +26,8 @@ pub(crate) use io::{
     worker_framed_channel, FrameGuard, FrameWriteClaim, FramedWorkerRecv, GuardedReserveError,
     OrderedStreamFailure, OrderedStreamFailureCause, QueuedFrame,
 };
+pub(crate) use message_rule::{FrameFilter, InboundReader};
+pub use message_rule::{FrameRejection, MessageRole, MessageRule, PayloadLen};
 pub(crate) use pipe::{
     handle_pipe_exit, spawn_supervised_peer_task, spawn_supervised_pipe, CloseCause, Edge, Flow,
     Node, NodeKind, Pipe, PipeCx, PipeShape,

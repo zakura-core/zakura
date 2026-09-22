@@ -18,6 +18,24 @@ pub const MSG_BS_BLOCKS_DONE: u8 = 4;
 /// Report that a requested range is not servable.
 pub const MSG_BS_RANGE_UNAVAILABLE: u8 = 5;
 
+/// Stream-6 message rules, checked from each frame header.
+///
+/// `Status` is a 1-byte discriminator plus 52 status bytes. The range messages
+/// are a discriminator, a height, and a count. `Block` carries one block body
+/// no larger than [`block::MAX_BLOCK_BYTES`]. The `as u16` casts widen u8
+/// discriminators, which is lossless.
+pub const BLOCK_SYNC_MESSAGE_RULES: [MessageRule; 5] = [
+    MessageRule::announcement(MSG_BS_STATUS as u16, PayloadLen::exact(53)),
+    MessageRule::request(MSG_BS_GET_BLOCKS as u16, PayloadLen::exact(9)),
+    // The block maximum fits usize: `MAX_BS_MESSAGE_BYTES` is a usize above it.
+    MessageRule::response(
+        MSG_BS_BLOCK as u16,
+        PayloadLen::between(2, 1 + block::MAX_BLOCK_BYTES as usize),
+    ),
+    MessageRule::response(MSG_BS_BLOCKS_DONE as u16, PayloadLen::exact(9)),
+    MessageRule::response(MSG_BS_RANGE_UNAVAILABLE as u16, PayloadLen::exact(9)),
+];
+
 /// Maximum block bodies ever requested or reported by stream 6.
 pub const MAX_BS_BLOCKS_PER_REQUEST: u32 = 128;
 /// Maximum encoded stream-6 message bytes.

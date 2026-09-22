@@ -1405,7 +1405,10 @@ impl DiskDb {
     /// Writes `batch` to the database and publishes its retained-body floor.
     /// Body pruning must use this path so the floor is visible before callers publish a new tip.
     pub(crate) fn write(&self, batch: DiskWriteBatch) -> Result<(), rocksdb::Error> {
+        let write_profile = zakura_jsonl_trace::block_profile::Context::current()
+            .span(zakura_jsonl_trace::block_profile::Stage::RocksdbWrite);
         self.db.write(batch.batch)?;
+        drop(write_profile);
         // Header/full-state callers publish their new tip after this returns.
         // Publishing the floor first prevents a new tip using the previous floor.
         self.publish_retained_block_height();

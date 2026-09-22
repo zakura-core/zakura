@@ -22,6 +22,8 @@ use std::{
     },
 };
 
+use zakura_jsonl_trace::block_profile as profiles;
+
 use zakura_chain::{
     block, ironwood, orchard,
     parallel::tree::NoteCommitmentTrees,
@@ -846,6 +848,8 @@ impl FinalizedState {
             VctAuthenticationProof,
         ) -> Result<(), CommitCheckpointVerifiedError>,
     {
+        let prepare_profile =
+            profiles::Context::current().span(profiles::Stage::FinalizedBlockPrepare);
         let mut vct_authentication = VctAuthenticationProof::NotAuthenticated;
         let (height, hash, finalized, prev_note_commitment_trees, retention, fast_write) =
             match finalizable_block {
@@ -1359,6 +1363,7 @@ impl FinalizedState {
         // round-trip; its internal rayon uses the global pool instead. Measured net
         // win on the sandblast region (see PR).
         let network = self.network();
+        drop(prepare_profile);
         let result = self.db.write_block_with(
             finalized,
             prev_note_commitment_trees,

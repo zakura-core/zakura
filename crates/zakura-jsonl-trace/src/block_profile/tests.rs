@@ -128,3 +128,47 @@ fn transaction_fanout_cannot_displace_writer_phases() {
         })
     ));
 }
+
+#[test]
+fn finalization_children_keep_their_parent_after_caller_completion() {
+    let (r, detail, summary) = recorder();
+    let root = begin_with(&r, block()).unwrap();
+    let context = root.context();
+    root.finish(Outcome::Success);
+    let finalization = context.span(Stage::Finalization);
+    finalization.context().in_scope(|| {
+        let commit = Context::current().span(Stage::FinalizedCommit);
+        commit.context().in_scope(|| {
+            drop(Context::current().span(Stage::RocksdbWrite));
+        });
+    });
+    drop(finalization);
+    drop(context);
+    let events: Vec<_> = detail.try_iter().collect();
+    assert_eq!(events.len(), 3);
+    let mut links = Vec::new();
+    for event in events {
+        let encoded = serde_json::to_vec(&event).unwrap();
+        let Event::Span {
+            span,
+            parent,
+            stage,
+            ..
+        } = serde_json::from_slice(&encoded).unwrap()
+        else {
+            panic!("finalization emits span events");
+        };
+        links.push((span, parent, stage));
+    }
+    assert_eq!(links[0], (3, 2, Stage::RocksdbWrite));
+    assert_eq!(links[1], (2, 1, Stage::FinalizedCommit));
+    assert_eq!(links[2], (1, 0, Stage::Finalization));
+    assert!(matches!(
+        summary.try_iter().last(),
+        Some(Event::Seal {
+            spans: 3,
+            dropped: 0,
+            ..
+        })
+    ));
+}

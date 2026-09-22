@@ -17,6 +17,7 @@ use std::{
 
 use chrono::{DateTime, Utc};
 use itertools::Itertools;
+use zakura_jsonl_trace::block_profile as profiles;
 
 use zakura_chain::{
     amount::NonNegative,
@@ -976,6 +977,8 @@ impl ZakuraDb {
     where
         C: FnOnce(&mut Self, DiskWriteBatch) -> Result<(), CommitCheckpointVerifiedError>,
     {
+        let profile = profiles::Context::current();
+        let input_profile = profile.span(profiles::Stage::FinalizedInputPrepare);
         let tx_hash_indexes: HashMap<transaction::Hash, usize> = finalized
             .transaction_hashes
             .iter()
@@ -1015,11 +1018,15 @@ impl ZakuraDb {
         // `None` it serializes inline (e.g. the semantic path).
         let store_raw_txs = retention.stores_raw_transactions();
         let db: &ZakuraDb = self;
+        drop(input_profile);
+        let parallel_profile = profile.span(profiles::Stage::FinalizedParallelReads);
+        let parallel_context = parallel_profile.context();
         let (spent_utxos, precomputed_raw_txs): (
             Vec<(transparent::OutPoint, OutputLocation, transparent::Utxo)>,
             Option<Vec<RawBytes>>,
         ) = rayon::join(
             || {
+                let _read_profile = parallel_context.span(profiles::Stage::FinalizedUtxoRead);
                 if outpoints.len() >= super::PARALLEL_BLOCK_READ_THRESHOLD {
                     use rayon::prelude::*;
                     outpoints
@@ -1050,6 +1057,7 @@ impl ZakuraDb {
                 }
             },
             || {
+                let _serialize_profile = parallel_context.span(profiles::Stage::FinalizedSerialize);
                 if store_raw_txs {
                     use rayon::prelude::*;
                     Some(
@@ -1066,6 +1074,8 @@ impl ZakuraDb {
             },
         );
 
+        drop(parallel_profile);
+        let address_profile = profile.span(profiles::Stage::FinalizedAddressRead);
         let spent_utxos_by_outpoint: HashMap<transparent::OutPoint, transparent::Utxo> =
             spent_utxos
                 .iter()
@@ -1141,6 +1151,9 @@ impl ZakuraDb {
             }))
         };
 
+        drop(address_profile);
+        let batch_profile = profile.span(profiles::Stage::FinalizedBatchPrepare);
+        let batch_scope = batch_profile.context().enter();
         let mut batch = DiskWriteBatch::new();
 
         // In case of errors, propagate and do not write the batch.
@@ -1161,6 +1174,10 @@ impl ZakuraDb {
             vct_data,
         )?;
 
+        drop(batch_scope);
+        drop(batch_profile);
+        let prune_profile = profile.span(profiles::Stage::FinalizedPrune);
+
         // In pruned storage mode, delete raw transaction history that has fallen
         // outside the retention window, and/or advance the pruning marker. This
         // goes in the same atomic batch as the tip advance, so pruning and the
@@ -1168,10 +1185,15 @@ impl ZakuraDb {
         // block commit path. In archive mode the plan is always `Store`, so this
         // is a no-op.
         retention.prepare_prune(&mut batch, self, &finalized);
+        drop(prune_profile);
 
         // Track batch commit latency for observability
         let batch_start = std::time::Instant::now();
+        let commit_profile = profile.span(profiles::Stage::FinalizedCommit);
+        let commit_scope = commit_profile.context().enter();
         commit(self, batch)?;
+        drop(commit_scope);
+        drop(commit_profile);
         metrics::histogram!("zakura.state.rocksdb.batch_commit.duration_seconds")
             .record(batch_start.elapsed().as_secs_f64());
 
@@ -1467,6 +1489,8 @@ impl DiskWriteBatch {
         precomputed_raw_txs: Option<Vec<RawBytes>>,
         vct_data: VctWriteData,
     ) -> Result<(), CommitCheckpointVerifiedError> {
+        let profile = profiles::Context::current();
+        let block_profile = profile.span(profiles::Stage::FinalizedBlockBatch);
         // Commit block, transaction, and note commitment tree data.
         self.prepare_block_header_and_transaction_data_batch(
             zakura_db,
@@ -1480,8 +1504,13 @@ impl DiskWriteBatch {
         // which is already present from height 1 to the first shielded transaction.
         //
         // In Zebra we include the nullifiers and note commitments in the genesis block because it simplifies our code.
+        drop(block_profile);
+        let nullifier_profile = profile.span(profiles::Stage::FinalizedNullifierBatch);
         self.prepare_shielded_transaction_batch(zakura_db, finalized);
+        drop(nullifier_profile);
+        let tree_profile = profile.span(profiles::Stage::FinalizedTreeBatch);
         self.prepare_trees_batch(zakura_db, finalized, prev_note_commitment_trees, vct_data)?;
+        drop(tree_profile);
 
         // # Consensus
         //
@@ -1494,6 +1523,7 @@ impl DiskWriteBatch {
         // for the genesis block. This also ignores genesis shielded value pool updates, but there
         // aren't any of those on mainnet or testnet.
         if !finalized.height.is_min() {
+            let _transparent_profile = profile.span(profiles::Stage::FinalizedTransparentBatch);
             // Commit transaction indexes
             self.prepare_transparent_transaction_batch(
                 zakura_db,
@@ -1508,6 +1538,7 @@ impl DiskWriteBatch {
             );
         }
 
+        let value_pool_profile = profile.span(profiles::Stage::FinalizedValuePoolBatch);
         // Commit UTXOs and value pools
         self.prepare_chain_value_pools_batch(
             zakura_db,
@@ -1516,6 +1547,7 @@ impl DiskWriteBatch {
             value_pool,
         )?;
 
+        drop(value_pool_profile);
         // The block has passed contextual validation, so update the metrics
         block_precommit_metrics(&finalized.block, finalized.hash, finalized.height);
 

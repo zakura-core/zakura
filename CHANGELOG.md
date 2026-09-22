@@ -11,6 +11,11 @@ independently.
 
 ## [Unreleased]
 
+### Added
+
+- Added an opt-in block profile explorer with finalization timings for state
+  updates, database preparation and writes, pruning, and publication.
+
 ## [1.5.0-rc0] - 2026-09-21
 
 ### Added

@@ -1217,8 +1217,12 @@ fn commit_contextual_finalization(
     live: &mut NonFinalizedState,
     prev_note_commitment_trees: Option<NoteCommitmentTrees>,
 ) -> Result<(block::Hash, NoteCommitmentTrees), CommitCheckpointVerifiedError> {
+    let profile = profiles::Context::current();
+    let clone_profile = profile.span(profiles::Stage::SnapshotClone);
     let mut staged = live.clone();
+    drop(clone_profile);
     let finalizable = staged.finalize();
+    let prepare_profile = profile.span(profiles::Stage::HeaderTransitionPrepare);
     let new_finalized = match &finalizable {
         FinalizableBlock::Contextual {
             contextually_verified,
@@ -1240,6 +1244,7 @@ fn commit_contextual_finalization(
         .frontiers
         .verified_best;
     let new_verified_path = verified_path(&staged);
+    drop(prepare_profile);
     finalized_state.commit_finalized_direct_with(
         finalizable,
         prev_note_commitment_trees,
@@ -3081,7 +3086,9 @@ impl WriteBlockWorkerTask {
             let _ = rsp_tx.send(result.map(|()| child_hash).map_err(Into::into));
 
             drop(publication_profile);
-            let _finalization_profile = profile.span(profiles::Stage::Finalization);
+            let finalization_profile =
+                profiles::Context::current().span(profiles::Stage::Finalization);
+            let finalization_scope = finalization_profile.context().enter();
             while non_finalized_state
                 .best_chain_len()
                 .expect("just successfully inserted a non-finalized block above")
@@ -3114,6 +3121,8 @@ impl WriteBlockWorkerTask {
                         return header_chain_finalization_failure(error);
                     }
                 };
+                let _publication =
+                    profiles::Context::current().span(profiles::Stage::FinalizationPublication);
                 // Finalization drops side chains that fork below the new finalized tip,
                 // so readers must not keep seeing them in the published state.
                 update_latest_chain_channels(
@@ -3123,6 +3132,9 @@ impl WriteBlockWorkerTask {
                     backup_dir_path.as_deref(),
                 );
             }
+
+            drop(finalization_scope);
+            drop(finalization_profile);
 
             // Update the metrics if semantic and contextual validation passes
             //

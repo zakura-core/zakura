@@ -159,6 +159,46 @@ pub enum Stage {
     Publication,
     /// Finalizing older blocks after a semantic response.
     Finalization,
+    /// Removing the oldest block and obsolete forks from memory.
+    FinalizeState,
+    /// Copying the best chain before removing its root.
+    FinalizeChainClone,
+    /// Removing the best chain root and extracting its tree state.
+    FinalizeRoot,
+    /// Updating or dropping side chains and invalidated blocks.
+    FinalizeForks,
+    /// Preparing a finalized block, retention plan, and cached trees.
+    FinalizedBlockPrepare,
+    /// Preparing transaction and output indexes for the write.
+    FinalizedInputPrepare,
+    /// Waiting for spent-output reads and transaction serialization.
+    FinalizedParallelReads,
+    /// Reading spent outputs, including parallel worker scheduling.
+    FinalizedUtxoRead,
+    /// Serializing retained transactions, including parallel worker scheduling.
+    FinalizedSerialize,
+    /// Preparing spent-output maps and reading address balances.
+    FinalizedAddressRead,
+    /// Building the database batch before it is committed.
+    FinalizedBatchPrepare,
+    /// Encoding block headers and retained transaction data.
+    FinalizedBlockBatch,
+    /// Encoding shielded nullifiers.
+    FinalizedNullifierBatch,
+    /// Encoding note commitment trees and anchors.
+    FinalizedTreeBatch,
+    /// Encoding transparent indexes and UTXO updates.
+    FinalizedTransparentBatch,
+    /// Encoding chain value pools.
+    FinalizedValuePoolBatch,
+    /// Adding historical-data deletions and pruning markers to the batch.
+    FinalizedPrune,
+    /// Committing the batch, including any header-state transition.
+    FinalizedCommit,
+    /// The RocksDB write call, excluding batch preparation.
+    RocksdbWrite,
+    /// Publishing the state after finalization, including synchronous backups.
+    FinalizationPublication,
 }
 
 /// One attempt's immutable identity. Hashes use their native byte representation on the wire.

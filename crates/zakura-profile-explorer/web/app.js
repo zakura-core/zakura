@@ -68,8 +68,35 @@ async function openDetail(run,attempt) {
   if(row.end_us != null) lanes.push({stage:'Verifier request',start_us:start,end_us:row.end_us,root:true});
   lanes.push(...spans);
   $('timeline').replaceChildren(...lanes.map(s=>{const lane=el('div',null,`lane${s.root?' root':''}`), track=el('div',null,'lane-bar'),bar=el('div',null,'bar');bar.style.left=`${Math.max(0,(s.start_us-start)/duration*100)}%`;bar.style.width=`${Math.max(0,(s.end_us-s.start_us)/duration*100)}%`;bar.title=`${ms(s.start_us-start)} → ${ms(s.end_us-start)}`;track.append(bar);lane.append(el('span',s.stage.replaceAll('_',' '),'lane-name'),track,el('span',ms(s.end_us-s.start_us)));return lane;}));
+  renderFinalization(spans);
   renderCpu(data.cpu);
   $('detail').scrollIntoView({behavior:'smooth'});
+}
+const finalizationLabels = {
+  finalize_state: 'Move block out of memory', finalize_chain_clone: 'Copy the best chain',
+  finalize_root: 'Remove oldest block', finalize_forks: 'Update forks and invalidated blocks',
+  finalized_block_prepare: 'Prepare finalized block', finalized_input_prepare: 'Prepare output indexes',
+  finalized_parallel_reads: 'Read outputs and serialize transactions', finalized_utxo_read: 'Read spent outputs',
+  finalized_serialize: 'Serialize transactions', finalized_address_read: 'Read address balances',
+  finalized_batch_prepare: 'Build database batch', finalized_block_batch: 'Encode block and transactions',
+  finalized_nullifier_batch: 'Encode nullifiers', finalized_tree_batch: 'Encode trees and anchors',
+  finalized_transparent_batch: 'Encode transparent indexes', finalized_value_pool_batch: 'Encode value pools',
+  finalized_prune: 'Prepare historical-data pruning', finalized_commit: 'Commit finalized state',
+  rocksdb_write: 'Write RocksDB batch', finalization_publication: 'Publish updated state',
+  snapshot_clone: 'Copy state snapshot', header_transition_prepare: 'Prepare header transition'
+};
+function renderFinalization(spans) {
+  const host=$('finalization'); host.replaceChildren();
+  const root=spans.find(s=>s.stage==='finalization'); if(!root)return;
+  host.append(el('h2','Finalization breakdown'),el('p',`${ms(root.end_us-root.start_us)} total. This moves older blocks into finalized storage and can continue after the verifier responds.`,'muted'));
+  const children=new Map();
+  for(const span of spans){if(!children.has(span.parent))children.set(span.parent,[]);children.get(span.parent).push(span);}
+  if(!children.get(root.span)?.length){host.append(el('p','Detailed finalization timings were not recorded for this block. New recordings include this breakdown.','muted'));return;}
+  const t=el('table'),head=el('tr');for(const title of ['Step','Elapsed','Share of finalization'])head.append(el('th',title));
+  const thead=el('thead');thead.append(head);t.append(thead);const body=el('tbody'),seen=new Set([root.span]);
+  function visit(parent,depth){if(depth>8)return;for(const span of children.get(parent)||[]){if(seen.has(span.span))continue;seen.add(span.span);const row=el('tr'),name=el('td',`${'↳ '.repeat(depth)}${finalizationLabels[span.stage]||span.stage.replaceAll('_',' ')}`),elapsed=span.end_us-span.start_us;
+    row.append(name,el('td',ms(elapsed)),el('td',`${(100*elapsed/Math.max(1,root.end_us-root.start_us)).toFixed(1)}%`));body.append(row);visit(span.span,depth+1);}}
+  visit(root.span,0);t.append(body);const wrap=el('div',null,'table-wrap');wrap.append(t);host.append(wrap,el('p','Indented rows are included in their parent. Parallel reads and serialization overlap. Do not add every row together.','muted'));
 }
 function renderCpu(cpu) {
   const host=$('cpu');host.replaceChildren();

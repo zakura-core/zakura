@@ -355,6 +355,9 @@ impl NonFinalizedState {
     /// Finalize the lowest height block in the non-finalized portion of the best
     /// chain and update all side-chains to match.
     pub fn finalize(&mut self) -> FinalizableBlock {
+        let state_profile = profiles::Context::current().span(profiles::Stage::FinalizeState);
+        let profile = state_profile.context();
+        let clone_profile = profile.span(profiles::Stage::FinalizeChainClone);
         // Chain::cmp uses the partial cumulative work, and the hash of the tip block.
         // Neither of these fields has interior mutability.
         // (And when the tip block is dropped for a chain, the chain is also dropped.)
@@ -367,6 +370,8 @@ impl NonFinalizedState {
 
         // clone if required
         let mut_best_chain = Arc::make_mut(&mut best_chain);
+        drop(clone_profile);
+        let root_profile = profile.span(profiles::Stage::FinalizeRoot);
 
         // extract the rest into side_chains so they can be mutated
         let side_chains = chains;
@@ -379,6 +384,9 @@ impl NonFinalizedState {
         if !best_chain.is_empty() {
             self.insert(best_chain);
         }
+
+        drop(root_profile);
+        let _forks_profile = profile.span(profiles::Stage::FinalizeForks);
 
         // for each remaining chain in side_chains
         for mut side_chain in side_chains.rev() {

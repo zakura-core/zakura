@@ -2,7 +2,8 @@
 const $ = (id) => document.getElementById(id);
 const number = (n) => Number(n || 0).toLocaleString();
 const ms = (n) => `${(n / 1000).toFixed(1)} ms`;
-const blockUrl = (run,attempt) => `/block/${encodeURIComponent(run)}/${encodeURIComponent(attempt)}`;
+const recordingUrl = (run,attempt) => `/block/${encodeURIComponent(run)}/${encodeURIComponent(attempt)}`;
+const blockUrl = (row,byHash=false) => row.height!=null && !byHash ? `/block/${row.height}` : row.hash ? `/block/${encodeURIComponent(row.hash)}` : recordingUrl(row.run,row.attempt);
 const el = (tag, text, cls) => { const n = document.createElement(tag); if (text != null) n.textContent = text; if (cls) n.className = cls; return n; };
 let loading = false;
 async function api(path) { const response = await fetch(path); if (!response.ok) throw Error(await response.text()); return response.json(); }
@@ -24,7 +25,7 @@ function table(target, rows) {
   for (const title of ['Block','Hash','Observed','Transactions','Verifier response','Evidence']) head.append(el('th',title));
   const thead = el('thead'); thead.append(head); t.append(thead); const body = el('tbody');
   for (const row of rows) {
-    const tr = el('tr'), link = el('a',row.height == null ? 'Unknown height' : number(row.height)); link.href = blockUrl(row.run,row.attempt);
+    const tr = el('tr'), link = el('a',row.height == null ? 'Unknown height' : number(row.height)); link.href = blockUrl(row,target==='results');
     const first = el('td'); first.append(link); tr.append(first);
     const duration = row.end_us == null ? null : row.end_us-row.start_us;
     tr.append(el('td',row.hash ? `${row.hash.slice(0,12)}…` : '—','hash'),el('td', row.utc_ms ? new Date(row.utc_ms).toLocaleString() : 'Unknown'),el('td',number(row.transactions)),el('td',row.exclusion_reason ? 'Excluded' : duration == null ? 'Pending' : ms(duration),duration >= 500000 ? 'slow' : ''),el('td',quality(row)));
@@ -88,13 +89,20 @@ function renderMetadata(row,recording) {
 }
 async function loadBlockPage() {
   const linked=/^\/block\/([a-f0-9]{32})\/(\d{1,20})$/.exec(location.pathname);
-  if(linked)return openDetail(linked[1],linked[2]);
-  const query=(new URLSearchParams(location.search).get('q')||'').trim();
+  const block=/^\/block\/([0-9]{1,10}|[a-f0-9]{64})$/.exec(location.pathname);
+  let query=block?.[1] || (new URLSearchParams(location.search).get('q')||'').trim(), preferredHash;
+  if(linked){
+    const {summary}=await api(`/api/attempt/${linked[1]}/${linked[2]}`);
+    if(summary.height==null && !summary.hash)return openDetail(linked[1],linked[2]);
+    query=String(summary.height ?? summary.hash);preferredHash=summary.hash;
+  }
   $('query').value=query;
   if(!query){$('lookup-title').textContent='Find a block';$('lookup-copy').textContent='Enter a block height or full hash above to open its latest recorded breakdown.';return;}
-  const rows=await api(`/api/search?q=${encodeURIComponent(query)}`);
+  let rows=await api(`/api/search?q=${encodeURIComponent(query)}`);
+  // An old link still identifies the same block if multiple forks share its height.
+  if(preferredHash && (rows.length!==1 || rows[0].hash!==preferredHash)){query=preferredHash;rows=await api(`/api/search?q=${encodeURIComponent(query)}`);}
   if(rows.length===1){
-    history.replaceState(null,'',blockUrl(rows[0].run,rows[0].attempt));
+    history.replaceState(null,'',blockUrl(rows[0],query.length===64));
     return openDetail(rows[0].run,rows[0].attempt);
   }
   $('lookup-title').textContent=rows.length?'Choose a block':'No recorded block found';
@@ -177,7 +185,7 @@ function renderCpu(cpu) {
 }
 if(document.body.dataset.page==='home'){
   const legacy=/^#([a-f0-9]{32})\/(\d{1,20})$/.exec(location.hash);
-  if(legacy)location.replace(blockUrl(legacy[1],legacy[2]));
+  if(legacy)location.replace(recordingUrl(legacy[1],legacy[2]));
   else{refresh();setInterval(refresh,10000);}
 }else{
   loadBlockPage().catch(error=>{$('lookup-title').textContent='Block unavailable';note(error.message);});

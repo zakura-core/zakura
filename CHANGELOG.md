@@ -17,10 +17,11 @@ independently.
   updates, database preparation and writes, pruning, and publication. Timeline
   detail opens on a dedicated block page, expands on demand, and shows total
   recorded time, with metadata and downloads collapsed. Home starts with the
-  latest blocks and search, and follows the
-  current profile automatically without session or route controls. Searches
-  prefer the latest recording per block. Known measurement interference is labeled and
-  excluded from timing statistics, and bounded collector batches reduce capture loss.
+  latest blocks and search, and follows the current profile automatically
+  without session or route controls. Block URLs use height or hash and always
+  resolve the latest recording, including links to older recordings. Known
+  measurement interference is labeled and excluded from timing statistics, and
+  bounded collector batches reduce capture loss.
 
 ## [1.5.0-rc0] - 2026-09-21
 

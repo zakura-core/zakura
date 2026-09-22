@@ -10,7 +10,7 @@ target/debug/zakura-profile-explorer collect --store /tmp/block-profiles --socke
 target/debug/zakura-profile-explorer serve --store /tmp/block-profiles
 ```
 
-Open `http://127.0.0.1:8787`. Configure the node with `[block_profile] socket = "/tmp/block-profiles/node.sock"` in TOML, or run the synthetic `zakura-jsonl-trace` example. The collector must own a private store and socket directory. The web server binds to localhost. Use SSH forwarding for a remote viewer.
+Open `http://127.0.0.1:8787`. Set the node’s `block_profile.socket` field to `"/tmp/block-profiles/node.sock"` in its TOML configuration, or run the synthetic `zakura-jsonl-trace` example. The collector must own a private store and socket directory. The web server binds to localhost. Use SSH forwarding for a remote viewer.
 
 A block detail page shows overlapping elapsed spans, their evidence completeness, and JSON/Perfetto exports. Retained timestamped CPU captures add a process flamegraph. It includes other blocks and background work and never claims exclusive CPU ownership from elapsed intervals.
 

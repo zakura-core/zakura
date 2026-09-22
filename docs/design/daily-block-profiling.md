@@ -1,6 +1,6 @@
 # Daily block profiling and explorer
 
-Status: architecture accepted in principle on September 22, 2026, with a recent-blocks/outliers home page and on-demand DigitalOcean deployment. Design updated with those preferences. An initial implementation is in progress. See [the operator runbook](../../deploy/block-profile/README.md) for implemented coverage, current limits, and canary gates. Deployment has not started.
+Status: architecture accepted in principle on September 22, 2026, with a recent-blocks/outliers home page and on-demand DigitalOcean deployment. Design updated with those preferences. The initial implementation is available in draft PRs [#1111](https://github.com/zakura-core/zakura/pull/1111), [#1112](https://github.com/zakura-core/zakura/pull/1112), and [#1113](https://github.com/zakura-core/zakura/pull/1113). See [the operator runbook](../../deploy/block-profile/README.md) for implemented coverage, current limits, and canary gates. Deployment has not started.
 
 Prepared September 22, 2026. Source inspection is pinned to Zakura [`d4997d9dd43f269008b85542d708344b9acbb54e`](https://github.com/zakura-core/zakura/tree/d4997d9dd43f269008b85542d708344b9acbb54e), fetched at approximately 15:54 UTC. The working checkout has an unrelated unfinished merge, so this proposal was grounded in a separate export of that revision.
 

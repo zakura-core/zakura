@@ -1009,6 +1009,7 @@ class ContinuousSyncTests(unittest.TestCase):
 
         self.assertIn('p2p_stack = "zakura"', rendered["zakurad.toml.template"])
         self.assertIn('mode_label = "Zakura/v2-only"', rendered["controller.toml"])
+        self.assertTrue(tomllib.loads(rendered["controller.toml"])["policy"]["archive_traces"])
         self.assertIn("stall_seconds = 600", rendered["controller.toml"])
         self.assertIn("status_unavailable_seconds = 600", rendered["controller.toml"])
         self.assertIn("[[nodes]]", rendered["alert-monitor.toml"])
@@ -1097,6 +1098,7 @@ p2p_stack = "zakura"
         self.assertIn('p2p_stack = "legacy"', rendered["zakurad.toml.template"])
         self.assertIn('mode_label = "Zebra/legacy-only"', rendered["controller.toml"])
         self.assertIn('branch = "v1.5.0-rc0"', rendered["controller.toml"])
+        self.assertFalse(tomllib.loads(rendered["controller.toml"])["policy"]["archive_traces"])
         self.assertEqual(rendered["alert-monitor.toml"].count("[[nodes]]"), 3)
         for index in [1, 2, 5]:
             self.assertIn(

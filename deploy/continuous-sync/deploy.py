@@ -157,6 +157,7 @@ def subst_for(node: Node) -> dict[str, str]:
         "ALERT_THROTTLE_SECONDS": str(raw["alert_throttle_seconds"]),
         "DOWN_CONFIRMATION_SAMPLES": str(raw["down_confirmation_samples"]),
         "CLUSTER_STALL_SECONDS": str(raw["cluster_stall_seconds"]),
+        "ARCHIVE_TRACES": str(raw.get("archive_traces", True)).lower(),
         "BRANCH": str(raw["branch"]),
         "REMOTE": str(raw["remote"]),
         "SERVICE_NAME": str(raw["service_name"]),

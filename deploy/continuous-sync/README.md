@@ -541,7 +541,12 @@ For a fresh Ubuntu x86_64 host:
 
 ## Trace archives
 
-New controller deployments enable `policy.archive_traces`. Install the AWS CLI
+Controller deployments enable `policy.archive_traces` unless a node sets
+`archive_traces = false` in `nodes.toml`. Nodes 1 and 5 temporarily retain traces
+locally until their Spaces credentials can read the bucket lifecycle policy.
+Remove those overrides after repairing the credentials.
+
+Install the AWS CLI
 on each sync host. Set these values in `/etc/zakura-traces.env` (mode 0600):
 
 ```sh

@@ -66,6 +66,8 @@ ssh_string = "root@138.68.43.212"
 alias = "temp-zakura-sync-test-1"
 public_ip = "138.68.43.212"
 mode_label = "dual-stack"
+# Keep traces locally until Spaces credentials can read the lifecycle policy.
+archive_traces = false
 p2p_stack = "dual"
 poll_interval_seconds = 10
 
@@ -87,5 +89,6 @@ ssh_string = "root@142.93.27.189"
 alias = "temp-zakura-sync-test-5"
 public_ip = "142.93.27.189"
 mode_label = "Zebra/legacy-only"
+archive_traces = false
 p2p_stack = "legacy"
 stall_seconds = 1800

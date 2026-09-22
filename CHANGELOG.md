@@ -15,7 +15,8 @@ independently.
 
 - Added an opt-in block profile explorer with finalization timings for state
   updates, database preparation and writes, pruning, and publication. Timeline
-  detail expands on demand and shows total recorded time. Searches prefer the
+  detail opens on a dedicated block page, expands on demand, and shows total
+  recorded time. Searches prefer the
   latest recording per block, known measurement interference is labeled and
   excluded from timing statistics, and bounded collector batches reduce capture loss.
 

@@ -625,6 +625,12 @@ impl Reader {
     }
     pub(crate) fn detail(&self, run: &str, attempt: u64) -> Result<Value> {
         ensure!(valid_id(run), "invalid run");
+        let recording: Value = self
+            .db
+            .query_row("SELECT metadata FROM runs WHERE id=?", [run], |r| {
+                r.get::<_, String>(0)
+            })?
+            .parse()?;
         let summary = self.db.query_row(
             &format!("{COLUMNS} WHERE run=? AND attempt=?"),
             params![run, integer(attempt)?],
@@ -704,7 +710,7 @@ impl Reader {
             "valid":summary["exclusion_reason"].is_null(),
         });
         Ok(
-            json!({"summary":summary,"spans":spans,"complete":complete,"missing_chunks":missing,"cpu":cpu,"timing":timing,"boundary":"Verifier request measures router entry to caller result. Total recorded time extends through the last recorded work, including finalization after the response. Caller readiness, network and ingress are outside both intervals. Missing detail can leave the total understated."}),
+            json!({"summary":summary,"recording":recording,"spans":spans,"complete":complete,"missing_chunks":missing,"cpu":cpu,"timing":timing,"boundary":"Verifier request measures router entry to caller result. Total recorded time extends through the last recorded work, including finalization after the response. Caller readiness, network and ingress are outside both intervals. Missing detail can leave the total understated."}),
         )
     }
     pub(crate) fn search(&self, query: &str) -> Result<Value> {

@@ -2,6 +2,7 @@
 const $ = (id) => document.getElementById(id);
 const number = (n) => Number(n || 0).toLocaleString();
 const ms = (n) => `${(n / 1000).toFixed(1)} ms`;
+const blockUrl = (run,attempt) => `/block/${encodeURIComponent(run)}/${encodeURIComponent(attempt)}`;
 const el = (tag, text, cls) => { const n = document.createElement(tag); if (text != null) n.textContent = text; if (cls) n.className = cls; return n; };
 let selected = '', loading = false;
 async function api(path) { const response = await fetch(path); if (!response.ok) throw Error(await response.text()); return response.json(); }
@@ -23,8 +24,7 @@ function table(target, rows) {
   for (const title of ['Block','Hash','Observed','Transactions','Verifier response','Evidence']) head.append(el('th',title));
   const thead = el('thead'); thead.append(head); t.append(thead); const body = el('tbody');
   for (const row of rows) {
-    const tr = el('tr'), link = el('a',row.height == null ? 'Unknown height' : number(row.height)); link.href = `#${row.run}/${row.attempt}`;
-    link.addEventListener('click', e => { e.preventDefault(); openDetail(row.run,row.attempt).catch(e=>note(e.message)); });
+    const tr = el('tr'), link = el('a',row.height == null ? 'Unknown height' : number(row.height)); link.href = blockUrl(row.run,row.attempt);
     const first = el('td'); first.append(link); tr.append(first);
     const duration = row.end_us == null ? null : row.end_us-row.start_us;
     tr.append(el('td',row.hash ? `${row.hash.slice(0,12)}…` : '—','hash'),el('td', row.utc_ms ? new Date(row.utc_ms).toLocaleString() : 'Unknown'),el('td',number(row.transactions)),el('td',row.exclusion_reason ? 'Excluded' : duration == null ? 'Pending' : ms(duration),duration >= 500000 ? 'slow' : ''),el('td',quality(row)));
@@ -58,11 +58,13 @@ async function refresh() {
   finally { loading=false; }
 }
 async function openDetail(run,attempt) {
-  if(selected!==run){selected=run;await refresh();}
   const data=await api(`/api/attempt/${run}/${attempt}`), row=data.summary;
+  $('lookup').hidden=true;
   $('detail').hidden=false; $('detail-title').textContent=`Block ${number(row.height)}`;
+  document.title=`Block ${number(row.height)} · Zakura`;
   $('detail-meta').textContent=`${row.hash} · ${row.outcome || 'unfinished'} · ${quality(row)} · run ${row.run}`;
-  history.replaceState(null,'',`#${run}/${attempt}`);
+  const recording=data.recording;
+  $('detail-cohort').textContent=`${recording.network} · ${recording.storage} · ${recording.build} · Recorded ${new Date(row.utc_ms).toLocaleString()}`;
   $('boundary').textContent=data.boundary;
   $('detail-warning').hidden=!row.exclusion_reason;
   $('detail-warning').textContent=row.exclusion_reason ? `Timing excluded from rankings and percentiles. ${row.exclusion_reason} Raw intervals are preserved below and include this interference.` : '';
@@ -76,7 +78,22 @@ async function openDetail(run,attempt) {
   const end=Math.max(row.end_us||start,...spans.map(s=>s.end_us)), duration=Math.max(end-start,1);
   renderTimeline(spans,row,start,duration);
   renderCpu(data.cpu);
-  $('detail').scrollIntoView({behavior:'smooth'});
+}
+async function loadBlockPage() {
+  const linked=/^\/block\/([a-f0-9]{32})\/(\d{1,20})$/.exec(location.pathname);
+  if(linked)return openDetail(linked[1],linked[2]);
+  const query=(new URLSearchParams(location.search).get('q')||'').trim();
+  $('query').value=query;
+  if(!query){$('lookup-title').textContent='Find a block';$('lookup-copy').textContent='Enter a block height or full hash above to open its latest recorded breakdown.';return;}
+  const rows=await api(`/api/search?q=${encodeURIComponent(query)}`);
+  if(rows.length===1){
+    history.replaceState(null,'',blockUrl(rows[0].run,rows[0].attempt));
+    return openDetail(rows[0].run,rows[0].attempt);
+  }
+  $('lookup-title').textContent=rows.length?'Choose a block':'No recorded block found';
+  $('lookup-copy').textContent=rows.length?'Different block hashes were recorded at this height. Choose the block to inspect.':'Try another height or full hash. Only retained recordings can be shown.';
+  document.title=`${$('lookup-title').textContent} · Zakura`;
+  if(rows.length)table('results',rows);
 }
 const finalizationLabels = {
   finalize_state: 'Move block out of memory', finalize_chain_clone: 'Copy the best chain',
@@ -151,11 +168,14 @@ function renderCpu(cpu) {
     branch(root,0,0,1000);graph.append(svg,el('p','Widths are sample counts, not milliseconds. Showing the top 200 stacks and up to 18 frames. Click to zoom.'));}
   reset.addEventListener('click',()=>draw(tree));draw(tree);
 }
-$('run').addEventListener('change',()=>{selected=$('run').value;refresh();});
-$('mode').addEventListener('change',refresh);
-$('close').addEventListener('click',()=>{$('detail').hidden=true;history.replaceState(null,'',location.pathname);});
-$('search').addEventListener('submit',async e=>{e.preventDefault();try{table('results',await api(`/api/search?q=${encodeURIComponent($('query').value.trim())}`));$('search-results').hidden=false;$('search-results').scrollIntoView({behavior:'smooth'});}catch(error){note(error.message);}});
-const linked=/^#([a-f0-9]{32})\/(\d+)$/.exec(location.hash);
-if(linked)selected=linked[1];
-refresh();setInterval(refresh,10000);
-if(linked)openDetail(linked[1],linked[2]).catch(e=>note(e.message));
+if(document.body.dataset.page==='home'){
+  const legacy=/^#([a-f0-9]{32})\/(\d{1,20})$/.exec(location.hash);
+  if(legacy)location.replace(blockUrl(legacy[1],legacy[2]));
+  else{
+    $('run').addEventListener('change',()=>{selected=$('run').value;refresh();});
+    $('mode').addEventListener('change',refresh);
+    refresh();setInterval(refresh,10000);
+  }
+}else{
+  loadBlockPage().catch(error=>{$('lookup-title').textContent='Block unavailable';note(error.message);});
+}

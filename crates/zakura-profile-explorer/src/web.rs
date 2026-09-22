@@ -95,6 +95,8 @@ pub(crate) async fn serve(path: PathBuf, port: u16) -> Result<()> {
     };
     let router = Router::new()
         .route("/",get(|| async { Html(include_str!("../web/index.html")) }))
+        .route("/block",get(|| async { Html(include_str!("../web/block.html")) }))
+        .route("/block/{run}/{attempt}",get(|| async { Html(include_str!("../web/block.html")) }))
         .route("/app.js",get(|| async { ([(header::CONTENT_TYPE,"text/javascript")],include_str!("../web/app.js")) }))
         .route("/style.css",get(|| async { ([(header::CONTENT_TYPE,"text/css")],include_str!("../web/style.css")) }))
         .route("/api/home",get(home)).route("/api/search",get(search))

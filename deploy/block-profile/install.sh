@@ -24,8 +24,10 @@ install -d -m 2770 -o zakura-profile -g zakura-profile /srv/zakura-profile/data
 install -d -m 2700 -o zakura-profile -g zakura-profile /srv/zakura-profile/data/reports
 # 97,656,250 KiB is exactly 100,000,000,000 bytes. Group ownership covers every producer.
 setquota -g zakura-profile 87890625 97656250 0 0 /srv/zakura-profile
-quota_state=$(LC_ALL=C quotaon -p -g /srv/zakura-profile)
-[[ "$quota_state" == *" is on" ]] || {
+# quotaon --print-state returns the number of enabled quota types, not success/failure.
+quota_status=0
+quota_state=$(LC_ALL=C quotaon -p -g /srv/zakura-profile) || quota_status=$?
+[[ "$quota_status" == 1 && "$quota_state" == *" is on" ]] || {
   echo 'Group quota enforcement is not confirmed. Enable it before installing profiler services.' >&2
   exit 1
 }

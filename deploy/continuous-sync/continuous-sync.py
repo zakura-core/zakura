@@ -382,7 +382,7 @@ def resolve_sha(config: Config) -> str:
     policy = config.policy
     run(["git", "fetch", "--prune", policy.remote, policy.branch], cwd=config.paths.repo_dir)
     result = run(
-        ["git", "rev-parse", "--verify", f"{policy.remote}/{policy.branch}^{{commit}}"],
+        ["git", "rev-parse", "--verify", "FETCH_HEAD^{commit}"],
         cwd=config.paths.repo_dir,
         capture=True,
     )

@@ -19,7 +19,7 @@ on:
         description: "Commit, branch, or tag to test"
         required: false
         type: string
-        default: main
+        default: v1.5.0-rc0
   workflow_dispatch:
     inputs:
       notify:
@@ -29,7 +29,7 @@ on:
       target_ref:
         description: "Commit, branch, or tag to test"
         required: false
-        default: main
+        default: v1.5.0-rc0
   schedule:
     - cron: "0 12 * * *"
 
@@ -38,7 +38,7 @@ permissions:
   pull-requests: write
 
 concurrency:
-  group: zakura-vct-handoff-canary-${{ inputs.target_ref || github.event.pull_request.head.sha || 'main' }}
+  group: zakura-vct-handoff-canary-${{ inputs.target_ref || github.event.pull_request.head.sha || 'v1.5.0-rc0' }}
   cancel-in-progress: false
 
 jobs:
@@ -60,7 +60,7 @@ jobs:
       contents: read
       pull-requests: write
     with:
-      ref: ${{ inputs.target_ref || github.event.pull_request.head.sha || 'main' }}
+      ref: ${{ inputs.target_ref || github.event.pull_request.head.sha || 'v1.5.0-rc0' }}
       snapshot_mode: pre-checkpoint
       network: mainnet
       duration_minutes: "60"
@@ -80,7 +80,7 @@ jobs:
       contents: read
     env:
       SLACK_WEB_HOOK: ${{ secrets.SLACK_WEB_HOOK }}
-      TARGET_REF: ${{ inputs.target_ref || github.event.pull_request.head.sha || 'main' }}
+      TARGET_REF: ${{ inputs.target_ref || github.event.pull_request.head.sha || 'v1.5.0-rc0' }}
       FAILURE_PHASE: ${{ needs.handoff.outputs.failure_phase }}
       TARGET_SHA: ${{ needs.handoff.outputs.target_sha }}
       MAX_CHECKPOINT: ${{ needs.handoff.outputs.max_checkpoint }}

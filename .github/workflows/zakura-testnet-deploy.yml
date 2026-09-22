@@ -14,7 +14,7 @@ on:
         description: "Git branch, tag, or SHA to build and deploy"
         required: true
         type: string
-        default: main
+        default: v1.5.0-rc0
       force_rebuild:
         description: "Rebuild even if a cached binary for this commit exists"
         type: boolean

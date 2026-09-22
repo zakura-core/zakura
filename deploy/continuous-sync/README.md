@@ -1,7 +1,7 @@
 # Zakura Continuous Genesis Sync Fleet
 
 This directory codifies the three permanent mainnet sync nodes that repeatedly
-test a fresh genesis-to-tip sync from the latest `origin/main` build:
+test a fresh genesis-to-tip sync from the `v1.5.0-rc0` release candidate:
 
 | Node | Address | Mode |
 | --- | --- | --- |
@@ -20,7 +20,7 @@ v2 stack.
 `zakura-continuous-sync.service` runs
 `/usr/local/sbin/zakura-continuous-sync.py` on each host:
 
-1. Stop the node, prune old artifacts, check disk space, then fetch `origin/main` in `/root/zakura` and pin the full commit SHA.
+1. Stop the node, prune old artifacts, check disk space, then fetch the ref configured by `defaults.branch` in `nodes.toml` in `/root/zakura` and pin the full commit SHA.
 2. Build `zakurad` from a detached worktree and cache the binary by SHA.
 3. Atomically install the binary at `/usr/local/bin/zakurad`.
 4. Stop `zakura.service`.

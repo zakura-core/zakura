@@ -39,6 +39,35 @@ alert_status = load_module("continuous_sync_alert_status", ALERT_STATUS_PATH)
 
 
 class ContinuousSyncTests(unittest.TestCase):
+    def test_resolve_sha_fetches_branches_tags_and_commits(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            upstream = root / "upstream"
+            upstream.mkdir()
+
+            def git(*args, cwd=upstream):
+                return subprocess.run(
+                    ["git", *args], cwd=cwd, check=True, capture_output=True, text=True
+                ).stdout.strip()
+
+            git("init", "--initial-branch=main")
+            git("-c", "user.name=Test", "-c", "user.email=test@example.com",
+                "-c", "commit.gpgsign=false", "commit", "--allow-empty", "-m", "release")
+            release_sha = git("rev-parse", "HEAD")
+            git("-c", "user.name=Test", "-c", "user.email=test@example.com",
+                "tag", "-a", "v1.5.0-rc0", "-m", "release candidate")
+            git("-c", "user.name=Test", "-c", "user.email=test@example.com",
+                "-c", "commit.gpgsign=false", "commit", "--allow-empty", "-m", "next")
+            main_sha = git("rev-parse", "HEAD")
+            git("clone", "--no-tags", str(upstream), str(root / "repo"))
+            for ref, expected in (("main", main_sha), ("v1.5.0-rc0", release_sha),
+                                  (main_sha, main_sha), ("v1.5.0-rc0", release_sha)):
+                with self.subTest(ref=ref):
+                    config = make_config(root, policy=sync.Policy(branch=ref))
+                    self.assertEqual(sync.resolve_sha(config), expected)
+            with self.assertRaises(sync.ControllerError):
+                sync.resolve_sha(make_config(root, policy=sync.Policy(branch="missing")))
+
     def test_sync_metrics_build_features_follow_mode_and_selected_ref(self):
         for mode in ("dual", "zakura", "legacy"):
             for supported in (False, True):
@@ -1067,7 +1096,7 @@ p2p_stack = "zakura"
 
         self.assertIn('p2p_stack = "legacy"', rendered["zakurad.toml.template"])
         self.assertIn('mode_label = "Zebra/legacy-only"', rendered["controller.toml"])
-        self.assertIn('branch = "main"', rendered["controller.toml"])
+        self.assertIn('branch = "v1.5.0-rc0"', rendered["controller.toml"])
         self.assertEqual(rendered["alert-monitor.toml"].count("[[nodes]]"), 3)
         for index in [1, 2, 5]:
             self.assertIn(

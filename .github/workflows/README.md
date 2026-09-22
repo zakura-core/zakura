@@ -49,6 +49,10 @@ These workflows run on pull requests, pushes to `main` / `feat/**` / `release/**
 
 Deploys are manual, SSH-based, and run from self-hosted deployer runners; there are no cloud-managed instance groups.
 
+The mainnet and testnet deployment defaults, continuous-sync fleet, and scheduled
+VCT handoff canary target `v1.5.0-rc0`. Explicit PR and release-canary refs still
+override the smoke-test default.
+
 - **`zakura-mainnet-deploy.yml`** — manual, binary-only deploy across the mainnet fleet. Builds `zakurad` natively on the `zakura-mainnet-deployer` runner, then installs it host-by-host with `deploy/deployer/deploy.py`. Node configs, identities, and chain state are deliberately left untouched; the previous binary is kept as `.bak`.
 - **`zakura-testnet-deploy.yml`** — the same for the testnet fleet, from the `zakura-testnet-deployer` runner.
 - **`zakura-mainnet-rollback.yml`** — emergency rollback for a single mainnet node: captures diagnostics, restores `<bin_path>.bak`, restarts the service.

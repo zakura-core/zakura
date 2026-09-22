@@ -56,7 +56,6 @@ async function openDetail(run,attempt) {
   $('detail-meta').textContent=`${row.hash} · ${row.outcome || 'unfinished'} · ${quality(row)} · run ${row.run}`;
   const recording=data.recording;
   $('detail-cohort').textContent=`${recording.network} · ${recording.storage} · ${recording.build} · Recorded ${new Date(row.utc_ms).toLocaleString()}`;
-  $('boundary').textContent=data.boundary;
   $('detail-warning').hidden=!row.exclusion_reason;
   $('detail-warning').textContent=row.exclusion_reason ? `Timing excluded from rankings and percentiles. ${row.exclusion_reason} Raw intervals are preserved below and include this interference.` : '';
   const timing=data.timing, formatTime=value=>value==null?'Pending':ms(value);

@@ -14,6 +14,7 @@ class Installation(unittest.TestCase):
             root = Path(directory)
             log = root / "mutations"
             scripts = {
+                "explorer": "exit 0\n",
                 "id": 'if [ "$1" = -u ]; then echo 0; fi\n',
                 "mountpoint": "exit 0\n",
                 "findmnt": 'case "$*" in *FSTYPE*) echo ext4;; *) echo rw,grpquota;; esac\n',
@@ -27,7 +28,7 @@ class Installation(unittest.TestCase):
                 file.write_text("#!/bin/sh\n" + script)
                 file.chmod(0o755)
             result = subprocess.run(
-                ["bash", str(INSTALLER), "/bin/true", "zakura"],
+                ["bash", str(INSTALLER), str(root / "explorer"), "zakura"],
                 env={**os.environ, "PATH": f"{root}:{os.environ['PATH']}", "QUOTA_STATE": state,
                      "QUOTA_STATUS": str(status), "MUTATION_LOG": str(log)},
                 capture_output=True, text=True, timeout=5,

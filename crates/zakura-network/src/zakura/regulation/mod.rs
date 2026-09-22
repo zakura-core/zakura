@@ -1,21 +1,27 @@
 #![allow(dead_code, unused_imports)] // activated by the serving migration
 
-//! Shared admission and ownership for native Zakura message policies.
+//! Shared, role-based regulation for native Zakura messages.
 //!
-//! Finite request policies supply their codec and response bound. The shared
-//! admission path owns concurrency, rollback, execution, and response lifetimes.
-//! Peer routines retain protocol dispatch and scheduling decisions.
+//! - [`Serve`] and [`ServeSession`] own capacity and lifetimes for requests
+//!   that produce one response.
+//! - [`Reservations`] admit a response only if a request reserved it.
+//! - [`Verdict`] names the result of checking one message.
+//!
+//! Services keep protocol dispatch in plain `match` arms.
 
-mod request;
-pub(crate) use request::{
-    RequestAdmission, RequestPolicy, RequestSession, ResponsePermit, WorkAttempt, WorkLease,
+mod serve;
+#[cfg(test)]
+pub(crate) use serve::tests::kit as serving_kit;
+pub(crate) use serve::{
+    PeerServeLimits, Responded, ResponseSink, Serve, ServeCapacity, ServeEnd, ServeSession,
+    WorkLease,
 };
 
 mod reservations;
 pub(crate) use reservations::{ClaimRefused, Reservations, ReserveRefused};
 
 mod slots;
-pub(crate) use slots::{SlotBudget, SlotPermit};
+pub(crate) use slots::{OutputByteBudget, OutputGrant, SlotBudget, SlotPermit};
 
 mod verdict;
 pub(crate) use verdict::Verdict;

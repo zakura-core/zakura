@@ -201,6 +201,30 @@ impl FramedSend {
             .map_err(|_| GuardedReserveError::Closed)
     }
 
+    /// Queue a frame and hold `guard` until the frame leaves the queue.
+    ///
+    /// On a transport queue, the guard lives until the transport finishes
+    /// writing the frame. On an in-process channel, which has no write step,
+    /// the guard ends when the channel accepts the frame. Waiting for queue
+    /// space holds only the guard.
+    pub(crate) async fn send_with_guard(
+        &self,
+        frame: Frame,
+        guard: FrameGuard,
+    ) -> Result<(), GuardedReserveError> {
+        match &self.sender {
+            FramedSender::Plain(sender) => {
+                let sent = sender.send(frame).await;
+                drop(guard);
+                sent.map_err(|_| GuardedReserveError::Closed)
+            }
+            FramedSender::Queued(_) => {
+                self.reserve_guarded().await?.send(frame, guard);
+                Ok(())
+            }
+        }
+    }
+
     /// Current free slots in the bounded transport queue.
     pub fn capacity(&self) -> usize {
         match &self.sender {

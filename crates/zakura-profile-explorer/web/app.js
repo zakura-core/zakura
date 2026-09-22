@@ -4,7 +4,7 @@ const number = (n) => Number(n || 0).toLocaleString();
 const ms = (n) => `${(n / 1000).toFixed(1)} ms`;
 const blockUrl = (run,attempt) => `/block/${encodeURIComponent(run)}/${encodeURIComponent(attempt)}`;
 const el = (tag, text, cls) => { const n = document.createElement(tag); if (text != null) n.textContent = text; if (cls) n.className = cls; return n; };
-let selected = '', loading = false;
+let loading = false;
 async function api(path) { const response = await fetch(path); if (!response.ok) throw Error(await response.text()); return response.json(); }
 function note(message) { $('notice').textContent = message; $('notice').hidden = !message; }
 function quality(row) {
@@ -35,25 +35,21 @@ function table(target, rows) {
 async function refresh() {
   if (loading) return; loading = true;
   try {
-    const query = new URLSearchParams({mode:$('mode').value}); if (selected) query.set('run',selected);
-    const data = await api(`/api/home?${query}`); selected = data.run;
-    $('run').replaceChildren(...data.runs.map(({metadata:r}) => { const o = el('option',`${r.node || 'Node'} · ${r.session || r.id.slice(0,8)} · ${new Date(r.utc_start_ms).toLocaleString()}`); o.value=r.id; o.selected=r.id===selected; return o; }));
-    const run = data.runs.find(r=>r.metadata.id===selected), health = data.health;
+    const data = await api('/api/home');
+    const run = data.runs.find(r=>r.metadata.id===data.run), health = data.health;
     const fresh = health && Date.now()-health.updated_ms<15000, nodeFresh = run && Date.now()-run.seen_ms<10000;
     $('connection').textContent = fresh && nodeFresh ? '● Recording' : '○ Retained evidence';
     const notices = [];
     if (!fresh) notices.push('Collector is offline or its health is stale.');
     if (run && !nodeFresh) notices.push('This node is no longer sending observations.');
-    if (run && (run.dropped || run.sequence_gaps || run.transport_dropped)) notices.push(`Collection loss: ${number(run.dropped)} producer drops, ${number(run.sequence_gaps)} missing sequences, ${number(run.transport_dropped)} transport drops. Counts may overlap.`);
     if (health?.errors) notices.push(`${number(health.errors)} collector errors. Detail may be incomplete.`);
     if (data.excluded_timings) notices.push(`${number(data.excluded_timings)} recordings excluded from timing statistics because of known measurement interference.`);
     note(notices.join(' '));
     const used = health ? `${(health.used / 1e9).toFixed(2)} / ${(health.budget / 1e9).toFixed(0)} GB` : 'Unavailable';
     const stats = [[number(data.counts.captured),'Requests captured · last 24h'],[number(data.counts.success),'Accepted or checked · last 24h'],[number(data.counts.sealed_detail),'Sealed detail · last 24h'],[used,'Profiler storage · excludes chain state']];
     $('stats').replaceChildren(...stats.map(([value,label])=>{const box=el('div',null,'stat');box.append(el('b',value),el('span',label));return box;}));
-    $('cohort').textContent = run ? `${run.metadata.network} · ${run.metadata.storage} · ${run.metadata.build} · ${run.metadata.id}` : 'Waiting for the first node recording.';
+    $('cohort').textContent = run ? `${run.metadata.network} · ${run.metadata.storage.split('(')[0]} node · ${run.metadata.build}` : 'Waiting for the first node recording.';
     for (const key of ['latest','outliers','failures']) table(key,data[key]);
-    $('report').href=`/api/home?${query}`;
   } catch (error) { note(error.message); $('connection').textContent='○ Connection unavailable'; }
   finally { loading=false; }
 }
@@ -171,11 +167,7 @@ function renderCpu(cpu) {
 if(document.body.dataset.page==='home'){
   const legacy=/^#([a-f0-9]{32})\/(\d{1,20})$/.exec(location.hash);
   if(legacy)location.replace(blockUrl(legacy[1],legacy[2]));
-  else{
-    $('run').addEventListener('change',()=>{selected=$('run').value;refresh();});
-    $('mode').addEventListener('change',refresh);
-    refresh();setInterval(refresh,10000);
-  }
+  else{refresh();setInterval(refresh,10000);}
 }else{
   loadBlockPage().catch(error=>{$('lookup-title').textContent='Block unavailable';note(error.message);});
 }

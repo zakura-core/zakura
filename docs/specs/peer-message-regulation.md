@@ -33,7 +33,10 @@ which eligible peers receive service within those bounds.
 | Response | Frame and allocation bounds; a receiver-created one-shot, range, or subscription reservation |
 
 The message rules below describe observable behavior. They do not require a declaration builder,
-one handler function per message, or a particular filter API.
+one handler function per message, or a particular filter API. An implementation MAY state each
+message's role and payload bounds in a static data table and MAY share one typed codec trait
+across message families. It MUST NOT route handling through a generic dispatch framework; handlers
+remain ordinary code per message.
 
 | Result | Meaning |
 | --- | --- |
@@ -65,8 +68,9 @@ verification, and response production before each resource commitment occurs.
 
 1. Every supported message kind MUST have explicit payload and decoded-allocation bounds,
    validation, handling, and tests. Bounds MAY depend on a checked fixed prefix, a protocol limit,
-   and a live reservation. Tests MUST cover all supported kinds without requiring a new common
-   declaration or reference-model framework.
+   and a live reservation. Tests MUST cover all supported kinds without requiring a declaration
+   builder or reference-model framework. A shared test suite MAY run against each kind's static
+   table and codec.
 2. Each peer's protocol state MUST have a receiver-configured capacity and defined behavior at
    capacity. Peer-provided keys and counts MUST NOT increase that capacity. Aggregate state across
    admitted connections MUST fit node-wide resource bounds.
@@ -792,8 +796,9 @@ before enforcing those values:
 ## Conformance tests
 
 The implementation MUST provide focused checks for the following properties. It MAY use existing
-unit, property, synthetic-peer, and transport test infrastructure. A new declaration framework,
-universal panic-recovery suite, and exhaustive model explorer are not prerequisites.
+unit, property, synthetic-peer, and transport test infrastructure. A declaration builder,
+universal panic-recovery suite, and exhaustive model explorer are not prerequisites. A static
+message table and a typed codec trait are allowed; a second reference model is not required.
 
 1. Every supported message kind has legal boundary cases, canonical round trips, exact decoding,
    payload caps, and decoded-allocation checks. Deterministic cases MUST cover every kind and rule;

@@ -26,7 +26,9 @@ responses can still cause CPU or storage work.
 ## Message checks and handler policy
 
 The implementation may use existing codecs, handlers, and validators. It need not introduce a
-declaration builder, universal filter framework, or one ingress call site per data type.
+declaration builder, universal filter framework, or one ingress call site per data type. It uses
+a static `MessageRule` table per stream and a typed `WireMessage` codec trait; handlers stay plain
+`match` arms. The [testing design](property-testing.md) describes both.
 
 Frame checks precede allocation. Cadence checks precede expensive metadata handling. Reservation
 prechecks supply request-selected decode bounds. Exact response matching precedes expensive
@@ -142,8 +144,8 @@ Diagnostics identify protocol violations and local failures with bounded logging
 Sampling or aggregation is allowed. Complete per-decision traces are optional test/debug output.
 No particular file name or schema is required.
 
-A new exhaustive model explorer, compiler-enforced declaration framework, and universal
-panic-recovery suite are deferred. The [testing design](property-testing.md) and
+A new exhaustive model explorer, declaration builder, dispatch framework, and universal
+panic-recovery suite are deferred. Static message tables and the typed codec trait are in use. The [testing design](property-testing.md) and
 [GetBlocks plan](property-testing-block-sync-infrastructure.md) describe the initial checks.
 
 ## Adoption order

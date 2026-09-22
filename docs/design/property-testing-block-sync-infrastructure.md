@@ -11,7 +11,9 @@ Use production framing, decode, reservations, serving, and cleanup. Add only the
 control capacity, storage completion, and response delivery.
 
 This work introduces no Work bucket, refund, mandatory Delay verdict, or serving query-result timer.
-It does not require a generic framework or exhaustive explorer. Header subscriptions have separate
+It does not require a declaration builder, dispatch framework, or exhaustive explorer. The
+shared message table, codec, and serving suites in the [testing design](property-testing.md)
+apply to GetBlocks once #945 lands. Header subscriptions have separate
 tests. Version 2 retains height-range correlation and forbids overlapping live ranges per connection.
 
 ## Existing infrastructure
@@ -57,7 +59,7 @@ Local scheduling must not remove authorization. Terminals consume a range once. 
 not validate arbitrary bodies; retain body-commitment and downstream consensus checks.
 
 Use production transitions. A small expected-state model is optional when it clarifies a race.
-Do not build a generic model merely to mirror every handler.
+Do not build a second reference model to mirror every handler.
 
 ## Capacity and ownership
 

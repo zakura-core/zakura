@@ -61,7 +61,6 @@ fn retains_context_error(error: &ValidateContextError) -> bool {
             | ValidateContextError::VctSuppliedRootUnavailable { .. }
             | ValidateContextError::VctSuppliedRootAwaitingSuccessor { .. }
             | ValidateContextError::VctSproutHandoffRootMismatch { .. }
-            | ValidateContextError::NoteCommitmentTreeError(_)
             | ValidateContextError::HistoryTreeError(_)
     )
 }

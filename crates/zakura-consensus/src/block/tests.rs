@@ -3082,6 +3082,52 @@ fn receipt_retry_policy_drops_permanent_errors_without_changing_peer_attribution
     }
 }
 
+#[test]
+fn full_note_commitment_tree_errors_do_not_keep_retry_receipts() {
+    use zakura_chain::{parallel::tree::NoteCommitmentTreeError, sapling, sprout};
+
+    let block: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
+        .zcash_deserialize_into()
+        .unwrap();
+    let receipts = receipt::ReceiptRegistry::default();
+    for tree_error in [
+        NoteCommitmentTreeError::Sprout(sprout::tree::NoteCommitmentTreeError::FullTree),
+        NoteCommitmentTreeError::Sapling(sapling::tree::NoteCommitmentTreeError::FullTree),
+        NoteCommitmentTreeError::Orchard(orchard::tree::NoteCommitmentTreeError::FullTree),
+        NoteCommitmentTreeError::Ironwood(ironwood::tree::NoteCommitmentTreeError::FullTree),
+    ] {
+        for error in [
+            VerifyBlockError::Commit(
+                Box::new(zs::ValidateContextError::NoteCommitmentTreeError(
+                    tree_error,
+                ))
+                .into(),
+            ),
+            VerifyBlockError::Transaction(
+                zs::ValidateContextError::NoteCommitmentTreeError(tree_error).into(),
+            ),
+            VerifyBlockError::from(BlockError::Transaction(
+                zs::ValidateContextError::NoteCommitmentTreeError(tree_error).into(),
+            )),
+        ] {
+            assert!(matches!(
+                error.body_verification_class(),
+                zakura_header_chain::BodyVerificationClass::Retryable(_)
+            ));
+            assert!(!error.retains_retry_receipt(), "{error:?}");
+
+            let first = receipts.register(block.clone());
+            let order = first.order;
+            receipts.allow_retry(block.hash(), order);
+            first.finish(true);
+            let retry = receipts.register(block.clone());
+            assert_eq!(retry.order, order);
+            retry.finish(error.retains_retry_receipt());
+            assert!(receipts.register(block.clone()).order > order, "{error:?}");
+        }
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn nonsequential_block_rejection_clears_retry_receipt() {
     let _init_guard = zakura_test::init();

@@ -28,7 +28,8 @@ RestrictAddressFamilies=AF_UNIX
 UMask=0007
 StandardOutput=null
 StandardError=append:/srv/zakura-profile/data/collector.log
-LimitFSIZE=256M
+# The catalog grows across captures. The group quota bounds total storage.
+LimitFSIZE=8G
 
 [Install]
 WantedBy=multi-user.target

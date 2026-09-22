@@ -67,7 +67,7 @@ The initial collector uses one indexed SQLite catalog with bounded summary reten
 
 ## Linux installation
 
-On the dedicated host, install `perf` for the running kernel, Python 3.11 or later, and the quota tools. Use the normal deployment build and preserve debugging information for useful Rust symbols. The profiling process never changes `perf_event_paranoid`.
+On the dedicated host, install `perf` for the running kernel, Python 3.11 or later, and the quota tools. Ubuntu minimal images may also need `linux-modules-extra-$(uname -r)` for `quota_v2`. Verify quota enforcement before installing the services. Use the normal deployment build and preserve debugging information for useful Rust symbols. The profiling process never changes `perf_event_paranoid`.
 
 ```sh
 sudo deploy/block-profile/install.sh target/release/zakura-profile-explorer zakura

@@ -1,0 +1,34 @@
+[Unit]
+Description=Zakura block profile collector
+After=local-fs.target
+RequiresMountsFor=/srv/zakura-profile
+
+[Service]
+Slice=zakura-profile.slice
+Type=simple
+User=zakura-profile
+Group=zakura-profile
+RuntimeDirectory=zakura-profile
+RuntimeDirectoryMode=0750
+ExecStart=/usr/local/bin/zakura-profile-explorer collect --store /srv/zakura-profile/data --socket /run/zakura-profile/node.sock
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=15
+MemoryMax=512M
+CPUQuota=100%
+IOWeight=10
+Nice=10
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ReadWritePaths=/srv/zakura-profile/data /run/zakura-profile
+RestrictAddressFamilies=AF_UNIX
+UMask=0007
+StandardOutput=null
+StandardError=append:/srv/zakura-profile/data/collector.log
+LimitFSIZE=256M
+
+[Install]
+WantedBy=multi-user.target

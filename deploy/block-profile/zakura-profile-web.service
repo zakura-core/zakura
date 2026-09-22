@@ -1,0 +1,31 @@
+[Unit]
+Description=Zakura block profile explorer
+After=zakura-profile-collector.service
+RequiresMountsFor=/srv/zakura-profile
+
+[Service]
+Slice=zakura-profile.slice
+Type=simple
+User=zakura-profile
+Group=zakura-profile
+ExecStart=/usr/local/bin/zakura-profile-explorer serve --store /srv/zakura-profile/data --port 8787
+Restart=on-failure
+RestartSec=5
+MemoryMax=512M
+CPUQuota=100%
+Nice=10
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ReadOnlyPaths=/srv/zakura-profile/data
+RestrictAddressFamilies=AF_INET AF_UNIX
+UMask=0077
+StandardOutput=null
+StandardError=journal
+LogRateLimitIntervalSec=1min
+LogRateLimitBurst=5
+
+[Install]
+WantedBy=multi-user.target

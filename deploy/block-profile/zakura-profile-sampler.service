@@ -1,0 +1,34 @@
+[Unit]
+Description=Bounded CPU sampling of the dedicated Zakura profiling node
+After=zakura-profile-collector.service zakurad.service
+RequiresMountsFor=/srv/zakura-profile
+
+[Service]
+Slice=zakura-profile.slice
+Type=simple
+User=zakura-profile
+Group=zakura-profile
+EnvironmentFile=/etc/zakura-profile-sampler.env
+ExecStart=/usr/bin/python3 /opt/zakura-profile/sample.py --store /srv/zakura-profile/data --pid ${NODE_PID} --executable ${NODE_EXECUTABLE} --duration-seconds ${SESSION_SECONDS}
+RuntimeMaxSec=1d
+TimeoutStopSec=90
+MemoryMax=512M
+CPUQuota=100%
+IOWeight=10
+Nice=10
+# These capabilities are confined to this service. Do not weaken perf_event_paranoid.
+CapabilityBoundingSet=CAP_PERFMON CAP_SYS_PTRACE CAP_DAC_READ_SEARCH
+AmbientCapabilities=CAP_PERFMON CAP_SYS_PTRACE CAP_DAC_READ_SEARCH
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/srv/zakura-profile/data
+RestrictAddressFamilies=AF_UNIX
+UMask=0077
+StandardOutput=null
+StandardError=append:/srv/zakura-profile/data/sampler.log
+LimitFSIZE=256M
+
+[Install]
+WantedBy=multi-user.target

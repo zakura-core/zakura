@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily report while the profile host is running
+
+[Timer]
+OnCalendar=*-*-* 00:10:00 UTC
+Persistent=true
+RandomizedDelaySec=60
+Unit=zakura-profile-report.service
+
+[Install]
+WantedBy=timers.target

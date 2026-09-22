@@ -1,0 +1,7 @@
+[Unit]
+Description=Shared resource budget for block profiling
+
+[Slice]
+CPUQuota=100%
+MemoryMax=1G
+IOWeight=10

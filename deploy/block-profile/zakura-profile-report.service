@@ -1,0 +1,21 @@
+[Unit]
+Description=Daily Zakura block profile report
+After=zakura-profile-collector.service
+RequiresMountsFor=/srv/zakura-profile
+
+[Service]
+Slice=zakura-profile.slice
+Type=oneshot
+User=zakura-profile
+Group=zakura-profile
+ExecStart=/usr/bin/python3 /opt/zakura-profile/report.py --store /srv/zakura-profile/data
+MemoryMax=256M
+CPUQuota=100%
+TimeoutStartSec=15min
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/srv/zakura-profile/data/reports
+RestrictAddressFamilies=AF_UNIX
+UMask=0077

@@ -2006,6 +2006,12 @@ impl ZakuraDiscoveryHandle {
             .insert_static_candidate(node_addr, current_unix_secs())
     }
 
+    /// Hold the discovery book lock until the returned value is dropped.
+    #[cfg(test)]
+    pub(crate) async fn hold_book_for_test(&self) -> Box<dyn std::any::Any + Send> {
+        Box::new(self.inner.clone().lock_owned().await)
+    }
+
     /// Returns a bounded sample of owned peer records for one authenticated requester.
     ///
     /// Only confirmed records are disclosed, and results come from a per-requester

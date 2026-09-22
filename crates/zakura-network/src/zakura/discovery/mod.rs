@@ -7,6 +7,7 @@ mod protocol;
 mod redial;
 mod runtime;
 mod service;
+mod serving;
 mod trace;
 
 #[cfg(any(test, feature = "zakura-testkit"))]

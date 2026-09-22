@@ -38,8 +38,10 @@ pub(crate) trait ServingUnderTest: Send + Sync + Sized + 'static {
     fn max_response_bytes(&self) -> u32;
     /// Block every later `produce` until the returned value is dropped.
     fn stall(&self) -> impl Future<Output = Self::Stall> + Send;
-    /// Make the next `produce` fail locally.
-    fn fail_next(&self);
+    /// Make the next `produce` fail locally. Returns `false` if the service
+    /// has no local failure to inject; the failure case then only checks
+    /// that the next request still gets a response.
+    fn fail_next(&self) -> bool;
     /// Check that `frame` answers the `seq`-th request.
     fn assert_response(&self, frame: &Frame, seq: u32);
 }
@@ -209,13 +211,14 @@ pub(crate) async fn blocked_output_stops_at_the_byte_bound_without_node_slots<
 pub(crate) async fn failure_releases_everything<T: ServingUnderTest>() {
     let harness = Harness::<T>::new().await;
     let mut link = harness.link(1);
-    harness.adapter.fail_next();
-    link.session.serve(harness.adapter.request(1)).await;
-    harness.await_released(1).await;
-    assert!(
-        stays_pending(link.peer_recv.recv()).await,
-        "a failed request sends nothing"
-    );
+    if harness.adapter.fail_next() {
+        link.session.serve(harness.adapter.request(1)).await;
+        harness.await_released(1).await;
+        assert!(
+            stays_pending(link.peer_recv.recv()).await,
+            "a failed request sends nothing"
+        );
+    }
 
     link.session.serve(harness.adapter.request(2)).await;
     let frame = next_frame(&mut link.peer_recv).await;

@@ -67,6 +67,7 @@ impl SlotBudget {
     }
 
     /// Reserve one slot without waiting.
+    #[cfg(test)]
     pub(crate) fn try_reserve(&self) -> Option<SlotPermit> {
         self.permits
             .clone()

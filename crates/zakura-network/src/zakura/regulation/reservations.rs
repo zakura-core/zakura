@@ -118,12 +118,8 @@ impl<K: Eq + Hash, C> Reservations<K, C> {
         Ok(reservation.credit)
     }
 
-    /// Whether `key` has a live reservation.
-    pub(crate) fn is_live(&self, key: &K) -> bool {
-        self.live.contains_key(key)
-    }
-
     /// Number of live reservations.
+    #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.live.len()
     }

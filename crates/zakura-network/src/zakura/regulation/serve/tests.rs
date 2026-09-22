@@ -85,8 +85,9 @@ impl ServingUnderTest for ScriptedServeUnderTest {
         self.serve.gate.clone().lock_owned().await
     }
 
-    fn fail_next(&self) {
+    fn fail_next(&self) -> bool {
         self.serve.fail_next.store(true, Ordering::SeqCst);
+        true
     }
 
     fn assert_response(&self, frame: &Frame, seq: u32) {

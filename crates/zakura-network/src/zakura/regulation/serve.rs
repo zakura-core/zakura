@@ -35,7 +35,7 @@ pub(crate) use admission::{PeerServeLimits, ServeCapacity};
 pub(crate) use lease::WorkLease;
 pub(crate) use response_sink::{Responded, ResponseSink};
 
-use super::{OutputByteBudget, SlotBudget, Verdict};
+use super::{SlotBudget, Verdict};
 use crate::zakura::{FrameGuard, FramedSend, ZakuraPeerId};
 
 /// A request kind that produces exactly one response frame.

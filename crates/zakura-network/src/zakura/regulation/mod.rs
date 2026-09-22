@@ -1,5 +1,3 @@
-#![allow(dead_code, unused_imports)] // activated by the serving migration
-
 //! Shared, role-based regulation for native Zakura messages.
 //!
 //! - [`Serve`] and [`ServeSession`] own capacity and lifetimes for requests
@@ -18,7 +16,7 @@ pub(crate) use serve::{
 };
 
 mod reservations;
-pub(crate) use reservations::{ClaimRefused, Reservations, ReserveRefused};
+pub(crate) use reservations::{ClaimRefused, Reservations};
 
 mod slots;
 pub(crate) use slots::{OutputByteBudget, OutputGrant, SlotBudget, SlotPermit};

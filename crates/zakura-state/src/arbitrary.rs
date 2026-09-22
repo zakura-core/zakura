@@ -105,6 +105,7 @@ impl ContextuallyVerifiedBlock {
             transaction_hashes,
             deferred_pool_balance_change: _,
             auth_data_root: _,
+            profile: _,
             receipt_order,
         } = block.into();
 

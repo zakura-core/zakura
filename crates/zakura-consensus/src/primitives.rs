@@ -4,6 +4,7 @@ use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
 };
+use zakura_jsonl_trace::block_profile as profiles;
 
 use once_cell::sync::Lazy;
 use tokio::sync::oneshot::error::RecvError;
@@ -64,6 +65,7 @@ struct BlockFlush {
     expected_transactions: usize,
     started_transactions: usize,
     flush_queued: bool,
+    profile: profiles::Context,
 }
 
 /// Registers a block's transaction verifier batch for one explicit crypto
@@ -81,12 +83,33 @@ pub(crate) fn register_block_verifier_batch_flush<T>(
             key,
             BlockFlush {
                 expected_transactions,
+                profile: profiles::Context::current(),
                 started_transactions: 0,
                 flush_queued: expected_transactions == 0,
             },
         );
 
     BlockVerifierBatchFlushGuard { key }
+}
+
+/// Recovers context across the transaction buffer without waiting for the registry.
+/// The existing registration guard keeps this Arc identity alive for the block attempt.
+pub(crate) fn block_profile<T>(shared: &Arc<T>) -> profiles::Context {
+    if !profiles::enabled() {
+        return Default::default();
+    }
+    let profile = BLOCK_VERIFIER_BATCH_FLUSHES
+        .try_lock()
+        .ok()
+        .and_then(|entries| {
+            entries
+                .get(&BlockVerifierBatchFlushKey::new(shared))
+                .map(|entry| entry.profile.clone())
+        });
+    if profile.is_none() {
+        profiles::context_lost();
+    }
+    profile.unwrap_or_default()
 }
 
 /// Returns the block-level batch flush key for `shared_block_context`.
@@ -227,8 +250,14 @@ pub async fn spawn_fifo<T: 'static + Send, F: 'static + FnOnce() -> T + Send>(
     // so we use a oneshot channel instead.
     let (rsp_tx, rsp_rx) = tokio::sync::oneshot::channel();
 
+    let context = profiles::Context::current();
+    let queued = context.span(profiles::Stage::WorkerQueue);
     rayon::spawn_fifo(move || {
-        let _ = rsp_tx.send(f());
+        drop(queued);
+        let execution = context.span(profiles::Stage::WorkerExecution);
+        execution.context().in_scope(|| {
+            let _ = rsp_tx.send(f());
+        });
     });
 
     rsp_rx.await

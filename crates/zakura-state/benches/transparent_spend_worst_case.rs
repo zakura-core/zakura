@@ -166,6 +166,7 @@ fn benchmark_fixture(
         transaction_hashes: vec![transaction::Hash([0; 32]); transaction_count + 1].into(),
         deferred_pool_balance_change: None,
         auth_data_root: None,
+        profile: Default::default(),
         receipt_order: None,
     };
 

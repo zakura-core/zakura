@@ -8,6 +8,7 @@ use std::{
     task::{Context, Poll},
     time::Duration,
 };
+use zakura_jsonl_trace::block_profile as profiles;
 
 use chrono::{DateTime, Utc};
 use futures::{
@@ -451,7 +452,15 @@ where
         };
         let span = tracing::debug_span!("tx", ?tx_id);
 
-        async move {
+        let profile = match &req {
+            Request::Block {
+                known_outpoint_hashes,
+                ..
+            } => primitives::block_profile(known_outpoint_hashes),
+            Request::Mempool { .. } => Default::default(),
+        };
+        profile.clone().wrap(async move {
+            let _transaction_profile = profile.span(profiles::Stage::Transaction);
             tracing::trace!(?tx_id, ?req, "got tx verify request");
 
             // Do quick checks first
@@ -571,7 +580,9 @@ where
             // The UTXOs are required for almost all the async checks.
             let load_spent_utxos_fut =
                 Self::spent_utxos(tx.clone(), req.clone(), state.clone(), mempool.clone(),);
+            let inputs_profile = profile.span(profiles::Stage::TransactionInputs);
             let (spent_utxos, spent_outputs, spent_mempool_outpoints) = load_spent_utxos_fut.await?;
+            drop(inputs_profile);
 
             // WONTFIX: Return an error for Request::Block as well to replace this check in
             //       the state once #2336 has been implemented?
@@ -662,7 +673,9 @@ where
 
             tracing::trace!(?tx_id, "awaiting async checks...");
 
+            let checks_profile = profile.span(profiles::Stage::TransactionChecks);
             async_checks.check(block_batch_flush_key).await?;
+            drop(checks_profile);
 
             tracing::trace!(?tx_id, "finished async checks");
 
@@ -720,7 +733,7 @@ where
             };
 
             Ok(rsp)
-        }
+        })
             .inspect(move |result| {
                 // Hide the transaction data to avoid filling the logs
                 tracing::trace!(?tx_id, result = ?result.as_ref().map(|_tx| ()), "got tx verify result");
@@ -1396,7 +1409,8 @@ where
         //
         // https://zips.z.cash/protocol/protocol.pdf#txnconsensus
         if let Some(bundle) = bundle {
-            async_checks.push(
+            async_checks.push_profiled(
+                profiles::Stage::SaplingRequest,
                 primitives::sapling::VERIFIER
                     .clone()
                     .oneshot(primitives::sapling::Item::new(bundle, *sighash, tx_id)),
@@ -1451,7 +1465,8 @@ where
             // bundles only under the fixed key, and NU6.3-onward bundles only
             // under the NU6.3 key (which enforces the Orchard cross-address
             // restriction even in v5 transactions).
-            async_checks.push(
+            async_checks.push_profiled(
+                profiles::Stage::Halo2Request,
                 primitives::halo2::verifier_for(network_upgrade)
                     .clone()
                     .oneshot(primitives::halo2::Item::new_with_wtx_id(
@@ -1478,6 +1493,18 @@ impl AsyncChecks {
     /// Push a check into the set.
     pub fn push(&mut self, check: impl Future<Output = Result<(), BoxError>> + Send + 'static) {
         self.0.push(check.boxed());
+    }
+
+    fn push_profiled(
+        &mut self,
+        stage: profiles::Stage,
+        check: impl Future<Output = Result<(), BoxError>> + Send + 'static,
+    ) {
+        let profile = profiles::Context::current();
+        self.push(async move {
+            let _span = profile.span(stage);
+            check.await
+        });
     }
 
     /// Push a set of checks into the set.

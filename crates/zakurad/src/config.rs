@@ -5,6 +5,7 @@
 //! for specifying it.
 
 use std::{collections::HashMap, path::PathBuf};
+use zakura_jsonl_trace::block_profile as profiles;
 
 use serde::{Deserialize, Serialize};
 use zakura_rpc::config::mining::{default_miner_address, MinerAddressType};
@@ -65,6 +66,9 @@ pub struct ZakuradConfig {
 
     /// State configuration
     pub state: zakura_state::config::Config,
+
+    /// Optional bounded block profiles exported to a local collector.
+    pub block_profile: profiles::Config,
 
     /// Tracing configuration
     pub tracing: crate::components::tracing::Config,

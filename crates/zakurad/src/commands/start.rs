@@ -80,6 +80,7 @@ use std::{
     path::Path,
     sync::Arc,
 };
+use zakura_jsonl_trace::block_profile as profiles;
 
 use abscissa_core::{config, Command, FrameworkError};
 use color_eyre::eyre::{eyre, Report};
@@ -366,6 +367,23 @@ impl StartCmd {
             }
         } else {
             Vec::new()
+        };
+
+        let _block_profile = match profiles::start(
+            &config.block_profile,
+            config.network.network.to_string(),
+            format!(
+                "{} {}",
+                env!("CARGO_PKG_VERSION"),
+                option_env!("VERGEN_GIT_DESCRIBE").unwrap_or("unknown")
+            ),
+            format!("{:?}", config.state.storage_mode),
+        ) {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                tracing::warn!(%error, "block profiling unavailable");
+                None
+            }
         };
 
         Self::validate_consensus_config(&config)?;

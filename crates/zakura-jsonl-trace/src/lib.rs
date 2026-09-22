@@ -1,5 +1,8 @@
 //! Shared non-blocking JSONL tracing support for Zebra components.
 
+/// Bounded block timelines exported to a local collector.
+pub mod block_profile;
+
 use std::{
     collections::{HashMap, HashSet},
     fmt,

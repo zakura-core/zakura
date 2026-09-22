@@ -19,6 +19,7 @@ use std::{
     sync::Arc,
     task::{Context, Poll},
 };
+use zakura_jsonl_trace::block_profile as profiles;
 
 use futures::{FutureExt, TryFutureExt};
 use thiserror::Error;
@@ -339,53 +340,95 @@ where
 
     fn call(&mut self, request: Request) -> Self::Future {
         let block = request.block();
-
-        // V5+ transaction IDs authenticate the expiry height, but not the coinbase input height.
-        // Check their agreement before a peer-controlled height selects the checkpoint verifier.
-        if let Some(height) = block.coinbase_height() {
-            let coinbase = &block.transactions[0];
-            if coinbase.version() >= 5 {
-                if let Err(error) =
-                    transaction::check::coinbase_height_matches_expiry(&height, coinbase)
-                {
-                    // A rewritten expiry changes the coinbase transaction ID. That body fails
-                    // its header commitment, so only the supplier is at fault.
-                    let merkle_root: block::merkle::Root =
-                        block.transactions.iter().map(|tx| tx.hash()).collect();
-                    let error = if merkle_root == block.header.merkle_root {
-                        VerifyBlockError::Transaction(error)
+        let root = profiles::enabled()
+            .then(|| {
+                use profiles::{Block, Mode};
+                profiles::begin(Block {
+                    hash: block.hash().0,
+                    parent: block.header.previous_block_hash.0,
+                    height: block.coinbase_height().map(|h| h.0),
+                    transactions: u32::try_from(block.transactions.len()).unwrap_or(u32::MAX),
+                    mode: if request.should_cache() {
+                        Mode::Preparation
+                    } else if request.is_proposal() {
+                        Mode::Proposal
+                    } else if block
+                        .coinbase_height()
+                        .is_some_and(|h| h <= self.max_checkpoint_height)
+                    {
+                        Mode::Checkpoint
                     } else {
-                        BlockError::BadMerkleRoot {
-                            actual: merkle_root,
-                            expected: block.header.merkle_root,
-                        }
-                        .into()
-                    };
-                    return async { Err(error.into()) }.boxed();
+                        Mode::Semantic
+                    },
+                })
+            })
+            .flatten();
+        let context = root.as_ref().map(|root| root.context()).unwrap_or_default();
+        let future: Self::Future = context.in_scope(|| {
+            // V5+ transaction IDs authenticate the expiry height, but not the coinbase input height.
+            // Check their agreement before a peer-controlled height selects the checkpoint verifier.
+            if let Some(height) = block.coinbase_height() {
+                let coinbase = &block.transactions[0];
+                if coinbase.version() >= 5 {
+                    if let Err(error) =
+                        transaction::check::coinbase_height_matches_expiry(&height, coinbase)
+                    {
+                        // A rewritten expiry changes the coinbase transaction ID. That body fails
+                        // its header commitment, so only the supplier is at fault.
+                        let merkle_root: block::merkle::Root =
+                            block.transactions.iter().map(|tx| tx.hash()).collect();
+                        let error = if merkle_root == block.header.merkle_root {
+                            VerifyBlockError::Transaction(error)
+                        } else {
+                            BlockError::BadMerkleRoot {
+                                actual: merkle_root,
+                                expected: block.header.merkle_root,
+                            }
+                            .into()
+                        };
+                        return async { Err(error.into()) }.boxed();
+                    }
                 }
             }
-        }
 
-        match block.coinbase_height() {
-            // There's currently no known use case for block proposals below the checkpoint height,
-            // so it's okay to immediately return an error here.
-            Some(height) if height <= self.max_checkpoint_height && request.is_proposal() => {
-                async {
-                    // TODO: Add a `ValidateProposalError` enum with a `BelowCheckpoint` variant?
-                    Err(VerifyBlockError::ValidateProposal(
-                        "block proposals must be above checkpoint height".into(),
-                    ))?
+            match block.coinbase_height() {
+                // There's currently no known use case for block proposals below the checkpoint height,
+                // so it's okay to immediately return an error here.
+                Some(height) if height <= self.max_checkpoint_height && request.is_proposal() => {
+                    async {
+                        // TODO: Add a `ValidateProposalError` enum with a `BelowCheckpoint` variant?
+                        Err(VerifyBlockError::ValidateProposal(
+                            "block proposals must be above checkpoint height".into(),
+                        ))?
+                    }
+                    .boxed()
                 }
-                .boxed()
-            }
 
-            Some(height) if height <= self.max_checkpoint_height => {
-                self.checkpoint.call(block).map_err(Into::into).boxed()
+                Some(height) if height <= self.max_checkpoint_height => {
+                    self.checkpoint.call(block).map_err(Into::into).boxed()
+                }
+                // This also covers blocks with no height, which the block verifier
+                // will reject immediately.
+                _ => self.block.call(request).map_err(Into::into).boxed(),
             }
-            // This also covers blocks with no height, which the block verifier
-            // will reject immediately.
-            _ => self.block.call(request).map_err(Into::into).boxed(),
+        });
+        if root.is_none() {
+            return future;
         }
+        context
+            .wrap(async move {
+                let result = future.await;
+                if let Some(root) = root {
+                    use profiles::Outcome;
+                    root.finish(match &result {
+                        Ok(_) => Outcome::Success,
+                        Err(error) if error.is_duplicate_request() => Outcome::Duplicate,
+                        Err(_) => Outcome::Failed,
+                    });
+                }
+                result
+            })
+            .boxed()
     }
 }
 

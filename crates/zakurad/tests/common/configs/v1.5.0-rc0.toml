@@ -42,6 +42,10 @@
 # | macOS    | `$HOME/Library/Preferences`           | `/Users/Alice/Library/Preferences/zakura.toml` |
 # | Windows  | `{FOLDERID_RoamingAppData}`           | `C:\Users\Alice\AppData\Local\zakura.toml`     |
 
+[block_profile]
+node = ""
+session = ""
+
 [consensus]
 checkpoint_sync = true
 

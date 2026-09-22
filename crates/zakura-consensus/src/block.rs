@@ -14,6 +14,7 @@ use std::{
     sync::Arc,
     task::{Context, Poll},
 };
+use zakura_jsonl_trace::block_profile as profiles;
 
 use chrono::Utc;
 use futures::stream::FuturesUnordered;
@@ -350,12 +351,15 @@ where
         // We don't include the block hash, because it's likely already in a parent span
         let span = tracing::debug_span!("block", height = ?block.coinbase_height());
 
-        async move {
+        let profile = profiles::Context::current();
+        let context = profile.clone();
+        let future = async move {
             let hash = zakura_header_chain::validate_encoding_version_hash(&block.header)
                 .map_err(BlockError::from)?;
             let preparation_start = request.should_cache().then(std::time::Instant::now);
             // Check that this block is actually a new block.
             tracing::trace!("checking that block is not already in state");
+            let known_profile = profile.span(profiles::Stage::KnownBlock);
             let pending_commit_deadline = tokio::time::Instant::now() + PENDING_COMMIT_WAIT_LIMIT;
             loop {
                 match state_service
@@ -385,6 +389,8 @@ where
                 }
             }
 
+            drop(known_profile);
+            let checks_profile = profile.span(profiles::Stage::BlockChecks);
             tracing::trace!("performing block checks");
             let height = block
                 .coinbase_height()
@@ -552,6 +558,8 @@ where
             // Check compatibility with ZIP-212 shielded Sapling and Orchard coinbase output decryption
             tx::check::coinbase_outputs_are_decryptable(&coinbase_tx, &network, height)?;
 
+            drop(checks_profile);
+            let tx_profile = profile.span(profiles::Stage::Transactions);
             // Send transactions to the transaction verifier to be checked
             let mut async_checks = FuturesUnordered::new();
 
@@ -682,6 +690,7 @@ where
                 &network,
             )?;
 
+            drop(tx_profile);
             // Finally, submit the block for contextual verification.
             let new_outputs = Arc::into_inner(known_utxos)
                 .expect("all verification tasks using known_utxos are complete");
@@ -695,6 +704,7 @@ where
                 deferred_pool_balance_change: Some(deferred_pool_balance_change),
                 auth_data_root: None,
                 receipt_order: None,
+                profile: profile.clone(),
             };
 
             // Return early for proposal requests.
@@ -733,9 +743,8 @@ where
             }
 
             commit_prepared_block(state_service, prepared_block, request.admission()).await
-        }
-        .instrument(span)
-        .boxed()
+        };
+        context.wrap(future).instrument(span).boxed()
     }
 }
 
@@ -770,13 +779,16 @@ where
 
 async fn commit_prepared_block<S>(
     mut state_service: S,
-    prepared_block: zs::SemanticallyVerifiedBlock,
+    mut prepared_block: zs::SemanticallyVerifiedBlock,
     admission: Option<zs::BlockAdmission>,
 ) -> Result<block::Hash, VerifyBlockError>
 where
     S: Service<zs::Request, Response = zs::Response, Error = BoxError> + Send + Clone + 'static,
     S::Future: Send + 'static,
 {
+    let profile = profiles::Context::current();
+    prepared_block.profile = profile.clone();
+    let ready_profile = profile.span(profiles::Stage::StateReady);
     let hash = prepared_block.hash;
     let is_mined_commit = admission.is_some();
     let commit_start = std::time::Instant::now();
@@ -790,6 +802,8 @@ where
             .record(ready_start.elapsed().as_secs_f64());
     }
 
+    drop(ready_profile);
+    let _response_profile = profile.span(profiles::Stage::StateResponse);
     let request = match admission {
         Some(admission) => zs::Request::CommitSemanticallyVerifiedBlockWithAdmission {
             block: prepared_block,

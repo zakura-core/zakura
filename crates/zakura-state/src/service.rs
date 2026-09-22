@@ -3518,6 +3518,7 @@ impl Service<ReadRequest> for ReadStateService {
             }
 
             ReadRequest::CheckBlockProposalValidity(semantically_verified) => {
+                let _profile_scope = semantically_verified.profile.enter();
                 tracing::debug!(
                     "attempting to validate and commit block proposal \
                          onto a cloned non-finalized state"

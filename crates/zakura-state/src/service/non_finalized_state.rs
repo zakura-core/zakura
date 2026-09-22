@@ -9,6 +9,7 @@ use std::{
     sync::Arc,
     time::Instant,
 };
+use zakura_jsonl_trace::block_profile as profiles;
 
 use indexmap::IndexMap;
 use tokio::sync::watch;
@@ -61,6 +62,31 @@ impl ContextualMetrics {
         mined_metric_name: &'static str,
         duration: std::time::Duration,
     ) {
+        use profiles::{Context, Stage};
+        let stage = match metric_name {
+            "state.contextual.parent_chain.duration_seconds" => Some(Stage::ParentChain),
+            "state.contextual.chain_new.duration_seconds" => Some(Stage::ChainNew),
+            "state.contextual.unspent_utxo_snapshot.duration_seconds" => Some(Stage::UtxoSnapshot),
+            "state.contextual.transparent_spend.duration_seconds" => Some(Stage::TransparentSpend),
+            "state.contextual.shielded_anchors.duration_seconds" => Some(Stage::ShieldedAnchors),
+            "state.contextual.sprout_anchor_fetch.duration_seconds" => Some(Stage::SproutAnchors),
+            "state.contextual.block_construction.duration_seconds" => {
+                Some(Stage::BlockConstruction)
+            }
+            "state.contextual.parallel_update.duration_seconds" => Some(Stage::ParallelUpdate),
+            "state.contextual.snapshot_clone.duration_seconds" => Some(Stage::SnapshotClone),
+            "state.contextual.header_transition_prepare.duration_seconds" => {
+                Some(Stage::HeaderTransitionPrepare)
+            }
+            "state.contextual.header_transition_commit.duration_seconds" => {
+                Some(Stage::HeaderTransitionCommit)
+            }
+            "state.contextual.initial_checks.duration_seconds" => Some(Stage::InitialChecks),
+            _ => None,
+        };
+        if let Some(stage) = stage {
+            Context::current().duration(stage, duration);
+        }
         if self == Self::Disabled {
             return;
         }
@@ -793,8 +819,10 @@ impl NonFinalizedState {
         let height = contextual.height;
         let transaction_hashes = contextual.transaction_hashes.clone();
 
+        let profile = profiles::Context::current();
         rayon::in_place_scope_fifo(|scope| {
             scope.spawn_fifo(|_scope| {
+                let _profile = profile.span(profiles::Stage::BlockCommitment);
                 let start = Instant::now();
                 let result = check::block_commitment_is_valid_for_chain_history(
                     block,
@@ -806,6 +834,7 @@ impl NonFinalizedState {
             });
 
             scope.spawn_fifo(|_scope| {
+                let _profile = profile.span(profiles::Stage::SproutAnchorCheck);
                 let start = Instant::now();
                 let result = check::anchors::block_sprout_anchors_refer_to_treestates(
                     sprout_final_treestates,
@@ -822,10 +851,13 @@ impl NonFinalizedState {
             // Pushing a block onto a Chain can launch additional parallel batches.
             // TODO: should we pass _scope into Chain::push()?
             scope.spawn_fifo(|_scope| {
+                let clone_profile = profile.span(profiles::Stage::ChainClone);
                 let chain_clone_start = Instant::now();
                 let new_chain = Arc::unwrap_or_clone(new_chain);
                 let chain_clone_duration = chain_clone_start.elapsed();
 
+                drop(clone_profile);
+                let _push_profile = profile.span(profiles::Stage::ChainPush);
                 let chain_push_start = Instant::now();
                 let result = new_chain.push(contextual).map(Arc::new);
                 chain_push_result =

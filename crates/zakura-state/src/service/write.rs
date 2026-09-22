@@ -7,6 +7,7 @@ use std::{
     sync::{Arc, OnceLock},
     time::{Duration, Instant},
 };
+use zakura_jsonl_trace::block_profile as profiles;
 
 use indexmap::IndexMap;
 use sha2::{Digest, Sha256};
@@ -2904,6 +2905,11 @@ impl WriteBlockWorkerTask {
                 continue;
             };
 
+            let profile = queued_child.profile.clone();
+            profile.duration(profiles::Stage::WriterQueue, queued_at.elapsed());
+            let occupied = profile.span(profiles::Stage::WriterOccupied);
+            let _profile_scope = occupied.context().enter();
+            let contextual_profile = profiles::Context::current().span(profiles::Stage::Contextual);
             let writer_queue_duration = queued_at.elapsed().as_secs_f64();
             metrics::histogram!("state.block_writer.queue.duration_seconds")
                 .record(writer_queue_duration);
@@ -3003,6 +3009,9 @@ impl WriteBlockWorkerTask {
                     }
                 };
 
+            drop(contextual_profile);
+            let publication_profile = profile.span(profiles::Stage::Publication);
+
             // TODO: fix the test timing bugs that require the result to be sent
             //       after `update_latest_chain_channels()`,
             //       and send the result on rsp_tx here
@@ -3071,6 +3080,8 @@ impl WriteBlockWorkerTask {
             // Update the caller with the result.
             let _ = rsp_tx.send(result.map(|()| child_hash).map_err(Into::into));
 
+            drop(publication_profile);
+            let _finalization_profile = profile.span(profiles::Stage::Finalization);
             while non_finalized_state
                 .best_chain_len()
                 .expect("just successfully inserted a non-finalized block above")

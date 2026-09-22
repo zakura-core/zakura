@@ -10,6 +10,7 @@ use std::{
     },
     time::Instant,
 };
+use zakura_jsonl_trace::block_profile as profiles;
 
 use tokio::sync::Notify;
 
@@ -362,7 +363,7 @@ impl std::str::FromStr for HashOrHeight {
 /// This structure contains data from contextual validation, which is computed in
 /// the *service caller*'s task, not inside the service call itself. This allows
 /// moving work out of the single-threaded state service.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct SemanticallyVerifiedBlock {
     /// The block to commit to the state.
     pub block: Arc<Block>,
@@ -400,7 +401,35 @@ pub struct SemanticallyVerifiedBlock {
     /// This is process-local metadata, not serialized block data. Restored
     /// blocks have no order. Orders from different primary sessions cannot be compared.
     pub receipt_order: Option<u64>,
+    /// Process-local observation context. Never serialized or used by validation.
+    pub profile: profiles::Context,
 }
+
+// Observation context must not affect equality of prepared consensus data.
+impl PartialEq for SemanticallyVerifiedBlock {
+    fn eq(&self, other: &Self) -> bool {
+        let Self {
+            block,
+            hash,
+            height,
+            new_outputs,
+            transaction_hashes,
+            deferred_pool_balance_change,
+            auth_data_root,
+            receipt_order,
+            profile: _,
+        } = self;
+        block == &other.block
+            && hash == &other.hash
+            && height == &other.height
+            && new_outputs == &other.new_outputs
+            && transaction_hashes == &other.transaction_hashes
+            && deferred_pool_balance_change == &other.deferred_pool_balance_change
+            && auth_data_root == &other.auth_data_root
+            && receipt_order == &other.receipt_order
+    }
+}
+impl Eq for SemanticallyVerifiedBlock {}
 
 /// Data required to check a prepared mined block before optimistic relay.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -673,6 +702,7 @@ impl ContextuallyVerifiedBlock {
             transaction_hashes,
             deferred_pool_balance_change,
             auth_data_root: _,
+            profile: _,
             receipt_order,
         } = semantically_verified;
 
@@ -727,6 +757,7 @@ impl CheckpointVerifiedBlock {
             transaction_hashes,
             deferred_pool_balance_change: None,
             auth_data_root: None,
+            profile: Default::default(),
             receipt_order: None,
         })
     }
@@ -768,6 +799,7 @@ impl SemanticallyVerifiedBlock {
             deferred_pool_balance_change: None,
             auth_data_root: Some(auth_data_root),
             receipt_order: None,
+            profile: Default::default(),
         }
     }
 
@@ -805,6 +837,7 @@ impl From<Arc<Block>> for SemanticallyVerifiedBlock {
             deferred_pool_balance_change: None,
             auth_data_root: Some(auth_data_root),
             receipt_order: None,
+            profile: Default::default(),
         }
     }
 }
@@ -946,6 +979,7 @@ impl From<ContextuallyVerifiedBlock> for SemanticallyVerifiedBlock {
                 valid.chain_value_pool_change.deferred_amount(),
             )),
             auth_data_root: None,
+            profile: Default::default(),
             receipt_order: valid.receipt_order,
         }
     }
@@ -961,6 +995,7 @@ impl From<FinalizedBlock> for SemanticallyVerifiedBlock {
             transaction_hashes: finalized.transaction_hashes,
             deferred_pool_balance_change: finalized.deferred_pool_balance_change,
             auth_data_root: None,
+            profile: Default::default(),
             receipt_order: None,
         }
     }

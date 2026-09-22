@@ -141,6 +141,7 @@ fn test_block_db_round_trip_with(
                 transaction_hashes,
                 deferred_pool_balance_change: None,
                 auth_data_root: None,
+                profile: Default::default(),
                 receipt_order: None,
             })
         };

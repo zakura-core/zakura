@@ -20,9 +20,10 @@ Overlapping deliveries of the same complete block share their first receipt.
 Different bodies with the same header hash do not share priority. Active
 registrations are removed when their last verification completes or is cancelled.
 Only blocks that passed proof-of-work checks (or the network's authenticated
-waiver) retain a receipt after retryable failures or cancellation. Unchecked and
-PoW-invalid blocks cannot occupy the retry cache. Retried blocks retain only a
-complete-body digest and receipt order, bounded to 4096 entries for one hour after
+waiver) and transaction Merkle root checks retain a receipt after retryable
+failures or cancellation. These checks do not establish full transaction
+validity. Retried blocks retain only a complete-body digest and receipt order,
+bounded to 4096 entries for one hour after
 the last attempt. Each header can retain at most four body variants, including
 canceled attempts. Additional variants evict that header's oldest cached variant
 before they can displace unrelated receipts. Capacity eviction or expiry gives a

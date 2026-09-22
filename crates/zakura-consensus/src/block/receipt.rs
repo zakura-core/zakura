@@ -230,8 +230,8 @@ impl ReceiptRegistry {
         }
     }
 
-    /// Only checked proof of work (or the network's authenticated waiver) earns
-    /// cache space. Cancellation before that point must not retain unchecked input.
+    /// Proof of work (or its authenticated waiver) and the transaction Merkle root
+    /// must pass before retryable failures or cancellation can retain a receipt.
     pub(super) fn allow_retry(&self, hash: block::Hash, order: u64) {
         self.0
             .lock()

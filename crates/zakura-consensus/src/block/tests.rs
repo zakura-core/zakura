@@ -2687,6 +2687,32 @@ async fn receipt_order_precedes_polling_and_cached_mining_uses_solved_submission
                 .await
                 .unwrap();
         }
+        let mut future_block = candidate.as_ref().clone();
+        Arc::make_mut(&mut future_block.header).time = Utc::now()
+            .checked_add_signed(chrono::Duration::hours(3))
+            .unwrap();
+        let future_block = Arc::new(future_block);
+        assert_eq!(
+            verifier
+                .prepared_candidates
+                .lookup(&future_block, Some("receipt-test"), &network)
+                .is_some(),
+            cache_hit
+        );
+        let first = verifier.receipt_orders.register(future_block.clone());
+        let order = first.order;
+        let future_attempt = verifier.call(Request::CommitMined {
+            block: future_block.clone(),
+            work_id: Some("receipt-test".into()),
+            admission: zs::BlockAdmission::pending(),
+        });
+        drop(first);
+        assert!(matches!(
+            future_attempt.await,
+            Err(VerifyBlockError::Time(_))
+        ));
+        assert_eq!(verifier.receipt_orders.register(future_block).order, order);
+
         let request = || Request::CommitMined {
             block: candidate.clone(),
             work_id: Some("receipt-test".into()),
@@ -2965,6 +2991,75 @@ async fn pow_checked_missing_parent_keeps_retry_receipt() {
         ))
     ));
     assert_eq!(verifier.receipt_orders.register(block).order, order);
+}
+
+#[tokio::test]
+async fn merkle_invalid_mined_variants_do_not_displace_retry_receipts() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let block: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
+        .zcash_deserialize_into()
+        .unwrap();
+    let parent = block.header.previous_block_hash;
+    let parent_queries = Arc::new(AtomicUsize::new(0));
+    let state = service_fn({
+        let parent_queries = parent_queries.clone();
+        move |request| {
+            if let zs::Request::KnownBlock(hash) = request {
+                if hash == parent {
+                    parent_queries.fetch_add(1, Ordering::SeqCst);
+                }
+            } else {
+                panic!("unexpected request: {request:?}");
+            }
+            std::future::ready(Ok::<_, BoxError>(zs::Response::KnownBlock(None)))
+        }
+    });
+    let transaction = service_fn(|_| -> std::future::Ready<Result<tx::Response, BoxError>> {
+        panic!("missing parents and invalid Merkle roots precede transaction verification")
+    });
+    let mut verifier = SemanticBlockVerifier::new(&Network::Mainnet, state, transaction);
+    let original = verifier.receipt_orders.register(block.clone());
+    let original_order = original.order;
+    let attempt = verifier.call(Request::CommitMined {
+        block: block.clone(),
+        work_id: None,
+        admission: zs::BlockAdmission::pending(),
+    });
+    drop(original);
+    assert!(matches!(
+        attempt.await,
+        Err(VerifyBlockError::Commit(
+            zs::CommitBlockError::MissingMinedParent
+        ))
+    ));
+    assert_eq!(parent_queries.load(Ordering::SeqCst), 1);
+
+    for value in 1..=4u64 {
+        let mut variant = block.as_ref().clone();
+        Arc::make_mut(&mut variant.transactions[0]).outputs_mut()[0].value =
+            value.try_into().unwrap();
+        let variant = Arc::new(variant);
+        assert_eq!(variant.hash(), block.hash());
+        assert!(matches!(
+            verifier
+                .call(Request::CommitMined {
+                    block: variant,
+                    work_id: None,
+                    admission: zs::BlockAdmission::pending(),
+                })
+                .await,
+            Err(VerifyBlockError::Block {
+                source: BlockError::BadMerkleRoot { .. }
+            })
+        ));
+    }
+
+    assert_eq!(parent_queries.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        verifier.receipt_orders.register(block).order,
+        original_order
+    );
 }
 
 #[tokio::test]

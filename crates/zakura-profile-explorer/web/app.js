@@ -56,6 +56,7 @@ async function refresh() {
   finally { loading=false; }
 }
 async function openDetail(run,attempt) {
+  if(selected!==run){selected=run;await refresh();}
   const data=await api(`/api/attempt/${run}/${attempt}`), row=data.summary;
   $('detail').hidden=false; $('detail-title').textContent=`Block ${number(row.height)} · attempt ${attempt}`;
   $('detail-meta').textContent=`${row.hash} · ${row.outcome || 'unfinished'} · ${quality(row)} · run ${row.run}`;
@@ -64,11 +65,7 @@ async function openDetail(run,attempt) {
   $('trace').href=`/api/trace/${run}/${attempt}`; $('raw').href=`/api/attempt/${run}/${attempt}`;
   const spans=[...data.spans].sort((a,b)=>a.start_us-b.start_us), start=row.start_us || 0;
   const end=Math.max(row.end_us||start,...spans.map(s=>s.end_us)), duration=Math.max(end-start,1);
-  const lanes=[];
-  if(row.end_us != null) lanes.push({stage:'Verifier request',start_us:start,end_us:row.end_us,root:true});
-  lanes.push(...spans);
-  $('timeline').replaceChildren(...lanes.map(s=>{const lane=el('div',null,`lane${s.root?' root':''}`), track=el('div',null,'lane-bar'),bar=el('div',null,'bar');bar.style.left=`${Math.max(0,(s.start_us-start)/duration*100)}%`;bar.style.width=`${Math.max(0,(s.end_us-s.start_us)/duration*100)}%`;bar.title=`${ms(s.start_us-start)} → ${ms(s.end_us-start)}`;track.append(bar);lane.append(el('span',s.stage.replaceAll('_',' '),'lane-name'),track,el('span',ms(s.end_us-s.start_us)));return lane;}));
-  renderFinalization(spans);
+  renderTimeline(spans,row,start,duration);
   renderCpu(data.cpu);
   $('detail').scrollIntoView({behavior:'smooth'});
 }
@@ -85,13 +82,40 @@ const finalizationLabels = {
   rocksdb_write: 'Write RocksDB batch', finalization_publication: 'Publish updated state',
   snapshot_clone: 'Copy state snapshot', header_transition_prepare: 'Prepare header transition'
 };
-function renderFinalization(spans) {
-  const host=$('finalization'); host.replaceChildren();
-  const root=spans.find(s=>s.stage==='finalization'); if(!root)return;
-  host.append(el('h2','Finalization breakdown'),el('p',`${ms(root.end_us-root.start_us)} total. This moves older blocks into finalized storage and can continue after the verifier responds.`,'muted'));
+const transactionStages = new Set(['transaction','transaction_inputs','transaction_checks','sapling_request','halo2_request','worker_queue','worker_execution']);
+function renderTimeline(spans,row,start,duration) {
+  const host=$('timeline');host.replaceChildren();
+  const finalization=spans.find(s=>s.stage==='finalization'), transactions=spans.find(s=>s.stage==='transactions');
   const children=new Map();
   for(const span of spans){if(!children.has(span.parent))children.set(span.parent,[]);children.get(span.parent).push(span);}
-  if(!children.get(root.span)?.length){host.append(el('p','Detailed finalization timings were not recorded for this block. New recordings include this breakdown.','muted'));return;}
+  const finalizationIds=new Set();
+  function collect(parent,depth=0){if(depth>8)return;for(const span of children.get(parent)||[]){if(finalizationIds.has(span.span))continue;finalizationIds.add(span.span);collect(span.span,depth+1);}}
+  if(finalization)collect(finalization.span);
+  const transactionDetail=spans.filter(s=>transactionStages.has(s.stage)&&!finalizationIds.has(s.span));
+  const transactionIds=new Set(transactionDetail.map(s=>s.span));
+  function lane(span,tag='div',label=span.stage.replaceAll('_',' ')) {
+    const line=el(tag,null,`lane${span.root?' root':''}`),track=el('div',null,'lane-bar'),bar=el('div',null,'bar');
+    bar.style.left=`${Math.max(0,(span.start_us-start)/duration*100)}%`;bar.style.width=`${Math.max(0,(span.end_us-span.start_us)/duration*100)}%`;
+    bar.title=`${ms(span.start_us-start)} → ${ms(span.end_us-start)}`;track.append(bar);
+    line.append(el('span',label,'lane-name'),track,el('span',ms(span.end_us-span.start_us),'lane-time'));return line;
+  }
+  if(row.end_us!=null)host.append(lane({stage:'Verifier request',start_us:start,end_us:row.end_us,root:true}));
+  for(const span of spans){
+    if(finalizationIds.has(span.span)||(transactions&&transactionIds.has(span.span)))continue;
+    if(span===transactions){
+      const group=el('details',null,'timeline-group transactions'),body=el('div',null,'timeline-children');
+      group.append(lane(span,'summary',`Transactions (${number(row.transactions)})`));
+      if(transactionDetail.length)body.append(...transactionDetail.map(s=>lane(s)));else body.append(el('p','No individual transaction timings were retained.','muted'));
+      group.append(body);host.append(group);
+    }else if(span===finalization){
+      const group=el('details',null,'timeline-group finalization'),body=el('div',null,'timeline-children');
+      group.append(lane(span,'summary','Finalization'));renderFinalization(body,span,children);group.append(body);host.append(group);
+    }else host.append(lane(span));
+  }
+}
+function renderFinalization(host,root,children) {
+  host.append(el('p',`${ms(root.end_us-root.start_us)} total. This moves older blocks into finalized storage and can continue after the verifier responds.`,'muted'));
+  if(!children.get(root.span)?.length){host.append(el('p','This recording has only the total. A replay with detailed instrumentation is needed to measure its substeps.','muted'));return;}
   const t=el('table'),head=el('tr');for(const title of ['Step','Elapsed','Share of finalization'])head.append(el('th',title));
   const thead=el('thead');thead.append(head);t.append(thead);const body=el('tbody'),seen=new Set([root.span]);
   function visit(parent,depth){if(depth>8)return;for(const span of children.get(parent)||[]){if(seen.has(span.span))continue;seen.add(span.span);const row=el('tr'),name=el('td',`${'↳ '.repeat(depth)}${finalizationLabels[span.stage]||span.stage.replaceAll('_',' ')}`),elapsed=span.end_us-span.start_us;
@@ -116,6 +140,7 @@ $('run').addEventListener('change',()=>{selected=$('run').value;refresh();});
 $('mode').addEventListener('change',refresh);
 $('close').addEventListener('click',()=>{$('detail').hidden=true;history.replaceState(null,'',location.pathname);});
 $('search').addEventListener('submit',async e=>{e.preventDefault();try{table('results',await api(`/api/search?q=${encodeURIComponent($('query').value.trim())}`));$('search-results').hidden=false;$('search-results').scrollIntoView({behavior:'smooth'});}catch(error){note(error.message);}});
-refresh();setInterval(refresh,10000);
 const linked=/^#([a-f0-9]{32})\/(\d+)$/.exec(location.hash);
+if(linked)selected=linked[1];
+refresh();setInterval(refresh,10000);
 if(linked)openDetail(linked[1],linked[2]).catch(e=>note(e.message));

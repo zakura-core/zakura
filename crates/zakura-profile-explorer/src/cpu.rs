@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
     collections::BTreeMap,
+    fmt::{self, Write},
     fs::{self, File},
     io::Read,
     path::Path,
@@ -200,9 +201,41 @@ pub(crate) fn window(
     let mut stacks: Vec<_> = stacks.into_iter().collect();
     stacks.sort_by_key(|entry| std::cmp::Reverse(entry.1));
     stacks.truncate(200);
+    for (frames, _) in &mut stacks {
+        for frame in frames {
+            *frame = readable_frame(frame);
+        }
+    }
     Ok(
         json!({"status":"available","scope":"process samples during the request interval; includes other blocks and background work","samples":samples,"unknown_samples":unknown,"sparse":samples<100,"clock_error_us":run_metadata.clock_error_us,"captures":captures,"covered_intervals_us":covered,"stacks":stacks.into_iter().map(|(frames,count)|json!({"frames":frames,"samples":count})).collect::<Vec<_>>() }),
     )
+}
+
+// Some perf builds demangle C++ but leave Rust v0 symbols encoded.
+fn readable_frame(frame: &str) -> String {
+    let (symbol, suffix) = frame
+        .rsplit_once(" (")
+        .map_or((frame, ""), |(symbol, _)| (symbol, &frame[symbol.len()..]));
+    let Ok(symbol) = rustc_demangle::try_demangle(symbol) else {
+        return frame.to_owned();
+    };
+    struct Label(String);
+    impl Write for Label {
+        fn write_str(&mut self, text: &str) -> fmt::Result {
+            if self.0.len().saturating_add(text.len()) > 1024 {
+                return Err(fmt::Error);
+            }
+            self.0.push_str(text);
+            Ok(())
+        }
+    }
+    // Bound expansion while formatting, before allocating the expanded symbol.
+    let mut label = Label(String::new());
+    if write!(&mut label, "{symbol:#}{suffix}").is_ok() {
+        label.0
+    } else {
+        frame.to_owned()
+    }
 }
 
 pub(crate) fn recover(db: &Connection, path: &Path) -> Result<()> {

@@ -205,7 +205,10 @@ fn cpu_samples_use_process_scope_and_exclude_clock_boundaries() -> Result<()> {
             .map(|offset| crate::cpu::Sample {
                 mono_us: 1_000_000 + offset,
                 tid: 1,
-                frames: vec!["synthetic function".into()],
+                frames: vec![
+                    "_RNvC6_123foo3bar (zakurad)".into(),
+                    "native function (libc.so.6)".into(),
+                ],
             })
             .collect(),
     };
@@ -218,6 +221,14 @@ fn cpu_samples_use_process_scope_and_exclude_clock_boundaries() -> Result<()> {
     let result = Reader::open(temp.path())?.detail(RUN, 1)?;
     assert_eq!(result["cpu"]["samples"], 1);
     assert_eq!(result["cpu"]["sparse"], true);
+    assert_eq!(
+        result["cpu"]["stacks"][0]["frames"][0],
+        "123foo::bar (zakurad)"
+    );
+    assert_eq!(
+        result["cpu"]["stacks"][0]["frames"][1],
+        "native function (libc.so.6)"
+    );
     assert!(result["cpu"]["scope"]
         .as_str()
         .unwrap()

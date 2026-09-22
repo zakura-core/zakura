@@ -15,6 +15,7 @@ use std::{
 };
 use zakura_jsonl_trace::block_profile as profiles;
 
+pub(crate) const MAX_INGEST_BATCH: usize = 256;
 const MAX_CHUNK_EVENTS: usize = 4096;
 const MAX_DECODE_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_DETAIL_CHUNKS: usize = 64;
@@ -138,6 +139,25 @@ impl Store {
         Ok(())
     }
 
+    /// Commit a bounded receive batch with one durable SQLite sync. Each event keeps its
+    /// own savepoint, so malformed events cannot advance the sequence. A batch commit
+    /// failure is fatal to the collector; reopening recovers any unpublished chunks.
+    pub(crate) fn ingest_batch(&mut self, frames: Vec<Frame>) -> Result<u64> {
+        ensure!(
+            frames.len() <= MAX_INGEST_BATCH,
+            "receive batch exceeds bound"
+        );
+        self.db.execute_batch("SAVEPOINT profile_ingest")?;
+        let mut errors = 0u64;
+        for frame in frames {
+            if self.ingest(frame).is_err() {
+                errors = errors.saturating_add(1);
+            }
+        }
+        self.db.execute_batch("RELEASE profile_ingest")?;
+        Ok(errors)
+    }
+
     pub(crate) fn ingest(&mut self, frame: Frame) -> Result<()> {
         match frame {
             Frame::Run { schema, run } => {
@@ -203,7 +223,7 @@ impl Store {
                 let attempt = integer(attempt_id(&data))?;
                 ensure!(attempt > 0, "invalid attempt");
                 // A transaction keeps sequence deduplication consistent with summary writes.
-                let tx = self.db.unchecked_transaction()?;
+                let tx = self.db.savepoint()?;
                 tx.execute(
                     "UPDATE runs SET sequence=?,gaps=gaps+?,seen_ms=? WHERE id=?",
                     params![
@@ -321,7 +341,7 @@ impl Store {
         let temp = self.path.join("chunks").join(format!("{id}.tmp"));
         let final_path = temp.with_extension("zst");
         let size = write_payload(&temp, &final_path, &compressed, |size| {
-            let tx = self.db.unchecked_transaction()?;
+            let tx = self.db.savepoint()?;
             tx.execute(
                 "INSERT INTO chunks VALUES(?,?,?,0)",
                 params![id, integer(size)?, integer(now_ms())?],

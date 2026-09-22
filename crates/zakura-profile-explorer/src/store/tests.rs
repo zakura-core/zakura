@@ -253,3 +253,105 @@ fn failed_catalog_commit_removes_payload_and_preserves_budget() -> Result<()> {
     assert!(store.storage_bytes()? < 16_000_000);
     Ok(())
 }
+
+#[test]
+fn receive_batch_syncs_once_and_isolates_invalid_events() -> Result<()> {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    let temp = tempfile::tempdir()?;
+    let mut store = Store::open(temp.path(), 16_000_000)?;
+    let commits = Arc::new(AtomicUsize::new(0));
+    let count = commits.clone();
+    store.db.commit_hook(Some(move || {
+        count.fetch_add(1, Ordering::Relaxed);
+        false
+    }))?;
+    let mut invalid = span();
+    if let Event::Span { end_us, .. } = &mut invalid {
+        *end_us = 0;
+    }
+    assert_eq!(
+        store.ingest_batch(vec![
+            metadata(),
+            event(1, finish()),
+            event(2, invalid),
+            event(2, span()),
+            event(
+                3,
+                Event::Seal {
+                    attempt: 1,
+                    spans: 1,
+                    dropped: 0
+                }
+            ),
+        ])?,
+        1
+    );
+    assert_eq!(commits.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        store
+            .db
+            .pragma_query_value::<u32, _>(None, "synchronous", |r| r.get(0))?,
+        2
+    );
+    store.flush()?;
+    drop(store);
+    let _reopened = Store::open(temp.path(), 16_000_000)?;
+    assert_eq!(Reader::open(temp.path())?.detail(RUN, 1)?["complete"], true);
+    Ok(())
+}
+
+#[test]
+fn receive_batch_can_publish_a_full_chunk_and_recover_a_failed_commit() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let mut store = Store::open(temp.path(), 16_000_000)?;
+    store.ingest(metadata())?;
+    let mut sequence = 0u64;
+    for batch in 0..(MAX_CHUNK_EVENTS / MAX_INGEST_BATCH) {
+        let frames = (0..MAX_INGEST_BATCH)
+            .map(|index| {
+                sequence += 1;
+                let mut data = span();
+                if let Event::Span { attempt, span, .. } = &mut data {
+                    *attempt = u64::try_from(batch + 1).unwrap();
+                    *span = u64::try_from(index + 1).unwrap();
+                }
+                event(sequence, data)
+            })
+            .collect();
+        assert_eq!(store.ingest_batch(frames)?, 0);
+    }
+    assert!(store.pending.is_empty());
+    assert_eq!(
+        Reader::open(temp.path())?.detail(RUN, 1)?["spans"]
+            .as_array()
+            .unwrap()
+            .len(),
+        MAX_INGEST_BATCH
+    );
+    // Force the next chunk to publish its file, then reject the outer catalog commit.
+    for _ in 0..(MAX_CHUNK_EVENTS - 1) {
+        store.pending.push(Detail {
+            run: RUN.into(),
+            data: span(),
+        });
+    }
+    store.db.commit_hook(Some(|| true))?;
+    assert!(store
+        .ingest_batch(vec![event(sequence + 1, span())])
+        .is_err());
+    store.db.commit_hook(None::<fn() -> bool>)?;
+    drop(store);
+    let reopened = Store::open(temp.path(), 16_000_000)?;
+    assert_eq!(fs::read_dir(temp.path().join("chunks"))?.count(), 1);
+    assert_eq!(
+        reopened
+            .db
+            .query_row("SELECT sequence FROM runs WHERE id=?", [RUN], |r| r
+                .get::<_, i64>(0))?,
+        i64::try_from(sequence)?
+    );
+    Ok(())
+}

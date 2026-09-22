@@ -124,22 +124,41 @@ fn collect(
     let mut maintenance = std::time::Instant::now();
     let mut errors = 0u64;
     while !stopping.load(Ordering::Acquire) {
-        match socket.recv(&mut bytes) {
-            Ok(n) if n <= 8192 => {
-                let result = serde_json::from_slice(&bytes[..n])
-                    .map_err(anyhow::Error::from)
-                    .and_then(|frame| store.ingest(frame));
-                if result.is_err() {
-                    errors = errors.saturating_add(1);
+        let mut frames = Vec::with_capacity(store::MAX_INGEST_BATCH);
+        let mut decode = |bytes: &[u8], n| {
+            if n <= 8192 {
+                match serde_json::from_slice(&bytes[..n]) {
+                    Ok(frame) => frames.push(frame),
+                    Err(_) => errors = errors.saturating_add(1),
                 }
+            } else {
+                errors = errors.saturating_add(1);
             }
-            Ok(_) => errors = errors.saturating_add(1),
+        };
+        // Wait for the first datagram, then drain only the already queued burst.
+        // Neither the receive batch nor the SQLite transaction can grow without bound.
+        match socket.recv(&mut bytes) {
+            Ok(n) => {
+                decode(&bytes, n);
+                socket.set_nonblocking(true)?;
+                for _ in 1..store::MAX_INGEST_BATCH {
+                    match socket.recv(&mut bytes) {
+                        Ok(n) => decode(&bytes, n),
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                        Err(error) => return Err(error.into()),
+                    }
+                }
+                socket.set_nonblocking(false)?;
+            }
             Err(error)
                 if matches!(
                     error.kind(),
                     std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
                 ) => {}
             Err(error) => return Err(error.into()),
+        }
+        if !frames.is_empty() {
+            errors = errors.saturating_add(store.ingest_batch(frames)?);
         }
         if tick.elapsed() >= Duration::from_secs(1) {
             if store.flush().is_err() {

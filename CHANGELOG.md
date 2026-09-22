@@ -14,7 +14,8 @@ independently.
 ### Added
 
 - Added an opt-in block profile explorer with finalization timings for state
-  updates, database preparation and writes, pruning, and publication.
+  updates, database preparation and writes, pruning, and publication. Timeline
+  detail expands on demand, and bounded collector batches reduce capture loss.
 
 ## [1.5.0-rc0] - 2026-09-21
 

@@ -364,11 +364,14 @@ impl Store {
     pub(crate) fn prune(&mut self) -> Result<()> {
         self.used = self.storage_bytes()?;
         if self.used < self.budget * 85 / 100 {
-            for entry in fs::read_dir(self.path.join("inbox"))?.take(8) {
+            let ready = fs::read_dir(self.path.join("inbox"))?.filter(|entry| {
+                entry.as_ref().map_or(true, |entry| {
+                    entry.path().extension().is_some_and(|e| e == "json")
+                })
+            });
+            for entry in ready.take(8) {
                 let entry = entry?;
-                if entry.path().extension().is_some_and(|e| e == "json")
-                    && crate::cpu::import(&self.db, &self.path, &entry.path()).is_err()
-                {
+                if crate::cpu::import(&self.db, &self.path, &entry.path()).is_err() {
                     self.discarded = self.discarded.saturating_add(1);
                     fs::remove_file(entry.path())?;
                 }

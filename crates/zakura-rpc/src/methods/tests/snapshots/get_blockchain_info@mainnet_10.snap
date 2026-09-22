@@ -1,5 +1,5 @@
 ---
-source: zebra-rpc/src/methods/tests/snapshot.rs
+source: crates/zakura-rpc/src/methods/tests/snapshot.rs
 expression: info
 ---
 {
@@ -57,6 +57,7 @@ expression: info
       "monitored": false
     }
   ],
+  "nsmValueBalanceZat": 0,
   "upgrades": {
     "5ba81b19": {
       "name": "Overwinter",

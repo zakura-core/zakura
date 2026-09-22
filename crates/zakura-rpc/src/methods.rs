@@ -1627,6 +1627,7 @@ where
             prune_height,
             (tip_height, tip_hash),
             value_balance,
+            nsm_value_balance_zat,
             difficulty,
         ) = {
             use zakura_state::ReadResponse::*;
@@ -1643,14 +1644,25 @@ where
                 unreachable!("unmatched response to a PruningInfo request")
             };
 
-            let (tip, value_balance) = match tip_pool_values_rsp {
+            // TipPoolValues soft-fails to genesis + a synthetic zero ValueBalance. The NSM
+            // counter is optional and distinguishes "not reported" from a legitimate zero, so
+            // only populate it when the query succeeded.
+            let (tip, value_balance, nsm_value_balance_zat) = match tip_pool_values_rsp {
                 Ok(TipPoolValues {
                     tip_height,
                     tip_hash,
                     value_balance,
-                }) => ((tip_height, tip_hash), value_balance),
+                }) => (
+                    (tip_height, tip_hash),
+                    value_balance,
+                    Some(value_balance.nsm_value_balance_amount()),
+                ),
                 Ok(_) => unreachable!("unmatched response to a TipPoolValues request"),
-                Err(_) => ((Height::MIN, network.genesis_hash()), Default::default()),
+                Err(_) => (
+                    (Height::MIN, network.genesis_hash()),
+                    Default::default(),
+                    None,
+                ),
             };
 
             let difficulty = chain_tip_difficulty
@@ -1662,6 +1674,7 @@ where
                 prune_height,
                 tip,
                 value_balance,
+                nsm_value_balance_zat,
                 difficulty,
             )
         };
@@ -1755,6 +1768,7 @@ where
             estimated_height,
             chain_supply: GetBlockchainInfoBalance::chain_supply(value_balance),
             value_pools: GetBlockchainInfoBalance::value_pools(value_balance, None),
+            nsm_value_balance_zat,
             upgrades,
             consensus,
             headers: header_height,
@@ -4377,6 +4391,32 @@ pub struct GetBlockchainInfoResponse {
     #[serde(deserialize_with = "deserialize_blockchain_value_pool_balances")]
     value_pools: BlockchainValuePoolBalances,
 
+    /// The ZIP 234 NSM value balance, in zatoshis.
+    ///
+    /// This is an accounting counter rather than a pool of spendable value: it tracks
+    /// historical unclaimed issuance plus scheduled issuance, minus issuance since NU7, and
+    /// is what funds reissuance. It is deliberately absent from
+    /// [`chain_supply`](Self::chain_supply) and [`value_pools`](Self::value_pools), which
+    /// report monetary supply, so that summing those fields still yields the supply.
+    ///
+    /// The stored counter is signed. Contextual validation requires it to stay non-negative
+    /// from NU7 onward, but it carries no such guarantee before then, so clients must accept
+    /// a negative value.
+    ///
+    /// Reported in zatoshis only. There is no `zcashd` field to stay compatible with, and a
+    /// ZEC `f64` cannot represent every zatoshi amount exactly.
+    ///
+    /// `None` means the responding node does not report the counter, which is not the same
+    /// as reporting zero: zero is a legitimate balance. Nodes that know the value always
+    /// send it. When tip pool values are unavailable, the field is omitted.
+    #[serde(
+        rename = "nsmValueBalanceZat",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[getter(copy)]
+    nsm_value_balance_zat: Option<Amount<NegativeAllowed>>,
+
     /// Status of network upgrades
     upgrades: IndexMap<ConsensusBranchIdHex, NetworkUpgradeInfo>,
 
@@ -4524,6 +4564,7 @@ impl Default for GetBlockchainInfoResponse {
             estimated_height: Height(1),
             chain_supply: GetBlockchainInfoBalance::chain_supply(Default::default()),
             value_pools: GetBlockchainInfoBalance::zero_pools(),
+            nsm_value_balance_zat: None,
             upgrades: IndexMap::new(),
             consensus: TipConsensusBranch {
                 chain_tip: ConsensusBranchIdHex(ConsensusBranchId::default()),
@@ -4572,6 +4613,9 @@ impl GetBlockchainInfoResponse {
             estimated_height,
             chain_supply,
             value_pools,
+            // Left unset so this constructor's signature stays stable; callers that
+            // report the ZIP 234 counter set it with `with_nsm_value_balance_zat`.
+            nsm_value_balance_zat: None,
             upgrades,
             consensus,
             headers,
@@ -4584,6 +4628,18 @@ impl GetBlockchainInfoResponse {
             commitments,
             header_chain: None,
         }
+    }
+
+    /// Sets the ZIP 234 NSM value balance, in zatoshis.
+    ///
+    /// [`GetBlockchainInfoResponse::new`] predates this field and leaves it unset, so that
+    /// adding the field did not change its argument list.
+    pub fn with_nsm_value_balance_zat(
+        mut self,
+        nsm_value_balance_zat: Amount<NegativeAllowed>,
+    ) -> Self {
+        self.nsm_value_balance_zat = Some(nsm_value_balance_zat);
+        self
     }
 }
 

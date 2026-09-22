@@ -323,6 +323,13 @@ impl QueuedBlocks {
     }
 }
 
+#[derive(Debug)]
+struct SharedSentUtxo {
+    utxo: transparent::Utxo,
+    /// Number of distinct sent block hashes that contain this output.
+    owners: usize,
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct SentHashes {
     /// A list of previously sent block batches, each batch is in increasing height order.
@@ -336,8 +343,8 @@ pub(crate) struct SentHashes {
     /// may not be in the finalized state yet.
     pub sent: HashMap<block::Hash, Vec<transparent::OutPoint>>,
 
-    /// Known UTXOs.
-    known_utxos: HashMap<transparent::OutPoint, transparent::Utxo>,
+    /// Outputs retained until their last tracked block leaves the cache.
+    known_utxos: HashMap<transparent::OutPoint, SharedSentUtxo>,
 
     /// Whether the hashes in this struct can be used check if the chain can be forked.
     /// This is set to false until all checkpoint-verified block hashes have been pruned.
@@ -368,22 +375,7 @@ impl SentHashes {
     /// Assumes that blocks are added in the order of their height between `finish_batch` calls
     /// for efficient pruning.
     pub fn add(&mut self, block: &SemanticallyVerifiedBlock) {
-        // Track known UTXOs in sent blocks.
-        let outpoints = block
-            .new_outputs
-            .iter()
-            .map(|(outpoint, ordered_utxo)| {
-                self.known_utxos
-                    .insert(*outpoint, ordered_utxo.utxo.clone());
-                outpoint
-            })
-            .cloned()
-            .collect();
-
-        self.curr_buf.push_back((block.hash, block.height));
-        self.sent.insert(block.hash, outpoints);
-
-        self.update_metrics_for_block(block.height);
+        self.add_outputs(block.hash, block.height, &block.new_outputs);
     }
 
     /// Stores the checkpoint verified `block`'s hash, height, and UTXOs, so they can be used to check if a
@@ -397,28 +389,52 @@ impl SentHashes {
     ///
     /// For more details see `add()`.
     pub fn add_finalized(&mut self, block: &CheckpointVerifiedBlock) {
-        // Track known UTXOs in sent blocks.
-        let outpoints = block
-            .new_outputs
+        self.add_outputs(block.hash, block.height, &block.new_outputs);
+    }
+
+    fn add_outputs(
+        &mut self,
+        hash: block::Hash,
+        height: block::Height,
+        outputs: &HashMap<transparent::OutPoint, transparent::OrderedUtxo>,
+    ) {
+        // Startup visits shared ancestors once per retained chain.
+        if self.sent.contains_key(&hash) {
+            return;
+        }
+
+        let outpoints = outputs
             .iter()
             .map(|(outpoint, ordered_utxo)| {
                 self.known_utxos
-                    .insert(*outpoint, ordered_utxo.utxo.clone());
-                outpoint
+                    .entry(*outpoint)
+                    .and_modify(|shared| {
+                        shared.owners = shared
+                            .owners
+                            .checked_add(1)
+                            .expect("each owner occupies an allocated sent block entry");
+                        shared.utxo = ordered_utxo.utxo.clone();
+                    })
+                    .or_insert_with(|| SharedSentUtxo {
+                        utxo: ordered_utxo.utxo.clone(),
+                        owners: 1,
+                    });
+                *outpoint
             })
-            .cloned()
             .collect();
 
-        self.curr_buf.push_back((block.hash, block.height));
-        self.sent.insert(block.hash, outpoints);
+        self.curr_buf.push_back((hash, height));
+        self.sent.insert(hash, outpoints);
 
-        self.update_metrics_for_block(block.height);
+        self.update_metrics_for_block(height);
     }
 
     /// Try to look up this UTXO in any sent block.
     #[instrument(skip(self))]
     pub fn utxo(&self, outpoint: &transparent::OutPoint) -> Option<transparent::Utxo> {
-        self.known_utxos.get(outpoint).cloned()
+        self.known_utxos
+            .get(outpoint)
+            .map(|shared| shared.utxo.clone())
     }
 
     /// Finishes the current block batch, and stores it for efficient pruning.
@@ -445,11 +461,7 @@ impl SentHashes {
                     buf.push_front((hash, height));
                     return true;
                 } else if let Some(expired_outpoints) = self.sent.remove(&hash) {
-                    // TODO: only remove UTXOs if there are no queued blocks with that UTXO
-                    //       (known_utxos is best-effort, so this is ok for now)
-                    for outpoint in expired_outpoints.iter() {
-                        self.known_utxos.remove(outpoint);
-                    }
+                    Self::release_outputs(&mut self.known_utxos, &expired_outpoints);
                 }
             }
 
@@ -468,24 +480,38 @@ impl SentHashes {
         self.sent.contains_key(hash)
     }
 
-    /// Removes a `hash` from `SentHashes`, dropping its outpoints from `known_utxos`
-    /// and its entry from whichever batch buffer holds it.
+    /// Removes a block hash and its batch entry, releasing outputs no other sent block owns.
     ///
-    /// Called when the block write task rejects a block, so that a subsequent
-    /// re-delivery of a block with the same hash is not short-circuited as a
-    /// "duplicate" against a rejected variant that never reached any chain.
+    /// Rejected or evicted blocks must be eligible for redelivery without removing
+    /// outputs that an in-flight sibling still supplies to `AwaitUtxo` requests.
     pub fn remove(&mut self, hash: &block::Hash) {
         let Some(outpoints) = self.sent.remove(hash) else {
             return;
         };
 
-        for outpoint in &outpoints {
-            self.known_utxos.remove(outpoint);
-        }
+        Self::release_outputs(&mut self.known_utxos, &outpoints);
 
         self.curr_buf.retain(|(h, _)| h != hash);
         for buf in &mut self.bufs {
             buf.retain(|(h, _)| h != hash);
+        }
+    }
+
+    fn release_outputs(
+        known_utxos: &mut HashMap<transparent::OutPoint, SharedSentUtxo>,
+        outpoints: &[transparent::OutPoint],
+    ) {
+        for outpoint in outpoints {
+            let shared = known_utxos
+                .get_mut(outpoint)
+                .expect("each tracked output has a cache entry");
+            shared.owners = shared
+                .owners
+                .checked_sub(1)
+                .expect("each cache entry has an owning block");
+            if shared.owners == 0 {
+                known_utxos.remove(outpoint);
+            }
         }
     }
 

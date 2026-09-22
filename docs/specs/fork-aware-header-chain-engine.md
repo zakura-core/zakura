@@ -557,7 +557,7 @@ A peer that does not offer stream version 8 has no header-sync relationship with
 | Local sync checkpoints | Exact configured hash plus absolute trust pin | Checkpoint verifier / finalized state | Trusted local policy; normal post-anchor validation |
 | Finality | Automatic 1,000-deep disclosed local pin | Only fully verified full-state finalization | Deliberate mode-specific trust policy |
 | Work | Same target-derived formula | Same | Zcash consensus ordering input |
-| Equal-work tie | Greater raw `block::Hash.0` | Greater raw `block::Hash.0` | Zakura deterministic policy; differs from protocol first-seen guidance |
+| Equal-work tie | Greater raw `block::Hash.0` | Earlier tip receipt, with unstamped tips first and raw hash for equal receipt orders | Separate header and full-state policies under LC-SELECT-03 |
 | Transaction Merkle/body matching | Cannot validate without body/proof | Validated | Deliberate impossibility boundary |
 | Coinbase height and subsidy | Cannot validate | Validated | Deliberate difference |
 | Transactions, signatures, scripts, proofs | Cannot validate | Validated | Deliberate difference |
@@ -635,7 +635,7 @@ The following matrix supersedes the old audit invariant that the verified chain 
 | Covered heights are branch-blind | generation- and branch-keyed coverage retired on change | IN-05/AUD-08 |
 | Invalidate/reconsider bypass reconciliation | one durable transition for every eligibility/selection mutation | IN-01, IN-04/AUD-10..12 |
 | VCT repair survives reset | branch/generation-scoped repair ownership and retirement | IN-06/AUD-09 |
-| Equal-work header/full-state mismatch | exact raw `block::Hash.0` comparator | HV-07, DF-01/AUD-03 |
+| Incorrect equal-work verified frontier | separate header and full-state comparators; atomic verified frontier follows full state | HV-07, DF-01/AUD-03 |
 | Single-chain overlay cannot retain candidates | hash-addressed bounded DAG plus selected projection | DG-01, DG-06/AUD-01..04 |
 | Headers cannot prove full validity | independent frontiers and evidence-based body feedback | DG-02, IN-02, DF-02 |
 | Missing durable anchor / `UnknownAnchor` incident | atomic hash DAG/projection, durable-before-publish, local bounded recovery | DG-03, IN-07/AUD-INCIDENT |
@@ -726,7 +726,7 @@ The “architecture dependency check” asserts that wallet scanning, FlyClient 
 
 **LC-ACCEPT-01 [LS] — Complete regression coverage.** The redesign MUST NOT be accepted until every normative rule maps to a passing deterministic test, every audit finding maps to a prevention rule and regression, and all 15 audit scenarios plus `AUD-INCIDENT` pass.
 
-**LC-ACCEPT-02 [LS] — Durable deterministic frontiers.** In every test and crash point, each published frontier MUST be durable and walkable to `finalized`. For the same finalized anchor and admitted candidates, event order and response partitioning MUST NOT change fork choice. Headers-only finality changes that anchor irreversibly and is accepted only with the explicit policy, proof, and disclosure in LC-FINAL-03, LC-FINAL-04, and LC-SCOPE-08.
+**LC-ACCEPT-02 [LS] — Durable deterministic frontiers.** In every test and crash point, each published frontier MUST be durable and walkable to `finalized`. For the same finalized anchor and admitted candidates, event order and response partitioning MUST NOT change `header_best`. For `verified_best`, verification and commit completion order MUST NOT change selection when candidate receipt metadata is fixed. Different receipt orders MAY change equal-work full-state selection under LC-SELECT-03. Headers-only finality changes that anchor irreversibly and is accepted only with the explicit policy, proof, and disclosure in LC-FINAL-03, LC-FINAL-04, and LC-SCOPE-08.
 
 **LC-ACCEPT-03 [LS] — Zero stale-generation effects.** Stale generations MUST have zero frontier, coverage, retry, repair, scheduling, publication, body-task, and peer-score effects.
 
@@ -747,7 +747,7 @@ The implementation must share code with or remain differential-test equivalent t
 | Compact target, work formula, and integer ordering | `crates/zakura-chain/src/work/difficulty.rs`; its target conversion remains authoritative, but the redesign replaces the existing `u128` `Work` and `PartialCumulativeWork` storage with the exact 256-bit representation required by LC-VAL-10 and LC-WORKCALC-01 |
 | Equihash and context-free PoW checks | `crates/zakura-consensus/src/block/check.rs` |
 | Contextual 28-header difficulty, 11-header MTP, and MTP+90-minute rule | `crates/zakura-state/src/service/check/difficulty.rs`, `crates/zakura-state/src/service/check.rs` |
-| Full-state greatest-work/raw-tip-hash ordering | `crates/zakura-state/src/service/non_finalized_state/chain.rs` (`impl Ord for Chain`) |
+| Full-state greatest-work/first-received ordering with raw-tip-hash fallback | `crates/zakura-state/src/service/non_finalized_state/chain.rs` (`impl Ord for Chain`) |
 | Local 1,000-block finality horizon | `crates/zakura-chain/src/parameters/constants.rs`, `crates/zakura-state/src/constants.rs` |
 | Shared non-finalized fork cap | `MAX_NON_FINALIZED_CHAIN_FORKS` (today `crates/zakura-state/src/constants.rs`; the redesign MUST hoist one shared definition into `zakura-chain::parameters` consumed by both full state and the header engine) |
 | Checkpoint hashes and verification | `crates/zakura-chain/src/parameters/checkpoint/`, `crates/zakura-consensus/src/checkpoint.rs` |

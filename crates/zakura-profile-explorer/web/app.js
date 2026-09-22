@@ -38,7 +38,6 @@ async function refresh() {
     const data = await api('/api/home');
     const run = data.runs.find(r=>r.metadata.id===data.run), health = data.health;
     const fresh = health && Date.now()-health.updated_ms<15000, nodeFresh = run && Date.now()-run.seen_ms<10000;
-    $('connection').textContent = fresh && nodeFresh ? '● Recording' : '○ Retained evidence';
     const notices = [];
     if (!fresh) notices.push('Collector is offline or its health is stale.');
     if (run && !nodeFresh) notices.push('This node is no longer sending observations.');
@@ -46,7 +45,7 @@ async function refresh() {
     if (data.excluded_timings) notices.push(`${number(data.excluded_timings)} recordings excluded from timing statistics because of known measurement interference.`);
     note(notices.join(' '));
     for (const key of ['latest','outliers','failures']) table(key,data[key]);
-  } catch (error) { note(error.message); $('connection').textContent='○ Connection unavailable'; }
+  } catch (error) { note(error.message); }
   finally { loading=false; }
 }
 async function openDetail(run,attempt) {

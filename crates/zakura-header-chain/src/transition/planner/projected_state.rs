@@ -81,7 +81,7 @@ impl<'a> ProjectedTransitionState<'a> {
         Ok(())
     }
 
-    /// Drop body availability after full-state eviction and recheck verified selection.
+    /// Drop evicted bodies outside the surviving full-state verified path.
     pub(super) fn forget_evicted_bodies(
         &mut self,
         hashes: &[block::Hash],
@@ -94,7 +94,6 @@ impl<'a> ProjectedTransitionState<'a> {
                 )
             }) {
                 self.set_body_validation_state(hash, BodyValidationState::Unknown)?;
-                self.verified_selection_dirty = true;
             }
         }
         Ok(())
@@ -158,7 +157,7 @@ impl<'a> ProjectedTransitionState<'a> {
         Ok(())
     }
 
-    /// Reselect after operator policy or retained body availability changes.
+    /// Reselect after operator policy changes, with evicted bodies already removed.
     pub(super) fn refresh_verified_selection(
         &mut self,
         preferred_tip: Option<Frontier>,

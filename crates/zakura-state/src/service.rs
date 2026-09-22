@@ -863,6 +863,9 @@ impl StateService {
             write::NonFinalizedWriteUpdate::Evicted(hashes) => {
                 self.non_finalized_block_write_sent_hashes
                     .remove_many(&hashes);
+                for hash in hashes {
+                    self.non_finalized_failed_ancestors.shift_remove(&hash);
+                }
                 // Resource eviction does not invalidate queued descendants.
                 return;
             }

@@ -1,0 +1,53 @@
+name: Block profiles
+
+on:
+  pull_request:
+    branches: [main, "adam/block-profile-*"]
+    paths:
+      - "crates/zakura-jsonl-trace/**"
+      - "crates/zakura-profile-explorer/**"
+      - "deploy/block-profile/**"
+      - "scripts/block-profile-smoke.py"
+      - ".github/workflows/block-profile.yml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  local-profile:
+    name: Linux recorder and explorer
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      CARGO_PROFILE_DEV_DEBUG: 1
+      CARGO_PROFILE_TEST_DEBUG: 1
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        run: rustup toolchain install 1.97.1 --profile minimal --component rustfmt,clippy
+      - name: Check and test profile crates
+        run: |
+          cargo +1.97.1 fmt --all -- --check
+          cargo +1.97.1 clippy --locked -p zakura-jsonl-trace -p zakura-profile-explorer --all-targets -- -D warnings
+          cargo +1.97.1 test --locked -p zakura-jsonl-trace -p zakura-profile-explorer
+          cargo +1.97.1 build --locked -p zakura-profile-explorer
+          cargo +1.97.1 build --locked -p zakura-jsonl-trace --example block_profile
+      - name: Exercise collection, queries, and crash recovery
+        run: |
+          python3 scripts/block-profile-smoke.py
+          node --check crates/zakura-profile-explorer/web/app.js
+      - name: Check deployment tools when present
+        run: |
+          if [[ -d deploy/block-profile ]]; then
+            python3 -m unittest discover -s deploy/block-profile -p 'test_*.py'
+            bash -n deploy/block-profile/install.sh
+          fi

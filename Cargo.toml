@@ -16,6 +16,7 @@ members = [
         "deploy/zakura-watchdog",
         "crates/xtask",
         "crates/zakura-jsonl-trace",
+        "crates/zakura-profile-explorer",
 ]
 
 # The asset packaging crate publishes on the release-state cadence rather than with the

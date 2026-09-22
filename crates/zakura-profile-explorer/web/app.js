@@ -45,10 +45,6 @@ async function refresh() {
     if (health?.errors) notices.push(`${number(health.errors)} collector errors. Detail may be incomplete.`);
     if (data.excluded_timings) notices.push(`${number(data.excluded_timings)} recordings excluded from timing statistics because of known measurement interference.`);
     note(notices.join(' '));
-    const used = health ? `${(health.used / 1e9).toFixed(2)} / ${(health.budget / 1e9).toFixed(0)} GB` : 'Unavailable';
-    const stats = [[number(data.counts.captured),'Requests captured · last 24h'],[number(data.counts.success),'Accepted or checked · last 24h'],[number(data.counts.sealed_detail),'Sealed detail · last 24h'],[used,'Profiler storage · excludes chain state']];
-    $('stats').replaceChildren(...stats.map(([value,label])=>{const box=el('div',null,'stat');box.append(el('b',value),el('span',label));return box;}));
-    $('cohort').textContent = run ? `${run.metadata.network} · ${run.metadata.storage.split('(')[0]} node · ${run.metadata.build}` : 'Waiting for the first node recording.';
     for (const key of ['latest','outliers','failures']) table(key,data[key]);
   } catch (error) { note(error.message); $('connection').textContent='○ Connection unavailable'; }
   finally { loading=false; }

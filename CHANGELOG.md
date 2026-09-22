@@ -16,9 +16,9 @@ independently.
 - Added an opt-in block profile explorer with finalization timings for state
   updates, database preparation and writes, pruning, and publication. Timeline
   detail opens on a dedicated block page, expands on demand, and shows total
-  recorded time. Home follows the current profile automatically without session
-  or route controls. Searches prefer the latest recording per block, known
-  measurement interference is labeled and
+  recorded time. Home starts with the latest blocks and search, and follows the
+  current profile automatically without session or route controls. Searches
+  prefer the latest recording per block. Known measurement interference is labeled and
   excluded from timing statistics, and bounded collector batches reduce capture loss.
 
 ## [1.5.0-rc0] - 2026-09-21

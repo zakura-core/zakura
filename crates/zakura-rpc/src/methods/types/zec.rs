@@ -229,7 +229,7 @@ mod tests {
 
     use zakura_chain::amount::{NonNegative, MAX_MONEY};
 
-    /// The lockbox balance that made `getblockchaininfo` unparseable on a NU7 chain.
+    /// The lockbox balance that made `getblockchaininfo` unparsable on a NU7 chain.
     ///
     /// Before NU7 the lockbox accrues 18_750_000 zatoshi per block, which is 0.1875 ZEC and
     /// needs only four decimal places, so it always round-tripped. NU7 divides the subsidy by

@@ -1627,6 +1627,7 @@ where
             prune_height,
             (tip_height, tip_hash),
             value_balance,
+            nsm_value_balance_zat,
             difficulty,
         ) = {
             use zakura_state::ReadResponse::*;
@@ -1643,14 +1644,25 @@ where
                 unreachable!("unmatched response to a PruningInfo request")
             };
 
-            let (tip, value_balance) = match tip_pool_values_rsp {
+            // TipPoolValues soft-fails to genesis + a synthetic zero ValueBalance. The NSM
+            // counter is optional and distinguishes "not reported" from a legitimate zero, so
+            // only populate it when the query succeeded.
+            let (tip, value_balance, nsm_value_balance_zat) = match tip_pool_values_rsp {
                 Ok(TipPoolValues {
                     tip_height,
                     tip_hash,
                     value_balance,
-                }) => ((tip_height, tip_hash), value_balance),
+                }) => (
+                    (tip_height, tip_hash),
+                    value_balance,
+                    Some(value_balance.nsm_value_balance_amount()),
+                ),
                 Ok(_) => unreachable!("unmatched response to a TipPoolValues request"),
-                Err(_) => ((Height::MIN, network.genesis_hash()), Default::default()),
+                Err(_) => (
+                    (Height::MIN, network.genesis_hash()),
+                    Default::default(),
+                    None,
+                ),
             };
 
             let difficulty = chain_tip_difficulty
@@ -1662,6 +1674,7 @@ where
                 prune_height,
                 tip,
                 value_balance,
+                nsm_value_balance_zat,
                 difficulty,
             )
         };
@@ -1755,7 +1768,7 @@ where
             estimated_height,
             chain_supply: GetBlockchainInfoBalance::chain_supply(value_balance),
             value_pools: GetBlockchainInfoBalance::value_pools(value_balance, None),
-            nsm_value_balance_zat: Some(value_balance.nsm_value_balance_amount()),
+            nsm_value_balance_zat,
             upgrades,
             consensus,
             headers: header_height,
@@ -4395,7 +4408,7 @@ pub struct GetBlockchainInfoResponse {
     ///
     /// `None` means the responding node does not report the counter, which is not the same
     /// as reporting zero: zero is a legitimate balance. Nodes that know the value always
-    /// send it.
+    /// send it. When tip pool values are unavailable, the field is omitted.
     #[serde(
         rename = "nsmValueBalanceZat",
         default,

@@ -118,7 +118,10 @@ approval policy.
 
 PR events are not filtered by base branch, and periodic reconciliation includes
 all open PRs. If an approved PR moves away from `main`, the adapter withdraws its
-approval; PRs on other bases cannot receive a new approval.
+approval; PRs on other bases cannot receive a new approval. The retarget event
+itself runs on the new base, which the `main`-only environment does not admit,
+so the writer job skips it. Withdrawal then waits for the next run on `main`:
+a comment on that PR, a manual dispatch, or hourly reconciliation.
 
 A read-only permission preflight skips the App job when no target PR has an
 authorized author. The exception is cleanup: a PR with an existing App approval

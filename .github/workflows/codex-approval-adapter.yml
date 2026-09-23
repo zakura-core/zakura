@@ -60,7 +60,10 @@ jobs:
 
   reconcile:
     needs: audit
+    # The environment admits only main; runs on other bases (stacked or
+    # retargeted PRs) skip here and rely on main-context runs for cleanup.
     if: >-
+      github.ref == 'refs/heads/main' &&
       !cancelled() && needs.audit.result != 'skipped' &&
       needs.audit.outputs.run_reconcile == 'true' &&
       vars.CODEX_APPROVAL_ENABLED == 'true'

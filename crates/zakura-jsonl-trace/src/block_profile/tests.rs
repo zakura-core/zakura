@@ -359,3 +359,137 @@ fn full_detail_queue_never_blocks_or_loses_the_root_summary() {
     );
     assert!(started.elapsed() < Duration::from_secs(5));
 }
+
+#[cfg(unix)]
+mod transport {
+    use super::*;
+    use std::os::unix::net::UnixDatagram;
+
+    fn run() -> Run {
+        Run {
+            id: "11111111111111111111111111111111".into(),
+            node: "test".into(),
+            session: "synthetic".into(),
+            network: "regtest".into(),
+            build: "test".into(),
+            storage: "pruned".into(),
+            pid: 1,
+            utc_start_ms: 0,
+            monotonic_start_us: None,
+            clock_error_us: 1,
+            startup_gate: false,
+        }
+    }
+
+    #[test]
+    fn burst_survives_a_temporarily_full_collector_socket() {
+        const SPANS: usize = 1024;
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("collector.sock");
+        let socket = UnixDatagram::bind(&path).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let (recorder, detail, summary) = recorder();
+        let runtime = Runtime {
+            recorder: recorder.clone(),
+        };
+        let root = begin_with(&recorder, block()).unwrap();
+        for _ in 0..SPANS {
+            drop(root.context().span(Stage::BlockChecks));
+        }
+        root.finish(Outcome::Success);
+        let worker = std::thread::spawn(move || export(path, run(), recorder, detail, summary));
+        let mut bytes = [0; 8193];
+        let n = socket.recv(&mut bytes).unwrap();
+        assert!(matches!(
+            serde_json::from_slice::<Frame>(&bytes[..n]).unwrap(),
+            Frame::Run { .. }
+        ));
+        // Let the exporter fill the socket while the collector is busy elsewhere.
+        std::thread::sleep(Duration::from_millis(100));
+        let mut sequence = 0;
+        let mut spans = std::collections::BTreeSet::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while sequence < u64::try_from(SPANS + 3).unwrap() {
+            assert!(Instant::now() < deadline, "exporter must drain the burst");
+            let n = socket.recv(&mut bytes).unwrap();
+            match serde_json::from_slice::<Frame>(&bytes[..n]).unwrap() {
+                Frame::Event {
+                    sequence: next,
+                    data,
+                    ..
+                } => {
+                    assert_eq!(next, sequence + 1, "no dropped or duplicate events");
+                    sequence = next;
+                    if let Event::Span { span, .. } = data {
+                        assert!(spans.insert(span));
+                    }
+                }
+                Frame::Health {
+                    transport_dropped, ..
+                } => assert_eq!(transport_dropped, 0),
+                Frame::Run { .. } => {}
+            }
+        }
+        assert_eq!(spans, (1..=u64::try_from(SPANS).unwrap()).collect());
+        drop(runtime);
+        worker.join().unwrap();
+    }
+
+    fn fill_socket(socket: &UnixDatagram, path: &std::path::Path) {
+        for _ in 0..10_000 {
+            match socket.send_to(&[0], path) {
+                Ok(_) => {}
+                Err(error) if retryable_send_error(&error) => return,
+                Err(error) => panic!("unexpected socket error: {error}"),
+            }
+        }
+        panic!("test must reach socket backpressure");
+    }
+
+    #[test]
+    fn permanently_full_socket_has_a_retry_deadline() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("collector.sock");
+        let _receiver = UnixDatagram::bind(&path).unwrap();
+        let socket = UnixDatagram::unbound().unwrap();
+        socket.set_nonblocking(true).unwrap();
+        fill_socket(&socket, &path);
+        let frame = Frame::Run {
+            schema: SCHEMA_VERSION,
+            run: run(),
+        };
+        let started = Instant::now();
+        assert!(!send_frame(&socket, &path, &frame, &AtomicBool::new(false)));
+        assert!(started.elapsed() >= SEND_RETRY_TIMEOUT);
+        assert!(started.elapsed() < SEND_RETRY_TIMEOUT + Duration::from_secs(1));
+    }
+
+    #[test]
+    fn shutdown_interrupts_a_pending_socket_retry() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("collector.sock");
+        let _receiver = UnixDatagram::bind(&path).unwrap();
+        let socket = UnixDatagram::unbound().unwrap();
+        socket.set_nonblocking(true).unwrap();
+        fill_socket(&socket, &path);
+        let frame = Frame::Run {
+            schema: SCHEMA_VERSION,
+            run: run(),
+        };
+        let stopped = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            let worker = scope.spawn(|| send_frame(&socket, &path, &frame, &stopped));
+            std::thread::sleep(Duration::from_millis(50));
+            assert!(
+                !worker.is_finished(),
+                "full socket must retain the pending frame"
+            );
+            let started = Instant::now();
+            stopped.store(true, Ordering::Release);
+            assert!(!worker.join().unwrap());
+            assert!(started.elapsed() < Duration::from_millis(250));
+        });
+    }
+}

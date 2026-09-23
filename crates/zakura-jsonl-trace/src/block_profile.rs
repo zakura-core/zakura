@@ -32,6 +32,8 @@ const MAX_FINE_SPANS: u64 = MAX_SPANS - 128;
 /// Fixed-size event queue slots. Detail and summary queue storage stays below 64 MiB.
 const DETAIL_CAPACITY: usize = 131_072;
 const SUMMARY_CAPACITY: usize = 2048;
+#[cfg(unix)]
+const SEND_RETRY_TIMEOUT: Duration = Duration::from_secs(1);
 
 static RECORDER: OnceLock<Arc<Recorder>> = OnceLock::new();
 thread_local! { static CURRENT: RefCell<Context> = const { RefCell::new(Context(None)) }; }
@@ -860,6 +862,45 @@ fn recorder() -> (Arc<Recorder>, Receiver<Event>, Receiver<Event>) {
 }
 
 #[cfg(unix)]
+fn retryable_send_error(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+    ) || error.raw_os_error() == Some(libc::ENOBUFS)
+}
+
+#[cfg(unix)]
+fn send_frame(
+    socket: &std::os::unix::net::UnixDatagram,
+    path: &std::path::Path,
+    frame: &Frame,
+    stopped: &AtomicBool,
+) -> bool {
+    let Ok(bytes) = serde_json::to_vec(frame) else {
+        return false;
+    };
+    if bytes.len() > 8192 {
+        return false;
+    }
+    let deadline = Instant::now() + SEND_RETRY_TIMEOUT;
+    loop {
+        match socket.send_to(&bytes, path) {
+            Ok(sent) => return sent == bytes.len(),
+            Err(error)
+                if retryable_send_error(&error)
+                    && !stopped.load(Ordering::Acquire)
+                    && Instant::now() < deadline =>
+            {
+                // Only the exporter waits. Keep this frame and sequence while the bounded
+                // producer queues absorb the burst, without spinning on a full socket.
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            Err(_) => return false,
+        }
+    }
+}
+
+#[cfg(unix)]
 fn export(
     path: PathBuf,
     run: Run,
@@ -880,10 +921,7 @@ fn export(
     let mut health = Instant::now() - Duration::from_secs(2);
     let mut connected = false;
     let send = |frame: &Frame| {
-        let result = serde_json::to_vec(frame)
-            .ok()
-            .filter(|bytes| bytes.len() <= 8192)
-            .is_some_and(|bytes| socket.send_to(&bytes, &path).is_ok());
+        let result = send_frame(&socket, &path, frame, &recorder.stopped);
         if !result {
             transport_dropped.set(transport_dropped.get().saturating_add(1));
         }

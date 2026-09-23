@@ -23,6 +23,8 @@ The root measures router entry through the caller's result. It excludes caller r
 
 An attempt owns no block payload or consensus state. At most 1,024 attempt contexts, 131,072 detail events, and 2,048 summary events are retained by the recorder. Each attempt permits 65,536 spans, reserving 128 for state phases after transaction/worker detail. The fixed event queues use less than 64 MiB. Queue writes are nonblocking. Only the exporter thread serializes and sends datagrams, each at most 8,192 bytes. It sends repeated run metadata and health counters to recover collector restarts.
 
+If the socket temporarily fills or a send is interrupted, the exporter retains the serialized datagram and retries every 2 ms for up to one second. Its transport sequence stays unchanged. Only this background thread waits, and the existing bounded queues absorb new events. Shutdown interrupts retries. Permanent send errors, an exhausted retry deadline, or sustained queue pressure still cause counted loss. Successful retries do not increment transport-drop counters.
+
 Transaction contexts carry their zero-based position in the block. Descendant spans inherit that index across async polls and worker handoffs, and their parent IDs identify the owning transaction span. Transaction envelope spans also record the already-computed mined transaction ID as `transaction_hash`, in internal byte order. Child spans do not repeat the hash. Both transaction fields are optional for compatibility with older recordings. The collector must be upgraded before the node to preserve these fields and accept span IDs above the previous limit of 256. The larger budget preserves ordinary block detail while retaining bounded loss under extreme fanout or collection pressure.
 
 ## Wire format

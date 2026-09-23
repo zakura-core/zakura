@@ -46,7 +46,7 @@ use crate::{
             VctAuxiliaryWindow, VctSuccessorWitness, ZakuraDb,
         },
         non_finalized_state::{ContextualMetrics, NonFinalizedState},
-        queued_blocks::{QueuedCheckpointVerified, QueuedSemanticallyVerified},
+        queued_blocks::{QueuedBlockVariants, QueuedCheckpointVerified},
         ChainTipBlock, ChainTipSender, InvalidateError, ReconsiderError,
     },
     CheckpointVerifiedBlock, CommitBlockError, CommitCheckpointVerifiedError,
@@ -1800,8 +1800,8 @@ pub enum NonFinalizedWriteMessage {
     /// A newly downloaded and semantically verified block prepared for
     /// contextual validation and insertion into the non-finalized state.
     Commit {
-        /// The block, response channel, and optional lifecycle reporter.
-        queued: QueuedSemanticallyVerified,
+        /// Distinct bodies for one header, with their response channels and lifecycle reporters.
+        queued: QueuedBlockVariants,
         /// The instant immediately before the state service attempted the channel send.
         queued_at: Instant,
         /// Bounds queued block bodies and blocks relay against an unpublished transition.
@@ -2944,33 +2944,44 @@ impl WriteBlockWorkerTask {
                 }
             };
 
-            let Some(((queued_child, rsp_tx, admission, attempt), queued_at, _write_slot)) =
-                queued_child_and_rsp_tx
-            else {
+            let Some((queued_variants, queued_at, _write_slot)) = queued_child_and_rsp_tx else {
                 continue;
             };
 
-            let writer_queue_duration = queued_at.elapsed().as_secs_f64();
-            metrics::histogram!("state.block_writer.queue.duration_seconds")
-                .record(writer_queue_duration);
-            let is_mined = admission.is_some();
-            let contextual_metrics = ContextualMetrics::for_commit(is_mined);
-            if is_mined {
-                metrics::histogram!("state.block_writer.queue.mined.duration_seconds")
-                    .record(writer_queue_duration);
-            }
-            let child_hash = queued_child.hash;
-            let parent_hash = queued_child.block.header.previous_block_hash;
-            let child_height = queued_child.height;
+            let attempt = queued_variants
+                .iter()
+                .map(|variant| variant.3)
+                .max()
+                .expect("a queued header has at least one body");
+            let first = &queued_variants[0].0;
+            let child_hash = first.hash;
+            let parent_hash = first.block.header.previous_block_hash;
             let rejected_ancestor_hash = rejected_ancestor_map.get(&parent_hash).copied();
+            let mut variants = queued_variants.into_iter().peekable();
+            let mut any_retryable_failure = false;
+            let (rsp_tx, result) = loop {
+                let (queued_child, rsp_tx, admission, _) = variants
+                    .next()
+                    .expect("a queued header has a body until the final result");
+                let writer_queue_duration = queued_at.elapsed().as_secs_f64();
+                metrics::histogram!("state.block_writer.queue.duration_seconds")
+                    .record(writer_queue_duration);
+                let is_mined = admission.is_some();
+                let contextual_metrics = ContextualMetrics::for_commit(is_mined);
+                if is_mined {
+                    metrics::histogram!("state.block_writer.queue.mined.duration_seconds")
+                        .record(writer_queue_duration);
+                }
+                let child_height = queued_child.height;
 
-            // If the parent block was marked as rejected, also reject all its children.
-            //
-            // At this point, we know that all the block's descendants
-            // are invalid, because we checked all the consensus rules before
-            // committing the failing ancestor block to the non-finalized state.
-            let result: Result<(), CommitBlockError> =
-                if let Some(ancestor_hash) = rejected_ancestor_hash {
+                // If the parent block was marked as rejected, also reject all its children.
+                //
+                // At this point, we know that all the block's descendants
+                // are invalid, because we checked all the consensus rules before
+                // committing the failing ancestor block to the non-finalized state.
+                let result: Result<(), CommitBlockError> = if let Some(ancestor_hash) =
+                    rejected_ancestor_hash
+                {
                     Err(Box::new(ValidateContextError::InvalidAncestorBlock(ancestor_hash)).into())
                 } else {
                     tracing::trace!(?child_hash, "validating queued child");
@@ -3049,12 +3060,27 @@ impl WriteBlockWorkerTask {
                     }
                 };
 
+                if result.is_ok() || variants.peek().is_none() {
+                    break (rsp_tx, result);
+                }
+                any_retryable_failure |= result.as_ref().is_err_and(|error| {
+                    NonFinalizedWriteFailureKind::from_error(error)
+                        == NonFinalizedWriteFailureKind::Retryable
+                });
+                // A rejected body does not reject the header while another body can still commit.
+                let _ = rsp_tx.send(result.map(|()| child_hash).map_err(Into::into));
+            };
+
             // TODO: fix the test timing bugs that require the result to be sent
             //       after `update_latest_chain_channels()`,
             //       and send the result on rsp_tx here
 
             if let Err(error) = &result {
-                let failure_kind = NonFinalizedWriteFailureKind::from_error(error);
+                let failure_kind = if any_retryable_failure {
+                    NonFinalizedWriteFailureKind::Retryable
+                } else {
+                    NonFinalizedWriteFailureKind::from_error(error)
+                };
 
                 // If the block is invalid, mark any descendant blocks as rejected.
                 if failure_kind == NonFinalizedWriteFailureKind::Invalid {
@@ -3123,6 +3149,22 @@ impl WriteBlockWorkerTask {
             if !evicted.is_empty() {
                 let _ = non_finalized_write_update_sender
                     .send(NonFinalizedWriteUpdate::Evicted(evicted));
+            }
+
+            let location = if non_finalized_state
+                .best_chain()
+                .is_some_and(|chain| chain.contains_block_hash(child_hash))
+            {
+                crate::KnownBlock::BestChain
+            } else {
+                crate::KnownBlock::SideChain
+            };
+            for (_, response, _, _) in variants {
+                let _ = response.send(Err(CommitBlockError::new_duplicate(
+                    Some(child_hash.into()),
+                    location.clone(),
+                )
+                .into()));
             }
 
             // Update the caller with the result.

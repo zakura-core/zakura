@@ -1,7 +1,7 @@
 //! Queued blocks that are awaiting their parent block for verification.
 
 use std::{
-    collections::{hash_map::Drain, BTreeMap, HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     iter, mem,
 };
 
@@ -21,6 +21,9 @@ mod tests;
 
 /// Bounds semantically verified blocks retained while their parents are unavailable.
 pub(crate) const MAX_QUEUED_BLOCKS: usize = crate::MAX_BLOCK_REORG_HEIGHT as usize;
+
+/// Limits competing bodies for one header while their parent is unavailable.
+pub(crate) const MAX_QUEUED_BODY_VARIANTS: usize = 4;
 
 /// A checkpoint verified block and its response channel.
 pub type CheckpointCommit = (
@@ -43,11 +46,16 @@ pub type QueuedSemanticallyVerified = (
     u64,
 );
 
+/// Nonempty set of distinct bodies sharing one header, validated together by the writer.
+pub(super) type QueuedBlockVariants = Vec<QueuedSemanticallyVerified>;
+
 /// A queue of blocks, awaiting the arrival of parent blocks.
 #[derive(Debug, Default)]
 pub struct QueuedBlocks {
     /// Blocks awaiting their parent blocks for contextual verification.
-    blocks: HashMap<block::Hash, QueuedSemanticallyVerified>,
+    blocks: HashMap<block::Hash, QueuedBlockVariants>,
+    /// Counts bodies, including variants, against the shared queue limit.
+    body_count: usize,
     /// Hashes from `queued_blocks`, indexed by parent hash.
     by_parent: HashMap<block::Hash, HashSet<block::Hash>>,
     /// Hashes from `queued_blocks`, indexed by block height.
@@ -59,22 +67,54 @@ pub struct QueuedBlocks {
 impl QueuedBlocks {
     /// Returns true when the orphan queue cannot retain another distinct block.
     pub fn is_full(&self) -> bool {
-        self.blocks.len() >= MAX_QUEUED_BLOCKS
+        self.body_count >= MAX_QUEUED_BLOCKS
+    }
+
+    /// Identical retries use no extra space. Only immediately drained bodies can exceed
+    /// the shared limit, so a missing parent can still release a full queue.
+    pub fn can_queue(&self, block: &SemanticallyVerifiedBlock, drains_now: bool) -> bool {
+        if let Some(variants) = self.blocks.get(&block.hash) {
+            if variants.iter().any(|old| old.0.block == block.block) {
+                return true;
+            }
+            if variants.len() >= MAX_QUEUED_BODY_VARIANTS {
+                return false;
+            }
+        }
+        !self.is_full() || drains_now
     }
 
     /// Queue a block for eventual verification and commit.
     ///
-    /// # Panics
-    ///
-    /// - if a block with the same `block::Hash` has already been queued.
+    /// The caller must check [`Self::can_queue`] before adding a body. An identical
+    /// retry replaces its response channel but preserves its original receipt.
     #[instrument(skip(self), fields(height = ?new.0.height, hash = %new.0.hash))]
-    pub fn queue(&mut self, new: QueuedSemanticallyVerified) {
+    pub fn queue(&mut self, mut new: QueuedSemanticallyVerified) {
         let new_hash = new.0.hash;
         let new_height = new.0.height;
         let parent_hash = new.0.block.header.previous_block_hash;
 
-        if self.blocks.contains_key(&new_hash) {
-            // Skip queueing the block and return early if the hash is not unique
+        if let Some(variants) = self.blocks.get(&new_hash) {
+            let first = &variants[0].0;
+            assert_eq!(first.height, new_height);
+            assert_eq!(first.block.header.previous_block_hash, parent_hash);
+        }
+
+        if let Some(old) = self
+            .blocks
+            .get_mut(&new_hash)
+            .and_then(|variants| variants.iter_mut().find(|old| old.0.block == new.0.block))
+        {
+            new.0.receipt_order = old.0.receipt_order;
+            let (_, response, admission, _) = mem::replace(old, new);
+            if let Some(admission) = admission {
+                admission.reject();
+            }
+            let _ = response.send(Err(CommitBlockError::new_duplicate(
+                Some(new_hash.into()),
+                KnownBlock::Queue,
+            )
+            .into()));
             return;
         }
 
@@ -84,7 +124,8 @@ impl QueuedBlocks {
                 .insert(*outpoint, ordered_utxo.utxo.clone());
         }
 
-        self.blocks.insert(new_hash, new);
+        self.blocks.entry(new_hash).or_default().push(new);
+        self.body_count += 1;
         self.by_height
             .entry(new_height)
             .or_default()
@@ -111,6 +152,14 @@ impl QueuedBlocks {
         &mut self,
         parent_hash: block::Hash,
     ) -> Vec<QueuedSemanticallyVerified> {
+        self.dequeue_child_variants(parent_hash)
+            .into_iter()
+            .flatten()
+            .collect()
+    }
+
+    /// Keep all bodies for a header together until one passes contextual validation.
+    pub fn dequeue_child_variants(&mut self, parent_hash: block::Hash) -> Vec<QueuedBlockVariants> {
         let queued_children = self
             .by_parent
             .remove(&parent_hash)
@@ -123,7 +172,7 @@ impl QueuedBlocks {
             })
             .collect::<Vec<_>>();
 
-        for queued in &queued_children {
+        for queued in queued_children.iter().flatten() {
             if let Some(hashes) = self.by_height.get_mut(&queued.0.height) {
                 hashes.remove(&queued.0.hash);
 
@@ -138,6 +187,7 @@ impl QueuedBlocks {
                 self.known_utxos.remove(outpoint);
             }
         }
+        self.body_count -= queued_children.iter().map(Vec::len).sum::<usize>();
 
         tracing::trace!(
             dequeued = queued_children.len(),
@@ -198,46 +248,33 @@ impl QueuedBlocks {
         mem::swap(&mut self.by_height, &mut by_height);
 
         for hash in by_height.into_values().flatten() {
-            let (expired_block, expired_sender, admission, _) =
-                self.blocks.remove(&hash).expect("block is present");
-            let parent_hash = &expired_block.block.header.previous_block_hash;
-
-            if let Some(admission) = admission {
-                admission.reject();
+            let variants = self.blocks.remove(&hash).expect("block is present");
+            self.body_count -= variants.len();
+            let parent_hash = variants[0].0.block.header.previous_block_hash;
+            for (expired_block, expired_sender, admission, _) in variants {
+                if let Some(admission) = admission {
+                    admission.reject();
+                }
+                let _ = expired_sender.send(Err(CommitBlockError::new_duplicate(
+                    Some(expired_block.height.into()),
+                    KnownBlock::Finalized,
+                )
+                .into()));
+                // The cache is best-effort when different headers share an output.
+                for outpoint in expired_block.new_outputs.keys() {
+                    self.known_utxos.remove(outpoint);
+                }
             }
-
-            // we don't care if the receiver was dropped
-            let _ = expired_sender.send(Err(CommitBlockError::new_duplicate(
-                Some(expired_block.height.into()),
-                KnownBlock::Finalized,
-            )
-            .into()));
-
-            // TODO: only remove UTXOs if there are no queued blocks with that UTXO
-            //       (known_utxos is best-effort, so this is ok for now)
-            for outpoint in expired_block.new_outputs.keys() {
-                self.known_utxos.remove(outpoint);
-            }
-
             let parent_list = self
                 .by_parent
-                .get_mut(parent_hash)
-                .expect("parent is present");
-
-            if parent_list.len() == 1 {
-                let removed = self
-                    .by_parent
-                    .remove(parent_hash)
-                    .expect("parent is present");
-                assert!(
-                    removed.contains(&hash),
-                    "hash must be present in parent hash list"
-                );
-            } else {
-                assert!(
-                    parent_list.remove(&hash),
-                    "hash must be present in parent hash list"
-                );
+                .get_mut(&parent_hash)
+                .expect("a queued block is indexed by its parent");
+            assert!(
+                parent_list.remove(&hash),
+                "a queued block is indexed by its hash"
+            );
+            if parent_list.is_empty() {
+                self.by_parent.remove(&parent_hash);
             }
         }
 
@@ -245,43 +282,12 @@ impl QueuedBlocks {
         self.update_metrics();
     }
 
-    /// Return the queued block if it has already been registered
+    /// Return the first queued body for test inspection.
+    #[cfg(test)]
     pub fn get_mut(&mut self, hash: &block::Hash) -> Option<&mut QueuedSemanticallyVerified> {
-        self.blocks.get_mut(hash)
-    }
-
-    /// Replaces a same-hash queued request and its retained body.
-    pub fn replace(
-        &mut self,
-        hash: block::Hash,
-        new: QueuedSemanticallyVerified,
-    ) -> QueuedSemanticallyVerified {
-        let old = self
-            .blocks
-            .insert(hash, new)
-            .expect("replacement hash exists in the queue");
-        let replacement = self
-            .blocks
-            .get_mut(&hash)
-            .expect("replacement was inserted under the same hash");
-        assert_eq!(old.0.height, replacement.0.height);
-        assert_eq!(
-            old.0.block.header.previous_block_hash,
-            replacement.0.block.header.previous_block_hash
-        );
-        // The queue can retain a body longer than the verifier's retry receipt cache.
-        if old.0.block == replacement.0.block {
-            replacement.0.receipt_order = old.0.receipt_order;
-        }
-
-        for outpoint in old.0.new_outputs.keys() {
-            self.known_utxos.remove(outpoint);
-        }
-        for (outpoint, ordered_utxo) in &replacement.0.new_outputs {
-            self.known_utxos
-                .insert(*outpoint, ordered_utxo.utxo.clone());
-        }
-        old
+        self.blocks
+            .get_mut(hash)
+            .and_then(|variants| variants.first_mut())
     }
 
     /// Update metrics after the queue is modified
@@ -299,7 +305,7 @@ impl QueuedBlocks {
             metrics::gauge!("state.memory.queued.max.height").set(f64::NAN);
         }
 
-        metrics::gauge!("state.memory.queued.block.count").set(self.blocks.len() as f64);
+        metrics::gauge!("state.memory.queued.block.count").set(self.body_count as f64);
     }
 
     /// Try to look up this UTXO in any queued block.
@@ -312,14 +318,19 @@ impl QueuedBlocks {
     /// Returns all key-value pairs of blocks as an iterator.
     ///
     /// Doesn't update the metrics, because it is only used when the state is being dropped.
-    pub fn drain(&mut self) -> Drain<'_, block::Hash, QueuedSemanticallyVerified> {
+    pub fn drain(
+        &mut self,
+    ) -> impl Iterator<Item = (block::Hash, QueuedSemanticallyVerified)> + '_ {
         self.known_utxos.clear();
         self.known_utxos.shrink_to_fit();
         self.by_parent.clear();
         self.by_parent.shrink_to_fit();
         self.by_height.clear();
 
-        self.blocks.drain()
+        self.body_count = 0;
+        self.blocks
+            .drain()
+            .flat_map(|(hash, variants)| variants.into_iter().map(move |queued| (hash, queued)))
     }
 }
 

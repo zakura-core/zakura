@@ -36,6 +36,13 @@ failures, and blocks ahead of the local clock can retry. Permanent block and
 transaction failures release their receipts even when peer attribution must
 remain inconclusive.
 
+The state queue retains up to four distinct bodies per header while waiting for
+its parent. Every body counts against the existing global queue limit. Identical
+retries replace their response channel and keep their original receipt. Distinct
+bodies keep separate receipts until contextual validation finds a valid body.
+Rejecting one body does not reject the header or its children while another
+retained body can still commit.
+
 For example, A arrives before B, but B finishes verification first. Mining can
 briefly use B while A is unverified. Once A passes, equal-work selection chooses
 A. If B gains a child with more cumulative work, mining switches to that child.

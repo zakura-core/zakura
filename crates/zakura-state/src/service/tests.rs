@@ -713,6 +713,191 @@ fn prepared_relay_preflight_rejects_a_forged_commitment() {
     ));
 }
 
+/// Exercise real V5 authorizing-data variants through the queue and writer, including
+/// the header engine, descendant completion, and the retained mining receipt.
+#[tokio::test(flavor = "multi_thread")]
+async fn queued_body_variants_preserve_the_valid_block_in_both_orders() {
+    use crate::tests::{setup::changed_coinbase_body, FakeChainHelper};
+    use zakura_chain::{
+        block::ChainHistoryBlockTxAuthCommitmentHash,
+        history_tree::HistoryTree,
+        parameters::testnet::{ConfiguredActivationHeights, RegtestParameters},
+        transaction::Transaction,
+    };
+
+    let _init_guard = zakura_test::init();
+    let limit = Duration::from_secs(15);
+    let network = Network::new_regtest(RegtestParameters {
+        activation_heights: ConfiguredActivationHeights {
+            nu5: Some(2),
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+    let mut chain = vec![block::genesis::regtest_genesis_block()];
+    let mut history = HistoryTree::default();
+    for height in 1..=4 {
+        let mut child = chain.last().unwrap().make_fake_child();
+        let coinbase = &child.transactions[0];
+        let transaction = if height == 1 {
+            transaction_v4_from_coinbase(coinbase)
+        } else {
+            Transaction::V5 {
+                network_upgrade: NetworkUpgrade::Nu5,
+                lock_time: transaction::LockTime::unlocked(),
+                expiry_height: Height(height),
+                inputs: coinbase.inputs().to_vec(),
+                outputs: coinbase.outputs().to_vec(),
+                sapling_shielded_data: None,
+                orchard_shielded_data: None,
+            }
+        };
+        Arc::make_mut(&mut child).transactions = vec![Arc::new(transaction)];
+        let merkle = child.transactions.iter().cloned().collect();
+        let commitment = if height == 1 {
+            [0; 32]
+        } else {
+            ChainHistoryBlockTxAuthCommitmentHash::from_commitments(
+                &history.hash().unwrap(),
+                &child.auth_data_root(),
+            )
+            .into()
+        };
+        let header = Arc::make_mut(&mut Arc::make_mut(&mut child).header);
+        header.merkle_root = merkle;
+        header.commitment_bytes = commitment.into();
+        header.time += chrono::Duration::seconds(1);
+        history
+            .push(
+                &network,
+                child.clone(),
+                &zakura_chain::sapling::tree::NoteCommitmentTree::default().root(),
+                &zakura_chain::orchard::tree::NoteCommitmentTree::default().root(),
+                &zakura_chain::ironwood::tree::NoteCommitmentTree::default().root(),
+            )
+            .unwrap();
+        chain.push(child);
+    }
+    let valid = chain[3].clone();
+    let invalid = changed_coinbase_body(&valid, 42);
+    let sibling = (1_u64..=1024)
+        .find_map(|nonce| {
+            let mut sibling = valid.clone();
+            Arc::make_mut(&mut Arc::make_mut(&mut sibling).header)
+                .nonce
+                .0[..8]
+                .copy_from_slice(&nonce.to_le_bytes());
+            (sibling.hash().0 > valid.hash().0).then_some(sibling)
+        })
+        .expect("the fixture has a sibling with a larger raw hash");
+    for header_runtime in [false, true] {
+        for valid_first in [false, true] {
+            let config = Config {
+                enable_zakura_header_seed_from_committed_blocks: header_runtime,
+                ..Config::ephemeral()
+            };
+            let (mut state, _, _, _) = StateService::new(config, &network, Height::MAX, 0)
+                .await
+                .unwrap();
+            for block in &chain[..2] {
+                timeout(
+                    limit,
+                    state.queue_and_commit_to_finalized_state(CheckpointVerifiedBlock::from(
+                        block.clone(),
+                    )),
+                )
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            }
+            let first = if valid_first {
+                valid.clone()
+            } else {
+                invalid.clone()
+            };
+            let second = if valid_first {
+                invalid.clone()
+            } else {
+                valid.clone()
+            };
+            let mut responses = Vec::new();
+            for (index, body) in [first, second, sibling.clone(), chain[4].clone()]
+                .into_iter()
+                .enumerate()
+            {
+                let mut prepared = body.prepare();
+                prepared.receipt_order = Some(u64::try_from(index).unwrap() + 1);
+                responses.push(state.queue_and_commit_to_non_finalized_state(prepared, None));
+            }
+            timeout(
+                limit,
+                state.queue_and_commit_to_non_finalized_state(chain[2].clone().prepare(), None),
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+            for (index, response) in responses.into_iter().enumerate() {
+                let result = timeout(limit, response).await.unwrap().unwrap();
+                if index == usize::from(valid_first) {
+                    assert!(
+                        result.is_err(),
+                        "the altered body cannot commit: {result:?}"
+                    );
+                } else {
+                    assert!(
+                        result.is_ok(),
+                        "valid bodies and descendants still commit: {result:?}"
+                    );
+                }
+            }
+            state.drain_non_finalized_write_updates();
+            assert!(!state
+                .non_finalized_failed_ancestors
+                .contains_key(&valid.hash()));
+            assert!(!state
+                .non_finalized_failed_ancestors
+                .contains_key(&chain[4].hash()));
+            assert_eq!(state.best_tip(), Some((Height(4), chain[4].hash())));
+            assert_eq!(state.non_finalized_state_queued_blocks.drain().count(), 0);
+            assert!(!state
+                .non_finalized_state_queued_blocks
+                .has_queued_children(chain[2].hash()));
+            let permits = timeout(
+                limit,
+                state.non_finalized_write_slots.clone().acquire_many_owned(
+                    u32::try_from(super::queued_blocks::MAX_QUEUED_BLOCKS).unwrap(),
+                ),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            drop(permits);
+            let snapshot = state.read_service.latest_non_finalized_state();
+            let accepted = snapshot
+                .best_chain()
+                .unwrap()
+                .blocks
+                .get(&Height(3))
+                .unwrap();
+            assert_eq!(accepted.block, valid);
+            assert_eq!(
+                accepted.receipt_order,
+                Some(if valid_first { 1 } else { 2 })
+            );
+            // Removing the child restores an equal-work tie. The valid body's own receipt
+            // beats the later sibling even though that sibling has the larger raw hash.
+            timeout(limit, state.send_invalidate_block(chain[4].hash()))
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert_eq!(state.best_tip(), Some((Height(3), valid.hash())));
+        }
+    }
+}
+
 /// A full orphan queue must not strand the descendants that are waiting on the very block
 /// that would release them.
 ///

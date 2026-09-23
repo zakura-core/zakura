@@ -378,6 +378,12 @@ impl StartCmd {
                 option_env!("VERGEN_GIT_DESCRIBE").unwrap_or("unknown")
             ),
             format!("{:?}", config.state.storage_mode),
+            option_env!("ZAKURA_PROFILE_BASE_COMMIT")
+                .zip(option_env!("VERGEN_GIT_SHA"))
+                .map(|(base, commit)| profiles::Source {
+                    base_commit: base.into(),
+                    commit: commit.into(),
+                }),
         ) {
             Ok(runtime) => runtime,
             Err(error) => {

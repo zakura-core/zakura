@@ -68,6 +68,19 @@ enum Command {
         #[arg(long)]
         ready_us: u64,
     },
+    /// Attach Git-verified provenance to a legacy recording. Existing provenance is immutable.
+    Source {
+        #[arg(long)]
+        store: PathBuf,
+        #[arg(long)]
+        run: String,
+        #[arg(long)]
+        expected_build: String,
+        #[arg(long)]
+        base_commit: String,
+        #[arg(long)]
+        commit: String,
+    },
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
@@ -115,6 +128,21 @@ async fn main() -> Result<()> {
             run,
             ready_us,
         } => store::startup_boundary(&store, &run, ready_us),
+        Command::Source {
+            store,
+            run,
+            expected_build,
+            base_commit,
+            commit,
+        } => store::source(
+            &store,
+            &run,
+            &expected_build,
+            zakura_jsonl_trace::block_profile::Source {
+                base_commit,
+                commit,
+            },
+        ),
     }
 }
 

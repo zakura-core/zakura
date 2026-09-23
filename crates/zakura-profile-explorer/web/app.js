@@ -16,6 +16,15 @@ function transactionHash(bytes) {
   if(!Array.isArray(bytes) || bytes.length!==32 || !bytes.every(b=>Number.isInteger(b)&&b>=0&&b<=255))return null;
   return [...bytes].reverse().map(b=>b.toString(16).padStart(2,'0')).join('');
 }
+function commitUrl(sha) {
+  return typeof sha==='string' && /^[a-f0-9]{40}$/i.test(sha)
+    ? `https://github.com/zakura-core/zakura/commit/${sha.toLowerCase()}` : null;
+}
+function commitLink(sha,short=false) {
+  const url=commitUrl(sha);
+  if(!url)return el('span','Not recorded');
+  const link=el('a',short?sha.slice(0,9):sha);link.href=url;link.target='_blank';link.rel='noopener noreferrer';link.title=sha;return link;
+}
 function explorerLink(url,label) {
   const link=el('a',null,'explorer-link');link.href=url;link.target='_blank';link.rel='noopener noreferrer';
   const ns='http://www.w3.org/2000/svg',icon=document.createElementNS(ns,'svg'),circle=document.createElementNS(ns,'circle'),handle=document.createElementNS(ns,'path');
@@ -93,6 +102,7 @@ async function openDetail(run,attempt) {
   if(showCpu){$('cpu').hidden=false;renderCpu(data.cpu);}
 }
 function renderMetadata(row,recording) {
+  $('detail-base').replaceChildren(el('span','Main base · '),commitLink(recording.source?.base_commit,true));
   const retention=/^Pruned\(PruningConfig \{ tx_retention: (\d+) \}\)$/.exec(recording.storage);
   const storage=retention ? `Pruned · transaction data retained for ${number(retention[1])} blocks` : recording.storage;
   const outcome=row.outcome || 'unfinished';
@@ -103,7 +113,8 @@ function renderMetadata(row,recording) {
     ['Network',recording.network],
     ['Storage',storage],
     ['Recorded',new Date(row.utc_ms).toLocaleString(undefined,{dateStyle:'medium',timeStyle:'long'})],
-    ['Node build',recording.build],
+    ['Instrumented build',recording.build],
+    ...(recording.source ? [['Instrumented commit',recording.source.commit,true,true]] : []),
     ['Profile ID',row.run,true,true]
   ];
   $('detail-meta').replaceChildren(...fields.map(([label,value,wide,code])=>{

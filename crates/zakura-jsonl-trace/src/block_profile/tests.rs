@@ -372,6 +372,7 @@ mod transport {
             session: "synthetic".into(),
             network: "regtest".into(),
             build: "test".into(),
+            source: None,
             storage: "pruned".into(),
             pid: 1,
             utc_start_ms: 0,

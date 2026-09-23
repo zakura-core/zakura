@@ -76,16 +76,31 @@ fn emit_git_metadata() -> Result<(), String> {
     emit_env("VERGEN_GIT_COMMIT_TIMESTAMP", timestamp);
     emit_env("VERGEN_GIT_DESCRIBE", describe);
     emit_env("VERGEN_GIT_SHA", sha);
+    // Never infer this from the version tag or from the profiling branch's tip.
+    if let Ok(base) = git(&["merge-base", "--all", "HEAD", "refs/remotes/origin/main"]) {
+        if base.len() == 40 && base.bytes().all(|c| c.is_ascii_hexdigit()) {
+            emit_env("ZAKURA_PROFILE_BASE_COMMIT", base);
+        }
+    }
 
     Ok(())
 }
 
 fn emit_git_rerun_triggers() -> Result<(), String> {
-    let git_dir = PathBuf::from(git(&["rev-parse", "--git-dir"])?);
-    emit_rerun_if_exists(&git_dir.join("HEAD"));
+    for reference in ["HEAD", "packed-refs", "refs/remotes/origin/main"] {
+        emit_rerun_if_exists(&PathBuf::from(git(&[
+            "rev-parse",
+            "--git-path",
+            reference,
+        ])?));
+    }
 
     if let Ok(reference) = git(&["symbolic-ref", "HEAD"]) {
-        emit_rerun_if_exists(&git_dir.join(reference));
+        emit_rerun_if_exists(&PathBuf::from(git(&[
+            "rev-parse",
+            "--git-path",
+            &reference,
+        ])?));
     }
 
     Ok(())

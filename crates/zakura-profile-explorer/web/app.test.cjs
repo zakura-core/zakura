@@ -62,3 +62,11 @@ test('missing transaction root does not lose or misnumber its checks', () => {
   assert.equal(result.groups[0].root, null);
   assert.equal(result.groups[0].spans.length, 1);
 });
+
+test('base commit links require a complete Git object ID', () => {
+  const sha='a'.repeat(40);
+  assert.equal(context.commitUrl(sha.toUpperCase()), `https://github.com/zakura-core/zakura/commit/${sha}`);
+  for(const invalid of [null,undefined,'latest main','abc1234','g'.repeat(40),'https://example.com']) {
+    assert.equal(context.commitUrl(invalid),null);
+  }
+});

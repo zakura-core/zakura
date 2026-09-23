@@ -29,6 +29,8 @@ Transaction contexts carry their zero-based position in the block. Descendant sp
 
 ## Wire format
 
+Run metadata optionally includes `source`, with full `base_commit` and `commit` Git object IDs. The node captures these at build time to distinguish the included main code from the profiling branch revision. Old recordings omit this field. Upgrade the collector before the node so it retains the additional metadata.
+
 Every JSON datagram has `schema: 1` and a `type` of `run`, `event`, or `health`. Events also carry `run_id` and an increasing transport sequence. Within a run, attempts have distinct IDs even when block hashes are equal.
 
 - `start` records identity and the monotonic start offset.

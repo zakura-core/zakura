@@ -63,6 +63,9 @@ pub struct Run {
     pub network: String,
     /// Build identifier provided by the node.
     pub build: String,
+    /// Git provenance captured when the node was built. Absent in older recordings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<Source>,
     /// Archive or pruned storage configuration, without paths or secrets.
     pub storage: String,
     /// Operating-system process ID.
@@ -76,6 +79,24 @@ pub struct Run {
     /// Require a startup readiness boundary before including timings in statistics.
     #[serde(default)]
     pub startup_gate: bool,
+}
+
+/// Main code included in a build, separate from the profiling branch's full revision.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Source {
+    /// Latest common ancestor of the build and the fetched main branch.
+    pub base_commit: String,
+    /// Exact instrumented source revision.
+    pub commit: String,
+}
+
+impl Source {
+    /// Accept only full Git SHA-1 object IDs, including for externally received metadata.
+    pub fn is_valid(&self) -> bool {
+        [&self.base_commit, &self.commit]
+            .iter()
+            .all(|sha| sha.len() == 40 && sha.bytes().all(|c| c.is_ascii_hexdigit()))
+    }
 }
 
 /// Verification route, kept separate in latency distributions.
@@ -767,7 +788,7 @@ pub fn start(
     build: String,
     storage: String,
 ) -> std::io::Result<Option<Runtime>> {
-    start_inner(config, network, build, storage, false)
+    start_inner(config, network, build, storage, false, None)
 }
 
 /// Start recording with startup timings excluded until the node reports readiness.
@@ -776,8 +797,9 @@ pub fn start_with_startup_gate(
     network: String,
     build: String,
     storage: String,
+    source: Option<Source>,
 ) -> std::io::Result<Option<Runtime>> {
-    start_inner(config, network, build, storage, true)
+    start_inner(config, network, build, storage, true, source)
 }
 
 fn start_inner(
@@ -786,6 +808,7 @@ fn start_inner(
     build: String,
     storage: String,
     startup_gate: bool,
+    source: Option<Source>,
 ) -> std::io::Result<Option<Runtime>> {
     let Some(path) = &config.socket else {
         return Ok(None);
@@ -795,6 +818,7 @@ fn start_inner(
         || network.len() > 128
         || build.len() > 256
         || storage.len() > 256
+        || source.as_ref().is_some_and(|source| !source.is_valid())
     {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -814,6 +838,7 @@ fn start_inner(
         session: config.session.clone(),
         network,
         build,
+        source,
         storage,
         pid: std::process::id(),
         utc_start_ms: micros(utc).saturating_sub(before) / 1000,

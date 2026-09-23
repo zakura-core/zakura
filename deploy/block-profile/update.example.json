@@ -1,0 +1,8 @@
+{
+  "host": "profile-trial",
+  "hostname": "zakura-profile-trial-20260922",
+  "ssh_config": "~/.codex/operations/zakura-profile-20260922/ssh_config",
+  "branch": "adam/block-profile-operations",
+  "repo": "/root/zakura",
+  "target": "/root/cargo-target"
+}

@@ -48,7 +48,33 @@ storage_mode = "pruned"
 
 Use a fresh or compatible pruned database. Do not restore a benchmark snapshot over a serving node. Archive mode is useful for archive-specific work, but retained profiles do not require historical block bodies. Never switch a pruned database back to archive.
 
-Each restart creates a new run ID. Metadata includes network, node/session label, node build, PID, storage settings, and UTC/monotonic clock anchors. The sampler also records the executable SHA-256 and perf build IDs. Public block and transaction hashes are retained. No transaction payloads, peer addresses, credentials, or arbitrary node logs enter the profile schema.
+Each restart creates a new run ID. Metadata includes network, node/session label, the main base commit, the exact instrumented commit, node build, PID, storage settings, and UTC/monotonic clock anchors. The block heading links to the main base. The full instrumented build stays in collapsed details. This identifies the code included in that recording, not whichever revision main points to when the page is opened. Unknown historical provenance is labeled “Not recorded”. The sampler also records the executable SHA-256 and perf build IDs. Public block and transaction hashes are retained. No transaction payloads, peer addresses, credentials, or arbitrary node logs enter the profile schema.
+
+## Updating the main base
+
+Keep the profiling additions on `adam/block-profile-operations`. From its clean local checkout, run:
+
+```sh
+python3 deploy/block-profile/update.py --config deploy/block-profile/update.example.json
+```
+
+The example config names the dedicated profiling host. Copy it to an operator location for another installation and set its SSH alias, expected hostname, repository, and shared Cargo target directory. This requires an authenticated Git remote, SSH access as root, local Node.js for the frontend tests, and the existing Linux profiler installation with Rust and Python 3.11+. It does not create infrastructure, change DNS, touch chain state directly, or enable CPU sampling.
+
+The command fetches main and the profiling branch, includes other operators' changes by fast-forward, merges the selected main commit, and pushes normally. It never rebases or force-pushes. A merge conflict aborts the new merge and stops before deployment. Use `--base MAIN_SHA` to select a particular main revision, `--keep-base` to deploy only profiling changes, or `--prepare-only` to merge and push without deploying. A branch that already includes newer main code cannot be downgraded with this command.
+
+A persistent systemd job builds the exact pushed revision on the dedicated host with four build jobs, a four-core CPU limit, and a 20 GiB memory limit. The current services continue running during tests and compilation. Only after success does it stop the node, drain the collector, install both executables, and start the collector, web service, and node. It verifies the new run's main and instrumented commits through the local API. New blocks may take longer to arrive, and normal startup timing exclusions still apply. The command leaves the proxy, quotas, service configuration, and lifecycle timers alone.
+
+Build-time provenance is `git merge-base --all HEAD refs/remotes/origin/main` plus the full `HEAD` SHA. Builds without a single verifiable base omit provenance. Cargo tracks the Git references, including shared references in worktrees. The updater fetches main before building and checks that the computed base matches the requested base. Historical clean builds with a resolvable Git revision in the profiling history are backfilled from their own merge base, never from the new deployment's base.
+
+Logs, previous executables, and `result.json` are retained under `/var/lib/zakura-profile-updates/INSTRUMENTED_SHA/`. Check `systemctl status zakura-profile-update` after an interrupted SSH connection. The remote job continues independently. A build failure leaves the running services untouched. A failure during activation is reported with its stage and requires inspection. There is no automatic binary downgrade because newer main code may have changed the chain database format.
+
+For a separately verified legacy recording, provenance can also be attached explicitly. Existing provenance cannot be changed, and the original build string must match:
+
+```sh
+sudo -u zakura-profile zakura-profile-explorer source \
+  --store /srv/zakura-profile/data --run RUN_ID --expected-build 'EXACT_RECORDED_BUILD' \
+  --base-commit VERIFIED_MAIN_SHA --commit VERIFIED_INSTRUMENTED_SHA
+```
 
 ## Timing and coverage
 

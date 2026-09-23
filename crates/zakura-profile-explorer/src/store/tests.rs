@@ -12,6 +12,7 @@ fn metadata() -> Frame {
             session: "test".into(),
             network: "regtest".into(),
             build: "fixture".into(),
+            source: None,
             storage: "pruned".into(),
             pid: 1,
             utc_start_ms: now_ms(),
@@ -602,5 +603,44 @@ fn excluded_timing_preserves_raw_evidence_and_cannot_resurface_old_outlier() -> 
                 .get::<_, i64>(0))?,
         0
     );
+    Ok(())
+}
+
+#[test]
+fn source_provenance_survives_collection_and_legacy_annotation() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let mut store = Store::open(temp.path(), 16_000_000)?;
+    let legacy = metadata();
+    let mut encoded = serde_json::to_value(&legacy)?;
+    assert!(encoded["run"].get("source").is_none());
+    let source_info = profiles::Source {
+        base_commit: "a".repeat(40),
+        commit: "b".repeat(40),
+    };
+    store.ingest(legacy)?;
+    source(temp.path(), RUN, "fixture", source_info.clone())?;
+    source(temp.path(), RUN, "fixture", source_info.clone())?;
+    assert!(source(temp.path(), RUN, "wrong build", source_info.clone()).is_err());
+    assert!(source(
+        temp.path(),
+        RUN,
+        "fixture",
+        profiles::Source {
+            base_commit: "c".repeat(40),
+            ..source_info.clone()
+        }
+    )
+    .is_err());
+    let home = Reader::open(temp.path())?.home(Some(RUN), "semantic")?;
+    assert_eq!(
+        home["runs"][0]["metadata"]["source"],
+        serde_json::to_value(&source_info)?
+    );
+    // New run frames retain both revisions and reject malformed provenance.
+    encoded["run"]["id"] = json!("22222222222222222222222222222222");
+    encoded["run"]["source"] = serde_json::to_value(&source_info)?;
+    store.ingest(serde_json::from_value(encoded.clone())?)?;
+    encoded["run"]["source"]["base_commit"] = json!("main");
+    assert!(store.ingest(serde_json::from_value(encoded)?).is_err());
     Ok(())
 }

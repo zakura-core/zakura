@@ -169,6 +169,7 @@ impl Store {
                     run.node.len() <= 128
                         && run.session.len() <= 128
                         && run.build.len() <= 256
+                        && run.source.as_ref().is_none_or(profiles::Source::is_valid)
                         && run.storage.len() <= 256
                         && run.network.len() <= 128,
                     "metadata too long"
@@ -576,6 +577,39 @@ pub(crate) fn startup_boundary(path: &Path, run: &str, ready_us: u64) -> Result<
     db.busy_timeout(Duration::from_secs(4))?;
     db.execute_batch("PRAGMA foreign_keys=ON; PRAGMA synchronous=FULL;")?;
     ensure!(db.execute("INSERT INTO run_readiness(run,ready_us) VALUES(?,?) ON CONFLICT(run) DO UPDATE SET ready_us=excluded.ready_us WHERE run_readiness.ready_us IS NULL OR run_readiness.ready_us=excluded.ready_us", params![run,integer(ready_us)?])? == 1, "startup boundary already set");
+    Ok(())
+}
+
+/// Add provenance only when the operator's build identity matches the retained run.
+pub(crate) fn source(path: &Path, run: &str, build: &str, source: profiles::Source) -> Result<()> {
+    ensure!(
+        valid_id(run) && source.is_valid(),
+        "invalid source identity"
+    );
+    let db =
+        Connection::open_with_flags(path.join("index.sqlite"), OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+    db.busy_timeout(Duration::from_secs(4))?;
+    db.execute_batch("PRAGMA synchronous=FULL;")?;
+    let previous: String =
+        db.query_row("SELECT metadata FROM runs WHERE id=?", [run], |r| r.get(0))?;
+    let mut metadata: Value = serde_json::from_str(&previous)?;
+    ensure!(
+        metadata["build"].as_str() == Some(build),
+        "recorded build does not match"
+    );
+    let source = serde_json::to_value(source)?;
+    ensure!(
+        metadata["source"].is_null() || metadata["source"] == source,
+        "source already set"
+    );
+    metadata["source"] = source;
+    ensure!(
+        db.execute(
+            "UPDATE runs SET metadata=? WHERE id=? AND metadata=?",
+            params![serde_json::to_string(&metadata)?, run, previous]
+        )? == 1,
+        "recording changed during annotation"
+    );
     Ok(())
 }
 

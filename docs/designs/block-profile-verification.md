@@ -28,7 +28,7 @@ Batch captures must be bounded independently of attacker-controlled request/acti
 
 ## Explorer
 
-Add an expandable Shielded verification section above the transaction list. Keep transactions collapsed and preserve longest-first/transaction-number sorting and explorer links. Show cache hit/miss counts with unknown counts, pool/workload, primary vs individual retry, and one row per batch. Cached-only blocks clearly say no fresh execution was recorded rather than zero proof cost.
+Add an expandable Shielded verification section above the transaction list. Keep transactions collapsed and default to transaction-number sorting with longest-first available and explorer links. Show cache hit/miss counts with unknown counts, pool/workload, primary vs individual retry, and one row per batch. Cached-only blocks clearly say no fresh execution was recorded rather than zero proof cost.
 
 Use one visibly aligned time axis across nested rows. Labels may indent, plot origins and widths may not. Distinguish preparation/setup, waiting, execution, and delivery using text and colors. Use microseconds below one millisecond. Full batch intervals may begin before block entry; extend the axis and label the block-entry marker rather than pretending that work began at zero. Do not change block timing totals by including earlier/shared work as exclusive block work. Existing verifier response and recorded-after-response semantics remain intact; shared batch projections are excluded from exclusive timing aggregates, including the server-derived recorded_end and after-response totals, not only frontend sums.
 

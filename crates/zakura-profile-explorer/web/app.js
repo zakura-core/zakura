@@ -181,7 +181,7 @@ function renderTransactions(host,spans,lane,network) {
   for(const [value,label] of [['number','Transaction number'],['duration','Slowest first']]){
     const option=el('option',label);option.value=value;sort.append(option);
   }
-  sort.value='duration';
+  sort.value='number';
   if(groups.length+legacy.length>1){
     const controls=el('label',null,'transaction-sort');controls.append(el('span','Sort transactions'),sort);host.append(controls);
   }

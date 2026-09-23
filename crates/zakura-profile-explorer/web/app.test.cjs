@@ -110,7 +110,7 @@ test('small durations and pre-block offsets retain microsecond precision',()=>{
   assert.equal(vm.runInContext('ms(1200)',context),'1.2 ms');
 });
 
-test('rendered transactions default to longest first and can switch to transaction number',()=>{
+test('rendered transactions default to transaction number and can switch to longest first',()=>{
   class Element {
     constructor(tag){this.tag=tag;this.children=[];this.listeners={};}
     append(...children){this.children.push(...children);}
@@ -132,13 +132,13 @@ test('rendered transactions default to longest first and can switch to transacti
   ],lane,'Mainnet');
   const select=host.children[0].children[1],list=host.children[1];
   const labels=()=>list.children.map(entry=>entry.children[0].textContent);
-  assert.equal(select.value,'duration');
-  assert.deepEqual(labels(),['Transaction 2','Transaction 3','Transaction 1']);
-  const expanded=list.children[0];expanded.open=true;
-  select.value='number';select.listeners.change();
+  assert.equal(select.value,'number');
   assert.deepEqual(labels(),['Transaction 1','Transaction 2','Transaction 3']);
-  assert.equal(list.children[1],expanded);
-  assert.equal(list.children[1].open,true);
+  const expanded=list.children[1];expanded.open=true;
   select.value='duration';select.listeners.change();
   assert.deepEqual(labels(),['Transaction 2','Transaction 3','Transaction 1']);
+  assert.equal(list.children[0],expanded);
+  assert.equal(list.children[0].open,true);
+  select.value='number';select.listeners.change();
+  assert.deepEqual(labels(),['Transaction 1','Transaction 2','Transaction 3']);
 });

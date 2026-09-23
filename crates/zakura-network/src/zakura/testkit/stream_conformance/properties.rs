@@ -11,14 +11,14 @@ use std::{
 
 use super::{
     node::production_limits, LayoutNode, LayoutPlan, RawLayoutPeer, RequestPlan, StreamConformance,
-    CONFORMANCE_DEADLINE, SIBLINGS,
+    SubscriptionPlan, SubscriptionUpdate, UpdateOp, CONFORMANCE_DEADLINE, SIBLINGS,
 };
 use crate::{
     zakura::{
-        regulation::UNFINISHED_EXCHANGE,
+        regulation::{ServeCapacity, UNFINISHED_EXCHANGE},
         testkit::await_until,
         wire_codec::{decode_frame, encode_frame},
-        Frame, MessageRole, MessageRule, Stream, DEFAULT_ZAKURA_RECEIVE_WINDOW,
+        Credit, Frame, MessageRole, MessageRule, Stream, DEFAULT_ZAKURA_RECEIVE_WINDOW,
         DEFAULT_ZAKURA_STREAM_RECEIVE_WINDOW, FRAME_HEADER_BYTES,
     },
     BoxError,
@@ -573,5 +573,169 @@ pub(crate) async fn partial_frames<A: StreamConformance>(
     })?;
     raw.shutdown().await;
     victim.shutdown().await;
+    Ok(())
+}
+
+/// The pages of subscription 0 that `credit` covers, pushed greedily from
+/// cursor 1 as the harness's publisher pushes them.
+fn pages_within<A: StreamConformance>(
+    subscription: &SubscriptionPlan,
+    credit: Credit,
+) -> Result<u32, BoxError> {
+    let mut bytes = 0u64;
+    let mut pages = 0;
+    while pages < credit.objects {
+        let frame = encode_frame(&A::page(subscription.page, 0, pages + 1))
+            .map_err(|error| error.to_string())?;
+        // Widening usize to u64 is lossless on supported targets.
+        bytes += frame.payload.len() as u64;
+        if bytes > u64::from(credit.bytes) {
+            break;
+        }
+        pages += 1;
+    }
+    Ok(pages)
+}
+
+/// P9: `Close` ends a subscription while its pages sit unread, every
+/// execution slot and output byte is held, and a page waits for them. Other
+/// control messages still progress on the connection. Once the peer reads
+/// again, it finds every page in order, then the ending.
+pub(crate) async fn close_progresses<A: StreamConformance>(
+    layout: &'static [Stream],
+) -> Result<(), BoxError> {
+    let plan = LayoutPlan::new(layout);
+    let Some(subscription) = plan.subscriptions.first().copied() else {
+        return Ok(());
+    };
+    let MessageRole::Subscription { credit, .. } = subscription.row.role else {
+        unreachable!("the plan lists subscription rows");
+    };
+    let update = |op, sequence, added| {
+        encode_frame(&A::update(
+            subscription.row,
+            SubscriptionUpdate {
+                op,
+                key: 0,
+                sequence,
+                acknowledged: 0,
+                added,
+            },
+        ))
+        .map_err(|error| BoxError::from(error.to_string()))
+    };
+    // Open with all but one page of the window; a grant adds that page later.
+    let largest = u32::try_from(subscription.page.payload.max())?;
+    let one_page = Credit {
+        objects: 1,
+        bytes: largest,
+    };
+    let opening = (credit.objects >= 2 && credit.bytes >= 2 * largest).then(|| Credit {
+        objects: credit.objects - one_page.objects,
+        bytes: credit.bytes - one_page.bytes,
+    });
+    let pages = pages_within::<A>(&subscription, opening.unwrap_or(credit))?;
+    let seed = seeds(9, layout);
+    let victim = LayoutNode::<A>::spawn(seed, layout).await?;
+    let control = LayoutNode::<A>::spawn(seed + 1, layout).await?;
+    victim.connect(&control).await?;
+    let (mut raw, _) = raw_peer(&victim, layout, seed + 2).await?;
+    let shared = victim.shared();
+
+    // Open, and read nothing.
+    raw.send(
+        subscription.stream,
+        &update(UpdateOp::Open, 0, opening.unwrap_or(credit))?,
+    )
+    .await?;
+    await_until(
+        "the victim pushes every page the credit covers",
+        CONFORMANCE_DEADLINE,
+        || u64::from(pages) == shared.pushed.load(Ordering::Relaxed),
+    )
+    .await?;
+
+    // Hold every execution slot and output byte. A grant makes the next page
+    // wait for them.
+    let holds: Vec<_> = shared
+        .serving
+        .iter()
+        .chain(&shared.pushing)
+        .map(ServeCapacity::hold_node_for_test)
+        .collect();
+    let mut sequence = 1;
+    if opening.is_some() {
+        raw.send(
+            subscription.stream,
+            &update(UpdateOp::Grant, sequence, one_page)?,
+        )
+        .await?;
+        sequence += 1;
+        await_until("a page waits for capacity", CONFORMANCE_DEADLINE, || {
+            shared.push_waits.load(Ordering::Relaxed) >= 1
+        })
+        .await?;
+    }
+    let none = Credit {
+        objects: 0,
+        bytes: 0,
+    };
+    raw.send(
+        subscription.stream,
+        &update(UpdateOp::Close, sequence, none)?,
+    )
+    .await?;
+    await_until(
+        "the victim ends the subscription",
+        CONFORMANCE_DEADLINE,
+        || shared.published_ended.load(Ordering::Relaxed) == 1,
+    )
+    .await?;
+
+    // A request is still admitted, and a sibling still answers.
+    let request = plan.requests.first().copied();
+    if let Some(request) = request {
+        let handled = shared.handled.load(Ordering::Relaxed);
+        raw.send(request.stream, &encode::<A>(request.row, 9)?)
+            .await?;
+        await_until("the victim admits a request", CONFORMANCE_DEADLINE, || {
+            shared.handled.load(Ordering::Relaxed) > handled
+        })
+        .await?;
+    }
+    victim.siblings[0].probe(&control.id()).await?;
+
+    // The peer reads again: every page in order, then the ending.
+    for cursor in 1..=pages {
+        let frame = raw.recv(subscription.response_stream).await?;
+        let message = decode_frame::<A::Message>(&frame).map_err(|error| error.to_string())?;
+        ensure(
+            frame.message_type == subscription.page.message_type && A::exchange(&message) == cursor,
+            || format!("expected page {cursor}, got row {}", frame.message_type),
+        )?;
+    }
+    let frame = raw.recv(subscription.response_stream).await?;
+    ensure(frame.message_type == subscription.end.message_type, || {
+        format!("expected the ending, got row {}", frame.message_type)
+    })?;
+
+    // Serving resumes once capacity returns.
+    drop(holds);
+    if let Some(request) = request {
+        let exchange = read_ending::<A>(&mut raw, &request).await?;
+        ensure(exchange == 9, || format!("request 9 ended as {exchange}"))?;
+    }
+    ensure(shared.violations().is_empty(), || {
+        format!(
+            "the victim faulted a conformant peer: {:?}",
+            shared.violations()
+        )
+    })?;
+    ensure(victim.connected(&raw.id()), || {
+        "the connection closed".into()
+    })?;
+    raw.shutdown().await;
+    victim.shutdown().await;
+    control.shutdown().await;
     Ok(())
 }

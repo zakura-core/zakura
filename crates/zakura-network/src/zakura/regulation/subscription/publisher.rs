@@ -292,10 +292,11 @@ impl<K: Eq + Hash + Clone, C: Clone + Eq> Publications<K, C> {
         if published.sent.len() >= history {
             return Err(PageStall::HistoryFull);
         }
+        // The check above found enough unspent credit, so this spends it.
         published
             .credit
             .consume(u64::from(objects), bytes)
-            .expect("the check above found enough unspent credit");
+            .map_err(|_| PageStall::NoCredit)?;
         published
             .sent
             .push_back((cursor, published.credit.consumed()));
@@ -320,6 +321,18 @@ impl<K: Eq + Hash + Clone, C: Clone + Eq> Publications<K, C> {
         Some(TerminalPermit {
             _slot: published.slot,
         })
+    }
+
+    /// The cursor of the last page sent, or the acknowledged cursor if none
+    /// is unacknowledged. The next page follows it.
+    pub(crate) fn last_sent(&self, key: &K) -> Option<&C> {
+        let published = self.live.get(key)?;
+        Some(
+            published
+                .sent
+                .back()
+                .map_or(&published.acknowledged.0, |(cursor, _)| cursor),
+        )
     }
 
     /// Unspent credit of `key`, if it is live and not closing.

@@ -179,6 +179,13 @@ impl<K: Eq + Hash + Clone, C: Clone + Eq> Subscriptions<K, C> {
         })
     }
 
+    /// Remove a subscription whose `Open` was never written.
+    ///
+    /// Use it only when the send failed locally before the first byte.
+    pub(crate) fn retract(&mut self, key: &K) -> bool {
+        self.live.remove(key).is_some()
+    }
+
     /// Record `Grant` before writing it. It acknowledges the last page the
     /// handler accepted.
     pub(crate) fn grant(&mut self, key: &K, added: Credit) -> Result<Update<C>, SubscribeRefused> {
@@ -350,6 +357,12 @@ impl<K: Eq + Hash + Clone, C: Clone + Eq> Subscriptions<K, C> {
             close_sent: subscribed.close_sent,
             received: subscribed.received,
         })
+    }
+
+    /// The cursor of the last page received from `key`, or its start. The
+    /// reactor checks a page's linkage against it.
+    pub(crate) fn received(&self, key: &K) -> Option<&C> {
+        self.live.get(key).map(|subscribed| &subscribed.received)
     }
 
     /// Live subscriptions.

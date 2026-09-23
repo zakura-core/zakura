@@ -3,7 +3,9 @@
 //! It reserves sessions through `SessionCapacity` and keeps them in a
 //! `SessionTable`. It serves each request row through `Serve`, answering with
 //! the adapter's messages. It downloads through fenced `Reservations`, with
-//! the reader precheck attached to every member that carries responses.
+//! the reader precheck attached to every member that carries responses. It
+//! publishes each subscription row through `Publications`, pushing pages
+//! with the capacity `ServeCapacity::push` grants.
 
 use std::{
     marker::PhantomData,
@@ -15,21 +17,24 @@ use std::{
 };
 
 use futures::{stream::SelectAll, StreamExt};
-use tokio::sync::watch;
+use tokio::sync::{watch, Notify};
 use tokio_util::sync::CancellationToken;
 
-use super::{LayoutPlan, RequestPlan, StreamConformance};
+use super::{
+    LayoutPlan, RequestPlan, StreamConformance, SubscriptionPlan, SubscriptionUpdate, UpdateOp,
+};
 use crate::{
     zakura::{
         regulation::{
-            sizing, Current, Produce, Replacement, ReservationPool, Reservations, Responded,
-            ResponseCap, ResponseSink, Serve, ServeCapacity, ServeEnd, SessionCapacity, SessionKey,
-            SessionTable, SharedReservations, SinkError, SinkProgress, WorkLease, WriterFence,
+            sizing, Applied, Current, Produce, Publications, Push, Replacement, ReservationPool,
+            Reservations, Responded, ResponseCap, ResponseSink, Serve, ServeCapacity, ServeEnd,
+            SessionCapacity, SessionKey, SessionTable, SharedReservations, SinkError, SinkProgress,
+            SubscriptionLimits, WorkLease, WriterFence,
         },
         wire_codec::{decode_frame, encode_frame, WireMessage},
         CloseCause, Frame, FramedRecv, FramedSend, MessageRole, Peer, Service,
         ServicePeerDirection, ServicePeerLimits, SessionDemand, SessionFull, SessionOpening,
-        SessionPolicy, SessionResources, Stream, ZakuraConnId, ZakuraPeerId,
+        SessionPolicy, SessionResources, Stream, ZakuraConnId, ZakuraPeerId, FRAME_HEADER_BYTES,
     },
     BoxError,
 };
@@ -79,6 +84,8 @@ pub(crate) struct LayoutSession<A: StreamConformance> {
     pub(crate) sends: Vec<FramedSend>,
     pub(crate) reservations: SharedReservations<ExchangeKey>,
     serve: Vec<Serve<EchoProduce<A>>>,
+    /// The peer's subscriptions, per subscription row in the plan's order.
+    publishers: Vec<Publisher>,
     pub(crate) fence: WriterFence,
     /// The session's token: cancelling it retires every member.
     pub(crate) cancel: CancellationToken,
@@ -87,6 +94,45 @@ pub(crate) struct LayoutSession<A: StreamConformance> {
     pub(crate) close_cause: CloseCause,
     /// Every exchange this session ended, in order.
     pub(crate) ended: watch::Sender<Vec<ExchangeKey>>,
+}
+
+/// One subscription row's publications on a session, shared with the task
+/// that pushes its pages.
+#[derive(Clone, Debug)]
+struct Publisher {
+    publications: Arc<Mutex<Publications<u32, u32>>>,
+    wake: Arc<Notify>,
+}
+
+impl Publisher {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Publications<u32, u32>> {
+        self.publications
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn apply(&self, update: SubscriptionUpdate) -> Result<(), String> {
+        let SubscriptionUpdate {
+            op,
+            key,
+            sequence,
+            acknowledged,
+            added,
+        } = update;
+        let mut publications = self.lock();
+        let applied = match op {
+            UpdateOp::Open => publications
+                .open(key, sequence, added, acknowledged)
+                .map(|()| Applied::Live),
+            UpdateOp::Grant => publications.grant(&key, sequence, &acknowledged, added),
+            UpdateOp::Close => publications.close(&key, sequence, &acknowledged),
+        }
+        .map_err(|fault| fault.to_string())?;
+        if applied == Applied::Live {
+            self.wake.notify_one();
+        }
+        Ok(())
+    }
 }
 
 impl<A: StreamConformance> std::fmt::Debug for EchoProduce<A> {
@@ -147,7 +193,14 @@ impl<A: StreamConformance> LayoutSession<A> {
                 }
                 Ok(())
             }
-            _ => decode::<A>(frame).map(drop),
+            MessageRole::Subscription { .. } => {
+                let message = decode::<A>(frame)?;
+                let update = A::read_update(&message)
+                    .ok_or_else(|| format!("row {} carried no update", row.message_type))?;
+                let index = shared.subscription_index(row.message_type);
+                self.publishers[index].apply(update)
+            }
+            MessageRole::Announcement { .. } => decode::<A>(frame).map(drop),
         }
     }
 }
@@ -164,6 +217,14 @@ pub(crate) struct LayoutShared<A: StreamConformance> {
     pub(crate) table: SessionTable<Arc<LayoutSession<A>>>,
     /// Serving capacity per request row, in the plan's order.
     pub(crate) serving: Vec<ServeCapacity>,
+    /// Page capacity per subscription row, in the plan's order.
+    pub(crate) pushing: Vec<ServeCapacity>,
+    /// Pages this node pushed.
+    pub(crate) pushed: AtomicU64,
+    /// Pages that waited for capacity.
+    pub(crate) push_waits: AtomicU64,
+    /// Subscriptions this node ended, their outcomes queued.
+    pub(crate) published_ended: AtomicU64,
     pub(crate) pool: ReservationPool,
     /// Frames that reached this node's handler.
     pub(crate) handled: AtomicU64,
@@ -180,6 +241,14 @@ impl<A: StreamConformance> LayoutShared<A> {
             .iter()
             .position(|plan| plan.row.message_type == request_type)
             .expect("the plan lists every request row of the layout")
+    }
+
+    fn subscription_index(&self, subscription_type: u16) -> usize {
+        self.plan
+            .subscriptions
+            .iter()
+            .position(|plan| plan.row.message_type == subscription_type)
+            .expect("the plan lists every subscription row of the layout")
     }
 
     /// The violations this node disconnected a peer for.
@@ -212,6 +281,17 @@ impl<A: StreamConformance> LayoutService<A> {
                     .expect("derived limits are valid")
             })
             .collect();
+        let pushing = plan
+            .subscriptions
+            .iter()
+            .map(|subscription| {
+                // Widening usize to u64 is lossless on supported targets.
+                let largest = (subscription.page.payload.max() + FRAME_HEADER_BYTES) as u64;
+                let limits = sizing::serve_limits(largest, Duration::from_millis(1));
+                ServeCapacity::new("stream_conformance", subscription.row, limits)
+                    .expect("derived limits are valid")
+            })
+            .collect();
         let smallest = plan
             .requests
             .iter()
@@ -232,6 +312,10 @@ impl<A: StreamConformance> LayoutService<A> {
                 capacity: SessionCapacity::new("stream_conformance", &limits),
                 table: SessionTable::default(),
                 serving,
+                pushing,
+                pushed: AtomicU64::new(0),
+                push_waits: AtomicU64::new(0),
+                published_ended: AtomicU64::new(0),
                 pool,
                 handled: AtomicU64::new(0),
                 violations: Mutex::new(Vec::new()),
@@ -356,6 +440,29 @@ impl<A: StreamConformance> Service for LayoutService<A> {
                 )
             })
             .collect();
+        let publishers = shared
+            .plan
+            .subscriptions
+            .iter()
+            .zip(&shared.pushing)
+            .map(|(plan, capacity)| {
+                let limits = SubscriptionLimits::from_rule(plan.row)
+                    .expect("the plan lists subscription rows");
+                let publisher = Publisher {
+                    publications: Arc::new(Mutex::new(Publications::new(limits))),
+                    wake: Arc::new(Notify::new()),
+                };
+                tokio::spawn(publish(
+                    shared.clone(),
+                    *plan,
+                    publisher.clone(),
+                    capacity.push(&peer.id),
+                    sends[plan.response_stream].clone(),
+                    cancel.clone(),
+                ));
+                publisher
+            })
+            .collect();
         let key = SessionKey {
             conn_id: peer.conn_id,
             session_id,
@@ -367,6 +474,7 @@ impl<A: StreamConformance> Service for LayoutService<A> {
             sends,
             reservations,
             serve,
+            publishers,
             fence: fence.clone(),
             cancel: cancel.clone(),
             connection: peer.cancel_token(),
@@ -393,6 +501,85 @@ impl<A: StreamConformance> Service for LayoutService<A> {
             if key.conn_id == conn_id {
                 self.shared.table.remove(peer, key);
             }
+        }
+    }
+}
+
+/// Push pages of every live subscription while credit lasts, and end each
+/// subscription after its `Close`.
+///
+/// One task writes a row's pages and endings, so each ending follows its
+/// subscription's pages. A page waits for the capacity a served response
+/// takes; an update wakes the task, so `Close` never waits behind it.
+async fn publish<A: StreamConformance>(
+    shared: Arc<LayoutShared<A>>,
+    plan: SubscriptionPlan,
+    publisher: Publisher,
+    push: Push,
+    send: FramedSend,
+    cancel: CancellationToken,
+) {
+    loop {
+        let (ended, page) = {
+            let mut publications = publisher.lock();
+            let mut closing: Vec<u32> = publications
+                .keys()
+                .copied()
+                .filter(|key| publications.is_closing(key))
+                .collect();
+            closing.sort_unstable();
+            let ended: Vec<_> = closing
+                .into_iter()
+                .filter_map(|key| Some((key, publications.end(&key)?)))
+                .collect();
+            let mut keys: Vec<u32> = publications.keys().copied().collect();
+            keys.sort_unstable();
+            let page = keys.into_iter().find_map(|key| {
+                let cursor = publications.last_sent(&key)?.checked_add(1)?;
+                let frame = encode_frame(&A::page(plan.page, key, cursor)).ok()?;
+                let unspent = publications.unspent(&key)?;
+                // Widening usize to u64 is lossless on supported targets.
+                (unspent.objects >= 1 && unspent.bytes >= frame.payload.len() as u64)
+                    .then_some((key, cursor, frame))
+            });
+            (ended, page)
+        };
+        for (key, terminal) in ended {
+            let Ok(frame) = encode_frame(&A::message(plan.end, key)) else {
+                cancel.cancel();
+                return;
+            };
+            if !terminal.send(&send, frame).await {
+                return;
+            }
+            shared.published_ended.fetch_add(1, Ordering::Relaxed);
+        }
+        let Some((key, cursor, frame)) = page else {
+            tokio::select! {
+                () = cancel.cancelled() => return,
+                () = publisher.wake.notified() => continue,
+            }
+        };
+        let len = frame.payload.len();
+        let acquire = push.acquire(len);
+        tokio::pin!(acquire);
+        let permit = match futures::FutureExt::now_or_never(&mut acquire) {
+            Some(permit) => permit,
+            None => {
+                shared.push_waits.fetch_add(1, Ordering::Relaxed);
+                tokio::select! {
+                    () = cancel.cancelled() => return,
+                    () = publisher.wake.notified() => continue,
+                    permit = acquire => permit,
+                }
+            }
+        };
+        // A stall means the subscription changed while the page waited.
+        if publisher.lock().reserve_page(&key, 1, len, cursor).is_ok() {
+            if !permit.send(&send, frame).await {
+                return;
+            }
+            shared.pushed.fetch_add(1, Ordering::Relaxed);
         }
     }
 }

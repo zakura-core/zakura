@@ -9,7 +9,9 @@ use proptest::prelude::*;
 use super::*;
 use crate::zakura::{
     check_frame_filter,
-    testkit::stream_conformance::{stream_conformance_suite, StreamConformance},
+    testkit::stream_conformance::{
+        stream_conformance_suite, StreamConformance, SubscriptionUpdate, UpdateOp,
+    },
     wire_codec::{
         message_suite::{check_layout_carries_family, message_suite, MessageSample, Violation},
         sample::WireSample,
@@ -27,6 +29,29 @@ fn frame(message_type: u16, payload: Vec<u8>) -> Frame {
         flags: 0,
         payload,
     }
+}
+
+fn watch(op: WatchOp, sequence: u32, objects: u32, bytes: u32) -> ExampleMessage {
+    ExampleMessage::Watch(WatchUpdate {
+        op,
+        id: 1,
+        sequence,
+        acknowledged: Height(0),
+        added: Credit { objects, bytes },
+    })
+}
+
+/// A watch update's payload, which may break the update's domain rules.
+fn watch_payload(op: u8, objects: u32) -> Vec<u8> {
+    [
+        &[op][..],
+        &1u32.to_le_bytes(),
+        &1u32.to_le_bytes(),
+        &0u32.to_le_bytes(),
+        &objects.to_le_bytes(),
+        &0u32.to_le_bytes(),
+    ]
+    .concat()
 }
 
 /// The payload of a range row, which may break the range's domain rules.
@@ -65,6 +90,31 @@ impl MessageSample for ExampleMessage {
                 returned: MAX_ITEMS_PER_REQUEST,
             },
             Self::RangeUnavailable(range(Height::MAX, 1)),
+            watch(WatchOp::Open, 0, 1, 1),
+            watch(WatchOp::Grant, u32::MAX, u32::MAX, u32::MAX),
+            watch(WatchOp::Close, 1, 0, 0),
+            Self::Pushed {
+                id: 0,
+                height: Height(0),
+                bytes: vec![0],
+            },
+            Self::Pushed {
+                id: u32::MAX,
+                height: Height::MAX,
+                bytes: vec![u8::MAX; MAX_ITEM_BYTES],
+            },
+            Self::WatchEnded {
+                id: 0,
+                reason: EndReason::Unavailable,
+            },
+            Self::WatchEnded {
+                id: u32::MAX,
+                reason: EndReason::Superseded,
+            },
+            Self::WatchEnded {
+                id: 7,
+                reason: EndReason::Closed,
+            },
         ]
     }
 
@@ -88,6 +138,46 @@ impl MessageSample for ExampleMessage {
             (height(), 1..=MAX_ITEMS_PER_REQUEST)
                 .prop_map(|(start, returned)| Self::ItemsDone { start, returned }),
             ranges.prop_map(Self::RangeUnavailable),
+            (
+                prop_oneof![
+                    Just(WatchOp::Open),
+                    Just(WatchOp::Grant),
+                    Just(WatchOp::Close)
+                ],
+                any::<u32>(),
+                any::<u32>(),
+                height(),
+                any::<u32>(),
+                any::<u32>(),
+            )
+                .prop_map(|(op, id, sequence, acknowledged, objects, bytes)| {
+                    let added = if op == WatchOp::Close {
+                        Credit {
+                            objects: 0,
+                            bytes: 0,
+                        }
+                    } else {
+                        Credit { objects, bytes }
+                    };
+                    Self::Watch(WatchUpdate {
+                        op,
+                        id,
+                        sequence,
+                        acknowledged,
+                        added,
+                    })
+                }),
+            (any::<u32>(), height(), ItemBytes::arbitrary())
+                .prop_map(|(id, height, bytes)| Self::Pushed { id, height, bytes }),
+            (
+                any::<u32>(),
+                prop_oneof![
+                    Just(EndReason::Unavailable),
+                    Just(EndReason::Superseded),
+                    Just(EndReason::Closed)
+                ],
+            )
+                .prop_map(|(id, reason)| Self::WatchEnded { id, reason }),
         ]
         .boxed()
     }
@@ -140,6 +230,21 @@ impl MessageSample for ExampleMessage {
                 rejected_by: |error| *error == WireError::OutOfRange("returned count"),
             },
             Violation {
+                name: "unknown watch operation",
+                frame: frame(message_type::WATCH, watch_payload(3, 0)),
+                rejected_by: |error| *error == WireError::OutOfRange("watch operation"),
+            },
+            Violation {
+                name: "close that adds credit",
+                frame: frame(message_type::WATCH, watch_payload(2, 1)),
+                rejected_by: |error| *error == WireError::OutOfRange("close credit"),
+            },
+            Violation {
+                name: "unknown end reason",
+                frame: frame(message_type::WATCH_ENDED, [&[0; 4][..], &[3]].concat()),
+                rejected_by: |error| *error == WireError::OutOfRange("end reason"),
+            },
+            Violation {
                 // A zero count, padded to the row's minimum length.
                 name: "item with no bytes",
                 frame: frame(message_type::ITEM, [&[0; 4][..], &[0, 0xaa]].concat()),
@@ -188,6 +293,12 @@ impl StreamConformance for ExampleConformance {
                 returned: 1,
             },
             message_type::RANGE_UNAVAILABLE => ExampleMessage::RangeUnavailable(range(height, 1)),
+            message_type::WATCH => watch(WatchOp::Open, 0, 1, 1),
+            message_type::PUSHED => Self::page(row, 0, exchange),
+            message_type::WATCH_ENDED => ExampleMessage::WatchEnded {
+                id: exchange,
+                reason: EndReason::Closed,
+            },
             other => unreachable!("the example family has no row {other}"),
         }
     }
@@ -200,6 +311,51 @@ impl StreamConformance for ExampleConformance {
             }
             ExampleMessage::Item { height, .. } => height.0,
             ExampleMessage::ItemsDone { start, .. } => start.0,
+            ExampleMessage::Watch(update) => update.id,
+            ExampleMessage::Pushed { height, .. } => height.0,
+            ExampleMessage::WatchEnded { id, .. } => *id,
+        }
+    }
+
+    fn update(row: &MessageRule, update: SubscriptionUpdate) -> ExampleMessage {
+        assert_eq!(row.message_type, message_type::WATCH);
+        ExampleMessage::Watch(WatchUpdate {
+            op: match update.op {
+                UpdateOp::Open => WatchOp::Open,
+                UpdateOp::Grant => WatchOp::Grant,
+                UpdateOp::Close => WatchOp::Close,
+            },
+            id: update.key,
+            sequence: update.sequence,
+            acknowledged: Height(update.acknowledged),
+            added: update.added,
+        })
+    }
+
+    fn read_update(message: &ExampleMessage) -> Option<SubscriptionUpdate> {
+        let ExampleMessage::Watch(update) = message else {
+            return None;
+        };
+        Some(SubscriptionUpdate {
+            op: match update.op {
+                WatchOp::Open => UpdateOp::Open,
+                WatchOp::Grant => UpdateOp::Grant,
+                WatchOp::Close => UpdateOp::Close,
+            },
+            key: update.id,
+            sequence: update.sequence,
+            acknowledged: update.acknowledged.0,
+            added: update.added,
+        })
+    }
+
+    fn page(row: &MessageRule, key: u32, cursor: u32) -> ExampleMessage {
+        assert_eq!(row.message_type, message_type::PUSHED);
+        let height = Height(cursor);
+        ExampleMessage::Pushed {
+            id: key,
+            height,
+            bytes: super::exchange::item_bytes(height),
         }
     }
 }

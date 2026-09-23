@@ -30,8 +30,9 @@ pub const ESTIMATED_BLOCKS_PER_DAY: u32 = 24 * 60 * 60 / POST_BLOSSOM_POW_TARGET
 ///   `ESTIMATED_RELEASE_HEIGHT` plus this number of days.
 /// - Currently set to 30 days
 ///
-/// Note: v1.5.0 is estimated to release at height 3,494,121 (~2026-09-25)
-/// and halts after height 3,528,681 (~2026-10-25).
+/// Note: v1.5.0 is planned for 2026-09-23, but its release-height floor is
+/// 3,494,121 (~2026-09-25). This window halts after height 3,528,681
+/// (~2026-10-25), about 32 days after the planned release.
 pub const EOS_PANIC_AFTER: u32 = 30;
 
 /// The number of days before the end of support where Zebra will display warnings.

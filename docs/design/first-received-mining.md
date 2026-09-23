@@ -19,30 +19,15 @@ reconsideration. The comparator reads the current tip block directly.
 Overlapping deliveries of the same complete block share their first receipt.
 Different bodies with the same header hash do not share priority. Active
 registrations are removed when their last verification completes or is cancelled.
-Only blocks that passed proof-of-work checks (or the network's authenticated
-waiver) and transaction Merkle root checks retain a receipt after retryable
-failures or cancellation. These checks do not establish full transaction
-validity. Retried blocks retain only a complete-body digest and receipt order,
-bounded to 4096 entries for one hour after
-the last attempt. Each header can retain at most four body variants, including
-canceled attempts. Additional variants evict that header's oldest cached variant
-before they can displace unrelated receipts. Capacity eviction or expiry gives a
-later retry a new receipt.
-Success, already committed duplicates, and permanent rejection clear the retry
-receipt. A duplicate still waiting in the commit queue preserves it because the
-outstanding attempt can fail transiently.
+A block redelivered after that gets a new receipt, including after a transient
+failure before it reached the state queue.
 
-The one-hour expiry applies only to retry metadata. A full body already waiting
-for its parent in the state queue keeps its receipt even if its caller times out.
+A full body already waiting for its parent in the state queue keeps its receipt
+even if its caller times out, and an identical redelivery does not replace it.
 That queue has a 1000-entry bound, but no wall-clock expiry. The body stays until
 its parent arrives, an ancestor fails, finalization reaches its height and it is
-pruned, or the process stops. Retention can therefore exceed one hour and depends
-on chain progress. An old receipt still cannot beat a chain with greater work.
-
-Receipt retention has its own error policy. Missing context, local service
-failures, and blocks ahead of the local clock can retry. Permanent block and
-transaction failures release their receipts even when peer attribution must
-remain inconclusive.
+pruned, or the process stops. An old receipt still cannot beat a chain with
+greater work.
 
 The state queue retains up to four distinct bodies per header while waiting for
 its parent. Every body counts against the existing global queue limit. Identical
@@ -56,8 +41,8 @@ briefly use B while A is unverified. Once A passes, equal-work selection chooses
 A. If B gains a child with more cumulative work, mining switches to that child.
 
 This also applies when A arrives before its parent. B's chain can be fully
-available first, but A can retain its earlier receipt while waiting for missing
-context. Once A's parent arrives and both chains validate, A can win an equal-work
+available first, but A can retain its earlier receipt while waiting in the state
+queue. Once A's parent arrives and both chains validate, A can win an equal-work
 tie. This preserves priority for honest out-of-order delivery. It also lets a
 miner with a private lead reserve priority for a tip while withholding an
 ancestor from nodes that received the tip.
@@ -72,6 +57,8 @@ The header engine still uses greatest work and raw hash to select downloads.
 Native block sync requests bodies on that selected header chain. If both headers
 arrive before either body is handed off for verification, the higher-hash branch
 can be the only one whose body reaches the verifier.
+Making header selection agree with full state on equal work is tracked in
+[#1137](https://github.com/zakura-core/zakura/issues/1137).
 
 Peers also serve retained bodies on the selected header branch. A node can keep
 mining on the earlier block A while serving an equal-work side-fork block B to a

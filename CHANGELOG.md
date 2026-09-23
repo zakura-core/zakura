@@ -11,7 +11,7 @@ independently.
 
 ## [Unreleased]
 
-## [1.5.0-rc0] - 2026-09-21
+## [1.5.0] - 2026-09-23
 
 ### Added
 
@@ -59,6 +59,11 @@ independently.
   existing continuous-sync samples for Dual and Zakura-only runs. The retained
   data can be used to generate charts
   ([#984](https://github.com/zakura-core/zakura/pull/984)).
+- `getblockchaininfo` now reports the ZIP 234 NSM value balance as
+  `nsmValueBalanceZat`, so the counter can be observed and monitored. It is
+  reported beside the monetary totals rather than inside them, so summing
+  `valuePools` still yields the money supply
+  ([#1106](https://github.com/zakura-core/zakura/pull/1106)).
 
 ### Changed
 
@@ -115,6 +120,11 @@ independently.
 - Keep the connection and unrelated services running when a persistent native
   P2P stream write times out
   ([#943](https://github.com/zakura-core/zakura/pull/943)).
+- Trusted secondary nodes carry the primary's block receipt order and reset it
+  when the primary process changes, preparing them for first-received mining.
+  A primary restart temporarily lowers the secondary's reported height to its
+  finalized tip while it reloads recent blocks
+  ([#1102](https://github.com/zakura-core/zakura/pull/1102)).
 
 ### Removed
 
@@ -298,6 +308,10 @@ independently.
   check also reports snapshot decoding errors. Fallible primitive history tree constructors
   reject upgrades without a branch ID
   ([#998](https://github.com/zakura-core/zakura/pull/998)).
+- Fixed `getblockchaininfo` and other ZEC-valued RPC responses failing to parse
+  with "loss of precision parsing ZEC value", which affected roughly one in
+  seven value pool balances and became constant after NU7
+  ([#1105](https://github.com/zakura-core/zakura/pull/1105)).
 
 ## [1.4.0] - 2026-09-10
 

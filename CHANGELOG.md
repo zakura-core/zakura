@@ -17,7 +17,8 @@ independently.
   updates, database preparation and writes, pruning, and publication. Timeline
   detail opens on a dedicated block page, groups checks by transaction, retains
   up to 65,536 spans per block, expands on demand, and shows total
-  recorded time, with metadata and downloads collapsed. Home starts with the
+  recorded time, with metadata and downloads collapsed. Block and transaction
+  hashes link to CipherScan when retained. Home starts with the
   latest blocks, search, and slow blocks from 120 ms, and follows the current
   profile automatically
   without session or route controls. Block URLs use height or hash and always

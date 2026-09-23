@@ -460,7 +460,12 @@ where
             } => primitives::block_profile(known_outpoint_hashes, transaction_hash),
             Request::Mempool { .. } => Default::default(),
         };
-        let transaction_profile = profile.span(profiles::Stage::Transaction);
+        let transaction_profile = match &req {
+            Request::Block {
+                transaction_hash, ..
+            } => profile.transaction_span(transaction_hash.0),
+            Request::Mempool { .. } => profile.span(profiles::Stage::Transaction),
+        };
         let profile = transaction_profile.context();
         profile.clone().wrap(async move {
             let _transaction_profile = transaction_profile;

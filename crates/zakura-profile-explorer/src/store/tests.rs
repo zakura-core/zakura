@@ -55,6 +55,7 @@ fn span() -> Event {
         parent: 0,
         stage: Stage::WriterOccupied,
         transaction_index: None,
+        transaction_hash: None,
         start_us: 600000,
         end_us: 800000,
         completion_thread: None,
@@ -83,6 +84,7 @@ fn large_transaction_profile_survives_chunking_and_restart() -> Result<()> {
                             Stage::TransactionChecks
                         },
                         transaction_index: Some(7),
+                        transaction_hash: if id == 1 { Some([3; 32]) } else { None },
                         start_us: 200,
                         end_us: 600000,
                         completion_thread: None,
@@ -108,6 +110,12 @@ fn large_transaction_profile_survives_chunking_and_restart() -> Result<()> {
     let spans = detail["spans"].as_array().unwrap();
     assert_eq!(spans.len(), usize::try_from(count)?);
     assert!(spans.iter().all(|span| span["transaction_index"] == 7));
+    let root = spans.iter().find(|span| span["span"] == 1).unwrap();
+    assert_eq!(root["transaction_hash"], json!([3; 32].to_vec()));
+    assert!(spans
+        .iter()
+        .filter(|span| span["span"] != 1)
+        .all(|span| span.get("transaction_hash").is_none()));
     Ok(())
 }
 

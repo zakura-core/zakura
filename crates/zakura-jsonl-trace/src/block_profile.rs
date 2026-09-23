@@ -270,6 +270,9 @@ pub enum Event {
         /// Zero-based position in the block, absent in older recordings and non-transaction work.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         transaction_index: Option<u32>,
+        /// Mined transaction ID in internal byte order, on transaction envelope spans only.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        transaction_hash: Option<[u8; 32]>,
         /// Begin offset.
         start_us: u64,
         /// End offset.
@@ -512,9 +515,16 @@ impl Context {
             context: Self(Some((attempt.clone(), id, *transaction_index))),
             parent: *parent,
             stage,
+            transaction_hash: None,
             start_us: attempt.recorder.now(),
             finished: false,
         }
+    }
+    /// Start a transaction envelope using its already-computed mined ID in internal byte order.
+    pub fn transaction_span(&self, hash: [u8; 32]) -> Span {
+        let mut span = self.span(Stage::Transaction);
+        span.transaction_hash = Some(hash);
+        span
     }
     /// Record an already measured synchronous phase without allocating or formatting its name.
     pub fn duration(&self, stage: Stage, elapsed: Duration) {
@@ -562,6 +572,7 @@ pub struct Span {
     context: Context,
     parent: u64,
     stage: Stage,
+    transaction_hash: Option<[u8; 32]>,
     start_us: u64,
     finished: bool,
 }
@@ -571,6 +582,7 @@ impl Default for Span {
             context: Context::default(),
             parent: 0,
             stage: Stage::VerifierRequest,
+            transaction_hash: None,
             start_us: 0,
             finished: true,
         }
@@ -595,6 +607,7 @@ impl Drop for Span {
                     parent: self.parent,
                     stage: self.stage,
                     transaction_index: *transaction_index,
+                    transaction_hash: self.transaction_hash,
                     start_us: self.start_us,
                     end_us: attempt.recorder.now(),
                     completion_thread: thread_id(),

@@ -7,6 +7,20 @@ const ms = (n) => `${(n / 1000).toFixed(1)} ms`;
 const recordingUrl = (run,attempt) => `/block/${encodeURIComponent(run)}/${encodeURIComponent(attempt)}`;
 const blockUrl = (row,byHash=false) => row.height!=null && !byHash ? `/block/${row.height}` : row.hash ? `/block/${encodeURIComponent(row.hash)}` : recordingUrl(row.run,row.attempt);
 const el = (tag, text, cls) => { const n = document.createElement(tag); if (text != null) n.textContent = text; if (cls) n.className = cls; return n; };
+function explorerUrl(network,kind,hash) {
+  const host=network==='Mainnet'?'cipherscan.app':network==='Testnet'?'testnet.cipherscan.app':null;
+  return host && ['block','tx'].includes(kind) && typeof hash==='string' && /^[a-f0-9]{64}$/i.test(hash)
+    ? `https://${host}/${kind}/${hash.toLowerCase()}` : null;
+}
+function transactionHash(bytes) {
+  if(!Array.isArray(bytes) || bytes.length!==32 || !bytes.every(b=>Number.isInteger(b)&&b>=0&&b<=255))return null;
+  return [...bytes].reverse().map(b=>b.toString(16).padStart(2,'0')).join('');
+}
+function explorerLink(url,label) {
+  const link=el('a','↗','explorer-link');link.href=url;link.target='_blank';link.rel='noopener noreferrer';
+  link.title=`View ${label} on CipherScan (opens in a new tab)`;link.setAttribute('aria-label',link.title);
+  link.addEventListener('click',event=>event.stopPropagation());return link;
+}
 let loading = false;
 async function api(path) { const response = await fetch(path); if (!response.ok) throw Error(await response.text()); return response.json(); }
 function note(message) { $('notice').textContent = message; $('notice').hidden = !message; }
@@ -59,6 +73,8 @@ async function openDetail(run,attempt) {
   $('detail').hidden=false; $('detail-title').textContent=`Block ${number(row.height)}`;
   document.title=`Block ${number(row.height)} · Zakura`;
   renderMetadata(row,data.recording);
+  const blockExplorer=explorerUrl(data.recording.network,'block',row.hash);
+  $('block-explorer').replaceChildren(...(blockExplorer?[explorerLink(blockExplorer,`block ${number(row.height)}`)]:[]));
   $('detail-warning').hidden=!row.exclusion_reason && !row.startup;
   $('detail-warning').textContent=row.exclusion_reason ? `Timing excluded from rankings and percentiles. ${row.exclusion_reason} Raw intervals are preserved below and include this interference.` : row.startup ? 'Startup profile · excluded from slow blocks and timing statistics.' : '';
   const timing=data.timing, formatTime=value=>value==null?'Pending':ms(value);
@@ -69,7 +85,7 @@ async function openDetail(run,attempt) {
   $('trace').href=`/api/trace/${run}/${attempt}`; $('raw').href=`/api/attempt/${run}/${attempt}`;
   const spans=[...data.spans].sort((a,b)=>a.start_us-b.start_us), start=row.start_us || 0;
   const end=Math.max(row.end_us||start,...spans.map(s=>s.end_us)), duration=Math.max(end-start,1);
-  renderTimeline(spans,row,start,duration);
+  renderTimeline(spans,row,start,duration,data.recording.network);
   if(showCpu){$('cpu').hidden=false;renderCpu(data.cpu);}
 }
 function renderMetadata(row,recording) {
@@ -144,12 +160,15 @@ function onFirstExpand(group,render) {
   let rendered=false;
   group.addEventListener('toggle',()=>{if(group.open && !rendered){rendered=true;render();}});
 }
-function renderTransactions(host,spans,lane) {
+function renderTransactions(host,spans,lane,network) {
   const {groups,legacy,unassigned}=groupTransactions(spans);
   for(const group of groups){
     const entry=el('details',null,'timeline-group transaction'),body=el('div',null,'timeline-children');
     const root=group.root || group.spans.reduce((bounds,span)=>({start_us:Math.min(bounds.start_us,span.start_us),end_us:Math.max(bounds.end_us,span.end_us)}),{start_us:Infinity,end_us:0});
-    entry.append(lane(root,'summary',`Transaction ${number(group.index+1)}`),body);
+    const summary=lane(root,'summary',`Transaction ${number(group.index+1)}`);
+    const url=explorerUrl(network,'tx',transactionHash(group.root?.transaction_hash));
+    if(url)summary.querySelector('.lane-name').append(explorerLink(url,`transaction ${number(group.index+1)}`));
+    entry.append(summary,body);
     onFirstExpand(entry,()=>{
       if(!group.root)body.append(el('p','Transaction total was not retained. The bar covers the available checks.','muted'));
       for(const span of group.spans)if(span!==group.root)body.append(lane(span));
@@ -168,7 +187,7 @@ function renderTransactions(host,spans,lane) {
   }
   if(!spans.length)host.append(el('p','No individual transaction timings were retained.','muted'));
 }
-function renderTimeline(spans,row,start,duration) {
+function renderTimeline(spans,row,start,duration,network) {
   const host=$('timeline');host.replaceChildren();
   const finalization=spans.find(s=>s.stage==='finalization'), transactions=spans.find(s=>s.stage==='transactions');
   const children=new Map();
@@ -196,7 +215,7 @@ function renderTimeline(spans,row,start,duration) {
         summary.append(el('span',`Transactions (${number(row.transactions)})`,'lane-name'),el('span','Group timing not recorded','muted'));
         group.append(summary);
       }
-      onFirstExpand(group,()=>renderTransactions(body,transactionDetail,lane));
+      onFirstExpand(group,()=>renderTransactions(body,transactionDetail,lane,network));
       group.append(body);host.append(group);
     }else if(span===finalization){
       const group=el('details',null,'timeline-group finalization'),body=el('div',null,'timeline-children');

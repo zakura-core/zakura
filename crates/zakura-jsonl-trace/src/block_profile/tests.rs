@@ -243,11 +243,11 @@ fn overlapping_transactions_keep_indexes_and_parents_across_polls_and_workers() 
     let first = envelope
         .context()
         .for_transaction(0)
-        .span(Stage::Transaction);
+        .transaction_span([1; 32]);
     let second = envelope
         .context()
         .for_transaction(1)
-        .span(Stage::Transaction);
+        .transaction_span([2; 32]);
     let late_worker = first.context();
     let task = |span: Span| async move {
         let context = span.context();
@@ -274,16 +274,29 @@ fn overlapping_transactions_keep_indexes_and_parents_across_polls_and_workers() 
     let events: Vec<_> = detail.try_iter().collect();
     assert_eq!(events.len(), 8);
     for event in events {
+        let encoded = serde_json::to_vec(&event).unwrap();
         let Event::Span {
             span,
             parent,
             stage,
             transaction_index,
+            transaction_hash,
             ..
-        } = event
+        } = serde_json::from_slice(&encoded).unwrap()
         else {
             panic!("detail contains spans");
         };
+        if stage == Stage::Transaction {
+            assert_eq!(
+                transaction_hash,
+                Some([u8::try_from(span - 1).unwrap(); 32])
+            );
+        } else {
+            assert_eq!(transaction_hash, None);
+            assert!(!String::from_utf8(encoded)
+                .unwrap()
+                .contains("transaction_hash"));
+        }
         match stage {
             Stage::Transactions => assert_eq!((span, parent, transaction_index), (1, 0, None)),
             Stage::Transaction => assert_eq!(
@@ -304,6 +317,23 @@ fn overlapping_transactions_keep_indexes_and_parents_across_polls_and_workers() 
             dropped: 0,
             ..
         })
+    ));
+}
+
+#[test]
+fn older_transaction_spans_decode_without_a_hash() {
+    let (r, detail, _) = recorder();
+    let root = begin_with(&r, block()).unwrap();
+    drop(root.context().for_transaction(0).span(Stage::Transaction));
+    let encoded = serde_json::to_string(&detail.try_recv().unwrap()).unwrap();
+    assert!(!encoded.contains("transaction_hash"));
+    assert!(matches!(
+        serde_json::from_str::<Event>(&encoded).unwrap(),
+        Event::Span {
+            transaction_index: Some(0),
+            transaction_hash: None,
+            ..
+        }
     ));
 }
 

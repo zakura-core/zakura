@@ -68,6 +68,10 @@ pub enum Response {
     /// indicating that a block was successfully committed to the state.
     Committed(block::Hash),
 
+    /// Response to [`Request::CheckCheckpointHandoff`] after checking the durable-state
+    /// handoff conditions. Any released semantic blocks can still be awaiting commit.
+    CheckpointHandoffChecked,
+
     /// Response to [`Request::InvalidateBlock`] indicating that a block was found and
     /// invalidated in the state.
     Invalidated(block::Hash),

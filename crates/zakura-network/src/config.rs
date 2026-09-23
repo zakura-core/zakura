@@ -1205,7 +1205,7 @@ impl<'de> Deserialize<'de> for Config {
                 build_configured_testnet::<D>(*params, &initial_testnet_peers)?
             }
             (DNetwork::ConfiguredRegtest { params, .. }, _) => {
-                Network::new_regtest(build_regtest_params::<D>(*params)?)
+                build_configured_regtest::<D>(*params)?
             }
             (DNetwork::DefaultForKind(NetworkKind::Mainnet), _) => Network::Mainnet,
             (DNetwork::DefaultForKind(NetworkKind::Testnet), Some(params)) => {
@@ -1215,7 +1215,7 @@ impl<'de> Deserialize<'de> for Config {
                 Network::new_default_testnet()
             }
             (DNetwork::DefaultForKind(NetworkKind::Regtest), Some(params)) => {
-                Network::new_regtest(build_regtest_params::<D>(params)?)
+                build_configured_regtest::<D>(params)?
             }
             (DNetwork::DefaultForKind(NetworkKind::Regtest), None) => {
                 Network::new_regtest(Default::default())
@@ -1500,9 +1500,11 @@ where
     params_builder.to_network().map_err(de::Error::custom)
 }
 
-fn build_regtest_params<'de, D: Deserializer<'de>>(
-    params: DTestnetParameters,
-) -> Result<RegtestParameters, D::Error> {
+/// Builds Regtest parameters while reporting invalid settings as configuration errors.
+fn build_configured_regtest<'de, D>(params: DTestnetParameters) -> Result<Network, D::Error>
+where
+    D: Deserializer<'de>,
+{
     let DTestnetParameters {
         activation_heights,
         pre_nu6_funding_streams,
@@ -1549,5 +1551,8 @@ fn build_regtest_params<'de, D: Deserializer<'de>>(
         initial_nsm_value_balance,
         ..Default::default()
     };
-    Ok(params)
+
+    testnet::Parameters::new_regtest(params)
+        .map(Network::new_configured_testnet)
+        .map_err(de::Error::custom)
 }

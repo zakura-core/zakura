@@ -7,10 +7,7 @@ use std::{
 
 use thiserror::Error;
 
-use super::{
-    Frame, Peer, Service, SessionDemand, SessionPolicy, SinkReject, Stream, StreamMode,
-    StreamWritePolicy,
-};
+use super::{Frame, Peer, Service, SessionDemand, SessionPolicy, SinkReject, Stream, StreamMode};
 use crate::zakura::{ServicePeerDirection, ZakuraConnId, ZakuraPeerId};
 
 /// Errors returned while building a [`ServiceRegistry`].
@@ -201,22 +198,6 @@ impl ServiceRegistry {
             .map(|index| Arc::clone(&self.services[*index]))
     }
 
-    /// Local message limits supplied by the service that owns this stream.
-    pub(crate) fn message_payload_limits(&self, stream: Stream) -> &'static [(u16, usize)] {
-        self.service_for_kind(stream.kind)
-            .map(|service| service.message_payload_limits(stream))
-            .unwrap_or(&[])
-    }
-
-    pub(crate) fn stream_queue_depths(&self, stream: Stream) -> Option<(usize, usize)> {
-        self.service_for_kind(stream.kind)?
-            .stream_queue_depths(stream)
-    }
-
-    pub(crate) fn message_types(&self, stream: Stream) -> Option<&'static [u16]> {
-        self.service_for_kind(stream.kind)?.message_types(stream)
-    }
-
     /// Lookup the declared stream for `kind`.
     pub fn stream_for_kind(&self, kind: u16) -> Option<Stream> {
         let service = self.service_for_kind(kind)?;
@@ -297,12 +278,6 @@ impl ServiceRegistry {
             .get(&(stream.kind, stream.version))
             .filter(|layout| layout.streams.contains(&stream))
             .cloned()
-    }
-
-    pub(crate) fn stream_write_policy(&self, stream: Stream) -> StreamWritePolicy {
-        self.service_for_kind(stream.kind)
-            .expect("a registered stream has an owning service")
-            .stream_write_policy(stream)
     }
 
     fn selected_session_streams(&self, service: &dyn Service, negotiated: u64) -> Vec<Stream> {
@@ -711,7 +686,7 @@ mod tests {
             version: 1,
             frame_cap: 1024,
             capability,
-            mode: StreamMode::Persistent,
+            ..Stream::PERSISTENT
         }
     }
 

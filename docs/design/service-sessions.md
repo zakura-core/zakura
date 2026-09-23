@@ -20,9 +20,14 @@ const DATA: Stream = Stream {
     version: 1,
     frame_cap: 1024 * 1024,
     capability: 1 << 16,
-    mode: StreamMode::Persistent,
+    ..Stream::PERSISTENT
 };
-const REQUESTS: Stream = Stream { kind: 65, ..DATA };
+const REQUESTS: Stream = Stream {
+    kind: 65,
+    queue_depths: Some(StreamQueueDepths { inbound: 1, outbound: 1 }),
+    write_policy: StreamWritePolicy::UntilCancelled,
+    ..DATA
+};
 const EVENTS: Stream = Stream { kind: 66, ..DATA };
 const LOOKUP: Stream = Stream {
     kind: 67,
@@ -50,14 +55,16 @@ The service does not declare membership a second time. The transport waits for
 data, requests, and events before handing their receive/send handles to the
 service. It does not wait for a lookup request.
 
-The service uses `message_types()`, `message_payload_limits()`, and
-`stream_queue_depths()` to specify each stream's traffic and bounds. The protocol
-defines message assignments; peers do not negotiate individual message types.
-The service routes outgoing messages to the appropriate sender.
+Each `Stream` constant also declares that stream's traffic and bounds:
+`message_types`, `payload_limits`, `queue_depths`, and `write_policy`. A
+declaration lists only the fields that differ from `Stream::PERSISTENT` or
+`Stream::REQUEST_RESPONSE`. The protocol defines message assignments; peers do
+not negotiate individual message types. The service routes outgoing messages to
+the appropriate sender.
 
-`stream_write_policy()` sets each persistent stream's write deadline. The default
-is ten seconds. A service can choose another duration or `UntilCancelled`.
-A service that chooses `UntilCancelled` must enforce its own progress deadline.
+`write_policy` sets each persistent stream's write deadline. The default is ten
+seconds. A service can choose another duration or `UntilCancelled`. A service
+that chooses `UntilCancelled` must enforce its own progress deadline.
 
 ## Negotiating complete layouts
 
@@ -138,10 +145,10 @@ Remove `OrderedStreamPair` and `ordered_stream_pair()`. Declare the persistent
 members with one capability in `streams()`. Use the `Session*` policy, demand,
 and resource APIs. The transport supplies all declared members together.
 
-Move role-specific queue limits and write deadlines into the service hooks.
-For the block-sync activation following #943, the service must declare the
-one-slot request queue, the request write policy, and the 32-second data write
-deadline. The transport no longer assigns those policies by role name.
+Declare role-specific queue limits and write deadlines on each member's `Stream`
+constant. For the block-sync activation following #943, the stream constants must
+declare the one-slot request queue, the request write policy, and the 32-second
+data write deadline. The transport no longer assigns those policies by role name.
 
 Production block sync in #943 remains a single-stream protocol. This change does
 not activate the later block-sync layout.

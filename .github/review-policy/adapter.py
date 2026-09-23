@@ -235,6 +235,9 @@ def check_evidence(policy, pull, comments, summary, reactions, reviews, threads,
         require(bool(requests), "Manual review request is missing")
         latest = max(requests, key=lambda c: instant(c["created_at"]))
         require(latest["body"].strip() == "@codex review", "Scoped review requests require human review")
+        # Codex may have read the body before an edit, so only the original text is trusted.
+        require(instant(latest["updated_at"]) == instant(latest["created_at"]),
+                "Edited review requests require human review")
         require(started["time"] - instant(latest["created_at"]) <= timedelta(minutes=30),
                 "Cannot correlate this manual request to the review")
     else:

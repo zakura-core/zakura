@@ -181,6 +181,13 @@ class EvidenceTests(unittest.TestCase):
                 self.data["comments"].append(command(body))
                 self.reject("Scoped review")
 
+    def test_scoped_request_edited_before_review_start_cannot_approve(self):
+        self.data = evidence("Manual request")
+        request = command()
+        request["updated_at"] = "2026-09-01T09:59:59Z"
+        self.data["comments"].append(request)
+        self.reject("Edited review requests")
+
     def test_missing_manual_request(self):
         self.data = evidence("Manual request")
         self.reject("request is missing")

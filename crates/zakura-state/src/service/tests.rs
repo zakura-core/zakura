@@ -1104,6 +1104,37 @@ async fn writer_capacity_failure_completes_variant_descendants() {
 }
 
 #[tokio::test]
+async fn in_flight_variant_duplicate_is_retryable_until_commit() {
+    use crate::tests::setup::changed_coinbase_body;
+    use zakura_header_chain::{BodyVerificationClass, TransientBodyFailureKind};
+
+    let _init_guard = zakura_test::init();
+    let (mut state, _, _, _) =
+        StateService::new(Config::ephemeral(), &Network::Mainnet, Height::MAX, 0)
+            .await
+            .unwrap();
+    let valid: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1687107_BYTES
+        .zcash_deserialize_into()
+        .unwrap();
+    let altered = changed_coinbase_body(&valid, 42).prepare();
+    // The honest caller already passed its initial lookup before this write began.
+    state.non_finalized_block_write_sent_hashes.add(&altered);
+    let error = timeout(
+        Duration::from_secs(1),
+        state.queue_and_commit_to_non_finalized_state(valid.prepare(), None),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .unwrap_err();
+    assert_eq!(
+        error.inner().body_verification_class(),
+        BodyVerificationClass::Retryable(TransientBodyFailureKind::VerifierUnavailable)
+    );
+    assert_eq!(error.inner().misbehavior_score(), 0);
+}
+
+#[tokio::test]
 async fn descendant_arriving_after_a_local_parent_failure_completes_immediately() {
     use super::write::{NonFinalizedWriteFailure, NonFinalizedWriteUpdate};
 

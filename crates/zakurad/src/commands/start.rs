@@ -2780,6 +2780,51 @@ mod zakura_header_sync_driver_tests {
     }
 
     #[tokio::test]
+    async fn block_sync_retries_pending_duplicates_from_lookup_and_commit() {
+        use zakura_consensus::{BlockError, RouterError, VerifyBlockError};
+        use zakura_header_chain::{BodyVerificationOutcome, TransientBodyFailureKind};
+        use zakura_state::{CommitBlockError, KnownBlock};
+
+        let block = mainnet_block(&BLOCK_MAINNET_1_BYTES);
+        for location in [KnownBlock::Queue, KnownBlock::WriteChannel] {
+            for at_commit in [false, true] {
+                let hash = block.hash();
+                let location = location.clone();
+                let verifier = service_fn(move |_: zakura_consensus::Request| {
+                    let location = location.clone();
+                    async move {
+                        let source = if at_commit {
+                            VerifyBlockError::Commit(CommitBlockError::new_duplicate(
+                                Some(hash.into()),
+                                location,
+                            ))
+                        } else {
+                            VerifyBlockError::Block {
+                                source: BlockError::AlreadyInChain(hash, location),
+                            }
+                        };
+                        Err::<block::Hash, _>(RouterError::Block {
+                            source: Box::new(source),
+                        })
+                    }
+                });
+                let outcome = commit_block_sync_body(
+                    verifier,
+                    test_block_work_owner(),
+                    test_block_source(),
+                    block.clone(),
+                    BlockApplyClass::Full,
+                )
+                .await;
+                assert!(
+                    matches!(outcome.verification(), BodyVerificationOutcome::Retryable(failure)
+                    if failure.kind == TransientBodyFailureKind::VerifierUnavailable)
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn block_commit_maps_unknown_local_errors_to_unavailable() {
         let block = mainnet_block(&BLOCK_MAINNET_1_BYTES);
         let owner = test_block_work_owner();

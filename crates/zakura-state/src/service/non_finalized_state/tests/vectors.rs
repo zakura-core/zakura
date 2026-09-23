@@ -16,7 +16,7 @@ use zakura_test::prelude::*;
 
 use crate::{
     arbitrary::Prepare,
-    error::ReconsiderError,
+    error::{PreciousError, ReconsiderError},
     service::{
         finalized_state::FinalizedState,
         non_finalized_state::{Chain, NonFinalizedState, MIN_DURATION_BETWEEN_BACKUP_UPDATES},
@@ -1199,4 +1199,148 @@ fn fork_drops_subtrees_above_fork_point() -> Result<()> {
     );
 
     Ok(())
+}
+
+/// Commits `root` and two equal-work children, returning the state, the finalized state, and
+/// the children ordered as `(hash_loser, hash_winner)`.
+fn precious_test_state(
+    network: &Network,
+) -> (NonFinalizedState, FinalizedState, Arc<Block>, Arc<Block>) {
+    let root = Arc::new(network.test_block(653599, 583999).unwrap());
+    let a = root
+        .make_fake_child()
+        .set_work(10)
+        .set_block_commitment([1; 32]);
+    let b = root
+        .make_fake_child()
+        .set_work(10)
+        .set_block_commitment([2; 32]);
+    let (mut state, finalized) = new_invalidate_test_state(network);
+    state
+        .commit_new_chain(root.prepare(), &finalized.db)
+        .unwrap();
+    for block in [&a, &b] {
+        state
+            .commit_block(block.clone().prepare(), &finalized.db)
+            .unwrap();
+    }
+    let (low, high) = if a.hash().0 < b.hash().0 {
+        (a, b)
+    } else {
+        (b, a)
+    };
+    assert_eq!(state.best_tip().unwrap().1, high.hash());
+    (state, finalized, low, high)
+}
+
+/// Commits `block` to `state`.
+fn commit_test_block(
+    state: &mut NonFinalizedState,
+    finalized: &FinalizedState,
+    block: &Arc<Block>,
+) {
+    state
+        .commit_block(block.clone().prepare(), &finalized.db)
+        .unwrap();
+}
+
+/// A precious tip beats the hash tie-break, and a later call wins.
+#[test]
+fn precious_block_overrides_hash_order_and_later_calls_win() {
+    let _init_guard = zakura_test::init();
+    for network in Network::iter() {
+        let (mut state, finalized, low, high) = precious_test_state(&network);
+
+        state.precious_block(low.hash(), &finalized.db).unwrap();
+        assert_eq!(state.best_tip().unwrap().1, low.hash());
+        assert_eq!(state.chain_count(), 2);
+
+        state.precious_block(high.hash(), &finalized.db).unwrap();
+        assert_eq!(state.best_tip().unwrap().1, high.hash());
+
+        // Repeating a call on the best tip keeps it best.
+        state.precious_block(high.hash(), &finalized.db).unwrap();
+        assert_eq!(state.best_tip().unwrap().1, high.hash());
+    }
+}
+
+/// Greater work still wins, and only unknown hashes are errors.
+#[test]
+fn precious_block_ignores_lower_work_and_rejects_unknown_hashes() {
+    let _init_guard = zakura_test::init();
+    let network = Network::Mainnet;
+    let (mut state, finalized, low, high) = precious_test_state(&network);
+    let child = low.make_fake_child().set_work(1);
+    commit_test_block(&mut state, &finalized, &child);
+    assert_eq!(state.best_tip().unwrap().1, child.hash());
+
+    // A lower-work tip and a block below the best tip leave the state unchanged.
+    for hash in [high.hash(), low.hash()] {
+        let before = state.clone();
+        state.precious_block(hash, &finalized.db).unwrap();
+        assert!(state.eq_internal_state(&before));
+        assert_eq!(state.best_tip().unwrap().1, child.hash());
+    }
+
+    let unknown = high.make_fake_child().set_work(1).hash();
+    assert!(matches!(
+        state.precious_block(unknown, &finalized.db),
+        Err(PreciousError::BlockNotFound(hash)) if hash == unknown
+    ));
+    assert_eq!(state.best_tip().unwrap().1, child.hash());
+}
+
+/// The preference applies to the precious tip only: later equal-work tips do not displace it,
+/// descendants do not inherit it, and reverting to the tip restores it.
+#[test]
+fn precious_block_follows_the_preferred_tip() {
+    let _init_guard = zakura_test::init();
+    let network = Network::Mainnet;
+    let (mut state, finalized, low, high) = precious_test_state(&network);
+    state.precious_block(low.hash(), &finalized.db).unwrap();
+    assert_eq!(state.best_tip().unwrap().1, low.hash());
+
+    // Equal-work siblings arriving later do not displace the precious tip, whatever their hash.
+    let root_hash = low.header.previous_block_hash;
+    let root = state
+        .best_chain()
+        .unwrap()
+        .block(root_hash.into())
+        .unwrap()
+        .block
+        .clone();
+    for commitment in [3, 4, 5] {
+        let sibling = root
+            .make_fake_child()
+            .set_work(10)
+            .set_block_commitment([commitment; 32]);
+        commit_test_block(&mut state, &finalized, &sibling);
+        assert_eq!(state.best_tip().unwrap().1, low.hash());
+    }
+
+    // Children with equal work fall back to the hash tie-break.
+    let low_child = low.make_fake_child().set_work(1);
+    let high_child = high.make_fake_child().set_work(1);
+    commit_test_block(&mut state, &finalized, &low_child);
+    assert_eq!(state.best_tip().unwrap().1, low_child.hash());
+    commit_test_block(&mut state, &finalized, &high_child);
+    let hash_winner = std::cmp::max_by_key(low_child.hash(), high_child.hash(), |hash| hash.0);
+    assert_eq!(state.best_tip().unwrap().1, hash_winner);
+
+    // Reverting both children restores the precious tip.
+    state.invalidate_block(low_child.hash()).unwrap();
+    state.invalidate_block(high_child.hash()).unwrap();
+    assert_eq!(state.best_tip().unwrap().1, low.hash());
+}
+
+/// Preferences are independent between clones.
+#[test]
+fn precious_block_changes_only_the_cloned_state() {
+    let _init_guard = zakura_test::init();
+    let network = Network::Mainnet;
+    let (state, finalized, low, high) = precious_test_state(&network);
+    let mut staged = state.clone();
+    staged.precious_block(low.hash(), &finalized.db).unwrap();
+    assert_eq!(staged.best_tip().unwrap().1, low.hash());
+    assert_eq!(state.best_tip().unwrap().1, high.hash());
 }

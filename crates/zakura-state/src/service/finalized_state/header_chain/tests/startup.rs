@@ -1638,7 +1638,7 @@ fn configured_network_startup_rebinds_a_changed_network_policy() {
         engine_config.mode,
         Network::new_regtest(RegtestParameters {
             activation_heights: ConfiguredActivationHeights {
-                canopy: Some(10),
+                nu5: Some(10),
                 ..Default::default()
             },
             ..Default::default()

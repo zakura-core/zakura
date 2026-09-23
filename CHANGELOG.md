@@ -15,7 +15,8 @@ independently.
 
 - Added an opt-in block profile explorer with finalization timings for state
   updates, database preparation and writes, pruning, and publication. Timeline
-  detail opens on a dedicated block page, groups checks by transaction with
+  detail opens on a dedicated block page, separates shielded cache hits, queue
+  waits, shared batches, and combined proof/signature execution, and groups checks by transaction with
   sorting by elapsed time or transaction number, retains
   up to 65,536 spans per block, expands on demand, and shows total
   recorded time, with metadata and downloads collapsed. Profiles identify the

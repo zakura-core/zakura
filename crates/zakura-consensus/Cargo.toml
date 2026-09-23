@@ -83,6 +83,7 @@ proptest = { workspace = true, optional = true }
 proptest-derive = { workspace = true, optional = true }
 
 [dev-dependencies]
+serde_json = { workspace = true }
 color-eyre = { workspace = true }
 
 hex = { workspace = true }

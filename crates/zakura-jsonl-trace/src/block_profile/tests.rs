@@ -379,6 +379,7 @@ mod transport {
             monotonic_start_us: None,
             clock_error_us: 1,
             startup_gate: false,
+            verification_detail_version: 1,
         }
     }
 

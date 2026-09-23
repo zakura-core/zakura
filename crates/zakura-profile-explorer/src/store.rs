@@ -16,7 +16,7 @@ use std::{
 use zakura_jsonl_trace::block_profile as profiles;
 
 pub(crate) const MAX_INGEST_BATCH: usize = 256;
-const MAX_CHUNK_EVENTS: usize = 4096;
+const MAX_CHUNK_EVENTS: usize = 2048;
 const MAX_DECODE_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_DETAIL_CHUNKS: usize = 64;
 const DAY_MS: u64 = 86_400_000;
@@ -284,8 +284,27 @@ impl Store {
                         start_us,
                         end_us,
                         parent,
+                        stage,
+                        verification,
                         ..
                     } => {
+                        if let Some(detail) = verification {
+                            ensure!(
+                                detail.is_valid(start_us, end_us),
+                                "invalid verification detail"
+                            );
+                            let valid_stage = matches!(
+                                (stage, detail),
+                                (
+                                    profiles::Stage::VerificationRequest,
+                                    profiles::verification::Detail::Request { .. }
+                                ) | (
+                                    profiles::Stage::VerificationBatch,
+                                    profiles::verification::Detail::Batch { .. }
+                                )
+                            );
+                            ensure!(valid_stage, "verification detail does not match span stage");
+                        }
                         ensure!(
                             span > 0
                                 && span <= profiles::MAX_SPANS
@@ -764,7 +783,11 @@ impl Reader {
         let recorded_end = spans
             .iter()
             .filter_map(|span| match span {
-                Event::Span { end_us, .. } => Some(*end_us),
+                Event::Span { stage, end_us, .. }
+                    if *stage != profiles::Stage::VerificationBatch =>
+                {
+                    Some(*end_us)
+                }
                 _ => None,
             })
             .chain(summary["end_us"].as_u64())

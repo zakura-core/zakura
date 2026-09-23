@@ -70,3 +70,42 @@ test('base commit links require a complete Git object ID', () => {
     assert.equal(context.commitUrl(invalid),null);
   }
 });
+
+const plain=value=>JSON.parse(JSON.stringify(value));
+test('shared verification batches are deduplicated and missing links remain partial',()=>{
+  const request=(id)=>({stage:'verification_request',verification:{kind:'request',cache:'miss',primary_batch:id}});
+  const batch={stage:'verification_batch',verification:{kind:'batch',id:7}};
+  const summary=context.verificationSummary([request(7),request(7),batch,batch],1);
+  assert.equal(summary.batches.length,1);
+  assert.equal(summary.counts.miss,2);
+  assert.equal(summary.partial,false);
+  const missing=context.verificationSummary([request(8),batch],1);
+  assert.deepEqual(plain(missing.missing),[8]);
+  assert.equal(missing.partial,true);
+  assert.equal(context.verificationSummary([],undefined).available,false);
+});
+test('cache-only evidence has no invented execution phases',()=>{
+  const summary=context.verificationSummary([{verification:{kind:'request',cache:'hit'}}],1);
+  assert.equal(summary.counts.hit,1);
+  assert.equal(summary.batches.length,0);
+  assert.deepEqual(plain(context.batchPhases({verification:{kind:'batch'}})),[]);
+});
+test('batch phase intervals preserve separate waiting setup execution and publication',()=>{
+  const phases=context.batchPhases({verification:{dispatch_us:10,worker_start_us:20,setup_end_us:25,execution_end_us:50,published_us:55}});
+  assert.deepEqual(plain(phases.map(p=>[p.stage,p.start_us,p.end_us])),[
+    ['batch_worker_wait',10,20],['batch_setup',20,25],['batch_execution',25,50],['batch_publication',50,55]
+  ]);
+});
+test('shared work before block entry extends the axis without shifting the block',()=>{
+  const bounds=context.timelineBounds([{start_us:20,end_us:120}],{start_us:100,end_us:150});
+  assert.deepEqual(plain(bounds),{start:20,end:150,duration:130});
+  const position=context.intervalPosition({start_us:100,end_us:150},bounds.start,bounds.duration);
+  assert.equal(position.left,80/130*100);
+  assert.equal(position.width,100-position.left);
+  assert.deepEqual(plain(context.intervalPosition({start_us:0,end_us:300},20,130)),{left:0,width:100});
+});
+test('small durations and pre-block offsets retain microsecond precision',()=>{
+  assert.equal(vm.runInContext('ms(6)',context),'6 µs');
+  assert.equal(vm.runInContext('ms(-6)',context),'-6 µs');
+  assert.equal(vm.runInContext('ms(1200)',context),'1.2 ms');
+});

@@ -21,6 +21,8 @@ use std::{
 use crossbeam_channel::{bounded, Receiver, Sender};
 use serde::{Deserialize, Serialize};
 
+pub mod verification;
+
 /// Version of the wire schema and timing definitions.
 pub const SCHEMA_VERSION: u32 = 1;
 /// Maximum simultaneous retained attempt contexts.
@@ -79,6 +81,9 @@ pub struct Run {
     /// Require a startup readiness boundary before including timings in statistics.
     #[serde(default)]
     pub startup_gate: bool,
+    /// Version of the optional shielded verification detail. Zero means unavailable.
+    #[serde(default)]
+    pub verification_detail_version: u32,
 }
 
 /// Main code included in a build, separate from the profiling branch's full revision.
@@ -139,6 +144,22 @@ pub enum Stage {
     Halo2Request,
     /// Readiness of the state service before submitting a commit.
     StateReady,
+    /// Shielded bundle request with explicit cache and batch evidence.
+    VerificationRequest,
+    /// Shared batch projection, not exclusive work of this block.
+    VerificationBatch,
+    /// Verification cache lookup.
+    VerificationCache,
+    /// Inner verification service readiness.
+    VerificationReady,
+    /// Request submission until batch service admission.
+    VerificationAdmission,
+    /// Bundle preparation and admission checks.
+    VerificationPreparation,
+    /// Admitted request waiting for batch dispatch.
+    VerificationFormation,
+    /// Result publication until caller resumes.
+    VerificationDelivery,
     /// State request through caller response, including queues.
     StateResponse,
     /// A synchronous worker's dispatch-to-start delay.
@@ -302,6 +323,9 @@ pub enum Event {
         end_us: u64,
         /// Thread at completion, not proof of exclusive CPU ownership.
         completion_thread: Option<u64>,
+        /// Optional bounded evidence for shielded verification.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        verification: Option<verification::Detail>,
     },
     /// Self-contained root completion.
     Finish {
@@ -522,6 +546,14 @@ impl Context {
                 | Stage::Halo2Request
                 | Stage::WorkerExecution
                 | Stage::WorkerQueue
+                | Stage::VerificationRequest
+                | Stage::VerificationBatch
+                | Stage::VerificationCache
+                | Stage::VerificationReady
+                | Stage::VerificationAdmission
+                | Stage::VerificationPreparation
+                | Stage::VerificationFormation
+                | Stage::VerificationDelivery
         );
         if fine && attempt.fine_spans.fetch_add(1, Ordering::Relaxed) >= MAX_FINE_SPANS {
             attempt.dropped.fetch_add(1, Ordering::Relaxed);
@@ -539,6 +571,8 @@ impl Context {
             parent: *parent,
             stage,
             transaction_hash: None,
+            verification: None,
+            end_us: None,
             start_us: attempt.recorder.now(),
             finished: false,
         }
@@ -596,6 +630,8 @@ pub struct Span {
     parent: u64,
     stage: Stage,
     transaction_hash: Option<[u8; 32]>,
+    verification: Option<verification::Detail>,
+    end_us: Option<u64>,
     start_us: u64,
     finished: bool,
 }
@@ -606,6 +642,8 @@ impl Default for Span {
             parent: 0,
             stage: Stage::VerifierRequest,
             transaction_hash: None,
+            verification: None,
+            end_us: None,
             start_us: 0,
             finished: true,
         }
@@ -632,8 +670,9 @@ impl Drop for Span {
                     transaction_index: *transaction_index,
                     transaction_hash: self.transaction_hash,
                     start_us: self.start_us,
-                    end_us: attempt.recorder.now(),
+                    end_us: self.end_us.unwrap_or_else(|| attempt.recorder.now()),
                     completion_thread: thread_id(),
+                    verification: self.verification,
                 },
                 false,
             ) {
@@ -845,6 +884,7 @@ fn start_inner(
         monotonic_start_us: mono.map(|t| t.saturating_sub(before)),
         clock_error_us: after.saturating_sub(before).saturating_add(1),
         startup_gate,
+        verification_detail_version: 1,
     };
     RECORDER.set(recorder.clone()).map_err(|_| {
         std::io::Error::new(

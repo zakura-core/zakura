@@ -1,5 +1,7 @@
 //! Async Halo2 batch verifier service
 
+use zakura_jsonl_trace::block_profile::{self as profiles, verification};
+
 use std::{
     fmt,
     future::Future,
@@ -146,6 +148,7 @@ pub struct Item {
     bundle: Arc<orchard::bundle::Bundle<orchard::bundle::Authorized, ZatBalance>>,
     sighash: SigHash,
     cache_key: Option<CacheKey>,
+    profile: verification::Request,
 }
 
 impl RequestWeight for Item {
@@ -169,6 +172,7 @@ impl Item {
             bundle: Arc::new(bundle),
             sighash,
             cache_key: None,
+            profile: verification::Request::default(),
         }
     }
 
@@ -189,6 +193,7 @@ impl Item {
         Self {
             bundle: Arc::new(bundle),
             sighash,
+            profile: verification::Request::default(),
             cache_key: Some(CacheKey::new(
                 UnminedTxId::Witnessed(wtx_id),
                 sighash.0,
@@ -203,15 +208,63 @@ impl Item {
     /// fallback logic when batch verification fails. The caller supplies the
     /// verifying key for the item's era.
     pub fn verify_single(self, vk: &ItemVerifyingKey) -> bool {
-        let mut batch = BatchValidator::new(vk);
-        if batch.queue(self).is_err() {
-            return false;
+        let mut profile = verification::Batch::new();
+        profile.submitted();
+        profile.dispatch();
+        let (valid, mut profile) = self.verify_single_profiled(vk, profile);
+        profile.finish(if valid {
+            verification::Status::Success
+        } else {
+            verification::Status::Failed
+        });
+        valid
+    }
+
+    fn pool(&self) -> verification::Pool {
+        match ShieldedPool::from(self.bundle.bundle_version().value_pool()) {
+            ShieldedPool::Orchard => verification::Pool::Orchard,
+            ShieldedPool::Ironwood => verification::Pool::Ironwood,
+            ShieldedPool::Sapling => unreachable!("Orchard bundle cannot have the Sapling pool"),
         }
-        batch.validate(thread_rng())
+    }
+
+    fn workload(&self) -> verification::Workload {
+        verification::Workload {
+            actions: u32::try_from(self.bundle.actions().len()).unwrap_or(u32::MAX),
+            ..Default::default()
+        }
+    }
+
+    fn verify_single_profiled(
+        self,
+        vk: &ItemVerifyingKey,
+        mut profile: verification::Batch,
+    ) -> (bool, verification::Batch) {
+        profile.worker_start();
+        let pool = self.pool();
+        let workload = self.workload();
+        let request = self.profile.clone();
+        let preparation = request.phase(profiles::Stage::VerificationPreparation);
+        let mut batch = BatchValidator::new(vk);
+        let queued = batch.queue(self);
+        drop(preparation);
+        if queued.is_err() {
+            return (false, profile);
+        }
+        profile.add(&request, pool, workload);
+        profile.setup_finished();
+        let result = batch.validate(thread_rng());
+        profile.execution_finished();
+        (result, profile)
     }
 }
 
 impl CachedItem for Item {
+    fn start_profile(&mut self) -> verification::Request {
+        self.profile = verification::Request::new(self.pool(), self.workload());
+        self.profile.clone()
+    }
+
     /// Returns this item's cache key, if it was constructed with a witnessed
     /// transaction ID.
     ///
@@ -461,6 +514,7 @@ pub struct Verifier {
 
     /// The synchronous Halo2 batch validator.
     batch: BatchValidator<'static>,
+    profile: verification::Batch,
 
     /// A channel for broadcasting the result of a batch to the futures for each batch item.
     ///
@@ -476,50 +530,73 @@ impl Verifier {
         Self {
             vk,
             batch: BatchValidator::new(vk),
+            profile: verification::Batch::new(),
             tx,
         }
     }
 
     /// Returns the batch verifier and channel sender,
     /// replacing the batch and channel with new empty ones.
-    fn take(&mut self) -> (BatchValidator<'static>, Sender) {
+    fn take(&mut self) -> (BatchValidator<'static>, Sender, verification::Batch) {
         // Use a new verifier and channel for each batch.
         let batch = mem::replace(&mut self.batch, BatchValidator::new(self.vk));
         let (tx, _) = watch::channel(None);
         let tx = mem::replace(&mut self.tx, tx);
 
-        (batch, tx)
+        (batch, tx, mem::take(&mut self.profile))
     }
 
     /// Synchronously process the batch using its bound verifying key, and send the result using
     /// the channel sender. This function blocks until the batch is completed.
-    fn verify(batch: BatchValidator<'static>, tx: Sender) {
+    fn verify(batch: BatchValidator<'static>, tx: Sender, mut profile: verification::Batch) {
+        profile.worker_start();
+        profile.setup_finished();
         let result = batch.validate(thread_rng());
+        profile.execution_finished();
+        profile.finish(if result {
+            verification::Status::Success
+        } else {
+            verification::Status::Failed
+        });
         let _ = tx.send(Some(result));
     }
 
     /// Flush the batch using a thread pool, sending the result via the channel.
     /// This returns immediately, usually before the batch is completed.
     fn flush_blocking(&mut self) {
-        let (batch, tx) = self.take();
+        let (batch, tx, mut profile) = self.take();
+        profile.submitted();
+        profile.dispatch();
 
         // Correctness: Do CPU-intensive work on a dedicated thread, to avoid blocking other futures.
         //
         // We don't care about execution order here, because this method is only called on drop.
-        tokio::task::block_in_place(|| rayon::spawn_fifo(move || Self::verify(batch, tx)));
+        tokio::task::block_in_place(|| rayon::spawn_fifo(move || Self::verify(batch, tx, profile)));
     }
 
     /// Flush the batch using a thread pool, validating against the batch's bound key and returning
     /// the result via the channel. This function returns a future that becomes ready when the batch
     /// is completed.
-    async fn flush_spawning(batch: BatchValidator<'static>, tx: Sender) {
+    async fn flush_spawning(
+        batch: BatchValidator<'static>,
+        tx: Sender,
+        mut profile: verification::Batch,
+    ) {
         // Correctness: Do CPU-intensive work on a dedicated thread, to avoid blocking other futures.
         let start = std::time::Instant::now();
-        let result = spawn_fifo(move || batch.validate(thread_rng())).await;
+        profile.dispatch();
+        let result = spawn_fifo(move || {
+            profile.worker_start();
+            profile.setup_finished();
+            let valid = batch.validate(thread_rng());
+            profile.execution_finished();
+            (valid, profile)
+        })
+        .await;
         let duration = start.elapsed().as_secs_f64();
 
         let result_label = match &result {
-            Ok(true) => "success",
+            Ok((true, _)) => "success",
             _ => "failure",
         };
         metrics::histogram!(
@@ -529,7 +606,15 @@ impl Verifier {
         )
         .record(duration);
 
-        let _ = tx.send(result.ok());
+        let result = result.ok().map(|(valid, mut profile)| {
+            profile.finish(if valid {
+                verification::Status::Success
+            } else {
+                verification::Status::Failed
+            });
+            valid
+        });
+        let _ = tx.send(result);
     }
 
     /// Verify a single item against `vk` using a thread pool, and return the result.
@@ -538,7 +623,19 @@ impl Verifier {
         vk: &'static ItemVerifyingKey,
     ) -> Result<(), BoxError> {
         // Correctness: Do CPU-intensive work on a dedicated thread, to avoid blocking other futures.
-        if spawn_fifo(move || item.verify_single(vk)).await? {
+        item.profile.fallback();
+        item.profile.admitted();
+        let mut profile = verification::Batch::new();
+        profile.submitted();
+        profile.dispatch();
+        let (valid, mut profile) =
+            spawn_fifo(move || item.verify_single_profiled(vk, profile)).await?;
+        profile.finish(if valid {
+            verification::Status::Success
+        } else {
+            verification::Status::Failed
+        });
+        if valid {
             Ok(())
         } else {
             Err(TransactionError::Halo2VerificationFailed.into())
@@ -566,9 +663,18 @@ impl Service<BatchControl<Item>> for Verifier {
         match req {
             BatchControl::Item(item) => {
                 tracing::trace!("got item");
-                if let Err(err) = self.batch.queue(item) {
+                let pool = item.pool();
+                let workload = item.workload();
+                let profile = item.profile.clone();
+                profile.admitted();
+                let preparation = profile.phase(profiles::Stage::VerificationPreparation);
+                let queued = self.batch.queue(item);
+                drop(preparation);
+                if let Err(err) = queued {
                     return Box::pin(async move { Err(BoxError::from(err)) });
                 }
+                self.profile.add(&profile, pool, workload);
+                profile.prepared();
                 let mut rx = self.tx.subscribe();
                 Box::pin(async move {
                     match rx.changed().await {
@@ -598,9 +704,10 @@ impl Service<BatchControl<Item>> for Verifier {
             BatchControl::Flush => {
                 tracing::trace!("got halo2 flush command");
 
-                let (batch, tx) = self.take();
+                let (batch, tx, mut profile) = self.take();
+                profile.submitted();
 
-                Box::pin(Self::flush_spawning(batch, tx).map(|()| Ok(())))
+                Box::pin(Self::flush_spawning(batch, tx, profile).map(|()| Ok(())))
             }
         }
     }

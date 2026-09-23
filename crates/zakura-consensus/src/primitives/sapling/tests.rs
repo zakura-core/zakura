@@ -840,3 +840,303 @@ async fn cached_verifier_still_rejects_a_corrupted_proof_after_verifying_a_valid
         "expected SaplingVerificationFailed, got: {error:?}"
     );
 }
+
+/// Exercise the real verifier and exporter together. This test owns the process recorder;
+/// other tests have no attempt context, so their work is not attributed to these blocks.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn verification_profile_records_real_cache_batch_fallback_and_cancellation() {
+    use std::{os::unix::net::UnixDatagram, time::Duration};
+    use zakura_jsonl_trace::block_profile::{
+        self as profiles,
+        verification::{Cache, Detail, Status},
+    };
+
+    async fn recorded<F>(tag: u8, future: F) -> Result<(), BoxError>
+    where
+        F: std::future::Future<Output = Result<(), BoxError>>,
+    {
+        let root = profiles::begin(profiles::Block {
+            hash: [tag; 32],
+            parent: [0; 32],
+            height: Some(u32::from(tag)),
+            transactions: 1,
+            mode: profiles::Mode::Semantic,
+        })
+        .expect("test recorder admits the attempt");
+        let result = root.context().wrap(future).await;
+        root.finish(if result.is_ok() {
+            profiles::Outcome::Success
+        } else {
+            profiles::Outcome::Failed
+        });
+        result
+    }
+
+    let _init_guard = zakura_test::init();
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!("zkp-{}-{unique}.sock", std::process::id()));
+    let socket = UnixDatagram::bind(&path).unwrap();
+    socket
+        .set_read_timeout(Some(Duration::from_millis(100)))
+        .unwrap();
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let receiver_stop = stop.clone();
+    let complete = Arc::new(AtomicUsize::new(0));
+    let receiver_complete = complete.clone();
+    let receiver = std::thread::spawn(move || {
+        let mut frames = Vec::new();
+        let mut expected = std::collections::BTreeMap::<u64, u64>::new();
+        let mut spans = std::collections::BTreeMap::<u64, u64>::new();
+        let mut bytes = [0; 8192];
+        loop {
+            match socket.recv(&mut bytes) {
+                Ok(len) => {
+                    let frame = serde_json::from_slice::<profiles::Frame>(&bytes[..len]).unwrap();
+                    if let profiles::Frame::Event { data, .. } = &frame {
+                        match data {
+                            profiles::Event::Span { attempt, .. } => {
+                                *spans.entry(*attempt).or_default() += 1;
+                            }
+                            profiles::Event::Seal {
+                                attempt,
+                                spans: count,
+                                ..
+                            } => {
+                                expected.insert(*attempt, *count);
+                            }
+                            _ => {}
+                        }
+                        receiver_complete.store(
+                            expected
+                                .iter()
+                                .filter(|(id, count)| spans.get(id) == Some(count))
+                                .count(),
+                            Ordering::Release,
+                        );
+                    }
+                    frames.push(frame);
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    if receiver_stop.load(Ordering::Acquire) {
+                        return frames;
+                    }
+                }
+                Err(error) => panic!("profile receiver failed: {error}"),
+            }
+        }
+    });
+    let runtime = profiles::start(
+        &profiles::Config {
+            socket: Some(path.clone()),
+            node: "test".into(),
+            session: "verification".into(),
+        },
+        "test".into(),
+        "test".into(),
+        "test".into(),
+    )
+    .unwrap()
+    .unwrap();
+
+    let (nu, valid) = mined_v4_sapling_transaction_with_spends();
+    let valid_item = item(&valid, nu).unwrap();
+    let verifier = uncached_verification_behind_a_fresh_cache();
+    recorded(1, verifier.clone().oneshot(valid_item.clone()))
+        .await
+        .unwrap();
+    recorded(2, verifier.clone().oneshot(valid_item.clone()))
+        .await
+        .unwrap();
+    verifier.clear();
+    recorded(3, verifier.clone().oneshot(valid_item.clone()))
+        .await
+        .unwrap();
+
+    let corrupted = mutated_spend(&valid, |spend| {
+        let (first, rest) = spend.zkproof.0.split_at_mut(48);
+        first.swap_with_slice(&mut rest[96..144]);
+    });
+    recorded(4, verifier.clone().oneshot(item(&corrupted, nu).unwrap()))
+        .await
+        .unwrap_err();
+    let dead = Cached::new(UnreadyVerifier::new(), 8, TEST_CACHE_VERIFIER_LABEL);
+    recorded(5, dead.oneshot(valid_item.clone()))
+        .await
+        .unwrap_err();
+
+    let pending = Cached::new(
+        tower::service_fn(|_: Item| std::future::pending::<Result<(), BoxError>>()),
+        8,
+        TEST_CACHE_VERIFIER_LABEL,
+    );
+    recorded(6, async {
+        let mut request = Box::pin(pending.oneshot(valid_item.clone()));
+        assert!(futures::poll!(request.as_mut()).is_pending());
+        drop(request);
+        Ok(())
+    })
+    .await
+    .unwrap();
+
+    recorded(7, async {
+        let mut verifier = super::Verifier::default();
+        let mut item = valid_item;
+        let profile = item.start_profile();
+        let _guard = profile.guard();
+        profile.cache(Cache::Bypass);
+        profile.submitted();
+        let response = verifier.call(tower_batch_control::BatchControl::Item(item));
+        drop(verifier);
+        let result = response.await;
+        profile.finish(if result.is_ok() {
+            Status::Success
+        } else {
+            Status::Failed
+        });
+        result
+    })
+    .await
+    .unwrap();
+
+    let malformed = mutated_spend(&valid, |spend| spend.zkproof.0.fill(0));
+    recorded(8, verifier.clone().oneshot(item(&malformed, nu).unwrap()))
+        .await
+        .unwrap_err();
+
+    // Summary records can overtake detail. Wait for every sealed attempt's exact span count.
+    let drained = tokio::time::timeout(Duration::from_secs(5), async {
+        while complete.load(Ordering::Acquire) != 8 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    stop.store(true, Ordering::Release);
+    let frames = tokio::task::spawn_blocking(move || receiver.join().unwrap())
+        .await
+        .unwrap();
+    drop(runtime);
+    std::fs::remove_file(path).unwrap();
+    drained.expect("exporter delivers all eight sealed attempts within five seconds");
+
+    let mut requests = std::collections::BTreeMap::new();
+    let mut batches = std::collections::BTreeMap::<u64, Vec<u64>>::new();
+    let mut seals = 0;
+    for frame in frames {
+        if let profiles::Frame::Event { data, .. } = frame {
+            match data {
+                profiles::Event::Span {
+                    attempt,
+                    verification: Some(detail),
+                    start_us,
+                    end_us,
+                    ..
+                } => {
+                    assert!(detail.is_valid(start_us, end_us));
+                    match detail {
+                        Detail::Request { .. } => {
+                            requests.insert(attempt, detail);
+                        }
+                        Detail::Batch {
+                            id,
+                            dispatch_us,
+                            worker_start_us,
+                            execution_end_us,
+                            published_us,
+                            status,
+                            ..
+                        } => {
+                            assert!(dispatch_us.is_some() && worker_start_us.is_some());
+                            assert!(execution_end_us.is_some() && published_us.is_some());
+                            assert_ne!(status, Status::Abandoned);
+                            batches.entry(attempt).or_default().push(id);
+                        }
+                    }
+                }
+                profiles::Event::Seal { dropped, .. } => {
+                    assert_eq!(dropped, 0);
+                    seals += 1;
+                }
+                _ => {}
+            }
+        }
+    }
+    assert_eq!(seals, 8);
+    assert_eq!(requests.len(), 8);
+    assert!(matches!(
+        requests[&8],
+        Detail::Request {
+            fallback: true,
+            partial: true,
+            status: Status::Failed,
+            ..
+        }
+    ));
+    assert!(
+        !batches[&8].is_empty(),
+        "partial preparation still contributes batch work"
+    );
+    assert_eq!(
+        batches[&7].len(),
+        1,
+        "Drop flush retains execution evidence"
+    );
+    assert!(matches!(
+        requests[&1],
+        Detail::Request {
+            cache: Cache::Miss,
+            status: Status::Success,
+            ..
+        }
+    ));
+    assert!(matches!(
+        requests[&2],
+        Detail::Request {
+            cache: Cache::Hit,
+            primary_batch: None,
+            ..
+        }
+    ));
+    assert!(!batches.contains_key(&2));
+    assert_eq!(batches[&1].len(), 1);
+    assert_eq!(batches[&3].len(), 1);
+    assert_ne!(
+        batches[&1][0], batches[&3][0],
+        "successive flushes retain distinct batches"
+    );
+    assert!(matches!(
+        requests[&4],
+        Detail::Request {
+            fallback: true,
+            primary_batch: Some(_),
+            fallback_batch: Some(_),
+            status: Status::Failed,
+            ..
+        }
+    ));
+    assert_eq!(batches[&4].len(), 2);
+    assert!(matches!(
+        requests[&5],
+        Detail::Request {
+            cache: Cache::Miss,
+            status: Status::Failed,
+            primary_batch: None,
+            ..
+        }
+    ));
+    assert!(matches!(
+        requests[&6],
+        Detail::Request {
+            status: Status::Abandoned,
+            ..
+        }
+    ));
+}

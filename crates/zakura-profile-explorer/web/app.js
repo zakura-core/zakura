@@ -3,7 +3,7 @@ const $ = (id) => document.getElementById(id);
 const showCpu = new URLSearchParams(location.search).get('cpu') === '1';
 const cpuSuffix = showCpu ? '?cpu=1' : '';
 const number = (n) => Number(n || 0).toLocaleString();
-const ms = (n) => `${(n / 1000).toFixed(1)} ms`;
+const ms = (n) => Math.abs(n)<1000 ? `${Math.round(n)} µs` : `${(n / 1000).toFixed(1)} ms`;
 const recordingUrl = (run,attempt) => `/block/${encodeURIComponent(run)}/${encodeURIComponent(attempt)}`;
 const blockUrl = (row,byHash=false) => row.height!=null && !byHash ? `/block/${row.height}` : row.hash ? `/block/${encodeURIComponent(row.hash)}` : recordingUrl(row.run,row.attempt);
 const el = (tag, text, cls) => { const n = document.createElement(tag); if (text != null) n.textContent = text; if (cls) n.className = cls; return n; };
@@ -97,8 +97,8 @@ async function openDetail(run,attempt) {
   $('detail-timing').replaceChildren(...metrics.map(([value,label])=>{const box=el('div',null,'stat');box.append(el('b',value),el('span',label));return box;}));
   $('trace').href=`/api/trace/${run}/${attempt}`; $('raw').href=`/api/attempt/${run}/${attempt}`;
   const spans=[...data.spans].sort((a,b)=>a.start_us-b.start_us), start=row.start_us || 0;
-  const end=Math.max(row.end_us||start,...spans.map(s=>s.end_us)), duration=Math.max(end-start,1);
-  renderTimeline(spans,row,start,duration,data.recording.network);
+  const bounds=timelineBounds(spans,row);
+  renderTimeline(spans,row,bounds.start,bounds.duration,data.recording.network,data.recording.verification_detail_version,data.complete);
   if(showCpu){$('cpu').hidden=false;renderCpu(data.cpu);}
 }
 function renderMetadata(row,recording) {
@@ -178,7 +178,7 @@ function onFirstExpand(group,render) {
 function renderTransactions(host,spans,lane,network) {
   const {groups,legacy,unassigned}=groupTransactions(spans);
   const entries=[],list=el('div'),sort=el('select');
-  for(const [value,label] of [['duration','Longest first'],['number','Transaction number']]){
+  for(const [value,label] of [['number','Transaction number'],['duration','Slowest first']]){
     const option=el('option',label);option.value=value;sort.append(option);
   }
   if(groups.length+legacy.length>1){
@@ -210,7 +210,89 @@ function renderTransactions(host,spans,lane,network) {
   }
   if(!spans.length)host.append(el('p','No individual transaction timings were retained.','muted'));
 }
-function renderTimeline(spans,row,start,duration,network) {
+const verificationLabels = {
+  verification_request:'Shielded verification request', verification_cache:'Cache lookup',
+  verification_ready:'Wait for service readiness', verification_admission:'Wait for admission',
+  verification_preparation:'Prepare verification inputs', verification_formation:'Wait for batch flush',
+  verification_delivery:'Deliver result', verification_batch:'Shared verification batch'
+};
+function phaseCategory(stage) {
+  if(['verification_ready','verification_admission','verification_formation','batch_flush_wait','batch_worker_wait'].includes(stage))return 'waiting';
+  if(['verification_preparation','batch_setup'].includes(stage))return 'preparation';
+  if(stage==='batch_execution')return 'execution';
+  if(['verification_delivery','batch_publication','verification_cache'].includes(stage))return 'delivery';
+  return '';
+}
+function verificationSummary(spans,version) {
+  const requests=spans.filter(s=>s.verification?.kind==='request');
+  const batches=new Map();
+  for(const span of spans)if(span.verification?.kind==='batch' && !batches.has(span.verification.id))batches.set(span.verification.id,span);
+  const counts={hit:0,miss:0,bypass:0,unknown:0};
+  for(const request of requests)counts[request.verification.cache in counts?request.verification.cache:'unknown']++;
+  const missing=new Set();
+  for(const request of requests)for(const id of [request.verification.primary_batch,request.verification.fallback_batch])if(id!=null && !batches.has(id))missing.add(id);
+  const partial=missing.size>0 || requests.some(s=>s.verification.partial) || [...batches.values()].some(s=>s.verification.partial || (s.verification.status==='success' && (s.verification.execution_end_us==null || s.verification.published_us==null)));
+  return {available:version>=1,requests,batches:[...batches.values()],counts,missing:[...missing],partial};
+}
+function batchPhases(span) {
+  const d=span.verification,phases=[];
+  for(const [stage,label,a,b] of [
+    ['batch_flush_wait','Wait to dispatch flushed batch',d.flush_us,d.dispatch_us],
+    ['batch_worker_wait','Wait for worker',d.dispatch_us,d.worker_start_us],
+    ['batch_setup','Worker setup / preparation',d.worker_start_us,d.setup_end_us],
+    ['batch_execution','Proofs + signatures',d.setup_end_us ?? d.worker_start_us,d.execution_end_us],
+    ['batch_publication','Publish batch result',d.execution_end_us,d.published_us]
+  ])if(a!=null && b!=null && b>=a)phases.push({stage,label,start_us:a,end_us:b});
+  return phases;
+}
+function workloadLabel(workload) {
+  return [['spends','spends'],['outputs','outputs'],['actions','actions']].filter(([key])=>workload?.[key]>0).map(([key,label])=>`${number(workload[key])} ${label}`).join(' · ') || 'No shielded work';
+}
+function renderVerification(host,spans,version,lane,complete) {
+  const info=verificationSummary(spans,version),group=el('details',null,'timeline-group verification'),body=el('div',null,'timeline-children');
+  group.append(el('summary','Shielded verification'),body);host.append(group);
+  onFirstExpand(group,()=>{
+    if(!info.available){body.append(el('p','This profile predates the detailed verification instrumentation. Existing request timings remain below.','muted'));return;}
+    if(!info.requests.length && !info.batches.length){body.append(el('p',complete?'No shielded verification requests were recorded for this block.':'Verification detail is partial. No shielded request detail was retained, so verification cost is unknown.',complete?'muted':'slow'));return;}
+    body.append(el('p',`${number(info.counts.hit)} cached · ${number(info.counts.miss)} cache misses · ${number(info.counts.bypass)} cache bypass · ${number(info.counts.unknown)} unknown`,'muted'));
+    if(info.partial || !complete)body.append(el('p','Verification detail is partial. Some batch links or phases were not retained.','slow'));
+    const legend=el('div',null,'verification-legend');for(const [key,label] of [['preparation','Preparation / setup'],['waiting','Waiting'],['execution','Proofs + signatures'],['delivery','Cache / delivery']])legend.append(el('span',label,`phase-${key}`));body.append(legend);
+    if(!info.batches.length)body.append(el('p',info.counts.hit===info.requests.length?'All retained requests used cached results. No fresh execution was recorded.':'No shared execution detail was retained. Fresh verification time is unknown.','muted'));
+    const fallback=new Set(info.requests.map(s=>s.verification.fallback_batch).filter(id=>id!=null));
+    for(const batch of info.batches.sort((a,b)=>a.start_us-b.start_us)){
+      const d=batch.verification,entry=el('details',null,'timeline-group verification-batch'),inside=el('div',null,'timeline-children');
+      entry.id=`verification-batch-${d.id}`;
+      entry.append(lane(batch,'summary',`${fallback.has(d.id)?'Individual retry':'Shared batch'} ${d.id}`),inside);
+      inside.append(el('p',`${d.sapling} Sapling · ${d.orchard} Orchard · ${d.ironwood} Ironwood requests · ${workloadLabel(d.workload)} submitted · ${d.profiled} profiled / ${d.unprofiled} unprofiled · ${d.status}${d.partial?' · Partial detail':''}`,'muted'));
+      for(const phase of batchPhases(batch))inside.append(lane(phase,'div',phase.label));
+      inside.append(el('p','Elapsed work shared by all members. It is not an exclusive cost of this block or transaction.','muted'));body.append(entry);
+    }
+    const last=info.requests.filter(s=>s.verification.status!=='abandoned').sort((a,b)=>b.end_us-a.end_us).slice(0,3);
+    if(last.length)body.append(el('p',`Last completed shielded requests: ${last.map(s=>`${s.transaction_index==null?'Unassigned':`transaction ${s.transaction_index+1}`} (${s.verification.pool}, ${ms(s.end_us-s.start_us)})`).join('; ')}. This is not a proven critical path.`,'muted'));
+  });
+}
+function requestLinks(span) {
+  const d=span.verification,box=el('span',null,'request-links');
+  if(d?.kind!=='request')return box;
+  box.append(el('span',`${d.pool} · ${d.cache}${d.fallback?' · Individual retry':''} · ${workloadLabel(d.workload)} · ${d.status}${d.partial?' · Partial':''}`));
+  for(const [id,label] of [[d.primary_batch,'Batch'],[d.fallback_batch,'Retry']])if(id!=null){
+    const link=el('a',`${label} ${id}`);link.href=`#verification-batch-${id}`;
+    link.addEventListener('click',()=>{const section=document.querySelector('.verification');if(section)section.open=true;setTimeout(()=>{const target=document.getElementById(`verification-batch-${id}`);if(target){target.open=true;target.scrollIntoView({block:'center'});}},0);});box.append(link);
+  }
+  return box;
+}
+function timelineBounds(spans,row) {
+  const entry=row.start_us || 0;
+  const start=Math.min(entry,...spans.map(s=>s.start_us));
+  const end=Math.max(row.end_us || entry,...spans.map(s=>s.end_us));
+  return {start,end,duration:Math.max(end-start,1)};
+}
+function intervalPosition(span,start,duration) {
+  const left=Math.max(0,Math.min(100,(span.start_us-start)/duration*100));
+  const right=Math.max(left,Math.min(100,(span.end_us-start)/duration*100));
+  return {left,width:right-left};
+}
+function renderTimeline(spans,row,start,duration,network,verificationDetail,complete) {
   const host=$('timeline');host.replaceChildren();
   const finalization=spans.find(s=>s.stage==='finalization'), transactions=spans.find(s=>s.stage==='transactions');
   const children=new Map();
@@ -218,17 +300,25 @@ function renderTimeline(spans,row,start,duration,network) {
   const finalizationIds=new Set();
   function collect(parent,depth=0){if(depth>8)return;for(const span of children.get(parent)||[]){if(finalizationIds.has(span.span))continue;finalizationIds.add(span.span);collect(span.span,depth+1);}}
   if(finalization)collect(finalization.span);
-  const transactionDetail=spans.filter(s=>(transactionStages.has(s.stage)||s.transaction_index!=null)&&!finalizationIds.has(s.span));
+  const transactionDetail=spans.filter(s=>s.stage!=='verification_batch'&&(transactionStages.has(s.stage)||s.transaction_index!=null)&&!finalizationIds.has(s.span));
   const transactionIds=new Set(transactionDetail.map(s=>s.span));
   const transactionEntry=transactions||transactionDetail[0];
-  function lane(span,tag='div',label=span.stage.replaceAll('_',' ')) {
-    const line=el(tag,null,`lane${span.root?' root':''}`),track=el('div',null,'lane-bar'),bar=el('div',null,'bar');
-    bar.style.left=`${Math.max(0,(span.start_us-start)/duration*100)}%`;bar.style.width=`${Math.max(0,(span.end_us-span.start_us)/duration*100)}%`;
-    bar.title=`${ms(span.start_us-start)} → ${ms(span.end_us-start)}`;track.append(bar);
-    line.append(el('span',label,'lane-name'),track,el('span',ms(span.end_us-span.start_us),'lane-time'));return line;
+  function lane(span,tag='div',label=verificationLabels[span.stage] || span.stage.replaceAll('_',' ')) {
+    const line=el(tag,null,`lane${span.root?' root':''}${phaseCategory(span.stage)?` phase-${phaseCategory(span.stage)}`:''}`),track=el('div',null,'lane-bar'),bar=el('div',null,'bar');
+    const position=intervalPosition(span,start,duration);
+    bar.style.left=`${position.left}%`;bar.style.width=`${position.width}%`;
+    bar.title=`${ms(span.start_us-row.start_us)} → ${ms(span.end_us-row.start_us)} from block entry`;track.append(bar);
+    const name=el('span',label,'lane-name');if(span.verification?.kind==='request')name.append(requestLinks(span));
+    line.append(name,track,el('span',ms(span.end_us-span.start_us),'lane-time'));return line;
   }
-  if(row.end_us!=null)host.append(lane({stage:'Verifier request',start_us:start,end_us:row.end_us,root:true}));
+  const ruler=el('div',null,'lane time-ruler'),ticks=el('div',null,'time-ticks');
+  for(let i=0;i<=4;i++){const tick=el('span',ms(start+duration*i/4-row.start_us));tick.style.left=`${i*25}%`;ticks.append(tick);}
+  ruler.append(el('span','Time from block entry','lane-name'),ticks,el('span','Elapsed','lane-time'));host.append(ruler);
+  if(start<row.start_us){const marker=el('div',null,'lane entry-marker'),track=el('div',null,'lane-bar'),line=el('div',null,'entry-line');line.style.left=`${(row.start_us-start)/duration*100}%`;track.append(line);marker.append(el('span','Block entry','lane-name'),track,el('span','0 µs','lane-time'));host.append(marker);}
+  if(row.end_us!=null)host.append(lane({stage:'Verifier request',start_us:row.start_us,end_us:row.end_us,root:true}));
+  renderVerification(host,spans,verificationDetail,lane,complete);
   for(const span of spans){
+    if(span.stage==='verification_batch')continue;
     if(finalizationIds.has(span.span)||(transactionIds.has(span.span)&&span!==transactionEntry))continue;
     if(span===transactionEntry){
       const group=el('details',null,'timeline-group transactions'),body=el('div',null,'timeline-children');

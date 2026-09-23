@@ -19,6 +19,7 @@ fn metadata() -> Frame {
             monotonic_start_us: None,
             clock_error_us: 1,
             startup_gate: false,
+            verification_detail_version: 0,
         },
     }
 }
@@ -60,6 +61,7 @@ fn span() -> Event {
         start_us: 600000,
         end_us: 800000,
         completion_thread: None,
+        verification: None,
     }
 }
 
@@ -89,6 +91,7 @@ fn large_transaction_profile_survives_chunking_and_restart() -> Result<()> {
                         start_us: 200,
                         end_us: 600000,
                         completion_thread: None,
+                        verification: None,
                     },
                 )
             })
@@ -642,5 +645,154 @@ fn source_provenance_survives_collection_and_legacy_annotation() -> Result<()> {
     store.ingest(serde_json::from_value(encoded.clone())?)?;
     encoded["run"]["source"]["base_commit"] = json!("main");
     assert!(store.ingest(serde_json::from_value(encoded)?).is_err());
+    Ok(())
+}
+
+#[test]
+fn shared_verification_work_preserves_block_totals_and_survives_restart() -> Result<()> {
+    use profiles::verification::{Detail, Status, Workload};
+    let temp = tempfile::tempdir()?;
+    let mut store = Store::open(temp.path(), 16_000_000)?;
+    store.ingest(metadata())?;
+    store.ingest(event(1, finish()))?;
+    let mut batch = span();
+    if let Event::Span {
+        stage,
+        start_us,
+        end_us,
+        verification,
+        ..
+    } = &mut batch
+    {
+        *stage = Stage::VerificationBatch;
+        *start_us = 10;
+        *end_us = 900000;
+        *verification = Some(Detail::Batch {
+            id: 7,
+            workload: Workload {
+                spends: 0,
+                outputs: 0,
+                actions: 4,
+            },
+            members: 2,
+            profiled: 1,
+            unprofiled: 1,
+            sapling: 0,
+            orchard: 2,
+            ironwood: 0,
+            flush_us: Some(15),
+            dispatch_us: Some(20),
+            worker_start_us: Some(30),
+            setup_end_us: Some(40),
+            execution_end_us: Some(899000),
+            published_us: Some(900000),
+            status: Status::Success,
+            partial: false,
+        });
+    }
+    store.ingest(event(2, batch))?;
+    store.ingest(event(
+        3,
+        Event::Seal {
+            attempt: 1,
+            spans: 1,
+            dropped: 0,
+        },
+    ))?;
+    store.flush()?;
+    drop(store);
+    let _store = Store::open(temp.path(), 16_000_000)?;
+    let detail = Reader::open(temp.path())?.detail(RUN, 1)?;
+    assert_eq!(detail["complete"], true);
+    assert_eq!(detail["timing"]["recorded_elapsed_us"], 700000);
+    assert_eq!(detail["timing"]["after_response_us"], 0);
+    assert_eq!(detail["spans"][0]["verification"]["id"], 7);
+    assert_eq!(detail["spans"][0]["start_us"], 10);
+    Ok(())
+}
+
+#[test]
+fn malformed_verification_evidence_is_rejected_without_losing_following_frames() -> Result<()> {
+    use profiles::verification::{Cache, Detail, Pool, Status, Workload};
+    let temp = tempfile::tempdir()?;
+    let mut store = Store::open(temp.path(), 16_000_000)?;
+    store.ingest(metadata())?;
+    let mut invalid = span();
+    if let Event::Span {
+        stage,
+        verification,
+        ..
+    } = &mut invalid
+    {
+        *stage = Stage::VerificationRequest;
+        *verification = Some(Detail::Request {
+            pool: Pool::Sapling,
+            workload: Workload::default(),
+            cache: Cache::Miss,
+            status: Status::Success,
+            primary_batch: Some(0),
+            fallback_batch: None,
+            fallback: false,
+            partial: false,
+        });
+    }
+    assert_eq!(
+        store.ingest_batch(vec![event(1, invalid), event(2, finish())])?,
+        1
+    );
+    assert_eq!(
+        Reader::open(temp.path())?.detail(RUN, 1)?["summary"]["outcome"],
+        "success"
+    );
+    Ok(())
+}
+
+#[test]
+fn verification_metadata_fits_chunk_and_attempt_query_budgets() -> Result<()> {
+    use profiles::verification::{Detail as VerificationDetail, Status, Workload};
+    let verification = VerificationDetail::Batch {
+        id: u64::MAX,
+        workload: Workload {
+            spends: u32::MAX,
+            outputs: u32::MAX,
+            actions: u32::MAX,
+        },
+        members: u32::MAX,
+        profiled: u32::MAX,
+        unprofiled: u32::MAX,
+        sapling: u32::MAX,
+        orchard: u32::MAX,
+        ironwood: u32::MAX,
+        flush_us: Some(u64::MAX),
+        dispatch_us: Some(u64::MAX),
+        worker_start_us: Some(u64::MAX),
+        setup_end_us: Some(u64::MAX),
+        execution_end_us: Some(u64::MAX),
+        published_us: Some(u64::MAX),
+        status: Status::Abandoned,
+        partial: false,
+    };
+    // Use maximum-width values even where collector validation would reject them.
+    let detail = Detail {
+        run: RUN.into(),
+        data: Event::Span {
+            attempt: u64::MAX,
+            span: u64::MAX,
+            parent: u64::MAX,
+            stage: Stage::VerificationBatch,
+            transaction_index: Some(u32::MAX),
+            transaction_hash: Some([255; 32]),
+            start_us: u64::MAX,
+            end_us: u64::MAX,
+            completion_thread: Some(u64::MAX),
+            verification: Some(verification),
+        },
+    };
+    let encoded_size = serde_json::to_vec(&detail)?.len();
+    assert!(u64::try_from((encoded_size + 1) * MAX_CHUNK_EVENTS + 2)? <= MAX_DECODE_BYTES);
+    assert!(
+        profiles::MAX_SPANS.div_ceil(u64::try_from(MAX_CHUNK_EVENTS)?)
+            <= u64::try_from(MAX_DETAIL_CHUNKS)?
+    );
     Ok(())
 }

@@ -14,6 +14,19 @@
 //!
 //! Rows without a cadence charge nothing. Commitments bound requests, and
 //! reservations bound responses.
+//!
+//! # Properties and their tests
+//!
+//! | Property | Test |
+//! | --- | --- |
+//! | A full bucket admits its capacity, then exhausts | `a_full_bucket_admits_its_capacity_back_to_back_then_exhausts` |
+//! | One token per refill interval, up to capacity | `one_token_returns_per_refill_interval_up_to_capacity` |
+//! | A sender at the refill rate never drifts | `a_sender_at_exactly_the_refill_rate_never_drifts` |
+//! | Rows without a cadence charge nothing | `rows_without_a_cadence_charge_nothing` |
+//! | A sender faster than the refill exhausts, only after its capacity | `a_sender_faster_than_the_refill_exhausts_only_after_its_capacity` |
+//! | The bursts after an outage or a local pause are admitted | `the_burst_after_the_longest_outage_is_admitted`, `the_burst_after_a_local_pause_of_any_length_is_admitted` |
+//! | Every accepted cadence admits every conformant sender | `a_conformant_sender_is_never_exhausted` |
+//! | The sender paces rows and keeps one unwritten frame per row | `the_sender_waits_for_its_interval_and_keeps_only_the_latest_value`, `a_blocked_writer_holds_at_most_one_frame_per_row` |
 
 use std::{collections::HashMap, time::Duration};
 

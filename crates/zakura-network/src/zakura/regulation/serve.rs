@@ -49,6 +49,27 @@
 //! Cancellation never aborts `produce`. It marks the [`WorkLease`] cancelled,
 //! and the execution slots stay held until `produce` and every lease clone
 //! drop, so a blocking operation that is still running keeps its capacity.
+//!
+//! # Properties and their tests
+//!
+//! | Property | Test |
+//! | --- | --- |
+//! | Parts, then exactly one ending | `a_request_ends_with_its_parts_then_one_ending` |
+//! | Whole responses in admission order | `output_is_whole_responses_in_admission_order` |
+//! | Running `produce` steps never exceed node slots | `peak_running_produce_steps_stay_within_node_slots` |
+//! | `limit` requests re-sent at each ending never fault | `exactly_limit_open_requests_never_fault_when_resent_at_each_ending` |
+//! | Up to `2 × limit` served and traced; one more faults | `requests_within_twice_the_limit_are_served_and_traced_and_one_more_faults` |
+//! | The highest advertised limit applies | `the_enforced_limit_is_the_highest_advertised` |
+//! | A retired session's work never counts against the next | `a_retired_sessions_running_jobs_do_not_count_against_the_next_session` |
+//! | Cancellation never aborts work or frees its slot early | `cancellation_lets_produce_finish_before_its_slot_returns`, `cancellation_keeps_the_node_slot_until_the_work_ends` |
+//! | The node slot returns before the peer slot | `the_node_slot_returns_before_the_peer_slot` |
+//! | A non-reading peer holds output but no execution | `a_non_reading_peer_holds_output_bytes_but_no_execution_slot` |
+//! | Output returns when the last frame is written | `output_bytes_return_only_when_the_last_frame_is_written` |
+//! | A stalled peer does not block another | `a_stalled_produce_on_one_peer_does_not_block_another` |
+//! | A local failure ends the exchange; the connection stays | `a_local_failure_after_a_prefix_sends_the_failure_ending` |
+//! | The ending frees the commitment before execution ends | `the_ending_frees_the_commitment_before_execution_ends` |
+//! | The sink checks rows, frames, bytes, and the ending reserve | the `the_sink_*` and `a_*cap*` tests |
+//! | Every budget returns after any operation sequence | `cancelling_a_session_frees_every_budget`, `operation_sequences_keep_every_bound` |
 
 mod capacity;
 mod lease;

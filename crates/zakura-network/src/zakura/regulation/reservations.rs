@@ -22,6 +22,21 @@
 //! Every map draws its entries from one node-wide [`ReservationPool`], so the
 //! requester's bookkeeping has a node-wide bound. A full pool makes the node
 //! wait before its next request; it never acts against a peer.
+//!
+//! # Properties and their tests
+//!
+//! | Property | Test |
+//! | --- | --- |
+//! | A response claims its frames, then its ending | `a_response_claims_its_frames_then_its_ending` |
+//! | Each violation refuses, and a refusal changes nothing | `every_violation_refuses` |
+//! | Abandoned work still delivers and never refuses | `an_abandoned_reservation_still_delivers_and_never_refuses` |
+//! | No time passing removes a reservation | `no_time_passing_removes_a_reservation` |
+//! | Reserving is local and bounded | `reserving_is_local_and_bounded` |
+//! | The precheck needs a live reservation with room | `the_precheck_needs_a_live_reservation_with_room` |
+//! | A refused precheck allocates no decoded body | `a_refused_precheck_allocates_no_decoded_body` |
+//! | A full pool waits, with no lost or spurious wakeup and no allocation | `a_full_pool_waits_without_lost_or_spurious_wakeups` |
+//! | Racing threads never overcommit the pool | `racing_threads_never_overcommit_the_pool` |
+//! | Refusals are exactly the violations, for any sequence | `operation_sequences_refuse_exactly_the_violations` |
 
 use std::{
     collections::{BTreeMap, HashMap},

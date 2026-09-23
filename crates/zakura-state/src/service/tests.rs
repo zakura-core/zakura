@@ -1047,6 +1047,63 @@ async fn a_full_orphan_queue_still_admits_a_block_whose_parent_is_available() ->
 }
 
 #[tokio::test]
+async fn writer_capacity_failure_completes_variant_descendants() {
+    use crate::tests::{setup::changed_coinbase_body, FakeChainHelper};
+
+    let _init_guard = zakura_test::init();
+    let (mut state, _, _, _) =
+        StateService::new(Config::ephemeral(), &Network::Mainnet, Height::MAX, 0)
+            .await
+            .unwrap();
+    // Keep the writer idle and exercise queue admission with exactly three free slots.
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+    state.block_write_sender.non_finalized = Some(sender);
+    let held_slots = state
+        .non_finalized_write_slots
+        .clone()
+        .try_acquire_many_owned(u32::try_from(super::queued_blocks::MAX_QUEUED_BLOCKS - 3).unwrap())
+        .unwrap();
+    let parent: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1687107_BYTES
+        .zcash_deserialize_into()
+        .unwrap();
+    let child = parent.make_fake_child();
+    let grandchild = child.make_fake_child();
+    let mut responses = Vec::new();
+    for body in (0..4)
+        .map(|tag| changed_coinbase_body(&parent, tag))
+        .chain([child, grandchild])
+    {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        state
+            .non_finalized_state_queued_blocks
+            .queue((body.prepare(), tx, None, 0));
+        responses.push(rx);
+    }
+
+    state.send_ready_non_finalized_queued(parent.header.previous_block_hash);
+    for response in responses {
+        let error = timeout(Duration::from_secs(1), response)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert!(matches!(error.inner(), CommitBlockError::QueueFull));
+    }
+    assert!(receiver.try_recv().is_err());
+    assert_eq!(state.non_finalized_state_queued_blocks.drain().count(), 0);
+    assert_eq!(state.non_finalized_write_slots.available_permits(), 3);
+    drop(held_slots);
+
+    // Capacity recovery can admit a fresh parent attempt.
+    let (tx, _rx) = tokio::sync::oneshot::channel();
+    state
+        .non_finalized_state_queued_blocks
+        .queue((parent.clone().prepare(), tx, None, 0));
+    state.send_ready_non_finalized_queued(parent.header.previous_block_hash);
+    assert!(receiver.try_recv().is_ok());
+}
+
+#[tokio::test]
 async fn descendant_arriving_after_a_local_parent_failure_completes_immediately() {
     use super::write::{NonFinalizedWriteFailure, NonFinalizedWriteUpdate};
 

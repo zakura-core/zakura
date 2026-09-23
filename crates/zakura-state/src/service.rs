@@ -1235,6 +1235,12 @@ impl StateService {
                         .clone()
                         .try_acquire_many_owned(body_count)
                     else {
+                        // No writer will report this parent's failure, so release its
+                        // queued descendants here instead of leaving them waiting.
+                        self.non_finalized_state_queued_blocks.fail_descendants(
+                            queued_child[0].0.hash,
+                            CommitBlockError::QueueFull.into(),
+                        );
                         for variant in queued_child {
                             Self::send_semantically_verified_block_error(
                                 variant,

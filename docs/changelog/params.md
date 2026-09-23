@@ -32,6 +32,7 @@ Keep entries **newest-first**. Each row records:
 
 | Parameter | Location | Old → New | PR | Why |
 | --- | --- | --- | --- | --- |
+| `MAX_QUEUED_BODY_VARIANTS` | `crates/zakura-state/src/service/queued_blocks.rs` | new → `4` bodies per header | [#1130](https://github.com/zakura-core/zakura/pull/1130) | Retain distinct queued bodies without allowing one header to fill the orphan queue. All bodies share the existing total queue limit. |
 | `MAX_RETRY_RECEIPTS` | `crates/zakura-consensus/src/block/receipt.rs` | new → `4096` entries | [#1084](https://github.com/zakura-core/zakura/pull/1084) | Bound receipt metadata retained after transient verification failures and cancellation. |
 | `MAX_RETRY_RECEIPTS_PER_HASH` | `crates/zakura-consensus/src/block/receipt.rs` | new → `4` body variants per header | [#1084](https://github.com/zakura-core/zakura/pull/1084) | Limit one header's share of the retry receipt cache. |
 | `RETRY_RECEIPT_TTL` | `crates/zakura-consensus/src/block/receipt.rs` | new → `1 hour` after the last attempt | [#1084](https://github.com/zakura-core/zakura/pull/1084) | Expire idle retry receipts while preserving priority across transient retries. |

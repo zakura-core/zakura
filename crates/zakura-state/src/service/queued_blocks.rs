@@ -282,14 +282,6 @@ impl QueuedBlocks {
         self.update_metrics();
     }
 
-    /// Return the first queued body for test inspection.
-    #[cfg(test)]
-    pub fn get_mut(&mut self, hash: &block::Hash) -> Option<&mut QueuedSemanticallyVerified> {
-        self.blocks
-            .get_mut(hash)
-            .and_then(|variants| variants.first_mut())
-    }
-
     /// Update metrics after the queue is modified
     fn update_metrics(&self) {
         if let Some(min_height) = self.by_height.keys().next() {
@@ -305,6 +297,7 @@ impl QueuedBlocks {
             metrics::gauge!("state.memory.queued.max.height").set(f64::NAN);
         }
 
+        // The queue's small fixed body limit fits exactly in f64.
         metrics::gauge!("state.memory.queued.block.count").set(self.body_count as f64);
     }
 

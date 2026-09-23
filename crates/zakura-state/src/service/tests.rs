@@ -791,7 +791,7 @@ async fn queued_body_variants_preserve_the_valid_block_in_both_orders() {
         })
         .expect("the fixture has a sibling with a larger raw hash");
     for header_runtime in [false, true] {
-        for valid_first in [false, true] {
+        for (valid_first, include_valid) in [(false, true), (true, true), (false, false)] {
             let config = Config {
                 enable_zakura_header_seed_from_committed_blocks: header_runtime,
                 ..Config::ephemeral()
@@ -818,8 +818,10 @@ async fn queued_body_variants_preserve_the_valid_block_in_both_orders() {
             };
             let second = if valid_first {
                 invalid.clone()
-            } else {
+            } else if include_valid {
                 valid.clone()
+            } else {
+                changed_coinbase_body(&valid, 43)
             };
             let mut responses = Vec::new();
             for (index, body) in [first, second, sibling.clone(), chain[4].clone()]
@@ -840,7 +842,9 @@ async fn queued_body_variants_preserve_the_valid_block_in_both_orders() {
             .unwrap();
             for (index, response) in responses.into_iter().enumerate() {
                 let result = timeout(limit, response).await.unwrap().unwrap();
-                if index == usize::from(valid_first) {
+                if (include_valid && index == usize::from(valid_first))
+                    || (!include_valid && index != 2)
+                {
                     assert!(
                         result.is_err(),
                         "the altered body cannot commit: {result:?}"
@@ -853,13 +857,6 @@ async fn queued_body_variants_preserve_the_valid_block_in_both_orders() {
                 }
             }
             state.drain_non_finalized_write_updates();
-            assert!(!state
-                .non_finalized_failed_ancestors
-                .contains_key(&valid.hash()));
-            assert!(!state
-                .non_finalized_failed_ancestors
-                .contains_key(&chain[4].hash()));
-            assert_eq!(state.best_tip(), Some((Height(4), chain[4].hash())));
             assert_eq!(state.non_finalized_state_queued_blocks.drain().count(), 0);
             assert!(!state
                 .non_finalized_state_queued_blocks
@@ -874,6 +871,47 @@ async fn queued_body_variants_preserve_the_valid_block_in_both_orders() {
             .unwrap()
             .unwrap();
             drop(permits);
+            if !include_valid {
+                assert!(matches!(
+                    state.non_finalized_failed_ancestors.get(&valid.hash()),
+                    Some((_, NonFinalizedWriteFailureKind::Retryable))
+                ));
+                assert!(state
+                    .non_finalized_failed_ancestors
+                    .contains_key(&chain[4].hash()));
+                assert!(!state
+                    .block_commit_sender
+                    .borrow()
+                    .is_rejected(&valid.hash()));
+                assert_eq!(state.best_tip(), Some((Height(3), sibling.hash())));
+                // Mismatched bodies do not prove the header invalid. A later honest
+                // delivery and its child must still be able to commit.
+                for (index, body) in [valid.clone(), chain[4].clone()].into_iter().enumerate() {
+                    let mut prepared = body.prepare();
+                    prepared.receipt_order = Some(5 + u64::try_from(index).unwrap());
+                    timeout(
+                        limit,
+                        state.queue_and_commit_to_non_finalized_state(prepared, None),
+                    )
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
+                }
+                assert_eq!(state.best_tip(), Some((Height(4), chain[4].hash())));
+                continue;
+            }
+            assert!(!state
+                .non_finalized_failed_ancestors
+                .contains_key(&valid.hash()));
+            assert!(!state
+                .non_finalized_failed_ancestors
+                .contains_key(&chain[4].hash()));
+            assert!(!state
+                .block_commit_sender
+                .borrow()
+                .is_rejected(&valid.hash()));
+            assert_eq!(state.best_tip(), Some((Height(4), chain[4].hash())));
             let snapshot = state.read_service.latest_non_finalized_state();
             let accepted = snapshot
                 .best_chain()

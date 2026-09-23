@@ -116,7 +116,7 @@ fn identical_queued_retries_preserve_receipts_and_complete_the_old_waiter() -> R
         queue.queue(retry);
         assert!(matches!(receiver.try_recv(), Ok(Err(_))));
         assert_eq!(queue.body_count, 1);
-        assert_eq!(queue.get_mut(&block.hash()).unwrap().0.receipt_order, order);
+        assert_eq!(queue.blocks[&block.hash()][0].0.receipt_order, order);
         assert_eq!(
             queue.dequeue_children(block.header.previous_block_hash)[0]
                 .0
@@ -232,9 +232,9 @@ fn prune_removes_right_children() -> Result<()> {
     assert_eq!(2, queue.blocks.len());
     assert_eq!(1, queue.by_parent.len());
     assert_eq!(1, queue.by_height.len());
-    assert!(queue.get_mut(&block1.hash()).is_none());
-    assert!(queue.get_mut(&child1.hash()).is_some());
-    assert!(queue.get_mut(&child2.hash()).is_some());
+    assert!(!queue.blocks.contains_key(&block1.hash()));
+    assert!(queue.blocks.contains_key(&child1.hash()));
+    assert!(queue.blocks.contains_key(&child2.hash()));
     assert_eq!(632, queue.known_utxos.len());
 
     // Pruning the children of the first block removes both of the other
@@ -243,8 +243,8 @@ fn prune_removes_right_children() -> Result<()> {
     assert_eq!(0, queue.blocks.len());
     assert_eq!(0, queue.by_parent.len());
     assert_eq!(0, queue.by_height.len());
-    assert!(queue.get_mut(&child1.hash()).is_none());
-    assert!(queue.get_mut(&child2.hash()).is_none());
+    assert!(!queue.blocks.contains_key(&child1.hash()));
+    assert!(!queue.blocks.contains_key(&child2.hash()));
     assert_eq!(0, queue.known_utxos.len());
 
     Ok(())

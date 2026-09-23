@@ -1320,7 +1320,7 @@ pub enum Request {
     /// request for an identical queued body fails the older request and replaces
     /// its response channel, preserving its receipt order. Different bodies with
     /// the same header share bounded queue capacity until contextual validation
-    /// selects a valid body. Excess bodies fail with [`CommitBlockError::QueueFull`].
+    /// selects a valid body. Excess bodies fail with [`crate::CommitBlockError::QueueFull`].
     ///
     /// # Correctness
     ///

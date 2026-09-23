@@ -6056,6 +6056,8 @@ impl HeaderChainStore {
 
 // Retained checkpoint headers already carry contextual validation. The planner still
 // checks their exact identity, continuity, and eligibility before advancing finality.
+// Assumes checkpoint commits carry no retention references; one authenticated only by
+// the skipped parent lease would fail closed with `TransitionFailure::Authority`.
 fn retained_checkpoint_headers(engine: &HeaderChainEngine, event: &TransitionEvent) -> bool {
     matches!(event, TransitionEvent::VerifiedChainChanged(event)
         if event.cause == VerifiedChangeCause::CheckpointFinalizedGrow

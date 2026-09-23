@@ -28,12 +28,13 @@ use zakura_chain::{
     block::{Block, Height},
     parameters::{Network, NetworkUpgrade},
     serialization::ZcashSerialize,
+    transaction::Transaction,
     work::equihash::Solution,
 };
 use zakura_node_services::rpc_client::RpcRequestClient;
 use zakura_rpc::{
     client::{
-        BlockTemplateResponse, BlockTemplateTimeSource, GetBlockchainInfoResponse,
+        BlockTemplateResponse, BlockTemplateTimeSource,
         SubmitBlockResponse,
     },
     proposal_block_from_template,
@@ -72,6 +73,52 @@ struct Args {
     /// already decayed to the PoW limit.
     #[arg(long)]
     no_gap_wait: bool,
+
+    /// Claim this many extra zatoshi in the coinbase, over what the subsidy and the
+    /// miner's fee share allow.
+    ///
+    /// This is an attack, used to check that consensus rejects a miner taking the NSM
+    /// share of the block's fees. A correct node rejects any non-zero value.
+    #[arg(long, default_value_t = 0)]
+    steal_zats: u64,
+}
+
+/// Inflates the coinbase's first output by `zats` and repairs the merkle root.
+///
+/// The merkle root has to be recomputed, otherwise the block is rejected for an
+/// inconsistent root and never reaches the fee check being tested.
+fn steal_fees(block: Block, zats: u64) -> Result<Block> {
+    use zakura_chain::{amount::Amount, block::merkle};
+
+    let Block {
+        header,
+        mut transactions,
+    } = block;
+
+    let coinbase = std::sync::Arc::make_mut(
+        transactions
+            .first_mut()
+            .ok_or_else(|| eyre!("the block has no coinbase transaction"))?,
+    );
+
+    let outputs = match coinbase {
+        Transaction::V5 { outputs, .. } | Transaction::V6 { outputs, .. } => outputs,
+        _ => bail!("the coinbase is not a V5 or V6 transaction"),
+    };
+    let output = outputs
+        .first_mut()
+        .ok_or_else(|| eyre!("the coinbase has no outputs"))?;
+    output.value = (output.value + Amount::try_from(i64::try_from(zats)?)?)
+        .map_err(|error| eyre!("the inflated coinbase output overflows: {error:?}"))?;
+
+    let merkle_root = transactions.iter().collect::<merkle::Root>();
+    let mut header = (*header).clone();
+    header.merkle_root = merkle_root;
+
+    Ok(Block {
+        header: std::sync::Arc::new(header),
+        transactions,
+    })
 }
 
 /// Recover the fork's `Network` by deserializing the node's own config section.
@@ -100,11 +147,19 @@ fn minimum_difficulty_gap(network: &Network, tip: Height) -> Duration {
     Duration::from_secs(seconds.saturating_mul(u64::from(MINIMUM_DIFFICULTY_GAP_MULTIPLIER)))
 }
 
-async fn blockchain_info(client: &RpcRequestClient) -> Result<GetBlockchainInfoResponse> {
-    client
-        .json_result_from_call("getblockchaininfo", "[]")
+/// Read the tip height with `getblockcount` rather than `getblockchaininfo`.
+///
+/// `getblockchaininfo` renders every value pool balance as an f64 `chainValue`.
+/// Some zatoshi amounts have no exact f64 form -- after NU7 the lockbox pool is
+/// one -- so the node emits a response its own `GetBlockchainInfoResponse`
+/// deserializer refuses with "floating point had fractional zatoshis". The
+/// miner only needs the height, and `getblockcount` returns a plain integer.
+async fn tip_height(client: &RpcRequestClient) -> Result<Height> {
+    let count: u32 = client
+        .json_result_from_call("getblockcount", "[]".to_string())
         .await
-        .map_err(|error| eyre!("getblockchaininfo failed: {error}"))
+        .map_err(|error| eyre!("getblockcount failed: {error}"))?;
+    Ok(Height(count))
 }
 
 async fn block_from_template(
@@ -184,8 +239,7 @@ async fn main() -> Result<()> {
 
     let mut mined = 0u32;
     loop {
-        let info = blockchain_info(&client).await?;
-        let tip = info.blocks();
+        let tip = tip_height(&client).await?;
 
         if !args.no_gap_wait {
             let gap = minimum_difficulty_gap(&network, tip)
@@ -199,6 +253,15 @@ async fn main() -> Result<()> {
         }
 
         let (block, height) = block_from_template(&client, &network).await?;
+        let block = if args.steal_zats > 0 {
+            tracing::warn!(
+                steal_zats = args.steal_zats,
+                "inflating the coinbase: consensus must reject this block"
+            );
+            steal_fees(block, args.steal_zats)?
+        } else {
+            block
+        };
         tracing::info!(height = height.0, "solving");
         let block = solve(block).await?;
         submit_block(&client, block).await?;

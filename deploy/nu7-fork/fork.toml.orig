@@ -45,7 +45,7 @@ snapshot_mount = "/mnt/snapshots"
 # Holds the untouched seed: state/v<db-format>/testnet, as cloned from the
 # DigitalOcean Testnet state snapshot. fork.py only ever reads this.
 # "tip" is the subdirectory do_provision.py's `--mode tip` snapshot uses.
-pristine_cache_dir = "/var/lib/zakura-pristine"
+pristine_cache_dir = "/mnt/snapshots/tip"
 
 # Must match how the seed was built. do_provision.py's `tip` snapshot is a
 # pruned database, so opening it as an archive node would misdescribe it.
@@ -77,28 +77,3 @@ volume_name = "zakura-pr-nu7-fork-state-nyc1"
 # Transparent address receiving the fork's coinbase. Testnet-encoded, because a
 # configured testnet keeps NetworkKind::Testnet address prefixes.
 address = "tmGkvoQGmvJu6H5Wp22wUFAsBuX6SPGHnMq"
-
-[peer]
-# A second zakurad on the same droplet, validating the miner's blocks through
-# the sync path instead of producing them. One node that both mines and
-# validates cannot catch a block it builds wrong and accepts wrong in the same
-# way; an independent node receiving blocks over the wire can.
-enabled = true
-
-name = "zakura-nu7-fork-2"
-# Distinct unit, config and state so the two nodes share nothing but the fork
-# parameters themselves.
-service_name = "zakurad-fork2"
-# Its own binary: two services cannot share one file on disk, because
-# installing over it fails while the other node is executing it.
-bin_path = "/usr/local/bin/zakurad-fork2"
-config_path = "/etc/zakura/zakura-fork2.toml"
-cache_dir = "/var/lib/zakura-fork2"
-log_file = "/var/log/zakura/zakura-fork2.log"
-# Pins a separate node identity: two nodes sharing the default identity dir on
-# one host would collide.
-identity_dir = "/root/.zakura-fork2"
-
-listen_addr = "0.0.0.0:18333"
-rpc_listen_addr = "127.0.0.1:18242"
-metrics_endpoint = "127.0.0.1:9998"

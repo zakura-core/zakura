@@ -7581,6 +7581,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "zakura-fork-txload"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "color-eyre",
+ "hex",
+ "rand 0.10.2",
+ "secp256k1",
+ "serde_json",
+ "tokio",
+ "toml 1.1.2+spec-1.1.0",
+ "tracing",
+ "tracing-subscriber",
+ "zakura-chain",
+ "zakura-network",
+ "zakura-node-services",
+ "zakura-orchard",
+ "zakura-reddsa",
+ "zakura-rpc",
+]
+
+[[package]]
 name = "zakura-halo2-gadgets"
 version = "1.3.0-alpha.1"
 source = "git+https://github.com/zakura-core/common.git?rev=c4c255c4be5cacaad77b918a481cbf6d35b1f8fd#c4c255c4be5cacaad77b918a481cbf6d35b1f8fd"

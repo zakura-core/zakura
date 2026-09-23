@@ -217,7 +217,7 @@ def testnet_parameters(config: dict, plan: dict) -> dict:
 
 
 def render_nodes_toml(config: dict, plan: dict) -> str:
-    """Emit a deploy.py fleet config describing the fork node(s)."""
+    """Emit a deploy.py fleet config describing the single fork node."""
     sys.path.insert(0, str(DEPLOYER.parent))
     import deploy  # noqa: E402  (path is set immediately above)
 
@@ -262,60 +262,15 @@ def render_nodes_toml(config: dict, plan: dict) -> str:
     ]
 
     lines.extend(deploy.render_toml_table("defaults.testnet_parameters", params))
-
-    peer = config.get("peer", {})
-    peer_enabled = bool(peer.get("enabled", False))
-
     lines.extend([
         "",
         "[[nodes]]",
         f'name = "{config["droplet"]["name"]}"',
         f'ssh_string = "{host["ssh_string"]}"',
         f'commit = "{host["commit"]}"',
+        "",
     ])
-    if peer_enabled:
-        # Dial the validator so the miner does not depend on inbound-only
-        # connectivity. These are explicit local addresses, not the public DNS
-        # seeds, so build_configured_testnet's incompatible-seeds guard does
-        # not fire.
-        lines.append(
-            f'initial_testnet_peers = ["{peer_dial_addr(peer["listen_addr"])}"]'
-        )
-    lines.append("")
-
-    if peer_enabled:
-        lines.extend([
-            "[[nodes]]",
-            f'name = "{peer["name"]}"',
-            f'ssh_string = "{host["ssh_string"]}"',
-            f'commit = "{host["commit"]}"',
-            f'service_name = "{peer["service_name"]}"',
-            f'bin_path = "{peer["bin_path"]}"',
-            f'config_path = "{peer["config_path"]}"',
-            f'state_cache_dir = "{peer["cache_dir"]}"',
-            f'network_cache_dir = "{peer["cache_dir"]}"',
-            f'log_file = "{peer["log_file"]}"',
-            f'identity_dir = "{peer["identity_dir"]}"',
-            f'listen_addr = "{peer["listen_addr"]}"',
-            f'rpc_listen_addr = "{peer["rpc_listen_addr"]}"',
-            f'metrics_endpoint = "{peer["metrics_endpoint"]}"',
-            f'initial_testnet_peers = ["{peer_dial_addr(host["listen_addr"])}"]',
-            # Validator only. Without a miner address this node refuses
-            # getblocktemplate, which is what keeps it independent of the
-            # blocks it is asked to validate.
-            'miner_address = ""',
-            "",
-        ])
-
     return "\n".join(lines)
-
-
-def peer_dial_addr(listen_addr: str) -> str:
-    """Turn a wildcard listen address into one the other local node can dial."""
-    host_part, _, port = listen_addr.rpartition(":")
-    if host_part in ("0.0.0.0", "[::]", "::", ""):
-        return f"127.0.0.1:{port}"
-    return listen_addr
 
 
 # --------------------------------------------------------------------------- #

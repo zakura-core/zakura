@@ -15,6 +15,7 @@ members = [
         "crates/tower-fallback",
         "deploy/zakura-watchdog",
         "deploy/nu7-fork/miner",
+        "deploy/nu7-fork/txload",
         "crates/xtask",
         "crates/zakura-jsonl-trace",
 ]

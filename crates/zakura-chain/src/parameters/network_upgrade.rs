@@ -238,7 +238,7 @@ pub(crate) const CONSENSUS_BRANCH_IDS: &[(NetworkUpgrade, ConsensusBranchId)] = 
     (Nu6_1, ConsensusBranchId(0x4dec4df0)),
     (Nu6_2, ConsensusBranchId(0x5437f330)),
     (Nu6_3, ConsensusBranchId(0x37a5165b)),
-    (Nu7, ConsensusBranchId(0x77190ad8)),
+    (Nu7, ConsensusBranchId(0x77190ad9)),
     #[cfg(zcash_unstable = "zfuture")]
     (ZFuture, ConsensusBranchId(0xfffffffd)),
 ];

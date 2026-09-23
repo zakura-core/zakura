@@ -243,9 +243,10 @@ def check_evidence(policy, pull, comments, summary, reactions, reviews, threads,
 
     # Completed means processing finished, including runs with findings. Only a
     # fresh PR-level thumbs-up is a clean-result signal; old reactions cannot pass.
+    # Reaction times are truncated to whole seconds, so compare at that precision.
     clean = [r for r in reactions if r.get("content") == "+1"
              and (r.get("user") or {}).get("id") == policy.data["codex_user_id"]
-             and finished["time"] < instant(r["created_at"])
+             and finished["time"].replace(microsecond=0) <= instant(r["created_at"])
              <= finished["time"] + timedelta(minutes=2)]
     require(not any(r.get("content") == "eyes"
                     and (r.get("user") or {}).get("id") == policy.data["codex_user_id"]

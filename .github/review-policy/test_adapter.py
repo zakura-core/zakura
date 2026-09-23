@@ -204,6 +204,13 @@ class EvidenceTests(unittest.TestCase):
                     reaction["created_at"] = "2026-09-01T10:10:00Z"
                 self.reject("fresh Codex thumbs-up")
 
+    def test_thumbs_up_in_the_completion_second_is_fresh(self):
+        # FINISH has microseconds; REST reaction times do not.
+        self.data["reactions"][0]["created_at"] = "2026-09-01T10:02:00Z"
+        self.assertEqual(adapter.check_evidence(**self.data)["reaction"], 200)
+        self.data["reactions"][0]["created_at"] = "2026-09-01T10:01:59Z"
+        self.reject("fresh Codex thumbs-up")
+
     def test_running_reaction_with_lingering_thumbs_up(self):
         self.data["reactions"].append({"content": "eyes", "user": NATIVE})
         self.reject("running-review reaction")

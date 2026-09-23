@@ -31,6 +31,14 @@ later retry a new receipt.
 Success, already committed duplicates, and permanent rejection clear the retry
 receipt. A duplicate still waiting in the commit queue preserves it because the
 outstanding attempt can fail transiently.
+
+The one-hour expiry applies only to retry metadata. A full body already waiting
+for its parent in the state queue keeps its receipt even if its caller times out.
+That queue has a 1000-entry bound, but no wall-clock expiry. The body stays until
+its parent arrives, an ancestor fails, finalization reaches its height and it is
+pruned, or the process stops. Retention can therefore exceed one hour and depends
+on chain progress. An old receipt still cannot beat a chain with greater work.
+
 Receipt retention has its own error policy. Missing context, local service
 failures, and blocks ahead of the local clock can retry. Permanent block and
 transaction failures release their receipts even when peer attribution must

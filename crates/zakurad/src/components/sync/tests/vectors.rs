@@ -134,22 +134,24 @@ async fn profile_tip_requires_a_positive_peer_confirmation() -> Result<(), crate
     ] {
         let (mut chain_sync, _, _verifier, mut peers, mut state, tip_sender) = setup_chain_sync();
         tip_sender.send_best_tip_hash(tip.hash());
-        let probe = tokio::spawn(async move { chain_sync.profile_tip_confirmed().await });
-        state
-            .expect_request(zs::Request::BlockLocator)
-            .await
-            .respond(zs::Response::BlockLocator(vec![tip.hash(), parent.hash()]));
-        peers
-            .expect_request(zn::Request::FindHeaders {
-                known_blocks: vec![parent.hash()],
-                stop: None,
-            })
-            .await
-            .respond(zn::Response::BlockHeaders(headers));
-        assert_eq!(
-            tokio::time::timeout(Duration::from_secs(5), probe).await??,
-            expected
-        );
+        let responses = async {
+            state
+                .expect_request(zs::Request::BlockLocator)
+                .await
+                .respond(zs::Response::BlockLocator(vec![tip.hash(), parent.hash()]));
+            peers
+                .expect_request(zn::Request::FindHeaders {
+                    known_blocks: vec![parent.hash()],
+                    stop: None,
+                })
+                .await
+                .respond(zn::Response::BlockHeaders(headers));
+        };
+        let (confirmed, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(chain_sync.profile_tip_confirmed(), responses)
+        })
+        .await?;
+        assert_eq!(confirmed, expected);
     }
     Ok(())
 }

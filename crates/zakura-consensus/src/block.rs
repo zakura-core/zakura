@@ -347,23 +347,23 @@ where
     }
 
     fn call(&mut self, request: Request) -> Self::Future {
-        let receipt =
-            (!request.is_proposal()).then(|| self.receipt_orders.register(request.block()));
+        let block = request.block();
+        let hash = match zakura_header_chain::validate_encoding_version_hash(&block.header) {
+            Ok(hash) => hash,
+            Err(error) => return async move { Err(BlockError::from(error).into()) }.boxed(),
+        };
+        let receipt = (!request.is_proposal()).then(|| self.receipt_orders.register(block.clone()));
         let mut state_service = self.state_service.clone();
         let mut transaction_verifier = self.transaction_verifier.clone();
         let network = self.network.clone();
         let prepared_candidates = self.prepared_candidates.clone();
         let receipt_orders = self.receipt_orders.clone();
 
-        let block = request.block();
-
         // We don't include the block hash, because it's likely already in a parent span
         let span = tracing::debug_span!("block", height = ?block.coinbase_height());
 
         let receipt_order = receipt.as_ref().map(|receipt| receipt.order);
         async move {
-            let hash = zakura_header_chain::validate_encoding_version_hash(&block.header)
-                .map_err(BlockError::from)?;
             let preparation_start = request.should_cache().then(std::time::Instant::now);
             // Check that this block is actually a new block.
             tracing::trace!("checking that block is not already in state");

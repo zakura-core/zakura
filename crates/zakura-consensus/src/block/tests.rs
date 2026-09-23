@@ -2626,6 +2626,77 @@ mod zip218_shielded_action_limits {
 }
 
 #[tokio::test]
+async fn malformed_headers_do_not_stop_buffered_verification() {
+    let block: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
+        .zcash_deserialize_into()
+        .unwrap();
+    let hash = block.hash();
+    let state = service_fn(move |request| async move {
+        assert!(matches!(request, zs::Request::KnownBlock(requested) if requested == hash));
+        Ok::<_, BoxError>(zs::Response::KnownBlock(Some(zs::KnownBlock::Finalized)))
+    });
+    let transaction = service_fn(|_| -> std::future::Ready<Result<tx::Response, BoxError>> {
+        panic!("malformed headers and committed duplicates stop before transaction verification")
+    });
+    let verifier = Buffer::new(
+        SemanticBlockVerifier::new(&Network::Mainnet, state, transaction),
+        1,
+    );
+
+    for (version, time) in [
+        (3, block.header.time),
+        (1 << 31, block.header.time),
+        (4, DateTime::from_timestamp(-1, 0).unwrap()),
+        (
+            4,
+            DateTime::from_timestamp(i64::from(u32::MAX) + 1, 0).unwrap(),
+        ),
+    ] {
+        let mut malformed = block.as_ref().clone();
+        let header = Arc::make_mut(&mut malformed.header);
+        header.version = version;
+        header.time = time;
+        let malformed = Arc::new(malformed);
+        for request in [
+            Request::Commit(malformed.clone()),
+            Request::CommitMined {
+                block: malformed,
+                work_id: None,
+                admission: zs::BlockAdmission::pending(),
+            },
+        ] {
+            let error = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                verifier.clone().oneshot(request),
+            )
+            .await
+            .expect("malformed headers must return without waiting on state")
+            .unwrap_err();
+            assert!(matches!(
+                error.downcast_ref::<VerifyBlockError>(),
+                Some(VerifyBlockError::Block {
+                    source: BlockError::InvalidHeaderEncoding(_),
+                })
+            ));
+        }
+    }
+
+    let error = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        verifier.oneshot(Request::Commit(block)),
+    )
+    .await
+    .expect("the verifier worker must still accept subsequent requests")
+    .unwrap_err();
+    assert!(matches!(
+        error.downcast_ref::<VerifyBlockError>(),
+        Some(VerifyBlockError::Block {
+            source: BlockError::AlreadyInChain(duplicate, zs::KnownBlock::Finalized),
+        }) if *duplicate == hash
+    ));
+}
+
+#[tokio::test]
 async fn receipt_order_precedes_polling_and_cached_mining_uses_solved_submission() {
     use std::sync::{
         atomic::{AtomicUsize, Ordering},

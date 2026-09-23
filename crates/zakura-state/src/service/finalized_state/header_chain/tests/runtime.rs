@@ -2207,7 +2207,7 @@ fn body_size_hints_by_hash_read_known_sizes_from_retained_deliveries() {
                 target.hash,
                 source,
                 owner.into(),
-                zakura_header_chain::BodySizeHint::Known(known_size),
+                zakura_header_chain::BodySizeHint::Unknown,
                 Some(zakura_header_chain::TreeAuxRecordV1 {
                     height: target.height,
                     sapling_root: Default::default(),
@@ -2235,34 +2235,41 @@ fn body_size_hints_by_hash_read_known_sizes_from_retained_deliveries() {
         ApplyResult::Committed
     ));
 
-    let hints = runtime
-        .reader()
-        .body_size_hints_by_hash(&[parent.hash, target.hash, successor.hash])
-        .expect("the delivery hints read");
-
-    assert_eq!(hints, vec![None, Some(known_size), None]);
+    let hints_by_hash = || {
+        runtime
+            .reader()
+            .body_size_hints_by_hash(&[parent.hash, target.hash, successor.hash])
+            .expect("the delivery hints read")
+    };
+    assert_eq!(hints_by_hash(), vec![None, None, None]);
     assert!(runtime
         .store
         .scan_raw(HEADER_AUX_BODY_SIZE)
         .unwrap()
         .is_empty());
+    let replay = |request_id, marker, size| {
+        let view = runtime.publisher().view();
+        let mut replay = original_request.clone();
+        replay.expected_version = view.state_version;
+        let TransitionEvent::InsertHeaders(insert) = &mut replay.event else {
+            unreachable!()
+        };
+        let new_owner = HeaderWorkAuthority::for_target(&view.snapshot, target.hash)
+            .bind(27, NonZeroU64::new(request_id).unwrap());
+        insert.owner = new_owner.into();
+        insert.completion = TargetCompletion::TargetPrefix {
+            common_ancestor: parent,
+        };
+        insert.aux[0].owner = new_owner.into();
+        insert.aux[0].delivery_id = EvidenceId::from_digest([marker; 32]);
+        insert.aux[0].body_size = zakura_header_chain::BodySizeHint::new(size).unwrap();
+        replay
+    };
     let before = runtime.publisher().view();
-    let mut correction = original_request;
-    correction.expected_version = before.state_version;
-    let TransitionEvent::InsertHeaders(insert) = &mut correction.event else {
-        unreachable!()
-    };
-    let new_owner = HeaderWorkAuthority::for_target(&before.snapshot, target.hash)
-        .bind(27, NonZeroU64::new(29).unwrap());
-    insert.owner = new_owner.into();
-    insert.completion = TargetCompletion::TargetPrefix {
-        common_ancestor: parent,
-    };
-    insert.aux[0].owner = new_owner.into();
-    insert.aux[0].delivery_id = EvidenceId::from_digest([0xc4; 32]);
-    insert.aux[0].body_size = zakura_header_chain::BodySizeHint::new(3_146).unwrap();
-    let corrected = runtime.apply(correction, &context).unwrap();
-    assert!(matches!(corrected, ApplyResult::Committed), "{corrected:?}");
+    let filled = runtime
+        .apply(replay(29, 0xc4, known_size.get()), &context)
+        .unwrap();
+    assert!(matches!(filled, ApplyResult::Committed), "{filled:?}");
     let after = runtime.publisher().view();
     assert_eq!(after.header_generation, before.header_generation);
     assert_eq!(after.body_work_epoch, before.body_work_epoch);
@@ -2281,7 +2288,19 @@ fn body_size_hints_by_hash_read_known_sizes_from_retained_deliveries() {
     let persisted = runtime.store.untrusted_aux_deliveries(target.hash).unwrap();
     assert_eq!(
         persisted[0].delivery().body_size,
-        zakura_header_chain::BodySizeHint::Known(known_size)
+        zakura_header_chain::BodySizeHint::Unknown
+    );
+    assert_eq!(hints_by_hash(), vec![None, Some(known_size), None]);
+
+    // A differing known hint is false, so it cannot replace the filled size.
+    let conflicting = runtime.apply(replay(30, 0xc5, 3_146), &context).unwrap();
+    assert!(
+        matches!(conflicting, ApplyResult::NoChange(_)),
+        "{conflicting:?}"
+    );
+    assert_eq!(
+        runtime.publisher().view().body_size_hint_revision,
+        after.body_size_hint_revision
     );
     let config = runtime.config.clone();
     drop(runtime);
@@ -2291,7 +2310,7 @@ fn body_size_hints_by_hash_read_known_sizes_from_retained_deliveries() {
             .reader()
             .body_size_hints_by_hash(&[target.hash])
             .unwrap(),
-        vec![std::num::NonZeroU32::new(3_146)]
+        vec![Some(known_size)]
     );
 }
 

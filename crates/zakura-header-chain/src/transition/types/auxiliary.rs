@@ -231,7 +231,7 @@ pub struct AuxDelivery {
     pub owner: HeaderSyncWorkOwner,
     /// Advisory bounded body size.
     pub body_size: BodySizeHint,
-    /// Mutable scheduling metadata. Never part of verification provenance.
+    /// Size filled in when `body_size` was unknown. Never part of verification provenance.
     scheduling_body_size: Option<NonZeroU32>,
     /// Complete schema-1 record retained for later one-header-later authentication.
     pub tree_aux: Option<TreeAuxRecordV1>,
@@ -266,7 +266,7 @@ impl AuxDelivery {
     }
 
     /// Attach bounded advisory scheduling metadata without changing verification evidence.
-    /// Admission accepts corrections only from a matching semantic delivery.
+    /// Header admission only uses it to fill a matching semantic delivery's unknown size.
     pub fn with_scheduling_body_size(mut self, hint: BodySizeHint) -> Self {
         if let BodySizeHint::Known(size) = hint {
             self.scheduling_body_size = Some(size);

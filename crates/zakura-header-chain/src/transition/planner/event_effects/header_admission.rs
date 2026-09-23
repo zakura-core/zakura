@@ -281,9 +281,11 @@ pub(super) fn admit_prepared_headers(
                     .find(|existing| existing.semantic_fingerprint() == semantic_fingerprint)
             });
         if let Some(existing) = existing {
+            // A header hash fixes its body size, so honest known hints always agree. Only fill a
+            // missing size: a differing known hint is false and must not rewrite the row.
             if !existing.is_rejected()
                 && matches!(delivery.body_size, crate::BodySizeHint::Known(_))
-                && existing.effective_body_size() != delivery.body_size
+                && existing.effective_body_size() == crate::BodySizeHint::Unknown
             {
                 let updated = existing.with_scheduling_body_size(delivery.body_size);
                 let index = if let Some(index) = staged_index {

@@ -1144,7 +1144,7 @@ fn auxiliary_resource_limits_reject_equal_plus_one_without_effects() {
 }
 
 #[test]
-fn duplicate_hints_refresh_scheduling_without_replacing_evidence() {
+fn duplicate_hints_fill_unknown_size_once_without_replacing_evidence() {
     for original_size in [0, 2_000_000] {
         let (mut store, config) = TestStore::new(EngineMode::Integrated);
         let clock = ManualClock(Utc::now());
@@ -1183,10 +1183,10 @@ fn duplicate_hints_refresh_scheduling_without_replacing_evidence() {
         );
         let mut current_size = original_size;
         for (index, sizes) in [
-            vec![3_146],
+            vec![0],
+            vec![3_146, 7_000],
             vec![7_000],
             vec![0],
-            vec![7_000],
             vec![2_000_000, 3_146],
         ]
         .into_iter()
@@ -1219,12 +1219,12 @@ fn duplicate_hints_refresh_scheduling_without_replacing_evidence() {
                     )
                 })
                 .collect();
-            let expected_size = sizes
-                .iter()
-                .rev()
-                .copied()
-                .find(|size| *size != 0)
-                .unwrap_or(current_size);
+            // Only an unknown size is filled, by the batch's first known hint.
+            let expected_size = if current_size == 0 {
+                sizes.iter().copied().find(|size| *size != 0).unwrap_or(0)
+            } else {
+                current_size
+            };
             let plan = apply_transition(
                 &store,
                 TransitionRequest {
@@ -1269,9 +1269,14 @@ fn duplicate_hints_refresh_scheduling_without_replacing_evidence() {
         .unwrap();
         store.commit(&authenticated);
         assert!(store.aux[0].is_authenticated());
+        // The first known hint wins, including a 2 MB one that no honest supplier sends.
         assert_eq!(
             crate::AuxDelivery::advertised_body_size(&store.aux),
-            std::num::NonZeroU32::new(3_146)
+            std::num::NonZeroU32::new(if original_size == 0 {
+                3_146
+            } else {
+                original_size
+            })
         );
     }
 }

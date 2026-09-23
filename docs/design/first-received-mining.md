@@ -40,6 +40,17 @@ For example, A arrives before B, but B finishes verification first. Mining can
 briefly use B while A is unverified. Once A passes, equal-work selection chooses
 A. If B gains a child with more cumulative work, mining switches to that child.
 
+This also applies when A arrives before its parent. B's chain can be fully
+available first, but A can retain its earlier receipt while waiting for missing
+context. Once A's parent arrives and both chains validate, A can win an equal-work
+tie. This preserves priority for honest out-of-order delivery. It also lets a
+miner with a private lead reserve priority for a tip while withholding an
+ancestor from nodes that received the tip.
+
+zcashd assigns tie priority only once the block and its ancestor data are
+available. Zakura uses the tip's full-block verifier receipt instead. Reconsidering
+this policy is tracked separately in [#1127](https://github.com/zakura-core/zakura/issues/1127).
+
 ## Header sync
 
 The header engine still uses greatest work and raw hash to select downloads.

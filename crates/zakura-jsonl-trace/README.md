@@ -21,7 +21,9 @@ The root measures router entry through the caller's result. It excludes caller r
 
 `Context::wrap` enters a context only while polling an async future. `Context::in_scope` carries an explicitly captured context into synchronous work. Never hold the synchronous `Entered` guard across an await. Dropping a span emits a complete elapsed interval. Shared crypto-batch work has no exclusive block owner and must not be attributed by timestamp alone.
 
-An attempt owns no block payload or consensus state. At most 1,024 attempt contexts, 16,384 detail events, and 2,048 summary events are retained by the recorder. Each attempt permits 256 spans, with transaction/worker detail capped at 128. This preserves capacity for state phases even on blocks with many transactions. Queue writes are nonblocking. Only the exporter thread serializes and sends datagrams, each at most 8,192 bytes. It sends repeated run metadata and health counters to recover collector restarts.
+An attempt owns no block payload or consensus state. At most 1,024 attempt contexts, 131,072 detail events, and 2,048 summary events are retained by the recorder. Each attempt permits 65,536 spans, reserving 128 for state phases after transaction/worker detail. The fixed event queues use less than 64 MiB. Queue writes are nonblocking. Only the exporter thread serializes and sends datagrams, each at most 8,192 bytes. It sends repeated run metadata and health counters to recover collector restarts.
+
+Transaction contexts carry their zero-based position in the block. Descendant spans inherit that index across async polls and worker handoffs, and their parent IDs identify the owning transaction span. The optional `transaction_index` field is absent in older recordings. The collector must be upgraded before the node to preserve this field and accept span IDs above the previous limit of 256. The larger budget preserves ordinary block detail while retaining bounded loss under extreme fanout or collection pressure.
 
 ## Wire format
 

@@ -970,13 +970,13 @@ impl StateService {
     /// hash we sent, and either:
     /// - the finalized tip has reached the maximum checkpoint height (the last block the checkpoint
     ///   verifier commits to the finalized state), or
-    /// - a semantically verified child of the last block we sent is already queued.
+    /// - the configured height is unbounded and a semantically verified child is already queued.
     ///
     /// The height condition is the one that matters in production: the checkpoint verifier only
     /// commits blocks up to `max_checkpoint_height`, so once the finalized tip reaches that height
-    /// the handoff happens immediately, **without** waiting for a semantically verified block to
-    /// arrive. The first semantically verified block then has a valid finalized parent the instant
-    /// it shows up, instead of the pipeline stalling at the checkpoint boundary.
+    /// the next check hands off without waiting for a semantically verified block to arrive.
+    /// Checkpoint completion explicitly requests this check because a buffered service is not
+    /// polled while its request queue is empty.
     ///
     /// The queued-child condition is a fallback for configurations with no finite checkpoint height
     /// (`max_checkpoint_height == Height::MAX`, e.g. full-verification test setups), where the
@@ -994,16 +994,10 @@ impl StateService {
         // The database tip is only read while we are still committing checkpoint verified blocks, so
         // the cheap `is_some()` check short-circuits this for the rest of the node's life.
         if self.block_write_sender.finalized.is_some()
-            && self.read_service.db.finalized_tip_hash()
-                == self.finalized_block_write_last_sent_hash
-            && (self
-                .read_service
-                .db
-                .finalized_tip_height()
-                .is_some_and(|tip_height| tip_height >= self.max_checkpoint_height)
-                || self
-                    .non_finalized_state_queued_blocks
-                    .has_queued_children(self.finalized_block_write_last_sent_hash))
+            && self.checkpoint_handoff_is_ready(
+                self.non_finalized_state_queued_blocks
+                    .has_queued_children(self.finalized_block_write_last_sent_hash),
+            )
         {
             // Tell the block write task to stop committing checkpoint verified blocks to the
             // finalized state, and move on to committing semantically verified blocks to the
@@ -1026,6 +1020,19 @@ impl StateService {
         } else {
             false
         }
+    }
+
+    /// Returns whether the last checkpoint write is durable and the writer may switch modes.
+    /// `has_child` can include a child about to be queued, but only an unbounded checkpoint
+    /// configuration may use that child instead of reaching the configured height.
+    fn checkpoint_handoff_is_ready(&self, has_child: bool) -> bool {
+        self.read_service.db.finalized_tip_hash() == self.finalized_block_write_last_sent_hash
+            && (self
+                .read_service
+                .db
+                .finalized_tip_height()
+                .is_some_and(|tip_height| tip_height >= self.max_checkpoint_height)
+                || (self.max_checkpoint_height == block::Height::MAX && has_child))
     }
 
     /// Queue a semantically verified block for contextual verification and check if any queued
@@ -1200,17 +1207,15 @@ impl StateService {
         if self.block_write_sender.finalized.is_some() {
             // The write task is still committing checkpoint blocks, so `send_ready_non_finalized_queued`
             // does not run for this parent and only the handoff empties the queue. The handoff
-            // needs the last hash we sent to be durably written, and it needs a queued child of
-            // that same hash. A block meeting both is drained by `try_handoff_to_non_finalized_write`
-            // below, and it fires at most once in the life of the node.
+            // needs the last hash we sent to be durably written and the configured boundary to
+            // be reached. Only an unbounded configuration can hand off based on a child alone.
             //
             // The durable finalized tip is not enough on its own. It lags the last hash we sent
             // for as long as checkpoint writes are in flight, and a block naming the lagging tip
             // neither completes the handoff condition nor gets reached by the eventual handoff
             // traversal, which walks forward from the last hash we sent.
-            return self.read_service.db.finalized_tip_hash()
-                == self.finalized_block_write_last_sent_hash
-                && *parent_hash == self.finalized_block_write_last_sent_hash;
+            return *parent_hash == self.finalized_block_write_last_sent_hash
+                && self.checkpoint_handoff_is_ready(true);
         }
 
         // The queue is live: `send_ready_non_finalized_queued` walks forward from this parent
@@ -2170,6 +2175,13 @@ impl Service<Request> for StateService {
                 }
                 .instrument(span)
                 .boxed()
+            }
+
+            Request::CheckCheckpointHandoff => {
+                // Checkpoint completion explicitly reconciles state even when no other request
+                // follows it. Keep this guarantee separate from incidental readiness polls.
+                self.try_handoff_to_non_finalized_write();
+                async { Ok(Response::CheckpointHandoffChecked) }.boxed()
             }
 
             // Runs concurrently using the ReadStateService

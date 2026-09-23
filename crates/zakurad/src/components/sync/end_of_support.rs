@@ -230,8 +230,9 @@ mod tests {
         let post_blossom_blocks_per_day = blocks_per_day(NetworkUpgrade::Blossom);
 
         // Blossom activates after the support window.
-        let network =
-            regtest_with_blossom(ESTIMATED_RELEASE_HEIGHT + 30 * pre_blossom_blocks_per_day);
+        let network = regtest_with_blossom(
+            ESTIMATED_RELEASE_HEIGHT + (EOS_PANIC_AFTER + 1) * pre_blossom_blocks_per_day,
+        );
         assert_eq!(
             estimated_height_after_release(&network, EOS_PANIC_AFTER),
             Height(ESTIMATED_RELEASE_HEIGHT + EOS_PANIC_AFTER * pre_blossom_blocks_per_day),

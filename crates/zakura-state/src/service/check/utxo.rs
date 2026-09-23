@@ -165,6 +165,8 @@ fn transparent_spend_chain_order(
     non_finalized_chain_created_utxos
         .get(&spend)
         .cloned()
+        // TODO: if finalized UTXO disk reads show up in profiles, fetch missing
+        // UTXOs in parallel.
         .or_else(|| finalized_state.utxo(&spend))
         // we don't keep spent UTXOs in the finalized state,
         // so all we can say is that it's missing from both

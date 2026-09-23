@@ -12,6 +12,10 @@ pub(crate) fn verify_pins(
 ) -> Result<(), InvariantViolation> {
     // Configuration stores pins in height order. No pin outside the affected
     // projections and changed nodes can match one of the checks below.
+    debug_assert!(
+        pins.is_sorted_by(|left, right| left.height < right.height),
+        "trust pins must be strictly ascending by height"
+    );
     let mut heights = selected
         .first()
         .into_iter()

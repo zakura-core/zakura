@@ -854,3 +854,88 @@ fn assert_fork_eviction_after_restart(replace_winner: bool) {
     }
     assert!(saw_eviction, "the fixture must cross the fork limit");
 }
+
+/// A `preciousblock` change publishes the preferred tip as the verified best tip, and operator
+/// invalidation and reconsideration of another fork keep it.
+#[test]
+fn precious_block_publishes_and_keeps_the_preferred_verified_tip() {
+    let _init_guard = zakura_test::init();
+    let network = Network::new_regtest(Default::default());
+    let mut finalized = FinalizedState::new(&Config::ephemeral(), &network).unwrap();
+    let genesis = regtest_genesis_block();
+    let mut parent = genesis.make_fake_child();
+    Arc::make_mut(&mut Arc::make_mut(&mut parent).header).time += chrono::Duration::seconds(1);
+    for block in [genesis, parent.clone()] {
+        finalized
+            .commit_finalized_direct(
+                CheckpointVerifiedBlock::from(block).into(),
+                None,
+                None,
+                "precious block fixture",
+            )
+            .unwrap();
+    }
+    let mut live = NonFinalizedState::new(&network);
+    let writer = HeaderChainWriter::attach_at_semantic_handoff(&finalized, &live).unwrap();
+    let mut template = parent.make_fake_child();
+    let height = template.coinbase_height().unwrap();
+    let transaction = crate::tests::setup::transaction_v4_from_coinbase(&template.transactions[0]);
+    Arc::make_mut(&mut template).transactions[0] = Arc::new(transaction);
+    let merkle_root = template.transactions.iter().cloned().collect();
+    let header = Arc::make_mut(&mut Arc::make_mut(&mut template).header);
+    header.time += chrono::Duration::seconds(1);
+    header.merkle_root = merkle_root;
+    header.commitment_bytes = <[u8; 32]>::from(finalized.db.history_tree().hash().unwrap()).into();
+
+    let siblings = template.make_fake_siblings(3);
+    for (order, block) in siblings.iter().enumerate() {
+        let mut prepared = block.clone().prepare();
+        prepared.receipt_order = Some(u64::try_from(order).unwrap());
+        let mut staged = live.clone();
+        staged.commit_new_chain(prepared, &finalized.db).unwrap();
+        commit_verified_change(
+            &writer,
+            &mut live,
+            staged,
+            Frontier::new(height, block.hash()),
+        );
+    }
+    assert_eq!(live.best_tip().unwrap().1, siblings[0].hash());
+
+    let preferred = siblings[1].hash();
+    let mut staged = live.clone();
+    staged.precious_block(preferred, &finalized.db).unwrap();
+    commit_precious_change(&writer, &mut live, staged, Frontier::new(height, preferred)).unwrap();
+    assert_eq!(live.best_tip().unwrap().1, preferred);
+    assert_eq!(
+        writer
+            .runtime
+            .publisher()
+            .snapshot()
+            .frontiers
+            .verified_best,
+        Frontier::new(height, preferred)
+    );
+
+    // The header planner reselects after operator changes, and must keep the preferred tip.
+    let other = siblings[2].hash();
+    for invalidate in [true, false] {
+        let mut staged = live.clone();
+        if invalidate {
+            staged.invalidate_block(other).unwrap();
+        } else {
+            staged.reconsider_block(other, &finalized.db).unwrap();
+        }
+        commit_operator_change(&writer, &mut live, staged, other, invalidate).unwrap();
+        assert_eq!(live.best_tip().unwrap().1, preferred);
+        assert_eq!(
+            writer
+                .runtime
+                .publisher()
+                .snapshot()
+                .frontiers
+                .verified_best,
+            Frontier::new(height, preferred)
+        );
+    }
+}

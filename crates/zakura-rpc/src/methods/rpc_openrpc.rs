@@ -277,6 +277,14 @@ pub static METHODS: ::phf::Map<&str, openrpsee::openrpc::RpcMethod> = ::phf::phf
     result: |g| g.result::<openrpsee::openrpc::ResultType>("reconsiderblock_result"),
     deprecated: false,
 },
+"preciousblock" => openrpsee::openrpc::RpcMethod {
+    description: "Treats a block as if it were received before other chain tips with the same work.\n\nA later call overrides an earlier one. A chain with more work still wins, so this does\nnothing for a block with less work than the best tip. The preference is not kept across\nrestarts. See Bitcoin Core\'s\n[`preciousblock`](https://developer.bitcoin.org/reference/rpc/preciousblock.html).\n\n# Parameters\n\n- `block_hash`: (hex-encoded block hash, required) The hash of the block to prefer.\n",
+    params: |_g| vec![
+        _g.param::<String>("block_hash", crate::methods::PARAM_BLOCK_HASH_DESC, true),
+    ],
+    result: |g| g.result::<openrpsee::openrpc::ResultType>("preciousblock_result"),
+    deprecated: false,
+},
 "generate" => openrpsee::openrpc::RpcMethod {
     description: "Mine blocks immediately. Returns the block hashes of the generated blocks.\n\n# Parameters\n\n- `num_blocks`: (numeric, required, example=1) Number of blocks to be generated.\n\n# Notes\n\nOnly works if the network of the running zakurad process is `Regtest`.\n\nzcashd reference: [`generate`](https://zcash.github.io/rpc/generate.html)\nmethod: post\ntags: generating\n",
     params: |_g| vec![

@@ -189,6 +189,10 @@ async fn a_request_ends_with_its_parts_then_one_ending() {
     assert_eq!(next(&mut session.output).await, Probe::Part(vec![7; 3]));
     assert_eq!(next(&mut session.output).await, Probe::Done(2));
     settle().await;
+    assert!(
+        session.output.try_recv().is_err(),
+        "one ending, then nothing"
+    );
     assert_eq!(session.serve.open(), 0);
     assert_eq!(capacity.node_output_held(), 0);
     assert_eq!(capacity.node_execution_held(), 0);
@@ -338,6 +342,25 @@ async fn a_retired_sessions_running_jobs_do_not_count_against_the_next_session()
 }
 
 #[tokio::test]
+async fn cancellation_lets_produce_finish_before_its_slot_returns() {
+    let capacity = capacity(LIMITS);
+    let gate = Arc::new(Semaphore::new(0));
+    let session = session(&capacity, 1, 4);
+    session.serve.admit(gated(&gate)).unwrap();
+    settle().await;
+    session.cancel.cancel();
+    settle().await;
+    assert_eq!(
+        capacity.node_execution_held(),
+        1,
+        "cancellation does not abort produce"
+    );
+    gate.add_permits(1);
+    settle().await;
+    assert_eq!(capacity.node_execution_held(), 0);
+}
+
+#[tokio::test]
 async fn cancellation_keeps_the_node_slot_until_the_work_ends() {
     let capacity = capacity(LIMITS);
     let probe = ExecutionProbe::new(true, false);
@@ -427,6 +450,30 @@ async fn a_non_reading_peer_holds_output_bytes_but_no_execution_slot() {
 }
 
 #[tokio::test]
+async fn output_bytes_return_only_when_the_last_frame_is_written() {
+    let capacity = capacity(LIMITS);
+    let mut session = session(&capacity, 1, 4);
+    session
+        .serve
+        .admit(Job {
+            parts: 2,
+            part_len: 8,
+            ..job()
+        })
+        .unwrap();
+    settle().await;
+    // Every frame sits in the transport queue; none is written.
+    assert_eq!(capacity.node_execution_held(), 0);
+    assert!(capacity.node_output_held() > 0);
+    next(&mut session.output).await;
+    next(&mut session.output).await;
+    assert!(capacity.node_output_held() > 0, "the ending is unwritten");
+    next(&mut session.output).await;
+    assert_eq!(capacity.node_output_held(), 0);
+    assert_eq!(capacity.peer_held(&peer(1)), (0, 0));
+}
+
+#[tokio::test]
 async fn a_stalled_produce_on_one_peer_does_not_block_another() {
     let capacity = capacity(ServeLimits {
         peer_execution: 1,
@@ -509,6 +556,19 @@ fn sink(
     mpsc::UnboundedReceiver<ResponseFrame>,
     Arc<Commitments>,
 ) {
+    let (sink, queued, commitments, _core) = sink_and_core(cap);
+    (sink, queued, commitments)
+}
+
+/// [`sink`], and the core its serving task would keep.
+fn sink_and_core(
+    cap: ResponseCap,
+) -> (
+    ResponseSink<Probe>,
+    mpsc::UnboundedReceiver<ResponseFrame>,
+    Arc<Commitments>,
+    Arc<Mutex<SinkCore>>,
+) {
     let budget = OutputByteBudget::new(1).unwrap();
     let grant =
         || futures::FutureExt::now_or_never(budget.grant(0)).expect("an empty grant never waits");
@@ -528,11 +588,8 @@ fn sink(
         }),
         Commitment(commitments.clone()),
     );
-    (
-        ResponseSink::new(Arc::new(Mutex::new(core))),
-        queued,
-        commitments,
-    )
+    let core = Arc::new(Mutex::new(core));
+    (ResponseSink::new(core.clone()), queued, commitments, core)
 }
 
 fn open(commitments: &Commitments) -> u32 {
@@ -575,7 +632,7 @@ fn the_sink_keeps_room_for_the_largest_ending() {
         frames: 3,
         bytes: 2 + 2 + 4,
     };
-    let (mut sink, mut queued, commitments) = sink(cap);
+    let (mut sink, mut queued, commitments, core) = sink_and_core(cap);
     sink.send(&Probe::Part(vec![1])).unwrap();
     sink.send(&Probe::Part(vec![1])).unwrap();
     // A third part fits the frame count, but not beside the ending.
@@ -591,6 +648,8 @@ fn the_sink_keeps_room_for_the_largest_ending() {
     assert_eq!(open(&commitments), 1);
     sink.finish(&Probe::Done(2)).unwrap();
     assert_eq!(open(&commitments), 0, "the ending frees the commitment");
+    // The serving task sees the ending and queues no failure ending.
+    assert!(core.lock().unwrap().ended());
     let ends: Vec<_> = std::iter::from_fn(|| queued.try_recv().ok())
         .map(|frame| frame.ends)
         .collect();

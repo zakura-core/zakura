@@ -161,6 +161,17 @@ pub(crate) enum Violation {
     Count { reported: u32, received: u32 },
 }
 
+/// Why this node could not request a range. Each case is local.
+#[derive(Debug, Error, PartialEq)]
+pub(crate) enum RequestFailed {
+    #[error(transparent)]
+    Reserve(#[from] ReserveRefused),
+    #[error("the request did not encode: {0}")]
+    Encode(#[from] WireError),
+    #[error("the request queue is full")]
+    QueueFull,
+}
+
 /// A range this node requested, and the items it received so far.
 #[derive(Debug)]
 struct Download {
@@ -234,13 +245,21 @@ impl ExampleNode {
     }
 
     /// Reserve `range`'s response, then request it.
+    ///
+    /// A request that is never written gives its reservation back.
     pub(crate) fn request(
         &mut self,
         range: ItemRange,
         entry: PoolEntry,
-    ) -> Result<(), ReserveRefused> {
+    ) -> Result<(), RequestFailed> {
+        let frame = encode_frame(&ExampleMessage::GetItems(range))?;
         self.reservations
             .reserve(range.start, GET_ITEMS.message_type, range_cap(range), entry)?;
+        let stream = stream_for(self.layout, message_type::GET_ITEMS);
+        if self.sends[stream].try_send(frame).is_err() {
+            self.reservations.retract(&range.start);
+            return Err(RequestFailed::QueueFull);
+        }
         self.downloads.insert(
             range.start,
             Download {
@@ -248,12 +267,6 @@ impl ExampleNode {
                 items: Vec::new(),
             },
         );
-        let frame = encode_frame(&ExampleMessage::GetItems(range))
-            .expect("a range this node requests encodes");
-        let stream = stream_for(self.layout, message_type::GET_ITEMS);
-        self.sends[stream]
-            .try_send(frame)
-            .expect("the request queue holds one request per reservation");
         Ok(())
     }
 

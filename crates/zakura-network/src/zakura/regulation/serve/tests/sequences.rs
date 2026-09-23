@@ -55,7 +55,7 @@ fn run(ops: Vec<Op>) -> Result<(), TestCaseError> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .expect("a test runtime builds");
+        .map_err(|error| TestCaseError::fail(error.to_string()))?;
     runtime.block_on(async move {
         let limits = ServeLimits {
             peer_execution: 1,

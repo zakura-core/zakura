@@ -23,6 +23,27 @@ timers. A future rate limit needs a measured resource cost that existing bounds 
 Repeated unavailable-range lookups and subscription control updates need measurement because small
 responses can still cause CPU or storage work.
 
+## Acting on violations
+
+The regulation tools act against a peer (`Disconnect`, a ban score, or any penalty) only on an
+unambiguous violation: an event that no conformant peer could cause. An event that a conformant
+peer could cause is traced, never acted on, so the protocol can be tuned with evidence. A local
+bug is no reason to stay passive; bugs get fixed.
+
+Whether this node still wants a response is local scheduling. It never decides whether the peer
+broke the protocol.
+
+Limits are conservative enough that exceeding them is unambiguous. A limit holds, with margin, for
+every conformant peer after the worst transport stall and at full link speed. A count limit acts
+only above the largest count a conformant peer can reach on this node's tally, under any
+congestion, reordering between streams, or release timing. Counts between the advertised limit and
+that margin are served and traced.
+
+Limits never cost throughput. Every capacity default derives from one target, 10 Gbps per
+connection at 500 ms round-trip time, and a test checks each default against its derivation. A
+local capacity limit makes the node wait; it never faults a peer. QUIC flow control binds first
+today: a 32 MiB connection send window carries about 540 Mbps at 500 ms.
+
 ## Message checks and handler policy
 
 The implementation may use existing codecs, handlers, and validators. It need not introduce a
@@ -65,9 +86,25 @@ table fails the build. The registry repeats the check at startup. These checks
 cover the tables' consistency only. The stream arrangement must still
 demonstrate progress under paused reads with the transport tests below.
 
+A row with a cadence declares both sides of it: the sender's minimum interval,
+and the receiver's bucket capacity and refill interval. The sender's tool and
+the receiver's tool read the same row, so they cannot drift apart. The layout
+validator proves that a conformant sender never empties the bucket: the bucket
+refills faster than the sender sends, and its capacity holds every message a
+sender can queue during the longest outage a connection survives, plus two. The
+receiver credits its own read pauses as they happen. An empty bucket is
+therefore a violation, and the reader disconnects the peer. Buckets that fall
+below a quarter of their capacity are traced, as evidence for tuning the values.
+
+On a stream with a table, only rows with a cadence charge a bucket. Commitments
+bound requests without one, and reservations bound responses. A service can
+attach its reservations to the stream as a response precheck: the reader then
+checks each response header against the live reservations before it allocates
+the payload.
+
 A stream without a table keeps the legacy behavior: its reader admits any
-message type and any flags up to the stream's frame cap. Reactors adopt tables
-one at a time.
+message type and any flags up to the stream's frame cap, and charges its
+per-kind message-rate bucket. Reactors adopt tables one at a time.
 
 ## Capacity admission and QUIC backpressure
 
@@ -75,8 +112,26 @@ The receiver starts response work only when worker capacity and bounded output c
 available. When capacity is unavailable, it stops draining the affected request stream. Capacity
 release resumes eligible processing. Local capacity exhaustion is not a peer violation.
 
-The receive or serving loop owns this wait. It needs no mandatory admission verdict, second
-delayed-request scheduler, or byte-refill timer. Bound any retained request prefix or decoded request.
+The serving task owns this wait, not the reader. The reader admits each request as a commitment
+without waiting, so no layout can trap responses or control messages behind waiting requests. The
+serving task takes the peer's and the node's output bytes for the whole response cap, then a peer
+and a node execution slot, and only then starts the work. The response therefore never waits for
+the peer: its frames queue against output that is already granted, and the work gives back its
+execution slots as soon as it returns. This meets "stop draining the affected request stream"
+because accepted commitments are bounded and every capacity wait runs off the reader. It needs no
+admission verdict, second delayed-request scheduler, or byte-refill timer.
+
+A commitment is released when its ending enters the session's ordered output, before transmission.
+A conformant peer sends its next request only after it receives an ending, so it never exceeds the
+advertised limit on this node's tally. The toolkit still acts only above twice the limit: even if
+the release happened after the write, the tally would include at most one further request per
+ending in transit. Requests between the limit and twice the limit are served and traced.
+Commitments are counted per session, so a retired session's running work never counts against the
+peer's next session. The enforced limit is the highest one advertised on the connection.
+
+Every admitted request ends exactly once. If the work fails locally, the reactor supplies a legal
+ending for what it already sent, and the connection stays open. The response cap reserves room for
+the largest ending, so the failure ending always fits.
 
 Stopping application reads must stop draining the QUIC receive buffer. Once the peer consumes its
 existing stream credit, it cannot send more data on that stream. Already authorized bytes still
@@ -139,6 +194,21 @@ cannot disconnect a conformant sender. Ambiguous bursts still consume bounded ex
 
 The requester creates a reservation before sending a request. A response consumes exactly one
 reservation or one unconsumed range part. Local work reassignment does not revoke authorization.
+
+A claim either succeeds, and the frame reaches its handler, or is refused, and the peer is
+disconnected. Every refusal is unambiguous: no live reservation, a row that answers another
+request, an ending claimed as a frame or the reverse, or frames or bytes over the reservation's
+budget. Only the response's own ending or the connection's end removes a reservation. The same
+response cap bounds the responder's output and the requester's reservation, so a conformant
+responder can never exceed it.
+
+Want is local. A requester that no longer wants the work abandons the reservation: it stays live,
+its frames still reach the handler, which may skip their work, and they are counted as unwanted.
+Nothing about want reaches the peer's record.
+
+Every requester map draws its entries from one node-wide pool, sized to keep twice the target's
+bandwidth-delay product reserved. A full pool makes the node wait before its next request; it
+never acts against a peer.
 
 Header push remains in scope. SubscribeHeaders grants bounded header and byte credit. The
 subscription identifies the initial target, locator, schema, cursor, and authorized descendants.

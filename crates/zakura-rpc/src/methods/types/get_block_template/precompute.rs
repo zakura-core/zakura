@@ -14,7 +14,11 @@
 use std::{sync::Arc, time::Duration};
 
 use jsonrpsee::core::RpcResult;
-use tokio::{sync::watch, task::JoinHandle, time::sleep};
+use tokio::{
+    sync::{watch, Semaphore},
+    task::JoinHandle,
+    time::sleep,
+};
 
 use tower::ServiceExt;
 
@@ -23,7 +27,10 @@ use zakura_chain::{
     block::{self, Height},
     chain_sync_status::ChainSyncStatus,
     chain_tip::ChainTip,
-    parameters::{Network, NetworkUpgrade},
+    parameters::{
+        subsidy::{is_zip234_active, parent_nsm_value_balance},
+        Network, NetworkUpgrade,
+    },
     serialization::{DateTime32, Duration32},
     work::difficulty::ParameterDifficulty,
 };
@@ -187,6 +194,7 @@ pub(crate) async fn run<Mempool, ReadStateService, Tip, SyncStatus>(
     network: Network,
     miner_params: MinerParams,
     coinbase_cache: CoinbaseCache,
+    build_slots: Arc<Semaphore>,
     cache: TemplateCache,
     mempool: Mempool,
     read_state: ReadStateService,
@@ -236,6 +244,7 @@ pub(crate) async fn run<Mempool, ReadStateService, Tip, SyncStatus>(
                     &network,
                     &miner_params,
                     &coinbase_cache,
+                    build_slots.clone(),
                     read_state.clone(),
                     None::<Mempool>,
                 )
@@ -258,6 +267,7 @@ pub(crate) async fn run<Mempool, ReadStateService, Tip, SyncStatus>(
             &network,
             &miner_params,
             &coinbase_cache,
+            build_slots.clone(),
             read_state.clone(),
             Some(mempool.clone()),
         )
@@ -320,7 +330,13 @@ pub(crate) async fn run<Mempool, ReadStateService, Tip, SyncStatus>(
             .and_then(|tip_height| tip_height.next().ok())
             .and_then(|next_height| next_height.next().ok())
         {
-            start_precomputing_coinbase(&mut next_coinbase, &network, &miner_params, height);
+            start_precomputing_coinbase(
+                &mut next_coinbase,
+                &network,
+                &miner_params,
+                height,
+                build_slots.clone(),
+            );
         }
 
         // Refresh the template when the chain tip changes, or when the mempool has had time to
@@ -365,6 +381,7 @@ async fn build<Mempool, ReadStateService>(
     network: &Network,
     miner_params: &MinerParams,
     coinbase_cache: &CoinbaseCache,
+    build_slots: Arc<Semaphore>,
     read_state: ReadStateService,
     mempool: Option<Mempool>,
 ) -> RpcResult<Option<BlockTemplateResponse>>
@@ -401,18 +418,26 @@ where
 
     // Transaction selection, the coinbase transaction, and the block roots are all CPU-bound, and
     // a shielded coinbase takes seconds to prove, so keep them off the async executor.
-    tokio::task::spawn_blocking(move || {
+    super::run_template_build(build_slots, move || {
         let mempool_txs = select_mempool_transactions(
             &network,
             height,
             &miner_params,
+            if is_zip234_active(&network, height) {
+                Some(
+                    parent_nsm_value_balance(chain_info.value_pools.nsm_value_balance_amount())
+                        .map_misc_error()?,
+                )
+            } else {
+                None
+            },
             mempool_txs,
             mempool_tx_deps,
-            Some(&coinbase_cache),
-        );
+        )
+        .map_misc_error()?;
 
         // `submit_old` depends on the long poll ID the client sent, so the RPC sets it.
-        Some(BlockTemplateResponse::new_internal(
+        BlockTemplateResponse::new_internal(
             &network,
             &coinbase_cache,
             &miner_params,
@@ -420,10 +445,12 @@ where
             long_poll_id,
             mempool_txs,
             None,
-        ))
+        )
+        .map(Some)
+        .map_misc_error()
     })
     .await
-    .map_misc_error()
+    .map_misc_error()?
 }
 
 /// Starts building the coinbase transaction for a coinbase-only block at `height`, unless it is
@@ -433,7 +460,11 @@ fn start_precomputing_coinbase(
     network: &Network,
     miner_params: &MinerParams,
     height: Height,
+    build_slots: Arc<Semaphore>,
 ) {
+    if is_zip234_active(network, height) {
+        return;
+    }
     if next_coinbase
         .as_ref()
         .is_some_and(|(precomputed_height, task)| {
@@ -443,12 +474,16 @@ fn start_precomputing_coinbase(
         return;
     }
 
+    let Ok(permit) = build_slots.try_acquire_owned() else {
+        return;
+    };
     let (network, miner_params) = (network.clone(), miner_params.clone());
 
     *next_coinbase = Some((
         height,
         tokio::task::spawn_blocking(move || {
-            TransactionTemplate::new_coinbase(&network, height, &miner_params, Amount::zero())
+            let _permit = permit;
+            TransactionTemplate::new_coinbase(&network, height, &miner_params, Amount::zero(), None)
                 .expect("valid coinbase tx")
         }),
     ));
@@ -475,8 +510,7 @@ async fn store_precomputed_coinbase(
         .expect("the precomputed height was checked above");
 
     match coinbase.await {
-        // A coinbase-only block pays no fees, so this also caches the zero-fee coinbase that
-        // ZIP-317 transaction selection needs for its size and sigop limits.
+        // The next empty template reuses this zero-fee coinbase.
         Ok(coinbase) => coinbase_cache.store(height, Amount::zero(), coinbase),
         Err(error) => tracing::warn!(?error, "precomputed coinbase transaction task failed"),
     }

@@ -9,7 +9,6 @@ edition.workspace = true
 rust-version.workspace = true
 
 readme = "../../README.md"
-homepage.workspace = true
 # crates.io is limited to 5 keywords and categories
 keywords.workspace = true
 # Must be one of <https://crates.io/category_slugs>
@@ -35,7 +34,7 @@ rpc-client = [
 
 [dependencies]
 zakura-chain = { path = "../zakura-chain" , version = "8.0.0" }
-zakura-header-chain = { path = "../zakura-header-chain", version = "2.1.0" }
+zakura-header-chain = { path = "../zakura-header-chain", version = "3.0.0" }
 tower = { workspace = true }
 
 # Optional dependencies

@@ -13,7 +13,7 @@ use zakura_chain::{
 use crate::application::release_version;
 
 /// The estimated height that this release will be published.
-pub const ESTIMATED_RELEASE_HEIGHT: u32 = 3_480_539;
+pub const ESTIMATED_RELEASE_HEIGHT: u32 = 3_494_121;
 
 /// The estimated number of blocks per day after Blossom.
 ///
@@ -28,12 +28,12 @@ pub const ESTIMATED_BLOCKS_PER_DAY: u32 = 24 * 60 * 60 / POST_BLOSSOM_POW_TARGET
 ///
 /// - Zebra will exit with a panic if the current tip height is bigger than the
 ///   `ESTIMATED_RELEASE_HEIGHT` plus this number of days.
-/// - Currently set to 21 days
+/// - Currently set to 30 days
 ///
-/// Note: v1.4.0 is estimated to release at height 3,480,539 (~2026-09-12)
-/// and halts 21 days later at height 3,504,731 (~2026-10-03) — the same
-/// halt block and date as the v1.4.0 release candidates and v1.3.2.
-pub const EOS_PANIC_AFTER: u32 = 21;
+/// Note: v1.5.0 is planned for 2026-09-23, but its release-height floor is
+/// 3,494,121 (~2026-09-25). This window halts after height 3,528,681
+/// (~2026-10-25), about 32 days after the planned release.
+pub const EOS_PANIC_AFTER: u32 = 30;
 
 /// The number of days before the end of support where Zebra will display warnings.
 pub const EOS_WARN_AFTER: u32 = EOS_PANIC_AFTER - 3;
@@ -182,7 +182,9 @@ pub fn check(tip_height: Height, network: &Network) {
 
 #[cfg(test)]
 mod tests {
-    use zakura_chain::parameters::testnet::ConfiguredActivationHeights;
+    use zakura_chain::parameters::testnet::{
+        ConfiguredActivationHeights, ConfiguredCheckpoints, RegtestParameters,
+    };
 
     use super::*;
 
@@ -197,13 +199,19 @@ mod tests {
 
     /// Returns a Regtest network with Blossom at `blossom`.
     fn regtest_with_blossom(blossom: u32) -> Network {
-        Network::new_regtest(
-            ConfiguredActivationHeights {
+        let genesis = Network::new_regtest(Default::default()).genesis_hash();
+        Network::new_regtest(RegtestParameters {
+            activation_heights: ConfiguredActivationHeights {
                 blossom: Some(blossom),
                 ..Default::default()
-            }
-            .into(),
-        )
+            },
+            // Canopy defaults to Blossom, so the checkpoints must cover the block before it.
+            checkpoints: Some(ConfiguredCheckpoints::HeightsAndHashes(vec![
+                (Height(0), genesis),
+                (Height(blossom - 1), zakura_chain::block::Hash([1; 32])),
+            ])),
+            ..Default::default()
+        })
     }
 
     #[test]
@@ -230,8 +238,9 @@ mod tests {
         let post_blossom_blocks_per_day = blocks_per_day(NetworkUpgrade::Blossom);
 
         // Blossom activates after the support window.
-        let network =
-            regtest_with_blossom(ESTIMATED_RELEASE_HEIGHT + 30 * pre_blossom_blocks_per_day);
+        let network = regtest_with_blossom(
+            ESTIMATED_RELEASE_HEIGHT + (EOS_PANIC_AFTER + 1) * pre_blossom_blocks_per_day,
+        );
         assert_eq!(
             estimated_height_after_release(&network, EOS_PANIC_AFTER),
             Height(ESTIMATED_RELEASE_HEIGHT + EOS_PANIC_AFTER * pre_blossom_blocks_per_day),

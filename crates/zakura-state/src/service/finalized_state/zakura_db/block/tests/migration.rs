@@ -4,13 +4,13 @@ use std::sync::Arc;
 
 use zakura_chain::{
     block::{self, Height},
-    parameters::Network,
+    parameters::{Network, NetworkKind},
     work::difficulty::U256,
 };
 use zakura_header_chain::{
     prepare_headers, CheckpointSet, EngineConfig, EngineMode, Frontier, HeaderBatchInput,
-    HeaderRules, RowLimit, StoreAuditRead, StoreAuditSnapshot, SystemClock, TrustedAnchor,
-    MAX_NON_FINALIZED_NODES_V1,
+    HeaderChainDiskVersion, HeaderRules, RowLimit, StoreAuditRead, StoreAuditSnapshot, SystemClock,
+    TrustedAnchor, MAX_NON_FINALIZED_NODES_V1,
 };
 
 use super::{
@@ -23,17 +23,20 @@ use super::{
 use crate::{
     service::finalized_state::{
         disk_db::{DiskWriteBatch, WriteDisk},
-        disk_format::RawBytes,
+        disk_format::{
+            header_chain_values::{decode_v4_engine_metadata, HeaderChainValueError},
+            RawBytes,
+        },
         header_chain::{
             migration::{initialize_header_chain_reconciled, HeaderChainInitializationError},
-            HeaderChainStore,
+            HeaderChainStore, HeaderChainStoreError,
         },
-        ZakuraDb,
+        FallibleDiskValue, ZakuraDb,
     },
     Config,
 };
 
-use crate::service::finalized_state::HEADER_VALIDATION_CONTEXT;
+use crate::service::finalized_state::{HEADER_ENGINE_META, HEADER_VALIDATION_CONTEXT};
 
 /// Writes a synthetic finalized header chain from `genesis` to `chain_tip`, and
 /// returns its headers indexed by height.
@@ -261,7 +264,7 @@ fn existing_narrow_validation_context_is_backfilled_before_startup() {
     let network = Network::Mainnet;
     let genesis = mainnet_block(0);
     let state = state_with_genesis_config(&network, genesis.clone(), Config::ephemeral());
-    let predecessor_span = zakura_header_chain::POW_PREDECESSOR_CONTEXT_SPAN;
+    let predecessor_span = zakura_header_chain::MAX_POW_PREDECESSOR_CONTEXT_SPAN;
     let chain_tip = u32::try_from(predecessor_span + 1)
         .expect("the validation context span fits in a block height");
     write_synthetic_finalized_headers(&state, &genesis, chain_tip);
@@ -298,11 +301,94 @@ fn existing_narrow_validation_context_is_backfilled_before_startup() {
     {
         downgrade.zs_delete(&context_cf, context.header.hash());
     }
+    // That build also recorded header-chain disk format 4.
+    let metadata_cf = state
+        .db
+        .cf_handle(HEADER_ENGINE_META)
+        .expect("the header-chain metadata column exists");
+    let mut metadata = state
+        .db
+        .raw_get_cf(&metadata_cf, b"")
+        .expect("the metadata row reads")
+        .expect("the initialized store has metadata");
+    metadata[..4].copy_from_slice(&4_u32.to_be_bytes());
+    downgrade.zs_insert(
+        &metadata_cf,
+        RawBytes::new_raw_bytes(Vec::new()),
+        RawBytes::new_raw_bytes(metadata.clone()),
+    );
     state
         .db
         .write(downgrade)
         .expect("the pre-ZIP 218 context fixture writes");
 
+    // A different network kind must still be rejected without changing its bytes,
+    // even though Mainnet permits a network policy change.
+    let mut incompatible =
+        decode_v4_engine_metadata(&metadata).expect("the version-four metadata fixture decodes");
+    incompatible.network_id = NetworkKind::Testnet;
+    let incompatible = incompatible
+        .encode()
+        .expect("the incompatible metadata fixture encodes");
+    let mut corrupt = DiskWriteBatch::new();
+    corrupt.zs_insert(
+        &metadata_cf,
+        RawBytes::new_raw_bytes(Vec::new()),
+        RawBytes::new_raw_bytes(incompatible.clone()),
+    );
+    state
+        .db
+        .write(corrupt)
+        .expect("the incompatible metadata fixture writes");
+    assert!(matches!(
+        store.migrate_to_current(&config),
+        Err(HeaderChainStoreError::Incoherent(
+            "legacy network kind does not match the configured network"
+        ))
+    ));
+    assert_eq!(
+        state
+            .db
+            .raw_get_cf(&metadata_cf, b"")
+            .expect("the rejected metadata row reads")
+            .expect("the rejected metadata row remains present"),
+        incompatible,
+    );
+    let mut restore = DiskWriteBatch::new();
+    restore.zs_insert(
+        &metadata_cf,
+        RawBytes::new_raw_bytes(Vec::new()),
+        RawBytes::new_raw_bytes(metadata),
+    );
+    state
+        .db
+        .write(restore)
+        .expect("the valid version-four metadata fixture is restored");
+
+    assert!(store
+        .migrate_to_current(&config)
+        .expect("version four migrates to the current format"));
+    let metadata = state
+        .db
+        .raw_get_cf(&metadata_cf, b"")
+        .expect("the metadata row reads")
+        .expect("the migrated store has metadata");
+    assert_eq!(
+        metadata[..4],
+        HeaderChainDiskVersion::CURRENT.0.to_be_bytes()
+    );
+    // The previous release accepts only format 4, so it reports the newer format
+    // instead of reading a validation context wider than its row limit.
+    assert_eq!(
+        decode_v4_engine_metadata(&metadata),
+        Err(HeaderChainValueError::UnsupportedDiskFormat(
+            HeaderChainDiskVersion::CURRENT.0
+        ))
+    );
+
+    // Model a restart after the version marker commits but before the context
+    // resize. A fresh store must complete the idempotent backfill.
+    let store = HeaderChainStore::new(state.header_chain_disk_db());
     assert_eq!(
         store
             .resize_validation_context(&state)

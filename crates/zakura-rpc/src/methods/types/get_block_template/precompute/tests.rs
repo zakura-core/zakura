@@ -37,6 +37,7 @@ fn template_with_max_time(net: &Network, max_time: DateTime32) -> BlockTemplateR
         expected_difficulty: CompactDifficulty::from(ExpandedDifficulty::from(U256::one())),
         tip_height,
         tip_hash: block::Hash([0xab; 32]),
+        value_pools: Default::default(),
         cur_time: DateTime32::from(1654008617),
         min_time: DateTime32::from(1654008606),
         max_time,
@@ -60,6 +61,7 @@ fn template_with_max_time(net: &Network, max_time: DateTime32) -> BlockTemplateR
         vec![],
         None,
     )
+    .expect("test parameters produce a valid template")
 }
 
 /// Returns a template for the notification and coinbase tests.
@@ -227,7 +229,13 @@ async fn in_flight_coinbase_is_retained_across_height_changes() {
     tokio::time::timeout(Duration::from_secs(10), async {
         // Neither consuming at a different height nor starting the next proof may detach this one.
         store_precomputed_coinbase(&mut next_coinbase, other_height, &cache).await;
-        start_precomputing_coinbase(&mut next_coinbase, &net, &miner_params, other_height);
+        start_precomputing_coinbase(
+            &mut next_coinbase,
+            &net,
+            &miner_params,
+            other_height,
+            Arc::new(Semaphore::new(1)),
+        );
         release_proof
             .send(())
             .expect("the in-flight proof is still waiting");
@@ -263,7 +271,13 @@ async fn completed_coinbase_is_replaced_without_caching_the_wrong_height() {
     let other_height = height.next().expect("test height is below the maximum");
     let cache = CoinbaseCache::default();
     let mut next_coinbase = None;
-    start_precomputing_coinbase(&mut next_coinbase, &net, &miner_params, height);
+    start_precomputing_coinbase(
+        &mut next_coinbase,
+        &net,
+        &miner_params,
+        height,
+        Arc::new(Semaphore::new(1)),
+    );
 
     tokio::time::timeout(Duration::from_secs(10), async {
         while !next_coinbase
@@ -279,7 +293,13 @@ async fn completed_coinbase_is_replaced_without_caching_the_wrong_height() {
         assert!(cache.get(height, Amount::zero()).is_none());
         assert!(cache.get(other_height, Amount::zero()).is_none());
 
-        start_precomputing_coinbase(&mut next_coinbase, &net, &miner_params, other_height);
+        start_precomputing_coinbase(
+            &mut next_coinbase,
+            &net,
+            &miner_params,
+            other_height,
+            Arc::new(Semaphore::new(1)),
+        );
         store_precomputed_coinbase(&mut next_coinbase, other_height, &cache).await;
         assert_eq!(
             cache.get(other_height, Amount::zero()),
@@ -288,7 +308,8 @@ async fn completed_coinbase_is_replaced_without_caching_the_wrong_height() {
                     &net,
                     other_height,
                     &miner_params,
-                    Amount::zero()
+                    Amount::zero(),
+                    None,
                 )
                 .expect("test parameters produce a valid coinbase")
             ),
@@ -333,4 +354,58 @@ fn shielded_miner_addresses_wait_longer_for_a_template() {
             "{name} should wait for the updater instead of proving per request"
         );
     }
+}
+
+/// Speculative proofs must leave occupied construction capacity to the active build.
+#[tokio::test]
+async fn next_coinbase_respects_shared_proof_capacity() {
+    let net = Network::Mainnet;
+    let miner = MinerParams::from(
+        Address::decode(
+            &net,
+            default_miner_address(net.kind(), &MinerAddressType::Transparent),
+        )
+        .unwrap(),
+    );
+    let slots = Arc::new(Semaphore::new(1));
+    let permit = slots.clone().acquire_owned().await.unwrap();
+    let mut next = None;
+    let height = Height(template().height);
+    start_precomputing_coinbase(&mut next, &net, &miner, height, slots.clone());
+    assert!(next.is_none());
+    drop(permit);
+    start_precomputing_coinbase(&mut next, &net, &miner, height, slots);
+    let (_, proof) = next.expect("released capacity permits precomputation");
+    proof.await.unwrap();
+}
+
+/// ZIP 234 needs the future parent's balance, which speculative proofs cannot know.
+#[tokio::test]
+async fn next_coinbase_skips_zip234() {
+    use zakura_chain::parameters::testnet::{ConfiguredActivationHeights, RegtestParameters};
+    let net = Network::new_regtest(RegtestParameters {
+        activation_heights: ConfiguredActivationHeights {
+            nu6_3: Some(1),
+            nu7: Some(5),
+            ..Default::default()
+        },
+        test_nsm_reissuance_height: Some(Height(10)),
+        ..Default::default()
+    });
+    let miner = MinerParams::from(
+        Address::decode(
+            &net,
+            default_miner_address(net.kind(), &MinerAddressType::Transparent),
+        )
+        .unwrap(),
+    );
+    let mut next = None;
+    start_precomputing_coinbase(
+        &mut next,
+        &net,
+        &miner,
+        Height(10),
+        Arc::new(Semaphore::new(1)),
+    );
+    assert!(next.is_none());
 }

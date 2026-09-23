@@ -25,7 +25,7 @@ use zakura_chain::{
     orchard::{Action, AuthorizedAction, Flags},
     parameters::{
         testnet::{ConfiguredActivationHeights, Parameters},
-        Network, NetworkUpgrade, ORCHARD_BLOCK_ACTION_LIMIT,
+        Network, NetworkUpgrade, GLOBAL_SHIELDED_BUDGET, ORCHARD_PROTOCOL_BLOCK_ACTION_LIMIT,
     },
     primitives::{ed25519, x25519, Groth16Proof},
     sapling,
@@ -2989,7 +2989,8 @@ async fn v5_transaction_with_last_valid_expiry_height() {
 /// is equal to the height of the block the transaction belongs to.
 #[tokio::test]
 async fn v5_coinbase_transaction_expiry_height() {
-    let network = Network::new_default_testnet();
+    // Keep this expiry-height test independent of future NU7 activation heights.
+    let network = configured_network_with_nu7(None);
     let state_service =
         service_fn(|_| async { unreachable!("State service should not be called") });
     let verifier = Verifier::new_for_tests(&network, state_service);
@@ -3213,7 +3214,9 @@ async fn v5_transaction_with_exceeding_expiry_height() {
 
     let transaction_hash = transaction.hash();
 
-    let verification_result = Verifier::new_for_tests(&Network::Mainnet, state)
+    // Keep this expiry-height test independent of future NU7 activation heights.
+    let network = configured_network_with_nu7(None);
+    let verification_result = Verifier::new_for_tests(&network, state)
         .oneshot(Request::Block {
             transaction_hash: transaction.hash(),
             transaction: Arc::new(transaction.clone()),
@@ -4455,11 +4458,13 @@ async fn v5_with_duplicate_orchard_action() {
     }
 }
 
-/// The mempool rejects a transaction whose Orchard and Ironwood actions exceed
-/// the ZIP 218 Orchard limit, because no block can include it. The check runs
-/// before any state service query, and only at or after NU7 activation.
+/// The mempool rejects a transaction whose own shielded actions exceed a ZIP 218
+/// per-block limit or the global budget, because no block can include it. The
+/// check runs before any state service query, and only at or after NU7
+/// activation. Ironwood has its own per-pool limit, and shares the global budget
+/// with Orchard.
 #[tokio::test]
-async fn mempool_applies_the_orchard_limit_to_ironwood_actions() {
+async fn mempool_applies_the_zip218_limits_to_ironwood_actions() {
     let _init_guard = zakura_test::init();
 
     let height = Height(1);
@@ -4473,14 +4478,9 @@ async fn mempool_applies_the_orchard_limit_to_ironwood_actions() {
         .to_network()
         .expect("configured testnet is valid");
 
-    let limit = usize::try_from(ORCHARD_BLOCK_ACTION_LIMIT).expect("the limit fits in usize");
+    let limit =
+        usize::try_from(ORCHARD_PROTOCOL_BLOCK_ACTION_LIMIT).expect("the limit fits in usize");
     let orchard_half = limit / 2;
-    let over_limit = || {
-        Some(TransactionError::OrchardActionsExceedBlockLimit {
-            actions: ORCHARD_BLOCK_ACTION_LIMIT + 1,
-            limit: ORCHARD_BLOCK_ACTION_LIMIT,
-        })
-    };
 
     // The fake proofs fail the proof size check, which the verifier runs after
     // the shielded limits. That error shows a transaction passed the limits.
@@ -4488,13 +4488,19 @@ async fn mempool_applies_the_orchard_limit_to_ironwood_actions() {
         (
             0,
             limit + 1,
-            over_limit(),
+            Some(TransactionError::IronwoodActionsExceedBlockLimit {
+                actions: ORCHARD_PROTOCOL_BLOCK_ACTION_LIMIT + 1,
+                limit: ORCHARD_PROTOCOL_BLOCK_ACTION_LIMIT,
+            }),
             TransactionError::IronwoodProofSize,
         ),
         (
             orchard_half,
             limit + 1 - orchard_half,
-            over_limit(),
+            Some(TransactionError::ShieldedCostExceedsBlockBudget {
+                cost: GLOBAL_SHIELDED_BUDGET + 1,
+                limit: GLOBAL_SHIELDED_BUDGET,
+            }),
             TransactionError::OrchardProofSize,
         ),
         (0, limit, None, TransactionError::IronwoodProofSize),
@@ -4532,7 +4538,7 @@ async fn mempool_applies_the_orchard_limit_to_ironwood_actions() {
 }
 
 /// Checks that ZIP 2003 accepts V4 transactions below NU7 and rejects them
-/// from NU7 when the `nu7` feature is enabled.
+/// from NU7.
 #[test]
 fn v4_deprecation_boundary() {
     let _init_guard = zakura_test::init();
@@ -4554,18 +4560,14 @@ fn v4_deprecation_boundary() {
         "a V4 transaction must be valid below the NU7 activation height",
     );
 
-    let expected = if cfg!(feature = "nu7") {
-        Err(TransactionError::UnsupportedByNetworkUpgrade(
-            transaction.version(),
-            NetworkUpgrade::Nu7,
-        ))
-    } else {
-        Ok(())
-    };
+    let expected = Err(TransactionError::UnsupportedByNetworkUpgrade(
+        transaction.version(),
+        NetworkUpgrade::Nu7,
+    ));
     assert_eq!(
         verify_v4_at(&network, &transaction, nu7),
         expected,
-        "V4 deprecation must match the `nu7` feature at NU7",
+        "a V4 transaction must be invalid at the NU7 activation height",
     );
     assert_eq!(
         verify_v4_at(
@@ -4574,14 +4576,21 @@ fn v4_deprecation_boundary() {
             nu7.next().expect("NU7 is below the maximum height"),
         ),
         expected,
-        "V4 deprecation must match the `nu7` feature after NU7",
+        "a V4 transaction must be invalid after the NU7 activation height",
     );
 
-    let no_nu7 = configured_network_with_nu7(None);
-    assert!(
-        verify_v4_at(&no_nu7, &transaction, Height::MAX).is_ok(),
-        "a network without an exact NU7 activation must keep accepting V4",
-    );
+    for network in [
+        Network::Mainnet,
+        Network::new_default_testnet(),
+        configured_network_with_nu7(None),
+    ] {
+        assert_eq!(NetworkUpgrade::Nu7.activation_height(&network), None);
+        assert!(!NetworkUpgrade::is_nu7_active(&network, Height::MAX));
+        assert!(
+            verify_v4_at(&network, &transaction, Height::MAX).is_ok(),
+            "a network without an exact NU7 activation must keep accepting V4",
+        );
+    }
 }
 
 /// Returns a configured network whose latest upgrade is NU6.3 unless `nu7`

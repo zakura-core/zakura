@@ -13,6 +13,7 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     fmt::{self},
     sync::{Arc, Mutex},
+    time::Duration,
 };
 
 use derive_getters::Getters;
@@ -20,7 +21,7 @@ use derive_new::new;
 use jsonrpsee::core::RpcResult;
 use jsonrpsee_types::{ErrorCode, ErrorObject};
 use rand::{rngs::OsRng, RngCore};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, watch, Semaphore};
 use tower::{Service, ServiceExt};
 use zcash_keys::address::Address;
 use zcash_protocol::memo::MemoBytes;
@@ -32,7 +33,10 @@ use zakura_chain::{
     },
     chain_sync_status::ChainSyncStatus,
     chain_tip::ChainTip,
-    parameters::Network,
+    parameters::{
+        subsidy::{is_zip234_active, parent_nsm_value_balance},
+        Network,
+    },
     serialization::{DateTime32, ZcashDeserializeInto},
     transaction::VerifiedUnminedTx,
     work::difficulty::{CompactDifficulty, ExpandedDifficulty},
@@ -42,7 +46,9 @@ use zcash_script::{opcode::PushValue, pv::push_value};
 #[allow(unused_imports)]
 use zakura_chain::serialization::BytesInDisplayOrder;
 
-use zakura_consensus::{router::service_trait::BlockVerifierService, MAX_BLOCK_SIGOPS};
+use zakura_consensus::{
+    error::TransactionError, router::service_trait::BlockVerifierService, MAX_BLOCK_SIGOPS,
+};
 use zakura_node_services::mempool::{self, TransactionDependencies};
 use zakura_state::GetBlockTemplateChainInfo;
 
@@ -54,7 +60,7 @@ use crate::{
     methods::types::{
         default_roots::DefaultRoots, long_poll::LongPollId, transaction::TransactionTemplate,
     },
-    server::error::OkOrError,
+    server::error::{LegacyCode, MapError, OkOrError},
     MinedBlockEvent, PendingBlockRegistry, SubmitBlockChannel,
 };
 
@@ -66,6 +72,11 @@ pub use parameters::{
     GetBlockTemplateCapability, GetBlockTemplateParameters, GetBlockTemplateRequestMode,
 };
 pub use proposal::{BlockProposalResponse, BlockTemplateTimeSource};
+
+/// Proof construction can itself use multiple cores. Admit one build across RPC clones.
+const MAX_TEMPLATE_BUILDS: usize = 1;
+/// Bound admission waits without cancelling an already running proof.
+const TEMPLATE_BUILD_WAIT: Duration = Duration::from_secs(30);
 
 /// Rejections for the current template parent. Overflow fails closed until the tip changes.
 #[derive(Clone, Debug, Default)]
@@ -379,17 +390,20 @@ impl BlockTemplateResponse {
     /// Returns a new [`BlockTemplateResponse`] struct, based on the supplied arguments and defaults.
     ///
     /// The result of this method only depends on the supplied arguments and constants.
-    #[allow(clippy::too_many_arguments)]
+    ///
+    /// Returns an error if the coinbase transaction cannot be built, for example because
+    /// the chain tip's value pools make the ZIP 234 NSM value balance negative. Its `expect`s
+    /// check invariants that the caller already guarantees.
+    #[allow(clippy::too_many_arguments, clippy::unwrap_in_result)]
     pub(crate) fn new_internal(
         net: &Network,
         coinbase_cache: &CoinbaseCache,
         miner_params: &MinerParams,
         chain_info: &GetBlockTemplateChainInfo,
         long_poll_id: LongPollId,
-        #[cfg(not(test))] mempool_txs: Vec<VerifiedUnminedTx>,
-        #[cfg(test)] mempool_txs: Vec<(InBlockTxDependenciesDepth, VerifiedUnminedTx)>,
+        mempool_txs: Vec<zip317::SelectedMempoolTx>,
         submit_old: Option<bool>,
-    ) -> Self {
+    ) -> Result<Self, TransactionError> {
         // Determine the next block height.
         let height = chain_info
             .tip_height
@@ -438,15 +452,34 @@ impl BlockTemplateResponse {
             .sum::<amount::Result<Amount<NonNegative>>>()
             .expect("mempool tx fees must be non-negative");
 
-        let coinbase_txn = coinbase_cache.get(height, txs_fee).unwrap_or_else(|| {
-            let coinbase_txn =
-                TransactionTemplate::new_coinbase(net, height, miner_params, txs_fee)
-                    .expect("valid coinbase tx");
-
-            coinbase_cache.store(height, txs_fee, coinbase_txn.clone());
-
-            coinbase_txn
-        });
+        // After reissuance, equal-height parents can have different NSM balances.
+        // The height/fee cache cannot identify that context, so bypass it.
+        let cache_allowed = !is_zip234_active(net, height);
+        let cached = cache_allowed
+            .then(|| coinbase_cache.get(height, txs_fee))
+            .flatten();
+        let coinbase_txn = match cached {
+            Some(coinbase) => coinbase,
+            None => {
+                let coinbase = TransactionTemplate::new_coinbase(
+                    net,
+                    height,
+                    miner_params,
+                    txs_fee,
+                    if cache_allowed {
+                        None
+                    } else {
+                        Some(parent_nsm_value_balance(
+                            chain_info.value_pools.nsm_value_balance_amount(),
+                        )?)
+                    },
+                )?;
+                if cache_allowed {
+                    coinbase_cache.store(height, txs_fee, coinbase.clone());
+                }
+                coinbase
+            }
+        };
 
         let default_roots = DefaultRoots::from_coinbase(
             net,
@@ -474,7 +507,7 @@ impl BlockTemplateResponse {
             "creating template ... "
         );
 
-        BlockTemplateResponse {
+        Ok(BlockTemplateResponse {
             capabilities,
 
             version: ZCASH_BLOCK_VERSION,
@@ -514,7 +547,7 @@ impl BlockTemplateResponse {
             work_id: new_work_id(),
 
             submit_old,
-        }
+        })
     }
 }
 
@@ -682,14 +715,9 @@ impl From<zcash_address::ConversionError<&'static str>> for MinerParamsError {
 
 /// Caches recently built coinbase transactions for the next block, keyed on `(height, fee)`.
 ///
-/// `getblocktemplate` clients commonly short-poll (re-request without long polling), and building
-/// the coinbase to a shielded address re-runs an expensive Sapling/Orchard proof. The coinbase only
-/// depends on `(height, fees)` for a given miner configuration, so repeated requests within the
-/// same block can reuse the cached transaction instead of re-proving it on every call.
-///
-/// Each `getblocktemplate` call needs two coinbase transactions at the same height: a zero-fee
-/// "fake" coinbase for ZIP-317 weight estimation, and the real coinbase with actual fees. Entries
-/// from previous heights are cleared on insert to bound memory.
+/// Before ZIP 234, the height and fees determine the coinbase for fixed miner parameters.
+/// The cache retains the zero-fee coinbase and recent fee variants at one height.
+/// Template construction bypasses this cache after ZIP 234 because rewards depend on parent balances.
 #[derive(Clone, Default)]
 pub(crate) struct CoinbaseCache(
     Arc<
@@ -704,7 +732,7 @@ pub(crate) struct CoinbaseCache(
 
 impl CoinbaseCache {
     /// Returns the cached coinbase transaction if it was built for `height` and `fee`.
-    fn get(
+    pub(crate) fn get(
         &self,
         height: block::Height,
         fee: Amount<NonNegative>,
@@ -717,7 +745,7 @@ impl CoinbaseCache {
     }
 
     /// Stores `coinbase` as the cached transaction for `height` and `fee`.
-    fn store(
+    pub(crate) fn store(
         &self,
         height: block::Height,
         fee: Amount<NonNegative>,
@@ -730,10 +758,7 @@ impl CoinbaseCache {
 
         // Evict entries from previous heights so the map stays bounded.
         map.retain(|&(h, _), _| h == height);
-        // Only 2 entries are ever useful (zero-fee fake + current real-fee coinbase), but mempool
-        // fee churn can accumulate stale entries within a block. Cap at 4 to stay well above the
-        // useful set while preventing unbounded growth. When evicting, preserve the zero-fee sizing
-        // coinbase — losing it recreates the churn this cache exists to prevent.
+        // Bound fee variants while retaining the zero-fee coinbase for empty templates.
         if !map.contains_key(&(height, fee)) && map.len() >= 4 {
             let evict_key = map
                 .keys()
@@ -785,6 +810,9 @@ where
     /// Coalesces detached template preparation work to the newest template.
     template_preparation_queue: TemplatePreparationQueue<BlockTemplateResponse>,
 
+    /// Bounds proof work across foreground requests and the background updater.
+    pub(crate) template_build_slots: Arc<Semaphore>,
+
     /// Retains failures so late subscribers cannot miss template withdrawal.
     pub(crate) template_rejections: watch::Sender<TemplateRejections>,
 }
@@ -816,8 +844,17 @@ where
             mined_submissions: Default::default(),
             optimistic_block_inventory,
             template_preparation_queue: TemplatePreparationQueue::default(),
+            template_build_slots: Arc::new(Semaphore::new(MAX_TEMPLATE_BUILDS)),
             template_rejections: watch::channel(TemplateRejections::default()).0,
         }
+    }
+
+    /// Runs bounded proof work off the async worker, retaining capacity across cancellation.
+    pub(crate) async fn run_template_build<T: Send + 'static>(
+        &self,
+        build: impl FnOnce() -> T + Send + 'static,
+    ) -> RpcResult<T> {
+        run_template_build(self.template_build_slots.clone(), build).await
     }
 
     pub(crate) fn reserve_mined_submission(
@@ -1134,4 +1171,29 @@ where
 
     // Check that the mempool and state were in sync when we made the requests
     Ok((last_seen_tip_hash == chain_tip_hash).then_some((transactions, transaction_dependencies)))
+}
+
+/// Runs proof work while retaining the shared permit across cancellation.
+async fn run_template_build<T: Send + 'static>(
+    slots: Arc<Semaphore>,
+    build: impl FnOnce() -> T + Send + 'static,
+) -> RpcResult<T> {
+    let permit = tokio::time::timeout(TEMPLATE_BUILD_WAIT, slots.acquire_owned())
+        .await
+        .map_err(|_| {
+            ErrorObject::owned(
+                LegacyCode::Misc.into(),
+                "timed out waiting for mining template construction capacity",
+                None::<()>,
+            )
+        })?
+        .map_misc_error()?;
+
+    tokio::task::spawn_blocking(move || {
+        // Dropping the RPC future cannot release capacity while this job still owns work.
+        let _permit = permit;
+        build()
+    })
+    .await
+    .map_misc_error()
 }

@@ -11,10 +11,10 @@ use zakura_chain::{
     block::{Block, Hash, Header, Height},
     parameters::{
         subsidy::{
-            founders_reward, founders_reward_address, funding_stream_values, FundingStreamReceiver,
-            ParameterSubsidy, SubsidyError,
+            founders_reward, founders_reward_address, funding_stream_values, miner_fee_share,
+            FundingStreamReceiver, ParameterSubsidy, SubsidyError,
         },
-        Network, NetworkUpgrade, GLOBAL_SHIELDED_BUDGET, ORCHARD_BLOCK_ACTION_LIMIT,
+        Network, NetworkUpgrade, GLOBAL_SHIELDED_BUDGET, ORCHARD_PROTOCOL_BLOCK_ACTION_LIMIT,
         SAPLING_BLOCK_IO_LIMIT, SPROUT_BLOCK_JOINSPLIT_LIMIT,
     },
     transaction::{self, ShieldedActionCounts, Transaction},
@@ -320,11 +320,14 @@ pub fn subsidy_is_valid(
 
 /// Returns `Ok(())` if the miner fees consensus rule is valid.
 ///
+/// `block_transaction_fees` is the aggregate fee before the NU7 NSM contribution.
+/// The coinbase must claim the remaining miner share from NU7 onward.
+///
 /// [7.1.2]: https://zips.z.cash/protocol/protocol.pdf#txnconsensus
 pub fn miner_fees_are_valid(
     coinbase_tx: &Transaction,
     height: Height,
-    block_miner_fees: Amount<NonNegative>,
+    block_transaction_fees: Amount<NonNegative>,
     expected_block_subsidy: Amount<NonNegative>,
     expected_deferred_pool_balance_change: DeferredPoolBalanceChange,
     network: &Network,
@@ -360,6 +363,9 @@ pub fn miner_fees_are_valid(
         + expected_deferred_pool_balance_change.value())
     .map_err(|_| SubsidyError::Overflow)?;
 
+    // NU7 modifies ZIP 236's full-claim rule by excluding the NSM fee contribution.
+    // Round once over the aggregate fees, independently of the reissuance start height.
+    let block_miner_fees = miner_fee_share(height, network, block_transaction_fees);
     let total_input_value =
         (expected_block_subsidy + block_miner_fees).map_err(|_| SubsidyError::Overflow)?;
 
@@ -422,26 +428,26 @@ pub fn time_is_valid_at(
 /// > following limits MUST be satisfied:
 /// >
 /// > - The total number of Orchard actions across all transactions in the block
-/// >   MUST NOT exceed `OrchardBlockActionLimit`.
+/// >   MUST NOT exceed `OrchardProtocolBlockActionLimit`.
+/// > - The total number of Ironwood actions across all transactions in the block
+/// >   MUST NOT exceed `OrchardProtocolBlockActionLimit`.
 /// > - The total number of Sapling inputs and outputs across all transactions in
 /// >   the block MUST NOT exceed `SaplingBlockIOLimit`.
 /// > - The total number of Sprout JoinSplits across all transactions in the
 /// >   block MUST NOT exceed `SproutBlockJoinSplitLimit`.
 /// > - The total shielded cost across all pools MUST NOT exceed
 /// >   `GlobalShieldedBudget`, where that cost is
-/// >   `Σ orchard_actions + Σ (sapling_spends + sapling_outputs) + 2 * Σ joinsplits`.
+/// >   `Σ (orchard_actions + ironwood_actions) + Σ (sapling_spends +
+/// >   sapling_outputs) + 2 * Σ joinsplits`.
 ///
 /// <https://zips.z.cash/zip-0218#shielded-pool-action-limits>
 ///
-/// ZIP 218 names only Orchard actions. Zakura also counts Ironwood actions
-/// against the Orchard limit and in the global shielded budget, because NU6.3
-/// (ZIP 258) moves new Orchard-protocol value to the Ironwood pool. See
-/// [`ShieldedActionCounts::orchard_and_ironwood_actions`].
+/// Orchard and Ironwood each get their own per-pool limit, and both draw on the
+/// single global shielded budget.
 ///
-/// ZIP 218 sets `SproutBlockJoinSplitLimit` to 25. Zakura sets it to zero, so
-/// this check rejects any JoinSplit at or after NU7, because ZIP 2003 disallows
-/// the only transaction versions that can carry one. See
-/// [`SPROUT_BLOCK_JOINSPLIT_LIMIT`].
+/// ZIP 218 sets `SproutBlockJoinSplitLimit` to zero. Zakura rejects any
+/// JoinSplit at or after NU7, because ZIP 2003 disallows the only transaction
+/// versions that can carry one. See [`SPROUT_BLOCK_JOINSPLIT_LIMIT`].
 pub fn shielded_action_limits_are_valid<'a>(
     transactions: impl IntoIterator<Item = &'a Arc<Transaction>>,
     height: Height,
@@ -459,10 +465,17 @@ pub fn shielded_action_limits_are_valid<'a>(
             ShieldedActionCounts::saturating_add,
         );
 
-    if totals.orchard_and_ironwood_actions > ORCHARD_BLOCK_ACTION_LIMIT {
+    if totals.orchard_actions > ORCHARD_PROTOCOL_BLOCK_ACTION_LIMIT {
         return Err(TransactionError::OrchardActionsExceedBlockLimit {
-            actions: totals.orchard_and_ironwood_actions,
-            limit: ORCHARD_BLOCK_ACTION_LIMIT,
+            actions: totals.orchard_actions,
+            limit: ORCHARD_PROTOCOL_BLOCK_ACTION_LIMIT,
+        });
+    }
+
+    if totals.ironwood_actions > ORCHARD_PROTOCOL_BLOCK_ACTION_LIMIT {
+        return Err(TransactionError::IronwoodActionsExceedBlockLimit {
+            actions: totals.ironwood_actions,
+            limit: ORCHARD_PROTOCOL_BLOCK_ACTION_LIMIT,
         });
     }
 

@@ -1,4 +1,4 @@
-spec_version = "1.4"
+spec_version = "1.5"
 
 # Phase 0 registers the complete rule catalog without implementation claims.
 # Later checkpoints change a status after the manifest can name its owner and tests.
@@ -478,7 +478,7 @@ id = "LC-FINAL-05"
 name = "Authenticated disk migration"
 status = "implemented"
 owner = "zakura_state::HeaderChainStore::migrate_to_current"
-tests = ["DG-07::version_three_integrated_migration_authenticates_the_full_state_frontier", "DG-07::version_three_migration_rejects_a_network_policy_mismatch_atomically", "DG-07::every_legacy_headers_only_version_migrates_with_a_complete_depth_proof"]
+tests = ["DG-07::version_three_integrated_migration_authenticates_the_full_state_frontier", "DG-07::version_three_migration_keeps_a_policy_change_for_startup", "DG-07::every_legacy_headers_only_version_migrates_with_a_complete_depth_proof"]
 networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
@@ -486,7 +486,7 @@ id = "LC-RETAIN-01"
 name = "Fork and node limits"
 status = "implemented"
 owner = "zakura_header_chain::enforce_retention"
-tests = ["DG-06::candidate_tip_eviction_is_lowest_work_then_smallest_raw_hash", "DG-06::exact_v1_node_boundary_refuses_to_evict_the_selected_path", "DG-06::protected_paths_and_context_references_fail_closed_under_node_pressure"]
+tests = ["DF-01::fork_eviction_demotes_only_bodies_missing_from_full_state", "DF-01::reconsideration_eviction_demotes_only_bodies_missing_from_full_state", "DG-06::candidate_tip_eviction_is_lowest_work_then_smallest_raw_hash", "DG-06::exact_v1_node_boundary_refuses_to_evict_the_selected_path", "DG-06::protected_paths_and_context_references_fail_closed_under_node_pressure"]
 networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
@@ -502,7 +502,7 @@ id = "LC-RETAIN-03"
 name = "Eviction is not invalidity"
 status = "implemented"
 owner = "zakura_header_chain::RetentionPlan"
-tests = ["DG-06::candidate_tip_eviction_is_lowest_work_then_smallest_raw_hash"]
+tests = ["DF-01::fork_eviction_demotes_only_bodies_missing_from_full_state", "DF-01::reconsideration_eviction_demotes_only_bodies_missing_from_full_state", "DG-06::candidate_tip_eviction_is_lowest_work_then_smallest_raw_hash"]
 networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]

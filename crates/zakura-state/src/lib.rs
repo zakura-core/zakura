@@ -49,7 +49,7 @@ pub use constants::{
     MAX_HISTORICAL_TREE_REPLAY_BLOCKS,
 };
 pub use error::{
-    BoxError, CloneError, CommitBlockError, CommitCheckpointVerifiedError,
+    AwaitBlockInfoError, BoxError, CloneError, CommitBlockError, CommitCheckpointVerifiedError,
     CommitSemanticallyVerifiedError, DuplicateNullifierError, HistoricalSubtreeUnavailable,
     HistoricalSubtreeUnavailableReason, HistoricalTreeUnavailable, MissingSproutTipTree,
     StateInitError, ValidateContextError,
@@ -67,8 +67,8 @@ pub use request::Spend;
 
 pub use response::{
     AnyTx, BlockSyncBodyMetadata, GetBlockTemplateChainInfo, KnownBlock, MinedTx,
-    NonFinalizedBlocksListener, ParentInputs, PreparedMinedRelayEligibility, ReadResponse,
-    Response,
+    NonFinalizedBlock, NonFinalizedBlocksListener, ParentInputs, PreparedMinedRelayEligibility,
+    ReadResponse, Response,
 };
 #[cfg(any(test, feature = "header-fuzz"))]
 pub use service::finalized_state::{replay_recovery_rows_bytes, RecoveryRowsReplaySummary};

@@ -28,6 +28,7 @@ use zakura_chain::{
 
 use crate::{
     request::FinalizedBlock,
+    service::check,
     service::finalized_state::{
         disk_db::DiskWriteBatch,
         disk_format::{
@@ -114,6 +115,18 @@ impl ZakuraDb {
     pub(crate) fn block_info_cf(&self) -> BlockInfoCf<'_> {
         BlockInfoCf::new(&self.db, BLOCK_INFO)
             .expect("column family was created when database was created")
+    }
+
+    /// Read legacy pool bytes during checked format upgrades.
+    pub(crate) fn raw_chain_value_pools_cf(&self) -> TypedColumnFamily<'_, (), RawBytes> {
+        TypedColumnFamily::new(&self.db, CHAIN_VALUE_POOLS)
+            .expect("database creation installs the pool column family")
+    }
+
+    /// Read legacy block-info bytes during checked format upgrades.
+    pub(crate) fn raw_block_info_cf(&self) -> TypedColumnFamily<'_, Height, RawBytes> {
+        TypedColumnFamily::new(&self.db, BLOCK_INFO)
+            .expect("database creation installs the block-info column family")
     }
 
     // History tree methods
@@ -281,6 +294,7 @@ impl DiskWriteBatch {
         let block_value_pool_change = finalized
             .block
             .chain_value_pool_change(
+                &db.network(),
                 &utxos_spent_by_block,
                 finalized.deferred_pool_balance_change,
             )
@@ -294,8 +308,16 @@ impl DiskWriteBatch {
                 }
             })?;
 
+        check::nsm_value_balance_is_non_negative(
+            &db.network(),
+            finalized.height,
+            &value_pool,
+            &block_value_pool_change,
+        )?;
+
         let new_value_pool = value_pool
             .add_chain_value_pool_change(block_value_pool_change)
+            .and_then(|pools| pools.seed_nsm_value_balance(finalized.height, &db.network()))
             .map_err(|value_balance_error| ValidateContextError::AddValuePool {
                 value_balance_error,
                 chain_value_pools: Box::new(value_pool),

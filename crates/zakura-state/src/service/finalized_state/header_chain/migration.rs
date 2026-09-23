@@ -22,7 +22,7 @@ use crate::service::finalized_state::{
         header_chain_values::{
             decode_v1_aux_delivery, decode_v1_consensus_invalid_body_tombstone,
             decode_v1_engine_metadata, decode_v1_full_state_body_validation_evidence_authority,
-            decode_v2_engine_metadata, decode_v3_engine_metadata,
+            decode_v2_engine_metadata, decode_v3_engine_metadata, decode_v4_engine_metadata,
             FullStateBodyValidationEvidenceAuthorityDisk, HeaderChainValueError,
             HeaderFinalityWitnessDisk, HeaderRowCountDisk, HeaderValidationContextDisk,
         },
@@ -39,18 +39,8 @@ use crate::service::finalized_state::{
     HEADER_FINALITY_WITNESS, HEADER_VALIDATION_CONTEXT,
 };
 
-/// The widest validation context any build retains below the finalized anchor:
-/// ZIP 218's averaging window plus the median-time span, less the anchor.
-///
-/// Startup reads up to this many rows while normalizing validation contexts
-/// written before the maximum increased.
-const WIDEST_PREDECESSOR_CONTEXT_SPAN: usize = zakura_header_chain::POW_PREDECESSOR_CONTEXT_SPAN;
-
-const _: () =
-    assert!(zakura_header_chain::POW_PREDECESSOR_CONTEXT_SPAN <= WIDEST_PREDECESSOR_CONTEXT_SPAN);
-
 impl HeaderChainStore {
-    /// Atomically migrate every released legacy header-chain format to v4.
+    /// Atomically migrate every released legacy header-chain format to the current format.
     pub(in crate::service) fn migrate_to_current(
         &self,
         config: &EngineConfig,
@@ -77,6 +67,7 @@ impl HeaderChainStore {
             1 => decode_v1_engine_metadata(&metadata_bytes, config.network_policy_digest())?,
             2 => decode_v2_engine_metadata(&metadata_bytes, config.network_policy_digest())?,
             3 => decode_v3_engine_metadata(&metadata_bytes)?,
+            4 => decode_v4_engine_metadata(&metadata_bytes)?,
             _ => return Err(HeaderChainValueError::UnsupportedDiskFormat(version).into()),
         };
         if metadata.network_id != config.network().kind() {
@@ -92,19 +83,37 @@ impl HeaderChainStore {
             };
             return Err(HeaderChainStoreError::Incoherent(message));
         }
-        if metadata.network_policy_digest != config.network_policy_digest() {
-            return Err(HeaderChainStoreError::Incoherent(
-                "legacy network policy does not match the configured policy",
-            ));
-        }
         // Mode must match: Integrated and HeadersOnly authenticate migration
         // differently. Trust-anchor digest may differ (for example when a release
-        // extends the checkpoint list). Keep the durable digest for now; post-migration
-        // startup audits with `allow_trust_anchor_update` and rebinds it atomically.
+        // extends the checkpoint list), and so may the diagnostic network policy digest
+        // (for example when a release sets an activation height). Keep the durable
+        // digests for now; post-migration startup audits with `allow_trust_anchor_update`
+        // and rebinds them atomically.
         if metadata.mode != config.mode {
             return Err(HeaderChainStoreError::Incoherent(
                 "legacy metadata does not match the configured engine policy",
             ));
+        }
+        if version == 4 {
+            // Version five only widens the retained validation context, which
+            // [`Self::resize_validation_context`] backfills next. Recording the new
+            // format first means a release that reads 27 context rows never opens a
+            // wider context: it rejects the format marker instead.
+            metadata.disk_format = HeaderChainDiskVersion::CURRENT;
+            let mut batch = DiskWriteBatch::new();
+            self.put_value(
+                &mut batch,
+                HEADER_ENGINE_META,
+                super::METADATA_KEY,
+                &metadata,
+            )?;
+            self.db.write(batch)?;
+            tracing::info!(
+                from_version = version,
+                to_version = HeaderChainDiskVersion::CURRENT.0,
+                "migrated the authenticated durable header-chain format"
+            );
+            return Ok(true);
         }
 
         let frontier = metadata.frontiers.finalized;
@@ -298,7 +307,9 @@ impl HeaderChainStore {
         self.audit_snapshot()
             .map_err(HeaderChainStoreError::Store)?
             .visit_validation_context_records(
-                zakura_header_chain::RowLimit::new(WIDEST_PREDECESSOR_CONTEXT_SPAN),
+                zakura_header_chain::RowLimit::new(
+                    zakura_header_chain::MAX_POW_PREDECESSOR_CONTEXT_SPAN,
+                ),
                 &mut |record| {
                     retained.push(record);
                     Ok(())
@@ -927,7 +938,7 @@ fn linked_validation_context(
     let mut height = anchor.height;
     // The recovery audit requires exactly the maximum predecessor span below
     // the anchor, even when the active difficulty window is narrower.
-    for _ in 0..zakura_header_chain::POW_PREDECESSOR_CONTEXT_SPAN {
+    for _ in 0..zakura_header_chain::MAX_POW_PREDECESSOR_CONTEXT_SPAN {
         let Ok(previous) = height.previous() else {
             break;
         };
@@ -982,7 +993,7 @@ mod tests {
 
     #[test]
     fn later_anchor_predecessor_context_has_the_exact_span_boundary() {
-        let predecessor_span = zakura_header_chain::POW_PREDECESSOR_CONTEXT_SPAN;
+        let predecessor_span = zakura_header_chain::MAX_POW_PREDECESSOR_CONTEXT_SPAN;
         let span_bound =
             u32::try_from(predecessor_span).expect("the retained predecessor span fits in u32");
         let chain_len = span_bound + 3;

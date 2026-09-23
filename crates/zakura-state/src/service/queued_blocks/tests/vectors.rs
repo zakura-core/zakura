@@ -24,7 +24,7 @@ trait IntoQueued {
 impl IntoQueued for Arc<Block> {
     fn into_queued(self) -> QueuedSemanticallyVerified {
         let (rsp_tx, _) = oneshot::channel();
-        (self.prepare(), rsp_tx, None)
+        (self.prepare(), rsp_tx, None, 0)
     }
 }
 
@@ -87,10 +87,10 @@ fn dequeue_gives_right_children() -> Result<()> {
     assert_eq!(2, children.len());
     assert!(children
         .iter()
-        .any(|(block, _, _)| block.hash == child1.hash()));
+        .any(|(block, _, _, _)| block.hash == child1.hash()));
     assert!(children
         .iter()
-        .any(|(block, _, _)| block.hash == child2.hash()));
+        .any(|(block, _, _, _)| block.hash == child2.hash()));
     assert_eq!(0, queue.blocks.len());
     assert_eq!(0, queue.by_parent.len());
     assert_eq!(0, queue.by_height.len());
@@ -179,7 +179,7 @@ fn prune_removes_right_children() -> Result<()> {
     Ok(())
 }
 
-/// `SentHashes::remove` must drop the hash, its outpoints from `known_utxos`,
+/// `SentHashes::remove` must drop the hash, its unshared outpoints from `known_utxos`,
 /// and the corresponding `(hash, height)` entry from `curr_buf` (or whichever
 /// batch buffer holds it). Without this, a rejected same-hash block would
 /// keep a later honest re-delivery of a block at the same hash locked out as
@@ -236,6 +236,165 @@ fn sent_hashes_remove_drops_rejected_hash_and_utxos() -> Result<()> {
     sent.remove(&block3.hash());
     assert!(sent.contains(&prepared2.hash));
 
+    Ok(())
+}
+
+#[test]
+fn sent_hashes_remove_many_preserves_other_blocks_across_batches() -> Result<()> {
+    let _init_guard = zakura_test::init();
+    let earlier: Arc<Block> =
+        zakura_test::vectors::BLOCK_MAINNET_419200_BYTES.zcash_deserialize_into()?;
+    let block: Arc<Block> =
+        zakura_test::vectors::BLOCK_MAINNET_419201_BYTES.zcash_deserialize_into()?;
+    let earlier = earlier.prepare();
+    let siblings = block.make_fake_siblings(3);
+    let removed = siblings[0].clone().prepare();
+    let retained = siblings[1].clone().prepare();
+    let removed_current = siblings[2].clone().prepare();
+    let unknown_hash = block.make_fake_child().hash();
+
+    let mut sent = SentHashes::default();
+    sent.add(&earlier);
+    sent.finish_batch();
+    sent.add(&removed);
+    sent.add(&retained);
+    sent.finish_batch();
+    sent.add(&removed_current);
+
+    // Empty input must leave both finished and unfinished batches untouched.
+    sent.remove_many(&[]);
+    assert_eq!(sent.sent.len(), 4);
+    assert_eq!(sent.bufs.len(), 2);
+    assert_eq!(sent.curr_buf.len(), 1);
+
+    sent.remove_many(&[
+        earlier.hash,
+        removed.hash,
+        removed_current.hash,
+        removed.hash,
+        unknown_hash,
+    ]);
+
+    assert_eq!(sent.sent.len(), 1);
+    assert!(sent.contains(&retained.hash));
+    assert_eq!(sent.known_utxos.len(), retained.new_outputs.len());
+    for outpoint in retained.new_outputs.keys() {
+        assert!(sent.utxo(outpoint).is_some());
+    }
+    assert!(sent.curr_buf.is_empty());
+    assert_eq!(sent.bufs.len(), 1);
+    assert_eq!(
+        sent.bufs[0].iter().copied().collect::<Vec<_>>(),
+        vec![(retained.hash, retained.height)]
+    );
+
+    // Redelivery acquires a new owner after the previous batch entry was removed.
+    sent.add(&removed_current);
+    sent.remove_many(&[retained.hash, removed_current.hash]);
+    assert!(sent.sent.is_empty());
+    assert!(sent.known_utxos.is_empty());
+    assert!(sent.curr_buf.is_empty());
+    assert!(sent.bufs.is_empty());
+    Ok(())
+}
+
+#[test]
+fn sent_hashes_remove_keeps_outputs_shared_with_sent_sibling() -> Result<()> {
+    let _init_guard = zakura_test::init();
+    let block: Arc<Block> =
+        zakura_test::vectors::BLOCK_MAINNET_419201_BYTES.zcash_deserialize_into()?;
+    let siblings = block.make_fake_siblings(2);
+    let evicted = siblings[0].clone().prepare();
+    let in_flight = siblings[1].clone().prepare();
+    assert_ne!(evicted.hash, in_flight.hash);
+
+    let mut sent = SentHashes::default();
+    sent.add(&evicted);
+    sent.add(&in_flight);
+    sent.remove(&evicted.hash);
+
+    assert!(sent.contains(&in_flight.hash));
+    for outpoint in in_flight.new_outputs.keys() {
+        assert!(
+            sent.utxo(outpoint).is_some(),
+            "removing one sibling must retain shared output {outpoint:?} for the other"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn sent_hashes_shared_outputs_release_after_last_distinct_block() -> Result<()> {
+    let _init_guard = zakura_test::init();
+    let block: Arc<Block> =
+        zakura_test::vectors::BLOCK_MAINNET_419201_BYTES.zcash_deserialize_into()?;
+    let siblings = block.make_fake_siblings(2);
+    let first = siblings[0].clone().prepare();
+    let second = siblings[1].clone().prepare();
+    let mut sent = SentHashes::default();
+    sent.add(&first);
+    sent.add(&first);
+    sent.add_finalized(&crate::CheckpointVerifiedBlock::from(siblings[0].clone()));
+    sent.add_finalized(&crate::CheckpointVerifiedBlock::from(siblings[1].clone()));
+    sent.add(&second);
+    sent.finish_batch();
+
+    sent.remove(&first.hash);
+    sent.remove(&first.hash);
+    for outpoint in second.new_outputs.keys() {
+        assert!(sent.utxo(outpoint).is_some());
+    }
+    sent.remove(&second.hash);
+    assert!(sent.known_utxos.is_empty());
+    assert!(sent.bufs.iter().all(|batch| batch.is_empty()));
+
+    sent.add(&second);
+    sent.prune_by_height(second.height);
+    assert!(sent.known_utxos.is_empty());
+    assert!(sent.sent.is_empty());
+    Ok(())
+}
+
+#[test]
+fn sent_hashes_pruning_keeps_outputs_owned_by_later_block() -> Result<()> {
+    let _init_guard = zakura_test::init();
+    let block: Arc<Block> =
+        zakura_test::vectors::BLOCK_MAINNET_419201_BYTES.zcash_deserialize_into()?;
+    let siblings = block.make_fake_siblings(2);
+    let first = siblings[0].clone().prepare();
+    // The other fork includes the shared transactions one block later.
+    let mut other_parent = siblings[1].clone();
+    Arc::make_mut(&mut other_parent).transactions.truncate(1);
+    let mut later = other_parent.make_fake_child();
+    Arc::make_mut(&mut later)
+        .transactions
+        .extend(block.transactions.iter().skip(1).cloned());
+    let later = later.prepare();
+    assert_eq!(later.height, (first.height + 1).unwrap());
+    assert!(first.new_outputs.iter().any(|(outpoint, output)| {
+        !output.utxo.from_coinbase && later.new_outputs.contains_key(outpoint)
+    }));
+
+    let mut sent = SentHashes::default();
+    sent.add(&first);
+    sent.finish_batch();
+    sent.add(&later);
+    sent.finish_batch();
+    sent.prune_by_height(first.height);
+    assert!(!sent.contains(&first.hash));
+    assert!(sent.contains(&later.hash));
+    for outpoint in later.new_outputs.keys() {
+        assert!(sent.utxo(outpoint).is_some());
+    }
+    for outpoint in first.new_outputs.keys() {
+        if !later.new_outputs.contains_key(outpoint) {
+            assert!(sent.utxo(outpoint).is_none());
+        }
+    }
+
+    sent.prune_by_height(later.height);
+    assert!(sent.known_utxos.is_empty());
+    assert!(sent.sent.is_empty());
     Ok(())
 }
 
@@ -301,7 +460,7 @@ fn dequeue_descendants_removes_the_complete_failed_subtree() -> Result<()> {
     let mut responses = Vec::new();
     for block in [failed_child, failed_grandchild, sibling] {
         let (response, receiver) = oneshot::channel();
-        queue.queue((block.prepare(), response, None));
+        queue.queue((block.prepare(), response, None, 0));
         responses.push(receiver);
     }
     let error = CommitSemanticallyVerifiedError::from(CommitBlockError::HeaderChainError {

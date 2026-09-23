@@ -346,12 +346,11 @@ pub const MAX_ADDRS_IN_ADDRESS_BOOK: usize =
 /// messages from each of our peers.
 pub const TIMESTAMP_TRUNCATION_SECONDS: u32 = 30 * 60;
 
-// ZIP 204 assigns the NU7 protocol versions. `Version::min_specified_for_upgrade` holds the
-// same values.
-// Next upgrade values, uncomment on activation:
-//   const CURRENT_NETWORK_PROTOCOL_VERSION_VALUE: u32 = 170_180; // NU7 Testnet.
-//   const CURRENT_NETWORK_PROTOCOL_VERSION_VALUE: u32 = 170_190; // NU7 Mainnet.
-const CURRENT_NETWORK_PROTOCOL_VERSION_VALUE: u32 = 170_160; // NU6.3 (Mainnet + Testnet).
+// ZIP 204 assigns NU7 the protocol version 170_180 on Testnet and 170_190 on Mainnet.
+// `Version::min_specified_for_upgrade` holds the same values. Mainnet and Testnet both have
+// an NU7 height, so one binary advertises the Mainnet value, which also meets the Testnet
+// minimum.
+const CURRENT_NETWORK_PROTOCOL_VERSION_VALUE: u32 = 170_190; // NU7 (Mainnet + Testnet).
 
 /// The Zcash network protocol version implemented by this crate, and advertised
 /// during connection setup.

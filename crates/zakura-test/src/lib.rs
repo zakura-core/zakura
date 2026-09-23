@@ -17,6 +17,7 @@ use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 pub mod command;
 
 pub mod allocations;
+pub mod execution;
 pub mod log_capture;
 pub mod mock_service;
 pub mod net;

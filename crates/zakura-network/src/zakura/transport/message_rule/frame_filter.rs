@@ -25,6 +25,15 @@ pub enum FrameRejection {
         /// The row's minimum payload bytes.
         min: usize,
     },
+    /// No live reservation answers this response.
+    #[error("no live reservation answers the response")]
+    Unsolicited,
+    /// The payload exceeds every live reservation's remaining bytes.
+    #[error("the payload exceeds the largest reservation's {bytes} remaining bytes")]
+    AboveReservation {
+        /// The largest remaining payload bytes among the live reservations.
+        bytes: u64,
+    },
 }
 
 impl FrameRejection {
@@ -34,6 +43,8 @@ impl FrameRejection {
             Self::UnknownMessageType => "unknown_message_type",
             Self::ReservedFlags => "reserved_flags",
             Self::PayloadTooShort { .. } => "payload_too_short",
+            Self::Unsolicited => "unsolicited",
+            Self::AboveReservation { .. } => "above_reservation",
         }
     }
 }

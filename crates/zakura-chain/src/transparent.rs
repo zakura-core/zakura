@@ -52,7 +52,11 @@ use proptest_derive::Arbitrary;
 /// [7.1](https://zips.z.cash/protocol/nu5.pdf#txnencodingandconsensus)
 //
 // TODO: change type to HeightDiff
-pub const MIN_TRANSPARENT_COINBASE_MATURITY: u32 = 100;
+// FORK TEST DEVIATION: lowered from the consensus value of 100 so a freshly seeded fork
+// has spendable value without waiting ~4h for its own coinbase to mature. Lowering this
+// only ever permits more spends, so it cannot invalidate the inherited Testnet history,
+// and NU7 fee recycling does not consult it. Never ship this value.
+pub const MIN_TRANSPARENT_COINBASE_MATURITY: u32 = 1;
 
 /// The rate used to calculate the dust threshold, in zatoshis per 1000 bytes.
 ///

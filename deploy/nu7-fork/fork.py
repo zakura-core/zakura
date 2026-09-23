@@ -300,10 +300,11 @@ def render_nodes_toml(config: dict, plan: dict) -> str:
             f'rpc_listen_addr = "{peer["rpc_listen_addr"]}"',
             f'metrics_endpoint = "{peer["metrics_endpoint"]}"',
             f'initial_testnet_peers = ["{peer_dial_addr(host["listen_addr"])}"]',
-            # Validator only. Without a miner address this node refuses
-            # getblocktemplate, which is what keeps it independent of the
-            # blocks it is asked to validate.
-            'miner_address = ""',
+            # An empty address leaves this node a pure validator: without one it refuses
+            # getblocktemplate, so it can only ever accept blocks the other node produced.
+            # Setting one makes the two nodes compete, which is what exercises losing a
+            # race and re-templating on a tip someone else mined.
+            f'miner_address = "{peer.get("miner_address", "")}"',
             "",
         ])
 

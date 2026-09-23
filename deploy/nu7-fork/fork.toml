@@ -36,7 +36,7 @@ ssh_string = "root@localhost"
 
 # The ref built and deployed. Must contain the finalized NU7 branch ID, which
 # landed in PR #1093 — a build without it has no NU7 consensus branch at all.
-commit = "feat/nu7-fork-testnet"
+commit = "a6626f1cc"
 
 # Where the cloned state volume is mounted. `fork.py seed` mounts it here if it
 # is attached but not yet mounted, matching .github/workflows/scripts/pr-node-run.sh.
@@ -102,3 +102,8 @@ identity_dir = "/root/.zakura-fork2"
 listen_addr = "0.0.0.0:18333"
 rpc_listen_addr = "127.0.0.1:18242"
 metrics_endpoint = "127.0.0.1:9998"
+
+# Its own coinbase address, so the two nodes compete for each block instead of one
+# producing every block the other merely accepts. Leave empty to make this node a pure
+# validator that refuses getblocktemplate.
+miner_address = "tmA1eXkKigWig8xmeDBJdLGPiyhrmKcTxnq"

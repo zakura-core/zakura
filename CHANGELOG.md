@@ -23,7 +23,9 @@ independently.
   resolve the latest recording, including links to older recordings. Known
   measurement interference is labeled and excluded from timing statistics, and
   bounded collector batches reduce capture loss. CPU sampling and flamegraphs
-  are reserved for explicitly requested diagnostic sessions.
+  are reserved for explicitly requested diagnostic sessions. Startup profiles
+  remain searchable but are excluded from slow blocks and latency statistics
+  until verifier initialization, catch-up, and a quiet settling period finish.
 
 ## [1.5.0-rc0] - 2026-09-21
 

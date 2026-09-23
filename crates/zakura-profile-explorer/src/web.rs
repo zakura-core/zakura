@@ -84,7 +84,7 @@ async fn trace(State(app): State<App>, Path((run, attempt)): Path<(String, u64)>
             // Logical tracks, not OS threads. Async elapsed time is not CPU ownership.
             events.push(json!({"name":span["stage"],"cat":"elapsed","ph":"X","pid":1,"tid":span["span"],"ts":start,"dur":end.saturating_sub(start),"args":{"parent_span":span["parent"],"completion_thread":span["completion_thread"]}}));
         }
-        Ok(json!({"traceEvents":events,"displayTimeUnit":"ms","metadata":{"complete":detail["complete"],"exclusion_reason":summary["exclusion_reason"],"timing":detail["timing"],"cpu":"unavailable","run":run,"attempt":attempt}}))
+        Ok(json!({"traceEvents":events,"displayTimeUnit":"ms","metadata":{"complete":detail["complete"],"exclusion_reason":summary["exclusion_reason"],"startup":summary["startup"],"timing":detail["timing"],"cpu":"unavailable","run":run,"attempt":attempt}}))
     }).await
 }
 

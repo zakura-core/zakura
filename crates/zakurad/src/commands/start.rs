@@ -369,7 +369,7 @@ impl StartCmd {
             Vec::new()
         };
 
-        let _block_profile = match profiles::start(
+        let _block_profile = match profiles::start_with_startup_gate(
             &config.block_profile,
             config.network.network.to_string(),
             format!(
@@ -625,6 +625,25 @@ impl StartCmd {
         // Start health server if configured (after sync_status is available)
 
         info!("initializing verifiers");
+        if profiles::enabled() {
+            let upgrade = zakura_chain::parameters::NetworkUpgrade::current(
+                &config.network.network,
+                latest_chain_tip.best_tip_height().unwrap_or(Height(0)),
+            );
+            let warmup = tokio::task::spawn_blocking(move || {
+                use zakura_consensus::{groth16, halo2, sapling_prover};
+                let _ = sapling_prover().verifying_keys();
+                let _ = halo2::verifier_for(upgrade);
+                let _ = groth16::SPROUT.prepared_verifying_key();
+            });
+            match tokio::time::timeout(Duration::from_secs(300), warmup).await {
+                Ok(Ok(())) => profiles::verification_initialized(),
+                error => warn!(
+                    ?error,
+                    "profiler verification warmup failed; startup timings stay excluded"
+                ),
+            }
+        }
         let (tx_verifier_setup_tx, tx_verifier_setup_rx) = oneshot::channel();
         let (block_verifier_router, tx_verifier, consensus_task_handles, max_checkpoint_height) =
             zakura_consensus::router::init_with_read_state(

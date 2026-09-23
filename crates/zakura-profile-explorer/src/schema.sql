@@ -30,6 +30,10 @@ CREATE TABLE IF NOT EXISTS timing_exclusions (
  PRIMARY KEY(run,attempt),
  FOREIGN KEY(run,attempt) REFERENCES attempts(run,attempt) ON DELETE CASCADE
 );
+CREATE TABLE IF NOT EXISTS run_readiness (
+ run TEXT PRIMARY KEY REFERENCES runs(id) ON DELETE CASCADE,
+ ready_us INTEGER CHECK(ready_us >= 0)
+);
 CREATE TABLE IF NOT EXISTS chunks (
  id TEXT PRIMARY KEY, bytes INTEGER NOT NULL, created_ms INTEGER NOT NULL,
  deleting INTEGER NOT NULL DEFAULT 0

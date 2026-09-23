@@ -17,6 +17,7 @@ fn metadata() -> Frame {
             utc_start_ms: now_ms(),
             monotonic_start_us: None,
             clock_error_us: 1,
+            startup_gate: false,
         },
     }
 }
@@ -57,6 +58,86 @@ fn span() -> Event {
         end_us: 800000,
         completion_thread: None,
     }
+}
+
+#[test]
+fn startup_boundary_uses_entry_time_and_survives_heartbeat_and_collector_restarts() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let mut store = Store::open(temp.path(), 16_000_000)?;
+    let mut run = metadata();
+    if let Frame::Run { run, .. } = &mut run {
+        run.startup_gate = true;
+    }
+    store.ingest(run)?;
+    store.ingest(event(1, finish()))?;
+    let health = |ready_us| Frame::Health {
+        schema: SCHEMA_VERSION,
+        run_id: RUN.into(),
+        at_us: 1_000_000,
+        attempts: 2,
+        dropped: 0,
+        transport_dropped: 0,
+        ready_us,
+    };
+    store.ingest(health(None))?;
+    let home = Reader::open(temp.path())?.home(Some(RUN), "semantic")?;
+    assert_eq!(home["startup_pending"], true);
+    assert_eq!(home["timing_blocks"], 0);
+    assert_eq!(home["outliers"], json!([]));
+    assert_eq!(home["latest"][0]["startup"], true);
+
+    store.ingest(health(Some(200_000)))?;
+    // Finishing after the boundary must not promote a request that started during startup.
+    let detail = Reader::open(temp.path())?.detail(RUN, 1)?;
+    assert_eq!(detail["summary"]["startup"], true);
+    assert_eq!(detail["timing"]["verifier_elapsed_us"], 700_000);
+    assert_eq!(detail["timing"]["eligible_for_statistics"], false);
+    let mut next = block();
+    next.hash = [2; 32];
+    next.height = Some(43);
+    store.ingest(event(
+        2,
+        Event::Finish {
+            attempt: 2,
+            start_us: 200_000,
+            end_us: 1_000_000,
+            block: next,
+            outcome: Outcome::Success,
+            dropped: 0,
+        },
+    ))?;
+    store.ingest(health(None))?;
+    drop(store);
+    let _store = Store::open(temp.path(), 16_000_000)?;
+    let reader = Reader::open(temp.path())?;
+    let home = reader.home(Some(RUN), "semantic")?;
+    assert_eq!(home["startup_pending"], false);
+    assert_eq!(home["startup_timings"], 1);
+    assert_eq!(home["timing_blocks"], 1);
+    assert_eq!(home["outliers"].as_array().unwrap().len(), 1);
+    assert_eq!(home["outliers"][0]["attempt"], 2);
+    assert_eq!(home["latency"]["p99_us"], 800_000);
+    assert_eq!(reader.search("42")?[0]["startup"], true);
+    Ok(())
+}
+
+#[test]
+fn legacy_startup_boundary_preserves_raw_timings_and_cannot_move() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let mut store = Store::open(temp.path(), 16_000_000)?;
+    store.ingest(metadata())?;
+    store.ingest(event(1, finish()))?;
+    assert_eq!(
+        Reader::open(temp.path())?.home(Some(RUN), "semantic")?["timing_blocks"],
+        1
+    );
+    startup_boundary(temp.path(), RUN, 200_000)?;
+    startup_boundary(temp.path(), RUN, 200_000)?;
+    assert!(startup_boundary(temp.path(), RUN, 0).is_err());
+    let reader = Reader::open(temp.path())?;
+    assert_eq!(reader.home(Some(RUN), "semantic")?["outliers"], json!([]));
+    assert_eq!(reader.detail(RUN, 1)?["summary"]["end_us"], 700_100);
+    Ok(())
 }
 
 #[test]

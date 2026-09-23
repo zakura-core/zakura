@@ -175,19 +175,33 @@ impl Store {
                 );
                 let metadata = serde_json::to_string(&run)?;
                 self.db.execute("INSERT INTO runs(id,metadata,utc_ms,seen_ms) VALUES(?,?,?,?) ON CONFLICT(id) DO UPDATE SET seen_ms=excluded.seen_ms WHERE metadata=excluded.metadata", params![run.id,metadata,integer(run.utc_start_ms)?,integer(now_ms())?])?;
+                if run.startup_gate {
+                    self.db.execute(
+                        "INSERT OR IGNORE INTO run_readiness(run) VALUES(?)",
+                        [&run.id],
+                    )?;
+                }
             }
             Frame::Health {
                 schema,
                 run_id,
-                at_us: _,
+                at_us,
                 attempts,
                 dropped,
                 transport_dropped,
+                ready_us,
             } => {
                 ensure!(
                     schema == SCHEMA_VERSION && valid_id(&run_id),
                     "unsupported health"
                 );
+                if let Some(ready) = ready_us {
+                    ensure!(ready <= at_us, "readiness is after health observation");
+                    self.db.execute(
+                        "UPDATE run_readiness SET ready_us=coalesce(ready_us,?) WHERE run=?",
+                        params![integer(ready)?, run_id],
+                    )?;
+                }
                 self.db.execute(
                     "UPDATE runs SET seen_ms=?,attempts=?,dropped=?,transport_dropped=? WHERE id=?",
                     params![
@@ -551,6 +565,17 @@ pub(crate) fn exclude_timing(path: &Path, run: &str, attempt: u64, reason: &str)
     Ok(())
 }
 
+/// Backfill a proven startup boundary for a legacy run. Existing boundaries cannot be changed.
+pub(crate) fn startup_boundary(path: &Path, run: &str, ready_us: u64) -> Result<()> {
+    ensure!(valid_id(run), "invalid run");
+    let db =
+        Connection::open_with_flags(path.join("index.sqlite"), OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+    db.busy_timeout(Duration::from_secs(4))?;
+    db.execute_batch("PRAGMA foreign_keys=ON; PRAGMA synchronous=FULL;")?;
+    ensure!(db.execute("INSERT INTO run_readiness(run,ready_us) VALUES(?,?) ON CONFLICT(run) DO UPDATE SET ready_us=excluded.ready_us WHERE run_readiness.ready_us IS NULL OR run_readiness.ready_us=excluded.ready_us", params![run,integer(ready_us)?])? == 1, "startup boundary already set");
+    Ok(())
+}
+
 impl Reader {
     pub(crate) fn open(path: &Path) -> Result<Self> {
         let db = Connection::open_with_flags(
@@ -592,7 +617,7 @@ impl Reader {
         let cohort = format!(
             "run=?1 AND mode=?2 AND outcome='success' AND utc_ms>=?3 AND {LATEST_IN_SESSION}"
         );
-        let timings = format!("{cohort} AND {VALID_TIMING}");
+        let timings = format!("{cohort} AND {VALID_TIMING} AND {READY_TIMING}");
         let latest = self.rows(
             &format!("{COLUMNS} WHERE {cohort} ORDER BY utc_ms DESC,attempt DESC LIMIT 10"),
             run,
@@ -608,6 +633,16 @@ impl Reader {
             |r| r.get(0),
         )?;
         let excluded: i64 = self.db.query_row("SELECT count(*) FROM attempts a JOIN timing_exclusions e USING(run,attempt) WHERE run=? AND mode=? AND utc_ms>=?",params![run,mode,integer(since)?],|r|r.get(0))?;
+        let startup: i64 = self.db.query_row(
+            &format!("SELECT count(*) FROM attempts a WHERE {cohort} AND NOT ({READY_TIMING})"),
+            params![run, mode, integer(since)?],
+            |r| r.get(0),
+        )?;
+        let startup_pending: bool = self.db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM run_readiness WHERE run=? AND ready_us IS NULL)",
+            [run],
+            |r| r.get(0),
+        )?;
         let mut latency = serde_json::Map::new();
         for (label, percent) in [("p50_us", 50), ("p95_us", 95), ("p99_us", 99)] {
             let value: Option<i64> = if accepted > 0 {
@@ -620,7 +655,7 @@ impl Reader {
         let cpu:Value = self.db.query_row("SELECT count(*),coalesce(sum(samples),0),min(start_us),max(end_us) FROM cpu WHERE run=? AND end_us>=coalesce((SELECT (? - utc_ms)*1000 FROM runs WHERE id=?),0)",params![run,integer(since)?,run],|r|Ok(json!({"captures":r.get::<_,i64>(0)?,"samples":r.get::<_,i64>(1)?,"first_us":r.get::<_,Option<i64>>(2)?,"last_us":r.get::<_,Option<i64>>(3)?,"scope":"process"})))?;
         let health = self.db.query_row("SELECT updated_ms,errors,budget,used,discarded_spans FROM status WHERE id=1", [], |r| Ok(json!({"updated_ms":r.get::<_,i64>(0)?,"errors":r.get::<_,i64>(1)?,"budget":r.get::<_,i64>(2)?,"used":r.get::<_,i64>(3)?,"discarded_spans":r.get::<_,i64>(4)?}))).optional()?;
         Ok(
-            json!({"generated_ms":now_ms(),"run":run,"mode":mode,"runs":runs,"latest":latest,"outliers":outliers,"failures":failures,"counts":counts,"timing_blocks":accepted,"excluded_timings":excluded,"health":health,"cpu":cpu,"latency":latency}),
+            json!({"generated_ms":now_ms(),"run":run,"mode":mode,"runs":runs,"latest":latest,"outliers":outliers,"failures":failures,"counts":counts,"timing_blocks":accepted,"excluded_timings":excluded,"startup_timings":startup,"startup_pending":startup_pending,"health":health,"cpu":cpu,"latency":latency}),
         )
     }
     pub(crate) fn detail(&self, run: &str, attempt: u64) -> Result<Value> {
@@ -708,6 +743,7 @@ impl Reader {
             "verifier_elapsed_us":elapsed(summary["end_us"].as_u64()),
             "after_response_us":summary["end_us"].as_u64().zip(recorded_end).map(|(response,end)|end.saturating_sub(response)),
             "valid":summary["exclusion_reason"].is_null(),
+            "eligible_for_statistics":summary["exclusion_reason"].is_null() && summary["startup"] == false,
         });
         Ok(
             json!({"summary":summary,"recording":recording,"spans":spans,"complete":complete,"missing_chunks":missing,"cpu":cpu,"timing":timing,"boundary":"Verifier request measures router entry to caller result. Total recorded time extends through the last recorded work, including finalization after the response. Caller readiness, network and ingress are outside both intervals. Missing detail can leave the total understated."}),
@@ -737,10 +773,11 @@ impl Reader {
 const LATEST_IN_SESSION: &str = "NOT EXISTS (SELECT 1 FROM attempts b WHERE b.run=a.run AND b.hash=a.hash AND b.mode=a.mode AND (b.utc_ms,b.attempt)>(a.utc_ms,a.attempt))";
 const VALID_TIMING: &str =
     "NOT EXISTS (SELECT 1 FROM timing_exclusions e WHERE e.run=a.run AND e.attempt=a.attempt)";
-const COLUMNS: &str = "SELECT run,attempt,hash,height,mode,transactions,start_us,end_us,utc_ms,outcome,dropped,expected_spans,received_spans,expired,(SELECT reason FROM timing_exclusions e WHERE e.run=a.run AND e.attempt=a.attempt) FROM attempts a";
+const READY_TIMING: &str = "NOT EXISTS (SELECT 1 FROM run_readiness g WHERE g.run=a.run AND (g.ready_us IS NULL OR a.start_us IS NULL OR a.start_us<g.ready_us))";
+const COLUMNS: &str = "SELECT run,attempt,hash,height,mode,transactions,start_us,end_us,utc_ms,outcome,dropped,expected_spans,received_spans,expired,(SELECT reason FROM timing_exclusions e WHERE e.run=a.run AND e.attempt=a.attempt),EXISTS(SELECT 1 FROM run_readiness g WHERE g.run=a.run AND (g.ready_us IS NULL OR a.start_us IS NULL OR a.start_us<g.ready_us)) FROM attempts a";
 fn row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Value> {
     Ok(
-        json!({"run":r.get::<_,String>(0)?,"attempt":r.get::<_,i64>(1)?,"hash":r.get::<_,Option<String>>(2)?,"height":r.get::<_,Option<u32>>(3)?,"mode":r.get::<_,Option<String>>(4)?,"transactions":r.get::<_,Option<u32>>(5)?,"start_us":r.get::<_,Option<i64>>(6)?,"end_us":r.get::<_,Option<i64>>(7)?,"utc_ms":r.get::<_,Option<i64>>(8)?,"outcome":r.get::<_,Option<String>>(9)?,"dropped":r.get::<_,i64>(10)?,"expected_spans":r.get::<_,Option<i64>>(11)?,"received_spans":r.get::<_,i64>(12)?,"expired":r.get::<_,bool>(13)?,"exclusion_reason":r.get::<_,Option<String>>(14)?}),
+        json!({"run":r.get::<_,String>(0)?,"attempt":r.get::<_,i64>(1)?,"hash":r.get::<_,Option<String>>(2)?,"height":r.get::<_,Option<u32>>(3)?,"mode":r.get::<_,Option<String>>(4)?,"transactions":r.get::<_,Option<u32>>(5)?,"start_us":r.get::<_,Option<i64>>(6)?,"end_us":r.get::<_,Option<i64>>(7)?,"utc_ms":r.get::<_,Option<i64>>(8)?,"outcome":r.get::<_,Option<String>>(9)?,"dropped":r.get::<_,i64>(10)?,"expected_spans":r.get::<_,Option<i64>>(11)?,"received_spans":r.get::<_,i64>(12)?,"expired":r.get::<_,bool>(13)?,"exclusion_reason":r.get::<_,Option<String>>(14)?,"startup":r.get::<_,bool>(15)?}),
     )
 }
 

@@ -59,6 +59,21 @@ The node holds at most 1,024 active attempt contexts, 16,384 detail events, and 
 
 Root completion is self-contained and separate from detail. A seal is emitted when the last worker/context owner finishes. The collector compares the seal's expected count with retained spans. Queue drops, transport gaps, interrupted attempts, truncation, expired chunks, and collector failures stay visible. A context handoff that cannot acquire the existing transaction registry immediately is omitted and counted as run-level loss.
 
+## Startup readiness
+
+The dedicated profiling node preloads Sapling parameters, the Orchard verifier for its starting chain tip, and the Sprout verifying key before accepting verification work. Reporting stays in startup until fresh sync checks confirm catch-up has finished and no profiled block work has run for 60 seconds. Retained attempt contexts include finalization after the caller response. A missed sync observation for more than 30 seconds or failed sync check restarts the settling period. Legacy sync requires a fresh peer response and a drained round with no discovered blocks. Native sync additionally checks the committed tip against the header tip and confirms it with a bounded peer query.
+
+Readiness is recorded once per process run. Later slow blocks, queue delays, and sync interruptions remain eligible. The boundary is repeated in health frames so collector restarts and lost datagrams cannot turn startup into valid timing. Blocks are classified by router-entry time, including requests that finish after readiness. Before the boundary arrives, every block in a gated run is conservatively classified as startup.
+
+Startup profiles remain in latest blocks and search with a Startup label. Their raw timings and downloads stay intact, but they are excluded from slow blocks and daily latency statistics. Historical recordings without readiness metadata keep their prior behavior. After checking operator logs, backfill a proven boundary for an old run with:
+
+```sh
+sudo -u zakura-profile zakura-profile-explorer startup-boundary \
+  --store /srv/zakura-profile/data --run RUN_ID --ready-us MICROSECONDS_FROM_RUN_START
+```
+
+The boundary cannot be moved once set. Upgrade and restart the collector before the web service and node. This installs the additive catalog table before readers need it. Nodes without profiling enabled do not preload keys or perform extra readiness checks.
+
 ## Known measurement interference
 
 Do not reject recordings just because they are slow. When operator logs prove a capture was contaminated, such as a deliberate process pause, annotate the exact recording locally with a reason. The collector must have opened the store with this version first to install the additive catalog table.

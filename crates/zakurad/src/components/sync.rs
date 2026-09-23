@@ -35,6 +35,7 @@ use zakura_chain::{
     parameters::{Network, NetworkUpgrade, POST_BLOSSOM_POW_TARGET_SPACING},
 };
 use zakura_consensus::{error::TransactionError, RouterError, VerifyBlockError};
+use zakura_jsonl_trace::block_profile as profiles;
 use zakura_network::{self as zn, PeerSocketAddr};
 use zakura_state as zs;
 
@@ -928,6 +929,10 @@ where
     /// The lengths of recent sync responses.
     recent_syncs: RecentSyncLengths,
 
+    /// Fresh peer evidence and discovered work in this startup sync round.
+    profile_observed_peer: bool,
+    profile_discovered_blocks: bool,
+
     /// Queue-level retry counts for block hashes whose download failed with a single-peer
     /// `notfound` ([`NotFoundKind::Response`]). Bounded by [`MISSING_BLOCK_DOWNLOAD_RETRY_LIMIT`].
     missing_block_retry_counts: HashMap<block::Hash, usize>,
@@ -1105,6 +1110,8 @@ where
             latest_chain_tip,
             prospective_tips: HashSet::new(),
             recent_syncs,
+            profile_observed_peer: false,
+            profile_discovered_blocks: false,
             missing_block_retry_counts: HashMap::new(),
             transient_block_retry_counts: HashMap::new(),
             verify_timeout_retry_counts: HashMap::new(),
@@ -1129,6 +1136,7 @@ where
 
         loop {
             if self.try_to_sync(None).await.is_err() {
+                profiles::startup_sync_observation(false);
                 self.downloads.cancel_all();
             }
 
@@ -1262,6 +1270,14 @@ where
 
             let verified_height = self.latest_chain_tip.best_tip_height();
             let header_tip_height = best_header_tip_height(&mut read_state).await;
+            if profiles::startup_pending() {
+                let caught_up = verified_height.is_some()
+                    && verified_height == header_tip_height
+                    && timeout(Duration::from_secs(10), self.profile_tip_confirmed())
+                        .await
+                        .unwrap_or(false);
+                profiles::startup_sync_observation(caught_up);
+            }
             if let Some(sync_length) = zakura_sync_status_length(verified_height, header_tip_height)
             {
                 self.recent_syncs.push_extend_tips_length(sync_length);
@@ -1467,6 +1483,8 @@ where
             &mut watch::Receiver<zakura_node_services::sync_lifecycle::HeaderRuntimeStatus>,
         >,
     ) -> Result<(), Report> {
+        self.profile_observed_peer = false;
+        self.profile_discovered_blocks = false;
         self.prospective_tips = HashSet::new();
         self.missing_block_retry_counts.clear();
         self.transient_block_retry_counts.clear();
@@ -1499,6 +1517,7 @@ where
         let extra_hashes = match extra_hashes {
             Ok(extra_hashes) => extra_hashes,
             Err(error) => {
+                profiles::startup_sync_observation(false);
                 self.trace
                     .round_finish("obtain_tips_error", state_tip, Some(&error));
                 return Err(error);
@@ -1509,6 +1528,7 @@ where
             .tips_obtained(extra_hashes.len(), self.prospective_tips.len());
 
         if let Err(error) = self.sync_round(extra_hashes, header_runtime_status).await {
+            profiles::startup_sync_observation(false);
             self.trace_sync_snapshot("round_error_snapshot", 0);
             self.trace.round_finish(
                 "sync_error",
@@ -1519,6 +1539,13 @@ where
         }
 
         info!("exhausted prospective tip set");
+        profiles::startup_sync_observation(
+            self.profile_observed_peer
+                && !self.profile_discovered_blocks
+                && state_tip.is_some()
+                && state_tip == self.latest_chain_tip.best_tip_height()
+                && self.downloads.in_flight() == 0,
+        );
         self.trace
             .round_finish("exhausted", self.latest_chain_tip.best_tip_height(), None);
 
@@ -2042,6 +2069,9 @@ where
             {
                 Ok(zn::Response::BlockHashes(hashes)) => {
                     trace!(?hashes);
+                    if hashes.len() <= MAX_TIPS_RESPONSE_HASH_COUNT + 1 {
+                        self.profile_observed_peer = true;
+                    }
 
                     // zcashd sometimes appends an unrelated hash at the start
                     // or end of its response.
@@ -2155,6 +2185,7 @@ where
         }
 
         let new_downloads = download_set.len();
+        self.profile_discovered_blocks |= new_downloads != 0;
         debug!(new_downloads, "queueing new downloads");
         metrics::gauge!("sync.obtain.queued.hash.count").set(new_downloads as f64);
 
@@ -2168,6 +2199,34 @@ where
             .record(stage_start.elapsed().as_secs_f64());
 
         Self::handle_hash_response(response, self.expose_peer_addresses).map_err(Into::into)
+    }
+
+    /// Confirm the native sync tip with a fresh peer response without dispatching body work.
+    /// The caller bounds both the network request and state lookups with one timeout.
+    async fn profile_tip_confirmed(&mut self) -> bool {
+        let Some(hash) = self.latest_chain_tip.best_tip_hash() else {
+            return false;
+        };
+        let response = self
+            .tip_network
+            .clone()
+            .oneshot(zn::Request::FindBlocks {
+                known_blocks: vec![hash],
+                stop: None,
+            })
+            .await;
+        let Ok(zn::Response::BlockHashes(hashes)) = response else {
+            return false;
+        };
+        if hashes.len() > MAX_TIPS_RESPONSE_HASH_COUNT + 1 {
+            return false;
+        }
+        for hash in hashes {
+            if !self.state_contains(hash).await.unwrap_or(false) {
+                return false;
+            }
+        }
+        true
     }
 
     /// Limit compatibility downloads to the final checkpoint during initial block-apply ownership.

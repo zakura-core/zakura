@@ -12,6 +12,7 @@ async function api(path) { const response = await fetch(path); if (!response.ok)
 function note(message) { $('notice').textContent = message; $('notice').hidden = !message; }
 function quality(row) {
   if (row.exclusion_reason) return 'Timing excluded';
+  if (row.startup) return 'Startup';
   if (!row.outcome) return 'Unfinished';
   if (row.expired) return 'Detail expired';
   if (row.dropped) return `Truncated · ${number(row.dropped)} omitted`;
@@ -42,6 +43,7 @@ async function refresh() {
     const run = data.runs.find(r=>r.metadata.id===data.run), health = data.health;
     const fresh = health && Date.now()-health.updated_ms<15000, nodeFresh = run && Date.now()-run.seen_ms<10000;
     const notices = [];
+    if (data.startup_pending) notices.push('Node is warming up. Startup blocks are excluded from slow blocks.');
     if (!fresh) notices.push('Collector is offline or its health is stale.');
     if (run && !nodeFresh) notices.push('This node is no longer sending observations.');
     if (health?.errors) notices.push(`${number(health.errors)} collector errors. Detail may be incomplete.`);
@@ -57,8 +59,8 @@ async function openDetail(run,attempt) {
   $('detail').hidden=false; $('detail-title').textContent=`Block ${number(row.height)}`;
   document.title=`Block ${number(row.height)} · Zakura`;
   renderMetadata(row,data.recording);
-  $('detail-warning').hidden=!row.exclusion_reason;
-  $('detail-warning').textContent=row.exclusion_reason ? `Timing excluded from rankings and percentiles. ${row.exclusion_reason} Raw intervals are preserved below and include this interference.` : '';
+  $('detail-warning').hidden=!row.exclusion_reason && !row.startup;
+  $('detail-warning').textContent=row.exclusion_reason ? `Timing excluded from rankings and percentiles. ${row.exclusion_reason} Raw intervals are preserved below and include this interference.` : row.startup ? 'Startup profile · excluded from slow blocks and timing statistics.' : '';
   const timing=data.timing, formatTime=value=>value==null?'Pending':ms(value);
   const metrics=row.exclusion_reason
     ? [['Excluded','Processing time'],[formatTime(timing.recorded_elapsed_us),'Raw recorded elapsed · includes interference']]

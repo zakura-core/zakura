@@ -1,5 +1,67 @@
 use super::*;
 
+#[test]
+fn startup_waits_for_initialization_and_late_workers_then_stays_ready() {
+    let (recorder, _, _) = recorder();
+    for second in 0..=70 {
+        recorder.observe_startup(second * 1_000_000, true);
+    }
+    assert_eq!(recorder.ready_us.load(Ordering::Acquire), u64::MAX);
+    recorder.initialized.store(true, Ordering::Release);
+    let root = begin_with(&recorder, block()).unwrap();
+    let worker = root.context();
+    root.finish(Outcome::Success);
+    for second in 71..=140 {
+        recorder.observe_startup(second * 1_000_000, true);
+    }
+    assert_eq!(recorder.ready_us.load(Ordering::Acquire), u64::MAX);
+    drop(worker);
+    for second in 141..=201 {
+        recorder.observe_startup(second * 1_000_000, true);
+    }
+    assert_eq!(recorder.ready_us.load(Ordering::Acquire), 201_000_000);
+    let _later_block = begin_with(&recorder, block()).unwrap();
+    recorder.observe_startup(202_000_000, false);
+    assert_eq!(recorder.ready_us.load(Ordering::Acquire), 201_000_000);
+}
+
+#[test]
+fn startup_requires_stable_fresh_sync_checks_and_quiet_workers() {
+    let mut gate = StartupGate::default();
+    // Initialization, sync lag, or active finalization all make the observation ineligible.
+    for second in 0..=70 {
+        assert!(!gate.observe(second * 1_000_000, false, 0));
+    }
+    for second in 71..131 {
+        assert!(!gate.observe(second * 1_000_000, true, 0));
+    }
+    assert!(gate.observe(131_000_000, true, 0));
+
+    let mut gate = StartupGate::default();
+    for second in 0..60 {
+        // Work that began and ended between observations must restart the settling period.
+        let activity = if second >= 30 { 30_000_000 } else { 0 };
+        assert!(!gate.observe(second * 1_000_000, true, activity));
+    }
+    for second in 60..90 {
+        assert!(!gate.observe(second * 1_000_000, true, 30_000_000));
+    }
+    assert!(gate.observe(90_000_000, true, 30_000_000));
+}
+
+#[test]
+fn startup_does_not_treat_missing_observations_as_readiness() {
+    let mut gate = StartupGate::default();
+    assert!(!gate.observe(0, true, 0));
+    assert!(!gate.observe(90_000_000, true, 0));
+    assert!(!gate.observe(110_000_000, true, 0));
+    assert!(!gate.observe(120_000_000, false, 0));
+    for second in 121..181 {
+        assert!(!gate.observe(second * 1_000_000, true, 0));
+    }
+    assert!(gate.observe(181_000_000, true, 0));
+}
+
 fn block() -> Block {
     Block {
         hash: [1; 32],

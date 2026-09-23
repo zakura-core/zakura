@@ -58,6 +58,16 @@ enum Command {
         #[arg(long)]
         reason: String,
     },
+    /// Backfill a proven startup boundary for a recording made before automatic readiness.
+    StartupBoundary {
+        #[arg(long)]
+        store: PathBuf,
+        #[arg(long)]
+        run: String,
+        /// First eligible router-entry offset, in microseconds from the run start.
+        #[arg(long)]
+        ready_us: u64,
+    },
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
@@ -100,6 +110,11 @@ async fn main() -> Result<()> {
             attempt,
             reason,
         } => store::exclude_timing(&store, &run, attempt, &reason),
+        Command::StartupBoundary {
+            store,
+            run,
+            ready_us,
+        } => store::startup_boundary(&store, &run, ready_us),
     }
 }
 

@@ -12,7 +12,7 @@ use std::{
     rc::Rc,
     sync::{
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
-        Arc, OnceLock,
+        Arc, Mutex, OnceLock,
     },
     task::{Context as TaskContext, Poll},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -69,6 +69,9 @@ pub struct Run {
     pub monotonic_start_us: Option<u64>,
     /// Maximum anchor acquisition interval. Samples too close to boundaries remain unattributed.
     pub clock_error_us: u64,
+    /// Require a startup readiness boundary before including timings in statistics.
+    #[serde(default)]
+    pub startup_gate: bool,
 }
 
 /// Verification route, kept separate in latency distributions.
@@ -322,7 +325,38 @@ pub enum Frame {
         dropped: u64,
         /// Datagrams not delivered.
         transport_dropped: u64,
+        /// First eligible router-entry offset. Repeated so collector restarts recover it.
+        #[serde(default)]
+        ready_us: Option<u64>,
     },
+}
+
+const STARTUP_SETTLE_US: u64 = 60_000_000;
+const MAX_READINESS_OBSERVATION_GAP_US: u64 = 30_000_000;
+
+#[derive(Default)]
+struct StartupGate {
+    since: Option<u64>,
+    last_observation: Option<u64>,
+}
+
+impl StartupGate {
+    fn observe(&mut self, now: u64, eligible: bool, last_activity: u64) -> bool {
+        if self
+            .last_observation
+            .is_some_and(|last| now.saturating_sub(last) > MAX_READINESS_OBSERVATION_GAP_US)
+        {
+            self.since = None;
+        }
+        self.last_observation = Some(now);
+        if !eligible {
+            self.since = None;
+            return false;
+        }
+        let since = self.since.get_or_insert(now);
+        *since = (*since).max(last_activity);
+        now.saturating_sub(*since) >= STARTUP_SETTLE_US
+    }
 }
 
 struct Recorder {
@@ -333,6 +367,10 @@ struct Recorder {
     active: AtomicUsize,
     dropped: AtomicU64,
     stopped: AtomicBool,
+    initialized: AtomicBool,
+    ready_us: AtomicU64,
+    last_activity_us: AtomicU64,
+    startup: Mutex<StartupGate>,
 }
 
 impl Recorder {
@@ -346,6 +384,27 @@ impl Recorder {
             false
         } else {
             true
+        }
+    }
+    fn observe_startup(&self, now: u64, caught_up: bool) {
+        if self.ready_us.load(Ordering::Acquire) != u64::MAX {
+            return;
+        }
+        let eligible = caught_up
+            && self.initialized.load(Ordering::Acquire)
+            && self.active.load(Ordering::Acquire) == 0;
+        let ready = self
+            .startup
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .observe(now, eligible, self.last_activity_us.load(Ordering::Acquire));
+        if ready
+            && self
+                .ready_us
+                .compare_exchange(u64::MAX, now, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        {
+            tracing::info!(ready_us = now, "block profiling startup complete");
         }
     }
 }
@@ -368,7 +427,10 @@ impl Drop for Attempt {
             },
             true,
         );
-        self.recorder.active.fetch_sub(1, Ordering::Relaxed);
+        self.recorder
+            .last_activity_us
+            .fetch_max(self.recorder.now(), Ordering::Release);
+        self.recorder.active.fetch_sub(1, Ordering::Release);
     }
 }
 
@@ -573,6 +635,31 @@ pub fn enabled() -> bool {
         .is_some_and(|r| !r.stopped.load(Ordering::Relaxed))
 }
 
+/// Mark completion of verifier parameter initialization on the dedicated profiling node.
+pub fn verification_initialized() {
+    if let Some(recorder) = RECORDER.get() {
+        recorder.initialized.store(true, Ordering::Release);
+    }
+}
+
+/// Whether the profiler is still waiting for startup readiness.
+pub fn startup_pending() -> bool {
+    enabled()
+        && RECORDER
+            .get()
+            .is_some_and(|r| r.ready_us.load(Ordering::Acquire) == u64::MAX)
+}
+
+/// Observe a fresh sync check. `caught_up` requires no outstanding discovered blocks.
+/// Readiness latches once initialization and 60 seconds without block work are observed.
+/// Attempt contexts include workers and finalization that outlive the verifier response.
+pub fn startup_sync_observation(caught_up: bool) {
+    let Some(recorder) = RECORDER.get() else {
+        return;
+    };
+    recorder.observe_startup(recorder.now(), caught_up);
+}
+
 /// Report a best-effort handoff that could not recover its attempt context.
 /// It is run-level loss because assigning it to a guessed attempt would be misleading.
 pub fn context_lost() {
@@ -586,6 +673,9 @@ pub fn begin(block: Block) -> Option<Root> {
     begin_with(RECORDER.get()?, block)
 }
 fn begin_with(recorder: &Arc<Recorder>, block: Block) -> Option<Root> {
+    recorder
+        .last_activity_us
+        .fetch_max(recorder.now(), Ordering::Release);
     let id = recorder
         .attempts
         .fetch_add(1, Ordering::Relaxed)
@@ -647,6 +737,26 @@ pub fn start(
     build: String,
     storage: String,
 ) -> std::io::Result<Option<Runtime>> {
+    start_inner(config, network, build, storage, false)
+}
+
+/// Start recording with startup timings excluded until the node reports readiness.
+pub fn start_with_startup_gate(
+    config: &Config,
+    network: String,
+    build: String,
+    storage: String,
+) -> std::io::Result<Option<Runtime>> {
+    start_inner(config, network, build, storage, true)
+}
+
+fn start_inner(
+    config: &Config,
+    network: String,
+    build: String,
+    storage: String,
+    startup_gate: bool,
+) -> std::io::Result<Option<Runtime>> {
     let Some(path) = &config.socket else {
         return Ok(None);
     };
@@ -679,6 +789,7 @@ pub fn start(
         utc_start_ms: micros(utc).saturating_sub(before) / 1000,
         monotonic_start_us: mono.map(|t| t.saturating_sub(before)),
         clock_error_us: after.saturating_sub(before).saturating_add(1),
+        startup_gate,
     };
     RECORDER.set(recorder.clone()).map_err(|_| {
         std::io::Error::new(
@@ -710,6 +821,10 @@ fn recorder() -> (Arc<Recorder>, Receiver<Event>, Receiver<Event>) {
             active: AtomicUsize::new(0),
             dropped: AtomicU64::new(0),
             stopped: AtomicBool::new(false),
+            initialized: AtomicBool::new(false),
+            ready_us: AtomicU64::new(u64::MAX),
+            last_activity_us: AtomicU64::new(0),
+            startup: Mutex::new(StartupGate::default()),
         }),
         detail,
         summary,
@@ -762,6 +877,10 @@ fn export(
                 run: run.clone(),
             });
             // Counts are independent of the fine-detail queue, which may be saturated.
+            let ready_us = match recorder.ready_us.load(Ordering::Acquire) {
+                u64::MAX => None,
+                at => Some(at),
+            };
             send(&Frame::Health {
                 schema: SCHEMA_VERSION,
                 run_id: run.id.clone(),
@@ -769,6 +888,7 @@ fn export(
                 attempts: recorder.attempts.load(Ordering::Relaxed),
                 dropped: recorder.dropped.load(Ordering::Relaxed),
                 transport_dropped: transport_dropped.get(),
+                ready_us,
             });
             health = Instant::now();
         }

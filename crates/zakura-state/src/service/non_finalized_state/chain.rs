@@ -236,7 +236,11 @@ pub struct ChainInner {
     // TODO: move to the transparent section
     //
     /// Partial transparent address index data from `blocks`.
-    pub(super) partial_transparent_transfers: HashMap<transparent::Address, TransparentTransfers>,
+    ///
+    /// Share each address's history across chain snapshots. Updating a block
+    /// clones only the histories for addresses touched by that block.
+    pub(super) partial_transparent_transfers:
+        HashMap<transparent::Address, Arc<TransparentTransfers>>,
 
     // Chain Work
     //
@@ -1521,6 +1525,7 @@ impl Chain {
     /// Callers should also check the finalized state for available UTXOs.
     /// If UTXOs remain unspent when a block is finalized, they are stored in the finalized state,
     /// and removed from the relevant chain(s).
+    #[cfg(test)]
     pub fn unspent_utxos(&self) -> HashMap<transparent::OutPoint, transparent::OrderedUtxo> {
         let mut unspent_utxos = self.created_utxos.clone();
         unspent_utxos.retain(|outpoint, _utxo| !self.spent_utxos.contains_key(outpoint));
@@ -1569,9 +1574,11 @@ impl Chain {
         &'a self,
         addresses: &'a HashSet<transparent::Address>,
     ) -> impl Iterator<Item = &'a TransparentTransfers> {
-        addresses
-            .iter()
-            .flat_map(|address| self.partial_transparent_transfers.get(address))
+        addresses.iter().filter_map(|address| {
+            self.partial_transparent_transfers
+                .get(address)
+                .map(Arc::as_ref)
+        })
     }
 
     /// Returns a tuple of the transparent balance change and the total received funds for
@@ -2171,7 +2178,8 @@ impl
                     .entry(receiving_address)
                     .or_default();
 
-                address_transfers.update_chain_tip_with(&(&outpoint, created_utxo))?;
+                Arc::make_mut(address_transfers)
+                    .update_chain_tip_with(&(&outpoint, created_utxo))?;
             }
         }
 
@@ -2210,7 +2218,8 @@ impl
                     .get_mut(&receiving_address)
                     .expect("block has previously been applied to the chain");
 
-                address_transfers.revert_chain_with(&(&outpoint, created_utxo), position);
+                Arc::make_mut(address_transfers)
+                    .revert_chain_with(&(&outpoint, created_utxo), position);
 
                 // Remove this transfer if it is now empty
                 if address_transfers.is_empty() {
@@ -2282,7 +2291,7 @@ impl
                     .entry(spending_address)
                     .or_default();
 
-                address_transfers.update_chain_tip_with(&(
+                Arc::make_mut(address_transfers).update_chain_tip_with(&(
                     spending_input,
                     spending_tx_hash,
                     spent_output,
@@ -2334,7 +2343,7 @@ impl
                     .get_mut(&receiving_address)
                     .expect("block has previously been applied to the chain");
 
-                address_transfers
+                Arc::make_mut(address_transfers)
                     .revert_chain_with(&(spending_input, spending_tx_hash, spent_output), position);
 
                 // Remove this transfer if it is now empty

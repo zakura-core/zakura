@@ -8,6 +8,10 @@
 #![allow(unknown_lints)]
 #![allow(semicolon_in_expressions_from_macros)]
 #![allow(semicolon_in_expressions_from_non_local_macros)]
+// `construct_uint!` still expands to `*_value` / `std::isize::MAX` helpers that
+// newer nightlies mark deprecated. Cap them here so path-dependent rustdoc
+// builds under `CARGO_BUILD_WARNINGS=deny` stay clean.
+#![allow(deprecated)]
 #![allow(missing_docs)]
 
 use uint::construct_uint;

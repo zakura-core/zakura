@@ -426,7 +426,10 @@ mod tests {
         pow_adjustment_block_span_for_height, POW_ADJUSTMENT_BLOCK_SPAN,
     };
     use zakura_chain::{
-        parameters::testnet::ConfiguredActivationHeights, serialization::ZcashDeserializeInto,
+        parameters::testnet::{
+            ConfiguredActivationHeights, ConfiguredCheckpoints, RegtestParameters,
+        },
+        serialization::ZcashDeserializeInto,
         work::difficulty::ParameterDifficulty,
     };
 
@@ -515,13 +518,19 @@ mod tests {
     fn testnet_template_uses_candidate_spacing_at_blossom() {
         let _init_guard = zakura_test::init();
         const BLOSSOM: u32 = 400_000;
-        let network = Network::new_regtest(
-            ConfiguredActivationHeights {
+        let genesis = Network::new_regtest(Default::default()).genesis_hash();
+        let network = Network::new_regtest(RegtestParameters {
+            activation_heights: ConfiguredActivationHeights {
                 blossom: Some(BLOSSOM),
                 ..Default::default()
-            }
-            .into(),
-        );
+            },
+            // Canopy defaults to Blossom, so the checkpoints must cover the block before it.
+            checkpoints: Some(ConfiguredCheckpoints::HeightsAndHashes(vec![
+                (Height(0), genesis),
+                (Height(BLOSSOM - 1), block::Hash([1; 32])),
+            ])),
+            ..Default::default()
+        });
         assert_eq!(
             last_standard_difficulty_offset(&network, Height(BLOSSOM - 2)),
             600

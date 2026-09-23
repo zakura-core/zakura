@@ -1,11 +1,13 @@
 # Fork-aware headers-only chain engine specification
 
 Status: normative design oracle for the replacement of PR #229<br>
-Version: 1.4<br>
-Date: 2026-07-22<br>
+Version: 1.5<br>
+Date: 2026-09-21<br>
 Scope: Zakura native (v2 P2P) header sync and its integration with Zakura full state
 
 Version 1.4 removes every backward-compatibility surface from this engine. There is exactly one header-sync message set, one codec, one status message, and one supported stream version. The previous native stream version 7, its dual-version negotiation, and the legacy Zcash `getheaders` fallback are not implemented, not served, and not tested. The legacy Zcash P2P stack is out of scope entirely: this engine neither reads, writes, nor changes it.
+
+Version 1.5 makes full-state fork eviction recoverable. Newly accepted branches remain available for extension within the existing full-state fork limit. Atomic block acceptance and reconsideration clear verification markers for evicted bodies while leaving their headers eligible. This adds no wire or disk fields.
 
 ## Document overview
 
@@ -292,7 +294,7 @@ Eligibility reasons are a set, not a single overwritable flag. Permanent reasons
 **LC-FINAL-05 [LS] — Authenticated disk migration.** A released legacy store MUST publish current metadata only in the same atomic batch as its authenticated migration record, witness proof, and required row counts. Formats that lack a network-policy digest MUST migrate only under the fixed Mainnet policy. A stored network-policy digest is diagnostic. A mismatch MUST NOT reject migration by itself. Startup MUST audit source rows under the configured policy before atomically updating the digest. Migration MUST authenticate integrated finality through canonical full state or authenticate headers-only finality through the complete active depth proof. Migration failure MUST leave every legacy row unchanged.
 
 <a id="lc-retain-01"></a>
-**LC-RETAIN-01 [LS] — Fork and node limits.** The engine MUST retain no more than `MAX_NON_FINALIZED_CHAIN_FORKS` eligible candidate tips—the same shared constant that caps full-state non-finalized chains, currently 10—and 65,536 non-finalized DAG nodes. The tip cap MUST be consumed from the same shared `zakura-chain`-level definition as full state, so the header engine can never retain an eligible fork that integrated full state cannot represent. It MUST protect every node on `header_best` and `verified_best` from resource eviction. If integrated-mode verification/finalization stalls and admitting another node would exceed the node cap after all permitted eviction, the engine MUST refuse or stage that admission, retain the current frontiers, and raise an explicit resource-stalled alarm; it MUST NOT evict either protected path or synthesize finality to make room.
+**LC-RETAIN-01 [LS] — Fork and node limits.** The engine MUST retain no more than `MAX_CANDIDATE_TIPS_V1` eligible candidate tips, currently `MAX_NON_FINALIZED_CHAIN_FORKS + 1` (11), and 65,536 non-finalized DAG nodes. The extra header candidate accommodates an independent `header_best` alongside the ten retained full-state forks. When block acceptance or reconsideration evicts a full-state fork, the same atomic transition MUST clear body verification markers for its removed suffix without invalidating the headers. It MUST protect every node on `header_best` and `verified_best` from resource eviction. If integrated-mode verification/finalization stalls and admitting another node would exceed the node cap after all permitted eviction, the engine MUST refuse or stage that admission, retain the current frontiers, and raise an explicit resource-stalled alarm; it MUST NOT evict either protected path or synthesize finality to make room.
 
 **LC-RETAIN-02 [LS] — Deterministic eviction order.** On pressure, the engine MUST remove permanently ineligible subtrees first. It MUST then evict unprotected candidate tips in ascending order of cumulative work, breaking equal-work eviction ties by the smallest raw tip hash. Shared ancestors MUST be removed only when no retained path or validation-context window references them.
 
@@ -730,7 +732,7 @@ The “architecture dependency check” asserts that wallet scanning, FlyClient 
 
 **LC-ACCEPT-04 [LS] — Terminating body-failure handling.** Body-invalid and body-unavailable cases MUST terminate each retry episode in either deterministic reselection or an explicit persistent alarm; neither may produce an infinite silent retry.
 
-**LC-ACCEPT-05 [LS] — Explained parity differences.** The full-state/header differential suite MUST enumerate and explain every intentional difference. Version 1.4 acceptance MUST contain no unresolved design placeholders.
+**LC-ACCEPT-05 [LS] — Explained parity differences.** The full-state/header differential suite MUST enumerate and explain every intentional difference. Version 1.5 acceptance MUST contain no unresolved design placeholders.
 
 ## 8. Implementation oracle and source authority
 
@@ -785,6 +787,6 @@ This table covers every part of the cited Zcash sources that this engine impleme
 
 ### 8.4 Fixed design decisions
 
-This version fixes the following choices: one integrated reusable engine; linear verification of all candidate headers; exactly one native fork-discovery protocol at one supported stream version, with no predecessor compatibility, no fallback header exchange, and no change to the legacy Zcash P2P stack; independent `header_best`, `verified_best`, and `finalized`; exact 256-bit work with 32-byte little-endian wire encoding; Zakura’s greater-raw-tip-hash equal-work policy; integrated finality sourced only from fully verified state; headers-only automatic local finality 1,000 descendants behind `header_best`; an eligible-candidate-tip cap equal to the shared non-finalized fork-cap constant, currently 10; 65,536 non-finalized DAG nodes; body-invalid branch disqualification; body-unavailable selection plus alarm; independent mandatory settled-upgrade pins in every deployment mode as a deliberate strengthening of the Zcash deployment requirement; absolute local checkpoint pins with observable header checks; auxiliary schema 1 and no block-relay message in header sync; and authenticated-only use of VCT/tree-aux metadata.
+This version fixes the following choices: one integrated reusable engine; linear verification of all candidate headers; exactly one native fork-discovery protocol at one supported stream version, with no predecessor compatibility, no fallback header exchange, and no change to the legacy Zcash P2P stack; independent `header_best`, `verified_best`, and `finalized`; exact 256-bit work with 32-byte little-endian wire encoding; Zakura’s greater-raw-tip-hash equal-work policy; integrated finality sourced only from fully verified state; headers-only automatic local finality 1,000 descendants behind `header_best`; an eligible-candidate-tip cap one greater than the shared non-finalized fork-cap constant, currently 11; 65,536 non-finalized DAG nodes; body-invalid branch disqualification; body-unavailable selection plus alarm; independent mandatory settled-upgrade pins in every deployment mode as a deliberate strengthening of the Zcash deployment requirement; absolute local checkpoint pins with observable header checks; auxiliary schema 1 and no block-relay message in header sync; and authenticated-only use of VCT/tree-aux metadata.
 
 Any future change to one of these choices requires a new specification version, explicit migration and compatibility rules, and corresponding updates to the conformance manifest. It is not an implementation detail.

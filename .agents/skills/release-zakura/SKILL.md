@@ -59,9 +59,9 @@ The `Prepare release PR` workflow (`prepare-release-pr.yml`, wrapping
 `scripts/prepare-release.sh` / `make prepare-release`) performs the mechanical
 preparation below for a given tag and opens a draft PR through the release
 bot. Prefer dispatching it, then finish the judgment items it lists in the PR
-body (bump-level review, authoritative end-of-support height, changelog
-curation). The manual steps below remain the fallback and the reference for
-what the automation must produce.
+body (bump-level review, authoritative end-of-support halt height via
+`#zakura-collab` or Dev/Sean, changelog curation). The manual steps below
+remain the fallback and the reference for what the automation must produce.
 
 Name the branch `release/v<version>`. Never use `hotfix/v*` — that namespace
 is reserved for the hotfix release process

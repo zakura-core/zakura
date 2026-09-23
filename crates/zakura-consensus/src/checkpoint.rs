@@ -116,7 +116,7 @@ struct CheckpointReset {
 pub const MAX_QUEUED_BLOCKS_PER_HEIGHT: usize = 4;
 
 /// Returns the deferred pool balance change for a checkpoint block.
-fn deferred_pool_balance_change(
+pub(crate) fn deferred_pool_balance_change(
     height: block::Height,
     network: &Network,
     nsm_value_balance: Option<Amount<NonNegative>>,

@@ -9,6 +9,7 @@ use crate::parameters::{
         constants::POST_NU6_FUNDING_STREAM_NUM_BLOCKS, FundingStreamReceiver,
         FundingStreamRecipient, FundingStreams,
     },
+    Network, NetworkUpgrade,
 };
 
 /// The start height of post-NU6 funding streams on Mainnet as described in [ZIP-1015](https://zips.z.cash/zip-1015).
@@ -198,6 +199,10 @@ lazy_static! {
     /// - [ZIP-1015](https://zips.z.cash/zip-1015)
     /// - [ZIP-214#funding-streams](https://zips.z.cash/zip-0214#funding-streams)
     ///
+    /// ZIP 218 moves the third halving, so the heights listed here are the heights
+    /// before ZIP 218. A height above the NU7 activation height moves to keep its date,
+    /// see [`FundingStreams::with_nu7_adjusted_height_range`].
+    ///
     /// [7.10.1]: https://zips.z.cash/protocol/protocol.pdf#zip214fundingstreams
     pub(crate) static ref FUNDING_STREAMS: Vec<FundingStreams> = vec![
         FundingStreams {
@@ -250,6 +255,11 @@ lazy_static! {
             .into_iter()
             .collect(),
         },
-    ];
-
+    ]
+    .into_iter()
+    .map(|funding_streams| {
+        funding_streams
+            .with_nu7_adjusted_height_range(NetworkUpgrade::Nu7.activation_height(&Network::Mainnet))
+    })
+    .collect();
 }

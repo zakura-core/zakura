@@ -125,7 +125,7 @@ async fn replacement_fences_the_old_publication_and_queued_first_write() {
         let new_fence = new.fence.clone();
         assert!(matches!(
             table.replace(peer.clone(), new),
-            Replaced::Replaced(_)
+            Replacement::Replaced(_)
         ));
         assert!(old_cancel.is_cancelled());
         assert!(old_fence.open().is_none());
@@ -176,7 +176,7 @@ async fn replacement_closes_a_started_exchange_even_after_its_write_finished() {
     let new_cancel = new.cancel.clone();
     assert!(matches!(
         table.replace(peer.clone(), new),
-        Replaced::Refused
+        Replacement::Refused
     ));
     assert!(connection.cancel.is_cancelled());
     assert_eq!(connection.cause.get_or("unset"), UNFINISHED_EXCHANGE);
@@ -217,7 +217,7 @@ async fn an_ended_exchange_or_a_new_connection_allows_replacement() {
         let new_fence = new.fence.clone();
         assert!(matches!(
             table.replace(peer.clone(), new),
-            Replaced::Replaced(_)
+            Replacement::Replaced(_)
         ));
         assert_eq!(old_connection.cancel.is_cancelled(), !ended);
         assert!(!next_connection.cancel.is_cancelled());
@@ -317,13 +317,13 @@ proptest! {
                         old.conn == conn && !old.started.is_empty()
                     });
                     let outcome = table.replace(peers[peer].clone(), session);
-                    prop_assert_eq!(matches!(outcome, Replaced::Refused), expect_refused);
+                    prop_assert_eq!(matches!(outcome, Replacement::Refused), expect_refused);
                     match outcome {
-                        Replaced::Refused => {
+                        Replacement::Refused => {
                             prop_assert!(connections[conn].cancel.is_cancelled());
                         }
-                        Replaced::Inserted => prop_assert!(current[peer].is_none()),
-                        Replaced::Replaced(_) => {
+                        Replacement::Inserted => prop_assert!(current[peer].is_none()),
+                        Replacement::Replaced(_) => {
                             let old = current[peer].take().expect("the table replaced a session");
                             if !old.started.is_empty() {
                                 prop_assert!(connections[old.conn].cancel.is_cancelled());

@@ -45,7 +45,7 @@ mod session_capacity;
 pub(crate) use session_capacity::SessionCapacity;
 
 mod session_table;
-pub(crate) use session_table::{Current, Replaced, SessionKey, SessionTable};
+pub(crate) use session_table::{Current, Replacement, SessionKey, SessionTable};
 
 pub(crate) mod sizing;
 

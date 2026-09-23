@@ -56,7 +56,7 @@ pub(crate) struct Current<S> {
 
 /// The outcome of [`SessionTable::replace`].
 #[derive(Debug)]
-pub(crate) enum Replaced<S> {
+pub(crate) enum Replacement<S> {
     /// The peer had no session.
     Inserted,
     /// The old session was fenced and cancelled.
@@ -97,10 +97,10 @@ impl<S: Clone> SessionTable<S> {
     ///
     /// Under the table lock, retire the old session's fence, then cancel and
     /// replace it.
-    pub(crate) fn replace(&self, peer: ZakuraPeerId, current: Current<S>) -> Replaced<S> {
+    pub(crate) fn replace(&self, peer: ZakuraPeerId, current: Current<S>) -> Replacement<S> {
         let mut table = self.lock();
         let replaced = match table.remove(&peer) {
-            None => Replaced::Inserted,
+            None => Replacement::Inserted,
             Some(old) => {
                 let reusable = old.fence.retire();
                 if !reusable && old.key.conn_id == current.key.conn_id {
@@ -108,10 +108,10 @@ impl<S: Clone> SessionTable<S> {
                     // The connection is closing. The old session's own
                     // teardown removes it.
                     table.insert(peer, old);
-                    return Replaced::Refused;
+                    return Replacement::Refused;
                 }
                 old.cancel.cancel();
-                Replaced::Replaced(old)
+                Replacement::Replaced(old)
             }
         };
         table.insert(peer, current);
@@ -125,12 +125,10 @@ impl<S: Clone> SessionTable<S> {
     /// A stale key, from a session that was already replaced, removes nothing.
     pub(crate) fn remove(&self, peer: &ZakuraPeerId, key: SessionKey) -> Option<Current<S>> {
         let mut table = self.lock();
-        if table.get(peer).is_none_or(|current| current.key != key) {
+        if table.get(peer)?.key != key {
             return None;
         }
-        let removed = table
-            .remove(peer)
-            .expect("the entry was just found under the same lock");
+        let removed = table.remove(peer)?;
         removed.fence.retire();
         removed.cancel.cancel();
         self.changed.send_replace(());

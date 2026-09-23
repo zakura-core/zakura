@@ -22,7 +22,7 @@ use super::{LayoutPlan, RequestPlan, StreamConformance};
 use crate::{
     zakura::{
         regulation::{
-            sizing, Current, Produce, Replaced, ReservationPool, Reservations, Responded,
+            sizing, Current, Produce, Replacement, ReservationPool, Reservations, Responded,
             ResponseCap, ResponseSink, Serve, ServeCapacity, ServeEnd, SessionCapacity, SessionKey,
             SessionTable, SharedReservations, SinkError, SinkProgress, WorkLease, WriterFence,
         },
@@ -381,7 +381,7 @@ impl<A: StreamConformance> Service for LayoutService<A> {
         };
         if matches!(
             shared.table.replace(peer.id.clone(), current),
-            Replaced::Refused
+            Replacement::Refused
         ) {
             return;
         }

@@ -199,9 +199,9 @@ lazy_static! {
     /// - [ZIP-1015](https://zips.z.cash/zip-1015)
     /// - [ZIP-214#funding-streams](https://zips.z.cash/zip-0214#funding-streams)
     ///
-    /// ZIP 218 moves the third halving, so the heights listed here are the heights
-    /// before ZIP 218. A height above the NU7 activation height moves to keep its date,
-    /// see [`FundingStreams::with_nu7_adjusted_height_range`].
+    /// ZIP 218 moves the third halving, so ZIP 214 Revision 3 moves the end of the
+    /// Revision 2 streams there, see [`FundingStreams::with_nu7_adjusted_end_height`].
+    /// The other heights listed here are the heights before ZIP 218.
     ///
     /// [7.10.1]: https://zips.z.cash/protocol/protocol.pdf#zip214fundingstreams
     pub(crate) static ref FUNDING_STREAMS: Vec<FundingStreams> = vec![
@@ -254,12 +254,7 @@ lazy_static! {
             ]
             .into_iter()
             .collect(),
-        },
-    ]
-    .into_iter()
-    .map(|funding_streams| {
-        funding_streams
-            .with_nu7_adjusted_height_range(NetworkUpgrade::Nu7.activation_height(&Network::Mainnet))
-    })
-    .collect();
+        }
+        .with_nu7_adjusted_end_height(NetworkUpgrade::Nu7.activation_height(&Network::Mainnet)),
+    ];
 }

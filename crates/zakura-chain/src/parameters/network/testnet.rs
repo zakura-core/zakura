@@ -20,6 +20,7 @@ use crate::{
             constants::{
                 BLOSSOM_POW_TARGET_SPACING_RATIO, FUNDING_STREAM_RECEIVER_DENOMINATOR,
                 MAX_BLOCK_SUBSIDY, POST_BLOSSOM_HALVING_INTERVAL, PRE_BLOSSOM_HALVING_INTERVAL,
+                REVISION_2_FUNDING_STREAMS_INDEX,
             },
             funding_stream_address_period, scheduled_issuance_zatoshis, FundingStreamReceiver,
             FundingStreamRecipient, FundingStreams, ParameterSubsidy,
@@ -651,8 +652,8 @@ pub struct ParametersBuilder {
     /// Funding streams for this network
     funding_streams: Vec<FundingStreams>,
     /// Whether each funding stream in `funding_streams` inherited its height range from the
-    /// built-in Testnet funding streams. Only inherited ranges move with NU7, see
-    /// [`FundingStreams::with_nu7_adjusted_height_range`].
+    /// built-in Testnet funding streams. Only an inherited Revision 2 range moves with NU7,
+    /// see [`FundingStreams::with_nu7_adjusted_end_height`].
     inherited_funding_stream_ranges: Vec<bool>,
     /// A flag indicating whether to allow changes to fields that affect
     /// the funding stream address period.
@@ -1139,19 +1140,22 @@ impl ParametersBuilder {
             initial_nsm_value_balance,
         };
 
-        // ZIP 218 moves the third halving, and the built-in funding streams end there.
-        // Explicitly configured height ranges stay as configured.
+        // ZIP 218 moves the third halving, and ZIP 214 Revision 3 moves the end of the
+        // Revision 2 streams there. Explicitly configured height ranges stay as configured.
         let nu7_activation = NetworkUpgrade::Nu7
             .activation_height(&Network::new_configured_testnet(parameters.clone()));
-        for (funding_streams, _) in parameters
+        if let Some(funding_streams) = parameters
             .funding_streams
-            .iter_mut()
-            .zip(inherited_funding_stream_ranges)
-            .filter(|(_, is_range_inherited)| *is_range_inherited)
+            .get_mut(REVISION_2_FUNDING_STREAMS_INDEX)
+            .filter(|_| {
+                inherited_funding_stream_ranges
+                    .get(REVISION_2_FUNDING_STREAMS_INDEX)
+                    .is_some_and(|is_range_inherited| *is_range_inherited)
+            })
         {
             *funding_streams = funding_streams
                 .clone()
-                .with_nu7_adjusted_height_range(nu7_activation);
+                .with_nu7_adjusted_end_height(nu7_activation);
         }
 
         parameters

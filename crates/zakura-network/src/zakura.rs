@@ -17,6 +17,8 @@ use crate::{
 
 mod block_sync;
 mod discovery;
+#[cfg(test)]
+mod example_reactor;
 mod handler;
 mod handshake;
 mod header_sync;
@@ -27,6 +29,7 @@ mod regulation;
 pub mod testkit;
 mod trace;
 pub mod transport;
+pub mod wire_codec;
 
 pub use block_sync::*;
 pub use discovery::*;

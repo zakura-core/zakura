@@ -147,6 +147,12 @@ extern crate bitflags;
 /// parameterized by 'a), *not* that the object itself has 'static lifetime.
 pub type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
+/// Records heap use so codec tests can check decoders' allocation bounds.
+#[cfg(test)]
+#[global_allocator]
+static ALLOCATOR: zakura_test::allocations::TrackingAllocator =
+    zakura_test::allocations::TrackingAllocator;
+
 pub mod address_book_peers;
 pub mod config;
 pub mod constants;

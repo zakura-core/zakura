@@ -103,6 +103,17 @@ webhook event, a completion event gets one short retry for the thumbs-up. Hourly
 reconciliation catches missed events, removed reactions, changed policy, and
 interrupted runners. Manual dispatch on `main` rechecks evidence without asking
 Codex for another review.
+
+Withdrawal after a push is asynchronous. The workflow shares one concurrency
+group across PRs, with one running and one pending run. A newer event replaces
+the pending run even when it concerns another PR. For example, a comment on
+PR B can replace a queued withdrawal for PR A after A receives new commits.
+The existing ruleset does not dismiss stale approvals on push, so A's old
+approval can still count until reconciliation withdraws it. Hourly reconciliation
+provides recovery, but it can also be delayed or replaced; there is no guaranteed
+one-hour withdrawal deadline. Human approvals follow the same existing stale
+approval policy.
+
 PR events are not filtered by base branch, and periodic reconciliation includes
 all open PRs. If an approved PR moves away from `main`, the adapter withdraws its
 approval; PRs on other bases cannot receive a new approval.

@@ -1,13 +1,15 @@
 //! The example reactor's tests: its test data, then the generated suites.
 //!
-//! The only hand-written parts are the samples, the value strategy, and the
-//! domain violations. Every other check comes from a suite.
+//! The only hand-written parts are the samples, the value strategy, the
+//! domain violations, and the conformance adapter. Every other check comes
+//! from a suite.
 
 use proptest::prelude::*;
 
 use super::*;
 use crate::zakura::{
     check_frame_filter,
+    testkit::stream_conformance::{stream_conformance_suite, StreamConformance},
     wire_codec::{
         message_suite::{check_layout_carries_family, message_suite, MessageSample, Violation},
         sample::WireSample,
@@ -160,3 +162,47 @@ fn readers_follow_both_layouts() {
     check_frame_filter(&SINGLE);
     check_frame_filter(&PAIRED);
 }
+
+/// The conformance suite's view of the example: exchange `e` asks for the
+/// one item at height `e`.
+#[derive(Debug)]
+struct ExampleConformance;
+
+impl StreamConformance for ExampleConformance {
+    type Message = ExampleMessage;
+
+    fn message(row: &MessageRule, exchange: u32) -> ExampleMessage {
+        let height = Height(exchange);
+        match row.message_type {
+            message_type::STATUS => ExampleMessage::Status {
+                low: height,
+                high: height,
+            },
+            message_type::GET_ITEMS => ExampleMessage::GetItems(range(height, 1)),
+            message_type::ITEM => ExampleMessage::Item {
+                height,
+                bytes: super::exchange::item_bytes(height),
+            },
+            message_type::ITEMS_DONE => ExampleMessage::ItemsDone {
+                start: height,
+                returned: 1,
+            },
+            message_type::RANGE_UNAVAILABLE => ExampleMessage::RangeUnavailable(range(height, 1)),
+            other => unreachable!("the example family has no row {other}"),
+        }
+    }
+
+    fn exchange(message: &ExampleMessage) -> u32 {
+        match message {
+            ExampleMessage::Status { low, .. } => low.0,
+            ExampleMessage::GetItems(range) | ExampleMessage::RangeUnavailable(range) => {
+                range.start.0
+            }
+            ExampleMessage::Item { height, .. } => height.0,
+            ExampleMessage::ItemsDone { start, .. } => start.0,
+        }
+    }
+}
+
+stream_conformance_suite!(single_stream_conformance, SINGLE, ExampleConformance);
+stream_conformance_suite!(paired_stream_conformance, PAIRED, ExampleConformance);

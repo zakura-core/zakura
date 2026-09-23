@@ -498,7 +498,7 @@ impl HostilePeer {
         }
     }
 
-    async fn read_prelude(recv: &mut RecvStream) -> Result<StreamPrelude, BoxError> {
+    pub(crate) async fn read_prelude(recv: &mut RecvStream) -> Result<StreamPrelude, BoxError> {
         let mut bytes = vec![0; 4 + 2 + 2 + 1];
         recv.read_exact(&mut bytes).await?;
         match bytes[8] {
@@ -516,7 +516,10 @@ impl HostilePeer {
         Ok(StreamPrelude::decode(&bytes)?)
     }
 
-    async fn read_frame(recv: &mut RecvStream, max_frame_bytes: u32) -> Result<Frame, BoxError> {
+    pub(crate) async fn read_frame(
+        recv: &mut RecvStream,
+        max_frame_bytes: u32,
+    ) -> Result<Frame, BoxError> {
         let mut header = vec![0; FRAME_HEADER_BYTES];
         recv.read_exact(&mut header).await?;
         let mut reader = std::io::Cursor::new(&header);

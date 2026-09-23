@@ -260,6 +260,16 @@ impl ServeCapacity {
         (budgets.execution.reserved(), budgets.output.granted())
     }
 
+    /// Take every free node execution slot and output byte, so serving
+    /// waits until the returned hold drops.
+    #[cfg(test)]
+    pub(crate) fn hold_node_for_test(&self) -> NodeHold {
+        NodeHold {
+            _execution: self.node_execution.hold_free(),
+            _output: self.node_output.hold_free(),
+        }
+    }
+
     /// Requests served above the advertised limit, within the margin.
     #[cfg(test)]
     pub(crate) fn over_limit_count(&self) -> u64 {
@@ -274,6 +284,14 @@ impl ServeCapacity {
             self.metrics.waiting.load(Ordering::Relaxed),
         )
     }
+}
+
+/// Every node slot and byte a test took. Dropping it releases them.
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct NodeHold {
+    _execution: Vec<crate::zakura::regulation::SlotPermit>,
+    _output: Option<crate::zakura::regulation::OutputGrant>,
 }
 
 /// One peer's execution slots and output bytes.

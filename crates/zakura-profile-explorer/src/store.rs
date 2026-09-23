@@ -599,7 +599,7 @@ impl Reader {
             mode,
             0,
         )?;
-        let outliers = self.rows(&format!("{COLUMNS} WHERE {timings} AND end_us-start_us>=500000 ORDER BY end_us-start_us DESC LIMIT 20"),run,mode,since)?;
+        let outliers = self.rows(&format!("{COLUMNS} WHERE {timings} AND end_us-start_us>=120000 ORDER BY end_us-start_us DESC LIMIT 20"),run,mode,since)?;
         let failures = self.rows(&format!("{COLUMNS} WHERE run=?1 AND mode=?2 AND utc_ms>=?3 AND (outcome IS NULL OR outcome IN ('failed','abandoned')) AND {LATEST_IN_SESSION} ORDER BY utc_ms DESC,attempt DESC LIMIT 20"),run,mode,since)?;
         let counts: Value = self.db.query_row("SELECT count(*),coalesce(sum(outcome='success'),0),coalesce(sum(expected_spans IS NOT NULL AND expected_spans=received_spans AND dropped=0 AND expired=0),0),min(utc_ms),max(utc_ms) FROM attempts WHERE run=? AND mode=? AND utc_ms>=?", params![run,mode,integer(since)?], |r| Ok(json!({"captured":r.get::<_,i64>(0)?,"success":r.get::<_,i64>(1)?,"sealed_detail":r.get::<_,i64>(2)?,"first_ms":r.get::<_,Option<i64>>(3)?,"last_ms":r.get::<_,Option<i64>>(4)?})))?;
         let accepted: i64 = self.db.query_row(

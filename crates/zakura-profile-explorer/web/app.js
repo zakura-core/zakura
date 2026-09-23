@@ -30,7 +30,7 @@ function table(target, rows) {
     const tr = el('tr'), link = el('a',row.height == null ? 'Unknown height' : number(row.height)); link.href = blockUrl(row,target==='results')+cpuSuffix;
     const first = el('td'); first.append(link); tr.append(first);
     const duration = row.end_us == null ? null : row.end_us-row.start_us;
-    tr.append(el('td',row.hash ? `${row.hash.slice(0,12)}…` : '—','hash'),el('td', row.utc_ms ? new Date(row.utc_ms).toLocaleString() : 'Unknown'),el('td',number(row.transactions)),el('td',row.exclusion_reason ? 'Excluded' : duration == null ? 'Pending' : ms(duration),duration >= 500000 ? 'slow' : ''),el('td',quality(row)));
+    tr.append(el('td',row.hash ? `${row.hash.slice(0,12)}…` : '—','hash'),el('td', row.utc_ms ? new Date(row.utc_ms).toLocaleString() : 'Unknown'),el('td',number(row.transactions)),el('td',row.exclusion_reason ? 'Excluded' : duration == null ? 'Pending' : ms(duration),duration >= 120000 ? 'slow' : ''),el('td',quality(row)));
     body.append(tr);
   }
   t.append(body);wrap.append(t);host.append(wrap);

@@ -523,10 +523,11 @@ impl NonFinalizedState {
     /// it had been received first.
     ///
     /// A later call overrides an earlier one. Greater work still wins, so a block with less work
-    /// than the best tip, including a block below another chain tip or a finalized block, leaves
-    /// the state unchanged.
+    /// than the best tip, including a block below another chain tip, an invalidated block, or a
+    /// finalized block, leaves the state unchanged.
     ///
-    /// Returns [`PreciousError::BlockNotFound`] if neither state contains `block_hash`.
+    /// Returns [`PreciousError::BlockNotFound`] if the block is not known to either state.
+    /// Invalidated blocks are known, like Bitcoin Core's block index.
     pub fn precious_block(
         &mut self,
         block_hash: block::Hash,
@@ -538,7 +539,14 @@ impl NonFinalizedState {
             .find(|chain| chain.non_finalized_tip_hash() == block_hash)
             .cloned()
         else {
-            if self.any_chain_contains(&block_hash) || finalized_state.height(block_hash).is_some()
+            let is_invalidated = || {
+                self.invalidated_blocks
+                    .values()
+                    .any(|blocks| blocks.iter().any(|block| block.hash == block_hash))
+            };
+            if self.any_chain_contains(&block_hash)
+                || is_invalidated()
+                || finalized_state.height(block_hash).is_some()
             {
                 return Ok(());
             }

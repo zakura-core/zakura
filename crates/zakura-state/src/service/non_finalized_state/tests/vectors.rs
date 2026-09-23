@@ -1392,9 +1392,9 @@ fn precious_block_overrides_receipt_order_and_later_calls_win() {
     }
 }
 
-/// Greater work still wins, and only unknown hashes are errors.
+/// Greater work still wins, and only unknown hashes are errors, not lower-work or invalidated blocks.
 #[test]
-fn precious_block_ignores_lower_work_and_rejects_unknown_hashes() {
+fn precious_block_ignores_known_blocks_and_rejects_unknown_hashes() {
     let _init_guard = zakura_test::init();
     let network = Network::Mainnet;
     let (mut state, finalized, a, b) = precious_test_state(&network, Some(1), Some(2));
@@ -1409,6 +1409,13 @@ fn precious_block_ignores_lower_work_and_rejects_unknown_hashes() {
         assert!(state.eq_internal_state(&before));
         assert_eq!(state.best_tip().unwrap().1, child.hash());
     }
+
+    // An invalidated block is known, so the request succeeds without changing the state.
+    state.invalidate_block(b.hash()).unwrap();
+    let before = state.clone();
+    state.precious_block(b.hash(), &finalized.db).unwrap();
+    assert!(state.eq_internal_state(&before));
+    assert_eq!(state.best_tip().unwrap().1, child.hash());
 
     let unknown = b.make_fake_child().set_work(1).hash();
     assert!(matches!(

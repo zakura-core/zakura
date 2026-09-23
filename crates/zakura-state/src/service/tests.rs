@@ -3416,3 +3416,28 @@ async fn assert_precious_block_request(header_runtime: bool) {
     assert!(matches!(error, crate::PreciousError::BlockNotFound(hash) if hash == unknown));
     assert_eq!(best_tip(&state), siblings[1].hash());
 }
+
+/// During checkpoint sync the writer defers non-finalized messages, so precious requests fail
+/// immediately instead of waiting for the checkpoint phase to end.
+#[tokio::test(flavor = "multi_thread")]
+async fn precious_block_request_fails_fast_during_checkpoint_sync() {
+    let _init_guard = zakura_test::init();
+    let network = Network::new_regtest(Default::default());
+    let (state, _, _, _) = StateService::new(Config::ephemeral(), &network, Height::MAX, 0)
+        .await
+        .unwrap();
+    assert!(state.block_write_sender.finalized.is_some());
+
+    let error = timeout(
+        Duration::from_secs(1),
+        state.send_precious_block(network.genesis_hash()),
+    )
+    .await
+    .expect("the request is answered without waiting for checkpoint sync")
+    .unwrap()
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        crate::PreciousError::ProcessingCheckpointedBlocks
+    ));
+}

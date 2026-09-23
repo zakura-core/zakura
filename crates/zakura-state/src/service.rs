@@ -1404,9 +1404,17 @@ impl StateService {
     ) -> oneshot::Receiver<Result<(), PreciousError>> {
         let (rsp_tx, rsp_rx) = oneshot::channel();
 
-        let Some(sender) = &self.block_write_sender.non_finalized else {
-            let _ = rsp_tx.send(Err(PreciousError::ProcessingCheckpointedBlocks));
-            return rsp_rx;
+        // The writer defers non-finalized messages until checkpoint sync ends, so fail fast
+        // instead of queueing requests that could wait for the whole checkpoint phase.
+        let sender = match &self.block_write_sender {
+            write::BlockWriteSender {
+                finalized: None,
+                non_finalized: Some(sender),
+            } => sender,
+            _ => {
+                let _ = rsp_tx.send(Err(PreciousError::ProcessingCheckpointedBlocks));
+                return rsp_rx;
+            }
         };
 
         if let Err(tokio::sync::mpsc::error::SendError(error)) =

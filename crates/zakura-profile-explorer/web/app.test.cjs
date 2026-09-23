@@ -109,3 +109,36 @@ test('small durations and pre-block offsets retain microsecond precision',()=>{
   assert.equal(vm.runInContext('ms(-6)',context),'-6 µs');
   assert.equal(vm.runInContext('ms(1200)',context),'1.2 ms');
 });
+
+test('rendered transactions default to longest first and can switch to transaction number',()=>{
+  class Element {
+    constructor(tag){this.tag=tag;this.children=[];this.listeners={};}
+    append(...children){this.children.push(...children);}
+    replaceChildren(...children){this.children=children;}
+    addEventListener(event,callback){this.listeners[event]=callback;}
+    // Like a browser select, use its first option unless explicitly selected.
+    get value(){return this.selected ?? (this.tag==='select'?this.children[0]?.value:'');}
+    set value(value){this.selected=value;}
+  }
+  const document={body:{dataset:{page:'test'}},createElement:tag=>new Element(tag)};
+  const rendering=vm.createContext({URLSearchParams,location:{search:''},document});
+  vm.runInContext(source.slice(0,source.indexOf("if(document.body.dataset.page==='home')")),rendering);
+  const host=new Element('div');
+  const lane=(_span,tag,label)=>{const node=new Element(tag);node.textContent=label;return node;};
+  rendering.renderTransactions(host,[
+    {stage:'transaction',transaction_index:0,start_us:0,end_us:5},
+    {stage:'transaction',transaction_index:1,start_us:10,end_us:30},
+    {stage:'transaction',transaction_index:2,start_us:20,end_us:40},
+  ],lane,'Mainnet');
+  const select=host.children[0].children[1],list=host.children[1];
+  const labels=()=>list.children.map(entry=>entry.children[0].textContent);
+  assert.equal(select.value,'duration');
+  assert.deepEqual(labels(),['Transaction 2','Transaction 3','Transaction 1']);
+  const expanded=list.children[0];expanded.open=true;
+  select.value='number';select.listeners.change();
+  assert.deepEqual(labels(),['Transaction 1','Transaction 2','Transaction 3']);
+  assert.equal(list.children[1],expanded);
+  assert.equal(list.children[1].open,true);
+  select.value='duration';select.listeners.change();
+  assert.deepEqual(labels(),['Transaction 2','Transaction 3','Transaction 1']);
+});

@@ -52,15 +52,18 @@ mod message_type {
     pub(super) const RANGE_UNAVAILABLE: u16 = 5;
 }
 
-/// The sender's servable range, at most four messages at once and one every
-/// 15 seconds after that.
+/// The sender's servable range, sent at most every 30 seconds.
+///
+/// The receiver refills twice as fast, and holds the 20 messages a sender
+/// can queue during a 10-minute outage plus two.
 const STATUS: MessageRule = MessageRule {
     message_type: message_type::STATUS,
     payload: PayloadLen::of::<StatusPayload>(),
     role: MessageRole::Announcement {
         cadence: Cadence {
-            capacity: 4,
+            capacity: 22,
             refill_interval: Duration::from_secs(15),
+            send_interval: Duration::from_secs(30),
         },
     },
 };

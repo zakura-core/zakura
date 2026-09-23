@@ -16,6 +16,7 @@
 use tokio::sync::mpsc;
 
 use super::Frame;
+use crate::zakura::regulation::{PrecheckSlot, ResponsePrecheck};
 use std::sync::{Arc, OnceLock};
 
 /// Why a persistent stream ended before local cancellation.
@@ -44,6 +45,7 @@ impl OrderedStreamFailureCause {
 pub struct FramedRecv {
     receiver: FramedReceiver,
     failure_cause: Option<OrderedStreamFailureCause>,
+    precheck: Option<PrecheckSlot>,
 }
 
 #[derive(Debug)]
@@ -58,6 +60,7 @@ impl FramedRecv {
         Self {
             receiver: FramedReceiver::Plain(receiver),
             failure_cause: None,
+            precheck: None,
         }
     }
 
@@ -65,12 +68,30 @@ impl FramedRecv {
         Self {
             receiver: FramedReceiver::Queued(receiver),
             failure_cause: None,
+            precheck: None,
         }
     }
 
     pub(crate) fn with_failure_cause(mut self, failure_cause: OrderedStreamFailureCause) -> Self {
         self.failure_cause = Some(failure_cause);
         self
+    }
+
+    /// Share the reader's precheck slot, so the service can attach one.
+    pub(crate) fn with_precheck(mut self, precheck: PrecheckSlot) -> Self {
+        self.precheck = Some(precheck);
+        self
+    }
+
+    /// Check every later response header against `precheck` before the
+    /// reader allocates its payload.
+    ///
+    /// Returns false if this stream has no transport reader, such as an
+    /// in-process channel, or if a precheck is already attached.
+    pub(crate) fn attach_precheck(&self, precheck: Arc<dyn ResponsePrecheck>) -> bool {
+        self.precheck
+            .as_ref()
+            .is_some_and(|slot| slot.attach(precheck))
     }
 
     /// Failure of any member, retained through session cancellation for service policy.

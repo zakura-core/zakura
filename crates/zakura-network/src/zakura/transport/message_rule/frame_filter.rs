@@ -3,7 +3,7 @@
 use thiserror::Error;
 
 use super::{MessageRole, MessageRule};
-use crate::zakura::FRAME_HEADER_BYTES;
+use crate::zakura::{regulation::ResponsePrecheck, FRAME_HEADER_BYTES};
 
 /// Why a reader rejected a frame from its header.
 ///
@@ -74,25 +74,44 @@ impl InboundReader {
     }
 }
 
-/// One reader's header check: its stream's table and the reader's end.
+/// One reader's header check: its stream's table, the reader's end, and the
+/// service's response precheck, if the service attached one.
 #[derive(Copy, Clone, Debug)]
-pub(crate) struct FrameFilter {
+pub(crate) struct FrameFilter<'a> {
     rules: Option<&'static [MessageRule]>,
     reader: InboundReader,
+    precheck: Option<&'a dyn ResponsePrecheck>,
 }
 
-impl FrameFilter {
+impl<'a> FrameFilter<'a> {
     pub(crate) const fn new(rules: Option<&'static [MessageRule]>, reader: InboundReader) -> Self {
-        Self { rules, reader }
+        Self {
+            rules,
+            reader,
+            precheck: None,
+        }
+    }
+
+    /// Also check each response header against `precheck`, which bounds it by
+    /// the live reservations.
+    pub(crate) fn with_precheck<'b>(
+        self,
+        precheck: Option<&'b dyn ResponsePrecheck>,
+    ) -> FrameFilter<'b> {
+        FrameFilter {
+            rules: self.rules,
+            reader: self.reader,
+            precheck,
+        }
     }
 
     /// Check a frame header and return the largest frame this reader accepts
     /// for it.
     ///
-    /// The checks run in order: message type, flags, then minimum length. The
-    /// returned cap never exceeds `frame_cap`. The caller rejects a longer frame
-    /// as oversize before it allocates the payload. A stream without a table
-    /// accepts any header up to `frame_cap`.
+    /// The checks run in order: message type, flags, minimum length, then the
+    /// response precheck. The returned cap never exceeds `frame_cap`. The
+    /// caller rejects a longer frame as oversize before it allocates the
+    /// payload. A stream without a table accepts any header up to `frame_cap`.
     pub(crate) fn check_header(
         &self,
         message_type: u16,
@@ -114,6 +133,9 @@ impl FrameFilter {
             return Err(FrameRejection::PayloadTooShort {
                 min: rule.payload.min(),
             });
+        }
+        if let (MessageRole::Response { .. }, Some(precheck)) = (rule.role, self.precheck) {
+            precheck.check(message_type, payload_len)?;
         }
         Ok(frame_cap.min(rule.payload.max().saturating_add(FRAME_HEADER_BYTES)))
     }

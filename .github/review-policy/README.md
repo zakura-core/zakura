@@ -150,16 +150,18 @@ closed PRs require an explicit dispatch if notification delivery is outstanding.
 ## Administrator setup
 
 After this PR is merged, keep `CODEX_APPROVAL_ENABLED` unset or `false` while
-configuring the credentials. No GitHub environment or review-rule changes are
-needed.
+configuring the credentials. Use a protected environment for the App key; no
+review-rule changes are needed.
 
 1. Create a dedicated GitHub App with repository **Pull requests: read and write**
    permission and webhooks disabled. Install it only on `zakura-core/zakura` and
    generate a private key. The App needs no additional permissions beyond the
    mandatory metadata access; do not grant administration access or ruleset bypass.
-2. Under repository **Settings → Secrets and variables → Actions**, add the
-   repository secret `CODEX_APPROVAL_APP_PRIVATE_KEY` with the full PEM key
-   contents. Keep the key in a dedicated Infisical scope and sync it here.
+2. Under repository **Settings → Environments**, create `codex-approval`.
+   Select deployment branches and tags, allow only the **branch** `main`, and
+   leave required reviewers unset. Add `CODEX_APPROVAL_APP_PRIVATE_KEY` as an
+   environment secret with the full PEM key contents. Keep the key in a dedicated
+   Infisical scope and sync it only to this environment, never a repository secret.
    Reuse the existing `SLACK_BOT_TOKEN`; confirm its bot has `chat:write` and
    invite it to **#gh-alerts** if it is not already a member.
 3. On the **Variables** tab, add these repository variables:
@@ -181,8 +183,17 @@ needed.
    and an excluded PR does not. Set the variable back to `false` if validation
    fails. Personal Codex settings and the normal review process stay unchanged.
 
-The key is a repository Actions secret, so no environment approval or branch
-restriction gates access to it. The adapter still checks out trusted `main`.
+The writer job uses `codex-approval`, so its App key is available only to runs
+allowed by the environment's `main` branch restriction. No reviewer approval is
+needed to enter the environment. Checking out `main` alone does not protect a
+repository secret from a different workflow pushed to another branch.
+
+If the key was previously a repository secret, generate a replacement App key,
+update its dedicated Infisical scope and environment secret, and verify the
+environment branch restriction. Delete the repository secret and revoke the old
+key in the App settings. Update any secret sync to target the environment so it
+cannot recreate the repository secret. Keep approval writes disabled until this
+migration is complete.
 The existing `main` ruleset already supplies the one required approval,
 `test success` check, and empty bypass list; leave those settings unchanged.
 

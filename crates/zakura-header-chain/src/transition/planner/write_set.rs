@@ -161,7 +161,17 @@ pub(super) fn derive_plan(
         if effect.is_checkpoint_finality() && finality_append.is_some() {
             // Finality removes ancestors and sibling subtrees. The new anchor is
             // retained, and every remaining header descends from it.
-            graph.view_finalized_frontier().height
+            let anchor_height = graph.view_finalized_frontier().height;
+            debug_assert_eq!(
+                graph
+                    .view_header_nodes()
+                    .into_iter()
+                    .map(|node| node.height)
+                    .min(),
+                Some(anchor_height),
+                "checkpoint finality must leave the anchor as the lowest retained header",
+            );
+            anchor_height
         } else if delete_nodes.is_empty() {
             put_nodes
                 .iter()

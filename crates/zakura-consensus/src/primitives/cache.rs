@@ -21,8 +21,6 @@
 //! [`Fallback`](tower_fallback::Fallback) re-verifies failures singly, and it may not be a verdict
 //! at all — a shut-down batch worker reports the same way. Caching it would reject a valid block.
 
-use zakura_jsonl_trace::block_profile::{self as profiles, verification};
-
 use std::{
     collections::{HashSet, VecDeque},
     future,
@@ -172,11 +170,6 @@ pub(super) trait CachedItem {
     /// items with equal keys have identical verification inputs. [`CacheKey`] derives why a
     /// transaction ID, a sighash and a shielded pool are enough.
     fn cache_key(&self) -> Option<CacheKey>;
-
-    /// Attach observational request context before crossing the service queue.
-    fn start_profile(&mut self) -> verification::Request {
-        verification::Request::default()
-    }
 }
 
 /// What one [`VerifiedBundles::insert`] did, so the caller can report it after releasing the
@@ -439,10 +432,7 @@ where
         Poll::Ready(Ok(()))
     }
 
-    fn call(&mut self, mut item: I) -> Self::Future {
-        let profile = item.start_profile();
-        let guard = profile.guard();
-        let lookup = profile.phase(profiles::Stage::VerificationCache);
+    fn call(&mut self, item: I) -> Self::Future {
         // Copied once here, outside `Fallback`, which clones every request eagerly.
         let key = item.cache_key();
 
@@ -454,19 +444,10 @@ where
                 .contains(&key)
             {
                 metrics::counter!(CACHE_HIT, VERIFIER_LABEL => self.verifier_name).increment(1);
-                drop(lookup);
-                profile.cache(verification::Cache::Hit);
-                profile.finish(verification::Status::Success);
                 return future::ready(Ok(())).boxed();
             }
         }
 
-        drop(lookup);
-        profile.cache(if key.is_some() {
-            verification::Cache::Miss
-        } else {
-            verification::Cache::Bypass
-        });
         metrics::counter!(CACHE_MISS, VERIFIER_LABEL => self.verifier_name).increment(1);
 
         let verified = self.verified.clone();
@@ -477,14 +458,10 @@ where
         let inner_calls = self.inner_calls.clone();
 
         async move {
-            let _guard = guard;
             // Readiness is acquired here rather than in `poll_ready` so that only misses reserve
             // inner capacity. See `poll_ready`.
-            let ready = profile.phase(profiles::Stage::VerificationReady);
             let result = match inner.ready().await {
                 Ok(inner) => {
-                    drop(ready);
-                    profile.submitted();
                     #[cfg(test)]
                     if let Some(key) = key {
                         inner_calls
@@ -495,10 +472,7 @@ where
 
                     inner.call(item).await
                 }
-                Err(error) => {
-                    drop(ready);
-                    Err(error)
-                }
+                Err(error) => Err(error),
             };
 
             // Only successes are recorded: see the module docs.
@@ -511,11 +485,6 @@ where
                 outcome.report(verifier_name);
             }
 
-            profile.finish(if result.is_ok() {
-                verification::Status::Success
-            } else {
-                verification::Status::Failed
-            });
             result
         }
         .boxed()

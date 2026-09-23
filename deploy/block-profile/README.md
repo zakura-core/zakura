@@ -10,18 +10,6 @@ Magnifying glass links beside the block heading and transaction rows open Cipher
 
 The timeline answers where elapsed time went. Continuous CPU sampling is off for normal operation, and normal block pages show stage timings without a CPU section. Keep the sampler stopped and disabled. For a targeted replay, an operator can explicitly run a bounded CPU capture and append `?cpu=1` to the block URL to view its retained stacks. Existing captures remain accessible through this optional view and the profile JSON API. Parallel spans overlap. Shared batches and other blocks can appear in process samples, so neither view claims an exact allocation of CPU milliseconds to one block.
 
-## Shielded verification detail
-
-New profiles include a collapsed Shielded verification section for Sapling, Orchard, and Ironwood. It shows each request's actual cache decision and workload, and links fresh checks to their shared batch. A cache hit skips fresh proof and signature verification. It does not mean that the whole transaction or block was accepted without checking the remaining rules.
-
-The waterfall separates service readiness, admission, synchronous bundle preparation, batch formation, flush scheduling, worker dispatch, key setup where measured, combined **Proofs + signatures**, and result delivery. These are elapsed intervals. Waiting can include other work using the same service or worker pool. The crypto libraries expose proof and signature validation together, so this view does not claim separate measurements for them. Key initialization outside a measured worker is not included in the setup phase.
-
-A shared batch appears once within each participating block, with the same batch ID across those profiles. Its workload can include requests from other blocks or unprofiled callers. The full batch is not charged to each transaction, and shared batch projections do not extend the block header's total recorded time. Overlapping intervals must not be summed. “Last completed” identifies which captured requests finished last, not a proven critical path.
-
-Batch work can begin before the block's own request, so the timeline can extend before the marked block entry. Individual retries after a batch or service failure are distinguished from primary checks. Missing evidence is labeled partial rather than interpreted as zero cost. Older profiles remain readable and say that this verification detail was not recorded. There is no replay requirement when rolling out a new instrumentation version.
-
-The implementation and validation gates are described in [the verification design](../../docs/designs/block-profile-verification.md). CPU sampling remains off.
-
 ## Build and local check
 
 ```sh
@@ -223,3 +211,5 @@ Before broader use, run one disposable pruned Linux node and record its exact ex
 Exercise collector kill/restart, sampler failure, quota exhaustion, pruning during reads, node restart, and clean detach/reattach. Test near-capacity query latency and retention under catch-up load. Local unit tests and synthetic examples do not establish these performance or Linux deployment results. Leave the feature opt-in until the canary meets the targets.
 
 Transaction detail starts collapsed in each block timeline. Expand Transactions, then an individual transaction to inspect its checks, or expand Finalization to inspect its nested elapsed-time breakdown. Public links resolve the newest retained profile for the block.
+
+The experimental shielded verification breakdown has been withdrawn. New recordings use the previous stage instrumentation. The collector retains read compatibility for already stored experimental spans, and the restored timeline hides those additional rows. Historical profile downloads remain intact.

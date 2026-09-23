@@ -7,7 +7,6 @@ use std::{
     pin::Pin,
     task::{Context, Poll},
 };
-use zakura_jsonl_trace::block_profile::{self as profiles, verification};
 
 use futures::{future::BoxFuture, FutureExt};
 use once_cell::sync::Lazy;
@@ -64,7 +63,6 @@ pub struct Item {
     sighash: SigHash,
     /// The key this item's successful verification is remembered under.
     cache_key: CacheKey,
-    profile: verification::Request,
 }
 
 impl Item {
@@ -83,27 +81,11 @@ impl Item {
             bundle,
             sighash,
             cache_key: CacheKey::new(tx_id, sighash.0, ShieldedPool::Sapling),
-            profile: verification::Request::default(),
-        }
-    }
-}
-
-impl Item {
-    fn workload(&self) -> verification::Workload {
-        verification::Workload {
-            spends: u32::try_from(self.bundle.shielded_spends().len()).unwrap_or(u32::MAX),
-            outputs: u32::try_from(self.bundle.shielded_outputs().len()).unwrap_or(u32::MAX),
-            ..Default::default()
         }
     }
 }
 
 impl CachedItem for Item {
-    fn start_profile(&mut self) -> verification::Request {
-        self.profile = verification::Request::new(verification::Pool::Sapling, self.workload());
-        self.profile.clone()
-    }
-
     /// Returns the key this item's successful verification is remembered under.
     ///
     /// The transaction ID commits to the bundle, in both of the forms it takes. A v5 or v6
@@ -144,7 +126,6 @@ impl RequestWeight for Item {
 pub struct Verifier {
     /// A batch verifier for Sapling shielded data.
     batch: BatchValidator,
-    profile: verification::Batch,
 
     /// A channel for broadcasting the verification result of the batch.
     ///
@@ -170,24 +151,13 @@ impl Drop for Verifier {
     fn drop(&mut self) {
         let batch = mem::take(&mut self.batch);
         let tx = mem::take(&mut self.tx);
-        let mut profile = mem::take(&mut self.profile);
-        profile.submitted();
-        profile.dispatch();
 
         // The validation is CPU-intensive; do it on a dedicated thread so it does not block.
         rayon::spawn_fifo(move || {
-            profile.worker_start();
             let (spend_vk, output_vk) = SAPLING.verifying_keys();
-            profile.setup_finished();
 
             // Validate the batch and send the result through the channel.
             let res = batch.validate(&spend_vk, &output_vk, thread_rng());
-            profile.execution_finished();
-            profile.finish(if res {
-                verification::Status::Success
-            } else {
-                verification::Status::Failed
-            });
             let _ = tx.send(Some(res));
         });
     }
@@ -205,12 +175,6 @@ impl Service<BatchControl<Item>> for Verifier {
     fn call(&mut self, req: BatchControl<Item>) -> Self::Future {
         match req {
             BatchControl::Item(item) => {
-                let workload = item.workload();
-                let profile = item.profile;
-                profile.admitted();
-                self.profile
-                    .add(&profile, verification::Pool::Sapling, workload);
-                let preparation = profile.phase(profiles::Stage::VerificationPreparation);
                 let mut rx = self.tx.subscribe();
 
                 let bundle_check = self
@@ -218,14 +182,6 @@ impl Service<BatchControl<Item>> for Verifier {
                     .check_bundle(item.bundle, item.sighash.into())
                     .then_some(())
                     .ok_or(TransactionError::SaplingVerificationFailed);
-                drop(preparation);
-                if bundle_check.is_ok() {
-                    profile.prepared();
-                } else {
-                    // check_bundle can enqueue a subset before reporting failure.
-                    self.profile.mark_partial();
-                    profile.mark_partial();
-                }
 
                 async move {
                     bundle_check.map_err(BoxError::from)?;
@@ -256,25 +212,18 @@ impl Service<BatchControl<Item>> for Verifier {
             BatchControl::Flush => {
                 let batch = mem::take(&mut self.batch);
                 let tx = mem::take(&mut self.tx);
-                let mut profile = mem::take(&mut self.profile);
-                profile.submitted();
 
                 async move {
                     let start = std::time::Instant::now();
-                    profile.dispatch();
                     let spawn_result = tokio::task::spawn_blocking(move || {
-                        profile.worker_start();
                         let (spend_vk, output_vk) = SAPLING.verifying_keys();
-                        profile.setup_finished();
-                        let result = batch.validate(&spend_vk, &output_vk, thread_rng());
-                        profile.execution_finished();
-                        (result, profile)
+                        batch.validate(&spend_vk, &output_vk, thread_rng())
                     })
                     .await;
                     let duration = start.elapsed().as_secs_f64();
 
                     let result_label = match &spawn_result {
-                        Ok((true, _)) => "success",
+                        Ok(true) => "success",
                         _ => "failure",
                     };
                     metrics::histogram!(
@@ -285,18 +234,9 @@ impl Service<BatchControl<Item>> for Verifier {
                     .record(duration);
 
                     // Extract the value before consuming spawn_result
-                    let is_valid = spawn_result.as_ref().ok().map(|(result, _)| *result);
-                    let result = spawn_result
-                        .map(|(result, mut profile)| {
-                            profile.finish(if result {
-                                verification::Status::Success
-                            } else {
-                                verification::Status::Failed
-                            });
-                        })
-                        .map_err(Self::Error::from);
+                    let is_valid = spawn_result.as_ref().ok().copied();
                     let _ = tx.send(is_valid);
-                    result
+                    spawn_result.map(|_| ()).map_err(Self::Error::from)
                 }
                 .boxed()
             }
@@ -310,48 +250,21 @@ pub fn verify_single(
 ) -> Pin<Box<dyn Future<Output = Result<(), Box<dyn std::error::Error + Send + Sync>>> + Send>> {
     async move {
         let mut verifier = Verifier::default();
-        let workload = item.workload();
-        let request = item.profile;
-        request.fallback();
-        request.admitted();
-        verifier
-            .profile
-            .add(&request, verification::Pool::Sapling, workload);
-        let preparation = request.phase(profiles::Stage::VerificationPreparation);
 
         let check = verifier
             .batch
             .check_bundle(item.bundle, item.sighash.into())
             .then_some(())
             .ok_or(TransactionError::SaplingVerificationFailed);
-        drop(preparation);
-        if check.is_err() {
-            verifier.profile.mark_partial();
-            request.mark_partial();
-        }
         check.map_err(BoxError::from)?;
-        let mut profile = mem::take(&mut verifier.profile);
-        request.prepared();
-        profile.submitted();
-        profile.dispatch();
 
-        let (is_valid, mut profile) = tokio::task::spawn_blocking(move || {
-            profile.worker_start();
+        let is_valid = tokio::task::spawn_blocking(move || {
             let (spend_vk, output_vk) = SAPLING.verifying_keys();
 
-            profile.setup_finished();
-            let result =
-                mem::take(&mut verifier.batch).validate(&spend_vk, &output_vk, thread_rng());
-            profile.execution_finished();
-            (result, profile)
+            mem::take(&mut verifier.batch).validate(&spend_vk, &output_vk, thread_rng())
         })
         .await
         .map_err(|_| BoxError::from("Sapling bundle validation thread panicked"))?;
-        profile.finish(if is_valid {
-            verification::Status::Success
-        } else {
-            verification::Status::Failed
-        });
 
         if is_valid {
             Ok(())

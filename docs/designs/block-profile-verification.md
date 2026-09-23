@@ -1,6 +1,6 @@
 # Verification waterfall plan
 
-Status: approved with high confidence by three independent reviewers (measurement, recording/storage, and UI/operations). All three reviewers also approved the integrated implementation with high confidence after cross-review. Deployment remains gated on the validation below. Keep main base d4997d9dd43f269008b85542d708344b9acbb54e, profiling branch only, CPU sampling off, existing 100 GB retention. No replay or rewriting historical timings.
+Status: withdrawn at the user’s request because the display was difficult to parse. The previous instrumentation and explorer view are restored. This document records the discarded design, not the active service.
 
 ## Goal
 

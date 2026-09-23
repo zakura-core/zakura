@@ -7625,7 +7625,6 @@ dependencies = [
  "rand 0.8.6",
  "rayon",
  "serde",
- "serde_json",
  "spandoc",
  "thiserror 2.0.18",
  "tokio",

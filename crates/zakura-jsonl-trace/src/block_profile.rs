@@ -81,7 +81,7 @@ pub struct Run {
     /// Require a startup readiness boundary before including timings in statistics.
     #[serde(default)]
     pub startup_gate: bool,
-    /// Version of the optional shielded verification detail. Zero means unavailable.
+    /// Historical shielded verification detail version. New runs leave this disabled.
     #[serde(default)]
     pub verification_detail_version: u32,
 }
@@ -323,7 +323,7 @@ pub enum Event {
         end_us: u64,
         /// Thread at completion, not proof of exclusive CPU ownership.
         completion_thread: Option<u64>,
-        /// Optional bounded evidence for shielded verification.
+        /// Retained historical verification metadata, no longer emitted.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         verification: Option<verification::Detail>,
     },
@@ -546,14 +546,6 @@ impl Context {
                 | Stage::Halo2Request
                 | Stage::WorkerExecution
                 | Stage::WorkerQueue
-                | Stage::VerificationRequest
-                | Stage::VerificationBatch
-                | Stage::VerificationCache
-                | Stage::VerificationReady
-                | Stage::VerificationAdmission
-                | Stage::VerificationPreparation
-                | Stage::VerificationFormation
-                | Stage::VerificationDelivery
         );
         if fine && attempt.fine_spans.fetch_add(1, Ordering::Relaxed) >= MAX_FINE_SPANS {
             attempt.dropped.fetch_add(1, Ordering::Relaxed);
@@ -571,8 +563,6 @@ impl Context {
             parent: *parent,
             stage,
             transaction_hash: None,
-            verification: None,
-            end_us: None,
             start_us: attempt.recorder.now(),
             finished: false,
         }
@@ -630,8 +620,6 @@ pub struct Span {
     parent: u64,
     stage: Stage,
     transaction_hash: Option<[u8; 32]>,
-    verification: Option<verification::Detail>,
-    end_us: Option<u64>,
     start_us: u64,
     finished: bool,
 }
@@ -642,8 +630,6 @@ impl Default for Span {
             parent: 0,
             stage: Stage::VerifierRequest,
             transaction_hash: None,
-            verification: None,
-            end_us: None,
             start_us: 0,
             finished: true,
         }
@@ -670,9 +656,9 @@ impl Drop for Span {
                     transaction_index: *transaction_index,
                     transaction_hash: self.transaction_hash,
                     start_us: self.start_us,
-                    end_us: self.end_us.unwrap_or_else(|| attempt.recorder.now()),
+                    end_us: attempt.recorder.now(),
                     completion_thread: thread_id(),
-                    verification: self.verification,
+                    verification: None,
                 },
                 false,
             ) {
@@ -884,7 +870,7 @@ fn start_inner(
         monotonic_start_us: mono.map(|t| t.saturating_sub(before)),
         clock_error_us: after.saturating_sub(before).saturating_add(1),
         startup_gate,
-        verification_detail_version: 1,
+        verification_detail_version: 0,
     };
     RECORDER.set(recorder.clone()).map_err(|_| {
         std::io::Error::new(

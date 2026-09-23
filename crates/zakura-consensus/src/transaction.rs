@@ -1510,8 +1510,8 @@ impl AsyncChecks {
     ) {
         let profile = profiles::Context::current();
         self.push(async move {
-            let span = profile.span(stage);
-            span.context().wrap(check).await
+            let _span = profile.span(stage);
+            check.await
         });
     }
 

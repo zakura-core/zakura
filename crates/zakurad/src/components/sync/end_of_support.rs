@@ -28,12 +28,11 @@ pub const ESTIMATED_BLOCKS_PER_DAY: u32 = 24 * 60 * 60 / POST_BLOSSOM_POW_TARGET
 ///
 /// - Zebra will exit with a panic if the current tip height is bigger than the
 ///   `ESTIMATED_RELEASE_HEIGHT` plus this number of days.
-/// - Currently set to 21 days
+/// - Currently set to 30 days
 ///
-/// Note: v1.4.0 is estimated to release at height 3,480,539 (~2026-09-12)
-/// and halts 21 days later at height 3,504,731 (~2026-10-03) — the same
-/// halt block and date as the v1.4.0 release candidates and v1.3.2.
-pub const EOS_PANIC_AFTER: u32 = 21;
+/// Note: v1.5.0 is estimated to release at height 3,494,121 (~2026-09-25)
+/// and halts after height 3,528,681 (~2026-10-25).
+pub const EOS_PANIC_AFTER: u32 = 30;
 
 /// The number of days before the end of support where Zebra will display warnings.
 pub const EOS_WARN_AFTER: u32 = EOS_PANIC_AFTER - 3;

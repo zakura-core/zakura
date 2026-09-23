@@ -73,13 +73,6 @@ impl ContextualMetrics {
     }
 }
 
-fn block_has_transparent_spends(block: &Block) -> bool {
-    block
-        .transactions
-        .iter()
-        .any(|transaction| transaction.spent_outpoints().next().is_some())
-}
-
 /// The state of the chains in memory, including queued blocks.
 ///
 /// Clones of the non-finalized state contain independent copies of the chains.
@@ -694,25 +687,10 @@ impl NonFinalizedState {
             });
         }
 
-        // Avoid cloning the non-finalized UTXO set when this block cannot use it.
-        // Transparent spend validation can read missing UTXOs from disk.
-        // TODO: if those disk reads show up in profiles, run them in parallel.
-        let unspent_utxo_snapshot_start = Instant::now();
-        let unspent_utxos = if block_has_transparent_spends(&prepared.block) {
-            new_chain.unspent_utxos()
-        } else {
-            HashMap::new()
-        };
-        contextual_metrics.record_duration(
-            "state.contextual.unspent_utxo_snapshot.duration_seconds",
-            "state.contextual.mined.unspent_utxo_snapshot.duration_seconds",
-            unspent_utxo_snapshot_start.elapsed(),
-        );
-
         let transparent_spend_start = Instant::now();
         let spent_utxos = check::utxo::transparent_spend(
             &prepared,
-            &unspent_utxos,
+            &new_chain.created_utxos,
             &new_chain.spent_utxos,
             finalized_state,
         );
@@ -721,8 +699,6 @@ impl NonFinalizedState {
             "state.contextual.mined.transparent_spend.duration_seconds",
             transparent_spend_start.elapsed(),
         );
-        // Free the snapshot before the rest of validation clones and extends the chain.
-        drop(unspent_utxos);
         let spent_utxos = spent_utxos?;
 
         // Reads from disk

@@ -1521,6 +1521,7 @@ impl Chain {
     /// Callers should also check the finalized state for available UTXOs.
     /// If UTXOs remain unspent when a block is finalized, they are stored in the finalized state,
     /// and removed from the relevant chain(s).
+    #[cfg(test)]
     pub fn unspent_utxos(&self) -> HashMap<transparent::OutPoint, transparent::OrderedUtxo> {
         let mut unspent_utxos = self.created_utxos.clone();
         unspent_utxos.retain(|outpoint, _utxo| !self.spent_utxos.contains_key(outpoint));

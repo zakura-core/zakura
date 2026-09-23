@@ -54,10 +54,61 @@ fn span() -> Event {
         span: 1,
         parent: 0,
         stage: Stage::WriterOccupied,
+        transaction_index: None,
         start_us: 600000,
         end_us: 800000,
         completion_thread: None,
     }
+}
+
+#[test]
+fn large_transaction_profile_survives_chunking_and_restart() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let mut store = Store::open(temp.path(), 16_000_000)?;
+    store.ingest(metadata())?;
+    store.ingest(event(1, finish()))?;
+    let count = u64::try_from(MAX_CHUNK_EVENTS + 100)?;
+    for first in (1..=count).step_by(MAX_INGEST_BATCH) {
+        let frames = (first..=(first + u64::try_from(MAX_INGEST_BATCH)? - 1).min(count))
+            .map(|id| {
+                event(
+                    id + 1,
+                    Event::Span {
+                        attempt: 1,
+                        span: id,
+                        parent: if id == 1 { 0 } else { 1 },
+                        stage: if id == 1 {
+                            Stage::Transaction
+                        } else {
+                            Stage::TransactionChecks
+                        },
+                        transaction_index: Some(7),
+                        start_us: 200,
+                        end_us: 600000,
+                        completion_thread: None,
+                    },
+                )
+            })
+            .collect();
+        assert_eq!(store.ingest_batch(frames)?, 0);
+    }
+    store.ingest(event(
+        count + 2,
+        Event::Seal {
+            attempt: 1,
+            spans: count,
+            dropped: 0,
+        },
+    ))?;
+    store.flush()?;
+    drop(store);
+    let _reopened = Store::open(temp.path(), 16_000_000)?;
+    let detail = Reader::open(temp.path())?.detail(RUN, 1)?;
+    assert_eq!(detail["complete"], true);
+    let spans = detail["spans"].as_array().unwrap();
+    assert_eq!(spans.len(), usize::try_from(count)?);
+    assert!(spans.iter().all(|span| span["transaction_index"] == 7));
+    Ok(())
 }
 
 #[test]

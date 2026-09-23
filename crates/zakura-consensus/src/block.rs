@@ -593,6 +593,7 @@ where
                 &known_outpoint_hashes,
                 block.transactions.len(),
             );
+            _block_batch_flush.profile_transactions(&transaction_hashes, tx_profile.context());
 
             for (&transaction_hash, transaction) in
                 transaction_hashes.iter().zip(block.transactions.iter())

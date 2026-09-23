@@ -50,6 +50,32 @@ pub(crate) struct BlockVerifierBatchFlushGuard {
     key: BlockVerifierBatchFlushKey,
 }
 
+impl BlockVerifierBatchFlushGuard {
+    /// Associate buffered transaction requests with their position and transaction envelope.
+    pub(crate) fn profile_transactions(
+        &self,
+        hashes: &[zakura_chain::transaction::Hash],
+        profile: profiles::Context,
+    ) {
+        if !profiles::enabled() {
+            return;
+        }
+        let indexes = hashes
+            .iter()
+            .enumerate()
+            .filter_map(|(index, hash)| u32::try_from(index).ok().map(|index| (*hash, index)))
+            .collect();
+        if let Ok(mut entries) = BLOCK_VERIFIER_BATCH_FLUSHES.try_lock() {
+            if let Some(entry) = entries.get_mut(&self.key) {
+                entry.profile = profile;
+                entry.transaction_indexes = indexes;
+            }
+        } else {
+            profiles::context_lost();
+        }
+    }
+}
+
 impl Drop for BlockVerifierBatchFlushGuard {
     fn drop(&mut self) {
         BLOCK_VERIFIER_BATCH_FLUSHES
@@ -66,6 +92,7 @@ struct BlockFlush {
     started_transactions: usize,
     flush_queued: bool,
     profile: profiles::Context,
+    transaction_indexes: HashMap<zakura_chain::transaction::Hash, u32>,
 }
 
 /// Registers a block's transaction verifier batch for one explicit crypto
@@ -84,6 +111,7 @@ pub(crate) fn register_block_verifier_batch_flush<T>(
             BlockFlush {
                 expected_transactions,
                 profile: profiles::Context::current(),
+                transaction_indexes: HashMap::new(),
                 started_transactions: 0,
                 flush_queued: expected_transactions == 0,
             },
@@ -94,7 +122,10 @@ pub(crate) fn register_block_verifier_batch_flush<T>(
 
 /// Recovers context across the transaction buffer without waiting for the registry.
 /// The existing registration guard keeps this Arc identity alive for the block attempt.
-pub(crate) fn block_profile<T>(shared: &Arc<T>) -> profiles::Context {
+pub(crate) fn block_profile<T>(
+    shared: &Arc<T>,
+    hash: &zakura_chain::transaction::Hash,
+) -> profiles::Context {
     if !profiles::enabled() {
         return Default::default();
     }
@@ -104,7 +135,12 @@ pub(crate) fn block_profile<T>(shared: &Arc<T>) -> profiles::Context {
         .and_then(|entries| {
             entries
                 .get(&BlockVerifierBatchFlushKey::new(shared))
-                .map(|entry| entry.profile.clone())
+                .and_then(|entry| {
+                    entry
+                        .transaction_indexes
+                        .get(hash)
+                        .map(|index| entry.profile.for_transaction(*index))
+                })
         });
     if profile.is_none() {
         profiles::context_lost();

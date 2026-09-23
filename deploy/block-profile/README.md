@@ -13,6 +13,7 @@ The timeline answers where elapsed time went. Continuous CPU sampling is off for
 ```sh
 cargo build --release --locked -p zakura -p zakura-profile-explorer
 cargo test --locked -p zakura-jsonl-trace -p zakura-profile-explorer
+node --test crates/zakura-profile-explorer/web/app.test.cjs
 python3 -m unittest discover -s deploy/block-profile -p 'test_*.py'
 ```
 
@@ -55,7 +56,9 @@ Semantic profiles include known-block lookup, block checks, the transaction enve
 
 New semantic recordings split finalization into in-memory chain/fork updates, finalized-block preparation, output indexes, parallel spent-output reads and transaction serialization, address reads, database batch preparation, pruning, commit, and state publication. Batch detail separates block/transaction data, nullifiers, trees, transparent indexes, and value pools. The RocksDB write call is nested inside commit. These spans describe older blocks being finalized by the current writer request, not a second verification of the displayed block. Parent rows include child time, and parallel rows overlap. Older recordings keep their original coarse timing. Upgrade the collector before the node so it understands the additional stage names.
 
-The node holds at most 1,024 active attempt contexts, 16,384 detail events, and 2,048 summary events. Each attempt admits at most 256 spans, with transaction/worker detail limited to 128 so it cannot consume the entire phase budget. Producers use nonblocking queues and never serialize or write files. An exporter thread sends bounded Unix datagrams. A missing collector loses evidence without delaying verification.
+The node holds at most 1,024 active attempt contexts, 131,072 detail events, and 2,048 summary events. Each attempt admits up to 65,536 spans, reserving 128 slots for state phases after transaction/worker detail. This replaces the original 128-span transaction limit. The fixed event queues use less than 64 MiB. Producers use nonblocking queues and never serialize or write files. An exporter thread sends bounded Unix datagrams. A missing collector loses evidence without delaying verification. The larger budget aims to preserve full detail for ordinary blocks, while an extreme block or collection overload can still lose detail and is labeled accordingly. Profile retention continues to use the same 100 GB quota and pruning policy.
+
+New transaction spans carry their zero-based position in the block and their parent span. The explorer displays these as Transaction 1, Transaction 2, and so on, in block order. Each row expands into its own input waits, checks, proof requests, and worker timings. The browser creates check rows only when expanded. Older profiles have no transaction association, so they show transaction totals in recorded start order and keep unassigned checks separate instead of guessing ownership from overlapping times. Omitted historical spans require a replay to recover. Upgrade the collector before the node so it accepts the larger span IDs and preserves transaction indexes.
 
 Root completion is self-contained and separate from detail. A seal is emitted when the last worker/context owner finishes. The collector compares the seal's expected count with retained spans. Queue drops, transport gaps, interrupted attempts, truncation, expired chunks, and collector failures stay visible. A context handoff that cannot acquire the existing transaction registry immediately is omitted and counted as run-level loss.
 
@@ -177,4 +180,4 @@ Before broader use, run one disposable pruned Linux node and record its exact ex
 
 Exercise collector kill/restart, sampler failure, quota exhaustion, pruning during reads, node restart, and clean detach/reattach. Test near-capacity query latency and retention under catch-up load. Local unit tests and synthetic examples do not establish these performance or Linux deployment results. Leave the feature opt-in until the canary meets the targets.
 
-Transaction detail starts collapsed in each block timeline. Click the Transactions row to inspect it, or click Finalization to expand its nested elapsed-time breakdown. A link to a specific attempt selects its recording session, so replay results remain distinct from earlier observations of the same block.
+Transaction detail starts collapsed in each block timeline. Expand Transactions, then an individual transaction to inspect its checks, or expand Finalization to inspect its nested elapsed-time breakdown. Public links resolve the newest retained profile for the block.

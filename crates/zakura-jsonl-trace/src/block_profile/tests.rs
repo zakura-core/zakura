@@ -91,7 +91,7 @@ fn detail_pressure_does_not_displace_completion() {
             ..
         }
     ));
-    assert!(std::mem::size_of::<Event>() * (DETAIL_CAPACITY + SUMMARY_CAPACITY) < 8 * 1024 * 1024);
+    assert!(std::mem::size_of::<Event>() * (DETAIL_CAPACITY + SUMMARY_CAPACITY) < 64 * 1024 * 1024);
 }
 
 #[test]
@@ -176,12 +176,12 @@ fn full_queues_drop_without_waiting() {
 fn transaction_fanout_cannot_displace_writer_phases() {
     let (r, detail, _) = recorder();
     let root = begin_with(&r, block()).unwrap();
-    for _ in 0..1000 {
+    for _ in 0..MAX_FINE_SPANS + 10 {
         drop(root.context().span(Stage::Transaction));
     }
     drop(root.context().span(Stage::WriterOccupied));
     let events: Vec<_> = detail.try_iter().collect();
-    assert_eq!(events.len(), 129);
+    assert_eq!(events.len(), usize::try_from(MAX_FINE_SPANS).unwrap() + 1);
     assert!(matches!(
         events.last(),
         Some(Event::Span {
@@ -233,4 +233,99 @@ fn finalization_children_keep_their_parent_after_caller_completion() {
             ..
         })
     ));
+}
+
+#[test]
+fn overlapping_transactions_keep_indexes_and_parents_across_polls_and_workers() {
+    let (r, detail, summary) = recorder();
+    let root = begin_with(&r, block()).unwrap();
+    let envelope = root.context().span(Stage::Transactions);
+    let first = envelope
+        .context()
+        .for_transaction(0)
+        .span(Stage::Transaction);
+    let second = envelope
+        .context()
+        .for_transaction(1)
+        .span(Stage::Transaction);
+    let late_worker = first.context();
+    let task = |span: Span| async move {
+        let context = span.context();
+        let mut polled = false;
+        context
+            .wrap(std::future::poll_fn(move |cx| {
+                drop(Context::current().span(Stage::TransactionChecks));
+                if polled {
+                    Poll::Ready(())
+                } else {
+                    polled = true;
+                    cx.waker().wake_by_ref();
+                    Poll::Pending
+                }
+            }))
+            .await;
+        drop(span);
+    };
+    futures::executor::block_on(futures::future::join(task(first), task(second)));
+    drop(envelope);
+    root.finish(Outcome::Success);
+    late_worker.in_scope(|| drop(Context::current().span(Stage::WorkerExecution)));
+    drop(late_worker);
+    let events: Vec<_> = detail.try_iter().collect();
+    assert_eq!(events.len(), 8);
+    for event in events {
+        let Event::Span {
+            span,
+            parent,
+            stage,
+            transaction_index,
+            ..
+        } = event
+        else {
+            panic!("detail contains spans");
+        };
+        match stage {
+            Stage::Transactions => assert_eq!((span, parent, transaction_index), (1, 0, None)),
+            Stage::Transaction => assert_eq!(
+                (parent, transaction_index),
+                (1, Some(u32::try_from(span - 2).unwrap()))
+            ),
+            Stage::TransactionChecks | Stage::WorkerExecution => {
+                assert!(parent == 2 || parent == 3);
+                assert_eq!(transaction_index, Some(u32::try_from(parent - 2).unwrap()));
+            }
+            _ => panic!("unexpected stage"),
+        }
+    }
+    assert!(matches!(
+        summary.try_iter().last(),
+        Some(Event::Seal {
+            spans: 8,
+            dropped: 0,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn full_detail_queue_never_blocks_or_loses_the_root_summary() {
+    let (r, detail, summary) = recorder();
+    let started = Instant::now();
+    for _ in 0..3 {
+        let root = begin_with(&r, block()).unwrap();
+        for _ in 0..MAX_SPANS {
+            drop(root.context().span(Stage::BlockChecks));
+        }
+        root.finish(Outcome::Success);
+    }
+    assert_eq!(detail.len(), DETAIL_CAPACITY);
+    assert_eq!(r.dropped.load(Ordering::Relaxed), MAX_SPANS);
+    assert_eq!(
+        summary
+            .try_iter()
+            .filter(|event| matches!(event, Event::Finish { .. }))
+            .count(),
+        3
+    );
+    assert!(started.elapsed() < Duration::from_secs(5));
 }

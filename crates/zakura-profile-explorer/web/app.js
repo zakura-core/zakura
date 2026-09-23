@@ -128,6 +128,46 @@ const finalizationLabels = {
   snapshot_clone: 'Copy state snapshot', header_transition_prepare: 'Prepare header transition'
 };
 const transactionStages = new Set(['transaction','transaction_inputs','transaction_checks','sapling_request','halo2_request','worker_queue','worker_execution']);
+function groupTransactions(spans) {
+  const indexed=new Map(), legacy=[], unassigned=[];
+  for(const span of spans){
+    if(Number.isInteger(span.transaction_index) && span.transaction_index>=0){
+      if(!indexed.has(span.transaction_index))indexed.set(span.transaction_index,{index:span.transaction_index,spans:[],root:null});
+      const group=indexed.get(span.transaction_index);group.spans.push(span);
+      if(span.stage==='transaction')group.root=span;
+    }else if(span.stage==='transaction')legacy.push(span);
+    else unassigned.push(span);
+  }
+  return {groups:[...indexed.values()].sort((a,b)=>a.index-b.index),legacy:legacy.sort((a,b)=>a.start_us-b.start_us),unassigned};
+}
+function onFirstExpand(group,render) {
+  let rendered=false;
+  group.addEventListener('toggle',()=>{if(group.open && !rendered){rendered=true;render();}});
+}
+function renderTransactions(host,spans,lane) {
+  const {groups,legacy,unassigned}=groupTransactions(spans);
+  for(const group of groups){
+    const entry=el('details',null,'timeline-group transaction'),body=el('div',null,'timeline-children');
+    const root=group.root || group.spans.reduce((bounds,span)=>({start_us:Math.min(bounds.start_us,span.start_us),end_us:Math.max(bounds.end_us,span.end_us)}),{start_us:Infinity,end_us:0});
+    entry.append(lane(root,'summary',`Transaction ${number(group.index+1)}`),body);
+    onFirstExpand(entry,()=>{
+      if(!group.root)body.append(el('p','Transaction total was not retained. The bar covers the available checks.','muted'));
+      for(const span of group.spans)if(span!==group.root)body.append(lane(span));
+      if(group.spans.length===1 && group.root)body.append(el('p','No individual check timings were retained.','muted'));
+    });
+    host.append(entry);
+  }
+  if(legacy.length || unassigned.length){
+    host.append(el('p','This older recording did not link checks to transactions. Transaction numbers below follow verification start order.','muted'));
+    legacy.forEach((span,index)=>host.append(lane(span,'div',`Transaction ${number(index+1)}`)));
+    if(unassigned.length){
+      const entry=el('details',null,'timeline-group'),body=el('div',null,'timeline-children');
+      entry.append(el('summary','Unassigned transaction checks'),body);
+      onFirstExpand(entry,()=>{for(const span of unassigned)body.append(lane(span));});host.append(entry);
+    }
+  }
+  if(!spans.length)host.append(el('p','No individual transaction timings were retained.','muted'));
+}
 function renderTimeline(spans,row,start,duration) {
   const host=$('timeline');host.replaceChildren();
   const finalization=spans.find(s=>s.stage==='finalization'), transactions=spans.find(s=>s.stage==='transactions');
@@ -136,7 +176,7 @@ function renderTimeline(spans,row,start,duration) {
   const finalizationIds=new Set();
   function collect(parent,depth=0){if(depth>8)return;for(const span of children.get(parent)||[]){if(finalizationIds.has(span.span))continue;finalizationIds.add(span.span);collect(span.span,depth+1);}}
   if(finalization)collect(finalization.span);
-  const transactionDetail=spans.filter(s=>transactionStages.has(s.stage)&&!finalizationIds.has(s.span));
+  const transactionDetail=spans.filter(s=>(transactionStages.has(s.stage)||s.transaction_index!=null)&&!finalizationIds.has(s.span));
   const transactionIds=new Set(transactionDetail.map(s=>s.span));
   const transactionEntry=transactions||transactionDetail[0];
   function lane(span,tag='div',label=span.stage.replaceAll('_',' ')) {
@@ -156,7 +196,7 @@ function renderTimeline(spans,row,start,duration) {
         summary.append(el('span',`Transactions (${number(row.transactions)})`,'lane-name'),el('span','Group timing not recorded','muted'));
         group.append(summary);
       }
-      if(transactionDetail.length)body.append(...transactionDetail.map(s=>lane(s)));else body.append(el('p','No individual transaction timings were retained.','muted'));
+      onFirstExpand(group,()=>renderTransactions(body,transactionDetail,lane));
       group.append(body);host.append(group);
     }else if(span===finalization){
       const group=el('details',null,'timeline-group finalization'),body=el('div',null,'timeline-children');

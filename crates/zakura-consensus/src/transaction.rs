@@ -455,12 +455,15 @@ where
         let profile = match &req {
             Request::Block {
                 known_outpoint_hashes,
+                transaction_hash,
                 ..
-            } => primitives::block_profile(known_outpoint_hashes),
+            } => primitives::block_profile(known_outpoint_hashes, transaction_hash),
             Request::Mempool { .. } => Default::default(),
         };
+        let transaction_profile = profile.span(profiles::Stage::Transaction);
+        let profile = transaction_profile.context();
         profile.clone().wrap(async move {
-            let _transaction_profile = profile.span(profiles::Stage::Transaction);
+            let _transaction_profile = transaction_profile;
             tracing::trace!(?tx_id, ?req, "got tx verify request");
 
             // Do quick checks first

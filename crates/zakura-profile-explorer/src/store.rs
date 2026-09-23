@@ -286,7 +286,10 @@ impl Store {
                         ..
                     } => {
                         ensure!(
-                            span > 0 && span <= 256 && parent < span && end_us >= start_us,
+                            span > 0
+                                && span <= profiles::MAX_SPANS
+                                && parent < span
+                                && end_us >= start_us,
                             "invalid span"
                         );
                     }

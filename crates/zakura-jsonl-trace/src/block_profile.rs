@@ -25,10 +25,12 @@ use serde::{Deserialize, Serialize};
 pub const SCHEMA_VERSION: u32 = 1;
 /// Maximum simultaneous retained attempt contexts.
 const MAX_ATTEMPTS: usize = 1024;
-/// Fine-detail records per attempt. Summaries use a separate queue.
-const MAX_SPANS: u64 = 256;
-/// Fixed-size event queue slots. Together with summaries and contexts this is below 64 MiB.
-const DETAIL_CAPACITY: usize = 16_384;
+/// Maximum retained spans per attempt, shared with collector validation.
+pub const MAX_SPANS: u64 = 65_536;
+/// Reserve room for state phases after transaction fanout.
+const MAX_FINE_SPANS: u64 = MAX_SPANS - 128;
+/// Fixed-size event queue slots. Detail and summary queue storage stays below 64 MiB.
+const DETAIL_CAPACITY: usize = 131_072;
 const SUMMARY_CAPACITY: usize = 2048;
 
 static RECORDER: OnceLock<Arc<Recorder>> = OnceLock::new();
@@ -265,6 +267,9 @@ pub enum Event {
         parent: u64,
         /// Timing category.
         stage: Stage,
+        /// Zero-based position in the block, absent in older recordings and non-transaction work.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        transaction_index: Option<u32>,
         /// Begin offset.
         start_us: u64,
         /// End offset.
@@ -436,11 +441,11 @@ impl Drop for Attempt {
 
 /// Propagated profiling context. Does not own blocks, transactions, or consensus state.
 #[derive(Clone, Default)]
-pub struct Context(Option<(Arc<Attempt>, u64)>);
+pub struct Context(Option<(Arc<Attempt>, u64, Option<u32>)>);
 impl std::fmt::Debug for Context {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ProfileContext")
-            .field("attempt", &self.0.as_ref().map(|(a, _)| a.id))
+            .field("attempt", &self.0.as_ref().map(|(a, _, _)| a.id))
             .finish()
     }
 }
@@ -448,6 +453,14 @@ impl Context {
     /// Context of the currently executing poll or explicitly entered worker.
     pub fn current() -> Self {
         CURRENT.with(|c| c.borrow().clone())
+    }
+    /// Associate this context and its descendants with a transaction's position in the block.
+    pub fn for_transaction(&self, index: u32) -> Self {
+        Self(
+            self.0
+                .as_ref()
+                .map(|(attempt, parent, _)| (attempt.clone(), *parent, Some(index))),
+        )
     }
     /// Run synchronous work under this context, restoring the previous scope on panic.
     pub fn in_scope<T>(&self, f: impl FnOnce() -> T) -> T {
@@ -470,7 +483,7 @@ impl Context {
     }
     /// Start an elapsed child span. The guard can safely live across await points.
     pub fn span(&self, stage: Stage) -> Span {
-        let Some((attempt, parent)) = &self.0 else {
+        let Some((attempt, parent, transaction_index)) = &self.0 else {
             return Span::default();
         };
         attempt.requested_spans.fetch_add(1, Ordering::Relaxed);
@@ -484,7 +497,7 @@ impl Context {
                 | Stage::WorkerExecution
                 | Stage::WorkerQueue
         );
-        if fine && attempt.fine_spans.fetch_add(1, Ordering::Relaxed) >= 128 {
+        if fine && attempt.fine_spans.fetch_add(1, Ordering::Relaxed) >= MAX_FINE_SPANS {
             attempt.dropped.fetch_add(1, Ordering::Relaxed);
             attempt.recorder.dropped.fetch_add(1, Ordering::Relaxed);
             return Span::default();
@@ -496,7 +509,7 @@ impl Context {
             return Span::default();
         }
         Span {
-            context: Self(Some((attempt.clone(), id))),
+            context: Self(Some((attempt.clone(), id, *transaction_index))),
             parent: *parent,
             stage,
             start_us: attempt.recorder.now(),
@@ -574,13 +587,14 @@ impl Drop for Span {
         if self.finished {
             return;
         }
-        if let Some((attempt, id)) = &self.context.0 {
+        if let Some((attempt, id, transaction_index)) = &self.context.0 {
             if !attempt.recorder.emit(
                 Event::Span {
                     attempt: attempt.id,
                     span: *id,
                     parent: self.parent,
                     stage: self.stage,
+                    transaction_index: *transaction_index,
                     start_us: self.start_us,
                     end_us: attempt.recorder.now(),
                     completion_thread: thread_id(),
@@ -612,7 +626,7 @@ impl Root {
 }
 impl Drop for Root {
     fn drop(&mut self) {
-        if let Some((attempt, _)) = &self.context.0 {
+        if let Some((attempt, _, _)) = &self.context.0 {
             attempt.recorder.emit(
                 Event::Finish {
                     attempt: attempt.id,
@@ -702,6 +716,7 @@ fn begin_with(recorder: &Arc<Recorder>, block: Block) -> Option<Root> {
             dropped: AtomicU64::new(0),
         }),
         0,
+        None,
     )));
     recorder.emit(
         Event::Start {

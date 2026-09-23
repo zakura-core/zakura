@@ -17,7 +17,11 @@ function transactionHash(bytes) {
   return [...bytes].reverse().map(b=>b.toString(16).padStart(2,'0')).join('');
 }
 function explorerLink(url,label) {
-  const link=el('a','↗','explorer-link');link.href=url;link.target='_blank';link.rel='noopener noreferrer';
+  const link=el('a',null,'explorer-link');link.href=url;link.target='_blank';link.rel='noopener noreferrer';
+  const ns='http://www.w3.org/2000/svg',icon=document.createElementNS(ns,'svg'),circle=document.createElementNS(ns,'circle'),handle=document.createElementNS(ns,'path');
+  icon.setAttribute('viewBox','0 0 24 24');icon.setAttribute('aria-hidden','true');icon.setAttribute('focusable','false');
+  circle.setAttribute('cx','10.5');circle.setAttribute('cy','10.5');circle.setAttribute('r','6.5');
+  handle.setAttribute('d','M16 16l5 5');icon.append(circle,handle);link.append(icon);
   link.title=`View ${label} on CipherScan (opens in a new tab)`;link.setAttribute('aria-label',link.title);
   link.addEventListener('click',event=>event.stopPropagation());return link;
 }
@@ -162,6 +166,15 @@ function onFirstExpand(group,render) {
 }
 function renderTransactions(host,spans,lane,network) {
   const {groups,legacy,unassigned}=groupTransactions(spans);
+  const entries=[],list=el('div'),sort=el('select');
+  for(const [value,label] of [['duration','Longest first'],['number','Transaction number']]){
+    const option=el('option',label);option.value=value;sort.append(option);
+  }
+  if(groups.length+legacy.length>1){
+    const controls=el('label',null,'transaction-sort');controls.append(el('span','Sort transactions'),sort);host.append(controls);
+  }
+  if(legacy.length || unassigned.length)host.append(el('p','This older recording did not link checks to transactions. Its transaction numbers reflect verification start order.','muted'));
+  host.append(list);
   for(const group of groups){
     const entry=el('details',null,'timeline-group transaction'),body=el('div',null,'timeline-children');
     const root=group.root || group.spans.reduce((bounds,span)=>({start_us:Math.min(bounds.start_us,span.start_us),end_us:Math.max(bounds.end_us,span.end_us)}),{start_us:Infinity,end_us:0});
@@ -174,16 +187,15 @@ function renderTransactions(host,spans,lane,network) {
       for(const span of group.spans)if(span!==group.root)body.append(lane(span));
       if(group.spans.length===1 && group.root)body.append(el('p','No individual check timings were retained.','muted'));
     });
-    host.append(entry);
+    entries.push({index:group.index,elapsed:root.end_us-root.start_us,node:entry});
   }
-  if(legacy.length || unassigned.length){
-    host.append(el('p','This older recording did not link checks to transactions. Transaction numbers below follow verification start order.','muted'));
-    legacy.forEach((span,index)=>host.append(lane(span,'div',`Transaction ${number(index+1)}`)));
-    if(unassigned.length){
-      const entry=el('details',null,'timeline-group'),body=el('div',null,'timeline-children');
-      entry.append(el('summary','Unassigned transaction checks'),body);
-      onFirstExpand(entry,()=>{for(const span of unassigned)body.append(lane(span));});host.append(entry);
-    }
+  legacy.forEach((span,index)=>entries.push({index,elapsed:span.end_us-span.start_us,node:lane(span,'div',`Transaction ${number(index+1)}`)}));
+  const reorder=()=>list.replaceChildren(...entries.sort((a,b)=>sort.value==='number'?a.index-b.index:b.elapsed-a.elapsed || a.index-b.index).map(entry=>entry.node));
+  sort.addEventListener('change',reorder);reorder();
+  if(unassigned.length){
+    const entry=el('details',null,'timeline-group'),body=el('div',null,'timeline-children');
+    entry.append(el('summary','Unassigned transaction checks'),body);
+    onFirstExpand(entry,()=>{for(const span of unassigned)body.append(lane(span));});host.append(entry);
   }
   if(!spans.length)host.append(el('p','No individual transaction timings were retained.','muted'));
 }

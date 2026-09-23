@@ -238,9 +238,8 @@ pub(crate) const CONSENSUS_BRANCH_IDS: &[(NetworkUpgrade, ConsensusBranchId)] = 
     (Nu6_1, ConsensusBranchId(0x4dec4df0)),
     (Nu6_2, ConsensusBranchId(0x5437f330)),
     (Nu6_3, ConsensusBranchId(0x37a5165b)),
-    // TODO: set below to (Nu7, ConsensusBranchId(0x77190ad8)), once the same value is set in librustzcash
-    #[cfg(any(test, feature = "zakura-test"))]
-    (Nu7, ConsensusBranchId(0xfffffffe)),
+    // The NU7 consensus branch ID from ZIP 259, matching zcash_protocol's `BranchId::Nu7`.
+    (Nu7, ConsensusBranchId(0x77190ad9)),
     #[cfg(zcash_unstable = "zfuture")]
     (ZFuture, ConsensusBranchId(0xfffffffd)),
 ];

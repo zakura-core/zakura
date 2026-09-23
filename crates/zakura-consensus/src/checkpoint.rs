@@ -166,6 +166,10 @@ where
     /// The checkpoint list for this verifier.
     checkpoint_list: Arc<CheckpointList>,
 
+    /// The final checkpoint routed to this verifier. This can precede the list's maximum
+    /// when optional checkpoint sync is disabled.
+    max_checkpoint_height: block::Height,
+
     /// The network rules used by this verifier.
     network: Network,
 
@@ -216,6 +220,7 @@ where
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CheckpointVerifier")
             .field("checkpoint_list", &self.checkpoint_list)
+            .field("max_checkpoint_height", &self.max_checkpoint_height)
             .field("network", &self.network)
             .field("initial_tip_hash", &self.initial_tip_hash)
             .field("queued", &self.queued)
@@ -258,7 +263,13 @@ where
             ?initial_tip,
             "initialising CheckpointVerifier"
         );
-        Self::from_checkpoint_list(checkpoint_list, network, initial_tip, state_service)
+        Self::from_checkpoint_list(
+            checkpoint_list,
+            network,
+            initial_tip,
+            max_height,
+            state_service,
+        )
     }
 
     /// Return a checkpoint verification service using `list`, `network`,
@@ -282,12 +293,15 @@ where
         initial_tip: Option<(block::Height, block::Hash)>,
         state_service: S,
     ) -> Result<Self, VerifyCheckpointError> {
+        let checkpoint_list = Arc::new(
+            CheckpointList::from_list(list).map_err(VerifyCheckpointError::CheckpointList)?,
+        );
+        let max_height = checkpoint_list.max_height();
         Ok(Self::from_checkpoint_list(
-            CheckpointList::from_list(list)
-                .map(Arc::new)
-                .map_err(VerifyCheckpointError::CheckpointList)?,
+            checkpoint_list,
             network,
             initial_tip,
+            max_height,
             state_service,
         ))
     }
@@ -296,6 +310,8 @@ where
     /// `network`, `initial_tip`, and `state_service`.
     ///
     /// Assumes that the provided genesis checkpoint is correct.
+    /// `max_checkpoint_height` must be the checkpoint where the router switches to semantic
+    /// verification. Only its durable commit triggers the state handoff notification.
     ///
     /// Callers should prefer `CheckpointVerifier::new`, which uses the
     /// hard-coded checkpoint lists. See that function for more details.
@@ -303,8 +319,13 @@ where
         checkpoint_list: Arc<CheckpointList>,
         network: &Network,
         initial_tip: Option<(block::Height, block::Hash)>,
+        max_checkpoint_height: block::Height,
         state_service: S,
     ) -> Self {
+        assert!(
+            checkpoint_list.contains(max_checkpoint_height),
+            "the router switches verification at a checkpoint in the list"
+        );
         // All the initialisers should call this function, so we only have to
         // change fields or default values in one place.
         let (initial_tip_hash, verifier_progress) =
@@ -321,6 +342,7 @@ where
 
         let verifier = CheckpointVerifier {
             checkpoint_list,
+            max_checkpoint_height,
             network: network.clone(),
             initial_tip_hash,
             state_service,
@@ -1294,6 +1316,8 @@ where
         // we don't reject the entire checkpoint.
         // Instead, we reset the verifier to the successfully committed state tip.
         let state_service = self.state_service.clone();
+        let handoff_state = (req_block.block.height == self.max_checkpoint_height)
+            .then(|| self.state_service.clone());
         let recovery_state = self.state_service.clone();
         let reset_sender = self.reset_sender.clone();
         let network = self.network.clone();
@@ -1364,6 +1388,32 @@ where
                 {
                     zs::Response::Committed(committed_hash) => {
                         assert_eq!(committed_hash, hash, "state must commit correct hash");
+                        if let Some(state) = handoff_state {
+                            // Retain the notification even if its response times out. A delayed
+                            // buffer worker must still reconcile the already-durable checkpoint.
+                            let handoff = tokio::spawn(async move {
+                                match state.oneshot(zs::Request::CheckCheckpointHandoff).await {
+                                    Ok(zs::Response::CheckpointHandoffChecked) => {
+                                        metrics::counter!("checkpoint.handoff.checked").increment(1);
+                                    }
+                                    result => {
+                                        metrics::counter!("checkpoint.handoff.errors").increment(1);
+                                        tracing::error!(?hash, ?result, "checkpoint committed but handoff notification failed");
+                                    }
+                                }
+                            });
+                            match tokio::time::timeout(std::time::Duration::from_secs(30), handoff).await {
+                                Ok(Ok(())) => {}
+                                Ok(Err(error)) => {
+                                    metrics::counter!("checkpoint.handoff.errors").increment(1);
+                                    tracing::error!(?hash, ?error, "checkpoint committed but handoff notification task failed");
+                                }
+                                Err(_) => {
+                                    metrics::counter!("checkpoint.handoff.timeouts").increment(1);
+                                    tracing::warn!(?hash, "checkpoint committed; handoff notification remains pending after its deadline");
+                                }
+                            }
+                        }
                         Ok(hash)
                     }
                     _ => unreachable!("wrong response for CommitCheckpointVerifiedBlock"),

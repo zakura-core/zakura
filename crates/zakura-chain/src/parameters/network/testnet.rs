@@ -1144,13 +1144,7 @@ impl ParametersBuilder {
         check_lockbox_disbursements(&self.lockbox_disbursements)?;
         check_derived_nsm_seed_schedule(&network)?;
 
-        // Final check that the configured checkpoints are valid for this network.
-        if network.checkpoint_list().hash(Height(0)) != Some(network.genesis_hash()) {
-            return Err(ParametersBuilderError::CheckpointGenesisMismatch);
-        }
-        if network.checkpoint_list().max_height() < network.mandatory_checkpoint_height() {
-            return Err(ParametersBuilderError::InsufficientCheckpointCoverage);
-        }
+        check_checkpoint_coverage(&network)?;
 
         Ok(network)
     }
@@ -1205,6 +1199,19 @@ impl ParametersBuilder {
     }
 }
 
+/// Checks that the trusted checkpoint list starts at genesis and covers blocks that
+/// cannot be verified semantically.
+fn check_checkpoint_coverage(network: &Network) -> Result<(), ParametersBuilderError> {
+    let checkpoints = network.checkpoint_list();
+    if checkpoints.hash(Height(0)) != Some(network.genesis_hash()) {
+        return Err(ParametersBuilderError::CheckpointGenesisMismatch);
+    }
+    if checkpoints.max_height() < network.mandatory_checkpoint_height() {
+        return Err(ParametersBuilderError::InsufficientCheckpointCoverage);
+    }
+    Ok(())
+}
+
 /// A struct of parameters for configuring Regtest in Zebra.
 #[derive(Debug, Default, Clone)]
 pub struct RegtestParameters {
@@ -1214,7 +1221,8 @@ pub struct RegtestParameters {
     pub funding_streams: Option<Vec<ConfiguredFundingStreams>>,
     /// Expected one-time lockbox disbursement outputs in NU6.1 activation block coinbase for Regtest
     pub lockbox_disbursements: Option<Vec<ConfiguredLockboxDisbursement>>,
-    /// Configured checkpointed block heights and hashes.
+    /// Configured checkpointed block heights and hashes, covering the mandatory checkpoint
+    /// before Canopy activation. Omitting this list is valid when Canopy activates at height 1.
     pub checkpoints: Option<ConfiguredCheckpoints>,
     /// Local activation height for the MTP-plus-90-minutes rule.
     pub max_block_time_start_height: Option<Height>,
@@ -1327,6 +1335,9 @@ impl Parameters {
     /// Accepts a [`ConfiguredActivationHeights`].
     ///
     /// Creates an instance of [`Parameters`] with `Regtest` values.
+    ///
+    /// Returns an error if the checkpoints do not match genesis or cover the mandatory
+    /// checkpoint before Canopy activation, or if another parameter is invalid.
     pub fn new_regtest(
         RegtestParameters {
             activation_heights,
@@ -1389,7 +1400,7 @@ impl Parameters {
             ..parameters.finish()
         };
         check_derived_nsm_seed_schedule(&Network::new_configured_testnet(parameters.clone()))?;
-
+        check_checkpoint_coverage(&Network::new_configured_testnet(parameters.clone()))?;
         Ok(parameters)
     }
 

@@ -182,7 +182,9 @@ pub fn check(tip_height: Height, network: &Network) {
 
 #[cfg(test)]
 mod tests {
-    use zakura_chain::parameters::testnet::ConfiguredActivationHeights;
+    use zakura_chain::parameters::testnet::{
+        ConfiguredActivationHeights, ConfiguredCheckpoints, RegtestParameters,
+    };
 
     use super::*;
 
@@ -197,13 +199,19 @@ mod tests {
 
     /// Returns a Regtest network with Blossom at `blossom`.
     fn regtest_with_blossom(blossom: u32) -> Network {
-        Network::new_regtest(
-            ConfiguredActivationHeights {
+        let genesis = Network::new_regtest(Default::default()).genesis_hash();
+        Network::new_regtest(RegtestParameters {
+            activation_heights: ConfiguredActivationHeights {
                 blossom: Some(blossom),
                 ..Default::default()
-            }
-            .into(),
-        )
+            },
+            // Canopy defaults to Blossom, so the checkpoints must cover the block before it.
+            checkpoints: Some(ConfiguredCheckpoints::HeightsAndHashes(vec![
+                (Height(0), genesis),
+                (Height(blossom - 1), zakura_chain::block::Hash([1; 32])),
+            ])),
+            ..Default::default()
+        })
     }
 
     #[test]

@@ -28,12 +28,12 @@ pub const ESTIMATED_BLOCKS_PER_DAY: u32 = 24 * 60 * 60 / POST_BLOSSOM_POW_TARGET
 ///
 /// - Zebra will exit with a panic if the current tip height is bigger than the
 ///   `ESTIMATED_RELEASE_HEIGHT` plus this number of days.
-/// - Currently set to 21 days
+/// - Currently set to 30 days
 ///
-/// Note: v1.4.0 is estimated to release at height 3,480,539 (~2026-09-12)
-/// and halts 21 days later at height 3,504,731 (~2026-10-03) — the same
-/// halt block and date as the v1.4.0 release candidates and v1.3.2.
-pub const EOS_PANIC_AFTER: u32 = 21;
+/// Note: v1.5.0 is planned for 2026-09-23, but its release-height floor is
+/// 3,494,121 (~2026-09-25). This window halts after height 3,528,681
+/// (~2026-10-25), about 32 days after the planned release.
+pub const EOS_PANIC_AFTER: u32 = 30;
 
 /// The number of days before the end of support where Zebra will display warnings.
 pub const EOS_WARN_AFTER: u32 = EOS_PANIC_AFTER - 3;
@@ -230,8 +230,9 @@ mod tests {
         let post_blossom_blocks_per_day = blocks_per_day(NetworkUpgrade::Blossom);
 
         // Blossom activates after the support window.
-        let network =
-            regtest_with_blossom(ESTIMATED_RELEASE_HEIGHT + 30 * pre_blossom_blocks_per_day);
+        let network = regtest_with_blossom(
+            ESTIMATED_RELEASE_HEIGHT + (EOS_PANIC_AFTER + 1) * pre_blossom_blocks_per_day,
+        );
         assert_eq!(
             estimated_height_after_release(&network, EOS_PANIC_AFTER),
             Height(ESTIMATED_RELEASE_HEIGHT + EOS_PANIC_AFTER * pre_blossom_blocks_per_day),

@@ -32,6 +32,7 @@ Keep entries **newest-first**. Each row records:
 
 | Parameter | Location | Old → New | PR | Why |
 | --- | --- | --- | --- | --- |
+| `EOS_PANIC_AFTER` | `crates/zakurad/src/components/sync/end_of_support.rs` | `21` days → `30` days | [#1121](https://github.com/zakura-core/zakura/pull/1121) | With the v1.5.0 release-height floor at 3,494,121, keep Mainnet nodes running through height 3,528,681 (~2026-10-25), about 32 days after the planned September 23 release. Warnings retain their three-day lead. |
 | `MAX_TEMPLATE_BUILDS` | `crates/zakura-rpc/src/methods/types/get_block_template.rs` | unbounded → `1` build across RPC clones | [#1074](https://github.com/zakura-core/zakura/pull/1074) | Bound concurrent coinbase proof work, including long-poll precomputation and cancelled callers. |
 | `TEMPLATE_BUILD_WAIT` | `crates/zakura-rpc/src/methods/types/get_block_template.rs` | new → `30 s` | [#1074](https://github.com/zakura-core/zakura/pull/1074) | Bound waiting for construction capacity without releasing a running proof's slot. |
 | `AT_OR_NEAR_TIP_THRESHOLD` (effective value) | `crates/zakura-chain/src/chain_tip.rs` | `16` blocks → `16` blocks × the post-Blossom spacing ratio at the estimated network tip (`48` blocks after NU7) | [#1066](https://github.com/zakura-core/zakura/pull/1066) | Keep the approximately 20-minute window before legacy peer stall tracking activates when ZIP 218 shortens the target spacing to 25 seconds. |

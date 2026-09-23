@@ -66,6 +66,12 @@ Native block sync requests bodies on that selected header chain. If both headers
 arrive before either body is handed off for verification, the higher-hash branch
 can be the only one whose body reaches the verifier.
 
+Peers also serve retained bodies on the selected header branch. A node can keep
+mining on the earlier block A while serving an equal-work side-fork block B to a
+peer whose header sync selected B. Each response uses one branch snapshot and
+stops if the next selected body is unavailable. It never substitutes a block
+from the node's mining branch at the same height.
+
 A header switch can discard a body that is still downloading or buffered. A block
 already handed off for verification is not cancelled by the switch alone.
 First-received priority starts when the full-block verifier receives the block,

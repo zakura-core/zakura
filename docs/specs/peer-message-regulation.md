@@ -692,6 +692,10 @@ sequential reads rather than retaining the whole response from one contiguous re
 no more than one `Block` for each requested height. It MUST finish with exactly one `BlocksDone`
 or `RangeUnavailable`.
 
+Body ranges follow one snapshot of the selected header branch, including retained side-fork
+bodies when first-received mining chooses a different equal-work tip. The response stops at the
+first unavailable selected body rather than substituting a body from another branch at that height.
+
 Repeated unavailable-range requests still consume lookup work. The receiver MUST bound that work
 even when responses are small and output backpressure does not engage. Continuous requests MUST
 yield shared execution so another runnable peer can progress. Prioritization policy remains

@@ -3180,7 +3180,7 @@ impl Service<ReadRequest> for ReadStateService {
             }
 
             ReadRequest::BlocksByHeightRange { start, count } => {
-                let best_chain = state.latest_best_chain();
+                let snapshot = state.block_range_snapshot()?;
                 let blocks = (0..count)
                     .map_while(|offset| {
                         start
@@ -3188,7 +3188,8 @@ impl Service<ReadRequest> for ReadStateService {
                             .checked_add(offset)
                             .map(block::Height)
                             .and_then(|height| {
-                                read::block_and_size(best_chain.clone(), &state.db, height.into())
+                                snapshot
+                                    .block_and_size(&state.db, height)
                                     .map(|(block, size)| (height, block, size))
                             })
                     })

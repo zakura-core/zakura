@@ -232,11 +232,6 @@ impl VerifyBlockError {
         }
     }
 
-    /// Preserve priority only when the same block may succeed after a local retry.
-    fn retains_retry_receipt(&self) -> bool {
-        receipt::retains_error(self)
-    }
-
     /// Returns a suggested misbehaviour score increment for a certain error.
     pub fn misbehavior_score(&self) -> u32 {
         use VerifyBlockError::*;
@@ -357,13 +352,14 @@ where
         let mut transaction_verifier = self.transaction_verifier.clone();
         let network = self.network.clone();
         let prepared_candidates = self.prepared_candidates.clone();
-        let receipt_orders = self.receipt_orders.clone();
 
         // We don't include the block hash, because it's likely already in a parent span
         let span = tracing::debug_span!("block", height = ?block.coinbase_height());
 
         let receipt_order = receipt.as_ref().map(|receipt| receipt.order);
         async move {
+            // Keep this receipt registered until verification finishes or is cancelled.
+            let _receipt = receipt;
             let preparation_start = request.should_cache().then(std::time::Instant::now);
             // Check that this block is actually a new block.
             tracing::trace!("checking that block is not already in state");
@@ -421,33 +417,45 @@ where
             }
 
             if request.is_mined_commit() {
+                let parent = block.header.previous_block_hash;
+                match state_service
+                    .ready()
+                    .await
+                    .map_err(|source| VerifyBlockError::Depth { source, hash })?
+                    .call(zs::Request::KnownBlock(parent))
+                    .await
+                    .map_err(|source| VerifyBlockError::Depth { source, hash })?
+                {
+                    zs::Response::KnownBlock(Some(_)) => {}
+                    zs::Response::KnownBlock(None) => {
+                        return Err(VerifyBlockError::Commit(
+                            zs::CommitBlockError::MissingMinedParent,
+                        ));
+                    }
+                    _ => unreachable!("wrong response to Request::KnownBlock"),
+                }
+            }
+
+            if request.is_mined_commit() {
                 let solved_header_start = std::time::Instant::now();
                 if let Some(prepared::CachedPreparedCandidate {
                     source,
                     prepared: cached_prepared_block,
                 }) = prepared_candidates.lookup(&block, request.work_id(), &network)
                 {
-                    check::merkle_root_validity(
-                        &network,
-                        &block,
-                        &cached_prepared_block.transaction_hashes,
-                    )?;
-                    if let Some(order) = receipt_order {
-                        receipt_orders.allow_retry(hash, order);
-                    }
-                    // Exclude the parent-state lookup from solved-header timings.
-                    let solved_header_elapsed = solved_header_start.elapsed();
-                    check_mined_parent(&mut state_service, &block, hash).await?;
-                    let solved_header_start = std::time::Instant::now();
                     check::time_is_valid_at(&block.header, Utc::now(), &height, &hash)
                         .map_err(VerifyBlockError::Time)?;
                     for transaction in &block.transactions {
                         tx::check::lock_time_has_passed(transaction, height, block.header.time)
                             .map_err(VerifyBlockError::Transaction)?;
                     }
-                    metrics::histogram!("mining.solved_header_check.duration_seconds").record(
-                        (solved_header_elapsed + solved_header_start.elapsed()).as_secs_f64(),
-                    );
+                    check::merkle_root_validity(
+                        &network,
+                        &block,
+                        &cached_prepared_block.transaction_hashes,
+                    )?;
+                    metrics::histogram!("mining.solved_header_check.duration_seconds")
+                        .record(solved_header_start.elapsed().as_secs_f64());
 
                     let mut prepared_block = cached_prepared_block.as_ref().clone();
                     prepared_block.block = block;
@@ -482,13 +490,6 @@ where
                 block.transactions.iter().map(|t| t.hash()).collect();
 
             check::merkle_root_validity(&network, &block, &transaction_hashes)?;
-
-            if let Some(order) = receipt_order {
-                receipt_orders.allow_retry(hash, order);
-            }
-            if request.is_mined_commit() {
-                check_mined_parent(&mut state_service, &block, hash).await?;
-            }
 
             // Since errors cause an early exit, try to do the
             // quick checks first.
@@ -741,43 +742,8 @@ where
 
             commit_prepared_block(state_service, prepared_block, request.admission()).await
         }
-        .map(move |result: Result<_, VerifyBlockError>| {
-            if let Some(receipt) = receipt {
-                let retryable = result
-                    .as_ref()
-                    .is_err_and(VerifyBlockError::retains_retry_receipt);
-                receipt.finish(retryable);
-            }
-            result
-        })
         .instrument(span)
         .boxed()
-    }
-}
-
-/// Reject mined orphans before transaction verification or optimistic relay.
-async fn check_mined_parent<S>(
-    state_service: &mut S,
-    block: &block::Block,
-    hash: block::Hash,
-) -> Result<(), VerifyBlockError>
-where
-    S: Service<zs::Request, Response = zs::Response, Error = BoxError> + Send + Clone + 'static,
-    S::Future: Send + 'static,
-{
-    match state_service
-        .ready()
-        .await
-        .map_err(|source| VerifyBlockError::Depth { source, hash })?
-        .call(zs::Request::KnownBlock(block.header.previous_block_hash))
-        .await
-        .map_err(|source| VerifyBlockError::Depth { source, hash })?
-    {
-        zs::Response::KnownBlock(Some(_)) => Ok(()),
-        zs::Response::KnownBlock(None) => Err(VerifyBlockError::Commit(
-            zs::CommitBlockError::MissingMinedParent,
-        )),
-        _ => unreachable!("wrong response to Request::KnownBlock"),
     }
 }
 

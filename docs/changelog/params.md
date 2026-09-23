@@ -32,9 +32,6 @@ Keep entries **newest-first**. Each row records:
 
 | Parameter | Location | Old → New | PR | Why |
 | --- | --- | --- | --- | --- |
-| `MAX_RETRY_RECEIPTS` | `crates/zakura-consensus/src/block/receipt.rs` | new → `4096` entries | [#1084](https://github.com/zakura-core/zakura/pull/1084) | Bound receipt metadata retained after transient verification failures and cancellation. |
-| `MAX_RETRY_RECEIPTS_PER_HASH` | `crates/zakura-consensus/src/block/receipt.rs` | new → `4` body variants per header | [#1084](https://github.com/zakura-core/zakura/pull/1084) | Limit one header's share of the retry receipt cache. |
-| `RETRY_RECEIPT_TTL` | `crates/zakura-consensus/src/block/receipt.rs` | new → `1 hour` after the last attempt | [#1084](https://github.com/zakura-core/zakura/pull/1084) | Expire idle retry receipts while preserving priority across transient retries. |
 | `EOS_PANIC_AFTER` | `crates/zakurad/src/components/sync/end_of_support.rs` | `21` days → `30` days | [#1121](https://github.com/zakura-core/zakura/pull/1121) | With the v1.5.0 release-height floor at 3,494,121, keep Mainnet nodes running through height 3,528,681 (~2026-10-25), about 32 days after the planned September 23 release. Warnings retain their three-day lead. |
 | `MAX_TEMPLATE_BUILDS` | `crates/zakura-rpc/src/methods/types/get_block_template.rs` | unbounded → `1` build across RPC clones | [#1074](https://github.com/zakura-core/zakura/pull/1074) | Bound concurrent coinbase proof work, including long-poll precomputation and cancelled callers. |
 | `TEMPLATE_BUILD_WAIT` | `crates/zakura-rpc/src/methods/types/get_block_template.rs` | new → `30 s` | [#1074](https://github.com/zakura-core/zakura/pull/1074) | Bound waiting for construction capacity without releasing a running proof's slot. |

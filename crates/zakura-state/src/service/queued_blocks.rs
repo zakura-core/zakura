@@ -269,7 +269,7 @@ impl QueuedBlocks {
             old.0.block.header.previous_block_hash,
             replacement.0.block.header.previous_block_hash
         );
-        // The queue can retain a body longer than the verifier's retry receipt cache.
+        // A redelivery gets a new verifier receipt once earlier attempts finish.
         if old.0.block == replacement.0.block {
             replacement.0.receipt_order = old.0.receipt_order;
         }

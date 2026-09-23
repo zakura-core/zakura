@@ -117,7 +117,7 @@ fn same_hash_replacement_preserves_receipts_only_for_identical_bodies() -> Resul
         original.0.receipt_order = original_order;
         queue.queue(original);
 
-        // Model a duplicate whose verifier retry receipt has already expired.
+        // Model a redelivery that received a new verifier receipt.
         let mut replacement = replacement_block.clone().into_queued();
         replacement.0.receipt_order = Some(9);
         let old = queue.replace(block.hash(), replacement);

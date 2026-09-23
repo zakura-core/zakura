@@ -7,7 +7,7 @@
 # result with `make pre-release`, and opens or updates a draft PR through the
 # release GitHub App. Nothing merges, tags, or publishes from this workflow:
 # the PR is always a draft, judgment items (bump-level review, authoritative
-# end-of-support height, changelog curation) are listed in the PR body, and
+# end-of-support halt height, changelog curation) are listed in the PR body, and
 # create-release.yml re-validates everything after merge.
 #
 # Re-running with the same tag recreates the release/v* branch from the
@@ -437,6 +437,12 @@ jobs:
                   "crates require initial publish versions."
               )
           lines += [
+              "- [ ] <!-- release-judgment:eos-height --> Validate the "
+              "end-of-support halt height "
+              "(`ESTIMATED_RELEASE_HEIGHT` + `EOS_PANIC_AFTER`) against the "
+              "intended support horizon for this release. Review recent "
+              "discussion in `#zakura-collab` or ask Dev/Sean before checking "
+              "this off.",
               "- [ ] <!-- release-judgment:release-hold --> Confirm no release "
               "hold is in effect (an embargoed hotfix may be in flight for "
               "the same version).",

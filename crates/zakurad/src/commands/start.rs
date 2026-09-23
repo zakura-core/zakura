@@ -626,6 +626,7 @@ impl StartCmd {
 
         info!("initializing verifiers");
         if profiles::enabled() {
+            use zakura_chain::chain_tip::ChainTip;
             let upgrade = zakura_chain::parameters::NetworkUpgrade::current(
                 &config.network.network,
                 latest_chain_tip

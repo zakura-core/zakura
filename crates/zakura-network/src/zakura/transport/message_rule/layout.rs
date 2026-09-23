@@ -87,14 +87,204 @@ pub enum LayoutError {
         /// The row's message type.
         message_type: u16,
     },
-    /// A response names a message type that is not a request row in the layout.
+    /// A subscription sits on a request/response stream, which carries one
+    /// exchange. A subscription outlives it.
+    ///
+    /// This subscription row sits on a request/response stream:
+    ///
+    /// ```compile_fail,E0080
+    /// # use zakura_network::zakura::{
+    /// #     Credit, MessageRole, MessageRule, PayloadLen, Stream, StreamMode,
+    /// # };
+    /// const WATCH: MessageRule = MessageRule {
+    ///     message_type: 1,
+    ///     payload: PayloadLen::exact(8),
+    ///     role: MessageRole::Subscription {
+    ///         max_live: 1,
+    ///         credit: Credit { objects: 16, bytes: 4096 },
+    ///         cursor_history: 16,
+    ///         cadence: None,
+    ///     },
+    /// };
+    /// # const PAGE: MessageRule = MessageRule {
+    /// #     message_type: 2, payload: PayloadLen::between(8, 64),
+    /// #     role: MessageRole::Response { request: 1, ends_exchange: false },
+    /// # };
+    /// # const ENDED: MessageRule = MessageRule {
+    /// #     message_type: 3, payload: PayloadLen::exact(8),
+    /// #     role: MessageRole::Response { request: 1, ends_exchange: true },
+    /// # };
+    /// # const FEED: [Stream; 1] = [Stream {
+    /// #     kind: 64, version: 1, frame_cap: 1024, capability: 1 << 16,
+    /// #     messages: Some(&[WATCH, PAGE, ENDED]),
+    /// #     mode: StreamMode::RequestResponse,
+    /// #     ..Stream::PERSISTENT
+    /// # }];
+    /// # const _: () = Stream::validate_layout(&FEED);
+    /// ```
+    SubscriptionOnRequestResponse {
+        /// The request/response stream.
+        kind: u16,
+        /// The subscription's message type.
+        message_type: u16,
+    },
+    /// A subscription allows no live subscription, so a peer can never open
+    /// one.
+    ///
+    /// This subscription allows none live:
+    ///
+    /// ```compile_fail,E0080
+    /// # use zakura_network::zakura::{Credit, MessageRole, MessageRule, PayloadLen, Stream};
+    /// const WATCH: MessageRule = MessageRule {
+    ///     message_type: 1,
+    ///     payload: PayloadLen::exact(8),
+    ///     role: MessageRole::Subscription {
+    ///         max_live: 0,
+    ///         credit: Credit { objects: 16, bytes: 4096 },
+    ///         cursor_history: 16,
+    ///         cadence: None,
+    ///     },
+    /// };
+    /// # const PAGE: MessageRule = MessageRule {
+    /// #     message_type: 2, payload: PayloadLen::between(8, 64),
+    /// #     role: MessageRole::Response { request: 1, ends_exchange: false },
+    /// # };
+    /// # const ENDED: MessageRule = MessageRule {
+    /// #     message_type: 3, payload: PayloadLen::exact(8),
+    /// #     role: MessageRole::Response { request: 1, ends_exchange: true },
+    /// # };
+    /// # const FEED: [Stream; 1] = [Stream {
+    /// #     kind: 64, version: 1, frame_cap: 1024, capability: 1 << 16,
+    /// #     messages: Some(&[WATCH, PAGE, ENDED]), ..Stream::PERSISTENT
+    /// # }];
+    /// # const _: () = Stream::validate_layout(&FEED);
+    /// ```
+    NoLiveSubscriptions {
+        /// The subscription's message type.
+        message_type: u16,
+    },
+    /// A subscription's credit is zero in objects or bytes, so no page can
+    /// ever be sent.
+    ///
+    /// This subscription grants no bytes:
+    ///
+    /// ```compile_fail,E0080
+    /// # use zakura_network::zakura::{Credit, MessageRole, MessageRule, PayloadLen, Stream};
+    /// const WATCH: MessageRule = MessageRule {
+    ///     message_type: 1,
+    ///     payload: PayloadLen::exact(8),
+    ///     role: MessageRole::Subscription {
+    ///         max_live: 1,
+    ///         credit: Credit { objects: 16, bytes: 0 },
+    ///         cursor_history: 16,
+    ///         cadence: None,
+    ///     },
+    /// };
+    /// # const PAGE: MessageRule = MessageRule {
+    /// #     message_type: 2, payload: PayloadLen::between(8, 64),
+    /// #     role: MessageRole::Response { request: 1, ends_exchange: false },
+    /// # };
+    /// # const ENDED: MessageRule = MessageRule {
+    /// #     message_type: 3, payload: PayloadLen::exact(8),
+    /// #     role: MessageRole::Response { request: 1, ends_exchange: true },
+    /// # };
+    /// # const FEED: [Stream; 1] = [Stream {
+    /// #     kind: 64, version: 1, frame_cap: 1024, capability: 1 << 16,
+    /// #     messages: Some(&[WATCH, PAGE, ENDED]), ..Stream::PERSISTENT
+    /// # }];
+    /// # const _: () = Stream::validate_layout(&FEED);
+    /// ```
+    EmptyCredit {
+        /// The subscription's message type.
+        message_type: u16,
+    },
+    /// A subscription's cursor history holds fewer pages than its object
+    /// credit, so the publisher could forget a page the subscriber may still
+    /// acknowledge.
+    ///
+    /// This cursor history is one page short of the credit:
+    ///
+    /// ```compile_fail,E0080
+    /// # use zakura_network::zakura::{Credit, MessageRole, MessageRule, PayloadLen, Stream};
+    /// const WATCH: MessageRule = MessageRule {
+    ///     message_type: 1,
+    ///     payload: PayloadLen::exact(8),
+    ///     role: MessageRole::Subscription {
+    ///         max_live: 1,
+    ///         credit: Credit { objects: 16, bytes: 4096 },
+    ///         cursor_history: 15,
+    ///         cadence: None,
+    ///     },
+    /// };
+    /// # const PAGE: MessageRule = MessageRule {
+    /// #     message_type: 2, payload: PayloadLen::between(8, 64),
+    /// #     role: MessageRole::Response { request: 1, ends_exchange: false },
+    /// # };
+    /// # const ENDED: MessageRule = MessageRule {
+    /// #     message_type: 3, payload: PayloadLen::exact(8),
+    /// #     role: MessageRole::Response { request: 1, ends_exchange: true },
+    /// # };
+    /// # const FEED: [Stream; 1] = [Stream {
+    /// #     kind: 64, version: 1, frame_cap: 1024, capability: 1 << 16,
+    /// #     messages: Some(&[WATCH, PAGE, ENDED]), ..Stream::PERSISTENT
+    /// # }];
+    /// # const _: () = Stream::validate_layout(&FEED);
+    /// ```
+    ShortCursorHistory {
+        /// The subscription's message type.
+        message_type: u16,
+    },
+    /// No response row is a page of a subscription: every row that answers
+    /// it ends the exchange. [`MessageRole::Subscription`] shows a failing
+    /// declaration.
+    SubscriptionWithoutPages {
+        /// The subscription's message type.
+        message_type: u16,
+    },
+    /// A page's smallest payload exceeds its subscription's byte credit, so
+    /// the page can never be sent.
+    ///
+    /// This page needs more bytes than the credit holds:
+    ///
+    /// ```compile_fail,E0080
+    /// # use zakura_network::zakura::{Credit, MessageRole, MessageRule, PayloadLen, Stream};
+    /// const WATCH: MessageRule = MessageRule {
+    ///     message_type: 1,
+    ///     payload: PayloadLen::exact(8),
+    ///     role: MessageRole::Subscription {
+    ///         max_live: 1,
+    ///         credit: Credit { objects: 16, bytes: 4096 },
+    ///         cursor_history: 16,
+    ///         cadence: None,
+    ///     },
+    /// };
+    /// # const PAGE: MessageRule = MessageRule {
+    /// #     message_type: 2, payload: PayloadLen::between(8192, 8192),
+    /// #     role: MessageRole::Response { request: 1, ends_exchange: false },
+    /// # };
+    /// # const ENDED: MessageRule = MessageRule {
+    /// #     message_type: 3, payload: PayloadLen::exact(8),
+    /// #     role: MessageRole::Response { request: 1, ends_exchange: true },
+    /// # };
+    /// # const FEED: [Stream; 1] = [Stream {
+    /// #     kind: 64, version: 1, frame_cap: 1024, capability: 1 << 16,
+    /// #     messages: Some(&[WATCH, PAGE, ENDED]), ..Stream::PERSISTENT
+    /// # }];
+    /// # const _: () = Stream::validate_layout(&FEED);
+    /// ```
+    PageAboveCredit {
+        /// The page's message type.
+        message_type: u16,
+    },
+    /// A response names a message type that is not a request or subscription
+    /// row in the layout.
     ResponseWithoutRequest {
         /// The response's message type.
         message_type: u16,
     },
-    /// No response row ends a request's exchange.
+    /// No response row ends a request's or a subscription's exchange.
     RequestWithoutEnding {
-        /// The request's message type.
+        /// The request's or subscription's message type.
         message_type: u16,
     },
 }
@@ -132,10 +322,24 @@ impl LayoutError {
             Self::CapacityBelowStall { .. } => {
                 "each cadence holds every message a conformant sender queues during an outage"
             }
-            Self::ResponseWithoutRequest { .. } => {
-                "each response answers a request row in its layout"
+            Self::SubscriptionOnRequestResponse { .. } => {
+                "a subscription sits on a persistent stream"
             }
-            Self::RequestWithoutEnding { .. } => "each request has a response row that ends it",
+            Self::NoLiveSubscriptions { .. } => "each subscription allows one live at least",
+            Self::EmptyCredit { .. } => "each subscription grants nonzero object and byte credit",
+            Self::ShortCursorHistory { .. } => {
+                "each subscription's cursor history covers its object credit"
+            }
+            Self::SubscriptionWithoutPages { .. } => {
+                "each subscription has a response row that does not end it"
+            }
+            Self::PageAboveCredit { .. } => "each page's smallest payload fits its byte credit",
+            Self::ResponseWithoutRequest { .. } => {
+                "each response answers a request or subscription row in its layout"
+            }
+            Self::RequestWithoutEnding { .. } => {
+                "each request and subscription has a response row that ends it"
+            }
         }
     }
 }
@@ -155,12 +359,18 @@ impl fmt::Display for LayoutError {
             | Self::EmptyCadence { message_type }
             | Self::RefillNotFasterThanSender { message_type }
             | Self::CapacityBelowStall { message_type }
+            | Self::NoLiveSubscriptions { message_type }
+            | Self::EmptyCredit { message_type }
+            | Self::ShortCursorHistory { message_type }
+            | Self::SubscriptionWithoutPages { message_type }
+            | Self::PageAboveCredit { message_type }
             | Self::ResponseWithoutRequest { message_type }
             | Self::RequestWithoutEnding { message_type } => {
                 write!(f, " (message type {message_type})")
             }
             Self::PayloadAboveFrameCap { kind, message_type }
-            | Self::AnnouncementOnRequestResponse { kind, message_type } => {
+            | Self::AnnouncementOnRequestResponse { kind, message_type }
+            | Self::SubscriptionOnRequestResponse { kind, message_type } => {
                 write!(f, " (stream kind {kind}, message type {message_type})")
             }
         }
@@ -252,11 +462,17 @@ impl Stream {
     /// - each row's largest frame fits its stream's frame cap;
     /// - a request/response stream carries no announcement;
     /// - each request allows an exchange in flight;
+    /// - each subscription sits on a persistent stream, allows a live
+    ///   subscription, grants nonzero credit, and remembers a cursor for every
+    ///   object of credit ([`MessageRole::Subscription`]);
     /// - each cadence admits a message, refills faster than its sender sends,
     ///   and holds every message a conformant sender queues during an outage
     ///   ([`Cadence`]);
-    /// - each response answers a request row of the layout, which may sit on
-    ///   another stream, and each request has a response row that ends it.
+    /// - each response answers a request or subscription row of the layout,
+    ///   which may sit on another stream, and each request has a response row
+    ///   that ends it;
+    /// - each subscription has a page row, a response row that does not end
+    ///   it, and each page's smallest payload fits the byte credit.
     pub const fn check_layout(layout: &[Stream]) -> Result<(), LayoutError> {
         let Some(first) = layout.first() else {
             return Err(LayoutError::Empty);
@@ -341,15 +557,62 @@ const fn check_stream(layout: &[Stream], stream: &Stream) -> Result<(), LayoutEr
                         return Err(error);
                     }
                 }
-                if !has_ending(layout, message_type) {
+                if !has_response(layout, message_type, true) {
                     return Err(LayoutError::RequestWithoutEnding { message_type });
                 }
             }
-            MessageRole::Response { request, .. } => {
-                if !is_request(layout, request) {
-                    return Err(LayoutError::ResponseWithoutRequest { message_type });
+            MessageRole::Subscription {
+                max_live,
+                credit,
+                cursor_history,
+                cadence,
+            } => {
+                if matches!(stream.mode, StreamMode::RequestResponse) {
+                    return Err(LayoutError::SubscriptionOnRequestResponse {
+                        kind: stream.kind,
+                        message_type,
+                    });
+                }
+                if max_live == 0 {
+                    return Err(LayoutError::NoLiveSubscriptions { message_type });
+                }
+                if credit.objects == 0 || credit.bytes == 0 {
+                    return Err(LayoutError::EmptyCredit { message_type });
+                }
+                if cursor_history < credit.objects {
+                    return Err(LayoutError::ShortCursorHistory { message_type });
+                }
+                if let Some(cadence) = cadence {
+                    if let Err(error) = check_cadence(message_type, cadence) {
+                        return Err(error);
+                    }
+                }
+                if !has_response(layout, message_type, false) {
+                    return Err(LayoutError::SubscriptionWithoutPages { message_type });
+                }
+                if !has_response(layout, message_type, true) {
+                    return Err(LayoutError::RequestWithoutEnding { message_type });
                 }
             }
+            MessageRole::Response {
+                request,
+                ends_exchange,
+            } => match find_row(layout, request) {
+                Some(MessageRule {
+                    role: MessageRole::Request { .. },
+                    ..
+                }) => {}
+                Some(MessageRule {
+                    role: MessageRole::Subscription { credit, .. },
+                    ..
+                }) => {
+                    // Widening u32 to usize is lossless on supported targets.
+                    if !ends_exchange && row.payload.min() > credit.bytes as usize {
+                        return Err(LayoutError::PageAboveCredit { message_type });
+                    }
+                }
+                _ => return Err(LayoutError::ResponseWithoutRequest { message_type }),
+            },
         }
         index += 1;
     }
@@ -373,7 +636,7 @@ const fn check_cadence(message_type: u16, cadence: Cadence) -> Result<(), Layout
 
 /// Visit every row of every stream in `layout`.
 ///
-/// `const fn` cannot take closures, so the three queries below share this
+/// `const fn` cannot take closures, so the queries below share this
 /// cursor instead of a visitor.
 struct Rows<'a> {
     layout: &'a [Stream],
@@ -417,27 +680,28 @@ const fn count_rows(layout: &[Stream], message_type: u16) -> usize {
     count
 }
 
-/// Whether `message_type` is a request row in `layout`.
-const fn is_request(layout: &[Stream], message_type: u16) -> bool {
+/// The row of `message_type` in `layout`.
+const fn find_row(layout: &[Stream], message_type: u16) -> Option<MessageRule> {
     let mut rows = Rows::new(layout);
     while let Some(row) = rows.next() {
-        if row.message_type == message_type && matches!(row.role, MessageRole::Request { .. }) {
-            return true;
+        if row.message_type == message_type {
+            return Some(row);
         }
     }
-    false
+    None
 }
 
-/// Whether a response row in `layout` ends the exchange of `request`.
-const fn has_ending(layout: &[Stream], request: u16) -> bool {
+/// Whether a response row in `layout` answers `request` and ends its exchange
+/// exactly when `ends` is true.
+const fn has_response(layout: &[Stream], request: u16, ends: bool) -> bool {
     let mut rows = Rows::new(layout);
     while let Some(row) = rows.next() {
         if let MessageRole::Response {
             request: answered,
-            ends_exchange: true,
+            ends_exchange,
         } = row.role
         {
-            if answered == request {
+            if answered == request && ends_exchange == ends {
                 return true;
             }
         }

@@ -218,7 +218,7 @@ impl<C: Clock> CadenceBuckets<C> {
 fn cadence(rule: &MessageRule) -> Option<Cadence> {
     match rule.role {
         MessageRole::Announcement { cadence } => Some(cadence),
-        MessageRole::Request { cadence, .. } => cadence,
+        MessageRole::Request { cadence, .. } | MessageRole::Subscription { cadence, .. } => cadence,
         MessageRole::Response { .. } => None,
     }
 }

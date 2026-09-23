@@ -664,16 +664,18 @@ class RulesTests(unittest.TestCase):
         adapter.check_rules(self.api, POLICY)
         self.assertEqual(self.rules, before)
 
-    def test_missing_approval_test_gate_or_bypass_stops_approval(self):
-        for change in ("approval", "ci", "bypass", "evaluate"):
+    def test_ruleset_without_admin_only_bypass_field_is_supported(self):
+        del self.full["bypass_actors"]
+        adapter.check_rules(self.api, POLICY)
+
+    def test_missing_approval_test_gate_or_inactive_rule_stops_approval(self):
+        for change in ("approval", "ci", "evaluate"):
             with self.subTest(change=change):
                 self.setUp()
                 if change == "approval":
                     self.rules[0]["parameters"]["required_approving_review_count"] = 0
                 if change == "ci":
                     self.rules.pop()
-                if change == "bypass":
-                    self.full["bypass_actors"] = [{"actor_type": "Integration", "actor_id": APP_ID}]
                 if change == "evaluate":
                     self.full["enforcement"] = "evaluate"
                 with self.assertRaises(adapter.Ineligible):

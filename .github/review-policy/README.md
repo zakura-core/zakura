@@ -9,10 +9,11 @@ audit mode. Merging this implementation does not enable approval writes.
 
 Bot approval is available only when the person who opened the PR currently has
 Write, Maintain, or Admin access to `zakura-core/zakura`. Authors with Read,
-Triage, or no repository access use the normal human review process, even if someone with
-more access requests Codex review on their PR. Bot-authored PRs also use normal
-review. This check uses the author's live repository permissions, including team
-and organization grants; membership labels and the event sender do not qualify.
+Triage, or no repository access use the normal human review process, even if
+someone with more access requests Codex review on their PR. Bot-authored PRs
+also use normal review. This check uses the author's live repository
+permissions, including team and organization grants; membership labels and the
+event sender do not qualify.
 
 Use the normal automatic Codex review, or comment exactly `@codex review`.
 After a clean review of the current commit, eligible PRs receive an approval from
@@ -41,7 +42,8 @@ and native output formats it cannot verify take the human-review path.
 [policy.json](policy.json) is the authoritative scope. Existing files under
 `deploy/`, `.github/workflows/`, and `.github/scripts/` qualify, except for:
 
-- Release creation, preparation, publishing, readiness, drafting, and release-state workflows.
+- Release creation, preparation, publishing, readiness, drafting, and release-state
+  workflows.
 - Release-state fetch/import scripts, checkpoint validation, and `deploy/release-state/`.
 - The adapter workflow itself.
 
@@ -122,8 +124,8 @@ A read-only permission preflight skips the App job when no target PR has an
 authorized author. The exception is cleanup: a PR with an existing App approval
 still reaches the writer so it can withdraw that approval if access was revoked
 or cannot be verified. Pending Slack withdrawal notifications also reach the
-writer after access is revoked. The writer independently checks the author's access on
-every evaluation before and after approval, including scheduled runs.
+writer after access is revoked. The writer independently checks the author's
+access on every evaluation before and after approval, including scheduled runs.
 
 ## Slack notifications
 
@@ -205,13 +207,18 @@ environment branch restriction. Delete the repository secret and revoke the old
 key in the App settings. Update any secret sync to target the environment so it
 cannot recreate the repository secret. Keep approval writes disabled until this
 migration is complete.
-The existing `main` ruleset already supplies the one required approval,
-`test success` check, and empty bypass list; leave those settings unchanged.
+Before enabling writes, an administrator must verify that the existing `main`
+ruleset requires at least one approval and `test success`, and has an empty
+bypass list. Leave those settings unchanged.
 
 The writer independently rereads the ruleset and checks its approval requirement
-and required test check before every approval. Missing or
-weakened configuration prevents new approvals. A trusted `main` checkout is used
-in both jobs; PR code, artifacts, and commands never execute with the App token.
+and required test check before every approval. Missing requirements or an
+inactive approval ruleset prevent new approvals. It cannot verify the bypass
+list: GitHub omits `bypass_actors` for this token, which has no ruleset write
+access. An omitted field does not prove that the list is empty; bypass-list
+verification remains an administrator responsibility. A trusted `main` checkout
+is used in both jobs; PR code, artifacts, and commands never execute with the
+App token.
 Keep GitHub Actions' general permission to approve PRs disabled; this workflow
 uses its own narrowly scoped App token.
 

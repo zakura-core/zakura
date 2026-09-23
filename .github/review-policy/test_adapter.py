@@ -208,6 +208,15 @@ class EvidenceTests(unittest.TestCase):
         self.data["reactions"].append({"content": "eyes", "user": NATIVE})
         self.reject("running-review reaction")
 
+    def test_deleted_account_entries_are_ignored(self):
+        # GitHub may return a null user for content from a deleted account.
+        self.data["comments"].append({"id": 98, "body": "@codex review", "user": None,
+                                      "created_at": FINISH, "updated_at": FINISH})
+        self.data["reactions"].append({"id": 201, "content": "+1", "user": None,
+                                       "created_at": "2026-09-01T10:02:03Z"})
+        self.data["reviews"] = [{**native_review(), "user": None}]
+        self.assertEqual(adapter.check_evidence(**self.data)["head"], HEAD)
+
     def test_resolving_current_findings_does_not_turn_review_clean(self):
         self.data["reviews"] = [native_review()]
         self.data["threads"] = [thread(resolved=True)]
@@ -726,6 +735,12 @@ class ReconcileTests(unittest.TestCase):
         result = self.worker.reconcile()
         self.assertFalse(result["approved"])
         self.assertEqual(self.writes(), [("PUT", self.worker.pull_path + "/reviews/400/dismissals")])
+
+    def test_deleted_account_review_does_not_block_withdrawal(self):
+        self.api.pages.return_value = [owned_review(), {"id": 600, "state": "APPROVED",
+                                                        "body": "", "user": None}]
+        self.worker.evaluate.side_effect = adapter.Ineligible("New head is not reviewed")
+        self.assertEqual(self.worker.reconcile()["dismissed"], 1)
 
     def test_missing_rules_or_api_failure_withdraws_existing_approval(self):
         for error in (adapter.Ineligible("Rules missing"), adapter.APIError("Unavailable")):

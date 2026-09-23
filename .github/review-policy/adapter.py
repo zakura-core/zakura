@@ -124,8 +124,8 @@ class Policy:
         return fragment
 
     def native(self, obj):
-        return (obj.get("user", {}).get("id") == self.data["codex_user_id"]
-                and obj.get("user", {}).get("type") == "Bot"
+        return ((obj.get("user") or {}).get("id") == self.data["codex_user_id"]
+                and (obj.get("user") or {}).get("type") == "Bot"
                 and (obj.get("performed_via_github_app") or {}).get("id")
                 == self.data["codex_app_id"])
 
@@ -224,8 +224,8 @@ def check_evidence(policy, pull, comments, summary, reactions, reviews, threads,
             and resolved_sha == pull["head"]["sha"] and resolved_sha.startswith(finished["sha"]),
             "Codex reviewed a different or ambiguous commit")
 
-    requests = [c for c in comments if c.get("user", {}).get("type") != "Bot"
-                and c.get("user", {}).get("id") in authorized_requesters
+    requests = [c for c in comments if (c.get("user") or {}).get("type") != "Bot"
+                and (c.get("user") or {}).get("id") in authorized_requesters
                 and COMMAND.search(c.get("body", ""))]
     for request in requests:
         require(instant(request["created_at"]) <= started["time"]
@@ -244,16 +244,16 @@ def check_evidence(policy, pull, comments, summary, reactions, reviews, threads,
     # Completed means processing finished, including runs with findings. Only a
     # fresh PR-level thumbs-up is a clean-result signal; old reactions cannot pass.
     clean = [r for r in reactions if r.get("content") == "+1"
-             and r.get("user", {}).get("id") == policy.data["codex_user_id"]
+             and (r.get("user") or {}).get("id") == policy.data["codex_user_id"]
              and finished["time"] < instant(r["created_at"])
              <= finished["time"] + timedelta(minutes=2)]
     require(not any(r.get("content") == "eyes"
-                    and r.get("user", {}).get("id") == policy.data["codex_user_id"]
+                    and (r.get("user") or {}).get("id") == policy.data["codex_user_id"]
                     for r in reactions), "Codex still has a running-review reaction")
     require(len(clean) == 1, "Waiting for a fresh Codex thumbs-up on the PR")
     # Review objects do not expose performed_via_github_app. The immutable Bot
     # user ID is the native App's identity on this endpoint.
-    require(not any(r.get("user", {}).get("id") == policy.data["codex_user_id"]
+    require(not any((r.get("user") or {}).get("id") == policy.data["codex_user_id"]
                     and instant(r["submitted_at"]) >= started["time"]
                     for r in reviews), "Codex posted findings during or after this review")
     for thread in threads:
@@ -436,8 +436,8 @@ class Adapter:
 
     def owned_reviews(self):
         return [r for r in self.api.pages(self.pull_path + "/reviews")
-                if r.get("user", {}).get("id") == self.bot_id
-                and r.get("user", {}).get("type") == "Bot"
+                if (r.get("user") or {}).get("id") == self.bot_id
+                and (r.get("user") or {}).get("type") == "Bot"
                 and r.get("body", "").startswith(RECEIPT_MARKER)]
 
     def dismiss(self, review_id):
@@ -529,8 +529,8 @@ class Adapter:
             created = self.writer.request(self.pull_path + "/reviews", "POST", {
                 "event": "APPROVE", "commit_id": receipt["head"], "body": body,
             })
-            require(created.get("user", {}).get("id") == self.bot_id
-                    and created.get("user", {}).get("type") == "Bot",
+            require((created.get("user") or {}).get("id") == self.bot_id
+                    and (created.get("user") or {}).get("type") == "Bot",
                     "Approval token does not belong to the configured App")
             require(self.evaluate() == receipt, "Review evidence changed while approving")
             self.check_trusted_revision()

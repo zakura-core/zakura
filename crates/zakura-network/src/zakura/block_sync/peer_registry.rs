@@ -600,7 +600,10 @@ impl PeerRegistry {
 
     /// Remove a peer's entry entirely (disconnect/teardown/admission-reject).
     pub(super) fn remove(&self, peer: &ZakuraPeerId) {
-        self.lock().remove(peer);
+        if self.lock().remove(peer).is_some() {
+            // A routine may have deferred the floor to the removed peer.
+            self.floor_ranking_changed.notify_waiters();
+        }
     }
 
     /// Publish a freshly-applied `Status` (routine-side, inverted inbound flow): grow
@@ -613,19 +616,29 @@ impl PeerRegistry {
         generation: u64,
         status: BlockSyncStatus,
     ) {
-        let mut peers = self.lock();
-        let Some(entry) = peers.get_mut(peer) else {
-            return;
+        let eligibility_changed = {
+            let mut peers = self.lock();
+            let Some(entry) = peers.get_mut(peer) else {
+                return;
+            };
+            if entry.generation != generation {
+                return;
+            }
+            let eligibility_changed = !entry.received_status
+                || entry.servable_low != status.servable_low
+                || entry.servable_high != status.servable_high;
+            entry.servable_low = status.servable_low;
+            entry.servable_high = status.servable_high;
+            entry.max_blocks_per_response = clamp_advertised_blocks(status.max_blocks_per_response);
+            entry.max_inflight_requests = clamp_advertised_inflight(status.max_inflight_requests);
+            entry.max_response_bytes = clamp_advertised_response_bytes(status.max_response_bytes);
+            entry.received_status = true;
+            eligibility_changed
         };
-        if entry.generation != generation {
-            return;
+        if eligibility_changed {
+            // A servable-range change can add or remove the preferred floor carrier.
+            self.floor_ranking_changed.notify_waiters();
         }
-        entry.servable_low = status.servable_low;
-        entry.servable_high = status.servable_high;
-        entry.max_blocks_per_response = clamp_advertised_blocks(status.max_blocks_per_response);
-        entry.max_inflight_requests = clamp_advertised_inflight(status.max_inflight_requests);
-        entry.max_response_bytes = clamp_advertised_response_bytes(status.max_response_bytes);
-        entry.received_status = true;
     }
 
     /// Replace the peer's outstanding height→hash set (routine-owned), but only if
@@ -1467,6 +1480,44 @@ mod floor_bias_tests {
             assert!(futures::poll!(first.as_mut()).is_ready());
             assert!(futures::poll!(second.as_mut()).is_ready());
         }
+    }
+
+    #[tokio::test]
+    async fn floor_ranking_notifies_when_a_carrier_changes_range_or_leaves() {
+        let config = super::super::ZakuraBlockSyncConfig::default();
+        let reg = PeerRegistry::new();
+        let provider = peer(1);
+        register_with_rtprop(&reg, &config, &provider, 0, 1000, 3, Some(75));
+        let generation = reg.lock().get(&provider).unwrap().generation;
+        let status = |high| BlockSyncStatus {
+            servable_low: block::Height(0),
+            servable_high: block::Height(high),
+            ..BlockSyncStatus::default()
+        };
+
+        let unchanged = reg.subscribe_floor_ranking().notified();
+        tokio::pin!(unchanged);
+        unchanged.as_mut().enable();
+        reg.upsert_status(&provider, generation, status(1000));
+        reg.remove(&peer(2));
+        assert!(
+            futures::poll!(unchanged.as_mut()).is_pending(),
+            "a repeated range and an unknown peer must not wake routines"
+        );
+
+        // A routine that deferred to `provider` must reconsider once the provider
+        // stops serving the floor, and again once it leaves.
+        let narrowed = reg.subscribe_floor_ranking().notified();
+        tokio::pin!(narrowed);
+        narrowed.as_mut().enable();
+        reg.upsert_status(&provider, generation, status(50));
+        assert!(futures::poll!(narrowed.as_mut()).is_ready());
+
+        let removed = reg.subscribe_floor_ranking().notified();
+        tokio::pin!(removed);
+        removed.as_mut().enable();
+        reg.remove(&provider);
+        assert!(futures::poll!(removed.as_mut()).is_ready());
     }
 
     #[test]

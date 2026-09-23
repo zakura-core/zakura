@@ -54,7 +54,16 @@ this policy is tracked separately in [#1127](https://github.com/zakura-core/zaku
 ## Header sync
 
 The header engine still uses greatest work and raw hash to select downloads.
-Its `header_best` may differ from the fully validated `verified_best` on equal
+Native block sync requests bodies on that selected header chain. If both headers
+arrive before either body is handed off for verification, the higher-hash branch
+can be the only one whose body reaches the verifier.
+
+A header switch can discard a body that is still downloading or buffered. A block
+already handed off for verification is not cancelled by the switch alone.
+First-received priority starts when the full-block verifier receives the block,
+which can be after it waits in the apply queue.
+
+The header engine's `header_best` may differ from the fully validated `verified_best` on equal
 work. The atomic full-state transition publishes the verified choice, including
 after operator invalidation and reconsideration. The planner checks that the
 chosen path is eligible, fully verified, and has greatest cumulative work.

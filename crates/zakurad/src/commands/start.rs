@@ -628,7 +628,9 @@ impl StartCmd {
         if profiles::enabled() {
             let upgrade = zakura_chain::parameters::NetworkUpgrade::current(
                 &config.network.network,
-                latest_chain_tip.best_tip_height().unwrap_or(Height(0)),
+                latest_chain_tip
+                    .best_tip_height()
+                    .unwrap_or(block::Height(0)),
             );
             let warmup = tokio::task::spawn_blocking(move || {
                 use zakura_consensus::{groth16, halo2, sapling_prover};
@@ -636,7 +638,7 @@ impl StartCmd {
                 let _ = halo2::verifier_for(upgrade);
                 let _ = groth16::SPROUT.prepared_verifying_key();
             });
-            match tokio::time::timeout(Duration::from_secs(300), warmup).await {
+            match tokio::time::timeout(std::time::Duration::from_secs(300), warmup).await {
                 Ok(Ok(())) => profiles::verification_initialized(),
                 error => warn!(
                     ?error,

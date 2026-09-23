@@ -2,7 +2,7 @@ name: Test Crate Build
 
 on:
   pull_request:
-    branches: [main, "feat/**", "release/**"]
+    branches: [main, "feat/**", "split/**", "release/**"]
     paths:
       - "**/*.rs"
       - "**/Cargo.toml"
@@ -83,14 +83,14 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 #v1.17.0 # zizmor: ignore[cache-poisoning] -- CI crate-check job; feature-matrix build check only, nothing published/released
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f #v1.17.0 # zizmor: ignore[cache-poisoning] -- CI crate-check job; feature-matrix build check only, nothing published/released
         with:
           toolchain: stable
           cache-key: crate-checks
           cache-on-failure: true
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      - uses: taiki-e/install-action@e67fa11c4b9316fa714ddf0abed07a0c3143b95b #v2.87.4
+      - uses: taiki-e/install-action@c3ec0de9ae7f1019cea21aa96aa0a895b9552063 #v2.87.9
         with:
           tool: cargo-hack
 

@@ -1024,7 +1024,6 @@ fn check_configured_funding_stream_regtest() {
     );
 
     let regtest = Network::new_regtest(RegtestParameters {
-        activation_heights: (&default_testnet.activation_list()).into(),
         funding_streams: Some(vec![
             configured_pre_nu6_funding_streams.clone(),
             configured_post_nu6_funding_streams.clone(),
@@ -1106,7 +1105,7 @@ fn lockbox_input_value(network: &Network, height: Height) -> Amount<NonNegative>
         return Amount::zero();
     };
 
-    let total_block_subsidy = block_subsidy(height, network).unwrap();
+    let total_block_subsidy = block_subsidy(height, network, None).unwrap();
     let &deferred_amount_per_block =
         funding_stream_values(nu6_activation_height, network, total_block_subsidy)
             .expect("we always expect a funding stream hashmap response even if empty")
@@ -1261,4 +1260,59 @@ fn temporary_orchard_disabling_soft_fork_heights() {
         None,
     );
     assert!(!disabled.is_temporary_orchard_disabling_soft_fork_activation_height(testnet_height));
+}
+
+#[test]
+fn regtest_requires_mandatory_checkpoint_coverage() {
+    use testnet::ConfiguredCheckpoints;
+
+    let genesis = Network::new_regtest(Default::default()).genesis_hash();
+    let params = RegtestParameters {
+        activation_heights: ConfiguredActivationHeights {
+            canopy: Some(10),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    for checkpoints in [
+        None,
+        Some(ConfiguredCheckpoints::HeightsAndHashes(vec![
+            (Height(0), genesis),
+            (Height(8), crate::block::Hash([1; 32])),
+        ])),
+    ] {
+        assert!(matches!(
+            testnet::Parameters::new_regtest(RegtestParameters {
+                checkpoints,
+                ..params.clone()
+            }),
+            Err(ParametersBuilderError::InsufficientCheckpointCoverage)
+        ));
+    }
+
+    let checkpoints = ConfiguredCheckpoints::HeightsAndHashes(vec![
+        (Height(0), genesis),
+        (Height(9), crate::block::Hash([1; 32])),
+    ]);
+    let network = Network::new_regtest(RegtestParameters {
+        checkpoints: Some(checkpoints),
+        ..params
+    });
+    assert_eq!(network.mandatory_checkpoint_height(), Height(9));
+    assert_eq!(network.checkpoint_list().max_height(), Height(9));
+}
+
+#[test]
+fn regtest_rejects_checkpoints_from_another_genesis() {
+    let checkpoints = testnet::ConfiguredCheckpoints::HeightsAndHashes(vec![(
+        Height(0),
+        Network::Mainnet.genesis_hash(),
+    )]);
+    assert!(matches!(
+        testnet::Parameters::new_regtest(RegtestParameters {
+            checkpoints: Some(checkpoints),
+            ..Default::default()
+        }),
+        Err(ParametersBuilderError::CheckpointGenesisMismatch)
+    ));
 }

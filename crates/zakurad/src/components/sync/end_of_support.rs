@@ -13,7 +13,7 @@ use zakura_chain::{
 use crate::application::release_version;
 
 /// The estimated height that this release will be published.
-pub const ESTIMATED_RELEASE_HEIGHT: u32 = 3_493_172;
+pub const ESTIMATED_RELEASE_HEIGHT: u32 = 3_494_121;
 
 /// The estimated number of blocks per day after Blossom.
 ///

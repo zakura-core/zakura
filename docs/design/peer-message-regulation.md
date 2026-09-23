@@ -233,6 +233,41 @@ Block sync retains version-2 correlation rules. Live ranges cannot overlap on on
 the wire format lacks a request ID. BlocksDone and RangeUnavailable close the matching range once.
 A separate successor protocol can improve correlation later.
 
+### Subscriptions
+
+A subscription row declares its live limit, its credit window, its cursor history, and an optional
+cadence. Its pages and terminal outcome are response rows that name it. `Open`, `Grant`, and
+`Close` change a live exchange rather than create a commitment, so serving never receives them.
+A subscription row may therefore share a stream with request rows. `Subscriptions` holds the
+subscriber's side and `Publications` the publisher's. Both read their limits from the row.
+
+**Credit window.** Granted credit minus acknowledged progress never exceeds the row's credit, in
+objects and in bytes. Both sides compute the same window. A page in flight has left the
+publisher's unspent credit and has not reached the subscriber's acknowledgement, and the window
+counts it either way. So a grant that breaks the window is a violation. Every page spends at least
+one object, so unacknowledged pages never exceed the object credit. A cursor history of that size
+therefore never fills. Header sync version 9 bounds the same window.
+
+**Slots and the margin.** A subscription holds a slot from `Open` until its terminal outcome's
+write finishes. The slot also reserves that outcome's output, so spent credit and busy output
+cannot prevent closure. A conformant subscriber holds at most `max_live` slots when its `Open`
+arrives. As with requests, the toolkit acts only above a proven margin: it admits an `Open` beyond
+`max_live` within `2 × max_live`, counts it in `zakura.p2p.subscription.over_limit`, and
+disconnects only beyond that. This departs from header sync version 9's rule that an `Open`
+without a free slot returns `Disconnect`.
+
+**Tombstones.** An ended subscription leaves a tombstone. A crossing `Grant` that matches it is
+dropped and keeps it; a crossing `Close` is dropped and consumes it. A subscriber below its limit
+must have received every terminal outcome but those of its other live subscriptions, and outcomes
+arrive in the order the publisher ended the subscriptions. So an `Open` clears the oldest
+tombstones until live subscriptions plus tombstones number at most `max_live - 1`. With one live
+subscription, this is header sync version 9's rule that the next `Open` clears the tombstone.
+
+**Pages.** Pages take the budgets a served response takes, through `ServeCapacity::push`. The
+terminal outcome needs no credit, output grant, or execution slot. A reactor writes a session's
+pages and outcomes from one task, so each outcome follows its pages. Each update wakes that task,
+so `Close` never waits behind a page that waits for capacity.
+
 ## Tests and diagnostics
 
 Use existing tests for frame/allocation bounds, cadence, reservations, subscription races,

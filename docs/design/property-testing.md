@@ -47,11 +47,12 @@ Four suites read the declarations, so each property is written once:
 | Item | one codec item | Tight length bounds against real encodings, round trips, exact reads, truncation, canonical decoding of arbitrary and mutated input, and the allocation bound |
 | Message | one message family | Closed coverage of its rows, tight row bounds, round trips, header and payload mutations, domain violations, and the allocation bound for every decode |
 | Frame | one layout | Each reader accepts its rows at both bounds and rejects short, flagged, other-role, sibling-stream, and undeclared frames from the header |
-| Stream conformance | one layout and an adapter | Over real QUIC: unsolicited responses, the request margin, sustained and mutually saturated exchanges, member retirement and the writer fence, paused siblings and connection credit, unnegotiated versions, and partial frames |
+| Stream conformance | one layout and an adapter | Over real QUIC: unsolicited responses, the request margin, sustained and mutually saturated exchanges, member retirement and the writer fence, paused siblings and connection credit, unnegotiated versions, partial frames, and `Close` progress while pages and execution are blocked |
 
 The stream conformance adapter only encodes a valid message for a row and names the exchange a
-message belongs to. The suite's harness serves and downloads through the exchange tools, so it tests
-the tools and the transport together. A reactor that bypasses the tools gets no coverage from it.
+message belongs to. For a subscription row it also encodes and reads updates and encodes pages. The
+suite's harness serves, downloads, and publishes through the tools, so it tests the tools and the
+transport together. A reactor that bypasses the tools gets no coverage from it.
 
 Tuples and lists of items are items, so the item suite checks composition once. A message whose
 payload composes checked items needs no bound test of its own. The test allocator measures heap
@@ -61,9 +62,11 @@ A family supplies deterministic samples that reach each row's minimum and maximu
 strategy, and its domain violations. Random generation adds cases; it never decides whether a row
 gets tested.
 
-Each exchange and session tool has its own properties, listed in its module doc with the test for
-each. Tools are tested alone with unit tests and an operation-sequence proptest that checks the
-tool's own counters after every step, with no reference model.
+Each exchange, session, and subscription tool has its own properties, listed in its module doc
+with the test for each. Tools are tested alone with unit tests and an operation-sequence proptest
+that checks the tool's own counters after every step, with no reference model. The two subscription
+tools are also joined through two ordered queues: a proptest interleaves updates, pages, and
+terminal outcomes and checks that crossed messages never fault a conformant peer.
 
 ## Stateful checks
 

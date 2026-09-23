@@ -536,6 +536,45 @@ impl<K: Eq + Hash + std::fmt::Debug + Send + 'static> ResponsePrecheck for Share
     }
 }
 
+/// The prechecks of one stream, chosen by the row that each response answers.
+///
+/// A stream may carry responses to a request, which [`SharedReservations`]
+/// check, and pages of a subscription, which
+/// [`SharedSubscriptions`](super::SharedSubscriptions) check. A response to a
+/// row with no precheck here is unsolicited.
+#[derive(Debug)]
+pub(crate) struct PrecheckByRequest {
+    rules: &'static [MessageRule],
+    prechecks: Vec<(u16, Arc<dyn ResponsePrecheck>)>,
+}
+
+impl PrecheckByRequest {
+    /// Prechecks for the family `rules`, each for the request or
+    /// subscription row it names.
+    pub(crate) fn new(
+        rules: &'static [MessageRule],
+        prechecks: Vec<(u16, Arc<dyn ResponsePrecheck>)>,
+    ) -> Self {
+        Self { rules, prechecks }
+    }
+}
+
+impl ResponsePrecheck for PrecheckByRequest {
+    fn check(&self, message_type: u16, payload_len: usize) -> Result<(), FrameRejection> {
+        let Some(MessageRole::Response { request, .. }) =
+            MessageRule::find(self.rules, message_type).map(|row| row.role)
+        else {
+            return Err(FrameRejection::Unsolicited);
+        };
+        self.prechecks
+            .iter()
+            .find(|(row, _)| *row == request)
+            .ok_or(FrameRejection::Unsolicited)?
+            .1
+            .check(message_type, payload_len)
+    }
+}
+
 /// The precheck a stream's reader and its receiver share.
 ///
 /// A transport receiver pauses ingress until the service attaches a precheck

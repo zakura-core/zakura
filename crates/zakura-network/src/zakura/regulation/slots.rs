@@ -56,6 +56,11 @@ impl SlotBudget {
             .saturating_sub(self.permits.available_permits())
     }
 
+    /// Free slots now. Another owner can take them at any time.
+    pub(crate) fn available(&self) -> usize {
+        self.permits.available_permits()
+    }
+
     /// Create a non-owning handle to this same pool for registry bookkeeping.
     /// This does not change capacity or release any reserved slots.
     pub(super) fn downgrade(&self) -> WeakSlotBudget {

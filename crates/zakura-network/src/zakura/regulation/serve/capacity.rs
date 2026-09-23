@@ -37,8 +37,8 @@ pub(crate) struct ServeLimits {
 /// A serving configuration that cannot work.
 #[derive(Copy, Clone, Debug, Eq, Error, PartialEq)]
 pub(crate) enum ServeConfigError {
-    /// The row is not a request row.
-    #[error("message type {message_type} is not a request row")]
+    /// The row is not a request or subscription row.
+    #[error("message type {message_type} is not a request or subscription row")]
     NotARequest {
         /// The row's message type.
         message_type: u16,
@@ -190,16 +190,23 @@ pub(crate) struct ServeCapacity {
 }
 
 impl ServeCapacity {
-    /// Capacity for the request `row` of `service`.
+    /// Capacity for the request or subscription `row` of `service`.
+    ///
+    /// A subscription row's capacity serves its pages through
+    /// [`Self::push`].
     pub(crate) fn new(
         service: &'static str,
         request: &'static MessageRule,
         limits: ServeLimits,
     ) -> Result<Self, ServeConfigError> {
-        let MessageRole::Request { max_in_flight, .. } = request.role else {
-            return Err(ServeConfigError::NotARequest {
-                message_type: request.message_type,
-            });
+        let max_in_flight = match request.role {
+            MessageRole::Request { max_in_flight, .. } => max_in_flight,
+            MessageRole::Subscription { max_live, .. } => max_live,
+            _ => {
+                return Err(ServeConfigError::NotARequest {
+                    message_type: request.message_type,
+                })
+            }
         };
         let limit = |limit| ServeConfigError::Limit { limit };
         SlotBudget::new(limits.peer_execution).map_err(|_| limit("peer_execution"))?;

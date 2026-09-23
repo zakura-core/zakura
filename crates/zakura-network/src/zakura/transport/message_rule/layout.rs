@@ -267,7 +267,7 @@ pub enum LayoutError {
     /// #     role: MessageRole::Response { request: 1, ends_exchange: true },
     /// # };
     /// # const FEED: [Stream; 1] = [Stream {
-    /// #     kind: 64, version: 1, frame_cap: 1024, capability: 1 << 16,
+    /// #     kind: 64, version: 1, frame_cap: 16 * 1024, capability: 1 << 16,
     /// #     messages: Some(&[WATCH, PAGE, ENDED]), ..Stream::PERSISTENT
     /// # }];
     /// # const _: () = Stream::validate_layout(&FEED);

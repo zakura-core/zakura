@@ -67,6 +67,9 @@ independently.
 
 ### Changed
 
+- Extended v1.5.0 Mainnet support through approximately October 25, with the
+  last supported height at 3,528,681
+  ([#1121](https://github.com/zakura-core/zakura/pull/1121)).
 - Updated the common libraries to `1.3.0-alpha.1`, including the removal of
   unused experimental ZIP 233 fields
   ([#1042](https://github.com/zakura-core/zakura/pull/1042)).

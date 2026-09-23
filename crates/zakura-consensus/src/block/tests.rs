@@ -2699,7 +2699,7 @@ async fn malformed_headers_do_not_stop_buffered_verification() {
 #[tokio::test]
 async fn receipt_order_precedes_polling_and_cached_mining_uses_solved_submission() {
     use std::sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Mutex,
     };
     let _init_guard = zakura_test::init();
@@ -2707,14 +2707,19 @@ async fn receipt_order_precedes_polling_and_cached_mining_uses_solved_submission
         let network = librustzcash_conversion_test_network(NetworkUpgrade::Nu5);
         let candidate = Arc::new(nu5_prepared_test_block(&network, None));
         let received = Arc::new(Mutex::new(Vec::new()));
+        let parent_available = Arc::new(AtomicBool::new(true));
         let state = service_fn({
             let received = received.clone();
+            let parent_available = parent_available.clone();
             move |request: zs::Request| {
                 let received = received.clone();
+                let parent_available = parent_available.clone();
                 async move {
                     let response = match request {
                         zs::Request::KnownBlock(hash) => zs::Response::KnownBlock(
-                            (hash == block::Hash([0; 32])).then_some(zs::KnownBlock::Finalized),
+                            (hash == block::Hash([0; 32])
+                                && parent_available.load(Ordering::Relaxed))
+                            .then_some(zs::KnownBlock::Finalized),
                         ),
                         zs::Request::CheckBlockProposalValidity(block) => {
                             assert!(block.receipt_order.is_none());
@@ -2772,12 +2777,25 @@ async fn receipt_order_precedes_polling_and_cached_mining_uses_solved_submission
         );
         let first = verifier.receipt_orders.register(future_block.clone());
         let order = first.order;
+        parent_available.store(false, Ordering::Relaxed);
         let future_attempt = verifier.call(Request::CommitMined {
             block: future_block.clone(),
             work_id: Some("receipt-test".into()),
             admission: zs::BlockAdmission::pending(),
         });
         drop(first);
+        assert!(matches!(
+            future_attempt.await,
+            Err(VerifyBlockError::Commit(
+                zs::CommitBlockError::MissingMinedParent
+            ))
+        ));
+        parent_available.store(true, Ordering::Relaxed);
+        let future_attempt = verifier.call(Request::CommitMined {
+            block: future_block.clone(),
+            work_id: Some("receipt-test".into()),
+            admission: zs::BlockAdmission::pending(),
+        });
         assert!(matches!(
             future_attempt.await,
             Err(VerifyBlockError::Time(_))

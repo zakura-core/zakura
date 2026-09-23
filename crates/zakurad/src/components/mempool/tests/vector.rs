@@ -45,7 +45,7 @@ fn policy_rejection_has_no_misbehavior_score() {
             max_bytes: 250_000,
         },
     );
-    assert_eq!(transaction_misbehavior(&policy_error), None);
+    assert_eq!(transaction_misbehavior(&policy_error, None), None);
 
     let advertiser_addr = PeerSocketAddr::from(([203, 0, 113, 7], 8233));
     let consensus_error = zakura_consensus::error::TransactionError::WrongVersion;
@@ -54,11 +54,51 @@ fn policy_rejection_has_no_misbehavior_score() {
     let invalid_error = TransactionDownloadVerifyError::Invalid {
         error: consensus_error,
         advertiser_addr: Some(advertiser_addr),
+        tip_height: Some(block::Height(100)),
     };
     assert_eq!(
-        transaction_misbehavior(&invalid_error),
+        transaction_misbehavior(&invalid_error, Some(block::Height(100))),
         Some((advertiser_addr, expected_score))
     );
+}
+
+#[test]
+fn stale_verification_failures_do_not_score_peers() {
+    let peer = PeerSocketAddr::from(([203, 0, 113, 7], 8233));
+    let error = TransactionDownloadVerifyError::Invalid {
+        error: TransactionError::WrongVersion,
+        advertiser_addr: Some(peer),
+        tip_height: Some(block::Height(100)),
+    };
+
+    assert_eq!(
+        transaction_misbehavior(&error, Some(block::Height(101))),
+        None
+    );
+    assert_eq!(transaction_misbehavior(&error, None), None);
+    assert_eq!(
+        transaction_misbehavior(&error, Some(block::Height(100))),
+        Some((peer, 100))
+    );
+}
+
+#[test]
+fn context_dependent_failures_do_not_score_current_peers() {
+    for error in [
+        TransactionError::WrongConsensusBranchId,
+        TransactionError::LockedUntilAfterBlockHeight(block::Height(101)),
+        TransactionError::LockedUntilAfterBlockTime(chrono::Utc::now()),
+    ] {
+        let error = TransactionDownloadVerifyError::Invalid {
+            error,
+            advertiser_addr: Some(PeerSocketAddr::from(([203, 0, 113, 7], 8233))),
+            tip_height: Some(block::Height(100)),
+        };
+        assert_eq!(
+            transaction_misbehavior(&error, Some(block::Height(100))),
+            None
+        );
+    }
 }
 
 #[test]
@@ -72,13 +112,156 @@ fn invalid_shielded_proof_sizes_ban_mempool_peers() {
         let invalid_error = TransactionDownloadVerifyError::Invalid {
             error: consensus_error,
             advertiser_addr: Some(advertiser_addr),
+            tip_height: Some(block::Height(100)),
         };
 
         assert_eq!(
-            transaction_misbehavior(&invalid_error),
+            transaction_misbehavior(&invalid_error, Some(block::Height(100))),
             Some((advertiser_addr, zn::constants::MAX_PEER_MISBEHAVIOR_SCORE)),
         );
     }
+}
+
+/// Check that a mempool far behind the network tip rejects invalid peer
+/// transactions without scoring the peer.
+///
+/// Regression test: a debug-enabled mempool on a node syncing from scratch
+/// verified current network transactions against stale consensus rules and
+/// banned every honest peer that relayed them.
+#[tokio::test(flavor = "multi_thread")]
+async fn stale_mempool_rejects_invalid_peer_transaction_without_misbehavior() -> Result<(), Report>
+{
+    assert_peer_error_is_not_scored(None, false, TransactionError::WrongVersion).await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn future_dated_tip_does_not_score_branch_mismatch() -> Result<(), Report> {
+    assert_peer_error_is_not_scored(
+        Some(chrono::Utc::now() + chrono::Duration::minutes(90)),
+        false,
+        TransactionError::WrongConsensusBranchId,
+    )
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn caught_up_mempool_does_not_score_stale_verification() -> Result<(), Report> {
+    assert_peer_error_is_not_scored(
+        Some(chrono::Utc::now() - chrono::Duration::minutes(300)),
+        true,
+        TransactionError::WrongVersion,
+    )
+    .await
+}
+
+async fn assert_peer_error_is_not_scored(
+    tip_time: Option<chrono::DateTime<chrono::Utc>>,
+    catch_up: bool,
+    error: TransactionError,
+) -> Result<(), Report> {
+    let network = Network::Mainnet;
+    let transaction = network
+        .unmined_transactions_in_blocks(2..)
+        .next()
+        .expect("mainnet test vectors contain an unmined transaction")
+        .transaction
+        .clone();
+    let peer_addr = PeerSocketAddr::from(([203, 0, 113, 7], 8233));
+    let (misbehavior_tx, mut misbehavior_rx) = tokio::sync::mpsc::channel(1);
+
+    let (
+        mut mempool,
+        mut peer_set,
+        _state_service,
+        _chain_tip_change,
+        mut tx_verifier,
+        mut recent_syncs,
+        _mempool_transaction_receiver,
+    ) = setup_with_mempool_config_and_misbehavior_sender(
+        &network,
+        mempool::Config::default(),
+        true,
+        misbehavior_tx,
+    )
+    .await;
+    let mut tip_sender = tip_time.map(|time| {
+        let mut sender = mempool.use_current_chain_tip(&network);
+        sender.set_finalized_tip(Some(zs::ChainTipBlock {
+            hash: block::Hash([3; 32]),
+            height: block::Height(0),
+            time,
+            transactions: Vec::new(),
+            transaction_hashes: Arc::new([]),
+            previous_block_hash: block::Hash([0; 32]),
+        }));
+        sender
+    });
+    mempool.enable(&mut recent_syncs).await;
+    assert_eq!(
+        mempool.is_current_enough_for_mempool(),
+        tip_time.is_some() && !catch_up
+    );
+
+    let transaction_id = transaction.id();
+    let response = mempool
+        .ready()
+        .await
+        .expect("mempool service becomes ready")
+        .call(Request::QueueFromPeer {
+            transactions: vec![transaction_id.into()],
+            source: QueueSource::LegacySocket(peer_addr.remove_socket_addr_privacy()),
+        })
+        .await
+        .expect("mempool service queues the peer transaction");
+    assert!(matches!(response, Response::Queued(results) if results.is_empty()));
+
+    peer_set
+        .expect_request_that(|request| {
+            matches!(request, zn::Request::TransactionsById(ids) if ids.contains(&transaction_id))
+        })
+        .await
+        .respond(zn::Response::Transactions(vec![
+            zn::InventoryResponse::Available((transaction, Some(peer_addr))),
+        ]));
+    let verification = tx_verifier
+        .expect_request_that(|request| {
+            matches!(
+                request,
+                tx::Request::Mempool { transaction, .. } if transaction.id() == transaction_id
+            )
+        })
+        .await;
+    if catch_up {
+        tip_sender
+            .as_mut()
+            .expect("catch-up test has a tip sender")
+            .set_finalized_tip(Some(zs::ChainTipBlock {
+                hash: block::Hash([4; 32]),
+                height: block::Height(1),
+                time: chrono::Utc::now(),
+                transactions: Vec::new(),
+                transaction_hashes: Arc::new([]),
+                previous_block_hash: block::Hash([3; 32]),
+            }));
+        assert!(mempool.is_current_enough_for_mempool());
+    }
+    verification.respond(Err(error));
+
+    timeout(Duration::from_secs(3), async {
+        while mempool.tx_downloads().in_flight() != 0 {
+            mempool.dummy_call().await;
+            time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("invalid transaction verification should finish");
+
+    assert!(matches!(
+        misbehavior_rx.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    ));
+
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -128,6 +311,8 @@ async fn oversized_peer_transaction_is_rejected_without_misbehavior() -> Result<
         misbehavior_tx,
     )
     .await;
+    // Peer misbehavior is only scored when the mempool's validation context is current.
+    let _chain_tip_sender = mempool.use_current_chain_tip(&network);
     mempool.enable(&mut recent_syncs).await;
 
     let oversized_id = oversized_transaction.id();
@@ -730,15 +915,14 @@ async fn mempool_service_stays_enabled_when_legacy_sync_status_falls_behind() ->
     Ok(())
 }
 
-/// Check that a disabled mempool does not consume the latest tip action until
-/// legacy sync status says Zebra is close enough to activate it.
+/// Check that a disabled mempool does not activate until both sync status and
+/// estimated tip distance say Zakura is close enough.
 ///
-/// Regression test: `poll_ready()` used to call `last_tip_change()` before
-/// checking the initial-activation gate. If Zebra was still far from tip, that
-/// consumed the only available tip action and left the disabled mempool unable
-/// to activate when sync status later caught up without another tip change.
+/// Regression test: a peer-starved syncer can report zero new downloads and
+/// therefore look close to tip by throughput alone, even when the local chain
+/// tip timestamp proves the node is far behind the network.
 #[tokio::test]
-async fn disabled_mempool_keeps_tip_action_until_legacy_sync_catches_up() -> Result<(), Report> {
+async fn disabled_mempool_waits_for_sync_status_and_tip_distance() -> Result<(), Report> {
     let network = Network::Mainnet;
 
     let (
@@ -759,11 +943,12 @@ async fn disabled_mempool_keeps_tip_action_until_legacy_sync_catches_up() -> Res
     service.dummy_call().await;
     assert!(!service.is_enabled());
 
-    // Now catch up without committing another block. The same tip action should
-    // still be available for initial activation.
+    // Now make legacy sync throughput look caught up without committing another
+    // block. The genesis tip is still far from the estimated network tip, so the
+    // mempool must remain disabled.
     SyncStatus::sync_close_to_tip(&mut recent_syncs);
     service.dummy_call().await;
-    assert!(service.is_enabled());
+    assert!(!service.is_enabled());
 
     Ok(())
 }

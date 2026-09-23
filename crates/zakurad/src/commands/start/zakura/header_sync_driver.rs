@@ -110,6 +110,7 @@ where
         verified_block_tip_hash: verified_block_tip.1,
         committed_snapshots,
         committed_views,
+        retained_block_height: read_state.subscribe_retained_block_height(),
         service_demand: coordinator.subscribe_service_demand(),
         vct_root_repairs: Some(vct_root_repairs),
         header_chain_port: Arc::new(HeaderChainServicePort::new(
@@ -940,7 +941,7 @@ where
                     read_state,
                     &network,
                     page.common_ancestor,
-                    page.headers.len(),
+                    &page.headers,
                 )
                 .await?
             } else {
@@ -973,7 +974,7 @@ async fn finalized_tree_aux_for_page<ReadState>(
     read_state: ReadState,
     network: &zakura_chain::parameters::Network,
     common_ancestor: zakura_header_chain::Frontier,
-    header_count: usize,
+    headers: &[Arc<block::Header>],
 ) -> Result<Vec<Option<zakura_header_chain::TreeAuxRecordV1>>, PortError>
 where
     ReadState: Service<
@@ -985,6 +986,7 @@ where
         + 'static,
     ReadState::Future: Send + 'static,
 {
+    let header_count = headers.len();
     let empty = || vec![None; header_count];
     let Ok(count) = u32::try_from(header_count) else {
         return Ok(empty());
@@ -995,11 +997,7 @@ where
     let Ok(start_height) = common_ancestor.height.next() else {
         return Ok(empty());
     };
-    let Some(end_height) = start_height + i64::from(count.saturating_sub(1)) else {
-        return Ok(empty());
-    };
-
-    let finalized_tip = match tokio::time::timeout(
+    let finalized_height = match tokio::time::timeout(
         ZAKURA_HEADER_SYNC_DRIVER_TIMEOUT,
         read_state
             .clone()
@@ -1007,7 +1005,8 @@ where
     )
     .await
     {
-        Ok(Ok(zakura_state::ReadResponse::FinalizedTip(tip))) => tip,
+        Ok(Ok(zakura_state::ReadResponse::FinalizedTip(Some((height, _))))) => height,
+        Ok(Ok(zakura_state::ReadResponse::FinalizedTip(None))) => return Ok(empty()),
         Ok(Ok(_)) => return Err(PortError::Unavailable { source: None }),
         Ok(Err(error)) => {
             return Err(PortError::Unavailable {
@@ -1016,15 +1015,50 @@ where
         }
         Err(_) => return Err(PortError::Timeout),
     };
-    if finalized_tip.is_none_or(|(height, _)| end_height > height) {
+    let Some(finalized_count) = finalized_height
+        .0
+        .checked_sub(start_height.0)
+        .and_then(|distance| distance.checked_add(1))
+        .map(|available| available.min(count))
+    else {
         return Ok(empty());
+    };
+
+    // A lease can outlive a branch change. Match the last finalized header in
+    // this linked page before attaching canonical roots looked up by height.
+    let last_index =
+        usize::try_from(finalized_count - 1).expect("a page count fits usize on supported targets");
+    let last_height = block::Height(
+        start_height
+            .0
+            .checked_add(finalized_count - 1)
+            .expect("the finalized prefix ends at or below the finalized height"),
+    );
+    match tokio::time::timeout(
+        ZAKURA_HEADER_SYNC_DRIVER_TIMEOUT,
+        read_state
+            .clone()
+            .oneshot(zakura_state::ReadRequest::BestChainBlockHash(last_height)),
+    )
+    .await
+    {
+        Ok(Ok(zakura_state::ReadResponse::BlockHash(Some(hash))))
+            if hash == headers[last_index].hash() => {}
+        Ok(Ok(zakura_state::ReadResponse::BlockHash(_))) => return Ok(empty()),
+        Ok(Ok(_)) => return Err(PortError::Unavailable { source: None }),
+        Ok(Err(error)) => {
+            return Err(PortError::Unavailable {
+                source: Some(Arc::from(error)),
+            })
+        }
+        Err(_) => return Err(PortError::Timeout),
     }
 
     let roots = match tokio::time::timeout(
         ZAKURA_HEADER_SYNC_DRIVER_TIMEOUT,
         read_state.oneshot(zakura_state::ReadRequest::BlockRoots {
             start_height,
-            count,
+            count: finalized_count,
         }),
     )
     .await
@@ -1038,14 +1072,16 @@ where
         }
         Err(_) => return Err(PortError::Timeout),
     };
-    if !block_roots_cover_range(start_height, count, &roots) {
+    if !block_roots_cover_range(start_height, finalized_count, &roots) {
         return Ok(empty());
     }
 
-    Ok(roots
+    let mut records: Vec<_> = roots
         .into_iter()
         .map(|roots| Some(finalized_tree_aux_record(roots, network)))
-        .collect())
+        .collect();
+    records.resize(header_count, None);
+    Ok(records)
 }
 
 fn finalized_tree_aux_record(
@@ -1527,6 +1563,15 @@ mod tests {
         assert_eq!(served.entries[0].tree_aux, Some(tree_aux));
     }
 
+    fn two_page_headers() -> [Arc<block::Header>; 2] {
+        let mut first = *regtest_genesis_block().header;
+        first.previous_block_hash = block::Hash([0; 32]);
+        let first = Arc::new(first);
+        let mut second = *first;
+        second.previous_block_hash = first.hash();
+        [first, Arc::new(second)]
+    }
+
     #[tokio::test]
     async fn finalized_pages_load_contiguous_tree_aux_from_state() {
         let roots = |height| BlockCommitmentRoots {
@@ -1539,6 +1584,8 @@ mod tests {
             ironwood_tx: 0,
             auth_data_root: [9; 32].into(),
         };
+        let headers = two_page_headers();
+        let hashes = headers.each_ref().map(|header| header.hash());
         let read_state = tower::service_fn(move |request| async move {
             Ok::<_, zakura_state::BoxError>(match request {
                 zakura_state::ReadRequest::FinalizedTip => {
@@ -1546,6 +1593,10 @@ mod tests {
                         block::Height(2),
                         block::Hash([2; 32]),
                     )))
+                }
+                zakura_state::ReadRequest::BestChainBlockHash(height) => {
+                    let index = usize::try_from(height.0 - 1).expect("fixture heights fit usize");
+                    zakura_state::ReadResponse::BlockHash(Some(hashes[index]))
                 }
                 zakura_state::ReadRequest::BlockRoots {
                     start_height,
@@ -1566,7 +1617,7 @@ mod tests {
             read_state,
             &zakura_chain::parameters::Network::Mainnet,
             zakura_header_chain::Frontier::new(block::Height(0), block::Hash([0; 32])),
-            2,
+            &headers,
         )
         .await
         .expect("the finalized roots are available");
@@ -1584,6 +1635,91 @@ mod tests {
                 .sapling_tx_count,
             2
         );
+    }
+
+    #[tokio::test]
+    async fn mixed_pages_load_tree_aux_for_the_finalized_prefix() {
+        let headers = two_page_headers();
+        let hashes = headers.each_ref().map(|header| header.hash());
+        let read_state = tower::service_fn(move |request| async move {
+            Ok::<_, zakura_state::BoxError>(match request {
+                zakura_state::ReadRequest::FinalizedTip => {
+                    zakura_state::ReadResponse::FinalizedTip(Some((
+                        block::Height(1),
+                        block::Hash([1; 32]),
+                    )))
+                }
+                zakura_state::ReadRequest::BestChainBlockHash(height) => {
+                    let index = usize::try_from(height.0 - 1).expect("fixture heights fit usize");
+                    zakura_state::ReadResponse::BlockHash(Some(hashes[index]))
+                }
+                zakura_state::ReadRequest::BlockRoots {
+                    start_height,
+                    count,
+                } => {
+                    assert_eq!(start_height, block::Height(1));
+                    assert_eq!(count, 1);
+                    zakura_state::ReadResponse::BlockRoots(vec![BlockCommitmentRoots {
+                        height: block::Height(1),
+                        sapling_root: Default::default(),
+                        orchard_root: Default::default(),
+                        ironwood_root: Default::default(),
+                        sapling_tx: 1,
+                        orchard_tx: 0,
+                        ironwood_tx: 0,
+                        auth_data_root: [9; 32].into(),
+                    }])
+                }
+                request => panic!("unexpected mixed-page state request: {request:?}"),
+            })
+        });
+
+        let records = finalized_tree_aux_for_page(
+            read_state,
+            &zakura_chain::parameters::Network::Mainnet,
+            zakura_header_chain::Frontier::new(block::Height(0), block::Hash([0; 32])),
+            &headers,
+        )
+        .await
+        .expect("the finalized prefix roots are available");
+
+        assert_eq!(records.len(), 2);
+        assert_eq!(
+            records[0]
+                .expect("height one has a finalized root record")
+                .height,
+            block::Height(1)
+        );
+        assert_eq!(records[1], None);
+    }
+
+    #[tokio::test]
+    async fn finalized_metadata_is_not_attached_to_a_losing_path() {
+        let headers = two_page_headers();
+        let read_state = tower::service_fn(move |request| async move {
+            Ok::<_, zakura_state::BoxError>(match request {
+                zakura_state::ReadRequest::FinalizedTip => {
+                    zakura_state::ReadResponse::FinalizedTip(Some((
+                        block::Height(2),
+                        block::Hash([0x99; 32]),
+                    )))
+                }
+                zakura_state::ReadRequest::BestChainBlockHash(height) => {
+                    assert_eq!(height, block::Height(2));
+                    zakura_state::ReadResponse::BlockHash(Some(block::Hash([0x99; 32])))
+                }
+                request => panic!("a losing path must not request canonical roots: {request:?}"),
+            })
+        });
+        let records = finalized_tree_aux_for_page(
+            read_state,
+            &zakura_chain::parameters::Network::Mainnet,
+            zakura_header_chain::Frontier::new(block::Height(0), block::Hash([0; 32])),
+            &headers,
+        )
+        .await
+        .expect("a different finalized branch is a normal absence of metadata");
+        assert_eq!(records, vec![None, None]);
     }
 
     #[test]

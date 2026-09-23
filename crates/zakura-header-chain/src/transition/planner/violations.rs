@@ -158,8 +158,8 @@ pub enum HeaderViolation {
     /// Selected auxiliary repair lacks body authority.
     #[error("selected auxiliary repair does not have body authority")]
     RepairOwnerRoleMismatch,
-    /// Auxiliary repair is not one exact selected header.
-    #[error("auxiliary repair is not one exact selected header")]
+    /// Auxiliary repair is not one exact selected range.
+    #[error("auxiliary repair is not one exact selected range")]
     AuxiliaryRepairShape,
 }
 

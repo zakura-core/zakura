@@ -64,6 +64,7 @@ def run(
     capture: bool = False,
     check: bool = True,
     input_text: str | None = None,
+    timeout: int | None = None,
 ) -> subprocess.CompletedProcess[str]:
     try:
         return subprocess.run(
@@ -72,6 +73,7 @@ def run(
             capture_output=capture,
             text=True,
             input=input_text,
+            timeout=timeout,
         )
     except subprocess.CalledProcessError as error:
         detail = ""
@@ -172,6 +174,7 @@ def subst_for(node: Node) -> dict[str, str]:
         "POLL_INTERVAL_SECONDS": str(raw["poll_interval_seconds"]),
         "STARTUP_TIMEOUT_SECONDS": str(raw["startup_timeout_seconds"]),
         "STALL_SECONDS": str(raw["stall_seconds"]),
+        "STATUS_UNAVAILABLE_SECONDS": str(raw["status_unavailable_seconds"]),
         "MAX_RUN_SECONDS": str(raw["max_run_seconds"]),
         "READY_SAMPLES": str(raw["ready_samples"]),
         "READY_SAMPLE_INTERVAL_SECONDS": str(raw["ready_sample_interval_seconds"]),
@@ -391,6 +394,50 @@ def cmd_deploy(args: argparse.Namespace) -> int:
     return summarize_parallel(nodes, lambda node: deploy_node(node, args))
 
 
+def summary_node(args: argparse.Namespace) -> Node:
+    """Resolve the single inventory-owned sender without granting peer write access."""
+    with args.config.open("rb") as file:
+        hostname = tomllib.load(file)["summary"]["hostname"]
+    nodes = [node for node in load_nodes(args.config, None) if node.raw["hostname"] == hostname]
+    if len(nodes) != 1 or args.node:
+        raise DeployError("summary operations require one configured sender and no --node override")
+    return nodes[0]
+
+
+def cmd_deploy_summary(args: argparse.Namespace) -> int:
+    """Install reporting separately from controllers; never initialize delivery history."""
+    node = summary_node(args)
+    # Disable new invocations without interrupting a post between delivery and state save.
+    run(node.ssh_cmd(
+        "if systemctl cat zakura-sync-summary.timer >/dev/null 2>&1; then "
+        "systemctl disable --now zakura-sync-summary.timer; fi; "
+        "if systemctl cat zakura-sync-summary.service >/dev/null 2>&1; then "
+        'case "$(systemctl show --value --property=ActiveState zakura-sync-summary.service)" in '
+        "inactive|failed) ;; *) echo 'sender still running; wait for completion and retry installation' >&2; exit 1;; esac; fi"
+    ), timeout=30)
+    run(node.ssh_cmd("install -d -m 755 /opt/zakura-sync-summary"), timeout=30)
+    for name in ("daily_summary.py", "deploy.py", "alert-monitor.py"):
+        run(node.scp_to(SCRIPT_DIR / name, f"/opt/zakura-sync-summary/{name}"), timeout=30)
+    run(node.scp_to(args.config, "/opt/zakura-sync-summary/nodes.toml"), timeout=30)
+    for name in ("zakura-sync-summary.service", "zakura-sync-summary.timer"):
+        run(node.scp_to(TEMPLATES_DIR / name, f"/etc/systemd/system/{name}"), timeout=30)
+    run(node.ssh_cmd("systemctl daemon-reload"), timeout=30)
+    if not args.no_start:
+        with args.config.open("rb") as file:
+            state_path = tomllib.load(file)["summary"]["state_file"]
+        run(node.ssh_cmd(f"test -s {shlex.quote(state_path)} && systemctl enable --now zakura-sync-summary.timer"), timeout=30)
+    return 0
+
+
+def cmd_summary_status(args: argparse.Namespace) -> int:
+    node = summary_node(args)
+    proc = subprocess.run(node.ssh_cmd(
+        "systemctl is-active --quiet zakura-sync-summary.timer && "
+        "python3 /opt/zakura-sync-summary/daily_summary.py status"
+    ), timeout=30)
+    return proc.returncode
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     nodes = load_nodes(args.config, args.node)
 
@@ -466,6 +513,8 @@ def audit_problem(
         detail = f"controller halted: {failure}"
         if run_id:
             detail += f" (run {run_id})"
+        if url := state.get("last_failed_trace_archive_url"):
+            detail += f" | <{url}|Download traces (7 days)>"
         return Problem(
             f"controller-halted:{failure}", detail,
             incident_id, delivered_at,
@@ -729,13 +778,15 @@ def completion_run_text(item: dict[str, Any]) -> str:
     valid_duration = type(duration) is int and duration >= 0
     timing = (f"{duration // 3600}h {duration % 3600 // 60:02d}m"
               if valid_duration else "duration unavailable")
+    url = item.get("trace_archive_url")
+    download = f" · <{url}|Download traces (7 days)>" if url else ""
     height = item.get("end_height")
     if type(height) is not int or not 0 <= height <= 0xFFFFFFFF:
-        return f"{timing} · BPS unavailable"
+        return f"{timing} · BPS unavailable{download}"
     # Every cycle starts from empty chain state; height zero is genesis.
     blocks = height + 1
     rate = f"{blocks / duration:.0f} blocks/sec" if valid_duration and duration > 0 else "BPS unavailable"
-    return f"{timing} · {rate}"
+    return f"{timing} · {rate}{download}"
 
 
 def completion_updates(
@@ -772,6 +823,7 @@ def completion_updates(
         history[total] = {
             "run_id": run_id, "duration": controller.get("last_success_duration_seconds"),
             "end_height": controller.get("last_success_end_height"),
+            "trace_archive_url": controller.get("last_success_trace_archive_url"),
         }
         details = completion_details(old) + [history[number] for number in sorted(history)]
         records[name] = {
@@ -780,6 +832,7 @@ def completion_updates(
             "sha": controller.get("last_success_sha", "unknown"),
             "duration": controller.get("last_success_duration_seconds"),
             "end_height": controller.get("last_success_end_height"),
+            "trace_archive_url": controller.get("last_success_trace_archive_url"),
             "pending": old.get("pending", 0) + delta,
             "details": details[-COMPLETION_DETAIL_LIMIT:],
         }
@@ -843,9 +896,13 @@ def cmd_audit(args: argparse.Namespace) -> int:
         destination=destination,
     )
     state["problems"].update({k: v for k, v in prior_problems.items() if k not in selected})
-    completion_lines, state["completions"] = completion_updates(
-        statuses, previous, digest_due, {node.name: sync_label(node) for node in nodes}
-    )
+    completion_lines = []
+    # Normal audits no longer own routine summaries. Keep explicit legacy mode for rollback.
+    state["completions"] = previous.get("completions", {})
+    if getattr(args, "legacy_digest", False):
+        completion_lines, state["completions"] = completion_updates(
+            statuses, previous, digest_due, {node.name: sync_label(node) for node in nodes}
+        )
     state["last_digest_at"] = timestamp if digest_due else last_digest
     text = audit_message(new_lines, reminder_lines, recovered_lines)
     if completion_lines:
@@ -881,7 +938,7 @@ def cmd_audit(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
 
-    return 1 if problems else 0
+    return 1 if problems or not posted else 0
 
 
 def summarize_parallel(nodes: list[Node], fn) -> int:
@@ -911,10 +968,14 @@ def parse_args() -> argparse.Namespace:
     deploy = sub.add_parser("deploy", help="install controller/config/systemd files")
     deploy.add_argument("--no-start", action="store_true", help="install but do not start controller")
     deploy.add_argument("--dry-run", action="store_true", help="render local files only")
+    summary = sub.add_parser("deploy-summary", help="install the daily sender without restarting nodes")
+    summary.add_argument("--no-start", action="store_true", help="install only; initialize delivery state before enabling")
+    sub.add_parser("summary-status", help="check the sender timer and overdue delivery")
     sub.add_parser("status", help="fetch controller status JSON")
     sub.add_parser("resume", help="clear durable failure marker and restart controller")
     audit = sub.add_parser("audit", help="scheduled external audit for CI")
     audit.add_argument("--dry-run", action="store_true")
+    audit.add_argument("--legacy-digest", action="store_true", help="rollback only: emit summaries from the old audit cache")
     audit.add_argument(
         "--max-completion-age",
         type=int,
@@ -941,6 +1002,10 @@ def main() -> int:
     try:
         if args.command == "deploy":
             return cmd_deploy(args)
+        if args.command == "deploy-summary":
+            return cmd_deploy_summary(args)
+        if args.command == "summary-status":
+            return cmd_summary_status(args)
         if args.command == "status":
             return cmd_status(args)
         if args.command == "resume":

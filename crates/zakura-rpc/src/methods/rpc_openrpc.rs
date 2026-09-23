@@ -160,7 +160,7 @@ pub static METHODS: ::phf::Map<&str, openrpsee::openrpc::RpcMethod> = ::phf::phf
     deprecated: false,
 },
 "getblocktemplate" => openrpsee::openrpc::RpcMethod {
-    description: "Returns a block template for mining new Zcash blocks.\n\n# Parameters\n\n- `jsonrequestobject`: (string, optional) A JSON object containing arguments.\n\nzcashd reference: [`getblocktemplate`](https://zcash-rpc.github.io/getblocktemplate.html)\nmethod: post\ntags: mining\n\n# Notes\n\nArguments to this RPC are currently ignored.\nLong polling, block proposals, server lists, and work IDs are not supported.\n\nMiners can make arbitrary changes to blocks, as long as:\n- the data sent to `submitblock` is a valid Zcash block, and\n- the parent block is a valid block that Zebra already has, or will receive soon.\n\nZebra verifies blocks in parallel, and keeps recent chains in parallel,\nso moving between chains and forking chains is very cheap.\n",
+    description: "Returns a block template for mining new Zcash blocks.\n\n# Parameters\n\n- `jsonrequestobject`: (string, optional) A JSON object containing arguments.\n\nzcashd reference: [`getblocktemplate`](https://zcash-rpc.github.io/getblocktemplate.html)\nmethod: post\ntags: mining\n\n# Notes\n\nServer lists are not supported. Long polling, block proposals, and work IDs are supported.\n\nMiners can make arbitrary changes to blocks, as long as:\n- the data sent to `submitblock` is a valid Zcash block, and\n- the parent block is a valid block that Zebra already has, or will receive soon.\n\nZebra verifies blocks in parallel, and keeps recent chains in parallel,\nso moving between chains and forking chains is very cheap.\n",
     params: |_g| vec![
         _g.param::<GetBlockTemplateParameters>("parameters", crate::methods::PARAM_PARAMETERS_DESC, false),
     ],
@@ -168,7 +168,7 @@ pub static METHODS: ::phf::Map<&str, openrpsee::openrpc::RpcMethod> = ::phf::phf
     deprecated: false,
 },
 "submitblock" => openrpsee::openrpc::RpcMethod {
-    description: "Submits block to the node to be validated and committed.\nReturns the [`SubmitBlockResponse`] for the operation, as a JSON string.\n\nzcashd reference: [`submitblock`](https://zcash.github.io/rpc/submitblock.html)\nmethod: post\ntags: mining\n\n# Parameters\n\n- `hexdata`: (string, required)\n- `jsonparametersobject`: (string, optional) - currently ignored\n\n# Notes\n\n - `jsonparametersobject` holds a single field, workid, that must be included in submissions if provided by the server.\n",
+    description: "Submits block to the node to be validated and committed.\nReturns the [`SubmitBlockResponse`] for the operation, as a JSON string.\n\nzcashd reference: [`submitblock`](https://zcash.github.io/rpc/submitblock.html)\nmethod: post\ntags: mining\n\n# Parameters\n\n- `hexdata`: (string, required)\n- `jsonparametersobject`: (string, optional)\n\n# Notes\n\n - `jsonparametersobject` holds a single field, workid, that must be included in submissions if provided by the server.\n",
     params: |_g| vec![
         _g.param::<HexData>("hex_data", crate::methods::PARAM_HEX_DATA_DESC, true),
         _g.param::<SubmitBlockParameters>("_parameters", crate::methods::PARAM__PARAMETERS_DESC, false),
@@ -184,7 +184,7 @@ pub static METHODS: ::phf::Map<&str, openrpsee::openrpc::RpcMethod> = ::phf::phf
     deprecated: false,
 },
 "getnetworksolps" => openrpsee::openrpc::RpcMethod {
-    description: "Returns the estimated network solutions per second based on the last `num_blocks` before\n`height`.\n\nIf `num_blocks` is not supplied, uses 120 blocks. If it is 0 or -1, uses the difficulty\naveraging window.\nIf `height` is not supplied or is -1, uses the tip height.\n\nzcashd reference: [`getnetworksolps`](https://zcash.github.io/rpc/getnetworksolps.html)\nmethod: post\ntags: mining\n",
+    description: "Returns the estimated network solutions per second based on the last `num_blocks` before\n`height`.\n\nIf `num_blocks` is not supplied, uses 120 blocks. If it is 0 or -1, uses the difficulty\naveraging window at `height`, which ZIP 218 widens at NU7.\nIf `height` is not supplied or is -1, uses the tip height.\n\nzcashd reference: [`getnetworksolps`](https://zcash.github.io/rpc/getnetworksolps.html)\nmethod: post\ntags: mining\n",
     params: |_g| vec![
         _g.param::<i32>("num_blocks", crate::methods::PARAM_NUM_BLOCKS_DESC, false),
         _g.param::<i32>("height", crate::methods::PARAM_HEIGHT_DESC, false),
@@ -239,7 +239,7 @@ pub static METHODS: ::phf::Map<&str, openrpsee::openrpc::RpcMethod> = ::phf::phf
     deprecated: false,
 },
 "getblocksubsidy" => openrpsee::openrpc::RpcMethod {
-    description: "Returns the block subsidy reward of the block at `height`, taking into account the mining slow start.\nReturns an error if `height` is less than the height of the first halving for the current network.\n\nzcashd reference: [`getblocksubsidy`](https://zcash.github.io/rpc/getblocksubsidy.html)\nmethod: post\ntags: mining\n\n# Parameters\n\n- `height`: (numeric, optional, example=1) Can be any valid current or future height.\n\n# Notes\n\nIf `height` is not supplied, uses the tip height.\n",
+    description: "Returns the block subsidy reward of the block at `height`, taking into account the mining slow start.\nReturns an error if `height` is less than the height of the first halving for the current network.\n\nzcashd reference: [`getblocksubsidy`](https://zcash.github.io/rpc/getblocksubsidy.html)\nmethod: post\ntags: mining\n\n# Parameters\n\n- `height`: (numeric, optional, example=1) Can be any valid current or future height.\n\n# Notes\n\nIf `height` is not supplied, uses the tip height.\n\nFrom the ZIP 234 reissuance start height, the subsidy depends on the parent block\'s\nchain value pools, so `height` must be at most one block above the best chain tip.\n",
     params: |_g| vec![
         _g.param::<u32>("height", crate::methods::PARAM_HEIGHT_DESC, false),
     ],

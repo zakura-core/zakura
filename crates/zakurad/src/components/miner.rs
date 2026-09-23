@@ -92,6 +92,13 @@ fn cancel_if_mining_template_changed(
     }
 }
 
+/// Waits for a template update or channel closure, with a timeout for shutdown checks.
+async fn wait_for_mining_template_change(
+    template_receiver: &mut WatchReceiver<Option<Arc<Block>>>,
+) {
+    let _ = tokio::time::timeout(BLOCK_TEMPLATE_WAIT_TIME, template_receiver.changed()).await;
+}
+
 /// Initialize the miner based on its config, and spawn a task for it.
 ///
 /// This method is CPU and memory-intensive. It uses 144 MB of RAM and one CPU core per configured
@@ -324,13 +331,29 @@ where
     // Request long polling so each update says whether current work remains valid.
     let mut parameters =
         GetBlockTemplateParameters::new(Template, None, vec![LongPoll, CoinbaseTxn], None, None);
+    let mut active_work_id: Option<String> = None;
 
     // Shut down the task when all the template receivers are dropped, or Zebra shuts down.
     while !template_sender.is_closed() && !is_shutting_down() {
-        let template: Result<_, _> = rpc.get_block_template(Some(parameters.clone())).await;
+        let template: Result<_, _> = tokio::select! {
+            biased;
+            _ = async {
+                if let Some(work_id) = &active_work_id {
+                    rpc.wait_for_mining_template_rejection(work_id).await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            } => {
+                template_sender.send_replace(None);
+                active_work_id = None;
+                continue;
+            }
+            template = rpc.get_block_template(Some(parameters.clone())) => template,
+        };
 
         // Wait for the chain to sync so we get a valid template.
         let Ok(template) = template else {
+            active_work_id = None;
             let active_template_invalidated = template_sender.send_if_modified(|template| {
                 if template.is_none() {
                     return false;
@@ -362,7 +385,23 @@ where
 
         let height = template.height();
         let transaction_count = template.transactions().len();
-        let submit_old = template.submit_old();
+        let mut submit_old = template.submit_old();
+        let work_id = template.work_id().clone();
+        if rpc.mining_template_withdrawn(&work_id) {
+            continue;
+        }
+        // External long polls withdraw all old shares on rejection. The internal miner
+        // can preserve work that already passed validation on the same parent.
+        if parameters.long_poll_id().is_some_and(|old| {
+            let new = template.long_poll_id();
+            new.same_work_context(&old) && new.revision() != old.revision()
+        }) && active_work_id
+            .as_ref()
+            .is_some_and(|id| rpc.mining_template_prepared(id))
+            && chrono::Utc::now().timestamp() < i64::from(template.max_time().timestamp())
+        {
+            submit_old = Some(true);
+        }
 
         // Tell the next get_block_template() call to wait until the template has changed.
         parameters = GetBlockTemplateParameters::new(
@@ -395,6 +434,7 @@ where
         });
 
         if template_replaced {
+            active_work_id = Some(work_id);
             info!(
                 ?height,
                 transactions = ?transaction_count,
@@ -412,7 +452,19 @@ where
         // If the blockchain is changing rapidly, limit how often we'll update the template.
         // But if we're shutting down, do that immediately.
         if !template_sender.is_closed() && !is_shutting_down() {
-            sleep(BLOCK_TEMPLATE_REFRESH_LIMIT).await;
+            tokio::select! {
+                _ = sleep(BLOCK_TEMPLATE_REFRESH_LIMIT) => {},
+                _ = async {
+                    if let Some(work_id) = &active_work_id {
+                        rpc.wait_for_mining_template_rejection(work_id).await;
+                    } else {
+                        std::future::pending::<()>().await;
+                    }
+                } => {
+                    template_sender.send_replace(None);
+                    active_work_id = None;
+                }
+            }
         }
     }
 
@@ -504,7 +556,7 @@ where
 
             // Skip the wait if we didn't get a template because we are shutting down.
             if !is_shutting_down() {
-                sleep(BLOCK_TEMPLATE_WAIT_TIME).await;
+                wait_for_mining_template_change(&mut template_receiver).await;
             }
 
             continue;
@@ -731,6 +783,71 @@ mod tests {
         ));
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn idle_solver_wakes_when_template_arrives() {
+        let block = zakura_chain::block::genesis::regtest_genesis_block();
+        let (sender, receiver) = watch::channel(None);
+        let mut receiver = WatchReceiver::new(receiver);
+        {
+            let wait = wait_for_mining_template_change(&mut receiver);
+            tokio::pin!(wait);
+            assert!(futures::poll!(&mut wait).is_pending());
+            tokio::time::advance(Duration::from_secs(1)).await;
+            sender.send(Some(block.clone())).unwrap();
+            tokio::time::timeout(Duration::from_millis(1), wait)
+                .await
+                .expect("new work must wake an idle solver before the 20-second timer");
+        }
+        assert_eq!(receiver.cloned_watch_data(), Some(block));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_solver_observes_template_arriving_before_wait() {
+        let block = zakura_chain::block::genesis::regtest_genesis_block();
+        let (sender, receiver) = watch::channel(None);
+        let mut receiver = WatchReceiver::new(receiver);
+        receiver.mark_as_seen();
+        assert!(receiver.cloned_watch_data().is_none());
+        sender.send(Some(block.clone())).unwrap();
+        tokio::time::timeout(
+            Duration::from_millis(1),
+            wait_for_mining_template_change(&mut receiver),
+        )
+        .await
+        .expect("a template arriving between the read and wait must not be missed");
+        assert_eq!(receiver.cloned_watch_data(), Some(block));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_solver_wakes_when_template_sender_closes() {
+        let (sender, receiver) = watch::channel(None);
+        let mut receiver = WatchReceiver::new(receiver);
+        {
+            let wait = wait_for_mining_template_change(&mut receiver);
+            tokio::pin!(wait);
+            assert!(futures::poll!(&mut wait).is_pending());
+            drop(sender);
+            tokio::time::timeout(Duration::from_millis(1), wait)
+                .await
+                .expect("channel closure must wake an idle solver promptly");
+        }
+        assert!(receiver.has_changed().is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_solver_wait_is_bounded_for_shutdown_checks() {
+        let (_sender, receiver) = watch::channel(None);
+        let mut receiver = WatchReceiver::new(receiver);
+        let started = tokio::time::Instant::now();
+        tokio::time::timeout(
+            BLOCK_TEMPLATE_WAIT_TIME + Duration::from_secs(1),
+            wait_for_mining_template_change(&mut receiver),
+        )
+        .await
+        .expect("an idle solver must periodically recheck shutdown without channel updates");
+        assert!(started.elapsed() >= BLOCK_TEMPLATE_WAIT_TIME);
+    }
+
     #[tokio::test]
     async fn template_generation_failure_invalidates_current_template() {
         let network = Network::Mainnet;
@@ -821,5 +938,140 @@ mod tests {
 
         template_generator.abort();
         rpc_queue_task.abort();
+    }
+
+    #[tokio::test]
+    async fn template_rejection_cancels_during_refresh_delay() {
+        check_template_rejection_cancellation(false).await;
+    }
+
+    #[tokio::test]
+    async fn template_rejection_cancels_during_rpc_wait() {
+        check_template_rejection_cancellation(true).await;
+    }
+
+    async fn check_template_rejection_cancellation(during_rpc: bool) {
+        let _init_guard = zakura_test::init();
+        let network = Network::Mainnet;
+        let parent = block::Hash([1; 32]);
+        let height = zakura_chain::parameters::NetworkUpgrade::Nu5
+            .activation_height(&network)
+            .unwrap();
+        let (tip, tip_sender) = MockChainTip::new();
+        tip_sender.send_best_tip_height(height);
+        tip_sender.send_best_tip_hash(parent);
+        tip_sender.send_estimated_distance_to_network_chain_tip(Some(0));
+        let mut sync = MockSyncStatus::default();
+        sync.set_is_close_to_tip(true);
+        let (mempool_calls, mut calls) = watch::channel(0);
+        let mempool = tower::service_fn(move |_| {
+            mempool_calls.send_modify(|calls| *calls += 1);
+            async move {
+                Ok::<_, zakura_node_services::BoxError>(mempool::Response::FullTransactions {
+                    transactions: vec![],
+                    transaction_dependencies: Default::default(),
+                    last_seen_tip_hash: parent,
+                })
+            }
+        });
+        let block = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
+            .zcash_deserialize_into::<Arc<Block>>()
+            .unwrap();
+        let difficulty = block.header.difficulty_threshold;
+        let read_state = tower::service_fn(move |request| async move {
+            assert!(matches!(request, zakura_state::ReadRequest::ChainInfo));
+            Ok::<_, zakura_state::BoxError>(zakura_state::ReadResponse::ChainInfo(
+                zakura_state::GetBlockTemplateChainInfo {
+                    value_pools: Default::default(),
+                    expected_difficulty: difficulty,
+                    tip_height: height,
+                    tip_hash: parent,
+                    cur_time: 2_000_000_000.into(),
+                    min_time: 1_999_999_999.into(),
+                    max_time: 2_000_005_000.into(),
+                    chain_history_root: Some([0; 32].into()),
+                },
+            ))
+        });
+        let state = MockService::build().for_unit_tests::<zakura_state::Request, zakura_state::Response, zakura_state::BoxError>();
+        let mut verifier = MockService::build()
+            .for_unit_tests::<zakura_consensus::Request, block::Hash, zakura_consensus::BoxError>();
+        let mining_config = zakura_rpc::config::mining::Config {
+            miner_address: Some(
+                default_miner_address(network.kind(), &MinerAddressType::Transparent)
+                    .parse()
+                    .unwrap(),
+            ),
+            internal_miner: true,
+            ..Default::default()
+        };
+        let (_log, log_rx) = watch::channel(None);
+        let (rpc, queue) = RpcImpl::new(
+            network,
+            mining_config,
+            false,
+            "0.0.1",
+            "withdrawal test",
+            Buffer::new(mempool, 1),
+            Buffer::new(state, 1),
+            Buffer::new(read_state, 1),
+            Buffer::new(verifier.clone(), 1),
+            sync,
+            tip,
+            MockAddressBookPeers::default(),
+            log_rx,
+            None,
+        );
+        let (sender, mut receiver) = watch::channel(None);
+        let generator = tokio::spawn(generate_block_templates(rpc, sender));
+        tokio::time::timeout(Duration::from_secs(1), receiver.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        let old_header = *receiver.borrow_and_update().as_ref().unwrap().header;
+        let mut solver_receiver = WatchReceiver::new(receiver.clone());
+        let preparation = verifier
+            .expect_request_that(|request| {
+                matches!(request, zakura_consensus::Request::Prepare { .. })
+            })
+            .await;
+        if during_rpc {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while *calls.borrow_and_update() < 2 {
+                    calls.changed().await.unwrap();
+                }
+            })
+            .await
+            .unwrap();
+        }
+        preparation.respond_error(Box::new(zakura_consensus::RouterError::Block {
+            source: Box::new(zakura_consensus::BlockError::DuplicateTransaction.into()),
+        }));
+        tokio::time::timeout(Duration::from_secs(1), receiver.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(receiver.borrow_and_update().is_none());
+        assert!(matches!(
+            cancel_if_mining_template_changed(&mut solver_receiver, old_header),
+            Err(SolverCancelled)
+        ));
+        let recovery = verifier
+            .expect_request_that(|request| {
+                matches!(request, zakura_consensus::Request::Prepare { .. })
+            })
+            .await;
+        assert!(
+            receiver.borrow().is_none(),
+            "mining must stop while recovery validates"
+        );
+        recovery.respond(block::Hash([2; 32]));
+        tokio::time::timeout(Duration::from_secs(1), receiver.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(receiver.borrow().is_some());
+        generator.abort();
+        queue.abort();
     }
 }

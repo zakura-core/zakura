@@ -1,6 +1,6 @@
 use super::super::trace::{
     block_sync_message_label, elapsed_us, height as trace_height, peer as trace_peer,
-    saturating_usize, BlockTraceEvent, BlockTraceFields, BoolOrU64, QueueSendFailedEvent,
+    saturating_usize, BlockTraceEvent, BlockTraceFields, BoolOrU64,
 };
 use super::*;
 use crate::zakura::trace::block_sync_trace as bs_trace;
@@ -67,6 +67,7 @@ impl PeerRoutine {
         let unreceived_count = u64::try_from(unreceived_count).unwrap_or(u64::MAX);
         if outcome.missing_count == 0
             && outcome.released_count == 0
+            && outcome.committed_count == 0
             && outcome.returned_count == unreceived_count
         {
             return;
@@ -106,18 +107,6 @@ impl PeerRoutine {
             row.budget_available = Some(self.budget.available());
             row.pending_work = Some(saturating_usize(self.work.pending_len()));
             row.received_status = Some(BoolOrU64::U64(u64::from(self.received_status)));
-        });
-    }
-
-    pub(super) fn trace_queue_send_failed(&self, msg: &BlockSyncMessage, error: &OrderedSendError) {
-        self.trace.emit_event(|| {
-            QueueSendFailedEvent::peer_routine(
-                &self.peer,
-                msg,
-                error,
-                self.session.outbound_capacity(),
-                self.session.outbound_max_capacity(),
-            )
         });
     }
 
@@ -288,6 +277,7 @@ impl PeerRoutine {
 fn insert_work_return_outcome(row: &mut BlockTraceFields, outcome: WorkReturnOutcome) {
     row.released_bytes = Some(outcome.released_bytes);
     row.returned_count = Some(outcome.returned_count);
+    row.committed_count = Some(outcome.committed_count);
     row.already_pending_count = Some(outcome.already_pending_count);
     row.released_count = Some(outcome.released_count);
     row.missing_count = Some(outcome.missing_count);

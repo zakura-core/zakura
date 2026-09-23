@@ -9,8 +9,10 @@ pub mod zip317;
 mod tests;
 
 use std::{
+    collections::{HashSet, VecDeque},
     fmt::{self},
-    sync::Arc,
+    sync::{Arc, Mutex},
+    time::Duration,
 };
 
 use derive_getters::Getters;
@@ -18,7 +20,7 @@ use derive_new::new;
 use jsonrpsee::core::RpcResult;
 use jsonrpsee_types::{ErrorCode, ErrorObject};
 use rand::{rngs::OsRng, RngCore};
-use tokio::sync::mpsc::{self, error::TrySendError};
+use tokio::sync::{mpsc, watch, Semaphore};
 use tower::{Service, ServiceExt};
 use zcash_keys::address::Address;
 use zcash_protocol::memo::MemoBytes;
@@ -30,7 +32,10 @@ use zakura_chain::{
     },
     chain_sync_status::ChainSyncStatus,
     chain_tip::ChainTip,
-    parameters::Network,
+    parameters::{
+        subsidy::{is_zip234_active, parent_nsm_value_balance},
+        Network,
+    },
     serialization::{DateTime32, ZcashDeserializeInto},
     transaction::VerifiedUnminedTx,
     work::difficulty::{CompactDifficulty, ExpandedDifficulty},
@@ -40,7 +45,9 @@ use zcash_script::{opcode::PushValue, pv::push_value};
 #[allow(unused_imports)]
 use zakura_chain::serialization::BytesInDisplayOrder;
 
-use zakura_consensus::{router::service_trait::BlockVerifierService, MAX_BLOCK_SIGOPS};
+use zakura_consensus::{
+    error::TransactionError, router::service_trait::BlockVerifierService, MAX_BLOCK_SIGOPS,
+};
 use zakura_node_services::mempool::{self, TransactionDependencies};
 use zakura_state::GetBlockTemplateChainInfo;
 
@@ -52,8 +59,8 @@ use crate::{
     methods::types::{
         default_roots::DefaultRoots, long_poll::LongPollId, transaction::TransactionTemplate,
     },
-    server::error::OkOrError,
-    SubmitBlockChannel,
+    server::error::{LegacyCode, MapError, OkOrError},
+    MinedBlockEvent, PendingBlockRegistry, SubmitBlockChannel,
 };
 
 use constants::{
@@ -64,6 +71,119 @@ pub use parameters::{
     GetBlockTemplateCapability, GetBlockTemplateParameters, GetBlockTemplateRequestMode,
 };
 pub use proposal::{BlockProposalResponse, BlockTemplateTimeSource};
+
+/// Proof construction can itself use multiple cores. Admit one build across RPC clones.
+const MAX_TEMPLATE_BUILDS: usize = 1;
+/// Bound admission waits without cancelling an already running proof.
+const TEMPLATE_BUILD_WAIT: Duration = Duration::from_secs(30);
+
+/// Rejections for the current template parent. Overflow fails closed until the tip changes.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct TemplateRejections {
+    pub(crate) parent: Option<block::Hash>,
+    pub(crate) revision: u64,
+    rejected: HashSet<String>,
+    prepared: VecDeque<String>,
+    pub(crate) saturated: bool,
+}
+
+impl TemplateRejections {
+    pub(crate) fn set_parent(&mut self, parent: block::Hash) {
+        if self.parent != Some(parent) {
+            self.parent = Some(parent);
+            self.rejected.clear();
+            self.prepared.clear();
+            self.saturated = false;
+        }
+    }
+
+    pub(crate) fn reject(&mut self, parent: block::Hash, work_id: &str) -> bool {
+        if self.parent != Some(parent) || self.contains(work_id) {
+            return false;
+        }
+        if self.rejected.len() == 64 {
+            self.saturated = true;
+        } else {
+            self.rejected.insert(work_id.to_owned());
+        }
+        self.revision = self
+            .revision
+            .checked_add(1)
+            .expect("template revision cannot exhaust u64");
+        true
+    }
+
+    pub(crate) fn contains(&self, work_id: &str) -> bool {
+        self.saturated || self.rejected.contains(work_id)
+    }
+
+    pub(crate) fn needs_fallback(&self) -> bool {
+        self.saturated || !self.rejected.is_empty()
+    }
+
+    pub(crate) fn mark_prepared(&mut self, parent: block::Hash, work_id: &str) {
+        if self.parent == Some(parent) && !self.prepared.iter().any(|id| id == work_id) {
+            if self.prepared.len() == 64 {
+                self.prepared.pop_front();
+            }
+            self.prepared.push_back(work_id.to_owned());
+        }
+    }
+
+    pub(crate) fn is_prepared(&self, work_id: &str) -> bool {
+        self.prepared.iter().any(|id| id == work_id) && !self.contains(work_id)
+    }
+
+    pub(crate) fn withdrawn(&self, work_id: &str) -> bool {
+        self.contains(work_id) || (self.needs_fallback() && !self.is_prepared(work_id))
+    }
+}
+
+#[derive(Clone, Debug)]
+struct TemplatePreparationQueue<T>(Arc<Mutex<TemplatePreparationState<T>>>);
+
+#[derive(Debug)]
+struct TemplatePreparationState<T> {
+    running: bool,
+    pending: Option<T>,
+}
+
+impl<T> Default for TemplatePreparationQueue<T> {
+    fn default() -> Self {
+        Self(Arc::new(Mutex::new(TemplatePreparationState {
+            running: false,
+            pending: None,
+        })))
+    }
+}
+
+impl<T> TemplatePreparationQueue<T> {
+    fn enqueue(&self, template: T) -> Option<T> {
+        let mut state = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.running {
+            state.pending = Some(template);
+            None
+        } else {
+            state.running = true;
+            Some(template)
+        }
+    }
+
+    fn next_or_finish(&self) -> Option<T> {
+        let mut state = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let next = state.pending.take();
+        if next.is_none() {
+            state.running = false;
+        }
+        next
+    }
+}
 
 /// An alias to indicate that a usize value represents the depth of in-block dependencies of a
 /// transaction.
@@ -81,12 +201,8 @@ type InBlockTxDependenciesDepth = usize;
 pub struct BlockTemplateResponse {
     /// The getblocktemplate RPC capabilities supported by Zebra.
     ///
-    /// At the moment, Zebra does not support any of the extra capabilities from the specification:
-    /// - `proposal`: <https://en.bitcoin.it/wiki/BIP_0023#Block_Proposal>
-    /// - `longpoll`: <https://en.bitcoin.it/wiki/BIP_0022#Optional:_Long_Polling>
-    /// - `serverlist`: <https://en.bitcoin.it/wiki/BIP_0023#Logical_Services>
-    ///
-    /// By the above, Zebra will always return an empty vector here.
+    /// Zakura accepts proposal, long-poll, and work-ID fields without requiring miners to declare
+    /// those capabilities. Zakura does not support server lists.
     pub(crate) capabilities: Vec<String>,
 
     /// The version of the block format.
@@ -204,6 +320,10 @@ pub struct BlockTemplateResponse {
     #[getter(copy)]
     pub(crate) max_time: DateTime32,
 
+    /// Identifies this prepared mining candidate.
+    #[serde(rename = "workid")]
+    pub(crate) work_id: String,
+
     /// > only relevant for long poll responses:
     /// > indicates if work received prior to this response remains potentially valid (default)
     /// > and should have its shares submitted;
@@ -254,6 +374,7 @@ impl fmt::Debug for BlockTemplateResponse {
             .field("bits", &self.bits)
             .field("height", &self.height)
             .field("max_time", &self.max_time)
+            .field("work_id", &self.work_id)
             .field("submit_old", &self.submit_old)
             .finish()
     }
@@ -268,17 +389,20 @@ impl BlockTemplateResponse {
     /// Returns a new [`BlockTemplateResponse`] struct, based on the supplied arguments and defaults.
     ///
     /// The result of this method only depends on the supplied arguments and constants.
-    #[allow(clippy::too_many_arguments)]
+    ///
+    /// Returns an error if the coinbase transaction cannot be built, for example because
+    /// the chain tip's value pools make the ZIP 234 NSM value balance negative. Its `expect`s
+    /// check invariants that the caller already guarantees.
+    #[allow(clippy::too_many_arguments, clippy::unwrap_in_result)]
     pub(crate) fn new_internal(
         net: &Network,
         precomputed_coinbase: Option<TransactionTemplate<amount::NegativeOrZero>>,
         miner_params: &MinerParams,
         chain_info: &GetBlockTemplateChainInfo,
         long_poll_id: LongPollId,
-        #[cfg(not(test))] mempool_txs: Vec<VerifiedUnminedTx>,
-        #[cfg(test)] mempool_txs: Vec<(InBlockTxDependenciesDepth, VerifiedUnminedTx)>,
+        mempool_txs: Vec<zip317::SelectedMempoolTx>,
         submit_old: Option<bool>,
-    ) -> Self {
+    ) -> Result<Self, TransactionError> {
         // Determine the next block height.
         let height = chain_info
             .tip_height
@@ -327,10 +451,24 @@ impl BlockTemplateResponse {
             .sum::<amount::Result<Amount<NonNegative>>>()
             .expect("mempool tx fees must be non-negative");
 
-        let coinbase_txn = precomputed_coinbase.unwrap_or_else(|| {
-            TransactionTemplate::new_coinbase(net, height, miner_params, txs_fee)
-                .expect("valid coinbase tx")
-        });
+        let coinbase_txn = match precomputed_coinbase {
+            Some(coinbase_txn) => coinbase_txn,
+            // ZIP 234 derives the subsidy from the money reserve after the parent, which
+            // is the chain tip this template builds on.
+            None => TransactionTemplate::new_coinbase(
+                net,
+                height,
+                miner_params,
+                txs_fee,
+                if is_zip234_active(net, height) {
+                    Some(parent_nsm_value_balance(
+                        chain_info.value_pools.nsm_value_balance_amount(),
+                    )?)
+                } else {
+                    None
+                },
+            )?,
+        };
 
         let default_roots = DefaultRoots::from_coinbase(
             net,
@@ -358,7 +496,7 @@ impl BlockTemplateResponse {
             "creating template ... "
         );
 
-        BlockTemplateResponse {
+        Ok(BlockTemplateResponse {
             capabilities,
 
             version: ZCASH_BLOCK_VERSION,
@@ -395,9 +533,17 @@ impl BlockTemplateResponse {
 
             max_time: chain_info.max_time,
 
+            work_id: new_work_id(),
+
             submit_old,
-        }
+        })
     }
+}
+
+fn new_work_id() -> String {
+    let mut bytes = [0; 16];
+    OsRng.fill_bytes(&mut bytes);
+    hex::encode(bytes)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -561,7 +707,25 @@ where
 
     /// A channel to send successful block submissions to the block gossip task,
     /// so they can be advertised to peers.
-    mined_block_sender: mpsc::Sender<(block::Hash, block::Height)>,
+    mined_block_sender: mpsc::UnboundedSender<MinedBlockEvent>,
+
+    /// Blocks whose hashes were advertised before contextual commit completed.
+    pending_blocks: PendingBlockRegistry,
+
+    /// Detached submissions that still own verification or contextual commit work.
+    mined_submissions: super::submit_block::MinedSubmissions,
+
+    /// Whether state admission can trigger an early inventory.
+    optimistic_block_inventory: bool,
+
+    /// Coalesces detached template preparation work to the newest template.
+    template_preparation_queue: TemplatePreparationQueue<BlockTemplateResponse>,
+
+    /// Shared by foreground construction and long-poll coinbase precomputation.
+    template_build_slots: Arc<Semaphore>,
+
+    /// Retains failures so late subscribers cannot miss template withdrawal.
+    pub(crate) template_rejections: watch::Sender<TemplateRejections>,
 }
 
 impl<BlockVerifierRouter, SyncStatus> GetBlockTemplateHandler<BlockVerifierRouter, SyncStatus>
@@ -569,21 +733,65 @@ where
     BlockVerifierRouter: BlockVerifierService,
     SyncStatus: ChainSyncStatus + Clone + Send + Sync + 'static,
 {
-    /// Creates a new [`GetBlockTemplateHandler`].
-    pub fn new(
+    /// Creates a handler with a registry shared by RPC and peer serving.
+    pub fn new_with_pending_blocks(
         net: &Network,
         conf: config::mining::Config,
         block_verifier_router: BlockVerifierRouter,
         sync_status: SyncStatus,
-        mined_block_sender: Option<mpsc::Sender<(block::Hash, block::Height)>>,
+        mined_block_sender: Option<mpsc::UnboundedSender<MinedBlockEvent>>,
+        pending_blocks: PendingBlockRegistry,
     ) -> Self {
+        let optimistic_block_inventory = conf.optimistic_block_inventory;
         Self {
             miner_params: MinerParams::new(net, conf).ok(),
             block_verifier_router,
             sync_status,
             mined_block_sender: mined_block_sender
                 .unwrap_or(SubmitBlockChannel::default().sender()),
+            pending_blocks,
+            mined_submissions: Default::default(),
+            optimistic_block_inventory,
+            template_preparation_queue: TemplatePreparationQueue::default(),
+            template_build_slots: Arc::new(Semaphore::new(MAX_TEMPLATE_BUILDS)),
+            template_rejections: watch::channel(TemplateRejections::default()).0,
         }
+    }
+
+    /// Runs bounded proof work off the async worker, retaining capacity across cancellation.
+    pub(crate) async fn run_template_build<T: Send + 'static>(
+        &self,
+        build: impl FnOnce() -> T + Send + 'static,
+    ) -> RpcResult<T> {
+        let permit = tokio::time::timeout(
+            TEMPLATE_BUILD_WAIT,
+            self.template_build_slots.clone().acquire_owned(),
+        )
+        .await
+        .map_err(|_| {
+            ErrorObject::owned(
+                LegacyCode::Misc.into(),
+                "timed out waiting for mining template construction capacity",
+                None::<()>,
+            )
+        })?
+        .map_misc_error()?;
+
+        tokio::task::spawn_blocking(move || {
+            // Dropping the RPC future cannot release capacity while this job still owns work.
+            let _permit = permit;
+            build()
+        })
+        .await
+        .map_misc_error()
+    }
+
+    pub(crate) fn reserve_mined_submission(
+        &self,
+        hash: block::Hash,
+    ) -> Result<super::submit_block::MinedSubmission, super::submit_block::SubmitBlockErrorResponse>
+    {
+        self.mined_submissions.reserve(hash)
     }
 
     /// Returns the miner parameters, including the address, data, and memo.
@@ -601,13 +809,32 @@ where
         self.block_verifier_router.clone()
     }
 
-    /// Advertises the mined block.
-    pub fn advertise_mined_block(
+    /// Returns a sender for the owned mined-block lifecycle task.
+    pub fn mined_block_sender(&self) -> mpsc::UnboundedSender<MinedBlockEvent> {
+        self.mined_block_sender.clone()
+    }
+
+    /// Returns the shared pending-block registry.
+    pub fn pending_blocks(&self) -> PendingBlockRegistry {
+        self.pending_blocks.clone()
+    }
+
+    /// Returns whether early mined-block inventory is enabled.
+    pub fn optimistic_block_inventory(&self) -> bool {
+        self.optimistic_block_inventory
+    }
+
+    /// Queues a server template and returns the first item for a new worker.
+    pub(crate) fn queue_template_preparation(
         &self,
-        block: block::Hash,
-        height: block::Height,
-    ) -> Result<(), TrySendError<(block::Hash, block::Height)>> {
-        self.mined_block_sender.try_send((block, height))
+        template: BlockTemplateResponse,
+    ) -> Option<BlockTemplateResponse> {
+        self.template_preparation_queue.enqueue(template)
+    }
+
+    /// Returns the newest queued template or marks the worker idle.
+    pub(crate) fn next_template_preparation(&self) -> Option<BlockTemplateResponse> {
+        self.template_preparation_queue.next_or_finish()
     }
 
     /// Randomizes the coinbase data, if miner parameters are set.
@@ -689,6 +916,7 @@ pub async fn validate_block_proposal<BlockVerifierRouter, Tip, SyncStatus>(
     net: &Network,
     latest_chain_tip: Tip,
     sync_status: SyncStatus,
+    work_id: Option<String>,
 ) -> RpcResult<GetBlockTemplateResponse>
 where
     BlockVerifierRouter: Service<
@@ -724,7 +952,11 @@ where
         .ready()
         .await
         .map_err(|error| ErrorObject::owned(0, error.to_string(), None::<()>))?
-        .call(zakura_consensus::Request::CheckProposal(Arc::new(block)))
+        .call(zakura_consensus::Request::Prepare {
+            block: Arc::new(block),
+            work_id,
+            source: zakura_consensus::PreparedCandidateSource::ClientProposal,
+        })
         .await;
 
     Ok(block_verifier_router_response

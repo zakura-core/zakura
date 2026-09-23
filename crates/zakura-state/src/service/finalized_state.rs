@@ -38,7 +38,7 @@ use crate::{
     constants::{state_database_format_version_in_code, STATE_DATABASE_KIND},
     error::CommitCheckpointVerifiedError,
     request::{FinalizableBlock, FinalizedBlock, Treestate},
-    service::{check, QueuedCheckpointVerified},
+    service::{check, queued_blocks::CheckpointCommit, QueuedCheckpointVerified},
     CheckpointVerifiedBlock, Config, StateInitError, ValidateContextError,
 };
 
@@ -446,14 +446,17 @@ impl FinalizedState {
         // source to resume. Without it, the legacy committer would refuse every
         // remaining checkpoint block.
         if enforce_resume_guard
+            && !read_only
             && new_state.vct.is_below_last_checkpoint()
-            && new_state.vct.source().is_none()
+            && (new_state.vct.source().is_none()
+                || !config.enable_zakura_header_seed_from_committed_blocks)
         {
             panic!(
                 "this database was previously synced in verified commitment tree mode that was \
                  interrupted below the last checkpoint height. the fast path that supplies \
                  the verified roots needed to resume the VCT sync is disabled. Set \
-                 `consensus.checkpoint_sync = true` and `consensus.vct_fast_sync = true` to \
+                 `consensus.checkpoint_sync = true`, `consensus.vct_fast_sync = true`, and \
+                 `network.p2p_stack = \"zakura\"` or `\"dual\"` to \
                  finish the VCT sync, or delete the cache directory and re-sync from genesis"
             );
         }
@@ -617,19 +620,21 @@ impl FinalizedState {
     /// order.
     pub fn commit_finalized(
         &mut self,
-        ordered_block: QueuedCheckpointVerified,
+        ordered_block: CheckpointCommit,
         prev_note_commitment_trees: Option<NoteCommitmentTrees>,
         vct_successor_witness: Option<VctSuccessorWitness>,
     ) -> Result<
         (CheckpointVerifiedBlock, NoteCommitmentTrees),
-        (QueuedCheckpointVerified, CommitCheckpointVerifiedError),
+        (CheckpointCommit, CommitCheckpointVerifiedError),
     > {
+        let (block, response) = ordered_block;
         self.commit_finalized_inner(
-            ordered_block,
+            (block, response, 0),
             prev_note_commitment_trees,
             vct_successor_witness,
             None,
         )
+        .map_err(|((block, response, _attempt), error)| ((block, response), error))
     }
 
     /// Commit a checkpoint block and delegate its exact full-state batch to `commit`.
@@ -704,7 +709,7 @@ impl FinalizedState {
             VctAuthenticationProof,
         ) -> Result<(), CommitCheckpointVerifiedError>,
     {
-        let (checkpoint_verified, rsp_tx) = ordered_block;
+        let (checkpoint_verified, rsp_tx, attempt) = ordered_block;
         let result = self.commit_finalized_direct_with_aux(
             checkpoint_verified.clone().into(),
             prev_note_commitment_trees,
@@ -736,7 +741,7 @@ impl FinalizedState {
                 let _ = rsp_tx.send(Ok(hash));
                 Ok((checkpoint_verified, note_commitment_trees))
             }
-            Err(error) => Err(((checkpoint_verified, rsp_tx), error)),
+            Err(error) => Err(((checkpoint_verified, rsp_tx, attempt), error)),
         }
     }
 
@@ -1404,6 +1409,11 @@ impl FinalizedState {
             .is_some_and(|v| v.accepts_exact_roots_at(height))
     }
 
+    /// Whether the saved frontiers can still be advanced when VCT metadata is unavailable.
+    pub(crate) fn vct_can_recompute_trees(&self) -> bool {
+        !self.vct.is_below_last_checkpoint()
+    }
+
     /// Clears any cached successor prevalidation.
     ///
     /// The finalized write loop calls this when it discards checkpoint queue state, so a
@@ -1464,9 +1474,8 @@ impl FinalizedState {
     /// The committer therefore cannot recompute the root locally.
     /// Local recomputation could fold an incorrect root into the history MMR.
     /// The committer leaves the database untouched.
-    /// Header sync does not request individual roots.
-    /// A later delivery of the same header range can fill the missing root.
-    /// Another fanout peer's in-flight response can provide that delivery.
+    /// Header sync requests a bounded selected range that starts at the missing height.
+    /// A later delivery can fill the missing root.
     /// Otherwise, the commit remains parked and the section 8 stall metrics and logs report it.
     /// An incorrect root therefore never corrupts state, at the cost
     /// of stalling the sync at this height.
@@ -1476,6 +1485,14 @@ impl FinalizedState {
         error: ValidateContextError,
         failure: crate::error::VctCommitFailure,
     ) -> CommitCheckpointVerifiedError {
+        if matches!(
+            error,
+            ValidateContextError::HistoryTreeError(ref error)
+                if matches!(error.as_ref(), zakura_chain::history_tree::HistoryTreeError::MissingBranchId { .. })
+        ) {
+            return error.into();
+        }
+
         metrics::counter!("state.vct.root.rejected.count").increment(1);
         tracing::warn!(
             ?height,

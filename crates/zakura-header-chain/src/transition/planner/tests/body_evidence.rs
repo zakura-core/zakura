@@ -124,8 +124,8 @@ fn invalidating_a_losing_body_advances_header_generation_without_a_reason_delta(
             .checked_next()
             .expect("the fixture generation has capacity")
     );
-    let projected_graph = projected_graph(&store.graph, &plan);
-    let changed = projected_graph
+    let invalid_graph = projected_graph(&store.graph, &plan);
+    let changed = invalid_graph
         .header_node(losing.hash)
         .expect("the invalid losing node remains retained");
     assert_eq!(
@@ -136,6 +136,32 @@ fn invalidating_a_losing_body_advances_header_generation_without_a_reason_delta(
         }
     );
     assert!(changed.eligibility.direct_reasons.is_empty());
+
+    store.commit(&plan);
+    let repeated = apply_transition(
+        &store,
+        TransitionRequest {
+            expected_version: store.metadata.state_version,
+            event: TransitionEvent::BodyEvidence(BodyEvidence::ConsensusInvalid(
+                crate::ConsensusBodyInvalid {
+                    hash: losing.hash,
+                    evidence: EvidenceId::from_digest([0x35; 32]),
+                    rule: BodyRuleId::new("test.another-invalid-rule"),
+                    source: SourceId::from_digest([0x36; 32]),
+                },
+            )),
+        },
+        &context(&config, &clock, Some(&authority)),
+    )
+    .expect("a different invalid verdict must not fail the transition");
+    let replayed_graph = projected_graph(&store.graph, &repeated);
+    assert_eq!(
+        replayed_graph
+            .header_node(losing.hash)
+            .unwrap()
+            .body_validation_state,
+        changed.body_validation_state
+    );
 }
 
 #[test]

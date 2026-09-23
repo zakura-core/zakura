@@ -16,6 +16,7 @@ initial_testnet_peers = ["127.0.0.1:18233"]
 max_connections_per_ip = 10
 
 [network.zakura]
+listen_addr = "127.0.0.1:18534"
 trace_dir = "/traces/node4"
 
 [state]

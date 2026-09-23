@@ -5,10 +5,13 @@ use std::{
     ops::{Add, Deref, RangeInclusive},
     pin::Pin,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU8, Ordering},
         Arc,
     },
+    time::Instant,
 };
+
+use tokio::sync::Notify;
 
 use tower::{BoxError, Service, ServiceExt};
 use zakura_chain::{
@@ -22,6 +25,7 @@ use zakura_chain::{
     history_tree::HistoryTree,
     ironwood, orchard,
     parallel::tree::NoteCommitmentTrees,
+    parameters::Network,
     sapling,
     serialization::SerializationError,
     sprout,
@@ -38,6 +42,122 @@ use crate::{
     constants::{MAX_FIND_BLOCK_HASHES_RESULTS, MAX_FIND_BLOCK_HEADERS_RESULTS},
     ReadResponse, Response,
 };
+
+/// Notifies a mined-block submitter when state admits its block to the active write queue.
+#[derive(Clone)]
+pub struct BlockAdmission(Arc<BlockAdmissionInner>);
+
+#[derive(Debug)]
+struct BlockAdmissionInner {
+    state: AtomicU8,
+    optimistic_relay_authorized: AtomicBool,
+    changed: Notify,
+}
+
+impl BlockAdmission {
+    const PENDING: u8 = 0;
+    const ADMITTED: u8 = 1;
+    const REJECTED: u8 = 2;
+
+    /// Creates a pending admission notification.
+    pub fn pending() -> Self {
+        Self(Arc::new(BlockAdmissionInner {
+            state: AtomicU8::new(Self::PENDING),
+            optimistic_relay_authorized: AtomicBool::new(false),
+            changed: Notify::new(),
+        }))
+    }
+
+    /// Authorizes optimistic relay if state later admits the prepared mined block.
+    #[doc(hidden)]
+    pub fn authorize_optimistic_relay(&self) {
+        self.0
+            .optimistic_relay_authorized
+            .store(true, Ordering::Release);
+    }
+
+    /// Returns true when consensus authorized optimistic relay for this admission.
+    pub fn optimistic_relay_authorized(&self) -> bool {
+        self.0.optimistic_relay_authorized.load(Ordering::Acquire)
+    }
+
+    /// Marks the block as admitted to the active non-finalized write queue.
+    pub(crate) fn admit(&self, optimistic_relay_still_authorized: bool) {
+        if !optimistic_relay_still_authorized {
+            self.0
+                .optimistic_relay_authorized
+                .store(false, Ordering::Release);
+        }
+        if self
+            .0
+            .state
+            .compare_exchange(
+                Self::PENDING,
+                Self::ADMITTED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            self.0.changed.notify_waiters();
+        }
+    }
+
+    /// Marks the block as rejected before admission.
+    pub(crate) fn reject(&self) {
+        if self
+            .0
+            .state
+            .compare_exchange(
+                Self::PENDING,
+                Self::REJECTED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            self.0.changed.notify_waiters();
+        }
+    }
+
+    /// Waits until state admits or rejects the block.
+    ///
+    /// # Correctness
+    ///
+    /// This future never resolves when neither `admit` nor `reject` runs. The state rejects
+    /// duplicates, queue replacements, and expired blocks, but a verifier error before the state
+    /// receives the block leaves the admission pending. Callers must await this future under a
+    /// cancellation path, such as a `select!` arm that also awaits verification.
+    pub async fn wait(&self) -> bool {
+        loop {
+            let notified = self.0.changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            match self.0.state.load(Ordering::Acquire) {
+                Self::ADMITTED => return true,
+                Self::REJECTED => return false,
+                Self::PENDING => notified.as_mut().await,
+                _ => unreachable!("block admission state only uses declared constants"),
+            }
+        }
+    }
+}
+
+impl std::fmt::Debug for BlockAdmission {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("BlockAdmission")
+            .field(&self.0.state.load(Ordering::Acquire))
+            .finish()
+    }
+}
+
+impl PartialEq for BlockAdmission {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for BlockAdmission {}
 use crate::{
     error::{CommitCheckpointVerifiedError, InvalidateError, LayeredStateError, ReconsiderError},
     CommitSemanticallyVerifiedError,
@@ -275,6 +395,29 @@ pub struct SemanticallyVerifiedBlock {
     /// finalized committer. `None` means the committer falls back to computing
     /// it from the block's transactions.
     pub auth_data_root: Option<AuthDataRoot>,
+    /// Original verifier receipt order, also forwarded by trusted mirrors.
+    ///
+    /// This is process-local metadata, not serialized block data. Restored
+    /// blocks have no order. Orders from different primary sessions cannot be compared.
+    pub receipt_order: Option<u64>,
+}
+
+/// Data required to check a prepared mined block before optimistic relay.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BlockCommitmentData {
+    /// The block whose header commits to the prepared body and parent history.
+    pub block: Arc<Block>,
+    /// The precomputed authorizing-data commitment root, when available.
+    pub auth_data_root: Option<AuthDataRoot>,
+}
+
+impl From<&SemanticallyVerifiedBlock> for BlockCommitmentData {
+    fn from(block: &SemanticallyVerifiedBlock) -> Self {
+        Self {
+            block: block.block.clone(),
+            auth_data_root: block.auth_data_root,
+        }
+    }
 }
 
 /// A block ready to be committed directly to the finalized state with
@@ -346,6 +489,8 @@ pub struct ContextuallyVerifiedBlock {
 
     /// The sum of the chain value pool changes of all transactions in this block.
     pub(crate) chain_value_pool_change: ValueBalance<NegativeAllowed>,
+    /// Original verifier receipt order, retained through forks and reconsideration.
+    pub(crate) receipt_order: Option<u64>,
 }
 
 /// Wraps note commitment trees and the history tree together.
@@ -516,6 +661,7 @@ impl ContextuallyVerifiedBlock {
     ///
     /// This function panics if `spent_outputs` omits a transparent input's UTXO.
     pub fn with_block_and_spent_utxos(
+        network: &Network,
         semantically_verified: SemanticallyVerifiedBlock,
         spent_outputs: HashMap<transparent::OutPoint, transparent::OrderedUtxo>,
     ) -> Result<Self, ValueBalanceError> {
@@ -527,9 +673,11 @@ impl ContextuallyVerifiedBlock {
             transaction_hashes,
             deferred_pool_balance_change,
             auth_data_root: _,
+            receipt_order,
         } = semantically_verified;
 
         let chain_value_pool_change = block.chain_value_pool_change_from_ordered_utxos(
+            network,
             &spent_outputs,
             deferred_pool_balance_change,
         )?;
@@ -542,6 +690,7 @@ impl ContextuallyVerifiedBlock {
             spent_outputs: Arc::new(spent_outputs),
             transaction_hashes,
             chain_value_pool_change,
+            receipt_order,
         })
     }
 }
@@ -578,6 +727,7 @@ impl CheckpointVerifiedBlock {
             transaction_hashes,
             deferred_pool_balance_change: None,
             auth_data_root: None,
+            receipt_order: None,
         })
     }
 
@@ -587,6 +737,15 @@ impl CheckpointVerifiedBlock {
     /// different block.
     pub fn with_precomputed_auth_data_root(mut self) -> Self {
         self.0.auth_data_root = Some(self.0.block.auth_data_root());
+        self
+    }
+
+    /// Returns this checkpoint block with its deferred pool balance change.
+    pub fn with_deferred_pool_balance_change(
+        mut self,
+        deferred_pool_balance_change: Option<DeferredPoolBalanceChange>,
+    ) -> Self {
+        self.0.deferred_pool_balance_change = deferred_pool_balance_change;
         self
     }
 }
@@ -608,6 +767,7 @@ impl SemanticallyVerifiedBlock {
             transaction_hashes,
             deferred_pool_balance_change: None,
             auth_data_root: Some(auth_data_root),
+            receipt_order: None,
         }
     }
 
@@ -644,6 +804,7 @@ impl From<Arc<Block>> for SemanticallyVerifiedBlock {
             transaction_hashes,
             deferred_pool_balance_change: None,
             auth_data_root: Some(auth_data_root),
+            receipt_order: None,
         }
     }
 }
@@ -703,6 +864,7 @@ mod tests {
                 .expect("the genesis block deserializes"),
         );
         let contextual = ContextuallyVerifiedBlock::with_block_and_spent_utxos(
+            &Network::Mainnet,
             SemanticallyVerifiedBlock::from(block),
             HashMap::new(),
         )
@@ -719,6 +881,7 @@ mod tests {
         assert_eq!(&semantic.new_outputs, contextual.new_outputs.as_ref());
 
         let unique = ContextuallyVerifiedBlock::with_block_and_spent_utxos(
+            &Network::Mainnet,
             SemanticallyVerifiedBlock::from(contextual.block.clone()),
             HashMap::new(),
         )
@@ -747,6 +910,28 @@ mod tests {
 
         assert_eq!(checkpoint.auth_data_root, Some(block.auth_data_root()));
     }
+
+    #[tokio::test]
+    async fn block_admission_keeps_its_first_terminal_state() {
+        let rejected = BlockAdmission::pending();
+        assert!(!rejected.optimistic_relay_authorized());
+        rejected.authorize_optimistic_relay();
+        assert!(rejected.optimistic_relay_authorized());
+        rejected.reject();
+        rejected.admit(true);
+        assert!(!rejected.wait().await);
+
+        let admitted = BlockAdmission::pending();
+        admitted.admit(true);
+        admitted.reject();
+        assert!(admitted.wait().await);
+
+        let stale = BlockAdmission::pending();
+        stale.authorize_optimistic_relay();
+        stale.admit(false);
+        assert!(stale.wait().await);
+        assert!(!stale.optimistic_relay_authorized());
+    }
 }
 
 impl From<ContextuallyVerifiedBlock> for SemanticallyVerifiedBlock {
@@ -761,6 +946,7 @@ impl From<ContextuallyVerifiedBlock> for SemanticallyVerifiedBlock {
                 valid.chain_value_pool_change.deferred_amount(),
             )),
             auth_data_root: None,
+            receipt_order: valid.receipt_order,
         }
     }
 }
@@ -775,6 +961,7 @@ impl From<FinalizedBlock> for SemanticallyVerifiedBlock {
             transaction_hashes: finalized.transaction_hashes,
             deferred_pool_balance_change: finalized.deferred_pool_balance_change,
             auth_data_root: None,
+            receipt_order: None,
         }
     }
 }
@@ -1142,6 +1329,16 @@ pub enum Request {
     /// [0]: (crate::error::CommitSemanticallyVerifiedError)
     CommitSemanticallyVerifiedBlock(SemanticallyVerifiedBlock),
 
+    /// Commits a mined block and reports when state admits it to the active write queue.
+    CommitSemanticallyVerifiedBlockWithAdmission {
+        /// The semantically verified mined block.
+        block: SemanticallyVerifiedBlock,
+        /// The admission notification.
+        admission: BlockAdmission,
+        /// When consensus submitted this request to the buffered state service.
+        requested_at: Instant,
+    },
+
     /// Commit a checkpointed block to the state, skipping most but not all
     /// contextual validation.
     ///
@@ -1208,6 +1405,13 @@ pub enum Request {
     /// with the current best chain tip.
     Tip,
 
+    /// Reconciles durable checkpoint completion with queued semantic writes, including when
+    /// no further requests would drive the buffered state service.
+    ///
+    /// Returns [`Response::CheckpointHandoffChecked`] after checking the existing durable-state
+    /// handoff conditions. Repeated requests are safe. This does not wait for semantic commits.
+    CheckCheckpointHandoff,
+
     /// Computes a block locator object based on the current best chain.
     ///
     /// Returns [`Response::BlockLocator`] with hashes starting
@@ -1233,6 +1437,16 @@ pub enum Request {
     /// Checks verified blocks in the finalized chain and the _best_ non-finalized chain.
     UnspentBestChainUtxo(transparent::OutPoint),
 
+    /// Checks a candidate block's external inputs against the UTXO set at `parent`.
+    /// Returns [`ParentInputs::Inconclusive`](crate::ParentInputs::Inconclusive) if the parent
+    /// context changes during the read. Callers must omit outputs created within the candidate block.
+    CheckParentInputs {
+        /// Parent whose UTXO set must contain the inputs.
+        parent: block::Hash,
+        /// External inputs from one bounded block.
+        outpoints: Arc<[transparent::OutPoint]>,
+    },
+
     /// Looks up a block by hash or height in the current best chain.
     ///
     /// Returns
@@ -1243,6 +1457,29 @@ pub enum Request {
     /// Note: the [`HashOrHeight`] can be constructed from a [`block::Hash`] or
     /// [`block::Height`] using `.into()`.
     Block(HashOrHeight),
+
+    /// Looks up the [`BlockInfo`](zakura_chain::block_info::BlockInfo) for a block hash.
+    ///
+    /// This request waits until the block commits if needed.
+    ///
+    /// This request checks every non-finalized chain and the finalized state.
+    ///
+    /// Returns [`Response::BlockInfo(Some(block_info))`](Response::BlockInfo) after the block
+    /// commits. The response future remains pending while the block is unknown.
+    ///
+    /// Returns [`AwaitBlockInfoError`](crate::AwaitBlockInfoError) if the state rejects the
+    /// block or the block does not commit within
+    /// [`AWAIT_BLOCK_INFO_TIMEOUT`](crate::constants::AWAIT_BLOCK_INFO_TIMEOUT).
+    AwaitBlockInfo(block::Hash),
+
+    /// Looks up the [`BlockInfo`](zakura_chain::block_info::BlockInfo) for a committed block
+    /// hash without waiting.
+    ///
+    /// This request checks every non-finalized chain and the finalized state.
+    ///
+    /// Returns [`Response::BlockInfo(Some(block_info))`](Response::BlockInfo) if the block
+    /// has committed, and [`Response::BlockInfo(None)`](Response::BlockInfo) otherwise.
+    BlockInfo(block::Hash),
 
     /// Looks up a block by hash in any current chain or by height in the current best chain.
     ///
@@ -1338,6 +1575,9 @@ pub enum Request {
     /// Returns [`Response::ValidBestChainTipNullifiersAndAnchors`]
     CheckBestChainTipNullifiersAndAnchors(UnminedTx),
 
+    /// Checks the expected work, body commitment, parent history, and selected tip.
+    CheckPreparedMinedRelayEligibility(BlockCommitmentData),
+
     /// Calculates the median-time-past for the *next* block on the best chain.
     ///
     /// Returns [`Response::BestChainNextMedianTimePast`] when successful.
@@ -1400,20 +1640,30 @@ impl Request {
                 "retry_header_chain_body_availability"
             }
             Request::CommitSemanticallyVerifiedBlock(_) => "commit_semantically_verified_block",
+            Request::CommitSemanticallyVerifiedBlockWithAdmission { .. } => {
+                "commit_semantically_verified_block_with_admission"
+            }
             Request::CommitCheckpointVerifiedBlock(_) => "commit_checkpoint_verified_block",
             Request::AwaitUtxo(_) => "await_utxo",
             Request::Depth(_) => "depth",
             Request::Tip => "tip",
+            Request::CheckCheckpointHandoff => "check_checkpoint_handoff",
             Request::BlockLocator => "block_locator",
             Request::Transaction(_) => "transaction",
             Request::UnspentBestChainUtxo { .. } => "unspent_best_chain_utxo",
+            Request::CheckParentInputs { .. } => "check_parent_inputs",
             Request::Block(_) => "block",
+            Request::AwaitBlockInfo(_) => "await_block_info",
+            Request::BlockInfo(_) => "block_info",
             Request::AnyChainBlock(_) => "any_chain_block",
             Request::BlockHeader(_) => "block_header",
             Request::FindBlockHashes { .. } => "find_block_hashes",
             Request::FindBlockHeaders { .. } => "find_block_headers",
             Request::CheckBestChainTipNullifiersAndAnchors(_) => {
                 "best_chain_tip_nullifiers_anchors"
+            }
+            Request::CheckPreparedMinedRelayEligibility(_) => {
+                "check_prepared_mined_relay_eligibility"
             }
             Request::BestChainNextMedianTimePast => "best_chain_next_median_time_past",
             Request::BestChainBlockHash(_) => "best_chain_block_hash",
@@ -1463,9 +1713,10 @@ pub enum ReadRequest {
     /// with the pool values of the current best chain tip.
     TipPoolValues,
 
-    /// Looks up the block info after a block by hash or height in the current best chain.
+    /// Looks up the block info after a block by hash in any chain, or by height in the
+    /// current best chain.
     ///
-    /// * [`ReadResponse::BlockInfo(Some(pool_values))`](ReadResponse::BlockInfo) if the block is in the best chain;
+    /// * [`ReadResponse::BlockInfo(Some(pool_values))`](ReadResponse::BlockInfo) if the block is found;
     /// * [`ReadResponse::BlockInfo(None)`](ReadResponse::BlockInfo) otherwise.
     BlockInfo(HashOrHeight),
 
@@ -1569,6 +1820,16 @@ pub enum ReadRequest {
     /// Checks verified blocks in the finalized chain and the _best_ non-finalized chain.
     UnspentBestChainUtxo(transparent::OutPoint),
 
+    /// Checks a candidate block's external inputs against the UTXO set at `parent`.
+    /// Returns [`ParentInputs::Inconclusive`](crate::ParentInputs::Inconclusive) if the parent
+    /// context changes during the read. Callers must omit outputs created within the candidate block.
+    CheckParentInputs {
+        /// Parent whose UTXO set must contain the inputs.
+        parent: block::Hash,
+        /// External inputs from one bounded block.
+        outpoints: Arc<[transparent::OutPoint]>,
+    },
+
     /// Looks up a UTXO identified by the given [`OutPoint`](transparent::OutPoint),
     /// returning `None` immediately if it is unknown.
     ///
@@ -1664,13 +1925,13 @@ pub enum ReadRequest {
         session_id: u64,
         /// Exact target named by the peer's status.
         target_tip_hash: block::Hash,
-        /// Exact generation and branch captured before the state read.
+        /// Request correlation scope. Head progress does not stale this read-only lease.
         scope: zakura_header_chain::HeaderWorkAuthority,
         /// Locator hashes in requester order.
         locator_hashes: Vec<block::Hash>,
     },
 
-    /// Read and renew one bounded hash-keyed page from an immutable lease.
+    /// Read one bounded hash-keyed page and consume its lease on success.
     ReadRetainedHeaderPath {
         /// Stable requesting peer identity.
         peer: zakura_header_chain::SourceId,
@@ -1722,6 +1983,9 @@ pub enum ReadRequest {
     /// Returns contiguous committed blocks by height, in ascending order.
     ///
     /// The response stops before the first height without a committed body.
+    /// Callers that charge resources to the database job should instead use
+    /// [`crate::ReadStateService::read_owned_block_range`] so cancellation of
+    /// the caller cannot release those resources during a running read.
     BlocksByHeightRange {
         /// First height to read.
         start: block::Height,
@@ -1857,6 +2121,9 @@ pub enum ReadRequest {
     /// Returns [`ReadResponse::ValidBestChainTipNullifiersAndAnchors`].
     CheckBestChainTipNullifiersAndAnchors(UnminedTx),
 
+    /// Checks the expected work, body commitment, parent history, and selected tip.
+    CheckPreparedMinedRelayEligibility(BlockCommitmentData),
+
     /// Calculates the median-time-past for the *next* block on the best chain.
     ///
     /// Returns [`ReadResponse::BestChainNextMedianTimePast`] when successful.
@@ -1950,6 +2217,7 @@ impl ReadRequest {
             ReadRequest::TransactionIdsForBlock(_) => "transaction_ids_for_block",
             ReadRequest::AnyChainTransactionIdsForBlock(_) => "any_chain_transaction_ids_for_block",
             ReadRequest::UnspentBestChainUtxo { .. } => "unspent_best_chain_utxo",
+            ReadRequest::CheckParentInputs { .. } => "check_parent_inputs",
             ReadRequest::AnyChainUtxo { .. } => "any_chain_utxo",
             ReadRequest::BlockLocator => "block_locator",
             ReadRequest::FindBlockHashes { .. } => "find_block_hashes",
@@ -1978,6 +2246,9 @@ impl ReadRequest {
             ReadRequest::UtxosByAddresses(_) => "utxos_by_addresses",
             ReadRequest::CheckBestChainTipNullifiersAndAnchors(_) => {
                 "best_chain_tip_nullifiers_anchors"
+            }
+            ReadRequest::CheckPreparedMinedRelayEligibility(_) => {
+                "check_prepared_mined_relay_eligibility"
             }
             ReadRequest::BestChainNextMedianTimePast => "best_chain_next_median_time_past",
             ReadRequest::BestChainBlockHash(_) => "best_chain_block_hash",
@@ -2018,11 +2289,15 @@ impl TryFrom<Request> for ReadRequest {
             Request::BestChainBlockHash(hash) => Ok(ReadRequest::BestChainBlockHash(hash)),
 
             Request::Block(hash_or_height) => Ok(ReadRequest::Block(hash_or_height)),
+            Request::BlockInfo(hash) => Ok(ReadRequest::BlockInfo(hash.into())),
             Request::AnyChainBlock(hash_or_height) => {
                 Ok(ReadRequest::AnyChainBlock(hash_or_height))
             }
             Request::BlockHeader(hash_or_height) => Ok(ReadRequest::BlockHeader(hash_or_height)),
             Request::Transaction(tx_hash) => Ok(ReadRequest::Transaction(tx_hash)),
+            Request::CheckParentInputs { parent, outpoints } => {
+                Ok(ReadRequest::CheckParentInputs { parent, outpoints })
+            }
             Request::UnspentBestChainUtxo(outpoint) => {
                 Ok(ReadRequest::UnspentBestChainUtxo(outpoint))
             }
@@ -2038,6 +2313,9 @@ impl TryFrom<Request> for ReadRequest {
             Request::CheckBestChainTipNullifiersAndAnchors(tx) => {
                 Ok(ReadRequest::CheckBestChainTipNullifiersAndAnchors(tx))
             }
+            Request::CheckPreparedMinedRelayEligibility(block) => {
+                Ok(ReadRequest::CheckPreparedMinedRelayEligibility(block))
+            }
 
             Request::ApplyHeaderChainInsert { .. }
             | Request::RecordHeaderChainBodyUnavailable { .. }
@@ -2045,13 +2323,17 @@ impl TryFrom<Request> for ReadRequest {
             | Request::RestartHeaderChainBodyAvailability { .. }
             | Request::RetryHeaderChainBodyAvailability { .. }
             | Request::CommitSemanticallyVerifiedBlock(_)
+            | Request::CommitSemanticallyVerifiedBlockWithAdmission { .. }
             | Request::CommitCheckpointVerifiedBlock(_)
+            | Request::CheckCheckpointHandoff
             | Request::InvalidateBlock(_)
             | Request::ReconsiderBlock(_) => Err("ReadService does not write blocks"),
 
             Request::AwaitUtxo(_) => Err("ReadService does not track pending UTXOs. \
                      Manually convert the request to ReadRequest::AnyChainUtxo, \
                      and handle pending UTXOs"),
+
+            Request::AwaitBlockInfo(_) => Err("ReadService does not track pending block commits"),
 
             Request::KnownBlock(_) => Err("ReadService does not track queued blocks"),
 

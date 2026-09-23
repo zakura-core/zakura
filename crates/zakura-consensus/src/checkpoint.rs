@@ -28,11 +28,14 @@ use tower::{Service, ServiceExt};
 use tracing::instrument;
 
 use zakura_chain::{
-    amount::{self, DeferredPoolBalanceChange},
+    amount::{self, Amount, DeferredPoolBalanceChange, NonNegative},
     block::{self, Block},
     parameters::{
         checkpoint::list::CheckpointList,
-        subsidy::{block_subsidy, funding_stream_values, FundingStreamReceiver, SubsidyError},
+        subsidy::{
+            block_subsidy, funding_stream_values, is_zip234_active, parent_nsm_value_balance,
+            FundingStreamReceiver, SubsidyError,
+        },
         Network, NetworkUpgrade, GENESIS_PREVIOUS_BLOCK_HASH,
     },
     work::equihash,
@@ -112,6 +115,25 @@ struct CheckpointReset {
 /// usage by committing blocks to the disk state. (Or dropping invalid blocks.)
 pub const MAX_QUEUED_BLOCKS_PER_HEIGHT: usize = 4;
 
+/// Returns the deferred pool balance change for a checkpoint block.
+fn deferred_pool_balance_change(
+    height: block::Height,
+    network: &Network,
+    nsm_value_balance: Option<Amount<NonNegative>>,
+) -> Result<Option<DeferredPoolBalanceChange>, VerifyCheckpointError> {
+    let expected_deferred_amount = funding_stream_values(
+        height,
+        network,
+        block_subsidy(height, network, nsm_value_balance)?,
+    )?
+    .remove(&FundingStreamReceiver::Deferred);
+
+    Ok(expected_deferred_amount
+        .unwrap_or_default()
+        .checked_sub(network.lockbox_disbursement_total_amount(height))
+        .map(DeferredPoolBalanceChange::new))
+}
+
 /// Convert a tip into its hash and matching progress.
 fn progress_from_tip(
     checkpoint_list: &CheckpointList,
@@ -143,6 +165,10 @@ where
 {
     /// The checkpoint list for this verifier.
     checkpoint_list: Arc<CheckpointList>,
+
+    /// The final checkpoint routed to this verifier. This can precede the list's maximum
+    /// when optional checkpoint sync is disabled.
+    max_checkpoint_height: block::Height,
 
     /// The network rules used by this verifier.
     network: Network,
@@ -194,6 +220,7 @@ where
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CheckpointVerifier")
             .field("checkpoint_list", &self.checkpoint_list)
+            .field("max_checkpoint_height", &self.max_checkpoint_height)
             .field("network", &self.network)
             .field("initial_tip_hash", &self.initial_tip_hash)
             .field("queued", &self.queued)
@@ -236,7 +263,13 @@ where
             ?initial_tip,
             "initialising CheckpointVerifier"
         );
-        Self::from_checkpoint_list(checkpoint_list, network, initial_tip, state_service)
+        Self::from_checkpoint_list(
+            checkpoint_list,
+            network,
+            initial_tip,
+            max_height,
+            state_service,
+        )
     }
 
     /// Return a checkpoint verification service using `list`, `network`,
@@ -260,12 +293,15 @@ where
         initial_tip: Option<(block::Height, block::Hash)>,
         state_service: S,
     ) -> Result<Self, VerifyCheckpointError> {
+        let checkpoint_list = Arc::new(
+            CheckpointList::from_list(list).map_err(VerifyCheckpointError::CheckpointList)?,
+        );
+        let max_height = checkpoint_list.max_height();
         Ok(Self::from_checkpoint_list(
-            CheckpointList::from_list(list)
-                .map(Arc::new)
-                .map_err(VerifyCheckpointError::CheckpointList)?,
+            checkpoint_list,
             network,
             initial_tip,
+            max_height,
             state_service,
         ))
     }
@@ -274,6 +310,8 @@ where
     /// `network`, `initial_tip`, and `state_service`.
     ///
     /// Assumes that the provided genesis checkpoint is correct.
+    /// `max_checkpoint_height` must be the checkpoint where the router switches to semantic
+    /// verification. Only its durable commit triggers the state handoff notification.
     ///
     /// Callers should prefer `CheckpointVerifier::new`, which uses the
     /// hard-coded checkpoint lists. See that function for more details.
@@ -281,8 +319,13 @@ where
         checkpoint_list: Arc<CheckpointList>,
         network: &Network,
         initial_tip: Option<(block::Height, block::Hash)>,
+        max_checkpoint_height: block::Height,
         state_service: S,
     ) -> Self {
+        assert!(
+            checkpoint_list.contains(max_checkpoint_height),
+            "the router switches verification at a checkpoint in the list"
+        );
         // All the initialisers should call this function, so we only have to
         // change fields or default values in one place.
         let (initial_tip_hash, verifier_progress) =
@@ -299,6 +342,7 @@ where
 
         let verifier = CheckpointVerifier {
             checkpoint_list,
+            max_checkpoint_height,
             network: network.clone(),
             initial_tip_hash,
             state_service,
@@ -673,15 +717,12 @@ where
             crate::block::check::equihash_solution_is_valid(&block.header, &self.network)?;
         }
 
-        // See [ZIP-1015](https://zips.z.cash/zip-1015).
-        let expected_deferred_amount =
-            funding_stream_values(height, &self.network, block_subsidy(height, &self.network)?)?
-                .remove(&FundingStreamReceiver::Deferred);
-
-        let deferred_pool_balance_change = expected_deferred_amount
-            .unwrap_or_default()
-            .checked_sub(self.network.lockbox_disbursement_total_amount(height))
-            .map(DeferredPoolBalanceChange::new);
+        // The commit task calculates this value after the parent commits at ZIP 234 heights.
+        let deferred_pool_balance_change = if is_zip234_active(&self.network, height) {
+            None
+        } else {
+            deferred_pool_balance_change(height, &self.network, None)?
+        };
 
         // don't do precalculation until the block passes basic difficulty checks
         let block = CheckpointVerifiedBlock::new(block, Some(hash), deferred_pool_balance_change);
@@ -1224,6 +1265,20 @@ where
 
         // Immediately reject all incoming blocks that arrive after we've finished.
         if let FinalCheckpoint = self.previous_checkpoint_height() {
+            // A peer can rewrite the coinbase input and expiry heights without changing the header hash.
+            // Reject the changed transaction IDs before returning the unscored Finished error.
+            let transaction_hashes = block
+                .transactions
+                .iter()
+                .map(|tx| tx.hash())
+                .collect::<Vec<_>>();
+            if let Err(error) = crate::block::check::merkle_root_validity(
+                &self.network,
+                &block,
+                &transaction_hashes,
+            ) {
+                return async { Err(error.into()) }.boxed();
+            }
             return async { Err(VerifyCheckpointError::Finished) }.boxed();
         }
 
@@ -1261,6 +1316,10 @@ where
         // we don't reject the entire checkpoint.
         // Instead, we reset the verifier to the successfully committed state tip.
         let state_service = self.state_service.clone();
+        let handoff_state = (req_block.block.height == self.max_checkpoint_height)
+            .then(|| self.state_service.clone());
+        let recovery_state = self.state_service.clone();
+        let reset_sender = self.reset_sender.clone();
         let network = self.network.clone();
         let commit_checkpoint_verified = tokio::spawn(async move {
             let queued_result = req_block
@@ -1273,6 +1332,39 @@ where
 
             let result: Result<block::Hash, VerifyCheckpointError> = async move {
                 let hash = queued_result.result?;
+
+                if is_zip234_active(&network, req_block.block.height) {
+                    let parent_hash = req_block.block.block.header.previous_block_hash;
+                    let response = state_service
+                        .clone()
+                        .oneshot(zs::Request::AwaitBlockInfo(parent_hash))
+                        .map_err(VerifyCheckpointError::CommitCheckpointVerified)
+                        .await?;
+                    let zs::Response::BlockInfo(parent_info) = response else {
+                        unreachable!("wrong response to Request::AwaitBlockInfo");
+                    };
+                    let parent_info = parent_info
+                        .expect("AwaitBlockInfo only returns after the parent block commits");
+                    // The verifier has already advanced its progress past this block, so
+                    // report a failure here as a commit failure, which resets the verifier.
+                    let deferred_pool_balance_change = parent_nsm_value_balance(
+                        parent_info.value_pools().nsm_value_balance_amount(),
+                    )
+                    .map_err(VerifyCheckpointError::from)
+                    .and_then(|nsm_value_balance| {
+                        deferred_pool_balance_change(
+                            req_block.block.height,
+                            &network,
+                            Some(nsm_value_balance),
+                        )
+                    })
+                    .map_err(|error| {
+                        VerifyCheckpointError::CommitCheckpointVerified(error.into())
+                    })?;
+                    req_block.block = req_block
+                        .block
+                        .with_deferred_pool_balance_change(deferred_pool_balance_change);
+                }
 
                 if req_block.block.auth_data_root.is_none()
                     && NetworkUpgrade::current(&network, req_block.block.height)
@@ -1296,6 +1388,32 @@ where
                 {
                     zs::Response::Committed(committed_hash) => {
                         assert_eq!(committed_hash, hash, "state must commit correct hash");
+                        if let Some(state) = handoff_state {
+                            // Retain the notification even if its response times out. A delayed
+                            // buffer worker must still reconcile the already-durable checkpoint.
+                            let handoff = tokio::spawn(async move {
+                                match state.oneshot(zs::Request::CheckCheckpointHandoff).await {
+                                    Ok(zs::Response::CheckpointHandoffChecked) => {
+                                        metrics::counter!("checkpoint.handoff.checked").increment(1);
+                                    }
+                                    result => {
+                                        metrics::counter!("checkpoint.handoff.errors").increment(1);
+                                        tracing::error!(?hash, ?result, "checkpoint committed but handoff notification failed");
+                                    }
+                                }
+                            });
+                            match tokio::time::timeout(std::time::Duration::from_secs(30), handoff).await {
+                                Ok(Ok(())) => {}
+                                Ok(Err(error)) => {
+                                    metrics::counter!("checkpoint.handoff.errors").increment(1);
+                                    tracing::error!(?hash, ?error, "checkpoint committed but handoff notification task failed");
+                                }
+                                Err(_) => {
+                                    metrics::counter!("checkpoint.handoff.timeouts").increment(1);
+                                    tracing::warn!(?hash, "checkpoint committed; handoff notification remains pending after its deadline");
+                                }
+                            }
+                        }
                         Ok(hash)
                     }
                     _ => unreachable!("wrong response for CommitCheckpointVerifiedBlock"),
@@ -1303,37 +1421,17 @@ where
             }
             .await;
 
-            (result, reset_generation)
-        });
-
-        let state_service = self.state_service.clone();
-        let reset_sender = self.reset_sender.clone();
-        async move {
-            let commit_result = commit_checkpoint_verified.await;
-            // Avoid a panic on shutdown
-            //
-            // When `zakurad` is terminated using Ctrl-C, the `commit_checkpoint_verified` task
-            // can return a `JoinError::Cancelled`. We expect task cancellation on shutdown,
-            // so we don't need to panic here. The persistent state is correct even when the
-            // task is cancelled, because block data is committed inside transactions, in
-            // height order.
+            // The commit task owns recovery so a canceled caller cannot discard the reset.
             if zakura_chain::shutdown::is_shutting_down() {
                 return Err(VerifyCheckpointError::ShuttingDown);
             }
-            let (result, reset_generation) =
-                commit_result.expect("commit_checkpoint_verified should not panic");
-            // Only reset on real commit/state desyncs. Duplicate / NewerRequest
-            // failures are expected when sync resubmits in-queue bodies; resetting
-            // for them rewinds progress behind the already-verified checkpoint and
-            // leaves a permanent queue gap for the next range.
-            if let Err(error) = &result {
-                if !error.is_duplicate_request()
-                    && !matches!(
-                        error,
-                        VerifyCheckpointError::ShuttingDown | VerifyCheckpointError::Dropped
-                    )
-                {
-                    let tip = match state_service
+            // Only a failed state commit can leave verified progress ahead of the state.
+            // Block rejections must preserve progress while a verified range commits:
+            // resetting to the lagging state tip would reopen an already-consumed range.
+            // Duplicate commits also leave progress intact.
+            if let Err(error @ VerifyCheckpointError::CommitCheckpointVerified(_)) = &result {
+                if !error.is_duplicate_request() {
+                    let tip = match recovery_state
                         .oneshot(zs::Request::Tip)
                         .await
                         .map_err(VerifyCheckpointError::Tip)?
@@ -1350,6 +1448,15 @@ where
                 }
             }
             result
+        });
+
+        async move {
+            let commit_result = commit_checkpoint_verified.await;
+            // Shutdown can cancel the commit task. State commits remain transactional.
+            if zakura_chain::shutdown::is_shutting_down() {
+                return Err(VerifyCheckpointError::ShuttingDown);
+            }
+            commit_result.expect("commit_checkpoint_verified should not panic")
         }
         .boxed()
     }

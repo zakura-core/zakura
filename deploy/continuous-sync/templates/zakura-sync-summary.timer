@@ -1,0 +1,11 @@
+[Unit]
+Description=Check the fixed daily summary deadline and retry failed delivery
+
+[Timer]
+# The sender checks 17:00 America/Denver, including daylight saving changes.
+OnCalendar=*-*-* *:*:00
+AccuracySec=1s
+Persistent=true
+
+[Install]
+WantedBy=timers.target

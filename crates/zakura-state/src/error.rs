@@ -44,6 +44,26 @@ impl From<BoxError> for CloneError {
 /// A boxed [`std::error::Error`].
 pub type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
+/// A [`crate::Request::AwaitBlockInfo`] request stopped waiting before its block committed.
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
+pub enum AwaitBlockInfoError {
+    /// The state rejected the block, so it will not commit unless it is sent again.
+    #[error("block {hash} was rejected by the state")]
+    Rejected {
+        /// The requested block.
+        hash: block::Hash,
+    },
+
+    /// The block did not commit within the wait limit.
+    #[error("block {hash} did not commit within {limit:?}")]
+    TimedOut {
+        /// The requested block.
+        hash: block::Hash,
+        /// The wait limit.
+        limit: std::time::Duration,
+    },
+}
+
 /// The finalized database has blocks but no persisted Sprout tip frontier.
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 #[error("missing Sprout note commitment tree at finalized tip {tip:?}")]
@@ -275,6 +295,14 @@ pub enum CommitBlockError {
         error: String,
     },
 
+    /// A mined submission cannot wait in the orphan queue.
+    #[error("mined block parent is unavailable")]
+    MissingMinedParent,
+
+    /// The orphan queue or contextual writer reached its memory bound.
+    #[error("too many blocks are waiting for contextual verification")]
+    QueueFull,
+
     /// The write task exited (likely during shutdown).
     #[error("block commit task exited. Is Zakura shutting down?")]
     #[non_exhaustive]
@@ -338,6 +366,12 @@ impl CommitBlockError {
             Self::ValidateContextError(error) => error.body_verification_class(),
             Self::HeaderChainError { .. } => {
                 BodyVerificationClass::Retryable(TransientBodyFailureKind::Storage)
+            }
+            Self::MissingMinedParent => {
+                BodyVerificationClass::Retryable(TransientBodyFailureKind::MissingContext)
+            }
+            Self::QueueFull => {
+                BodyVerificationClass::Retryable(TransientBodyFailureKind::VerifierUnavailable)
             }
             Self::WriteTaskExited => {
                 BodyVerificationClass::Retryable(TransientBodyFailureKind::VerifierUnavailable)
@@ -764,6 +798,17 @@ pub enum ValidateContextError {
         height: Option<block::Height>,
     },
 
+    #[error(
+        "block makes the ZIP 234 NSM value balance negative: balance {balance_before:?} \
+         changes by {balance_change:?} at {height:?}"
+    )]
+    #[non_exhaustive]
+    NegativeNsmValueBalance {
+        height: block::Height,
+        balance_before: amount::Amount<NegativeAllowed>,
+        balance_change: amount::Amount<NegativeAllowed>,
+    },
+
     #[error("error updating a note commitment tree: {0}")]
     NoteCommitmentTreeError(#[from] zakura_chain::parallel::tree::NoteCommitmentTreeError),
 
@@ -938,6 +983,7 @@ impl ValidateContextError {
                 consensus("context.calculate_block_chain_value_change")
             }
             Self::AddValuePool { .. } => consensus("context.add_value_pool"),
+            Self::NegativeNsmValueBalance { .. } => consensus("context.negative_nsm_value_balance"),
             Self::UnknownSproutAnchor { .. } => consensus("context.unknown_sprout_anchor"),
             Self::UnknownSaplingAnchor { .. } => consensus("context.unknown_sapling_anchor"),
             Self::UnknownOrchardAnchor { .. } => consensus("context.unknown_orchard_anchor"),
@@ -966,6 +1012,7 @@ impl ValidateContextError {
             | ValidateContextError::DuplicateIronwoodNullifier { .. }
             | ValidateContextError::NegativeRemainingTransactionValue { .. }
             | ValidateContextError::AddValuePool { .. }
+            | ValidateContextError::NegativeNsmValueBalance { .. }
             | ValidateContextError::InvalidBlockCommitment(_)
             | ValidateContextError::UnknownSproutAnchor { .. }
             | ValidateContextError::UnknownSaplingAnchor { .. }
@@ -1008,10 +1055,9 @@ impl ValidateContextError {
     ///
     /// The query returns the subset of [`Self::vct_retryable_height`] where the supplied root is
     /// missing. The peer either omitted the root from its header range or supplied a root that
-    /// verification later evicted. Only a later delivery of the same header range can fill the
-    /// missing root. Header sync does not request individual roots. An await-successor stall
-    /// ([`Self::vct_retryable_height`] but not this method) already has its root
-    /// and only waits for the next header to be stored.
+    /// verification later evicted. Header sync requests a bounded selected range that starts at
+    /// the missing height. An await-successor stall ([`Self::vct_retryable_height`] but not this
+    /// method) already has its root and only waits for the next header to be stored.
     pub fn vct_supplied_root_unavailable_height(&self) -> Option<block::Height> {
         match self {
             ValidateContextError::VctSuppliedRootUnavailable { height } => Some(*height),
@@ -1022,8 +1068,8 @@ impl ValidateContextError {
     /// Returns the height for any retryable VCT root stall: either an absent/evicted supplied
     /// root ([`Self::VctSuppliedRootUnavailable`]) or one not yet verifiable because no successor
     /// is buffered to confirm it ([`Self::VctSuppliedRootAwaitingSuccessor`]). The write loop
-    /// parks and retries the same block for both; the former polls slower because nothing is
-    /// actively fetching a replacement root.
+    /// parks and retries the same block for both. A header insertion wakes a missing-root stall.
+    /// A short bounded delay wakes an await-successor stall.
     pub fn vct_retryable_height(&self) -> Option<block::Height> {
         match self {
             ValidateContextError::VctSuppliedRootUnavailable { height }
@@ -1318,6 +1364,12 @@ mod tests {
                 chain_value_pools: Box::new(ValueBalance::<NonNegative>::zero()),
                 block_value_pool_change: Box::new(ValueBalance::<NegativeAllowed>::zero()),
                 height: Some(height),
+            },
+            ValidateContextError::NegativeNsmValueBalance {
+                height,
+                balance_before: amount::Amount::zero(),
+                balance_change: amount::Amount::try_from(-1)
+                    .expect("minus one zatoshi is a valid amount"),
             },
             ValidateContextError::InvalidBlockCommitment(
                 CommitmentError::InvalidChainHistoryActivationReserved { actual: [1; 32] },

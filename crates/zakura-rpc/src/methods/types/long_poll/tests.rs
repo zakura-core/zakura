@@ -74,6 +74,7 @@ fn long_poll_id_rejects_non_ascii_at_each_field_boundary() {
 #[test]
 fn long_poll_id_round_trip_ascii() {
     let id = LongPollId {
+        revision: 0,
         tip_height: 1234567890,
         tip_hash_checksum: 0xdeadbeef,
         max_timestamp: 4000000000,
@@ -83,6 +84,27 @@ fn long_poll_id_round_trip_ascii() {
     let s = id.to_string();
     assert_eq!(s.len(), LONG_POLL_ID_LENGTH);
     assert_eq!(LongPollId::from_str(&s).unwrap(), id);
+}
+
+#[test]
+fn long_poll_withdrawal_changes_id_and_disallows_old_work() {
+    let old = LongPollInput::new(Height(1), Default::default(), 100.into(), []).generate_id();
+    let mut withdrawn = old;
+    withdrawn.revision = 1;
+    assert_ne!(old, withdrawn);
+    assert!(!withdrawn.submit_old(&old));
+    assert_eq!(withdrawn.to_string().len(), LONG_POLL_ID_LENGTH + 16);
+    assert_eq!(
+        withdrawn.to_string().parse::<LongPollId>().unwrap(),
+        withdrawn
+    );
+    assert!(withdrawn.submit_old(&withdrawn));
+    let before_mempool_update = withdrawn;
+    withdrawn.mempool_transaction_count += 1;
+    assert!(withdrawn.submit_old(&before_mempool_update));
+    assert!(withdrawn.same_work_context(&old));
+    withdrawn.tip_height += 1;
+    assert!(!withdrawn.same_work_context(&old));
 }
 
 /// Check that `LongPollId::from_str` rejects inputs whose byte length does not match

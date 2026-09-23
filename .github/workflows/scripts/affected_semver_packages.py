@@ -8,10 +8,6 @@ import subprocess
 import sys
 
 
-# The crate's first crates.io publication will give cargo-semver-checks a stable
-# comparison baseline. Maintainers must remove this exclusion after that publication.
-UNPUBLISHED_BASELINE_EXCLUSIONS = {"zakura-header-chain"}
-
 # `zakura` is the node binary package, rather than a supported Rust library API.
 # Its command and configuration types can change without library SemVer bumps.
 SEMVER_ENFORCEMENT_EXCLUSIONS = {"zakura"}
@@ -54,7 +50,14 @@ def directly_changed_packages(metadata, changed_files):
     workspace_root = Path(metadata["workspace_root"]).resolve()
     changed_paths = [Path(path) for path in changed_files]
 
-    if Path("Cargo.toml") in changed_paths:
+    # Registry patches affect fresh resolution for every semver build.
+    if any(
+        path in changed_paths
+        for path in (
+            Path("Cargo.toml"),
+            Path(".github/workflows/scripts/patch_registry_for_semver.sh"),
+        )
+    ):
         return set(packages)
 
     roots_by_depth = sorted(
@@ -135,7 +138,6 @@ def affected_publishable_packages(metadata, changed_files=None, check_all=False)
         packages[package_id]["name"]
         for package_id in ordered
         if is_publishable(packages[package_id])
-        and packages[package_id]["name"] not in UNPUBLISHED_BASELINE_EXCLUSIONS
         and packages[package_id]["name"] not in SEMVER_ENFORCEMENT_EXCLUSIONS
     ]
 

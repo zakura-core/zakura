@@ -191,7 +191,7 @@ jobs:
           fi
         env:
           SLACK_WEB_HOOK: ${{ secrets.SLACK_WEB_HOOK }}
-          # Remind about an unresolved failure every 6 hours.
+          # Remind about an unresolved failure daily; routine summaries have a host timer.
           REMINDER_INTERVAL: "86400"
           # A run is capped at 48h, so only flag a node that has not completed one
           # in four days -- long enough that a legitimately long run cannot trip it.
@@ -201,9 +201,13 @@ jobs:
       # never record its `last_sent` and would re-page on every cycle.
       - name: Save audit alert state
         if: always() && env.ACTION == 'audit'
-        # A lost state save only costs one duplicate reminder; never fail the job for it.
+        # Routine summary cursors live on the sender; this cache only tracks audit alerts.
         continue-on-error: true
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 #v6.1.0
         with:
           path: .audit-alert-state
           key: continuous-sync-audit-state-${{ github.run_id }}
+
+      - name: Check daily summary delivery
+        if: always() && env.ACTION == 'audit'
+        run: python3 deploy/continuous-sync/deploy.py summary-status

@@ -929,8 +929,7 @@ where
     /// The lengths of recent sync responses.
     recent_syncs: RecentSyncLengths,
 
-    /// Fresh peer evidence and discovered work in this startup sync round.
-    profile_observed_peer: bool,
+    /// Whether this startup sync round discovered blocks to process.
     profile_discovered_blocks: bool,
 
     /// Queue-level retry counts for block hashes whose download failed with a single-peer
@@ -1110,7 +1109,6 @@ where
             latest_chain_tip,
             prospective_tips: HashSet::new(),
             recent_syncs,
-            profile_observed_peer: false,
             profile_discovered_blocks: false,
             missing_block_retry_counts: HashMap::new(),
             transient_block_retry_counts: HashMap::new(),
@@ -1483,7 +1481,6 @@ where
             &mut watch::Receiver<zakura_node_services::sync_lifecycle::HeaderRuntimeStatus>,
         >,
     ) -> Result<(), Report> {
-        self.profile_observed_peer = false;
         self.profile_discovered_blocks = false;
         self.prospective_tips = HashSet::new();
         self.missing_block_retry_counts.clear();
@@ -1539,13 +1536,16 @@ where
         }
 
         info!("exhausted prospective tip set");
-        profiles::startup_sync_observation(
-            self.profile_observed_peer
-                && !self.profile_discovered_blocks
+        if profiles::startup_pending() {
+            let caught_up = !self.profile_discovered_blocks
                 && state_tip.is_some()
                 && state_tip == self.latest_chain_tip.best_tip_height()
-                && self.downloads.in_flight() == 0,
-        );
+                && self.downloads.in_flight() == 0
+                && timeout(Duration::from_secs(10), self.profile_tip_confirmed())
+                    .await
+                    .unwrap_or(false);
+            profiles::startup_sync_observation(caught_up);
+        }
         self.trace
             .round_finish("exhausted", self.latest_chain_tip.best_tip_height(), None);
 
@@ -2069,9 +2069,6 @@ where
             {
                 Ok(zn::Response::BlockHashes(hashes)) => {
                     trace!(?hashes);
-                    if hashes.len() <= MAX_TIPS_RESPONSE_HASH_COUNT + 1 {
-                        self.profile_observed_peer = true;
-                    }
 
                     // zcashd sometimes appends an unrelated hash at the start
                     // or end of its response.
@@ -2201,32 +2198,35 @@ where
         Self::handle_hash_response(response, self.expose_peer_addresses).map_err(Into::into)
     }
 
-    /// Confirm the native sync tip with a fresh peer response without dispatching body work.
+    /// Confirm the sync tip with a fresh peer response without dispatching body work.
     /// The caller bounds both the network request and state lookups with one timeout.
     async fn profile_tip_confirmed(&mut self) -> bool {
         let Some(hash) = self.latest_chain_tip.best_tip_hash() else {
             return false;
         };
+        let Ok(zs::Response::BlockLocator(mut locator)) =
+            self.state.clone().oneshot(zs::Request::BlockLocator).await
+        else {
+            return false;
+        };
+        if locator.len() < 2 || locator[0] != hash {
+            return false;
+        }
+        // Empty tip responses are intentionally suppressed by peers. Ask from the parent,
+        // so an up-to-date peer positively confirms the tip with one header.
+        locator.remove(0);
         let response = self
             .tip_network
             .clone()
-            .oneshot(zn::Request::FindBlocks {
-                known_blocks: vec![hash],
+            .oneshot(zn::Request::FindHeaders {
+                known_blocks: locator,
                 stop: None,
             })
             .await;
-        let Ok(zn::Response::BlockHashes(hashes)) = response else {
+        let Ok(zn::Response::BlockHeaders(headers)) = response else {
             return false;
         };
-        if hashes.len() > MAX_TIPS_RESPONSE_HASH_COUNT + 1 {
-            return false;
-        }
-        for hash in hashes {
-            if !self.state_contains(hash).await.unwrap_or(false) {
-                return false;
-            }
-        }
-        true
+        headers.len() == 1 && headers[0].header.hash() == hash
     }
 
     /// Limit compatibility downloads to the final checkpoint during initial block-apply ownership.

@@ -159,7 +159,10 @@ impl PartialEq for BlockAdmission {
 
 impl Eq for BlockAdmission {}
 use crate::{
-    error::{CommitCheckpointVerifiedError, InvalidateError, LayeredStateError, ReconsiderError},
+    error::{
+        CommitCheckpointVerifiedError, InvalidateError, LayeredStateError, PreciousError,
+        ReconsiderError,
+    },
     CommitSemanticallyVerifiedError,
 };
 
@@ -1078,6 +1081,28 @@ impl MappedRequest for InvalidateBlockRequest {
     }
 }
 
+/// Request to prefer a block over other chain tips with the same work.
+///
+/// See the [`crate`] documentation and [`Request::PreciousBlock`] for details.
+#[allow(dead_code)]
+pub struct PreciousBlockRequest(pub block::Hash);
+
+impl MappedRequest for PreciousBlockRequest {
+    type MappedResponse = ();
+    type Error = PreciousError;
+
+    fn map_request(self) -> Request {
+        Request::PreciousBlock(self.0)
+    }
+
+    fn map_response(response: Response) -> Self::MappedResponse {
+        match response {
+            Response::Precious => (),
+            _ => unreachable!("wrong response variant for request"),
+        }
+    }
+}
+
 /// Request to reconsider a previously invalidated block and re-commit it to the state.
 ///
 /// See the [`crate`] documentation and [`Request::ReconsiderBlock`] for details.
@@ -1610,6 +1635,17 @@ pub enum Request {
     /// [0]: (crate::error::ReconsiderError)
     ReconsiderBlock(block::Hash),
 
+    /// Prefers the block with the provided hash over other chain tips with the same work, as if
+    /// it had been received first. A later request overrides an earlier one, and greater work
+    /// still wins. The preference is local and is not kept across restarts.
+    ///
+    /// Returns [`Response::Precious`] if the state contains the block, even when it has less
+    /// work than the best tip and the request changes nothing. Otherwise returns a
+    /// [`PreciousError`][0].
+    ///
+    /// [0]: (crate::error::PreciousError)
+    PreciousBlock(block::Hash),
+
     /// Performs contextual validation of the given block, but does not commit it to the state.
     ///
     /// Returns [`Response::ValidBlockProposal`] when successful.
@@ -1661,6 +1697,7 @@ impl Request {
             Request::BestChainBlockHash(_) => "best_chain_block_hash",
             Request::KnownBlock(_) => "known_block",
             Request::InvalidateBlock(_) => "invalidate_block",
+            Request::PreciousBlock(_) => "precious_block",
             Request::ReconsiderBlock(_) => "reconsider_block",
             Request::CheckBlockProposalValidity(_) => "check_block_proposal_validity",
         }
@@ -2318,7 +2355,8 @@ impl TryFrom<Request> for ReadRequest {
             | Request::CommitSemanticallyVerifiedBlockWithAdmission { .. }
             | Request::CommitCheckpointVerifiedBlock(_)
             | Request::InvalidateBlock(_)
-            | Request::ReconsiderBlock(_) => Err("ReadService does not write blocks"),
+            | Request::ReconsiderBlock(_)
+            | Request::PreciousBlock(_) => Err("ReadService does not write blocks"),
 
             Request::AwaitUtxo(_) => Err("ReadService does not track pending UTXOs. \
                      Manually convert the request to ReadRequest::AnyChainUtxo, \

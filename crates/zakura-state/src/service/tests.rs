@@ -3324,3 +3324,120 @@ async fn await_block_info_waits_for_a_valid_retry_after_rejection() {
         Response::BlockInfo(Some(_))
     ));
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn precious_block_request_selects_the_preferred_tip_legacy() {
+    assert_precious_block_request(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn precious_block_request_selects_the_preferred_tip_header_integrated() {
+    assert_precious_block_request(true).await;
+}
+
+/// `Request::PreciousBlock` changes the published best tip through the block write task.
+async fn assert_precious_block_request(header_runtime: bool) {
+    use crate::tests::FakeChainHelper;
+
+    let _init_guard = zakura_test::init();
+    let limit = Duration::from_secs(10);
+    let network = Network::new_regtest(Default::default());
+    let config = Config {
+        enable_zakura_header_seed_from_committed_blocks: header_runtime,
+        ..Config::ephemeral()
+    };
+    let (mut state, _, _, _) = StateService::new(config, &network, Height::MAX, 0)
+        .await
+        .unwrap();
+    let genesis = block::genesis::regtest_genesis_block();
+    let genesis_hash = genesis.hash();
+    let mut parent = genesis.make_fake_child();
+    Arc::make_mut(&mut Arc::make_mut(&mut parent).header).time += chrono::Duration::seconds(1);
+    for block in [genesis, parent.clone()] {
+        timeout(
+            limit,
+            state.queue_and_commit_to_finalized_state(CheckpointVerifiedBlock::from(block)),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    }
+    let mut template = parent.make_fake_child();
+    let transaction = transaction_v4_from_coinbase(&template.transactions[0]);
+    Arc::make_mut(&mut template).transactions[0] = Arc::new(transaction);
+    let merkle_root = template.transactions.iter().cloned().collect();
+    let header = Arc::make_mut(&mut Arc::make_mut(&mut template).header);
+    header.time += chrono::Duration::seconds(1);
+    header.merkle_root = merkle_root;
+    header.commitment_bytes =
+        <[u8; 32]>::from(state.read_service.db.history_tree().hash().unwrap()).into();
+
+    let siblings = template.make_fake_siblings(2);
+    for (order, block) in siblings.iter().enumerate() {
+        let mut prepared = block.clone().prepare();
+        prepared.receipt_order = Some(u64::try_from(order).unwrap());
+        timeout(
+            limit,
+            state.queue_and_commit_to_non_finalized_state(prepared, None),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    }
+    let best_tip = |state: &StateService| {
+        state
+            .read_service
+            .latest_non_finalized_state()
+            .best_tip()
+            .unwrap()
+            .1
+    };
+    assert_eq!(best_tip(&state), siblings[0].hash());
+
+    // A finalized block is known, so its request succeeds without changing the tip.
+    // The later receipt then becomes best when preferred.
+    for hash in [genesis_hash, siblings[1].hash()] {
+        timeout(limit, state.send_precious_block(hash))
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+    assert_eq!(best_tip(&state), siblings[1].hash());
+
+    let unknown = siblings[1].make_fake_child().hash();
+    let error = timeout(limit, state.send_precious_block(unknown))
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    assert!(matches!(error, crate::PreciousError::BlockNotFound(hash) if hash == unknown));
+    assert_eq!(best_tip(&state), siblings[1].hash());
+}
+
+/// During checkpoint sync the writer defers non-finalized messages, so precious requests fail
+/// immediately instead of waiting for the checkpoint phase to end.
+#[tokio::test(flavor = "multi_thread")]
+async fn precious_block_request_fails_fast_during_checkpoint_sync() {
+    let _init_guard = zakura_test::init();
+    let network = Network::new_regtest(Default::default());
+    let (state, _, _, _) = StateService::new(Config::ephemeral(), &network, Height::MAX, 0)
+        .await
+        .unwrap();
+    assert!(state.block_write_sender.finalized.is_some());
+
+    let error = timeout(
+        Duration::from_secs(1),
+        state.send_precious_block(network.genesis_hash()),
+    )
+    .await
+    .expect("the request is answered without waiting for checkpoint sync")
+    .unwrap()
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        crate::PreciousError::ProcessingCheckpointedBlocks
+    ));
+}

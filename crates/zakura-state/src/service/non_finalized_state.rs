@@ -5,6 +5,7 @@
 use std::{
     collections::{BTreeSet, HashMap},
     mem,
+    num::NonZeroU64,
     path::{Path, PathBuf},
     sync::Arc,
     time::Instant,
@@ -23,7 +24,7 @@ use crate::{
     constants::{MAX_INVALIDATED_BLOCKS, MAX_NON_FINALIZED_CHAIN_FORKS},
     error::ReconsiderError,
     request::{ContextuallyVerifiedBlock, FinalizableBlock},
-    service::{check, finalized_state::ZakuraDb, InvalidateError},
+    service::{check, finalized_state::ZakuraDb, InvalidateError, PreciousError},
     SemanticallyVerifiedBlock, ValidateContextError, WatchReceiver,
 };
 
@@ -101,6 +102,11 @@ pub struct NonFinalizedState {
     /// state.
     invalidated_blocks: IndexMap<Height, Arc<Vec<ContextuallyVerifiedBlock>>>,
 
+    /// The sequence of the latest `preciousblock` call, so later calls win equal-work ties.
+    ///
+    /// Operator preferences are local and are not restored from the backup after a restart.
+    precious_sequence: u64,
+
     // Configuration
     //
     /// The configured Zcash network.
@@ -147,6 +153,7 @@ impl Clone for NonFinalizedState {
             chain_set: self.chain_set.clone(),
             network: self.network.clone(),
             invalidated_blocks: self.invalidated_blocks.clone(),
+            precious_sequence: self.precious_sequence,
             should_count_metrics: self.should_count_metrics,
             // Don't track progress in clones.
             #[cfg(feature = "progress-bar")]
@@ -164,6 +171,7 @@ impl NonFinalizedState {
             chain_set: Default::default(),
             network: network.clone(),
             invalidated_blocks: Default::default(),
+            precious_sequence: 0,
             should_count_metrics: true,
             #[cfg(feature = "progress-bar")]
             chain_count_bar: None,
@@ -509,6 +517,61 @@ impl NonFinalizedState {
         self.update_metrics_bars();
 
         Ok(block_hash)
+    }
+
+    /// Prefers the chain tip with hash `block_hash` over every other tip with the same work, as if
+    /// it had been received first.
+    ///
+    /// A later call overrides an earlier one. Greater work still wins, so a block with less work
+    /// than the best tip, including a block below another chain tip, an invalidated block, or a
+    /// finalized block, leaves the state unchanged.
+    ///
+    /// Returns [`PreciousError::BlockNotFound`] if the block is not known to either state.
+    /// Invalidated blocks are known, like Bitcoin Core's block index.
+    pub fn precious_block(
+        &mut self,
+        block_hash: block::Hash,
+        finalized_state: &ZakuraDb,
+    ) -> Result<(), PreciousError> {
+        let Some(chain) = self
+            .chain_set
+            .iter()
+            .find(|chain| chain.non_finalized_tip_hash() == block_hash)
+            .cloned()
+        else {
+            let is_invalidated = || {
+                self.invalidated_blocks
+                    .values()
+                    .any(|blocks| blocks.iter().any(|block| block.hash == block_hash))
+            };
+            if self.any_chain_contains(&block_hash)
+                || is_invalidated()
+                || finalized_state.height(block_hash).is_some()
+            {
+                return Ok(());
+            }
+            return Err(PreciousError::BlockNotFound(block_hash));
+        };
+
+        let best_work = self
+            .best_chain()
+            .expect("the chain set contains the chain found above")
+            .partial_cumulative_work;
+        if chain.partial_cumulative_work < best_work {
+            return Ok(());
+        }
+
+        self.precious_sequence = self.precious_sequence.saturating_add(1);
+        let sequence = NonZeroU64::new(self.precious_sequence)
+            .expect("the sequence was just incremented from a non-negative value");
+
+        // Chain::cmp reads the preference, so change it only while the chain is outside the set.
+        self.chain_set.remove(&chain);
+        let mut chain = chain;
+        Arc::make_mut(&mut chain).set_precious(sequence);
+        self.chain_set.insert(chain);
+
+        Ok(())
     }
 
     /// Reconsiders a previously invalidated block and its descendants into the non-finalized state

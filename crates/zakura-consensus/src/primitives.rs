@@ -17,6 +17,8 @@ pub mod halo2;
 pub mod redjubjub;
 pub mod redpallas;
 pub mod sapling;
+#[cfg(zcash_unstable = "nutachyon")]
+pub mod tachyon;
 
 /// The maximum batch size for any of the batch verifiers.
 const MAX_BATCH_SIZE: usize = 64;

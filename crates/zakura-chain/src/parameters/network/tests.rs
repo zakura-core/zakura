@@ -1020,6 +1020,8 @@ fn estimated_mainnet_nsm_crossing_lands_in_february_2031() {
             nu6_2: Some(mainnet::NU6_2.0),
             nu6_3: Some(mainnet::NU6_3.0),
             nu7: Some(ESTIMATED_NU7_HEIGHT),
+            #[cfg(zcash_unstable = "nutachyon")]
+            nu_tachyon: None,
         })
         .expect("the estimated Mainnet activation schedule is ordered")
         .clear_funding_streams()

@@ -102,7 +102,22 @@ pub const MAX_PRUNE_HEIGHTS_PER_COMMIT: u32 = 100;
 ///
 /// Instead of using this constant directly, use [`constants::state_database_format_version_in_code()`]
 /// or [`config::database_format_version_on_disk()`] to get the full semantic format version.
+#[cfg(not(zcash_unstable = "nutachyon"))]
 const DATABASE_FORMAT_VERSION: u64 = 29;
+#[cfg(zcash_unstable = "nutachyon")]
+const DATABASE_FORMAT_VERSION: u64 = RESERVED_NUTACHYON_DATABASE_FORMAT_MAJOR_VERSION;
+
+/// Reserved for NuTachyon databases derived from production database format 29.
+///
+/// This reservation prevents a future production format from giving version 30 a
+/// different meaning while NuTachyon development remains out of tree.
+const RESERVED_NUTACHYON_DATABASE_FORMAT_MAJOR_VERSION: u64 = 30;
+
+#[cfg(not(zcash_unstable = "nutachyon"))]
+const _: () = assert!(
+    DATABASE_FORMAT_VERSION != RESERVED_NUTACHYON_DATABASE_FORMAT_MAJOR_VERSION,
+    "production database format conflicts with reserved NuTachyon major version 30",
+);
 
 /// The database format minor version, incremented each time the on-disk database format has a
 /// significant data format change.
@@ -111,6 +126,12 @@ const DATABASE_FORMAT_VERSION: u64 = 29;
 /// - adding new column families,
 /// - changing the format of a column family in a compatible way, or
 /// - breaking changes with compatibility code in all supported Zebra versions.
+///
+/// Version history:
+/// - 30.0.0: adds the Tachyon anchor and Tachygram column families, widens the chain value
+///   balance from 56 to 64 bytes, and widens history entries for the V4 history-node fields.
+///   Existing value-balance and history rows remain readable, so version 30 can reuse a version
+///   29 database without a row migration.
 const DATABASE_FORMAT_MINOR_VERSION: u64 = 0;
 
 /// The database format patch version, incremented each time the on-disk database format has a

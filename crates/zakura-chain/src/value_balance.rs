@@ -20,6 +20,11 @@ mod tests;
 
 use ValueBalanceError::*;
 
+#[cfg(not(zcash_unstable = "nutachyon"))]
+const VALUE_BALANCE_BYTES: usize = 56;
+#[cfg(zcash_unstable = "nutachyon")]
+const VALUE_BALANCE_BYTES: usize = 64;
+
 /// A balance in each chain value pool or transaction value pool.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
 pub struct ValueBalance<C> {
@@ -33,6 +38,8 @@ pub struct ValueBalance<C> {
     /// This accounting counter funds reissuance but holds no spendable value.
     /// Monetary totals exclude it. Contextual validation rejects negative balances from NU7.
     nsm_value_balance: Amount<NegativeAllowed>,
+    #[cfg(zcash_unstable = "nutachyon")]
+    tachyon: Amount<C>,
 }
 
 impl<C> ValueBalance<C>
@@ -75,6 +82,15 @@ where
     pub fn from_ironwood_amount(ironwood_amount: Amount<C>) -> Self {
         ValueBalance {
             ironwood: ironwood_amount,
+            ..ValueBalance::zero()
+        }
+    }
+
+    /// Creates a [`ValueBalance`] from the given Tachyon amount.
+    #[cfg(zcash_unstable = "nutachyon")]
+    pub fn from_tachyon_amount(tachyon_amount: Amount<C>) -> Self {
+        ValueBalance {
+            tachyon: tachyon_amount,
             ..ValueBalance::zero()
         }
     }
@@ -167,6 +183,19 @@ where
         self
     }
 
+    /// Get the Tachyon amount from the [`ValueBalance`].
+    #[cfg(zcash_unstable = "nutachyon")]
+    pub fn tachyon_amount(&self) -> Amount<C> {
+        self.tachyon
+    }
+
+    /// Insert a Tachyon value balance without changing the other pools.
+    #[cfg(zcash_unstable = "nutachyon")]
+    pub fn set_tachyon_value_balance(&mut self, tachyon_value_balance: ValueBalance<C>) -> &Self {
+        self.tachyon = tachyon_value_balance.tachyon;
+        self
+    }
+
     /// Creates a [`ValueBalance`] where all the pools are zero.
     pub fn zero() -> Self {
         let zero = Amount::zero();
@@ -178,6 +207,8 @@ where
             deferred: zero,
             ironwood: zero,
             nsm_value_balance: Amount::zero(),
+            #[cfg(zcash_unstable = "nutachyon")]
+            tachyon: zero,
         }
     }
 
@@ -201,6 +232,9 @@ where
         .map(|amount| i128::from(amount.zatoshis()))
         .sum();
 
+        #[cfg(zcash_unstable = "nutachyon")]
+        let total = total + i128::from(self.tachyon.zatoshis());
+
         Amount::try_from(total)
     }
 
@@ -220,6 +254,8 @@ where
             // The balance is signed in every `ValueBalance`, so it survives the conversion
             // unchanged.
             nsm_value_balance: self.nsm_value_balance,
+            #[cfg(zcash_unstable = "nutachyon")]
+            tachyon: self.tachyon.constrain().map_err(Tachyon)?,
         })
     }
 }
@@ -246,8 +282,12 @@ impl ValueBalance<NegativeAllowed> {
         // like the orchard bundle; it is zero for transactions without an ironwood bundle.
         //
         // This will error if the remaining value in the transaction value pool is negative.
-        (self.transparent + self.sprout + self.sapling + self.orchard + self.ironwood)?
-            .constrain::<NonNegative>()
+        let remaining =
+            self.transparent + self.sprout + self.sapling + self.orchard + self.ironwood;
+        #[cfg(zcash_unstable = "nutachyon")]
+        let remaining = remaining? + self.tachyon;
+
+        remaining?.constrain::<NonNegative>()
     }
 }
 
@@ -496,10 +536,10 @@ impl ValueBalance<NonNegative> {
 
     /// To byte array
     ///
-    /// Each leg is appended after the last, so that records written by earlier versions
-    /// (32 bytes without `deferred`, 40 bytes with it, 48 bytes with `ironwood`) remain
-    /// parsable by [`Self::from_bytes`]. `nsm_value_balance` is the seventh leg, at 48..56.
-    pub fn to_bytes(self) -> [u8; 56] {
+    /// Each leg is appended after the last, so records written by earlier versions remain
+    /// parsable by [`Self::from_bytes`]. `nsm_value_balance` is at 48..56, and Tachyon is at
+    /// 56..64 when enabled.
+    pub fn to_bytes(self) -> [u8; VALUE_BALANCE_BYTES] {
         match [
             self.transparent.to_bytes(),
             self.sprout.to_bytes(),
@@ -508,13 +548,15 @@ impl ValueBalance<NonNegative> {
             self.deferred.to_bytes(),
             self.ironwood.to_bytes(),
             self.nsm_value_balance.to_bytes(),
+            #[cfg(zcash_unstable = "nutachyon")]
+            self.tachyon.to_bytes(),
         ]
         .concat()
         .try_into()
         {
             Ok(bytes) => bytes,
             _ => unreachable!(
-                "seven [u8; 8] should always concat with no error into a single [u8; 56]"
+                "the value balance fields should concat into the configured fixed-width array"
             ),
         }
     }
@@ -522,7 +564,8 @@ impl ValueBalance<NonNegative> {
     /// From byte array
     ///
     /// Accepts 32-byte (pre-`deferred`), 40-byte (pre-`ironwood`), 48-byte
-    /// (pre-`nsm_value_balance`) and 56-byte records; missing trailing pools default to zero.
+    /// (pre-`nsm_value_balance`), 56-byte (pre-Tachyon), and 64-byte records when Tachyon is
+    /// enabled; missing trailing pools default to zero.
     ///
     /// A zero `nsm_value_balance` on a shorter record is a placeholder, not the real balance.
     /// The `nsm_value_balance_pool` database upgrade recomputes it from the halving schedule
@@ -532,10 +575,11 @@ impl ValueBalance<NonNegative> {
         let bytes_length = bytes.len();
 
         // Return an error early if bytes don't have the right length instead of panicking later.
-        match bytes_length {
-            32 | 40 | 48 | 56 => {}
-            _ => return Err(Unparsable),
-        };
+        let valid_length = matches!(bytes_length, 32 | 40 | 48 | 56)
+            || cfg!(zcash_unstable = "nutachyon") && bytes_length == 64;
+        if !valid_length {
+            return Err(Unparsable);
+        }
 
         let transparent = Amount::from_bytes(
             bytes[0..8]
@@ -567,7 +611,7 @@ impl ValueBalance<NonNegative> {
 
         let deferred = match bytes_length {
             32 => Amount::zero(),
-            40 | 48 | 56 => Amount::from_bytes(
+            40 | 48 | 56 | 64 => Amount::from_bytes(
                 bytes[32..40]
                     .try_into()
                     .expect("deferred amount should be parsable"),
@@ -578,7 +622,7 @@ impl ValueBalance<NonNegative> {
 
         let ironwood = match bytes_length {
             32 | 40 => Amount::zero(),
-            48 | 56 => Amount::from_bytes(
+            48 | 56 | 64 => Amount::from_bytes(
                 bytes[40..48]
                     .try_into()
                     .expect("ironwood amount should be parsable"),
@@ -589,12 +633,24 @@ impl ValueBalance<NonNegative> {
 
         let nsm_value_balance = match bytes_length {
             32 | 40 | 48 => Amount::zero(),
-            56 => Amount::from_bytes(
+            56 | 64 => Amount::from_bytes(
                 bytes[48..56]
                     .try_into()
                     .expect("NSM value balance amount should be parsable"),
             )
             .map_err(NsmValueBalance)?,
+            _ => return Err(Unparsable),
+        };
+
+        #[cfg(zcash_unstable = "nutachyon")]
+        let tachyon = match bytes_length {
+            32 | 40 | 48 | 56 => Amount::zero(),
+            64 => Amount::from_bytes(
+                bytes[56..64]
+                    .try_into()
+                    .expect("tachyon amount should be parsable"),
+            )
+            .map_err(Tachyon)?,
             _ => return Err(Unparsable),
         };
 
@@ -606,6 +662,8 @@ impl ValueBalance<NonNegative> {
             deferred,
             ironwood,
             nsm_value_balance,
+            #[cfg(zcash_unstable = "nutachyon")]
+            tachyon,
         })
     }
 }
@@ -648,6 +706,10 @@ pub enum ValueBalanceError {
     /// the block has no coinbase height, so its NSM value balance change is undefined
     MissingCoinbaseHeight,
 
+    /// Tachyon amount error {0}
+    #[cfg(zcash_unstable = "nutachyon")]
+    Tachyon(amount::Error),
+
     /// total amount error {0}
     Total(amount::Error),
 
@@ -673,6 +735,8 @@ impl fmt::Display for ValueBalanceError {
                 "block has no coinbase height, so its NSM value balance change is undefined"
                     .to_string()
             }
+            #[cfg(zcash_unstable = "nutachyon")]
+            Tachyon(e) => format!("tachyon amount err: {e}"),
             Total(e) => format!("total amount err: {e}"),
             Unparsable => "value balance is unparsable".to_string(),
         })
@@ -694,6 +758,8 @@ where
             ironwood: (self.ironwood + rhs.ironwood).map_err(Ironwood)?,
             nsm_value_balance: (self.nsm_value_balance + rhs.nsm_value_balance)
                 .map_err(NsmValueBalance)?,
+            #[cfg(zcash_unstable = "nutachyon")]
+            tachyon: (self.tachyon + rhs.tachyon).map_err(Tachyon)?,
         })
     }
 }
@@ -746,6 +812,8 @@ where
             ironwood: (self.ironwood - rhs.ironwood).map_err(Ironwood)?,
             nsm_value_balance: (self.nsm_value_balance - rhs.nsm_value_balance)
                 .map_err(NsmValueBalance)?,
+            #[cfg(zcash_unstable = "nutachyon")]
+            tachyon: (self.tachyon - rhs.tachyon).map_err(Tachyon)?,
         })
     }
 }
@@ -817,6 +885,8 @@ where
             deferred: self.deferred.neg(),
             ironwood: self.ironwood.neg(),
             nsm_value_balance: self.nsm_value_balance.neg(),
+            #[cfg(zcash_unstable = "nutachyon")]
+            tachyon: self.tachyon.neg(),
         }
     }
 }

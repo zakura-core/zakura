@@ -143,7 +143,7 @@ pub use vct_treestate_audit::{
 pub use zakura_db::commitment_roots_db::{CommitmentRootIndexIssue, COMMITMENT_ROOTS_BY_HEIGHT};
 #[allow(unused_imports)]
 pub use zakura_db::highest_completed_checkpoint::*;
-pub use zakura_db::ZakuraDb;
+pub use zakura_db::{DatabaseWriterMetadata, ZakuraDb};
 
 #[cfg(any(test, feature = "proptest-impl"))]
 pub use disk_format::KV;
@@ -214,17 +214,34 @@ pub const STATE_COLUMN_FAMILIES_IN_CODE: &[&str] = &[
     "ironwood_anchors",
     "ironwood_note_commitment_tree",
     "ironwood_note_commitment_subtree",
+    #[cfg(zcash_unstable = "nutachyon")]
+    "tachyon_anchors",
+    #[cfg(zcash_unstable = "nutachyon")]
+    "tachyon_anchor_by_height",
+    #[cfg(zcash_unstable = "nutachyon")]
+    "tachyon_epoch_anchor_by_epoch",
+    #[cfg(zcash_unstable = "nutachyon")]
+    "tachyon_tachygrams",
     // Chain
     "history_tree",
     "tip_chain_value_pool",
     BLOCK_INFO,
     // Verified-commitment-trees serving index
     COMMITMENT_ROOTS_BY_HEIGHT,
+    // Node software metadata
+    NODE_SOFTWARE_METADATA,
     // Storage policy
     PRUNING_METADATA,
     VCT_SYNC_METADATA,
     VCT_UPGRADE_METADATA,
 ];
+
+/// The name of the column family that records the last node software to write
+/// this database.
+///
+/// This column family is a simple key/value store for operational metadata. It
+/// is not consensus data.
+pub const NODE_SOFTWARE_METADATA: &str = "node_software_metadata";
 
 /// Fork-aware header-chain node rows keyed by canonical hash.
 pub const HEADER_NODE_BY_HASH: &str = "header_node_by_hash_v1";
@@ -328,7 +345,31 @@ impl FinalizedState {
     /// Returns an on-disk database instance for `config` and `network`.
     /// If there is no existing database, creates a new database on disk.
     pub fn new(config: &Config, network: &Network) -> Result<Self, StateInitError> {
-        Self::new_with_debug(config, network, false, false)
+        Self::new_with_database_writer_metadata(
+            config,
+            network,
+            DatabaseWriterMetadata::default_zakura(),
+        )
+    }
+
+    /// Returns an on-disk database instance for `config`, `network`, and the
+    /// supplied database writer metadata.
+    ///
+    /// If there is no existing database, creates a new database on disk.
+    pub fn new_with_database_writer_metadata(
+        config: &Config,
+        network: &Network,
+        database_writer_metadata: DatabaseWriterMetadata,
+    ) -> Result<Self, StateInitError> {
+        Self::new_with_debug_and_database_writer_metadata_and_storage_validation(
+            config,
+            network,
+            database_writer_metadata,
+            false,
+            false,
+            true,
+            true,
+        )
     }
 
     /// Opens (or creates) the on-disk finalized state database read-write, for
@@ -354,9 +395,10 @@ impl FinalizedState {
         debug_skip_format_upgrades: bool,
         read_only: bool,
     ) -> Result<Self, StateInitError> {
-        Self::new_with_debug_and_storage_validation(
+        Self::new_with_debug_and_database_writer_metadata_and_storage_validation(
             config,
             network,
+            DatabaseWriterMetadata::default_zakura(),
             debug_skip_format_upgrades,
             read_only,
             true,
@@ -385,10 +427,32 @@ impl FinalizedState {
         )
     }
 
+    #[cfg(test)]
     #[allow(clippy::unwrap_in_result)]
     fn new_with_debug_and_storage_validation(
         config: &Config,
         network: &Network,
+        debug_skip_format_upgrades: bool,
+        read_only: bool,
+        validate_storage_mode: bool,
+        enforce_resume_guard: bool,
+    ) -> Result<Self, StateInitError> {
+        Self::new_with_debug_and_database_writer_metadata_and_storage_validation(
+            config,
+            network,
+            DatabaseWriterMetadata::default_zakura(),
+            debug_skip_format_upgrades,
+            read_only,
+            validate_storage_mode,
+            enforce_resume_guard,
+        )
+    }
+
+    #[allow(clippy::unwrap_in_result)]
+    fn new_with_debug_and_database_writer_metadata_and_storage_validation(
+        config: &Config,
+        network: &Network,
+        database_writer_metadata: DatabaseWriterMetadata,
         debug_skip_format_upgrades: bool,
         read_only: bool,
         validate_storage_mode: bool,
@@ -401,7 +465,7 @@ impl FinalizedState {
             }
         }
 
-        let db = ZakuraDb::new(
+        let db = ZakuraDb::new_with_database_writer_metadata(
             config,
             STATE_DATABASE_KIND,
             &state_database_format_version_in_code(),
@@ -411,6 +475,7 @@ impl FinalizedState {
                 .iter()
                 .map(ToString::to_string),
             read_only,
+            Some(&database_writer_metadata),
         )?;
 
         let vct = VctState::from_config(config.checkpoint_sync, config.vct_fast_sync, network);
@@ -902,6 +967,13 @@ impl FinalizedState {
                         }),
                     };
 
+                    // The roots-only VCT payload does not carry Tachyon anchors or transaction
+                    // counts, so NuTachyon blocks must use the body-derived commitment path.
+                    #[cfg(zcash_unstable = "nutachyon")]
+                    let vct_roots = vct_roots.filter(|_| {
+                        NetworkUpgrade::current(&network, height) < NetworkUpgrade::NuTachyon
+                    });
+
                     let mut vct_write = VctWriteData::default();
 
                     if let Some((sapling_root, orchard_root, ironwood_root)) = vct_roots {
@@ -1033,6 +1105,8 @@ impl FinalizedState {
                                 commitment_aux_verify::verify_commitment_roots(
                                     &network,
                                     (*history_tree).clone(),
+                                    #[cfg(zcash_unstable = "nutachyon")]
+                                    prev_note_commitment_trees.tachyon_anchor,
                                     verification_items,
                                 )
                             })
@@ -1176,6 +1250,10 @@ impl FinalizedState {
                                 orchard_subtree: None,
                                 ironwood: ironwood_frontier,
                                 ironwood_subtree: None,
+                                #[cfg(zcash_unstable = "nutachyon")]
+                                tachyon_anchor: note_commitment_trees.tachyon_anchor,
+                                #[cfg(zcash_unstable = "nutachyon")]
+                                tachyon_epoch_anchor: None,
                             };
 
                             // The handoff writes the real final frontier as the tip
@@ -1261,10 +1339,24 @@ impl FinalizedState {
                         commitment_result.expect("scope has already finished")?;
 
                         // Update the history tree (depends on both operations above).
+                        #[cfg(zcash_unstable = "nutachyon")]
+                        if let Some(pool_height) =
+                            zakura_chain::tachyon::pool_height(&network, checkpoint_verified.height)
+                        {
+                            let advance = note_commitment_trees
+                                .tachyon_anchor
+                                .advance_with_block(pool_height, &block)
+                                .map_err(ValidateContextError::from)?;
+                            note_commitment_trees.tachyon_anchor = advance.post_block;
+                            note_commitment_trees.tachyon_epoch_anchor = advance.epoch_boundary;
+                        }
+
                         let history_tree_mut = Arc::make_mut(&mut history_tree);
                         let sapling_root = note_commitment_trees.sapling.root();
                         let orchard_root = note_commitment_trees.orchard.root();
                         let ironwood_root = note_commitment_trees.ironwood.root();
+                        #[cfg(zcash_unstable = "nutachyon")]
+                        let tachyon_anchor = note_commitment_trees.tachyon_anchor;
                         history_tree_mut
                             .push(
                                 &network,
@@ -1272,6 +1364,8 @@ impl FinalizedState {
                                 &sapling_root,
                                 &orchard_root,
                                 &ironwood_root,
+                                #[cfg(zcash_unstable = "nutachyon")]
+                                &tachyon_anchor,
                             )
                             .map_err(Arc::new)
                             .map_err(ValidateContextError::from)?;

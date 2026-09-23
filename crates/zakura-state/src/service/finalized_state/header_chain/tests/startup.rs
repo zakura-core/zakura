@@ -932,7 +932,7 @@ fn version_one_migration_rejects_an_ambiguous_network_policy_without_writing() {
     let (engine_config, anchor, metadata) = fixture();
     let changed_network = Network::new_regtest(RegtestParameters {
         activation_heights: ConfiguredActivationHeights {
-            canopy: Some(10),
+            nu5: Some(10),
             ..Default::default()
         },
         ..Default::default()
@@ -1085,7 +1085,7 @@ fn version_two_migration_rejects_an_ambiguous_network_policy_without_writing() {
     let (engine_config, anchor, metadata) = fixture();
     let changed_network = Network::new_regtest(RegtestParameters {
         activation_heights: ConfiguredActivationHeights {
-            canopy: Some(10),
+            nu5: Some(10),
             ..Default::default()
         },
         ..Default::default()
@@ -1638,7 +1638,7 @@ fn configured_network_startup_rebinds_a_changed_network_policy() {
         engine_config.mode,
         Network::new_regtest(RegtestParameters {
             activation_heights: ConfiguredActivationHeights {
-                canopy: Some(10),
+                nu5: Some(10),
                 ..Default::default()
             },
             ..Default::default()

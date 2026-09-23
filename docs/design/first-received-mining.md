@@ -40,6 +40,20 @@ For example, A arrives before B, but B finishes verification first. Mining can
 briefly use B while A is unverified. Once A passes, equal-work selection chooses
 A. If B gains a child with more cumulative work, mining switches to that child.
 
+## Operator preference
+
+The admin `preciousblock` RPC treats a chain tip as if it were received before
+every other tip with equal work, like Bitcoin Core's method of the same name. It
+ranks above receipt order, and a later call overrides an earlier one. Greater
+work still wins, so a block with less work than the best tip is left unchanged.
+The preference belongs to the tip: descendants do not inherit it, and it applies
+again if invalidation reverts the chain to that tip. When the best tip changes,
+the writer publishes the new tip as a verified chain reset, and operator
+invalidation and reconsideration keep it through the full-state verified tip.
+
+The preference is local. It is not stored in backups, so it does not survive a
+restart, and trusted secondaries do not receive it.
+
 ## Header sync
 
 The header engine still uses greatest work and raw hash to select downloads.

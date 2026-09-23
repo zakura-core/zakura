@@ -4,6 +4,7 @@
 use std::{
     cmp::Ordering,
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    num::NonZeroU64,
     ops::{Deref, DerefMut, RangeInclusive},
     sync::Arc,
 };
@@ -74,6 +75,14 @@ pub struct Chain {
     /// diagnostics only use the best chain, and others need to modify the Chain state, but that's
     /// difficult with `Arc<Chain>`s.
     pub(super) last_fork_height: Option<Height>,
+
+    /// The operator's `preciousblock` preference for this chain's tip, with its call sequence.
+    ///
+    /// Local policy, not chain state, so it is not checked by [`Chain::eq_internal_state`].
+    /// Only [`NonFinalizedState`](super::NonFinalizedState) sets it, while the chain is outside
+    /// the `chain_set`. Growing or forking the chain keeps the stored hash, which stops matching
+    /// the tip until the chain is reverted to that block.
+    precious: Option<(block::Hash, NonZeroU64)>,
 }
 
 /// Spending transaction id type when the `indexer` feature is selected.
@@ -308,6 +317,7 @@ impl Chain {
             network: network.clone(),
             inner,
             last_fork_height: None,
+            precious: None,
         };
 
         chain.add_sprout_tree_and_anchor(finalized_tip_height, sprout_note_commitment_tree);
@@ -452,6 +462,20 @@ impl Chain {
         }
 
         Some(forked)
+    }
+
+    /// Marks the current tip as the operator's preferred block, ahead of any earlier call.
+    pub(super) fn set_precious(&mut self, sequence: NonZeroU64) {
+        self.precious = Some((self.non_finalized_tip_hash(), sequence));
+    }
+
+    /// Returns the `preciousblock` sequence if it applies to the current tip, or zero.
+    ///
+    /// A later call has a higher sequence and wins equal-work ties against earlier ones.
+    fn active_precedence(&self) -> u64 {
+        self.precious
+            .filter(|(hash, _)| *hash == self.non_finalized_tip_hash())
+            .map_or(0, |(_, sequence)| sequence.get())
     }
 
     /// Returns the [`Network`] for this chain.
@@ -2626,9 +2650,10 @@ impl UpdateWith<(ValueBalance<NegativeAllowed>, Height, usize)> for Chain {
 impl Ord for Chain {
     /// Chain order for the [`NonFinalizedState`][1]'s `chain_set`.
     ///
-    /// Greater work wins, then the earlier tip receipt, then the raw tip hash.
-    /// Missing receipt orders precede live receipts and tie by hash, so backup
-    /// replay order cannot decide the best chain after restart.
+    /// Greater work wins, then the operator's latest `preciousblock` tip, then the
+    /// earlier tip receipt, then the raw tip hash. Missing receipt orders precede
+    /// live receipts and tie by hash, so backup replay order cannot decide the
+    /// best chain after restart.
     ///
     /// See <https://zips.z.cash/protocol/protocol.pdf#blockchain>.
     ///
@@ -2642,6 +2667,7 @@ impl Ord for Chain {
     fn cmp(&self, other: &Self) -> Ordering {
         self.partial_cumulative_work
             .cmp(&other.partial_cumulative_work)
+            .then_with(|| self.active_precedence().cmp(&other.active_precedence()))
             .then_with(|| {
                 let self_tip = self
                     .tip_block()

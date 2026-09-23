@@ -561,6 +561,35 @@ pub enum ReconsiderError {
     },
 }
 
+/// An error describing why a `preciousblock` request failed.
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum PreciousError {
+    /// The state is still committing checkpointed blocks and cannot prefer a tip yet.
+    #[error("cannot prefer blocks while still committing checkpointed blocks")]
+    ProcessingCheckpointedBlocks,
+
+    /// Sending the precious request to the block write task failed.
+    #[error("failed to send precious block request to block write task")]
+    SendPreciousRequestFailed,
+
+    /// The precious request was dropped before processing.
+    #[error("precious block request was unexpectedly dropped")]
+    PreciousRequestDropped,
+
+    /// The block hash was not found in the finalized or non-finalized state.
+    #[error("block hash {0} not found")]
+    BlockNotFound(block::Hash),
+
+    /// The staged state mutation disagreed with or could not commit its header transition.
+    #[error("could not commit matching header-chain selection: {error}")]
+    HeaderChain {
+        /// Stable local error diagnostic.
+        /// State never attributes this diagnostic to a peer.
+        error: String,
+    },
+}
+
 /// An error describing why a block failed contextual validation.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 #[non_exhaustive]

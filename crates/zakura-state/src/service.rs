@@ -51,7 +51,7 @@ use crate::{
     },
     error::{
         AwaitBlockInfoError, CommitBlockError, CommitCheckpointVerifiedError, InvalidateError,
-        ReconsiderError,
+        PreciousError, ReconsiderError,
     },
     request::TimedSpan,
     response::NonFinalizedBlocksListener,
@@ -1398,6 +1398,30 @@ impl StateService {
         rsp_rx
     }
 
+    fn send_precious_block(
+        &self,
+        hash: block::Hash,
+    ) -> oneshot::Receiver<Result<(), PreciousError>> {
+        let (rsp_tx, rsp_rx) = oneshot::channel();
+
+        let Some(sender) = &self.block_write_sender.non_finalized else {
+            let _ = rsp_tx.send(Err(PreciousError::ProcessingCheckpointedBlocks));
+            return rsp_rx;
+        };
+
+        if let Err(tokio::sync::mpsc::error::SendError(error)) =
+            sender.send(NonFinalizedWriteMessage::Precious { hash, rsp_tx })
+        {
+            let NonFinalizedWriteMessage::Precious { rsp_tx, .. } = error else {
+                unreachable!("should return the same Precious message could not be sent");
+            };
+
+            let _ = rsp_tx.send(Err(PreciousError::SendPreciousRequestFailed));
+        }
+
+        rsp_rx
+    }
+
     fn send_reconsider_block(
         &self,
         hash: block::Hash,
@@ -2133,6 +2157,25 @@ impl Service<Request> for StateService {
                         .and_then(|result| result)
                         .map_err(BoxError::from)
                         .map(Response::Invalidated)
+                }
+                .instrument(span)
+                .boxed()
+            }
+
+            // The expected error type for this request is `PreciousError`
+            Request::PreciousBlock(block_hash) => {
+                let rsp_rx = tokio::task::block_in_place(move || {
+                    span.in_scope(|| self.send_precious_block(block_hash))
+                });
+
+                let span = Span::current();
+                async move {
+                    rsp_rx
+                        .await
+                        .map_err(|_recv_error| PreciousError::PreciousRequestDropped)
+                        .and_then(|result| result)
+                        .map_err(BoxError::from)
+                        .map(|()| Response::Precious)
                 }
                 .instrument(span)
                 .boxed()

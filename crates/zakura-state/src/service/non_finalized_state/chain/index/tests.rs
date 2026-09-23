@@ -62,6 +62,7 @@ fn cloned_chain_keeps_transparent_address_history_isolated() {
 
 #[test]
 #[ignore = "release-mode clone benchmark"]
+#[allow(clippy::print_stdout)]
 fn compare_address_index_clone() {
     // Isolate the address index; other chain indexes are empty. This does not
     // reproduce a full block replay or its thread scheduling.

@@ -20,8 +20,9 @@ use zakura_state::GetBlockTemplateChainInfo;
 use zcash_address::{ToAddress, ZcashAddress};
 use zcash_protocol::consensus::NetworkType;
 
-use super::super::{BlockTemplateResponse, MinerParams};
+use super::super::{BlockTemplateResponse, CoinbaseCache, MinerParams};
 use crate::config::mining;
+use crate::methods::types::transaction::TransactionTemplate;
 
 #[test]
 fn nsm_fee_templates_pay_miner_and_credit_balance_once() {
@@ -99,9 +100,23 @@ fn nsm_fee_templates_pay_miner_and_credit_balance_once() {
                     zakura_chain::block::CHAIN_HISTORY_ACTIVATION_RESERVED.into(),
                 ),
             };
+            let cache = CoinbaseCache::default();
+            if height >= Height(10) {
+                // An equal-height parent can have a different NSM balance.
+                let fees = Amount::try_from(i64::from(transaction_count) * 10_001).unwrap();
+                let stale = TransactionTemplate::new_coinbase(
+                    &network,
+                    height,
+                    &miner,
+                    fees,
+                    Some(Amount::zero()),
+                )
+                .unwrap();
+                cache.store(height, fees, stale);
+            }
             let template = BlockTemplateResponse::new_internal(
                 &network,
-                None,
+                &cache,
                 &miner,
                 &chain_info,
                 "0".repeat(46).parse().unwrap(),

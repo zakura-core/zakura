@@ -2,6 +2,7 @@
 
 pub mod constants;
 pub mod parameters;
+pub(crate) mod precompute;
 pub mod proposal;
 pub mod zip317;
 
@@ -12,7 +13,7 @@ pub(crate) mod prepared_candidates;
 use prepared_candidates::PreparedCandidateResolver;
 
 use std::{
-    collections::{HashSet, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     fmt::{self},
     sync::{Arc, Mutex},
     time::Duration,
@@ -510,7 +511,7 @@ impl BlockTemplateResponse {
     #[allow(clippy::too_many_arguments, clippy::unwrap_in_result)]
     pub(crate) fn new_internal(
         net: &Network,
-        precomputed_coinbase: Option<TransactionTemplate<amount::NegativeOrZero>>,
+        coinbase_cache: &CoinbaseCache,
         miner_params: &MinerParams,
         chain_info: &GetBlockTemplateChainInfo,
         long_poll_id: LongPollId,
@@ -565,23 +566,33 @@ impl BlockTemplateResponse {
             .sum::<amount::Result<Amount<NonNegative>>>()
             .expect("mempool tx fees must be non-negative");
 
-        let coinbase_txn = match precomputed_coinbase {
-            Some(coinbase_txn) => coinbase_txn,
-            // ZIP 234 derives the subsidy from the money reserve after the parent, which
-            // is the chain tip this template builds on.
-            None => TransactionTemplate::new_coinbase(
-                net,
-                height,
-                miner_params,
-                txs_fee,
-                if is_zip234_active(net, height) {
-                    Some(parent_nsm_value_balance(
-                        chain_info.value_pools.nsm_value_balance_amount(),
-                    )?)
-                } else {
-                    None
-                },
-            )?,
+        // After reissuance, equal-height parents can have different NSM balances.
+        // The height/fee cache cannot identify that context, so bypass it.
+        let cache_allowed = !is_zip234_active(net, height);
+        let cached = cache_allowed
+            .then(|| coinbase_cache.get(height, txs_fee))
+            .flatten();
+        let coinbase_txn = match cached {
+            Some(coinbase) => coinbase,
+            None => {
+                let coinbase = TransactionTemplate::new_coinbase(
+                    net,
+                    height,
+                    miner_params,
+                    txs_fee,
+                    if cache_allowed {
+                        None
+                    } else {
+                        Some(parent_nsm_value_balance(
+                            chain_info.value_pools.nsm_value_balance_amount(),
+                        )?)
+                    },
+                )?;
+                if cache_allowed {
+                    coinbase_cache.store(height, txs_fee, coinbase.clone());
+                }
+                coinbase
+            }
         };
 
         let default_roots = DefaultRoots::from_coinbase(
@@ -761,6 +772,19 @@ impl MinerParams {
         self.memo.as_ref()
     }
 
+    /// Returns `true` if the coinbase transaction that pays these parameters has a shielded
+    /// output, which needs a proof that takes seconds to build.
+    ///
+    /// This mirrors the receiver that `TransactionTemplate::new_coinbase()` pays: a unified
+    /// address falls back to its transparent receiver when it has no shielded receiver.
+    pub(crate) fn has_shielded_component(&self) -> bool {
+        match &self.addr {
+            Address::Unified(addr) => addr.orchard().is_some() || addr.sapling().is_some(),
+            Address::Sapling(_) => true,
+            _ => false,
+        }
+    }
+
     /// Randomizes the memo.
     pub fn randomize_memo(&mut self) {
         let mut random = [0u8; 512];
@@ -803,6 +827,65 @@ impl From<zcash_address::ConversionError<&'static str>> for MinerParamsError {
     }
 }
 
+/// Caches recently built coinbase transactions for the next block, keyed on `(height, fee)`.
+///
+/// Before ZIP 234, the height and fees determine the coinbase for fixed miner parameters.
+/// The cache retains the zero-fee coinbase and recent fee variants at one height.
+/// Template construction bypasses this cache after ZIP 234 because rewards depend on parent balances.
+#[derive(Clone, Default)]
+pub(crate) struct CoinbaseCache(
+    Arc<
+        Mutex<
+            HashMap<
+                (block::Height, Amount<NonNegative>),
+                TransactionTemplate<amount::NegativeOrZero>,
+            >,
+        >,
+    >,
+);
+
+impl CoinbaseCache {
+    /// Returns the cached coinbase transaction if it was built for `height` and `fee`.
+    pub(crate) fn get(
+        &self,
+        height: block::Height,
+        fee: Amount<NonNegative>,
+    ) -> Option<TransactionTemplate<amount::NegativeOrZero>> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&(height, fee))
+            .cloned()
+    }
+
+    /// Stores `coinbase` as the cached transaction for `height` and `fee`.
+    pub(crate) fn store(
+        &self,
+        height: block::Height,
+        fee: Amount<NonNegative>,
+        coinbase: TransactionTemplate<amount::NegativeOrZero>,
+    ) {
+        let mut map = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        // Evict entries from previous heights so the map stays bounded.
+        map.retain(|&(h, _), _| h == height);
+        // Bound fee variants while retaining the zero-fee coinbase for empty templates.
+        if !map.contains_key(&(height, fee)) && map.len() >= 4 {
+            let evict_key = map
+                .keys()
+                .copied()
+                .find(|&(_, f)| f != Amount::<NonNegative>::zero());
+            if let Some(key) = evict_key {
+                map.remove(&key);
+            }
+        }
+        map.insert((height, fee), coinbase);
+    }
+}
+
 /// Handler for the `getblocktemplate` RPC.
 #[derive(Clone)]
 pub struct GetBlockTemplateHandler<BlockVerifierRouter, SyncStatus>
@@ -812,6 +895,12 @@ where
 {
     /// Miner parameters, including the miner address, data, and memo.
     miner_params: Option<MinerParams>,
+
+    /// Shares coinbase transactions across template builds.
+    coinbase_cache: CoinbaseCache,
+
+    /// Shares templates built by the background updater.
+    template_cache: Option<precompute::TemplateCache>,
 
     /// The chain verifier, used for submitting blocks.
     block_verifier_router: BlockVerifierRouter,
@@ -838,8 +927,8 @@ where
     /// Coalesces detached template preparation work to the newest template.
     template_preparation_queue: TemplatePreparationQueue<BlockTemplateResponse>,
 
-    /// Shared by foreground construction and long-poll coinbase precomputation.
-    template_build_slots: Arc<Semaphore>,
+    /// Bounds proof work across foreground requests and the background updater.
+    pub(crate) template_build_slots: Arc<Semaphore>,
 
     /// Retains failures so late subscribers cannot miss template withdrawal.
     pub(crate) template_rejections: watch::Sender<TemplateRejections>,
@@ -866,6 +955,8 @@ where
         let optimistic_block_inventory = conf.optimistic_block_inventory;
         Self {
             miner_params: MinerParams::new(net, conf).ok(),
+            coinbase_cache: CoinbaseCache::default(),
+            template_cache: Some(precompute::TemplateCache::default()),
             block_verifier_router,
             prepared_candidates: PreparedCandidateResolver::default(),
             sync_status,
@@ -891,27 +982,7 @@ where
         &self,
         build: impl FnOnce() -> T + Send + 'static,
     ) -> RpcResult<T> {
-        let permit = tokio::time::timeout(
-            TEMPLATE_BUILD_WAIT,
-            self.template_build_slots.clone().acquire_owned(),
-        )
-        .await
-        .map_err(|_| {
-            ErrorObject::owned(
-                LegacyCode::Misc.into(),
-                "timed out waiting for mining template construction capacity",
-                None::<()>,
-            )
-        })?
-        .map_misc_error()?;
-
-        tokio::task::spawn_blocking(move || {
-            // Dropping the RPC future cannot release capacity while this job still owns work.
-            let _permit = permit;
-            build()
-        })
-        .await
-        .map_misc_error()
+        run_template_build(self.template_build_slots.clone(), build).await
     }
 
     pub(crate) fn reserve_mined_submission(
@@ -925,6 +996,16 @@ where
     /// Returns the miner parameters, including the address, data, and memo.
     pub fn miner_params(&self) -> Option<&MinerParams> {
         self.miner_params.as_ref()
+    }
+
+    /// Returns the shared coinbase cache.
+    pub(crate) fn coinbase_cache(&self) -> CoinbaseCache {
+        self.coinbase_cache.clone()
+    }
+
+    /// Returns the template cache for this handler's miner parameters.
+    pub(crate) fn template_cache(&self) -> Option<&precompute::TemplateCache> {
+        self.template_cache.as_ref()
     }
 
     /// Returns the sync status.
@@ -973,6 +1054,9 @@ where
         if let Some(miner_params) = &mut self.miner_params {
             miner_params.randomize_data();
             miner_params.randomize_memo();
+            // This clone now builds different coinbases from the updater.
+            self.coinbase_cache = CoinbaseCache::default();
+            self.template_cache = None;
         }
     }
 }
@@ -1226,4 +1310,29 @@ where
 
     // Check that the mempool and state were in sync when we made the requests
     Ok((last_seen_tip_hash == chain_tip_hash).then_some((transactions, transaction_dependencies)))
+}
+
+/// Runs proof work while retaining the shared permit across cancellation.
+async fn run_template_build<T: Send + 'static>(
+    slots: Arc<Semaphore>,
+    build: impl FnOnce() -> T + Send + 'static,
+) -> RpcResult<T> {
+    let permit = tokio::time::timeout(TEMPLATE_BUILD_WAIT, slots.acquire_owned())
+        .await
+        .map_err(|_| {
+            ErrorObject::owned(
+                LegacyCode::Misc.into(),
+                "timed out waiting for mining template construction capacity",
+                None::<()>,
+            )
+        })?
+        .map_misc_error()?;
+
+    tokio::task::spawn_blocking(move || {
+        // Dropping the RPC future cannot release capacity while this job still owns work.
+        let _permit = permit;
+        build()
+    })
+    .await
+    .map_misc_error()
 }

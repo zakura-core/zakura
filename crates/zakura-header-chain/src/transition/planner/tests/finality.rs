@@ -1569,3 +1569,70 @@ fn one_insertion_finalizes_past_the_headers_it_inserted() {
         );
     }
 }
+
+#[test]
+fn checkpoint_retained_floor_matches_graph_minimum_after_fork_pruning() {
+    let (mut store, config) = TestStore::new(EngineMode::Integrated);
+    let clock = ManualClock(Utc::now());
+    let insert = insertion(&store, 8, EvidenceId::from_digest([0xa3; 32]));
+    let plan = apply_transition(&store, insert, &context(&config, &clock, None))
+        .expect("the selected path is admitted");
+    store.commit(&plan);
+    let anchor = store.graph.finalized_frontier();
+    let mut sibling = *regtest_genesis_block().header;
+    sibling.previous_block_hash = anchor.hash;
+    sibling.nonce.0[0] = 0xf1;
+    let sibling_hash = sibling.hash();
+    store
+        .graph
+        .insert(
+            Arc::new(sibling),
+            HeaderValidationState::Valid,
+            [],
+            BodyValidationState::Unknown,
+        )
+        .expect("the competing child is retained below the winning tip");
+    for height in [1, 3, 8] {
+        let old_tip = store.metadata.frontiers.verified_best;
+        let new_path = store
+            .selected
+            .iter()
+            .filter(|frontier| {
+                frontier.height > old_tip.height && frontier.height <= block::Height(height)
+            })
+            .map(|frontier| crate::VerifiedHeaderRef {
+                height: frontier.height,
+                hash: frontier.hash,
+                header: store
+                    .graph
+                    .header_node(frontier.hash)
+                    .expect("the selected header is retained")
+                    .header
+                    .clone(),
+            })
+            .collect();
+        let mut evidence = [0xa4; 32];
+        evidence[..4].copy_from_slice(&height.to_le_bytes());
+        let request = TransitionRequest {
+            expected_version: store.metadata.state_version,
+            event: TransitionEvent::VerifiedChainChanged(crate::VerifiedChainChanged {
+                full_state_transition_id: EvidenceId::from_digest(evidence),
+                old_tip,
+                new_path,
+                cause: crate::VerifiedChangeCause::CheckpointFinalizedGrow,
+            }),
+        };
+        let plan = apply_transition(&store, request, &context(&config, &clock, Some(&Authority)))
+            .expect("checkpoint finality advances through retained headers");
+        let projected = projected_graph(&store.graph, &plan);
+        let minimum = projected
+            .header_nodes()
+            .map(|node| node.height)
+            .min()
+            .expect("the finalized anchor remains retained");
+        assert_eq!(plan.change_set.metadata.oldest_retained_height, minimum);
+        assert_eq!(minimum, block::Height(height));
+        assert!(projected.header_node(sibling_hash).is_none());
+        store.commit(&plan);
+    }
+}

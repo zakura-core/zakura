@@ -40,6 +40,61 @@ use crate::{
 
 const LAST_BLOCK_HEIGHT: u32 = 10;
 
+#[tokio::test]
+async fn sent_sibling_removal_keeps_await_utxo_ready() {
+    use super::write::{NonFinalizedWriteFailure, NonFinalizedWriteUpdate};
+    use crate::tests::FakeChainHelper;
+
+    let _init_guard = zakura_test::init();
+    let block: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_419201_BYTES
+        .zcash_deserialize_into()
+        .unwrap();
+    let siblings = block.make_fake_siblings(2);
+    let removed = siblings[0].clone().prepare();
+    let in_flight = siblings[1].clone().prepare();
+    let (outpoint, expected_output) = in_flight
+        .new_outputs
+        .iter()
+        .find(|(_, output)| !output.utxo.from_coinbase)
+        .unwrap();
+
+    for update in [
+        NonFinalizedWriteUpdate::Evicted(vec![removed.hash]),
+        NonFinalizedWriteUpdate::Failed(NonFinalizedWriteFailure {
+            hash: removed.hash,
+            kind: NonFinalizedWriteFailureKind::Invalid,
+        }),
+        NonFinalizedWriteUpdate::Failed(NonFinalizedWriteFailure {
+            hash: removed.hash,
+            kind: NonFinalizedWriteFailureKind::Retryable,
+        }),
+    ] {
+        let (mut state, _, _, _) =
+            StateService::new(Config::ephemeral(), &Network::Mainnet, Height::MAX, 0)
+                .await
+                .unwrap();
+        state.non_finalized_block_write_sent_hashes.add(&removed);
+        state.non_finalized_block_write_sent_hashes.add(&in_flight);
+        state.handle_non_finalized_write_update(update);
+        assert!(!state
+            .non_finalized_block_write_sent_hashes
+            .contains(&removed.hash));
+        assert!(state
+            .non_finalized_block_write_sent_hashes
+            .contains(&in_flight.hash));
+
+        let response = timeout(
+            Duration::from_secs(5),
+            state.call(Request::AwaitUtxo(*outpoint)),
+        )
+        .await
+        .expect("a sent sibling still supplies this output before it commits")
+        .unwrap();
+        assert_eq!(response, Response::Utxo(expected_output.utxo.clone()));
+        assert_eq!(state.pending_utxos.len(), 0);
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn block_info_does_not_wait_for_a_queued_parent() {
     let _init_guard = zakura_test::init();
@@ -770,6 +825,8 @@ async fn a_full_orphan_queue_still_admits_a_block_whose_parent_is_available() ->
 
 #[tokio::test]
 async fn descendant_arriving_after_a_local_parent_failure_completes_immediately() {
+    use super::write::{NonFinalizedWriteFailure, NonFinalizedWriteUpdate};
+
     let network = Network::Mainnet;
     let (mut state, _, _, _) = StateService::new(Config::ephemeral(), &network, Height::MAX, 0)
         .await
@@ -780,6 +837,22 @@ async fn descendant_arriving_after_a_local_parent_failure_completes_immediately(
     let block = block.prepare();
     let ancestor = block.block.header.previous_block_hash;
     state.remember_failed_ancestor(ancestor, ancestor, NonFinalizedWriteFailureKind::Retryable);
+    let unrelated = block::Hash([0xff; 32]);
+    state.remember_failed_ancestor(unrelated, unrelated, NonFinalizedWriteFailureKind::Invalid);
+    state.handle_non_finalized_write_update(NonFinalizedWriteUpdate::Evicted(vec![ancestor]));
+    assert!(!state.non_finalized_failed_ancestors.contains_key(&ancestor));
+    assert_eq!(
+        state.non_finalized_failed_ancestors.get(&unrelated),
+        Some(&(unrelated, NonFinalizedWriteFailureKind::Invalid))
+    );
+
+    // A fresh failure sent after eviction must still reject the next child.
+    state.handle_non_finalized_write_update(NonFinalizedWriteUpdate::Failed(
+        NonFinalizedWriteFailure {
+            hash: ancestor,
+            kind: NonFinalizedWriteFailureKind::Retryable,
+        },
+    ));
 
     let response = state
         .queue_and_commit_to_non_finalized_state(block.clone(), None)
@@ -795,6 +868,265 @@ async fn descendant_arriving_after_a_local_parent_failure_completes_immediately(
     assert_eq!(
         state.non_finalized_failed_ancestors.get(&block.hash),
         Some(&(ancestor, NonFinalizedWriteFailureKind::Retryable))
+    );
+}
+
+#[tokio::test]
+async fn fork_eviction_allows_new_and_replayed_parents_to_extend() {
+    use super::write::{NonFinalizedWriteFailure, NonFinalizedWriteUpdate};
+    use crate::tests::FakeChainHelper;
+
+    let _init_guard = zakura_test::init();
+    let network = Network::Mainnet;
+    let (mut state, _, _, _) = StateService::new(Config::ephemeral(), &network, Height::MAX, 0)
+        .await
+        .expect("the ephemeral state opens");
+    for (_, bytes) in zakura_test::vectors::MAINNET_BLOCKS.range(0..=1) {
+        let block: Arc<Block> = bytes.zcash_deserialize_into().unwrap();
+        state
+            .queue_and_commit_to_finalized_state(CheckpointVerifiedBlock::from(block))
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    let mut template: Block = zakura_test::vectors::BLOCK_MAINNET_2_BYTES
+        .zcash_deserialize_into()
+        .unwrap();
+    template.transactions = vec![Arc::new(transaction_v4_from_coinbase(
+        &template.transactions[0],
+    ))];
+    let siblings =
+        Arc::new(template).make_fake_siblings(crate::constants::MAX_NON_FINALIZED_CHAIN_FORKS + 1);
+    let evicted = &siblings[siblings.len() - 2];
+    // Record a temporary failure before this block succeeds on its next attempt.
+    state.handle_non_finalized_write_update(NonFinalizedWriteUpdate::Failed(
+        NonFinalizedWriteFailure {
+            hash: evicted.hash(),
+            kind: NonFinalizedWriteFailureKind::Retryable,
+        },
+    ));
+    for (order, block) in siblings.iter().enumerate() {
+        let prepared = block.clone().prepare();
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            state.queue_and_commit_to_non_finalized_state(prepared, None),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+        let retained = state.read_service.latest_non_finalized_state();
+        assert_eq!(retained.best_tip().unwrap().1, siblings[0].hash());
+        assert!(retained.any_chain_contains(&siblings[order].hash()));
+        assert!(retained.chain_iter().count() <= crate::constants::MAX_NON_FINALIZED_CHAIN_FORKS);
+    }
+    state.drain_non_finalized_write_updates();
+    assert!(!state.can_fork_chain_at(&evicted.hash()));
+    assert!(!state
+        .non_finalized_block_write_sent_hashes
+        .contains(&evicted.hash()));
+    assert!(!state
+        .non_finalized_failed_ancestors
+        .contains_key(&evicted.hash()));
+
+    // The newest branch can win with a child. An evicted branch can then be
+    // downloaded again and win with two children, without restarting the node.
+    for (parent, mut depth) in [(siblings.last().unwrap(), 1), (evicted, 2)] {
+        let mut tip = parent.clone();
+        if parent.hash() == evicted.hash() {
+            tip = tip.make_fake_child();
+            let mut child_response =
+                state.queue_and_commit_to_non_finalized_state(tip.clone().prepare(), None);
+            assert!(
+                matches!(
+                    child_response.try_recv(),
+                    Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+                ),
+                "the child waits for its previously valid parent to be downloaded again"
+            );
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                state.queue_and_commit_to_non_finalized_state(parent.clone().prepare(), None),
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+            tokio::time::timeout(Duration::from_secs(10), child_response)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            depth -= 1;
+        }
+        for _ in 0..depth {
+            tip = tip.make_fake_child();
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                state.queue_and_commit_to_non_finalized_state(tip.clone().prepare(), None),
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        }
+        assert_eq!(
+            state
+                .read_service
+                .latest_non_finalized_state()
+                .best_tip()
+                .unwrap()
+                .1,
+            tip.hash()
+        );
+    }
+}
+
+#[tokio::test]
+async fn reconsideration_eviction_allows_legacy_replay() {
+    assert_reconsideration_eviction_replay(false).await;
+}
+
+#[tokio::test]
+async fn reconsideration_eviction_allows_header_integrated_replay() {
+    assert_reconsideration_eviction_replay(true).await;
+}
+
+async fn assert_reconsideration_eviction_replay(header_runtime: bool) {
+    use crate::tests::FakeChainHelper;
+
+    let _init_guard = zakura_test::init();
+    let limit = Duration::from_secs(10);
+    let network = Network::new_regtest(Default::default());
+    let config = Config {
+        enable_zakura_header_seed_from_committed_blocks: header_runtime,
+        ..Config::ephemeral()
+    };
+    let (mut state, _, _, _) = StateService::new(config, &network, Height::MAX, 0)
+        .await
+        .unwrap();
+    let genesis = block::genesis::regtest_genesis_block();
+    let mut parent = genesis.make_fake_child();
+    Arc::make_mut(&mut Arc::make_mut(&mut parent).header).time += chrono::Duration::seconds(1);
+    for block in [genesis, parent.clone()] {
+        timeout(
+            limit,
+            state.queue_and_commit_to_finalized_state(CheckpointVerifiedBlock::from(block)),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    }
+    let mut template = parent.make_fake_child();
+    let transaction = transaction_v4_from_coinbase(&template.transactions[0]);
+    Arc::make_mut(&mut template).transactions[0] = Arc::new(transaction);
+    let merkle_root = template.transactions.iter().cloned().collect();
+    let header = Arc::make_mut(&mut Arc::make_mut(&mut template).header);
+    header.time += chrono::Duration::seconds(1);
+    header.merkle_root = merkle_root;
+    header.commitment_bytes =
+        <[u8; 32]>::from(state.read_service.db.history_tree().hash().unwrap()).into();
+
+    let siblings = template.make_fake_siblings(crate::constants::MAX_NON_FINALIZED_CHAIN_FORKS + 1);
+    for (order, block) in siblings.iter().enumerate() {
+        if order == crate::constants::MAX_NON_FINALIZED_CHAIN_FORKS {
+            timeout(limit, state.send_invalidate_block(siblings[0].hash()))
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+        }
+        let prepared = block.clone().prepare();
+        timeout(
+            limit,
+            state.queue_and_commit_to_non_finalized_state(prepared, None),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    }
+    assert_eq!(
+        state
+            .read_service
+            .header_chain_reader_receiver
+            .borrow()
+            .is_some(),
+        header_runtime
+    );
+    assert_eq!(
+        state
+            .read_service
+            .latest_non_finalized_state()
+            .chain_iter()
+            .count(),
+        crate::constants::MAX_NON_FINALIZED_CHAIN_FORKS
+    );
+    timeout(limit, state.send_reconsider_block(siblings[0].hash()))
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+
+    let evicted = siblings.last().unwrap();
+    assert!(!state
+        .read_service
+        .latest_non_finalized_state()
+        .any_chain_contains(&evicted.hash()));
+    let known = timeout(limit, state.call(Request::KnownBlock(evicted.hash())))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(known, Response::KnownBlock(None)),
+        "an evicted body must be downloadable again: {known:?}"
+    );
+    assert!(!state.can_fork_chain_at(&evicted.hash()));
+    assert!(!state
+        .non_finalized_failed_ancestors
+        .contains_key(&evicted.hash()));
+
+    let prepared = evicted.clone().prepare();
+    timeout(
+        limit,
+        state.queue_and_commit_to_non_finalized_state(prepared, None),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .unwrap();
+    let retained = state.read_service.latest_non_finalized_state();
+    assert_eq!(retained.best_tip().unwrap().1, siblings[0].hash());
+    let history_root = retained
+        .find_chain(|chain| chain.contains_block_hash(evicted.hash()))
+        .unwrap()
+        .history_tree(crate::HashOrHeight::Hash(evicted.hash()))
+        .unwrap()
+        .hash()
+        .unwrap();
+    let mut child = evicted.make_fake_child();
+    let merkle_root = child.transactions.iter().cloned().collect();
+    let header = Arc::make_mut(&mut Arc::make_mut(&mut child).header);
+    header.time += chrono::Duration::seconds(1);
+    header.merkle_root = merkle_root;
+    header.commitment_bytes = <[u8; 32]>::from(history_root).into();
+    timeout(
+        limit,
+        state.queue_and_commit_to_non_finalized_state(child.clone().prepare(), None),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        state
+            .read_service
+            .latest_non_finalized_state()
+            .best_tip()
+            .unwrap()
+            .1,
+        child.hash()
     );
 }
 
@@ -1609,6 +1941,72 @@ async fn poll_ready_hands_off_at_max_checkpoint_height() -> Result<()> {
     .await
     .expect("the production writer attaches the header runtime at handoff");
 
+    Ok(())
+}
+
+/// The handoff request must release children queued before the final checkpoint became durable.
+#[tokio::test(flavor = "multi_thread")]
+async fn checkpoint_handoff_request_drains_waiting_children() -> Result<()> {
+    use color_eyre::eyre::eyre;
+    use tower::Service;
+
+    let _init_guard = zakura_test::init();
+    let blocks: Vec<Arc<Block>> = zakura_test::vectors::MAINNET_BLOCKS
+        .range(0..=2)
+        .map(|(_, bytes)| bytes.zcash_deserialize_into::<Arc<Block>>().unwrap())
+        .collect();
+    let (mut state, _read, _tip, _tip_change) =
+        StateService::new(Config::ephemeral(), &Network::Mainnet, Height(1), 0)
+            .await
+            .expect("ephemeral state opens");
+    state
+        .queue_and_commit_to_finalized_state(blocks[0].clone().into())
+        .await??;
+    state
+        .call(Request::CheckCheckpointHandoff)
+        .await
+        .map_err(|error| eyre!(error))?;
+    assert!(
+        state.block_write_sender.finalized.is_some(),
+        "an intermediate checkpoint cannot hand off"
+    );
+
+    // Exercise the internal writer queue with the small historical vectors. Production consensus
+    // submits semantic blocks after Canopy; this test only checks their release to the writer.
+    let _child = state.queue_and_commit_to_non_finalized_state(blocks[2].clone().prepare(), None);
+    state
+        .queue_and_commit_to_finalized_state(blocks[1].clone().into())
+        .await??;
+    assert!(state
+        .non_finalized_state_queued_blocks
+        .has_queued_children(blocks[1].hash()));
+    assert!(state.block_write_sender.finalized.is_some());
+
+    // Deliberately call without poll_ready: Tip only reads, and the handoff request owns the check.
+    state
+        .call(Request::Tip)
+        .await
+        .map_err(|error| eyre!(error))?;
+    assert!(state.block_write_sender.finalized.is_some());
+    assert_eq!(
+        state
+            .call(Request::CheckCheckpointHandoff)
+            .await
+            .map_err(|error| eyre!(error))?,
+        Response::CheckpointHandoffChecked
+    );
+    assert!(state.block_write_sender.finalized.is_none());
+    assert!(!state
+        .non_finalized_state_queued_blocks
+        .has_queued_children(blocks[1].hash()));
+    state
+        .call(Request::CheckCheckpointHandoff)
+        .await
+        .map_err(|error| eyre!(error))?;
+    assert!(
+        state.block_write_sender.finalized.is_none(),
+        "reconciliation is idempotent"
+    );
     Ok(())
 }
 

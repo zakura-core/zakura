@@ -1097,3 +1097,48 @@ fn configured_network_rejects_an_oversized_omitted_nsm_seed() {
         "unexpected configuration error: {error}",
     );
 }
+
+#[test]
+fn regtest_missing_mandatory_checkpoints_returns_config_error() {
+    // Exercise both supported forms of the network parameter table.
+    for config in [
+        "network = { params = { activation_heights = { Canopy = 10 } } }",
+        "network = 'Regtest'\n[testnet_parameters.activation_heights]\nCanopy = 10",
+    ] {
+        let error = toml::from_str::<Config>(config).unwrap_err();
+        assert!(
+            error.to_string().contains("mandatory checkpoint height"),
+            "insufficient coverage must be a configuration error: {error}"
+        );
+    }
+
+    let default_config: Config = toml::from_str("network = 'Regtest'").unwrap();
+    assert_eq!(
+        default_config.network.mandatory_checkpoint_height(),
+        zakura_chain::block::Height(0)
+    );
+    assert_eq!(
+        default_config.network.checkpoint_list().max_height(),
+        zakura_chain::block::Height(0)
+    );
+}
+
+#[test]
+fn regtest_accepts_checkpoints_covering_delayed_canopy() {
+    let genesis = Network::new_regtest(Default::default()).genesis_hash();
+    let checkpoint = zakura_chain::block::Hash([7; 32]);
+    let config = format!(
+        "network = {{ params = {{ activation_heights = {{ Canopy = 10 }}, checkpoints = [[0, {:?}], [9, {:?}]] }} }}",
+        genesis.0, checkpoint.0,
+    );
+    let config: Config = toml::from_str(&config).unwrap();
+    assert!(config.network.is_regtest());
+    assert_eq!(
+        config.network.mandatory_checkpoint_height(),
+        zakura_chain::block::Height(9)
+    );
+    assert_eq!(
+        config.network.checkpoint_list().max_height(),
+        zakura_chain::block::Height(9)
+    );
+}

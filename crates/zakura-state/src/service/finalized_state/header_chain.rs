@@ -5,6 +5,7 @@
 use std::{
     borrow::Cow,
     collections::{BTreeSet, HashMap, HashSet},
+    num::NonZeroU32,
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -50,10 +51,11 @@ use super::{
         FallibleDiskValue, FromDisk, IntoDisk, RawBytes,
     },
     zakura_db::block::ZAKURA_HEADER_HASH_BY_HEIGHT,
-    DiskDb, DiskWriteBatch, WriteDisk, HEADER_AUX_DELIVERY, HEADER_BODY_EVIDENCE_AUTHORITY,
-    HEADER_CHILD, HEADER_CONSENSUS_INVALID_BODY_TOMBSTONE, HEADER_DEFERRED,
-    HEADER_ELIGIBILITY_ROOT, HEADER_ENGINE_META, HEADER_FINALITY_HISTORY, HEADER_FINALITY_WITNESS,
-    HEADER_NODE_BY_HASH, HEADER_SELECTED, HEADER_VALIDATION_CONTEXT, HEADER_VERIFIED,
+    DiskDb, DiskWriteBatch, WriteDisk, HEADER_AUX_BODY_SIZE, HEADER_AUX_DELIVERY,
+    HEADER_BODY_EVIDENCE_AUTHORITY, HEADER_CHILD, HEADER_CONSENSUS_INVALID_BODY_TOMBSTONE,
+    HEADER_DEFERRED, HEADER_ELIGIBILITY_ROOT, HEADER_ENGINE_META, HEADER_FINALITY_HISTORY,
+    HEADER_FINALITY_WITNESS, HEADER_NODE_BY_HASH, HEADER_SELECTED, HEADER_VALIDATION_CONTEXT,
+    HEADER_VERIFIED,
 };
 
 const METADATA_KEY: &[u8] = b"";
@@ -271,6 +273,10 @@ struct TestHeaderCompletionAuthority<'a>(Option<&'a dyn FullStateEvidenceAuthori
 
 #[cfg(test)]
 impl FullStateEvidenceAuthority for TestHeaderCompletionAuthority<'_> {
+    fn evicted_bodies(&self, event: &TransitionEvent) -> &[block::Hash] {
+        self.0.map_or(&[], |inner| inner.evicted_bodies(event))
+    }
+
     fn authorizes_full_state(&self, event: &TransitionEvent) -> bool {
         self.0
             .is_some_and(|inner| inner.authorizes_full_state(event))
@@ -304,6 +310,10 @@ struct StateIssuedAuthority<'a> {
 }
 
 impl FullStateEvidenceAuthority for StateIssuedAuthority<'_> {
+    fn evicted_bodies(&self, event: &TransitionEvent) -> &[block::Hash] {
+        self.inner.map_or(&[], |inner| inner.evicted_bodies(event))
+    }
+
     fn authorizes_full_state(&self, event: &TransitionEvent) -> bool {
         self.inner
             .is_some_and(|inner| inner.authorizes_full_state(event))
@@ -419,7 +429,7 @@ fn untrusted_aux_row_matches(authoritative: AuxDelivery, row: UntrustedAuxDelive
     let authoritative_observations = authoritative
         .observation_ids()
         .map(|observation| observation.map(|observation| observation.digest()));
-    row.delivery() == expected_base
+    row.delivery().without_scheduling_body_size() == expected_base
         && row.has_valid_outcome()
         && (authoritative.is_unauthenticated()
             || (row.outcome_status_code() == authoritative_status
@@ -613,6 +623,20 @@ impl Publisher {
     }
 
     fn publish(&self, snapshot: EngineSnapshot, effect: TransitionEffect) {
+        self.publish_with_hint_changes(snapshot, effect, Vec::new());
+    }
+
+    fn publish_with_hint_changes(
+        &self,
+        snapshot: EngineSnapshot,
+        effect: TransitionEffect,
+        updates: Vec<(
+            block::Height,
+            block::Hash,
+            zakura_header_chain::BodySizeHint,
+        )>,
+    ) {
+        let previous_hint_revision = self.views.borrow().body_size_hint_revision;
         let previous_epoch = self.views.borrow().body_work_epoch;
         let body_work_epoch = if effect.invalidates_body_work() {
             previous_epoch
@@ -621,7 +645,32 @@ impl Publisher {
         } else {
             previous_epoch
         };
-        let view = CommittedHeaderChainView::new(snapshot.clone(), body_work_epoch);
+        let mut view = CommittedHeaderChainView::new(snapshot.clone(), body_work_epoch);
+        view.body_size_hint_batches = self.views.borrow().body_size_hint_batches.clone();
+        view.body_size_hint_revision = if !updates.is_empty() {
+            previous_hint_revision
+                .checked_add(1)
+                .expect("a process cannot commit u64::MAX hint corrections")
+        } else {
+            previous_hint_revision
+        };
+        if !updates.is_empty() {
+            // A lagging watch subscriber can recover by querying its bounded work window.
+            const RETAINED_HINT_BATCHES: usize = 16;
+            let mut batches = view
+                .body_size_hint_batches
+                .as_deref()
+                .unwrap_or_default()
+                .to_vec();
+            if batches.len() == RETAINED_HINT_BATCHES {
+                batches.remove(0);
+            }
+            batches.push(zakura_header_chain::BodySizeHintBatch {
+                revision: view.body_size_hint_revision,
+                updates: updates.into(),
+            });
+            view.body_size_hint_batches = Some(batches.into());
+        }
         record_published_snapshot(&snapshot);
         self.sender.send_replace(snapshot.clone());
         self.views.send_replace(view.clone());
@@ -1508,6 +1557,24 @@ impl HeaderChainReader {
                 .min(selected_tip.height.0),
         );
         self.store.projection_range(HEADER_SELECTED, start, end)
+    }
+
+    /// Advisory body sizes for `hashes` from the retained auxiliary deliveries, parallel to
+    /// `hashes` (`None` when no non-rejected delivery knows the size). Reads the in-memory
+    /// engine only, so it is cheap for a whole needed-body window; see
+    /// [`AuxDelivery::advertised_body_size`] for the selection rule.
+    pub(crate) fn body_size_hints_by_hash(
+        &self,
+        hashes: &[block::Hash],
+    ) -> Result<Vec<Option<NonZeroU32>>, HeaderChainStoreError> {
+        let engine = self
+            .transition_engine
+            .lock()
+            .map_err(|_| HeaderChainStoreError::WriterPoisoned)?;
+        Ok(hashes
+            .iter()
+            .map(|hash| AuxDelivery::advertised_body_size(engine.aux_deliveries(*hash)))
+            .collect())
     }
 
     pub(crate) fn selected_successor(
@@ -2582,13 +2649,8 @@ impl HeaderChainRuntime {
                 ));
             }
         };
-        let checkpoint_headers_are_retained = match &checkpoint_request.event {
-            TransitionEvent::VerifiedChainChanged(event) => event
-                .new_path
-                .iter()
-                .all(|header| transition_engine.graph().header_node(header.hash).is_some()),
-            _ => false,
-        };
+        let checkpoint_headers_are_retained =
+            retained_checkpoint_headers(&transition_engine, &checkpoint_request.event);
         // Header sync normally admits headers before native checkpoint growth promotes them.
         // Only a missing header needs contextual validation and a validation lease.
         let validation_leases = if checkpoint_headers_are_retained {
@@ -2745,7 +2807,9 @@ impl HeaderChainRuntime {
         request: TransitionRequest,
         before: &EngineSnapshot,
         network: &Network,
+        engine: &HeaderChainEngine,
     ) -> Result<TransitionInput, HeaderChainStoreError> {
+        let retained_checkpoint = retained_checkpoint_headers(engine, &request.event);
         let expected_version = request.expected_version;
         Ok(match request.event {
             TransitionEvent::InsertHeaders(event) => {
@@ -2790,9 +2854,11 @@ impl HeaderChainRuntime {
                     expected_version,
                     event,
                     facts: HeaderValidationFacts {
-                        validation_leases: vec![self
-                            .store
-                            .validation_context(parent.hash, network)?],
+                        validation_leases: if retained_checkpoint {
+                            Vec::new()
+                        } else {
+                            vec![self.store.validation_context(parent.hash, network)?]
+                        },
                     },
                 }
             }
@@ -3142,7 +3208,12 @@ impl HeaderChainRuntime {
                 }
             }
         }
-        let input = self.build_transition_input(request, &before, base_context.config.network())?;
+        let input = self.build_transition_input(
+            request,
+            &before,
+            base_context.config.network(),
+            &transition_engine,
+        )?;
         let validation_leases = input
             .header_validation_facts()
             .map(|facts| facts.validation_leases.clone())
@@ -3268,6 +3339,25 @@ impl HeaderChainRuntime {
         }
 
         let current = transition.snapshot_after_commit();
+        let hint_hashes: std::collections::HashSet<_> = transition
+            .change_set()
+            .aux_changes
+            .iter()
+            .filter_map(|change| {
+                let AuxDelta::Put(delivery) = change else {
+                    return None;
+                };
+                (delivery.scheduling_body_size().is_some()
+                    && transition_engine
+                        .aux_deliveries(delivery.header_hash)
+                        .iter()
+                        .find(|old| old.delivery_id == delivery.delivery_id)
+                        .is_none_or(|old| {
+                            old.effective_body_size() != delivery.effective_body_size()
+                        }))
+                .then_some(delivery.header_hash)
+            })
+            .collect();
         let migrated_pin_refuted = transition.change_set().metadata.alarms.migrated_pin_refuted;
         let batch = self
             .store
@@ -3289,7 +3379,21 @@ impl HeaderChainRuntime {
         memory_swap();
         #[cfg(test)]
         fault(FaultPoint::AfterMemorySwap)?;
-        self.publisher.publish(current, transition_effect);
+        let updates = hint_hashes
+            .into_iter()
+            .filter_map(|hash| {
+                let node = transition_engine.graph().header_node(hash)?;
+                let size =
+                    AuxDelivery::advertised_body_size(transition_engine.aux_deliveries(hash))?;
+                Some((
+                    node.height,
+                    hash,
+                    zakura_header_chain::BodySizeHint::Known(size),
+                ))
+            })
+            .collect();
+        self.publisher
+            .publish_with_hint_changes(current, transition_effect, updates);
         #[cfg(test)]
         fault(FaultPoint::AfterPublish)?;
         Ok(ApplyResult::Committed)
@@ -4672,28 +4776,34 @@ impl HeaderChainStore {
 
         for delta in &changes.aux_changes {
             match delta {
-                AuxDelta::Put(delivery) => self.put_value(
-                    &mut batch,
-                    HEADER_AUX_DELIVERY,
-                    HeaderAuxDeliveryKey {
+                AuxDelta::Put(delivery) => {
+                    let key = HeaderAuxDeliveryKey {
                         header: delivery.header_hash,
                         delivery: delivery.delivery_id,
                     }
-                    .as_bytes(),
-                    delivery.as_ref(),
-                )?,
+                    .as_bytes();
+                    self.put_value(&mut batch, HEADER_AUX_DELIVERY, key, delivery.as_ref())?;
+                    if let Some(size) = delivery.scheduling_body_size() {
+                        self.put_value(
+                            &mut batch,
+                            HEADER_AUX_BODY_SIZE,
+                            key,
+                            &zakura_header_chain::BodySizeHint::Known(size),
+                        )?;
+                    }
+                }
                 AuxDelta::Delete {
                     header_hash,
                     delivery_id,
-                } => self.delete_raw(
-                    &mut batch,
-                    HEADER_AUX_DELIVERY,
-                    HeaderAuxDeliveryKey {
+                } => {
+                    let key = HeaderAuxDeliveryKey {
                         header: *header_hash,
                         delivery: *delivery_id,
                     }
-                    .as_bytes(),
-                )?,
+                    .as_bytes();
+                    self.delete_raw(&mut batch, HEADER_AUX_DELIVERY, key)?;
+                    self.delete_raw(&mut batch, HEADER_AUX_BODY_SIZE, key)?;
+                }
             }
         }
 
@@ -6048,6 +6158,16 @@ impl HeaderChainStore {
         })?;
         Ok(found)
     }
+}
+
+// Retained checkpoint headers already carry contextual validation. The planner still
+// checks their exact identity, continuity, and eligibility before advancing finality.
+// Assumes checkpoint commits carry no retention references; one authenticated only by
+// the skipped parent lease would fail closed with `TransitionFailure::Authority`.
+fn retained_checkpoint_headers(engine: &HeaderChainEngine, event: &TransitionEvent) -> bool {
+    matches!(event, TransitionEvent::VerifiedChainChanged(event)
+        if event.cause == VerifiedChangeCause::CheckpointFinalizedGrow
+            && event.new_path.iter().all(|header| engine.graph().header_node(header.hash).is_some()))
 }
 
 fn authenticated_context_headers(

@@ -1440,6 +1440,13 @@ pub enum Request {
     /// with the current best chain tip.
     Tip,
 
+    /// Reconciles durable checkpoint completion with queued semantic writes, including when
+    /// no further requests would drive the buffered state service.
+    ///
+    /// Returns [`Response::CheckpointHandoffChecked`] after checking the existing durable-state
+    /// handoff conditions. Repeated requests are safe. This does not wait for semantic commits.
+    CheckCheckpointHandoff,
+
     /// Computes a block locator object based on the current best chain.
     ///
     /// Returns [`Response::BlockLocator`] with hashes starting
@@ -1675,6 +1682,7 @@ impl Request {
             Request::AwaitUtxo(_) => "await_utxo",
             Request::Depth(_) => "depth",
             Request::Tip => "tip",
+            Request::CheckCheckpointHandoff => "check_checkpoint_handoff",
             Request::BlockLocator => "block_locator",
             Request::Transaction(_) => "transaction",
             Request::UnspentBestChainUtxo { .. } => "unspent_best_chain_utxo",
@@ -1996,6 +2004,16 @@ pub enum ReadRequest {
         count: u32,
     },
 
+    /// Returns [`ReadResponse::BlockSizesByHash(Vec<Option<u32>>)`](ReadResponse::BlockSizesByHash)
+    /// with the committed serialized size of each requested block hash, parallel to `hashes`.
+    /// `None` marks a hash that is committed in neither the best chain nor the finalized
+    /// state. Scheduling metadata for header serving; verification never consults it.
+    /// Rejects more than `MAX_HEADER_SYNC_HEIGHT_RANGE` hashes.
+    BlockSizesByHash {
+        /// Block hashes to look up.
+        hashes: Vec<block::Hash>,
+    },
+
     /// Returns the highest header held on disk.
     BestHeaderTip,
 
@@ -2257,6 +2275,7 @@ impl ReadRequest {
             ReadRequest::ReadRetainedHeaderPath { .. } => "read_retained_header_path",
             ReadRequest::ReleaseRetainedHeaderPath { .. } => "release_retained_header_path",
             ReadRequest::BlockRoots { .. } => "block_roots",
+            ReadRequest::BlockSizesByHash { .. } => "block_sizes_by_hash",
             ReadRequest::BestHeaderTip => "best_header_tip",
             ReadRequest::MissingBlockBodyMetadata { .. } => "missing_block_body_metadata",
             ReadRequest::BlocksByHeightRange { .. } => "blocks_by_height_range",
@@ -2352,6 +2371,7 @@ impl TryFrom<Request> for ReadRequest {
             | Request::CommitSemanticallyVerifiedBlock(_)
             | Request::CommitSemanticallyVerifiedBlockWithAdmission { .. }
             | Request::CommitCheckpointVerifiedBlock(_)
+            | Request::CheckCheckpointHandoff
             | Request::InvalidateBlock(_)
             | Request::ReconsiderBlock(_) => Err("ReadService does not write blocks"),
 

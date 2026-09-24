@@ -35,7 +35,7 @@ independently.
   The experimental shielded batch breakdown was withdrawn. Existing captures
   remain readable, and transactions default to block order.
 
-## [1.5.0-rc0] - 2026-09-21
+## [1.5.0] - 2026-09-24
 
 ### Added
 
@@ -83,9 +83,17 @@ independently.
   existing continuous-sync samples for Dual and Zakura-only runs. The retained
   data can be used to generate charts
   ([#984](https://github.com/zakura-core/zakura/pull/984)).
+- `getblockchaininfo` now reports the ZIP 234 NSM value balance as
+  `nsmValueBalanceZat`, so the counter can be observed and monitored. It is
+  reported beside the monetary totals rather than inside them, so summing
+  `valuePools` still yields the money supply
+  ([#1106](https://github.com/zakura-core/zakura/pull/1106)).
 
 ### Changed
 
+- Extended v1.5.0 Mainnet support through approximately October 25, with the
+  last supported height at 3,528,681
+  ([#1121](https://github.com/zakura-core/zakura/pull/1121)).
 - Updated the common libraries to `1.3.0-alpha.1`, including the removal of
   unused experimental ZIP 233 fields
   ([#1042](https://github.com/zakura-core/zakura/pull/1042)).
@@ -139,6 +147,36 @@ independently.
 - Keep the connection and unrelated services running when a persistent native
   P2P stream write times out
   ([#943](https://github.com/zakura-core/zakura/pull/943)).
+- Trusted secondary nodes carry the primary's block receipt order and reset it
+  when the primary process changes, preparing them for first-received mining.
+  A primary restart temporarily lowers the secondary's reported height to its
+  finalized tip while it reloads recent blocks
+  ([#1102](https://github.com/zakura-core/zakura/pull/1102)).
+- Bump `zakura-state` to 9.0.0 for the dedicated checkpoint handoff request and
+  response variants. Consumers with exhaustive state request or response matches
+  must handle the new variants
+  ([#972](https://github.com/zakura-core/zakura/pull/972)).
+- Reduced header transition work by limiting checkpoint checks to affected
+  heights
+  ([#1018](https://github.com/zakura-core/zakura/pull/1018)).
+- Reduced checkpoint finalization work when updating the retained header height
+  ([#1019](https://github.com/zakura-core/zakura/pull/1019)).
+- Reduced sync header processing work when the selected chain is unchanged
+  ([#1030](https://github.com/zakura-core/zakura/pull/1030)).
+- Reduced block commit latency by validating transparent spends against
+  borrowed non-finalized UTXO indexes instead of cloning the complete UTXO set
+  ([#1109](https://github.com/zakura-core/zakura/pull/1109)).
+- `Stream` declares each stream's payload limits, message types, queue depths,
+  and write policy as fields, replacing four `Service` hooks
+  ([#1115](https://github.com/zakura-core/zakura/pull/1115)).
+- Updated the Zakura Common (`zakura-core/common`) crates from `1.3.0-alpha.1`
+  to `2.0.0`, replacing the upstream `zcash_protocol`, `zcash_address`, and
+  `zcash_transparent` dependencies with the `zakura-protocol`, `zakura-address`,
+  and `zakura-transparent` forks
+  ([#1144](https://github.com/zakura-core/zakura/pull/1144)).
+- Set the NU7 consensus branch ID to `0x77190AD9` from ZIP 259, replacing the
+  test-only placeholder; NU7 remains unscheduled on Mainnet and Testnet
+  ([#1144](https://github.com/zakura-core/zakura/pull/1144)).
 
 ### Removed
 
@@ -150,6 +188,10 @@ independently.
 - Remove the explicit `nsm_reissuance_height` configuration override; networks
   with NU7 configured use the calculated crossover
   ([#1082](https://github.com/zakura-core/zakura/pull/1082)).
+- Removed the `state.contextual.unspent_utxo_snapshot.duration_seconds` and
+  `state.contextual.mined.unspent_utxo_snapshot.duration_seconds` metrics
+  because transparent spend validation no longer creates UTXO snapshots
+  ([#1109](https://github.com/zakura-core/zakura/pull/1109)).
 
 ### Fixed
 
@@ -322,6 +364,27 @@ independently.
   check also reports snapshot decoding errors. Fallible primitive history tree constructors
   reject upgrades without a branch ID
   ([#998](https://github.com/zakura-core/zakura/pull/998)).
+- Fixed `getblockchaininfo` and other ZEC-valued RPC responses failing to parse
+  with "loss of precision parsing ZEC value", which affected roughly one in
+  seven value pool balances and became constant after NU7
+  ([#1105](https://github.com/zakura-core/zakura/pull/1105)).
+- Keep sync moving after the final checkpoint when full-verification blocks are
+  already queued and no further state requests arrive, without reporting a
+  committed block as failed if the handoff notification is delayed
+  ([#972](https://github.com/zakura-core/zakura/pull/972)).
+- Prevent semantic children from ending checkpoint sync before the configured
+  boundary and disabling further checkpoint writes
+  ([#972](https://github.com/zakura-core/zakura/pull/972)).
+- Reject Regtest configurations with insufficient mandatory checkpoints during
+  configuration parsing instead of panicking during startup or block validation
+  ([#972](https://github.com/zakura-core/zakura/pull/972)).
+- Fixed block-sync pauses when provider latency estimates expire, so ready blocks
+  are requested promptly ([#1006](https://github.com/zakura-core/zakura/pull/1006)).
+- Keep newly accepted forks available for extension at the retention limit and
+  allow evicted blocks to be downloaded again. Clear stale header verification
+  records after normal commits and reconsideration. Preserve shared transaction
+  outputs when removing a fork so pending block verification can continue
+  ([#1104](https://github.com/zakura-core/zakura/pull/1104)).
 
 ## [1.4.0] - 2026-09-10
 

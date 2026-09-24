@@ -379,13 +379,19 @@ fn end_of_service_estimate_follows_target_spacing() {
     );
 
     const BLOSSOM: u32 = 1_000;
-    let network = Network::new_regtest(
-        testnet::ConfiguredActivationHeights {
+    let genesis = Network::new_regtest(Default::default()).genesis_hash();
+    let network = Network::new_regtest(testnet::RegtestParameters {
+        activation_heights: testnet::ConfiguredActivationHeights {
             blossom: Some(BLOSSOM),
             ..Default::default()
-        }
-        .into(),
-    );
+        },
+        // Canopy defaults to Blossom, so the checkpoints must cover the block before it.
+        checkpoints: Some(testnet::ConfiguredCheckpoints::HeightsAndHashes(vec![
+            (Height(0), genesis),
+            (Height(BLOSSOM - 1), Hash([1; 32])),
+        ])),
+        ..Default::default()
+    });
 
     // 10 blocks before Blossom, and 20 blocks from Blossom onwards.
     let expected = 10 * pre_blossom_spacing + 20 * post_blossom_spacing;

@@ -99,13 +99,6 @@ impl ContextualMetrics {
     }
 }
 
-fn block_has_transparent_spends(block: &Block) -> bool {
-    block
-        .transactions
-        .iter()
-        .any(|transaction| transaction.spent_outpoints().next().is_some())
-}
-
 /// The state of the chains in memory, including queued blocks.
 ///
 /// Clones of the non-finalized state contain independent copies of the chains.
@@ -329,13 +322,21 @@ impl NonFinalizedState {
     where
         F: FnOnce(&mut BTreeSet<Arc<Chain>>),
     {
+        let inserted_tip = chain.non_finalized_tip_hash();
         self.chain_set.insert(chain);
 
         chain_filter(&mut self.chain_set);
 
         while self.chain_set.len() > MAX_NON_FINALIZED_CHAIN_FORKS {
-            // The first chain is the chain with the lowest work.
-            self.chain_set.pop_first();
+            // Keep the accepted parent available for a child that could make it best.
+            // Mining still uses the best chain, and the total fork limit is unchanged.
+            let evicted = self
+                .chain_set
+                .iter()
+                .find(|chain| chain.non_finalized_tip_hash() != inserted_tip)
+                .expect("the fork limit leaves room for both the best and inserted chains")
+                .clone();
+            self.chain_set.remove(&evicted);
         }
 
         self.update_metrics_bars();
@@ -344,6 +345,22 @@ impl NonFinalizedState {
     /// Insert `chain` into `self.chain_set`, then limit the number of tracked chains.
     fn insert(&mut self, chain: Arc<Chain>) {
         self.insert_with(chain, |_ignored_chain| { /* no filter */ })
+    }
+
+    /// Blocks removed by a fork eviction, excluding prefixes shared with retained chains.
+    /// Only compare states at the same finalized height.
+    pub(crate) fn evicted_blocks(&self, after: &Self) -> Vec<block::Hash> {
+        let mut evicted = std::collections::HashSet::new();
+        for chain in self.chain_iter() {
+            for block in chain.blocks.values().rev() {
+                if after.any_chain_contains(&block.hash) || !evicted.insert(block.hash) {
+                    break;
+                }
+            }
+        }
+        let mut evicted: Vec<_> = evicted.into_iter().collect();
+        evicted.sort_unstable_by_key(|hash| hash.0);
+        evicted
     }
 
     #[cfg(test)]
@@ -704,25 +721,10 @@ impl NonFinalizedState {
             });
         }
 
-        // Avoid cloning the non-finalized UTXO set when this block cannot use it.
-        // Transparent spend validation can read missing UTXOs from disk.
-        // TODO: if those disk reads show up in profiles, run them in parallel.
-        let unspent_utxo_snapshot_start = Instant::now();
-        let unspent_utxos = if block_has_transparent_spends(&prepared.block) {
-            new_chain.unspent_utxos()
-        } else {
-            HashMap::new()
-        };
-        contextual_metrics.record_duration(
-            "state.contextual.unspent_utxo_snapshot.duration_seconds",
-            "state.contextual.mined.unspent_utxo_snapshot.duration_seconds",
-            unspent_utxo_snapshot_start.elapsed(),
-        );
-
         let transparent_spend_start = Instant::now();
         let spent_utxos = check::utxo::transparent_spend(
             &prepared,
-            &unspent_utxos,
+            &new_chain.created_utxos,
             &new_chain.spent_utxos,
             finalized_state,
         );
@@ -731,8 +733,6 @@ impl NonFinalizedState {
             "state.contextual.mined.transparent_spend.duration_seconds",
             transparent_spend_start.elapsed(),
         );
-        // Free the snapshot before the rest of validation clones and extends the chain.
-        drop(unspent_utxos);
         let spent_utxos = spent_utxos?;
 
         // Reads from disk

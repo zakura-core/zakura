@@ -594,7 +594,13 @@ where
     );
 
     let block = SemanticBlockVerifier::new(network, state_service.clone(), transaction.clone());
-    let checkpoint = CheckpointVerifier::from_checkpoint_list(list, network, tip, state_service);
+    let checkpoint = CheckpointVerifier::from_checkpoint_list(
+        list,
+        network,
+        tip,
+        max_checkpoint_height,
+        state_service,
+    );
     let router = BlockVerifierRouter {
         checkpoint,
         max_checkpoint_height,

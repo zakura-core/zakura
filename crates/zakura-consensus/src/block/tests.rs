@@ -1149,28 +1149,25 @@ fn miner_fees_validation_failure() -> Result<(), Report> {
 struct LibrustzcashConversionFailure {
     name: &'static str,
     network_upgrade: NetworkUpgrade,
-    rk: Option<[u8; 32]>,
+    rk: [u8; 32],
 }
 
+/// Every consensus branch ID in Zakura's table is known to librustzcash, so the
+/// conversion can only fail on malformed Orchard data.
 #[tokio::test]
 async fn block_rejects_transactions_failing_librustzcash_conversion() {
     let _init_guard = zakura_test::init();
 
     let cases = [
         LibrustzcashConversionFailure {
-            name: "unrecognized consensus branch ID",
-            network_upgrade: NetworkUpgrade::Nu7,
-            rk: None,
-        },
-        LibrustzcashConversionFailure {
             name: "incorrect curve point encoding",
             network_upgrade: NetworkUpgrade::Nu5,
-            rk: Some([0xff; 32]),
+            rk: [0xff; 32],
         },
         LibrustzcashConversionFailure {
             name: "rk=identity",
             network_upgrade: NetworkUpgrade::Nu5,
-            rk: Some([0; 32]),
+            rk: [0; 32],
         },
     ];
 
@@ -1223,11 +1220,7 @@ fn librustzcash_conversion_test_network(network_upgrade: NetworkUpgrade) -> Netw
             nu5: Some(1),
             ..Default::default()
         },
-        NetworkUpgrade::Nu7 => ConfiguredActivationHeights {
-            nu7: Some(1),
-            ..Default::default()
-        },
-        _ => panic!("test cases only use NU5 and NU7"),
+        _ => panic!("test cases only use NU5"),
     };
 
     Parameters::build()
@@ -1329,15 +1322,13 @@ fn failing_librustzcash_v5_transaction(
         )
     ]);
 
-    if let Some(rk) = case.rk {
-        shielded_data
-            .actions
-            .iter_mut()
-            .next()
-            .expect("Orchard fixture has at least one action")
-            .action
-            .rk = rk.into();
-    }
+    shielded_data
+        .actions
+        .iter_mut()
+        .next()
+        .expect("Orchard fixture has at least one action")
+        .action
+        .rk = case.rk.into();
 
     Transaction::V5 {
         network_upgrade: case.network_upgrade,
@@ -1974,8 +1965,8 @@ async fn derived_nsm_crossing_gates_block_verification() {
                     _ => panic!("unexpected state request: {request:?}"),
                 })
             });
-            // NU7 has no production branch ID yet, so use the existing transaction
-            // stub while exercising the real semantic block and subsidy checks.
+            // Use the existing transaction stub so the test isolates the real semantic
+            // block and subsidy checks from transaction verification.
             let transaction = service_fn(|request| async move {
                 Ok::<_, BoxError>(accept_block_transaction(request))
             });

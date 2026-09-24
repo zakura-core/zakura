@@ -68,6 +68,10 @@ pub enum Response {
     /// indicating that a block was successfully committed to the state.
     Committed(block::Hash),
 
+    /// Response to [`Request::CheckCheckpointHandoff`] after checking the durable-state
+    /// handoff conditions. Any released semantic blocks can still be awaiting commit.
+    CheckpointHandoffChecked,
+
     /// Response to [`Request::InvalidateBlock`] indicating that a block was found and
     /// invalidated in the state.
     Invalidated(block::Hash),
@@ -451,6 +455,10 @@ pub enum ReadResponse {
     /// this node holds for the requested range, in ascending height order.
     BlockRoots(Vec<zakura_chain::parallel::commitment_aux::BlockCommitmentRoots>),
 
+    /// Response to [`ReadRequest::BlockSizesByHash`]: committed serialized sizes parallel to
+    /// the requested hashes, `None` for hashes that are not committed.
+    BlockSizesByHash(Vec<Option<u32>>),
+
     /// Response to [`ReadRequest::Tip`] with the current best chain tip.
     Tip(Option<(block::Height, block::Hash)>),
 
@@ -759,6 +767,7 @@ impl TryFrom<ReadResponse> for Response {
             ReadResponse::UsageInfo(_)
             | ReadResponse::PruningInfo { .. }
             | ReadResponse::BlockRoots(_)
+            | ReadResponse::BlockSizesByHash(_)
             | ReadResponse::TipPoolValues { .. }
             | ReadResponse::TransactionIdsForBlock(_)
             | ReadResponse::AnyChainTransactionIdsForBlock(_)

@@ -165,7 +165,9 @@ together, or select another node for staging. A node startup failure leaves the
 publisher timer stopped and fails the deployment. There is no automatic binary
 rollback after startup because the database may already have migrated. Repair
 with a compatible revision and retry the paired deployment. A marker under
-`/run/zakura-release-state-deploy.resume-timer` lets a successful retry resume a
-timer that the failed deployment stopped. Remove that marker only if deliberately
+`/opt/zakura-release-state/deploy.resume-timer` lets a successful retry resume a
+timer that the failed deployment stopped. A persistent `deploy.paused` marker in
+the same directory and a systemd service condition keep publication blocked across
+reboots until the paired deployment validates the node. Remove the resume marker only if deliberately
 leaving publication paused. A publication-only failure keeps the compatible pair
 installed and restores the previous timer state so the next scheduled run can retry.

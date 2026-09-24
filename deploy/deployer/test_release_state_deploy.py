@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import shutil
 import sys
 import tempfile
 import unittest
@@ -160,7 +161,7 @@ manage_config = true
 class PairedShellTests(unittest.TestCase):
     """Execute the deployment script with isolated paths and fake host commands."""
 
-    def run_pair(self, failure="", *, resume_marker=False, timer_active=True):
+    def run_pair(self, failure="", *, resume_marker=False, timer_active=True, reboot_after_failure=False):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             script = (HERE.parent / "release-state/deploy-archive-pair.sh").read_text()
@@ -171,9 +172,10 @@ class PairedShellTests(unittest.TestCase):
             for directory in ("opt/zakura-release-state/bin", "etc", "run", "usr/local/bin", "stage", "mocks"):
                 (root / directory).mkdir(parents=True)
             (root / "etc/zakura-release-state.env").touch()
-            marker = root / "run/zakura-release-state-deploy.resume-timer"
+            marker = root / "opt/zakura-release-state/deploy.resume-timer"
             if resume_marker:
                 marker.touch()
+                (root / "opt/zakura-release-state/deploy.paused").touch()
             (root / "opt/zakura-release-state/profile.env").write_text(
                 "RELEASE_STATE_EXPECTED_HOST=roman-zakura-archive-vct-off\n"
                 "RELEASE_STATE_NODE_UNIT=zakurad.service\n")
@@ -195,6 +197,13 @@ elif name == "flock":
     if failure == "lock" and args[-1] == "9" and "-u" not in args:
         sys.exit(1)
 elif name == "systemctl":
+    if args == ["start", "zakura-release-state.service"]:
+        guard = pathlib.Path(os.environ["TEST_ROOT"]) / "etc/systemd/system/zakura-release-state.service.d/deployment-pause.conf"
+        if guard.exists():
+            blocked = guard.read_text().split("ConditionPathExists=!", 1)[1].strip()
+            if pathlib.Path(blocked).exists():
+                print("publisher skipped")
+                sys.exit(0)
     if args == ["is-active", "--quiet", "zakura-release-state.timer"] and os.environ["TEST_TIMER_ACTIVE"] == "false":
         sys.exit(3)
     if args == ["start", "zakurad"] and failure == "node":
@@ -221,9 +230,19 @@ elif name == "curl":
                                      str(root / "usr/local/bin/zakurad"), "zakurad", SHA],
                                     input=script, text=True, capture_output=True, timeout=10,
                                     env={**os.environ, "PATH": f"{root}/mocks:{os.environ['PATH']}",
-                                         "TEST_LOG": str(log), "TEST_FAILURE": failure,
+                                         "TEST_ROOT": str(root), "TEST_LOG": str(log), "TEST_FAILURE": failure,
                                          "TEST_BIN_PATH": str(root / "usr/local/bin/zakurad"),
                                          "TEST_TIMER_ACTIVE": str(timer_active).lower()})
+            if reboot_after_failure:
+                self.assertNotEqual(result.returncode, 0)
+                shutil.rmtree(root / "run")
+                (root / "run").mkdir()
+                reboot = subprocess.run([str(root / "mocks/systemctl"), "start", "zakura-release-state.service"],
+                                        env={**os.environ, "TEST_ROOT": str(root), "TEST_LOG": str(log),
+                                             "TEST_FAILURE": ""}, capture_output=True)
+                self.assertEqual(reboot.returncode, 0)
+                self.assertEqual(reboot.stdout.strip(), b"publisher skipped",
+                                 "reboot must not bypass the publisher guard")
             events = log.read_text().splitlines()
             installed = (root / "opt/zakura-release-state/EXPORTER_REVISION").exists()
             return result, events, installed, marker.exists()
@@ -251,6 +270,11 @@ elif name == "curl":
         self.assertNotIn("systemctl start zakura-release-state.timer", events)
         self.assertNotIn("systemctl start zakura-release-state.service", events)
         self.assertTrue(marker)
+
+    def test_failed_deployment_pause_survives_reboot(self):
+        for timer_active in (True, False):
+            with self.subTest(timer_active=timer_active):
+                self.run_pair("node", timer_active=timer_active, reboot_after_failure=True)
 
     def test_successful_retry_restores_previously_active_timer(self):
         result, events, installed, marker = self.run_pair(resume_marker=True, timer_active=False)

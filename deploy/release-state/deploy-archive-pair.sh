@@ -30,12 +30,13 @@ version=$("$STAGE/zakurad" --version)
 # Keep concurrent deployments out until publication completes.
 exec 8>/run/zakura-release-state-deploy.lock
 flock -w 600 8
-RESUME_MARKER=/run/zakura-release-state-deploy.resume-timer
+RESUME_MARKER="$INSTALL_ROOT/deploy.resume-timer"
+PAUSE_MARKER="$INSTALL_ROOT/deploy.paused"
 TIMER_WAS_ACTIVE=false
 # An inherited marker means an earlier attempt may have left a partial pair.
 # Even an early failure of this retry must keep publication paused.
 RESTORE_TIMER=true
-if [ -f "$RESUME_MARKER" ]; then
+if [ -f "$PAUSE_MARKER" ] || [ -f "$RESUME_MARKER" ]; then
     RESTORE_TIMER=false
 fi
 if systemctl is-active --quiet "$TIMER"; then
@@ -82,6 +83,14 @@ case "$state" in inactive|failed) ;; *) exit 1 ;; esac
 install -m 755 "$STAGE/zakurad" "${BIN_PATH}.new"
 install -m 755 "$STAGE/zakura-checkpoints" "$INSTALL_ROOT/bin/zakura-checkpoints.new"
 printf '%s\n' "$REVISION" > "$INSTALL_ROOT/EXPORTER_REVISION.new"
+# A persistent unit condition also blocks timer activation after a reboot.
+# Install the guard before recording the pause, and record the pause before
+# replacing either binary. It applies even when the timer was initially stopped.
+install -d /etc/systemd/system/zakura-release-state.service.d
+printf '[Unit]\nConditionPathExists=!%s\n' "$PAUSE_MARKER" \
+    > /etc/systemd/system/zakura-release-state.service.d/deployment-pause.conf
+systemctl daemon-reload
+touch "$PAUSE_MARKER"
 RESTORE_TIMER=false
 systemctl stop "$NODE_SERVICE"
 mv -f "$INSTALL_ROOT/bin/zakura-checkpoints.new" "$INSTALL_ROOT/bin/zakura-checkpoints"
@@ -117,6 +126,7 @@ rpc_ready
 pid=$(systemctl show -p MainPID --value "$NODE_SERVICE")
 [[ "$pid" =~ ^[1-9][0-9]*$ ]]
 [ "$(readlink "/proc/$pid/exe")" = "$BIN_PATH" ]
+rm -f "$PAUSE_MARKER"
 RESTORE_TIMER=true
 cursor=$(journalctl -n 1 --show-cursor -o cat --no-pager | sed -n 's/^-- cursor: //p')
 [ -n "$cursor" ]

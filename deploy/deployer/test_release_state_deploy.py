@@ -161,7 +161,7 @@ manage_config = true
 class PairedShellTests(unittest.TestCase):
     """Execute the deployment script with isolated paths and fake host commands."""
 
-    def run_pair(self, failure="", *, resume_marker=False, timer_active=True, reboot_after_failure=False):
+    def run_pair(self, failure="", *, resume_marker=False, timer_active=True, reboot_after_failure=False, historical_restarts=0):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             script = (HERE.parent / "release-state/deploy-archive-pair.sh").read_text()
@@ -206,6 +206,14 @@ elif name == "systemctl":
                 sys.exit(0)
     if args == ["is-active", "--quiet", "zakura-release-state.timer"] and os.environ["TEST_TIMER_ACTIVE"] == "false":
         sys.exit(3)
+    counter = pathlib.Path(os.environ["TEST_ROOT"]) / "restart-count"
+    if args == ["reset-failed", "zakurad"]:
+        counter.write_text("0")
+    if args == ["start", "zakurad"] and failure == "restart":
+        counter.write_text("1")
+    if args == ["show", "-p", "NRestarts", "--value", "zakurad"]:
+        print(counter.read_text() if counter.exists() else os.environ["TEST_HISTORICAL_RESTARTS"])
+        sys.exit(0)
     if args == ["start", "zakurad"] and failure == "node":
         sys.exit(1)
     if args == ["start", "zakura-release-state.service"] and failure == "publish":
@@ -232,7 +240,8 @@ elif name == "curl":
                                     env={**os.environ, "PATH": f"{root}/mocks:{os.environ['PATH']}",
                                          "TEST_ROOT": str(root), "TEST_LOG": str(log), "TEST_FAILURE": failure,
                                          "TEST_BIN_PATH": str(root / "usr/local/bin/zakurad"),
-                                         "TEST_TIMER_ACTIVE": str(timer_active).lower()})
+                                         "TEST_TIMER_ACTIVE": str(timer_active).lower(),
+                                         "TEST_HISTORICAL_RESTARTS": str(historical_restarts)})
             if reboot_after_failure:
                 self.assertNotEqual(result.returncode, 0)
                 shutil.rmtree(root / "run")
@@ -270,6 +279,20 @@ elif name == "curl":
         self.assertNotIn("systemctl start zakura-release-state.timer", events)
         self.assertNotIn("systemctl start zakura-release-state.service", events)
         self.assertTrue(marker)
+
+    def test_historical_restarts_are_cleared_before_new_start(self):
+        result, events, installed, marker = self.run_pair(historical_restarts=5)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertLess(events.index("systemctl stop zakurad"), events.index("systemctl reset-failed zakurad"))
+        self.assertLess(events.index("systemctl reset-failed zakurad"), events.index("systemctl start zakurad"))
+
+    def test_restart_before_readiness_poll_rejects_new_deployment(self):
+        result, events, installed, marker = self.run_pair("restart", historical_restarts=5)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertTrue(installed)
+        self.assertTrue(marker)
+        self.assertNotIn("systemctl start zakura-release-state.service", events)
+        self.assertNotIn("systemctl start zakura-release-state.timer", events)
 
     def test_failed_deployment_pause_survives_reboot(self):
         for timer_active in (True, False):

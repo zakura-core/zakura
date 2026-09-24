@@ -96,6 +96,9 @@ systemctl stop "$NODE_SERVICE"
 mv -f "$INSTALL_ROOT/bin/zakura-checkpoints.new" "$INSTALL_ROOT/bin/zakura-checkpoints"
 mv -f "$INSTALL_ROOT/EXPORTER_REVISION.new" "$INSTALL_ROOT/EXPORTER_REVISION"
 mv -f "${BIN_PATH}.new" "$BIN_PATH"
+# Clear historical automatic restarts before measuring this deployment. Keep
+# requiring zero so even a restart before the first readiness poll is rejected.
+systemctl reset-failed "$NODE_SERVICE"
 systemctl start "$NODE_SERVICE"
 
 # The archive node has unauthenticated loopback RPC. Wait for database migration,

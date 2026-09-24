@@ -430,7 +430,11 @@ impl Store {
                 let entry = entry?;
                 if crate::cpu::import(&self.db, &self.path, &entry.path()).is_err() {
                     self.discarded = self.discarded.saturating_add(1);
-                    fs::remove_file(entry.path())?;
+                    match fs::remove_file(entry.path()) {
+                        Ok(()) => {}
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(error) => return Err(error.into()),
+                    }
                 }
             }
         }
@@ -481,8 +485,14 @@ impl Store {
         )?;
         let mut total = u64::try_from(payloads)?;
         for entry in fs::read_dir(&self.path)? {
-            let entry = entry?;
-            let metadata = fs::symlink_metadata(entry.path())?;
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.into()),
+            };
+            let Some(metadata) = accounting_metadata(&entry.path())? else {
+                continue;
+            };
             total = total.saturating_add(allocated_bytes(&metadata));
             if metadata.is_dir() && entry.file_name() != "chunks" && entry.file_name() != "cpu" {
                 total = total.saturating_add(directory_bytes(&entry.path())?);
@@ -551,11 +561,31 @@ pub(crate) fn write_payload(
     result
 }
 
+/// Sampler publication and pruning can remove an entry between enumeration and stat.
+fn accounting_metadata(path: &Path) -> Result<Option<fs::Metadata>> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => Ok(Some(metadata)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
 fn directory_bytes(path: &Path) -> Result<u64> {
+    let entries = match fs::read_dir(path) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error.into()),
+    };
     let mut total = 0u64;
-    for entry in fs::read_dir(path)? {
-        let entry = entry?;
-        let metadata = fs::symlink_metadata(entry.path())?;
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        let Some(metadata) = accounting_metadata(&entry.path())? else {
+            continue;
+        };
         total = total.saturating_add(allocated_bytes(&metadata));
         if metadata.is_dir() {
             total = total.saturating_add(directory_bytes(&entry.path())?);

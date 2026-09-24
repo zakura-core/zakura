@@ -1070,3 +1070,65 @@ fn cpu_pending_waits_for_boundary_neighbor_with_late_samples() -> Result<()> {
     assert_eq!(reader.detail(RUN, 1)?["cpu"]["pending"], false);
     Ok(())
 }
+
+#[test]
+fn accounting_tolerates_published_or_pruned_entries_but_preserves_other_errors() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let directory = temp.path().join("raw");
+    fs::create_dir(&directory)?;
+    let temporary = directory.join("segment.json.tmp");
+    fs::write(&temporary, b"capture metadata")?;
+    let listed = fs::read_dir(&directory)?.next().unwrap()?;
+    fs::rename(&temporary, directory.join("segment.json"))?;
+    assert!(
+        accounting_metadata(&listed.path())?.is_none(),
+        "an atomically published temporary file no longer exists at its enumerated name"
+    );
+    assert!(directory_bytes(&directory)? > 0);
+
+    let nested = directory.join("expired-session");
+    fs::create_dir(&nested)?;
+    assert!(accounting_metadata(&nested)?.unwrap().is_dir());
+    fs::remove_dir(&nested)?;
+    assert_eq!(
+        directory_bytes(&nested)?,
+        0,
+        "pruning can remove a directory after its parent entry was examined"
+    );
+
+    let ordinary_file = directory.join("segment.json");
+    assert!(
+        directory_bytes(&ordinary_file).is_err(),
+        "not-a-directory must not be treated as ordinary disappearance"
+    );
+    assert!(
+        accounting_metadata(&ordinary_file.join("child")).is_err(),
+        "other stat failures still surface"
+    );
+    Ok(())
+}
+
+#[test]
+fn collector_accounting_survives_sampler_atomic_publication() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let mut store = Store::open(temp.path(), 16_000_000)?;
+    let root = temp.path().to_path_buf();
+    let worker = std::thread::spawn(move || -> std::io::Result<()> {
+        for _ in 0..500 {
+            let staged = root.join("cpu-status.json.tmp");
+            let published = root.join("cpu-status.json");
+            fs::write(&staged, b"{}")?;
+            fs::rename(&staged, &published)?;
+            fs::remove_file(&published)?;
+        }
+        Ok(())
+    });
+    for _ in 0..100 {
+        store.prune()?;
+    }
+    worker
+        .join()
+        .map_err(|_| anyhow::anyhow!("sampler fixture panicked"))??;
+    store.prune()?;
+    Ok(())
+}

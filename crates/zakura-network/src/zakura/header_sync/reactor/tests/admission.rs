@@ -802,6 +802,22 @@ fn verified_progress_reopens_refill_without_a_status_refresh_or_reanchor() {
         advertised.selected_tip_height = block::Height(anchor.height.0 + target_height);
         reactor.peer_state.get_mut(&peer).unwrap().last_status = Some(advertised.clone());
         reactor.clear_peer_work_for_test(&peer);
+        let caught_up_peer = ZakuraPeerId::new(vec![0x72; 32]).unwrap();
+        let (send, _caught_up_outbound) = framed_channel(8);
+        reactor.handle_peer_connected(PeerSession::from_parts_with_session_id(
+            caught_up_peer.clone(),
+            8,
+            send,
+            CancellationToken::new(),
+        ));
+        let mut caught_up = advertised.clone();
+        caught_up.selected_tip_height = initial.frontiers.header_best.height;
+        caught_up.selected_tip_hash = initial.frontiers.header_best.hash;
+        reactor
+            .peer_state
+            .get_mut(&caught_up_peer)
+            .unwrap()
+            .last_status = Some(caught_up);
         while actions.try_recv().is_ok() {}
 
         let mut next = initial.clone();
@@ -952,4 +968,43 @@ fn assert_retiring_repair_reopens_refill(initial_window: u32) {
             "retiring the repair must wake refill once, without waiting for peer status"
         );
     }
+}
+
+#[test]
+fn apply_completion_observes_committed_headers_before_reusing_capacity() {
+    let mut startup = startup(CancellationToken::new());
+    let anchor = zakura_header_chain::Frontier::new(startup.anchor.0, startup.anchor.1);
+    let mut initial = committed_snapshot(anchor);
+    initial.frontiers.header_best.height = block::Height(anchor.height.0 + 3_599);
+    let (snapshots_tx, snapshots_rx) = watch::channel(Some(initial.clone()));
+    startup.committed_snapshots = Some(snapshots_rx);
+    let (_handle, _actions, mut reactor) = build_header_sync_reactor(startup).unwrap();
+    let peer = peer();
+    let (source, owner, _) = seed_applying_request(&mut reactor, &initial, peer.clone(), 7);
+    reactor.peer_work_queue.set_capacity_for_test(&peer, 401, 0);
+    let mut committed = initial.clone();
+    committed.frontiers.header_best.height = block::Height(anchor.height.0 + 4_000);
+    committed.header_generation = committed.header_generation.checked_next().unwrap();
+    committed.state_version = committed.state_version.checked_next().unwrap();
+    snapshots_tx.send_replace(Some(committed.clone()));
+
+    reactor.handle_port_completion(PortOperationResult::Completed(Box::new(move |reactor| {
+        reactor.handle_header_target_admission_ready(
+            peer,
+            source,
+            owner,
+            HeaderTargetAdmissionResult::Applied,
+        );
+    })));
+
+    assert_eq!(reactor.peer_work_queue.claimed_header_count(), 0);
+    assert_eq!(reactor.committed_snapshot.as_ref(), Some(&committed));
+    assert_eq!(
+        HeaderSyncReactor::request_header_prefix_remaining(
+            reactor.committed_snapshot.as_ref().unwrap(),
+            reactor.peer_work_queue.claimed_header_count(),
+            block::Height(20_000),
+        ),
+        0
+    );
 }

@@ -205,7 +205,7 @@ impl Drop for HeaderCountReservationInner {
 }
 
 #[derive(Clone, Debug)]
-struct HeaderCapacityLease(Arc<HeaderCapacityLeaseInner>);
+pub(in crate::zakura::header_sync) struct HeaderCapacityLease(Arc<HeaderCapacityLeaseInner>);
 
 #[derive(Debug)]
 struct HeaderCapacityLeaseInner {
@@ -850,6 +850,14 @@ impl PeerWorkQueue {
         }
         self.publish_phase_metrics();
         true
+    }
+
+    /// Keep local work charged after its peer slot retires.
+    pub(in crate::zakura::header_sync) fn retain_header_capacity(
+        &self,
+        peer: &ZakuraPeerId,
+    ) -> Vec<HeaderCapacityLease> {
+        self.staged_capacity.get(peer).cloned().unwrap_or_default()
     }
 
     pub(in crate::zakura::header_sync) fn owned_header_count(&self, peer: &ZakuraPeerId) -> usize {

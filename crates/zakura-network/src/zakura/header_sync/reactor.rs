@@ -894,9 +894,12 @@ impl HeaderSyncReactor {
             PortOperationResult::Completed(completion) => completion(self),
             PortOperationResult::Panicked(context) => self.handle_port_panic(*context),
         }
+        // Apply publishes its snapshot before completing. Observe it before another
+        // event can reserve the capacity that this completion released.
+        self.refresh_committed_snapshot();
     }
 
-    fn handle_peer_connected(&mut self, session: PeerSession) {
+    fn refresh_committed_snapshot(&mut self) {
         let latest_snapshot = self
             .startup
             .committed_snapshots
@@ -905,7 +908,10 @@ impl HeaderSyncReactor {
         if let Some(snapshot) = latest_snapshot {
             self.observe_latest_committed_snapshot(snapshot);
         }
+    }
 
+    fn handle_peer_connected(&mut self, session: PeerSession) {
+        self.refresh_committed_snapshot();
         let peer = session.peer_id().clone();
         if self
             .unproductive_peer_cooldowns
@@ -1167,15 +1173,36 @@ impl HeaderSyncReactor {
         }
     }
 
-    fn reconsider_advertised_header_targets(&mut self) {
+    fn reconsider_advertised_header_targets(
+        &mut self,
+        previous: Option<(&zakura_header_chain::EngineSnapshot, usize)>,
+    ) {
+        let Some(current) = self.committed_snapshot.as_ref() else {
+            return;
+        };
+        let claimed = self.peer_work_queue.claimed_header_count();
         let targets: Vec<_> = self
             .peer_state
             .iter()
             .filter_map(|(peer, state)| {
                 state
                     .last_status
-                    .clone()
-                    .map(|status| (peer.clone(), state.session.session_id(), status))
+                    .as_ref()
+                    .filter(|status| {
+                        Self::request_header_prefix_remaining(
+                            current,
+                            claimed,
+                            status.selected_tip_height,
+                        ) > 0
+                            && previous.is_none_or(|(old, claimed_before)| {
+                                Self::request_header_prefix_remaining(
+                                    old,
+                                    claimed_before,
+                                    status.selected_tip_height,
+                                ) == 0
+                            })
+                    })
+                    .map(|status| (peer.clone(), state.session.session_id(), status.clone()))
             })
             .collect();
         for (peer, session_id, status) in targets {
@@ -2878,27 +2905,6 @@ impl HeaderSyncReactor {
         durable.min(body_window.saturating_sub(claimed))
     }
 
-    /// Report whether a new snapshot reopens refill for a target a peer already advertised.
-    ///
-    /// Verified-body progress returns window credits without changing header authority.
-    /// Compare claims before and after retirement so released repairs also reopen refill.
-    /// Only a closed-to-open transition schedules work, so an open window costs no locator query.
-    fn reopens_refill(
-        &self,
-        old: &zakura_header_chain::EngineSnapshot,
-        new: &zakura_header_chain::EngineSnapshot,
-        claimed_before: usize,
-        claimed_after: usize,
-    ) -> bool {
-        self.peer_state.values().any(|state| {
-            state.last_status.as_ref().is_some_and(|status| {
-                let target = status.selected_tip_height;
-                Self::request_header_prefix_remaining(old, claimed_before, target) == 0
-                    && Self::request_header_prefix_remaining(new, claimed_after, target) > 0
-            })
-        })
-    }
-
     fn observe_latest_committed_snapshot(&mut self, snapshot: zakura_header_chain::EngineSnapshot) {
         if self.committed_snapshot.as_ref() == Some(&snapshot) {
             return;
@@ -2911,11 +2917,6 @@ impl HeaderSyncReactor {
         self.emit_snapshot_observed(self.committed_snapshot.as_ref(), &snapshot);
         let claimed_before = self.peer_work_queue.claimed_header_count();
         self.retire_obsolete_work(&snapshot);
-        let claimed_after = self.peer_work_queue.claimed_header_count();
-        let refill_reopened = !header_authority_changed
-            && self.committed_snapshot.as_ref().is_some_and(|old| {
-                self.reopens_refill(old, &snapshot, claimed_before, claimed_after)
-            });
         let old_tip = self
             .committed_snapshot
             .as_ref()
@@ -2928,7 +2929,7 @@ impl HeaderSyncReactor {
         };
         let status = Status::from_snapshot(&snapshot, &self.serving_limits);
         let now = Instant::now();
-        self.committed_snapshot = Some(snapshot);
+        let previous = self.committed_snapshot.replace(snapshot);
         self.schedule_current_vct_repair();
         self.request_vct_repair_context();
         for state in self.peer_state.values_mut() {
@@ -2948,8 +2949,10 @@ impl HeaderSyncReactor {
             self.publish_peer_state();
         }
         self.refresh_statuses();
-        if header_authority_changed || refill_reopened {
-            self.reconsider_advertised_header_targets();
+        if header_authority_changed {
+            self.reconsider_advertised_header_targets(None);
+        } else if let Some(previous) = previous.as_ref() {
+            self.reconsider_advertised_header_targets(Some((previous, claimed_before)));
         }
     }
 
@@ -4162,6 +4165,13 @@ impl HeaderSyncReactor {
                 return true;
             }
         }
+        let capacity = match &action {
+            HeaderPortOperation::PrepareHeaderTarget { peer, .. }
+            | HeaderPortOperation::ApplyHeaderTarget { peer, .. } => {
+                self.peer_work_queue.retain_header_capacity(peer)
+            }
+            _ => Vec::new(),
+        };
         let panic_context = self.port_panic_context(&action);
         let header_chain = self.startup.header_chain_port.clone();
         let request_timeout = self.startup.request_timeout;
@@ -4490,7 +4500,10 @@ impl HeaderSyncReactor {
             AssertUnwindSafe(operation)
                 .catch_unwind()
                 .map(move |result| match result {
-                    Ok(completion) => PortOperationResult::Completed(completion),
+                    Ok(completion) => PortOperationResult::Completed(Box::new(move |reactor| {
+                        completion(reactor);
+                        drop(capacity);
+                    })),
                     Err(_) => PortOperationResult::Panicked(Box::new(panic_context)),
                 });
         if let Some(operation) = vct_local_operation {

@@ -2,7 +2,7 @@
 
 Fee recycling activates at NU7 and reissuance at the ZIP 234 start height.
 Both activate by height alone in every build.
-Production activation still requires policy guidance and a production NU7 branch ID.
+Production activation still requires policy guidance and production NU7 activation heights.
 
 ## The seed
 
@@ -167,13 +167,13 @@ writes, cancellation, corruption, and startup retry.
 Checkpoint fixtures isolate accounting. Some intentionally underclaim coinbases
 and do not represent semantically valid post-NU6 blocks. The semantic subsidy
 test checks exact claims and one-zatoshi overclaims, but mocks transaction
-verification because NU7 has no production branch ID. Accounting reductions do
-not establish support for a ZIP 233 transaction format.
+verification to isolate the accounting checks. Accounting reductions do not
+establish support for a ZIP 233 transaction format.
 
 Before production activation:
 
 - Resolve the reissuance start height against the deployment ZIP.
-- Assign the production NU7 branch ID and activation heights.
+- Assign the production NU7 activation heights.
 - Run real transaction verification across activation on a private network.
 - Mine bonus-paying blocks, create forks, restart nodes, migrate a database,
   and verify convergence on that network.

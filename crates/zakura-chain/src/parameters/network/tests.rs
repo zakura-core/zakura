@@ -1,5 +1,6 @@
 #![allow(clippy::unwrap_in_result)]
 
+mod nu7_rounding;
 mod prop;
 mod vectors;
 
@@ -1035,7 +1036,10 @@ fn estimated_mainnet_nsm_crossing_lands_in_february_2031() {
     let crossing = nsm_reissuance_crossing_height(&network)
         .expect("crossing arithmetic is valid")
         .expect("the estimated Mainnet schedule has a crossing");
-    assert_eq!(crossing, Height(8_940_474));
+    // With a constant 26,041,666 subsidy the crossing is H3 + 2,807,274 = 8,940,474
+    // (zips#1370). The exact ZIP 218 rounding rule pays 26,041,667 at the last two blocks
+    // of each group, and 8,940,473 is such a block, so the crossing moves one block earlier.
+    assert_eq!(crossing, Height(8_940_473));
     assert_eq!(
         crate::parameters::subsidy::nsm_reissuance_height(&network),
         Some(crossing)

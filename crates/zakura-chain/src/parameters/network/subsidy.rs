@@ -22,7 +22,7 @@ use std::{collections::HashMap, sync::OnceLock};
 use crate::{
     amount::{self, Amount, NegativeAllowed, NonNegative, MAX_MONEY},
     block::{Height, HeightDiff},
-    parameters::{Network, NetworkUpgrade},
+    parameters::{Network, NetworkUpgrade, NU7_POW_TARGET_SPACING_RATIO},
     transparent,
 };
 
@@ -364,14 +364,38 @@ pub fn funding_stream_values(
     if NetworkUpgrade::current(network, height) >= NetworkUpgrade::Canopy {
         let funding_streams = network.funding_streams(height);
         if let Some(funding_streams) = funding_streams {
+            // From NU7, each stream's share of the halving subsidy follows the exact ZIP 218
+            // rounding rule, see [`Nu7RoundingGroup`]. Any ZIP 234 reissuance bonus above
+            // the halving subsidy keeps the specification's floor rule. On the public
+            // networks the Revision 2 streams end long before reissuance starts, so the
+            // bonus is zero while a stream pays.
+            let group = nu7_rounding_group(height, network);
+            let bonus = match group {
+                Some(group) => {
+                    let halving_subsidy =
+                        Amount::try_from(group.share(group.post_blossom_subsidy()))?;
+                    (expected_block_subsidy - halving_subsidy)?
+                }
+                None => expected_block_subsidy,
+            };
+
             for (&receiver, recipient) in funding_streams.recipients() {
                 // - Spec equation: `fs.value = floor(block_subsidy(height)*(fs.numerator/fs.denominator))`:
                 //   https://zips.z.cash/protocol/protocol.pdf#subsidies
                 // - In Rust, "integer division rounds towards zero":
                 //   https://doc.rust-lang.org/stable/reference/expressions/operator-expr.html#arithmetic-and-logical-binary-operators
                 //   This is the same as `floor()`, because these numbers are all positive.
-                let amount_value = ((expected_block_subsidy * recipient.numerator())?
-                    / FUNDING_STREAM_RECEIVER_DENOMINATOR)?;
+                let floor_share =
+                    ((bonus * recipient.numerator())? / FUNDING_STREAM_RECEIVER_DENOMINATOR)?;
+
+                let amount_value = match group {
+                    Some(group) => {
+                        let post_blossom_value =
+                            group.post_blossom_stream_value(recipient.numerator());
+                        (Amount::try_from(group.share(post_blossom_value))? + floor_share)?
+                    }
+                    None => floor_share,
+                };
 
                 results.insert(receiver, amount_value);
             }
@@ -483,6 +507,111 @@ pub fn halving(height: Height, network: &Network) -> u32 {
         .expect("halving index is non-negative and fits in u32")
 }
 
+/// A block's position in its ZIP 218 rounding group.
+///
+/// ZIP 218 divides the block subsidy by `NU7PoWTargetSpacingRatio` (`R` = 3) at NU7, so a
+/// post-NU7 block pays a third of what a post-Blossom block paid at the same halving. The
+/// post-Blossom subsidy and the funding stream values do not divide evenly by three, so
+/// taking `floor` at every block pays the streams less and the miner more than their
+/// specified shares, by a few zatoshi for every three blocks.
+///
+/// This type implements the exact rule instead. Post-NU7 blocks form groups of `R`
+/// consecutive blocks aligned to the NU7 activation height `A`. Each amount `V` that a
+/// post-Blossom block would pay at this halving is split over the group so that the block
+/// at index `k = (height − A) mod R` pays
+///
+/// > `floor((k + 1) · V / R) − floor(k · V / R)`
+///
+/// Every group therefore pays exactly `V`, and every block pays `floor(V / R)` or one
+/// zatoshi more. For the block subsidy, the first block of each group pays the plain
+/// ZIP 218 amount. A funding stream's `V` is its share of the post-Blossom subsidy, so a
+/// stream whose `V` divides evenly by `R` is paid exactly at every block, where the plain
+/// rule's `floor` of a share of an already-floored subsidy could drop a zatoshi. Halving
+/// heights and the ZIP 214 funding stream end heights fall on group boundaries, because
+/// every post-NU7 halving interval is a multiple of `R` blocks and the pre-NU7 intervals
+/// map onto `R` blocks each.
+///
+/// The miner's share is the remainder of the subsidy after the streams, as before, so the
+/// coinbase still balances exactly at every block.
+///
+/// See [`nu7_rounding_group`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Nu7RoundingGroup {
+    /// The number of blocks per group, `NU7PoWTargetSpacingRatio`.
+    blocks_per_group: u64,
+    /// The number of blocks from NU7 activation up to this block.
+    blocks_since_activation: u64,
+    /// `floor(MaxBlockSubsidy / (BlossomPoWTargetSpacingRatio · 2^Halving(height)))`, the
+    /// subsidy of a post-Blossom block at this block's halving.
+    post_blossom_subsidy: u64,
+}
+
+impl Nu7RoundingGroup {
+    /// Returns this block's index within its group, `(height − A) mod R`.
+    pub fn index(&self) -> u64 {
+        self.blocks_since_activation % self.blocks_per_group
+    }
+
+    /// Returns the subsidy a post-Blossom block pays at this block's halving.
+    pub fn post_blossom_subsidy(&self) -> u64 {
+        self.post_blossom_subsidy
+    }
+
+    /// Returns the value a post-Blossom block pays at this block's halving to a funding
+    /// stream with `numerator`, `floor(post_blossom_subsidy · numerator / 100)`.
+    pub fn post_blossom_stream_value(&self, numerator: u64) -> u64 {
+        self.post_blossom_subsidy * numerator / FUNDING_STREAM_RECEIVER_DENOMINATOR
+    }
+
+    /// Returns this block's share of `post_blossom_value`.
+    pub fn share(&self, post_blossom_value: u64) -> u64 {
+        u64::try_from(self.run_total(post_blossom_value, 1))
+            .expect("a share is at most the post-Blossom value, which fits in u64")
+    }
+
+    /// Returns the total that this block and the `blocks − 1` blocks after it pay to a
+    /// recipient whose post-Blossom value is `post_blossom_value`.
+    ///
+    /// The shares telescope: the blocks from NU7 activation through any height pay
+    /// `floor(blocks · V / R)` in total, so a run's total is a difference of two floors.
+    /// The run must not cross a halving, where `V` changes.
+    pub fn run_total(&self, post_blossom_value: u64, blocks: u128) -> u128 {
+        let paid_through = |blocks: u128| {
+            blocks * u128::from(post_blossom_value) / u128::from(self.blocks_per_group)
+        };
+        let start = u128::from(self.blocks_since_activation);
+
+        paid_through(start + blocks) - paid_through(start)
+    }
+}
+
+/// Returns the ZIP 218 rounding group of the block at `height`, or `None` if the exact
+/// rounding rule does not apply there.
+///
+/// The rule applies from NU7 activation to every block after the slow start whose
+/// halving subsidy is not zero. The slow start pays a per-block rate that ZIP 218 leaves
+/// unchanged, and a zero subsidy has nothing to split.
+///
+/// See [`Nu7RoundingGroup`].
+pub fn nu7_rounding_group(height: Height, net: &Network) -> Option<Nu7RoundingGroup> {
+    let activation = NetworkUpgrade::Nu7.activation_height(net)?;
+    if height < activation || height < net.slow_start_interval() {
+        return None;
+    }
+    let halving_div = halving_divisor(height, net)?;
+
+    let blocks_since_activation = u64::try_from(height - activation)
+        .expect("the height is at or above the activation height");
+
+    Some(Nu7RoundingGroup {
+        blocks_per_group: u64::from(NU7_POW_TARGET_SPACING_RATIO),
+        blocks_since_activation,
+        post_blossom_subsidy: MAX_BLOCK_SUBSIDY
+            / u64::from(BLOSSOM_POW_TARGET_SPACING_RATIO)
+            / halving_div,
+    })
+}
+
 /// `ln(2)` scaled by [`BLOCK_SUBSIDY_FRACTION_DENOMINATOR`] and rounded up to a
 /// multiple of 1,680,000, as specified by the [halving-preserving NSM draft].
 ///
@@ -552,8 +681,21 @@ pub(crate) fn nsm_reissuance_crossing_height(
         .previous()
         .map_err(|_| SubsidyError::UnsupportedHeight)?;
     let supply_before_first = scheduled_issuance_zatoshis(parent, network)?;
-    let subsidy = amount_to_u128(halving_block_subsidy(first_candidate, network)?);
     let max_money = u128::try_from(MAX_MONEY).map_err(|_| SubsidyError::Overflow)?;
+
+    // The run stays in the third halving era, so it is one ZIP 218 rounding run.
+    if let Some(group) = nu7_rounding_group(first_candidate, network) {
+        return Ok(first_nsm_crossing_in_rounding_run(
+            first_candidate.0,
+            run_end.0,
+            supply_before_first,
+            group,
+            max_money,
+        )?
+        .map(Height));
+    }
+
+    let subsidy = amount_to_u128(halving_block_subsidy(first_candidate, network)?);
 
     Ok(first_nsm_crossing_in_subsidy_run(
         first_candidate.0,
@@ -563,6 +705,60 @@ pub(crate) fn nsm_reissuance_crossing_height(
         max_money,
     )?
     .map(Height))
+}
+
+/// Returns the first reference NSM crossing in a run of ZIP 218 rounding groups.
+///
+/// `group` is the rounding group of `first`, and `supply_before_first` is the scheduled
+/// supply after its parent. Every block in the run shares `first`'s halving.
+pub(super) fn first_nsm_crossing_in_rounding_run(
+    first: u32,
+    run_end: u32,
+    supply_before_first: u128,
+    group: Nu7RoundingGroup,
+    max_money: u128,
+) -> Result<Option<u32>, SubsidyError> {
+    let value = group.post_blossom_subsidy();
+
+    // No block in the run pays more than `ceil(V / R)`. A run that paid that much at
+    // every block would have issued at least as much by any height, leaving at most the
+    // same reserve, and would offer at least as large a subsidy there. So wherever the
+    // exact run crosses, that run has already crossed: its crossing is a lower bound.
+    let max_share = u128::from(value).div_ceil(u128::from(group.blocks_per_group));
+    let Some(lower_bound) = first_nsm_crossing_in_subsidy_run(
+        first,
+        run_end,
+        supply_before_first,
+        max_share,
+        max_money,
+    )?
+    else {
+        return Ok(None);
+    };
+
+    // The bound overstates issuance by less than one zatoshi per block, which moves the
+    // crossing by a fraction of a block, so this scan ends within a few blocks. It stops at
+    // the run end regardless.
+    for height in lower_bound..=run_end {
+        let blocks_before = u128::from(height - first);
+        let supply_before = supply_before_first
+            .checked_add(group.run_total(value, blocks_before))
+            .ok_or(SubsidyError::Overflow)?;
+        let subsidy =
+            group.run_total(value, blocks_before + 1) - group.run_total(value, blocks_before);
+
+        let reserve = max_money.saturating_sub(supply_before);
+        let reference = reserve
+            .checked_mul(BLOCK_SUBSIDY_FRACTION_NUMERATOR)
+            .ok_or(SubsidyError::Overflow)?
+            .div_ceil(BLOCK_SUBSIDY_FRACTION_DENOMINATOR);
+
+        if reference < subsidy {
+            return Ok(Some(height));
+        }
+    }
+
+    Ok(None)
 }
 
 /// Returns the first reference NSM crossing in a constant-subsidy run.
@@ -771,7 +967,12 @@ pub fn scheduled_issuance_zatoshis(height: Height, net: &Network) -> Result<u128
             .min(height);
         let run_blocks = u128::from(run_end - block) + 1;
 
-        total += run_blocks * subsidy;
+        // A run never crosses a halving, so within a ZIP 218 rounding run the shares
+        // telescope into one difference of floors.
+        total += match nu7_rounding_group(Height(block), net) {
+            Some(group) => group.run_total(group.post_blossom_subsidy(), run_blocks),
+            None => run_blocks * subsidy,
+        };
 
         if run_end == height || run_end == u32::MAX {
             break;
@@ -881,6 +1082,10 @@ pub fn halving_block_subsidy(
         } else {
             slow_start_rate * (u64::from(height) + 1)
         }
+    } else if let Some(group) = nu7_rounding_group(height, net) {
+        // From NU7, the post-Blossom subsidy is split exactly over each group of
+        // `NU7PoWTargetSpacingRatio` blocks, see `Nu7RoundingGroup`.
+        group.share(group.post_blossom_subsidy())
     } else {
         // Each spacing era scales the per-block subsidy by
         // `current_spacing / pre_blossom_spacing`, which keeps issuance per unit of

@@ -357,8 +357,10 @@ fn cpu_samples_use_process_scope_and_exclude_clock_boundaries() -> Result<()> {
                     "_RNvC6_123foo3bar (zakurad)".into(),
                     "native function (libc.so.6)".into(),
                 ],
+                ..Default::default()
             })
             .collect(),
+        ..Default::default()
     };
     let path = temp
         .path()
@@ -366,21 +368,19 @@ fn cpu_samples_use_process_scope_and_exclude_clock_boundaries() -> Result<()> {
         .join(format!("{}.json", "a".repeat(32)));
     fs::write(&path, serde_json::to_vec(&capture)?)?;
     crate::cpu::import(&store.db, temp.path(), &path)?;
-    let result = Reader::open(temp.path())?.detail(RUN, 1)?;
-    assert_eq!(result["cpu"]["samples"], 1);
-    assert_eq!(result["cpu"]["sparse"], true);
-    assert_eq!(
-        result["cpu"]["stacks"][0]["frames"][0],
-        "123foo::bar (zakurad)"
-    );
-    assert_eq!(
-        result["cpu"]["stacks"][0]["frames"][1],
-        "native function (libc.so.6)"
-    );
-    assert!(result["cpu"]["scope"]
-        .as_str()
-        .unwrap()
-        .contains("other blocks"));
+    let reader = Reader::open(temp.path())?;
+    assert_eq!(reader.detail(RUN, 1)?["cpu"]["status"], "available");
+    let result = reader.cpu(RUN, 1, "recorded")?;
+    assert_eq!(result["counts"]["returned_samples"], 1);
+    assert_eq!(result["counts"]["boundary_excluded_samples"], 2);
+    assert_eq!(result["sparse"], true);
+    assert_eq!(result["frames"][1]["name"], "123foo::bar (zakurad)");
+    assert_eq!(result["frames"][0]["name"], "native function (libc.so.6)");
+    assert!(result["scope"].as_str().unwrap().contains("other blocks"));
+    assert_eq!(result["coverage"]["state"], "partial");
+    let export = reader.cpu_speedscope(RUN, 1, "recorded")?;
+    assert_eq!(export["profiles"][0]["unit"], "none");
+    assert_eq!(export["profiles"][0]["weights"], json!([1]));
     assert!(!path.exists());
     Ok(())
 }
@@ -794,5 +794,204 @@ fn verification_metadata_fits_chunk_and_attempt_query_budgets() -> Result<()> {
         profiles::MAX_SPANS.div_ceil(u64::try_from(MAX_CHUNK_EVENTS)?)
             <= u64::try_from(MAX_DETAIL_CHUNKS)?
     );
+    Ok(())
+}
+
+fn cpu_v2(samples: Vec<(u64, u32)>) -> crate::cpu::Capture {
+    crate::cpu::Capture {
+        run: RUN.into(),
+        pid: 1,
+        frequency: 99,
+        clock: "monotonic".into(),
+        schema_version: 2,
+        session: "session".into(),
+        start_mono_us: 1_000_000,
+        end_mono_us: 2_000_000,
+        executable_sha256: "a".repeat(64),
+        lost_samples: Some(0),
+        frames: vec![
+            crate::cpu::CpuFrame {
+                ip: "1234".into(),
+                symbol: "long_symbol".repeat(500),
+                dso: "zakurad".into(),
+            },
+            crate::cpu::CpuFrame {
+                symbol: "root".into(),
+                ..Default::default()
+            },
+        ],
+        stacks: vec![vec![0, 1]],
+        samples: samples
+            .into_iter()
+            .map(|(offset, tid)| crate::cpu::Sample {
+                mono_us: 1_000_000 + offset,
+                tid,
+                stack: Some(0),
+                ..Default::default()
+            })
+            .collect(),
+        ..Default::default()
+    }
+}
+fn cpu_test_store(path: &Path) -> Result<Store> {
+    let mut store = Store::open(path, 16_000_000)?;
+    let mut frame = metadata();
+    if let Frame::Run { run, .. } = &mut frame {
+        run.monotonic_start_us = Some(1_000_000);
+        run.clock_error_us = 2;
+    }
+    store.ingest(frame)?;
+    store.ingest(event(1, finish()))?;
+    store.ingest(event(2, span()))?;
+    store.ingest(event(
+        3,
+        Event::Seal {
+            attempt: 1,
+            spans: 1,
+            dropped: 0,
+        },
+    ))?;
+    store.flush()?;
+    Ok(store)
+}
+fn import_cpu(store: &Store, capture: &crate::cpu::Capture, id: &str) -> Result<()> {
+    let path = store.path.join("inbox").join(format!("{id}.json"));
+    fs::write(&path, serde_json::to_vec(capture)?)?;
+    crate::cpu::import(&store.db, &store.path, &path)
+}
+#[test]
+fn cpu_v2_preserves_timestamps_tids_full_symbols_and_finalization_window() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let store = cpu_test_store(temp.path())?;
+    import_cpu(
+        &store,
+        &cpu_v2(vec![(200, 11), (600000, 12), (750000, 11)]),
+        &"a".repeat(32),
+    )?;
+    let reader = Reader::open(temp.path())?;
+    let data = reader.cpu(RUN, 1, "recorded")?;
+    assert_eq!(data["window"]["end_us"], 800000);
+    assert_eq!(data["window"]["boundary_complete"], true);
+    assert_eq!(data["samples"].as_array().unwrap().len(), 3);
+    assert_eq!(data["samples"][2]["mono_us"], 1_750_000);
+    assert_eq!(data["samples"][2]["at_us"], 749900);
+    assert_eq!(data["samples"][1]["tid"], 12);
+    assert_eq!(data["frames"][1]["symbol"], "long_symbol".repeat(500));
+    assert_eq!(data["stacks"][0], json!([0, 1]));
+    assert_eq!(
+        data["coverage"]["state"], "partial",
+        "acquisition bounds are not proof of gap-free sampling"
+    );
+    let verifier = reader.cpu(RUN, 1, "verifier")?;
+    assert_eq!(verifier["window"]["end_us"], 700100);
+    assert_eq!(verifier["counts"]["returned_samples"], 2);
+    let export = reader.cpu_speedscope(RUN, 1, "recorded")?;
+    assert_eq!(
+        export["profiles"][0]["weights"],
+        json!([1, 1, 1]),
+        "long waits must never become sample CPU duration"
+    );
+    assert_eq!(export["profiles"].as_array().unwrap().len(), 3);
+    assert_eq!(export["profiles"][0]["endValue"], 3);
+    Ok(())
+}
+#[test]
+fn cpu_coverage_distinguishes_pending_gaps_empty_and_loss() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let store = cpu_test_store(temp.path())?;
+    fs::write(
+        temp.path().join("cpu-status.json"),
+        serde_json::to_vec(
+            &json!({"run":RUN,"state":"recording","updated_ms":now_ms(),"started_mono_us":1_000_000,"published_through_mono_us":1_000_000}),
+        )?,
+    )?;
+    let reader = Reader::open(temp.path())?;
+    assert_eq!(reader.detail(RUN, 1)?["cpu"]["status"], "pending");
+    assert_eq!(
+        reader.cpu(RUN, 1, "recorded")?["coverage"]["state"],
+        "pending"
+    );
+    fs::remove_file(temp.path().join("cpu-status.json"))?;
+    assert_eq!(
+        reader.cpu(RUN, 1, "recorded")?["coverage"]["state"],
+        "unavailable"
+    );
+    let mut empty = cpu_v2(vec![]);
+    empty.end_mono_us = 1_100_000;
+    empty.coverage_proven = true;
+    import_cpu(&store, &empty, &"b".repeat(32))?;
+    let data = reader.cpu(RUN, 1, "recorded")?;
+    assert_eq!(data["coverage"]["state"], "partial");
+    assert_eq!(data["counts"]["returned_samples"], 0);
+    assert_eq!(data["sparse"], true);
+    assert_eq!(data["coverage"]["gaps_us"], json!([[100000, 800000]]));
+    let mut lost = cpu_v2(vec![]);
+    lost.start_mono_us = 1_100_000;
+    lost.truncated = true;
+    lost.lost_samples = None;
+    import_cpu(&store, &lost, &"c".repeat(32))?;
+    let data = reader.cpu(RUN, 1, "recorded")?;
+    assert_eq!(data["coverage"]["lost_samples"], Value::Null);
+    assert_eq!(data["coverage"]["truncated"], true);
+    assert_eq!(data["coverage"]["state"], "partial");
+    Ok(())
+}
+#[test]
+fn cpu_limits_are_explicit_and_more_than_two_hundred_stacks_survive() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let store = cpu_test_store(temp.path())?;
+    let mut capture = cpu_v2(vec![]);
+    capture.frames = (0..250)
+        .map(|n| crate::cpu::CpuFrame {
+            symbol: format!("function{n}"),
+            ..Default::default()
+        })
+        .collect();
+    capture.stacks = (0..250).map(|n| vec![n]).collect();
+    capture.samples = (0..20_005)
+        .map(|n| crate::cpu::Sample {
+            mono_us: 1_001_000 + n,
+            tid: 11,
+            stack: Some(u32::try_from(n % 250).unwrap()),
+            ..Default::default()
+        })
+        .collect();
+    import_cpu(&store, &capture, &"d".repeat(32))?;
+    let data = Reader::open(temp.path())?.cpu(RUN, 1, "recorded")?;
+    assert_eq!(data["stacks"].as_array().unwrap().len(), 250);
+    assert_eq!(data["counts"]["returned_samples"], 20000);
+    assert_eq!(data["counts"]["omitted_samples"], 5);
+    assert_eq!(data["counts"]["matching_samples"], 20005);
+    assert_eq!(data["coverage"]["query_limited"], true);
+    Ok(())
+}
+
+#[test]
+fn cpu_repeated_long_frames_are_interned_and_expansion_is_bounded() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let store = cpu_test_store(temp.path())?;
+    let mut capture = cpu_v2(vec![]);
+    capture.frames = vec![crate::cpu::CpuFrame {
+        symbol: "x".repeat(65_536),
+        ..Default::default()
+    }];
+    capture.stacks = vec![vec![0; 128]];
+    capture.samples = (0..50_000)
+        .map(|n| crate::cpu::Sample {
+            mono_us: 1_001_000 + n,
+            tid: 1,
+            stack: Some(0),
+            ..Default::default()
+        })
+        .collect();
+    import_cpu(&store, &capture, &"e".repeat(32))?;
+    let data = Reader::open(temp.path())?.cpu(RUN, 1, "recorded")?;
+    assert_eq!(data["frames"].as_array().unwrap().len(), 1);
+    assert_eq!(data["frames"][0]["symbol"].as_str().unwrap().len(), 65_536);
+    assert_eq!(data["stacks"].as_array().unwrap().len(), 1);
+    assert_eq!(data["counts"]["returned_samples"], 3906);
+    assert_eq!(data["counts"]["omitted_samples"], 46094);
+    assert_eq!(data["counts"]["matching_samples"], 50000);
+    assert_eq!(data["coverage"]["query_limited"], true);
     Ok(())
 }

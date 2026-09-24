@@ -767,14 +767,6 @@ impl Reader {
                 }
             }
         }
-        let cpu = crate::cpu::window(
-            &self.db,
-            &self.path,
-            run,
-            summary["start_us"].as_u64().unwrap_or(0),
-            summary["end_us"].as_u64().unwrap_or(0),
-        )
-        .unwrap_or_else(|error| json!({"status":"unavailable","reason":error.to_string()}));
         let complete = summary["end_us"].is_number()
             && !missing
             && summary["expired"] == false
@@ -792,6 +784,14 @@ impl Reader {
             })
             .chain(summary["end_us"].as_u64())
             .max();
+        let cpu = crate::cpu::availability(
+            &self.db,
+            &self.path,
+            run,
+            summary["start_us"].as_u64().unwrap_or(0),
+            recorded_end.unwrap_or_else(|| summary["start_us"].as_u64().unwrap_or(0)),
+        )
+        .unwrap_or_else(|error| json!({"status":"unavailable","reason":error.to_string()}));
         let elapsed = |end: Option<u64>| {
             summary["start_us"]
                 .as_u64()
@@ -800,6 +800,7 @@ impl Reader {
         };
         let timing = json!({
             "recorded_elapsed_us":elapsed(recorded_end),
+            "recorded_end_us":recorded_end,
             "verifier_elapsed_us":elapsed(summary["end_us"].as_u64()),
             "after_response_us":summary["end_us"].as_u64().zip(recorded_end).map(|(response,end)|end.saturating_sub(response)),
             "valid":summary["exclusion_reason"].is_null(),
@@ -808,6 +809,46 @@ impl Reader {
         Ok(
             json!({"summary":summary,"recording":recording,"spans":spans,"complete":complete,"missing_chunks":missing,"cpu":cpu,"timing":timing,"boundary":"Verifier request measures router entry to caller result. Total recorded time extends through the last recorded work, including finalization after the response. Caller readiness, network and ingress are outside both intervals. Missing detail can leave the total understated."}),
         )
+    }
+    /// CPU decoding is explicit and bounded, separate from ordinary block timeline reads.
+    pub(crate) fn cpu(&self, run: &str, attempt: u64, scope: &str) -> Result<Value> {
+        ensure!(
+            matches!(scope, "recorded" | "verifier"),
+            "invalid CPU window"
+        );
+        let detail = self.detail(run, attempt)?;
+        let start = detail["summary"]["start_us"]
+            .as_u64()
+            .context("block has no start boundary")?;
+        let end = if scope == "verifier" {
+            detail["summary"]["end_us"].as_u64()
+        } else {
+            detail["timing"]["recorded_end_us"].as_u64()
+        };
+        let Some(end) = end else {
+            return Ok(
+                json!({"status":"pending", "coverage":{"state":"pending","reason":"Block response boundary is not recorded yet"},"samples":[],"frames":[],"stacks":[]}),
+            );
+        };
+        let boundary_complete = scope == "verifier" || detail["complete"] == true;
+        let summary = detail["summary"].clone();
+        let timing = detail["timing"].clone();
+        let recording = detail["recording"].clone();
+        drop(detail);
+        let mut cpu = crate::cpu::window(&self.db, &self.path, run, start, end)?;
+        cpu["window"] = json!({"start_us":start,"end_us":end,"scope":scope,"boundary_complete":boundary_complete});
+        cpu["summary"] = summary;
+        cpu["timing"] = timing;
+        cpu["recording"] = recording;
+        if scope == "recorded" && !boundary_complete && cpu["coverage"]["state"] == "complete" {
+            cpu["coverage"]["state"] = json!("partial");
+            cpu["coverage"]["reason"] =
+                json!("Missing timeline detail can understate the recorded work boundary");
+        }
+        Ok(cpu)
+    }
+    pub(crate) fn cpu_speedscope(&self, run: &str, attempt: u64, scope: &str) -> Result<Value> {
+        crate::cpu::speedscope(&self.cpu(run, attempt, scope)?)
     }
     pub(crate) fn search(&self, query: &str) -> Result<Value> {
         ensure!(query.len() <= 64, "query too long");

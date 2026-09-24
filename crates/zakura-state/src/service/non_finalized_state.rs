@@ -477,7 +477,7 @@ impl NonFinalizedState {
 
             // Add the new chain fork or updated chain to the set of recent chains, and
             // remove the chain containing the hash of the block from chain set
-            self.insert_with(Arc::new(new_chain.clone()), |chain_set| {
+            self.insert_with(Arc::new(new_chain), |chain_set| {
                 chain_set.retain(|c| !c.contains_block_hash(block_hash))
             });
 
@@ -773,7 +773,12 @@ impl NonFinalizedState {
 
     /// Validate `contextual` and update `new_chain`, doing CPU-intensive work in parallel batches.
     #[allow(clippy::unwrap_in_result)]
-    #[tracing::instrument(skip(new_chain, sprout_final_treestates))]
+    // Referenced output scripts can dwarf the block's wire size. Keep their
+    // Debug representation out of span fields, including retained span traces.
+    #[tracing::instrument(
+        skip(new_chain, contextual, sprout_final_treestates),
+        fields(height = ?contextual.height, hash = ?contextual.hash)
+    )]
     fn validate_and_update_parallel(
         new_chain: Arc<Chain>,
         contextual: ContextuallyVerifiedBlock,

@@ -1,6 +1,8 @@
 #![allow(clippy::unwrap_in_result)]
 
 mod prop;
+mod shared_outputs;
+mod tracing_fields;
 mod vectors;
 
 use std::sync::Mutex;

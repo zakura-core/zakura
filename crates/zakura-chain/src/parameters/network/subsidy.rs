@@ -120,6 +120,22 @@ impl FundingStreams {
         &self.height_range
     }
 
+    /// Moves the end height of a ZIP 214 Revision 2 funding stream to the ZIP 218 third
+    /// halving, as ZIP 214 Revision 3 specifies. The start height stays as specified.
+    ///
+    /// See [`nu7_adjusted_funding_stream_height`].
+    ///
+    /// # Panics
+    ///
+    /// If the moved end height is above [`Height::MAX`]. Built-in funding stream heights are far
+    /// below `Height::MAX / NU7_POW_TARGET_SPACING_RATIO`, so this cannot happen for them.
+    pub(crate) fn with_nu7_adjusted_end_height(mut self, nu7_activation: Option<Height>) -> Self {
+        self.height_range.end =
+            nu7_adjusted_funding_stream_height(self.height_range.end, nu7_activation)
+                .expect("built-in funding stream end heights stay below Height::MAX after NU7");
+        self
+    }
+
     /// Returns recipients of these [`FundingStreams`].
     pub fn recipients(&self) -> &HashMap<FundingStreamReceiver, FundingStreamRecipient> {
         &self.recipients
@@ -318,7 +334,9 @@ impl ParameterSubsidy for Network {
 /// > AddressPeriod(height) := floor((NU7PoWTargetSpacingRatio · (A + PostBlossomHalvingInterval
 /// > − FirstHalvingHeight) + (height − A)) / (NU7PoWTargetSpacingRatio · FSRecipientChangeInterval))
 ///
-/// Both cases agree at `A`.
+/// Both cases agree at `A`. A funding stream boundary that
+/// [`nu7_adjusted_funding_stream_height`] moves keeps its old address period, so a stream
+/// needs the same number of recipient addresses after ZIP 218 as before it.
 ///
 /// [7.10]: https://zips.z.cash/protocol/protocol.pdf#fundingstreams
 pub fn funding_stream_address_period<N: ParameterSubsidy>(
@@ -349,6 +367,38 @@ pub fn funding_stream_address_period<N: ParameterSubsidy>(
         }
         _ => period_offset(height).div_euclid(change_interval),
     }
+}
+
+/// Returns the height that a funding stream end height moves to under ZIP 218.
+///
+/// ZIP 218 shortens the target spacing at NU7 activation `A` from 75 to 25 seconds, so the
+/// halvings after `A` move to keep their dates. [ZIP 1016] ends the ZIP 214 Revision 2 funding
+/// streams at the third halving, so ZIP 214 Revision 3 ([zips#1370]) moves an end height above
+/// `A` to
+///
+/// > A + NU7PoWTargetSpacingRatio · (height − A)
+///
+/// which is `HeightForHalving(3)` for the Revision 2 end heights. End heights at or below `A`,
+/// and all end heights on a network without NU7, stay where they are.
+///
+/// Returns `None` if the moved height is above [`Height::MAX`].
+///
+/// [ZIP 1016]: https://zips.z.cash/zip-1016
+/// [zips#1370]: https://github.com/zcash/zips/pull/1370
+pub fn nu7_adjusted_funding_stream_height(
+    height: Height,
+    nu7_activation: Option<Height>,
+) -> Option<Height> {
+    let Some(nu7_activation) = nu7_activation.filter(|nu7_activation| *nu7_activation < height)
+    else {
+        return Some(height);
+    };
+
+    (height.0 - nu7_activation.0)
+        .checked_mul(NU7_POW_TARGET_SPACING_RATIO)
+        .and_then(|blocks| nu7_activation.0.checked_add(blocks))
+        .map(Height)
+        .filter(|height| *height <= Height::MAX)
 }
 
 /// The first block height of the halving at the provided halving index for a network.

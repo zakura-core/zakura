@@ -27,6 +27,11 @@ pub(crate) const PRE_BLOSSOM_HALVING_INTERVAL: HeightDiff = 840_000;
 pub(crate) const POST_BLOSSOM_HALVING_INTERVAL: HeightDiff =
     PRE_BLOSSOM_HALVING_INTERVAL * (BLOSSOM_POW_TARGET_SPACING_RATIO as HeightDiff);
 
+/// The index of the ZIP 214 Revision 2 funding streams in the built-in funding stream lists.
+///
+/// ZIP 214 Revision 3 moves only the end height of these streams.
+pub(crate) const REVISION_2_FUNDING_STREAMS_INDEX: usize = 2;
+
 /// Denominator as described in [protocol specification §7.10.1][7.10.1].
 ///
 /// [7.10.1]: https://zips.z.cash/protocol/protocol.pdf#zip214fundingstreams

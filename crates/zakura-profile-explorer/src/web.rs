@@ -70,6 +70,33 @@ async fn detail(State(app): State<App>, Path((run, attempt)): Path<(String, u64)
 async fn search(State(app): State<App>, Query(q): Query<Search>) -> ApiResult {
     app.read(move |r| r.search(&q.q)).await
 }
+#[derive(Deserialize)]
+struct CpuQuery {
+    #[serde(default = "recorded_scope")]
+    scope: String,
+}
+fn recorded_scope() -> String {
+    "recorded".into()
+}
+async fn cpu(
+    State(app): State<App>,
+    Path((run, attempt)): Path<(String, u64)>,
+    Query(q): Query<CpuQuery>,
+) -> ApiResult {
+    app.read(move |r| r.cpu(&run, attempt, &q.scope)).await
+}
+async fn cpu_profile(
+    State(app): State<App>,
+    Path((run, attempt)): Path<(String, u64)>,
+    Query(q): Query<CpuQuery>,
+) -> ApiResult {
+    app.read(move |r| r.cpu_speedscope(&run, attempt, &q.scope))
+        .await
+}
+async fn viewer_asset(Path(asset): Path<String>) -> Response {
+    include!("../web/vendor/speedscope/routes.rs")
+}
+
 async fn trace(State(app): State<App>, Path((run, attempt)): Path<(String, u64)>) -> ApiResult {
     app.read(move |r| {
         let detail = r.detail(&run,attempt)?;
@@ -100,6 +127,12 @@ pub(crate) async fn serve(path: PathBuf, port: u16) -> Result<()> {
         .route("/block/{run}/{attempt}",get(|| async { Html(include_str!("../web/block.html")) }))
         .route("/app.js",get(|| async { ([(header::CONTENT_TYPE,"text/javascript")],include_str!("../web/app.js")) }))
         .route("/style.css",get(|| async { ([(header::CONTENT_TYPE,"text/css")],include_str!("../web/style.css")) }))
+        .route("/cpu/{run}/{attempt}",get(|| async { Html(include_str!("../web/cpu.html")) }))
+        .route("/cpu.js",get(|| async { ([(header::CONTENT_TYPE,"text/javascript")],include_str!("../web/cpu.js")) }))
+        .route("/cpu.css",get(|| async { ([(header::CONTENT_TYPE,"text/css")],include_str!("../web/cpu.css")) }))
+        .route("/cpu-viewer/{asset}",get(viewer_asset))
+        .route("/api/cpu/{run}/{attempt}",get(cpu))
+        .route("/api/cpu-profile/{run}/{attempt}",get(cpu_profile))
         .route("/api/home",get(home)).route("/api/search",get(search))
         .route("/api/attempt/{run}/{attempt}",get(detail))
         .route("/api/trace/{run}/{attempt}",get(trace))
@@ -108,9 +141,16 @@ pub(crate) async fn serve(path: PathBuf, port: u16) -> Result<()> {
             // Restrict browser access to the forwarded localhost origin. No public controls.
             let allowed = request.headers().get(header::HOST).and_then(|h|h.to_str().ok()).is_some_and(|h| h.starts_with("127.0.0.1:") || h.starts_with("localhost:"));
             if !allowed { return StatusCode::FORBIDDEN.into_response(); }
+            let viewer = request.uri().path().starts_with("/cpu-viewer/");
             let mut response: Response = next.run(request).await;
-            for (key,value) in [ ("content-security-policy","default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'"), ("x-content-type-options","nosniff"), ("cache-control","no-store") ] {
-                response.headers_mut().insert(axum::http::HeaderName::from_static(key),axum::http::HeaderValue::from_static(value));
+            // Speedscope generates styles, and is embedded only by this same-origin viewer.
+            let csp = if viewer {
+                "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'; frame-ancestors 'self'; base-uri 'none'"
+            } else {
+                "default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'"
+            };
+            for (key,value) in [ ("content-security-policy",csp), ("x-content-type-options","nosniff"), ("cache-control","no-store") ] {
+                response.headers_mut().insert(axum::http::HeaderName::from_static(key),axum::http::HeaderValue::from_str(value).expect("static policy header is valid"));
             }
             response
         }));

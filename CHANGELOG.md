@@ -27,8 +27,9 @@ independently.
   resolve the latest recording, including links to older recordings. Known
   measurement interference is labeled and excluded from timing statistics, and
   bounded collector batches and background retries on full sockets reduce
-  capture loss. CPU sampling and flamegraphs
-  are reserved for explicitly requested diagnostic sessions. Startup profiles
+  capture loss. Optional continuous CPU sampling provides full-page interactive
+  flame graphs for newly captured blocks, with readable function labels, full
+  symbol inspection, and explicit sample coverage. Startup profiles
   remain searchable but are excluded from slow blocks and latency statistics
   until verifier initialization, catch-up, and a quiet settling period finish.
   The experimental shielded batch breakdown was withdrawn. Existing captures

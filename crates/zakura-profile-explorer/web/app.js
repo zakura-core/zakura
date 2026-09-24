@@ -87,6 +87,9 @@ async function openDetail(run,attempt) {
   $('detail').hidden=false; $('detail-title').textContent=`Block ${number(row.height)}`;
   document.title=`Block ${number(row.height)} · Zakura`;
   renderMetadata(row,data.recording);
+  $('cpu-link').hidden=!['available','pending'].includes(data.cpu?.status);
+  $('cpu-link').textContent=data.cpu?.status==='pending'?'CPU profile processing…':'CPU flame graph';
+  $('cpu-link').href=`/cpu/${encodeURIComponent(row.run)}/${encodeURIComponent(row.attempt)}`;
   const blockExplorer=explorerUrl(data.recording.network,'block',row.hash);
   $('block-explorer').replaceChildren(...(blockExplorer?[explorerLink(blockExplorer,`block ${number(row.height)}`)]:[]));
   $('detail-warning').hidden=!row.exclusion_reason && !row.startup;

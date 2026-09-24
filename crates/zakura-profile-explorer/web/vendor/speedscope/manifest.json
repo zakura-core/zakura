@@ -1,0 +1,31 @@
+{
+  "project": "https://github.com/jlfwong/speedscope",
+  "version": "1.25.0",
+  "commit": "810efdf0a4868bb28f1300f4daacd0db6b8a95bd",
+  "license": "MIT",
+  "package_lock_sha256": "e7b5273e8513b7dff511aa45003e492255b5227492dcd08d7037cc665cd8d96f",
+  "node": "24.7.0",
+  "npm": "11.5.1",
+  "files": {
+    "LICENSE": "6244b13e9bf25cfd42d81c939d6c535d932596e8c320050234f2c2ac5a6f36a0",
+    "README.md": "ba84cdd550a30347c30ae63dfd5af9d4c912d0796b2ebd39004270c3c06ef587",
+    "SourceCodePro-Regular.ttf-ILST5JV6.woff2": "8badfe75c98da1e8315a52619f177def4618350f7b3e496baf5b8894da2c2ac0",
+    "chunk-FW4363Y4.js": "455da7cd03013fac5a4abd7a1e875326ee48c1a8f44ec9920aebc3964c54ae78",
+    "chunk-PIR2RKP7.js": "30275bb3972095c09f7488e66c613db5322e3474862f61a27fe1c7e6fecbfa8f",
+    "compact-labels.patch": "3d80d2a56ab855d25e2832eb9dca3734b4f26c3ddd82e0e53fb53e552a86226f",
+    "favicon-16x16-6PS2IAOI.js": "9172236551e230f4b181dc5ddec5e70412584ded1cd34fe90e19ab3115af9697",
+    "favicon-16x16-VSI62OPJ.png": "a62a6da7742b43ee798b106b709aa82eafd1b500ef050427cfec05e4d41dacac",
+    "favicon-32x32-3EB2YCUY.png": "9ea6e6d13b7b8064187866deba1e8674d8ba25071279ba7b15f34b54df2508d0",
+    "favicon-32x32-QBAZQQKX.js": "e326f34dc2a6e84bfb94776b6a7b01f5ddf2e8d555c045f424e8d77b9fe33357",
+    "favicon-3JMDIDSO.js": "3b7c54728f12d232049efff19373173535c1a8e4e0f41ff7d35c4325ad9b02c0",
+    "favicon-FOKUP5Y5.ico": "45701858a8fe9daccd63d2cb5749fdbd155a471b5fc391d04f3f61d18a9efcdd",
+    "import-BTQ4TV45.js": "4e4963fec29385e3b51c13bb45df69c1147dd3ff4d4155b52090497c4bfb93d4",
+    "index.html": "bf8d05d0f889dda0b199f9ecf129dd230223c4c4bddf72aa66eac15736a8c160",
+    "jfrview_bg-BLJXNNQB.wasm": "8538ff05a6a76f6bb3177aa0841d54dba92db6cb6435a4917fa4d25d908092c6",
+    "perf-vertx-stacks-01-collapsed-all-ZNUIGAJL.txt": "dedaa1c8055267638030efa25081116105fd0e357944cefc0974e792dfcabedd",
+    "source-code-pro.LICENSE.md": "2e14ee65e55dbcc7d66347cd7c76a10a1a18ac49dd7989a2b3838b479676f746",
+    "source-map-MNRU3M6F.js": "19ee8cef36c64ecca3a1caf96fe4f635913f99704404a80c9d8beee62eb736bd",
+    "speedscope-CDCT45LR.css": "432a53b84ac30e7dddca74a2df051080823a5407139d921b26b9cd79847cd549",
+    "speedscope-SVRFROHV.js": "eee4b6a2adb877e216582a7025294b32610ffd878053a5ecc3c629374fb5a8c8"
+  }
+}

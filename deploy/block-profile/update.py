@@ -61,7 +61,7 @@ def main():
     print(f'Main base {base}\nInstrumented commit {revision}', flush=True)
     if args.prepare_only:
         return
-    command(['node', '--test', str(root / 'crates/zakura-profile-explorer/web/app.test.cjs')])
+    command(['node', '--test', str(root / 'crates/zakura-profile-explorer/web/app.test.cjs'), str(root / 'crates/zakura-profile-explorer/web/cpu.test.cjs')])
     ssh = ['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=15']
     if config.get('ssh_config'):
         ssh += ['-F', str(Path(config['ssh_config']).expanduser())]

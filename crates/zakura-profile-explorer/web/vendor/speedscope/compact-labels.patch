@@ -1,0 +1,130 @@
+diff --git a/src/lib/compact-frame.ts b/src/lib/compact-frame.ts
+new file mode 100644
+index 0000000..40b84b5
+--- /dev/null
++++ b/src/lib/compact-frame.ts
+@@ -0,0 +1,20 @@
++// Display only. Frame keys, search, exports and inspection keep the full symbol.
++export function compactFrame(name: string): string {
++  const symbol = name.replace(/ \(.*\)$/, '').replace(/::h[0-9a-f]{16}$/, '')
++  const qualified = symbol.startsWith('<')
++  const visibleDepth = qualified ? 1 : 0
++  let compact = '', depth = 0
++  for (const char of symbol) {
++    if (char === '<') {
++      if (depth === visibleDepth) compact += '<…>'
++      else if (qualified && depth === 0) compact += '<'
++      depth++
++    } else if (char === '>' && depth > 0) {
++      depth--
++      if (qualified && depth === 0) compact += '>'
++    } else if (depth <= visibleDepth) compact += char
++  }
++  if (qualified) return compact
++  const parts = compact.split('::')
++  return parts.length > 4 ? parts[0] + '::…::' + parts.slice(-3).join('::') : compact
++}
+diff --git a/src/lib/profile.ts b/src/lib/profile.ts
+index e34ac58..2c5a6f1 100644
+--- a/src/lib/profile.ts
++++ b/src/lib/profile.ts
+@@ -401,25 +401,9 @@ export class Profile {
+     return ret
+   }
+ 
+-  // Demangle symbols for readability
+-  async demangle() {
+-    let demangle: ((name: string) => string) | null = null
+-
+-    for (let frame of this.frames) {
+-      // This function converts a mangled C++ and Rust name into a human-readable symbol.
+-      if (
+-        frame.name.startsWith('__Z') ||
+-        frame.name.startsWith('_R') ||
+-        frame.name.startsWith('_Z')
+-      ) {
+-        if (!demangle) {
+-          const demangleModule = await import('./demangle')
+-          demangle = await demangleModule.loadDemangling()
+-        }
+-        frame.name = demangle(frame.name)
+-      }
+-    }
+-  }
++  // Zakura already supplies bounded demangled names and retains raw symbols separately.
++  // Do not load the redundant WASM demangler or alter canonical frame names here.
++  async demangle() {}
+ 
+   remapSymbols(callback: SymbolRemapper) {
+     for (let frame of this.frames) {
+diff --git a/src/views/application.tsx b/src/views/application.tsx
+index be24242..c2cb5c6 100644
+--- a/src/views/application.tsx
++++ b/src/views/application.tsx
+@@ -28,7 +28,7 @@ const importModule = import('../import')
+ // We put them all in one place so we can directly control the relative priority
+ // of these.
+ importModule.then(() => {})
+-import('../lib/demangle').then(() => {})
++// The host supplies canonical demangled names; no WASM demangler preload.
+ import('source-map').then(() => {})
+ 
+ async function importProfilesFromText(
+diff --git a/src/views/flamechart-pan-zoom-view.tsx b/src/views/flamechart-pan-zoom-view.tsx
+index 78e7cf1..83d30ad 100644
+--- a/src/views/flamechart-pan-zoom-view.tsx
++++ b/src/views/flamechart-pan-zoom-view.tsx
+@@ -1,3 +1,4 @@
++import {compactFrame} from '../lib/compact-frame'
+ import {Rect, AffineTransform, Vec2, clamp} from '../lib/math'
+ import {CallTreeNode} from '../lib/profile'
+ import {Flamechart, FlamechartFrame} from '../lib/flamechart'
+@@ -235,7 +236,7 @@ export class FlamechartPanZoomView extends Component<FlamechartPanZoomViewProps,
+ 
+           const trimmedText = trimTextMid(
+             ctx,
+-            frame.node.frame.name,
++            match ? frame.node.frame.name : compactFrame(frame.node.frame.name),
+             physicalLabelBounds.width() - 2 * LABEL_PADDING_PX,
+           )
+ 
+diff --git a/src/views/profile-table-view.tsx b/src/views/profile-table-view.tsx
+index 9a429dc..67c6485 100644
+--- a/src/views/profile-table-view.tsx
++++ b/src/views/profile-table-view.tsx
+@@ -1,3 +1,4 @@
++import {compactFrame} from '../lib/compact-frame'
+ import {h, JSX, ComponentChild} from 'preact'
+ import {StyleSheet, css} from 'aphrodite'
+ import {Profile, Frame} from '../lib/profile'
+@@ -131,7 +132,7 @@ const ProfileTableRowView = ({
+         {profile.formatValue(selfWeight)} ({formatPercent(selfPerc)})
+         <HBarDisplay perc={selfPerc} />
+       </td>
+-      <td title={frame.file} className={css(style.textCell)}>
++      <td title={frame.name} className={css(style.textCell)}>
+         <ColorChit color={getCSSColorForFrame(frame)} />
+         {matchedRanges
+           ? highlightRanges(
+@@ -139,7 +140,7 @@ const ProfileTableRowView = ({
+               matchedRanges,
+               css(style.matched, selected && style.matchedSelected),
+             )
+-          : frame.name}
++          : compactFrame(frame.name)}
+       </td>
+     </tr>
+   )
+diff --git a/src/views/toolbar.tsx b/src/views/toolbar.tsx
+index a47372c..562076f 100644
+--- a/src/views/toolbar.tsx
++++ b/src/views/toolbar.tsx
+@@ -39,7 +39,7 @@ function ToolbarLeftContent(props: ToolbarProps) {
+         )}
+         onClick={setChronoFlameChart}
+       >
+-        <span className={css(style.emoji)}>🕰</span>Time Order
++        <span className={css(style.emoji)}>🕰</span>Sample Order
+       </div>
+       <div
+         className={css(

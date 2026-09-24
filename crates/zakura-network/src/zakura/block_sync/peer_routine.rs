@@ -444,6 +444,7 @@ impl PeerRoutine {
         // `self.work`.
         let budget = self.budget.clone();
         let work = self.work.clone();
+        let registry = Arc::clone(&self.registry);
         // Per-peer BBR heartbeat cadence. `Skip` so a routine busy past a tick emits one
         // fresh sample rather than a catch-up burst. Observability only.
         let mut bbr_trace_ticks = time::interval(BBR_TRACE_INTERVAL);
@@ -452,17 +453,20 @@ impl PeerRoutine {
             if self.cancel.is_cancelled() {
                 return Ok(());
             }
-            // missed-wake safety: register both `Notify`s via
-            // `Notified::enable()` BEFORE the fill attempt. The budget/work
+            // missed-wake safety: register all `Notify`s via
+            // `Notified::enable()` BEFORE the fill attempt. These
             // `Notify`s use `notify_waiters` (no stored permit), so a
             // release/extend that lands between the fill-check and the await
             // would be lost if we registered after — the routine would stall.
             let capacity = budget.subscribe_capacity().notified();
             let available = work.subscribe_available().notified();
+            let floor_ranking = registry.subscribe_floor_ranking().notified();
             tokio::pin!(capacity);
             tokio::pin!(available);
+            tokio::pin!(floor_ranking);
             Notified::enable(capacity.as_mut());
             Notified::enable(available.as_mut());
+            Notified::enable(floor_ranking.as_mut());
 
             self.flush_pending_status();
             let retry_filter_deadline = if self.session.outbound_capacity() > 0 {
@@ -521,6 +525,9 @@ impl PeerRoutine {
                 }
                 _ = &mut available => {
                     self.trace_wake("work_added");
+                }
+                _ = &mut floor_ranking => {
+                    self.trace_wake("floor_ranking_changed");
                 }
                 _ = bbr_trace_ticks.tick() => self.trace_bbr_sample(),
                 _ = &mut outbound_queue_poll, if !outbound_queue_has_capacity => {}
@@ -2437,6 +2444,120 @@ mod tests {
             ZakuraTrace::noop(),
         );
         (routine, out_recv, routine_to_reactor_rx)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn floor_ranking_change_wakes_a_deferred_routine() {
+        use super::super::peer_registry::SlotDiagnostics;
+
+        let (mut slow, mut outbound, _reactor_events) = status_test_routine();
+        // Keep the input streams open while driving the real wait loop.
+        let (_in_send, in_recv) = framed_channel(16);
+        slow.recv = in_recv;
+        let (_view_tx, view_rx) = watch::channel(*slow.sequencer_view.borrow());
+        slow.sequencer_view = view_rx;
+        slow.received_status = true;
+        slow.servable_low = block::Height(1);
+        slow.servable_high = block::Height(10);
+
+        let registry = Arc::clone(&slow.registry);
+        let work = Arc::clone(&slow.work);
+        let slow_peer = slow.peer.clone();
+        let slow_generation = slow.generation;
+        let cancel = slow.cancel.clone();
+        let fast_peer = ZakuraPeerId::new(vec![8; 32]).unwrap();
+        let fast_generation = registry
+            .admit_session(
+                &fast_peer,
+                slow.session.direction(),
+                &slow.config,
+                0,
+                Instant::now(),
+            )
+            .generation();
+        for (peer, generation) in [(&slow_peer, slow_generation), (&fast_peer, fast_generation)] {
+            registry.upsert_status(
+                peer,
+                generation,
+                BlockSyncStatus {
+                    servable_low: block::Height(0),
+                    servable_high: block::Height(10),
+                    ..BlockSyncStatus::default()
+                },
+            );
+        }
+
+        let mut running = Box::pin(slow.run());
+        assert!(futures::poll!(running.as_mut()).is_pending());
+        // Consume the initial heartbeat before publishing the two finite scores.
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert!(futures::poll!(running.as_mut()).is_pending());
+        let before_refill = tokio::time::Instant::now();
+        let slots = SlotDiagnostics {
+            available_slots: 3,
+            bbr_rtprop_ms: Some(75),
+            ..SlotDiagnostics::default()
+        };
+        registry.publish_slots(&fast_peer, fast_generation, slots);
+        registry.publish_slots(
+            &slow_peer,
+            slow_generation,
+            SlotDiagnostics {
+                bbr_rtprop_ms: Some(145),
+                ..slots
+            },
+        );
+        work.extend(
+            super::super::test_work_scope(),
+            [(
+                block::Height(1),
+                block::Hash([1; 32]),
+                BlockSizeEstimate::Advertised(1_000),
+            )],
+        );
+
+        // The slow worker sees the faster carrier and goes back to sleep.
+        assert!(futures::poll!(running.as_mut()).is_pending());
+        assert!(outbound.try_recv().is_err());
+        assert!(work.pending_contains(block::Height(1)));
+
+        registry.publish_slots(
+            &fast_peer,
+            fast_generation,
+            SlotDiagnostics {
+                bbr_rtprop_ms: None,
+                ..slots
+            },
+        );
+        assert!(registry.floor_has_preferred_unsaturated_server(
+            block::Height(0),
+            &fast_peer,
+            None,
+            false
+        ));
+
+        // The fast worker now defers to the sleeping slow worker. Only the
+        // ranking update can wake it: no work, capacity, view, or timer changed.
+        assert!(futures::poll!(running.as_mut()).is_pending());
+        let frame = outbound
+            .try_recv()
+            .expect("a ranking change must wake the deferred worker");
+        assert!(matches!(
+            BlockSyncMessage::decode_frame(frame).unwrap(),
+            BlockSyncMessage::GetBlocks {
+                start_height: block::Height(1),
+                count: 1
+            }
+        ));
+        assert!(work.in_flight_contains(block::Height(1)));
+        assert!(!work.pending_contains(block::Height(1)));
+        assert_eq!(tokio::time::Instant::now(), before_refill);
+
+        cancel.cancel();
+        assert!(timeout(Duration::from_secs(1), running)
+            .await
+            .unwrap()
+            .is_ok());
     }
 
     #[tokio::test]

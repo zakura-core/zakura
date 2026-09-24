@@ -2649,13 +2649,8 @@ impl HeaderChainRuntime {
                 ));
             }
         };
-        let checkpoint_headers_are_retained = match &checkpoint_request.event {
-            TransitionEvent::VerifiedChainChanged(event) => event
-                .new_path
-                .iter()
-                .all(|header| transition_engine.graph().header_node(header.hash).is_some()),
-            _ => false,
-        };
+        let checkpoint_headers_are_retained =
+            retained_checkpoint_headers(&transition_engine, &checkpoint_request.event);
         // Header sync normally admits headers before native checkpoint growth promotes them.
         // Only a missing header needs contextual validation and a validation lease.
         let validation_leases = if checkpoint_headers_are_retained {
@@ -2812,7 +2807,9 @@ impl HeaderChainRuntime {
         request: TransitionRequest,
         before: &EngineSnapshot,
         network: &Network,
+        engine: &HeaderChainEngine,
     ) -> Result<TransitionInput, HeaderChainStoreError> {
+        let retained_checkpoint = retained_checkpoint_headers(engine, &request.event);
         let expected_version = request.expected_version;
         Ok(match request.event {
             TransitionEvent::InsertHeaders(event) => {
@@ -2857,9 +2854,11 @@ impl HeaderChainRuntime {
                     expected_version,
                     event,
                     facts: HeaderValidationFacts {
-                        validation_leases: vec![self
-                            .store
-                            .validation_context(parent.hash, network)?],
+                        validation_leases: if retained_checkpoint {
+                            Vec::new()
+                        } else {
+                            vec![self.store.validation_context(parent.hash, network)?]
+                        },
                     },
                 }
             }
@@ -3209,7 +3208,12 @@ impl HeaderChainRuntime {
                 }
             }
         }
-        let input = self.build_transition_input(request, &before, base_context.config.network())?;
+        let input = self.build_transition_input(
+            request,
+            &before,
+            base_context.config.network(),
+            &transition_engine,
+        )?;
         let validation_leases = input
             .header_validation_facts()
             .map(|facts| facts.validation_leases.clone())
@@ -6154,6 +6158,16 @@ impl HeaderChainStore {
         })?;
         Ok(found)
     }
+}
+
+// Retained checkpoint headers already carry contextual validation. The planner still
+// checks their exact identity, continuity, and eligibility before advancing finality.
+// Assumes checkpoint commits carry no retention references; one authenticated only by
+// the skipped parent lease would fail closed with `TransitionFailure::Authority`.
+fn retained_checkpoint_headers(engine: &HeaderChainEngine, event: &TransitionEvent) -> bool {
+    matches!(event, TransitionEvent::VerifiedChainChanged(event)
+        if event.cause == VerifiedChangeCause::CheckpointFinalizedGrow
+            && event.new_path.iter().all(|header| engine.graph().header_node(header.hash).is_some()))
 }
 
 fn authenticated_context_headers(

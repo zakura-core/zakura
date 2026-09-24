@@ -895,8 +895,10 @@ async fn fork_eviction_allows_new_and_replayed_parents_to_extend() {
     template.transactions = vec![Arc::new(transaction_v4_from_coinbase(
         &template.transactions[0],
     ))];
-    let siblings =
+    let mut siblings =
         Arc::new(template).make_fake_siblings(crate::constants::MAX_NON_FINALIZED_CHAIN_FORKS + 1);
+    // Receipt order deliberately opposes the hash tie-breaker.
+    siblings.reverse();
     let evicted = &siblings[siblings.len() - 2];
     // Record a temporary failure before this block succeeds on its next attempt.
     state.handle_non_finalized_write_update(NonFinalizedWriteUpdate::Failed(
@@ -906,7 +908,8 @@ async fn fork_eviction_allows_new_and_replayed_parents_to_extend() {
         },
     ));
     for (order, block) in siblings.iter().enumerate() {
-        let prepared = block.clone().prepare();
+        let mut prepared = block.clone().prepare();
+        prepared.receipt_order = Some(u64::try_from(order).unwrap());
         tokio::time::timeout(
             Duration::from_secs(10),
             state.queue_and_commit_to_non_finalized_state(prepared, None),
@@ -1028,7 +1031,10 @@ async fn assert_reconsideration_eviction_replay(header_runtime: bool) {
     header.commitment_bytes =
         <[u8; 32]>::from(state.read_service.db.history_tree().hash().unwrap()).into();
 
-    let siblings = template.make_fake_siblings(crate::constants::MAX_NON_FINALIZED_CHAIN_FORKS + 1);
+    let mut siblings =
+        template.make_fake_siblings(crate::constants::MAX_NON_FINALIZED_CHAIN_FORKS + 1);
+    // Receipt order deliberately opposes the hash tie-breaker.
+    siblings.reverse();
     for (order, block) in siblings.iter().enumerate() {
         if order == crate::constants::MAX_NON_FINALIZED_CHAIN_FORKS {
             timeout(limit, state.send_invalidate_block(siblings[0].hash()))
@@ -1037,7 +1043,8 @@ async fn assert_reconsideration_eviction_replay(header_runtime: bool) {
                 .unwrap()
                 .unwrap();
         }
-        let prepared = block.clone().prepare();
+        let mut prepared = block.clone().prepare();
+        prepared.receipt_order = Some(u64::try_from(order).unwrap());
         timeout(
             limit,
             state.queue_and_commit_to_non_finalized_state(prepared, None),
@@ -1087,7 +1094,8 @@ async fn assert_reconsideration_eviction_replay(header_runtime: bool) {
         .non_finalized_failed_ancestors
         .contains_key(&evicted.hash()));
 
-    let prepared = evicted.clone().prepare();
+    let mut prepared = evicted.clone().prepare();
+    prepared.receipt_order = Some(u64::try_from(siblings.len()).unwrap());
     timeout(
         limit,
         state.queue_and_commit_to_non_finalized_state(prepared, None),

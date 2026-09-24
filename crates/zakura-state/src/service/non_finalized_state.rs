@@ -346,8 +346,8 @@ impl NonFinalizedState {
     /// Finalize the lowest height block in the non-finalized portion of the best
     /// chain and update all side-chains to match.
     pub fn finalize(&mut self) -> FinalizableBlock {
-        // Chain::cmp uses the partial cumulative work, and the hash of the tip block.
-        // Neither of these fields has interior mutability.
+        // Chain::cmp uses the partial cumulative work, receipt order, and the hash of the tip block.
+        // None of these fields has interior mutability.
         // (And when the tip block is dropped for a chain, the chain is also dropped.)
         #[allow(clippy::mutable_key_type)]
         let chains = mem::take(&mut self.chain_set);
@@ -673,10 +673,17 @@ impl NonFinalizedState {
     fn validate_and_commit(
         &self,
         new_chain: Arc<Chain>,
-        prepared: SemanticallyVerifiedBlock,
+        mut prepared: SemanticallyVerifiedBlock,
         finalized_state: &ZakuraDb,
         contextual_metrics: ContextualMetrics,
     ) -> Result<Arc<Chain>, ValidateContextError> {
+        // Re-delivery cannot change the ordering key of a retained block.
+        if let Some(chain) = self.find_chain(|chain| chain.contains_block_hash(prepared.hash)) {
+            prepared.receipt_order = chain
+                .block(prepared.hash.into())
+                .expect("the selected chain contains this block")
+                .receipt_order;
+        }
         if self
             .invalidated_blocks
             .values()
@@ -898,7 +905,7 @@ impl NonFinalizedState {
     /// Returns the first chain satisfying the given predicate.
     ///
     /// If multiple chains satisfy the predicate, returns the chain with the highest difficulty.
-    /// (Using the tip block hash tie-breaker.)
+    /// (Using receipt order, then tip hash to break ties.)
     pub fn find_chain<P>(&self, mut predicate: P) -> Option<Arc<Chain>>
     where
         P: FnMut(&Chain) -> bool,

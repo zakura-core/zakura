@@ -14,7 +14,8 @@ name: Deploy Zakura mainnet fleet
 # state DB at /root/.cache/zebra. To avoid changing node identities or resyncing,
 # this deploy sets manage_config = false: it only swaps /usr/local/bin/zakurad and
 # restarts the existing `zakurad` service, leaving the config, unit, and cache
-# untouched. Rebuilding those configs into the deployer's managed model is
+# untouched. The archive publisher also installs its matching exporter and
+# verifies publication. Rebuilding configs into the deployer's managed model is
 # separate future work.
 #
 # After PR #21, hand configs should use network.p2p_stack (legacy|zakura|dual|
@@ -61,7 +62,7 @@ jobs:
   deploy:
     name: "Deploy Zakura mainnet ${{ inputs.ref }}"
     runs-on: [self-hosted, "${{ vars.ZAKURA_MAINNET_RUNNER_LABEL || 'zakura-mainnet-deployer' }}"]
-    timeout-minutes: 180
+    timeout-minutes: 600
     environment: zakura-mainnet
 
     # Persist Cargo build artifacts across runs, outside the checked-out workspace
@@ -99,27 +100,28 @@ jobs:
             exit 1
           fi
 
-      - name: Checkout deploy ref
+      - name: Checkout deployment tooling
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
         with:
           persist-credentials: false
-          ref: ${{ inputs.ref }}
+          ref: ${{ github.sha }}
+          fetch-depth: 0
 
-      - name: Verify deployer supports binary-only mode
-        # The checked-out deploy.py comes from `inputs.ref`; this fleet's config
-        # sets `manage_config = false`. If the checked-out deploy.py predates that
-        # support it would silently run a destructive config-managed deploy, so
-        # fail fast instead. deploy.py also now rejects unknown config keys.
+      # Keep orchestration from this workflow revision even when deploying an old
+      # release. Only the binaries come from the requested ref.
+      - name: Resolve deployment commit
         env:
           REF: ${{ inputs.ref }}
+          NODE: ${{ inputs.node }}
+          NO_RESTART: ${{ inputs.no_restart }}
         run: |
           set -euo pipefail
-          if ! grep -q 'manage_config' deploy/deployer/deploy.py ||
-             ! grep -q 'container_name' deploy/deployer/deploy.py; then
-            echo "::error::deploy.py at ref '${REF}' lacks binary-only Docker support." \
-                 "Deploy from a ref whose deploy.py supports manage_config and container_name."
+          if [ "$NO_RESTART" = true ] && { [ -z "$NODE" ] || [ "$NODE" = archive-vct-off ]; }; then
+            echo "Archive publisher deployments require restarting the matched node/exporter pair." >&2
             exit 1
           fi
+          git fetch --no-tags origin "$REF"
+          echo "DEPLOY_COMMIT=$(git rev-parse 'FETCH_HEAD^{commit}')" >> "$GITHUB_ENV"
 
       - name: Set up Rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
@@ -187,6 +189,7 @@ jobs:
         run: |
           set -euo pipefail
 
+          REF="$DEPLOY_COMMIT"
           cat > nodes.ci.toml <<EOF
           [defaults]
           # Binary-only: swap the binary and restart the existing service; leave
@@ -285,6 +288,7 @@ jobs:
           # rewritten by a deploy; that setting is the whole point of the node.
           [[nodes]]
           name       = "archive-vct-off"
+          release_state_publisher = true
           ssh_string = "root@104.131.174.28"
           commit     = "${REF}"
           rpc_listen_addr = "127.0.0.1:8232"
@@ -398,7 +402,7 @@ jobs:
           python3 deploy.py status "${args[@]}"
 
       - name: Validate deployed node startup
-        if: ${{ inputs.validate_start && inputs.node != '' && !inputs.no_restart }}
+        if: ${{ inputs.validate_start && inputs.node != '' && inputs.node != 'archive-vct-off' && !inputs.no_restart }}
         env:
           NODE: ${{ inputs.node }}
         run: |
@@ -441,7 +445,7 @@ jobs:
           PY
           )"
 
-          expected_commit="$(git rev-parse HEAD)"
+          expected_commit="$DEPLOY_COMMIT"
           ssh -o BatchMode=yes -o ConnectTimeout=20 -- "$SSH_TARGET" \
             "SERVICE_NAME='$SERVICE_NAME' BIN_PATH='$BIN_PATH' \
              RPC_LISTEN_ADDR='$RPC_LISTEN_ADDR' RPC_AUTH='$RPC_AUTH' \

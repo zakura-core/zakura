@@ -1317,8 +1317,10 @@ pub enum Request {
     ///
     /// This request cannot be cancelled once submitted; dropping the response
     /// future will have no effect on whether it is eventually processed. A
-    /// request to commit a block which has been queued internally but not yet
-    /// committed will fail the older request and replace it with the newer request.
+    /// request for an identical queued body fails the older request and replaces
+    /// its response channel, preserving its receipt order. Different bodies with
+    /// the same header share bounded queue capacity until contextual validation
+    /// selects a valid body. Excess bodies fail with [`crate::CommitBlockError::QueueFull`].
     ///
     /// # Correctness
     ///

@@ -2211,7 +2211,7 @@ async fn pending_commit_retry_waits_for_state_outcome() {
 
 /// A pending commit that never resolves must not hold a caller without its own timeout.
 #[tokio::test(start_paused = true)]
-async fn pending_commit_wait_reports_the_duplicate_after_its_limit() {
+async fn pending_commit_wait_reports_a_retryable_duplicate_after_its_limit() {
     let block: Block = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
         .zcash_deserialize_into()
         .unwrap();
@@ -2237,6 +2237,12 @@ async fn pending_commit_wait_reports_the_duplicate_after_its_limit() {
     assert_eq!(
         error.duplicate_location(),
         Some(&zs::KnownBlock::WriteChannel)
+    );
+    assert_eq!(
+        error.body_verification_class(),
+        zakura_header_chain::BodyVerificationClass::Retryable(
+            zakura_header_chain::TransientBodyFailureKind::VerifierUnavailable,
+        ),
     );
 }
 

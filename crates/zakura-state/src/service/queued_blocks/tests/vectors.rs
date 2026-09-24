@@ -100,66 +100,111 @@ fn dequeue_gives_right_children() -> Result<()> {
 }
 
 #[test]
-fn same_hash_replacement_preserves_receipts_only_for_identical_bodies() -> Result<()> {
+fn identical_queued_retries_preserve_receipts_and_complete_the_old_waiter() -> Result<()> {
     let block: Arc<Block> =
-        zakura_test::vectors::BLOCK_MAINNET_419200_BYTES.zcash_deserialize_into()?;
-    for (original_order, different_body) in [(Some(1), false), (None, false), (Some(1), true)] {
-        let mut replacement_block = (*block).clone();
-        if different_body {
-            replacement_block
-                .transactions
-                .push(block.transactions[0].clone());
-        }
-        let replacement_block = Arc::new(replacement_block);
-        assert_eq!(block.hash(), replacement_block.hash());
+        zakura_test::vectors::BLOCK_MAINNET_1687107_BYTES.zcash_deserialize_into()?;
+    for order in [Some(1), None] {
         let mut queue = QueuedBlocks::default();
-        let mut original = block.clone().into_queued();
-        original.0.receipt_order = original_order;
-        queue.queue(original);
-
-        // Model a redelivery that received a new verifier receipt.
-        let mut replacement = replacement_block.clone().into_queued();
-        replacement.0.receipt_order = Some(9);
-        let old = queue.replace(block.hash(), replacement);
-        assert!(Arc::ptr_eq(&old.0.block, &block));
-        let retained = queue.get_mut(&block.hash()).unwrap();
-        assert!(Arc::ptr_eq(&retained.0.block, &replacement_block));
+        let (response, mut receiver) = oneshot::channel();
+        let admission = crate::BlockAdmission::pending();
+        let mut first = block.clone().prepare();
+        first.receipt_order = order;
+        queue.queue((first, response, Some(admission), 1));
+        let mut retry = block.clone().into_queued();
+        retry.0.receipt_order = Some(9);
+        assert!(queue.can_queue(&retry.0, false));
+        queue.queue(retry);
+        assert!(matches!(receiver.try_recv(), Ok(Err(_))));
+        assert_eq!(queue.body_count, 1);
+        assert_eq!(queue.blocks[&block.hash()][0].0.receipt_order, order);
         assert_eq!(
-            retained.0.receipt_order,
-            if different_body {
-                Some(9)
-            } else {
-                original_order
-            }
+            queue.dequeue_children(block.header.previous_block_hash)[0]
+                .0
+                .receipt_order,
+            order
         );
-        let children = queue.dequeue_children(block.header.previous_block_hash);
-        assert_eq!(children.len(), 1);
-        assert_eq!(
-            children[0].0.receipt_order,
-            if different_body {
-                Some(9)
-            } else {
-                original_order
-            }
-        );
+        assert_eq!(queue.body_count, 0);
     }
     Ok(())
 }
 
 #[test]
-fn orphan_queue_has_a_fixed_entry_bound() -> Result<()> {
+fn queued_body_variants_are_bounded_and_cleaned_up_together() -> Result<()> {
+    use super::super::MAX_QUEUED_BODY_VARIANTS;
+    use crate::tests::setup::changed_coinbase_body;
     let block: Arc<Block> =
-        zakura_test::vectors::BLOCK_MAINNET_419200_BYTES.zcash_deserialize_into()?;
-    let mut queue = QueuedBlocks::default();
-    assert!(!queue.is_full());
+        zakura_test::vectors::BLOCK_MAINNET_1687107_BYTES.zcash_deserialize_into()?;
+    for cleanup in 0..4 {
+        let mut queue = QueuedBlocks::default();
+        let mut responses = Vec::new();
+        for index in 0..MAX_QUEUED_BODY_VARIANTS {
+            let body = changed_coinbase_body(&block, u8::try_from(index).unwrap());
+            let (sender, receiver) = oneshot::channel();
+            let prepared = body.prepare();
+            assert!(queue.can_queue(&prepared, false));
+            queue.queue((prepared, sender, None, 0));
+            responses.push(receiver);
+        }
+        assert_eq!(queue.body_count, MAX_QUEUED_BODY_VARIANTS);
+        assert_eq!(queue.blocks.len(), 1);
+        assert!(!queue.can_queue(&block.clone().prepare(), false));
+        assert!(!queue.can_queue(&block.clone().prepare(), true));
+        assert!(queue.can_queue(&changed_coinbase_body(&block, 0).prepare(), false));
+        match cleanup {
+            0 => assert_eq!(
+                queue
+                    .dequeue_children(block.header.previous_block_hash)
+                    .len(),
+                MAX_QUEUED_BODY_VARIANTS
+            ),
+            1 => queue.prune_by_height(block.coinbase_height().unwrap()),
+            2 => assert_eq!(queue.drain().count(), MAX_QUEUED_BODY_VARIANTS),
+            _ => {
+                let error = CommitBlockError::HeaderChainError {
+                    error: "test failure".into(),
+                };
+                assert_eq!(
+                    queue
+                        .fail_descendants(block.header.previous_block_hash, error.into())
+                        .len(),
+                    MAX_QUEUED_BODY_VARIANTS
+                );
+            }
+        }
+        for receiver in &mut responses {
+            assert!(!matches!(
+                receiver.try_recv(),
+                Err(oneshot::error::TryRecvError::Empty)
+            ));
+        }
+        assert_eq!(queue.body_count, 0);
+        assert!(queue.blocks.is_empty());
+        assert!(queue.by_parent.is_empty());
+        assert!(queue.by_height.is_empty());
+        assert!(queue.known_utxos.is_empty());
+    }
+    Ok(())
+}
 
-    for index in 0..MAX_QUEUED_BLOCKS {
+#[test]
+fn orphan_queue_counts_variants_against_the_shared_bound() -> Result<()> {
+    use crate::tests::setup::changed_coinbase_body;
+    let block: Arc<Block> =
+        zakura_test::vectors::BLOCK_MAINNET_1687107_BYTES.zcash_deserialize_into()?;
+    let mut queue = QueuedBlocks::default();
+    queue.queue(block.clone().into_queued());
+    queue.queue(changed_coinbase_body(&block, 1).into_queued());
+    for index in 2..MAX_QUEUED_BLOCKS {
         let mut queued = block.clone().into_queued();
         let index = u64::try_from(index).expect("the queue bound fits in u64");
         queued.0.hash.0[..8].copy_from_slice(&index.to_le_bytes());
-        queue.blocks.insert(queued.0.hash, queued);
+        queue.queue(queued);
     }
     assert!(queue.is_full());
+    assert_eq!(queue.blocks.len(), MAX_QUEUED_BLOCKS - 1);
+    assert!(queue.can_queue(&block.clone().prepare(), false));
+    assert!(!queue.can_queue(&changed_coinbase_body(&block, 2).prepare(), false));
+    assert!(queue.can_queue(&changed_coinbase_body(&block, 2).prepare(), true));
     Ok(())
 }
 
@@ -187,9 +232,9 @@ fn prune_removes_right_children() -> Result<()> {
     assert_eq!(2, queue.blocks.len());
     assert_eq!(1, queue.by_parent.len());
     assert_eq!(1, queue.by_height.len());
-    assert!(queue.get_mut(&block1.hash()).is_none());
-    assert!(queue.get_mut(&child1.hash()).is_some());
-    assert!(queue.get_mut(&child2.hash()).is_some());
+    assert!(!queue.blocks.contains_key(&block1.hash()));
+    assert!(queue.blocks.contains_key(&child1.hash()));
+    assert!(queue.blocks.contains_key(&child2.hash()));
     assert_eq!(632, queue.known_utxos.len());
 
     // Pruning the children of the first block removes both of the other
@@ -198,8 +243,8 @@ fn prune_removes_right_children() -> Result<()> {
     assert_eq!(0, queue.blocks.len());
     assert_eq!(0, queue.by_parent.len());
     assert_eq!(0, queue.by_height.len());
-    assert!(queue.get_mut(&child1.hash()).is_none());
-    assert!(queue.get_mut(&child2.hash()).is_none());
+    assert!(!queue.blocks.contains_key(&child1.hash()));
+    assert!(!queue.blocks.contains_key(&child2.hash()));
     assert_eq!(0, queue.known_utxos.len());
 
     Ok(())

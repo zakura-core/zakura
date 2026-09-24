@@ -12,7 +12,7 @@
     "SourceCodePro-Regular.ttf-ILST5JV6.woff2": "8badfe75c98da1e8315a52619f177def4618350f7b3e496baf5b8894da2c2ac0",
     "chunk-FW4363Y4.js": "455da7cd03013fac5a4abd7a1e875326ee48c1a8f44ec9920aebc3964c54ae78",
     "chunk-KY5FQVXF.js": "587147f8631b114cdadb8154b2cce0bab392b1ed39635bb9d4f966b735158de9",
-    "compact-labels.patch": "1aa3f077be572f365d0e4e3be98c7e82c24f8a3cc92f083c61dfea08210f9b60",
+    "compact-labels.patch": "768abe2e7c35c490771220d33b5302696ed5aa3541e0e83361fd120bbef48502",
     "favicon-16x16-6PS2IAOI.js": "9172236551e230f4b181dc5ddec5e70412584ded1cd34fe90e19ab3115af9697",
     "favicon-16x16-VSI62OPJ.png": "a62a6da7742b43ee798b106b709aa82eafd1b500ef050427cfec05e4d41dacac",
     "favicon-32x32-3EB2YCUY.png": "9ea6e6d13b7b8064187866deba1e8674d8ba25071279ba7b15f34b54df2508d0",
@@ -20,13 +20,13 @@
     "favicon-3JMDIDSO.js": "3b7c54728f12d232049efff19373173535c1a8e4e0f41ff7d35c4325ad9b02c0",
     "favicon-FOKUP5Y5.ico": "45701858a8fe9daccd63d2cb5749fdbd155a471b5fc391d04f3f61d18a9efcdd",
     "import-L3I5W4LA.js": "23bdae7aad3a4925a6ed520efd9bb4e2cacbb421bbf460d0107fb413dd15fddb",
-    "index.html": "b78c5afd1e9781be8e8ddc0171b5518e781b146f6eb9fed196b0e9011a85d301",
+    "index.html": "cd2e0884de6d755a76f1dfcdb841da0949d4f430d4ff3b3a5b3fefea08a07fd8",
     "jfrview_bg-BLJXNNQB.wasm": "8538ff05a6a76f6bb3177aa0841d54dba92db6cb6435a4917fa4d25d908092c6",
     "perf-vertx-stacks-01-collapsed-all-ZNUIGAJL.txt": "dedaa1c8055267638030efa25081116105fd0e357944cefc0974e792dfcabedd",
-    "routes.rs": "5bc9af9e1315b9d1cd389c6e8167be970695f4b6f384312bef348e283308e498",
+    "routes.rs": "87de85bc6442f21c93adbf00ed5dae4a809b2025d4e9d384414bf1b78e58ea8b",
     "source-code-pro.LICENSE.md": "2e14ee65e55dbcc7d66347cd7c76a10a1a18ac49dd7989a2b3838b479676f746",
     "source-map-FFWWKABY.js": "f170f738c656383a18c311c0dc1bff9418b402b8edc9ece8b38f0f6f2ad538e6",
-    "speedscope-CISOMWVE.js": "94c2b74488c14df656ca9c85f1208129d0b5e814397377e96ec7ebfa8eb0e626",
-    "speedscope-GHPHNKXC.css": "0f823f58242a0ca365d46761dd99034626931157a08e24dd667b310363209bc9"
+    "speedscope-GHPHNKXC.css": "0f823f58242a0ca365d46761dd99034626931157a08e24dd667b310363209bc9",
+    "speedscope-PX73TTU3.js": "a5ac8839c67befd01f62c3dc8e5895ebf7783017047e650f1a65943ec714375c"
   }
 }

@@ -71,7 +71,7 @@ index be24242..c2cb5c6 100644
 
  async function importProfilesFromText(
 diff --git a/src/views/flamechart-pan-zoom-view.tsx b/src/views/flamechart-pan-zoom-view.tsx
-index 78e7cf1..548e796 100644
+index 78e7cf1..9d8e5c1 100644
 --- a/src/views/flamechart-pan-zoom-view.tsx
 +++ b/src/views/flamechart-pan-zoom-view.tsx
 @@ -1,3 +1,4 @@
@@ -88,7 +88,7 @@ index 78e7cf1..548e796 100644
              physicalLabelBounds.width() - 2 * LABEL_PADDING_PX,
            )
 
-@@ -579,11 +580,11 @@ export class FlamechartPanZoomView extends Component<FlamechartPanZoomViewProps,
+@@ -579,7 +580,7 @@ export class FlamechartPanZoomView extends Component<FlamechartPanZoomViewProps,
      }
    }
 
@@ -97,11 +97,6 @@ index 78e7cf1..548e796 100644
      if (this.hoveredLabel) {
        const hoveredBounds = this.hoveredLabel.configSpaceBounds
        const viewportRect = new Rect(
--        hoveredBounds.origin.minus(new Vec2(0, 1)),
-+        hoveredBounds.origin,
-         hoveredBounds.size.withY(this.props.configSpaceViewportRect.height()),
-       )
-       this.props.setConfigSpaceViewportRect(viewportRect)
 @@ -603,6 +604,7 @@ export class FlamechartPanZoomView extends Component<FlamechartPanZoomViewProps,
 
      if (this.hoveredLabel) {

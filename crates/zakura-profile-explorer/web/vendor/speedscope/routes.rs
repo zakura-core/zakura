@@ -15,7 +15,7 @@ match asset.as_str() {
     "jfrview_bg-BLJXNNQB.wasm" => ([(header::CONTENT_TYPE, "application/wasm")], include_bytes!("jfrview_bg-BLJXNNQB.wasm").as_slice()).into_response(),
     "perf-vertx-stacks-01-collapsed-all-ZNUIGAJL.txt" => ([(header::CONTENT_TYPE, "text/plain")], include_bytes!("perf-vertx-stacks-01-collapsed-all-ZNUIGAJL.txt").as_slice()).into_response(),
     "source-map-FFWWKABY.js" => ([(header::CONTENT_TYPE, "text/javascript")], include_bytes!("source-map-FFWWKABY.js").as_slice()).into_response(),
-    "speedscope-CISOMWVE.js" => ([(header::CONTENT_TYPE, "text/javascript")], include_bytes!("speedscope-CISOMWVE.js").as_slice()).into_response(),
     "speedscope-GHPHNKXC.css" => ([(header::CONTENT_TYPE, "text/css")], include_bytes!("speedscope-GHPHNKXC.css").as_slice()).into_response(),
+    "speedscope-PX73TTU3.js" => ([(header::CONTENT_TYPE, "text/javascript")], include_bytes!("speedscope-PX73TTU3.js").as_slice()).into_response(),
     _ => StatusCode::NOT_FOUND.into_response(),
 }

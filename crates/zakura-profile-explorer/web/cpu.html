@@ -1,7 +1,7 @@
 <!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>CPU profile · Zakura</title><link rel="stylesheet" href="/cpu.css"><script defer src="/cpu.js"></script></head>
 <body data-page="cpu">
-<header><a id="block-link" href="/">← Block breakdown</a><h1 id="title">CPU profile</h1><label>Interval <select id="scope"><option value="recorded">All recorded work</option><option value="verifier">Verifier response</option></select></label><a id="download" download="cpu-samples.json">Download samples</a></header>
+<header><a id="block-link" href="/">← Block breakdown</a><h1 id="title">CPU profile</h1><label>Interval <select id="scope"><option value="recorded">All recorded work</option><option value="verifier">Verifier response</option></select></label><button id="reset-zoom" type="button">Reset zoom</button><a id="download" download="cpu-samples.json">Download samples</a></header>
 <section id="context"><p id="interval"></p><p id="coverage" role="status">Loading retained samples…</p>
 <details id="capture-details"><summary>Capture details</summary><p>Widths are CPU sample counts. Sample order is not elapsed time. These are user-space process samples during this block interval, including other blocks and background work. Sampling cannot prove that a short function did not run.</p><p id="capture-reason"></p></details>
 <details id="symbols"><summary>Full symbol lookup</summary><label for="symbol-query">Find a function, type, or module</label><input id="symbol-query" type="search" placeholder="Search full symbols"><div id="symbol-results"></div></details></section>

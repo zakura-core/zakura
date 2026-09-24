@@ -67,6 +67,7 @@ async function startCpuPage() {
       }
     }catch(error){if(current===generation)$('coverage').textContent=error.message;}
   }
+  $('reset-zoom').addEventListener('click',()=>{const viewer=$('viewer');if(viewer.getAttribute('src'))viewer.src=viewer.src;});
   $('scope').value=cpuScope(new URLSearchParams(location.search).get('scope'));
   $('scope').addEventListener('change',()=>load());await load();
 }

@@ -22,7 +22,7 @@ use std::{collections::HashMap, sync::OnceLock};
 use crate::{
     amount::{self, Amount, NegativeAllowed, NonNegative, MAX_MONEY},
     block::{Height, HeightDiff},
-    parameters::{Network, NetworkUpgrade},
+    parameters::{Network, NetworkUpgrade, NU7_POW_TARGET_SPACING_RATIO},
     transparent,
 };
 
@@ -236,6 +236,13 @@ pub trait ParameterSubsidy {
     /// [7.10]: https://zips.z.cash/protocol/protocol.pdf#zip214fundingstreams
     fn funding_stream_address_change_interval(&self) -> HeightDiff;
 
+    /// Returns the NU7 activation height, where ZIP 218's 25 second target spacing starts.
+    ///
+    /// Returns `None` when the network has no NU7 activation height.
+    fn nu7_activation_height(&self) -> Option<Height> {
+        None
+    }
+
     /// Returns the expected public seed or configured override, or zero when unset.
     /// State derives the actual seed from monetary pools unless a configured override applies.
     fn initial_nsm_value_balance(&self) -> Amount<NonNegative>;
@@ -282,6 +289,12 @@ impl ParameterSubsidy for Network {
         self.post_blossom_halving_interval() / 48
     }
 
+    fn nu7_activation_height(&self) -> Option<Height> {
+        // `halving` starts the 25 second era at this height too, through
+        // `NetworkUpgrade::target_spacings`.
+        NetworkUpgrade::Nu7.activation_height(self)
+    }
+
     fn initial_nsm_value_balance(&self) -> Amount<NonNegative> {
         match self {
             Network::Mainnet => mainnet::INITIAL_NSM_VALUE_BALANCE,
@@ -291,7 +304,21 @@ impl ParameterSubsidy for Network {
 }
 
 /// Returns the address change period
-/// as described in [protocol specification §7.10][7.10]
+/// as described in [protocol specification §7.10][7.10], amended for ZIP 218.
+///
+/// Before NU7 activation, or on a network without NU7, this is the specification's
+///
+/// > AddressPeriod(height) := floor((height + PostBlossomHalvingInterval − FirstHalvingHeight)
+/// > / FSRecipientChangeInterval)
+///
+/// ZIP 218 multiplies the number of blocks per halving by `NU7PoWTargetSpacingRatio` at NU7
+/// activation `A`, but keeps `FSRecipientChangeInterval`. From `A` on, the period therefore
+/// advances once every `NU7PoWTargetSpacingRatio · FSRecipientChangeInterval` blocks:
+///
+/// > AddressPeriod(height) := floor((NU7PoWTargetSpacingRatio · (A + PostBlossomHalvingInterval
+/// > − FirstHalvingHeight) + (height − A)) / (NU7PoWTargetSpacingRatio · FSRecipientChangeInterval))
+///
+/// Both cases agree at `A`.
 ///
 /// [7.10]: https://zips.z.cash/protocol/protocol.pdf#fundingstreams
 pub fn funding_stream_address_period<N: ParameterSubsidy>(
@@ -305,15 +332,23 @@ pub fn funding_stream_address_period<N: ParameterSubsidy>(
     //
     // Note that the brackets make it so the post-Blossom halving interval is
     // added to the total.
-
-    let height_after_first_halving = height - network.height_for_first_halving();
+    let period_offset = |height: Height| {
+        height - network.height_for_first_halving() + network.post_blossom_halving_interval()
+    };
+    let change_interval = network.funding_stream_address_change_interval();
 
     // `div_euclid` matches the specification's floor because the interval is
     // positive. The regression test uses a height one block before the
     // address-period anchor: its numerator is -1, so `/` would truncate it
     // to 0 rather than floor it to -1.
-    (height_after_first_halving + network.post_blossom_halving_interval())
-        .div_euclid(network.funding_stream_address_change_interval())
+    match network.nu7_activation_height() {
+        Some(nu7_activation) if height >= nu7_activation => {
+            let ratio = HeightDiff::from(NU7_POW_TARGET_SPACING_RATIO);
+            (ratio * period_offset(nu7_activation) + (height - nu7_activation))
+                .div_euclid(ratio * change_interval)
+        }
+        _ => period_offset(height).div_euclid(change_interval),
+    }
 }
 
 /// The first block height of the halving at the provided halving index for a network.

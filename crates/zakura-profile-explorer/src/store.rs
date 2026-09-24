@@ -708,7 +708,7 @@ impl Reader {
             };
             latency.insert(label.into(), json!(value));
         }
-        let cpu:Value = self.db.query_row("SELECT count(*),coalesce(sum(samples),0),min(start_us),max(end_us) FROM cpu WHERE run=? AND end_us>=coalesce((SELECT (? - utc_ms)*1000 FROM runs WHERE id=?),0)",params![run,integer(since)?,run],|r|Ok(json!({"captures":r.get::<_,i64>(0)?,"samples":r.get::<_,i64>(1)?,"first_us":r.get::<_,Option<i64>>(2)?,"last_us":r.get::<_,Option<i64>>(3)?,"scope":"process"})))?;
+        let cpu:Value = self.db.query_row("SELECT count(*),coalesce(sum(samples),0),min(start_us),max(end_us) FROM cpu WHERE run=? AND start_us>=coalesce((SELECT max(0,(? - utc_ms)*1000-120000000) FROM runs WHERE id=?),0) AND end_us>=coalesce((SELECT (? - utc_ms)*1000 FROM runs WHERE id=?),0)",params![run,integer(since)?,run,integer(since)?,run],|r|Ok(json!({"captures":r.get::<_,i64>(0)?,"samples":r.get::<_,i64>(1)?,"first_us":r.get::<_,Option<i64>>(2)?,"last_us":r.get::<_,Option<i64>>(3)?,"scope":"process"})))?;
         let health = self.db.query_row("SELECT updated_ms,errors,budget,used,discarded_spans FROM status WHERE id=1", [], |r| Ok(json!({"updated_ms":r.get::<_,i64>(0)?,"errors":r.get::<_,i64>(1)?,"budget":r.get::<_,i64>(2)?,"used":r.get::<_,i64>(3)?,"discarded_spans":r.get::<_,i64>(4)?}))).optional()?;
         Ok(
             json!({"generated_ms":now_ms(),"run":run,"mode":mode,"runs":runs,"latest":latest,"outliers":outliers,"failures":failures,"counts":counts,"timing_blocks":accepted,"excluded_timings":excluded,"startup_timings":startup,"startup_pending":startup_pending,"health":health,"cpu":cpu,"latency":latency}),

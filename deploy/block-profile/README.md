@@ -8,14 +8,14 @@ The block header shows total recorded time from router entry through the last re
 
 Magnifying glass links beside the block heading and transaction rows open CipherScan in a new tab. They use the exact block hash and mined transaction ID, with separate Mainnet and Testnet hosts. Other network names have no links. Transaction links require a retained `transaction_hash` on the transaction envelope, so older profiles still have block links but no transaction links. The explorer does not fetch data from CipherScan in the background.
 
-The timeline answers where elapsed time went. Continuous CPU sampling is off for normal operation, and normal block pages show stage timings without a CPU section. Keep the sampler stopped and disabled. For a targeted replay, an operator can explicitly run a bounded CPU capture and append `?cpu=1` to the block URL to view its retained stacks. Existing captures remain accessible through this optional view and the profile JSON API. Parallel spans overlap. Shared batches and other blocks can appear in process samples, so neither view claims an exact allocation of CPU milliseconds to one block.
+The timeline answers where elapsed time went. When live CPU capture covers a block, its CPU profile button opens a dedicated full-page interactive viewer pinned to that exact request. New sampling does not fill in historical blocks. The default interval includes finalization after the verifier response. Flame widths represent sample counts, not elapsed milliseconds. Actual timestamps and thread IDs remain in the CPU JSON. Samples show user-space process activity during the block, including any concurrent background work. Waiting and kernel execution are outside this measurement. Parallel spans overlap, and neither view claims an exact allocation of CPU milliseconds to one block. See [the live CPU design](../../docs/designs/block-profile-cpu.md) for capture and coverage guarantees.
 
 ## Build and local check
 
 ```sh
 cargo build --release --locked -p zakura -p zakura-profile-explorer
 cargo test --locked -p zakura-jsonl-trace -p zakura-profile-explorer
-node --test crates/zakura-profile-explorer/web/app.test.cjs
+node --test crates/zakura-profile-explorer/web/*.test.cjs
 python3 -m unittest discover -s deploy/block-profile -p 'test_*.py'
 ```
 
@@ -58,7 +58,7 @@ Keep the profiling additions on `adam/block-profile-operations`. From its clean 
 python3 deploy/block-profile/update.py --config deploy/block-profile/update.example.json
 ```
 
-The example config names the dedicated profiling host. Copy it to an operator location for another installation and set its SSH alias, expected hostname, repository, and shared Cargo target directory. This requires an authenticated Git remote, SSH access as root, local Node.js for the frontend tests, and the existing Linux profiler installation with Rust and Python 3.11+. It does not create infrastructure, change DNS, touch chain state directly, or enable CPU sampling.
+The example config names the dedicated profiling host. Copy it to an operator location for another installation and set its SSH alias, expected hostname, repository, and shared Cargo target directory. This requires an authenticated Git remote, SSH access as root, local Node.js for the frontend tests, and the existing Linux profiler installation with Rust and Python 3.11+. It does not create infrastructure, change DNS, touch chain state directly, or enable CPU sampling when it was stopped. An already running sampler is drained before executable replacement and restarted against the new supervised node PID after verification.
 
 The command fetches main and the profiling branch, includes other operators' changes by fast-forward, merges the selected main commit, and pushes normally. It never rebases or force-pushes. A merge conflict aborts the new merge and stops before deployment. Use `--base MAIN_SHA` to select a particular main revision, `--keep-base` to deploy only profiling changes, or `--prepare-only` to merge and push without deploying. A branch that already includes newer main code cannot be downgraded with this command.
 
@@ -141,15 +141,17 @@ sudo systemctl start zakura-profile-collector.service zakura-profile-web.service
 sudo systemctl enable --now zakura-profile-report.timer
 ```
 
-Start the dedicated node with the configured socket after updating its supplementary group membership. Leave `zakura-profile-sampler.service` stopped and disabled for normal collection. Only for an explicitly requested CPU profiling session, set `/etc/zakura-profile-sampler.env` to the actual supervised node PID, its exact executable path, and a bounded session limit of at most 86,400 seconds.
+Start the dedicated node with the configured socket after updating its supplementary group membership. CPU capture is opt-in. After a bounded canary verifies symbol quality, decoding throughput, resource use and collection loss, enable continuous sampling on the dedicated profiler:
 
-```text
-NODE_PID=12345
-NODE_EXECUTABLE=/usr/local/bin/zakurad
-SESSION_SECONDS=86400
+```sh
+sudo systemctl enable --now zakura-profile-sampler.service
 ```
 
-For that bounded session, start `zakura-profile-sampler.service` manually without enabling it at boot. Replay controllers should restore sampling only if it was running before the replay. The sampler verifies `/proc/PID/exe`, process start ticks, and the fresh recorder run before capture. A node restart requires a refreshed PID and a new sampler invocation. No PID-name matching is used. Capabilities are restricted to the sampler unit. An unsupported kernel or denied perf access stops sampling and leaves timelines available. Decoding keeps symbolized stack frames without expanding compiler-inlined calls, which avoids unbounded `addr2line` memory use.
+The sampler resolves the exact supervised `zakurad` PID, verifies its executable and process start identity, and matches a fresh profiling run. It verifies the exact systemd control group against `/proc/PID/cgroup` and uses per-CPU events filtered to that group, with an additional exact PID filter during decoding. This avoids an exited-thread polling storm in the host's perf version while including newly created workers. It rotates the continuously running recorder about every ten seconds and decodes closed segments in a separate process. A node restart starts a new capture session automatically. No PID-name matching is used. Stop and disable the sampler to return to timeline-only collection.
+
+For a bounded operator canary, invoke `sample.py --store STORE --pid PID --executable EXACT_PATH --frequency 99 --duration-seconds 120` in the same restricted service environment. A zero duration means continuous collection. The service no longer uses the old fixed-PID environment file or a one-day expiry. Capabilities remain restricted to the sampler unit. An unsupported kernel or denied perf access leaves timelines available. Decoding keeps symbolized stack frames without expanding compiler-inlined calls, avoiding expensive `addr2line` expansion.
+
+The raw spool, symbol cache, import inbox, and decoded captures stay under the profiler's filesystem quota. Backlog and query limits are explicit in CPU coverage. Short blocks can have few or zero statistical samples. New profiles normally become available after rotation, decoding, and the collector's next import pass. Downloads preserve full symbols and exact monotonic sample timestamps, even though the interactive flame graph uses sample counts.
 
 All profiler services share a one-core CPU cap and a 1 GiB memory cap through `zakura-profile.slice`. The collector and viewer each have a 512 MiB cap. Kernel sample buffers and node recorder memory are additional and must be measured in the canary. Each HTTP query uses a read-only connection with a four-second SQLite work deadline and at most two concurrent readers.
 

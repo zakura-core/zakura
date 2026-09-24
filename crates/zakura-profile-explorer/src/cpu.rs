@@ -205,8 +205,8 @@ pub(crate) fn import(db: &Connection, path: &Path, source: &Path) -> Result<()> 
 fn pending(db: &Connection, path: &Path, run: &str, anchor: u64, end: u64) -> bool {
     let imported: Option<i64> = db
         .query_row(
-            "SELECT max(end_us) FROM cpu WHERE run=? AND deleting=0",
-            [run],
+            "SELECT max(end_us) FROM cpu WHERE run=? AND start_us>=coalesce((SELECT max(start_us)-120000000 FROM cpu WHERE run=? AND deleting=0),0) AND deleting=0",
+            [run,run],
             |r| r.get(0),
         )
         .ok()
@@ -244,8 +244,8 @@ pub(crate) fn availability(
     end: u64,
 ) -> Result<Value> {
     let count: i64 = db.query_row(
-        "SELECT count(*) FROM cpu WHERE run=? AND end_us>=? AND start_us<=? AND deleting=0",
-        params![run, i64::try_from(start)?, i64::try_from(end)?],
+        "SELECT count(*) FROM cpu WHERE run=? AND start_us>=? AND end_us>=? AND start_us<=? AND deleting=0",
+        params![run, i64::try_from(start.saturating_sub(120_000_000))?, i64::try_from(start)?, i64::try_from(end)?],
         |r| r.get(0),
     )?;
     let metadata: String =
@@ -294,8 +294,8 @@ pub(crate) fn window(
             json!({"status":"unavailable","coverage":{"state":"unavailable","reason":"No Linux clock anchor"},"samples":[],"frames":[],"stacks":[]}),
         );
     };
-    let files:Vec<(String,String,i64,i64,i64)>=db.prepare("SELECT id,metadata,start_us,end_us,samples FROM cpu WHERE run=? AND end_us>=? AND start_us<=? AND deleting=0 ORDER BY start_us,id LIMIT 33")?
-        .query_map(params![run,i64::try_from(start)?,i64::try_from(end)?],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)))?.collect::<rusqlite::Result<_>>()?;
+    let files:Vec<(String,String,i64,i64,i64)>=db.prepare("SELECT id,metadata,start_us,end_us,samples FROM cpu WHERE run=? AND start_us>=? AND end_us>=? AND start_us<=? AND deleting=0 ORDER BY start_us,id LIMIT 33")?
+        .query_map(params![run,i64::try_from(start.saturating_sub(120_000_000))?,i64::try_from(start)?,i64::try_from(end)?],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)))?.collect::<rusqlite::Result<_>>()?;
     let waiting = pending(db, path, run, anchor, end);
     let mut limited = files.len() > MAX_CAPTURES;
     let mut skipped = false;
@@ -553,13 +553,46 @@ pub(crate) fn window(
 
 /// Speedscope widths are sample counts. Its schema has no per-sample timestamp field.
 pub(crate) fn speedscope(data: &Value) -> Result<Value> {
-    let frames = data["frames"]
+    // A function's sampled instruction addresses should not split its hot-path count.
+    // Raw symbols preserve monomorph identity; unresolved addresses stay distinct.
+    let mut identities = BTreeMap::new();
+    let mut frames = Vec::new();
+    let mut mapping = Vec::new();
+    for frame in data["frames"].as_array().context("CPU frames")? {
+        let symbol = frame["symbol"].as_str().context("CPU raw symbol")?;
+        let dso = frame["dso"].as_str().context("CPU module")?;
+        let address = if symbol.is_empty() || symbol.contains("[unknown]") {
+            Some(frame["ip"].as_str().context("CPU unresolved address")?)
+        } else {
+            None
+        };
+        let next = frames.len();
+        let id = *identities.entry((symbol, dso, address)).or_insert_with(|| {
+            frames.push(json!({"name":frame["name"]}));
+            next
+        });
+        mapping.push(id);
+    }
+    let stacks = data["stacks"]
         .as_array()
-        .context("CPU frames")?
+        .context("CPU stacks")?
         .iter()
-        .map(|f| json!({"name":f["name"]}))
-        .collect::<Vec<_>>();
-    let stacks = data["stacks"].as_array().context("CPU stacks")?;
+        .map(|stack| {
+            stack
+                .as_array()
+                .context("CPU stack")?
+                .iter()
+                .map(|id| {
+                    id.as_u64()
+                        .and_then(|id| usize::try_from(id).ok())
+                        .and_then(|id| mapping.get(id))
+                        .copied()
+                        .context("CPU frame reference")
+                })
+                .collect::<Result<Vec<_>>>()
+                .map(|stack| json!(stack))
+        })
+        .collect::<Result<Vec<_>>>()?;
     let samples = data["samples"].as_array().context("CPU samples")?;
     let mut threads = BTreeMap::<u64, Vec<Value>>::new();
     let mut all = Vec::new();
@@ -587,8 +620,10 @@ pub(crate) fn speedscope(data: &Value) -> Result<Value> {
             samples,
         )
     }));
+    let coverage = data["coverage"]["state"].as_str().unwrap_or("unknown");
     Ok(
-        json!({"$schema":"https://www.speedscope.app/file-format-schema.json","name":"User-space process CPU samples; widths are counts","activeProfileIndex":0,"exporter":"Zakura profiler","shared":{"frames":frames},"profiles":profiles}),
+        json!({"$schema":"https://www.speedscope.app/file-format-schema.json","name":format!("User-space process CPU samples ({coverage} capture); widths are counts"),"activeProfileIndex":0,"exporter":"Zakura profiler","shared":{"frames":frames},"profiles":profiles,
+            "zakura":{"frame_aggregation":"Exact raw function symbol and module; unresolved addresses remain distinct","window":data["window"],"counts":data["counts"],"coverage":data["coverage"],"run":data["summary"]["run"],"attempt":data["summary"]["attempt"],"block_height":data["summary"]["height"]}}),
     )
 }
 
@@ -660,4 +695,36 @@ pub(crate) fn prune(db: &Connection, path: &Path, mut bytes: u64) -> Result<u64>
         bytes = bytes.saturating_sub(u64::try_from(size)?);
     }
     Ok(initial - bytes)
+}
+
+#[cfg(test)]
+mod export_tests {
+    use super::*;
+
+    #[test]
+    fn function_export_aggregates_instruction_addresses_without_merging_raw_symbols() -> Result<()>
+    {
+        let frame = |symbol: &str, ip: &str, dso: &str| json!({"name":"same display label","symbol":symbol,"ip":ip,"dso":dso});
+        let data = json!({
+            "frames":[frame("function<T>","100","node"),frame("function<T>","104","node"),
+                frame("function<U>","108","node"),frame("function<T>","100","other.so"),
+                frame("[unknown]","200","node"),frame("[unknown]","204","node")],
+            "stacks":[[0],[1],[2],[3],[4],[5]],
+            "samples":(0..6).map(|id|json!({"tid":1,"stack":id})).collect::<Vec<_>>(),
+            "coverage":{"state":"partial"}
+        });
+        let export = speedscope(&data)?;
+        assert_eq!(export["shared"]["frames"].as_array().unwrap().len(), 5);
+        assert_eq!(
+            export["profiles"][0]["samples"],
+            json!([[0], [0], [1], [2], [3], [4]])
+        );
+        assert_eq!(export["profiles"][0]["weights"], json!([1, 1, 1, 1, 1, 1]));
+        assert_eq!(
+            data["frames"].as_array().unwrap().len(),
+            6,
+            "canonical addresses remain intact"
+        );
+        Ok(())
+    }
 }

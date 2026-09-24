@@ -14,7 +14,7 @@ Flame widths represent sample counts. Speedscope exports use unit `none` and wei
 
 ## Capture
 
-Use one continuously running `perf record` process with rotated output and an independent bounded decoder. Ordinary rotation must not stop sampling while symbols are decoded. Start at 99 Hz and rotate around 10 seconds, with size and backlog limits. Verify the installed perf version's rotation and closed-file behavior in a bounded live canary before enabling the service.
+Use one continuously running `perf record` process with rotated output and an independent bounded decoder. Ordinary rotation must not stop sampling while symbols are decoded. Start at 99 Hz and use native timed rotation every 10 seconds, with size and backlog limits. The installed perf version busy-polls after monitored worker threads exit. Capture therefore uses per-CPU events filtered to the node's exact systemd control group, verified against `/proc/PID/cgroup`. The decoder still filters the exact node PID. This preserves newly created workers without per-thread event lifetimes. An oversized active file stops capture visibly before its hard file limit. Verify the installed perf version's rotation and closed-file behavior in a bounded live canary before enabling the service.
 
 Only immutable files no longer open by the producer can be decoded. Preserve process start identity, run ID, executable SHA-256, and build identity. Bound active files, sealed backlog, decoder memory and CPU, output size, and retained raw data. Never remove active or decoder-owned files. Overload must produce explicit partial coverage or stop capture visibly, without blocking the verifier. Keep all new data under the existing profiler quota.
 

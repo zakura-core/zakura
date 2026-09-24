@@ -893,6 +893,10 @@ fn cpu_v2_preserves_timestamps_tids_full_symbols_and_finalization_window() -> Re
     );
     assert_eq!(export["profiles"].as_array().unwrap().len(), 3);
     assert_eq!(export["profiles"][0]["endValue"], 3);
+    assert!(export["name"].as_str().unwrap().contains("partial capture"));
+    assert_eq!(export["zakura"]["window"], data["window"]);
+    assert_eq!(export["zakura"]["counts"], data["counts"]);
+    assert_eq!(export["zakura"]["coverage"], data["coverage"]);
     Ok(())
 }
 #[test]
@@ -993,5 +997,34 @@ fn cpu_repeated_long_frames_are_interned_and_expansion_is_bounded() -> Result<()
     assert_eq!(data["counts"]["omitted_samples"], 46094);
     assert_eq!(data["counts"]["matching_samples"], 50000);
     assert_eq!(data["coverage"]["query_limited"], true);
+    Ok(())
+}
+
+#[test]
+fn cpu_late_window_retains_exact_maximum_duration_overlap() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let store = cpu_test_store(temp.path())?;
+    let mut old = cpu_v2(vec![]);
+    old.start_mono_us = 10_999_999;
+    old.end_mono_us = 130_999_999;
+    import_cpu(&store, &old, &"7".repeat(32))?;
+    let mut edge = cpu_v2(vec![]);
+    edge.start_mono_us = 11_000_000;
+    edge.end_mono_us = 131_000_000;
+    import_cpu(&store, &edge, &"8".repeat(32))?;
+    let mut recent = cpu_v2(vec![(130_000_010, 7)]);
+    recent.start_mono_us = 130_000_000;
+    recent.end_mono_us = 131_000_100;
+    import_cpu(&store, &recent, &"9".repeat(32))?;
+    let availability =
+        crate::cpu::availability(&store.db, temp.path(), RUN, 130_000_000, 130_000_100)?;
+    assert_eq!(
+        availability["captures"], 2,
+        "exact 120-second lookback boundary remains inclusive"
+    );
+    let data = crate::cpu::window(&store.db, temp.path(), RUN, 130_000_000, 130_000_100)?;
+    assert_eq!(data["coverage"]["captures"].as_array().unwrap().len(), 2);
+    assert_eq!(data["counts"]["returned_samples"], 1);
+    assert_eq!(data["samples"][0]["at_us"], 10);
     Ok(())
 }

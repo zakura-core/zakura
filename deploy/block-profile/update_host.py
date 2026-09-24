@@ -61,8 +61,7 @@ def deploy(args, progress):
             raise RuntimeError('Remote checkout has local changes.')
         for service in SERVICES:
             command(['systemctl', 'is-active', '--quiet', service])
-        if command(['systemctl', 'show', 'zakura-profile-sampler', '-p', 'MainPID', '--value'], capture_output=True).stdout.strip() != '0':
-            raise RuntimeError('Stop the explicit CPU capture before upgrading.')
+        sampler_running = command(['systemctl', 'show', 'zakura-profile-sampler', '-p', 'MainPID', '--value'], capture_output=True).stdout.strip() != '0'
         # Fail before building if this is not the expected installation layout.
         for service, binary in [('zakurad', 'zakurad'), ('zakura-profile-collector', 'zakura-profile-explorer'), ('zakura-profile-web', 'zakura-profile-explorer')]:
             start = command(['systemctl', 'show', service, '-p', 'ExecStart', '--value'], capture_output=True).stdout
@@ -87,12 +86,21 @@ def deploy(args, progress):
         version = command([str(Path(args.target) / 'release/zakurad'), '--version'], capture_output=True).stdout
         if args.revision[:9] not in version or '-dirty' in version:
             raise RuntimeError('Built executable does not identify the pinned revision.')
+        if sampler_running:
+            command(['python3', str(Path(args.repo) / 'deploy/block-profile/sample.py'),
+                     '--store', '/srv/zakura-profile/data', '--executable', str(Path(args.target) / 'release/zakurad'), '--check-symbol-budget'])
         backup = Path(__file__).parent / 'previous'
         backup.mkdir(exist_ok=True)
         for name in BINARIES:
             shutil.copy2(f'/usr/local/bin/{name}', backup / name)
             command(['install', '-m0755', str(Path(args.target) / 'release' / name), f'/usr/local/bin/{name}.next'])
         progress('deploying')
+        # Drain CPU segments while the exact old executable is still installed.
+        if sampler_running:
+            command(['systemctl', 'stop', 'zakura-profile-sampler'])
+        command(['install', '-m0755', str(Path(args.repo) / 'deploy/block-profile/sample.py'), '/opt/zakura-profile/sample.py'])
+        command(['install', '-m0644', str(Path(args.repo) / 'deploy/block-profile/zakura-profile-sampler.service'), '/etc/systemd/system/zakura-profile-sampler.service'])
+        command(['systemctl', 'daemon-reload'])
         # Seal the old node's last work, then drain the collector before replacing it.
         for service in SERVICES:
             command(['systemctl', 'stop', service])
@@ -118,6 +126,8 @@ def deploy(args, progress):
             raise RuntimeError('New run provenance was not observed. Inspect services before retrying.')
         for service in SERVICES:
             command(['systemctl', 'is-active', '--quiet', service])
+        if sampler_running:
+            command(['systemctl', 'start', 'zakura-profile-sampler'])
         annotations = 0
         for legacy, base, commit in prior:
             try:

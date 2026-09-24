@@ -28,7 +28,8 @@ RestrictAddressFamilies=AF_UNIX
 UMask=0077
 StandardOutput=null
 StandardError=append:/srv/zakura-profile/data/sampler.log
-LimitFSIZE=256M
+# Symbol generations contain the full node ELF. Record/decode children set their own 256MiB limit.
+LimitFSIZE=1G
 
 [Install]
 WantedBy=multi-user.target

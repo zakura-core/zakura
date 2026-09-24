@@ -1,5 +1,7 @@
 import importlib.util
 import json
+import hashlib
+import subprocess
 from pathlib import Path
 import tempfile
 import unittest
@@ -136,6 +138,42 @@ class Parsing(unittest.TestCase):
              patch.object(Path, 'read_text', return_value='0::/\n'):
             with self.assertRaises(RuntimeError):
                 sample.node_cgroup(123, 'zakurad')
+
+    def test_incomplete_symbol_copy_is_rebuilt_and_published_atomically(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            executable = root / 'node'
+            executable.write_bytes(b'complete node executable')
+            digest = hashlib.sha256(executable.read_bytes()).hexdigest()
+            target = root / digest
+            target.mkdir()
+            (target / 'elf').write_bytes(b'truncated')
+            def build(argv, **kwargs):
+                self.assertEqual(kwargs['preexec_fn'], sample.symbol_limits)
+                self.assertFalse(target.exists())
+                staging = Path(argv[2])
+                (staging / 'elf').write_bytes(executable.read_bytes())
+            with patch.object(sample.subprocess, 'run', side_effect=build):
+                sample.prepare_symbols(target, executable, digest)
+            self.assertEqual((target / 'elf').read_bytes(), executable.read_bytes())
+            self.assertTrue((target / '.complete').exists())
+            self.assertFalse(target.with_name(target.name + '.building').exists())
+
+    def test_failed_symbol_copy_cannot_be_reused_on_retry(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            executable = root / 'node'
+            executable.write_bytes(b'complete')
+            digest = hashlib.sha256(executable.read_bytes()).hexdigest()
+            target = root / digest
+            def fail(argv, **kwargs):
+                (Path(argv[2]) / 'elf').write_bytes(b'partial')
+                raise subprocess.CalledProcessError(-25, argv)
+            with patch.object(sample.subprocess, 'run', side_effect=fail):
+                with self.assertRaises(subprocess.CalledProcessError):
+                    sample.prepare_symbols(target, executable, digest)
+            self.assertFalse(target.exists())
+            self.assertFalse(target.with_name(target.name + '.building').exists())
 
     def test_symbol_preflight_does_not_create_root_owned_cache(self):
         with tempfile.TemporaryDirectory() as root:

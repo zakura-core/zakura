@@ -18,6 +18,7 @@ import time
 import uuid
 
 MAX_FILE = 256 * 1024 * 1024
+MAX_SYMBOL_FILE = 1024 * 1024 * 1024
 MAX_JSON = 12 * 1024 * 1024
 MAX_SYMBOL = 65536
 MAX_LINE = 256 * 1024
@@ -28,6 +29,14 @@ MAX_PENDING = 8
 HEADER = re.compile(r"^\s*(\d+)(?:/|\s+)(\d+)\s+(\d+\.\d+):\s+(\S+:)\s*(.*)$")
 FRAME = re.compile(r"^\s*([0-9a-fA-F]+)\s+(.+?)\s+\((.+)\)\s*$")
 LOST = re.compile(r"(?:PERF_RECORD_LOST.*?lost\s*[:=]?\s*(\d+)|LOST\s+(\d+)(?:\s+events)?)", re.I)
+
+
+def sha256_file(path):
+    digest = hashlib.sha256()
+    with path.open('rb') as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b''):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def monotonic_us():
@@ -144,6 +153,11 @@ def parse_perf(lines, pid, start, end):
 
 def limits():
     resource.setrlimit(resource.RLIMIT_FSIZE, (MAX_FILE, MAX_FILE))
+    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+
+
+def symbol_limits():
+    resource.setrlimit(resource.RLIMIT_FSIZE, (MAX_SYMBOL_FILE, MAX_SYMBOL_FILE))
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
 
 
@@ -313,9 +327,14 @@ def prune_raw(raw):
 
 def symbol_cache(store, executable, digest, prune=False):
     """Retain required builds. Expire decoded raw evidence before evicting its symbol cache."""
+    if executable.stat().st_size > MAX_SYMBOL_FILE:
+        raise RuntimeError('Node executable exceeds the 1GiB symbol-file limit')
     symbols, raw = store / 'symbols', store / 'raw'
     if prune:
         symbols.mkdir(exist_ok=True)
+        for staging in symbols.iterdir():
+            if staging.is_dir() and not staging.is_symlink() and re.fullmatch(r'[0-9a-f]{64}\.building', staging.name):
+                shutil.rmtree(staging)
     protected, references, completed = {digest}, set(), {}
     try:
         status = json.loads((store / 'cpu-status.json').read_text())
@@ -344,7 +363,10 @@ def symbol_cache(store, executable, digest, prune=False):
     sizes = {p: directory_size(p) for p in generations}
     used = sum(sizes.values())
     target = symbols / digest
-    addition = 0 if (target / '.complete').exists() else executable.stat().st_size
+    complete = (target / '.complete').exists()
+    addition = 0 if complete else executable.stat().st_size
+    if not complete:
+        used -= sizes.get(target, 0)  # prepare_symbols replaces this interrupted generation.
     candidates = sorted((p for p in generations if p.name not in protected),
                         key=lambda p: (p.name in references, p.stat().st_mtime))
     removals = []
@@ -364,6 +386,30 @@ def symbol_cache(store, executable, digest, prune=False):
     return target
 
 
+def prepare_symbols(target, executable, digest):
+    """Publish a complete verified generation atomically. Failed copies are never reused."""
+    if (target / '.complete').exists():
+        return
+    # A previous interrupted perf invocation may leave a truncated ELF that perf would skip.
+    if target.exists():
+        shutil.rmtree(target)
+    staging = target.with_name(target.name + '.building')
+    if staging.exists():
+        shutil.rmtree(staging)
+    staging.mkdir()
+    try:
+        subprocess.run(['perf', '--buildid-dir', str(staging), 'buildid-cache', '--add', str(executable)],
+                       timeout=30, preexec_fn=symbol_limits, check=True)
+        copies = list(staging.rglob('elf'))
+        if len(copies) != 1 or sha256_file(copies[0]) != digest:
+            raise RuntimeError('Cached node executable does not match its source SHA-256')
+        (staging / '.complete').write_text(digest + '\n')
+        staging.rename(target)
+    except Exception:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+
+
 def capture(args, stopping):
     store, executable = args.store.resolve(), args.executable.resolve(strict=True)
     raw, inbox = store / 'raw', store / 'inbox'
@@ -377,13 +423,10 @@ def capture(args, stopping):
     start_ticks = identity(pid, executable)
     cgroup = node_cgroup(pid, args.node_service)
     run = current_run(store, pid, start_ticks)
-    digest = hashlib.file_digest(executable.open('rb'), 'sha256').hexdigest()
+    digest = sha256_file(executable)
     prune_raw(raw)
     symbols = symbol_cache(store, executable, digest, prune=True)
-    symbols.mkdir(exist_ok=True)
-    if not (symbols / '.complete').exists():
-        subprocess.run(['perf', '--buildid-dir', str(symbols), 'buildid-cache', '--add', str(executable)], timeout=30, check=True)
-        (symbols / '.complete').touch()
+    prepare_symbols(symbols, executable, digest)
     session = uuid.uuid4().hex
     directory = raw / session
     directory.mkdir()
@@ -529,7 +572,7 @@ def main():
     os.umask(0o077)
     if args.check_symbol_budget:
         executable = args.executable.resolve(strict=True)
-        digest = hashlib.file_digest(executable.open('rb'), 'sha256').hexdigest()
+        digest = sha256_file(executable)
         symbol_cache(args.store.resolve(), executable, digest)
         return
     stopping = [False]

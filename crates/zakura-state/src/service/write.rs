@@ -146,6 +146,7 @@ pub struct PreparedFullStateTransition {
 struct PreparedAuthority {
     transition: zakura_header_chain::TransitionFingerprint,
     retention_references: Vec<block::Hash>,
+    verified_tip: Option<Frontier>,
     evicted_bodies: Vec<block::Hash>,
 }
 
@@ -156,6 +157,7 @@ impl PreparedAuthority {
             .map(|transition| Self {
                 transition,
                 retention_references: Vec::new(),
+                verified_tip: None,
                 evicted_bodies: Vec::new(),
             })
             .ok_or(HeaderChainStoreError::Incoherent(
@@ -176,6 +178,12 @@ impl PreparedAuthority {
 impl FullStateEvidenceAuthority for PreparedAuthority {
     fn authorizes_full_state(&self, event: &TransitionEvent) -> bool {
         event.fingerprint() == Some(self.transition)
+    }
+
+    fn verified_tip(&self, event: &TransitionEvent) -> Option<Frontier> {
+        self.authorizes_full_state(event)
+            .then_some(self.verified_tip)
+            .flatten()
     }
 
     fn evicted_bodies(&self, event: &TransitionEvent) -> &[block::Hash] {
@@ -280,6 +288,7 @@ impl PreparedFullStateTransition {
             &header_request.event,
             staged_tips.clone(),
         )?;
+        authority.verified_tip = Some(expected_verified);
         if matches!(
             &header_request.event,
             TransitionEvent::VerifiedBlockAccepted(_)

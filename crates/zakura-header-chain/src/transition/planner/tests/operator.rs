@@ -691,3 +691,72 @@ fn operator_body_retry_rejects_stale_or_malformed_requests() {
         ))
     ));
 }
+
+#[test]
+fn operator_reconsider_respects_full_state_receipt_preference() {
+    struct PreferredTipAuthority {
+        event: TransitionEvent,
+        tip: Frontier,
+    }
+    impl crate::FullStateEvidenceAuthority for PreferredTipAuthority {
+        fn authorizes_full_state(&self, event: &TransitionEvent) -> bool {
+            event.fingerprint() == self.event.fingerprint()
+        }
+        fn verified_tip(&self, event: &TransitionEvent) -> Option<Frontier> {
+            self.authorizes_full_state(event).then_some(self.tip)
+        }
+    }
+    let (mut store, config) = TestStore::new(EngineMode::Integrated);
+    let clock = ManualClock(Utc::now());
+    let anchor = store.graph.finalized_frontier();
+    let difficulty = store
+        .graph
+        .header_node(anchor.hash)
+        .unwrap()
+        .header
+        .difficulty_threshold;
+    let a = insert_verified_branch(&mut store.graph, anchor, 1, difficulty, 0x11);
+    let b = insert_verified_branch(&mut store.graph, anchor, 1, difficulty, 0x22);
+    let (hash_winner, first_received) = if a.hash.0 > b.hash.0 { (a, b) } else { (b, a) };
+    synchronize_fixture(&mut store, hash_winner);
+    let id = crate::OperatorInvalidationId::new([0x71; 16]);
+    let invalidation = operator_invalidate(&store, hash_winner.hash, id, 0x72);
+    let plan = apply_transition(
+        &store,
+        invalidation,
+        &context(&config, &clock, Some(&Authority)),
+    )
+    .unwrap();
+    store.commit(&plan);
+    let request = operator_reconsider(&store, hash_winner.hash, id, 0x73);
+    let authority = PreferredTipAuthority {
+        event: request.event.clone(),
+        tip: first_received,
+    };
+    let ctx = TransitionContext {
+        config: &config,
+        clock: &clock,
+        full_state_authority: Some(&authority),
+        retention_references: &[],
+    };
+    let plan = apply_transition(&store, request.clone(), &ctx).unwrap();
+    assert_eq!(plan.change_set.metadata.frontiers.header_best, hash_winner);
+    assert_eq!(
+        plan.change_set.metadata.frontiers.verified_best,
+        first_received
+    );
+    let weaker = PreferredTipAuthority {
+        event: request.event.clone(),
+        tip: anchor,
+    };
+    let ctx = TransitionContext {
+        full_state_authority: Some(&weaker),
+        ..ctx
+    };
+    assert!(matches!(
+        apply_transition(&store, request, &ctx),
+        Err(TransitionFailure::InvalidEvidence(
+            InvalidTransitionEvidence::Operator(OperatorViolation::InvalidVerifiedPreference)
+        ))
+    ));
+}

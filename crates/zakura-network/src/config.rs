@@ -1437,6 +1437,10 @@ where
     }
 
     // Set configured funding streams after setting any parameters that affect the funding stream address period.
+    // An explicit empty `funding_streams` list clears the built-in Testnet streams.
+    let are_funding_streams_configured = funding_streams.is_some()
+        || pre_nu6_funding_streams.is_some()
+        || post_nu6_funding_streams.is_some();
     let mut funding_streams_vec = funding_streams.unwrap_or_default();
 
     if let Some(funding_streams) = post_nu6_funding_streams {
@@ -1447,7 +1451,7 @@ where
         funding_streams_vec.insert(0, funding_streams);
     }
 
-    if !funding_streams_vec.is_empty() {
+    if are_funding_streams_configured {
         params_builder = params_builder.with_funding_streams(funding_streams_vec);
     }
 

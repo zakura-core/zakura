@@ -847,6 +847,31 @@ fn max_block_time_start_height_serialization_roundtrip() {
         .is_max_block_time_enforced(start_height));
 }
 
+/// Checks that a configured Testnet with no funding streams keeps none after a
+/// serialization round-trip, instead of inheriting the built-in Testnet streams.
+#[test]
+fn cleared_funding_streams_serialization_roundtrip() {
+    let _init_guard = zakura_test::init();
+    let mut config = Config {
+        network: testnet::Parameters::build()
+            .clear_funding_streams()
+            .to_network()
+            .expect("failed to build configured network"),
+        initial_testnet_peers: [].into(),
+        ..Config::for_test(P2pStack::Dual)
+    };
+    config.zakura.apply_network_defaults(&config.network);
+
+    let serialized = toml::to_string(&config).expect("the custom network serializes");
+    let deserialized: Config =
+        toml::from_str(&serialized).expect("the custom network deserializes");
+    assert_eq!(config, deserialized);
+    let Network::Testnet(params) = &deserialized.network else {
+        panic!("deserialized network must be a Testnet");
+    };
+    assert!(params.funding_streams().is_empty());
+}
+
 #[test]
 fn nsm_reissuance_height_is_derived_after_config_roundtrip() {
     use zakura_chain::parameters::{

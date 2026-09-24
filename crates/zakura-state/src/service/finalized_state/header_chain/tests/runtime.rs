@@ -2574,3 +2574,155 @@ fn finalize_serving_test_path(
         )
         .expect("the authoritative test path finalizes");
 }
+
+fn retained_checkpoint_fixture() -> (HeaderChainRuntime, DiskDb, Vec<VerifiedHeaderRef>) {
+    let (runtime, db, _genesis, path) = reconciled_store_with_finalized_prefix(5);
+    let before = runtime.publisher().snapshot();
+    let evidence = EvidenceId::from_digest([0xc4; 32]);
+    let authority = Authority(evidence);
+    runtime
+        .apply(
+            TransitionRequest {
+                expected_version: before.state_version,
+                event: TransitionEvent::VerifiedChainChanged(VerifiedChainChanged {
+                    full_state_transition_id: evidence,
+                    old_tip: before.frontiers.verified_best,
+                    new_path: Vec::new(),
+                    cause: VerifiedChangeCause::Reset,
+                }),
+            },
+            &TransitionContext {
+                config: &runtime.config,
+                clock: &SystemClock,
+                full_state_authority: Some(&authority),
+                retention_references: &[],
+            },
+        )
+        .expect("the fixture resets the verified tip while retaining its headers");
+    assert_eq!(
+        runtime.publisher().snapshot().frontiers.verified_best,
+        before.frontiers.finalized
+    );
+    (runtime, db, path)
+}
+
+#[test]
+fn retained_checkpoint_omits_context_but_missing_headers_and_other_causes_keep_it() {
+    let (runtime, _db, path) = retained_checkpoint_fixture();
+    let before = runtime.publisher().snapshot();
+    let make_request = |header: VerifiedHeaderRef, cause| TransitionRequest {
+        expected_version: before.state_version,
+        event: TransitionEvent::VerifiedChainChanged(VerifiedChainChanged {
+            full_state_transition_id: zakura_header_chain::checkpoint_finality_evidence(
+                before.state_version,
+                Frontier::new(header.height, header.hash),
+            ),
+            old_tip: before.frontiers.verified_best,
+            new_path: vec![header],
+            cause,
+        }),
+    };
+    let engine = runtime
+        .transition_engine
+        .lock()
+        .expect("the fixture writer is unlocked");
+    let retained = make_request(
+        path[3].clone(),
+        VerifiedChangeCause::CheckpointFinalizedGrow,
+    );
+    let input = runtime
+        .build_transition_input(retained.clone(), &before, runtime.config.network(), &engine)
+        .expect("retained checkpoint input needs no durable context");
+    assert!(input
+        .header_validation_facts()
+        .expect("checkpoint facts exist")
+        .validation_leases
+        .is_empty());
+    let grow = runtime
+        .build_transition_input(
+            make_request(path[3].clone(), VerifiedChangeCause::Grow),
+            &before,
+            runtime.config.network(),
+            &engine,
+        )
+        .expect("ordinary growth keeps its context");
+    assert_eq!(
+        grow.header_validation_facts()
+            .expect("growth facts exist")
+            .validation_leases
+            .len(),
+        1
+    );
+    let mut missing = path[3].clone();
+    Arc::make_mut(&mut missing.header).nonce.0[0] ^= 0x80;
+    missing.hash = missing.header.hash();
+    let input = runtime
+        .build_transition_input(
+            make_request(missing, VerifiedChangeCause::CheckpointFinalizedGrow),
+            &before,
+            runtime.config.network(),
+            &engine,
+        )
+        .expect("a missing header receives durable context");
+    assert_eq!(
+        input
+            .header_validation_facts()
+            .expect("checkpoint facts exist")
+            .validation_leases
+            .len(),
+        1
+    );
+    drop(engine);
+
+    let TransitionEvent::VerifiedChainChanged(event) = &retained.event else {
+        unreachable!()
+    };
+    let authority = Authority(event.full_state_transition_id);
+    let context = TransitionContext {
+        config: &runtime.config,
+        clock: &SystemClock,
+        full_state_authority: Some(&authority),
+        retention_references: &[],
+    };
+    let mut batch = DiskWriteBatch::new();
+    let accepted = Frontier::new(path[3].height, path[3].hash);
+    stage_full_state_canonical_hash(&runtime.store, &mut batch, accepted);
+    assert!(matches!(
+        runtime
+            .apply_combined(retained, &context, batch, || {})
+            .expect("retained checkpoint commits through the full adapter"),
+        ApplyResult::Committed
+    ));
+    assert_eq!(runtime.publisher().snapshot().frontiers.finalized, accepted);
+}
+
+#[test]
+fn retained_checkpoint_still_rejects_mismatched_header_identity() {
+    let (runtime, _db, path) = retained_checkpoint_fixture();
+    let before = runtime.publisher().snapshot();
+    let accepted = Frontier::new(path[3].height, path[3].hash);
+    let evidence =
+        zakura_header_chain::checkpoint_finality_evidence(before.state_version, accepted);
+    let authority = Authority(evidence);
+    let context = TransitionContext {
+        config: &runtime.config,
+        clock: &SystemClock,
+        full_state_authority: Some(&authority),
+        retention_references: &[],
+    };
+    let mut tampered = path[3].clone();
+    Arc::make_mut(&mut tampered.header).nonce.0[0] ^= 0x80;
+    let request = TransitionRequest {
+        expected_version: before.state_version,
+        event: TransitionEvent::VerifiedChainChanged(VerifiedChainChanged {
+            full_state_transition_id: evidence,
+            old_tip: before.frontiers.verified_best,
+            new_path: vec![tampered],
+            cause: VerifiedChangeCause::CheckpointFinalizedGrow,
+        }),
+    };
+    assert!(runtime
+        .apply_combined(request, &context, DiskWriteBatch::new(), || {})
+        .is_err());
+    assert_eq!(runtime.publisher().snapshot(), before);
+}

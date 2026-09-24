@@ -1,4 +1,5 @@
 mod admission;
+mod capacity;
 mod completion;
 mod eviction;
 mod peer_faults;

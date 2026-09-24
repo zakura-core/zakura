@@ -14,6 +14,7 @@ on:
       - deny.toml
       - rust-toolchain.toml
       - .github/workflows/lint.yml
+      - .github/workflows/zakura-mainnet-deploy.yml
       - .github/workflows/cross-platform.yml
       - docs/specs/fork-aware-header-chain-engine.md
       - qa/supply-chain/**
@@ -38,6 +39,7 @@ on:
       - deny.toml
       - rust-toolchain.toml
       - .github/workflows/lint.yml
+      - .github/workflows/zakura-mainnet-deploy.yml
       - .github/workflows/cross-platform.yml
       - docs/specs/fork-aware-header-chain-engine.md
       - qa/supply-chain/**
@@ -189,7 +191,7 @@ jobs:
         if: ${{ !cancelled() }}
         # .github/workflows/scripts/*.sh included: those run on provisioned
         # droplets, where a shell bug costs a full provisioning cycle to find.
-        run: shellcheck scripts/*.sh scripts/lib/*.sh .github/workflows/scripts/*.sh
+        run: shellcheck scripts/*.sh scripts/lib/*.sh .github/workflows/scripts/*.sh deploy/release-state/deploy-archive-pair.sh
       # Stdlib-only, so there is nothing to install.
       - name: Mempool load harness tests
         if: ${{ !cancelled() }}
@@ -217,7 +219,7 @@ jobs:
 
       - name: Deployer tests
         if: ${{ !cancelled() }}
-        run: python3 deploy/deployer/test_deploy.py
+        run: python3 -m unittest discover -s deploy/deployer -p 'test_*.py'
 
       - name: Continuous-sync tests
         if: ${{ !cancelled() }}

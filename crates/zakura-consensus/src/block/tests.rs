@@ -20,7 +20,7 @@ use zakura_chain::{
     orchard,
     parameters::{
         subsidy::block_subsidy,
-        testnet::{ConfiguredActivationHeights, Parameters},
+        testnet::{ConfiguredActivationHeights, ConfiguredCheckpoints, Parameters},
         NetworkUpgrade,
     },
     primitives::Halo2Proof,
@@ -37,6 +37,8 @@ use zakura_test::transcript::{ExpectedTranscriptError, Transcript};
 use crate::{block::check::subsidy_is_valid, transaction};
 
 use super::*;
+
+mod nsm_fees;
 
 static VALID_BLOCK_TRANSCRIPT: Lazy<Vec<(Request, Result<block::Hash, ExpectedTranscriptError>)>> =
     Lazy::new(|| {
@@ -145,6 +147,9 @@ fn prepared_test_verifier(
                     .then_some(zs::KnownBlock::Finalized),
             ),
             zs::Request::CheckBlockProposalValidity(_) => zs::Response::ValidBlockProposal,
+            zs::Request::CheckParentInputs { .. } => {
+                zs::Response::ParentInputs(zs::ParentInputs::Inconclusive)
+            }
             _ => panic!("prepared-path test received an unexpected state request: {request:?}"),
         };
         Ok::<_, BoxError>(response)
@@ -153,6 +158,125 @@ fn prepared_test_verifier(
         service_fn(|request| async move { Ok::<_, BoxError>(accept_block_transaction(request)) });
 
     SemanticBlockVerifier::new(network, state, transaction)
+}
+
+#[tokio::test(start_paused = true)]
+async fn missing_input_requires_committed_parent_evidence() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let _init_guard = zakura_test::init();
+    let block = Arc::new(
+        Block::zcash_deserialize(&zakura_test::vectors::BLOCK_MAINNET_347499_BYTES[..])
+            .expect("the test block deserializes"),
+    );
+    let outpoint = block
+        .transactions
+        .iter()
+        .flat_map(|tx| tx.inputs())
+        .find_map(transparent::Input::outpoint)
+        .expect("the test block spends an external output");
+    #[derive(Clone, Copy, Debug)]
+    enum ContextRead {
+        Missing,
+        ParentUnavailable,
+        Inconclusive,
+        Failed,
+        TimedOut,
+    }
+    #[derive(Debug)]
+    enum Expected {
+        Missing,
+        ParentUnavailable,
+        Timeout,
+    }
+    use ContextRead::*;
+    // The first read runs before the UTXO wait, and the second runs after the wait expires.
+    for (reads, expected) in [
+        (vec![Missing], Expected::Missing),
+        (vec![Inconclusive, Missing], Expected::Missing),
+        (vec![ParentUnavailable, Missing], Expected::Missing),
+        (
+            vec![ParentUnavailable, ParentUnavailable],
+            Expected::ParentUnavailable,
+        ),
+        (vec![Inconclusive, Inconclusive], Expected::Timeout),
+        (vec![Failed, Failed], Expected::Timeout),
+        (vec![TimedOut, TimedOut], Expected::Timeout),
+    ] {
+        let reads = Arc::new(reads);
+        let read_count = Arc::new(AtomicUsize::new(0));
+        let state = service_fn({
+            let reads = reads.clone();
+            let read_count = read_count.clone();
+            move |request: zs::Request| {
+                let reads = reads.clone();
+                let read_count = read_count.clone();
+                async move {
+                    Ok::<_, BoxError>(match request {
+                        zs::Request::KnownBlock(_) => zs::Response::KnownBlock(None),
+                        zs::Request::CheckParentInputs { parent, outpoints } => {
+                            assert!(outpoints.contains(&outpoint));
+                            assert_ne!(parent, block::Hash([0; 32]));
+                            let read = reads[read_count.fetch_add(1, Ordering::SeqCst)];
+                            zs::Response::ParentInputs(match read {
+                                Failed => {
+                                    return Err(std::io::Error::other("state unavailable").into())
+                                }
+                                TimedOut => return std::future::pending().await,
+                                Missing => zs::ParentInputs::Missing(outpoint),
+                                ParentUnavailable => zs::ParentInputs::ParentUnavailable,
+                                Inconclusive => zs::ParentInputs::Inconclusive,
+                            })
+                        }
+                        _ => panic!("unexpected state request: {request:?}"),
+                    })
+                }
+            }
+        });
+        let proven_before_wait = matches!(reads[0], Missing);
+        let transaction = service_fn(move |_: tx::Request| async move {
+            assert!(
+                !proven_before_wait,
+                "proven missing inputs must fail before transaction checks"
+            );
+            Err::<tx::Response, BoxError>(TransactionError::TransparentInputNotFound.into())
+        });
+        let error = SemanticBlockVerifier::new(&Network::Mainnet, state, transaction)
+            .oneshot(Request::Commit(block.clone()))
+            .await
+            .expect_err("the input cannot be resolved");
+        assert_eq!(read_count.load(Ordering::SeqCst), reads.len(), "{reads:?}");
+        match expected {
+            Expected::Missing => {
+                assert!(
+                    matches!(error, VerifyBlockError::MissingTransparentInput { .. }),
+                    "{reads:?}: {error:?}"
+                );
+                assert_eq!(error.misbehavior_score(), 100);
+            }
+            Expected::ParentUnavailable => {
+                assert!(
+                    matches!(error, VerifyBlockError::ParentUnavailable { .. }),
+                    "{reads:?}: {error:?}"
+                );
+                assert_eq!(error.misbehavior_score(), 0);
+                assert!(matches!(
+                    error.body_verification_class(),
+                    zakura_header_chain::BodyVerificationClass::Retryable(_)
+                ));
+            }
+            Expected::Timeout => {
+                assert!(
+                    matches!(
+                        error,
+                        VerifyBlockError::Transaction(TransactionError::TransparentInputNotFound)
+                    ),
+                    "{reads:?}: {error:?}"
+                );
+                assert_eq!(error.misbehavior_score(), 0);
+            }
+        }
+    }
 }
 
 fn accept_block_transaction(request: tx::Request) -> tx::Response {
@@ -462,6 +586,9 @@ async fn proposal_validation_succeeds_when_cache_insertion_conflicts() {
                     .then_some(zs::KnownBlock::Finalized),
             ),
             zs::Request::CheckBlockProposalValidity(_) => zs::Response::ValidBlockProposal,
+            zs::Request::CheckParentInputs { .. } => {
+                zs::Response::ParentInputs(zs::ParentInputs::Inconclusive)
+            }
             zs::Request::CommitSemanticallyVerifiedBlockWithAdmission { block, .. } => {
                 zs::Response::Committed(block.hash)
             }
@@ -682,7 +809,7 @@ fn subsidy_is_valid_for_network(network: Network) -> Result<(), Report> {
         // TODO: first halving, second halving, third halving, and very large halvings
         if height >= canopy_activation_height {
             let expected_block_subsidy =
-                zakura_chain::parameters::subsidy::block_subsidy(height, &network)
+                zakura_chain::parameters::subsidy::block_subsidy(height, &network, None)
                     .expect("valid block subsidy");
 
             check::subsidy_is_valid(&block, &network, expected_block_subsidy)
@@ -741,8 +868,8 @@ fn local_genesis_nu6_3_activation_has_satisfiable_lockbox_rule() -> Result<(), R
             .clone(),
         transactions: vec![Arc::new(coinbase)],
     };
-    let expected_block_subsidy =
-        block_subsidy(height, &network).expect("the local activation height has a block subsidy");
+    let expected_block_subsidy = block_subsidy(height, &network, None)
+        .expect("the local activation height has a block subsidy");
 
     // `subsidy_is_valid` skips all checks (including the lockbox rule) for a
     // zero subsidy, which would make this test vacuous.
@@ -772,6 +899,7 @@ fn coinbase_validation_failure() -> Result<(), Report> {
             .coinbase_height()
             .expect("block should have coinbase height"),
         &network,
+        None,
     )
     .expect("valid block subsidy");
 
@@ -798,6 +926,7 @@ fn coinbase_validation_failure() -> Result<(), Report> {
             .coinbase_height()
             .expect("block should have coinbase height"),
         &network,
+        None,
     )
     .expect("valid block subsidy");
 
@@ -838,6 +967,7 @@ fn coinbase_validation_failure() -> Result<(), Report> {
             .coinbase_height()
             .expect("block should have coinbase height"),
         &network,
+        None,
     )
     .expect("valid block subsidy");
 
@@ -870,7 +1000,7 @@ fn funding_stream_validation_for_network(network: Network) -> Result<(), Report>
         if height >= canopy_activation_height {
             let block = Block::zcash_deserialize(&block[..]).expect("block should deserialize");
             let expected_block_subsidy =
-                zakura_chain::parameters::subsidy::block_subsidy(height, &network)
+                zakura_chain::parameters::subsidy::block_subsidy(height, &network, None)
                     .expect("valid block subsidy");
 
             // Validate
@@ -923,6 +1053,7 @@ fn funding_stream_validation_failure() -> Result<(), Report> {
             .coinbase_height()
             .expect("block should have coinbase height"),
         &network,
+        None,
     )
     .expect("valid block subsidy");
 
@@ -954,7 +1085,7 @@ fn miner_fees_validation_for_network(network: Network) -> Result<(), Report> {
             let block = Block::zcash_deserialize(&block[..]).expect("block should deserialize");
             let coinbase_tx = check::coinbase_is_first(&block)?;
 
-            let expected_block_subsidy = block_subsidy(height, &network)?;
+            let expected_block_subsidy = block_subsidy(height, &network, None)?;
             // See [ZIP-1015](https://zips.z.cash/zip-1015).
             let deferred_pool_balance_change =
                 match NetworkUpgrade::Canopy.activation_height(&network) {
@@ -987,7 +1118,7 @@ fn miner_fees_validation_failure() -> Result<(), Report> {
     let block = Block::zcash_deserialize(&zakura_test::vectors::BLOCK_MAINNET_347499_BYTES[..])
         .expect("block should deserialize");
     let height = block.coinbase_height().expect("valid coinbase height");
-    let expected_block_subsidy = block_subsidy(height, &network)?;
+    let expected_block_subsidy = block_subsidy(height, &network, None)?;
     // See [ZIP-1015](https://zips.z.cash/zip-1015).
     let deferred_pool_balance_change = match NetworkUpgrade::Canopy.activation_height(&network) {
         Some(activation_height) if height >= activation_height => {
@@ -1018,28 +1149,25 @@ fn miner_fees_validation_failure() -> Result<(), Report> {
 struct LibrustzcashConversionFailure {
     name: &'static str,
     network_upgrade: NetworkUpgrade,
-    rk: Option<[u8; 32]>,
+    rk: [u8; 32],
 }
 
+/// Every consensus branch ID in Zakura's table is known to librustzcash, so the
+/// conversion can only fail on malformed Orchard data.
 #[tokio::test]
 async fn block_rejects_transactions_failing_librustzcash_conversion() {
     let _init_guard = zakura_test::init();
 
     let cases = [
         LibrustzcashConversionFailure {
-            name: "unrecognized consensus branch ID",
-            network_upgrade: NetworkUpgrade::Nu7,
-            rk: None,
-        },
-        LibrustzcashConversionFailure {
             name: "incorrect curve point encoding",
             network_upgrade: NetworkUpgrade::Nu5,
-            rk: Some([0xff; 32]),
+            rk: [0xff; 32],
         },
         LibrustzcashConversionFailure {
             name: "rk=identity",
             network_upgrade: NetworkUpgrade::Nu5,
-            rk: Some([0; 32]),
+            rk: [0; 32],
         },
     ];
 
@@ -1047,6 +1175,14 @@ async fn block_rejects_transactions_failing_librustzcash_conversion() {
         let network = librustzcash_conversion_test_network(case.network_upgrade);
         let block = block_with_librustzcash_conversion_failure(case, &network);
         let state_service = zakura_state::init_test(&network).await;
+        let genesis =
+            Arc::<Block>::zcash_deserialize(&zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES[..])
+                .expect("genesis block should deserialize");
+        state_service
+            .clone()
+            .oneshot(zs::Request::CommitCheckpointVerifiedBlock(genesis.into()))
+            .await
+            .expect("genesis block should commit");
         let transaction = transaction::Verifier::new_for_tests(&network, state_service.clone());
         let transaction = Buffer::new(BoxService::new(transaction), 1);
         let block_verifier =
@@ -1084,14 +1220,17 @@ fn librustzcash_conversion_test_network(network_upgrade: NetworkUpgrade) -> Netw
             nu5: Some(1),
             ..Default::default()
         },
-        NetworkUpgrade::Nu7 => ConfiguredActivationHeights {
-            nu7: Some(1),
-            ..Default::default()
-        },
-        _ => panic!("test cases only use NU5 and NU7"),
+        _ => panic!("test cases only use NU5"),
     };
 
     Parameters::build()
+        .with_genesis_hash(genesis_block.hash())
+        .expect("failed to set genesis hash")
+        .with_checkpoints(ConfiguredCheckpoints::HeightsAndHashes(vec![(
+            Height(0),
+            genesis_block.hash(),
+        )]))
+        .expect("failed to set genesis checkpoint")
         .with_activation_heights(activation_heights)
         .expect("failed to set test activation heights")
         .clear_funding_streams()
@@ -1112,6 +1251,7 @@ fn block_with_librustzcash_conversion_failure(
     let mut block =
         Block::zcash_deserialize(&zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES[..])
             .expect("genesis block should deserialize");
+    let parent_hash = block.hash();
 
     block.transactions = vec![
         Arc::new(v5_coinbase_transaction(
@@ -1121,7 +1261,9 @@ fn block_with_librustzcash_conversion_failure(
         )),
         Arc::new(failing_librustzcash_v5_transaction(case, height)),
     ];
-    Arc::make_mut(&mut block.header).merkle_root = block.transactions.iter().collect();
+    let header = Arc::make_mut(&mut block.header);
+    header.previous_block_hash = parent_hash;
+    header.merkle_root = block.transactions.iter().collect();
 
     block
 }
@@ -1132,7 +1274,12 @@ fn v5_coinbase_transaction(
     network: &Network,
 ) -> Transaction {
     let mut outputs = vec![transparent::Output {
-        value: block_subsidy(height, network).expect("valid test block subsidy"),
+        value: block_subsidy(
+            height,
+            network,
+            Some(MAX_MONEY.try_into().expect("valid money reserve")),
+        )
+        .expect("valid test block subsidy"),
         lock_script: transparent::Script::new(&[0]),
     }];
 
@@ -1175,15 +1322,13 @@ fn failing_librustzcash_v5_transaction(
         )
     ]);
 
-    if let Some(rk) = case.rk {
-        shielded_data
-            .actions
-            .iter_mut()
-            .next()
-            .expect("Orchard fixture has at least one action")
-            .action
-            .rk = rk.into();
-    }
+    shielded_data
+        .actions
+        .iter_mut()
+        .next()
+        .expect("Orchard fixture has at least one action")
+        .action
+        .rk = case.rk.into();
 
     Transaction::V5 {
         network_upgrade: case.network_upgrade,
@@ -1597,4 +1742,876 @@ fn state_commit_context_errors_keep_misbehavior_scores() {
 
     let router_error = crate::router::RouterError::from(err);
     assert_eq!(router_error.misbehavior_score(), 100);
+}
+/// A balance that pays a nonzero ZIP 234 bonus.
+const ZIP234_TEST_DEFICIT: i64 = 400_000_000;
+
+/// Restates the fixed NU7 ceiling payout independently of `block_subsidy`.
+fn zip234_bonus(balance: i64) -> i64 {
+    let bonus = (i128::from(balance) * 1_375 + 9_999_999_999) / 10_000_000_000;
+
+    i64::try_from(bonus).expect("the bonus fits in i64")
+}
+
+/// The fixed NU7 ceiling payout for [`ZIP234_TEST_DEFICIT`].
+fn zip234_test_bonus() -> i64 {
+    zip234_bonus(ZIP234_TEST_DEFICIT)
+}
+
+/// Returns the chain value pools after `parent` on `network`, `balance` zatoshi behind the
+/// halving schedule.
+///
+/// The balance is stored in its own value pool leg, and the transparent pool is set so that
+/// the test can isolate subsidy validation from the historical-baseline policy.
+fn zip234_parent_pools(
+    network: &Network,
+    parent: Height,
+    balance: i64,
+) -> zakura_chain::value_balance::ValueBalance<zakura_chain::amount::NonNegative> {
+    let scheduled_supply: i64 = (1..=parent.0)
+        .map(|height| {
+            i64::from(
+                zakura_chain::parameters::subsidy::halving_block_subsidy(Height(height), network)
+                    .expect("valid halving subsidy"),
+            )
+        })
+        .sum();
+
+    let mut pools = zakura_chain::value_balance::ValueBalance::from_transparent_amount(
+        Amount::try_from(scheduled_supply - balance).expect("the issued supply is valid"),
+    );
+    pools.set_nsm_value_balance_amount(Amount::try_from(balance).expect("valid balance"));
+
+    pools
+}
+
+/// Semantic verification checks the coinbase against the ZIP 234 subsidy, which depends on
+/// the parent's chain value pools.
+#[tokio::test]
+async fn zip234_block_verification_checks_the_reissuance_bonus() {
+    use zakura_chain::{block_info::BlockInfo, parameters::subsidy::halving_block_subsidy};
+
+    let _init_guard = zakura_test::init();
+
+    let start = Height(3);
+    let network = zip234_test_network(start);
+    let parent = start.previous().expect("the start is above genesis");
+    let halving_subsidy = halving_block_subsidy(start, &network).expect("valid halving subsidy");
+    let with_bonus = (halving_subsidy
+        + Amount::try_from(zip234_test_bonus()).expect("valid bonus"))
+    .expect("valid subsidy");
+
+    let verify =
+        |parent_balance: i64, coinbase_value: Amount<zakura_chain::amount::NonNegative>| {
+            let network = network.clone();
+            let parent_pools = zip234_parent_pools(&network, parent, parent_balance);
+            let block = zip234_test_block(&network, start, coinbase_value);
+            let expected_parent = block.header.previous_block_hash;
+
+            let state = service_fn(move |request: zs::Request| async move {
+                let response = match request {
+                    zs::Request::KnownBlock(_) => zs::Response::KnownBlock(None),
+                    zs::Request::AwaitBlockInfo(requested_parent) => {
+                        assert_eq!(requested_parent, expected_parent);
+                        zs::Response::BlockInfo(Some(BlockInfo::new(parent_pools, 0)))
+                    }
+                    zs::Request::CommitSemanticallyVerifiedBlock(block) => {
+                        zs::Response::Committed(block.hash)
+                    }
+                    _ => panic!("ZIP 234 test received an unexpected state request: {request:?}"),
+                };
+                Ok::<_, BoxError>(response)
+            });
+            // The real transaction verifier rejects every NU7 transaction until NU7 has a
+            // production consensus branch ID, so this test accepts them unchecked.
+            let transaction = service_fn(|request| async move {
+                Ok::<_, BoxError>(accept_block_transaction(request))
+            });
+            let verifier = SemanticBlockVerifier::new(&network, state, transaction);
+
+            verifier.oneshot(Request::Commit(Arc::new(block)))
+        };
+
+    // Exercise zero, single-zatoshi rounding, a rounding boundary, and a larger deficit.
+    let numerator = 1_375i128;
+    // The largest deficit that still rounds up to a one-zatoshi bonus.
+    let boundary = i64::try_from(10_000_000_000 / numerator).expect("the boundary fits in i64");
+    for deficit in [0i64, 1, 2, boundary, boundary + 1, ZIP234_TEST_DEFICIT] {
+        let bonus = zip234_bonus(deficit);
+        let allowed = (halving_subsidy + Amount::try_from(bonus).unwrap()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), verify(deficit, allowed))
+            .await
+            .expect("verification completes")
+            .expect("exact claim passes");
+        let excess = (allowed + Amount::try_from(1).unwrap()).unwrap();
+        let result =
+            tokio::time::timeout(std::time::Duration::from_secs(10), verify(deficit, excess))
+                .await
+                .expect("verification completes");
+        assert!(
+            matches!(
+                result,
+                Err(VerifyBlockError::Block {
+                    source: BlockError::Transaction(TransactionError::Subsidy(
+                        SubsidyError::InvalidMinerFees
+                    ))
+                })
+            ),
+            "deficit {deficit}: {result:?}"
+        );
+    }
+
+    // The coinbase claims the halving subsidy plus the reissuance bonus.
+    let block = zip234_test_block(&network, start, with_bonus);
+    assert_eq!(
+        verify(ZIP234_TEST_DEFICIT, with_bonus)
+            .await
+            .expect("the coinbase claims the ZIP 234 subsidy"),
+        block.hash(),
+    );
+
+    // A one-zatoshi overclaim must fail the semantic subsidy check.
+    assert!(matches!(
+        verify(
+            ZIP234_TEST_DEFICIT,
+            (with_bonus + Amount::try_from(1).unwrap()).unwrap()
+        )
+        .await,
+        Err(VerifyBlockError::Block {
+            source: BlockError::Transaction(TransactionError::Subsidy(
+                SubsidyError::InvalidMinerFees
+            )),
+        }),
+    ));
+
+    // A coinbase without the bonus does not balance.
+    assert!(matches!(
+        verify(ZIP234_TEST_DEFICIT, halving_subsidy).await,
+        Err(VerifyBlockError::Block {
+            source: BlockError::Transaction(TransactionError::Subsidy(
+                SubsidyError::InvalidMinerFees
+            )),
+        }),
+    ));
+
+    // A parent that issued more than the schedule has a negative balance, which
+    // semantic verification reports instead of computing a subsidy from it.
+    assert!(matches!(
+        verify(-1, halving_subsidy).await,
+        Err(VerifyBlockError::Subsidy(
+            SubsidyError::NegativeNsmValueBalance
+        )),
+    ));
+}
+
+/// The derived crossing gates parent lookups and coinbase claims in semantic verification.
+#[tokio::test]
+async fn derived_nsm_crossing_gates_block_verification() {
+    use zakura_chain::{
+        block_info::BlockInfo,
+        parameters::subsidy::{
+            halving_block_subsidy, nsm_reissuance_height, scheduled_issuance_zatoshis,
+        },
+        value_balance::ValueBalance,
+    };
+
+    let _init_guard = zakura_test::init();
+    let network = zip234_test_network_builder()
+        .to_network()
+        .expect("the fixture has valid network parameters");
+    let start = nsm_reissuance_height(&network)
+        .expect("the full-length halving schedule has a reissuance crossing");
+    assert!(start > Height(1), "NU7 must precede the derived crossing");
+
+    for height in [start.previous().unwrap(), start, start.next().unwrap()] {
+        let active = height >= start;
+        let parent = height.previous().unwrap();
+        let supply = i64::try_from(scheduled_issuance_zatoshis(parent, &network).unwrap())
+            .expect("the scheduled supply fits in i64");
+        let mut parent_pools = ValueBalance::from_transparent_amount(
+            Amount::try_from(supply - ZIP234_TEST_DEFICIT).unwrap(),
+        );
+        parent_pools.set_nsm_value_balance_amount(Amount::try_from(ZIP234_TEST_DEFICIT).unwrap());
+        let scheduled = halving_block_subsidy(height, &network).unwrap();
+        let bonus = zip234_test_bonus();
+
+        // The exact claim changes at the crossing. Also reject an early bonus,
+        // a missing bonus once active, and a one-zatoshi overclaim on either side.
+        for claimed_bonus in [0, bonus, if active { bonus + 1 } else { 1 }] {
+            let valid = claimed_bonus == if active { bonus } else { 0 };
+            let claim = (scheduled + Amount::try_from(claimed_bonus).unwrap()).unwrap();
+            let block = zip234_test_block(&network, height, claim);
+            let hash = block.hash();
+            let expected_parent = block.header.previous_block_hash;
+            let state = service_fn(move |request: zs::Request| async move {
+                Ok::<_, BoxError>(match request {
+                    zs::Request::KnownBlock(requested_hash) => {
+                        assert_eq!(requested_hash, hash);
+                        zs::Response::KnownBlock(None)
+                    }
+                    zs::Request::AwaitBlockInfo(requested_parent) => {
+                        assert!(
+                            active,
+                            "the pre-crossing block must not request an NSM balance"
+                        );
+                        assert_eq!(requested_parent, expected_parent);
+                        zs::Response::BlockInfo(Some(BlockInfo::new(parent_pools, 0)))
+                    }
+                    zs::Request::CommitSemanticallyVerifiedBlock(block) => {
+                        assert!(valid, "an invalid coinbase must not reach state commit");
+                        assert_eq!(block.hash, hash);
+                        zs::Response::Committed(block.hash)
+                    }
+                    _ => panic!("unexpected state request: {request:?}"),
+                })
+            });
+            // Use the existing transaction stub so the test isolates the real semantic
+            // block and subsidy checks from transaction verification.
+            let transaction = service_fn(|request| async move {
+                Ok::<_, BoxError>(accept_block_transaction(request))
+            });
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                SemanticBlockVerifier::new(&network, state, transaction)
+                    .oneshot(Request::Commit(Arc::new(block))),
+            )
+            .await
+            .expect("semantic verification completes");
+
+            if valid {
+                assert_eq!(result.unwrap(), hash);
+            } else {
+                assert!(
+                    matches!(
+                        result,
+                        Err(VerifyBlockError::Block {
+                            source: BlockError::Transaction(TransactionError::Subsidy(
+                                SubsidyError::InvalidMinerFees
+                            ))
+                        })
+                    ),
+                    "height {height:?}, claimed bonus {claimed_bonus}: {result:?}"
+                );
+            }
+        }
+    }
+}
+
+/// A proposal uses its committed parent's balance and rejects an excessive bonus.
+#[tokio::test]
+async fn zip234_proposal_with_committed_parent_checks_the_bonus_without_waiting() {
+    use zakura_chain::{block_info::BlockInfo, parameters::subsidy::halving_block_subsidy};
+
+    let _init_guard = zakura_test::init();
+    let start = Height(3);
+    let network = zip234_test_network(start);
+    let parent_pools =
+        zip234_parent_pools(&network, start.previous().unwrap(), ZIP234_TEST_DEFICIT);
+    let subsidy = (halving_block_subsidy(start, &network).unwrap()
+        + Amount::try_from(zip234_test_bonus()).unwrap())
+    .unwrap();
+    for excess in [0, 1] {
+        let claim = (subsidy + Amount::try_from(excess).unwrap()).unwrap();
+        let block = zip234_test_block(&network, start, claim);
+        let hash = block.hash();
+        let expected_parent = block.header.previous_block_hash;
+        let state = service_fn(move |request: zs::Request| async move {
+            Ok::<_, BoxError>(match request {
+                zs::Request::KnownBlock(_) => zs::Response::KnownBlock(None),
+                zs::Request::BlockInfo(parent) => {
+                    assert_eq!(parent, expected_parent);
+                    zs::Response::BlockInfo(Some(BlockInfo::new(parent_pools, 0)))
+                }
+                zs::Request::CheckBlockProposalValidity(_) => zs::Response::ValidBlockProposal,
+                _ => panic!("a proposal must neither wait nor commit: {request:?}"),
+            })
+        });
+        let transaction =
+            service_fn(
+                |request| async move { Ok::<_, BoxError>(accept_block_transaction(request)) },
+            );
+        let verifier = SemanticBlockVerifier::new(&network, state, transaction);
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            verifier.oneshot(Request::CheckProposal(Arc::new(block))),
+        )
+        .await
+        .expect("proposal verification completes");
+        if excess == 0 {
+            assert_eq!(result.unwrap(), hash);
+        } else {
+            assert!(
+                matches!(
+                    result,
+                    Err(VerifyBlockError::Block {
+                        source: BlockError::Transaction(TransactionError::Subsidy(
+                            SubsidyError::InvalidMinerFees
+                        ))
+                    })
+                ),
+                "{result:?}"
+            );
+        }
+    }
+}
+
+/// A proposal must reject an uncommitted parent without waiting for its commit.
+#[tokio::test]
+async fn zip234_proposal_with_uncommitted_parent_is_rejected_without_waiting() {
+    use zakura_chain::parameters::subsidy::halving_block_subsidy;
+
+    let _init_guard = zakura_test::init();
+
+    let start = Height(3);
+    let network = zip234_test_network(start);
+    let halving_subsidy = halving_block_subsidy(start, &network).expect("valid halving subsidy");
+    let block = zip234_test_block(&network, start, halving_subsidy);
+    let expected_parent = block.header.previous_block_hash;
+
+    let state = service_fn(move |request: zs::Request| async move {
+        let response = match request {
+            zs::Request::KnownBlock(_) => zs::Response::KnownBlock(None),
+            zs::Request::BlockInfo(requested_parent) => {
+                assert_eq!(requested_parent, expected_parent);
+                zs::Response::BlockInfo(None)
+            }
+            _ => panic!("a proposal must not wait for its parent: {request:?}"),
+        };
+        Ok::<_, BoxError>(response)
+    });
+    let transaction =
+        service_fn(|request| async move { Ok::<_, BoxError>(accept_block_transaction(request)) });
+    let verifier = SemanticBlockVerifier::new(&network, state, transaction);
+
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        verifier.oneshot(Request::CheckProposal(Arc::new(block))),
+    )
+    .await
+    .expect("proposal verification does not wait for the parent");
+
+    assert!(
+        matches!(result, Err(VerifyBlockError::ValidateProposal(_))),
+        "{result:?}"
+    );
+}
+
+/// A network with NU7 at height 1 and ZIP 234 reissuance from `start`.
+fn zip234_test_network(start: Height) -> Network {
+    zip234_test_network_builder()
+        .with_test_nsm_reissuance_height(start)
+        .to_network()
+        .expect("failed to build configured network")
+}
+
+/// NU7 fixture parameters with the full halving schedule and no reissuance override.
+fn zip234_test_network_builder() -> zakura_chain::parameters::testnet::ParametersBuilder {
+    let genesis_block =
+        Block::zcash_deserialize(&zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES[..])
+            .expect("genesis block should deserialize");
+    let target_difficulty_limit = genesis_block
+        .header
+        .difficulty_threshold
+        .to_expanded()
+        .expect("genesis difficulty threshold should be valid");
+
+    Parameters::build()
+        .with_genesis_hash(genesis_block.hash())
+        .expect("failed to set genesis hash")
+        .with_checkpoints(ConfiguredCheckpoints::HeightsAndHashes(vec![(
+            Height(0),
+            genesis_block.hash(),
+        )]))
+        .expect("failed to set genesis checkpoint")
+        .with_activation_heights(ConfiguredActivationHeights {
+            nu7: Some(1),
+            ..Default::default()
+        })
+        .expect("failed to set test activation heights")
+        .clear_funding_streams()
+        .with_slow_start_interval(Height::MIN)
+        .with_disable_pow(true)
+        .disable_temporary_orchard_disabling_soft_fork()
+        .with_target_difficulty_limit(target_difficulty_limit)
+        .expect("failed to set target difficulty limit")
+}
+
+/// A block at `height` whose coinbase pays `coinbase_value`.
+fn zip234_test_block(
+    network: &Network,
+    height: Height,
+    coinbase_value: Amount<zakura_chain::amount::NonNegative>,
+) -> Block {
+    let mut block =
+        Block::zcash_deserialize(&zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES[..])
+            .expect("the genesis block deserializes");
+    let mut coinbase = v5_coinbase_transaction(NetworkUpgrade::Nu7, height, network);
+    if let Transaction::V5 { outputs, .. } = &mut coinbase {
+        outputs[0].value = coinbase_value;
+    }
+    block.transactions = vec![Arc::new(coinbase)];
+    Arc::make_mut(&mut block.header).merkle_root = block.transactions.iter().collect();
+
+    block
+}
+
+/// A retry must observe the queued commit's outcome before reporting a duplicate.
+#[tokio::test(start_paused = true)]
+async fn pending_commit_retry_waits_for_state_outcome() {
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+
+    for committed in [true, false] {
+        let mut block: Block = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
+            .zcash_deserialize_into()
+            .unwrap();
+        // If the previous commit fails, revalidation must reach this malformed body.
+        block.transactions.clear();
+        let hash = block.hash();
+        let locations = Arc::new(Mutex::new(VecDeque::from([
+            Some(zs::KnownBlock::WriteChannel),
+            Some(zs::KnownBlock::WriteChannel),
+            committed.then_some(zs::KnownBlock::BestChain),
+        ])));
+        let state = service_fn({
+            let locations = locations.clone();
+            move |request| {
+                assert_eq!(request, zs::Request::KnownBlock(hash));
+                let location = locations
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .expect("three state queries");
+                async move { Ok::<_, BoxError>(zs::Response::KnownBlock(location)) }
+            }
+        });
+        let transaction = service_fn(|_| -> std::future::Ready<Result<tx::Response, BoxError>> {
+            panic!("duplicate and missing-height blocks cannot reach transaction verification")
+        });
+        let verifier = SemanticBlockVerifier::new(&Network::Mainnet, state, transaction);
+        let start = tokio::time::Instant::now();
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            verifier.oneshot(Request::Commit(Arc::new(block))),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert!(start.elapsed() >= std::time::Duration::from_secs(2));
+        assert!(locations.lock().unwrap().is_empty());
+        if committed {
+            assert_eq!(error.duplicate_location(), Some(&zs::KnownBlock::BestChain));
+        } else {
+            assert!(
+                matches!(error, VerifyBlockError::Block { source: BlockError::MissingHeight(h) } if h == hash)
+            );
+        }
+    }
+}
+
+/// A pending commit that never resolves must not hold a caller without its own timeout.
+#[tokio::test(start_paused = true)]
+async fn pending_commit_wait_reports_the_duplicate_after_its_limit() {
+    let block: Block = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
+        .zcash_deserialize_into()
+        .unwrap();
+    let hash = block.hash();
+    let state = service_fn(move |request| {
+        assert_eq!(request, zs::Request::KnownBlock(hash));
+        async move { Ok::<_, BoxError>(zs::Response::KnownBlock(Some(zs::KnownBlock::WriteChannel))) }
+    });
+    let transaction = service_fn(|_| -> std::future::Ready<Result<tx::Response, BoxError>> {
+        panic!("a pending duplicate cannot reach transaction verification")
+    });
+    let start = tokio::time::Instant::now();
+    let error = tokio::time::timeout(
+        super::PENDING_COMMIT_WAIT_LIMIT * 2,
+        SemanticBlockVerifier::new(&Network::Mainnet, state, transaction)
+            .oneshot(Request::Commit(Arc::new(block))),
+    )
+    .await
+    .expect("the pending commit wait has a limit")
+    .unwrap_err();
+    assert!(start.elapsed() >= super::PENDING_COMMIT_WAIT_LIMIT);
+    assert!(start.elapsed() < super::PENDING_COMMIT_WAIT_LIMIT * 2);
+    assert_eq!(
+        error.duplicate_location(),
+        Some(&zs::KnownBlock::WriteChannel)
+    );
+}
+
+/// Tests for the ZIP 218 per-block shielded action limits.
+///
+/// The limits only apply once NU7 is active.
+mod zip218_shielded_action_limits {
+    use std::sync::Arc;
+
+    use proptest::{
+        arbitrary::any,
+        strategy::{Strategy, ValueTree},
+        test_runner::TestRunner,
+    };
+    use zakura_chain::{
+        block::{Block, Height},
+        parameters::{
+            testnet::{ConfiguredActivationHeights, Parameters},
+            Network, NetworkUpgrade, GLOBAL_SHIELDED_BUDGET, ORCHARD_PROTOCOL_BLOCK_ACTION_LIMIT,
+            SAPLING_BLOCK_IO_LIMIT, SPROUT_BLOCK_JOINSPLIT_LIMIT,
+        },
+        primitives::Groth16Proof,
+        serialization::{ZcashDeserialize, ZcashDeserializeInto},
+        transaction::{
+            arbitrary::{
+                fake_v5_with_orchard_actions, fake_v5_with_sapling_outputs,
+                fake_v6_with_orchard_and_ironwood_actions,
+            },
+            JoinSplitData, LockTime, Transaction,
+        },
+    };
+
+    use crate::block::check;
+    use crate::error::TransactionError;
+
+    /// Every historical block satisfies the limits, because NU7 is not active on
+    /// Mainnet. A block with no shielded data also satisfies them once NU7 is
+    /// active.
+    #[test]
+    fn historical_blocks_satisfy_the_limits() {
+        let _init_guard = zakura_test::init();
+
+        for block in zakura_test::vectors::BLOCKS.iter() {
+            let block = block
+                .zcash_deserialize_into::<Block>()
+                .expect("block is structurally valid");
+
+            check::shielded_action_limits_are_valid(
+                &block.transactions,
+                block
+                    .coinbase_height()
+                    .expect("block has a coinbase height"),
+                &Network::Mainnet,
+            )
+            .expect("a historical Mainnet block satisfies the shielded action limits");
+        }
+
+        let genesis =
+            Block::zcash_deserialize(&zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES[..])
+                .expect("mainnet genesis deserializes");
+
+        check::shielded_action_limits_are_valid(
+            &genesis.transactions,
+            Height(1),
+            &nu7_active_testnet(),
+        )
+        .expect("a block with no shielded data satisfies the post-NU7 limits");
+    }
+
+    #[test]
+    fn limits_activate_at_the_nu7_height() {
+        let network = nu7_activation_testnet(2);
+        let over_limit_tx =
+            fake_v5_with_orchard_actions(limit_plus_one(ORCHARD_PROTOCOL_BLOCK_ACTION_LIMIT));
+
+        check::shielded_action_limits_are_valid(
+            [over_limit_tx.clone()].iter(),
+            Height(1),
+            &network,
+        )
+        .expect("the limits are inactive below the NU7 activation height");
+
+        let err =
+            check::shielded_action_limits_are_valid([over_limit_tx].iter(), Height(2), &network)
+                .expect_err("the limits are enforced at the NU7 activation height");
+
+        assert_eq!(
+            err,
+            TransactionError::OrchardActionsExceedBlockLimit {
+                actions: ORCHARD_PROTOCOL_BLOCK_ACTION_LIMIT + 1,
+                limit: ORCHARD_PROTOCOL_BLOCK_ACTION_LIMIT,
+            }
+        );
+    }
+
+    #[test]
+    fn counts_at_the_per_pool_limits_are_accepted() {
+        let cases: [(&str, Arc<Transaction>); 3] = [
+            (
+                "Orchard actions",
+                fake_v5_with_orchard_actions(limit_as_usize(ORCHARD_PROTOCOL_BLOCK_ACTION_LIMIT)),
+            ),
+            (
+                "Sapling spends and outputs",
+                fake_v5_with_sapling_outputs(limit_as_usize(SAPLING_BLOCK_IO_LIMIT)),
+            ),
+            (
+                "Sprout JoinSplits",
+                fake_v4_with_sprout_joinsplits(limit_as_usize(SPROUT_BLOCK_JOINSPLIT_LIMIT)),
+            ),
+        ];
+
+        for (pool, tx) in cases {
+            check::shielded_action_limits_are_valid([tx].iter(), Height(1), &nu7_active_testnet())
+                .unwrap_or_else(|error| {
+                    panic!("{pool} exactly at the per-block limit must pass, got {error}")
+                });
+        }
+    }
+
+    #[test]
+    fn a_cost_at_the_global_budget_is_accepted() {
+        // One Sapling output costs 1, so the rest of the budget can hold one
+        // fewer Orchard action.
+        let orchard_actions = limit_as_usize(
+            GLOBAL_SHIELDED_BUDGET
+                .checked_sub(1)
+                .expect("the global shielded budget covers at least one Sapling output"),
+        );
+
+        check::shielded_action_limits_are_valid(
+            [
+                fake_v5_with_orchard_actions(orchard_actions),
+                fake_v5_with_sapling_outputs(1),
+            ]
+            .iter(),
+            Height(1),
+            &nu7_active_testnet(),
+        )
+        .expect("a combined shielded cost exactly at the global budget must pass");
+    }
+
+    #[test]
+    fn sapling_ios_above_the_limit_are_rejected() {
+        let err = check::shielded_action_limits_are_valid(
+            [fake_v5_with_sapling_outputs(limit_plus_one(
+                SAPLING_BLOCK_IO_LIMIT,
+            ))]
+            .iter(),
+            Height(1),
+            &nu7_active_testnet(),
+        )
+        .expect_err("Sapling spends and outputs above the per-block limit must fail");
+
+        assert_eq!(
+            err,
+            TransactionError::SaplingIOsExceedBlockLimit {
+                ios: SAPLING_BLOCK_IO_LIMIT + 1,
+                limit: SAPLING_BLOCK_IO_LIMIT,
+            }
+        );
+    }
+
+    /// The Sprout limit is zero, so a block containing any JoinSplit is
+    /// rejected once NU7 is active.
+    #[test]
+    fn sprout_joinsplits_above_the_limit_are_rejected() {
+        let err = check::shielded_action_limits_are_valid(
+            [fake_v4_with_sprout_joinsplits(limit_plus_one(
+                SPROUT_BLOCK_JOINSPLIT_LIMIT,
+            ))]
+            .iter(),
+            Height(1),
+            &nu7_active_testnet(),
+        )
+        .expect_err("Sprout JoinSplits above the per-block limit must fail");
+
+        assert_eq!(
+            err,
+            TransactionError::SproutJoinSplitsExceedBlockLimit {
+                joinsplits: SPROUT_BLOCK_JOINSPLIT_LIMIT + 1,
+                limit: SPROUT_BLOCK_JOINSPLIT_LIMIT,
+            }
+        );
+    }
+
+    /// A block can satisfy every per-pool limit and still exceed the global
+    /// budget.
+    #[test]
+    fn a_cost_above_the_global_budget_is_rejected() {
+        let err = check::shielded_action_limits_are_valid(
+            [
+                fake_v5_with_orchard_actions(limit_as_usize(ORCHARD_PROTOCOL_BLOCK_ACTION_LIMIT)),
+                fake_v5_with_sapling_outputs(1),
+            ]
+            .iter(),
+            Height(1),
+            &nu7_active_testnet(),
+        )
+        .expect_err("a combined shielded cost above the global budget must fail");
+
+        assert_eq!(
+            err,
+            TransactionError::ShieldedCostExceedsBlockBudget {
+                cost: GLOBAL_SHIELDED_BUDGET + 1,
+                limit: GLOBAL_SHIELDED_BUDGET,
+            }
+        );
+    }
+
+    /// Ironwood has its own per-pool limit, which Orchard actions do not
+    /// consume.
+    #[test]
+    fn ironwood_actions_above_the_ironwood_limit_are_rejected() {
+        let over_limit = limit_plus_one(ORCHARD_PROTOCOL_BLOCK_ACTION_LIMIT);
+
+        let cases: [(&str, Vec<Arc<Transaction>>); 2] = [
+            ("Ironwood actions alone", vec![ironwood_tx(0, over_limit)]),
+            (
+                "Ironwood actions across transactions",
+                vec![ironwood_tx(0, over_limit - 1), ironwood_tx(0, 1)],
+            ),
+        ];
+
+        for (case, transactions) in cases {
+            let err = check::shielded_action_limits_are_valid(
+                transactions.iter(),
+                Height(1),
+                &nu7_active_testnet(),
+            )
+            .expect_err("Ironwood actions above the Ironwood limit must fail");
+
+            assert_eq!(
+                err,
+                TransactionError::IronwoodActionsExceedBlockLimit {
+                    actions: ORCHARD_PROTOCOL_BLOCK_ACTION_LIMIT + 1,
+                    limit: ORCHARD_PROTOCOL_BLOCK_ACTION_LIMIT,
+                },
+                "{case}"
+            );
+        }
+    }
+
+    /// Each Orchard-protocol pool can reach its own per-pool limit, but the two
+    /// pools share one global budget, so together they cannot exceed it.
+    #[test]
+    fn orchard_and_ironwood_actions_share_the_global_budget() {
+        let over_budget = limit_plus_one(GLOBAL_SHIELDED_BUDGET);
+        let orchard_half = over_budget / 2;
+        let ironwood_half = over_budget - orchard_half;
+
+        let cases: [(&str, Vec<Arc<Transaction>>); 2] = [
+            (
+                "Orchard and Ironwood actions in one transaction",
+                vec![ironwood_tx(orchard_half, ironwood_half)],
+            ),
+            (
+                "Orchard and Ironwood actions in separate transactions",
+                vec![
+                    fake_v5_with_orchard_actions(orchard_half),
+                    ironwood_tx(0, ironwood_half),
+                ],
+            ),
+        ];
+
+        for (case, transactions) in cases {
+            let err = check::shielded_action_limits_are_valid(
+                transactions.iter(),
+                Height(1),
+                &nu7_active_testnet(),
+            )
+            .expect_err("Orchard plus Ironwood actions above the global budget must fail");
+
+            assert_eq!(
+                err,
+                TransactionError::ShieldedCostExceedsBlockBudget {
+                    cost: GLOBAL_SHIELDED_BUDGET + 1,
+                    limit: GLOBAL_SHIELDED_BUDGET,
+                },
+                "{case}"
+            );
+        }
+    }
+
+    #[test]
+    fn ironwood_actions_at_the_ironwood_limit_are_accepted() {
+        let limit = limit_as_usize(ORCHARD_PROTOCOL_BLOCK_ACTION_LIMIT);
+        let orchard_half = limit / 2;
+
+        for tx in [
+            ironwood_tx(0, limit),
+            ironwood_tx(orchard_half, limit - orchard_half),
+        ] {
+            check::shielded_action_limits_are_valid([tx].iter(), Height(1), &nu7_active_testnet())
+                .expect("Orchard and Ironwood actions exactly at the global budget must pass");
+        }
+    }
+
+    /// Ironwood actions add to the global budget like Orchard actions.
+    #[test]
+    fn ironwood_actions_count_in_the_global_budget() {
+        let err = check::shielded_action_limits_are_valid(
+            [
+                ironwood_tx(0, limit_as_usize(ORCHARD_PROTOCOL_BLOCK_ACTION_LIMIT)),
+                fake_v5_with_sapling_outputs(1),
+            ]
+            .iter(),
+            Height(1),
+            &nu7_active_testnet(),
+        )
+        .expect_err("Ironwood actions plus a Sapling output above the global budget must fail");
+
+        assert_eq!(
+            err,
+            TransactionError::ShieldedCostExceedsBlockBudget {
+                cost: GLOBAL_SHIELDED_BUDGET + 1,
+                limit: GLOBAL_SHIELDED_BUDGET,
+            }
+        );
+    }
+
+    /// Returns a V6 transaction with `orchard_actions` Orchard actions and
+    /// `ironwood_actions` Ironwood actions.
+    fn ironwood_tx(orchard_actions: usize, ironwood_actions: usize) -> Arc<Transaction> {
+        fake_v6_with_orchard_and_ironwood_actions(
+            NetworkUpgrade::Nu7,
+            orchard_actions,
+            ironwood_actions,
+        )
+    }
+
+    fn nu7_active_testnet() -> Network {
+        nu7_activation_testnet(1)
+    }
+
+    fn nu7_activation_testnet(nu7_activation_height: u32) -> Network {
+        Parameters::build()
+            .with_slow_start_interval(Height(0))
+            .with_activation_heights(ConfiguredActivationHeights {
+                nu7: Some(nu7_activation_height),
+                ..Default::default()
+            })
+            .expect("activation heights are valid")
+            .clear_funding_streams()
+            .to_network()
+            .expect("configured testnet is valid")
+    }
+
+    fn limit_as_usize(limit: u32) -> usize {
+        usize::try_from(limit).expect("a shielded action limit fits in usize")
+    }
+
+    fn limit_plus_one(limit: u32) -> usize {
+        usize::try_from(limit + 1).expect("a shielded action limit fits in usize")
+    }
+
+    /// Returns a V4 transaction containing `count` Sprout JoinSplits.
+    fn fake_v4_with_sprout_joinsplits(count: usize) -> Arc<Transaction> {
+        let joinsplit_data = count.checked_sub(1).map(|rest_len| {
+            let mut runner = TestRunner::default();
+            let mut joinsplit_data = any::<JoinSplitData<Groth16Proof>>()
+                .new_tree(&mut runner)
+                .expect("sprout JoinSplit data strategy is valid")
+                .current();
+            joinsplit_data.rest = vec![joinsplit_data.first.clone(); rest_len];
+            joinsplit_data
+        });
+
+        Arc::new(Transaction::V4 {
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            lock_time: LockTime::unlocked(),
+            expiry_height: Height(100),
+            joinsplit_data,
+            sapling_shielded_data: None,
+        })
+    }
 }

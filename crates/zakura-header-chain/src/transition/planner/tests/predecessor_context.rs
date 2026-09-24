@@ -89,7 +89,7 @@ fn retained_header_context_uses_exact_span_and_newest_to_oldest_order() {
         let expected_len = usize::try_from(height)
             .expect("fixture height fits")
             .saturating_add(1)
-            .min(crate::POW_ADJUSTMENT_BLOCK_SPAN);
+            .min(crate::MAX_POW_ADJUSTMENT_BLOCK_SPAN);
         let reconstructed = retained_header_context(&store.graph, parent, None, &ctx)
             .expect("fully retained context succeeds without durable facts");
         assert_eq!(reconstructed.len(), expected_len, "height {height}");
@@ -117,7 +117,7 @@ fn retained_header_context_splices_authorized_leases_and_rejects_bad_facts() {
     let full_path = header_path(&store, parent);
     let lease_path: Vec<_> = full_path
         .iter()
-        .take(crate::POW_ADJUSTMENT_BLOCK_SPAN)
+        .take(crate::MAX_POW_ADJUSTMENT_BLOCK_SPAN)
         .cloned()
         .collect();
     let matching_lease = lease_for_path(&store, parent, &lease_path);

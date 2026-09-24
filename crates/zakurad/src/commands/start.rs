@@ -409,6 +409,35 @@ impl StartCmd {
             &config.network.network,
         );
 
+        if config.network.v2_p2p() {
+            // Report boundaries from this binary's effective network configuration.
+            for (upgrade, metric) in [
+                (
+                    zakura_chain::parameters::NetworkUpgrade::Sapling,
+                    "sync.report.sapling.height",
+                ),
+                (
+                    zakura_chain::parameters::NetworkUpgrade::Nu6_3,
+                    "sync.report.ironwood.height",
+                ),
+            ] {
+                if let Some(height) = upgrade.activation_height(&config.network.network) {
+                    metrics::gauge!(metric).set(f64::from(height.0));
+                }
+            }
+            metrics::gauge!("sync.report.checkpoint.height")
+                .set(f64::from(max_checkpoint_height.0));
+            for metric in [
+                "sync.block.payload.received.bytes",
+                "state.vct.fast.block.count",
+                "state.vct.legacy.block.count",
+            ] {
+                metrics::counter!(metric).increment(0);
+            }
+            #[cfg(feature = "sync-metrics")]
+            metrics::counter!("sync.block.payload.committed.bytes").increment(0);
+        }
+
         info!("opening database, this may take a few minutes");
 
         let mut state_config = config.state.clone();
@@ -673,6 +702,7 @@ impl StartCmd {
             mempool: mempool.clone(),
             state: state.clone(),
             latest_chain_tip: latest_chain_tip.clone(),
+            network: config.network.network.clone(),
             misbehavior_sender,
         };
         setup_tx

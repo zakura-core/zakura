@@ -68,6 +68,11 @@ const TOMBSTONE_LIMIT: usize = 65_536;
 const RECONSTRUCTION_PROGRESS_KEY: &[u8] = b"reconstruction-progress-v1";
 const RETAINED_PATH_LEASE_IDLE: Duration = Duration::from_secs(30);
 
+#[cfg(test)]
+thread_local! {
+    static TEST_HEADER_NODE_DISK_READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 #[cfg(feature = "internal-bench")]
 static BENCH_WITNESS_POINT_READS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
@@ -267,6 +272,10 @@ struct TestHeaderCompletionAuthority<'a>(Option<&'a dyn FullStateEvidenceAuthori
 
 #[cfg(test)]
 impl FullStateEvidenceAuthority for TestHeaderCompletionAuthority<'_> {
+    fn evicted_bodies(&self, event: &TransitionEvent) -> &[block::Hash] {
+        self.0.map_or(&[], |inner| inner.evicted_bodies(event))
+    }
+
     fn authorizes_full_state(&self, event: &TransitionEvent) -> bool {
         self.0
             .is_some_and(|inner| inner.authorizes_full_state(event))
@@ -300,6 +309,10 @@ struct StateIssuedAuthority<'a> {
 }
 
 impl FullStateEvidenceAuthority for StateIssuedAuthority<'_> {
+    fn evicted_bodies(&self, event: &TransitionEvent) -> &[block::Hash] {
+        self.inner.map_or(&[], |inner| inner.evicted_bodies(event))
+    }
+
     fn authorizes_full_state(&self, event: &TransitionEvent) -> bool {
         self.inner
             .is_some_and(|inner| inner.authorizes_full_state(event))
@@ -2678,13 +2691,8 @@ impl HeaderChainRuntime {
                 ));
             }
         };
-        let checkpoint_headers_are_retained = match &checkpoint_request.event {
-            TransitionEvent::VerifiedChainChanged(event) => event
-                .new_path
-                .iter()
-                .all(|header| transition_engine.graph().header_node(header.hash).is_some()),
-            _ => false,
-        };
+        let checkpoint_headers_are_retained =
+            retained_checkpoint_headers(&transition_engine, &checkpoint_request.event);
         // Header sync normally admits headers before native checkpoint growth promotes them.
         // Only a missing header needs contextual validation and a validation lease.
         let validation_leases = if checkpoint_headers_are_retained {
@@ -2841,7 +2849,9 @@ impl HeaderChainRuntime {
         request: TransitionRequest,
         before: &EngineSnapshot,
         network: &Network,
+        engine: &HeaderChainEngine,
     ) -> Result<TransitionInput, HeaderChainStoreError> {
+        let retained_checkpoint = retained_checkpoint_headers(engine, &request.event);
         let expected_version = request.expected_version;
         Ok(match request.event {
             TransitionEvent::InsertHeaders(event) => {
@@ -2886,9 +2896,11 @@ impl HeaderChainRuntime {
                     expected_version,
                     event,
                     facts: HeaderValidationFacts {
-                        validation_leases: vec![self
-                            .store
-                            .validation_context(parent.hash, network)?],
+                        validation_leases: if retained_checkpoint {
+                            Vec::new()
+                        } else {
+                            vec![self.store.validation_context(parent.hash, network)?]
+                        },
                     },
                 }
             }
@@ -3238,7 +3250,12 @@ impl HeaderChainRuntime {
                 }
             }
         }
-        let input = self.build_transition_input(request, &before, base_context.config.network())?;
+        let input = self.build_transition_input(
+            request,
+            &before,
+            base_context.config.network(),
+            &transition_engine,
+        )?;
         let validation_leases = input
             .header_validation_facts()
             .map(|facts| facts.validation_leases.clone())
@@ -3304,6 +3321,8 @@ impl HeaderChainRuntime {
             return Ok(ApplyResult::ResourceStalled(receipt));
         }
         if !expectation.staged.is_empty() {
+            let staged_check_start = std::time::Instant::now();
+            let staged_header_count = u32::try_from(expectation.staged.len()).unwrap_or(u32::MAX);
             let put_nodes: HashMap<_, _> = transition
                 .change_set()
                 .put_nodes
@@ -3320,9 +3339,9 @@ impl HeaderChainRuntime {
                 let projected = if deleted.contains(&expected.hash) {
                     None
                 } else if let Some(node) = put_nodes.get(&expected.hash) {
-                    Some((*node).clone())
+                    Some(*node)
                 } else {
-                    self.store.header_node(expected.hash)?
+                    transition_engine.graph().header_node(expected.hash)
                 };
                 let matches = projected.is_some_and(|node| {
                     node.height == expected.height
@@ -3335,6 +3354,10 @@ impl HeaderChainRuntime {
                     });
                 }
             }
+            metrics::histogram!("state.header.full_state_expectation.headers")
+                .record(f64::from(staged_header_count));
+            metrics::histogram!("state.header.full_state_expectation.duration_seconds")
+                .record(staged_check_start.elapsed().as_secs_f64());
         }
         if let Some(expected) = expectation.verified {
             let actual = transition.change_set().metadata.frontiers.verified_best;
@@ -3824,6 +3847,16 @@ pub struct HeaderChainStore {
 }
 
 impl HeaderChainStore {
+    #[cfg(test)]
+    fn reset_header_node_disk_reads() {
+        TEST_HEADER_NODE_DISK_READS.with(|reads| reads.set(0));
+    }
+
+    #[cfg(test)]
+    fn header_node_disk_reads() -> u64 {
+        TEST_HEADER_NODE_DISK_READS.with(std::cell::Cell::get)
+    }
+
     /// Attach the header-chain adapter to the existing finalized-state database.
     pub fn new(db: DiskDb) -> Self {
         Self {
@@ -5434,7 +5467,7 @@ impl HeaderChainStore {
             return Ok(None);
         }
 
-        let predecessor_span = u32::try_from(zakura_header_chain::POW_PREDECESSOR_CONTEXT_SPAN)
+        let predecessor_span = u32::try_from(zakura_header_chain::MAX_POW_PREDECESSOR_CONTEXT_SPAN)
             .map_err(|_| {
                 HeaderChainStoreError::Incoherent("validation context bound does not fit in u32")
             })?;
@@ -5470,6 +5503,14 @@ impl HeaderChainStore {
     }
 
     fn recovery_batch(&self, plan: &RecoveryPlan) -> Result<DiskWriteBatch, HeaderChainStoreError> {
+        if plan
+            .repairs
+            .contains(&RecoveryRepair::NetworkPolicyConfiguration)
+        {
+            tracing::warn!(
+                "header-chain network policy changed; source audit passed, updating stored digest"
+            );
+        }
         let mut batch = DiskWriteBatch::new();
         if plan.repairs.contains(&RecoveryRepair::InheritedEligibility) {
             for node in &plan.header_nodes {
@@ -5928,6 +5969,15 @@ impl HeaderChainStore {
     }
 
     fn header_node(&self, hash: block::Hash) -> Result<Option<HeaderNode>, StoreError> {
+        #[cfg(test)]
+        TEST_HEADER_NODE_DISK_READS.with(|reads| {
+            reads.set(
+                reads
+                    .get()
+                    .checked_add(1)
+                    .expect("test header-node disk read count stays below u64::MAX"),
+            );
+        });
         let value = self
             .get_value::<HeaderNodeDisk>(HEADER_NODE_BY_HASH, hash.0)
             .map_err(store_error)?;
@@ -6113,6 +6163,16 @@ impl HeaderChainStore {
     }
 }
 
+// Retained checkpoint headers already carry contextual validation. The planner still
+// checks their exact identity, continuity, and eligibility before advancing finality.
+// Assumes checkpoint commits carry no retention references; one authenticated only by
+// the skipped parent lease would fail closed with `TransitionFailure::Authority`.
+fn retained_checkpoint_headers(engine: &HeaderChainEngine, event: &TransitionEvent) -> bool {
+    matches!(event, TransitionEvent::VerifiedChainChanged(event)
+        if event.cause == VerifiedChangeCause::CheckpointFinalizedGrow
+            && event.new_path.iter().all(|header| engine.graph().header_node(header.hash).is_some()))
+}
+
 fn authenticated_context_headers(
     store: &HeaderChainStore,
     parent: block::Hash,
@@ -6127,7 +6187,7 @@ fn authenticated_context_headers(
     let parent_node = staged_parent
         .or(stored_parent.as_ref())
         .ok_or(StoreError::Incoherent("validation parent is not retained"))?;
-    let predecessor_span = u32::try_from(zakura_header_chain::POW_PREDECESSOR_CONTEXT_SPAN)
+    let predecessor_span = u32::try_from(zakura_header_chain::MAX_POW_PREDECESSOR_CONTEXT_SPAN)
         .map_err(|_| StoreError::Incoherent("validation context bound does not fit in u32"))?;
     let required = usize::try_from(parent_node.height.0.min(predecessor_span))
         .map_err(|_| StoreError::Incoherent("validation context bound does not fit in usize"))?;

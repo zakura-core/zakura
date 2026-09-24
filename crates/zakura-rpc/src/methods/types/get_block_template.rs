@@ -12,6 +12,7 @@ use std::{
     collections::{HashSet, VecDeque},
     fmt::{self},
     sync::{Arc, Mutex},
+    time::Duration,
 };
 
 use derive_getters::Getters;
@@ -19,7 +20,7 @@ use derive_new::new;
 use jsonrpsee::core::RpcResult;
 use jsonrpsee_types::{ErrorCode, ErrorObject};
 use rand::{rngs::OsRng, RngCore};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, watch, Semaphore};
 use tower::{Service, ServiceExt};
 use zcash_keys::address::Address;
 use zcash_protocol::memo::MemoBytes;
@@ -31,7 +32,10 @@ use zakura_chain::{
     },
     chain_sync_status::ChainSyncStatus,
     chain_tip::ChainTip,
-    parameters::Network,
+    parameters::{
+        subsidy::{is_zip234_active, parent_nsm_value_balance},
+        Network,
+    },
     serialization::{DateTime32, ZcashDeserializeInto},
     transaction::VerifiedUnminedTx,
     work::difficulty::{CompactDifficulty, ExpandedDifficulty},
@@ -41,7 +45,9 @@ use zcash_script::{opcode::PushValue, pv::push_value};
 #[allow(unused_imports)]
 use zakura_chain::serialization::BytesInDisplayOrder;
 
-use zakura_consensus::{router::service_trait::BlockVerifierService, MAX_BLOCK_SIGOPS};
+use zakura_consensus::{
+    error::TransactionError, router::service_trait::BlockVerifierService, MAX_BLOCK_SIGOPS,
+};
 use zakura_node_services::mempool::{self, TransactionDependencies};
 use zakura_state::GetBlockTemplateChainInfo;
 
@@ -53,7 +59,7 @@ use crate::{
     methods::types::{
         default_roots::DefaultRoots, long_poll::LongPollId, transaction::TransactionTemplate,
     },
-    server::error::OkOrError,
+    server::error::{LegacyCode, MapError, OkOrError},
     MinedBlockEvent, PendingBlockRegistry, SubmitBlockChannel,
 };
 
@@ -65,6 +71,11 @@ pub use parameters::{
     GetBlockTemplateCapability, GetBlockTemplateParameters, GetBlockTemplateRequestMode,
 };
 pub use proposal::{BlockProposalResponse, BlockTemplateTimeSource};
+
+/// Proof construction can itself use multiple cores. Admit one build across RPC clones.
+const MAX_TEMPLATE_BUILDS: usize = 1;
+/// Bound admission waits without cancelling an already running proof.
+const TEMPLATE_BUILD_WAIT: Duration = Duration::from_secs(30);
 
 /// Rejections for the current template parent. Overflow fails closed until the tip changes.
 #[derive(Clone, Debug, Default)]
@@ -378,17 +389,20 @@ impl BlockTemplateResponse {
     /// Returns a new [`BlockTemplateResponse`] struct, based on the supplied arguments and defaults.
     ///
     /// The result of this method only depends on the supplied arguments and constants.
-    #[allow(clippy::too_many_arguments)]
+    ///
+    /// Returns an error if the coinbase transaction cannot be built, for example because
+    /// the chain tip's value pools make the ZIP 234 NSM value balance negative. Its `expect`s
+    /// check invariants that the caller already guarantees.
+    #[allow(clippy::too_many_arguments, clippy::unwrap_in_result)]
     pub(crate) fn new_internal(
         net: &Network,
         precomputed_coinbase: Option<TransactionTemplate<amount::NegativeOrZero>>,
         miner_params: &MinerParams,
         chain_info: &GetBlockTemplateChainInfo,
         long_poll_id: LongPollId,
-        #[cfg(not(test))] mempool_txs: Vec<VerifiedUnminedTx>,
-        #[cfg(test)] mempool_txs: Vec<(InBlockTxDependenciesDepth, VerifiedUnminedTx)>,
+        mempool_txs: Vec<zip317::SelectedMempoolTx>,
         submit_old: Option<bool>,
-    ) -> Self {
+    ) -> Result<Self, TransactionError> {
         // Determine the next block height.
         let height = chain_info
             .tip_height
@@ -437,10 +451,24 @@ impl BlockTemplateResponse {
             .sum::<amount::Result<Amount<NonNegative>>>()
             .expect("mempool tx fees must be non-negative");
 
-        let coinbase_txn = precomputed_coinbase.unwrap_or_else(|| {
-            TransactionTemplate::new_coinbase(net, height, miner_params, txs_fee)
-                .expect("valid coinbase tx")
-        });
+        let coinbase_txn = match precomputed_coinbase {
+            Some(coinbase_txn) => coinbase_txn,
+            // ZIP 234 derives the subsidy from the money reserve after the parent, which
+            // is the chain tip this template builds on.
+            None => TransactionTemplate::new_coinbase(
+                net,
+                height,
+                miner_params,
+                txs_fee,
+                if is_zip234_active(net, height) {
+                    Some(parent_nsm_value_balance(
+                        chain_info.value_pools.nsm_value_balance_amount(),
+                    )?)
+                } else {
+                    None
+                },
+            )?,
+        };
 
         let default_roots = DefaultRoots::from_coinbase(
             net,
@@ -468,7 +496,7 @@ impl BlockTemplateResponse {
             "creating template ... "
         );
 
-        BlockTemplateResponse {
+        Ok(BlockTemplateResponse {
             capabilities,
 
             version: ZCASH_BLOCK_VERSION,
@@ -508,7 +536,7 @@ impl BlockTemplateResponse {
             work_id: new_work_id(),
 
             submit_old,
-        }
+        })
     }
 }
 
@@ -693,6 +721,9 @@ where
     /// Coalesces detached template preparation work to the newest template.
     template_preparation_queue: TemplatePreparationQueue<BlockTemplateResponse>,
 
+    /// Shared by foreground construction and long-poll coinbase precomputation.
+    template_build_slots: Arc<Semaphore>,
+
     /// Retains failures so late subscribers cannot miss template withdrawal.
     pub(crate) template_rejections: watch::Sender<TemplateRejections>,
 }
@@ -722,8 +753,37 @@ where
             mined_submissions: Default::default(),
             optimistic_block_inventory,
             template_preparation_queue: TemplatePreparationQueue::default(),
+            template_build_slots: Arc::new(Semaphore::new(MAX_TEMPLATE_BUILDS)),
             template_rejections: watch::channel(TemplateRejections::default()).0,
         }
+    }
+
+    /// Runs bounded proof work off the async worker, retaining capacity across cancellation.
+    pub(crate) async fn run_template_build<T: Send + 'static>(
+        &self,
+        build: impl FnOnce() -> T + Send + 'static,
+    ) -> RpcResult<T> {
+        let permit = tokio::time::timeout(
+            TEMPLATE_BUILD_WAIT,
+            self.template_build_slots.clone().acquire_owned(),
+        )
+        .await
+        .map_err(|_| {
+            ErrorObject::owned(
+                LegacyCode::Misc.into(),
+                "timed out waiting for mining template construction capacity",
+                None::<()>,
+            )
+        })?
+        .map_misc_error()?;
+
+        tokio::task::spawn_blocking(move || {
+            // Dropping the RPC future cannot release capacity while this job still owns work.
+            let _permit = permit;
+            build()
+        })
+        .await
+        .map_misc_error()
     }
 
     pub(crate) fn reserve_mined_submission(

@@ -37,7 +37,7 @@ use zakura_state as zs;
 use crate::{
     block::{Request, SemanticBlockVerifier, VerifyBlockError},
     checkpoint::{CheckpointVerifier, VerifyCheckpointError},
-    error::TransactionError,
+    error::{BlockError, TransactionError},
     transaction, BoxError, Config,
 };
 
@@ -340,6 +340,32 @@ where
     fn call(&mut self, request: Request) -> Self::Future {
         let block = request.block();
 
+        // V5+ transaction IDs authenticate the expiry height, but not the coinbase input height.
+        // Check their agreement before a peer-controlled height selects the checkpoint verifier.
+        if let Some(height) = block.coinbase_height() {
+            let coinbase = &block.transactions[0];
+            if coinbase.version() >= 5 {
+                if let Err(error) =
+                    transaction::check::coinbase_height_matches_expiry(&height, coinbase)
+                {
+                    // A rewritten expiry changes the coinbase transaction ID. That body fails
+                    // its header commitment, so only the supplier is at fault.
+                    let merkle_root: block::merkle::Root =
+                        block.transactions.iter().map(|tx| tx.hash()).collect();
+                    let error = if merkle_root == block.header.merkle_root {
+                        VerifyBlockError::Transaction(error)
+                    } else {
+                        BlockError::BadMerkleRoot {
+                            actual: merkle_root,
+                            expected: block.header.merkle_root,
+                        }
+                        .into()
+                    };
+                    return async { Err(error.into()) }.boxed();
+                }
+            }
+        }
+
         match block.coinbase_height() {
             // There's currently no known use case for block proposals below the checkpoint height,
             // so it's okay to immediately return an error here.
@@ -525,7 +551,13 @@ where
     );
 
     let block = SemanticBlockVerifier::new(network, state_service.clone(), transaction.clone());
-    let checkpoint = CheckpointVerifier::from_checkpoint_list(list, network, tip, state_service);
+    let checkpoint = CheckpointVerifier::from_checkpoint_list(
+        list,
+        network,
+        tip,
+        max_checkpoint_height,
+        state_service,
+    );
     let router = BlockVerifierRouter {
         checkpoint,
         max_checkpoint_height,

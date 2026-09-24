@@ -1,0 +1,19 @@
+[Unit]
+Description=Bounded rotation of Zakura profiling logs
+RequiresMountsFor=/srv/zakura-profile
+
+[Service]
+Type=oneshot
+Group=zakura-profile
+ExecStart=/usr/sbin/logrotate --state /srv/zakura-profile/data/logrotate.status /etc/zakura-profile-logrotate.conf
+TimeoutStartSec=60
+Nice=10
+IOWeight=10
+MemoryMax=128M
+CPUQuota=50%
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/srv/zakura-profile/data
+UMask=0077

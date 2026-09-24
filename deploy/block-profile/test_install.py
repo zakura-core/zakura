@@ -19,6 +19,7 @@ class Installation(unittest.TestCase):
                 "mountpoint": "exit 0\n",
                 "findmnt": 'case "$*" in *FSTYPE*) echo ext4;; *) echo rw,grpquota;; esac\n',
                 "getent": "exit 0\n",
+                "logrotate": "exit 0\n",
                 "quotaon": 'echo "group quota on /srv/zakura-profile (/dev/test) is $QUOTA_STATE"; exit "$QUOTA_STATUS"\n',
             }
             for command in ["groupadd", "useradd", "usermod", "install", "setquota", "systemctl"]:
@@ -40,6 +41,8 @@ class Installation(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("setquota -g zakura-profile 87890625 97656250 0 0 /srv/zakura-profile", mutations)
         self.assertIn("systemctl daemon-reload", mutations)
+        self.assertIn("/etc/zakura-profile-logrotate.conf", mutations)
+        self.assertIn("systemctl enable --now zakura-profile-logrotate.timer", mutations)
 
     def test_disabled_quota_returning_zero_prevents_changes(self):
         result, mutations = self.run_installer("off", 0)

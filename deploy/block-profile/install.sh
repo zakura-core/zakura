@@ -9,6 +9,7 @@ binary=$(realpath "$1")
 node_user=$2
 source_dir=$(cd "$(dirname "$0")" && pwd)
 [[ -x "$binary" ]]
+command -v logrotate >/dev/null
 id "$node_user" >/dev/null
 mountpoint -q /srv/zakura-profile
 fstype=$(findmnt -n -o FSTYPE --target /srv/zakura-profile)
@@ -35,5 +36,7 @@ install -m 0755 "$binary" /usr/local/bin/zakura-profile-explorer
 install -d -m 0755 /opt/zakura-profile
 install -m 0755 "$source_dir/sample.py" "$source_dir/report.py" /opt/zakura-profile/
 install -m 0644 "$source_dir"/*.service "$source_dir"/*.timer "$source_dir"/*.slice /etc/systemd/system/
+install -m 0644 "$source_dir/logrotate.conf" /etc/zakura-profile-logrotate.conf
 systemctl daemon-reload
+systemctl enable --now zakura-profile-logrotate.timer
 echo 'Installed. Configure the node socket, then start the services as described in README.md.'

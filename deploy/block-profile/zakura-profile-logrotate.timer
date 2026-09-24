@@ -1,0 +1,10 @@
+[Unit]
+Description=Check Zakura profiling log sizes every five minutes
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=5min
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target

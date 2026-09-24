@@ -127,6 +127,7 @@ class UpdateTest(unittest.TestCase):
                 return self.base
             return ''
         with patch.object(host.os, 'geteuid', return_value=0), \
+             patch.object(host.os, 'access', return_value=True), \
              patch.object(host.socket, 'gethostname', return_value='fixture'), \
              patch.object(host, 'open', lambda *a, **kw: open(self.root / 'lock', 'w'), create=True), \
              patch.object(host, 'git', side_effect=remote_git), \

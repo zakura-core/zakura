@@ -53,6 +53,8 @@ def old_sources(runs, revision):
 def deploy(args, progress):
     if os.geteuid() != 0 or socket.gethostname() != args.hostname:
         raise RuntimeError('Expected root on the configured profiling host.')
+    if not os.access('/usr/sbin/logrotate', os.X_OK):
+        raise RuntimeError('Install logrotate before updating the profiling host. No services were stopped.')
     # The public web service never exposes this operator command.
     with open('/run/zakura-profile-update.lock', 'w') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -100,7 +102,12 @@ def deploy(args, progress):
             command(['systemctl', 'stop', 'zakura-profile-sampler'])
         command(['install', '-m0755', str(Path(args.repo) / 'deploy/block-profile/sample.py'), '/opt/zakura-profile/sample.py'])
         command(['install', '-m0644', str(Path(args.repo) / 'deploy/block-profile/zakura-profile-sampler.service'), '/etc/systemd/system/zakura-profile-sampler.service'])
+        command(['install', '-m0644', str(Path(args.repo) / 'deploy/block-profile/logrotate.conf'), '/etc/zakura-profile-logrotate.conf'])
+        for suffix in ['service', 'timer']:
+            name = f'zakura-profile-logrotate.{suffix}'
+            command(['install', '-m0644', str(Path(args.repo) / 'deploy/block-profile' / name), f'/etc/systemd/system/{name}'])
         command(['systemctl', 'daemon-reload'])
+        command(['systemctl', 'enable', '--now', 'zakura-profile-logrotate.timer'])
         # Seal the old node's last work, then drain the collector before replacing it.
         for service in SERVICES:
             command(['systemctl', 'stop', service])

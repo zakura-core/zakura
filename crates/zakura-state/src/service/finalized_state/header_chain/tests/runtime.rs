@@ -624,13 +624,13 @@ fn body_refill_does_not_attach_committed_sizes_to_another_fork() {
     )
     .expect("test block size fits u32");
     assert_eq!(
-        crate::service::read::block_size_hints(
+        crate::service::read::block_info(
             full_state.best_chain(),
             &finalized.db,
-            block::Height(1),
-            1
-        ),
-        vec![(block::Height(1), Some(old_size))],
+            old.hash().into(),
+        )
+        .map(|info| info.size()),
+        Some(old_size),
         "the old branch has a confirmed size at the same height",
     );
     let metadata = crate::service::missing_block_body_metadata(
@@ -2154,6 +2154,164 @@ async fn retained_path_serves_a_bounded_finalized_range_below_the_header_frontie
             .expect("the unknown target lookup is coherent"),
         RetainedPathLeaseOutcome::TargetNotRetained
     ));
+}
+
+#[test]
+fn body_size_hints_by_hash_read_known_sizes_from_retained_deliveries() {
+    let (runtime, db, _genesis, path) = reconciled_store_with_finalized_prefix(5);
+    let parent = Frontier::new(path[2].height, path[2].hash);
+    let target = Frontier::new(path[3].height, path[3].hash);
+    let successor = Frontier::new(path[4].height, path[4].hash);
+    let snapshot = runtime.publisher().snapshot();
+    let owner = zakura_header_chain::BodyWorkAuthority::for_snapshot(&snapshot)
+        .bind(27, NonZeroU64::new(28).expect("twenty-eight is nonzero"));
+    let range = runtime
+        .reader()
+        .vct_repair_context(owner, target.height)
+        .expect("the range repair context is coherent")
+        .expect("the selected empty range needs repair");
+    let prefix = range
+        .bounded_prefix(1)
+        .expect("the one-header range prefix exists");
+    let lease = runtime
+        .reader()
+        .validation_context(parent.hash)
+        .expect("the repair parent validation context is coherent")
+        .expect("the repair parent remains retained");
+    let rules =
+        HeaderRules::for_validation_lease(&lease).expect("the repair parent produces header rules");
+    let batch = zakura_header_chain::prepare_headers(
+        HeaderBatchInput::new(std::slice::from_ref(&path[3].header)),
+        parent,
+        &rules,
+        &SystemClock,
+    )
+    .expect("the selected prefix passes deterministic preparation");
+    let source = SourceId::from_digest([0xc1; 32]);
+    let known_size = std::num::NonZeroU32::new(123_456).expect("the fixture size is nonzero");
+    let request = TransitionRequest {
+        expected_version: StateVersion::default(),
+        event: TransitionEvent::InsertHeaders(Box::new(InsertHeaders {
+            owner: owner.into(),
+            source,
+            parent_hash: parent.hash,
+            target_tip_hash: target.hash,
+            completion: TargetCompletion::SelectedAuxiliaryRepair {
+                common_ancestor: parent,
+                selected_target: target,
+                episode: prefix.episode,
+            },
+            batch,
+            aux: vec![AuxDelivery::new(
+                EvidenceId::from_digest([0xc2; 32]),
+                target.hash,
+                source,
+                owner.into(),
+                zakura_header_chain::BodySizeHint::Unknown,
+                Some(zakura_header_chain::TreeAuxRecordV1 {
+                    height: target.height,
+                    sapling_root: Default::default(),
+                    orchard_root: Default::default(),
+                    ironwood_root: Default::default(),
+                    sapling_tx_count: 1,
+                    orchard_tx_count: 0,
+                    ironwood_tx_count: 0,
+                    auth_data_root: [0xc3; 32].into(),
+                }),
+            )],
+        })),
+    };
+    let original_request = request.clone();
+    let context = TransitionContext {
+        config: &runtime.config,
+        clock: &SystemClock,
+        full_state_authority: None,
+        retention_references: &[],
+    };
+    assert!(matches!(
+        runtime
+            .apply(request, &context)
+            .expect("the one-header range prefix applies"),
+        ApplyResult::Committed
+    ));
+
+    let hints_by_hash = || {
+        runtime
+            .reader()
+            .body_size_hints_by_hash(&[parent.hash, target.hash, successor.hash])
+            .expect("the delivery hints read")
+    };
+    assert_eq!(hints_by_hash(), vec![None, None, None]);
+    assert!(runtime
+        .store
+        .scan_raw(HEADER_AUX_BODY_SIZE)
+        .unwrap()
+        .is_empty());
+    let replay = |request_id, marker, size| {
+        let view = runtime.publisher().view();
+        let mut replay = original_request.clone();
+        replay.expected_version = view.state_version;
+        let TransitionEvent::InsertHeaders(insert) = &mut replay.event else {
+            unreachable!()
+        };
+        let new_owner = HeaderWorkAuthority::for_target(&view.snapshot, target.hash)
+            .bind(27, NonZeroU64::new(request_id).unwrap());
+        insert.owner = new_owner.into();
+        insert.completion = TargetCompletion::TargetPrefix {
+            common_ancestor: parent,
+        };
+        insert.aux[0].owner = new_owner.into();
+        insert.aux[0].delivery_id = EvidenceId::from_digest([marker; 32]);
+        insert.aux[0].body_size = zakura_header_chain::BodySizeHint::new(size).unwrap();
+        replay
+    };
+    let before = runtime.publisher().view();
+    let filled = runtime
+        .apply(replay(29, 0xc4, known_size.get()), &context)
+        .unwrap();
+    assert!(matches!(filled, ApplyResult::Committed), "{filled:?}");
+    let after = runtime.publisher().view();
+    assert_eq!(after.header_generation, before.header_generation);
+    assert_eq!(after.body_work_epoch, before.body_work_epoch);
+    assert_eq!(
+        after.body_size_hint_revision,
+        before.body_size_hint_revision + 1
+    );
+    assert_eq!(
+        runtime.store.scan_raw(HEADER_AUX_DELIVERY).unwrap().len(),
+        1
+    );
+    assert_eq!(
+        runtime.store.scan_raw(HEADER_AUX_BODY_SIZE).unwrap().len(),
+        1
+    );
+    let persisted = runtime.store.untrusted_aux_deliveries(target.hash).unwrap();
+    assert_eq!(
+        persisted[0].delivery().body_size,
+        zakura_header_chain::BodySizeHint::Unknown
+    );
+    assert_eq!(hints_by_hash(), vec![None, Some(known_size), None]);
+
+    // A differing known hint is false, so it cannot replace the filled size.
+    let conflicting = runtime.apply(replay(30, 0xc5, 3_146), &context).unwrap();
+    assert!(
+        matches!(conflicting, ApplyResult::NoChange(_)),
+        "{conflicting:?}"
+    );
+    assert_eq!(
+        runtime.publisher().view().body_size_hint_revision,
+        after.body_size_hint_revision
+    );
+    let config = runtime.config.clone();
+    drop(runtime);
+    let (reopened, _) = HeaderChainStore::new(db).startup(&config).unwrap();
+    assert_eq!(
+        reopened
+            .reader()
+            .body_size_hints_by_hash(&[target.hash])
+            .unwrap(),
+        vec![Some(known_size)]
+    );
 }
 
 #[test]

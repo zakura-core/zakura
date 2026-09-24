@@ -85,7 +85,7 @@ proptest = { workspace = true, optional = true }
 proptest-derive = { workspace = true, optional = true }
 
 zakura-chain = { path = "../zakura-chain", version = "8.0.0", features = ["async-error"] }
-zakura-header-chain = { path = "../zakura-header-chain", version = "3.0.0" }
+zakura-header-chain = { path = "../zakura-header-chain", version = "4.0.0" }
 zakura-jsonl-trace = { path = "../zakura-jsonl-trace", version = "1.2.0" }
 zakura-node-services = { path = "../zakura-node-services", version = "4.0.0" }
 
@@ -100,7 +100,7 @@ toml = { workspace = true }
 tracing-subscriber = { workspace = true }
 
 zakura-chain = { path = "../zakura-chain", version = "8.0.0", features = ["proptest-impl"] }
-zakura-header-chain = { path = "../zakura-header-chain", version = "3.0.0", features = ["test-support"] }
+zakura-header-chain = { path = "../zakura-header-chain", version = "4.0.0", features = ["test-support"] }
 zakura-test = { path = "../zakura-test/", version = "2.1.0" }
 
 [lints]

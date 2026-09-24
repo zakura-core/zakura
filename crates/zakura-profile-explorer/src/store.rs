@@ -700,25 +700,38 @@ impl Reader {
                 .unwrap_or("")
         });
         let since = now_ms().saturating_sub(DAY_MS);
+        // The current run identifies node health, not the retained block history.
+        let run_filter = if selected.is_some() {
+            "run=?1"
+        } else {
+            "?1=?1"
+        };
+        let latest_recording = if selected.is_some() {
+            LATEST_IN_SESSION
+        } else {
+            LATEST_ACROSS_RUNS
+        };
         let cohort = format!(
-            "run=?1 AND mode=?2 AND outcome='success' AND utc_ms>=?3 AND {LATEST_IN_SESSION}"
+            "{run_filter} AND mode=?2 AND outcome='success' AND utc_ms>=?3 AND {latest_recording}"
         );
         let timings = format!("{cohort} AND {VALID_TIMING} AND {READY_TIMING}");
         let latest = self.rows(
-            &format!("{COLUMNS} WHERE {cohort} ORDER BY utc_ms DESC,attempt DESC LIMIT 10"),
+            &format!(
+                "{COLUMNS} WHERE {cohort} ORDER BY utc_ms DESC,run DESC,attempt DESC LIMIT 10"
+            ),
             run,
             mode,
             0,
         )?;
         let outliers = self.rows(&format!("{COLUMNS} WHERE {timings} AND end_us-start_us>=120000 ORDER BY end_us-start_us DESC LIMIT 20"),run,mode,since)?;
-        let failures = self.rows(&format!("{COLUMNS} WHERE run=?1 AND mode=?2 AND utc_ms>=?3 AND (outcome IS NULL OR outcome IN ('failed','abandoned')) AND {LATEST_IN_SESSION} ORDER BY utc_ms DESC,attempt DESC LIMIT 20"),run,mode,since)?;
-        let counts: Value = self.db.query_row("SELECT count(*),coalesce(sum(outcome='success'),0),coalesce(sum(expected_spans IS NOT NULL AND expected_spans=received_spans AND dropped=0 AND expired=0),0),min(utc_ms),max(utc_ms) FROM attempts WHERE run=? AND mode=? AND utc_ms>=?", params![run,mode,integer(since)?], |r| Ok(json!({"captured":r.get::<_,i64>(0)?,"success":r.get::<_,i64>(1)?,"sealed_detail":r.get::<_,i64>(2)?,"first_ms":r.get::<_,Option<i64>>(3)?,"last_ms":r.get::<_,Option<i64>>(4)?})))?;
+        let failures = self.rows(&format!("{COLUMNS} WHERE {run_filter} AND mode=?2 AND utc_ms>=?3 AND (outcome IS NULL OR outcome IN ('failed','abandoned')) AND {latest_recording} ORDER BY utc_ms DESC,attempt DESC LIMIT 20"),run,mode,since)?;
+        let counts: Value = self.db.query_row(&format!("SELECT count(*),coalesce(sum(outcome='success'),0),coalesce(sum(expected_spans IS NOT NULL AND expected_spans=received_spans AND dropped=0 AND expired=0),0),min(utc_ms),max(utc_ms) FROM attempts WHERE {run_filter} AND mode=?2 AND utc_ms>=?3"), params![run,mode,integer(since)?], |r| Ok(json!({"captured":r.get::<_,i64>(0)?,"success":r.get::<_,i64>(1)?,"sealed_detail":r.get::<_,i64>(2)?,"first_ms":r.get::<_,Option<i64>>(3)?,"last_ms":r.get::<_,Option<i64>>(4)?})))?;
         let accepted: i64 = self.db.query_row(
             &format!("SELECT count(*) FROM attempts a WHERE {timings}"),
             params![run, mode, integer(since)?],
             |r| r.get(0),
         )?;
-        let excluded: i64 = self.db.query_row("SELECT count(*) FROM attempts a JOIN timing_exclusions e USING(run,attempt) WHERE run=? AND mode=? AND utc_ms>=?",params![run,mode,integer(since)?],|r|r.get(0))?;
+        let excluded: i64 = self.db.query_row(&format!("SELECT count(*) FROM attempts a JOIN timing_exclusions e USING(run,attempt) WHERE {run_filter} AND mode=?2 AND utc_ms>=?3"),params![run,mode,integer(since)?],|r|r.get(0))?;
         let startup: i64 = self.db.query_row(
             &format!("SELECT count(*) FROM attempts a WHERE {cohort} AND NOT ({READY_TIMING})"),
             params![run, mode, integer(since)?],
@@ -901,6 +914,7 @@ impl Reader {
 
 // Choose the newest request before filtering its outcome or timing validity, so an old
 // success cannot resurface as a slow block after a newer recording replaces it.
+const LATEST_ACROSS_RUNS: &str = "NOT EXISTS (SELECT 1 FROM attempts b WHERE b.hash=a.hash AND b.mode=a.mode AND (b.utc_ms,b.run,b.attempt)>(a.utc_ms,a.run,a.attempt))";
 const LATEST_IN_SESSION: &str = "NOT EXISTS (SELECT 1 FROM attempts b WHERE b.run=a.run AND b.hash=a.hash AND b.mode=a.mode AND (b.utc_ms,b.attempt)>(a.utc_ms,a.attempt))";
 const VALID_TIMING: &str =
     "NOT EXISTS (SELECT 1 FROM timing_exclusions e WHERE e.run=a.run AND e.attempt=a.attempt)";

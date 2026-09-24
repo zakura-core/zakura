@@ -20,6 +20,7 @@ CREATE TABLE IF NOT EXISTS attempts (
  received_spans INTEGER NOT NULL DEFAULT 0, expired INTEGER NOT NULL DEFAULT 0,
  PRIMARY KEY(run,attempt)
 );
+CREATE INDEX IF NOT EXISTS recent_across_runs ON attempts(mode,outcome,utc_ms DESC,run DESC,attempt DESC);
 CREATE INDEX IF NOT EXISTS recent ON attempts(run,mode,outcome,utc_ms DESC);
 CREATE INDEX IF NOT EXISTS slow ON attempts(run,mode,outcome,end_us-start_us DESC);
 CREATE INDEX IF NOT EXISTS hashes ON attempts(hash);

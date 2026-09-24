@@ -1132,3 +1132,62 @@ fn collector_accounting_survives_sampler_atomic_publication() -> Result<()> {
     store.prune()?;
     Ok(())
 }
+
+#[test]
+fn home_keeps_history_across_restarts_and_uses_latest_block_result() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let mut store = Store::open(temp.path(), 16_000_000)?;
+    store.ingest(metadata())?;
+    store.ingest(event(1, recording(1, 1, 100, 900_000)))?;
+    store.ingest(event(2, recording(2, 2, 200, 600_000)))?;
+    store.ingest(event(3, recording(3, 3, 300, 800_000)))?;
+    store.db.execute(
+        "UPDATE attempts SET utc_ms=? WHERE attempt=3",
+        [integer(now_ms().saturating_sub(DAY_MS + 1000))?],
+    )?;
+    let next_run = "22222222222222222222222222222222";
+    let mut next = metadata();
+    if let Frame::Run { run, .. } = &mut next {
+        run.id = next_run.into();
+        run.utc_start_ms += 10_000;
+    }
+    store.ingest(next)?;
+    for (sequence, data) in [
+        (1, recording(1, 1, 100, 50_000)),
+        (2, recording(2, 4, 200, 60_000)),
+    ] {
+        store.ingest(Frame::Event {
+            schema: SCHEMA_VERSION,
+            run_id: next_run.into(),
+            sequence,
+            data,
+        })?;
+    }
+    let reader = Reader::open(temp.path())?;
+    let home = reader.home(None, "semantic")?;
+    assert_eq!(home["run"], next_run);
+    let latest = home["latest"].as_array().context("latest rows")?;
+    assert_eq!(latest.len(), 4);
+    assert_eq!(latest[0]["run"], next_run);
+    assert_eq!(
+        latest
+            .iter()
+            .filter(|r| r["hash"] == "01".repeat(32))
+            .count(),
+        1
+    );
+    assert!(latest.iter().any(|r| r["run"] == RUN && r["attempt"] == 2));
+    assert_eq!(home["outliers"].as_array().context("outliers")?.len(), 1);
+    assert_eq!(home["outliers"][0]["run"], RUN);
+    assert_eq!(home["outliers"][0]["attempt"], 2);
+    assert_eq!(home["timing_blocks"], 3);
+    assert_eq!(
+        reader.home(Some(next_run), "semantic")?["latest"]
+            .as_array()
+            .context("run rows")?
+            .len(),
+        2
+    );
+    assert_eq!(reader.detail(RUN, 1)?["summary"]["end_us"], 900100);
+    Ok(())
+}

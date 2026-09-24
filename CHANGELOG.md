@@ -21,8 +21,7 @@ independently.
   recorded time, with metadata and downloads collapsed. Profiles identify the
   included main commit, with a single command to update the dedicated node. Block and transaction
   hashes link to CipherScan when retained. Home starts with the
-  latest blocks, search, and slow blocks from 120 ms, and follows the current
-  profile automatically
+  latest blocks, search, and slow blocks from 120 ms, and retains visible history across node restarts and version updates
   without session or route controls. Block URLs use height or hash and always
   resolve the latest recording, including links to older recordings. Known
   measurement interference is labeled and excluded from timing statistics, and

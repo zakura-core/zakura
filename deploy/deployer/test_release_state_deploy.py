@@ -183,6 +183,13 @@ class PairedShellTests(unittest.TestCase):
                 path = root / name
                 path.write_text(f"#!/bin/sh\necho zakurad+g{SHA[:12]}\n")
                 path.chmod(0o755)
+            options = ["--state-cache-dir", "--full-list", "--mainnet-frontier-output",
+                       "--mainnet-subtree-output", "--mainnet-frontier-grid-output",
+                       "--mainnet-frontier-grid-input", "--frontier-grid-target-cost-ms"]
+            if failure.startswith("missing:"):
+                options.remove(failure.split(":", 1)[1])
+            (root / "stage/zakura-checkpoints").write_text(
+                "#!/bin/sh\nprintf '%s\\n' '" + "\n".join(options) + "'\n")
             wrapper = root / "mocks/command"
             wrapper.write_text(f'''#!{sys.executable}
 import os, pathlib, sys
@@ -264,6 +271,18 @@ elif name == "curl":
                  "systemctl stop zakurad", "systemctl start zakurad", "flock -u 9",
                  "systemctl start zakura-release-state.service", "systemctl start zakura-release-state.timer"]
         self.assertEqual(sorted(events.index(event) for event in order), [events.index(event) for event in order])
+
+    def test_missing_publisher_options_rejected_before_changing_host(self):
+        for option in ("--state-cache-dir", "--full-list", "--mainnet-frontier-output",
+                       "--mainnet-subtree-output", "--mainnet-frontier-grid-output",
+                       "--mainnet-frontier-grid-input", "--frontier-grid-target-cost-ms"):
+            with self.subTest(option=option):
+                result, events, installed, marker = self.run_pair(f"missing:{option}")
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(f"lacks publisher option {option}", result.stderr)
+                self.assertFalse(installed)
+                self.assertFalse(marker)
+                self.assertFalse(any(event.startswith("systemctl ") for event in events))
 
     def test_busy_publisher_preserves_node_and_restores_timer(self):
         result, events, installed, marker = self.run_pair("lock")

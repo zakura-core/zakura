@@ -25,7 +25,18 @@ TIMER=zakura-release-state.timer
 [ -z "${RELEASE_STATE_SNAPSHOT_UNIT:-}" ]
 version=$("$STAGE/zakurad" --version)
 [[ "$version" =~ \+([0-9]+\.)?g${REVISION:0:9} ]]
-"$STAGE/zakura-checkpoints" --help >/dev/null
+# The publisher scripts remain host-managed. A main ancestor can still predate
+# their CLI contract. Include optional resume/cost arguments so later timer runs
+# cannot discover an incompatibility after the binaries have been replaced.
+exporter_help=$("$STAGE/zakura-checkpoints" --help)
+for option in --state-cache-dir --full-list --mainnet-frontier-output \
+    --mainnet-subtree-output --mainnet-frontier-grid-output \
+    --mainnet-frontier-grid-input --frontier-grid-target-cost-ms; do
+    if ! grep -Eq -- "(^|[[:space:],])${option}([=[:space:]]|$)" <<< "$exporter_help"; then
+        echo "Exporter $REVISION lacks publisher option $option; refusing deployment." >&2
+        exit 1
+    fi
+done
 
 # Keep concurrent deployments out until publication completes.
 exec 8>/run/zakura-release-state-deploy.lock

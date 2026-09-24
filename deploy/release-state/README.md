@@ -152,6 +152,9 @@ The mainnet fleet deployer marks `archive-vct-off` with
 `zakura-checkpoints` exporter at the same resolved commit. The exporter revision
 must be on `origin/main`. Deployment tooling comes from the workflow revision,
 so selecting an older release does not select an older deployment procedure.
+Before changing the host, the deployer checks that the exporter supports the
+publisher's required CLI options, including grid output, resume, and cost settings.
+Older exporters that lack any of these options are rejected before installation.
 
 The deployer pauses the timer, waits up to ten minutes for publication to finish,
 and installs both binaries before restarting the node. It checks RPC and a

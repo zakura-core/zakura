@@ -1028,3 +1028,45 @@ fn cpu_late_window_retains_exact_maximum_duration_overlap() -> Result<()> {
     assert_eq!(data["samples"][0]["at_us"], 10);
     Ok(())
 }
+
+#[test]
+fn cpu_pending_waits_for_boundary_neighbor_with_late_samples() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let store = cpu_test_store(temp.path())?;
+    fs::write(
+        temp.path().join("cpu-status.json"),
+        serde_json::to_vec(&json!({
+            "run":RUN,"state":"recording","updated_ms":now_ms(),"started_mono_us":1_000_000,
+            "published_through_mono_us":1_900_000
+        }))?,
+    )?;
+    let mut first = cpu_v2(vec![(200, 1)]);
+    first.end_mono_us = 1_900_000;
+    import_cpu(&store, &first, &"a".repeat(32))?;
+    let reader = Reader::open(temp.path())?;
+    let initial = reader.cpu(RUN, 1, "recorded")?;
+    assert_eq!(initial["window"]["end_us"], 800000);
+    assert_eq!(initial["counts"]["returned_samples"], 1);
+    assert_eq!(
+        initial["coverage"]["state"], "pending",
+        "observed sealing end does not prove the neighboring segment was imported"
+    );
+
+    let mut neighbor = cpu_v2(vec![(770000, 2)]);
+    neighbor.start_mono_us = 1_750_000;
+    neighbor.end_mono_us = 2_000_000;
+    import_cpu(&store, &neighbor, &"b".repeat(32))?;
+    let updated = reader.cpu(RUN, 1, "recorded")?;
+    assert_eq!(updated["counts"]["returned_samples"], 2);
+    assert_eq!(updated["coverage"]["state"], "pending");
+
+    let mut beyond = cpu_v2(vec![]);
+    beyond.start_mono_us = 1_900_000;
+    beyond.end_mono_us = 2_100_000;
+    import_cpu(&store, &beyond, &"c".repeat(32))?;
+    let settled = reader.cpu(RUN, 1, "recorded")?;
+    assert_eq!(settled["counts"]["returned_samples"], 2);
+    assert_eq!(settled["coverage"]["state"], "partial");
+    assert_eq!(reader.detail(RUN, 1)?["cpu"]["pending"], false);
+    Ok(())
+}

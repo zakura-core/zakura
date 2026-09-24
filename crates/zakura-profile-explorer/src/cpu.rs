@@ -203,17 +203,19 @@ pub(crate) fn import(db: &Connection, path: &Path, source: &Path) -> Result<()> 
 }
 
 fn pending(db: &Connection, path: &Path, run: &str, anchor: u64, end: u64) -> bool {
-    let imported: Option<i64> = db
+    // A seal's observed end can precede publication of neighboring samples inside this
+    // window. Wait for an imported segment whose sample-adjusted start is beyond it.
+    let imported_start: Option<i64> = db
         .query_row(
-            "SELECT max(end_us) FROM cpu WHERE run=? AND start_us>=coalesce((SELECT max(start_us)-120000000 FROM cpu WHERE run=? AND deleting=0),0) AND deleting=0",
-            [run,run],
+            "SELECT max(start_us) FROM cpu WHERE run=? AND deleting=0",
+            [run],
             |r| r.get(0),
         )
         .ok()
         .flatten();
-    if imported
+    if imported_start
         .and_then(|n| u64::try_from(n).ok())
-        .is_some_and(|n| end <= n)
+        .is_some_and(|n| end < n)
     {
         return false;
     }

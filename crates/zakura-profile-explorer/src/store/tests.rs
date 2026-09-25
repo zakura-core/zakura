@@ -860,6 +860,36 @@ fn import_cpu(store: &Store, capture: &crate::cpu::Capture, id: &str) -> Result<
     crate::cpu::import(&store.db, &store.path, &path)
 }
 #[test]
+fn cpu_import_keeps_up_with_one_second_segments_and_a_short_backlog() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let mut store = cpu_test_store(temp.path())?;
+    let mut capture = cpu_v2(vec![(200, 11)]);
+    capture.schema_version = 3;
+    capture.frequency = 999;
+    capture.samples[0].cpu_period_ns = Some(1_001_001);
+    // Ten fresh seconds plus ten seconds accumulated during a collector restart.
+    for second in 0..20u64 {
+        let mut segment = serde_json::to_value(&capture)?;
+        segment["start_mono_us"] = json!(1_000_000 + second * 1_000_000);
+        segment["end_mono_us"] = json!(2_000_000 + second * 1_000_000);
+        segment["samples"][0]["mono_us"] = json!(1_000_200 + second * 1_000_000);
+        fs::write(
+            temp.path()
+                .join("inbox")
+                .join(format!("{second:032x}.json")),
+            serde_json::to_vec(&segment)?,
+        )?;
+    }
+    store.prune()?;
+    let imported: i64 = store
+        .db
+        .query_row("SELECT count(*) FROM cpu", [], |r| r.get(0))?;
+    assert_eq!(imported, 20);
+    assert_eq!(fs::read_dir(temp.path().join("inbox"))?.count(), 0);
+    Ok(())
+}
+
+#[test]
 fn cpu_v3_preserves_periods_through_import_query_and_export() -> Result<()> {
     let temp = tempfile::tempdir()?;
     let store = cpu_test_store(temp.path())?;

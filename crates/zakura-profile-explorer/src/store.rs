@@ -426,7 +426,9 @@ impl Store {
                     entry.path().extension().is_some_and(|e| e == "json")
                 })
             });
-            for entry in ready.take(8) {
+            // One-second CPU segments need more than ten imports per maintenance pass.
+            // Leave headroom to drain a temporary backlog without unbounded disk work.
+            for entry in ready.take(32) {
                 let entry = entry?;
                 if crate::cpu::import(&self.db, &self.path, &entry.path()).is_err() {
                     self.discarded = self.discarded.saturating_add(1);

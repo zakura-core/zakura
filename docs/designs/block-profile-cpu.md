@@ -59,3 +59,11 @@ The initial live observation had no sampler restarts or dropped segments and
 zero collector errors. Capture coverage remains explicitly approximate and
 unresolved stack frames remain visible. Historical block 3,495,775 still uses
 its original 99 Hz count-only profile.
+
+The live check also exposed an import throughput limit: the collector originally
+accepted only eight segments per ten-second maintenance pass. With one-second
+rotation, decoded segments accumulated in its inbox even though decoding kept
+up. The collector now accepts up to 32 segments per pass, allowing steady
+collection plus bounded backlog recovery. Existing queued captures import
+normally without replaying blocks. A regression test covers ten new segments
+plus ten accumulated during a collector restart.

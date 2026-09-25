@@ -628,3 +628,78 @@ async fn start_server(
         mempool_transaction_sender,
     ))
 }
+
+#[tokio::test]
+async fn non_finalized_stream_preserves_receipts_within_a_session() -> Result<()> {
+    use zakura_chain::serialization::BytesInDisplayOrder;
+    use zakura_state::{NonFinalizedBlock, NonFinalizedBlocksListener};
+
+    let _init_guard = zakura_test::init();
+    let (server, client, mut state, _tip, _mempool) = start_server_and_get_client().await?;
+    let block: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1_BYTES.zcash_deserialize_into()?;
+    let hash = block.hash();
+    for (session, retain_known_tips) in [
+        (None, true),
+        (Some("previous-primary".to_owned()), false),
+        (Some(indexer::receipt_session().to_owned()), true),
+    ] {
+        let mut client = client.clone();
+        let request = tokio::spawn(async move {
+            client
+                .non_finalized_state_change(indexer::NonFinalizedStateChangeRequest {
+                    chain_tip_hashes: vec![hash.bytes_in_display_order().to_vec()],
+                    receipt_session: session,
+                })
+                .await
+        });
+        let (sender, receiver) = tokio::sync::mpsc::channel(8);
+        state
+            .expect_request(ReadRequest::NonFinalizedBlocksListener {
+                known_chain_tips: if retain_known_tips {
+                    [hash].into_iter().collect()
+                } else {
+                    Default::default()
+                },
+            })
+            .await
+            .respond(ReadResponse::NonFinalizedBlocksListener(
+                NonFinalizedBlocksListener(Arc::new(receiver)),
+            ));
+        let response = request.await??;
+        assert_eq!(
+            response
+                .metadata()
+                .get(indexer::RECEIPT_SESSION_HEADER)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            indexer::receipt_session()
+        );
+        let mut stream = response.into_inner();
+        for change in [
+            NonFinalizedBlock {
+                hash,
+                block: block.clone(),
+                receipt_order: Some(2),
+            },
+            NonFinalizedBlock {
+                hash,
+                block: block.clone(),
+                receipt_order: Some(1),
+            },
+        ] {
+            sender.send(change).await?;
+        }
+        tokio::time::timeout(Duration::from_secs(3), async {
+            let first = stream.message().await.unwrap().unwrap();
+            assert_eq!(first.receipt_order, Some(2));
+            assert_eq!(first.decode().unwrap().1, hash);
+            let last = stream.message().await.unwrap().unwrap();
+            assert_eq!(last.receipt_order, Some(1));
+            assert_eq!(last.decode().unwrap().1, hash);
+        })
+        .await?;
+    }
+    server.abort();
+    Ok(())
+}

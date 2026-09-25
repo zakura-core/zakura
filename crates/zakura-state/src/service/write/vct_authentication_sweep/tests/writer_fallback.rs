@@ -34,7 +34,7 @@ impl RunningWriter {
             epoch: LifecycleEpoch::INITIAL,
             reason: HeaderRuntimeDetachedReason::AttachmentPending,
         });
-        let (senders, invalid_resets, _, _, _, task) = BlockWriteSender::spawn_with_header_chain(
+        let (senders, invalid_resets, _, _, _, _, task) = BlockWriteSender::spawn_with_header_chain(
             fixture.finalized_state.clone(),
             live,
             tip_sender,
@@ -64,7 +64,7 @@ impl RunningWriter {
             .finalized
             .as_ref()
             .expect("checkpoint writes are enabled")
-            .send((CheckpointVerifiedBlock::from(block), sender))
+            .send((CheckpointVerifiedBlock::from(block), sender, 0))
             .expect("the writer accepts the checkpoint block");
         receiver
     }

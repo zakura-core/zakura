@@ -9,6 +9,7 @@ use crate::parameters::{
         constants::POST_NU6_FUNDING_STREAM_NUM_BLOCKS, FundingStreamReceiver,
         FundingStreamRecipient, FundingStreams,
     },
+    Network, NetworkUpgrade,
 };
 
 /// The start height of post-NU6 funding streams on Mainnet as described in [ZIP-1015](https://zips.z.cash/zip-1015).
@@ -30,6 +31,16 @@ pub(crate) const NU6_1_LOCKBOX_DISBURSEMENTS: [(&str, Amount<NonNegative>); 10] 
 /// See: <https://zips.z.cash/zip-0271#one-timelockboxdisbursement>.
 pub(crate) const EXPECTED_NU6_1_LOCKBOX_DISBURSEMENTS_TOTAL: Amount<NonNegative> =
     Amount::new_from_zec(78_750);
+
+/// `INITIAL_NSM_VALUE_BALANCE` on Mainnet: block subsidy and fees the coinbase
+/// transactions below NU6 never claimed, which seeds the NSM value balance at NU7.
+///
+/// Measured at the last pre-NU6 height, 2,726,399: the halving schedule issued
+/// 15,750,000 ZEC there, and the chain value pools held 15,749,631.41554480 ZEC.
+///
+/// zips#1354 leaves this constant as a TODO and estimates 350.8 ZEC. The estimate is
+/// about 17.8 ZEC low.
+pub(crate) const INITIAL_NSM_VALUE_BALANCE: Amount<NonNegative> = Amount::new(36_858_445_520);
 
 /// The post-NU6 funding stream height range on Mainnet
 pub(crate) const POST_NU6_FUNDING_STREAM_START_RANGE: std::ops::Range<Height> =
@@ -188,6 +199,10 @@ lazy_static! {
     /// - [ZIP-1015](https://zips.z.cash/zip-1015)
     /// - [ZIP-214#funding-streams](https://zips.z.cash/zip-0214#funding-streams)
     ///
+    /// ZIP 218 moves the third halving, so ZIP 214 Revision 3 moves the end of the
+    /// Revision 2 streams there, see [`FundingStreams::with_nu7_adjusted_end_height`].
+    /// The other heights listed here are the heights before ZIP 218.
+    ///
     /// [7.10.1]: https://zips.z.cash/protocol/protocol.pdf#zip214fundingstreams
     pub(crate) static ref FUNDING_STREAMS: Vec<FundingStreams> = vec![
         FundingStreams {
@@ -239,7 +254,7 @@ lazy_static! {
             ]
             .into_iter()
             .collect(),
-        },
+        }
+        .with_nu7_adjusted_end_height(NetworkUpgrade::Nu7.activation_height(&Network::Mainnet)),
     ];
-
 }

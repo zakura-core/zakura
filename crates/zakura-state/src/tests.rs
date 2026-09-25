@@ -18,6 +18,9 @@ pub mod setup;
 pub trait FakeChainHelper {
     fn make_fake_child(&self) -> Arc<Block>;
 
+    /// Clone this block with distinct nonces, sorted by descending raw hash.
+    fn make_fake_siblings(&self, count: usize) -> Vec<Arc<Block>>;
+
     fn set_work(self, work: u128) -> Arc<Block>;
 
     fn set_block_commitment(self, commitment: [u8; 32]) -> Arc<Block>;
@@ -48,6 +51,19 @@ impl FakeChainHelper for Arc<Block> {
         Arc::make_mut(&mut child.header).previous_block_hash = parent_hash;
 
         Arc::new(child)
+    }
+
+    fn make_fake_siblings(&self, count: usize) -> Vec<Arc<Block>> {
+        let mut siblings: Vec<_> = (0..count)
+            .map(|nonce| {
+                let mut block = self.clone();
+                Arc::make_mut(&mut Arc::make_mut(&mut block).header).nonce.0[..8]
+                    .copy_from_slice(&u64::try_from(nonce).unwrap().to_le_bytes());
+                block
+            })
+            .collect();
+        siblings.sort_unstable_by_key(|block| std::cmp::Reverse(block.hash().0));
+        siblings
     }
 
     fn set_work(mut self, work: u128) -> Arc<Block> {

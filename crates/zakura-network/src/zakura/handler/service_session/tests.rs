@@ -1,5 +1,6 @@
 use super::*;
 use crate::zakura::testkit::LocalEndpointFactory;
+use crate::zakura::StreamQueueDepths;
 use tokio_util::task::AbortOnDropHandle;
 
 const DATA: Stream = Stream {
@@ -7,10 +8,26 @@ const DATA: Stream = Stream {
     version: 1,
     frame_cap: 2 * 1024 * 1024,
     capability: 1 << 16,
-    mode: StreamMode::Persistent,
+    queue_depths: Some(StreamQueueDepths {
+        inbound: 1,
+        outbound: 1,
+    }),
+    write_policy: StreamWritePolicy::Timeout(TEST_DATA_WRITE_TIMEOUT),
+    ..Stream::PERSISTENT
 };
-const REQUESTS: Stream = Stream { kind: 65, ..DATA };
-const EVENTS: Stream = Stream { kind: 67, ..DATA };
+const REQUESTS: Stream = Stream {
+    kind: 65,
+    write_policy: StreamWritePolicy::UntilCancelled,
+    ..DATA
+};
+const EVENTS: Stream = Stream {
+    kind: 67,
+    queue_depths: Some(StreamQueueDepths {
+        inbound: 3,
+        outbound: 3,
+    }),
+    ..DATA
+};
 const ONE_SHOT: Stream = Stream {
     kind: 68,
     mode: StreamMode::RequestResponse,
@@ -92,16 +109,6 @@ impl Service for SessionService {
     }
     fn streams(&self) -> &[Stream] {
         self.streams
-    }
-    fn stream_write_policy(&self, stream: Stream) -> StreamWritePolicy {
-        if stream == REQUESTS {
-            StreamWritePolicy::UntilCancelled
-        } else {
-            StreamWritePolicy::Timeout(TEST_DATA_WRITE_TIMEOUT)
-        }
-    }
-    fn stream_queue_depths(&self, stream: Stream) -> Option<(usize, usize)> {
-        Some(if stream == EVENTS { (3, 3) } else { (1, 1) })
     }
     fn as_request_response(&self) -> Option<&dyn crate::zakura::RequestResponseService> {
         Some(self)

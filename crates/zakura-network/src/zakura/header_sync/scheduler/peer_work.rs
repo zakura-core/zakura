@@ -205,7 +205,7 @@ impl Drop for HeaderCountReservationInner {
 }
 
 #[derive(Clone, Debug)]
-struct HeaderCapacityLease(Arc<HeaderCapacityLeaseInner>);
+pub(in crate::zakura::header_sync) struct HeaderCapacityLease(Arc<HeaderCapacityLeaseInner>);
 
 #[derive(Debug)]
 struct HeaderCapacityLeaseInner {
@@ -293,7 +293,8 @@ pub struct ActiveHeaderRequest {
     pub entries: Vec<HeaderEntry>,
     /// Exact phase of complete-target processing.
     pub phase: HeaderTargetPhase,
-    /// Effective count bound preserved across continuation requests.
+    /// Negotiated page bound before temporary credit limits.
+    /// Each request reserves its count against current shared headroom.
     pub max_header_count: u32,
     /// Requested auxiliary schema preserved across continuation requests.
     pub tree_aux_schema: AuxSchema,
@@ -849,6 +850,14 @@ impl PeerWorkQueue {
         }
         self.publish_phase_metrics();
         true
+    }
+
+    /// Keep local work charged after its peer slot retires.
+    pub(in crate::zakura::header_sync) fn retain_header_capacity(
+        &self,
+        peer: &ZakuraPeerId,
+    ) -> Vec<HeaderCapacityLease> {
+        self.staged_capacity.get(peer).cloned().unwrap_or_default()
     }
 
     pub(in crate::zakura::header_sync) fn owned_header_count(&self, peer: &ZakuraPeerId) -> usize {

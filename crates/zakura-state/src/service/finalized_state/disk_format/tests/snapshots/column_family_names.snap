@@ -10,6 +10,7 @@ expression: cf_names
   "default",
   "hash_by_height",
   "hash_by_tx_loc",
+  "header_aux_body_size_v1",
   "header_aux_delivery_v1",
   "header_body_evidence_authority_v1",
   "header_child_v1",

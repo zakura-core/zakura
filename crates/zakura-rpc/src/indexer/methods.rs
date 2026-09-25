@@ -121,7 +121,16 @@ where
         // The caller may provide the hashes of the chain tips it already has so
         // the server only streams blocks after those tips. Malformed hashes are
         // rejected up front.
-        let known_chain_tips = decode_known_chain_tips(request.into_inner().chain_tip_hashes)?;
+        let request = request.into_inner();
+        let mut known_chain_tips = decode_known_chain_tips(request.chain_tip_hashes)?;
+        // Older clients send resume tips without a receipt session.
+        if request
+            .receipt_session
+            .as_deref()
+            .is_some_and(|session| session != super::receipt_session())
+        {
+            known_chain_tips.clear();
+        }
 
         tokio::spawn(async move {
             let mut non_finalized_state_change = match read_state
@@ -170,11 +179,18 @@ where
                     return;
                 }
 
-                let Some((hash, block)) = non_finalized_state_change.recv().await else {
+                let Some(zakura_state::NonFinalizedBlock {
+                    hash,
+                    block,
+                    receipt_order,
+                }) = non_finalized_state_change.recv().await
+                else {
                     break;
                 };
 
-                let send = response_sender.send(Ok(BlockAndHash::new(hash, block)));
+                let mut message = BlockAndHash::new(hash, block);
+                message.receipt_order = receipt_order;
+                let send = response_sender.send(Ok(message));
                 match tokio::time::timeout(SEND_TIMEOUT, send).await {
                     Ok(Ok(())) => {}
                     Ok(Err(_)) => {
@@ -208,7 +224,15 @@ where
                 .await;
         });
 
-        Ok(Response::new(Box::pin(response_stream)))
+        let mut response =
+            Response::new(Box::pin(response_stream) as Self::NonFinalizedStateChangeStream);
+        response.metadata_mut().insert(
+            super::RECEIPT_SESSION_HEADER,
+            super::receipt_session()
+                .parse()
+                .expect("receipt session is hexadecimal ASCII"),
+        );
+        Ok(response)
     }
 
     async fn mempool_change(

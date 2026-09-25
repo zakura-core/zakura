@@ -420,6 +420,7 @@ proptest! {
                         .await
                         .expect("getblockchaininfo should call mock state service with correct request")
                         .respond(zakura_state::ReadResponse::ChainInfo(GetBlockTemplateChainInfo {
+                            value_pools: Default::default(),
                             tip_hash: genesis_hash,
                             tip_height: Height::MIN,
                             chain_history_root: HistoryTree::default().hash(),
@@ -433,8 +434,12 @@ proptest! {
 
             let (response, _) = tokio::join!(response_fut, mock_state_handler);
 
+            let response = response.expect("should succeed without a chain tip");
+
+            // TipPoolValues failed, so the NSM counter is omitted rather than reported as zero.
+            prop_assert_eq!(response.nsm_value_balance_zat(), None);
             prop_assert_eq!(
-                response.unwrap().best_block_hash,
+                response.best_block_hash,
                 genesis_hash
             );
 
@@ -536,6 +541,7 @@ proptest! {
                         .await
                         .expect("getblockchaininfo should call mock state service with correct request")
                         .respond(zakura_state::ReadResponse::ChainInfo(GetBlockTemplateChainInfo {
+                            value_pools: Default::default(),
                             tip_hash: block_hash,
                             tip_height: block_height,
                             chain_history_root: HistoryTree::default().hash(),
@@ -552,6 +558,9 @@ proptest! {
             // Check response
             match response {
                 Ok(info) => {
+                    // TipPoolValues succeeded with a known zero NSM balance; report Some(0),
+                    // which must stay distinguishable from omitting the field.
+                    prop_assert_eq!(info.nsm_value_balance_zat(), Some(Amount::zero()));
                     prop_assert_eq!(info.chain, network.bip70_network_name());
                     prop_assert_eq!(info.blocks, block_height);
                     prop_assert_eq!(info.best_block_hash, block_hash);
@@ -674,6 +683,8 @@ proptest! {
 
             let response = response.expect("should succeed with genesis block info");
 
+            // TipPoolValues failed, so the NSM counter is omitted rather than reported as zero.
+            prop_assert_eq!(response.nsm_value_balance_zat(), None);
             prop_assert_eq!(response.best_block_hash, genesis_block.header.hash());
             prop_assert_eq!(response.chain, network.bip70_network_name());
             prop_assert_eq!(response.blocks, Height::MIN);

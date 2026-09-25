@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import ipaddress
 import json
+import logging
 import re
 import statistics
 import subprocess
@@ -23,6 +24,10 @@ TARGET_SPACING_SECONDS = 25
 DAA_WINDOW_BLOCKS = 102
 RECENT_HEADER_COUNT = 31
 MAX_OBSERVATION_AGE_SECONDS = 120
+# Bounds for the public HTTP server: explorer requests each hold a thread and a
+# node RPC call, on the host that also validates and mines the fork.
+MAX_CONCURRENT_REQUESTS = 16
+REQUEST_TIMEOUT_SECONDS = 10
 BLOCK_ID = re.compile(r"(?:[0-9]{1,10}|[0-9a-fA-F]{64})\Z")
 TX_ID = re.compile(r"[0-9a-fA-F]{64}\Z")
 
@@ -43,7 +48,11 @@ def rpc(port: int, method: str, params: list | None = None):
 def network_parameters(path: Path) -> dict:
     with path.open("rb") as stream:
         config = tomllib.load(stream)
-    parameters = config["network"]["testnet_parameters"]
+    network = config["network"]
+    # A configured testnet is `network = { ... }` since #1147. The running fork's
+    # config predates that and keeps its parameters in [network.testnet_parameters].
+    parameters = (network["network"] if isinstance(network.get("network"), dict)
+                  else network["testnet_parameters"])
     return {
         "name": parameters["network_name"],
         "magic": "".join(f"{byte:02x}" for byte in parameters["network_magic"]),
@@ -144,7 +153,10 @@ class Collector:
         self.started_at = time.time()
 
     def sample_headers(self, port: int, height: int) -> list[dict]:
-        start = max(self.network["activationHeight"], height - RECENT_HEADER_COUNT + 1)
+        # Post-NU7 blocks only, but always at least the tip: a freshly seeded fork
+        # sits below activation until its first blocks are mined.
+        start = max(min(self.network["activationHeight"], height),
+                    height - RECENT_HEADER_COUNT + 1)
         for number in range(start, height + 1):
             if number not in self.headers:
                 block_hash = rpc(port, "getblockhash", [number])
@@ -215,7 +227,10 @@ class Collector:
         headers = self.sample_headers(primary["port"], height)
         if self.last_tip and self.last_tip != (height, block_hash):
             old_height, old_hash = self.last_tip
-            if old_height <= height and rpc(primary["port"], "getblockhash", [old_height]) != old_hash:
+            # A lower tip can only come from a reorganization, and its old height may
+            # no longer exist to compare hashes at.
+            if (old_height > height
+                    or rpc(primary["port"], "getblockhash", [old_height]) != old_hash):
                 self.observed_reorgs.append(observed_at)
                 self.headers.clear()
                 headers = self.sample_headers(primary["port"], height)
@@ -274,6 +289,8 @@ class Collector:
             try:
                 payload = self.collect()
             except Exception:
+                # The public payload stays generic; the journal keeps the cause.
+                logging.exception("status collection failed")
                 payload = {"schemaVersion": 1, "observedAt": time.time(),
                            "status": "unavailable", "network": self.network,
                            "error": "Collector failed to sample node RPC"}
@@ -282,8 +299,39 @@ class Collector:
             time.sleep(interval)
 
 
+class BoundedHTTPServer(ThreadingHTTPServer):
+    """A threading HTTP server that handles at most `max_concurrent` requests at once.
+
+    ThreadingHTTPServer starts one thread per connection without limit. Here the
+    accept loop waits for a free slot instead, so excess clients queue in the listen
+    backlog rather than exhausting threads and node RPC capacity.
+    """
+
+    daemon_threads = True
+
+    def __init__(self, address, handler, max_concurrent: int = MAX_CONCURRENT_REQUESTS):
+        super().__init__(address, handler)
+        self.slots = threading.BoundedSemaphore(max_concurrent)
+
+    def process_request(self, request, client_address):
+        self.slots.acquire()
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self.slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self.slots.release()
+
+
 class Handler(BaseHTTPRequestHandler):
     collector: Collector
+    # Socket timeout, so a client that stalls mid-request frees its slot.
+    timeout = REQUEST_TIMEOUT_SECONDS
 
     def do_GET(self):
         if self.path == "/healthz":
@@ -341,11 +389,12 @@ def main():
     parser.add_argument("--port", type=int, default=8093)
     parser.add_argument("--interval", type=float, default=15)
     args = parser.parse_args()
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     remote_miners = json.loads(args.remote_miners.read_text())["miners"] if args.remote_miners.exists() else []
     collector = Collector(args.config, args.primary_port, args.observer_port, remote_miners)
     Handler.collector = collector
     threading.Thread(target=collector.run, args=(args.interval,), daemon=True).start()
-    ThreadingHTTPServer((args.host, args.port), Handler).serve_forever()
+    BoundedHTTPServer((args.host, args.port), Handler).serve_forever()
 
 
 if __name__ == "__main__":

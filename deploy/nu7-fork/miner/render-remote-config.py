@@ -9,7 +9,11 @@ from pathlib import Path
 
 def render(source: str, peers: list[str], miner_address: str) -> str:
     config = tomllib.loads(source)
-    network = config["network"]["testnet_parameters"]
+    network = config["network"]
+    # A configured testnet is `network = { ... }` since #1147. The running fork's
+    # config predates that and keeps its parameters in [network.testnet_parameters].
+    network = (network["network"] if isinstance(network.get("network"), dict)
+               else network["testnet_parameters"])
     if (network["network_name"] != "Nu7Fork"
             or network["network_magic"] != [122, 107, 117, 55]
             or network["activation_heights"]["NU7"] != 4_382_859):

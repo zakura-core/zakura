@@ -3,6 +3,7 @@
 Run with `python3 -m unittest test_fork` from `deploy/nu7-fork`.
 """
 
+import importlib.util
 import os
 import subprocess
 import tempfile
@@ -163,6 +164,40 @@ class SshOptions(unittest.TestCase):
         # ConnectTimeout only bounds the handshake; keepalives bound every later wait.
         self.assertIn("ServerAliveInterval=30", fork.SSH_OPTS)
         self.assertIn("ServerAliveCountMax=4", fork.SSH_OPTS)
+
+
+def load_remote_config_renderer():
+    path = Path(__file__).parent / "miner" / "render-remote-config.py"
+    spec = importlib.util.spec_from_file_location("render_remote_config", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class RemoteMinerConfig(unittest.TestCase):
+    PARAMETERS = (
+        'network_name = "Nu7Fork"\n'
+        'network_magic = [122, 107, 117, 55]\n'
+        '[{table}.activation_heights]\n'
+        'NU7 = 4382859\n'
+    )
+
+    def render(self, table: str) -> str:
+        base = (
+            '[network]\n'
+            'initial_testnet_peers = ["127.0.0.1:18333"]\n'
+            f'[{table}]\n' + self.PARAMETERS.format(table=table)
+            + '[mining]\nminer_address = "tmOld"\n'
+        )
+        renderer = load_remote_config_renderer()
+        return renderer.render(base, ["seed.example:18233"], "t" + "A" * 34)
+
+    def test_reads_both_config_forms(self):
+        # The running fork predates #1147's `network = { ... }` form; a new fork uses it.
+        for table in ("network.testnet_parameters", "network.network"):
+            rendered = self.render(table)
+            self.assertIn('"seed.example:18233"', rendered, table)
+            self.assertIn('miner_address = "t' + "A" * 34 + '"', rendered, table)
 
 
 class RenderedNodeConfig(unittest.TestCase):

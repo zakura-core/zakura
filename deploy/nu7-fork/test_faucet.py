@@ -5,7 +5,9 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import faucet
 from faucet import Faucet, PAYOUT_ZAT
+from test_dashboard import max_concurrent_handlers
 
 
 class FaucetClaimsTest(unittest.TestCase):
@@ -57,6 +59,14 @@ class FaucetClaimsTest(unittest.TestCase):
             with self.assertRaisesRegex(PermissionError, "Too many"):
                 self.faucet.reserve("bad", "192.0.2.1")
             self.assertEqual(validate.call_count, 10)
+
+
+class BoundedServerTest(unittest.TestCase):
+    def test_concurrent_requests_are_capped(self):
+        self.assertEqual(max_concurrent_handlers(faucet.BoundedHTTPServer, 2, 6), 2)
+
+    def test_stalled_clients_time_out(self):
+        self.assertEqual(faucet.Handler.timeout, faucet.REQUEST_TIMEOUT_SECONDS)
 
 
 if __name__ == "__main__":

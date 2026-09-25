@@ -270,6 +270,8 @@ pub fn spawn_block_sync_reactor(
         verified_block_tip: startup.frontiers.verified_block_tip,
         request_floor: startup.frontiers.verified_block_tip,
         pending_needed_query: None,
+        verified_tip_on_selected: None,
+        verified_probe_from: None,
         hint_refresh: None,
         needed_query_retry_at: None,
         pending_body_supplier_restart: None,
@@ -369,6 +371,10 @@ pub(super) struct BlockSyncReactor {
     request_floor: block::Height,
     /// Identity and scope of the state query awaiting a response.
     pending_needed_query: Option<PendingNeededQuery>,
+    /// Committed verified tip whose hash matched selected-branch work when it was observed.
+    verified_tip_on_selected: Option<zakura_header_chain::Frontier>,
+    /// Start of the next query when it must list the selected hash at an unproven verified tip.
+    verified_probe_from: Option<block::Height>,
     /// Revision and bounded height interval of queued hints being refreshed.
     hint_refresh: Option<(u64, block::Height, block::Height)>,
     /// Earliest time to retry the last failed body-missing metadata query.
@@ -894,6 +900,20 @@ impl BlockSyncReactor {
         });
         let frontiers = block_sync_frontiers(&view);
         let header_best = view.frontiers.header_best;
+        let verified_best = view.frontiers.verified_best;
+        // Queued or submitted work still holds the selected hash at this height,
+        // because the floor advance for this view has not been forwarded yet.
+        if body_work_epoch_changed {
+            self.verified_tip_on_selected = None;
+        } else if previous
+            .as_ref()
+            .is_none_or(|old| old.frontiers.verified_best != verified_best)
+        {
+            self.verified_tip_on_selected =
+                (self.state.work_queue.hash_for_height(verified_best.height)
+                    == Some(verified_best.hash))
+                .then_some(verified_best);
+        }
         self.committed_view = Some(view.clone());
         self.pending_body_supplier_restart = None;
         self.pending_operator_body_retry = None;
@@ -1345,7 +1365,36 @@ impl BlockSyncReactor {
         let repairs_existing_fork = body_anchor.height < completed_query.verified_anchor.height
             || (body_anchor.height == completed_query.verified_anchor.height
                 && body_anchor.hash != completed_query.verified_anchor.hash);
-        if compatible_read && repairs_existing_fork {
+        // Same-epoch verified growth can extend a retained fork instead of the
+        // selected branch. The read anchor then sits at or below the fork point,
+        // so it is not an older selected frontier. Keep the read only when the
+        // committed verified tip is proven on the selected branch. Reset only
+        // when the read proves the fork. Otherwise re-read from the tip height.
+        let mut read_proves_fork = false;
+        if let Some(verified) = self
+            .committed_view
+            .as_ref()
+            .map(|view| view.frontiers.verified_best)
+            .filter(|verified| compatible_read && verified.height > body_anchor.height)
+        {
+            match blocks.iter().find(|block| block.height == verified.height) {
+                Some(selected) => read_proves_fork = selected.hash != verified.hash,
+                None if self.verified_tip_on_selected == Some(verified) => {}
+                // The selected branch ends below the verified tip.
+                None if verified.height > self.state.best_header_tip => read_proves_fork = true,
+                None => {
+                    metrics::counter!(
+                        "sync.block.stale_completion.total",
+                        "kind" => "needed_blocks_unproven_growth"
+                    )
+                    .increment(1);
+                    self.verified_probe_from = Some(verified.height);
+                    self.query_needed_blocks_with_options(true).await;
+                    return;
+                }
+            }
+        }
+        if compatible_read && (repairs_existing_fork || read_proves_fork) {
             self.handle_chain_tip_reset(
                 BlockSyncFrontiers {
                     finalized_height: self.state.finalized_height,
@@ -1852,6 +1901,7 @@ impl BlockSyncReactor {
     /// low-water gate so a still-uncleared registry outstanding snapshot cannot
     /// suppress the post-`reset_above` re-query.
     async fn query_needed_blocks_with_options(&mut self, force: bool) -> bool {
+        let probe_from = self.verified_probe_from.take();
         if !self.startup.state_queries_enabled {
             return false;
         }
@@ -1873,9 +1923,9 @@ impl BlockSyncReactor {
         {
             self.hint_refresh = None;
         }
-        let refresh = self.hint_refresh;
-        let Some(from) = refresh
-            .map(|(_, from, _)| from)
+        let refresh = self.hint_refresh.filter(|_| probe_from.is_none());
+        let Some(from) = probe_from
+            .or(refresh.map(|(_, from, _)| from))
             .or_else(|| self.next_needed_block_query_start())
         else {
             return true;

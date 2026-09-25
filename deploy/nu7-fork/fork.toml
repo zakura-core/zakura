@@ -69,6 +69,9 @@ size = "c-8"
 regions = "nyc1,sfo3,nyc3"
 # Absent from the reaper's sweep list, so the node outlives a CI run.
 tag = "zakura-nu7-fork"
+# Fingerprint of a DigitalOcean SSH key (`doctl compute ssh-key list`) installed
+# on the droplet. Required: do_provision.py refuses to create a host without one.
+ssh_fingerprint = ""
 # Must start with zakura-pr- (do_provision.py enforces this). The reaper deletes
 # such volumes only while DETACHED, so never leave this volume unattached.
 volume_name = "zakura-pr-nu7-fork-state"

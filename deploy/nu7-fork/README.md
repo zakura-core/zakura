@@ -28,8 +28,9 @@ The deployed ref **must** contain the ZIP 259 NU7 consensus branch ID
 entry was gated behind `cfg(any(test, feature = "zakura-test"))`, so a stock
 release binary had no NU7 branch at all and the fork could not activate.
 
-`provision` additionally needs `doctl` on PATH and a DigitalOcean token. The
-other subcommands only need SSH access to the host.
+`provision` additionally needs `doctl` on PATH, a DigitalOcean token, and
+`droplet.ssh_fingerprint` in `fork.toml` set to a DigitalOcean SSH key's
+fingerprint. The other subcommands only need SSH access to the host.
 
 `plan` and `up` read the seed's tip with the host's own `zakurad tip-height`, so
 the host needs a `zakurad` at `/usr/local/bin/zakurad` and a config at
@@ -255,6 +256,25 @@ reloaded. `fork.py` refuses a `network_name` of `Mainnet`, `Testnet` or
 `fork.py deploy` deploys the nodes one at a time. `deploy.py` deploys in
 parallel and stages every node at the same `/tmp` paths, so two nodes on one
 host would otherwise install each other's files.
+
+## Tearing down
+
+The fork droplet carries the `zakura-nu7-fork` tag, which the PR-node reaper
+deliberately skips, so nothing deletes it automatically. When a fork run is
+finished, delete the droplet and then its state volume. The volume is named
+`droplet.volume_name` plus the region it landed in, for example
+`zakura-pr-nu7-fork-state-nyc1`:
+
+```sh
+doctl compute droplet list --tag-name zakura-nu7-fork
+doctl compute droplet delete <droplet-id>
+doctl compute volume list | grep zakura-pr-nu7-fork-state
+doctl compute volume delete <volume-id>
+```
+
+Delete the droplet first: it detaches the volume, and the reaper deletes a
+detached `zakura-pr-*` volume on its own. Deleting the volume explicitly avoids
+waiting for that sweep.
 
 ## Why each setting is the way it is
 

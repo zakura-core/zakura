@@ -4,9 +4,12 @@ Run with `python3 -m unittest test_fork` from `deploy/nu7-fork`.
 """
 
 import os
+import subprocess
 import tempfile
+import types
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import fork
 
@@ -120,6 +123,46 @@ class RenderedNodes(unittest.TestCase):
         config["miner"]["address"] = ""
         with self.assertRaises(fork.ForkError):
             render(config)
+
+
+class Provision(unittest.TestCase):
+    DROPLET = {
+        "name": "zakura-nu7-fork-1",
+        "size": "c-8",
+        "regions": "nyc1",
+        "tag": "zakura-nu7-fork",
+        "volume_name": "zakura-pr-nu7-fork-state",
+    }
+
+    def provision(self, fingerprint, plan):
+        config = {"droplet": {**self.DROPLET, "ssh_fingerprint": fingerprint}}
+        done = subprocess.CompletedProcess([], 0, "", "")
+        with mock.patch.object(fork, "run", return_value=done) as run:
+            fork.cmd_provision(config, types.SimpleNamespace(plan=plan))
+        return run.call_args.args[0]
+
+    def test_a_missing_fingerprint_is_refused_before_provisioning(self):
+        # do_provision.py refuses to create a host without a key, and would only
+        # say so after the DigitalOcean catalog lookups.
+        with mock.patch.object(fork, "run") as run:
+            with self.assertRaises(fork.ForkError):
+                fork.cmd_provision({"droplet": {**self.DROPLET, "ssh_fingerprint": ""}},
+                                   types.SimpleNamespace(plan=False))
+        run.assert_not_called()
+
+    def test_plan_runs_without_a_fingerprint(self):
+        self.assertIn("--plan", self.provision("", plan=True))
+
+    def test_the_fingerprint_is_passed_through(self):
+        cmd = self.provision("aa:bb", plan=False)
+        self.assertEqual(cmd[cmd.index("--ssh-fingerprint") + 1], "aa:bb")
+
+
+class SshOptions(unittest.TestCase):
+    def test_an_unresponsive_connected_host_is_dropped(self):
+        # ConnectTimeout only bounds the handshake; keepalives bound every later wait.
+        self.assertIn("ServerAliveInterval=30", fork.SSH_OPTS)
+        self.assertIn("ServerAliveCountMax=4", fork.SSH_OPTS)
 
 
 class RenderedNodeConfig(unittest.TestCase):

@@ -48,6 +48,11 @@ TESTNET_INITIAL_NSM_VALUE_BALANCE = 55_768_414_957
 SSH_OPTS = [
     "-o", "BatchMode=yes",
     "-o", "ConnectTimeout=15",
+    # Bound waits after the connection is up: a host that stops answering is
+    # dropped after about two minutes of missed keepalives, while a long silent
+    # remote command such as the state copy keeps running.
+    "-o", "ServerAliveInterval=30",
+    "-o", "ServerAliveCountMax=4",
     "-o", "StrictHostKeyChecking=accept-new",
 ]
 
@@ -344,6 +349,13 @@ def cmd_provision(config: dict, args) -> int:
     fingerprint = droplet.get("ssh_fingerprint", "")
     if fingerprint:
         cmd += ["--ssh-fingerprint", fingerprint]
+    elif not args.plan:
+        # do_provision.py refuses to create a host without one, and a droplet no
+        # key can reach would be useless anyway.
+        raise ForkError(
+            "droplet.ssh_fingerprint is empty in fork.toml; set it to the fingerprint "
+            "of a DigitalOcean SSH key (`doctl compute ssh-key list`)"
+        )
     if args.plan:
         cmd.append("--plan")
 
@@ -557,7 +569,8 @@ def cmd_up(config: dict, args) -> int:
     print(f"[up] NU7 activates at {plan['activation']} (seed tip {tip})")
     args.nodes = args.out
     cmd_deploy(config, args)
-    print("[up] deployed; `fork.py status` to watch, `fork.py mine` to produce blocks")
+    print("[up] deployed; `fork.py status` to watch. To produce blocks, run "
+          "zakura-fork-miner (see README.md, \"Continuous mining on the primary node\")")
     return 0
 
 

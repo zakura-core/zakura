@@ -18,7 +18,8 @@ from pathlib import Path
 REGIONS = ("nyc1", "sfo3", "nyc3")
 # The reaper sweeps zakura-pr-node, zakura-image-bake and zakura-mempool-load by
 # age. zakura-nu7-fork is deliberately absent from that sweep: a fork testnet
-# outlives any single CI run, so its operator deletes the droplet and volume.
+# outlives any single CI run, so its operator deletes the droplet and volume
+# (deploy/nu7-fork/README.md, "Tearing down").
 TAGS = {
     "zakura-pr-node",
     "zakura-image-bake",

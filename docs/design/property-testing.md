@@ -31,11 +31,30 @@ Call production code at the boundary appropriate to the claim. Check:
 - bounded arbitrary payloads return a result without panicking.
 
 A payload cap is not an allocation bound. Check requested allocation and retained decoded state.
-Keep expected bounds reviewable against the specification without requiring a new declaration API.
+Keep expected bounds reviewable against the specification. A stream's message table states each
+row's payload bounds, and each codec item states its allocation bound.
 
-Adding a message requires updating its codec, handling, bounds, boundary cases, and applicable
-protocol tests. Reuse exhaustive production dispatch where available. Do not require a new
-reference-model arm for every wire variant.
+Adding a message requires a table row, a codec arm, its samples and domain violations, its
+handling, and applicable protocol tests. Reuse exhaustive production dispatch where available.
+Do not require a new reference-model arm for every wire variant.
+
+## Generated suites
+
+Three suites read the declarations, so each property is written once:
+
+| Suite | Input | Checks |
+| --- | --- | --- |
+| Item | one codec item | Tight length bounds against real encodings, round trips, exact reads, truncation, canonical decoding of arbitrary and mutated input, and the allocation bound |
+| Message | one message family | Closed coverage of its rows, tight row bounds, round trips, header and payload mutations, domain violations, and the allocation bound for every decode |
+| Frame | one layout | Each reader accepts its rows at both bounds and rejects short, flagged, other-role, sibling-stream, and undeclared frames from the header |
+
+Tuples and lists of items are items, so the item suite checks composition once. A message whose
+payload composes checked items needs no bound test of its own. The test allocator measures heap
+use during each decode and fails when it is not installed.
+
+A family supplies deterministic samples that reach each row's minimum and maximum, a value
+strategy, and its domain violations. Random generation adds cases; it never decides whether a row
+gets tested.
 
 ## Stateful checks
 

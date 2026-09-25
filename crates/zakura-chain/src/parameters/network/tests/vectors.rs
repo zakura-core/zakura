@@ -666,7 +666,7 @@ fn check_configured_funding_stream_constraints() {
     let configured_funding_streams = [
         Default::default(),
         ConfiguredFundingStreams {
-            height_range: Some(Height(2_000_000)..Height(2_200_000)),
+            height_range: Some(Height(4_000_000)..Height(4_200_000)),
             ..Default::default()
         },
         ConfiguredFundingStreams {

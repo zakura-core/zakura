@@ -8,7 +8,7 @@ use std::collections::HashMap;
 
 use proptest::prelude::*;
 
-use super::testnet_with_nu7;
+use super::{super::error::ParametersBuilderError, testnet_with_nu7};
 use crate::{
     amount::{Amount, NonNegative},
     block::{Height, HeightDiff},
@@ -477,6 +477,48 @@ fn configured_funding_stream_ranges_after_nu7() {
             .addresses()
             .len(),
         27,
+    );
+}
+
+#[test]
+fn moved_revision_2_range_must_not_shadow_a_later_configured_stream() {
+    let _init_guard = zakura_test::init();
+
+    let old_end = Height(TESTNET_THIRD_HALVING);
+    let moved_end = Height(4_656_000);
+    let later_stream = |height_range| ConfiguredFundingStreams {
+        height_range: Some(height_range),
+        recipients: Some(vec![ConfiguredFundingStreamRecipient {
+            receiver: FundingStreamReceiver::Deferred,
+            numerator: 1,
+            addresses: None,
+        }]),
+    };
+
+    let mut overlapping = configured_streams(ConfiguredFundingStreams::default());
+    overlapping.push(later_stream(old_end..moved_end));
+    assert_eq!(
+        testnet_with_nu7(Some(TESTNET_NU7))
+            .with_funding_streams(overlapping)
+            .to_network(),
+        Err(ParametersBuilderError::OverlappingFundingStreams {
+            first_index: REVISION_2,
+            first_range: Height(3_536_500)..moved_end,
+            second_index: REVISION_2 + 1,
+            second_range: old_end..moved_end,
+        }),
+    );
+
+    // Ranges are end-exclusive, so a later stream can start exactly where the moved stream ends.
+    let mut adjacent = configured_streams(ConfiguredFundingStreams::default());
+    adjacent.push(later_stream(moved_end..Height(moved_end.0 + 1)));
+    let network = testnet_with_nu7(Some(TESTNET_NU7))
+        .with_funding_streams(adjacent)
+        .to_network()
+        .expect("adjacent funding stream ranges do not overlap");
+    assert_eq!(
+        network.all_funding_streams()[REVISION_2 + 1].height_range(),
+        &(moved_end..Height(moved_end.0 + 1)),
     );
 }
 

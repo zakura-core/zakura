@@ -362,6 +362,30 @@ fn check_funding_stream_address_period(funding_streams: &FundingStreams, network
     }
 }
 
+/// Rejects overlapping funding stream ranges, because [`Network::funding_streams`] returns only
+/// the first matching stream and would silently ignore every later match.
+fn check_funding_stream_ranges_do_not_overlap(
+    funding_streams: &[FundingStreams],
+) -> Result<(), ParametersBuilderError> {
+    for (first_index, first) in funding_streams.iter().enumerate() {
+        for (second_index, second) in funding_streams.iter().enumerate().skip(first_index + 1) {
+            let first_range = first.height_range();
+            let second_range = second.height_range();
+
+            if first_range.start < second_range.end && second_range.start < first_range.end {
+                return Err(ParametersBuilderError::OverlappingFundingStreams {
+                    first_index,
+                    first_range: first_range.clone(),
+                    second_index,
+                    second_range: second_range.clone(),
+                });
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// Checks that every funding stream recipient address in the provided [`FundingStreams`]
 /// is a P2SH address.
 ///
@@ -1166,12 +1190,14 @@ impl ParametersBuilder {
         Network::new_configured_testnet(self.clone().finish())
     }
 
-    /// Checks funding streams and converts the builder to a configured [`Network::Testnet`]
+    /// Checks that funding stream ranges do not overlap, validates each stream, and converts the
+    /// builder to a configured [`Network::Testnet`].
     pub fn to_network(self) -> Result<Network, ParametersBuilderError> {
         let network = self.to_network_unchecked();
 
         // Final check that the configured funding streams will be valid for these Testnet parameters.
         // The network holds the height ranges after NU7 moves the inherited ones.
+        check_funding_stream_ranges_do_not_overlap(network.all_funding_streams())?;
         for fs in network.all_funding_streams() {
             // Check that the funding streams are valid for the configured Testnet parameters.
             check_funding_stream_address_period(fs, &network);

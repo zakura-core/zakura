@@ -32,6 +32,7 @@ Keep entries **newest-first**. Each row records:
 
 | Parameter | Location | Old → New | PR | Why |
 | --- | --- | --- | --- | --- |
+| Integrated header refill threshold | `crates/zakura-network/src/zakura/header_sync/reactor.rs` | header lead ≤ 2,000 → enough room for one checkpoint range plus its successor (currently lead ≤ 3,599 within the same 4,000-header window) | [#1136](https://github.com/zakura-core/zakura/pull/1136) | Replenish the body backlog earlier while coalescing small credit returns and preserving memory bounds. |
 | `block_profile.socket` | `crates/zakurad/src/config.rs` | new → omitted (recording disabled) | [#1111](https://github.com/zakura-core/zakura/pull/1111) | Enable local block profiles only on an explicitly configured node. |
 | Block profile capacity | `crates/zakura-jsonl-trace/src/block_profile.rs` | new → 1,024 active attempts, 256 spans per attempt (128 fine-detail spans), 16,384 detail and 2,048 summary queue slots | [#1111](https://github.com/zakura-core/zakura/pull/1111) | Bound recorder memory and preserve state-phase capacity when transaction detail is truncated. |
 | Block profile exporter | `crates/zakura-jsonl-trace/src/block_profile.rs` | new → 8,192-byte datagrams, 256-event batches, 2 ms poll, 1 s metadata heartbeat, 100 ms shutdown drain | [#1111](https://github.com/zakura-core/zakura/pull/1111) | Keep serialization off verification workers and bound exporter shutdown without waiting for a collector. |

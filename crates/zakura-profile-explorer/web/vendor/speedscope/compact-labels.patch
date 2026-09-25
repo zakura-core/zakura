@@ -61,7 +61,7 @@ index 0920d11..1b93d5a 100644
 +  })
 +})
 diff --git a/src/lib/profile.ts b/src/lib/profile.ts
-index e34ac58..c47b4c7 100644
+index e34ac58..16a13f5 100644
 --- a/src/lib/profile.ts
 +++ b/src/lib/profile.ts
 @@ -27,6 +27,20 @@ export type SymbolRemapper = (
@@ -71,7 +71,7 @@ index e34ac58..c47b4c7 100644
 +  private selfSamples: number | null = null
 +  private totalSamples: number | null = null
 +  getSelfSamples() {
-+    return this.selfSamples
++    return this.selfSamples ?? (this.totalSamples !== null ? 0 : null)
 +  }
 +  getTotalSamples() {
 +    return this.totalSamples
@@ -203,6 +203,52 @@ index e34ac58..c47b4c7 100644
    }
 
    private pendingSample: {
+diff --git a/src/lib/value-formatters.test.ts b/src/lib/value-formatters.test.ts
+index b147e58..69f492a 100644
+--- a/src/lib/value-formatters.test.ts
++++ b/src/lib/value-formatters.test.ts
+@@ -3,12 +3,12 @@ import {TimeFormatter, ByteFormatter} from './value-formatters'
+ describe('TimeFormatter', () => {
+   test('input units milliseconds', () => {
+     const f = new TimeFormatter('milliseconds')
+-    expect(f.format(0.00004)).toEqual('40.00ns')
+-    expect(f.format(0.04)).toEqual('40.00µs')
+-    expect(f.format(3)).toEqual('3.00ms')
+-    expect(f.format(2070)).toEqual('2.07s')
+-    expect(f.format(150000)).toEqual('2:30')
+-    expect(f.format(1203123)).toEqual('20:03')
++    expect(f.format(0.00004)).toEqual('0.00 ms')
++    expect(f.format(0.04)).toEqual('0.04 ms')
++    expect(f.format(3)).toEqual('3.00 ms')
++    expect(f.format(2070)).toEqual('2070.00 ms')
++    expect(f.format(150000)).toEqual('150000.00 ms')
++    expect(f.format(1203123)).toEqual('1203123.00 ms')
+   })
+
+   test('input units seconds', () => {
+@@ -28,3 +28,10 @@ test('ByteFormatter', () => {
+   expect(f.format(3.5 * 1024 * 1024)).toEqual('3.50 MB')
+   expect(f.format(4.32 * 1024 * 1024 * 1024)).toEqual('4.32 GB')
+ })
++
++test('millisecond profiles keep one explicit unit even at zero', () => {
++  const f = new TimeFormatter('milliseconds')
++  expect(f.format(0)).toBe('0.00 ms')
++  expect(f.format(0.01)).toBe('0.01 ms')
++  expect(f.format(1200)).toBe('1200.00 ms')
++})
+diff --git a/src/lib/value-formatters.ts b/src/lib/value-formatters.ts
+index 5635eed..ac28758 100644
+--- a/src/lib/value-formatters.ts
++++ b/src/lib/value-formatters.ts
+@@ -24,6 +24,7 @@ export class TimeFormatter implements ValueFormatter {
+   }
+
+   formatUnsigned(v: number) {
++    if (this.unit === 'milliseconds') return `${v.toFixed(2)} ms`
+     const s = v * this.multiplier
+
+     if (s / 60 >= 1) {
 diff --git a/src/views/application.tsx b/src/views/application.tsx
 index be24242..c2cb5c6 100644
 --- a/src/views/application.tsx
@@ -260,14 +306,16 @@ index 78e7cf1..9d8e5c1 100644
          ref={this.containerRef}
        >
 diff --git a/src/views/flamechart-view.tsx b/src/views/flamechart-view.tsx
-index 0ae7854..cadda9c 100644
+index 0ae7854..2b63f58 100644
 --- a/src/views/flamechart-view.tsx
 +++ b/src/views/flamechart-view.tsx
-@@ -87,7 +87,13 @@ export class FlamechartView extends StatelessComponent<FlamechartViewProps> {
+@@ -87,9 +87,15 @@ export class FlamechartView extends StatelessComponent<FlamechartViewProps> {
      return (
        <Hovertip containerSize={new Vec2(width, height)} offset={offset}>
          <span className={css(style.hoverCount)}>
 -          {this.formatValue(hover.node.getTotalWeight())}
+-        </span>{' '}
+-        {frame.name}
 +          Total (including calls): {this.formatValue(hover.node.getTotalWeight())}
 +          {hover.node.getTotalSamples() !== null
 +            ? ` · ${hover.node.getTotalSamples()} samples`
@@ -275,18 +323,22 @@ index 0ae7854..cadda9c 100644
 +          <br />
 +          Self (this function): {this.formatValue(hover.node.getSelfWeight())}
 +          {hover.node.getSelfSamples() !== null ? ` · ${hover.node.getSelfSamples()} samples` : ''}
-         </span>{' '}
-         {frame.name}
++        </span>
++        <div>{frame.name}</div>
          {frame.file ? (
+           <div>
+             {frame.file}:{frame.line}
 diff --git a/src/views/flamechart-wrapper.tsx b/src/views/flamechart-wrapper.tsx
-index 409358e..289952c 100644
+index 409358e..beebbab 100644
 --- a/src/views/flamechart-wrapper.tsx
 +++ b/src/views/flamechart-wrapper.tsx
-@@ -46,7 +46,13 @@ export class FlamechartWrapper extends StatelessComponent<FlamechartViewProps> {
+@@ -46,9 +46,15 @@ export class FlamechartWrapper extends StatelessComponent<FlamechartViewProps> {
      return (
        <Hovertip containerSize={new Vec2(width, height)} offset={offset}>
          <span className={css(style.hoverCount)}>
 -          {this.formatValue(hover.node.getTotalWeight())}
+-        </span>{' '}
+-        {frame.name}
 +          Total (including calls): {this.formatValue(hover.node.getTotalWeight())}
 +          {hover.node.getTotalSamples() !== null
 +            ? ` · ${hover.node.getTotalSamples()} samples`
@@ -294,9 +346,11 @@ index 409358e..289952c 100644
 +          <br />
 +          Self (this function): {this.formatValue(hover.node.getSelfWeight())}
 +          {hover.node.getSelfSamples() !== null ? ` · ${hover.node.getSelfSamples()} samples` : ''}
-         </span>{' '}
-         {frame.name}
++        </span>
++        <div>{frame.name}</div>
          {frame.file ? (
+           <div>
+             {frame.file}:{frame.line}
 diff --git a/src/views/profile-table-view.tsx b/src/views/profile-table-view.tsx
 index 9a429dc..67c6485 100644
 --- a/src/views/profile-table-view.tsx

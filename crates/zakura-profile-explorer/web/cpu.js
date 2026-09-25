@@ -14,6 +14,7 @@ function cpuEndpoints(route,scope) {
   return {samples:`/api/cpu/${suffix}`,profile:`/api/cpu-profile/${suffix}`};
 }
 function cpuWeightLabel(data) {
+  if(data.counts?.returned_samples===0)return 'No retained CPU samples in this interval';
   const ns=data.weight?.estimated_cpu_ns;
   return typeof ns==='number' && Number.isFinite(ns) && ns>=0
     ? `${(ns/1e6).toFixed(2)} estimated CPU ms in retained samples`

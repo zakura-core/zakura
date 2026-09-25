@@ -2,6 +2,7 @@
 match asset.as_str() {
     "LICENSE" => ([(header::CONTENT_TYPE, "text/plain")], include_bytes!("LICENSE").as_slice()).into_response(),
     "SourceCodePro-Regular.ttf-ILST5JV6.woff2" => ([(header::CONTENT_TYPE, "font/woff2")], include_bytes!("SourceCodePro-Regular.ttf-ILST5JV6.woff2").as_slice()).into_response(),
+    "chunk-2GNXCJEH.js" => ([(header::CONTENT_TYPE, "text/javascript")], include_bytes!("chunk-2GNXCJEH.js").as_slice()).into_response(),
     "chunk-5Y2DUWX2.js" => ([(header::CONTENT_TYPE, "text/javascript")], include_bytes!("chunk-5Y2DUWX2.js").as_slice()).into_response(),
     "chunk-FW4363Y4.js" => ([(header::CONTENT_TYPE, "text/javascript")], include_bytes!("chunk-FW4363Y4.js").as_slice()).into_response(),
     "favicon-16x16-6PS2IAOI.js" => ([(header::CONTENT_TYPE, "text/javascript")], include_bytes!("favicon-16x16-6PS2IAOI.js").as_slice()).into_response(),
@@ -10,12 +11,14 @@ match asset.as_str() {
     "favicon-32x32-QBAZQQKX.js" => ([(header::CONTENT_TYPE, "text/javascript")], include_bytes!("favicon-32x32-QBAZQQKX.js").as_slice()).into_response(),
     "favicon-3JMDIDSO.js" => ([(header::CONTENT_TYPE, "text/javascript")], include_bytes!("favicon-3JMDIDSO.js").as_slice()).into_response(),
     "favicon-FOKUP5Y5.ico" => ([(header::CONTENT_TYPE, "image/x-icon")], include_bytes!("favicon-FOKUP5Y5.ico").as_slice()).into_response(),
+    "import-QM3H4EFY.js" => ([(header::CONTENT_TYPE, "text/javascript")], include_bytes!("import-QM3H4EFY.js").as_slice()).into_response(),
     "import-YIQUPTL5.js" => ([(header::CONTENT_TYPE, "text/javascript")], include_bytes!("import-YIQUPTL5.js").as_slice()).into_response(),
     "index.html" => ([(header::CONTENT_TYPE, "text/html")], include_bytes!("index.html").as_slice()).into_response(),
     "jfrview_bg-BLJXNNQB.wasm" => ([(header::CONTENT_TYPE, "application/wasm")], include_bytes!("jfrview_bg-BLJXNNQB.wasm").as_slice()).into_response(),
     "perf-vertx-stacks-01-collapsed-all-ZNUIGAJL.txt" => ([(header::CONTENT_TYPE, "text/plain")], include_bytes!("perf-vertx-stacks-01-collapsed-all-ZNUIGAJL.txt").as_slice()).into_response(),
     "source-map-FFWWKABY.js" => ([(header::CONTENT_TYPE, "text/javascript")], include_bytes!("source-map-FFWWKABY.js").as_slice()).into_response(),
     "speedscope-GHPHNKXC.css" => ([(header::CONTENT_TYPE, "text/css")], include_bytes!("speedscope-GHPHNKXC.css").as_slice()).into_response(),
+    "speedscope-XV7JTFBE.js" => ([(header::CONTENT_TYPE, "text/javascript")], include_bytes!("speedscope-XV7JTFBE.js").as_slice()).into_response(),
     "speedscope-YW5WP6AX.js" => ([(header::CONTENT_TYPE, "text/javascript")], include_bytes!("speedscope-YW5WP6AX.js").as_slice()).into_response(),
     _ => StatusCode::NOT_FOUND.into_response(),
 }

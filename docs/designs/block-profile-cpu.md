@@ -31,3 +31,31 @@ Distinguish pending, partial, unavailable, and retained coverage. Report acquisi
 Three independent plan reviews covered capture lifecycle, measurement correctness, and UI/operations. They approved this approach with the boundaries above. Validate parser losses, bounded capture decoding, timestamp selection, finalization inclusion, exact recording links, and viewer interaction. Test the actual Linux perf rotation behavior and observe decoder throughput, retained sample quality, collection drops, CPU, memory, and disk growth during a bounded canary.
 
 Deploy collector and viewer changes before enabling continuous capture. Preserve the live TLS/domain configuration when extending the proxy's explicit read-only routes. Assets remain local, with any viewer-specific content-security policy scoped to the viewer. Verify new live blocks and historical block pages. Rollback stops the sampler and restores the previous explorer executable without changing chain state.
+
+## 999 Hz validation, September 25, 2026
+
+The Linux host's perf 6.8.12 emits `cpu-clock:u` periods of 1,001,001 ns at
+999 Hz. The decoder preserves these periods, rather than assigning wall-clock
+intervals between samples. Tests cover nonuniform periods, concurrent threads,
+idle gaps, mixed historical/new samples, invalid periods, import/query/export,
+and count preservation in the viewer's grouped and caller/callee views.
+
+A controlled OpenSSL SHA-256 throughput check ran three rounds of disabled,
+99 Hz, and 999 Hz sampling in rotating order. Each workload used
+`openssl speed -elapsed -seconds 3 -bytes 16384 -evp sha256`. Sampling used
+`perf record -e cpu-clock:u -F RATE --call-graph dwarf,8192`. Median throughput
+was 425,519.79, 425,831.08, and 424,591.36 kB/s respectively. The 999 Hz median
+was 0.22% below disabled. It captured about 3,000 samples per three-second run,
+compared with 297 at 99 Hz. Decode time was about 0.10 seconds versus 0.03 seconds.
+This is a sampler overhead check, not a matched block-verification benchmark.
+It does not establish a block latency percentile overhead bound.
+
+The live rollout kept the node PID, current main base, run ID, and retained
+history. It restarted the sampler, collector, and web service. The first new
+blocks, 3,495,776 and 3,495,777, retained 56 and 46 samples, with period sums of
+56.056056 and 46.046046 CPU ms. Their recorded elapsed times were 42.158 and
+35.460 ms. Both had zero reported sample loss, decode errors, or query omissions.
+The initial live observation had no sampler restarts or dropped segments and
+zero collector errors. Capture coverage remains explicitly approximate and
+unresolved stack frames remain visible. Historical block 3,495,775 still uses
+its original 99 Hz count-only profile.

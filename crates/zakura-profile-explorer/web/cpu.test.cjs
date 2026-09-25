@@ -47,4 +47,5 @@ test('CPU time label uses actual period sum, never elapsed time or configured ra
   assert.equal(context.cpuWeightLabel({weight:{estimated_cpu_ns:3001001},frequency_hz:99}),'3.00 estimated CPU ms in retained samples');
   assert.equal(context.cpuWeightLabel({weight:{estimated_cpu_ns:null},frequency_hz:999}),'Sample counts only · CPU time weights were not recorded');
   assert.match(context.cpuWeightLabel({}),/Sample counts only/);
+  assert.equal(context.cpuWeightLabel({counts:{returned_samples:0}}),'No retained CPU samples in this interval');
 });

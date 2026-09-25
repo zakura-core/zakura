@@ -3645,7 +3645,7 @@ async fn compatible_commit_preserves_the_pending_body_query() {
         .unwrap();
         assert_eq!(view.borrow().verified_tip, block::Height(2));
         assert_eq!(
-            wiring.work.pending_item(block::Height(3)).unwrap().scope,
+            wiring.work.pending_scope(block::Height(3)).unwrap(),
             zakura_header_chain::BodyWorkAuthority::for_view(&advanced)
         );
         if extended_header > 100 {

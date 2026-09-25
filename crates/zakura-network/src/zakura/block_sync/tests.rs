@@ -942,6 +942,42 @@ fn persistent_body_alarm_metrics_expose_every_required_dimension() {
     }
 }
 
+/// Answer every other metadata query with an empty same-epoch read until the
+/// reactor dispatches the query `target` accepts.
+///
+/// A frontier or reset reaction can dispatch a query after the test completed
+/// the previous one. The same-epoch dedupe then holds later refills until that
+/// query completes, as the driver would complete it.
+async fn complete_queries_until(
+    handle: &BlockSyncHandle,
+    actions: &mut mpsc::Receiver<BlockSyncAction>,
+    anchor: zakura_header_chain::Frontier,
+    target: impl Fn(&BlockSyncAction) -> bool,
+) {
+    loop {
+        let action = next_action(actions).await;
+        if target(&action) {
+            return;
+        }
+        let BlockSyncAction::QueryNeededBlocks {
+            query_id, scope, ..
+        } = action
+        else {
+            panic!("unexpected action before the target query: {action:?}");
+        };
+        handle
+            .send(BlockSyncEvent::ScopedNeededBlocks {
+                read_authority: Some(scope),
+                query_id,
+                scope,
+                body_anchor: anchor,
+                blocks: Vec::new(),
+            })
+            .await
+            .expect("the empty read completes");
+    }
+}
+
 async fn wait_for_query_needed_blocks(
     actions: &mut mpsc::Receiver<BlockSyncAction>,
     verified_block_tip: block::Height,
@@ -13319,7 +13355,22 @@ async fn committed_reanchor_requeries_while_downloads_in_flight() {
             1,
         )))
         .expect("the committed snapshot receiver is live");
-    wait_for_query_needed_blocks(&mut actions, block::Height(0), block::Height(3)).await;
+    complete_queries_until(
+        &handle,
+        &mut actions,
+        zakura_header_chain::Frontier::new(block::Height(0), block::Hash([0; 32])),
+        |action| {
+            matches!(
+                action,
+                BlockSyncAction::QueryNeededBlocks {
+                    from: block::Height(1),
+                    best_header_tip: block::Height(3),
+                    ..
+                }
+            )
+        },
+    )
+    .await;
 
     reactor_task.abort();
 }
@@ -13598,17 +13649,22 @@ async fn header_extension_preserves_checkpoint_pipeline() {
     snapshots
         .send(Some(extension))
         .expect("the 2,007-header extension publishes");
-    loop {
-        match next_action(&mut actions).await {
-            BlockSyncAction::QueryNeededBlocks {
-                from: block::Height(4),
-                scope,
-                ..
-            } if scope == extension_scope => break,
-            BlockSyncAction::QueryNeededBlocks { .. } => {}
-            action => panic!("unexpected action after the compatible extension: {action:?}"),
-        }
-    }
+    complete_queries_until(
+        &handle,
+        &mut actions,
+        zakura_header_chain::Frontier::new(block::Height(1), blocks[0].hash()),
+        |action| {
+            matches!(
+                action,
+                BlockSyncAction::QueryNeededBlocks {
+                    from: block::Height(4),
+                    scope,
+                    ..
+                } if *scope == extension_scope
+            )
+        },
+    )
+    .await;
     assert_eq!(sequencer_view.borrow().reset_epoch, reset_epoch);
     assert_eq!(sequencer_view.borrow().download_floor, block::Height(3));
     assert_eq!(sequencer_view.borrow().applying_len, 2);
@@ -13633,17 +13689,22 @@ async fn header_extension_preserves_checkpoint_pipeline() {
     snapshots
         .send(Some(checkpoint))
         .expect("checkpoint finality publishes after the extension");
-    loop {
-        match next_action(&mut actions).await {
-            BlockSyncAction::QueryNeededBlocks {
-                from: block::Height(4),
-                scope,
-                ..
-            } if scope == checkpoint_scope => break,
-            BlockSyncAction::QueryNeededBlocks { .. } => {}
-            action => panic!("unexpected action after checkpoint finality: {action:?}"),
-        }
-    }
+    complete_queries_until(
+        &handle,
+        &mut actions,
+        zakura_header_chain::Frontier::new(block::Height(1), blocks[0].hash()),
+        |action| {
+            matches!(
+                action,
+                BlockSyncAction::QueryNeededBlocks {
+                    from: block::Height(4),
+                    scope,
+                    ..
+                } if *scope == checkpoint_scope
+            )
+        },
+    )
+    .await;
     assert_eq!(sequencer_view.borrow().reset_epoch, reset_epoch);
     assert_eq!(sequencer_view.borrow().download_floor, block::Height(3));
     assert_eq!(sequencer_view.borrow().applying_len, 2);
@@ -13883,7 +13944,22 @@ async fn committed_reanchor_releases_stale_submitted_bodies() {
             1,
         )))
         .expect("the committed snapshot receiver is live");
-    wait_for_query_needed_blocks(&mut actions, block::Height(0), block::Height(3)).await;
+    complete_queries_until(
+        &handle,
+        &mut actions,
+        zakura_header_chain::Frontier::new(block::Height(0), block::Hash([0; 32])),
+        |action| {
+            matches!(
+                action,
+                BlockSyncAction::QueryNeededBlocks {
+                    from: block::Height(1),
+                    best_header_tip: block::Height(3),
+                    ..
+                }
+            )
+        },
+    )
+    .await;
 
     handle
         .send(BlockSyncEvent::NeededBlocks(

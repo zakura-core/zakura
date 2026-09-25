@@ -1,0 +1,57 @@
+# Rendered by deploy/deployer/deploy.py — do not edit on the node by hand.
+# Placeholders ({{NAME}}) are substituted at deploy time from the node config.
+
+[network]
+# network: configured testnet, see [network.network]
+listen_addr = "0.0.0.0:18233"
+# identity_dir unset (zakurad default)
+cache_dir = "/var/lib/zakura-fork"
+initial_testnet_peers = [
+    "127.0.0.1:18333",
+]
+p2p_stack = "legacy"
+
+[network.network]
+network_name = "Nu7Fork"
+network_magic = [122, 107, 117, 55]
+checkpoints = true
+initial_nsm_value_balance = 55768414957
+[network.network.activation_heights]
+BeforeOverwinter = 1
+Overwinter = 207500
+Sapling = 280000
+Blossom = 584000
+Heartwood = 903800
+Canopy = 1028500
+NU5 = 1842420
+NU6 = 2976000
+"NU6.1" = 3536500
+"NU6.2" = 4052000
+"NU6.3" = 4134000
+NU7 = 4400010
+
+[state]
+cache_dir = "/var/lib/zakura-fork"
+storage_mode = "pruned"
+
+[rpc]
+listen_addr = "127.0.0.1:18232"
+enable_cookie_auth = false
+
+[metrics]
+endpoint_addr = "127.0.0.1:9999"
+
+
+[mining]
+miner_address = "tmGkvoQGmvJu6H5Wp22wUFAsBuX6SPGHnMq"
+
+[consensus]
+checkpoint_sync = true
+vct_fast_sync = false
+
+[tracing]
+# Deterministic log file: the deploy tool reads exactly this path for
+# `logs fetch` / `logs follow`, so writer and reader share one source of truth.
+log_file = "/var/log/zakura/zakura-fork.log"
+use_color = false
+filter = "info"

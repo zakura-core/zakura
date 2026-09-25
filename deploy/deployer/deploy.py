@@ -89,7 +89,7 @@ DEFAULTS = {
     # Keys: dev_network, listen_addr, bootstrap_peers. Absent -> no section.
     "zakura": None,
     # Optional [defaults.testnet_parameters] table -> rendered
-    # [network.testnet_parameters], for configured testnets such as the NU7 fork.
+    # [network.network], for configured testnets such as the NU7 fork.
     # Absent -> no section, so the node runs the default public network.
     "testnet_parameters": None,
     # Process deploys are for manually supervised nodes, like the testnet
@@ -137,7 +137,7 @@ class Node:
     checkpoint_sync: bool
     vct_fast_sync: bool
     zakura: object  # dict | None: fleet-wide [network.zakura] settings
-    testnet_parameters: object  # dict | None: [network.testnet_parameters] settings
+    testnet_parameters: object  # dict | None: configured testnet [network.network] settings
     working_dir: str
     start_command: str
     process_pattern: str
@@ -463,17 +463,29 @@ def render_template(name: str, subst: dict[str, str]) -> str:
 
 
 def toml_scalar(value: object) -> str:
-    """Render one TOML scalar. Booleans must be checked before ints."""
+    """Render one TOML value. Booleans must be checked before ints.
+
+    Strings use JSON escaping, which is also a valid TOML basic string. Tables and
+    arrays nested below the top level render inline.
+    """
+    if value is None:
+        raise DeployError("TOML has no null value; omit the key instead")
     if isinstance(value, bool):
         return "true" if value else "false"
     if isinstance(value, (int, float)):
         return str(value)
-    return f'"{value}"'
+    if isinstance(value, dict):
+        items = ", ".join(f"{toml_key(k)} = {toml_scalar(v)}" for k, v in value.items())
+        return f"{{ {items} }}" if items else "{}"
+    if isinstance(value, list):
+        return "[" + ", ".join(toml_scalar(item) for item in value) + "]"
+    return json.dumps(str(value), ensure_ascii=False)
 
 
 def toml_key(key: str) -> str:
     """Quote a bare key only when TOML requires it, e.g. the "NU6.1" upgrade names."""
-    return key if key.replace("_", "").replace("-", "").isalnum() else f'"{key}"'
+    bare = key.isascii() and key.replace("_", "").replace("-", "").isalnum()
+    return key if bare else json.dumps(key, ensure_ascii=False)
 
 
 def render_toml_pair(key: str, value: object) -> str:
@@ -533,17 +545,34 @@ def render_zakura_block(zakura: object) -> str:
     return "\n" + "\n".join(lines) + "\n"
 
 
-def render_testnet_params_block(params: object) -> str:
-    """Render [network.testnet_parameters] from a dict, or "" if unset.
+def render_network_line(node: Node) -> str:
+    """Render the `network` key, or a pointer to the configured-testnet table.
+
+    A configured testnet is `network = { ... }` itself, rendered as the
+    [network.network] table, so it has no `network = "..."` line: zakurad rejects
+    `[network.testnet_parameters]` beside `network = "Testnet"`, because the
+    public Testnet's parameters are fixed.
+    """
+    if node.testnet_parameters:
+        return "# network: configured testnet, see [network.network]"
+    return f'network = "{node.network}"'
+
+
+def render_testnet_params_block(node: Node) -> str:
+    """Render a configured testnet's [network.network] table, or "" if unset.
 
     Keys pass through verbatim, so the deployer does not need to learn every
     field of `DTestnetParameters` in crates/zakura-network/src/config.rs. Nested
     tables (`activation_heights`) and arrays of tables (`lockbox_disbursements`)
     are rendered as such.
     """
-    if not params:
+    if not node.testnet_parameters:
         return ""
-    lines = render_toml_table("network.testnet_parameters", dict(params))
+    if node.network != "Testnet":
+        raise DeployError(
+            f"{node.name}: testnet_parameters configure a Testnet, but network = {node.network!r}"
+        )
+    lines = render_toml_table("network.network", dict(node.testnet_parameters))
     return "\n" + "\n".join(lines) + "\n"
 
 
@@ -578,7 +607,7 @@ def render_node_config(node: Node) -> str:
         else "# initial_testnet_peers unset (zakurad default DNS seeds)"
     )
     return render_template("zakura.toml", {
-        "NETWORK": node.network,
+        "NETWORK_LINE": render_network_line(node),
         "LISTEN_ADDR": node.listen_addr,
         "IDENTITY_DIR": identity_dir_line,
         "NETWORK_CACHE_DIR": network_cache_line,
@@ -586,7 +615,7 @@ def render_node_config(node: Node) -> str:
         "STATE_CACHE_DIR": node.state_cache_dir,
         "STORAGE_MODE": node.storage_mode,
         "P2P_STACK": node.p2p_stack,
-        "TESTNET_PARAMS_BLOCK": render_testnet_params_block(node.testnet_parameters),
+        "TESTNET_PARAMS_BLOCK": render_testnet_params_block(node),
         "ZAKURA_BLOCK": render_zakura_block(node.zakura),
         "METRICS_BLOCK": metrics_block,
         "HEALTH_BLOCK": health_block,

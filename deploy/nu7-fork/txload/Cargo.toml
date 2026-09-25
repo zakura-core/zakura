@@ -33,7 +33,6 @@ orchard = { workspace = true, features = ["circuit"] }
 zakura-chain = { path = "../../../crates/zakura-chain" }
 zakura-network = { path = "../../../crates/zakura-network" }
 zakura-node-services = { path = "../../../crates/zakura-node-services", features = ["rpc-client"] }
-zakura-rpc = { path = "../../../crates/zakura-rpc" }
 
 [lints]
 workspace = true

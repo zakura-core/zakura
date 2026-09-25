@@ -162,6 +162,11 @@ class Collector:
                            "acceptedBlocks24h": status.get("acceptedBlocks24h"),
                            "observedAt": status["observedAt"]})
             height = status["height"]
+            # A remote report is untrusted: a malformed height would reach the primary's
+            # RPC below and must not take down the whole status feed.
+            if (type(height) is not int or height < 0
+                    or not isinstance(status["recentHashes"], dict)):
+                raise ValueError("malformed remote miner status")
             fresh = 0 <= time.time() - status["observedAt"] <= 90
             lag = primary["height"] - height
             common_height = min(height, primary["height"])
@@ -173,7 +178,7 @@ class Collector:
                        and status["branchId"] == primary["branch"]
                        and status["activationHeight"] == self.network["activationHeight"])
             result.update({"healthy": healthy, "height": height, "lagBlocks": lag})
-        except (OSError, ValueError, KeyError, TypeError, urllib.error.URLError):
+        except (OSError, ValueError, KeyError, TypeError, RuntimeError, urllib.error.URLError):
             pass
         return result
 

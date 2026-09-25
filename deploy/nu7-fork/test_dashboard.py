@@ -128,6 +128,24 @@ class DashboardTests(unittest.TestCase):
         ):
             self.assertFalse(self.collector.sample_remote_miner(miner, primary)["healthy"])
 
+    def test_malformed_remote_miner_report_is_unhealthy_without_rpc(self):
+        miner = {"id": "eu", "region": "Amsterdam", "url": "http://example/v1/miner"}
+        primary = {"height": 11, "hash": "hash11", "branch": "77190ad9", "port": 1}
+        base = {"observedAt": 1000, "minerActive": True, "nodeActive": True,
+                "nodeHealthy": True, "height": 11, "recentHashes": {"11": "hash11"},
+                "branchId": "77190ad9", "activationHeight": 10}
+
+        for field, value in (("height", True), ("height", 1.5), ("height", -9),
+                             ("recentHashes", ["hash11"])):
+            sample = {**base, field: value}
+            with mock.patch.object(dashboard.time, "time", return_value=1002), mock.patch.object(
+                dashboard.urllib.request, "urlopen",
+                return_value=io.BytesIO(json.dumps(sample).encode()),
+            ), mock.patch.object(dashboard, "rpc") as rpc:
+                result = self.collector.sample_remote_miner(miner, primary)
+            self.assertFalse(result["healthy"], (field, value))
+            rpc.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

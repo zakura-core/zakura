@@ -3,9 +3,17 @@
 Run with `python3 -m unittest test_fork` from `deploy/nu7-fork`.
 """
 
+import os
+import tempfile
 import unittest
+from pathlib import Path
 
 import fork
+
+# The rendered primary node config, loaded by zakurad's own config deserializer in
+# the fork miner's `rendered_fork_config_loads_in_zakurad` test. Regenerate it with
+# `ZAKURA_REGENERATE_FIXTURES=1 python3 -m unittest test_fork` after an intended change.
+RENDERED_NODE_FIXTURE = Path(__file__).parent / "miner" / "testdata" / "fork-node.toml"
 
 
 def base_config(peer=None):
@@ -112,6 +120,35 @@ class RenderedNodes(unittest.TestCase):
         config["miner"]["address"] = ""
         with self.assertRaises(fork.ForkError):
             render(config)
+
+
+class RenderedNodeConfig(unittest.TestCase):
+    """The deployer's output for a fork node must be a config zakurad accepts.
+
+    tomllib only proves the output is TOML. The fixture is what the Rust side loads,
+    so a shape zakurad rejects fails `cargo test -p zakura-fork-miner`.
+    """
+
+    def render_primary(self) -> str:
+        fork.sys.path.insert(0, str(fork.DEPLOYER.parent))
+        import deploy  # noqa: E402  (path is set immediately above)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            nodes_path = Path(tmp) / "nodes.toml"
+            nodes_path.write_text(render(base_config(PEER)))
+            nodes = deploy.load_nodes(nodes_path, None)
+        return deploy.render_node_config(nodes[0])
+
+    def test_matches_the_fixture_the_rust_test_loads(self):
+        rendered = self.render_primary()
+        if os.environ.get("ZAKURA_REGENERATE_FIXTURES"):
+            RENDERED_NODE_FIXTURE.parent.mkdir(parents=True, exist_ok=True)
+            RENDERED_NODE_FIXTURE.write_text(rendered)
+        self.assertEqual(
+            rendered, RENDERED_NODE_FIXTURE.read_text(),
+            "the rendered fork config changed; regenerate the fixture with "
+            "ZAKURA_REGENERATE_FIXTURES=1 and run cargo test -p zakura-fork-miner",
+        )
 
 
 if __name__ == "__main__":

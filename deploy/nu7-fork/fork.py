@@ -388,15 +388,60 @@ def mount_state_volume(config: dict) -> None:
     print(f"[seed] state volume: {result.stdout.strip()}")
 
 
+def fork_nodes(config: dict) -> list[dict]:
+    """The fork's zakurad nodes on the host: their deploy name, unit, and cache root."""
+    nodes = [{
+        "name": config["droplet"]["name"],
+        # render_nodes_toml leaves the primary on deploy.py's default unit name.
+        "service": config["host"].get("service_name", "zakurad"),
+        "cache_dir": config["host"]["fork_cache_dir"],
+    }]
+    peer = config.get("peer", {})
+    if peer.get("enabled", False):
+        nodes.append({
+            "name": peer["name"],
+            "service": peer["service_name"],
+            "cache_dir": peer["cache_dir"],
+        })
+    return nodes
+
+
+def check_fork_paths(config: dict, nodes: list[dict]) -> str:
+    """Refuse fork state paths that a forced re-seed must never delete.
+
+    Returns the fork's state directory name.
+    """
+    name = state_dir_name(config["fork"]["network_name"])
+    if not re.fullmatch(r"[a-z0-9_-]+", name) or name in ("mainnet", "testnet", "regtest"):
+        raise ForkError(
+            f"network_name {config['fork']['network_name']!r} must be a distinct fork name; "
+            f"it names the state directories that a re-seed deletes"
+        )
+    pristine = Path(config["host"]["pristine_cache_dir"])
+    for node in nodes:
+        root = Path(node["cache_dir"])
+        if not root.is_absolute() or root == Path("/"):
+            raise ForkError(f"{node['name']}: cache_dir {root} must be an absolute directory")
+        if root == pristine or pristine in root.parents or root in pristine.parents:
+            raise ForkError(
+                f"{node['name']}: cache_dir {root} overlaps the pristine seed at {pristine}"
+            )
+    return name
+
+
 def cmd_seed(config: dict, args) -> int:
-    """Copy the pristine Testnet state into the fork's own state directory.
+    """Copy the pristine Testnet state into every fork node's own state directory.
 
     The pristine copy is never modified, so a reconfigure can re-seed from it
-    without touching DigitalOcean again.
+    without touching DigitalOcean again. Each node gets its own copy: the fork
+    nodes are pruned, so a node seeded from nothing could not sync the inherited
+    history from its peer.
     """
     host = config["host"]["ssh_string"]
     code_version = db_format_version()
     pristine_root = config["host"]["pristine_cache_dir"]
+    nodes = fork_nodes(config)
+    name = check_fork_paths(config, nodes)
 
     mount_state_volume(config)
 
@@ -427,23 +472,39 @@ def cmd_seed(config: dict, args) -> int:
             f"restores the previous major format in place on first start"
         )
 
-    pristine = found
-    target_root = config["host"]["fork_cache_dir"]
-    target = (
-        f"{target_root}/state/v{seed_version}/"
-        f"{state_dir_name(config['fork']['network_name'])}"
-    )
-
-    print(f"[seed] {pristine} -> {target}")
-
     if args.force:
-        ssh(host, f"rm -rf {shlex.quote(target)}")
-    ssh(host, f"mkdir -p {shlex.quote(str(Path(target).parent))}")
-    ssh(host, f"test ! -e {shlex.quote(target)} || "
-              f"{{ echo 'fork state already exists at {target}; pass --force' >&2; exit 1; }}")
-    # -a preserves the RocksDB file set exactly; --link-dest would share inodes
-    # with the pristine copy and let the fork corrupt its own seed.
-    ssh(host, f"cp -a {shlex.quote(pristine)} {shlex.quote(target)}")
+        # A running node keeps writing database files into the directory being
+        # replaced, which would silently corrupt the fresh copy.
+        for node in nodes:
+            unit = shlex.quote(node["service"])
+            print(f"[seed] stopping {node['service']}")
+            ssh(host, f"if systemctl cat {unit} >/dev/null 2>&1; then systemctl stop {unit}; fi")
+
+    for node in nodes:
+        root = node["cache_dir"]
+        state_target = f"{root}/state/v{seed_version}/{name}"
+        # zakurad moves a previous-major seed to the code's version on first start,
+        # so an earlier run's state can live under either version, and the moved
+        # copy would win over a fresh seed.
+        targets = [f"{root}/state/v{version}/{name}"
+                   for version in sorted({seed_version, code_version})]
+        # Only the finalized database is seeded, because `tip-height` reads only that
+        # and the activation height is relative to it. A previous run's non-finalized
+        # backup would reload blocks from the old fork, so it goes too.
+        targets.append(f"{root}/non_finalized_state/{name}")
+
+        print(f"[seed] {found} -> {state_target}")
+        quoted = " ".join(shlex.quote(target) for target in targets)
+        if args.force:
+            ssh(host, f"rm -rf {quoted}")
+        else:
+            ssh(host, f"for target in {quoted}; do test ! -e \"$target\" || "
+                      f"{{ echo \"fork state already exists at $target; pass --force\" >&2; "
+                      f"exit 1; }}; done")
+        ssh(host, f"mkdir -p {shlex.quote(str(Path(state_target).parent))}")
+        # -a preserves the RocksDB file set exactly; --link-dest would share inodes
+        # with the pristine copy and let the fork corrupt its own seed.
+        ssh(host, f"cp -a {shlex.quote(found)} {shlex.quote(state_target)}")
     print("[seed] done")
     return 0
 
@@ -475,9 +536,15 @@ def cmd_render(config: dict, args) -> int:
 def cmd_deploy(config: dict, args) -> int:
     if not args.nodes.is_file():
         raise ForkError(f"{args.nodes} not found; run `fork.py render` first")
+    names = [node["name"] for node in tomllib.loads(args.nodes.read_text())["nodes"]]
     # deploy.py takes --config after the subcommand, not before it.
-    for subcommand in ("build", "deploy"):
-        run([sys.executable, str(DEPLOYER), subcommand, "--config", str(args.nodes)],
+    deployer = [sys.executable, str(DEPLOYER)]
+    run([*deployer, "build", "--config", str(args.nodes)], cwd=DEPLOYER.parent)
+    # One node at a time: deploy.py deploys in parallel and stages every node at the
+    # same /tmp/zakurad-deploy.* paths, so co-located fork nodes would install each
+    # other's binary, config, or unit.
+    for name in names:
+        run([*deployer, "deploy", "--config", str(args.nodes), "--node", name],
             cwd=DEPLOYER.parent)
     return 0
 

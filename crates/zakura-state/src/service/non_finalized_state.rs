@@ -773,11 +773,9 @@ impl NonFinalizedState {
 
     /// Validate `contextual` and update `new_chain`, doing CPU-intensive work in parallel batches.
     #[allow(clippy::unwrap_in_result)]
-    // Referenced output scripts can dwarf the block's wire size. Keep their
-    // Debug representation out of span fields, including retained span traces.
     #[tracing::instrument(
         skip(new_chain, contextual, sprout_final_treestates),
-        fields(height = ?contextual.height, hash = ?contextual.hash)
+        fields(height = ?contextual.height, hash = %contextual.hash)
     )]
     fn validate_and_update_parallel(
         new_chain: Arc<Chain>,

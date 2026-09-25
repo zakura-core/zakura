@@ -42,3 +42,9 @@ test('compact labels preserve qualified types and closure context without changi
   assert.equal(labels.compactFrame('halo2::plonk::Verifier<Foo<Bar>>::verify'),'halo2::plonk::Verifier<…>::verify');
   assert.equal(labels.compactFrame('tokio::runtime::task::core::Core<T>::poll::{{closure}}'),'tokio::…::Core<…>::poll::{{closure}}');
 });
+
+test('CPU time label uses actual period sum, never elapsed time or configured rate',()=>{
+  assert.equal(context.cpuWeightLabel({weight:{estimated_cpu_ns:3001001},frequency_hz:99}),'3.00 estimated CPU ms in retained samples');
+  assert.equal(context.cpuWeightLabel({weight:{estimated_cpu_ns:null},frequency_hz:999}),'Sample counts only · CPU time weights were not recorded');
+  assert.match(context.cpuWeightLabel({}),/Sample counts only/);
+});

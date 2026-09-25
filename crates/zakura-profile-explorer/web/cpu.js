@@ -1,4 +1,4 @@
-/* Canonical samples stay separate from Speedscope's sample-count representation. */
+/* CPU weights and elapsed time are separate measurements. */
 function cpuRoute(path) {
   const match=/^\/cpu\/([a-f0-9]{32})\/([0-9]{1,20})$/.exec(path);
   return match?{run:match[1],attempt:match[2]}:null;
@@ -12,6 +12,12 @@ function findSymbols(frames,query) {
 function cpuEndpoints(route,scope) {
   const suffix=`${route.run}/${route.attempt}?scope=${cpuScope(scope)}`;
   return {samples:`/api/cpu/${suffix}`,profile:`/api/cpu-profile/${suffix}`};
+}
+function cpuWeightLabel(data) {
+  const ns=data.weight?.estimated_cpu_ns;
+  return typeof ns==='number' && Number.isFinite(ns) && ns>=0
+    ? `${(ns/1e6).toFixed(2)} estimated CPU ms in retained samples`
+    : 'Sample counts only · CPU time weights were not recorded';
 }
 async function startCpuPage() {
   const $=id=>document.getElementById(id),route=cpuRoute(location.pathname);
@@ -57,7 +63,8 @@ async function startCpuPage() {
       for(const [key,label] of [['decode_errors','capture decode errors'],['known_lost_samples','known capture losses'],['capture_omitted_samples','capture omissions'],['omitted_frames','capture omitted frames']])if(coverage[key])problems.push(`${coverage[key]} ${label}`);
       if(coverage.query_limited)problems.push('query limit reached');
       $('coverage').dataset.partial=String(problems.length>0);
-      $('coverage').textContent=[`${Number(count).toLocaleString()} samples`,data.frequency_hz?`${data.frequency_hz} Hz`:null,'process-wide',`${coverage.state || 'unknown'} coverage`,...problems].filter(Boolean).join(' · ');
+      $('coverage').textContent=[`${Number(count).toLocaleString()} samples`,data.frequencies_hz?.length?`${data.frequencies_hz.join(' / ')} Hz`:data.frequency_hz?`${data.frequency_hz} Hz`:null,'process-wide',`${coverage.state || 'unknown'} coverage`,...problems].filter(Boolean).join(' · ');
+      $('cpu-time').textContent=cpuWeightLabel(data);
       $('capture-reason').textContent=coverage.reason || 'Acquisition coverage is unknown.';
       if(coverage.state==='pending')schedulePending(current);
       if(count>0){

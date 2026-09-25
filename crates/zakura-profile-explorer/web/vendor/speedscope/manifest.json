@@ -8,25 +8,25 @@
   "npm": "11.5.1",
   "files": {
     "LICENSE": "6244b13e9bf25cfd42d81c939d6c535d932596e8c320050234f2c2ac5a6f36a0",
-    "README.md": "dff1a9c024ba567f6a6c3dc6d95d9ee8fdd6acebd81b9a9a126ec1e634ad0506",
+    "README.md": "8c3cce0cd129fa59a1f89e81639281db3d0fdcfd738b4df5b8e2f533d18b84ea",
     "SourceCodePro-Regular.ttf-ILST5JV6.woff2": "8badfe75c98da1e8315a52619f177def4618350f7b3e496baf5b8894da2c2ac0",
+    "chunk-5Y2DUWX2.js": "b5dad87decc59767c089422471804b1c25ed43dd89385ef9be339d4e786b0941",
     "chunk-FW4363Y4.js": "455da7cd03013fac5a4abd7a1e875326ee48c1a8f44ec9920aebc3964c54ae78",
-    "chunk-KY5FQVXF.js": "587147f8631b114cdadb8154b2cce0bab392b1ed39635bb9d4f966b735158de9",
-    "compact-labels.patch": "768abe2e7c35c490771220d33b5302696ed5aa3541e0e83361fd120bbef48502",
+    "compact-labels.patch": "09dae1156fcdc6038cd528baf83ad73eb40fe40d86f7967baa10a8e13e8c7f22",
     "favicon-16x16-6PS2IAOI.js": "9172236551e230f4b181dc5ddec5e70412584ded1cd34fe90e19ab3115af9697",
     "favicon-16x16-VSI62OPJ.png": "a62a6da7742b43ee798b106b709aa82eafd1b500ef050427cfec05e4d41dacac",
     "favicon-32x32-3EB2YCUY.png": "9ea6e6d13b7b8064187866deba1e8674d8ba25071279ba7b15f34b54df2508d0",
     "favicon-32x32-QBAZQQKX.js": "e326f34dc2a6e84bfb94776b6a7b01f5ddf2e8d555c045f424e8d77b9fe33357",
     "favicon-3JMDIDSO.js": "3b7c54728f12d232049efff19373173535c1a8e4e0f41ff7d35c4325ad9b02c0",
     "favicon-FOKUP5Y5.ico": "45701858a8fe9daccd63d2cb5749fdbd155a471b5fc391d04f3f61d18a9efcdd",
-    "import-L3I5W4LA.js": "23bdae7aad3a4925a6ed520efd9bb4e2cacbb421bbf460d0107fb413dd15fddb",
-    "index.html": "cd2e0884de6d755a76f1dfcdb841da0949d4f430d4ff3b3a5b3fefea08a07fd8",
+    "import-YIQUPTL5.js": "b9a0fdb981e18c3fffac9c635b7f3821ba14e1616f0b3cee6924b648f5868c64",
+    "index.html": "eeca51a90e6db2d5a3c6176e4a2b6a59c18815f690f0dc4f9916fa9c35c80ec3",
     "jfrview_bg-BLJXNNQB.wasm": "8538ff05a6a76f6bb3177aa0841d54dba92db6cb6435a4917fa4d25d908092c6",
     "perf-vertx-stacks-01-collapsed-all-ZNUIGAJL.txt": "dedaa1c8055267638030efa25081116105fd0e357944cefc0974e792dfcabedd",
-    "routes.rs": "87de85bc6442f21c93adbf00ed5dae4a809b2025d4e9d384414bf1b78e58ea8b",
+    "routes.rs": "e2e9293497e3b29b1bc3fd12b76d4db39a9da9ff865072910d80e4e40121ed43",
     "source-code-pro.LICENSE.md": "2e14ee65e55dbcc7d66347cd7c76a10a1a18ac49dd7989a2b3838b479676f746",
     "source-map-FFWWKABY.js": "f170f738c656383a18c311c0dc1bff9418b402b8edc9ece8b38f0f6f2ad538e6",
     "speedscope-GHPHNKXC.css": "0f823f58242a0ca365d46761dd99034626931157a08e24dd667b310363209bc9",
-    "speedscope-PX73TTU3.js": "a5ac8839c67befd01f62c3dc8e5895ebf7783017047e650f1a65943ec714375c"
+    "speedscope-YW5WP6AX.js": "7559928366fee9b41c9242c22c1069cd0fef9e2bc20520b34805589cfa8dac7f"
   }
 }

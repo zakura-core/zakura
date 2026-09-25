@@ -24,6 +24,23 @@ class Parsing(unittest.TestCase):
         self.assertEqual(result['decode_errors'], 0)
         self.assertFalse(result['truncated'])
 
+    def test_cpu_period_survives_without_filling_idle_gaps(self):
+        lines = ['12/13 1.001: 1001001 cpu-clock:u: abcd work (node)\n',
+                 '12/14 8.001: 2000000 cpu-clock:u: abce work (node)\n']
+        parsed = sample.parse_perf(lines, 12, 0, 9000000, require_period=True)
+        self.assertEqual([s['cpu_period_ns'] for s in parsed['samples']], [1001001, 2000000])
+        self.assertEqual([s['mono_us'] for s in parsed['samples']], [1001000, 8001000])
+        self.assertEqual(parsed['decode_errors'], 0)
+
+    def test_weighted_capture_rejects_missing_wrong_or_invalid_period(self):
+        for header in ('cpu-clock:u:', '0 cpu-clock:u:', '1000000001 cpu-clock:u:', '1000 cycles:u:'):
+            parsed = sample.parse_perf([f'12/13 1.001: {header} abcd work (node)\n'],
+                                       12, 0, 2000000, require_period=True)
+            self.assertEqual(parsed['samples'], [])
+            self.assertEqual(parsed['decode_errors'], 1)
+            self.assertEqual(parsed['omitted_samples'], 1)
+            self.assertTrue(parsed['truncated'])
+
     def test_long_symbols_and_raw_addresses_do_not_merge(self):
         symbol = '_R' + 'long_symbol' * 500
         lines = [f'12/13 1.1: cpu-clock:u: {ip} {symbol} (/full/node)\n\n' for ip in ('abcd', 'abce')]

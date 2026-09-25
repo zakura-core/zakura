@@ -1,4 +1,4 @@
-//! Bounded timestamped process samples. Sample counts are never elapsed CPU ownership.
+//! Bounded process CPU samples. Period weights estimate CPU time, not block elapsed time.
 use anyhow::{ensure, Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -66,6 +66,9 @@ pub(crate) struct Sample {
     pub frames: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stack: Option<u32>,
+    /// Recorded cpu-clock event period. Absent in historical count-only captures.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_period_ns: Option<u64>,
 }
 #[derive(Clone, Default, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -81,10 +84,10 @@ fn validate(c: &Capture) -> Result<()> {
         "run identity"
     );
     ensure!(
-        [19, 49, 99].contains(&c.frequency) && c.clock == "monotonic",
+        [19, 49, 99, 999].contains(&c.frequency) && c.clock == "monotonic",
         "capture settings"
     );
-    ensure!(matches!(c.schema_version, 0..=2), "capture schema");
+    ensure!(matches!(c.schema_version, 0..=3), "capture schema");
     ensure!(
         c.end_mono_us >= c.start_mono_us && c.end_mono_us - c.start_mono_us <= 120_000_000,
         "capture duration"
@@ -121,6 +124,13 @@ fn validate(c: &Capture) -> Result<()> {
     }
     for sample in &c.samples {
         ensure!(
+            sample
+                .cpu_period_ns
+                .is_none_or(|ns| (1..=1_000_000_000).contains(&ns))
+                && (c.schema_version < 3 || sample.cpu_period_ns.is_some()),
+            "CPU period required and bounded for weighted captures"
+        );
+        ensure!(
             sample.mono_us >= c.start_mono_us && sample.mono_us <= c.end_mono_us,
             "sample outside capture"
         );
@@ -128,7 +138,7 @@ fn validate(c: &Capture) -> Result<()> {
             sample.frames.len() <= 128 && sample.frames.iter().all(|f| f.len() <= MAX_SYMBOL),
             "stack bound"
         );
-        if c.schema_version == 2 {
+        if c.schema_version >= 2 {
             ensure!(
                 sample.frames.is_empty()
                     && sample
@@ -309,7 +319,7 @@ pub(crate) fn window(
     let mut frames = Vec::new();
     let mut stack_ids = BTreeMap::<Vec<u32>, u32>::new();
     let mut stacks = Vec::new();
-    let mut samples = Vec::<(u64, u32, u32)>::new();
+    let mut samples = Vec::<(u64, u32, u32, Option<u64>)>::new();
     let mut matching = 0u64;
     let mut boundary_samples = 0u64;
     let mut omitted = 0u64;
@@ -423,7 +433,7 @@ pub(crate) fn window(
             {
                 sample_refs += depth;
                 unknown += u64::from(is_unknown);
-                samples.push((sample.mono_us, sample.tid, stack));
+                samples.push((sample.mono_us, sample.tid, stack, sample.cpu_period_ns));
                 continue;
             }
             let legacy;
@@ -505,10 +515,17 @@ pub(crate) fn window(
             if let Some(id) = sample.stack {
                 local_stacks[usize::try_from(id)?] = Some((stack, is_unknown));
             }
-            samples.push((sample.mono_us, sample.tid, stack));
+            samples.push((sample.mono_us, sample.tid, stack, sample.cpu_period_ns));
         }
     }
     samples.sort_unstable();
+    let weighted = !samples.is_empty() && samples.iter().all(|s| s.3.is_some());
+    let frequencies: std::collections::BTreeSet<u64> = captures
+        .iter()
+        .filter_map(|c| c["metadata"]["frequency"].as_u64())
+        .collect();
+    let frequency = (frequencies.len() == 1).then(|| *frequencies.first().expect("one frequency"));
+    let cpu_ns = weighted.then(|| samples.iter().filter_map(|s| s.3).sum::<u64>());
     let missing = gaps(start, end, &mut intervals);
     let partial = boundary_samples > 0
         || limited
@@ -546,14 +563,15 @@ pub(crate) fn window(
         "Acquisition coverage verified; sample counts remain statistical"
     };
     Ok(
-        json!({"status":if samples.is_empty(){state}else{"available"},"scope":"User-space process CPU samples in this block window, including other blocks and background work; not exclusive block CPU ownership","frequency_hz":captures.first().and_then(|c|c["metadata"]["frequency"].as_u64()),"sparse":samples.len()<100,
+        json!({"status":if samples.is_empty(){state}else{"available"},"scope":"User-space process CPU samples in this block window, including other blocks and background work; not exclusive block CPU ownership","frequency_hz":frequency,"frequencies_hz":frequencies,"sparse":samples.len()<100,
+        "weight": {"unit":if weighted {"nanoseconds"} else {"samples"}, "source":if weighted {"perf cpu-clock:u period"} else {"sample count"}, "estimated_cpu_ns":cpu_ns, "scope":"retained samples of process user CPU during the block window", "estimated":weighted},
         "counts":{"returned_samples":samples.len(),"matching_samples":matching,"omitted_samples":omitted,"capture_omitted_samples":capture_omitted,"unknown_samples":unknown,"boundary_excluded_samples":boundary_samples,"matching_count_complete":!skipped&&!limited},
         "coverage":{"state":state,"reason":reason,"capture_intervals_us":intervals,"gaps_us":missing,"clock_error_us":run_metadata.clock_error_us,"acquisition_uncertain":!proven,"query_limited":limited,"expired_or_unreadable":skipped,"lost_samples":if loss_unknown{None}else{Some(lost)},"known_lost_samples":lost,"capture_omitted_samples":capture_omitted,"decode_errors":decode_errors,"omitted_frames":omitted_frames,"symbol_truncations":symbol_truncations,"truncated":truncated,"captures":captures},
-        "samples":samples.into_iter().map(|(mono_us,tid,stack)|json!({"at_us":mono_us.saturating_sub(anchor).saturating_sub(start),"mono_us":mono_us,"tid":tid,"stack":stack})).collect::<Vec<_>>(),"frames":frames,"stacks":stacks}),
+        "samples":samples.into_iter().map(|(mono_us,tid,stack,cpu_period_ns)|json!({"cpu_period_ns":cpu_period_ns,"at_us":mono_us.saturating_sub(anchor).saturating_sub(start),"mono_us":mono_us,"tid":tid,"stack":stack})).collect::<Vec<_>>(),"frames":frames,"stacks":stacks}),
     )
 }
 
-/// Speedscope widths are sample counts. Its schema has no per-sample timestamp field.
+/// Period-weighted CPU time where available, with sample-count views for every capture.
 pub(crate) fn speedscope(data: &Value) -> Result<Value> {
     // A function's sampled instruction addresses should not split its hot-path count.
     // Raw symbols preserve monomorph identity; unresolved addresses stay distinct.
@@ -596,7 +614,13 @@ pub(crate) fn speedscope(data: &Value) -> Result<Value> {
         })
         .collect::<Result<Vec<_>>>()?;
     let samples = data["samples"].as_array().context("CPU samples")?;
-    let mut threads = BTreeMap::<u64, Vec<Value>>::new();
+    let weighted = !samples.is_empty()
+        && samples.iter().all(|s| {
+            s["cpu_period_ns"]
+                .as_u64()
+                .is_some_and(|ns| (1..=1_000_000_000).contains(&ns))
+        });
+    let mut threads = BTreeMap::<u64, Vec<(Value, f64)>>::new();
     let mut all = Vec::new();
     for sample in samples {
         let stack = sample["stack"]
@@ -605,27 +629,44 @@ pub(crate) fn speedscope(data: &Value) -> Result<Value> {
             .and_then(|id| stacks.get(id))
             .context("CPU stack reference")?
             .clone();
-        all.push(stack.clone());
+        let weight = if weighted {
+            sample["cpu_period_ns"].as_f64().context("CPU period")? / 1_000_000.0
+        } else {
+            1.0
+        };
+        all.push((stack.clone(), weight));
         threads
             .entry(sample["tid"].as_u64().context("CPU TID")?)
             .or_default()
-            .push(stack);
+            .push((stack, weight));
     }
-    let profile = |name: String, samples: Vec<Value>| json!({"type":"sampled","unit":"none","name":name,"startValue":0,"endValue":samples.len(),"weights":vec![1;samples.len()],"samples":samples});
-    let mut profiles = vec![profile(
-        "All threads: sample order, not elapsed time".into(),
-        all,
-    )];
-    profiles.extend(threads.into_iter().map(|(tid, samples)| {
-        profile(
-            format!("TID {tid}: sample order, not elapsed time"),
-            samples,
-        )
-    }));
+    let profile = |name: String, samples: &[(Value, f64)], time: bool| {
+        let weights: Vec<Value> = samples
+            .iter()
+            .map(|s| if time { json!(s.1) } else { json!(1) })
+            .collect();
+        json!({"type":"sampled","unit":if time {"milliseconds"} else {"none"},"name":name,"startValue":0,"endValue":if time {json!(samples.iter().map(|s| s.1).sum::<f64>())} else {json!(samples.len())},"weights":weights,"samples":samples.iter().map(|s| &s.0).collect::<Vec<_>>()})
+    };
+    let mut profiles = Vec::new();
+    if weighted {
+        profiles.push(profile("All threads · estimated CPU ms".into(), &all, true));
+        profiles.extend(
+            threads.iter().map(|(tid, samples)| {
+                profile(format!("TID {tid} · estimated CPU ms"), samples, true)
+            }),
+        );
+    }
+    profiles.push(profile("All threads · samples".into(), &all, false));
+    profiles.extend(
+        threads
+            .iter()
+            .map(|(tid, samples)| profile(format!("TID {tid} · samples"), samples, false)),
+    );
+
     let coverage = data["coverage"]["state"].as_str().unwrap_or("unknown");
     Ok(
-        json!({"$schema":"https://www.speedscope.app/file-format-schema.json","name":format!("User-space process CPU samples ({coverage} capture); widths are counts"),"activeProfileIndex":0,"exporter":"Zakura profiler","shared":{"frames":frames},"profiles":profiles,
-            "zakura":{"frame_aggregation":"Exact raw function symbol and module; unresolved addresses remain distinct","window":data["window"],"counts":data["counts"],"coverage":data["coverage"],"run":data["summary"]["run"],"attempt":data["summary"]["attempt"],"block_height":data["summary"]["height"]}}),
+        json!({"$schema":"https://www.speedscope.app/file-format-schema.json","name":format!("Process user CPU during block ({coverage} capture)"),"activeProfileIndex":0,"exporter":"Zakura profiler","shared":{"frames":frames},"profiles":profiles,
+            "zakura":{"weight":data["weight"],"frame_aggregation":"Exact raw function symbol and module; unresolved addresses remain distinct","window":data["window"],"counts":data["counts"],"coverage":data["coverage"],"run":data["summary"]["run"],"attempt":data["summary"]["attempt"],"block_height":data["summary"]["height"]}}),
     )
 }
 
@@ -702,6 +743,31 @@ pub(crate) fn prune(db: &Connection, path: &Path, mut bytes: u64) -> Result<u64>
 #[cfg(test)]
 mod export_tests {
     use super::*;
+
+    #[test]
+    fn weighted_export_preserves_periods_threads_and_legacy_fallback() -> Result<()> {
+        let mut data = json!({"frames":[{"name":"work", "symbol":"work", "ip":"1", "dso":"node"}],
+            "stacks":[[0]], "samples":[
+                {"tid":1,"stack":0,"at_us":0,"cpu_period_ns":1_000_000},
+                {"tid":2,"stack":0,"at_us":0,"cpu_period_ns":2_000_000},
+                {"tid":1,"stack":0,"at_us":9_000_000,"cpu_period_ns":4_000_000}],
+            "coverage":{"state":"partial"}});
+        let export = speedscope(&data)?;
+        let profiles = &export["profiles"];
+        assert_eq!(profiles[0]["unit"], "milliseconds");
+        assert_eq!(profiles[0]["weights"], json!([1.0, 2.0, 4.0]));
+        assert_eq!(profiles[0]["endValue"], 7.0);
+        assert_eq!(profiles[1]["endValue"], 5.0);
+        assert_eq!(profiles[2]["endValue"], 2.0);
+        assert_eq!(profiles[3]["unit"], "none");
+        assert_eq!(profiles[3]["endValue"], 3);
+        // A mixed interval must not combine milliseconds with unweighted counts.
+        data["samples"][1]["cpu_period_ns"] = Value::Null;
+        let legacy = speedscope(&data)?;
+        assert_eq!(legacy["profiles"][0]["unit"], "none");
+        assert_eq!(legacy["profiles"][0]["endValue"], 3);
+        Ok(())
+    }
 
     #[test]
     fn function_export_aggregates_instruction_addresses_without_merging_raw_symbols() -> Result<()>

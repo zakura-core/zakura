@@ -24,11 +24,95 @@ index 0000000..40b84b5
 +  const parts = compact.split('::')
 +  return parts.length > 4 ? parts[0] + '::…::' + parts.slice(-3).join('::') : compact
 +}
+diff --git a/src/lib/profile.test.ts b/src/lib/profile.test.ts
+index 0920d11..1b93d5a 100644
+--- a/src/lib/profile.test.ts
++++ b/src/lib/profile.test.ts
+@@ -333,3 +333,31 @@ test('getProfileWithRecursionFlattened', () => {
+   const allFrameKeys = new Set([fa, fb].map(f => f.key))
+   expect(allFrameKeys).toEqual(framesInProfile)
+ })
++
++test('sample counts survive weighted aggregation and caller/callee views', () => {
++  const b = new StackListProfileBuilder()
++  const root = {key: 'root', name: 'root'}
++  const leaf = {key: 'leaf', name: 'leaf'}
++  b.appendSampleWithWeight([root, leaf], 2)
++  b.appendSampleWithWeight([root, leaf], 5)
++  b.appendSampleWithWeight([root], 3)
++  const p = b.build()
++  p.forEachCallGrouped((node) => {
++    if (node.frame.key === 'root') {
++      expect(node.getTotalWeight()).toBe(10)
++      expect(node.getTotalSamples()).toBe(3)
++      expect(node.getSelfSamples()).toBe(1)
++    }
++    if (node.frame.key === 'leaf') {
++      expect(node.getTotalWeight()).toBe(7)
++      expect(node.getTotalSamples()).toBe(2)
++      expect(node.getSelfSamples()).toBe(2)
++    }
++  }, () => {})
++  p.getProfileForCalleesOf(root).forEachFrame(frame => {
++    if (frame.key === 'root') expect(frame.getTotalSamples()).toBe(3)
++  })
++  p.getInvertedProfileForCallersOf(leaf).forEachFrame(frame => {
++    if (frame.key === 'leaf') expect(frame.getTotalSamples()).toBe(2)
++  })
++})
 diff --git a/src/lib/profile.ts b/src/lib/profile.ts
-index e34ac58..2c5a6f1 100644
+index e34ac58..c47b4c7 100644
 --- a/src/lib/profile.ts
 +++ b/src/lib/profile.ts
-@@ -401,25 +401,9 @@ export class Profile {
+@@ -27,6 +27,20 @@ export type SymbolRemapper = (
+ export class HasWeights {
+   private selfWeight = 0
+   private totalWeight = 0
++  private selfSamples: number | null = null
++  private totalSamples: number | null = null
++  getSelfSamples() {
++    return this.selfSamples
++  }
++  getTotalSamples() {
++    return this.totalSamples
++  }
++  addToSelfSamples(count: number | null) {
++    this.selfSamples = count === null ? null : (this.selfSamples || 0) + count
++  }
++  addToTotalSamples(count: number | null) {
++    this.totalSamples = count === null ? null : (this.totalSamples || 0) + count
++  }
+   getSelfWeight() {
+     return this.selfWeight
+   }
+@@ -43,6 +57,8 @@ export class HasWeights {
+   overwriteWeightWith(other: HasWeights) {
+     this.selfWeight = other.selfWeight
+     this.totalWeight = other.totalWeight
++    this.selfSamples = other.selfSamples
++    this.totalSamples = other.totalSamples
+   }
+ }
+
+@@ -355,7 +371,7 @@ export class Profile {
+       for (let n: CallTreeNode | null = node; n != null && n.frame !== Frame.root; n = n.parent) {
+         stack.push(n.frame)
+       }
+-      builder.appendSampleWithWeight(stack, node.getTotalWeight())
++      builder.appendSampleWithWeight(stack, node.getTotalWeight(), node.getTotalSamples())
+     }
+
+     const ret = builder.build()
+@@ -373,7 +389,7 @@ export class Profile {
+
+       function visit(node: CallTreeNode) {
+         stack.push(node.frame)
+-        builder.appendSampleWithWeight(stack, node.getSelfWeight())
++        builder.appendSampleWithWeight(stack, node.getSelfWeight(), node.getSelfSamples())
+         for (let child of node.children) {
+           visit(child)
+         }
+@@ -401,25 +417,9 @@ export class Profile {
      return ret
    }
 
@@ -57,6 +141,68 @@ index e34ac58..2c5a6f1 100644
 
    remapSymbols(callback: SymbolRemapper) {
      for (let frame of this.frames) {
+@@ -445,7 +445,12 @@ export class Profile {
+ }
+
+ export class StackListProfileBuilder extends Profile {
+-  _appendSample(stack: Frame[], weight: number, useAppendOrder: boolean) {
++  _appendSample(
++    stack: Frame[],
++    weight: number,
++    useAppendOrder: boolean,
++    sampleCount: number | null,
++  ) {
+     if (isNaN(weight)) throw new Error('invalid weight')
+     let node = useAppendOrder ? this.appendOrderCalltreeRoot : this.groupedCalltreeRoot
+
+@@ -463,6 +468,7 @@ export class StackListProfileBuilder extends Profile {
+         parent.children.push(node)
+       }
+       node.addToTotalWeight(weight)
++      node.addToTotalSamples(sampleCount)
+
+       // It's possible for the same frame to occur multiple
+       // times in the same call stack due to either direct
+@@ -473,6 +479,7 @@ export class StackListProfileBuilder extends Profile {
+       framesInStack.add(node.frame)
+     }
+     node.addToSelfWeight(weight)
++    node.addToSelfSamples(sampleCount)
+
+     if (useAppendOrder) {
+       for (let child of node.children) {
+@@ -482,9 +489,11 @@ export class StackListProfileBuilder extends Profile {
+
+     if (useAppendOrder) {
+       node.frame.addToSelfWeight(weight)
++      node.frame.addToSelfSamples(sampleCount)
+
+       for (let frame of framesInStack) {
+         frame.addToTotalWeight(weight)
++        frame.addToTotalSamples(sampleCount)
+       }
+
+       if (node === lastOf(this.samples)) {
+@@ -496,7 +505,7 @@ export class StackListProfileBuilder extends Profile {
+     }
+   }
+
+-  appendSampleWithWeight(stack: FrameInfo[], weight: number) {
++  appendSampleWithWeight(stack: FrameInfo[], weight: number, sampleCount: number | null = 1) {
+     if (weight === 0) {
+       // Samples with zero weight have no effect, so let's ignore them
+       return
+@@ -506,8 +515,8 @@ export class StackListProfileBuilder extends Profile {
+     }
+
+     const frames = stack.map(fr => Frame.getOrInsert(this.frames, fr))
+-    this._appendSample(frames, weight, true)
+-    this._appendSample(frames, weight, false)
++    this._appendSample(frames, weight, true, sampleCount)
++    this._appendSample(frames, weight, false, sampleCount)
+   }
+
+   private pendingSample: {
 diff --git a/src/views/application.tsx b/src/views/application.tsx
 index be24242..c2cb5c6 100644
 --- a/src/views/application.tsx
@@ -113,6 +259,44 @@ index 78e7cf1..9d8e5c1 100644
          onWheel={this.onWheel}
          ref={this.containerRef}
        >
+diff --git a/src/views/flamechart-view.tsx b/src/views/flamechart-view.tsx
+index 0ae7854..cadda9c 100644
+--- a/src/views/flamechart-view.tsx
++++ b/src/views/flamechart-view.tsx
+@@ -87,7 +87,13 @@ export class FlamechartView extends StatelessComponent<FlamechartViewProps> {
+     return (
+       <Hovertip containerSize={new Vec2(width, height)} offset={offset}>
+         <span className={css(style.hoverCount)}>
+-          {this.formatValue(hover.node.getTotalWeight())}
++          Total (including calls): {this.formatValue(hover.node.getTotalWeight())}
++          {hover.node.getTotalSamples() !== null
++            ? ` · ${hover.node.getTotalSamples()} samples`
++            : ''}
++          <br />
++          Self (this function): {this.formatValue(hover.node.getSelfWeight())}
++          {hover.node.getSelfSamples() !== null ? ` · ${hover.node.getSelfSamples()} samples` : ''}
+         </span>{' '}
+         {frame.name}
+         {frame.file ? (
+diff --git a/src/views/flamechart-wrapper.tsx b/src/views/flamechart-wrapper.tsx
+index 409358e..289952c 100644
+--- a/src/views/flamechart-wrapper.tsx
++++ b/src/views/flamechart-wrapper.tsx
+@@ -46,7 +46,13 @@ export class FlamechartWrapper extends StatelessComponent<FlamechartViewProps> {
+     return (
+       <Hovertip containerSize={new Vec2(width, height)} offset={offset}>
+         <span className={css(style.hoverCount)}>
+-          {this.formatValue(hover.node.getTotalWeight())}
++          Total (including calls): {this.formatValue(hover.node.getTotalWeight())}
++          {hover.node.getTotalSamples() !== null
++            ? ` · ${hover.node.getTotalSamples()} samples`
++            : ''}
++          <br />
++          Self (this function): {this.formatValue(hover.node.getSelfWeight())}
++          {hover.node.getSelfSamples() !== null ? ` · ${hover.node.getSelfSamples()} samples` : ''}
+         </span>{' '}
+         {frame.name}
+         {frame.file ? (
 diff --git a/src/views/profile-table-view.tsx b/src/views/profile-table-view.tsx
 index 9a429dc..67c6485 100644
 --- a/src/views/profile-table-view.tsx

@@ -26,7 +26,7 @@ RAW_BUDGET = 8_000_000_000
 INBOX_BUDGET = 128 * 1024 * 1024
 SYMBOL_BUDGET = 2_000_000_000
 MAX_PENDING = 8
-HEADER = re.compile(r"^\s*(\d+)(?:/|\s+)(\d+)\s+(\d+\.\d+):\s+(\S+:)\s*(.*)$")
+HEADER = re.compile(r"^\s*(\d+)(?:/|\s+)(\d+)\s+(\d+\.\d+):\s+(?:(\d+)\s+)?(\S+:)\s*(.*)$")
 FRAME = re.compile(r"^\s*([0-9a-fA-F]+)\s+(.+?)\s+\((.+)\)\s*$")
 LOST = re.compile(r"(?:PERF_RECORD_LOST.*?lost\s*[:=]?\s*(\d+)|LOST\s+(\d+)(?:\s+events)?)", re.I)
 
@@ -52,7 +52,7 @@ def atomic_json(path, value):
     temp.replace(path)
 
 
-def parse_perf(lines, pid, start, end):
+def parse_perf(lines, pid, start, end, require_period=False):
     """Keep raw symbol identity, intern repeated stacks, and count every bounded omission."""
     frames, stacks, samples, frame_ids, stack_ids = [], [], [], {}, {}
     current, size = None, 0
@@ -63,7 +63,7 @@ def parse_perf(lines, pid, start, end):
         nonlocal current, size
         if current is None:
             return
-        stamp, tid, raw_frames = current
+        stamp, tid, period, raw_frames = current
         current = None
         if len(samples) >= 50000 or size >= MAX_JSON:
             stats['omitted_samples'] += 1
@@ -97,6 +97,8 @@ def parse_perf(lines, pid, start, end):
             stack_ids[stack] = len(stacks)
             stacks.append(indices)
         sample = dict(mono_us=stamp, tid=tid, stack=stack_ids[stack])
+        if period is not None:
+            sample['cpu_period_ns'] = period
         size += len(json.dumps(sample)) + 1
         if size > MAX_JSON:
             stats['omitted_samples'] += 1
@@ -121,9 +123,16 @@ def parse_perf(lines, pid, start, end):
         match = HEADER.match(line)
         if match:
             append_sample()
-            sample_pid, tid, stamp, _event, tail = match.groups()
+            sample_pid, tid, stamp, period, event, tail = match.groups()
             stamp = int(decimal.Decimal(stamp) * 1_000_000)
-            current = [stamp, int(tid), []] if int(sample_pid) == pid and start <= stamp <= end else None
+            period = int(period) if period is not None else None
+            if require_period and (event != 'cpu-clock:u:' or period is None or not 0 < period <= 1_000_000_000):
+                stats['decode_errors'] += 1
+                stats['omitted_samples'] += 1
+                stats['truncated'] = True
+                current = None
+                continue
+            current = [stamp, int(tid), period, []] if int(sample_pid) == pid and start <= stamp <= end else None
             line = tail
         elif not line.strip():
             append_sample()
@@ -140,8 +149,8 @@ def parse_perf(lines, pid, start, end):
                 stats['omitted_frames'] += 1
                 stats['truncated'] = True
                 continue
-            if len(current[2]) < 128:
-                current[2].append((ip, symbol, dso))
+            if len(current[3]) < 128:
+                current[3].append((ip, symbol, dso))
             else:
                 stats['omitted_frames'] += 1
                 stats['truncated'] = True
@@ -259,11 +268,12 @@ def decode_one(store, path):
     try:
         with decoded.open('wb') as out, errors_path.open('wb') as errors:
             subprocess.run(['perf', '--buildid-dir', manifest.get('symbol_dir', str(store / 'symbols')), 'script', '--no-inline', '--ns',
-                            '--show-lost-events', '-F', 'pid,tid,time,event,ip,sym,dso', '-i', str(source)],
+                            '--show-lost-events', '-F', 'pid,tid,time,period,event,ip,sym,dso', '-i', str(source)],
                            stdout=out, stderr=errors, timeout=45, preexec_fn=limits, check=True)
         capture = manifest['capture']
         with decoded.open(errors='replace') as lines:
-            parsed = parse_perf(bounded_lines(lines), capture['pid'], 0, (1 << 64) - 1)
+            parsed = parse_perf(bounded_lines(lines), capture['pid'], 0, (1 << 64) - 1,
+                                require_period=capture.get('schema_version', 0) >= 3)
         if parsed['samples']:
             capture['start_mono_us'] = min(capture['start_mono_us'], min(s['mono_us'] for s in parsed['samples']))
             capture['end_mono_us'] = max(capture['end_mono_us'], max(s['mono_us'] for s in parsed['samples']))
@@ -434,7 +444,7 @@ def capture(args, stopping):
     state = dict(state='recording', run=run['id'], pid=pid, session=session, frequency=args.frequency,
                  executable_sha256=digest, updated_ms=int(time.time() * 1000), started_mono_us=started, sealed_through_mono_us=started,
                  published_through_mono_us=started, backlog_segments=0, dropped_segments=0, last_error=None)
-    base = dict(schema_version=2, run=run['id'], pid=pid, frequency=args.frequency, clock='monotonic',
+    base = dict(schema_version=3, run=run['id'], pid=pid, frequency=args.frequency, clock='monotonic',
                 process_start_ticks=start_ticks, executable_sha256=digest, build_ids=[], session=session,
                 coverage_proven=False, decode_errors=0, truncated=False)
     context = multiprocessing.get_context('spawn')
@@ -442,9 +452,11 @@ def capture(args, stopping):
     worker = context.Process(target=decoder, args=(store, stop_decoder))
     worker.start()
     error_file = (directory / 'record.stderr').open('wb')
+    # At 999 Hz, one second keeps 16 busy CPUs below the raw segment limit.
+    rotation_seconds = 1 if args.frequency >= 999 else 10
     command = ['perf', '--buildid-dir', str(symbols), 'record', '--no-buildid-cache', '--no-no-buildid', '--buildid-all',
                '--clockid', 'mono', '-e', 'cpu-clock:u', '-F', str(args.frequency), '--call-graph', 'dwarf,8192',
-               '--mmap-pages', '128', '--switch-output=10s', '-a', '-G', cgroup.lstrip('/'), '-o', str(directory / 'capture.data')]
+               '--mmap-pages', '128', f'--switch-output={rotation_seconds}s', '-a', '-G', cgroup.lstrip('/'), '-o', str(directory / 'capture.data')]
     try:
         process = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=error_file, preexec_fn=limits, start_new_session=True)
     except Exception:
@@ -562,7 +574,7 @@ def main():
     parser.add_argument('--pid', type=int)
     parser.add_argument('--node-service', default='zakurad')
     parser.add_argument('--executable', type=Path, required=True)
-    parser.add_argument('--frequency', type=int, choices=(19, 49, 99), default=99)
+    parser.add_argument('--frequency', type=int, choices=(19, 49, 99, 999), default=999)
     parser.add_argument('--duration-seconds', type=int, default=0, help='Zero records continuously.')
     parser.add_argument('--once', action='store_true')
     parser.add_argument('--check-symbol-budget', action='store_true')

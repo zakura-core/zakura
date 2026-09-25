@@ -28,7 +28,9 @@ independently.
   bounded collector batches and background retries on full sockets reduce
   capture loss. Optional continuous CPU sampling provides full-page interactive
   flame graphs for newly captured blocks, with readable function labels, full
-  symbol inspection, and explicit sample coverage. Startup profiles
+  symbol inspection, and explicit sample coverage. New CPU captures sample at
+  999 Hz and show estimated CPU milliseconds, Self and Total time, percentages,
+  and sample counts, while historical captures retain their original units. Startup profiles
   remain searchable but are excluded from slow blocks and latency statistics
   until verifier initialization, catch-up, and a quiet settling period finish.
   The experimental shielded batch breakdown was withdrawn. Existing captures

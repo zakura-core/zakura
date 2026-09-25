@@ -953,11 +953,12 @@ impl PeerRoutine {
                                 .window
                                 .cwnd_byte_headroom_at(floor_bonus, now)
                                 .unwrap_or(u64::MAX);
-                            items = self.work.take_for_request(
+                            items = self.work.take_for_admitted_request(
                                 servable_low,
                                 grant.take_high,
                                 max_count,
                                 grant.max_request_bytes.min(floor_cwnd_cap).max(1),
+                                grant.max_exposure_bytes,
                                 self.generation,
                                 request_id,
                             );
@@ -1000,11 +1001,12 @@ impl PeerRoutine {
                             .window
                             .cwnd_byte_headroom_at(0, now)
                             .unwrap_or(u64::MAX);
-                        items = self.work.take_for_request(
+                        items = self.work.take_for_admitted_request(
                             servable_low,
                             grant.take_high,
                             max_count,
                             grant.max_request_bytes.min(above_cwnd_cap),
+                            grant.max_exposure_bytes,
                             self.generation,
                             request_id,
                         );
@@ -2415,7 +2417,16 @@ mod tests {
         crate::zakura::FramedRecv,
         mpsc::Receiver<RoutineToReactor>,
     ) {
-        let config = ZakuraBlockSyncConfig::default();
+        status_test_routine_with_config(ZakuraBlockSyncConfig::default())
+    }
+
+    fn status_test_routine_with_config(
+        config: ZakuraBlockSyncConfig,
+    ) -> (
+        PeerRoutine,
+        crate::zakura::FramedRecv,
+        mpsc::Receiver<RoutineToReactor>,
+    ) {
         let peer = ZakuraPeerId::new(vec![7u8; 32]).expect("test peer id is within bounds");
         let cancel = CancellationToken::new();
         let (out_send, out_recv) = framed_channel(16);
@@ -2510,6 +2521,66 @@ mod tests {
         assert!(
             counts[1] > counts[0],
             "observed sizes must open byte credits: {counts:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn observed_estimates_do_not_overfill_lookahead_headroom() {
+        let config = ZakuraBlockSyncConfig {
+            max_blocks_per_response: 128,
+            max_reorder_lookahead_bytes: 4 * block::MAX_BLOCK_BYTES,
+            ..ZakuraBlockSyncConfig::default()
+        };
+        let (mut routine, _outbound, _events) = status_test_routine_with_config(config.clone());
+        routine
+            .window
+            .note_block_progress(Instant::now(), Duration::from_secs(30));
+        routine.handle_status(BlockSyncStatus {
+            servable_low: block::Height(1_000),
+            servable_high: block::Height(1_127),
+            max_blocks_per_response: 128,
+            ..BlockSyncStatus::default()
+        });
+        let scope = super::super::test_work_scope();
+        routine.work.extend(
+            scope,
+            (1_000..1_128).chain(2_000..2_100).map(|h| {
+                (
+                    block::Height(h),
+                    block::Hash([1; 32]),
+                    BlockSizeEstimate::Unknown,
+                )
+            }),
+        );
+        // Train the shared estimate down to its floor with small accepted bodies.
+        for h in 2_000..2_100 {
+            let request = std::num::NonZeroU64::new(u64::from(h)).unwrap();
+            let owner = scope.bind(99, request);
+            routine.work.take_for_request(
+                block::Height(h),
+                block::Height(h),
+                1,
+                u64::MAX,
+                99,
+                request,
+            );
+            routine
+                .work
+                .mark_reserved_for_owner(owner, [block::Height(h)]);
+            routine
+                .work
+                .receive_body_for_owner(owner, block::Height(h), 1_024)
+                .unwrap();
+        }
+
+        routine.try_fill().await;
+
+        // Admission charges each outstanding unknown body at the worst case, so one
+        // take may overshoot the headroom by at most its always-taken first body.
+        let (exposure, _) = routine.work.reserved_above(block::Height(0));
+        assert!(
+            exposure <= config.max_reorder_lookahead_bytes + block::MAX_BLOCK_BYTES,
+            "unknown-size takes must fit the look-ahead headroom: {exposure}"
         );
     }
 

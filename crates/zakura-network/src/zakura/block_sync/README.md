@@ -302,5 +302,7 @@ resets with the frontier.
 Known hints always take precedence, including advertised, committed, and filled
 sizes. A local measured size remains a minimum for a retry. An issued request keeps
 its reservation and hint provenance until it settles. Memory admission still charges
-every outstanding unknown body at `MAX_BLOCK_BYTES`. A body larger than a local
-estimate is not reported as a size mismatch, because no peer made a claim.
+every outstanding unknown body at `MAX_BLOCK_BYTES`. A take above the commit window
+charges its unknown bodies the same way against the remaining look-ahead headroom.
+A body larger than a local estimate is not reported as a size mismatch, because no
+peer made a claim.

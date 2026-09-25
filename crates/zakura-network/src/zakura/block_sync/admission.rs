@@ -89,6 +89,9 @@ pub(super) struct AdmissionGrant {
     /// Authoritative summed-estimate byte cap for the take and its reservation.
     /// Nothing downstream may substitute its own sizing.
     pub(super) max_request_bytes: u64,
+    /// Remaining look-ahead headroom, charged as `reserved_above` charges the
+    /// published take: unknown-size bodies at `MAX_BLOCK_BYTES`.
+    pub(super) max_exposure_bytes: u64,
 }
 
 /// Return the highest start height that can be rescued by a floor request.
@@ -340,12 +343,13 @@ pub(super) fn admit(
     let priority = request_priority(snapshot.download_floor, start_height);
     let window_high = commit_window_high(&snapshot);
 
-    let (take_high, max_request_bytes) = if start_height <= window_high {
+    let (take_high, max_request_bytes, max_exposure_bytes) = if start_height <= window_high {
         // Exempt: liveness sizing, take clamped at the window top so the resident
         // gate's coverage of above-window heights is total.
         (
             servable_high.min(window_high),
             snapshot.budget_available.min(response_byte_cap),
+            u64::MAX,
         )
     } else {
         if lookahead_over_budget(config, &snapshot) {
@@ -361,6 +365,7 @@ pub(super) fn admit(
                 .budget_available
                 .min(remaining_wire_bytes)
                 .min(response_byte_cap),
+            remaining_wire_bytes,
         )
     };
 
@@ -376,6 +381,7 @@ pub(super) fn admit(
         priority,
         take_high,
         max_request_bytes,
+        max_exposure_bytes,
     })
 }
 

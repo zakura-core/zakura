@@ -389,12 +389,11 @@ impl WorkQueue {
         max_count: usize,
         max_estimated_bytes: u64,
     ) -> Vec<(block::Height, WorkItem)> {
-        self.take_budgeted(low, high, max_count, max_estimated_bytes, None)
+        self.take_budgeted(low, high, max_count, max_estimated_bytes, u64::MAX, None)
     }
 
-    /// Give the provisional take an exact owner before releasing the queue lock.
-    /// A reset followed by a new take cannot be undone by this attempt's cleanup.
-    #[allow(clippy::too_many_arguments)]
+    /// Take owned work without a look-ahead exposure cap in tests.
+    #[cfg(test)]
     pub(super) fn take_for_request(
         &self,
         low: block::Height,
@@ -404,11 +403,38 @@ impl WorkQueue {
         session_id: u64,
         request_id: NonZeroU64,
     ) -> Vec<(block::Height, WorkItem)> {
+        self.take_for_admitted_request(
+            low,
+            high,
+            max_count,
+            max_estimated_bytes,
+            u64::MAX,
+            session_id,
+            request_id,
+        )
+    }
+
+    /// Give the provisional take an exact owner before releasing the queue lock.
+    /// A reset followed by a new take cannot be undone by this attempt's cleanup.
+    /// `max_exposure_bytes` charges unknown sizes at `MAX_BLOCK_BYTES`, as
+    /// [`reserved_above`](Self::reserved_above) does after publication.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn take_for_admitted_request(
+        &self,
+        low: block::Height,
+        high: block::Height,
+        max_count: usize,
+        max_estimated_bytes: u64,
+        max_exposure_bytes: u64,
+        session_id: u64,
+        request_id: NonZeroU64,
+    ) -> Vec<(block::Height, WorkItem)> {
         self.take_budgeted(
             low,
             high,
             max_count,
             max_estimated_bytes,
+            max_exposure_bytes,
             Some((session_id, request_id)),
         )
     }
@@ -419,6 +445,7 @@ impl WorkQueue {
         high: block::Height,
         max_count: usize,
         max_estimated_bytes: u64,
+        max_exposure_bytes: u64,
         attempt: Option<(u64, NonZeroU64)>,
     ) -> Vec<(block::Height, WorkItem)> {
         // An empty count or inverted range is a caller bug, not a real "nothing to
@@ -436,6 +463,7 @@ impl WorkQueue {
         let mut inner = self.lock();
         let mut taken: Vec<(block::Height, WorkItem)> = Vec::new();
         let mut estimated_bytes = 0u64;
+        let mut exposure_bytes = 0u64;
         let mut next_expected: Option<block::Height> = None;
         let mut scope = None;
         for (height, item) in inner.pending.range(low..=high) {
@@ -453,13 +481,23 @@ impl WorkQueue {
 
             let item = inner.scheduling_item(*item);
             let next_estimated_bytes = estimated_bytes.saturating_add(item.estimated_bytes);
-            if !taken.is_empty() && next_estimated_bytes > max_estimated_bytes {
+            let next_exposure_bytes =
+                exposure_bytes.saturating_add(if item.reservation_has_size_hint {
+                    item.estimated_bytes
+                } else {
+                    block::MAX_BLOCK_BYTES
+                });
+            if !taken.is_empty()
+                && (next_estimated_bytes > max_estimated_bytes
+                    || next_exposure_bytes > max_exposure_bytes)
+            {
                 break;
             }
 
             taken.push((*height, item));
             scope = Some(item.scope);
             estimated_bytes = next_estimated_bytes;
+            exposure_bytes = next_exposure_bytes;
             if taken.len() >= max_count {
                 break;
             }

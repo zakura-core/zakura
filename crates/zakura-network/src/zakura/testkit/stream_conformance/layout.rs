@@ -34,11 +34,24 @@ fn max_payload(payload: PayloadLen) -> u64 {
     payload.max() as u64
 }
 
+/// One subscription row, as the layout's tables declare it.
+#[derive(Copy, Clone, Debug)]
+pub(crate) struct SubscriptionPlan {
+    pub(crate) row: &'static MessageRule,
+    /// The member that carries the updates.
+    pub(crate) stream: usize,
+    /// The member that carries the pages and the ending.
+    pub(crate) response_stream: usize,
+    pub(crate) page: &'static MessageRule,
+    pub(crate) end: &'static MessageRule,
+}
+
 /// The exchanges and members of one layout.
 #[derive(Debug)]
 pub(crate) struct LayoutPlan {
     pub(crate) layout: &'static [Stream],
     pub(crate) requests: Vec<RequestPlan>,
+    pub(crate) subscriptions: Vec<SubscriptionPlan>,
     /// Every response row, with the member that carries it.
     pub(crate) responses: Vec<(&'static MessageRule, usize)>,
 }
@@ -58,20 +71,41 @@ impl LayoutPlan {
         let responses: Vec<_> = rows()
             .filter(|(row, _)| matches!(row.role, MessageRole::Response { .. }))
             .collect();
+        let answers = |row: &MessageRule, ends: bool| {
+            responses.iter().find(|(response, _)| {
+                matches!(
+                    response.role,
+                    MessageRole::Response { request, ends_exchange }
+                        if request == row.message_type && ends_exchange == ends
+                )
+            })
+        };
+        let subscriptions = rows()
+            .filter(|(row, _)| matches!(row.role, MessageRole::Subscription { .. }))
+            .map(|(row, stream)| {
+                let &(page, response_stream) = answers(row, false)
+                    .expect("the layout validator requires a page row for every subscription");
+                let &(end, end_stream) = answers(row, true)
+                    .expect("the layout validator requires an ending for every subscription");
+                assert_eq!(
+                    end_stream, response_stream,
+                    "the harness publishes each subscription on one member"
+                );
+                SubscriptionPlan {
+                    row,
+                    stream,
+                    response_stream,
+                    page,
+                    end,
+                }
+            })
+            .collect();
         let requests = rows()
             .filter_map(|(row, stream)| {
                 let MessageRole::Request { max_in_flight, .. } = row.role else {
                     return None;
                 };
-                let answers = |ends: bool| {
-                    responses.iter().find(|(response, _)| {
-                        matches!(
-                            response.role,
-                            MessageRole::Response { request, ends_exchange }
-                                if request == row.message_type && ends_exchange == ends
-                        )
-                    })
-                };
+                let answers = |ends: bool| answers(row, ends);
                 let &(end, response_stream) = answers(true)
                     .expect("the layout validator requires an ending for every request");
                 let part = answers(false).map(|&(part, part_stream)| {
@@ -94,6 +128,7 @@ impl LayoutPlan {
         Self {
             layout,
             requests,
+            subscriptions,
             responses,
         }
     }

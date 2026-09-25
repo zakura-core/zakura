@@ -144,3 +144,33 @@ deploying the same day over leaving it red for a week.
   (or the bucket was tampered with) — investigate before deleting anything.
 - `another release-state publisher is already running`: wait for the active
   timer or manual publication to finish before retrying.
+
+## Updating the archive publisher
+
+The mainnet fleet deployer marks `archive-vct-off` with
+`release_state_publisher = true`. A deployment builds `zakurad` and the offline
+`zakura-checkpoints` exporter at the same resolved commit. The exporter revision
+must be on `origin/main`. Deployment tooling comes from the workflow revision,
+so selecting an older release does not select an older deployment procedure.
+Before changing the host, the deployer checks that the exporter supports the
+publisher's required CLI options, including grid output, resume, and cost settings.
+Older exporters that lack any of these options are rejected before installation.
+
+The deployer pauses the timer, waits up to ten minutes for publication to finish,
+and installs both binaries before restarting the node. It checks RPC and a
+90-second settle window, runs publication, then verifies the public bundle's
+height and digests. The existing publisher scripts, unit, profile, and credentials
+remain host-managed. Use `deploy-snapshot-host.sh` for initial installation or
+changes to those components.
+
+`--no-restart` is rejected when the selection includes this host. Deploy the pair
+together, or select another node for staging. A node startup failure leaves the
+publisher timer stopped and fails the deployment. There is no automatic binary
+rollback after startup because the database may already have migrated. Repair
+with a compatible revision and retry the paired deployment. A marker under
+`/opt/zakura-release-state/deploy.resume-timer` lets a successful retry resume a
+timer that the failed deployment stopped. A persistent `deploy.paused` marker in
+the same directory and a systemd service condition keep publication blocked across
+reboots until the paired deployment validates the node. Remove the resume marker only if deliberately
+leaving publication paused. A publication-only failure keeps the compatible pair
+installed and restores the previous timer state so the next scheduled run can retry.

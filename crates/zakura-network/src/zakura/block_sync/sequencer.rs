@@ -350,6 +350,14 @@ impl Sequencer {
         )
     }
 
+    /// Includes detached submissions so a late response cannot replace live work.
+    pub(super) fn already_retains(&self, height: block::Height, hash: block::Hash) -> bool {
+        height <= self.body_download_floor
+            || self.reorder.contains(height)
+            || self.applying.contains_key(&height)
+            || self.has_submitted_apply(height, hash)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(super) fn accept_buffered_body(
         &mut self,
@@ -362,11 +370,7 @@ impl Sequencer {
         bytes: u64,
         source_peer: ZakuraPeerId,
     ) -> AcceptOutcome {
-        if height <= self.body_download_floor
-            || self.reorder.contains(height)
-            || self.applying.contains_key(&height)
-            || self.has_submitted_apply(height, hash)
-        {
+        if self.already_retains(height, hash) {
             return AcceptOutcome::Redundant {
                 release_bytes: bytes,
             };

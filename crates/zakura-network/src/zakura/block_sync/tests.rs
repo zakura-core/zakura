@@ -14791,7 +14791,7 @@ async fn reactor_publishes_block_sync_candidate_gap() {
 }
 
 #[tokio::test]
-async fn testnet_fork_body_replays_wrong_branch_size_rejection() {
+async fn testnet_fork_body_reports_wrong_branch_hint_and_keeps_selected_body() {
     let losing = mainnet_block(include_bytes!("tests/fixtures/testnet-4351709-losing.bin"));
     let selected = mainnet_block(include_bytes!(
         "tests/fixtures/testnet-4351709-selected.bin"
@@ -14803,7 +14803,7 @@ async fn testnet_fork_body_replays_wrong_branch_size_rejection() {
     assert_eq!(block_size(&losing), 1_670);
     assert_eq!(block_size(&selected), 7_592);
 
-    for (size, rejected) in [
+    for (size, expect_mismatch) in [
         (BlockSizeEstimate::Advertised(block_size(&losing)), true),
         (BlockSizeEstimate::Unknown, false),
     ] {
@@ -14861,31 +14861,36 @@ async fn testnet_fork_body_replays_wrong_branch_size_rejection() {
             )
             .await
             .expect("captured body queues");
-        loop {
-            match next_action(&mut actions).await {
-                BlockSyncAction::QueryNeededBlocks { .. } => {}
-                BlockSyncAction::Misbehavior { reason, .. } => {
-                    assert!(rejected, "the replacement block must reach verification without the unrelated size hint");
-                    assert_eq!(reason, BlockSyncMisbehavior::SizeMismatch);
-                    break;
+        let mut saw_mismatch = false;
+        let mut saw_submit = false;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !(saw_submit && saw_mismatch == expect_mismatch) {
+                match next_action(&mut actions).await {
+                    BlockSyncAction::QueryNeededBlocks { .. } => {}
+                    BlockSyncAction::Misbehavior { reason, .. } => {
+                        assert!(
+                            expect_mismatch,
+                            "an unknown size must not report a mismatch"
+                        );
+                        assert_eq!(reason, BlockSyncMisbehavior::SizeMismatch);
+                        saw_mismatch = true;
+                    }
+                    BlockSyncAction::SubmitBlock { block, .. } => {
+                        assert_eq!(block.hash(), selected.hash());
+                        saw_submit = true;
+                    }
+                    action => panic!("unexpected replay action: {action:?}"),
                 }
-                BlockSyncAction::SubmitBlock { block, .. } => {
-                    assert!(
-                        !rejected,
-                        "the captured old-branch hint reproduces the rejection"
-                    );
-                    assert_eq!(block.hash(), selected.hash());
-                    break;
-                }
-                action => panic!("unexpected replay action: {action:?}"),
             }
-        }
+        })
+        .await
+        .expect("the selected body is submitted even with the old branch's size hint");
         task.abort();
     }
 }
 
 #[tokio::test]
-async fn oversize_body_policy_reports_size_mismatch_and_retries_without_buffering() {
+async fn oversize_body_policy_reports_size_mismatch_and_keeps_the_body() {
     let mut config = ZakuraBlockSyncConfig {
         size_deviation_tolerance: 100,
         ..immediate_body_download_config()
@@ -14969,31 +14974,23 @@ async fn oversize_body_policy_reports_size_mismatch_and_retries_without_bufferin
         .await
         .expect("block queues");
 
-    loop {
-        match next_action(&mut actions).await {
-            BlockSyncAction::Misbehavior { reason, .. } => {
-                assert_eq!(reason, BlockSyncMisbehavior::SizeMismatch);
-                break;
-            }
-            BlockSyncAction::QueryNeededBlocks { .. } => {}
-            action => panic!("unexpected action during size mismatch test: {action:?}"),
-        }
-    }
-
-    let no_submit = tokio::time::timeout(Duration::from_millis(200), async {
-        while let Some(action) = actions.recv().await {
-            if matches!(action, BlockSyncAction::SubmitBlock { .. }) {
-                return false;
+    let mut saw_mismatch = false;
+    let mut saw_submit = false;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !(saw_mismatch && saw_submit) {
+            match next_action(&mut actions).await {
+                BlockSyncAction::Misbehavior { reason, .. } => {
+                    assert_eq!(reason, BlockSyncMisbehavior::SizeMismatch);
+                    saw_mismatch = true;
+                }
+                BlockSyncAction::SubmitBlock { .. } => saw_submit = true,
+                BlockSyncAction::QueryNeededBlocks { .. } => {}
+                action => panic!("unexpected action during size mismatch test: {action:?}"),
             }
         }
-        true
     })
     .await
-    .unwrap_or(true);
-    assert!(
-        no_submit,
-        "oversize body is not submitted after SizeMismatch"
-    );
+    .expect("the mismatch is reported and the hash-matched body is still submitted");
 
     reactor_task.abort();
 }
@@ -15777,4 +15774,283 @@ async fn serving_only_coordinator_demand_keeps_block_session_available_during_fa
         SessionDemand::OpenNow,
     ));
     reactor_task.abort();
+}
+
+#[test]
+fn hint_refresh_updates_pending_and_retry_sizes_without_recharging_requests() {
+    let queue = work_queue_with(
+        0,
+        [
+            needed(1, BlockSizeEstimate::Unknown),
+            needed(2, BlockSizeEstimate::Advertised(2_000_000)),
+            needed(3, BlockSizeEstimate::Advertised(1_024)),
+        ],
+    );
+    let owner = queue.take_for_request(
+        block::Height(2),
+        block::Height(2),
+        1,
+        2_000_000,
+        1,
+        std::num::NonZeroU64::new(1).unwrap(),
+    )[0]
+    .1
+    .owner
+    .unwrap();
+    assert_eq!(
+        queue.mark_reserved_for_owner(owner, [block::Height(2)]),
+        2_000_000
+    );
+    queue.refresh_size_estimates(
+        test_work_scope(),
+        [
+            needed(1, BlockSizeEstimate::Advertised(3_146)),
+            needed(2, BlockSizeEstimate::Advertised(3_146)),
+        ],
+    );
+    assert_eq!(queue.reserved_bytes(), 2_000_000);
+    assert_eq!(
+        queue
+            .release_reserved_and_return_items_detailed_for_owner(owner, [block::Height(2)])
+            .released_bytes,
+        2_000_000
+    );
+    let pending = queue.take_in_range(block::Height(1), block::Height(2), 2);
+    assert_eq!(
+        pending
+            .iter()
+            .map(|(_, item)| item.estimated_bytes)
+            .collect::<Vec<_>>(),
+        [3_146, 3_146]
+    );
+
+    let owner = queue.take_for_request(
+        block::Height(3),
+        block::Height(3),
+        1,
+        1_024,
+        2,
+        std::num::NonZeroU64::new(1).unwrap(),
+    )[0]
+    .1
+    .owner
+    .unwrap();
+    queue.mark_reserved_for_owner(owner, [block::Height(3)]);
+    queue.release_active_reserved_height_for_owner(owner, block::Height(3));
+    queue.refresh_size_estimates(
+        test_work_scope(),
+        [needed(3, BlockSizeEstimate::Advertised(7_000))],
+    );
+    assert!(queue.defer_received_for_owner(
+        owner,
+        block::Height(3),
+        needed(3, BlockSizeEstimate::Unknown).1,
+        5_000,
+        block::Height(0)
+    ));
+    queue.extend(
+        test_work_scope(),
+        [needed(3, BlockSizeEstimate::Advertised(1_024))],
+    );
+    queue.refresh_size_estimates(test_work_scope(), [needed(3, BlockSizeEstimate::Unknown)]);
+    queue.advance_floor(block::Height(1));
+    assert_eq!(
+        queue.take_in_range(block::Height(3), block::Height(3), 1)[0]
+            .1
+            .estimated_bytes,
+        5_000
+    );
+    queue.return_items([block::Height(3)]);
+    assert_eq!(
+        queue.take_in_range(block::Height(3), block::Height(3), 1)[0]
+            .1
+            .estimated_bytes,
+        5_000,
+        "a later retry must not restore an older correction"
+    );
+}
+
+#[tokio::test]
+async fn committed_hint_batches_refresh_queued_work_without_resetting_it() {
+    let initial = test_committed_snapshot(
+        1,
+        1,
+        1,
+        (1, block::Hash([1; 32])),
+        (1, block::Hash([1; 32])),
+        (3, block::Hash([3; 32])),
+    );
+    let mut changed_view = committed_view(initial.clone(), 0);
+    let (snapshots, startup) =
+        committed_block_sync_startup(initial, immediate_body_download_config());
+    let (handle, mut actions, task) = spawn_block_sync_reactor(startup);
+    let BlockSyncAction::QueryNeededBlocks {
+        query_id, scope, ..
+    } = next_action(&mut actions).await
+    else {
+        panic!("startup query")
+    };
+    let wiring = handle.routine_wiring.as_ref().unwrap();
+    let work = &wiring.work;
+    work.extend(
+        scope,
+        [
+            needed(2, BlockSizeEstimate::Unknown),
+            needed(3, BlockSizeEstimate::Unknown),
+        ],
+    );
+    let reset_epoch = wiring.view.borrow().reset_epoch;
+    let changed = work.subscribe_available().notified();
+    tokio::pin!(changed);
+    changed.as_mut().enable();
+    changed_view.snapshot.state_version = zakura_header_chain::StateVersion::new(3);
+    changed_view.body_size_hint_revision = 2;
+    changed_view.body_size_hint_batches = Some(
+        vec![
+            zakura_header_chain::BodySizeHintBatch {
+                revision: 1,
+                updates: vec![(
+                    block::Height(2),
+                    block::Hash([2; 32]),
+                    zakura_header_chain::BodySizeHint::new(3_146).unwrap(),
+                )]
+                .into(),
+            },
+            zakura_header_chain::BodySizeHintBatch {
+                revision: 2,
+                updates: vec![(
+                    block::Height(3),
+                    block::Hash([3; 32]),
+                    zakura_header_chain::BodySizeHint::new(7_000).unwrap(),
+                )]
+                .into(),
+            },
+        ]
+        .into(),
+    );
+    snapshots.send(Some(changed_view)).unwrap();
+    tokio::time::timeout(Duration::from_secs(1), changed)
+        .await
+        .unwrap();
+    // A reply read before the correction must not restore the old estimates.
+    let mut candidates = handle.subscribe_candidate_state();
+    candidates.borrow_and_update();
+    handle
+        .send(BlockSyncEvent::ScopedNeededBlocks {
+            query_id,
+            scope,
+            body_anchor: zakura_header_chain::Frontier::new(block::Height(1), block::Hash([1; 32])),
+            blocks: [2, 3]
+                .into_iter()
+                .map(|height| BlockSyncBlockMeta {
+                    height: block::Height(height),
+                    hash: needed(height, BlockSizeEstimate::Unknown).1,
+                    size: BlockSizeEstimate::Advertised(2_000_000),
+                })
+                .collect(),
+        })
+        .await
+        .unwrap();
+    // The same event queue publishes candidates after the stale reply is handled.
+    handle
+        .send(BlockSyncEvent::NeededBlocks(Vec::new()))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(1), candidates.changed())
+        .await
+        .unwrap()
+        .unwrap();
+    let items = work.take_in_range(block::Height(2), block::Height(3), 2);
+    assert_eq!(
+        items
+            .iter()
+            .map(|(_, item)| item.estimated_bytes)
+            .collect::<Vec<_>>(),
+        [3_146, 7_000]
+    );
+    assert_eq!(wiring.view.borrow().reset_epoch, reset_epoch);
+    task.abort();
+}
+
+#[tokio::test]
+async fn missed_hint_history_refreshes_the_existing_queued_window() {
+    let initial = test_committed_snapshot(
+        1,
+        1,
+        1,
+        (1, block::Hash([1; 32])),
+        (1, block::Hash([1; 32])),
+        (3, block::Hash([3; 32])),
+    );
+    let mut changed_view = committed_view(initial.clone(), 0);
+    let (snapshots, startup) =
+        committed_block_sync_startup(initial, immediate_body_download_config());
+    let (handle, mut actions, task) = spawn_block_sync_reactor(startup);
+    let BlockSyncAction::QueryNeededBlocks { scope, .. } = next_action(&mut actions).await else {
+        panic!("startup query")
+    };
+    let work = &handle.routine_wiring.as_ref().unwrap().work;
+    work.extend(
+        scope,
+        [
+            needed(2, BlockSizeEstimate::Unknown),
+            needed(3, BlockSizeEstimate::Unknown),
+        ],
+    );
+    // A missed correction must also reach the next retry of an issued body.
+    assert_eq!(
+        work.take_in_range(block::Height(2), block::Height(2), 1)
+            .len(),
+        1
+    );
+    changed_view.snapshot.state_version = zakura_header_chain::StateVersion::new(21);
+    changed_view.body_size_hint_revision = 20;
+    changed_view.body_size_hint_batches = Some(
+        vec![zakura_header_chain::BodySizeHintBatch {
+            revision: 20,
+            updates: Vec::new().into(),
+        }]
+        .into(),
+    );
+    snapshots.send(Some(changed_view)).unwrap();
+    let BlockSyncAction::QueryNeededBlocks {
+        query_id,
+        scope,
+        from,
+        limit,
+        ..
+    } = next_action(&mut actions).await
+    else {
+        panic!("refresh query")
+    };
+    assert_eq!(from, block::Height(2));
+    assert_eq!(limit, 2);
+    let changed = work.subscribe_available().notified();
+    tokio::pin!(changed);
+    changed.as_mut().enable();
+    handle
+        .send(BlockSyncEvent::ScopedNeededBlocks {
+            query_id,
+            scope,
+            body_anchor: zakura_header_chain::Frontier::new(block::Height(1), block::Hash([1; 32])),
+            blocks: [2, 3]
+                .into_iter()
+                .map(|height| BlockSyncBlockMeta {
+                    height: block::Height(height),
+                    hash: needed(height, BlockSizeEstimate::Unknown).1,
+                    size: BlockSizeEstimate::Advertised(3_146),
+                })
+                .collect(),
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(1), changed)
+        .await
+        .unwrap();
+    work.return_items([block::Height(2)]);
+    assert!(work
+        .take_in_range(block::Height(2), block::Height(3), 2)
+        .iter()
+        .all(|(_, item)| item.estimated_bytes == 3_146));
+    task.abort();
 }

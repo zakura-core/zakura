@@ -390,33 +390,38 @@ criteria = "safe-to-deploy"
 version = "0.52.5"
 criteria = "safe-to-deploy"
 
+[[exemptions.zakura-address]]
+version = "2.0.0"
+criteria = "safe-to-deploy"
+notes = "Coordinated Zakura fork release; retain this exact-version exemption pending direct package audit."
+
 [[exemptions.zakura-bellman]]
-version = "1.3.0-alpha.1"
+version = "2.0.0"
 criteria = "safe-to-deploy"
 notes = "Coordinated Zakura fork release; retain this exact-version exemption pending direct package audit."
 
 [[exemptions.zakura-bls12-381]]
-version = "1.3.0-alpha.1"
+version = "2.0.0"
 criteria = "safe-to-deploy"
 notes = "Coordinated Zakura fork release; retain this exact-version exemption pending direct package audit."
 
 [[exemptions.zakura-halo2-gadgets]]
-version = "1.3.0-alpha.1"
+version = "2.0.0"
 criteria = "safe-to-deploy"
 notes = "Coordinated Zakura fork release; retain this exact-version exemption pending direct package audit."
 
 [[exemptions.zakura-halo2-legacy-pdqsort]]
-version = "1.3.0-alpha.1"
+version = "2.0.0"
 criteria = "safe-to-deploy"
 notes = "Coordinated Zakura fork release; retain this exact-version exemption pending direct package audit."
 
 [[exemptions.zakura-halo2-poseidon]]
-version = "1.3.0-alpha.1"
+version = "2.0.0"
 criteria = "safe-to-deploy"
 notes = "Coordinated Zakura fork release; retain this exact-version exemption pending direct package audit."
 
 [[exemptions.zakura-halo2-proofs]]
-version = "1.3.0-alpha.1"
+version = "2.0.0"
 criteria = "safe-to-deploy"
 notes = "Coordinated Zakura fork release; retain this exact-version exemption pending direct package audit."
 
@@ -431,57 +436,67 @@ criteria = "safe-to-deploy"
 notes = "Audit hold: the 0.92.0 to 1.1.0 delta adds derived Debug output that includes relay bearer tokens on ServerConfig, ClientBuilder and RelayConfig (src/main.rs, src/client.rs, src/relay_map.rs), and a probe with debug logging enabled printed a configured token, so ordinary debug logs can leak a live relay credential. The server also replaces shutdown on a duplicate identity with an uncapped inactive-client list (src/server/clients.rs), so an authorized endpoint can hold arbitrarily many same-key connections. Frame decoding is bounded at 1 MiB per WebSocket message and 64 KiB per payload, fixed-width fields are length-checked, and the key cache is bounded by its configured capacity. Zakura runs with relays disabled and without the server feature, so neither path is reachable in the node; 82 all-feature tests and 20,000 malformed-frame property cases pass. Retain the exemption until upstream redacts tokens from Debug output and bounds the inactive list; the published compatibility package preserves the reviewed Rust source. Registry migration: the 1.1.0-rc.0 archive preserves every upstream Rust file byte for byte, renames sibling packages with exact version requirements, retains the reviewed Dalek versions, and pins relay LRU to 0.18.3. Existing defects and acceptance conditions remain unchanged. Rc1 review: the main Iroh package additionally accepts zero to disable QUIC NAT traversal and tests bilateral opt-out with direct data transfer; its other production source is unchanged. The relay production source is unchanged. Known upstream defects and their existing acceptance conditions remain."
 
 [[exemptions.zakura-jubjub]]
-version = "1.3.0-alpha.1"
+version = "2.0.0"
 criteria = "safe-to-deploy"
 notes = "Coordinated Zakura fork release; retain this exact-version exemption pending direct package audit."
 
 [[exemptions.zakura-keys]]
-version = "1.3.0-alpha.1"
+version = "2.0.0"
 criteria = "safe-to-deploy"
 notes = "Coordinated Zakura fork release; retain this exact-version exemption pending direct package audit."
 
 [[exemptions.zakura-orchard]]
-version = "1.3.0-alpha.1"
+version = "2.0.0"
 criteria = "safe-to-deploy"
 notes = "Coordinated Zakura fork release; retain this exact-version exemption pending direct package audit."
 
 [[exemptions.zakura-pairing]]
-version = "1.3.0-alpha.1"
+version = "2.0.0"
 criteria = "safe-to-deploy"
 notes = "Coordinated Zakura fork release; retain this exact-version exemption pending direct package audit."
 
 [[exemptions.zakura-pasta-curves]]
-version = "1.3.0-alpha.1"
+version = "2.0.0"
 criteria = "safe-to-deploy"
 notes = "Coordinated Zakura fork release; retain this exact-version exemption pending direct package audit."
 
 [[exemptions.zakura-primitives]]
-version = "1.3.0-alpha.1"
+version = "2.0.0"
 criteria = "safe-to-deploy"
 notes = "Coordinated Zakura fork release; retain this exact-version exemption pending direct package audit."
 
 [[exemptions.zakura-proofs]]
-version = "1.3.0-alpha.1"
+version = "2.0.0"
+criteria = "safe-to-deploy"
+notes = "Coordinated Zakura fork release; retain this exact-version exemption pending direct package audit."
+
+[[exemptions.zakura-protocol]]
+version = "2.0.0"
 criteria = "safe-to-deploy"
 notes = "Coordinated Zakura fork release; retain this exact-version exemption pending direct package audit."
 
 [[exemptions.zakura-reddsa]]
-version = "1.3.0-alpha.1"
+version = "2.0.0"
 criteria = "safe-to-deploy"
 notes = "Coordinated Zakura fork release; retain this exact-version exemption pending direct package audit."
 
 [[exemptions.zakura-redjubjub]]
-version = "1.3.0-alpha.1"
+version = "2.0.0"
 criteria = "safe-to-deploy"
 notes = "Coordinated Zakura fork release; retain this exact-version exemption pending direct package audit."
 
 [[exemptions.zakura-sapling-crypto]]
-version = "1.3.0-alpha.1"
+version = "2.0.0"
 criteria = "safe-to-deploy"
 notes = "Coordinated Zakura fork release; retain this exact-version exemption pending direct package audit."
 
 [[exemptions.zakura-sinsemilla]]
-version = "1.3.0-alpha.1"
+version = "2.0.0"
+criteria = "safe-to-deploy"
+notes = "Coordinated Zakura fork release; retain this exact-version exemption pending direct package audit."
+
+[[exemptions.zakura-transparent]]
+version = "2.0.0"
 criteria = "safe-to-deploy"
 notes = "Coordinated Zakura fork release; retain this exact-version exemption pending direct package audit."
 

@@ -455,6 +455,10 @@ pub enum ReadResponse {
     /// this node holds for the requested range, in ascending height order.
     BlockRoots(Vec<zakura_chain::parallel::commitment_aux::BlockCommitmentRoots>),
 
+    /// Response to [`ReadRequest::BlockSizesByHash`]: committed serialized sizes parallel to
+    /// the requested hashes, `None` for hashes that are not committed.
+    BlockSizesByHash(Vec<Option<u32>>),
+
     /// Response to [`ReadRequest::Tip`] with the current best chain tip.
     Tip(Option<(block::Height, block::Hash)>),
 
@@ -763,6 +767,7 @@ impl TryFrom<ReadResponse> for Response {
             ReadResponse::UsageInfo(_)
             | ReadResponse::PruningInfo { .. }
             | ReadResponse::BlockRoots(_)
+            | ReadResponse::BlockSizesByHash(_)
             | ReadResponse::TipPoolValues { .. }
             | ReadResponse::TransactionIdsForBlock(_)
             | ReadResponse::AnyChainTransactionIdsForBlock(_)

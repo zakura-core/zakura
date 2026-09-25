@@ -1,6 +1,6 @@
 //! Error types for `ParametersBuilder`.
 
-use std::path::PathBuf;
+use std::{ops::Range, path::PathBuf};
 
 use thiserror::Error;
 
@@ -127,6 +127,18 @@ pub enum ParametersBuilderError {
     FundingStreamAddressNotP2SH {
         receiver: FundingStreamReceiver,
         address: String,
+    },
+
+    #[error(
+        "configured funding stream ranges must not overlap: stream {first_index} {first_range:?} \
+         overlaps stream {second_index} {second_range:?}"
+    )]
+    #[non_exhaustive]
+    OverlappingFundingStreams {
+        first_index: usize,
+        first_range: Range<Height>,
+        second_index: usize,
+        second_range: Range<Height>,
     },
 
     #[error(

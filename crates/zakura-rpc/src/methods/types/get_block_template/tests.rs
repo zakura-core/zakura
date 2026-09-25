@@ -54,6 +54,39 @@ fn template_rejection_targets_work_and_ignores_old_parents() {
     assert_eq!(state.revision, 2);
 }
 
+/// A caller that validated an older tip can select it after a newer one. That must not erase
+/// the newer parent's withdrawals, or the next caller for the newer parent serves rejected work.
+#[test]
+fn stale_parent_selection_keeps_newer_parent_rejections() {
+    let old_parent = zakura_chain::block::Hash([1; 32]);
+    let new_parent = zakura_chain::block::Hash([2; 32]);
+    let mut state = super::TemplateRejections::default();
+    state.set_parent(old_parent);
+    state.set_parent(new_parent);
+    state.mark_prepared(new_parent, "recovery");
+    assert!(state.reject(new_parent, "rejected"));
+
+    // A stale caller selects the old parent, then a rejection for the newer parent arrives.
+    state.set_parent(old_parent);
+    assert!(!state.needs_fallback());
+    assert!(!state.reject(new_parent, "late"));
+    assert_eq!(state.revision, 1, "only current-parent rejections notify");
+
+    state.set_parent(new_parent);
+    assert!(state.contains("rejected"));
+    assert!(state.contains("late"));
+    assert!(state.needs_fallback());
+    assert!(state.is_prepared("recovery"));
+    assert_eq!(state.revision, 1);
+
+    // Only the parent immediately before the current one is retained.
+    let third_parent = zakura_chain::block::Hash([3; 32]);
+    state.set_parent(third_parent);
+    state.set_parent(old_parent);
+    state.set_parent(new_parent);
+    assert!(!state.needs_fallback());
+}
+
 #[test]
 fn template_rejection_storage_fails_closed_at_capacity() {
     let parent = zakura_chain::block::Hash([1; 32]);
@@ -62,7 +95,7 @@ fn template_rejection_storage_fails_closed_at_capacity() {
     for id in 0..100 {
         state.reject(parent, &id.to_string());
     }
-    assert_eq!(state.rejected.len(), 64);
+    assert_eq!(state.records.rejected.len(), 64);
     assert!(state.contains("unknown"));
     assert!(state.needs_fallback());
 }
@@ -76,7 +109,7 @@ fn prepared_template_tracking_keeps_new_recovery_work_at_capacity() {
     for id in 0..100 {
         state.mark_prepared(parent, &id.to_string());
     }
-    assert_eq!(state.prepared.len(), 64);
+    assert_eq!(state.records.prepared.len(), 64);
     assert!(!state.withdrawn("99"));
     assert!(state.withdrawn("0"));
 }
@@ -510,11 +543,14 @@ fn coinbase_cache_reuses_built_coinbase() {
     );
 
     let cache = CoinbaseCache::default();
-    assert!(cache.get(height, fee).is_none(), "an empty cache misses");
+    assert!(
+        cache.get(height, fee, None).is_none(),
+        "an empty cache misses"
+    );
 
-    cache.store(height, fee, coinbase.clone());
+    cache.store(height, fee, None, coinbase.clone());
     assert_eq!(
-        cache.get(height, fee),
+        cache.get(height, fee, None),
         Some(coinbase.clone()),
         "a cache hit reuses the stored coinbase",
     );
@@ -522,7 +558,7 @@ fn coinbase_cache_reuses_built_coinbase() {
     // A different height key misses, so the next request rebuilds.
     let next_height = height.next().expect("height is below Height::MAX");
     assert!(
-        cache.get(next_height, fee).is_none(),
+        cache.get(next_height, fee, None).is_none(),
         "a different height misses"
     );
 }
@@ -579,17 +615,17 @@ fn coinbase_cache_retains_both_fake_and_real_fee_entries() {
     )
     .unwrap();
 
-    cache.store(height, zero_fee, fake_coinbase.clone());
-    cache.store(height, real_fee, real_coinbase.clone());
+    cache.store(height, zero_fee, None, fake_coinbase.clone());
+    cache.store(height, real_fee, None, real_coinbase.clone());
 
     // Both entries coexist — the zero-fee sizing coinbase survives the real-fee store.
     assert_eq!(
-        cache.get(height, zero_fee),
+        cache.get(height, zero_fee, None),
         Some(fake_coinbase),
         "zero-fee fake coinbase should still be cached after storing real-fee coinbase"
     );
     assert_eq!(
-        cache.get(height, real_fee),
+        cache.get(height, real_fee, None),
         Some(real_coinbase),
         "real-fee coinbase should be cached"
     );
@@ -614,14 +650,14 @@ fn coinbase_cache_retains_both_fake_and_real_fee_entries() {
     )
     .unwrap();
 
-    cache.store(next_height, zero_fee, next_coinbase.clone());
+    cache.store(next_height, zero_fee, None, next_coinbase.clone());
     assert_eq!(
-        cache.get(next_height, zero_fee),
+        cache.get(next_height, zero_fee, None),
         Some(next_coinbase),
         "new-height entry should be cached"
     );
     assert!(
-        cache.get(height, zero_fee).is_none(),
+        cache.get(height, zero_fee, None).is_none(),
         "old-height entry should be evicted"
     );
 }
@@ -655,17 +691,17 @@ fn coinbase_cache_preserves_zero_fee_entry_at_capacity() {
 
     // Store the zero-fee sizing coinbase first.
     let fake_coinbase = make_coinbase(zero_fee);
-    cache.store(height, zero_fee, fake_coinbase.clone());
+    cache.store(height, zero_fee, None, fake_coinbase.clone());
 
     // Fill to capacity with distinct fee values (simulating mempool fee churn).
     for i in 1..=5u64 {
         let fee = Amount::try_from(i * 1_000).expect("valid amount");
-        cache.store(height, fee, make_coinbase(fee));
+        cache.store(height, fee, None, make_coinbase(fee));
     }
 
     // The zero-fee entry must survive eviction at capacity.
     assert_eq!(
-        cache.get(height, zero_fee),
+        cache.get(height, zero_fee, None),
         Some(fake_coinbase.clone()),
         "zero-fee sizing coinbase must survive fee churn at capacity"
     );
@@ -674,17 +710,72 @@ fn coinbase_cache_preserves_zero_fee_entry_at_capacity() {
     let fee_1k: Amount<zakura_chain::amount::NonNegative> =
         Amount::try_from(1_000).expect("valid amount");
     let updated_coinbase = make_coinbase(fee_1k);
-    cache.store(height, fee_1k, updated_coinbase.clone());
+    cache.store(height, fee_1k, None, updated_coinbase.clone());
     assert_eq!(
-        cache.get(height, fee_1k),
+        cache.get(height, fee_1k, None),
         Some(updated_coinbase),
         "updating an existing key should replace in place"
     );
     assert_eq!(
-        cache.get(height, zero_fee),
+        cache.get(height, zero_fee, None),
         Some(fake_coinbase),
         "zero-fee entry must still be present after in-place update"
     );
+}
+
+/// A build for a superseded parent can finish after a build for the current tip. Its store must
+/// not evict the current tip's coinbase, or the next template proves that coinbase again.
+#[test]
+fn coinbase_cache_keeps_higher_heights_on_stale_stores() {
+    use super::CoinbaseCache;
+
+    let net = Network::Mainnet;
+    let stale_height = Height(2_000_000);
+    let current_height = stale_height.next().expect("height is below Height::MAX");
+    let zero_fee = Amount::zero();
+    let miner_params = MinerParams::from(
+        Address::decode(
+            &net,
+            default_miner_address(net.kind(), &MinerAddressType::Transparent),
+        )
+        .unwrap(),
+    );
+    let make_coinbase = |height, fee| {
+        TransactionTemplate::new_coinbase(&net, height, &miner_params, fee, None).unwrap()
+    };
+
+    let cache = CoinbaseCache::default();
+    let current = make_coinbase(current_height, zero_fee);
+    cache.store(current_height, zero_fee, None, current.clone());
+
+    let stale_fee = Amount::try_from(1_000).unwrap();
+    cache.store(
+        stale_height,
+        stale_fee,
+        None,
+        make_coinbase(stale_height, stale_fee),
+    );
+    assert_eq!(
+        cache.get(current_height, zero_fee, None),
+        Some(current.clone()),
+        "a stale build must not evict the current tip's coinbase",
+    );
+
+    // Fee churn for the stale height evicts its own entries, not the current tip's.
+    for i in 2..=5u64 {
+        let fee = Amount::try_from(i * 1_000).unwrap();
+        cache.store(stale_height, fee, None, make_coinbase(stale_height, fee));
+    }
+    assert_eq!(cache.get(current_height, zero_fee, None), Some(current));
+
+    // The next current-tip store evicts the stale height.
+    cache.store(
+        current_height,
+        stale_fee,
+        None,
+        make_coinbase(current_height, stale_fee),
+    );
+    assert!(cache.get(stale_height, stale_fee, None).is_none());
 }
 
 /// A randomized miner clone must not read or overwrite the original miner's caches.
@@ -717,15 +808,17 @@ fn coinbase_cache_detaches_when_miner_data_changes() {
     let original =
         TransactionTemplate::new_coinbase(&net, height, handler.miner_params().unwrap(), fee, None)
             .unwrap();
-    handler.coinbase_cache.store(height, fee, original.clone());
+    handler
+        .coinbase_cache
+        .store(height, fee, None, original.clone());
 
     let mut randomized = handler.clone();
     randomized.randomize_coinbase_data();
     assert!(randomized.template_cache().is_none());
-    assert!(randomized.coinbase_cache.get(height, fee).is_none());
+    assert!(randomized.coinbase_cache.get(height, fee, None).is_none());
     assert!(handler.template_cache().is_some());
     assert_eq!(
-        handler.coinbase_cache.get(height, fee),
+        handler.coinbase_cache.get(height, fee, None),
         Some(original.clone())
     );
 
@@ -738,6 +831,11 @@ fn coinbase_cache_detaches_when_miner_data_changes() {
     )
     .unwrap();
     assert_ne!(replacement, original);
-    randomized.coinbase_cache.store(height, fee, replacement);
-    assert_eq!(handler.coinbase_cache.get(height, fee), Some(original));
+    randomized
+        .coinbase_cache
+        .store(height, fee, None, replacement);
+    assert_eq!(
+        handler.coinbase_cache.get(height, fee, None),
+        Some(original)
+    );
 }

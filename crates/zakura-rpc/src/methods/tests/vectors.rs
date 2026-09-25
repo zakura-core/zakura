@@ -3653,6 +3653,93 @@ async fn check_template_rejection_recovery(reject_before_poll: bool, cached: boo
     queue.abort();
 }
 
+/// Cached templates share one work ID across requests, so background validation must prepare it
+/// once, including when requests queue it again while it is being prepared.
+#[tokio::test(flavor = "multi_thread")]
+async fn cached_template_work_is_prepared_once() {
+    let _init_guard = zakura_test::init();
+    let parent = Hash([1; 32]);
+    let (tip, tip_sender) = MockChainTip::new();
+    let height = NetworkUpgrade::Nu5.activation_height(&Mainnet).unwrap();
+    tip_sender.send_best_tip_height(height);
+    tip_sender.send_best_tip_hash(parent);
+    tip_sender.send_estimated_distance_to_network_chain_tip(Some(0));
+    let mut sync = MockSyncStatus::default();
+    sync.set_is_close_to_tip(true);
+    let read_state = tower::service_fn(move |request| async move {
+        Ok::<_, BoxError>(match request {
+            ReadRequest::Tip => ReadResponse::Tip(Some((height, parent))),
+            other => unreachable!("unexpected read request: {other:?}"),
+        })
+    });
+    let mempool: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let mut verifier: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let (_tx, rx) = tokio::sync::watch::channel(None);
+    let (rpc, queue) = RpcImpl::new(
+        Mainnet,
+        mining::Config {
+            miner_address: Some(ZcashAddress::from_transparent_p2pkh(
+                NetworkType::Main,
+                [0x7e; 20],
+            )),
+            ..Default::default()
+        },
+        false,
+        "0.0.1",
+        "preparation test",
+        Buffer::new(mempool, 1),
+        Buffer::new(state, 1),
+        Buffer::new(read_state, 1),
+        Buffer::new(verifier.clone(), 1),
+        sync,
+        tip,
+        MockAddressBookPeers::default(),
+        rx,
+        None,
+    );
+    rpc.gbt
+        .template_cache()
+        .unwrap()
+        .publish(template_extending(&Mainnet, height, parent));
+
+    let get_template = || async {
+        rpc.get_block_template(None)
+            .await
+            .unwrap()
+            .try_into_template()
+            .unwrap()
+    };
+
+    let first = get_template().await;
+    let preparation = verifier
+        .expect_request_that(|request| matches!(request, zakura_consensus::Request::Prepare { .. }))
+        .await;
+
+    // Queued while the first preparation runs.
+    assert_eq!(get_template().await.work_id, first.work_id);
+
+    preparation.respond(Hash([2; 32]));
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while !rpc
+            .gbt
+            .template_rejections
+            .borrow()
+            .is_prepared(&first.work_id)
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the preparation is recorded");
+
+    // Served after the preparation finished.
+    assert_eq!(get_template().await.work_id, first.work_id);
+
+    verifier.expect_no_requests().await;
+    queue.abort();
+}
+
 async fn gbt_with(net: Network, addr: ZcashAddress) {
     let mut mempool: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
     let state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
@@ -5750,6 +5837,9 @@ async fn getblocktemplate_long_poll_accounts_for_template_age() {
     let (mock_tip, mock_tip_sender) = MockChainTip::new();
     mock_tip_sender.send_best_tip_height(tip_height);
     mock_tip_sender.send_best_tip_hash(tip_hash);
+    mock_tip_sender.send_estimated_distance_to_network_chain_tip(Some(0));
+    let mut sync_status = MockSyncStatus::default();
+    sync_status.set_is_close_to_tip(true);
     let (_tx, rx) = tokio::sync::watch::channel(None);
     let (rpc, _) = RpcImpl::new(
         net.clone(),
@@ -5767,7 +5857,7 @@ async fn getblocktemplate_long_poll_accounts_for_template_age() {
         state,
         read_state.clone(),
         MockService::build().for_unit_tests(),
-        MockSyncStatus::default(),
+        sync_status,
         mock_tip,
         MockAddressBookPeers::default(),
         rx,
@@ -5809,6 +5899,254 @@ async fn getblocktemplate_long_poll_accounts_for_template_age() {
     let served = served.expect("long polling must return at the maximum-time deadline");
     assert_eq!(served.previous_block_hash, tip_hash);
     assert_eq!(served.submit_old, Some(false));
+}
+
+/// Mining RPC mocks for the cached long-poll tests, with a Mainnet tip that is synced.
+///
+/// The read state is a mock the test answers by hand, so each wake of a long poll is visible as a
+/// state tip read.
+macro_rules! cached_long_poll_rpc {
+    ($net:expr, $tip_height:expr, $tip_hash:expr, $read_state:expr, $mempool:expr) => {{
+        let (mock_tip, mock_tip_sender) = MockChainTip::new();
+        mock_tip_sender.send_best_tip_height($tip_height);
+        mock_tip_sender.send_best_tip_hash($tip_hash);
+        mock_tip_sender.send_estimated_distance_to_network_chain_tip(Some(0));
+        let mut sync_status = MockSyncStatus::default();
+        sync_status.set_is_close_to_tip(true);
+        let state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+        let (_tx, rx) = tokio::sync::watch::channel(None);
+        let (rpc, _) = RpcImpl::new(
+            $net.clone(),
+            mining::Config {
+                miner_address: Some(ZcashAddress::from_transparent_p2pkh(
+                    NetworkType::Main,
+                    [0x7e; 20],
+                )),
+                ..Default::default()
+            },
+            Default::default(),
+            "0.0.1",
+            "RPC test",
+            Buffer::new($mempool, 1),
+            state,
+            $read_state.clone(),
+            MockService::build().for_unit_tests(),
+            sync_status.clone(),
+            mock_tip,
+            MockAddressBookPeers::default(),
+            rx,
+            None,
+        );
+        (rpc, mock_tip_sender, sync_status)
+    }};
+}
+
+/// Returns `getblocktemplate` parameters that long poll on `long_poll_id`.
+fn long_poll_parameters(long_poll_id: LongPollId) -> GetBlockTemplateParameters {
+    GetBlockTemplateParameters::new(
+        GetBlockTemplateRequestMode::Template,
+        None,
+        vec![],
+        Some(long_poll_id),
+        None,
+    )
+}
+
+/// A cached long poll must re-check the sync status while it waits, like the synchronous path,
+/// instead of serving the updater's retained template after Zebra falls behind.
+#[tokio::test(start_paused = true)]
+async fn cached_long_poll_rechecks_sync_status() {
+    let _init_guard = zakura_test::init();
+    let net = Network::Mainnet;
+    let tip_height = NetworkUpgrade::Nu5.activation_height(&net).unwrap();
+    let tip_hash = Hash([0xab; 32]);
+    let mempool: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let mut read_state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let (rpc, _mock_tip_sender, mut sync_status) =
+        cached_long_poll_rpc!(net, tip_height, tip_hash, read_state, mempool);
+
+    let template = template_extending(&net, tip_height, tip_hash);
+    let client_id = template.long_poll_id;
+    rpc.gbt.template_cache().unwrap().publish(template);
+
+    let long_poll = rpc.get_block_template(Some(long_poll_parameters(client_id)));
+    tokio::pin!(long_poll);
+    tokio::select! {
+        biased;
+        _ = &mut long_poll => panic!("long polling must wait while the template is current"),
+        request = read_state.expect_request(ReadRequest::Tip) => {
+            request.respond(ReadResponse::Tip(Some((tip_height, tip_hash))));
+        }
+    }
+    assert!(futures::poll!(&mut long_poll).is_pending());
+
+    sync_status.set_is_close_to_tip(false);
+    let response = tokio::time::timeout(
+        Duration::from_secs(MEMPOOL_LONG_POLL_INTERVAL + 1),
+        &mut long_poll,
+    )
+    .await
+    .expect("a long poll must notice lost sync within the mempool polling interval");
+    let error = response.expect_err("an unsynced node must not serve cached work");
+    assert_eq!(
+        error.code(),
+        types::get_block_template::constants::NOT_SYNCED_ERROR_CODE.code()
+    );
+}
+
+/// A same-ID publication can win the wake at the `max_time` deadline. The deadline must still
+/// fire, rather than being recomputed from wall time and pushed back or disabled.
+#[tokio::test(start_paused = true)]
+async fn cached_long_poll_deadline_survives_a_simultaneous_publication() {
+    let _init_guard = zakura_test::init();
+    let net = Network::Mainnet;
+    let tip_height = NetworkUpgrade::Nu5.activation_height(&net).unwrap();
+    let tip_hash = Hash([0xab; 32]);
+    let mempool: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let mut read_state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let (rpc, _mock_tip_sender, _sync_status) =
+        cached_long_poll_rpc!(net, tip_height, tip_hash, read_state, mempool);
+    let cache = rpc.gbt.template_cache().unwrap();
+
+    let mut template = template_extending(&net, tip_height, tip_hash);
+    let now = DateTime32::now();
+    template.min_time = now.saturating_sub(Duration32::from_minutes(89));
+    template.max_time = now.saturating_add(Duration32::from_minutes(1));
+    template.long_poll_id =
+        LongPollInput::new(tip_height, tip_hash, template.max_time, std::iter::empty())
+            .generate_id();
+    let client_id = template.long_poll_id;
+    cache.publish(template.clone());
+
+    let waiting = rpc.precomputed_block_template(Some(client_id));
+    tokio::pin!(waiting);
+    tokio::select! {
+        biased;
+        _ = &mut waiting => panic!("long polling must wait while the template is current"),
+        request = read_state.expect_request(ReadRequest::Tip) => {
+            request.respond(ReadResponse::Tip(Some((tip_height, tip_hash))));
+        }
+    }
+    assert!(futures::poll!(&mut waiting).is_pending());
+
+    // The updater republishes the same work just as the deadline passes, and wins the wake.
+    tokio::time::advance(Duration::from_secs(62)).await;
+    cache.publish(template);
+    tokio::select! {
+        biased;
+        _ = &mut waiting => panic!("the publication wakes the call before the deadline does"),
+        request = read_state.expect_request(ReadRequest::Tip) => {
+            request.respond(ReadResponse::Tip(Some((tip_height, tip_hash))));
+        }
+    }
+
+    // The passed deadline fires on the next wait without any more time passing.
+    let started = tokio::time::Instant::now();
+    let (served, ()) = tokio::join!(waiting, async {
+        read_state
+            .expect_request(ReadRequest::Tip)
+            .await
+            .respond(ReadResponse::Tip(Some((tip_height, tip_hash))));
+    });
+    assert_eq!(started.elapsed(), Duration::ZERO);
+    let served = served.expect("long polling must return at the maximum-time deadline");
+    assert_eq!(served.submit_old, Some(false));
+}
+
+/// While the updater serves the cache, a synchronous long poll must not start its own
+/// speculative coinbase proof. That proof waits for the shared build slot before the tip wait, so
+/// a busy slot would hide a tip change until the mempool timer.
+#[tokio::test(start_paused = true)]
+async fn synchronous_long_poll_leaves_speculative_proofs_to_the_updater() {
+    let _init_guard = zakura_test::init();
+    let net = Network::Mainnet;
+    let tip_height = NetworkUpgrade::Nu5.activation_height(&net).unwrap();
+    let tip_hash = Hash([0xab; 32]);
+    let mut mempool: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let mut read_state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let (rpc, mock_tip_sender, _sync_status) =
+        cached_long_poll_rpc!(net, tip_height, tip_hash, read_state, mempool.clone());
+
+    // The updater has published, but not for this tip, so requests use the synchronous path.
+    rpc.gbt
+        .template_cache()
+        .unwrap()
+        .publish(template_extending(&net, tip_height, Hash([0x11; 32])));
+
+    // Another build holds the only build slot.
+    let _build_slot = rpc
+        .gbt
+        .template_build_slots
+        .clone()
+        .acquire_owned()
+        .await
+        .unwrap();
+
+    let chain_info = GetBlockTemplateChainInfo {
+        value_pools: Default::default(),
+        expected_difficulty: CompactDifficulty::from(ExpandedDifficulty::from(U256::one())),
+        tip_height,
+        tip_hash,
+        cur_time: DateTime32::from(1654008617),
+        min_time: DateTime32::from(1654008606),
+        max_time: DateTime32::from(1654008719),
+        chain_history_root: fake_history_tree(&net).hash(),
+    };
+    let client_id = LongPollInput::new(
+        tip_height,
+        tip_hash,
+        chain_info.max_time,
+        std::iter::empty(),
+    )
+    .generate_id();
+
+    let long_poll = rpc.get_block_template(Some(long_poll_parameters(client_id)));
+    tokio::pin!(long_poll);
+
+    // The cached path reads the tip, then gives up on the updater.
+    tokio::select! {
+        biased;
+        _ = &mut long_poll => panic!("the cached path waits for the updater"),
+        request = read_state.expect_request(ReadRequest::Tip) => {
+            request.respond(ReadResponse::Tip(Some((tip_height, tip_hash))));
+        }
+    }
+    assert!(futures::poll!(&mut long_poll).is_pending());
+    tokio::time::advance(precompute::NEW_TIP_TIMEOUT).await;
+
+    // The synchronous path reads the state and the mempool, then waits on the same ID.
+    tokio::select! {
+        biased;
+        _ = &mut long_poll => panic!("the synchronous path reads the state"),
+        request = read_state.expect_request(ReadRequest::ChainInfo) => {
+            request.respond(ReadResponse::ChainInfo(chain_info));
+        }
+    }
+    tokio::select! {
+        biased;
+        _ = &mut long_poll => panic!("the synchronous path reads the mempool"),
+        request = mempool.expect_request(mempool::Request::FullTransactions) => {
+            request.respond(mempool::Response::FullTransactions {
+                transactions: vec![],
+                transaction_dependencies: Default::default(),
+                last_seen_tip_hash: tip_hash,
+            });
+        }
+    }
+    assert!(futures::poll!(&mut long_poll).is_pending());
+
+    // A tip change wakes the long poll at once, and it asks the cache for the new tip's work.
+    mock_tip_sender.send_best_tip_height(tip_height.next().unwrap());
+    mock_tip_sender.send_best_tip_hash(Hash([0xcd; 32]));
+    let started = tokio::time::Instant::now();
+    tokio::select! {
+        biased;
+        _ = &mut long_poll => panic!("the build slot is still busy"),
+        request = read_state.expect_request(ReadRequest::Tip) => {
+            request.respond(ReadResponse::Tip(Some((tip_height, tip_hash))));
+        }
+    }
+    assert!(started.elapsed() < Duration::from_secs(MEMPOOL_LONG_POLL_INTERVAL));
 }
 
 /// Returns a template for the block after `(tip_height, tip_hash)`, as the updater would publish.

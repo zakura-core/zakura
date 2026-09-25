@@ -193,6 +193,12 @@ class RemoteMinerConfig(unittest.TestCase):
         renderer = load_remote_config_renderer()
         return renderer.render(base, ["seed.example:18233"], "t" + "A" * 34)
 
+    def test_a_config_without_nu7_is_refused(self):
+        renderer = load_remote_config_renderer()
+        base = '[network]\nnetwork = "Testnet"\ninitial_testnet_peers = []\n'
+        with self.assertRaises(ValueError):
+            renderer.render(base, ["seed.example:18233"], "t" + "A" * 34)
+
     def test_reads_both_config_forms(self):
         # The running fork predates #1147's `network = { ... }` form; a new fork uses it.
         for table in ("network.testnet_parameters", "network.network"):

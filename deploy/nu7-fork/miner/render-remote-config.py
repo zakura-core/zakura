@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Derive a remote miner node config from the live fork's pinned config."""
+"""Derive a remote miner node config from a fork node's own config."""
 
 import argparse
 import re
@@ -13,11 +13,12 @@ def render(source: str, peers: list[str], miner_address: str) -> str:
     # A configured testnet is `network = { ... }` since #1147. The running fork's
     # config predates that and keeps its parameters in [network.testnet_parameters].
     network = (network["network"] if isinstance(network.get("network"), dict)
-               else network["testnet_parameters"])
-    if (network["network_name"] != "Nu7Fork"
-            or network["network_magic"] != [122, 107, 117, 55]
-            or network["activation_heights"]["NU7"] != 4_382_859):
-        raise ValueError("base config is not the running NU7 fork")
+               else network.get("testnet_parameters"))
+    # The base must be a fork node's own config, so the remote node inherits exactly
+    # its name, magic and activation heights. Nothing is restated here, so a
+    # reconfigured fork needs no edit to this script.
+    if not network or "NU7" not in network.get("activation_heights", {}):
+        raise ValueError("base config is not a NU7 fork node config")
     if not peers or any(not re.fullmatch(r"[A-Za-z0-9.:-]+", peer) for peer in peers):
         raise ValueError("provide at least one valid P2P peer")
     if not re.fullmatch(r"t[0-9A-Za-z]{34}", miner_address):

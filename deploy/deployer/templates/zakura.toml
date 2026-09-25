@@ -6,8 +6,9 @@ network = "{{NETWORK}}"
 listen_addr = "{{LISTEN_ADDR}}"
 {{IDENTITY_DIR}}
 {{NETWORK_CACHE_DIR}}
+{{INITIAL_TESTNET_PEERS}}
 p2p_stack = "{{P2P_STACK}}"
-{{ZAKURA_BLOCK}}
+{{TESTNET_PARAMS_BLOCK}}{{ZAKURA_BLOCK}}
 [state]
 cache_dir = "{{STATE_CACHE_DIR}}"
 storage_mode = "{{STORAGE_MODE}}"
@@ -17,6 +18,7 @@ storage_mode = "{{STORAGE_MODE}}"
 
 {{METRICS_BLOCK}}
 {{HEALTH_BLOCK}}
+{{MINING_BLOCK}}
 [consensus]
 checkpoint_sync = {{CHECKPOINT_SYNC}}
 vct_fast_sync = {{VCT_FAST_SYNC}}

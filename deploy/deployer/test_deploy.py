@@ -108,7 +108,7 @@ class BuildCacheTests(unittest.TestCase):
                 old.append(path)
 
             with mock.patch.dict(os.environ, {deploy.BUILD_CACHE_RETAIN_ENV: "3"}):
-                deploy.prune_cached_binaries(cache_dir, current_sha)
+                deploy.prune_cached_binaries(cache_dir, f"zakurad-{current_sha}")
 
             remaining = {path.name for path in cache_dir.iterdir()}
             self.assertEqual(remaining, {
@@ -167,16 +167,19 @@ class NodeBuilder:
             "listen_addr": "0.0.0.0:18233",
             "identity_dir": "",
             "network_cache_dir": "",
+            "initial_testnet_peers": None,
             "rpc_listen_addr": "",
             "rpc_enable_cookie_auth": None,
             "storage_mode": "archive",
             "p2p_stack": "dual",
             "metrics_endpoint": "",
             "health_listen_addr": "",
+            "miner_address": "",
             "tracing_filter": "",
             "checkpoint_sync": True,
             "vct_fast_sync": True,
             "zakura": None,
+            "testnet_parameters": None,
             "working_dir": "",
             "start_command": "",
             "process_pattern": "",
@@ -221,6 +224,22 @@ class ObservabilityRenderingTests(NodeBuilder, unittest.TestCase):
         self.assertNotIn("metrics", config)
         self.assertNotIn("health", config)
 
+    def test_mining_section_renders_when_a_miner_address_is_set(self):
+        config = tomllib.loads(deploy.render_node_config(self.node(
+            miner_address="tmJymvcUCn1ctbghvTJpXBwHiMEB8P6wxNV",
+        )))
+
+        # getblocktemplate is refused without it, so an external miner on the
+        # fork could never produce a block.
+        self.assertEqual(
+            config["mining"], {"miner_address": "tmJymvcUCn1ctbghvTJpXBwHiMEB8P6wxNV"}
+        )
+
+    def test_mining_section_omitted_when_unset(self):
+        config = tomllib.loads(deploy.render_node_config(self.node()))
+
+        self.assertNotIn("mining", config)
+
     def test_health_renders_independently_of_metrics(self):
         config = tomllib.loads(deploy.render_node_config(self.node(
             health_listen_addr="127.0.0.1:8080",
@@ -228,6 +247,93 @@ class ObservabilityRenderingTests(NodeBuilder, unittest.TestCase):
 
         self.assertNotIn("metrics", config)
         self.assertEqual(config["health"], {"listen_addr": "127.0.0.1:8080"})
+
+
+class TestnetParametersRenderingTests(NodeBuilder, unittest.TestCase):
+    """A configured testnet such as the NU7 fork renders [network.testnet_parameters]."""
+
+    FORK_PARAMS = {
+        "network_name": "Nu7Fork",
+        "network_magic": [0xF0, 0x0D, 0xCA, 0xFE],
+        "checkpoints": True,
+        "initial_nsm_value_balance": 55_768_414_957,
+        "activation_heights": {
+            "BeforeOverwinter": 1,
+            "Overwinter": 207_500,
+            "Sapling": 280_000,
+            "Blossom": 584_000,
+            "Heartwood": 903_800,
+            "Canopy": 1_028_500,
+            "NU5": 1_842_420,
+            "NU6": 2_976_000,
+            "NU6.1": 3_536_500,
+            "NU6.2": 4_052_000,
+            "NU6.3": 4_134_000,
+            "NU7": 4_376_000,
+        },
+    }
+
+    def test_omitted_when_unset(self):
+        config = tomllib.loads(deploy.render_node_config(self.node()))
+
+        self.assertNotIn("testnet_parameters", config["network"])
+
+    def test_fork_parameters_round_trip(self):
+        config = tomllib.loads(deploy.render_node_config(
+            self.node(testnet_parameters=self.FORK_PARAMS)
+        ))
+
+        params = config["network"]["testnet_parameters"]
+        self.assertEqual(params["network_name"], "Nu7Fork")
+        self.assertEqual(params["network_magic"], [240, 13, 202, 254])
+        self.assertEqual(params["initial_nsm_value_balance"], 55_768_414_957)
+        # Genesis-only checkpoints would make the node verify 4M blocks from scratch.
+        self.assertTrue(params["checkpoints"])
+
+    def test_dotted_upgrade_names_are_quoted(self):
+        config = tomllib.loads(deploy.render_node_config(
+            self.node(testnet_parameters=self.FORK_PARAMS)
+        ))
+
+        heights = config["network"]["testnet_parameters"]["activation_heights"]
+        # An unquoted "NU6.1" would parse as a nested table, silently dropping the
+        # height, and a partial list wipes every upgrade above it in the builder.
+        self.assertEqual(heights["NU6.1"], 3_536_500)
+        self.assertEqual(heights["NU7"], 4_376_000)
+        self.assertEqual(len(heights), 12)
+
+    def test_lockbox_disbursements_render_as_an_array_of_tables(self):
+        config = tomllib.loads(deploy.render_node_config(self.node(testnet_parameters={
+            "network_name": "Nu7Fork",
+            "lockbox_disbursements": [{"address": "t2Lockbox", "amount": 0}],
+        })))
+
+        disbursements = config["network"]["testnet_parameters"]["lockbox_disbursements"]
+        self.assertEqual(disbursements, [{"address": "t2Lockbox", "amount": 0}])
+
+    def test_empty_peer_list_renders_for_an_incompatible_testnet(self):
+        config = tomllib.loads(deploy.render_node_config(self.node(
+            testnet_parameters=self.FORK_PARAMS,
+            initial_testnet_peers=[],
+        )))
+
+        # zakurad refuses to load a config that pairs the default public DNS
+        # seeds with parameters incompatible with the public Testnet.
+        self.assertEqual(config["network"]["initial_testnet_peers"], [])
+
+    def test_peer_list_omitted_when_unset(self):
+        config = tomllib.loads(deploy.render_node_config(self.node()))
+
+        self.assertNotIn("initial_testnet_peers", config["network"])
+
+    def test_zakura_block_still_renders_alongside(self):
+        config = tomllib.loads(deploy.render_node_config(self.node(
+            testnet_parameters=self.FORK_PARAMS,
+            zakura={"listen_addr": "0.0.0.0:8234", "bootstrap_peers": ["abc@1.2.3.4:8234"]},
+        )))
+
+        self.assertEqual(config["network"]["zakura"]["listen_addr"], "0.0.0.0:8234")
+        self.assertEqual(config["network"]["testnet_parameters"]["network_name"], "Nu7Fork")
 
 
 class ConfigKeyTests(unittest.TestCase):
@@ -251,6 +357,27 @@ class ConfigKeyTests(unittest.TestCase):
             nodes = deploy.load_nodes(path, None)
 
             self.assertEqual(nodes[0].health_listen_addr, "127.0.0.1:8080")
+
+    def test_testnet_parameters_is_a_known_key(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self.write_config(tmp, """
+                [defaults.testnet_parameters]
+                network_name = "Nu7Fork"
+
+                [defaults.testnet_parameters.activation_heights]
+                NU7 = 4376000
+
+                [[nodes]]
+                name = "node-a"
+                ssh_string = "root@example"
+                commit = "main"
+            """.replace("                ", ""))
+
+            nodes = deploy.load_nodes(path, None)
+
+            self.assertEqual(
+                nodes[0].testnet_parameters["activation_heights"]["NU7"], 4_376_000
+            )
 
     def test_unknown_key_still_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:

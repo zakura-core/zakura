@@ -1,0 +1,31 @@
+[package]
+name = "zakura-fork-miner"
+version = "0.1.0"
+authors.workspace = true
+description = "External miner for the NU7 fork testnet, driving getblocktemplate and submitblock over RPC"
+license.workspace = true
+repository.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+# This crate is deploy/operator tooling, not a published library.
+publish = false
+
+[dependencies]
+clap = { workspace = true, features = ["derive", "env"] }
+color-eyre = { workspace = true }
+hex = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+toml = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+
+# `internal-miner` pulls in the Equihash solver. The deployed zakurad stays a
+# stock build; only this sidecar solves proofs of work.
+zakura-chain = { path = "../../../crates/zakura-chain", features = ["internal-miner"] }
+zakura-network = { path = "../../../crates/zakura-network" }
+zakura-node-services = { path = "../../../crates/zakura-node-services", features = ["rpc-client"] }
+zakura-rpc = { path = "../../../crates/zakura-rpc" }
+
+[lints]
+workspace = true

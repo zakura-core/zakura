@@ -1,0 +1,22 @@
+[Unit]
+Description=Rate-limited public NU7 faucet
+After=network-online.target zakurad.service
+Wants=network-online.target zakurad.service
+
+[Service]
+Type=simple
+DynamicUser=yes
+StateDirectory=zakura-nu7-faucet
+WorkingDirectory=/opt/zakura-nu7-faucet
+LoadCredential=miner-key.hex:/root/fork-miner-key.hex
+ExecStart=/usr/bin/python3 /opt/zakura-nu7-faucet/faucet.py --db /var/lib/zakura-nu7-faucet/claims.sqlite3 --miner-address tmGkvoQGmvJu6H5Wp22wUFAsBuX6SPGHnMq --sender /usr/local/bin/zakura-fork-txload --config /etc/zakura/zakura.toml
+Restart=always
+RestartSec=10
+Nice=10
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

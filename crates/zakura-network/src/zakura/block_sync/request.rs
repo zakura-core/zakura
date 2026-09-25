@@ -2,8 +2,8 @@
 //!
 //! The block-range *request* a peer routine issues and tracks in its
 //! `outstanding` set ([`BlockRangeRequest`]), plus the body-size estimate hint
-//! ([`BlockSizeEstimate`]) that feeds the receive-path `SizeMismatch` tolerance
-//! check. There is no scheduler here: the per-peer routine pulls work from the
+//! ([`BlockSizeEstimate`]) that feeds the advisory receive-path `SizeMismatch`
+//! report. There is no scheduler here: the per-peer routine pulls work from the
 //! [`WorkQueue`](super::work_queue::WorkQueue) and builds a request directly (see
 //! [`pipe`] for the subsystem map).
 

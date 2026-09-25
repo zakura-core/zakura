@@ -142,9 +142,9 @@ fn configured_nsm_seed_is_preserved_and_controls_public_peer_compatibility() {
                 "initial_testnet_peers = []\n"
             };
             let seed_field = seed
-                .map(|seed| format!("initial_nsm_value_balance = {seed}\n"))
+                .map(|seed| format!(", initial_nsm_value_balance = {seed}"))
                 .unwrap_or_default();
-            let config = format!("network = 'Testnet'\n{peers}[testnet_parameters]\ncheckpoints = true\n{seed_field}");
+            let config = format!("network = {{ checkpoints = true{seed_field} }}\n{peers}");
             let parsed = toml::from_str::<Config>(&config);
             if public_peers && seed.is_some_and(|seed| seed != public_seed) {
                 assert!(
@@ -162,6 +162,68 @@ fn configured_nsm_seed_is_preserved_and_controls_public_peer_compatibility() {
             assert_eq!(parsed.network, roundtrip.network);
         }
     }
+}
+
+#[test]
+fn public_network_parameters_are_not_configurable() {
+    let _init_guard = zakura_test::init();
+
+    for network in ["Mainnet", "Testnet"] {
+        let plain_config: Config =
+            toml::from_str(&format!("network = \"{network}\"")).expect("public network parses");
+        assert_eq!(plain_config.network.to_string(), network);
+
+        let config = format!(
+            r#"
+            network = "{network}"
+
+            [testnet_parameters]
+            funding_streams = [
+                {{}},
+                {{}},
+                {{ height_range = {{ start = 3536500, end = 4476000 }} }},
+            ]
+            "#,
+        );
+
+        let error = toml::from_str::<Config>(&config)
+            .expect_err("public network parameters must be fixed")
+            .to_string();
+        assert!(
+            error.contains("Mainnet and public Testnet parameters are fixed"),
+            "unexpected configuration error: {error}",
+        );
+    }
+}
+
+#[test]
+fn old_revision_2_range_is_allowed_only_on_a_configured_testnet() {
+    let _init_guard = zakura_test::init();
+
+    let config: Config = toml::from_str(
+        r#"
+        initial_testnet_peers = []
+        network = {
+            checkpoints = true,
+            funding_streams = [
+                {},
+                {},
+                { height_range = { start = 3536500, end = 4476000 } },
+            ],
+        }
+        "#,
+    )
+    .expect("an explicit configured Testnet can set its own funding stream range");
+
+    assert!(!config.network.is_default_testnet());
+    assert_eq!(
+        config.network.all_funding_streams()[2].height_range(),
+        &(Height(3_536_500)..Height(4_476_000)),
+    );
+
+    let serialized = toml::to_string(&config).expect("configured Testnet serializes");
+    let round_trip: Config = toml::from_str(&serialized).expect("configured Testnet round-trips");
+    assert_eq!(config, round_trip);
 }
 
 #[test]
@@ -845,6 +907,31 @@ fn max_block_time_start_height_serialization_roundtrip() {
     assert!(deserialized
         .network
         .is_max_block_time_enforced(start_height));
+}
+
+/// Checks that a configured Testnet with no funding streams keeps none after a
+/// serialization round-trip, instead of inheriting the built-in Testnet streams.
+#[test]
+fn cleared_funding_streams_serialization_roundtrip() {
+    let _init_guard = zakura_test::init();
+    let mut config = Config {
+        network: testnet::Parameters::build()
+            .clear_funding_streams()
+            .to_network()
+            .expect("failed to build configured network"),
+        initial_testnet_peers: [].into(),
+        ..Config::for_test(P2pStack::Dual)
+    };
+    config.zakura.apply_network_defaults(&config.network);
+
+    let serialized = toml::to_string(&config).expect("the custom network serializes");
+    let deserialized: Config =
+        toml::from_str(&serialized).expect("the custom network deserializes");
+    assert_eq!(config, deserialized);
+    let Network::Testnet(params) = &deserialized.network else {
+        panic!("deserialized network must be a Testnet");
+    };
+    assert!(params.funding_streams().is_empty());
 }
 
 #[test]

@@ -128,7 +128,7 @@ fn transparent_coinbase() -> anyhow::Result<()> {
         })?
         .with_funding_streams(vec![
             ConfiguredFundingStreams {
-                height_range: Some(Height(1)..Height(100)),
+                height_range: Some(Height(5)..Height(7)),
                 recipients: Some(vec![
                     ConfiguredFundingStreamRecipient::new_for(Ecc),
                     ConfiguredFundingStreamRecipient::new_for(ZcashFoundation),
@@ -136,7 +136,7 @@ fn transparent_coinbase() -> anyhow::Result<()> {
                 ]),
             },
             ConfiguredFundingStreams {
-                height_range: Some(Height(1)..Height(100)),
+                height_range: Some(Height(7)..Height(100)),
                 recipients: Some(vec![
                     ConfiguredFundingStreamRecipient::new_for(MajorGrants),
                     ConfiguredFundingStreamRecipient {

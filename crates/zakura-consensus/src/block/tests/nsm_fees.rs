@@ -108,7 +108,7 @@ async fn nsm_fee_semantic_verification_rounds_the_block_total() {
                     _ => panic!("unexpected state request: {request:?}"),
                 })
             });
-            // NU7 has no production branch ID yet. Mock only transaction verification;
+            // Mock only transaction verification so the test isolates fee aggregation;
             // the real block verifier must aggregate the returned fees before splitting.
             let transaction = service_fn(|request| async move {
                 let mut response = accept_block_transaction(request);
@@ -200,8 +200,8 @@ proptest::proptest! {
                 });
                 let fees = [first, MAX_MONEY - first + excess];
                 let index = Arc::new(AtomicUsize::new(0));
-                // NU7 has no production branch ID. Mock transaction verification while
-                // exercising fee aggregation in the real semantic block verifier.
+                // Mock transaction verification while exercising fee aggregation in the
+                // real semantic block verifier.
                 let transaction = service_fn(move |request| {
                     let index = index.clone();
                     async move {

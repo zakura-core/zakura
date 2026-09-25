@@ -712,6 +712,9 @@ where
     /// Blocks whose hashes were advertised before contextual commit completed.
     pending_blocks: PendingBlockRegistry,
 
+    /// Bounds proof checks independently of contextual commit capacity.
+    pub(crate) mined_pow_checks: super::submit_block::MinedSubmissions,
+
     /// Detached submissions that still own verification or contextual commit work.
     mined_submissions: super::submit_block::MinedSubmissions,
 
@@ -751,6 +754,7 @@ where
                 .unwrap_or(SubmitBlockChannel::default().sender()),
             pending_blocks,
             mined_submissions: Default::default(),
+            mined_pow_checks: Default::default(),
             optimistic_block_inventory,
             template_preparation_queue: TemplatePreparationQueue::default(),
             template_build_slots: Arc::new(Semaphore::new(MAX_TEMPLATE_BUILDS)),

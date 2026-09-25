@@ -1652,9 +1652,11 @@ where
                     //
                     // Requests for a cached template can queue its work ID again while it is
                     // being prepared. Skip work that is already prepared or rejected.
-                    if gbt.template_rejections.borrow().needs_fallback()
-                        || gbt.template_preparation_settled(&template)
-                    {
+                    //
+                    // Read each condition under its own lock: a recursive read can deadlock
+                    // behind a queued writer.
+                    let needs_fallback = gbt.template_rejections.borrow().needs_fallback();
+                    if needs_fallback || gbt.template_preparation_settled(&template) {
                         let Some(next) = gbt.next_template_preparation() else {
                             break;
                         };

@@ -32,6 +32,7 @@ Keep entries **newest-first**. Each row records:
 
 | Parameter | Location | Old → New | PR | Why |
 | --- | --- | --- | --- | --- |
+| Created-output index `PARTITIONS` | `crates/zakura-state/src/service/non_finalized_state/created_utxos.rs` | one copied map → 256 shared partitions | [#1153](https://github.com/zakura-core/zakura/pull/1153) | Reduce snapshot copying and cleanup at the cost of an extra hash per lookup. |
 | Integrated header refill threshold | `crates/zakura-network/src/zakura/header_sync/reactor.rs` | header lead ≤ 2,000 → enough room for one checkpoint range plus its successor (currently lead ≤ 3,599 within the same 4,000-header window) | [#1136](https://github.com/zakura-core/zakura/pull/1136) | Replenish the body backlog earlier while coalescing small credit returns and preserving memory bounds. |
 | `block_profile.socket` | `crates/zakurad/src/config.rs` | new → omitted (recording disabled) | [#1111](https://github.com/zakura-core/zakura/pull/1111) | Enable local block profiles only on an explicitly configured node. |
 | Block profile capacity | `crates/zakura-jsonl-trace/src/block_profile.rs` | new → 1,024 active attempts, 256 spans per attempt (128 fine-detail spans), 16,384 detail and 2,048 summary queue slots | [#1111](https://github.com/zakura-core/zakura/pull/1111) | Bound recorder memory and preserve state-phase capacity when transaction detail is truncated. |

@@ -30,6 +30,7 @@ use crate::{
 
 mod backup;
 mod chain;
+mod created_utxos;
 
 #[cfg(test)]
 pub(crate) use backup::MIN_DURATION_BETWEEN_BACKUP_UPDATES;
@@ -39,6 +40,7 @@ mod tests;
 
 pub(crate) use backup::write_semantically_verified_backup_block;
 pub(crate) use chain::{Chain, SpendingTransactionId};
+pub(crate) use created_utxos::CreatedUtxos;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ContextualMetrics {

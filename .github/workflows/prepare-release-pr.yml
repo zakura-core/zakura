@@ -196,7 +196,7 @@ jobs:
 
       # Deliberately unpinned (like semver-checks.yml): cargo-semver-checks
       # must track new stable rustdoc formats.
-      - uses: taiki-e/install-action@c3ec0de9ae7f1019cea21aa96aa0a895b9552063 #v2.87.9
+      - uses: taiki-e/install-action@26e9283f268b880168bdbd2c545dfcd60ec2c6ab #v2.87.13
         with:
           tool: cargo-release,cargo-semver-checks
 

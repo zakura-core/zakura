@@ -32,6 +32,7 @@ Keep entries **newest-first**. Each row records:
 
 | Parameter | Location | Old → New | PR | Why |
 | --- | --- | --- | --- | --- |
+| Created-output index `PARTITIONS` | `crates/zakura-state/src/service/non_finalized_state/created_utxos.rs` | one copied map → 256 shared partitions | [#1153](https://github.com/zakura-core/zakura/pull/1153) | Reduce snapshot copying and cleanup at the cost of an extra hash per lookup. |
 | Integrated header refill threshold | `crates/zakura-network/src/zakura/header_sync/reactor.rs` | header lead ≤ 2,000 → enough room for one checkpoint range plus its successor (currently lead ≤ 3,599 within the same 4,000-header window) | [#1136](https://github.com/zakura-core/zakura/pull/1136) | Replenish the body backlog earlier while coalescing small credit returns and preserving memory bounds. |
 | `EOS_PANIC_AFTER` | `crates/zakurad/src/components/sync/end_of_support.rs` | `21` days → `30` days | [#1121](https://github.com/zakura-core/zakura/pull/1121) | With the v1.5.0 release-height floor at 3,494,121, keep Mainnet nodes running through height 3,528,681 (~2026-10-25), about 32 days after the planned September 23 release. Warnings retain their three-day lead. |
 | `MAX_TEMPLATE_BUILDS` | `crates/zakura-rpc/src/methods/types/get_block_template.rs` | unbounded → `1` build across RPC clones | [#1074](https://github.com/zakura-core/zakura/pull/1074) | Bound concurrent coinbase proof work, including long-poll precomputation and cancelled callers. |

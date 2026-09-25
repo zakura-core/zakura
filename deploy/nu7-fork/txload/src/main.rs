@@ -177,10 +177,23 @@ async fn mempool_spent_outpoints(
             .json_result_from_call("getrawtransaction", format!(r#"["{txid}", 1]"#))
             .await
             .map_err(|error| eyre!("getrawtransaction failed for {txid}: {error}"))?;
-        for input in tx["vin"].as_array().into_iter().flatten() {
-            if let (Some(hash), Some(index)) = (input["txid"].as_str(), input["vout"].as_u64()) {
-                spent.insert((hash.to_string(), index as u32));
-            }
+        spent.extend(spent_outpoints(&tx).wrap_err_with(|| format!("mempool transaction {txid}"))?);
+    }
+    Ok(spent)
+}
+
+/// Returns the outpoints a verbose `getrawtransaction` result spends.
+///
+/// Coinbase inputs have no `txid` and spend nothing. An index that does not fit in
+/// an outpoint is malformed RPC data: narrowing it would name a different output,
+/// and the caller could then select an output this transaction already spends.
+fn spent_outpoints(tx: &serde_json::Value) -> Result<Vec<(String, u32)>> {
+    let mut spent = Vec::new();
+    for input in tx["vin"].as_array().into_iter().flatten() {
+        if let (Some(hash), Some(index)) = (input["txid"].as_str(), input["vout"].as_u64()) {
+            let index = u32::try_from(index)
+                .wrap_err_with(|| format!("input {hash}:{index} has an out-of-range vout"))?;
+            spent.push((hash.to_string(), index));
         }
     }
     Ok(spent)
@@ -422,7 +435,11 @@ async fn main() -> Result<()> {
     }
 
     tracing::info!(%network, nu7 = nu7.0, "building the proving key");
-    let pk = ProvingKey::build(CIRCUIT_VERSION);
+    let pk = std::sync::Arc::new(
+        tokio::task::spawn_blocking(|| ProvingKey::build(CIRCUIT_VERSION))
+            .await
+            .wrap_err("building the proving key panicked")?,
+    );
     tracing::info!("proving key ready");
 
     let mut sent = 0u32;
@@ -468,7 +485,14 @@ async fn main() -> Result<()> {
         } else {
             throwaway_recipient()?
         };
-        let proved = prove_shielding_bundle(&pk, shielded_value, destination, change)?;
+        let proved = {
+            let pk = pk.clone();
+            tokio::task::spawn_blocking(move || {
+                prove_shielding_bundle(&pk, shielded_value, destination, change)
+            })
+            .await
+            .wrap_err("proving the shielding bundle panicked")??
+        };
 
         // Two-phase assembly: the sighash commits to the bundle's contents but not to the
         // signatures over it, so the transaction is assembled once with a placeholder
@@ -528,7 +552,15 @@ async fn main() -> Result<()> {
 
         // Verify the proof here, against the same circuit era the node uses, so a proving
         // failure is distinguishable from a serialization failure at the node.
-        match authorized.verify_proof(&orchard::circuit::VerifyingKey::build(CIRCUIT_VERSION)) {
+        let verified = {
+            let authorized = authorized.clone();
+            tokio::task::spawn_blocking(move || {
+                authorized.verify_proof(&orchard::circuit::VerifyingKey::build(CIRCUIT_VERSION))
+            })
+            .await
+            .wrap_err("verifying the proof panicked")?
+        };
+        match verified {
             Ok(()) => tracing::info!("local proof verification passed"),
             Err(error) => bail!("local proof verification FAILED: {error:?}"),
         }
@@ -538,7 +570,10 @@ async fn main() -> Result<()> {
         let signature = secp256k1::SECP256K1.sign_ecdsa(&message, &secret);
         let mut unlock = Vec::new();
         let mut der = signature.serialize_der().to_vec();
-        der.push(HashType::ALL.bits() as u8);
+        der.push(
+            u8::try_from(HashType::ALL.bits())
+                .wrap_err("the sighash type must fit in the signature's one-byte suffix")?,
+        );
         unlock.push(u8::try_from(der.len())?);
         unlock.extend_from_slice(&der);
         let public_key = secp256k1::PublicKey::from_secret_key_global(&secret).serialize();
@@ -608,5 +643,34 @@ async fn main() -> Result<()> {
         if args.count != 0 && sent >= args.count {
             return Ok(());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn spent_outpoints_reads_prevouts_and_skips_coinbase() -> Result<()> {
+        let tx = serde_json::json!({"vin": [
+            {"coinbase": "03a0b1c2"},
+            {"txid": "aa", "vout": 3},
+            {"txid": "bb", "vout": u64::from(u32::MAX)},
+        ]});
+
+        assert_eq!(
+            spent_outpoints(&tx)?,
+            vec![("aa".to_string(), 3), ("bb".to_string(), u32::MAX)],
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn spent_outpoints_rejects_an_out_of_range_vout() {
+        // Truncating 2^32 + 3 would record output 3 as spent, and leave the real one
+        // eligible for selection.
+        let tx = serde_json::json!({"vin": [{"txid": "aa", "vout": (1u64 << 32) + 3}]});
+
+        assert!(spent_outpoints(&tx).is_err());
     }
 }

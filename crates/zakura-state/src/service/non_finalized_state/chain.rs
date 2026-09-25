@@ -105,9 +105,12 @@ pub struct ChainInner {
     ///
     /// Note that these UTXOs may not be unspent.
     /// Outputs can be spent by later transactions or blocks in the chain.
+    ///
+    /// Share immutable output payloads when cloning chain snapshots. Membership and
+    /// spend indexes remain independent for each chain.
     //
     // TODO: replace OutPoint with OutputLocation?
-    pub(crate) created_utxos: HashMap<transparent::OutPoint, transparent::OrderedUtxo>,
+    pub(crate) created_utxos: HashMap<transparent::OutPoint, Arc<transparent::OrderedUtxo>>,
     /// The spending transaction ids by [`transparent::OutPoint`]s spent by `blocks`,
     /// including spent outputs created by earlier transactions or blocks in the chain.
     ///
@@ -1527,10 +1530,11 @@ impl Chain {
     /// and removed from the relevant chain(s).
     #[cfg(test)]
     pub fn unspent_utxos(&self) -> HashMap<transparent::OutPoint, transparent::OrderedUtxo> {
-        let mut unspent_utxos = self.created_utxos.clone();
-        unspent_utxos.retain(|outpoint, _utxo| !self.spent_utxos.contains_key(outpoint));
-
-        unspent_utxos
+        self.created_utxos
+            .iter()
+            .filter(|(outpoint, _)| !self.spent_utxos.contains_key(outpoint))
+            .map(|(outpoint, utxo)| (*outpoint, utxo.as_ref().clone()))
+            .collect()
     }
 
     /// Returns the [`transparent::Utxo`] pointed to by the given
@@ -2165,7 +2169,9 @@ impl
                 .expect("new_outputs contains all created UTXOs");
 
             // Update the chain's created UTXOs
-            let previous_entry = self.created_utxos.insert(outpoint, created_utxo.clone());
+            let previous_entry = self
+                .created_utxos
+                .insert(outpoint, Arc::new(created_utxo.clone()));
             assert_eq!(
                 previous_entry, None,
                 "unexpected created output: duplicate update or duplicate UTXO",

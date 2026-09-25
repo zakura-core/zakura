@@ -2,8 +2,12 @@
 
 import io
 import json
+import socket
 import tempfile
+import threading
+import time
 import unittest
+from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 from unittest import mock
 
@@ -145,6 +149,138 @@ class DashboardTests(unittest.TestCase):
                 result = self.collector.sample_remote_miner(miner, primary)
             self.assertFalse(result["healthy"], (field, value))
             rpc.assert_not_called()
+
+
+class ChainRpc:
+    """A fake primary and observer RPC over a chain of `{height: hash}`."""
+
+    def __init__(self, chain: dict[int, str]):
+        self.chain = chain
+
+    def __call__(self, port, method, params=None):
+        tip = max(self.chain)
+        if method == "getblockchaininfo":
+            return {"chain": "test", "blocks": tip, "bestblockhash": self.chain[tip],
+                    "upgrades": {"77190ad9": {"name": "NU7", "activationheight": 10}}}
+        if method == "getpeerinfo":
+            return []
+        if method == "getblockhash":
+            return self.chain[params[0]]
+        if method == "getblockheader":
+            number = next(n for n, h in self.chain.items() if h == params[0])
+            return {"height": number, "hash": params[0], "time": 1000 + 30 * number}
+        raise AssertionError(method)
+
+
+class CollectorChainTests(unittest.TestCase):
+    def collector(self, config_text: str) -> dashboard.Collector:
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        config = Path(temp.name) / "zakura.toml"
+        config.write_text(config_text, encoding="utf-8")
+        return dashboard.Collector(config, 18232, 18242)
+
+    CONFIGURED_TESTNET = (
+        '[network.network]\n'
+        'network_name = "Nu7Fork"\n'
+        'network_magic = [122, 107, 117, 55]\n'
+        'initial_nsm_value_balance = 100\n'
+        '[network.network.activation_heights]\n'
+        'NU7 = 10\n'
+    )
+
+    def collect(self, collector, rpc):
+        with mock.patch.object(dashboard, "rpc", side_effect=rpc), mock.patch.object(
+            dashboard, "active_miners", return_value=1
+        ):
+            return collector.collect()
+
+    def test_reads_the_configured_testnet_form(self):
+        # The deployer writes a configured testnet as `network = { ... }` since #1147.
+        collector = self.collector(self.CONFIGURED_TESTNET)
+
+        self.assertEqual(collector.network["name"], "Nu7Fork")
+        self.assertEqual(collector.network["activationHeight"], 10)
+        self.assertEqual(collector.network["nsmSeedZat"], 100)
+
+    def test_reports_the_tip_before_nu7_activates(self):
+        collector = self.collector(self.CONFIGURED_TESTNET)
+
+        result = self.collect(collector, ChainRpc({7: "a7", 8: "a8"}))
+
+        self.assertEqual(result["chain"]["height"], 8)
+        self.assertEqual([block["hash"] for block in result["recentBlocks"]], ["a8"])
+        self.assertIsNone(result["chain"]["medianIntervalSeconds"])
+
+    def test_a_lower_tip_is_a_reorg_that_drops_cached_headers(self):
+        collector = self.collector(self.CONFIGURED_TESTNET)
+        self.collect(collector, ChainRpc({10: "a10", 11: "a11", 12: "a12"}))
+
+        result = self.collect(collector, ChainRpc({10: "b10", 11: "b11"}))
+
+        self.assertEqual(result["observation"]["reorgs24h"], 1)
+        self.assertEqual([block["hash"] for block in result["recentBlocks"]], ["b11", "b10"])
+
+    def test_collector_failures_are_logged_with_their_cause(self):
+        collector = self.collector(self.CONFIGURED_TESTNET)
+
+        with mock.patch.object(collector, "collect", side_effect=KeyError("blocks")), \
+                mock.patch.object(dashboard.time, "sleep", side_effect=KeyboardInterrupt), \
+                self.assertLogs(level="ERROR") as logs, self.assertRaises(KeyboardInterrupt):
+            collector.run(15)
+
+        self.assertIn("KeyError: 'blocks'", "\n".join(logs.output))
+        self.assertEqual(collector.payload["status"], "unavailable")
+        self.assertNotIn("blocks", collector.payload["error"])
+
+
+def max_concurrent_handlers(server_class, limit: int, clients: int) -> int:
+    """Serve `clients` parallel requests through `server_class` and count the peak."""
+    release = threading.Event()
+    lock = threading.Lock()
+    active = peak = 0
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            nonlocal active, peak
+            with lock:
+                active += 1
+                peak = max(peak, active)
+            release.wait(5)
+            with lock:
+                active -= 1
+            self.send_response(204)
+            self.end_headers()
+
+        def log_message(self, *args):
+            pass
+
+    server = server_class(("127.0.0.1", 0), Handler, max_concurrent=limit)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+
+    def request():
+        with socket.create_connection(server.server_address, timeout=10) as conn:
+            conn.sendall(b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+            conn.recv(64)
+
+    threads = [threading.Thread(target=request) for _ in range(clients)]
+    for thread in threads:
+        thread.start()
+    time.sleep(0.5)
+    release.set()
+    for thread in threads:
+        thread.join(10)
+    server.shutdown()
+    server.server_close()
+    return peak
+
+
+class BoundedServerTests(unittest.TestCase):
+    def test_concurrent_requests_are_capped(self):
+        self.assertEqual(max_concurrent_handlers(dashboard.BoundedHTTPServer, 2, 6), 2)
+
+    def test_stalled_clients_time_out(self):
+        self.assertEqual(dashboard.Handler.timeout, dashboard.REQUEST_TIMEOUT_SECONDS)
 
 
 if __name__ == "__main__":

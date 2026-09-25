@@ -30,6 +30,10 @@ MIN_CLAIM_SPACING_SECONDS = 30
 MAX_ATTEMPTS_PER_IP = 10
 ATTEMPT_WINDOW_SECONDS = 600
 ALLOWED_ORIGIN = "https://nu7.valargroup.dev"
+# Bounds for the public HTTP server, so parallel or stalled clients cannot exhaust
+# threads on the fork host.
+MAX_CONCURRENT_REQUESTS = 16
+REQUEST_TIMEOUT_SECONDS = 10
 CLAIM_ID = re.compile(r"[A-Za-z0-9_-]{20,40}\Z")
 TXID = re.compile(r"FAUCET_TXID=([0-9a-f]{64})\b")
 
@@ -238,8 +242,39 @@ class Faucet:
         print(f"claim {row['id']} {status} txid={txid or 'none'}", flush=True)
 
 
+class BoundedHTTPServer(ThreadingHTTPServer):
+    """A threading HTTP server that handles at most `max_concurrent` requests at once.
+
+    ThreadingHTTPServer starts one thread per connection without limit. Here the
+    accept loop waits for a free slot instead, so excess clients queue in the listen
+    backlog rather than exhausting threads.
+    """
+
+    daemon_threads = True
+
+    def __init__(self, address, handler, max_concurrent: int = MAX_CONCURRENT_REQUESTS):
+        super().__init__(address, handler)
+        self.slots = threading.BoundedSemaphore(max_concurrent)
+
+    def process_request(self, request, client_address):
+        self.slots.acquire()
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self.slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self.slots.release()
+
+
 class Handler(BaseHTTPRequestHandler):
     faucet: Faucet
+    # Socket timeout, so a client that stalls mid-request frees its slot.
+    timeout = REQUEST_TIMEOUT_SECONDS
 
     def respond(self, status: int, payload: dict):
         body = json.dumps(payload, separators=(",", ":")).encode()
@@ -318,7 +353,7 @@ def main():
     faucet = Faucet(args.db, args.rpc_port, args.miner_address, args.sender, args.config)
     Handler.faucet = faucet
     threading.Thread(target=faucet.run_worker, daemon=True).start()
-    ThreadingHTTPServer((args.host, args.port), Handler).serve_forever()
+    BoundedHTTPServer((args.host, args.port), Handler).serve_forever()
 
 
 if __name__ == "__main__":

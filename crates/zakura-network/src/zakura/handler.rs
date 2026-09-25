@@ -4205,6 +4205,15 @@ async fn persistent_stream_worker_with_policy(
         // to poll the reader's terminal event. Preserve the close cause first.
         let _cancel_session_on_exit = reader_context.stream_token.clone().drop_guard();
         let mut recv = recv;
+        let waiting_since = Instant::now();
+        tokio::select! {
+            biased;
+            _ = reader_context.connection_token.cancelled() => return,
+            _ = reader_context.stream_token.cancelled() => return,
+            _ = reader_context.precheck.ready() => {}
+            _ = inbound_tx.closed() => reader_context.precheck.start(),
+        }
+        reader_context.credit_read_pause(waiting_since.elapsed());
         loop {
             let frame = tokio::select! {
                 biased;
@@ -4902,7 +4911,8 @@ async fn write_outbound_request_frame_inner(
         match read_frame(
             &mut recv,
             inbound_frame_cap,
-            FrameFilter::new(stream.messages, InboundReader::Requester),
+            FrameFilter::new(stream.messages, InboundReader::Requester)
+                .with_precheck(Some(&legacy_state)),
             limits.idle_timeout,
             // This is the requester side of a one-shot legacy request/response:
             // the responder streams its frames promptly, so a silent gap before
@@ -5055,6 +5065,22 @@ struct LegacyResponseReadState {
     items: usize,
     active_chunk_type: Option<u16>,
     active_chunk: Vec<u8>,
+}
+
+impl super::regulation::ResponsePrecheck for LegacyResponseReadState {
+    fn check(&self, _message_type: u16, payload_len: usize) -> Result<(), FrameRejection> {
+        if self.frames >= self.budget.max_frames {
+            return Err(FrameRejection::Unsolicited);
+        }
+        let remaining = self.budget.max_bytes.saturating_sub(self.bytes);
+        if payload_len > remaining {
+            return Err(FrameRejection::AboveReservation {
+                // The aggregate response cap keeps this value below u64::MAX.
+                bytes: remaining as u64,
+            });
+        }
+        Ok(())
+    }
 }
 
 impl LegacyResponseReadState {
@@ -9179,6 +9205,88 @@ mod tests {
             Some(FrameRejection::AboveReservation { bytes: 10 })
         );
 
+        // A peer sends its response header before the service receives its
+        // handle. The production reader must wait for precheck attachment.
+        let _open = read_header(message_type::PART, 11).await?;
+        let (send, recv) = timeout(Duration::from_secs(2), stream_rx.recv())
+            .await?
+            .unwrap();
+        let mut context = tabled_context(Some(RULES), 128);
+        context.limits.idle_timeout = Duration::from_secs(30);
+        let cancel = context.connection_token.clone();
+        let prelude = StreamPrelude {
+            magic: STREAM_PRELUDE_MAGIC,
+            stream_kind: stream.kind,
+            stream_version: stream.version,
+            request_id: None,
+            max_frame_bytes: stream.frame_cap,
+        };
+        let mut workers = JoinSet::new();
+        let (exit_tx, _exit_rx) = mpsc::unbounded_channel();
+        let admitted = spawn_persistent_stream_worker(
+            &mut workers,
+            send,
+            recv,
+            stream,
+            prelude,
+            context,
+            1,
+            false,
+            exit_tx,
+        );
+        // Give the independent reader time to consume the already sent header
+        // if its startup gate is missing.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!cancel.is_cancelled());
+        assert!(admitted.streams[0]
+            .recv
+            .attach_precheck(Arc::new(shared.clone())));
+        timeout(Duration::from_secs(1), cancel.cancelled())
+            .await
+            .expect("the attached precheck rejects the first header without its payload");
+        timeout(Duration::from_secs(1), workers.join_next()).await?;
+
+        // Legacy streams have no rows, but their request budget still rejects
+        // a header before the peer supplies any payload bytes.
+        let mut legacy = LegacyResponseReadState::new(
+            LegacyResponseBudget::from_request(LEGACY_REQUEST_PING, &[], test_connection_limits())
+                .unwrap(),
+        );
+        for (payload_len, expected) in [
+            (9, FrameRejection::AboveReservation { bytes: 8 }),
+            (0, FrameRejection::Unsolicited),
+        ] {
+            let _open = read_header(LEGACY_RESPONSE_PONG, payload_len).await?;
+            let (_, mut recv) = timeout(Duration::from_secs(2), stream_rx.recv())
+                .await?
+                .unwrap();
+            let result = timeout(
+                Duration::from_secs(1),
+                read_frame(
+                    &mut recv,
+                    stream.frame_cap,
+                    FrameFilter::new(None, InboundReader::Requester).with_precheck(Some(&legacy)),
+                    Duration::from_secs(5),
+                    Some(Duration::from_secs(5)),
+                ),
+            )
+            .await
+            .expect("the legacy budget rejects a header without reading its payload");
+            assert_eq!(rejected(result), Some(expected));
+            if legacy.frames == 0 {
+                legacy
+                    .validate_frame(
+                        1,
+                        &Frame {
+                            message_type: LEGACY_RESPONSE_PONG,
+                            flags: 0,
+                            payload: 1u64.to_le_bytes().to_vec(),
+                        },
+                    )
+                    .expect("the first pong fits its request budget");
+            }
+        }
+
         // Requests are not responses: the precheck does not apply.
         let (_connection, mut send) = read_header(message_type::GET, 4).await?;
         timeout(Duration::from_secs(2), send.write_all(&[0; 4])).await??;
@@ -9966,6 +10074,41 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn legacy_header_precheck_tracks_remaining_bytes_across_frames() {
+        let mut state = LegacyResponseReadState::new(LegacyResponseBudget {
+            kind: LegacyResponseKind::Blocks,
+            max_items: 1,
+            max_frames: 10,
+            max_bytes: 18,
+            max_message_bytes: 1024,
+        });
+        let mut payload = 1u64.to_le_bytes().to_vec();
+        payload.push(0); // An empty missing-block inventory.
+        let frame = Frame {
+            message_type: LEGACY_RESPONSE_MISSING_BLOCKS,
+            flags: 0,
+            payload,
+        };
+        for remaining in [18, 9, 0] {
+            let filter =
+                FrameFilter::new(None, InboundReader::Requester).with_precheck(Some(&state));
+            assert_eq!(
+                filter.check_header(frame.message_type, 0, remaining, 1024),
+                Ok(1024),
+            );
+            assert_eq!(
+                filter.check_header(frame.message_type, 0, remaining + 1, 1024),
+                Err(FrameRejection::AboveReservation {
+                    bytes: u64::try_from(remaining).unwrap(),
+                }),
+            );
+            if remaining != 0 {
+                state.validate_frame(1, &frame).unwrap();
+            }
+        }
+    }
+
     fn assert_codec_frames_validate_at_transport(
         request: LegacyRequestFrame,
         request_kind: LegacyRequestKind,
@@ -9990,6 +10133,14 @@ mod tests {
 
         let mut state = LegacyResponseReadState::new(budget);
         for frame in &frames {
+            FrameFilter::new(None, InboundReader::Requester)
+                .with_precheck(Some(&state))
+                .check_header(
+                    frame.message_type,
+                    frame.flags,
+                    frame.payload.len(),
+                    usize::MAX,
+                )?;
             state
                 .validate_frame(request_id, frame)
                 .map_err(|error| -> BoxError { format!("{error:?}").into() })?;

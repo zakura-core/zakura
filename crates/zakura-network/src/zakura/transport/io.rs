@@ -83,11 +83,12 @@ impl FramedRecv {
         self
     }
 
-    /// Check every later response header against `precheck` before the
-    /// reader allocates its payload.
+    /// Check every response header against `precheck` before the reader
+    /// allocates its payload. Attach it before the first receive call.
     ///
     /// Returns false if this stream has no transport reader, such as an
-    /// in-process channel, or if a precheck is already attached.
+    /// in-process channel, or if the service already started receiving or
+    /// attached a precheck.
     pub(crate) fn attach_precheck(&self, precheck: Arc<dyn ResponsePrecheck>) -> bool {
         self.precheck
             .as_ref()
@@ -109,6 +110,9 @@ impl FramedRecv {
 
     /// Receive an already queued frame without waiting for transport progress.
     pub(crate) fn try_recv(&mut self) -> Result<Frame, mpsc::error::TryRecvError> {
+        if let Some(precheck) = &self.precheck {
+            precheck.start();
+        }
         match &mut self.receiver {
             FramedReceiver::Plain(receiver) => receiver.try_recv(),
             FramedReceiver::Queued(receiver) => loop {
@@ -121,6 +125,9 @@ impl FramedRecv {
 
     /// Receive the next admitted frame, or `None` after the transport closes the stream.
     pub async fn recv(&mut self) -> Option<Frame> {
+        if let Some(precheck) = &self.precheck {
+            precheck.start();
+        }
         match &mut self.receiver {
             FramedReceiver::Plain(receiver) => receiver.recv().await,
             FramedReceiver::Queued(receiver) => {

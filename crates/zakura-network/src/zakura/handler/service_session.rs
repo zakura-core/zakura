@@ -220,6 +220,9 @@ pub(super) fn spawn_service_session(
             bounded_stream_queue_depths(queue_depth, prepared.context.queue_depths);
         let (inbound_tx, inbound_rx) = mpsc::channel(inbound_depth);
         let (sender, outbound_rx) = worker_framed_channel(outbound_depth);
+        if prepared.context.messages.is_some() {
+            prepared.context.precheck.pause();
+        }
         admitted.streams.push(ServiceStreamRole {
             kind: prepared.stream.kind,
             version: prepared.stream.version,

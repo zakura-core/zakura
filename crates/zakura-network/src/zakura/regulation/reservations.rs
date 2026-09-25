@@ -498,20 +498,48 @@ impl<K: Eq + Hash + std::fmt::Debug + Send + 'static> ResponsePrecheck for Share
 
 /// The precheck a stream's reader and its receiver share.
 ///
-/// The reader starts before the service takes the stream, so the service
-/// attaches its precheck later. Until then, and on streams whose service never
-/// attaches one, the reader checks each header against its row only.
+/// A transport receiver pauses ingress until the service attaches a precheck
+/// or starts receiving without one. The choice applies to the first header.
 #[derive(Clone, Debug, Default)]
-pub(crate) struct PrecheckSlot(Arc<OnceLock<Arc<dyn ResponsePrecheck>>>);
+pub(crate) struct PrecheckSlot(Arc<PrecheckSetup>);
+
+#[derive(Debug, Default)]
+struct PrecheckSetup {
+    choice: OnceLock<Option<Arc<dyn ResponsePrecheck>>>,
+    gated: std::sync::atomic::AtomicBool,
+    ready: tokio_util::sync::CancellationToken,
+}
 
 impl PrecheckSlot {
-    /// Attach `precheck`. Returns false if one is already attached.
+    /// Pause ingress before spawning the transport reader.
+    pub(crate) fn pause(&self) {
+        self.0
+            .gated
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Wait for the service to choose its header check.
+    pub(crate) async fn ready(&self) {
+        if self.0.gated.load(std::sync::atomic::Ordering::Acquire) {
+            self.0.ready.cancelled().await;
+        }
+    }
+
+    /// Attach `precheck`. Returns false if the service already chose a check.
     pub(crate) fn attach(&self, precheck: Arc<dyn ResponsePrecheck>) -> bool {
-        self.0.set(precheck).is_ok()
+        let attached = self.0.choice.set(Some(precheck)).is_ok();
+        self.0.ready.cancel();
+        attached
+    }
+
+    /// Start receiving with the attached check, or with row checks alone.
+    pub(crate) fn start(&self) {
+        self.0.choice.get_or_init(|| None);
+        self.0.ready.cancel();
     }
 
     /// The attached precheck.
     pub(crate) fn get(&self) -> Option<&dyn ResponsePrecheck> {
-        self.0.get().map(|precheck| &**precheck)
+        self.0.choice.get().and_then(|choice| choice.as_deref())
     }
 }

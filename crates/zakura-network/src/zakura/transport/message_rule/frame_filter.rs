@@ -111,7 +111,8 @@ impl<'a> FrameFilter<'a> {
     /// The checks run in order: message type, flags, minimum length, then the
     /// response precheck. The returned cap never exceeds `frame_cap`. The
     /// caller rejects a longer frame as oversize before it allocates the
-    /// payload. A stream without a table accepts any header up to `frame_cap`.
+    /// payload. A stream without a table applies the precheck to every header
+    /// and otherwise accepts any header up to `frame_cap`.
     pub(crate) fn check_header(
         &self,
         message_type: u16,
@@ -120,6 +121,9 @@ impl<'a> FrameFilter<'a> {
         frame_cap: usize,
     ) -> Result<usize, FrameRejection> {
         let Some(rules) = self.rules else {
+            if let Some(precheck) = self.precheck {
+                precheck.check(message_type, payload_len)?;
+            }
             return Ok(frame_cap);
         };
         let rule = MessageRule::find(rules, message_type)

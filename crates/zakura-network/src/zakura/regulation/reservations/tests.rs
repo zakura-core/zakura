@@ -452,3 +452,28 @@ proptest! {
         prop_assert_eq!(pool.held(), 0);
     }
 }
+
+#[tokio::test]
+async fn a_reader_waits_for_the_services_precheck_choice() {
+    let slot = PrecheckSlot::default();
+    slot.pause();
+    assert!(futures::poll!(std::pin::pin!(slot.ready())).is_pending());
+    let shared = SharedReservations::new(Reservations::<u32>::new(RULES, 4));
+    assert!(slot.attach(Arc::new(shared)));
+    assert!(futures::poll!(std::pin::pin!(slot.ready())).is_ready());
+    assert_eq!(
+        slot.get().unwrap().check(message_type::PART, 1),
+        Err(FrameRejection::Unsolicited)
+    );
+
+    let slot = PrecheckSlot::default();
+    slot.pause();
+    slot.start();
+    assert!(futures::poll!(std::pin::pin!(slot.ready())).is_ready());
+    assert!(slot.get().is_none());
+    assert!(
+        !slot.attach(Arc::new(SharedReservations::new(Reservations::<u32>::new(
+            RULES, 4
+        ))))
+    );
+}

@@ -5849,9 +5849,13 @@ mod tests {
         responder_result?;
         let error = request_result.expect_err("excessive response frames are rejected");
         assert!(
-            error
-                .to_string()
-                .contains("too many legacy response frames"),
+            matches!(
+                error.downcast_ref::<crate::zakura::handler::ZakuraHandlerError>(),
+                Some(crate::zakura::handler::ZakuraHandlerError::RejectedFrame {
+                    rejection: crate::zakura::FrameRejection::Unsolicited,
+                    ..
+                })
+            ),
             "unexpected error: {error}"
         );
         wait_registered_count(&node, 0).await?;

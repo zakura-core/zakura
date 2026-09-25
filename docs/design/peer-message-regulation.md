@@ -100,7 +100,10 @@ On a stream with a table, only rows with a cadence charge a bucket. Commitments
 bound requests without one, and reservations bound responses. A service can
 attach its reservations to the stream as a response precheck: the reader then
 checks each response header against the live reservations before it allocates
-the payload.
+the payload. The tabled reader waits until the service attaches its precheck
+or calls `recv` or `try_recv` to choose row checks alone. A service must attach
+its precheck before its first receive call. The reader credits this local
+startup pause to its cadence buckets.
 
 A stream without a table keeps the legacy behavior: its reader admits any
 message type and any flags up to the stream's frame cap, and charges its

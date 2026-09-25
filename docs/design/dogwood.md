@@ -1,0 +1,559 @@
+# Dogwood: block propagation for Zcash
+
+Proof of work makes the next block's entry point unpredictable. Propagation
+delay increases the orphan rate. We need low latency from any proposer across
+peers with unequal bandwidth.
+
+Dogwood pushes block parts along subscriptions established before the block
+exists. Each node requests different parts from different peers and forwards
+verified parts to its subscribers. It shifts subscriptions toward faster peers.
+Parity lets it reconstruct the block without waiting for every part.
+
+The tradeoff is bandwidth: standing routes avoid request latency, but stale
+routes need redundancy and recovery. The
+[protocol specification](../specs/dogwood.md) defines the rules. This document
+explains the design. The [experiment report](dogwood-experiments.md) records the
+local codec and congestion-control estimates and connected-relay tests. They do
+not establish overlay convergence or sustained throughput at the planning
+target.
+
+## Performance targets
+
+We use rough estimates to set the targets below. They still need network testing
+and do not set consensus parameters.
+
+**Throughput:** Assuming 2 KiB per aggregated transaction after Tachyon, 50,000
+TPS requires `50,000 × 2,048 × 8 = 819.2 Mbps` of block-body traffic. Adding 25%
+parity brings that to 1.024 Gbps, so roughly 1 Gbps is our starting point before
+transport overhead and recovery. Relays also need upload capacity for each
+forwarding copy. This is a sustained rate: delivering a block accumulated over
+`T` seconds in `D` seconds requires at least `819.2 × T / D Mbps` of body
+ingress. We must size blocks and links together to meet the latency target.
+
+**Latency:** We aim to replicate a block to 90% of nodes within about 400 ms,
+and keep that target below 500 ms. If we assume nodes are uniformly distributed
+over Earth, their median surface separation is about 10,000 km. Light takes
+about 33 ms to cover that distance in vacuum, or 50 ms in fiber. Allowing three
+such overlay hops gives about 150 ms of propagation. We provisionally budget
+another 250 ms for indirect physical routes, serialization, queueing,
+verification, and reconstruction. That gives a 400 ms target; actual geography,
+topology, and block size will determine whether we can meet it for 90% of nodes.
+
+In traditional proof of work, propagation consumes part of the block interval
+and increases competing-block risk. Allowing propagation to take roughly 10% of
+the block interval gives four-second blocks for a 400 ms delay. This is a sizing
+heuristic, not a prediction of the orphan rate.
+
+**Robustness:** Any node can propose the next block. Bandwidth, peer
+connections, and topology change without central control. Dogwood should perform
+well from any entry point relative to the capacity and paths available at that
+moment. Nodes continuously measure delivery, explore other peers, and shift
+subscriptions toward peers that deliver more data. Redundancy and recovery
+should preserve delivery while those subscriptions adapt.
+
+## Tradeoffs
+
+### Protocol comparison
+
+Each node limits its forwarding peers as the network grows. Like
+[Gossipsub](https://github.com/libp2p/specs/blob/master/pubsub/gossipsub/gossipsub-v1.0.md#gossipsub-the-gossiping-mesh-router),
+Dogwood uses bounded local forwarding, with a separate subscription graph for
+each part.
+
+[Rotor](https://www.anza.xyz/blog/alpenglow-a-new-consensus-for-solana) uses
+erasure coding and a single relay layer to reduce the proposer's upload burden
+and propagation hops. Its routes depend on a known proposer and validator set.
+
+Celestia's Pull-Based Broadcast Tree
+([PBBT](https://github.com/celestiaorg/celestia-app/blob/9c1e04d1dfd090531252f16f34293242d04b1157/specs/src/recovery.md))
+discovers routes as parts propagate. It pipelines authenticated `Have` and
+`Want` messages with data transfer. Congestion affects route selection through
+FIFO scheduling, but the first transfer still waits for a request.
+
+Dogwood moves that request before the block. Like
+[DOG](https://github.com/cometbft/cometbft/issues/3263), it uses local delivery
+measurements to adjust push routes. Each node requests parts from selected
+suppliers. Subscriptions divide the traffic across connections and adapt
+separately for each proposer.
+
+Each node retains learned routes for each proposer. Switching between known
+proposers does not discard those routes. An unfamiliar proposer uses default
+routes until measurements support its own assignments. Congestion or a change in
+a proposer's entry point can still make its routes stale. Recovery handles
+missing parts while the controller adapts.
+
+## Parts and subscriptions
+
+The proposer splits the block body into `k` data parts, with 64 KiB payloads by
+default. Systematic Reed–Solomon over GF(2¹⁶) adds `ceil(k / 4)` parity parts.
+Any `k` distinct correctly encoded parts reconstruct the body.
+
+`HeaderMeta` wraps the consensus header with coding parameters, a Merkle root
+over the parts, and proposer authentication. Each `BlockPart` carries a proof
+against that root. Nodes verify parts before forwarding or decoding them.
+
+A subscription selects parts. For future blocks, it uses a fixed-width part mask
+that maps to indices once the block size and hash are known. Each enabled bit
+selects a share of the encoded parts. For an announced block, a subscription can
+name exact indices. A part always means one payload, not a group of payloads.
+
+Each node chooses its suppliers independently. These choices form overlapping
+directed graphs: different parts follow different paths through the same peers.
+A node can forward a part as soon as it verifies it. Once it reconstructs and
+checks the encoded body, it can regenerate parts that never reached it.
+
+### Block-part lifecycle
+
+The nodes subscribe before the block exists. The diagram then follows one part.
+Both nodes collect other parts through their own subscriptions.
+
+```mermaid
+sequenceDiagram
+    participant P as Proposer
+    participant A as Node A
+    participant B as Node B
+    B->>A: SubscribeParts
+    A->>P: SubscribeParts
+    P->>A: HeaderMeta
+    A->>A: Verify header and metadata
+    A->>B: HeaderMeta
+    B->>B: Verify header and metadata
+    P->>A: BlockPart
+    A->>A: Verify block part
+    A->>B: BlockPart
+    B->>B: Verify block part
+    Note over A,B: Repeat for other parts
+    B->>B: Reconstruct and check block
+    B->>A: FullBlock
+```
+
+`FullBlock` stops further parts for that block toward its sender. Node A cancels
+queued sends to Node B, but in-flight parts may still arrive. Node B continues
+serving its own subscribers. Future subscriptions remain active. Reconstruction
+checks do not replace consensus block validation.
+
+### Messages
+
+| Message | Purpose |
+| --- | --- |
+| `HeaderMeta` | Announce the header and authenticated commitment to its encoded body. |
+| `BlockPart` | Send one part with its proof and subscription authorization. |
+| `SubscribeParts` | Request parts of future blocks or specific parts of an active block. |
+| `UnsubscribeParts` | Stop a route or restore inherited subscriptions. |
+| `FullBlock` | Report reconstruction and stop receiving parts for this block. |
+
+Subscriptions grant finite part and byte credit over a bounded height range.
+Each part identifies its grant. Canceling a route stops future sends without
+making an authorized in-flight part a protocol violation.
+
+## Subscription state
+
+Each node keeps incoming and outgoing part masks per peer and proposer. Incoming
+masks record what it requests. Outgoing masks record what peers request from it.
+When a block arrives, the node resolves these masks into peer-by-part bitmaps.
+
+Default masks provide initial routes for unfamiliar proposers. Steady-state
+routes use one supplier per part where coverage permits. The draft retains
+bounded two-supplier startup coverage until routes demonstrate delivery. Startup
+traffic must fit its own byte budget. Here, each checkmark shows a steady-state
+request for an announced block:
+
+| Incoming peer | Part 0 | Part 1 | Part 2 | Part 3 |
+| --- | --- | --- | --- | --- |
+| A | ✓ | — | ✓ | — |
+| B | — | ✓ | — | — |
+| C | — | — | — | ✓ |
+| D | — | — | — | — |
+
+The node learns separate routes for each authenticated proposer. A nearby peer
+may provide most of one proposer's block without being the best supplier for
+another. For example, learned primary assignments could look like this:
+
+| Proposer | Part 0 | Part 1 | Part 2 | Part 3 |
+| --- | --- | --- | --- | --- |
+| X | A | A | A | B |
+| Y | C | C | C | A |
+
+Backup subscriptions supplement these assignments where failure coverage
+requires them. Changing X's routes does not change Y's routes. All routes share
+the connection's byte budget.
+
+Outgoing demand is independent. A can request a part from B while B requests it
+from A. Either node might receive a part elsewhere first or reconstruct it. A
+node suppresses an echo to the peer that supplied the part. Reciprocal
+subscriptions do not prove that either peer has the data.
+
+Block-specific subscriptions request missing parts during recovery without
+changing the learned routes for future blocks. The spec defines how these
+subscriptions override persistent state.
+
+## Routing and congestion control
+
+The receiver chooses suppliers. Transport congestion control paces each
+connection. The subscription controller decides how much traffic to assign to
+that connection.
+
+Arrival times alone cannot reveal unused capacity: a peer might be slow because
+it received the part late, or because its connection is congested. The receiver
+instead tests an alternative under load. It requests the same parts from two
+peers and compares verified arrivals on its own clock. Ordinary deliveries help
+select candidates. Different-part comparisons alone can confuse peer performance with
+upstream part availability.
+
+### Delivery feedback
+
+The receiver measures delivered bytes over local arrival intervals and filters
+that rate to guide supplier assignments. It excludes the first part's bytes
+when the interval starts at that part's arrival.
+
+Delivery measurements describe active routes. To discover unused capacity, the
+receiver increases assignments within a bounded exploration budget and measures
+the resulting delivery. It reduces future assignments after repeated deadline
+misses. A shared ingress budget limits total demand across peers and active
+blocks. Finite grants bound the traffic each peer may send.
+
+### Supplier exploration
+
+The controller follows five rules:
+
+1. **Compare like with like.** Add a random challenger for selected parts within
+   a traffic-funded exploration budget. Compare the same parts from the same
+   proposer under similar block size and concurrent load.
+2. **Move gradually.** Require repeated wins. Keep the old supplier until the
+   replacement delivers. Preserve failure coverage.
+3. **Budget bytes across blocks.** Count active blocks, proposers, backups, and
+   challenges together per connection. Limit each move and measure its effect
+   before adding more demand.
+4. **Adjust the budget from delivery.** Raise it gradually after success under
+   increased load. Lower it after repeated uncanceled deadline misses.
+   Idle time does not establish spare capacity.
+5. **Recover independently.** Repair a stalled block within a bounded reserve.
+   Do not wait for route learning. Do not count canceled copies as failures.
+
+For selected parts, a successful challenge changes the route as follows. Arrows
+show pushed data; subscription requests travel in the opposite direction.
+
+```text
+Before:       A ──> Receiver
+Challenge:    A ──> Receiver <── B
+After:             Receiver <── B
+```
+
+The receiver keeps A if it still needs A for failure coverage. Random challenges
+continue so peers can recover from past losses.
+
+Local coverage does not protect global delivery paths. Several nodes can prune
+different supplier edges and strand parts that previously reached them. The
+connected-relay experiments reproduce this failure despite local coverage
+checks. Treat the challenge controller as experimental. Retain startup routes
+until a pruning policy demonstrates normal delivery under concurrent changes.
+
+A part mask's byte cost grows with block size and concurrent block count.
+Selecting a quarter of a 40-part block costs 640 KiB at 64 KiB per part. Two
+such blocks cost 1.25 MiB. A win at the first load does not establish capacity
+for the second.
+
+Challenge frequency follows block traffic, not just a timer. The receiver funds
+extra copies from the encoded size of completed, validated blocks. It spaces
+trial starts, shares opportunities across active proposers, and bounds each
+trial's lifetime. Idle time adds no budget. Existing backup deliveries can
+provide comparisons without adding traffic.
+
+Standing subscriptions use an estimated workload. When `HeaderMeta` arrives, the
+receiver checks actual demand and coverage. Corrections take control-message
+latency. The learned budget guides allocation; finite grants and queue limits
+bound resource use.
+
+[Section 7 of the spec](../specs/dogwood.md#7-redundancy-and-route-control)
+defines the measurements and update rules.
+
+## Proposer subscriptions and seeding
+
+Proposer upload is a separate scheduling problem. A receiver may request all
+parts, but that does not tell the proposer which subset to seed there first.
+Sending the whole codeword to every direct peer can multiply proposer upload.
+Sending disjoint subsets can strand peers that cannot exchange those subsets. We
+need both an authorized seeding policy and a delivery path after seeding.
+
+### Seed offers
+
+The candidate is a negotiated `SeedOffer` selection within `SubscribeParts`. The
+receiver permits any subset of the selected parts up to its existing part and
+byte credits. The proposer chooses the actual indices. This is permission to
+receive seeds, not a promise that every selected index will arrive. Ordinary
+subscriptions continue to request specific coverage. Candidate payload profile
+W1 encodes separate ordinary and seed selections and cancellation actions. The
+[spec rules](../specs/dogwood.md#proposer-seeding-candidate-extension) define
+the remaining requirements before enabling it.
+
+The proposer keeps one upload budget across seed transfers, ordinary
+subscriptions, repairs, and concurrent blocks. It tracks indices already seeded
+or in flight so the initial pass favors new distinct parts. It schedules against
+measured service and receiver credit, not advertised bandwidth. A receiver
+verifies and forwards each seed immediately through its normal subscriptions.
+The proposer retains bounded repair service after the initial pass.
+
+Seed offers should identify parts the receiver can forward through outgoing
+subscriptions. A receiver can also offer a decodable subset for local bootstrap.
+The proposer should prefer eligible recipients with useful outgoing demand. This
+local hint improved static startup in the connected-relay experiment, but does
+not prove downstream reachability. Missing eligible credit must appear as
+degraded seeding, not unsolicited sends or hidden normal-path repair.
+
+### Seed scheduling
+
+For equal-size parts, fixed known peer rates, sufficient any-index seed credit,
+and a shared proposer upload limit, we can minimize the time to seed a chosen
+number of parts. Select the earliest available per-peer service slots, then pace
+their aggregate rate under the proposer limit. The
+[local proof and exhaustive check](dogwood-experiments.md#proposer-seeding-checks)
+establish this limited optimum. It does not minimize network-wide reconstruction
+time or infer changing bandwidth.
+
+| Proposer's peers | Seeding direction | Delivery constraint |
+| --- | --- | --- |
+| One peer | Send enough distinct parts for that peer to decode; test whether to send remaining parity before cancellation. | That peer is the only exit. No routing or parity choice protects against its loss. |
+| Equal-rate peers | Divide the first pass evenly when peers have comparable credit and relay reachability. | Disjoint seeds work only if each downstream group can collect enough distinct parts. |
+| A few fast peers and many slow peers | Assign more seed parts to the fast peers; a slow peer need not receive an initial seed. | Seed recipients still need useful outgoing part routes. Separate relay components are outside the normal topology assumption. |
+
+The 2 MiB local example seeds 40 parts through a 1 Gbps proposer in a minimum
+21.1 ms including the model's framing allowance. With peer rates of
+800/400/200/100/20/5 Mbps, one optimal allocation is 22/11/5/2/0/0 parts. Equal
+assignment takes 632.8 ms to seed every assigned part because it waits for the
+slowest peer. Neither number includes downstream delivery. The source can spend
+more time or bytes to establish a usable path for every receiver.
+
+### Seeding reachability
+
+Assume honest peers, an arbitrary body with no prior body information, one valid
+codeword, retained data, adequate credit, fair eventual service, and
+subscriptions to every part on every relay edge. Remove the proposer from that
+relay graph. Every remaining connected component must receive at least `k`
+distinct seeded indices. This condition is necessary and sufficient for eventual
+reconstruction in this model: fewer than `k` cannot create the missing
+information; `k` distinct parts can spread through the component and let every
+member reconstruct.
+
+Giving each peer some parity does not satisfy that condition. In a star with
+four isolated leaves and `k=4, n=8`, each leaf can receive one data part and one
+parity part yet remain unable to decode. The proposer must supply additional
+parts. More generally, `c` isolated downstream components need at least `c*k*S`
+payload bytes across the proposer cut, even if they request the same indices. A
+seeding budget of one codeword cannot meet every such topology.
+
+Sparse subscriptions have different graphs for different parts. The proposer
+cannot observe global relay connectivity. The design assumes that relays remain
+connected after removing the proposer and have enough upload to carry their
+subscriptions. Each part also needs a subscription path from its seed to its
+receivers; physical connectivity alone does not provide that path.
+
+### Coding stripes
+
+The whole-body codeword remains the current profile. A separate large-body
+candidate uses equal-shape coding stripes. Nodes retain the incoming suppliers
+that delivered one shared reference stripe before reconstruction. They keep the
+part-mask mapping and seed recipients fixed for subsequent stripes of that body.
+Under unchanged availability, adequate credit, and fair service, these retained
+paths can reproduce the reference's delivery. The local paired sweep reduced
+relay upload by 45.8–52.5% without fallback in the tested static cases.
+
+This candidate needs authenticated stripe commitments and identifiers, bounded
+pipeline state, stripe completion semantics, and failure recovery. It cannot
+reuse `FullBlock` for individual stripes. A changed mapping, shape, seed plan,
+or unavailable supplier invalidates the reference argument. The experiment does
+not establish concurrent throughput or single-supplier failure coverage. Do not
+enable stripe pruning under the present profile.
+
+The
+[reference codec scaling test](dogwood-experiments.md#reference-codec-scaling)
+compares the same 64 MiB body at different stripe sizes. With 2 MiB stripes,
+source encoding/root work takes about 179 ms and receiver work takes 382 ms
+under parity-first reception. One 64 MiB codeword takes about 4.46 seconds and
+9.13 seconds respectively. These are serial reference-kernel measurements. They
+support testing 2 MiB stripes and show why the field bound alone cannot select a
+practical codeword size. They do not implement an authenticated stripe profile
+or establish production throughput.
+
+The concurrent follow-up preserves normal delivery at the synthetic 819.2 Mbps
+body rate in its steady cases. Temporary upload changes still cause misses.
+Restoring startup suppliers after a miss does not consistently restore timely
+delivery. The candidate therefore does not complete the adaptive controller.
+
+### Small-block parity and scheduling
+
+More parity for small blocks is worth testing because its absolute proposer cost
+can be small while a repair round trip remains expensive. The actual ratio
+includes rounding: the current `ceil(k/4)` rule already adds 100% parity at
+`k=1` and 50% at `k=2`. A candidate experiment uses 100% parity for `k<=8` and
+25% above that threshold. This is not a selected profile. It must beat duplicate
+forwarding after accounting for padding, encoding, proposer upload, and
+cancellation. At `k=1`, each parity part repeats the same information.
+
+We can also group several block parts into a local scheduling portion. This
+changes assignment granularity, not the coding unit. Every part still has its
+own index, proof, grant charge, and send-once state. Larger portions may reduce
+scheduling work but place more load on one peer at a time. The experiment starts
+with one part per scheduling portion. A portion that changes coding stripes,
+Merkle commitments, or wire messages requires a separate profile design.
+
+## Redundancy and recovery
+
+Parity lets a receiver reconstruct a block despite missing parts. With 32 data
+parts and eight parity parts, it needs any 32 of the 40 parts. To survive one
+supplier's failure without repair, its subscriptions must leave 32 distinct
+parts available from other suppliers.
+
+Assigning more parts to a fast peer can improve delivery, but requires coverage
+elsewhere if that peer fails. Receivers can request additional parity or
+duplicate parts, or accept repair latency. Parity consumes proposer upload;
+duplicates forwarded by relays consume relay upload. The
+[coverage rules](../specs/dogwood.md#distinct-part-coverage) define how receivers
+account for supplier failures, including correlated failures.
+
+When delivery stalls, a receiver requests missing parts from peers advertising
+`FullBlock`. Repair adds a request delay and extra traffic, so normal delivery
+should rarely need it. Grants and deadlines bound repair work. Existing
+full-block download provides final recovery when coded propagation fails.
+
+## Encoding and verification
+
+Dogwood uses systematic Reed–Solomon coding, as described in
+[RFC 5510, section 8](https://www.rfc-editor.org/rfc/rfc5510.html#section-8).
+The receiver verifies each part's Merkle proof before forwarding it and can
+start decoding while other parts arrive. Forwarding never waits for decoding.
+The spec gives an [on-arrival decoding example](../specs/dogwood.md#on-arrival-decoding-example).
+
+A part's Merkle proof establishes membership in the committed codeword. After
+reconstruction, the receiver checks padding and re-encodes the body to verify
+the committed root. It then submits the block for consensus validation.
+
+Changing the body requires new parity and a new Merkle tree. Changing only the
+header preserves both. After mining, the proposer signs the final block hash
+and coding metadata.
+
+## Parameter tuning
+
+The [spec parameter registry](../specs/dogwood.md#parameter-registry) owns the
+definitions, starting values, and change rules. These values make experiments
+comparable; they are not tuned production defaults. We should tune them together
+against the [performance targets](#performance-targets), accounting for proposer
+and relay upload as well as receiver capacity.
+
+| Parameter group | Starting point and rationale | What could change it |
+| --- | --- | --- |
+| Workload and capacity | Use the throughput assumptions in [Performance targets](#performance-targets). | Transaction sizes, forwarding copies, overhead, and block size determine required link capacity. |
+| Part size and mask width | 64 KiB parts; 16 mask bits in experiments bound proof work and route state. | Smaller parts or more bits permit smaller assignment changes but increase overhead. |
+| Codec, parity, and subscribed coverage | Systematic GF(2^16) Reed–Solomon with 25% parity; compare 12.5–100% and duplicate subscriptions. | Proposer seeding time, encoding cost, receiver bytes, and recovery latency jointly determine the ratio. A codec change requires a profile revision. |
+| Proposer seed budget, peers, and portions | Compare one-codeword seeding with repair and ordinary demand; one part per scheduling portion. | Receiver credit, proposer upload, and downstream component coverage can require more copies or a different assignment. |
+| Small-block parity | Keep `ceil(k/4)` in the draft; test 100% parity at `k<=8`. | Absolute upload cost, rounding, and avoided repair delay determine whether a new deterministic profile is useful. |
+| Failure model and startup copies | Test any one supplier loss; zero extra safety parts in the experiment; two selected startup copies where affordable. | Correlated failures and cold-route measurements can justify more coverage. Learned routes may use one copy or retain duplicates. |
+| Decode schedule | Eager on-arrival elimination is a candidate; verify every part before use. | CPU backlog and memory measurements may favor another equivalent schedule. |
+| Delivery and recovery deadlines | Aim for 90% replication around 400 ms, below 500 ms; bound recovery separately. | Geography, topology, block size, and concurrent traffic determine achievable latency. |
+| Assignment budget | Start at 20 parts; test additive steps of one part and a 0.75 decrease factor. | Loaded delivery, queue delay, and eligible misses guide changes across all blocks on a connection. |
+| Observation and migration | Require three race votes and a two-thirds win share; move at most four parts per trial. | Noise, part-mask granularity, and measured settling time constrain faster adaptation. |
+| Challenge funding | Fund extra traffic at 1/32 of completed encoded bytes; use one mask bit per trial. | Ordinary-delivery telemetry or existing duplicates may reduce the needed challenge traffic. |
+| Challenge cadence and retention | Start no faster than 250 ms plus jitter; retain at most two trials, 12 blocks, or 20 seconds. | Rare proposers need a longer bounded opportunity window, not faster empty trials. |
+| Candidate delivery-rate estimator | Test 100 ms samples, at least four deliveries, and an EWMA weight of 0.5. | Application-limited traffic, transport batching and shared ingress require further tests. |
+| Queue and recovery reserves | Test 256 queued parts per link and at most `2k` repair copies per block. | Production needs aggregate byte/work caps and fair service under concurrent assemblies. |
+| History, grants, and retained work | Keep finite height, byte, state, and time limits; production values remain open. | Resource measurements set these caps before interoperability. Idle time or new proposer keys must not reset budgets. |
+| Wire and authentication | Hashes, mapping hash, signature, chain binding, and frame caps require an agreed profile. | These choices require an agreed profile; a receiver cannot tune them unilaterally. |
+
+Local policies can evolve within the spec's bounds as observations accumulate.
+They must record parameter versions with results and avoid interpreting stale
+samples across material workload changes. Wire parameters require negotiation
+before use. Existing grants retain their original authority during a policy
+change.
+
+## Open work
+
+The
+[bounded-recovery follow-up](dogwood-experiments.md#bounded-recovery-follow-up)
+tests sparse routes, failed parents, source caps, small-block parity, and
+scheduling portions. Its star and bridge cuts test behavior outside the normal
+topology assumption. Its repair-heavy completion results do not establish the
+normal throughput path. The
+[connected-network follow-up](dogwood-experiments.md#connected-network-and-transport-follow-up)
+measures completion before fallback and tests local pruning. Its failures keep
+the complete adaptive controller open. The design is not ready for interoperable
+implementation until transport negotiation, chain admission, and production
+resource bounds are selected. W1 fixes candidate payload bytes and signatures.
+
+- [x] Test finite single-block recovery on single-peer, star, bridge, and mesh
+  topologies with equal and mixed relay upload rates.
+- [x] Sweep 25%/100% parity, 16/64 KiB parts, and 1/2/4-part service portions;
+  measure reference encoding costs for small codewords.
+- [x] Specify that repair retries cannot reset credit or the total deadline;
+  require separate per-part accounting inside a scheduling portion.
+- [x] Test sparse connected relay graphs with finite ingress, assumed CPU
+  queues, one-codeword seeding, and separately accounted `FullBlock` fallback.
+- [x] Test simultaneous local pruning and forwardable seed eligibility;
+  identify failures that local coverage does not prevent.
+- [x] Test a fixed-reference stripe pruning candidate under static conditions.
+- [x] Run real TCP allocation tests with shared capacity, a capacity drop,
+  application stalls, loss, and ECN; retain receiver-local feedback as a candidate.
+- [x] Exhaust a finite grant model and test cancellation, exploration funding,
+  loaded cohorts, settling gates, and migration coverage.
+- [x] Test concurrent synthetic bodies with shared upload, ingress, encoding,
+  and reconstruction queues; reject simple restoration as a complete controller.
+- [x] Specify and probe a coinbase-output key commitment for transparent-only
+  V5 transactions; exclude input-script keys backed only by a txid proof.
+- [ ] **Proposer grants:** specify and test `SeedOffer` negotiation, eligibility,
+  credit consumption, expiry, cancellation, and coexistence with ordinary demand.
+  Lifecycle rules, candidate wire encoding, and a finite grant model exist;
+  negotiation and concurrent grant validation remain.
+- [ ] **Proposer scheduling:** test learned bandwidth against the static optimum
+  with changing rates, shared bottlenecks, pending work, and insufficient credit.
+- [ ] **Bootstrap coverage:** test one peer, equal peers, mixed peers, star cuts,
+  bridge peers, and failed header parents under bounded source upload and repair.
+  The finite single-block sweep is complete; add concurrent blocks, changing
+  failures, and measured coding work in the connected push model.
+- [ ] **Overlay delivery:** select and validate a pruning policy that preserves
+  delivery when several receivers adapt. Local coverage and majority wins failed
+  this gate; the fixed-reference stripe candidate needs a separate profile.
+- [ ] **Parity versus copies:** measure proposer encoding and upload, relay
+  upload, receiver bytes, and reconstruction latency under the same failure model.
+- [ ] **Small blocks and portions:** sweep size-dependent parity, part size,
+  scheduling group size, and systematic-first versus parity-first seeding.
+  The initial sweep is complete; test correlated loss and joint CPU/network
+  costs before selecting a body-size threshold or changing the profile.
+- [ ] **Congestion feedback:** integrate receiver-local feedback with standing
+  push, grants, and receiver-wide queue control.
+- [ ] **Controller completeness:** implement settling, migration, stale-history,
+  grant, and cancellation rules omitted by the reduced simulations.
+- [x] Measure equal-body reference codec scaling from 2 MiB stripes to one
+  64 MiB codeword; separate the field bound from practical CPU cost.
+- [ ] **Large bodies:** choose the block interval and body size against the
+  latency target; select the committed-stripe profile and test the resulting burst
+  with measured coding work, bounded memory, and separately measured fallback.
+- [x] Specify W1 payload encoding, tagged hashes, Merkle proofs, signatures,
+  and separate seed cancellation; test bounds and signature context binding.
+- [ ] **Wire and authentication:** finish the production chain adapter,
+  transport negotiation, and aggregate resource limits in the registry.
+
+## Headerchain integration
+
+Headerchain remains responsible for header validation, fork choice, and header
+recovery. The node admits the complete header, including proof of work and
+contextual difficulty, before authenticating metadata or allocating assembly
+state. It then pushes `HeaderMeta` through header gossip without a per-hop
+request exchange. Peers without part subscriptions also receive metadata.
+
+The current header does not commit to the part root or directly identify a
+Dogwood proposer key. The proposed wrapper carries a signature from a key bound
+to the mined block. The candidate binds a 32-byte key in a zero-value coinbase
+output and proves its txid membership at index zero. The
+[spec](../specs/dogwood.md#bind-the-proposer-to-the-proof-of-work) fixes the
+candidate script. A txid proof alone cannot authenticate a key in the V5
+coinbase input script. W1 selects Ed25519 and a chain-bound signature
+transcript. The post-Tachyon adapter remains open. A self-chosen wrapper key
+would let anyone attach conflicting roots to someone else's proof of work.
+
+Nodes accept at most one authenticated metadata variant per block. An
+authenticated conflict stops coded propagation for that block and triggers
+ordinary block recovery.
+
+The [W1 payload profile](../specs/dogwood.md#candidate-payload-profile-w1) fixes
+canonical bytes and cryptographic commitments. The spec leaves the production
+chain adapter, service negotiation, and aggregate resource limits open. Network
+experiments with realistic geography, workloads, and changing peer capacity must
+establish whether the design meets its performance targets.

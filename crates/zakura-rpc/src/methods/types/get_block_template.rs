@@ -2,6 +2,7 @@
 
 pub mod constants;
 pub mod parameters;
+pub(crate) mod precompute;
 pub mod proposal;
 pub mod zip317;
 
@@ -9,7 +10,7 @@ pub mod zip317;
 mod tests;
 
 use std::{
-    collections::{HashSet, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     fmt::{self},
     sync::{Arc, Mutex},
     time::Duration,
@@ -34,7 +35,7 @@ use zakura_chain::{
     chain_tip::ChainTip,
     parameters::{
         subsidy::{is_zip234_active, parent_nsm_value_balance},
-        Network,
+        Network, NetworkUpgrade,
     },
     serialization::{DateTime32, ZcashDeserializeInto},
     transaction::VerifiedUnminedTx,
@@ -82,29 +83,87 @@ const TEMPLATE_BUILD_WAIT: Duration = Duration::from_secs(30);
 pub(crate) struct TemplateRejections {
     pub(crate) parent: Option<block::Hash>,
     pub(crate) revision: u64,
-    rejected: HashSet<String>,
-    prepared: VecDeque<String>,
-    pub(crate) saturated: bool,
+    records: ParentRecords,
+    /// The records of the parent before [`Self::parent`].
+    ///
+    /// A caller that validated an older tip can select it after a newer one. Keeping the newer
+    /// parent's records here restores them when a later caller selects it again, so a stale
+    /// caller cannot erase a withdrawal.
+    previous: Option<(block::Hash, ParentRecords)>,
 }
 
-impl TemplateRejections {
-    pub(crate) fn set_parent(&mut self, parent: block::Hash) {
-        if self.parent != Some(parent) {
-            self.parent = Some(parent);
-            self.rejected.clear();
-            self.prepared.clear();
-            self.saturated = false;
-        }
-    }
+/// The work IDs recorded for one template parent.
+#[derive(Clone, Debug, Default)]
+struct ParentRecords {
+    rejected: HashSet<String>,
+    prepared: VecDeque<String>,
+    saturated: bool,
+}
 
-    pub(crate) fn reject(&mut self, parent: block::Hash, work_id: &str) -> bool {
-        if self.parent != Some(parent) || self.contains(work_id) {
+impl ParentRecords {
+    /// Returns `true` if `work_id` was not already rejected.
+    fn reject(&mut self, work_id: &str) -> bool {
+        if self.contains(work_id) {
             return false;
         }
         if self.rejected.len() == 64 {
             self.saturated = true;
         } else {
             self.rejected.insert(work_id.to_owned());
+        }
+        true
+    }
+
+    fn contains(&self, work_id: &str) -> bool {
+        self.saturated || self.rejected.contains(work_id)
+    }
+
+    fn mark_prepared(&mut self, work_id: &str) {
+        if !self.prepared.iter().any(|id| id == work_id) {
+            if self.prepared.len() == 64 {
+                self.prepared.pop_front();
+            }
+            self.prepared.push_back(work_id.to_owned());
+        }
+    }
+}
+
+impl TemplateRejections {
+    pub(crate) fn set_parent(&mut self, parent: block::Hash) {
+        if self.parent == Some(parent) {
+            return;
+        }
+
+        let restored = match self.previous.take() {
+            Some((previous_parent, records)) if previous_parent == parent => records,
+            _ => ParentRecords::default(),
+        };
+        let replaced = std::mem::replace(&mut self.records, restored);
+        self.previous = self.parent.map(|old_parent| (old_parent, replaced));
+        self.parent = Some(parent);
+    }
+
+    /// Returns the records for `parent`, if it is the current or the previous parent.
+    fn records_for(&mut self, parent: block::Hash) -> Option<&mut ParentRecords> {
+        if self.parent == Some(parent) {
+            return Some(&mut self.records);
+        }
+        self.previous
+            .as_mut()
+            .filter(|(previous_parent, _)| *previous_parent == parent)
+            .map(|(_, records)| records)
+    }
+
+    /// Returns `true` if this rejection withdraws work for the current parent.
+    ///
+    /// Retains a rejection for the previous parent without a notification.
+    pub(crate) fn reject(&mut self, parent: block::Hash, work_id: &str) -> bool {
+        let is_current = self.parent == Some(parent);
+        let Some(records) = self.records_for(parent) else {
+            return false;
+        };
+        if !records.reject(work_id) || !is_current {
+            return false;
         }
         self.revision = self
             .revision
@@ -114,24 +173,25 @@ impl TemplateRejections {
     }
 
     pub(crate) fn contains(&self, work_id: &str) -> bool {
-        self.saturated || self.rejected.contains(work_id)
+        self.records.contains(work_id)
+    }
+
+    pub(crate) fn saturated(&self) -> bool {
+        self.records.saturated
     }
 
     pub(crate) fn needs_fallback(&self) -> bool {
-        self.saturated || !self.rejected.is_empty()
+        self.records.saturated || !self.records.rejected.is_empty()
     }
 
     pub(crate) fn mark_prepared(&mut self, parent: block::Hash, work_id: &str) {
-        if self.parent == Some(parent) && !self.prepared.iter().any(|id| id == work_id) {
-            if self.prepared.len() == 64 {
-                self.prepared.pop_front();
-            }
-            self.prepared.push_back(work_id.to_owned());
+        if let Some(records) = self.records_for(parent) {
+            records.mark_prepared(work_id);
         }
     }
 
     pub(crate) fn is_prepared(&self, work_id: &str) -> bool {
-        self.prepared.iter().any(|id| id == work_id) && !self.contains(work_id)
+        self.records.prepared.iter().any(|id| id == work_id) && !self.contains(work_id)
     }
 
     pub(crate) fn withdrawn(&self, work_id: &str) -> bool {
@@ -396,7 +456,7 @@ impl BlockTemplateResponse {
     #[allow(clippy::too_many_arguments, clippy::unwrap_in_result)]
     pub(crate) fn new_internal(
         net: &Network,
-        precomputed_coinbase: Option<TransactionTemplate<amount::NegativeOrZero>>,
+        coinbase_cache: &CoinbaseCache,
         miner_params: &MinerParams,
         chain_info: &GetBlockTemplateChainInfo,
         long_poll_id: LongPollId,
@@ -451,23 +511,22 @@ impl BlockTemplateResponse {
             .sum::<amount::Result<Amount<NonNegative>>>()
             .expect("mempool tx fees must be non-negative");
 
-        let coinbase_txn = match precomputed_coinbase {
-            Some(coinbase_txn) => coinbase_txn,
-            // ZIP 234 derives the subsidy from the money reserve after the parent, which
-            // is the chain tip this template builds on.
-            None => TransactionTemplate::new_coinbase(
-                net,
-                height,
-                miner_params,
-                txs_fee,
-                if is_zip234_active(net, height) {
-                    Some(parent_nsm_value_balance(
-                        chain_info.value_pools.nsm_value_balance_amount(),
-                    )?)
-                } else {
-                    None
-                },
-            )?,
+        // After reissuance, equal-height parents can have different NSM balances, so the
+        // cache key includes the balance.
+        let nsm_value_balance = coinbase_nsm_value_balance(net, height, chain_info)?;
+        let coinbase_txn = match coinbase_cache.get(height, txs_fee, nsm_value_balance) {
+            Some(coinbase) => coinbase,
+            None => {
+                let coinbase = TransactionTemplate::new_coinbase(
+                    net,
+                    height,
+                    miner_params,
+                    txs_fee,
+                    nsm_value_balance,
+                )?;
+                coinbase_cache.store(height, txs_fee, nsm_value_balance, coinbase.clone());
+                coinbase
+            }
         };
 
         let default_roots = DefaultRoots::from_coinbase(
@@ -538,6 +597,19 @@ impl BlockTemplateResponse {
             submit_old,
         })
     }
+}
+
+/// Returns the parent's NSM value balance that the coinbase at `height` depends on, if ZIP 234 is
+/// active at `height`.
+pub(crate) fn coinbase_nsm_value_balance(
+    net: &Network,
+    height: block::Height,
+    chain_info: &GetBlockTemplateChainInfo,
+) -> Result<Option<Amount<NonNegative>>, TransactionError> {
+    is_zip234_active(net, height)
+        .then(|| parent_nsm_value_balance(chain_info.value_pools.nsm_value_balance_amount()))
+        .transpose()
+        .map_err(Into::into)
 }
 
 fn new_work_id() -> String {
@@ -647,6 +719,24 @@ impl MinerParams {
         self.memo.as_ref()
     }
 
+    /// Returns `true` if the coinbase transaction that pays these parameters has a shielded
+    /// output, which needs a proof that takes seconds to build.
+    ///
+    /// This mirrors the receiver that `TransactionTemplate::new_coinbase()` pays at `height`: a
+    /// unified address pays its Orchard receiver only from NU5, and falls back to its transparent
+    /// receiver when it has no payable shielded receiver.
+    pub(crate) fn has_shielded_component(&self, net: &Network, height: block::Height) -> bool {
+        match &self.addr {
+            Address::Unified(addr) => {
+                addr.sapling().is_some()
+                    || (addr.orchard().is_some()
+                        && NetworkUpgrade::current(net, height) >= NetworkUpgrade::Nu5)
+            }
+            Address::Sapling(_) => true,
+            _ => false,
+        }
+    }
+
     /// Randomizes the memo.
     pub fn randomize_memo(&mut self) {
         let mut random = [0u8; 512];
@@ -689,6 +779,90 @@ impl From<zcash_address::ConversionError<&'static str>> for MinerParamsError {
     }
 }
 
+/// The inputs that determine a coinbase transaction for fixed miner parameters: the block height,
+/// the transaction fees, and after ZIP 234, the parent's NSM value balance.
+type CoinbaseKey = (
+    block::Height,
+    Amount<NonNegative>,
+    Option<Amount<NonNegative>>,
+);
+
+/// The number of coinbase transactions [`CoinbaseCache`] retains.
+const COINBASE_CACHE_CAPACITY: usize = 4;
+
+/// Caches recently built coinbase transactions for the next block, keyed on the height, the fees,
+/// and after ZIP 234, the parent's NSM value balance.
+///
+/// These inputs determine the coinbase for fixed miner parameters, so requests that wait for
+/// construction capacity reuse the proof of the request before them. The cache retains the
+/// zero-fee coinbase and recent fee variants.
+#[derive(Clone, Default)]
+pub(crate) struct CoinbaseCache(
+    Arc<Mutex<HashMap<CoinbaseKey, TransactionTemplate<amount::NegativeOrZero>>>>,
+);
+
+impl CoinbaseCache {
+    /// Returns the cached coinbase transaction if it was built for `height`, `fee`, and the
+    /// parent's `nsm_value_balance`.
+    pub(crate) fn get(
+        &self,
+        height: block::Height,
+        fee: Amount<NonNegative>,
+        nsm_value_balance: Option<Amount<NonNegative>>,
+    ) -> Option<TransactionTemplate<amount::NegativeOrZero>> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&(height, fee, nsm_value_balance))
+            .cloned()
+    }
+
+    /// Stores `coinbase` as the cached transaction for `height`, `fee`, and the parent's
+    /// `nsm_value_balance`.
+    pub(crate) fn store(
+        &self,
+        height: block::Height,
+        fee: Amount<NonNegative>,
+        nsm_value_balance: Option<Amount<NonNegative>>,
+        coinbase: TransactionTemplate<amount::NegativeOrZero>,
+    ) {
+        let mut map = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        // Evict entries for lower heights so the map follows the chain. A build for a superseded
+        // parent can finish after builds for the current tip, so it must not evict higher heights.
+        map.retain(|&(h, _, _), _| h >= height);
+
+        let key = (height, fee, nsm_value_balance);
+        let zero = Amount::<NonNegative>::zero();
+        while !map.contains_key(&key) && map.len() >= COINBASE_CACHE_CAPACITY {
+            // Evict fee variants before zero-fee coinbases, which build empty templates for new
+            // tips. Then evict lower heights first, because a lower height is usually a
+            // superseded parent's.
+            let Some(evict) = map
+                .keys()
+                .copied()
+                .max_by_key(|&(h, f, _)| (f != zero, std::cmp::Reverse(h)))
+            else {
+                break;
+            };
+            map.remove(&evict);
+        }
+        map.insert(key, coinbase);
+    }
+
+    /// Removes every cached coinbase, so the next template build constructs its own.
+    #[cfg(test)]
+    pub(crate) fn clear(&self) {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+    }
+}
+
 /// Handler for the `getblocktemplate` RPC.
 #[derive(Clone)]
 pub struct GetBlockTemplateHandler<BlockVerifierRouter, SyncStatus>
@@ -698,6 +872,12 @@ where
 {
     /// Miner parameters, including the miner address, data, and memo.
     miner_params: Option<MinerParams>,
+
+    /// Shares coinbase transactions across template builds.
+    coinbase_cache: CoinbaseCache,
+
+    /// Shares templates built by the background updater.
+    template_cache: Option<precompute::TemplateCache>,
 
     /// The chain verifier, used for submitting blocks.
     block_verifier_router: BlockVerifierRouter,
@@ -721,8 +901,8 @@ where
     /// Coalesces detached template preparation work to the newest template.
     template_preparation_queue: TemplatePreparationQueue<BlockTemplateResponse>,
 
-    /// Shared by foreground construction and long-poll coinbase precomputation.
-    template_build_slots: Arc<Semaphore>,
+    /// Bounds proof work across foreground requests and the background updater.
+    pub(crate) template_build_slots: Arc<Semaphore>,
 
     /// Retains failures so late subscribers cannot miss template withdrawal.
     pub(crate) template_rejections: watch::Sender<TemplateRejections>,
@@ -745,6 +925,8 @@ where
         let optimistic_block_inventory = conf.optimistic_block_inventory;
         Self {
             miner_params: MinerParams::new(net, conf).ok(),
+            coinbase_cache: CoinbaseCache::default(),
+            template_cache: Some(precompute::TemplateCache::default()),
             block_verifier_router,
             sync_status,
             mined_block_sender: mined_block_sender
@@ -763,27 +945,7 @@ where
         &self,
         build: impl FnOnce() -> T + Send + 'static,
     ) -> RpcResult<T> {
-        let permit = tokio::time::timeout(
-            TEMPLATE_BUILD_WAIT,
-            self.template_build_slots.clone().acquire_owned(),
-        )
-        .await
-        .map_err(|_| {
-            ErrorObject::owned(
-                LegacyCode::Misc.into(),
-                "timed out waiting for mining template construction capacity",
-                None::<()>,
-            )
-        })?
-        .map_misc_error()?;
-
-        tokio::task::spawn_blocking(move || {
-            // Dropping the RPC future cannot release capacity while this job still owns work.
-            let _permit = permit;
-            build()
-        })
-        .await
-        .map_misc_error()
+        run_template_build(self.template_build_slots.clone(), build).await
     }
 
     pub(crate) fn reserve_mined_submission(
@@ -797,6 +959,16 @@ where
     /// Returns the miner parameters, including the address, data, and memo.
     pub fn miner_params(&self) -> Option<&MinerParams> {
         self.miner_params.as_ref()
+    }
+
+    /// Returns the shared coinbase cache.
+    pub(crate) fn coinbase_cache(&self) -> CoinbaseCache {
+        self.coinbase_cache.clone()
+    }
+
+    /// Returns the template cache for this handler's miner parameters.
+    pub(crate) fn template_cache(&self) -> Option<&precompute::TemplateCache> {
+        self.template_cache.as_ref()
     }
 
     /// Returns the sync status.
@@ -832,6 +1004,14 @@ where
         self.template_preparation_queue.enqueue(template)
     }
 
+    /// Returns `true` if background validation already prepared or rejected `template`'s work.
+    pub(crate) fn template_preparation_settled(&self, template: &BlockTemplateResponse) -> bool {
+        let rejections = self.template_rejections.borrow();
+        rejections.parent == Some(template.previous_block_hash)
+            && (rejections.is_prepared(template.work_id())
+                || rejections.contains(template.work_id()))
+    }
+
     /// Returns the newest queued template or marks the worker idle.
     pub(crate) fn next_template_preparation(&self) -> Option<BlockTemplateResponse> {
         self.template_preparation_queue.next_or_finish()
@@ -842,6 +1022,9 @@ where
         if let Some(miner_params) = &mut self.miner_params {
             miner_params.randomize_data();
             miner_params.randomize_memo();
+            // This clone now builds different coinbases from the updater.
+            self.coinbase_cache = CoinbaseCache::default();
+            self.template_cache = None;
         }
     }
 }
@@ -1087,4 +1270,29 @@ where
 
     // Check that the mempool and state were in sync when we made the requests
     Ok((last_seen_tip_hash == chain_tip_hash).then_some((transactions, transaction_dependencies)))
+}
+
+/// Runs proof work while retaining the shared permit across cancellation.
+async fn run_template_build<T: Send + 'static>(
+    slots: Arc<Semaphore>,
+    build: impl FnOnce() -> T + Send + 'static,
+) -> RpcResult<T> {
+    let permit = tokio::time::timeout(TEMPLATE_BUILD_WAIT, slots.acquire_owned())
+        .await
+        .map_err(|_| {
+            ErrorObject::owned(
+                LegacyCode::Misc.into(),
+                "timed out waiting for mining template construction capacity",
+                None::<()>,
+            )
+        })?
+        .map_misc_error()?;
+
+    tokio::task::spawn_blocking(move || {
+        // Dropping the RPC future cannot release capacity while this job still owns work.
+        let _permit = permit;
+        build()
+    })
+    .await
+    .map_misc_error()
 }

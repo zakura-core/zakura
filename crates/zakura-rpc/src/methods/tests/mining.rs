@@ -397,6 +397,9 @@ fn template_build_paths_retain_capacity_when_cancelled() {
                 .unwrap()
                 .try_into_template()
                 .unwrap();
+            // Requests for the same parent reuse the initial coinbase. Forget it, so each path
+            // below constructs one.
+            rpc.gbt.coinbase_cache().clear();
             let gate = BlockingPoolGate::new().await;
             tokio::time::pause();
 
@@ -781,6 +784,8 @@ fn superseded_deadline_build_does_not_resume_long_polling() {
             .unwrap()
             .try_into_template()
             .unwrap();
+        // The deadline build reuses the initial coinbase unless the test forgets it.
+        rpc.gbt.coinbase_cache().clear();
         let gate = BlockingPoolGate::new().await;
         tokio::time::pause();
 
@@ -943,6 +948,8 @@ fn recovery_construction_yields_and_rebuilds_on_parent_change() {
             ))
             .await
             .unwrap();
+            // Recovery reuses this template's coinbase unless the test forgets it.
+            rpc.gbt.coinbase_cache().clear();
             rpc.gbt.template_rejections.send_modify(|state| {
                 state.set_parent(chain.tip_hash);
                 state.reject(chain.tip_hash, "rejected-work");

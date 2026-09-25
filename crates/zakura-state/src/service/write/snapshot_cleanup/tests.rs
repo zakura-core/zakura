@@ -26,6 +26,8 @@ use crate::{
     TransactionLocation,
 };
 
+mod benchmark;
+
 const TIMEOUT: Duration = Duration::from_secs(10);
 
 struct Probe {

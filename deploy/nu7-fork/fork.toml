@@ -62,6 +62,16 @@ rpc_listen_addr = "127.0.0.1:18232"
 listen_addr = "0.0.0.0:18233"
 metrics_endpoint = "127.0.0.1:9999"
 
+[catch_up]
+# The temporary public-Testnet node `fork.py catch-up` runs over the pristine
+# cache. Its ports must not collide with the fork nodes'.
+listen_addr = "0.0.0.0:18433"
+rpc_listen_addr = "127.0.0.1:18252"
+log_file = "/var/log/zakura/zakura-seed-catch-up.log"
+# Caught up once the tip block is at most this old.
+max_tip_age_minutes = 20
+timeout_minutes = 240
+
 [droplet]
 # Only used by `fork.py provision`.
 name = "zakura-nu7-fork-1"

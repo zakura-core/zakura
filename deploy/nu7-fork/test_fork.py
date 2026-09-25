@@ -4,6 +4,7 @@ Run with `python3 -m unittest test_fork` from `deploy/nu7-fork`.
 """
 
 import importlib.util
+import json
 import os
 import subprocess
 import tempfile
@@ -198,6 +199,122 @@ class RemoteMinerConfig(unittest.TestCase):
             rendered = self.render(table)
             self.assertIn('"seed.example:18233"', rendered, table)
             self.assertIn('miner_address = "t' + "A" * 34 + '"', rendered, table)
+
+
+class FakeHost:
+    """Records remote commands and answers the few whose output fork.py reads."""
+
+    def __init__(self, seed_tip=None):
+        self.commands = []
+        self.seed_tip = seed_tip
+
+    def ssh(self, host, *remote, capture=False, check=True):
+        command = " ".join(remote)
+        self.commands.append(command)
+        stdout, code = "", 0
+        if command.startswith("ls -d"):
+            stdout = "/var/lib/zakura-pristine/state/v29/testnet\n"
+        elif command.startswith("cat ") and command.endswith(fork.SEED_TIP_FILE):
+            if self.seed_tip is None:
+                code = 1
+            else:
+                stdout = json.dumps(self.seed_tip)
+        return subprocess.CompletedProcess([], code, stdout, "")
+
+
+class CaughtUpSeed(unittest.TestCase):
+    TIP = {"height": 4_390_000, "hash": "ab" * 32, "time": 1_790_000_000}
+
+    def config(self):
+        config = base_config(PEER)
+        config["host"]["pristine_cache_dir"] = "/var/lib/zakura-pristine"
+        config["host"]["snapshot_mount"] = "/mnt/snapshots"
+        config["droplet"]["volume_name"] = "zakura-pr-nu7-fork-state"
+        return config
+
+    def seed(self, host):
+        with mock.patch.object(fork, "ssh", side_effect=host.ssh), \
+                mock.patch.object(fork, "db_format_version", return_value=29):
+            fork.cmd_seed(self.config(), types.SimpleNamespace(force=False))
+        return host.commands
+
+    def test_the_recorded_tip_is_the_seed_tip(self):
+        host = FakeHost(self.TIP)
+        with mock.patch.object(fork, "ssh", side_effect=host.ssh):
+            self.assertEqual(fork.seeded_tip_height(self.config()), 4_390_000)
+        # The finalized-only `tip-height` is not consulted.
+        self.assertFalse(any("tip-height" in command for command in host.commands))
+
+    def test_a_caught_up_seed_copies_the_non_finalized_backup(self):
+        commands = self.seed(FakeHost(self.TIP))
+        copies = [c for c in commands if "cp -a" in c and "non_finalized_state" in c]
+        self.assertEqual(len(copies), 2)
+        self.assertIn("/var/lib/zakura-fork/non_finalized_state/nu7fork", copies[0])
+        self.assertIn("/var/lib/zakura-fork2/non_finalized_state/nu7fork", copies[1])
+
+    def test_without_catch_up_only_the_finalized_state_is_seeded(self):
+        # The finalized tip is what the activation height is computed from, so
+        # non-finalized blocks above it must not be seeded.
+        commands = self.seed(FakeHost(None))
+        self.assertFalse(any("cp -a" in c and "non_finalized_state" in c for c in commands))
+
+
+class CatchUp(unittest.TestCase):
+    def run_catch_up(self, tip_times):
+        host = FakeHost()
+        now = 1_790_000_000
+        answers = iter(tip_times)
+
+        def fake_rpc(host_name, addr, method, params=None):
+            self.assertEqual(addr, "127.0.0.1:18252")
+            if method == "getblockchaininfo":
+                self.block_time = next(answers)
+                return {"blocks": 4_390_000, "bestblockhash": "cd" * 32}
+            return {"time": self.block_time}
+
+        config = CaughtUpSeed().config()
+        with mock.patch.object(fork, "ssh", side_effect=host.ssh), \
+                mock.patch.object(fork, "rpc", side_effect=fake_rpc), \
+                mock.patch.object(fork.time, "time", return_value=now), \
+                mock.patch.object(fork.time, "sleep"):
+            fork.cmd_catch_up(config, types.SimpleNamespace())
+        return host.commands
+
+    def test_waits_for_a_fresh_tip_then_stops_before_recording_it(self):
+        now = 1_790_000_000
+        commands = self.run_catch_up([now - 6 * 3600, now - 300])
+
+        self.assertTrue(commands[0].startswith("rm -f /var/lib/zakura-pristine/seed-tip.json"))
+        started = next(i for i, c in enumerate(commands) if c.startswith("systemctl reset-failed"))
+        stopped = next(i for i, c in enumerate(commands) if c.startswith("systemctl stop"))
+        recorded = next(i for i, c in enumerate(commands) if "seed-tip.json <<" in c)
+        self.assertLess(started, stopped)
+        # The tip is only written once the node has stopped and flushed its state.
+        self.assertLess(stopped, recorded)
+        self.assertIn('"height": 4390000', commands[recorded])
+        self.assertIn('"time": 1789999700', commands[recorded])
+
+    def test_a_node_that_never_catches_up_is_stopped_and_nothing_is_recorded(self):
+        host = FakeHost()
+        config = CaughtUpSeed().config()
+        config["catch_up"] = {"timeout_minutes": 0}
+        with mock.patch.object(fork, "ssh", side_effect=host.ssh), \
+                mock.patch.object(fork, "rpc", return_value={"blocks": 1, "bestblockhash": "x",
+                                                             "time": 0}), \
+                mock.patch.object(fork.time, "sleep"):
+            with self.assertRaises(fork.ForkError):
+                fork.cmd_catch_up(config, types.SimpleNamespace())
+        self.assertTrue(any(c.startswith("systemctl stop") for c in host.commands))
+        self.assertFalse(any("seed-tip.json <<" in c for c in host.commands))
+
+    def test_the_temporary_node_runs_the_public_testnet_over_the_pristine_cache(self):
+        text = fork.catch_up_config(CaughtUpSeed().config(), fork.CATCH_UP_DEFAULTS)
+        config = __import__("tomllib").loads(text)
+        self.assertEqual(config["network"]["network"], "Testnet")
+        self.assertNotIn("initial_testnet_peers", config["network"])
+        self.assertEqual(config["state"]["cache_dir"], "/var/lib/zakura-pristine")
+        self.assertEqual(config["state"]["storage_mode"], "pruned")
+        self.assertEqual(config["rpc"]["listen_addr"], "127.0.0.1:18252")
 
 
 class RenderedNodeConfig(unittest.TestCase):

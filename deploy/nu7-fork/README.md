@@ -48,6 +48,7 @@ cd deploy/nu7-fork
 
 ./fork.py provision            # droplet + a clone of the newest Testnet state snapshot
 $EDITOR fork.toml              # set host.ssh_string to the new droplet
+./fork.py catch-up             # sync the seed to the public Testnet tip
 ./fork.py plan                 # what heights would this fork use?
 ./fork.py up                   # seed, render, deploy
 ./fork.py status               # height and NU7 status
@@ -160,9 +161,25 @@ convention, then copies `state/v<db-format>/testnet` out of it into each fork
 node's own cache. The peer gets its own copy: the fork nodes are pruned, so a
 node that started empty could not sync the inherited history from the other.
 
-Only the finalized database is seeded. `tip-height` reads only that, and the NU7
-activation height is computed from it; the snapshot's non-finalized backup would
-add blocks above that tip.
+### Catching the seed up to the public tip
+
+A snapshot's tip is hours to days old, and a fork cannot be mined on a tip that
+old: every block time is capped at the median time of the previous blocks plus
+90 minutes, so the miner's blocks never get far enough past their parents to use
+the Testnet minimum-difficulty rule, and difficulty ratchets up until the fork
+stalls.
+
+`fork.py catch-up` fixes that before seeding. It starts a temporary public-Testnet
+node over `host.pristine_cache_dir`, on its own ports (`[catch_up]` in
+`fork.toml`), and waits until the tip block is at most 20 minutes old. Then it
+stops the node, which flushes the finalized database and its non-finalized
+backup, and records the tip it reached over RPC in `seed-tip.json`.
+
+`zakurad` keeps the last thousand or so blocks outside the finalized database, and
+`tip-height` reads only the finalized part. After `catch-up`, `seed` also copies
+the non-finalized backup, and the activation height is computed from the recorded
+tip. Without `catch-up`, only the finalized database is seeded, because non-finalized
+blocks above the tip `tip-height` reports would put NU7 below the loaded chain.
 
 That snapshot is taken in `tip` mode, which is a **pruned** database, so
 `host.storage_mode` defaults to `pruned` to match. Describing a pruned seed as an

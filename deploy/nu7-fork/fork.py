@@ -12,6 +12,7 @@ value balance rather than starting from nothing.
 Typical use:
 
     ./fork.py provision          # create the droplet + clone a Testnet snapshot
+    ./fork.py catch-up           # sync the pristine copy to the public Testnet tip
     ./fork.py up                 # seed, plan, render, deploy
     ./fork.py status             # height and NU7 status
     ./fork.py reconfigure        # re-seed and redeploy at a new activation height
@@ -27,6 +28,7 @@ import re
 import shlex
 import subprocess
 import sys
+import time
 import tomllib
 from pathlib import Path
 
@@ -161,11 +163,72 @@ def state_dir_name(network_name: str) -> str:
     return network_name.lower()
 
 
-def seeded_tip_height(config: dict) -> int:
-    """Read the tip of the pristine Testnet seed, using the node's own binary.
+# Written into the pristine cache by `catch-up`, once the temporary node has stopped.
+SEED_TIP_FILE = "seed-tip.json"
 
-    Runs before the fork node starts, so nothing else holds the database.
+# The temporary public-Testnet node `catch-up` runs over the pristine cache.
+CATCH_UP_UNIT = "zakura-fork-seed-catch-up"
+CATCH_UP_CONFIG = "/etc/zakura/zakura-seed-catch-up.toml"
+CATCH_UP_DEFAULTS = {
+    # Off the fork nodes' ports, so it can run beside them.
+    "listen_addr": "0.0.0.0:18433",
+    "rpc_listen_addr": "127.0.0.1:18252",
+    "log_file": "/var/log/zakura/zakura-seed-catch-up.log",
+    # The seed counts as caught up once its tip block is at most this old. The
+    # fork's first block may be at most 90 minutes past the median time of the
+    # tip, so a tip older than that cannot be mined on.
+    "max_tip_age_minutes": 20,
+    "timeout_minutes": 240,
+}
+
+
+def rpc(host: str, rpc_addr: str, method: str, params: list | None = None) -> object:
+    """Call a node's JSON-RPC on `host`, returning the result."""
+    body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": params or []})
+    result = ssh(
+        host,
+        f"curl -s --max-time 10 -X POST http://{rpc_addr}/ "
+        f"-H 'content-type: application/json' -d {shlex.quote(body)}",
+        capture=True, check=False,
+    )
+    try:
+        response = json.loads(result.stdout)
+    except json.JSONDecodeError as error:
+        raise ForkError(f"{method}: no JSON-RPC response from {rpc_addr}: "
+                        f"{result.stdout or result.stderr}") from error
+    if response.get("error"):
+        raise ForkError(f"{method}: {response['error']}")
+    return response["result"]
+
+
+def recorded_seed_tip(config: dict) -> dict | None:
+    """The tip `catch-up` recorded for the pristine cache, or None if it never ran."""
+    host = config["host"]["ssh_string"]
+    path = f"{config['host']['pristine_cache_dir']}/{SEED_TIP_FILE}"
+    result = ssh(host, f"cat {shlex.quote(path)}", capture=True, check=False)
+    if result.returncode != 0:
+        return None
+    try:
+        tip = json.loads(result.stdout)
+        return {"height": int(tip["height"]), "hash": str(tip["hash"]), "time": int(tip["time"])}
+    except (json.JSONDecodeError, KeyError, TypeError, ValueError) as error:
+        raise ForkError(f"{path} is malformed; re-run `fork.py catch-up`") from error
+
+
+def seeded_tip_height(config: dict) -> int:
+    """Read the tip of the pristine Testnet seed.
+
+    After `catch-up`, this is the tip it recorded over RPC, which includes the
+    non-finalized blocks `seed` copies. Otherwise it is the finalized tip, read with
+    the node's own binary before the fork node starts, so nothing else holds the
+    database.
     """
+    recorded = recorded_seed_tip(config)
+    if recorded is not None:
+        age = (time.time() - recorded["time"]) / 60
+        print(f"[plan] caught-up seed tip {recorded['height']}, block time {age:.0f} min ago")
+        return recorded["height"]
+
     host = config["host"]["ssh_string"]
     pristine = config["host"]["pristine_cache_dir"]
     binary = config["host"].get("bin_path", "/usr/local/bin/zakurad")
@@ -484,6 +547,15 @@ def cmd_seed(config: dict, args) -> int:
             f"restores the previous major format in place on first start"
         )
 
+    # After `catch-up`, the pristine non-finalized backup holds the ~1000 most recent
+    # blocks, and the recorded tip includes them. Without `catch-up` the tip is read
+    # from the finalized database alone, so the backup must not be seeded: it would
+    # put blocks above the tip the activation height is computed from.
+    caught_up = recorded_seed_tip(config) is not None
+    non_finalized = f"{pristine_root}/non_finalized_state/testnet"
+    if caught_up:
+        print(f"[seed] caught-up seed: also copying {non_finalized}")
+
     if args.force:
         # A running node keeps writing database files into the directory being
         # replaced, which would silently corrupt the fresh copy.
@@ -500,10 +572,10 @@ def cmd_seed(config: dict, args) -> int:
         # copy would win over a fresh seed.
         targets = [f"{root}/state/v{version}/{name}"
                    for version in sorted({seed_version, code_version})]
-        # Only the finalized database is seeded, because `tip-height` reads only that
-        # and the activation height is relative to it. A previous run's non-finalized
-        # backup would reload blocks from the old fork, so it goes too.
-        targets.append(f"{root}/non_finalized_state/{name}")
+        # A previous run's non-finalized backup would reload blocks from the old
+        # fork, so it goes too.
+        non_finalized_target = f"{root}/non_finalized_state/{name}"
+        targets.append(non_finalized_target)
 
         print(f"[seed] {found} -> {state_target}")
         quoted = " ".join(shlex.quote(target) for target in targets)
@@ -517,7 +589,91 @@ def cmd_seed(config: dict, args) -> int:
         # -a preserves the RocksDB file set exactly; --link-dest would share inodes
         # with the pristine copy and let the fork corrupt its own seed.
         ssh(host, f"cp -a {shlex.quote(found)} {shlex.quote(state_target)}")
+        if caught_up:
+            ssh(host, f"mkdir -p {shlex.quote(str(Path(non_finalized_target).parent))} && "
+                      f"cp -a {shlex.quote(non_finalized)} {shlex.quote(non_finalized_target)}")
     print("[seed] done")
+    return 0
+
+
+def catch_up_config(config: dict, settings: dict) -> str:
+    """The temporary node's config: the public Testnet, over the pristine cache."""
+    pristine = config["host"]["pristine_cache_dir"]
+    storage_mode = config["host"].get("storage_mode", "pruned")
+    return "\n".join([
+        "# Written by deploy/nu7-fork/fork.py catch-up; removed when it finishes.",
+        "[network]",
+        'network = "Testnet"',
+        f'listen_addr = "{settings["listen_addr"]}"',
+        f'cache_dir = "{pristine}"',
+        "",
+        "[state]",
+        f'cache_dir = "{pristine}"',
+        f'storage_mode = "{storage_mode}"',
+        "",
+        "[rpc]",
+        f'listen_addr = "{settings["rpc_listen_addr"]}"',
+        "enable_cookie_auth = false",
+        "",
+        "[tracing]",
+        f'log_file = "{settings["log_file"]}"',
+        "use_color = false",
+        "",
+    ])
+
+
+def cmd_catch_up(config: dict, args) -> int:
+    """Sync the pristine Testnet cache to the public tip, and record that tip.
+
+    A seed whose tip is hours old cannot be mined on: the fork's first block time is
+    capped at the tip's median time plus 90 minutes. The temporary node syncs the
+    pristine cache from public peers, then stops, flushing the finalized database and
+    its non-finalized backup. The tip it reached is recorded over RPC, because
+    `tip-height` sees only the finalized part.
+    """
+    host = config["host"]["ssh_string"]
+    pristine = config["host"]["pristine_cache_dir"]
+    binary = config["host"].get("bin_path", "/usr/local/bin/zakurad")
+    settings = {**CATCH_UP_DEFAULTS, **config.get("catch_up", {})}
+    rpc_addr = settings["rpc_listen_addr"]
+    unit = shlex.quote(CATCH_UP_UNIT)
+    tip_file = shlex.quote(f"{pristine}/{SEED_TIP_FILE}")
+
+    # The recorded tip describes the cache only until the node writes to it again.
+    ssh(host, f"rm -f {tip_file}")
+    ssh(host, f"mkdir -p /etc/zakura $(dirname {shlex.quote(settings['log_file'])}) && "
+              f"cat > {CATCH_UP_CONFIG} <<'EOF'\n{catch_up_config(config, settings)}EOF")
+    ssh(host, f"systemctl reset-failed {unit} 2>/dev/null; "
+              f"systemd-run --unit={unit} --collect --property=TimeoutStopSec=600 "
+              f"{shlex.quote(binary)} -c {CATCH_UP_CONFIG} start")
+    print(f"[catch-up] started {CATCH_UP_UNIT}; syncing {pristine} to the public Testnet tip")
+
+    deadline = time.monotonic() + settings["timeout_minutes"] * 60
+    max_age = settings["max_tip_age_minutes"] * 60
+    try:
+        while True:
+            try:
+                info = rpc(host, rpc_addr, "getblockchaininfo")
+                header = rpc(host, rpc_addr, "getblockheader", [info["bestblockhash"], True])
+                age = time.time() - header["time"]
+                print(f"[catch-up] height {info['blocks']}, tip block {age / 60:.0f} min old")
+                if age <= max_age:
+                    tip = {"height": info["blocks"], "hash": info["bestblockhash"],
+                           "time": header["time"]}
+                    break
+            except ForkError as error:
+                print(f"[catch-up] waiting for RPC: {error}")
+            if time.monotonic() > deadline:
+                raise ForkError(f"the seed did not reach a tip younger than "
+                                f"{settings['max_tip_age_minutes']} min in time")
+            time.sleep(30)
+    finally:
+        # Stopping flushes the database and the non-finalized backup the fork seeds from.
+        ssh(host, f"systemctl stop {unit}; rm -f {CATCH_UP_CONFIG}", check=False)
+
+    ssh(host, f"! systemctl is-active --quiet {unit}")
+    ssh(host, f"cat > {tip_file} <<'EOF'\n{json.dumps(tip)}\nEOF")
+    print(f"[catch-up] recorded seed tip {tip['height']} ({tip['hash']})")
     return 0
 
 
@@ -575,21 +731,8 @@ def cmd_up(config: dict, args) -> int:
 
 
 def cmd_status(config: dict, args) -> int:
-    host = config["host"]["ssh_string"]
-    rpc = config["host"]["rpc_listen_addr"]
-    body = json.dumps({
-        "jsonrpc": "2.0", "id": 1, "method": "getblockchaininfo", "params": [],
-    })
-    result = ssh(
-        host,
-        f"curl -s --max-time 10 -X POST http://{rpc}/ "
-        f"-H 'content-type: application/json' -d {shlex.quote(body)}",
-        capture=True,
-    )
-    try:
-        info = json.loads(result.stdout)["result"]
-    except (json.JSONDecodeError, KeyError) as error:
-        raise ForkError(f"unexpected RPC response: {result.stdout}") from error
+    info = rpc(config["host"]["ssh_string"], config["host"]["rpc_listen_addr"],
+               "getblockchaininfo")
 
     print(f"chain    {info['chain']}")
     print(f"height   {info['blocks']}")
@@ -623,6 +766,11 @@ def main() -> int:
     provision.add_argument("--plan", action="store_true",
                            help="validate the DigitalOcean catalog without creating anything")
     provision.set_defaults(func=cmd_provision)
+
+    catch_up = sub.add_parser(
+        "catch-up", help="sync the pristine Testnet cache to the public tip and record it"
+    )
+    catch_up.set_defaults(func=cmd_catch_up)
 
     seed = sub.add_parser("seed", help="copy the pristine Testnet state into the fork")
     seed.add_argument("--force", action="store_true", help="replace existing fork state")

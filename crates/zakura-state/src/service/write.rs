@@ -60,9 +60,11 @@ use crate::service::{
     non_finalized_state::Chain,
 };
 
+mod snapshot_cleanup;
 mod vct_authentication_sweep;
 mod vct_write_retry;
 
+use snapshot_cleanup::SnapshotCleanup;
 use vct_authentication_sweep::VctAuthenticationSweeper;
 use vct_write_retry::{
     VctRepairTrigger, VctWriteRetryCause, VctWriteRetryManager, VctWriteRetryWait,
@@ -1512,6 +1514,7 @@ fn validate_and_commit_non_finalized_with_metrics(
         chain_tip_sender,
         non_finalized_state_sender,
         backup_dir_path,
+        snapshot_cleanup,
     ),
     fields(chains = non_finalized_state.chain_count())
 )]
@@ -1520,6 +1523,7 @@ fn update_latest_chain_channels(
     chain_tip_sender: &mut ChainTipSender,
     non_finalized_state_sender: &watch::Sender<NonFinalizedState>,
     backup_dir_path: Option<&Path>,
+    snapshot_cleanup: &SnapshotCleanup<NonFinalizedState>,
 ) -> block::Height {
     let best_chain = non_finalized_state.best_chain().expect("unexpected empty non-finalized state: must commit at least one block before updating channels");
 
@@ -1535,8 +1539,7 @@ fn update_latest_chain_channels(
         non_finalized_state.write_to_backup(backup_dir_path);
     }
 
-    // If the final receiver was just dropped, ignore the error.
-    let _ = non_finalized_state_sender.send(non_finalized_state.clone());
+    snapshot_cleanup.publish(non_finalized_state_sender, non_finalized_state.clone());
 
     chain_tip_sender.set_best_non_finalized_tip(tip_block);
 
@@ -1549,12 +1552,13 @@ fn update_channels_after_operator_change(
     chain_tip_sender: &mut ChainTipSender,
     non_finalized_state_sender: &watch::Sender<NonFinalizedState>,
     backup_dir_path: Option<&Path>,
+    snapshot_cleanup: &SnapshotCleanup<NonFinalizedState>,
 ) {
     if non_finalized_state.is_chain_set_empty() {
         if let Some(backup_dir_path) = backup_dir_path {
             non_finalized_state.write_to_backup(backup_dir_path);
         }
-        let _ = non_finalized_state_sender.send(non_finalized_state.clone());
+        snapshot_cleanup.publish(non_finalized_state_sender, non_finalized_state.clone());
         chain_tip_sender.clear_best_non_finalized_tip(
             finalized_state
                 .db
@@ -1568,6 +1572,7 @@ fn update_channels_after_operator_change(
             chain_tip_sender,
             non_finalized_state_sender,
             backup_dir_path,
+            snapshot_cleanup,
         );
     }
 }
@@ -2260,6 +2265,7 @@ impl WriteBlockWorkerTask {
         )
     )]
     pub fn run(mut self) -> BlockWriteTaskExit {
+        let snapshot_cleanup = SnapshotCleanup::new();
         let Self {
             finalized_block_write_receiver,
             non_finalized_block_write_receiver,
@@ -2878,6 +2884,7 @@ impl WriteBlockWorkerTask {
                             chain_tip_sender,
                             non_finalized_state_sender,
                             backup_dir_path.as_deref(),
+                            &snapshot_cleanup,
                         );
                     }
                     let _ = rsp_tx.send(result);
@@ -2921,6 +2928,7 @@ impl WriteBlockWorkerTask {
                             chain_tip_sender,
                             non_finalized_state_sender,
                             backup_dir_path.as_deref(),
+                            &snapshot_cleanup,
                         );
                         if !evicted.is_empty() {
                             let _ = non_finalized_write_update_sender
@@ -3107,6 +3115,7 @@ impl WriteBlockWorkerTask {
                 chain_tip_sender,
                 non_finalized_state_sender,
                 backup_dir_path.as_deref(),
+                &snapshot_cleanup,
             );
 
             notify_block_committed(block_commit_sender, child_hash);
@@ -3158,6 +3167,7 @@ impl WriteBlockWorkerTask {
                     chain_tip_sender,
                     non_finalized_state_sender,
                     backup_dir_path.as_deref(),
+                    &snapshot_cleanup,
                 );
             }
 

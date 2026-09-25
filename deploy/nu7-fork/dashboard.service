@@ -1,0 +1,18 @@
+[Unit]
+Description=Public NU7 fork status feed
+After=network-online.target zakurad.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/bin/python3 /opt/zakura-nu7-dashboard/dashboard.py --config /etc/zakura/zakura.toml
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

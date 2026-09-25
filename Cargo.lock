@@ -7567,6 +7567,47 @@ dependencies = [
 ]
 
 [[package]]
+name = "zakura-fork-miner"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "color-eyre",
+ "hex",
+ "tokio",
+ "toml 1.1.2+spec-1.1.0",
+ "tracing",
+ "tracing-subscriber",
+ "zakura-chain",
+ "zakura-network",
+ "zakura-node-services",
+ "zakura-rpc",
+]
+
+[[package]]
+name = "zakura-fork-txload"
+version = "0.1.0"
+dependencies = [
+ "blake2b_simd",
+ "clap",
+ "color-eyre",
+ "hex",
+ "rand 0.10.2",
+ "secp256k1",
+ "serde_json",
+ "tokio",
+ "toml 1.1.2+spec-1.1.0",
+ "tracing",
+ "tracing-subscriber",
+ "zakura-address",
+ "zakura-chain",
+ "zakura-network",
+ "zakura-node-services",
+ "zakura-orchard",
+ "zakura-reddsa",
+ "zakura-rpc",
+]
+
+[[package]]
 name = "zakura-halo2-gadgets"
 version = "2.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

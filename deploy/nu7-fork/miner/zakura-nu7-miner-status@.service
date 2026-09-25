@@ -1,0 +1,19 @@
+[Unit]
+Description=NU7 remote miner %i health endpoint
+After=network-online.target zakurad.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /opt/zakura-nu7-miner/remote-status.py --miner-service zakura-nu7-remote-miner@%i.service
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

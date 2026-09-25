@@ -16,7 +16,15 @@ import time
 from pathlib import Path
 
 REGIONS = ("nyc1", "sfo3", "nyc3")
-TAGS = {"zakura-pr-node", "zakura-image-bake", "zakura-mempool-load"}
+# The reaper sweeps zakura-pr-node, zakura-image-bake and zakura-mempool-load by
+# age. zakura-nu7-fork is deliberately absent from that sweep: a fork testnet
+# outlives any single CI run and is torn down by deploy/nu7-fork/fork.py.
+TAGS = {
+    "zakura-pr-node",
+    "zakura-image-bake",
+    "zakura-mempool-load",
+    "zakura-nu7-fork",
+}
 
 
 def doctl(*args):

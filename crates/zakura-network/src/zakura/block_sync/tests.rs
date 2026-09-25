@@ -16171,6 +16171,58 @@ fn observed_size_estimates_preserve_reservations_and_memory_exposure() {
     );
 }
 
+#[test]
+fn observed_size_estimates_keep_the_measured_size_of_a_deferred_body() {
+    let queue = work_queue_with(0, (2..=100).map(|h| needed(h, BlockSizeEstimate::Unknown)));
+    let deferred = test_work_scope().bind(7, std::num::NonZeroU64::new(1).unwrap());
+    queue.take_for_request(
+        block::Height(2),
+        block::Height(2),
+        1,
+        u64::MAX,
+        7,
+        deferred.request_id,
+    );
+    queue.mark_reserved_for_owner(deferred, [block::Height(2)]);
+    queue
+        .receive_body_for_owner(deferred, block::Height(2), 1_500_000)
+        .unwrap();
+    // The sequencer defers a speculative body that does not fit retained capacity.
+    assert!(queue.defer_received_for_owner(
+        deferred,
+        block::Height(2),
+        block::Hash([2; 32]),
+        1_500_000,
+        block::Height(0),
+    ));
+    for h in 3..=100 {
+        let request = std::num::NonZeroU64::new(u64::from(h)).unwrap();
+        let owner = test_work_scope().bind(8, request);
+        queue.take_for_request(block::Height(h), block::Height(h), 1, u64::MAX, 8, request);
+        queue.mark_reserved_for_owner(owner, [block::Height(h)]);
+        queue
+            .receive_body_for_owner(owner, block::Height(h), 1024)
+            .unwrap();
+    }
+    queue.extend(test_work_scope(), [needed(101, BlockSizeEstimate::Unknown)]);
+    let learned = queue
+        .pending_item(block::Height(101))
+        .unwrap()
+        .estimated_bytes;
+    assert!(learned < 1_500_000, "small bodies must lower the estimate");
+    queue.advance_floor(block::Height(1));
+    let retry = queue.take_for_request(
+        block::Height(2),
+        block::Height(2),
+        1,
+        u64::MAX,
+        7,
+        std::num::NonZeroU64::new(2).unwrap(),
+    );
+    assert!(!retry[0].1.reservation_has_size_hint);
+    assert_eq!(retry[0].1.estimated_bytes, 1_500_000);
+}
+
 #[tokio::test(start_paused = true)]
 async fn observed_size_estimates_wake_adapt_and_expire_without_changing_hints() {
     let queue = work_queue_with(0, (1..=201).map(|h| needed(h, BlockSizeEstimate::Unknown)));

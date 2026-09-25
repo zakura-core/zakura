@@ -1166,8 +1166,7 @@ impl SequencerTask {
                 .saturating_add(reorder_decoded_attributed_memory_bytes)
                 .saturating_add(applying_decoded_attributed_memory_bytes);
         // Retained bodies do not charge the request budget.
-        self.budget
-            .audit(self.work.reserved_bytes(), "block-sync sequencer view");
+        self.work.audit_budget(&self.budget);
         let next = SequencerView {
             verified_tip: self.sequencer.verified_tip(),
             verified_hash: self.verified_block_hash,

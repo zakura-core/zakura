@@ -289,3 +289,18 @@ consumer misses the retained update history, it refreshes its existing queued wi
 in bounded state queries. Accurate first deliveries add no correction writes or
 refresh queries. Size-only changes leave verification observations, header generations,
 and body-work epochs intact.
+
+## Unknown sizes
+
+A peer without committed sizes sends a hint of `0`, which the queue records as
+`Unknown`. The queue schedules such a body with one shared estimate instead of
+`MAX_BLOCK_BYTES`. Each accepted body updates the estimate once with a 1/8-weight
+moving average, clamped to `[floor, MAX_BLOCK_BYTES]`. The estimate starts at
+`MAX_BLOCK_BYTES`, returns to it after 60 seconds without an accepted body, and
+resets with the frontier.
+
+Known hints always take precedence, including advertised, committed, and filled
+sizes. A local measured size remains a minimum for a retry. An issued request keeps
+its reservation and hint provenance until it settles. Memory admission still charges
+every outstanding unknown body at `MAX_BLOCK_BYTES`. A body larger than a local
+estimate is not reported as a size mismatch, because no peer made a claim.

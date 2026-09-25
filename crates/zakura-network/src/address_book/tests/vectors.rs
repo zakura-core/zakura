@@ -11,7 +11,10 @@ use zakura_chain::{
 };
 
 use crate::{
-    constants::{DEFAULT_MAX_CONNS_PER_IP, MAX_ADDRS_IN_ADDRESS_BOOK, MAX_PEER_MISBEHAVIOR_SCORE},
+    constants::{
+        DEFAULT_MAX_CONNS_PER_IP, MAX_ADDRS_IN_ADDRESS_BOOK, MAX_PEER_MISBEHAVIOR_SCORE,
+        MIN_PEER_RECONNECTION_DELAY,
+    },
     meta_addr::{MetaAddr, MetaAddrChange},
     protocol::external::types::PeerServices,
     AddressBook,
@@ -300,4 +303,167 @@ fn test_reconnection_peers_skips_recently_updated_ip<
     } else {
         assert_ne!(next_reconnection_peer, None,);
     }
+}
+
+/// Peers learned from inbound connections are neither dialed nor cached.
+///
+/// Their port is the peer's ephemeral source port rather than a listener, so
+/// dialing them wastes the crawler's connection budget. They are also connected
+/// right now, which makes them rank as maximally active — without the filter
+/// they crowd dialable peers out of the disk cache and a restarted node comes
+/// back with mostly undialable candidates.
+#[test]
+fn inbound_peers_are_not_reconnection_or_cache_candidates() {
+    let inbound_addr = "127.0.0.1:54321".parse().unwrap();
+    let outbound_addr = "127.0.0.2:8233".parse().unwrap();
+
+    let instant_now = Instant::now();
+    let chrono_now = Utc::now();
+    let local_now: DateTime32 = chrono_now.try_into().expect("will succeed until 2038");
+
+    let inbound_peer = MetaAddr::new_connected(inbound_addr, &PeerServices::NODE_NETWORK, true)
+        .into_new_meta_addr(instant_now, local_now);
+    let outbound_peer = MetaAddr::new_connected(outbound_addr, &PeerServices::NODE_NETWORK, false)
+        .into_new_meta_addr(instant_now, local_now);
+
+    let address_book = AddressBook::new_with_addrs(
+        "0.0.0.0:0".parse().unwrap(),
+        &Mainnet,
+        DEFAULT_MAX_CONNS_PER_IP,
+        MAX_ADDRS_IN_ADDRESS_BOOK,
+        Span::current(),
+        vec![inbound_peer, outbound_peer],
+    );
+
+    // Both peers are active for gossip, so activity is not what separates them.
+    assert!(inbound_peer.is_active_for_gossip(chrono_now));
+    assert!(outbound_peer.is_active_for_gossip(chrono_now));
+
+    // Look at the book after the reconnection delay, so neither peer is held
+    // back by `was_recently_updated`.
+    let later_instant = instant_now + MIN_PEER_RECONNECTION_DELAY * 2;
+    let later_chrono = chrono_now
+        + chrono::Duration::from_std(MIN_PEER_RECONNECTION_DELAY * 2)
+            .expect("test reconnection delay fits in chrono");
+
+    let reconnection_addrs: Vec<_> = address_book
+        .reconnection_peers(later_instant, later_chrono)
+        .map(|peer| peer.addr())
+        .collect();
+    assert_eq!(reconnection_addrs, vec![outbound_addr]);
+
+    let cacheable_addrs: Vec<_> = address_book
+        .cacheable(chrono_now)
+        .into_iter()
+        .map(|peer| peer.addr())
+        .collect();
+    assert_eq!(cacheable_addrs, vec![outbound_addr]);
+}
+
+/// An inbound connection does not stop us dialing the same peer's listener.
+///
+/// `most_recent_by_ip` spaces out our own outbound connections to one IP, but it does
+/// not record which direction the connection came from. An inbound peer refreshes its
+/// entry with every message it sends, so it holds its IP's slot for as long as it stays
+/// connected — and the address that slot bars us from dialing is a different address on
+/// that IP, the peer's listener. Peers that connect to us are the ones most active on
+/// the network, so this silently removes the best dial candidates, in proportion to how
+/// many inbound connections we accept.
+#[test]
+fn inbound_connections_do_not_block_dialing_the_same_ip() {
+    // The peer's ephemeral source port, and the listener it is really reachable on.
+    let inbound_addr = "127.0.0.1:54321".parse().unwrap();
+    let listener_addr = "127.0.0.1:8233".parse().unwrap();
+    // A peer we dialed ourselves, and another address at that same IP.
+    let outbound_addr = "127.0.0.2:8233".parse().unwrap();
+    let same_ip_as_outbound = "127.0.0.2:8234".parse().unwrap();
+
+    let instant_now = Instant::now();
+    let chrono_now = Utc::now();
+    let local_now: DateTime32 = chrono_now.try_into().expect("will succeed until 2038");
+
+    let inbound_peer = MetaAddr::new_connected(inbound_addr, &PeerServices::NODE_NETWORK, true)
+        .into_new_meta_addr(instant_now, local_now);
+    let outbound_peer = MetaAddr::new_connected(outbound_addr, &PeerServices::NODE_NETWORK, false)
+        .into_new_meta_addr(instant_now, local_now);
+    let gossiped = |addr| {
+        MetaAddr::new_gossiped_meta_addr(addr, PeerServices::NODE_NETWORK, local_now)
+            .new_gossiped_change()
+            .expect("recently gossiped peer creates an address book change")
+            .into_new_meta_addr(instant_now, local_now)
+    };
+
+    let address_book = AddressBook::new_with_addrs(
+        "0.0.0.0:0".parse().unwrap(),
+        &Mainnet,
+        // Only a limit of one enables the per-IP cache under test.
+        DEFAULT_MAX_CONNS_PER_IP,
+        MAX_ADDRS_IN_ADDRESS_BOOK,
+        Span::current(),
+        vec![
+            inbound_peer,
+            gossiped(listener_addr),
+            outbound_peer,
+            gossiped(same_ip_as_outbound),
+        ],
+    );
+
+    let reconnection_addrs: Vec<_> = address_book
+        .reconnection_peers(instant_now, chrono_now)
+        .map(|peer| peer.addr())
+        .collect();
+
+    // The listener is dialable even though its IP holds a live inbound connection,
+    // while the address sharing an IP with a peer we dialed ourselves is still spaced
+    // out, which is what this cache is for.
+    assert_eq!(reconnection_addrs, vec![listener_addr]);
+}
+
+/// Addresses we have never connected to ourselves are not written to the disk cache.
+///
+/// The cache file stores bare socket addresses, so an entry read back from disk has
+/// no record of where it came from: it is re-added as an ordinary initial peer, with
+/// no inbound flag. Caching an address on another peer's word therefore launders it,
+/// and the ephemeral source ports that inbound peers gossip around the network
+/// survive every restart. Requiring a response of our own is the only property that
+/// outlives the round trip through the cache file.
+#[test]
+fn peers_we_have_never_connected_to_are_not_cached() {
+    let gossiped_addr = "127.0.0.1:54321".parse().unwrap();
+    let connected_addr = "127.0.0.2:8233".parse().unwrap();
+
+    let instant_now = Instant::now();
+    let chrono_now = Utc::now();
+    let local_now: DateTime32 = chrono_now.try_into().expect("will succeed until 2038");
+
+    let gossiped_peer =
+        MetaAddr::new_gossiped_meta_addr(gossiped_addr, PeerServices::NODE_NETWORK, local_now)
+            .new_gossiped_change()
+            .expect("recently gossiped peer creates an address book change")
+            .into_new_meta_addr(instant_now, local_now);
+    let connected_peer =
+        MetaAddr::new_connected(connected_addr, &PeerServices::NODE_NETWORK, false)
+            .into_new_meta_addr(instant_now, local_now);
+
+    let address_book = AddressBook::new_with_addrs(
+        "0.0.0.0:0".parse().unwrap(),
+        &Mainnet,
+        DEFAULT_MAX_CONNS_PER_IP,
+        MAX_ADDRS_IN_ADDRESS_BOOK,
+        Span::current(),
+        vec![gossiped_peer, connected_peer],
+    );
+
+    // The gossiped peer passes every other cache filter: it is not inbound, and its
+    // gossiped last seen time makes it active for gossip.
+    assert!(!gossiped_peer.is_inbound());
+    assert!(gossiped_peer.is_active_for_gossip(chrono_now));
+    assert!(!gossiped_peer.has_ever_responded());
+
+    let cacheable_addrs: Vec<_> = address_book
+        .cacheable(chrono_now)
+        .into_iter()
+        .map(|peer| peer.addr())
+        .collect();
+    assert_eq!(cacheable_addrs, vec![connected_addr]);
 }

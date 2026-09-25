@@ -31,6 +31,15 @@ release binary had no NU7 branch at all and the fork could not activate.
 `provision` additionally needs `doctl` on PATH and a DigitalOcean token. The
 other subcommands only need SSH access to the host.
 
+`plan` and `up` read the seed's tip with the host's own `zakurad tip-height`, so
+the host needs a `zakurad` at `/usr/local/bin/zakurad` and a config at
+`/etc/zakura/zakura.toml` naming `storage_mode = "pruned"`. A freshly provisioned
+droplet has neither; install them before the first `up`.
+
+`deploy` and `up` build `zakurad` on the machine running `fork.py`, through
+`deploy/deployer/deploy.py build`, and ship that binary. Run them from a Linux
+x86_64 host, not a Mac.
+
 ## Quick start
 
 ```sh
@@ -146,7 +155,13 @@ seed, not to the public chain.
 `fork.py provision` attaches a clone of the Testnet state snapshot but nothing
 mounts it, because in CI that is `pr-node-run.sh`'s job. `fork.py seed` mounts it
 at `host.snapshot_mount` using DigitalOcean's `/dev/disk/by-id/scsi-0DO_Volume_*`
-convention, then copies `state/v<db-format>/testnet` out of it.
+convention, then copies `state/v<db-format>/testnet` out of it into each fork
+node's own cache. The peer gets its own copy: the fork nodes are pruned, so a
+node that started empty could not sync the inherited history from the other.
+
+Only the finalized database is seeded. `tip-height` reads only that, and the NU7
+activation height is computed from it; the snapshot's non-finalized backup would
+add blocks above that tip.
 
 That snapshot is taken in `tip` mode, which is a **pruned** database, so
 `host.storage_mode` defaults to `pruned` to match. Describing a pruned seed as an
@@ -230,7 +245,26 @@ is what makes repeated reconfiguration cheap: `host.pristine_cache_dir` keeps
 the untouched Testnet seed, and each run copies it into a fresh fork directory.
 Never point the node at the pristine copy directly.
 
+`reconfigure` stops both fork nodes before it deletes their state, then removes
+the fork's state under both the seed's and the code's database versions, because
+`zakurad` moves a previous-version seed forward on first start. It also removes
+the fork's `non_finalized_state` backup, so the previous run's blocks are not
+reloaded. `fork.py` refuses a `network_name` of `Mainnet`, `Testnet` or
+`Regtest`, and a cache directory that overlaps the pristine seed.
+
+`fork.py deploy` deploys the nodes one at a time. `deploy.py` deploys in
+parallel and stages every node at the same `/tmp` paths, so two nodes on one
+host would otherwise install each other's files.
+
 ## Why each setting is the way it is
+
+**`network = { ... }`, not `network = "Testnet"`.** The public Testnet's
+parameters are fixed: `zakurad` rejects `[network.testnet_parameters]` beside
+`network = "Testnet"`. The deployer writes the fork parameters as the
+`[network.network]` table instead. `test_fork.py` keeps
+`miner/testdata/fork-node.toml` equal to the deployer's output, and the miner's
+`rendered_fork_config_loads_in_zakurad` test loads that file with `zakurad`'s own
+config type.
 
 **Distinct `network_magic`.** Without it the fork dials real Testnet peers,
 rejects their blocks once NU7 activates, and bans them. The magic is what makes

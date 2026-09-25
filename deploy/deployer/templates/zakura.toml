@@ -2,7 +2,7 @@
 # Placeholders ({{NAME}}) are substituted at deploy time from the node config.
 
 [network]
-network = "{{NETWORK}}"
+{{NETWORK_LINE}}
 listen_addr = "{{LISTEN_ADDR}}"
 {{IDENTITY_DIR}}
 {{NETWORK_CACHE_DIR}}

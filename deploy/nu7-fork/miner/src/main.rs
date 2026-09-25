@@ -363,3 +363,32 @@ async fn main() -> Result<()> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The deployer's rendered fork node config, kept in sync with the renderer by
+    /// `test_fork.py`. Loading it here proves zakurad accepts the shape the deployer
+    /// writes, which a TOML parser alone cannot.
+    #[test]
+    fn rendered_fork_config_loads_in_zakurad() -> Result<()> {
+        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("testdata/fork-node.toml");
+
+        let network = network_from_config(&fixture)?;
+
+        assert_eq!(network.to_string(), "Nu7Fork");
+        assert!(!network.is_default_testnet());
+        assert_eq!(
+            NetworkUpgrade::Nu7.activation_height(&network),
+            Some(Height(4_400_010)),
+        );
+        // The public Testnet upgrades survive: a partial activation list would
+        // silently drop them.
+        assert_eq!(
+            NetworkUpgrade::Nu6_3.activation_height(&network),
+            Some(Height(4_134_000)),
+        );
+        Ok(())
+    }
+}

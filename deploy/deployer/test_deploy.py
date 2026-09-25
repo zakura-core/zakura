@@ -108,7 +108,7 @@ class BuildCacheTests(unittest.TestCase):
                 old.append(path)
 
             with mock.patch.dict(os.environ, {deploy.BUILD_CACHE_RETAIN_ENV: "3"}):
-                deploy.prune_cached_binaries(cache_dir, f"zakurad-{current_sha}")
+                deploy.prune_cached_binaries(cache_dir, current_sha)
 
             remaining = {path.name for path in cache_dir.iterdir()}
             self.assertEqual(remaining, {
@@ -250,7 +250,7 @@ class ObservabilityRenderingTests(NodeBuilder, unittest.TestCase):
 
 
 class TestnetParametersRenderingTests(NodeBuilder, unittest.TestCase):
-    """A configured testnet such as the NU7 fork renders [network.testnet_parameters]."""
+    """A configured testnet such as the NU7 fork renders as the [network.network] table."""
 
     FORK_PARAMS = {
         "network_name": "Nu7Fork",
@@ -276,14 +276,33 @@ class TestnetParametersRenderingTests(NodeBuilder, unittest.TestCase):
     def test_omitted_when_unset(self):
         config = tomllib.loads(deploy.render_node_config(self.node()))
 
+        self.assertEqual(config["network"]["network"], "Testnet")
         self.assertNotIn("testnet_parameters", config["network"])
+
+    def test_configured_testnet_replaces_the_public_network_name(self):
+        rendered = deploy.render_node_config(self.node(testnet_parameters=self.FORK_PARAMS))
+        config = tomllib.loads(rendered)
+
+        # zakurad rejects [network.testnet_parameters] beside `network = "Testnet"`,
+        # because the public Testnet's parameters are fixed. The parameters must be
+        # the `network` value itself.
+        self.assertIsInstance(config["network"]["network"], dict)
+        self.assertNotIn("testnet_parameters", config["network"])
+        self.assertNotIn('network = "Testnet"', rendered)
+
+    def test_parameters_on_a_non_testnet_node_are_refused(self):
+        for network in ("Mainnet", "Regtest"):
+            with self.assertRaises(deploy.DeployError, msg=network):
+                deploy.render_node_config(
+                    self.node(network=network, testnet_parameters=self.FORK_PARAMS)
+                )
 
     def test_fork_parameters_round_trip(self):
         config = tomllib.loads(deploy.render_node_config(
             self.node(testnet_parameters=self.FORK_PARAMS)
         ))
 
-        params = config["network"]["testnet_parameters"]
+        params = config["network"]["network"]
         self.assertEqual(params["network_name"], "Nu7Fork")
         self.assertEqual(params["network_magic"], [240, 13, 202, 254])
         self.assertEqual(params["initial_nsm_value_balance"], 55_768_414_957)
@@ -295,7 +314,7 @@ class TestnetParametersRenderingTests(NodeBuilder, unittest.TestCase):
             self.node(testnet_parameters=self.FORK_PARAMS)
         ))
 
-        heights = config["network"]["testnet_parameters"]["activation_heights"]
+        heights = config["network"]["network"]["activation_heights"]
         # An unquoted "NU6.1" would parse as a nested table, silently dropping the
         # height, and a partial list wipes every upgrade above it in the builder.
         self.assertEqual(heights["NU6.1"], 3_536_500)
@@ -308,8 +327,32 @@ class TestnetParametersRenderingTests(NodeBuilder, unittest.TestCase):
             "lockbox_disbursements": [{"address": "t2Lockbox", "amount": 0}],
         })))
 
-        disbursements = config["network"]["testnet_parameters"]["lockbox_disbursements"]
+        disbursements = config["network"]["network"]["lockbox_disbursements"]
         self.assertEqual(disbursements, [{"address": "t2Lockbox", "amount": 0}])
+
+    def test_tables_nested_in_an_array_of_tables_render_inline(self):
+        streams = [{
+            "height_range": {"start": 1, "end": 2},
+            "recipients": [{"receiver": "Deferred", "numerator": 12, "addresses": []}],
+        }]
+        config = tomllib.loads(deploy.render_node_config(self.node(testnet_parameters={
+            "network_name": "Nu7Fork",
+            "funding_streams": streams,
+        })))
+
+        self.assertEqual(config["network"]["network"]["funding_streams"], streams)
+
+    def test_strings_are_escaped(self):
+        name = 'quote " backslash \\ newline \n'
+        config = tomllib.loads(deploy.render_node_config(self.node(testnet_parameters={
+            "network_name": name,
+        })))
+
+        self.assertEqual(config["network"]["network"]["network_name"], name)
+
+    def test_a_null_value_is_refused(self):
+        with self.assertRaises(deploy.DeployError):
+            deploy.render_node_config(self.node(testnet_parameters={"network_name": None}))
 
     def test_empty_peer_list_renders_for_an_incompatible_testnet(self):
         config = tomllib.loads(deploy.render_node_config(self.node(
@@ -333,7 +376,7 @@ class TestnetParametersRenderingTests(NodeBuilder, unittest.TestCase):
         )))
 
         self.assertEqual(config["network"]["zakura"]["listen_addr"], "0.0.0.0:8234")
-        self.assertEqual(config["network"]["testnet_parameters"]["network_name"], "Nu7Fork")
+        self.assertEqual(config["network"]["network"]["network_name"], "Nu7Fork")
 
 
 class ConfigKeyTests(unittest.TestCase):

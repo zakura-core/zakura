@@ -43,6 +43,7 @@ use crate::{
 use crate::request::Spend;
 
 use self::{counted_set::CountedSet, index::TransparentTransfers};
+use super::CreatedUtxos;
 
 mod counted_set;
 pub mod index;
@@ -106,11 +107,11 @@ pub struct ChainInner {
     /// Note that these UTXOs may not be unspent.
     /// Outputs can be spent by later transactions or blocks in the chain.
     ///
-    /// Share immutable output payloads when cloning chain snapshots. Membership and
-    /// spend indexes remain independent for each chain.
+    /// Share output index partitions and immutable payloads when cloning snapshots.
+    /// Membership and spend indexes remain independent for each chain.
     //
     // TODO: replace OutPoint with OutputLocation?
-    pub(crate) created_utxos: HashMap<transparent::OutPoint, Arc<transparent::OrderedUtxo>>,
+    pub(crate) created_utxos: CreatedUtxos,
     /// The spending transaction ids by [`transparent::OutPoint`]s spent by `blocks`,
     /// including spent outputs created by earlier transactions or blocks in the chain.
     ///

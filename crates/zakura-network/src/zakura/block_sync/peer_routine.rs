@@ -1911,7 +1911,7 @@ impl PeerRoutine {
             // request slot.
             let Some(estimate) = self
                 .work
-                .release_active_reserved_height_for_owner(owner, height)
+                .receive_body_for_owner(owner, height, serialized_bytes)
             else {
                 return false;
             };
@@ -2581,6 +2581,68 @@ mod tests {
         assert!(
             exposure <= config.max_reorder_lookahead_bytes + block::MAX_BLOCK_BYTES,
             "unknown-size takes must fit the look-ahead headroom: {exposure}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn late_active_body_trains_unknown_estimate() {
+        use super::super::work_queue::RequestWrite;
+        use zakura_chain::serialization::ZcashDeserializeInto;
+
+        let body: Arc<block::Block> = Arc::new(
+            zakura_test::vectors::BLOCK_MAINNET_1_BYTES
+                .zcash_deserialize_into()
+                .unwrap(),
+        );
+        let (mut routine, _outbound, _events) = status_test_routine();
+        routine.handle_status(BlockSyncStatus {
+            servable_low: block::Height(1),
+            servable_high: block::Height(2),
+            ..BlockSyncStatus::default()
+        });
+        let scope = super::super::test_work_scope();
+        routine.work.extend(
+            scope,
+            [
+                (block::Height(1), body.hash(), BlockSizeEstimate::Unknown),
+                (
+                    block::Height(2),
+                    block::Hash([2; 32]),
+                    BlockSizeEstimate::Unknown,
+                ),
+            ],
+        );
+        // Another peer owns the reissued request for height 1.
+        let request = std::num::NonZeroU64::new(1).unwrap();
+        let items = routine.work.take_for_request(
+            block::Height(1),
+            block::Height(1),
+            1,
+            u64::MAX,
+            99,
+            request,
+        );
+        let claim = RequestWrite::new(
+            scope.bind(99, request),
+            items,
+            Arc::clone(&routine.work),
+            routine.budget.clone(),
+            CancellationToken::new(),
+        );
+        assert!(claim.publish(|| {}));
+
+        // This routine's own request timed out, so its body arrives unmatched.
+        let bytes = u64::try_from(zakura_test::vectors::BLOCK_MAINNET_1_BYTES.len()).unwrap();
+        routine.handle_body(body, Some(bytes), None, None).await;
+
+        assert!(
+            routine
+                .work
+                .pending_item(block::Height(2))
+                .unwrap()
+                .estimated_bytes
+                < block::MAX_BLOCK_BYTES,
+            "an accepted late body must train the unknown-size estimate"
         );
     }
 

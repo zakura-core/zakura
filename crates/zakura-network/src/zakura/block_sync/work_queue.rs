@@ -628,6 +628,7 @@ impl WorkQueue {
 
     /// End the receipt reservation and retire any queued request it invalidates.
     /// Returns all released bytes, including the request's other unsent heights.
+    #[cfg(test)]
     pub(super) fn release_active_reserved_height_for_owner(
         &self,
         owner: zakura_header_chain::BodyWorkOwner,

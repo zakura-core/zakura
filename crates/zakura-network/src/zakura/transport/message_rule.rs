@@ -20,6 +20,8 @@
 
 use std::time::Duration;
 
+use crate::zakura::handshake::LOCAL_MAX_IDLE_TIMEOUT_MILLIS;
+
 #[cfg(doc)]
 use super::Stream;
 
@@ -106,16 +108,130 @@ pub enum MessageRole {
     },
 }
 
-/// A message-count token bucket, kept for each `(peer, message_type)`.
+/// A row's rate: the sender's obligation and the receiver's bucket.
 ///
-/// A full bucket holds `capacity` messages. It regains one message every
-/// `refill_interval`.
+/// One declaration serves both sides. The sender leaves at least
+/// `send_interval` between two messages of the row. The receiver keeps a
+/// message-count bucket for each `(connection, message_type)`: a full bucket
+/// holds `capacity` messages and regains one every `refill_interval`.
+///
+/// [`Stream::validate_layout`] proves that a conformant sender can never empty
+/// the bucket, so an empty bucket is a protocol violation:
+///
+/// - the bucket refills faster than the sender sends, so steady sending gains
+///   tokens;
+/// - `capacity` covers every message a conformant sender can queue during the
+///   longest outage a connection survives ([`Cadence::MAX_OUTAGE`]), plus the
+///   initial message and one message of jitter.
+///
+/// The receiver's own read pauses add tokens as they happen, so a burst after
+/// a local pause never counts against the sender.
+///
+/// A sender every 30 seconds needs a refill under 30 seconds and a capacity of
+/// at least `10 min / 30 s + 2 = 22`:
+///
+/// ```
+/// # use zakura_network::zakura::{Cadence, MessageRole, MessageRule, PayloadLen, Stream};
+/// # use std::time::Duration;
+/// const EVERY_30_SECONDS: Cadence = Cadence {
+///     capacity: 22,
+///     refill_interval: Duration::from_secs(20),
+///     send_interval: Duration::from_secs(30),
+/// };
+/// # const STATUS: MessageRule = MessageRule {
+/// #     message_type: 1,
+/// #     payload: PayloadLen::exact(8),
+/// #     role: MessageRole::Announcement { cadence: EVERY_30_SECONDS },
+/// # };
+/// # const EVENTS: [Stream; 1] = [Stream {
+/// #     kind: 64, version: 1, frame_cap: 1024, capability: 1 << 16,
+/// #     messages: Some(&[STATUS]), ..Stream::PERSISTENT
+/// # }];
+/// # const _: () = Stream::validate_layout(&EVENTS);
+/// ```
+///
+/// A refill as slow as the sender fails the build, because jitter alone could
+/// empty the bucket:
+///
+/// ```compile_fail,E0080
+/// # use zakura_network::zakura::{Cadence, MessageRole, MessageRule, PayloadLen, Stream};
+/// # use std::time::Duration;
+/// const EVERY_30_SECONDS: Cadence = Cadence {
+///     capacity: 22,
+///     refill_interval: Duration::from_secs(30),
+///     send_interval: Duration::from_secs(30),
+/// };
+/// # const STATUS: MessageRule = MessageRule {
+/// #     message_type: 1,
+/// #     payload: PayloadLen::exact(8),
+/// #     role: MessageRole::Announcement { cadence: EVERY_30_SECONDS },
+/// # };
+/// # const EVENTS: [Stream; 1] = [Stream {
+/// #     kind: 64, version: 1, frame_cap: 1024, capability: 1 << 16,
+/// #     messages: Some(&[STATUS]), ..Stream::PERSISTENT
+/// # }];
+/// # const _: () = Stream::validate_layout(&EVENTS);
+/// ```
+///
+/// So does a capacity below the outage burst:
+///
+/// ```compile_fail,E0080
+/// # use zakura_network::zakura::{Cadence, MessageRole, MessageRule, PayloadLen, Stream};
+/// # use std::time::Duration;
+/// const EVERY_30_SECONDS: Cadence = Cadence {
+///     capacity: 21,
+///     refill_interval: Duration::from_secs(20),
+///     send_interval: Duration::from_secs(30),
+/// };
+/// # const STATUS: MessageRule = MessageRule {
+/// #     message_type: 1,
+/// #     payload: PayloadLen::exact(8),
+/// #     role: MessageRole::Announcement { cadence: EVERY_30_SECONDS },
+/// # };
+/// # const EVENTS: [Stream; 1] = [Stream {
+/// #     kind: 64, version: 1, frame_cap: 1024, capability: 1 << 16,
+/// #     messages: Some(&[STATUS]), ..Stream::PERSISTENT
+/// # }];
+/// # const _: () = Stream::validate_layout(&EVENTS);
+/// ```
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct Cadence {
     /// Messages a full bucket admits back to back.
     pub capacity: u32,
-    /// Time to regain one message.
+    /// Time for the receiver's bucket to regain one message.
     pub refill_interval: Duration,
+    /// Shortest gap the sender leaves between two messages of the row.
+    pub send_interval: Duration,
+}
+
+impl Cadence {
+    /// Longest network outage a connection survives.
+    ///
+    /// A connection closes after its negotiated idle timeout passes without a
+    /// packet, and this node never negotiates more than 10 minutes.
+    // Widening u32 to u64 is lossless.
+    pub const MAX_OUTAGE: Duration = Duration::from_millis(LOCAL_MAX_IDLE_TIMEOUT_MILLIS as u64);
+
+    /// Smallest capacity that admits every burst a conformant sender at
+    /// `send_interval` can deliver after an outage.
+    ///
+    /// During an outage of [`Cadence::MAX_OUTAGE`], the sender queues at most
+    /// `MAX_OUTAGE / send_interval` messages in its transport buffers. The two
+    /// extra messages cover the initial send and one message of jitter.
+    ///
+    /// # Panics
+    ///
+    /// If `send_interval` is zero.
+    pub const fn min_capacity(send_interval: Duration) -> u32 {
+        let queued = Self::MAX_OUTAGE.as_nanos() / send_interval.as_nanos();
+        // Widening u32 to u128 is lossless, and the check keeps the narrowing
+        // cast below lossless. Only a sub-microsecond interval saturates.
+        if queued > (u32::MAX - 2) as u128 {
+            u32::MAX
+        } else {
+            queued as u32 + 2
+        }
+    }
 }
 
 /// Inclusive payload length bounds for one message type.

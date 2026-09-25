@@ -12,7 +12,7 @@
 
 use std::fmt;
 
-use super::{MessageRole, MessageRule};
+use super::{Cadence, MessageRole, MessageRule};
 use crate::zakura::{transport::StreamMode, Stream, FRAME_HEADER_BYTES};
 
 /// A rule that a layout's message tables break.
@@ -75,6 +75,18 @@ pub enum LayoutError {
         /// The row's message type.
         message_type: u16,
     },
+    /// A cadence refills no faster than its sender sends, so a conformant
+    /// sender could empty the bucket.
+    RefillNotFasterThanSender {
+        /// The row's message type.
+        message_type: u16,
+    },
+    /// A cadence's capacity is below [`Cadence::min_capacity`], so a burst
+    /// after an outage could empty the bucket.
+    CapacityBelowStall {
+        /// The row's message type.
+        message_type: u16,
+    },
     /// A response names a message type that is not a request row in the layout.
     ResponseWithoutRequest {
         /// The response's message type.
@@ -114,6 +126,12 @@ impl LayoutError {
                 "each request allows at least one exchange in flight"
             }
             Self::EmptyCadence { .. } => "each cadence admits a message and refills",
+            Self::RefillNotFasterThanSender { .. } => {
+                "each cadence refills faster than its sender sends"
+            }
+            Self::CapacityBelowStall { .. } => {
+                "each cadence holds every message a conformant sender queues during an outage"
+            }
             Self::ResponseWithoutRequest { .. } => {
                 "each response answers a request row in its layout"
             }
@@ -135,6 +153,8 @@ impl fmt::Display for LayoutError {
             Self::DuplicateMessageType { message_type }
             | Self::NoRequestsInFlight { message_type }
             | Self::EmptyCadence { message_type }
+            | Self::RefillNotFasterThanSender { message_type }
+            | Self::CapacityBelowStall { message_type }
             | Self::ResponseWithoutRequest { message_type }
             | Self::RequestWithoutEnding { message_type } => {
                 write!(f, " (message type {message_type})")
@@ -162,7 +182,11 @@ impl Stream {
     ///     message_type: 1,
     ///     payload: PayloadLen::exact(8),
     ///     role: MessageRole::Announcement {
-    ///         cadence: Cadence { capacity: 4, refill_interval: Duration::from_secs(15) },
+    ///         cadence: Cadence {
+    ///             capacity: 22,
+    ///             refill_interval: Duration::from_secs(15),
+    ///             send_interval: Duration::from_secs(30),
+    ///         },
     ///     },
     /// };
     /// const EVENTS: [Stream; 1] = [Stream {
@@ -186,7 +210,11 @@ impl Stream {
     ///     message_type: 1,
     ///     payload: PayloadLen::exact(1024),
     ///     role: MessageRole::Announcement {
-    ///         cadence: Cadence { capacity: 4, refill_interval: Duration::from_secs(15) },
+    ///         cadence: Cadence {
+    ///             capacity: 22,
+    ///             refill_interval: Duration::from_secs(15),
+    ///             send_interval: Duration::from_secs(30),
+    ///         },
     ///     },
     /// };
     /// const EVENTS: [Stream; 1] = [Stream {
@@ -223,8 +251,10 @@ impl Stream {
     ///   row of the layout;
     /// - each row's largest frame fits its stream's frame cap;
     /// - a request/response stream carries no announcement;
-    /// - each request allows an exchange in flight, and each cadence admits a
-    ///   message and refills;
+    /// - each request allows an exchange in flight;
+    /// - each cadence admits a message, refills faster than its sender sends,
+    ///   and holds every message a conformant sender queues during an outage
+    ///   ([`Cadence`]);
     /// - each response answers a request row of the layout, which may sit on
     ///   another stream, and each request has a response row that ends it.
     pub const fn check_layout(layout: &[Stream]) -> Result<(), LayoutError> {
@@ -295,8 +325,8 @@ const fn check_stream(layout: &[Stream], stream: &Stream) -> Result<(), LayoutEr
                         message_type,
                     });
                 }
-                if cadence.capacity == 0 || cadence.refill_interval.is_zero() {
-                    return Err(LayoutError::EmptyCadence { message_type });
+                if let Err(error) = check_cadence(message_type, cadence) {
+                    return Err(error);
                 }
             }
             MessageRole::Request {
@@ -307,8 +337,8 @@ const fn check_stream(layout: &[Stream], stream: &Stream) -> Result<(), LayoutEr
                     return Err(LayoutError::NoRequestsInFlight { message_type });
                 }
                 if let Some(cadence) = cadence {
-                    if cadence.capacity == 0 || cadence.refill_interval.is_zero() {
-                        return Err(LayoutError::EmptyCadence { message_type });
+                    if let Err(error) = check_cadence(message_type, cadence) {
+                        return Err(error);
                     }
                 }
                 if !has_ending(layout, message_type) {
@@ -322,6 +352,21 @@ const fn check_stream(layout: &[Stream], stream: &Stream) -> Result<(), LayoutEr
             }
         }
         index += 1;
+    }
+    Ok(())
+}
+
+/// Check that a conformant sender can never empty `cadence`'s bucket.
+const fn check_cadence(message_type: u16, cadence: Cadence) -> Result<(), LayoutError> {
+    if cadence.capacity == 0 || cadence.refill_interval.is_zero() {
+        return Err(LayoutError::EmptyCadence { message_type });
+    }
+    // `Duration`'s ordering is not `const`; compare nanoseconds instead.
+    if cadence.refill_interval.as_nanos() >= cadence.send_interval.as_nanos() {
+        return Err(LayoutError::RefillNotFasterThanSender { message_type });
+    }
+    if cadence.capacity < Cadence::min_capacity(cadence.send_interval) {
+        return Err(LayoutError::CapacityBelowStall { message_type });
     }
     Ok(())
 }

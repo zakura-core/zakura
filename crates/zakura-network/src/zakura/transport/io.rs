@@ -16,6 +16,7 @@
 use tokio::sync::mpsc;
 
 use super::Frame;
+use crate::zakura::regulation::{PrecheckSlot, ResponsePrecheck};
 use std::sync::{Arc, OnceLock};
 
 /// Why a persistent stream ended before local cancellation.
@@ -44,6 +45,7 @@ impl OrderedStreamFailureCause {
 pub struct FramedRecv {
     receiver: FramedReceiver,
     failure_cause: Option<OrderedStreamFailureCause>,
+    precheck: Option<PrecheckSlot>,
 }
 
 #[derive(Debug)]
@@ -58,6 +60,7 @@ impl FramedRecv {
         Self {
             receiver: FramedReceiver::Plain(receiver),
             failure_cause: None,
+            precheck: None,
         }
     }
 
@@ -65,12 +68,31 @@ impl FramedRecv {
         Self {
             receiver: FramedReceiver::Queued(receiver),
             failure_cause: None,
+            precheck: None,
         }
     }
 
     pub(crate) fn with_failure_cause(mut self, failure_cause: OrderedStreamFailureCause) -> Self {
         self.failure_cause = Some(failure_cause);
         self
+    }
+
+    /// Share the reader's precheck slot, so the service can attach one.
+    pub(crate) fn with_precheck(mut self, precheck: PrecheckSlot) -> Self {
+        self.precheck = Some(precheck);
+        self
+    }
+
+    /// Check every response header against `precheck` before the reader
+    /// allocates its payload. Attach it before the first receive call.
+    ///
+    /// Returns false if this stream has no transport reader, such as an
+    /// in-process channel, or if the service already started receiving or
+    /// attached a precheck.
+    pub(crate) fn attach_precheck(&self, precheck: Arc<dyn ResponsePrecheck>) -> bool {
+        self.precheck
+            .as_ref()
+            .is_some_and(|slot| slot.attach(precheck))
     }
 
     /// Failure of any member, retained through session cancellation for service policy.
@@ -88,6 +110,9 @@ impl FramedRecv {
 
     /// Receive an already queued frame without waiting for transport progress.
     pub(crate) fn try_recv(&mut self) -> Result<Frame, mpsc::error::TryRecvError> {
+        if let Some(precheck) = &self.precheck {
+            precheck.start();
+        }
         match &mut self.receiver {
             FramedReceiver::Plain(receiver) => receiver.try_recv(),
             FramedReceiver::Queued(receiver) => loop {
@@ -100,6 +125,9 @@ impl FramedRecv {
 
     /// Receive the next admitted frame, or `None` after the transport closes the stream.
     pub async fn recv(&mut self) -> Option<Frame> {
+        if let Some(precheck) = &self.precheck {
+            precheck.start();
+        }
         match &mut self.receiver {
             FramedReceiver::Plain(receiver) => receiver.recv().await,
             FramedReceiver::Queued(receiver) => {

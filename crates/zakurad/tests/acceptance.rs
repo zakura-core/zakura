@@ -4933,3 +4933,36 @@ async fn zcashd_compat_reorg_context_zakura_tip_behind_recovers() -> Result<()> 
 async fn zcashd_compat_reorg_churn() -> Result<()> {
     common::zcashd_compat::reorg::churn().await
 }
+
+/// Requires NSM_RELEASE_ACCEPTANCE=1 and a separately built production binary.
+#[tokio::test]
+async fn nsm_release_production_acceptance() -> Result<()> {
+    tokio::time::timeout(
+        std::time::Duration::from_secs(600),
+        common::nsm_release::run(),
+    )
+    .await
+    .map_err(|error| eyre!("NU7 release acceptance timed out: {error}"))?
+}
+
+/// Verifies shielded output proofs with the same production artifact gate.
+#[tokio::test]
+async fn nsm_release_shielded_sapling_acceptance() -> Result<()> {
+    tokio::time::timeout(
+        std::time::Duration::from_secs(600),
+        common::nsm_release::run_shielded(zakura_rpc::config::mining::MinerAddressType::Sapling),
+    )
+    .await
+    .map_err(|error| eyre!("NU7 shielded acceptance timed out: {error}"))?
+}
+
+/// Verifies Ironwood coinbase proofs with the production artifact.
+#[tokio::test]
+async fn nsm_release_shielded_ironwood_acceptance() -> Result<()> {
+    tokio::time::timeout(
+        std::time::Duration::from_secs(600),
+        common::nsm_release::run_shielded(zakura_rpc::config::mining::MinerAddressType::Unified),
+    )
+    .await
+    .map_err(|error| eyre!("NU7 Ironwood acceptance timed out: {error}"))?
+}

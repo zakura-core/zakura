@@ -221,6 +221,10 @@ jobs:
         if: ${{ !cancelled() }}
         run: python3 -m unittest discover -s deploy/deployer -p 'test_*.py'
 
+      - name: NU7 fork tooling tests
+        if: ${{ !cancelled() }}
+        run: python3 -m unittest discover -s deploy/nu7-fork -p 'test_*.py'
+
       - name: Continuous-sync tests
         if: ${{ !cancelled() }}
         run: python3 deploy/continuous-sync/tests/test_continuous_sync.py

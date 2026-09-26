@@ -1,0 +1,122 @@
+# NU7 fork testnet parameters.
+#
+# Read by deploy/nu7-fork/fork.py. Every value here is safe to change between
+# runs: `fork.py up` re-seeds the chain state and re-renders the node config from
+# whatever this file says.
+#
+# See README.md for the runbook.
+
+[fork]
+# Names the network AND its state directory: zakurad stores the chain under
+# state/v<db-format>/<network_name lowercased>. Changing the name gives the next
+# run a clean cache, which is how a reconfiguration starts from the seed again.
+network_name = "Nu7Fork"
+
+# Distinct from the public Testnet magic (fa1af9bf) so fork nodes only ever talk
+# to each other. Without this the fork would dial real Testnet peers, reject
+# their blocks after activation, and ban them.
+network_magic = [0x7A, 0x6B, 0x75, 0x37]
+
+# NU7 activates this many blocks above the seeded tip.
+#
+# On an isolated fork we mine every one of these blocks ourselves, and the
+# Testnet minimum-difficulty rule sets the pace: the gap is target spacing x 6,
+# so 450s per block before NU7 and 150s after. An offset of 10 is therefore
+# about 75 minutes to activation. Raise it only if you want to wait longer.
+activation_offset = 10
+
+# NOTE: ZIP 234 NSM reissuance has no configurable start height on this base —
+# DTestnetParameters exposes only initial_nsm_value_balance — so reissuance stays
+# unscheduled. Fee recycling still begins at NU7 activation.
+# See docs/design/reissuance-accounting.md.
+
+[host]
+# Set by `fork.py provision`, or fill in by hand to target an existing host.
+ssh_string = ""
+
+# The ref built and deployed. Must contain the ZIP 259 NU7 branch ID, which
+# landed in PR #1144 — a build without it has no NU7 consensus branch at all.
+commit = "main"
+
+# Where the cloned state volume is mounted. `fork.py seed` mounts it here if it
+# is attached but not yet mounted, matching .github/workflows/scripts/pr-node-run.sh.
+snapshot_mount = "/mnt/snapshots"
+
+# Holds the untouched seed: state/v<db-format>/testnet, as cloned from the
+# DigitalOcean Testnet state snapshot. fork.py only ever reads this.
+# "tip" is the subdirectory do_provision.py's `--mode tip` snapshot uses.
+pristine_cache_dir = "/mnt/snapshots/tip"
+
+# Must match how the seed was built. do_provision.py's `tip` snapshot is a
+# pruned database, so opening it as an archive node would misdescribe it.
+storage_mode = "pruned"
+
+# The fork's own working cache, wiped and re-seeded on every reconfigure.
+# On the root disk, not /mnt/data: a provisioned droplet has no /mnt/data, and
+# the deployer asserts that /mnt/data paths are real mount points.
+fork_cache_dir = "/var/lib/zakura-fork"
+
+log_file = "/var/log/zakura/zakura-fork.log"
+
+rpc_listen_addr = "127.0.0.1:18232"
+listen_addr = "0.0.0.0:18233"
+metrics_endpoint = "127.0.0.1:9999"
+
+[catch_up]
+# The temporary public-Testnet node `fork.py catch-up` runs over the pristine
+# cache. Its ports must not collide with the fork nodes'.
+listen_addr = "0.0.0.0:18433"
+rpc_listen_addr = "127.0.0.1:18252"
+log_file = "/var/log/zakura/zakura-seed-catch-up.log"
+# Caught up once the tip block is at most this old.
+max_tip_age_minutes = 20
+timeout_minutes = 240
+
+[droplet]
+# Only used by `fork.py provision`.
+name = "zakura-nu7-fork-1"
+size = "c-8"
+regions = "nyc1,sfo3,nyc3"
+# Absent from the reaper's sweep list, so the node outlives a CI run.
+tag = "zakura-nu7-fork"
+# Fingerprint of a DigitalOcean SSH key (`doctl compute ssh-key list`) installed
+# on the droplet. Required: do_provision.py refuses to create a host without one.
+ssh_fingerprint = ""
+# Must start with zakura-pr- (do_provision.py enforces this). The reaper deletes
+# such volumes only while DETACHED, so never leave this volume unattached.
+volume_name = "zakura-pr-nu7-fork-state"
+
+[miner]
+# Transparent address receiving the fork's coinbase. Testnet-encoded, because a
+# configured testnet keeps NetworkKind::Testnet address prefixes.
+address = ""
+
+[peer]
+# A second zakurad on the same droplet, validating the miner's blocks through
+# the sync path instead of producing them. One node that both mines and
+# validates cannot catch a block it builds wrong and accepts wrong in the same
+# way; an independent node receiving blocks over the wire can.
+enabled = true
+
+name = "zakura-nu7-fork-2"
+# Distinct unit, config and state so the two nodes share nothing but the fork
+# parameters themselves.
+service_name = "zakurad-fork2"
+# Its own binary: two services cannot share one file on disk, because
+# installing over it fails while the other node is executing it.
+bin_path = "/usr/local/bin/zakurad-fork2"
+config_path = "/etc/zakura/zakura-fork2.toml"
+cache_dir = "/var/lib/zakura-fork2"
+log_file = "/var/log/zakura/zakura-fork2.log"
+# Pins a separate node identity: two nodes sharing the default identity dir on
+# one host would collide.
+identity_dir = "/root/.zakura-fork2"
+
+listen_addr = "0.0.0.0:18333"
+rpc_listen_addr = "127.0.0.1:18242"
+metrics_endpoint = "127.0.0.1:9998"
+
+# Its own coinbase address, so the two nodes compete for each block instead of one
+# producing every block the other merely accepts. Leave empty to make this node a pure
+# validator that refuses getblocktemplate.
+miner_address = ""

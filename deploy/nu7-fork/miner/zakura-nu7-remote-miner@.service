@@ -1,0 +1,17 @@
+[Unit]
+Description=NU7 fork remote miner %i
+After=zakurad.service
+Requires=zakurad.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/zakura-fork-miner --rpc 127.0.0.1:18232 --config /etc/zakura/zakura.toml --no-gap-wait --template-refresh-secs 15 --solver-id %i
+Restart=always
+RestartSec=10
+Nice=10
+CPUQuota=70%
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,16 @@
+[Unit]
+Description=NU7 fork continuous miner (local observer)
+After=zakurad-fork2.service
+Wants=zakurad-fork2.service
+
+[Service]
+Type=simple
+ExecStart=/root/cargo-target/release/zakura-fork-miner --rpc 127.0.0.1:18242 --config /etc/zakura/zakura-fork2.toml --no-gap-wait --template-refresh-secs 15 --solver-id 2
+Restart=always
+RestartSec=10
+Nice=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

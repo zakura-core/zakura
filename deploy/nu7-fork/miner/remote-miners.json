@@ -1,0 +1,7 @@
+{
+  "miners": [
+    {"id": "us", "region": "San Francisco, US", "url": "http://134.199.239.83:8094/v1/miner"},
+    {"id": "eu", "region": "Amsterdam, NL", "url": "http://157.245.69.251:8094/v1/miner"},
+    {"id": "ap", "region": "Singapore, SG", "url": "http://165.22.255.181:8094/v1/miner"}
+  ]
+}

@@ -60,6 +60,12 @@ DEFAULTS = {
     "listen_addr": "[::]:8233",
     "identity_dir": "",     # e.g. "/root/.zakura" -> pins the iroh node_id; "" uses zakurad default
     "network_cache_dir": "",
+    # Optional explicit peer seeds -> rendered `initial_testnet_peers`.
+    # None omits the key so zakurad keeps its default DNS seeds. A configured
+    # testnet incompatible with the public one MUST set this (an empty list is
+    # fine): zakurad refuses to load such a config while the default seeds are
+    # present. See build_configured_testnet in crates/zakura-network/src/config.rs.
+    "initial_testnet_peers": None,
     "rpc_listen_addr": "",  # empty -> RPC stays disabled
     "rpc_enable_cookie_auth": None,
     "port": None,           # ssh port; None -> ssh default
@@ -71,6 +77,10 @@ DEFAULTS = {
     # e.g. "127.0.0.1:8080" -> renders [health] (/healthy, /ready); "" omits it.
     # Both endpoints are unauthenticated, so keep them on loopback.
     "health_listen_addr": "",
+    # Transparent address receiving coinbase output, rendered as [mining].
+    # Required before the node will serve getblocktemplate, so an external miner
+    # (deploy/nu7-fork/miner) cannot produce blocks without it. "" omits it.
+    "miner_address": "",
     "tracing_filter": "",    # e.g. "info,zakura_network::zakura=debug"; "" uses zakurad default
     "checkpoint_sync": True,
     # Setting this false keeps checkpoint sync on while selecting the legacy non-VCT path.
@@ -78,6 +88,10 @@ DEFAULTS = {
     # Optional fleet-wide [defaults.zakura] table -> rendered [network.zakura].
     # Keys: dev_network, listen_addr, bootstrap_peers. Absent -> no section.
     "zakura": None,
+    # Optional [defaults.testnet_parameters] table -> rendered
+    # [network.network], for configured testnets such as the NU7 fork.
+    # Absent -> no section, so the node runs the default public network.
+    "testnet_parameters": None,
     # Process deploys are for manually supervised nodes, like the testnet
     # zcashd-compat Zakura sidecar, where systemd would fight the local runbook.
     "working_dir": "",
@@ -111,16 +125,19 @@ class Node:
     listen_addr: str
     identity_dir: str
     network_cache_dir: str
+    initial_testnet_peers: object  # list | None: explicit peer seeds
     rpc_listen_addr: str
     rpc_enable_cookie_auth: object
     storage_mode: str
     p2p_stack: str
     metrics_endpoint: str
     health_listen_addr: str
+    miner_address: str
     tracing_filter: str
     checkpoint_sync: bool
     vct_fast_sync: bool
     zakura: object  # dict | None: fleet-wide [network.zakura] settings
+    testnet_parameters: object  # dict | None: configured testnet [network.network] settings
     working_dir: str
     start_command: str
     process_pattern: str
@@ -243,6 +260,7 @@ def load_nodes(config_path: Path, only: list[str] | None) -> list[Node]:
             listen_addr=merged["listen_addr"],
             identity_dir=merged["identity_dir"],
             network_cache_dir=merged["network_cache_dir"],
+            initial_testnet_peers=merged.get("initial_testnet_peers"),
             rpc_listen_addr=merged["rpc_listen_addr"],
             rpc_enable_cookie_auth=merged["rpc_enable_cookie_auth"],
             storage_mode=merged["storage_mode"],
@@ -251,10 +269,12 @@ def load_nodes(config_path: Path, only: list[str] | None) -> list[Node]:
             ),
             metrics_endpoint=merged["metrics_endpoint"],
             health_listen_addr=merged["health_listen_addr"],
+            miner_address=merged["miner_address"],
             tracing_filter=merged["tracing_filter"],
             checkpoint_sync=merged["checkpoint_sync"],
             vct_fast_sync=merged["vct_fast_sync"],
             zakura=merged.get("zakura"),
+            testnet_parameters=merged.get("testnet_parameters"),
             working_dir=merged["working_dir"],
             start_command=merged["start_command"],
             process_pattern=merged["process_pattern"],
@@ -442,6 +462,73 @@ def render_template(name: str, subst: dict[str, str]) -> str:
     return text
 
 
+def toml_scalar(value: object) -> str:
+    """Render one TOML value. Booleans must be checked before ints.
+
+    Strings use JSON escaping, which is also a valid TOML basic string. Tables and
+    arrays nested below the top level render inline.
+    """
+    if value is None:
+        raise DeployError("TOML has no null value; omit the key instead")
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return str(value)
+    if isinstance(value, dict):
+        items = ", ".join(f"{toml_key(k)} = {toml_scalar(v)}" for k, v in value.items())
+        return f"{{ {items} }}" if items else "{}"
+    if isinstance(value, list):
+        return "[" + ", ".join(toml_scalar(item) for item in value) + "]"
+    return json.dumps(str(value), ensure_ascii=False)
+
+
+def toml_key(key: str) -> str:
+    """Quote a bare key only when TOML requires it, e.g. the "NU6.1" upgrade names."""
+    bare = key.isascii() and key.replace("_", "").replace("-", "").isalnum()
+    return key if bare else json.dumps(key, ensure_ascii=False)
+
+
+def render_toml_pair(key: str, value: object) -> str:
+    """Render one `key = value` line, choosing an inline or multi-line array."""
+    if isinstance(value, list):
+        if not value:
+            return f"{toml_key(key)} = []"
+        # Strings (peer lists, addresses) read better one per line; numeric
+        # arrays such as network_magic stay inline.
+        if any(isinstance(item, str) for item in value):
+            items = "".join(f"    {toml_scalar(item)},\n" for item in value)
+            return f"{toml_key(key)} = [\n{items}]"
+        inline = ", ".join(toml_scalar(item) for item in value)
+        return f"{toml_key(key)} = [{inline}]"
+    return f"{toml_key(key)} = {toml_scalar(value)}"
+
+
+def is_table_array(value: object) -> bool:
+    return isinstance(value, list) and bool(value) and all(isinstance(i, dict) for i in value)
+
+
+def render_toml_table(header: str, table: dict) -> list[str]:
+    """Render `[header]` and its contents, recursing into nested tables.
+
+    Scalars are emitted before any sub-table, because in TOML every key after a
+    sub-table header belongs to that sub-table.
+    """
+    lines = [f"[{header}]"]
+    for key, value in table.items():
+        if isinstance(value, dict) or is_table_array(value):
+            continue
+        lines.append(render_toml_pair(key, value))
+    for key, value in table.items():
+        if is_table_array(value):
+            for entry in value:
+                lines.append(f"[[{header}.{toml_key(key)}]]")
+                for sub_key, sub_value in entry.items():
+                    lines.append(render_toml_pair(sub_key, sub_value))
+        elif isinstance(value, dict):
+            lines.extend(render_toml_table(f"{header}.{toml_key(key)}", value))
+    return lines
+
+
 def render_zakura_block(zakura: object) -> str:
     """Render a fleet-wide [network.zakura] section from a dict, or "" if unset.
 
@@ -453,19 +540,39 @@ def render_zakura_block(zakura: object) -> str:
         return ""
     lines = ["[network.zakura]"]
     for key, value in zakura.items():
-        if isinstance(value, bool):
-            lines.append(f"{key} = {'true' if value else 'false'}")
-        elif isinstance(value, (int, float)):
-            lines.append(f"{key} = {value}")
-        elif isinstance(value, list):
-            if value:
-                items = "".join(f'    "{v}",\n' for v in value)
-                lines.append(f"{key} = [\n{items}]")
-            else:
-                lines.append(f"{key} = []")
-        else:
-            lines.append(f'{key} = "{value}"')
+        lines.append(render_toml_pair(key, value))
     # Leading/trailing blank lines so the section reads cleanly between [network] and [state].
+    return "\n" + "\n".join(lines) + "\n"
+
+
+def render_network_line(node: Node) -> str:
+    """Render the `network` key, or a pointer to the configured-testnet table.
+
+    A configured testnet is `network = { ... }` itself, rendered as the
+    [network.network] table, so it has no `network = "..."` line: zakurad rejects
+    `[network.testnet_parameters]` beside `network = "Testnet"`, because the
+    public Testnet's parameters are fixed.
+    """
+    if node.testnet_parameters:
+        return "# network: configured testnet, see [network.network]"
+    return f'network = "{node.network}"'
+
+
+def render_testnet_params_block(node: Node) -> str:
+    """Render a configured testnet's [network.network] table, or "" if unset.
+
+    Keys pass through verbatim, so the deployer does not need to learn every
+    field of `DTestnetParameters` in crates/zakura-network/src/config.rs. Nested
+    tables (`activation_heights`) and arrays of tables (`lockbox_disbursements`)
+    are rendered as such.
+    """
+    if not node.testnet_parameters:
+        return ""
+    if node.network != "Testnet":
+        raise DeployError(
+            f"{node.name}: testnet_parameters configure a Testnet, but network = {node.network!r}"
+        )
+    lines = render_toml_table("network.network", dict(node.testnet_parameters))
     return "\n" + "\n".join(lines) + "\n"
 
 
@@ -484,6 +591,9 @@ def render_node_config(node: Node) -> str:
     health_block = (
         f'[health]\nlisten_addr = "{node.health_listen_addr}"\n' if node.health_listen_addr else ""
     )
+    mining_block = (
+        f'[mining]\nminer_address = "{node.miner_address}"\n' if node.miner_address else ""
+    )
     filter_line = f'filter = "{node.tracing_filter}"' if node.tracing_filter else "# filter unset (zakurad default)"
     network_cache_line = (
         f'cache_dir = "{node.network_cache_dir}"' if node.network_cache_dir else "# cache_dir unset (zakurad default)"
@@ -491,17 +601,25 @@ def render_node_config(node: Node) -> str:
     identity_dir_line = (
         f'identity_dir = "{node.identity_dir}"' if node.identity_dir else "# identity_dir unset (zakurad default)"
     )
+    initial_peers_line = (
+        render_toml_pair("initial_testnet_peers", node.initial_testnet_peers)
+        if node.initial_testnet_peers is not None
+        else "# initial_testnet_peers unset (zakurad default DNS seeds)"
+    )
     return render_template("zakura.toml", {
-        "NETWORK": node.network,
+        "NETWORK_LINE": render_network_line(node),
         "LISTEN_ADDR": node.listen_addr,
         "IDENTITY_DIR": identity_dir_line,
         "NETWORK_CACHE_DIR": network_cache_line,
+        "INITIAL_TESTNET_PEERS": initial_peers_line,
         "STATE_CACHE_DIR": node.state_cache_dir,
         "STORAGE_MODE": node.storage_mode,
         "P2P_STACK": node.p2p_stack,
+        "TESTNET_PARAMS_BLOCK": render_testnet_params_block(node),
         "ZAKURA_BLOCK": render_zakura_block(node.zakura),
         "METRICS_BLOCK": metrics_block,
         "HEALTH_BLOCK": health_block,
+        "MINING_BLOCK": mining_block,
         "TRACING_FILTER": filter_line,
         "LOG_FILE": node.log_file,
         "RPC_BLOCK": rpc_block,

@@ -1,8 +1,8 @@
 //! Per-session serving admission with exact live-range overlap checks.
 
-use std::{collections::BTreeMap, sync::Arc};
+use std::{collections::BTreeMap, future::Future, pin::Pin, sync::Arc};
 
-use futures::{future::BoxFuture, stream::FuturesUnordered, FutureExt, StreamExt};
+use futures::{stream::FuturesUnordered, FutureExt, StreamExt};
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 use zakura_chain::block::Height;
@@ -36,6 +36,8 @@ impl Serving {
         }
         .response_cap(MAX_BS_RESPONSE_BYTES)
         .output_bytes();
+        // Allow one target RTT for production. This is a sizing assumption,
+        // not a measured storage latency.
         let limits = sizing::serve_limits(largest, sizing::TARGET_RTT);
         Self {
             source,
@@ -66,10 +68,12 @@ impl Serving {
     }
 }
 
+type RangeCompletion = Pin<Box<dyn Future<Output = (Height, watch::Receiver<bool>)> + Send + Sync>>;
+
 pub(crate) struct ServingSession {
     serve: Serve<Server<dyn Source>>,
     ranges: BTreeMap<Height, (Height, watch::Receiver<bool>)>,
-    completed: FuturesUnordered<BoxFuture<'static, (Height, watch::Receiver<bool>)>>,
+    completed: FuturesUnordered<RangeCompletion>,
 }
 
 impl ServingSession {

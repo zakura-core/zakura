@@ -414,9 +414,6 @@ impl PeerRoutine {
         }
     }
 
-    /// Run the pipe-routine until stream close, cancellation, or a protocol
-    /// reject. A reject returns `Err(SinkReject::protocol(..))` so the supervised
-    /// pipe tears the whole connection down.
     pub(super) fn with_serving(
         mut self,
         serving: Option<super::regulated::session::ServingSession>,
@@ -425,6 +422,9 @@ impl PeerRoutine {
         self
     }
 
+    /// Run the pipe-routine until stream close, cancellation, or a protocol
+    /// reject. A reject returns `Err(SinkReject::protocol(..))` so the supervised
+    /// pipe tears the whole connection down.
     pub(super) async fn run(mut self) -> Result<(), SinkReject> {
         let mut guard = block_sync_guard();
         let result = self.run_inner(&mut guard).await;
@@ -1423,10 +1423,10 @@ impl PeerRoutine {
             {
                 // Outbound full but *only just* filled (< one `request_timeout` of
                 // continuous backpressure): plausibly transient local write congestion, not
-                // a dead peer. While outbound is full the select loop does not drain inbound
-                // frames (`if outbound_queue_has_capacity`), so a block the peer already sent
-                // may be waiting behind our write side. Grant one short, BOUNDED grace. This
-                // is the *only* liveness extension: a peer that stopped reading holds outbound
+                // a dead peer. The action-driver serving path pauses inbound reads while
+                // outbound is full, so a block the peer already sent may be waiting behind
+                // our write side. Regulated serving keeps reading. Grant one short, BOUNDED
+                // grace. This is the *only* liveness extension: a peer that stopped reading holds outbound
                 // full past `request_timeout`, falls through to the park arm, and is
                 // parked at the liveness deadline — it cannot dodge the timer.
                 self.window

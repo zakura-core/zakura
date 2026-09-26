@@ -199,6 +199,8 @@ pub(super) struct ResponseGrants {
     // execution slots.
     _node: OutputGrant,
     _peer: OutputGrant,
+    // Keep both budgets discoverable until the last response write finishes.
+    _peer_budgets: PeerBudgets,
 }
 
 /// An admitted request that waits for capacity.
@@ -400,6 +402,7 @@ impl<P: Produce> Dispatch<P> {
         let grants = ResponseGrants {
             _node: node,
             _peer: peer,
+            _peer_budgets: self.peer.clone(),
         };
         let peer = self
             .wait("peer_execution", self.peer.execution.reserve())
@@ -407,7 +410,7 @@ impl<P: Produce> Dispatch<P> {
         let node = self
             .wait("node_execution", self.capacity.node_execution.reserve())
             .await?;
-        Some((grants, ExecutionSlots::new(peer, node)))
+        Some((grants, ExecutionSlots::new(peer, node, self.peer.clone())))
     }
 
     async fn wait<T>(&self, bound: &'static str, acquire: impl Future<Output = T>) -> Option<T> {

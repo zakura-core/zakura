@@ -364,9 +364,14 @@ fn live_serving(source: Arc<Store>, max_bytes: u32) -> LiveServing {
         BlockSyncService, Peer, Service, ServicePeerDirection, ZakuraBlockSyncConfig,
         ZAKURA_CAP_BLOCK_SYNC, ZAKURA_STREAM_BLOCK_SYNC,
     };
-    let mut config = ZakuraBlockSyncConfig::default();
-    config.max_response_bytes = max_bytes;
-    config.peer_limits.max_outbound_peers = 1;
+    let config = ZakuraBlockSyncConfig {
+        max_response_bytes: max_bytes,
+        peer_limits: crate::zakura::ServicePeerLimits {
+            max_outbound_peers: 1,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
     let cancel = CancellationToken::new();
     let mut startup =
         super::super::BlockSyncStartup::inert(config.clone()).with_range_source(source);

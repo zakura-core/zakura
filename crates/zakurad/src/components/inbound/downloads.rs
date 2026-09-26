@@ -26,6 +26,7 @@ use zakura_chain::{
     chain_tip::ChainTip,
     parameters::Network,
 };
+use zakura_jsonl_trace::block_profile::lifecycle::{self, Download, Phase, Route};
 use zakura_network::{self as zn, PeerSocketAddr};
 use zakura_state as zs;
 
@@ -33,6 +34,13 @@ use crate::components::{
     auth_download_height::tip_child_mismatch,
     sync::{lookahead_limit_multiplier, MIN_CONCURRENCY_LIMIT},
 };
+
+fn profile_source(source: &AdvertiserSource) -> Option<u64> {
+    match source {
+        AdvertiserSource::LegacyIp(ip) => lifecycle::source(ip),
+        AdvertiserSource::Zakura(id) => lifecycle::source(id),
+    }
+}
 
 type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
@@ -529,6 +537,12 @@ where
         hash: block::Hash,
         download_source: Option<zn::PeerSource>,
     ) -> DownloadAction {
+        let profile_source = download_source
+            .as_ref()
+            .map(|s| AdvertiserSource::from(s.clone()))
+            .as_ref()
+            .and_then(profile_source);
+        lifecycle::observe(hash.0, Route::Gossip, Phase::Discovered, profile_source);
         let source_label = download_source
             .as_ref()
             .map(|source| peer_source_log_label(source, self.expose_peer_addresses))
@@ -536,6 +550,7 @@ where
         tracing::Span::current().record("source", source_label.as_str());
 
         if self.cancel_handles.contains_key(&hash) {
+            lifecycle::observe(hash.0, Route::Gossip, Phase::AlreadyQueued, profile_source);
             debug!(
                 ?hash,
                 queue_len = self.queue_len(),
@@ -550,6 +565,7 @@ where
         }
 
         if self.queue_len() >= self.full_verify_concurrency_limit {
+            lifecycle::observe(hash.0, Route::Gossip, Phase::QueueFull, profile_source);
             debug!(
                 ?hash,
                 queue_len = self.queue_len(),
@@ -568,6 +584,7 @@ where
             let source_count = self.source_counts.get(source).copied().unwrap_or_default();
             let source_limit = source.max_in_flight(self.full_verify_concurrency_limit);
             if source_count >= source_limit {
+                lifecycle::observe(hash.0, Route::Gossip, Phase::SourceFull, profile_source);
                 debug!(
                     ?hash,
                     source_count,
@@ -632,7 +649,13 @@ where
         let latest_chain_tip = self.latest_chain_tip.clone();
         let full_verify_concurrency_limit = self.full_verify_concurrency_limit;
 
+        let ingress = Download::new(
+            hash.0,
+            Route::Gossip,
+            advertiser.as_ref().and_then(profile_source),
+        );
         let fut = async move {
+            ingress.mark(Phase::TaskStarted);
             // Check if the full block body is already in the state. `KnownBlock`
             // can be true for header-only Zakura sync state, but inbound gossip
             // still needs to fetch and verify the block body in that case.
@@ -644,6 +667,7 @@ where
             }
             .map_err(|e| (e, None))?;
 
+            ingress.mark(Phase::StateLookupDone);
             let request_hashes = std::iter::once(hash).collect();
             let request = match download_source {
                 Some(source) => zn::Request::BlocksByHashFrom {
@@ -653,9 +677,12 @@ where
                 None => zn::Request::BlocksByHash(request_hashes),
             };
 
+            ingress.mark(Phase::NetworkRequest);
             let (block, advertiser_addr) = if let zn::Response::Blocks(blocks) =
-                network.oneshot(request).await.map_err(|e| (e, None))?
-            {
+                network.oneshot(request).await.map_err(|e| {
+                    ingress.mark(Phase::NetworkFailed);
+                    (e, None)
+                })? {
                 // A peer must answer a single-hash block request with exactly one
                 // block entry. A malformed or empty response is a peer fault (e.g.
                 // a Zakura peer that tore its connection down mid-response), not a
@@ -685,6 +712,7 @@ where
                 unreachable!("wrong response to block request");
             };
 
+            ingress.mark(Phase::BodyReceived);
             // Bind the delivered block to the hash we requested. A peer that
             // substitutes a different (even valid) block must not be able to
             // corrupt our hash/source accounting: the verifier returns the
@@ -806,14 +834,19 @@ where
                     .map_err(|e| (e.into(), None))?;
             }
 
+            ingress.mark(Phase::SourceWait);
             let _source_guard = match source_lock {
                 Some(source_lock) => Some(source_lock.lock_owned().await),
                 None => None,
             };
 
-            verifier
+            ingress.mark(Phase::SourceAcquired);
+            ingress.mark(Phase::VerifierReadyWait);
+            let result = verifier
                 .oneshot(zakura_consensus::Request::Commit(block))
-                .await
+                .await;
+            ingress.finish(result.is_ok());
+            result
                 .map(|hash| (hash, block_height))
                 .map_err(|e| (e, advertiser_addr))
         }

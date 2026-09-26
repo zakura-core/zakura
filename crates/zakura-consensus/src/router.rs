@@ -343,8 +343,15 @@ where
         let root = profiles::enabled()
             .then(|| {
                 use profiles::{Block, Mode};
+                let profile_hash = block.hash().0;
+                profiles::lifecycle::observe(
+                    profile_hash,
+                    profiles::lifecycle::Route::Router,
+                    profiles::lifecycle::Phase::RouterEntered,
+                    None,
+                );
                 profiles::begin(Block {
-                    hash: block.hash().0,
+                    hash: profile_hash,
                     parent: block.header.previous_block_hash.0,
                     height: block.coinbase_height().map(|h| h.0),
                     transactions: u32::try_from(block.transactions.len()).unwrap_or(u32::MAX),

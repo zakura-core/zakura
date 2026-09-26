@@ -108,3 +108,12 @@ test('withdrawn verification detail stays out of the restored timeline',()=>{
   const spans=[{stage:'transaction'},{stage:'verification_request'},{stage:'verification_batch'},{stage:'verification_cache'},{stage:'sapling_request'},{stage:'finalization'}];
   assert.deepEqual(JSON.parse(JSON.stringify(context.displayedSpans(spans))).map(s=>s.stage),['transaction','sapling_request','finalization']);
 });
+
+
+test('arrival timeline correlates exact parent and child without fabricating missing milestones',()=>{
+  const data={summary:{start_us:1000},dependencies:{events:[{phase:'router_entered',at_us:1000,operation:0}],parent_events:[{phase:'body_received',at_us:400,operation:12},{phase:'router_entered',at_us:2000,operation:0}]}};
+  const rows=JSON.parse(JSON.stringify(context.dependencyRows(data)));
+  assert.deepEqual(rows.map(r=>[r.block,r.offset]),[['Parent',-600],['This block',0],['Parent',1000]]);
+  assert.equal(rows[0].label,'Downloader received body');
+  assert.equal(context.dependencyRows({summary:{start_us:0}}).length,0);
+});

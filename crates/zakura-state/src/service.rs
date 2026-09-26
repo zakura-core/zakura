@@ -1051,6 +1051,15 @@ impl StateService {
     ) -> oneshot::Receiver<Result<block::Hash, CommitSemanticallyVerifiedError>> {
         tracing::debug!(block = %semantically_verified.block, "queueing block for contextual verification");
         let parent_hash = semantically_verified.block.header.previous_block_hash;
+        if zakura_jsonl_trace::block_profile::enabled() && !self.can_fork_chain_at(&parent_hash) {
+            semantically_verified.profile.parent_wait_started();
+            zakura_jsonl_trace::block_profile::lifecycle::observe(
+                semantically_verified.hash.0,
+                zakura_jsonl_trace::block_profile::lifecycle::Route::State,
+                zakura_jsonl_trace::block_profile::lifecycle::Phase::ParentUnavailable,
+                None,
+            );
+        }
         let hash = semantically_verified.hash;
 
         // Drop hashes of any blocks the write task has rejected before checking
@@ -1293,6 +1302,13 @@ impl StateService {
                         self.optimistic_relay_reserved_parents
                             .insert(candidate_parent, queued_child.0.height);
                     }
+                    queued_child.0.profile.parent_wait_finished();
+                    zakura_jsonl_trace::block_profile::lifecycle::observe(
+                        hash.0,
+                        zakura_jsonl_trace::block_profile::lifecycle::Route::State,
+                        zakura_jsonl_trace::block_profile::lifecycle::Phase::WriterEnqueued,
+                        None,
+                    );
                     let send_result =
                         non_finalized_block_write_sender.send(NonFinalizedWriteMessage::Commit {
                             queued: queued_child,

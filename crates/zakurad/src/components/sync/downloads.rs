@@ -562,6 +562,8 @@ where
         &mut self,
         hash: block::Hash,
     ) -> Result<(), BlockDownloadVerifyError> {
+        use zakura_jsonl_trace::block_profile::lifecycle::{Download, Phase, Route};
+        let ingress = Download::new(hash.0, Route::Sync, None);
         if self.cancel_handles.contains_key(&hash) {
             metrics::counter!("sync.already.queued.dropped.block.hash.count").increment(1);
             return Err(BlockDownloadVerifyError::DuplicateBlockQueuedForDownload { hash });
@@ -582,6 +584,7 @@ where
         // if we waited for readiness and did the service call in the spawned
         // tasks, all of the spawned tasks would race each other waiting for the
         // network to become ready.
+        ingress.mark(Phase::NetworkReadyWait);
         let network = match timeout(BLOCK_DOWNLOAD_TIMEOUT, self.network.ready()).await {
             Ok(Ok(network)) => network,
             Ok(Err(error)) => {
@@ -598,6 +601,7 @@ where
                 return Err(error);
             }
         };
+        ingress.mark(Phase::NetworkRequest);
         let block_req = network.call(zn::Request::BlocksByHash(std::iter::once(hash).collect()));
         Self::transition_task(&self.task_states, &self.trace, hash, "downloading", None);
 
@@ -618,6 +622,7 @@ where
 
         let task = tokio::spawn(
             async move {
+                ingress.mark(Phase::TaskStarted);
                 // Download the block.
                 // Prefer the cancel handle if both are ready.
                 let download_start = std::time::Instant::now();
@@ -640,6 +645,7 @@ where
                     None,
                 );
 
+                ingress.mark(Phase::BodyReceived);
                 let (block, advertiser_addr) = if let zn::Response::Blocks(blocks) = rsp {
                     // A cooperating peer returns exactly one available block for a
                     // single-hash request. A response with a different count, or a
@@ -833,6 +839,7 @@ where
                 }
 
                 // Wait for the verifier service to be ready.
+                ingress.mark(Phase::VerifierReadyWait);
                 let readiness = verifier.ready();
                 // Prefer the cancel handle if both are ready.
                 let verifier = tokio::select! {
@@ -853,6 +860,7 @@ where
                 );
 
                 // Verify the block.
+                ingress.mark(Phase::VerifierSubmitted);
                 let verify_start = std::time::Instant::now();
                 let mut rsp = verifier
                     .map_err(|error| BlockDownloadVerifyError::VerifierServiceError { error })?
@@ -880,6 +888,7 @@ where
                     verification = rsp => verification,
                 };
 
+                ingress.finish(verification.is_ok());
                 let verify_result = if verification.is_ok() { "success" } else { "failure" };
                 metrics::histogram!("sync.block.verify.duration_seconds", "result" => verify_result)
                     .record(verify_start.elapsed().as_secs_f64());

@@ -1253,3 +1253,101 @@ fn home_keeps_history_across_restarts_and_uses_latest_block_result() -> Result<(
     assert_eq!(reader.detail(RUN, 1)?["summary"]["end_us"], 900100);
     Ok(())
 }
+
+#[test]
+fn ingress_correlates_parent_without_changing_block_timing() -> Result<()> {
+    use profiles::lifecycle::{Phase, Record, Route};
+    let temp = tempfile::tempdir()?;
+    let mut store = Store::open(temp.path(), 16_000_000)?;
+    store.ingest(metadata())?;
+    for (seq, hash) in [(1, [0; 32]), (2, [1; 32])] {
+        store.ingest(event(
+            seq,
+            Event::Lifecycle(Record {
+                hash,
+                operation: seq,
+                source: Some(u64::MAX),
+                route: Route::Gossip,
+                phase: Phase::BodyReceived,
+                at_us: 50,
+            }),
+        ))?;
+    }
+    store.ingest(event(3, finish()))?;
+    store.flush()?;
+    drop(store);
+    let reader = Reader::open(temp.path())?;
+    let data = reader.detail(RUN, 1)?;
+    assert_eq!(data["timing"]["recorded_elapsed_us"], 700000);
+    assert_eq!(data["dependencies"]["parent_hash"], "00".repeat(32));
+    assert_eq!(data["dependencies"]["events"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        data["dependencies"]["parent_events"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        data["dependencies"]["events"][0]["source"],
+        "ffffffffffffffff"
+    );
+    assert!(data["spans"].as_array().unwrap().is_empty());
+    Ok(())
+}
+
+#[test]
+fn lifecycle_bound_covers_hashes_without_verifier_attempts() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let mut store = Store::open(temp.path(), 16_000_000)?;
+    store.ingest(metadata())?;
+    store.db.execute(
+        "INSERT INTO lifecycle(id,run,hash,at_us,payload) VALUES(1,?,'old',1,'{}')",
+        [RUN],
+    )?;
+    store.db.execute(
+        "INSERT INTO lifecycle(id,run,hash,at_us,payload) VALUES(200001,?,'new',2,'{}')",
+        [RUN],
+    )?;
+    let hashes: Vec<String> = store
+        .db
+        .prepare("SELECT hash FROM lifecycle")?
+        .query_map([], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    assert_eq!(hashes, vec!["new"]);
+    Ok(())
+}
+
+#[test]
+fn parent_source_context_identifies_another_block_holding_the_slot() -> Result<()> {
+    use profiles::lifecycle::{Phase, Record, Route};
+    let temp = tempfile::tempdir()?;
+    let mut store = Store::open(temp.path(), 16_000_000)?;
+    store.ingest(metadata())?;
+    for (seq, hash, phase) in [
+        (1, [9; 32], Phase::SourceAcquired),
+        (2, [0; 32], Phase::SourceWait),
+    ] {
+        store.ingest(event(
+            seq,
+            Event::Lifecycle(Record {
+                hash,
+                operation: seq,
+                source: Some(42),
+                route: Route::Gossip,
+                phase,
+                at_us: 50 + seq,
+            }),
+        ))?;
+    }
+    store.ingest(event(3, finish()))?;
+    let reader = Reader::open(temp.path())?;
+    let detail = reader.detail(RUN, 1)?;
+    let context = detail["dependencies"]["source_activity"]
+        .as_array()
+        .unwrap();
+    assert_eq!(context.len(), 1);
+    assert_eq!(context[0]["hash"], "09".repeat(32));
+    assert_eq!(context[0]["phase"], "source_acquired");
+    Ok(())
+}

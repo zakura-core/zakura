@@ -495,3 +495,29 @@ mod transport {
         });
     }
 }
+
+#[test]
+fn parent_wait_closes_once_on_the_original_attempt() {
+    let (r, detail, summary) = recorder();
+    let root = begin_with(&r, block()).unwrap();
+    let context = root.context();
+    context.parent_wait_started();
+    context.parent_wait_started();
+    context.parent_wait_finished();
+    context.parent_wait_finished();
+    root.finish(Outcome::Success);
+    drop(context);
+    let spans: Vec<_> = detail.try_iter().collect();
+    assert_eq!(spans.len(), 1);
+    assert!(
+        matches!(spans[0], Event::Span { attempt:1, stage:Stage::ParentWait, start_us, end_us, .. } if end_us >= start_us)
+    );
+    assert!(summary.try_iter().any(|e| matches!(
+        e,
+        Event::Seal {
+            spans: 1,
+            dropped: 0,
+            ..
+        }
+    )));
+}

@@ -103,7 +103,49 @@ async function openDetail(run,attempt) {
   const spans=displayedSpans(data.spans).sort((a,b)=>a.start_us-b.start_us), start=row.start_us || 0;
   const end=Math.max(row.end_us||start,...spans.map(s=>s.end_us)), duration=Math.max(end-start,1);
   renderTimeline(spans,row,start,duration,data.recording.network);
+  renderDependencies(data);
   if(showCpu){$('cpu').hidden=false;renderCpu(data.cpu);}
+}
+const milestoneLabels = {
+  discovered:'Download considered', already_queued:'Already downloading or verifying', queue_full:'Download queue full',
+  source_full:'Source concurrency limit reached', task_started:'Download task started', state_lookup_done:'Existing-block lookup finished',
+  network_ready_wait:'Waiting for network readiness', network_request:'Request submitted to network service', network_failed:'Network request failed',
+  peer_announcement:'Peer announced block', peer_request:'Peer connection accepted request', peer_request_flushed:'Request flushed to peer transport',
+  peer_body:'Peer connection received block body', peer_timeout:'Peer response timed out', peer_not_found:'Peer reported block unavailable', peer_failed:'Peer connection failed during request', body_received:'Downloader received body',
+  source_wait:'Waiting for source verification slot', source_acquired:'Source verification slot acquired',
+  verifier_ready_wait:'Waiting for verifier readiness', verifier_submitted:'Submitted to verifier', router_entered:'Verification started',
+  parent_unavailable:'Parent unavailable to state writer', writer_enqueued:'Queued for state writer', success:'Download and verification succeeded',
+  failed:'Download or verification failed', incomplete:'Attempt ended early (error, rejection or cancellation)',
+};
+function dependencyRows(data) {
+  const d=data.dependencies||{}, start=data.summary.start_us;
+  return [...(d.events||[]).map(e=>({...e,block:'This block'})),...(d.parent_events||[]).map(e=>({...e,block:'Parent'})),...(d.source_activity||[]).map(e=>({...e,block:'Same source · '+e.hash.slice(-8)}))]
+    .sort((a,b)=>a.at_us-b.at_us)
+    .map(e=>({...e,offset:e.at_us-start,label:milestoneLabels[e.phase]||e.phase}));
+}
+function renderDependencies(data) {
+  const host=$('dependencies');host.replaceChildren();
+  const d=data.dependencies, rows=dependencyRows(data);
+  if(!rows.length)return;
+  const panel=el('details',null,'timeline-group'), body=el('div',null,'timeline-children');
+  const wait=data.spans.find(s=>s.stage==='parent_wait');
+  panel.open=Boolean(wait && wait.end_us-wait.start_us>=1000);
+  panel.append(el('summary','Arrival and parent wait'));
+  if(d.parent_hash){
+    const link=el('a','Open parent block');
+    link.href=d.parent_attempt?`/block/${data.summary.run}/${d.parent_attempt}`:`/block/${d.parent_hash}`;
+    body.append(link);
+  }
+  body.append(el('p','Source IDs are local to this recording. Other blocks from the same source show up to 128 recent milestones per source, including the two minutes before its slot wait.','muted'));
+  body.append(el('p','Times are relative to this block entering verification. Negative times happened earlier. These are retained observations, not a complete network log. Missing events do not prove that a block was never announced.','muted'));
+  if(d.recording_has_loss)body.append(el('p','Some events were omitted during this recording. The retained timeline may have gaps.','muted'));
+  if(!d.parent_events?.length)body.append(el('p','No retained arrival milestones for the parent.','muted'));
+  if((d.events?.length||0)>=513||(d.parent_events?.length||0)>=513)body.append(el('p','Only the latest 513 milestones per block are shown.','muted'));
+  const table=el('table'),head=el('tr');
+  for(const label of ['Time','Block','Milestone','Route / operation','Source'])head.append(el('th',label));
+  const thead=el('thead');thead.append(head);table.append(thead);const tbody=el('tbody');
+  for(const e of rows){const tr=el('tr');for(const value of [`${e.offset<0?'−':'+'}${ms(Math.abs(e.offset))}`,e.block,e.label,`${e.route}${e.operation?' / '+e.operation:''}`,e.source||'—'])tr.append(el('td',value));tbody.append(tr);}
+  table.append(tbody);body.append(table);panel.append(body);host.append(panel);
 }
 function renderMetadata(row,recording) {
   $('detail-base').replaceChildren(el('span','Main base · '),commitLink(recording.source?.base_commit,true));
@@ -225,7 +267,7 @@ function renderTimeline(spans,row,start,duration,network) {
   const transactionDetail=spans.filter(s=>(transactionStages.has(s.stage)||s.transaction_index!=null)&&!finalizationIds.has(s.span));
   const transactionIds=new Set(transactionDetail.map(s=>s.span));
   const transactionEntry=transactions||transactionDetail[0];
-  function lane(span,tag='div',label=span.stage.replaceAll('_',' ')) {
+  function lane(span,tag='div',label=span.stage==='parent_wait'?'Waiting for parent':span.stage.replaceAll('_',' ')) {
     const line=el(tag,null,`lane${span.root?' root':''}`),track=el('div',null,'lane-bar'),bar=el('div',null,'bar');
     bar.style.left=`${Math.max(0,(span.start_us-start)/duration*100)}%`;bar.style.width=`${Math.max(0,(span.end_us-span.start_us)/duration*100)}%`;
     bar.title=`${ms(span.start_us-start)} → ${ms(span.end_us-start)}`;track.append(bar);

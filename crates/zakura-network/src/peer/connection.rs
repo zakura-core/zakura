@@ -40,6 +40,10 @@ use crate::{
     BoxError, PeerSocketAddr, MAX_TX_INV_IN_SENT_MESSAGE,
 };
 
+use zakura_jsonl_trace::block_profile::{
+    self as profiles,
+    lifecycle::{self, Phase, Route},
+};
 use InventoryResponse::*;
 
 mod peer_tx;
@@ -754,6 +758,10 @@ where
                         }
                         Either::Left((Some(Err(e)), _)) => self.fail_with(e).await,
                         Either::Left((Some(Ok(msg)), _)) => {
+                            profile_peer_message(
+                                &msg,
+                                self.connection_info.connected_addr.get_transient_addr(),
+                            );
                             let unhandled_msg = self.handle_message_as_request(msg).await;
 
                             if let Some(unhandled_msg) = unhandled_msg {
@@ -863,6 +871,10 @@ where
                         }
                         Either::Right((Some(Err(e)), _)) => self.fail_with(e).await,
                         Either::Right((Some(Ok(peer_msg)), _cancel)) => {
+                            profile_peer_message(
+                                &peer_msg,
+                                self.connection_info.connected_addr.get_transient_addr(),
+                            );
                             self.update_state_metrics(format!("Out::Rsp::{}", peer_msg.command()));
 
                             // Try to process the message using the handler.
@@ -905,6 +917,27 @@ where
                         }
                         Either::Left((Either::Right(_), _peer_fut)) => {
                             trace!(parent: &span, "client request timed out");
+                            if profiles::enabled() {
+                                if let State::AwaitingResponse {
+                                    handler: Handler::BlocksByHash { pending_hashes, .. },
+                                    ..
+                                } = &self.state
+                                {
+                                    let source = self
+                                        .connection_info
+                                        .connected_addr
+                                        .get_transient_addr()
+                                        .and_then(|a| lifecycle::source(&a.ip()));
+                                    for hash in pending_hashes.iter().take(64) {
+                                        lifecycle::observe(
+                                            hash.0,
+                                            Route::LegacyPeer,
+                                            Phase::PeerTimeout,
+                                            source,
+                                        );
+                                    }
+                                }
+                            }
                             let e = PeerError::ConnectionReceiveTimeout;
 
                             // Replace the state with a temporary value,
@@ -964,6 +997,22 @@ where
     /// Use [`Self::shutdown_async()`] to avoid logging the failure,
     /// and [`Self::shutdown()`] from non-async code.
     async fn fail_with(&mut self, error: impl Into<SharedPeerError>) {
+        if profiles::enabled() {
+            if let State::AwaitingResponse {
+                handler: Handler::BlocksByHash { pending_hashes, .. },
+                ..
+            } = &self.state
+            {
+                let source = self
+                    .connection_info
+                    .connected_addr
+                    .get_transient_addr()
+                    .and_then(|a| lifecycle::source(&a.ip()));
+                for hash in pending_hashes.iter().take(64) {
+                    lifecycle::observe(hash.0, Route::LegacyPeer, Phase::PeerFailed, source);
+                }
+            }
+        }
         let error = error.into();
 
         debug!(
@@ -1055,18 +1104,23 @@ where
             }
 
             (AwaitingRequest, BlocksByHash(hashes) | BlocksByHashFrom { hashes, .. }) => {
+                if profiles::enabled() {
+                    let source = self.connection_info.connected_addr.get_transient_addr().and_then(|a| lifecycle::source(&a.ip()));
+                    for hash in hashes.iter().take(64) { lifecycle::observe(hash.0, Route::LegacyPeer, Phase::PeerRequest, source); }
+                }
                 self
                     .peer_tx
                     .send(Message::GetData(
                         hashes.iter().map(|h| (*h).into()).collect(),
                     ))
                     .await
-                    .map(|()|
-                         Handler::BlocksByHash {
-                             blocks: Vec::with_capacity(hashes.len()),
-                             pending_hashes: hashes,
-                         }
-                    )
+                    .map(|()| {
+                        if profiles::enabled() {
+                            let source = self.connection_info.connected_addr.get_transient_addr().and_then(|a| lifecycle::source(&a.ip()));
+                            for hash in hashes.iter().take(64) { lifecycle::observe(hash.0, Route::LegacyPeer, Phase::PeerRequestFlushed, source); }
+                        }
+                        Handler::BlocksByHash { blocks: Vec::with_capacity(hashes.len()), pending_hashes: hashes }
+                    })
             }
             (AwaitingRequest, TransactionsById(ids) | TransactionsByIdFrom { ids, .. }) => {
                 self
@@ -1860,4 +1914,32 @@ fn transaction_ids(items: &'_ [InventoryHash]) -> impl Iterator<Item = UnminedTx
 /// Non-block inventory hashes are skipped.
 fn block_hashes(items: &'_ [InventoryHash]) -> impl Iterator<Item = block::Hash> + '_ {
     items.iter().filter_map(InventoryHash::block_hash)
+}
+
+/// Observe before response handling can consume inventory messages.
+fn profile_peer_message(message: &Message, peer: Option<PeerSocketAddr>) {
+    if !profiles::enabled() {
+        return;
+    }
+    let source = peer.and_then(|a| lifecycle::source(&a.ip()));
+    match message {
+        Message::Inv(items) => {
+            for item in items.iter().take(64) {
+                if let InventoryHash::Block(hash) = item {
+                    lifecycle::observe(hash.0, Route::LegacyPeer, Phase::PeerAnnouncement, source);
+                }
+            }
+        }
+        Message::Block(block) => {
+            lifecycle::observe(block.hash().0, Route::LegacyPeer, Phase::PeerBody, source)
+        }
+        Message::NotFound(items) => {
+            for item in items.iter().take(64) {
+                if let InventoryHash::Block(hash) = item {
+                    lifecycle::observe(hash.0, Route::LegacyPeer, Phase::PeerNotFound, source);
+                }
+            }
+        }
+        _ => {}
+    }
 }

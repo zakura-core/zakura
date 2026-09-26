@@ -215,3 +215,36 @@ Exercise collector kill/restart, sampler failure, quota exhaustion, pruning duri
 Transaction detail starts collapsed in each block timeline. Expand Transactions, then an individual transaction to inspect its checks, or expand Finalization to inspect its nested elapsed-time breakdown. Public links resolve the newest retained profile for the block.
 
 The experimental shielded verification breakdown has been withdrawn. New recordings use the previous stage instrumentation. The collector retains read compatibility for already stored experimental spans, and the restored timeline hides those additional rows. Historical profile downloads remain intact.
+
+
+## Parent wait diagnostics
+
+New recordings include a `Waiting for parent` span and an expandable arrival timeline
+for the exact block and parent hash within the same run. Verifier and total recorded
+time retain their existing boundaries. Arrival timestamps can precede those boundaries
+and are not added to block processing time. Historical recordings are not reconstructed.
+
+The active legacy gossip and sync paths record discovery, queue rejection, download
+submission/body delivery, per-source verification admission, router entry, and state
+writer admission. Legacy peer connections also record decoded inventory, request
+flush, decoded bodies, unavailable-block responses, connection failures, and response
+timeouts before response handling consumes them.
+These transport milestones are local observations, not remote mining or receipt times.
+Header-driven sync does not yet have the same ingress coverage. The router/state
+milestones still apply, so a missing downloader timeline is not evidence of peer delay.
+
+Source IDs are random-keyed hashes local to a node run. They correlate the same legacy
+IP across connection and gossip events without exporting the address. Download operation
+IDs distinguish retry attempts. An `incomplete` result can mean an early rejection,
+error or cancellation; the last milestone narrows the phase, but does not identify the
+error by itself. The parent panel also shows bounded recent activity for matching
+sources, to identify another block occupying the source verification slot.
+
+Recording is best effort and only enabled with the existing collector socket. Producers
+use a nonblocking admission lock, at most 256 lifecycle events per second, and the existing
+bounded export queue. Peer message inspection considers at most 64 items. The collector
+retains at most 200,000 milestones globally, prunes oldest first, and stops retaining them
+at 90% of its storage budget. Each block query returns at most 513 milestones for each
+of child and parent, plus 128 records for each of at most four sources. Source context
+starts two minutes before a source wait. Missing or expired events never prove a block
+was not announced. No scheduling, retries, source locks, or validation rules are changed.

@@ -61,6 +61,7 @@ fn name<T: Serialize>(value: &T) -> Result<String> {
 }
 fn attempt_id(data: &Event) -> u64 {
     match data {
+        Event::Lifecycle(_) => 0,
         Event::Start { attempt, .. }
         | Event::Span { attempt, .. }
         | Event::Finish { attempt, .. }
@@ -235,6 +236,43 @@ impl Store {
                 if sequence <= previous {
                     return Ok(());
                 }
+                if let Event::Lifecycle(record) = data {
+                    let tx = self.db.savepoint()?;
+                    tx.execute(
+                        "UPDATE runs SET sequence=?,gaps=gaps+?,seen_ms=? WHERE id=?",
+                        params![
+                            sequence,
+                            sequence - previous - 1,
+                            integer(now_ms())?,
+                            run_id
+                        ],
+                    )?;
+                    if self.used < self.budget * 9 / 10 {
+                        let mut hash = record.hash;
+                        hash.reverse();
+                        let mut payload = serde_json::to_value(record)?;
+                        payload["hash"] = json!(hex::encode(hash));
+                        // JSON numbers cannot exactly represent all opaque 64-bit source IDs.
+                        payload["source"] = record
+                            .source
+                            .map(|s| json!(format!("{s:016x}")))
+                            .unwrap_or(Value::Null);
+                        tx.execute(
+                            "INSERT INTO lifecycle(run,hash,source,at_us,payload) VALUES(?,?,?,?,?)",
+                            params![
+                                run_id,
+                                hex::encode(hash),
+                                payload["source"].as_str(),
+                                integer(record.at_us)?,
+                                payload.to_string()
+                            ],
+                        )?;
+                    } else {
+                        self.discarded = self.discarded.saturating_add(1);
+                    }
+                    tx.commit()?;
+                    return Ok(());
+                }
                 let attempt = integer(attempt_id(&data))?;
                 ensure!(attempt > 0, "invalid attempt");
                 // A transaction keeps sequence deduplication consistent with summary writes.
@@ -253,6 +291,9 @@ impl Store {
                     params![run_id, attempt],
                 )?;
                 match data {
+                    Event::Lifecycle(_) => {
+                        unreachable!("lifecycle records handled before attempt ingestion")
+                    }
                     Event::Start {
                         block, start_us, ..
                     } => Self::summary(&tx, &run_id, attempt, block, start_us, None, None, 0)?,
@@ -342,6 +383,12 @@ impl Store {
         dropped: u64,
     ) -> Result<()> {
         // Native hash bytes are reversed for the conventional block explorer representation.
+        let mut parent = block.parent;
+        parent.reverse();
+        db.execute(
+            "INSERT OR REPLACE INTO block_parents(run,attempt,hash) VALUES(?,?,?)",
+            params![run, attempt, hex::encode(parent)],
+        )?;
         let mut hash = block.hash;
         hash.reverse();
         db.execute("UPDATE attempts SET hash=?,height=?,mode=?,transactions=?,start_us=?,end_us=COALESCE(?,end_us),outcome=COALESCE(?,outcome),dropped=MAX(dropped,?),utc_ms=(SELECT utc_ms FROM runs WHERE id=?)+?/1000 WHERE run=? AND attempt=?",
@@ -772,6 +819,63 @@ impl Reader {
             params![run, integer(attempt)?],
             row,
         )?;
+        let parent_hash: Option<String> = self
+            .db
+            .query_row(
+                "SELECT hash FROM block_parents WHERE run=? AND attempt=?",
+                params![run, integer(attempt)?],
+                |r| r.get(0),
+            )
+            .optional()?;
+        // Bound both reads. Missing records never establish that a peer did not announce a block.
+        let milestones = |hash: &str| -> Result<Vec<Value>> {
+            let records: Vec<String> = self.db.prepare("SELECT payload FROM lifecycle WHERE run=? AND hash=? AND at_us<=? ORDER BY at_us DESC,id DESC LIMIT 513")?
+                .query_map(params![run,hash,integer(summary["end_us"].as_u64().unwrap_or(u64::MAX >> 1))?],|r|r.get(0))?.collect::<rusqlite::Result<_>>()?;
+            records
+                .into_iter()
+                .rev()
+                .map(|s| Ok(serde_json::from_str(&s)?))
+                .collect()
+        };
+        let ingress = milestones(summary["hash"].as_str().unwrap_or(""))?;
+        let parent_ingress = parent_hash
+            .as_deref()
+            .map(milestones)
+            .transpose()?
+            .unwrap_or_default();
+        let parent_attempt: Option<i64> = if let Some(hash) = &parent_hash {
+            self.db.query_row("SELECT attempt FROM attempts WHERE run=? AND hash=? AND start_us<=? AND outcome='success' AND mode IN ('semantic','checkpoint') ORDER BY start_us DESC LIMIT 1", params![run,hash,integer(summary["end_us"].as_u64().unwrap_or(u64::MAX >> 1))?], |r|r.get(0)).optional()?
+        } else {
+            None
+        };
+        let mut source_activity = Vec::<Value>::new();
+        let mut sources = BTreeSet::new();
+        for record in parent_ingress.iter().chain(ingress.iter()).rev() {
+            if record["phase"] != "source_wait" {
+                continue;
+            }
+            let Some(source) = record["source"].as_str() else {
+                continue;
+            };
+            if sources.len() >= 4 || !sources.insert(source.to_owned()) {
+                continue;
+            }
+            let start = record["at_us"]
+                .as_u64()
+                .unwrap_or(0)
+                .saturating_sub(120_000_000);
+            let records: Vec<String> = self.db.prepare("SELECT payload FROM lifecycle WHERE run=? AND source=? AND at_us>=? AND at_us<=? AND hash!=? AND hash!=? ORDER BY at_us DESC,id DESC LIMIT 128")?
+                .query_map(params![run,source,integer(start)?,integer(summary["end_us"].as_u64().unwrap_or(u64::MAX>>1))?,summary["hash"].as_str(),parent_hash],|r|r.get(0))?.collect::<rusqlite::Result<_>>()?;
+            for record in records {
+                source_activity.push(serde_json::from_str(&record)?);
+            }
+        }
+        let recording_loss: bool = self.db.query_row(
+            "SELECT dropped>0 OR transport_dropped>0 OR gaps>0 FROM runs WHERE id=?",
+            [run],
+            |r| r.get(0),
+        )?;
+        let dependencies = json!({"parent_hash":parent_hash,"parent_attempt":parent_attempt,"events":ingress,"parent_events":parent_ingress,"source_activity":source_activity,"recording_has_loss":recording_loss,"best_effort":true});
         let files: Vec<String> = self.db.prepare("SELECT chunk FROM details JOIN chunks ON chunk=id WHERE run=? AND attempt=? AND deleting=0 LIMIT 65")?.query_map(params![run,integer(attempt)?], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
         ensure!(
             files.len() <= MAX_DETAIL_CHUNKS,
@@ -852,7 +956,7 @@ impl Reader {
             "eligible_for_statistics":summary["exclusion_reason"].is_null() && summary["startup"] == false,
         });
         Ok(
-            json!({"summary":summary,"recording":recording,"spans":spans,"complete":complete,"missing_chunks":missing,"cpu":cpu,"timing":timing,"boundary":"Verifier request measures router entry to caller result. Total recorded time extends through the last recorded work, including finalization after the response. Caller readiness, network and ingress are outside both intervals. Missing detail can leave the total understated."}),
+            json!({"summary":summary,"recording":recording,"dependencies":dependencies,"spans":spans,"complete":complete,"missing_chunks":missing,"cpu":cpu,"timing":timing,"boundary":"Verifier request measures router entry to caller result. Total recorded time extends through the last recorded work, including finalization after the response. Caller readiness, network and ingress are outside both intervals. Missing detail can leave the total understated."}),
         )
     }
     /// CPU decoding is explicit and bounded, separate from ordinary block timeline reads.

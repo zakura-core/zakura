@@ -57,3 +57,20 @@ CREATE TABLE IF NOT EXISTS status (
  errors INTEGER NOT NULL, budget INTEGER NOT NULL, used INTEGER NOT NULL,
  discarded_spans INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS block_parents (
+ run TEXT NOT NULL, attempt INTEGER NOT NULL, hash TEXT NOT NULL,
+ PRIMARY KEY(run,attempt),
+ FOREIGN KEY(run,attempt) REFERENCES attempts(run,attempt) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS lifecycle (
+ id INTEGER PRIMARY KEY AUTOINCREMENT,
+ run TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+ hash TEXT NOT NULL, source TEXT, at_us INTEGER NOT NULL, payload TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS lifecycle_source ON lifecycle(run,source,at_us);
+CREATE INDEX IF NOT EXISTS lifecycle_block ON lifecycle(run,hash,at_us);
+-- Independent hard bound even if announcements arrive for blocks that never verify.
+CREATE TRIGGER IF NOT EXISTS lifecycle_bound AFTER INSERT ON lifecycle BEGIN
+ DELETE FROM lifecycle WHERE id <= NEW.id - 200000;
+END;

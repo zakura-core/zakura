@@ -21,6 +21,7 @@ use std::{
 use crossbeam_channel::{bounded, Receiver, Sender};
 use serde::{Deserialize, Serialize};
 
+pub mod lifecycle;
 pub mod verification;
 
 /// Version of the wire schema and timing definitions.
@@ -168,6 +169,8 @@ pub enum Stage {
     WorkerExecution,
     /// State writer queue residence.
     WriterQueue,
+    /// Block retained until its parent can be handed to the state writer.
+    ParentWait,
     /// Writer processing, which can continue after caller response.
     WriterOccupied,
     /// Contextual checks and state application.
@@ -283,6 +286,8 @@ pub enum Outcome {
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum Event {
+    /// Bounded block ingress evidence, independent of verifier attempts.
+    Lifecycle(lifecycle::Record),
     /// All owners released this attempt, including work after the caller response.
     Seal {
         /// Attempt identity.
@@ -426,6 +431,7 @@ struct Recorder {
     ready_us: AtomicU64,
     last_activity_us: AtomicU64,
     startup: Mutex<StartupGate>,
+    lifecycle: lifecycle::Limiter,
 }
 
 impl Recorder {
@@ -470,6 +476,7 @@ struct Attempt {
     next_span: AtomicU64,
     requested_spans: AtomicU64,
     fine_spans: AtomicU64,
+    parent_wait: AtomicU64,
     dropped: AtomicU64,
 }
 impl Drop for Attempt {
@@ -572,6 +579,27 @@ impl Context {
         let mut span = self.span(Stage::Transaction);
         span.transaction_hash = Some(hash);
         span
+    }
+    /// Mark an actual unavailable-parent branch, without keeping another block or context alive.
+    pub fn parent_wait_started(&self) {
+        if let Some((attempt, _, _)) = &self.0 {
+            let _ = attempt.parent_wait.compare_exchange(
+                u64::MAX,
+                attempt.recorder.now(),
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            );
+        }
+    }
+    /// End the dependency wait when the state service dispatches this block to its writer.
+    pub fn parent_wait_finished(&self) {
+        if let Some((attempt, _, _)) = &self.0 {
+            let start = attempt.parent_wait.swap(u64::MAX, Ordering::Relaxed);
+            if start != u64::MAX {
+                let mut span = self.span(Stage::ParentWait);
+                span.start_us = start;
+            }
+        }
     }
     /// Record an already measured synchronous phase without allocating or formatting its name.
     pub fn duration(&self, stage: Stage, elapsed: Duration) {
@@ -774,6 +802,7 @@ fn begin_with(recorder: &Arc<Recorder>, block: Block) -> Option<Root> {
             next_span: AtomicU64::new(1),
             requested_spans: AtomicU64::new(0),
             fine_spans: AtomicU64::new(0),
+            parent_wait: AtomicU64::new(u64::MAX),
             dropped: AtomicU64::new(0),
         }),
         0,
@@ -906,6 +935,7 @@ fn recorder() -> (Arc<Recorder>, Receiver<Event>, Receiver<Event>) {
             ready_us: AtomicU64::new(u64::MAX),
             last_activity_us: AtomicU64::new(0),
             startup: Mutex::new(StartupGate::default()),
+            lifecycle: lifecycle::Limiter::default(),
         }),
         detail,
         summary,

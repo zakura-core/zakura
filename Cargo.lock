@@ -7823,7 +7823,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-network"
-version = "8.0.0"
+version = "9.0.0"
 dependencies = [
  "bitflags",
  "blake2b_simd",
@@ -8041,7 +8041,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-rpc"
-version = "11.0.0"
+version = "12.0.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",

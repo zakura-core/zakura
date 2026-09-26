@@ -8,8 +8,8 @@ in --artifacts on success or failure. Every RPC and process wait is bounded.
 import argparse
 import json
 import pathlib
+import re
 import signal
-import socket
 import subprocess
 import time
 import urllib.error
@@ -18,12 +18,14 @@ import urllib.request
 
 NU7 = 1104
 RESTART_HEIGHT = NU7 + 2
+RPC_ENDPOINT = re.compile(rb"Opened RPC endpoint at 127\.0\.0\.1:(\d+)")
 
 
-def port():
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
+def assigned_rpc_port(log_path, offset):
+    with log_path.open("rb") as log:
+        log.seek(offset)
+        matches = RPC_ENDPOINT.findall(log.read())
+    return int(matches[-1]) if matches else None
 
 
 class Node:
@@ -31,8 +33,7 @@ class Node:
         self.binary = str(pathlib.Path(binary).resolve(strict=True))
         self.directory = directory
         directory.mkdir(parents=True, exist_ok=True)
-        self.rpc_port = port()
-        self.p2p_port = port()
+        self.rpc_port = None
         self.process = None
         self.log = None
         self.activate = activate
@@ -47,7 +48,7 @@ class Node:
 
         text = f'''[network]
 network = {{ params = {{ activation_heights = {{ {upgrades} }}{disbursement} }} }}
-listen_addr = "127.0.0.1:{self.p2p_port}"
+listen_addr = "127.0.0.1:0"
 p2p_stack = "legacy"
 initial_testnet_peers = []
 cache_dir = false
@@ -55,7 +56,7 @@ cache_dir = false
 cache_dir = {json.dumps(str(self.directory / 'state'))}
 ephemeral = false
 [rpc]
-listen_addr = "127.0.0.1:{self.rpc_port}"
+listen_addr = "127.0.0.1:0"
 enable_cookie_auth = false
 [mining]
 miner_address = "tmJymvcUCn1ctbghvTJpXBwHiMEB8P6wxNV"
@@ -65,12 +66,23 @@ filter = "info"
         (self.directory / "zakura.toml").write_text(text)
 
     def start(self):
-        self.log = (self.directory / "node.log").open("ab")
+        log_path = self.directory / "node.log"
+        rpc_log_offset = log_path.stat().st_size if log_path.exists() else 0
+        self.rpc_port = None
+        self.log = log_path.open("ab")
         self.process = subprocess.Popen(
             [self.binary, "-c", str(self.directory / "zakura.toml"), "start"],
             stdout=self.log, stderr=subprocess.STDOUT,
         )
+        self.wait(
+            lambda: self.set_rpc_port(log_path, rpc_log_offset),
+            "OS-assigned RPC listener",
+        )
         self.wait(lambda: self.call("getblockcount") is not None, "RPC startup")
+
+    def set_rpc_port(self, log_path, offset):
+        self.rpc_port = assigned_rpc_port(log_path, offset)
+        return self.rpc_port is not None
 
     def call(self, method, params=None):
         data = json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": params or []}).encode()

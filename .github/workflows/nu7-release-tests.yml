@@ -72,6 +72,8 @@ jobs:
       - uses: ./.github/actions/setup-zakura-build
       - name: Production branch and dependency compatibility
         run: cargo run --locked --release -p xtask -- nu7-readiness 2>&1 | tee "$RUNNER_TEMP/nu7-readiness.log"
+      - name: Upgrade harness unit tests
+        run: python3 -m unittest scripts.tests.test_nsm_release_upgrade
       - name: Build the production artifact without dev dependency features
         run: |
           cargo build --locked --release -p zakura --bin zakurad

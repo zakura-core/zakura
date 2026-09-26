@@ -10,6 +10,7 @@
 //!
 //! A root of a note commitment tree is associated with each treestate.
 
+use crate::serialization::ZcashReader;
 use std::{
     default::Default,
     fmt,
@@ -136,7 +137,9 @@ impl ZcashSerialize for Root {
 }
 
 impl ZcashDeserialize for Root {
-    fn zcash_deserialize<R: io::Read>(mut reader: R) -> Result<Self, SerializationError> {
+    fn zcash_deserialize_from<R: io::Read>(
+        reader: &mut ZcashReader<R>,
+    ) -> Result<Self, SerializationError> {
         Self::try_from(reader.read_32_bytes()?)
     }
 }

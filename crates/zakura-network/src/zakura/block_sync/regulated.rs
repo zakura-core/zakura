@@ -6,6 +6,7 @@
 
 mod requester;
 mod serving;
+pub(super) mod session;
 mod wire;
 
 #[cfg(test)]

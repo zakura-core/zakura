@@ -255,6 +255,7 @@ impl Disposition {
 /// shared primitives. One task per connected peer; spawned at the pipe spawn point
 /// (`service::add_peer`) so a protocol reject cancels the whole connection.
 pub(super) struct PeerRoutine {
+    serving: Option<super::regulated::session::ServingSession>,
     peer: ZakuraPeerId,
     conn_id: ZakuraConnId,
     source: zakura_header_chain::SourceId,
@@ -375,6 +376,7 @@ impl PeerRoutine {
         let max_blocks_per_response = config.advertised_max_blocks_per_response();
         let max_response_bytes = config.advertised_max_response_bytes();
         PeerRoutine {
+            serving: None,
             peer,
             conn_id,
             source,
@@ -415,6 +417,14 @@ impl PeerRoutine {
     /// Run the pipe-routine until stream close, cancellation, or a protocol
     /// reject. A reject returns `Err(SinkReject::protocol(..))` so the supervised
     /// pipe tears the whole connection down.
+    pub(super) fn with_serving(
+        mut self,
+        serving: Option<super::regulated::session::ServingSession>,
+    ) -> Self {
+        self.serving = serving;
+        self
+    }
+
     pub(super) async fn run(mut self) -> Result<(), SinkReject> {
         let mut guard = block_sync_guard();
         let result = self.run_inner(&mut guard).await;
@@ -495,7 +505,7 @@ impl PeerRoutine {
             tokio::select! {
                 biased;
                 _ = self.cancel.cancelled() => return Ok(()),
-                frame = self.recv.recv(), if outbound_queue_has_capacity => {
+                frame = self.recv.recv(), if outbound_queue_has_capacity || self.serving.is_some() => {
                     match frame {
                         // Decode the frame and run the download/serving dispatch
                         // in this same task. A protocol reject propagates out so
@@ -610,15 +620,19 @@ impl PeerRoutine {
                 start_height,
                 count,
             } => {
-                // Serving is reactor-owned (state query + driver). Forward the
-                // request; the reactor serves via the session clone it holds.
-                let _ = self
-                    .routine_to_reactor
-                    .try_send(RoutineToReactor::ServeGetBlocks {
-                        peer: self.peer.clone(),
-                        start_height,
-                        count,
-                    });
+                if let Some(serving) = &mut self.serving {
+                    serving.admit(start_height, count)?;
+                } else {
+                    // Serving is reactor-owned (state query + driver). Forward the
+                    // request; the reactor serves via the session clone it holds.
+                    let _ = self
+                        .routine_to_reactor
+                        .try_send(RoutineToReactor::ServeGetBlocks {
+                            peer: self.peer.clone(),
+                            start_height,
+                            count,
+                        });
+                }
             }
             BlockSyncMessage::Block(block) => {
                 self.trace_wake("own_body");

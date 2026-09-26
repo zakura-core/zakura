@@ -87,7 +87,7 @@ use std::{
 };
 
 use thiserror::Error;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
 pub(crate) use capacity::{ServeCapacity, ServeConfigError, ServeLimits};
@@ -163,11 +163,32 @@ struct Commitments {
 
 /// One open request. Dropping it releases the commitment.
 #[derive(Debug)]
-pub(super) struct Commitment(Arc<Commitments>);
+pub(super) struct Commitment(Arc<Commitments>, Option<watch::Sender<bool>>);
+
+impl Commitment {
+    /// Publish and mark complete under the same lock. A receiver that has seen
+    /// the ending must also see completion when it checks for a reused key.
+    fn queue_ending<T, E>(&self, publish: impl FnOnce() -> Result<T, E>) -> Result<T, E> {
+        if let Some(completed) = &self.1 {
+            let mut result = None;
+            completed.send_modify(|done| {
+                let published = publish();
+                *done = published.is_ok();
+                result = Some(published);
+            });
+            result.expect("send_modify runs its closure before returning")
+        } else {
+            publish()
+        }
+    }
+}
 
 impl Drop for Commitment {
     fn drop(&mut self) {
         self.0.open.fetch_sub(1, Ordering::AcqRel);
+        if let Some(completed) = &self.1 {
+            completed.send_replace(true);
+        }
     }
 }
 
@@ -261,8 +282,28 @@ impl<P: Produce> Serve<P> {
     /// than any conformant peer could have. See the module docs for the
     /// margin.
     pub(crate) fn admit(&self, request: P::Request) -> Result<(), ServeViolation> {
+        self.admit_inner(request, None)
+    }
+
+    /// Admit a request and observe when its ending is queued or it is cancelled.
+    /// Reading the watch value is synchronized with ending publication, so a
+    /// reactor can safely reject overlapping requests until completion.
+    pub(crate) fn admit_tracked(
+        &self,
+        request: P::Request,
+    ) -> Result<watch::Receiver<bool>, ServeViolation> {
+        let (completed, receiver) = watch::channel(false);
+        self.admit_inner(request, Some(completed))?;
+        Ok(receiver)
+    }
+
+    fn admit_inner(
+        &self,
+        request: P::Request,
+        completed: Option<watch::Sender<bool>>,
+    ) -> Result<(), ServeViolation> {
         let open = self.commitments.open.fetch_add(1, Ordering::AcqRel) + 1;
-        let commitment = Commitment(self.commitments.clone());
+        let commitment = Commitment(self.commitments.clone(), completed);
         let limit = self.commitments.limit.load(Ordering::Acquire);
         if open > limit.saturating_mul(2) {
             return Err(ServeViolation::OverCommitted { open, limit });

@@ -125,7 +125,7 @@ async fn committed_tip_relay_over_legacy_tcp_is_prompt() -> Result<(), crate::Bo
         body_response,
         Response::Blocks(ref blocks) if blocks.iter().any(|item| matches!(item, Available((block, _)) if block.hash() == block_two.hash()))
     ));
-    eprintln!(
+    tracing::info!(
         "relay_tcp_probe scenario=back_to_back inv_ms={} body_ms={}",
         inv_elapsed.as_millis(),
         body_elapsed.as_millis()

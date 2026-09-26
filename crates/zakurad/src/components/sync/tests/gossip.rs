@@ -125,6 +125,7 @@ async fn setup_gossip_test() -> GossipTestSetup {
 /// Synthetic selected-tip notifications isolate the scheduler from async state commits.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn committed_tip_relay_is_prompt() {
+    let _init_guard = zakura_test::init();
     let (mut tip_sender, _latest_tip, tip_change) = ChainTipSender::new(None, &Mainnet);
     let (sync_status, mut recent_syncs) = SyncStatus::new();
     SyncStatus::sync_close_to_tip(&mut recent_syncs);
@@ -165,7 +166,7 @@ async fn committed_tip_relay_is_prompt() {
         .await
         .respond(Response::Nil);
     let elapsed = changed_at.elapsed();
-    eprintln!(
+    tracing::info!(
         "relay_probe scenario=back_to_back elapsed_ms={}",
         elapsed.as_millis()
     );
@@ -188,7 +189,7 @@ async fn committed_tip_relay_is_prompt() {
         .await
         .respond(Response::Nil);
     let same_height_elapsed = changed_at.elapsed();
-    eprintln!(
+    tracing::info!(
         "relay_probe scenario=same_height elapsed_ms={}",
         same_height_elapsed.as_millis()
     );
@@ -206,7 +207,7 @@ async fn committed_tip_relay_is_prompt() {
         .await
         .respond(Response::Nil);
     let idle_elapsed = changed_at.elapsed();
-    eprintln!(
+    tracing::info!(
         "relay_probe scenario=idle_same_height elapsed_ms={}",
         idle_elapsed.as_millis()
     );
@@ -217,6 +218,7 @@ async fn committed_tip_relay_is_prompt() {
 /// The synthetic tips model selected-tip notifications, not consensus validation.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn committed_tip_stalled_send_is_bounded() {
+    let _init_guard = zakura_test::init();
     struct ActiveSend(Arc<AtomicUsize>);
     impl Drop for ActiveSend {
         fn drop(&mut self) {
@@ -288,7 +290,7 @@ async fn committed_tip_stalled_send_is_bounded() {
     }
     let peak = maximum.load(Ordering::SeqCst);
     let requests = sent.load(Ordering::SeqCst);
-    eprintln!("relay_burst_probe tips=20 requests={requests} max_in_flight={peak}");
+    tracing::info!("relay_burst_probe tips=20 requests={requests} max_in_flight={peak}");
     assert_eq!(peak, 1, "only one ordinary operation may be in flight");
     assert_eq!(
         requests, 1,
@@ -306,6 +308,7 @@ async fn committed_tip_stalled_send_is_bounded() {
 /// A failed ordinary send retries without another selected-tip notification.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn committed_tip_failure_retries_without_new_tip() {
+    let _init_guard = zakura_test::init();
     let (mut tip_sender, _latest_tip, tip_change) = ChainTipSender::new(None, &Mainnet);
     let (sync_status, mut recent_syncs) = SyncStatus::new();
     SyncStatus::sync_close_to_tip(&mut recent_syncs);
@@ -346,7 +349,7 @@ async fn committed_tip_failure_retries_without_new_tip() {
     tokio::time::sleep(Duration::from_secs(20)).await;
     tokio::task::yield_now().await;
     let count = calls.load(Ordering::SeqCst);
-    eprintln!("relay_failed_send_probe elapsed_after_failure_s=20 requests={count}");
+    tracing::info!("relay_failed_send_probe elapsed_after_failure_s=20 requests={count}");
     assert!(count >= 2, "unchanged tip must retry after failed delivery");
     assert!(count <= 21, "failures must not cause a busy retry loop");
     gossip_task.abort();

@@ -648,12 +648,7 @@ async fn any_chain_block_finds_side_chain_blocks() -> Result<()> {
     let best_hash = best_chain_block.hash();
     let side_hash = side_chain_block.hash();
 
-    // If hashes are the same, we can't test side chains properly
-    // This would mean our fake block generation isn't working as expected
-    if best_hash == side_hash {
-        tracing::warn!("unable to create different block hashes, skipping side chain test");
-        return Ok(());
-    }
+    assert_ne!(best_hash, side_hash, "fixture must contain distinct forks");
 
     // Create state with a finalized and non-finalized component
     let mut non_finalized_state = NonFinalizedState::new(&network);
@@ -730,6 +725,172 @@ async fn any_chain_block_finds_side_chain_blocks() -> Result<()> {
     );
     assert_eq!(found.unwrap().hash(), best_hash);
 
+    // A reorg can leave an RPC's resolved block on a retained side chain.
+    // Exercise the actual service dispatch, including all three pool variants.
+    let (_state, mut read_state, _tip, _change) = init_test_services(&network).await;
+    let (_sender, receiver) = tokio::sync::watch::channel(non_finalized_state.clone());
+    read_state.non_finalized_state_receiver =
+        crate::service::watch_receiver::WatchReceiver::new(receiver);
+
+    assert!(matches!(
+        read_state
+            .clone()
+            .oneshot(ReadRequest::SaplingTree(side_hash.into()))
+            .await?,
+        ReadResponse::SaplingTree(None)
+    ));
+    for hash in [best_hash, side_hash] {
+        let ReadResponse::SaplingTree(Some(found)) = read_state
+            .clone()
+            .oneshot(ReadRequest::AnyChainSaplingTree(hash))
+            .await?
+        else {
+            panic!("retained blocks have a Sapling tree");
+        };
+        let chain = non_finalized_state
+            .find_chain(|chain| chain.contains_block_hash(hash))
+            .unwrap();
+        assert_eq!(
+            found.root(),
+            chain.sapling_tree(hash.into()).unwrap().root()
+        );
+    }
+    assert!(matches!(
+        read_state
+            .clone()
+            .oneshot(ReadRequest::AnyChainSaplingTree(zakura_chain::block::Hash(
+                [0xff; 32]
+            )))
+            .await?,
+        ReadResponse::SaplingTree(None)
+    ));
+
+    assert!(matches!(
+        read_state
+            .clone()
+            .oneshot(ReadRequest::OrchardTree(side_hash.into()))
+            .await?,
+        ReadResponse::OrchardTree(None)
+    ));
+    for hash in [best_hash, side_hash] {
+        let ReadResponse::OrchardTree(Some(found)) = read_state
+            .clone()
+            .oneshot(ReadRequest::AnyChainOrchardTree(hash))
+            .await?
+        else {
+            panic!("retained blocks have an Orchard tree");
+        };
+        let chain = non_finalized_state
+            .find_chain(|chain| chain.contains_block_hash(hash))
+            .unwrap();
+        assert_eq!(
+            found.root(),
+            chain.orchard_tree(hash.into()).unwrap().root()
+        );
+    }
+    assert!(matches!(
+        read_state
+            .clone()
+            .oneshot(ReadRequest::AnyChainOrchardTree(zakura_chain::block::Hash(
+                [0xff; 32]
+            )))
+            .await?,
+        ReadResponse::OrchardTree(None)
+    ));
+
+    assert!(matches!(
+        read_state
+            .clone()
+            .oneshot(ReadRequest::IronwoodTree(side_hash.into()))
+            .await?,
+        ReadResponse::IronwoodTree(None)
+    ));
+    for hash in [best_hash, side_hash] {
+        let ReadResponse::IronwoodTree(Some(found)) = read_state
+            .clone()
+            .oneshot(ReadRequest::AnyChainIronwoodTree(hash))
+            .await?
+        else {
+            panic!("retained blocks have an Ironwood tree");
+        };
+        let chain = non_finalized_state
+            .find_chain(|chain| chain.contains_block_hash(hash))
+            .unwrap();
+        assert_eq!(
+            found.root(),
+            chain.ironwood_tree(hash.into()).unwrap().root()
+        );
+    }
+    assert!(matches!(
+        read_state
+            .clone()
+            .oneshot(ReadRequest::AnyChainIronwoodTree(
+                zakura_chain::block::Hash([0xff; 32])
+            ))
+            .await?,
+        ReadResponse::IronwoodTree(None)
+    ));
+
+    Ok(())
+}
+
+/// Any-chain requests retain the finalized-state fallback for each shielded pool.
+#[tokio::test]
+async fn any_chain_treestate_finds_finalized_trees() -> Result<()> {
+    let _init_guard = zakura_test::init();
+    let blocks: Vec<Arc<Block>> = zakura_test::vectors::CONTINUOUS_MAINNET_BLOCKS
+        .values()
+        .map(|bytes| bytes.zcash_deserialize_into().unwrap())
+        .collect();
+    let (_state, read_state, _tip, _change) = populated_state(blocks.clone(), &Mainnet).await;
+    for block in blocks {
+        let hash = block.hash();
+        let ReadResponse::SaplingTree(Some(expected)) = read_state
+            .clone()
+            .oneshot(ReadRequest::SaplingTree(hash.into()))
+            .await?
+        else {
+            panic!("committed block has a Sapling tree");
+        };
+        let ReadResponse::SaplingTree(Some(found)) = read_state
+            .clone()
+            .oneshot(ReadRequest::AnyChainSaplingTree(hash))
+            .await?
+        else {
+            panic!("any-chain lookup must preserve finalized trees");
+        };
+        assert_eq!(expected.root(), found.root());
+        let ReadResponse::OrchardTree(Some(expected)) = read_state
+            .clone()
+            .oneshot(ReadRequest::OrchardTree(hash.into()))
+            .await?
+        else {
+            panic!("committed block has a Orchard tree");
+        };
+        let ReadResponse::OrchardTree(Some(found)) = read_state
+            .clone()
+            .oneshot(ReadRequest::AnyChainOrchardTree(hash))
+            .await?
+        else {
+            panic!("any-chain lookup must preserve finalized trees");
+        };
+        assert_eq!(expected.root(), found.root());
+        let ReadResponse::IronwoodTree(Some(expected)) = read_state
+            .clone()
+            .oneshot(ReadRequest::IronwoodTree(hash.into()))
+            .await?
+        else {
+            panic!("committed block has a Ironwood tree");
+        };
+        let ReadResponse::IronwoodTree(Some(found)) = read_state
+            .clone()
+            .oneshot(ReadRequest::AnyChainIronwoodTree(hash))
+            .await?
+        else {
+            panic!("any-chain lookup must preserve finalized trees");
+        };
+        assert_eq!(expected.root(), found.root());
+    }
     Ok(())
 }
 

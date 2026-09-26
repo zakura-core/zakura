@@ -2029,6 +2029,11 @@ pub enum ReadRequest {
     /// * [`ReadResponse::SaplingTree(None)`](crate::ReadResponse::SaplingTree) otherwise.
     SaplingTree(HashOrHeight),
 
+    /// Looks up the Sapling tree by block hash across retained chains and finalized state.
+    /// Returns [`ReadResponse::SaplingTree`](crate::ReadResponse::SaplingTree),
+    /// preserving historical-tree recovery and errors for fast-synced blocks.
+    AnyChainSaplingTree(block::Hash),
+
     /// Looks up an Orchard note commitment tree either by a hash or height.
     ///
     /// Returns
@@ -2038,6 +2043,11 @@ pub enum ReadRequest {
     /// * [`ReadResponse::OrchardTree(None)`](crate::ReadResponse::OrchardTree) otherwise.
     OrchardTree(HashOrHeight),
 
+    /// Looks up the Orchard tree by block hash across retained chains and finalized state.
+    /// Returns [`ReadResponse::OrchardTree`](crate::ReadResponse::OrchardTree),
+    /// preserving historical-tree recovery and errors for fast-synced blocks.
+    AnyChainOrchardTree(block::Hash),
+
     /// Looks up an Ironwood note commitment tree either by a hash or height.
     ///
     /// Returns
@@ -2046,6 +2056,11 @@ pub enum ReadRequest {
     ///   if the corresponding block contains an Ironwood note commitment tree.
     /// * [`ReadResponse::IronwoodTree(None)`](crate::ReadResponse::IronwoodTree) otherwise.
     IronwoodTree(HashOrHeight),
+
+    /// Looks up the Ironwood tree by block hash across retained chains and finalized state.
+    /// Returns [`ReadResponse::IronwoodTree`](crate::ReadResponse::IronwoodTree),
+    /// preserving historical-tree recovery and errors for fast-synced blocks.
+    AnyChainIronwoodTree(block::Hash),
 
     /// Returns a list of Sapling note commitment subtrees by their indexes, starting at
     /// `start_index`, and returning up to `limit` subtrees.
@@ -2247,8 +2262,11 @@ impl ReadRequest {
             #[cfg(feature = "indexer")]
             ReadRequest::RawBlocksByHeightRange { .. } => "raw_blocks_by_height_range",
             ReadRequest::SaplingTree { .. } => "sapling_tree",
+            ReadRequest::AnyChainSaplingTree { .. } => "any_chain_sapling_tree",
             ReadRequest::OrchardTree { .. } => "orchard_tree",
+            ReadRequest::AnyChainOrchardTree { .. } => "any_chain_orchard_tree",
             ReadRequest::IronwoodTree { .. } => "ironwood_tree",
+            ReadRequest::AnyChainIronwoodTree { .. } => "any_chain_ironwood_tree",
             ReadRequest::SaplingSubtrees { .. } => "sapling_subtrees",
             ReadRequest::OrchardSubtrees { .. } => "orchard_subtrees",
             ReadRequest::IronwoodSubtrees { .. } => "ironwood_subtrees",

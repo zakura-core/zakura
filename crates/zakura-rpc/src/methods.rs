@@ -2558,7 +2558,8 @@ where
         // # Concurrency
         //
         // For consistency, this lookup must be performed first, then all the other lookups must
-        // be based on the hash.
+        // be based on the hash. Tree reads also check retained side chains in case a reorg
+        // moves this block off the best chain between requests.
         //
         // TODO: If this RPC is called a lot, just get the block header, rather than the whole block.
         let block = match call_service(
@@ -2591,7 +2592,7 @@ where
         let sapling = if network.is_nu_active(consensus::NetworkUpgrade::Sapling, height.into()) {
             match call_service(
                 &mut read_state,
-                zakura_state::ReadRequest::SaplingTree(hash.into()),
+                zakura_state::ReadRequest::AnyChainSaplingTree(hash),
             )
             .await?
             {
@@ -2609,7 +2610,7 @@ where
         let orchard = if network.is_nu_active(consensus::NetworkUpgrade::Nu5, height.into()) {
             match call_service(
                 &mut read_state,
-                zakura_state::ReadRequest::OrchardTree(hash.into()),
+                zakura_state::ReadRequest::AnyChainOrchardTree(hash),
             )
             .await?
             {
@@ -2627,7 +2628,7 @@ where
         let ironwood = if network.is_nu_active(consensus::NetworkUpgrade::Nu6_3, height.into()) {
             match call_service(
                 &mut read_state,
-                zakura_state::ReadRequest::IronwoodTree(hash.into()),
+                zakura_state::ReadRequest::AnyChainIronwoodTree(hash),
             )
             .await?
             {

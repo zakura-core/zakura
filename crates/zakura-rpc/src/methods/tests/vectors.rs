@@ -1667,7 +1667,7 @@ async fn rpc_z_get_treestate_absent_band_is_an_error() {
         .respond(ReadResponse::Block(Some(block)));
 
     read_state
-        .expect_request(ReadRequest::SaplingTree(block_hash.into()))
+        .expect_request(ReadRequest::AnyChainSaplingTree(block_hash))
         .await
         .respond_error(Box::new(zakura_state::HistoricalTreeUnavailable {
             hash_or_height: block_hash.into(),

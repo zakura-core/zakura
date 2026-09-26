@@ -3279,12 +3279,44 @@ impl Service<ReadRequest> for ReadStateService {
                 Ok(ReadResponse::SaplingTree(tree))
             }
 
+            ReadRequest::AnyChainSaplingTree(hash) => {
+                let hash_or_height = hash.into();
+                let chain = state
+                    .latest_non_finalized_state()
+                    .find_chain(|chain| chain.contains_block_hash(hash));
+                let tree = match read::sapling_tree(chain, &state.db, hash_or_height) {
+                    Ok(tree) => tree,
+                    Err(unavailable) => Some(
+                        historical_frontiers(&state, hash_or_height, unavailable)?
+                            .sapling
+                            .clone(),
+                    ),
+                };
+                Ok(ReadResponse::SaplingTree(tree))
+            }
+
             ReadRequest::OrchardTree(hash_or_height) => {
                 let tree = match read::orchard_tree(
                     state.latest_best_chain(),
                     &state.db,
                     hash_or_height,
                 ) {
+                    Ok(tree) => tree,
+                    Err(unavailable) => Some(
+                        historical_frontiers(&state, hash_or_height, unavailable)?
+                            .orchard
+                            .clone(),
+                    ),
+                };
+                Ok(ReadResponse::OrchardTree(tree))
+            }
+
+            ReadRequest::AnyChainOrchardTree(hash) => {
+                let hash_or_height = hash.into();
+                let chain = state
+                    .latest_non_finalized_state()
+                    .find_chain(|chain| chain.contains_block_hash(hash));
+                let tree = match read::orchard_tree(chain, &state.db, hash_or_height) {
                     Ok(tree) => tree,
                     Err(unavailable) => Some(
                         historical_frontiers(&state, hash_or_height, unavailable)?
@@ -3306,6 +3338,22 @@ impl Service<ReadRequest> for ReadStateService {
                                 .clone(),
                         ),
                     };
+                Ok(ReadResponse::IronwoodTree(tree))
+            }
+
+            ReadRequest::AnyChainIronwoodTree(hash) => {
+                let hash_or_height = hash.into();
+                let chain = state
+                    .latest_non_finalized_state()
+                    .find_chain(|chain| chain.contains_block_hash(hash));
+                let tree = match read::ironwood_tree(chain, &state.db, hash_or_height) {
+                    Ok(tree) => tree,
+                    Err(unavailable) => Some(
+                        historical_frontiers(&state, hash_or_height, unavailable)?
+                            .ironwood
+                            .clone(),
+                    ),
+                };
                 Ok(ReadResponse::IronwoodTree(tree))
             }
 

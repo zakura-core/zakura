@@ -3,6 +3,10 @@
 //! For example, removing a finished request from a list does not free the list's
 //! backing allocation. This wrapper keeps the memory permit with that allocation.
 //! Growing the list funds both old and new buffers until the entries have moved.
+//!
+//! Planning allocates nothing. Sum container growth plans with exchange metadata
+//! and admit them together through a funded [`super::WriterFence`]. Apply every
+//! plan before publishing the request.
 
 use std::{
     marker::PhantomData,

@@ -3,6 +3,7 @@
 //! Each entry pairs a message's matching key with its owner's position. Keeping
 //! duplicate keys lets callers reject ambiguous responses instead of choosing
 //! whichever request happened to be inserted first.
+//! The message adapter supplies the keys and decides how to handle each match.
 
 use std::collections::BTreeSet;
 

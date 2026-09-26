@@ -4,6 +4,7 @@
 //! conservative allowance and retain it until the tree is dropped, including
 //! when removals leave an empty root. Cold allocation tests check the allowance
 //! against the supported compiler's actual tree growth and key replacement.
+//! This bounds requested allocation sizes, not allocator overhead or process memory.
 
 use super::ResponseIndex;
 use crate::zakura::regulation::{collection_allocation_bytes, MemoryFull, ResponseMemoryPermit};
@@ -30,7 +31,7 @@ impl<K> ResponseIndexPlan<K> {
 }
 
 impl<K: Copy + Ord> ResponseIndex<K> {
-    /// Planning changes neither the tree nor its funding.
+    /// Planning allocates nothing and changes neither the tree nor its funding.
     pub(crate) fn plan_capacity(
         &self,
         required: usize,

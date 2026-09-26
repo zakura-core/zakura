@@ -241,11 +241,11 @@ const MIN_UNREQUESTED_HASHES_BEFORE_EXTEND: usize = MAX_TIPS_RESPONSE_HASH_COUNT
 /// failure loop.
 pub const TIPS_RESPONSE_TIMEOUT: Duration = Duration::from_secs(6);
 
-/// Controls how long we wait between gossiping successive blocks or transactions.
+/// Controls how long we wait between gossiping successive transaction announcements.
 ///
 /// ## Correctness
 ///
-/// If this timeout is set too high, blocks and transactions won't propagate through
+/// If this timeout is set too high, transactions won't propagate through
 /// the network efficiently.
 ///
 /// If this timeout is set too low, the peer set and remote peers can get overloaded.

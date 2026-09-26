@@ -1711,8 +1711,17 @@ impl Service<Request> for LegacyGossipAdapter {
         let broadcast = self.broadcast.clone();
         Box::pin(async move {
             let frame = LegacyGossipFrame::from_request(request)?;
-            let Some(frame) = broadcast.record_first_seen(&frame).await else {
-                return Ok(Response::Nil);
+            let frame = if matches!(frame, LegacyGossipFrame::AdvertiseBlock(_)) {
+                // Incoming echoes still need deduplication, but an explicit local
+                // retry or committed-block announcement must reach the send path.
+                // A previous attempt can have failed after recording this hash.
+                broadcast.mark_seen(&frame).await;
+                frame
+            } else {
+                let Some(frame) = broadcast.record_first_seen(&frame).await else {
+                    return Ok(Response::Nil);
+                };
+                frame
             };
             broadcast.broadcast(frame, None).await?;
             Ok(Response::Nil)
@@ -1800,7 +1809,7 @@ impl Service<Request> for LegacyRequestAdapter {
 /// Which transports a [`ZakuraDualStackService`] request fans out to.
 #[derive(Copy, Clone)]
 enum DualStackRoute {
-    /// Block/transaction advertisements: fan out to both stacks, fire-and-forget.
+    /// Fan out advertisements to both stacks; blocks require one accepting route.
     Advertise,
     /// Requests the Zakura adapter can serve (inventory fetches, chain-sync
     /// discovery, and mempool data): legacy peer set first, then Zakura fallback.
@@ -1825,10 +1834,10 @@ enum DualStackRoute {
 ///
 /// Routing (with `legacy_enabled` = `config.legacy_p2p()`):
 /// - Advertisements fan out concurrently to the legacy peer set (when
-///   `legacy_enabled`) and the Zakura gossip adapter. Advertise is
-///   fire-and-forget, so per-path errors are logged and swallowed and the
-///   composite always reports success — one stack failing never fails the local
-///   advertisement.
+///   `legacy_enabled`) and the Zakura gossip adapter. Blocks require at least
+///   one accepting route; native acceptance may retain the tip for future peers
+///   and does not acknowledge remote receipt. Transaction advertisements remain
+///   best effort, with per-path errors logged without failing the composite.
 /// - Inventory fetches hit the legacy peer set first and fall back to Zakura
 ///   when the legacy response is all-missing or errors. With `legacy_enabled`
 ///   false they route straight to Zakura.
@@ -1905,6 +1914,10 @@ where
     }
 
     fn call(&mut self, request: Request) -> Self::Future {
+        let is_block_advertisement = matches!(
+            request,
+            Request::AdvertiseBlock(..) | Request::AdvertiseBlockToAll(..)
+        );
         let route = match &request {
             Request::AdvertiseBlock(..)
             | Request::AdvertiseBlockToAll(..)
@@ -1959,11 +1972,17 @@ where
                         }
                     };
                     let (legacy_res, gossip_res) = futures::join!(legacy_fut, gossip_fut);
-                    if let Some(Err(error)) = legacy_res {
+                    if let Some(Err(error)) = &legacy_res {
                         debug!(%error, "legacy advertise path failed; continuing");
                     }
-                    if let Err(error) = gossip_res {
+                    if let Err(error) = &gossip_res {
                         debug!(%error, "zakura advertise path failed; continuing");
+                    }
+                    if is_block_advertisement && !legacy_res.as_ref().is_some_and(Result::is_ok) {
+                        // At least one route must accept a block announcement.
+                        // Native acceptance can retain it for a later peer; it is
+                        // not evidence of remote receipt. Transactions remain best effort.
+                        gossip_res?;
                     }
                     Ok(Response::Nil)
                 }
@@ -5945,6 +5964,141 @@ mod tests {
             };
             std::future::ready(Ok(response))
         }
+    }
+
+    #[tokio::test]
+    async fn explicit_block_retry_reaches_native_sender_after_queue_failure() -> Result<(), BoxError>
+    {
+        let mut adapter = LegacyGossipAdapter::new(ZakuraSupervisorHandle::new(9921));
+        let peer = ZakuraPeerId::new(vec![91; 32]).expect("test peer id is within bounds");
+        let (sender, mut receiver) = framed_channel(1);
+        sender.try_send(LegacyGossipFrame::AdvertiseBlock(block_hash(1)).encode_frame()?)?;
+        adapter
+            .broadcast
+            .outbound
+            .insert(LegacyGossipPeerSession::new(peer, 0, 0, sender));
+        let hash = block_hash(2);
+        assert!(adapter
+            .ready()
+            .await?
+            .call(Request::AdvertiseBlock(hash, None))
+            .await
+            .is_err());
+        assert!(
+            adapter
+                .broadcast
+                .unseen(&LegacyGossipFrame::AdvertiseBlock(hash))
+                .await
+                .is_none(),
+            "incoming echoes remain suppressed after an explicit announcement"
+        );
+        receiver
+            .try_recv()
+            .expect("the first frame filled the queue");
+
+        for request in [
+            Request::AdvertiseBlock(hash, None),
+            Request::AdvertiseBlockToAll(hash),
+        ] {
+            adapter.ready().await?.call(request).await?;
+            let frame = receiver
+                .try_recv()
+                .expect("an explicit retry reaches the peer queue");
+            assert_eq!(
+                LegacyGossipFrame::decode_frame(frame)?,
+                LegacyGossipFrame::AdvertiseBlock(hash)
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn block_advertisement_reports_all_route_failures_and_recovers() -> Result<(), BoxError> {
+        let legacy = tower::service_fn(|_request: Request| async {
+            Err::<Response, BoxError>("injected legacy send failure".into())
+        });
+        let mut composite =
+            ZakuraDualStackService::new(legacy, ZakuraSupervisorHandle::new(9922), true);
+        let peer = ZakuraPeerId::new(vec![92; 32]).expect("test peer id is within bounds");
+        let (sender, mut receiver) = framed_channel(1);
+        sender.try_send(LegacyGossipFrame::AdvertiseBlock(block_hash(1)).encode_frame()?)?;
+        composite
+            .gossip
+            .broadcast
+            .outbound
+            .insert(LegacyGossipPeerSession::new(peer, 0, 0, sender));
+
+        let hash = block_hash(2);
+        assert!(
+            composite
+                .ready()
+                .await?
+                .call(Request::AdvertiseBlock(hash, None))
+                .await
+                .is_err(),
+            "both failing routes must leave the scheduler able to retry"
+        );
+        receiver
+            .try_recv()
+            .expect("the first frame filled the queue");
+        composite
+            .ready()
+            .await?
+            .call(Request::AdvertiseBlock(hash, None))
+            .await?;
+        let frame = receiver
+            .try_recv()
+            .expect("a successful retry queues the block on native transport");
+        assert_eq!(
+            LegacyGossipFrame::decode_frame(frame)?,
+            LegacyGossipFrame::AdvertiseBlock(hash)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn block_advertisement_accepts_legacy_success_and_keeps_transactions_best_effort(
+    ) -> Result<(), BoxError> {
+        let legacy_succeeds = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let legacy = tower::service_fn({
+            let legacy_succeeds = legacy_succeeds.clone();
+            move |_request: Request| {
+                let succeeds = legacy_succeeds.load(Ordering::SeqCst);
+                async move {
+                    if succeeds {
+                        Ok::<Response, BoxError>(Response::Nil)
+                    } else {
+                        Err("injected legacy send failure".into())
+                    }
+                }
+            }
+        });
+        let mut composite =
+            ZakuraDualStackService::new(legacy, ZakuraSupervisorHandle::new(9923), true);
+        let peer = ZakuraPeerId::new(vec![93; 32]).expect("test peer id is within bounds");
+        let (sender, _receiver) = framed_channel(1);
+        sender.try_send(LegacyGossipFrame::AdvertiseBlock(block_hash(1)).encode_frame()?)?;
+        composite
+            .gossip
+            .broadcast
+            .outbound
+            .insert(LegacyGossipPeerSession::new(peer, 0, 0, sender));
+
+        composite
+            .ready()
+            .await?
+            .call(Request::AdvertiseBlockToAll(block_hash(2)))
+            .await?;
+        legacy_succeeds.store(false, Ordering::SeqCst);
+        composite
+            .ready()
+            .await?
+            .call(Request::AdvertiseTransactionIds(
+                vec![legacy_tx_id(3)].into_iter().collect(),
+                None,
+            ))
+            .await?;
+        Ok(())
     }
 
     #[tokio::test]

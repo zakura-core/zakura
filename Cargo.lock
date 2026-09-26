@@ -7317,7 +7317,7 @@ dependencies = [
 
 [[package]]
 name = "zakura"
-version = "1.5.0"
+version = "1.5.1"
 dependencies = [
  "abscissa_core",
  "bytes",
@@ -7519,7 +7519,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-consensus"
-version = "9.0.0"
+version = "10.0.0"
 dependencies = [
  "blake2b_simd",
  "chrono",
@@ -7823,7 +7823,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-network"
-version = "8.0.0"
+version = "9.0.0"
 dependencies = [
  "bitflags",
  "blake2b_simd",
@@ -8041,7 +8041,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-rpc"
-version = "11.0.0"
+version = "12.0.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -8310,7 +8310,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-utils"
-version = "2.2.5"
+version = "2.2.6"
 dependencies = [
  "clap",
  "color-eyre",

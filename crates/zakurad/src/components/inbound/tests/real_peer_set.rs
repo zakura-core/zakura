@@ -6,6 +6,7 @@ use std::{
     io, iter,
     net::SocketAddr,
     sync::{Arc, Mutex},
+    time::{Duration, Instant},
 };
 
 use futures::FutureExt;
@@ -47,6 +48,96 @@ use crate::{
 };
 
 use InventoryResponse::*;
+
+/// Measure commit completion to inventory receipt and full-body receipt across
+/// the real legacy TCP connection. The same test is run on both experiment arms.
+#[tokio::test(flavor = "multi_thread")]
+async fn committed_tip_relay_over_legacy_tcp_is_prompt() -> Result<(), crate::BoxError> {
+    let (inv_sender, mut inv_receiver) = tokio::sync::mpsc::unbounded_channel();
+    let (
+        connected_peer_service,
+        _inbound_service,
+        _peer_set,
+        _mempool_service,
+        state_service,
+        _mock_block_verifier,
+        _mock_tx_verifier,
+        block_gossip_task_handle,
+        tx_gossip_task_handle,
+        _listen_addr,
+    ) = setup_with_inv_observer(
+        None,
+        P2pStack::Legacy,
+        StateConfig::ephemeral(),
+        None,
+        Some(inv_sender),
+    )
+    .await;
+
+    let genesis: Arc<block::Block> =
+        zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES.zcash_deserialize_into()?;
+    let block_one: Arc<block::Block> =
+        zakura_test::vectors::BLOCK_MAINNET_1_BYTES.zcash_deserialize_into()?;
+    for block in [&genesis, &block_one] {
+        state_service
+            .clone()
+            .oneshot(zakura_state::Request::CommitCheckpointVerifiedBlock(
+                (*block).clone().into(),
+            ))
+            .await?;
+    }
+    loop {
+        let (hash, _) = tokio::time::timeout(Duration::from_secs(15), inv_receiver.recv())
+            .await?
+            .expect("legacy peer observer remains connected");
+        if hash == block_one.hash() {
+            break;
+        }
+    }
+
+    let block_two: Arc<block::Block> =
+        zakura_test::vectors::BLOCK_MAINNET_2_BYTES.zcash_deserialize_into()?;
+    state_service
+        .clone()
+        .oneshot(zakura_state::Request::CommitCheckpointVerifiedBlock(
+            block_two.clone().into(),
+        ))
+        .await?;
+    let commit_complete = Instant::now();
+    let (second_inv, inv_received_at) =
+        tokio::time::timeout(Duration::from_secs(15), inv_receiver.recv())
+            .await?
+            .expect("legacy peer observer remains connected");
+    let inv_elapsed = inv_received_at.saturating_duration_since(commit_complete);
+    assert_eq!(second_inv, block_two.hash());
+
+    let body_response = tokio::time::timeout(
+        Duration::from_secs(10),
+        connected_peer_service
+            .clone()
+            .oneshot(Request::BlocksByHash(
+                iter::once(block_two.hash()).collect(),
+            )),
+    )
+    .await??;
+    let body_elapsed = commit_complete.elapsed();
+    assert!(matches!(
+        body_response,
+        Response::Blocks(ref blocks) if blocks.iter().any(|item| matches!(item, Available((block, _)) if block.hash() == block_two.hash()))
+    ));
+    tracing::info!(
+        "relay_tcp_probe scenario=back_to_back inv_ms={} body_ms={}",
+        inv_elapsed.as_millis(),
+        body_elapsed.as_millis()
+    );
+    assert!(
+        inv_elapsed < Duration::from_secs(3),
+        "legacy inventory must not wait for the seven-second gossip interval"
+    );
+    block_gossip_task_handle.abort();
+    tx_gossip_task_handle.abort();
+    Ok(())
+}
 
 /// An in-memory writer for assertions on test-local tracing output.
 struct TestWriter {
@@ -898,6 +989,45 @@ async fn setup(
     state_config: StateConfig,
     zcashd_compat_pruning_retention: Option<u32>,
 ) -> (
+    Buffer<zakura_network::Client, zakura_network::Request>,
+    LoadShed<
+        Buffer<
+            BoxService<zakura_network::Request, zakura_network::Response, BoxError>,
+            zakura_network::Request,
+        >,
+    >,
+    Buffer<
+        BoxService<zakura_network::Request, zakura_network::Response, BoxError>,
+        zakura_network::Request,
+    >,
+    Buffer<BoxService<mempool::Request, mempool::Response, BoxError>, mempool::Request>,
+    Buffer<
+        BoxService<zakura_state::Request, zakura_state::Response, BoxError>,
+        zakura_state::Request,
+    >,
+    MockService<zakura_consensus::Request, block::Hash, PanicAssertion, RouterError>,
+    MockService<transaction::Request, transaction::Response, PanicAssertion, TransactionError>,
+    JoinHandle<Result<(), BlockGossipError>>,
+    JoinHandle<Result<(), BoxError>>,
+    SocketAddr,
+) {
+    setup_with_inv_observer(
+        isolated_peer_response,
+        p2p_stack,
+        state_config,
+        zcashd_compat_pruning_retention,
+        None,
+    )
+    .await
+}
+
+async fn setup_with_inv_observer(
+    isolated_peer_response: Option<Response>,
+    p2p_stack: P2pStack,
+    state_config: StateConfig,
+    zcashd_compat_pruning_retention: Option<u32>,
+    inv_observer: Option<tokio::sync::mpsc::UnboundedSender<(block::Hash, Instant)>>,
+) -> (
     // real services
     // connected peer which responds with isolated_peer_response
     Buffer<zakura_network::Client, zakura_network::Request>,
@@ -1087,8 +1217,11 @@ async fn setup(
 
     // Set up the inbound service response for the isolated peer
     let isolated_peer_response = isolated_peer_response.unwrap_or(Response::Nil);
-    let response_inbound_service = tower::service_fn(move |_req| {
+    let response_inbound_service = tower::service_fn(move |req| {
         let isolated_peer_response = isolated_peer_response.clone();
+        if let (Some(observer), Request::AdvertiseBlock(hash, _)) = (&inv_observer, req) {
+            let _ = observer.send((hash, Instant::now()));
+        }
         async move { Ok::<Response, BoxError>(isolated_peer_response) }
     });
     let user_agent = "test".to_string();

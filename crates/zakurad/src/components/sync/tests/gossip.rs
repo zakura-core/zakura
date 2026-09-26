@@ -298,11 +298,13 @@ async fn committed_tip_stalled_send_is_bounded() {
     );
     gossip_task.abort();
     assert!(gossip_task.await.unwrap_err().is_cancelled());
-    assert_eq!(
-        active.load(Ordering::SeqCst),
-        0,
-        "canceling gossip must drop the ordinary send"
-    );
+    timeout(Duration::from_secs(1), async {
+        while active.load(Ordering::SeqCst) != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("canceling gossip aborts its owned ordinary send");
 }
 
 /// A failed ordinary send retries without another selected-tip notification.
@@ -923,5 +925,449 @@ async fn mined_notification_backlog_does_not_starve_ordinary_completion() {
         0,
         "a ready ordinary completion must be polled ahead of the mined backlog"
     );
+    task.abort();
+}
+
+#[tokio::test(start_paused = true)]
+async fn committed_mined_send_defers_same_hash_fallback_until_timeout() {
+    let (mut tips, _latest, changes) = ChainTipSender::new(None, &Mainnet);
+    let (status, mut recent) = SyncStatus::new();
+    SyncStatus::sync_close_to_tip(&mut recent);
+    let mut peers = MockService::build()
+        .with_max_request_delay(MAX_PEER_SET_REQUEST_DELAY)
+        .for_unit_tests();
+    let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+    let task = tokio::spawn(sync::gossip_best_tip_block_hashes(
+        status,
+        changes,
+        peers.clone(),
+        Some(receiver),
+    ));
+    let hash = selected_tip(1).hash;
+    tips.set_finalized_tip(selected_tip(1));
+    sender
+        .send(MinedBlockEvent::Committed {
+            hash,
+            height: Height(2),
+        })
+        .unwrap();
+    let mined = peers
+        .expect_request(Request::AdvertiseBlockToAll(hash))
+        .await;
+    assert!(
+        timeout(
+            TIPS_RESPONSE_TIMEOUT - Duration::from_secs(1),
+            peers.try_next_request()
+        )
+        .await
+        .is_err(),
+        "ordinary fallback must not overlap an active committed mined send for the same hash"
+    );
+    timeout(
+        Duration::from_secs(2),
+        peers.expect_request(Request::AdvertiseBlock(hash, None)),
+    )
+    .await
+    .unwrap()
+    .respond(Response::Nil);
+    drop(mined);
+    task.abort();
+}
+
+#[tokio::test(start_paused = true)]
+async fn committed_mined_success_suppresses_fallback_after_slow_send() {
+    let (mut tips, _latest, changes) = ChainTipSender::new(None, &Mainnet);
+    let (status, mut recent) = SyncStatus::new();
+    SyncStatus::sync_close_to_tip(&mut recent);
+    let mut peers = MockService::build()
+        .with_max_request_delay(MAX_PEER_SET_REQUEST_DELAY)
+        .for_unit_tests();
+    let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+    let task = tokio::spawn(sync::gossip_best_tip_block_hashes(
+        status,
+        changes,
+        peers.clone(),
+        Some(receiver),
+    ));
+    let hash = selected_tip(1).hash;
+    tips.set_finalized_tip(selected_tip(1));
+    sender
+        .send(MinedBlockEvent::Committed {
+            hash,
+            height: Height(2),
+        })
+        .unwrap();
+    let mined = peers
+        .expect_request(Request::AdvertiseBlockToAll(hash))
+        .await;
+    assert!(timeout(Duration::from_secs(2), peers.try_next_request())
+        .await
+        .is_err());
+    mined.respond(Response::Nil);
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    peers.expect_no_requests().await;
+    task.abort();
+}
+
+#[tokio::test(start_paused = true)]
+async fn duplicate_committed_mined_failures_release_only_after_last_operation() {
+    let (mut tips, _latest, changes) = ChainTipSender::new(None, &Mainnet);
+    let (status, mut recent) = SyncStatus::new();
+    SyncStatus::sync_close_to_tip(&mut recent);
+    let mut peers = MockService::build()
+        .with_max_request_delay(MAX_PEER_SET_REQUEST_DELAY)
+        .for_unit_tests();
+    let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+    let task = tokio::spawn(sync::gossip_best_tip_block_hashes(
+        status,
+        changes,
+        peers.clone(),
+        Some(receiver),
+    ));
+    let hash = selected_tip(1).hash;
+    tips.set_finalized_tip(selected_tip(1));
+    for _ in 0..2 {
+        sender
+            .send(MinedBlockEvent::Committed {
+                hash,
+                height: Height(2),
+            })
+            .unwrap();
+    }
+    let first = peers
+        .expect_request(Request::AdvertiseBlockToAll(hash))
+        .await;
+    let second = peers
+        .expect_request(Request::AdvertiseBlockToAll(hash))
+        .await;
+    first.respond_error(std::io::Error::other("first mined send failed").into());
+    assert!(
+        timeout(Duration::from_secs(2), peers.try_next_request())
+            .await
+            .is_err(),
+        "a second active committed send must still defer fallback"
+    );
+    second.respond_error(std::io::Error::other("second mined send failed").into());
+    timeout(
+        Duration::from_secs(1),
+        peers.expect_request(Request::AdvertiseBlock(hash, None)),
+    )
+    .await
+    .unwrap()
+    .respond(Response::Nil);
+    task.abort();
+}
+
+#[tokio::test(start_paused = true)]
+async fn slow_committed_mined_send_does_not_stall_newer_tip() {
+    let (mut tips, _latest, changes) = ChainTipSender::new(None, &Mainnet);
+    let (status, mut recent) = SyncStatus::new();
+    SyncStatus::sync_close_to_tip(&mut recent);
+    let mut peers = MockService::build()
+        .with_max_request_delay(MAX_PEER_SET_REQUEST_DELAY)
+        .for_unit_tests();
+    let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+    let task = tokio::spawn(sync::gossip_best_tip_block_hashes(
+        status,
+        changes,
+        peers.clone(),
+        Some(receiver),
+    ));
+    let hash = selected_tip(1).hash;
+    tips.set_finalized_tip(selected_tip(1));
+    sender
+        .send(MinedBlockEvent::Committed {
+            hash,
+            height: Height(2),
+        })
+        .unwrap();
+    let mined = peers
+        .expect_request(Request::AdvertiseBlockToAll(hash))
+        .await;
+    tips.set_finalized_tip(selected_tip(2));
+    timeout(
+        Duration::from_secs(1),
+        peers.expect_request(Request::AdvertiseBlock(selected_tip(2).hash, None)),
+    )
+    .await
+    .unwrap()
+    .respond(Response::Nil);
+    mined.respond(Response::Nil);
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    peers.expect_no_requests().await;
+    task.abort();
+}
+
+#[tokio::test(start_paused = true)]
+async fn active_early_inventory_does_not_defer_committed_body_fallback() {
+    let (mut tips, _latest, changes) = ChainTipSender::new(None, &Mainnet);
+    let (status, mut recent) = SyncStatus::new();
+    SyncStatus::sync_close_to_tip(&mut recent);
+    let mut peers = MockService::build()
+        .with_max_request_delay(MAX_PEER_SET_REQUEST_DELAY)
+        .for_unit_tests();
+    let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+    let task = tokio::spawn(sync::gossip_best_tip_block_hashes(
+        status,
+        changes,
+        peers.clone(),
+        Some(receiver),
+    ));
+    let hash = selected_tip(1).hash;
+    sender
+        .send(MinedBlockEvent::Early {
+            hash,
+            height: Height(2),
+            submitted_at: std::time::Instant::now(),
+            pending: PendingBlockSignal::valid_for_tests(),
+        })
+        .unwrap();
+    let early = peers
+        .expect_request(Request::AdvertiseBlockToAll(hash))
+        .await;
+    tips.set_finalized_tip(selected_tip(1));
+    timeout(
+        Duration::from_secs(1),
+        peers.expect_request(Request::AdvertiseBlock(hash, None)),
+    )
+    .await
+    .unwrap()
+    .respond(Response::Nil);
+    drop(early);
+    task.abort();
+}
+
+#[tokio::test(start_paused = true)]
+async fn mined_broadcast_capacity_queues_events_and_shutdown_cancels_active_work() {
+    struct Active(Arc<AtomicUsize>);
+    impl Drop for Active {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+    let (mut tips, _latest, changes) = ChainTipSender::new(None, &Mainnet);
+    let (status, mut recent) = SyncStatus::new();
+    SyncStatus::sync_close_to_tip(&mut recent);
+    let active = Arc::new(AtomicUsize::new(0));
+    let maximum = Arc::new(AtomicUsize::new(0));
+    let (requests, mut received) = tokio::sync::mpsc::unbounded_channel();
+    let service = tower::service_fn({
+        let active = active.clone();
+        let maximum = maximum.clone();
+        move |request| {
+            let active = active.clone();
+            let maximum = maximum.clone();
+            let requests = requests.clone();
+            async move {
+                let _guard = if matches!(request, Request::AdvertiseBlockToAll(_)) {
+                    let count = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    maximum.fetch_max(count, Ordering::SeqCst);
+                    Some(Active(active))
+                } else {
+                    None
+                };
+                let (finish, completed) = tokio::sync::oneshot::channel();
+                requests.send((request, finish)).unwrap();
+                completed
+                    .await
+                    .map_err(|error| -> crate::BoxError { error.into() })?
+            }
+        }
+    });
+    let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+    let task = tokio::spawn(sync::gossip_best_tip_block_hashes(
+        status,
+        changes,
+        service,
+        Some(receiver),
+    ));
+    let capacity = sync::gossip::MAX_MINED_BROADCASTS;
+    let hash = selected_tip(1).hash;
+    tips.set_finalized_tip(selected_tip(1));
+    for _ in 0..=capacity {
+        sender
+            .send(MinedBlockEvent::Committed {
+                hash,
+                height: Height(2),
+            })
+            .unwrap();
+    }
+    let mut held = Vec::new();
+    for _ in 0..capacity {
+        let (request, finish) = timeout(Duration::from_secs(1), received.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(request, Request::AdvertiseBlockToAll(hash));
+        held.push(finish);
+    }
+    assert!(
+        timeout(Duration::from_millis(100), received.recv())
+            .await
+            .is_err(),
+        "excess mined work must remain queued"
+    );
+    assert_eq!(active.load(Ordering::SeqCst), capacity);
+
+    tips.set_finalized_tip(selected_tip(2));
+    let (request, finish) = timeout(Duration::from_secs(1), received.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        request,
+        Request::AdvertiseBlock(selected_tip(2).hash, None),
+        "full mined capacity must not stall a different selected tip"
+    );
+    finish.send(Ok(Response::Nil)).unwrap();
+    held.pop()
+        .unwrap()
+        .send(Err(std::io::Error::other("release a mined slot").into()))
+        .unwrap();
+    let (request, finish) = timeout(Duration::from_secs(1), received.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        request,
+        Request::AdvertiseBlockToAll(hash),
+        "queued lifecycle notification must be retained"
+    );
+    held.push(finish);
+    assert_eq!(maximum.load(Ordering::SeqCst), capacity);
+
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    timeout(Duration::from_secs(1), async {
+        while active.load(Ordering::SeqCst) != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("actor shutdown cancels every owned mined task");
+}
+
+#[tokio::test(start_paused = true)]
+async fn panicked_mined_send_releases_fallback_without_killing_gossip() {
+    let (mut tips, _latest, changes) = ChainTipSender::new(None, &Mainnet);
+    let (status, mut recent) = SyncStatus::new();
+    SyncStatus::sync_close_to_tip(&mut recent);
+    let (requests, mut received) = tokio::sync::mpsc::unbounded_channel();
+    let service = tower::service_fn(move |request| {
+        let requests = requests.clone();
+        async move {
+            assert!(
+                !matches!(request, Request::AdvertiseBlockToAll(_)),
+                "injected mined send panic"
+            );
+            requests.send(request).unwrap();
+            Ok::<_, crate::BoxError>(Response::Nil)
+        }
+    });
+    let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+    let task = tokio::spawn(sync::gossip_best_tip_block_hashes(
+        status,
+        changes,
+        service,
+        Some(receiver),
+    ));
+    let hash = selected_tip(1).hash;
+    tips.set_finalized_tip(selected_tip(1));
+    sender
+        .send(MinedBlockEvent::Committed {
+            hash,
+            height: Height(2),
+        })
+        .unwrap();
+    let request = timeout(Duration::from_secs(1), received.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(request, Request::AdvertiseBlock(hash, None));
+    assert!(!task.is_finished());
+    task.abort();
+}
+
+#[tokio::test(start_paused = true)]
+async fn committed_mined_readiness_wait_defers_same_hash_fallback() {
+    let (mut tips, _latest, changes) = ChainTipSender::new(None, &Mainnet);
+    let (status, mut recent) = SyncStatus::new();
+    SyncStatus::sync_close_to_tip(&mut recent);
+    let mut peers = MockService::build()
+        .with_max_request_delay(MAX_PEER_SET_REQUEST_DELAY)
+        .for_unit_tests();
+    let gate = ReadinessGate {
+        opened: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        waker: Arc::new(futures::task::AtomicWaker::new()),
+        peer: peers.clone(),
+    };
+    let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+    let task = tokio::spawn(sync::gossip_best_tip_block_hashes(
+        status,
+        changes,
+        gate.clone(),
+        Some(receiver),
+    ));
+    let hash = selected_tip(1).hash;
+    tips.set_finalized_tip(selected_tip(1));
+    sender
+        .send(MinedBlockEvent::Committed {
+            hash,
+            height: Height(2),
+        })
+        .unwrap();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    gate.opened.store(true, Ordering::SeqCst);
+    gate.waker.wake();
+    let mined = peers
+        .expect_request(Request::AdvertiseBlockToAll(hash))
+        .await;
+    assert!(
+        timeout(Duration::from_secs(1), peers.try_next_request())
+            .await
+            .is_err(),
+        "ordinary send must not have accumulated behind mined readiness"
+    );
+    mined.respond(Response::Nil);
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    peers.expect_no_requests().await;
+    task.abort();
+}
+
+#[tokio::test(start_paused = true)]
+async fn panicked_ordinary_send_retries_without_killing_gossip() {
+    let (mut tips, _latest, changes) = ChainTipSender::new(None, &Mainnet);
+    let (status, mut recent) = SyncStatus::new();
+    SyncStatus::sync_close_to_tip(&mut recent);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let (requests, mut received) = tokio::sync::mpsc::unbounded_channel();
+    let service = tower::service_fn(move |request| {
+        let calls = calls.clone();
+        let requests = requests.clone();
+        async move {
+            assert_ne!(
+                calls.fetch_add(1, Ordering::SeqCst),
+                0,
+                "injected first ordinary send panic"
+            );
+            requests.send(request).unwrap();
+            Ok::<_, crate::BoxError>(Response::Nil)
+        }
+    });
+    let task = tokio::spawn(sync::gossip_best_tip_block_hashes(
+        status, changes, service, None,
+    ));
+    tips.set_finalized_tip(selected_tip(1));
+    let started = tokio::time::Instant::now();
+    let request = timeout(Duration::from_secs(2), received.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(request, Request::AdvertiseBlock(selected_tip(1).hash, None));
+    assert!(
+        started.elapsed() >= Duration::from_secs(1),
+        "panics must use the same bounded retry backoff"
+    );
+    assert!(!task.is_finished());
     task.abort();
 }

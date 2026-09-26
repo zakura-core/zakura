@@ -32,6 +32,7 @@ Keep entries **newest-first**. Each row records:
 
 | Parameter | Location | Old → New | PR | Why |
 | --- | --- | --- | --- | --- |
+| `MAX_MINED_BROADCASTS` | `crates/zakurad/src/components/sync/gossip.rs` | unbounded spawned operations → `64` owned active operations | [#1170](https://github.com/zakura-core/zakura/pull/1170) | Bound mined relay work and per-task metadata while deferring only the matching committed-tip fallback; excess events remain in the existing input channel. |
 | Ordinary committed-tip gossip spacing | `crates/zakurad/src/components/sync/gossip.rs` | `7 s` between observations → prompt eligible delivery, at most one ordinary operation in flight | [#1170](https://github.com/zakura-core/zakura/pull/1170) | Remove relay delay for closely spaced tips without overlapping ordinary sends; transaction gossip remains at `7 s`. |
 | Ordinary committed-tip `RETRY_DELAY` | `crates/zakurad/src/components/sync/gossip.rs` | no unchanged-tip retry → `1 s` after a failed or timed-out attempt | [#1170](https://github.com/zakura-core/zakura/pull/1170) | Recover failed announcements without a new block while bounding repeated failures. |
 | Created-output index `PARTITIONS` | `crates/zakura-state/src/service/non_finalized_state/created_utxos.rs` | one copied map → 256 shared partitions | [#1153](https://github.com/zakura-core/zakura/pull/1153) | Reduce snapshot copying and cleanup at the cost of an extra hash per lookup. |

@@ -1,4 +1,4 @@
-spec_version = "1.5"
+spec_version = "1.6"
 
 # Phase 0 registers the complete rule catalog without implementation claims.
 # Later checkpoints change a status after the manifest can name its owner and tests.
@@ -901,8 +901,8 @@ networks = ["mainnet", "testnet", "custom"]
 id = "LC-PARITY-03"
 name = "Tie-break policy isolation"
 status = "implemented"
-owner = "zakura_header_chain::ChainScore::cmp"
-tests = ["DF-01::chain_score_breaks_equal_work_ties_using_raw_hash_bytes"]
+owner = "zakura_header_chain::ChainScore::cmp + zakura_state::Chain::cmp"
+tests = ["DF-01::chain_score_breaks_equal_work_ties_using_raw_hash_bytes", "DF-02::operator_reconsider_respects_full_state_receipt_preference", "DF-02::equal_work_prefers_first_receipt_through_forks_and_reconsideration"]
 networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]

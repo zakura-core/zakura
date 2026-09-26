@@ -260,7 +260,7 @@ class Collector:
             "status": "live" if agreement else "degraded", "network": network,
             "chain": {"height": height, "hash": block_hash, "blockTime": headers[-1]["time"],
                       "tipAgeSeconds": max(0, int(observed_at - headers[-1]["time"])),
-                      "difficulty": info.get("difficulty"),
+                      "difficulty": headers[-1].get("difficulty"),
                       "meanIntervalSeconds": round(statistics.mean(intervals), 1) if intervals else None,
                       "medianIntervalSeconds": round(statistics.median(intervals), 1) if intervals else None,
                       "intervalSampleBlocks": len(intervals)},

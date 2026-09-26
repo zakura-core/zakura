@@ -44,7 +44,7 @@ class DashboardTests(unittest.TestCase):
                 return f"hash{params[0]}"
             if method == "getblockheader":
                 number = int(params[0].removeprefix("hash"))
-                return {"height": number, "hash": params[0], "time": 1000 + 30 * number}
+                return {"height": number, "hash": params[0], "time": 1000 + 30 * number, "difficulty": 3.0}
             raise AssertionError(method)
 
         with mock.patch.object(dashboard, "rpc", side_effect=fake_rpc), mock.patch.object(
@@ -54,6 +54,7 @@ class DashboardTests(unittest.TestCase):
 
         self.assertEqual(result["status"], "live")
         self.assertEqual(result["chain"]["medianIntervalSeconds"], 30)
+        self.assertEqual(result["chain"]["difficulty"], 3.0)
         self.assertEqual(result["chain"]["intervalSampleBlocks"], 1)
         self.assertEqual(result["nsm"]["balanceZat"], 125)
         self.assertEqual(result["nodes"][0]["externalPeers"], 1)
@@ -168,7 +169,7 @@ class ChainRpc:
             return self.chain[params[0]]
         if method == "getblockheader":
             number = next(n for n, h in self.chain.items() if h == params[0])
-            return {"height": number, "hash": params[0], "time": 1000 + 30 * number}
+            return {"height": number, "hash": params[0], "time": 1000 + 30 * number, "difficulty": 3.0}
         raise AssertionError(method)
 
 

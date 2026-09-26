@@ -216,18 +216,11 @@ fn start_solver(
     block: Block,
     cancel: Arc<AtomicBool>,
     solver_id: u8,
+    solver_round: u64,
 ) -> tokio::task::JoinHandle<Result<Block, SolverCancelled>> {
     tokio::task::spawn_blocking(move || {
         let mut header = *block.header;
-        // Separate nonce streams even if both local nodes return the same template.
-        *header
-            .nonce
-            .first_mut()
-            .expect("the block header nonce is a fixed nonempty array") = solver_id;
-        *header
-            .nonce
-            .last_mut()
-            .expect("the block header nonce is a fixed nonempty array") = solver_id;
+        *header.nonce = solver_nonce(solver_id, solver_round);
         let solved = Solution::solve(header, || {
             if cancel.load(Ordering::Relaxed) {
                 Err(SolverCancelled)
@@ -244,6 +237,16 @@ fn start_solver(
             transactions: block.transactions,
         })
     })
+}
+
+/// Start a distinct nonce range even when a refresh returns an unchanged template.
+fn solver_nonce(solver_id: u8, solver_round: u64) -> [u8; 32] {
+    let mut nonce = [0; 32];
+    nonce[0] = solver_id;
+    nonce[1..9].copy_from_slice(&solver_round.to_be_bytes());
+    // The solver increments the nonce in big-endian order, leaving 23 bytes
+    // for work within this round before it could overlap the next range.
+    nonce
 }
 
 #[tokio::main]
@@ -277,6 +280,7 @@ async fn main() -> Result<()> {
     tracing::info!(%network, nu7 = activation.0, "mining the fork");
 
     let mut mined = 0u32;
+    let mut solver_round = 0u64;
     'mining: loop {
         let tip = tip_height(&client).await?;
         let parent_hash = tip_hash(&client).await?;
@@ -308,7 +312,10 @@ async fn main() -> Result<()> {
         };
         tracing::info!(height = height.0, "solving");
         let cancel = Arc::new(AtomicBool::new(false));
-        let mut solver = start_solver(block, cancel.clone(), args.solver_id);
+        solver_round = solver_round
+            .checked_add(1)
+            .ok_or_else(|| eyre!("the miner exhausted its nonce ranges"))?;
+        let mut solver = start_solver(block, cancel.clone(), args.solver_id, solver_round);
         let refresh_at = Instant::now() + Duration::from_secs(args.template_refresh_secs);
         let mut tip_poll = interval(TIP_POLL_INTERVAL);
         tip_poll.tick().await;
@@ -367,6 +374,20 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn refreshed_templates_use_distinct_nonce_ranges() {
+        let first = solver_nonce(1, 1);
+        let refreshed = solver_nonce(1, 2);
+        let other_miner = solver_nonce(2, 1);
+        assert_ne!(first, refreshed);
+        assert_ne!(first, other_miner);
+        // Even exhausting a round's low bytes cannot reach the next range.
+        let mut last_in_round = first;
+        last_in_round[9..].fill(u8::MAX);
+        assert!(last_in_round < refreshed);
+        assert_eq!(&solver_nonce(1, u64::MAX)[1..9], &u64::MAX.to_be_bytes());
+    }
 
     /// The deployer's rendered fork node config, kept in sync with the renderer by
     /// `test_fork.py`. Loading it here proves zakurad accepts the shape the deployer

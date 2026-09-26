@@ -1351,3 +1351,46 @@ fn parent_source_context_identifies_another_block_holding_the_slot() -> Result<(
     assert_eq!(context[0]["phase"], "source_acquired");
     Ok(())
 }
+
+#[test]
+fn execution_records_survive_restart_without_extending_elapsed_work() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let mut store = Store::open(temp.path(), 16_000_000)?;
+    store.ingest(metadata())?;
+    store.ingest(event(1, finish()))?;
+    store.ingest(event(2, span()))?;
+    store.ingest(event(
+        3,
+        Event::Seal {
+            attempt: 1,
+            spans: 1,
+            dropped: 0,
+        },
+    ))?;
+    store.flush()?;
+    let before = Reader::open(temp.path())?.detail(RUN, 1)?;
+    store.ingest(event(
+        4,
+        Event::Execution {
+            attempt: 1,
+            span: 1,
+            thread: 7,
+            start_us: 700000,
+            end_us: 900000,
+        },
+    ))?;
+    drop(store);
+    let reader = Reader::open(temp.path())?;
+    let after = reader.detail(RUN, 1)?;
+    assert_eq!(before["timing"], after["timing"]);
+    assert_eq!(before["summary"], after["summary"]);
+    assert_eq!(after["complete"], true);
+    assert_eq!(
+        reader
+            .db
+            .query_row("SELECT count(*) FROM executions", [], |r| r
+                .get::<_, i64>(0))?,
+        1
+    );
+    Ok(())
+}

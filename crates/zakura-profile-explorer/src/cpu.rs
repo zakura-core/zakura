@@ -850,4 +850,39 @@ mod export_tests {
         );
         Ok(())
     }
+    #[test]
+    fn context_export_adds_evidence_without_changing_sample_weights_or_raw_stacks() -> Result<()> {
+        let mut data = json!({"view":"context","frames":[
+            {"name":"clone3 (libc)","symbol":"clone3","ip":"1","dso":"libc"},
+            {"name":"work (node)","symbol":"work","ip":"2","dso":"node"}],
+            "stacks":[[0,1]],"samples":[
+                {"tid":7,"stack":0,"context":[0,1],"cpu_period_ns":2000000},
+                {"tid":8,"stack":0,"context":null,"cpu_period_ns":1000000}],
+            "attribution":{"contexts":[{"span":0,"label":"Block work"},{"span":1,"label":"Finalization"}]}});
+        let annotated = speedscope(&data)?;
+        assert_eq!(annotated["profiles"][0]["endValue"], 3.0);
+        assert_eq!(
+            annotated["profiles"][0]["samples"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        let root = annotated["profiles"][0]["samples"][0][0].as_u64().unwrap();
+        assert!(
+            annotated["shared"]["frames"][usize::try_from(root)?]["name"]
+                .as_str()
+                .unwrap()
+                .contains("Recorded context")
+        );
+        data["view"] = json!("raw");
+        let raw = speedscope(&data)?;
+        assert_eq!(raw["profiles"][0]["samples"], json!([[0, 1], [0, 1]]));
+        assert_eq!(
+            raw["profiles"][0]["weights"],
+            annotated["profiles"][0]["weights"]
+        );
+        assert_eq!(data["frames"][0]["symbol"], "clone3");
+        Ok(())
+    }
 }

@@ -41,6 +41,7 @@ mod peer_registry;
 mod peer_routine;
 mod pipe;
 mod reactor;
+mod regulated;
 mod reorder;
 mod request;
 mod sequencer;

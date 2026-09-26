@@ -7,6 +7,7 @@ use std::{future::Future, time::Duration};
 use futures::TryFutureExt;
 use thiserror::Error;
 use tokio::sync::{mpsc, watch};
+use tokio::time::Instant;
 use tower::{Service, ServiceExt};
 use tracing::Instrument;
 
@@ -27,6 +28,12 @@ enum GossipEvent<T> {
     MinedBlockBroadcastCompleted(block::Hash),
     MinedBlock(MinedBlockEvent),
     CommittedTip(T),
+}
+
+#[derive(Clone, Copy, Debug)]
+struct CommittedTipTiming {
+    pacing_delay: Duration,
+    tip_to_request: Duration,
 }
 
 async fn next_gossip_event<T>(
@@ -125,14 +132,28 @@ where
             // TODO: Add a test to check that Zakura does not advertise mined blocks to peers twice.
             const WAIT_FOR_BLOCK_SUBMISSION_DELAY: Duration = Duration::from_micros(100);
 
-            // wait for at least the network timeout between gossips
-            //
-            // in practice, we expect blocks to arrive approximately every 75 seconds,
-            // so waiting 6 seconds won't make much difference
-            tokio::time::sleep(PEER_GOSSIP_DELAY).await;
+            // Observe tip changes on a separate cursor while preserving the existing pacing
+            // behavior on `chain_tip`. This tells us how long a committed tip was held behind
+            // the timer without consuming or changing the production gossip cursor.
+            let pacing_deadline = Instant::now() + PEER_GOSSIP_DELAY;
+            let pacing_sleep = tokio::time::sleep_until(pacing_deadline);
+            tokio::pin!(pacing_sleep);
+            let mut timing_chain_tip = chain_tip.clone_for_task();
+            let tip_observed_before_deadline = tokio::select! {
+                tip_change = timing_chain_tip.wait_for_tip_change() => {
+                    tip_change.map_err(TipChange)?;
+                    Some(Instant::now())
+                }
+                () = &mut pacing_sleep => None,
+            };
+
+            if tip_observed_before_deadline.is_some() {
+                pacing_sleep.await;
+            }
 
             // wait for at least one tip change, to make sure we have a new block hash to broadcast
             let tip_action = chain_tip.wait_for_tip_change().await.map_err(TipChange)?;
+            let tip_observed_at = tip_observed_before_deadline.unwrap_or_else(Instant::now);
 
             // wait for block submissions to be received through the `mined_block_receiver` if the tip
             // change is from a block submission.
@@ -152,8 +173,18 @@ where
                 .last_tip_change()
                 .unwrap_or(tip_action)
                 .best_tip_hash_and_height();
+            let request_started_at = Instant::now();
+            let timing = CommittedTipTiming {
+                pacing_delay: pacing_deadline.saturating_duration_since(tip_observed_at),
+                tip_to_request: request_started_at.saturating_duration_since(tip_observed_at),
+            };
 
-            Ok((best_tip, "sending committed block broadcast", chain_tip))
+            Ok((
+                best_tip,
+                "sending committed block broadcast",
+                chain_tip,
+                Some(timing),
+            ))
         }
         .in_current_span();
 
@@ -162,47 +193,77 @@ where
         // Prefer mined-block completions and submissions when multiple
         // branches are ready. The committed-tip path is a fallback, so
         // selecting it first can duplicate a mined-block broadcast.
-        let (((hash, height), log_msg, updated_chain_state), is_block_submission, early) =
-            match next_gossip_event(
-                mined_block_receiver.as_mut(),
-                &mut mined_block_mark_receiver,
-                tip_change_close_to_network_tip_fut,
-            )
-            .await
-            {
-                GossipEvent::MinedBlockBroadcastCompleted(mark_hash) => {
-                    chain_state.mark_last_change_hash(mark_hash);
-                    continue;
-                }
-                GossipEvent::MinedBlock(MinedBlockEvent::Early {
-                    hash,
-                    height,
-                    submitted_at,
-                    pending,
-                }) => (
-                    (
-                        (hash, height),
-                        "sending early mined block broadcast",
-                        chain_state,
-                    ),
-                    true,
-                    Some((pending, submitted_at)),
-                ),
-                GossipEvent::MinedBlock(MinedBlockEvent::Committed { hash, height }) => (
-                    (
-                        (hash, height),
-                        "sending committed mined block broadcast",
-                        chain_state,
-                    ),
-                    true,
+        let (
+            ((hash, height), log_msg, updated_chain_state, committed_tip_timing),
+            is_block_submission,
+            early,
+        ) = match next_gossip_event(
+            mined_block_receiver.as_mut(),
+            &mut mined_block_mark_receiver,
+            tip_change_close_to_network_tip_fut,
+        )
+        .await
+        {
+            GossipEvent::MinedBlockBroadcastCompleted(mark_hash) => {
+                chain_state.mark_last_change_hash(mark_hash);
+                continue;
+            }
+            GossipEvent::MinedBlock(MinedBlockEvent::Early {
+                hash,
+                height,
+                submitted_at,
+                pending,
+            }) => (
+                (
+                    (hash, height),
+                    "sending early mined block broadcast",
+                    chain_state,
                     None,
                 ),
-                GossipEvent::CommittedTip(tip_change_close_to_network_tip) => {
-                    (tip_change_close_to_network_tip?, false, None)
-                }
-            };
+                true,
+                Some((pending, submitted_at)),
+            ),
+            GossipEvent::MinedBlock(MinedBlockEvent::Committed { hash, height }) => (
+                (
+                    (hash, height),
+                    "sending committed mined block broadcast",
+                    chain_state,
+                    None,
+                ),
+                true,
+                None,
+            ),
+            GossipEvent::CommittedTip(tip_change_close_to_network_tip) => {
+                (tip_change_close_to_network_tip?, false, None)
+            }
+        };
 
         chain_state = updated_chain_state;
+
+        if let Some(timing) = committed_tip_timing {
+            let pacing_result = if timing.pacing_delay.is_zero() {
+                "ready"
+            } else {
+                "blocked"
+            };
+            metrics::counter!(
+                "block.gossip.committed_tip.pacing.total",
+                "result" => pacing_result
+            )
+            .increment(1);
+            metrics::histogram!("block.gossip.committed_tip.pacing_delay.duration_seconds")
+                .record(timing.pacing_delay.as_secs_f64());
+            metrics::histogram!("block.gossip.committed_tip.tip_to_request.duration_seconds")
+                .record(timing.tip_to_request.as_secs_f64());
+            info!(
+                ?hash,
+                ?height,
+                pacing_result,
+                pacing_delay_seconds = timing.pacing_delay.as_secs_f64(),
+                tip_to_request_seconds = timing.tip_to_request.as_secs_f64(),
+                "measured committed block gossip scheduling delay"
+            );
+        }
 
         // TODO: Move logic for calling the peer set to its own method.
 
@@ -226,33 +287,54 @@ where
         // early broadcast would remove the last prompt. Marking here is also redundant: a block
         // that commits always sends `Committed`, and that broadcast marks the same hash.
         let marks_broadcast = is_block_submission && early.is_none();
+        let broadcast_path = match (is_block_submission, early.is_some()) {
+            (false, _) => "committed_tip",
+            (true, true) => "mined_early",
+            (true, false) => "mined_committed",
+        };
         tokio::spawn(async move {
+            let broadcast_started_at = Instant::now();
             let broadcast = async move {
-                tokio::time::timeout(TIPS_RESPONSE_TIMEOUT, network.oneshot(request))
-                    .await
-                    .is_ok_and(|result| result.is_ok())
+                match tokio::time::timeout(TIPS_RESPONSE_TIMEOUT, network.oneshot(request)).await {
+                    Ok(Ok(_)) => "success",
+                    Ok(Err(_)) => "error",
+                    Err(_) => "timeout",
+                }
             };
-            let succeeded = match early {
+            let broadcast_result = match early {
                 Some((mut pending, submitted_at)) => {
                     if !pending.is_valid() {
-                        false
+                        "invalidated"
                     } else {
-                        let succeeded = tokio::select! {
+                        let broadcast_result = tokio::select! {
                             biased;
-                            _ = pending.wait_for_failure() => false,
-                            succeeded = broadcast => succeeded,
+                            _ = pending.wait_for_failure() => "invalidated",
+                            broadcast_result = broadcast => broadcast_result,
                         };
-                        if succeeded {
+                        if broadcast_result == "success" {
                             metrics::counter!("mining.optimistic_inventory.early_inventories")
                                 .increment(1);
                             metrics::histogram!("mining.submit_to_inventory.duration_seconds")
                                 .record(submitted_at.elapsed().as_secs_f64());
                         }
-                        succeeded
+                        broadcast_result
                     }
                 }
                 None => broadcast.await,
             };
+            let succeeded = broadcast_result == "success";
+            metrics::counter!(
+                "block.gossip.broadcast.total",
+                "path" => broadcast_path,
+                "result" => broadcast_result
+            )
+            .increment(1);
+            metrics::histogram!(
+                "block.gossip.broadcast.duration_seconds",
+                "path" => broadcast_path,
+                "result" => broadcast_result
+            )
+            .record(broadcast_started_at.elapsed().as_secs_f64());
 
             if succeeded && marks_broadcast {
                 let _ = mark_tx.send(hash);

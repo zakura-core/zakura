@@ -593,6 +593,8 @@ struct HeaderSyncBackgroundTasks {
 /// Durable state facts required before attaching the production header-sync driver.
 #[derive(Clone, Debug)]
 pub struct ZakuraHeaderSyncDriverStartup {
+    /// State-backed source for bounded native GetBlocks serving.
+    pub block_range_source: Arc<dyn super::BlockRangeSource>,
     /// Durable state frontiers loaded at node startup.
     pub frontiers: FullStateFrontiers,
     /// Durable best header tip loaded from state.
@@ -3780,7 +3782,8 @@ async fn spawn_zakura_endpoint_inner(
                 best_header_tip,
                 driver_startup.committed_views.clone(),
                 config.zakura.block_sync.clone(),
-            );
+            )
+            .with_range_source(driver_startup.block_range_source.clone());
             startup.shutdown = header_sync_shutdown.clone();
             startup.trace = trace.clone();
             let (handle, actions, task) = spawn_block_sync_reactor(startup.with_retention(

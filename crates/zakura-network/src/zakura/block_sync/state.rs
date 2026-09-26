@@ -38,6 +38,7 @@ pub(super) struct NeededBlocksQueryFailure {
 #[derive(Clone, Debug)]
 pub struct BlockSyncStartup {
     pub(super) body_retention: Option<BodyRetention>,
+    pub(super) range_source: Option<Arc<dyn BlockRangeSource>>,
     /// Cached state frontiers at startup.
     pub frontiers: BlockSyncFrontiers,
     /// Durable best header tip at startup.
@@ -69,6 +70,7 @@ impl BlockSyncStartup {
     ) -> Self {
         Self {
             body_retention: None,
+            range_source: None,
             frontiers,
             best_header_tip,
             header_tip: Some(header_tip),
@@ -91,6 +93,7 @@ impl BlockSyncStartup {
     ) -> Self {
         Self {
             body_retention: None,
+            range_source: None,
             frontiers,
             best_header_tip,
             header_tip: None,
@@ -119,9 +122,16 @@ impl BlockSyncStartup {
         self
     }
 
+    /// Use shared regulation for storage reads and response output on live peers.
+    pub fn with_range_source(mut self, source: Arc<dyn BlockRangeSource>) -> Self {
+        self.range_source = Some(source);
+        self
+    }
+
     pub(super) fn inert(config: ZakuraBlockSyncConfig) -> Self {
         Self {
             body_retention: None,
+            range_source: None,
             frontiers: BlockSyncFrontiers {
                 finalized_height: block::Height::MIN,
                 verified_block_tip: block::Height::MIN,
@@ -183,6 +193,7 @@ pub struct BlockSyncHandle {
 /// `service::add_peer`.
 #[derive(Clone, Debug)]
 pub(super) struct RoutineWiring {
+    pub(super) serving: Option<Arc<super::regulated::session::Serving>>,
     pub(super) config: ZakuraBlockSyncConfig,
     pub(super) budget: ByteBudget,
     pub(super) work: Arc<WorkQueue>,

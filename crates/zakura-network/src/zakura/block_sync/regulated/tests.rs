@@ -18,6 +18,7 @@ use crate::zakura::{
     Frame, ZakuraPeerId,
 };
 
+#[derive(Debug)]
 struct Store {
     blocks: Vec<(block::Height, Arc<block::Block>, usize)>,
     started: Arc<Semaphore>,
@@ -343,4 +344,235 @@ fn envelope_allocations_are_bounded_by_the_payload() {
                 <= Message::max_heap_bytes(frame.message_type, frame.payload.len())
         );
     }
+}
+
+struct LiveServing {
+    service: crate::zakura::BlockSyncService,
+    input: crate::zakura::FramedSend,
+    output: crate::zakura::FramedRecv,
+    cancel: CancellationToken,
+}
+
+impl Drop for LiveServing {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+    }
+}
+
+fn live_serving(source: Arc<Store>, max_bytes: u32) -> LiveServing {
+    use crate::zakura::{
+        BlockSyncService, Peer, Service, ServicePeerDirection, ZakuraBlockSyncConfig,
+        ZAKURA_CAP_BLOCK_SYNC, ZAKURA_STREAM_BLOCK_SYNC,
+    };
+    let config = ZakuraBlockSyncConfig {
+        max_response_bytes: max_bytes,
+        peer_limits: crate::zakura::ServicePeerLimits {
+            max_outbound_peers: 1,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let cancel = CancellationToken::new();
+    let mut startup =
+        super::super::BlockSyncStartup::inert(config.clone()).with_range_source(source);
+    startup.shutdown = cancel.clone();
+    let (handle, _actions, _task) = super::super::spawn_block_sync_reactor(startup);
+    let service = BlockSyncService::new_with_handle(config, handle);
+    let resources = service
+        .reserve_session(ServicePeerDirection::Outbound)
+        .unwrap()
+        .unwrap();
+    resources.admitted();
+    let (input, recv) = framed_channel(4);
+    let (send, output) = framed_channel(4);
+    let send = send.with_session_resources(Some(resources));
+    service.add_peer(Peer::new_with_direction(
+        ZakuraPeerId::new(vec![11; 32]).unwrap(),
+        None,
+        ZAKURA_CAP_BLOCK_SYNC,
+        ServicePeerDirection::Outbound,
+        std::collections::HashMap::from([(ZAKURA_STREAM_BLOCK_SYNC, (recv, send))]),
+        cancel.clone(),
+    ));
+    LiveServing {
+        service,
+        input,
+        output,
+        cancel,
+    }
+}
+
+async fn next_response(output: &mut crate::zakura::FramedRecv) -> Message {
+    loop {
+        let message = receive(output).await;
+        if !matches!(message, Message::Status(_)) {
+            return message;
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn live_routine_serves_bounded_prefixes_and_allows_reuse_after_each_ending() {
+    let source = store(&[&BLOCK_MAINNET_1_BYTES, &BLOCK_MAINNET_2_BYTES], true);
+    let _release_on_drop = ReleaseOnDrop(source.release.clone());
+    let mut live = live_serving(
+        source.clone(),
+        u32::try_from(BLOCK_MAINNET_1_BYTES.len()).unwrap(),
+    );
+    for _ in 0..32 {
+        source.release.add_permits(1);
+        live.input
+            .send(
+                BlockSyncMessage::GetBlocks {
+                    start_height: block::Height(1),
+                    count: 2,
+                }
+                .encode_frame()
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            next_response(&mut live.output).await,
+            Message::Block(BLOCK_MAINNET_1_BYTES.to_vec())
+        );
+        assert_eq!(
+            next_response(&mut live.output).await,
+            Message::BlocksDone {
+                start: block::Height(1),
+                returned: 1
+            }
+        );
+        assert!(!live.cancel.is_cancelled());
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn live_routine_rejects_overlaps_and_retains_the_session_until_storage_stops() {
+    use crate::zakura::{Service, ServicePeerDirection};
+    let source = store(&[], false);
+    let _release_on_drop = ReleaseOnDrop(source.release.clone());
+    let live = live_serving(source.clone(), 1);
+    live.input
+        .send(
+            BlockSyncMessage::GetBlocks {
+                start_height: block::Height(1),
+                count: 2,
+            }
+            .encode_frame()
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), source.started.acquire())
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    live.input
+        .send(
+            BlockSyncMessage::GetBlocks {
+                start_height: block::Height(2),
+                count: 1,
+            }
+            .encode_frame()
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), live.cancel.cancelled())
+        .await
+        .unwrap();
+    assert!(live
+        .service
+        .reserve_session(ServicePeerDirection::Outbound)
+        .is_err());
+    assert_eq!(
+        source.started.available_permits(),
+        0,
+        "the overlap starts no second read"
+    );
+    source.release.add_permits(1);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if live
+                .service
+                .reserve_session(ServicePeerDirection::Outbound)
+                .is_ok()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[derive(Debug)]
+struct TimedOutRead {
+    started: Arc<Semaphore>,
+    release: Arc<Semaphore>,
+}
+
+impl Source for TimedOutRead {
+    fn read(&self, request: Read) -> BoxFuture<'static, Result<ReadResult, crate::BoxError>> {
+        let started = self.started.clone();
+        let release = self.release.clone();
+        Box::pin(async move {
+            let entered = started.clone();
+            tokio::task::spawn_blocking(move || {
+                assert!(request.lease.try_start());
+                entered.add_permits(1);
+                futures::executor::block_on(release.acquire())
+                    .unwrap()
+                    .forget();
+                drop(request.lease);
+            });
+            started.acquire().await.unwrap().forget();
+            Err("state read timed out while its blocking job is still running".into())
+        })
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_timed_out_read_keeps_the_same_peer_budget_after_its_output_drains() {
+    let source = Arc::new(TimedOutRead {
+        started: Arc::new(Semaphore::new(0)),
+        release: Arc::new(Semaphore::new(0)),
+    });
+    let _release_on_drop = ReleaseOnDrop(source.release.clone());
+    let capacity = capacity(1);
+    let peer = ZakuraPeerId::new(vec![12; 32]).unwrap();
+    let (send, mut recv) = framed_channel(1);
+    let cancel = CancellationToken::new();
+    let serving = capacity.session(
+        Arc::new(Server::new(source.clone(), 1, 1).unwrap()),
+        &peer,
+        1,
+        send,
+        cancel.clone(),
+    );
+    let range = Range::new(block::Height(1), 1).unwrap();
+    serving.admit(range).unwrap();
+    assert_eq!(receive(&mut recv).await, Message::RangeUnavailable(range));
+    cancel.cancel();
+    drop(serving);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while capacity.node_output_held() != 0 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            recv.recv().await.is_none(),
+            "the retired session drops its writer"
+        );
+    })
+    .await
+    .unwrap();
+    assert_eq!(capacity.node_execution_held(), 1);
+    assert_eq!(
+        capacity.peer_held(&peer),
+        (1, 0),
+        "a reconnect must find the still-running peer execution budget"
+    );
 }

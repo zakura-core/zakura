@@ -1,11 +1,12 @@
 //! GetBlocks-specific adapters for the shared regulation tools.
 //!
-//! Activation follows requester and session integration. The existing service
-//! remains in use until those pieces preserve the whole exchange contract.
+//! Production serving uses the shared runtime and state-owned reads. Requester
+//! authorization and frame-rule activation are staged for the next integration.
 #![allow(dead_code)]
 
 mod requester;
 mod serving;
+pub(super) mod session;
 mod wire;
 
 #[cfg(test)]

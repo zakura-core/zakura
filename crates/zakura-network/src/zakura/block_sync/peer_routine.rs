@@ -255,6 +255,7 @@ impl Disposition {
 /// shared primitives. One task per connected peer; spawned at the pipe spawn point
 /// (`service::add_peer`) so a protocol reject cancels the whole connection.
 pub(super) struct PeerRoutine {
+    serving: Option<super::regulated::session::ServingSession>,
     peer: ZakuraPeerId,
     conn_id: ZakuraConnId,
     source: zakura_header_chain::SourceId,
@@ -375,6 +376,7 @@ impl PeerRoutine {
         let max_blocks_per_response = config.advertised_max_blocks_per_response();
         let max_response_bytes = config.advertised_max_response_bytes();
         PeerRoutine {
+            serving: None,
             peer,
             conn_id,
             source,
@@ -410,6 +412,14 @@ impl PeerRoutine {
             cancel,
             trace,
         }
+    }
+
+    pub(super) fn with_serving(
+        mut self,
+        serving: Option<super::regulated::session::ServingSession>,
+    ) -> Self {
+        self.serving = serving;
+        self
     }
 
     /// Run the pipe-routine until stream close, cancellation, or a protocol
@@ -495,7 +505,7 @@ impl PeerRoutine {
             tokio::select! {
                 biased;
                 _ = self.cancel.cancelled() => return Ok(()),
-                frame = self.recv.recv(), if outbound_queue_has_capacity => {
+                frame = self.recv.recv(), if outbound_queue_has_capacity || self.serving.is_some() => {
                     match frame {
                         // Decode the frame and run the download/serving dispatch
                         // in this same task. A protocol reject propagates out so
@@ -610,15 +620,19 @@ impl PeerRoutine {
                 start_height,
                 count,
             } => {
-                // Serving is reactor-owned (state query + driver). Forward the
-                // request; the reactor serves via the session clone it holds.
-                let _ = self
-                    .routine_to_reactor
-                    .try_send(RoutineToReactor::ServeGetBlocks {
-                        peer: self.peer.clone(),
-                        start_height,
-                        count,
-                    });
+                if let Some(serving) = &mut self.serving {
+                    serving.admit(start_height, count)?;
+                } else {
+                    // Serving is reactor-owned (state query + driver). Forward the
+                    // request; the reactor serves via the session clone it holds.
+                    let _ = self
+                        .routine_to_reactor
+                        .try_send(RoutineToReactor::ServeGetBlocks {
+                            peer: self.peer.clone(),
+                            start_height,
+                            count,
+                        });
+                }
             }
             BlockSyncMessage::Block(block) => {
                 self.trace_wake("own_body");
@@ -1409,10 +1423,10 @@ impl PeerRoutine {
             {
                 // Outbound full but *only just* filled (< one `request_timeout` of
                 // continuous backpressure): plausibly transient local write congestion, not
-                // a dead peer. While outbound is full the select loop does not drain inbound
-                // frames (`if outbound_queue_has_capacity`), so a block the peer already sent
-                // may be waiting behind our write side. Grant one short, BOUNDED grace. This
-                // is the *only* liveness extension: a peer that stopped reading holds outbound
+                // a dead peer. The action-driver serving path pauses inbound reads while
+                // outbound is full, so a block the peer already sent may be waiting behind
+                // our write side. Regulated serving keeps reading. Grant one short, BOUNDED
+                // grace. This is the *only* liveness extension: a peer that stopped reading holds outbound
                 // full past `request_timeout`, falls through to the park arm, and is
                 // parked at the liveness deadline — it cannot dodge the timer.
                 self.window

@@ -2,7 +2,6 @@
 
 use std::sync::Arc;
 
-use futures::future::BoxFuture;
 use zakura_chain::{block, serialization::ZcashSerialize};
 
 use super::wire::{Message, Range};
@@ -14,32 +13,20 @@ use crate::zakura::{
     wire_codec::WireError,
 };
 
-/// The source moves the lease into the actual blocking job and returns it with
-/// the result. Cancellation must not release execution while that job runs.
-pub(super) trait Source: Send + Sync + 'static {
-    fn read(&self, request: Read) -> BoxFuture<'static, Result<ReadResult, crate::BoxError>>;
-}
+use super::super::source::BlockRangeReadLease;
+pub(super) use super::super::source::{
+    BlockRangeRead as Read, BlockRangeReadResult as ReadResult, BlockRangeSource as Source,
+};
 
-pub(super) struct Read {
-    pub(super) range: Range,
-    pub(super) max_body_bytes: u32,
-    pub(super) lease: WorkLease,
-}
-
-/// Blocks drop before their execution lease. The source limits the result to
-/// the requested count and body bytes before retaining it.
-pub(super) struct ReadResult {
-    pub(super) blocks: Vec<(block::Height, Arc<block::Block>, usize)>,
-    pub(super) lease: WorkLease,
-}
-
-pub(super) struct Server<S> {
+#[derive(Debug)]
+pub(super) struct Server<S: ?Sized> {
     source: Arc<S>,
+    session: Option<crate::zakura::FramedSend>,
     max_blocks: u32,
     max_body_bytes: u32,
 }
 
-impl<S> Server<S> {
+impl<S: ?Sized> Server<S> {
     pub(super) fn new(
         source: Arc<S>,
         max_blocks: u32,
@@ -52,13 +39,21 @@ impl<S> Server<S> {
         }
         Ok(Self {
             source,
+            session: None,
             max_blocks,
             max_body_bytes,
         })
     }
 }
 
-impl<S: Source> Produce for Server<S> {
+impl<S: ?Sized> Server<S> {
+    pub(super) fn with_session(mut self, send: crate::zakura::FramedSend) -> Self {
+        self.session = Some(send);
+        self
+    }
+}
+
+impl<S: Source + ?Sized> Produce for Server<S> {
     type Request = Range;
     type Message = Message;
 
@@ -86,9 +81,13 @@ impl<S: Source> Produce for Server<S> {
         let result = self
             .source
             .read(Read {
-                range: read_range,
+                start_height: read_range.start,
+                count: read_range.count,
                 max_body_bytes: self.max_body_bytes,
-                lease,
+                lease: BlockRangeReadLease {
+                    work: lease,
+                    _session: self.session.clone(),
+                },
             })
             .await
             .map_err(|error| ServeEnd::LocalFault(error.to_string()))?;

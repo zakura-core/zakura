@@ -1,8 +1,10 @@
 //! Keep response bookkeeping inside both a connection limit and a node limit.
 //!
-//! Every service on a connection shares the same pool. An allocation keeps its
-//! permit until its last owner disappears, even after cancellation or an ending.
-//! New connections also pay for the accounting they create before admission.
+//! Services and replacement sessions clone the same [`ConnectionResponseMemory`].
+//! Creating a new handle for each service gives each a separate connection limit.
+//! An allocation keeps its permit until its last owner disappears, even after
+//! cancellation or an ending. New connections pay for their accounting before
+//! admission. Body, decoder, worker and transport budgets remain separate.
 
 use std::sync::Arc;
 
@@ -144,6 +146,8 @@ impl ConnectionResponseMemory {
 
     /// Wait for room in both limits. This does not reserve bytes, so the caller
     /// must retry admission. Register before rechecking to avoid a missed release.
+    /// Cancel the wait when the session retires. A request exceeding either
+    /// limit cannot become ready.
     pub(crate) async fn wait_for_capacity(&self, bytes: u64) {
         assert!(
             bytes > 0,

@@ -96,7 +96,8 @@ impl Requester {
             .range(..=last)
             .next_back()
             .is_some_and(|(_, pending)| {
-                pending.range.start.0 + pending.range.count - 1 >= range.start.0
+                u64::from(pending.range.start.0) + u64::from(pending.range.count)
+                    > u64::from(range.start.0)
             })
         {
             return Err(RequestError::Overlap);

@@ -22,9 +22,9 @@ pub(crate) fn run() -> Result<(), super::BoxError> {
             "NU7 release blocked: a test/unstable placeholder branch ID is configured".into(),
         );
     }
-    // NU7 deployment draft, as implemented by valargroup/librustzcash#76.
-    if raw != 0x7719_0ad8 {
-        return Err("NU7 release blocked: branch ID differs from the deployment draft".into());
+    // Final NU7 consensus branch ID from ZIP 259.
+    if raw != 0x7719_0ad9 {
+        return Err("NU7 release blocked: branch ID differs from ZIP 259".into());
     }
     let dependency_branch = zcash_protocol::consensus::BranchId::try_from(raw).map_err(|_| {
         "NU7 release blocked: zcash_protocol does not recognize the configured branch ID"

@@ -548,14 +548,18 @@ async fn the_ending_frees_the_commitment_before_execution_ends() {
     let capacity = capacity(LIMITS);
     let session = session(&capacity, 1, 1);
     let hold = Arc::new(Semaphore::new(0));
-    session
+    let completed = session
         .serve
-        .admit(Job {
+        .admit_tracked(Job {
             hold_after: Some(hold.clone()),
             ..job()
         })
         .unwrap();
     settle().await;
+    assert!(
+        *completed.borrow(),
+        "ending publication completes the tracked request before the producer exits"
+    );
     assert_eq!(session.serve.open(), 0);
     assert_eq!(capacity.node_execution_held(), 1);
     hold.add_permits(1);
@@ -622,7 +626,7 @@ fn sink_and_core(
                 output: budget.clone(),
             },
         }),
-        Commitment(commitments.clone()),
+        Commitment(commitments.clone(), None),
     );
     let core = Arc::new(Mutex::new(core));
     (ResponseSink::new(core.clone()), queued, commitments, core)

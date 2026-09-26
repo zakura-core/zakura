@@ -63,6 +63,12 @@ function table(target, rows) {
   }
   t.append(body);wrap.append(t);host.append(wrap);
 }
+// Reviewed parent waits from before arrival diagnostics. Hide only these known
+// blocks from the homepage shortlist, preserving raw data and timing statistics.
+const reviewedOutliers = new Set([
+  '0000000000689c474974e1743f728b94f1ecb37ef9467398a6d02804317a6833', // 3495898
+  '00000000001c859e5c3ca9510b01e605bf2b2b28c499f53537f2a09523fd1383', // 3496634
+]);
 async function refresh() {
   if (loading) return; loading = true;
   try {
@@ -76,7 +82,7 @@ async function refresh() {
     if (health?.errors) notices.push(`${number(health.errors)} collector errors. Detail may be incomplete.`);
     if (data.excluded_timings) notices.push(`${number(data.excluded_timings)} recordings excluded from timing statistics because of known measurement interference.`);
     note(notices.join(' '));
-    for (const key of ['latest','outliers','failures']) table(key,data[key]);
+    for (const key of ['latest','outliers','failures']) table(key,key==='outliers' ? data[key].filter(row=>!reviewedOutliers.has(row.hash)) : data[key]);
   } catch (error) { note(error.message); }
   finally { loading=false; }
 }

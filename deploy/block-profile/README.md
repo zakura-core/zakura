@@ -248,3 +248,5 @@ at 90% of its storage budget. Each block query returns at most 513 milestones fo
 of child and parent, plus 128 records for each of at most four sources. Source context
 starts two minutes before a source wait. Missing or expired events never prove a block
 was not announced. No scheduling, retries, source locks, or validation rules are changed.
+
+The homepage shortlist hides the two reviewed parent-wait examples at heights 3495898 and 3496634 by exact block hash. Search, profiles, raw API results, and timing statistics retain them. New slow blocks remain eligible.

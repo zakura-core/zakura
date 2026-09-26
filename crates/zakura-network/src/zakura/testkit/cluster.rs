@@ -1113,9 +1113,63 @@ mod tests {
     #[tokio::test]
     async fn native_block_sync_getblocks_flushes_before_hostile_peer_sends_bodies(
     ) -> Result<(), BoxError> {
+        native_getblocks_exchange(false).await
+    }
+
+    #[tokio::test]
+    async fn regulated_getblocks_serves_and_receives_over_native_quic() -> Result<(), BoxError> {
+        native_getblocks_exchange(true).await
+    }
+
+    #[derive(Debug)]
+    struct FixtureBlockSource(Vec<Arc<block::Block>>);
+
+    impl crate::zakura::BlockRangeSource for FixtureBlockSource {
+        fn read(
+            &self,
+            request: crate::zakura::BlockRangeRead,
+        ) -> futures::future::BoxFuture<
+            'static,
+            Result<crate::zakura::BlockRangeReadResult, BoxError>,
+        > {
+            let mut selected = Vec::new();
+            let mut remaining = request.max_body_bytes;
+            if request.lease.try_start() {
+                for block in &self.0 {
+                    let height = block
+                        .coinbase_height()
+                        .expect("fixture has a coinbase height");
+                    if height < request.start_height {
+                        continue;
+                    }
+                    if selected.len() >= usize::try_from(request.count).unwrap() {
+                        break;
+                    }
+                    let size = block_size(block);
+                    let Some(bytes) = remaining.checked_sub(size) else {
+                        break;
+                    };
+                    remaining = bytes;
+                    selected.push((height, block.clone(), usize::try_from(size).unwrap()));
+                }
+            }
+            Box::pin(async move {
+                Ok(crate::zakura::BlockRangeReadResult {
+                    blocks: selected,
+                    lease: request.lease,
+                })
+            })
+        }
+    }
+
+    async fn native_getblocks_exchange(regulated: bool) -> Result<(), BoxError> {
         let _guard = zakura_test::init();
         let mut capture = TraceCapture::for_test_with_keep_override(
-            "native_block_sync_getblocks_flushes_before_hostile_peer_sends_bodies",
+            if regulated {
+                "regulated_getblocks_serves_and_receives_over_native_quic"
+            } else {
+                "native_block_sync_getblocks_flushes_before_hostile_peer_sends_bodies"
+            },
             false,
         )?;
         let blocks = vec![
@@ -1146,7 +1200,7 @@ mod tests {
 
         let anchor = (block::Height(0), mainnet_genesis_hash());
         let mut cluster = ZakuraTestCluster::new();
-        let victim = ZakuraTestNode::builder(60)
+        let builder = ZakuraTestNode::builder(60)
             .limits(limits)
             .tracer(capture.tracer_for_node(60))
             .header_sync_driver(
@@ -1159,9 +1213,19 @@ mod tests {
                 },
                 Some((block::Height(3), blocks[2].hash())),
             )
-            .block_sync_config(block_sync_config)
-            .spawn()
-            .await?;
+            .block_sync_config(block_sync_config);
+        let builder = if regulated {
+            builder
+                .block_range_source(Arc::new(FixtureBlockSource(blocks.clone())))
+                .transport(
+                    iroh::endpoint::QuicTransportConfig::builder()
+                        .send_window(1024)
+                        .build(),
+                )
+        } else {
+            builder
+        };
+        let victim = builder.spawn().await?;
         cluster.nodes.push(victim);
         let victim = cluster.node(0);
         assert!(
@@ -1172,9 +1236,19 @@ mod tests {
         let submitted = Arc::new(StdMutex::new(Vec::new()));
         let driver =
             drive_native_block_sync_actions(victim, blocks.clone(), submitted.clone()).await;
-        let hostile =
-            HostilePeer::connect_native_with_capabilities(victim, 61, ZAKURA_CAP_BLOCK_SYNC)
-                .await?;
+        let hostile = if regulated {
+            // Each fixture block exceeds this receive window. Leaving the response
+            // unread must stall the serving writer while downloads still progress.
+            assert!(blocks.iter().all(|block| block_size(block) > 1024));
+            let transport = iroh::endpoint::QuicTransportConfig::builder()
+                .stream_receive_window(iroh::endpoint::VarInt::from_u32(1024))
+                .receive_window(iroh::endpoint::VarInt::from_u32(2048))
+                .build();
+            HostilePeer::connect_native_with_transport(victim, 61, ZAKURA_CAP_BLOCK_SYNC, transport)
+                .await?
+        } else {
+            HostilePeer::connect_native_with_capabilities(victim, 61, ZAKURA_CAP_BLOCK_SYNC).await?
+        };
         let hostile_peer = hostile.id()?;
         let peer_set = victim.supervisor().subscribe();
         await_until("block-sync peer registered", Duration::from_secs(5), || {
@@ -1229,6 +1303,21 @@ mod tests {
             "the test-side responder must not send bodies or trigger submissions before it has \
              physically read GetBlocks from stream 6"
         );
+
+        if regulated {
+            // Keep both directions active with a one-frame application queue.
+            // Do not consume the served response until our own bodies reach the driver.
+            hostile
+                .send_raw_frame(
+                    ZAKURA_STREAM_BLOCK_SYNC,
+                    BlockSyncMessage::GetBlocks {
+                        start_height,
+                        count,
+                    }
+                    .encode_frame()?,
+                )
+                .await?;
+        }
 
         let end_height = start_height
             .0
@@ -1294,6 +1383,34 @@ mod tests {
             },
         )
         .await?;
+
+        if regulated {
+            let served = tokio::time::timeout(Duration::from_secs(5), async {
+                let mut hashes = Vec::new();
+                loop {
+                    let frame = hostile.recv_ordered_frame(ZAKURA_STREAM_BLOCK_SYNC).await?;
+                    match BlockSyncMessage::decode_frame(frame)? {
+                        BlockSyncMessage::Status(_) => {}
+                        BlockSyncMessage::Block(block) => hashes.push(block.hash()),
+                        BlockSyncMessage::BlocksDone {
+                            start_height: actual_start,
+                            returned,
+                        } => {
+                            assert_eq!(actual_start, start_height);
+                            assert_eq!(returned, count);
+                            return Ok::<_, BoxError>(hashes);
+                        }
+                        msg => return Err(format!("unexpected served message: {msg:?}").into()),
+                    }
+                }
+            })
+            .await
+            .map_err(|_| -> BoxError { "timed out reading regulated serving response".into() })??;
+            assert_eq!(
+                served,
+                blocks.iter().map(|block| block.hash()).collect::<Vec<_>>()
+            );
+        }
 
         driver.abort();
         hostile.shutdown().await;

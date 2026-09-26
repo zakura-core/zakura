@@ -1044,7 +1044,10 @@ mod requester_session_tests {
 
     #[tokio::test]
     async fn connection_removal_retires_and_removes_its_requester_fence() {
-        let service = BlockSyncService::new(ZakuraBlockSyncConfig::default());
+        let service = BlockSyncService::new(
+            ZakuraBlockSyncConfig::default(),
+            ZcashDecoder::for_network(&zakura_chain::parameters::Network::Mainnet),
+        );
         let peer = ZakuraPeerId::new(vec![41; 32]).unwrap();
         let connection = CancellationToken::new();
         let cancel = CancellationToken::new();
@@ -1120,6 +1123,7 @@ mod regulated_frame_tests {
         let service = BlockSyncService::new_with_startup(
             BlockSyncStartup::inert(ZakuraBlockSyncConfig::default())
                 .with_range_source(Arc::new(EmptySource)),
+            ZcashDecoder::for_network(&zakura_chain::parameters::Network::Mainnet),
         );
         let peer = ZakuraPeerId::new(vec![42; 32]).unwrap();
         let mut held_channels = Vec::new();

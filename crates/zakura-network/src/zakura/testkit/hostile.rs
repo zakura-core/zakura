@@ -47,8 +47,24 @@ impl HostilePeer {
         seed: u64,
         capabilities: u64,
     ) -> Result<Self, BoxError> {
+        Self::connect_native_with_transport(
+            victim,
+            seed,
+            capabilities,
+            victim.limits().transport_config(),
+        )
+        .await
+    }
+
+    /// Connect with explicit QUIC windows for transport backpressure tests.
+    pub(crate) async fn connect_native_with_transport(
+        victim: &ZakuraTestNode,
+        seed: u64,
+        capabilities: u64,
+        transport: iroh::endpoint::QuicTransportConfig,
+    ) -> Result<Self, BoxError> {
         let limits = victim.limits().clone();
-        let endpoint = LocalEndpointFactory::with_transport_config(limits.transport_config())
+        let endpoint = LocalEndpointFactory::with_transport_config(transport)
             .endpoint(seed)
             .await?;
         let victim_addr = victim.node_addr().await;

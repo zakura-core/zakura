@@ -2,6 +2,7 @@
 //!
 //! [ps]: https://zips.z.cash/protocol/protocol.pdf#outputencoding
 
+use crate::serialization::ZcashReader;
 use std::io;
 
 use derive_getters::Getters;
@@ -135,7 +136,9 @@ impl ZcashSerialize for OutputInTransactionV4 {
 }
 
 impl ZcashDeserialize for OutputInTransactionV4 {
-    fn zcash_deserialize<R: io::Read>(mut reader: R) -> Result<Self, SerializationError> {
+    fn zcash_deserialize_from<R: io::Read>(
+        reader: &mut ZcashReader<R>,
+    ) -> Result<Self, SerializationError> {
         // # Consensus
         //
         // > Elements of an Output description MUST be valid encodings of the types given above.
@@ -153,32 +156,32 @@ impl ZcashDeserialize for OutputInTransactionV4 {
             // https://zips.z.cash/protocol/protocol.pdf#abstractcommit
             // Stores the bytes without validating the point; see
             // [`commitment::ValueCommitment::zcash_deserialize`].
-            cv: commitment::ValueCommitment::zcash_deserialize(&mut reader)?,
+            cv: reader.read_value::<commitment::ValueCommitment>()?,
             // Type is `B^{[ℓ_{Sapling}_{Merkle}]}`, i.e. 32 bytes.
             // However, the consensus rule above restricts it even more.
             // See [`sapling_crypto::note::ExtractedNoteCommitment::zcash_deserialize`].
-            cm_u: sapling_crypto::note::ExtractedNoteCommitment::zcash_deserialize(&mut reader)?,
+            cm_u: reader.read_value::<sapling_crypto::note::ExtractedNoteCommitment>()?,
             // Type is `KA^{Sapling}.Public`, i.e. J
             // https://zips.z.cash/protocol/protocol.pdf#concretesaplingkeyagreement
             // Stores the bytes without validating the point; see
             // [`keys::EphemeralPublicKey::zcash_deserialize`].
-            ephemeral_key: keys::EphemeralPublicKey::zcash_deserialize(&mut reader)?,
+            ephemeral_key: reader.read_value::<keys::EphemeralPublicKey>()?,
             // Type is `Sym.C`, i.e. `B^Y^{\[N\]}`, i.e. arbitrary-sized byte arrays
             // https://zips.z.cash/protocol/protocol.pdf#concretesym but fixed to
             // 580 bytes in https://zips.z.cash/protocol/protocol.pdf#outputencodingandconsensus
             // See [`note::EncryptedNote::zcash_deserialize`].
-            enc_ciphertext: note::EncryptedNote::zcash_deserialize(&mut reader)?,
+            enc_ciphertext: reader.read_value::<note::EncryptedNote>()?,
             // Type is `Sym.C`, i.e. `B^Y^{\[N\]}`, i.e. arbitrary-sized byte arrays.
             // https://zips.z.cash/protocol/protocol.pdf#concretesym but fixed to
             // 80 bytes in https://zips.z.cash/protocol/protocol.pdf#outputencodingandconsensus
             // See [`note::WrappedNoteKey::zcash_deserialize`].
-            out_ciphertext: note::WrappedNoteKey::zcash_deserialize(&mut reader)?,
+            out_ciphertext: reader.read_value::<note::WrappedNoteKey>()?,
             // Type is `ZKOutput.Proof`, described in
             // https://zips.z.cash/protocol/protocol.pdf#grothencoding
             // It is not enforced here; this just reads 192 bytes.
             // The type is validated when validating the proof, see
             // [`groth16::Item::try_from`]. In #3179 we plan to validate here instead.
-            zkproof: Groth16Proof::zcash_deserialize(&mut reader)?,
+            zkproof: reader.read_value::<Groth16Proof>()?,
         }))
     }
 }
@@ -201,7 +204,9 @@ impl ZcashSerialize for OutputPrefixInTransactionV5 {
 }
 
 impl ZcashDeserialize for OutputPrefixInTransactionV5 {
-    fn zcash_deserialize<R: io::Read>(mut reader: R) -> Result<Self, SerializationError> {
+    fn zcash_deserialize_from<R: io::Read>(
+        reader: &mut ZcashReader<R>,
+    ) -> Result<Self, SerializationError> {
         // # Consensus
         //
         // > Elements of an Output description MUST be valid encodings of the types given above.
@@ -219,26 +224,26 @@ impl ZcashDeserialize for OutputPrefixInTransactionV5 {
             // https://zips.z.cash/protocol/protocol.pdf#abstractcommit
             // Stores the bytes without validating the point; see
             // [`commitment::ValueCommitment::zcash_deserialize`].
-            cv: commitment::ValueCommitment::zcash_deserialize(&mut reader)?,
+            cv: reader.read_value::<commitment::ValueCommitment>()?,
             // Type is `B^{[ℓ_{Sapling}_{Merkle}]}`, i.e. 32 bytes.
             // However, the consensus rule above restricts it even more.
             // See [`sapling_crypto::note::ExtractedNoteCommitment::zcash_deserialize`].
-            cm_u: sapling_crypto::note::ExtractedNoteCommitment::zcash_deserialize(&mut reader)?,
+            cm_u: reader.read_value::<sapling_crypto::note::ExtractedNoteCommitment>()?,
             // Type is `KA^{Sapling}.Public`, i.e. J
             // https://zips.z.cash/protocol/protocol.pdf#concretesaplingkeyagreement
             // Stores the bytes without validating the point; see
             // [`keys::EphemeralPublicKey::zcash_deserialize`].
-            ephemeral_key: keys::EphemeralPublicKey::zcash_deserialize(&mut reader)?,
+            ephemeral_key: reader.read_value::<keys::EphemeralPublicKey>()?,
             // Type is `Sym.C`, i.e. `B^Y^{\[N\]}`, i.e. arbitrary-sized byte arrays
             // https://zips.z.cash/protocol/protocol.pdf#concretesym but fixed to
             // 580 bytes in https://zips.z.cash/protocol/protocol.pdf#outputencodingandconsensus
             // See [`note::EncryptedNote::zcash_deserialize`].
-            enc_ciphertext: note::EncryptedNote::zcash_deserialize(&mut reader)?,
+            enc_ciphertext: reader.read_value::<note::EncryptedNote>()?,
             // Type is `Sym.C`, i.e. `B^Y^{\[N\]}`, i.e. arbitrary-sized byte arrays.
             // https://zips.z.cash/protocol/protocol.pdf#concretesym but fixed to
             // 80 bytes in https://zips.z.cash/protocol/protocol.pdf#outputencodingandconsensus
             // See [`note::WrappedNoteKey::zcash_deserialize`].
-            out_ciphertext: note::WrappedNoteKey::zcash_deserialize(&mut reader)?,
+            out_ciphertext: reader.read_value::<note::WrappedNoteKey>()?,
         })
     }
 }
@@ -262,6 +267,10 @@ pub(crate) const OUTPUT_SIZE: u64 = OUTPUT_PREFIX_SIZE + 192;
 /// valid on the network and in the mempool, but it can never be mined into a block. So
 /// rejecting these large edge-case transactions can never break consensus
 impl TrustedPreallocate for OutputInTransactionV4 {
+    fn min_serialized_size() -> u64 {
+        OUTPUT_SIZE
+    }
+
     fn max_allocation() -> u64 {
         // Since a serialized Vec<Output> uses at least one byte for its length,
         // the max allocation can never exceed (MAX_BLOCK_BYTES - 1) / OUTPUT_SIZE
@@ -284,6 +293,10 @@ impl TrustedPreallocate for OutputInTransactionV4 {
 }
 
 impl TrustedPreallocate for OutputPrefixInTransactionV5 {
+    fn min_serialized_size() -> u64 {
+        OUTPUT_PREFIX_SIZE
+    }
+
     fn max_allocation() -> u64 {
         // Since V4 and V5 have the same fields,
         // and the V5 associated fields are required,

@@ -41,6 +41,7 @@ use super::{
         DownloadWindow, LivenessOutcome, OutstandingBlockRange, ReceivedBlockTracker,
         ThroughputMeter,
     },
+    wire::RawBlockPayload,
     work_queue::{RequestWrite, WorkItem, WorkQueue, WorkReturnOutcome},
     BlockSyncMessage, BlockSyncMisbehavior, BlockSyncPeerSession, BlockSyncStatus,
     ZakuraBlockSyncConfig, ZakuraPeerId, ZakuraTrace, MSG_BS_BLOCK,
@@ -49,7 +50,10 @@ use crate::zakura::transport::OrderedStreamFailure;
 use crate::zakura::{trace::BlockBodySource, Admit, FramedRecv, SinkReject, ZakuraConnId};
 use std::{sync::Arc, time::Duration, time::Instant};
 use tokio::time;
-use zakura_chain::{block, serialization::ZcashSerialize};
+use zakura_chain::{
+    block,
+    serialization::{ZcashDecoder, ZcashSerialize},
+};
 
 #[cfg(test)]
 mod requester_tests;
@@ -260,6 +264,7 @@ pub(super) struct PeerRoutine {
     requester: Option<super::regulated::live_requester::LiveRequester>,
     request_pool_waiting: bool,
     serving: Option<super::regulated::session::ServingSession>,
+    decoder: ZcashDecoder,
     peer: ZakuraPeerId,
     conn_id: ZakuraConnId,
     source: zakura_header_chain::SourceId,
@@ -348,6 +353,7 @@ impl PeerRoutine {
     /// [`PeerRegistry::admit_session`](super::peer_registry::PeerRegistry::admit_session).
     #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
+        decoder: ZcashDecoder,
         peer: ZakuraPeerId,
         conn_id: ZakuraConnId,
         session: BlockSyncPeerSession,
@@ -383,6 +389,7 @@ impl PeerRoutine {
             requester: None,
             request_pool_waiting: false,
             serving: None,
+            decoder,
             peer,
             conn_id,
             source,
@@ -623,7 +630,7 @@ impl PeerRoutine {
         // Measured here, on the per-peer task, so the body size never has to be
         // recomputed by re-serializing the block on another thread (A1).
         let (msg, raw_block_payload) =
-            match BlockSyncMessage::decode_frame_with_raw_block_payload(frame) {
+            match BlockSyncMessage::decode_frame_with_raw_block_payload(frame, self.decoder) {
                 Ok(decoded) => decoded,
                 Err(error) => {
                     // A malformed frame is `MalformedMessage` misbehavior AND a fatal
@@ -1704,7 +1711,7 @@ impl PeerRoutine {
         block: Arc<block::Block>,
         body_wire_bytes: Option<u64>,
         body_permit: Option<mpsc::OwnedPermit<SequencedBody>>,
-        raw_block_payload: Option<Arc<[u8]>>,
+        raw_block_payload: Option<RawBlockPayload>,
     ) {
         let hash = block.hash();
         let Some(height) = block.coinbase_height() else {
@@ -1975,7 +1982,7 @@ impl PeerRoutine {
         block: Arc<block::Block>,
         body_wire_bytes: Option<u64>,
         body_permit: Option<mpsc::OwnedPermit<SequencedBody>>,
-        raw_block_payload: Option<Arc<[u8]>>,
+        raw_block_payload: Option<RawBlockPayload>,
     ) -> bool {
         if self.work.hash_for_height(height) != Some(hash) {
             return false;
@@ -2529,7 +2536,7 @@ mod tests {
     use tokio::sync::{mpsc, watch};
     use tokio::time::timeout;
     use tokio_util::sync::CancellationToken;
-    use zakura_chain::block;
+    use zakura_chain::{block, serialization::ZcashDecoder};
 
     use super::super::peer_registry::PeerRegistry;
     use super::super::request::BlockSizeEstimate;
@@ -2579,6 +2586,7 @@ mod tests {
             verified_block_hash: block::Hash([0; 32]),
         }));
         let routine = PeerRoutine::new(
+            ZcashDecoder::for_network(&zakura_chain::parameters::Network::Mainnet),
             peer.clone(),
             0,
             session,
@@ -3003,6 +3011,7 @@ mod tests {
             verified_block_hash: block::Hash([0; 32]),
         }));
         let mut routine = PeerRoutine::new(
+            ZcashDecoder::for_network(&zakura_chain::parameters::Network::Mainnet),
             peer,
             0,
             session,
@@ -3105,6 +3114,7 @@ mod tests {
         }));
 
         let mut routine = PeerRoutine::new(
+            ZcashDecoder::for_network(&zakura_chain::parameters::Network::Mainnet),
             peer,
             0,
             session,
@@ -3243,6 +3253,7 @@ mod tests {
             verified_block_hash: block::Hash([0; 32]),
         }));
         let mut routine = PeerRoutine::new(
+            ZcashDecoder::for_network(&zakura_chain::parameters::Network::Mainnet),
             peer.clone(),
             0,
             session,
@@ -3498,6 +3509,7 @@ mod tests {
             verified_block_hash: block::Hash([0; 32]),
         }));
         let mut routine = PeerRoutine::new(
+            ZcashDecoder::for_network(&zakura_chain::parameters::Network::Mainnet),
             peer.clone(),
             0,
             session,
@@ -3680,6 +3692,7 @@ mod tests {
         }));
 
         let mut routine = PeerRoutine::new(
+            ZcashDecoder::for_network(&zakura_chain::parameters::Network::Mainnet),
             peer,
             0,
             session,
@@ -3994,6 +4007,7 @@ mod tests {
             verified_block_hash: block::Hash([0; 32]),
         }));
         let mut routine = PeerRoutine::new(
+            ZcashDecoder::for_network(&zakura_chain::parameters::Network::Mainnet),
             peer.clone(),
             0,
             session,
@@ -4254,6 +4268,7 @@ mod tests {
             verified_block_hash: block::Hash([0; 32]),
         }));
         let mut routine = PeerRoutine::new(
+            ZcashDecoder::for_network(&zakura_chain::parameters::Network::Mainnet),
             peer.clone(),
             0,
             session,

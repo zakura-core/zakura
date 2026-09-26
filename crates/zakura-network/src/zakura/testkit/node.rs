@@ -227,6 +227,7 @@ pub struct ZakuraTestNodeBuilder {
     header_sync_request_timeout: Option<Duration>,
     supported_capabilities: Option<u64>,
     block_sync_config: ZakuraBlockSyncConfig,
+    block_range_source: Option<Arc<dyn crate::zakura::BlockRangeSource>>,
 }
 
 #[derive(Clone, Debug)]
@@ -282,6 +283,7 @@ impl ZakuraTestNodeBuilder {
             header_sync_request_timeout: None,
             supported_capabilities: None,
             block_sync_config: ZakuraBlockSyncConfig::default(),
+            block_range_source: None,
         }
     }
 
@@ -411,6 +413,12 @@ impl ZakuraTestNodeBuilder {
         self
     }
 
+    /// Enable production GetBlocks regulation with a test-owned block source.
+    pub fn block_range_source(mut self, source: Arc<dyn crate::zakura::BlockRangeSource>) -> Self {
+        self.block_range_source = Some(source);
+        self
+    }
+
     /// Spawn the node.
     pub async fn spawn(self) -> Result<ZakuraTestNode, BoxError> {
         if self.legacy_upgrade {
@@ -526,6 +534,9 @@ impl ZakuraTestNodeBuilder {
                 handle.subscribe_tip(),
                 self.block_sync_config.clone(),
             );
+            if let Some(source) = self.block_range_source {
+                startup = startup.with_range_source(source);
+            }
             let shutdown = header_sync_actions
                 .as_ref()
                 .expect("header sync actions were just initialized")
@@ -554,6 +565,7 @@ impl ZakuraTestNodeBuilder {
             Arc::new(DiscoveryService::new(discovery.clone()))
         };
         let registry = service_registry(
+            zakura_chain::serialization::ZcashDecoder::for_network(&network),
             &supervisor,
             header_sync,
             block_sync_handle.clone(),

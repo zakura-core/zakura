@@ -4,6 +4,7 @@
 //!
 //! <https://zips.z.cash/protocol/nu5.pdf#orchardkeycomponents>
 
+use crate::serialization::ZcashReader;
 use std::{fmt, io};
 
 use group::{ff::PrimeField, CurveAffine as _, Group, GroupEncoding};
@@ -246,7 +247,9 @@ impl ZcashSerialize for EphemeralPublicKey {
 }
 
 impl ZcashDeserialize for EphemeralPublicKey {
-    fn zcash_deserialize<R: io::Read>(mut reader: R) -> Result<Self, SerializationError> {
+    fn zcash_deserialize_from<R: io::Read>(
+        reader: &mut ZcashReader<R>,
+    ) -> Result<Self, SerializationError> {
         Self::try_from(reader.read_32_bytes()?).map_err(SerializationError::Parse)
     }
 }

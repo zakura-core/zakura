@@ -72,7 +72,13 @@ impl SyntheticBlockSyncPeers {
     /// Attach synthetic peers to an already-spawned block-sync reactor handle.
     pub fn new(config: ZakuraBlockSyncConfig, handle: BlockSyncHandle, queue_depth: usize) -> Self {
         Self {
-            service: BlockSyncService::new_with_handle(config, handle),
+            service: BlockSyncService::new_with_handle(
+                config,
+                handle,
+                zakura_chain::serialization::ZcashDecoder::for_network(
+                    &zakura_chain::parameters::Network::Mainnet,
+                ),
+            ),
             queue_depth: queue_depth.max(1),
         }
     }

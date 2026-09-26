@@ -87,7 +87,7 @@ async fn transaction_messages_reject_missing_inputs_at_the_count() {
     // The same codec still accepts a complete transaction after rejection.
     codec.reconfigure_full_body_len();
     let transaction = Transaction::zcash_deserialize(&zakura_test::vectors::DUMMY_TX1[..]).unwrap();
-    let message = Message::Tx(Arc::new(transaction));
+    let message = Message::Tx(Arc::new(transaction).into());
     let mut encoded = BytesMut::new();
     codec.encode(message.clone(), &mut encoded).unwrap();
     assert_eq!(codec.decode(&mut encoded).unwrap(), Some(message));

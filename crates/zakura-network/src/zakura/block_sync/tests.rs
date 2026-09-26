@@ -61,7 +61,7 @@ fn mainnet_blocks_1_to_3() -> Vec<Arc<block::Block>> {
     ]
 }
 
-fn raw_block_payload(block: &Arc<block::Block>) -> super::wire::RawBlockPayload {
+pub(super) fn raw_block_payload(block: &Arc<block::Block>) -> super::wire::RawBlockPayload {
     let frame = BlockSyncMessage::Block(block.clone())
         .encode_frame()
         .expect("test block frame encodes");

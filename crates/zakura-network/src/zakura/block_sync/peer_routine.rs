@@ -2381,7 +2381,7 @@ mod tests {
     use tokio::sync::{mpsc, watch};
     use tokio::time::timeout;
     use tokio_util::sync::CancellationToken;
-    use zakura_chain::block;
+    use zakura_chain::{block, serialization::ZcashDecoder};
 
     use super::super::peer_registry::PeerRegistry;
     use super::super::request::BlockSizeEstimate;

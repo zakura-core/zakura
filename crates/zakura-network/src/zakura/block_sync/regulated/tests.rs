@@ -22,14 +22,19 @@ struct Store {
     blocks: Vec<(block::Height, Arc<block::Block>, usize)>,
     started: Arc<Semaphore>,
     release: Arc<Semaphore>,
+    fail: bool,
 }
 
 impl Source for Store {
     fn read(&self, request: Read) -> BoxFuture<'static, Result<ReadResult, crate::BoxError>> {
         let blocks = self.blocks.clone();
+        let fail = self.fail;
         let started = self.started.clone();
         let release = self.release.clone();
         Box::pin(async move {
+            if fail {
+                return Err("storage failure".into());
+            }
             Ok(tokio::task::spawn_blocking(move || {
                 if !request.lease.try_start() {
                     return ReadResult {
@@ -66,6 +71,7 @@ fn store(blocks: &[&[u8]], open: bool) -> Arc<Store> {
             .collect(),
         started: Arc::new(Semaphore::new(0)),
         release: Arc::new(Semaphore::new(if open { 128 } else { 0 })),
+        fail: false,
     })
 }
 
@@ -263,5 +269,78 @@ struct ReleaseOnDrop(Arc<Semaphore>);
 impl Drop for ReleaseOnDrop {
     fn drop(&mut self) {
         self.0.add_permits(128);
+    }
+}
+
+#[test]
+fn status_values_are_rejected_instead_of_silently_clamped() {
+    for status in [
+        BlockSyncStatus {
+            max_blocks_per_response: 0,
+            ..Default::default()
+        },
+        BlockSyncStatus {
+            max_inflight_requests: 32_769,
+            ..Default::default()
+        },
+        BlockSyncStatus {
+            max_response_bytes: 33_554_433,
+            ..Default::default()
+        },
+        BlockSyncStatus {
+            servable_low: block::Height(2),
+            servable_high: block::Height(1),
+            ..Default::default()
+        },
+    ] {
+        assert!(encode_frame(&Message::Status(status)).is_err());
+    }
+    let mut frame = BlockSyncMessage::Status(BlockSyncStatus::default())
+        .encode_frame()
+        .unwrap();
+    frame.payload[41..45].copy_from_slice(&0_u32.to_le_bytes());
+    assert!(decode_frame::<Message>(&frame).is_err());
+}
+
+#[tokio::test]
+async fn a_storage_failure_ends_without_faulting_or_cancelling_the_session() {
+    let mut source = store(&[], true);
+    Arc::get_mut(&mut source).unwrap().fail = true;
+    let capacity = capacity(1);
+    let (send, mut recv) = framed_channel(1);
+    let cancel = CancellationToken::new();
+    let server = capacity.session(
+        Arc::new(Server::new(source, 1, 1).unwrap()),
+        &ZakuraPeerId::new(vec![5; 32]).unwrap(),
+        1,
+        send,
+        cancel.clone(),
+    );
+    let range = Range::new(block::Height(1), 1).unwrap();
+    server.admit(range).unwrap();
+    assert_eq!(receive(&mut recv).await, Message::RangeUnavailable(range));
+    assert!(!cancel.is_cancelled());
+    cancel.cancel();
+}
+
+#[test]
+fn envelope_allocations_are_bounded_by_the_payload() {
+    for frame in [
+        encode_frame(&Message::GetBlocks(
+            Range::new(block::Height(1), 128).unwrap(),
+        ))
+        .unwrap(),
+        encode_frame(&Message::Block(BLOCK_MAINNET_1_BYTES.to_vec())).unwrap(),
+        Frame {
+            message_type: 3,
+            flags: 0,
+            payload: vec![2; 2_000_001],
+        },
+    ] {
+        let (_, allocated) = zakura_test::allocations::measure(|| decode_frame::<Message>(&frame));
+        assert!(
+            allocated.peak_live_bytes
+                <= Message::max_heap_bytes(frame.message_type, frame.payload.len())
+        );
     }
 }

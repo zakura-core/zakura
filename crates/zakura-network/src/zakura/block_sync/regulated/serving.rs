@@ -127,7 +127,8 @@ fn encode_response(
         let bytes = block
             .zcash_serialize_to_vec()
             .map_err(|error| ServeEnd::LocalFault(error.to_string()))?;
-        let len = u64::try_from(bytes.len()).expect("block bytes fit u64 on supported targets");
+        // usize fits u64 on the supported 64-bit targets.
+        let len = bytes.len() as u64;
         if len > block::MAX_BLOCK_BYTES {
             return Err(ServeEnd::LocalFault(
                 "stored block exceeds the block byte limit".into(),

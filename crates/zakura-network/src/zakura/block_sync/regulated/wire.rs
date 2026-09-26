@@ -105,7 +105,8 @@ impl WireMessage for Message {
     }
 
     fn encode_payload(&self, out: &mut Vec<u8>) -> Result<(), WireError> {
-        let tag = u8::try_from(self.message_type()).expect("all message tags are u8 constants");
+        // Every message type above comes from a u8 discriminator.
+        let tag = self.message_type() as u8;
         out.push(tag);
         match self {
             Self::Status(status) => {

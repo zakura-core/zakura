@@ -881,7 +881,16 @@ impl Service for BlockSyncService {
                 .lock()
                 .expect("block-sync peer map mutex is never poisoned");
             let removed = match active_peers.get(peer) {
-                Some(record) if record.conn_id == conn_id => active_peers.remove(peer),
+                Some(record) if record.conn_id == conn_id => {
+                    self.inner.requester_sessions.remove(
+                        peer,
+                        crate::zakura::regulation::SessionKey {
+                            conn_id,
+                            session_id: record.session_id,
+                        },
+                    );
+                    active_peers.remove(peer)
+                }
                 Some(_) | None => None,
             };
             // The claim is cleared while still holding the peer-map lock so it
@@ -953,5 +962,62 @@ async fn drain_inbound(mut recv: FramedRecv, cancel: CancellationToken) -> Resul
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod requester_session_tests {
+    use super::*;
+    use crate::zakura::{
+        regulation::{Current, SessionKey, WriterFence},
+        CloseCause,
+    };
+
+    #[tokio::test]
+    async fn connection_removal_retires_and_removes_its_requester_fence() {
+        let service = BlockSyncService::new(ZakuraBlockSyncConfig::default());
+        let peer = ZakuraPeerId::new(vec![41; 32]).unwrap();
+        let connection = CancellationToken::new();
+        let cancel = CancellationToken::new();
+        let fence = WriterFence::new(connection.clone(), CloseCause::default());
+        let exchange = fence.open().unwrap();
+        let writer = exchange.writer();
+        assert!(writer.publish(|| {}));
+        assert!(writer.try_start(|| true));
+        service.inner.requester_sessions.replace(
+            peer.clone(),
+            Current {
+                key: SessionKey {
+                    conn_id: 7,
+                    session_id: 3,
+                },
+                cancel: cancel.clone(),
+                fence: fence.clone(),
+                session: (),
+            },
+        );
+        service.inner.active_peers.lock().unwrap().insert(
+            peer.clone(),
+            BlockSyncPeerRecord {
+                conn_id: 7,
+                session_id: 3,
+                direction: ServicePeerDirection::Outbound,
+                cancel_token: cancel.clone(),
+            },
+        );
+        service.remove_peer(&peer, 6);
+        assert!(service.inner.requester_sessions.get(&peer).is_some());
+        assert!(
+            !connection.is_cancelled(),
+            "stale removal leaves the current fence open"
+        );
+        service.remove_peer(&peer, 7);
+        assert!(service.inner.requester_sessions.get(&peer).is_none());
+        assert!(
+            connection.is_cancelled(),
+            "removal fences the unanswered written exchange"
+        );
+        assert!(cancel.is_cancelled());
+        assert!(fence.open().is_none());
     }
 }

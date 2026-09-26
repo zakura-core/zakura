@@ -14,12 +14,21 @@ inherited, which is why the tooling here is small.
 Its chain state is seeded from a real Testnet cache, so it carries genuine
 pre-NU7 history and the measured NSM value balance rather than starting empty.
 
-**Current public fork:** the running nodes use consensus branch ID `77190ad9`
-and source revision [`ff0e0f0442d857b395b6c721cc177e7dcd550e78`](https://github.com/zakura-core/zakura/tree/ff0e0f0442d857b395b6c721cc177e7dcd550e78).
-Build that pinned revision to join the existing chain. `main` uses the same
-branch ID but also carries later post-NU7 consensus changes and the full
-100-block coinbase maturity, so a `main` build starts a new fork rather than
-joining the running one.
+**Current public fork:** use the [network manifest](https://api.nu7.valargroup.dev/v1/network)
+for the exact node revision, activation height, network identity, participant
+configuration, and matching snapshot/checksum. The manifest is generated from the
+running node's configuration and checked against its RPC upgrade list; these
+values are not maintained separately in the website. The September 26 rerun uses
+the rebased PR and main's consensus rules, including 100-block coinbase maturity.
+Do not reuse state from the earlier fork.
+
+After a reset, publish the manifest with `publish_network.py --help`. Supply the
+built binary's exact revision, explicit public peers, the recorded `seed-tip.json`,
+and snapshot metadata (`url`, `sha256`, `height`). Archive only the stopped seed's
+`state` and `non_finalized_state` directories, renaming the Testnet subdirectories
+to the lowercased fork name. Participants extract that archive into `nu7-state`.
+The Caddy configuration exposes `/v1/network`, `/v1/config`, and the snapshot;
+`https://zakura.com` may fetch the manifest and status via CORS.
 
 ## Prerequisites
 
@@ -95,7 +104,8 @@ sudo systemctl daemon-reload
 sudo systemctl restart zakura-fork-miner.service
 ```
 
-Keep node RPC bound to localhost. Watch accepted blocks, template refreshes, CPU use,
+Keep node RPC bound to localhost. Watch accepted blocks, template refreshes,
+CPU use,
 the observed block intervals, and tip replacements during the trial. The
 25-second protocol target is an average; the dashboard's median is a different
 statistic. Observe at least one 102-block DAA window before judging whether
@@ -107,11 +117,11 @@ Three additional validating nodes mine in SFO3, AMS3, and SGP1. Each is a
 DigitalOcean `s-1vcpu-2gb` Droplet (1 shared vCPU, 2 GiB RAM, 50 GiB disk;
 $12/month), assigned to the `zakura-testnet` project. One original miner
 remains on the NYC1 fork host. The remote nodes use the same pinned live source
-revision (`ff0e0f044`), network magic, activation heights, and NSM seed, with
+revision from the manifest, network magic, activation heights, and NSM seed, with
 different P2P peers and solver IDs 3, 4, and 5. Their RPC servers bind only to
 localhost. The miner service has a 70% CPU quota to leave capacity for node
-validation on a shared CPU plan. Do not deploy a `main` build to these hosts;
-it would diverge from the running fork after NU7.
+validation on a shared CPU plan. Deploy the same revision and network parameters
+to every participant; changing consensus requires a coordinated new run.
 
 The remote configs are derived from the live node config with
 `miner/render-remote-config.py`. All three currently mine to the existing
@@ -219,12 +229,12 @@ SQLite, spaced at least 30 seconds apart, and in-flight claims become
 `review` after a restart so a broadcast is never repeated automatically.
 Only `/v1/faucet/*` is public; the node RPC and the Python listener stay local.
 
-For the existing public fork, build the sender with
-`./build-live-faucet.sh /path/to/fresh-build-dir`. The script combines the
-faucet sender from this PR with the pinned live node source and patches the
-pinned `zakura-protocol` dependency to encode the running chain's branch ID.
-It prints the resulting binary path. This patch is specific to the current
-fork; a new fork built from `main` needs no patch.
+Build the sender from the same revision as the node with
+`cargo build --release --locked -p zakura-fork-txload`. No protocol dependency
+patch is needed for the current run. `build-live-faucet.sh` is retained only for
+reproducing the retired fork and must not be used for the current network.
+After a reset, preserve the old claims database for audit and use a fresh one.
+Wait for coinbase maturity before reopening the faucet.
 
 Install the release build as `/usr/local/bin/zakura-fork-txload`, install
 `faucet.py` under `/opt/zakura-nu7-faucet`, and install `faucet.service` as

@@ -1,6 +1,23 @@
 api.nu7.valargroup.dev {
     encode zstd gzip
 
+    @network_manifest path /v1/network /v1/config
+    handle @network_manifest {
+        header Access-Control-Allow-Origin https://zakura.com
+        header Cache-Control "no-store"
+        root * /var/lib/zakura-nu7-public
+        @manifest path /v1/network
+        rewrite @manifest /network.json
+        @config path /v1/config
+        rewrite @config /nu7-zakura.toml
+        file_server
+    }
+
+    handle /snapshots/* {
+        root * /mnt/snapshots/nu7-public
+        file_server
+    }
+
     @faucet path /v1/faucet/*
     handle @faucet {
         reverse_proxy 127.0.0.1:8094 {

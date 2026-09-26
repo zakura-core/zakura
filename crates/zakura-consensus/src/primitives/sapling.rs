@@ -287,6 +287,9 @@ pub fn verify_single(
             .check_bundle(item.bundle, item.sighash.into())
             .then_some(())
             .ok_or(TransactionError::SaplingVerificationFailed);
+        if check.is_err() {
+            verifier.profile.partial();
+        }
         check.map_err(BoxError::from)?;
 
         let is_valid = tokio::task::spawn_blocking(move || {

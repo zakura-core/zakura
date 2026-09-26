@@ -12799,6 +12799,196 @@ async fn committed_reanchor_requeries_while_downloads_in_flight() {
     reactor_task.abort();
 }
 
+#[tokio::test(start_paused = true)]
+async fn selected_fork_anchor_probe_retries_and_ignores_stale_replies() {
+    let parent = block::Hash([0; 32]);
+    let verified = block::Hash([0x51; 32]);
+    let old_header = block::Hash([0x52; 32]);
+    let selected = block::Hash([0x53; 32]);
+    let initial = test_committed_snapshot(1, 1, 1, (0, parent), (1, verified), (1, old_header));
+    let (snapshots, startup) =
+        committed_block_sync_startup(initial, immediate_body_download_config());
+    let (handle, mut actions, task) = spawn_block_sync_reactor(startup);
+    let BlockSyncAction::QueryNeededBlocks {
+        query_id: old_id,
+        scope: old_scope,
+        ..
+    } = next_action(&mut actions).await
+    else {
+        panic!("startup must resolve the selected branch anchor");
+    };
+    snapshots
+        .send(Some(committed_view(
+            test_committed_snapshot(2, 2, 1, (0, parent), (1, verified), (1, selected)),
+            1,
+        )))
+        .unwrap();
+    let view = &handle.routine_wiring.as_ref().unwrap().view;
+    await_until("epoch reset", Duration::from_secs(1), || {
+        view.borrow().reset_epoch > 0
+    })
+    .await
+    .unwrap();
+    // Allow the reactor to consume the sequencer view and supersede any query
+    // issued before that reset, then retain the latest current query.
+    tokio::task::yield_now().await;
+    let mut current = next_action(&mut actions).await;
+    while let Ok(action) = actions.try_recv() {
+        current = action;
+    }
+    let BlockSyncAction::QueryNeededBlocks {
+        query_id, scope, ..
+    } = current
+    else {
+        panic!("the changed branch needs an anchor query");
+    };
+    assert_ne!(scope, old_scope);
+    handle
+        .send(BlockSyncEvent::ScopedNeededBlocks {
+            query_id: old_id,
+            scope: old_scope,
+            body_anchor: zakura_header_chain::Frontier::new(block::Height(1), old_header),
+            blocks: Vec::new(),
+        })
+        .await
+        .unwrap();
+    handle
+        .send_needed_blocks_query_failure(query_id, scope)
+        .unwrap();
+    let BlockSyncAction::QueryNeededBlocks {
+        query_id: retry_id,
+        scope: retry_scope,
+        from,
+        limit,
+        ..
+    } = next_action(&mut actions).await
+    else {
+        panic!("a failed anchor probe must retry even at equal heights");
+    };
+    assert_ne!(retry_id, query_id);
+    assert_eq!(retry_scope, scope);
+    assert_eq!(from, block::Height(1));
+    assert_eq!(limit, 1);
+    handle
+        .send(BlockSyncEvent::ScopedNeededBlocks {
+            query_id: retry_id,
+            scope: retry_scope,
+            body_anchor: zakura_header_chain::Frontier::new(block::Height(1), selected),
+            blocks: Vec::new(),
+        })
+        .await
+        .unwrap();
+    await_until("resolved anchor", Duration::from_secs(1), || {
+        view.borrow().verified_hash == selected
+    })
+    .await
+    .unwrap();
+    assert!(
+        tokio::time::timeout(NEEDED_BLOCK_QUERY_RETRY_DELAY * 2, actions.recv())
+            .await
+            .is_err(),
+        "a resolved caught-up branch must stop querying"
+    );
+    task.abort();
+}
+
+#[tokio::test]
+async fn selected_fork_same_height_downloads_missing_body() {
+    selected_fork_downloads_missing_body(1, false).await;
+}
+
+#[tokio::test]
+async fn selected_fork_higher_height_downloads_missing_body() {
+    selected_fork_downloads_missing_body(2, false).await;
+}
+
+#[tokio::test]
+async fn selected_fork_same_height_at_startup_downloads_missing_body() {
+    selected_fork_downloads_missing_body(1, true).await;
+}
+
+async fn selected_fork_downloads_missing_body(selected_height: u32, at_startup: bool) {
+    let parent = block::Hash([0; 32]);
+    let verified = block::Hash([0x51; 32]);
+    let selected = block::Hash([0x52; 32]);
+    let missing = mainnet_blocks_1_to_3()[0].clone();
+    let config = immediate_body_download_config();
+    let initial_header = if at_startup {
+        (selected_height, selected)
+    } else {
+        (1, verified)
+    };
+    let initial = test_committed_snapshot(1, 1, 1, (0, parent), (1, verified), initial_header);
+    let (snapshots, startup) = committed_block_sync_startup(initial, config.clone());
+    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
+    let wiring = handle.routine_wiring.as_ref().unwrap();
+    if !at_startup {
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), actions.recv())
+                .await
+                .is_err(),
+            "the unchanged caught-up branch must not query"
+        );
+        snapshots
+            .send(Some(committed_view(
+                test_committed_snapshot(
+                    2,
+                    2,
+                    1,
+                    (0, parent),
+                    (1, verified),
+                    (selected_height, selected),
+                ),
+                1,
+            )))
+            .unwrap();
+    }
+
+    // Replies can race the sequencer epoch reset. Answer each query through the
+    // normal scoped completion path until the selected branch's body is queued.
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            tokio::select! {
+                action = actions.recv() => {
+                    let Some(BlockSyncAction::QueryNeededBlocks { query_id, scope, from, limit, .. }) = action else {
+                        panic!("expected a selected-branch body query: {action:?}");
+                    };
+                    assert!(limit > 0);
+                    assert!(from <= block::Height(selected_height));
+                    handle.send(BlockSyncEvent::ScopedNeededBlocks {
+                        query_id,
+                        scope,
+                        body_anchor: zakura_header_chain::Frontier::new(block::Height(0), parent),
+                        blocks: vec![block_meta(&missing)],
+                    }).await.unwrap();
+                }
+                _ = wiring.work.subscribe_available().notified() => {
+                    if wiring.work.queued_bounds().is_some() {
+                        break;
+                    }
+                }
+            }
+        }
+    }).await.expect("the selected fork's missing body must be scheduled without a higher header");
+    assert_eq!(wiring.view.borrow().download_floor, block::Height(0));
+    let (_peer, _inbound, mut outbound) = connect_peer_with_status(
+        &service,
+        &mut actions,
+        91,
+        block::Height(selected_height),
+        selected,
+        1,
+        MAX_BS_RESPONSE_BYTES,
+    )
+    .await;
+    assert_eq!(
+        wait_for_outbound_getblocks(&mut outbound).await,
+        (block::Height(1), 1)
+    );
+    reactor_task.abort();
+}
+
 #[tokio::test]
 async fn epoch_change_supersedes_stale_floor_query() {
     let blocks = mainnet_blocks_1_to_3();

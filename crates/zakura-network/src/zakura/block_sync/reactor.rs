@@ -269,6 +269,8 @@ pub fn spawn_block_sync_reactor(
         verified_block_tip: startup.frontiers.verified_block_tip,
         request_floor: startup.frontiers.verified_block_tip,
         pending_needed_query: None,
+        body_anchor_query_required: startup.best_header_tip.1
+            != startup.frontiers.verified_block_hash,
         hint_refresh: None,
         needed_query_retry_at: None,
         pending_body_supplier_restart: None,
@@ -368,6 +370,9 @@ pub(super) struct BlockSyncReactor {
     request_floor: block::Height,
     /// Identity and scope of the state query awaiting a response.
     pending_needed_query: Option<PendingNeededQuery>,
+    /// A new selected branch must resolve its body anchor before height alone
+    /// can establish that downloads are caught up. Cleared only by a current reply.
+    body_anchor_query_required: bool,
     /// Revision and bounded height interval of queued hints being refreshed.
     hint_refresh: Option<(u64, block::Height, block::Height)>,
     /// Earliest time to retry the last failed body-missing metadata query.
@@ -859,6 +864,7 @@ impl BlockSyncReactor {
     }
 
     async fn handle_header_tip_changed(&mut self, height: block::Height, hash: block::Hash) {
+        self.body_anchor_query_required |= self.state.best_header_hash != hash;
         self.state.best_header_tip = height;
         self.state.best_header_hash = hash;
         self.query_needed_blocks().await;
@@ -917,6 +923,7 @@ impl BlockSyncReactor {
             let authority =
                 current_scope.expect("a committed view always constructs current body authority");
             if body_work_epoch_changed {
+                self.body_anchor_query_required = true;
                 let _ = self
                     .sequencer_control
                     .send(SequencerControlInput::BodyWorkEpochChanged {
@@ -1318,6 +1325,7 @@ impl BlockSyncReactor {
             self.query_needed_blocks().await;
             return;
         }
+        self.body_anchor_query_required = false;
         let anchor_changed = body_anchor.height != self.verified_block_tip
             || body_anchor.hash != self.state.verified_block_hash;
         if anchor_changed {
@@ -1807,7 +1815,7 @@ impl BlockSyncReactor {
         if self.empty_state_header_quiet_until.is_some() {
             return true;
         }
-        if self.request_floor >= self.state.best_header_tip {
+        if self.request_floor >= self.state.best_header_tip && !self.body_anchor_query_required {
             self.clear_pending_needed_query();
             return true;
         }
@@ -1821,10 +1829,18 @@ impl BlockSyncReactor {
         let Some(from) = refresh
             .map(|(_, from, _)| from)
             .or_else(|| self.next_needed_block_query_start())
+            // Even at equal heights the selected hash can be missing. Query a
+            // nonempty range at the header tip to obtain the branch body anchor;
+            // a changed anchor resets the floor and triggers a normal refill.
+            .or_else(|| {
+                self.body_anchor_query_required
+                    .then_some(self.state.best_header_tip)
+            })
         else {
             return true;
         };
         if !force
+            && !self.body_anchor_query_required
             && refresh.is_none()
             && self.local_body_work_blocks() >= self.refill_low_water_blocks()
         {

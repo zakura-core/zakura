@@ -142,6 +142,7 @@ impl WriterFence {
 
     /// Fund the fence before allocating it. Services and replacement sessions
     /// on a connection must pass clones of the same memory handle.
+    /// Construct a replacement successfully before retiring the current receiver.
     pub(crate) fn try_with_memory(
         connection: &CancellationToken,
         close_cause: &CloseCause,
@@ -176,6 +177,9 @@ impl WriterFence {
     /// Reserve the exchange, caller metadata and retained container growth as
     /// one allocation plan before publishing work. The separate permit must
     /// follow the container. Exchange metadata follows every writer clone.
+    /// An ending or receiver replacement does not release that metadata while
+    /// any writer remains. Heap allocations inside caller metadata need explicit
+    /// charges in the plan.
     pub(crate) fn try_open_with_retained_memory(
         &self,
         metadata_bytes: u64,

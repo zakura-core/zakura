@@ -2093,7 +2093,10 @@ fn native_connection_transcript_hash(
 /// The endpoint with the smaller node ID opens the stream.
 /// The other endpoint accepts the stream.
 /// Older peers also use this result to resolve simultaneous offers.
-fn i_open_collision_winner(local_node_id: &EndpointId, remote_node_id: &EndpointId) -> bool {
+pub(crate) fn i_open_collision_winner(
+    local_node_id: &EndpointId,
+    remote_node_id: &EndpointId,
+) -> bool {
     local_node_id.as_bytes() < remote_node_id.as_bytes()
 }
 

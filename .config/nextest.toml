@@ -46,6 +46,14 @@ default-filter = "not test(check_no_git_dependencies) and not test(=fully_synced
 # wall-clock deadline even when the logic is correct: a load-induced flake, not a
 # regression (a genuine stall fails every attempt). Retry them so a contended miss does
 # not fail the run. Mirrors the `zakura-integration` profile, which already retries.
+# The stream conformance suite runs real handlers over loopback QUIC. Each test
+# waits for events with a 30-second bound, so give it room beyond the default
+# slow-test warning. It keeps the package's retries below.
+[[profile.all-tests.overrides]]
+filter = 'package(zakura-network) and test(~stream_conformance::)'
+retries = 2
+slow-timeout = { period = "60s", terminate-after = 2 }
+
 [[profile.all-tests.overrides]]
 filter = 'package(zakura-network) and test(~zakura)'
 retries = 2

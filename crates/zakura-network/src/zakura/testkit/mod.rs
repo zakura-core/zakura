@@ -14,6 +14,8 @@ mod mock_blocksync;
 mod node;
 mod pinned;
 mod recorder;
+#[cfg(test)]
+pub(crate) mod stream_conformance;
 mod trace_capture;
 mod trace_reader;
 mod wait;

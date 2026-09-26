@@ -193,6 +193,7 @@ pub struct BlockSyncHandle {
 /// `service::add_peer`.
 #[derive(Clone, Debug)]
 pub(super) struct RoutineWiring {
+    pub(super) request_pool: crate::zakura::regulation::ReservationPool,
     pub(super) serving: Option<Arc<super::regulated::session::Serving>>,
     pub(super) config: ZakuraBlockSyncConfig,
     pub(super) budget: ByteBudget,

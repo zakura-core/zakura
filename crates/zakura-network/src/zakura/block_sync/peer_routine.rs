@@ -51,6 +51,8 @@ use std::{sync::Arc, time::Duration, time::Instant};
 use tokio::time;
 use zakura_chain::{block, serialization::ZcashSerialize};
 
+#[cfg(test)]
+mod requester_tests;
 mod trace;
 
 /// How long a routine avoids a height after returning it because of a failure.
@@ -255,6 +257,8 @@ impl Disposition {
 /// shared primitives. One task per connected peer; spawned at the pipe spawn point
 /// (`service::add_peer`) so a protocol reject cancels the whole connection.
 pub(super) struct PeerRoutine {
+    requester: Option<super::regulated::live_requester::LiveRequester>,
+    request_pool_waiting: bool,
     serving: Option<super::regulated::session::ServingSession>,
     peer: ZakuraPeerId,
     conn_id: ZakuraConnId,
@@ -376,6 +380,8 @@ impl PeerRoutine {
         let max_blocks_per_response = config.advertised_max_blocks_per_response();
         let max_response_bytes = config.advertised_max_response_bytes();
         PeerRoutine {
+            requester: None,
+            request_pool_waiting: false,
             serving: None,
             peer,
             conn_id,
@@ -412,6 +418,14 @@ impl PeerRoutine {
             cancel,
             trace,
         }
+    }
+
+    pub(super) fn with_requester(
+        mut self,
+        requester: Option<super::regulated::live_requester::LiveRequester>,
+    ) -> Self {
+        self.requester = requester;
+        self
     }
 
     pub(super) fn with_serving(
@@ -455,6 +469,10 @@ impl PeerRoutine {
         let budget = self.budget.clone();
         let work = self.work.clone();
         let registry = Arc::clone(&self.registry);
+        let request_pool = self
+            .requester
+            .as_ref()
+            .map(|requester| requester.pool.clone());
         // Per-peer BBR heartbeat cadence. `Skip` so a routine busy past a tick emits one
         // fresh sample rather than a catch-up burst. Observability only.
         let mut bbr_trace_ticks = time::interval(BBR_TRACE_INTERVAL);
@@ -539,6 +557,12 @@ impl PeerRoutine {
                 _ = &mut floor_ranking => {
                     self.trace_wake("floor_ranking_changed");
                 }
+                entry = async {
+                    match &request_pool {
+                        Some(pool) => pool.entry().await,
+                        None => std::future::pending().await,
+                    }
+                }, if self.request_pool_waiting => { drop(entry); }
                 _ = bbr_trace_ticks.tick() => self.trace_bbr_sample(),
                 _ = &mut outbound_queue_poll, if !outbound_queue_has_capacity => {}
             }
@@ -571,6 +595,12 @@ impl PeerRoutine {
             }
         }
 
+        let authorized_height = self
+            .requester
+            .as_ref()
+            .map(|requester| requester.authorize(&frame))
+            .transpose()?
+            .flatten();
         let frame_payload_bytes = frame.payload.len();
         let body_permit = if is_block_frame(&frame) {
             let permit = self.reserve_body_decode_permit();
@@ -613,6 +643,23 @@ impl PeerRoutine {
             };
         let body_wire_bytes = msg.block_body_wire_bytes(frame_payload_bytes);
         self.trace_message_received(&msg);
+        if let Some(height) = authorized_height {
+            if let BlockSyncMessage::Block(block) = &msg {
+                if block.coinbase_height() != Some(height) {
+                    return Err(SinkReject::protocol(
+                        "authorized block has a different coinbase height",
+                    ));
+                }
+            }
+        }
+        if self.requester.is_some() {
+            if let Some(start) = super::regulated::live_requester::LiveRequester::ending_start(&msg)
+            {
+                if self.window.outstanding_index_for_start(start).is_none() {
+                    return Ok(());
+                }
+            }
+        }
 
         match msg {
             BlockSyncMessage::Status(status) => self.handle_status(status),
@@ -656,6 +703,7 @@ impl PeerRoutine {
     fn return_unreceived_requests(&mut self, reason: &'static str) {
         let outstanding_ranges = std::mem::take(&mut self.window.outstanding);
         for outstanding in outstanding_ranges {
+            self.retire_authorization(&outstanding);
             let unreceived: Vec<_> = unreceived_heights(&outstanding).collect();
             let outcome = self
                 .work
@@ -841,6 +889,7 @@ impl PeerRoutine {
     /// There is no floor gate: downloads are governed by the byte budget and
     /// per-peer slots, never floor-distance / near-tip lag.
     async fn try_fill(&mut self) -> Option<Instant> {
+        self.request_pool_waiting = false;
         self.gc_skipped_outstanding();
         // The BBR cwnd is clamped to the peer's advertised hard cap inside
         // `available_slots`, so there is no separate window to reconcile on a
@@ -891,6 +940,24 @@ impl PeerRoutine {
             if floor_slots == 0 {
                 break FillStop::CwndSaturated;
             }
+            self.request_pool_waiting = false;
+            let authorization = if let Some(requester) = &self.requester {
+                // Count unanswered exchanges, including scheduler-abandoned work.
+                // The peer's u32 advertised limit fits usize on supported targets.
+                if requester.len() >= self.window.max_inflight_requests as usize {
+                    break FillStop::CwndSaturated;
+                }
+                let Some(entry) = requester.pool.try_entry() else {
+                    self.request_pool_waiting = true;
+                    break FillStop::Budget;
+                };
+                let Some(exchange) = requester.open() else {
+                    break FillStop::SendError;
+                };
+                Some((entry, exchange))
+            } else {
+                None
+            };
             // Reserve transport capacity before taking work or charging bytes.
             let slot = match request_sender.try_reserve_guarded() {
                 Ok(slot) => slot,
@@ -1048,7 +1115,11 @@ impl PeerRoutine {
             // expires (see `earliest_deadline_sleep`).
             {
                 let is_allowed = |height: &block::Height, item: &WorkItem| {
-                    !self.retry_avoid.contains_key(height)
+                    !self
+                        .requester
+                        .as_ref()
+                        .is_some_and(|requester| requester.contains_height(*height))
+                        && !self.retry_avoid.contains_key(height)
                         && !self
                             .registry
                             .is_floor_height_avoided(&self.peer, *height, now)
@@ -1145,6 +1216,34 @@ impl PeerRoutine {
                     .collect(),
             };
 
+            let writer = if let (Some(requester), Some((entry, exchange))) =
+                (&self.requester, authorization)
+            {
+                let expected: Vec<_> = request
+                    .expected_blocks
+                    .iter()
+                    .map(|block| block.hash)
+                    .collect();
+                match requester.reserve(
+                    first_height,
+                    &expected,
+                    self.max_response_bytes,
+                    entry,
+                    exchange,
+                ) {
+                    Ok(writer) => Some(writer),
+                    Err(error) => {
+                        tracing::error!(
+                            ?error,
+                            "valid scheduler request could not reserve its response"
+                        );
+                        self.cancel.cancel();
+                        break FillStop::Internal;
+                    }
+                }
+            } else {
+                None
+            };
             let queued_at = Instant::now();
             let msg = BlockSyncMessage::GetBlocks {
                 start_height: request.start_height,
@@ -1182,19 +1281,38 @@ impl PeerRoutine {
             let request_count = request.count;
             let request_estimated_bytes = request.estimated_bytes;
             let mut delivered = false;
-            if !claim.publish(|| {
-                self.window.outstanding.push(OutstandingBlockRange {
-                    request,
-                    write_status: claim.status(),
-                    charged_for_liveness: false,
-                    queued_at,
-                    deadline,
-                    delivery_snapshot: self.window.delivery_snapshot(queued_at),
-                    delivered_bytes: 0,
-                    received: ReceivedBlockTracker::default(),
+            let write_claim: Arc<dyn crate::zakura::transport::FrameWriteClaim> = match &writer {
+                Some(exchange) => Arc::new(super::regulated::live_requester::FencedRequest {
+                    exchange: exchange.clone(),
+                    work: claim.clone(),
+                }),
+                None => claim.clone(),
+            };
+            let mut published = false;
+            let publish = || {
+                published = claim.publish(|| {
+                    self.window.outstanding.push(OutstandingBlockRange {
+                        request,
+                        write_status: claim.status(),
+                        charged_for_liveness: false,
+                        queued_at,
+                        deadline,
+                        delivery_snapshot: self.window.delivery_snapshot(queued_at),
+                        delivered_bytes: 0,
+                        received: ReceivedBlockTracker::default(),
+                    });
+                    delivered = slot.send_request(frame, write_claim);
                 });
-                delivered = slot.send_request(frame, claim.clone());
-            }) {
+            };
+            if let Some(writer) = &writer {
+                writer.publish(publish);
+            } else {
+                publish();
+            }
+            if !published {
+                if let Some(requester) = &self.requester {
+                    requester.retire(first_height, true);
+                }
                 break FillStop::Internal;
             }
             if !delivered {
@@ -1206,6 +1324,9 @@ impl PeerRoutine {
                     "block request transport closed during publication"
                 );
                 claim.delivery_failed();
+                if let Some(requester) = &self.requester {
+                    requester.retire(first_height, true);
+                }
                 break FillStop::SendError;
             }
             metrics::counter!("sync.block.request.sent").increment(1);
@@ -1385,6 +1506,7 @@ impl PeerRoutine {
             self.window.record_timeout(timed_out.len());
         }
         for outstanding in skipped.iter().chain(&timed_out) {
+            self.retire_authorization(outstanding);
             // Return only the unreceived heights — received ones are buffered (in
             // `in_flight` until committed); re-queuing them would re-fetch a body
             // we already hold (the WorkQueue single-owner invariant forbids it).
@@ -1509,6 +1631,7 @@ impl PeerRoutine {
         while index < self.window.outstanding.len() {
             if self.window.outstanding[index].request.end_height() <= floor {
                 let outstanding = self.window.retire_locally(index);
+                self.retire_authorization(&outstanding);
                 // Release only estimates whose per-height ledger is still
                 // `Reserved`. A competing delivery changes that ledger to
                 // `Released` at receipt, so floor GC must not release it again.
@@ -1533,6 +1656,13 @@ impl PeerRoutine {
     /// A skipped frame ends the peer obligation independently of any received
     /// body whose owner must remain available to the sequencer.
     fn gc_skipped_outstanding(&mut self) {
+        if let Some(requester) = &self.requester {
+            for outstanding in &self.window.outstanding {
+                if outstanding.write_status.was_skipped() {
+                    requester.retire(outstanding.request.start_height, true);
+                }
+            }
+        }
         if self.window.discard_skipped_requests() {
             self.publish_outstanding();
         }
@@ -1556,7 +1686,8 @@ impl PeerRoutine {
             if still_owned {
                 index += 1;
             } else {
-                self.window.retire_locally(index);
+                let retired = self.window.retire_locally(index);
+                self.retire_authorization(&retired);
                 removed = true;
             }
         }
@@ -2159,12 +2290,22 @@ impl PeerRoutine {
         if index >= self.window.outstanding.len() {
             return;
         }
-        self.window.retire_locally(index);
+        let retired = self.window.retire_locally(index);
+        self.retire_authorization(&retired);
         self.publish_outstanding();
         self.window.disarm_liveness_after_progress_if_idle();
     }
 
+    fn retire_authorization(&self, outstanding: &OutstandingBlockRange) {
+        if let Some(requester) = &self.requester {
+            let unwritten = outstanding.write_status.expire_unwritten()
+                || outstanding.write_status.was_skipped();
+            requester.retire(outstanding.request.start_height, unwritten);
+        }
+    }
+
     fn finish_detached(&mut self, outstanding: OutstandingBlockRange, disposition: Disposition) {
+        self.retire_authorization(&outstanding);
         match disposition {
             Disposition::Satisfied => {
                 // Every requested height was received and buffered; nothing
@@ -2414,7 +2555,7 @@ mod tests {
         Some(start..start + len)
     }
 
-    fn status_test_routine() -> (
+    pub(super) fn status_test_routine() -> (
         PeerRoutine,
         crate::zakura::FramedRecv,
         mpsc::Receiver<RoutineToReactor>,

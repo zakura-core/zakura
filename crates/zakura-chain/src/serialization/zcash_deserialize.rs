@@ -157,6 +157,11 @@ pub(super) fn read_external_count<R: io::Read, T: ZcashDeserialize + TrustedPrea
     let mut vec = Vec::with_capacity(external_count.min(MAX_INITIAL_ALLOCATION));
     for _ in 0..external_count {
         let item = reader.read_value()?;
+        if reader.remaining_bytes().is_some() && vec.len() == vec.capacity() {
+            // Vec's automatic growth could exceed the count checked above.
+            let capacity = vec.capacity().saturating_mul(2).min(external_count);
+            vec.reserve_exact(capacity - vec.len());
+        }
         vec.push(item);
     }
     Ok(vec)

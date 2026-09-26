@@ -278,3 +278,20 @@ fn external_streaming_implementations_remain_usable_but_do_not_claim_bounds() {
     assert!(StreamingByte::zcash_deserialize_from_slice(&mut &[7][..]).is_err());
     assert!(Vec::<StreamingByte>::zcash_deserialize_from_slice(&mut &[1, 7][..]).is_err());
 }
+
+#[test]
+fn bounded_collection_growth_never_requests_more_than_the_declared_count() {
+    for count in [1_023, 1_024, 1_025, 2_047, 2_048, 2_049] {
+        let encoded = vec![0; count * 192];
+        let (proofs, allocations) = zakura_test::allocations::measure(|| {
+            ZcashReader::from_slice(&mut encoded.as_slice())
+                .read_external_count::<Groth16Proof>(count)
+                .unwrap()
+        });
+        assert_eq!(proofs.len(), count);
+        assert!(
+            allocations.largest_request <= count * std::mem::size_of::<Groth16Proof>(),
+            "count {count}: {allocations:?}"
+        );
+    }
+}

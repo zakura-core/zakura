@@ -2,7 +2,7 @@
 
 use std::{fmt, net::SocketAddr, sync::Arc, time::Duration};
 
-use iroh::{endpoint::QuicTransportConfig, protocol::Router, EndpointAddr, EndpointId};
+use iroh::{endpoint::QuicTransportConfig, EndpointAddr, EndpointId};
 use tokio::{
     sync::{mpsc, Mutex},
     task::JoinHandle,
@@ -19,7 +19,7 @@ use crate::{
         HeaderSyncStartup, Service, ZakuraBlockSyncConfig, ZakuraDiscoveryHandle, ZakuraEndpoint,
         ZakuraHandshakeConfig, ZakuraHeaderSyncConfig, ZakuraHeaderSyncDriverStartup,
         ZakuraLocalLimits, ZakuraPeerId, ZakuraProtocolHandler, ZakuraServiceId,
-        ZakuraSupervisorHandle, ZakuraTrace, P2P_V2_ALPN,
+        ZakuraSupervisorHandle, ZakuraTrace,
     },
     BoxError, Config,
 };
@@ -586,9 +586,7 @@ impl ZakuraTestNodeBuilder {
         if let Some(supported_capabilities) = self.supported_capabilities {
             handler = handler.with_supported_capabilities(supported_capabilities);
         }
-        let router = Router::builder(endpoint)
-            .accept(P2P_V2_ALPN, handler.clone())
-            .spawn();
+        let router = handler.spawn_router(endpoint);
         let endpoint = if let (Some(header_handle), Some(block_handle), Some((shutdown, actions))) =
             (header_sync_handle, block_sync_handle, header_sync_actions)
         {

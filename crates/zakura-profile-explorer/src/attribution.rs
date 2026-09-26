@@ -124,6 +124,22 @@ pub(crate) fn associate(
     Ok(())
 }
 
+/// Compact link availability uses the same sample ancestry as the flame graph filter.
+pub(crate) fn stage_counts(cpu: &Value) -> Value {
+    let mut counts = BTreeMap::<u64, usize>::new();
+    for sample in cpu["samples"].as_array().into_iter().flatten() {
+        for id in sample["context"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_u64)
+        {
+            *counts.entry(id).or_default() += 1;
+        }
+    }
+    json!({"stages":counts})
+}
+
 pub(crate) fn select(cpu: &mut Value, view: &str, span: Option<u64>) -> Result<()> {
     ensure!(
         matches!(view, "context" | "raw" | "unassigned"),
@@ -221,14 +237,17 @@ mod tests {
         let mut selected = cpu.clone();
         select(&mut selected, "context", Some(1))?;
         assert_eq!(selected["selected_samples"], 2);
+        assert_eq!(stage_counts(&cpu), json!({"stages":{"0":2,"1":2,"2":1}}));
         // Missing ancestry does not get replaced with a plausible stage name.
         let missing = json!({"summary":{"start_us":100},"spans":[]});
         associate(&db, "run", 1, &missing, &mut cpu)?;
         assert_eq!(cpu["attribution"]["associated_samples"], 0);
+        assert_eq!(stage_counts(&cpu), json!({"stages":{}}));
         // Unexpected overlapping intervals fail closed for the affected thread.
         db.execute("INSERT INTO executions(run,attempt,span,thread,start_us,end_us) VALUES('run',1,1,7,120,240)",[])?;
         associate(&db, "run", 1, &detail, &mut cpu)?;
         assert_eq!(cpu["attribution"]["associated_samples"], 0);
+        assert_eq!(stage_counts(&cpu), json!({"stages":{}}));
         db.execute("DELETE FROM attempts WHERE run='run'", [])?;
         assert_eq!(
             db.query_row("SELECT count(*) FROM executions", [], |r| r

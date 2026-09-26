@@ -92,6 +92,17 @@ async fn cpu(
     app.read(move |r| r.cpu_view(&run, attempt, &q.scope, &q.view, q.span))
         .await
 }
+async fn cpu_stages(
+    State(app): State<App>,
+    Path((run, attempt)): Path<(String, u64)>,
+) -> ApiResult {
+    app.read(move |r| {
+        Ok(crate::attribution::stage_counts(
+            &r.cpu(&run, attempt, "recorded")?,
+        ))
+    })
+    .await
+}
 async fn cpu_profile(
     State(app): State<App>,
     Path((run, attempt)): Path<(String, u64)>,
@@ -142,6 +153,7 @@ pub(crate) async fn serve(path: PathBuf, port: u16) -> Result<()> {
         .route("/cpu-viewer/{asset}",get(viewer_asset))
         .route("/api/cpu/{run}/{attempt}",get(cpu))
         .route("/api/cpu-profile/{run}/{attempt}",get(cpu_profile))
+        .route("/api/cpu-stages/{run}/{attempt}",get(cpu_stages))
         .route("/api/home",get(home)).route("/api/search",get(search))
         .route("/api/attempt/{run}/{attempt}",get(detail))
         .route("/api/trace/{run}/{attempt}",get(trace))

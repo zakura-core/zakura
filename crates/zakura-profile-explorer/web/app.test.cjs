@@ -117,3 +117,38 @@ test('arrival timeline correlates exact parent and child without fabricating mis
   assert.equal(rows[0].label,'Downloader received body');
   assert.equal(context.dependencyRows({summary:{start_us:0}}).length,0);
 });
+
+test('CPU links appear only for sampled stages, including lazily expanded rows',async()=>{
+  let respond,requests=0;
+  const rendering=vm.createContext({
+    URLSearchParams,location:{search:''},
+    document:{createElement:()=>({addEventListener(){}})},
+    fetch:()=>{requests++;return new Promise(resolve=>{respond=data=>resolve({ok:true,json:async()=>data});});},
+  });
+  vm.runInContext(source.slice(0,source.indexOf("if(document.body.dataset.page==='home')")),rendering);
+  const linkFor=rendering.stageCpuLinks({run:'abc',attempt:1},'available');
+  const sampled=linkFor({span:3}),empty=linkFor({span:4});
+  assert.equal(sampled.hidden,true);
+  assert.equal(empty.hidden,true);
+  respond({stages:{3:2,5:1}});
+  await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(sampled.hidden,false);
+  assert.match(sampled.title,/2 CPU samples/);
+  assert.equal(empty.hidden,true);
+  const lazy=linkFor({span:5});
+  assert.equal(lazy.hidden,false);
+  assert.match(lazy.href,/span=5$/);
+  for(const status of ['pending','unavailable',undefined]){
+    assert.equal(rendering.stageCpuLinks({run:'abc',attempt:1},status)({span:3}).hidden,true);
+  }
+  assert.equal(requests,1);
+});
+
+test('failed CPU count requests leave links hidden',async()=>{
+  const rendering=vm.createContext({URLSearchParams,location:{search:''},
+    document:{createElement:()=>({addEventListener(){}})},fetch:async()=>{throw new Error('offline');}});
+  vm.runInContext(source.slice(0,source.indexOf("if(document.body.dataset.page==='home')")),rendering);
+  const link=rendering.stageCpuLinks({run:'abc',attempt:1},'available')({span:3});
+  await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(link.hidden,true);
+});

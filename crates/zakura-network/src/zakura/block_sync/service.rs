@@ -215,6 +215,7 @@ pub(crate) struct BlockSyncService {
 
 #[derive(Debug)]
 struct BlockSyncServiceInner {
+    requester_sessions: crate::zakura::regulation::SessionTable<()>,
     sessions: crate::zakura::regulation::SessionCapacity,
     config: ZakuraBlockSyncConfig,
     lifecycle: mpsc::UnboundedSender<BlockSyncEvent>,
@@ -260,6 +261,13 @@ impl BlockSyncServiceInner {
             return false;
         }
 
+        self.requester_sessions.remove(
+            peer,
+            crate::zakura::regulation::SessionKey {
+                conn_id,
+                session_id,
+            },
+        );
         let removed = active_peers
             .remove(peer)
             .expect("record exists because the ownership check just matched it");
@@ -291,6 +299,7 @@ impl BlockSyncService {
     pub(crate) fn new_with_handle(config: ZakuraBlockSyncConfig, handle: BlockSyncHandle) -> Self {
         Self {
             inner: Arc::new(BlockSyncServiceInner {
+                requester_sessions: Default::default(),
                 sessions: crate::zakura::regulation::SessionCapacity::new(
                     "block-sync",
                     &config.peer_limits,
@@ -333,6 +342,7 @@ impl BlockSyncService {
         let (handle, _actions, reactor_task) = spawn_block_sync_reactor(startup);
         Self {
             inner: Arc::new(BlockSyncServiceInner {
+                requester_sessions: Default::default(),
                 sessions: crate::zakura::regulation::SessionCapacity::new(
                     "block-sync",
                     &config.peer_limits,
@@ -370,6 +380,7 @@ impl BlockSyncService {
         (
             Self {
                 inner: Arc::new(BlockSyncServiceInner {
+                    requester_sessions: Default::default(),
                     sessions: crate::zakura::regulation::SessionCapacity::new(
                         "block-sync",
                         &config.peer_limits,
@@ -609,6 +620,17 @@ impl Service for BlockSyncService {
         // nothing is lost by dropping it.
         drop(send);
 
+        let requester_fence = self
+            .inner
+            .routine_wiring
+            .as_ref()
+            .filter(|wiring| wiring.serving.is_some())
+            .map(|_| {
+                crate::zakura::regulation::WriterFence::new(
+                    connection_cancel_token.clone(),
+                    close_cause.clone(),
+                )
+            });
         let (old_record, re_admitted_after_no_progress, routine_generation) = {
             let mut active_peers = self
                 .inner
@@ -670,6 +692,26 @@ impl Service for BlockSyncService {
                 } else {
                     (None, false)
                 };
+            if let Some(fence) = &requester_fence {
+                use crate::zakura::regulation::{Current, Replacement, SessionKey};
+                if matches!(
+                    self.inner.requester_sessions.replace(
+                        peer_id.clone(),
+                        Current {
+                            key: SessionKey {
+                                conn_id,
+                                session_id
+                            },
+                            cancel: service_cancel_token.clone(),
+                            fence: fence.clone(),
+                            session: (),
+                        }
+                    ),
+                    Replacement::Refused
+                ) {
+                    return;
+                }
+            }
             let old_record = active_peers.insert(
                 peer_id.clone(),
                 BlockSyncPeerRecord {
@@ -743,6 +785,14 @@ impl Service for BlockSyncService {
                                 run_cancel.clone(),
                             )
                         });
+                        let requester = requester_fence.map(|fence| {
+                            super::regulated::live_requester::LiveRequester::new(
+                                wiring.request_pool.clone(),
+                                fence,
+                                &recv,
+                                block_sync_session.request_sender(),
+                            )
+                        });
                         let routine = super::peer_routine::PeerRoutine::new(
                             peer_id,
                             conn_id,
@@ -763,7 +813,8 @@ impl Service for BlockSyncService {
                             run_cancel,
                             wiring.trace,
                         )
-                        .with_serving(serving);
+                        .with_serving(serving)
+                        .with_requester(requester);
                         tokio::select! {
                             biased;
                             () = connection_cancel_token.cancelled() => Ok(()),

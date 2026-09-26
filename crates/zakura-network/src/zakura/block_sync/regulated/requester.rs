@@ -39,6 +39,7 @@ pub(super) enum ResponseError {
     Ending,
 }
 
+#[derive(Debug)]
 struct Pending {
     range: Range,
     // An exact-sized allocation avoids retaining a caller's excess Vec capacity.
@@ -54,6 +55,7 @@ struct Pending {
 ///
 /// `next` has at most one entry per live range. It avoids an O(live requests)
 /// scan on every block without adding a generic index or allocation budget.
+#[derive(Debug)]
 pub(super) struct Requester {
     reservations: Reservations<Height>,
     ranges: BTreeMap<Height, Pending>,
@@ -68,6 +70,20 @@ impl Requester {
             ranges: BTreeMap::new(),
             next: HashMap::new(),
         }
+    }
+
+    pub(super) fn len(&self) -> usize {
+        self.reservations.len()
+    }
+
+    pub(super) fn contains_height(&self, height: Height) -> bool {
+        self.ranges
+            .range(..=height)
+            .next_back()
+            .is_some_and(|(_, pending)| {
+                u64::from(pending.range.start.0) + u64::from(pending.range.count)
+                    > u64::from(height.0)
+            })
     }
 
     /// Reserve before publishing the request. `expected` must come from the

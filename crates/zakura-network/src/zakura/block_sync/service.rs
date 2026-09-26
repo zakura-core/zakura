@@ -26,6 +26,7 @@ const BLOCK_SYNC_SERVICE_STREAMS: [Stream; 1] = [Stream {
     version: ZAKURA_BLOCK_SYNC_STREAM_VERSION,
     frame_cap: MAX_BS_FRAME_BYTES,
     capability: ZAKURA_CAP_BLOCK_SYNC,
+    messages: Some(super::regulated::wire::RULES),
     ..Stream::PERSISTENT
 }];
 
@@ -37,6 +38,7 @@ pub(crate) fn block_sync_streams() -> &'static [Stream] {
 /// Cloneable typed stream-6 sender.
 #[derive(Clone, Debug)]
 pub struct BlockSyncPeerSession {
+    status_sender: Option<Arc<super::regulated::status_sender::StatusSender>>,
     peer_id: ZakuraPeerId,
     direction: ServicePeerDirection,
     send: FramedSend,
@@ -46,6 +48,7 @@ pub struct BlockSyncPeerSession {
 impl BlockSyncPeerSession {
     pub(crate) fn new(session: &PeerStreamSession, direction: ServicePeerDirection) -> Self {
         Self {
+            status_sender: None,
             peer_id: session.peer_id().clone(),
             direction,
             send: session.sender(),
@@ -63,6 +66,7 @@ impl BlockSyncPeerSession {
         cancel_token: CancellationToken,
     ) -> Self {
         Self {
+            status_sender: None,
             peer_id,
             direction: ServicePeerDirection::Outbound,
             send,
@@ -101,12 +105,38 @@ impl BlockSyncPeerSession {
 
     /// Send a typed status advertisement.
     pub fn try_send_status(&self, status: BlockSyncStatus) -> Result<(), OrderedSendError> {
+        if let Some(sender) = &self.status_sender {
+            return sender.try_send(status, &self.send);
+        }
         self.try_send_message(BlockSyncMessage::Status(status))
     }
 
     /// Send a typed status advertisement, waiting for transport queue capacity.
     pub async fn send_status(&self, status: BlockSyncStatus) -> Result<(), OrderedSendError> {
-        self.send_message(BlockSyncMessage::Status(status)).await
+        if self.status_sender.is_none() {
+            return self.send_message(BlockSyncMessage::Status(status)).await;
+        }
+        loop {
+            match self.try_send_status(status) {
+                Err(OrderedSendError::Full) => {
+                    let next = self
+                        .status_next_due()
+                        .unwrap_or_else(Instant::now)
+                        .max(Instant::now() + Duration::from_millis(100));
+                    tokio::select! {
+                        () = self.cancel_token.cancelled() => return Err(OrderedSendError::Closed),
+                        () = tokio::time::sleep_until(next.into()) => {},
+                    }
+                }
+                result => return result,
+            }
+        }
+    }
+
+    pub(super) fn status_next_due(&self) -> Option<Instant> {
+        self.status_sender
+            .as_ref()
+            .and_then(|sender| sender.next_due())
     }
 
     /// Send a typed block range request.
@@ -215,6 +245,10 @@ pub(crate) struct BlockSyncService {
 
 #[derive(Debug)]
 struct BlockSyncServiceInner {
+    // Connection lifetime, not session lifetime: replacement cannot reset cadence.
+    status_senders: StdMutex<
+        HashMap<(ZakuraPeerId, ZakuraConnId), Arc<super::regulated::status_sender::StatusSender>>,
+    >,
     requester_sessions: crate::zakura::regulation::SessionTable<()>,
     sessions: crate::zakura::regulation::SessionCapacity,
     config: ZakuraBlockSyncConfig,
@@ -299,6 +333,7 @@ impl BlockSyncService {
     pub(crate) fn new_with_handle(config: ZakuraBlockSyncConfig, handle: BlockSyncHandle) -> Self {
         Self {
             inner: Arc::new(BlockSyncServiceInner {
+                status_senders: Default::default(),
                 requester_sessions: Default::default(),
                 sessions: crate::zakura::regulation::SessionCapacity::new(
                     "block-sync",
@@ -342,6 +377,7 @@ impl BlockSyncService {
         let (handle, _actions, reactor_task) = spawn_block_sync_reactor(startup);
         Self {
             inner: Arc::new(BlockSyncServiceInner {
+                status_senders: Default::default(),
                 requester_sessions: Default::default(),
                 sessions: crate::zakura::regulation::SessionCapacity::new(
                     "block-sync",
@@ -380,6 +416,7 @@ impl BlockSyncService {
         (
             Self {
                 inner: Arc::new(BlockSyncServiceInner {
+                    status_senders: Default::default(),
                     requester_sessions: Default::default(),
                     sessions: crate::zakura::regulation::SessionCapacity::new(
                         "block-sync",
@@ -606,7 +643,7 @@ impl Service for BlockSyncService {
         let service_cancel_token = session.cancel_token();
         let connection_cancel_token = peer.cancel_token();
         let close_cause = peer.close_cause();
-        let block_sync_session = BlockSyncPeerSession::new(&session, peer.direction);
+        let mut block_sync_session = BlockSyncPeerSession::new(&session, peer.direction);
         let session_id = self.inner.next_session_id.fetch_add(1, Ordering::Relaxed);
         let conn_id = peer.conn_id;
         let (_session_peer, _stream_kind, _stream_version, recv, send, _session_cancel) =
@@ -711,6 +748,17 @@ impl Service for BlockSyncService {
                 ) {
                     return;
                 }
+            }
+            if requester_fence.is_some() {
+                block_sync_session.status_sender = Some(
+                    self.inner
+                        .status_senders
+                        .lock()
+                        .expect("status sender map is not poisoned")
+                        .entry((peer_id.clone(), conn_id))
+                        .or_default()
+                        .clone(),
+                );
             }
             let old_record = active_peers.insert(
                 peer_id.clone(),
@@ -880,6 +928,11 @@ impl Service for BlockSyncService {
                 .active_peers
                 .lock()
                 .expect("block-sync peer map mutex is never poisoned");
+            self.inner
+                .status_senders
+                .lock()
+                .expect("status sender map is not poisoned")
+                .remove(&(peer.clone(), conn_id));
             let removed = match active_peers.get(peer) {
                 Some(record) if record.conn_id == conn_id => {
                     self.inner.requester_sessions.remove(
@@ -1019,5 +1072,43 @@ mod requester_session_tests {
         );
         assert!(cancel.is_cancelled());
         assert!(fence.open().is_none());
+    }
+}
+
+#[cfg(test)]
+mod regulated_frame_tests {
+    use super::*;
+    use crate::zakura::{
+        transport::{FrameFilter, InboundReader},
+        MessageRole,
+    };
+
+    #[test]
+    fn production_getblocks_layout_declares_exact_control_and_body_limits() {
+        Stream::check_layout(block_sync_streams()).unwrap();
+        let stream = &block_sync_streams()[0];
+        let filter = FrameFilter::new(stream.messages, InboundReader::Persistent);
+        for (tag, bytes) in [(1, 53), (2, 9), (3, 2_000_001), (4, 9), (5, 9)] {
+            assert_eq!(
+                filter
+                    .check_header(tag, 0, bytes, stream.frame_cap as usize)
+                    .unwrap(),
+                bytes + FRAME_HEADER_BYTES
+            );
+            assert!(filter
+                .check_header(tag, 1, bytes, stream.frame_cap as usize)
+                .is_err());
+        }
+        assert!(filter
+            .check_header(6, 0, 1, stream.frame_cap as usize)
+            .is_err());
+        assert!(filter
+            .check_header(4, 0, 8, stream.frame_cap as usize)
+            .is_err());
+        let MessageRole::Announcement { cadence } = stream.messages.unwrap()[0].role else {
+            panic!("Status is an announcement")
+        };
+        assert_eq!(cadence.capacity, 22);
+        assert_eq!(cadence.send_interval, Duration::from_secs(30));
     }
 }

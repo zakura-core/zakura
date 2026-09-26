@@ -135,8 +135,8 @@ impl LiveRequester {
                 .map_err(SinkReject::protocol)?;
             return Ok(Some(height));
         }
+        let message: Message = decode_frame(frame).map_err(SinkReject::protocol)?;
         if matches!(frame.message_type, 4 | 5) {
-            let message: Message = decode_frame(frame).map_err(SinkReject::protocol)?;
             self.shared
                 .lock()
                 .finish(&message)

@@ -45,6 +45,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use tokio_util::sync::CancellationToken;
 
+use super::{shared_allocation_bytes, ConnectionResponseMemory, ResponseMemoryPermit};
 use crate::zakura::{transport::FrameWriteClaim, CloseCause, Frame, FramedSend};
 
 #[cfg(test)]
@@ -62,6 +63,30 @@ struct Fence {
     state: Mutex<FenceState>,
     connection: CancellationToken,
     close_cause: CloseCause,
+    memory: Option<ConnectionResponseMemory>,
+    _setup: Option<ResponseMemoryPermit>,
+}
+
+// Includes the shared fence and first-use platform lock storage.
+// Cold allocation tests check this allowance.
+const FENCE_SETUP_BYTES: u64 = 512;
+// The phase mutex can allocate storage on first use independently of its Arc.
+// Cold allocation tests include this storage rather than treating the Arc's
+// inline layout as the whole allocation.
+const EXCHANGE_LOCK_BYTES: u64 = 128;
+
+/// A local reason an exchange could not be opened. Never a peer violation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub(crate) enum ExchangeOpenError {
+    /// The session retired or its connection closed.
+    #[error("the exchange fence retired")]
+    Retired,
+    /// The connection or node has insufficient metadata capacity.
+    #[error("response metadata capacity is full")]
+    MemoryFull,
+    /// Additional metadata needs a fence constructed with a shared memory pool.
+    #[error("the exchange fence has no metadata pool")]
+    Unfunded,
 }
 
 #[derive(Debug, Default)]
@@ -84,6 +109,7 @@ struct ExchangeState {
     fence: WriterFence,
     // Always lock the fence before the phase, including in `Drop`.
     phase: Mutex<Phase>,
+    _memory: Option<ResponseMemoryPermit>,
 }
 
 /// One request's exchange, with one owner.
@@ -105,6 +131,8 @@ impl WriterFence {
             state: Mutex::new(FenceState::default()),
             connection,
             close_cause,
+            memory: None,
+            _setup: None,
         }))
     }
 
@@ -112,17 +140,82 @@ impl WriterFence {
         self.0.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Open an exchange before taking local work for it. `None` once the
-    /// fence retired or the connection closed.
+    /// Fund the fence before allocating it. Services and replacement sessions
+    /// on a connection must pass clones of the same memory handle.
+    pub(crate) fn try_with_memory(
+        connection: &CancellationToken,
+        close_cause: &CloseCause,
+        memory: ConnectionResponseMemory,
+    ) -> Result<Self, ExchangeOpenError> {
+        let setup = memory
+            .try_reserve(FENCE_SETUP_BYTES)
+            .ok_or(ExchangeOpenError::MemoryFull)?;
+        let fence = Fence {
+            state: Mutex::new(FenceState::default()),
+            connection: connection.clone(),
+            close_cause: close_cause.clone(),
+            memory: Some(memory),
+            _setup: Some(setup),
+        };
+        drop(fence.state.lock().unwrap_or_else(PoisonError::into_inner));
+        Ok(Self(Arc::new(fence)))
+    }
+
+    /// Open before taking local work. Returns `None` after retirement or when
+    /// a funded fence has no room. Use `try_open` to distinguish these cases.
     pub(crate) fn open(&self) -> Option<Exchange> {
+        self.try_open().ok()
+    }
+
+    /// Open an exchange, charging its shared allocation when the fence is funded.
+    pub(crate) fn try_open(&self) -> Result<Exchange, ExchangeOpenError> {
+        self.try_open_with_retained_memory(0, 0)
+            .map(|(exchange, _)| exchange)
+    }
+
+    /// Reserve the exchange, caller metadata and retained container growth as
+    /// one allocation plan before publishing work. The separate permit must
+    /// follow the container. Exchange metadata follows every writer clone.
+    pub(crate) fn try_open_with_retained_memory(
+        &self,
+        metadata_bytes: u64,
+        retained_bytes: u64,
+    ) -> Result<(Exchange, Option<ResponseMemoryPermit>), ExchangeOpenError> {
         let state = self.lock();
         if state.retired || self.0.connection.is_cancelled() {
-            return None;
+            return Err(ExchangeOpenError::Retired);
         }
-        Some(Exchange(Arc::new(ExchangeState {
-            fence: self.clone(),
-            phase: Mutex::new(Phase::Opened),
-        })))
+        let (memory, retained) = if let Some(pool) = &self.0.memory {
+            let bytes = Self::admission_bytes(metadata_bytes, retained_bytes)
+                .ok_or(ExchangeOpenError::MemoryFull)?;
+            let mut memory = pool
+                .try_reserve(bytes)
+                .ok_or(ExchangeOpenError::MemoryFull)?;
+            let retained = (retained_bytes > 0).then(|| memory.split_off(retained_bytes));
+            (Some(memory), retained)
+        } else if metadata_bytes == 0 && retained_bytes == 0 {
+            (None, None)
+        } else {
+            return Err(ExchangeOpenError::Unfunded);
+        };
+        let phase = Mutex::new(Phase::Opened);
+        drop(phase.lock().unwrap_or_else(PoisonError::into_inner));
+        Ok((
+            Exchange(Arc::new(ExchangeState {
+                fence: self.clone(),
+                phase,
+                _memory: memory,
+            })),
+            retained,
+        ))
+    }
+
+    /// Total charge for an exchange, its caller metadata and retained growth.
+    pub(crate) fn admission_bytes(metadata_bytes: u64, retained_bytes: u64) -> Option<u64> {
+        shared_allocation_bytes::<ExchangeState>()
+            .checked_add(EXCHANGE_LOCK_BYTES)?
+            .checked_add(metadata_bytes)?
+            .checked_add(retained_bytes)
     }
 
     /// Fence every unstarted write. Close the connection if an exchange

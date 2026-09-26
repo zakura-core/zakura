@@ -301,3 +301,9 @@ proptest! {
         }
     }
 }
+
+impl WriterFence {
+    pub(crate) fn setup_bytes_for_test() -> u64 {
+        FENCE_SETUP_BYTES
+    }
+}

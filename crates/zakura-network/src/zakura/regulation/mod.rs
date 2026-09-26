@@ -12,6 +12,7 @@
 //! - [`SessionTable`] holds each peer's current session, and its
 //!   [`WriterFence`] closes the connection rather than orphan a started
 //!   exchange.
+//! - [`ResponseMemory`] funds retained metadata across services sharing a connection.
 //! - [`sizing`] derives every capacity default from the throughput target.
 //!
 //! Every tool acts against a peer only on an unambiguous violation: an event
@@ -52,9 +53,15 @@ pub(crate) mod sizing;
 mod slots;
 pub(crate) use slots::{OutputByteBudget, OutputGrant, SlotBudget, SlotPermit};
 
+mod response_memory;
+pub(crate) use response_memory::{
+    collection_allocation_bytes, shared_allocation_bytes, ConnectionResponseMemory, ResponseMemory,
+    ResponseMemoryPermit,
+};
+
 mod writer_fence;
 pub(crate) use writer_fence::{
-    Exchange, ExchangeWriter, FencedSendError, WriterFence, UNFINISHED_EXCHANGE,
+    Exchange, ExchangeOpenError, ExchangeWriter, FencedSendError, WriterFence, UNFINISHED_EXCHANGE,
 };
 
 #[cfg(test)]

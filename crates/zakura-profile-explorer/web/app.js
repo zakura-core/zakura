@@ -108,7 +108,8 @@ async function openDetail(run,attempt) {
   $('trace').href=`/api/trace/${run}/${attempt}`; $('raw').href=`/api/attempt/${run}/${attempt}`;
   const spans=displayedSpans(data.spans).sort((a,b)=>a.start_us-b.start_us), start=row.start_us || 0;
   const end=Math.max(row.end_us||start,...spans.map(s=>s.end_us)), duration=Math.max(end-start,1);
-  renderTimeline(spans,row,start,duration,data.recording.network,data.cpu?.status);
+  renderTimeline(spans,row,start,duration,data.recording.network);
+  renderSharedProofs(data.spans);
   renderDependencies(data);
   if(showCpu){$('cpu').hidden=false;renderCpu(data.cpu);}
 }
@@ -262,8 +263,7 @@ function renderTransactions(host,spans,lane,network) {
   }
   if(!spans.length)host.append(el('p','No individual transaction timings were retained.','muted'));
 }
-function renderTimeline(spans,row,start,duration,network,cpuStatus) {
-  const cpuLink=stageCpuLinks(row,cpuStatus);
+function renderTimeline(spans,row,start,duration,network) {
   const host=$('timeline');host.replaceChildren();
   const finalization=spans.find(s=>s.stage==='finalization'), transactions=spans.find(s=>s.stage==='transactions');
   const children=new Map();
@@ -278,7 +278,7 @@ function renderTimeline(spans,row,start,duration,network,cpuStatus) {
     const line=el(tag,null,`lane${span.root?' root':''}`),track=el('div',null,'lane-bar'),bar=el('div',null,'bar');
     bar.style.left=`${Math.max(0,(span.start_us-start)/duration*100)}%`;bar.style.width=`${Math.max(0,(span.end_us-span.start_us)/duration*100)}%`;
     bar.title=`${ms(span.start_us-start)} → ${ms(span.end_us-start)}`;track.append(bar);
-    const name=el('span',label,'lane-name');if(span.span!=null)name.append(cpuLink(span));
+    const name=el('span',label,'lane-name');
     line.append(name,track,el('span',ms(span.end_us-span.start_us),'lane-time'));return line;
   }
   if(row.end_us!=null)host.append(lane({stage:'Verifier request',start_us:start,end_us:row.end_us,root:true}));
@@ -296,38 +296,56 @@ function renderTimeline(spans,row,start,duration,network,cpuStatus) {
       group.append(body);host.append(group);
     }else if(span===finalization){
       const group=el('details',null,'timeline-group finalization'),body=el('div',null,'timeline-children');
-      group.append(lane(span,'summary','Finalization'));renderFinalization(body,span,children,cpuLink);group.append(body);host.append(group);
+      group.append(lane(span,'summary','Finalization'));renderFinalization(body,span,children);group.append(body);host.append(group);
     }else host.append(lane(span));
   }
 }
-function stageCpuLinks(row,status) {
-  const links=[],counts={};
-  const update=(link,span)=>{
-    const count=counts[span] || 0;
-    link.hidden=count===0;
-    link.title=`${number(count)} CPU samples associated with this stage`;
-  };
-  // Load counts separately so decoding CPU samples never delays the waterfall.
-  // Links stay hidden if samples are pending, absent, pruned, or fail to load.
-  if(status==='available')api(`/api/cpu-stages/${row.run}/${row.attempt}`).then(data=>{
-    Object.assign(counts,data.stages);
-    for(const [link,span] of links)update(link,span);
-  }).catch(()=>{});
-  return span=>{
-    const link=el('a',' CPU','stage-cpu');
-    link.href=`/cpu/${row.run}/${row.attempt}?scope=recorded&view=context&span=${span.span}`;
-    link.addEventListener('click',event=>event.stopPropagation());
-    links.push([link,span.span]);update(link,span.span);return link;
-  };
-}
-function renderFinalization(host,root,children,cpuLink) {
+function renderFinalization(host,root,children) {
   host.append(el('p',`${ms(root.end_us-root.start_us)} total. This moves older blocks into finalized storage and can continue after the verifier responds.`,'muted'));
   if(!children.get(root.span)?.length){host.append(el('p','This recording has only the total. A replay with detailed instrumentation is needed to measure its substeps.','muted'));return;}
   const t=el('table'),head=el('tr');for(const title of ['Step','Elapsed','Share of finalization'])head.append(el('th',title));
   const thead=el('thead');thead.append(head);t.append(thead);const body=el('tbody'),seen=new Set([root.span]);
   function visit(parent,depth){if(depth>8)return;for(const span of children.get(parent)||[]){if(seen.has(span.span))continue;seen.add(span.span);const row=el('tr'),name=el('td',`${'↳ '.repeat(depth)}${finalizationLabels[span.stage]||span.stage.replaceAll('_',' ')}`),elapsed=span.end_us-span.start_us;
-    name.append(cpuLink(span));row.append(name,el('td',ms(elapsed)),el('td',`${(100*elapsed/Math.max(1,root.end_us-root.start_us)).toFixed(1)}%`));body.append(row);visit(span.span,depth+1);}}
+    row.append(name,el('td',ms(elapsed)),el('td',`${(100*elapsed/Math.max(1,root.end_us-root.start_us)).toFixed(1)}%`));body.append(row);visit(span.span,depth+1);}}
   visit(root.span,0);t.append(body);const wrap=el('div',null,'table-wrap');wrap.append(t);host.append(wrap,el('p','Indented rows are included in their parent. Parallel reads and serialization overlap. Do not add every row together.','muted'));
+}
+function sharedProofRows(spans) {
+  const batches=new Map(),members=new Map();
+  for(const span of spans){
+    const detail=span.verification;
+    if(detail?.kind==='batch')batches.set(detail.id,{span,detail});
+    if(detail?.kind==='request')for(const id of [detail.primary_batch,detail.fallback_batch]){
+      if(id==null)continue;
+      if(!members.has(id))members.set(id,[]);
+      members.get(id).push(span);
+    }
+  }
+  return [...batches].map(([id,{span,detail}])=>{
+    const requests=members.get(id)||[],transactions=[...new Set(requests.map(s=>s.transaction_index).filter(Number.isInteger))].sort((a,b)=>a-b);
+    const pools=[['sapling','Sapling'],['orchard','Orchard'],['ironwood','Ironwood']].filter(([key])=>detail[key]>0).map(([,name])=>name);
+    const elapsed=detail.worker_start_us!=null && detail.execution_end_us!=null ? detail.execution_end_us-detail.worker_start_us : null;
+    return {label:`${pools.join(' + ')||'Shielded'} proofs + signatures`,transactions,elapsed,
+      other:Math.max(0,detail.members-requests.length),partial:detail.partial||requests.some(s=>s.verification.partial),
+      fallback:requests.some(s=>s.verification.fallback),status:detail.status,start:span.start_us};
+  }).sort((a,b)=>a.start-b.start);
+}
+function renderSharedProofs(spans) {
+  const host=$('shared-proofs');host.replaceChildren();
+  const rows=sharedProofRows(spans);host.hidden=!rows.length;
+  if(!rows.length)return;
+  host.append(el('h2','Shared proof verification'),el('p','Each row is one worker execution serving the listed transactions. Elapsed times overlap the transaction bars and are not extra block time.','muted'));
+  const table=el('table'),head=el('tr');for(const label of ['Work','Transactions','Execution elapsed'])head.append(el('th',label));
+  const thead=el('thead');thead.append(head);table.append(thead);const body=el('tbody');
+  for(const row of rows){
+    const tr=el('tr'),work=el('td',row.label+(row.fallback?' (individual retry)':''));
+    const names=row.transactions.map(index=>number(index+1)).join(', ');
+    const members=el('td',names?`Transactions ${names}`:'Membership not retained');
+    if(row.other)members.append(el('div',`${number(row.other)} other or unlinked requests`,'muted'));
+    if(row.partial)members.append(el('div','Partial membership detail','muted'));
+    if(row.status!=='success')work.append(el('div',row.status==='failed'?'Verification failed':'Execution incomplete','muted'));
+    tr.append(work,members,el('td',row.elapsed==null?'Not recorded':ms(row.elapsed)));body.append(tr);
+  }
+  table.append(body);const wrap=el('div',null,'table-wrap');wrap.append(table);host.append(wrap);
 }
 function renderCpu(cpu) {
   const host=$('cpu');host.replaceChildren();

@@ -23,6 +23,7 @@ use serde::{Deserialize, Serialize};
 
 mod execution;
 pub mod lifecycle;
+pub mod shared;
 pub mod verification;
 
 /// Version of the wire schema and timing definitions.
@@ -564,7 +565,8 @@ impl Context {
         attempt.requested_spans.fetch_add(1, Ordering::Relaxed);
         let fine = matches!(
             stage,
-            Stage::Transaction
+            Stage::VerificationRequest
+                | Stage::Transaction
                 | Stage::TransactionChecks
                 | Stage::TransactionInputs
                 | Stage::SaplingRequest

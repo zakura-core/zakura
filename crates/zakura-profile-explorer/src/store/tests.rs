@@ -1394,3 +1394,52 @@ fn execution_records_survive_restart_without_extending_elapsed_work() -> Result<
     );
     Ok(())
 }
+
+#[test]
+fn shared_membership_survives_restart_without_extending_block_time() -> Result<()> {
+    use profiles::verification::{Cache, Detail, Pool, Status, Workload};
+    let temp = tempfile::tempdir()?;
+    let mut store = Store::open(temp.path(), 16_000_000)?;
+    store.ingest(metadata())?;
+    store.ingest(event(1, finish()))?;
+    store.ingest(event(
+        2,
+        Event::Span {
+            attempt: 1,
+            span: 1,
+            parent: 0,
+            stage: Stage::VerificationRequest,
+            transaction_index: Some(0),
+            transaction_hash: None,
+            start_us: 800000,
+            end_us: 900000,
+            completion_thread: None,
+            verification: Some(Detail::Request {
+                pool: Pool::Orchard,
+                workload: Workload::default(),
+                cache: Cache::Unknown,
+                status: Status::Success,
+                primary_batch: Some(7),
+                fallback_batch: None,
+                fallback: false,
+                partial: false,
+            }),
+        },
+    ))?;
+    store.ingest(event(
+        3,
+        Event::Seal {
+            attempt: 1,
+            spans: 1,
+            dropped: 0,
+        },
+    ))?;
+    store.flush()?;
+    drop(store);
+    let data = Reader::open(temp.path())?.detail(RUN, 1)?;
+    assert_eq!(data["timing"]["recorded_elapsed_us"], 700000);
+    assert_eq!(data["spans"][0]["verification"]["primary_batch"], 7);
+    assert_eq!(data["spans"][0]["transaction_index"], 0);
+    assert_eq!(data["complete"], true);
+    Ok(())
+}

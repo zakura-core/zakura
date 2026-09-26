@@ -942,7 +942,10 @@ impl Reader {
             .iter()
             .filter_map(|span| match span {
                 Event::Span { stage, end_us, .. }
-                    if *stage != profiles::Stage::VerificationBatch =>
+                    if !matches!(
+                        stage,
+                        profiles::Stage::VerificationBatch | profiles::Stage::VerificationRequest
+                    ) =>
                 {
                     Some(*end_us)
                 }

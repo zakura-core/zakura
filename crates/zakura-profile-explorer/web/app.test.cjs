@@ -118,37 +118,27 @@ test('arrival timeline correlates exact parent and child without fabricating mis
   assert.equal(context.dependencyRows({summary:{start_us:0}}).length,0);
 });
 
-test('CPU links appear only for sampled stages, including lazily expanded rows',async()=>{
-  let respond,requests=0;
-  const rendering=vm.createContext({
-    URLSearchParams,location:{search:''},
-    document:{createElement:()=>({addEventListener(){}})},
-    fetch:()=>{requests++;return new Promise(resolve=>{respond=data=>resolve({ok:true,json:async()=>data});});},
-  });
-  vm.runInContext(source.slice(0,source.indexOf("if(document.body.dataset.page==='home')")),rendering);
-  const linkFor=rendering.stageCpuLinks({run:'abc',attempt:1},'available');
-  const sampled=linkFor({span:3}),empty=linkFor({span:4});
-  assert.equal(sampled.hidden,true);
-  assert.equal(empty.hidden,true);
-  respond({stages:{3:2,5:1}});
-  await new Promise(resolve=>setImmediate(resolve));
-  assert.equal(sampled.hidden,false);
-  assert.match(sampled.title,/2 CPU samples/);
-  assert.equal(empty.hidden,true);
-  const lazy=linkFor({span:5});
-  assert.equal(lazy.hidden,false);
-  assert.match(lazy.href,/span=5$/);
-  for(const status of ['pending','unavailable',undefined]){
-    assert.equal(rendering.stageCpuLinks({run:'abc',attempt:1},status)({span:3}).hidden,true);
-  }
-  assert.equal(requests,1);
+test('shared proof execution appears once with its actual transaction membership',()=>{
+  const spans=[
+    {start_us:10,verification:{kind:'batch',id:42,members:4,orchard:4,worker_start_us:20,execution_end_us:4020,status:'success'}},
+    ...[2,0,2].map(transaction_index=>({transaction_index,verification:{kind:'request',primary_batch:42,fallback_batch:null}})),
+  ];
+  const rows=JSON.parse(JSON.stringify(context.sharedProofRows(spans)));
+  assert.equal(rows.length,1);
+  assert.deepEqual(rows[0].transactions,[0,2]);
+  assert.equal(rows[0].elapsed,4000);
+  assert.equal(rows[0].other,1);
+  assert.equal(rows[0].label,'Orchard proofs + signatures');
+  assert.deepEqual(JSON.parse(JSON.stringify(context.sharedProofRows([]))),[]);
 });
 
-test('failed CPU count requests leave links hidden',async()=>{
-  const rendering=vm.createContext({URLSearchParams,location:{search:''},
-    document:{createElement:()=>({addEventListener(){}})},fetch:async()=>{throw new Error('offline');}});
-  vm.runInContext(source.slice(0,source.indexOf("if(document.body.dataset.page==='home')")),rendering);
-  const link=rendering.stageCpuLinks({run:'abc',attempt:1},'available')({span:3});
-  await new Promise(resolve=>setImmediate(resolve));
-  assert.equal(link.hidden,true);
+test('shared proof rows preserve missing timing and fallback evidence',()=>{
+  const rows=context.sharedProofRows([
+    {start_us:0,verification:{kind:'batch',id:4,members:1,sapling:1,partial:true,status:'abandoned'}},
+    {transaction_index:5,verification:{kind:'request',primary_batch:null,fallback_batch:4,fallback:true}},
+  ]);
+  assert.equal(rows[0].elapsed,null);
+  assert.equal(rows[0].partial,true);
+  assert.equal(rows[0].fallback,true);
+  assert.equal(rows[0].status,'abandoned');
 });

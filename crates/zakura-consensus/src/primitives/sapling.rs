@@ -22,6 +22,11 @@ use zcash_proofs::prover::LocalTxProver;
 use zcash_protocol::value::ZatBalance;
 
 use crate::{error::TransactionError, BoxError};
+use zakura_jsonl_trace::block_profile::{
+    self as profiles,
+    shared::SharedBatch,
+    verification::{Pool, Workload},
+};
 
 use super::cache::{CacheKey, Cached, CachedItem, ShieldedPool, CACHE_CAPACITY};
 
@@ -63,6 +68,7 @@ pub struct Item {
     sighash: SigHash,
     /// The key this item's successful verification is remembered under.
     cache_key: CacheKey,
+    profile: profiles::Context,
 }
 
 impl Item {
@@ -81,7 +87,22 @@ impl Item {
             bundle,
             sighash,
             cache_key: CacheKey::new(tx_id, sighash.0, ShieldedPool::Sapling),
+            profile: profiles::Context::current(),
         }
+    }
+}
+
+impl Item {
+    fn profile_batch(&self, batch: &mut SharedBatch) {
+        batch.add(
+            self.profile.clone(),
+            Pool::Sapling,
+            Workload {
+                spends: u32::try_from(self.bundle.shielded_spends().len()).unwrap_or(u32::MAX),
+                outputs: u32::try_from(self.bundle.shielded_outputs().len()).unwrap_or(u32::MAX),
+                actions: 0,
+            },
+        );
     }
 }
 
@@ -126,6 +147,7 @@ impl RequestWeight for Item {
 pub struct Verifier {
     /// A batch verifier for Sapling shielded data.
     batch: BatchValidator,
+    profile: SharedBatch,
 
     /// A channel for broadcasting the verification result of the batch.
     ///
@@ -150,6 +172,7 @@ impl Drop for Verifier {
     // returns immediately, usually before the validation finishes.
     fn drop(&mut self) {
         let batch = mem::take(&mut self.batch);
+        let profile = mem::take(&mut self.profile);
         let tx = mem::take(&mut self.tx);
 
         // The validation is CPU-intensive; do it on a dedicated thread so it does not block.
@@ -158,7 +181,7 @@ impl Drop for Verifier {
             let (spend_vk, output_vk) = SAPLING.verifying_keys();
 
             // Validate the batch and send the result through the channel.
-            let res = batch.validate(&spend_vk, &output_vk, thread_rng());
+            let res = profile.measure(|| batch.validate(&spend_vk, &output_vk, thread_rng()));
             let _ = tx.send(Some(res));
         });
     }
@@ -178,12 +201,16 @@ impl Service<BatchControl<Item>> for Verifier {
             BatchControl::Item(item) => {
                 let mut rx = self.tx.subscribe();
 
+                item.profile_batch(&mut self.profile);
                 let bundle_check = self
                     .batch
                     .check_bundle(item.bundle, item.sighash.into())
                     .then_some(())
                     .ok_or(TransactionError::SaplingVerificationFailed);
 
+                if bundle_check.is_err() {
+                    self.profile.partial();
+                }
                 async move {
                     bundle_check.map_err(BoxError::from)?;
 
@@ -212,13 +239,14 @@ impl Service<BatchControl<Item>> for Verifier {
 
             BatchControl::Flush => {
                 let batch = mem::take(&mut self.batch);
+                let profile = mem::take(&mut self.profile);
                 let tx = mem::take(&mut self.tx);
 
                 async move {
                     let start = std::time::Instant::now();
                     let spawn_result = tokio::task::spawn_blocking(move || {
                         let (spend_vk, output_vk) = SAPLING.verifying_keys();
-                        batch.validate(&spend_vk, &output_vk, thread_rng())
+                        profile.measure(|| batch.validate(&spend_vk, &output_vk, thread_rng()))
                     })
                     .await;
                     let duration = start.elapsed().as_secs_f64();
@@ -252,6 +280,8 @@ pub fn verify_single(
     async move {
         let mut verifier = Verifier::default();
 
+        verifier.profile.fallback();
+        item.profile_batch(&mut verifier.profile);
         let check = verifier
             .batch
             .check_bundle(item.bundle, item.sighash.into())
@@ -262,7 +292,9 @@ pub fn verify_single(
         let is_valid = tokio::task::spawn_blocking(move || {
             let (spend_vk, output_vk) = SAPLING.verifying_keys();
 
-            mem::take(&mut verifier.batch).validate(&spend_vk, &output_vk, thread_rng())
+            mem::take(&mut verifier.profile).measure(|| {
+                mem::take(&mut verifier.batch).validate(&spend_vk, &output_vk, thread_rng())
+            })
         })
         .await
         .map_err(|_| BoxError::from("Sapling bundle validation thread panicked"))?;

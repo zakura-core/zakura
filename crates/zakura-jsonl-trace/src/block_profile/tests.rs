@@ -674,3 +674,133 @@ fn measure_execution_scope_overhead() {
     }
     eprintln!("execution records: {}", detail.try_iter().count());
 }
+
+#[test]
+fn shared_proof_batch_links_members_once_per_block_without_cpu_ownership() {
+    use shared::SharedBatch;
+    use verification::{Detail, Pool, Workload};
+    let (r, events, _) = recorder();
+    let first = begin_with(&r, block()).unwrap();
+    let second = begin_with(&r, block()).unwrap();
+    let mut batch = SharedBatch::default();
+    for (root, index) in [(&first, 0), (&first, 2), (&second, 1)] {
+        batch.add(
+            root.context().for_transaction(index),
+            Pool::Orchard,
+            Workload {
+                actions: 2,
+                ..Workload::default()
+            },
+        );
+    }
+    batch.add(
+        Context::default(),
+        Pool::Orchard,
+        Workload {
+            actions: 1,
+            ..Workload::default()
+        },
+    );
+    assert!(batch.measure(|| {
+        assert!(Context::current().0.is_none());
+        true
+    }));
+    let events: Vec<_> = events.try_iter().collect();
+    let mut ids = std::collections::BTreeSet::new();
+    let mut batches = 0;
+    let mut requests = Vec::new();
+    let mut intervals = std::collections::BTreeSet::new();
+    for event in events {
+        assert!(!matches!(event, Event::Execution { .. }));
+        if let Event::Span {
+            attempt,
+            start_us,
+            end_us,
+            transaction_index,
+            verification: Some(detail),
+            ..
+        } = event
+        {
+            assert!(detail.is_valid(start_us, end_us));
+            match detail {
+                Detail::Batch {
+                    id,
+                    members,
+                    profiled,
+                    unprofiled,
+                    workload,
+                    ..
+                } => {
+                    ids.insert(id);
+                    batches += 1;
+                    intervals.insert((start_us, end_us));
+                    assert_eq!((members, profiled, unprofiled), (4, 3, 1));
+                    assert_eq!(workload.actions, 7);
+                    assert_eq!(transaction_index, None);
+                }
+                Detail::Request {
+                    primary_batch: Some(id),
+                    ..
+                } => {
+                    ids.insert(id);
+                    requests.push((attempt, transaction_index));
+                }
+                _ => panic!("expected batch membership"),
+            }
+        }
+    }
+    assert_eq!(ids.len(), 1);
+    assert_eq!(batches, 2);
+    assert_eq!(intervals.len(), 1);
+    assert_eq!(requests.len(), 3);
+    assert_eq!(requests[0].1, Some(0));
+    assert_eq!(requests[1].1, Some(2));
+    assert_eq!(requests[2].1, Some(1));
+}
+
+#[test]
+fn shared_proof_panics_are_incomplete_and_membership_is_bounded() {
+    use shared::SharedBatch;
+    use verification::{Detail, Pool, Status, Workload};
+    let (r, events, _) = recorder();
+    let root = begin_with(&r, block()).unwrap();
+    let mut batch = SharedBatch::default();
+    batch.fallback();
+    for index in 0..1025 {
+        batch.add(
+            root.context().for_transaction(index),
+            Pool::Sapling,
+            Workload::default(),
+        );
+    }
+    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+        || batch.measure(|| panic!("worker panic"))
+    ))
+    .is_err());
+    let events: Vec<_> = events.try_iter().collect();
+    assert_eq!(events.len(), 1025);
+    assert!(events.iter().any(|e| matches!(
+        e,
+        Event::Span {
+            verification: Some(Detail::Batch {
+                members: 1025,
+                partial: true,
+                status: Status::Abandoned,
+                ..
+            }),
+            ..
+        }
+    )));
+    assert!(events.iter().any(|e| matches!(
+        e,
+        Event::Span {
+            verification: Some(Detail::Request {
+                primary_batch: None,
+                fallback_batch: Some(_),
+                fallback: true,
+                ..
+            }),
+            ..
+        }
+    )));
+}

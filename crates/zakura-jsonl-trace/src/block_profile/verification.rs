@@ -1,4 +1,4 @@
-//! Read compatibility for retained experimental verification profiles.
+//! Shared verification evidence and compatibility with earlier detailed profiles.
 
 use serde::{Deserialize, Serialize};
 

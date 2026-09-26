@@ -28,6 +28,7 @@
 //!
 //! [1]: crate::transaction::UnminedTx
 
+use crate::serialization::ZcashReader;
 use std::{fmt, sync::Arc};
 
 #[cfg(any(test, feature = "proptest-impl"))]
@@ -190,7 +191,9 @@ impl ZcashSerialize for Hash {
 }
 
 impl ZcashDeserialize for Hash {
-    fn zcash_deserialize<R: std::io::Read>(mut reader: R) -> Result<Self, SerializationError> {
+    fn zcash_deserialize_from<R: std::io::Read>(
+        reader: &mut ZcashReader<R>,
+    ) -> Result<Self, SerializationError> {
         Ok(reader.read_32_bytes()?.into())
     }
 }
@@ -354,7 +357,9 @@ impl ZcashSerialize for WtxId {
 }
 
 impl ZcashDeserialize for WtxId {
-    fn zcash_deserialize<R: std::io::Read>(mut reader: R) -> Result<Self, SerializationError> {
+    fn zcash_deserialize_from<R: std::io::Read>(
+        reader: &mut ZcashReader<R>,
+    ) -> Result<Self, SerializationError> {
         Ok(reader.read_64_bytes()?.into())
     }
 }

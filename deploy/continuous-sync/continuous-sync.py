@@ -125,6 +125,7 @@ class Policy:
     retention_runs: int = 10
     retention_bytes: int = 20 * 1024**3
     trace_file_bytes: int = 128 * 1024**2
+    trace_segments: int = 1000
     cooldown_seconds: int = 60
     wipe_entries: tuple[str, ...] = ("state", "non_finalized_state")
     preserve_entries: tuple[str, ...] = ("network",)
@@ -488,9 +489,9 @@ def check_free_space(config: Config, *, recovery: bool = False) -> None:
 
 
 def preflight(config: Config) -> None:
-    commands = ("cargo", "git", "systemctl", "logrotate")
+    commands = ("cargo", "git", "systemctl", "logrotate", "gzip")
     if config.policy.archive_traces:
-        commands += ("aws", "tar", "gzip")
+        commands += ("aws", "tar")
     for command in commands:
         if shutil.which(command) is None:
             raise ControllerError(f"required command is unavailable: {command}")
@@ -725,7 +726,8 @@ def rotate_run_logs(config: Config, run_dir: Path) -> None:
     rotation_config.write_text(
         f'{json.dumps(str(run_dir / "traces" / "*.jsonl"))} {{\n'
         f"    size {config.policy.trace_file_bytes}\n"
-        "    rotate 2\n    missingok\n    notifempty\n    copytruncate\n    nocompress\n}\n"
+        f"    rotate {config.policy.trace_segments}\n"
+        "    missingok\n    notifempty\n    copytruncate\n    compress\n}\n"
         f'{json.dumps(str(run_dir / "zebrad.log"))} {{\n'
         "    size 64M\n    rotate 1\n    missingok\n    notifempty\n    copytruncate\n    nocompress\n}\n",
         encoding="utf-8",
@@ -803,13 +805,22 @@ def trace_archive_destination() -> tuple[list[str], str]:
         raise ControllerError("set ZAKURA_TRACE_SPACE and ZAKURA_TRACE_ENDPOINT")
     aws = ["aws", "--endpoint-url", endpoint, "--cli-connect-timeout", "30",
            "--cli-read-timeout", "120"]
-    lifecycle = json.loads(run(aws + ["s3api", "get-bucket-lifecycle-configuration",
-                                    "--bucket", bucket], capture=True, timeout=180).stdout)
+    lifecycle = run(aws + ["s3api", "get-bucket-lifecycle-configuration", "--bucket", bucket],
+                    capture=True, check=False, timeout=180)
+    error = (lifecycle.stderr or "").strip()
+    if "AccessDenied" in error:
+        # Keys limited to one Space cannot read its lifecycle rules, so the
+        # operator checks the rule at setup. Still prove the key reaches the Space.
+        run(aws + ["s3api", "head-bucket", "--bucket", bucket], capture=True, timeout=180)
+        return aws, bucket
+    if lifecycle.returncode and "NoSuchLifecycleConfiguration" not in error:
+        raise ControllerError(f"cannot read Space lifecycle rules: {error}")
+    rules = json.loads(lifecycle.stdout).get("Rules", []) if lifecycle.returncode == 0 else []
     if not any(rule.get("Status") == "Enabled"
                and rule.get("Expiration", {}).get("Days") == 7
                and (rule.get("Prefix") == "sync-traces/"
                     or rule.get("Filter") == {"Prefix": "sync-traces/"})
-               for rule in lifecycle.get("Rules", [])):
+               for rule in rules):
         raise ControllerError("Space requires a seven-day sync-traces/ expiration rule")
     return aws, bucket
 

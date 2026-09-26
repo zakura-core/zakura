@@ -554,6 +554,7 @@ impl ZakuraTestNodeBuilder {
             Arc::new(DiscoveryService::new(discovery.clone()))
         };
         let registry = service_registry(
+            zakura_chain::serialization::ZcashDecoder::for_network(&network),
             &supervisor,
             header_sync,
             block_sync_handle.clone(),

@@ -1078,6 +1078,79 @@ mod requester_session_tests {
 #[cfg(test)]
 mod regulated_frame_tests {
     use super::*;
+
+    #[derive(Debug)]
+    struct EmptySource;
+
+    impl crate::zakura::BlockRangeSource for EmptySource {
+        fn read(
+            &self,
+            request: crate::zakura::BlockRangeRead,
+        ) -> futures::future::BoxFuture<
+            'static,
+            Result<crate::zakura::BlockRangeReadResult, crate::BoxError>,
+        > {
+            Box::pin(async move {
+                Ok(crate::zakura::BlockRangeReadResult {
+                    blocks: vec![],
+                    lease: request.lease,
+                })
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn status_cadence_survives_session_replacement_and_ends_with_its_connection() {
+        let service = BlockSyncService::new_with_startup(
+            BlockSyncStartup::inert(ZakuraBlockSyncConfig::default())
+                .with_range_source(Arc::new(EmptySource)),
+        );
+        let peer = ZakuraPeerId::new(vec![42; 32]).unwrap();
+        let mut held_channels = Vec::new();
+        let mut attach = |conn_id| {
+            let (in_tx, in_rx) = crate::zakura::framed_channel(4);
+            let (out_tx, out_rx) = crate::zakura::framed_channel(4);
+            service.add_peer(Peer::new_with_conn_id_and_direction(
+                conn_id,
+                peer.clone(),
+                None,
+                ZAKURA_CAP_BLOCK_SYNC,
+                ServicePeerDirection::Outbound,
+                HashMap::from([(ZAKURA_STREAM_BLOCK_SYNC, (in_rx, out_tx))]),
+                CancellationToken::new(),
+            ));
+            held_channels.push((in_tx, out_rx));
+            service
+                .inner
+                .status_senders
+                .lock()
+                .unwrap()
+                .get(&(peer.clone(), conn_id))
+                .unwrap()
+                .clone()
+        };
+        let first = attach(1);
+        let replacement = attach(1);
+        assert!(Arc::ptr_eq(&first, &replacement));
+        let new_connection = attach(2);
+        assert!(!Arc::ptr_eq(&first, &new_connection));
+        service.remove_peer(&peer, 1);
+        assert!(!service
+            .inner
+            .status_senders
+            .lock()
+            .unwrap()
+            .contains_key(&(peer.clone(), 1)));
+        assert!(service
+            .inner
+            .status_senders
+            .lock()
+            .unwrap()
+            .contains_key(&(peer.clone(), 2)));
+        service.remove_peer(&peer, 2);
+        assert!(service.inner.status_senders.lock().unwrap().is_empty());
+    }
+
     use crate::zakura::{
         transport::{FrameFilter, InboundReader},
         MessageRole,
@@ -1091,19 +1164,19 @@ mod regulated_frame_tests {
         for (tag, bytes) in [(1, 53), (2, 9), (3, 2_000_001), (4, 9), (5, 9)] {
             assert_eq!(
                 filter
-                    .check_header(tag, 0, bytes, stream.frame_cap as usize)
+                    .check_header(tag, 0, bytes, usize::try_from(stream.frame_cap).unwrap())
                     .unwrap(),
                 bytes + FRAME_HEADER_BYTES
             );
             assert!(filter
-                .check_header(tag, 1, bytes, stream.frame_cap as usize)
+                .check_header(tag, 1, bytes, usize::try_from(stream.frame_cap).unwrap())
                 .is_err());
         }
         assert!(filter
-            .check_header(6, 0, 1, stream.frame_cap as usize)
+            .check_header(6, 0, 1, usize::try_from(stream.frame_cap).unwrap())
             .is_err());
         assert!(filter
-            .check_header(4, 0, 8, stream.frame_cap as usize)
+            .check_header(4, 0, 8, usize::try_from(stream.frame_cap).unwrap())
             .is_err());
         let MessageRole::Announcement { cadence } = stream.messages.unwrap()[0].role else {
             panic!("Status is an announcement")

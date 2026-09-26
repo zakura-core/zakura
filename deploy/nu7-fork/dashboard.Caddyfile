@@ -8,7 +8,18 @@ api.nu7.valargroup.dev {
         }
     }
 
-    @status path /v1/status /v1/block/* /v1/tx/* /healthz
+    handle /v1/status {
+        header {
+            Access-Control-Allow-Origin https://zakura.com
+            Access-Control-Allow-Methods "GET, OPTIONS"
+            Access-Control-Allow-Headers Content-Type
+        }
+        @preflight method OPTIONS
+        respond @preflight 204
+        reverse_proxy 127.0.0.1:8093
+    }
+
+    @status path /v1/block/* /v1/tx/* /healthz
     handle @status {
         reverse_proxy 127.0.0.1:8093
     }

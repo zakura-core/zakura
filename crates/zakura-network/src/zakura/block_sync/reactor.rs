@@ -269,8 +269,9 @@ pub fn spawn_block_sync_reactor(
         verified_block_tip: startup.frontiers.verified_block_tip,
         request_floor: startup.frontiers.verified_block_tip,
         pending_needed_query: None,
-        body_anchor_query_required: startup.best_header_tip.1
-            != startup.frontiers.verified_block_hash,
+        body_anchor_query_required: startup.best_header_tip.0
+            <= startup.frontiers.verified_block_tip
+            && startup.best_header_tip.1 != startup.frontiers.verified_block_hash,
         hint_refresh: None,
         needed_query_retry_at: None,
         pending_body_supplier_restart: None,
@@ -864,7 +865,8 @@ impl BlockSyncReactor {
     }
 
     async fn handle_header_tip_changed(&mut self, height: block::Height, hash: block::Hash) {
-        self.body_anchor_query_required |= self.state.best_header_hash != hash;
+        self.body_anchor_query_required |=
+            height <= self.request_floor && self.state.best_header_hash != hash;
         self.state.best_header_tip = height;
         self.state.best_header_hash = hash;
         self.query_needed_blocks().await;
@@ -892,6 +894,10 @@ impl BlockSyncReactor {
         });
         let frontiers = block_sync_frontiers(&view);
         let header_best = view.frontiers.header_best;
+        if previous.is_none() {
+            self.body_anchor_query_required = header_best.height <= frontiers.verified_block_tip
+                && header_best.hash != frontiers.verified_block_hash;
+        }
         self.committed_view = Some(view.clone());
         self.pending_body_supplier_restart = None;
         self.pending_operator_body_retry = None;

@@ -39,7 +39,7 @@ use crate::{
             Config as MempoolConfig, Mempool, MempoolError, SameEffectsChainRejectionError,
             UnboxMempoolError,
         },
-        sync::{self, BlockGossipError, SyncStatus, PEER_GOSSIP_DELAY},
+        sync::{self, BlockGossipError, SyncStatus},
     },
     BoxError,
 };
@@ -48,19 +48,9 @@ use InventoryResponse::*;
 
 /// How long the mock peer set waits for an expected request before panicking.
 ///
-/// Must comfortably exceed [`PEER_GOSSIP_DELAY`]: after that sleep the gossip task still needs a tip
-/// change notification and a short submission delay before it advertises. A tight 500ms bound
-/// races under CI scheduling and fails with `timeout while waiting for a request` even though the
-/// advertise would arrive a moment later. The dedicated gossip tests use the same 30s budget;
-/// with a paused runtime the extra headroom does not slow the happy path.
+/// Leave scheduling headroom for state notifications and transaction gossip. Waiting on the
+/// request itself lets paused-time tests respond before a prompt block send times out.
 const MAX_PEER_SET_REQUEST_DELAY: Duration = Duration::from_secs(30);
-
-async fn wait_for_gossip() {
-    // Let background gossip tasks arm their timers before this paused runtime
-    // advances to the next gossip deadline.
-    tokio::task::yield_now().await;
-    tokio::time::sleep(PEER_GOSSIP_DELAY).await;
-}
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn mempool_requests_for_transactions() {
@@ -686,8 +676,7 @@ async fn mempool_transaction_expiration() -> Result<(), crate::BoxError> {
     let mut hs = HashSet::new();
     hs.insert(tx1_id);
 
-    // Transaction and Block IDs are gossipped, in any order, after waiting for the gossip delay
-    wait_for_gossip().await;
+    // Transaction and block announcements can arrive in either order.
     let possible_requests = &mut [
         Request::AdvertiseTransactionIds(hs, None),
         Request::AdvertiseBlock(block_two.hash(), None),
@@ -755,8 +744,7 @@ async fn mempool_transaction_expiration() -> Result<(), crate::BoxError> {
         .await
         .unwrap();
 
-    // Test the block is gossiped, after waiting for the multi-gossip delay
-    wait_for_gossip().await;
+    // Wait for the block announcement.
     peer_set
         .expect_request(Request::AdvertiseBlock(block_three.hash(), None))
         .await
@@ -834,8 +822,7 @@ async fn mempool_transaction_expiration() -> Result<(), crate::BoxError> {
         MempoolError::StorageEffectsChain(SameEffectsChainRejectionError::Expired)
     );
 
-    // Test transaction 2 is gossiped, after waiting for the multi-gossip delay
-    wait_for_gossip().await;
+    // Wait for the transaction announcement.
 
     let mut hs = HashSet::new();
     hs.insert(tx2_id);
@@ -865,8 +852,7 @@ async fn mempool_transaction_expiration() -> Result<(), crate::BoxError> {
             .await
             .unwrap();
 
-        // Test the block is gossiped, after waiting for the multi-gossip delay
-        wait_for_gossip().await;
+        // Wait for the block announcement.
         peer_set
             .expect_request(Request::AdvertiseBlock(block.hash(), None))
             .await
@@ -1442,8 +1428,6 @@ async fn setup_with_misbehavior_receiver(
     //
     // (The genesis block gets skipped, because block 1 is committed before the task is spawned.)
     for block in committed_blocks.iter().skip(1) {
-        tokio::time::sleep(PEER_GOSSIP_DELAY).await;
-
         peer_set
             .expect_request(Request::AdvertiseBlock(block.hash(), None))
             .await

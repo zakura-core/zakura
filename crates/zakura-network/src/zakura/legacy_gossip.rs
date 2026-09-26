@@ -1809,7 +1809,7 @@ impl Service<Request> for LegacyRequestAdapter {
 /// Which transports a [`ZakuraDualStackService`] request fans out to.
 #[derive(Copy, Clone)]
 enum DualStackRoute {
-    /// Block/transaction advertisements: fan out to both stacks, fire-and-forget.
+    /// Fan out advertisements to both stacks; blocks require one accepting route.
     Advertise,
     /// Requests the Zakura adapter can serve (inventory fetches, chain-sync
     /// discovery, and mempool data): legacy peer set first, then Zakura fallback.
@@ -1834,10 +1834,10 @@ enum DualStackRoute {
 ///
 /// Routing (with `legacy_enabled` = `config.legacy_p2p()`):
 /// - Advertisements fan out concurrently to the legacy peer set (when
-///   `legacy_enabled`) and the Zakura gossip adapter. Advertise is
-///   fire-and-forget, so per-path errors are logged and swallowed and the
-///   composite always reports success — one stack failing never fails the local
-///   advertisement.
+///   `legacy_enabled`) and the Zakura gossip adapter. Blocks require at least
+///   one accepting route; native acceptance may retain the tip for future peers
+///   and does not acknowledge remote receipt. Transaction advertisements remain
+///   best effort, with per-path errors logged without failing the composite.
 /// - Inventory fetches hit the legacy peer set first and fall back to Zakura
 ///   when the legacy response is all-missing or errors. With `legacy_enabled`
 ///   false they route straight to Zakura.

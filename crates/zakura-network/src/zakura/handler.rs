@@ -290,7 +290,11 @@ pub struct ZakuraConfig {
     /// untrusted peers; this does not enable relays, external address lookup,
     /// automatic router port mapping, or restrict connections to paired devices.
     pub nat_traversal: bool,
-    /// Total concurrent Zakura connections, inbound plus outbound.
+    /// Total native connection capacity, inbound plus outbound.
+    ///
+    /// A slot is reserved before QUIC construction and retained through handshake
+    /// failure and final transport cleanup. Closing connections still use a slot
+    /// while stream handles retain their state.
     pub max_connections: usize,
     /// Maximum established Zakura connections admitted from one source IP.
     ///

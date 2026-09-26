@@ -1,5 +1,6 @@
 //! Orchard shielded data for `V5` `Transaction`s.
 
+use crate::serialization::ZcashReader;
 use std::{
     cmp::{Eq, PartialEq},
     fmt::{self, Debug},
@@ -218,6 +219,10 @@ pub const AUTHORIZED_ACTION_SIZE: u64 = ACTION_SIZE + SPEND_AUTH_SIG_SIZE;
 /// valid on the network and in the mempool, but it can never be mined into a block. So
 /// rejecting these large edge-case transactions can never break consensus.
 impl TrustedPreallocate for Action {
+    fn min_serialized_size() -> u64 {
+        ACTION_SIZE
+    }
+
     fn max_allocation() -> u64 {
         // Since a serialized Vec<AuthorizedAction> uses at least one byte for its length,
         // and the signature is required,
@@ -240,6 +245,10 @@ impl TrustedPreallocate for Action {
 }
 
 impl TrustedPreallocate for Signature<SpendAuth> {
+    fn min_serialized_size() -> u64 {
+        SPEND_AUTH_SIG_SIZE
+    }
+
     fn max_allocation() -> u64 {
         // Each signature must have a corresponding action.
         Action::max_allocation()
@@ -308,7 +317,9 @@ impl ZcashSerialize for Flags {
 }
 
 impl ZcashDeserialize for Flags {
-    fn zcash_deserialize<R: io::Read>(mut reader: R) -> Result<Self, SerializationError> {
+    fn zcash_deserialize_from<R: io::Read>(
+        reader: &mut ZcashReader<R>,
+    ) -> Result<Self, SerializationError> {
         // Consensus rule: "In a version 5 transaction,
         // the reserved bits 2..7 of the flagsOrchard field MUST be zero."
         // https://zips.z.cash/protocol/protocol.pdf#txnencodingandconsensus

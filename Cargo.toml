@@ -436,10 +436,10 @@ result_large_err = "allow"
 
 # Temporary qualification pins. Return to published packages after dependency review.
 [patch.crates-io]
-zakura-iroh = { git = "https://github.com/zakura-core/iroh", rev = "e3b8e7d20bd1d5b6ae93c70ce5054125c82f71f1" }
-zakura-iroh-base = { git = "https://github.com/zakura-core/iroh", rev = "e3b8e7d20bd1d5b6ae93c70ce5054125c82f71f1" }
-zakura-iroh-dns = { git = "https://github.com/zakura-core/iroh", rev = "e3b8e7d20bd1d5b6ae93c70ce5054125c82f71f1" }
-zakura-iroh-relay = { git = "https://github.com/zakura-core/iroh", rev = "e3b8e7d20bd1d5b6ae93c70ce5054125c82f71f1" }
-noq = { git = "https://github.com/zakura-core/iroh-quinn", rev = "efef9a4ea4ef9daeab7d14216fe0989b6662bd70" }
-noq-proto = { git = "https://github.com/zakura-core/iroh-quinn", rev = "efef9a4ea4ef9daeab7d14216fe0989b6662bd70" }
-noq-udp = { git = "https://github.com/zakura-core/iroh-quinn", rev = "efef9a4ea4ef9daeab7d14216fe0989b6662bd70" }
+zakura-iroh = { git = "https://github.com/zakura-core/iroh", rev = "7aaf22ba6ce07a1cf215b7048c6246efd2cd6034" }
+zakura-iroh-base = { git = "https://github.com/zakura-core/iroh", rev = "7aaf22ba6ce07a1cf215b7048c6246efd2cd6034" }
+zakura-iroh-dns = { git = "https://github.com/zakura-core/iroh", rev = "7aaf22ba6ce07a1cf215b7048c6246efd2cd6034" }
+zakura-iroh-relay = { git = "https://github.com/zakura-core/iroh", rev = "7aaf22ba6ce07a1cf215b7048c6246efd2cd6034" }
+noq = { git = "https://github.com/zakura-core/iroh-quinn", rev = "f2362a53d9119db01fec5d121d1febdedeba48ca" }
+noq-proto = { git = "https://github.com/zakura-core/iroh-quinn", rev = "f2362a53d9119db01fec5d121d1febdedeba48ca" }
+noq-udp = { git = "https://github.com/zakura-core/iroh-quinn", rev = "f2362a53d9119db01fec5d121d1febdedeba48ca" }

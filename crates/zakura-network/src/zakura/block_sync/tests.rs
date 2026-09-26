@@ -12910,8 +12910,9 @@ async fn selected_fork_same_height_at_startup_downloads_missing_body() {
 async fn selected_fork_downloads_missing_body(selected_height: u32, at_startup: bool) {
     let parent = block::Hash([0; 32]);
     let verified = block::Hash([0x51; 32]);
-    let selected = block::Hash([0x52; 32]);
-    let missing = mainnet_blocks_1_to_3()[0].clone();
+    let blocks = mainnet_blocks_1_to_3();
+    let selected = blocks[usize::try_from(selected_height - 1).unwrap()].hash();
+    let missing = blocks[0].clone();
     let config = immediate_body_download_config();
     let initial_header = if at_startup {
         (selected_height, selected)

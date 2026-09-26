@@ -55,9 +55,15 @@ pub(crate) use slots::{OutputByteBudget, OutputGrant, SlotBudget, SlotPermit};
 
 mod response_memory;
 pub(crate) use response_memory::{
-    collection_allocation_bytes, shared_allocation_bytes, ConnectionResponseMemory, ResponseMemory,
-    ResponseMemoryPermit,
+    collection_allocation_bytes, shared_allocation_bytes, ConnectionResponseMemory, MemoryFull,
+    ResponseMemory, ResponseMemoryPermit,
 };
+
+mod response_vec;
+pub(crate) use response_vec::{CapacityPlan, ResponseVec};
+
+mod response_index;
+pub(crate) use response_index::{ResponseIndex, ResponseIndexPlan, ResponseMatch};
 
 mod writer_fence;
 pub(crate) use writer_fence::{

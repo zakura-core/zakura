@@ -8,6 +8,11 @@ use std::sync::Arc;
 
 use crate::zakura::transport::ByteBudget;
 
+/// A response storage allocation cannot fit or cannot be represented.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+#[error("response storage capacity is full")]
+pub(crate) struct MemoryFull;
+
 /// Requested heap size of an Arc, including its reference counts and padding.
 pub(crate) fn shared_allocation_bytes<T>() -> u64 {
     let (layout, _) = std::alloc::Layout::new::<[usize; 2]>()

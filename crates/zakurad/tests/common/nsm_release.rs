@@ -33,6 +33,7 @@ use zakura_test::{
 };
 
 const NU7: u32 = 104;
+const OPENED_P2P_ENDPOINT_MSG: &str = "Opened Zcash protocol endpoint at ";
 
 struct Node {
     child: TestChild<TempDir>,
@@ -46,7 +47,6 @@ impl Node {
         let config = dir.path().join("zakura.toml");
         let settings: zakurad::config::ZakuradConfig =
             toml::from_str(&std::fs::read_to_string(&config)?)?;
-        let p2p = settings.network.listen_addr;
         let backup = settings
             .state
             .non_finalized_state_backup_dir(&settings.network.network)
@@ -57,6 +57,7 @@ impl Node {
                 args!["-c": config.to_str().expect("test path is Unicode"), "start"],
             )?
             .with_timeout(EXTENDED_LAUNCH_DELAY);
+        let p2p = read_listen_addr_from_logs(&mut child, OPENED_P2P_ENDPOINT_MSG)?;
         let addr = read_listen_addr_from_logs(&mut child, OPENED_RPC_ENDPOINT_MSG)?;
         Ok(Self {
             child,
@@ -212,8 +213,7 @@ pub async fn run() -> Result<()> {
     );
     let make_node = || -> Result<Node> {
         let mut config = os_assigned_rpc_port_config(false, &network)?;
-        config.network.listen_addr =
-            std::net::SocketAddr::from(([127, 0, 0, 1], zakura_test::net::random_known_port()));
+        config.network.listen_addr = std::net::SocketAddr::from(([127, 0, 0, 1], 0));
         config.state.ephemeral = false;
         config.mempool.debug_enable_at_height = Some(0);
         Node::start(testdir()?.with_config(&mut config)?)

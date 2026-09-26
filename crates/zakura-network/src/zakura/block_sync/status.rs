@@ -71,6 +71,13 @@ impl StatusDelivery {
         self.queue_retry_at = None;
     }
 
+    pub(super) fn defer_until(&mut self, deadline: Instant) {
+        self.queue_retry_at = Some(
+            self.queue_retry_at
+                .map_or(deadline, |retry| retry.max(deadline)),
+        );
+    }
+
     /// Back off failed queue attempts without spending the range-change allowance.
     pub(super) fn queue_full(&mut self, now: Instant) {
         self.queue_retry_at = Some(now + self.queue_retry_interval);

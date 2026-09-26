@@ -4,7 +4,7 @@
 
 use std::{future::Future, time::Duration};
 
-use futures::TryFutureExt;
+use futures::{future::BoxFuture, TryFutureExt};
 use thiserror::Error;
 use tokio::sync::{mpsc, watch};
 use tower::{Service, ServiceExt};
@@ -16,7 +16,7 @@ use zakura_rpc::MinedBlockEvent;
 use zakura_state::ChainTipChange;
 
 use crate::{
-    components::sync::{SyncStatus, PEER_GOSSIP_DELAY, TIPS_RESPONSE_TIMEOUT},
+    components::sync::{SyncStatus, TIPS_RESPONSE_TIMEOUT},
     BoxError,
 };
 
@@ -25,6 +25,7 @@ use BlockGossipError::*;
 #[derive(Debug)]
 enum GossipEvent<T> {
     MinedBlockBroadcastCompleted(block::Hash),
+    OrdinaryBroadcastCompleted(block::Hash, bool),
     MinedBlock(MinedBlockEvent),
     CommittedTip(T),
 }
@@ -102,6 +103,12 @@ where
 
     let (mined_block_mark_sender, mut mined_block_mark_receiver) = mpsc::unbounded_channel();
 
+    // Keep the ordinary operation here rather than spawning it: its readiness wait and send
+    // share one deadline, cancellation drops it, and tip churn cannot create overlapping sends.
+    let mut ordinary_broadcast: Option<BoxFuture<'static, (block::Hash, bool)>> = None;
+    let mut retry_at = tokio::time::Instant::now();
+    const RETRY_DELAY: Duration = Duration::from_secs(1);
+
     loop {
         // Drain local completion notifications from spawned mined-block
         // broadcasts before deciding whether the committed-tip fallback should
@@ -118,6 +125,7 @@ where
         // TODO: Refactor this into a struct and move the contents of this loop into its own method.
         let mut sync_status = sync_status.clone();
         let mut chain_tip = chain_state.clone_for_task();
+        let ordinary_busy = ordinary_broadcast.is_some();
 
         // TODO: Move the contents of this async block to its own method
         let tip_change_close_to_network_tip_fut = async move {
@@ -125,11 +133,12 @@ where
             // TODO: Add a test to check that Zakura does not advertise mined blocks to peers twice.
             const WAIT_FOR_BLOCK_SUBMISSION_DELAY: Duration = Duration::from_micros(100);
 
-            // wait for at least the network timeout between gossips
-            //
-            // in practice, we expect blocks to arrive approximately every 75 seconds,
-            // so waiting 6 seconds won't make much difference
-            tokio::time::sleep(PEER_GOSSIP_DELAY).await;
+            if ordinary_busy {
+                std::future::pending::<()>().await;
+            }
+            // A failed attempt leaves the delivery cursor unchanged, so the same tip is
+            // retried even without another state notification. Bound retries when offline.
+            tokio::time::sleep_until(retry_at).await;
 
             // wait for at least one tip change, to make sure we have a new block hash to broadcast
             let tip_action = chain_tip.wait_for_tip_change().await.map_err(TipChange)?;
@@ -153,7 +162,7 @@ where
                 .unwrap_or(tip_action)
                 .best_tip_hash_and_height();
 
-            Ok((best_tip, "sending committed block broadcast", chain_tip))
+            Ok((best_tip, "sending committed block broadcast"))
         }
         .in_current_span();
 
@@ -162,47 +171,55 @@ where
         // Prefer mined-block completions and submissions when multiple
         // branches are ready. The committed-tip path is a fallback, so
         // selecting it first can duplicate a mined-block broadcast.
-        let (((hash, height), log_msg, updated_chain_state), is_block_submission, early) =
-            match next_gossip_event(
+        let event = tokio::select! {
+            biased;
+            event = next_gossip_event(
                 mined_block_receiver.as_mut(),
                 &mut mined_block_mark_receiver,
                 tip_change_close_to_network_tip_fut,
-            )
-            .await
-            {
-                GossipEvent::MinedBlockBroadcastCompleted(mark_hash) => {
-                    chain_state.mark_last_change_hash(mark_hash);
-                    continue;
+            ) => event,
+            (hash, succeeded) = async {
+                match ordinary_broadcast.as_mut() {
+                    Some(broadcast) => broadcast.await,
+                    None => std::future::pending().await,
                 }
-                GossipEvent::MinedBlock(MinedBlockEvent::Early {
-                    hash,
-                    height,
-                    submitted_at,
-                    pending,
-                }) => (
-                    (
-                        (hash, height),
-                        "sending early mined block broadcast",
-                        chain_state,
-                    ),
-                    true,
-                    Some((pending, submitted_at)),
-                ),
-                GossipEvent::MinedBlock(MinedBlockEvent::Committed { hash, height }) => (
-                    (
-                        (hash, height),
-                        "sending committed mined block broadcast",
-                        chain_state,
-                    ),
-                    true,
-                    None,
-                ),
-                GossipEvent::CommittedTip(tip_change_close_to_network_tip) => {
-                    (tip_change_close_to_network_tip?, false, None)
+            } => GossipEvent::OrdinaryBroadcastCompleted(hash, succeeded),
+        };
+        let (((hash, height), log_msg), is_block_submission, early) = match event {
+            GossipEvent::MinedBlockBroadcastCompleted(mark_hash) => {
+                chain_state.mark_last_change_hash(mark_hash);
+                continue;
+            }
+            GossipEvent::OrdinaryBroadcastCompleted(hash, succeeded) => {
+                ordinary_broadcast = None;
+                if succeeded {
+                    // A late completion must not consume a newer selected tip.
+                    chain_state.mark_last_change_hash(hash);
+                    retry_at = tokio::time::Instant::now();
+                } else {
+                    retry_at = tokio::time::Instant::now() + RETRY_DELAY;
                 }
-            };
-
-        chain_state = updated_chain_state;
+                continue;
+            }
+            GossipEvent::MinedBlock(MinedBlockEvent::Early {
+                hash,
+                height,
+                submitted_at,
+                pending,
+            }) => (
+                ((hash, height), "sending early mined block broadcast"),
+                true,
+                Some((pending, submitted_at)),
+            ),
+            GossipEvent::MinedBlock(MinedBlockEvent::Committed { hash, height }) => (
+                ((hash, height), "sending committed mined block broadcast"),
+                true,
+                None,
+            ),
+            GossipEvent::CommittedTip(tip_change_close_to_network_tip) => {
+                (tip_change_close_to_network_tip?, false, None)
+            }
+        };
 
         // TODO: Move logic for calling the peer set to its own method.
 
@@ -218,6 +235,16 @@ where
         // Include readiness in the deadline. The event loop must keep consuming lifecycle and tip
         // events when the peer set has no ready service.
         let network = broadcast_network.clone();
+        if !is_block_submission {
+            ordinary_broadcast = Some(Box::pin(async move {
+                let succeeded =
+                    tokio::time::timeout(TIPS_RESPONSE_TIMEOUT, network.oneshot(request))
+                        .await
+                        .is_ok_and(|result| result.is_ok());
+                (hash, succeeded)
+            }));
+            continue;
+        }
         let mark_tx = mined_block_mark_sender.clone();
         // Only a committed broadcast may suppress the committed-tip fallback. Early inventory
         // advertises a hash whose body this node cannot serve yet, so a peer that follows it can

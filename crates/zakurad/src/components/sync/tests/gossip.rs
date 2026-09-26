@@ -2,7 +2,13 @@
 
 #![allow(clippy::unwrap_in_result)]
 
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 
 use tokio::{task::JoinHandle, time::timeout};
 use tower::{builder::ServiceBuilder, util::BoxService, Service, ServiceExt};
@@ -16,7 +22,9 @@ use zakura_chain::{
 };
 use zakura_network::{Request, Response};
 use zakura_rpc::{MinedBlockEvent, PendingBlockSignal, SubmitBlockChannel};
-use zakura_state::{Config as StateConfig, CHAIN_TIP_UPDATE_WAIT_LIMIT};
+use zakura_state::{
+    ChainTipBlock, ChainTipSender, Config as StateConfig, CHAIN_TIP_UPDATE_WAIT_LIMIT,
+};
 use zakura_test::mock_service::{MockService, PanicAssertion};
 
 use crate::components::sync::{
@@ -113,6 +121,230 @@ async fn setup_gossip_test() -> GossipTestSetup {
         state_service: BoxService::new(state_service),
         gossip_task_handle,
     }
+}
+
+/// Synthetic selected-tip notifications isolate the scheduler from async state commits.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn committed_tip_relay_is_prompt() {
+    let (mut tip_sender, _latest_tip, tip_change) = ChainTipSender::new(None, &Mainnet);
+    let (sync_status, mut recent_syncs) = SyncStatus::new();
+    SyncStatus::sync_close_to_tip(&mut recent_syncs);
+    let mut peer_set = MockService::build()
+        .with_max_request_delay(MAX_PEER_SET_REQUEST_DELAY)
+        .for_unit_tests();
+    let _gossip_task_handle = tokio::spawn(sync::gossip_best_tip_block_hashes(
+        sync_status,
+        tip_change,
+        peer_set.clone(),
+        None,
+    ));
+    let tip = |byte, height, previous| ChainTipBlock {
+        hash: zakura_chain::block::Hash([byte; 32]),
+        height: Height(height),
+        time: chrono::Utc::now(),
+        transactions: Vec::new(),
+        transaction_hashes: Arc::from([]),
+        previous_block_hash: zakura_chain::block::Hash([previous; 32]),
+    };
+    tip_sender.set_finalized_tip(tip(1, 1, 0));
+    peer_set
+        .expect_request(Request::AdvertiseBlock(
+            zakura_chain::block::Hash([1; 32]),
+            None,
+        ))
+        .await
+        .respond(Response::Nil);
+    tokio::task::yield_now().await;
+
+    let changed_at = tokio::time::Instant::now();
+    tip_sender.set_finalized_tip(tip(2, 2, 1));
+    peer_set
+        .expect_request(Request::AdvertiseBlock(
+            zakura_chain::block::Hash([2; 32]),
+            None,
+        ))
+        .await
+        .respond(Response::Nil);
+    let elapsed = changed_at.elapsed();
+    eprintln!(
+        "relay_probe scenario=back_to_back elapsed_ms={}",
+        elapsed.as_millis()
+    );
+
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "closely spaced tip must be prompt"
+    );
+
+    // A second selected-tip change at the same height exercises the timer while
+    // it is active, as in a competing-branch selection.
+    tokio::task::yield_now().await;
+    let changed_at = tokio::time::Instant::now();
+    tip_sender.set_finalized_tip(tip(3, 2, 1));
+    peer_set
+        .expect_request(Request::AdvertiseBlock(
+            zakura_chain::block::Hash([3; 32]),
+            None,
+        ))
+        .await
+        .respond(Response::Nil);
+    let same_height_elapsed = changed_at.elapsed();
+    eprintln!(
+        "relay_probe scenario=same_height elapsed_ms={}",
+        same_height_elapsed.as_millis()
+    );
+    assert!(same_height_elapsed < Duration::from_secs(1));
+
+    // After a long idle, the loop has already consumed its delay in either arm.
+    tokio::time::advance(Duration::from_secs(8)).await;
+    let changed_at = tokio::time::Instant::now();
+    tip_sender.set_finalized_tip(tip(4, 2, 1));
+    peer_set
+        .expect_request(Request::AdvertiseBlock(
+            zakura_chain::block::Hash([4; 32]),
+            None,
+        ))
+        .await
+        .respond(Response::Nil);
+    let idle_elapsed = changed_at.elapsed();
+    eprintln!(
+        "relay_probe scenario=idle_same_height elapsed_ms={}",
+        idle_elapsed.as_millis()
+    );
+    assert!(idle_elapsed < Duration::from_secs(1));
+}
+
+/// A stalled peer exposes how many relay futures can overlap under tip churn.
+/// The synthetic tips model selected-tip notifications, not consensus validation.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn committed_tip_stalled_send_is_bounded() {
+    struct ActiveSend(Arc<AtomicUsize>);
+    impl Drop for ActiveSend {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    let (mut tip_sender, _latest_tip, tip_change) = ChainTipSender::new(None, &Mainnet);
+    let (sync_status, mut recent_syncs) = SyncStatus::new();
+    SyncStatus::sync_close_to_tip(&mut recent_syncs);
+    let active = Arc::new(AtomicUsize::new(0));
+    let maximum = Arc::new(AtomicUsize::new(0));
+    let sent = Arc::new(AtomicUsize::new(0));
+    let (request_sender, mut request_receiver) = tokio::sync::mpsc::unbounded_channel();
+    let service = tower::service_fn({
+        let active = active.clone();
+        let maximum = maximum.clone();
+        let sent = sent.clone();
+        let request_sender = request_sender.clone();
+        move |_request: Request| {
+            let active = active.clone();
+            let maximum = maximum.clone();
+            let sent = sent.clone();
+            let request_sender = request_sender.clone();
+            async move {
+                let count = active.fetch_add(1, Ordering::SeqCst) + 1;
+                maximum.fetch_max(count, Ordering::SeqCst);
+                sent.fetch_add(1, Ordering::SeqCst);
+                let _ = request_sender.send(());
+                let _guard = ActiveSend(active);
+                std::future::pending::<()>().await;
+                Ok::<Response, crate::BoxError>(Response::Nil)
+            }
+        }
+    });
+    let gossip_task = tokio::spawn(sync::gossip_best_tip_block_hashes(
+        sync_status,
+        tip_change,
+        service,
+        None,
+    ));
+    let tip = |byte, height, previous| ChainTipBlock {
+        hash: zakura_chain::block::Hash([byte; 32]),
+        height: Height(height),
+        time: chrono::Utc::now(),
+        transactions: Vec::new(),
+        transaction_hashes: Arc::from([]),
+        previous_block_hash: zakura_chain::block::Hash([previous; 32]),
+    };
+    tip_sender.set_finalized_tip(tip(1, 1, 0));
+    request_receiver
+        .recv()
+        .await
+        .expect("initial relay request arrives");
+    assert_eq!(
+        sent.load(Ordering::SeqCst),
+        1,
+        "first blocked send must start"
+    );
+    assert_eq!(
+        active.load(Ordering::SeqCst),
+        1,
+        "first send must be in flight"
+    );
+    for byte in 2..=21 {
+        tip_sender.set_finalized_tip(tip(byte, u32::from(byte), byte - 1));
+        tokio::time::advance(Duration::from_millis(110)).await;
+        tokio::task::yield_now().await;
+    }
+    let peak = maximum.load(Ordering::SeqCst);
+    let requests = sent.load(Ordering::SeqCst);
+    eprintln!("relay_burst_probe tips=20 requests={requests} max_in_flight={peak}");
+    assert_eq!(peak, 1, "only one ordinary operation may be in flight");
+    assert_eq!(
+        requests, 1,
+        "tip churn must coalesce while the sender is busy"
+    );
+    gossip_task.abort();
+}
+
+/// A failed ordinary send retries without another selected-tip notification.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn committed_tip_failure_retries_without_new_tip() {
+    let (mut tip_sender, _latest_tip, tip_change) = ChainTipSender::new(None, &Mainnet);
+    let (sync_status, mut recent_syncs) = SyncStatus::new();
+    SyncStatus::sync_close_to_tip(&mut recent_syncs);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let (request_sender, mut request_receiver) = tokio::sync::mpsc::unbounded_channel();
+    let service = tower::service_fn({
+        let calls = calls.clone();
+        move |_request: Request| {
+            let calls = calls.clone();
+            let request_sender = request_sender.clone();
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                let _ = request_sender.send(());
+                Err::<Response, crate::BoxError>(
+                    std::io::Error::other("injected send failure").into(),
+                )
+            }
+        }
+    });
+    let gossip_task = tokio::spawn(sync::gossip_best_tip_block_hashes(
+        sync_status,
+        tip_change,
+        service,
+        None,
+    ));
+    tip_sender.set_finalized_tip(ChainTipBlock {
+        hash: zakura_chain::block::Hash([1; 32]),
+        height: Height(1),
+        time: chrono::Utc::now(),
+        transactions: Vec::new(),
+        transaction_hashes: Arc::from([]),
+        previous_block_hash: zakura_chain::block::Hash([0; 32]),
+    });
+    request_receiver
+        .recv()
+        .await
+        .expect("first relay request arrives");
+    tokio::time::sleep(Duration::from_secs(20)).await;
+    tokio::task::yield_now().await;
+    let count = calls.load(Ordering::SeqCst);
+    eprintln!("relay_failed_send_probe elapsed_after_failure_s=20 requests={count}");
+    assert!(count >= 2, "unchanged tip must retry after failed delivery");
+    assert!(count <= 21, "failures must not cause a busy retry loop");
+    gossip_task.abort();
 }
 
 /// After a successful mined block broadcast, the gossip task marks the tip as seen and does not

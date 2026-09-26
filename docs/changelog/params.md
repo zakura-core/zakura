@@ -32,6 +32,7 @@ Keep entries **newest-first**. Each row records:
 
 | Parameter | Location | Old → New | PR | Why |
 | --- | --- | --- | --- | --- |
+| Native GetBlocks authorization entries | `crates/zakura-network/src/zakura/block_sync/reactor.rs` | scheduler requests only → 32,768 live exchanges across active and draining sessions | [#1173](https://github.com/zakura-core/zakura/pull/1173) | Preserve one full protocol window while bounding written requests retained after scheduler abandonment. |
 | Production GetBlocks execution capacity | `crates/zakura-network/src/zakura/block_sync/regulated/session.rs` | action-driver scheduling → 38 node / 19 per peer | [#1172](https://github.com/zakura-core/zakura/pull/1172) | Activate shared sizing using the maximum response and an assumed 500 ms production time, retaining slots through actual storage completion. |
 | Production GetBlocks output capacity | `crates/zakura-network/src/zakura/regulation/sizing.rs` | action-driver queues → 1,250,000,000 bytes node / 64 MiB per peer | [#1172](https://github.com/zakura-core/zakura/pull/1172) | Activate the shared byte grants and retain them through transport writes. |
 | Created-output index `PARTITIONS` | `crates/zakura-state/src/service/non_finalized_state/created_utxos.rs` | one copied map → 256 shared partitions | [#1153](https://github.com/zakura-core/zakura/pull/1153) | Reduce snapshot copying and cleanup at the cost of an extra hash per lookup. |

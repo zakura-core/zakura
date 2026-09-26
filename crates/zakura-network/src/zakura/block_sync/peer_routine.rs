@@ -653,8 +653,7 @@ impl PeerRoutine {
             }
         }
         if self.requester.is_some() {
-            if let Some(start) =
-                super::regulated::live_requester::LiveRequester::ending_is_current(&msg)
+            if let Some(start) = super::regulated::live_requester::LiveRequester::ending_start(&msg)
             {
                 if self.window.outstanding_index_for_start(start).is_none() {
                     return Ok(());
@@ -1290,7 +1289,7 @@ impl PeerRoutine {
                 None => claim.clone(),
             };
             let mut published = false;
-            let mut publish = || {
+            let publish = || {
                 published = claim.publish(|| {
                     self.window.outstanding.push(OutstandingBlockRange {
                         request,

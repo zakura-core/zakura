@@ -6,7 +6,9 @@ use crate::zakura::{
 };
 use zakura_chain::serialization::ZcashDeserializeInto;
 
-fn requester_routine() -> (PeerRoutine, FramedRecv, ReservationPool, CancellationToken) {
+fn requester_routine(
+    expected_hash: block::Hash,
+) -> (PeerRoutine, FramedRecv, ReservationPool, CancellationToken) {
     let (mut routine, outbound, _events) = super::tests::status_test_routine();
     let pool = ReservationPool::new(2).unwrap();
     let connection = CancellationToken::new();
@@ -27,7 +29,7 @@ fn requester_routine() -> (PeerRoutine, FramedRecv, ReservationPool, Cancellatio
         super::super::test_work_scope(),
         [(
             block::Height(1),
-            block::Hash([1; 32]),
+            expected_hash,
             BlockSizeEstimate::Confirmed(1000),
         )],
     );
@@ -36,7 +38,7 @@ fn requester_routine() -> (PeerRoutine, FramedRecv, ReservationPool, Cancellatio
 
 #[tokio::test]
 async fn written_timeout_preserves_authorization_and_blocks_overlap_until_ending() {
-    let (mut routine, mut outbound, pool, connection) = requester_routine();
+    let (mut routine, mut outbound, pool, connection) = requester_routine(block::Hash([1; 32]));
     routine.try_fill().await;
     let request = tokio::time::timeout(Duration::from_secs(1), outbound.recv())
         .await
@@ -85,7 +87,7 @@ async fn written_timeout_preserves_authorization_and_blocks_overlap_until_ending
 
 #[tokio::test]
 async fn unwritten_timeout_retracts_authorization_without_closing_connection() {
-    let (mut routine, _outbound, pool, connection) = requester_routine();
+    let (mut routine, _outbound, pool, connection) = requester_routine(block::Hash([1; 32]));
     routine.try_fill().await;
     assert_eq!(pool.held(), 1);
     let deadline = routine.window.outstanding[0].deadline;
@@ -96,7 +98,7 @@ async fn unwritten_timeout_retracts_authorization_without_closing_connection() {
 
 #[tokio::test]
 async fn wrong_header_is_rejected_before_transaction_decoding_or_decode_capacity() {
-    let (mut routine, mut outbound, _pool, _connection) = requester_routine();
+    let (mut routine, mut outbound, _pool, _connection) = requester_routine(block::Hash([1; 32]));
     routine.try_fill().await;
     tokio::time::timeout(Duration::from_secs(1), outbound.recv())
         .await
@@ -120,12 +122,12 @@ async fn wrong_header_is_rejected_before_transaction_decoding_or_decode_capacity
         )
         .await
         .unwrap_err();
-    assert!(format!("{error:?}").contains("next expected header"));
+    assert!(error.to_string().contains("next expected header"));
 }
 
 #[tokio::test]
 async fn invalid_ending_keeps_the_written_exchange_fenced() {
-    let (mut routine, mut outbound, pool, connection) = requester_routine();
+    let (mut routine, mut outbound, pool, connection) = requester_routine(block::Hash([1; 32]));
     routine.try_fill().await;
     tokio::time::timeout(Duration::from_secs(1), outbound.recv())
         .await
@@ -146,5 +148,52 @@ async fn invalid_ending_keeps_the_written_exchange_fenced() {
     assert!(
         connection.is_cancelled(),
         "dropping an unanswered written exchange closes its connection"
+    );
+}
+
+#[tokio::test]
+async fn authorized_block_and_exact_ending_complete_the_live_request() {
+    let block: block::Block = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
+        .zcash_deserialize_into()
+        .unwrap();
+    let (mut routine, mut outbound, pool, connection) = requester_routine(block.hash());
+    let (body_sender, mut bodies) = mpsc::channel(1);
+    routine.sequencer_input = body_sender;
+    routine.try_fill().await;
+    tokio::time::timeout(Duration::from_secs(1), outbound.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let response = BlockSyncMessage::Block(Arc::new(block))
+        .encode_frame()
+        .unwrap();
+    routine
+        .handle_frame(&mut block_sync_guard(), response)
+        .await
+        .unwrap();
+    assert!(
+        bodies.try_recv().is_ok(),
+        "the authorized body reaches the existing sequencer"
+    );
+    assert_eq!(
+        pool.held(),
+        1,
+        "the ending still owns authorization after all bodies arrive"
+    );
+    let ending = BlockSyncMessage::BlocksDone {
+        start_height: block::Height(1),
+        returned: 1,
+    }
+    .encode_frame()
+    .unwrap();
+    routine
+        .handle_frame(&mut block_sync_guard(), ending)
+        .await
+        .unwrap();
+    assert_eq!(pool.held(), 0);
+    drop(routine);
+    assert!(
+        !connection.is_cancelled(),
+        "the completed exchange leaves its connection reusable"
     );
 }

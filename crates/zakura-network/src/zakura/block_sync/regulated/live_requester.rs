@@ -8,7 +8,7 @@ use super::{
     wire::{Message, Range, RULES},
 };
 use crate::zakura::{
-    block_sync::{work_queue::RequestWrite, BlockSyncMessage, MAX_BS_INFLIGHT_REQUESTS},
+    block_sync::{config::MAX_BS_INFLIGHT_REQUESTS, work_queue::RequestWrite, BlockSyncMessage},
     regulation::{
         ClaimRefused, Exchange, ExchangeWriter, PoolEntry, ReservationPool, ResponsePrecheck,
         WriterFence,
@@ -145,7 +145,7 @@ impl LiveRequester {
         Ok(None)
     }
 
-    pub(crate) fn ending_is_current(message: &BlockSyncMessage) -> Option<block::Height> {
+    pub(crate) fn ending_start(message: &BlockSyncMessage) -> Option<block::Height> {
         match message {
             BlockSyncMessage::BlocksDone { start_height, .. }
             | BlockSyncMessage::RangeUnavailable { start_height, .. } => Some(*start_height),

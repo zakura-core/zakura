@@ -37,6 +37,8 @@ pub(crate) struct Capture {
     #[serde(default)]
     pub schema_version: u32,
     #[serde(default)]
+    pub stack_bytes: Option<u32>,
+    #[serde(default)]
     pub session: String,
     #[serde(default)]
     pub sequence: u64,
@@ -86,6 +88,11 @@ fn validate(c: &Capture) -> Result<()> {
     ensure!(
         [19, 49, 99, 999].contains(&c.frequency) && c.clock == "monotonic",
         "capture settings"
+    );
+    ensure!(
+        c.stack_bytes
+            .is_none_or(|size| [8192, 16384, 32768, 65528].contains(&size)),
+        "stack capture size"
     );
     ensure!(matches!(c.schema_version, 0..=3), "capture schema");
     ensure!(
@@ -192,7 +199,7 @@ pub(crate) fn import(db: &Connection, path: &Path, source: &Path) -> Result<()> 
     let compressed = zstd::stream::encode_all(bytes.as_slice(), 1)?;
     let target = path.join("cpu").join(format!("{id}.zst"));
     let temp = target.with_extension("tmp");
-    let summary = json!({"schema_version":c.schema_version,"frequency":c.frequency,"scope":"process","decode_errors":c.decode_errors,"truncated":c.truncated,"executable_sha256":c.executable_sha256,"build_ids":c.build_ids,"process_start_ticks":c.process_start_ticks,"session":c.session,"sequence":c.sequence,"uncertainty_us":c.uncertainty_us,"lost_samples":c.lost_samples,"omitted_samples":c.omitted_samples,"omitted_frames":c.omitted_frames,"symbol_truncations":c.symbol_truncations,"coverage_proven":c.coverage_proven,"decoded_bytes":bytes.len()});
+    let summary = json!({"stack_bytes":c.stack_bytes,"schema_version":c.schema_version,"frequency":c.frequency,"scope":"process","decode_errors":c.decode_errors,"truncated":c.truncated,"executable_sha256":c.executable_sha256,"build_ids":c.build_ids,"process_start_ticks":c.process_start_ticks,"session":c.session,"sequence":c.sequence,"uncertainty_us":c.uncertainty_us,"lost_samples":c.lost_samples,"omitted_samples":c.omitted_samples,"omitted_frames":c.omitted_frames,"symbol_truncations":c.symbol_truncations,"coverage_proven":c.coverage_proven,"decoded_bytes":bytes.len()});
     crate::store::write_payload(&temp, &target, &compressed, |size| {
         db.execute(
             "INSERT INTO cpu VALUES(?,?,?,?,?,?,?,0)",
@@ -620,15 +627,63 @@ pub(crate) fn speedscope(data: &Value) -> Result<Value> {
                 .as_u64()
                 .is_some_and(|ns| (1..=1_000_000_000).contains(&ns))
         });
+    let context_view = data["view"] == "context";
+    let mut context_frames = BTreeMap::new();
+    if context_view {
+        for context in data["attribution"]["contexts"]
+            .as_array()
+            .into_iter()
+            .flatten()
+        {
+            if let Some(id) = context["span"].as_u64() {
+                context_frames.insert(id, frames.len());
+                frames.push(json!({"name":format!("[Recorded context] {}",context["label"].as_str().unwrap_or("stage"))}));
+            }
+        }
+    }
+    let unassigned = frames.len();
+    let incomplete = unassigned + 1;
+    let thread_entry = unassigned + 2;
+    if context_view {
+        frames.push(json!({"name":"[Unassigned CPU] No exclusive block context recorded"}));
+        frames.push(json!({"name":"[Caller stack incomplete] Older callers were not recovered"}));
+        frames.push(json!({"name":"[Worker thread entry] clone3"}));
+    }
     let mut threads = BTreeMap::<u64, Vec<(Value, f64)>>::new();
     let mut all = Vec::new();
     for sample in samples {
-        let stack = sample["stack"]
+        let mut stack = sample["stack"]
             .as_u64()
             .and_then(|id| usize::try_from(id).ok())
             .and_then(|id| stacks.get(id))
             .context("CPU stack reference")?
             .clone();
+        if context_view {
+            let native = stack.as_array_mut().context("native stack")?;
+            if let Some(first) = native.first_mut() {
+                let name = frames[first
+                    .as_u64()
+                    .and_then(|n| usize::try_from(n).ok())
+                    .context("root frame")?]["name"]
+                    .as_str()
+                    .unwrap_or("");
+                if name.starts_with("[unknown] ([unknown])") {
+                    *first = json!(incomplete);
+                } else if name.starts_with("clone3 (") {
+                    *first = json!(thread_entry);
+                }
+            }
+            let mut prefix: Vec<Value> = sample["context"]
+                .as_array()
+                .map(|path| {
+                    path.iter()
+                        .filter_map(|id| context_frames.get(&id.as_u64()?).map(|id| json!(id)))
+                        .collect()
+                })
+                .unwrap_or_else(|| vec![json!(unassigned)]);
+            prefix.append(native);
+            stack = json!(prefix);
+        }
         let weight = if weighted {
             sample["cpu_period_ns"].as_f64().context("CPU period")? / 1_000_000.0
         } else {
@@ -666,7 +721,7 @@ pub(crate) fn speedscope(data: &Value) -> Result<Value> {
     let coverage = data["coverage"]["state"].as_str().unwrap_or("unknown");
     Ok(
         json!({"$schema":"https://www.speedscope.app/file-format-schema.json","name":format!("Process user CPU during block ({coverage} capture)"),"activeProfileIndex":0,"exporter":"Zakura profiler","shared":{"frames":frames},"profiles":profiles,
-            "zakura":{"weight":data["weight"],"frame_aggregation":"Exact raw function symbol and module; unresolved addresses remain distinct","window":data["window"],"counts":data["counts"],"coverage":data["coverage"],"run":data["summary"]["run"],"attempt":data["summary"]["attempt"],"block_height":data["summary"]["height"]}}),
+            "zakura":{"weight":data["weight"],"frame_aggregation":"Exact raw function symbol and module; unresolved addresses remain distinct","view":data["view"],"selected_span":data["selected_span"],"attribution":data["attribution"],"window":data["window"],"counts":data["counts"],"coverage":data["coverage"],"run":data["summary"]["run"],"attempt":data["summary"]["attempt"],"block_height":data["summary"]["height"]}}),
     )
 }
 

@@ -49,3 +49,13 @@ test('CPU time label uses actual period sum, never elapsed time or configured ra
   assert.match(context.cpuWeightLabel({}),/Sample counts only/);
   assert.equal(context.cpuWeightLabel({counts:{returned_samples:0}}),'No retained CPU samples in this interval');
 });
+
+test('stage selection is bounded and views cannot inject query parameters',()=>{
+  const route={run:'a'.repeat(32),attempt:'1'};
+  assert.match(context.cpuEndpoints(route,'recorded','context','42').profile,/view=context&span=42$/);
+  assert.doesNotMatch(context.cpuEndpoints(route,'recorded','raw&span=1','1&scope=verifier').profile,/span=/);
+});
+test('filtered CPU totals use only the selected sample weights',()=>{
+  const label=context.cpuWeightLabel({selected_samples:1,counts:{returned_samples:10},weight:{estimated_cpu_ns:10000000},samples:[{cpu_period_ns:2000000}]});
+  assert.match(label,/2.00 estimated CPU ms/);
+});

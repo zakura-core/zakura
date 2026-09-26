@@ -180,7 +180,10 @@ fn transaction_fanout_cannot_displace_writer_phases() {
         drop(root.context().span(Stage::Transaction));
     }
     drop(root.context().span(Stage::WriterOccupied));
-    let events: Vec<_> = detail.try_iter().collect();
+    let events: Vec<_> = detail
+        .try_iter()
+        .filter(|e| !matches!(e, Event::Execution { .. }))
+        .collect();
     assert_eq!(events.len(), usize::try_from(MAX_FINE_SPANS).unwrap() + 1);
     assert!(matches!(
         events.last(),
@@ -206,7 +209,10 @@ fn finalization_children_keep_their_parent_after_caller_completion() {
     });
     drop(finalization);
     drop(context);
-    let events: Vec<_> = detail.try_iter().collect();
+    let events: Vec<_> = detail
+        .try_iter()
+        .filter(|e| !matches!(e, Event::Execution { .. }))
+        .collect();
     assert_eq!(events.len(), 3);
     let mut links = Vec::new();
     for event in events {
@@ -271,7 +277,10 @@ fn overlapping_transactions_keep_indexes_and_parents_across_polls_and_workers() 
     root.finish(Outcome::Success);
     late_worker.in_scope(|| drop(Context::current().span(Stage::WorkerExecution)));
     drop(late_worker);
-    let events: Vec<_> = detail.try_iter().collect();
+    let events: Vec<_> = detail
+        .try_iter()
+        .filter(|e| !matches!(e, Event::Execution { .. }))
+        .collect();
     assert_eq!(events.len(), 8);
     for event in events {
         let encoded = serde_json::to_vec(&event).unwrap();
@@ -507,7 +516,10 @@ fn parent_wait_closes_once_on_the_original_attempt() {
     context.parent_wait_finished();
     root.finish(Outcome::Success);
     drop(context);
-    let spans: Vec<_> = detail.try_iter().collect();
+    let spans: Vec<_> = detail
+        .try_iter()
+        .filter(|e| !matches!(e, Event::Execution { .. }))
+        .collect();
     assert_eq!(spans.len(), 1);
     assert!(
         matches!(spans[0], Event::Span { attempt:1, stage:Stage::ParentWait, start_us, end_us, .. } if end_us >= start_us)
@@ -520,4 +532,145 @@ fn parent_wait_closes_once_on_the_original_attempt() {
             ..
         }
     )));
+}
+
+#[test]
+fn execution_intervals_split_nested_contexts_and_exclude_unassigned_work() {
+    let (r, detail, _) = recorder();
+    let root = begin_with(&r, block()).unwrap();
+    let context = root.context();
+    let work = || std::thread::sleep(Duration::from_millis(1));
+    context.in_scope(|| {
+        work();
+        let phase = Context::current().sync_span(Stage::Finalization);
+        work();
+        Context::default().in_scope(work);
+        work();
+        drop(phase);
+        work();
+    });
+    let mut intervals = detail
+        .try_iter()
+        .filter_map(|e| match e {
+            Event::Execution {
+                span,
+                thread,
+                start_us,
+                end_us,
+                ..
+            } => Some((span, thread, start_us, end_us)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    intervals.sort_by_key(|entry| entry.2);
+    assert!(intervals.len() >= 4);
+    assert!(intervals.iter().all(|entry| entry.1 == intervals[0].1));
+    assert!(intervals.windows(2).all(|p| p[0].3 <= p[1].2));
+    assert!(intervals
+        .windows(2)
+        .any(|p| p[1].2.saturating_sub(p[0].3) >= 900));
+    assert_eq!(intervals.first().unwrap().0, 0);
+    assert_eq!(intervals.last().unwrap().0, 0);
+    assert!(intervals.iter().any(|entry| entry.0 == 1));
+}
+
+#[test]
+fn pending_migration_and_panic_restore_execution_context() {
+    use std::task::Waker;
+    let (r, detail, _) = recorder();
+    let root = begin_with(&r, block()).unwrap();
+    let context = root.context();
+    let mut count = 0;
+    let mut future = Box::pin(context.wrap(std::future::poll_fn(move |_| {
+        std::thread::sleep(Duration::from_millis(1));
+        count += 1;
+        if count == 1 {
+            Poll::Pending
+        } else {
+            Poll::Ready(())
+        }
+    })));
+    let waker = Waker::noop();
+    assert!(future
+        .as_mut()
+        .poll(&mut TaskContext::from_waker(waker))
+        .is_pending());
+    assert!(CURRENT.with(|c| c.borrow().0.is_none()));
+    std::thread::sleep(Duration::from_millis(2));
+    std::thread::spawn(move || {
+        assert!(future
+            .as_mut()
+            .poll(&mut TaskContext::from_waker(waker))
+            .is_ready());
+        assert!(CURRENT.with(|c| c.borrow().0.is_none()));
+    })
+    .join()
+    .unwrap();
+    let intervals = detail
+        .try_iter()
+        .filter_map(|e| match e {
+            Event::Execution {
+                thread,
+                start_us,
+                end_us,
+                ..
+            } => Some((thread, start_us, end_us)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(intervals.len(), 2);
+    assert_ne!(intervals[0].0, intervals[1].0);
+    assert!(intervals[1].1.saturating_sub(intervals[0].2) >= 1900);
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        context.in_scope(|| panic!("test restoration"))
+    }));
+    assert!(CURRENT.with(|c| c.borrow().0.is_none()));
+}
+
+#[test]
+fn execution_cap_does_not_change_elapsed_span_completeness() {
+    let (r, detail, summary) = recorder();
+    let root = begin_with(&r, block()).unwrap();
+    root.context()
+        .0
+        .as_ref()
+        .unwrap()
+        .0
+        .execution_records
+        .store(65_536, Ordering::Relaxed);
+    root.context()
+        .in_scope(|| std::thread::sleep(Duration::from_millis(1)));
+    root.finish(Outcome::Success);
+    assert!(detail
+        .try_iter()
+        .all(|event| !matches!(event, Event::Execution { .. })));
+    assert!(r.dropped.load(Ordering::Relaxed) > 0);
+    assert!(summary.try_iter().any(|event| matches!(
+        event,
+        Event::Seal {
+            dropped: 0,
+            spans: 0,
+            ..
+        }
+    )));
+}
+
+#[test]
+#[ignore = "operator microbenchmark, not a timing assertion"]
+#[allow(clippy::print_stderr)]
+fn measure_execution_scope_overhead() {
+    let (r, detail, _) = recorder();
+    let root = begin_with(&r, block()).unwrap();
+    let context = root.context();
+    for (label, context) in [("disabled", Context::default()), ("enabled", context)] {
+        let start = Instant::now();
+        for _ in 0..20_000 {
+            context.in_scope(|| std::hint::black_box(()));
+        }
+        eprintln!(
+            "execution_scope {label}: {:?} for 20000 entries",
+            start.elapsed()
+        );
+    }
+    eprintln!("execution records: {}", detail.try_iter().count());
 }

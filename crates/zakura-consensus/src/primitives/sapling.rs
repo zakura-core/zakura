@@ -154,6 +154,7 @@ impl Drop for Verifier {
 
         // The validation is CPU-intensive; do it on a dedicated thread so it does not block.
         rayon::spawn_fifo(move || {
+            let _unassigned = zakura_jsonl_trace::block_profile::Context::default().enter();
             let (spend_vk, output_vk) = SAPLING.verifying_keys();
 
             // Validate the batch and send the result through the channel.

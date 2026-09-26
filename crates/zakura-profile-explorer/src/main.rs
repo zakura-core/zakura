@@ -1,5 +1,6 @@
 //! A local collector and a separately runnable read-only explorer.
 
+mod attribution;
 mod cpu;
 mod store;
 mod web;

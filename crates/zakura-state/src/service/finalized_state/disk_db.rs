@@ -1406,7 +1406,7 @@ impl DiskDb {
     /// Body pruning must use this path so the floor is visible before callers publish a new tip.
     pub(crate) fn write(&self, batch: DiskWriteBatch) -> Result<(), rocksdb::Error> {
         let write_profile = zakura_jsonl_trace::block_profile::Context::current()
-            .span(zakura_jsonl_trace::block_profile::Stage::RocksdbWrite);
+            .sync_span(zakura_jsonl_trace::block_profile::Stage::RocksdbWrite);
         self.db.write(batch.batch)?;
         drop(write_profile);
         // Header/full-state callers publish their new tip after this returns.

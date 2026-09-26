@@ -444,7 +444,7 @@ def capture(args, stopping):
     state = dict(state='recording', run=run['id'], pid=pid, session=session, frequency=args.frequency,
                  executable_sha256=digest, updated_ms=int(time.time() * 1000), started_mono_us=started, sealed_through_mono_us=started,
                  published_through_mono_us=started, backlog_segments=0, dropped_segments=0, last_error=None)
-    base = dict(schema_version=3, run=run['id'], pid=pid, frequency=args.frequency, clock='monotonic',
+    base = dict(stack_bytes=args.stack_bytes, schema_version=3, run=run['id'], pid=pid, frequency=args.frequency, clock='monotonic',
                 process_start_ticks=start_ticks, executable_sha256=digest, build_ids=[], session=session,
                 coverage_proven=False, decode_errors=0, truncated=False)
     context = multiprocessing.get_context('spawn')
@@ -455,7 +455,7 @@ def capture(args, stopping):
     # At 999 Hz, one second keeps 16 busy CPUs below the raw segment limit.
     rotation_seconds = 1 if args.frequency >= 999 else 10
     command = ['perf', '--buildid-dir', str(symbols), 'record', '--no-buildid-cache', '--no-no-buildid', '--buildid-all',
-               '--clockid', 'mono', '-e', 'cpu-clock:u', '-F', str(args.frequency), '--call-graph', 'dwarf,8192',
+               '--clockid', 'mono', '-e', 'cpu-clock:u', '-F', str(args.frequency), '--call-graph', f'dwarf,{args.stack_bytes}',
                '--mmap-pages', '128', f'--switch-output={rotation_seconds}s', '-a', '-G', cgroup.lstrip('/'), '-o', str(directory / 'capture.data')]
     try:
         process = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=error_file, preexec_fn=limits, start_new_session=True)
@@ -574,6 +574,7 @@ def main():
     parser.add_argument('--pid', type=int)
     parser.add_argument('--node-service', default='zakurad')
     parser.add_argument('--executable', type=Path, required=True)
+    parser.add_argument('--stack-bytes', type=int, choices=(8192, 16384, 32768, 65528), default=8192)
     parser.add_argument('--frequency', type=int, choices=(19, 49, 99, 999), default=999)
     parser.add_argument('--duration-seconds', type=int, default=0, help='Zero records continuously.')
     parser.add_argument('--once', action='store_true')

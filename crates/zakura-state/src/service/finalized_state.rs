@@ -853,7 +853,7 @@ impl FinalizedState {
         ) -> Result<(), CommitCheckpointVerifiedError>,
     {
         let prepare_profile =
-            profiles::Context::current().span(profiles::Stage::FinalizedBlockPrepare);
+            profiles::Context::current().sync_span(profiles::Stage::FinalizedBlockPrepare);
         let mut vct_authentication = VctAuthenticationProof::NotAuthenticated;
         let (height, hash, finalized, prev_note_commitment_trees, retention, fast_write) =
             match finalizable_block {

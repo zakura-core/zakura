@@ -64,6 +64,7 @@ fn attempt_id(data: &Event) -> u64 {
         Event::Lifecycle(_) => 0,
         Event::Start { attempt, .. }
         | Event::Span { attempt, .. }
+        | Event::Execution { attempt, .. }
         | Event::Finish { attempt, .. }
         | Event::Seal { attempt, .. } => *attempt,
     }
@@ -293,6 +294,22 @@ impl Store {
                 match data {
                     Event::Lifecycle(_) => {
                         unreachable!("lifecycle records handled before attempt ingestion")
+                    }
+                    Event::Execution {
+                        span,
+                        thread,
+                        start_us,
+                        end_us,
+                        ..
+                    } => {
+                        ensure!(
+                            span <= profiles::MAX_SPANS && thread > 0 && end_us >= start_us,
+                            "invalid execution interval"
+                        );
+                        if self.used < self.budget * 9 / 10 {
+                            tx.execute("INSERT INTO executions(run,attempt,span,thread,start_us,end_us) VALUES(?,?,?,?,?,?)",
+                                params![run_id,attempt,integer(span)?,integer(thread)?,integer(start_us)?,integer(end_us)?])?;
+                        }
                     }
                     Event::Start {
                         block, start_us, ..
@@ -983,8 +1000,8 @@ impl Reader {
         let summary = detail["summary"].clone();
         let timing = detail["timing"].clone();
         let recording = detail["recording"].clone();
-        drop(detail);
         let mut cpu = crate::cpu::window(&self.db, &self.path, run, start, end)?;
+        crate::attribution::associate(&self.db, run, attempt, &detail, &mut cpu)?;
         cpu["window"] = json!({"start_us":start,"end_us":end,"scope":scope,"boundary_complete":boundary_complete});
         cpu["summary"] = summary;
         cpu["timing"] = timing;
@@ -996,6 +1013,19 @@ impl Reader {
         }
         Ok(cpu)
     }
+    pub(crate) fn cpu_view(
+        &self,
+        run: &str,
+        attempt: u64,
+        scope: &str,
+        view: &str,
+        span: Option<u64>,
+    ) -> Result<Value> {
+        let mut data = self.cpu(run, attempt, scope)?;
+        crate::attribution::select(&mut data, view, span)?;
+        Ok(data)
+    }
+    #[cfg(test)]
     pub(crate) fn cpu_speedscope(&self, run: &str, attempt: u64, scope: &str) -> Result<Value> {
         crate::cpu::speedscope(&self.cpu(run, attempt, scope)?)
     }

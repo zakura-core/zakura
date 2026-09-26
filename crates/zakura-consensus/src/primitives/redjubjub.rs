@@ -137,7 +137,12 @@ impl Verifier {
         // Correctness: Do CPU-intensive work on a dedicated thread, to avoid blocking other futures.
         //
         // We don't care about execution order here, because this method is only called on drop.
-        tokio::task::block_in_place(|| rayon::spawn_fifo(|| Self::verify(batch, tx)));
+        tokio::task::block_in_place(|| {
+            rayon::spawn_fifo(|| {
+                let _unassigned = zakura_jsonl_trace::block_profile::Context::default().enter();
+                Self::verify(batch, tx)
+            })
+        });
     }
 
     /// Flush the batch using a thread pool, and return the result via the channel.

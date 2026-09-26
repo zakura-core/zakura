@@ -938,7 +938,7 @@ impl ZakuraDb {
         C: FnOnce(&mut Self, DiskWriteBatch) -> Result<(), CommitCheckpointVerifiedError>,
     {
         let profile = profiles::Context::current();
-        let input_profile = profile.span(profiles::Stage::FinalizedInputPrepare);
+        let input_profile = profile.sync_span(profiles::Stage::FinalizedInputPrepare);
         let tx_hash_indexes: HashMap<transaction::Hash, usize> = finalized
             .transaction_hashes
             .iter()
@@ -979,15 +979,17 @@ impl ZakuraDb {
         let store_raw_txs = retention.stores_raw_transactions();
         let db: &ZakuraDb = self;
         drop(input_profile);
-        let parallel_profile = profile.span(profiles::Stage::FinalizedParallelReads);
+        let parallel_profile = profile.sync_span(profiles::Stage::FinalizedParallelReads);
         let parallel_context = parallel_profile.context();
+        let suspended_profile = profiles::Context::default().enter();
         let (spent_utxos, precomputed_raw_txs): (
             Vec<(transparent::OutPoint, OutputLocation, transparent::Utxo)>,
             Option<Vec<RawBytes>>,
         ) = rayon::join(
             || {
-                let _read_profile = parallel_context.span(profiles::Stage::FinalizedUtxoRead);
+                let _read_profile = parallel_context.sync_span(profiles::Stage::FinalizedUtxoRead);
                 if outpoints.len() >= super::PARALLEL_BLOCK_READ_THRESHOLD {
+                    let _unassigned = profiles::Context::default().enter();
                     use rayon::prelude::*;
                     outpoints
                         .into_par_iter()
@@ -1017,8 +1019,10 @@ impl ZakuraDb {
                 }
             },
             || {
-                let _serialize_profile = parallel_context.span(profiles::Stage::FinalizedSerialize);
+                let _serialize_profile =
+                    parallel_context.sync_span(profiles::Stage::FinalizedSerialize);
                 if store_raw_txs {
+                    let _unassigned = profiles::Context::default().enter();
                     use rayon::prelude::*;
                     Some(
                         finalized
@@ -1034,8 +1038,9 @@ impl ZakuraDb {
             },
         );
 
+        drop(suspended_profile);
         drop(parallel_profile);
-        let address_profile = profile.span(profiles::Stage::FinalizedAddressRead);
+        let address_profile = profile.sync_span(profiles::Stage::FinalizedAddressRead);
         let spent_utxos_by_outpoint: HashMap<transparent::OutPoint, transparent::Utxo> =
             spent_utxos
                 .iter()
@@ -1076,6 +1081,7 @@ impl ZakuraDb {
             f: F,
         ) -> HashMap<transparent::Address, T> {
             if changed_addresses.len() >= super::PARALLEL_BLOCK_READ_THRESHOLD {
+                let _unassigned = profiles::Context::default().enter();
                 use rayon::prelude::*;
                 changed_addresses
                     .into_iter()
@@ -1112,7 +1118,7 @@ impl ZakuraDb {
         };
 
         drop(address_profile);
-        let batch_profile = profile.span(profiles::Stage::FinalizedBatchPrepare);
+        let batch_profile = profile.sync_span(profiles::Stage::FinalizedBatchPrepare);
         let batch_scope = batch_profile.context().enter();
         let mut batch = DiskWriteBatch::new();
 
@@ -1136,7 +1142,7 @@ impl ZakuraDb {
 
         drop(batch_scope);
         drop(batch_profile);
-        let prune_profile = profile.span(profiles::Stage::FinalizedPrune);
+        let prune_profile = profile.sync_span(profiles::Stage::FinalizedPrune);
 
         // In pruned storage mode, delete raw transaction history that has fallen
         // outside the retention window, and/or advance the pruning marker. This
@@ -1149,7 +1155,7 @@ impl ZakuraDb {
 
         // Track batch commit latency for observability
         let batch_start = std::time::Instant::now();
-        let commit_profile = profile.span(profiles::Stage::FinalizedCommit);
+        let commit_profile = profile.sync_span(profiles::Stage::FinalizedCommit);
         let commit_scope = commit_profile.context().enter();
         commit(self, batch)?;
         drop(commit_scope);
@@ -1450,7 +1456,7 @@ impl DiskWriteBatch {
         vct_data: VctWriteData,
     ) -> Result<(), CommitCheckpointVerifiedError> {
         let profile = profiles::Context::current();
-        let block_profile = profile.span(profiles::Stage::FinalizedBlockBatch);
+        let block_profile = profile.sync_span(profiles::Stage::FinalizedBlockBatch);
         // Commit block, transaction, and note commitment tree data.
         self.prepare_block_header_and_transaction_data_batch(
             zakura_db,
@@ -1465,10 +1471,10 @@ impl DiskWriteBatch {
         //
         // In Zebra we include the nullifiers and note commitments in the genesis block because it simplifies our code.
         drop(block_profile);
-        let nullifier_profile = profile.span(profiles::Stage::FinalizedNullifierBatch);
+        let nullifier_profile = profile.sync_span(profiles::Stage::FinalizedNullifierBatch);
         self.prepare_shielded_transaction_batch(zakura_db, finalized);
         drop(nullifier_profile);
-        let tree_profile = profile.span(profiles::Stage::FinalizedTreeBatch);
+        let tree_profile = profile.sync_span(profiles::Stage::FinalizedTreeBatch);
         self.prepare_trees_batch(zakura_db, finalized, prev_note_commitment_trees, vct_data)?;
         drop(tree_profile);
 
@@ -1483,7 +1489,8 @@ impl DiskWriteBatch {
         // for the genesis block. This also ignores genesis shielded value pool updates, but there
         // aren't any of those on mainnet or testnet.
         if !finalized.height.is_min() {
-            let _transparent_profile = profile.span(profiles::Stage::FinalizedTransparentBatch);
+            let _transparent_profile =
+                profile.sync_span(profiles::Stage::FinalizedTransparentBatch);
             // Commit transaction indexes
             self.prepare_transparent_transaction_batch(
                 zakura_db,
@@ -1498,7 +1505,7 @@ impl DiskWriteBatch {
             );
         }
 
-        let value_pool_profile = profile.span(profiles::Stage::FinalizedValuePoolBatch);
+        let value_pool_profile = profile.sync_span(profiles::Stage::FinalizedValuePoolBatch);
         // Commit UTXOs and value pools
         self.prepare_chain_value_pools_batch(
             zakura_db,
@@ -1635,6 +1642,7 @@ impl DiskWriteBatch {
             // spent-UTXO reads in `write_block`); use those bytes directly.
             precomputed
         } else if block.transactions.len() >= super::PARALLEL_BLOCK_TX_THRESHOLD {
+            let _unassigned = profiles::Context::default().enter();
             use rayon::prelude::*;
             block
                 .transactions

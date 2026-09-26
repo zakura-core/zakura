@@ -277,7 +277,8 @@ function renderTimeline(spans,row,start,duration,network) {
     const line=el(tag,null,`lane${span.root?' root':''}`),track=el('div',null,'lane-bar'),bar=el('div',null,'bar');
     bar.style.left=`${Math.max(0,(span.start_us-start)/duration*100)}%`;bar.style.width=`${Math.max(0,(span.end_us-span.start_us)/duration*100)}%`;
     bar.title=`${ms(span.start_us-start)} → ${ms(span.end_us-start)}`;track.append(bar);
-    line.append(el('span',label,'lane-name'),track,el('span',ms(span.end_us-span.start_us),'lane-time'));return line;
+    const name=el('span',label,'lane-name');if(span.span!=null)name.append(stageCpuLink(row,span));
+    line.append(name,track,el('span',ms(span.end_us-span.start_us),'lane-time'));return line;
   }
   if(row.end_us!=null)host.append(lane({stage:'Verifier request',start_us:start,end_us:row.end_us,root:true}));
   for(const span of spans){
@@ -294,17 +295,20 @@ function renderTimeline(spans,row,start,duration,network) {
       group.append(body);host.append(group);
     }else if(span===finalization){
       const group=el('details',null,'timeline-group finalization'),body=el('div',null,'timeline-children');
-      group.append(lane(span,'summary','Finalization'));renderFinalization(body,span,children);group.append(body);host.append(group);
+      group.append(lane(span,'summary','Finalization'));renderFinalization(body,span,children,row);group.append(body);host.append(group);
     }else host.append(lane(span));
   }
 }
-function renderFinalization(host,root,children) {
+function stageCpuLink(row,span) {
+  const link=el('a',' CPU','stage-cpu');link.href=`/cpu/${row.run}/${row.attempt}?scope=recorded&view=context&span=${span.span}`;link.title='CPU samples associated with this stage';link.addEventListener('click',event=>event.stopPropagation());return link;
+}
+function renderFinalization(host,root,children,block) {
   host.append(el('p',`${ms(root.end_us-root.start_us)} total. This moves older blocks into finalized storage and can continue after the verifier responds.`,'muted'));
   if(!children.get(root.span)?.length){host.append(el('p','This recording has only the total. A replay with detailed instrumentation is needed to measure its substeps.','muted'));return;}
   const t=el('table'),head=el('tr');for(const title of ['Step','Elapsed','Share of finalization'])head.append(el('th',title));
   const thead=el('thead');thead.append(head);t.append(thead);const body=el('tbody'),seen=new Set([root.span]);
   function visit(parent,depth){if(depth>8)return;for(const span of children.get(parent)||[]){if(seen.has(span.span))continue;seen.add(span.span);const row=el('tr'),name=el('td',`${'↳ '.repeat(depth)}${finalizationLabels[span.stage]||span.stage.replaceAll('_',' ')}`),elapsed=span.end_us-span.start_us;
-    row.append(name,el('td',ms(elapsed)),el('td',`${(100*elapsed/Math.max(1,root.end_us-root.start_us)).toFixed(1)}%`));body.append(row);visit(span.span,depth+1);}}
+    name.append(stageCpuLink(block,span));row.append(name,el('td',ms(elapsed)),el('td',`${(100*elapsed/Math.max(1,root.end_us-root.start_us)).toFixed(1)}%`));body.append(row);visit(span.span,depth+1);}}
   visit(root.span,0);t.append(body);const wrap=el('div',null,'table-wrap');wrap.append(t);host.append(wrap,el('p','Indented rows are included in their parent. Parallel reads and serialization overlap. Do not add every row together.','muted'));
 }
 function renderCpu(cpu) {

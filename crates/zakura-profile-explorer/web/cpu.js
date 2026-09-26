@@ -9,13 +9,14 @@ function findSymbols(frames,query) {
   if(!term)return [];
   return frames.filter(frame=>[frame.name,frame.symbol,frame.dso].some(value=>typeof value==='string'&&value.toLowerCase().includes(term))).slice(0,40);
 }
-function cpuEndpoints(route,scope) {
-  const suffix=`${route.run}/${route.attempt}?scope=${cpuScope(scope)}`;
+function cpuEndpoints(route,scope,view,span) {
+  const selection = view ? `&view=${['context','raw','unassigned'].includes(view)?view:'context'}${/^\d{1,5}$/.test(span || '')?`&span=${span}`:''}` : '';
+  const suffix=`${route.run}/${route.attempt}?scope=${cpuScope(scope)}${selection}`;
   return {samples:`/api/cpu/${suffix}`,profile:`/api/cpu-profile/${suffix}`};
 }
 function cpuWeightLabel(data) {
   if(data.counts?.returned_samples===0)return 'No retained CPU samples in this interval';
-  const ns=data.weight?.estimated_cpu_ns;
+  const ns=data.selected_samples!=null ? (data.samples?.every(s=>Number.isFinite(s.cpu_period_ns)) ? data.samples.reduce((sum,s)=>sum+s.cpu_period_ns,0) : null) : data.weight?.estimated_cpu_ns;
   return typeof ns==='number' && Number.isFinite(ns) && ns>=0
     ? `${(ns/1e6).toFixed(2)} estimated CPU ms in retained samples`
     : 'Sample counts only · CPU time weights were not recorded';
@@ -45,10 +46,10 @@ async function startCpuPage() {
   }
   async function load(poll=false){
     clearTimeout(pollTimer);if(!poll)pollDeadline=Date.now()+120000;
-    const current=++generation,scope=cpuScope($('scope').value),endpoints=cpuEndpoints(route,scope);
+    const current=++generation,scope=cpuScope($('scope').value),view=$('view').value,span=$('stage').value,endpoints=cpuEndpoints(route,scope,view,span);
     $('viewer').hidden=true;$('viewer').removeAttribute('src');$('coverage').textContent='Loading retained samples…';
     $('download').href=endpoints.samples;
-    history.replaceState(null,'',`${location.pathname}?scope=${scope}`);
+    history.replaceState(null,'',`${location.pathname}?scope=${scope}&view=${view}${span?`&span=${span}`:''}`);
     try{
       const response=await fetch(endpoints.samples);if(!response.ok)throw Error(await response.text());
       const data=await response.json();if(current!==generation)return;
@@ -58,11 +59,23 @@ async function startCpuPage() {
       const window=data.window || {},coverage=data.coverage || {},counts=data.counts || {};
       const elapsed=Math.max(0,(window.end_us || 0)-(window.start_us || 0));
       $('interval').textContent=`${scope==='verifier'?'Verifier response':'All recorded work'} · ${(elapsed/1000).toFixed(2)} ms measured elapsed`;
-      const count=counts.returned_samples ?? data.samples?.length ?? 0;
+      const count=data.selected_samples ?? counts.returned_samples ?? data.samples?.length ?? 0;
       const problems=[];
-      for(const [key,label] of [['omitted_samples','omitted samples'],['unknown_samples','samples with unknown frames']])if(counts[key])problems.push(`${counts[key]} ${label}`);
+      if(counts.omitted_samples)problems.push(`${counts.omitted_samples} omitted samples in capture window`);
+      const selectedUnknown=(data.samples || []).filter(sample=>(data.stacks?.[sample.stack] || []).some(id=>data.frames?.[id]?.symbol?.includes('[unknown]'))).length;
+      if(selectedUnknown)problems.push(`${selectedUnknown} samples with unknown frames`);
       for(const [key,label] of [['decode_errors','capture decode errors'],['known_lost_samples','known capture losses'],['capture_omitted_samples','capture omissions'],['omitted_frames','capture omitted frames']])if(coverage[key])problems.push(`${coverage[key]} ${label}`);
       if(coverage.query_limited)problems.push('query limit reached');
+      const attribution=data.attribution || {};
+      $('attribution').textContent=attribution.available ? `${attribution.associated_samples} of ${counts.returned_samples || 0} samples associated with this block · ${attribution.unassigned_samples} unassigned · ${count} shown` : 'No execution associations retained for this recording. Raw process stacks remain available.';
+      if(span && !count)$('attribution').textContent+=' No CPU samples were associated with this stage. This does not mean it used no CPU.';
+      const selected=$('stage').value;
+      $('stage').replaceChildren();
+      for(const context of [{span:'',label:'All stages'},...(attribution.contexts || [])]){
+        const option=document.createElement('option');option.value=context.span;option.textContent=context.label;$('stage').append(option);
+      }
+      $('stage').value=selected;
+      $('stage').disabled=view==='unassigned';
       $('coverage').dataset.partial=String(problems.length>0);
       $('coverage').textContent=[`${Number(count).toLocaleString()} samples`,data.frequencies_hz?.length?`${data.frequencies_hz.join(' / ')} Hz`:data.frequency_hz?`${data.frequency_hz} Hz`:null,'process-wide',`${coverage.state || 'unknown'} coverage`,...problems].filter(Boolean).join(' · ');
       $('cpu-time').textContent=cpuWeightLabel(data);
@@ -77,6 +90,12 @@ async function startCpuPage() {
   }
   $('reset-zoom').addEventListener('click',()=>{const viewer=$('viewer');if(viewer.getAttribute('src'))viewer.contentWindow.location.reload();});
   $('scope').value=cpuScope(new URLSearchParams(location.search).get('scope'));
-  $('scope').addEventListener('change',()=>load());await load();
+  const params=new URLSearchParams(location.search);
+  $('view').value=['context','raw','unassigned'].includes(params.get('view'))?params.get('view'):'context';
+  const requested=params.get('span');
+  if(/^\d{1,5}$/.test(requested || '')){const option=document.createElement('option');option.value=requested;option.textContent='Selected stage';$('stage').append(option);$('stage').value=requested;}
+  $('scope').addEventListener('change',()=>load());
+  $('stage').addEventListener('change',()=>load());
+  $('view').addEventListener('change',()=>{if($('view').value==='unassigned')$('stage').value='';load();});await load();
 }
 if(document.body.dataset.page==='cpu')startCpuPage();

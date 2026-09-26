@@ -1707,6 +1707,7 @@ impl Chain {
         // Run 4 tasks in parallel:
         // - sprout, sapling, orchard, and Ironwood tree updates and root calculations
         // - the rest of the Chain updates
+        let suspended_profile = zakura_jsonl_trace::block_profile::Context::default().enter();
         rayon::in_place_scope_fifo(|scope| {
             // Spawns a separate rayon task for each note commitment tree
             tree_result = Some(nct.update_trees_parallel(&contextually_valid.block.clone()));
@@ -1716,6 +1717,8 @@ impl Chain {
                     Some(self.update_chain_tip_with_block_except_trees(contextually_valid));
             });
         });
+
+        drop(suspended_profile);
 
         tree_result.expect("scope has already finished")?;
         partial_result.expect("scope has already finished")?;

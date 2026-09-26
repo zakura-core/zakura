@@ -1241,11 +1241,11 @@ fn commit_contextual_finalization(
     prev_note_commitment_trees: Option<NoteCommitmentTrees>,
 ) -> Result<(block::Hash, NoteCommitmentTrees), CommitCheckpointVerifiedError> {
     let profile = profiles::Context::current();
-    let clone_profile = profile.span(profiles::Stage::SnapshotClone);
+    let clone_profile = profile.sync_span(profiles::Stage::SnapshotClone);
     let mut staged = live.clone();
     drop(clone_profile);
     let finalizable = staged.finalize();
-    let prepare_profile = profile.span(profiles::Stage::HeaderTransitionPrepare);
+    let prepare_profile = profile.sync_span(profiles::Stage::HeaderTransitionPrepare);
     let new_finalized = match &finalizable {
         FinalizableBlock::Contextual {
             contextually_verified,
@@ -2951,7 +2951,8 @@ impl WriteBlockWorkerTask {
             profile.duration(profiles::Stage::WriterQueue, queued_at.elapsed());
             let occupied = profile.span(profiles::Stage::WriterOccupied);
             let _profile_scope = occupied.context().enter();
-            let contextual_profile = profiles::Context::current().span(profiles::Stage::Contextual);
+            let contextual_profile =
+                profiles::Context::current().sync_span(profiles::Stage::Contextual);
             let writer_queue_duration = queued_at.elapsed().as_secs_f64();
             metrics::histogram!("state.block_writer.queue.duration_seconds")
                 .record(writer_queue_duration);
@@ -3052,7 +3053,7 @@ impl WriteBlockWorkerTask {
                 };
 
             drop(contextual_profile);
-            let publication_profile = profile.span(profiles::Stage::Publication);
+            let publication_profile = profile.sync_span(profiles::Stage::Publication);
 
             // TODO: fix the test timing bugs that require the result to be sent
             //       after `update_latest_chain_channels()`,
@@ -3169,8 +3170,8 @@ impl WriteBlockWorkerTask {
                         return header_chain_finalization_failure(error);
                     }
                 };
-                let _publication =
-                    profiles::Context::current().span(profiles::Stage::FinalizationPublication);
+                let _publication = profiles::Context::current()
+                    .sync_span(profiles::Stage::FinalizationPublication);
                 // Finalization drops side chains that fork below the new finalized tip,
                 // so readers must not keep seeing them in the published state.
                 update_latest_chain_channels(

@@ -74,3 +74,15 @@ CREATE INDEX IF NOT EXISTS lifecycle_block ON lifecycle(run,hash,at_us);
 CREATE TRIGGER IF NOT EXISTS lifecycle_bound AFTER INSERT ON lifecycle BEGIN
  DELETE FROM lifecycle WHERE id <= NEW.id - 200000;
 END;
+
+-- Execution intervals do not affect elapsed span counts or block completion.
+CREATE TABLE IF NOT EXISTS executions (
+ id INTEGER PRIMARY KEY AUTOINCREMENT,
+ run TEXT NOT NULL, attempt INTEGER NOT NULL, span INTEGER NOT NULL,
+ thread INTEGER NOT NULL, start_us INTEGER NOT NULL, end_us INTEGER NOT NULL,
+ FOREIGN KEY(run,attempt) REFERENCES attempts(run,attempt) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS execution_attempt ON executions(run,attempt,thread,start_us);
+CREATE TRIGGER IF NOT EXISTS execution_bound AFTER INSERT ON executions BEGIN
+ DELETE FROM executions WHERE id <= NEW.id - 1000000;
+END;

@@ -21,6 +21,7 @@ use std::{
 use crossbeam_channel::{bounded, Receiver, Sender};
 use serde::{Deserialize, Serialize};
 
+mod execution;
 pub mod lifecycle;
 pub mod verification;
 
@@ -288,6 +289,19 @@ pub enum Outcome {
 pub enum Event {
     /// Bounded block ingress evidence, independent of verifier attempts.
     Lifecycle(lifecycle::Record),
+    /// Disjoint active execution interval on one OS thread. Separate from elapsed spans.
+    Execution {
+        /// Owning attempt.
+        attempt: u64,
+        /// Active context span, zero for the verifier root.
+        span: u64,
+        /// Linux thread ID, matching perf samples.
+        thread: u64,
+        /// Inclusive start offset from the run epoch.
+        start_us: u64,
+        /// Exclusive end offset from the run epoch.
+        end_us: u64,
+    },
     /// All owners released this attempt, including work after the caller response.
     Seal {
         /// Attempt identity.
@@ -475,6 +489,7 @@ struct Attempt {
     id: u64,
     next_span: AtomicU64,
     requested_spans: AtomicU64,
+    execution_records: AtomicU64,
     fine_spans: AtomicU64,
     parent_wait: AtomicU64,
     dropped: AtomicU64,
@@ -527,7 +542,10 @@ impl Context {
     /// Enter a synchronous scope. Never hold this guard across an await.
     pub fn enter(&self) -> Entered {
         Entered {
-            previous: Some(CURRENT.with(|c| c.replace(self.clone()))),
+            previous: Some(CURRENT.with(|c| {
+                execution::boundary(&c.borrow(), self);
+                c.replace(self.clone())
+            })),
             _not_send: PhantomData,
         }
     }
@@ -574,6 +592,12 @@ impl Context {
             finished: false,
         }
     }
+    /// Start and enter a synchronous phase. The guard must never cross an await.
+    pub fn sync_span(&self, stage: Stage) -> ScopedSpan {
+        let span = self.span(stage);
+        let entered = span.context().enter();
+        ScopedSpan { entered, span }
+    }
     /// Start a transaction envelope using its already-computed mined ID in internal byte order.
     pub fn transaction_span(&self, hash: [u8; 32]) -> Span {
         let mut span = self.span(Stage::Transaction);
@@ -617,6 +641,7 @@ impl Drop for Entered {
     fn drop(&mut self) {
         if let Some(previous) = self.previous.take() {
             CURRENT.with(|c| {
+                execution::boundary(&c.borrow(), &previous);
                 c.replace(previous);
             });
         }
@@ -639,6 +664,20 @@ impl<F: Future> Future for Instrumented<F> {
         }
         let _entered = this.context.enter();
         this.future.poll(cx)
+    }
+}
+
+/// A synchronous phase with explicit CPU context. Fields drop in declaration order.
+pub struct ScopedSpan {
+    entered: Entered,
+    span: Span,
+}
+impl ScopedSpan {
+    /// Context for synchronous descendants or explicitly dispatched workers.
+    pub fn context(&self) -> Context {
+        // Keep the scope alive until before the elapsed span is closed.
+        let _ = &self.entered;
+        self.span.context()
     }
 }
 
@@ -801,6 +840,7 @@ fn begin_with(recorder: &Arc<Recorder>, block: Block) -> Option<Root> {
             id,
             next_span: AtomicU64::new(1),
             requested_spans: AtomicU64::new(0),
+            execution_records: AtomicU64::new(0),
             fine_spans: AtomicU64::new(0),
             parent_wait: AtomicU64::new(u64::MAX),
             dropped: AtomicU64::new(0),

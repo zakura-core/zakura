@@ -348,6 +348,7 @@ impl DiskWriteBatch {
             let transactions = &finalized.block.transactions;
             let transactions_size: usize =
                 if transactions.len() >= super::PARALLEL_BLOCK_TX_THRESHOLD {
+                    let _unassigned = zakura_jsonl_trace::block_profile::Context::default().enter();
                     use rayon::prelude::*;
                     transactions
                         .par_iter()

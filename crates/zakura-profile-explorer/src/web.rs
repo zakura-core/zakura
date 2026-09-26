@@ -74,6 +74,12 @@ async fn search(State(app): State<App>, Query(q): Query<Search>) -> ApiResult {
 struct CpuQuery {
     #[serde(default = "recorded_scope")]
     scope: String,
+    #[serde(default = "context_view")]
+    view: String,
+    span: Option<u64>,
+}
+fn context_view() -> String {
+    "context".into()
 }
 fn recorded_scope() -> String {
     "recorded".into()
@@ -83,15 +89,18 @@ async fn cpu(
     Path((run, attempt)): Path<(String, u64)>,
     Query(q): Query<CpuQuery>,
 ) -> ApiResult {
-    app.read(move |r| r.cpu(&run, attempt, &q.scope)).await
+    app.read(move |r| r.cpu_view(&run, attempt, &q.scope, &q.view, q.span))
+        .await
 }
 async fn cpu_profile(
     State(app): State<App>,
     Path((run, attempt)): Path<(String, u64)>,
     Query(q): Query<CpuQuery>,
 ) -> ApiResult {
-    app.read(move |r| r.cpu_speedscope(&run, attempt, &q.scope))
-        .await
+    app.read(move |r| {
+        crate::cpu::speedscope(&r.cpu_view(&run, attempt, &q.scope, &q.view, q.span)?)
+    })
+    .await
 }
 async fn viewer_asset(Path(asset): Path<String>) -> Response {
     include!("../web/vendor/speedscope/routes.rs")

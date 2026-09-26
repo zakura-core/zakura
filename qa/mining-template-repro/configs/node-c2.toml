@@ -1,0 +1,51 @@
+# zakura#1080 repro — Lever C node c2.
+#
+# Regtest, because it is the only network that self-seeds its genesis block
+# (crates/zakurad/src/commands/start.rs) — a configured custom testnet starts with
+# an empty state and no peer to fetch genesis from, so its miner never gets a
+# template. Regtest forces disable_pow, so PoW *validation* is off, but the
+# internal miner still runs the real Equihash solver against the template, and the
+# two nodes still race for the same height over real p2p.
+#
+# Both nodes start with no peers so they mine independent chains; lever-c.sh then
+# joins them with the addnode RPC, which delivers a large batch of equal-height
+# competitors at once.
+
+[network]
+network = { params = { checkpoints = false, activation_heights = { NU5 = 5 } }, regtest = true }
+listen_addr = "127.0.0.1:18343"
+# Legacy TCP only: the Zakura QUIC endpoint defaults to 0.0.0.0:8234, so two
+# nodes on one host collide on it. Block gossip over legacy TCP is all this
+# lever needs.
+p2p_stack = "legacy"
+cache_dir = false
+initial_testnet_peers = []
+max_connections_per_ip = 10
+crawl_new_peer_interval = "5s"
+
+[state]
+ephemeral = true
+
+[mempool]
+debug_enable_at_height = 0
+
+[rpc]
+listen_addr = "127.0.0.1:18342"
+enable_cookie_auth = false
+debug_force_finished_sync = true
+
+[metrics]
+endpoint_addr = "127.0.0.1:19004"
+
+[mining]
+# Requires --features internal-miner; it is not a default feature, so a stock
+# zakurad has a no-op miner task.
+internal_miner = true
+miner_address = "tmJymvcUCn1ctbghvTJpXBwHiMEB8P6wxNV"
+# Distinct coinbase data per node. Without it both miners are deterministic and
+# build byte-identical blocks from identical configs, so the two chains never
+# diverge and no equal-height race can occur.
+extra_coinbase_data = "repro-c2"
+
+[tracing]
+filter = "info"

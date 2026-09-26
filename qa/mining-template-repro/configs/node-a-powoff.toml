@@ -1,0 +1,38 @@
+# zakura#1080 repro — Lever A and Lever B node.
+#
+# Single Regtest node. Regtest forces disable_pow = true
+# (crates/zakura-chain/src/parameters/network/testnet.rs: Parameters::new_regtest),
+# so blocks can be produced instantly via the `generate` RPC and sibling blocks
+# need no Equihash solution (Solution::for_proposal).
+
+[network]
+network = { params = { checkpoints = false, activation_heights = { NU5 = 5 } }, regtest = true }
+listen_addr = "127.0.0.1:18233"
+cache_dir = false
+initial_testnet_peers = []
+max_connections_per_ip = 10
+
+[state]
+ephemeral = true
+
+[mempool]
+# Without this the mempool never activates on a tiny local chain and
+# getblocktemplate has no mempool to query.
+debug_enable_at_height = 0
+
+[rpc]
+listen_addr = "127.0.0.1:18232"
+# Exposes the full method surface, including the RpcAccess::Test method `generate`.
+enable_cookie_auth = false
+# A one-node local net never looks "synced" to the normal heuristic.
+debug_force_finished_sync = true
+
+[metrics]
+endpoint_addr = "127.0.0.1:19001"
+
+[mining]
+internal_miner = false
+miner_address = "tmJymvcUCn1ctbghvTJpXBwHiMEB8P6wxNV"
+
+[tracing]
+filter = "info"

@@ -411,7 +411,14 @@ fn the_node_slot_returns_before_the_peer_slot() {
     // find the node slot already returned.
     let peer = SlotBudget::new(1).unwrap();
     let node = SlotBudget::new(1).unwrap();
-    let slots = ExecutionSlots::new(peer.try_reserve().unwrap(), node.try_reserve().unwrap());
+    let slots = ExecutionSlots::new(
+        peer.try_reserve().unwrap(),
+        node.try_reserve().unwrap(),
+        PeerBudgets {
+            execution: peer.clone(),
+            output: OutputByteBudget::new(1).unwrap(),
+        },
+    );
     let observer = Arc::new(ObserveNode {
         node: node.clone(),
         free_at_wake: AtomicUsize::new(usize::MAX),
@@ -474,6 +481,31 @@ async fn output_bytes_return_only_when_the_last_frame_is_written() {
 }
 
 #[tokio::test]
+async fn a_retired_session_keeps_its_peer_budget_until_output_is_written() {
+    let capacity = capacity(LIMITS);
+    let Session {
+        serve,
+        mut output,
+        cancel,
+    } = session(&capacity, 1, 4);
+    serve.admit(job()).unwrap();
+    settle().await;
+    cancel.cancel();
+    drop(serve);
+    settle().await;
+    let held = capacity.node_output_held();
+    assert!(held > 0, "the ending remains in the transport queue");
+    assert_eq!(
+        capacity.peer_held(&peer(1)),
+        (0, held),
+        "a reconnect must share the budget of the unwritten ending"
+    );
+    assert_eq!(next(&mut output).await, Probe::Done(0));
+    assert!(output.recv().await.is_none());
+    assert_eq!(capacity.peer_held(&peer(1)), (0, 0));
+}
+
+#[tokio::test]
 async fn a_stalled_produce_on_one_peer_does_not_block_another() {
     let capacity = capacity(ServeLimits {
         peer_execution: 1,
@@ -516,14 +548,18 @@ async fn the_ending_frees_the_commitment_before_execution_ends() {
     let capacity = capacity(LIMITS);
     let session = session(&capacity, 1, 1);
     let hold = Arc::new(Semaphore::new(0));
-    session
+    let completed = session
         .serve
-        .admit(Job {
+        .admit_tracked(Job {
             hold_after: Some(hold.clone()),
             ..job()
         })
         .unwrap();
     settle().await;
+    assert!(
+        *completed.borrow(),
+        "ending publication completes the tracked request before the producer exits"
+    );
     assert_eq!(session.serve.open(), 0);
     assert_eq!(capacity.node_execution_held(), 1);
     hold.add_permits(1);
@@ -585,8 +621,12 @@ fn sink_and_core(
         Arc::new(ResponseGrants {
             _node: grant(),
             _peer: grant(),
+            _peer_budgets: PeerBudgets {
+                execution: SlotBudget::new(1).unwrap(),
+                output: budget.clone(),
+            },
         }),
-        Commitment(commitments.clone()),
+        Commitment(commitments.clone(), None),
     );
     let core = Arc::new(Mutex::new(core));
     (ResponseSink::new(core.clone()), queued, commitments, core)

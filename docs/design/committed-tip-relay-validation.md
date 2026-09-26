@@ -86,7 +86,10 @@ CI also detected published API breaks inherited from PR #1116. This PR carries
 the missing network major bump to 9.0.0. RPC moves to 12.0.0 because its public
 bounds expose network traits, and the node moves to 1.5.1 so its updated
 dependency requirements can publish. The version correction preserves the
-compatibility check and relay behavior.
+compatibility check and relay behavior. The package-graph check also found
+existing unpublished dependency updates in consensus and utilities. Consensus
+moves to 10.0.0 because its public API exposes the new state/header types;
+utilities moves to 2.2.6 because those dependencies are internal to its binaries.
 
 ## Reproduce
 

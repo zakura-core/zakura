@@ -79,9 +79,14 @@ gossip tests, and ten inbound fake-peer-set tests.
 Clippy passed for both changed crates, all targets, with
 `default-release-binaries` enabled and warnings denied. Formatting, Markdown
 lint, and changelog validation passed. Fixtures answer actual announcement
-requests rather than sleeping past
-the six-second send timeout; transaction expiration remains driven by block
-height.
+requests rather than sleeping past the six-second send timeout; transaction
+expiration remains driven by block height.
+
+CI also detected published API breaks inherited from PR #1116. This PR carries
+the missing network major bump to 9.0.0. RPC moves to 12.0.0 because its public
+bounds expose network traits, and the node moves to 1.5.1 so its updated
+dependency requirements can publish. The version correction preserves the
+compatibility check and relay behavior.
 
 ## Reproduce
 

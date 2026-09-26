@@ -1305,7 +1305,7 @@ mod tests {
         );
 
         if regulated {
-            // Keep both directions active with a one-frame application queue.
+            // Keep both directions active with bounded application queues.
             // Do not consume the served response until our own bodies reach the driver.
             hostile
                 .send_raw_frame(

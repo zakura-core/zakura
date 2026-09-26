@@ -452,7 +452,7 @@ def capture(args, stopping):
     worker = context.Process(target=decoder, args=(store, stop_decoder))
     worker.start()
     error_file = (directory / 'record.stderr').open('wb')
-    # At 999 Hz, one second keeps 16 busy CPUs below the raw segment limit.
+    # High-rate captures rotate every second. Burst size and backlog guards still apply.
     rotation_seconds = 1 if args.frequency >= 999 else 10
     command = ['perf', '--buildid-dir', str(symbols), 'record', '--no-buildid-cache', '--no-no-buildid', '--buildid-all',
                '--clockid', 'mono', '-e', 'cpu-clock:u', '-F', str(args.frequency), '--call-graph', f'dwarf,{args.stack_bytes}',
@@ -575,7 +575,7 @@ def main():
     parser.add_argument('--node-service', default='zakurad')
     parser.add_argument('--executable', type=Path, required=True)
     parser.add_argument('--stack-bytes', type=int, choices=(8192, 16384, 32768, 65528), default=8192)
-    parser.add_argument('--frequency', type=int, choices=(19, 49, 99, 999), default=999)
+    parser.add_argument('--frequency', type=int, choices=(19, 49, 99, 999, 2000), default=999)
     parser.add_argument('--duration-seconds', type=int, default=0, help='Zero records continuously.')
     parser.add_argument('--once', action='store_true')
     parser.add_argument('--check-symbol-budget', action='store_true')

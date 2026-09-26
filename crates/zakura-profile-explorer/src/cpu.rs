@@ -86,7 +86,7 @@ fn validate(c: &Capture) -> Result<()> {
         "run identity"
     );
     ensure!(
-        [19, 49, 99, 999].contains(&c.frequency) && c.clock == "monotonic",
+        [19, 49, 99, 999, 2000].contains(&c.frequency) && c.clock == "monotonic",
         "capture settings"
     );
     ensure!(

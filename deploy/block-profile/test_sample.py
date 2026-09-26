@@ -13,6 +13,10 @@ spec.loader.exec_module(sample)
 
 
 class Parsing(unittest.TestCase):
+    def test_2000_hz_is_an_explicit_cli_option(self):
+        result = subprocess.run([__import__('sys').executable, str(Path(__file__).with_name('sample.py')), '--help'], capture_output=True, text=True, check=True)
+        self.assertIn('19,49,99,999,2000', result.stdout)
+
     def test_exact_timestamp_stack_and_shared_dictionary(self):
         lines = [' 12/13 123.123456789: cpu-clock:u: abcd validate (/usr/bin/zakurad)\n',
                  ' abce caller (/usr/bin/zakurad)\n', '\n'] * 2

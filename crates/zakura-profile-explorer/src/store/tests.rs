@@ -891,33 +891,36 @@ fn cpu_import_keeps_up_with_one_second_segments_and_a_short_backlog() -> Result<
 
 #[test]
 fn cpu_v3_preserves_periods_through_import_query_and_export() -> Result<()> {
-    let temp = tempfile::tempdir()?;
-    let store = cpu_test_store(temp.path())?;
-    let mut capture = cpu_v2(vec![(200, 11), (600000, 12), (750000, 11)]);
-    capture.schema_version = 3;
-    capture.frequency = 999;
-    for (sample, ns) in capture
-        .samples
-        .iter_mut()
-        .zip([1_000_000, 2_000_000, 4_000_000])
-    {
-        sample.cpu_period_ns = Some(ns);
+    for frequency in [999, 2000] {
+        let temp = tempfile::tempdir()?;
+        let store = cpu_test_store(temp.path())?;
+        let mut capture = cpu_v2(vec![(200, 11), (600000, 12), (750000, 11)]);
+        capture.schema_version = 3;
+        capture.frequency = frequency;
+        for (sample, ns) in capture
+            .samples
+            .iter_mut()
+            .zip([1_000_000, 2_000_000, 4_000_000])
+        {
+            sample.cpu_period_ns = Some(ns);
+        }
+        import_cpu(&store, &capture, &"a".repeat(32))?;
+        let reader = Reader::open(temp.path())?;
+        let data = reader.cpu(RUN, 1, "recorded")?;
+        assert_eq!(data["frequency_hz"], frequency);
+        assert_eq!(data["weight"]["estimated_cpu_ns"], 7_000_000);
+        assert_eq!(data["samples"][2]["cpu_period_ns"], 4_000_000);
+        assert_eq!(
+            crate::cpu::speedscope(&data)?["profiles"][0]["endValue"],
+            7.0
+        );
+        let verifier = reader.cpu(RUN, 1, "verifier")?;
+        assert_eq!(verifier["weight"]["estimated_cpu_ns"], 3_000_000);
+        capture.samples[0].cpu_period_ns = None;
+        assert!(import_cpu(&store, &capture, &"b".repeat(32)).is_err());
+        capture.samples[0].cpu_period_ns = Some(1_000_000_001);
+        assert!(import_cpu(&store, &capture, &"c".repeat(32)).is_err());
     }
-    import_cpu(&store, &capture, &"a".repeat(32))?;
-    let reader = Reader::open(temp.path())?;
-    let data = reader.cpu(RUN, 1, "recorded")?;
-    assert_eq!(data["weight"]["estimated_cpu_ns"], 7_000_000);
-    assert_eq!(data["samples"][2]["cpu_period_ns"], 4_000_000);
-    assert_eq!(
-        crate::cpu::speedscope(&data)?["profiles"][0]["endValue"],
-        7.0
-    );
-    let verifier = reader.cpu(RUN, 1, "verifier")?;
-    assert_eq!(verifier["weight"]["estimated_cpu_ns"], 3_000_000);
-    capture.samples[0].cpu_period_ns = None;
-    assert!(import_cpu(&store, &capture, &"b".repeat(32)).is_err());
-    capture.samples[0].cpu_period_ns = Some(1_000_000_001);
-    assert!(import_cpu(&store, &capture, &"c".repeat(32)).is_err());
     Ok(())
 }
 

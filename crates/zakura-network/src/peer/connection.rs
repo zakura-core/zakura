@@ -408,6 +408,7 @@ impl Handler {
                     .iter()
                     .all(|item| matches!(item, InventoryHash::Block(_))) =>
             {
+                profile_inventory(&items, transient_addr, Phase::InventorySyncResponse);
                 Handler::Finished(Ok(Response::BlockHashes(
                     block_hashes(&items[..]).collect(),
                 )))
@@ -1326,14 +1327,21 @@ where
             Message::Inv(ref items) => match &items[..] {
                 // We don't expect to be advertised multiple blocks at a time,
                 // so we ignore any advertisements of multiple blocks.
-                [InventoryHash::Block(hash)] => Request::AdvertiseBlock(
-                    *hash,
-                    self.connection_info
-                        .connected_addr
-                        .get_transient_addr()
-                        .map(Into::into),
-                )
-                .into(),
+                [InventoryHash::Block(hash)] => {
+                    profile_inventory(
+                        items,
+                        self.connection_info.connected_addr.get_transient_addr(),
+                        Phase::InventoryGossip,
+                    );
+                    Request::AdvertiseBlock(
+                        *hash,
+                        self.connection_info
+                            .connected_addr
+                            .get_transient_addr()
+                            .map(Into::into),
+                    )
+                    .into()
+                }
 
                 // Some peers advertise invs with mixed item types.
                 // But we're just interested in the transaction invs.
@@ -1341,6 +1349,11 @@ where
                 // TODO: split mixed invs into multiple requests,
                 //       but skip runs of multiple blocks.
                 tx_ids if tx_ids.iter().any(|item| item.unmined_tx_id().is_some()) => {
+                    profile_inventory(
+                        items,
+                        self.connection_info.connected_addr.get_transient_addr(),
+                        Phase::InventoryIgnoredMixed,
+                    );
                     Request::AdvertiseTransactionIds(
                         transaction_ids(items).collect(),
                         self.connection_info
@@ -1359,10 +1372,20 @@ where
                     Unused
                 }
                 [InventoryHash::Block(_), InventoryHash::Block(_), ..] => {
+                    profile_inventory(
+                        items,
+                        self.connection_info.connected_addr.get_transient_addr(),
+                        Phase::InventoryIgnoredMultiBlock,
+                    );
                     debug!(%msg, "ignoring inv with multiple blocks");
                     Unused
                 }
                 _ => {
+                    profile_inventory(
+                        items,
+                        self.connection_info.connected_addr.get_transient_addr(),
+                        Phase::InventoryIgnoredMixed,
+                    );
                     debug!(%msg, "ignoring inv with no transactions");
                     Unused
                 }
@@ -1914,6 +1937,19 @@ fn transaction_ids(items: &'_ [InventoryHash]) -> impl Iterator<Item = UnminedTx
 /// Non-block inventory hashes are skipped.
 fn block_hashes(items: &'_ [InventoryHash]) -> impl Iterator<Item = block::Hash> + '_ {
     items.iter().filter_map(InventoryHash::block_hash)
+}
+
+/// Observe the selected inventory route without exposing peer addresses or unbounded lists.
+fn profile_inventory(items: &[InventoryHash], peer: Option<PeerSocketAddr>, phase: Phase) {
+    if !profiles::enabled() {
+        return;
+    }
+    let source = peer.and_then(|a| lifecycle::source(&a.ip()));
+    for item in items.iter().take(64) {
+        if let InventoryHash::Block(hash) = item {
+            lifecycle::observe(hash.0, Route::LegacyPeer, phase, source);
+        }
+    }
 }
 
 /// Observe before response handling can consume inventory messages.

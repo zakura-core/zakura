@@ -16,6 +16,7 @@ use color_eyre::eyre::{eyre, Report};
 use futures::{
     future::OptionFuture,
     stream::{FuturesUnordered, StreamExt},
+    FutureExt,
 };
 use indexmap::IndexSet;
 use serde::{Deserialize, Serialize};
@@ -29,6 +30,7 @@ use tower::{
     ServiceExt,
 };
 
+use profiles::lifecycle::{Discovery, Phase};
 use zakura_chain::{
     block::{self, Height, HeightDiff},
     chain_tip::ChainTip,
@@ -1891,6 +1893,7 @@ where
     async fn first_unknown_in_find_blocks_response(
         &mut self,
         hashes: &[block::Hash],
+        profile: &Discovery,
     ) -> Result<Option<usize>, Report> {
         let mut seen = HashSet::new();
         let mut first_unknown = None;
@@ -1898,6 +1901,7 @@ where
         for (index, &hash) in hashes.iter().enumerate() {
             if !seen.insert(hash) {
                 debug!(?hash, "discarding FindBlocks response with duplicate hash");
+                profile.hash_iter(Phase::SyncResponseDuplicate, hashes.iter().map(|h| h.0));
                 return Ok(None);
             }
 
@@ -1913,10 +1917,14 @@ where
                     ?hash,
                     "discarding FindBlocks response with known hash in advertised suffix"
                 );
+                profile.hash_iter(Phase::SyncResponseKnownSuffix, hashes.iter().map(|h| h.0));
                 return Ok(None);
             }
         }
 
+        if first_unknown.is_none() {
+            profile.hash_iter(Phase::SyncHashesKnown, hashes.iter().map(|h| h.0));
+        }
         Ok(first_unknown)
     }
 
@@ -2011,6 +2019,7 @@ where
         checkpoint_bootstrap: bool,
     ) -> Result<IndexSet<block::Hash>, Report> {
         let stage_start = std::time::Instant::now();
+        let mut discovery = Discovery::new(FANOUT);
 
         let block_locator = self
             .state
@@ -2042,17 +2051,38 @@ where
                 tokio::task::yield_now().await;
             }
 
+            let mut query = discovery.request(attempt);
             let ready_tip_network = self.tip_network.ready().await;
-            requests.push(tokio::spawn(ready_tip_network.map_err(|e| eyre!(e))?.call(
-                zn::Request::FindBlocks {
+            let response = ready_tip_network
+                .map_err(|e| eyre!(e))?
+                .call(zn::Request::FindBlocks {
                     known_blocks: block_locator.clone(),
                     stop: None,
-                },
-            )));
+                });
+            query.mark(Phase::SyncRequestSubmitted, None, None);
+            // Keep call/submit ordering unchanged. Completion is recorded inside the task,
+            // separately from when the round gets around to consuming its result.
+            requests.push(
+                tokio::spawn(async move {
+                    let result = response.await;
+                    let phase = match &result {
+                        Ok(_) => Phase::SyncRequestCompleted,
+                        Err(error) if error.is::<tower::timeout::error::Elapsed>() => {
+                            Phase::SyncRequestTimeout
+                        }
+                        Err(_) => Phase::SyncRequestFailed,
+                    };
+                    query.finish(phase, None, None);
+                    result
+                })
+                .map(move |result| (attempt, result)),
+            );
         }
 
         let mut download_set = IndexSet::new();
-        while let Some(res) = requests.next().await {
+        while let Some((slot, res)) = requests.next().await {
+            let query = discovery.query(slot);
+            query.mark(Phase::SyncResponseHandled, Some(requests.len()), None);
             match res
                 .unwrap_or_else(|e @ JoinError { .. }| {
                     if e.is_panic() {
@@ -2069,6 +2099,7 @@ where
             {
                 Ok(zn::Response::BlockHashes(hashes)) => {
                     trace!(?hashes);
+                    query.hash_iter(Phase::SyncHashesReceived, hashes.iter().map(|h| h.0));
 
                     // zcashd sometimes appends an unrelated hash at the start
                     // or end of its response.
@@ -2093,7 +2124,10 @@ where
                         match hashes.as_slice() {
                             [] => continue,
                             [_only_unknown] => hashes.as_slice(),
-                            [rest @ .., _last] => rest,
+                            [rest @ .., last] => {
+                                query.hashes(Phase::SyncTrailingHashDiscarded, &[last.0]);
+                                rest
+                            }
                         }
                     };
                     if hashes.is_empty() {
@@ -2104,6 +2138,7 @@ where
                     // hash so a full 500-hash chain plus one appended hash is
                     // still usable.
                     if !has_valid_tips_response_hash_count(hashes) {
+                        query.hash_iter(Phase::SyncResponseOversized, hashes.iter().map(|h| h.0));
                         debug!(
                             hashes.len = hashes.len(),
                             max_hashes = MAX_TIPS_RESPONSE_HASH_COUNT,
@@ -2112,11 +2147,17 @@ where
                         continue;
                     }
 
-                    let first_unknown = self.first_unknown_in_find_blocks_response(hashes).await?;
+                    let first_unknown = self
+                        .first_unknown_in_find_blocks_response(hashes, &query)
+                        .await?;
 
                     debug!(hashes.len = ?hashes.len(), ?first_unknown);
 
                     let unknown_hashes = if let Some(index) = first_unknown {
+                        query.hash_iter(
+                            Phase::SyncHashKnownPrefix,
+                            hashes[..index].iter().map(|h| h.0),
+                        );
                         &hashes[index..]
                     } else {
                         continue;
@@ -2153,6 +2194,7 @@ where
                     // TODO: can we make the download order independent of response order?
                     let prev_download_len = download_set.len();
                     download_set.extend(unknown_hashes);
+                    query.hash_iter(Phase::SyncHashAccepted, unknown_hashes.iter().map(|h| h.0));
                     let new_download_len = download_set.len();
                     let new_hashes = new_download_len - prev_download_len;
                     debug!(new_hashes, "added hashes to download set");
@@ -2165,6 +2207,7 @@ where
             }
         }
 
+        discovery.mark(Phase::SyncFanoutComplete, Some(0), Some(download_set.len()));
         let reached_checkpoint =
             self.cap_checkpoint_bootstrap_downloads(&mut download_set, checkpoint_bootstrap);
         if reached_checkpoint {
@@ -2177,6 +2220,7 @@ where
         for hash in &download_set {
             debug!(?hash, "checking if state contains hash");
             if self.state_contains(*hash).await? {
+                discovery.hashes(Phase::SyncHashAlreadyCommitted, &[hash.0]);
                 return Err(eyre!("queued download of hash behind our chain tip"));
             }
         }
@@ -2190,12 +2234,21 @@ where
         // so the last peer to respond can't toggle our mempool
         self.recent_syncs.push_obtain_tips_length(new_downloads);
 
+        discovery.hash_iter(
+            Phase::SyncDownloadsDispatch,
+            download_set.iter().map(|h| h.0),
+        );
         let response = self.request_blocks(download_set).await;
 
         metrics::histogram!("sync.stage.duration_seconds", "stage" => "obtain_tips")
             .record(stage_start.elapsed().as_secs_f64());
 
-        Self::handle_hash_response(response, self.expose_peer_addresses).map_err(Into::into)
+        let result =
+            Self::handle_hash_response(response, self.expose_peer_addresses).map_err(Into::into);
+        if result.is_ok() {
+            discovery.finish(Phase::SyncRoundCompleted, Some(0), Some(new_downloads));
+        }
+        result
     }
 
     /// Confirm the sync tip with a fresh peer response without dispatching body work.

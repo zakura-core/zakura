@@ -1,5 +1,7 @@
 //! Best-effort ingress milestones. No blocks, addresses, or error strings are retained.
 use super::*;
+mod discovery;
+pub use discovery::{Discovery, DiscoveryInfo};
 use std::{
     collections::hash_map::RandomState,
     hash::{BuildHasher, Hash},
@@ -79,6 +81,56 @@ pub enum Phase {
     PeerTimeout,
     /// Peer explicitly reported the requested block unavailable.
     PeerNotFound,
+    /// Inventory was consumed as a FindBlocks response.
+    InventorySyncResponse,
+    /// A singleton block inventory was routed to inbound gossip.
+    InventoryGossip,
+    /// Unsolicited inventory contained multiple blocks.
+    InventoryIgnoredMultiBlock,
+    /// Unsolicited inventory mixed blocks with other item types.
+    InventoryIgnoredMixed,
+    /// An obtain-tips discovery round started.
+    SyncRoundStarted,
+    /// Waiting for readiness to submit one discovery query.
+    SyncRequestReadyWait,
+    /// Discovery query submitted, before peer routing.
+    SyncRequestSubmitted,
+    /// Discovery query returned successfully.
+    SyncRequestCompleted,
+    /// Discovery query hit its service timeout.
+    SyncRequestTimeout,
+    /// Discovery query failed, without retaining its error text.
+    SyncRequestFailed,
+    /// Discovery query was cancelled or panicked.
+    SyncRequestIncomplete,
+    /// The round consumed one query result; pending counts unconsumed queries.
+    SyncResponseHandled,
+    /// Hashes returned by a discovery query, before filtering.
+    SyncHashesReceived,
+    /// Last response hash discarded by the legacy compatibility rule.
+    SyncTrailingHashDiscarded,
+    /// Discovery response exceeded its existing size guard.
+    SyncResponseOversized,
+    /// Response contained duplicate hashes.
+    SyncResponseDuplicate,
+    /// Response contained an already-known hash after an unknown hash.
+    SyncResponseKnownSuffix,
+    /// All remaining response hashes were already known.
+    SyncHashesKnown,
+    /// Hash skipped as an already-known response prefix.
+    SyncHashKnownPrefix,
+    /// Hash added to the combined download list.
+    SyncHashAccepted,
+    /// All discovery query results have been consumed.
+    SyncFanoutComplete,
+    /// Hash committed by another route before dispatch.
+    SyncHashAlreadyCommitted,
+    /// Combined list handed to the existing download admission path.
+    SyncDownloadsDispatch,
+    /// Discovery round returned successfully.
+    SyncRoundCompleted,
+    /// Discovery round ended early, including errors or cancellation.
+    SyncRoundIncomplete,
     /// Selected connection failed while a block request was pending.
     PeerFailed,
 }
@@ -98,6 +150,9 @@ pub struct Record {
     pub phase: Phase,
     /// Microseconds since the recorder monotonic epoch.
     pub at_us: u64,
+    /// Optional bounded sync-discovery context. Older records omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub discovery: Option<DiscoveryInfo>,
 }
 
 /// At most 256 ingress records per monotonic second, independently of span capacity.
@@ -157,6 +212,7 @@ impl Download {
             operation: r.lifecycle.operations.fetch_add(1, Ordering::Relaxed),
             phase: Phase::Discovered,
             at_us: 0,
+            discovery: None,
         });
         let trace = Self {
             record,
@@ -200,6 +256,7 @@ pub fn observe(hash: [u8; 32], route: Route, phase: Phase, source: Option<u64>) 
             source,
             operation: 0,
             at_us: 0,
+            discovery: None,
         });
     }
 }
@@ -229,6 +286,15 @@ mod tests {
         assert!(!limiter.admit(2_000_000));
     }
     #[test]
+    fn historical_milestones_without_discovery_still_decode() {
+        let old = serde_json::json!({
+            "hash": vec![4; 32], "operation": 1, "source": null,
+            "route": "legacy_peer", "phase": "peer_announcement", "at_us": 25
+        });
+        let decoded: Record = serde_json::from_value(old).unwrap();
+        assert!(decoded.discovery.is_none());
+    }
+    #[test]
     fn record_roundtrips_without_peer_addresses() {
         let event = Event::Lifecycle(Record {
             hash: [4; 32],
@@ -237,6 +303,7 @@ mod tests {
             route: Route::Gossip,
             phase: Phase::ParentUnavailable,
             at_us: 10,
+            discovery: None,
         });
         let encoded = serde_json::to_string(&event).unwrap();
         assert!(matches!(

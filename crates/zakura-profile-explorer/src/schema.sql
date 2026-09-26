@@ -86,3 +86,7 @@ CREATE INDEX IF NOT EXISTS execution_attempt ON executions(run,attempt,thread,st
 CREATE TRIGGER IF NOT EXISTS execution_bound AFTER INSERT ON executions BEGIN
  DELETE FROM executions WHERE id <= NEW.id - 1000000;
 END;
+
+-- Round-only milestones can arrive after the block finishes; keep lookups indexed.
+CREATE INDEX IF NOT EXISTS lifecycle_discovery_round
+ ON lifecycle(run,json_extract(payload,'$.discovery.round'),hash,at_us);

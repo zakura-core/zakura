@@ -117,7 +117,32 @@ const milestoneLabels = {
   discovered:'Download considered', already_queued:'Already downloading or verifying', queue_full:'Download queue full',
   source_full:'Source concurrency limit reached', task_started:'Download task started', state_lookup_done:'Existing-block lookup finished',
   network_ready_wait:'Waiting for network readiness', network_request:'Request submitted to network service', network_failed:'Network request failed',
-  peer_announcement:'Peer announced block', peer_request:'Peer connection accepted request', peer_request_flushed:'Request flushed to peer transport',
+  inventory_sync_response:'Inventory used as sync response',
+  inventory_gossip:'Inventory routed to gossip',
+  inventory_ignored_multi_block:'Gossip ignored inventory containing multiple blocks',
+  inventory_ignored_mixed:'Gossip ignored blocks in mixed inventory',
+  sync_round_started:'Sync discovery started',
+  sync_request_ready_wait:'Sync query waiting for network readiness',
+  sync_request_submitted:'Sync query submitted',
+  sync_request_completed:'Sync query returned',
+  sync_request_timeout:'Sync query timed out',
+  sync_request_failed:'Sync query failed',
+  sync_request_incomplete:'Sync query cancelled or interrupted',
+  sync_response_handled:'Sync consumed query result',
+  sync_hashes_received:'Sync received candidate hashes',
+  sync_trailing_hash_discarded:'Sync discarded trailing compatibility hash',
+  sync_response_oversized:'Sync rejected oversized response',
+  sync_response_duplicate:'Sync rejected duplicate hashes',
+  sync_response_known_suffix:'Sync rejected known hash after unknown hash',
+  sync_hashes_known:'Sync skipped already-known hashes',
+  sync_hash_known_prefix:'Sync skipped known prefix',
+  sync_hash_accepted:'Sync kept hash for download',
+  sync_fanout_complete:'Sync finished collecting query results',
+  sync_hash_already_committed:'Block committed before sync dispatched downloads',
+  sync_downloads_dispatch:'Sync submitted list for download admission',
+  sync_round_completed:'Sync discovery completed',
+  sync_round_incomplete:'Sync discovery ended early (error or cancellation)',
+  peer_announcement:'Received block-hash inventory (handling not yet classified)', peer_request:'Peer connection accepted request', peer_request_flushed:'Request flushed to peer transport',
   peer_body:'Peer connection received block body', peer_timeout:'Peer response timed out', peer_not_found:'Peer reported block unavailable', peer_failed:'Peer connection failed during request', body_received:'Downloader received body',
   source_wait:'Waiting for source verification slot', source_acquired:'Source verification slot acquired',
   verifier_ready_wait:'Waiting for verifier readiness', verifier_submitted:'Submitted to verifier', router_entered:'Verification started',
@@ -126,9 +151,14 @@ const milestoneLabels = {
 };
 function dependencyRows(data) {
   const d=data.dependencies||{}, start=data.summary.start_us;
-  return [...(d.events||[]).map(e=>({...e,block:'This block'})),...(d.parent_events||[]).map(e=>({...e,block:'Parent'})),...(d.source_activity||[]).map(e=>({...e,block:'Same source · '+e.hash.slice(-8)}))]
+  return [...(d.events||[]).map(e=>({...e,block:'This block'})),...(d.parent_events||[]).map(e=>({...e,block:'Parent'})),...(d.source_activity||[]).map(e=>({...e,block:'Same source · '+e.hash.slice(-8)})),...(d.discovery_rounds||[]).flatMap(r=>r.events.map(e=>({...e,block:'Sync round '+r.round})))]
     .sort((a,b)=>a.at_us-b.at_us)
-    .map(e=>({...e,offset:e.at_us-start,label:milestoneLabels[e.phase]||e.phase}));
+    .map(e=>{const info=e.discovery;const extra=info?[
+      info.request!=null?`query ${info.request+1}`:null,
+      info.pending!=null?`${info.pending} query results still to consume`:null,
+      info.hashes!=null?`${info.hashes} hashes${info.hashes>64?' (only first 64 recorded)':''}`:null,
+    ].filter(Boolean).join(' · '):'';
+      return {...e,offset:e.at_us-start,label:(milestoneLabels[e.phase]||e.phase)+(extra?' · '+extra:'')};});
 }
 function renderDependencies(data) {
   const host=$('dependencies');host.replaceChildren();
@@ -145,13 +175,15 @@ function renderDependencies(data) {
   }
   body.append(el('p','Source IDs are local to this recording. Other blocks from the same source show up to 128 recent milestones per source, including the two minutes before its slot wait.','muted'));
   body.append(el('p','Times are relative to this block entering verification. Negative times happened earlier. These are retained observations, not a complete network log. Missing events do not prove that a block was never announced.','muted'));
+  if(d.discovery_rounds?.length)body.append(el('p','Linked sync rounds include later completion events. Query numbers identify local requests, not peers. A returned query can still wait for the round to consume it. Hash decisions are limited to the first 64 per list.','muted'));
+  if(d.discovery_limited||d.discovery_rounds?.some(r=>r.limited))body.append(el('p','Some linked sync-round detail exceeds the display limit.','muted'));
   if(d.recording_has_loss)body.append(el('p','Some events were omitted during this recording. The retained timeline may have gaps.','muted'));
   if(!d.parent_events?.length)body.append(el('p','No retained arrival milestones for the parent.','muted'));
   if((d.events?.length||0)>=513||(d.parent_events?.length||0)>=513)body.append(el('p','Only the latest 513 milestones per block are shown.','muted'));
   const table=el('table'),head=el('tr');
   for(const label of ['Time','Block','Milestone','Route / operation','Source'])head.append(el('th',label));
   const thead=el('thead');thead.append(head);table.append(thead);const tbody=el('tbody');
-  for(const e of rows){const tr=el('tr');for(const value of [`${e.offset<0?'−':'+'}${ms(Math.abs(e.offset))}`,e.block,e.label,`${e.route}${e.operation?' / '+e.operation:''}`,e.source||'—'])tr.append(el('td',value));tbody.append(tr);}
+  for(const e of rows){const tr=el('tr');for(const value of [`${e.offset<0?'−':'+'}${ms(Math.abs(e.offset))}`,e.block,e.label,`${e.route}${e.discovery?' / round '+e.discovery.round:e.operation?' / '+e.operation:''}`,e.source||'—'])tr.append(el('td',value));tbody.append(tr);}
   table.append(tbody);body.append(table);panel.append(body);host.append(panel);
 }
 function renderMetadata(row,recording) {

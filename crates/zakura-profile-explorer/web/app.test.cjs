@@ -142,3 +142,16 @@ test('shared proof rows preserve missing timing and fallback evidence',()=>{
   assert.equal(rows[0].fallback,true);
   assert.equal(rows[0].status,'abandoned');
 });
+
+test('sync queries retain later outcomes and do not imply unconsumed results are network waits',()=>{
+  const rows=JSON.parse(JSON.stringify(context.dependencyRows({summary:{start_us:100},dependencies:{
+    events:[{at_us:90,phase:'inventory_sync_response',route:'legacy_peer'}],
+    discovery_rounds:[{round:42,events:[{at_us:900,phase:'sync_response_handled',route:'sync',discovery:{round:42,request:1,pending:2,hashes:65}}]}],
+  }})));
+  assert.equal(rows[0].label,'Inventory used as sync response');
+  assert.equal(rows[1].block,'Sync round 42');
+  assert.equal(rows[1].offset,800);
+  assert.match(rows[1].label,/query 2/);
+  assert.match(rows[1].label,/2 query results still to consume/);
+  assert.match(rows[1].label,/only first 64 recorded/);
+});

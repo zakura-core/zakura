@@ -264,3 +264,31 @@ The waterfall has no per-stage CPU links. The block-level flame graph remains av
 Membership capture is limited to 1,024 profiled requests per batch, in addition to existing per-block span limits. Truncation is marked partial. Failed preparation marks membership partial, individual fallback executions are labeled as retries, and worker panics mark execution incomplete. Cache hits bypass the batch and do not create execution rows. This records combined proof and signature validation, not separate costs for each proof.
 
 The dedicated profiling service uses 2,000 Hz after a five-minute operational canary with no reported sample loss, omissions, decode errors, or restarts. The sampler CLI default remains 999 Hz. Both sampler and collector must support 2,000 Hz before increasing the live rate. Compare capture loss, omitted samples, decoder lag, cgroup CPU and memory pressure against 999 Hz. A different set of live blocks cannot establish zero timing overhead. Keep the node running during a rate change and restart only the sampler. To restore the previous rate, set `--frequency 999` in the service and restart it.
+
+## Sync discovery diagnostics
+
+New arrival panels distinguish decoded block inventory from its actual handling:
+consumed as a `FindBlocks` response, routed to gossip, or ignored as multiple-block
+or mixed inventory. Historical `peer_announcement` entries only establish that a
+block hash was decoded, not that gossip accepted it.
+
+Legacy obtain-tips rounds now record each local query's readiness wait, submission,
+completion, timeout/failure, and consumption by the round. Hash decisions distinguish
+accepted candidates, known prefixes, already-known lists, duplicate/known-suffix
+rejections, oversized responses, and the trailing-hash compatibility rule. The round
+also records when all query results were consumed and when its combined list was
+submitted to download admission. Early returns and cancellation remain explicit.
+This observes the existing wait-for-all behavior without changing it.
+
+The explorer links rounds only through hashes explicitly recorded for the block or
+its parent. It includes later round completion, even after block verification ends.
+Query numbers identify local requests, not remote peers. Remaining-result counts
+include completed results not yet consumed by the round. Transport records do not
+carry these query numbers, so a peer must not be inferred from a slot number.
+
+At most 64 hashes are recorded per decision list, with the original list length
+included. Existing 256-events-per-second admission, queue, disk, and oldest-first
+retention limits apply. The panel reads at most eight linked rounds and 128
+round-wide events per round. Missing events remain inconclusive. No addresses,
+response payloads, or error strings are retained. Upgrade collector and viewer before
+starting the instrumented node; old records decode without the optional context.

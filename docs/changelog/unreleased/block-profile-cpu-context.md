@@ -5,3 +5,5 @@
 Show shared proof worker execution once with its participating transactions. Remove per-stage CPU links and retain the block-level flame graph.
 
 Support a 2,000 Hz CPU sampling trial while preserving recorded CPU-period weights.
+
+The internal explorer now distinguishes inventory handling and links parent waits to bounded sync-query outcomes and hash decisions, including round completion after a block finishes. Download and verification scheduling are unchanged.

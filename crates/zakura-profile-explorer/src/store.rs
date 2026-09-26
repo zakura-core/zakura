@@ -846,7 +846,7 @@ impl Reader {
             .optional()?;
         // Bound both reads. Missing records never establish that a peer did not announce a block.
         let milestones = |hash: &str| -> Result<Vec<Value>> {
-            let records: Vec<String> = self.db.prepare("SELECT payload FROM lifecycle WHERE run=? AND hash=? AND at_us<=? ORDER BY at_us DESC,id DESC LIMIT 513")?
+            let records: Vec<String> = self.db.prepare("SELECT payload FROM lifecycle WHERE run=? AND hash=? AND at_us<=? AND (hash!='0000000000000000000000000000000000000000000000000000000000000000' OR json_extract(payload,'$.discovery') IS NULL) ORDER BY at_us DESC,id DESC LIMIT 513")?
                 .query_map(params![run,hash,integer(summary["end_us"].as_u64().unwrap_or(u64::MAX >> 1))?],|r|r.get(0))?.collect::<rusqlite::Result<_>>()?;
             records
                 .into_iter()
@@ -892,7 +892,25 @@ impl Reader {
             [run],
             |r| r.get(0),
         )?;
-        let dependencies = json!({"parent_hash":parent_hash,"parent_attempt":parent_attempt,"events":ingress,"parent_events":parent_ingress,"source_activity":source_activity,"recording_has_loss":recording_loss,"best_effort":true});
+        // Link only rounds that explicitly mentioned this block or its parent. Their
+        // completion can follow the block response, so do not clip to the block window.
+        let rounds: BTreeSet<u64> = ingress
+            .iter()
+            .chain(parent_ingress.iter())
+            .filter_map(|event| event["discovery"]["round"].as_u64())
+            .collect();
+        let discovery_limited = rounds.len() > 8;
+        let mut discovery_rounds = Vec::new();
+        for round in rounds.iter().rev().take(8) {
+            let mut events: Vec<Value> = self.db.prepare(
+                "SELECT payload FROM lifecycle WHERE run=? AND json_extract(payload,'$.discovery.round')=? AND hash=? ORDER BY at_us,id LIMIT 129"
+            )?.query_map(params![run, integer(*round)?, "00".repeat(32)], |r| r.get::<_, String>(0))?
+                .map(|row| Ok(serde_json::from_str(&row?)?)).collect::<Result<_>>()?;
+            let limited = events.len() > 128;
+            events.truncate(128);
+            discovery_rounds.push(json!({"round":round,"events":events,"limited":limited}));
+        }
+        let dependencies = json!({"parent_hash":parent_hash,"parent_attempt":parent_attempt,"events":ingress,"parent_events":parent_ingress,"source_activity":source_activity,"recording_has_loss":recording_loss,"best_effort":true,"discovery_rounds":discovery_rounds,"discovery_limited":discovery_limited});
         let files: Vec<String> = self.db.prepare("SELECT chunk FROM details JOIN chunks ON chunk=id WHERE run=? AND attempt=? AND deleting=0 LIMIT 65")?.query_map(params![run,integer(attempt)?], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
         ensure!(
             files.len() <= MAX_DETAIL_CHUNKS,

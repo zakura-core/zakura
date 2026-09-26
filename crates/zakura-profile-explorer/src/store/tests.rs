@@ -1273,6 +1273,7 @@ fn ingress_correlates_parent_without_changing_block_timing() -> Result<()> {
                 route: Route::Gossip,
                 phase: Phase::BodyReceived,
                 at_us: 50,
+                discovery: None,
             }),
         ))?;
     }
@@ -1340,6 +1341,7 @@ fn parent_source_context_identifies_another_block_holding_the_slot() -> Result<(
                 route: Route::Gossip,
                 phase,
                 at_us: 50 + seq,
+                discovery: None,
             }),
         ))?;
     }
@@ -1444,5 +1446,56 @@ fn shared_membership_survives_restart_without_extending_block_time() -> Result<(
     assert_eq!(data["spans"][0]["verification"]["primary_batch"], 7);
     assert_eq!(data["spans"][0]["transaction_index"], 0);
     assert_eq!(data["complete"], true);
+    Ok(())
+}
+
+#[test]
+fn discovery_links_only_related_rounds_and_keeps_late_completion() -> Result<()> {
+    use profiles::lifecycle::{DiscoveryInfo, Phase, Record, Route};
+    let temp = tempfile::tempdir()?;
+    let mut store = Store::open(temp.path(), 16_000_000)?;
+    store.ingest(metadata())?;
+    // A child whose parent is a real, nonzero hash, not the round-event sentinel.
+    let mut done = finish();
+    if let Event::Finish { block, .. } = &mut done {
+        block.parent = [2; 32];
+    }
+    store.ingest(event(1, done))?;
+    for (seq, round, hash, phase, at_us) in [
+        (2, 10, [2; 32], Phase::SyncHashAccepted, 50),
+        (3, 10, [0; 32], Phase::SyncRequestTimeout, 900_000),
+        (4, 11, [3; 32], Phase::SyncHashAccepted, 50),
+        (5, 11, [0; 32], Phase::SyncRequestTimeout, 900_000),
+    ] {
+        store.ingest(event(
+            seq,
+            Event::Lifecycle(Record {
+                hash,
+                operation: round,
+                source: None,
+                route: Route::Sync,
+                phase,
+                at_us,
+                discovery: Some(DiscoveryInfo {
+                    round,
+                    request: Some(1),
+                    pending: None,
+                    hashes: None,
+                }),
+            }),
+        ))?;
+    }
+    store.flush()?;
+    drop(store);
+    // The additive index/schema update must reopen without discarding history.
+    let _store = Store::open(temp.path(), 16_000_000)?;
+    let data = Reader::open(temp.path())?.detail(RUN, 1)?;
+    assert_eq!(data["timing"]["recorded_elapsed_us"], 700000);
+    let rounds = data["dependencies"]["discovery_rounds"].as_array().unwrap();
+    assert_eq!(rounds.len(), 1);
+    assert_eq!(rounds[0]["round"], 10);
+    assert_eq!(rounds[0]["events"][0]["phase"], "sync_request_timeout");
+    assert_eq!(rounds[0]["events"][0]["at_us"], 900_000);
+    assert_eq!(rounds[0]["events"][0]["discovery"]["request"], 1);
     Ok(())
 }

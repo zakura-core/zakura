@@ -684,6 +684,23 @@ pub(crate) fn exclude_timing(path: &Path, run: &str, attempt: u64, reason: &str)
     Ok(())
 }
 
+/// Hide a reviewed request from the home page without changing its outcome or timing.
+/// This is an operator-only action. Raw profiles and the dismissal reason remain available.
+pub(crate) fn dismiss_request(path: &Path, run: &str, attempt: u64, reason: &str) -> Result<()> {
+    ensure!(valid_id(run) && attempt > 0, "invalid recording");
+    ensure!(
+        !reason.trim().is_empty() && reason.len() <= 500,
+        "reason must be 1 to 500 bytes"
+    );
+    let db =
+        Connection::open_with_flags(path.join("index.sqlite"), OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+    db.busy_timeout(Duration::from_secs(4))?;
+    db.execute_batch("PRAGMA foreign_keys=ON; PRAGMA synchronous=FULL;")?;
+    ensure!(db.query_row("SELECT outcome IS NULL OR outcome IN ('failed','abandoned') FROM attempts WHERE run=? AND attempt=?", params![run,integer(attempt)?], |r| r.get::<_,bool>(0))?, "request is already complete");
+    db.execute("INSERT INTO request_dismissals(run,attempt,reason,created_ms) VALUES(?,?,?,?) ON CONFLICT(run,attempt) DO UPDATE SET reason=excluded.reason,created_ms=excluded.created_ms", params![run,integer(attempt)?,reason.trim(),integer(now_ms())?])?;
+    Ok(())
+}
+
 /// Backfill a proven startup boundary for a legacy run. Existing boundaries cannot be changed.
 pub(crate) fn startup_boundary(path: &Path, run: &str, ready_us: u64) -> Result<()> {
     ensure!(valid_id(run), "invalid run");
@@ -790,7 +807,7 @@ impl Reader {
             0,
         )?;
         let outliers = self.rows(&format!("{COLUMNS} WHERE {timings} AND end_us-start_us>=120000 ORDER BY end_us-start_us DESC LIMIT 20"),run,mode,since)?;
-        let failures = self.rows(&format!("{COLUMNS} WHERE {run_filter} AND mode=?2 AND utc_ms>=?3 AND (outcome IS NULL OR outcome IN ('failed','abandoned')) AND {latest_recording} ORDER BY utc_ms DESC,attempt DESC LIMIT 20"),run,mode,since)?;
+        let failures = self.rows(&format!("{COLUMNS} WHERE {run_filter} AND mode=?2 AND utc_ms>=?3 AND (outcome IS NULL OR outcome IN ('failed','abandoned')) AND NOT EXISTS (SELECT 1 FROM request_dismissals d WHERE d.run=a.run AND d.attempt=a.attempt) AND {latest_recording} ORDER BY utc_ms DESC,attempt DESC LIMIT 20"),run,mode,since)?;
         let counts: Value = self.db.query_row(&format!("SELECT count(*),coalesce(sum(outcome='success'),0),coalesce(sum(expected_spans IS NOT NULL AND expected_spans=received_spans AND dropped=0 AND expired=0),0),min(utc_ms),max(utc_ms) FROM attempts WHERE {run_filter} AND mode=?2 AND utc_ms>=?3"), params![run,mode,integer(since)?], |r| Ok(json!({"captured":r.get::<_,i64>(0)?,"success":r.get::<_,i64>(1)?,"sealed_detail":r.get::<_,i64>(2)?,"first_ms":r.get::<_,Option<i64>>(3)?,"last_ms":r.get::<_,Option<i64>>(4)?})))?;
         let accepted: i64 = self.db.query_row(
             &format!("SELECT count(*) FROM attempts a WHERE {timings}"),
@@ -1076,10 +1093,10 @@ const LATEST_IN_SESSION: &str = "NOT EXISTS (SELECT 1 FROM attempts b WHERE b.ru
 const VALID_TIMING: &str =
     "NOT EXISTS (SELECT 1 FROM timing_exclusions e WHERE e.run=a.run AND e.attempt=a.attempt)";
 const READY_TIMING: &str = "NOT EXISTS (SELECT 1 FROM run_readiness g WHERE g.run=a.run AND (g.ready_us IS NULL OR a.start_us IS NULL OR a.start_us<g.ready_us))";
-const COLUMNS: &str = "SELECT run,attempt,hash,height,mode,transactions,start_us,end_us,utc_ms,outcome,dropped,expected_spans,received_spans,expired,(SELECT reason FROM timing_exclusions e WHERE e.run=a.run AND e.attempt=a.attempt),EXISTS(SELECT 1 FROM run_readiness g WHERE g.run=a.run AND (g.ready_us IS NULL OR a.start_us IS NULL OR a.start_us<g.ready_us)) FROM attempts a";
+const COLUMNS: &str = "SELECT run,attempt,hash,height,mode,transactions,start_us,end_us,utc_ms,outcome,dropped,expected_spans,received_spans,expired,(SELECT reason FROM timing_exclusions e WHERE e.run=a.run AND e.attempt=a.attempt),EXISTS(SELECT 1 FROM run_readiness g WHERE g.run=a.run AND (g.ready_us IS NULL OR a.start_us IS NULL OR a.start_us<g.ready_us)),(SELECT reason FROM request_dismissals d WHERE d.run=a.run AND d.attempt=a.attempt) FROM attempts a";
 fn row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Value> {
     Ok(
-        json!({"run":r.get::<_,String>(0)?,"attempt":r.get::<_,i64>(1)?,"hash":r.get::<_,Option<String>>(2)?,"height":r.get::<_,Option<u32>>(3)?,"mode":r.get::<_,Option<String>>(4)?,"transactions":r.get::<_,Option<u32>>(5)?,"start_us":r.get::<_,Option<i64>>(6)?,"end_us":r.get::<_,Option<i64>>(7)?,"utc_ms":r.get::<_,Option<i64>>(8)?,"outcome":r.get::<_,Option<String>>(9)?,"dropped":r.get::<_,i64>(10)?,"expected_spans":r.get::<_,Option<i64>>(11)?,"received_spans":r.get::<_,i64>(12)?,"expired":r.get::<_,bool>(13)?,"exclusion_reason":r.get::<_,Option<String>>(14)?,"startup":r.get::<_,bool>(15)?}),
+        json!({"run":r.get::<_,String>(0)?,"attempt":r.get::<_,i64>(1)?,"hash":r.get::<_,Option<String>>(2)?,"height":r.get::<_,Option<u32>>(3)?,"mode":r.get::<_,Option<String>>(4)?,"transactions":r.get::<_,Option<u32>>(5)?,"start_us":r.get::<_,Option<i64>>(6)?,"end_us":r.get::<_,Option<i64>>(7)?,"utc_ms":r.get::<_,Option<i64>>(8)?,"outcome":r.get::<_,Option<String>>(9)?,"dropped":r.get::<_,i64>(10)?,"expected_spans":r.get::<_,Option<i64>>(11)?,"received_spans":r.get::<_,i64>(12)?,"expired":r.get::<_,bool>(13)?,"exclusion_reason":r.get::<_,Option<String>>(14)?,"startup":r.get::<_,bool>(15)?,"dismissal_reason":r.get::<_,Option<String>>(16)?}),
     )
 }
 

@@ -90,3 +90,10 @@ END;
 -- Round-only milestones can arrive after the block finishes; keep lookups indexed.
 CREATE INDEX IF NOT EXISTS lifecycle_discovery_round
  ON lifecycle(run,json_extract(payload,'$.discovery.round'),hash,at_us);
+
+-- Operator dismissals retain the raw recording and never fabricate a caller result.
+CREATE TABLE IF NOT EXISTS request_dismissals (
+ run TEXT NOT NULL, attempt INTEGER NOT NULL, reason TEXT NOT NULL, created_ms INTEGER NOT NULL,
+ PRIMARY KEY(run,attempt),
+ FOREIGN KEY(run,attempt) REFERENCES attempts(run,attempt) ON DELETE CASCADE
+);

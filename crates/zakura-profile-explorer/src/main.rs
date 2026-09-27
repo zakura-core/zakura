@@ -59,6 +59,17 @@ enum Command {
         #[arg(long)]
         reason: String,
     },
+    /// Dismiss a reviewed failed or incomplete profile from the home page, preserving evidence.
+    Dismiss {
+        #[arg(long)]
+        store: PathBuf,
+        #[arg(long)]
+        run: String,
+        #[arg(long)]
+        attempt: u64,
+        #[arg(long)]
+        reason: String,
+    },
     /// Backfill a proven startup boundary for a recording made before automatic readiness.
     StartupBoundary {
         #[arg(long)]
@@ -124,6 +135,12 @@ async fn main() -> Result<()> {
             attempt,
             reason,
         } => store::exclude_timing(&store, &run, attempt, &reason),
+        Command::Dismiss {
+            store,
+            run,
+            attempt,
+            reason,
+        } => store::dismiss_request(&store, &run, attempt, &reason),
         Command::StartupBoundary {
             store,
             run,

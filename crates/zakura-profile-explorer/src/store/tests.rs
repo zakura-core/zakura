@@ -1499,3 +1499,109 @@ fn discovery_links_only_related_rounds_and_keeps_late_completion() -> Result<()>
     assert_eq!(rounds[0]["events"][0]["discovery"]["request"], 1);
     Ok(())
 }
+
+#[test]
+fn replay_recovers_completion_without_duplicating_detail() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let mut store = Store::open(temp.path(), 16_000_000)?;
+    store.ingest(metadata())?;
+    store.ingest(event(
+        1,
+        Event::Start {
+            attempt: 1,
+            start_us: 100,
+            block: block(),
+        },
+    ))?;
+    store.ingest(event(2, span()))?;
+    store.flush()?;
+    drop(store);
+    let mut store = Store::open(temp.path(), 16_000_000)?;
+    assert_eq!(
+        Reader::open(temp.path())?.home(Some(RUN), "semantic")?["failures"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    // Original completion datagrams 3 and 4 never reached durable storage.
+    for sequence in [5, 7] {
+        store.ingest(event(sequence, finish()))?;
+        store.ingest(event(
+            sequence + 1,
+            Event::Seal {
+                attempt: 1,
+                spans: 1,
+                dropped: 0,
+            },
+        ))?;
+    }
+    let home = Reader::open(temp.path())?.home(Some(RUN), "semantic")?;
+    assert_eq!(home["failures"], json!([]));
+    assert_eq!(home["latest"].as_array().unwrap().len(), 1);
+    assert_eq!(home["latest"][0]["end_us"], 700100);
+    assert_eq!(home["latest"][0]["received_spans"], 1);
+    assert_eq!(home["latest"][0]["expected_spans"], 1);
+    Ok(())
+}
+
+#[test]
+fn dismissed_incomplete_profile_keeps_evidence_and_other_failures() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let mut store = Store::open(temp.path(), 16_000_000)?;
+    store.ingest(metadata())?;
+    store.ingest(event(
+        1,
+        Event::Start {
+            attempt: 1,
+            start_us: 100,
+            block: block(),
+        },
+    ))?;
+    let mut other = block();
+    other.hash = [2; 32];
+    store.ingest(event(
+        2,
+        Event::Finish {
+            attempt: 2,
+            start_us: 200,
+            end_us: 300,
+            block: other,
+            outcome: Outcome::Failed,
+            dropped: 0,
+        },
+    ))?;
+    assert!(dismiss_request(temp.path(), RUN, 1, " ").is_err());
+    assert!(dismiss_request(temp.path(), RUN, 99, "test").is_err());
+    dismiss_request(
+        temp.path(),
+        RUN,
+        1,
+        "Hash confirmed on accepted chain. Completion result missing.",
+    )?;
+    let reader = Reader::open(temp.path())?;
+    let home = reader.home(Some(RUN), "semantic")?;
+    assert_eq!(home["failures"].as_array().unwrap().len(), 1);
+    assert_eq!(home["failures"][0]["attempt"], 2);
+    let raw: Value = store.db.query_row(
+        &format!("{COLUMNS} WHERE a.run=? AND a.attempt=?"),
+        params![RUN, 1],
+        row,
+    )?;
+    assert!(raw["outcome"].is_null());
+    assert!(raw["end_us"].is_null());
+    assert!(raw["dismissal_reason"]
+        .as_str()
+        .unwrap()
+        .contains("accepted chain"));
+    store.ingest(event(3, finish()))?;
+    assert!(dismiss_request(temp.path(), RUN, 1, "test").is_err());
+    assert_eq!(
+        Reader::open(temp.path())?.home(Some(RUN), "semantic")?["latest"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    Ok(())
+}

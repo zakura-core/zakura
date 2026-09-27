@@ -40,10 +40,10 @@ function note(message) { $('notice').textContent = message; $('notice').hidden =
 function quality(row) {
   if (row.exclusion_reason) return 'Timing excluded';
   if (row.startup) return 'Startup';
-  if (!row.outcome) return 'Unfinished';
+  if (!row.outcome) return 'Profile incomplete';
   if (row.expired) return 'Detail expired';
   if (row.dropped) return `Truncated · ${number(row.dropped)} omitted`;
-  if (row.expected_spans == null) return row.outcome ? 'Detail not sealed' : 'Unfinished';
+  if (row.expected_spans == null) return row.outcome ? 'Detail not sealed' : 'Profile incomplete';
   if (row.received_spans !== row.expected_spans) return 'Detail missing';
   if (row.expected_spans === 0) return 'Root timing only';
   return 'Recorded spans complete';
@@ -58,7 +58,7 @@ function table(target, rows) {
     const tr = el('tr'), link = el('a',row.height == null ? 'Unknown height' : number(row.height)); link.href = blockUrl(row,target==='results')+cpuSuffix;
     const first = el('td'); first.append(link); tr.append(first);
     const duration = row.end_us == null ? null : row.end_us-row.start_us;
-    tr.append(el('td',row.hash ? `${row.hash.slice(0,12)}…` : '—','hash'),el('td', row.utc_ms ? new Date(row.utc_ms).toLocaleString() : 'Unknown'),el('td',number(row.transactions)),el('td',row.exclusion_reason ? 'Excluded' : duration == null ? 'Pending' : ms(duration),duration >= 120000 ? 'slow' : ''),el('td',quality(row)));
+    tr.append(el('td',row.hash ? `${row.hash.slice(0,12)}…` : '—','hash'),el('td', row.utc_ms ? new Date(row.utc_ms).toLocaleString() : 'Unknown'),el('td',number(row.transactions)),el('td',row.exclusion_reason ? 'Excluded' : duration == null ? 'Not recorded' : ms(duration),duration >= 120000 ? 'slow' : ''),el('td',quality(row)));
     body.append(tr);
   }
   t.append(body);wrap.append(t);host.append(wrap);
@@ -190,11 +190,12 @@ function renderMetadata(row,recording) {
   $('detail-base').replaceChildren(el('span','Main base · '),commitLink(recording.source?.base_commit,true));
   const retention=/^Pruned\(PruningConfig \{ tx_retention: (\d+) \}\)$/.exec(recording.storage);
   const storage=retention ? `Pruned · transaction data retained for ${number(retention[1])} blocks` : recording.storage;
-  const outcome=row.outcome || 'unfinished';
+  const outcome=row.outcome || 'not recorded';
   const fields=[
     ['Block hash',row.hash || 'Unknown',true,true],
     ['Result',outcome[0].toUpperCase()+outcome.slice(1)],
     ['Timing detail',quality(row)],
+    ...(row.dismissal_reason ? [['Review note',row.dismissal_reason]] : []),
     ['Network',recording.network],
     ['Storage',storage],
     ['Recorded',new Date(row.utc_ms).toLocaleString(undefined,{dateStyle:'medium',timeStyle:'long'})],

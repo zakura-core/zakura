@@ -1023,6 +1023,42 @@ fn send_frame(
     }
 }
 
+/// Exporter-only recovery cache. Replays never enter the node's producer queues.
+#[cfg(unix)]
+#[derive(Default)]
+struct CompletionReplay {
+    events: std::collections::VecDeque<Event>,
+    cursor: usize,
+}
+
+#[cfg(unix)]
+impl CompletionReplay {
+    // About 256 completed blocks. Memory and replay traffic remain bounded during outages.
+    const CAPACITY: usize = 512;
+    const INTERVAL: Duration = Duration::from_millis(50);
+
+    fn retain(&mut self, event: Event) {
+        if !matches!(event, Event::Finish { .. } | Event::Seal { .. }) {
+            return;
+        }
+        if self.events.len() == Self::CAPACITY {
+            self.events.pop_front();
+            self.cursor = self.cursor.saturating_sub(1);
+        }
+        self.events.push_back(event);
+    }
+
+    fn next(&mut self) -> Option<Event> {
+        if self.events.is_empty() {
+            return None;
+        }
+        self.cursor %= self.events.len();
+        let event = self.events[self.cursor];
+        self.cursor = (self.cursor + 1) % self.events.len();
+        Some(event)
+    }
+}
+
 #[cfg(unix)]
 fn export(
     path: PathBuf,
@@ -1051,6 +1087,8 @@ fn export(
         result
     };
     let mut stopping = None;
+    let mut completions = CompletionReplay::default();
+    let mut replayed = Instant::now();
     loop {
         if recorder.stopped.load(Ordering::Acquire) {
             let since = stopping.get_or_insert_with(Instant::now);
@@ -1086,6 +1124,7 @@ fn export(
             let Ok(data) = event else {
                 break;
             };
+            completions.retain(data);
             sequence = sequence.saturating_add(1);
             if connected {
                 send(&Frame::Event {
@@ -1097,6 +1136,20 @@ fn export(
             } else {
                 transport_dropped.set(transport_dropped.get().saturating_add(1));
             }
+        }
+        if connected && stopping.is_none() && replayed.elapsed() >= CompletionReplay::INTERVAL {
+            if let Some(data) = completions.next() {
+                // A successful socket send is not a durable collector acknowledgement.
+                // Use a new sequence so a lost or rolled-back completion can be repaired.
+                sequence = sequence.saturating_add(1);
+                send(&Frame::Event {
+                    schema: SCHEMA_VERSION,
+                    run_id: run.id.clone(),
+                    sequence,
+                    data,
+                });
+            }
+            replayed = Instant::now();
         }
         std::thread::sleep(Duration::from_millis(2));
     }

@@ -422,7 +422,7 @@ mod transport {
         let mut sequence = 0;
         let mut spans = std::collections::BTreeSet::new();
         let deadline = Instant::now() + Duration::from_secs(5);
-        while sequence < u64::try_from(SPANS + 3).unwrap() {
+        while spans.len() < SPANS {
             assert!(Instant::now() < deadline, "exporter must drain the burst");
             let n = socket.recv(&mut bytes).unwrap();
             match serde_json::from_slice::<Frame>(&bytes[..n]).unwrap() {
@@ -446,6 +446,98 @@ mod transport {
         assert_eq!(spans, (1..=u64::try_from(SPANS).unwrap()).collect());
         drop(runtime);
         worker.join().unwrap();
+    }
+
+    #[test]
+    fn completion_recovers_after_collector_discards_delivered_messages() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("collector.sock");
+        let first = UnixDatagram::bind(&path).unwrap();
+        first
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let (recorder, detail, summary) = recorder();
+        let runtime = Runtime {
+            recorder: recorder.clone(),
+        };
+        begin_with(&recorder, block())
+            .unwrap()
+            .finish(Outcome::Success);
+        let worker_path = path.clone();
+        let worker =
+            std::thread::spawn(move || export(worker_path, run(), recorder, detail, summary));
+        let mut bytes = [0; 8193];
+        // Simulate receiving the completion, then crashing before saving it.
+        loop {
+            let n = first.recv(&mut bytes).unwrap();
+            if matches!(
+                serde_json::from_slice::<Frame>(&bytes[..n]).unwrap(),
+                Frame::Event {
+                    data: Event::Seal { .. },
+                    ..
+                }
+            ) {
+                break;
+            }
+        }
+        drop(first);
+        std::fs::remove_file(&path).unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        let second = UnixDatagram::bind(&path).unwrap();
+        second
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let (mut metadata, mut finish, mut seal) = (false, false, false);
+        while !(metadata && finish && seal) {
+            assert!(
+                Instant::now() < deadline,
+                "completion must recover without another block"
+            );
+            let n = second.recv(&mut bytes).unwrap();
+            match serde_json::from_slice::<Frame>(&bytes[..n]).unwrap() {
+                Frame::Run { .. } => metadata = true,
+                Frame::Event {
+                    data:
+                        Event::Finish {
+                            outcome: Outcome::Success,
+                            ..
+                        },
+                    ..
+                } if metadata => finish = true,
+                Frame::Event {
+                    data: Event::Seal { .. },
+                    ..
+                } if metadata => seal = true,
+                _ => {}
+            }
+        }
+        drop(runtime);
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn completion_replay_is_bounded_and_excludes_detail() {
+        let mut cache = CompletionReplay::default();
+        for attempt in 0..=u64::try_from(CompletionReplay::CAPACITY).unwrap() {
+            cache.retain(Event::Seal {
+                attempt,
+                spans: 1,
+                dropped: 0,
+            });
+        }
+        cache.retain(Event::Start {
+            attempt: 9999,
+            start_us: 0,
+            block: block(),
+        });
+        assert_eq!(cache.events.len(), CompletionReplay::CAPACITY);
+        for attempt in 1..=u64::try_from(CompletionReplay::CAPACITY).unwrap() {
+            assert!(
+                matches!(cache.next(), Some(Event::Seal { attempt: actual, .. }) if actual == attempt)
+            );
+        }
+        assert!(matches!(cache.next(), Some(Event::Seal { attempt: 1, .. })));
     }
 
     fn fill_socket(socket: &UnixDatagram, path: &std::path::Path) {

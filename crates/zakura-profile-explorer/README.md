@@ -23,3 +23,21 @@ python3 scripts/block-profile-smoke.py
 ```
 
 The smoke test checks real datagram transport, latest/outlier queries, detail after the caller response, exports, collector crash recovery, and socket ownership using synthetic blocks. Linux overhead, real perf output, and near-capacity retention need a dedicated canary before broader use.
+
+
+### Completion recovery
+
+The node exporter retains the latest 512 Finish/Seal events in memory and replays
+one every 50ms while the collector is reachable. Replays have fresh sequence IDs
+and update the same attempt without duplicating spans or changing its measured
+end time. This repairs transient transport loss and collector restarts, including
+messages received before a collector transaction was saved. The cache lives only
+in the exporter. Block verification never waits for collection. Recovery remains
+bounded: node restarts, producer queue overflow, and events evicted during a long
+outage can still leave an incomplete profile. Detailed spans are not replayed.
+
+A missing result is shown as an incomplete profile, not proof of a failed block.
+After independently checking an entry, an operator can remove it from the home
+page with `zakura-profile-explorer dismiss --store PATH --run RUN --attempt ID
+--reason REASON`. The command retains the raw profile and review note, and never
+invents a completion time. It is not exposed through the public HTTP service.

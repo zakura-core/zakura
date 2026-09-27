@@ -323,6 +323,17 @@ pub const MAX_ADDRS_IN_MESSAGE: usize = 1000;
 /// in a single `GetAddr` response.
 pub const ADDR_RESPONSE_LIMIT_DENOMINATOR: usize = 2;
 
+/// The largest fraction of a `GetAddr` response that can be addresses of peers
+/// that do not advertise `NODE_NETWORK`, such as pruned nodes.
+///
+/// Each response contains at most
+/// `response_len.div_ceil(PRUNED_ADDR_RESPONSE_SHARE_DENOMINATOR)` such addresses.
+///
+/// Many peers treat every gossiped address as a candidate full node. Bounding
+/// this share keeps pruned nodes discoverable without letting them crowd full
+/// nodes out of those peers' outbound connections.
+pub const PRUNED_ADDR_RESPONSE_SHARE_DENOMINATOR: usize = 4;
+
 /// The address book capacity as a multiple of the address message limit.
 const ADDRESS_BOOK_CAPACITY_MULTIPLIER: usize = 5;
 

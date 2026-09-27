@@ -6,7 +6,7 @@
 //! and advertises them to peers. Draining from the mempool service lets the task
 //! recover the IDs behind any wakeups dropped by a lagged channel.
 
-use std::collections::HashSet;
+use std::{collections::HashSet, time::Duration};
 
 use tokio::sync::broadcast::{
     self,
@@ -20,10 +20,19 @@ use zakura_chain::transaction::UnminedTxId;
 use zakura_network as zn;
 use zakura_node_services::mempool::{MempoolChange, Request, Response};
 
-use crate::{
-    components::sync::{PEER_GOSSIP_DELAY, TIPS_RESPONSE_TIMEOUT},
-    BoxError,
-};
+use crate::{components::sync::TIPS_RESPONSE_TIMEOUT, BoxError};
+
+/// Controls how long we wait between gossiping successive batches of transaction IDs.
+///
+/// Block gossip has no delay, so this delay only applies to transactions. It is a third of
+/// Zcash's historical 7 second gossip delay, matching the 25 second block spacing in ZIP 218.
+///
+/// ## Correctness
+///
+/// If this delay is set too high, transactions won't propagate through the network efficiently.
+///
+/// If this delay is set too low, the peer set and remote peers can get overloaded.
+pub const TRANSACTION_GOSSIP_DELAY: Duration = Duration::from_secs(2);
 
 /// The maximum number of channel messages we will combine into a single peer broadcast.
 pub const MAX_CHANGES_BEFORE_SEND: usize = 10;
@@ -137,11 +146,8 @@ where
         // drain again after the delay instead of waiting for another wakeup.
         drain_pending_without_wakeup = advertised_count == MAX_TX_INV_IN_SENT_MESSAGE;
 
-        // wait for at least the network timeout between gossips
-        //
-        // in practice, transactions arrive every 1-20 seconds,
-        // so waiting 6 seconds can delay transaction propagation, in order to reduce peer load
-        tokio::time::sleep(PEER_GOSSIP_DELAY).await;
+        // Waiting between batches can delay transaction propagation, in order to reduce peer load.
+        tokio::time::sleep(TRANSACTION_GOSSIP_DELAY).await;
     }
 }
 
@@ -462,7 +468,7 @@ mod tests {
             "first recovery cycle should be bounded to one inv-sized batch",
         );
 
-        tokio::time::advance(PEER_GOSSIP_DELAY).await;
+        tokio::time::advance(TRANSACTION_GOSSIP_DELAY).await;
 
         assert_eq!(
             limit_receiver

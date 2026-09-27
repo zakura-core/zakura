@@ -67,6 +67,7 @@ pub const NODE_ID_ENV: &str = "ZEBRA_NODE_ID";
 pub const RUNTIME_ENV_VARS: &[&str] = &[
     NODE_ID_ENV,
     "ZAKURA_TRACE_FILE_BYTES",
+    "ZAKURA_TRACE_FILE_SEGMENTS",
     "ZAKURA_TRACE_CAPTURE_RUN",
 ];
 
@@ -560,7 +561,12 @@ impl Default for JsonlTraceConfig {
 }
 
 impl JsonlTraceConfig {
-    /// Return defaults with the controller-provided CSV limit, when valid.
+    /// Return defaults with the controller-provided CSV limits, when valid.
+    ///
+    /// `ZAKURA_TRACE_FILE_SEGMENTS=0` stops the writer from rotating. An
+    /// external rotator can then rename the current file while it holds the
+    /// directory's `.trace.lock`. The writer creates a new file with a header
+    /// on its next append.
     pub fn from_environment() -> Self {
         let mut config = Self::default();
         if let Ok(value) = std::env::var("ZAKURA_TRACE_FILE_BYTES") {
@@ -568,6 +574,11 @@ impl JsonlTraceConfig {
                 if bytes > 0 {
                     config.csv_rotation_bytes = bytes;
                 }
+            }
+        }
+        if let Ok(value) = std::env::var("ZAKURA_TRACE_FILE_SEGMENTS") {
+            if let Ok(segments) = value.parse::<usize>() {
+                config.csv_rotation_segments = segments;
             }
         }
         if let Ok(run_id) = std::env::var("ZAKURA_TRACE_CAPTURE_RUN") {

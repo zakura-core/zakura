@@ -38,6 +38,36 @@ v2 stack.
 The same commit may be tested repeatedly. That is intentional: the fleet is a
 continuous sync canary, not a once-per-SHA CI job.
 
+For Zakura and dual-stack nodes, the controller distinguishes an idle chain from
+a stalled node. It compares the exact committed block height with the exact
+local header-chain height. A header height at or below the committed height
+means that the node has no local header backlog, so a long Mainnet block
+interval does not start the stall deadline. A higher header height starts the
+deadline because the node has a local backlog that it can process. New
+committed progress restarts the deadline.
+
+A dual-stack node that hands block sync to legacy fallback stops the run
+immediately, naming the handoff as the reason. The canary exists to catch v2
+stalls before legacy masks them, so an active fallback is the failure it is
+looking for, not a recovery window to wait out. Measuring legacy progress after
+the handoff would report a healthy node while the v2 stack stayed stalled.
+
+The controller records a metrics error or missing exact height as unavailable
+status evidence. It does not classify that sample as a sync stall. Continuous
+status unavailability has its own deadline and failure reason. Wall-clock tip
+estimates remain available for diagnostics, but they do not supply stall
+evidence.
+
+The legacy-only node does not run the Zakura header chain. It retains its
+1800-second height-only deadline. The cluster monitor independently requires a
+healthy peer with an exact committed height to advance before it reports a local
+sync stall. The stall timer starts when the monitor first observes that peer
+advance ahead of the local node. Local progress or loss of peer evidence resets
+the timer, so an idle block gap does not count toward the deadline.
+It never uses a wall-clock estimate as peer evidence. That peer
+evidence covers a header-sync failure where the local node never learns the
+newer header.
+
 ## Failure Semantics
 
 Build, install, cleanup, startup, sync, stall, timeout, metrics, and readiness
@@ -365,6 +395,58 @@ The relevant loopback endpoints are only bound locally:
 - readiness: `http://127.0.0.1:8080/ready`
 - liveness: `http://127.0.0.1:8080/healthy`
 
+## Retained sync data
+
+Native runs build with the opt-in `sync-metrics` feature when the selected ref
+supports it. This enables completion-based commit-byte accounting and corrects
+the commit rates in detailed traces. Commit rates accumulate at least one second
+of activity between samples instead of resetting on each queue update.
+Normal builds omit that instrumentation.
+The existing `commit-metrics` feature controls separate state timing histograms.
+Build-cache metadata records the selected features so a default binary cannot
+silently replace an instrumented binary at the same commit.
+
+Committed bytes are counted once per successful native submission, even when a
+chain-frontier update removes its applying entry before the callback arrives.
+Duplicates and failed submissions do not count. The counter uses the wire size
+already retained for the submission, without reserializing blocks or reading the
+database. It measures block payload rather than physical disk writes. Without
+`sync-metrics`, the commit-byte counter is absent rather than a misleading zero.
+
+Dual (mixed) and Zakura-only runs add these fields to their existing
+`/var/log/zakura/runs/<run-id>/samples.jsonl`, at a 10-second polling interval
+plus the time spent checking status. Their `poll_interval_seconds` overrides live
+in `nodes.toml`. Readiness confirmation uses its separate 30-second interval.
+The adjacent `run.json` identifies
+the run, binary commit, networking mode, and start/completion times.
+
+| Sample field | Meaning |
+| --- | --- |
+| `elapsed_seconds` | Monotonic seconds since completion polling started. Use differences between samples to calculate rates. |
+| `zcash_chain_verified_block_height` | Committed block height for assigning chain regions. |
+| `sync.block.applying.unsubmitted` | Apply queue depth: downloaded, ordered blocks waiting to enter verification. |
+| `sync.block.payload.received.bytes`, `sync.block.payload.committed.bytes` | Cumulative downloaded and successfully committed Zakura block-sync payload bytes. Download bytes can include retries and exclude transport overhead. |
+| `state.vct.fast.block.count`, `state.vct.legacy.block.count` | Fast-path and fallback tree updates within the native run. |
+| `sync.report.sapling.height`, `sync.report.ironwood.height`, `sync.report.checkpoint.height` | Effective phase boundaries and checkpoint limit from the running binary. |
+
+For download or commit MB/s, divide the byte-counter increase by the increase in
+`elapsed_seconds`, then by 1,000,000. Missing metrics are omitted, including when
+an older binary does not expose them. Leave gaps for missing samples, counter
+resets, or unusually long sampling intervals. For region shading, the
+initial Sandblast window is heights 1,707,211–2,000,000 inclusive.
+
+Copy a run's data to generate charts, replacing `HOST` and `RUN_ID`:
+
+```bash
+scp root@HOST:/var/log/zakura/runs/RUN_ID/run.json .
+scp root@HOST:/var/log/zakura/runs/RUN_ID/samples.jsonl .
+```
+
+The samples use the existing run retention described below and survive detailed
+trace rotation. Collection adds no chart generation or Slack delivery step.
+Legacy keeps its existing samples. Ordinary nodes expose the added counters and
+queue gauge through their existing metrics endpoint, which is disabled by default.
+
 ## Retention
 
 Detailed traces stay enabled so a failure can be investigated without reproducing
@@ -373,16 +455,26 @@ successful runs first, oldest first. The current run and the most recent failed
 run are protected, including their traces, metadata, samples, and log tail.
 Protected runs may exceed the target; cleanup never discards them to meet it.
 
-The trace writer rotates each CSV table at 128 MiB and keeps two older segments.
-The deployment sets the limit through `ZAKURA_TRACE_FILE_BYTES`.
-The writer keeps each row intact, so one large row can exceed the limit.
-Each segment contains its own header. The writer locks append and rotation
-together. The controller uses logrotate only for the node log.
+During sync, the controller rotates trace tables every polling interval (10
+seconds for native runs, 30 seconds for legacy). Each CSV table rotates at 128 MiB
+into a gzip-compressed segment beside the current file. The controller keeps up to
+1,000 segments per table, which covers a full genesis sync. Files can exceed
+128 MiB between checks.
 
-Read `block_sync.csv.2`, then `.1`, then `block_sync.csv` for chronological
-history. The readers skip each segment's header. Do not concatenate CSV files
-without removing subsequent headers. The stopped failure's files remain
-unchanged until a newer failure replaces its protected status.
+The node runs with `ZAKURA_TRACE_FILE_SEGMENTS=0`, so its writer does not rotate.
+The writer holds the trace directory's `.trace.lock` for each batch and reopens a
+table whose file was renamed. The controller renames an oversized table while it
+holds that lock, then compresses the detached file after releasing it. The
+node's next batch starts a new file with a header, so rotation loses no rows. If
+the node holds the lock for more than half a second, the controller retries at
+the next poll. The controller uses logrotate only for the node log.
+
+The highest-numbered segment is the oldest. For example, read
+`block_sync.csv.N.gz` down to `block_sync.csv.1.gz`, then `block_sync.csv`
+for chronological history. Each segment contains its own header. Do not
+concatenate CSV files without removing subsequent headers. The stopped
+failure's files remain unchanged until a newer failure replaces its protected
+status.
 
 The controller also retains two cached binaries and removes interrupted
 controller build worktrees and temporary binary copies. The cache is reserved
@@ -475,7 +567,14 @@ For a shared Space, merge the supplied rule with its existing rules first.
 aws --endpoint-url https://YOUR_REGION.digitaloceanspaces.com s3api put-bucket-lifecycle-configuration --bucket YOUR_SPACE --lifecycle-configuration file://deploy/continuous-sync/spaces-lifecycle.json
 ```
 
-The controller verifies seven-day expiration before uploading. It streams gzip
+Give the hosts a key limited to the trace Space, for example
+`doctl spaces keys create zakura-sync-traces --grants 'bucket=YOUR_SPACE;permission=readwrite'`.
+A limited key cannot read lifecycle rules, so run the lifecycle command with an
+account key and confirm the rule with `get-bucket-lifecycle-configuration`.
+
+Before each sync and upload, the controller verifies seven-day expiration when
+its key can read lifecycle rules. With a limited key, it only confirms that the
+key reaches the Space. It streams gzip
 compressed tar archives into `sync-traces/<hostname>/<run-id>.tar.gz` after the
 node stops. Upload failures halt the next run and preserve local traces.
 Daily reports and failure alerts include private download links valid for

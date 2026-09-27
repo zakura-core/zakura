@@ -91,7 +91,7 @@ fn validate_snapshot_rejects_same_kind_network_policy_changes() {
     let (store, config) = TestStore::new(EngineMode::Integrated);
     let changed_network = Network::new_regtest(RegtestParameters {
         activation_heights: ConfiguredActivationHeights {
-            canopy: Some(10),
+            nu5: Some(10),
             ..Default::default()
         },
         ..Default::default()

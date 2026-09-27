@@ -11,7 +11,7 @@ from pathlib import Path
 from zipfile import ZIP_DEFLATED, ZipFile
 
 
-TRACE_FILE_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+\.csv(?:\.\d+)?$")
+TRACE_FILE_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+\.csv(?:\.\d+(?:\.gz)?)?$")
 
 
 def is_trace_file(path: Path) -> bool:

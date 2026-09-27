@@ -2,7 +2,7 @@ use super::{
     bbr::{rounded_usize, BbrState},
     config::*,
     request::*,
-    work_queue::WorkQueue,
+    work_queue::{RequestWriteStatus, WorkQueue},
     *,
 };
 use crate::zakura::{ServicePeerDirection, ServicePeerSnapshot, ZakuraBlockSyncCandidateState};
@@ -37,6 +37,7 @@ pub(super) struct NeededBlocksQueryFailure {
 /// Startup inputs for the dependency-neutral block-sync reactor.
 #[derive(Clone, Debug)]
 pub struct BlockSyncStartup {
+    pub(super) body_retention: Option<BodyRetention>,
     /// Cached state frontiers at startup.
     pub frontiers: BlockSyncFrontiers,
     /// Durable best header tip at startup.
@@ -58,6 +59,8 @@ pub struct BlockSyncStartup {
 
 impl BlockSyncStartup {
     /// Build block-sync startup config from durable/frontier facts.
+    ///
+    /// This assumes archive storage unless [`Self::with_retention`] is supplied.
     pub fn new(
         frontiers: BlockSyncFrontiers,
         best_header_tip: (block::Height, block::Hash),
@@ -65,6 +68,7 @@ impl BlockSyncStartup {
         config: ZakuraBlockSyncConfig,
     ) -> Self {
         Self {
+            body_retention: None,
             frontiers,
             best_header_tip,
             header_tip: Some(header_tip),
@@ -77,6 +81,8 @@ impl BlockSyncStartup {
     }
 
     /// Build production block sync from the sole committed frontier publisher.
+    ///
+    /// Pruned storage must also supply [`Self::with_retention`].
     pub fn new_with_committed_views(
         frontiers: BlockSyncFrontiers,
         best_header_tip: (block::Height, block::Hash),
@@ -84,6 +90,7 @@ impl BlockSyncStartup {
         config: ZakuraBlockSyncConfig,
     ) -> Self {
         Self {
+            body_retention: None,
             frontiers,
             best_header_tip,
             header_tip: None,
@@ -95,8 +102,26 @@ impl BlockSyncStartup {
         }
     }
 
+    /// Attach the storage-owned retained-body floor and the network's genesis hash.
+    ///
+    /// The floor must be initialized from disk and updated after pruning commits,
+    /// before publishing the corresponding verified tip. Genesis remains servable
+    /// separately when checkpoint retention is ahead of that tip.
+    pub fn with_retention(
+        mut self,
+        retained_height: watch::Receiver<block::Height>,
+        genesis_hash: block::Hash,
+    ) -> Self {
+        self.body_retention = Some(BodyRetention {
+            retained_height,
+            genesis_hash,
+        });
+        self
+    }
+
     pub(super) fn inert(config: ZakuraBlockSyncConfig) -> Self {
         Self {
+            body_retention: None,
             frontiers: BlockSyncFrontiers {
                 finalized_height: block::Height::MIN,
                 verified_block_tip: block::Height::MIN,
@@ -110,6 +135,26 @@ impl BlockSyncStartup {
             state_queries_enabled: false,
             trace: ZakuraTrace::noop(),
         }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct BodyRetention {
+    pub(super) retained_height: watch::Receiver<block::Height>,
+    pub(super) genesis_hash: block::Hash,
+}
+
+impl BodyRetention {
+    pub(super) fn apply(&self, mut status: BlockSyncStatus) -> BlockSyncStatus {
+        let retained_height = *self.retained_height.borrow();
+        if retained_height > status.servable_high {
+            status.servable_low = block::Height::MIN;
+            status.servable_high = block::Height::MIN;
+            status.tip_hash = self.genesis_hash;
+        } else {
+            status.servable_low = retained_height;
+        }
+        status
     }
 }
 
@@ -247,12 +292,13 @@ impl BlockSyncHandle {
             .park_session_for_test(peer, conn_id, std::time::Instant::now() + cooldown);
     }
 
-    /// Subscribe to local block-sync status advertisements.
+    /// Subscribe to the reactor's current local serving status.
+    /// Peer delivery is tracked separately and can lag while outbound queues are full.
     pub fn subscribe_status(&self) -> watch::Receiver<BlockSyncStatus> {
         self.status.clone()
     }
 
-    /// Return the currently cached local status advertisement.
+    /// Return the reactor's current local serving status, independent of peer delivery.
     pub fn local_status(&self) -> BlockSyncStatus {
         *self.status.borrow()
     }
@@ -290,9 +336,6 @@ pub(super) struct BlockSyncState {
     pub(super) work_queue: Arc<WorkQueue>,
     pub(super) budget: ByteBudget,
     pub(super) needed_heights: Vec<block::Height>,
-    pub(super) status_refresh: RateMeter,
-    pub(super) pending_status_refresh: bool,
-    pub(super) last_advertised_status: BlockSyncStatus,
     /// Throughput of bodies received off the wire (the download rate). Shared
     /// with the per-peer routines (they `record` on receipt); the reactor samples
     /// it each trace tick. Compared against the Sequencer task's committed
@@ -302,15 +345,6 @@ pub(super) struct BlockSyncState {
 
 impl BlockSyncState {
     pub(super) fn new(startup: &BlockSyncStartup) -> Self {
-        let last_advertised_status = BlockSyncStatus {
-            servable_low: block::Height::MIN,
-            servable_high: startup.frontiers.verified_block_tip,
-            tip_hash: startup.frontiers.verified_block_hash,
-            max_blocks_per_response: startup.config.advertised_max_blocks_per_response(),
-            max_inflight_requests: startup.config.advertised_max_inflight_requests(),
-            max_response_bytes: startup.config.advertised_max_response_bytes(),
-        };
-
         Self {
             finalized_height: startup.frontiers.finalized_height,
             verified_block_hash: startup.frontiers.verified_block_hash,
@@ -323,12 +357,20 @@ impl BlockSyncState {
             work_queue: Arc::new(WorkQueue::new(startup.frontiers.verified_block_tip)),
             budget: ByteBudget::new(startup.config.max_inflight_block_bytes),
             needed_heights: Vec::new(),
-            status_refresh: RateMeter::new(startup.config.status_refresh_interval),
-            pending_status_refresh: false,
-            last_advertised_status,
             received_throughput: Arc::new(std::sync::Mutex::new(ThroughputMeter::new(
                 Instant::now(),
             ))),
+        }
+    }
+
+    pub(super) fn local_status(&self, config: &ZakuraBlockSyncConfig) -> BlockSyncStatus {
+        BlockSyncStatus {
+            servable_low: block::Height::MIN,
+            servable_high: self.servable_high,
+            tip_hash: self.servable_hash,
+            max_blocks_per_response: config.advertised_max_blocks_per_response(),
+            max_inflight_requests: config.advertised_max_inflight_requests(),
+            max_response_bytes: config.advertised_max_response_bytes(),
         }
     }
 
@@ -650,7 +692,7 @@ impl DownloadWindow {
     /// Bytes reserved across this peer's in-flight requests (the per-request size
     /// estimates of heights not yet received). Recomputed on demand — the byte unit is
     /// experimental; a hot path would maintain a running counter instead.
-    fn outstanding_reserved_bytes(&self) -> u64 {
+    pub(super) fn outstanding_reserved_bytes(&self) -> u64 {
         self.outstanding.iter().fold(0u64, |acc, range| {
             acc.saturating_add(range.reserved_bytes())
         })
@@ -703,6 +745,9 @@ impl DownloadWindow {
     }
 
     pub(super) fn arm_liveness(&mut self, now: Instant, timeout: Duration) {
+        if let Some(outstanding) = self.outstanding.last_mut() {
+            outstanding.charged_for_liveness = true;
+        }
         self.last_request_at = Some(now);
         self.requests_without_block_progress =
             self.requests_without_block_progress.saturating_add(1);
@@ -714,6 +759,9 @@ impl DownloadWindow {
     pub(super) fn note_block_progress(&mut self, now: Instant, timeout: Duration) {
         self.last_block_at = Some(now);
         self.requests_without_block_progress = 0;
+        for outstanding in &mut self.outstanding {
+            outstanding.charged_for_liveness = false;
+        }
         self.block_liveness_deadline = if self.outstanding.is_empty() {
             None
         } else {
@@ -738,21 +786,47 @@ impl DownloadWindow {
         }
     }
 
-    /// Reset per-view no-progress accounting after a destructive view reset. The reset
-    /// returned this peer's outstanding to the queue on *our* initiative (a reorg/rollback,
-    /// not the peer's fault), so the in-flight probe streak must not stay charged against
-    /// it: clearing `requests_without_block_progress` lets an unproven peer probe again
-    /// instead of wedging at its one-probe cap forever (the reset also cleared its liveness
-    /// deadline, so nothing would disconnect it). Proof state (`last_block_at`) is preserved.
-    pub(super) fn note_view_reset(&mut self) {
+    /// Clear the probe streak after we return requests on our own initiative,
+    /// such as a view reset. Keep proof of earlier
+    /// progress, but let even an unproven peer receive work again when we resume.
+    pub(super) fn note_locally_returned_requests(&mut self) {
         self.requests_without_block_progress = 0;
         self.clear_liveness_if_idle();
     }
 
-    /// Push the block-liveness deadline out by `timeout` when a would-be park is
-    /// attributable to *local* outbound backpressure, not the peer: while our outbound queue
-    /// is full the routine stops draining inbound, so a useful body may be sitting unread.
-    /// Avoids punishing the peer for our own write-side congestion.
+    /// Retire attempts that never reached the wire, refunding only their own
+    /// probe charges. Keep unanswered requests from this peer accountable.
+    pub(super) fn discard_skipped_requests(&mut self) -> bool {
+        let mut removed = false;
+        let mut index = 0;
+        while index < self.outstanding.len() {
+            if self.outstanding[index].write_status.was_skipped() {
+                self.retire_locally(index);
+                removed = true;
+            } else {
+                index += 1;
+            }
+        }
+        removed
+    }
+
+    /// End a locally retired obligation before discarding its write status. If
+    /// transport has not started, it must skip the frame and refund this probe.
+    pub(super) fn retire_locally(&mut self, index: usize) -> OutstandingBlockRange {
+        let outstanding = self.outstanding.remove(index);
+        outstanding.write_status.expire_unwritten();
+        if outstanding.write_status.was_skipped() && outstanding.charged_for_liveness {
+            self.requests_without_block_progress =
+                self.requests_without_block_progress.saturating_sub(1);
+        }
+        if self.requests_without_block_progress == 0 {
+            self.clear_liveness_if_idle();
+        }
+        outstanding
+    }
+
+    /// Give a briefly congested writer time to deliver our queued request before
+    /// parking the peer for not answering it. The caller bounds this grace.
     pub(super) fn extend_liveness_deadline(&mut self, now: Instant, timeout: Duration) {
         self.block_liveness_deadline = Some(now + timeout);
     }
@@ -803,12 +877,7 @@ impl DownloadWindow {
 pub(super) struct PeerBlockState {
     pub(super) session: BlockSyncPeerSession,
     pub(super) direction: ServicePeerDirection,
-    /// Per-peer rate meter for the reactor's `Status` *advertisement* refresh
-    /// (serving-tip change broadcast + retry to peers that have not acknowledged
-    /// our Status). The inbound-status *reply* half lives on the routine's
-    /// `status_reply_meter`; this half stays reactor-side because the reactor owns
-    /// serving-tip advertisement.
-    pub(super) refresh_meter: RateMeter,
+    pub(super) status_delivery: super::status::StatusDelivery,
     pub(super) served_blocks_inflight: u32,
     pub(super) served_block_requests: VecDeque<(block::Height, Instant)>,
 }
@@ -818,7 +887,10 @@ impl PeerBlockState {
         Self {
             direction: session.direction(),
             session,
-            refresh_meter: RateMeter::new(config.status_refresh_interval),
+            status_delivery: super::status::StatusDelivery::new(
+                config.status_refresh_interval,
+                Instant::now(),
+            ),
             served_blocks_inflight: 0,
             served_block_requests: VecDeque::new(),
         }
@@ -860,6 +932,9 @@ impl PeerBlockState {
 #[derive(Clone, Debug)]
 pub(super) struct OutstandingBlockRange {
     pub(super) request: BlockRangeRequest,
+    pub(super) write_status: RequestWriteStatus,
+    /// Whether this attempt still contributes to the no-progress probe streak.
+    pub(super) charged_for_liveness: bool,
     pub(super) queued_at: Instant,
     pub(super) deadline: Instant,
     pub(super) delivery_snapshot: DeliverySnapshot,
@@ -975,12 +1050,12 @@ const _: () = assert!(MAX_BS_BLOCKS_PER_REQUEST <= RECEIVED_TRACKER_OFFSET_CAPAC
 #[derive(Clone, Debug, Default)]
 pub(super) struct ReceivedBlockTracker {
     bits: u128,
-    count: usize,
 }
 
 impl ReceivedBlockTracker {
     pub(super) fn len(&self) -> usize {
-        self.count
+        // At most 128 set bits fit in usize on every supported target.
+        self.bits.count_ones() as usize
     }
 
     fn contains_offset(&self, offset: u32) -> bool {
@@ -995,7 +1070,6 @@ impl ReceivedBlockTracker {
             return false;
         }
         self.bits |= bit;
-        self.count = self.count.saturating_add(1);
         true
     }
 
@@ -1064,6 +1138,14 @@ impl ThroughputMeter {
     pub(super) fn record(&mut self, bytes: u64) {
         self.bytes = self.bytes.saturating_add(bytes);
         self.blocks = self.blocks.saturating_add(1);
+    }
+
+    /// Keep frequent queue updates from draining an incomplete rate window.
+    #[cfg(feature = "sync-metrics")]
+    pub(super) fn sample_at_interval(&mut self, now: Instant, interval: Duration) {
+        if now.saturating_duration_since(self.window_start) >= interval {
+            self.sample(now);
+        }
     }
 
     /// Recompute the cached per-second rates from the bytes/blocks accumulated

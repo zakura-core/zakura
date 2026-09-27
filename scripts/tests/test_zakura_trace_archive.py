@@ -22,7 +22,7 @@ class TraceArchiveTests(unittest.TestCase):
             traces = root / "traces"
             node = traces / "node1"
             node.mkdir(parents=True)
-            for name in ("block_sync.csv", "block_sync.csv.1", "legacy_sync.csv.2"):
+            for name in ("block_sync.csv", "block_sync.csv.1", "legacy_sync.csv.2", "commit_state.csv.3.gz"):
                 (node / name).write_text("event,extra\nexample,\n")
             (node / "block_sync.csv.lock").write_text("")
             output = root / "traces.zip"
@@ -35,6 +35,7 @@ class TraceArchiveTests(unittest.TestCase):
                 "traces/node1/block_sync.csv",
                 "traces/node1/block_sync.csv.1",
                 "traces/node1/legacy_sync.csv.2",
+                "traces/node1/commit_state.csv.3.gz",
             }.issubset(names))
             self.assertFalse(any(name.endswith(".lock") for name in names))
 

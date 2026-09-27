@@ -47,6 +47,7 @@ mod sequencer;
 mod sequencer_task;
 mod service;
 mod state;
+mod status;
 #[cfg(test)]
 mod tests;
 mod trace;

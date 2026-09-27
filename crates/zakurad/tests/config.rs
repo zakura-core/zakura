@@ -197,6 +197,17 @@ fn config_nonexistent_file_errors() {
 // --- Environment variable precedence ---
 
 #[test]
+fn config_leaves_trace_rotation_segments_to_the_writer() {
+    let env = EnvGuard::new();
+    env.set_var("ZAKURA_TRACE_FILE_SEGMENTS", "0");
+
+    ZakuradConfig::load(None).expect("trace runtime variables are not TOML fields");
+    let trace = zakura_jsonl_trace::JsonlTraceConfig::from_environment();
+    assert_eq!(trace.csv_rotation_segments, 0);
+    assert_eq!(trace.capture_run_id, None);
+}
+
+#[test]
 fn config_leaves_trace_runtime_environment_to_the_writer() {
     let env = EnvGuard::new();
     env.set_var("ZAKURA_TRACE_FILE_BYTES", "1024");

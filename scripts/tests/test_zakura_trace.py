@@ -140,6 +140,25 @@ class TraceTests(unittest.TestCase):
         self.assertEqual(len(failures), 100)
         self.assertIs(failures[0].detail["diagnostics"], failures[-1].detail["diagnostics"])
 
+    def test_compressed_segments_read_oldest_first(self):
+        import gzip
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "block_sync.csv"
+            for name, event in (("block_sync.csv.2", "oldest"), ("block_sync.csv.1", "older")):
+                oracle.write_csv(path, [dict(event=event)])
+                path.with_name(f"{name}.gz").write_bytes(gzip.compress(path.read_bytes()))
+            oracle.write_csv(path, [dict(event="current")])
+            self.assertEqual([item["event"] for item in trace.read_table(path)],
+                             ["oldest", "older", "current"])
+
+            budget = trace.Budget(bytes_left=path.with_name("block_sync.csv.2.gz").stat().st_size + 1)
+            with self.assertRaises(trace.TraceInputError):
+                list(trace.read_table(path, budget))
+
+            path.with_name("block_sync.csv.1.gz").write_bytes(b"not gzip")
+            with self.assertRaises(trace.TraceInputError):
+                list(trace.read_table(path))
+
     def test_row_count_cursor_rejects_rotated_capture(self):
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "block_sync.csv"

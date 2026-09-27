@@ -32,7 +32,7 @@ pub(in crate::transition::planner) fn retained_header_context<G: HeaderGraphView
         .ok_or(StoreError::Unavailable(
             "retained parent context length overflowed",
         ))?
-        .min(crate::POW_ADJUSTMENT_BLOCK_SPAN);
+        .min(crate::MAX_POW_ADJUSTMENT_BLOCK_SPAN);
     let mut context = Vec::with_capacity(required);
     let mut hash = parent.hash;
     while context.len() < required {

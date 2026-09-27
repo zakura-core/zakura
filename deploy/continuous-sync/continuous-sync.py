@@ -10,9 +10,13 @@ durable halt marker. Disk pressure retries after cleanup; other failures require
 from __future__ import annotations
 
 import argparse
+import contextlib
 import errno
+import fcntl
+import gzip
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
@@ -28,6 +32,50 @@ from typing import Any
 
 STATE_VERSION = 1
 COMPLETION_HISTORY_LIMIT = 256
+NATIVE_SYNC_MODES = ("dual", "zakura")
+SYNC_SAMPLE_METRICS = (
+    "sync.block.applying.unsubmitted",
+    "sync.block.payload.received.bytes",
+    "sync.block.payload.committed.bytes",
+    "state.vct.fast.block.count",
+    "state.vct.legacy.block.count",
+    "sync.report.sapling.height",
+    "sync.report.ironwood.height",
+    "sync.report.checkpoint.height",
+)
+
+# These gauges track the best committed tip. Finalized and verifier-only gauges
+# can trail or lead that tip, so they remain diagnostics.
+COMMITTED_HEIGHT_METRICS = (
+    "state.memory.best.committed.block.height",
+    "state.memory.committed.block.height",
+    "zcash_chain_verified_block_height",
+    "sync.block.verified_tip.height",
+)
+
+HEADER_HEIGHT_METRICS = (
+    "sync.header_chain.frontier.header_best_height",
+    "sync.block.best_header_tip.height",
+)
+
+LEGACY_FALLBACK_ACTIVE_METRIC = "sync.zakura.legacy_fallback.active"
+
+DIAGNOSTIC_METRICS = (
+    "state_finalized_block_height",
+    "state_checkpoint_finalized_block_height",
+    "checkpoint_verified_height",
+    "checkpoint_processing_next_height",
+    "sync.estimated_network_tip_height",
+    "sync.estimated_distance_to_tip",
+    "sync.prospective_tips.len",
+    "sync.reserve.depth",
+    "sync.downloads.in_flight",
+    "sync.downloads.waiting_network",
+    "sync.downloads.downloading",
+    "sync.downloads.response_received",
+    "sync.downloads.waiting_verifier",
+    "sync.downloads.verifying",
+)
 
 
 class ControllerError(Exception):
@@ -71,6 +119,7 @@ class Policy:
     poll_interval_seconds: int = 30
     startup_timeout_seconds: int = 600
     stall_seconds: int = 600
+    status_unavailable_seconds: int = 600
     max_run_seconds: int = 172800
     ready_samples: int = 6
     ready_sample_interval_seconds: int = 30
@@ -79,6 +128,7 @@ class Policy:
     retention_runs: int = 10
     retention_bytes: int = 20 * 1024**3
     trace_file_bytes: int = 128 * 1024**2
+    trace_segments: int = 1000
     cooldown_seconds: int = 60
     wipe_entries: tuple[str, ...] = ("state", "non_finalized_state")
     preserve_entries: tuple[str, ...] = ("network",)
@@ -90,6 +140,88 @@ class Policy:
 class Config:
     paths: Paths
     policy: Policy = field(default_factory=Policy)
+
+
+@dataclass
+class SyncProgress:
+    started_at: int
+    last_height: int | None = None
+    highest_height: int | None = None
+    last_progress_at: int = field(init=False)
+    backlog_since: int | None = None
+    status_unavailable_since: int | None = None
+
+    def __post_init__(self) -> None:
+        self.last_progress_at = self.started_at
+
+    def observe(
+        self,
+        sample: dict[str, Any],
+        policy: Policy,
+        observed_at: int,
+    ) -> tuple[bool, str | None]:
+        committed_height = sample.get("committed_height")
+        progressed = False
+        if isinstance(committed_height, int):
+            self.last_height = committed_height
+            if self.highest_height is None or committed_height > self.highest_height:
+                self.highest_height = committed_height
+                self.last_progress_at = observed_at
+                progressed = True
+
+        evidence, detail = classify_sync_evidence(sample, policy.p2p_stack)
+        sample["stall_evidence"] = evidence
+        sample["stall_evidence_detail"] = detail
+
+        if evidence == "local_header_backlog":
+            if self.status_unavailable_since is not None and self.backlog_since is not None:
+                self.backlog_since += observed_at - self.status_unavailable_since
+            self.status_unavailable_since = None
+            if progressed or self.backlog_since is None:
+                self.backlog_since = observed_at
+            stalled_for = observed_at - self.backlog_since
+            if stalled_for >= policy.stall_seconds:
+                return progressed, (
+                    f"committed height {self.last_height} has not progressed while "
+                    f"{detail} for {stalled_for}s (threshold {policy.stall_seconds}s)"
+                )
+            return progressed, None
+
+        if evidence == "no_local_header_backlog":
+            self.backlog_since = None
+            self.status_unavailable_since = None
+            return progressed, None
+
+        if evidence == "legacy_fallback":
+            self.backlog_since = None
+            self.status_unavailable_since = None
+            return progressed, (
+                f"Zakura block sync handed off to legacy fallback at committed height "
+                f"{self.last_height}; {detail}"
+            )
+
+        if evidence == "legacy_height_only":
+            self.backlog_since = None
+            self.status_unavailable_since = None
+            stalled_for = observed_at - self.last_progress_at
+            if self.last_height is not None and stalled_for >= policy.stall_seconds:
+                return progressed, (
+                    f"legacy committed height {self.last_height} has not progressed for "
+                    f"{stalled_for}s (threshold {policy.stall_seconds}s)"
+                )
+            return progressed, None
+
+        if progressed:
+            self.backlog_since = None
+        if self.status_unavailable_since is None:
+            self.status_unavailable_since = observed_at
+        unavailable_for = observed_at - self.status_unavailable_since
+        if unavailable_for >= policy.status_unavailable_seconds:
+            return progressed, (
+                f"sync status evidence unavailable for {unavailable_for}s "
+                f"(threshold {policy.status_unavailable_seconds}s): {detail}"
+            )
+        return progressed, None
 
 
 def now() -> int:
@@ -272,13 +404,26 @@ def binary_runnable(path: Path) -> bool:
     return result.returncode == 0
 
 
+def build_features(config: Config, sha: str) -> list[str]:
+    """Opt native runs into commit accounting when the selected ref supports it."""
+    if config.policy.p2p_stack not in NATIVE_SYNC_MODES:
+        return []
+    result = run(["git", "show", f"{sha}:crates/zakurad/Cargo.toml"],
+                 cwd=config.paths.repo_dir, capture=True)
+    manifest = tomllib.loads(result.stdout)
+    return ["sync-metrics"] if "sync-metrics" in manifest.get("features", {}) else []
+
+
 def build_binary(config: Config, sha: str) -> Path:
     config.paths.build_cache_dir.mkdir(parents=True, exist_ok=True)
     target = cached_binary(config, sha)
     meta = target.with_suffix(".json")
+    features = build_features(config, sha)
     if binary_runnable(target) and meta.exists():
-        log(config, f"build-cache-hit sha={sha}")
-        return target
+        metadata = json.loads(meta.read_text(encoding="utf-8"))
+        if metadata.get("features", []) == features:
+            log(config, f"build-cache-hit sha={sha} features={features}")
+            return target
 
     worktree = config.paths.build_cache_dir / f"worktree-{sha[:12]}"
     if worktree.exists():
@@ -286,7 +431,10 @@ def build_binary(config: Config, sha: str) -> Path:
         shutil.rmtree(worktree, ignore_errors=True)
     try:
         run(["git", "worktree", "add", "--detach", str(worktree), sha], cwd=config.paths.repo_dir)
-        run(["cargo", "build", "--release", "--locked", "-p", "zakura"], cwd=worktree)
+        build_command = ["cargo", "build", "--release", "--locked", "-p", "zakura"]
+        if features:
+            build_command.extend(["--features", ",".join(features)])
+        run(build_command, cwd=worktree)
         built = worktree / "target" / "release" / "zakurad"
         if not built.is_file():
             raise ControllerError(f"build completed but binary is missing: {built}")
@@ -300,6 +448,7 @@ def build_binary(config: Config, sha: str) -> Path:
                 {
                     "sha": sha,
                     "binary_sha256": sha256_file(target),
+                    "features": features,
                     "built_at": utc_stamp(),
                 },
                 indent=2,
@@ -343,9 +492,9 @@ def check_free_space(config: Config, *, recovery: bool = False) -> None:
 
 
 def preflight(config: Config) -> None:
-    commands = ("cargo", "git", "systemctl", "logrotate")
+    commands = ("cargo", "git", "systemctl", "logrotate", "gzip")
     if config.policy.archive_traces:
-        commands += ("aws", "tar", "gzip")
+        commands += ("aws", "tar")
     for command in commands:
         if shutil.which(command) is None:
             raise ControllerError(f"required command is unavailable: {command}")
@@ -469,11 +618,58 @@ def metric_value(metrics: str, name: str) -> float | None:
     prometheus_name = re.escape(name.replace(".", "_"))
     dotted_name = re.escape(name)
     pattern = re.compile(
-        rf"^(?:{dotted_name}|{prometheus_name})\s+(-?\d+(?:\.\d+)?)$",
+        rf"^(?:{dotted_name}|{prometheus_name})(?:_total)?[ \t]+(\S+)[ \t]*$",
         re.MULTILINE,
     )
     match = pattern.search(metrics)
-    return float(match.group(1)) if match else None
+    try:
+        value = float(match.group(1)) if match else None
+    except ValueError:
+        return None
+    return value if value is not None and math.isfinite(value) else None
+
+
+def first_metric(status: dict[str, Any], names: tuple[str, ...]) -> tuple[int | None, str | None]:
+    for name in names:
+        value = status.get(name)
+        if isinstance(value, int):
+            return value, name
+    return None, None
+
+
+def classify_sync_evidence(sample: dict[str, Any], p2p_stack: str) -> tuple[str, str]:
+    metrics_status = sample.get("metrics_status")
+    if metrics_status != "ok":
+        return "unknown", f"metrics={metrics_status}"
+
+    committed_height = sample.get("committed_height")
+    if not isinstance(committed_height, int):
+        return "unknown", "committed block height is missing"
+
+    if p2p_stack in ("legacy", "zebra"):
+        return "legacy_height_only", "Zakura header state is disabled"
+
+    if sample.get(LEGACY_FALLBACK_ACTIVE_METRIC) == 1:
+        return "legacy_fallback", "legacy fallback is the active block-sync driver"
+
+    header_height = sample.get("header_height")
+    if not isinstance(header_height, int):
+        return "unknown", "authoritative local header height is missing"
+    if header_height < committed_height:
+        return (
+            "no_local_header_backlog",
+            f"local header height {header_height} has no backlog above committed height "
+            f"{committed_height}",
+        )
+    if header_height == committed_height:
+        return (
+            "no_local_header_backlog",
+            f"local header height equals committed height {committed_height}",
+        )
+    return (
+        "local_header_backlog",
+        f"local header height {header_height} is ahead of committed height {committed_height}",
+    )
 
 
 def sample_status(config: Config) -> dict[str, Any]:
@@ -481,44 +677,34 @@ def sample_status(config: Config) -> dict[str, Any]:
     try:
         metrics = fetch_text(config.policy.metrics_url)
         status["metrics_status"] = "ok"
+        if config.policy.p2p_stack in NATIVE_SYNC_MODES:
+            for key in SYNC_SAMPLE_METRICS:
+                value = metric_value(metrics, key)
+                if value is not None and value >= 0:
+                    status[key] = int(value)
         for key in (
-            "state.memory.best.committed.block.height",
-            "state.memory.committed.block.height",
-            "state_finalized_block_height",
-            "state_checkpoint_finalized_block_height",
-            "zcash_chain_verified_block_height",
-            "sync_block_verified_tip_height",
-            "checkpoint_verified_height",
-            "checkpoint_processing_next_height",
-            "sync.estimated_network_tip_height",
-            "sync.estimated_distance_to_tip",
-            "sync.prospective_tips.len",
-            "sync.reserve.depth",
-            "sync.downloads.in_flight",
-            "sync.downloads.waiting_network",
-            "sync.downloads.downloading",
-            "sync.downloads.response_received",
-            "sync.downloads.waiting_verifier",
-            "sync.downloads.verifying",
+            *COMMITTED_HEIGHT_METRICS,
+            *HEADER_HEIGHT_METRICS,
+            LEGACY_FALLBACK_ACTIVE_METRIC,
+            *DIAGNOSTIC_METRICS,
         ):
             value = metric_value(metrics, key)
             if value is not None:
                 status[key] = int(value)
-        status["height"] = None
-        for key in (
-            "state.memory.best.committed.block.height",
-            "state.memory.committed.block.height",
-            "state_finalized_block_height",
-            "state_checkpoint_finalized_block_height",
-            "zcash_chain_verified_block_height",
-            "sync_block_verified_tip_height",
-            "checkpoint_verified_height",
-            "checkpoint_processing_next_height",
-        ):
-            if status.get(key) is not None:
-                status["height"] = status[key]
-                status["height_source"] = key
-                break
+
+        committed_height, committed_source = first_metric(status, COMMITTED_HEIGHT_METRICS)
+        status["committed_height"] = committed_height
+        if committed_source is not None:
+            status["committed_height_source"] = committed_source
+
+        header_height, header_source = first_metric(status, HEADER_HEIGHT_METRICS)
+        status["header_height"] = header_height
+        if header_source is not None:
+            status["header_height_source"] = header_source
+
+        status["height"] = committed_height
+        if committed_source is not None:
+            status["height_source"] = committed_source
         if status["height"] is None:
             tip = status.get("sync.estimated_network_tip_height")
             distance = status.get("sync.estimated_distance_to_tip")
@@ -531,11 +717,98 @@ def sample_status(config: Config) -> dict[str, Any]:
     ready, ready_detail = fetch_ready(config)
     status["ready"] = ready
     status["ready_detail"] = ready_detail
+    evidence, detail = classify_sync_evidence(status, config.policy.p2p_stack)
+    status["stall_evidence"] = evidence
+    status["stall_evidence_detail"] = detail
     return status
+
+
+TRACE_LOCK_SECONDS = 0.5
+
+
+@contextlib.contextmanager
+def trace_directory_lock(traces: Path):
+    """Hold the node writer's `.trace.lock`, which it holds for every batch.
+
+    Yields False when the lock stays busy, so the caller retries at the next
+    poll. The node gives up on the lock after two seconds, so callers hold it
+    only for renames.
+    """
+    descriptor = os.open(traces / ".trace.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o644)
+    try:
+        deadline = time.monotonic() + TRACE_LOCK_SECONDS
+        while True:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    yield False
+                    return
+                time.sleep(0.01)
+        yield True
+    finally:
+        os.close(descriptor)
+
+
+def trace_segment_path(trace: Path, index: int) -> Path:
+    return trace.with_name(f"{trace.name}.{index}.gz")
+
+
+def place_trace_segment(config: Config, trace: Path, compressed: Path) -> None:
+    """Shift older segments and make `compressed` the newest segment."""
+    with trace_directory_lock(trace.parent) as locked:
+        if not locked:
+            return
+        oldest = trace_segment_path(trace, config.policy.trace_segments)
+        oldest.unlink(missing_ok=True)
+        for index in range(config.policy.trace_segments - 1, 0, -1):
+            source = trace_segment_path(trace, index)
+            if source.exists():
+                source.rename(trace_segment_path(trace, index + 1))
+        compressed.rename(trace_segment_path(trace, 1))
+
+
+def compress_trace_segment(config: Config, trace: Path) -> None:
+    """Compress a detached segment and place it; resumes after a crash."""
+    detached = trace.with_name(f"{trace.name}.rotating")
+    compressed = trace.with_name(f"{trace.name}.rotating.gz")
+    if detached.exists():
+        with detached.open("rb") as source, compressed.open("wb") as target:
+            # Level 6 matches the gzip default that logrotate used.
+            with gzip.GzipFile(fileobj=target, mode="wb", compresslevel=6) as encoder:
+                shutil.copyfileobj(source, encoder, 1024 * 1024)
+            target.flush()
+            os.fsync(target.fileno())
+        detached.unlink()
+    if compressed.exists():
+        place_trace_segment(config, trace, compressed)
+
+
+def rotate_trace(config: Config, trace: Path) -> None:
+    """Detach an oversized CSV table under the node writer's directory lock.
+
+    The node runs with `ZAKURA_TRACE_FILE_SEGMENTS=0`. It holds the lock for
+    each batch and reopens a table whose file was renamed. A rename under the
+    lock therefore never splits a batch, and the node's next append starts a
+    new file with a header. Compression happens after the lock is released.
+    """
+    compress_trace_segment(config, trace)
+    if trace.is_symlink() or not trace.is_file() or trace.stat().st_size < config.policy.trace_file_bytes:
+        return
+    with trace_directory_lock(trace.parent) as locked:
+        if not locked:
+            return
+        trace.rename(trace.with_name(f"{trace.name}.rotating"))
+    compress_trace_segment(config, trace)
 
 
 def rotate_run_logs(config: Config, run_dir: Path) -> None:
     """Keep trace and node-log rotations inside the run that produced them."""
+    traces = run_dir / "traces"
+    if traces.is_dir() and not traces.is_symlink():
+        for trace in sorted(traces.glob("*.csv")):
+            rotate_trace(config, trace)
     rotation_config = run_dir / ".trace-logrotate.conf"
     rotation_config.write_text(
         f'{json.dumps(str(run_dir / "zebrad.log"))} {{\n'
@@ -550,8 +823,8 @@ def wait_for_completion(
     config: Config, run_dir: Path, run_state: dict[str, Any], state: dict[str, Any]
 ) -> None:
     started = now()
-    last_height: int | None = None
-    last_progress = started
+    progress = SyncProgress(started)
+    sample_started = time.monotonic() if config.policy.p2p_stack in NATIVE_SYNC_MODES else None
     ready_samples = 0
     samples_path = run_dir / "samples.jsonl"
 
@@ -570,29 +843,26 @@ def wait_for_completion(
         rotate_run_logs(config, run_dir)
         sample = sample_status(config)
         sample["time"] = utc_stamp(ts)
+        progressed, failure = progress.observe(sample, config.policy, ts)
+        if sample_started is not None:
+            sample["elapsed_seconds"] = round(time.monotonic() - sample_started, 3)
         with samples_path.open("a", encoding="utf-8") as samples:
             samples.write(json.dumps(sample, sort_keys=True) + "\n")
 
-        height = sample.get("height")
-        if isinstance(height, int) and height != last_height:
-            last_height = height
-            last_progress = ts
-            run_state["height"] = height
+        if progressed:
+            run_state["height"] = progress.last_height
             run_state["last_progress_at"] = utc_stamp(ts)
             write_run_json(run_dir, run_state)
 
-        if last_height is None and ts - started >= config.policy.startup_timeout_seconds:
+        if progress.last_height is None and ts - started >= config.policy.startup_timeout_seconds:
             raise ControllerError(
-                f"no height observed within startup timeout "
+                f"no committed height observed within startup timeout "
                 f"{config.policy.startup_timeout_seconds}s; metrics={sample.get('metrics_status')}, "
                 f"ready={sample.get('ready_detail')}"
             )
 
-        if ts - last_progress >= config.policy.stall_seconds:
-            raise ControllerError(
-                f"height {last_height} has not progressed for {ts - last_progress}s "
-                f"(threshold {config.policy.stall_seconds}s)"
-            )
+        if failure is not None:
+            raise ControllerError(failure)
 
         if sample.get("ready") is True:
             ready_samples += 1
@@ -618,13 +888,22 @@ def trace_archive_destination() -> tuple[list[str], str]:
         raise ControllerError("set ZAKURA_TRACE_SPACE and ZAKURA_TRACE_ENDPOINT")
     aws = ["aws", "--endpoint-url", endpoint, "--cli-connect-timeout", "30",
            "--cli-read-timeout", "120"]
-    lifecycle = json.loads(run(aws + ["s3api", "get-bucket-lifecycle-configuration",
-                                    "--bucket", bucket], capture=True, timeout=180).stdout)
+    lifecycle = run(aws + ["s3api", "get-bucket-lifecycle-configuration", "--bucket", bucket],
+                    capture=True, check=False, timeout=180)
+    error = (lifecycle.stderr or "").strip()
+    if "AccessDenied" in error:
+        # Keys limited to one Space cannot read its lifecycle rules, so the
+        # operator checks the rule at setup. Still prove the key reaches the Space.
+        run(aws + ["s3api", "head-bucket", "--bucket", bucket], capture=True, timeout=180)
+        return aws, bucket
+    if lifecycle.returncode and "NoSuchLifecycleConfiguration" not in error:
+        raise ControllerError(f"cannot read Space lifecycle rules: {error}")
+    rules = json.loads(lifecycle.stdout).get("Rules", []) if lifecycle.returncode == 0 else []
     if not any(rule.get("Status") == "Enabled"
                and rule.get("Expiration", {}).get("Days") == 7
                and (rule.get("Prefix") == "sync-traces/"
                     or rule.get("Filter") == {"Prefix": "sync-traces/"})
-               for rule in lifecycle.get("Rules", [])):
+               for rule in rules):
         raise ControllerError("Space requires a seven-day sync-traces/ expiration rule")
     return aws, bucket
 

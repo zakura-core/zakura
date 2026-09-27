@@ -1,27 +1,18 @@
-//! Reusable resource accounting for native Zakura services.
+#![allow(dead_code, unused_imports)] // activated by the serving migration
+
+//! Shared admission and ownership for native Zakura message policies.
 //!
-//! This facade provides the ownership mechanics shared by message-specific
-//! policies. It does not decide what a message costs or what should happen
-//! when capacity is unavailable. Those decisions stay with each service.
+//! Finite request policies supply their codec and response bound. The shared
+//! admission path owns concurrency, rollback, execution, and response lifetimes.
+//! Peer routines retain protocol dispatch and scheduling decisions.
 
-#[allow(dead_code)] // used by the first message policy in the stacked PR
-mod outstanding_bytes;
-#[allow(dead_code)] // used by the first message policy in the stacked PR
-mod rate;
-#[allow(dead_code)] // used by the first message policy in the stacked PR
+mod request;
+pub(crate) use request::{
+    RequestAdmission, RequestPolicy, RequestSession, ResponsePermit, WorkAttempt, WorkLease,
+};
+
 mod slots;
-
-#[allow(unused_imports)] // used by the first message policy in the stacked PR
-pub(crate) use outstanding_bytes::{
-    FrameLease, OutstandingByteBudget, OutstandingByteReservation, OutstandingCapacityError,
-};
-#[allow(unused_imports)] // used by the first message policy in the stacked PR
-pub(crate) use rate::{
-    CommittedRateReservation, RateBudget, RateBudgetConfigError, RateReservation,
-    RateReservationError, RateReservationSpendError,
-};
-#[allow(unused_imports)] // used by the first message policy in the stacked PR
-pub(crate) use slots::{SlotBudget, SlotBudgetCapacityError, SlotPermit};
+pub(crate) use slots::{SlotBudget, SlotPermit};
 
 #[cfg(test)]
 mod tests;

@@ -4,6 +4,7 @@ from contextlib import contextmanager
 import csv
 from dataclasses import dataclass
 from datetime import datetime
+import gzip
 import io
 import json
 import math
@@ -157,7 +158,8 @@ def segments(path, budget=None):
     path = Path(path)
     retained = []
     for item in entries(path.parent, budget):
-        suffix = item.name.removeprefix(path.name + ".")
+        # Writers keep plain numeric segments; the sync controller compresses them.
+        suffix = item.name.removeprefix(path.name + ".").removesuffix(".gz")
         if item.name.startswith(path.name + ".") and suffix.isascii() and suffix.isdigit():
             if len(suffix) > 6:
                 raise TraceInputError("invalid trace segment number")
@@ -214,6 +216,11 @@ def read_segment(path, table, budget):
             data = raw.read(size + 1)
             if len(data) != size:
                 raise TraceInputError("trace changed while reading")
+        if Path(path).name.endswith(".gz"):
+            data = gzip.GzipFile(fileobj=io.BytesIO(data)).read(budget.bytes_left + 1)
+            if len(data) > budget.bytes_left:
+                raise TraceInputError("trace byte/file budget exceeded")
+            budget.bytes_left -= len(data)
         reader = csv.DictReader(io.StringIO(data.decode("utf-8"), newline=""), strict=True)
         header = validate_header(table, reader.fieldnames)
         for record in reader:
@@ -235,7 +242,7 @@ def read_segment(path, table, budget):
                 raise TraceInputError("CSV extra must be an object with no declared columns")
             row.update(extra)
             yield validate_row(row)
-    except (OSError, UnicodeError, csv.Error) as error:
+    except (OSError, EOFError, UnicodeError, csv.Error) as error:
         raise TraceInputError(f"cannot decode trace segment {Path(path).name}: {type(error).__name__}") from error
 
 

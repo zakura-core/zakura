@@ -91,7 +91,7 @@ pub struct RetainedHeaderPath {
     pub common_ancestor: Frontier,
     /// Exact retained target.
     pub target: Frontier,
-    /// Exact generation and branch fixed at acquisition.
+    /// Original request scope, retained for correlation across local head updates.
     pub scope: HeaderWorkAuthority,
 }
 
@@ -195,7 +195,7 @@ pub struct RetainedHeaderPathPage {
     pub common_ancestor: Frontier,
     /// Exact retained target.
     pub target: Frontier,
-    /// Exact generation and branch fixed at acquisition.
+    /// Original request scope, retained for correlation across local head updates.
     pub scope: HeaderWorkAuthority,
     /// Canonical headers in parent-first order.
     pub headers: Vec<Arc<block::Header>>,
@@ -207,6 +207,10 @@ pub struct RetainedHeaderPathPage {
     /// The page keeps the roots separate from `aux_deliveries`.
     /// A serving adapter may use the roots for finalized historical pages.
     pub finalized_tree_aux: Vec<Option<zakura_header_chain::TreeAuxRecordV1>>,
+    /// Committed serialized body sizes looked up by header hash in the full state, parallel
+    /// to `headers`. No peer-delivery provenance; a serving adapter prefers these over
+    /// advertised delivery sizes. `None` where the block is not committed locally.
+    pub finalized_body_sizes: Vec<Option<std::num::NonZeroU32>>,
     /// Whether this page reaches the immutable target.
     pub complete: bool,
 }
@@ -403,7 +407,8 @@ pub trait Port: Send + Sync + 'static {
 
     /// Retain the target path identified by `request`.
     ///
-    /// An acquired reply pins the path until the caller releases it.
+    /// An acquired reply reserves capacity until a successful read or explicit release.
+    /// Local retention may evict the path before a page snapshot is captured.
     fn acquire_header_path(
         &self,
         request: AcquirePath,

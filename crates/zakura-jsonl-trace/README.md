@@ -27,10 +27,18 @@ current schema. A mismatched or incomplete header disables that table and emits
 a warning. Use a new trace directory after changing a CSV schema.
 
 The writer rotates at 128 MiB by default and retains two older segments.
-`ZAKURA_TRACE_FILE_BYTES` sets the size limit. Each segment contains one header.
+`ZAKURA_TRACE_FILE_BYTES` sets the size limit, and `ZAKURA_TRACE_FILE_SEGMENTS`
+sets the number of older segments. Each segment contains one header.
 The writer locks the table during append and rotation. It syncs each segment
 before rotation and syncs current files on the periodic timer and guarded shutdown.
 External tools must not truncate trace files.
+
+`ZAKURA_TRACE_FILE_SEGMENTS=0` hands rotation to an external tool. The writer
+holds the directory's `.trace.lock` with `flock` for each batch. The tool holds
+the same lock while it renames the current file, then releases it. The writer
+notices the rename and starts a new file with a header. The writer waits at most
+two seconds for the lock, so the tool must not hold it while it compresses or
+copies data.
 
 Validation captures use `ZAKURA_TRACE_CAPTURE_RUN` to name the harness run.
 This mode disables rotation and publishes one `capture-*.json` status per writer.

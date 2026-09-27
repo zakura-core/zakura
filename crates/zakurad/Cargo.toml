@@ -77,8 +77,12 @@ features = [
 default-release-binaries = ["release_max_level_info", "progress-bar", "prometheus", "sentry", "opentelemetry"]
 
 
-# Default features for official ZF binary release builds
+# Default local builds retain common's automatic native CPU optimization.
 default = ["default-release-binaries"]
+
+# Disable build-host-specific x86-64 Pasta assembly for redistributable binaries.
+# Keep this out of the defaults so local builds can use BMI2+ADX automatically.
+portable = ["dep:orchard", "orchard/portable"]
 
 # Production features that activate extra dependencies, or extra features in dependencies
 
@@ -183,6 +187,10 @@ zakura-state = { path = "../zakura-state", version = "10.0.0" }
 # enabling it in the other imports of zcash-script.)
 zakura-script = { path = "../zakura-script", version = "3.2.4" }
 zcash_script = { workspace = true }
+
+# Only used to forward portable arithmetic through Orchard and Halo 2. Cargo
+# feature unification applies it to the existing transitive dependencies.
+orchard = { workspace = true, optional = true }
 
 # Required for crates.io publishing, but it's only used in tests
 zakura-utils = { path = "../zakura-utils", version = "2.2.5", optional = true }

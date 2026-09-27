@@ -433,3 +433,30 @@ unwrap_in_result = "warn"
 
 # TODOs: fix this lint eventually
 result_large_err = "allow"
+
+# Common PR #505 adds automatic native x86-64 assembly and its portable
+# override. Patch the complete family so registry consumers and path dependencies
+# share the same types. Remove these patches after a common crates.io release
+# includes https://github.com/zakura-core/common/pull/505.
+[patch.crates-io]
+zakura-address = { git = "https://github.com/zakura-core/common", rev = "c4343b33b6cd65a0bafb4e95f12faed6608df4f0" }
+zakura-bellman = { git = "https://github.com/zakura-core/common", rev = "c4343b33b6cd65a0bafb4e95f12faed6608df4f0" }
+zakura-bls12-381 = { git = "https://github.com/zakura-core/common", rev = "c4343b33b6cd65a0bafb4e95f12faed6608df4f0" }
+zakura-equihash = { git = "https://github.com/zakura-core/common", rev = "c4343b33b6cd65a0bafb4e95f12faed6608df4f0" }
+zakura-halo2-gadgets = { git = "https://github.com/zakura-core/common", rev = "c4343b33b6cd65a0bafb4e95f12faed6608df4f0" }
+zakura-halo2-legacy-pdqsort = { git = "https://github.com/zakura-core/common", rev = "c4343b33b6cd65a0bafb4e95f12faed6608df4f0" }
+zakura-halo2-poseidon = { git = "https://github.com/zakura-core/common", rev = "c4343b33b6cd65a0bafb4e95f12faed6608df4f0" }
+zakura-halo2-proofs = { git = "https://github.com/zakura-core/common", rev = "c4343b33b6cd65a0bafb4e95f12faed6608df4f0" }
+zakura-jubjub = { git = "https://github.com/zakura-core/common", rev = "c4343b33b6cd65a0bafb4e95f12faed6608df4f0" }
+zakura-keys = { git = "https://github.com/zakura-core/common", rev = "c4343b33b6cd65a0bafb4e95f12faed6608df4f0" }
+zakura-orchard = { git = "https://github.com/zakura-core/common", rev = "c4343b33b6cd65a0bafb4e95f12faed6608df4f0" }
+zakura-pairing = { git = "https://github.com/zakura-core/common", rev = "c4343b33b6cd65a0bafb4e95f12faed6608df4f0" }
+zakura-pasta-curves = { git = "https://github.com/zakura-core/common", rev = "c4343b33b6cd65a0bafb4e95f12faed6608df4f0" }
+zakura-primitives = { git = "https://github.com/zakura-core/common", rev = "c4343b33b6cd65a0bafb4e95f12faed6608df4f0" }
+zakura-proofs = { git = "https://github.com/zakura-core/common", rev = "c4343b33b6cd65a0bafb4e95f12faed6608df4f0" }
+zakura-protocol = { git = "https://github.com/zakura-core/common", rev = "c4343b33b6cd65a0bafb4e95f12faed6608df4f0" }
+zakura-reddsa = { git = "https://github.com/zakura-core/common", rev = "c4343b33b6cd65a0bafb4e95f12faed6608df4f0" }
+zakura-redjubjub = { git = "https://github.com/zakura-core/common", rev = "c4343b33b6cd65a0bafb4e95f12faed6608df4f0" }
+zakura-sapling-crypto = { git = "https://github.com/zakura-core/common", rev = "c4343b33b6cd65a0bafb4e95f12faed6608df4f0" }
+zakura-sinsemilla = { git = "https://github.com/zakura-core/common", rev = "c4343b33b6cd65a0bafb4e95f12faed6608df4f0" }
+zakura-transparent = { git = "https://github.com/zakura-core/common", rev = "c4343b33b6cd65a0bafb4e95f12faed6608df4f0" }

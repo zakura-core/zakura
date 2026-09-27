@@ -43,6 +43,29 @@ class ManifestTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "precede"):
             self.make()
 
+    def test_snapshot_metadata(self):
+        snapshot = {"url": "https://api.nu7.valargroup.dev/snapshots/seed.tar.zst",
+                    "sha256": "c" * 64, "height": self.seed["height"],
+                    "sizeBytes": 9618204704, "publishedAt": 1790450304,
+                    "storageMode": "pruned", "dbVersion": "29.1.0"}
+        def publish(value):
+            return publish_network.manifest(self.config, self.info, "b" * 40,
+                                            ["seed.nu7.valargroup.dev:18233"], self.seed, value)
+        self.assertEqual(publish(snapshot)["snapshot"], snapshot)
+        for key, value in [("url", "https://api.nu7.valargroup.dev/snapshots/../private.tar.zst"),
+                           ("url", snapshot["url"] + "?download=1"),
+                           ("sha256", "bad"), ("sizeBytes", -1), ("sizeBytes", True),
+                           ("sizeBytes", 2**53), ("publishedAt", 0), ("publishedAt", 2**53 - 1),
+                           ("storageMode", "archive"), ("dbVersion", "v29"),
+                           ("height", self.seed["height"] + 1)]:
+            with self.subTest(key=key, value=value), self.assertRaises(ValueError):
+                publish(dict(snapshot, **{key: value}))
+        for key in snapshot:
+            incomplete = dict(snapshot)
+            del incomplete[key]
+            with self.subTest(missing=key), self.assertRaises(ValueError):
+                publish(incomplete)
+
 
 if __name__ == "__main__":
     unittest.main()

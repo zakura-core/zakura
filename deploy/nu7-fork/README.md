@@ -24,11 +24,43 @@ Do not reuse state from the earlier fork.
 
 After a reset, publish the manifest with `publish_network.py --help`. Supply the
 built binary's exact revision, explicit public peers, the recorded `seed-tip.json`,
-and snapshot metadata (`url`, `sha256`, `height`). Archive only the stopped seed's
+and snapshot metadata (see the one-time snapshot below). Archive only the
+stopped seed's
 `state` and `non_finalized_state` directories, renaming the Testnet subdirectories
 to the lowercased fork name. Participants extract that archive into `nu7-state`.
 The Caddy configuration exposes `/v1/network`, `/v1/config`, and the snapshot;
 `https://zakura.com` may fetch the manifest and status via CORS.
+
+## One-time bootstrap snapshot
+
+The current seed is served directly by Caddy on `zakura-nu7-fork-1`
+(`api.nu7.valargroup.dev`), from
+`/mnt/snapshots/nu7-public/snapshots/nu7-v2-seed-4398752.tar.zst`.
+It is a fixed, pruned seed at height **4,398,752**, published on
+**2026-09-26 at 19:18:24 UTC**, before NU7 activation. Its database format is
+**29.1.0** and compressed size is **9,618,204,704 bytes**. There is no daily
+refresh job. The website presents this artifact separately from Mainnet snapshots.
+
+The manifest's `snapshot` object includes `url`, `sha256`, `height`, `sizeBytes`,
+`publishedAt` (Unix seconds, UTC), `storageMode` (`pruned`), and `dbVersion`
+(the database's three-component version). Publication time describes the artifact,
+not a later manifest refresh. The publisher requires the snapshot height to match
+`seed.height`; this publication flow is for the original pre-activation seed.
+
+For a manual publication, verify the entire archive with `sha256sum`, inspect its
+members, and restore it into an isolated cache using the manifest's pinned binary.
+Only `state` and `non_finalized_state` with the matching fork name belong in the
+archive. Read `dbVersion` from its `state/v*/<network>/version` file. Record the
+compressed file size and original publication time in the snapshot metadata JSON.
+Pass that file to `publish_network.py --snapshot` with the existing config, seed,
+revision and peers. It validates metadata before atomically replacing the manifest.
+Keep a copy of the previous manifest outside the public document root for rollback.
+
+Keep the existing archive URL immutable. Caddy's `/snapshots/*` file server already
+supports HTTPS GET, HEAD, and byte ranges for resumed downloads. No proxy, bucket,
+or extra service is needed. Verify these responses and `/v1/network` CORS after
+publication; the website should consume metadata only after the archive is verified.
+A future fork reset needs a distinct artifact URL and a matching manifest/config.
 
 ## Prerequisites
 

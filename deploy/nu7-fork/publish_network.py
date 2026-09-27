@@ -10,6 +10,7 @@ import hashlib
 import json
 import re
 import sys
+import time
 import tomllib
 from pathlib import Path
 
@@ -17,6 +18,21 @@ import dashboard
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "deployer"))
 from deploy import render_toml_table  # noqa: E402
+
+
+def validate_snapshot(snapshot):
+    """Validate immutable seed metadata shared by the publisher and website."""
+    try:
+        if (not re.fullmatch(r"https://api\.nu7\.valargroup\.dev/snapshots/[A-Za-z0-9][A-Za-z0-9._-]*\.tar\.zst", snapshot["url"])
+                or not re.fullmatch(r"[0-9a-f]{64}", snapshot["sha256"])
+                or any(type(snapshot[key]) is not int or not 0 < snapshot[key] <= 2**53 - 1
+                       for key in ("height", "sizeBytes", "publishedAt"))
+                or snapshot["publishedAt"] > time.time() + 300
+                or snapshot["storageMode"] != "pruned"
+                or not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", snapshot["dbVersion"])):
+            raise ValueError("invalid snapshot metadata")
+    except (KeyError, TypeError) as exc:
+        raise ValueError("incomplete snapshot metadata") from exc
 
 
 def manifest(config, info, revision, peers, seed, snapshot=None):
@@ -60,9 +76,9 @@ def manifest(config, info, revision, peers, seed, snapshot=None):
         "configSha256": hashlib.sha256(rendered.encode()).hexdigest(),
     }
     if snapshot is not None:
-        if (not snapshot["url"].startswith("https://api.nu7.valargroup.dev/snapshots/")
-                or not re.fullmatch(r"[0-9a-f]{64}", snapshot["sha256"])):
-            raise ValueError("snapshot must have a public HTTPS URL and SHA256")
+        validate_snapshot(snapshot)
+        if snapshot["height"] != seed["height"]:
+            raise ValueError("bootstrap snapshot must match the recorded seed height")
         result["snapshot"] = snapshot
     return result
 

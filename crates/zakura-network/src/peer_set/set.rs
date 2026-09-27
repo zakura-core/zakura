@@ -908,6 +908,39 @@ where
         self.select_p2c_peer_from_list(&self.ready_services.keys().copied().collect())
     }
 
+    /// Performs P2C on the peers in `peer_list` that advertise `NODE_NETWORK`,
+    /// falling back to all of `peer_list` if none of them do.
+    ///
+    /// Peers without `NODE_NETWORK` are usually pruned nodes, which only serve
+    /// recent blocks, so block requests only go to them when no full node in
+    /// `peer_list` is ready.
+    ///
+    /// # Correctness
+    ///
+    /// This must return a peer whenever [`Self::select_p2c_peer_from_list`]
+    /// would. Failing a block request because no full node is ready makes the
+    /// syncer abort every round under ordinary peer set saturation (#448).
+    fn select_p2c_block_peer_from_list(&self, peer_list: &HashSet<D::Key>) -> Option<D::Key> {
+        let full_node_list: HashSet<D::Key> = peer_list
+            .iter()
+            .filter(|key| {
+                self.ready_services
+                    .get(key)
+                    .is_some_and(LoadTrackedClient::advertises_node_network)
+            })
+            .copied()
+            .collect();
+
+        if !full_node_list.is_empty() {
+            return self.select_p2c_peer_from_list(&full_node_list);
+        }
+
+        if !peer_list.is_empty() {
+            metrics::counter!("pool.route_block.pruned_fallback.count").increment(1);
+        }
+        self.select_p2c_peer_from_list(peer_list)
+    }
+
     /// Performs P2C on `ready_service_list` to randomly select a less-loaded ready service.
     #[allow(clippy::unwrap_in_result)]
     fn select_p2c_peer_from_list(&self, ready_service_list: &HashSet<D::Key>) -> Option<D::Key> {
@@ -1024,7 +1057,16 @@ where
 
     /// Routes a request using P2C load-balancing.
     fn route_p2c(&mut self, req: Request) -> <Self as tower::Service<Request>>::Future {
-        if let Some(p2c_key) = self.select_ready_p2c_peer() {
+        let peer = if matches!(
+            &req,
+            Request::BlocksByHash(_) | Request::BlocksByHashFrom { .. }
+        ) {
+            self.select_p2c_block_peer_from_list(&self.ready_services.keys().copied().collect())
+        } else {
+            self.select_ready_p2c_peer()
+        };
+
+        if let Some(p2c_key) = peer {
             tracing::trace!(
                 peer = %p2c_key.addr_label(self.expose_peer_addresses),
                 "routing based on p2c"
@@ -1183,7 +1225,13 @@ where
             .collect();
 
         // Security: choose a random, less-loaded peer that might have the inventory.
-        let peer = self.select_p2c_peer_from_list(&maybe_peer_list);
+        //
+        // An unadvertised block may be historical, so prefer full nodes over pruned peers.
+        // Peers that advertised the block are used above regardless, because they have it.
+        let peer = match hash {
+            InventoryHash::Block(_) => self.select_p2c_block_peer_from_list(&maybe_peer_list),
+            _ => self.select_p2c_peer_from_list(&maybe_peer_list),
+        };
 
         if let Some(mut svc) = peer.and_then(|key| self.take_ready_service(&key)) {
             let peer = peer.expect("just checked peer is Some");

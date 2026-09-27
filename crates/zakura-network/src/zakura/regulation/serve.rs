@@ -8,7 +8,7 @@
 //!    the session and queues the request. The reader keeps reading, so no
 //!    stream layout can trap responses behind waiting requests.
 //! 2. **The serving task waits instead.** For each queued request, in order,
-//!    it takes the peer's output bytes and the node's output bytes for the
+//!    it takes peer and node response slots, then their output bytes for the
 //!    whole response cap, then a peer execution slot and a node execution
 //!    slot. Then it spawns `produce`.
 //! 3. **`produce` never waits for the peer.** Its [`ResponseSink`] queues
@@ -16,7 +16,10 @@
 //!    back its execution slots as soon as it returns.
 //! 4. **Output is ordered.** Each session's writer sends whole responses in
 //!    admission order. A response's output grants return when its last frame
-//!    finishes its transport write.
+//!    finishes its transport write. Response slots return at the same time.
+//!    These slots bound response bookkeeping even when encoded responses are tiny.
+//!    Waiting requests retain commitments, so each session queues at most twice
+//!    its advertised limit beyond the responses that hold output capacity.
 //! 5. **Every admitted request ends exactly once.** If `produce` returns
 //!    without an ending, Serve queues [`Produce::local_failure`]'s ending. The
 //!    connection stays open. Only an ending that cannot be queued retires the
@@ -65,6 +68,8 @@
 //! | The node slot returns before the peer slot | `the_node_slot_returns_before_the_peer_slot` |
 //! | A non-reading peer holds output but no execution | `a_non_reading_peer_holds_output_bytes_but_no_execution_slot` |
 //! | Output returns when the last frame is written | `output_bytes_return_only_when_the_last_frame_is_written` |
+//! | Tiny responses stop at the response count limit | `tiny_responses_with_a_blocked_writer_hold_response_slots` |
+//! | Response slots span peers and session replacement | `response_slots_bound_all_peers_and_survive_session_replacement` |
 //! | A stalled peer does not block another | `a_stalled_produce_on_one_peer_does_not_block_another` |
 //! | A local failure ends the exchange; the connection stays | `a_local_failure_after_a_prefix_sends_the_failure_ending` |
 //! | The ending frees the commitment before execution ends | `the_ending_frees_the_commitment_before_execution_ends` |
@@ -99,7 +104,7 @@ use lease::ExecutionSlots;
 pub(super) use sink::ending_reserve;
 use sink::{ResponseFrame, SinkCore};
 
-use super::OutputGrant;
+use super::{OutputGrant, SlotPermit};
 use crate::zakura::{wire_codec::WireMessage, FramedSend, ZakuraPeerId};
 
 /// A reactor's serving logic for one request row.
@@ -198,8 +203,10 @@ pub(super) struct ResponseGrants {
     // Field order is drop order: the node grant returns first, as with
     // execution slots.
     _node: OutputGrant,
+    _node_response: SlotPermit,
     _peer: OutputGrant,
-    // Keep both budgets discoverable until the last response write finishes.
+    _peer_response: SlotPermit,
+    // Keep every peer budget discoverable while queued output survives a session.
     _peer_budgets: PeerBudgets,
 }
 
@@ -386,10 +393,21 @@ impl<P: Produce> Dispatch<P> {
         }
     }
 
-    /// Take, in order, peer output, node output, peer execution, and node
-    /// execution. Returns `None` if the session is cancelled first; nothing
-    /// stays held.
+    /// Take peer and node response slots, output bytes, then execution slots.
+    /// Returns `None` if cancellation wins, releasing every acquired grant.
     async fn acquire(&self, cap: ResponseCap) -> Option<(ResponseGrants, ExecutionSlots)> {
+        let peer_response = self
+            .wait(
+                "peer_output_responses",
+                self.peer.output_responses.reserve(),
+            )
+            .await?;
+        let node_response = self
+            .wait(
+                "node_output_responses",
+                self.capacity.node_output_responses.reserve(),
+            )
+            .await?;
         let bytes = cap.output_bytes();
         let peer_output = &self.peer.output;
         let node_output = &self.capacity.node_output;
@@ -401,7 +419,9 @@ impl<P: Produce> Dispatch<P> {
             .await?;
         let grants = ResponseGrants {
             _node: node,
+            _node_response: node_response,
             _peer: peer,
+            _peer_response: peer_response,
             _peer_budgets: self.peer.clone(),
         };
         let peer = self

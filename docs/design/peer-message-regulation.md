@@ -89,12 +89,12 @@ demonstrate progress under paused reads with the transport tests below.
 A row with a cadence declares both sides of it: the sender's minimum interval,
 and the receiver's bucket capacity and refill interval. The sender's tool and
 the receiver's tool read the same row, so they cannot drift apart. The layout
-validator proves that a conformant sender never empties the bucket: the bucket
-refills faster than the sender sends, and its capacity holds every message a
-sender can queue during the longest outage a connection survives, plus two. The
-receiver credits its own read pauses as they happen. An empty bucket is
-therefore a violation, and the reader disconnects the peer. Buckets that fall
-below a quarter of their capacity are traced, as evidence for tuning the values.
+validator requires a faster refill than the sender and enough capacity for a
+connection-wide outage. A single stream can stall longer while sibling traffic
+keeps the connection alive. Bucket exhaustion therefore cannot prove a sender
+violation. The reader records exhaustion and forwards the message. The receiver
+credits its own read pauses as they happen. Buckets below a quarter of their
+capacity also provide evidence for tuning.
 
 On a stream with a table, only rows with a cadence charge a bucket. Commitments
 bound requests without one, and reservations bound responses. A service can
@@ -117,12 +117,19 @@ release resumes eligible processing. Local capacity exhaustion is not a peer vio
 
 The serving task owns this wait, not the reader. The reader admits each request as a commitment
 without waiting, so no layout can trap responses or control messages behind waiting requests. The
-serving task takes the peer's and the node's output bytes for the whole response cap, then a peer
+serving task takes peer and node response slots, then output bytes for the whole response cap, then a peer
 and a node execution slot, and only then starts the work. The response therefore never waits for
 the peer: its frames queue against output that is already granted, and the work gives back its
 execution slots as soon as it returns. This meets "stop draining the affected request stream"
 because accepted commitments are bounded and every capacity wait runs off the reader. It needs no
 admission verdict, second delayed-request scheduler, or byte-refill timer.
+
+Each unsent response holds a peer response slot and a node response slot until its final
+transport write completes. These slots bound per-response bookkeeping independently of encoded
+bytes. The byte budget and frame caps bound frames within those responses. The default allocates
+one response slot per 4 KiB of output budget, rounded up. This ratio is a sizing policy, not an
+allocator measurement. Adoption must measure throughput for tiny responses. Requests waiting for
+output capacity retain their commitments and remain bounded by the session's commitment limit.
 
 A commitment is released when its ending enters the session's ordered output, before transmission.
 A conformant peer sends its next request only after it receives an ending, so it never exceeds the

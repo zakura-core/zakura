@@ -326,6 +326,16 @@ mod tests {
 
     use super::*;
 
+    /// Parse a trace file holding one header row and one event row.
+    fn rows(file: &str) -> [Value; 2] {
+        let rows: Vec<Value> = file
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("trace row is valid JSON"))
+            .collect();
+        rows.try_into()
+            .expect("trace file holds one header row and one event row")
+    }
+
     #[test]
     fn absent_round_tip_is_omitted() {
         assert_eq!(
@@ -350,9 +360,10 @@ mod tests {
 
         let event = std::fs::read_to_string(dir.path().join(TABLE.file_name()))
             .expect("legacy trace file is written");
-        let event: Value = serde_json::from_str(event.trim()).expect("trace row is valid JSON");
+        let [header, event] = rows(&event);
+        assert_eq!(header["node"], "test-node");
         assert_eq!(event["event"], "round_start");
-        assert_eq!(event["node"], "test-node");
+        assert!(event.get("node").is_none());
         assert_eq!(event["state_tip"], 42);
     }
 
@@ -371,16 +382,18 @@ mod tests {
 
         let event = std::fs::read_to_string(dir.path().join(TABLE.file_name()))
             .expect("legacy trace file is written");
-        let event: Value = serde_json::from_str(event.trim()).expect("trace row is valid JSON");
+        let [header, event] = rows(&event);
         assert_eq!(event["event"], "round_finish");
         assert_eq!(event["reason"], "checkpoint_handoff");
         assert_eq!(event["state_tip"], 160);
         assert_eq!(event["checkpoint_height"], 160);
-        assert_eq!(event["node"], "test-node");
+        assert_eq!(header["event"], zakura_jsonl_trace::TRACE_START_EVENT);
+        assert_eq!(header["node"], "test-node");
         assert_eq!(
-            event["process_trace_id"],
+            header["process_trace_id"],
             zakura_jsonl_trace::process_trace_id()
         );
+        assert!(event.get("process_trace_id").is_none());
     }
 
     #[test]

@@ -4,7 +4,7 @@ use std::{
     collections::{HashMap, HashSet},
     fmt,
     path::PathBuf,
-    sync::OnceLock,
+    sync::{Arc, OnceLock},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -45,8 +45,16 @@ pub const DEFAULT_BUFFER_FLUSH_BYTES: usize = 256 * 1024;
 /// so the extra fsync cadence is negligible against the debuggability win.
 pub const DEFAULT_FILE_FLUSH_INTERVAL: Duration = Duration::from_secs(1);
 
-/// Env var used to label every JSONL trace record with a stable node identifier.
+/// Env var used to label JSONL trace files with a stable node identifier.
 pub const NODE_ID_ENV: &str = "ZEBRA_NODE_ID";
+
+/// `event` value of the header row the writer puts at the start of each
+/// table file it opens, and again whenever the emitting node label changes.
+///
+/// The header carries the `node` and `process_trace_id` that apply to every
+/// following row in that file, so those constant values are not repeated on
+/// each row.
+pub const TRACE_START_EVENT: &str = "trace_start";
 
 /// A logical JSONL trace table and its output file.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -126,7 +134,7 @@ macro_rules! impl_jsonl_trace_event {
 #[derive(Clone, Debug)]
 pub struct JsonlEventEmitter {
     tracer: JsonlTracer,
-    node: std::sync::Arc<str>,
+    node: Arc<str>,
     started: Instant,
 }
 
@@ -137,7 +145,7 @@ impl JsonlEventEmitter {
     }
 
     /// Create an event emitter with an explicit node label.
-    pub fn new(tracer: JsonlTracer, node: impl Into<std::sync::Arc<str>>) -> Self {
+    pub fn new(tracer: JsonlTracer, node: impl Into<Arc<str>>) -> Self {
         Self {
             tracer,
             node: node.into(),
@@ -171,8 +179,6 @@ impl JsonlEventEmitter {
         let event = build();
         let row = JsonlEventEnvelope {
             ts: elapsed_micros(self.started.elapsed()),
-            node: &self.node,
-            process_trace_id: process_trace_id(),
             event: &event,
         };
 
@@ -180,6 +186,7 @@ impl JsonlEventEmitter {
             permit.send(JsonlWriteEvent {
                 table: E::TABLE.table(),
                 file_name: E::TABLE.file_name(),
+                node: self.node.clone(),
                 line,
             });
         }
@@ -196,17 +203,13 @@ impl JsonlEventEmitter {
             "ts".to_string(),
             Value::from(elapsed_micros(self.started.elapsed())),
         );
-        row.insert("node".to_string(), Value::String(self.node.to_string()));
-        row.insert(
-            "process_trace_id".to_string(),
-            Value::String(process_trace_id().to_string()),
-        );
         build(&mut row);
 
         if let Ok(line) = serde_json::to_vec(&Value::Object(row)) {
             permit.send(JsonlWriteEvent {
                 table: table.table(),
                 file_name: table.file_name(),
+                node: self.node.clone(),
                 line,
             });
         }
@@ -222,17 +225,22 @@ impl Default for JsonlEventEmitter {
 #[derive(Serialize)]
 struct JsonlEventEnvelope<'a, E> {
     ts: u64,
-    node: &'a str,
-    process_trace_id: &'static str,
     #[serde(flatten)]
     event: &'a E,
+}
+
+#[derive(Serialize)]
+struct TraceStartHeader<'a> {
+    event: &'static str,
+    node: &'a str,
+    process_trace_id: &'static str,
 }
 
 fn elapsed_micros(elapsed: Duration) -> u64 {
     saturating_micros(elapsed)
 }
 
-/// Returns the process-wide node identifier used to tag JSONL trace records.
+/// Returns the process-wide node identifier used to label JSONL trace files.
 ///
 /// Resolution order: `ZEBRA_NODE_ID`, `HOSTNAME`, `/etc/hostname`, then
 /// `"unknown"`. The value is resolved once on first call and cached for the
@@ -255,7 +263,8 @@ pub fn node_id() -> &'static str {
 
 /// Returns an opaque identifier shared by every JSONL emitter in this process.
 ///
-/// The identifier disambiguates appended trace rows across process restarts.
+/// The identifier is written in each [`TRACE_START_EVENT`] header row, and
+/// disambiguates appended trace rows across process restarts.
 /// Emitter-local monotonic timestamps restart from zero after each restart.
 /// The identifier provides only a correlation label.
 /// The identifier does not provide randomness or security identity.
@@ -279,6 +288,8 @@ pub struct JsonlWriteEvent {
     pub table: &'static str,
     /// Output file name for this table.
     pub file_name: &'static str,
+    /// Node label written in this file's [`TRACE_START_EVENT`] header row.
+    pub node: Arc<str>,
     /// Pre-serialized JSON bytes for a single record, without a trailing newline.
     pub line: Vec<u8>,
 }
@@ -537,6 +548,9 @@ impl std::fmt::Debug for JsonlTracer {
 struct TableWriter {
     file: tokio::fs::File,
     encode_buf: Vec<u8>,
+    /// The node label of the last header row written to this file by this
+    /// process, or `None` before the first row.
+    header_node: Option<Arc<str>>,
 }
 
 impl TableWriter {
@@ -544,7 +558,25 @@ impl TableWriter {
         Self {
             file,
             encode_buf: Vec::with_capacity(buffer_flush_bytes),
+            header_node: None,
         }
+    }
+
+    /// Append `line`, preceded by a header row if this is the first row this
+    /// process writes to the file, or if `node` differs from the last header.
+    fn append_row(&mut self, node: &Arc<str>, line: &[u8]) {
+        if self.header_node.as_ref() != Some(node) {
+            if let Ok(header) = serde_json::to_vec(&TraceStartHeader {
+                event: TRACE_START_EVENT,
+                node,
+                process_trace_id: process_trace_id(),
+            }) {
+                self.append_line(&header);
+            }
+            self.header_node = Some(node.clone());
+        }
+
+        self.append_line(line);
     }
 
     fn append_line(&mut self, line: &[u8]) {
@@ -600,7 +632,7 @@ impl TraceWriter {
 
             let append_result = match self.table_writer_mut(event.table, event.file_name).await {
                 Some(table_writer) => {
-                    table_writer.append_line(&event.line);
+                    table_writer.append_row(&event.node, &event.line);
                     Ok(())
                 }
                 None => Err(()),
@@ -830,6 +862,31 @@ mod tests {
 
     impl_jsonl_trace_event!(TestEvent, TEST_TABLE);
 
+    fn write_event(table: &'static str, file_name: &'static str, line: Vec<u8>) -> JsonlWriteEvent {
+        write_event_for_node("node-test", table, file_name, line)
+    }
+
+    fn write_event_for_node(
+        node: &str,
+        table: &'static str,
+        file_name: &'static str,
+        line: Vec<u8>,
+    ) -> JsonlWriteEvent {
+        JsonlWriteEvent {
+            table,
+            file_name,
+            node: node.into(),
+            line,
+        }
+    }
+
+    fn header_line(node: &str) -> String {
+        format!(
+            r#"{{"event":"{TRACE_START_EVENT}","node":"{node}","process_trace_id":"{}"}}"#,
+            process_trace_id()
+        )
+    }
+
     #[test]
     fn common_adapters_use_display_and_saturating_numeric_forms() {
         assert_eq!(
@@ -856,9 +913,14 @@ mod tests {
         assert_eq!(written.table, "typed");
         assert_eq!(written.file_name, "typed.jsonl");
 
+        assert_eq!(&*written.node, "node-typed");
+
         let row: Value = serde_json::from_slice(&written.line).expect("valid typed event JSON");
-        assert_eq!(row["node"], "node-typed");
-        assert_eq!(row["process_trace_id"], process_trace_id());
+        assert!(
+            row.get("node").is_none(),
+            "node is written in the file header"
+        );
+        assert!(row.get("process_trace_id").is_none());
         assert_eq!(row["event"], "typed_event");
         assert_eq!(row["value"], 7);
         assert_eq!(row["optional"], Value::Null);
@@ -866,7 +928,7 @@ mod tests {
     }
 
     #[test]
-    fn compatibility_emitter_serializes_the_common_process_envelope() {
+    fn compatibility_emitter_serializes_the_timestamp_envelope() {
         let (tx, mut rx) = mpsc::channel(1);
         let emitter = JsonlEventEmitter::new(JsonlTracer::new(tx), "node-raw");
 
@@ -875,9 +937,14 @@ mod tests {
         });
 
         let written = rx.try_recv().expect("raw event uses the reserved slot");
+        assert_eq!(&*written.node, "node-raw");
+
         let row: Value = serde_json::from_slice(&written.line).expect("valid raw event JSON");
-        assert_eq!(row["node"], "node-raw");
-        assert_eq!(row["process_trace_id"], process_trace_id());
+        assert!(
+            row.get("node").is_none(),
+            "node is written in the file header"
+        );
+        assert!(row.get("process_trace_id").is_none());
         assert_eq!(row["event"], "raw_event");
         assert!(row["ts"].is_u64());
     }
@@ -926,19 +993,19 @@ mod tests {
         let writer = TraceWriter::new(trace_dir.clone(), JsonlTraceConfig::default());
         let handle = tokio::spawn(run_trace_writer(rx, writer, CancellationToken::new()));
 
-        tx.send(JsonlWriteEvent {
-            table: "alpha",
-            file_name: "alpha.jsonl",
-            line: br#"{"value":1}"#.to_vec(),
-        })
+        tx.send(write_event(
+            "alpha",
+            "alpha.jsonl",
+            br#"{"value":1}"#.to_vec(),
+        ))
         .await
         .expect("send should succeed");
 
-        tx.send(JsonlWriteEvent {
-            table: "beta",
-            file_name: "beta.jsonl",
-            line: br#"{"value":2}"#.to_vec(),
-        })
+        tx.send(write_event(
+            "beta",
+            "beta.jsonl",
+            br#"{"value":2}"#.to_vec(),
+        ))
         .await
         .expect("send should succeed");
 
@@ -952,8 +1019,14 @@ mod tests {
             .await
             .expect("beta file");
 
-        assert_eq!(alpha.trim(), "{\"value\":1}");
-        assert_eq!(beta.trim(), "{\"value\":2}");
+        assert_eq!(
+            alpha.lines().collect::<Vec<_>>(),
+            [header_line("node-test").as_str(), r#"{"value":1}"#]
+        );
+        assert_eq!(
+            beta.lines().collect::<Vec<_>>(),
+            [header_line("node-test").as_str(), r#"{"value":2}"#]
+        );
     }
 
     #[tokio::test]
@@ -972,11 +1045,11 @@ mod tests {
         let writer = TraceWriter::new(trace_dir.clone(), config);
         let handle = tokio::spawn(run_trace_writer(rx, writer, CancellationToken::new()));
 
-        tx.send(JsonlWriteEvent {
-            table: "alpha",
-            file_name: "alpha.jsonl",
-            line: br#"{"value":1}"#.to_vec(),
-        })
+        tx.send(write_event(
+            "alpha",
+            "alpha.jsonl",
+            br#"{"value":1}"#.to_vec(),
+        ))
         .await
         .expect("send should succeed");
 
@@ -986,10 +1059,72 @@ mod tests {
             .await
             .expect("alpha file should be flushed while the writer is idle");
 
-        assert_eq!(alpha.trim(), "{\"value\":1}");
+        assert_eq!(alpha.lines().last(), Some(r#"{"value":1}"#));
 
         drop(tx);
         handle.await.expect("writer task should complete");
+    }
+
+    #[tokio::test]
+    async fn writer_writes_header_once_per_file_and_on_node_change() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let trace_dir = dir.path().join("traces");
+
+        let (tx, rx) = mpsc::channel(16);
+        let writer = TraceWriter::new(trace_dir.clone(), JsonlTraceConfig::default());
+        let handle = tokio::spawn(run_trace_writer(rx, writer, CancellationToken::new()));
+
+        for (node, value) in [("a", 1), ("a", 2), ("b", 3), ("b", 4)] {
+            tx.send(write_event_for_node(
+                node,
+                "alpha",
+                "alpha.jsonl",
+                format!(r#"{{"value":{value}}}"#).into_bytes(),
+            ))
+            .await
+            .expect("send should succeed");
+        }
+
+        drop(tx);
+        handle.await.expect("writer task should complete");
+
+        let alpha = tokio::fs::read_to_string(trace_dir.join("alpha.jsonl"))
+            .await
+            .expect("alpha file");
+        assert_eq!(
+            alpha.lines().collect::<Vec<_>>(),
+            [
+                header_line("a").as_str(),
+                r#"{"value":1}"#,
+                r#"{"value":2}"#,
+                header_line("b").as_str(),
+                r#"{"value":3}"#,
+                r#"{"value":4}"#,
+            ]
+        );
+
+        // A restarted process appends a fresh header to the existing file.
+        let (tx, rx) = mpsc::channel(16);
+        let writer = TraceWriter::new(trace_dir.clone(), JsonlTraceConfig::default());
+        let handle = tokio::spawn(run_trace_writer(rx, writer, CancellationToken::new()));
+        tx.send(write_event_for_node(
+            "b",
+            "alpha",
+            "alpha.jsonl",
+            br#"{"value":5}"#.to_vec(),
+        ))
+        .await
+        .expect("send should succeed");
+        drop(tx);
+        handle.await.expect("writer task should complete");
+
+        let alpha = tokio::fs::read_to_string(trace_dir.join("alpha.jsonl"))
+            .await
+            .expect("alpha file");
+        assert_eq!(
+            alpha.lines().rev().take(2).collect::<Vec<_>>(),
+            [r#"{"value":5}"#, header_line("b").as_str()]
+        );
     }
 
     #[test]
@@ -1001,11 +1136,11 @@ mod tests {
             Err(JsonlTraceReserveError::Disabled)
         ));
 
-        let send_result = tracer.try_send(JsonlWriteEvent {
-            table: "alpha",
-            file_name: "alpha.jsonl",
-            line: br#"{"value":1}"#.to_vec(),
-        });
+        let send_result = tracer.try_send(write_event(
+            "alpha",
+            "alpha.jsonl",
+            br#"{"value":1}"#.to_vec(),
+        ));
 
         assert!(matches!(send_result, Err(JsonlTraceSendError::Disabled(_))));
     }
@@ -1024,11 +1159,11 @@ mod tests {
         let tracer = guard.tracer();
 
         tracer
-            .try_send(JsonlWriteEvent {
-                table: "alpha",
-                file_name: "alpha.jsonl",
-                line: br#"{"value":1}"#.to_vec(),
-            })
+            .try_send(write_event(
+                "alpha",
+                "alpha.jsonl",
+                br#"{"value":1}"#.to_vec(),
+            ))
             .expect("queued row");
 
         guard.shutdown().await;
@@ -1036,7 +1171,7 @@ mod tests {
         let alpha = tokio::fs::read_to_string(trace_dir.join("alpha.jsonl"))
             .await
             .expect("alpha file");
-        assert_eq!(alpha.trim(), "{\"value\":1}");
+        assert_eq!(alpha.lines().last(), Some(r#"{"value":1}"#));
     }
 
     #[test]
@@ -1066,17 +1201,17 @@ mod tests {
         let tracer = JsonlTracer::new(tx);
 
         tracer
-            .try_send(JsonlWriteEvent {
-                table: "alpha",
-                file_name: "alpha.jsonl",
-                line: br#"{"value":1}"#.to_vec(),
-            })
+            .try_send(write_event(
+                "alpha",
+                "alpha.jsonl",
+                br#"{"value":1}"#.to_vec(),
+            ))
             .expect("first row fits");
-        let full = tracer.try_send(JsonlWriteEvent {
-            table: "alpha",
-            file_name: "alpha.jsonl",
-            line: br#"{"value":2}"#.to_vec(),
-        });
+        let full = tracer.try_send(write_event(
+            "alpha",
+            "alpha.jsonl",
+            br#"{"value":2}"#.to_vec(),
+        ));
 
         assert!(matches!(full, Err(JsonlTraceSendError::Full(_))));
     }
@@ -1087,21 +1222,21 @@ mod tests {
         let tracer = JsonlTracer::new(tx);
 
         tracer
-            .try_send(JsonlWriteEvent {
-                table: "alpha",
-                file_name: "alpha.jsonl",
-                line: br#"{"value":0}"#.to_vec(),
-            })
+            .try_send(write_event(
+                "alpha",
+                "alpha.jsonl",
+                br#"{"value":0}"#.to_vec(),
+            ))
             .expect("first row fits");
 
         let start = Instant::now();
         let mut full = 0;
         for value in 0..10_000 {
-            let result = tracer.try_send(JsonlWriteEvent {
-                table: "alpha",
-                file_name: "alpha.jsonl",
-                line: format!(r#"{{"value":{value}}}"#).into_bytes(),
-            });
+            let result = tracer.try_send(write_event(
+                "alpha",
+                "alpha.jsonl",
+                format!(r#"{{"value":{value}}}"#).into_bytes(),
+            ));
             if matches!(result, Err(JsonlTraceSendError::Full(_))) {
                 full += 1;
             }

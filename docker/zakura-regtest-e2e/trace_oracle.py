@@ -64,6 +64,10 @@ COMMIT_TREND_FACTOR = 4.0
 APPLY_CLASS_FULL = "full"
 LEGACY_ROUND_FINISH = "round_finish"
 LEGACY_CHECKPOINT_HANDOFF = "checkpoint_handoff"
+# Header row the JSONL writer puts at the start of each process's rows in a
+# file. Its `node` and `process_trace_id` apply to every following row.
+TRACE_START = "trace_start"
+TRACE_HEADER_FIELDS = ("node", "process_trace_id")
 
 
 @dataclass(frozen=True)
@@ -261,6 +265,7 @@ def read_jsonl(path: Path, node: str, table: str) -> list[TraceRow]:
         return []
 
     rows: list[TraceRow] = []
+    header: dict[str, Any] = {}
     with path.open("r", encoding="utf-8") as handle:
         for index, line in enumerate(handle, start=1):
             line = line.strip()
@@ -284,6 +289,12 @@ def read_jsonl(path: Path, node: str, table: str) -> list[TraceRow]:
                 )
                 continue
             if isinstance(value, dict):
+                if value.get("event") == TRACE_START:
+                    header = {field: value[field] for field in TRACE_HEADER_FIELDS if field in value}
+                    continue
+                # Rows written before the header format carry these fields inline.
+                for field, field_value in header.items():
+                    value.setdefault(field, field_value)
                 rows.append(TraceRow(node, table, index, value))
     return rows
 
@@ -1155,6 +1166,44 @@ def run_self_test() -> None:
         assert not check_v7_request_ids(
             load_traces(root / "v7_cross_process_ids")
         ), "request IDs may restart in a distinct traced process"
+
+        header_ids = {key: value for key, value in duplicate.items() if key != "process_trace_id"}
+        header_process_ids = root / "v7_header_process_ids" / "node2"
+        write_jsonl(
+            header_process_ids / "header_sync.jsonl",
+            [
+                {"event": TRACE_START, "node": "node2", "process_trace_id": "first-process"},
+                {"ts": 1, **header_ids},
+                {"event": TRACE_START, "node": "node2", "process_trace_id": "restarted-process"},
+                {"ts": 1, **header_ids},
+            ],
+        )
+        header_rows = load_traces(root / "v7_header_process_ids")[0].tables["header_sync"]
+        assert [row.row["process_trace_id"] for row in header_rows] == [
+            "first-process",
+            "restarted-process",
+        ], "rows take process_trace_id from the latest header and headers are not rows"
+
+        mixed_process_ids = root / "v7_mixed_process_ids" / "node2"
+        write_jsonl(
+            mixed_process_ids / "header_sync.jsonl",
+            [
+                {"ts": 1, **header_ids, "node": "node2", "process_trace_id": "old-format-process"},
+                {"event": TRACE_START, "node": "node2", "process_trace_id": "upgraded-process"},
+                {"ts": 1, **header_ids},
+            ],
+        )
+        mixed_rows = load_traces(root / "v7_mixed_process_ids")[0].tables["header_sync"]
+        assert [row.row["process_trace_id"] for row in mixed_rows] == [
+            "old-format-process",
+            "upgraded-process",
+        ], "old-format rows keep inline ids when a new process appends headers"
+        assert not check_v7_request_ids(
+            load_traces(root / "v7_mixed_process_ids")
+        ), "request IDs may restart after an upgrade appends to an old-format file"
+        assert not check_v7_request_ids(
+            load_traces(root / "v7_header_process_ids")
+        ), "header process ids separate request IDs across restarts"
 
         handoff = root / "handoff" / "node2"
         write_jsonl(

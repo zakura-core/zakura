@@ -289,7 +289,12 @@ mod tests {
             *shared_path.lock().unwrap() = Some(capture.persisted_path().to_path_buf());
             fs::write(
                 capture.path().join("conn.jsonl"),
-                r#"{"node":"01","event":"accepted","conn":1}"#.to_string() + "\n",
+                format!(
+                    r#"{{"event":"{}","node":"01","process_trace_id":"1-2"}}"#,
+                    zakura_jsonl_trace::TRACE_START_EVENT
+                ) + "\n"
+                    + r#"{"event":"accepted","conn":1}"#
+                    + "\n",
             )
             .unwrap();
 

@@ -7,6 +7,7 @@ use std::{
 };
 
 use serde_json::Value;
+use zakura_jsonl_trace::TRACE_START_EVENT;
 
 /// Loaded Zakura trace tables.
 #[derive(Clone, Debug, Default)]
@@ -18,6 +19,8 @@ pub struct TraceReader {
 struct TraceRow {
     table: String,
     source_node: Option<String>,
+    /// The `node` from the latest header row preceding this row in its file.
+    header_node: Option<String>,
     row: Value,
 }
 
@@ -113,17 +116,23 @@ impl TraceReader {
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid trace file name"))?
             .to_string();
         let file = fs::File::open(path)?;
+        let mut header_node = None;
 
         for line in io::BufReader::new(file).lines() {
             let line = line?;
             if line.trim().is_empty() {
                 continue;
             }
-            let row = serde_json::from_str(&line)
+            let row: Value = serde_json::from_str(&line)
                 .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+            if row.get("event").and_then(Value::as_str) == Some(TRACE_START_EVENT) {
+                header_node = row.get("node").and_then(Value::as_str).map(str::to_string);
+                continue;
+            }
             self.rows.push(TraceRow {
                 table: table.clone(),
                 source_node: source_node.clone(),
+                header_node: header_node.clone(),
                 row,
             });
         }
@@ -238,10 +247,9 @@ impl TraceRow {
             return source_node == node;
         }
 
-        self.row
-            .get("node")
-            .and_then(Value::as_str)
-            .is_some_and(|row_node| row_node == node)
+        // Rows written before the header format carry their node inline.
+        let row_node = self.row.get("node").and_then(Value::as_str);
+        row_node.or(self.header_node.as_deref()) == Some(node)
     }
 }
 
@@ -257,6 +265,11 @@ fn source_node_from_dir(path: &Path) -> Option<String> {
 mod tests {
     use super::*;
 
+    fn header(node: &str) -> String {
+        format!(r#"{{"event":"{TRACE_START_EVENT}","node":"{node}","process_trace_id":"1-2"}}"#)
+            + "\n"
+    }
+
     #[test]
     fn reader_counts_and_matches_subsequences_within_a_table() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -264,9 +277,10 @@ mod tests {
         fs::create_dir_all(&node_dir).expect("node dir");
         fs::write(
             node_dir.join("handshake.jsonl"),
-            r#"{"node":"01","event":"control.started"}"#.to_string()
+            header("01")
+                + r#"{"event":"control.started"}"#
                 + "\n"
-                + r#"{"node":"01","event":"control.succeeded"}"#
+                + r#"{"event":"control.succeeded"}"#
                 + "\n",
         )
         .expect("trace file");
@@ -279,6 +293,11 @@ mod tests {
                 .count("control.started"),
             1
         );
+        assert_eq!(
+            reader.table("handshake").rows().len(),
+            2,
+            "header rows are not returned as trace rows"
+        );
         reader
             .node("01")
             .table("handshake")
@@ -286,19 +305,76 @@ mod tests {
     }
 
     #[test]
-    fn reader_uses_node_subdir_before_row_node_field() {
+    fn reader_uses_node_subdir_before_header_node() {
         let dir = tempfile::tempdir().expect("tempdir");
         let node_dir = dir.path().join("node-01");
         fs::create_dir_all(&node_dir).expect("node dir");
         fs::write(
             node_dir.join("conn.jsonl"),
-            r#"{"node":"wrong","event":"accepted"}"#.to_string() + "\n",
+            header("wrong") + r#"{"event":"accepted"}"# + "\n",
         )
         .expect("trace file");
 
         let reader = TraceReader::load(dir.path()).expect("reader");
         assert_eq!(reader.node("01").table("conn").count("accepted"), 1);
         assert_eq!(reader.node("wrong").table("conn").count("accepted"), 0);
+    }
+
+    #[test]
+    fn reader_attributes_rows_to_the_latest_header_node() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        fs::write(
+            dir.path().join("conn.jsonl"),
+            header("01")
+                + r#"{"event":"accepted"}"#
+                + "\n"
+                + &header("02")
+                + r#"{"event":"accepted"}"#
+                + "\n"
+                + r#"{"event":"accepted"}"#
+                + "\n",
+        )
+        .expect("trace file");
+
+        let reader = TraceReader::load(dir.path()).expect("reader");
+        assert_eq!(reader.node("01").table("conn").count("accepted"), 1);
+        assert_eq!(reader.node("02").table("conn").count("accepted"), 2);
+    }
+
+    #[test]
+    fn reader_attributes_old_format_rows_by_their_node_field() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        fs::write(
+            dir.path().join("conn.jsonl"),
+            r#"{"node":"01","process_trace_id":"1-2","event":"accepted"}"#.to_string()
+                + "\n"
+                + r#"{"node":"02","process_trace_id":"1-2","event":"accepted"}"#
+                + "\n",
+        )
+        .expect("trace file");
+
+        let reader = TraceReader::load(dir.path()).expect("reader");
+        assert_eq!(reader.node("01").table("conn").count("accepted"), 1);
+        assert_eq!(reader.node("02").table("conn").count("accepted"), 1);
+    }
+
+    #[test]
+    fn reader_handles_header_rows_appended_to_an_old_format_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        fs::write(
+            dir.path().join("conn.jsonl"),
+            r#"{"node":"01","process_trace_id":"1-2","event":"accepted"}"#.to_string()
+                + "\n"
+                + &header("02")
+                + r#"{"event":"accepted"}"#
+                + "\n",
+        )
+        .expect("trace file");
+
+        let reader = TraceReader::load(dir.path()).expect("reader");
+        assert_eq!(reader.node("01").table("conn").count("accepted"), 1);
+        assert_eq!(reader.node("02").table("conn").count("accepted"), 1);
+        assert_eq!(reader.table("conn").rows().len(), 2);
     }
 
     #[test]
@@ -310,12 +386,12 @@ mod tests {
         fs::create_dir_all(&node_a).expect("node-a dir");
         fs::write(
             node_b.join("conn.jsonl"),
-            r#"{"node":"b","event":"from-b"}"#.to_string() + "\n",
+            header("b") + r#"{"event":"from-b"}"# + "\n",
         )
         .expect("node-b trace file");
         fs::write(
             node_a.join("conn.jsonl"),
-            r#"{"node":"a","event":"from-a"}"#.to_string() + "\n",
+            header("a") + r#"{"event":"from-a"}"# + "\n",
         )
         .expect("node-a trace file");
 

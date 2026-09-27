@@ -346,7 +346,13 @@ mod tests {
 
         let events = std::fs::read_to_string(dir.path().join(TABLE.file_name()))
             .expect("legacy peer trace file is written");
-        let lines: Vec<_> = events.lines().collect();
+        let (header, lines) = events
+            .split_once('\n')
+            .expect("trace file starts with a header row");
+        let header: Value = serde_json::from_str(header).expect("header row is valid JSON");
+        assert_eq!(header["event"], zakura_jsonl_trace::TRACE_START_EVENT);
+        assert_eq!(header["node"], "test-node");
+        let lines: Vec<_> = lines.lines().collect();
         let events: Vec<Value> = lines
             .iter()
             .map(|line| serde_json::from_str(line).expect("trace row is valid JSON"))
@@ -358,7 +364,6 @@ mod tests {
             lines[0],
             &[
                 "ts",
-                "node",
                 "event",
                 "request_id",
                 "peer_id",
@@ -377,7 +382,6 @@ mod tests {
             lines[1],
             &[
                 "ts",
-                "node",
                 "event",
                 "request_id",
                 "peer_id",
@@ -439,7 +443,8 @@ mod tests {
 
         let event = std::fs::read_to_string(dir.path().join(TABLE.file_name()))
             .expect("legacy peer trace file is written");
-        let event: Value = serde_json::from_str(event.trim()).expect("trace row is valid JSON");
+        let event = event.lines().last().expect("trace row is written");
+        let event: Value = serde_json::from_str(event).expect("trace row is valid JSON");
 
         assert_eq!(event["hash_count"], hash_count);
         assert_eq!(event["inferred_start_height"], 91);

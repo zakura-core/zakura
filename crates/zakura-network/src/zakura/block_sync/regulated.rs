@@ -2,7 +2,7 @@
 //!
 //! Production serving uses the shared runtime and state-owned reads. The live
 //! requester authorizes responses and fences publication through replacement.
-//! The stream table applies frame and cadence checks before payload allocation.
+//! The stream table checks frames and observes cadence before payload allocation.
 #![allow(dead_code)]
 
 pub(super) mod live_requester;

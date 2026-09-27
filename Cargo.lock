@@ -7290,6 +7290,8 @@ dependencies = [
  "tempfile",
  "toml 1.1.2+spec-1.1.0",
  "tonic-prost-build",
+ "zakura-chain",
+ "zakura-protocol",
 ]
 
 [[package]]
@@ -7359,6 +7361,7 @@ dependencies = [
  "rayon",
  "regex",
  "reqwest 0.12.28",
+ "secp256k1",
  "semver",
  "sentry",
  "serde",
@@ -7823,7 +7826,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-network"
-version = "8.0.0"
+version = "9.0.0"
 dependencies = [
  "bitflags",
  "blake2b_simd",

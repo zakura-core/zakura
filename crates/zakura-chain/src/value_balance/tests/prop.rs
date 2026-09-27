@@ -267,3 +267,41 @@ proptest! {
         prop_assert_eq!(i64::from(pools.total().unwrap()), monetary);
     }
 }
+
+proptest! {
+    #[test]
+    fn nsm_release_seed_ignores_pool_distribution_and_previous_counter(
+        cuts in prop::array::uniform5(0u32..=1_000_000),
+        issued_fraction in 0u32..=1_000_000,
+        stale_counter in 0i64..=MAX_MONEY,
+    ) {
+        use crate::{block::Height, parameters::{Network, subsidy::scheduled_issuance_zatoshis, testnet::{RegtestParameters, ConfiguredActivationHeights}}};
+        let network = Network::new_regtest(RegtestParameters {
+            activation_heights: ConfiguredActivationHeights { nu7: Some(5), ..Default::default() },
+            ..Default::default()
+        });
+        let height = Height(4);
+        let scheduled = i64::try_from(scheduled_issuance_zatoshis(height, &network).unwrap()).unwrap();
+        let issued = scheduled * i64::from(issued_fraction) / 1_000_000;
+        let mut cuts = cuts.map(|cut| issued * i64::from(cut) / 1_000_000);
+        cuts.sort_unstable();
+        let mut edges = [0; 7];
+        edges[1..6].copy_from_slice(&cuts);
+        edges[6] = issued;
+        let amounts: Vec<_> = edges.windows(2).map(|pair| Amount::try_from(pair[1] - pair[0]).unwrap()).collect();
+        let mut pools = ValueBalance {
+            transparent: amounts[0], sprout: amounts[1], sapling: amounts[2],
+            orchard: amounts[3], deferred: amounts[4], ironwood: amounts[5],
+            nsm_value_balance: Amount::try_from(stale_counter).unwrap(),
+        };
+        let expected = Amount::<NonNegative>::try_from(scheduled - issued).unwrap();
+        prop_assert_eq!(pools.initial_nsm_value_balance(height, &network).unwrap(), expected);
+        let seeded = pools.seed_nsm_value_balance(height, &network).unwrap();
+        prop_assert_eq!(i64::from(seeded.nsm_value_balance_amount()), i64::from(expected));
+        prop_assert_eq!(seeded.seed_nsm_value_balance(height, &network).unwrap(), seeded);
+        prop_assert_eq!(pools.seed_nsm_value_balance(Height(3), &network).unwrap(), pools);
+        prop_assert_eq!(pools.seed_nsm_value_balance(Height(5), &network).unwrap(), pools);
+        pools = ValueBalance::from_transparent_amount(Amount::try_from(scheduled + 1).unwrap());
+        prop_assert!(pools.initial_nsm_value_balance(height, &network).is_err());
+    }
+}

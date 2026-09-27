@@ -9,6 +9,7 @@ use std::{
 
 mod header_conformance;
 mod header_fuzz;
+mod nu7_readiness;
 mod rpc_artifacts;
 
 const DEFAULT_FEATURES: &str = "default-release-binaries";
@@ -38,6 +39,14 @@ fn try_main() -> Result<(), BoxError> {
             }
 
             package_ubuntu()
+        }
+        Some("nu7-readiness") => {
+            if args.next().is_some() {
+                return Err(Box::new(UsageError(
+                    "nu7-readiness does not accept arguments",
+                )));
+            }
+            nu7_readiness::run()
         }
         Some("header-conformance") => {
             let rule_id = args.next();
@@ -281,6 +290,7 @@ fn print_usage(output: &mut impl fmt::Write) -> fmt::Result {
     writeln!(output, "Usage:")?;
     writeln!(output, "  cargo xtask package ubuntu")?;
     writeln!(output, "  cargo xtask header-conformance [LC-…]")?;
+    writeln!(output, "  cargo xtask nu7-readiness")?;
     writeln!(output, "  cargo xtask minimize-header-fuzz <artifact>")?;
     writeln!(output, "  cargo xtask generate-rpc-artifacts")?;
     writeln!(output, "  cargo xtask check-rpc-artifacts")?;

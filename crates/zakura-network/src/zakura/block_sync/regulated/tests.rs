@@ -84,6 +84,8 @@ fn capacity(body_bytes: u32) -> ServeCapacity {
         "block-sync",
         &GET_BLOCKS,
         ServeLimits {
+            node_output_responses: 4,
+            peer_output_responses: 2,
             node_execution: 1,
             peer_execution: 1,
             peer_output_bytes: bytes * 2,

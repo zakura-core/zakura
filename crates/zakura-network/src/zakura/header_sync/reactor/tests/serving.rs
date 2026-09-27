@@ -25,6 +25,7 @@ fn port_page_serves_finalized_tree_aux_without_peer_delivery_provenance() {
         headers: vec![header],
         aux_deliveries: vec![Vec::new()],
         finalized_tree_aux: vec![Some(tree_aux)],
+        finalized_body_sizes: vec![None],
         complete: true,
     };
 
@@ -34,6 +35,79 @@ fn port_page_serves_finalized_tree_aux_without_peer_delivery_provenance() {
     assert_eq!(served.tree_aux_schema, AuxSchema::V1);
     assert_eq!(served.entries[0].tree_aux, Some(tree_aux));
     assert_eq!(served.entries[0].body_size, 0);
+}
+
+#[test]
+fn port_page_prefers_committed_body_size_over_delivery_hints() {
+    let header = regtest_genesis_block().header.clone();
+    let hash = header.hash();
+    let frontier = zakura_header_chain::Frontier::new(block::Height(0), hash);
+    let scope = || zakura_header_chain::HeaderWorkAuthority {
+        header_generation: zakura_header_chain::HeaderGeneration::new(1),
+        branch: zakura_header_chain::BranchId::new(hash, hash),
+    };
+    let owner: zakura_header_chain::HeaderSyncWorkOwner = scope()
+        .bind(3, std::num::NonZeroU64::new(4).expect("four is nonzero"))
+        .into();
+    let advertised = zakura_header_chain::AuxDelivery::new(
+        zakura_header_chain::EvidenceId::from_digest([1; 32]),
+        hash,
+        zakura_header_chain::SourceId::from_digest([2; 32]),
+        owner,
+        zakura_header_chain::BodySizeHint::Known(
+            std::num::NonZeroU32::new(777).expect("the hint is nonzero"),
+        ),
+        None,
+    );
+    let page = |finalized_body_size: Option<std::num::NonZeroU32>| {
+        zakura_node_services::header_chain::RetainedHeaderPathPage {
+            common_ancestor: frontier,
+            target: frontier,
+            scope: scope(),
+            headers: vec![header.clone()],
+            aux_deliveries: vec![vec![advertised]],
+            finalized_tree_aux: vec![None],
+            finalized_body_sizes: vec![finalized_body_size],
+            complete: true,
+        }
+    };
+
+    let served =
+        assemble_port_header_path_page(1, page(std::num::NonZeroU32::new(1_234)), AuxSchema::None)
+            .expect("the page is coherent");
+    assert_eq!(
+        served.entries[0].body_size, 1_234,
+        "the committed size wins"
+    );
+
+    let served = assemble_port_header_path_page(1, page(None), AuxSchema::None)
+        .expect("the page is coherent");
+    assert_eq!(
+        served.entries[0].body_size, 777,
+        "the delivery hint is the fallback"
+    );
+}
+
+#[test]
+fn port_page_rejects_misaligned_body_sizes() {
+    let header = regtest_genesis_block().header.clone();
+    let hash = header.hash();
+    let frontier = zakura_header_chain::Frontier::new(block::Height(0), hash);
+    let page = zakura_node_services::header_chain::RetainedHeaderPathPage {
+        common_ancestor: frontier,
+        target: frontier,
+        scope: zakura_header_chain::HeaderWorkAuthority {
+            header_generation: zakura_header_chain::HeaderGeneration::new(1),
+            branch: zakura_header_chain::BranchId::new(hash, hash),
+        },
+        headers: vec![header],
+        aux_deliveries: vec![Vec::new()],
+        finalized_tree_aux: vec![None],
+        finalized_body_sizes: Vec::new(),
+        complete: true,
+    };
+
+    assert!(assemble_port_header_path_page(1, page, AuxSchema::None).is_none());
 }
 
 #[test]
@@ -744,4 +818,198 @@ async fn every_unservable_path_result_is_a_correlated_explicit_outcome() {
 
     shutdown.cancel();
     task.await.expect("the reactor exits cleanly");
+}
+
+#[test]
+fn served_aux_selection_is_deterministic_and_excludes_rejected_evidence() {
+    let owner: zakura_header_chain::HeaderSyncWorkOwner =
+        zakura_header_chain::HeaderWorkAuthority {
+            header_generation: zakura_header_chain::HeaderGeneration::new(2),
+            branch: zakura_header_chain::BranchId::new(block::Hash([1; 32]), block::Hash([2; 32])),
+        }
+        .bind(3, std::num::NonZeroU64::new(4).expect("four is nonzero"))
+        .into();
+    let source = zakura_header_chain::SourceId::from_digest([5; 32]);
+    let header_hash = block::Hash([6; 32]);
+    let tree_aux = TreeAuxRecordV1 {
+        height: block::Height(1),
+        sapling_root: Default::default(),
+        orchard_root: Default::default(),
+        ironwood_root: Default::default(),
+        sapling_tx_count: 0,
+        orchard_tx_count: 0,
+        ironwood_tx_count: 0,
+        auth_data_root: [0; 32].into(),
+    };
+    // status_code: 0 = fresh (unauthenticated), 1 = authenticated, 2 = rejected.
+    let delivery = |marker: u8, size: u32, status_code: u8| {
+        let delivery = zakura_header_chain::AuxDelivery::new(
+            zakura_header_chain::EvidenceId::from_digest([marker; 32]),
+            header_hash,
+            source,
+            owner,
+            zakura_header_chain::BodySizeHint::Known(
+                std::num::NonZeroU32::new(size).expect("test sizes are nonzero"),
+            ),
+            Some(tree_aux),
+        );
+        if status_code == 0 {
+            delivery
+        } else {
+            delivery
+                .test_only_with_outcome(
+                    status_code,
+                    [Some([marker.wrapping_add(6); 32]), None],
+                    Some(block::Hash([9; 32])),
+                )
+                .expect("the test outcome is coherent")
+        }
+    };
+    let rejected = delivery(1, 10, 2);
+    let unauthenticated = delivery(2, 20, 0);
+    let authenticated = delivery(3, 30, 1);
+    let deliveries = [rejected, unauthenticated, authenticated];
+
+    assert_eq!(
+        selected_port_aux_delivery(&deliveries, AuxSchema::V1),
+        Some(authenticated)
+    );
+    assert_eq!(
+        selected_port_aux_delivery(&deliveries, AuxSchema::None),
+        Some(authenticated)
+    );
+    assert_eq!(selected_port_aux_delivery(&[rejected], AuxSchema::V1), None);
+}
+
+#[test]
+fn retained_page_uses_v1_only_when_every_record_is_available() {
+    let header = regtest_genesis_block().header.clone();
+    let hash = header.hash();
+    let frontier = zakura_header_chain::Frontier::new(block::Height(0), hash);
+    let scope = || zakura_header_chain::HeaderWorkAuthority {
+        header_generation: zakura_header_chain::HeaderGeneration::new(2),
+        branch: zakura_header_chain::BranchId::new(block::Hash([1; 32]), block::Hash([2; 32])),
+    };
+    let owner: zakura_header_chain::HeaderSyncWorkOwner = scope()
+        .bind(3, std::num::NonZeroU64::new(4).expect("four is nonzero"))
+        .into();
+    let tree_aux = TreeAuxRecordV1 {
+        height: block::Height(0),
+        sapling_root: Default::default(),
+        orchard_root: Default::default(),
+        ironwood_root: Default::default(),
+        sapling_tx_count: 0,
+        orchard_tx_count: 0,
+        ironwood_tx_count: 0,
+        auth_data_root: [0; 32].into(),
+    };
+    let mut page = zakura_node_services::header_chain::RetainedHeaderPathPage {
+        common_ancestor: frontier,
+        target: frontier,
+        scope: scope(),
+        headers: vec![header],
+        aux_deliveries: vec![Vec::new()],
+        finalized_tree_aux: vec![None],
+        finalized_body_sizes: vec![None],
+        complete: true,
+    };
+
+    let fallback = assemble_port_header_path_page(1, page.clone(), AuxSchema::V1)
+        .expect("the coherent parallel page assembles");
+    assert_eq!(fallback.tree_aux_schema, AuxSchema::None);
+    assert_eq!(fallback.entries[0].body_size, 0);
+    assert_eq!(fallback.entries[0].tree_aux, None);
+
+    page.finalized_tree_aux[0] = Some(tree_aux);
+    let served_from_finalized_state =
+        assemble_port_header_path_page(1, page.clone(), AuxSchema::V1)
+            .expect("the coherent finalized-state page assembles");
+    assert_eq!(served_from_finalized_state.tree_aux_schema, AuxSchema::V1);
+    assert_eq!(served_from_finalized_state.entries[0].body_size, 0);
+    assert_eq!(
+        served_from_finalized_state.entries[0].tree_aux,
+        Some(tree_aux)
+    );
+    page.finalized_tree_aux[0] = None;
+
+    page.aux_deliveries[0].push(zakura_header_chain::AuxDelivery::new(
+        zakura_header_chain::EvidenceId::from_digest([10; 32]),
+        hash,
+        zakura_header_chain::SourceId::from_digest([11; 32]),
+        owner,
+        zakura_header_chain::BodySizeHint::Known(
+            std::num::NonZeroU32::new(321).expect("the hint is nonzero"),
+        ),
+        Some(tree_aux),
+    ));
+    let no_aux = assemble_port_header_path_page(1, page.clone(), AuxSchema::None)
+        .expect("the coherent parallel page assembles");
+    assert_eq!(no_aux.tree_aux_schema, AuxSchema::None);
+    assert_eq!(no_aux.entries[0].body_size, 321);
+    assert_eq!(no_aux.entries[0].tree_aux, None);
+
+    let served = assemble_port_header_path_page(1, page, AuxSchema::V1)
+        .expect("the coherent parallel page assembles");
+    assert_eq!(served.tree_aux_schema, AuxSchema::V1);
+    assert_eq!(served.entries[0].body_size, 321);
+    assert_eq!(served.entries[0].tree_aux, Some(tree_aux));
+}
+
+#[test]
+fn port_page_takes_the_size_from_any_retained_delivery_under_v1() {
+    let header = regtest_genesis_block().header.clone();
+    let hash = header.hash();
+    let frontier = zakura_header_chain::Frontier::new(block::Height(0), hash);
+    let scope = || zakura_header_chain::HeaderWorkAuthority {
+        header_generation: zakura_header_chain::HeaderGeneration::new(1),
+        branch: zakura_header_chain::BranchId::new(hash, hash),
+    };
+    let owner: zakura_header_chain::HeaderSyncWorkOwner = scope()
+        .bind(3, std::num::NonZeroU64::new(4).expect("four is nonzero"))
+        .into();
+    let tree_aux = TreeAuxRecordV1 {
+        height: block::Height(0),
+        sapling_root: Default::default(),
+        orchard_root: Default::default(),
+        ironwood_root: Default::default(),
+        sapling_tx_count: 0,
+        orchard_tx_count: 0,
+        ironwood_tx_count: 0,
+        auth_data_root: [0; 32].into(),
+    };
+    let rooted_without_size = zakura_header_chain::AuxDelivery::new(
+        zakura_header_chain::EvidenceId::from_digest([1; 32]),
+        hash,
+        zakura_header_chain::SourceId::from_digest([2; 32]),
+        owner,
+        zakura_header_chain::BodySizeHint::Unknown,
+        Some(tree_aux),
+    );
+    let sized_without_root = zakura_header_chain::AuxDelivery::new(
+        zakura_header_chain::EvidenceId::from_digest([3; 32]),
+        hash,
+        zakura_header_chain::SourceId::from_digest([4; 32]),
+        owner,
+        zakura_header_chain::BodySizeHint::Known(
+            std::num::NonZeroU32::new(555).expect("the hint is nonzero"),
+        ),
+        None,
+    );
+    let page = zakura_node_services::header_chain::RetainedHeaderPathPage {
+        common_ancestor: frontier,
+        target: frontier,
+        scope: scope(),
+        headers: vec![header],
+        aux_deliveries: vec![vec![rooted_without_size, sized_without_root]],
+        finalized_tree_aux: vec![None],
+        finalized_body_sizes: vec![None],
+        complete: true,
+    };
+
+    let served =
+        assemble_port_header_path_page(1, page, AuxSchema::V1).expect("the page is coherent");
+
+    assert_eq!(served.tree_aux_schema, AuxSchema::V1);
+    assert_eq!(served.entries[0].tree_aux, Some(tree_aux));
+    assert_eq!(served.entries[0].body_size, 555);
 }

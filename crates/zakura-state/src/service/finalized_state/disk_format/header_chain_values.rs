@@ -1098,6 +1098,28 @@ fn get_unavailable(
     })
 }
 
+impl FallibleDiskValue for BodySizeHint {
+    type Error = HeaderChainValueError;
+
+    fn encode(&self) -> Result<Vec<u8>, Self::Error> {
+        let value = match self {
+            Self::Unknown => 0,
+            Self::Known(size) => size.get(),
+        };
+        Ok(value.to_be_bytes().to_vec())
+    }
+
+    fn decode(bytes: &[u8]) -> Result<Self, Self::Error> {
+        let mut decoder = Decoder::new(bytes);
+        let value = decoder.u32()?;
+        decoder.finish()?;
+        Self::new(value).map_err(|_| HeaderChainValueError::Oversized {
+            field: "scheduling_body_size",
+            length: usize::try_from(value).unwrap_or(usize::MAX),
+        })
+    }
+}
+
 impl FallibleDiskValue for AuxDelivery {
     type Error = HeaderChainValueError;
 

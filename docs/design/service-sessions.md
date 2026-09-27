@@ -56,11 +56,16 @@ data, requests, and events before handing their receive/send handles to the
 service. It does not wait for a lookup request.
 
 Each `Stream` constant also declares that stream's traffic and bounds:
-`message_types`, `payload_limits`, `queue_depths`, and `write_policy`. A
-declaration lists only the fields that differ from `Stream::PERSISTENT` or
-`Stream::REQUEST_RESPONSE`. The protocol defines message assignments; peers do
-not negotiate individual message types. The service routes outgoing messages to
-the appropriate sender.
+`messages`, `queue_depths`, and `write_policy`. A declaration lists only the
+fields that differ from `Stream::PERSISTENT` or `Stream::REQUEST_RESPONSE`. The
+protocol defines message assignments; peers do not negotiate individual message
+types. The service routes outgoing messages to the appropriate sender.
+
+`messages` is the stream's message table. A response row may answer a request
+row on another member of the session, so the table describes a stream pair
+without pair-specific code. The
+[message regulation design](peer-message-regulation.md#message-tables) describes
+the tables and their checks.
 
 `write_policy` sets each persistent stream's write deadline. The default is ten
 seconds. A service can choose another duration or `UntilCancelled`. A service

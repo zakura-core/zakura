@@ -41,6 +41,34 @@ Ordinary local failures release resources whose work has ended and return affect
 scheduler. They do not count as peer violations. Universal panic recovery belongs to separate
 runtime work. Bounded decoder tests still check that untrusted payloads cannot cause a panic.
 
+## Message tables
+
+A stream can declare a message table: one row for each message type it carries.
+A row states the message's role, its payload bounds, and the limits its role
+needs. An announcement declares its cadence. A request declares its in-flight
+limit and an optional cadence. A response names the request it answers and
+whether it ends the exchange. Rows hold values only. A bound that depends on a
+message's contents stays in the codec or the reactor.
+
+The table is the single source for three checks. The reader checks each frame
+header against it before it reads the payload. The message family's codec
+checks each payload against the same rows. Generated test suites read the rows,
+so a new message needs a row and a codec arm, not new bound tests.
+
+A layout is one request/response stream, or the persistent streams of one
+service session. A response row may answer a request row on another stream of
+its layout. A stream pair is a layout whose request rows sit on their own
+stream. It needs no pair-specific code.
+
+`Stream::validate_layout` checks a layout's tables in a `const` item, so a bad
+table fails the build. The registry repeats the check at startup. These checks
+cover the tables' consistency only. The stream arrangement must still
+demonstrate progress under paused reads with the transport tests below.
+
+A stream without a table keeps the legacy behavior: its reader admits any
+message type and any flags up to the stream's frame cap. Reactors adopt tables
+one at a time.
+
 ## Capacity admission and QUIC backpressure
 
 The receiver starts response work only when worker capacity and bounded output capacity are
@@ -142,8 +170,7 @@ Diagnostics identify protocol violations and local failures with bounded logging
 Sampling or aggregation is allowed. Complete per-decision traces are optional test/debug output.
 No particular file name or schema is required.
 
-A new exhaustive model explorer, compiler-enforced declaration framework, and universal
-panic-recovery suite are deferred. The [testing design](property-testing.md) and
+A new exhaustive model explorer and universal panic-recovery suite are deferred. The [testing design](property-testing.md) and
 [GetBlocks plan](property-testing-block-sync-infrastructure.md) describe the initial checks.
 
 ## Adoption order

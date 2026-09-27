@@ -405,6 +405,10 @@ impl StoreAuditSnapshot for HeaderChainAuditSnapshot<'_> {
                 let key = HeaderAuxDeliveryKey::from_bytes(key);
                 let delivery = decode_untrusted_aux_delivery(value)
                     .map_err(|_| StoreError::Incoherent("invalid auxiliary value"))?;
+                let delivery = delivery.with_scheduling_body_size(
+                    self.get_value(HEADER_AUX_BODY_SIZE, key.as_bytes())?
+                        .unwrap_or(zakura_header_chain::BodySizeHint::Unknown),
+                );
                 if delivery.delivery().header_hash != key.header
                     || delivery.delivery().delivery_id != key.delivery
                 {

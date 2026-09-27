@@ -994,10 +994,13 @@ fn peers_receiving_block_request(
 
     let (discovered_peers, mut handles) =
         peer_versions.mock_peer_discovery_with_services(peer_services);
+    let (minimum_peer_version, _best_tip) =
+        MinimumPeerVersion::with_mock_chain_tip(&Network::Mainnet);
 
     runtime.block_on(async move {
         let (mut peer_set, mut peer_set_guard) = PeerSetBuilder::new()
             .with_discover(discovered_peers)
+            .with_minimum_peer_version(minimum_peer_version)
             .max_conns_per_ip(max(peer_services.len(), DEFAULT_MAX_CONNS_PER_IP))
             .build();
 

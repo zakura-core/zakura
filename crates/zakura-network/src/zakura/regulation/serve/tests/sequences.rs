@@ -105,8 +105,13 @@ fn run(ops: Vec<Op>) -> Result<(), TestCaseError> {
                 );
             }
             prop_assert!(capacity.node_execution_held() <= limits.node_execution);
+            prop_assert!(capacity.node_output_responses.reserved() <= limits.node_output_responses);
             for peer_n in 1..=3 {
                 prop_assert!(capacity.peer_held(&peer(peer_n)).0 <= limits.peer_execution);
+                prop_assert!(
+                    capacity.peer(&peer(peer_n)).output_responses.reserved()
+                        <= limits.peer_output_responses
+                );
             }
         }
         // Release everything; every counter returns to zero.
@@ -127,6 +132,7 @@ fn run(ops: Vec<Op>) -> Result<(), TestCaseError> {
         }
         prop_assert_eq!(capacity.node_execution_held(), 0);
         prop_assert_eq!(capacity.node_output_held(), 0);
+        prop_assert_eq!(capacity.node_output_responses.reserved(), 0);
         prop_assert_eq!(capacity.active_and_waiting(), (0, 0));
         for peer_n in 1..=3 {
             prop_assert_eq!(capacity.peer_held(&peer(peer_n)), (0, 0));

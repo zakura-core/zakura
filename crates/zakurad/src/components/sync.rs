@@ -2025,6 +2025,16 @@ where
         }
 
         let mut download_set = IndexSet::new();
+        // Overlap one advertised block with discovery, without changing checkpoint batches
+        // or competing with sync downloads already in progress. Gossip stays independent
+        // so a slow early source cannot suppress a later, faster download.
+        let allow_early_download = !checkpoint_bootstrap
+            && self.downloads.in_flight() == 0
+            && self
+                .latest_chain_tip
+                .best_tip_height()
+                .is_some_and(|height| height >= self.max_checkpoint_height);
+        let mut early_hash = None;
         while let Some(res) = requests.next().await {
             match res
                 .unwrap_or_else(|e @ JoinError { .. }| {
@@ -2042,6 +2052,8 @@ where
             {
                 Ok(zn::Response::BlockHashes(hashes)) => {
                     trace!(?hashes);
+                    // Only singleton wire inventories advertise availability to our peer set.
+                    let singleton_advertisement = hashes.len() == 1;
 
                     // zcashd sometimes appends an unrelated hash at the start
                     // or end of its response.
@@ -2131,6 +2143,19 @@ where
                     debug!(new_hashes, "added hashes to download set");
                     metrics::histogram!("sync.obtain.response.hash.count")
                         .record(new_hashes as f64);
+                    if allow_early_download
+                        && singleton_advertisement
+                        && early_hash.is_none()
+                        && !requests.is_empty()
+                        && download_set.len() == 1
+                    {
+                        let hash = download_set[0];
+                        self.downloads
+                            .download_and_verify(hash)
+                            .await
+                            .map_err(|error| eyre!(error))?;
+                        early_hash = Some(hash);
+                    }
                 }
                 Ok(_) => unreachable!("network returned wrong response"),
                 // We ignore this error because we made multiple fanout requests.
@@ -2148,6 +2173,10 @@ where
 
         // Check that the new tips we got are actually unknown.
         for hash in &download_set {
+            // Our early task may already have committed while discovery was pending.
+            if Some(*hash) == early_hash {
+                continue;
+            }
             debug!(?hash, "checking if state contains hash");
             if self.state_contains(*hash).await? {
                 return Err(eyre!("queued download of hash behind our chain tip"));
@@ -2162,7 +2191,22 @@ where
         // so the last peer to respond can't toggle our mempool
         self.recent_syncs.push_obtain_tips_length(new_downloads);
 
-        let response = self.request_blocks(download_set).await;
+        let mut early_reserve = IndexSet::new();
+        if let Some(hash) = early_hash {
+            download_set.shift_remove(&hash);
+            // request_blocks bounds each batch, not the total outstanding work.
+            let available = self
+                .lookahead_limit(download_set.len())
+                .saturating_sub(self.downloads.in_flight());
+            if download_set.len() > available {
+                early_reserve = download_set.split_off(available);
+            }
+        }
+
+        let response = self.request_blocks(download_set).await.map(|mut reserve| {
+            reserve.extend(early_reserve);
+            reserve
+        });
 
         metrics::histogram!("sync.stage.duration_seconds", "stage" => "obtain_tips")
             .record(stage_start.elapsed().as_secs_f64());

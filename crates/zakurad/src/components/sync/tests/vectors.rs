@@ -4581,3 +4581,6 @@ fn scaled_lookahead_stays_below_the_drop_height() {
         );
     }
 }
+
+#[path = "early_discovery.rs"]
+mod early_discovery;

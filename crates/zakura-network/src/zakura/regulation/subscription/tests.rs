@@ -1039,6 +1039,8 @@ fn capacity() -> ServeCapacity {
         "test",
         &RULES[0],
         ServeLimits {
+            node_output_responses: 2,
+            peer_output_responses: 1,
             node_execution: 1,
             peer_execution: 1,
             peer_output_bytes: 1024,
@@ -1192,4 +1194,27 @@ fn retirement_with_a_live_subscription_closes_the_connection() {
             "the table stays usable; only the connection closes"
         );
     }
+}
+
+#[tokio::test]
+async fn pushed_pages_keep_response_slots_until_transport_completion() {
+    let capacity = capacity();
+    let push = capacity.push(&peer());
+    let (send, mut recv) = framed_channel(4);
+    let permit = push.acquire(1).await;
+    assert!(permit.send(&send, frame(message_type::PAGE)).await);
+    drop(push);
+    let replacement = capacity.push(&peer());
+    assert_eq!(capacity.node_execution_held(), 0);
+    assert!(replacement.acquire(1).now_or_never().is_none());
+    tokio::time::timeout(Duration::from_secs(1), recv.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    drop(
+        tokio::time::timeout(Duration::from_secs(1), replacement.acquire(1))
+            .await
+            .unwrap(),
+    );
+    assert_eq!(capacity.node_output_held(), 0);
 }

@@ -1,8 +1,8 @@
 //! Capacity for pushed frames, such as subscription pages.
 //!
 //! No request admits a pushed frame, so `Serve` never sees it. It still takes
-//! the budgets a served response takes, in the same order: peer output, node
-//! output, peer execution, then node execution. So pushes and served
+//! the budgets a served response takes, in the same order: peer and node
+//! response slots, output bytes, then execution slots. So pushes and served
 //! responses share every node-wide and per-peer bound.
 
 use std::sync::Arc;
@@ -43,6 +43,14 @@ impl Push {
         // Widening usize to u64 is lossless on supported targets.
         let bytes = (payload_len + FRAME_HEADER_BYTES) as u64;
         let delayed = |bound| self.capacity.metrics.delayed(bound);
+        let peer_response = wait(self.peer.output_responses.reserve(), || {
+            delayed("peer_output_responses")
+        })
+        .await;
+        let node_response = wait(self.capacity.node_output_responses.reserve(), || {
+            delayed("node_output_responses")
+        })
+        .await;
         let peer_output = &self.peer.output;
         let node_output = &self.capacity.node_output;
         let peer = wait(peer_output.grant(peer_output.clamp(bytes)), || {
@@ -55,7 +63,10 @@ impl Push {
         .await;
         let grants = ResponseGrants {
             _node: node,
+            _node_response: node_response,
             _peer: peer,
+            _peer_response: peer_response,
+            _peer_budgets: self.peer.clone(),
         };
         let peer = wait(self.peer.execution.reserve(), || delayed("peer_execution")).await;
         let node = wait(self.capacity.node_execution.reserve(), || {

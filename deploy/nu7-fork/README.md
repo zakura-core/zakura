@@ -264,8 +264,8 @@ The inline form on `https://zakura.com/nu7/` uses this API directly. Browser
 requests allow only the exact origins `https://zakura.com` and
 `https://nu7.valargroup.dev`; errors carry the same CORS headers so rate limits
 and address validation remain readable. Command-line requests without an Origin
-header remain supported. Local previews use a simulated API, not a production
-localhost allowlist.
+header remain supported. Local previews use a loopback proxy to the real staging
+faucet; production does not allow localhost origins.
 
 The website reads `GET /v1/faucet/status`, submits JSON `{"address":"utest1…"}`
 to `POST /v1/faucet/claim`, and polls `GET /v1/faucet/claim/<claimId>`.

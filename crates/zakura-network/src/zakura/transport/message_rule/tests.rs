@@ -8,9 +8,10 @@ use std::time::Duration;
 use super::{frame_filter::*, layout::LayoutError, *};
 use crate::zakura::{check_frame_filter, Stream, StreamMode, FRAME_HEADER_BYTES};
 
-const EVERY_15_SECONDS: Cadence = Cadence {
-    capacity: 4,
+const EVERY_30_SECONDS: Cadence = Cadence {
+    capacity: 22,
     refill_interval: Duration::from_secs(15),
+    send_interval: Duration::from_secs(30),
 };
 
 const fn announcement(message_type: u16) -> MessageRule {
@@ -18,7 +19,7 @@ const fn announcement(message_type: u16) -> MessageRule {
         message_type,
         payload: PayloadLen::exact(8),
         role: MessageRole::Announcement {
-            cadence: EVERY_15_SECONDS,
+            cadence: EVERY_30_SECONDS,
         },
     }
 }
@@ -229,11 +230,11 @@ fn a_request_allows_an_exchange_in_flight() {
 fn a_cadence_admits_a_message_and_refills() {
     let empty = Cadence {
         capacity: 0,
-        ..EVERY_15_SECONDS
+        ..EVERY_30_SECONDS
     };
     let frozen = Cadence {
         refill_interval: Duration::ZERO,
-        ..EVERY_15_SECONDS
+        ..EVERY_30_SECONDS
     };
     for cadence in [empty, frozen] {
         let announcement = MessageRule {
@@ -256,6 +257,48 @@ fn a_cadence_admits_a_message_and_refills() {
             Err(LayoutError::EmptyCadence { message_type: 2 })
         );
     }
+}
+
+#[test]
+fn a_cadence_refills_faster_than_its_sender_sends() {
+    for refill_interval in [EVERY_30_SECONDS.send_interval, Duration::from_secs(31)] {
+        let announcement = MessageRule {
+            role: MessageRole::Announcement {
+                cadence: Cadence {
+                    refill_interval,
+                    ..EVERY_30_SECONDS
+                },
+            },
+            ..STATUS
+        };
+        assert_eq!(
+            check(&[persistent(64, leak(&[announcement]))]),
+            Err(LayoutError::RefillNotFasterThanSender { message_type: 1 })
+        );
+    }
+}
+
+#[test]
+fn a_cadence_holds_the_burst_after_the_longest_outage() {
+    // Ten minutes of 30-second sends, the initial send, and one of jitter.
+    assert_eq!(Cadence::min_capacity(Duration::from_secs(30)), 22);
+    assert_eq!(Cadence::min_capacity(Duration::from_secs(7 * 60)), 3);
+    assert_eq!(Cadence::min_capacity(Duration::from_nanos(1)), u32::MAX);
+
+    let short = MessageRule {
+        role: MessageRole::Request {
+            max_in_flight: 1,
+            cadence: Some(Cadence {
+                capacity: 21,
+                ..EVERY_30_SECONDS
+            }),
+        },
+        ..GET
+    };
+    assert_eq!(
+        check(&[persistent(64, leak(&[short, DONE]))]),
+        Err(LayoutError::CapacityBelowStall { message_type: 2 })
+    );
 }
 
 #[test]

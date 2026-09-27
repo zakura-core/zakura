@@ -9,12 +9,15 @@
 //!
 //! 1. **Rows.** One constant per message, holding values only.
 //! 2. **Layouts.** [`SINGLE`] carries every row on one stream. [`PAIRED`] moves
-//!    the request row to its own stream, so a reader that waits for serving
-//!    capacity never delays the responses to the node's own requests. Both
-//!    layouts carry the same rows, and a `const` check validates each one.
+//!    the request row to its own stream. Serving never waits in the reader, so
+//!    both layouts keep responses flowing; the pair remains a layout choice.
+//!    Both layouts carry the same rows, and a `const` check validates each one.
 //! 3. **Codec.** [`ExampleMessage`] implements [`WireMessage`] as plain
 //!    `match`es from message type to payload item.
-//! 4. **Tests.** The generated suites run once for the message family and once
+//! 4. **Exchange.** `exchange` serves ranges through `Serve`, downloads them
+//!    through `Reservations`, and paces `Status` through `CadenceSender`. One
+//!    function bounds a range's response for both sides.
+//! 5. **Tests.** The generated suites run once for the message family and once
 //!    for each layout. The reactor writes no bound or header test of its own.
 
 use std::time::Duration;
@@ -26,6 +29,7 @@ use crate::zakura::{
     Cadence, MessageRole, MessageRule, PayloadLen, Stream, StreamQueueDepths, StreamWritePolicy,
 };
 
+mod exchange;
 mod tests;
 
 /// Most items one `GetItems` asks for.
@@ -52,15 +56,18 @@ mod message_type {
     pub(super) const RANGE_UNAVAILABLE: u16 = 5;
 }
 
-/// The sender's servable range, at most four messages at once and one every
-/// 15 seconds after that.
+/// The sender's servable range, sent at most every 30 seconds.
+///
+/// The receiver refills twice as fast, and holds the 20 messages a sender
+/// can queue during a 10-minute outage plus two.
 const STATUS: MessageRule = MessageRule {
     message_type: message_type::STATUS,
     payload: PayloadLen::of::<StatusPayload>(),
     role: MessageRole::Announcement {
         cadence: Cadence {
-            capacity: 4,
+            capacity: 22,
             refill_interval: Duration::from_secs(15),
+            send_interval: Duration::from_secs(30),
         },
     },
 };

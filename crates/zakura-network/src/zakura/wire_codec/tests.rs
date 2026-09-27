@@ -229,6 +229,7 @@ impl WireMessage for LooseRow {
             cadence: crate::zakura::Cadence {
                 capacity: 1,
                 refill_interval: std::time::Duration::from_secs(1),
+                send_interval: std::time::Duration::from_secs(2),
             },
         },
     }];

@@ -130,7 +130,7 @@ impl LayoutError {
                 "each cadence refills faster than its sender sends"
             }
             Self::CapacityBelowStall { .. } => {
-                "each cadence holds every message a conformant sender queues during an outage"
+                "each cadence holds the configured connection-wide outage burst"
             }
             Self::ResponseWithoutRequest { .. } => {
                 "each response answers a request row in its layout"
@@ -253,7 +253,7 @@ impl Stream {
     /// - a request/response stream carries no announcement;
     /// - each request allows an exchange in flight;
     /// - each cadence admits a message, refills faster than its sender sends,
-    ///   and holds every message a conformant sender queues during an outage
+    ///   and holds a connection-wide outage burst
     ///   ([`Cadence`]);
     /// - each response answers a request row of the layout, which may sit on
     ///   another stream, and each request has a response row that ends it.
@@ -356,7 +356,7 @@ const fn check_stream(layout: &[Stream], stream: &Stream) -> Result<(), LayoutEr
     Ok(())
 }
 
-/// Check that a conformant sender can never empty `cadence`'s bucket.
+/// Check observation bucket sizing for a connection-wide outage.
 const fn check_cadence(message_type: u16, cadence: Cadence) -> Result<(), LayoutError> {
     if cadence.capacity == 0 || cadence.refill_interval.is_zero() {
         return Err(LayoutError::EmptyCadence { message_type });

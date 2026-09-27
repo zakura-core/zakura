@@ -28,9 +28,13 @@ pub(crate) struct ServeLimits {
     pub(crate) node_execution: usize,
     /// `produce` steps that may run at once for one peer.
     pub(crate) peer_execution: usize,
-    /// Unsent response bytes one peer may hold.
+    /// Unsent responses one peer may hold, independent of encoded size.
+    pub(crate) peer_output_responses: usize,
+    /// Unsent responses all peers may hold together.
+    pub(crate) node_output_responses: usize,
+    /// Unsent encoded response bytes one peer may hold.
     pub(crate) peer_output_bytes: u64,
-    /// Unsent response bytes all peers may hold together.
+    /// Unsent encoded response bytes all peers may hold together.
     pub(crate) node_output_bytes: u64,
 }
 
@@ -185,6 +189,7 @@ pub(crate) struct ServeCapacity {
     limits: ServeLimits,
     pub(super) node_execution: SlotBudget,
     pub(super) node_output: OutputByteBudget,
+    pub(super) node_output_responses: SlotBudget,
     peers: Arc<Mutex<HashMap<ZakuraPeerId, WeakPeerBudgets>>>,
     pub(super) metrics: Arc<ServeMetrics>,
 }
@@ -202,6 +207,8 @@ impl ServeCapacity {
             });
         };
         let limit = |limit| ServeConfigError::Limit { limit };
+        SlotBudget::new(limits.peer_output_responses)
+            .map_err(|_| limit("peer_output_responses"))?;
         SlotBudget::new(limits.peer_execution).map_err(|_| limit("peer_execution"))?;
         OutputByteBudget::new(limits.peer_output_bytes).map_err(|_| limit("peer_output_bytes"))?;
         Ok(Self {
@@ -212,6 +219,8 @@ impl ServeCapacity {
                 .map_err(|_| limit("node_execution"))?,
             node_output: OutputByteBudget::new(limits.node_output_bytes)
                 .map_err(|_| limit("node_output_bytes"))?,
+            node_output_responses: SlotBudget::new(limits.node_output_responses)
+                .map_err(|_| limit("node_output_responses"))?,
             peers: Arc::default(),
             metrics: Arc::new(ServeMetrics {
                 service,
@@ -232,6 +241,8 @@ impl ServeCapacity {
             return budgets;
         }
         let budgets = PeerBudgets {
+            output_responses: SlotBudget::new(self.limits.peer_output_responses)
+                .expect("peer output responses were validated when the capacity was built"),
             execution: SlotBudget::new(self.limits.peer_execution)
                 .expect("peer execution was validated when the capacity was built"),
             output: OutputByteBudget::new(self.limits.peer_output_bytes)
@@ -279,6 +290,7 @@ impl ServeCapacity {
 /// One peer's execution slots and output bytes.
 #[derive(Clone, Debug)]
 pub(super) struct PeerBudgets {
+    pub(super) output_responses: SlotBudget,
     pub(super) execution: SlotBudget,
     pub(super) output: OutputByteBudget,
 }
@@ -286,6 +298,7 @@ pub(super) struct PeerBudgets {
 impl PeerBudgets {
     fn downgrade(&self) -> WeakPeerBudgets {
         WeakPeerBudgets {
+            output_responses: self.output_responses.downgrade(),
             execution: self.execution.downgrade(),
             output: self.output.downgrade(),
         }
@@ -294,6 +307,7 @@ impl PeerBudgets {
 
 #[derive(Debug)]
 struct WeakPeerBudgets {
+    output_responses: WeakSlotBudget,
     execution: WeakSlotBudget,
     output: WeakOutputByteBudget,
 }
@@ -301,6 +315,7 @@ struct WeakPeerBudgets {
 impl WeakPeerBudgets {
     fn upgrade(&self) -> Option<PeerBudgets> {
         Some(PeerBudgets {
+            output_responses: self.output_responses.upgrade()?,
             execution: self.execution.upgrade()?,
             output: self.output.upgrade()?,
         })

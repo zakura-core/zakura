@@ -414,6 +414,7 @@ fn the_node_slot_returns_before_the_peer_slot() {
         peer.try_reserve().unwrap(),
         node.try_reserve().unwrap(),
         PeerBudgets {
+            output_responses: SlotBudget::new(1).unwrap(),
             execution: peer.clone(),
             output: OutputByteBudget::new(1).unwrap(),
         },

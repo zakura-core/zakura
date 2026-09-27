@@ -208,6 +208,57 @@ fn pruned_peers_are_gossiped_but_not_attempted_or_cached() {
     assert_eq!(sanitized_pruned.services, Some(PeerServices::empty()));
 }
 
+/// Only live or pending outbound connections to pruned peers count toward
+/// the pruned outbound connection cap.
+#[test]
+fn pruned_outbound_peer_count_counts_live_and_pending_outbound_pruned_peers() {
+    let gossiped_only: crate::PeerSocketAddr = "127.0.0.1:8233".parse().unwrap();
+    let pending: crate::PeerSocketAddr = "127.0.0.2:8233".parse().unwrap();
+    let live: crate::PeerSocketAddr = "127.0.0.3:8233".parse().unwrap();
+    let inbound: crate::PeerSocketAddr = "127.0.0.4:8233".parse().unwrap();
+    let full: crate::PeerSocketAddr = "127.0.0.5:8233".parse().unwrap();
+
+    let mut address_book = AddressBook::new(
+        "0.0.0.0:0".parse().unwrap(),
+        &Mainnet,
+        DEFAULT_MAX_CONNS_PER_IP,
+        Span::current(),
+    );
+
+    // Gossiped, but never attempted: not counted.
+    address_book.update(gossiped_change(
+        gossiped_only,
+        PeerServices::empty(),
+        DateTime32::now(),
+    ));
+    // Outbound attempt in progress: counted.
+    address_book.update(gossiped_change(
+        pending,
+        PeerServices::empty(),
+        DateTime32::now(),
+    ));
+    address_book.update(MetaAddr::new_reconnect(pending));
+    // Live outbound connection: counted.
+    address_book.update(MetaAddr::new_connected(live, &PeerServices::empty(), false));
+    address_book.update(MetaAddr::new_responded(live, None));
+    // Live inbound connection: not counted.
+    address_book.update(MetaAddr::new_connected(
+        inbound,
+        &PeerServices::empty(),
+        true,
+    ));
+    address_book.update(MetaAddr::new_responded(inbound, None));
+    // Live outbound full node: not counted.
+    address_book.update(MetaAddr::new_connected(
+        full,
+        &PeerServices::NODE_NETWORK,
+        false,
+    ));
+    address_book.update(MetaAddr::new_responded(full, None));
+
+    assert_eq!(address_book.pruned_outbound_peer_count(Utc::now()), 2);
+}
+
 /// A pruned node gossips its own listener address with its real services.
 #[test]
 fn pruned_local_listener_is_gossiped() {

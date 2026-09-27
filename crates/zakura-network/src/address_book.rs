@@ -919,6 +919,22 @@ impl AddressBook {
             .cloned()
     }
 
+    /// Returns the number of outbound connections to peers without
+    /// `NODE_NETWORK`, such as pruned nodes, that are live or being attempted.
+    ///
+    /// This scans the address book, like [`Self::reconnection_peers`].
+    pub fn pruned_outbound_peer_count(&self, chrono_now: chrono::DateTime<Utc>) -> usize {
+        self.peers
+            .ordered_values()
+            .filter(|peer| {
+                !peer.is_full_node()
+                    && !peer.is_inbound()
+                    && (peer.last_connection_state == PeerAddrState::AttemptPending
+                        || peer.was_recently_live(chrono_now))
+            })
+            .count()
+    }
+
     /// Return an iterator over all the peers in `state`,
     /// in reconnection attempt order, including recently connected peers.
     pub fn state_peers(

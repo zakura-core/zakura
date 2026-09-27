@@ -340,6 +340,15 @@ pub const PRUNED_PEER_DIAL_MAX_TIP_DISTANCE: HeightDiff = 2_000;
 /// Regtest pruned nodes keep only 101 recent blocks, so this stays below that.
 pub const REGTEST_PRUNED_PEER_DIAL_MAX_TIP_DISTANCE: HeightDiff = 50;
 
+/// The largest fraction of the target outbound connection count that can be
+/// connections to peers without `NODE_NETWORK`, such as pruned nodes.
+///
+/// Zakura opens at most `peerset_initial_target_size / MAX_PRUNED_OUTBOUND_SHARE_DENOMINATOR`
+/// such connections. If the node falls behind the tip, for example after
+/// downtime, the rest of its outbound connections are still full nodes that
+/// can serve the history it needs.
+pub const MAX_PRUNED_OUTBOUND_SHARE_DENOMINATOR: usize = 2;
+
 /// How often Zakura re-checks whether it is close enough to the network chain
 /// tip to open outbound connections to pruned peers.
 ///

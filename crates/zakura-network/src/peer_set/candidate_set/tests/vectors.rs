@@ -156,7 +156,7 @@ async fn candidate_set_dials_pruned_peers_only_when_enabled() {
 
     let (dial_pruned_tx, dial_pruned_rx) = tokio::sync::watch::channel(false);
     let mut candidates =
-        CandidateSet::new(address_book, peer_service).with_pruned_peer_dialing(dial_pruned_rx);
+        CandidateSet::new(address_book, peer_service).with_pruned_peer_dialing(dial_pruned_rx, 1);
     assert_eq!(candidates.next().await, None);
 
     dial_pruned_tx.send_replace(true);
@@ -165,6 +165,66 @@ async fn candidate_set_dials_pruned_peers_only_when_enabled() {
         .await
         .expect("pruned peers are candidates when dialing is enabled");
     assert_eq!(candidate.addr(), pruned_addr.into());
+}
+
+/// Pruned peers stop being candidates once the pruned outbound cap is reached,
+/// but full nodes are still returned.
+#[tokio::test]
+async fn candidate_set_caps_pruned_outbound_peers() {
+    let _init_guard = zakura_test::init();
+
+    let pruned_addrs: [SocketAddr; 2] = [
+        "127.0.0.1:8233".parse().unwrap(),
+        "127.0.0.2:8233".parse().unwrap(),
+    ];
+    let full_addr: SocketAddr = "127.0.0.3:8233".parse().unwrap();
+    let mut address_book = AddressBook::new(
+        SocketAddr::from_str("0.0.0.0:0").unwrap(),
+        &Mainnet,
+        DEFAULT_MAX_CONNS_PER_IP,
+        Span::none(),
+    );
+    for addr in pruned_addrs {
+        address_book.update(
+            MetaAddr::new_gossiped_meta_addr(addr.into(), PeerServices::empty(), DateTime32::now())
+                .new_gossiped_change()
+                .expect("gossiped MetaAddr produces a NewGossiped change"),
+        );
+    }
+    let address_book = Arc::new(std::sync::Mutex::new(address_book));
+    let peer_service = MockService::build().for_unit_tests::<Request, Response, _>();
+
+    let (_dial_pruned_tx, dial_pruned_rx) = tokio::sync::watch::channel(true);
+    let mut candidates = CandidateSet::new(address_book.clone(), peer_service)
+        .with_pruned_peer_dialing(dial_pruned_rx, 1);
+
+    let first = candidates
+        .next()
+        .await
+        .expect("the first pruned peer is under the cap");
+    assert!(pruned_addrs
+        .iter()
+        .any(|addr| first.addr() == (*addr).into()));
+    assert_eq!(
+        candidates.next().await,
+        None,
+        "the pending attempt to the first pruned peer fills the cap",
+    );
+
+    address_book.lock().unwrap().update(
+        MetaAddr::new_gossiped_meta_addr(
+            full_addr.into(),
+            PeerServices::NODE_NETWORK,
+            DateTime32::now(),
+        )
+        .new_gossiped_change()
+        .expect("gossiped MetaAddr produces a NewGossiped change"),
+    );
+    let full = candidates
+        .next()
+        .await
+        .expect("full nodes are candidates regardless of the pruned cap");
+    assert_eq!(full.addr(), full_addr.into());
 }
 
 /// Test that calls to [`CandidateSet::update`] are rate limited.

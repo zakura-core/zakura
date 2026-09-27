@@ -234,11 +234,9 @@ proptest! {
             let book_result = address_book.update(change);
             let book_contents: Vec<MetaAddr> = address_book.peers().collect();
 
-            // Ignore the same addresses that the address book ignores
-            let expected_result = if !expected_result.address_is_valid_for_outbound(&Mainnet)
-                || ( !expected_result.last_known_info_is_valid_for_outbound(&Mainnet)
-                      && expected_result.last_connection_state.is_never_attempted())
-            {
+            // Ignore the same addresses that the address book ignores.
+            // Peers without `NODE_NETWORK` are kept, so they can be gossiped.
+            let expected_result = if !expected_result.address_is_valid_for_outbound(&Mainnet) {
                None
             } else {
                 Some(expected_result)

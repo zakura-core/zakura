@@ -1136,13 +1136,16 @@ async fn setup(
 }
 
 mod submitblock_test {
+    use std::time::Duration;
+
     use tracing::{Instrument, Level};
     use tracing_subscriber::fmt;
     use zakura_rpc::{MinedBlockEvent, SubmitBlockChannel};
 
     use super::*;
 
-    use crate::components::sync::PEER_GOSSIP_DELAY;
+    /// How long the test waits for the mined block broadcast log before failing.
+    const MINED_BLOCK_BROADCAST_DEADLINE: Duration = Duration::from_secs(7);
 
     #[tokio::test]
     async fn submitblock_channel() -> Result<(), crate::BoxError> {
@@ -1224,9 +1227,8 @@ mod submitblock_test {
             .in_current_span(),
         );
 
-        // Wait for the exact event under test. The timeout is only a failure
-        // deadline; the mined-block channel bypasses the periodic gossip delay.
-        tokio::time::timeout(PEER_GOSSIP_DELAY, async {
+        // Wait for the exact event under test. The timeout is only a failure deadline.
+        tokio::time::timeout(MINED_BLOCK_BROADCAST_DEADLINE, async {
             loop {
                 let next_log = log_written.notified();
                 let sent_mined_block = {

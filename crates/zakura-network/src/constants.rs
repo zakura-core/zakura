@@ -14,6 +14,7 @@ use regex::Regex;
 use crate::protocol::external::types::*;
 
 use zakura_chain::{
+    block::HeightDiff,
     parameters::{
         Network::{self, *},
         NetworkKind,
@@ -322,6 +323,29 @@ pub const MAX_ADDRS_IN_MESSAGE: usize = 1000;
 /// This limit makes sure that Zakura does not reveal its entire address book
 /// in a single `GetAddr` response.
 pub const ADDR_RESPONSE_LIMIT_DENOMINATOR: usize = 2;
+
+/// The furthest our best chain tip can be behind the estimated network chain
+/// tip for Zakura to open outbound connections to peers without
+/// `NODE_NETWORK`, on Mainnet and Testnet.
+///
+/// Those peers are usually pruned nodes, which keep at least the 10,000 most
+/// recent blocks on Mainnet and Testnet. This distance leaves a wide margin
+/// for tip estimation error and for blocks that arrive while connected.
+pub const PRUNED_PEER_DIAL_MAX_TIP_DISTANCE: HeightDiff = 2_000;
+
+/// The furthest our best chain tip can be behind the estimated network chain
+/// tip for Zakura to open outbound connections to peers without
+/// `NODE_NETWORK`, on Regtest.
+///
+/// Regtest pruned nodes keep only 101 recent blocks, so this stays below that.
+pub const REGTEST_PRUNED_PEER_DIAL_MAX_TIP_DISTANCE: HeightDiff = 50;
+
+/// How often Zakura re-checks whether it is close enough to the network chain
+/// tip to open outbound connections to pruned peers.
+///
+/// The estimated network tip advances with time even when our tip does not,
+/// so this is polled rather than driven by tip changes.
+pub const PRUNED_PEER_DIAL_CHECK_INTERVAL: Duration = Duration::from_secs(30);
 
 /// The largest fraction of a `GetAddr` response that can be addresses of peers
 /// that do not advertise `NODE_NETWORK`, such as pruned nodes.

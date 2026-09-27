@@ -652,13 +652,32 @@ impl MetaAddr {
     }
 
     /// Is this address ready for a new outbound connection attempt?
+    ///
+    /// Peers without [`PeerServices::NODE_NETWORK`] are never ready. See
+    /// [`Self::is_ready_for_connection_attempt_including_pruned`].
     pub fn is_ready_for_connection_attempt(
         &self,
         instant_now: Instant,
         chrono_now: chrono::DateTime<Utc>,
         network: &Network,
     ) -> bool {
-        self.last_known_info_is_valid_for_outbound(network)
+        self.is_full_node()
+            && self.is_ready_for_connection_attempt_including_pruned(
+                instant_now,
+                chrono_now,
+                network,
+            )
+    }
+
+    /// Is this address ready for a new outbound connection attempt, including
+    /// peers without [`PeerServices::NODE_NETWORK`], such as pruned nodes?
+    pub fn is_ready_for_connection_attempt_including_pruned(
+        &self,
+        instant_now: Instant,
+        chrono_now: chrono::DateTime<Utc>,
+        network: &Network,
+    ) -> bool {
+        self.address_is_valid_for_outbound(network)
             && !self.was_recently_updated(instant_now, chrono_now)
             && self.is_probably_reachable(chrono_now)
     }

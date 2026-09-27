@@ -92,7 +92,9 @@ pub struct ChainInner {
     // Blocks, heights, hashes, and transaction locations
     //
     /// The contextually valid blocks which form this non-finalized partial chain, in height order.
-    pub(crate) blocks: BTreeMap<block::Height, ContextuallyVerifiedBlock>,
+    ///
+    /// Blocks are immutable once pushed, so chain snapshots share each block record.
+    pub(crate) blocks: BTreeMap<block::Height, Arc<ContextuallyVerifiedBlock>>,
 
     /// An index of block heights for each block hash in `blocks`.
     pub height_by_hash: HashMap<block::Hash, block::Height>,
@@ -374,7 +376,7 @@ impl Chain {
         self.update_chain_tip_with(&block)?;
 
         tracing::debug!(block = %block.block, "adding block to chain");
-        self.blocks.insert(block.height, block);
+        self.blocks.insert(block.height, Arc::new(block));
 
         Ok(self)
     }
@@ -382,7 +384,7 @@ impl Chain {
     /// Pops the lowest height block of the non-finalized portion of a chain,
     /// and returns it with its associated treestate.
     #[instrument(level = "debug", skip(self))]
-    pub(crate) fn pop_root(&mut self) -> (ContextuallyVerifiedBlock, Treestate) {
+    pub(crate) fn pop_root(&mut self) -> (Arc<ContextuallyVerifiedBlock>, Treestate) {
         // Obtain the lowest height.
         let block_height = self.non_finalized_root_height();
 
@@ -410,7 +412,7 @@ impl Chain {
             .expect("only called while blocks is populated");
 
         // Update cumulative data members.
-        self.revert_chain_with(&block, RevertPosition::Root);
+        self.revert_chain_with(block.as_ref(), RevertPosition::Root);
 
         (block, treestate)
     }
@@ -419,7 +421,7 @@ impl Chain {
     pub fn child_blocks(&self, block_height: &block::Height) -> Vec<ContextuallyVerifiedBlock> {
         self.blocks
             .range(block_height..)
-            .map(|(_h, b)| b.clone())
+            .map(|(_h, b)| b.as_ref().clone())
             .collect()
     }
 
@@ -474,7 +476,7 @@ impl Chain {
         let height =
             hash_or_height.height_or_else(|hash| self.height_by_hash.get(&hash).cloned())?;
 
-        self.blocks.get(&height)
+        self.blocks.get(&height).map(Arc::as_ref)
     }
 
     /// Returns the [`Transaction`] with [`transaction::Hash`], if it exists in this chain.
@@ -1487,7 +1489,7 @@ impl Chain {
             "Non-finalized chains must have at least one block to be valid"
         );
 
-        self.revert_chain_with(&block, RevertPosition::Tip);
+        self.revert_chain_with(block.as_ref(), RevertPosition::Tip);
     }
 
     /// Return the non-finalized tip height for this chain.
@@ -1510,7 +1512,7 @@ impl Chain {
     /// Return the non-finalized tip block for this chain,
     /// or `None` if `self.blocks` is empty.
     pub fn tip_block(&self) -> Option<&ContextuallyVerifiedBlock> {
-        self.blocks.values().next_back()
+        self.blocks.values().next_back().map(Arc::as_ref)
     }
 
     /// Returns true if the non-finalized part of this chain is empty.

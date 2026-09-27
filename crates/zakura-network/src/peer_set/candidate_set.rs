@@ -149,6 +149,10 @@ where
     /// Whether peers without `NODE_NETWORK`, such as pruned nodes, can be
     /// returned as connection candidates.
     dial_pruned_peers: watch::Receiver<bool>,
+
+    /// The most outbound connections to pruned peers that can be live or
+    /// attempted at the same time.
+    max_pruned_outbound_peers: usize,
 }
 
 impl<S> std::fmt::Debug for CandidateSet<S>
@@ -163,6 +167,7 @@ where
             .field("min_next_handshake", &self.min_next_handshake)
             .field("min_next_crawl", &self.min_next_crawl)
             .field("dial_pruned_peers", &*self.dial_pruned_peers.borrow())
+            .field("max_pruned_outbound_peers", &self.max_pruned_outbound_peers)
             .finish()
     }
 }
@@ -186,13 +191,20 @@ where
             min_next_handshake: Instant::now(),
             min_next_crawl: Instant::now(),
             dial_pruned_peers: watch::channel(false).1,
+            max_pruned_outbound_peers: 0,
         }
     }
 
     /// Returns peers without `NODE_NETWORK`, such as pruned nodes, as
-    /// connection candidates whenever `dial_pruned_peers` is true.
-    pub fn with_pruned_peer_dialing(mut self, dial_pruned_peers: watch::Receiver<bool>) -> Self {
+    /// connection candidates whenever `dial_pruned_peers` is true, while fewer
+    /// than `max_pruned_outbound_peers` pruned connections are live or attempted.
+    pub fn with_pruned_peer_dialing(
+        mut self,
+        dial_pruned_peers: watch::Receiver<bool>,
+        max_pruned_outbound_peers: usize,
+    ) -> Self {
         self.dial_pruned_peers = dial_pruned_peers;
+        self.max_pruned_outbound_peers = max_pruned_outbound_peers;
         self
     }
 
@@ -419,13 +431,17 @@ where
     pub async fn next(&mut self) -> Option<MetaAddr> {
         // Correctness: To avoid hangs, computation in the critical section should be kept to a minimum.
         let address_book = self.address_book.clone();
-        let include_pruned = *self.dial_pruned_peers.borrow();
+        let dial_pruned_peers = *self.dial_pruned_peers.borrow();
+        let max_pruned_outbound_peers = self.max_pruned_outbound_peers;
         let next_peer = move || -> Option<MetaAddr> {
             let mut guard = address_book.lock().unwrap();
 
             // Now we have the lock, get the current time
             let instant_now = std::time::Instant::now();
             let chrono_now = Utc::now();
+
+            let include_pruned = dial_pruned_peers
+                && guard.pruned_outbound_peer_count(chrono_now) < max_pruned_outbound_peers;
 
             // It's okay to return without sleeping here, because we're returning
             // `None`. We only need to sleep before yielding an address.

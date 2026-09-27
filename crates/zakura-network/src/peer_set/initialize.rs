@@ -443,7 +443,11 @@ where
             .in_current_span(),
         )));
         let mut candidates = CandidateSet::new(address_book.clone(), peer_set.clone())
-            .with_pruned_peer_dialing(dial_pruned_peers_rx);
+            .with_pruned_peer_dialing(
+                dial_pruned_peers_rx,
+                config.peerset_initial_target_size
+                    / constants::MAX_PRUNED_OUTBOUND_SHARE_DENOMINATOR,
+            );
 
         // Wait for the initial seed peer count
         let mut active_outbound_connections = initial_peers_join

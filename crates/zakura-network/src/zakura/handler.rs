@@ -1895,8 +1895,6 @@ enum InboundMessageAdmission {
     Admit,
     Oversize,
     Throttled,
-    /// A row's cadence bucket is empty: the sender broke the row's cadence.
-    CadenceExhausted,
 }
 
 fn admit_inbound_message(
@@ -1935,6 +1933,8 @@ fn admit_inbound_message(
             .lock()
             .expect("Zakura cadence bucket mutex is never poisoned")
             .charge(cadence.layout, rule);
+        // A sibling stream can keep the connection alive during an unbounded
+        // transport stall. Exhaustion cannot prove a sender violation.
         if charge == CadenceCharge::Exhausted {
             context.conn.trace_rate_limit(
                 "cadence.exhausted",
@@ -1944,7 +1944,6 @@ fn admit_inbound_message(
                 None,
                 None,
             );
-            return InboundMessageAdmission::CadenceExhausted;
         }
         return InboundMessageAdmission::Admit;
     }
@@ -4241,7 +4240,6 @@ async fn persistent_stream_worker_with_policy(
             let error = match frame {
                 Ok(frame) => {
                     let _ = reader_context.freshness_tx.send(Instant::now());
-                    let frame_type = frame.message_type;
                     match admit_inbound_message(&frame, &reader_context, stream_kind) {
                         InboundMessageAdmission::Admit => {
                             let waiting_since = Instant::now();
@@ -4272,11 +4270,6 @@ async fn persistent_stream_worker_with_policy(
                         }
                         InboundMessageAdmission::Oversize => ZakuraHandlerError::Oversize,
                         InboundMessageAdmission::Throttled => ZakuraHandlerError::RateLimited,
-                        InboundMessageAdmission::CadenceExhausted => {
-                            ZakuraHandlerError::CadenceExhausted {
-                                message_type: frame_type,
-                            }
-                        }
                     }
                 }
                 Err(error) => {
@@ -4410,12 +4403,6 @@ async fn persistent_stream_worker_with_policy(
                         context.connection_token.cancel();
                         break;
                     }
-                    Some(ZakuraHandlerError::CadenceExhausted { .. }) => {
-                        let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_RATE_LIMIT));
-                        context.close_cause.record("ordered_cadence_exhausted");
-                        context.connection_token.cancel();
-                        break;
-                    }
                     Some(ZakuraHandlerError::Closed) | None => {
                         break;
                     }
@@ -4498,12 +4485,6 @@ async fn request_stream_worker(
     let _ = context.freshness_tx.send(Instant::now());
     match admit_inbound_message(&frame, &context, prelude.stream_kind) {
         InboundMessageAdmission::Admit => {}
-        InboundMessageAdmission::CadenceExhausted => {
-            let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_RATE_LIMIT));
-            context.close_cause.record("request_cadence_exhausted");
-            context.connection_token.cancel();
-            return;
-        }
         InboundMessageAdmission::Oversize => {
             let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_OVERSIZE));
             context.close_cause.record("request_oversize");
@@ -5786,12 +5767,6 @@ pub enum ZakuraHandlerError {
     /// The peer exceeded its per-kind inbound message rate.
     #[error("Zakura message rate exceeded")]
     RateLimited,
-    /// The peer emptied a row's cadence bucket.
-    #[error("Zakura peer broke the cadence of message type {message_type}")]
-    CadenceExhausted {
-        /// The row's message type.
-        message_type: u16,
-    },
     /// Iroh connection error.
     #[error(transparent)]
     IrohConnection(#[from] iroh::endpoint::ConnectionError),
@@ -9054,7 +9029,7 @@ mod tests {
         }
         assert_eq!(
             admit_inbound_message(&probe_frame(message_type::STATUS, 4), &context, 900),
-            InboundMessageAdmission::CadenceExhausted
+            InboundMessageAdmission::Admit
         );
         // Each cadence row has its own bucket.
         assert_eq!(
@@ -9078,25 +9053,122 @@ mod tests {
         use crate::zakura::regulation::test_family::{message_type, EVERY_30_SECONDS, RULES};
 
         let context = tabled_context(Some(RULES), 1);
+        let tokens = || {
+            context
+                .cadence
+                .as_ref()
+                .unwrap()
+                .buckets
+                .lock()
+                .unwrap()
+                .tokens(900, message_type::STATUS)
+        };
         let status = probe_frame(message_type::STATUS, 4);
         for _ in 0..EVERY_30_SECONDS.capacity {
             admit_inbound_message(&status, &context, 900);
         }
         assert_eq!(
             admit_inbound_message(&status, &context, 900),
-            InboundMessageAdmission::CadenceExhausted
+            InboundMessageAdmission::Admit
         );
+        assert_eq!(tokens(), Some(0));
         context.credit_read_pause(EVERY_30_SECONDS.refill_interval * 3);
-        for _ in 0..3 {
+        assert_eq!(tokens(), Some(3));
+        for remaining in (0..3).rev() {
             assert_eq!(
                 admit_inbound_message(&status, &context, 900),
                 InboundMessageAdmission::Admit
             );
+            assert_eq!(tokens(), Some(remaining));
         }
         assert_eq!(
             admit_inbound_message(&status, &context, 900),
-            InboundMessageAdmission::CadenceExhausted
+            InboundMessageAdmission::Admit
         );
+    }
+
+    /// Replay the burst from 23 sends spaced 30 seconds apart during a
+    /// 660-second stream stall. A sibling can keep the connection alive.
+    #[tokio::test]
+    async fn cadence_bursts_beyond_the_outage_capacity_stay_connected() -> Result<(), BoxError> {
+        use crate::zakura::regulation::test_family::{decode, message_type, Probe, RULES};
+
+        const ALPN: &[u8] = b"/zakura/testkit/cadence-burst/0";
+        let _guard = zakura_test::init();
+        let server = LocalEndpointFactory::new().endpoint(83).await?;
+        let (conn_tx, _conn_rx) = mpsc::channel(8);
+        let (stream_tx, mut stream_rx) = mpsc::channel(8);
+        let router = Router::builder(server)
+            .accept(
+                ALPN,
+                CaptureConnection {
+                    connection_tx: conn_tx,
+                    stream_tx,
+                },
+            )
+            .spawn();
+        let client = LocalEndpointFactory::new().endpoint(84).await?;
+        let stream = Stream {
+            kind: 900,
+            messages: Some(RULES),
+            ..Stream::PERSISTENT
+        };
+        // The 22-frame control and larger bursts use fresh connection buckets.
+        for count in [22u32, 23, 64] {
+            let connection = timeout(
+                Duration::from_secs(5),
+                client.connect(router.endpoint().addr(), ALPN),
+            )
+            .await??;
+            let (mut sender, _receiver) =
+                timeout(Duration::from_secs(2), connection.open_bi()).await??;
+            let mut bytes = Vec::new();
+            for value in 0..count {
+                bytes.extend_from_slice(&message_type::STATUS.to_le_bytes());
+                bytes.extend_from_slice(&0u16.to_le_bytes());
+                bytes.extend_from_slice(&4u32.to_le_bytes());
+                bytes.extend_from_slice(&value.to_le_bytes());
+            }
+            timeout(Duration::from_secs(2), sender.write_all(&bytes)).await??;
+            let (send, recv) = timeout(Duration::from_secs(2), stream_rx.recv())
+                .await?
+                .unwrap();
+            let context = tabled_context(Some(RULES), 1);
+            let cancel = context.connection_token.clone();
+            let prelude = StreamPrelude {
+                magic: STREAM_PRELUDE_MAGIC,
+                stream_kind: stream.kind,
+                stream_version: stream.version,
+                request_id: None,
+                max_frame_bytes: stream.frame_cap,
+            };
+            let mut workers = JoinSet::new();
+            let (exit_tx, _exit_rx) = mpsc::unbounded_channel();
+            let mut admitted = spawn_persistent_stream_worker(
+                &mut workers,
+                send,
+                recv,
+                stream,
+                prelude,
+                context,
+                1,
+                false,
+                exit_tx,
+            );
+            for value in 0..count {
+                let frame = timeout(Duration::from_secs(2), admitted.streams[0].recv.recv())
+                    .await?
+                    .expect("the reader forwards every buffered announcement");
+                assert_eq!(decode(&frame), Probe::Status(value));
+            }
+            assert!(!cancel.is_cancelled());
+            cancel.cancel();
+            timeout(Duration::from_secs(2), workers.join_next()).await?;
+            connection.close(0u32.into(), b"done");
+        }
+        client.close().await;
+        router.shutdown().await?;
+        Ok(())
     }
 
     /// The reader checks each response header against the attached

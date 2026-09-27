@@ -449,3 +449,19 @@ sync before advertising a build as join-ready.
 `fork.py` renders a fleet config for `deploy/deployer/deploy.py` rather than
 deploying by itself, so the fork node is built, shipped and supervised by exactly
 the same path as every other managed node.
+
+## Website explorer
+
+The NU7 page links recent blocks and faucet receipts into its inline explorer.
+Read-only `GET /v1/block/<height-or-hash>` and `GET /v1/tx/<txid>` return selected
+public fields, transaction summaries, transparent inputs/outputs, and shielded
+action counts. Raw transaction hex, proofs, and shielded receiver details are
+not exposed. Browser reads allow the exact Zakura and existing Valargroup
+frontend origins, including on JSON errors.
+
+Invalid identifiers return 400 before RPC. Missing or pruned records return 404;
+RPC transport failures return 503. These endpoints use the existing bounded
+HTTP server and RPC timeouts. A missing record does not prove a transaction is
+invalid: older history may be pruned, or it may belong to another network.
+The website paginates long lists and uses fragment links for shareable views.
+No database index or node configuration change is needed.

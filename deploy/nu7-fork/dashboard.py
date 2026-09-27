@@ -28,6 +28,7 @@ MAX_OBSERVATION_AGE_SECONDS = 120
 # node RPC call, on the host that also validates and mines the fork.
 MAX_CONCURRENT_REQUESTS = 16
 REQUEST_TIMEOUT_SECONDS = 10
+EXPLORER_ORIGINS = frozenset({"https://zakura.com", "https://nu7.valargroup.dev"})
 BLOCK_ID = re.compile(r"(?:[0-9]{1,10}|[0-9a-fA-F]{64})\Z")
 TX_ID = re.compile(r"[0-9a-fA-F]{64}\Z")
 
@@ -136,6 +137,21 @@ def transaction_detail(transaction: dict) -> dict:
             for item in transaction.get("vout") or []
         ],
     }
+
+
+def explorer_response(port: int, kind: str, identifier: str) -> tuple[int, dict]:
+    """Read selected public fields; distinguish unavailable history from RPC outages."""
+    valid = BLOCK_ID.fullmatch(identifier) if kind == "block" else TX_ID.fullmatch(identifier)
+    if not valid or (kind == "block" and len(identifier) <= 10 and int(identifier) > 2**32 - 1):
+        return 400, {"error": "Invalid explorer identifier"}
+    try:
+        if kind == "block":
+            return 200, block_detail(rpc(port, "getblock", [identifier, 2]))
+        return 200, transaction_detail(rpc(port, "getrawtransaction", [identifier, 1]))
+    except (OSError, urllib.error.URLError):
+        return 503, {"error": "Explorer is temporarily unavailable"}
+    except (ValueError, KeyError, RuntimeError):
+        return 404, {"error": "Block or transaction unavailable on this node"}
 
 
 class Collector:
@@ -349,21 +365,7 @@ class Handler(BaseHTTPRequestHandler):
             content_type = "application/json"
         elif self.path.startswith("/v1/block/") or self.path.startswith("/v1/tx/"):
             kind, identifier = self.path.removeprefix("/v1/").split("/", 1)
-            valid = BLOCK_ID.fullmatch(identifier) if kind == "block" else TX_ID.fullmatch(identifier)
-            if not valid:
-                self.send_error(400, "Invalid explorer identifier")
-                return
-            try:
-                if kind == "block":
-                    result = rpc(self.collector.ports[0][1], "getblock", [identifier, 2])
-                    payload = block_detail(result)
-                else:
-                    result = rpc(self.collector.ports[0][1], "getrawtransaction", [identifier, 1])
-                    payload = transaction_detail(result)
-                status = 200
-            except (OSError, ValueError, KeyError, RuntimeError, urllib.error.URLError):
-                payload = {"error": "Block or transaction unavailable on this node"}
-                status = 404
+            status, payload = explorer_response(self.collector.ports[0][1], kind, identifier)
             body = json.dumps(payload, separators=(",", ":")).encode()
             content_type = "application/json"
         else:
@@ -374,6 +376,11 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "public, max-age=10" if status == 200 else "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
+        if self.path.startswith(("/v1/block/", "/v1/tx/")):
+            self.send_header("Vary", "Origin")
+            origin = self.headers.get("Origin")
+            if origin in EXPLORER_ORIGINS:
+                self.send_header("Access-Control-Allow-Origin", origin)
         self.end_headers()
         self.wfile.write(body)
 

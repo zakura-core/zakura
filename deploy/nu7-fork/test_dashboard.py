@@ -1,5 +1,6 @@
 """Focused checks for the public status feed's network and metric claims."""
 
+import http.client
 import io
 import json
 import socket
@@ -274,6 +275,61 @@ def max_concurrent_handlers(server_class, limit: int, clients: int) -> int:
     server.shutdown()
     server.server_close()
     return peak
+
+
+class ExplorerHttpTests(unittest.TestCase):
+    def setUp(self):
+        collector = mock.Mock(ports=[("primary", 18232)])
+        handler = type("ExplorerHandler", (dashboard.Handler,), {
+            "collector": collector, "log_message": lambda *args: None})
+        self.server = dashboard.BoundedHTTPServer(("127.0.0.1", 0), handler)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.addCleanup(self.close)
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+
+    def get(self, path, origin="https://zakura.com"):
+        connection = http.client.HTTPConnection(*self.server.server_address, timeout=3)
+        try:
+            connection.request("GET", path, headers={"Origin": origin})
+            response = connection.getresponse()
+            return response.status, dict(response.getheaders()), json.loads(response.read())
+        finally:
+            connection.close()
+
+    def test_blocks_transactions_and_errors_have_scoped_cors(self):
+        block = {"hash": "b" * 64, "height": 123, "time": 1000,
+                 "tx": [{"txid": "a" * 64}]}
+        with mock.patch.object(dashboard, "rpc", return_value=block):
+            for origin in dashboard.EXPLORER_ORIGINS:
+                code, headers, payload = self.get("/v1/block/123", origin)
+                self.assertEqual(code, 200)
+                self.assertEqual(headers["Access-Control-Allow-Origin"], origin)
+                self.assertEqual(payload["transactions"][0]["txid"], "a" * 64)
+            self.assertNotIn("Access-Control-Allow-Origin", self.get("/v1/block/123", "https://untrusted.example")[1])
+        with mock.patch.object(dashboard, "rpc", return_value={"txid": "a" * 64}):
+            self.assertEqual(self.get("/v1/tx/" + "a" * 64)[2]["txid"], "a" * 64)
+
+    def test_invalid_identifiers_do_not_reach_rpc(self):
+        with mock.patch.object(dashboard, "rpc") as rpc:
+            for path in ["/v1/block/4294967296", "/v1/block/-1", "/v1/block/x", "/v1/tx/123", "/v1/block/123/extra"]:
+                code, headers, _ = self.get(path)
+                self.assertEqual(code, 400)
+                self.assertEqual(headers["Access-Control-Allow-Origin"], "https://zakura.com")
+            rpc.assert_not_called()
+
+    def test_pruned_or_unknown_data_and_transport_outages_are_distinct(self):
+        for error, expected in [(ValueError("internal RPC error"), 404), (TimeoutError("private host"), 503)]:
+            with mock.patch.object(dashboard, "rpc", side_effect=error):
+                code, headers, payload = self.get("/v1/block/123")
+                self.assertEqual(code, expected)
+                self.assertEqual(headers["Cache-Control"], "no-store")
+                self.assertEqual(headers["Access-Control-Allow-Origin"], "https://zakura.com")
+                self.assertNotIn(str(error), payload["error"])
 
 
 class BoundedServerTests(unittest.TestCase):

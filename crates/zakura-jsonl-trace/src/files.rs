@@ -8,6 +8,8 @@ use std::{
 };
 
 /// Open a trace entry without following a symlink or blocking on a special file.
+///
+/// This also rejects symlinked ancestors, for readers of imported traces.
 pub fn open_regular(path: &Path, options: &mut OpenOptions) -> io::Result<File> {
     for ancestor in path.ancestors().skip(1) {
         if !ancestor.as_os_str().is_empty()
@@ -19,6 +21,14 @@ pub fn open_regular(path: &Path, options: &mut OpenOptions) -> io::Result<File> 
             ));
         }
     }
+    open_entry(path, options)
+}
+
+/// Open an entry inside an operator-configured trace directory.
+///
+/// The final component must be a regular file, not a symlink. Ancestors may be
+/// symlinks, such as a runs directory on another volume.
+pub(crate) fn open_entry(path: &Path, options: &mut OpenOptions) -> io::Result<File> {
     if let Ok(metadata) = fs::symlink_metadata(path) {
         if !metadata.is_file() {
             return Err(io::Error::new(
@@ -65,7 +75,7 @@ pub(crate) struct TraceLock {
 
 impl TraceLock {
     pub(crate) fn acquire(path: &Path) -> io::Result<Self> {
-        let file = open_regular(
+        let file = open_entry(
             path,
             OpenOptions::new()
                 .create(true)

@@ -1,16 +1,17 @@
 //! Shared non-blocking CSV tracing support for Zebra components.
 
 pub mod decode;
+mod encode;
 pub mod files;
 
-use files::{open_regular, TraceLock};
+use files::{open_entry, TraceLock};
 
 use std::{
     collections::{HashMap, HashSet},
     fmt,
-    fs::{self, OpenOptions},
-    io::{self, BufRead, BufReader, Read, Write},
-    path::PathBuf,
+    fs::{self, File, OpenOptions},
+    io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write},
+    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, OnceLock,
@@ -222,9 +223,12 @@ fn render_csv_header(header: &'static [&'static str]) -> Vec<u8> {
 
 /// Flatten nested objects into dotted column names.
 ///
+/// This is the reference encoding that [`encode`] must match.
+///
 /// `{"summary": {"height": 7}}` becomes `summary.height`, which is the column
 /// name DuckDB's `read_json_auto` already produced for the same rows, so
 /// switching a table to CSV does not move any column names.
+#[cfg(test)]
 fn flatten_row(prefix: &str, value: Map<String, Value>, out: &mut Map<String, Value>) {
     for (key, value) in value {
         let key = if prefix.is_empty() {
@@ -260,6 +264,7 @@ fn write_csv_value(out: &mut Vec<u8>, value: &Value) {
 ///
 /// Fields with no matching column are collected into [`EXTRA_COLUMN`] rather
 /// than dropped.
+#[cfg(test)]
 fn render_csv_row(header: &'static [&'static str], row: Map<String, Value>) -> Vec<u8> {
     let mut flat = Map::new();
     flatten_row("", row, &mut flat);
@@ -294,10 +299,7 @@ where
     T: Serialize,
 {
     match format {
-        TraceFormat::Csv => match serde_json::to_value(row).ok()? {
-            Value::Object(row) => Some(render_csv_row(header, row)),
-            _ => None,
-        },
+        TraceFormat::Csv => encode::encode_csv_row(header, row),
     }
 }
 
@@ -384,25 +386,18 @@ impl JsonlEventEmitter {
             return;
         };
 
-        let mut row = Map::new();
-        row.insert("trace_version".to_owned(), Value::from(2));
-        row.insert("ts".to_string(), Value::from(process_elapsed_micros()));
-        row.insert(
-            "wall_ts".to_string(),
-            Value::String(WallClock::now().to_string()),
-        );
-        row.insert("node".to_string(), Value::String(self.node.to_string()));
-        row.insert(
-            "process_trace_id".to_string(),
-            Value::String(process_trace_id().to_string()),
-        );
-        build(&mut row);
-
-        let line = match table.format() {
-            TraceFormat::Csv => Some(render_csv_row(table.header(), row)),
+        let mut fields = Map::new();
+        build(&mut fields);
+        let row = JsonlEventEnvelope {
+            ts: process_elapsed_micros(),
+            trace_version: 2,
+            wall_ts: WallClock::now(),
+            node: &self.node,
+            process_trace_id: process_trace_id(),
+            event: &fields,
         };
 
-        if let Some(line) = line {
+        if let Some(line) = encode_row(table.format(), table.header(), &row) {
             permit.send(JsonlWriteEvent {
                 table: table.table(),
                 file_name: table.file_name(),
@@ -410,6 +405,8 @@ impl JsonlEventEmitter {
                 header: table.header(),
                 line,
             });
+        } else {
+            permit.counts.dropped.fetch_add(1, Ordering::SeqCst);
         }
     }
 }
@@ -447,7 +444,21 @@ impl WallClock {
 
 impl fmt::Display for WallClock {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0.format("%Y-%m-%dT%H:%M:%S%.3fZ"))
+        use chrono::{Datelike, Timelike};
+        // Equivalent to `%Y-%m-%dT%H:%M:%S%.3fZ`, without parsing the format
+        // string on every trace row.
+        let time = self.0;
+        write!(
+            f,
+            "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
+            time.year(),
+            time.month(),
+            time.day(),
+            time.hour(),
+            time.minute(),
+            time.second(),
+            time.timestamp_subsec_millis(),
+        )
     }
 }
 
@@ -456,7 +467,7 @@ impl Serialize for WallClock {
     where
         S: serde::Serializer,
     {
-        serializer.collect_str(&self.0.format("%Y-%m-%dT%H:%M:%S%.3fZ"))
+        serializer.collect_str(self)
     }
 }
 
@@ -565,24 +576,34 @@ impl JsonlTraceConfig {
     ///
     /// `ZAKURA_TRACE_FILE_SEGMENTS=0` stops the writer from rotating. An
     /// external rotator can then rename the current file while it holds the
-    /// directory's `.trace.lock`. The writer creates a new file with a header
-    /// on its next append.
+    /// table's `.lock` file. The writer creates a new file with a header on its
+    /// next append.
     pub fn from_environment() -> Self {
         let mut config = Self::default();
         if let Ok(value) = std::env::var("ZAKURA_TRACE_FILE_BYTES") {
-            if let Ok(bytes) = value.parse::<u64>() {
-                if bytes > 0 {
-                    config.csv_rotation_bytes = bytes;
-                }
+            match value.parse::<u64>() {
+                Ok(bytes) if bytes > 0 => config.csv_rotation_bytes = bytes,
+                _ => tracing::warn!(
+                    %value,
+                    "ignoring invalid ZAKURA_TRACE_FILE_BYTES; expected a positive byte count"
+                ),
             }
         }
         if let Ok(value) = std::env::var("ZAKURA_TRACE_FILE_SEGMENTS") {
-            if let Ok(segments) = value.parse::<usize>() {
-                config.csv_rotation_segments = segments;
+            match value.parse::<usize>() {
+                Ok(segments) => config.csv_rotation_segments = segments,
+                Err(_) => tracing::warn!(
+                    %value,
+                    "ignoring invalid ZAKURA_TRACE_FILE_SEGMENTS; expected a segment count"
+                ),
             }
         }
         if let Ok(run_id) = std::env::var("ZAKURA_TRACE_CAPTURE_RUN") {
             if !run_id.is_empty() {
+                tracing::warn!(
+                    %run_id,
+                    "trace validation capture enabled: rotation is off and every batch is synced"
+                );
                 config.capture_run_id = Some(run_id);
                 config.csv_rotation_segments = 0;
             }
@@ -725,7 +746,7 @@ impl JsonlTracer {
             return JsonlTraceGuard::disabled();
         };
 
-        let (tx, rx) = mpsc::channel(config.channel_capacity);
+        let (tx, rx) = mpsc::channel(config.channel_capacity.max(1));
         let writer = TraceWriter::new(trace_dir.clone(), config);
         let counts = writer.counts.clone();
         let shutdown = CancellationToken::new();
@@ -847,141 +868,223 @@ impl std::fmt::Debug for JsonlTracer {
     }
 }
 
-#[derive(Clone)]
+/// The open current segment of a CSV table.
+struct CurrentSegment {
+    file: File,
+    /// Device and inode, used to notice a rename by another process.
+    identity: Option<(u64, u64)>,
+}
+
+fn file_identity(metadata: &fs::Metadata) -> Option<(u64, u64)> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Some((metadata.dev(), metadata.ino()))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        None
+    }
+}
+
 struct TableWriter {
     trace_dir: PathBuf,
     file_name: &'static str,
-    format: TraceFormat,
-    header: &'static [&'static str],
-    config: JsonlTraceConfig,
+    /// The rendered header, including its newline.
+    header_line: Vec<u8>,
+    rotation_bytes: u64,
+    rotation_segments: usize,
+    current: Option<CurrentSegment>,
+    checked_retained_segments: bool,
+    /// Whether written bytes still need `sync_data`.
+    dirty: bool,
 }
 
 impl TableWriter {
     fn new(
         trace_dir: PathBuf,
         file_name: &'static str,
-        format: TraceFormat,
         header: &'static [&'static str],
-        config: JsonlTraceConfig,
+        config: &JsonlTraceConfig,
     ) -> Self {
+        let mut header_line = render_csv_header(header);
+        header_line.push(b'\n');
         Self {
             trace_dir,
             file_name,
-            format,
-            header,
-            config,
+            header_line,
+            rotation_bytes: config.csv_rotation_bytes,
+            rotation_segments: config.csv_rotation_segments,
+            current: None,
+            checked_retained_segments: false,
+            dirty: false,
         }
     }
 
-    fn append_lines(&self, lines: &[Vec<u8>], sync_file: bool) -> io::Result<()> {
-        fs::create_dir_all(&self.trace_dir)?;
-        let _lock = TraceLock::acquire(&self.trace_dir.join(format!("{}.lock", self.file_name)))?;
-        let path = self.trace_dir.join(self.file_name);
+    fn segment_path(&self, index: usize) -> PathBuf {
+        self.trace_dir.join(format!("{}.{}", self.file_name, index))
+    }
 
-        if self.format == TraceFormat::Csv {
-            self.validate_csv_segments()?;
-        }
-
-        let mut file = open_regular(&path, OpenOptions::new().create(true).append(true))?;
-        let mut length = file.metadata()?.len();
-        let header = render_csv_header(self.header);
-        let header_length = u64::try_from(header.len() + 1).unwrap_or(u64::MAX);
-
-        if self.format == TraceFormat::Csv && length == 0 {
-            file.write_all(&header)?;
-            file.write_all(b"\n")?;
-            length = header_length;
-        }
-
-        for line in lines {
-            let line_length = u64::try_from(line.len() + 1).unwrap_or(u64::MAX);
-            if self.format == TraceFormat::Csv
-                && self.config.csv_rotation_segments > 0
-                && length > header_length
-                && length.saturating_add(line_length) > self.config.csv_rotation_bytes
-            {
-                file.sync_data()?;
-                drop(file);
-                self.rotate_csv_segments()?;
-                file = open_regular(&path, OpenOptions::new().create(true).append(true))?;
-                file.write_all(&header)?;
-                file.write_all(b"\n")?;
-                length = header_length;
+    /// Append `lines` with one write, rotating first when a line would cross
+    /// the size limit. The caller holds the directory lock.
+    fn append_lines(&mut self, lines: &[Vec<u8>], sync_file: bool) -> io::Result<()> {
+        if lines.is_empty() {
+            if sync_file && self.dirty {
+                if let Some(current) = &self.current {
+                    current.file.sync_data()?;
+                }
+                self.dirty = false;
             }
-
-            file.write_all(line)?;
-            file.write_all(b"\n")?;
-            length = length.saturating_add(line_length);
+            return Ok(());
         }
 
-        file.flush()?;
+        let header_length = saturating_count(self.header_line.len());
+        let mut length = self.current_file()?.metadata()?.len();
+        let mut buffer = Vec::with_capacity(lines.iter().map(|line| line.len() + 1).sum());
+        for line in lines {
+            let line_length = saturating_count(line.len() + 1);
+            let pending = length.saturating_add(saturating_count(buffer.len()));
+            if self.rotation_segments > 0
+                && pending > header_length
+                && pending.saturating_add(line_length) > self.rotation_bytes
+            {
+                let file = self.current_file()?;
+                file.write_all(&buffer)?;
+                file.sync_data()?;
+                buffer.clear();
+                self.current = None;
+                self.rotate_segments()?;
+                length = self.current_file()?.metadata()?.len();
+            }
+            buffer.extend_from_slice(line);
+            buffer.push(b'\n');
+        }
+
+        self.current_file()?.write_all(&buffer)?;
+        self.dirty = true;
         if sync_file {
-            file.sync_data()?;
+            self.current_file()?.sync_data()?;
+            self.dirty = false;
         }
         Ok(())
     }
 
-    fn validate_csv_segments(&self) -> io::Result<()> {
-        let expected = render_csv_header(self.header);
-        let current = self.trace_dir.join(self.file_name);
-        let mut paths = vec![current];
-        for index in 1..=self.config.csv_rotation_segments {
-            paths.push(self.trace_dir.join(format!("{}.{}", self.file_name, index)));
+    /// Return the current segment, reopening it when it is missing or when
+    /// another writer or an external rotator renamed it.
+    fn current_file(&mut self) -> io::Result<&mut File> {
+        let path = self.trace_dir.join(self.file_name);
+        let replaced = match (&self.current, fs::symlink_metadata(&path)) {
+            (Some(current), Ok(metadata)) => {
+                current.identity.is_none() || current.identity != file_identity(&metadata)
+            }
+            _ => true,
+        };
+        if replaced {
+            self.current = None;
+            if !self.checked_retained_segments {
+                self.validate_retained_segments()?;
+                self.checked_retained_segments = true;
+            }
+            let file = self.open_current(&path)?;
+            let identity = file_identity(&file.metadata()?);
+            self.current = Some(CurrentSegment { file, identity });
         }
+        Ok(&mut self
+            .current
+            .as_mut()
+            .expect("the current segment was opened above")
+            .file)
+    }
 
-        for path in paths {
-            let file = match open_regular(&path, OpenOptions::new().read(true)) {
+    /// Open the current segment, writing the header into an empty file.
+    ///
+    /// After a valid header, a trailing partial row from a crash is removed so
+    /// the next row starts on its own line.
+    fn open_current(&mut self, path: &Path) -> io::Result<File> {
+        let mut file = open_entry(
+            path,
+            OpenOptions::new().create(true).read(true).append(true),
+        )?;
+        let length = file.metadata()?.len();
+        if length == 0 {
+            file.write_all(&self.header_line)?;
+            self.dirty = true;
+            return Ok(file);
+        }
+        check_csv_header(&mut file, &self.header_line, path)?;
+        let complete = complete_length(&mut file, length)?;
+        if complete != length {
+            file.set_len(complete)?;
+        }
+        Ok(file)
+    }
+
+    /// Reject retained segments written with another schema.
+    fn validate_retained_segments(&self) -> io::Result<()> {
+        for index in 1..=self.rotation_segments {
+            let path = self.segment_path(index);
+            let mut file = match open_entry(&path, OpenOptions::new().read(true)) {
                 Ok(file) => file,
                 Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
                 Err(error) => return Err(error),
             };
-            if file.metadata()?.len() == 0 {
-                continue;
-            }
-            let mut reader =
-                BufReader::new(file.take(saturating_count(expected.len()).saturating_add(2)));
-            let mut header = Vec::new();
-            let read = reader.read_until(b'\n', &mut header)?;
-            if read == 0 || header.strip_suffix(b"\n") != Some(expected.as_slice()) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("CSV header mismatch in {}", path.display()),
-                ));
+            if file.metadata()?.len() > 0 {
+                check_csv_header(&mut file, &self.header_line, &path)?;
             }
         }
         Ok(())
     }
 
-    fn rotate_csv_segments(&self) -> io::Result<()> {
-        if self.config.csv_rotation_segments == 0 {
-            return Ok(());
-        }
-
-        let current = self.trace_dir.join(self.file_name);
-        let oldest = self.trace_dir.join(format!(
-            "{}.{}",
-            self.file_name, self.config.csv_rotation_segments
-        ));
+    fn rotate_segments(&self) -> io::Result<()> {
+        let oldest = self.segment_path(self.rotation_segments);
         if oldest.exists() {
             fs::remove_file(oldest)?;
         }
-        for index in (1..self.config.csv_rotation_segments).rev() {
-            let source = self.trace_dir.join(format!("{}.{}", self.file_name, index));
-            let destination = self
-                .trace_dir
-                .join(format!("{}.{}", self.file_name, index + 1));
+        for index in (1..self.rotation_segments).rev() {
+            let source = self.segment_path(index);
             if source.exists() {
-                fs::rename(source, destination)?;
+                fs::rename(source, self.segment_path(index + 1))?;
             }
         }
+        let current = self.trace_dir.join(self.file_name);
         if current.exists() {
-            fs::rename(
-                current,
-                self.trace_dir.join(format!("{}.1", self.file_name)),
-            )?;
+            fs::rename(current, self.segment_path(1))?;
         }
         Ok(())
     }
+}
+
+/// Return the length of `file` up to and including its last newline.
+fn complete_length(file: &mut File, length: u64) -> io::Result<u64> {
+    const CHUNK: usize = 64 * 1024;
+    let mut end = length;
+    let mut chunk = vec![0; CHUNK];
+    while end > 0 {
+        let start = end.saturating_sub(saturating_count(CHUNK));
+        let chunk = &mut chunk[..usize::try_from(end - start).unwrap_or(CHUNK)];
+        file.seek(SeekFrom::Start(start))?;
+        file.read_exact(chunk)?;
+        if let Some(position) = chunk.iter().rposition(|&byte| byte == b'\n') {
+            return Ok(start + saturating_count(position) + 1);
+        }
+        end = start;
+    }
+    Ok(0)
+}
+
+/// Check that `file` starts with `header_line`.
+fn check_csv_header(file: &mut File, header_line: &[u8], path: &Path) -> io::Result<()> {
+    let mut header = Vec::new();
+    BufReader::new(file.take(saturating_count(header_line.len()).saturating_add(1)))
+        .read_until(b'\n', &mut header)?;
+    if header != header_line {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("CSV header mismatch in {}", path.display()),
+        ));
+    }
+    Ok(())
 }
 
 struct TraceWriter {
@@ -1013,121 +1116,146 @@ impl TraceWriter {
         }
     }
 
-    fn has_open_files(&self) -> bool {
-        !self.tables.is_empty() || self.disabled_tables.is_empty()
+    fn drop_rows(&self, rows: u64) {
+        self.counts.dropped.fetch_add(rows, Ordering::SeqCst);
     }
 
     async fn write_batch(&mut self, batch: Vec<JsonlWriteEvent>, force_flush: bool) {
-        let trace_dir = self.trace_dir.clone();
-        let lock = tokio::task::spawn_blocking(move || {
-            fs::create_dir_all(&trace_dir)?;
-            TraceLock::acquire(&trace_dir.join(".trace.lock"))
-        })
-        .await;
-        let _lock = match lock {
-            Ok(Ok(lock)) => lock,
-            _ => {
-                self.counts
-                    .dropped
-                    .fetch_add(saturating_count(batch.len()), Ordering::SeqCst);
-                tracing::warn!("could not lock trace directory");
-                return;
-            }
-        };
         let sync_file = force_flush
             || self.config.capture_run_id.is_some()
             || self.last_file_flush.elapsed() >= self.config.file_flush_interval;
         let mut grouped: HashMap<&'static str, Vec<Vec<u8>>> = HashMap::new();
         for event in batch {
             if self.disabled_tables.contains(event.table) {
+                self.drop_rows(1);
                 continue;
             }
-
             if !self.tables.contains_key(event.table) {
-                self.tables.insert(
-                    event.table,
-                    TableWriter::new(
-                        self.trace_dir.clone(),
-                        event.file_name,
-                        event.format,
-                        event.header,
-                        self.config.clone(),
-                    ),
+                let table = TableWriter::new(
+                    self.trace_dir.clone(),
+                    event.file_name,
+                    event.header,
+                    &self.config,
                 );
+                self.tables.insert(event.table, table);
             }
             grouped.entry(event.table).or_default().push(event.line);
         }
 
-        if sync_file {
-            for &table in self.tables.keys() {
-                grouped.entry(table).or_default();
-            }
+        if !grouped.is_empty() || (sync_file && !self.tables.is_empty()) {
+            self.write_tables(grouped, sync_file).await;
         }
-
-        let mut failed_tables = Vec::new();
-        for (table_name, lines) in grouped {
-            let Some(table_writer) = self.tables.get(&table_name).cloned() else {
-                continue;
-            };
-            let row_count = saturating_count(lines.len());
-            let result =
-                tokio::task::spawn_blocking(move || table_writer.append_lines(&lines, sync_file))
-                    .await;
-            if let Err(error) = result
-                .map_err(|error| io::Error::other(error.to_string()))
-                .and_then(|result| result)
-            {
-                tracing::warn!(
-                    ?error,
-                    table = table_name,
-                    trace_dir = ?self.trace_dir,
-                    "disabling trace table after write failure"
-                );
-                failed_tables.push(table_name);
-            } else {
-                *self.table_counts.entry(table_name).or_default() += row_count;
-            }
-        }
-
         if sync_file {
             self.last_file_flush = Instant::now();
         }
-
-        for table in failed_tables {
-            self.disable_table(table);
+        if self.config.capture_run_id.is_some() {
+            self.publish_capture_status().await;
         }
-        if let Some(run_id) = &self.config.capture_run_id {
-            let status = serde_json::json!({
-                "version": 2,
-                "run_id": run_id,
-                "process_trace_id": process_trace_id(),
-                "accepted": self.counts.accepted.load(Ordering::SeqCst),
-                "sealed": self.counts.sealed.load(Ordering::SeqCst),
-                "dropped": self.counts.dropped.load(Ordering::SeqCst),
-                "tables": self.table_counts,
-                "failed_tables": self.disabled_tables,
-                "rotation_segments": self.config.csv_rotation_segments,
+    }
+
+    /// Write every table under one directory lock in one blocking task.
+    async fn write_tables(
+        &mut self,
+        mut grouped: HashMap<&'static str, Vec<Vec<u8>>>,
+        sync_file: bool,
+    ) {
+        let batch_rows = saturating_count(grouped.values().map(Vec::len).sum());
+        let mut tables = std::mem::take(&mut self.tables);
+        let trace_dir = self.trace_dir.clone();
+        let written = tokio::task::spawn_blocking(move || {
+            let locked = fs::create_dir_all(&trace_dir)
+                .and_then(|()| TraceLock::acquire(&trace_dir.join(".trace.lock")));
+            let results = locked.map(|_lock| {
+                tables
+                    .iter_mut()
+                    .map(|(&table, writer)| {
+                        let lines = grouped.remove(table).unwrap_or_default();
+                        let rows = saturating_count(lines.len());
+                        (table, rows, writer.append_lines(&lines, sync_file))
+                    })
+                    .collect::<Vec<_>>()
             });
-            let path = self.trace_dir.join(format!(
-                "capture-{}-{}.json",
-                process_trace_id(),
-                self.capture_id
-            ));
-            if let Err(error) = tokio::task::spawn_blocking(move || -> io::Result<()> {
-                let temporary = path.with_extension("pending");
-                let mut file =
-                    open_regular(&temporary, OpenOptions::new().create_new(true).write(true))?;
-                serde_json::to_writer(&mut file, &status)?;
-                file.sync_all()?;
-                fs::rename(temporary, path)?;
-                Ok(())
-            })
-            .await
-            .map_err(|error| io::Error::other(error.to_string()))
-            .and_then(|result| result)
-            {
-                tracing::warn!(?error, "could not publish trace capture status");
+            (tables, results)
+        })
+        .await;
+
+        let results = match written {
+            Ok((tables, Ok(results))) => {
+                self.tables = tables;
+                results
             }
+            Ok((tables, Err(error))) => {
+                self.tables = tables;
+                self.drop_rows(batch_rows);
+                tracing::warn!(?error, trace_dir = ?self.trace_dir, "could not lock trace directory");
+                return;
+            }
+            Err(error) => {
+                // The table writers were lost with the task; they reopen on demand.
+                self.drop_rows(batch_rows);
+                tracing::warn!(?error, trace_dir = ?self.trace_dir, "trace write task failed");
+                return;
+            }
+        };
+
+        for (table, rows, result) in results {
+            match result {
+                Ok(()) => *self.table_counts.entry(table).or_default() += rows,
+                Err(error) => {
+                    tracing::warn!(
+                        ?error,
+                        table,
+                        trace_dir = ?self.trace_dir,
+                        "disabling trace table after write failure"
+                    );
+                    self.drop_rows(rows);
+                    self.tables.remove(table);
+                    self.disabled_tables.insert(table);
+                }
+            }
+        }
+    }
+
+    async fn publish_capture_status(&self) {
+        let Some(run_id) = &self.config.capture_run_id else {
+            return;
+        };
+        let status = serde_json::json!({
+            "version": 2,
+            "run_id": run_id,
+            "process_trace_id": process_trace_id(),
+            "accepted": self.counts.accepted.load(Ordering::SeqCst),
+            "sealed": self.counts.sealed.load(Ordering::SeqCst),
+            "dropped": self.counts.dropped.load(Ordering::SeqCst),
+            "tables": self.table_counts,
+            "failed_tables": self.disabled_tables,
+            "rotation_segments": self.config.csv_rotation_segments,
+        });
+        let path = self.trace_dir.join(format!(
+            "capture-{}-{}.json",
+            process_trace_id(),
+            self.capture_id
+        ));
+        if let Err(error) = tokio::task::spawn_blocking(move || -> io::Result<()> {
+            let temporary = path.with_extension("pending");
+            // Truncation lets a later publish replace one that failed midway.
+            let file = open_entry(
+                &temporary,
+                OpenOptions::new().create(true).truncate(true).write(true),
+            )?;
+            let mut file = io::BufWriter::new(file);
+            serde_json::to_writer(&mut file, &status)?;
+            file.into_inner()
+                .map_err(|error| error.into_error())?
+                .sync_all()?;
+            fs::rename(temporary, path)?;
+            Ok(())
+        })
+        .await
+        .map_err(|error| io::Error::other(error.to_string()))
+        .and_then(|result| result)
+        {
+            tracing::warn!(?error, "could not publish trace capture status");
         }
     }
 
@@ -1137,7 +1265,7 @@ impl TraceWriter {
         }
         let path = self.trace_dir.join(format!(".seal-{}", process_trace_id()));
         matches!(
-            tokio::task::spawn_blocking(move || open_regular(&path, OpenOptions::new().read(true)))
+            tokio::task::spawn_blocking(move || open_entry(&path, OpenOptions::new().read(true)))
                 .await,
             Ok(Ok(_))
         )
@@ -1156,18 +1284,13 @@ impl TraceWriter {
         .await
         .is_err()
         {
-            self.counts.dropped.fetch_add(1, Ordering::SeqCst);
+            self.drop_rows(1);
         }
         self.write_batch(batch, true).await;
     }
 
     async fn flush_all(&mut self) {
         self.write_batch(Vec::new(), true).await;
-    }
-
-    fn disable_table(&mut self, table: &'static str) {
-        self.tables.remove(table);
-        self.disabled_tables.insert(table);
     }
 }
 
@@ -1195,14 +1318,9 @@ async fn run_trace_writer(
                     None => receiver_closed = true,
                 }
             }
-            _ = flush_tick.tick(), if writer.has_open_files() => {
+            // The tick also wakes the loop to notice a seal request.
+            _ = flush_tick.tick() => {
                 writer.flush_all().await;
-
-                if !writer.has_open_files() {
-                    tracing::warn!(trace_dir = ?writer.trace_dir, "all trace tables have been disabled");
-                    break;
-                }
-
                 continue;
             }
             _ = shutdown.cancelled() => {
@@ -1247,7 +1365,7 @@ async fn run_trace_writer(
                         }
                     }
                 }
-                _ = flush_tick.tick(), if writer.has_open_files() => {
+                _ = flush_tick.tick() => {
                     force_flush = true;
                     break;
                 }
@@ -1269,11 +1387,6 @@ async fn run_trace_writer(
         writer
             .write_batch(batch, force_flush || receiver_closed)
             .await;
-
-        if !writer.has_open_files() {
-            tracing::warn!(trace_dir = ?writer.trace_dir, "all trace tables have been disabled");
-            break;
-        }
 
         if receiver_closed {
             writer.seal(&mut rx).await;
@@ -1314,6 +1427,13 @@ mod tests {
     }
 
     impl_jsonl_trace_event!(CsvEvent, CSV_TABLE);
+
+    /// Append as the writer task does: create the directory and hold its lock.
+    fn append_locked(writer: &mut TableWriter, lines: &[Vec<u8>]) -> io::Result<()> {
+        fs::create_dir_all(&writer.trace_dir)?;
+        let _lock = TraceLock::acquire(&writer.trace_dir.join(".trace.lock"))?;
+        writer.append_lines(lines, true)
+    }
 
     /// Split a rendered CSV line into fields, honouring RFC 4180 quoting.
     fn csv_fields(line: &str) -> Vec<String> {
@@ -1576,6 +1696,189 @@ mod tests {
         }
     }
 
+    #[test]
+    fn direct_encoder_matches_the_json_value_reference() {
+        #[derive(Serialize)]
+        enum Kind {
+            Unit,
+            Newtype(u64),
+            Tuple(u8, u8),
+            Struct { inner: &'static str },
+        }
+        #[derive(Serialize)]
+        struct Nested {
+            height: u64,
+            unknown: Option<&'static str>,
+            deeper: Deeper,
+        }
+        #[derive(Serialize)]
+        struct Deeper {
+            leaf: i32,
+            extra_leaf: bool,
+        }
+        #[derive(Serialize)]
+        struct Row {
+            event: &'static str,
+            quoted: &'static str,
+            signed: i64,
+            float: f64,
+            nan: f64,
+            flag: bool,
+            none: Option<u64>,
+            list: Vec<u32>,
+            empty: Map<String, Value>,
+            summary: Nested,
+            kind: Kind,
+            newtype: Kind,
+            tuple: Kind,
+            variant: Kind,
+            undeclared: &'static str,
+            display: JsonlDisplay<'static, str>,
+            map: std::collections::BTreeMap<u16, &'static str>,
+        }
+        const HEADER: &[&str] = &[
+            "event",
+            "quoted",
+            "signed",
+            "float",
+            "nan",
+            "flag",
+            "none",
+            "list",
+            "summary.height",
+            "summary.deeper.leaf",
+            "kind",
+            "newtype.Newtype",
+            "display",
+            "map.7",
+        ];
+        let row = Row {
+            event: "state",
+            quoted: "say \"hi\", then\nleave",
+            signed: -42,
+            float: 1.5,
+            nan: f64::NAN,
+            flag: true,
+            none: None,
+            list: vec![1, 2],
+            empty: Map::new(),
+            summary: Nested {
+                height: 7,
+                unknown: Some("x,y"),
+                deeper: Deeper {
+                    leaf: -1,
+                    extra_leaf: false,
+                },
+            },
+            kind: Kind::Unit,
+            newtype: Kind::Newtype(3),
+            tuple: Kind::Tuple(1, 2),
+            variant: Kind::Struct { inner: "in" },
+            undeclared: "extra",
+            display: JsonlDisplay("shown"),
+            map: [(7, "seven"), (8, "eight")].into_iter().collect(),
+        };
+        let Value::Object(fields) = serde_json::to_value(&row).expect("row serializes") else {
+            panic!("row is an object");
+        };
+        assert_eq!(
+            String::from_utf8(encode::encode_csv_row(HEADER, &row).expect("row encodes")),
+            String::from_utf8(render_csv_row(HEADER, fields))
+        );
+
+        let mut map = Map::new();
+        map.insert("event".to_owned(), Value::from("raw"));
+        map.insert(
+            "summary".to_owned(),
+            serde_json::json!({"height": 1, "other": [1, {"a": 2}]}),
+        );
+        map.insert("ts".to_owned(), Value::from(9));
+        assert_eq!(
+            encode::encode_csv_row(HEADER, &map),
+            Some(render_csv_row(HEADER, map.clone()))
+        );
+        assert_eq!(encode::encode_csv_row(HEADER, &7_u64), None);
+        assert_eq!(encode::encode_csv_row(HEADER, &vec![1]), None);
+    }
+
+    #[tokio::test]
+    async fn one_failed_table_leaves_the_writer_running() {
+        const OTHER: JsonlTraceTable = JsonlTraceTable::csv("other", "other.csv", &["event"]);
+        let dir = tempfile::tempdir().expect("tempdir");
+        // The first table fails its header check; the writer must keep going.
+        std::fs::write(dir.path().join("csv.csv"), "stale,header\n").expect("stale CSV");
+        let guard = JsonlTracer::spawn_guard_with_config(
+            dir.path().to_owned(),
+            JsonlTraceConfig::default(),
+        );
+        let emitter = JsonlEventEmitter::new(guard.tracer(), "node");
+        emitter.emit_event(|| CsvEvent {
+            event: "first",
+            value: 1,
+            optional: None,
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        emitter.emit_with(OTHER, |row| {
+            row.insert("event".to_owned(), Value::from("second"));
+        });
+        guard.shutdown().await;
+
+        let other = std::fs::read_to_string(dir.path().join("other.csv")).expect("other CSV");
+        assert!(other.contains("second"));
+    }
+
+    #[test]
+    fn writer_drops_a_torn_row_before_appending() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut writer = TableWriter::new(
+            dir.path().to_owned(),
+            "csv.csv",
+            &["event"],
+            &JsonlTraceConfig::default(),
+        );
+        let header = "ts,wall_ts,node,process_trace_id,trace_version,event,extra\n";
+        std::fs::write(
+            dir.path().join("csv.csv"),
+            format!("{header}1,t,n,p,2,whole,\n1,t,n,p,2,to"),
+        )
+        .expect("torn CSV");
+        append_locked(&mut writer, &[b"1,t,n,p,2,next,".to_vec()]).expect("append");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("csv.csv")).expect("CSV"),
+            format!("{header}1,t,n,p,2,whole,\n1,t,n,p,2,next,\n")
+        );
+    }
+
+    #[test]
+    fn writer_follows_an_external_rename_under_the_directory_lock() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = JsonlTraceConfig {
+            csv_rotation_segments: 0,
+            ..JsonlTraceConfig::default()
+        };
+        let mut writer = TableWriter::new(dir.path().to_owned(), "csv.csv", &["event"], &config);
+        append_locked(&mut writer, &[b"1,t,n,p,2,before,".to_vec()]).expect("append");
+        {
+            let _lock = TraceLock::acquire(&dir.path().join(".trace.lock")).expect("lock");
+            std::fs::rename(
+                dir.path().join("csv.csv"),
+                dir.path().join("csv.csv.rotating"),
+            )
+            .expect("external rotation");
+        }
+        append_locked(&mut writer, &[b"1,t,n,p,2,after,".to_vec()]).expect("append");
+
+        let header = "ts,wall_ts,node,process_trace_id,trace_version,event,extra\n";
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("csv.csv.rotating")).expect("detached CSV"),
+            format!("{header}1,t,n,p,2,before,\n")
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("csv.csv")).expect("new CSV"),
+            format!("{header}1,t,n,p,2,after,\n")
+        );
+    }
+
     #[tokio::test]
     async fn writer_writes_the_csv_header_once_per_file() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1627,20 +1930,12 @@ mod tests {
             csv_rotation_segments: 3,
             ..JsonlTraceConfig::default()
         };
-        let writer = TableWriter::new(
-            trace_dir.clone(),
-            "csv.csv",
-            TraceFormat::Csv,
-            &["event"],
-            config,
-        );
+        let mut writer = TableWriter::new(trace_dir.clone(), "csv.csv", &["event"], &config);
         let lines = (0..4)
             .map(|index| format!("1,t,n,process,run{index},").into_bytes())
             .collect::<Vec<_>>();
 
-        writer
-            .append_lines(&lines, true)
-            .expect("CSV write and rotation should succeed");
+        append_locked(&mut writer, &lines).expect("CSV write and rotation should succeed");
 
         let expected_header = "ts,wall_ts,node,process_trace_id,trace_version,event,extra";
         for suffix in ["", ".1", ".2", ".3"] {
@@ -1680,19 +1975,13 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let trace_dir = dir.path().join("traces");
         let config = JsonlTraceConfig::default();
-        let first = TableWriter::new(
-            trace_dir.clone(),
-            "csv.csv",
-            TraceFormat::Csv,
-            &["event"],
-            config.clone(),
-        );
-        let second = first.clone();
+        let mut first = TableWriter::new(trace_dir.clone(), "csv.csv", &["event"], &config);
+        let mut second = TableWriter::new(trace_dir.clone(), "csv.csv", &["event"], &config);
         let first_task = tokio::task::spawn_blocking(move || {
-            first.append_lines(&[b"1,t,n,process,first,".to_vec()], true)
+            append_locked(&mut first, &[b"1,t,n,process,first,".to_vec()])
         });
         let second_task = tokio::task::spawn_blocking(move || {
-            second.append_lines(&[b"1,t,n,process,second,".to_vec()], true)
+            append_locked(&mut second, &[b"1,t,n,process,second,".to_vec()])
         });
         first_task
             .await
@@ -1723,22 +2012,15 @@ mod tests {
             csv_rotation_segments: 0,
             ..JsonlTraceConfig::default()
         };
-        let writer = TableWriter::new(
-            trace_dir.clone(),
-            "csv.csv",
-            TraceFormat::Csv,
-            &["event"],
-            config,
-        );
-        writer
-            .append_lines(
-                &[
-                    b"1,t,n,process,one,".to_vec(),
-                    b"1,t,n,process,two,".to_vec(),
-                ],
-                true,
-            )
-            .expect("CSV write without rotation should succeed");
+        let mut writer = TableWriter::new(trace_dir.clone(), "csv.csv", &["event"], &config);
+        append_locked(
+            &mut writer,
+            &[
+                b"1,t,n,process,one,".to_vec(),
+                b"1,t,n,process,two,".to_vec(),
+            ],
+        )
+        .expect("CSV write without rotation should succeed");
         let content = std::fs::read_to_string(trace_dir.join("csv.csv")).expect("CSV");
         assert_eq!(
             content
@@ -2080,20 +2362,19 @@ mod tests {
     #[test]
     fn writer_rejects_symlinked_current_retained_and_lock_entries() {
         use std::os::unix::fs::symlink;
-        for name in ["csv.csv", "csv.csv.1", "csv.csv.lock"] {
+        for name in ["csv.csv", "csv.csv.1", ".trace.lock"] {
             let dir = tempfile::tempdir().expect("temporary trace directory");
             let target = dir.path().join("outside");
             fs::write(&target, "").expect("fixture target is writable");
             symlink(&target, dir.path().join(name)).expect("fixture symlink");
-            let writer = TableWriter::new(
+            let mut writer = TableWriter::new(
                 dir.path().to_owned(),
                 "csv.csv",
-                TraceFormat::Csv,
                 &["event"],
-                JsonlTraceConfig::default(),
+                &JsonlTraceConfig::default(),
             );
             assert!(
-                writer.append_lines(&[b"row".to_vec()], true).is_err(),
+                append_locked(&mut writer, &[b"row".to_vec()]).is_err(),
                 "{name}"
             );
             assert_eq!(fs::read(&target).expect("target is readable"), b"");
@@ -2159,13 +2440,12 @@ mod tests {
             .status()
             .expect("POSIX mkfifo is installed")
             .success());
-        let writer = TableWriter::new(
+        let mut writer = TableWriter::new(
             dir.path().to_owned(),
             "csv.csv",
-            TraceFormat::Csv,
             &["event"],
-            JsonlTraceConfig::default(),
+            &JsonlTraceConfig::default(),
         );
-        assert!(writer.append_lines(&[b"row".to_vec()], true).is_err());
+        assert!(append_locked(&mut writer, &[b"row".to_vec()]).is_err());
     }
 }

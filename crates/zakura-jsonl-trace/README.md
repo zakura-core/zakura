@@ -29,7 +29,7 @@ a warning. Use a new trace directory after changing a CSV schema.
 The writer rotates at 128 MiB by default and retains two older segments.
 `ZAKURA_TRACE_FILE_BYTES` sets the size limit, and `ZAKURA_TRACE_FILE_SEGMENTS`
 sets the number of older segments. Each segment contains one header.
-The writer locks the table during append and rotation. It syncs each segment
+The writer holds the directory lock during append and rotation. It syncs each segment
 before rotation and syncs current files on the periodic timer and guarded shutdown.
 External tools must not truncate trace files.
 
@@ -51,7 +51,7 @@ restart or final validation, it requests a seal with the oracle's
 `--seal-capture RUN_ID` command. Each writer stops accepting events, drains its
 queue, and publishes a sealed status. Events after that boundary lie outside the
 capture. A new process starts a new capture in the same run directory.
-`--check-capture RUN_ID` waits for the acknowledgements. The final oracle checks
+`--check-capture RUN_ID` checks the acknowledgements once; the harness polls it. The final oracle checks
 `--capture-run-id RUN_ID`, required node/table/event coverage, and exact persisted
 row counts. Missing acknowledgements, dropped events, write failures, or mismatched
 counts prevent PASS. An unsealed process exit leaves incomplete evidence.
@@ -60,20 +60,24 @@ Python readers share `scripts/zakura_trace.py`. The Rust reader and Python reade
 check the same CSV fixtures. The schema defines required fields for events that
 feed the sync invariants. Full `block_sync_state` records include peer/request counters.
 Cheaper `block_sync_pipeline_state` records contain only pipeline counters.
-The oracle requires full snapshots for leak checks.
+The oracle takes `outstanding` from the latest full snapshot and the pipeline
+counters from the latest record of either kind.
 The oracle and flush guard share one commit matcher.
 It consumes each finish once and scopes identities by process and source.
 
-Python import tools require POSIX file descriptors. Readers reject symlinks and
-special files. The writer uses no-follow regular-file opens and bounded locks.
-Directory locks protect reader snapshots against append and rotation. The Rust
-test reader consumes captures after writers stop. Imported captures have limits
-of 256 MiB, 500,000 rows, and 256 files. Fields are limited to 64 KiB, records to
-1 MiB, and embedded JSON to 64 nesting levels. Budget failures prevent validation.
+Python import tools require POSIX file descriptors. Readers reject symlinked or
+special trace files; the operator-supplied directory may sit below symlinks. The
+writer uses no-follow regular-file opens and bounded locks. A reader holds the
+directory lock only while it opens descriptors, then parses after releasing it,
+so a slow reader never stalls the node's writer. The Rust test reader consumes
+captures after writers stop. Imported captures have limits
+of 256 MiB, 500,000 rows, and 256 files. Records and fields are limited to 1 MiB,
+and embedded JSON to 64 nesting levels. Budget failures prevent validation.
 The oracle caches diagnostics and limits reported failures. The benchmark digest
 uses only the latest process generation for its monotonic latency series.
 
-Production segments can support partial analysis. Without complete writer status,
+Production directories can exceed the import limits; copy the segments of interest
+into a separate directory for analysis. Without complete writer status,
 the oracle reports INCOMPLETE even when the available checks pass. Row-count
 cursors require unrotated captures. Preserve `capture-*.json` files when sharing a
 validation capture; CSV files alone cannot establish completeness.

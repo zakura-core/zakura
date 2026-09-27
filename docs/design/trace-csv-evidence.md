@@ -52,11 +52,11 @@ fields to avoid registry scans on each commit. The latter now use
 `block_sync_pipeline_state`, so validation can require complete leak counters
 without inventing values for omitted fields.
 
-Readers acquire a directory snapshot lock to avoid observing append or rotation
-halfway through an update. The Rust test reader runs after its writers stop.
+Readers hold the directory lock only while they open descriptors, so they never
+observe an append or rotation halfway through and never stall the writer. The Rust test reader runs after its writers stop.
 Row-count cursors reject rotated input. Complete validation captures never rotate.
-Production captures without completeness evidence support partial analysis, but
-cannot produce a complete oracle PASS.
+Production captures without completeness evidence support partial analysis
+within the import limits, but cannot produce a complete oracle PASS.
 
 The [trace README](../../crates/zakura-jsonl-trace/README.md) documents the commands,
 limits, platform requirements, and shutdown behavior. A timeout does not cancel an

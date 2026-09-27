@@ -159,6 +159,32 @@ class TraceTests(unittest.TestCase):
             with self.assertRaises(trace.TraceInputError):
                 list(trace.read_table(path))
 
+    def test_snapshot_releases_the_writer_lock_before_parsing(self):
+        import fcntl
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "block_sync.csv"
+            oracle.write_csv(path, [dict(event="before")])
+            (Path(temporary) / ".trace.lock").touch()
+            with trace.locked_directory(temporary):
+                # The node's writer can take its exclusive lock and append.
+                with (Path(temporary) / ".trace.lock").open("a") as writer_lock:
+                    fcntl.flock(writer_lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    with path.open("a") as appended:
+                        appended.write("partial,row")
+                self.assertEqual([row["event"] for row in trace.read_table(path)], ["before"])
+
+    def test_symlinked_ancestor_directories_are_readable(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            real = Path(temporary) / "real"
+            oracle.write_csv(real / "traces" / "block_sync.csv", [dict(event="linked")])
+            (Path(temporary) / "link").symlink_to(real)
+            path = Path(temporary) / "link" / "traces" / "block_sync.csv"
+            with trace.locked_directory(path.parent):
+                self.assertEqual([row["event"] for row in trace.read_table(path)], ["linked"])
+            (real / "traces" / "commit_state.csv").symlink_to(path)
+            with self.assertRaises(trace.TraceInputError):
+                list(trace.read_table(real / "traces" / "commit_state.csv"))
+
     def test_row_count_cursor_rejects_rotated_capture(self):
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "block_sync.csv"

@@ -24,8 +24,12 @@ INTEGER_FIELDS = set(SCHEMA["integer_fields"])
 BOOLEAN_FIELDS = set(SCHEMA["boolean_fields"])
 JSON_FIELDS = set(SCHEMA["json_fields"])
 TEXT_FIELDS = set().union(*HEADERS.values()) - INTEGER_FIELDS - BOOLEAN_FIELDS - JSON_FIELDS - {"extra"}
-MAX_FIELD_BYTES = 64 * 1024
+TYPED_FIELDS = INTEGER_FIELDS | BOOLEAN_FIELDS | JSON_FIELDS
+MAX_U64 = 2**64 - 1
 MAX_RECORD_BYTES = 1024 * 1024
+# Legacy sync stall snapshots can fill a record with one JSON task list.
+MAX_FIELD_BYTES = MAX_RECORD_BYTES
+MAX_STATUS_BYTES = 64 * 1024
 MAX_JSON_DEPTH = 64
 csv.field_size_limit(MAX_FIELD_BYTES)
 
@@ -96,18 +100,35 @@ def load_json(text):
         raise TraceInputError("invalid or ambiguous JSON field") from error
 
 
+# Descriptors opened under the writer lock, keyed by resolved directory.
+_SNAPSHOTS = {}
+
+
+def trusted_directory(path):
+    """Resolve an operator-supplied directory once; symlinked ancestors are allowed."""
+    return Path(os.path.realpath(path))
+
+
+def snapshot_entry(path):
+    path = Path(path)
+    snapshot = _SNAPSHOTS.get(trusted_directory(path.parent))
+    return None if snapshot is None else snapshot["files"].get(path.name)
+
+
 @contextmanager
 def regular_file(path):
-    """Resolve every component through descriptors without following symlinks."""
-    path = Path(os.path.abspath(path))
+    """Open a trace entry without following a symlink or blocking on a special file."""
     if os.name != "posix":
         raise TraceInputError("secure trace import requires POSIX file descriptors")
-    parent = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
+    snapshot = snapshot_entry(path)
+    if snapshot is not None:
+        with os.fdopen(os.dup(snapshot[0]), "rb") as handle:
+            handle.seek(0)
+            yield handle
+        return
+    path = Path(path)
+    parent = os.open(trusted_directory(path.parent), os.O_RDONLY | os.O_DIRECTORY)
     try:
-        for part in path.parts[1:-1]:
-            child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
-            os.close(parent)
-            parent = child
         fd = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
     finally:
         os.close(parent)
@@ -117,30 +138,93 @@ def regular_file(path):
         yield handle
 
 
+def file_size(path, handle):
+    """Return the snapshot size of `path`, or its current size outside a snapshot."""
+    snapshot = snapshot_entry(path)
+    return snapshot[1] if snapshot is not None else os.fstat(handle.fileno()).st_size
+
+
+def is_snapshot_file(name):
+    return ".csv" in name or (name.startswith("capture-") and name.endswith(".json"))
+
+
 @contextmanager
 def locked_directory(path):
-    """Read one snapshot while the node holds no directory writer lock."""
+    """Snapshot a trace directory without stalling the node's writer.
+
+    The writer holds `.trace.lock` for each batch and drops the batch after two
+    seconds. This holds a shared lock only while it lists the directory and
+    opens descriptors. Trace files are append-only, and renames keep open
+    descriptors valid, so reads after release see the recorded sizes.
+    """
     import fcntl
-    lock = Path(path) / ".trace.lock"
-    if not os.path.lexists(lock):
+    directory = trusted_directory(path)
+    if directory in _SNAPSHOTS:
         yield
         return
-    with regular_file(lock) as handle:
-        deadline = time.monotonic() + 2
-        while True:
-            try:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_SH | fcntl.LOCK_NB)
-                break
-            except BlockingIOError:
-                if time.monotonic() >= deadline:
-                    raise TraceInputError("trace snapshot lock timed out")
-                time.sleep(0.01)
+    files = {}
+    try:
+        lock = directory / ".trace.lock"
+        handle = None
+        if os.path.lexists(lock):
+            handle = open_entry(directory, lock.name)
+            deadline = time.monotonic() + 2
+            while True:
+                try:
+                    fcntl.flock(handle, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        os.close(handle)
+                        raise TraceInputError("trace snapshot lock timed out")
+                    time.sleep(0.01)
+        try:
+            listing = entries(directory)
+            for item in listing:
+                if not is_snapshot_file(item.name):
+                    continue
+                try:
+                    fd = open_entry(directory, item.name)
+                except TraceInputError:
+                    continue
+                files[item.name] = (fd, os.fstat(fd).st_size)
+        finally:
+            if handle is not None:
+                os.close(handle)
+        _SNAPSHOTS[directory] = {"entries": listing, "files": files}
         yield
+    finally:
+        _SNAPSHOTS.pop(directory, None)
+        for fd, _ in files.values():
+            os.close(fd)
+
+
+def open_entry(directory, name):
+    """Open a regular file in `directory` without following a final symlink."""
+    parent = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
+    except OSError as error:
+        raise TraceInputError(f"cannot open trace entry {name}: {type(error).__name__}") from error
+    finally:
+        os.close(parent)
+    if not stat.S_ISREG(os.fstat(fd).st_mode):
+        os.close(fd)
+        raise TraceInputError("trace entry must be a regular file")
+    return fd
 
 
 def entries(path, budget=None):
     if Path(path).is_symlink():
         raise TraceInputError("trace directory must not be a symlink")
+    snapshot = _SNAPSHOTS.get(trusted_directory(path))
+    if snapshot is not None:
+        listing = snapshot["entries"]
+        if budget is not None:
+            budget.entries_left -= len(listing)
+            if budget.entries_left < 0:
+                raise TraceInputError("trace discovery budget exceeded")
+        return list(listing)
     result = []
     with os.scandir(path) as iterator:
         for entry in iterator:
@@ -171,6 +255,18 @@ def segments(path, budget=None):
     return result
 
 
+def decode_field(name, value):
+    if name not in TYPED_FIELDS:
+        return value
+    # Fast paths for the canonical forms the writer emits; JSON handles the rest.
+    if (name in INTEGER_FIELDS and len(value) <= 20 and value.isascii() and value.isdigit()
+            and (value == "0" or value[0] != "0")):
+        return int(value)
+    if name in BOOLEAN_FIELDS and value in ("true", "false"):
+        return value == "true"
+    return load_json(value)
+
+
 def validate_header(table, header):
     if table not in HEADERS or tuple(header or ()) != HEADERS[table]:
         raise TraceInputError(f"CSV header does not match the {table} schema")
@@ -180,15 +276,15 @@ def validate_header(table, header):
 def validate_row(row):
     if not isinstance(row.get("event"), str) or not row["event"]:
         raise TraceInputError("trace event must be a nonempty string")
-    for name in INTEGER_FIELDS:
-        if name in row and (type(row[name]) is not int or not 0 <= row[name] <= 2**64 - 1):
-            raise TraceInputError(f"{name} must be an unsigned 64-bit integer")
-    for name in BOOLEAN_FIELDS:
-        if name in row and type(row[name]) is not bool:
-            raise TraceInputError(f"{name} must be a boolean")
     # Extra fields can carry fields declared by another table. Validate them too.
-    for name in TEXT_FIELDS:
-        if name in row and not isinstance(row[name], str):
+    for name, value in row.items():
+        if name in INTEGER_FIELDS:
+            if type(value) is not int or not 0 <= value <= MAX_U64:
+                raise TraceInputError(f"{name} must be an unsigned 64-bit integer")
+        elif name in BOOLEAN_FIELDS:
+            if type(value) is not bool:
+                raise TraceInputError(f"{name} must be a boolean")
+        elif name in TEXT_FIELDS and not isinstance(value, str):
             raise TraceInputError(f"{name} must be a string")
     if row.get("trace_version") != 2:
         raise TraceInputError("trace requires version 2 process-wide clocks")
@@ -210,10 +306,14 @@ def validate_row(row):
 def read_segment(path, table, budget):
     try:
         with regular_file(path) as raw:
-            size = os.fstat(raw.fileno()).st_size
+            size = file_size(path, raw)
             budget.file(size)
-            # The descriptor's initial size bounds growth by a noncooperating writer.
-            data = raw.read(size + 1)
+            if snapshot_entry(path) is not None:
+                # The writer may append after the snapshot; its size is the cut.
+                data = raw.read(size)
+            else:
+                # The descriptor's initial size bounds growth by a noncooperating writer.
+                data = raw.read(size + 1)
             if len(data) != size:
                 raise TraceInputError("trace changed while reading")
         if Path(path).name.endswith(".gz"):
@@ -227,7 +327,9 @@ def read_segment(path, table, budget):
             budget.row()
             if None in record or None in record.values():
                 raise TraceInputError("CSV row field count does not match header")
-            if sum(len(value.encode("utf-8")) for value in record.values()) > MAX_RECORD_BYTES:
+            # A character encodes to at most four UTF-8 bytes.
+            if (sum(map(len, record.values())) * 4 > MAX_RECORD_BYTES
+                    and sum(len(value.encode("utf-8")) for value in record.values()) > MAX_RECORD_BYTES):
                 raise TraceInputError("trace record budget exceeded")
             row = {}
             extra = {}
@@ -237,7 +339,7 @@ def read_segment(path, table, budget):
                 if name == "extra":
                     extra = load_json(value)
                 else:
-                    row[name] = load_json(value) if name in INTEGER_FIELDS | BOOLEAN_FIELDS | JSON_FIELDS else value
+                    row[name] = decode_field(name, value)
             if not isinstance(extra, dict) or set(header).intersection(extra):
                 raise TraceInputError("CSV extra must be an object with no declared columns")
             row.update(extra)
@@ -256,8 +358,8 @@ def read_table(path, budget=None):
 
 def read_status(path, budget):
     with regular_file(path) as handle:
-        size = os.fstat(handle.fileno()).st_size
-        if size > MAX_FIELD_BYTES:
+        size = file_size(path, handle)
+        if size > MAX_STATUS_BYTES:
             raise TraceInputError("capture status budget exceeded")
         budget.file(size)
         return load_json(handle.read(size + 1).decode("utf-8"))

@@ -41,6 +41,7 @@ BLOCK_APPLY_FINISHED = "block_apply_finished"
 BLOCK_FRONTIERS_CHANGED = "block_frontiers_changed"
 BLOCK_CHAIN_TIP_RESET = "block_chain_tip_reset"
 BLOCK_SYNC_STATE = "block_sync_state"
+BLOCK_SYNC_PIPELINE_STATE = "block_sync_pipeline_state"
 
 HEADER_FRONTIER_ADVANCED = "header_frontier_advanced"
 HEADER_FRONTIER_REANCHORED = "header_frontier_reanchored"
@@ -682,12 +683,17 @@ def check_block_sync_activity(node: NodeTrace, options: OracleOptions) -> list[F
                 )
                 break
 
-    final_state = states[-1] if states else None
-    if final_state is not None:
-        leaked = {
-            name: int_field(final_state.row, name)
-            for name in ("budget_reserved", "reorder", "applying", "outstanding")
-        }
+    # Per-commit pipeline rows keep the pipeline counters current between the
+    # periodic full snapshots, which alone carry `outstanding`.
+    pipeline_states = sorted(states + node.events("block_sync", BLOCK_SYNC_PIPELINE_STATE),
+                             key=lambda row: row.index)
+    for final_state, names in (
+        (pipeline_states[-1] if pipeline_states else None, ("budget_reserved", "reorder", "applying")),
+        (states[-1] if states else None, ("outstanding",)),
+    ):
+        if final_state is None:
+            continue
+        leaked = {name: int_field(final_state.row, name) for name in names}
         bad = {name: value for name, value in leaked.items() if value is not None and value != 0}
         if bad:
             failures.append(failure(node, "final_block_sync_state_has_no_leaks", final_state, {"leaked": bad}))

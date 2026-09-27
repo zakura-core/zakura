@@ -321,10 +321,16 @@ wait_for_trace_flush() {
       fi
       file="${ZAKURA_E2E_TRACE_DIR}/${node}/block_sync.csv"
       if [[ -s "${file}" ]]; then
-        last=$(trace_rows_after "${file}" 0 | jq -c 'select(.event == "block_sync_state")' | tail -1)
+        # Per-commit pipeline rows keep applying/budget/reorder current; only
+        # the periodic block_sync_state rows carry outstanding.
+        last=$( (trace_rows_after "${file}" 0 || true) \
+          | jq -sc '[.[] | select(.event == "block_sync_state" or .event == "block_sync_pipeline_state")] as $rows
+              | if ($rows | length) == 0 then empty else
+                  {pipeline: $rows[-1], state: ([$rows[] | select(.event == "block_sync_state")] | last)}
+                end' 2>/dev/null || true)
         if [[ -n "${last}" ]]; then
           leak=$(printf '%s' "${last}" \
-            | jq -r '[(.applying//0),(.budget_reserved//0),(.reorder//0),(.outstanding//0)]|add' \
+            | jq -r '[(.pipeline.applying//0),(.pipeline.budget_reserved//0),(.pipeline.reorder//0),(.state.outstanding//0)]|add' \
             2>/dev/null || printf '1')
           if [[ "${leak}" != "0" ]]; then
             printf '  %s block_sync_state not yet drained (applying+budget+reorder+outstanding=%s, waiting for flush)\n' \
@@ -393,8 +399,15 @@ run_trace_oracle() {
   if ! strict_upgrade; then
     oracle_args+=("--optional-lag-node" "node4")
   fi
-  seal_trace_capture "${ZAKURA_E2E_TRACE_DIR}" || return 1
-  python3 "${SCRIPT_DIR}/trace_oracle.py" "${oracle_args[@]}" "${ZAKURA_E2E_TRACE_DIR}"
+  local sealed=0
+  if ! seal_trace_capture "${ZAKURA_E2E_TRACE_DIR}"; then
+    # A crashed node cannot seal. Still print the oracle's diagnostics; the
+    # missing seal already makes the capture INCOMPLETE.
+    log "trace capture was not sealed; running the oracle for diagnostics"
+    sealed=1
+  fi
+  python3 "${SCRIPT_DIR}/trace_oracle.py" "${oracle_args[@]}" "${ZAKURA_E2E_TRACE_DIR}" || return
+  return "${sealed}"
 }
 
 cleanup() {

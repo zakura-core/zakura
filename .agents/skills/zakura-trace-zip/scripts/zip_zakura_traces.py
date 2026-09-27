@@ -12,11 +12,13 @@ from zipfile import ZIP_DEFLATED, ZipFile
 
 
 TRACE_FILE_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+\.csv(?:\.\d+(?:\.gz)?)?$")
+# Writer status files prove a validation capture complete.
+CAPTURE_STATUS_PATTERN = re.compile(r"^capture-[A-Za-z0-9_-]+\.json$")
 
 
 def is_trace_file(path: Path) -> bool:
     """Return whether a path is a trace payload rather than a coordination file."""
-    return bool(TRACE_FILE_PATTERN.fullmatch(path.name)) and not path.name.endswith(".lock")
+    return bool(TRACE_FILE_PATTERN.fullmatch(path.name) or CAPTURE_STATUS_PATTERN.fullmatch(path.name))
 
 
 def infer_label(trace_dir: Path) -> str:

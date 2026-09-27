@@ -17,10 +17,13 @@ pub const MAX_CAPTURE_BYTES: u64 = 256 * 1024 * 1024;
 pub const MAX_CAPTURE_ROWS: usize = 500_000;
 /// Maximum files accepted from one imported capture.
 pub const MAX_CAPTURE_FILES: usize = 256;
-/// Maximum bytes in a decoded CSV field.
-pub const MAX_FIELD_BYTES: usize = 64 * 1024;
 /// Maximum bytes in a decoded CSV record.
 pub const MAX_RECORD_BYTES: usize = 1024 * 1024;
+/// Maximum bytes in a decoded CSV field.
+///
+/// Legacy sync stall snapshots store up to one checkpoint concurrency limit of
+/// in-flight tasks in one JSON field, so a field may use a whole record.
+pub const MAX_FIELD_BYTES: usize = MAX_RECORD_BYTES;
 
 /// Return the checked producer schema.
 pub fn schema() -> &'static Value {

@@ -25,6 +25,7 @@ class TraceArchiveTests(unittest.TestCase):
             for name in ("block_sync.csv", "block_sync.csv.1", "legacy_sync.csv.2", "commit_state.csv.3.gz"):
                 (node / name).write_text("event,extra\nexample,\n")
             (node / "block_sync.csv.lock").write_text("")
+            (node / "capture-123-456-0.json").write_text("{}")
             output = root / "traces.zip"
             with patch("sys.argv", [str(SCRIPT), str(traces), "--output", str(output)]):
                 with contextlib.redirect_stdout(io.StringIO()):
@@ -36,6 +37,7 @@ class TraceArchiveTests(unittest.TestCase):
                 "traces/node1/block_sync.csv.1",
                 "traces/node1/legacy_sync.csv.2",
                 "traces/node1/commit_state.csv.3.gz",
+                "traces/node1/capture-123-456-0.json",
             }.issubset(names))
             self.assertFalse(any(name.endswith(".lock") for name in names))
 

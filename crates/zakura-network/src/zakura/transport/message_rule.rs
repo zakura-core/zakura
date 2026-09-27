@@ -188,17 +188,13 @@ pub struct Credit {
 /// message-count bucket for each `(connection, message_type)`: a full bucket
 /// holds `capacity` messages and regains one every `refill_interval`.
 ///
-/// [`Stream::validate_layout`] proves that a conformant sender can never empty
-/// the bucket, so an empty bucket is a protocol violation:
+/// [`Stream::validate_layout`] requires a faster refill than the sender and
+/// capacity for a connection-wide outage plus two messages. These checks size
+/// the observation bucket; they do not prove a sender violation. A single
+/// stream can stall longer while sibling traffic keeps the connection alive.
+/// The receiver records exhaustion without rejecting the message.
 ///
-/// - the bucket refills faster than the sender sends, so steady sending gains
-///   tokens;
-/// - `capacity` covers every message a conformant sender can queue during the
-///   longest outage a connection survives ([`Cadence::MAX_OUTAGE`]), plus the
-///   initial message and one message of jitter.
-///
-/// The receiver's own read pauses add tokens as they happen, so a burst after
-/// a local pause never counts against the sender.
+/// The receiver credits its own read pauses as they happen.
 ///
 /// A sender every 30 seconds needs a refill under 30 seconds and a capacity of
 /// at least `10 min / 30 s + 2 = 22`:
@@ -278,15 +274,16 @@ pub struct Cadence {
 }
 
 impl Cadence {
-    /// Longest network outage a connection survives.
+    /// Connection-wide outage used to size observation buckets.
     ///
     /// A connection closes after its negotiated idle timeout passes without a
-    /// packet, and this node never negotiates more than 10 minutes.
+    /// packet, and this node never negotiates more than 10 minutes. Sibling
+    /// traffic can keep a connection alive while one stream stalls longer.
     // Widening u32 to u64 is lossless.
     pub const MAX_OUTAGE: Duration = Duration::from_millis(LOCAL_MAX_IDLE_TIMEOUT_MILLIS as u64);
 
-    /// Smallest capacity that admits every burst a conformant sender at
-    /// `send_interval` can deliver after an outage.
+    /// Smallest observation capacity for a sender at `send_interval` after
+    /// a connection-wide outage. This does not bound stream-specific stalls.
     ///
     /// During an outage of [`Cadence::MAX_OUTAGE`], the sender queues at most
     /// `MAX_OUTAGE / send_interval` messages in its transport buffers. The two

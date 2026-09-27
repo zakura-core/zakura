@@ -109,6 +109,8 @@ impl Produce for Scripted {
 }
 
 pub(super) const LIMITS: ServeLimits = ServeLimits {
+    peer_output_responses: 128,
+    node_output_responses: 256,
     node_execution: 2,
     peer_execution: 2,
     peer_output_bytes: 1 << 20,
@@ -262,16 +264,13 @@ async fn peak_running_produce_steps_stay_within_node_slots() {
 #[tokio::test]
 async fn exactly_limit_open_requests_never_fault_when_resent_at_each_ending() {
     let capacity = capacity(LIMITS);
-    let session = session(&capacity, 1, 3);
-    // The output is never read, so every ending stays queued; commitments
-    // still free as each ending enters the output.
+    let mut session = session(&capacity, 1, 3);
     for _ in 0..3 {
         session.serve.admit(job()).unwrap();
     }
     for _ in 0..100 {
-        settle().await;
-        assert_eq!(session.serve.open(), 0, "endings free their commitments");
         for _ in 0..3 {
+            assert_eq!(next(&mut session.output).await, Probe::Done(0));
             session.serve.admit(job()).unwrap();
         }
     }
@@ -468,9 +467,104 @@ async fn output_bytes_return_only_when_the_last_frame_is_written() {
     next(&mut session.output).await;
     next(&mut session.output).await;
     assert!(capacity.node_output_held() > 0, "the ending is unwritten");
+    assert_eq!(capacity.node_output_responses.reserved(), 1);
     next(&mut session.output).await;
     assert_eq!(capacity.node_output_held(), 0);
     assert_eq!(capacity.peer_held(&peer(1)), (0, 0));
+    assert_eq!(capacity.node_output_responses.reserved(), 0);
+}
+
+/// Tiny responses must stop on bookkeeping capacity before encoded bytes fill.
+#[tokio::test]
+async fn tiny_responses_with_a_blocked_writer_hold_response_slots() {
+    let capacity = capacity(ServeLimits {
+        peer_output_responses: 32,
+        node_output_responses: 64,
+        peer_output_bytes: 64 * 1024,
+        node_output_bytes: 64 * 1024,
+        ..LIMITS
+    });
+    let (send, output) = framed_channel(1);
+    let cancel = CancellationToken::new();
+    let mut session = Session {
+        serve: capacity.session(Arc::new(Scripted), &peer(1), 4, send, cancel.clone()),
+        output,
+        cancel,
+    };
+    for _ in 0..32 {
+        session.serve.admit(job()).unwrap();
+        settle().await;
+        assert_eq!(session.serve.open(), 0);
+    }
+    let peer_budgets = capacity.peer(&peer(1));
+    assert_eq!(capacity.node_output_responses.reserved(), 32);
+    assert_eq!(peer_budgets.output_responses.reserved(), 32);
+    assert_eq!(capacity.node_output_held(), 32 * 12);
+    assert_eq!(capacity.node_execution_held(), 0);
+
+    // The reader still admits the bounded commitment margin without waiting.
+    for _ in 0..8 {
+        session.serve.admit(job()).unwrap();
+        settle().await;
+    }
+    assert_eq!(session.serve.open(), 8);
+    assert_eq!(capacity.node_output_held(), 32 * 12);
+    assert!(!session.cancel.is_cancelled());
+
+    // Completing one write lets exactly one waiting response run.
+    assert_eq!(next(&mut session.output).await, Probe::Done(0));
+    settle().await;
+    assert_eq!(session.serve.open(), 7);
+    assert_eq!(capacity.node_output_responses.reserved(), 32);
+    assert_eq!(capacity.node_output_held(), 32 * 12);
+
+    session.cancel.cancel();
+    drop(session);
+    settle().await;
+    assert_eq!(capacity.node_output_responses.reserved(), 0);
+    assert_eq!(peer_budgets.output_responses.reserved(), 0);
+    assert_eq!(capacity.node_output_held(), 0);
+}
+
+#[tokio::test]
+async fn response_slots_bound_all_peers_and_survive_session_replacement() {
+    let capacity = capacity(ServeLimits {
+        peer_output_responses: 2,
+        node_output_responses: 3,
+        ..LIMITS
+    });
+    let old = session(&capacity, 1, 4);
+    for _ in 0..2 {
+        old.serve.admit(job()).unwrap();
+        settle().await;
+    }
+    old.cancel.cancel();
+    settle().await;
+    // The transport still owns the old session's two unwritten endings.
+    let replacement = session(&capacity, 1, 4);
+    replacement.serve.admit(job()).unwrap();
+    let mut other = session(&capacity, 2, 4);
+    other.serve.admit(job()).unwrap();
+    settle().await;
+    assert_eq!(replacement.serve.open(), 1);
+    assert_eq!(other.serve.open(), 0);
+    assert_eq!(capacity.node_output_responses.reserved(), 3);
+    other.serve.admit(job()).unwrap();
+    settle().await;
+    assert_eq!(other.serve.open(), 1);
+    assert_eq!(capacity.node_output_held(), 3 * 12);
+    next(&mut other.output).await;
+    settle().await;
+    assert_eq!(other.serve.open(), 0);
+    drop(old);
+    settle().await;
+    assert_eq!(replacement.serve.open(), 0);
+    replacement.cancel.cancel();
+    other.cancel.cancel();
+    drop(replacement);
+    drop(other);
+    settle().await;
+    assert_eq!(capacity.node_output_responses.reserved(), 0);
 }
 
 #[tokio::test]
@@ -584,7 +678,10 @@ fn sink_and_core(
         frames,
         Arc::new(ResponseGrants {
             _node: grant(),
+            _node_response: SlotBudget::new(1).unwrap().try_reserve().unwrap(),
             _peer: grant(),
+            _peer_response: SlotBudget::new(1).unwrap().try_reserve().unwrap(),
+            _peer_budgets: capacity(LIMITS).peer(&peer(1)),
         }),
         Commitment(commitments.clone()),
     );

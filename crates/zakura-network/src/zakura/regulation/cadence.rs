@@ -1,4 +1,4 @@
-//! Cadence: the rate a row declares, enforced by the receiver and obeyed by
+//! Cadence: the rate a row declares, observed by the receiver and obeyed by
 //! the sender.
 //!
 //! Both sides read the same [`Cadence`] from the row. [`CadenceSender`]
@@ -6,11 +6,10 @@
 //! at most one of them unwritten. [`CadenceBuckets`] keeps one bucket for each
 //! `(layout, message_type)` of a connection.
 //!
-//! The layout validator proves that a conformant sender never empties a
-//! bucket: the bucket refills faster than the sender sends, and its capacity
-//! holds the burst after the longest outage a connection survives. The
-//! receiver's own read pauses add tokens as they happen. So an empty bucket
-//! is a protocol violation, and the reader disconnects the peer.
+//! The layout validator sizes buckets for a connection-wide outage. A single
+//! stream can stall longer while sibling streams keep the connection alive.
+//! Exhaustion therefore measures a burst, not a protocol violation. The reader
+//! records exhaustion and forwards the frame. Local read pauses add tokens.
 //!
 //! Rows without a cadence charge nothing. Commitments bound requests, and
 //! reservations bound responses.
@@ -25,7 +24,7 @@
 //! | Rows without a cadence charge nothing | `rows_without_a_cadence_charge_nothing` |
 //! | A sender faster than the refill exhausts, only after its capacity | `a_sender_faster_than_the_refill_exhausts_only_after_its_capacity` |
 //! | The bursts after an outage or a local pause are admitted | `the_burst_after_the_longest_outage_is_admitted`, `the_burst_after_a_local_pause_of_any_length_is_admitted` |
-//! | Every accepted cadence admits every conformant sender | `a_conformant_sender_is_never_exhausted` |
+//! | Bounded delays do not exhaust a conformant sender | `a_conformant_sender_is_never_exhausted` |
 //! | The sender paces rows and keeps one unwritten frame per row | `the_sender_waits_for_its_interval_and_keeps_only_the_latest_value`, `a_blocked_writer_holds_at_most_one_frame_per_row` |
 
 use std::{collections::HashMap, time::Duration};
@@ -47,7 +46,7 @@ pub(crate) enum CadenceCharge {
     Exempt,
     /// The bucket had a token.
     Admit,
-    /// The bucket is empty: the sender broke the row's cadence.
+    /// The bucket is empty; transport buffering can cause this.
     Exhausted,
 }
 
@@ -156,7 +155,7 @@ impl<C: Clock> CadenceBuckets<C> {
         bucket.refill(now);
         if bucket.tokens == 0 {
             metrics::counter!(
-                "zakura.p2p.cadence.violation",
+                "zakura.p2p.cadence.exhausted",
                 "layout" => layout.to_string(),
                 "message_type" => rule.message_type.to_string(),
             )
@@ -165,8 +164,7 @@ impl<C: Clock> CadenceBuckets<C> {
         }
         bucket.tokens -= 1;
         if bucket.tokens < cadence.capacity / 4 {
-            // A conformant sender came close to the limit. The values stay
-            // enforced; the trace is evidence for tuning them.
+            // Count low buckets as evidence for tuning.
             metrics::counter!(
                 "zakura.p2p.cadence.low",
                 "layout" => layout.to_string(),

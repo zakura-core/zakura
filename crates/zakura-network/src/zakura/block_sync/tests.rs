@@ -361,6 +361,23 @@ async fn same_epoch_verified_growth_without_successor_work_preserves_reset_epoch
         .clone();
     let reset_epoch = sequencer_view.borrow().reset_epoch;
 
+    let BlockSyncAction::QueryNeededBlocks {
+        query_id, scope, ..
+    } = next_action(&mut actions).await
+    else {
+        panic!("startup queries body metadata");
+    };
+    handle
+        .send(BlockSyncEvent::ScopedNeededBlocks {
+            query_id,
+            scope,
+            read_authority: Some(scope),
+            body_anchor: zakura_header_chain::Frontier::new(block::Height(0), block::Hash([0; 32])),
+            blocks: Vec::new(),
+        })
+        .await
+        .expect("startup metadata completes");
+
     snapshots
         .send(Some(committed_view(
             test_committed_snapshot(
@@ -381,7 +398,23 @@ async fn same_epoch_verified_growth_without_successor_work_preserves_reset_epoch
                 from: block::Height(2),
                 ..
             } => break,
-            BlockSyncAction::QueryNeededBlocks { .. } => {}
+            BlockSyncAction::QueryNeededBlocks {
+                query_id, scope, ..
+            } => {
+                handle
+                    .send(BlockSyncEvent::ScopedNeededBlocks {
+                        query_id,
+                        scope,
+                        read_authority: Some(scope),
+                        body_anchor: zakura_header_chain::Frontier::new(
+                            block::Height(1),
+                            verified_hash,
+                        ),
+                        blocks: Vec::new(),
+                    })
+                    .await
+                    .expect("a query dispatched before the sequencer update completes");
+            }
             action => panic!("unexpected action after verified growth: {action:?}"),
         }
     }
@@ -906,6 +939,42 @@ fn persistent_body_alarm_metrics_expose_every_required_dimension() {
             metrics.contains(required),
             "persistent body-alarm metrics must retain `{required}`"
         );
+    }
+}
+
+/// Answer every other metadata query with an empty same-epoch read until the
+/// reactor dispatches the query `target` accepts.
+///
+/// A frontier or reset reaction can dispatch a query after the test completed
+/// the previous one. The same-epoch dedupe then holds later refills until that
+/// query completes, as the driver would complete it.
+async fn complete_queries_until(
+    handle: &BlockSyncHandle,
+    actions: &mut mpsc::Receiver<BlockSyncAction>,
+    anchor: zakura_header_chain::Frontier,
+    target: impl Fn(&BlockSyncAction) -> bool,
+) {
+    loop {
+        let action = next_action(actions).await;
+        if target(&action) {
+            return;
+        }
+        let BlockSyncAction::QueryNeededBlocks {
+            query_id, scope, ..
+        } = action
+        else {
+            panic!("unexpected action before the target query: {action:?}");
+        };
+        handle
+            .send(BlockSyncEvent::ScopedNeededBlocks {
+                read_authority: Some(scope),
+                query_id,
+                scope,
+                body_anchor: anchor,
+                blocks: Vec::new(),
+            })
+            .await
+            .expect("the empty read completes");
     }
 }
 
@@ -3537,6 +3606,494 @@ async fn reactor_fill_loop_saturates_multiple_slots_in_one_pass() {
     assert_eq!(heights, vec![1, 2, 3, 4]);
 
     reactor_task.abort();
+}
+
+#[tokio::test]
+async fn compatible_commit_preserves_the_pending_body_query() {
+    for extended_header in [100, 110] {
+        let initial = test_committed_snapshot(
+            1,
+            1,
+            1,
+            (1, block::Hash([1; 32])),
+            (1, block::Hash([1; 32])),
+            (100, block::Hash([100; 32])),
+        );
+        let (snapshots, startup) =
+            committed_block_sync_startup(initial, immediate_body_download_config());
+        let (handle, mut actions, task) = spawn_block_sync_reactor(startup);
+        let BlockSyncAction::QueryNeededBlocks {
+            query_id, scope, ..
+        } = next_action(&mut actions).await
+        else {
+            panic!("startup must query the missing bodies");
+        };
+        let wiring = handle.routine_wiring.as_ref().unwrap();
+        let mut view = wiring.view.clone();
+        let advanced = committed_view(
+            test_committed_snapshot(
+                2,
+                2,
+                2,
+                (2, block::Hash([2; 32])),
+                (2, block::Hash([2; 32])),
+                (extended_header, block::Hash([100; 32])),
+            ),
+            0,
+        );
+        snapshots.send(Some(advanced.clone())).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while view.borrow().verified_tip < block::Height(2) {
+                view.changed().await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            actions.try_recv().is_err(),
+            "a compatible commit must not replace the pending metadata query"
+        );
+        handle
+            .send(BlockSyncEvent::ScopedNeededBlocks {
+                read_authority: Some(scope),
+                query_id,
+                scope,
+                body_anchor: zakura_header_chain::Frontier::new(
+                    block::Height(1),
+                    block::Hash([1; 32]),
+                ),
+                blocks: (2_u8..=100)
+                    .map(|h| BlockSyncBlockMeta {
+                        height: block::Height(u32::from(h)),
+                        hash: block::Hash([h; 32]),
+                        size: BlockSizeEstimate::Unknown,
+                    })
+                    .collect(),
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !wiring.work.pending_contains(block::Height(3)) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(view.borrow().verified_tip, block::Height(2));
+        assert_eq!(
+            wiring.work.pending_scope(block::Height(3)).unwrap(),
+            zakura_header_chain::BodyWorkAuthority::for_view(&advanced)
+        );
+        if extended_header > 100 {
+            let BlockSyncAction::QueryNeededBlocks {
+                query_id: refill,
+                best_header_tip,
+                ..
+            } = next_action(&mut actions).await
+            else {
+                panic!("completion must refill headers added during the read");
+            };
+            assert_ne!(refill, query_id);
+            assert_eq!(best_header_tip, block::Height(extended_header));
+        }
+        task.abort();
+    }
+}
+
+/// Verified growth onto a retained fork keeps the body-work epoch, so a pending
+/// query completes as a compatible read whose anchor is the fork point. The
+/// reactor must return to that anchor before it queues selected successors,
+/// or the selected child of the fork point is never requested.
+///
+/// With `listed`, the read lists the selected hash at the fork tip's height,
+/// which proves the fork. Without it, the read cannot tell, so the reactor
+/// discards it and re-reads from the fork tip's height.
+#[tokio::test]
+async fn fork_growth_during_compatible_query_resets_to_the_fork_point() {
+    for listed in [true, false] {
+        let fork_point = block::Hash([1; 32]);
+        let fork_child = block::Hash([0xf2; 32]);
+        let selected = |from: u8| -> Vec<BlockSyncBlockMeta> {
+            (from..=100)
+                .map(|h| BlockSyncBlockMeta {
+                    height: block::Height(u32::from(h)),
+                    hash: block::Hash([h; 32]),
+                    size: BlockSizeEstimate::Unknown,
+                })
+                .collect()
+        };
+        let initial = test_committed_snapshot(
+            1,
+            1,
+            1,
+            (1, fork_point),
+            (1, fork_point),
+            (100, block::Hash([100; 32])),
+        );
+        let (snapshots, startup) =
+            committed_block_sync_startup(initial, immediate_body_download_config());
+        let (handle, mut actions, task) = spawn_block_sync_reactor(startup);
+        let BlockSyncAction::QueryNeededBlocks {
+            query_id,
+            scope,
+            from,
+            ..
+        } = next_action(&mut actions).await
+        else {
+            panic!("startup must query the missing bodies");
+        };
+        assert_eq!(from, block::Height(2));
+        let wiring = handle.routine_wiring.as_ref().unwrap();
+        let mut view = wiring.view.clone();
+        let reset_epoch_before = view.borrow().reset_epoch;
+
+        // The full state commits the fork child of A. The selected header branch
+        // is unchanged and the verified path extends its prefix, so the epoch
+        // stays 0. The sequencer view moves only after the reactor observed it.
+        snapshots
+            .send(Some(committed_view(
+                test_committed_snapshot(
+                    2,
+                    1,
+                    2,
+                    (1, fork_point),
+                    (2, fork_child),
+                    (100, block::Hash([100; 32])),
+                ),
+                0,
+            )))
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while view.borrow().verified_tip < block::Height(2) {
+                view.changed().await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            actions.try_recv().is_err(),
+            "the same-epoch commit keeps the pending query"
+        );
+
+        // The state read returns the fork point A and the selected bodies.
+        handle
+            .send(BlockSyncEvent::ScopedNeededBlocks {
+                read_authority: Some(scope),
+                query_id,
+                scope,
+                body_anchor: zakura_header_chain::Frontier::new(block::Height(1), fork_point),
+                blocks: selected(if listed { 2 } else { 3 }),
+            })
+            .await
+            .unwrap();
+        if !listed {
+            let BlockSyncAction::QueryNeededBlocks {
+                query_id,
+                scope,
+                from,
+                ..
+            } = next_action(&mut actions).await
+            else {
+                panic!("an unproven tip needs a fresh read");
+            };
+            assert_eq!(
+                from,
+                block::Height(2),
+                "the fresh read lists the tip height"
+            );
+            assert_eq!(view.borrow().reset_epoch, reset_epoch_before);
+            assert!(!wiring.work.pending_contains(block::Height(3)));
+            handle
+                .send(BlockSyncEvent::ScopedNeededBlocks {
+                    read_authority: Some(scope),
+                    query_id,
+                    scope,
+                    body_anchor: zakura_header_chain::Frontier::new(block::Height(1), fork_point),
+                    blocks: selected(2),
+                })
+                .await
+                .unwrap();
+        }
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while view.borrow().reset_epoch == reset_epoch_before {
+                view.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("the completion resets to the fork point");
+        assert_eq!(view.borrow().verified_tip, block::Height(1));
+        assert!(!wiring.work.pending_contains(block::Height(3)));
+        // The reset reaction forces a refill from the selected child of A. A
+        // reaction to the earlier fork advance can still dispatch a query first;
+        // the reset supersedes it.
+        loop {
+            if let BlockSyncAction::QueryNeededBlocks {
+                from: block::Height(2),
+                ..
+            } = next_action(&mut actions).await
+            {
+                break;
+            }
+        }
+        assert!(!wiring.work.pending_contains(block::Height(3)));
+        assert_eq!(view.borrow().verified_tip, block::Height(1));
+        task.abort();
+    }
+}
+
+/// An older read that neither lists the committed verified tip nor has queued
+/// work proving it is stale: the reactor re-reads instead of resetting below
+/// the committed tip.
+#[tokio::test]
+async fn unproven_verified_growth_rereads_instead_of_resetting() {
+    let initial = test_committed_snapshot(
+        1,
+        1,
+        1,
+        (0, block::Hash([0; 32])),
+        (0, block::Hash([0; 32])),
+        (2, block::Hash([0x13; 32])),
+    );
+    let (snapshots, startup) =
+        committed_block_sync_startup(initial, immediate_body_download_config());
+    let (handle, mut actions, task) = spawn_block_sync_reactor(startup);
+    let BlockSyncAction::QueryNeededBlocks {
+        query_id, scope, ..
+    } = next_action(&mut actions).await
+    else {
+        panic!("startup queries body metadata");
+    };
+    let wiring = handle.routine_wiring.as_ref().unwrap();
+    let mut view = wiring.view.clone();
+    let reset_epoch_before = view.borrow().reset_epoch;
+    snapshots
+        .send(Some(committed_view(
+            test_committed_snapshot(
+                2,
+                1,
+                2,
+                (0, block::Hash([0; 32])),
+                (1, block::Hash([0x12; 32])),
+                (2, block::Hash([0x13; 32])),
+            ),
+            0,
+        )))
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while view.borrow().verified_tip < block::Height(1) {
+            view.changed().await.unwrap();
+        }
+    })
+    .await
+    .unwrap();
+    handle
+        .send(BlockSyncEvent::ScopedNeededBlocks {
+            read_authority: Some(scope),
+            query_id,
+            scope,
+            body_anchor: zakura_header_chain::Frontier::new(block::Height(0), block::Hash([0; 32])),
+            blocks: Vec::new(),
+        })
+        .await
+        .unwrap();
+    let BlockSyncAction::QueryNeededBlocks { from, .. } = next_action(&mut actions).await else {
+        panic!("the stale read is replaced");
+    };
+    assert_eq!(from, block::Height(1));
+    assert_eq!(view.borrow().reset_epoch, reset_epoch_before);
+    assert_eq!(view.borrow().verified_tip, block::Height(1));
+    task.abort();
+}
+
+/// Verified growth onto heights that block sync already queued is selected-branch
+/// progress, even when the pending read starts above the new verified tip.
+#[tokio::test]
+async fn queued_selected_growth_keeps_a_compatible_read_above_the_tip() {
+    let initial = test_committed_snapshot(
+        1,
+        1,
+        1,
+        (1, block::Hash([1; 32])),
+        (1, block::Hash([1; 32])),
+        (100, block::Hash([100; 32])),
+    );
+    let (snapshots, startup) =
+        committed_block_sync_startup(initial, immediate_body_download_config());
+    let (handle, mut actions, task) = spawn_block_sync_reactor(startup);
+    let selected = |from: u8, through: u8| -> Vec<BlockSyncBlockMeta> {
+        (from..=through)
+            .map(|h| BlockSyncBlockMeta {
+                height: block::Height(u32::from(h)),
+                hash: block::Hash([h; 32]),
+                size: BlockSizeEstimate::Unknown,
+            })
+            .collect()
+    };
+    let BlockSyncAction::QueryNeededBlocks {
+        query_id, scope, ..
+    } = next_action(&mut actions).await
+    else {
+        panic!("startup must query the missing bodies");
+    };
+    handle
+        .send(BlockSyncEvent::ScopedNeededBlocks {
+            read_authority: Some(scope),
+            query_id,
+            scope,
+            body_anchor: zakura_header_chain::Frontier::new(block::Height(1), block::Hash([1; 32])),
+            blocks: selected(2, 3),
+        })
+        .await
+        .unwrap();
+    // A selected header extension forces a refill above the queued window.
+    snapshots
+        .send(Some(committed_view(
+            test_committed_snapshot(
+                2,
+                2,
+                1,
+                (1, block::Hash([1; 32])),
+                (1, block::Hash([1; 32])),
+                (101, block::Hash([101; 32])),
+            ),
+            0,
+        )))
+        .unwrap();
+    let BlockSyncAction::QueryNeededBlocks {
+        query_id,
+        scope,
+        from,
+        ..
+    } = next_action(&mut actions).await
+    else {
+        panic!("the header extension refills above the queued window");
+    };
+    assert_eq!(from, block::Height(4));
+    let wiring = handle.routine_wiring.as_ref().unwrap();
+    let mut view = wiring.view.clone();
+    let reset_epoch_before = view.borrow().reset_epoch;
+
+    snapshots
+        .send(Some(committed_view(
+            test_committed_snapshot(
+                3,
+                2,
+                2,
+                (1, block::Hash([1; 32])),
+                (3, block::Hash([3; 32])),
+                (101, block::Hash([101; 32])),
+            ),
+            0,
+        )))
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while view.borrow().verified_tip < block::Height(3) {
+            view.changed().await.unwrap();
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        actions.try_recv().is_err(),
+        "selected growth keeps the pending query"
+    );
+
+    handle
+        .send(BlockSyncEvent::ScopedNeededBlocks {
+            read_authority: Some(scope),
+            query_id,
+            scope,
+            body_anchor: zakura_header_chain::Frontier::new(block::Height(1), block::Hash([1; 32])),
+            blocks: selected(4, 100),
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while !wiring.work.pending_contains(block::Height(4)) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the older selected read is admitted");
+    assert_eq!(view.borrow().reset_epoch, reset_epoch_before);
+    assert_eq!(view.borrow().verified_tip, block::Height(3));
+    task.abort();
+}
+
+#[tokio::test]
+async fn compatible_query_rebase_requires_state_captured_authority() {
+    for read_epoch in [None, Some(1)] {
+        let initial = test_committed_snapshot(
+            1,
+            1,
+            1,
+            (1, block::Hash([1; 32])),
+            (1, block::Hash([1; 32])),
+            (100, block::Hash([100; 32])),
+        );
+        let (snapshots, startup) =
+            committed_block_sync_startup(initial, immediate_body_download_config());
+        let (handle, mut actions, task) = spawn_block_sync_reactor(startup);
+        let BlockSyncAction::QueryNeededBlocks {
+            query_id, scope, ..
+        } = next_action(&mut actions).await
+        else {
+            panic!("startup query");
+        };
+        let wiring = handle.routine_wiring.as_ref().unwrap();
+        let mut view = wiring.view.clone();
+        snapshots
+            .send(Some(committed_view(
+                test_committed_snapshot(
+                    2,
+                    2,
+                    2,
+                    (2, block::Hash([2; 32])),
+                    (2, block::Hash([2; 32])),
+                    (100, block::Hash([100; 32])),
+                ),
+                0,
+            )))
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while view.borrow().verified_tip < block::Height(2) {
+                view.changed().await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+        handle
+            .send(BlockSyncEvent::ScopedNeededBlocks {
+                query_id,
+                scope,
+                read_authority: read_epoch.map(|epoch| zakura_header_chain::BodyWorkAuthority {
+                    body_work_epoch: zakura_header_chain::BodyWorkEpoch::new(epoch),
+                    ..scope
+                }),
+                body_anchor: zakura_header_chain::Frontier::new(
+                    block::Height(1),
+                    block::Hash([1; 32]),
+                ),
+                blocks: vec![BlockSyncBlockMeta {
+                    height: block::Height(3),
+                    hash: block::Hash([3; 32]),
+                    size: BlockSizeEstimate::Unknown,
+                }],
+            })
+            .await
+            .unwrap();
+        let BlockSyncAction::QueryNeededBlocks {
+            query_id: retry, ..
+        } = next_action(&mut actions).await
+        else {
+            panic!("unproven metadata must trigger a fresh query");
+        };
+        assert_ne!(retry, query_id);
+        assert!(!wiring.work.pending_contains(block::Height(3)));
+        assert_eq!(view.borrow().verified_tip, block::Height(2));
+        task.abort();
+    }
 }
 
 #[tokio::test]
@@ -12780,6 +13337,10 @@ async fn committed_reanchor_requeries_while_downloads_in_flight() {
         )))
         .expect("the committed snapshot receiver is live");
     wait_for_query_needed_blocks(&mut actions, block::Height(0), block::Height(1)).await;
+    handle
+        .send(BlockSyncEvent::NeededBlocks(Vec::new()))
+        .await
+        .expect("the reanchor metadata query completes before extension");
 
     snapshots
         .send(Some(committed_view(
@@ -12794,7 +13355,22 @@ async fn committed_reanchor_requeries_while_downloads_in_flight() {
             1,
         )))
         .expect("the committed snapshot receiver is live");
-    wait_for_query_needed_blocks(&mut actions, block::Height(0), block::Height(3)).await;
+    complete_queries_until(
+        &handle,
+        &mut actions,
+        zakura_header_chain::Frontier::new(block::Height(0), block::Hash([0; 32])),
+        |action| {
+            matches!(
+                action,
+                BlockSyncAction::QueryNeededBlocks {
+                    from: block::Height(1),
+                    best_header_tip: block::Height(3),
+                    ..
+                }
+            )
+        },
+    )
+    .await;
 
     reactor_task.abort();
 }
@@ -12838,6 +13414,7 @@ async fn epoch_change_supersedes_stale_floor_query() {
     .await;
     handle
         .send(BlockSyncEvent::ScopedNeededBlocks {
+            read_authority: None,
             query_id,
             scope,
             body_anchor: zakura_header_chain::Frontier::new(block::Height(0), block::Hash([0; 32])),
@@ -12940,6 +13517,7 @@ async fn epoch_change_supersedes_stale_floor_query() {
     .await;
     handle
         .send(BlockSyncEvent::ScopedNeededBlocks {
+            read_authority: None,
             query_id: stale_floor_query.0,
             scope: stale_floor_query.1,
             body_anchor: zakura_header_chain::Frontier::new(block::Height(0), block::Hash([0; 32])),
@@ -12949,6 +13527,7 @@ async fn epoch_change_supersedes_stale_floor_query() {
         .expect("stale query completion queues");
     handle
         .send(BlockSyncEvent::ScopedNeededBlocks {
+            read_authority: None,
             query_id: replacement_query.0,
             scope: replacement_query.1,
             body_anchor: zakura_header_chain::Frontier::new(block::Height(0), block::Hash([0; 32])),
@@ -12999,6 +13578,7 @@ async fn header_extension_preserves_checkpoint_pipeline() {
     .await;
     handle
         .send(BlockSyncEvent::ScopedNeededBlocks {
+            read_authority: None,
             query_id,
             scope,
             body_anchor: zakura_header_chain::Frontier::new(block::Height(1), blocks[0].hash()),
@@ -13049,6 +13629,11 @@ async fn header_extension_preserves_checkpoint_pipeline() {
     .expect("unresolved submissions advance the floor");
     let reset_epoch = sequencer_view.borrow().reset_epoch;
 
+    handle
+        .send(BlockSyncEvent::NeededBlocks(Vec::new()))
+        .await
+        .expect("the preceding metadata query completes");
+
     let extension = committed_view(
         test_committed_snapshot(
             2,
@@ -13064,20 +13649,30 @@ async fn header_extension_preserves_checkpoint_pipeline() {
     snapshots
         .send(Some(extension))
         .expect("the 2,007-header extension publishes");
-    loop {
-        match next_action(&mut actions).await {
-            BlockSyncAction::QueryNeededBlocks {
-                from: block::Height(4),
-                scope,
-                ..
-            } if scope == extension_scope => break,
-            BlockSyncAction::QueryNeededBlocks { .. } => {}
-            action => panic!("unexpected action after the compatible extension: {action:?}"),
-        }
-    }
+    complete_queries_until(
+        &handle,
+        &mut actions,
+        zakura_header_chain::Frontier::new(block::Height(1), blocks[0].hash()),
+        |action| {
+            matches!(
+                action,
+                BlockSyncAction::QueryNeededBlocks {
+                    from: block::Height(4),
+                    scope,
+                    ..
+                } if *scope == extension_scope
+            )
+        },
+    )
+    .await;
     assert_eq!(sequencer_view.borrow().reset_epoch, reset_epoch);
     assert_eq!(sequencer_view.borrow().download_floor, block::Height(3));
     assert_eq!(sequencer_view.borrow().applying_len, 2);
+
+    handle
+        .send(BlockSyncEvent::NeededBlocks(Vec::new()))
+        .await
+        .expect("the extension metadata query completes");
 
     let checkpoint = committed_view(
         test_committed_snapshot(
@@ -13094,17 +13689,22 @@ async fn header_extension_preserves_checkpoint_pipeline() {
     snapshots
         .send(Some(checkpoint))
         .expect("checkpoint finality publishes after the extension");
-    loop {
-        match next_action(&mut actions).await {
-            BlockSyncAction::QueryNeededBlocks {
-                from: block::Height(4),
-                scope,
-                ..
-            } if scope == checkpoint_scope => break,
-            BlockSyncAction::QueryNeededBlocks { .. } => {}
-            action => panic!("unexpected action after checkpoint finality: {action:?}"),
-        }
-    }
+    complete_queries_until(
+        &handle,
+        &mut actions,
+        zakura_header_chain::Frontier::new(block::Height(1), blocks[0].hash()),
+        |action| {
+            matches!(
+                action,
+                BlockSyncAction::QueryNeededBlocks {
+                    from: block::Height(4),
+                    scope,
+                    ..
+                } if *scope == checkpoint_scope
+            )
+        },
+    )
+    .await;
     assert_eq!(sequencer_view.borrow().reset_epoch, reset_epoch);
     assert_eq!(sequencer_view.borrow().download_floor, block::Height(3));
     assert_eq!(sequencer_view.borrow().applying_len, 2);
@@ -13326,6 +13926,10 @@ async fn committed_reanchor_releases_stale_submitted_bodies() {
         )))
         .expect("the committed snapshot receiver is live");
     wait_for_query_needed_blocks(&mut actions, block::Height(0), block::Height(1)).await;
+    handle
+        .send(BlockSyncEvent::NeededBlocks(Vec::new()))
+        .await
+        .expect("the reanchor metadata query completes before extension");
 
     snapshots
         .send(Some(committed_view(
@@ -13340,7 +13944,22 @@ async fn committed_reanchor_releases_stale_submitted_bodies() {
             1,
         )))
         .expect("the committed snapshot receiver is live");
-    wait_for_query_needed_blocks(&mut actions, block::Height(0), block::Height(3)).await;
+    complete_queries_until(
+        &handle,
+        &mut actions,
+        zakura_header_chain::Frontier::new(block::Height(0), block::Hash([0; 32])),
+        |action| {
+            matches!(
+                action,
+                BlockSyncAction::QueryNeededBlocks {
+                    from: block::Height(1),
+                    best_header_tip: block::Height(3),
+                    ..
+                }
+            )
+        },
+    )
+    .await;
 
     handle
         .send(BlockSyncEvent::NeededBlocks(
@@ -13499,6 +14118,7 @@ async fn selected_body_fork_reanchors_before_scheduling_successors() {
     };
     handle
         .send(BlockSyncEvent::ScopedNeededBlocks {
+            read_authority: Some(scope),
             query_id,
             scope,
             body_anchor: zakura_header_chain::Frontier::new(block::Height(1), block::Hash([1; 32])),
@@ -13571,6 +14191,7 @@ async fn stale_needed_block_completion_cannot_clear_a_newer_query() {
 
     handle
         .send(BlockSyncEvent::ScopedNeededBlocks {
+            read_authority: None,
             query_id: first_query_id,
             scope: first_scope,
             body_anchor: zakura_header_chain::Frontier::new(block::Height(0), block::Hash([0; 32])),
@@ -13580,6 +14201,7 @@ async fn stale_needed_block_completion_cannot_clear_a_newer_query() {
         .expect("stale completion queues");
     handle
         .send(BlockSyncEvent::ScopedNeededBlocks {
+            read_authority: None,
             query_id: second_query_id,
             scope: second_scope,
             body_anchor: zakura_header_chain::Frontier::new(block::Height(0), block::Hash([0; 32])),
@@ -15925,6 +16547,7 @@ async fn committed_hint_batches_refresh_queued_work_without_resetting_it() {
     candidates.borrow_and_update();
     handle
         .send(BlockSyncEvent::ScopedNeededBlocks {
+            read_authority: None,
             query_id,
             scope,
             body_anchor: zakura_header_chain::Frontier::new(block::Height(1), block::Hash([1; 32])),
@@ -16018,6 +16641,7 @@ async fn missed_hint_history_refreshes_the_existing_queued_window() {
     changed.as_mut().enable();
     handle
         .send(BlockSyncEvent::ScopedNeededBlocks {
+            read_authority: None,
             query_id,
             scope,
             body_anchor: zakura_header_chain::Frontier::new(block::Height(1), block::Hash([1; 32])),

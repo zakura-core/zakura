@@ -267,6 +267,7 @@ fn spawn_action_driver(
                     };
                     if handle
                         .send(BlockSyncEvent::ScopedNeededBlocks {
+                            read_authority: None,
                             query_id,
                             scope,
                             body_anchor: {

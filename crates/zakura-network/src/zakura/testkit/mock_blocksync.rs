@@ -581,6 +581,7 @@ async fn drive_mock_block_sync_actions(
                     };
                     let _ = handle
                         .send(BlockSyncEvent::ScopedNeededBlocks {
+                            read_authority: None,
                             query_id,
                             scope,
                             body_anchor: apply.as_ref().map_or_else(

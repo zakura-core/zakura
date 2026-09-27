@@ -819,6 +819,7 @@ mod tests {
                         };
                         let _ = handle
                             .send(BlockSyncEvent::ScopedNeededBlocks {
+                                read_authority: None,
                                 query_id,
                                 scope,
                                 body_anchor: {

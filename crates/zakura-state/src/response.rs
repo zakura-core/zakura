@@ -422,6 +422,8 @@ impl Eq for NonFinalizedBlocksListener {}
 /// Selected-chain body anchor and missing-body metadata for one block-sync query.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BlockSyncBodyMetadata {
+    /// Body-work authority captured with the selected projection, when header sync is active.
+    pub authority: Option<zakura_header_chain::BodyWorkAuthority>,
     /// Highest full-state block shared with the selected header chain.
     pub anchor: zakura_header_chain::Frontier,
     /// Selected-header bodies that block sync must download after `anchor`.

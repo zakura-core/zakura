@@ -874,6 +874,7 @@ fn restore_transition_engine_after_staging_error(
 #[derive(Clone, Debug)]
 pub(crate) struct HeaderChainReader {
     store: HeaderChainStore,
+    publisher: Publisher,
     config: Arc<EngineConfig>,
     leases: Arc<Mutex<RetainedPathLeaseRegistry>>,
     transition_engine: Arc<Mutex<HeaderChainEngine>>,
@@ -1440,7 +1441,8 @@ impl HeaderChainReader {
     pub(crate) fn with_selected_projection<T>(
         &self,
         read_full_state: impl FnOnce() -> T,
-    ) -> Result<(T, Vec<Frontier>), HeaderChainStoreError> {
+    ) -> Result<(T, Vec<Frontier>, zakura_header_chain::BodyWorkAuthority), HeaderChainStoreError>
+    {
         let _writer = self
             .store
             .writer
@@ -1461,7 +1463,17 @@ impl HeaderChainReader {
             )
             .into());
         }
-        Ok((full_state, projection))
+        let view = self.publisher.view();
+        if view.state_version != snapshot.state_version {
+            return Err(
+                StoreError::Incoherent("selected projection authority is not published").into(),
+            );
+        }
+        Ok((
+            full_state,
+            projection,
+            zakura_header_chain::BodyWorkAuthority::for_view(&view),
+        ))
     }
 
     /// Capture full-state data, the selected header tip, and the selected headers
@@ -2456,6 +2468,7 @@ impl HeaderChainRuntime {
     pub(crate) fn reader(&self) -> HeaderChainReader {
         HeaderChainReader {
             store: self.store.clone(),
+            publisher: self.publisher.clone(),
             config: Arc::new(self.config.clone()),
             leases: self.leases.clone(),
             transition_engine: self.transition_engine.clone(),

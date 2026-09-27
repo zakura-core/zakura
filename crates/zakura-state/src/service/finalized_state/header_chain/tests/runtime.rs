@@ -563,7 +563,7 @@ fn body_refill_snapshot_holds_the_complete_transition_barrier() {
 
     assert!(Arc::ptr_eq(&reader.config, &cloned_reader.config));
 
-    let (full_state, selected_projection) = reader
+    let (full_state, selected_projection, authority) = reader
         .with_selected_projection(|| {
             assert!(reader.store.writer.try_lock().is_err());
             assert!(reader.transition_engine.try_lock().is_err());
@@ -573,6 +573,10 @@ fn body_refill_snapshot_holds_the_complete_transition_barrier() {
 
     assert_eq!(full_state, Frontier::new(anchor.height, anchor.hash));
     assert_eq!(selected_projection, vec![full_state]);
+    assert_eq!(
+        authority,
+        zakura_header_chain::BodyWorkAuthority::for_view(&runtime.publisher.view())
+    );
 }
 
 #[test]

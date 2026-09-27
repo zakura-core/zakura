@@ -453,10 +453,11 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
                 trace.trace_needed_blocks_query_started(from, limit, best_header_tip);
                 let started = Instant::now();
                 match query_block_sync_needed_blocks(read_state.clone(), from, limit).await {
-                    Ok((body_anchor, blocks)) => {
+                    Ok((read_authority, body_anchor, blocks)) => {
                         trace.trace_needed_blocks_query_succeeded(blocks.len(), started);
                         if block_sync
                             .send_control(BlockSyncEvent::ScopedNeededBlocks {
+                                read_authority,
                                 query_id,
                                 scope,
                                 body_anchor,
@@ -1714,7 +1715,14 @@ pub(crate) async fn query_block_sync_needed_blocks<ReadState>(
     read_state: ReadState,
     from: block::Height,
     limit: u32,
-) -> Result<(zakura_header_chain::Frontier, Vec<BlockSyncBlockMeta>), zakura_state::BoxError>
+) -> Result<
+    (
+        Option<zakura_header_chain::BodyWorkAuthority>,
+        zakura_header_chain::Frontier,
+        Vec<BlockSyncBlockMeta>,
+    ),
+    zakura_state::BoxError,
+>
 where
     ReadState: Service<
             zakura_state::ReadRequest,
@@ -1733,6 +1741,7 @@ where
 
     let mut needed = Vec::new();
     let mut body_anchor = None;
+    let mut read_authority: Option<zakura_header_chain::BodyWorkAuthority> = None;
     let mut next_from = from;
     let mut remaining = limit;
 
@@ -1741,15 +1750,27 @@ where
         let chunk =
             query_block_sync_needed_blocks_chunk(read_state.clone(), next_from, chunk_limit)
                 .await?;
+        let compatible_epoch = read_authority
+            .zip(chunk.authority)
+            .is_some_and(|(before, after)| before.body_work_epoch == after.body_work_epoch);
+        if body_anchor.is_some() && read_authority != chunk.authority && !compatible_epoch {
+            return Err(std::io::Error::other(
+                "block-sync body authority changed across one chunked state query",
+            )
+            .into());
+        }
         if body_anchor
             .replace(chunk.anchor)
-            .is_some_and(|anchor| anchor != chunk.anchor)
+            .is_some_and(|anchor: zakura_header_chain::Frontier| {
+                anchor != chunk.anchor && !(compatible_epoch && chunk.anchor.height > anchor.height)
+            })
         {
             return Err(std::io::Error::other(
                 "block-sync body anchor changed across one chunked state query",
             )
             .into());
         }
+        read_authority = chunk.authority;
         needed.extend(block_sync_needed_blocks_from_state(chunk.blocks));
 
         remaining = remaining.saturating_sub(chunk_limit);
@@ -1761,7 +1782,7 @@ where
 
     let body_anchor = body_anchor
         .ok_or_else(|| std::io::Error::other("block-sync needed-body query returned no anchor"))?;
-    Ok((body_anchor, needed))
+    Ok((read_authority, body_anchor, needed))
 }
 
 async fn query_block_sync_needed_blocks_chunk<ReadState>(

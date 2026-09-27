@@ -23,7 +23,10 @@ use crate::{
         ClientRequest, ClientTestHarness, ConnectedAddr, LoadTrackedClient, MinimumPeerVersion,
     },
     peer_set::{inventory_registry::InventoryStatus, stall_tracker::FIND_RESPONSE_STALL_THRESHOLD},
-    protocol::external::{types::Version, InventoryHash},
+    protocol::external::{
+        types::{PeerServices, Version},
+        InventoryHash,
+    },
     BannedIps, BoxError, PeerSocketAddr, Request, Response, SharedPeerError,
 };
 
@@ -972,6 +975,128 @@ fn peer_set_route_inv_advertised_registry_order(advertised_first: bool) {
             "request routed to non-advertised peer",
         );
     });
+}
+
+/// Sends `request` through a new peer set whose peers advertise `peer_services`,
+/// and returns which peers received it.
+fn peers_receiving_block_request(
+    peer_services: &[PeerServices],
+    request: Request,
+    advertised: Option<(block::Hash, PeerSocketAddr)>,
+) -> Vec<bool> {
+    let peer_version = Version::min_specified_for_upgrade(&Network::Mainnet, NetworkUpgrade::Nu6_2);
+    let peer_versions = PeerVersions {
+        peer_versions: vec![peer_version; peer_services.len()],
+    };
+
+    let (runtime, _init_guard) = zakura_test::init_async();
+    let _guard = runtime.enter();
+
+    let (discovered_peers, mut handles) =
+        peer_versions.mock_peer_discovery_with_services(peer_services);
+
+    runtime.block_on(async move {
+        let (mut peer_set, mut peer_set_guard) = PeerSetBuilder::new()
+            .with_discover(discovered_peers)
+            .max_conns_per_ip(max(peer_services.len(), DEFAULT_MAX_CONNS_PER_IP))
+            .build();
+
+        if let Some((hash, peer)) = advertised {
+            peer_set_guard
+                .inventory_sender()
+                .as_mut()
+                .expect("inventory sender exists")
+                .send(InventoryStatus::new_available(
+                    InventoryHash::Block(hash),
+                    peer,
+                ))
+                .expect("inventory receiver exists");
+        }
+
+        // Make every peer ready before routing, so the choice is not limited by readiness.
+        while peer_set.ready_services.len() < peer_services.len() {
+            peer_set.ready().await.expect("peer set is ready");
+            tokio::task::yield_now().await;
+        }
+
+        let peer_ready = peer_set.ready().await.expect("peer set is ready");
+        let _response = peer_ready.call(request);
+
+        handles
+            .iter_mut()
+            .map(|handle| {
+                handle
+                    .try_to_receive_outbound_client_request()
+                    .request()
+                    .is_some()
+            })
+            .collect()
+    })
+}
+
+/// Unadvertised single-block requests go to full nodes before pruned peers.
+#[test]
+fn block_requests_prefer_full_nodes() {
+    for _ in 0..8 {
+        let request = Request::BlocksByHash(iter::once(block::Hash([1; 32])).collect());
+        let received = peers_receiving_block_request(
+            &[
+                PeerServices::empty(),
+                PeerServices::NODE_NETWORK,
+                PeerServices::empty(),
+            ],
+            request,
+            None,
+        );
+
+        assert_eq!(received, vec![false, true, false]);
+    }
+}
+
+/// Multi-block requests go to full nodes before pruned peers.
+#[test]
+fn multi_block_requests_prefer_full_nodes() {
+    for _ in 0..8 {
+        let request = Request::BlocksByHash(
+            [block::Hash([1; 32]), block::Hash([2; 32])]
+                .into_iter()
+                .collect(),
+        );
+        let received = peers_receiving_block_request(
+            &[PeerServices::empty(), PeerServices::NODE_NETWORK],
+            request,
+            None,
+        );
+
+        assert_eq!(received, vec![false, true]);
+    }
+}
+
+/// Block requests still go to a pruned peer when no full node is ready.
+///
+/// Regression test for #448: failing the request instead made the syncer abort
+/// every round under ordinary peer set saturation.
+#[test]
+fn block_requests_fall_back_to_pruned_peers() {
+    let request = Request::BlocksByHash(iter::once(block::Hash([1; 32])).collect());
+    let received = peers_receiving_block_request(&[PeerServices::empty()], request, None);
+
+    assert_eq!(received, vec![true]);
+}
+
+/// A pruned peer that advertised a block is still asked for it.
+#[test]
+fn advertised_block_requests_use_pruned_advertisers() {
+    let hash = block::Hash([3; 32]);
+    let pruned_peer: PeerSocketAddr = "127.0.0.1:1".parse().expect("test peer address is valid");
+    let request = Request::BlocksByHash(iter::once(hash).collect());
+    let received = peers_receiving_block_request(
+        &[PeerServices::empty(), PeerServices::NODE_NETWORK],
+        request,
+        Some((hash, pruned_peer)),
+    );
+
+    assert_eq!(received, vec![true, false]);
 }
 
 /// Check that a peer set routes inventory requests to peers that are not missing that inventory.

@@ -175,7 +175,7 @@ enum BbrPhase {
 }
 
 impl BbrPhase {
-    /// Numeric code for the JSONL trace (0 = ProbeBw, 1 = ProbeRtt).
+    /// Numeric code for the CSV trace (0 = ProbeBw, 1 = ProbeRtt).
     fn trace_code(self) -> u64 {
         match self {
             BbrPhase::ProbeBw => 0,
@@ -600,7 +600,7 @@ impl BbrState {
     }
 
     /// Current reliability estimate (goodput fraction) scaled to per-mille (0–1000)
-    /// for the integer JSONL trace. `1000` = every issued request delivered a body.
+    /// for the integer CSV trace. `1000` = every issued request delivered a body.
     pub(super) fn reliability_permille(&self) -> u64 {
         // A finite EWMA of values in [0, 1]; clamp defensively before the cast.
         (self.reliability.clamp(0.0, 1.0) * 1000.0).round() as u64

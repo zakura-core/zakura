@@ -11,7 +11,32 @@ use zakura_chain::block::{self, Height};
 use zakura_jsonl_trace::{JsonlEventEmitter, JsonlTraceTable, JsonlTracer};
 use zakura_network::PeerSocketAddr;
 
-const TABLE: JsonlTraceTable = JsonlTraceTable::new("legacy_sync", "legacy_sync.jsonl");
+const TABLE: JsonlTraceTable = JsonlTraceTable::csv(
+    "legacy_sync",
+    "legacy_sync.csv",
+    &[
+        "event",
+        "state_tip",
+        "reason",
+        "error",
+        "checkpoint_height",
+        "reserve",
+        "prospective_tips",
+        "discovered",
+        "hash",
+        "height",
+        "result",
+        "phase",
+        "elapsed_ms",
+        "phase_elapsed_ms",
+        "previous_phase",
+        "in_flight",
+        "registry_retries",
+        "tasks",
+        "download_elapsed_ms",
+        "peer",
+    ],
+);
 
 #[derive(Clone, Debug)]
 pub(super) struct LegacyTaskState {
@@ -322,9 +347,23 @@ impl LegacyTaskTrace {
 
 #[cfg(test)]
 mod tests {
-    use serde_json::{json, Value};
+    use serde_json::json;
+    use zakura_network::zakura::testkit::TraceReader;
 
     use super::*;
+
+    #[test]
+    fn csv_header_matches_shared_schema() {
+        let schema: serde_json::Value =
+            serde_json::from_str(zakura_jsonl_trace::SCHEMA_JSON).expect("shared trace schema");
+        let columns: Vec<_> = schema["tables"][TABLE.table()]
+            .as_array()
+            .expect("legacy sync table")
+            .iter()
+            .map(|value| value.as_str().unwrap())
+            .collect();
+        assert_eq!(TABLE.header(), columns);
+    }
 
     #[test]
     fn absent_round_tip_is_omitted() {
@@ -348,9 +387,8 @@ mod tests {
         drop(trace);
         guard.shutdown().await;
 
-        let event = std::fs::read_to_string(dir.path().join(TABLE.file_name()))
-            .expect("legacy trace file is written");
-        let event: Value = serde_json::from_str(event.trim()).expect("trace row is valid JSON");
+        let reader = TraceReader::load(dir.path()).expect("legacy CSV trace");
+        let event = reader.table("legacy_sync").first().expect("trace row");
         assert_eq!(event["event"], "round_start");
         assert_eq!(event["node"], "test-node");
         assert_eq!(event["state_tip"], 42);
@@ -369,9 +407,8 @@ mod tests {
         drop(trace);
         guard.shutdown().await;
 
-        let event = std::fs::read_to_string(dir.path().join(TABLE.file_name()))
-            .expect("legacy trace file is written");
-        let event: Value = serde_json::from_str(event.trim()).expect("trace row is valid JSON");
+        let reader = TraceReader::load(dir.path()).expect("legacy CSV trace");
+        let event = reader.table("legacy_sync").first().expect("trace row");
         assert_eq!(event["event"], "round_finish");
         assert_eq!(event["reason"], "checkpoint_handoff");
         assert_eq!(event["state_tip"], 160);

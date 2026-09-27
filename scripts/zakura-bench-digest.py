@@ -15,8 +15,8 @@ Subcommands:
   diff       Compare two folded-stacks files (baseline vs primary) and render
              the largest per-function self-share changes as markdown.
   latency    Render block-processing latency as markdown (+ optional JSON) from
-             a run's Zakura JSONL traces (per-block `commit_start`/`commit_finish`
-             rows in commit_state.jsonl) and a final Prometheus /metrics snapshot
+             a run's Zakura CSV traces (per-block `commit_start`/`commit_finish`
+             rows in commit_state.csv) and a final Prometheus /metrics snapshot
              (cumulative per-stage duration histograms).
 """
 
@@ -28,6 +28,9 @@ import re
 import sys
 from collections import defaultdict
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import zakura_trace as trace
 
 # ---------------------------------------------------------------------------
 # collapse
@@ -366,7 +369,7 @@ def nearest_rank(sorted_values, quantile):
 
 
 def parse_commit_trace(trace_path, min_height=None):
-    """Parse commit_state.jsonl into block, header-range, and stall records.
+    """Parse a CSV commit trace into block, header-range, and stall records.
 
     The trace table is shared by two drivers: the block-sync driver (per-block
     `block_submit_queued`/`commit_start`/`commit_finish` rows keyed by height,
@@ -376,49 +379,69 @@ def parse_commit_trace(trace_path, min_height=None):
     `finishes` maps height to `(ts, elapsed_ms, apply_class)` for committed
     blocks and `headers` lists `(elapsed_ms, range_count)` per committed range.
     """
+    with trace.locked_directory(Path(trace_path).parent):
+        rows = list(trace.read_segment(trace_path, "commit_state", trace.Budget()))
+    return parse_commit_rows(rows, min_height)
+
+
+def parse_commit_rows(rows, min_height=None):
     queued_ts, start_ts, finishes = {}, {}, {}
     headers = []
     stalls = defaultdict(int)
     non_committed = defaultdict(int)
-    with open(trace_path, encoding="utf-8", errors="replace") as trace:
-        for line in trace:
-            try:
-                row = json.loads(line)
-            except ValueError:
-                continue
-            event = row.get("event")
-            if row.get("source") == "header_sync_driver":
-                range_start = row.get("range_start")
-                if min_height is not None and isinstance(range_start, int):
-                    if range_start < min_height:
-                        continue
-                if event == "commit_finish" and row.get("result") == "committed":
-                    elapsed = row.get("elapsed_ms")
-                    if isinstance(elapsed, (int, float)):
-                        headers.append((float(elapsed), int(row.get("range_count") or 0)))
-                continue
-            height = row.get("height")
-            if min_height is not None and isinstance(height, int) and height < min_height:
-                continue
-            if event == "block_submit_queued" and height is not None:
-                queued_ts.setdefault(height, row.get("ts"))
-            elif event == "commit_start" and height is not None:
-                start_ts.setdefault(height, row.get("ts"))
-            elif event == "commit_stalled":
-                stalls[row.get("commit_stall_reason", "unknown")] += 1
-            elif event == "commit_finish":
-                if row.get("result") != "committed":
-                    non_committed[row.get("result") or "unknown"] += 1
+    # Monotonic timestamps from restarted processes cannot share a latency series.
+    process = rows[-1]["process_trace_id"] if rows else None
+    for row in rows:
+        if row["process_trace_id"] != process:
+            continue
+        event = row.get("event")
+        if row.get("source") == "header_sync_driver":
+            range_start = row.get("range_start")
+            if min_height is not None and isinstance(range_start, int):
+                if range_start < min_height:
                     continue
+            if event == "commit_finish" and row.get("result") == "committed":
                 elapsed = row.get("elapsed_ms")
-                if height is None or not isinstance(elapsed, (int, float)):
-                    continue
-                finishes[height] = (
-                    row.get("ts"),
-                    float(elapsed),
-                    row.get("apply_class") or "unknown",
-                )
+                if isinstance(elapsed, (int, float)):
+                    headers.append((float(elapsed), int(row.get("range_count") or 0)))
+            continue
+        height = row.get("height")
+        if min_height is not None and isinstance(height, int) and height < min_height:
+            continue
+        if event == "block_submit_queued" and height is not None:
+            queued_ts.setdefault(height, row.get("ts"))
+        elif event == "commit_start" and height is not None:
+            start_ts.setdefault(height, row.get("ts"))
+        elif event == "commit_stalled":
+            stalls[row.get("commit_stall_reason", "unknown")] += 1
+        elif event == "commit_finish":
+            if row.get("result") != "committed":
+                non_committed[row.get("result") or "unknown"] += 1
+                continue
+            elapsed = row.get("elapsed_ms")
+            if height is None or not isinstance(elapsed, (int, float)):
+                continue
+            finishes[height] = (
+                row.get("ts"),
+                float(elapsed),
+                row.get("apply_class") or "unknown",
+            )
     return queued_ts, start_ts, finishes, headers, dict(stalls), dict(non_committed)
+
+
+def trace_segments(trace_dir, filename):
+    return trace.segments(Path(trace_dir) / filename)
+
+
+def parse_trace_segments(paths, min_height=None):
+    """Analyze the latest process in a consistent, bounded CSV snapshot."""
+    if not paths:
+        return parse_commit_rows([], min_height)
+    budget = trace.Budget()
+    with trace.locked_directory(Path(paths[0]).parent):
+        # Rediscover under the lock because rotation can rename the input paths.
+        rows = list(trace.read_table(Path(paths[0]).parent / "commit_state.csv", budget))
+    return parse_commit_rows(rows, min_height)
 
 
 def latency_stats(values):
@@ -459,11 +482,18 @@ def cmd_latency(args):
     if observed_blocks is not None:
         report["observed_blocks"] = observed_blocks
 
-    trace_path = Path(args.traces, "commit_state.jsonl") if args.traces else None
-    if trace_path and trace_path.is_file():
-        queued_ts, start_ts, finishes, headers, stalls, non_committed = (
-            parse_commit_trace(trace_path, getattr(args, "min_height", None))
-        )
+    try:
+        trace_paths = trace_segments(args.traces, "commit_state.csv") if args.traces else []
+    except (OSError, ValueError) as error:
+        out.write(f"Trace analysis unavailable: {error}\n")
+        return 0
+    if trace_paths:
+        try:
+            queued_ts, start_ts, finishes, headers, stalls, non_committed = parse_trace_segments(trace_paths, getattr(args, "min_height", None))
+        except (ValueError, OSError) as error:
+            out.write(f"Trace analysis unavailable: {error}\n")
+            return 0
+        out.write("Trace latency uses the latest process generation.\n\n")
         by_class = defaultdict(list)  # class -> [(height, ts, elapsed_ms)]
         for height, (ts, elapsed, apply_class) in finishes.items():
             by_class[apply_class].append((height, ts, elapsed))
@@ -609,7 +639,7 @@ def cmd_latency(args):
             out.write(f"\n_(unclassified block commit rows: {counts})_\n")
 
         if not finishes:
-            out.write("_(commit_state.jsonl has no successful commit_finish rows)_\n")
+            out.write("_(commit_state.csv has no successful commit_finish rows)_\n")
 
         if headers:
             header_ms = sorted(ms for ms, _ in headers)
@@ -645,11 +675,11 @@ def cmd_latency(args):
             out.write(
                 f"Observed {observed_blocks:,} live tip advances. Detailed per-block"
                 " traces are unavailable because this stack does not emit Zakura"
-                " JSONL commit events.\n"
+                " CSV commit events.\n"
             )
         else:
             out.write(
-                "_(no per-block trace: commit_state.jsonl absent — legacy-stack leg"
+                "_(no per-block trace: commit_state.csv absent — legacy-stack leg"
                 " or tracing disabled)_\n"
             )
 
@@ -720,7 +750,7 @@ def main():
     stat.add_argument("--title", default="CPU")
 
     latency = sub.add_parser("latency", help="markdown block-latency digest")
-    latency.add_argument("--traces", default="", help="dir with commit_state.jsonl")
+    latency.add_argument("--traces", default="", help="dir with commit_state.csv")
     latency.add_argument("--metrics", default="", help="final /metrics text snapshot")
     latency.add_argument("--metrics-baseline", default="", help="optional starting /metrics snapshot")
     latency.add_argument("--min-height", type=int, help="ignore trace rows below this height")

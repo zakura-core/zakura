@@ -29,7 +29,7 @@ v2 stack.
    `/var/lib/zakura/state` and `/var/lib/zakura/non_finalized_state`.
 7. Preserve `/var/lib/zakura/network` and controller state.
 8. Render `/etc/zakura/zebrad.toml` with the node's assigned `p2p_stack`.
-   Detailed JSONL traces are enabled for every sync.
+   Detailed CSV traces are enabled for every sync.
 9. Start `zakura.service` with `Restart=no`.
 10. Poll metrics and `/ready` until the node is stably near tip.
 11. Stop the node, record the completion for the daily audit digest, and start
@@ -120,7 +120,7 @@ Host files:
 - run artifacts: `/var/log/zakura/runs/<timestamp>-<sha>/`
 - node log: `/var/log/zakura/zebrad.log`
 - trace symlink: `/var/log/zakura/traces`
-- legacy sync trace: `/var/log/zakura/traces/legacy_sync.jsonl`
+- legacy sync trace: `/var/log/zakura/traces/legacy_sync.csv`
 - monitor log: `/var/log/zakura/monitor.log`
 
 ## Deployment
@@ -455,20 +455,24 @@ successful runs first, oldest first. The current run and the most recent failed
 run are protected, including their traces, metadata, samples, and log tail.
 Protected runs may exceed the target; cleanup never discards them to meet it.
 
-During sync, the controller checks trace files with logrotate every polling
-interval (10 seconds for native runs, 30 seconds for legacy). Each stream rotates
-at 128 MiB into a gzip-compressed segment beside the current file. The controller
-keeps up to 1,000 segments per stream, which covers a full genesis sync. Files can
-exceed 128 MiB between checks. Compression shrinks the large trace streams 13 to
-18 times, so a full sync's roughly 20 GB of traces takes 1 to 2 GiB of disk.
-`copytruncate` keeps the existing append-only writer working without a restart;
-a small number of records can be lost at the copy/truncate boundary. Only the
-controller rotates traces, so retention cannot race a separate trace cleaner.
+During sync, the controller rotates trace tables every polling interval (10
+seconds for native runs, 30 seconds for legacy). Each CSV table rotates at 128 MiB
+into a gzip-compressed segment beside the current file. The controller keeps up to
+1,000 segments per table, which covers a full genesis sync. Files can exceed
+128 MiB between checks.
+
+The node runs with `ZAKURA_TRACE_FILE_SEGMENTS=0`, so its writer does not rotate.
+The writer holds the trace directory's `.trace.lock` for each batch and reopens a
+table whose file was renamed. The controller renames an oversized table while it
+holds that lock, then compresses the detached file after releasing it. The
+node's next batch starts a new file with a header, so rotation loses no rows. If
+the node holds the lock for more than half a second, the controller retries at
+the next poll. The controller uses logrotate only for the node log.
 
 The highest-numbered segment is the oldest. For example, read
-`block_sync.jsonl.N.gz` down to `block_sync.jsonl.1.gz`, then `block_sync.jsonl`
-for chronological history. To use tools that expect one file, decompress and
-concatenate those segments into a separate analysis directory. The stopped
+`block_sync.csv.N.gz` down to `block_sync.csv.1.gz`, then `block_sync.csv`
+for chronological history. Each segment contains its own header. Do not
+concatenate CSV files without removing subsequent headers. The stopped
 failure's files remain unchanged until a newer failure replaces its protected
 status.
 

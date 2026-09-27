@@ -16,8 +16,6 @@ use std::{
 };
 
 use serde::Serialize;
-#[cfg(test)]
-use serde_json::Value;
 use zakura_chain::block::{self, Height};
 use zakura_jsonl_trace::{
     saturating_count, saturating_millis, JsonlDisplay, JsonlEventEmitter, JsonlTraceEvent,
@@ -26,8 +24,32 @@ use zakura_jsonl_trace::{
 
 use crate::{protocol::internal::Response, NotFoundClass, PeerSocketAddr, SharedPeerError};
 
-const TABLE: JsonlTraceTable =
-    JsonlTraceTable::new("legacy_peer_request", "legacy_peer_request.jsonl");
+const TABLE: JsonlTraceTable = JsonlTraceTable::csv(
+    "legacy_peer_request",
+    "legacy_peer_request.csv",
+    &[
+        "event",
+        "request_id",
+        "peer_id",
+        "peer",
+        "peer_start_height",
+        "local_tip_height",
+        "elapsed_ms",
+        "locator_tip",
+        "stop",
+        "requested_hash",
+        "route",
+        "result",
+        "hash_count",
+        "inferred_start_height",
+        "inferred_end_height",
+        "response",
+        "error",
+        "returned_hash",
+        "returned_height",
+        "missing_hash",
+    ],
+);
 
 #[derive(Clone, Debug)]
 pub(super) struct LegacyPeerTrace {
@@ -292,19 +314,21 @@ mod tests {
 
     const MAX_RECEIVED_BLOCK_HASHES: usize = 50_000;
 
-    fn hash(byte: u8) -> block::Hash {
-        block::Hash([byte; 32])
+    #[test]
+    fn csv_header_matches_shared_schema() {
+        let schema: serde_json::Value =
+            serde_json::from_str(zakura_jsonl_trace::SCHEMA_JSON).expect("shared trace schema");
+        let columns: Vec<_> = schema["tables"][TABLE.table()]
+            .as_array()
+            .expect("legacy peer table")
+            .iter()
+            .map(|value| value.as_str().unwrap())
+            .collect();
+        assert_eq!(TABLE.header(), columns);
     }
 
-    fn assert_key_order(line: &str, keys: &[&str]) {
-        let mut remainder = line;
-        for key in keys {
-            let marker = format!("\"{key}\":");
-            let position = remainder
-                .find(&marker)
-                .unwrap_or_else(|| panic!("trace row is missing key {key}: {line}"));
-            remainder = &remainder[position + marker.len()..];
-        }
+    fn hash(byte: u8) -> block::Hash {
+        block::Hash([byte; 32])
     }
 
     #[tokio::test]
@@ -344,53 +368,11 @@ mod tests {
         drop(trace);
         guard.shutdown().await;
 
-        let events = std::fs::read_to_string(dir.path().join(TABLE.file_name()))
-            .expect("legacy peer trace file is written");
-        let lines: Vec<_> = events.lines().collect();
-        let events: Vec<Value> = lines
-            .iter()
-            .map(|line| serde_json::from_str(line).expect("trace row is valid JSON"))
-            .collect();
-
+        let reader =
+            crate::zakura::testkit::TraceReader::load(dir.path()).expect("CSV traces load");
+        let events = reader.rows();
         assert_eq!(TABLE.table(), "legacy_peer_request");
-        assert_eq!(TABLE.file_name(), "legacy_peer_request.jsonl");
-        assert_key_order(
-            lines[0],
-            &[
-                "ts",
-                "node",
-                "event",
-                "request_id",
-                "peer_id",
-                "peer",
-                "peer_start_height",
-                "local_tip_height",
-                "elapsed_ms",
-                "locator_tip",
-                "result",
-                "hash_count",
-                "inferred_start_height",
-                "inferred_end_height",
-            ],
-        );
-        assert_key_order(
-            lines[1],
-            &[
-                "ts",
-                "node",
-                "event",
-                "request_id",
-                "peer_id",
-                "peer",
-                "peer_start_height",
-                "local_tip_height",
-                "elapsed_ms",
-                "requested_hash",
-                "route",
-                "result",
-                "error",
-            ],
-        );
+        assert_eq!(TABLE.file_name(), "legacy_peer_request.csv");
         assert_eq!(events[0]["event"], "find_blocks_finish");
         assert_eq!(events[0]["peer_id"], 7);
         assert_eq!(events[0]["peer_start_height"], 100);
@@ -437,9 +419,9 @@ mod tests {
         drop(trace);
         guard.shutdown().await;
 
-        let event = std::fs::read_to_string(dir.path().join(TABLE.file_name()))
-            .expect("legacy peer trace file is written");
-        let event: Value = serde_json::from_str(event.trim()).expect("trace row is valid JSON");
+        let reader =
+            crate::zakura::testkit::TraceReader::load(dir.path()).expect("CSV traces load");
+        let event = reader.rows()[0];
 
         assert_eq!(event["hash_count"], hash_count);
         assert_eq!(event["inferred_start_height"], 91);

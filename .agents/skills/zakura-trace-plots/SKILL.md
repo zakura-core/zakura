@@ -1,6 +1,6 @@
 ---
 name: zakura-trace-plots
-description: Generate metrics-aware plots and summaries from Zakura perf trace directories. Use when the user asks to plot or analyze Zakura traces, block_sync.jsonl, commit_state.jsonl, feedrun CSVs, applying/reorder/stalls, HoL stalls, throughput, or commit metrics from a trace_dir.
+description: Generate metrics-aware plots and summaries from Zakura perf trace directories. Use when the user asks to plot or analyze Zakura traces, block_sync.csv, commit_state.csv, feedrun CSVs, applying/reorder/stalls, HoL stalls, throughput, or commit metrics from a trace_dir.
 ---
 
 # Zakura Trace Plots
@@ -31,7 +31,7 @@ Use the time plot for stall diagnosis. Height plots collapse zero-progress stall
 
 ## Metrics Awareness
 
-Use `block_sync.jsonl` as the source of truth for:
+Use `block_sync.csv` (including rotated `.N` and `.N.gz` segments) as the source of truth for:
 
 - `applying`
 - `reorder`
@@ -46,7 +46,7 @@ Use the CSV only for sampled node metrics:
 - commit phase counters like `sur`, `ar`, `bp`, `bc`
 - `cpu_cores`, peers, and other sampler-only columns
 
-Do not trust the CSV `reorder` column unless verified against `block_sync.jsonl`; in prior runs it was effectively zero while trace reorder was thousands.
+Do not trust the feed_run CSV `reorder` column unless verified against `block_sync.csv`; in prior runs it was effectively zero while trace reorder was thousands.
 
 ## Interpreting Output
 

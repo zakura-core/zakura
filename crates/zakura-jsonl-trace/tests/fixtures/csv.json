@@ -1,0 +1,67 @@
+[
+  {
+    "name": "quoted strings and numeric identity",
+    "valid": true,
+    "csv": "ts,wall_ts,node,process_trace_id,trace_version,event,source,action,peer,reason,range_start,range_count,height,hash,apply_token,best_header_tip,elapsed_ms,result,requested_count,apply_class,local_frontier,queue_len,in_flight_count,extra\r\n1,2026-09-13T00:00:00.000Z,=1+1,p,2,commit_start,,,,,,,1,000123,1,,,,,,,,,\"{\"\"future\"\":{\"\"label\"\":\"\"comma,\\nline\"\"}}\"\r\n"
+  },
+  {
+    "name": "extra collision",
+    "valid": false,
+    "csv": "ts,wall_ts,node,process_trace_id,trace_version,event,source,action,peer,reason,range_start,range_count,height,hash,apply_token,best_header_tip,elapsed_ms,result,requested_count,apply_class,local_frontier,queue_len,in_flight_count,extra\r\n1,2026-09-13T00:00:00.000Z,=1+1,p,2,commit_start,,,,,,,1,000123,1,,,,,,,,,\"{\"\"event\"\":\"\"ignored\"\"}\"\r\n"
+  },
+  {
+    "name": "duplicate nested JSON",
+    "valid": false,
+    "csv": "ts,wall_ts,node,process_trace_id,trace_version,event,source,action,peer,reason,range_start,range_count,height,hash,apply_token,best_header_tip,elapsed_ms,result,requested_count,apply_class,local_frontier,queue_len,in_flight_count,extra\r\n1,2026-09-13T00:00:00.000Z,=1+1,p,2,commit_start,,,,,,,1,000123,1,,,,,,,,,\"{\"\"future\"\":{\"\"value\"\":1,\"\"value\"\":2}}\"\r\n"
+  },
+  {
+    "name": "bad integer",
+    "valid": false,
+    "csv": "ts,wall_ts,node,process_trace_id,trace_version,event,source,action,peer,reason,range_start,range_count,height,hash,apply_token,best_header_tip,elapsed_ms,result,requested_count,apply_class,local_frontier,queue_len,in_flight_count,extra\r\n1,2026-09-13T00:00:00.000Z,=1+1,p,2,commit_start,,,,,,,1,000123,true,,,,,,,,,\"{\"\"future\"\":{\"\"label\"\":\"\"comma,\\nline\"\"}}\"\r\n"
+  },
+  {
+    "name": "negative integer",
+    "valid": false,
+    "csv": "ts,wall_ts,node,process_trace_id,trace_version,event,source,action,peer,reason,range_start,range_count,height,hash,apply_token,best_header_tip,elapsed_ms,result,requested_count,apply_class,local_frontier,queue_len,in_flight_count,extra\r\n1,2026-09-13T00:00:00.000Z,=1+1,p,2,commit_start,,,,,,,1,000123,-1,,,,,,,,,\"{\"\"future\"\":{\"\"label\"\":\"\"comma,\\nline\"\"}}\"\r\n"
+  },
+  {
+    "name": "nonfinite integer",
+    "valid": false,
+    "csv": "ts,wall_ts,node,process_trace_id,trace_version,event,source,action,peer,reason,range_start,range_count,height,hash,apply_token,best_header_tip,elapsed_ms,result,requested_count,apply_class,local_frontier,queue_len,in_flight_count,extra\r\n1,2026-09-13T00:00:00.000Z,=1+1,p,2,commit_start,,,,,,,1,000123,NaN,,,,,,,,,\"{\"\"future\"\":{\"\"label\"\":\"\"comma,\\nline\"\"}}\"\r\n"
+  },
+  {
+    "name": "old clock",
+    "valid": false,
+    "csv": "ts,wall_ts,node,process_trace_id,trace_version,event,source,action,peer,reason,range_start,range_count,height,hash,apply_token,best_header_tip,elapsed_ms,result,requested_count,apply_class,local_frontier,queue_len,in_flight_count,extra\r\n1,2026-09-13T00:00:00.000Z,=1+1,p,1,commit_start,,,,,,,1,000123,1,,,,,,,,,\"{\"\"future\"\":{\"\"label\"\":\"\"comma,\\nline\"\"}}\"\r\n"
+  },
+  {
+    "name": "missing process",
+    "valid": false,
+    "csv": "ts,wall_ts,node,process_trace_id,trace_version,event,source,action,peer,reason,range_start,range_count,height,hash,apply_token,best_header_tip,elapsed_ms,result,requested_count,apply_class,local_frontier,queue_len,in_flight_count,extra\r\n1,2026-09-13T00:00:00.000Z,=1+1,,2,commit_start,,,,,,,1,000123,1,,,,,,,,,\"{\"\"future\"\":{\"\"label\"\":\"\"comma,\\nline\"\"}}\"\r\n"
+  },
+  {
+    "name": "missing clock",
+    "valid": false,
+    "csv": "ts,wall_ts,node,process_trace_id,trace_version,event,source,action,peer,reason,range_start,range_count,height,hash,apply_token,best_header_tip,elapsed_ms,result,requested_count,apply_class,local_frontier,queue_len,in_flight_count,extra\r\n1,,=1+1,p,2,commit_start,,,,,,,1,000123,1,,,,,,,,,\"{\"\"future\"\":{\"\"label\"\":\"\"comma,\\nline\"\"}}\"\r\n"
+  },
+  {
+    "name": "bad scalar identity",
+    "valid": false,
+    "csv": "ts,wall_ts,node,process_trace_id,trace_version,event,source,action,peer,reason,range_start,range_count,height,hash,apply_token,best_header_tip,elapsed_ms,result,requested_count,apply_class,local_frontier,queue_len,in_flight_count,extra\r\n1,2026-09-13T00:00:00.000Z,=1+1,p,2,commit_start,,,,,,,1,123,1,,,,,,,,,\"{\"\"action\"\":[]}\"\r\n"
+  },
+  {
+    "name": "nested JSON budget",
+    "valid": false,
+    "csv": "ts,wall_ts,node,process_trace_id,trace_version,event,source,action,peer,reason,range_start,range_count,height,hash,apply_token,best_header_tip,elapsed_ms,result,requested_count,apply_class,local_frontier,queue_len,in_flight_count,extra\r\n1,2026-09-13T00:00:00.000Z,=1+1,p,2,commit_start,,,,,,,1,000123,1,,,,,,,,,\"{\"\"future\"\":[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[0]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]}\"\r\n"
+  },
+  {
+    "name": "duplicate header",
+    "valid": false,
+    "csv": "ts,wall_ts,node,process_trace_id,trace_version,event,source,action,peer,reason,range_start,range_count,height,hash,apply_token,best_header_tip,elapsed_ms,result,requested_count,apply_class,local_frontier,queue_len,in_flight_count,extra,event\r\n1,2026-09-13T00:00:00.000Z,=1+1,p,2,commit_start,,,,,,,1,000123,1,,,,,,,,,\"{\"\"future\"\":{\"\"label\"\":\"\"comma,\\nline\"\"}}\",commit_start\r\n"
+  },
+  {
+    "name": "missing column",
+    "valid": false,
+    "csv": "ts,wall_ts,node,process_trace_id,trace_version,event,source,action,peer,reason,range_start,range_count,height,hash,apply_token,best_header_tip,elapsed_ms,result,requested_count,apply_class,local_frontier,queue_len,in_flight_count\r\n1,2026-09-13T00:00:00.000Z,=1+1,p,2,commit_start,,,,,,,1,000123,1,,,,,,,,\r\n"
+  }
+]

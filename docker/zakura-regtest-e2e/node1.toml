@@ -24,7 +24,7 @@ zakura_node_secret_key = "010101010101010101010101010101010101010101010101010101
 # Stable Zakura QUIC port so node2 can dial this seed at a known address; without
 # it iroh picks an ephemeral port and bootstrap_peers cannot target this node.
 listen_addr = "127.0.0.1:18234"
-# JSONL traces let the e2e script assert that the legacy->Zakura upgrade ran.
+# CSV traces let the e2e script assert that the legacy->Zakura upgrade ran.
 trace_dir = "/traces/node1"
 
 [state]

@@ -787,30 +787,78 @@ class ContinuousSyncTests(unittest.TestCase):
             sync.cleanup_retention(config)
             self.assertEqual([path.exists() for path in paths], [True, True, False])
 
-    @unittest.skipUnless(sync.shutil.which("logrotate"), "logrotate is required on the canaries")
-    def test_trace_rotation_compresses_segments_and_keeps_open_writer(self):
+    def test_trace_rotation_compresses_segments_between_writer_batches(self):
+        import fcntl
         import gzip
         with tempfile.TemporaryDirectory() as tmp:
             config = make_config(Path(tmp), policy=sync.Policy(trace_file_bytes=64, trace_segments=3))
             run_dir = config.paths.runs_dir / "current"
             traces = run_dir / "traces"
             traces.mkdir(parents=True)
-            trace = traces / "block_sync.jsonl"
-            with trace.open("ab", buffering=0) as writer:
-                inode = trace.stat().st_ino
-                for batch in range(4):
-                    writer.write((json.dumps({"batch": batch, "detail": "x" * 100}) + "\n").encode())
+            trace = traces / "block_sync.csv"
+            lock = traces / ".trace.lock"
+
+            def append_batch(batch):
+                # The node appends under the directory lock and writes a header
+                # into a new file.
+                with lock.open("a") as held:
+                    fcntl.flock(held.fileno(), fcntl.LOCK_EX)
+                    with trace.open("a") as writer:
+                        if writer.tell() == 0:
+                            writer.write("ts,event,extra\n")
+                        writer.write(f"{batch},{'x' * 100},\n")
+
+            for batch in range(5):
+                append_batch(batch)
+                with patch.object(sync, "run"):
                     sync.rotate_run_logs(config, run_dir)
-                    self.assertEqual(trace.stat().st_ino, inode)
-                    self.assertEqual(trace.stat().st_size, 0)
-                writer.write(b'{"batch": 4}\n')
-            history = [json.loads(gzip.decompress(path.read_bytes()))["batch"] for path in (
-                traces / "block_sync.jsonl.3.gz", traces / "block_sync.jsonl.2.gz",
-                traces / "block_sync.jsonl.1.gz",
-            )]
-            history.append(json.loads(trace.read_text())["batch"])
-            self.assertEqual(history, [1, 2, 3, 4])
-            self.assertFalse((traces / "block_sync.jsonl.4.gz").exists())
+                self.assertFalse(trace.exists())
+            append_batch(5)
+
+            segments = [traces / f"block_sync.csv.{index}.gz" for index in (3, 2, 1)]
+            history = [gzip.decompress(path.read_bytes()).decode() for path in segments]
+            history.append(trace.read_text())
+            for content in history:
+                self.assertTrue(content.startswith("ts,event,extra\n"))
+            self.assertEqual([int(content.splitlines()[1].split(",")[0]) for content in history],
+                             [2, 3, 4, 5])
+            self.assertFalse((traces / "block_sync.csv.4.gz").exists())
+            self.assertEqual(sorted(path.name for path in traces.glob("*.rotating*")), [])
+            rotation = (run_dir / ".trace-logrotate.conf").read_text()
+            self.assertNotIn(str(traces), rotation)
+            self.assertIn("zebrad.log", rotation)
+
+    def test_trace_rotation_waits_for_the_writer_directory_lock(self):
+        import fcntl
+        with tempfile.TemporaryDirectory() as tmp:
+            config = make_config(Path(tmp), policy=sync.Policy(trace_file_bytes=8))
+            traces = Path(tmp) / "traces"
+            traces.mkdir()
+            trace = traces / "block_sync.csv"
+            trace.write_text("ts,event,extra\n1,state,\n")
+            with (traces / ".trace.lock").open("a") as held:
+                fcntl.flock(held.fileno(), fcntl.LOCK_EX)
+                with patch.object(sync, "TRACE_LOCK_SECONDS", 0.05):
+                    sync.rotate_trace(config, trace)
+                self.assertTrue(trace.exists())
+            sync.rotate_trace(config, trace)
+            self.assertFalse(trace.exists())
+            self.assertTrue((traces / "block_sync.csv.1.gz").exists())
+
+    def test_trace_rotation_resumes_an_interrupted_compression(self):
+        import gzip
+        with tempfile.TemporaryDirectory() as tmp:
+            config = make_config(Path(tmp), policy=sync.Policy(trace_file_bytes=1 << 20))
+            traces = Path(tmp) / "traces"
+            traces.mkdir()
+            trace = traces / "block_sync.csv"
+            (traces / "block_sync.csv.1.gz").write_bytes(gzip.compress(b"older"))
+            (traces / "block_sync.csv.rotating").write_text("detached")
+            (traces / "block_sync.csv.rotating.gz").write_bytes(b"partial")
+            sync.rotate_trace(config, trace)
+            self.assertEqual(gzip.decompress((traces / "block_sync.csv.1.gz").read_bytes()), b"detached")
+            self.assertEqual(gzip.decompress((traces / "block_sync.csv.2.gz").read_bytes()), b"older")
+            self.assertEqual(sorted(path.name for path in traces.glob("*.rotating*")), [])
 
     def test_cleanup_bounds_binary_cache_and_removes_interrupted_builds(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1004,6 +1052,11 @@ class ContinuousSyncTests(unittest.TestCase):
             ["temp-zakura-sync-test-2"],
         )
         rendered = deploy.render_files(nodes[0])
+
+        self.assertIn("ZAKURA_TRACE_FILE_BYTES=134217728", rendered["trace-writer.env"])
+        self.assertIn("ZAKURA_TRACE_FILE_SEGMENTS=0", rendered["trace-writer.env"])
+        self.assertIn("trace_file_bytes = 134217728", rendered["controller.toml"])
+        self.assertIn("trace-writer.env", rendered["zakura.service"])
 
         self.assertIn('p2p_stack = "zakura"', rendered["zakurad.toml.template"])
         self.assertIn('mode_label = "Zakura/v2-only"', rendered["controller.toml"])

@@ -1,4 +1,4 @@
-//! Typed JSONL events emitted by the zakurad Zakura sync drivers.
+//! Typed CSV events emitted by the zakurad Zakura sync drivers.
 
 pub(crate) mod block_driver;
 

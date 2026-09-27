@@ -1,9 +1,8 @@
-//! Capacity defaults, derived from one throughput target.
+//! Capacity defaults for encoded output, response bookkeeping, and execution.
 //!
-//! Limits must never cost throughput. Every capacity default is derived from
-//! the target below, never from a memory guess, and a test checks each
-//! default against its derivation. A local capacity limit makes this node
-//! wait; it never faults a peer.
+//! Byte and execution defaults derive from the target below. Response slots
+//! separately bound bookkeeping for tiny responses. A local capacity limit
+//! makes this node wait; it never faults a peer.
 //!
 //! **Target:** 10 Gbps per connection at 500 ms round-trip time, a
 //! bandwidth-delay product of 625 MB.
@@ -12,7 +11,8 @@
 //! send window is [`DEFAULT_ZAKURA_SEND_WINDOW`] (32 MiB), which carries about
 //! 540 Mbps at 500 ms, and reaches 10 Gbps only below about 27 ms. The
 //! budgets here are at least twice the transport's windows, so the transport
-//! stays the binding limit until its windows grow.
+//! stays the byte limit until its windows grow. Response slots can limit tiny
+//! responses sooner; adoption must measure their throughput.
 
 use std::time::Duration;
 
@@ -40,7 +40,8 @@ pub(crate) const fn peer_output_bytes() -> u64 {
 /// Unsent response bytes the whole node may hold: twice the bandwidth-delay
 /// product, so the node can fill the target link.
 ///
-/// This is a memory bound as well: frames a non-reading peer has not taken
+/// This bounds encoded bytes, not allocator or queue overhead. Response slots
+/// separately bound per-response bookkeeping. A non-reading peer's frames
 /// stay queued until its stream's write deadline. Serving fairness between
 /// peers that stop reading belongs to prioritization, not to this bound.
 pub(crate) const fn node_output_bytes() -> u64 {
@@ -80,10 +81,27 @@ pub(crate) const fn node_execution(response_bytes: u64, produce_time: Duration) 
 pub(crate) const fn serve_limits(largest_response: u64, produce_time: Duration) -> ServeLimits {
     let node_execution = node_execution(largest_response, produce_time);
     ServeLimits {
+        node_output_responses: output_responses(max(node_output_bytes(), largest_response)),
+        peer_output_responses: output_responses(max(peer_output_bytes(), largest_response)),
         node_execution,
         peer_execution: node_execution.div_ceil(2),
         peer_output_bytes: max(peer_output_bytes(), largest_response),
         node_output_bytes: max(node_output_bytes(), largest_response),
+    }
+}
+
+/// One queued response per 4 KiB of output budget, rounded up.
+///
+/// This count limits bookkeeping independently of encoded bytes. The 4 KiB
+/// ratio is a sizing policy, not an estimate of an allocator's exact overhead.
+/// Frames within a response remain bounded by its frame and byte caps.
+const fn output_responses(bytes: u64) -> usize {
+    let slots = bytes.div_ceil(4096);
+    // Clamp before narrowing on targets where usize is smaller than u64.
+    if slots > usize::MAX as u64 {
+        usize::MAX
+    } else {
+        slots as usize
     }
 }
 
@@ -157,6 +175,16 @@ mod tests {
             assert!(limits.node_output_bytes >= node_output_bytes());
             assert!(limits.node_output_bytes >= largest);
         }
+    }
+
+    #[test]
+    fn response_counts_bound_bookkeeping_separately_from_encoded_bytes() {
+        assert_eq!(output_responses(1), 1);
+        assert_eq!(output_responses(4096), 1);
+        assert_eq!(output_responses(4097), 2);
+        let limits = serve_limits(12, Duration::from_micros(1));
+        assert_eq!(limits.peer_output_responses, 16_384);
+        assert_eq!(limits.node_output_responses, 305_176);
     }
 
     #[test]

@@ -31,10 +31,34 @@ url = "https://raw.githubusercontent.com/zcash/zcash/master/qa/supply-chain/audi
 [policy.zakura]
 audit-as-crates-io = false
 
+[policy.zakura-address]
+audit-as-crates-io = false
+
+[policy.zakura-bellman]
+audit-as-crates-io = false
+
+[policy.zakura-bls12-381]
+audit-as-crates-io = false
+
 [policy.zakura-chain]
 audit-as-crates-io = false
 
 [policy.zakura-consensus]
+audit-as-crates-io = false
+
+[policy.zakura-equihash]
+audit-as-crates-io = false
+
+[policy.zakura-halo2-gadgets]
+audit-as-crates-io = false
+
+[policy.zakura-halo2-legacy-pdqsort]
+audit-as-crates-io = false
+
+[policy.zakura-halo2-poseidon]
+audit-as-crates-io = false
+
+[policy.zakura-halo2-proofs]
 audit-as-crates-io = false
 
 [policy.zakura-header-chain]
@@ -43,16 +67,52 @@ audit-as-crates-io = false
 [policy.zakura-jsonl-trace]
 audit-as-crates-io = false
 
+[policy.zakura-jubjub]
+audit-as-crates-io = false
+
+[policy.zakura-keys]
+audit-as-crates-io = false
+
 [policy.zakura-network]
 audit-as-crates-io = false
 
 [policy.zakura-node-services]
 audit-as-crates-io = false
 
+[policy.zakura-orchard]
+audit-as-crates-io = false
+
+[policy.zakura-pairing]
+audit-as-crates-io = false
+
+[policy.zakura-pasta-curves]
+audit-as-crates-io = false
+
+[policy.zakura-primitives]
+audit-as-crates-io = false
+
+[policy.zakura-proofs]
+audit-as-crates-io = false
+
+[policy.zakura-protocol]
+audit-as-crates-io = false
+
+[policy.zakura-reddsa]
+audit-as-crates-io = false
+
+[policy.zakura-redjubjub]
+audit-as-crates-io = false
+
 [policy.zakura-rpc]
 audit-as-crates-io = false
 
+[policy.zakura-sapling-crypto]
+audit-as-crates-io = false
+
 [policy.zakura-script]
+audit-as-crates-io = false
+
+[policy.zakura-sinsemilla]
 audit-as-crates-io = false
 
 [policy.zakura-state]
@@ -65,6 +125,9 @@ audit-as-crates-io = false
 audit-as-crates-io = false
 
 [policy.zakura-tower-fallback]
+audit-as-crates-io = false
+
+[policy.zakura-transparent]
 audit-as-crates-io = false
 
 [policy.zakura-utils]

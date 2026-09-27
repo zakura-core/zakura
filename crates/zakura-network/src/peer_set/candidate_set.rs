@@ -4,7 +4,10 @@ use std::{any::type_name, cmp::min, sync::Arc};
 
 use chrono::Utc;
 use futures::stream::{FuturesUnordered, StreamExt};
-use tokio::time::{sleep_until, timeout, Instant};
+use tokio::{
+    sync::watch,
+    time::{sleep_until, timeout, Instant},
+};
 use tower::{Service, ServiceExt};
 use tracing::Span;
 
@@ -142,6 +145,10 @@ where
 
     /// A timer that enforces a rate-limit on peer set requests for more peers.
     min_next_crawl: Instant,
+
+    /// Whether peers without `NODE_NETWORK`, such as pruned nodes, can be
+    /// returned as connection candidates.
+    dial_pruned_peers: watch::Receiver<bool>,
 }
 
 impl<S> std::fmt::Debug for CandidateSet<S>
@@ -155,6 +162,7 @@ where
             .field("peer_service", &type_name::<S>())
             .field("min_next_handshake", &self.min_next_handshake)
             .field("min_next_crawl", &self.min_next_crawl)
+            .field("dial_pruned_peers", &*self.dial_pruned_peers.borrow())
             .finish()
     }
 }
@@ -165,6 +173,9 @@ where
     S::Future: Send + 'static,
 {
     /// Uses `address_book` and `peer_service` to manage a [`CandidateSet`] of peers.
+    ///
+    /// Peers without `NODE_NETWORK` are never returned as candidates, unless
+    /// [`Self::with_pruned_peer_dialing`] is used.
     pub fn new(
         address_book: Arc<std::sync::Mutex<AddressBook>>,
         peer_service: S,
@@ -174,7 +185,15 @@ where
             peer_service,
             min_next_handshake: Instant::now(),
             min_next_crawl: Instant::now(),
+            dial_pruned_peers: watch::channel(false).1,
         }
+    }
+
+    /// Returns peers without `NODE_NETWORK`, such as pruned nodes, as
+    /// connection candidates whenever `dial_pruned_peers` is true.
+    pub fn with_pruned_peer_dialing(mut self, dial_pruned_peers: watch::Receiver<bool>) -> Self {
+        self.dial_pruned_peers = dial_pruned_peers;
+        self
     }
 
     /// Update the peer set from the network, using the default fanout limit.
@@ -400,6 +419,7 @@ where
     pub async fn next(&mut self) -> Option<MetaAddr> {
         // Correctness: To avoid hangs, computation in the critical section should be kept to a minimum.
         let address_book = self.address_book.clone();
+        let include_pruned = *self.dial_pruned_peers.borrow();
         let next_peer = move || -> Option<MetaAddr> {
             let mut guard = address_book.lock().unwrap();
 
@@ -409,7 +429,9 @@ where
 
             // It's okay to return without sleeping here, because we're returning
             // `None`. We only need to sleep before yielding an address.
-            let next_peer = guard.reconnection_peers(instant_now, chrono_now).next()?;
+            let next_peer = guard
+                .reconnection_peers_with_pruned(instant_now, chrono_now, include_pruned)
+                .next()?;
 
             // TODO: only mark the peer as AttemptPending when it is actually used (#1976)
             //

@@ -25,7 +25,7 @@ use futures::{
 use rand::seq::SliceRandom;
 use tokio::{
     net::{TcpListener, TcpStream},
-    sync::{broadcast, mpsc},
+    sync::{broadcast, mpsc, watch},
     time::{sleep, Instant},
 };
 use tokio_stream::wrappers::IntervalStream;
@@ -50,7 +50,10 @@ use crate::{
     },
     peer_cache_updater::peer_cache_updater,
     peer_registry::PeerRegistry,
-    peer_set::{set::MorePeers, ActiveConnectionCounter, CandidateSet, ConnectionTracker, PeerSet},
+    peer_set::{
+        pruned_peer_dialing::track_pruned_peer_dialing, set::MorePeers, ActiveConnectionCounter,
+        CandidateSet, ConnectionTracker, PeerSet,
+    },
     protocol::external::{canonical_peer_addr, canonical_socket_addr, types::PeerServices},
     zakura::{CustomService, ZakuraEndpoint, ZakuraHeaderSyncDriverStartup},
     AddressBook, BannedIps, BoxError, Config, PeerSocketAddr, Request, Response,
@@ -373,7 +376,7 @@ where
         inv_receiver,
         bans.clone(),
         address_metrics,
-        MinimumPeerVersion::new(latest_chain_tip, &config.network),
+        MinimumPeerVersion::new(latest_chain_tip.clone(), &config.network),
         None,
     );
     let shutdown = zakura_endpoint
@@ -428,7 +431,19 @@ where
             AbortOnDropHandle::new(tokio::spawn(initial_peers_fut.in_current_span()));
 
         // 3. Outgoing peers we connect to in response to load.
-        let mut candidates = CandidateSet::new(address_book.clone(), peer_set.clone());
+        //
+        // Pruned peers only become candidates once our tip is near the network tip.
+        let (dial_pruned_peers_tx, dial_pruned_peers_rx) = watch::channel(false);
+        task_handles.push(AbortOnDropHandle::new(tokio::spawn(
+            track_pruned_peer_dialing(
+                latest_chain_tip,
+                config.network.clone(),
+                dial_pruned_peers_tx,
+            )
+            .in_current_span(),
+        )));
+        let mut candidates = CandidateSet::new(address_book.clone(), peer_set.clone())
+            .with_pruned_peer_dialing(dial_pruned_peers_rx);
 
         // Wait for the initial seed peer count
         let mut active_outbound_connections = initial_peers_join

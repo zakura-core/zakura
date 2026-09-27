@@ -3,6 +3,7 @@ mod initialize;
 mod inventory_registry;
 mod legacy_peer_trace;
 mod limit;
+mod pruned_peer_dialing;
 mod set;
 mod stall_tracker;
 mod unready_service;

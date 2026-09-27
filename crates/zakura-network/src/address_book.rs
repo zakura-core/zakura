@@ -887,6 +887,20 @@ impl AddressBook {
         instant_now: Instant,
         chrono_now: chrono::DateTime<Utc>,
     ) -> impl DoubleEndedIterator<Item = MetaAddr> + '_ {
+        self.reconnection_peers_with_pruned(instant_now, chrono_now, false)
+    }
+
+    /// Return an iterator over peers that are ready for an outbound connection
+    /// attempt, in reconnection attempt order.
+    ///
+    /// Peers without `NODE_NETWORK`, such as pruned nodes, are only included
+    /// if `include_pruned` is true.
+    pub fn reconnection_peers_with_pruned(
+        &'_ self,
+        instant_now: Instant,
+        chrono_now: chrono::DateTime<Utc>,
+        include_pruned: bool,
+    ) -> impl DoubleEndedIterator<Item = MetaAddr> + '_ {
         let _guard = self.span.enter();
 
         // Skip live peers, and peers pending a reconnect attempt.
@@ -894,7 +908,12 @@ impl AddressBook {
         self.peers
             .ordered_values()
             .filter(move |peer| {
-                peer.is_ready_for_connection_attempt(instant_now, chrono_now, &self.network)
+                (include_pruned || peer.is_full_node())
+                    && peer.is_ready_for_connection_attempt_including_pruned(
+                        instant_now,
+                        chrono_now,
+                        &self.network,
+                    )
                     && self.is_ready_for_connection_attempt_with_ip(&peer.addr.ip(), chrono_now)
             })
             .cloned()

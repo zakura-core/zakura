@@ -214,6 +214,41 @@ class CollectorChainTests(unittest.TestCase):
         self.assertEqual([block["hash"] for block in result["recentBlocks"]], ["a8"])
         self.assertIsNone(result["chain"]["medianIntervalSeconds"])
 
+    def test_interval_window_uses_300_intervals_and_caches_headers(self):
+        collector = self.collector(self.CONFIGURED_TESTNET)
+        chain = {height: f"a{height}" for height in range(10, 411)}
+        rpc = ChainRpc(chain)
+
+        def timed_rpc(port, method, params=None):
+            result = rpc(port, method, params)
+            if method == "getblockheader":
+                height = result["height"]
+                # The last 30 intervals are fast; the broader window is stable.
+                result["time"] = 1000 + 20 * min(height, 380) + max(0, height - 380)
+            return result
+
+        with mock.patch.object(dashboard, "rpc", side_effect=timed_rpc) as calls, \
+                mock.patch.object(dashboard, "active_miners", return_value=1):
+            result = collector.collect()
+            self.assertEqual(result["chain"]["intervalSampleBlocks"], 300)
+            self.assertEqual(result["chain"]["medianIntervalSeconds"], 20)
+            self.assertEqual(result["chain"]["meanIntervalSeconds"], 18.1)
+            self.assertEqual(len(result["recentBlocks"]), 8)
+            self.assertEqual(set(collector.headers), set(range(110, 411)))
+            self.assertEqual(sum(call.args[1] == "getblockheader" for call in calls.call_args_list), 301)
+
+            calls.reset_mock()
+            chain[411] = "a411"
+            collector.collect()
+            self.assertEqual(set(collector.headers), set(range(111, 412)))
+            self.assertEqual(sum(call.args[1] == "getblockheader" for call in calls.call_args_list), 1)
+
+    def test_interval_window_stops_at_nu7_activation(self):
+        collector = self.collector(self.CONFIGURED_TESTNET)
+        result = self.collect(collector, ChainRpc({height: f"a{height}" for height in range(10, 210)}))
+        self.assertEqual(result["chain"]["intervalSampleBlocks"], 199)
+        self.assertEqual(min(collector.headers), 10)
+
     def test_a_lower_tip_is_a_reorg_that_drops_cached_headers(self):
         collector = self.collector(self.CONFIGURED_TESTNET)
         self.collect(collector, ChainRpc({10: "a10", 11: "a11", 12: "a12"}))

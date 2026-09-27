@@ -465,3 +465,13 @@ HTTP server and RPC timeouts. A missing record does not prove a transaction is
 invalid: older history may be pruned, or it may belong to another network.
 The website paginates long lists and uses fragment links for shareable views.
 No database index or node configuration change is needed.
+
+## Block interval sample
+
+The status feed computes mean and median header-time intervals over the latest
+301 post-NU7 headers (300 intervals). Before that many blocks exist, it uses
+only the available post-activation intervals and reports the actual count in
+`chain.intervalSampleBlocks`. Headers are cached between polls; normal tip
+advancement only fetches newly mined headers. The recent-block list stays at
+eight entries. Existing website clients display the returned sample count
+without a website update.

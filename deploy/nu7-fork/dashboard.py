@@ -22,7 +22,7 @@ from pathlib import Path
 
 TARGET_SPACING_SECONDS = 25
 DAA_WINDOW_BLOCKS = 102
-RECENT_HEADER_COUNT = 31
+RECENT_HEADER_COUNT = 301  # 300 adjacent post-NU7 block intervals.
 MAX_OBSERVATION_AGE_SECONDS = 120
 # Bounds for the public HTTP server: explorer requests each hold a thread and a
 # node RPC call, on the host that also validates and mines the fork.

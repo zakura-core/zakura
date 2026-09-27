@@ -16,7 +16,8 @@ use crate::zakura::testkit::TraceReader;
 /// Aggregate facts extracted from one run's `block_sync` trace table.
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct InvariantReport {
-    /// Number of `block_sync_state` snapshots emitted (tracing liveness).
+    /// Number of `block_sync_state` and `block_sync_pipeline_state` snapshots
+    /// emitted (tracing liveness).
     pub(crate) state_samples: usize,
     /// Peak aggregate in-flight requests across all peers.
     pub(crate) max_outstanding: u64,
@@ -91,7 +92,14 @@ pub(crate) fn report(reader: &TraceReader) -> InvariantReport {
         .table("block_sync")
         .rows()
         .into_iter()
-        .filter(|row| event(row) == Some("block_sync_state"))
+        // Per-commit pipeline rows carry the budget and pipeline counters but
+        // omit diagnostics such as `outstanding`, which the reads below skip.
+        .filter(|row| {
+            matches!(
+                event(row),
+                Some("block_sync_state" | "block_sync_pipeline_state")
+            )
+        })
         .collect();
 
     let max_outstanding = state_rows

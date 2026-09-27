@@ -174,6 +174,7 @@ pub const HEADER_SYNC_TABLE: ZakuraTraceTable = ZakuraTraceTable::csv(
         "rejected_schema",
         "rejected_busy",
         "rejected_tried",
+        "supplier_status_wait",
         "best_peer_height",
         "best_peer_hash",
     ],
@@ -235,6 +236,7 @@ pub(crate) mod header_sync_trace {
     pub(crate) const REJECTED_SCHEMA: &str = "rejected_schema";
     pub(crate) const REJECTED_BUSY: &str = "rejected_busy";
     pub(crate) const REJECTED_TRIED: &str = "rejected_tried";
+    pub(crate) const SUPPLIER_STATUS_WAIT: &str = "supplier_status_wait";
     pub(crate) const BEST_PEER_HEIGHT: &str = "best_peer_height";
     pub(crate) const BEST_PEER_HASH: &str = "best_peer_hash";
 
@@ -323,6 +325,7 @@ pub const BLOCK_SYNC_TABLE: ZakuraTraceTable = ZakuraTraceTable::csv(
         "received_blocks_per_sec",
         "committed_bytes_per_sec",
         "committed_blocks_per_sec",
+        "committed_count",
         "download_blocked_on_budget",
         "peers_wanting_slots",
         "peers",
@@ -452,6 +455,8 @@ pub const QUEUE_SEND_TABLE: ZakuraTraceTable = ZakuraTraceTable::csv(
         "queue_max_capacity",
         "range_start",
         "range_count",
+        "height",
+        "hash",
         "session_id",
         "request_id",
     ],

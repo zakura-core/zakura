@@ -783,6 +783,160 @@ mod tests {
         }
     }
 
+    /// Every field a struct declares, including `None` fields that serde skips.
+    fn declared_fields<T: Serialize>(value: &T) -> Vec<&'static str> {
+        use serde::ser::{self, Impossible};
+
+        #[derive(Debug)]
+        struct NotAStruct;
+
+        impl std::fmt::Display for NotAStruct {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("expected a struct")
+            }
+        }
+
+        impl std::error::Error for NotAStruct {}
+
+        impl ser::Error for NotAStruct {
+            fn custom<T: std::fmt::Display>(_: T) -> Self {
+                Self
+            }
+        }
+
+        struct Fields(Vec<&'static str>);
+
+        impl ser::SerializeStruct for &mut Fields {
+            type Ok = ();
+            type Error = NotAStruct;
+
+            fn serialize_field<T: Serialize + ?Sized>(
+                &mut self,
+                key: &'static str,
+                _: &T,
+            ) -> Result<(), NotAStruct> {
+                self.0.push(key);
+                Ok(())
+            }
+
+            fn skip_field(&mut self, key: &'static str) -> Result<(), NotAStruct> {
+                self.0.push(key);
+                Ok(())
+            }
+
+            fn end(self) -> Result<(), NotAStruct> {
+                Ok(())
+            }
+        }
+
+        macro_rules! not_a_struct {
+            ($($name:ident($($arg:ty),*) -> $ok:ty;)*) => {
+                $(fn $name(self, $(_: $arg),*) -> Result<$ok, NotAStruct> {
+                    Err(NotAStruct)
+                })*
+            };
+        }
+
+        impl<'a> ser::Serializer for &'a mut Fields {
+            type Ok = ();
+            type Error = NotAStruct;
+            type SerializeSeq = Impossible<(), NotAStruct>;
+            type SerializeTuple = Impossible<(), NotAStruct>;
+            type SerializeTupleStruct = Impossible<(), NotAStruct>;
+            type SerializeTupleVariant = Impossible<(), NotAStruct>;
+            type SerializeMap = Impossible<(), NotAStruct>;
+            type SerializeStruct = &'a mut Fields;
+            type SerializeStructVariant = Impossible<(), NotAStruct>;
+
+            fn serialize_struct(
+                self,
+                _: &'static str,
+                _: usize,
+            ) -> Result<Self::SerializeStruct, NotAStruct> {
+                Ok(self)
+            }
+
+            fn serialize_some<T: Serialize + ?Sized>(self, _: &T) -> Result<(), NotAStruct> {
+                Err(NotAStruct)
+            }
+
+            fn serialize_newtype_struct<T: Serialize + ?Sized>(
+                self,
+                _: &'static str,
+                _: &T,
+            ) -> Result<(), NotAStruct> {
+                Err(NotAStruct)
+            }
+
+            fn serialize_newtype_variant<T: Serialize + ?Sized>(
+                self,
+                _: &'static str,
+                _: u32,
+                _: &'static str,
+                _: &T,
+            ) -> Result<(), NotAStruct> {
+                Err(NotAStruct)
+            }
+
+            not_a_struct! {
+                serialize_bool(bool) -> ();
+                serialize_i8(i8) -> ();
+                serialize_i16(i16) -> ();
+                serialize_i32(i32) -> ();
+                serialize_i64(i64) -> ();
+                serialize_u8(u8) -> ();
+                serialize_u16(u16) -> ();
+                serialize_u32(u32) -> ();
+                serialize_u64(u64) -> ();
+                serialize_f32(f32) -> ();
+                serialize_f64(f64) -> ();
+                serialize_char(char) -> ();
+                serialize_str(&str) -> ();
+                serialize_bytes(&[u8]) -> ();
+                serialize_none() -> ();
+                serialize_unit() -> ();
+                serialize_unit_struct(&'static str) -> ();
+                serialize_unit_variant(&'static str, u32, &'static str) -> ();
+                serialize_seq(Option<usize>) -> Self::SerializeSeq;
+                serialize_tuple(usize) -> Self::SerializeTuple;
+                serialize_tuple_struct(&'static str, usize) -> Self::SerializeTupleStruct;
+                serialize_tuple_variant(&'static str, u32, &'static str, usize) -> Self::SerializeTupleVariant;
+                serialize_map(Option<usize>) -> Self::SerializeMap;
+                serialize_struct_variant(&'static str, u32, &'static str, usize) -> Self::SerializeStructVariant;
+            }
+        }
+
+        let mut fields = Fields(Vec::new());
+        value
+            .serialize(&mut fields)
+            .expect("trace field groups are plain structs");
+        fields.0
+    }
+
+    #[test]
+    fn typed_fields_have_declared_csv_columns() {
+        for (group, fields, table) in [
+            (
+                "BlockTraceFields",
+                declared_fields(&BlockTraceFields::default()),
+                BLOCK_SYNC_TABLE,
+            ),
+            (
+                "MessageFields",
+                declared_fields(&MessageFields::default()),
+                QUEUE_SEND_TABLE,
+            ),
+        ] {
+            for field in fields {
+                assert!(
+                    table.header().contains(&field),
+                    "{group}.{field} has no {} column, so it would land in `extra`",
+                    table.table(),
+                );
+            }
+        }
+    }
+
     fn value(event: BlockTraceEvent) -> serde_json::Value {
         serde_json::to_value(event).expect("typed block trace event serializes")
     }

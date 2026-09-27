@@ -130,6 +130,7 @@
       "rejected_schema",
       "rejected_busy",
       "rejected_tried",
+      "supplier_status_wait",
       "best_peer_height",
       "best_peer_hash"
     ],
@@ -192,6 +193,7 @@
       "received_blocks_per_sec",
       "committed_bytes_per_sec",
       "committed_blocks_per_sec",
+      "committed_count",
       "download_blocked_on_budget",
       "peers_wanting_slots",
       "peers",
@@ -289,6 +291,8 @@
       "queue_max_capacity",
       "range_start",
       "range_count",
+      "height",
+      "hash",
       "session_id",
       "request_id"
     ],
@@ -540,7 +544,9 @@
     "verified_block_tip",
     "verified_generation",
     "work_anchor_height",
-    "trace_version"
+    "trace_version",
+    "committed_count",
+    "supplier_status_wait"
   ],
   "boolean_fields": [
     "local_frontier",

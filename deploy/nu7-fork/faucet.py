@@ -29,7 +29,7 @@ MAX_QUEUE = 10
 MIN_CLAIM_SPACING_SECONDS = 30
 MAX_ATTEMPTS_PER_IP = 10
 ATTEMPT_WINDOW_SECONDS = 600
-ALLOWED_ORIGIN = "https://nu7.valargroup.dev"
+ALLOWED_ORIGINS = frozenset({"https://zakura.com", "https://nu7.valargroup.dev"})
 # Bounds for the public HTTP server, so parallel or stalled clients cannot exhaust
 # threads on the fork host.
 MAX_CONCURRENT_REQUESTS = 16
@@ -283,18 +283,19 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
-        if self.headers.get("Origin") == ALLOWED_ORIGIN:
-            self.send_header("Access-Control-Allow-Origin", ALLOWED_ORIGIN)
-            self.send_header("Vary", "Origin")
+        self.send_header("Vary", "Origin")
+        origin = self.headers.get("Origin")
+        if origin in ALLOWED_ORIGINS:
+            self.send_header("Access-Control-Allow-Origin", origin)
         self.end_headers()
         self.wfile.write(body)
 
     def do_OPTIONS(self):
-        if self.path != "/v1/faucet/claim" or self.headers.get("Origin") != ALLOWED_ORIGIN:
+        if self.path != "/v1/faucet/claim" or self.headers.get("Origin") not in ALLOWED_ORIGINS:
             self.respond(403, {"error": "Origin not allowed"})
             return
         self.send_response(204)
-        self.send_header("Access-Control-Allow-Origin", ALLOWED_ORIGIN)
+        self.send_header("Access-Control-Allow-Origin", self.headers["Origin"])
         self.send_header("Access-Control-Allow-Methods", "POST, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
         self.send_header("Access-Control-Max-Age", "600")
@@ -315,7 +316,7 @@ class Handler(BaseHTTPRequestHandler):
         if self.path != "/v1/faucet/claim":
             self.respond(404, {"error": "Not found"})
             return
-        if self.headers.get("Origin") not in (None, ALLOWED_ORIGIN):
+        if self.headers.get("Origin") is not None and self.headers["Origin"] not in ALLOWED_ORIGINS:
             self.respond(403, {"error": "Origin not allowed"})
             return
         try:

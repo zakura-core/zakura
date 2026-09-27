@@ -260,6 +260,19 @@ at most 100 claims (10 ZEC) per UTC day. Claims are queued persistently in
 SQLite, spaced at least 30 seconds apart, and in-flight claims become
 `review` after a restart so a broadcast is never repeated automatically.
 Only `/v1/faucet/*` is public; the node RPC and the Python listener stay local.
+The inline form on `https://zakura.com/nu7/` uses this API directly. Browser
+requests allow only the exact origins `https://zakura.com` and
+`https://nu7.valargroup.dev`; errors carry the same CORS headers so rate limits
+and address validation remain readable. Command-line requests without an Origin
+header remain supported. Local previews use a simulated API, not a production
+localhost allowlist.
+
+The website reads `GET /v1/faucet/status`, submits JSON `{"address":"utest1…"}`
+to `POST /v1/faucet/claim`, and polls `GET /v1/faucet/claim/<claimId>`.
+A 202 response reserves a queued claim; only a `sent` receipt with a transaction
+ID indicates broadcast. `review` requires operator attention and must not be
+resent automatically. Keep the existing claim limits and persistent database
+when deploying UI/CORS changes; restart the worker only when no claim is processing.
 
 Build the sender from the same revision as the node with
 `cargo build --release --locked -p zakura-fork-txload`. No protocol dependency

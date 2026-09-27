@@ -1,5 +1,8 @@
 """Tests for public claim allocation, without a node or miner key."""
 
+import http.client
+import json
+import threading
 import tempfile
 import unittest
 from pathlib import Path
@@ -59,6 +62,75 @@ class FaucetClaimsTest(unittest.TestCase):
             with self.assertRaisesRegex(PermissionError, "Too many"):
                 self.faucet.reserve("bad", "192.0.2.1")
             self.assertEqual(validate.call_count, 10)
+
+
+class FaucetCorsTest(unittest.TestCase):
+    def setUp(self):
+        from unittest.mock import Mock
+        self.fake = Mock()
+        self.fake.status.return_value = {"ready": True}
+        self.fake.reserve.return_value = "a" * 24
+        self.fake.claim.return_value = {"status": "sent", "txid": "b" * 64}
+        handler = type("TestHandler", (faucet.Handler,), {"faucet": self.fake,
+                       "log_message": lambda *args: None})
+        self.server = faucet.BoundedHTTPServer(("127.0.0.1", 0), handler)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.addCleanup(self.close)
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+
+    def request(self, method, path, origin=None, body=None):
+        headers = {"Content-Type": "application/json"}
+        if origin is not None:
+            headers["Origin"] = origin
+        connection = http.client.HTTPConnection(*self.server.server_address, timeout=3)
+        try:
+            connection.request(method, path, body, headers)
+            response = connection.getresponse()
+            return response.status, dict(response.getheaders()), response.read()
+        finally:
+            connection.close()
+
+    def test_both_sites_can_preflight_submit_and_read_receipts(self):
+        for origin in faucet.ALLOWED_ORIGINS:
+            for method, path, body, expected in [
+                ("OPTIONS", "/v1/faucet/claim", None, 204),
+                ("GET", "/v1/faucet/status", None, 200),
+                ("POST", "/v1/faucet/claim", json.dumps({"address": "utest1" + "a" * 100}), 202),
+                ("GET", "/v1/faucet/claim/" + "a" * 24, None, 200),
+            ]:
+                with self.subTest(origin=origin, method=method):
+                    status, headers, _ = self.request(method, path, origin, body)
+                    self.assertEqual(status, expected)
+                    self.assertEqual(headers["Access-Control-Allow-Origin"], origin)
+                    self.assertEqual(headers["Vary"], "Origin")
+
+    def test_unknown_origins_cannot_submit_or_read_cors_responses(self):
+        for origin in ["https://zakura.com.evil.test", "http://zakura.com", "null", "http://localhost:8769"]:
+            for method in ["OPTIONS", "POST"]:
+                status, headers, _ = self.request(method, "/v1/faucet/claim", origin, '{}')
+                self.assertEqual(status, 403)
+                self.assertNotIn("Access-Control-Allow-Origin", headers)
+            status, headers, _ = self.request("GET", "/v1/faucet/status", origin)
+            self.assertEqual(status, 200)
+            self.assertNotIn("Access-Control-Allow-Origin", headers)
+        self.fake.reserve.assert_not_called()
+
+    def test_errors_keep_cors_and_command_line_clients_still_work(self):
+        for error, expected in [(ValueError("Bad address"), 400),
+                                (PermissionError("Claim limit"), 429),
+                                (RuntimeError("Not ready"), 503)]:
+            self.fake.reserve.side_effect = error
+            status, headers, _ = self.request("POST", "/v1/faucet/claim", "https://zakura.com",
+                                              json.dumps({"address": "utest1" + "a" * 100}))
+            self.assertEqual(status, expected)
+            self.assertEqual(headers["Access-Control-Allow-Origin"], "https://zakura.com")
+        self.fake.reserve.side_effect = None
+        self.assertEqual(self.request("POST", "/v1/faucet/claim", body='{"address":"address"}')[0], 202)
 
 
 class BoundedServerTest(unittest.TestCase):

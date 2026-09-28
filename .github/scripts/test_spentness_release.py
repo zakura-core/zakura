@@ -121,6 +121,113 @@ class SpentnessReleaseTests(unittest.TestCase):
             with self.subTest(message=message), self.assertRaisesRegex(ValueError, message):
                 hints.validate_bundle(self.bundle, meta)
 
+    def test_rust_generated_files_pass_validation(self):
+        """The Rust golden test writes these files from a Mainnet fixture archive."""
+        bundle = self.root / "golden"
+        bundle.mkdir()
+        for name in (hints.ARTIFACT, hints.COMMITMENT, hints.VERIFICATION):
+            (bundle / name).write_bytes((GOLDEN / name).read_bytes())
+        pin = json.loads((bundle / hints.COMMITMENT).read_text())
+        report = json.loads((bundle / hints.VERIFICATION).read_text())
+        block_hash = bytes(pin["terminal_block_hash"])[::-1].hex()
+        (bundle / "main-checkpoints.txt").write_text(
+            "0 " + bytes(pin["chain_identity"])[::-1].hex()
+            + f"\n{pin['terminal_height']} {block_hash}\n"
+        )
+        meta = {
+            "height": pin["terminal_height"],
+            "block_hash": block_hash,
+            "spentness": {
+                "verification": report,
+                "generator_revision": "a" * 40,
+                "independent_source": "fixture",
+            },
+        }
+        self.assertEqual(hints.validate_bundle(bundle, meta)["commitment"], pin)
+
+    def test_schema_one_cannot_follow_a_committed_descriptor(self):
+        self.assertEqual(hints.minimum_bundle_schema(self.root), 1)
+        importer, repo, resolution = self.importer_fixture()
+        importer.import_bundle(repo, self.bundle, resolution)
+        self.assertEqual(hints.minimum_bundle_schema(repo), hints.BUNDLE_SCHEMA)
+
+        self.meta["schema_version"] = 1
+        self.meta["height"] = 11
+        meta_bytes = json.dumps(self.meta).encode()
+        (self.bundle / "meta.json").write_bytes(meta_bytes)
+        before = (repo / importer.CHECKPOINTS).read_bytes()
+        (self.bundle / "main-checkpoints.txt").write_text(
+            before.decode() + "11 " + "0" * 64 + "\n"
+        )
+        self.write_treestate(importer, 11)
+        resolution.write_text(json.dumps({
+            "height": 11,
+            "block_hash": self.meta["block_hash"],
+            "generated_at": self.meta["generated_at"],
+            "meta_url": "https://example.test/v1/11/meta.json",
+            "meta_sha256": hashlib.sha256(meta_bytes).hexdigest(),
+        }))
+        with self.assertRaisesRegex(importer.BundleImportError, "cannot follow"):
+            importer.import_bundle(repo, self.bundle, resolution)
+        self.assertEqual((repo / importer.CHECKPOINTS).read_bytes(), before)
+
+        fetcher = load_script("fetch-release-state")
+        base = "https://zakura-release.valargroup.dev/release-state/"
+        latest = {
+            "schema_version": 1,
+            "network": "Mainnet",
+            "height": 11,
+            "block_hash": "00" * 32,
+            "generated_at": "2026-09-10T00:00:00Z",
+            "meta_url": base + "v1/11/meta.json",
+            "meta_sha256": "00" * 32,
+        }
+
+        def fetch(url, limit):
+            self.assertEqual(url, base + "latest.json", "fetched a bundle after the schema check")
+            return json.dumps(latest).encode()
+
+        with self.assertRaisesRegex(fetcher.BundleError, "cannot follow"):
+            fetcher.resolve_bundle(
+                base + "latest.json",
+                self.root / "fetched",
+                self.root / "fetched.json",
+                48,
+                fetch=fetch,
+                now=datetime(2026, 9, 10, tzinfo=timezone.utc),
+                minimum_schema=hints.minimum_bundle_schema(repo),
+            )
+
+    def test_publisher_constants_match_the_release_tooling(self):
+        fetcher = load_script("fetch-release-state")
+        script = PUBLISHER.read_text()
+        for variable, name in (
+            ("SPENTNESS_ARTIFACT", hints.ARTIFACT),
+            ("SPENTNESS_COMMITMENT", hints.COMMITMENT),
+            ("SPENTNESS_VERIFICATION", hints.VERIFICATION),
+        ):
+            self.assertIn(f"\n{variable}={name}\n", script)
+        block = script[script.index("limits = {"):]
+        block = block[: block.index("}") + 1]
+        published = {}
+        exec(block, {}, published)
+        self.assertEqual(published["limits"], {**fetcher.FILE_LIMITS, **hints.FILE_LIMITS})
+
+    @staticmethod
+    def write_subtrees(importer, path, height):
+        prefix = importer.SUBTREE_HEADER_PREFIX.pack(b"ZKVCTST1", 1, 1, height, 0, 0, 0)
+        path.write_bytes(prefix + hashlib.sha256(prefix).digest())
+
+    def write_treestate(self, importer, height):
+        """Write the bundle's frontier, subtree roots, and frontier grid at `height`."""
+        self.write_subtrees(importer, self.bundle / importer.SUBTREE_BUNDLE_NAME, height)
+        (self.bundle / importer.FRONTIER.name).write_bytes(b"new frontier")
+        prefix = importer.FRONTIER_GRID_HEADER_PREFIX.pack(b"ZKVCTFR1", 1, 1, 1, height, 1)
+        payload = struct.pack("<IIII", 0, 0, 0, 0)
+        (self.bundle / importer.FRONTIER_GRID_BUNDLE_NAME).write_bytes(
+            prefix + hashlib.sha256(prefix + payload).digest() + payload
+        )
+
     def importer_fixture(self):
         importer = load_script("import-release-state")
         repo = self.root / "repo"
@@ -131,18 +238,8 @@ class SpentnessReleaseTests(unittest.TestCase):
         (repo / importer.CHECKPOINTS).write_text(genesis + "\n")
         (repo / importer.FRONTIER).write_bytes(b"old frontier")
         (repo / importer.EOS_FILE).write_text("const ESTIMATED_RELEASE_HEIGHT: u32 = 1;\n")
-        for height, path in (
-            (0, repo / importer.SUBTREES),
-            (10, self.bundle / importer.SUBTREE_BUNDLE_NAME),
-        ):
-            prefix = importer.SUBTREE_HEADER_PREFIX.pack(b"ZKVCTST1", 1, 1, height, 0, 0, 0)
-            path.write_bytes(prefix + hashlib.sha256(prefix).digest())
-        (self.bundle / importer.FRONTIER.name).write_bytes(b"new frontier")
-        prefix = importer.FRONTIER_GRID_HEADER_PREFIX.pack(b"ZKVCTFR1", 1, 1, 1, 10, 1)
-        payload = struct.pack("<IIII", 0, 0, 0, 0)
-        (self.bundle / importer.FRONTIER_GRID_BUNDLE_NAME).write_bytes(
-            prefix + hashlib.sha256(prefix + payload).digest() + payload
-        )
+        self.write_subtrees(importer, repo / importer.SUBTREES, 0)
+        self.write_treestate(importer, 10)
         meta_bytes = json.dumps(self.meta).encode()
         (self.bundle / "meta.json").write_bytes(meta_bytes)
         resolution = {

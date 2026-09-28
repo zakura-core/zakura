@@ -444,11 +444,20 @@ def _import_bundle(
     if (
         not isinstance(meta, dict)
         or type(meta.get("schema_version")) is not int
-        or meta["schema_version"] not in (1, spentness_release.BUNDLE_SCHEMA)
+        or meta["schema_version"] not in spentness_release.SUPPORTED_BUNDLE_SCHEMAS
         or meta.get("network") != "Mainnet"
         or any(meta.get(key) != resolution[key] for key in ("height", "block_hash", "generated_at"))
     ):
         raise BundleImportError("bundle metadata differs from the resolved Mainnet boundary")
+    try:
+        minimum_schema = spentness_release.minimum_bundle_schema(repo_root)
+    except (OSError, ValueError) as error:
+        raise BundleImportError(f"cannot read the spentness release manifest: {error}") from error
+    if meta["schema_version"] < minimum_schema:
+        raise BundleImportError(
+            f"a schema {meta['schema_version']} bundle cannot follow the committed "
+            f"schema {minimum_schema} release state"
+        )
     spentness = None
     if meta["schema_version"] == spentness_release.BUNDLE_SCHEMA:
         try:

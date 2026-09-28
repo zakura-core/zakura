@@ -43,12 +43,10 @@ FILE_LIMITS = {
     # uniform-spacing run, which is larger, without accepting an unbounded download.
     "mainnet-frontier-grid.bin": 32 * 1024 * 1024,
 }
-SPENTNESS_FILE_LIMITS = {
-    spentness_release.ARTIFACT: spentness_release.MAX_BYTES,
-    spentness_release.COMMITMENT: 16 * 1024,
-    spentness_release.VERIFICATION: 32 * 1024,
-}
-SUPPORTED_SCHEMAS = (1, spentness_release.BUNDLE_SCHEMA)
+SUPPORTED_SCHEMAS = spentness_release.SUPPORTED_BUNDLE_SCHEMAS
+# The checkout this script belongs to. Its spentness manifest sets the oldest
+# bundle schema that the moving pointer may resolve to.
+REPO_ROOT = Path(__file__).resolve().parents[2]
 LATEST_REQUIRED_KEYS = {
     "schema_version",
     "network",
@@ -191,8 +189,12 @@ def resolve_bundle(
     *,
     fetch: Callable[[str, int], bytes] = _download,
     now: datetime | None = None,
+    minimum_schema: int = min(SUPPORTED_SCHEMAS),
 ) -> dict[str, Any]:
-    """Resolve, download, and verify one immutable bundle from the pointer."""
+    """Resolve, download, and verify one immutable bundle from the pointer.
+
+    A pointer below `minimum_schema` fails before any bundle download.
+    """
 
     latest_parts = _validate_url(latest_url, "latest URL")
     if not latest_parts.path.endswith("/latest.json"):
@@ -207,6 +209,11 @@ def resolve_bundle(
     schema = _integer(latest["schema_version"], "latest.schema_version")
     if schema not in SUPPORTED_SCHEMAS:
         raise BundleError("unsupported latest pointer schema version")
+    if schema < minimum_schema:
+        raise BundleError(
+            f"latest pointer schema {schema} cannot follow the committed schema "
+            f"{minimum_schema} release state"
+        )
     if latest["network"] != "Mainnet":
         raise BundleError("latest.network must be Mainnet")
     height = _integer(latest["height"], "latest.height")
@@ -322,7 +329,7 @@ def _resolve_from_meta(
     files = _object(meta["files"], "meta.files")
     required_limits = dict(FILE_LIMITS)
     if schema == spentness_release.BUNDLE_SCHEMA:
-        required_limits.update(SPENTNESS_FILE_LIMITS)
+        required_limits.update(spentness_release.FILE_LIMITS)
     _check_keys(files, set(required_limits), set(), "meta.files")
     validated: dict[str, dict[str, Any]] = {}
     for name, max_size in required_limits.items():
@@ -684,6 +691,7 @@ def main() -> int:
                 args.output_dir,
                 args.metadata_out,
                 args.max_age_hours,
+                minimum_schema=spentness_release.minimum_bundle_schema(REPO_ROOT),
             )
     except BundleError as error:
         print(f"release-state fetch failed: {error}", file=sys.stderr)

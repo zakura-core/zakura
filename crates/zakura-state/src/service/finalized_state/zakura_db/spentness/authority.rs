@@ -68,7 +68,8 @@ impl ReleaseAuthority {
             .ok_or(SpentnessError::NoReviewedCommitment)
     }
 
-    /// Accept only a well-formed, recognized, unrevoked commitment for this chain.
+    /// Accept only a well-formed, recognized, unrevoked commitment for this chain
+    /// that ends before the NU7 seed block.
     pub(crate) fn check(&self, commitment: &Commitment) -> Result<(), SpentnessError> {
         commitment.validate()?;
         if self.revoked.contains(&commitment.sha256) {
@@ -84,6 +85,11 @@ impl ReleaseAuthority {
         let genesis = self.network.checkpoint_list().hash(Height(0));
         if genesis.map(|hash| hash.0) != Some(commitment.chain_identity) {
             return Err(SpentnessError::WrongChain);
+        }
+        if !commitment.precedes_nu7(&self.network) {
+            return Err(SpentnessError::ReachesNu7 {
+                height: commitment.terminal_height,
+            });
         }
         Ok(())
     }

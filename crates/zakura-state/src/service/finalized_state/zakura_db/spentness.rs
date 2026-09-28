@@ -118,6 +118,14 @@ pub enum SpentnessError {
     /// The commitment names another chain's genesis block.
     #[error("spentness commitment belongs to another chain")]
     WrongChain,
+    /// Construction cannot compute NSM accounting, so it must end before the NU7 seed block.
+    #[error(
+        "spentness commitment at height {height} reaches the NU7 seed block; use ordinary sync"
+    )]
+    ReachesNu7 {
+        /// The commitment's terminal height.
+        height: u32,
+    },
     /// This release has no reviewed commitment for the network.
     #[error("no reviewed spentness commitment for this network")]
     NoReviewedCommitment,

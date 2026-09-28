@@ -36,6 +36,8 @@ pub(super) struct Job {
     pub(super) gate: Option<Arc<Semaphore>>,
     /// Run a blocking operation under this probe first.
     pub(super) blocking: Option<Arc<ExecutionProbe>>,
+    /// Let the blocking operation outlive `produce`.
+    pub(super) detach_blocking: bool,
     /// Fail locally after this many parts.
     pub(super) fail_after: Option<u32>,
     /// Return from `produce` after the ending and hold this gate, so the
@@ -68,12 +70,13 @@ impl Produce for Scripted {
     ) -> Result<Responded, ServeEnd> {
         if let Some(probe) = job.blocking.clone() {
             let lease = lease.clone();
-            tokio::task::spawn_blocking(move || {
+            let work = tokio::task::spawn_blocking(move || {
                 let _lease = lease;
                 probe.start().finish();
-            })
-            .await
-            .expect("the blocking operation does not panic");
+            });
+            if !job.detach_blocking {
+                work.await.expect("the blocking operation does not panic");
+            }
         }
         if let Some(gate) = &job.gate {
             gate.acquire()
@@ -385,6 +388,52 @@ async fn cancellation_keeps_the_node_slot_until_the_work_ends() {
     })
     .await
     .expect("the slot frees once the blocking operation ends");
+}
+
+#[tokio::test]
+async fn detached_work_keeps_peer_capacity_across_reconnect_after_output_drains() {
+    let capacity = capacity(ServeLimits {
+        peer_execution: 1,
+        node_execution: 2,
+        ..LIMITS
+    });
+    let probe = ExecutionProbe::new(true, false);
+    let _release = probe.release_on_drop();
+    let mut old = session(&capacity, 1, 4);
+    old.serve
+        .admit(Job {
+            blocking: Some(probe.clone()),
+            detach_blocking: true,
+            ..job()
+        })
+        .unwrap();
+    probe.wait_started(1).await;
+    assert_eq!(next(&mut old.output).await, Probe::Done(0));
+    old.cancel.cancel();
+    drop(old);
+    settle().await;
+    assert_eq!(capacity.active_and_waiting(), (0, 0));
+    assert_eq!(capacity.node_output_held(), 0);
+    assert_eq!(capacity.node_output_responses.reserved(), 0);
+    assert_eq!(capacity.node_execution_held(), 1);
+    assert_eq!(probe.snapshot().running, 1);
+
+    let mut new = session(&capacity, 1, 4);
+    new.serve.admit(job()).unwrap();
+    settle().await;
+    assert_eq!(
+        capacity.active_and_waiting(),
+        (0, 1),
+        "the reconnect waits on the old work's peer slot despite a free node slot"
+    );
+    assert!(new.output.try_recv().is_err());
+
+    probe.release();
+    probe.wait_finished(1).await;
+    assert_eq!(next(&mut new.output).await, Probe::Done(0));
+    settle().await;
+    assert_eq!(capacity.node_execution_held(), 0);
+    assert_eq!(capacity.node_output_held(), 0);
 }
 
 /// Record how many node slots are free when the peer slot's waiter wakes.

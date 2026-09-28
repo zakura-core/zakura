@@ -27,14 +27,33 @@ pub const FORMAT_VERSION: u16 = 1;
 mod commitments;
 pub use commitments::MAINNET_COMMITMENTS;
 
+/// Revoked artifact digests. Recognition never overrides revocation.
+pub const REVOKED_COMMITMENTS: &[[u8; 32]] = &[];
+
 /// Release-reviewed commitments for `network`, oldest first.
 ///
 /// Only Mainnet has reviewed artifacts. Other networks always build ordinary state.
+/// This list can include revoked commitments; see [`supported_commitments`].
 pub fn release_commitments(network: &super::Network) -> &'static [Commitment] {
     match network {
         super::Network::Mainnet => MAINNET_COMMITMENTS,
         super::Network::Testnet(_) => &[],
     }
+}
+
+/// Release commitments for `network` that are not revoked, oldest first.
+///
+/// Artifact downloads, serving, and advertisements use only these commitments.
+pub fn supported_commitments(network: &super::Network) -> Vec<Commitment> {
+    unrevoked(release_commitments(network), REVOKED_COMMITMENTS)
+}
+
+fn unrevoked(commitments: &[Commitment], revoked: &[[u8; 32]]) -> Vec<Commitment> {
+    commitments
+        .iter()
+        .filter(|commitment| !revoked.contains(&commitment.sha256))
+        .cloned()
+        .collect()
 }
 
 /// Release-reviewed identity. Artifact bytes remain outside the executable.
@@ -354,6 +373,28 @@ mod tests {
         if let Some(pin) = MAINNET_COMMITMENTS.last() {
             assert_eq!(pin.terminal_height, checkpoints.max_height().0);
         }
+    }
+
+    #[test]
+    fn revocation_removes_supported_commitments() {
+        let pins: Vec<_> = (1..=3)
+            .map(|height| {
+                let bytes = encode([1; 32], height, [2; 32], [false, true]).unwrap();
+                ParsedArtifact::read(bytes.as_slice())
+                    .unwrap()
+                    .commitment()
+                    .clone()
+            })
+            .collect();
+        assert_eq!(unrevoked(&pins, &[]), pins);
+        assert_eq!(
+            unrevoked(&pins, &[pins[1].sha256]),
+            [pins[0].clone(), pins[2].clone()]
+        );
+        assert_eq!(
+            supported_commitments(&crate::parameters::Network::Mainnet),
+            unrevoked(MAINNET_COMMITMENTS, REVOKED_COMMITMENTS)
+        );
     }
 
     #[test]

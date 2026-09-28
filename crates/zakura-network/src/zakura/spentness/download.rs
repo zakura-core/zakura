@@ -85,20 +85,20 @@ pub(super) async fn wait_for_capable_peers(
 
 /// Attempt acquisition after bootstrap. Ordinary sync can continue if peers lack the artifact.
 ///
-/// The first failure for each artifact logs a warning; later failures log at debug level.
+/// `supported` must exclude revoked commitments. The first failure for each artifact logs a warning; later failures log at debug level.
 pub async fn download_missing(
     cache: PathBuf,
-    commitments: &'static [Commitment],
+    supported: Vec<Commitment>,
     service: Arc<ArtifactService>,
     supervisor: ZakuraSupervisorHandle,
 ) {
     let shutdown = supervisor.shutdown_token();
     let acquisition = async {
-        let mut cursors = vec![SourceCursor::default(); commitments.len()];
-        let mut warned = vec![false; commitments.len()];
+        let mut cursors = vec![SourceCursor::default(); supported.len()];
+        let mut warned = vec![false; supported.len()];
         loop {
             let mut missing = false;
-            for (index, commitment) in commitments.iter().enumerate().rev() {
+            for (index, commitment) in supported.iter().enumerate().rev() {
                 if service.contains(&commitment.sha256) {
                     continue;
                 }

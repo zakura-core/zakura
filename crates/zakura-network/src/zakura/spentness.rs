@@ -67,14 +67,17 @@ const STREAMS: &[Stream] = &[Stream {
 
 /// Load supported cache entries and prepare protocol negotiation and discovery.
 ///
-/// The node seeks the service when it recognizes any commitment, and provides
-/// it only when the cache already holds a verified artifact.
+/// `supported` must exclude revoked commitments, because the node downloads,
+/// serves, and advertises exactly these artifacts. The node seeks the service
+/// when it supports any commitment, and provides it only when the cache
+/// already holds a verified artifact.
 pub async fn prepare(
     cache: PathBuf,
-    commitments: &'static [Commitment],
+    supported: &[Commitment],
 ) -> Result<(Arc<ArtifactService>, CustomService), BoxError> {
+    let commitments = supported.to_vec();
     let artifacts =
-        tokio::task::spawn_blocking(move || cache::load_supported(&cache, commitments)).await?;
+        tokio::task::spawn_blocking(move || cache::load_supported(&cache, &commitments)).await?;
     let service = Arc::new(ArtifactService::new(artifacts));
     let id = ZakuraServiceId::new(SERVICE_ID)?;
     let custom = CustomService {
@@ -83,10 +86,7 @@ pub async fn prepare(
             .then(|| id.clone())
             .into_iter()
             .collect(),
-        seeks: (!commitments.is_empty())
-            .then_some(id)
-            .into_iter()
-            .collect(),
+        seeks: (!supported.is_empty()).then_some(id).into_iter().collect(),
     };
     Ok((service, custom))
 }
@@ -120,6 +120,38 @@ mod tests {
         }
         fn add_peer(&self, _peer: Peer) {}
         fn remove_peer(&self, _peer: &ZakuraPeerId, _conn: ZakuraConnId) {}
+    }
+
+    /// Publish a verified artifact at `terminal_height` into `cache`.
+    fn cached_artifact(
+        cache: &std::path::Path,
+        terminal_height: u32,
+    ) -> Result<Commitment, BoxError> {
+        let bytes = encode([1; 32], terminal_height, [2; 32], [false, true])?;
+        let parsed = ParsedArtifact::read(bytes.as_slice())?;
+        let commitment = parsed.commitment().clone();
+        publish(cache, &parsed.verify(&commitment)?)?;
+        Ok(commitment)
+    }
+
+    #[tokio::test]
+    async fn only_supported_artifacts_are_served_and_advertised() -> Result<(), BoxError> {
+        let cache = tempfile::tempdir()?;
+        let supported = cached_artifact(cache.path(), 1)?;
+        let revoked = cached_artifact(cache.path(), 2)?;
+
+        // The caller leaves the revoked commitment out of the supported set.
+        let (service, custom) =
+            prepare(cache.path().to_owned(), std::slice::from_ref(&supported)).await?;
+        assert_eq!(service.available(), vec![supported.sha256]);
+        assert!(!service.contains(&revoked.sha256));
+        assert_eq!(custom.provides, vec![ZakuraServiceId::new(SERVICE_ID)?]);
+
+        // A node without supported artifacts serves and advertises nothing.
+        let (service, custom) = prepare(cache.path().to_owned(), &[]).await?;
+        assert!(service.is_empty());
+        assert!(custom.provides.is_empty() && custom.seeks.is_empty());
+        Ok(())
     }
 
     #[tokio::test]

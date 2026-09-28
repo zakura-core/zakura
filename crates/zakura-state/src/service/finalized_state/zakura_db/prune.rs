@@ -475,6 +475,7 @@ mod tests {
     fn pruning_summary_uses_raw_transactions_to_correct_marker() {
         let _init_guard = zakura_test::init();
         let state = new_state_with_blocks();
+        let mut retained = state.db.subscribe_retained_block_height();
 
         // Simulate a marker that is ahead of the requested retention boundary,
         // while the corresponding raw transaction data is still present.
@@ -482,6 +483,7 @@ mod tests {
         batch.prepare_pruning_marker_batch(&state.db, block::Height(5));
         state.db.write_batch(batch).expect("marker writes");
         assert_eq!(state.db.lowest_retained_height(), Some(block::Height(5)));
+        assert_eq!(*retained.borrow_and_update(), block::Height(5));
         assert!(
             state.db.transaction(coinbase_tx_hash(4)).is_some(),
             "height 4 raw transaction data is still present despite the marker"
@@ -502,6 +504,25 @@ mod tests {
         assert_eq!(
             summary.compacted_height_range,
             Some((block::Height(1), block::Height(4)))
+        );
+
+        let corrected = summary
+            .new_lowest_retained_height
+            .expect("the plan corrects the marker to the retained range");
+        let mut batch = DiskWriteBatch::new();
+        batch.prepare_prune_batch(&state.db, block::Height(1), corrected);
+        state
+            .db
+            .write_batch(batch)
+            .expect("corrected pruning batch writes");
+        assert_eq!(state.db.lowest_retained_height(), Some(corrected));
+        assert!(retained
+            .has_changed()
+            .expect("database keeps the watch open"));
+        assert_eq!(
+            *retained.borrow(),
+            corrected,
+            "the watch must also publish legitimate decreases of the persisted floor"
         );
     }
 

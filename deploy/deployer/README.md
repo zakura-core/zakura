@@ -406,3 +406,13 @@ for new hosts.
 
 The deterministic `log_file` is the single source of truth shared by the running
 node (writer) and `logs fetch`/`logs follow` (reader).
+
+### Release-state publisher
+
+The mainnet archive publisher uses `release_state_publisher = true` on its node
+entry. This requires a binary-only systemd Mainnet archive node and an existing
+archive publisher installation on `roman-zakura-archive-vct-off`. It builds the
+node and offline exporter at the same commit and verifies publication after the
+restart. `--no-restart` is rejected for selections containing this node. See
+[the publisher runbook](../release-state/README.md#updating-the-archive-publisher)
+for locking, validation, and failure recovery.

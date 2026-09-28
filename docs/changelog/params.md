@@ -32,6 +32,7 @@ Keep entries **newest-first**. Each row records:
 
 | Parameter | Location | Old → New | PR | Why |
 | --- | --- | --- | --- | --- |
+| `MAX_QUEUED_BODY_VARIANTS` | `crates/zakura-state/src/service/queued_blocks.rs` | new → `4` bodies per header | [#1130](https://github.com/zakura-core/zakura/pull/1130) | Retain distinct queued bodies without allowing one header to fill the orphan queue. All bodies share the existing total queue limit. |
 | `PEER_GOSSIP_DELAY` (block gossip) | `crates/zakurad/src/components/sync.rs` | `7 s` between block gossips → removed | [#1177](https://github.com/zakura-core/zakura/pull/1177) | Each relay hop added up to 7 s to a block's propagation, and with ZIP 218's 25-second spacing about a quarter of blocks arrive within 7 s of the previous one. |
 | `TRANSACTION_GOSSIP_DELAY` (was `PEER_GOSSIP_DELAY`) | `crates/zakurad/src/components/mempool/gossip.rs` | `7 s` → `2 s` | [#1177](https://github.com/zakura-core/zakura/pull/1177) | Scale the transaction gossip batch interval by a third, matching the 25-second block spacing. |
 | Created-output index `PARTITIONS` | `crates/zakura-state/src/service/non_finalized_state/created_utxos.rs` | one copied map → 256 shared partitions | [#1153](https://github.com/zakura-core/zakura/pull/1153) | Reduce snapshot copying and cleanup at the cost of an extra hash per lookup. |

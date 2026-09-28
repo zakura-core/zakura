@@ -141,3 +141,19 @@ pub(crate) fn transaction_v4_from_coinbase(coinbase: &Transaction) -> Transactio
         sapling_shielded_data: None,
     }
 }
+
+/// Changes only V5 coinbase authorizing data, leaving the transaction and header hashes intact.
+pub(crate) fn changed_coinbase_body(block: &Arc<Block>, tag: u8) -> Arc<Block> {
+    let mut changed = block.clone();
+    let coinbase = Arc::make_mut(&mut Arc::make_mut(&mut changed).transactions[0]);
+    assert!(matches!(coinbase, Transaction::V5 { .. }));
+    let zakura_chain::transparent::Input::Coinbase { data, .. } = &mut coinbase.inputs_mut()[0]
+    else {
+        panic!("the first transaction is coinbase");
+    };
+    data.push(tag);
+    assert_eq!(block.transactions[0].hash(), changed.transactions[0].hash());
+    assert_eq!(block.hash(), changed.hash());
+    assert_ne!(block.auth_data_root(), changed.auth_data_root());
+    changed
+}

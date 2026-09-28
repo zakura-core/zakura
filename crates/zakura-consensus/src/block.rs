@@ -174,7 +174,7 @@ impl VerifyBlockError {
                 BlockError::BadMerkleRoot { .. } => BodyVerificationClass::PayloadMismatch(
                     BodyCommitmentKind::TransactionMerkleRoot,
                 ),
-                BlockError::AlreadyInChain(..) => BodyVerificationClass::Duplicate,
+                BlockError::AlreadyInChain(_, location) => location.body_verification_class(),
                 BlockError::Transaction(error) => error.body_verification_class(),
                 BlockError::NoTransactions => consensus("block.no_transactions"),
                 BlockError::DuplicateTransaction => consensus("block.duplicate_transaction"),

@@ -1118,39 +1118,12 @@ impl StateService {
             }
         }
 
-        // [`Request::CommitSemanticallyVerifiedBlock`] contract: a request to commit a block which
-        // has been queued but not yet committed to the state fails the older request and replaces
-        // it with the newer request.
-        let rsp_rx = if self
-            .non_finalized_state_queued_blocks
-            .get_mut(&semantically_verified.hash)
-            .is_some()
-        {
-            tracing::debug!("replacing older queued request with new request");
-            let (rsp_tx, rsp_rx) = oneshot::channel();
-            let attempt = write::start_block_write(&self.block_commit_sender, hash);
-            let (_, old_rsp_tx, old_admission, _) = self.non_finalized_state_queued_blocks.replace(
-                semantically_verified.hash,
-                (semantically_verified, rsp_tx, admission, attempt),
-            );
-            if let Some(old_admission) = old_admission {
-                old_admission.reject();
-            }
-            let _ = old_rsp_tx.send(Err(CommitBlockError::new_duplicate(
-                Some(hash.into()),
-                KnownBlock::Queue,
-            )
-            .into()));
-            rsp_rx
-        } else if self.non_finalized_state_queued_blocks.is_full()
-            && !self.drains_the_non_finalized_queue_now(&parent_hash)
-        {
-            // The bound only applies to blocks that must wait for a parent this state does not
-            // have. A block that this call goes on to drain is admitted even when the queue is
-            // full, because the drain walks forward from `parent_hash`: a block the queue refused
-            // is never the parent that releases its own queued descendants, and nothing else
-            // empties the queue while the chain is stalled, so rejecting it here would strand
-            // them permanently.
+        let rsp_rx = if !self.non_finalized_state_queued_blocks.can_queue(
+            &semantically_verified,
+            self.drains_the_non_finalized_queue_now(&parent_hash),
+        ) {
+            // Same-header variants share the global body limit and have their own cap.
+            // A block drained immediately can exceed the global limit to release its children.
             if let Some(admission) = admission {
                 admission.reject();
             }
@@ -1253,24 +1226,42 @@ impl StateService {
             while let Some(parent_hash) = new_parents.pop() {
                 let queued_children = self
                     .non_finalized_state_queued_blocks
-                    .dequeue_children(parent_hash);
+                    .dequeue_child_variants(parent_hash);
 
                 for queued_child in queued_children {
-                    let Ok(write_slot) = self.non_finalized_write_slots.clone().try_acquire_owned()
+                    let body_count = u32::try_from(queued_child.len())
+                        .expect("queued variants are bounded by a small constant");
+                    let Ok(write_slot) = self
+                        .non_finalized_write_slots
+                        .clone()
+                        .try_acquire_many_owned(body_count)
                     else {
-                        Self::send_semantically_verified_block_error(
-                            queued_child,
-                            CommitBlockError::QueueFull,
+                        // No writer will report this parent's failure, so release its
+                        // queued descendants here instead of leaving them waiting.
+                        self.non_finalized_state_queued_blocks.fail_descendants(
+                            queued_child[0].0.hash,
+                            CommitBlockError::QueueFull.into(),
                         );
+                        for variant in queued_child {
+                            Self::send_semantically_verified_block_error(
+                                variant,
+                                CommitBlockError::QueueFull,
+                            );
+                        }
                         continue;
                     };
-                    let (SemanticallyVerifiedBlock { hash, .. }, _, _, _) = &queued_child;
-                    let hash = *hash;
-
-                    self.non_finalized_block_write_sent_hashes
-                        .add(&queued_child.0);
-                    let admission = queued_child.2.clone();
-                    let candidate_parent = queued_child.0.block.header.previous_block_hash;
+                    let first = queued_child
+                        .first()
+                        .expect("a queued header has at least one body");
+                    let hash = first.0.hash;
+                    self.non_finalized_block_write_sent_hashes.add(&first.0);
+                    let admission = first.2.clone();
+                    let candidate_parent = first.0.block.header.previous_block_hash;
+                    let candidate_height = first.0.height;
+                    let admissions: Vec<_> = queued_child
+                        .iter()
+                        .filter_map(|variant| variant.2.clone())
+                        .collect();
                     let optimistic_relay_still_authorized = admission
                         .as_ref()
                         .is_some_and(BlockAdmission::optimistic_relay_authorized)
@@ -1291,7 +1282,7 @@ impl StateService {
                         // Only the first server candidate can reserve early relay for this parent.
                         // Siblings receive the normal committed relay after contextual validation.
                         self.optimistic_relay_reserved_parents
-                            .insert(candidate_parent, queued_child.0.height);
+                            .insert(candidate_parent, candidate_height);
                     }
                     let send_result =
                         non_finalized_block_write_sender.send(NonFinalizedWriteMessage::Commit {
@@ -1304,17 +1295,19 @@ impl StateService {
                         send_result
                     {
                         // If Zebra is shutting down, drop blocks and return an error.
-                        Self::send_semantically_verified_block_error(
-                            queued,
-                            CommitBlockError::WriteTaskExited,
-                        );
+                        for variant in queued {
+                            Self::send_semantically_verified_block_error(
+                                variant,
+                                CommitBlockError::WriteTaskExited,
+                            );
+                        }
 
                         self.clear_non_finalized_block_queue(CommitBlockError::WriteTaskExited);
 
                         return;
                     };
 
-                    if let Some(admission) = admission {
+                    for admission in admissions {
                         admission.admit(optimistic_relay_still_authorized);
                     }
 

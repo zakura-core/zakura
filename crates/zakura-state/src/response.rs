@@ -184,6 +184,21 @@ pub enum KnownBlock {
     Queue,
 }
 
+impl KnownBlock {
+    /// Classify a duplicate without treating an uncommitted body as verified evidence.
+    /// Queued and in-flight bodies can still fail, so their callers must be able to retry.
+    pub fn body_verification_class(&self) -> zakura_header_chain::BodyVerificationClass {
+        use zakura_header_chain::{BodyVerificationClass, TransientBodyFailureKind};
+
+        match self {
+            Self::Queue | Self::WriteChannel => {
+                BodyVerificationClass::Retryable(TransientBodyFailureKind::VerifierUnavailable)
+            }
+            Self::Finalized | Self::BestChain | Self::SideChain => BodyVerificationClass::Duplicate,
+        }
+    }
+}
+
 impl std::fmt::Display for KnownBlock {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {

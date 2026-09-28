@@ -110,7 +110,9 @@ fn chain_value_pool_change_propagates_transaction_value_balance_errors() {
     };
 
     assert!(
-        block.chain_value_pool_change(&utxos, None).is_err(),
+        block
+            .chain_value_pool_change(&Network::Mainnet, &utxos, None)
+            .is_err(),
         "block-level aggregation should propagate transaction value-balance errors"
     );
 }
@@ -171,8 +173,8 @@ fn ordered_utxo_value_balances_match_plain_utxo_value_balances() {
         transactions: vec![transaction],
     };
     assert_eq!(
-        block.chain_value_pool_change(&plain_utxos, None),
-        block.chain_value_pool_change_from_ordered_utxos(&ordered_utxos, None),
+        block.chain_value_pool_change(&Network::Mainnet, &plain_utxos, None),
+        block.chain_value_pool_change_from_ordered_utxos(&Network::Mainnet, &ordered_utxos, None),
     );
 }
 

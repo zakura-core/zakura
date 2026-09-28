@@ -27,6 +27,7 @@ use zakura_state::{self as zs};
 
 use zakura_chain::{
     block::{self, Block},
+    parameters::Network,
     serialization::ZcashSerialize,
     transaction::UnminedTxId,
 };
@@ -252,6 +253,9 @@ pub struct InboundSetupData {
     /// Allows efficient access to the best tip of the blockchain.
     pub latest_chain_tip: zs::LatestChainTip,
 
+    /// The network whose target spacing scales the gossip lookahead window.
+    pub network: Network,
+
     /// A channel to send misbehavior reports to the [`AddressBook`].
     pub misbehavior_sender: tokio::sync::mpsc::Sender<(PeerSocketAddr, u32)>,
 }
@@ -449,6 +453,7 @@ impl Service<zn::Request> for Inbound {
                         mempool,
                         state,
                         latest_chain_tip,
+                        network,
                         misbehavior_sender,
                     } = setup_data;
 
@@ -461,6 +466,7 @@ impl Service<zn::Request> for Inbound {
                         Timeout::new(block_verifier, BLOCK_VERIFY_TIMEOUT),
                         state.clone(),
                         latest_chain_tip,
+                        network,
                     ));
 
                     result = Ok(());

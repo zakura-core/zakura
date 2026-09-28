@@ -444,6 +444,7 @@ impl PeerRoutine {
         // `self.work`.
         let budget = self.budget.clone();
         let work = self.work.clone();
+        let registry = Arc::clone(&self.registry);
         // Per-peer BBR heartbeat cadence. `Skip` so a routine busy past a tick emits one
         // fresh sample rather than a catch-up burst. Observability only.
         let mut bbr_trace_ticks = time::interval(BBR_TRACE_INTERVAL);
@@ -452,17 +453,20 @@ impl PeerRoutine {
             if self.cancel.is_cancelled() {
                 return Ok(());
             }
-            // missed-wake safety: register both `Notify`s via
-            // `Notified::enable()` BEFORE the fill attempt. The budget/work
+            // missed-wake safety: register all `Notify`s via
+            // `Notified::enable()` BEFORE the fill attempt. These
             // `Notify`s use `notify_waiters` (no stored permit), so a
             // release/extend that lands between the fill-check and the await
             // would be lost if we registered after — the routine would stall.
             let capacity = budget.subscribe_capacity().notified();
             let available = work.subscribe_available().notified();
+            let floor_ranking = registry.subscribe_floor_ranking().notified();
             tokio::pin!(capacity);
             tokio::pin!(available);
+            tokio::pin!(floor_ranking);
             Notified::enable(capacity.as_mut());
             Notified::enable(available.as_mut());
+            Notified::enable(floor_ranking.as_mut());
 
             self.flush_pending_status();
             let retry_filter_deadline = if self.session.outbound_capacity() > 0 {
@@ -521,6 +525,9 @@ impl PeerRoutine {
                 }
                 _ = &mut available => {
                     self.trace_wake("work_added");
+                }
+                _ = &mut floor_ranking => {
+                    self.trace_wake("floor_ranking_changed");
                 }
                 _ = bbr_trace_ticks.tick() => self.trace_bbr_sample(),
                 _ = &mut outbound_queue_poll, if !outbound_queue_has_capacity => {}
@@ -1188,6 +1195,15 @@ impl PeerRoutine {
                 break FillStop::SendError;
             }
             metrics::counter!("sync.block.request.sent").increment(1);
+            let estimate_kind = if reserved_bytes
+                >= u64::from(request_count).saturating_mul(block::MAX_BLOCK_BYTES)
+            {
+                "worst_case"
+            } else {
+                "hinted"
+            };
+            metrics::counter!("sync.block.request.size_estimate", "kind" => estimate_kind)
+                .increment(1);
             if in_bypass {
                 // A floor request borrowed a bypass slot while the cwnd was saturated.
                 metrics::counter!("sync.block.request.floor_bypass").increment(1);
@@ -1656,10 +1672,12 @@ impl PeerRoutine {
         };
         if serialized_bytes > tolerated_bytes(estimated_bytes, self.config.size_deviation_tolerance)
         {
+            // The body matched the requested hash, so the hint was wrong, not the body.
+            // Discarding it would let one bad advertised size stall this height on every
+            // honest delivery; report and keep going.
+            metrics::counter!("sync.block.body.size_hint_mismatch").increment(1);
             self.report_misbehavior(BlockSyncMisbehavior::SizeMismatch)
                 .await;
-            self.finish_outstanding_at(index, Disposition::RetryOriginal);
-            return;
         }
 
         metrics::counter!("sync.block.body.received").increment(1);
@@ -2426,6 +2444,120 @@ mod tests {
             ZakuraTrace::noop(),
         );
         (routine, out_recv, routine_to_reactor_rx)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn floor_ranking_change_wakes_a_deferred_routine() {
+        use super::super::peer_registry::SlotDiagnostics;
+
+        let (mut slow, mut outbound, _reactor_events) = status_test_routine();
+        // Keep the input streams open while driving the real wait loop.
+        let (_in_send, in_recv) = framed_channel(16);
+        slow.recv = in_recv;
+        let (_view_tx, view_rx) = watch::channel(*slow.sequencer_view.borrow());
+        slow.sequencer_view = view_rx;
+        slow.received_status = true;
+        slow.servable_low = block::Height(1);
+        slow.servable_high = block::Height(10);
+
+        let registry = Arc::clone(&slow.registry);
+        let work = Arc::clone(&slow.work);
+        let slow_peer = slow.peer.clone();
+        let slow_generation = slow.generation;
+        let cancel = slow.cancel.clone();
+        let fast_peer = ZakuraPeerId::new(vec![8; 32]).unwrap();
+        let fast_generation = registry
+            .admit_session(
+                &fast_peer,
+                slow.session.direction(),
+                &slow.config,
+                0,
+                Instant::now(),
+            )
+            .generation();
+        for (peer, generation) in [(&slow_peer, slow_generation), (&fast_peer, fast_generation)] {
+            registry.upsert_status(
+                peer,
+                generation,
+                BlockSyncStatus {
+                    servable_low: block::Height(0),
+                    servable_high: block::Height(10),
+                    ..BlockSyncStatus::default()
+                },
+            );
+        }
+
+        let mut running = Box::pin(slow.run());
+        assert!(futures::poll!(running.as_mut()).is_pending());
+        // Consume the initial heartbeat before publishing the two finite scores.
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert!(futures::poll!(running.as_mut()).is_pending());
+        let before_refill = tokio::time::Instant::now();
+        let slots = SlotDiagnostics {
+            available_slots: 3,
+            bbr_rtprop_ms: Some(75),
+            ..SlotDiagnostics::default()
+        };
+        registry.publish_slots(&fast_peer, fast_generation, slots);
+        registry.publish_slots(
+            &slow_peer,
+            slow_generation,
+            SlotDiagnostics {
+                bbr_rtprop_ms: Some(145),
+                ..slots
+            },
+        );
+        work.extend(
+            super::super::test_work_scope(),
+            [(
+                block::Height(1),
+                block::Hash([1; 32]),
+                BlockSizeEstimate::Advertised(1_000),
+            )],
+        );
+
+        // The slow worker sees the faster carrier and goes back to sleep.
+        assert!(futures::poll!(running.as_mut()).is_pending());
+        assert!(outbound.try_recv().is_err());
+        assert!(work.pending_contains(block::Height(1)));
+
+        registry.publish_slots(
+            &fast_peer,
+            fast_generation,
+            SlotDiagnostics {
+                bbr_rtprop_ms: None,
+                ..slots
+            },
+        );
+        assert!(registry.floor_has_preferred_unsaturated_server(
+            block::Height(0),
+            &fast_peer,
+            None,
+            false
+        ));
+
+        // The fast worker now defers to the sleeping slow worker. Only the
+        // ranking update can wake it: no work, capacity, view, or timer changed.
+        assert!(futures::poll!(running.as_mut()).is_pending());
+        let frame = outbound
+            .try_recv()
+            .expect("a ranking change must wake the deferred worker");
+        assert!(matches!(
+            BlockSyncMessage::decode_frame(frame).unwrap(),
+            BlockSyncMessage::GetBlocks {
+                start_height: block::Height(1),
+                count: 1
+            }
+        ));
+        assert!(work.in_flight_contains(block::Height(1)));
+        assert!(!work.pending_contains(block::Height(1)));
+        assert_eq!(tokio::time::Instant::now(), before_refill);
+
+        cancel.cancel();
+        assert!(timeout(Duration::from_secs(1), running)
+            .await
+            .unwrap()
+            .is_ok());
     }
 
     #[tokio::test]
@@ -3920,6 +4052,130 @@ mod tests {
         assert_eq!(work.in_flight_contains(block::Height(1)), received);
         assert_eq!(sequencer_recv.try_recv().is_ok(), received);
         assert!(sequencer_recv.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn oversized_body_against_an_advertised_hint_is_reported_but_still_sequenced() {
+        use zakura_chain::serialization::ZcashDeserializeInto;
+
+        use crate::zakura::transport::OrderedStreamFailureCause;
+        use crate::zakura::ServicePeerDirection;
+
+        let body: Arc<block::Block> = Arc::new(
+            zakura_test::vectors::BLOCK_MAINNET_1_BYTES
+                .zcash_deserialize_into()
+                .unwrap(),
+        );
+        let config = ZakuraBlockSyncConfig::default();
+        let budget = ByteBudget::new(1_000_000);
+        let work = Arc::new(WorkQueue::new(block::Height(0)));
+        work.set_estimate_floor_for_tests(1);
+        // 500 B advertised at the default 200 % tolerance means anything over 1 000 B
+        // mismatches; the block header alone is 1 487 B.
+        work.extend(
+            super::super::test_work_scope(),
+            [(
+                block::Height(1),
+                body.hash(),
+                BlockSizeEstimate::Advertised(500),
+            )],
+        );
+        let peer = ZakuraPeerId::new(vec![23; 32]).unwrap();
+        let registry = Arc::new(PeerRegistry::new());
+        let now = Instant::now();
+        let generation = registry
+            .admit_session(&peer, ServicePeerDirection::Outbound, &config, 0, now)
+            .generation();
+        let cancel = CancellationToken::new();
+        let (out_send, mut out_recv) = crate::zakura::transport::worker_framed_channel(4);
+        let (in_send, in_recv) = framed_channel(4);
+        let cause = OrderedStreamFailureCause::default();
+        let session = BlockSyncPeerSession::for_test(peer.clone(), out_send, cancel.clone());
+        let (sequencer_input, mut sequencer_recv) = mpsc::channel(4);
+        let (reactor_input, mut reactor_recv) = mpsc::channel(4);
+        let (_view_tx, view_rx) = watch::channel(initial_view(BlockSyncFrontiers {
+            finalized_height: block::Height(0),
+            verified_block_tip: block::Height(0),
+            verified_block_hash: block::Hash([0; 32]),
+        }));
+        let mut routine = PeerRoutine::new(
+            peer.clone(),
+            0,
+            session,
+            in_recv.with_failure_cause(cause),
+            config.clone(),
+            true,
+            generation,
+            budget.clone(),
+            work.clone(),
+            registry.clone(),
+            Arc::new(Mutex::new(ThroughputMeter::new(now))),
+            sequencer_input,
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+            reactor_input,
+            view_rx,
+            cancel.clone(),
+            ZakuraTrace::noop(),
+        );
+        routine.handle_status(BlockSyncStatus {
+            servable_low: block::Height(1),
+            servable_high: block::Height(1),
+            max_blocks_per_response: 1,
+            ..BlockSyncStatus::default()
+        });
+        routine.try_fill().await;
+        assert_eq!(routine.window.outstanding.len(), 1);
+        timeout(Duration::from_secs(1), out_recv.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .write_with(|_| async { Ok::<_, std::convert::Infallible>(()) })
+            .await
+            .unwrap();
+        in_send
+            .send(
+                BlockSyncMessage::Block(body.clone())
+                    .encode_frame()
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        in_send
+            .send(
+                BlockSyncMessage::BlocksDone {
+                    start_height: block::Height(1),
+                    returned: 1,
+                }
+                .encode_frame()
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let mut running = Box::pin(routine.run());
+        let sequenced = tokio::select! {
+            sequenced = sequencer_recv.recv() => sequenced,
+            _ = &mut running => panic!("the routine must stay alive until the body is sequenced"),
+        };
+        assert!(
+            sequenced.is_some(),
+            "a hash-matched body is sequenced even though it exceeds its size hint"
+        );
+        let reported = std::iter::from_fn(|| reactor_recv.try_recv().ok()).any(|message| {
+            matches!(
+                message,
+                RoutineToReactor::Misbehavior {
+                    reason: super::BlockSyncMisbehavior::SizeMismatch,
+                    ..
+                }
+            )
+        });
+        assert!(reported, "the mismatch is still reported to the reactor");
+
+        cancel.cancel();
+        let result = timeout(Duration::from_secs(1), running).await.unwrap();
+        assert!(result.is_ok(), "{result:?}");
     }
 
     #[test]

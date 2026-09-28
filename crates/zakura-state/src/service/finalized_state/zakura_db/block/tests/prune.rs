@@ -925,6 +925,7 @@ fn contextual_commits_keep_raw_transactions_before_checkpoint_retention_start() 
         .zcash_deserialize_into()
         .expect("test data deserializes");
     let contextually_verified = ContextuallyVerifiedBlock::with_block_and_spent_utxos(
+        &network,
         SemanticallyVerifiedBlock::from(block.clone()),
         HashMap::new(),
     )

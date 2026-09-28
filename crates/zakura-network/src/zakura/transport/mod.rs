@@ -7,6 +7,7 @@ mod clock;
 mod frame;
 mod guard;
 mod io;
+mod message_rule;
 mod pipe;
 mod registry;
 mod service;
@@ -25,6 +26,13 @@ pub(crate) use io::{
     worker_framed_channel, FrameGuard, FrameWriteClaim, FramedWorkerRecv, GuardedReserveError,
     OrderedStreamFailure, OrderedStreamFailureCause, QueuedFrame,
 };
+pub(crate) use message_rule::frame_filter::{FrameFilter, InboundReader};
+#[cfg(test)]
+pub(crate) use message_rule::frame_suite::check_frame_filter;
+pub use message_rule::{
+    frame_filter::FrameRejection, layout::LayoutError, Cadence, MessageRole, MessageRule,
+    PayloadLen,
+};
 pub(crate) use pipe::{
     handle_pipe_exit, spawn_supervised_peer_task, spawn_supervised_pipe, CloseCause, Edge, Flow,
     Node, NodeKind, Pipe, PipeCx, PipeShape,
@@ -35,6 +43,6 @@ pub(crate) use service::ServiceStream;
 pub use service::{
     BoxRunFuture, Peer, RequestResponseService, Service, SessionDemand, SessionFull,
     SessionOpening, SessionPolicy, SessionResources, Sink, SinkReject, Source, Stream, StreamMode,
-    StreamWritePolicy,
+    StreamQueueDepths, StreamWritePolicy,
 };
 pub use session::{OrderedSendError, PeerStreamSession};

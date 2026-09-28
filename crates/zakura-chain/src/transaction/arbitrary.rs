@@ -1112,3 +1112,93 @@ pub fn insert_fake_orchard_shielded_data(
         _ => panic!("Fake V5 transaction is not V5"),
     }
 }
+
+/// Returns an empty V5 transaction with no shielded data, for use as a base in
+/// shielded-action test fixtures.
+pub fn empty_v5_transaction() -> Transaction {
+    Transaction::V5 {
+        network_upgrade: NetworkUpgrade::Nu5,
+        lock_time: LockTime::unlocked(),
+        expiry_height: block::Height(100),
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        sapling_shielded_data: None,
+        orchard_shielded_data: None,
+    }
+}
+
+/// Returns a V5 transaction containing `count` Orchard actions.
+pub fn fake_v5_with_orchard_actions(count: usize) -> Arc<Transaction> {
+    let mut tx = empty_v5_transaction();
+    let shielded_data = insert_fake_orchard_shielded_data(&mut tx);
+    let action = shielded_data.actions.first().clone();
+    shielded_data.actions = at_least_one![action; count];
+
+    Arc::new(tx)
+}
+
+/// Returns a V5 transaction containing `count` Sapling outputs.
+pub fn fake_v5_with_sapling_outputs(count: usize) -> Arc<Transaction> {
+    let mut runner = TestRunner::default();
+    let mut shielded_data = any::<sapling::ShieldedData<sapling::SharedAnchor>>()
+        .new_tree(&mut runner)
+        .expect("sapling shielded data strategy is valid")
+        .current();
+    let output = any::<sapling::Output>()
+        .new_tree(&mut runner)
+        .expect("sapling output strategy is valid")
+        .current();
+
+    shielded_data.transfers = sapling::TransferData::JustOutputs {
+        outputs: at_least_one![output; count],
+    };
+
+    let mut tx = empty_v5_transaction();
+    match &mut tx {
+        Transaction::V5 {
+            sapling_shielded_data,
+            ..
+        } => *sapling_shielded_data = Some(shielded_data),
+        _ => unreachable!("empty_v5_transaction returns a V5 transaction"),
+    }
+
+    Arc::new(tx)
+}
+
+/// Returns fake Orchard-protocol shielded data with `count` actions, or `None`
+/// if `count` is zero.
+///
+/// The data enables spends and outputs, so it passes the flag checks, but its
+/// proof and signatures are invalid.
+fn fake_orchard_protocol_shielded_data(count: usize) -> Option<orchard::ShieldedData> {
+    if count == 0 {
+        return None;
+    }
+
+    let mut tx = empty_v5_transaction();
+    let shielded_data = insert_fake_orchard_shielded_data(&mut tx);
+    let action = shielded_data.actions.first().clone();
+    shielded_data.actions = at_least_one![action; count];
+    shielded_data.flags = orchard::Flags::ENABLE_SPENDS | orchard::Flags::ENABLE_OUTPUTS;
+
+    Some(shielded_data.clone())
+}
+
+/// Returns a V6 transaction for `network_upgrade` containing `orchard_actions`
+/// Orchard actions and `ironwood_actions` Ironwood actions.
+pub fn fake_v6_with_orchard_and_ironwood_actions(
+    network_upgrade: NetworkUpgrade,
+    orchard_actions: usize,
+    ironwood_actions: usize,
+) -> Arc<Transaction> {
+    Arc::new(Transaction::V6 {
+        network_upgrade,
+        lock_time: LockTime::unlocked(),
+        expiry_height: block::Height(100),
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        sapling_shielded_data: None,
+        orchard_shielded_data: fake_orchard_protocol_shielded_data(orchard_actions),
+        ironwood_shielded_data: fake_orchard_protocol_shielded_data(ironwood_actions),
+    })
+}

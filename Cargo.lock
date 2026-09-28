@@ -1562,18 +1562,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "equihash"
-version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "306286e8dcc39ab3dfceb74c792ce8baffdab90591321d3ffaae64829734c37f"
-dependencies = [
- "blake2b_simd",
- "cc",
- "corez",
- "document-features",
-]
-
-[[package]]
 name = "equivalent"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7451,7 +7439,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-chain"
-version = "8.0.1"
+version = "9.0.0"
 dependencies = [
  "bech32",
  "bitflags",
@@ -7468,7 +7456,6 @@ dependencies = [
  "derive-getters",
  "dirs",
  "ed25519-zebra",
- "equihash",
  "futures",
  "group",
  "hex",
@@ -7502,6 +7489,7 @@ dependencies = [
  "uint 0.10.0",
  "x25519-dalek",
  "zakura-address",
+ "zakura-equihash",
  "zakura-halo2-proofs",
  "zakura-jubjub",
  "zakura-orchard",
@@ -7576,6 +7564,7 @@ dependencies = [
  "blake2b_simd",
  "corez",
  "document-features",
+ "libc",
 ]
 
 [[package]]

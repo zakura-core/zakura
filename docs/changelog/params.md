@@ -32,7 +32,7 @@ Keep entries **newest-first**. Each row records:
 
 | Parameter | Location | Old → New | PR | Why |
 | --- | --- | --- | --- | --- |
-| Testnet template mining allowance (`EXTRA_SPACINGS_TO_MINE_A_BLOCK`) | `crates/zakura-state/src/service/read/difficulty.rs` | 2 candidate target spacings → removed | Pending | Use the local clock within consensus bounds, and select minimum difficulty only after the consensus timeout. |
+| Testnet template mining allowance (`EXTRA_SPACINGS_TO_MINE_A_BLOCK`) | `crates/zakura-state/src/service/read/difficulty.rs` | 2 candidate target spacings → removed | [#1196](https://github.com/zakura-core/zakura/pull/1196) | Use the local clock within consensus bounds, and select minimum difficulty only after the consensus timeout. |
 | `PEER_GOSSIP_DELAY` (block gossip) | `crates/zakurad/src/components/sync.rs` | `7 s` between block gossips → removed | [#1177](https://github.com/zakura-core/zakura/pull/1177) | Each relay hop added up to 7 s to a block's propagation, and with ZIP 218's 25-second spacing about a quarter of blocks arrive within 7 s of the previous one. |
 | `TRANSACTION_GOSSIP_DELAY` (was `PEER_GOSSIP_DELAY`) | `crates/zakurad/src/components/mempool/gossip.rs` | `7 s` → `2 s` | [#1177](https://github.com/zakura-core/zakura/pull/1177) | Scale the transaction gossip batch interval by a third, matching the 25-second block spacing. |
 | Created-output index `PARTITIONS` | `crates/zakura-state/src/service/non_finalized_state/created_utxos.rs` | one copied map → 256 shared partitions | [#1153](https://github.com/zakura-core/zakura/pull/1153) | Reduce snapshot copying and cleanup at the cost of an extra hash per lookup. |

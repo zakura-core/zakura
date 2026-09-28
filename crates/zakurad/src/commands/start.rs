@@ -449,6 +449,9 @@ impl StartCmd {
         state_config.vct_fast_sync = config.consensus.vct_fast_sync_enabled();
         let spentness_config =
             spentness::prepare_construction(&config, &state_config, shutdown.clone()).await?;
+        // Acquisition failure in auto mode turns hints off for this run.
+        let spentness_enabled =
+            spentness_config.mode != zakura_chain::parameters::spentness_hints::Mode::Off;
 
         let (
             mut state_service,
@@ -617,9 +620,8 @@ impl StartCmd {
         // Start health server if configured (after sync_status is available)
 
         // Verifiers and the syncer wait on construction progress only when hints are enabled.
-        let spentness_status = (config.spentness.mode
-            != zakura_chain::parameters::spentness_hints::Mode::Off)
-            .then(|| read_only_state_service.spentness_status_receiver());
+        let spentness_status =
+            spentness_enabled.then(|| read_only_state_service.spentness_status_receiver());
 
         info!("initializing verifiers");
         let (tx_verifier_setup_tx, tx_verifier_setup_rx) = oneshot::channel();

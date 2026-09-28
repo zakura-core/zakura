@@ -713,11 +713,9 @@ fn prepared_relay_preflight_rejects_a_forged_commitment() {
     ));
 }
 
-/// Exercise real V5 authorizing-data variants through the queue and writer, including
-/// the header engine, descendant completion, and the retained mining receipt.
-#[tokio::test(flavor = "multi_thread")]
-async fn queued_body_variants_preserve_the_valid_block_in_both_orders() {
-    use crate::tests::{setup::changed_coinbase_body, FakeChainHelper};
+/// Four coinbase-only blocks with NU5 active from height 2 and matching commitments.
+fn nu5_coinbase_regtest_chain() -> (Network, Vec<Arc<Block>>) {
+    use crate::tests::FakeChainHelper;
     use zakura_chain::{
         block::ChainHistoryBlockTxAuthCommitmentHash,
         history_tree::HistoryTree,
@@ -725,8 +723,6 @@ async fn queued_body_variants_preserve_the_valid_block_in_both_orders() {
         transaction::Transaction,
     };
 
-    let _init_guard = zakura_test::init();
-    let limit = Duration::from_secs(15);
     let network = Network::new_regtest(RegtestParameters {
         activation_heights: ConfiguredActivationHeights {
             nu5: Some(2),
@@ -742,12 +738,14 @@ async fn queued_body_variants_preserve_the_valid_block_in_both_orders() {
         let transaction = if height == 1 {
             transaction_v4_from_coinbase(coinbase)
         } else {
+            let mut outputs = coinbase.outputs().to_vec();
+            outputs[0].value = 1.try_into().unwrap();
             Transaction::V5 {
                 network_upgrade: NetworkUpgrade::Nu5,
                 lock_time: transaction::LockTime::unlocked(),
                 expiry_height: Height(height),
                 inputs: coinbase.inputs().to_vec(),
-                outputs: coinbase.outputs().to_vec(),
+                outputs,
                 sapling_shielded_data: None,
                 orchard_shielded_data: None,
             }
@@ -778,6 +776,18 @@ async fn queued_body_variants_preserve_the_valid_block_in_both_orders() {
             .unwrap();
         chain.push(child);
     }
+    (network, chain)
+}
+
+/// Exercise real V5 authorizing-data variants through the queue and writer, including
+/// the header engine, descendant completion, and the retained mining receipt.
+#[tokio::test(flavor = "multi_thread")]
+async fn queued_body_variants_preserve_the_valid_block_in_both_orders() {
+    use crate::tests::setup::changed_coinbase_body;
+
+    let _init_guard = zakura_test::init();
+    let limit = Duration::from_secs(15);
+    let (network, chain) = nu5_coinbase_regtest_chain();
     let valid = chain[3].clone();
     let invalid = changed_coinbase_body(&valid, 42);
     let sibling = (1_u64..=1024)
@@ -932,6 +942,136 @@ async fn queued_body_variants_preserve_the_valid_block_in_both_orders() {
                 .unwrap()
                 .unwrap();
             assert_eq!(state.best_tip(), Some((Height(3), valid.hash())));
+        }
+    }
+}
+
+/// A commitment-matching consensus failure must survive another variant's payload mismatch.
+#[tokio::test(flavor = "multi_thread")]
+async fn queued_body_variants_preserve_deterministic_rejection_in_both_orders() {
+    use crate::tests::setup::changed_coinbase_body;
+    use zakura_chain::{
+        amount::{Amount, MAX_MONEY},
+        value_balance::ValueBalanceError,
+    };
+    use zakura_header_chain::{BodyRuleId, BodyVerificationClass};
+
+    let _init_guard = zakura_test::init();
+    let limit = Duration::from_secs(15);
+    let (network, chain) = nu5_coinbase_regtest_chain();
+    let hash = chain[3].hash();
+    let altered = changed_coinbase_body(&chain[3], 42);
+
+    for header_runtime in [false, true] {
+        for invalid_first in [false, true] {
+            let config = Config {
+                enable_zakura_header_seed_from_committed_blocks: header_runtime,
+                ..Config::ephemeral()
+            };
+            let (mut state, _, _, _) = StateService::new(config, &network, Height::MAX, 0)
+                .await
+                .unwrap();
+            for block in &chain[..2] {
+                timeout(
+                    limit,
+                    state.queue_and_commit_to_finalized_state(CheckpointVerifiedBlock::from(
+                        block.clone(),
+                    )),
+                )
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            }
+
+            // Seed supply so the parent reaches MAX_MONEY and the next coinbase exceeds it.
+            // AddValuePool is returned after commitment validation, unlike UTXO/anchor errors.
+            let db = &state.read_service.db;
+            let mut pools = db.finalized_value_pool();
+            let parent_value = i64::from(chain[2].transactions[0].outputs()[0].value);
+            pools.set_sapling_value_balance(ValueBalance::from_sapling_amount(
+                Amount::try_from(MAX_MONEY - i64::from(pools.transparent_amount()) - parent_value)
+                    .unwrap(),
+            ));
+            db.set_finalized_value_pool(pools);
+
+            let bodies = if invalid_first {
+                [chain[3].clone(), altered.clone()]
+            } else {
+                [altered.clone(), chain[3].clone()]
+            };
+            let responses = bodies
+                .map(|body| state.queue_and_commit_to_non_finalized_state(body.prepare(), None));
+            let child =
+                state.queue_and_commit_to_non_finalized_state(chain[4].clone().prepare(), None);
+            let wait = state.call(Request::AwaitBlockInfo(hash));
+            timeout(
+                limit,
+                state.queue_and_commit_to_non_finalized_state(chain[2].clone().prepare(), None),
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+
+            for (index, response) in responses.into_iter().enumerate() {
+                let error = timeout(limit, response)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap_err();
+                if (index == 0) == invalid_first {
+                    assert!(
+                        matches!(
+                            error.inner(),
+                            CommitBlockError::ValidateContextError(error)
+                                if matches!(**error, ValidateContextError::AddValuePool {
+                                    value_balance_error: ValueBalanceError::Total(_), ..
+                                })
+                        ),
+                        "expected chain-insertion failure: {error:?}"
+                    );
+                    assert_eq!(
+                        error.inner().body_verification_class(),
+                        BodyVerificationClass::ConsensusInvalid(BodyRuleId::new(
+                            "context.add_value_pool"
+                        ))
+                    );
+                } else {
+                    assert!(
+                        matches!(
+                            error.inner().body_verification_class(),
+                            BodyVerificationClass::PayloadMismatch(_)
+                        ),
+                        "expected the altered body's commitment mismatch: {error:?}"
+                    );
+                }
+            }
+
+            state.drain_non_finalized_write_updates();
+            assert_eq!(
+                state.non_finalized_failed_ancestors.get(&hash),
+                Some(&(hash, NonFinalizedWriteFailureKind::Invalid)),
+                "deterministic invalidity wins in either arrival order"
+            );
+            let error = timeout(limit, child).await.unwrap().unwrap().unwrap_err();
+            assert!(
+                matches!(
+                    error.inner(),
+                    CommitBlockError::ValidateContextError(error)
+                        if matches!(**error, ValidateContextError::InvalidAncestorBlock(ancestor) if ancestor == hash)
+                ),
+                "the descendant inherits its parent's invalidity: {error:?}"
+            );
+            assert_eq!(
+                await_block_info_error(
+                    timeout(limit, wait)
+                        .await
+                        .expect("rejection wakes the reader")
+                ),
+                crate::AwaitBlockInfoError::Rejected { hash }
+            );
+            assert_eq!(state.best_tip(), Some((Height(2), chain[2].hash())));
         }
     }
 }

@@ -2958,7 +2958,7 @@ impl WriteBlockWorkerTask {
             let parent_hash = first.block.header.previous_block_hash;
             let rejected_ancestor_hash = rejected_ancestor_map.get(&parent_hash).copied();
             let mut variants = queued_variants.into_iter().peekable();
-            let mut any_retryable_failure = false;
+            let mut any_invalid_failure = false;
             let (rsp_tx, result) = loop {
                 let (queued_child, rsp_tx, admission, _) = variants
                     .next()
@@ -3063,9 +3063,9 @@ impl WriteBlockWorkerTask {
                 if result.is_ok() || variants.peek().is_none() {
                     break (rsp_tx, result);
                 }
-                any_retryable_failure |= result.as_ref().is_err_and(|error| {
+                any_invalid_failure |= result.as_ref().is_err_and(|error| {
                     NonFinalizedWriteFailureKind::from_error(error)
-                        == NonFinalizedWriteFailureKind::Retryable
+                        == NonFinalizedWriteFailureKind::Invalid
                 });
                 // A rejected body does not reject the header while another body can still commit.
                 let _ = rsp_tx.send(result.map(|()| child_hash).map_err(Into::into));
@@ -3076,8 +3076,10 @@ impl WriteBlockWorkerTask {
             //       and send the result on rsp_tx here
 
             if let Err(error) = &result {
-                let failure_kind = if any_retryable_failure {
-                    NonFinalizedWriteFailureKind::Retryable
+                // A deterministic contextual failure applies to every same-header variant.
+                // Payload mismatches alone leave room for a valid replacement.
+                let failure_kind = if any_invalid_failure {
+                    NonFinalizedWriteFailureKind::Invalid
                 } else {
                     NonFinalizedWriteFailureKind::from_error(error)
                 };

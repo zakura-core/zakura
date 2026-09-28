@@ -34,10 +34,13 @@ its parent. Every body counts against the existing global queue limit. Identical
 retries replace their response channel and keep their original receipt. Distinct
 bodies keep separate receipts until contextual validation finds a valid body.
 Rejecting one body does not reject the header or its children while another
-retained body can still commit. If writer capacity rejects a group, its queued
-descendants are released with a retryable error as well. A duplicate in the queue
-or writer is retryable until committed state confirms the block. Native body sync
-must not treat that pending write as verified evidence.
+retained body can still commit. If all variants fail, a deterministic contextual
+failure rejects the header and wakes waiting readers even if another variant
+had a payload mismatch. Payload mismatches alone remain retryable. If writer
+capacity rejects a group, its queued descendants are released with a retryable
+error as well. A duplicate in the queue or writer is retryable until committed
+state confirms the block. Native body sync must not treat that pending write as
+verified evidence.
 
 For example, A arrives before B, but B finishes verification first. Mining can
 briefly use B while A is unverified. Once A passes, equal-work selection chooses

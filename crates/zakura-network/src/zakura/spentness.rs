@@ -1,7 +1,7 @@
 //! Bounded peer transfer of whole-file authenticated spentness artifacts.
 //!
 //! - `wire`: range request and response encoding.
-//! - `server`: serving verified artifacts under a shared rate limit.
+//! - `server`: serving verified artifacts under node and per-peer byte rates.
 //! - `cache`: content-addressed files that are reverified on every load.
 //! - `download`: resumable single-source acquisition with whole-file verification.
 //!
@@ -13,7 +13,8 @@ use std::{path::PathBuf, sync::Arc};
 use zakura_chain::parameters::spentness_hints::Commitment;
 
 use super::{
-    CustomService, Frame, MessageRole, MessageRule, PayloadLen, Stream, ZakuraServiceId,
+    CustomService, MessageRole, MessageRule, PayloadLen, Stream, ZakuraServiceId,
+    FRAME_HEADER_BYTES,
 };
 use crate::BoxError;
 
@@ -33,8 +34,9 @@ pub const STREAM_KIND: u16 = 8;
 pub const CAPABILITY: u64 = 1 << 6;
 const SERVICE_ID: &str = "zakura.spentness.v1";
 const PROTOCOL_VERSION: u16 = 1;
-/// Frame limit: one full range plus room for the response header.
-const FRAME_CAP: u32 = RANGE_BYTES + 64;
+/// Frame limit: one full range, the response header, and the frame header.
+// The cast is safe because both header lengths are small constants.
+const FRAME_CAP: u32 = RANGE_BYTES + (wire::RESPONSE_HEADER_LEN + FRAME_HEADER_BYTES) as u32;
 const GET_RANGE_RULE: MessageRule = MessageRule {
     message_type: GET_RANGE,
     payload: PayloadLen::exact(wire::REQUEST_LEN),
@@ -65,14 +67,19 @@ const STREAMS: &[Stream] = &[Stream {
 
 /// Load supported cache entries and prepare protocol negotiation and discovery.
 ///
-/// The node seeks the service when it recognizes any commitment, and provides
-/// it only when the cache already holds a verified artifact.
+/// `supported` must exclude revoked commitments, because the node downloads,
+/// serves, and advertises exactly these artifacts. The node provides the
+/// service when the cache already holds a verified artifact. It seeks the
+/// service only while a supported artifact is missing, so a node that holds
+/// every artifact does not bias its dialing toward providers.
 pub async fn prepare(
     cache: PathBuf,
-    commitments: &'static [Commitment],
+    supported: &[Commitment],
 ) -> Result<(Arc<ArtifactService>, CustomService), BoxError> {
+    let commitments = supported.to_vec();
     let artifacts =
-        tokio::task::spawn_blocking(move || cache::load_supported(&cache, commitments)).await?;
+        tokio::task::spawn_blocking(move || cache::load_supported(&cache, &commitments)).await?;
+    let missing = artifacts.len() < supported.len();
     let service = Arc::new(ArtifactService::new(artifacts));
     let id = ZakuraServiceId::new(SERVICE_ID)?;
     let custom = CustomService {
@@ -81,17 +88,9 @@ pub async fn prepare(
             .then(|| id.clone())
             .into_iter()
             .collect(),
-        seeks: (!commitments.is_empty())
-            .then_some(id)
-            .into_iter()
-            .collect(),
+        seeks: missing.then_some(id).into_iter().collect(),
     };
     Ok((service, custom))
-}
-
-/// Validate the single bounded response before the transport stores it.
-pub(crate) fn validate_response(frame: &Frame) -> Result<(), BoxError> {
-    wire::RangeResponse::parse(frame).map(|_| ())
 }
 
 #[cfg(test)]
@@ -123,6 +122,50 @@ mod tests {
         }
         fn add_peer(&self, _peer: Peer) {}
         fn remove_peer(&self, _peer: &ZakuraPeerId, _conn: ZakuraConnId) {}
+    }
+
+    /// Publish a verified artifact at `terminal_height` into `cache`.
+    fn cached_artifact(
+        cache: &std::path::Path,
+        terminal_height: u32,
+    ) -> Result<Commitment, BoxError> {
+        let bytes = encode([1; 32], terminal_height, [2; 32], [false, true])?;
+        let parsed = ParsedArtifact::read(bytes.as_slice())?;
+        let commitment = parsed.commitment().clone();
+        publish(cache, &parsed.verify(&commitment)?)?;
+        Ok(commitment)
+    }
+
+    #[tokio::test]
+    async fn only_supported_artifacts_are_served_and_advertised() -> Result<(), BoxError> {
+        let cache = tempfile::tempdir()?;
+        let supported = cached_artifact(cache.path(), 1)?;
+        let revoked = cached_artifact(cache.path(), 2)?;
+
+        // The caller leaves the revoked commitment out of the supported set.
+        let (service, custom) =
+            prepare(cache.path().to_owned(), std::slice::from_ref(&supported)).await?;
+        assert_eq!(service.available(), vec![supported.sha256]);
+        assert!(!service.contains(&revoked.sha256));
+        assert_eq!(custom.provides, vec![ZakuraServiceId::new(SERVICE_ID)?]);
+        assert!(
+            custom.seeks.is_empty(),
+            "a node holding every artifact does not seek"
+        );
+
+        // A missing supported artifact makes the node seek providers.
+        let missing = Commitment {
+            sha256: [9; DIGEST_LEN],
+            ..supported.clone()
+        };
+        let (_, custom) = prepare(cache.path().to_owned(), &[supported.clone(), missing]).await?;
+        assert_eq!(custom.seeks, vec![ZakuraServiceId::new(SERVICE_ID)?]);
+
+        // A node without supported artifacts serves and advertises nothing.
+        let (service, custom) = prepare(cache.path().to_owned(), &[]).await?;
+        assert!(service.is_empty());
+        assert!(custom.provides.is_empty() && custom.seeks.is_empty());
+        Ok(())
     }
 
     #[tokio::test]

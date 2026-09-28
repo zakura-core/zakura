@@ -100,23 +100,39 @@ offset, length, and at most 256 KiB. The capability advertises protocol support.
 Status values distinguish absent (0), available (1), busy (2), insufficient
 response capacity (3), and a range outside the artifact (4). Negative responses
 echo the digest and offset with length zero. These statuses do not penalize peers.
-The discovery service advertises availability only when startup loaded a verified
-artifact. Nodes can serve newly verified bytes immediately; they advertise those
-new cache entries after restart.
+The stream declares its message table, whose only response ends the exchange.
+The requester therefore admits exactly one response. It closes the connection on
+a second or missing response.
 
-The server admits at most four concurrent range preparations. Each successful
-preparation holds its slot for 250 ms, limiting aggregate data to 4 MiB/s.
+Distribution uses only supported commitments: release commitments minus
+`REVOKED_COMMITMENTS`. A node never downloads, serves, or advertises a revoked
+artifact. The discovery service advertises availability only when startup loaded
+a verified artifact. It seeks the service only when startup found a supported
+artifact missing. Nodes can serve newly verified bytes immediately; they advertise
+those new cache entries after restart.
+
+The server bounds serving with two byte token buckets. The node bucket allows
+8 MiB/s across all peers. Each peer bucket allows 2 MiB/s, so one peer takes at
+most a quarter of the node rate. Each bucket holds one second of its rate. A
+request that either bucket cannot cover gets an immediate busy reply. The server
+never delays a reply, so an idle server answers at transport speed.
 The transport also applies its stream, frame, message, and connection limits.
-Unavailable or busy servers return availability failure without a peer penalty.
 
-The downloader selects peers that negotiated the capability. It tries at most
-three sources per round, one source at a time. It rotates sources between rounds.
-It reduces the requested range when the peer reports insufficient response capacity.
-It retains interrupted progress under names
-that bind the expected digest and peer identity. It checks every returned range
-and verifies the complete file before durable cache publication. A whole-file
-mismatch discards that source's partial file. It does not attribute a whole-file
-mismatch to an individual chunk or disconnect the peer.
+The downloader selects peers that negotiated the capability. It tries one source
+at a time and rotates sources between rounds. At most three sources per round may
+transfer bytes. A source that replies absent before it transfers bytes does not
+count. A busy reply pauses the same source for 125 ms to 2 s, then retries the same
+range. The downloader reduces the requested range when the peer reports
+insufficient response capacity.
+
+The downloader retains interrupted progress under names that bind the expected
+digest and peer identity. It keeps at most three partial files per digest and
+deletes the shortest ones first. It checks every returned range and verifies the
+complete file before durable cache publication. Success deletes every partial file
+for that digest. Startup deletes partial files for digests that are held or
+unsupported. A whole-file mismatch, a format error, or a truncated file discards
+that source's partial file. A local read error keeps it. The downloader does not
+attribute a whole-file mismatch to an individual chunk or disconnect the peer.
 
 Enable artifact distribution explicitly:
 
@@ -127,8 +143,9 @@ spentness_cache_dir = "/data/zakura/spentness"
 
 The startup task waits up to 60 seconds for a capable peer, then makes bounded
 acquisition attempts. It retries missing artifacts after a 60-second pause until
-acquisition succeeds or the endpoint shuts down. Each source has a ten-minute
-deadline. An unavailable artifact does not block ordinary sync.
+acquisition succeeds or the endpoint shuts down. The first failure for each
+artifact logs a warning; later failures log at debug level. Each source has a
+ten-minute deadline. An unavailable artifact does not block ordinary sync.
 Supported historical cache entries also remain available for serving.
 
 For offline or seed provisioning, use a binary that contains the reviewed pin:

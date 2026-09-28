@@ -2986,12 +2986,8 @@ where
                 // Changes are also ignored in any clones made after the mark.
                 latest_chain_tip.mark_best_tip_seen();
 
-                // Fetch the state data and local time for the block template:
-                // - if the tip block hash changes, we must return from long polling,
-                // - if the local clock changes on testnet, we might return from long polling
-                //
-                // We always return after 90 minutes on mainnet, even if we have the same response,
-                // because the max time has been reached.
+                // Fetch the state data and local time for the block template.
+                // A new tip or reaching the maximum timestamp ends long polling.
                 let chain_info @ zakura_state::GetBlockTemplateChainInfo {
                     tip_hash,
                     tip_height,
@@ -3040,9 +3036,7 @@ where
                 // - the server long poll ID is different to the client long poll ID, or
                 // - the previous loop iteration waited until the max time.
                 if Some(&server_long_poll_id) != client_long_poll_id.as_ref() || max_time_reached {
-                    // On testnet, the max time changes the block difficulty, so old shares are invalid.
-                    // On mainnet, this means there has been 90 minutes without a new block or mempool
-                    // transaction, which is very unlikely. So the miner should probably reset anyway.
+                    // Refresh work at its maximum consensus timestamp.
                     let submit_old = if max_time_reached {
                         Some(false)
                     } else {
@@ -3121,9 +3115,7 @@ where
                     Ok::<_, ErrorObject<'static>>(precomputed_coinbase)
                 };
 
-                // Wait for the maximum block time to elapse. This can change the block header
-                // on testnet. (On mainnet it can happen due to a network disconnection, or a
-                // rapid drop in hash rate.)
+                // Wait for the maximum consensus timestamp to elapse.
                 //
                 // This duration might be slightly lower than the actual maximum,
                 // if cur_time was clamped to min_time. In that case the wait is very long,

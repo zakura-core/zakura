@@ -694,12 +694,12 @@ pub struct GetBlockTemplateChainInfo {
     /// Always depends on the local clock and the `tip_hash`.
     pub cur_time: DateTime32,
 
-    /// The mininimum time the miner can use in this block.
-    /// Depends on the `tip_hash`, and the local clock on testnet.
+    /// The minimum consensus timestamp for the candidate block.
+    /// Depends on the [`tip_hash`](Self::tip_hash).
     pub min_time: DateTime32,
 
-    /// The maximum time the miner can use in this block.
-    /// Depends on the `tip_hash`, and the local clock on testnet.
+    /// The maximum consensus timestamp for the candidate block.
+    /// Depends on the [`tip_hash`](Self::tip_hash).
     pub max_time: DateTime32,
 
     /// The chain value pools as of the end of the chain tip block.

@@ -307,15 +307,10 @@ pub struct BlockTemplateResponse {
     ///
     /// <https://en.bitcoin.it/wiki/BIP_0023#Mutations>
     ///
-    /// Zebra adjusts the minimum and current times for testnet minimum difficulty blocks,
-    /// so we need to tell miners what the maximum valid time is.
-    ///
-    /// This field is not in `zcashd` or the Zcash RPC reference yet.
-    ///
-    /// Currently, some miners just use `min_time` or `cur_time`. Others calculate `max_time` from the
-    /// fixed 90 minute consensus rule, or a smaller fixed interval (like 1000s).
-    /// Some miners don't check the maximum time. This can cause invalid blocks after network downtime,
-    /// a significant drop in the hash rate, or after the testnet minimum difficulty interval.
+    /// This is the consensus upper bound on the block timestamp. On testnet,
+    /// changing the timestamp across the minimum difficulty timeout can also
+    /// change the required difficulty. Miners must obtain a new template when
+    /// that happens.
     #[serde(rename = "maxtime")]
     #[getter(copy)]
     pub(crate) max_time: DateTime32,

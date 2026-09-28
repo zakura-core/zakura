@@ -211,7 +211,6 @@ impl LongPollId {
     /// because newer transactions don't have to be included in the old shares.
     ///
     /// But if the chain tip has changed, the block header has changed, so old shares are invalid.
-    /// (And if the max time has changed on testnet, the block header has changed.)
     pub fn submit_old(&self, old_long_poll_id: &LongPollId) -> bool {
         self.same_work_context(old_long_poll_id) && self.revision == old_long_poll_id.revision
     }

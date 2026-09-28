@@ -215,8 +215,7 @@ unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 
 # List of URLs for allowed Git repositories
-# Temporary common PR #505 pin in [patch.crates-io].
-allow-git = ["https://github.com/zakura-core/common"]
+allow-git = []
 
 [sources.allow-org]
 github = [

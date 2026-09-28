@@ -8,8 +8,6 @@ use crate::{
     serialization::arbitrary::datetime_u32,
 };
 
-const NU_BEFORE_BLOSSOM: NetworkUpgrade = NetworkUpgrade::Sapling;
-
 proptest! {
     /// Test network chain tip height estimation.
     ///
@@ -23,10 +21,6 @@ proptest! {
         time_displacement_factor in 0.0..1.0_f64,
     ) {
         let (chain_tip, mock_chain_tip_sender) = MockChainTip::new();
-        let blossom_activation_height = NetworkUpgrade::Blossom
-            .activation_height(&network)
-            .expect("Blossom activation height is missing");
-
         block_heights.sort();
         let current_height = block_heights[0];
         let network_height = block_heights[1];
@@ -35,18 +29,7 @@ proptest! {
         mock_chain_tip_sender.send_best_tip_block_time(current_block_time);
 
         let estimated_time_difference =
-            // Estimate time difference for heights before Blossom activation.
-            estimate_time_difference(
-                current_height.min(blossom_activation_height),
-                network_height.min(blossom_activation_height),
-                NU_BEFORE_BLOSSOM,
-            )
-            // Estimate time difference for heights after Blossom activation.
-            + estimate_time_difference(
-                current_height.max(blossom_activation_height),
-                network_height.max(blossom_activation_height),
-                NetworkUpgrade::Blossom,
-            );
+            estimate_time_difference(&network, current_height, network_height);
 
         let time_displacement = calculate_time_displacement(
             time_displacement_factor,
@@ -63,21 +46,34 @@ proptest! {
 }
 
 /// Estimate the time necessary for the chain to progress from `start_height` to `end_height`,
-/// assuming each block is produced at exactly the number of seconds of the target spacing for the
-/// `active_network_upgrade`.
+/// assuming each block is produced at exactly its height-dependent target spacing.
 fn estimate_time_difference(
+    network: &Network,
     start_height: block::Height,
     end_height: block::Height,
-    active_network_upgrade: NetworkUpgrade,
 ) -> Duration {
-    let spacing_seconds = active_network_upgrade.target_spacing().num_seconds();
-    let height_difference = end_height - start_height;
-
-    if height_difference > 0 {
-        Duration::seconds(height_difference * spacing_seconds)
-    } else {
-        Duration::zero()
+    if end_height <= start_height {
+        return Duration::zero();
     }
+    let mut segment_start = start_height
+        .next()
+        .expect("an end height above the start means the start is below Height::MAX");
+    let mut segment_spacing =
+        NetworkUpgrade::target_spacing_for_height(network, start_height).num_seconds();
+    let mut elapsed_seconds = 0;
+
+    for (change_height, next_spacing) in NetworkUpgrade::target_spacings(network) {
+        if change_height < segment_start {
+            segment_spacing = next_spacing.num_seconds();
+        } else if change_height <= end_height {
+            elapsed_seconds += (change_height - segment_start) * segment_spacing;
+            segment_start = change_height;
+            segment_spacing = next_spacing.num_seconds();
+        }
+    }
+
+    elapsed_seconds += (end_height - segment_start + 1) * segment_spacing;
+    Duration::seconds(elapsed_seconds)
 }
 
 /// Use `displacement` to get a displacement duration between zero and the target spacing of the

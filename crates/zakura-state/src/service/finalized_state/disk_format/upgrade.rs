@@ -37,6 +37,7 @@ pub(crate) mod cache_genesis_roots;
 pub(crate) mod drop_header_root_auth_frontier;
 pub(crate) mod fix_tree_key_type;
 pub(crate) mod no_migration;
+pub(crate) mod nsm_value_balance_pool;
 pub(crate) mod prune_trees;
 pub(crate) mod unauthenticated_commitment_roots;
 
@@ -144,11 +145,16 @@ fn format_upgrades(
         )),
         Box::new(drop_header_root_auth_frontier::Upgrade),
         Box::new(unauthenticated_commitment_roots::Upgrade),
+        Box::new(nsm_value_balance_pool::Upgrade),
+        Box::new(no_migration::NoMigration::new(
+            "add Zakura header auxiliary body size corrections",
+            Version::new(29, 1, 0),
+        )),
         Box::new(no_migration::NoMigration::new(
             "guard incomplete spentness construction from older binaries",
-            Version::new(29, 0, 0),
+            Version::new(30, 0, 0),
         )),
-    ] as [Box<dyn DiskFormatUpgrade>; 11])
+    ] as [Box<dyn DiskFormatUpgrade>; 13])
         .into_iter()
         .filter(move |upgrade| upgrade.version() > min_version())
 }
@@ -252,6 +258,9 @@ pub enum FormatChangeError {
     /// A migration or final format check found an invalid postcondition.
     #[error("database format migration postcondition failed: {0}")]
     InvalidPostcondition(String),
+    /// A migration cannot repair the existing records, so the state must be synced again.
+    #[error("delete the state database and sync again: {0}")]
+    ResyncRequired(String),
 }
 
 impl From<CancelFormatChange> for FormatChangeError {
@@ -1119,7 +1128,7 @@ fn vct_format_changes_include_root_auth_metadata_updates() {
 
     let upgrades: Vec<_> = format_upgrades(Some(Version::new(27, 3, 0))).collect();
 
-    assert_eq!(upgrades.len(), 7);
+    assert_eq!(upgrades.len(), 9);
     assert_eq!(upgrades[0].version(), Version::new(28, 0, 0));
     assert_eq!(upgrades[1].version(), Version::new(28, 0, 1));
     assert_eq!(upgrades[2].version(), Version::new(28, 0, 2));
@@ -1127,11 +1136,17 @@ fn vct_format_changes_include_root_auth_metadata_updates() {
     assert_eq!(upgrades[4].version(), Version::new(28, 1, 4));
     assert_eq!(upgrades[5].version(), Version::new(28, 1, 5));
     assert_eq!(upgrades[6].version(), Version::new(29, 0, 0));
-    assert!(upgrades[6].is_reusable_major_upgrade());
-    assert!(!upgrades[6].needs_migration());
+    assert_eq!(upgrades[7].version(), Version::new(29, 1, 0));
+    assert_eq!(upgrades[8].version(), Version::new(30, 0, 0));
+    assert!(upgrades[8].is_reusable_major_upgrade());
+    assert!(!upgrades[8].needs_migration());
     assert!(
         !upgrades[3].needs_migration(),
         "the header-chain column families are created on open without rebasing authenticated roots"
+    );
+    assert!(
+        !upgrades[7].needs_migration(),
+        "the sparse body size correction column family is created on open"
     );
     let mut current_schema_version = state_database_format_version_in_code();
     current_schema_version.build = semver::BuildMetadata::EMPTY;

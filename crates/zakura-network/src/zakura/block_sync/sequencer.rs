@@ -350,6 +350,14 @@ impl Sequencer {
         )
     }
 
+    /// Includes detached submissions so a late response cannot replace live work.
+    pub(super) fn already_retains(&self, height: block::Height, hash: block::Hash) -> bool {
+        height <= self.body_download_floor
+            || self.reorder.contains(height)
+            || self.applying.contains_key(&height)
+            || self.has_submitted_apply(height, hash)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(super) fn accept_buffered_body(
         &mut self,
@@ -362,11 +370,7 @@ impl Sequencer {
         bytes: u64,
         source_peer: ZakuraPeerId,
     ) -> AcceptOutcome {
-        if height <= self.body_download_floor
-            || self.reorder.contains(height)
-            || self.applying.contains_key(&height)
-            || self.has_submitted_apply(height, hash)
-        {
+        if self.already_retains(height, hash) {
             return AcceptOutcome::Redundant {
                 release_bytes: bytes,
             };
@@ -610,6 +614,25 @@ impl Sequencer {
         if entries.is_empty() {
             self.submitted_applies.remove(&height);
         }
+    }
+
+    /// Read the cached wire size only for the exact live submission identity.
+    /// The record survives applying-queue cleanup until its completion arrives.
+    #[cfg(feature = "sync-metrics")]
+    pub(super) fn submission_bytes(
+        &self,
+        owner: zakura_header_chain::BodyWorkOwner,
+        source: zakura_header_chain::SourceId,
+        token: BlockApplyToken,
+        height: block::Height,
+        hash: block::Hash,
+    ) -> Option<u64> {
+        let submission = self.in_flight_submissions.get(&token)?;
+        (submission.owner == owner
+            && submission.source == source
+            && submission.height == height
+            && submission.hash == hash)
+            .then_some(submission.bytes)
     }
 
     /// Release one driver-retained decoded submission only when its completion

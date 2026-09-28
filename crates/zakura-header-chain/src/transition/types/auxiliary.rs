@@ -231,6 +231,8 @@ pub struct AuxDelivery {
     pub owner: HeaderSyncWorkOwner,
     /// Advisory bounded body size.
     pub body_size: BodySizeHint,
+    /// Size filled in when `body_size` was unknown. Never part of verification provenance.
+    scheduling_body_size: Option<NonZeroU32>,
     /// Complete schema-1 record retained for later one-header-later authentication.
     pub tree_aux: Option<TreeAuxRecordV1>,
     outcome: AuxOutcome,
@@ -252,9 +254,36 @@ impl AuxDelivery {
             source,
             owner,
             body_size,
+            scheduling_body_size: None,
             tree_aux,
             outcome: AuxOutcome::unauthenticated(),
         }
+    }
+
+    /// Return a scheduling correction, stored separately from the original evidence.
+    pub const fn scheduling_body_size(self) -> Option<NonZeroU32> {
+        self.scheduling_body_size
+    }
+
+    /// Attach bounded advisory scheduling metadata without changing verification evidence.
+    /// Header admission only uses it to fill a matching semantic delivery's unknown size.
+    pub fn with_scheduling_body_size(mut self, hint: BodySizeHint) -> Self {
+        if let BodySizeHint::Known(size) = hint {
+            self.scheduling_body_size = Some(size);
+        }
+        self
+    }
+
+    /// Return the original evidence without its mutable scheduling correction.
+    pub fn without_scheduling_body_size(mut self) -> Self {
+        self.scheduling_body_size = None;
+        self
+    }
+
+    /// Return the current scheduling size, falling back to the original delivery.
+    pub fn effective_body_size(self) -> BodySizeHint {
+        self.scheduling_body_size
+            .map_or(self.body_size, BodySizeHint::Known)
     }
 
     /// Return the semantic payload identity without transport ownership or body-size metadata.
@@ -285,6 +314,23 @@ impl AuxDelivery {
     /// Return whether integrated verification disputed this delivery.
     pub fn is_disputed(self) -> bool {
         self.outcome().status() == AuxOutcomeStatus::Disputed
+    }
+
+    /// The advisory body size to schedule against from one header's retained deliveries:
+    /// the non-rejected delivery with a known size, preferring authenticated deliveries and
+    /// then the smallest `delivery_id`. `None` when no retained delivery knows the size.
+    /// Scheduling-only: verification never consults it.
+    pub fn advertised_body_size(deliveries: &[Self]) -> Option<NonZeroU32> {
+        deliveries
+            .iter()
+            .copied()
+            .filter(|delivery| !delivery.is_rejected())
+            .filter_map(|delivery| match delivery.effective_body_size() {
+                BodySizeHint::Known(size) => Some((delivery, size)),
+                BodySizeHint::Unknown => None,
+            })
+            .min_by_key(|(delivery, _)| (!delivery.is_authenticated(), delivery.delivery_id))
+            .map(|(_, size)| size)
     }
 
     /// Return the derived boundary, when an observation changed this delivery.
@@ -383,6 +429,12 @@ impl UntrustedAuxDeliveryRow {
     /// Return the unauthenticated delivery fields.
     pub const fn delivery(self) -> AuxDelivery {
         self.delivery
+    }
+
+    /// Attach the separately persisted scheduling correction during recovery.
+    pub fn with_scheduling_body_size(mut self, hint: BodySizeHint) -> Self {
+        self.delivery = self.delivery.with_scheduling_body_size(hint);
+        self
     }
 
     /// Return the raw durable outcome status code.

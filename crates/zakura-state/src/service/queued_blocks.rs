@@ -88,7 +88,7 @@ impl QueuedBlocks {
     ///
     /// The caller must check [`Self::can_queue`] before adding a body. An identical
     /// retry replaces its response channel but preserves its original receipt.
-    #[instrument(skip(self), fields(height = ?new.0.height, hash = %new.0.hash))]
+    #[instrument(skip(self, new), fields(height = ?new.0.height, hash = %new.0.hash))]
     pub fn queue(&mut self, mut new: QueuedSemanticallyVerified) {
         let new_hash = new.0.hash;
         let new_height = new.0.height;

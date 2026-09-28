@@ -2,6 +2,7 @@
 
 mod prop;
 mod vectors;
+mod zip218_funding_streams;
 
 use color_eyre::Report;
 
@@ -51,6 +52,43 @@ fn funding_stream_period_uses_floor_division_for_negative_periods() {
     assert_eq!(0, funding_stream_address_period(Height(50), &parameters));
     assert_eq!(-1, funding_stream_address_period(Height(49), &parameters));
     assert_eq!(-2, funding_stream_address_period(Height(39), &parameters));
+
+    // With NU7 at 40, heights from 40 on use ZIP 218's case:
+    // floor((3 · (40 + 50 − 100) + (height − 40)) / 30).
+    struct Nu7TestParameters;
+
+    impl ParameterSubsidy for Nu7TestParameters {
+        fn height_for_first_halving(&self) -> Height {
+            TestParameters.height_for_first_halving()
+        }
+
+        fn post_blossom_halving_interval(&self) -> HeightDiff {
+            TestParameters.post_blossom_halving_interval()
+        }
+
+        fn pre_blossom_halving_interval(&self) -> HeightDiff {
+            TestParameters.pre_blossom_halving_interval()
+        }
+
+        fn funding_stream_address_change_interval(&self) -> HeightDiff {
+            TestParameters.funding_stream_address_change_interval()
+        }
+
+        fn nu7_activation_height(&self) -> Option<Height> {
+            Some(Height(40))
+        }
+
+        fn initial_nsm_value_balance(&self) -> Amount<NonNegative> {
+            Amount::zero()
+        }
+    }
+
+    let parameters = Nu7TestParameters;
+
+    assert_eq!(-2, funding_stream_address_period(Height(39), &parameters));
+    assert_eq!(-1, funding_stream_address_period(Height(40), &parameters));
+    assert_eq!(-1, funding_stream_address_period(Height(69), &parameters));
+    assert_eq!(0, funding_stream_address_period(Height(70), &parameters));
 }
 
 /// Regtest derives its first halving, so NU7's 25 second spacing moves it.
@@ -76,19 +114,22 @@ fn regtest_first_halving_follows_the_target_spacing() {
         "the first halving matches the subsidy schedule"
     );
 
-    // Funding stream recipients rotate on period boundaries aligned to the
-    // derived first halving, which starts period 48.
+    // NU7 activates before the derived first halving, so every block uses ZIP 218's
+    // post-NU7 address period, `floor((3 · (A + I − F) + (h − A)) / (3 · C))` with
+    // A = 1, I = 288, F = 859, and C = 6. That is `-95 + floor((h − 1) / 18)`: it
+    // rotates once every 18 blocks, counted from NU7 activation.
     let period = |height: Height| funding_stream_address_period(height, &nu7_regtest);
-    let interval = nu7_regtest.funding_stream_address_change_interval();
-    assert_eq!(period(first_halving), 48);
+    assert_eq!(nu7_regtest.funding_stream_address_change_interval(), 6);
+    assert_eq!(period(Height(1)), -95);
+    assert_eq!(period(Height(18)), -95);
+    assert_eq!(period(Height(19)), -94);
     assert_eq!(
         period((first_halving - 1).expect("the test height is valid")),
-        47
+        -48
     );
-    assert_eq!(
-        period((first_halving + interval).expect("the test height is valid")),
-        49
-    );
+    assert_eq!(period(first_halving), -48);
+    assert_eq!(period(Height(864)), -48);
+    assert_eq!(period(Height(865)), -47);
 }
 
 #[test]

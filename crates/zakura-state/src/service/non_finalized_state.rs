@@ -29,6 +29,7 @@ use crate::{
 
 mod backup;
 mod chain;
+mod created_utxos;
 
 #[cfg(test)]
 pub(crate) use backup::MIN_DURATION_BETWEEN_BACKUP_UPDATES;
@@ -38,6 +39,7 @@ mod tests;
 
 pub(crate) use backup::write_semantically_verified_backup_block;
 pub(crate) use chain::{Chain, SpendingTransactionId};
+pub(crate) use created_utxos::CreatedUtxos;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ContextualMetrics {
@@ -477,7 +479,7 @@ impl NonFinalizedState {
 
             // Add the new chain fork or updated chain to the set of recent chains, and
             // remove the chain containing the hash of the block from chain set
-            self.insert_with(Arc::new(new_chain.clone()), |chain_set| {
+            self.insert_with(Arc::new(new_chain), |chain_set| {
                 chain_set.retain(|c| !c.contains_block_hash(block_hash))
             });
 
@@ -780,7 +782,10 @@ impl NonFinalizedState {
 
     /// Validate `contextual` and update `new_chain`, doing CPU-intensive work in parallel batches.
     #[allow(clippy::unwrap_in_result)]
-    #[tracing::instrument(skip(new_chain, sprout_final_treestates))]
+    #[tracing::instrument(
+        skip(new_chain, contextual, sprout_final_treestates),
+        fields(height = ?contextual.height, hash = %contextual.hash)
+    )]
     fn validate_and_update_parallel(
         new_chain: Arc<Chain>,
         contextual: ContextuallyVerifiedBlock,

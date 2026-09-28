@@ -162,6 +162,56 @@ async fn subsidy_lookup_preserves_success_and_service_errors() {
     }
 }
 
+/// `getblocksubsidy` reports the ZIP 214 Revision 2 streams until ZIP 218 moves the third
+/// halving, which is 4,656,000 on Testnet with NU7 at 4,386,000.
+#[tokio::test]
+async fn subsidy_reports_revision_2_streams_until_the_zip_218_third_halving() {
+    let mut activation_heights: ConfiguredActivationHeights = Network::new_default_testnet()
+        .parameters()
+        .expect("Testnet has parameters")
+        .activation_heights()
+        .into();
+    activation_heights.nu7 = Some(4_386_000);
+    let network = zakura_chain::parameters::testnet::Parameters::build()
+        .with_activation_heights(activation_heights)
+        .expect("activation heights are valid")
+        .to_network()
+        .expect("configured network is valid");
+
+    // A zero NSM value balance adds no reissuance to the block subsidy.
+    let read = tower::service_fn(|request| async move {
+        assert!(matches!(request, ReadRequest::BlockInfo(_)));
+        Ok::<_, BoxError>(ReadResponse::BlockInfo(Some(BlockInfo::new(
+            Default::default(),
+            0,
+        ))))
+    });
+    let (tip, _) = MockChainTip::new();
+    let (rpc, _) = rpc(network, MockService::build().for_unit_tests(), read, tip);
+    let zatoshis = |zec: Zec<zakura_chain::amount::NonNegative>| i64::from(zec);
+
+    // 4,476,000 is the third halving before ZIP 218.
+    for height in [4_476_000, 4_655_999] {
+        let subsidy = rpc
+            .get_block_subsidy(Some(height))
+            .await
+            .expect("the subsidy is available");
+        assert_eq!(zatoshis(subsidy.total_block_subsidy()), 52_083_333);
+        assert_eq!(zatoshis(subsidy.funding_streams_total()), 4_166_666);
+        assert_eq!(zatoshis(subsidy.lockbox_total()), 6_249_999);
+        assert_eq!(zatoshis(subsidy.miner()), 41_666_668);
+    }
+
+    let subsidy = rpc
+        .get_block_subsidy(Some(4_656_000))
+        .await
+        .expect("the subsidy is available");
+    assert_eq!(zatoshis(subsidy.total_block_subsidy()), 26_041_666);
+    assert_eq!(zatoshis(subsidy.funding_streams_total()), 0);
+    assert_eq!(zatoshis(subsidy.lockbox_total()), 0);
+    assert_eq!(zatoshis(subsidy.miner()), 26_041_666);
+}
+
 #[tokio::test]
 async fn subsidy_before_activation_does_not_read_parent() {
     let (tip, _) = MockChainTip::new();

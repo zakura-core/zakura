@@ -188,12 +188,21 @@ pub struct ParsedArtifact {
 
 impl ParsedArtifact {
     /// Read a bounded artifact, rejecting truncation and trailing bytes.
-    pub fn read(mut source: impl Read) -> Result<Self, Error> {
+    pub fn read(source: impl Read) -> Result<Self, Error> {
+        Self::read_expecting(source, None)
+    }
+
+    /// Read an artifact, rejecting a header whose length differs from `expected_len`
+    /// before allocating.
+    fn read_expecting(mut source: impl Read, expected_len: Option<u64>) -> Result<Self, Error> {
         let mut header = [0; HEADER_LEN];
         source.read_exact(&mut header)?;
         let parsed_header = Header::parse(&header)?;
         let output_count = parsed_header.output_count;
         let byte_len = artifact_len(output_count)?;
+        if expected_len.is_some_and(|expected_len| expected_len != byte_len) {
+            return Err(Error::CommitmentMismatch);
+        }
         let len = usize::try_from(byte_len)
             .map_err(|_| Error::Format("artifact cannot fit in memory"))?;
         let mut bytes = Vec::new();
@@ -253,15 +262,11 @@ pub struct VerifiedArtifact(ParsedArtifact);
 
 impl VerifiedArtifact {
     /// Read with the trusted size as an additional bound, then authenticate.
+    ///
+    /// The read allocates the artifact once and hashes it once.
     pub fn read(source: impl Read, expected: &Commitment) -> Result<Self, Error> {
         expected.validate()?;
-        // Read at most one extra byte so trailing data cannot be silently accepted.
-        let mut bytes = Vec::new();
-        source.take(expected.byte_len + 1).read_to_end(&mut bytes)?;
-        if u64::try_from(bytes.len()).ok() != Some(expected.byte_len) {
-            return Err(Error::CommitmentMismatch);
-        }
-        ParsedArtifact::read(bytes.as_slice())?.verify(expected)
+        ParsedArtifact::read_expecting(source, Some(expected.byte_len))?.verify(expected)
     }
 
     /// The authenticated descriptor.
@@ -442,9 +447,17 @@ mod tests {
         let mut padded = bytes.clone();
         padded[HEADER_LEN] |= 0x80;
         assert!(ParsedArtifact::read(padded.as_slice()).is_err());
+        // The trusted length rejects a longer header before allocating its body.
+        let longer = encode([1; 32], 9, [2; 32], [false; 64]).unwrap();
+        assert!(matches!(
+            VerifiedArtifact::read(longer.as_slice(), &pin),
+            Err(Error::CommitmentMismatch)
+        ));
+        assert!(VerifiedArtifact::read(&bytes[..bytes.len() - 1], &pin).is_err());
         let mut trailing = bytes;
         trailing.push(0);
         assert!(ParsedArtifact::read(trailing.as_slice()).is_err());
+        assert!(VerifiedArtifact::read(trailing.as_slice(), &pin).is_err());
         assert!(artifact_len(u64::MAX).is_err());
         assert!(artifact_len(MAX_ARTIFACT_LEN * 8).is_err());
         assert!(encode([1; 32], 9, [2; 32], [true]).is_err());

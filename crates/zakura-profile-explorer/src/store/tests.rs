@@ -1605,3 +1605,40 @@ fn dismissed_incomplete_profile_keeps_evidence_and_other_failures() -> Result<()
     );
     Ok(())
 }
+
+#[test]
+fn existing_cpu_catalogue_gets_covering_storage_accounting_index() -> Result<()> {
+    let db = Connection::open_in_memory()?;
+    let schema = include_str!("../schema.sql");
+    db.execute_batch(schema)?;
+    // Model an existing catalogue created before the accounting index was added.
+    db.execute_batch("DROP INDEX cpu_bytes")?;
+    db.execute(
+        "INSERT INTO runs(id,metadata,utc_ms,seen_ms) VALUES(?, '{}', 0, 0)",
+        [RUN],
+    )?;
+    for (id, bytes) in [("a", 4096), ("b", 8192)] {
+        db.execute(
+            "INSERT INTO cpu(id,run,start_us,end_us,samples,bytes,metadata) VALUES(?,?,0,1,1,?,?)",
+            params![id, RUN, bytes, "x".repeat(30_000)],
+        )?;
+    }
+    // Store::open applies this schema to both new and retained catalogues.
+    db.execute_batch(schema)?;
+    for query in [
+        "SELECT coalesce(sum(bytes),0) FROM cpu",
+        "SELECT (SELECT coalesce(sum(bytes),0) FROM chunks) + (SELECT coalesce(sum(bytes),0) FROM cpu)",
+    ] {
+        let plan = db.prepare(&format!("EXPLAIN QUERY PLAN {query}"))?
+            .query_map([], |row| row.get::<_, String>(3))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        assert!(plan.iter().any(|step| step.contains("COVERING INDEX cpu_bytes")), "{plan:?}");
+        assert_eq!(db.query_row(query, [], |row| row.get::<_, i64>(0))?, 12_288);
+    }
+    db.execute("DELETE FROM cpu WHERE id='a'", [])?;
+    assert_eq!(
+        db.query_row("SELECT sum(bytes) FROM cpu", [], |row| row.get::<_, i64>(0))?,
+        8192
+    );
+    Ok(())
+}

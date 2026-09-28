@@ -77,8 +77,8 @@ async function refresh() {
     const fresh = health && Date.now()-health.updated_ms<15000, nodeFresh = run && Date.now()-run.seen_ms<10000;
     const notices = [];
     if (data.startup_pending) notices.push('Node is warming up. Startup blocks are excluded from slow blocks.');
-    if (!fresh) notices.push('Collector is offline or its health is stale.');
-    if (run && !nodeFresh) notices.push('This node is no longer sending observations.');
+    if (!fresh) notices.push('Collector updates are delayed or unavailable. Recent profiles may be incomplete.');
+    if (fresh && run && !nodeFresh) notices.push('No recent node observations have reached the collector.');
     if (health?.errors) notices.push(`${number(health.errors)} collector errors. Detail may be incomplete.`);
     if (data.excluded_timings) notices.push(`${number(data.excluded_timings)} recordings excluded from timing statistics because of known measurement interference.`);
     note(notices.join(' '));

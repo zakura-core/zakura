@@ -52,6 +52,8 @@ CREATE TABLE IF NOT EXISTS cpu (
  deleting INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS cpu_window ON cpu(run,start_us,end_us);
+-- Retention accounting must not scan the large symbol metadata in every CPU row.
+CREATE INDEX IF NOT EXISTS cpu_bytes ON cpu(bytes);
 CREATE TABLE IF NOT EXISTS status (
  id INTEGER PRIMARY KEY CHECK(id=1), updated_ms INTEGER NOT NULL,
  errors INTEGER NOT NULL, budget INTEGER NOT NULL, used INTEGER NOT NULL,

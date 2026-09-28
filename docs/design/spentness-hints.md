@@ -141,11 +141,16 @@ sync if the empty database cannot start with compatible hints. `require` reports
 the failure. Neither policy starts hints midway through an ordinary database.
 An explicit file supplies bytes only; it cannot authorize an unrecognized digest.
 
-Before opening writable state, the node verifies a local artifact or starts a
-temporary peer endpoint to acquire the selected artifact. The node shuts down
-that endpoint before starting its normal endpoint. It uses the configured serving
-cache, or `<state.cache_dir>/spentness`, and keeps a durable recovery copy in the
-state cache. Nodes never download bitmap bytes from HTTP.
+Before opening writable state, the node checks the database that state opening
+will use. That includes a previous major version that the upgrade will reuse. Only
+an empty database or an interrupted hinted run needs an artifact. The node then
+verifies a local artifact or starts a temporary peer endpoint to acquire the
+selected artifact. The node shuts down that endpoint before starting its normal
+endpoint. A slow endpoint shutdown does not discard an acquired artifact. Shutdown
+during acquisition stops the node instead of falling back to ordinary sync. The
+node uses the configured serving cache, or `<state.cache_dir>/spentness`, and keeps
+a durable recovery copy in the state cache. Nodes never download bitmap bytes
+from HTTP.
 
 The writer persists one versioned record with each atomic block batch:
 
@@ -174,22 +179,26 @@ pool values. The replay and audit never change live consensus UTXOs. A mismatch
 stops the writer without attributing the failure to a peer.
 
 State access gates block pending-UTXO responses, monetary RPCs, mempool checks,
-mining checks, and ordinary semantic admission during construction. Header
-control messages continue during replay and the final audit. The legacy syncer
-waits before starting verifier deadlines. The native stall watchdog pauses
-during rebuilding. Completion lifts the gates and releases retained history
-to the existing pruning backlog.
+mining checks, and ordinary semantic admission during construction. Every state
+request variant is classified as allowed or denied, so a new variant needs a
+review decision. Synced blocks wait for completion before semantic verification.
+Block proposals and `submitblock` fail immediately. `getblockchaininfo` reports
+the real tip and omits `chainSupply` and `valuePools`. Header control messages
+continue during replay and the final audit. The legacy syncer waits before
+starting verifier deadlines. The native stall watchdog pauses during rebuilding.
+Completion lifts the gates and releases retained history to the existing pruning
+backlog.
 
 Startup resumes Applying with its original recognized commitment, even when a
 new release selects a later commitment. If the artifact is missing, restore
 identical bytes in the reported cache path or set `spentness.artifact_file`.
 Rebuilding needs retained bodies but no bitmap. Startup finishes that replay
-before exposing state. Completed databases need no bitmap for later operation.
+before exposing state. Shutdown interrupts the replay, and a restart resumes it. Completed databases need no bitmap for later operation.
 Unknown or revoked commitments stop startup with a compatibility error.
 
-Database format 29 gives this construction a separate major-version directory.
-The existing upgrade mechanism reuses ordinary format-28 data. Older binaries
-do not open format-29 data as ordinary state. Incomplete runs also require the
+Database format 30 gives this construction a separate major-version directory.
+The existing upgrade mechanism reuses ordinary format-29 data. Older binaries
+do not open format-30 data as ordinary state. Incomplete runs also require the
 same database format and indexer feature when they resume.
 
 Read-only opens, exports, offline pruning, and offline rollback reject incomplete

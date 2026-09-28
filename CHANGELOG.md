@@ -11,6 +11,12 @@ independently.
 
 ## [Unreleased]
 
+### Changed
+
+<!-- release-readiness: allow-patch; reason: Maintainer-approved patch maintenance
+release for accumulated fixes, performance improvements, NU7 preparation, and the
+support-height adjustment. Published library crates are versioned independently. -->
+
 ## [1.5.0] - 2026-09-24
 
 ### Added

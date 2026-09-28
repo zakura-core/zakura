@@ -1978,10 +1978,8 @@ impl Service<Request> for StateService {
                 //
                 // (Checkpoint block UTXOs are verified using block hash checkpoints
                 // and transaction merkle tree block header commitments.)
-                if !self.read_service.db.spentness_incomplete() {
-                    self.pending_utxos
-                        .check_against_ordered(&finalized.new_outputs);
-                }
+                self.pending_utxos
+                    .check_against_ordered(&finalized.new_outputs);
 
                 // # Performance
                 //

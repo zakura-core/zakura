@@ -9,10 +9,7 @@ use color_eyre::eyre::{ensure, eyre, Result};
 use zakura_chain::block::{self, Height};
 use zakura_state::FinalizedState;
 
-use super::{canonical_block, exact_boundary, open, state_config, NETWORK};
-
-/// Log replay progress every this many blocks.
-const PROGRESS_INTERVAL: u32 = 10_000;
+use super::{exact_boundary, for_each_block, open, state_config, NETWORK};
 
 /// Replay retained source blocks into `destination` until its tip is H/hash.
 ///
@@ -50,15 +47,16 @@ pub(super) fn replay(
     };
 
     let mut trees = None;
-    for h in start..=height {
-        let block = canonical_block(&source, Height(h))?;
-        let (_, next_trees) =
-            state.commit_finalized_direct(block.into(), trees, None, "spentness archive replay")?;
+    for_each_block(&source, start..=height, "replayed", |canonical| {
+        let (_, next_trees) = state.commit_finalized_direct(
+            canonical.block.into(),
+            trees.take(),
+            None,
+            "spentness archive replay",
+        )?;
         trees = Some(next_trees);
-        if h.is_multiple_of(PROGRESS_INTERVAL) {
-            eprintln!("replayed {h}/{height}");
-        }
-    }
+        Ok(())
+    })?;
     exact_boundary(&state.db, height, hash)?;
     Ok(())
 }

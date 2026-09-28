@@ -16,9 +16,20 @@
 #   RELEASE_STATE_PUBLIC_BASE public HTTPS base serving that destination's
 #                             release-state prefix, e.g.
 #                             "https://zakura-release.valargroup.dev/release-state"
+#   RELEASE_STATE_ORACLE_SOURCE
+#                             separately synchronized archive cache that
+#                             reproduces the spentness artifact
+#   RELEASE_STATE_ORACLE_ID   identity of that source and its validation software
+#   RELEASE_STATE_GENERATOR_REVISION
+#                             full git revision of both helper binaries
 # Optional environment:
 #   ZAKURA_CHECKPOINTS_BIN    zakura-checkpoints binary (default: on PATH),
+#                             built with --features zakura-checkpoints-offline
+#   ZAKURA_SPENTNESS_BIN      zakura-spentness binary (default: on PATH),
 #                             built with --features zakura-spentness
+#   RELEASE_STATE_DATA_DIR    persistent directory for both replay states and the
+#                             verification scratch database
+#                             (default: <cache-dir>-release-state)
 #   RELEASE_STATE_GRID_COST_MS
 #                             per-entry frontier grid cost budget in ms
 #                             (default: whatever the exporter defaults to). Only
@@ -34,7 +45,7 @@
 #                             walk reproducing it byte for byte.
 #   RELEASE_STATE_KEEP        legacy v1 bundles to retain (default 4)
 #   RELEASE_STATE_SPENTNESS_TIMEOUT
-#                             deadline for each spentness replay step (default 48h)
+#                             deadline for each spentness pipeline (default 48h)
 #   RELEASE_STATE_LOCK_FILE   host-local publisher lock
 #                             (default: /tmp/zakura-release-state-publish.lock)
 
@@ -45,11 +56,10 @@ STATE_DIR=${1:?usage: publish-release-state.sh <archive-node-zakura-cache-dir>}
 : "${RELEASE_STATE_PUBLIC_BASE:?set RELEASE_STATE_PUBLIC_BASE to the public HTTPS base URL}"
 BIN=${ZAKURA_CHECKPOINTS_BIN:-zakura-checkpoints}
 SPENTNESS_BIN=${ZAKURA_SPENTNESS_BIN:-zakura-spentness}
-export ZAKURA_SPENTNESS_BIN="$SPENTNESS_BIN"
 DATA_DIR=${RELEASE_STATE_DATA_DIR:-"${STATE_DIR%/}-release-state"}
 BUNDLE_SCHEMA=2
 LEGACY_BUNDLE_SCHEMA=1
-# The exporter derives both sidecar names from the artifact name.
+# .github/scripts/spentness_release.py defines the same names.
 SPENTNESS_ARTIFACT=mainnet-spentness-hints.bin
 SPENTNESS_COMMITMENT=mainnet-spentness-hints.commitment.json
 SPENTNESS_VERIFICATION=mainnet-spentness-hints.verification.json
@@ -112,7 +122,22 @@ if ! flock -n 9; then
 fi
 
 STAGE=$(mktemp -d)
-trap 'rm -rf "$STAGE"' EXIT
+# Verification builds a multi-gigabyte scratch database under $TMPDIR. A helper
+# killed by its deadline skips its own cleanup, so every run starts from an
+# empty directory and removes it on exit. The publisher lock guards both steps.
+SCRATCH="$DATA_DIR/tmp"
+SPENTNESS_PIDS=()
+cleanup() {
+    # Stop spentness pipelines that are still running after a failure.
+    if [ "${#SPENTNESS_PIDS[@]}" -gt 0 ]; then
+        kill "${SPENTNESS_PIDS[@]}" 2>/dev/null || true
+        wait "${SPENTNESS_PIDS[@]}" 2>/dev/null || true
+    fi
+    rm -rf "$STAGE" "$SCRATCH"
+}
+trap cleanup EXIT
+rm -rf "$SCRATCH"
+mkdir "$SCRATCH"
 
 sha256_of() {
     python3 -c 'import hashlib, sys; print(hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest())' "$1"
@@ -187,26 +212,14 @@ fi
     --mainnet-frontier-output "$STAGE/mainnet-frontier.bin" \
     --mainnet-subtree-output "$STAGE/mainnet-treestate-subtrees.bin" \
     --mainnet-frontier-grid-output "$STAGE/mainnet-frontier-grid.bin" \
-    --mainnet-spentness-output "$STAGE/$SPENTNESS_ARTIFACT" \
-    --spentness-replay-cache "$DATA_DIR/spentness-primary" \
     ${GRID_ARGS[@]+"${GRID_ARGS[@]}"} \
     > "$STAGE/main-checkpoints.txt"
 
 HEIGHT=$(tail -1 "$STAGE/main-checkpoints.txt" | cut -d' ' -f1)
 BLOCK_HASH=$(tail -1 "$STAGE/main-checkpoints.txt" | cut -d' ' -f2)
+# The timestamp records when the exporter selected H. The spentness pipelines
+# below count against the fetcher's 48-hour freshness window.
 GENERATED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-
-# Reproduce from a separate validated source, then check complete entries with the
-# tooling-only transparent replay oracle and fresh salted multiset accumulator.
-timeout "$SPENTNESS_TIMEOUT" "$SPENTNESS_BIN" replay --source "$RELEASE_STATE_ORACLE_SOURCE" \
-    --destination "$DATA_DIR/spentness-independent" --height "$HEIGHT" --block-hash "$BLOCK_HASH"
-timeout "$SPENTNESS_TIMEOUT" "$SPENTNESS_BIN" generate --state "$DATA_DIR/spentness-independent" \
-    --height "$HEIGHT" --block-hash "$BLOCK_HASH" \
-    --output "$STAGE/independent-spentness.bin" --commitment "$STAGE/independent-commitment.json"
-cmp "$STAGE/$SPENTNESS_ARTIFACT" "$STAGE/independent-spentness.bin"
-timeout "$SPENTNESS_TIMEOUT" "$SPENTNESS_BIN" verify --state "$DATA_DIR/spentness-independent" \
-    --artifact "$STAGE/$SPENTNESS_ARTIFACT" \
-    --commitment "$STAGE/$SPENTNESS_COMMITMENT"
 
 # Never move the pointer backwards: an export from stale state would regress
 # latest.json, and retention could then purge the very bundle it points at.
@@ -215,11 +228,53 @@ if [ -n "$POINTER_HEIGHT" ] && [ "$POINTER_HEIGHT" -gt "$HEIGHT" ]; then
     exit 1
 fi
 
+# Replay one source to H, generate its artifact into a directory, and optionally
+# verify that artifact with the independent transparent replay oracle.
+spentness_pipeline() {
+    local source=$1 state=$2 output=$3 report=${4:-}
+    "$SPENTNESS_BIN" replay --source "$source" --destination "$state" \
+        --height "$HEIGHT" --block-hash "$BLOCK_HASH"
+    "$SPENTNESS_BIN" generate --state "$state" --height "$HEIGHT" --block-hash "$BLOCK_HASH" \
+        --output "$output/$SPENTNESS_ARTIFACT" --commitment "$output/$SPENTNESS_COMMITMENT"
+    if [ -n "$report" ]; then
+        "$SPENTNESS_BIN" verify --state "$state" --artifact "$output/$SPENTNESS_ARTIFACT" \
+            --commitment "$output/$SPENTNESS_COMMITMENT" --report "$report"
+    fi
+}
+export -f spentness_pipeline
+export SPENTNESS_BIN HEIGHT BLOCK_HASH SPENTNESS_ARTIFACT SPENTNESS_COMMITMENT
+
+# Run one pipeline in the background under the spentness deadline. timeout
+# forwards a termination signal to its process group, which holds every helper.
+start_spentness_pipeline() {
+    # shellcheck disable=SC2016 # The inner shell expands its own arguments.
+    TMPDIR="$SCRATCH" timeout "$SPENTNESS_TIMEOUT" \
+        bash -euo pipefail -c 'spentness_pipeline "$@"' spentness_pipeline "$@" &
+    SPENTNESS_PIDS+=("$!")
+}
+
+# The primary pipeline generates the published artifact from this archive. The
+# independent pipeline reproduces it from a separately synchronized archive and
+# verifies the reproduction. The pipelines share no state, so they run concurrently.
+mkdir "$STAGE/independent"
+start_spentness_pipeline "$STATE_DIR" "$DATA_DIR/spentness-primary" "$STAGE"
+start_spentness_pipeline "$RELEASE_STATE_ORACLE_SOURCE" "$DATA_DIR/spentness-independent" \
+    "$STAGE/independent" "$STAGE/$SPENTNESS_VERIFICATION"
+for _ in "${SPENTNESS_PIDS[@]}"; do
+    if ! wait -n; then
+        echo "spentness generation or verification failed" >&2
+        exit 1
+    fi
+done
+SPENTNESS_PIDS=()
+cmp "$STAGE/$SPENTNESS_ARTIFACT" "$STAGE/independent/$SPENTNESS_ARTIFACT"
+cmp "$STAGE/$SPENTNESS_COMMITMENT" "$STAGE/independent/$SPENTNESS_COMMITMENT"
+
 HEIGHT="$HEIGHT" BLOCK_HASH="$BLOCK_HASH" GENERATED_AT="$GENERATED_AT" \
     BUNDLE_SCHEMA="$BUNDLE_SCHEMA" \
     RELEASE_STATE_GENERATOR_REVISION="$RELEASE_STATE_GENERATOR_REVISION" \
     RELEASE_STATE_ORACLE_ID="$RELEASE_STATE_ORACLE_ID" \
-    SPENTNESS_ARTIFACT="$SPENTNESS_ARTIFACT" SPENTNESS_VERIFICATION="$SPENTNESS_VERIFICATION" \
+    SPENTNESS_VERIFICATION="$SPENTNESS_VERIFICATION" \
     python3 - "$STAGE" "${BUNDLE_FILES[@]}" <<'PY'
 import hashlib, json, os, sys
 
@@ -251,11 +306,11 @@ meta = {
     "generated_at": os.environ["GENERATED_AT"],
     "files": files,
     "generator": {"name": "zakura-checkpoints", "mode": "offline"},
+    # The independent pipeline wrote this report after reproducing the artifact.
     "spentness": {
         "verification": json.load(open(os.path.join(stage, os.environ["SPENTNESS_VERIFICATION"]))),
         "generator_revision": os.environ["RELEASE_STATE_GENERATOR_REVISION"],
         "independent_source": os.environ["RELEASE_STATE_ORACLE_ID"],
-        "reproduced_sha256": files[os.environ["SPENTNESS_ARTIFACT"]]["sha256"],
     },
 }
 encoded = (json.dumps(meta, indent=2) + "\n").encode()

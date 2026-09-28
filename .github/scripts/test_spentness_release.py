@@ -15,6 +15,10 @@ from pathlib import Path
 
 import spentness_release as hints
 
+REPO = Path(__file__).resolve().parents[2]
+PUBLISHER = REPO / "deploy/release-state/publish-release-state.sh"
+GOLDEN = Path(__file__).with_name("testdata") / "spentness"
+
 
 def load_script(name):
     spec = importlib.util.spec_from_file_location(
@@ -65,7 +69,6 @@ class SpentnessReleaseTests(unittest.TestCase):
             "survivor_count": 3,
             "oracle": hints.ORACLE,
             "complete_entries": True,
-            "salted_multiset": True,
         }
         (self.bundle / hints.VERIFICATION).write_text(json.dumps(self.report))
         self.meta = {
@@ -78,7 +81,6 @@ class SpentnessReleaseTests(unittest.TestCase):
                 "verification": self.report,
                 "generator_revision": "a" * 40,
                 "independent_source": "separate fully validated archive",
-                "reproduced_sha256": bytes(self.pin["sha256"]).hex(),
             },
         }
 
@@ -133,12 +135,118 @@ class SpentnessReleaseTests(unittest.TestCase):
                       "survivor_count": sum(byte.bit_count() for byte in bitmap)}
             meta = copy.deepcopy(self.meta)
             meta["spentness"]["verification"] = report
-            meta["spentness"]["reproduced_sha256"] = bytes(pin["sha256"]).hex()
             path.write_bytes(data)
             (self.bundle / hints.COMMITMENT).write_text(json.dumps(pin))
             (self.bundle / hints.VERIFICATION).write_text(json.dumps(report))
             with self.subTest(message=message), self.assertRaisesRegex(ValueError, message):
                 hints.validate_bundle(self.bundle, meta)
+
+    def test_rust_generated_files_pass_validation(self):
+        """The Rust golden test writes these files from a Mainnet fixture archive."""
+        bundle = self.root / "golden"
+        bundle.mkdir()
+        for name in (hints.ARTIFACT, hints.COMMITMENT, hints.VERIFICATION):
+            (bundle / name).write_bytes((GOLDEN / name).read_bytes())
+        pin = json.loads((bundle / hints.COMMITMENT).read_text())
+        report = json.loads((bundle / hints.VERIFICATION).read_text())
+        block_hash = bytes(pin["terminal_block_hash"])[::-1].hex()
+        (bundle / "main-checkpoints.txt").write_text(
+            "0 " + bytes(pin["chain_identity"])[::-1].hex()
+            + f"\n{pin['terminal_height']} {block_hash}\n"
+        )
+        meta = {
+            "height": pin["terminal_height"],
+            "block_hash": block_hash,
+            "spentness": {
+                "verification": report,
+                "generator_revision": "a" * 40,
+                "independent_source": "fixture",
+            },
+        }
+        self.assertEqual(hints.validate_bundle(bundle, meta)["commitment"], pin)
+
+    def test_schema_one_cannot_follow_a_committed_descriptor(self):
+        self.assertEqual(hints.minimum_bundle_schema(self.root), 1)
+        importer, repo, resolution = self.importer_fixture()
+        importer.import_bundle(repo, self.bundle, resolution)
+        self.assertEqual(hints.minimum_bundle_schema(repo), hints.BUNDLE_SCHEMA)
+
+        self.meta["schema_version"] = 1
+        self.meta["height"] = 11
+        meta_bytes = json.dumps(self.meta).encode()
+        (self.bundle / "meta.json").write_bytes(meta_bytes)
+        before = (repo / importer.CHECKPOINTS).read_bytes()
+        (self.bundle / "main-checkpoints.txt").write_text(
+            before.decode() + "11 " + "0" * 64 + "\n"
+        )
+        self.write_treestate(importer, 11)
+        resolution.write_text(json.dumps({
+            "height": 11,
+            "block_hash": self.meta["block_hash"],
+            "generated_at": self.meta["generated_at"],
+            "meta_url": "https://example.test/v1/11/meta.json",
+            "meta_sha256": hashlib.sha256(meta_bytes).hexdigest(),
+        }))
+        with self.assertRaisesRegex(importer.BundleImportError, "cannot follow"):
+            importer.import_bundle(repo, self.bundle, resolution)
+        self.assertEqual((repo / importer.CHECKPOINTS).read_bytes(), before)
+
+        fetcher = load_script("fetch-release-state")
+        base = "https://zakura-release.valargroup.dev/release-state/"
+        latest = {
+            "schema_version": 1,
+            "network": "Mainnet",
+            "height": 11,
+            "block_hash": "00" * 32,
+            "generated_at": "2026-09-10T00:00:00Z",
+            "meta_url": base + "v1/11/meta.json",
+            "meta_sha256": "00" * 32,
+        }
+
+        def fetch(url, limit):
+            self.assertEqual(url, base + "latest.json", "fetched a bundle after the schema check")
+            return json.dumps(latest).encode()
+
+        with self.assertRaisesRegex(fetcher.BundleError, "cannot follow"):
+            fetcher.resolve_bundle(
+                base + "latest.json",
+                self.root / "fetched",
+                self.root / "fetched.json",
+                48,
+                fetch=fetch,
+                now=datetime(2026, 9, 10, tzinfo=timezone.utc),
+                minimum_schema=hints.minimum_bundle_schema(repo),
+            )
+
+    def test_publisher_constants_match_the_release_tooling(self):
+        fetcher = load_script("fetch-release-state")
+        script = PUBLISHER.read_text()
+        for variable, name in (
+            ("SPENTNESS_ARTIFACT", hints.ARTIFACT),
+            ("SPENTNESS_COMMITMENT", hints.COMMITMENT),
+            ("SPENTNESS_VERIFICATION", hints.VERIFICATION),
+        ):
+            self.assertIn(f"\n{variable}={name}\n", script)
+        block = script[script.index("limits = {"):]
+        block = block[: block.index("}") + 1]
+        published = {}
+        exec(block, {}, published)
+        self.assertEqual(published["limits"], {**fetcher.FILE_LIMITS, **hints.FILE_LIMITS})
+
+    @staticmethod
+    def write_subtrees(importer, path, height):
+        prefix = importer.SUBTREE_HEADER_PREFIX.pack(b"ZKVCTST1", 1, 1, height, 0, 0, 0)
+        path.write_bytes(prefix + hashlib.sha256(prefix).digest())
+
+    def write_treestate(self, importer, height):
+        """Write the bundle's frontier, subtree roots, and frontier grid at `height`."""
+        self.write_subtrees(importer, self.bundle / importer.SUBTREE_BUNDLE_NAME, height)
+        (self.bundle / importer.FRONTIER.name).write_bytes(b"new frontier")
+        prefix = importer.FRONTIER_GRID_HEADER_PREFIX.pack(b"ZKVCTFR1", 1, 1, 1, height, 1)
+        payload = struct.pack("<IIII", 0, 0, 0, 0)
+        (self.bundle / importer.FRONTIER_GRID_BUNDLE_NAME).write_bytes(
+            prefix + hashlib.sha256(prefix + payload).digest() + payload
+        )
 
     def importer_fixture(self):
         importer = load_script("import-release-state")
@@ -150,18 +258,8 @@ class SpentnessReleaseTests(unittest.TestCase):
         (repo / importer.CHECKPOINTS).write_text(genesis + "\n")
         (repo / importer.FRONTIER).write_bytes(b"old frontier")
         (repo / importer.EOS_FILE).write_text("const ESTIMATED_RELEASE_HEIGHT: u32 = 1;\n")
-        for height, path in (
-            (0, repo / importer.SUBTREES),
-            (10, self.bundle / importer.SUBTREE_BUNDLE_NAME),
-        ):
-            prefix = importer.SUBTREE_HEADER_PREFIX.pack(b"ZKVCTST1", 1, 1, height, 0, 0, 0)
-            path.write_bytes(prefix + hashlib.sha256(prefix).digest())
-        (self.bundle / importer.FRONTIER.name).write_bytes(b"new frontier")
-        prefix = importer.FRONTIER_GRID_HEADER_PREFIX.pack(b"ZKVCTFR1", 1, 1, 1, 10, 1)
-        payload = struct.pack("<IIII", 0, 0, 0, 0)
-        (self.bundle / importer.FRONTIER_GRID_BUNDLE_NAME).write_bytes(
-            prefix + hashlib.sha256(prefix + payload).digest() + payload
-        )
+        self.write_subtrees(importer, repo / importer.SUBTREES, 0)
+        self.write_treestate(importer, 10)
         meta_bytes = json.dumps(self.meta).encode()
         (self.bundle / "meta.json").write_bytes(meta_bytes)
         resolution = {
@@ -264,7 +362,7 @@ class SpentnessReleaseTests(unittest.TestCase):
         for key, value in (
             ("survivor_count", 2),
             ("complete_entries", False),
-            ("salted_multiset", False),
+            ("oracle", "unknown"),
         ):
             report = {**self.report, key: value}
             (self.bundle / hints.VERIFICATION).write_text(json.dumps(report))
@@ -354,7 +452,7 @@ class SpentnessReleaseTests(unittest.TestCase):
         tools.mkdir()
         mock = tools / "mock"
         mock.write_text("""#!/usr/bin/env python3
-import json, os, shutil, sys
+import json, os, shutil, sys, time
 from pathlib import Path
 tool = Path(sys.argv[0]).name
 args = sys.argv[1:]
@@ -367,18 +465,30 @@ def resolve(value):
 if tool == "zakura-checkpoints":
     if os.environ.get("MOCK_FAIL_GENERATION"):
         sys.exit(9)
-    output = option("--mainnet-spentness-output")
-    for source, target in [("mainnet-spentness-hints.bin", output), ("mainnet-spentness-hints.commitment.json", output.with_suffix(".commitment.json")), ("mainnet-spentness-hints.verification.json", output.with_suffix(".verification.json"))]:
-        shutil.copyfile(fixture / source, target)
     for flag in ("--mainnet-frontier-output", "--mainnet-subtree-output", "--mainnet-frontier-grid-output"):
         option(flag).write_bytes(b"treestate fixture")
     print((fixture / "main-checkpoints.txt").read_text(), end="")
 elif tool == "zakura-spentness":
+    with open(os.environ["MOCK_LOG"], "a") as log:
+        print(args[0], os.environ["TMPDIR"], file=log)
     if args[0] == "generate":
+        if os.environ.get("MOCK_FAIL_PRIMARY") and option("--state").name == "spentness-primary":
+            # Fail only after the independent pipeline has reached its slow step.
+            started = Path(os.environ["MOCK_SLOW_VERIFY"])
+            for _ in range(200):
+                if started.exists():
+                    break
+                time.sleep(0.05)
+            sys.exit(13)
         shutil.copyfile(fixture / "mainnet-spentness-hints.bin", option("--output"))
         shutil.copyfile(fixture / "mainnet-spentness-hints.commitment.json", option("--commitment"))
-    if args[0] == "verify" and os.environ.get("MOCK_FAIL_VERIFICATION"):
-        sys.exit(10)
+    if args[0] == "verify":
+        if os.environ.get("MOCK_FAIL_VERIFICATION"):
+            sys.exit(10)
+        if os.environ.get("MOCK_SLOW_VERIFY"):
+            Path(os.environ["MOCK_SLOW_VERIFY"]).write_text(str(os.getpid()))
+            time.sleep(60)
+        shutil.copyfile(fixture / "mainnet-spentness-hints.verification.json", option("--report"))
 elif tool == "rclone":
     target = resolve(args[1])
     if args[0] == "lsf":
@@ -421,6 +531,7 @@ else: sys.exit(12)
             "RELEASE_STATE_GENERATOR_REVISION": "a" * 40,
             "RELEASE_STATE_LOCK_FILE": str(self.root / "publisher.lock"),
             "RELEASE_STATE_DATA_DIR": str(self.root / "replay"),
+            "MOCK_LOG": str(self.root / "helper.log"),
         }
         return source, pointer, old, env
 
@@ -470,6 +581,35 @@ else: sys.exit(12)
         )
         self.assertEqual(result.returncode, 0, result.stderr.decode())
         self.assertEqual((published / "meta.json").read_bytes(), metadata)
+
+    def test_publisher_runs_helpers_in_scratch_and_removes_it(self):
+        source, pointer, old, env = self.publisher_environment()
+        stale = self.root / "replay/tmp/spentness-audit-killed"
+        stale.mkdir(parents=True)
+        result = subprocess.run(["bash", str(PUBLISHER), str(source)], env=env,
+                                capture_output=True, timeout=30, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
+        calls = (self.root / "helper.log").read_text().splitlines()
+        self.assertEqual(sorted(call.split()[0] for call in calls),
+                         ["generate", "generate", "replay", "replay", "verify"])
+        self.assertEqual({call.split()[1] for call in calls}, {str(self.root / "replay/tmp")})
+        self.assertFalse((self.root / "replay/tmp").exists())
+
+    def test_publisher_failure_stops_the_other_pipeline(self):
+        source, pointer, old, env = self.publisher_environment()
+        original = pointer.read_bytes()
+        started = self.root / "slow-verify.pid"
+        result = subprocess.run(
+            ["bash", str(PUBLISHER), str(source)],
+            env={**env, "MOCK_FAIL_PRIMARY": "1", "MOCK_SLOW_VERIFY": str(started)},
+            capture_output=True, timeout=30, check=False,
+        )
+        self.assertNotEqual(result.returncode, 0, result.stderr.decode())
+        self.assertIn("spentness generation or verification failed", result.stderr.decode())
+        self.assertEqual(pointer.read_bytes(), original)
+        pid = int(started.read_text())
+        with self.assertRaises(ProcessLookupError):
+            os.kill(pid, 0)
 
     def test_publisher_rejects_invalid_revision_and_oversized_sidecars(self):
         source, pointer, old, env = self.publisher_environment()

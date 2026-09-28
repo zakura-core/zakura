@@ -23,8 +23,8 @@ Type=oneshot
 # The wrapper is therefore no longer baked into ExecStart.
 EnvironmentFile=/etc/zakura-release-state.env
 ExecStart=/opt/zakura-release-state/bin/publish-from-archive-host.sh
-# Initial generation replays two ordinary archive states and audits transparent state.
-# Six helpers can each consume 48 hours; leave two days for export and upload.
-TimeoutStartSec=14d
+# Two concurrent spentness pipelines each have a 48-hour deadline. The first run
+# replays both archive states from genesis. Leave one day for export and upload.
+TimeoutStartSec=3d
 Nice=10
 IOSchedulingClass=idle

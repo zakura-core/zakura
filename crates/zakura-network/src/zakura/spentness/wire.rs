@@ -83,7 +83,7 @@ impl RangeRequest {
 pub(super) enum RangeResponse<'a> {
     /// The server lacks the artifact.
     Unavailable(RangeRequest),
-    /// All serving slots are occupied.
+    /// The server's node or peer byte rate is exhausted; retry later.
     Busy(RangeRequest),
     /// The negotiated response cap cannot fit the requested range.
     TooLarge(RangeRequest),

@@ -46,11 +46,27 @@ pub const REVOKED_COMMITMENTS: &[[u8; 32]] = &[];
 /// Release-reviewed commitments for `network`, oldest first.
 ///
 /// Only Mainnet has reviewed artifacts. Other networks always build ordinary state.
+/// This list can include revoked commitments; see [`supported_commitments`].
 pub fn release_commitments(network: &super::Network) -> &'static [Commitment] {
     match network {
         super::Network::Mainnet => MAINNET_COMMITMENTS,
         super::Network::Testnet(_) => &[],
     }
+}
+
+/// Release commitments for `network` that are not revoked, oldest first.
+///
+/// Artifact downloads, serving, and advertisements use only these commitments.
+pub fn supported_commitments(network: &super::Network) -> Vec<Commitment> {
+    unrevoked(release_commitments(network), REVOKED_COMMITMENTS)
+}
+
+fn unrevoked(commitments: &[Commitment], revoked: &[[u8; 32]]) -> Vec<Commitment> {
+    commitments
+        .iter()
+        .filter(|commitment| !revoked.contains(&commitment.sha256))
+        .cloned()
+        .collect()
 }
 
 /// Release-reviewed identity. Artifact bytes remain outside the executable.
@@ -185,12 +201,21 @@ pub struct ParsedArtifact {
 
 impl ParsedArtifact {
     /// Read a bounded artifact, rejecting truncation and trailing bytes.
-    pub fn read(mut source: impl Read) -> Result<Self, Error> {
+    pub fn read(source: impl Read) -> Result<Self, Error> {
+        Self::read_expecting(source, None)
+    }
+
+    /// Read an artifact, rejecting a header whose length differs from `expected_len`
+    /// before allocating.
+    fn read_expecting(mut source: impl Read, expected_len: Option<u64>) -> Result<Self, Error> {
         let mut header = [0; HEADER_LEN];
         source.read_exact(&mut header)?;
         let parsed_header = Header::parse(&header)?;
         let output_count = parsed_header.output_count;
         let byte_len = artifact_len(output_count)?;
+        if expected_len.is_some_and(|expected_len| expected_len != byte_len) {
+            return Err(Error::CommitmentMismatch);
+        }
         let len = usize::try_from(byte_len)
             .map_err(|_| Error::Format("artifact cannot fit in memory"))?;
         let mut bytes = Vec::new();
@@ -250,15 +275,11 @@ pub struct VerifiedArtifact(ParsedArtifact);
 
 impl VerifiedArtifact {
     /// Read with the trusted size as an additional bound, then authenticate.
+    ///
+    /// The read allocates the artifact once and hashes it once.
     pub fn read(source: impl Read, expected: &Commitment) -> Result<Self, Error> {
         expected.validate()?;
-        // Read at most one extra byte so trailing data cannot be silently accepted.
-        let mut bytes = Vec::new();
-        source.take(expected.byte_len + 1).read_to_end(&mut bytes)?;
-        if u64::try_from(bytes.len()).ok() != Some(expected.byte_len) {
-            return Err(Error::CommitmentMismatch);
-        }
-        ParsedArtifact::read(bytes.as_slice())?.verify(expected)
+        ParsedArtifact::read_expecting(source, Some(expected.byte_len))?.verify(expected)
     }
 
     /// The authenticated descriptor.
@@ -373,6 +394,28 @@ mod tests {
     }
 
     #[test]
+    fn revocation_removes_supported_commitments() {
+        let pins: Vec<_> = (1..=3)
+            .map(|height| {
+                let bytes = encode([1; 32], height, [2; 32], [false, true]).unwrap();
+                ParsedArtifact::read(bytes.as_slice())
+                    .unwrap()
+                    .commitment()
+                    .clone()
+            })
+            .collect();
+        assert_eq!(unrevoked(&pins, &[]), pins);
+        assert_eq!(
+            unrevoked(&pins, &[pins[1].sha256]),
+            [pins[0].clone(), pins[2].clone()]
+        );
+        assert_eq!(
+            supported_commitments(&crate::parameters::Network::Mainnet),
+            unrevoked(MAINNET_COMMITMENTS, REVOKED_COMMITMENTS)
+        );
+    }
+
+    #[test]
     fn boundaries_and_owned_verification() {
         for count in [0, 1, 7, 8, 9, 17] {
             let bits: Vec<_> = (0..count).map(|n| n != 0 && n % 3 != 0).collect();
@@ -417,9 +460,17 @@ mod tests {
         let mut padded = bytes.clone();
         padded[HEADER_LEN] |= 0x80;
         assert!(ParsedArtifact::read(padded.as_slice()).is_err());
+        // The trusted length rejects a longer header before allocating its body.
+        let longer = encode([1; 32], 9, [2; 32], [false; 64]).unwrap();
+        assert!(matches!(
+            VerifiedArtifact::read(longer.as_slice(), &pin),
+            Err(Error::CommitmentMismatch)
+        ));
+        assert!(VerifiedArtifact::read(&bytes[..bytes.len() - 1], &pin).is_err());
         let mut trailing = bytes;
         trailing.push(0);
         assert!(ParsedArtifact::read(trailing.as_slice()).is_err());
+        assert!(VerifiedArtifact::read(trailing.as_slice(), &pin).is_err());
         assert!(artifact_len(u64::MAX).is_err());
         assert!(artifact_len(MAX_ARTIFACT_LEN * 8).is_err());
         assert!(encode([1; 32], 9, [2; 32], [true]).is_err());

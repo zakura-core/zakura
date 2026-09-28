@@ -25,6 +25,14 @@ FORMAT_VERSION = 1
 SCHEMA_VERSION = 1
 # The first release-state bundle schema that carries spentness files.
 BUNDLE_SCHEMA = 2
+# Release-state bundle schemas that the fetcher and importer accept.
+SUPPORTED_BUNDLE_SCHEMAS = (1, BUNDLE_SCHEMA)
+# Download limits for the spentness files of a schema 2 bundle.
+FILE_LIMITS = {
+    ARTIFACT: MAX_BYTES,
+    COMMITMENT: 16 * 1024,
+    VERIFICATION: 32 * 1024,
+}
 HASH_BYTES = 32
 READ_CHUNK_BYTES = 1024 * 1024
 BITS_PER_BYTE = 8
@@ -97,7 +105,6 @@ def _validate_report(bundle: Path, pin: dict) -> dict:
         or report.get("commitment") != pin
         or report.get("oracle") != ORACLE
         or report.get("complete_entries") is not True
-        or report.get("salted_multiset") is not True
         or type(report.get("survivor_count")) is not int
         or report["survivor_count"] < 0
     ):
@@ -136,7 +143,7 @@ def _validate_artifact(bundle: Path, pin: dict) -> int:
             first = False
             last = chunk[-1]
             digest.update(chunk)
-            survivors += sum(byte.bit_count() for byte in chunk)
+            survivors += int.from_bytes(chunk, "little").bit_count()
     if size != pin["byte_len"] or list(digest.digest()) != pin["sha256"]:
         raise ValueError("spentness artifact digest or length mismatch")
     if count % BITS_PER_BYTE and last >> (count % BITS_PER_BYTE):
@@ -162,9 +169,19 @@ def _validate_provenance(meta: dict, pin: dict, report: dict) -> dict:
         raise ValueError(
             "spentness bundle must identify its independently synchronized source"
         )
-    if evidence.get("reproduced_sha256") != bytes(pin["sha256"]).hex():
-        raise ValueError("independent source did not reproduce the spentness artifact")
     return evidence
+
+
+def minimum_bundle_schema(repo: Path) -> int:
+    """Return the oldest bundle schema that can follow the committed release state.
+
+    Once a spentness descriptor is committed, a schema 1 bundle would advance the
+    checkpoint without its descriptor, which the release-state check rejects.
+    """
+    path = repo / MANIFEST
+    if path.exists() and json.loads(path.read_text()).get("artifacts"):
+        return BUNDLE_SCHEMA
+    return min(SUPPORTED_BUNDLE_SCHEMAS)
 
 
 def validate_bundle(bundle: Path, meta: dict) -> dict:

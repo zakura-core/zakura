@@ -10,7 +10,7 @@ use zakura_chain::{
 };
 use zakura_state::{OutputLocation, ZakuraDb};
 
-use super::{canonical_block, exact_boundary, open, write};
+use super::{exact_boundary, for_each_block, open, write};
 
 /// An untrusted artifact and the descriptor a reviewer checks before pinning it.
 pub(super) struct Generated {
@@ -29,17 +29,17 @@ pub(super) fn generate(db: &ZakuraDb, height: u32, hash: block::Hash) -> Result<
     let mut utxos = db.utxos_by_location().peekable();
     let mut survivors = 0;
 
-    for h in 0..=height {
-        let block = canonical_block(db, Height(h))?;
-        for (location, output) in outputs_in_order(&block, Height(h)) {
+    for_each_block(db, 0..=height, "generated", |canonical| {
+        let h = canonical.height;
+        for (location, output) in outputs_in_order(&canonical.block, h) {
             let retained = match utxos.next_if(|(next, _)| *next <= location) {
                 None => false,
                 Some((next, _)) if next != location => bail!("unmatched UTXO at {next:?}"),
                 Some((_, entry)) => {
-                    ensure!(h != 0, "genesis outputs must not enter the UTXO set");
+                    ensure!(h.0 != 0, "genesis outputs must not enter the UTXO set");
                     let tx_index = location.transaction_index().as_usize();
                     ensure!(
-                        entry == OrderedUtxo::new(output.clone(), Height(h), tx_index),
+                        entry == OrderedUtxo::new(output.clone(), h, tx_index),
                         "UTXO entry at {location:?} differs from its creating transaction"
                     );
                     survivors += 1;
@@ -48,7 +48,8 @@ pub(super) fn generate(db: &ZakuraDb, height: u32, hash: block::Hash) -> Result<
             };
             encoder.push(retained)?;
         }
-    }
+        Ok(())
+    })?;
     ensure!(
         utxos.next().is_none(),
         "UTXO set contains unmatched entries beyond canonical outputs"
@@ -87,6 +88,11 @@ fn outputs_in_order(
         })
 }
 
+/// The commitment descriptor that the release importer reads.
+pub(super) fn commitment_json(commitment: &Commitment) -> Result<Vec<u8>> {
+    Ok(serde_json::to_vec_pretty(commitment)?)
+}
+
 /// Write the artifact and its commitment, then print a summary for review.
 pub(super) fn run(
     state: &Path,
@@ -101,7 +107,7 @@ pub(super) fn run(
         survivors,
     } = generate(&open(state)?, height, block_hash)?;
     write(output, &bytes)?;
-    write(commitment_path, &serde_json::to_vec_pretty(&commitment)?)?;
+    write(commitment_path, &commitment_json(&commitment)?)?;
     println!(
         "outputs={} survivors={survivors} bytes={} sha256={}",
         commitment.output_count,

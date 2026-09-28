@@ -152,20 +152,24 @@ deploying the same day over leaving it red for a week.
 ## Updating the archive publisher
 
 The mainnet fleet deployer marks `archive-vct-off` with
-`release_state_publisher = true`. A deployment builds `zakurad` and the offline
-`zakura-checkpoints` exporter at the same resolved commit. The exporter revision
-must be on `origin/main`. Deployment tooling comes from the workflow revision,
-so selecting an older release does not select an older deployment procedure.
-Before changing the host, the deployer checks that the exporter supports the
-publisher's required CLI options, including grid output, resume, and cost settings.
-Older exporters that lack any of these options are rejected before installation.
+`release_state_publisher = true`. A deployment builds `zakurad`, the offline
+`zakura-checkpoints` exporter, and the `zakura-spentness` helper at the same
+resolved commit. `EXPORTER_REVISION` names that commit for both helpers. The
+revision must be on `origin/main`. Deployment tooling comes from the workflow
+revision, so selecting an older release does not select an older deployment procedure.
+Before changing the host, the deployer checks that both helpers support the
+publisher's required CLI options, including grid output, resume, cost settings,
+and the spentness `replay`, `generate`, and `verify` arguments.
+Older helpers that lack any of these options are rejected before installation.
 
 The deployer pauses the timer, waits up to ten minutes for publication to finish,
-and installs both binaries before restarting the node. It checks RPC and a
-90-second settle window, runs publication, then verifies the public bundle's
-height and digests. The existing publisher scripts, unit, profile, and credentials
-remain host-managed. Use `deploy-snapshot-host.sh` for initial installation or
-changes to those components.
+and installs all three binaries before restarting the node. It checks RPC and a
+90-second settle window, then starts a publication without waiting for it. A
+schema 2 publication can run for days, so the deployment succeeds once the new
+publisher invocation is running. Follow the publication in
+`journalctl -u zakura-release-state.service`. The existing publisher scripts,
+unit, profile, and credentials remain host-managed. Use `deploy-snapshot-host.sh`
+for initial installation or changes to those components.
 
 `--no-restart` is rejected when the selection includes this host. Deploy the pair
 together, or select another node for staging. A node startup failure leaves the
@@ -189,7 +193,8 @@ Set `RELEASE_STATE_ORACLE_SOURCE` to a separately synchronized archive cache.
 Set `RELEASE_STATE_ORACLE_ID` to identify that source and its validation software.
 Set `RELEASE_STATE_GENERATOR_REVISION` to the tool's full git revision; the host
 wrapper reads the installed `EXPORTER_REVISION`. `RELEASE_STATE_DATA_DIR` holds
-two ordinary archive replay states at the selected checkpoint. The publisher
+two ordinary archive replay states at the selected checkpoint and the verification
+scratch directory. The two spentness pipelines run concurrently. The publisher
 never rolls back the live node. Version 2 bundles remain available for recovery.
 
 The importer retains each reviewed commitment and its matching VCT handoff

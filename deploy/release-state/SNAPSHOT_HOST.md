@@ -239,8 +239,9 @@ Preserve the service journal.
 
 # Spentness generation
 
-The service allows 14 days for a run. Six helpers can each consume their 48-hour
-deadline. The remaining two days cover export and upload work.
+The service allows three days for a run. The two spentness pipelines run
+concurrently, and each has a 48-hour deadline. The remaining day covers export
+and upload work.
 
 The schema 2 publisher requires a second independently synchronized archive source.
 Configure `RELEASE_STATE_ORACLE_SOURCE` and `RELEASE_STATE_ORACLE_ID` in the host
@@ -250,7 +251,7 @@ environment before enabling the timer. The deployment script installs both
 Set `RELEASE_STATE_DATA_DIR` on persistent disk with room for two ordinary archive
 replay states. The publisher advances those states to the selected checkpoint.
 It leaves both running source nodes unchanged. Verification uses temporary disk
-under `$TMPDIR`; configure that variable on real disk for the service account.
+under `$RELEASE_STATE_DATA_DIR/tmp`, which the publisher removes after each run.
 
 Keep version 2 bundles while supported nodes may need their artifacts for recovery.
 Provision reviewed artifacts on seeds and test a client with only those seeds

@@ -19,7 +19,13 @@
 //!
 //! Until a run completes, [`SpentnessStatus`] gates consumers of monetary state.
 
-use std::{path::PathBuf, sync::Arc};
+use std::{
+    path::PathBuf,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+};
 
 use thiserror::Error;
 use tokio::sync::watch;
@@ -250,6 +256,8 @@ pub(super) struct Runtime {
     /// Present only while applying. The rebuild needs retained bodies, not the artifact.
     applying: Option<Arc<ApplyingRun>>,
     status: watch::Sender<SpentnessStatus>,
+    /// Mirrors `status != Usable`, so request gates avoid the watch channel's lock.
+    incomplete: Arc<AtomicBool>,
 }
 
 impl Runtime {
@@ -258,6 +266,7 @@ impl Runtime {
             setup,
             applying: None,
             status: watch::channel(SpentnessStatus::Usable).0,
+            incomplete: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -296,12 +305,12 @@ impl ZakuraDb {
 
     /// Whether this database currently exposes an incomplete terminal-survivor set.
     pub fn spentness_incomplete(&self) -> bool {
-        self.spentness_status() != SpentnessStatus::Usable
+        self.spentness.incomplete.load(Ordering::Acquire)
     }
 
     /// Whether the ordered writer has stopped at the terminal height to rebuild indexes.
     pub fn spentness_rebuilding(&self) -> bool {
-        self.spentness_status() == SpentnessStatus::Rebuilding
+        self.spentness_incomplete() && self.spentness_status() == SpentnessStatus::Rebuilding
     }
 
     pub(crate) fn subscribe_spentness(&self) -> watch::Receiver<SpentnessStatus> {
@@ -340,8 +349,9 @@ impl ZakuraDb {
     }
 
     fn set_spentness_status(&self, status: SpentnessStatus) {
-        self.spentness.status.send_replace(status);
         let usable = status == SpentnessStatus::Usable;
+        self.spentness.incomplete.store(!usable, Ordering::Release);
+        self.spentness.status.send_replace(status);
         metrics::gauge!("state.spentness.usable").set(if usable { 1.0 } else { 0.0 });
     }
 }

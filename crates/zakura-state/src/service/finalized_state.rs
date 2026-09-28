@@ -970,7 +970,9 @@ impl FinalizedState {
         ) -> Result<(), CommitCheckpointVerifiedError>,
     {
         let mut vct_authentication = VctAuthenticationProof::NotAuthenticated;
-        check_spentness_admits(self.db.spentness_status(), &finalizable_block)?;
+        if self.db.spentness_incomplete() {
+            check_spentness_admits(self.db.spentness_status(), &finalizable_block)?;
+        }
         let (height, hash, finalized, prev_note_commitment_trees, retention, fast_write) =
             match finalizable_block {
                 FinalizableBlock::Checkpoint {

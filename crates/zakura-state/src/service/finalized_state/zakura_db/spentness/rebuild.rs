@@ -315,7 +315,7 @@ impl ZakuraDb {
             .collect()
     }
 
-    /// Audit the rebuilt state at H, clear the omitted outputs, and complete.
+    /// Audit the rebuilt state at H, clear the omitted outputs, prune, and complete.
     fn complete_rebuild(
         &self,
         commitment: Commitment,
@@ -346,6 +346,7 @@ impl ZakuraDb {
             OutputLocation::from_usize(Height(0), 0, 0),
             OutputLocation::from_usize(Height(terminal.0 + 1), 0, 0),
         );
+        self.prepare_completion_pruning(&mut batch, terminal);
         let progress = Progress::Complete {
             rollback_floor: terminal.0,
             commitment,
@@ -358,6 +359,31 @@ impl ZakuraDb {
             "spentness index rebuild verified and complete"
         );
         Ok(())
+    }
+
+    /// In pruned mode, delete raw transactions below the retention window at H.
+    ///
+    /// Construction retains every body for the rebuild. The first block after H may
+    /// be a non-checkpoint block, and online pruning only advances from its marker.
+    fn prepare_completion_pruning(&self, batch: &mut DiskWriteBatch, terminal: Height) {
+        let Some(pruning) = self.config().pruning_config() else {
+            return;
+        };
+        let prune_from = self.lowest_retained_height().unwrap_or(Height(1));
+        // Keep `tx_retention` blocks below H, as online pruning would.
+        let Some(max_prunable) = terminal.0.checked_sub(pruning.tx_retention) else {
+            return;
+        };
+        let prune_until = Height(max_prunable + 1);
+        if prune_from < prune_until {
+            tracing::info!(
+                ?prune_from,
+                ?prune_until,
+                tip = ?terminal,
+                "pruning raw transaction history retained for the spentness rebuild",
+            );
+            batch.prepare_prune_batch(self, prune_from, prune_until);
+        }
     }
 
     fn omitted_outputs_cf(&self) -> impl rocksdb::AsColumnFamilyRef + '_ {

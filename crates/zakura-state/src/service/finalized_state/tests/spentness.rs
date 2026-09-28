@@ -142,9 +142,21 @@ impl Fixture {
     }
 
     fn open(&self) -> FinalizedState {
-        let mut state =
-            FinalizedState::new_with_spentness(&self.config, &self.network, self.spentness.clone())
-                .unwrap();
+        self.open_with_storage_validation(true)
+    }
+
+    /// Open the fixture state. Without validation, tests can use a short pruning window.
+    fn open_with_storage_validation(&self, validate_storage_mode: bool) -> FinalizedState {
+        let mut state = FinalizedState::new_with_debug_and_storage_validation(
+            &self.config,
+            &self.network,
+            false,
+            false,
+            validate_storage_mode,
+            true,
+            self.spentness.clone(),
+        )
+        .unwrap();
         if !matches!(
             state.db.spentness_progress().unwrap(),
             Some(Progress::Complete { .. })
@@ -833,6 +845,49 @@ fn spentness_pruning_waits_for_rebuild_and_rediscovers_backlog() {
     };
     assert!(state.db.output_location(&outpoint).is_some());
     assert!(state.db.utxo(&outpoint).is_some());
+}
+
+#[test]
+fn spentness_completion_prunes_history_when_h_is_the_last_checkpoint() {
+    let _guard = zakura_test::init();
+    let (blocks, network) = generated_transparent_chain();
+    let mut fixture = Fixture::from_blocks(blocks, network, None);
+    let retention = 50;
+    fixture.config.storage_mode = crate::StorageMode::Pruned(crate::PruningConfig {
+        tx_retention: retention,
+    });
+    let terminal = fixture.commitment.terminal_height;
+    // No checkpoint block follows H, so checkpoint skipping never drains the retained bodies.
+    let mut state = fixture
+        .open_with_storage_validation(false)
+        .with_checkpoint_raw_tx_retention(Height(terminal), &fixture.config);
+    fixture.commit(&mut state, 0..=terminal.try_into().unwrap());
+    while state.db.spentness_rebuilding() {
+        state.rebuild_spentness_step(&mut || Ok(())).unwrap();
+    }
+    let retained_from = terminal + 1 - retention;
+    assert_eq!(
+        state.db.lowest_retained_height(),
+        Some(Height(retained_from))
+    );
+    assert!(state.db.contains_body_at_height(Height(0)));
+    for height in [1, retained_from - 1] {
+        assert!(!state.db.contains_body_at_height(Height(height)));
+    }
+    assert!(state.db.contains_body_at_height(Height(retained_from)));
+
+    // Online pruning continues from the marker.
+    let next = synthetic_block(fixture.blocks.last().unwrap(), terminal + 1, Vec::new());
+    state
+        .commit_finalized_direct(
+            CheckpointVerifiedBlock::from(next).into(),
+            None,
+            None,
+            "pruning after the last checkpoint",
+        )
+        .unwrap();
+    assert!(!state.db.contains_body_at_height(Height(retained_from)));
+    assert!(state.db.contains_body_at_height(Height(retained_from + 1)));
 }
 
 #[tokio::test(flavor = "multi_thread")]

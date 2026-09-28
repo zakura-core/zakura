@@ -189,28 +189,58 @@ from HTTP.
 The writer persists one versioned record with each atomic block batch:
 
 ```text
-Applying { commitment, height, block_hash, next_ordinal, survivor_value }
-  -> Rebuilding { commitment, indexed_height, replay_accounting, survivor_value }
+Applying { commitment, height, block_hash, next_ordinal, omitted_outputs }
+  -> Rebuilding { commitment, indexed_height, transparent_value, unspent_omitted }
   -> Complete { commitment, rollback_floor }
 ```
 
 Applying consumes every output bit, including genesis and non-address scripts.
 It inserts terminal survivors without resolving or deleting spent input UTXOs.
-It retains raw transactions and defers address indexes. It preserves shielded
-and deferred accounting. The transparent balance at this stage describes the
-survivors created so far, so construction gates block monetary consumers.
+It writes every other output after genesis to the temporary
+`spentness_omitted_outputs` column family, keyed by output location. This column
+family holds spent outputs until the rebuild, so construction needs extra disk
+space for them. Applying retains raw transactions and defers address indexes.
+It preserves shielded and deferred accounting. The transparent balance at this
+stage describes the survivors created so far, so construction gates block
+monetary consumers.
+
+Construction cannot compute the NSM value balance or ZIP 234 issuance, because
+both depend on spent output values. Ordinary state seeds the NSM balance at the
+block before NU7 activation. The release authority therefore rejects a commitment
+when H + 1 reaches NU7 activation on its network. The NSM leg stays zero through
+H, as it does in ordinary state, and the first ordinary block after H seeds it
+from exact pools.
 
 At H, the writer checks the exact hash, output count, and VCT handoff frontiers.
 It then holds the consensus tip at H while it replays retained transactions.
-The replay uses transaction-location indexes and caches at most 64 creating
-transactions. It restores address balances, received totals, first-receive
-locations, address UTXOs, transaction indexes, and historical value pools.
-Each replay block commits its index updates and cursor in one batch.
+Each replay step takes a window of up to 1,000 blocks or 64 MiB of serialized
+blocks. The step deserializes the window's bodies and resolves its spends in
+parallel. Each spend reads the creating transaction's location and then the
+omitted output at that location. A serial pass restores address balances,
+received totals, first-receive locations, address UTXOs, transaction indexes,
+and historical value pools. The replay copies every pool except transparent from
+the saved block accounting. One batch commits the window's index updates, the
+deletion of each consumed omitted output, and the cursor.
 
-The final audit compares complete survivor entries with retained-body replay.
-It also checks address ownership, address balances, output count, and terminal
-pool values. The replay and audit never change live consensus UTXOs. A mismatch
-stops the writer without attributing the failure to a peer.
+The replay rejects a spend of a retained output, a missing or consumed output,
+an output that follows its spend, a genesis output, an immature or disallowed
+coinbase spend, and a transaction whose outputs exceed its inputs. Each spend
+therefore consumes a distinct omitted output. At H, the final audit requires
+that no omitted output remains. The omitted outputs are then exactly the spent
+outputs, so the survivors are exactly the terminal UTXO set. The audit also
+requires the replayed transparent pool to equal the survivors' value.
+
+The final audit then scans the address UTXO index once, in key order. Each
+entry must name a survivor with an address. Entries that share an address
+location must share an address. That address's balance row must name the same
+location and hold the entries' total. The index must hold one entry per survivor
+with an address, and every nonzero balance must belong to an indexed address.
+The audit writes nothing, so a restart repeats it from the beginning.
+
+The replay and audit never change live consensus UTXOs. A mismatch stops the
+writer without attributing the failure to a peer. A restart repeats the same
+failure, so the error tells the operator to delete the state and resync with
+hints off.
 
 State access gates block pending-UTXO responses, monetary RPCs, mempool checks,
 mining checks, and ordinary semantic admission during construction. Every state
@@ -218,22 +248,25 @@ request variant is classified as allowed or denied, so a new variant needs a
 review decision. Synced blocks wait for completion before semantic verification.
 Block proposals and `submitblock` fail immediately. `getblockchaininfo` reports
 the real tip and omits `chainSupply` and `valuePools`. Header control messages
-continue during replay and the final audit. The legacy syncer waits before
+continue between replay steps and audit chunks. The legacy syncer waits before
 starting verifier deadlines. The native stall watchdog pauses during rebuilding.
-Completion lifts the gates and releases retained history to the existing pruning
-backlog.
+Completion lifts the gates. In pruned mode, the completion batch also deletes raw
+transactions below the retention window at H. Online pruning continues from that
+marker.
 
 Startup resumes Applying with its original recognized commitment, even when a
 new release selects a later commitment. If the artifact is missing, restore
 identical bytes in the reported cache path or set `spentness.artifact_file`.
-Rebuilding needs retained bodies but no bitmap. Startup finishes that replay
-before exposing state. Shutdown interrupts the replay, and a restart resumes it. Completed databases need no bitmap for later operation.
-Unknown or revoked commitments stop startup with a compatibility error.
+Rebuilding needs retained bodies and omitted outputs but no bitmap. Startup
+finishes that replay before exposing state. Shutdown interrupts the replay, and a
+restart resumes it. Completed databases need no bitmap and no recognized
+commitment. Startup checks only their chain identity and revocation. Unknown or
+revoked commitments stop incomplete runs with a compatibility error.
 
-Database format 30 gives this construction a separate major-version directory.
-The existing upgrade mechanism reuses ordinary format-29 data. Older binaries
-do not open format-30 data as ordinary state. Incomplete runs also require the
-same database format and indexer feature when they resume.
+Database format 30.0.0 gives this construction a separate major-version
+directory. The existing upgrade mechanism reuses ordinary format-29 data. Older
+binaries do not open format-30 data as ordinary state. Incomplete runs also
+require the same database format and indexer feature when they resume.
 
 Read-only opens, exports, offline pruning, and offline rollback reject incomplete
 state. After completion, rollback cannot cross H or a stricter VCT boundary.
@@ -249,11 +282,12 @@ error without changing the record.
 
 `state.spentness.construction_height` and `state.spentness.rebuilt_height` report
 the two passes. `SpentnessStatus` and `state.spentness.usable` report consumer
-availability. The writer suppresses provisional value-pool metrics until completion. The
-`state.spentness.utxo.*` counters describe initial-pass reads, inserts, deletes,
-and omissions. Initial-pass reads and deletes remain zero. The preparation,
-commit, and rebuild-audit histograms separate those costs. Benchmark the entire
-path through the first ordinary commit above H before claiming a speedup.
+availability. The writer suppresses provisional value-pool metrics until completion.
+The `state.spentness.utxo.inserts` and `state.spentness.utxo.omitted` counters
+describe the initial pass. The preparation, commit, and rebuild-audit histograms
+separate those costs. The rebuild repeats the spent-output reads that the initial
+pass skipped. Benchmark the entire path through the first ordinary commit above H
+before claiming a speedup.
 
 ## Release-state schema 2
 

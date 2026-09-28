@@ -15,8 +15,8 @@ use super::super::{
     commitment_aux::{self, FinalFrontiers, FixtureSource},
     disk_format::{IntoDisk, OutputLocation, RawBytes},
     zakura_db::spentness::{
-        audit_progress_with_setup, Progress, ReleaseAuthority, ReplayCache, SpentnessConfig,
-        SpentnessSetup, METADATA,
+        audit_progress_with_setup, Progress, ReleaseAuthority, SpentnessConfig, SpentnessSetup,
+        METADATA, OMITTED_OUTPUTS,
     },
     CheckpointVerifiedBlock, FinalizedState,
 };
@@ -50,10 +50,11 @@ impl Fixture {
         )
     }
 
+    /// Build a fixture whose artifact flips the membership bit at `flipped`, if set.
     fn from_blocks(
         blocks: Vec<Arc<Block>>,
         network: Network,
-        omitted: Option<OutputLocation>,
+        flipped: Option<OutputLocation>,
     ) -> Self {
         let directory = tempfile::tempdir().unwrap();
         let terminal = Height((blocks.len() - 1).try_into().unwrap());
@@ -89,7 +90,9 @@ impl Fixture {
                         output_index,
                     );
                     let survives = ordinary.db.utxo_by_location(location).is_some();
-                    encoder.push(survives && omitted != Some(location)).unwrap();
+                    encoder
+                        .push(survives != (flipped == Some(location)))
+                        .unwrap();
                 }
             }
         }
@@ -142,9 +145,21 @@ impl Fixture {
     }
 
     fn open(&self) -> FinalizedState {
-        let mut state =
-            FinalizedState::new_with_spentness(&self.config, &self.network, self.spentness.clone())
-                .unwrap();
+        self.open_with_storage_validation(true)
+    }
+
+    /// Open the fixture state. Without validation, tests can use a short pruning window.
+    fn open_with_storage_validation(&self, validate_storage_mode: bool) -> FinalizedState {
+        let mut state = FinalizedState::new_with_debug_and_storage_validation(
+            &self.config,
+            &self.network,
+            false,
+            false,
+            validate_storage_mode,
+            true,
+            self.spentness.clone(),
+        )
+        .unwrap();
         if !matches!(
             state.db.spentness_progress().unwrap(),
             Some(Progress::Complete { .. })
@@ -170,6 +185,11 @@ impl Fixture {
             );
         }
         state
+    }
+
+    /// Commit every fixture block through H.
+    fn commit_all(&self, state: &mut FinalizedState) {
+        self.commit(state, 0..=self.blocks.len() - 1);
     }
 
     fn commit(&self, state: &mut FinalizedState, heights: std::ops::RangeInclusive<usize>) {
@@ -210,18 +230,18 @@ fn spentness_rebuild_matches_ordinary_state_and_resumes_applying() {
     fixture.commit(&mut state, 5..=10);
     assert!(state.db.spentness_rebuilding());
     let fixed_utxos = entries(&state, "utxo_by_out_loc");
-    let mut cache = ReplayCache::default();
     let mut yields = 0;
     while state.db.spentness_rebuilding() {
         state
-            .rebuild_spentness_step(&mut cache, &mut || {
+            .rebuild_spentness_step(&mut || {
                 yields += 1;
                 Ok(())
             })
             .unwrap();
         assert_eq!(entries(&state, "utxo_by_out_loc"), fixed_utxos);
     }
-    assert!(yields >= 11);
+    // Three replay windows, then the final audit.
+    assert!(yields >= 4);
     assert_eq!(
         state.db.finalized_value_pool(),
         fixture.ordinary.db.finalized_value_pool()
@@ -254,15 +274,14 @@ fn spentness_rebuild_rejects_false_terminal_membership() {
     let mut state = fixture.open();
     fixture.commit(&mut state, 0..=10);
     let fixed_utxos = entries(&state, "utxo_by_out_loc");
-    let mut cache = ReplayCache::default();
     let error = loop {
-        match state.rebuild_spentness_step(&mut cache, &mut || Ok(())) {
+        match state.rebuild_spentness_step(&mut || Ok(())) {
             Ok(false) => {}
             Ok(true) => panic!("false membership must never publish completion"),
             Err(error) => break error,
         }
     };
-    assert!(error.to_string().contains("pools"), "{error}");
+    assert!(error.to_string().contains("omits outputs"), "{error}");
     assert!(state.db.spentness_rebuilding());
     assert_eq!(entries(&state, "utxo_by_out_loc"), fixed_utxos);
 }
@@ -304,11 +323,8 @@ fn spentness_reconciles_failed_batch_outcomes() {
             if next <= 10 {
                 fixture.commit(&mut state, next..=10);
             }
-            let mut cache = ReplayCache::default();
             while state.db.spentness_rebuilding() {
-                state
-                    .rebuild_spentness_step(&mut cache, &mut || Ok(()))
-                    .unwrap();
+                state.rebuild_spentness_step(&mut || Ok(())).unwrap();
             }
             assert_eq!(
                 entries(&state, "utxo_by_out_loc"),
@@ -328,16 +344,13 @@ fn spentness_rebuild_resumes_without_artifact_and_keeps_rollback_floor() {
     let mut fixture = Fixture::new(false);
     let mut state = fixture.open();
     fixture.commit(&mut state, 0..=10);
-    let mut cache = ReplayCache::default();
-    for _ in 0..6 {
-        assert!(!state
-            .rebuild_spentness_step(&mut cache, &mut || Ok(()))
-            .unwrap());
+    for _ in 0..2 {
+        assert!(!state.rebuild_spentness_step(&mut || Ok(())).unwrap());
     }
     assert!(matches!(
         state.db.spentness_progress().unwrap(),
         Some(Progress::Rebuilding {
-            indexed_height: Some(5),
+            indexed_height: Some(8),
             ..
         })
     ));
@@ -379,6 +392,119 @@ fn spentness_rebuild_resumes_without_artifact_and_keeps_rollback_floor() {
 }
 
 #[test]
+fn spentness_completed_state_opens_after_release_drops_commitment() {
+    let _guard = zakura_test::init();
+    let fixture = Fixture::new(false);
+    let mut state = fixture.open();
+    fixture.commit(&mut state, 0..=10);
+    while state.db.spentness_rebuilding() {
+        state.rebuild_spentness_step(&mut || Ok(())).unwrap();
+    }
+    drop(state);
+    // The compiled Mainnet release lists no commitments.
+    let config = SpentnessConfig {
+        mode: Mode::Require,
+        artifact: None,
+    };
+    assert!(
+        crate::spentness_artifact_requirement(&fixture.config, &config, &fixture.network)
+            .unwrap()
+            .is_none()
+    );
+    let dropped = fixture.setup(Vec::new(), Vec::new());
+    let state =
+        FinalizedState::new_with_spentness(&fixture.config, &fixture.network, dropped).unwrap();
+    assert!(!state.db.spentness_incomplete());
+    drop(state);
+    let revoked = fixture.setup(Vec::new(), vec![fixture.commitment.sha256]);
+    let error = FinalizedState::new_with_spentness(&fixture.config, &fixture.network, revoked)
+        .err()
+        .unwrap();
+    assert!(error.to_string().contains("revoked"), "{error}");
+}
+
+#[test]
+fn spentness_audit_resumes_after_a_restart_at_the_terminal_cursor() {
+    let _guard = zakura_test::init();
+    let fixture = Fixture::new(false);
+    let mut state = fixture.open();
+    fixture.commit(&mut state, 0..=10);
+    while !matches!(
+        state.db.spentness_progress().unwrap(),
+        Some(Progress::Rebuilding {
+            indexed_height: Some(10),
+            ..
+        })
+    ) {
+        assert!(!state.rebuild_spentness_step(&mut || Ok(())).unwrap());
+    }
+    // A kill during the final audit leaves this record, because the audit writes nothing.
+    drop(state);
+    let state = fixture.open();
+    assert!(!state.db.spentness_incomplete());
+    for name in [
+        "utxo_by_out_loc",
+        "utxo_loc_by_transparent_addr_loc",
+        "balance_by_transparent_addr",
+        OMITTED_OUTPUTS,
+    ] {
+        assert_eq!(
+            entries(&state, name),
+            entries(&fixture.ordinary, name),
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn spentness_rollback_reaches_the_completed_handoff_from_above() {
+    let _guard = zakura_test::init();
+    let fixture = Fixture::new(false);
+    let mut state = fixture.open();
+    fixture.commit(&mut state, 0..=10);
+    while state.db.spentness_rebuilding() {
+        state.rebuild_spentness_step(&mut || Ok(())).unwrap();
+    }
+    let transparent = [
+        "utxo_by_out_loc",
+        "utxo_loc_by_transparent_addr_loc",
+        "balance_by_transparent_addr",
+        "tx_loc_by_transparent_addr_loc",
+        "tip_chain_value_pool",
+    ];
+    let at_handoff: Vec<_> = transparent
+        .iter()
+        .map(|name| entries(&state, name))
+        .collect();
+    let mut previous = fixture.blocks.last().unwrap().clone();
+    for height in 11..=12 {
+        let next = synthetic_block(&previous, height, Vec::new());
+        state
+            .commit_finalized_direct(
+                CheckpointVerifiedBlock::from(next.clone()).into(),
+                None,
+                None,
+                "blocks above the handoff",
+            )
+            .unwrap();
+        previous = next;
+    }
+    drop(state);
+    let options = crate::RollbackFinalizedStateOptions {
+        target_height: Height(10),
+        keep_rolled_back_blocks: false,
+        max_checkpoint_height: None,
+    };
+    crate::rollback_finalized_state(fixture.config.clone(), &Network::Mainnet, options).unwrap();
+    let state = fixture.open();
+    assert_eq!(state.db.finalized_tip_height(), Some(Height(10)));
+    assert!(!state.db.spentness_incomplete());
+    for (name, expected) in transparent.iter().zip(at_handoff) {
+        assert_eq!(entries(&state, name), expected, "{name}");
+    }
+}
+
+#[test]
 fn spentness_incomplete_open_guards_preserve_original_commitment() {
     let _guard = zakura_test::init();
     let fixture = Fixture::new(false);
@@ -412,10 +538,11 @@ fn spentness_incomplete_open_guards_preserve_original_commitment() {
             .contains("revoked")
     );
     assert!(crate::init_read_only(fixture.config.clone(), &Network::Mainnet).is_err());
+    // Older binaries look for the previous major version, which construction never writes.
     assert!(crate::config::database_format_version_on_disk(
         &fixture.config,
         crate::constants::STATE_DATABASE_KIND,
-        28,
+        crate::constants::state_database_format_version_in_code().major - 1,
         &Network::Mainnet
     )
     .unwrap()
@@ -476,11 +603,8 @@ async fn spentness_read_service_gates_partial_indexes() {
         .await
         .is_ok());
     fixture.commit(&mut state, 5..=10);
-    let mut cache = ReplayCache::default();
     while state.db.spentness_rebuilding() {
-        state
-            .rebuild_spentness_step(&mut cache, &mut || Ok(()))
-            .unwrap();
+        state.rebuild_spentness_step(&mut || Ok(())).unwrap();
     }
     assert!(reader
         .oneshot(crate::ReadRequest::AddressBalance(Default::default()))
@@ -537,71 +661,98 @@ fn spending_transaction(
     outpoint: zakura_chain::transparent::OutPoint,
     output: zakura_chain::transparent::Output,
 ) -> Arc<zakura_chain::transaction::Transaction> {
+    transparent_transaction(vec![outpoint], vec![output])
+}
+
+fn transparent_transaction(
+    outpoints: Vec<zakura_chain::transparent::OutPoint>,
+    outputs: Vec<zakura_chain::transparent::Output>,
+) -> Arc<zakura_chain::transaction::Transaction> {
     use zakura_chain::{
         transaction::{LockTime, Transaction},
         transparent::{Input, Script},
     };
     Arc::new(Transaction::V1 {
-        inputs: vec![Input::PrevOut {
-            outpoint,
-            unlock_script: Script::new(&[]),
-            sequence: u32::MAX,
-        }],
-        outputs: vec![output],
+        inputs: outpoints
+            .into_iter()
+            .map(|outpoint| Input::PrevOut {
+                outpoint,
+                unlock_script: Script::new(&[]),
+                sequence: u32::MAX,
+            })
+            .collect(),
+        outputs,
         lock_time: LockTime::Height(Height(0)),
     })
 }
 
+/// A one-zatoshi output to a distinct address for each `index`.
+fn indexed_output(index: u8) -> zakura_chain::transparent::Output {
+    zakura_chain::transparent::Output {
+        value: zakura_chain::amount::Amount::try_from(1u64).unwrap(),
+        lock_script: zakura_chain::transparent::Address::from_pub_key_hash(
+            zakura_chain::parameters::NetworkKind::Testnet,
+            [index; 20],
+        )
+        .script(),
+    }
+}
+
+/// Outputs that one transaction spends from creators in distinct transactions.
+const FAN_OUT: u8 = 70;
+
+/// The terminal height of the generated chain.
+const GENERATED_TIP: u32 = 104;
+
+/// A transparent chain through [`GENERATED_TIP`] with same-block, cross-window, and
+/// many-creator spends.
 fn generated_transparent_chain() -> (Vec<Arc<Block>>, Network) {
-    use zakura_chain::{
-        parameters::testnet::{ConfiguredCheckpoints, ParametersBuilder},
-        transparent::OutPoint,
-    };
+    use zakura_chain::transparent::OutPoint;
     let genesis: Arc<Block> = Arc::new(
         zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES[..]
             .zcash_deserialize_into()
             .unwrap(),
     );
-    let network = ParametersBuilder::default()
-        .with_genesis_hash(genesis.hash())
-        .unwrap()
-        .with_checkpoints(ConfiguredCheckpoints::HeightsAndHashes(vec![
-            (Height(0), genesis.hash()),
-            (Height(3_000_000), zakura_chain::block::Hash([9; 32])),
-        ]))
-        .unwrap()
-        .with_unshielded_coinbase_spends(true)
-        .to_network()
-        .unwrap();
+    let outpoint = |transaction: &Arc<zakura_chain::transaction::Transaction>, index| OutPoint {
+        hash: transaction.hash(),
+        index,
+    };
     let mut blocks = vec![genesis];
-    for height in 1..=103 {
+    let mut fan_out = Vec::new();
+    for height in 1..=GENERATED_TIP {
         let mut transactions = Vec::new();
         if height == 101 {
             let source = &blocks[1].transactions[0];
-            let first = spending_transaction(
-                OutPoint {
-                    hash: source.hash(),
-                    index: 0,
-                },
-                source.outputs()[0].clone(),
-            );
-            let second = spending_transaction(
-                OutPoint {
-                    hash: first.hash(),
-                    index: 0,
-                },
-                first.outputs()[0].clone(),
-            );
+            let first = spending_transaction(outpoint(source, 0), source.outputs()[0].clone());
+            let second = spending_transaction(outpoint(&first, 0), first.outputs()[0].clone());
             transactions.extend([first, second]);
         }
         if height == 102 {
             let source = &blocks[2].transactions[0];
             transactions.push(spending_transaction(
-                OutPoint {
-                    hash: source.hash(),
-                    index: 2,
-                },
+                outpoint(source, 2),
                 source.outputs()[2].clone(),
+            ));
+            transactions.push(transparent_transaction(
+                vec![outpoint(source, 0)],
+                (0..FAN_OUT).map(indexed_output).collect(),
+            ));
+        }
+        if height == 103 {
+            let fan = blocks[102].transactions.last().unwrap().clone();
+            fan_out = (0..FAN_OUT)
+                .map(|index| {
+                    spending_transaction(outpoint(&fan, index.into()), indexed_output(index))
+                })
+                .collect();
+            transactions.extend(fan_out.iter().cloned());
+        }
+        if height == GENERATED_TIP {
+            let mut sweep = indexed_output(0);
+            sweep.value = zakura_chain::amount::Amount::try_from(u64::from(FAN_OUT)).unwrap();
+            transactions.push(transparent_transaction(
+                fan_out.iter().map(|creator| outpoint(creator, 0)).collect(),
+                vec![sweep],
             ));
         }
         blocks.push(synthetic_block(
@@ -610,7 +761,34 @@ fn generated_transparent_chain() -> (Vec<Arc<Block>>, Network) {
             transactions,
         ));
     }
+    let network = generated_network(&blocks[0], None);
     (blocks, network)
+}
+
+/// A configured network for the generated chain, with NU7 at `nu7` if set.
+fn generated_network(genesis: &Block, nu7: Option<u32>) -> Network {
+    use zakura_chain::parameters::testnet::{
+        ConfiguredActivationHeights, ConfiguredCheckpoints, ParametersBuilder,
+    };
+    let mut builder = ParametersBuilder::default()
+        .with_genesis_hash(genesis.hash())
+        .unwrap()
+        .with_checkpoints(ConfiguredCheckpoints::HeightsAndHashes(vec![
+            (Height(0), genesis.hash()),
+            (Height(3_000_000), zakura_chain::block::Hash([9; 32])),
+        ]))
+        .unwrap()
+        .with_unshielded_coinbase_spends(true);
+    if let Some(nu7) = nu7 {
+        builder = builder
+            .with_activation_heights(ConfiguredActivationHeights {
+                nu7: Some(nu7),
+                ..Default::default()
+            })
+            .unwrap()
+            .clear_funding_streams();
+    }
+    builder.to_network().unwrap()
 }
 
 #[test]
@@ -621,8 +799,12 @@ fn spentness_generated_spends_match_all_indexes_and_validate_after_handoff() {
     let (blocks, network) = generated_transparent_chain();
     let fixture = Fixture::from_blocks(blocks, network, None);
     let mut state = fixture.open();
-    fixture.commit(&mut state, 0..=103);
-    let blocked = synthetic_block(fixture.blocks.last().unwrap(), 104, Vec::new());
+    fixture.commit_all(&mut state);
+    let blocked = synthetic_block(
+        fixture.blocks.last().unwrap(),
+        GENERATED_TIP + 1,
+        Vec::new(),
+    );
     assert!(state
         .commit_finalized_direct(
             CheckpointVerifiedBlock::from(blocked).into(),
@@ -631,13 +813,10 @@ fn spentness_generated_spends_match_all_indexes_and_validate_after_handoff() {
             "blocked above handoff"
         )
         .is_err());
-    assert_eq!(state.db.finalized_tip_height(), Some(Height(103)));
+    assert_eq!(state.db.finalized_tip_height(), Some(Height(GENERATED_TIP)));
     let fixed_utxos = entries(&state, "utxo_by_out_loc");
-    let mut cache = ReplayCache::default();
     while state.db.spentness_rebuilding() {
-        state
-            .rebuild_spentness_step(&mut cache, &mut || Ok(()))
-            .unwrap();
+        state.rebuild_spentness_step(&mut || Ok(())).unwrap();
         assert_eq!(entries(&state, "utxo_by_out_loc"), fixed_utxos);
     }
     for name in super::super::STATE_COLUMN_FAMILIES_IN_CODE {
@@ -658,14 +837,19 @@ fn spentness_generated_spends_match_all_indexes_and_validate_after_handoff() {
         },
         source.outputs()[0].clone(),
     );
-    let next = synthetic_block(fixture.blocks.last().unwrap(), 104, vec![spend.clone()]);
+    let next = synthetic_block(
+        fixture.blocks.last().unwrap(),
+        GENERATED_TIP + 1,
+        vec![spend.clone()],
+    );
     let prepared = SemanticallyVerifiedBlock::from(next.clone());
     transparent_spend(
         &prepared,
         &CreatedUtxos::default(),
         &HashMap::new(),
         &state.db,
-    ).unwrap();
+    )
+    .unwrap();
     state
         .commit_finalized_direct(
             CheckpointVerifiedBlock::from(next.clone()).into(),
@@ -674,7 +858,7 @@ fn spentness_generated_spends_match_all_indexes_and_validate_after_handoff() {
             "post-handoff ordinary commit",
         )
         .unwrap();
-    let double_spend = synthetic_block(&next, 105, vec![spend]);
+    let double_spend = synthetic_block(&next, GENERATED_TIP + 2, vec![spend]);
     assert!(transparent_spend(
         &SemanticallyVerifiedBlock::from(double_spend),
         &CreatedUtxos::default(),
@@ -682,7 +866,7 @@ fn spentness_generated_spends_match_all_indexes_and_validate_after_handoff() {
         &state.db
     )
     .is_err());
-    let source = &fixture.blocks[103].transactions[0];
+    let source = &fixture.blocks.last().unwrap().transactions[0];
     let immature = spending_transaction(
         OutPoint {
             hash: source.hash(),
@@ -691,7 +875,7 @@ fn spentness_generated_spends_match_all_indexes_and_validate_after_handoff() {
         source.outputs()[0].clone(),
     );
     assert!(transparent_spend(
-        &SemanticallyVerifiedBlock::from(synthetic_block(&next, 105, vec![immature])),
+        &SemanticallyVerifiedBlock::from(synthetic_block(&next, GENERATED_TIP + 2, vec![immature])),
         &CreatedUtxos::default(),
         &HashMap::new(),
         &state.db
@@ -708,7 +892,7 @@ fn spentness_generated_spends_match_all_indexes_and_validate_after_handoff() {
         excess,
     );
     assert!(transparent_spend(
-        &SemanticallyVerifiedBlock::from(synthetic_block(&next, 105, vec![negative])),
+        &SemanticallyVerifiedBlock::from(synthetic_block(&next, GENERATED_TIP + 2, vec![negative])),
         &CreatedUtxos::default(),
         &HashMap::new(),
         &state.db
@@ -726,19 +910,105 @@ fn spentness_audit_detects_zero_value_non_address_omission() {
         Some(OutputLocation::from_usize(Height(1), 0, 1)),
     );
     let mut state = fixture.open();
-    fixture.commit(&mut state, 0..=103);
-    let mut cache = ReplayCache::default();
+    fixture.commit_all(&mut state);
     let error = loop {
-        match state.rebuild_spentness_step(&mut cache, &mut || Ok(())) {
+        match state.rebuild_spentness_step(&mut || Ok(())) {
             Ok(false) => {}
             Ok(true) => panic!("zero-valued non-address outputs still require exact membership"),
             Err(error) => break error,
         }
     };
-    assert!(
-        error.to_string().contains("terminal UTXO entry differs"),
-        "{error}"
+    assert!(error.to_string().contains("omits outputs"), "{error}");
+}
+
+#[test]
+fn spentness_rebuild_rejects_retained_spent_output() {
+    let _guard = zakura_test::init();
+    let (blocks, network) = generated_transparent_chain();
+    // Block 101 spends this coinbase output, but the artifact retains it.
+    let fixture = Fixture::from_blocks(
+        blocks,
+        network,
+        Some(OutputLocation::from_usize(Height(1), 0, 0)),
     );
+    let mut state = fixture.open();
+    fixture.commit_all(&mut state);
+    let fixed_utxos = entries(&state, "utxo_by_out_loc");
+    let error = loop {
+        match state.rebuild_spentness_step(&mut || Ok(())) {
+            Ok(false) => {}
+            Ok(true) => panic!("a retained spent output must never publish completion"),
+            Err(error) => break error,
+        }
+    };
+    assert!(error.to_string().contains("artifact retains"), "{error}");
+    assert!(error.to_string().contains("delete the state"), "{error}");
+    assert!(state.db.spentness_rebuilding());
+    assert_eq!(entries(&state, "utxo_by_out_loc"), fixed_utxos);
+}
+
+#[test]
+fn spentness_construction_stops_before_the_nu7_seed_block() {
+    let _guard = zakura_test::init();
+    let (blocks, _) = generated_transparent_chain();
+    let tip = GENERATED_TIP;
+    // NU7 at H or H + 1 puts the seed block at or before H.
+    for nu7 in [tip, tip + 1] {
+        let (blocks, network) = generated_transparent_chain();
+        let fixture = Fixture::from_blocks(blocks, network, None);
+        let network = generated_network(&fixture.blocks[0], Some(nu7));
+        let mut setup = fixture.spentness.clone();
+        setup.authority = Arc::new(ReleaseAuthority::new(
+            &network,
+            vec![fixture.commitment.clone()],
+            Vec::new(),
+            vec![(fixture.commitment.sha256, fixture.frontiers.clone())],
+        ));
+        let error = FinalizedState::new_with_spentness(&fixture.config, &network, setup)
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("NU7"), "{nu7}: {error}");
+    }
+
+    // The first block after H seeds the NSM balance from exact pools.
+    let network = generated_network(&blocks[0], Some(tip + 2));
+    let mut fixture = Fixture::from_blocks(blocks, network, None);
+    let mut state = fixture.open();
+    fixture.commit_all(&mut state);
+    while state.db.spentness_rebuilding() {
+        state.rebuild_spentness_step(&mut || Ok(())).unwrap();
+    }
+    let seed = synthetic_block(fixture.blocks.last().unwrap(), tip + 1, Vec::new());
+    for target in [&mut state, &mut fixture.ordinary] {
+        target
+            .commit_finalized_direct(
+                CheckpointVerifiedBlock::from(seed.clone()).into(),
+                None,
+                None,
+                "NU7 seed block",
+            )
+            .unwrap();
+    }
+    let pool = state.db.finalized_value_pool();
+    assert_ne!(
+        pool.nsm_value_balance_amount(),
+        zakura_chain::amount::Amount::<zakura_chain::amount::NegativeAllowed>::zero()
+    );
+    assert_eq!(pool, fixture.ordinary.db.finalized_value_pool());
+    for name in [
+        "tip_chain_value_pool",
+        super::super::BLOCK_INFO,
+        "utxo_by_out_loc",
+        "utxo_loc_by_transparent_addr_loc",
+        "balance_by_transparent_addr",
+        "tx_loc_by_transparent_addr_loc",
+    ] {
+        assert_eq!(
+            entries(&state, name),
+            entries(&fixture.ordinary, name),
+            "{name}"
+        );
+    }
 }
 
 #[test]
@@ -789,11 +1059,8 @@ fn spentness_pruning_waits_for_rebuild_and_rediscovers_backlog() {
     for height in 0..=10 {
         assert!(state.db.contains_body_at_height(Height(height)));
     }
-    let mut cache = ReplayCache::default();
     while state.db.spentness_rebuilding() {
-        state
-            .rebuild_spentness_step(&mut cache, &mut || Ok(()))
-            .unwrap();
+        state.rebuild_spentness_step(&mut || Ok(())).unwrap();
     }
     assert!(state.has_checkpoint_raw_tx_archive_backlog());
     drop(state);
@@ -820,6 +1087,49 @@ fn spentness_pruning_waits_for_rebuild_and_rediscovers_backlog() {
     };
     assert!(state.db.output_location(&outpoint).is_some());
     assert!(state.db.utxo(&outpoint).is_some());
+}
+
+#[test]
+fn spentness_completion_prunes_history_when_h_is_the_last_checkpoint() {
+    let _guard = zakura_test::init();
+    let (blocks, network) = generated_transparent_chain();
+    let mut fixture = Fixture::from_blocks(blocks, network, None);
+    let retention = 50;
+    fixture.config.storage_mode = crate::StorageMode::Pruned(crate::PruningConfig {
+        tx_retention: retention,
+    });
+    let terminal = fixture.commitment.terminal_height;
+    // No checkpoint block follows H, so checkpoint skipping never drains the retained bodies.
+    let mut state = fixture
+        .open_with_storage_validation(false)
+        .with_checkpoint_raw_tx_retention(Height(terminal), &fixture.config);
+    fixture.commit_all(&mut state);
+    while state.db.spentness_rebuilding() {
+        state.rebuild_spentness_step(&mut || Ok(())).unwrap();
+    }
+    let retained_from = terminal + 1 - retention;
+    assert_eq!(
+        state.db.lowest_retained_height(),
+        Some(Height(retained_from))
+    );
+    assert!(state.db.contains_body_at_height(Height(0)));
+    for height in [1, retained_from - 1] {
+        assert!(!state.db.contains_body_at_height(Height(height)));
+    }
+    assert!(state.db.contains_body_at_height(Height(retained_from)));
+
+    // Online pruning continues from the marker.
+    let next = synthetic_block(fixture.blocks.last().unwrap(), terminal + 1, Vec::new());
+    state
+        .commit_finalized_direct(
+            CheckpointVerifiedBlock::from(next).into(),
+            None,
+            None,
+            "pruning after the last checkpoint",
+        )
+        .unwrap();
+    assert!(!state.db.contains_body_at_height(Height(retained_from)));
+    assert!(state.db.contains_body_at_height(Height(retained_from + 1)));
 }
 
 #[tokio::test(flavor = "multi_thread")]

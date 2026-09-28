@@ -2,7 +2,8 @@
 //!
 //! Applying consumes every output bit, including genesis and non-address scripts.
 //! It inserts terminal survivors without resolving or deleting spent input UTXOs,
-//! retains raw transactions, and defers address indexes to the rebuild. The
+//! and stores every other output after genesis in the omitted-output column family.
+//! It retains raw transactions and defers address indexes to the rebuild. The
 //! transparent pool therefore counts only the survivors created so far.
 
 use std::{collections::BTreeMap, time::Instant};
@@ -16,11 +17,11 @@ use zakura_chain::{
     value_balance::ValueBalance,
 };
 
-use super::{outputs_in_order, record::PoolAccounting, Progress, SpentnessError};
+use super::{outputs_in_order, record::OMITTED_OUTPUTS, Progress, SpentnessError};
 use crate::{
     request::FinalizedBlock,
     service::finalized_state::{
-        disk_db::DiskWriteBatch,
+        disk_db::{DiskWriteBatch, WriteDisk},
         disk_format::OutputLocation,
         vct::VctWriteData,
         zakura_db::{metrics::block_precommit_metrics, ZakuraDb},
@@ -28,15 +29,17 @@ use crate::{
     CommitCheckpointVerifiedError,
 };
 
-/// The artifact position and survivor total at a block boundary.
+/// The artifact position and omitted-output count at a block boundary.
 struct Cursor {
     ordinal: u64,
-    survivor_value: Amount<NonNegative>,
+    omitted: u64,
 }
 
-/// One block's survivors, its output count, and the cursor after it.
+/// One block's survivors and omitted outputs, and the cursor after it.
 struct BlockSurvivors {
     utxos: BTreeMap<OutputLocation, transparent::Utxo>,
+    omitted: Vec<(OutputLocation, transparent::Output)>,
+    survivor_value: Amount<NonNegative>,
     outputs: u64,
     cursor: Cursor,
 }
@@ -77,10 +80,17 @@ impl ZakuraDb {
         let started = Instant::now();
         let survivors = block_survivors(&finalized, &run.artifact, cursor)?;
         batch.prepare_created_utxos(&self.db, &survivors.utxos);
+        let omitted_outputs = self
+            .db
+            .cf_handle(OMITTED_OUTPUTS)
+            .expect("omitted-output column family is declared");
+        for (location, output) in &survivors.omitted {
+            batch.zs_insert(&omitted_outputs, location, output);
+        }
         metrics::histogram!("state.spentness.transparent.prepare_seconds")
             .record(started.elapsed().as_secs_f64());
 
-        let pool = self.applying_value_pool(&finalized, survivors.cursor.survivor_value)?;
+        let pool = self.applying_value_pool(&finalized, survivors.survivor_value)?;
         let progress = next_progress(&finalized, commitment, &survivors.cursor)?;
         batch.prepare_block_header_and_transaction_data_batch(self, &finalized, true, None)?;
         batch.prepare_shielded_transaction_batch(self, &finalized);
@@ -114,16 +124,16 @@ impl ZakuraDb {
         match self.spentness_progress()? {
             None if self.tip().is_none() && height.is_min() => Ok(Cursor {
                 ordinal: 0,
-                survivor_value: Amount::zero(),
+                omitted: 0,
             }),
             Some(Progress::Applying {
                 commitment: recorded,
                 next_ordinal,
-                survivor_value,
+                omitted_outputs,
                 ..
             }) if &recorded == commitment => Ok(Cursor {
                 ordinal: next_ordinal,
-                survivor_value: Amount::try_from(survivor_value)?,
+                omitted: omitted_outputs,
             }),
             _ => Err(SpentnessError::WriteOrder(
                 "unexpected spentness write phase",
@@ -132,6 +142,8 @@ impl ZakuraDb {
     }
 
     /// The exact shielded and deferred pools, with transparent value from survivors only.
+    ///
+    /// The NSM leg stays zero, because construction ends before the NU7 seed block.
     fn applying_value_pool(
         &self,
         finalized: &FinalizedBlock,
@@ -144,7 +156,8 @@ impl ZakuraDb {
                 .shielded_chain_value_pool_change(finalized.deferred_pool_balance_change)?;
             pool = pool.add_chain_value_pool_change(change)?;
         }
-        pool.set_transparent_value_balance(ValueBalance::from_transparent_amount(survivor_value));
+        let transparent = (pool.transparent_amount() + survivor_value)?;
+        pool.set_transparent_value_balance(ValueBalance::from_transparent_amount(transparent));
         Ok(pool)
     }
 }
@@ -157,11 +170,19 @@ fn block_survivors(
 ) -> Result<BlockSurvivors, SpentnessError> {
     let first_ordinal = cursor.ordinal;
     let mut utxos = BTreeMap::new();
+    let mut omitted = Vec::new();
+    let mut survivor_value = Amount::zero();
     for (location, transaction, output) in outputs_in_order(&finalized.block, finalized.height) {
         let retained = artifact.retains(cursor.ordinal)?;
         // `retains` accepted the ordinal, so it is below the output count and cannot overflow.
         cursor.ordinal += 1;
         if !retained {
+            // Genesis outputs are unspendable, so the rebuild never resolves them.
+            if !finalized.height.is_min() {
+                omitted.push((location, output.clone()));
+                // The omitted count is below the output count, so it cannot overflow.
+                cursor.omitted += 1;
+            }
             continue;
         }
         if finalized.height.is_min() {
@@ -169,13 +190,15 @@ fn block_survivors(
                 "artifact retains a genesis output",
             ));
         }
-        cursor.survivor_value = (cursor.survivor_value + output.value)?;
+        survivor_value = (survivor_value + output.value)?;
         let utxo =
             transparent::Utxo::new(output.clone(), finalized.height, transaction.is_coinbase());
         utxos.insert(location, utxo);
     }
     Ok(BlockSurvivors {
         utxos,
+        omitted,
+        survivor_value,
         outputs: cursor.ordinal - first_ordinal,
         cursor,
     })
@@ -193,7 +216,7 @@ fn next_progress(
             height: finalized.height.0,
             block_hash: finalized.hash.0,
             next_ordinal: cursor.ordinal,
-            survivor_value: cursor.survivor_value.into(),
+            omitted_outputs: cursor.omitted,
         });
     }
     if finalized.hash.0 != commitment.terminal_block_hash
@@ -206,8 +229,8 @@ fn next_progress(
     Ok(Progress::Rebuilding {
         commitment: commitment.clone(),
         indexed_height: None,
-        replay_accounting: PoolAccounting::default(),
-        survivor_value: cursor.survivor_value.into(),
+        transparent_value: 0,
+        unspent_omitted: cursor.omitted,
     })
 }
 
@@ -216,9 +239,6 @@ fn record_block_metrics(survivors: &BlockSurvivors, height: Height) {
         u64::try_from(survivors.utxos.len()).expect("usize fits in u64 on supported targets");
     metrics::counter!("state.spentness.bits").increment(survivors.outputs);
     metrics::counter!("state.spentness.utxo.inserts").increment(inserted);
-    // Applying never reads or deletes UTXOs. Report zero so benchmarks can confirm it.
-    metrics::counter!("state.spentness.utxo.reads").increment(0);
-    metrics::counter!("state.spentness.utxo.deletes").increment(0);
     metrics::counter!("state.spentness.utxo.omitted").increment(survivors.outputs - inserted);
     metrics::gauge!("state.spentness.construction_height").set(f64::from(height.0));
 }

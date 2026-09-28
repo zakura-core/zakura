@@ -26,6 +26,7 @@ expression: empty_column_families
   "sapling_note_commitment_subtree: no entries",
   "sapling_nullifiers: no entries",
   "spentness_metadata: no entries",
+  "spentness_omitted_outputs: no entries",
   "sprout_nullifiers: no entries",
   "tx_loc_by_spent_out_loc: no entries",
   "vct_sync_metadata: no entries",

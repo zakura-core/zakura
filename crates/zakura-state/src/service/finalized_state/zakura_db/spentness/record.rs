@@ -1,12 +1,7 @@
 //! The durable progress record, stored with each atomic block batch.
 
 use serde::{Deserialize, Serialize};
-use zakura_chain::{
-    amount::{Amount, NonNegative},
-    block::Height,
-    parameters::spentness_hints::Commitment,
-    value_balance::ValueBalance,
-};
+use zakura_chain::{block::Height, parameters::spentness_hints::Commitment};
 
 use super::{SpentnessError, SpentnessStatus};
 use crate::service::finalized_state::{
@@ -17,7 +12,12 @@ use crate::service::finalized_state::{
 
 /// Column family that holds the single progress record.
 pub(crate) const METADATA: &str = "spentness_metadata";
-const RECORD_VERSION: u32 = 1;
+/// Column family that holds the outputs the artifact omits, keyed by output location.
+///
+/// Applying writes every omitted output after genesis. The rebuild resolves each
+/// spend from this column family and deletes the row, and completion clears it.
+pub(crate) const OMITTED_OUTPUTS: &str = "spentness_omitted_outputs";
+const RECORD_VERSION: u32 = 2;
 /// Upper bound for the encoded record, checked on read and write.
 const MAX_RECORD_BYTES: usize = 4096;
 
@@ -35,21 +35,24 @@ pub(crate) enum Progress {
     /// Checkpoint blocks through `height` are committed with artifact survivors.
     ///
     /// `next_ordinal` is the artifact bit for the next block's first output.
-    /// `survivor_value` is the transparent value of the survivors inserted so far.
+    /// `omitted_outputs` counts the rows written to [`OMITTED_OUTPUTS`].
     Applying {
         commitment: Commitment,
         height: u32,
         block_hash: [u8; 32],
         next_ordinal: u64,
-        survivor_value: u64,
+        omitted_outputs: u64,
     },
     /// The terminal block is committed, and derived indexes are rebuilt through
-    /// `indexed_height`. `replay_accounting` holds the replayed pools at that height.
+    /// `indexed_height`.
+    ///
+    /// `transparent_value` is the replayed transparent pool at that height.
+    /// `unspent_omitted` counts the omitted outputs that no replayed input has spent.
     Rebuilding {
         commitment: Commitment,
         indexed_height: Option<u32>,
-        replay_accounting: PoolAccounting,
-        survivor_value: u64,
+        transparent_value: u64,
+        unspent_omitted: u64,
     },
     /// Rebuilt indexes passed the final audit. Rollback cannot cross `rollback_floor`.
     Complete {
@@ -76,54 +79,6 @@ impl Progress {
             Self::Rebuilding { .. } => SpentnessStatus::Rebuilding,
             Self::Complete { .. } => SpentnessStatus::Usable,
         }
-    }
-}
-
-/// Value pools in zatoshis, as stored in the progress record.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct PoolAccounting {
-    transparent: u64,
-    sprout: u64,
-    sapling: u64,
-    orchard: u64,
-    deferred: u64,
-    ironwood: u64,
-}
-
-impl From<ValueBalance<NonNegative>> for PoolAccounting {
-    fn from(pool: ValueBalance<NonNegative>) -> Self {
-        Self {
-            transparent: pool.transparent_amount().into(),
-            sprout: pool.sprout_amount().into(),
-            sapling: pool.sapling_amount().into(),
-            orchard: pool.orchard_amount().into(),
-            deferred: pool.deferred_amount().into(),
-            ironwood: pool.ironwood_amount().into(),
-        }
-    }
-}
-
-impl TryFrom<PoolAccounting> for ValueBalance<NonNegative> {
-    type Error = SpentnessError;
-
-    fn try_from(accounting: PoolAccounting) -> Result<Self, Self::Error> {
-        let mut pool =
-            ValueBalance::from_transparent_amount(Amount::try_from(accounting.transparent)?);
-        pool.set_sprout_value_balance(ValueBalance::from_sprout_amount(Amount::try_from(
-            accounting.sprout,
-        )?));
-        pool.set_sapling_value_balance(ValueBalance::from_sapling_amount(Amount::try_from(
-            accounting.sapling,
-        )?));
-        pool.set_orchard_value_balance(ValueBalance::from_orchard_amount(Amount::try_from(
-            accounting.orchard,
-        )?));
-        pool.set_deferred_amount(Amount::try_from(accounting.deferred)?);
-        pool.set_ironwood_value_balance(ValueBalance::from_ironwood_amount(Amount::try_from(
-            accounting.ironwood,
-        )?));
-        Ok(pool)
     }
 }
 

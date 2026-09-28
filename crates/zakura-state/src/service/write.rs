@@ -2301,7 +2301,6 @@ impl WriteBlockWorkerTask {
         } = &mut self;
 
         let mut prev_finalized_note_commitment_trees: Option<NoteCommitmentTrees> = None;
-        let mut spentness_cache = super::finalized_state::SpentnessReplayCache::default();
         let mut deferred_non_finalized_messages = VecDeque::new();
         let deadline_runtime = tokio::runtime::Builder::new_current_thread()
             .enable_time()
@@ -2350,9 +2349,7 @@ impl WriteBlockWorkerTask {
                         Err(crate::SpentnessError::ShuttingDown)
                     }
                 };
-                match finalized_state
-                    .rebuild_spentness_step(&mut spentness_cache, &mut yield_control)
-                {
+                match finalized_state.rebuild_spentness_step(&mut yield_control) {
                     Ok(_) => {}
                     // The state service closed the channel, so durable progress waits for a restart.
                     Err(crate::SpentnessError::ShuttingDown) => {

@@ -4,15 +4,17 @@
 //! stores the next progress record with its other writes:
 //!
 //! ```text
-//! Applying { commitment, height, block_hash, next_ordinal, survivor_value }
-//!   -> Rebuilding { commitment, indexed_height, replay_accounting, survivor_value }
+//! Applying { commitment, height, block_hash, next_ordinal, omitted_outputs }
+//!   -> Rebuilding { commitment, indexed_height, transparent_value, unspent_omitted }
 //!   -> Complete { commitment, rollback_floor }
 //! ```
 //!
 //! - `startup`: select, authenticate, and resume a run as the database opens.
-//! - `apply`: insert artifact survivors while checkpoint blocks commit through H.
-//! - `rebuild`: replay retained bodies at H to rebuild derived indexes.
-//! - `final_audit`: check the rebuilt indexes before completion is published.
+//! - `apply`: insert artifact survivors and store omitted outputs while checkpoint
+//!   blocks commit through H.
+//! - `rebuild`: replay retained bodies at H to rebuild derived indexes, and prove
+//!   that the omitted outputs are exactly the spent outputs.
+//! - `final_audit`: check the rebuilt address indexes before completion is published.
 //! - `progress_audit`: offline cursor diagnostics.
 //! - `record`: the durable progress record.
 //! - `authority`: the release commitments, revocations, and handoff frontiers.
@@ -54,8 +56,7 @@ pub(crate) use authority::ReleaseAuthority;
 #[cfg(test)]
 pub(crate) use progress_audit::audit_progress_with_setup;
 pub use progress_audit::{audit_spentness_progress, SpentnessProgressAudit};
-pub(crate) use rebuild::ReplayCache;
-pub(crate) use record::{Progress, METADATA};
+pub(crate) use record::{Progress, METADATA, OMITTED_OUTPUTS};
 pub use startup::{
     artifact_cache_path, spentness_artifact_requirement, spentness_cache_dir,
     SpentnessArtifactRequirement,
@@ -130,6 +131,14 @@ pub enum SpentnessError {
     /// The commitment names another chain's genesis block.
     #[error("spentness commitment belongs to another chain")]
     WrongChain,
+    /// Construction cannot compute NSM accounting, so it must end before the NU7 seed block.
+    #[error(
+        "spentness commitment at height {height} reaches the NU7 seed block; use ordinary sync"
+    )]
+    ReachesNu7 {
+        /// The commitment's terminal height.
+        height: u32,
+    },
     /// This release has no reviewed commitment for the network.
     #[error("no reviewed spentness commitment for this network")]
     NoReviewedCommitment,
@@ -169,7 +178,12 @@ pub enum SpentnessError {
     #[error("spentness writer cannot take this block: {0}")]
     WriteOrder(&'static str),
     /// Construction, replay, or audit found state that differs from retained history.
-    #[error("spentness verification failed: {0}")]
+    ///
+    /// Restarting repeats the failure, so the operator must discard the state.
+    #[error(
+        "spentness verification failed: {0}; delete the state cache directory and resync \
+         with spentness.mode = \"off\""
+    )]
     Mismatch(&'static str),
     /// The artifact failed authentication.
     #[error(transparent)]

@@ -88,12 +88,12 @@ pub mod treestate_export;
 mod vct;
 pub mod vct_treestate_audit;
 mod zakura_db;
+pub(crate) use zakura_db::spentness::SpentnessSetup;
 pub use zakura_db::spentness::{
     artifact_cache_path, audit_spentness_progress, spentness_artifact_requirement,
     spentness_cache_dir, wait_for_spentness, SpentnessArtifactRequirement, SpentnessConfig,
     SpentnessError, SpentnessProgressAudit, SpentnessStatus,
 };
-pub(crate) use zakura_db::spentness::{ReplayCache as SpentnessReplayCache, SpentnessSetup};
 
 pub(crate) use vct::embedded_last_checkpoint_leaf_counts;
 use vct::{VctCommitState, VctState, VctWriteData};
@@ -233,6 +233,7 @@ pub const STATE_COLUMN_FAMILIES_IN_CODE: &[&str] = &[
     VCT_SYNC_METADATA,
     VCT_UPGRADE_METADATA,
     zakura_db::spentness::METADATA,
+    zakura_db::spentness::OMITTED_OUTPUTS,
 ];
 
 /// Fork-aware header-chain node rows keyed by canonical hash.
@@ -494,7 +495,6 @@ impl FinalizedState {
             .zip(db.finalized_tip_height())
             .is_some_and(|(last_checkpoint_height, tip)| tip < last_checkpoint_height);
 
-        let mut cache = SpentnessReplayCache::default();
         let mut stop_for_shutdown = || {
             if zakura_chain::shutdown::is_shutting_down() {
                 Err(SpentnessError::ShuttingDown)
@@ -503,7 +503,7 @@ impl FinalizedState {
             }
         };
         while db.spentness_rebuilding() {
-            db.rebuild_spentness_step(&mut cache, &mut stop_for_shutdown)?;
+            db.rebuild_spentness_step(&mut stop_for_shutdown)?;
         }
 
         let new_state = Self {
@@ -733,10 +733,9 @@ impl FinalizedState {
     /// Advance the exclusive index replay before the writer takes another block.
     pub(crate) fn rebuild_spentness_step(
         &mut self,
-        cache: &mut SpentnessReplayCache,
         yield_control: &mut impl FnMut() -> Result<(), SpentnessError>,
     ) -> Result<bool, SpentnessError> {
-        let complete = self.db.rebuild_spentness_step(cache, yield_control)?;
+        let complete = self.db.rebuild_spentness_step(yield_control)?;
         if complete && self.db.config().pruning_config().is_some() {
             self.checkpoint_raw_tx_archive_backlog
                 .store(true, Ordering::Relaxed);

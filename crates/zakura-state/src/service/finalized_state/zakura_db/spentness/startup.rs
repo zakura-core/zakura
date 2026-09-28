@@ -14,7 +14,6 @@ use zakura_chain::{
         spentness_hints::{Commitment, Mode, VerifiedArtifact},
         Network,
     },
-    value_balance::ValueBalance,
 };
 
 use super::{
@@ -200,7 +199,7 @@ fn select_requirement(
 
     match progress {
         Progress::Complete { commitment, .. } => {
-            setup.authority.check(&commitment)?;
+            setup.authority.check_completed(&commitment)?;
             Ok(None)
         }
         // Rebuilding needs retained bodies, not the artifact.
@@ -348,7 +347,11 @@ impl ZakuraDb {
     /// Check that the record agrees with the finalized tip and the release authority.
     fn check_progress(&self, progress: &Progress) -> Result<(), SpentnessError> {
         let commitment = progress.commitment();
-        self.spentness.setup.authority.check(commitment)?;
+        let authority = &self.spentness.setup.authority;
+        match progress {
+            Progress::Complete { .. } => authority.check_completed(commitment)?,
+            _ => authority.check(commitment)?,
+        }
         let tip = self.tip().ok_or(SpentnessError::Inconsistent(
             "progress without a finalized tip",
         ))?;
@@ -361,32 +364,34 @@ impl ZakuraDb {
                 height,
                 block_hash,
                 next_ordinal,
-                survivor_value,
+                omitted_outputs,
                 ..
             } => {
                 if tip != (Height(*height), Hash(*block_hash))
                     || *height >= commitment.terminal_height
                     || *next_ordinal > commitment.output_count
+                    || omitted_outputs > next_ordinal
                 {
                     return Err(SpentnessError::Inconsistent(
                         "applying progress disagrees with the finalized boundary",
                     ));
                 }
-                Amount::<NonNegative>::try_from(*survivor_value)?;
             }
             Progress::Rebuilding {
                 indexed_height,
-                replay_accounting,
-                survivor_value,
+                transparent_value,
+                unspent_omitted,
                 ..
             } => {
-                if tip != terminal || indexed_height.is_some_and(|height| height > terminal.0 .0) {
+                if tip != terminal
+                    || indexed_height.is_some_and(|height| height > terminal.0 .0)
+                    || *unspent_omitted > commitment.output_count
+                {
                     return Err(SpentnessError::Inconsistent(
                         "rebuild progress disagrees with the terminal boundary",
                     ));
                 }
-                ValueBalance::<NonNegative>::try_from(*replay_accounting)?;
-                Amount::<NonNegative>::try_from(*survivor_value)?;
+                Amount::<NonNegative>::try_from(*transparent_value)?;
             }
             Progress::Complete { rollback_floor, .. } => {
                 if Height(*rollback_floor) != terminal.0

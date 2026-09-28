@@ -1,31 +1,27 @@
 //! Ordered spentness construction and its durable recovery boundary.
 //!
-//! A hinted run builds checkpoint state in three durable phases. Each block batch
+//! A hinted run builds checkpoint state in two durable phases. Each block batch
 //! stores the next progress record with its other writes:
 //!
 //! ```text
-//! Applying { commitment, height, block_hash, next_ordinal, omitted_outputs }
-//!   -> Rebuilding { commitment, indexed_height, transparent_value, unspent_omitted }
+//! Applying { commitment, height, block_hash, next_ordinal, omitted_outputs, resolved_spends }
 //!   -> Complete { commitment, rollback_floor }
 //! ```
 //!
 //! - `startup`: select, authenticate, and resume a run as the database opens.
-//! - `apply`: insert artifact survivors and store omitted outputs while checkpoint
-//!   blocks commit through H.
-//! - `rebuild`: replay retained bodies at H to rebuild derived indexes, and prove
-//!   that the omitted outputs are exactly the spent outputs.
-//! - `final_audit`: check the rebuilt address indexes before completion is published.
-//! - `progress_audit`: offline cursor diagnostics.
+//! - `apply`: read membership bits and resolve spends while checkpoint blocks commit
+//!   through H, and prove at H that the omitted outputs are exactly the spent outputs.
+//! - `live`: the omitted outputs that no block has spent yet, in memory and on disk.
 //! - `record`: the durable progress record.
 //! - `authority`: the release commitments, revocations, and handoff frontiers.
 //!
-//! Until a run completes, [`SpentnessStatus`] gates consumers of monetary state.
+//! Until a run completes, [`SpentnessStatus`] gates consumers of the UTXO set.
 
 use std::{
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc,
+        Arc, Mutex,
     },
 };
 
@@ -46,16 +42,12 @@ use crate::{service::finalized_state::disk_format::OutputLocation, CommitCheckpo
 
 mod apply;
 mod authority;
-mod final_audit;
-mod progress_audit;
-mod rebuild;
+mod live;
 mod record;
 mod startup;
 
+pub(crate) use apply::HintedBlock;
 pub(crate) use authority::ReleaseAuthority;
-#[cfg(test)]
-pub(crate) use progress_audit::audit_progress_with_setup;
-pub use progress_audit::{audit_spentness_progress, SpentnessProgressAudit};
 pub(crate) use record::{Progress, METADATA, OMITTED_OUTPUTS};
 pub use startup::{
     artifact_cache_path, spentness_artifact_requirement, spentness_cache_dir,
@@ -102,12 +94,9 @@ pub enum SpentnessError {
          before querying or exporting state"
     )]
     Incomplete,
-    /// Construction gates deny this request until index rebuilding finishes.
+    /// Construction gates deny this request until the run completes at H.
     #[error("state is unavailable while spentness construction is incomplete")]
     Unavailable,
-    /// Shutdown interrupted the rebuild. Durable progress lets a restart resume it.
-    #[error("spentness rebuild stopped for shutdown; restart to resume it")]
-    ShuttingDown,
     /// The construction writer failed or exited, so the gates never lift in this process.
     #[error("spentness construction stopped the state writer; restart to reconcile progress")]
     WriterStopped,
@@ -131,14 +120,6 @@ pub enum SpentnessError {
     /// The commitment names another chain's genesis block.
     #[error("spentness commitment belongs to another chain")]
     WrongChain,
-    /// Construction cannot compute NSM accounting, so it must end before the NU7 seed block.
-    #[error(
-        "spentness commitment at height {height} reaches the NU7 seed block; use ordinary sync"
-    )]
-    ReachesNu7 {
-        /// The commitment's terminal height.
-        height: u32,
-    },
     /// This release has no reviewed commitment for the network.
     #[error("no reviewed spentness commitment for this network")]
     NoReviewedCommitment,
@@ -177,7 +158,7 @@ pub enum SpentnessError {
     /// The ordered writer received a block that the current phase cannot take.
     #[error("spentness writer cannot take this block: {0}")]
     WriteOrder(&'static str),
-    /// Construction, replay, or audit found state that differs from retained history.
+    /// Construction found a spend or count that contradicts the artifact.
     ///
     /// Restarting repeats the failure, so the operator must discard the state.
     #[error(
@@ -225,8 +206,6 @@ pub enum SpentnessStatus {
         /// Checkpoint commits through this height can proceed during construction.
         terminal_height: Height,
     },
-    /// Body commits are paused while the writer rebuilds and verifies indexes.
-    Rebuilding,
     /// A local failure stopped construction; restart must reconcile durable progress.
     Failed,
 }
@@ -237,7 +216,7 @@ impl SpentnessStatus {
         match self {
             Self::Usable => true,
             Self::Applying { terminal_height } => height <= terminal_height,
-            Self::Rebuilding | Self::Failed => false,
+            Self::Failed => false,
         }
     }
 }
@@ -259,18 +238,27 @@ pub async fn wait_for_spentness(
     Ok(())
 }
 
-/// The artifact and VCT handoff for a run that is still applying.
+/// The artifact, VCT handoff, and live omitted outputs for a run that is still applying.
 #[derive(Debug)]
-struct ApplyingRun {
+pub(crate) struct ApplyingRun {
     artifact: VerifiedArtifact,
     handoff_frontiers: FinalFrontiers,
+    /// Only the writer uses the map, so the lock is uncontended.
+    live: Mutex<live::LiveOutputs>,
+}
+
+impl ApplyingRun {
+    /// The height H where construction completes.
+    pub(crate) fn terminal_height(&self) -> Height {
+        Height(self.artifact.commitment().terminal_height)
+    }
 }
 
 /// Construction state shared by a database handle and its clones.
 #[derive(Clone, Debug)]
 pub(super) struct Runtime {
     setup: SpentnessSetup,
-    /// Present only while applying. The rebuild needs retained bodies, not the artifact.
+    /// Present only while applying.
     applying: Option<Arc<ApplyingRun>>,
     status: watch::Sender<SpentnessStatus>,
     /// Mirrors `status != Usable`, so request gates avoid the watch channel's lock.
@@ -323,11 +311,6 @@ impl ZakuraDb {
     /// Whether this database currently exposes an incomplete terminal-survivor set.
     pub fn spentness_incomplete(&self) -> bool {
         self.spentness.incomplete.load(Ordering::Acquire)
-    }
-
-    /// Whether the ordered writer has stopped at the terminal height to rebuild indexes.
-    pub fn spentness_rebuilding(&self) -> bool {
-        self.spentness_incomplete() && self.spentness_status() == SpentnessStatus::Rebuilding
     }
 
     pub(crate) fn subscribe_spentness(&self) -> watch::Receiver<SpentnessStatus> {

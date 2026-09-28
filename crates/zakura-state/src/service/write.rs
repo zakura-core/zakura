@@ -2335,39 +2335,6 @@ impl WriteBlockWorkerTask {
                 &mut deferred_non_finalized_messages,
             );
 
-            // The rebuild holds the tip at H, but header control messages keep flowing.
-            if finalized_state.db.spentness_rebuilding() {
-                let mut yield_control = || {
-                    let open = serve_header_control_message(
-                        non_finalized_block_write_receiver,
-                        header_chain.as_ref(),
-                        &mut deferred_non_finalized_messages,
-                    );
-                    if open {
-                        Ok(())
-                    } else {
-                        Err(crate::SpentnessError::ShuttingDown)
-                    }
-                };
-                match finalized_state.rebuild_spentness_step(&mut yield_control) {
-                    Ok(_) => {}
-                    // The state service closed the channel, so durable progress waits for a restart.
-                    Err(crate::SpentnessError::ShuttingDown) => {
-                        return BlockWriteTaskExit::Completed;
-                    }
-                    Err(error) => {
-                        finalized_state.db.fail_spentness();
-                        return BlockWriteTaskExit::SpentnessFailed(
-                            BlockWriteTaskFailure::runtime(
-                                "spentness rebuild stopped the writer",
-                                error,
-                            ),
-                        );
-                    }
-                }
-                continue;
-            }
-
             let ordered_block = match vct_write_retry_manager.take_retryable_block() {
                 Some(block) => block,
                 None => match finalized_block_write_receiver.try_recv() {

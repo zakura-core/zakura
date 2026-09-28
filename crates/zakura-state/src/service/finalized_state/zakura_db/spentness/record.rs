@@ -12,12 +12,13 @@ use crate::service::finalized_state::{
 
 /// Column family that holds the single progress record.
 pub(crate) const METADATA: &str = "spentness_metadata";
-/// Column family that holds the outputs the artifact omits, keyed by output location.
+/// Column family that journals the outputs the artifact omits, keyed by creation height.
 ///
-/// Applying writes every omitted output after genesis. The rebuild resolves each
-/// spend from this column family and deletes the row, and completion clears it.
+/// Each block that creates omitted outputs, and does not spend them itself, writes one
+/// row. A spend that misses the in-memory map reads its creating block's row.
+/// Completion deletes every row.
 pub(crate) const OMITTED_OUTPUTS: &str = "spentness_omitted_outputs";
-const RECORD_VERSION: u32 = 2;
+const RECORD_VERSION: u32 = 3;
 /// Upper bound for the encoded record, checked on read and write.
 const MAX_RECORD_BYTES: usize = 4096;
 
@@ -35,26 +36,17 @@ pub(crate) enum Progress {
     /// Checkpoint blocks through `height` are committed with artifact survivors.
     ///
     /// `next_ordinal` is the artifact bit for the next block's first output.
-    /// `omitted_outputs` counts the rows written to [`OMITTED_OUTPUTS`].
+    /// `omitted_outputs` counts the omitted outputs after genesis, and
+    /// `resolved_spends` counts the spends that resolved to them.
     Applying {
         commitment: Commitment,
         height: u32,
         block_hash: [u8; 32],
         next_ordinal: u64,
         omitted_outputs: u64,
+        resolved_spends: u64,
     },
-    /// The terminal block is committed, and derived indexes are rebuilt through
-    /// `indexed_height`.
-    ///
-    /// `transparent_value` is the replayed transparent pool at that height.
-    /// `unspent_omitted` counts the omitted outputs that no replayed input has spent.
-    Rebuilding {
-        commitment: Commitment,
-        indexed_height: Option<u32>,
-        transparent_value: u64,
-        unspent_omitted: u64,
-    },
-    /// Rebuilt indexes passed the final audit. Rollback cannot cross `rollback_floor`.
+    /// Every omitted output is spent by H. Rollback cannot cross `rollback_floor`.
     Complete {
         commitment: Commitment,
         rollback_floor: u32,
@@ -64,9 +56,7 @@ pub(crate) enum Progress {
 impl Progress {
     pub(crate) fn commitment(&self) -> &Commitment {
         match self {
-            Self::Applying { commitment, .. }
-            | Self::Rebuilding { commitment, .. }
-            | Self::Complete { commitment, .. } => commitment,
+            Self::Applying { commitment, .. } | Self::Complete { commitment, .. } => commitment,
         }
     }
 
@@ -76,7 +66,6 @@ impl Progress {
             Self::Applying { commitment, .. } => SpentnessStatus::Applying {
                 terminal_height: Height(commitment.terminal_height),
             },
-            Self::Rebuilding { .. } => SpentnessStatus::Rebuilding,
             Self::Complete { .. } => SpentnessStatus::Usable,
         }
     }

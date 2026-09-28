@@ -1644,8 +1644,9 @@ where
                 unreachable!("unmatched response to a PruningInfo request")
             };
 
-            // The NSM counter is optional and distinguishes "not reported" from a legitimate
-            // zero, so only populate it when the query succeeded.
+            // TipPoolValues soft-fails to genesis + a synthetic zero ValueBalance. The NSM
+            // counter is optional and distinguishes "not reported" from a legitimate zero, so
+            // only populate it when the query succeeded.
             let (tip, value_balance, nsm_value_balance_zat) = match tip_pool_values_rsp {
                 Ok(TipPoolValues {
                     tip_height,
@@ -1653,20 +1654,15 @@ where
                     value_balance,
                 }) => (
                     (tip_height, tip_hash),
-                    Some(value_balance),
+                    value_balance,
                     Some(value_balance.nsm_value_balance_amount()),
                 ),
                 Ok(_) => unreachable!("unmatched response to a TipPoolValues request"),
-                Err(_) => match self.latest_chain_tip.best_tip_height_and_hash() {
-                    // Spentness construction gates the value pools, but the tip is exact.
-                    Some(tip) => (tip, None, None),
-                    // An empty state reports genesis with zero value pools.
-                    None => (
-                        (Height::MIN, network.genesis_hash()),
-                        Some(Default::default()),
-                        None,
-                    ),
-                },
+                Err(_) => (
+                    (Height::MIN, network.genesis_hash()),
+                    Default::default(),
+                    None,
+                ),
             };
 
             let difficulty = chain_tip_difficulty
@@ -1770,9 +1766,8 @@ where
             blocks: tip_height,
             best_block_hash: tip_hash,
             estimated_height,
-            chain_supply: value_balance.map(GetBlockchainInfoBalance::chain_supply),
-            value_pools: value_balance
-                .map(|value_balance| GetBlockchainInfoBalance::value_pools(value_balance, None)),
+            chain_supply: GetBlockchainInfoBalance::chain_supply(value_balance),
+            value_pools: GetBlockchainInfoBalance::value_pools(value_balance, None),
             nsm_value_balance_zat,
             upgrades,
             consensus,
@@ -4274,6 +4269,16 @@ pub struct EndOfService {
 /// Type alias for the array of `GetBlockchainInfoBalance` objects
 pub type BlockchainValuePoolBalances = [GetBlockchainInfoBalance; 6];
 
+fn deserialize_blockchain_value_pool_balances<'de, D>(
+    deserializer: D,
+) -> std::result::Result<BlockchainValuePoolBalances, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value_pools = Vec::<GetBlockchainInfoBalance>::deserialize(deserializer)?;
+    blockchain_value_pool_balances_from_vec(value_pools)
+}
+
 fn deserialize_optional_blockchain_value_pool_balances<'de, D>(
     deserializer: D,
 ) -> std::result::Result<Option<BlockchainValuePoolBalances>, D::Error>
@@ -4377,26 +4382,14 @@ pub struct GetBlockchainInfoResponse {
     #[getter(copy)]
     estimated_height: Height,
 
-    /// Chain supply balance.
-    ///
-    /// Omitted while spentness construction gates the tip's value pools.
-    #[serde(
-        rename = "chainSupply",
-        default,
-        skip_serializing_if = "Option::is_none"
-    )]
-    chain_supply: Option<GetBlockchainInfoBalance>,
+    /// Chain supply balance
+    #[serde(rename = "chainSupply")]
+    chain_supply: GetBlockchainInfoBalance,
 
-    /// Value pool balances.
-    ///
-    /// Omitted while spentness construction gates the tip's value pools.
-    #[serde(
-        rename = "valuePools",
-        default,
-        deserialize_with = "deserialize_optional_blockchain_value_pool_balances",
-        skip_serializing_if = "Option::is_none"
-    )]
-    value_pools: Option<BlockchainValuePoolBalances>,
+    /// Value pool balances
+    #[serde(rename = "valuePools")]
+    #[serde(deserialize_with = "deserialize_blockchain_value_pool_balances")]
+    value_pools: BlockchainValuePoolBalances,
 
     /// The ZIP 234 NSM value balance, in zatoshis.
     ///
@@ -4569,8 +4562,8 @@ impl Default for GetBlockchainInfoResponse {
             blocks: Height(1),
             best_block_hash: block::Hash([0; 32]),
             estimated_height: Height(1),
-            chain_supply: Some(GetBlockchainInfoBalance::chain_supply(Default::default())),
-            value_pools: Some(GetBlockchainInfoBalance::zero_pools()),
+            chain_supply: GetBlockchainInfoBalance::chain_supply(Default::default()),
+            value_pools: GetBlockchainInfoBalance::zero_pools(),
             nsm_value_balance_zat: None,
             upgrades: IndexMap::new(),
             consensus: TipConsensusBranch {
@@ -4618,8 +4611,8 @@ impl GetBlockchainInfoResponse {
             blocks,
             best_block_hash,
             estimated_height,
-            chain_supply: Some(chain_supply),
-            value_pools: Some(value_pools),
+            chain_supply,
+            value_pools,
             // Left unset so this constructor's signature stays stable; callers that
             // report the ZIP 234 counter set it with `with_nsm_value_balance_zat`.
             nsm_value_balance_zat: None,

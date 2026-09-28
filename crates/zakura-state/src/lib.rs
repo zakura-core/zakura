@@ -62,9 +62,8 @@ pub use request::{
     Request, SemanticallyVerifiedBlock,
 };
 pub use service::finalized_state::{
-    artifact_cache_path, audit_spentness_progress, spentness_artifact_requirement,
-    spentness_cache_dir, wait_for_spentness, SpentnessArtifactRequirement, SpentnessConfig,
-    SpentnessError, SpentnessProgressAudit, SpentnessStatus,
+    artifact_cache_path, spentness_artifact_requirement, spentness_cache_dir, wait_for_spentness,
+    SpentnessArtifactRequirement, SpentnessConfig, SpentnessError, SpentnessStatus,
 };
 
 #[cfg(feature = "indexer")]

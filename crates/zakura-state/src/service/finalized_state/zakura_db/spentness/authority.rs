@@ -68,19 +68,13 @@ impl ReleaseAuthority {
             .ok_or(SpentnessError::NoReviewedCommitment)
     }
 
-    /// Accept only a well-formed, recognized, unrevoked commitment for this chain
-    /// that ends before the NU7 seed block.
+    /// Accept only a well-formed, recognized, unrevoked commitment for this chain.
     pub(crate) fn check(&self, commitment: &Commitment) -> Result<(), SpentnessError> {
         commitment.validate()?;
         self.check_completed(commitment)?;
         if !self.commitments.contains(commitment) {
             return Err(SpentnessError::UnknownCommitment {
                 digest: commitment.digest_hex(),
-            });
-        }
-        if !commitment.precedes_nu7(&self.network) {
-            return Err(SpentnessError::ReachesNu7 {
-                height: commitment.terminal_height,
             });
         }
         Ok(())

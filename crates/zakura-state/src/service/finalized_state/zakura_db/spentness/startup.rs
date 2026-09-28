@@ -3,11 +3,15 @@
 //! A fresh run starts only on an empty database. An interrupted run resumes with
 //! its original commitment, even when a newer release selects a later one.
 
-use std::{fs::File, io, path::PathBuf, sync::Arc};
+use std::{
+    fs::File,
+    io,
+    path::PathBuf,
+    sync::{Arc, Mutex},
+};
 
 use semver::Version;
 use zakura_chain::{
-    amount::{Amount, NonNegative},
     block::{Hash, Height},
     common::atomic_write,
     parameters::{
@@ -17,6 +21,7 @@ use zakura_chain::{
 };
 
 use super::{
+    live::{LiveOutputs, LIVE_OUTPUT_CAPACITY},
     record::{read_progress, Progress},
     ApplyingRun, SpentnessConfig, SpentnessError, SpentnessSetup, SpentnessStatus,
 };
@@ -202,12 +207,6 @@ fn select_requirement(
             setup.authority.check_completed(&commitment)?;
             Ok(None)
         }
-        // Rebuilding needs retained bodies, not the artifact.
-        Progress::Rebuilding { commitment, .. } => {
-            setup.authority.check(&commitment)?;
-            require_enabled(mode)?;
-            Ok(None)
-        }
         Progress::Applying { commitment, .. } => {
             require_enabled(mode)?;
             Ok(Some(SpentnessArtifactRequirement {
@@ -286,9 +285,6 @@ impl ZakuraDb {
         match &progress {
             Progress::Complete { .. } => {}
             _ if !resumable => return Err(SpentnessError::Incomplete),
-            Progress::Rebuilding { commitment, .. } => {
-                self.check_recovery_environment(commitment)?;
-            }
             Progress::Applying { commitment, .. } => {
                 self.check_recovery_environment(commitment)?;
                 self.spentness.applying = Some(Arc::new(self.prepare_run(commitment)?));
@@ -341,6 +337,7 @@ impl ZakuraDb {
         Ok(ApplyingRun {
             artifact,
             handoff_frontiers,
+            live: Mutex::new(LiveOutputs::new(LIVE_OUTPUT_CAPACITY)),
         })
     }
 
@@ -365,33 +362,19 @@ impl ZakuraDb {
                 block_hash,
                 next_ordinal,
                 omitted_outputs,
+                resolved_spends,
                 ..
             } => {
                 if tip != (Height(*height), Hash(*block_hash))
                     || *height >= commitment.terminal_height
                     || *next_ordinal > commitment.output_count
                     || omitted_outputs > next_ordinal
+                    || resolved_spends > omitted_outputs
                 {
                     return Err(SpentnessError::Inconsistent(
                         "applying progress disagrees with the finalized boundary",
                     ));
                 }
-            }
-            Progress::Rebuilding {
-                indexed_height,
-                transparent_value,
-                unspent_omitted,
-                ..
-            } => {
-                if tip != terminal
-                    || indexed_height.is_some_and(|height| height > terminal.0 .0)
-                    || *unspent_omitted > commitment.output_count
-                {
-                    return Err(SpentnessError::Inconsistent(
-                        "rebuild progress disagrees with the terminal boundary",
-                    ));
-                }
-                Amount::<NonNegative>::try_from(*transparent_value)?;
             }
             Progress::Complete { rollback_floor, .. } => {
                 if Height(*rollback_floor) != terminal.0

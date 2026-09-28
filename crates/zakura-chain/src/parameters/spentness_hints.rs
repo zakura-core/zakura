@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use super::{Network, NetworkUpgrade};
+use super::Network;
 
 const HASH_LEN: usize = 32;
 const BITS_PER_BYTE: u64 = 8;
@@ -181,17 +181,6 @@ impl Commitment {
             return Err(Error::Format("invalid commitment version or length"));
         }
         Ok(())
-    }
-
-    /// Whether construction through this commitment ends before the NU7 seed block.
-    ///
-    /// Construction cannot compute the NSM value balance or ZIP 234 issuance, because
-    /// both depend on spent output values. Ordinary state seeds the NSM balance at
-    /// NU7 - 1, so the first block after H must be below that height.
-    pub fn precedes_nu7(&self, network: &Network) -> bool {
-        NetworkUpgrade::Nu7
-            .activation_height(network)
-            .is_none_or(|nu7| u64::from(self.terminal_height) + 1 < u64::from(nu7.0))
     }
 
     /// Hex-encoded artifact digest, for logs and operator messages.
@@ -387,7 +376,6 @@ mod tests {
         let mut previous = None;
         for pin in MAINNET_COMMITMENTS {
             pin.validate().unwrap();
-            assert!(pin.precedes_nu7(&Network::Mainnet));
             assert_eq!(
                 checkpoints.hash(crate::block::Height(0)).unwrap().0,
                 pin.chain_identity
@@ -427,29 +415,6 @@ mod tests {
             supported_commitments(&crate::parameters::Network::Mainnet),
             unrevoked(MAINNET_COMMITMENTS, REVOKED_COMMITMENTS)
         );
-    }
-
-    #[test]
-    fn spentness_commitments_must_end_before_the_nu7_seed_block() {
-        use crate::parameters::testnet::ConfiguredActivationHeights;
-
-        let network_with_nu7 = |nu7| {
-            Network::new_regtest(
-                ConfiguredActivationHeights {
-                    nu7: Some(nu7),
-                    ..Default::default()
-                }
-                .into(),
-            )
-        };
-        let pin = ParsedArtifact::read(encode([1; 32], 9, [2; 32], [false]).unwrap().as_slice())
-            .unwrap()
-            .commitment()
-            .clone();
-        // H = 9, so ordinary block 10 must be the NU7 seed block or precede it.
-        for (nu7, accepted) in [(9, false), (10, false), (11, true), (1_000, true)] {
-            assert_eq!(pin.precedes_nu7(&network_with_nu7(nu7)), accepted, "{nu7}");
-        }
     }
 
     #[test]

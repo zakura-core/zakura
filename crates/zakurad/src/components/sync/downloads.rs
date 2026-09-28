@@ -1033,7 +1033,6 @@ mod spentness_tests {
         let task =
             tokio::spawn(async move { wait_for_spentness_height(&mut later, Height(11)).await });
         tokio::task::yield_now().await;
-        sender.send_replace(zs::SpentnessStatus::Rebuilding);
         tokio::time::advance(std::time::Duration::from_secs(3600)).await;
         assert!(!task.is_finished());
         sender.send_replace(zs::SpentnessStatus::Usable);

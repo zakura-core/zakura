@@ -42,7 +42,11 @@ use crate::{
             transparent::{AddressBalanceLocationUpdates, OutputLocation},
         },
         vct::VctWriteData,
-        zakura_db::{metrics::block_precommit_metrics, ZakuraDb},
+        zakura_db::{
+            metrics::block_precommit_metrics,
+            spentness::{HintedBlock, SpentnessError},
+            ZakuraDb,
+        },
         FromDisk, IntoDisk, RawBytes, PRUNING_METADATA, VCT_SYNC_METADATA, VCT_UPGRADE_METADATA,
     },
     CommitBlockError, HashOrHeight,
@@ -930,20 +934,14 @@ impl ZakuraDb {
         network: &Network,
         source: &str,
         retention: RetentionPlan,
-        vct_data: VctWriteData,
+        mut vct_data: VctWriteData,
         commit: C,
     ) -> Result<block::Hash, CommitCheckpointVerifiedError>
     where
         C: FnOnce(&mut Self, DiskWriteBatch) -> Result<(), CommitCheckpointVerifiedError>,
     {
-        if self.spentness_incomplete() {
-            return self.write_spentness_block(
-                finalized,
-                prev_note_commitment_trees,
-                vct_data,
-                commit,
-            );
-        }
+        // A hinted run resolves spends from its omitted outputs, not from the UTXO set.
+        let hinted_run = self.hinted_run_for(finalized.height)?;
         let tx_hash_indexes: HashMap<transaction::Hash, usize> = finalized
             .transaction_hashes
             .iter()
@@ -983,12 +981,13 @@ impl ZakuraDb {
         // `None` it serializes inline (e.g. the semantic path).
         let store_raw_txs = retention.stores_raw_transactions();
         let db: &ZakuraDb = self;
-        let (spent_utxos, precomputed_raw_txs): (
-            Vec<(transparent::OutPoint, OutputLocation, transparent::Utxo)>,
-            Option<Vec<RawBytes>>,
-        ) = rayon::join(
+        let (spent_utxos, precomputed_raw_txs) = rayon::join(
             || {
-                if outpoints.len() >= super::PARALLEL_BLOCK_READ_THRESHOLD {
+                if let Some(run) = &hinted_run {
+                    let mut hinted = db.prepare_hinted_block(run, &finalized, &tx_hash_indexes)?;
+                    return Ok((std::mem::take(&mut hinted.spent), Some(hinted)));
+                }
+                let spent = if outpoints.len() >= super::PARALLEL_BLOCK_READ_THRESHOLD {
                     use rayon::prelude::*;
                     outpoints
                         .into_par_iter()
@@ -1015,7 +1014,8 @@ impl ZakuraDb {
                             )
                         })
                         .collect()
-                }
+                };
+                Ok::<_, SpentnessError>((spent, None))
             },
             || {
                 if store_raw_txs {
@@ -1033,6 +1033,11 @@ impl ZakuraDb {
                 }
             },
         );
+        let (spent_utxos, hinted): (
+            Vec<(transparent::OutPoint, OutputLocation, transparent::Utxo)>,
+            Option<HintedBlock>,
+        ) = spent_utxos?;
+        let precomputed_raw_txs: Option<Vec<RawBytes>> = precomputed_raw_txs;
 
         let spent_utxos_by_outpoint: HashMap<transparent::OutPoint, transparent::Utxo> =
             spent_utxos
@@ -1109,6 +1114,16 @@ impl ZakuraDb {
             }))
         };
 
+        // Omitted outputs never enter the UTXO set, so their spends delete nothing.
+        let no_omitted_outputs = HashSet::new();
+        let (omitted_outputs, spent_utxos_by_out_loc) = match &hinted {
+            Some(hinted) => (&hinted.omitted, BTreeMap::new()),
+            None => (&no_omitted_outputs, spent_utxos_by_out_loc),
+        };
+        if let Some(run) = &hinted_run {
+            vct_data.sync_below = Some(run.terminal_height());
+        }
+
         let mut batch = DiskWriteBatch::new();
 
         // In case of errors, propagate and do not write the batch.
@@ -1119,6 +1134,7 @@ impl ZakuraDb {
             new_outputs_by_out_loc,
             spent_utxos_by_outpoint,
             spent_utxos_by_out_loc,
+            omitted_outputs,
             #[cfg(feature = "indexer")]
             out_loc_by_outpoint,
             address_balances,
@@ -1136,10 +1152,23 @@ impl ZakuraDb {
         // block commit path. In archive mode the plan is always `Store`, so this
         // is a no-op.
         retention.prepare_prune(&mut batch, self, &finalized);
+        if let Some(hinted) = &hinted {
+            batch.prepare_hinted_block(self, hinted, finalized.height)?;
+        }
 
         // Track batch commit latency for observability
         let batch_start = std::time::Instant::now();
-        commit(self, batch)?;
+        match &hinted {
+            Some(hinted) => {
+                commit(self, batch).map_err(|error| {
+                    // The batch outcome is uncertain until a restart reconciles progress.
+                    self.fail_spentness();
+                    SpentnessError::Commit(Box::new(error))
+                })?;
+                self.finish_hinted_block(hinted, finalized.height);
+            }
+            None => commit(self, batch)?,
+        }
         metrics::histogram!("zakura.state.rocksdb.batch_commit.duration_seconds")
             .record(batch_start.elapsed().as_secs_f64());
 
@@ -1424,6 +1453,7 @@ impl DiskWriteBatch {
         new_outputs_by_out_loc: BTreeMap<OutputLocation, transparent::Utxo>,
         spent_utxos_by_outpoint: HashMap<transparent::OutPoint, transparent::Utxo>,
         spent_utxos_by_out_loc: BTreeMap<OutputLocation, transparent::Utxo>,
+        omitted_outputs: &HashSet<OutputLocation>,
         #[cfg(feature = "indexer")] out_loc_by_outpoint: HashMap<
             transparent::OutPoint,
             OutputLocation,
@@ -1472,6 +1502,7 @@ impl DiskWriteBatch {
                 &spent_utxos_by_out_loc,
                 #[cfg(feature = "indexer")]
                 &out_loc_by_outpoint,
+                omitted_outputs,
                 address_balances,
             );
         }

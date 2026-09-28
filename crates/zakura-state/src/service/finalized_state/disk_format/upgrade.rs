@@ -564,8 +564,8 @@ impl DbFormatChange {
             }
         }
 
-        // Construction deliberately leaves indexes and historical transparent accounting partial.
-        // Its ordered rebuild validates those rows before it publishes completion.
+        // Until H, construction's UTXO set holds only survivors, while address balances
+        // count every unspent output. Checks that compare the two would fail.
         if db.spentness_incomplete() {
             return Ok(());
         }

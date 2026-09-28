@@ -1627,8 +1627,9 @@ pub enum Request {
 impl Request {
     /// Whether this request can run while spentness construction is incomplete.
     ///
-    /// Allowed requests read or write headers, bodies, and checkpoint blocks. Denied requests
-    /// read UTXOs, value pools, or address indexes, or admit semantically verified blocks.
+    /// Allowed requests read or write headers, bodies, checkpoint blocks, and block value
+    /// pools, which construction keeps exact. Denied requests read the UTXO set, which
+    /// holds only survivors until H, or admit semantically verified blocks.
     /// The match has no wildcard arm, so every new variant must be classified.
     pub(crate) fn available_during_spentness(&self) -> bool {
         match self {
@@ -1649,14 +1650,14 @@ impl Request {
             | Self::FindBlockHashes { .. }
             | Self::FindBlockHeaders { .. }
             | Self::BestChainBlockHash(_)
-            | Self::KnownBlock(_) => true,
+            | Self::KnownBlock(_)
+            | Self::AwaitBlockInfo(_)
+            | Self::BlockInfo(_) => true,
 
             Self::CommitSemanticallyVerifiedBlock(_)
             | Self::CommitSemanticallyVerifiedBlockWithAdmission { .. }
             | Self::UnspentBestChainUtxo(_)
             | Self::CheckParentInputs { .. }
-            | Self::AwaitBlockInfo(_)
-            | Self::BlockInfo(_)
             | Self::AwaitUtxo(_)
             | Self::CheckBestChainTipNullifiersAndAnchors(_)
             | Self::CheckPreparedMinedRelayEligibility(_)
@@ -2252,8 +2253,10 @@ pub enum ReadRequest {
 impl ReadRequest {
     /// Whether this request can run while spentness construction is incomplete.
     ///
-    /// Allowed requests read headers, bodies, transactions, trees, or storage metadata. Denied
-    /// requests read UTXOs, value pools, or address indexes, or run mempool and mining checks.
+    /// Allowed requests read headers, bodies, transactions, trees, storage metadata, value
+    /// pools, address balances, or address transactions, which construction keeps exact.
+    /// Denied requests read the UTXO set, which holds only survivors until H, or run mempool
+    /// and mining checks.
     /// The match has no wildcard arm, so every new variant must be classified.
     pub(crate) fn available_during_spentness(&self) -> bool {
         match self {
@@ -2294,27 +2297,25 @@ impl ReadRequest {
             | Self::BestChainBlockHash(_)
             | Self::TipBlockSize
             | Self::ChainTips
-            | Self::NonFinalizedBlocksListener { .. } => true,
-            #[cfg(feature = "indexer")]
-            Self::RawBlocksByHeightRange { .. } => true,
-
-            Self::TipPoolValues
+            | Self::NonFinalizedBlocksListener { .. }
+            | Self::TipPoolValues
             | Self::BlockInfo(_)
-            | Self::UnspentBestChainUtxo(_)
-            | Self::CheckParentInputs { .. }
-            | Self::AnyChainUtxo(_)
             | Self::AddressBalance(_)
             | Self::TransactionIdsByAddresses { .. }
+            | Self::ChainInfo => true,
+            #[cfg(feature = "indexer")]
+            Self::RawBlocksByHeightRange { .. } | Self::SpendingTransactionId(_) => true,
+
+            Self::UnspentBestChainUtxo(_)
+            | Self::CheckParentInputs { .. }
+            | Self::AnyChainUtxo(_)
             | Self::UtxosByAddresses(_)
             | Self::CheckBestChainTipNullifiersAndAnchors(_)
             | Self::CheckPreparedMinedRelayEligibility(_)
             | Self::BestChainNextMedianTimePast
-            | Self::ChainInfo
             | Self::SolutionRate { .. }
             | Self::CheckBlockProposalValidity(_)
             | Self::IsTransparentOutputSpent(_) => false,
-            #[cfg(feature = "indexer")]
-            Self::SpendingTransactionId(_) => false,
         }
     }
 
@@ -2508,7 +2509,7 @@ mod spentness_gate_tests {
     use super::*;
 
     #[test]
-    fn spentness_gates_allow_metadata_and_deny_monetary_requests() {
+    fn spentness_gates_allow_exact_state_and_deny_the_utxo_set() {
         let hash = block::Hash([1; 32]);
         let outpoints: Arc<[transparent::OutPoint]> = Arc::new([]);
 
@@ -2522,8 +2523,8 @@ mod spentness_gate_tests {
                 },
                 false,
             ),
-            (Request::AwaitBlockInfo(hash), false),
-            (Request::BlockInfo(hash), false),
+            (Request::AwaitBlockInfo(hash), true),
+            (Request::BlockInfo(hash), true),
             (Request::BestChainNextMedianTimePast, false),
         ] {
             assert_eq!(
@@ -2544,9 +2545,11 @@ mod spentness_gate_tests {
                 },
                 false,
             ),
-            (ReadRequest::BlockInfo(hash.into()), false),
-            (ReadRequest::TipPoolValues, false),
-            (ReadRequest::ChainInfo, false),
+            (ReadRequest::BlockInfo(hash.into()), true),
+            (ReadRequest::TipPoolValues, true),
+            (ReadRequest::ChainInfo, true),
+            (ReadRequest::AddressBalance(Default::default()), true),
+            (ReadRequest::UtxosByAddresses(Default::default()), false),
         ] {
             assert_eq!(
                 request.available_during_spentness(),

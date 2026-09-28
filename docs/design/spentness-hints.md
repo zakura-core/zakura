@@ -1,8 +1,9 @@
 # Spentness hints
 
 Zakura can use reviewed terminal UTXO membership to omit spent outputs during
-checkpoint construction. The ordered writer then rebuilds derived indexes at H
-before ordinary commits resume. The default remains off. The compiled public
+checkpoint construction. The ordinary writer never inserts, reads, or deletes a
+UTXO row for an output that dies before H. It still writes every index, balance,
+and value pool, so the state at H equals ordinary state. The default remains off. The compiled public
 commitment list remains empty until maintainers review an artifact.
 
 Matched sync benchmarks and public-network rollout remain separate work.
@@ -189,79 +190,73 @@ from HTTP.
 The writer persists one versioned record with each atomic block batch:
 
 ```text
-Applying { commitment, height, block_hash, next_ordinal, omitted_outputs }
-  -> Rebuilding { commitment, indexed_height, transparent_value, unspent_omitted }
+Applying { commitment, height, block_hash, next_ordinal, omitted_outputs, resolved_spends }
   -> Complete { commitment, rollback_floor }
 ```
 
-Applying consumes every output bit, including genesis and non-address scripts.
-It inserts terminal survivors without resolving or deleting spent input UTXOs.
-It writes every other output after genesis to the temporary
-`spentness_omitted_outputs` column family, keyed by output location. This column
-family holds spent outputs until the rebuild, so construction needs extra disk
-space for them. Applying retains raw transactions and defers address indexes.
-It preserves shielded and deferred accounting. The transparent balance at this
-stage describes the survivors created so far, so construction gates block
-monetary consumers.
+Construction uses the ordinary block writer. For each block, the writer reads the
+bit of every created output, including genesis and non-address outputs. A set bit
+marks a survivor, which the writer inserts into the UTXO set and the address UTXO
+index. A clear bit marks an omitted output. The writer writes no UTXO row and no
+address UTXO row for an omitted output. It still writes the output's address
+transaction index entry, balance, received total, and value pool change.
 
-Construction cannot compute the NSM value balance or ZIP 234 issuance, because
-both depend on spent output values. Ordinary state seeds the NSM balance at the
-block before NU7 activation. The release authority therefore rejects a commitment
-when H + 1 reaches NU7 activation on its network. The NSM leg stays zero through
-H, as it does in ordinary state, and the first ordinary block after H seeds it
-from exact pools.
+The writer resolves each spend without the UTXO set:
 
-At H, the writer checks the exact hash, output count, and VCT handoff frontiers.
-It then holds the consensus tip at H while it replays retained transactions.
-Each replay step takes a window of up to 1,000 blocks or 64 MiB of serialized
-blocks. The step deserializes the window's bodies and resolves its spends in
-parallel. Each spend reads the creating transaction's location and then the
-omitted output at that location. A serial pass restores address balances,
-received totals, first-receive locations, address UTXOs, transaction indexes,
-and historical value pools. The replay copies every pool except transparent from
-the saved block accounting. One batch commits the window's index updates, the
-deletion of each consumed omitted output, and the cursor.
+1. A spend of an output in the same block resolves from that block.
+2. Otherwise it resolves from an in-memory map of omitted outputs that no block
+   has spent yet. A hit removes the entry.
+3. Otherwise it reads the creating transaction's location and the omitted-output
+   journal row at that height.
 
-The replay rejects a spend of a retained output, a missing or consumed output,
-an output that follows its spend, a genesis output, an immature or disallowed
-coinbase spend, and a transaction whose outputs exceed its inputs. Each spend
-therefore consumes a distinct omitted output. At H, the final audit requires
-that no omitted output remains. The omitted outputs are then exactly the spent
-outputs, so the survivors are exactly the terminal UTXO set. The audit also
-requires the replayed transparent pool to equal the survivors' value.
+Each map entry and journal record holds the output's location, value, coinbase
+flag, and P2PKH or P2SH hash. It holds no script. The writer rebuilds the standard
+script for the address, because it reads only the address from a spent output's
+script. The map evicts its oldest 1,000-height buckets when it exceeds 10 million
+entries. The journal is the `spentness_omitted_outputs` column family. Each block
+writes one row, keyed by height, with its omitted outputs that it does not spend
+itself. A miss after an eviction or a restart reads that row. Correctness never
+depends on the map; it only saves reads.
 
-The final audit then scans the address UTXO index once, in key order. Each
-entry must name a survivor with an address. Entries that share an address
-location must share an address. That address's balance row must name the same
-location and hold the entries' total. The index must hold one entry per survivor
-with an address, and every nonzero balance must belong to an indexed address.
-The audit writes nothing, so a restart repeats it from the beginning.
+Every spent output feeds the ordinary index and pool code. Construction therefore
+keeps exact address balances, received totals, first-receive locations, address
+transaction indexes, spending transaction indexes, and chain value pools at every
+height. That includes the NSM value balance and ZIP 234 issuance, so H may reach
+or pass NU7 activation. The writer skips spent-output deletes, because every
+output that a block spends before H is omitted.
 
-The replay and audit never change live consensus UTXOs. A mismatch stops the
-writer without attributing the failure to a peer. A restart repeats the same
-failure, so the error tells the operator to delete the state and resync with
-hints off.
+Only omitted outputs enter the map and the journal, so each resolved spend proves
+that the artifact omits its output. A spend that resolves nowhere, including a
+spend of a survivor, stops construction. The record counts omitted outputs and
+resolved spends. At H, the writer checks the exact hash, output count, and VCT
+handoff frontiers, and requires the two counts to be equal. Checkpoint sync
+already trusts the chain through H, so no output is spent twice. Equal counts
+then mean the omitted outputs are exactly the spent outputs, and the survivors
+are exactly the UTXO set at H. The terminal batch writes Complete and deletes the
+journal.
 
-State access gates block pending-UTXO responses, monetary RPCs, mempool checks,
-mining checks, and ordinary semantic admission during construction. Every state
-request variant is classified as allowed or denied, so a new variant needs a
-review decision. Synced blocks wait for completion before semantic verification.
-Block proposals and `submitblock` fail immediately. `getblockchaininfo` reports
-the real tip and omits `chainSupply` and `valuePools`. Header control messages
-continue between replay steps and audit chunks. The legacy syncer waits before
-starting verifier deadlines. The native stall watchdog pauses during rebuilding.
-Completion lifts the gates. In pruned mode, the completion batch also deletes raw
-transactions below the retention window at H. Online pruning continues from that
-marker.
+A mismatch stops the writer without attributing the failure to a peer. A
+restart repeats the same failure, so the error tells the operator to delete the
+state and resync with hints off.
+
+The ordinary retention plan applies during construction. Pruned mode therefore
+deletes raw transactions below the retention window as construction advances.
+
+State access gates the UTXO set during construction: pending-UTXO responses,
+UTXO and address UTXO reads, spent-output checks, mempool checks, mining checks,
+and ordinary semantic admission. Balances, address transaction indexes, value
+pools, block info, and chain info stay available, because they are exact. Every
+state request variant is classified as allowed or denied, so a new variant needs
+a review decision. Synced blocks wait for completion before semantic
+verification. Block proposals and `submitblock` fail immediately. Completion
+lifts the gates.
 
 Startup resumes Applying with its original recognized commitment, even when a
 new release selects a later commitment. If the artifact is missing, restore
 identical bytes in the reported cache path or set `spentness.artifact_file`.
-Rebuilding needs retained bodies and omitted outputs but no bitmap. Startup
-finishes that replay before exposing state. Shutdown interrupts the replay, and a
-restart resumes it. Completed databases need no bitmap and no recognized
-commitment. Startup checks only their chain identity and revocation. Unknown or
-revoked commitments stop incomplete runs with a compatibility error.
+Completed databases need no bitmap and no recognized commitment. Startup checks
+only their chain identity and revocation. Unknown or revoked commitments stop
+incomplete runs with a compatibility error.
 
 Database format 30.0.0 gives this construction a separate major-version
 directory. The existing upgrade mechanism reuses ordinary format-29 data. Older
@@ -270,24 +265,14 @@ require the same database format and indexer feature when they resume.
 
 Read-only opens, exports, offline pruning, and offline rollback reject incomplete
 state. After completion, rollback cannot cross H or a stricter VCT boundary.
-To diagnose a cursor without opening monetary state, stop the node and run:
 
-```sh
-zakura-spentness audit-progress --state /data/zakura
-```
-
-The audit re-enumerates retained transactions and verifies their header Merkle
-roots. It prints recorded and enumerated output counts. A mismatch returns an
-error without changing the record.
-
-`state.spentness.construction_height` and `state.spentness.rebuilt_height` report
-the two passes. `SpentnessStatus` and `state.spentness.usable` report consumer
-availability. The writer suppresses provisional value-pool metrics until completion.
-The `state.spentness.utxo.inserts` and `state.spentness.utxo.omitted` counters
-describe the initial pass. The preparation, commit, and rebuild-audit histograms
-separate those costs. The rebuild repeats the spent-output reads that the initial
-pass skipped. Benchmark the entire path through the first ordinary commit above H
-before claiming a speedup.
+`state.spentness.construction_height` reports construction progress.
+`SpentnessStatus` and `state.spentness.usable` report UTXO-set availability.
+`state.spentness.utxo.omitted` counts omitted outputs. `state.spentness.spends.hits`
+and `state.spentness.spends.misses` count spends that resolved from the map and from
+the journal. `state.spentness.live.entries` and `state.spentness.live.evicted`
+report the map. Benchmark the entire path through the first ordinary commit
+above H before claiming a speedup.
 
 ## Release-state schema 2
 

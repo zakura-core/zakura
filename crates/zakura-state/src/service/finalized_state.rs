@@ -90,9 +90,8 @@ pub mod vct_treestate_audit;
 mod zakura_db;
 pub(crate) use zakura_db::spentness::SpentnessSetup;
 pub use zakura_db::spentness::{
-    artifact_cache_path, audit_spentness_progress, spentness_artifact_requirement,
-    spentness_cache_dir, wait_for_spentness, SpentnessArtifactRequirement, SpentnessConfig,
-    SpentnessError, SpentnessProgressAudit, SpentnessStatus,
+    artifact_cache_path, spentness_artifact_requirement, spentness_cache_dir, wait_for_spentness,
+    SpentnessArtifactRequirement, SpentnessConfig, SpentnessError, SpentnessStatus,
 };
 
 pub(crate) use vct::embedded_last_checkpoint_leaf_counts;
@@ -352,7 +351,7 @@ fn select_vct_state(
     }
     let past_handoff = matches!(
         db.spentness_progress()?,
-        Some(SpentnessProgress::Rebuilding { .. } | SpentnessProgress::Complete { .. })
+        Some(SpentnessProgress::Complete { .. })
     );
     if past_handoff {
         return Ok(None);
@@ -364,7 +363,7 @@ fn select_vct_state(
     ))
 }
 
-/// While a run is incomplete, only checkpoint blocks through H commit, and none while rebuilding.
+/// While a run is incomplete, only checkpoint blocks through H commit.
 fn check_spentness_admits(
     status: SpentnessStatus,
     block: &FinalizableBlock,
@@ -472,7 +471,7 @@ impl FinalizedState {
             }
         }
 
-        let mut db = ZakuraDb::new_with_spentness(
+        let db = ZakuraDb::new_with_spentness(
             config,
             STATE_DATABASE_KIND,
             &state_database_format_version_in_code(),
@@ -494,17 +493,6 @@ impl FinalizedState {
             .vct_synced_below()
             .zip(db.finalized_tip_height())
             .is_some_and(|(last_checkpoint_height, tip)| tip < last_checkpoint_height);
-
-        let mut stop_for_shutdown = || {
-            if zakura_chain::shutdown::is_shutting_down() {
-                Err(SpentnessError::ShuttingDown)
-            } else {
-                Ok(())
-            }
-        };
-        while db.spentness_rebuilding() {
-            db.rebuild_spentness_step(&mut stop_for_shutdown)?;
-        }
 
         let new_state = Self {
             debug_stop_at_height: config.debug_stop_at_height.map(block::Height),
@@ -633,9 +621,6 @@ impl FinalizedState {
     /// draining) rather than the near-tip policy (ordinary online pruning). In
     /// archive mode the plan is always [`RetentionPlan::Store`].
     fn retention_plan(&self, height: block::Height, is_checkpoint: bool) -> RetentionPlan {
-        if self.db.spentness_incomplete() {
-            return RetentionPlan::Store;
-        }
         let Some(pruning) = self.db.config().pruning_config() else {
             return RetentionPlan::Store;
         };
@@ -728,19 +713,6 @@ impl FinalizedState {
             ));
         }
         Ok(())
-    }
-
-    /// Advance the exclusive index replay before the writer takes another block.
-    pub(crate) fn rebuild_spentness_step(
-        &mut self,
-        yield_control: &mut impl FnMut() -> Result<(), SpentnessError>,
-    ) -> Result<bool, SpentnessError> {
-        let complete = self.db.rebuild_spentness_step(yield_control)?;
-        if complete && self.db.config().pruning_config().is_some() {
-            self.checkpoint_raw_tx_archive_backlog
-                .store(true, Ordering::Relaxed);
-        }
-        Ok(complete)
     }
 
     /// Commit a checkpoint-verified block to the state.

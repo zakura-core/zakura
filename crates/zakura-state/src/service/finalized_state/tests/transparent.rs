@@ -11,7 +11,7 @@
 //! it panics on the buggy revision and passes on the fixed one.
 
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     sync::Arc,
 };
 
@@ -184,6 +184,7 @@ fn intra_block_self_spend_chain_in_finalized_state() {
         &spent_utxos_by_out_loc,
         #[cfg(feature = "indexer")]
         &HashMap::new(),
+        &HashSet::new(),
         address_balances,
     );
 

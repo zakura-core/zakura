@@ -20,7 +20,7 @@ use super::super::{
     },
     CheckpointVerifiedBlock, FinalizedState,
 };
-use crate::Config;
+use crate::{service::non_finalized_state::CreatedUtxos, Config};
 
 struct Fixture {
     _directory: tempfile::TempDir,
@@ -660,7 +660,12 @@ fn spentness_generated_spends_match_all_indexes_and_validate_after_handoff() {
     );
     let next = synthetic_block(fixture.blocks.last().unwrap(), 104, vec![spend.clone()]);
     let prepared = SemanticallyVerifiedBlock::from(next.clone());
-    transparent_spend(&prepared, &HashMap::new(), &HashMap::new(), &state.db).unwrap();
+    transparent_spend(
+        &prepared,
+        &CreatedUtxos::default(),
+        &HashMap::new(),
+        &state.db,
+    ).unwrap();
     state
         .commit_finalized_direct(
             CheckpointVerifiedBlock::from(next.clone()).into(),
@@ -672,7 +677,7 @@ fn spentness_generated_spends_match_all_indexes_and_validate_after_handoff() {
     let double_spend = synthetic_block(&next, 105, vec![spend]);
     assert!(transparent_spend(
         &SemanticallyVerifiedBlock::from(double_spend),
-        &HashMap::new(),
+        &CreatedUtxos::default(),
         &HashMap::new(),
         &state.db
     )
@@ -687,7 +692,7 @@ fn spentness_generated_spends_match_all_indexes_and_validate_after_handoff() {
     );
     assert!(transparent_spend(
         &SemanticallyVerifiedBlock::from(synthetic_block(&next, 105, vec![immature])),
-        &HashMap::new(),
+        &CreatedUtxos::default(),
         &HashMap::new(),
         &state.db
     )
@@ -704,7 +709,7 @@ fn spentness_generated_spends_match_all_indexes_and_validate_after_handoff() {
     );
     assert!(transparent_spend(
         &SemanticallyVerifiedBlock::from(synthetic_block(&next, 105, vec![negative])),
-        &HashMap::new(),
+        &CreatedUtxos::default(),
         &HashMap::new(),
         &state.db
     )

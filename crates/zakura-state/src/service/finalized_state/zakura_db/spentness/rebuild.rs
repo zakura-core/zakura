@@ -208,7 +208,7 @@ impl ZakuraDb {
         // Genesis outputs are unspendable, so genesis adds no transparent indexes or pool change.
         if !height.is_min() {
             pool = pool.add_chain_value_pool_change(
-                block.chain_value_pool_change(&changes.spent, None)?,
+                block.chain_value_pool_change(&self.network(), &changes.spent, None)?,
             )?;
             // Applying recorded the exact deferred pool supplied by checkpoint verification.
             pool.set_deferred_amount(saved.value_pools().deferred_amount());

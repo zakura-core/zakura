@@ -327,11 +327,14 @@ impl Block {
     }
 
     /// Return exact shielded and deferred changes while transparent indexes are under construction.
+    ///
+    /// The transparent and NSM legs stay zero. The NSM leg depends on the block's total
+    /// issuance, which needs the values of spent transparent outputs.
     pub fn shielded_chain_value_pool_change(
         &self,
         deferred_pool_balance_change: Option<DeferredPoolBalanceChange>,
     ) -> Result<ValueBalance<NegativeAllowed>, ValueBalanceError> {
-        self.chain_value_pool_change_from_utxos(
+        self.chain_value_pool_change_without_nsm(
             deferred_pool_balance_change,
             Transaction::shielded_value_balance,
         )
@@ -340,6 +343,23 @@ impl Block {
     fn chain_value_pool_change_from_utxos<F>(
         &self,
         network: &Network,
+        deferred_pool_balance_change: Option<DeferredPoolBalanceChange>,
+        transaction_value_balance: F,
+    ) -> Result<ValueBalance<NegativeAllowed>, ValueBalanceError>
+    where
+        F: FnMut(&Transaction) -> Result<ValueBalance<NegativeAllowed>, ValueBalanceError>,
+    {
+        let mut change = self.chain_value_pool_change_without_nsm(
+            deferred_pool_balance_change,
+            transaction_value_balance,
+        )?;
+        change.set_nsm_value_balance_amount(self.nsm_value_balance_change(network, &change)?);
+
+        Ok(change)
+    }
+
+    fn chain_value_pool_change_without_nsm<F>(
+        &self,
         deferred_pool_balance_change: Option<DeferredPoolBalanceChange>,
         mut transaction_value_balance: F,
     ) -> Result<ValueBalance<NegativeAllowed>, ValueBalanceError>
@@ -356,15 +376,11 @@ impl Block {
                 acc + transaction_value_balance(tx)?
             })?;
 
-        let mut change = *tx_pool_sum.neg().set_deferred_amount(
+        Ok(*tx_pool_sum.neg().set_deferred_amount(
             deferred_pool_balance_change
                 .map(DeferredPoolBalanceChange::value)
                 .unwrap_or_default(),
-        );
-
-        change.set_nsm_value_balance_amount(self.nsm_value_balance_change(network, &change)?);
-
-        Ok(change)
+        ))
     }
 
     /// Returns this block's change to the NSM value balance, as zips#1354 defines it.

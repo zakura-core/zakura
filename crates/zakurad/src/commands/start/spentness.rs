@@ -58,7 +58,7 @@ pub(super) async fn prepare_construction(
     };
 
     let commitment = &requirement.commitment;
-    match resolve_artifact(config, &requirement, shutdown).await {
+    match resolve_artifact(config, &requirement, shutdown.clone()).await {
         Ok(path) => {
             tracing::info!(
                 digest = %commitment.digest_hex(),
@@ -66,6 +66,10 @@ pub(super) async fn prepare_construction(
                 "verified spentness artifact before opening state"
             );
             construction.artifact = Some(path);
+        }
+        // Shutdown must not fall back to ordinary sync and open state.
+        Err(error) if shutdown.is_cancelled() => {
+            return Err(eyre!("spentness acquisition stopped for shutdown: {error}"));
         }
         Err(error) if requirement.recovery || mode == Mode::Require => {
             return Err(eyre!(

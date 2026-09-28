@@ -151,7 +151,8 @@ impl Service for NoNodeServices {
 
 /// Acquire a release-selected artifact over a temporary endpoint before writable state opens.
 ///
-/// The endpoint shuts down before this returns, so the node can start its normal endpoint.
+/// This waits a bounded time for the endpoint to shut down, so the node can start its normal
+/// endpoint. A shutdown timeout does not discard an acquired artifact.
 pub async fn acquire_before_state(
     config: &crate::Config,
     cache: &Path,
@@ -191,9 +192,14 @@ pub async fn acquire_before_state(
             result.unwrap_or_else(|_| Err("spentness startup acquisition exceeded its one-hour deadline".into())),
         _ = shutdown.cancelled() => Err("spentness acquisition cancelled during shutdown".into()),
     };
-    timeout(BOOTSTRAP_SHUTDOWN_TIMEOUT, endpoint.shutdown())
+    // A slow shutdown does not invalidate an acquired artifact. If the socket is still
+    // bound, starting the normal endpoint reports that failure.
+    if timeout(BOOTSTRAP_SHUTDOWN_TIMEOUT, endpoint.shutdown())
         .await
-        .map_err(|_| "spentness bootstrap shutdown timed out")?;
+        .is_err()
+    {
+        tracing::warn!("spentness bootstrap endpoint shutdown timed out");
+    }
     result
 }
 

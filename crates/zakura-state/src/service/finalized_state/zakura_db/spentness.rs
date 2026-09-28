@@ -320,6 +320,14 @@ impl ZakuraDb {
         self.spentness.status.subscribe()
     }
 
+    /// Drop this handle's reference to the applying run's artifact.
+    ///
+    /// Only the writer's handle needs the artifact, and it releases it at H.
+    pub(crate) fn without_spentness_run(mut self) -> Self {
+        self.spentness.applying = None;
+        self
+    }
+
     /// The commitment for a run that is still applying.
     pub(crate) fn applying_spentness_commitment(&self) -> Option<&Commitment> {
         self.spentness

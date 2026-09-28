@@ -1611,7 +1611,7 @@ impl ReadStateService {
         let read_service = Self {
             network: finalized_state.network(),
             max_checkpoint_height: block::Height::MAX,
-            db: finalized_state.db.clone(),
+            db: finalized_state.db.clone().without_spentness_run(),
             non_finalized_state_receiver,
             block_write_task,
             block_write_failure,

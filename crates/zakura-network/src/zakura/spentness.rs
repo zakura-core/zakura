@@ -13,7 +13,8 @@ use std::{path::PathBuf, sync::Arc};
 use zakura_chain::parameters::spentness_hints::Commitment;
 
 use super::{
-    CustomService, Frame, MessageRole, MessageRule, PayloadLen, Stream, ZakuraServiceId,
+    CustomService, MessageRole, MessageRule, PayloadLen, Stream, ZakuraServiceId,
+    FRAME_HEADER_BYTES,
 };
 use crate::BoxError;
 
@@ -33,8 +34,9 @@ pub const STREAM_KIND: u16 = 8;
 pub const CAPABILITY: u64 = 1 << 6;
 const SERVICE_ID: &str = "zakura.spentness.v1";
 const PROTOCOL_VERSION: u16 = 1;
-/// Frame limit: one full range plus room for the response header.
-const FRAME_CAP: u32 = RANGE_BYTES + 64;
+/// Frame limit: one full range, the response header, and the frame header.
+// The cast is safe because both header lengths are small constants.
+const FRAME_CAP: u32 = RANGE_BYTES + (wire::RESPONSE_HEADER_LEN + FRAME_HEADER_BYTES) as u32;
 const GET_RANGE_RULE: MessageRule = MessageRule {
     message_type: GET_RANGE,
     payload: PayloadLen::exact(wire::REQUEST_LEN),
@@ -87,11 +89,6 @@ pub async fn prepare(
             .collect(),
     };
     Ok((service, custom))
-}
-
-/// Validate the single bounded response before the transport stores it.
-pub(crate) fn validate_response(frame: &Frame) -> Result<(), BoxError> {
-    wire::RangeResponse::parse(frame).map(|_| ())
 }
 
 #[cfg(test)]

@@ -16,7 +16,7 @@ use super::{
 };
 use crate::zakura::{
     BoxRunFuture, Frame, Peer, RequestResponseService, Service, SinkReject, Stream, ZakuraConnId,
-    ZakuraPeerId,
+    ZakuraPeerId, FRAME_HEADER_BYTES,
 };
 
 /// Range preparations that may run at once across all peers.
@@ -25,8 +25,6 @@ pub(super) const MAX_CONCURRENT_SERVES: usize = 4;
 ///
 /// Four slots, each at most 256 KiB per 250 ms, limit aggregate data to 4 MiB/s.
 const SERVE_DELAY: Duration = Duration::from_millis(250);
-/// Bytes the transport adds to each frame beyond the message payload.
-pub(super) const TRANSPORT_FRAME_OVERHEAD: u32 = 8;
 
 type ArtifactMap = BTreeMap<[u8; DIGEST_LEN], Arc<VerifiedArtifact>>;
 
@@ -121,13 +119,15 @@ fn artifact_range(
 
 /// Largest response payload the negotiated frame and message limits allow.
 fn response_capacity(max_frame: u32, max_message: u32) -> Result<usize, SinkReject> {
-    let capacity = max_frame
-        .saturating_sub(TRANSPORT_FRAME_OVERHEAD)
-        .min(max_message);
-    usize::try_from(capacity)
-        .ok()
-        .filter(|capacity| *capacity >= RESPONSE_HEADER_LEN)
-        .ok_or_else(|| SinkReject::local("negotiated frame cap cannot carry a spentness response"))
+    let max_frame = usize::try_from(max_frame).unwrap_or(usize::MAX);
+    let max_message = usize::try_from(max_message).unwrap_or(usize::MAX);
+    Some(
+        max_frame
+            .saturating_sub(FRAME_HEADER_BYTES)
+            .min(max_message),
+    )
+    .filter(|capacity| *capacity >= RESPONSE_HEADER_LEN)
+    .ok_or_else(|| SinkReject::local("negotiated frame cap cannot carry a spentness response"))
 }
 
 impl Service for ArtifactService {
@@ -216,11 +216,10 @@ mod tests {
             RangeResponse::OutOfRange(_)
         ));
 
-        // A frame cap that fits only the header yields an unavailable response.
-        let header_only = u32::try_from(RESPONSE_HEADER_LEN)?;
+        // A frame cap that fits only the response header yields a too-large response.
         let response = call(
-            header_only + TRANSPORT_FRAME_OVERHEAD,
-            header_only,
+            u32::try_from(RESPONSE_HEADER_LEN + FRAME_HEADER_BYTES)?,
+            u32::try_from(RESPONSE_HEADER_LEN)?,
             request_frame(request),
         )
         .await?;

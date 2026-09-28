@@ -2347,17 +2347,26 @@ impl WriteBlockWorkerTask {
                     if open {
                         Ok(())
                     } else {
-                        Err(crate::SpentnessError::WriterStopped)
+                        Err(crate::SpentnessError::ShuttingDown)
                     }
                 };
-                if let Err(error) =
-                    finalized_state.rebuild_spentness_step(&mut spentness_cache, &mut yield_control)
+                match finalized_state
+                    .rebuild_spentness_step(&mut spentness_cache, &mut yield_control)
                 {
-                    finalized_state.db.fail_spentness();
-                    return BlockWriteTaskExit::SpentnessFailed(BlockWriteTaskFailure::runtime(
-                        "spentness rebuild stopped the writer",
-                        error,
-                    ));
+                    Ok(_) => {}
+                    // The state service closed the channel, so durable progress waits for a restart.
+                    Err(crate::SpentnessError::ShuttingDown) => {
+                        return BlockWriteTaskExit::Completed;
+                    }
+                    Err(error) => {
+                        finalized_state.db.fail_spentness();
+                        return BlockWriteTaskExit::SpentnessFailed(
+                            BlockWriteTaskFailure::runtime(
+                                "spentness rebuild stopped the writer",
+                                error,
+                            ),
+                        );
+                    }
                 }
                 continue;
             }

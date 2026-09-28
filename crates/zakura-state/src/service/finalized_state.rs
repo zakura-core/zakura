@@ -495,8 +495,15 @@ impl FinalizedState {
             .is_some_and(|(last_checkpoint_height, tip)| tip < last_checkpoint_height);
 
         let mut cache = SpentnessReplayCache::default();
+        let mut stop_for_shutdown = || {
+            if zakura_chain::shutdown::is_shutting_down() {
+                Err(SpentnessError::ShuttingDown)
+            } else {
+                Ok(())
+            }
+        };
         while db.spentness_rebuilding() {
-            db.rebuild_spentness_step(&mut cache, &mut || Ok(()))?;
+            db.rebuild_spentness_step(&mut cache, &mut stop_for_shutdown)?;
         }
 
         let new_state = Self {

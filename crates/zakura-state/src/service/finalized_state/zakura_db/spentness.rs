@@ -104,6 +104,9 @@ pub enum SpentnessError {
     /// Construction gates deny this request until index rebuilding finishes.
     #[error("state is unavailable while spentness construction is incomplete")]
     Unavailable,
+    /// Shutdown interrupted the rebuild. Durable progress lets a restart resume it.
+    #[error("spentness rebuild stopped for shutdown; restart to resume it")]
+    ShuttingDown,
     /// The construction writer failed or exited, so the gates never lift in this process.
     #[error("spentness construction stopped the state writer; restart to reconcile progress")]
     WriterStopped,

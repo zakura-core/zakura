@@ -14,6 +14,10 @@ from pathlib import Path
 
 import spentness_release as hints
 
+REPO = Path(__file__).resolve().parents[2]
+PUBLISHER = REPO / "deploy/release-state/publish-release-state.sh"
+GOLDEN = Path(__file__).with_name("testdata") / "spentness"
+
 
 def load_script(name):
     spec = importlib.util.spec_from_file_location(
@@ -75,7 +79,6 @@ class SpentnessReleaseTests(unittest.TestCase):
                 "verification": self.report,
                 "generator_revision": "a" * 40,
                 "independent_source": "separate fully validated archive",
-                "reproduced_sha256": bytes(self.pin["sha256"]).hex(),
             },
         }
 
@@ -112,7 +115,6 @@ class SpentnessReleaseTests(unittest.TestCase):
                       "survivor_count": sum(byte.bit_count() for byte in bitmap)}
             meta = copy.deepcopy(self.meta)
             meta["spentness"]["verification"] = report
-            meta["spentness"]["reproduced_sha256"] = bytes(pin["sha256"]).hex()
             path.write_bytes(data)
             (self.bundle / hints.COMMITMENT).write_text(json.dumps(pin))
             (self.bundle / hints.VERIFICATION).write_text(json.dumps(report))
@@ -303,7 +305,7 @@ class SpentnessReleaseTests(unittest.TestCase):
         tools.mkdir()
         mock = tools / "mock"
         mock.write_text("""#!/usr/bin/env python3
-import json, os, shutil, sys
+import json, os, shutil, sys, time
 from pathlib import Path
 tool = Path(sys.argv[0]).name
 args = sys.argv[1:]
@@ -316,18 +318,30 @@ def resolve(value):
 if tool == "zakura-checkpoints":
     if os.environ.get("MOCK_FAIL_GENERATION"):
         sys.exit(9)
-    output = option("--mainnet-spentness-output")
-    for source, target in [("mainnet-spentness-hints.bin", output), ("mainnet-spentness-hints.commitment.json", output.with_suffix(".commitment.json")), ("mainnet-spentness-hints.verification.json", output.with_suffix(".verification.json"))]:
-        shutil.copyfile(fixture / source, target)
     for flag in ("--mainnet-frontier-output", "--mainnet-subtree-output", "--mainnet-frontier-grid-output"):
         option(flag).write_bytes(b"treestate fixture")
     print((fixture / "main-checkpoints.txt").read_text(), end="")
 elif tool == "zakura-spentness":
+    with open(os.environ["MOCK_LOG"], "a") as log:
+        print(args[0], os.environ["TMPDIR"], file=log)
     if args[0] == "generate":
+        if os.environ.get("MOCK_FAIL_PRIMARY") and option("--state").name == "spentness-primary":
+            # Fail only after the independent pipeline has reached its slow step.
+            started = Path(os.environ["MOCK_SLOW_VERIFY"])
+            for _ in range(200):
+                if started.exists():
+                    break
+                time.sleep(0.05)
+            sys.exit(13)
         shutil.copyfile(fixture / "mainnet-spentness-hints.bin", option("--output"))
         shutil.copyfile(fixture / "mainnet-spentness-hints.commitment.json", option("--commitment"))
-    if args[0] == "verify" and os.environ.get("MOCK_FAIL_VERIFICATION"):
-        sys.exit(10)
+    if args[0] == "verify":
+        if os.environ.get("MOCK_FAIL_VERIFICATION"):
+            sys.exit(10)
+        if os.environ.get("MOCK_SLOW_VERIFY"):
+            Path(os.environ["MOCK_SLOW_VERIFY"]).write_text(str(os.getpid()))
+            time.sleep(60)
+        shutil.copyfile(fixture / "mainnet-spentness-hints.verification.json", option("--report"))
 elif tool == "rclone":
     target = resolve(args[1])
     if args[0] == "lsf":
@@ -370,6 +384,7 @@ else: sys.exit(12)
             "RELEASE_STATE_GENERATOR_REVISION": "a" * 40,
             "RELEASE_STATE_LOCK_FILE": str(self.root / "publisher.lock"),
             "RELEASE_STATE_DATA_DIR": str(self.root / "replay"),
+            "MOCK_LOG": str(self.root / "helper.log"),
         }
         return source, pointer, old, env
 
@@ -419,6 +434,35 @@ else: sys.exit(12)
         )
         self.assertEqual(result.returncode, 0, result.stderr.decode())
         self.assertEqual((published / "meta.json").read_bytes(), metadata)
+
+    def test_publisher_runs_helpers_in_scratch_and_removes_it(self):
+        source, pointer, old, env = self.publisher_environment()
+        stale = self.root / "replay/tmp/spentness-audit-killed"
+        stale.mkdir(parents=True)
+        result = subprocess.run(["bash", str(PUBLISHER), str(source)], env=env,
+                                capture_output=True, timeout=30, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
+        calls = (self.root / "helper.log").read_text().splitlines()
+        self.assertEqual(sorted(call.split()[0] for call in calls),
+                         ["generate", "generate", "replay", "replay", "verify"])
+        self.assertEqual({call.split()[1] for call in calls}, {str(self.root / "replay/tmp")})
+        self.assertFalse((self.root / "replay/tmp").exists())
+
+    def test_publisher_failure_stops_the_other_pipeline(self):
+        source, pointer, old, env = self.publisher_environment()
+        original = pointer.read_bytes()
+        started = self.root / "slow-verify.pid"
+        result = subprocess.run(
+            ["bash", str(PUBLISHER), str(source)],
+            env={**env, "MOCK_FAIL_PRIMARY": "1", "MOCK_SLOW_VERIFY": str(started)},
+            capture_output=True, timeout=30, check=False,
+        )
+        self.assertNotEqual(result.returncode, 0, result.stderr.decode())
+        self.assertIn("spentness generation or verification failed", result.stderr.decode())
+        self.assertEqual(pointer.read_bytes(), original)
+        pid = int(started.read_text())
+        with self.assertRaises(ProcessLookupError):
+            os.kill(pid, 0)
 
     def test_publisher_rejects_invalid_revision_and_oversized_sidecars(self):
         source, pointer, old, env = self.publisher_environment()

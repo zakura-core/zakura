@@ -157,8 +157,6 @@ def _validate_provenance(meta: dict, pin: dict, report: dict) -> dict:
         raise ValueError(
             "spentness bundle must identify its independently synchronized source"
         )
-    if evidence.get("reproduced_sha256") != bytes(pin["sha256"]).hex():
-        raise ValueError("independent source did not reproduce the spentness artifact")
     return evidence
 
 

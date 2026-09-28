@@ -1120,7 +1120,7 @@ where
                             let source = self.connection_info.connected_addr.get_transient_addr().and_then(|a| lifecycle::source(&a.ip()));
                             for hash in hashes.iter().take(64) { lifecycle::observe(hash.0, Route::LegacyPeer, Phase::PeerRequestFlushed, source); }
                         }
-                        Handler::BlocksByHash { blocks: Vec::with_capacity(hashes.len()), pending_hashes: hashes }
+                        Handler::BlocksByHash { blocks: Vec::with_capacity(hashes.len()), pending_hashes: hashes.into_iter().collect() }
                     })
             }
             (AwaitingRequest, TransactionsById(ids) | TransactionsByIdFrom { ids, .. }) => {

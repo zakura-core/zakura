@@ -32,6 +32,9 @@ Keep entries **newest-first**. Each row records:
 
 | Parameter | Location | Old → New | PR | Why |
 | --- | --- | --- | --- | --- |
+| Transparent address index `PARTITIONS` | `crates/zakura-state/src/service/non_finalized_state/address_transfers.rs` | one copied map → 256 shared partitions | [#1193](https://github.com/zakura-core/zakura/pull/1193) | Reduce snapshot copying and cleanup at the cost of an extra hash per lookup. |
+| `PEER_GOSSIP_DELAY` (block gossip) | `crates/zakurad/src/components/sync.rs` | `7 s` between block gossips → removed | [#1177](https://github.com/zakura-core/zakura/pull/1177) | Each relay hop added up to 7 s to a block's propagation, and with ZIP 218's 25-second spacing about a quarter of blocks arrive within 7 s of the previous one. |
+| `TRANSACTION_GOSSIP_DELAY` (was `PEER_GOSSIP_DELAY`) | `crates/zakurad/src/components/mempool/gossip.rs` | `7 s` → `2 s` | [#1177](https://github.com/zakura-core/zakura/pull/1177) | Scale the transaction gossip batch interval by a third, matching the 25-second block spacing. |
 | Created-output index `PARTITIONS` | `crates/zakura-state/src/service/non_finalized_state/created_utxos.rs` | one copied map → 256 shared partitions | [#1153](https://github.com/zakura-core/zakura/pull/1153) | Reduce snapshot copying and cleanup at the cost of an extra hash per lookup. |
 | Integrated header refill threshold | `crates/zakura-network/src/zakura/header_sync/reactor.rs` | header lead ≤ 2,000 → enough room for one checkpoint range plus its successor (currently lead ≤ 3,599 within the same 4,000-header window) | [#1136](https://github.com/zakura-core/zakura/pull/1136) | Replenish the body backlog earlier while coalescing small credit returns and preserving memory bounds. |
 | `block_profile.socket` | `crates/zakurad/src/config.rs` | new → omitted (recording disabled) | [#1111](https://github.com/zakura-core/zakura/pull/1111) | Enable local block profiles only on an explicitly configured node. |

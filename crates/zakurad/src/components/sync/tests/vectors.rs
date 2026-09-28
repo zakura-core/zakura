@@ -15,6 +15,7 @@ use std::{
 
 use color_eyre::Report;
 use futures::{Future, FutureExt, StreamExt};
+use indexmap::IndexSet;
 use tower::{timeout::Timeout, Service};
 
 use zakura_chain::{
@@ -2421,8 +2422,8 @@ async fn transient_download_failure_preserves_sync_round() -> Result<(), crate::
             let response = peer_set
                 .expect_request_that(|request| match request {
                     zn::Request::BlocksByHash(hashes) => {
-                        hashes == &HashSet::from([retried_hash])
-                            || hashes == &HashSet::from([unrelated_hash])
+                        hashes == &IndexSet::from([retried_hash])
+                            || hashes == &IndexSet::from([unrelated_hash])
                     }
                     _ => false,
                 })

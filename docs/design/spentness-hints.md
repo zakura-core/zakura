@@ -52,14 +52,21 @@ order with the ordered UTXO iterator. It checks complete matched entries and
 rejects unmatched UTXOs. It reports output count, survivor count, file size, and hash.
 Advancing H regenerates every membership bit, including bits for older outputs.
 
-`verify` builds an independent transparent replay database under `$TMPDIR`, or
-under Zakura's cache when `$TMPDIR` is unset. This oracle uses outpoints as keys.
-It rejects missing, duplicate, future, and immature coinbase spends. It compares
-complete terminal entries with the ordinary state. It then checks each hint bit
-and compares salted sums of spent output outpoints and input outpoints modulo
-2^256. The oracle does not call the ordinary writer or generator merge helpers.
-The source node's full validation remains responsible for signatures, shielded
-proofs, and other consensus rules.
+`verify` makes one pass over the canonical blocks. In that pass, an independent
+transparent replay oracle builds its own UTXO database under `$TMPDIR`, or under
+Zakura's cache when `$TMPDIR` is unset. This oracle uses outpoints as keys. It
+rejects missing, duplicate, future, and immature coinbase spends. The same pass
+reads the ordinary state at each output location. Each bit must equal the
+output's presence there, and each present entry must equal its creating output.
+After the pass, each oracle survivor must have a set bit. The oracle, the set
+bits, and the ordinary state must hold the same number of UTXOs. The oracle does
+not call the ordinary writer or generator merge helpers. The source node's full
+validation remains responsible for signatures, shielded proofs, and other
+consensus rules.
+
+`replay`, `generate`, and `verify` read and deserialize blocks on worker threads.
+Each block must match the canonical hash at its height. Its transactions must
+match the header's Merkle root and contain no duplicates.
 
 ```sh
 zakura-spentness replay --source /data/archive --destination /data/replay \
@@ -71,9 +78,19 @@ zakura-spentness verify --state /data/replay --artifact /data/hints.bin \
   --commitment /data/hints.commitment.json --report /data/hints.verification.json
 ```
 
-The publisher also reproduces the artifact from a separately synchronized archive.
-Reproducibility and independent transparent replay provide different evidence.
-Record the second source's validation software and identity in the bundle.
+The publisher runs two pipelines concurrently. The primary pipeline replays the
+publisher's archive and generates the published artifact. The independent pipeline
+replays a separately synchronized archive, generates the artifact again, and
+verifies that reproduction with `--report`. The publisher requires byte-identical
+artifacts and commitments. Reproducibility and independent transparent replay
+provide different evidence. Record the second source's validation software and
+identity in the bundle.
+
+The primary pipeline does not run `verify`. Identical bytes make the independent
+verification cover the published artifact. Both archives hold the same canonical
+blocks, because every pass checks each block's hash and Merkle root. Primary
+generation requires the primary UTXO set to equal the set bits. The primary
+UTXO set therefore equals the membership that the oracle verified.
 
 ## Peer protocol and cache
 
@@ -127,16 +144,28 @@ peers; the HTTPS bundle publisher serves release automation, not node acquisitio
 
 ## Release-state schema 2
 
-`zakura-checkpoints --mainnet-spentness-output` couples generation to its selected
-checkpoint. Supply `--spentness-replay-cache` with the three treestate outputs.
-`ZAKURA_SPENTNESS_BIN` selects the installed helper. The exporter writes commitment
-and verification JSON sidecars beside the hint. It emits checkpoint stdout only
-after generation and verification succeed. Each helper has a 48-hour deadline.
+The publisher runs `zakura-checkpoints` first and reads H/hash from the last line
+of its checkpoint list. It then runs both spentness pipelines at H.
+`ZAKURA_SPENTNESS_BIN` selects the installed helper.
+`RELEASE_STATE_SPENTNESS_TIMEOUT` bounds each pipeline and defaults to 48 hours.
+The helpers keep verification scratch under `$RELEASE_STATE_DATA_DIR/tmp`. The
+publisher empties that directory before each run and removes it afterwards.
+Publication fails before any upload if either pipeline fails or the artifacts differ.
+
+`generated_at` records when the exporter selected H. Pipeline time therefore
+counts against the fetcher's 48-hour freshness window. Both replays resume from
+their previous H, so a daily run replays only new blocks. The primary pipeline
+then reads the chain once, and the independent pipeline reads it twice. The two
+pipelines run concurrently. The first run replays both archives from genesis and
+can produce a bundle that is already too old to import.
 
 Schema 2 requires the hint, commitment, verification report, and frontier grid.
 The publisher uploads data before metadata and moves `latest.json` last.
 The importer checks the descriptor, format, digest, counts, genesis, shared H/hash,
 and provenance before generating Rust commitments. It never imports bitmap bytes.
+The verification report in the bundle comes from the independent pipeline. After
+a spentness descriptor is committed, the fetcher and importer reject schema 1
+bundles, which carry no descriptor.
 Version 2 bundles have no automatic newest-N deletion policy. Retention must cover
 all supported incomplete hinted runs when the state writer is introduced.
 
@@ -144,7 +173,8 @@ Deploy the fetcher/importer before enabling the version 2 publisher. Configure
 `RELEASE_STATE_ORACLE_SOURCE`, `RELEASE_STATE_ORACLE_ID`, and
 `RELEASE_STATE_GENERATOR_REVISION`. `RELEASE_STATE_DATA_DIR` holds both retained
 replay states. Budget archive-state disk space and full-history replay time.
-Publication fails before moving the pointer if generation or verification fails.
+The archive deployment installs `zakura-checkpoints` and `zakura-spentness` at the
+revision recorded in `EXPORTER_REVISION`.
 
 Before rollout, provision each seed with
 `deploy/release-state/provision-spentness-seed.sh`, configure its cache, and restart

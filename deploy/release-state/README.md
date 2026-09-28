@@ -193,7 +193,8 @@ Set `RELEASE_STATE_ORACLE_SOURCE` to a separately synchronized archive cache.
 Set `RELEASE_STATE_ORACLE_ID` to identify that source and its validation software.
 Set `RELEASE_STATE_GENERATOR_REVISION` to the tool's full git revision; the host
 wrapper reads the installed `EXPORTER_REVISION`. `RELEASE_STATE_DATA_DIR` holds
-two ordinary archive replay states at the selected checkpoint. The publisher
+two ordinary archive replay states at the selected checkpoint and the verification
+scratch directory. The two spentness pipelines run concurrently. The publisher
 never rolls back the live node. Version 2 bundles remain available for recovery.
 
 Provision reviewed artifacts on seeds with `provision-spentness-seed.sh`.

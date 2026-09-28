@@ -251,9 +251,8 @@ Build `zakura-spentness` with `--features zakura-spentness`. Its `replay`,
 membership artifacts. `install` provisions an artifact only when the binary
 contains its reviewed commitment. It does not enable hinted sync.
 
-The coupled checkpoint exporter accepts `--mainnet-spentness-output` and
-`--spentness-replay-cache`. It writes the artifact and commitment/verification
-sidecars before emitting the checkpoint list.
+The release-state publisher runs these commands at the checkpoint that
+`zakura-checkpoints` selects.
 
 See [the spentness design](../../docs/design/spentness-hints.md) for commands,
 source-validation requirements, peer distribution, and release provenance.

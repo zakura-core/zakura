@@ -5,20 +5,33 @@
 //! [`Reservations`] admit no more than it. The handler is a plain `match` from
 //! message to tool. Nothing in it depends on the layout, so the same node runs
 //! over [`SINGLE`](super::SINGLE) and [`PAIRED`](super::PAIRED).
+//!
+//! A watch pushes each item above its start as the next page. The node checks
+//! what the tools cannot: each page's height follows the previous one, and
+//! each end reason arrives in its window. One publisher task per session
+//! writes every page and outcome, so a watch's outcome follows its pages.
 
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::{BTreeMap, VecDeque},
+    sync::{Arc, Mutex, PoisonError},
+};
 
 use futures::{stream::SelectAll, StreamExt};
 use thiserror::Error;
+use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
-use super::{message_type, ExampleMessage, ItemPayload, ItemRange, RangePayload, GET_ITEMS};
+use super::{
+    message_type, EndReason, ExampleMessage, ItemPayload, ItemRange, RangePayload, WatchOp,
+    WatchUpdate, GET_ITEMS, WATCH,
+};
 use crate::zakura::{
     framed_channel,
     regulation::{
-        CadenceSendError, CadenceSender, ClaimRefused, PoolEntry, Produce, Reservations,
-        ReserveRefused, Responded, ResponseCap, ResponseSink, Serve, ServeCapacity, ServeEnd,
-        ServeViolation, SinkProgress, WorkLease,
+        Applied, CadenceSendError, CadenceSender, ClaimRefused, PoolEntry, Produce, Publications,
+        Push, Reservations, ReserveRefused, Responded, ResponseCap, ResponseSink, Serve,
+        ServeCapacity, ServeEnd, ServeViolation, SinkProgress, SubscribeRefused, SubscriptionFault,
+        SubscriptionLimits, Subscriptions, Update, WorkLease,
     },
     wire_codec::{decode_frame, encode_frame, Wire, WireError, WireMessage},
     Frame, FramedRecv, FramedSend, MessageRole, MessageRule, Stream, ZakuraPeerId,
@@ -159,6 +172,12 @@ pub(crate) enum Violation {
     Claim(#[from] ClaimRefused),
     #[error("an ending reports {reported} items after {received}")]
     Count { reported: u32, received: u32 },
+    #[error(transparent)]
+    Subscription(#[from] SubscriptionFault),
+    #[error("a pushed item at {got:?} does not follow {received:?}")]
+    Linkage { received: Height, got: Height },
+    #[error("a watch ended as {0:?} outside that reason's window")]
+    OutcomeWindow(EndReason),
 }
 
 /// Why this node could not request a range. Each case is local.
@@ -170,6 +189,23 @@ pub(crate) enum RequestFailed {
     Encode(#[from] WireError),
     #[error("the request queue is full")]
     QueueFull,
+}
+
+/// Why this node could not change its watch. Each case is local.
+#[derive(Debug, Error, PartialEq)]
+pub(crate) enum WatchFailed {
+    #[error(transparent)]
+    Refused(#[from] SubscribeRefused),
+    #[error("the update did not encode: {0}")]
+    Encode(#[from] WireError),
+}
+
+/// The watches peers hold on this node, shared with the publisher task.
+#[derive(Debug)]
+struct Watches {
+    publications: Publications<u32, Height>,
+    /// Watches this node ends as superseded.
+    superseded: Vec<u32>,
 }
 
 /// A range this node requested, and the items it received so far.
@@ -190,6 +226,19 @@ pub(crate) struct ExampleNode {
     reservations: Reservations<Height>,
     downloads: BTreeMap<Height, Download>,
     status: CadenceSender<ExampleMessage>,
+    /// This node's watches on the peer.
+    subscriptions: Subscriptions<u32, Height>,
+    next_watch: u32,
+    /// Updates recorded but not yet queued, oldest first. They leave in order
+    /// once the stream has room.
+    unsent: VecDeque<Frame>,
+    /// The peer's watches on this node.
+    watches: Arc<Mutex<Watches>>,
+    publisher: Arc<Notify>,
+    /// Watched items, in arrival order.
+    pub(crate) watched: Vec<(Height, Vec<u8>)>,
+    /// How each of this node's watches ended.
+    pub(crate) watch_ended: Vec<EndReason>,
     /// Items of every finished download, in arrival order.
     pub(crate) received: Vec<(Height, Vec<u8>)>,
     /// Ranges the peer reported unavailable.
@@ -213,12 +262,26 @@ impl ExampleNode {
         };
         let response_stream = stream_for(layout, message_type::ITEM);
         let serve = capacity.session(
-            store,
+            store.clone(),
             peer,
             max_in_flight,
             sends[response_stream].clone(),
-            cancel,
+            cancel.clone(),
         );
+        let limits = SubscriptionLimits::from_rule(&WATCH).expect("WATCH is a subscription row");
+        let watches = Arc::new(Mutex::new(Watches {
+            publications: Publications::new(limits),
+            superseded: Vec::new(),
+        }));
+        let publisher = Arc::new(Notify::new());
+        tokio::spawn(publish(
+            watches.clone(),
+            publisher.clone(),
+            capacity.push(peer),
+            store,
+            sends[stream_for(layout, message_type::PUSHED)].clone(),
+            cancel,
+        ));
         let max_in_flight = usize::try_from(max_in_flight).expect("a small limit fits usize");
         Self {
             layout,
@@ -228,6 +291,13 @@ impl ExampleNode {
             reservations: Reservations::new(ExampleMessage::RULES, max_in_flight),
             downloads: BTreeMap::new(),
             status: CadenceSender::new(),
+            subscriptions: Subscriptions::new(limits, ExampleMessage::RULES),
+            next_watch: 0,
+            unsent: VecDeque::new(),
+            watches,
+            publisher,
+            watched: Vec::new(),
+            watch_ended: Vec::new(),
             received: Vec::new(),
             unavailable: Vec::new(),
             peer_status: None,
@@ -287,14 +357,22 @@ impl ExampleNode {
     /// allocates the payload. In process, the node runs it here, still before
     /// the decode.
     pub(crate) fn handle(&mut self, frame: Frame) -> Result<(), Violation> {
-        if matches!(
-            MessageRule::find(ExampleMessage::RULES, frame.message_type).map(|row| row.role),
-            Some(MessageRole::Response { .. })
-        ) {
-            self.reservations
-                .precheck(frame.message_type, frame.payload.len())?;
-        }
         let len = frame.payload.len();
+        match MessageRule::find(ExampleMessage::RULES, frame.message_type).map(|row| row.role) {
+            Some(MessageRole::Response { request, .. }) if request == WATCH.message_type => {
+                self.subscriptions.precheck(frame.message_type, len)?;
+            }
+            Some(MessageRole::Response { .. }) => {
+                self.reservations.precheck(frame.message_type, len)?;
+            }
+            _ => {}
+        }
+        let handled = self.dispatch(frame, len);
+        self.flush();
+        handled
+    }
+
+    fn dispatch(&mut self, frame: Frame, len: usize) -> Result<(), Violation> {
         match decode_frame::<ExampleMessage>(&frame)? {
             ExampleMessage::Status { low, high } => self.peer_status = Some((low, high)),
             ExampleMessage::GetItems(range) => self.serve.admit(range)?,
@@ -340,8 +418,145 @@ impl ExampleNode {
                     .expect("a live reservation has a download");
                 self.unavailable.push(download.range);
             }
+            ExampleMessage::Watch(update) => {
+                let mut watches = self.watches.lock().unwrap_or_else(PoisonError::into_inner);
+                let publications = &mut watches.publications;
+                let applied = match update.op {
+                    WatchOp::Open => publications
+                        .open(
+                            update.id,
+                            update.sequence,
+                            update.added,
+                            update.acknowledged,
+                        )
+                        .map(|()| Applied::Live),
+                    WatchOp::Grant => publications.grant(
+                        &update.id,
+                        update.sequence,
+                        &update.acknowledged,
+                        update.added,
+                    ),
+                    WatchOp::Close => {
+                        publications.close(&update.id, update.sequence, &update.acknowledged)
+                    }
+                }?;
+                // A crossed update has nothing left to change.
+                if applied == Applied::Live {
+                    self.publisher.notify_one();
+                }
+            }
+            ExampleMessage::Pushed { id, height, bytes } => {
+                let &received = self
+                    .subscriptions
+                    .received(&id)
+                    .ok_or(SubscriptionFault::Unknown)?;
+                if received.next().ok() != Some(height) {
+                    return Err(Violation::Linkage {
+                        received,
+                        got: height,
+                    });
+                }
+                self.subscriptions.claim_page(&id, 1, len, height)?;
+                // The handler accepts each item as it arrives.
+                self.watched.push((height, bytes));
+                let accepted = self.subscriptions.accept(&id, &height);
+                debug_assert!(
+                    accepted.is_ok(),
+                    "the page was just claimed and not yet accepted"
+                );
+                self.renew(id);
+            }
+            ExampleMessage::WatchEnded { id, reason } => {
+                let ended = self.subscriptions.claim_end(&id)?;
+                let in_window = match reason {
+                    EndReason::Unavailable => ended.pages == 0,
+                    EndReason::Superseded => true,
+                    EndReason::Closed => ended.close_sent,
+                };
+                if !in_window {
+                    return Err(Violation::OutcomeWindow(reason));
+                }
+                self.watch_ended.push(reason);
+            }
         }
         Ok(())
+    }
+
+    /// Watch the peer's items above `from`, with the whole credit window.
+    pub(crate) fn watch(&mut self, from: Height) -> Result<u32, WatchFailed> {
+        let id = self.next_watch;
+        let MessageRole::Subscription { credit, .. } = WATCH.role else {
+            unreachable!("WATCH is a subscription row");
+        };
+        let update = self.subscriptions.open(id, credit, from)?;
+        let frame = match encode_frame(&watch_update(WatchOp::Open, id, update)) {
+            Ok(frame) => frame,
+            Err(error) => {
+                self.subscriptions.retract(&id);
+                return Err(error.into());
+            }
+        };
+        self.next_watch += 1;
+        self.unsent.push_back(frame);
+        self.flush();
+        Ok(id)
+    }
+
+    /// Ask the peer to end watch `id`.
+    pub(crate) fn close_watch(&mut self, id: u32) -> Result<(), WatchFailed> {
+        let update = self.subscriptions.close(&id)?;
+        self.queue_update(WatchOp::Close, id, update)
+    }
+
+    /// End every watch the peer holds on this node, as superseded.
+    pub(crate) fn supersede_watches(&self) {
+        let mut watches = self.watches.lock().unwrap_or_else(PoisonError::into_inner);
+        let live: Vec<u32> = watches.publications.keys().copied().collect();
+        watches.superseded.extend(live);
+        self.publisher.notify_one();
+    }
+
+    /// Grant the window back once half of it is free.
+    fn renew(&mut self, id: u32) {
+        let Some(room) = self.subscriptions.grantable(&id) else {
+            return;
+        };
+        if room.objects < super::WATCH_ITEMS / 2 {
+            return;
+        }
+        if let Ok(update) = self.subscriptions.grant(&id, room) {
+            self.queue_update(WatchOp::Grant, id, update)
+                .expect("a recorded update encodes");
+        }
+    }
+
+    /// Queue an update the tool already recorded. It must reach the peer, in
+    /// order, or the peer sees a sequence gap.
+    fn queue_update(
+        &mut self,
+        op: WatchOp,
+        id: u32,
+        update: Update<Height>,
+    ) -> Result<(), WatchFailed> {
+        self.unsent
+            .push_back(encode_frame(&watch_update(op, id, update))?);
+        self.flush();
+        Ok(())
+    }
+
+    /// Move queued updates to the stream while it has room.
+    pub(crate) fn flush(&mut self) {
+        let stream = stream_for(self.layout, message_type::WATCH);
+        while let Some(frame) = self.unsent.pop_front() {
+            if let Err(error) = self.sends[stream].try_send(frame) {
+                let frame = match error {
+                    tokio::sync::mpsc::error::TrySendError::Full(frame)
+                    | tokio::sync::mpsc::error::TrySendError::Closed(frame) => frame,
+                };
+                self.unsent.push_front(frame);
+                return;
+            }
+        }
     }
 
     /// The start of the live download containing `height`.
@@ -358,6 +573,125 @@ impl ExampleNode {
     pub(crate) fn serving_open(&self) -> u32 {
         self.serve.open()
     }
+}
+
+fn watch_update(op: WatchOp, id: u32, update: Update<Height>) -> ExampleMessage {
+    ExampleMessage::Watch(WatchUpdate {
+        op,
+        id,
+        sequence: update.sequence,
+        acknowledged: update.acknowledged,
+        added: update.added,
+    })
+}
+
+/// Push watched items until the session ends.
+///
+/// Each round ends the watches that must end, in the order
+/// [`Publications::end`] returns them, then pushes one page. A page waits for
+/// the same capacity a served response takes. A watch update wakes the task,
+/// so `Close` never waits behind a page that waits for capacity.
+async fn publish(
+    watches: Arc<Mutex<Watches>>,
+    wake: Arc<Notify>,
+    push: Push,
+    store: Arc<Store>,
+    send: FramedSend,
+    cancel: CancellationToken,
+) {
+    loop {
+        let (ended, page) = {
+            let mut watches = watches.lock().unwrap_or_else(PoisonError::into_inner);
+            let ended = end_due(&mut watches, &store);
+            (ended, next_page(&watches.publications, &store))
+        };
+        for (id, reason, terminal) in ended {
+            let frame = encode_frame(&ExampleMessage::WatchEnded { id, reason })
+                .expect("an end reason always encodes");
+            if !terminal.send(&send, frame).await {
+                return;
+            }
+        }
+        let Some((id, frame, height)) = page else {
+            tokio::select! {
+                () = cancel.cancelled() => return,
+                () = wake.notified() => continue,
+            }
+        };
+        let len = frame.payload.len();
+        let permit = tokio::select! {
+            () = cancel.cancelled() => return,
+            () = wake.notified() => continue,
+            permit = push.acquire(len) => permit,
+        };
+        let reserved = watches
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .publications
+            .reserve_page(&id, 1, len, height);
+        // A stall means the watch changed while this page waited; retry.
+        if reserved.is_ok() && !permit.send(&send, frame).await {
+            return;
+        }
+    }
+}
+
+/// End every watch that is closing, superseded, or unservable, and return
+/// its outcome and terminal permit.
+fn end_due(
+    watches: &mut Watches,
+    store: &Store,
+) -> Vec<(u32, EndReason, crate::zakura::regulation::TerminalPermit)> {
+    let publications = &watches.publications;
+    let mut due: Vec<(u32, EndReason)> = publications
+        .keys()
+        .filter_map(|&id| {
+            let first = publications.credit(&id)?.consumed().objects == 0;
+            let next = publications.last_sent(&id)?.next();
+            if publications.is_closing(&id) {
+                Some((id, EndReason::Closed))
+            } else if watches.superseded.contains(&id) {
+                Some((id, EndReason::Superseded))
+            } else if first && next.is_ok_and(|next| next < store.low) {
+                Some((id, EndReason::Unavailable))
+            } else {
+                None
+            }
+        })
+        .collect();
+    due.sort_unstable_by_key(|&(id, _)| id);
+    watches.superseded.clear();
+    due.into_iter()
+        .filter_map(|(id, reason)| {
+            let terminal = watches.publications.end(&id)?;
+            Some((id, reason, terminal))
+        })
+        .collect()
+}
+
+/// The next page of the first watch with an item to push and credit for it.
+fn next_page(
+    publications: &Publications<u32, Height>,
+    store: &Store,
+) -> Option<(u32, Frame, Height)> {
+    let mut ids: Vec<u32> = publications.keys().copied().collect();
+    ids.sort_unstable();
+    ids.into_iter().find_map(|id| {
+        let height = publications.last_sent(&id)?.next().ok()?;
+        if height < store.low || height > store.high {
+            return None;
+        }
+        let frame = encode_frame(&ExampleMessage::Pushed {
+            id,
+            height,
+            bytes: item_bytes(height),
+        })
+        .expect("a stored item always encodes");
+        let unspent = publications.unspent(&id)?;
+        // Widening usize to u64 is lossless on supported targets.
+        (unspent.objects >= 1 && unspent.bytes >= frame.payload.len() as u64)
+            .then_some((id, frame, height))
+    })
 }
 
 /// The index of the layout stream that carries `message_type`.

@@ -70,7 +70,10 @@ use zakura_chain::{
         },
         ConsensusBranchId, Network, NetworkUpgrade,
     },
-    serialization::{BytesInDisplayOrder, ZcashDeserialize, ZcashDeserializeInto, ZcashSerialize},
+    serialization::{
+        BytesInDisplayOrder, DateTime32, Duration32, ZcashDeserialize, ZcashDeserializeInto,
+        ZcashSerialize,
+    },
     subtree::NoteCommitmentSubtreeIndex,
     transaction::{self, SerializedTransaction, Transaction, UnminedTx},
     transparent::{self, Address, OutputIndex},
@@ -2987,7 +2990,8 @@ where
                 latest_chain_tip.mark_best_tip_seen();
 
                 // Fetch the state data and local time for the block template.
-                // A new tip or reaching the maximum timestamp ends long polling.
+                // A new tip, difficulty time range, or expired time limit ends
+                // long polling.
                 let chain_info @ zakura_state::GetBlockTemplateChainInfo {
                     tip_hash,
                     tip_height,
@@ -3036,7 +3040,7 @@ where
                 // - the server long poll ID is different to the client long poll ID, or
                 // - the previous loop iteration waited until the max time.
                 if Some(&server_long_poll_id) != client_long_poll_id.as_ref() || max_time_reached {
-                    // Refresh work at its maximum consensus timestamp.
+                    // Refresh work when its time range expires.
                     let submit_old = if max_time_reached {
                         Some(false)
                     } else {
@@ -3115,16 +3119,25 @@ where
                     Ok::<_, ErrorObject<'static>>(precomputed_coinbase)
                 };
 
-                // Wait for the maximum consensus timestamp to elapse.
-                //
-                // This duration might be slightly lower than the actual maximum,
-                // if cur_time was clamped to min_time. In that case the wait is very long,
-                // and it's ok to return early.
-                //
-                // It can also be zero if cur_time was clamped to max_time. In that case,
-                // we want to wait for another change, and ignore this timeout. So we use an
-                // `OptionFuture::None`.
-                let duration_until_max_time = max_time.saturating_duration_since(cur_time);
+                // Testnet's difficulty timeout is strict: the last standard
+                // timestamp is still valid, so refresh one second after it.
+                // Measure from the wall clock to keep a clamped cur_time from
+                // repeatedly scheduling a timer after the time limit expires.
+                let duration_until_max_time =
+                    if NetworkUpgrade::minimum_difficulty_spacing_for_height(
+                        &self.network,
+                        chain_info.tip_height.next().map_misc_error()?,
+                    )
+                    .is_some()
+                    {
+                        max_time
+                            .saturating_add(Duration32::from_seconds(1))
+                            .saturating_duration_since(DateTime32::now())
+                    } else {
+                        max_time.saturating_duration_since(cur_time)
+                    };
+
+                // An elapsed limit waits for another change to avoid spinning.
                 let wait_for_max_time: OptionFuture<_> = if duration_until_max_time.seconds() > 0 {
                     Some(tokio::time::sleep(duration_until_max_time.to_std()))
                 } else {
@@ -3202,8 +3215,8 @@ where
                         continue 'rebuild;
                     }
 
-                    // The max time does not elapse during normal operation on mainnet,
-                    // and it rarely elapses on testnet.
+                    // Testnet refreshes when the difficulty time range expires.
+                    // Mainnet only reaches this limit after a long stall.
                     Some(_elapsed) = wait_for_max_time => {
                         // This log is very rare so it's ok to be info.
                         tracing::info!(

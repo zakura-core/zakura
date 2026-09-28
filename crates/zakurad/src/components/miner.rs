@@ -761,6 +761,30 @@ mod tests {
     }
 
     #[test]
+    fn mining_template_replaces_harder_work_after_testnet_timeout() {
+        use zakura_chain::work::difficulty::ParameterDifficulty;
+
+        let block = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
+            .zcash_deserialize_into::<Arc<Block>>()
+            .expect("block 1 deserializes");
+        let mut standard = *block.header;
+        let limit = Network::new_default_testnet().target_difficulty_limit();
+        standard.difficulty_threshold = (limit / 4_u32).to_compact();
+        let mut minimum = standard;
+        minimum.time += chrono::Duration::seconds(1);
+        minimum.difficulty_threshold = limit.to_compact();
+
+        // The GBT time-range change sets submitold=false on the same parent.
+        // It must replace the harder header even though that fixed header would
+        // still be valid to submit.
+        assert!(should_replace_mining_template(
+            Some(standard),
+            minimum,
+            Some(false),
+        ));
+    }
+
+    #[test]
     fn unavailable_mining_template_cancels_current_work() {
         let block = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
             .zcash_deserialize_into::<Arc<Block>>()

@@ -307,10 +307,9 @@ pub struct BlockTemplateResponse {
     ///
     /// <https://en.bitcoin.it/wiki/BIP_0023#Mutations>
     ///
-    /// This is the consensus upper bound on the block timestamp. On testnet,
-    /// changing the timestamp across the minimum difficulty timeout can also
-    /// change the required difficulty. Miners must obtain a new template when
-    /// that happens.
+    /// On testnet, this also restricts timestamp mutations to the range that
+    /// matches the template's difficulty. Long polling refreshes the template
+    /// when the minimum difficulty timeout changes that range.
     #[serde(rename = "maxtime")]
     #[getter(copy)]
     pub(crate) max_time: DateTime32,
@@ -328,8 +327,9 @@ pub struct BlockTemplateResponse {
     ///
     /// This field is not in `zcashd` or the Zcash RPC reference yet.
     ///
-    /// In Zebra, `submit_old` is `false` when the tip block changed or max time is reached,
-    /// and `true` if only the mempool transactions have changed.
+    /// `submit_old` is `false` when the parent, timestamp range, or withdrawal
+    /// revision changes, or when the time range expires. It is `true` for
+    /// mempool-only changes.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(default)]
     #[serde(rename = "submitold")]

@@ -48,8 +48,8 @@ pub struct LongPollInput {
 
     /// The max time in the same template as this long poll ID.
     ///
-    /// If the max time is reached, a new template must be provided.
-    /// Old work is no longer valid.
+    /// A changed or expired time range requires fresh work. On testnet, the
+    /// range changes when the timestamp selects a different difficulty.
     ///
     /// Ideally, a new template should be provided at least one target block interval before
     /// the max time. This avoids wasted work.
@@ -154,8 +154,8 @@ pub struct LongPollId {
 
     /// The max time in the same template as this long poll ID.
     ///
-    /// If the max time is reached, a new template must be provided.
-    /// Old work is no longer valid.
+    /// A changed or expired time range requires fresh work. On testnet, the
+    /// range changes when the timestamp selects a different difficulty.
     ///
     /// Ideally, a new template should be provided at least one target block interval before
     /// the max time. This avoids wasted work.
@@ -211,6 +211,8 @@ impl LongPollId {
     /// because newer transactions don't have to be included in the old shares.
     ///
     /// But if the chain tip has changed, the block header has changed, so old shares are invalid.
+    /// A changed time range also requests fresh work for testnet difficulty
+    /// transitions.
     pub fn submit_old(&self, old_long_poll_id: &LongPollId) -> bool {
         self.same_work_context(old_long_poll_id) && self.revision == old_long_poll_id.revision
     }

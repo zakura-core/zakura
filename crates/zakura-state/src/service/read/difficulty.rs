@@ -8,7 +8,7 @@ use zakura_chain::{
     amount::NonNegative,
     block::{self, Hash, Height},
     history_tree::HistoryTree,
-    parameters::{subsidy::is_zip234_active, Network},
+    parameters::{subsidy::is_zip234_active, Network, NetworkUpgrade},
     serialization::{DateTime32, Duration32},
     value_balance::ValueBalance,
     work::difficulty::{CompactDifficulty, PartialCumulativeWork, Work, U256},
@@ -256,7 +256,7 @@ fn difficulty_time_and_history_tree(
             .collect(),
     ))?;
 
-    let min_time = median_time_past
+    let mut min_time = median_time_past
         .checked_add(Duration32::from_seconds(1))
         .expect("a valid block time plus a small constant is in-range");
 
@@ -264,7 +264,7 @@ fn difficulty_time_and_history_tree(
     // > MUST be less than or equal to the median-time-past of that block plus 90 * 60 seconds.
     //
     // We ignore the height as we are checkpointing on Canopy or higher in Mainnet and Testnet.
-    let max_time = median_time_past
+    let mut max_time = median_time_past
         .checked_add(Duration32::from_seconds(BLOCK_MAX_TIME_SINCE_MEDIAN))
         .expect("a valid block time plus a small constant is in-range");
 
@@ -278,6 +278,29 @@ fn difficulty_time_and_history_tree(
         relevant_data,
     )?;
     let expected_difficulty = difficulty_adjustment.expected_difficulty_threshold();
+
+    let candidate_height = tip_height.next()?;
+    if let Some(gap) =
+        NetworkUpgrade::minimum_difficulty_spacing_for_height(network, candidate_height)
+    {
+        let parent_time = DateTime32::try_from(relevant_chain[0].time)?;
+        let standard_difficulty_max_time = parent_time
+            .checked_add(gap.try_into()?)
+            .ok_or("testnet difficulty timeout exceeds the timestamp range")?;
+
+        // Select difficulty using the clock within consensus bounds first.
+        // Then restrict time mutations to the range compatible with those bits,
+        // without advancing the clock into the minimum-difficulty range early.
+        if cur_time > standard_difficulty_max_time {
+            min_time = min_time.max(
+                standard_difficulty_max_time
+                    .checked_add(Duration32::from_seconds(1))
+                    .ok_or("testnet minimum-difficulty time exceeds the timestamp range")?,
+            );
+        } else {
+            max_time = max_time.min(standard_difficulty_max_time);
+        }
+    }
 
     Ok(GetBlockTemplateChainInfo {
         tip_hash,
@@ -298,7 +321,7 @@ mod tests {
         pow_adjustment_block_span_for_height, POW_ADJUSTMENT_BLOCK_SPAN,
     };
     use zakura_chain::{
-        parameters::{testnet::ConfiguredActivationHeights, NetworkUpgrade},
+        parameters::testnet::{ConfiguredActivationHeights, Parameters},
         serialization::ZcashDeserializeInto,
         work::difficulty::ParameterDifficulty,
     };
@@ -306,14 +329,17 @@ mod tests {
     #[test]
     fn mining_template_testnet_uses_clock_at_difficulty_timeout() {
         let _init_guard = zakura_test::init();
-        const NU7: u32 = 400_000;
-        let regtest = Network::new_regtest(
-            ConfiguredActivationHeights {
+        const NU7: u32 = 800_000;
+        let configured_testnet = Parameters::build()
+            .with_activation_heights(ConfiguredActivationHeights {
+                blossom: Some(1),
                 nu7: Some(NU7),
                 ..Default::default()
-            }
-            .into(),
-        );
+            })
+            .unwrap()
+            .clear_funding_streams()
+            .to_network()
+            .unwrap();
         let block: block::Block = zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
             .zcash_deserialize_into()
             .expect("the genesis vector is valid");
@@ -321,10 +347,11 @@ mod tests {
 
         for (network, tip_height) in [
             (Network::new_default_testnet(), Height(3_000_000)),
-            (regtest.clone(), Height(NU7 - 2)),
-            (regtest.clone(), Height(NU7 - 1)),
-            (regtest, Height(NU7)),
+            (configured_testnet.clone(), Height(NU7 - 2)),
+            (configured_testnet.clone(), Height(NU7 - 1)),
+            (configured_testnet, Height(NU7)),
         ] {
+            assert!(!network.disable_pow());
             let candidate_height = tip_height.next().unwrap();
             let gap: Duration32 =
                 NetworkUpgrade::minimum_difficulty_spacing_for_height(&network, candidate_height)
@@ -340,8 +367,32 @@ mod tests {
             header.time = tip_time.to_chrono();
             header.difficulty_threshold = (limit / 4_u32).to_compact();
             let span = pow_adjustment_block_span_for_height(&network, candidate_height);
-            let header = Arc::new(header);
-            let relevant_chain = vec![header; span];
+            let relevant_chain: Vec<_> = (0..span)
+                .map(|index| {
+                    let mut header = header;
+                    let age = u32::try_from(index).unwrap() * spacing.seconds();
+                    header.time = tip_time
+                        .checked_sub(Duration32::from_seconds(age))
+                        .unwrap()
+                        .to_chrono();
+                    Arc::new(header)
+                })
+                .collect();
+            let median_time = tip_time
+                .checked_sub(Duration32::from_seconds(
+                    u32::try_from(POW_MEDIAN_BLOCK_SPAN / 2).unwrap() * spacing.seconds(),
+                ))
+                .unwrap();
+            let consensus_min = median_time
+                .checked_add(Duration32::from_seconds(1))
+                .unwrap();
+            let consensus_max = median_time
+                .checked_add(Duration32::from_seconds(BLOCK_MAX_TIME_SINCE_MEDIAN))
+                .unwrap();
+            let last_standard_time = tip_time.checked_add(gap).unwrap();
+            let first_minimum_time = last_standard_time
+                .checked_add(Duration32::from_seconds(1))
+                .unwrap();
 
             // Cover the old early-switch window and strict consensus timeout.
             for offset in [
@@ -367,19 +418,45 @@ mod tests {
                 assert_eq!(result.cur_time, now, "tip={tip_height:?}, offset={offset}");
                 assert_eq!(
                     result.min_time,
-                    tip_time.checked_add(Duration32::from_seconds(1)).unwrap()
+                    if offset > gap.seconds() {
+                        first_minimum_time
+                    } else {
+                        consensus_min
+                    }
                 );
                 assert_eq!(
                     result.max_time,
-                    tip_time
-                        .checked_add(Duration32::from_seconds(BLOCK_MAX_TIME_SINCE_MEDIAN))
-                        .unwrap()
+                    if offset > gap.seconds() {
+                        consensus_max
+                    } else {
+                        last_standard_time
+                    }
                 );
                 assert_eq!(
                     result.expected_difficulty == limit.to_compact(),
                     offset > gap.seconds(),
                     "tip={tip_height:?}, offset={offset}"
                 );
+
+                // Miners may mutate time without changing the template's bits.
+                // Validate both bounds and the clock against the shared header
+                // validator, including the candidate block's upgrade spacing.
+                for time in [result.min_time, result.cur_time, result.max_time] {
+                    let adjustment = AdjustedDifficulty::new_from_header_time(
+                        time.to_chrono(),
+                        tip_height,
+                        &network,
+                        relevant_chain
+                            .iter()
+                            .map(|header| (header.difficulty_threshold, header.time)),
+                    )
+                    .unwrap();
+                    zakura_header_chain::validate_contextual_difficulty_and_time(
+                        result.expected_difficulty,
+                        adjustment,
+                    )
+                    .expect("every advertised timestamp must match the template bits");
+                }
             }
         }
     }
@@ -428,8 +505,12 @@ mod tests {
                     result.cur_time, expected_time,
                     "network={network}, now={now:?}"
                 );
-                assert_eq!(result.min_time, min_time);
-                assert_eq!(result.max_time, max_time);
+                assert!(result.min_time <= result.cur_time);
+                assert!(result.cur_time <= result.max_time);
+                if network == Network::Mainnet {
+                    assert_eq!(result.min_time, min_time);
+                    assert_eq!(result.max_time, max_time);
+                }
             }
         }
     }

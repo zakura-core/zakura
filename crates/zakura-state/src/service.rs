@@ -474,20 +474,22 @@ impl StateService {
                 // `expect` would format the error with `Debug`, which drops the actionable
                 // guidance each `StateInitError` carries in its `Display` message.
                 let finalized_state =
-                    FinalizedState::new_with_spentness(&config, &network, spentness)
-                        .unwrap_or_else(|error| match error {
-                            // This database cannot be repaired, and the generic hint below would
-                            // send the operator looking at permissions and disk space instead.
-                            error @ StateInitError::VctSproutHistoryUnrepairable => {
-                                panic!("{error}")
-                            }
-                            error => panic!(
-                                "opening the read-write finalized state database failed: {error}; \
+                    match FinalizedState::new_with_spentness(&config, &network, spentness) {
+                        Ok(finalized_state) => finalized_state,
+                        // Spentness errors carry their own guidance, so the caller reports them.
+                        Err(error @ StateInitError::Spentness(_)) => return Err(error),
+                        // This database cannot be repaired, and the generic hint below would
+                        // send the operator looking at permissions and disk space instead.
+                        Err(error @ StateInitError::VctSproutHistoryUnrepairable) => {
+                            panic!("{error}")
+                        }
+                        Err(error) => panic!(
+                            "opening the read-write finalized state database failed: {error}; \
                              check that the state cache directory is writable and not locked by \
                              another Zakura instance, and that there is free disk space"
-                            ),
-                        })
-                        .with_checkpoint_raw_tx_retention(max_checkpoint_height, &config);
+                        ),
+                    }
+                    .with_checkpoint_raw_tx_retention(max_checkpoint_height, &config);
                 timer.finish_desc("opening finalized state database");
 
                 let timer = CodeTimer::start();

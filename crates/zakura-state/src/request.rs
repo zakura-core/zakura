@@ -1625,27 +1625,46 @@ pub enum Request {
 }
 
 impl Request {
+    /// Whether this request can run while spentness construction is incomplete.
+    ///
+    /// Allowed requests read or write headers, bodies, and checkpoint blocks. Denied requests
+    /// read UTXOs, value pools, or address indexes, or admit semantically verified blocks.
+    /// The match has no wildcard arm, so every new variant must be classified.
     pub(crate) fn available_during_spentness(&self) -> bool {
-        matches!(
-            self,
-            Self::CommitCheckpointVerifiedBlock(_)
-                | Self::ApplyHeaderChainInsert { .. }
-                | Self::RecordHeaderChainBodyUnavailable { .. }
-                | Self::RecordHeaderChainBodyInvalid { .. }
-                | Self::RestartHeaderChainBodyAvailability { .. }
-                | Self::RetryHeaderChainBodyAvailability { .. }
-                | Self::Depth(_)
-                | Self::Tip
-                | Self::BlockLocator
-                | Self::Transaction(_)
-                | Self::Block(_)
-                | Self::AnyChainBlock(_)
-                | Self::BlockHeader(_)
-                | Self::FindBlockHashes { .. }
-                | Self::FindBlockHeaders { .. }
-                | Self::BestChainBlockHash(_)
-                | Self::KnownBlock(_)
-        )
+        match self {
+            Self::ApplyHeaderChainInsert { .. }
+            | Self::RecordHeaderChainBodyUnavailable { .. }
+            | Self::RecordHeaderChainBodyInvalid { .. }
+            | Self::RestartHeaderChainBodyAvailability { .. }
+            | Self::RetryHeaderChainBodyAvailability { .. }
+            | Self::CommitCheckpointVerifiedBlock(_)
+            | Self::CheckCheckpointHandoff
+            | Self::Depth(_)
+            | Self::Tip
+            | Self::BlockLocator
+            | Self::Transaction(_)
+            | Self::Block(_)
+            | Self::AnyChainBlock(_)
+            | Self::BlockHeader(_)
+            | Self::FindBlockHashes { .. }
+            | Self::FindBlockHeaders { .. }
+            | Self::BestChainBlockHash(_)
+            | Self::KnownBlock(_) => true,
+
+            Self::CommitSemanticallyVerifiedBlock(_)
+            | Self::CommitSemanticallyVerifiedBlockWithAdmission { .. }
+            | Self::UnspentBestChainUtxo(_)
+            | Self::CheckParentInputs { .. }
+            | Self::AwaitBlockInfo(_)
+            | Self::BlockInfo(_)
+            | Self::AwaitUtxo(_)
+            | Self::CheckBestChainTipNullifiersAndAnchors(_)
+            | Self::CheckPreparedMinedRelayEligibility(_)
+            | Self::BestChainNextMedianTimePast
+            | Self::InvalidateBlock(_)
+            | Self::ReconsiderBlock(_)
+            | Self::CheckBlockProposalValidity(_) => false,
+        }
     }
 
     /// Returns a [`&'static str`](str) name of the variant representing this value.
@@ -2231,51 +2250,72 @@ pub enum ReadRequest {
 }
 
 impl ReadRequest {
+    /// Whether this request can run while spentness construction is incomplete.
+    ///
+    /// Allowed requests read headers, bodies, transactions, trees, or storage metadata. Denied
+    /// requests read UTXOs, value pools, or address indexes, or run mempool and mining checks.
+    /// The match has no wildcard arm, so every new variant must be classified.
     pub(crate) fn available_during_spentness(&self) -> bool {
-        #[cfg(feature = "indexer")]
-        if matches!(self, Self::RawBlocksByHeightRange { .. }) {
-            return true;
-        }
-        matches!(
-            self,
+        match self {
             Self::UsageInfo
-                | Self::PruningInfo
-                | Self::Tip
-                | Self::FinalizedTip
-                | Self::Depth(_)
-                | Self::Block(_)
-                | Self::AnyChainBlock(_)
-                | Self::BlockAndSize(_)
-                | Self::BlockHeader(_)
-                | Self::Transaction(_)
-                | Self::AnyChainTransaction(_)
-                | Self::TransactionIdsForBlock(_)
-                | Self::AnyChainTransactionIdsForBlock(_)
-                | Self::BlockLocator
-                | Self::FindBlockHashes { .. }
-                | Self::FindBlockHeaders { .. }
-                | Self::HeaderChainSnapshot
-                | Self::HeaderLocator
-                | Self::HeaderValidationLease { .. }
-                | Self::VctRepairContext { .. }
-                | Self::AcquireRetainedHeaderPath { .. }
-                | Self::ReadRetainedHeaderPath { .. }
-                | Self::ReleaseRetainedHeaderPath { .. }
-                | Self::BlockRoots { .. }
-                | Self::BestHeaderTip
-                | Self::MissingBlockBodyMetadata { .. }
-                | Self::BlocksByHeightRange { .. }
-                | Self::SaplingTree(_)
-                | Self::OrchardTree(_)
-                | Self::IronwoodTree(_)
-                | Self::SaplingSubtrees { .. }
-                | Self::OrchardSubtrees { .. }
-                | Self::IronwoodSubtrees { .. }
-                | Self::BestChainBlockHash(_)
-                | Self::TipBlockSize
-                | Self::ChainTips
-                | Self::NonFinalizedBlocksListener { .. }
-        )
+            | Self::PruningInfo
+            | Self::Tip
+            | Self::FinalizedTip
+            | Self::Depth(_)
+            | Self::Block(_)
+            | Self::AnyChainBlock(_)
+            | Self::BlockAndSize(_)
+            | Self::BlockHeader(_)
+            | Self::Transaction(_)
+            | Self::AnyChainTransaction(_)
+            | Self::TransactionIdsForBlock(_)
+            | Self::AnyChainTransactionIdsForBlock(_)
+            | Self::BlockLocator
+            | Self::FindBlockHashes { .. }
+            | Self::FindBlockHeaders { .. }
+            | Self::HeaderChainSnapshot
+            | Self::HeaderLocator
+            | Self::HeaderValidationLease { .. }
+            | Self::VctRepairContext { .. }
+            | Self::AcquireRetainedHeaderPath { .. }
+            | Self::ReadRetainedHeaderPath { .. }
+            | Self::ReleaseRetainedHeaderPath { .. }
+            | Self::BlockRoots { .. }
+            | Self::BlockSizesByHash { .. }
+            | Self::BestHeaderTip
+            | Self::MissingBlockBodyMetadata { .. }
+            | Self::BlocksByHeightRange { .. }
+            | Self::SaplingTree(_)
+            | Self::OrchardTree(_)
+            | Self::IronwoodTree(_)
+            | Self::SaplingSubtrees { .. }
+            | Self::OrchardSubtrees { .. }
+            | Self::IronwoodSubtrees { .. }
+            | Self::BestChainBlockHash(_)
+            | Self::TipBlockSize
+            | Self::ChainTips
+            | Self::NonFinalizedBlocksListener { .. } => true,
+            #[cfg(feature = "indexer")]
+            Self::RawBlocksByHeightRange { .. } => true,
+
+            Self::TipPoolValues
+            | Self::BlockInfo(_)
+            | Self::UnspentBestChainUtxo(_)
+            | Self::CheckParentInputs { .. }
+            | Self::AnyChainUtxo(_)
+            | Self::AddressBalance(_)
+            | Self::TransactionIdsByAddresses { .. }
+            | Self::UtxosByAddresses(_)
+            | Self::CheckBestChainTipNullifiersAndAnchors(_)
+            | Self::CheckPreparedMinedRelayEligibility(_)
+            | Self::BestChainNextMedianTimePast
+            | Self::ChainInfo
+            | Self::SolutionRate { .. }
+            | Self::CheckBlockProposalValidity(_)
+            | Self::IsTransparentOutputSpent(_) => false,
+            #[cfg(feature = "indexer")]
+            Self::SpendingTransactionId(_) => false,
+        }
     }
 
     /// Returns a [`&'static str`](str) name of the variant representing this value.
@@ -2460,5 +2500,60 @@ impl TimedSpan {
             })
         })
         .wait_for_panics()
+    }
+}
+
+#[cfg(test)]
+mod spentness_gate_tests {
+    use super::*;
+
+    #[test]
+    fn spentness_gates_allow_metadata_and_deny_monetary_requests() {
+        let hash = block::Hash([1; 32]);
+        let outpoints: Arc<[transparent::OutPoint]> = Arc::new([]);
+
+        for (request, allowed) in [
+            (Request::CheckCheckpointHandoff, true),
+            (Request::Tip, true),
+            (
+                Request::CheckParentInputs {
+                    parent: hash,
+                    outpoints: outpoints.clone(),
+                },
+                false,
+            ),
+            (Request::AwaitBlockInfo(hash), false),
+            (Request::BlockInfo(hash), false),
+            (Request::BestChainNextMedianTimePast, false),
+        ] {
+            assert_eq!(
+                request.available_during_spentness(),
+                allowed,
+                "{}",
+                request.variant_name()
+            );
+        }
+
+        for (request, allowed) in [
+            (ReadRequest::BlockSizesByHash { hashes: vec![hash] }, true),
+            (ReadRequest::Tip, true),
+            (
+                ReadRequest::CheckParentInputs {
+                    parent: hash,
+                    outpoints,
+                },
+                false,
+            ),
+            (ReadRequest::BlockInfo(hash.into()), false),
+            (ReadRequest::TipPoolValues, false),
+            (ReadRequest::ChainInfo, false),
+        ] {
+            assert_eq!(
+                request.available_during_spentness(),
+                allowed,
+                "{}",
+                request.variant_name()
+            );
+        }
     }
 }

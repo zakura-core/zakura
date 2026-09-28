@@ -1,13 +1,13 @@
-# Spentness artifact tooling and peer distribution
+# Spentness hints
 
-This implementation supplies the first stage of spentness hints. It generates,
-audits, distributes, and caches terminal UTXO membership. It does not change
-checkpoint commits or enable hinted state construction.
+Zakura can use reviewed terminal UTXO membership to omit spent outputs during
+checkpoint construction. The ordinary writer never inserts, reads, or deletes a
+UTXO row for an output that dies before H. It still writes every index, balance,
+and value pool, so the state at H equals ordinary state. The default remains off. The compiled public
+commitment list remains empty until maintainers review an artifact.
 
-The ordered writer, construction gates, blocking index rebuild at H, recovery
-markers, and differential sync benchmarks form the next stage. Activation stays
-off until those parts work together. A faster initial pass alone does not establish
-an end-to-end sync improvement.
+Matched sync benchmarks and public-network rollout remain separate work.
+A faster initial pass alone does not establish an end-to-end sync improvement.
 
 ## Artifact and trust
 
@@ -28,7 +28,7 @@ the compiled release list. A descriptor supplied by a peer cannot authorize a hi
 
 The compiled list starts empty because no public artifact has been reviewed.
 The release importer adds descriptors and provenance. It keeps older descriptors
-for future incomplete-run recovery. The bitmap never enters source data or the
+and their matching VCT handoff frontiers for incomplete-run recovery. The bitmap never enters source data or the
 executable. Checkpoint hashes alone do not authenticate terminal UTXO membership;
 maintainers must review the generation evidence before accepting a descriptor.
 
@@ -141,11 +141,13 @@ Enable artifact distribution explicitly:
 cache_dir = "/data/zakura/spentness"
 ```
 
-The startup task waits up to 60 seconds for a capable peer, then makes bounded
+The distribution task waits up to 60 seconds for a capable peer, then makes bounded
 acquisition attempts. It retries missing artifacts after a 60-second pause until
 acquisition succeeds or the endpoint shuts down. The first failure for each
 artifact logs a warning; later failures log at debug level. Each source has a
-ten-minute deadline. An unavailable artifact does not block ordinary sync.
+ten-minute deadline. An unavailable artifact does not block ordinary sync when hinted
+construction is disabled. Pre-state acquisition rotates peer cohorts for up to
+one hour. Auto mode then falls back to ordinary sync; Require mode reports failure.
 Supported historical cache entries also remain available for serving.
 
 For offline or seed provisioning, use a binary that contains the reviewed pin:
@@ -158,6 +160,119 @@ Cache names use the SHA-256 digest followed by `.bin`. Startup always reverifies
 cache bytes. Seed operators retain supported artifacts and load them before
 rolling out a release that selects their commitments. Nodes fetch artifacts from
 peers; the HTTPS bundle publisher serves release automation, not node acquisition.
+
+## Construction and recovery
+
+For a release with a reviewed commitment, select an explicit construction policy:
+
+```toml
+[spentness]
+mode = "require" # "off" (default), "auto", or "require"
+# artifact_file = "/data/hints.bin"
+```
+
+Construction requires checkpoint sync and VCT fast sync. `auto` can use ordinary
+sync if the empty database cannot start with compatible hints. `require` reports
+the failure. Neither policy starts hints midway through an ordinary database.
+An explicit file supplies bytes only; it cannot authorize an unrecognized digest.
+
+Before opening writable state, the node checks the database that state opening
+will use. That includes a previous major version that the upgrade will reuse. Only
+an empty database or an interrupted hinted run needs an artifact. The node then
+verifies a local artifact or starts a temporary peer endpoint to acquire the
+selected artifact. The node shuts down that endpoint before starting its normal
+endpoint. A slow endpoint shutdown does not discard an acquired artifact. Shutdown
+during acquisition stops the node instead of falling back to ordinary sync. The
+node uses the configured serving cache, or `<state.cache_dir>/spentness`, and keeps
+a durable recovery copy in the state cache. Nodes never download bitmap bytes
+from HTTP.
+
+The writer persists one versioned record with each atomic block batch:
+
+```text
+Applying { commitment, height, block_hash, next_ordinal, omitted_outputs, resolved_spends }
+  -> Complete { commitment, rollback_floor }
+```
+
+Construction uses the ordinary block writer. For each block, the writer reads the
+bit of every created output, including genesis and non-address outputs. A set bit
+marks a survivor, which the writer inserts into the UTXO set and the address UTXO
+index. A clear bit marks an omitted output. The writer writes no UTXO row and no
+address UTXO row for an omitted output. It still writes the output's address
+transaction index entry, balance, received total, and value pool change.
+
+The writer resolves each spend without the UTXO set:
+
+1. A spend of an output in the same block resolves from that block.
+2. Otherwise it resolves from an in-memory map of omitted outputs that no block
+   has spent yet. A hit removes the entry.
+3. Otherwise it reads the creating transaction's location and the omitted-output
+   journal row at that height.
+
+Each map entry and journal record holds the output's location, value, coinbase
+flag, and P2PKH or P2SH hash. It holds no script. The writer rebuilds the standard
+script for the address, because it reads only the address from a spent output's
+script. The map evicts its oldest 1,000-height buckets when it exceeds 10 million
+entries. The journal is the `spentness_omitted_outputs` column family. Each block
+writes one row, keyed by height, with its omitted outputs that it does not spend
+itself. A miss after an eviction or a restart reads that row. Correctness never
+depends on the map; it only saves reads.
+
+Every spent output feeds the ordinary index and pool code. Construction therefore
+keeps exact address balances, received totals, first-receive locations, address
+transaction indexes, spending transaction indexes, and chain value pools at every
+height. That includes the NSM value balance and ZIP 234 issuance, so H may reach
+or pass NU7 activation. The writer skips spent-output deletes, because every
+output that a block spends before H is omitted.
+
+Only omitted outputs enter the map and the journal, so each resolved spend proves
+that the artifact omits its output. A spend that resolves nowhere, including a
+spend of a survivor, stops construction. The record counts omitted outputs and
+resolved spends. At H, the writer checks the exact hash, output count, and VCT
+handoff frontiers, and requires the two counts to be equal. Checkpoint sync
+already trusts the chain through H, so no output is spent twice. Equal counts
+then mean the omitted outputs are exactly the spent outputs, and the survivors
+are exactly the UTXO set at H. The terminal batch writes Complete and deletes the
+journal.
+
+A mismatch stops the writer without attributing the failure to a peer. A
+restart repeats the same failure, so the error tells the operator to delete the
+state and resync with hints off.
+
+The ordinary retention plan applies during construction. Pruned mode therefore
+deletes raw transactions below the retention window as construction advances.
+
+State access gates the UTXO set during construction: pending-UTXO responses,
+UTXO and address UTXO reads, spent-output checks, mempool checks, mining checks,
+and ordinary semantic admission. Balances, address transaction indexes, value
+pools, block info, and chain info stay available, because they are exact. Every
+state request variant is classified as allowed or denied, so a new variant needs
+a review decision. Synced blocks wait for completion before semantic
+verification. Block proposals and `submitblock` fail immediately. Completion
+lifts the gates.
+
+Startup resumes Applying with its original recognized commitment, even when a
+new release selects a later commitment. If the artifact is missing, restore
+identical bytes in the reported cache path or set `spentness.artifact_file`.
+Completed databases need no bitmap and no recognized commitment. Startup checks
+only their chain identity and revocation. Unknown or revoked commitments stop
+incomplete runs with a compatibility error.
+
+Database format 30.0.0 gives this construction a separate major-version
+directory. The existing upgrade mechanism reuses ordinary format-29 data. Older
+binaries do not open format-30 data as ordinary state. Incomplete runs also
+require the same database format and indexer feature when they resume.
+
+Read-only opens, exports, offline pruning, and offline rollback reject incomplete
+state. After completion, rollback cannot cross H or a stricter VCT boundary.
+
+`state.spentness.construction_height` reports construction progress.
+`SpentnessStatus` and `state.spentness.usable` report UTXO-set availability.
+`state.spentness.utxo.omitted` counts omitted outputs. `state.spentness.spends.hits`
+and `state.spentness.spends.misses` count spends that resolved from the map and from
+the journal. `state.spentness.live.entries` and `state.spentness.live.evicted`
+report the map. Benchmark the entire path through the first ordinary commit
+above H before claiming a speedup.
 
 ## Release-state schema 2
 
@@ -179,12 +294,14 @@ can produce a bundle that is already too old to import.
 Schema 2 requires the hint, commitment, verification report, and frontier grid.
 The publisher uploads data before metadata and moves `latest.json` last.
 The importer checks the descriptor, format, digest, counts, genesis, shared H/hash,
-and provenance before generating Rust commitments. It never imports bitmap bytes.
+and provenance before generating Rust commitments. It retains each matching VCT
+frontier under the artifact digest and verifies retained frontier hashes on later
+imports. It never imports bitmap bytes.
 The verification report in the bundle comes from the independent pipeline. After
 a spentness descriptor is committed, the fetcher and importer reject schema 1
 bundles, which carry no descriptor.
 Version 2 bundles have no automatic newest-N deletion policy. Retention must cover
-all supported incomplete hinted runs when the state writer is introduced.
+all supported incomplete hinted runs.
 
 Deploy the fetcher/importer before enabling the version 2 publisher. Configure
 `RELEASE_STATE_ORACLE_SOURCE`, `RELEASE_STATE_ORACLE_ID`, and

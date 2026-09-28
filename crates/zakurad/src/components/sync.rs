@@ -1110,6 +1110,11 @@ where
         (new_syncer, sync_status)
     }
 
+    /// Pause body verification before verifier deadlines during local construction.
+    pub fn set_spentness_status(&mut self, status: watch::Receiver<zs::SpentnessStatus>) {
+        self.downloads.as_mut().set_spentness_status(status);
+    }
+
     /// Runs the syncer to synchronize the chain and keep it synchronized.
     #[instrument(skip(self))]
     pub async fn sync(mut self) -> Result<(), Report> {

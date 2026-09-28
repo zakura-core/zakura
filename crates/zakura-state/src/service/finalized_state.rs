@@ -31,6 +31,7 @@ use zakura_chain::{
 use zakura_db::{
     block::{RetentionPlan, ZAKURA_HEADER_BODY_SIZE_BY_HEIGHT},
     chain::BLOCK_INFO,
+    spentness::Progress as SpentnessProgress,
     transparent::{BALANCE_BY_TRANSPARENT_ADDR, TX_LOC_BY_SPENT_OUT_LOC},
 };
 
@@ -87,6 +88,11 @@ pub mod treestate_export;
 mod vct;
 pub mod vct_treestate_audit;
 mod zakura_db;
+pub(crate) use zakura_db::spentness::SpentnessSetup;
+pub use zakura_db::spentness::{
+    artifact_cache_path, spentness_artifact_requirement, spentness_cache_dir, wait_for_spentness,
+    SpentnessArtifactRequirement, SpentnessConfig, SpentnessError, SpentnessStatus,
+};
 
 pub(crate) use vct::embedded_last_checkpoint_leaf_counts;
 use vct::{VctCommitState, VctState, VctWriteData};
@@ -225,6 +231,8 @@ pub const STATE_COLUMN_FAMILIES_IN_CODE: &[&str] = &[
     PRUNING_METADATA,
     VCT_SYNC_METADATA,
     VCT_UPGRADE_METADATA,
+    zakura_db::spentness::METADATA,
+    zakura_db::spentness::OMITTED_OUTPUTS,
 ];
 
 /// Fork-aware header-chain node rows keyed by canonical hash.
@@ -328,11 +336,66 @@ pub struct FinalizedState {
     vct: VctCommitState,
 }
 
+/// Choose the committer VCT state.
+///
+/// An applying spentness run authenticates against its reviewed handoff frontiers.
+/// After a hinted run reaches H, the node computes note commitment trees for every
+/// later block. Other databases use the configured state.
+fn select_vct_state(
+    db: &ZakuraDb,
+    config: &Config,
+    network: &Network,
+) -> Result<Option<Arc<VctState>>, SpentnessError> {
+    if let Some(frontiers) = db.spentness_handoff_frontiers() {
+        return Ok(Some(VctState::for_spentness(frontiers.clone())));
+    }
+    let past_handoff = matches!(
+        db.spentness_progress()?,
+        Some(SpentnessProgress::Complete { .. })
+    );
+    if past_handoff {
+        return Ok(None);
+    }
+    Ok(VctState::from_config(
+        config.checkpoint_sync,
+        config.vct_fast_sync,
+        network,
+    ))
+}
+
+/// While a run is incomplete, only checkpoint blocks through H commit.
+fn check_spentness_admits(
+    status: SpentnessStatus,
+    block: &FinalizableBlock,
+) -> Result<(), SpentnessError> {
+    let admitted = match block {
+        FinalizableBlock::Checkpoint {
+            checkpoint_verified,
+        } => status.admits_checkpoint_body(checkpoint_verified.height),
+        FinalizableBlock::Contextual { .. } => status == SpentnessStatus::Usable,
+    };
+    if !admitted {
+        return Err(SpentnessError::Unavailable);
+    }
+    Ok(())
+}
+
 impl FinalizedState {
     /// Returns an on-disk database instance for `config` and `network`.
     /// If there is no existing database, creates a new database on disk.
     pub fn new(config: &Config, network: &Network) -> Result<Self, StateInitError> {
-        Self::new_with_debug(config, network, false, false)
+        Self::new_with_spentness(config, network, SpentnessSetup::ordinary(network))
+    }
+
+    /// Opens the database with spentness construction settings and release authority.
+    pub(crate) fn new_with_spentness(
+        config: &Config,
+        network: &Network,
+        spentness: SpentnessSetup,
+    ) -> Result<Self, StateInitError> {
+        Self::new_with_debug_and_storage_validation(
+            config, network, false, false, true, true, spentness,
+        )
     }
 
     /// Opens (or creates) the on-disk finalized state database read-write, for
@@ -365,6 +428,7 @@ impl FinalizedState {
             read_only,
             true,
             true,
+            SpentnessSetup::ordinary(network),
         )
     }
 
@@ -386,6 +450,7 @@ impl FinalizedState {
             read_only,
             false,
             true,
+            SpentnessSetup::ordinary(network),
         )
     }
 
@@ -397,6 +462,7 @@ impl FinalizedState {
         read_only: bool,
         validate_storage_mode: bool,
         enforce_resume_guard: bool,
+        spentness: SpentnessSetup,
     ) -> Result<Self, StateInitError> {
         // Fail fast on an invalid storage configuration, before opening the database.
         if validate_storage_mode {
@@ -405,7 +471,7 @@ impl FinalizedState {
             }
         }
 
-        let db = ZakuraDb::new(
+        let db = ZakuraDb::new_with_spentness(
             config,
             STATE_DATABASE_KIND,
             &state_database_format_version_in_code(),
@@ -415,9 +481,10 @@ impl FinalizedState {
                 .iter()
                 .map(ToString::to_string),
             read_only,
+            spentness,
         )?;
 
-        let vct = VctState::from_config(config.checkpoint_sync, config.vct_fast_sync, network);
+        let vct = select_vct_state(&db, config, network)?;
 
         // Re-derive this flag from the durable fast-sync marker, so reopening
         // before the checkpoint handoff still refuses roots below the last
@@ -616,6 +683,36 @@ impl FinalizedState {
     /// Returns the configured network for this database.
     pub fn network(&self) -> Network {
         self.db.network()
+    }
+
+    /// At H, the committed block and trees must match the reviewed handoff for the artifact.
+    fn check_spentness_handoff(
+        &self,
+        height: block::Height,
+        hash: block::Hash,
+        trees: &NoteCommitmentTrees,
+    ) -> Result<(), SpentnessError> {
+        let Some(commitment) = self
+            .db
+            .applying_spentness_commitment()
+            .filter(|commitment| commitment.terminal_height == height.0)
+        else {
+            return Ok(());
+        };
+        let frontiers = self
+            .db
+            .spentness_handoff_frontiers()
+            .expect("an applying run always carries its handoff frontiers");
+        let trees_match = frontiers.sapling.root() == trees.sapling.root()
+            && frontiers.orchard.root() == trees.orchard.root()
+            && frontiers.sprout.root() == trees.sprout.root()
+            && frontiers.ironwood.root() == trees.ironwood.root();
+        if hash.0 != commitment.terminal_block_hash || !trees_match {
+            return Err(SpentnessError::Mismatch(
+                "spentness and VCT handoff identities differ",
+            ));
+        }
+        Ok(())
     }
 
     /// Commit a checkpoint-verified block to the state.
@@ -851,6 +948,9 @@ impl FinalizedState {
         ) -> Result<(), CommitCheckpointVerifiedError>,
     {
         let mut vct_authentication = VctAuthenticationProof::NotAuthenticated;
+        if self.db.spentness_incomplete() {
+            check_spentness_admits(self.db.spentness_status(), &finalizable_block)?;
+        }
         let (height, hash, finalized, prev_note_commitment_trees, retention, fast_write) =
             match finalizable_block {
                 FinalizableBlock::Checkpoint {
@@ -1351,6 +1451,7 @@ impl FinalizedState {
         }
 
         let note_commitment_trees = finalized.treestate.note_commitment_trees.clone();
+        self.check_spentness_handoff(height, hash, &note_commitment_trees)?;
 
         // Run `write_block` directly on the committer thread rather than entering the
         // dedicated commit-compute pool via `install()`.

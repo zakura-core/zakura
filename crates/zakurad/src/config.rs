@@ -7,6 +7,7 @@
 use std::{collections::HashMap, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
+use zakura_chain::parameters::spentness_hints::Mode;
 use zakura_rpc::config::mining::{default_miner_address, MinerAddressType};
 
 use crate::components::With;
@@ -24,13 +25,18 @@ const DENY_CONFIG_KEY_SUFFIX_LIST: [&str; 5] = [
     "private_key",
 ];
 
-/// Spentness artifact distribution settings.
+/// Local spentness construction and distribution settings.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct SpentnessConfig {
-    /// Download artifacts to and serve artifacts from this directory.
+    /// Select whether the node may use a release-pinned artifact.
+    pub mode: Mode,
+    /// Load the artifact from this path instead of peers.
     ///
-    /// This enables artifact distribution only. It does not enable hinted state writes.
+    /// The file supplies bytes only. It cannot authorize an unrecognized digest.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub artifact_file: Option<PathBuf>,
+    /// Download artifacts to and serve artifacts from this directory.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_dir: Option<PathBuf>,
 }
@@ -74,7 +80,7 @@ pub struct ZakuradConfig {
     // These configs use full paths to avoid a rustdoc link bug (#7048).
     pub consensus: zakura_consensus::config::Config,
 
-    /// Spentness artifact distribution over Zakura peers.
+    /// Local spentness construction and peer distribution.
     #[serde(skip_serializing_if = "SpentnessConfig::is_default")]
     pub spentness: SpentnessConfig,
 

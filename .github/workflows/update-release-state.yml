@@ -345,8 +345,12 @@ jobs:
           crates/zakura-state/src/service/finalized_state/vct/mainnet-frontier.bin
           crates/zakura-state/src/service/finalized_state/vct/mainnet-vct-manifest.json
           crates/zakura-state/src/service/finalized_state/vct/mainnet-subtrees.bin
+          crates/zakura-state/src/service/finalized_state/vct/spentness_frontiers.rs
           crates/zakurad/src/components/sync/end_of_support.rs
           EOF
+          python3 -c 'import json, sys; sys.path.insert(0, ".github/scripts"); import spentness_release as s; print("\n".join(str(s.frontier_path(e)) for e in json.loads(s.MANIFEST.read_text())["artifacts"]))' >> "$RUNNER_TEMP/allowed-files"
+          sed -i '/^$/d' "$RUNNER_TEMP/allowed-files"
+          sort -o "$RUNNER_TEMP/allowed-files" "$RUNNER_TEMP/allowed-files"
           UNEXPECTED=$(comm -23 "$RUNNER_TEMP/actual-files" "$RUNNER_TEMP/allowed-files")
           if [ -n "$UNEXPECTED" ]; then
             echo "Import changed files outside the release-state allowlist:" >&2

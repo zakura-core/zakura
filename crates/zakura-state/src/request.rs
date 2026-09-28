@@ -1625,6 +1625,49 @@ pub enum Request {
 }
 
 impl Request {
+    /// Whether this request can run while spentness construction is incomplete.
+    ///
+    /// Allowed requests read or write headers, bodies, checkpoint blocks, and block value
+    /// pools, which construction keeps exact. Denied requests read the UTXO set, which
+    /// holds only survivors until H, or admit semantically verified blocks.
+    /// The match has no wildcard arm, so every new variant must be classified.
+    pub(crate) fn available_during_spentness(&self) -> bool {
+        match self {
+            Self::ApplyHeaderChainInsert { .. }
+            | Self::RecordHeaderChainBodyUnavailable { .. }
+            | Self::RecordHeaderChainBodyInvalid { .. }
+            | Self::RestartHeaderChainBodyAvailability { .. }
+            | Self::RetryHeaderChainBodyAvailability { .. }
+            | Self::CommitCheckpointVerifiedBlock(_)
+            | Self::CheckCheckpointHandoff
+            | Self::Depth(_)
+            | Self::Tip
+            | Self::BlockLocator
+            | Self::Transaction(_)
+            | Self::Block(_)
+            | Self::AnyChainBlock(_)
+            | Self::BlockHeader(_)
+            | Self::FindBlockHashes { .. }
+            | Self::FindBlockHeaders { .. }
+            | Self::BestChainBlockHash(_)
+            | Self::KnownBlock(_)
+            | Self::AwaitBlockInfo(_)
+            | Self::BlockInfo(_) => true,
+
+            Self::CommitSemanticallyVerifiedBlock(_)
+            | Self::CommitSemanticallyVerifiedBlockWithAdmission { .. }
+            | Self::UnspentBestChainUtxo(_)
+            | Self::CheckParentInputs { .. }
+            | Self::AwaitUtxo(_)
+            | Self::CheckBestChainTipNullifiersAndAnchors(_)
+            | Self::CheckPreparedMinedRelayEligibility(_)
+            | Self::BestChainNextMedianTimePast
+            | Self::InvalidateBlock(_)
+            | Self::ReconsiderBlock(_)
+            | Self::CheckBlockProposalValidity(_) => false,
+        }
+    }
+
     /// Returns a [`&'static str`](str) name of the variant representing this value.
     pub fn variant_name(&self) -> &'static str {
         match self {
@@ -2208,6 +2251,74 @@ pub enum ReadRequest {
 }
 
 impl ReadRequest {
+    /// Whether this request can run while spentness construction is incomplete.
+    ///
+    /// Allowed requests read headers, bodies, transactions, trees, storage metadata, value
+    /// pools, address balances, or address transactions, which construction keeps exact.
+    /// Denied requests read the UTXO set, which holds only survivors until H, or run mempool
+    /// and mining checks.
+    /// The match has no wildcard arm, so every new variant must be classified.
+    pub(crate) fn available_during_spentness(&self) -> bool {
+        match self {
+            Self::UsageInfo
+            | Self::PruningInfo
+            | Self::Tip
+            | Self::FinalizedTip
+            | Self::Depth(_)
+            | Self::Block(_)
+            | Self::AnyChainBlock(_)
+            | Self::BlockAndSize(_)
+            | Self::BlockHeader(_)
+            | Self::Transaction(_)
+            | Self::AnyChainTransaction(_)
+            | Self::TransactionIdsForBlock(_)
+            | Self::AnyChainTransactionIdsForBlock(_)
+            | Self::BlockLocator
+            | Self::FindBlockHashes { .. }
+            | Self::FindBlockHeaders { .. }
+            | Self::HeaderChainSnapshot
+            | Self::HeaderLocator
+            | Self::HeaderValidationLease { .. }
+            | Self::VctRepairContext { .. }
+            | Self::AcquireRetainedHeaderPath { .. }
+            | Self::ReadRetainedHeaderPath { .. }
+            | Self::ReleaseRetainedHeaderPath { .. }
+            | Self::BlockRoots { .. }
+            | Self::BlockSizesByHash { .. }
+            | Self::BestHeaderTip
+            | Self::MissingBlockBodyMetadata { .. }
+            | Self::BlocksByHeightRange { .. }
+            | Self::SaplingTree(_)
+            | Self::OrchardTree(_)
+            | Self::IronwoodTree(_)
+            | Self::SaplingSubtrees { .. }
+            | Self::OrchardSubtrees { .. }
+            | Self::IronwoodSubtrees { .. }
+            | Self::BestChainBlockHash(_)
+            | Self::TipBlockSize
+            | Self::ChainTips
+            | Self::NonFinalizedBlocksListener { .. }
+            | Self::TipPoolValues
+            | Self::BlockInfo(_)
+            | Self::AddressBalance(_)
+            | Self::TransactionIdsByAddresses { .. }
+            | Self::ChainInfo => true,
+            #[cfg(feature = "indexer")]
+            Self::RawBlocksByHeightRange { .. } | Self::SpendingTransactionId(_) => true,
+
+            Self::UnspentBestChainUtxo(_)
+            | Self::CheckParentInputs { .. }
+            | Self::AnyChainUtxo(_)
+            | Self::UtxosByAddresses(_)
+            | Self::CheckBestChainTipNullifiersAndAnchors(_)
+            | Self::CheckPreparedMinedRelayEligibility(_)
+            | Self::BestChainNextMedianTimePast
+            | Self::SolutionRate { .. }
+            | Self::CheckBlockProposalValidity(_)
+            | Self::IsTransparentOutputSpent(_) => false,
+        }
+    }
+
     /// Returns a [`&'static str`](str) name of the variant representing this value.
     pub fn variant_name(&self) -> &'static str {
         match self {
@@ -2390,5 +2501,62 @@ impl TimedSpan {
             })
         })
         .wait_for_panics()
+    }
+}
+
+#[cfg(test)]
+mod spentness_gate_tests {
+    use super::*;
+
+    #[test]
+    fn spentness_gates_allow_exact_state_and_deny_the_utxo_set() {
+        let hash = block::Hash([1; 32]);
+        let outpoints: Arc<[transparent::OutPoint]> = Arc::new([]);
+
+        for (request, allowed) in [
+            (Request::CheckCheckpointHandoff, true),
+            (Request::Tip, true),
+            (
+                Request::CheckParentInputs {
+                    parent: hash,
+                    outpoints: outpoints.clone(),
+                },
+                false,
+            ),
+            (Request::AwaitBlockInfo(hash), true),
+            (Request::BlockInfo(hash), true),
+            (Request::BestChainNextMedianTimePast, false),
+        ] {
+            assert_eq!(
+                request.available_during_spentness(),
+                allowed,
+                "{}",
+                request.variant_name()
+            );
+        }
+
+        for (request, allowed) in [
+            (ReadRequest::BlockSizesByHash { hashes: vec![hash] }, true),
+            (ReadRequest::Tip, true),
+            (
+                ReadRequest::CheckParentInputs {
+                    parent: hash,
+                    outpoints,
+                },
+                false,
+            ),
+            (ReadRequest::BlockInfo(hash.into()), true),
+            (ReadRequest::TipPoolValues, true),
+            (ReadRequest::ChainInfo, true),
+            (ReadRequest::AddressBalance(Default::default()), true),
+            (ReadRequest::UtxosByAddresses(Default::default()), false),
+        ] {
+            assert_eq!(
+                request.available_during_spentness(),
+                allowed,
+                "{}",
+                request.variant_name()
+            );
+        }
     }
 }

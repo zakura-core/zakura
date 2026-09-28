@@ -61,6 +61,10 @@ pub use request::{
     MappedRequest, PreparedHeaderChainBodyEvidence, PreparedHeaderChainInsert, ReadRequest,
     Request, SemanticallyVerifiedBlock,
 };
+pub use service::finalized_state::{
+    artifact_cache_path, spentness_artifact_requirement, spentness_cache_dir, wait_for_spentness,
+    SpentnessArtifactRequirement, SpentnessConfig, SpentnessError, SpentnessStatus,
+};
 
 #[cfg(feature = "indexer")]
 pub use request::Spend;

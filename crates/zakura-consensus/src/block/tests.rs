@@ -403,6 +403,58 @@ async fn mined_orphan_replays_skip_transaction_verification() {
     }
 }
 
+#[tokio::test(start_paused = true)]
+async fn mining_requests_fail_fast_during_spentness_construction() {
+    let _init_guard = zakura_test::init();
+    let network = Network::Mainnet;
+    let block = Arc::new(
+        zakura_test::vectors::BLOCK_MAINNET_1_BYTES
+            .zcash_deserialize_into::<Block>()
+            .unwrap(),
+    );
+    let state = service_fn(|request: zs::Request| async move {
+        panic!("gated verification must not reach state: {request:?}")
+    });
+    let transaction = service_fn(|request: tx::Request| async move {
+        panic!("gated verification must not verify transactions: {request:?}")
+    });
+    let (status_sender, status) = tokio::sync::watch::channel(zs::SpentnessStatus::Applying {
+        terminal_height: Height(10),
+    });
+    let mut verifier = SemanticBlockVerifier::new(&network, state, transaction)
+        .with_spentness_status(Some(status));
+
+    for request in [
+        Request::CheckProposal(block.clone()),
+        Request::Prepare {
+            block: block.clone(),
+            work_id: None,
+            source: PreparedCandidateSource::ClientProposal,
+        },
+        Request::CommitMined {
+            block: block.clone(),
+            work_id: None,
+            admission: zs::BlockAdmission::pending(),
+        },
+    ] {
+        let result = verifier.ready().await.unwrap().call(request).now_or_never();
+        assert!(
+            matches!(result, Some(Err(VerifyBlockError::StateService { .. }))),
+            "mining requests fail without waiting: {result:?}"
+        );
+    }
+
+    // A synced block waits for construction to finish.
+    let commit = verifier.ready().await.unwrap().call(Request::Commit(block));
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_secs(60), commit)
+            .await
+            .is_err(),
+        "synced blocks wait for completed construction"
+    );
+    drop(status_sender);
+}
+
 #[tokio::test]
 async fn prepared_mined_commit_rechecks_equihash() {
     let _init_guard = zakura_test::init();

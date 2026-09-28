@@ -456,6 +456,7 @@ impl DiskWriteBatch {
             transparent::OutPoint,
             OutputLocation,
         >,
+        omitted_outputs: &HashSet<OutputLocation>,
         mut address_balances: AddressBalanceLocationUpdates,
     ) {
         let db = &zakura_db.db;
@@ -480,6 +481,7 @@ impl DiskWriteBatch {
             db,
             network,
             new_outputs_by_out_loc,
+            omitted_outputs,
             &address_balances,
         );
         self.prepare_spent_transparent_outputs_batch(
@@ -608,6 +610,10 @@ impl DiskWriteBatch {
     /// [`Self::prepare_transparent_address_balance_updates`]); this function only reads
     /// `address_location()` from it.
     ///
+    /// Outputs in `omitted_outputs` get address transaction entries but no UTXO or
+    /// address UTXO entries. Spentness construction omits outputs that are spent by its
+    /// terminal height.
+    ///
     /// # Errors
     ///
     /// - This method doesn't currently return any errors, but it might in future
@@ -617,6 +623,7 @@ impl DiskWriteBatch {
         db: &DiskDb,
         network: &Network,
         new_outputs_by_out_loc: &BTreeMap<OutputLocation, transparent::Utxo>,
+        omitted_outputs: &HashSet<OutputLocation>,
         address_balances: &AddressBalanceLocationUpdates,
     ) {
         let utxo_by_out_loc = db.cf_handle("utxo_by_out_loc").unwrap();
@@ -629,6 +636,7 @@ impl DiskWriteBatch {
         for (new_output_location, utxo) in new_outputs_by_out_loc {
             let unspent_output = &utxo.output;
             let receiving_address = unspent_output.address(network);
+            let omitted = omitted_outputs.contains(new_output_location);
 
             if let Some(receiving_address) = receiving_address {
                 let receiving_address_location = match address_balances {
@@ -643,13 +651,15 @@ impl DiskWriteBatch {
                 };
 
                 // Create a link from the AddressLocation to the new OutputLocation in the database.
-                let address_unspent_output =
-                    AddressUnspentOutput::new(receiving_address_location, *new_output_location);
-                self.zs_insert(
-                    &utxo_loc_by_transparent_addr_loc,
-                    address_unspent_output,
-                    (),
-                );
+                if !omitted {
+                    let address_unspent_output =
+                        AddressUnspentOutput::new(receiving_address_location, *new_output_location);
+                    self.zs_insert(
+                        &utxo_loc_by_transparent_addr_loc,
+                        address_unspent_output,
+                        (),
+                    );
+                }
 
                 // Create a link from the AddressLocation to the new TransactionLocation in the database.
                 // Unlike the OutputLocation link, this will never be deleted.
@@ -663,7 +673,9 @@ impl DiskWriteBatch {
             // Use the OutputLocation to store a copy of the new Output in the database.
             // (For performance reasons, we don't want to deserialize the whole transaction
             // to get an output.)
-            self.zs_insert(&utxo_by_out_loc, new_output_location, unspent_output);
+            if !omitted {
+                self.zs_insert(&utxo_by_out_loc, new_output_location, unspent_output);
+            }
         }
     }
 

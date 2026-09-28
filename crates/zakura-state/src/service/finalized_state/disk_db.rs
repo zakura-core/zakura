@@ -15,7 +15,7 @@ use std::{
     fmt::{Debug, Write},
     fs,
     ops::RangeBounds,
-    path::Path,
+    path::{Path, PathBuf},
     sync::{
         atomic::{self, AtomicBool, AtomicU64},
         Arc,
@@ -1442,15 +1442,83 @@ impl DiskDb {
 
     // Private methods
 
+    /// Returns the previous major database that a major upgrade would reuse.
+    ///
+    /// Returns the canonical old path and the old major version, or `None` when the current
+    /// version is not restorable, no previous database exists, it is outside the cache
+    /// directory, or a current database already exists. This function changes no files.
+    pub(crate) fn reusable_previous_major_db(
+        restorable_db_versions: &[u64],
+        format_version_in_code: &Version,
+        config: &Config,
+        db_kind: impl AsRef<str>,
+        network: &Network,
+    ) -> Option<(PathBuf, u64)> {
+        let db_kind = db_kind.as_ref();
+
+        // Each restorable major reuses the major before it, and its upgrades migrate that data.
+        // Walk back through consecutive restorable majors to the newest existing database.
+        let mut major_db_ver = format_version_in_code.major;
+        let (old_path, old_major_db_ver) = loop {
+            if !restorable_db_versions.contains(&major_db_ver) {
+                return None;
+            }
+            let old_major_db_ver = major_db_ver.checked_sub(1)?;
+            let old_path = config.db_path(db_kind, old_major_db_ver, network);
+            // Treat an error checking the path as a missing database.
+            if fs::exists(&old_path).unwrap_or(false) {
+                break (old_path, old_major_db_ver);
+            }
+            major_db_ver = old_major_db_ver;
+        };
+
+        let new_path = config.db_path(db_kind, format_version_in_code.major, network);
+
+        let old_path = match fs::canonicalize(&old_path) {
+            Ok(canonicalized_old_path) => canonicalized_old_path,
+            Err(e) => {
+                warn!("could not canonicalize {old_path:?}: {e}");
+                return None;
+            }
+        };
+
+        let cache_path = match fs::canonicalize(&config.cache_dir) {
+            Ok(canonicalized_cache_path) => canonicalized_cache_path,
+            Err(e) => {
+                warn!("could not canonicalize {:?}: {e}", config.cache_dir);
+                return None;
+            }
+        };
+
+        // # Correctness
+        //
+        // Check that the path we're about to move is inside the cache directory.
+        //
+        // If the user has symlinked the state directory to a non-cache directory, we don't want
+        // to move it, because it might contain other files.
+        //
+        // We don't attempt to guard against malicious symlinks created by attackers
+        // (TOCTOU attacks). Zebra should not be run with elevated privileges.
+        if !old_path.starts_with(&cache_path) {
+            info!("skipped reusing previous state cache: state is outside cache directory");
+            return None;
+        }
+
+        let opts = DiskDb::options();
+        let old_db_exists = DB::list_cf(&opts, &old_path).is_ok_and(|cf| !cf.is_empty());
+        let new_db_exists = DB::list_cf(&opts, &new_path).is_ok_and(|cf| !cf.is_empty());
+
+        (old_db_exists && !new_db_exists).then_some((old_path, old_major_db_ver))
+    }
+
     /// Tries to reuse an existing db after a major upgrade.
     ///
     /// If the current db version belongs to `restorable_db_versions`, the function moves a previous
-    /// db to a new path so it can be used again. It does so by merely trying to rename the path
-    /// corresponding to the db version directly preceding the current version to the path that is
-    /// used by the current db. If successful, it also deletes the db version file.
+    /// db to a new path so it can be used again. It renames the newest existing db that consecutive
+    /// restorable versions can reach to the path that the current db uses. The format upgrades
+    /// then migrate it from its recorded version.
     ///
     /// Returns the old disk version if one existed and the db directory was renamed, or None otherwise.
-    // TODO: Update this function to rename older major db format version to the current version (#9565).
     #[allow(clippy::unwrap_in_result)]
     pub(crate) fn try_reusing_previous_db_after_major_upgrade(
         restorable_db_versions: &[u64],
@@ -1459,127 +1527,83 @@ impl DiskDb {
         db_kind: impl AsRef<str>,
         network: &Network,
     ) -> Option<Version> {
-        if let Some(&major_db_ver) = restorable_db_versions
-            .iter()
-            .find(|v| **v == format_version_in_code.major)
-        {
-            let db_kind = db_kind.as_ref();
+        let db_kind = db_kind.as_ref();
+        let (old_path, old_major_db_ver) = Self::reusable_previous_major_db(
+            restorable_db_versions,
+            format_version_in_code,
+            config,
+            db_kind,
+            network,
+        )?;
+        let major_db_ver = format_version_in_code.major;
+        let new_path = config.db_path(db_kind, major_db_ver, network);
 
-            let old_major_db_ver = major_db_ver - 1;
-            let old_path = config.db_path(db_kind, old_major_db_ver, network);
-            // Exit early if the path doesn't exist or there's an error checking it.
-            if !fs::exists(&old_path).unwrap_or(false) {
+        // Create the parent directory for the new db. This is because we can't directly
+        // rename e.g. `state/v25/mainnet/` to `state/v26/mainnet/` with `fs::rename()` if
+        // `state/v26/` does not exist.
+        match fs::create_dir_all(
+            new_path
+                .parent()
+                .expect("new state cache must have a parent path"),
+        ) {
+            Ok(()) => info!("created new directory for state cache at {new_path:?}"),
+            Err(e) => {
+                warn!("could not create new directory for state cache at {new_path:?}: {e}");
                 return None;
-            }
-
-            let new_path = config.db_path(db_kind, major_db_ver, network);
-
-            let old_path = match fs::canonicalize(&old_path) {
-                Ok(canonicalized_old_path) => canonicalized_old_path,
-                Err(e) => {
-                    warn!("could not canonicalize {old_path:?}: {e}");
-                    return None;
-                }
-            };
-
-            let cache_path = match fs::canonicalize(&config.cache_dir) {
-                Ok(canonicalized_cache_path) => canonicalized_cache_path,
-                Err(e) => {
-                    warn!("could not canonicalize {:?}: {e}", config.cache_dir);
-                    return None;
-                }
-            };
-
-            // # Correctness
-            //
-            // Check that the path we're about to move is inside the cache directory.
-            //
-            // If the user has symlinked the state directory to a non-cache directory, we don't want
-            // to move it, because it might contain other files.
-            //
-            // We don't attempt to guard against malicious symlinks created by attackers
-            // (TOCTOU attacks). Zebra should not be run with elevated privileges.
-            if !old_path.starts_with(&cache_path) {
-                info!("skipped reusing previous state cache: state is outside cache directory");
-                return None;
-            }
-
-            let opts = DiskDb::options();
-            let old_db_exists = DB::list_cf(&opts, &old_path).is_ok_and(|cf| !cf.is_empty());
-            let new_db_exists = DB::list_cf(&opts, &new_path).is_ok_and(|cf| !cf.is_empty());
-
-            if old_db_exists && !new_db_exists {
-                // Create the parent directory for the new db. This is because we can't directly
-                // rename e.g. `state/v25/mainnet/` to `state/v26/mainnet/` with `fs::rename()` if
-                // `state/v26/` does not exist.
-                match fs::create_dir_all(
-                    new_path
-                        .parent()
-                        .expect("new state cache must have a parent path"),
-                ) {
-                    Ok(()) => info!("created new directory for state cache at {new_path:?}"),
-                    Err(e) => {
-                        warn!(
-                            "could not create new directory for state cache at {new_path:?}: {e}"
-                        );
-                        return None;
-                    }
-                };
-
-                match fs::rename(&old_path, &new_path) {
-                    Ok(()) => {
-                        info!("moved state cache from {old_path:?} to {new_path:?}");
-
-                        let mut disk_version =
-                            database_format_version_on_disk(config, db_kind, major_db_ver, network)
-                                .expect("unable to read database format version file")
-                                .expect("unable to parse database format version");
-
-                        disk_version.major = old_major_db_ver;
-
-                        write_database_format_version_to_disk(
-                            config,
-                            db_kind,
-                            major_db_ver,
-                            &disk_version,
-                            network,
-                        )
-                        .expect("unable to write database format version file to disk");
-
-                        // Get the parent of the old path, e.g. `state/v25/` and delete it if it is
-                        // empty.
-                        let old_path = old_path
-                            .parent()
-                            .expect("old state cache must have parent path");
-
-                        if fs::read_dir(old_path)
-                            .expect("cached state dir needs to be readable")
-                            .next()
-                            .is_none()
-                        {
-                            match fs::remove_dir_all(old_path) {
-                                Ok(()) => {
-                                    info!("removed empty old state cache directory at {old_path:?}")
-                                }
-                                Err(e) => {
-                                    warn!(
-                                        "could not remove empty old state cache directory \
-                                           at {old_path:?}: {e}"
-                                    )
-                                }
-                            }
-                        }
-
-                        return Some(disk_version);
-                    }
-                    Err(e) => {
-                        warn!("could not move state cache from {old_path:?} to {new_path:?}: {e}");
-                    }
-                };
             }
         };
 
-        None
+        match fs::rename(&old_path, &new_path) {
+            Ok(()) => {
+                info!("moved state cache from {old_path:?} to {new_path:?}");
+
+                let mut disk_version =
+                    database_format_version_on_disk(config, db_kind, major_db_ver, network)
+                        .expect("unable to read database format version file")
+                        .expect("unable to parse database format version");
+
+                disk_version.major = old_major_db_ver;
+
+                write_database_format_version_to_disk(
+                    config,
+                    db_kind,
+                    major_db_ver,
+                    &disk_version,
+                    network,
+                )
+                .expect("unable to write database format version file to disk");
+
+                // Get the parent of the old path, e.g. `state/v25/` and delete it if it is
+                // empty.
+                let old_path = old_path
+                    .parent()
+                    .expect("old state cache must have parent path");
+
+                if fs::read_dir(old_path)
+                    .expect("cached state dir needs to be readable")
+                    .next()
+                    .is_none()
+                {
+                    match fs::remove_dir_all(old_path) {
+                        Ok(()) => {
+                            info!("removed empty old state cache directory at {old_path:?}")
+                        }
+                        Err(e) => {
+                            warn!(
+                                "could not remove empty old state cache directory \
+                                   at {old_path:?}: {e}"
+                            )
+                        }
+                    }
+                }
+
+                Some(disk_version)
+            }
+            Err(e) => {
+                warn!("could not move state cache from {old_path:?} to {new_path:?}: {e}");
+                None
+            }
+        }
     }
 
     /// Returns the database options for the finalized state database.

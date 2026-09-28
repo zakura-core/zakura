@@ -26,7 +26,7 @@ pub(super) async fn prepare_distribution(
     config: &ZakuradConfig,
     custom_services: &mut Vec<CustomService>,
 ) -> Result<Option<Distribution>, Report> {
-    let Some(cache) = config.network.zakura.spentness_cache_dir.clone() else {
+    let Some(cache) = config.spentness.cache_dir.clone() else {
         return Ok(None);
     };
     let network = config.network.network.clone();

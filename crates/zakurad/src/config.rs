@@ -24,6 +24,23 @@ const DENY_CONFIG_KEY_SUFFIX_LIST: [&str; 5] = [
     "private_key",
 ];
 
+/// Spentness artifact distribution settings.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct SpentnessConfig {
+    /// Download artifacts to and serve artifacts from this directory.
+    ///
+    /// This enables artifact distribution only. It does not enable hinted state writes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_dir: Option<PathBuf>,
+}
+
+impl SpentnessConfig {
+    fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
+}
+
 /// Returns true if a leaf key name should be considered sensitive and blocked
 /// from environment variable overrides.
 fn is_sensitive_leaf_key(leaf_key: &str) -> bool {
@@ -56,6 +73,10 @@ pub struct ZakuradConfig {
     //
     // These configs use full paths to avoid a rustdoc link bug (#7048).
     pub consensus: zakura_consensus::config::Config,
+
+    /// Spentness artifact distribution over Zakura peers.
+    #[serde(skip_serializing_if = "SpentnessConfig::is_default")]
+    pub spentness: SpentnessConfig,
 
     /// Metrics configuration
     pub metrics: crate::components::metrics::Config,

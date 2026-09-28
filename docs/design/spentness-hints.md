@@ -137,8 +137,8 @@ attribute a whole-file mismatch to an individual chunk or disconnect the peer.
 Enable artifact distribution explicitly:
 
 ```toml
-[network.zakura]
-spentness_cache_dir = "/data/zakura/spentness"
+[spentness]
+cache_dir = "/data/zakura/spentness"
 ```
 
 The startup task waits up to 60 seconds for a capable peer, then makes bounded

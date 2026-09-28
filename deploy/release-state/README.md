@@ -199,7 +199,7 @@ never rolls back the live node. Version 2 bundles remain available for recovery.
 
 Provision reviewed artifacts on seeds with `provision-spentness-seed.sh`.
 The seed's `zakura-spentness install` command requires a compiled commitment.
-Configure `network.zakura.spentness_cache_dir` and restart the seed before testing
+Configure `spentness.cache_dir` and restart the seed before testing
 a cold client against only those seeds. Nodes download from peers.
 
 See [the spentness design](../../docs/design/spentness-hints.md) for commands,

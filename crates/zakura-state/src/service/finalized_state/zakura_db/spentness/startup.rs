@@ -163,7 +163,7 @@ fn select_requirement(
 
     match progress {
         Progress::Complete { commitment, .. } => {
-            setup.authority.check(&commitment)?;
+            setup.authority.check_completed(&commitment)?;
             Ok(None)
         }
         // Rebuilding needs retained bodies, not the artifact.
@@ -311,7 +311,11 @@ impl ZakuraDb {
     /// Check that the record agrees with the finalized tip and the release authority.
     fn check_progress(&self, progress: &Progress) -> Result<(), SpentnessError> {
         let commitment = progress.commitment();
-        self.spentness.setup.authority.check(commitment)?;
+        let authority = &self.spentness.setup.authority;
+        match progress {
+            Progress::Complete { .. } => authority.check_completed(commitment)?,
+            _ => authority.check(commitment)?,
+        }
         let tip = self.tip().ok_or(SpentnessError::Inconsistent(
             "progress without a finalized tip",
         ))?;

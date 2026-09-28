@@ -379,6 +379,41 @@ fn spentness_rebuild_resumes_without_artifact_and_keeps_rollback_floor() {
 }
 
 #[test]
+fn spentness_completed_state_opens_after_release_drops_commitment() {
+    let _guard = zakura_test::init();
+    let fixture = Fixture::new(false);
+    let mut state = fixture.open();
+    fixture.commit(&mut state, 0..=10);
+    let mut cache = ReplayCache::default();
+    while state.db.spentness_rebuilding() {
+        state
+            .rebuild_spentness_step(&mut cache, &mut || Ok(()))
+            .unwrap();
+    }
+    drop(state);
+    // The compiled Mainnet release lists no commitments.
+    let config = SpentnessConfig {
+        mode: Mode::Require,
+        artifact: None,
+    };
+    assert!(
+        crate::spentness_artifact_requirement(&fixture.config, &config, &fixture.network)
+            .unwrap()
+            .is_none()
+    );
+    let dropped = fixture.setup(Vec::new(), Vec::new());
+    let state =
+        FinalizedState::new_with_spentness(&fixture.config, &fixture.network, dropped).unwrap();
+    assert!(!state.db.spentness_incomplete());
+    drop(state);
+    let revoked = fixture.setup(Vec::new(), vec![fixture.commitment.sha256]);
+    let error = FinalizedState::new_with_spentness(&fixture.config, &fixture.network, revoked)
+        .err()
+        .unwrap();
+    assert!(error.to_string().contains("revoked"), "{error}");
+}
+
+#[test]
 fn spentness_incomplete_open_guards_preserve_original_commitment() {
     let _guard = zakura_test::init();
     let fixture = Fixture::new(false);
@@ -665,7 +700,8 @@ fn spentness_generated_spends_match_all_indexes_and_validate_after_handoff() {
         &CreatedUtxos::default(),
         &HashMap::new(),
         &state.db,
-    ).unwrap();
+    )
+    .unwrap();
     state
         .commit_finalized_direct(
             CheckpointVerifiedBlock::from(next.clone()).into(),

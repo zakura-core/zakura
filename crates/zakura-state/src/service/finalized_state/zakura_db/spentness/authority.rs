@@ -72,24 +72,33 @@ impl ReleaseAuthority {
     /// that ends before the NU7 seed block.
     pub(crate) fn check(&self, commitment: &Commitment) -> Result<(), SpentnessError> {
         commitment.validate()?;
-        if self.revoked.contains(&commitment.sha256) {
-            return Err(SpentnessError::Revoked {
+        self.check_completed(commitment)?;
+        if !self.commitments.contains(commitment) {
+            return Err(SpentnessError::UnknownCommitment {
                 digest: commitment.digest_hex(),
             });
         }
-        if !self.commitments.contains(commitment) {
-            return Err(SpentnessError::UnknownCommitment {
+        if !commitment.precedes_nu7(&self.network) {
+            return Err(SpentnessError::ReachesNu7 {
+                height: commitment.terminal_height,
+            });
+        }
+        Ok(())
+    }
+
+    /// Accept a completed run's commitment if it is unrevoked and names this chain.
+    ///
+    /// A completed database no longer depends on the artifact, so a later release
+    /// can drop the commitment without stopping startup.
+    pub(crate) fn check_completed(&self, commitment: &Commitment) -> Result<(), SpentnessError> {
+        if self.revoked.contains(&commitment.sha256) {
+            return Err(SpentnessError::Revoked {
                 digest: commitment.digest_hex(),
             });
         }
         let genesis = self.network.checkpoint_list().hash(Height(0));
         if genesis.map(|hash| hash.0) != Some(commitment.chain_identity) {
             return Err(SpentnessError::WrongChain);
-        }
-        if !commitment.precedes_nu7(&self.network) {
-            return Err(SpentnessError::ReachesNu7 {
-                height: commitment.terminal_height,
-            });
         }
         Ok(())
     }

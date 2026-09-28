@@ -7,7 +7,7 @@ name = "zakura"
 # [package.metadata.release] below does it automatically, but only under the
 # full `cargo release` flow (`cargo release version` skips the replace step) -
 # keep the two in sync when bumping by hand.
-version = "1.5.0"
+version = "1.5.1"
 authors.workspace = true
 description = "Zakura, an independent, consensus-compatible implementation of a Zcash node"
 license.workspace = true
@@ -185,7 +185,7 @@ zakura-script = { path = "../zakura-script", version = "3.2.4" }
 zcash_script = { workspace = true }
 
 # Required for crates.io publishing, but it's only used in tests
-zakura-utils = { path = "../zakura-utils", version = "2.2.5", optional = true }
+zakura-utils = { path = "../zakura-utils", version = "2.2.6", optional = true }
 
 abscissa_core = { workspace = true, default-features = false, features = ["application"] }
 clap = { workspace = true, features = ["cargo"] }
@@ -325,7 +325,7 @@ zakura-test = { path = "../zakura-test", version = "2.1.0" }
 # When `-Z bindeps` is stabilised, enable this binary dependency instead:
 # https://github.com/rust-lang/cargo/issues/9096
 # zakura-utils { path = "../zakura-utils", artifact = "bin:zakura-checkpoints" }
-zakura-utils = { path = "../zakura-utils", version = "2.2.5" }
+zakura-utils = { path = "../zakura-utils", version = "2.2.6" }
 
 [package.metadata.cargo-udeps.ignore]
 # These dependencies are false positives - they are actually used

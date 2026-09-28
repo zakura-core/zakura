@@ -1992,7 +1992,10 @@ pub enum ReadRequest {
 
     /// Returns contiguous committed blocks by height, in ascending order.
     ///
-    /// The response stops before the first height without a committed body.
+    /// With the header engine attached, reads follow the selected header branch,
+    /// including retained side-fork bodies when receipt order selects another mining tip.
+    /// Otherwise, reads follow the best full-block chain.
+    /// The response stops before the first height without a committed body on that branch.
     /// Callers that charge resources to the database job should instead use
     /// [`crate::ReadStateService::read_owned_block_range`] so cancellation of
     /// the caller cannot release those resources during a running read.

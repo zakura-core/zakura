@@ -15,8 +15,27 @@ use tower::ServiceExt;
 use tracing::Span;
 use zakura_chain::{block, diagnostic::CodeTimer};
 
-use super::{read, ReadStateService};
+use super::{finalized_state::ZakuraDb, non_finalized_state::Chain, read, ReadStateService};
 use crate::{request::TimedSpan, BoxError, ReadRequest};
+
+/// One retained chain, capped at its last body on the selected header path.
+pub(super) struct BlockRangeSnapshot {
+    chain: Option<Arc<Chain>>,
+    tip: Option<block::Height>,
+}
+
+impl BlockRangeSnapshot {
+    pub(super) fn block_and_size(
+        &self,
+        db: &ZakuraDb,
+        height: block::Height,
+    ) -> Option<(Arc<block::Block>, usize)> {
+        if height > self.tip? {
+            return None;
+        }
+        read::block_and_size(self.chain.clone(), db, height.into())
+    }
+}
 
 /// A bounded block prefix together with the caller's resource reservations.
 ///
@@ -41,6 +60,48 @@ impl<R> OwnedBlockRange<R> {
 }
 
 impl ReadStateService {
+    /// Capture the download branch independently of the receipt-selected mining branch.
+    /// The header writer lock keeps the retained bodies and selected path coherent.
+    pub(super) fn block_range_snapshot(&self) -> Result<BlockRangeSnapshot, BoxError> {
+        let reader = self.header_chain_reader_receiver.borrow().clone();
+        let Some(reader) = reader else {
+            let chain = self.latest_best_chain();
+            return Ok(BlockRangeSnapshot {
+                tip: read::tip_height(chain.clone(), &self.db),
+                chain,
+            });
+        };
+        let (non_finalized, _, selected) = reader.with_selected_overlap(
+            || self.latest_non_finalized_state(),
+            |state| {
+                state
+                    .chain_iter()
+                    .map(|chain| chain.non_finalized_tip().0)
+                    .max()
+                    .or_else(|| self.db.finalized_tip_height())
+            },
+        )?;
+        for frontier in selected.iter().rev() {
+            if let Some(chain) =
+                non_finalized.find_chain(|chain| chain.contains_block_hash(frontier.hash))
+            {
+                return Ok(BlockRangeSnapshot {
+                    chain: Some(chain),
+                    tip: Some(frontier.height),
+                });
+            }
+        }
+
+        // No selected non-finalized body is available. Serve only the finalized prefix.
+        let finalized = selected
+            .first()
+            .expect("the coherent full-state overlap includes the finalized header");
+        Ok(BlockRangeSnapshot {
+            chain: None,
+            tip: Some(finalized.height),
+        })
+    }
+
     /// Read a bounded contiguous prefix while the database job owns `resources`.
     ///
     /// This uses the same readiness checks, chain snapshot, and missing-block
@@ -63,14 +124,16 @@ impl ReadStateService {
         self.ready().await?;
         ReadRequest::BlocksByHeightRange { start, count }.count_metric();
         let state = self.clone();
-        let best_chain = state.latest_best_chain();
         spawn_owned_block_range(
             start,
             count,
             max_response_bytes,
             resources,
             is_cancelled,
-            move |height| read::block_and_size(best_chain.clone(), &state.db, height.into()),
+            move || {
+                let snapshot = state.block_range_snapshot()?;
+                Ok(move |height| snapshot.block_and_size(&state.db, height))
+            },
         )
         .await
     }
@@ -82,19 +145,30 @@ impl ReadStateService {
 /// the blocking job. Capture `resources` inside that job so caller cancellation
 /// cannot release reservations still needed by the read. Move them into
 /// [`OwnedBlockRange`] on completion so they remain with the returned blocks.
-fn spawn_owned_block_range<R: Send + 'static>(
+fn spawn_owned_block_range<R, G>(
     start: block::Height,
     count: u32,
     max_response_bytes: u32,
     resources: R,
     mut is_cancelled: impl FnMut(&R) -> bool + Send + 'static,
-    mut get_block: impl FnMut(block::Height) -> Option<(Arc<block::Block>, usize)> + Send + 'static,
-) -> BoxFuture<'static, Result<OwnedBlockRange<R>, BoxError>> {
+    prepare_read: impl FnOnce() -> Result<G, BoxError> + Send + 'static,
+) -> BoxFuture<'static, Result<OwnedBlockRange<R>, BoxError>>
+where
+    R: Send + 'static,
+    G: FnMut(block::Height) -> Option<(Arc<block::Block>, usize)>,
+{
     let timed_span = TimedSpan::new(
         CodeTimer::start_desc("blocks_by_height_range"),
         Span::current(),
     );
     timed_span.spawn_blocking(move || {
+        if is_cancelled(&resources) {
+            return Ok(OwnedBlockRange {
+                blocks: Vec::new(),
+                resources,
+            });
+        }
+        let mut get_block = prepare_read()?;
         let blocks = collect_bounded_height_range(start, count, max_response_bytes, |height| {
             if is_cancelled(&resources) {
                 None

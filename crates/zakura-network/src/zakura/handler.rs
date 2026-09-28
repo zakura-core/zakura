@@ -4850,6 +4850,7 @@ async fn write_outbound_request_frame(
     .map_err(|_| OutboundRequestError::Local("Zakura outbound request/response timed out".into()))?
 }
 
+#[derive(Debug)]
 enum OutboundResponseReadState {
     Legacy(LegacyResponseReadState),
     Spentness { frames: usize },
@@ -4897,6 +4898,16 @@ impl OutboundResponseReadState {
             Self::Spentness { .. } => Err(OutboundRequestError::Fatal(
                 "missing spentness response frame".into(),
             )),
+        }
+    }
+}
+
+impl super::regulation::ResponsePrecheck for OutboundResponseReadState {
+    fn check(&self, message_type: u16, payload_len: usize) -> Result<(), FrameRejection> {
+        match self {
+            Self::Legacy(state) => state.check(message_type, payload_len),
+            Self::Spentness { frames: 0 } => Ok(()),
+            Self::Spentness { .. } => Err(FrameRejection::Unsolicited),
         }
     }
 }
@@ -4956,7 +4967,7 @@ async fn write_outbound_request_frame_inner(
             &mut recv,
             inbound_frame_cap,
             FrameFilter::new(stream.messages, InboundReader::Requester)
-                .with_precheck(Some(&legacy_state)),
+                .with_precheck(Some(&response_state)),
             limits.idle_timeout,
             // This is the requester side of a one-shot legacy request/response:
             // the responder streams its frames promptly, so a silent gap before

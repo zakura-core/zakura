@@ -12,7 +12,9 @@ use std::{path::PathBuf, sync::Arc};
 
 use zakura_chain::parameters::spentness_hints::Commitment;
 
-use super::{CustomService, Frame, Stream, StreamMode, ZakuraServiceId};
+use super::{
+    CustomService, Frame, MessageRole, MessageRule, PayloadLen, Stream, ZakuraServiceId,
+};
 use crate::BoxError;
 
 mod cache;
@@ -33,12 +35,32 @@ const SERVICE_ID: &str = "zakura.spentness.v1";
 const PROTOCOL_VERSION: u16 = 1;
 /// Frame limit: one full range plus room for the response header.
 const FRAME_CAP: u32 = RANGE_BYTES + 64;
+const GET_RANGE_RULE: MessageRule = MessageRule {
+    message_type: GET_RANGE,
+    payload: PayloadLen::exact(wire::REQUEST_LEN),
+    role: MessageRole::Request {
+        max_in_flight: 1,
+        cadence: None,
+    },
+};
+const RANGE_RULE: MessageRule = MessageRule {
+    message_type: RANGE,
+    payload: PayloadLen::between(
+        wire::RESPONSE_HEADER_LEN,
+        wire::RESPONSE_HEADER_LEN + RANGE_BYTES as usize,
+    ),
+    role: MessageRole::Response {
+        request: GET_RANGE,
+        ends_exchange: true,
+    },
+};
 const STREAMS: &[Stream] = &[Stream {
     kind: STREAM_KIND,
     version: PROTOCOL_VERSION,
     frame_cap: FRAME_CAP,
     capability: CAPABILITY,
-    mode: StreamMode::RequestResponse,
+    messages: Some(&[GET_RANGE_RULE, RANGE_RULE]),
+    ..Stream::REQUEST_RESPONSE
 }];
 
 /// Load supported cache entries and prepare protocol negotiation and discovery.

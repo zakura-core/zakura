@@ -12,9 +12,7 @@ use std::{path::PathBuf, sync::Arc};
 
 use zakura_chain::parameters::spentness_hints::Commitment;
 
-use super::{
-    CustomService, Frame, MessageRole, MessageRule, PayloadLen, Stream, ZakuraServiceId,
-};
+use super::{CustomService, Frame, MessageRole, MessageRule, PayloadLen, Stream, ZakuraServiceId};
 use crate::BoxError;
 
 mod cache;

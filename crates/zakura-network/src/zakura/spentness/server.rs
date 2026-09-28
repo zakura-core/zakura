@@ -7,7 +7,7 @@
 use std::{
     collections::{BTreeMap, HashMap},
     ops::Range,
-    sync::{Arc, Mutex, RwLock, RwLockReadGuard},
+    sync::{Arc, Mutex, PoisonError, RwLock, RwLockReadGuard},
 };
 
 use tokio::time::Instant;
@@ -104,7 +104,8 @@ impl ArtifactService {
         let admitted = self
             .rate
             .lock()
-            .expect("serve rate lock is not poisoned because no holder panics")
+            // The rate state stays consistent even if a holder panicked.
+            .unwrap_or_else(PoisonError::into_inner)
             .try_take(peer, u64::from(request.length), Instant::now());
         if !admitted {
             return Ok(RangeResponse::busy(request));

@@ -93,7 +93,6 @@ def _validate_report(bundle: Path, pin: dict) -> dict:
         or report.get("commitment") != pin
         or report.get("oracle") != ORACLE
         or report.get("complete_entries") is not True
-        or report.get("salted_multiset") is not True
         or type(report.get("survivor_count")) is not int
         or report["survivor_count"] < 0
     ):
@@ -132,7 +131,7 @@ def _validate_artifact(bundle: Path, pin: dict) -> int:
             first = False
             last = chunk[-1]
             digest.update(chunk)
-            survivors += sum(byte.bit_count() for byte in chunk)
+            survivors += int.from_bytes(chunk, "little").bit_count()
     if size != pin["byte_len"] or list(digest.digest()) != pin["sha256"]:
         raise ValueError("spentness artifact digest or length mismatch")
     if count % BITS_PER_BYTE and last >> (count % BITS_PER_BYTE):

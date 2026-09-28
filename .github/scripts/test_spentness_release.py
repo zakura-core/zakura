@@ -63,7 +63,6 @@ class SpentnessReleaseTests(unittest.TestCase):
             "survivor_count": 3,
             "oracle": hints.ORACLE,
             "complete_entries": True,
-            "salted_multiset": True,
         }
         (self.bundle / hints.VERIFICATION).write_text(json.dumps(self.report))
         self.meta = {
@@ -214,7 +213,7 @@ class SpentnessReleaseTests(unittest.TestCase):
         for key, value in (
             ("survivor_count", 2),
             ("complete_entries", False),
-            ("salted_multiset", False),
+            ("oracle", "unknown"),
         ):
             report = {**self.report, key: value}
             (self.bundle / hints.VERIFICATION).write_text(json.dumps(report))

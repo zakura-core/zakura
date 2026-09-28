@@ -1454,19 +1454,25 @@ impl DiskDb {
         db_kind: impl AsRef<str>,
         network: &Network,
     ) -> Option<(PathBuf, u64)> {
-        let major_db_ver = *restorable_db_versions
-            .iter()
-            .find(|v| **v == format_version_in_code.major)?;
         let db_kind = db_kind.as_ref();
 
-        let old_major_db_ver = major_db_ver - 1;
-        let old_path = config.db_path(db_kind, old_major_db_ver, network);
-        // Exit early if the path doesn't exist or there's an error checking it.
-        if !fs::exists(&old_path).unwrap_or(false) {
-            return None;
-        }
+        // Each restorable major reuses the major before it, and its upgrades migrate that data.
+        // Walk back through consecutive restorable majors to the newest existing database.
+        let mut major_db_ver = format_version_in_code.major;
+        let (old_path, old_major_db_ver) = loop {
+            if !restorable_db_versions.contains(&major_db_ver) {
+                return None;
+            }
+            let old_major_db_ver = major_db_ver.checked_sub(1)?;
+            let old_path = config.db_path(db_kind, old_major_db_ver, network);
+            // Treat an error checking the path as a missing database.
+            if fs::exists(&old_path).unwrap_or(false) {
+                break (old_path, old_major_db_ver);
+            }
+            major_db_ver = old_major_db_ver;
+        };
 
-        let new_path = config.db_path(db_kind, major_db_ver, network);
+        let new_path = config.db_path(db_kind, format_version_in_code.major, network);
 
         let old_path = match fs::canonicalize(&old_path) {
             Ok(canonicalized_old_path) => canonicalized_old_path,
@@ -1508,12 +1514,11 @@ impl DiskDb {
     /// Tries to reuse an existing db after a major upgrade.
     ///
     /// If the current db version belongs to `restorable_db_versions`, the function moves a previous
-    /// db to a new path so it can be used again. It does so by merely trying to rename the path
-    /// corresponding to the db version directly preceding the current version to the path that is
-    /// used by the current db. If successful, it also deletes the db version file.
+    /// db to a new path so it can be used again. It renames the newest existing db that consecutive
+    /// restorable versions can reach to the path that the current db uses. The format upgrades
+    /// then migrate it from its recorded version.
     ///
     /// Returns the old disk version if one existed and the db directory was renamed, or None otherwise.
-    // TODO: Update this function to rename older major db format version to the current version (#9565).
     #[allow(clippy::unwrap_in_result)]
     pub(crate) fn try_reusing_previous_db_after_major_upgrade(
         restorable_db_versions: &[u64],

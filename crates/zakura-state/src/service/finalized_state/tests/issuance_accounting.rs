@@ -628,7 +628,11 @@ fn migration_retry_matches_fresh_sync(network: Network) {
         .unwrap();
     drop(state);
     let old_path = config.db_path(STATE_DATABASE_KIND, 28, &network);
-    let new_path = config.db_path(STATE_DATABASE_KIND, 29, &network);
+    let new_path = config.db_path(
+        STATE_DATABASE_KIND,
+        state_database_format_version_in_code().major,
+        &network,
+    );
     std::fs::create_dir_all(old_path.parent().unwrap()).unwrap();
     std::fs::rename(&new_path, &old_path).unwrap();
     assert!(FinalizedState::new(&config, &network).is_err());

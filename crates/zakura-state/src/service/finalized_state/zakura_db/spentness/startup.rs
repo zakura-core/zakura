@@ -25,7 +25,7 @@ use crate::{
     config::database_format_version_on_disk,
     constants::{state_database_format_version_in_code, STATE_DATABASE_KIND},
     service::finalized_state::{
-        disk_db::DiskDb, zakura_db::ZakuraDb, STATE_COLUMN_FAMILIES_IN_CODE,
+        disk_db::DiskDb, restorable_db_versions, zakura_db::ZakuraDb, STATE_COLUMN_FAMILIES_IN_CODE,
     },
     Config, StateInitError,
 };
@@ -82,12 +82,19 @@ enum ExistingState {
     Hinted(Progress),
 }
 
+/// Classify the database that opening state will use.
+///
+/// Opening state first reuses a previous major database, so the probe checks it first too.
 fn probe_existing_state(
     config: &Config,
     network: &Network,
 ) -> Result<ExistingState, StateInitError> {
-    let Some((db, _)) = open_existing_state(config, network)? else {
-        return Ok(ExistingState::Empty);
+    let db = match open_reusable_previous_state(config, network)? {
+        Some(db) => db,
+        None => match open_existing_state(config, network)? {
+            Some((db, _)) => db,
+            None => return Ok(ExistingState::Empty),
+        },
     };
     if let Some(progress) = read_progress(&db)? {
         return Ok(ExistingState::Hinted(progress));
@@ -138,6 +145,36 @@ pub(super) fn open_existing_state(
         true,
     )?;
     Ok(Some((db, disk_version)))
+}
+
+/// Open the previous major database read-only, if opening state would reuse it.
+fn open_reusable_previous_state(
+    config: &Config,
+    network: &Network,
+) -> Result<Option<DiskDb>, StateInitError> {
+    if config.ephemeral {
+        return Ok(None);
+    }
+    let Some((_, major)) = DiskDb::reusable_previous_major_db(
+        &restorable_db_versions(),
+        &state_database_format_version_in_code(),
+        config,
+        STATE_DATABASE_KIND,
+        network,
+    ) else {
+        return Ok(None);
+    };
+    let db = DiskDb::new(
+        config,
+        STATE_DATABASE_KIND,
+        &Version::new(major, 0, 0),
+        network,
+        STATE_COLUMN_FAMILIES_IN_CODE
+            .iter()
+            .map(ToString::to_string),
+        true,
+    )?;
+    Ok(Some(db))
 }
 
 fn select_requirement(
@@ -380,5 +417,68 @@ impl ZakuraDb {
             ));
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{fs, sync::Arc};
+
+    use zakura_chain::{block::Block, serialization::ZcashDeserializeInto};
+
+    use super::*;
+    use crate::service::finalized_state::{CheckpointVerifiedBlock, FinalizedState};
+
+    /// A database that state opening would reuse from the previous major version is not empty.
+    #[test]
+    fn probe_classifies_a_reusable_previous_major_database() {
+        let _init_guard = zakura_test::init();
+        let network = Network::Mainnet;
+        let directory = tempfile::tempdir().unwrap();
+        let config = Config {
+            cache_dir: directory.path().join("state"),
+            vct_fast_sync: false,
+            ..Config::default()
+        };
+        let genesis: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
+            .zcash_deserialize_into()
+            .map(Arc::new)
+            .unwrap();
+        {
+            let mut state = FinalizedState::new(&config, &network).unwrap();
+            state
+                .commit_finalized_direct(
+                    CheckpointVerifiedBlock::from(genesis).into(),
+                    None,
+                    None,
+                    "probe test",
+                )
+                .unwrap();
+        }
+
+        let major = state_database_format_version_in_code().major;
+        let current = config.db_path(STATE_DATABASE_KIND, major, &network);
+        let previous = config.db_path(STATE_DATABASE_KIND, major - 1, &network);
+        fs::create_dir_all(previous.parent().unwrap()).unwrap();
+        fs::rename(&current, &previous).unwrap();
+
+        assert!(matches!(
+            probe_existing_state(&config, &network).unwrap(),
+            ExistingState::Ordinary
+        ));
+        assert!(
+            previous.exists() && !current.exists(),
+            "the probe leaves the previous database for state opening to reuse"
+        );
+
+        let spentness = SpentnessConfig {
+            mode: Mode::Require,
+            artifact: None,
+        };
+        assert!(
+            spentness_artifact_requirement(&config, &spentness, &network)
+                .unwrap()
+                .is_none()
+        );
     }
 }

@@ -2142,3 +2142,51 @@ fn chain_tips_measure_a_header_fork_from_the_active_chain() {
         "the header branch should be measured from block1, not the active tip"
     );
 }
+
+#[tokio::test]
+async fn block_sizes_by_hash_report_committed_sizes_and_none_for_unknown_hashes() -> Result<()> {
+    use tower::ServiceExt;
+    use zakura_chain::serialization::ZcashSerialize;
+
+    let _init_guard = zakura_test::init();
+    let blocks: Vec<Arc<Block>> = zakura_test::vectors::CONTINUOUS_MAINNET_BLOCKS
+        .values()
+        .map(|block_bytes| block_bytes.zcash_deserialize_into().unwrap())
+        .collect();
+    let (_state, read_state, _latest_chain_tip, _chain_tip_change) =
+        populated_state(blocks.clone(), &Mainnet).await;
+
+    let first = &blocks[0];
+    let last = blocks.last().expect("the continuous vectors are nonempty");
+    let unknown = zakura_chain::block::Hash([0xAA; 32]);
+    let expected_size = |block: &Arc<Block>| {
+        u32::try_from(block.zcash_serialized_size()).expect("mainnet test blocks fit u32")
+    };
+
+    let cases = vec![(
+        ReadRequest::BlockSizesByHash {
+            hashes: vec![first.hash(), unknown, last.hash()],
+        },
+        Ok(ReadResponse::BlockSizesByHash(vec![
+            Some(expected_size(first)),
+            None,
+            Some(expected_size(last)),
+        ])),
+    )];
+    Transcript::from(cases).check(read_state.clone()).await?;
+
+    let over_cap = usize::try_from(crate::constants::MAX_HEADER_SYNC_HEIGHT_RANGE)
+        .expect("u32 fits usize on supported targets")
+        + 1;
+    let rejected = read_state
+        .clone()
+        .oneshot(ReadRequest::BlockSizesByHash {
+            hashes: vec![unknown; over_cap],
+        })
+        .await;
+    assert!(
+        rejected.is_err(),
+        "size queries above the header range cap are rejected"
+    );
+    Ok(())
+}

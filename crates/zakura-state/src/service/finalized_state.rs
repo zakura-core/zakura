@@ -180,6 +180,7 @@ pub const STATE_COLUMN_FAMILIES_IN_CODE: &[&str] = &[
     HEADER_VERIFIED,
     HEADER_ELIGIBILITY_ROOT,
     HEADER_AUX_DELIVERY,
+    HEADER_AUX_BODY_SIZE,
     HEADER_DEFERRED,
     HEADER_FINALITY_HISTORY,
     HEADER_FINALITY_WITNESS,
@@ -242,6 +243,9 @@ pub const HEADER_VERIFIED: &str = "header_verified_v1";
 pub const HEADER_ELIGIBILITY_ROOT: &str = "header_eligibility_root_v1";
 /// Hash-keyed auxiliary deliveries.
 pub const HEADER_AUX_DELIVERY: &str = "header_aux_delivery_v1";
+
+/// Advisory size corrections keyed by the original auxiliary delivery.
+pub const HEADER_AUX_BODY_SIZE: &str = "header_aux_body_size_v1";
 /// Ordered future-time deferral index.
 pub const HEADER_DEFERRED: &str = "header_deferred_v1";
 /// Authoritative append-only finality history.

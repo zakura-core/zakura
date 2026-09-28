@@ -39,7 +39,8 @@ pub use preparation::{
     ValidationLease,
 };
 pub use snapshot::{
-    AlarmSet, CommittedHeaderChainView, EngineMetadata, EngineSnapshot, HeaderChainDiskVersion,
+    AlarmSet, BodySizeHintBatch, CommittedHeaderChainView, EngineMetadata, EngineSnapshot,
+    HeaderChainDiskVersion,
 };
 pub use write_set::{
     checkpoint_finality_evidence, full_state_finality_evidence, full_state_initialization_evidence,

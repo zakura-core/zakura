@@ -42,6 +42,7 @@ use zakura_chain::{
 
 use self::trace::ZakuraConnTrace;
 use super::discovery::{self, native_dial_supervised, spawn_native_bootstrap_dialer, RedialPolicy};
+use super::regulation::{CadenceBuckets, CadenceCharge, PrecheckSlot};
 use super::trace::{reject_reason_label, ZakuraTrace};
 use super::transport::{
     worker_framed_channel, FramedWorkerRecv, OrderedStreamFailure, OrderedStreamFailureCause,
@@ -57,19 +58,20 @@ use crate::{
     zakura::{
         canonical_ip, direct_endpoint_builder, spawn_block_sync_reactor, spawn_header_sync_reactor,
         AuthenticatedPeerRegistration, BlockSyncAction, BlockSyncFrontiers, BlockSyncHandle,
-        BlockSyncService, BlockSyncStartup, BoxRunFuture, Clock, CloseCause, Frame, FramedRecv,
-        FramedSend, FullStateFrontiers, HeaderSyncPassthroughService, HeaderSyncService,
-        HeaderSyncStartup, Peer, RealClock, Service, ServicePeerDirection, ServiceRegistry,
-        ServiceStream, SessionDemand, SessionOpening, SessionPolicy, SinkReject, Stream,
-        StreamMode, StreamPrelude, StreamQueueDepths, StreamWritePolicy, ZakuraAcceptedLimits,
-        ZakuraBlockSyncConfig, ZakuraConnId, ZakuraControlAck, ZakuraControlHello,
-        ZakuraControlRole, ZakuraControlValidation, ZakuraHandshakeConfig, ZakuraHandshakePath,
-        ZakuraHeaderSyncConfig, ZakuraInitialLimits, ZakuraLimits, ZakuraPeerId,
-        ZakuraPeerSupervisor, ZakuraProtocolError, ZakuraRejectReason, ZakuraServiceId,
-        ZakuraUpgradeDialStart, CONTROL_ACK_MAGIC, CONTROL_HELLO_MAGIC, CONTROL_VERSION,
-        FRAME_HEADER_BYTES, MAX_CONTROL_PAYLOAD_BYTES, P2P_V2_ALPN, STREAM_PRELUDE_MAGIC,
-        TRANSCRIPT_HASH_BYTES, ZAKURA_CAP_HEADER_SYNC, ZAKURA_HEADER_SYNC_STREAM_VERSION,
-        ZAKURA_PROTOCOL_VERSION_CURRENT, ZAKURA_STREAM_BLOCK_SYNC, ZAKURA_STREAM_HEADER_SYNC,
+        BlockSyncService, BlockSyncStartup, BoxRunFuture, Clock, CloseCause, Frame, FrameFilter,
+        FrameRejection, FramedRecv, FramedSend, FullStateFrontiers, HeaderSyncPassthroughService,
+        HeaderSyncService, HeaderSyncStartup, InboundReader, MessageRule, Peer, RealClock, Service,
+        ServicePeerDirection, ServiceRegistry, ServiceStream, SessionDemand, SessionOpening,
+        SessionPolicy, SinkReject, Stream, StreamMode, StreamPrelude, StreamQueueDepths,
+        StreamWritePolicy, ZakuraAcceptedLimits, ZakuraBlockSyncConfig, ZakuraConnId,
+        ZakuraControlAck, ZakuraControlHello, ZakuraControlRole, ZakuraControlValidation,
+        ZakuraHandshakeConfig, ZakuraHandshakePath, ZakuraHeaderSyncConfig, ZakuraInitialLimits,
+        ZakuraLimits, ZakuraPeerId, ZakuraPeerSupervisor, ZakuraProtocolError, ZakuraRejectReason,
+        ZakuraServiceId, ZakuraUpgradeDialStart, CONTROL_ACK_MAGIC, CONTROL_HELLO_MAGIC,
+        CONTROL_VERSION, FRAME_HEADER_BYTES, MAX_CONTROL_PAYLOAD_BYTES, P2P_V2_ALPN,
+        STREAM_PRELUDE_MAGIC, TRANSCRIPT_HASH_BYTES, ZAKURA_CAP_HEADER_SYNC,
+        ZAKURA_HEADER_SYNC_STREAM_VERSION, ZAKURA_PROTOCOL_VERSION_CURRENT,
+        ZAKURA_STREAM_BLOCK_SYNC, ZAKURA_STREAM_HEADER_SYNC,
     },
 };
 
@@ -1615,17 +1617,37 @@ struct StreamWorkerContext {
     _permit: OwnedSemaphorePermit,
     limits: ZakuraConnectionLimits,
     inbound_frame_cap: u32,
-    message_payload_limits: &'static [(u16, usize)],
-    message_types: Option<&'static [u16]>,
+    messages: Option<&'static [MessageRule]>,
     queue_depths: Option<StreamQueueDepths>,
     write_policy: StreamWritePolicy,
     session_resources: Option<Arc<dyn crate::zakura::SessionResources>>,
     outbound_frame_cap: u32,
     message_bucket: SharedMessageBucket,
+    /// Cadence buckets for a stream with a table; `None` for legacy streams.
+    cadence: Option<CadenceScope>,
+    /// The response precheck the stream's service attaches, if any.
+    precheck: PrecheckSlot,
     connection_token: CancellationToken,
     stream_token: CancellationToken,
     close_cause: CloseCause,
     freshness_tx: watch::Sender<Instant>,
+}
+
+impl StreamWorkerContext {
+    /// Credit a pause in which this reader waited for its own handler.
+    fn credit_read_pause(&self, paused: Duration) {
+        let (Some(cadence), Some(rules)) = (&self.cadence, self.messages) else {
+            return;
+        };
+        if paused.is_zero() {
+            return;
+        }
+        cadence
+            .buckets
+            .lock()
+            .expect("Zakura cadence bucket mutex is never poisoned")
+            .credit_pause(cadence.layout, rules, paused);
+    }
 }
 
 struct AdmittedSession {
@@ -1876,10 +1898,11 @@ enum InboundMessageAdmission {
 }
 
 fn admit_inbound_message(
-    payload_len: usize,
+    frame: &Frame,
     context: &StreamWorkerContext,
     stream_kind: u16,
 ) -> InboundMessageAdmission {
+    let payload_len = frame.payload.len();
     let stream_kind = stream_kind_label(stream_kind);
     let max_message_bytes = usize::try_from(context.limits.max_message_bytes)
         .expect("u32 message byte limit fits in usize");
@@ -1898,6 +1921,31 @@ fn admit_inbound_message(
             None,
         );
         return InboundMessageAdmission::Oversize;
+    }
+
+    // A stream with a table charges only the rows that declare a cadence.
+    // Commitments bound requests and reservations bound responses.
+    if let (Some(cadence), Some(rules)) = (&context.cadence, context.messages) {
+        let rule = MessageRule::find(rules, frame.message_type)
+            .expect("the frame filter admits only rows of the stream's table");
+        let charge = cadence
+            .buckets
+            .lock()
+            .expect("Zakura cadence bucket mutex is never poisoned")
+            .charge(cadence.layout, rule);
+        // A sibling stream can keep the connection alive during an unbounded
+        // transport stall. Exhaustion cannot prove a sender violation.
+        if charge == CadenceCharge::Exhausted {
+            context.conn.trace_rate_limit(
+                "cadence.exhausted",
+                context.stream_id,
+                stream_kind,
+                None,
+                None,
+                None,
+            );
+        }
+        return InboundMessageAdmission::Admit;
     }
 
     let admitted = {
@@ -2885,8 +2933,6 @@ impl ZakuraProtocolHandler {
                                     &connection,
                                     limits,
                                     stream,
-                                    stream.payload_limits,
-                                    stream.message_types,
                                     request_id,
                                     message_type,
                                     flags,
@@ -3218,14 +3264,16 @@ impl ZakuraProtocolHandler {
         } else {
             None
         };
+        let layout_kind = session
+            .as_ref()
+            .map_or(prelude.stream_kind, |(layout, _)| layout.primary().kind);
         let message_bucket = message_bucket_for(
             admission.message_buckets,
-            session
-                .as_ref()
-                .map_or(prelude.stream_kind, |(layout, _)| layout.primary().kind),
+            layout_kind,
             admission.limits.message_rate_per_second,
             RealClock,
         );
+        let cadence = cadence_scope(admission.message_buckets, stream, layout_kind);
         let stream_token = admission.connection_token.child_token();
 
         let context = StreamWorkerContext {
@@ -3235,8 +3283,7 @@ impl ZakuraProtocolHandler {
             _permit: permit,
             limits: admission.limits,
             inbound_frame_cap: inbound_frame_cap_for_stream(&admission.limits, stream),
-            message_payload_limits: stream.payload_limits,
-            message_types: stream.message_types,
+            messages: stream.messages,
             queue_depths: stream.queue_depths,
             write_policy: stream.write_policy,
             session_resources: resources,
@@ -3246,6 +3293,8 @@ impl ZakuraProtocolHandler {
                 prelude.max_frame_bytes,
             ),
             message_bucket,
+            cadence,
+            precheck: PrecheckSlot::default(),
             connection_token: admission.connection_token.clone(),
             stream_token,
             close_cause: admission.close_cause.clone(),
@@ -4155,6 +4204,15 @@ async fn persistent_stream_worker_with_policy(
         // to poll the reader's terminal event. Preserve the close cause first.
         let _cancel_session_on_exit = reader_context.stream_token.clone().drop_guard();
         let mut recv = recv;
+        let waiting_since = Instant::now();
+        tokio::select! {
+            biased;
+            _ = reader_context.connection_token.cancelled() => return,
+            _ = reader_context.stream_token.cancelled() => return,
+            _ = reader_context.precheck.ready() => {}
+            _ = inbound_tx.closed() => reader_context.precheck.start(),
+        }
+        reader_context.credit_read_pause(waiting_since.elapsed());
         loop {
             let frame = tokio::select! {
                 biased;
@@ -4163,8 +4221,8 @@ async fn persistent_stream_worker_with_policy(
                 frame = read_frame(
                     &mut recv,
                     reader_context.inbound_frame_cap,
-                    reader_context.message_payload_limits,
-                    reader_context.message_types,
+                    FrameFilter::new(reader_context.messages, InboundReader::Persistent)
+                        .with_precheck(reader_context.precheck.get()),
                     reader_context.limits.idle_timeout,
                     // A persistent ordered stream is legitimately quiet between
                     // frames; do not let an inter-frame gap time out and cancel
@@ -4179,14 +4237,19 @@ async fn persistent_stream_worker_with_policy(
             let error = match frame {
                 Ok(frame) => {
                     let _ = reader_context.freshness_tx.send(Instant::now());
-                    match admit_inbound_message(frame.payload.len(), &reader_context, stream_kind) {
+                    match admit_inbound_message(&frame, &reader_context, stream_kind) {
                         InboundMessageAdmission::Admit => {
+                            let waiting_since = Instant::now();
                             let forwarded = tokio::select! {
                                 biased;
                                 _ = reader_context.connection_token.cancelled() => break,
                                 _ = reader_context.stream_token.cancelled() => break,
                                 result = inbound_tx.send(frame) => result,
                             };
+                            // While this reader waited for its own handler, the
+                            // peer kept sending into transport buffers. Credit the
+                            // pause so the buffered burst never counts against it.
+                            reader_context.credit_read_pause(waiting_since.elapsed());
                             if forwarded.is_err() {
                                 // Local receiver closure leaves retained senders and
                                 // queued writes alive. Keep bounded ingress checks and
@@ -4393,8 +4456,7 @@ async fn request_stream_worker(
         frame = read_frame(
             &mut recv,
             context.inbound_frame_cap,
-            context.message_payload_limits,
-            context.message_types,
+            FrameFilter::new(context.messages, InboundReader::Responder),
             context.limits.idle_timeout,
             // A request stream carries its request frame immediately after the
             // prelude, so a peer that opens one and then goes silent is treated
@@ -4418,7 +4480,7 @@ async fn request_stream_worker(
     };
 
     let _ = context.freshness_tx.send(Instant::now());
-    match admit_inbound_message(frame.payload.len(), &context, prelude.stream_kind) {
+    match admit_inbound_message(&frame, &context, prelude.stream_kind) {
         InboundMessageAdmission::Admit => {}
         InboundMessageAdmission::Oversize => {
             let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_OVERSIZE));
@@ -4566,8 +4628,7 @@ async fn read_stream_prelude(
 async fn read_frame(
     recv: &mut RecvStream,
     max_frame_bytes: u32,
-    message_payload_limits: &[(u16, usize)],
-    message_types: Option<&[u16]>,
+    filter: FrameFilter<'_>,
     read_timeout: Duration,
     first_byte_timeout: Option<Duration>,
 ) -> Result<Frame, ZakuraHandlerError> {
@@ -4597,22 +4658,23 @@ async fn read_frame(
     }
     let mut reader = &header[..];
     let message_type = reader.read_u16::<LittleEndian>()?;
-    if message_types.is_some_and(|types| !types.contains(&message_type)) {
-        return Err(ZakuraHandlerError::InvalidMessageType(message_type));
-    }
     let flags = reader.read_u16::<LittleEndian>()?;
     let payload_len = usize::try_from(reader.read_u32::<LittleEndian>()?)
         .expect("u32 payload lengths fit usize on supported targets");
     let max_frame_bytes =
         usize::try_from(max_frame_bytes).expect("u32 frame cap fits usize on supported targets");
-    // A service may declare a tighter limit for this message. Apply it before
-    // allocating the payload; it can never enlarge the negotiated stream cap.
-    let max_frame_bytes = message_payload_limits
-        .iter()
-        .find(|(kind, _)| *kind == message_type)
-        .map_or(max_frame_bytes, |(_, max_payload_bytes)| {
-            max_frame_bytes.min(max_payload_bytes.saturating_add(FRAME_HEADER_BYTES))
-        });
+    // The stream's message table can only tighten the negotiated cap. Check it
+    // before allocating the payload.
+    let max_frame_bytes = filter
+        .check_header(message_type, flags, payload_len, max_frame_bytes)
+        .map_err(|rejection| {
+            metrics::counter!("zakura.p2p.frame.rejected", "reason" => rejection.label())
+                .increment(1);
+            ZakuraHandlerError::RejectedFrame {
+                message_type,
+                rejection,
+            }
+        })?;
     let frame_len = FRAME_HEADER_BYTES.saturating_add(payload_len);
     if frame_len > max_frame_bytes {
         metrics::counter!("zakura.p2p.ratelimit.frame.oversize").increment(1);
@@ -4751,8 +4813,6 @@ async fn write_outbound_request_frame(
     connection: &Connection,
     limits: ZakuraConnectionLimits,
     stream: Stream,
-    message_payload_limits: &'static [(u16, usize)],
-    message_types: Option<&'static [u16]>,
     request_id: u64,
     message_type: u16,
     flags: u16,
@@ -4764,8 +4824,6 @@ async fn write_outbound_request_frame(
             connection,
             limits,
             stream,
-            message_payload_limits,
-            message_types,
             request_id,
             message_type,
             flags,
@@ -4781,8 +4839,6 @@ async fn write_outbound_request_frame_inner(
     connection: &Connection,
     limits: ZakuraConnectionLimits,
     stream: Stream,
-    message_payload_limits: &'static [(u16, usize)],
-    message_types: Option<&'static [u16]>,
     request_id: u64,
     message_type: u16,
     flags: u16,
@@ -4836,8 +4892,8 @@ async fn write_outbound_request_frame_inner(
         match read_frame(
             &mut recv,
             inbound_frame_cap,
-            message_payload_limits,
-            message_types,
+            FrameFilter::new(stream.messages, InboundReader::Requester)
+                .with_precheck(Some(&legacy_state)),
             limits.idle_timeout,
             // This is the requester side of a one-shot legacy request/response:
             // the responder streams its frames promptly, so a silent gap before
@@ -4990,6 +5046,22 @@ struct LegacyResponseReadState {
     items: usize,
     active_chunk_type: Option<u16>,
     active_chunk: Vec<u8>,
+}
+
+impl super::regulation::ResponsePrecheck for LegacyResponseReadState {
+    fn check(&self, _message_type: u16, payload_len: usize) -> Result<(), FrameRejection> {
+        if self.frames >= self.budget.max_frames {
+            return Err(FrameRejection::Unsolicited);
+        }
+        let remaining = self.budget.max_bytes.saturating_sub(self.bytes);
+        if payload_len > remaining {
+            return Err(FrameRejection::AboveReservation {
+                // The aggregate response cap keeps this value below u64::MAX.
+                bytes: remaining as u64,
+            });
+        }
+        Ok(())
+    }
 }
 
 impl LegacyResponseReadState {
@@ -5513,10 +5585,56 @@ fn is_supported_stream(registry: &ServiceRegistry, stream_kind: u16, stream_vers
 /// per-connection budget instead of N independent ones (FLUP-014).
 type SharedMessageBucket<C = RealClock> = Arc<std::sync::Mutex<TokenBucket<C>>>;
 
-/// Per-connection collection of message-rate buckets keyed by validated stream
+/// Per-connection message-rate state, shared across that connection's workers.
+///
+/// Streams without a message table draw from one bucket per validated stream
 /// kind. Created lazily (FLUP-015 rejects unknown kinds before this point, so
-/// every key here is a known kind) and shared across that connection's workers.
-type MessageRateBuckets<C = RealClock> = HashMap<u16, SharedMessageBucket<C>>;
+/// every key here is a known kind). Streams with a table charge only the rows
+/// that declare a cadence, in the connection's [`CadenceBuckets`].
+struct MessageRateBuckets<C: Clock = RealClock> {
+    streams: HashMap<u16, SharedMessageBucket<C>>,
+    cadence: SharedCadenceBuckets<C>,
+}
+
+impl<C: Clock + Default> MessageRateBuckets<C> {
+    fn new() -> Self {
+        Self {
+            streams: HashMap::new(),
+            cadence: Arc::new(std::sync::Mutex::new(CadenceBuckets::new(C::default()))),
+        }
+    }
+}
+
+impl<C: Clock> MessageRateBuckets<C> {
+    /// Number of per-kind stream buckets.
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.streams.len()
+    }
+}
+
+/// One connection's cadence buckets, shared by its readers.
+type SharedCadenceBuckets<C = RealClock> = Arc<std::sync::Mutex<CadenceBuckets<C>>>;
+
+/// A tabled stream's view of its connection's cadence buckets.
+#[derive(Clone, Debug)]
+struct CadenceScope {
+    buckets: SharedCadenceBuckets,
+    /// The primary stream kind of the stream's layout, which keys its buckets.
+    layout: u16,
+}
+
+/// The cadence scope for `stream` in `layout`, if the stream has a table.
+fn cadence_scope(
+    buckets: &MessageRateBuckets,
+    stream: Stream,
+    layout: u16,
+) -> Option<CadenceScope> {
+    stream.messages.map(|_| CadenceScope {
+        buckets: buckets.cadence.clone(),
+        layout,
+    })
+}
 
 /// Returns the shared message-rate bucket for `stream_kind` on this connection,
 /// creating it sized from `message_rate_per_second` on first use.
@@ -5531,6 +5649,7 @@ fn message_bucket_for<C: Clock>(
     clock: C,
 ) -> SharedMessageBucket<C> {
     buckets
+        .streams
         .entry(stream_kind)
         .or_insert_with(|| {
             Arc::new(std::sync::Mutex::new(TokenBucket::with_clock(
@@ -5594,9 +5713,14 @@ impl<C: Clock> TokenBucket<C> {
 /// Errors produced by the Zakura protocol handler.
 #[derive(Debug, Error)]
 pub enum ZakuraHandlerError {
-    /// The frame header names a message that is invalid on this stream role.
-    #[error("invalid message type {0} for this stream role")]
-    InvalidMessageType(u16),
+    /// The stream's message table rejected a frame from its header.
+    #[error("rejected a frame of message type {message_type}: {rejection}")]
+    RejectedFrame {
+        /// The frame's message type.
+        message_type: u16,
+        /// The broken rule.
+        rejection: FrameRejection,
+    },
     /// Two ordered stream roles failed to name one complete session.
     #[error("invalid Zakura service session")]
     InvalidServiceSession,
@@ -8141,13 +8265,14 @@ mod tests {
             _permit: Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap(),
             limits,
             inbound_frame_cap: stream.frame_cap,
-            message_payload_limits: &[],
-            message_types: None,
+            messages: None,
             queue_depths: None,
             write_policy: StreamWritePolicy::Timeout(OUTBOUND_STREAM_WRITE_TIMEOUT),
             session_resources: None,
             outbound_frame_cap: stream.frame_cap,
             message_bucket: Arc::new(std::sync::Mutex::new(TokenBucket::new(128))),
+            cadence: None,
+            precheck: PrecheckSlot::default(),
             connection_token: cancel.clone(),
             stream_token: stream_cancel.clone(),
             close_cause: CloseCause::new(),
@@ -8206,8 +8331,7 @@ mod tests {
             read_frame(
                 &mut receiver,
                 stream.frame_cap,
-                &[],
-                None,
+                FrameFilter::new(None, InboundReader::Persistent),
                 Duration::from_secs(2),
                 None,
             ),
@@ -8347,13 +8471,14 @@ mod tests {
             _permit: permit,
             limits,
             inbound_frame_cap: inbound_frame_cap_for_stream(&limits, stream),
-            message_payload_limits: &[],
-            message_types: None,
+            messages: None,
             queue_depths: None,
             write_policy: StreamWritePolicy::Timeout(OUTBOUND_STREAM_WRITE_TIMEOUT),
             session_resources: None,
             outbound_frame_cap: application_frame_cap(&limits, stream),
             message_bucket: Arc::new(std::sync::Mutex::new(TokenBucket::new(128))),
+            cadence: None,
+            precheck: PrecheckSlot::default(),
             connection_token: connection_token.clone(),
             stream_token: stream_token.clone(),
             close_cause: CloseCause::new(),
@@ -8553,8 +8678,7 @@ mod tests {
                 _permit: permit,
                 limits,
                 inbound_frame_cap: inbound_frame_cap_for_stream(&limits, stream),
-                message_payload_limits: &[],
-                message_types: None,
+                messages: None,
                 queue_depths: None,
                 write_policy: StreamWritePolicy::Timeout(OUTBOUND_STREAM_WRITE_TIMEOUT),
                 session_resources: None,
@@ -8562,6 +8686,8 @@ mod tests {
                 message_bucket: Arc::new(std::sync::Mutex::new(TokenBucket::new(
                     limits.message_rate_per_second,
                 ))),
+                cadence: None,
+                precheck: PrecheckSlot::default(),
                 connection_token: connection_token.clone(),
                 stream_token: connection_token.child_token(),
                 close_cause: CloseCause::new(),
@@ -8835,18 +8961,453 @@ mod tests {
         Ok(())
     }
 
+    /// A reader's context for one stream of the regulation test family.
+    fn tabled_context(
+        messages: Option<&'static [MessageRule]>,
+        rate_per_second: u32,
+    ) -> StreamWorkerContext {
+        let buckets = MessageRateBuckets::new();
+        let (freshness_tx, _freshness_rx) = watch::channel(Instant::now());
+        let stream = Stream {
+            messages,
+            ..Stream::PERSISTENT
+        };
+        let cancel = CancellationToken::new();
+        StreamWorkerContext {
+            conn: ZakuraConnTrace::without_peer(1),
+            peer_id: test_peer(52),
+            stream_id: 1,
+            _permit: Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap(),
+            limits: test_connection_limits(),
+            inbound_frame_cap: 1024,
+            messages,
+            queue_depths: None,
+            write_policy: StreamWritePolicy::UntilCancelled,
+            session_resources: None,
+            outbound_frame_cap: 1024,
+            message_bucket: Arc::new(std::sync::Mutex::new(TokenBucket::new(rate_per_second))),
+            cadence: cadence_scope(&buckets, stream, 900),
+            precheck: PrecheckSlot::default(),
+            connection_token: cancel.clone(),
+            stream_token: cancel.child_token(),
+            close_cause: CloseCause::new(),
+            freshness_tx,
+        }
+    }
+
+    fn probe_frame(message_type: u16, payload_len: usize) -> Frame {
+        Frame {
+            message_type,
+            flags: 0,
+            payload: vec![1; payload_len],
+        }
+    }
+
+    #[test]
+    fn tabled_streams_charge_only_the_rows_that_declare_a_cadence() {
+        use crate::zakura::regulation::test_family::{message_type, EVERY_30_SECONDS, RULES};
+
+        // A one-message stream bucket would throttle the second frame of a
+        // legacy stream. A tabled stream never touches it.
+        let context = tabled_context(Some(RULES), 1);
+        for message_type in [message_type::PART, message_type::DONE, message_type::GET] {
+            for _ in 0..4096 {
+                assert_eq!(
+                    admit_inbound_message(&probe_frame(message_type, 4), &context, 900),
+                    InboundMessageAdmission::Admit
+                );
+            }
+        }
+        for _ in 0..EVERY_30_SECONDS.capacity {
+            assert_eq!(
+                admit_inbound_message(&probe_frame(message_type::STATUS, 4), &context, 900),
+                InboundMessageAdmission::Admit
+            );
+        }
+        assert_eq!(
+            admit_inbound_message(&probe_frame(message_type::STATUS, 4), &context, 900),
+            InboundMessageAdmission::Admit
+        );
+        // Each cadence row has its own bucket.
+        assert_eq!(
+            admit_inbound_message(&probe_frame(message_type::PING, 4), &context, 900),
+            InboundMessageAdmission::Admit
+        );
+
+        let legacy = tabled_context(None, 1);
+        assert_eq!(
+            admit_inbound_message(&probe_frame(message_type::PART, 4), &legacy, 900),
+            InboundMessageAdmission::Admit
+        );
+        assert_eq!(
+            admit_inbound_message(&probe_frame(message_type::PART, 4), &legacy, 900),
+            InboundMessageAdmission::Throttled
+        );
+    }
+
+    #[test]
+    fn a_read_pause_credits_the_streams_cadence_rows() {
+        use crate::zakura::regulation::test_family::{message_type, EVERY_30_SECONDS, RULES};
+
+        let context = tabled_context(Some(RULES), 1);
+        let tokens = || {
+            context
+                .cadence
+                .as_ref()
+                .unwrap()
+                .buckets
+                .lock()
+                .unwrap()
+                .tokens(900, message_type::STATUS)
+        };
+        let status = probe_frame(message_type::STATUS, 4);
+        for _ in 0..EVERY_30_SECONDS.capacity {
+            admit_inbound_message(&status, &context, 900);
+        }
+        assert_eq!(
+            admit_inbound_message(&status, &context, 900),
+            InboundMessageAdmission::Admit
+        );
+        assert_eq!(tokens(), Some(0));
+        context.credit_read_pause(EVERY_30_SECONDS.refill_interval * 3);
+        assert_eq!(tokens(), Some(3));
+        for remaining in (0..3).rev() {
+            assert_eq!(
+                admit_inbound_message(&status, &context, 900),
+                InboundMessageAdmission::Admit
+            );
+            assert_eq!(tokens(), Some(remaining));
+        }
+        assert_eq!(
+            admit_inbound_message(&status, &context, 900),
+            InboundMessageAdmission::Admit
+        );
+    }
+
+    /// Replay the burst from 23 sends spaced 30 seconds apart during a
+    /// 660-second stream stall. A sibling can keep the connection alive.
     #[tokio::test]
-    async fn message_payload_limits_apply_before_payload_reads() -> Result<(), BoxError> {
-        use crate::zakura::{block_sync_streams, BlockSyncMessage};
-        use zakura_chain::{block, serialization::ZcashDeserializeInto};
+    async fn cadence_bursts_beyond_the_outage_capacity_stay_connected() -> Result<(), BoxError> {
+        use crate::zakura::regulation::test_family::{decode, message_type, Probe, RULES};
+
+        const ALPN: &[u8] = b"/zakura/testkit/cadence-burst/0";
+        let _guard = zakura_test::init();
+        let server = LocalEndpointFactory::new().endpoint(83).await?;
+        let (conn_tx, _conn_rx) = mpsc::channel(8);
+        let (stream_tx, mut stream_rx) = mpsc::channel(8);
+        let router = Router::builder(server)
+            .accept(
+                ALPN,
+                CaptureConnection {
+                    connection_tx: conn_tx,
+                    stream_tx,
+                },
+            )
+            .spawn();
+        let client = LocalEndpointFactory::new().endpoint(84).await?;
+        let stream = Stream {
+            kind: 900,
+            messages: Some(RULES),
+            ..Stream::PERSISTENT
+        };
+        // The 22-frame control and larger bursts use fresh connection buckets.
+        for count in [22u32, 23, 64] {
+            let connection = timeout(
+                Duration::from_secs(5),
+                client.connect(router.endpoint().addr(), ALPN),
+            )
+            .await??;
+            let (mut sender, _receiver) =
+                timeout(Duration::from_secs(2), connection.open_bi()).await??;
+            let mut bytes = Vec::new();
+            for value in 0..count {
+                bytes.extend_from_slice(&message_type::STATUS.to_le_bytes());
+                bytes.extend_from_slice(&0u16.to_le_bytes());
+                bytes.extend_from_slice(&4u32.to_le_bytes());
+                bytes.extend_from_slice(&value.to_le_bytes());
+            }
+            timeout(Duration::from_secs(2), sender.write_all(&bytes)).await??;
+            let (send, recv) = timeout(Duration::from_secs(2), stream_rx.recv())
+                .await?
+                .unwrap();
+            let context = tabled_context(Some(RULES), 1);
+            let cancel = context.connection_token.clone();
+            let prelude = StreamPrelude {
+                magic: STREAM_PRELUDE_MAGIC,
+                stream_kind: stream.kind,
+                stream_version: stream.version,
+                request_id: None,
+                max_frame_bytes: stream.frame_cap,
+            };
+            let mut workers = JoinSet::new();
+            let (exit_tx, _exit_rx) = mpsc::unbounded_channel();
+            let mut admitted = spawn_persistent_stream_worker(
+                &mut workers,
+                send,
+                recv,
+                stream,
+                prelude,
+                context,
+                1,
+                false,
+                exit_tx,
+            );
+            for value in 0..count {
+                let frame = timeout(Duration::from_secs(2), admitted.streams[0].recv.recv())
+                    .await?
+                    .expect("the reader forwards every buffered announcement");
+                assert_eq!(decode(&frame), Probe::Status(value));
+            }
+            assert!(!cancel.is_cancelled());
+            cancel.cancel();
+            timeout(Duration::from_secs(2), workers.join_next()).await?;
+            connection.close(0u32.into(), b"done");
+        }
+        client.close().await;
+        router.shutdown().await?;
+        Ok(())
+    }
+
+    /// The reader checks each response header against the attached
+    /// reservations and fails before it waits for the payload.
+    #[tokio::test]
+    async fn response_prechecks_apply_before_payload_reads() -> Result<(), BoxError> {
+        use crate::zakura::regulation::{
+            test_family::{message_type, RULES},
+            ReservationPool, Reservations, ResponseCap, SharedReservations,
+        };
 
         let stream = Stream {
-            payload_limits: &[(2, 9)],
+            kind: 900,
+            version: 1,
+            frame_cap: 1024,
+            capability: 1 << 48,
+            messages: Some(RULES),
+            ..Stream::PERSISTENT
+        };
+        let pool = ReservationPool::new(4)?;
+        let shared = SharedReservations::new(Reservations::<u32>::new(RULES, 4));
+        let filter = FrameFilter::new(stream.messages, InboundReader::Persistent);
+
+        const ALPN: &[u8] = b"/zakura/testkit/response-precheck/0";
+        let _guard = zakura_test::init();
+        let server = LocalEndpointFactory::new().endpoint(81).await?;
+        let (conn_tx, _conn_rx) = mpsc::channel(8);
+        let (stream_tx, mut stream_rx) = mpsc::channel(8);
+        let router = Router::builder(server)
+            .accept(
+                ALPN,
+                CaptureConnection {
+                    connection_tx: conn_tx,
+                    stream_tx,
+                },
+            )
+            .spawn();
+        let client = LocalEndpointFactory::new().endpoint(82).await?;
+        let server_addr = router.endpoint().addr();
+
+        // The capture takes one stream per connection, so each case connects.
+        let read_header = |message_type: u16, payload_len: u32| {
+            let (client, server_addr) = (client.clone(), server_addr.clone());
+            async move {
+                let connection =
+                    timeout(Duration::from_secs(5), client.connect(server_addr, ALPN)).await??;
+                let (mut send, _recv) =
+                    timeout(Duration::from_secs(2), connection.open_bi()).await??;
+                let mut header = Vec::with_capacity(FRAME_HEADER_BYTES);
+                header.extend_from_slice(&message_type.to_le_bytes());
+                header.extend_from_slice(&0u16.to_le_bytes());
+                header.extend_from_slice(&payload_len.to_le_bytes());
+                timeout(Duration::from_secs(2), send.write_all(&header)).await??;
+                Ok::<_, BoxError>((connection, send))
+            }
+        };
+        let rejected = |result: Result<Frame, ZakuraHandlerError>| match result {
+            Err(ZakuraHandlerError::RejectedFrame { rejection, .. }) => Some(rejection),
+            _ => None,
+        };
+
+        // No reservation: a response header is unsolicited.
+        let _open = read_header(message_type::PART, 10).await?;
+        let (_, mut recv) = timeout(Duration::from_secs(2), stream_rx.recv())
+            .await?
+            .unwrap();
+        let result = timeout(
+            Duration::from_secs(1),
+            read_frame(
+                &mut recv,
+                stream.frame_cap,
+                filter.with_precheck(Some(&shared)),
+                Duration::from_secs(5),
+                Some(Duration::from_secs(5)),
+            ),
+        )
+        .await
+        .expect("a refused header fails without waiting for payload bytes");
+        assert_eq!(rejected(result), Some(FrameRejection::Unsolicited));
+
+        // A reservation with ten bytes left: eleven are refused.
+        shared.lock().reserve(
+            1,
+            message_type::GET,
+            ResponseCap {
+                frames: 1,
+                bytes: 10,
+            },
+            pool.try_entry().unwrap(),
+        )?;
+        let _open = read_header(message_type::PART, 11).await?;
+        let (_, mut recv) = timeout(Duration::from_secs(2), stream_rx.recv())
+            .await?
+            .unwrap();
+        let result = timeout(
+            Duration::from_secs(1),
+            read_frame(
+                &mut recv,
+                stream.frame_cap,
+                filter.with_precheck(Some(&shared)),
+                Duration::from_secs(5),
+                Some(Duration::from_secs(5)),
+            ),
+        )
+        .await
+        .expect("a refused header fails without waiting for payload bytes");
+        assert_eq!(
+            rejected(result),
+            Some(FrameRejection::AboveReservation { bytes: 10 })
+        );
+
+        // A peer sends its response header before the service receives its
+        // handle. The production reader must wait for precheck attachment.
+        let _open = read_header(message_type::PART, 11).await?;
+        let (send, recv) = timeout(Duration::from_secs(2), stream_rx.recv())
+            .await?
+            .unwrap();
+        let mut context = tabled_context(Some(RULES), 128);
+        context.limits.idle_timeout = Duration::from_secs(30);
+        let cancel = context.connection_token.clone();
+        let prelude = StreamPrelude {
+            magic: STREAM_PRELUDE_MAGIC,
+            stream_kind: stream.kind,
+            stream_version: stream.version,
+            request_id: None,
+            max_frame_bytes: stream.frame_cap,
+        };
+        let mut workers = JoinSet::new();
+        let (exit_tx, _exit_rx) = mpsc::unbounded_channel();
+        let admitted = spawn_persistent_stream_worker(
+            &mut workers,
+            send,
+            recv,
+            stream,
+            prelude,
+            context,
+            1,
+            false,
+            exit_tx,
+        );
+        // Give the independent reader time to consume the already sent header
+        // if its startup gate is missing.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!cancel.is_cancelled());
+        assert!(admitted.streams[0]
+            .recv
+            .attach_precheck(Arc::new(shared.clone())));
+        timeout(Duration::from_secs(1), cancel.cancelled())
+            .await
+            .expect("the attached precheck rejects the first header without its payload");
+        timeout(Duration::from_secs(1), workers.join_next()).await?;
+
+        // Legacy streams have no rows, but their request budget still rejects
+        // a header before the peer supplies any payload bytes.
+        let mut legacy = LegacyResponseReadState::new(
+            LegacyResponseBudget::from_request(LEGACY_REQUEST_PING, &[], test_connection_limits())
+                .unwrap(),
+        );
+        for (payload_len, expected) in [
+            (9, FrameRejection::AboveReservation { bytes: 8 }),
+            (0, FrameRejection::Unsolicited),
+        ] {
+            let _open = read_header(LEGACY_RESPONSE_PONG, payload_len).await?;
+            let (_, mut recv) = timeout(Duration::from_secs(2), stream_rx.recv())
+                .await?
+                .unwrap();
+            let result = timeout(
+                Duration::from_secs(1),
+                read_frame(
+                    &mut recv,
+                    stream.frame_cap,
+                    FrameFilter::new(None, InboundReader::Requester).with_precheck(Some(&legacy)),
+                    Duration::from_secs(5),
+                    Some(Duration::from_secs(5)),
+                ),
+            )
+            .await
+            .expect("the legacy budget rejects a header without reading its payload");
+            assert_eq!(rejected(result), Some(expected));
+            if legacy.frames == 0 {
+                legacy
+                    .validate_frame(
+                        1,
+                        &Frame {
+                            message_type: LEGACY_RESPONSE_PONG,
+                            flags: 0,
+                            payload: 1u64.to_le_bytes().to_vec(),
+                        },
+                    )
+                    .expect("the first pong fits its request budget");
+            }
+        }
+
+        // Requests are not responses: the precheck does not apply.
+        let (_connection, mut send) = read_header(message_type::GET, 4).await?;
+        timeout(Duration::from_secs(2), send.write_all(&[0; 4])).await??;
+        let (_, mut recv) = timeout(Duration::from_secs(2), stream_rx.recv())
+            .await?
+            .unwrap();
+        let frame = timeout(
+            Duration::from_secs(2),
+            read_frame(
+                &mut recv,
+                stream.frame_cap,
+                filter.with_precheck(Some(&shared)),
+                Duration::from_secs(5),
+                Some(Duration::from_secs(5)),
+            ),
+        )
+        .await??;
+        assert_eq!(frame.message_type, message_type::GET);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn message_tables_apply_before_payload_reads() -> Result<(), BoxError> {
+        use crate::zakura::{block_sync_streams, MessageRole, PayloadLen};
+
+        const REQUEST: MessageRule = MessageRule {
+            message_type: 2,
+            payload: PayloadLen::exact(9),
+            role: MessageRole::Request {
+                max_in_flight: 1,
+                cadence: None,
+            },
+        };
+        const RESPONSE: MessageRule = MessageRule {
+            message_type: 3,
+            payload: PayloadLen::between(1, 99),
+            role: MessageRole::Response {
+                request: REQUEST.message_type,
+                ends_exchange: true,
+            },
+        };
+        let stream = Stream {
+            messages: Some(&[REQUEST, RESPONSE]),
             ..block_sync_streams()[0]
         };
-        let payload_limits = stream.payload_limits;
+        Stream::check_layout(&[stream])?;
+        let filter = FrameFilter::new(stream.messages, InboundReader::Persistent);
 
-        const ALPN: &[u8] = b"/zakura/testkit/message-payload-limits/0";
+        const ALPN: &[u8] = b"/zakura/testkit/message-tables/0";
         let _guard = zakura_test::init();
         let server = LocalEndpointFactory::new().endpoint(79).await?;
         let (conn_tx, _conn_rx) = mpsc::channel(8);
@@ -8864,16 +9425,45 @@ mod tests {
         let server_addr = router.endpoint().addr();
 
         // Only send headers and keep the send sides open. The reader must reject
-        // before waiting for a payload that the peer has not supplied.
-        for (message_type, payload_len, frame_cap, expected_cap) in [
-            // Eight frame-header bytes plus the nine-byte GetBlocks payload cap.
-            (2u16, 10u32, stream.frame_cap, 17usize),
-            (2, u32::MAX, stream.frame_cap, 17),
-            // A tighter stream cap still applies to an otherwise legal request.
-            (2, 9, 16, 16),
-            // Block has no message-specific cap yet; its stream cap still applies.
-            (3, 100, 107, 107),
-        ] {
+        // each one before waiting for a payload that the peer has not supplied.
+        let oversize = |cap| move |result: &Result<Frame, ZakuraHandlerError>| matches!(result, Err(ZakuraHandlerError::OversizeFrame { max_frame_bytes, .. }) if *max_frame_bytes == cap);
+        let rejected = |expected| move |result: &Result<Frame, ZakuraHandlerError>| matches!(result, Err(ZakuraHandlerError::RejectedFrame { rejection, .. }) if *rejection == expected);
+        let cases: [(
+            u16,
+            u16,
+            u32,
+            u32,
+            Box<dyn Fn(&Result<Frame, ZakuraHandlerError>) -> bool>,
+        ); 7] = [
+            // Eight frame-header bytes plus the request row's nine-byte maximum.
+            (2, 0, 10, stream.frame_cap, Box::new(oversize(17))),
+            (2, 0, u32::MAX, stream.frame_cap, Box::new(oversize(17))),
+            // A tighter negotiated cap still applies to a legal request.
+            (2, 0, 9, 16, Box::new(oversize(16))),
+            (3, 0, 100, stream.frame_cap, Box::new(oversize(107))),
+            (
+                7,
+                0,
+                1,
+                stream.frame_cap,
+                Box::new(rejected(FrameRejection::UnknownMessageType)),
+            ),
+            (
+                2,
+                1,
+                9,
+                stream.frame_cap,
+                Box::new(rejected(FrameRejection::ReservedFlags)),
+            ),
+            (
+                2,
+                0,
+                8,
+                stream.frame_cap,
+                Box::new(rejected(FrameRejection::PayloadTooShort { min: 9 })),
+            ),
+        ];
+        for (message_type, flags, payload_len, frame_cap, expected) in cases {
             let connection = timeout(
                 Duration::from_secs(5),
                 client.connect(server_addr.clone(), ALPN),
@@ -8882,7 +9472,7 @@ mod tests {
             let (mut send, _recv) = timeout(Duration::from_secs(2), connection.open_bi()).await??;
             let mut header = Vec::with_capacity(FRAME_HEADER_BYTES);
             header.extend_from_slice(&message_type.to_le_bytes());
-            header.extend_from_slice(&0u16.to_le_bytes());
+            header.extend_from_slice(&flags.to_le_bytes());
             header.extend_from_slice(&payload_len.to_le_bytes());
             timeout(Duration::from_secs(2), send.write_all(&header)).await??;
             let (_, mut recv) = timeout(Duration::from_secs(2), stream_rx.recv())
@@ -8893,65 +9483,63 @@ mod tests {
                 read_frame(
                     &mut recv,
                     frame_cap,
-                    payload_limits,
-                    None,
+                    filter,
                     Duration::from_secs(5),
                     Some(Duration::from_secs(5)),
                 ),
             )
             .await
-            .expect("an oversized header is rejected without waiting for payload bytes");
+            .expect("a rejected header fails without waiting for payload bytes");
             assert!(
-                matches!(result, Err(ZakuraHandlerError::OversizeFrame { max_frame_bytes, .. }) if max_frame_bytes == expected_cap)
+                expected(&result),
+                "type {message_type} flags {flags} length {payload_len}: {result:?}"
             );
         }
 
-        // The generic payload gate preserves the independent Block allowance.
-        // Role enforcement is covered by the paired-stream tests.
+        // Frames within their rows read normally, at both bounds.
         let connection =
             timeout(Duration::from_secs(5), client.connect(server_addr, ALPN)).await??;
         let (mut send, _recv) = timeout(Duration::from_secs(2), connection.open_bi()).await??;
-        let messages = [
-            BlockSyncMessage::GetBlocks {
-                start_height: block::Height(1),
-                count: 1,
+        let frames = [
+            Frame {
+                message_type: 2,
+                flags: 0,
+                payload: vec![7; 9],
             },
-            BlockSyncMessage::Block(
-                zakura_test::vectors::BLOCK_MAINNET_1_BYTES.zcash_deserialize_into()?,
-            ),
+            Frame {
+                message_type: 3,
+                flags: 0,
+                payload: vec![8; 1],
+            },
+            Frame {
+                message_type: 3,
+                flags: 0,
+                payload: vec![9; 99],
+            },
         ];
-        let first = messages[0].encode_frame()?;
-        timeout(
-            Duration::from_secs(2),
-            send.write_all(&first.encode(stream.frame_cap)?),
-        )
-        .await??;
+        for frame in &frames {
+            timeout(
+                Duration::from_secs(2),
+                send.write_all(&frame.encode(stream.frame_cap)?),
+            )
+            .await??;
+        }
         let (_, mut recv) = timeout(Duration::from_secs(2), stream_rx.recv())
             .await?
             .unwrap();
-        for (index, message) in messages.into_iter().enumerate() {
-            if index > 0 {
-                let frame = message.encode_frame()?;
-                assert!(frame.payload.len() > 9);
-                timeout(
-                    Duration::from_secs(2),
-                    send.write_all(&frame.encode(stream.frame_cap)?),
-                )
-                .await??;
-            }
+        for expected in frames {
             let frame = timeout(
                 Duration::from_secs(2),
                 read_frame(
                     &mut recv,
                     stream.frame_cap,
-                    payload_limits,
-                    None,
+                    filter,
                     Duration::from_secs(2),
                     Some(Duration::from_secs(2)),
                 ),
             )
             .await??;
-            assert_eq!(BlockSyncMessage::decode_frame(frame)?, message);
+            assert_eq!(frame, expected);
         }
         client.close().await;
         router.shutdown().await?;
@@ -9056,8 +9644,7 @@ mod tests {
         let rejected = read_frame(
             &mut s1_recv,
             inbound_cap,
-            &[],
-            None,
+            FrameFilter::new(None, InboundReader::Persistent),
             Duration::from_secs(2),
             Some(Duration::from_secs(2)),
         )
@@ -9091,8 +9678,7 @@ mod tests {
         let allocated = read_frame(
             &mut s2_recv,
             raw_cap,
-            &[],
-            None,
+            FrameFilter::new(None, InboundReader::Persistent),
             Duration::from_secs(2),
             Some(Duration::from_secs(2)),
         )
@@ -9131,8 +9717,7 @@ mod tests {
         let frame = read_frame(
             &mut s3_recv,
             inbound_cap,
-            &[],
-            None,
+            FrameFilter::new(None, InboundReader::Persistent),
             Duration::from_secs(2),
             Some(Duration::from_secs(2)),
         )
@@ -9561,6 +10146,41 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn legacy_header_precheck_tracks_remaining_bytes_across_frames() {
+        let mut state = LegacyResponseReadState::new(LegacyResponseBudget {
+            kind: LegacyResponseKind::Blocks,
+            max_items: 1,
+            max_frames: 10,
+            max_bytes: 18,
+            max_message_bytes: 1024,
+        });
+        let mut payload = 1u64.to_le_bytes().to_vec();
+        payload.push(0); // An empty missing-block inventory.
+        let frame = Frame {
+            message_type: LEGACY_RESPONSE_MISSING_BLOCKS,
+            flags: 0,
+            payload,
+        };
+        for remaining in [18, 9, 0] {
+            let filter =
+                FrameFilter::new(None, InboundReader::Requester).with_precheck(Some(&state));
+            assert_eq!(
+                filter.check_header(frame.message_type, 0, remaining, 1024),
+                Ok(1024),
+            );
+            assert_eq!(
+                filter.check_header(frame.message_type, 0, remaining + 1, 1024),
+                Err(FrameRejection::AboveReservation {
+                    bytes: u64::try_from(remaining).unwrap(),
+                }),
+            );
+            if remaining != 0 {
+                state.validate_frame(1, &frame).unwrap();
+            }
+        }
+    }
+
     fn assert_codec_frames_validate_at_transport(
         request: LegacyRequestFrame,
         request_kind: LegacyRequestKind,
@@ -9585,6 +10205,14 @@ mod tests {
 
         let mut state = LegacyResponseReadState::new(budget);
         for frame in &frames {
+            FrameFilter::new(None, InboundReader::Requester)
+                .with_precheck(Some(&state))
+                .check_header(
+                    frame.message_type,
+                    frame.flags,
+                    frame.payload.len(),
+                    usize::MAX,
+                )?;
             state
                 .validate_frame(request_id, frame)
                 .map_err(|error| -> BoxError { format!("{error:?}").into() })?;

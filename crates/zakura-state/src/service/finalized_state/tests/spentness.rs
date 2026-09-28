@@ -15,8 +15,8 @@ use super::super::{
     commitment_aux::{self, FinalFrontiers, FixtureSource},
     disk_format::{IntoDisk, OutputLocation, RawBytes},
     zakura_db::spentness::{
-        audit_progress_with_setup, Progress, ReleaseAuthority, ReplayCache, SpentnessConfig,
-        SpentnessSetup, METADATA,
+        audit_progress_with_setup, Progress, ReleaseAuthority, SpentnessConfig, SpentnessSetup,
+        METADATA,
     },
     CheckpointVerifiedBlock, FinalizedState,
 };
@@ -210,18 +210,18 @@ fn spentness_rebuild_matches_ordinary_state_and_resumes_applying() {
     fixture.commit(&mut state, 5..=10);
     assert!(state.db.spentness_rebuilding());
     let fixed_utxos = entries(&state, "utxo_by_out_loc");
-    let mut cache = ReplayCache::default();
     let mut yields = 0;
     while state.db.spentness_rebuilding() {
         state
-            .rebuild_spentness_step(&mut cache, &mut || {
+            .rebuild_spentness_step(&mut || {
                 yields += 1;
                 Ok(())
             })
             .unwrap();
         assert_eq!(entries(&state, "utxo_by_out_loc"), fixed_utxos);
     }
-    assert!(yields >= 11);
+    // Three replay windows, then the final audit.
+    assert!(yields >= 4);
     assert_eq!(
         state.db.finalized_value_pool(),
         fixture.ordinary.db.finalized_value_pool()
@@ -254,15 +254,14 @@ fn spentness_rebuild_rejects_false_terminal_membership() {
     let mut state = fixture.open();
     fixture.commit(&mut state, 0..=10);
     let fixed_utxos = entries(&state, "utxo_by_out_loc");
-    let mut cache = ReplayCache::default();
     let error = loop {
-        match state.rebuild_spentness_step(&mut cache, &mut || Ok(())) {
+        match state.rebuild_spentness_step(&mut || Ok(())) {
             Ok(false) => {}
             Ok(true) => panic!("false membership must never publish completion"),
             Err(error) => break error,
         }
     };
-    assert!(error.to_string().contains("pools"), "{error}");
+    assert!(error.to_string().contains("omits outputs"), "{error}");
     assert!(state.db.spentness_rebuilding());
     assert_eq!(entries(&state, "utxo_by_out_loc"), fixed_utxos);
 }
@@ -304,11 +303,8 @@ fn spentness_reconciles_failed_batch_outcomes() {
             if next <= 10 {
                 fixture.commit(&mut state, next..=10);
             }
-            let mut cache = ReplayCache::default();
             while state.db.spentness_rebuilding() {
-                state
-                    .rebuild_spentness_step(&mut cache, &mut || Ok(()))
-                    .unwrap();
+                state.rebuild_spentness_step(&mut || Ok(())).unwrap();
             }
             assert_eq!(
                 entries(&state, "utxo_by_out_loc"),
@@ -328,16 +324,13 @@ fn spentness_rebuild_resumes_without_artifact_and_keeps_rollback_floor() {
     let mut fixture = Fixture::new(false);
     let mut state = fixture.open();
     fixture.commit(&mut state, 0..=10);
-    let mut cache = ReplayCache::default();
-    for _ in 0..6 {
-        assert!(!state
-            .rebuild_spentness_step(&mut cache, &mut || Ok(()))
-            .unwrap());
+    for _ in 0..2 {
+        assert!(!state.rebuild_spentness_step(&mut || Ok(())).unwrap());
     }
     assert!(matches!(
         state.db.spentness_progress().unwrap(),
         Some(Progress::Rebuilding {
-            indexed_height: Some(5),
+            indexed_height: Some(8),
             ..
         })
     ));
@@ -384,11 +377,8 @@ fn spentness_completed_state_opens_after_release_drops_commitment() {
     let fixture = Fixture::new(false);
     let mut state = fixture.open();
     fixture.commit(&mut state, 0..=10);
-    let mut cache = ReplayCache::default();
     while state.db.spentness_rebuilding() {
-        state
-            .rebuild_spentness_step(&mut cache, &mut || Ok(()))
-            .unwrap();
+        state.rebuild_spentness_step(&mut || Ok(())).unwrap();
     }
     drop(state);
     // The compiled Mainnet release lists no commitments.
@@ -511,11 +501,8 @@ async fn spentness_read_service_gates_partial_indexes() {
         .await
         .is_ok());
     fixture.commit(&mut state, 5..=10);
-    let mut cache = ReplayCache::default();
     while state.db.spentness_rebuilding() {
-        state
-            .rebuild_spentness_step(&mut cache, &mut || Ok(()))
-            .unwrap();
+        state.rebuild_spentness_step(&mut || Ok(())).unwrap();
     }
     assert!(reader
         .oneshot(crate::ReadRequest::AddressBalance(Default::default()))
@@ -668,11 +655,8 @@ fn spentness_generated_spends_match_all_indexes_and_validate_after_handoff() {
         .is_err());
     assert_eq!(state.db.finalized_tip_height(), Some(Height(103)));
     let fixed_utxos = entries(&state, "utxo_by_out_loc");
-    let mut cache = ReplayCache::default();
     while state.db.spentness_rebuilding() {
-        state
-            .rebuild_spentness_step(&mut cache, &mut || Ok(()))
-            .unwrap();
+        state.rebuild_spentness_step(&mut || Ok(())).unwrap();
         assert_eq!(entries(&state, "utxo_by_out_loc"), fixed_utxos);
     }
     for name in super::super::STATE_COLUMN_FAMILIES_IN_CODE {
@@ -763,18 +747,14 @@ fn spentness_audit_detects_zero_value_non_address_omission() {
     );
     let mut state = fixture.open();
     fixture.commit(&mut state, 0..=103);
-    let mut cache = ReplayCache::default();
     let error = loop {
-        match state.rebuild_spentness_step(&mut cache, &mut || Ok(())) {
+        match state.rebuild_spentness_step(&mut || Ok(())) {
             Ok(false) => {}
             Ok(true) => panic!("zero-valued non-address outputs still require exact membership"),
             Err(error) => break error,
         }
     };
-    assert!(
-        error.to_string().contains("terminal UTXO entry differs"),
-        "{error}"
-    );
+    assert!(error.to_string().contains("omits outputs"), "{error}");
 }
 
 #[test]
@@ -825,11 +805,8 @@ fn spentness_pruning_waits_for_rebuild_and_rediscovers_backlog() {
     for height in 0..=10 {
         assert!(state.db.contains_body_at_height(Height(height)));
     }
-    let mut cache = ReplayCache::default();
     while state.db.spentness_rebuilding() {
-        state
-            .rebuild_spentness_step(&mut cache, &mut || Ok(()))
-            .unwrap();
+        state.rebuild_spentness_step(&mut || Ok(())).unwrap();
     }
     assert!(state.has_checkpoint_raw_tx_archive_backlog());
     drop(state);

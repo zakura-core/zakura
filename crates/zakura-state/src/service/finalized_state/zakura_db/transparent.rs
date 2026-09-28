@@ -482,7 +482,7 @@ impl DiskWriteBatch {
 
     /// Prepare derived transparent indexes without modifying consensus UTXOs.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn prepare_transparent_indexes_batch(
+    fn prepare_transparent_indexes_batch(
         &mut self,
         zakura_db: &ZakuraDb,
         network: &Network,
@@ -497,6 +497,42 @@ impl DiskWriteBatch {
         >,
         mut address_balances: AddressBalanceLocationUpdates,
     ) {
+        self.prepare_transparent_index_entries(
+            zakura_db,
+            network,
+            block,
+            height,
+            new_outputs_by_out_loc,
+            spent_utxos_by_outpoint,
+            spent_utxos_by_out_loc,
+            #[cfg(feature = "indexer")]
+            out_loc_by_outpoint,
+            &mut address_balances,
+        );
+        self.prepare_transparent_balances_batch(&zakura_db.db, address_balances);
+    }
+
+    /// Prepare address UTXO, address transaction, and spent-output index entries,
+    /// and update `address_balances` in memory without writing it.
+    ///
+    /// `address_balances` must hold the current balance of every address that this
+    /// block spends from or pays to, if that address has one.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn prepare_transparent_index_entries(
+        &mut self,
+        zakura_db: &ZakuraDb,
+        network: &Network,
+        block: &zakura_chain::block::Block,
+        height: Height,
+        new_outputs_by_out_loc: &BTreeMap<OutputLocation, transparent::Utxo>,
+        spent_utxos_by_outpoint: &HashMap<transparent::OutPoint, transparent::Utxo>,
+        spent_utxos_by_out_loc: &BTreeMap<OutputLocation, transparent::Utxo>,
+        #[cfg(feature = "indexer")] out_loc_by_outpoint: &HashMap<
+            transparent::OutPoint,
+            OutputLocation,
+        >,
+        address_balances: &mut AddressBalanceLocationUpdates,
+    ) {
         let db = &zakura_db.db;
 
         // Update the in-memory `address_balances` transaction-by-transaction, debiting inputs
@@ -509,7 +545,7 @@ impl DiskWriteBatch {
             height,
             &block.transactions,
             spent_utxos_by_outpoint,
-            &mut address_balances,
+            address_balances,
         );
 
         // Write the new and spent transparent output index entries. These passes no longer
@@ -518,13 +554,13 @@ impl DiskWriteBatch {
             db,
             network,
             new_outputs_by_out_loc,
-            &address_balances,
+            address_balances,
         );
         self.prepare_spent_transparent_indexes_batch(
             db,
             network,
             spent_utxos_by_out_loc,
-            &address_balances,
+            address_balances,
         );
 
         // Index the transparent addresses that spent in each transaction
@@ -539,11 +575,9 @@ impl DiskWriteBatch {
                 spent_utxos_by_outpoint,
                 #[cfg(feature = "indexer")]
                 out_loc_by_outpoint,
-                &address_balances,
+                address_balances,
             );
         }
-
-        self.prepare_transparent_balances_batch(db, address_balances);
     }
 
     /// Update `address_balances` in memory for the transparent transfers in `transactions`,
@@ -632,40 +666,6 @@ impl DiskWriteBatch {
         }
     }
 
-    /// Prepare a database batch for the new UTXOs in `new_outputs_by_out_loc`.
-    ///
-    /// Adds the following changes to this batch:
-    /// - insert created UTXOs,
-    /// - insert transparent address UTXO index entries, and
-    /// - insert transparent address transaction entries,
-    ///
-    /// without actually writing anything.
-    ///
-    /// `address_balances` must already be populated for every transparent address that
-    /// receives one of these outputs (see
-    /// [`Self::prepare_transparent_address_balance_updates`]); this function only reads
-    /// `address_location()` from it.
-    ///
-    /// # Errors
-    ///
-    /// - This method doesn't currently return any errors, but it might in future
-    #[allow(clippy::unwrap_in_result)]
-    pub fn prepare_new_transparent_outputs_batch(
-        &mut self,
-        db: &DiskDb,
-        network: &Network,
-        new_outputs_by_out_loc: &BTreeMap<OutputLocation, transparent::Utxo>,
-        address_balances: &AddressBalanceLocationUpdates,
-    ) {
-        self.prepare_new_transparent_indexes_batch(
-            db,
-            network,
-            new_outputs_by_out_loc,
-            address_balances,
-        );
-        self.prepare_created_utxos(db, new_outputs_by_out_loc);
-    }
-
     /// Insert created UTXOs, without touching derived indexes.
     pub(crate) fn prepare_created_utxos(
         &mut self,
@@ -743,39 +743,6 @@ impl DiskWriteBatch {
                 self.zs_insert(&tx_loc_by_transparent_addr_loc, address_transaction, ());
             }
         }
-    }
-
-    /// Prepare a database batch for the spent outputs in `spent_utxos_by_out_loc`.
-    ///
-    /// Adds the following changes to this batch:
-    /// - delete spent UTXOs, and
-    /// - delete transparent address UTXO index entries,
-    ///
-    /// without actually writing anything.
-    ///
-    /// `address_balances` must already be populated for every transparent address that
-    /// spends one of these outputs (see
-    /// [`Self::prepare_transparent_address_balance_updates`]); this function only reads
-    /// `address_location()` from it.
-    ///
-    /// # Errors
-    ///
-    /// - This method doesn't currently return any errors, but it might in future
-    #[allow(clippy::unwrap_in_result)]
-    pub fn prepare_spent_transparent_outputs_batch(
-        &mut self,
-        db: &DiskDb,
-        network: &Network,
-        spent_utxos_by_out_loc: &BTreeMap<OutputLocation, transparent::Utxo>,
-        address_balances: &AddressBalanceLocationUpdates,
-    ) {
-        self.prepare_spent_transparent_indexes_batch(
-            db,
-            network,
-            spent_utxos_by_out_loc,
-            address_balances,
-        );
-        self.prepare_spent_utxos(db, spent_utxos_by_out_loc);
     }
 
     /// Delete address UTXO index entries for spent outputs.

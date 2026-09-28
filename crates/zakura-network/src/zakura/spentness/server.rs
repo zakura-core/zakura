@@ -1,13 +1,16 @@
-//! Serve verified artifacts with bounded aggregate concurrency and rate.
+//! Serve verified artifacts under node and per-peer byte rates.
+//!
+//! A request that would exceed either rate gets a busy reply at once. The
+//! server never delays a reply, so an idle server answers at transport speed
+//! and a waiting requester never holds a stream open.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     ops::Range,
-    sync::{Arc, RwLock, RwLockReadGuard},
-    time::Duration,
+    sync::{Arc, Mutex, RwLock, RwLockReadGuard},
 };
 
-use tokio::{sync::Semaphore, time::sleep};
+use tokio::time::Instant;
 use zakura_chain::parameters::spentness_hints::VerifiedArtifact;
 
 use super::{
@@ -19,20 +22,20 @@ use crate::zakura::{
     ZakuraPeerId, FRAME_HEADER_BYTES,
 };
 
-/// Range preparations that may run at once across all peers.
-pub(super) const MAX_CONCURRENT_SERVES: usize = 4;
-/// Each successful preparation holds its slot this long.
+/// Artifact bytes this node serves per second across all peers (8 MiB/s).
+const NODE_BYTES_PER_SECOND: u64 = 8 * 1024 * 1024;
+/// Artifact bytes this node serves per second to one peer (2 MiB/s).
 ///
-/// Four slots, each at most 256 KiB per 250 ms, limit aggregate data to 4 MiB/s.
-const SERVE_DELAY: Duration = Duration::from_millis(250);
+/// One peer can take at most a quarter of the node rate.
+const PEER_BYTES_PER_SECOND: u64 = 2 * 1024 * 1024;
 
 type ArtifactMap = BTreeMap<[u8; DIGEST_LEN], Arc<VerifiedArtifact>>;
 
-/// Immutable verified artifacts with bounded aggregate serving concurrency and rate.
+/// Immutable verified artifacts served under node and per-peer byte rates.
 #[derive(Debug)]
 pub struct ArtifactService {
     artifacts: RwLock<ArtifactMap>,
-    pub(super) serving: Semaphore,
+    rate: Mutex<ServeRate>,
 }
 
 impl ArtifactService {
@@ -44,7 +47,7 @@ impl ArtifactService {
             .collect();
         Self {
             artifacts: RwLock::new(artifacts),
-            serving: Semaphore::new(MAX_CONCURRENT_SERVES),
+            rate: Mutex::new(ServeRate::new(Instant::now())),
         }
     }
 
@@ -79,14 +82,16 @@ impl ArtifactService {
             .expect("artifact map lock is not poisoned because no holder panics")
     }
 
-    /// Answer one range request.
+    /// Answer one range request from `peer`.
     ///
     /// Busy, missing, or oversized responses are availability failures, not peer faults.
     /// A bounded request past the artifact end is also an availability failure.
-    async fn serve(&self, request: RangeRequest, response_cap: usize) -> Result<Frame, SinkReject> {
-        let Ok(_permit) = self.serving.try_acquire() else {
-            return Ok(RangeResponse::busy(request));
-        };
+    fn serve(
+        &self,
+        peer: &ZakuraPeerId,
+        request: RangeRequest,
+        response_cap: usize,
+    ) -> Result<Frame, SinkReject> {
         let Some(artifact) = self.get(&request.digest) else {
             return Ok(RangeResponse::unavailable(request));
         };
@@ -96,10 +101,95 @@ impl ArtifactService {
         if RESPONSE_HEADER_LEN + range.len() > response_cap {
             return Ok(RangeResponse::too_large(request));
         }
+        let admitted = self
+            .rate
+            .lock()
+            .expect("serve rate lock is not poisoned because no holder panics")
+            .try_take(peer, u64::from(request.length), Instant::now());
+        if !admitted {
+            return Ok(RangeResponse::busy(request));
+        }
+        Ok(RangeResponse::available(request, &artifact.bytes()[range]))
+    }
+}
 
-        let response = RangeResponse::available(request, &artifact.bytes()[range]);
-        sleep(SERVE_DELAY).await;
-        Ok(response)
+/// Byte buckets for the node and for each recently served peer.
+///
+/// A full peer bucket is equivalent to no entry, so the map keeps only peers
+/// served within the last second.
+#[derive(Debug)]
+struct ServeRate {
+    node: ByteBucket,
+    peers: HashMap<ZakuraPeerId, ByteBucket>,
+}
+
+impl ServeRate {
+    fn new(now: Instant) -> Self {
+        Self {
+            node: ByteBucket::full(NODE_BYTES_PER_SECOND, now),
+            peers: HashMap::new(),
+        }
+    }
+
+    /// Take `bytes` from the node and peer buckets, or take nothing.
+    fn try_take(&mut self, peer: &ZakuraPeerId, bytes: u64, now: Instant) -> bool {
+        self.node.refill(now);
+        if !self.peers.contains_key(peer) {
+            self.peers.retain(|_, bucket| {
+                bucket.refill(now);
+                !bucket.is_full()
+            });
+        }
+        let peer_bucket = self
+            .peers
+            .entry(peer.clone())
+            .or_insert_with(|| ByteBucket::full(PEER_BYTES_PER_SECOND, now));
+        peer_bucket.refill(now);
+        if self.node.tokens < bytes || peer_bucket.tokens < bytes {
+            return false;
+        }
+        self.node.tokens -= bytes;
+        peer_bucket.tokens -= bytes;
+        true
+    }
+}
+
+/// A token bucket over bytes that holds at most one second of its rate.
+#[derive(Debug)]
+struct ByteBucket {
+    bytes_per_second: u64,
+    tokens: u64,
+    refilled: Instant,
+}
+
+impl ByteBucket {
+    fn full(bytes_per_second: u64, now: Instant) -> Self {
+        Self {
+            bytes_per_second,
+            tokens: bytes_per_second,
+            refilled: now,
+        }
+    }
+
+    fn is_full(&self) -> bool {
+        self.tokens == self.bytes_per_second
+    }
+
+    fn refill(&mut self, now: Instant) {
+        let elapsed = now.saturating_duration_since(self.refilled);
+        let earned = elapsed
+            .as_nanos()
+            .saturating_mul(u128::from(self.bytes_per_second))
+            / 1_000_000_000;
+        if earned == 0 {
+            return;
+        }
+        let earned = u64::try_from(earned).unwrap_or(u64::MAX);
+        self.tokens = self
+            .tokens
+            .saturating_add(earned)
+            .min(self.bytes_per_second);
+        self.refilled = now;
     }
 }
 
@@ -147,7 +237,7 @@ impl Service for ArtifactService {
 impl RequestResponseService for ArtifactService {
     fn request_frame<'a>(
         &'a self,
-        _peer: ZakuraPeerId,
+        peer: ZakuraPeerId,
         _kind: u16,
         _id: u64,
         max_frame: u32,
@@ -157,23 +247,28 @@ impl RequestResponseService for ArtifactService {
         Box::pin(async move {
             let request = RangeRequest::parse(&frame).map_err(SinkReject::protocol)?;
             let response_cap = response_capacity(max_frame, max_message)?;
-            Ok(vec![self.serve(request, response_cap).await?])
+            Ok(vec![self.serve(&peer, request, response_cap)?])
         })
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use zakura_chain::parameters::spentness_hints::{encode, ParsedArtifact};
 
     use super::*;
     use crate::{
-        zakura::spentness::{wire::GET_RANGE, FRAME_CAP, STREAM_KIND},
+        zakura::spentness::{
+            wire::{GET_RANGE, RANGE_BYTES},
+            FRAME_CAP, STREAM_KIND,
+        },
         BoxError,
     };
 
     #[tokio::test]
-    async fn serving_bounds_and_busy_are_nonfatal() -> Result<(), BoxError> {
+    async fn serving_bounds_are_nonfatal() -> Result<(), BoxError> {
         let bytes = encode([1; 32], 1, [2; 32], [false, true])?;
         let parsed = ParsedArtifact::read(bytes.as_slice())?;
         let commitment = parsed.commitment().clone();
@@ -192,18 +287,6 @@ mod tests {
         let call = |max_frame, max_message, frame| {
             service.request_frame(peer.clone(), STREAM_KIND, 0, max_frame, max_message, frame)
         };
-
-        // Every serving slot is busy.
-        let permit = service
-            .serving
-            .acquire_many(u32::try_from(MAX_CONCURRENT_SERVES)?)
-            .await?;
-        let response = call(FRAME_CAP, FRAME_CAP, request_frame(request)).await?;
-        assert!(matches!(
-            RangeResponse::parse(&response[0])?,
-            RangeResponse::Busy(_)
-        ));
-        drop(permit);
 
         // A bounded range past the artifact end does not blame the peer.
         let past_end = RangeRequest {
@@ -228,6 +311,89 @@ mod tests {
             RangeResponse::parse(&response[0])?,
             RangeResponse::TooLarge(_)
         ));
+        Ok(())
+    }
+
+    /// Status of one full-range request from `peer`.
+    fn status(
+        service: &ArtifactService,
+        peer: u8,
+        digest: [u8; DIGEST_LEN],
+    ) -> Result<&'static str, BoxError> {
+        let request = RangeRequest {
+            digest,
+            offset: 0,
+            length: RANGE_BYTES,
+        };
+        let frame = service.serve(
+            &ZakuraPeerId::new(vec![peer; 32])?,
+            request,
+            RESPONSE_HEADER_LEN + usize::try_from(RANGE_BYTES)?,
+        )?;
+        Ok(match RangeResponse::parse(&frame)? {
+            RangeResponse::Available { .. } => "available",
+            RangeResponse::Busy(_) => "busy",
+            _ => "other",
+        })
+    }
+
+    fn full_range_service() -> Result<(ArtifactService, [u8; DIGEST_LEN]), BoxError> {
+        let bytes = encode(
+            [1; 32],
+            1,
+            [2; 32],
+            (0..u64::from(RANGE_BYTES) * 8).map(|_| false),
+        )?;
+        let parsed = ParsedArtifact::read(bytes.as_slice())?;
+        let commitment = parsed.commitment().clone();
+        let digest = commitment.sha256;
+        Ok((
+            ArtifactService::new([Arc::new(parsed.verify(&commitment)?)]),
+            digest,
+        ))
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn one_peer_cannot_take_the_node_rate() -> Result<(), BoxError> {
+        let (service, digest) = full_range_service()?;
+        let ranges_per_peer = PEER_BYTES_PER_SECOND / u64::from(RANGE_BYTES);
+
+        // An idle node serves a peer's full burst at once, then answers busy.
+        for _ in 0..ranges_per_peer {
+            assert_eq!(status(&service, 1, digest)?, "available");
+        }
+        assert_eq!(status(&service, 1, digest)?, "busy");
+
+        // Another peer still gets its share while the first waits.
+        assert_eq!(status(&service, 2, digest)?, "available");
+
+        // The first peer's bucket refills at its own rate.
+        tokio::time::advance(Duration::from_secs(1) / u32::try_from(ranges_per_peer)?).await;
+        assert_eq!(status(&service, 1, digest)?, "available");
+        assert_eq!(status(&service, 1, digest)?, "busy");
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_node_rate_bounds_all_peers() -> Result<(), BoxError> {
+        let (service, digest) = full_range_service()?;
+        let mut served = 0;
+        let mut peer = 0;
+        loop {
+            peer += 1;
+            if status(&service, peer, digest)? == "busy" {
+                break;
+            }
+            served += u64::from(RANGE_BYTES);
+            while status(&service, peer, digest)? == "available" {
+                served += u64::from(RANGE_BYTES);
+            }
+        }
+        assert_eq!(served, NODE_BYTES_PER_SECOND);
+
+        // The node bucket refills, and the busy replies charged nothing.
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert_eq!(status(&service, peer, digest)?, "available");
         Ok(())
     }
 }

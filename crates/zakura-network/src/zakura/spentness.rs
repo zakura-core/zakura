@@ -1,7 +1,7 @@
 //! Bounded peer transfer of whole-file authenticated spentness artifacts.
 //!
 //! - `wire`: range request and response encoding.
-//! - `server`: serving verified artifacts under a shared rate limit.
+//! - `server`: serving verified artifacts under node and per-peer byte rates.
 //! - `cache`: content-addressed files that are reverified on every load.
 //! - `download`: resumable single-source acquisition with whole-file verification.
 //!

@@ -688,7 +688,7 @@ proptest! {
             prop_assert_eq!(response.best_block_hash, genesis_block.header.hash());
             prop_assert_eq!(response.chain, network.bip70_network_name());
             prop_assert_eq!(response.blocks, Height::MIN);
-            prop_assert_eq!(response.value_pools, GetBlockchainInfoBalance::value_pools(ValueBalance::zero(), None));
+            prop_assert_eq!(response.value_pools, Some(GetBlockchainInfoBalance::value_pools(ValueBalance::zero(), None)));
 
             let genesis_branch_id = NetworkUpgrade::current(&network, Height::MIN).branch_id().unwrap_or(ConsensusBranchId::RPC_MISSING_ID);
             let next_height = (Height::MIN + 1).expect("genesis height plus one is next height and valid");
@@ -705,6 +705,87 @@ proptest! {
                 };
                 prop_assert_eq!(upgrade_info.status, status);
             }
+
+            mempool.expect_no_requests().await?;
+            state.expect_no_requests().await?;
+
+            // The queue task should continue without errors or panics
+            prop_assert!(mempool_tx_queue.now_or_never().is_none());
+
+            Ok(())
+        })?;
+    }
+
+    /// While spentness construction gates value pools, `getblockchaininfo` reports the real tip
+    /// and omits the value pools.
+    #[test]
+    fn get_blockchain_info_reports_the_tip_without_value_pools_during_construction(
+        network in any::<Network>(),
+    ) {
+        let (runtime, _init_guard) = zakura_test::init_async();
+        let _guard = runtime.enter();
+        let (chain_tip, chain_tip_sender) = MockChainTip::new();
+        let tip_height = Height(1_000);
+        let tip_hash = block::Hash([7; 32]);
+        chain_tip_sender.send_best_tip_height(tip_height);
+        chain_tip_sender.send_best_tip_hash(tip_hash);
+        let (mut mempool, mut state, rpc, mempool_tx_queue) =
+            mock_services(network.clone(), chain_tip);
+
+        // CORRECTNESS: Nothing in this test depends on real time, so we can speed it up.
+        tokio::time::pause();
+
+        runtime.block_on(async move {
+            let response_fut = rpc.get_blockchain_info();
+            let mock_state_handler = {
+                let mut state = state.clone();
+                async move {
+                    state
+                        .expect_request(zakura_state::ReadRequest::UsageInfo)
+                        .await
+                        .expect("getblockchaininfo should read disk usage")
+                        .respond(zakura_state::ReadResponse::UsageInfo(0));
+
+                    state
+                        .expect_request(zakura_state::ReadRequest::PruningInfo)
+                        .await
+                        .expect("getblockchaininfo should read pruning information")
+                        .respond(zakura_state::ReadResponse::PruningInfo {
+                            pruned: false,
+                            prune_height: None,
+                        });
+
+                    state
+                        .expect_request(zakura_state::ReadRequest::TipPoolValues)
+                        .await
+                        .expect("getblockchaininfo should read tip pool values")
+                        .respond(Err(BoxError::from(zakura_state::SpentnessError::Unavailable)));
+
+                    state
+                        .expect_request(zakura_state::ReadRequest::HeaderChainSnapshot)
+                        .await
+                        .expect("getblockchaininfo should read the authoritative header snapshot")
+                        .respond(zakura_state::ReadResponse::HeaderChainSnapshot(None));
+
+                    state
+                        .expect_request(zakura_state::ReadRequest::ChainInfo)
+                        .await
+                        .expect("getblockchaininfo should read chain information")
+                        .respond(Err(BoxError::from(zakura_state::SpentnessError::Unavailable)));
+                }
+            };
+
+            let (response, _) = tokio::join!(response_fut, mock_state_handler);
+            let response = response.expect("construction gates do not fail getblockchaininfo");
+
+            prop_assert_eq!(response.blocks, tip_height);
+            prop_assert_eq!(response.best_block_hash, tip_hash);
+            prop_assert_eq!(response.chain_supply(), &None);
+            prop_assert_eq!(response.value_pools(), &None);
+            prop_assert_eq!(response.nsm_value_balance_zat(), None);
+            let json = serde_json::to_value(&response).expect("response serializes");
+            prop_assert!(json.get("chainSupply").is_none());
+            prop_assert!(json.get("valuePools").is_none());
 
             mempool.expect_no_requests().await?;
             state.expect_no_requests().await?;

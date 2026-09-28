@@ -172,8 +172,10 @@ fn test_get_blockchain_info() -> Result<(), Box<dyn std::error::Error>> {
         blocks,
         best_block_hash,
         estimated_height,
-        chain_supply.clone(),
-        value_pools.clone(),
+        chain_supply
+            .clone()
+            .expect("the vector reports value pools"),
+        value_pools.clone().expect("the vector reports value pools"),
         upgrades.clone(),
         consensus,
         headers,
@@ -235,7 +237,10 @@ fn test_get_blockchain_info_accepts_legacy_value_pools() -> Result<(), Box<dyn s
     remove_ironwood_value_pool(&mut json);
 
     let obj: GetBlockchainInfoResponse = serde_json::from_value(json)?;
-    let value_pools = obj.value_pools();
+    let value_pools = obj
+        .value_pools()
+        .as_ref()
+        .expect("the vector reports value pools");
 
     assert_eq!(value_pools.len(), 6);
     assert_eq!(value_pools[4].id().as_str(), "deferred");
@@ -1674,7 +1679,11 @@ fn test_nsm_value_balance_is_reported_outside_the_monetary_totals(
     assert_eq!(with_nsm.value_pools(), obj.value_pools());
 
     // And it is not smuggled in as an extra pool.
-    assert!(with_nsm.value_pools().iter().all(|pool| pool.id() != "nsm"));
+    assert!(with_nsm
+        .value_pools()
+        .iter()
+        .flatten()
+        .all(|pool| pool.id() != "nsm"));
 
     Ok(())
 }

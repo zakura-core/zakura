@@ -122,6 +122,9 @@ main() {
     export RELEASE_STATE_PUBLIC_BASE="$PUBLIC_BASE"
     export RELEASE_STATE_LOCK_FILE=/run/zakura-release-state-publish.lock
     export ZAKURA_CHECKPOINTS_BIN="$INSTALL_ROOT/bin/zakura-checkpoints"
+    export ZAKURA_SPENTNESS_BIN="$INSTALL_ROOT/bin/zakura-spentness"
+    export RELEASE_STATE_GENERATOR_REVISION
+    RELEASE_STATE_GENERATOR_REVISION=$(cat "$INSTALL_ROOT/EXPORTER_REVISION")
 
     exec "$INSTALL_ROOT/bin/publish-release-state.sh" "$state_dir"
 }

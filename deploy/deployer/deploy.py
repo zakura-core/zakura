@@ -15,14 +15,12 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
-import json
 import os
 import re
 import shlex
 import shutil
 import subprocess
 import sys
-import tempfile
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
@@ -34,6 +32,10 @@ BUILD_CACHE_DIR_ENV = "ZAKURA_DEPLOYER_BUILD_CACHE_DIR"
 BUILD_CACHE_RETAIN_ENV = "ZAKURA_DEPLOYER_BUILD_CACHE_RETAIN"
 DEFAULT_BUILD_CACHE_RETAIN = 12
 DATA_MOUNT = Path("/mnt/data")
+# Release-state helpers that an archive publisher installs at its node's commit.
+PUBLISHER_BINARIES = ("zakura-checkpoints", "zakura-spentness")
+# Covers both host locks, the node restart and settle window, and publication start.
+PAIRED_DEPLOY_TIMEOUT_SECS = 3600
 
 # ssh/scp options shared by every remote call. BatchMode avoids interactive
 # password prompts hanging a parallel deploy; accept-new pins unknown host keys
@@ -376,15 +378,25 @@ def binary_is_runnable(binary: Path) -> bool:
         return False
 
 
+def publisher_binaries(sha: str) -> dict[str, Path]:
+    """The cached release-state helpers that a publisher installs, by name."""
+    return {name: cached_binary(sha, name) for name in PUBLISHER_BINARIES}
+
+
 def build_commit(root: Path, sha: str, *, force: bool = False, exporter: bool = False) -> Path:
-    """Build one binary at an exact commit, with a separate cache for the exporter."""
-    binary = "zakura-checkpoints" if exporter else "zakurad"
+    """Build at an exact commit, with a separate cache for the exporter.
+
+    An exporter build also builds and caches `zakura-spentness` at the same commit.
+    """
+    binaries = PUBLISHER_BINARIES if exporter else ("zakurad",)
+    binary = binaries[0]
     cache_dir = build_cache_dir()
     ensure_data_mount_for_path(cache_dir, purpose="build cache")
     cache_dir.mkdir(parents=True, exist_ok=True)
-    target = cached_binary(sha, binary)
-    if target.exists() and not force:
-        if binary_is_runnable(target):
+    targets = [cached_binary(sha, name) for name in binaries]
+    target = targets[0]
+    if all(path.exists() for path in targets) and not force:
+        if all(binary_is_runnable(path) for path in targets):
             print(f"[build] reusing cached binary for {sha[:9]} -> {target.name}")
             return target
         print(f"[build] cached binary for {sha[:9]} is corrupt, rebuilding")
@@ -398,22 +410,24 @@ def build_commit(root: Path, sha: str, *, force: bool = False, exporter: bool = 
     print(f"[build] checking out {sha[:9]} into {work.name}")
     run(["git", "worktree", "add", "--detach", str(work), sha], cwd=root)
     try:
-        package_args = (["-p", "zakura-utils", "--features", "zakura-checkpoints-offline",
-                         "--bin", "zakura-checkpoints"] if exporter else ["-p", "zakura"])
-        print(f"[build] {binary} ({sha[:9]}) ...")
+        package_args = (["-p", "zakura-utils", "--features", "zakura-spentness",
+                         *(arg for name in binaries for arg in ("--bin", name))]
+                        if exporter else ["-p", "zakura"])
+        print(f"[build] {', '.join(binaries)} ({sha[:9]}) ...")
         run(["cargo", "build", "--release", "--locked", *package_args], cwd=work)
         # Respect CARGO_TARGET_DIR (set per-worktree or shared) when locating the
         # output, falling back to the in-worktree target dir.
         target_dir = os.environ.get("CARGO_TARGET_DIR")
-        built = (Path(target_dir) if target_dir else work / "target") / "release" / binary
-        if not built.is_file():
-            raise DeployError(f"expected binary not found after build: {built}")
-        tmp = target.with_suffix(".tmp")
-        shutil.copy2(built, tmp)
-        os.chmod(tmp, 0o755)
-        tmp.replace(target)
-        print(f"[build] cached -> {target}")
-        prune_cached_binaries(cache_dir, sha, binary)
+        for name, cached in zip(binaries, targets):
+            built = (Path(target_dir) if target_dir else work / "target") / "release" / name
+            if not built.is_file():
+                raise DeployError(f"expected binary not found after build: {built}")
+            tmp = cached.with_suffix(".tmp")
+            shutil.copy2(built, tmp)
+            os.chmod(tmp, 0o755)
+            tmp.replace(cached)
+            print(f"[build] cached -> {cached}")
+            prune_cached_binaries(cache_dir, sha, name)
     finally:
         run(["git", "worktree", "remove", "--force", str(work)], cwd=root, check=False)
         shutil.rmtree(work, ignore_errors=True)
@@ -831,8 +845,8 @@ def ssh_capture_script(node: Node, script: str) -> subprocess.CompletedProcess:
 # Commands
 # --------------------------------------------------------------------------- #
 
-def build_publishers(nodes: list[Node], *, force: bool = False) -> dict[str, Path]:
-    """Build exporters from the already resolved node commits before remote changes."""
+def build_publishers(nodes: list[Node], *, force: bool = False) -> dict[str, dict[str, Path]]:
+    """Build publisher helpers from the already resolved node commits before remote changes."""
     publishers = [node for node in nodes if node.release_state_publisher]
     if not publishers:
         return {}
@@ -842,12 +856,18 @@ def build_publishers(nodes: list[Node], *, force: bool = False) -> dict[str, Pat
         if run(["git", "merge-base", "--is-ancestor", sha, "origin/main"],
                cwd=root, check=False).returncode:
             raise DeployError(f"refusing release-state exporter {sha}: not an ancestor of origin/main")
-    return {sha: build_commit(root, sha, force=force, exporter=True)
-            for sha in dict.fromkeys(node.sha for node in publishers)}
+    built = {}
+    for sha in dict.fromkeys(node.sha for node in publishers):
+        build_commit(root, sha, force=force, exporter=True)
+        built[sha] = publisher_binaries(sha)
+    return built
 
 
-def deploy_publisher(node: Node, binary: Path, exporter: Path) -> None:
-    """Install a matched pair and require a successful, publicly readable publication."""
+def deploy_publisher(node: Node, binary: Path, helpers: dict[str, Path]) -> None:
+    """Install the node and publisher helpers at one commit, then start a publication.
+
+    A publication can run for days, so the deployment checks only that it started.
+    """
     script = (SCRIPT_DIR.parent / "release-state" / "deploy-archive-pair.sh").read_text()
     # The per-deploy directory keeps overlapping invocations' staged files separate.
     # The remote script serializes installation and publication.
@@ -856,27 +876,18 @@ def deploy_publisher(node: Node, binary: Path, exporter: Path) -> None:
         raise DeployError("unexpected remote staging directory")
     try:
         run(node.scp_to(str(binary), f"{stage}/zakurad"), capture=True)
-        run(node.scp_to(str(exporter), f"{stage}/zakura-checkpoints"), capture=True)
+        for name in PUBLISHER_BINARIES:
+            run(node.scp_to(str(helpers[name]), f"{stage}/{name}"), capture=True)
         command = " ".join(shlex.quote(value) for value in (
             "bash", "-s", "--", stage, node.bin_path, node.service_name, node.sha,
         ))
         try:
-            proc = subprocess.run(node.ssh_cmd(command), input=script, text=True, timeout=9 * 3600)
+            proc = subprocess.run(node.ssh_cmd(command), input=script, text=True,
+                                  timeout=PAIRED_DEPLOY_TIMEOUT_SECS)
         except subprocess.TimeoutExpired as exc:
             raise DeployError("paired deployment timed out; inspect host state before retrying") from exc
         if proc.returncode:
-            raise DeployError(f"paired deployment/publication failed (rc={proc.returncode})")
-        expected_height = run(node.ssh_cmd(f"cat {shlex.quote(stage + '/published-height')}"),
-                              capture=True).stdout.strip()
-        if not expected_height.isdecimal():
-            raise DeployError("publication did not report its checkpoint height")
-        with tempfile.TemporaryDirectory(prefix="zakura-release-check-") as tmp:
-            run([sys.executable, str(SCRIPT_DIR.parents[1] / ".github/scripts/fetch-release-state.py"),
-                 "--latest-url", "https://zakura-release.valargroup.dev/release-state/latest.json",
-                 "--output-dir", f"{tmp}/bundle", "--metadata-out", f"{tmp}/resolution.json"])
-            resolution = json.loads(Path(tmp, "resolution.json").read_text())
-            if resolution["height"] != int(expected_height):
-                raise DeployError("public release-state pointer does not match the completed publication")
+            raise DeployError(f"paired deployment or publication start failed (rc={proc.returncode})")
     finally:
         run(node.ssh_cmd(f"rm -rf -- {shlex.quote(stage)}"), capture=True, check=False)
 
@@ -902,7 +913,7 @@ def cmd_deploy(args) -> int:
         try:
             if node.release_state_publisher:
                 deploy_publisher(node, binary, exporters[node.sha])
-                return (node.name, True, f"deployed node and exporter {node.sha[:9]}, publication verified")
+                return (node.name, True, f"deployed node and publisher helpers {node.sha[:9]}, publication started")
             if node.deploy_kind not in ("systemd", "process", "docker"):
                 return (node.name, False, f"unknown deploy_kind: {node.deploy_kind}")
 

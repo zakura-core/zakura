@@ -8316,6 +8316,7 @@ dependencies = [
  "color-eyre",
  "hex",
  "itertools 0.14.0",
+ "rocksdb",
  "serde_json",
  "tempfile",
  "thiserror 2.0.18",
@@ -8326,6 +8327,7 @@ dependencies = [
  "zakura-node-services",
  "zakura-primitives",
  "zakura-state",
+ "zakura-test",
 ]
 
 [[package]]

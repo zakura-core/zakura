@@ -60,18 +60,18 @@ use crate::{
         AuthenticatedPeerRegistration, BlockSyncAction, BlockSyncFrontiers, BlockSyncHandle,
         BlockSyncService, BlockSyncStartup, BoxRunFuture, Clock, CloseCause, Frame, FrameFilter,
         FrameRejection, FramedRecv, FramedSend, FullStateFrontiers, HeaderSyncPassthroughService,
-        HeaderSyncService, HeaderSyncStartup, InboundReader, MessageRule, Peer, RealClock, Service,
-        ServicePeerDirection, ServiceRegistry, ServiceStream, SessionDemand, SessionOpening,
-        SessionPolicy, SinkReject, Stream, StreamMode, StreamPrelude, StreamQueueDepths,
-        StreamWritePolicy, ZakuraAcceptedLimits, ZakuraBlockSyncConfig, ZakuraConnId,
-        ZakuraControlAck, ZakuraControlHello, ZakuraControlRole, ZakuraControlValidation,
-        ZakuraHandshakeConfig, ZakuraHandshakePath, ZakuraHeaderSyncConfig, ZakuraInitialLimits,
-        ZakuraLimits, ZakuraPeerId, ZakuraPeerSupervisor, ZakuraProtocolError, ZakuraRejectReason,
-        ZakuraServiceId, ZakuraUpgradeDialStart, CONTROL_ACK_MAGIC, CONTROL_HELLO_MAGIC,
-        CONTROL_VERSION, FRAME_HEADER_BYTES, MAX_CONTROL_PAYLOAD_BYTES, P2P_V2_ALPN,
-        STREAM_PRELUDE_MAGIC, TRANSCRIPT_HASH_BYTES, ZAKURA_CAP_HEADER_SYNC,
-        ZAKURA_HEADER_SYNC_STREAM_VERSION, ZAKURA_PROTOCOL_VERSION_CURRENT,
-        ZAKURA_STREAM_BLOCK_SYNC, ZAKURA_STREAM_HEADER_SYNC,
+        HeaderSyncService, HeaderSyncStartup, InboundReader, MessageRole, MessageRule, Peer,
+        RealClock, Service, ServicePeerDirection, ServiceRegistry, ServiceStream, SessionDemand,
+        SessionOpening, SessionPolicy, SinkReject, Stream, StreamMode, StreamPrelude,
+        StreamQueueDepths, StreamWritePolicy, ZakuraAcceptedLimits, ZakuraBlockSyncConfig,
+        ZakuraConnId, ZakuraControlAck, ZakuraControlHello, ZakuraControlRole,
+        ZakuraControlValidation, ZakuraHandshakeConfig, ZakuraHandshakePath,
+        ZakuraHeaderSyncConfig, ZakuraInitialLimits, ZakuraLimits, ZakuraPeerId,
+        ZakuraPeerSupervisor, ZakuraProtocolError, ZakuraRejectReason, ZakuraServiceId,
+        ZakuraUpgradeDialStart, CONTROL_ACK_MAGIC, CONTROL_HELLO_MAGIC, CONTROL_VERSION,
+        FRAME_HEADER_BYTES, MAX_CONTROL_PAYLOAD_BYTES, P2P_V2_ALPN, STREAM_PRELUDE_MAGIC,
+        TRANSCRIPT_HASH_BYTES, ZAKURA_CAP_HEADER_SYNC, ZAKURA_HEADER_SYNC_STREAM_VERSION,
+        ZAKURA_PROTOCOL_VERSION_CURRENT, ZAKURA_STREAM_BLOCK_SYNC, ZAKURA_STREAM_HEADER_SYNC,
     },
 };
 
@@ -1060,6 +1060,7 @@ struct ZakuraPeerConnectionEntry {
     disconnect_token: CancellationToken,
     registered_at: Instant,
     remote_ip: Option<IpAddr>,
+    accepted_capabilities: u64,
 }
 
 impl ZakuraSupervisorState {
@@ -1215,10 +1216,19 @@ impl ZakuraSupervisorHandle {
 
     /// Returns queue-backed handles for peers currently able to accept outbound work.
     pub async fn outbound_peer_handles(&self) -> Vec<ZakuraPeerHandle> {
+        self.outbound_peer_handles_for_capability(0).await
+    }
+
+    /// Return available peers that negotiated every bit in `capability`.
+    pub async fn outbound_peer_handles_for_capability(
+        &self,
+        capability: u64,
+    ) -> Vec<ZakuraPeerHandle> {
         let state = self.inner.lock().await;
         state
             .active_by_peer
             .values()
+            .filter(|entry| entry.accepted_capabilities & capability == capability)
             .map(|entry| &entry.outbound_handle)
             .filter(|handle| handle.has_outbound_capacity())
             .cloned()
@@ -1228,6 +1238,11 @@ impl ZakuraSupervisorHandle {
     /// Subscribe to peer-set changes for event-driven tests and diagnostics.
     pub fn subscribe(&self) -> watch::Receiver<Vec<ZakuraPeerId>> {
         self.peer_set_tx.subscribe()
+    }
+
+    /// Cancellation shared by endpoint-owned background acquisition tasks.
+    pub(crate) fn shutdown_token(&self) -> CancellationToken {
+        self.shutdown.clone()
     }
 
     /// Start an atomic wait for the next connection generation of `peer_id`.
@@ -1289,7 +1304,7 @@ impl ZakuraSupervisorHandle {
         transcript_hash: [u8; TRANSCRIPT_HASH_BYTES],
         outbound_handle: ZakuraPeerHandle,
         disconnect_token: CancellationToken,
-        _accepted_capabilities: u64,
+        accepted_capabilities: u64,
     ) -> ZakuraRegistration {
         let remote_ip = remote_ip.map(canonical_ip);
         let mut state = self.inner.lock().await;
@@ -1340,6 +1355,7 @@ impl ZakuraSupervisorHandle {
                     disconnect_token,
                     registered_at: Instant::now(),
                     remote_ip,
+                    accepted_capabilities,
                 };
                 if let Some(old_entry) = state.active_by_peer.insert(peer_id.clone(), entry) {
                     state.decrement_ip(old_entry.remote_ip);
@@ -4834,6 +4850,135 @@ async fn write_outbound_request_frame(
     .map_err(|_| OutboundRequestError::Local("Zakura outbound request/response timed out".into()))?
 }
 
+#[derive(Debug)]
+enum OutboundResponseReadState {
+    Legacy(LegacyResponseReadState),
+    Declared(DeclaredResponseReadState),
+}
+
+impl OutboundResponseReadState {
+    /// Streams without a message table carry legacy requests.
+    fn for_request(
+        stream: Stream,
+        message_type: u16,
+        payload: &[u8],
+        limits: ZakuraConnectionLimits,
+    ) -> Result<Self, OutboundRequestError> {
+        if let Some(rules) = stream.messages {
+            return Ok(Self::Declared(DeclaredResponseReadState::new(
+                rules,
+                message_type,
+                limits,
+            )));
+        }
+        Ok(Self::Legacy(LegacyResponseReadState::new(
+            LegacyResponseBudget::from_request(message_type, payload, limits)?,
+        )))
+    }
+
+    fn validate_frame(
+        &mut self,
+        request_id: u64,
+        frame: &Frame,
+    ) -> Result<(), OutboundRequestError> {
+        match self {
+            Self::Legacy(state) => state.validate_frame(request_id, frame),
+            Self::Declared(state) => state.validate_frame(frame),
+        }
+    }
+
+    fn finish(self) -> Result<(), OutboundRequestError> {
+        match self {
+            Self::Legacy(state) => state.finish(),
+            Self::Declared(state) => state.finish(),
+        }
+    }
+}
+
+impl super::regulation::ResponsePrecheck for OutboundResponseReadState {
+    fn check(&self, message_type: u16, payload_len: usize) -> Result<(), FrameRejection> {
+        match self {
+            Self::Legacy(state) => state.check(message_type, payload_len),
+            Self::Declared(state) => state.check(message_type, payload_len),
+        }
+    }
+}
+
+/// A one-shot exchange on a stream that declares its messages.
+///
+/// The stream's frame filter already checks each response's type, flags, and
+/// length bounds. This state admits responses that answer the sent request:
+/// any number of parts, then exactly one ending message. The exchange's frames
+/// fit one message: each frame charges its payload and header against
+/// `max_message_bytes` plus one frame header. The service checks the content.
+#[derive(Debug)]
+struct DeclaredResponseReadState {
+    rules: &'static [MessageRule],
+    request: u16,
+    remaining_bytes: usize,
+    ended: bool,
+}
+
+impl DeclaredResponseReadState {
+    fn new(rules: &'static [MessageRule], request: u16, limits: ZakuraConnectionLimits) -> Self {
+        let max_message = usize::try_from(limits.max_message_bytes).unwrap_or(usize::MAX);
+        Self {
+            rules,
+            request,
+            remaining_bytes: max_message.saturating_add(FRAME_HEADER_BYTES),
+            ended: false,
+        }
+    }
+
+    /// Return whether a response of `message_type` ends the exchange.
+    fn admit(&self, message_type: u16, payload_len: usize) -> Result<bool, FrameRejection> {
+        if self.ended {
+            return Err(FrameRejection::Unsolicited);
+        }
+        let Some(MessageRole::Response {
+            request,
+            ends_exchange,
+        }) = MessageRule::find(self.rules, message_type).map(|rule| rule.role)
+        else {
+            return Err(FrameRejection::Unsolicited);
+        };
+        if request != self.request {
+            return Err(FrameRejection::Unsolicited);
+        }
+        if payload_len.saturating_add(FRAME_HEADER_BYTES) > self.remaining_bytes {
+            return Err(FrameRejection::AboveReservation {
+                // The budget is at most a u32 message cap plus a frame header.
+                bytes: self.remaining_bytes.saturating_sub(FRAME_HEADER_BYTES) as u64,
+            });
+        }
+        Ok(ends_exchange)
+    }
+
+    fn validate_frame(&mut self, frame: &Frame) -> Result<(), OutboundRequestError> {
+        let ends_exchange = self
+            .admit(frame.message_type, frame.payload.len())
+            .map_err(|rejection| OutboundRequestError::Fatal(rejection.into()))?;
+        self.remaining_bytes -= frame.payload.len() + FRAME_HEADER_BYTES;
+        self.ended = ends_exchange;
+        Ok(())
+    }
+
+    fn finish(self) -> Result<(), OutboundRequestError> {
+        if !self.ended {
+            return Err(OutboundRequestError::Fatal(
+                "response stream closed without an ending message".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl super::regulation::ResponsePrecheck for DeclaredResponseReadState {
+    fn check(&self, message_type: u16, payload_len: usize) -> Result<(), FrameRejection> {
+        self.admit(message_type, payload_len).map(|_| ())
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn write_outbound_request_frame_inner(
     connection: &Connection,
@@ -4844,12 +4989,8 @@ async fn write_outbound_request_frame_inner(
     flags: u16,
     payload: Vec<u8>,
 ) -> Result<Vec<Frame>, OutboundRequestError> {
-    // The legacy request stream validates responses with a legacy-message-specific budget.
-    let mut legacy_state = LegacyResponseReadState::new(LegacyResponseBudget::from_request(
-        message_type,
-        &payload,
-        limits,
-    )?);
+    let mut response_state =
+        OutboundResponseReadState::for_request(stream, message_type, &payload, limits)?;
     let (mut send, mut recv) = timeout(OUTBOUND_STREAM_WRITE_TIMEOUT, connection.open_bi())
         .await
         .map_err(|_| -> BoxError { "Zakura outbound request stream open timed out".into() })
@@ -4893,7 +5034,7 @@ async fn write_outbound_request_frame_inner(
             &mut recv,
             inbound_frame_cap,
             FrameFilter::new(stream.messages, InboundReader::Requester)
-                .with_precheck(Some(&legacy_state)),
+                .with_precheck(Some(&response_state)),
             limits.idle_timeout,
             // This is the requester side of a one-shot legacy request/response:
             // the responder streams its frames promptly, so a silent gap before
@@ -4903,11 +5044,11 @@ async fn write_outbound_request_frame_inner(
         .await
         {
             Ok(frame) => {
-                legacy_state.validate_frame(request_id, &frame)?;
+                response_state.validate_frame(request_id, &frame)?;
                 frames.push(frame);
             }
             Err(ZakuraHandlerError::Closed) => {
-                legacy_state.finish()?;
+                response_state.finish()?;
                 return Ok(frames);
             }
             Err(ZakuraHandlerError::Timeout(_)) => {
@@ -10143,6 +10284,143 @@ mod tests {
             Response::Nil,
         )?;
 
+        Ok(())
+    }
+
+    /// A request on a stream with a message table admits its parts and then
+    /// exactly one ending response. A second ending, a missing ending, or a
+    /// response to another request closes the connection.
+    #[tokio::test]
+    async fn declared_exchanges_end_with_exactly_one_ending_response() -> Result<(), BoxError> {
+        use crate::zakura::{regulation::ResponsePrecheck, PayloadLen};
+
+        const REQUEST: MessageRule = MessageRule {
+            message_type: 1,
+            payload: PayloadLen::exact(4),
+            role: MessageRole::Request {
+                max_in_flight: 1,
+                cadence: None,
+            },
+        };
+        const PART: MessageRule = MessageRule {
+            message_type: 2,
+            payload: PayloadLen::between(1, 16),
+            role: MessageRole::Response {
+                request: REQUEST.message_type,
+                ends_exchange: false,
+            },
+        };
+        const DONE: MessageRule = MessageRule {
+            message_type: 3,
+            payload: PayloadLen::between(1, 16),
+            role: MessageRole::Response {
+                request: REQUEST.message_type,
+                ends_exchange: true,
+            },
+        };
+        let stream = Stream {
+            kind: 901,
+            version: 1,
+            frame_cap: 1024,
+            capability: 1 << 49,
+            messages: Some(&[REQUEST, PART, DONE]),
+            ..Stream::REQUEST_RESPONSE
+        };
+        Stream::check_layout(&[stream])?;
+        let limits = test_connection_limits();
+
+        // The precheck refuses a response to another request and a response
+        // beyond one message.
+        let rules = stream.messages.expect("the stream declares a table");
+        let other_request = DeclaredResponseReadState::new(rules, 9, limits);
+        assert_eq!(
+            other_request.check(DONE.message_type, 1),
+            Err(FrameRejection::Unsolicited),
+        );
+        let state = DeclaredResponseReadState::new(rules, REQUEST.message_type, limits);
+        let max_message = usize::try_from(limits.max_message_bytes)?;
+        assert_eq!(state.check(DONE.message_type, max_message), Ok(()));
+        assert_eq!(
+            state.check(DONE.message_type, max_message + 1),
+            Err(FrameRejection::AboveReservation {
+                bytes: u64::try_from(max_message)?,
+            }),
+        );
+
+        const ALPN: &[u8] = b"/zakura/testkit/declared-exchange/0";
+        let _guard = zakura_test::init();
+        let server = LocalEndpointFactory::new().endpoint(85).await?;
+        let (conn_tx, _conn_rx) = mpsc::channel(8);
+        let (stream_tx, mut stream_rx) = mpsc::channel(8);
+        let router = Router::builder(server)
+            .accept(
+                ALPN,
+                CaptureConnection {
+                    connection_tx: conn_tx,
+                    stream_tx,
+                },
+            )
+            .spawn();
+        let client = LocalEndpointFactory::new().endpoint(86).await?;
+        let server_addr = router.endpoint().addr();
+        let encode = |rule: MessageRule| {
+            Frame {
+                message_type: rule.message_type,
+                flags: 0,
+                payload: vec![7],
+            }
+            .encode(stream.frame_cap)
+        };
+
+        let cases: [(&[MessageRule], bool); 5] = [
+            (&[DONE], true),
+            (&[PART, PART, DONE], true),
+            (&[DONE, DONE], false),
+            (&[PART], false),
+            (&[], false),
+        ];
+        for (responses, accepted) in cases {
+            let connection = timeout(
+                Duration::from_secs(5),
+                client.connect(server_addr.clone(), ALPN),
+            )
+            .await??;
+            let serve = async {
+                let (mut send, recv) = timeout(Duration::from_secs(5), stream_rx.recv())
+                    .await?
+                    .ok_or("no request stream")?;
+                for rule in responses {
+                    send.write_all(&encode(*rule)?).await?;
+                }
+                send.finish()?;
+                Ok::<_, BoxError>((send, recv))
+            };
+            let (result, served) = tokio::join!(
+                timeout(
+                    Duration::from_secs(5),
+                    write_outbound_request_frame_inner(
+                        &connection,
+                        limits,
+                        stream,
+                        7,
+                        REQUEST.message_type,
+                        0,
+                        vec![0; 4],
+                    ),
+                ),
+                serve,
+            );
+            let _streams = served?;
+            match result? {
+                Ok(frames) => assert!(accepted && frames.len() == responses.len()),
+                Err(OutboundRequestError::Fatal(_)) => assert!(!accepted),
+                Err(OutboundRequestError::Local(error)) => {
+                    panic!("a declared exchange failed locally: {error}")
+                }
+            }
+        }
+
+        router.shutdown().await?;
         Ok(())
     }
 

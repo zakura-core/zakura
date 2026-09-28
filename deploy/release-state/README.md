@@ -29,8 +29,9 @@ host with none.
   runs the offline export and uploads one immutable bundle
   (`meta.json`, `main-checkpoints.txt`, `mainnet-frontier.bin`,
   `mainnet-treestate-subtrees.bin`, and `mainnet-frontier-grid.bin`),
-  then atomically replaces `release-state/latest.json`. Bundles are retained
-  newest-4 by default (`RELEASE_STATE_KEEP`).
+  then atomically replaces `release-state/latest.json`. Schema 2 adds spentness
+  artifacts and retains its bundles for recovery. Legacy schema 1 bundles use
+  newest-4 retention by default (`RELEASE_STATE_KEEP`).
 - **GitHub (repository):** the workflow resolves `latest.json` over a pinned
   HTTPS host, verifies every digest, publishes the bundle's frontier grid to
   crates.io, and opens a draft PR that imports the other three artifacts and
@@ -82,7 +83,7 @@ deploying the same day over leaving it red for a week.
 1. Install the export tool from the release the fleet runs:
 
    ```sh
-   cargo install --locked --features zakura-checkpoints-offline \
+   cargo install --locked --features zakura-spentness \
      --git https://github.com/zakura-core/zakura zakura-utils
    ```
 
@@ -98,6 +99,9 @@ deploying the same day over leaving it red for a week.
    ```sh
    RELEASE_STATE_R2_REMOTE=r2:zakura-artifacts \
    RELEASE_STATE_PUBLIC_BASE=https://zakura-release.valargroup.dev/release-state \
+   RELEASE_STATE_ORACLE_SOURCE=/var/lib/zakura/independent-archive \
+   RELEASE_STATE_ORACLE_ID='independent archive and validation software revision' \
+   RELEASE_STATE_GENERATOR_REVISION="$REVISION" \
    /opt/zakura/publish-release-state.sh /var/lib/zakura/archive-cache
    ```
 
@@ -148,20 +152,24 @@ deploying the same day over leaving it red for a week.
 ## Updating the archive publisher
 
 The mainnet fleet deployer marks `archive-vct-off` with
-`release_state_publisher = true`. A deployment builds `zakurad` and the offline
-`zakura-checkpoints` exporter at the same resolved commit. The exporter revision
-must be on `origin/main`. Deployment tooling comes from the workflow revision,
-so selecting an older release does not select an older deployment procedure.
-Before changing the host, the deployer checks that the exporter supports the
-publisher's required CLI options, including grid output, resume, and cost settings.
-Older exporters that lack any of these options are rejected before installation.
+`release_state_publisher = true`. A deployment builds `zakurad`, the offline
+`zakura-checkpoints` exporter, and the `zakura-spentness` helper at the same
+resolved commit. `EXPORTER_REVISION` names that commit for both helpers. The
+revision must be on `origin/main`. Deployment tooling comes from the workflow
+revision, so selecting an older release does not select an older deployment procedure.
+Before changing the host, the deployer checks that both helpers support the
+publisher's required CLI options, including grid output, resume, cost settings,
+and the spentness `replay`, `generate`, and `verify` arguments.
+Older helpers that lack any of these options are rejected before installation.
 
 The deployer pauses the timer, waits up to ten minutes for publication to finish,
-and installs both binaries before restarting the node. It checks RPC and a
-90-second settle window, runs publication, then verifies the public bundle's
-height and digests. The existing publisher scripts, unit, profile, and credentials
-remain host-managed. Use `deploy-snapshot-host.sh` for initial installation or
-changes to those components.
+and installs all three binaries before restarting the node. It checks RPC and a
+90-second settle window, then starts a publication without waiting for it. A
+schema 2 publication can run for days, so the deployment succeeds once the new
+publisher invocation is running. Follow the publication in
+`journalctl -u zakura-release-state.service`. The existing publisher scripts,
+unit, profile, and credentials remain host-managed. Use `deploy-snapshot-host.sh`
+for initial installation or changes to those components.
 
 `--no-restart` is rejected when the selection includes this host. Deploy the pair
 together, or select another node for staging. A node startup failure leaves the
@@ -174,3 +182,25 @@ the same directory and a systemd service condition keep publication blocked acro
 reboots until the paired deployment validates the node. Remove the resume marker only if deliberately
 leaving publication paused. A publication-only failure keeps the compatible pair
 installed and restores the previous timer state so the next scheduled run can retry.
+
+## Spentness artifacts
+
+The publisher now writes schema 2 bundles with external spentness artifacts.
+Deploy the updated fetcher/importer before enabling the publisher. Build and install
+`zakura-spentness` alongside `zakura-checkpoints` with feature `zakura-spentness`.
+
+Set `RELEASE_STATE_ORACLE_SOURCE` to a separately synchronized archive cache.
+Set `RELEASE_STATE_ORACLE_ID` to identify that source and its validation software.
+Set `RELEASE_STATE_GENERATOR_REVISION` to the tool's full git revision; the host
+wrapper reads the installed `EXPORTER_REVISION`. `RELEASE_STATE_DATA_DIR` holds
+two ordinary archive replay states at the selected checkpoint and the verification
+scratch directory. The two spentness pipelines run concurrently. The publisher
+never rolls back the live node. Version 2 bundles remain available for recovery.
+
+Provision reviewed artifacts on seeds with `provision-spentness-seed.sh`.
+The seed's `zakura-spentness install` command requires a compiled commitment.
+Configure `spentness.cache_dir` and restart the seed before testing
+a cold client against only those seeds. Nodes download from peers.
+
+See [the spentness design](../../docs/design/spentness-hints.md) for commands,
+trust boundaries, verification evidence, and disk requirements.

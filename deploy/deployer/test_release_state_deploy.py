@@ -2,7 +2,6 @@
 
 import argparse
 import importlib.util
-import json
 import os
 from pathlib import Path
 import subprocess
@@ -14,6 +13,17 @@ from unittest import mock
 
 
 HERE = Path(__file__).resolve().parent
+# Options that deploy-archive-pair.sh requires of each staged helper.
+HELPER_OPTIONS = {
+    "zakura-checkpoints": [
+        "--state-cache-dir", "--full-list", "--mainnet-frontier-output",
+        "--mainnet-subtree-output", "--mainnet-frontier-grid-output",
+        "--mainnet-frontier-grid-input", "--frontier-grid-target-cost-ms",
+    ],
+    "zakura-spentness replay": ["--source", "--destination", "--height", "--block-hash"],
+    "zakura-spentness generate": ["--state", "--height", "--block-hash", "--output", "--commitment"],
+    "zakura-spentness verify": ["--state", "--artifact", "--commitment", "--report"],
+}
 SPEC = importlib.util.spec_from_file_location("release_state_deploy", HERE / "deploy.py")
 deploy = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = deploy
@@ -80,7 +90,8 @@ manage_config = true
                 mock.patch.object(deploy, "build_commit", return_value=Path("/exporter")) as build:
             result = deploy.build_publishers([self.publisher(), ordinary, self.publisher()], force=True)
             build.assert_called_once_with(Path("/repo"), SHA, force=True, exporter=True)
-            self.assertEqual(result, {SHA: Path("/exporter")})
+            self.assertEqual(result, {SHA: deploy.publisher_binaries(SHA)})
+            self.assertEqual(set(result[SHA]), {"zakura-checkpoints", "zakura-spentness"})
 
     def test_unmerged_exporter_commit_is_rejected_before_build(self):
         with mock.patch.object(deploy, "repo_root", return_value=Path("/repo")), \
@@ -90,30 +101,25 @@ manage_config = true
                 deploy.build_publishers([self.publisher()])
             build.assert_not_called()
 
-    def test_public_pointer_must_match_completed_publication(self):
-        for height in (3500000, 3490000):
-            calls = []
+    def test_publisher_stages_both_helpers_and_waits_only_for_the_start(self):
+        calls = []
 
-            def fake_run(command, **kwargs):
-                calls.append(command)
-                if command[0] == "ssh":
-                    if "mktemp" in command[-1]:
-                        return mock.Mock(stdout="/tmp/zakura-release-deploy.abc123\n")
-                    if command[-1].startswith("cat "):
-                        return mock.Mock(stdout="3500000\n")
-                if "--metadata-out" in command:
-                    Path(command[command.index("--metadata-out") + 1]).write_text(json.dumps({"height": height}))
-                return mock.Mock(returncode=0, stdout="")
+        def fake_run(command, **kwargs):
+            calls.append(command)
+            if command[0] == "ssh" and "mktemp" in command[-1]:
+                return mock.Mock(stdout="/tmp/zakura-release-deploy.abc123\n")
+            return mock.Mock(returncode=0, stdout="")
 
-            with self.subTest(height=height), \
-                    mock.patch.object(deploy, "run", side_effect=fake_run), \
-                    mock.patch.object(deploy.subprocess, "run", return_value=mock.Mock(returncode=0)):
-                if height == 3500000:
-                    deploy.deploy_publisher(self.publisher(), Path("/node"), Path("/exporter"))
-                else:
-                    with self.assertRaisesRegex(deploy.DeployError, "pointer"):
-                        deploy.deploy_publisher(self.publisher(), Path("/node"), Path("/exporter"))
-                self.assertEqual(calls[-1][-1], "rm -rf -- /tmp/zakura-release-deploy.abc123")
+        helpers = {name: Path(f"/cache/{name}") for name in deploy.PUBLISHER_BINARIES}
+        with mock.patch.object(deploy, "run", side_effect=fake_run), \
+                mock.patch.object(deploy.subprocess, "run", return_value=mock.Mock(returncode=0)) as paired:
+            deploy.deploy_publisher(self.publisher(), Path("/node"), helpers)
+        self.assertEqual(paired.call_args.kwargs["timeout"], deploy.PAIRED_DEPLOY_TIMEOUT_SECS)
+        staged = [command[-2:] for command in calls if command[0] == "scp"]
+        for name in ("zakurad", *deploy.PUBLISHER_BINARIES):
+            self.assertTrue(any(target.endswith(f"/{name}") for _, target in staged), name)
+        self.assertFalse(any("fetch-release-state.py" in " ".join(command) for command in calls))
+        self.assertEqual(calls[-1][-1], "rm -rf -- /tmp/zakura-release-deploy.abc123")
 
     def test_node_cache_cannot_satisfy_exporter_build(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -125,9 +131,10 @@ manage_config = true
             def fake_run(command, *, cwd=None, **kwargs):
                 calls.append(command)
                 if command[:2] == ["cargo", "build"]:
-                    built = Path(cwd) / "target/release/zakura-checkpoints"
-                    built.parent.mkdir(parents=True)
-                    built.write_text("exporter")
+                    for name in deploy.PUBLISHER_BINARIES:
+                        built = Path(cwd) / "target/release" / name
+                        built.parent.mkdir(parents=True, exist_ok=True)
+                        built.write_text(name)
                 return mock.Mock(returncode=0, stdout="")
 
             with mock.patch.dict(os.environ, {deploy.BUILD_CACHE_DIR_ENV: str(cache)}, clear=True), \
@@ -135,10 +142,12 @@ manage_config = true
                     mock.patch.object(deploy, "binary_is_runnable", return_value=True):
                 exporter = deploy.build_commit(cache, SHA, exporter=True)
             self.assertEqual(exporter.name, f"zakura-checkpoints-{SHA}")
-            self.assertEqual(exporter.read_text(), "exporter")
+            self.assertEqual(exporter.read_text(), "zakura-checkpoints")
+            self.assertEqual((cache / f"zakura-spentness-{SHA}").read_text(), "zakura-spentness")
             self.assertEqual(node.read_text(), "node")
             self.assertIn(["cargo", "build", "--release", "--locked", "-p", "zakura-utils",
-                           "--features", "zakura-checkpoints-offline", "--bin", "zakura-checkpoints"], calls)
+                           "--features", "zakura-spentness", "--bin", "zakura-checkpoints",
+                           "--bin", "zakura-spentness"], calls)
             self.assertTrue(any(command[:3] == ["git", "worktree", "add"] and command[-1] == SHA
                                 for command in calls))
 
@@ -148,7 +157,7 @@ manage_config = true
             with self.subTest(failure=failure), \
                     mock.patch.object(deploy, "load_nodes", return_value=[self.publisher()]), \
                     mock.patch.object(deploy, "build_nodes", return_value={SHA: Path("/node")}), \
-                    mock.patch.object(deploy, "build_publishers", return_value={SHA: Path("/exporter")}), \
+                    mock.patch.object(deploy, "build_publishers", return_value={SHA: deploy.publisher_binaries(SHA)}), \
                     mock.patch.object(deploy, "deploy_publisher", side_effect=failure) as paired, \
                     mock.patch.object(deploy, "ssh_with_stdin") as generic, \
                     mock.patch.object(deploy, "run") as run:
@@ -169,6 +178,7 @@ class PairedShellTests(unittest.TestCase):
             for prefix in ("/opt/", "/etc/", "/run/", "/usr/local/"):
                 script = script.replace(prefix, f"{root}{prefix}")
             script = script.replace("SECONDS + 90", "SECONDS + 0")
+            script = script.replace("attempt < 60", "attempt < 2")
             for directory in ("opt/zakura-release-state/bin", "etc", "run", "usr/local/bin", "stage", "mocks"):
                 (root / directory).mkdir(parents=True)
             (root / "etc/zakura-release-state.env").touch()
@@ -179,17 +189,20 @@ class PairedShellTests(unittest.TestCase):
             (root / "opt/zakura-release-state/profile.env").write_text(
                 "RELEASE_STATE_EXPECTED_HOST=roman-zakura-archive-vct-off\n"
                 "RELEASE_STATE_NODE_UNIT=zakurad.service\n")
-            for name in ("stage/zakurad", "stage/zakura-checkpoints", "opt/zakura-release-state/bin/publish-from-archive-host.sh"):
+            for name in ("stage/zakurad", "opt/zakura-release-state/bin/publish-from-archive-host.sh"):
                 path = root / name
                 path.write_text(f"#!/bin/sh\necho zakurad+g{SHA[:12]}\n")
                 path.chmod(0o755)
-            options = ["--state-cache-dir", "--full-list", "--mainnet-frontier-output",
-                       "--mainnet-subtree-output", "--mainnet-frontier-grid-output",
-                       "--mainnet-frontier-grid-input", "--frontier-grid-target-cost-ms"]
-            if failure.startswith("missing:"):
-                options.remove(failure.split(":", 1)[1])
-            (root / "stage/zakura-checkpoints").write_text(
-                "#!/bin/sh\nprintf '%s\\n' '" + "\n".join(options) + "'\n")
+            for tool, options in HELPER_OPTIONS.items():
+                binary, *subcommand = tool.split()
+                if failure.startswith(f"missing:{tool}:"):
+                    options = [o for o in options if o != failure.rsplit(":", 1)[1]]
+                helper = root / "stage" / binary
+                script_text = helper.read_text() if helper.exists() else "#!/bin/sh\n"
+                condition = f'[ "$1" = "{subcommand[0]}" ]' if subcommand else '[ "$1" = --help ]'
+                helper.write_text(script_text + f"{condition} && printf '%s\\n' '"
+                                  + "\n".join(options) + "' && exit 0\n")
+                helper.chmod(0o755)
             wrapper = root / "mocks/command"
             wrapper.write_text(f'''#!{sys.executable}
 import os, pathlib, sys
@@ -204,7 +217,8 @@ elif name == "flock":
     if failure == "lock" and args[-1] == "9" and "-u" not in args:
         sys.exit(1)
 elif name == "systemctl":
-    if args == ["start", "zakura-release-state.service"]:
+    started = pathlib.Path(os.environ["TEST_ROOT"]) / "publisher-started"
+    if args[-1] == "zakura-release-state.service" and args[0] == "start":
         guard = pathlib.Path(os.environ["TEST_ROOT"]) / "etc/systemd/system/zakura-release-state.service.d/deployment-pause.conf"
         if guard.exists():
             blocked = guard.read_text().split("ConditionPathExists=!", 1)[1].strip()
@@ -223,10 +237,14 @@ elif name == "systemctl":
         sys.exit(0)
     if args == ["start", "zakurad"] and failure == "node":
         sys.exit(1)
-    if args == ["start", "zakura-release-state.service"] and failure == "publish":
-        sys.exit(1)
+    if args == ["start", "--no-block", "zakura-release-state.service"] and failure != "stall":
+        started.touch()
     if args[0] == "show":
-        print({{"ActiveState": "inactive", "NRestarts": "0", "Result": "success", "MainPID": "123"}}[args[2]])
+        state = "inactive"
+        if started.exists():
+            state = {{"publish": "failed", "skip": "inactive"}}.get(failure, "activating")
+        print({{"ActiveState": state, "NRestarts": "0", "MainPID": "123",
+               "InvocationID": "new" if started.exists() else "old"}}[args[2]])
 elif name == "journalctl":
     if "--show-cursor" in args:
         print("-- cursor: test-cursor")
@@ -261,6 +279,7 @@ elif name == "curl":
                                  "reboot must not bypass the publisher guard")
             events = log.read_text().splitlines()
             installed = (root / "opt/zakura-release-state/EXPORTER_REVISION").exists()
+            self.installed_helpers = sorted(path.name for path in (root / "opt/zakura-release-state/bin").iterdir())
             return result, events, installed, marker.exists()
 
     def test_success_waits_for_publisher_then_installs_and_publishes(self):
@@ -269,20 +288,26 @@ elif name == "curl":
         self.assertTrue(installed)
         order = ["systemctl stop zakura-release-state.timer", "flock -w 600 9",
                  "systemctl stop zakurad", "systemctl start zakurad", "flock -u 9",
-                 "systemctl start zakura-release-state.service", "systemctl start zakura-release-state.timer"]
+                 "systemctl start --no-block zakura-release-state.service",
+                 "systemctl start zakura-release-state.timer"]
         self.assertEqual(sorted(events.index(event) for event in order), [events.index(event) for event in order])
 
+    def test_success_installs_both_helpers(self):
+        result, events, installed, marker = self.run_pair()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.installed_helpers,
+                         ["publish-from-archive-host.sh", "zakura-checkpoints", "zakura-spentness"])
+
     def test_missing_publisher_options_rejected_before_changing_host(self):
-        for option in ("--state-cache-dir", "--full-list", "--mainnet-frontier-output",
-                       "--mainnet-subtree-output", "--mainnet-frontier-grid-output",
-                       "--mainnet-frontier-grid-input", "--frontier-grid-target-cost-ms"):
-            with self.subTest(option=option):
-                result, events, installed, marker = self.run_pair(f"missing:{option}")
-                self.assertNotEqual(result.returncode, 0)
-                self.assertIn(f"lacks publisher option {option}", result.stderr)
-                self.assertFalse(installed)
-                self.assertFalse(marker)
-                self.assertFalse(any(event.startswith("systemctl ") for event in events))
+        for tool, options in HELPER_OPTIONS.items():
+            for option in options:
+                with self.subTest(tool=tool, option=option):
+                    result, events, installed, marker = self.run_pair(f"missing:{tool}:{option}")
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn(f"lacks publisher option {option}", result.stderr)
+                    self.assertFalse(installed)
+                    self.assertFalse(marker)
+                    self.assertFalse(any(event.startswith("systemctl ") for event in events))
 
     def test_busy_publisher_preserves_node_and_restores_timer(self):
         result, events, installed, marker = self.run_pair("lock")
@@ -343,6 +368,13 @@ elif name == "curl":
     def test_skipped_publication_is_not_reported_as_success(self):
         result, events, installed, marker = self.run_pair("skip")
         self.assertNotEqual(result.returncode, 0)
+        self.assertTrue(installed)
+        self.assertIn("systemctl start zakura-release-state.timer", events)
+
+    def test_publication_that_never_starts_fails_deployment(self):
+        result, events, installed, marker = self.run_pair("stall")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("did not start", result.stderr)
         self.assertTrue(installed)
         self.assertIn("systemctl start zakura-release-state.timer", events)
 

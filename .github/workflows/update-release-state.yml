@@ -53,6 +53,7 @@ jobs:
           python3 .github/scripts/fetch-release-state.py --self-test
           python3 .github/scripts/import-release-state.py --self-test
           python3 scripts/pack-assets-crate.py --self-test
+          python3 .github/scripts/test_spentness_release.py
 
       - name: Fetch one immutable bundle
         env:
@@ -325,6 +326,7 @@ jobs:
         if: steps.import.outputs.has_changes == 'true'
         run: |
           cargo test -p zakura-state --lib -- frontier sprout_change
+          cargo test -p zakura-chain --lib -- spentness_hints
 
       - name: Restrict the generated diff to release-state files
         if: steps.import.outputs.has_changes == 'true'
@@ -338,6 +340,8 @@ jobs:
           Cargo.lock
           Cargo.toml
           crates/zakura-chain/src/parameters/checkpoint/main-checkpoints.txt
+          crates/zakura-chain/src/parameters/spentness_hints/commitments.rs
+          crates/zakura-chain/src/parameters/spentness_hints/mainnet-manifest.json
           crates/zakura-state/src/service/finalized_state/vct/mainnet-frontier.bin
           crates/zakura-state/src/service/finalized_state/vct/mainnet-vct-manifest.json
           crates/zakura-state/src/service/finalized_state/vct/mainnet-subtrees.bin
@@ -394,7 +398,7 @@ jobs:
           base: main
           title: "chore(chain): update Mainnet release state"
           body: |
-            Updates the embedded Mainnet checkpoint list, matching VCT frontier, subtree roots, and provenance record from one immutable release-state bundle, and repins the published historical frontier grid. It also floors the end-of-support estimate.
+            Updates the Mainnet checkpoint list, VCT frontier, subtree roots, spentness commitment, published historical frontier grid pin, and provenance from one immutable release-state bundle. The spentness bitmap remains external. It also floors the end-of-support estimate.
 
             - Finalized height: `${{ steps.import.outputs.height }}`
             - Finalized hash: `${{ steps.import.outputs.block_hash }}`

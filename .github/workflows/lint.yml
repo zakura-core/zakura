@@ -191,7 +191,7 @@ jobs:
         if: ${{ !cancelled() }}
         # .github/workflows/scripts/*.sh included: those run on provisioned
         # droplets, where a shell bug costs a full provisioning cycle to find.
-        run: shellcheck scripts/*.sh scripts/lib/*.sh .github/workflows/scripts/*.sh deploy/release-state/deploy-archive-pair.sh
+        run: shellcheck scripts/*.sh scripts/lib/*.sh .github/workflows/scripts/*.sh deploy/release-state/deploy-archive-pair.sh deploy/release-state/publish-release-state.sh
       # Stdlib-only, so there is nothing to install.
       - name: Mempool load harness tests
         if: ${{ !cancelled() }}
@@ -220,6 +220,13 @@ jobs:
       - name: Deployer tests
         if: ${{ !cancelled() }}
         run: python3 -m unittest discover -s deploy/deployer -p 'test_*.py'
+
+      - name: Release-state tooling tests
+        if: ${{ !cancelled() }}
+        run: |
+          python3 .github/scripts/fetch-release-state.py --self-test
+          python3 .github/scripts/import-release-state.py --self-test
+          python3 .github/scripts/test_spentness_release.py
 
       - name: Continuous-sync tests
         if: ${{ !cancelled() }}

@@ -1,0 +1,270 @@
+//! Bounded peer transfer of whole-file authenticated spentness artifacts.
+//!
+//! - `wire`: range request and response encoding.
+//! - `server`: serving verified artifacts under node and per-peer byte rates.
+//! - `cache`: content-addressed files that are reverified on every load.
+//! - `download`: resumable single-source acquisition with whole-file verification.
+//!
+//! The capability advertises protocol support. Discovery advertises availability
+//! only when startup loaded at least one verified artifact.
+
+use std::{path::PathBuf, sync::Arc};
+
+use zakura_chain::parameters::spentness_hints::Commitment;
+
+use super::{
+    CustomService, MessageRole, MessageRule, PayloadLen, Stream, ZakuraServiceId,
+    FRAME_HEADER_BYTES,
+};
+use crate::BoxError;
+
+mod cache;
+mod download;
+mod server;
+mod wire;
+
+pub use cache::{artifact_path, load, publish};
+pub use download::{acquire, download_missing};
+pub use server::ArtifactService;
+pub use wire::{GET_RANGE, RANGE, RANGE_BYTES};
+
+/// Spentness artifact request/response stream.
+pub const STREAM_KIND: u16 = 8;
+/// Negotiated support for the artifact protocol, independent of artifact availability.
+pub const CAPABILITY: u64 = 1 << 6;
+const SERVICE_ID: &str = "zakura.spentness.v1";
+const PROTOCOL_VERSION: u16 = 1;
+/// Frame limit: one full range, the response header, and the frame header.
+// The cast is safe because both header lengths are small constants.
+const FRAME_CAP: u32 = RANGE_BYTES + (wire::RESPONSE_HEADER_LEN + FRAME_HEADER_BYTES) as u32;
+const GET_RANGE_RULE: MessageRule = MessageRule {
+    message_type: GET_RANGE,
+    payload: PayloadLen::exact(wire::REQUEST_LEN),
+    role: MessageRole::Request {
+        max_in_flight: 1,
+        cadence: None,
+    },
+};
+const RANGE_RULE: MessageRule = MessageRule {
+    message_type: RANGE,
+    payload: PayloadLen::between(
+        wire::RESPONSE_HEADER_LEN,
+        wire::RESPONSE_HEADER_LEN + RANGE_BYTES as usize,
+    ),
+    role: MessageRole::Response {
+        request: GET_RANGE,
+        ends_exchange: true,
+    },
+};
+const STREAMS: &[Stream] = &[Stream {
+    kind: STREAM_KIND,
+    version: PROTOCOL_VERSION,
+    frame_cap: FRAME_CAP,
+    capability: CAPABILITY,
+    messages: Some(&[GET_RANGE_RULE, RANGE_RULE]),
+    ..Stream::REQUEST_RESPONSE
+}];
+
+/// Load supported cache entries and prepare protocol negotiation and discovery.
+///
+/// `supported` must exclude revoked commitments, because the node downloads,
+/// serves, and advertises exactly these artifacts. The node provides the
+/// service when the cache already holds a verified artifact. It seeks the
+/// service only while a supported artifact is missing, so a node that holds
+/// every artifact does not bias its dialing toward providers.
+pub async fn prepare(
+    cache: PathBuf,
+    supported: &[Commitment],
+) -> Result<(Arc<ArtifactService>, CustomService), BoxError> {
+    let commitments = supported.to_vec();
+    let artifacts =
+        tokio::task::spawn_blocking(move || cache::load_supported(&cache, &commitments)).await?;
+    let missing = artifacts.len() < supported.len();
+    let service = Arc::new(ArtifactService::new(artifacts));
+    let id = ZakuraServiceId::new(SERVICE_ID)?;
+    let custom = CustomService {
+        service: service.clone(),
+        provides: (!service.is_empty())
+            .then(|| id.clone())
+            .into_iter()
+            .collect(),
+        seeks: missing.then_some(id).into_iter().collect(),
+    };
+    Ok((service, custom))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use tokio::time::timeout;
+    use zakura_chain::parameters::spentness_hints::{encode, ParsedArtifact};
+
+    use super::{
+        cache::partial_path,
+        download::wait_for_capable_peers,
+        wire::{RangeRequest, RangeResponse, DIGEST_LEN},
+        *,
+    };
+    use crate::zakura::{
+        spawn_zakura_endpoint_with_services, Peer, Service, ZakuraConnId, ZakuraPeerId,
+    };
+
+    #[derive(Debug)]
+    struct Noop;
+
+    impl Service for Noop {
+        fn name(&self) -> &'static str {
+            "noop"
+        }
+        fn streams(&self) -> &[Stream] {
+            &[]
+        }
+        fn add_peer(&self, _peer: Peer) {}
+        fn remove_peer(&self, _peer: &ZakuraPeerId, _conn: ZakuraConnId) {}
+    }
+
+    /// Publish a verified artifact at `terminal_height` into `cache`.
+    fn cached_artifact(
+        cache: &std::path::Path,
+        terminal_height: u32,
+    ) -> Result<Commitment, BoxError> {
+        let bytes = encode([1; 32], terminal_height, [2; 32], [false, true])?;
+        let parsed = ParsedArtifact::read(bytes.as_slice())?;
+        let commitment = parsed.commitment().clone();
+        publish(cache, &parsed.verify(&commitment)?)?;
+        Ok(commitment)
+    }
+
+    #[tokio::test]
+    async fn only_supported_artifacts_are_served_and_advertised() -> Result<(), BoxError> {
+        let cache = tempfile::tempdir()?;
+        let supported = cached_artifact(cache.path(), 1)?;
+        let revoked = cached_artifact(cache.path(), 2)?;
+
+        // The caller leaves the revoked commitment out of the supported set.
+        let (service, custom) =
+            prepare(cache.path().to_owned(), std::slice::from_ref(&supported)).await?;
+        assert_eq!(service.available(), vec![supported.sha256]);
+        assert!(!service.contains(&revoked.sha256));
+        assert_eq!(custom.provides, vec![ZakuraServiceId::new(SERVICE_ID)?]);
+        assert!(
+            custom.seeks.is_empty(),
+            "a node holding every artifact does not seek"
+        );
+
+        // A missing supported artifact makes the node seek providers.
+        let missing = Commitment {
+            sha256: [9; DIGEST_LEN],
+            ..supported.clone()
+        };
+        let (_, custom) = prepare(cache.path().to_owned(), &[supported.clone(), missing]).await?;
+        assert_eq!(custom.seeks, vec![ZakuraServiceId::new(SERVICE_ID)?]);
+
+        // A node without supported artifacts serves and advertises nothing.
+        let (service, custom) = prepare(cache.path().to_owned(), &[]).await?;
+        assert!(service.is_empty());
+        assert!(custom.provides.is_empty() && custom.seeks.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn seed_only_transfer_resumes_and_serves_verified_bytes() -> Result<(), BoxError> {
+        let _guard = zakura_test::init();
+        let bytes = encode(
+            [1; 32],
+            10,
+            [2; 32],
+            (0..(u64::from(RANGE_BYTES) * 8 + 9)).map(|n| n != 0 && n % 2 == 0),
+        )?;
+        let parsed = ParsedArtifact::read(bytes.as_slice())?;
+        let commitment = parsed.commitment().clone();
+        let server_service = Arc::new(ArtifactService::new([Arc::new(
+            parsed.verify(&commitment)?,
+        )]));
+        let server_identity = tempfile::tempdir()?;
+        let client_identity = tempfile::tempdir()?;
+        let cache = tempfile::tempdir()?;
+        let service_id = ZakuraServiceId::new(SERVICE_ID)?;
+
+        let mut server_config = crate::Config::for_test(crate::P2pStack::Dual);
+        server_config.identity_dir = server_identity.path().to_owned();
+        server_config.zakura.listen_addr = Some("127.0.0.1:0".parse()?);
+        server_config.zakura.bootstrap_peers.clear();
+        let server = spawn_zakura_endpoint_with_services(
+            &server_config,
+            |_, _| Arc::new(Noop),
+            None,
+            vec![CustomService {
+                service: server_service,
+                provides: vec![service_id.clone()],
+                seeks: Vec::new(),
+            }],
+        )
+        .await?
+        .ok_or("server endpoint missing")?;
+        let server_addr = server.node_addr().await;
+        let direct = server_addr
+            .ip_addrs()
+            .copied()
+            .find(|addr| addr.ip().is_loopback())
+            .ok_or("server has no loopback address")?;
+
+        let mut client_config = server_config;
+        client_config.identity_dir = client_identity.path().to_owned();
+        client_config.zakura.bootstrap_peers = vec![format!("{}@{direct}", server_addr.id)];
+        let client_service = Arc::new(ArtifactService::new([]));
+        let client = spawn_zakura_endpoint_with_services(
+            &client_config,
+            |_, _| Arc::new(Noop),
+            None,
+            vec![CustomService {
+                service: client_service.clone(),
+                provides: Vec::new(),
+                seeks: vec![service_id],
+            }],
+        )
+        .await?
+        .ok_or("client endpoint missing")?;
+
+        let result = timeout(Duration::from_secs(20), async {
+            let peer = wait_for_capable_peers(&client.supervisor())
+                .await
+                .into_iter()
+                .next()
+                .ok_or("no capable peer connected")?;
+
+            // Resume from a partial file left by an earlier attempt against the same peer.
+            let partial = partial_path(cache.path(), &commitment, peer.peer_id());
+            tokio::fs::write(&partial, &bytes[..128]).await?;
+            let artifact = acquire(cache.path(), &commitment, std::slice::from_ref(&peer)).await?;
+            assert_eq!(artifact.bytes(), bytes);
+            assert!(!partial.exists());
+            assert_eq!(load(cache.path(), &commitment)?.bytes(), bytes);
+            client_service.insert(artifact);
+            assert_eq!(client_service.available(), vec![commitment.sha256]);
+
+            let unknown = RangeRequest {
+                digest: [3; DIGEST_LEN],
+                offset: 0,
+                length: 1,
+            };
+            let response = peer
+                .request(STREAM_KIND, 0, GET_RANGE, 0, unknown.payload())
+                .await?;
+            assert!(
+                matches!(
+                    RangeResponse::parse(&response[0])?,
+                    RangeResponse::Unavailable(_)
+                ),
+                "missing artifacts are availability failures"
+            );
+            Ok::<_, BoxError>(())
+        })
+        .await;
+        client.shutdown().await;
+        server.shutdown().await;
+        result??;
+        Ok(())
+    }
+}

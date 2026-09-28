@@ -7317,7 +7317,7 @@ dependencies = [
 
 [[package]]
 name = "zakura"
-version = "1.5.0"
+version = "1.5.1"
 dependencies = [
  "abscissa_core",
  "bytes",
@@ -7451,7 +7451,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-chain"
-version = "8.0.0"
+version = "8.0.1"
 dependencies = [
  "bech32",
  "bitflags",
@@ -8156,7 +8156,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-script"
-version = "3.2.4"
+version = "3.2.5"
 dependencies = [
  "hex",
  "lazy_static",
@@ -8322,7 +8322,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-utils"
-version = "2.2.5"
+version = "2.2.6"
 dependencies = [
  "clap",
  "color-eyre",

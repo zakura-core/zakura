@@ -89,12 +89,15 @@ impl SpentnessSetup {
 /// A local spentness construction failure. Peers must not receive blame for this error.
 #[derive(Debug, Error)]
 pub enum SpentnessError {
-    /// Construction gates protect consumers until index rebuilding finishes.
+    /// An incomplete run cannot open with hints off or for read-only access.
     #[error(
         "spentness construction is incomplete; resume with spentness.mode enabled \
          before querying or exporting state"
     )]
     Incomplete,
+    /// Construction gates deny this request until index rebuilding finishes.
+    #[error("state is unavailable while spentness construction is incomplete")]
+    Unavailable,
     /// The construction writer failed or exited, so the gates never lift in this process.
     #[error("spentness construction stopped the state writer; restart to reconcile progress")]
     WriterStopped,

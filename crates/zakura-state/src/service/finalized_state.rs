@@ -363,18 +363,19 @@ fn select_vct_state(
     ))
 }
 
-/// While a run is incomplete, only checkpoint blocks commit, and none while rebuilding.
+/// While a run is incomplete, only checkpoint blocks through H commit, and none while rebuilding.
 fn check_spentness_admits(
     status: SpentnessStatus,
     block: &FinalizableBlock,
 ) -> Result<(), SpentnessError> {
-    let admitted = match status {
-        SpentnessStatus::Usable => true,
-        SpentnessStatus::Applying { .. } => matches!(block, FinalizableBlock::Checkpoint { .. }),
-        SpentnessStatus::Rebuilding | SpentnessStatus::Failed => false,
+    let admitted = match block {
+        FinalizableBlock::Checkpoint {
+            checkpoint_verified,
+        } => status.admits_checkpoint_body(checkpoint_verified.height),
+        FinalizableBlock::Contextual { .. } => status == SpentnessStatus::Usable,
     };
     if !admitted {
-        return Err(SpentnessError::Incomplete);
+        return Err(SpentnessError::Unavailable);
     }
     Ok(())
 }

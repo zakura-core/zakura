@@ -1809,7 +1809,7 @@ impl Service<Request> for StateService {
         let span = Span::current();
 
         if self.read_service.db.spentness_incomplete() && !req.available_during_spentness() {
-            return async { Err(BoxError::from(crate::SpentnessError::Incomplete)) }.boxed();
+            return async { Err(BoxError::from(crate::SpentnessError::Unavailable)) }.boxed();
         }
 
         match req {
@@ -2883,7 +2883,7 @@ impl Service<ReadRequest> for ReadStateService {
     fn call(&mut self, req: ReadRequest) -> Self::Future {
         req.count_metric();
         if self.db.spentness_incomplete() && !req.available_during_spentness() {
-            return async { Err(BoxError::from(crate::SpentnessError::Incomplete)) }.boxed();
+            return async { Err(BoxError::from(crate::SpentnessError::Unavailable)) }.boxed();
         }
         let timer = CodeTimer::start_desc(req.variant_name());
         let span = Span::current();

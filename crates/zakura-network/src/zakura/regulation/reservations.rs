@@ -23,6 +23,10 @@
 //! requester's bookkeeping has a node-wide bound. A full pool makes the node
 //! wait before its next request; it never acts against a peer.
 //!
+//! [`Reservations::reserve_fenced`] makes a reservation own its request's
+//! [`Exchange`]. The ending's claim ends the exchange. Dropping the map at the
+//! session's end drops the rest, and a started one closes the connection.
+//!
 //! # Properties and their tests
 //!
 //! | Property | Test |
@@ -37,6 +41,7 @@
 //! | A full pool waits, with no lost or spurious wakeup and no allocation | `a_full_pool_waits_without_lost_or_spurious_wakeups` |
 //! | Racing threads never overcommit the pool | `racing_threads_never_overcommit_the_pool` |
 //! | Refusals are exactly the violations, for any sequence | `operation_sequences_refuse_exactly_the_violations` |
+//! | The ending ends a fenced exchange; the map's drop closes a started one | `a_fenced_reservation_ends_its_exchange_with_its_ending` |
 
 use std::{
     collections::{BTreeMap, HashMap},
@@ -49,7 +54,7 @@ use thiserror::Error;
 use super::{
     serve::{ending_reserve, ResponseCap},
     slots::SlotBudgetCapacityError,
-    SlotBudget, SlotPermit,
+    Exchange, SlotBudget, SlotPermit,
 };
 use crate::zakura::{FrameRejection, MessageRole, MessageRule};
 
@@ -197,6 +202,9 @@ struct Reservation {
     bytes: u64,
     abandoned: bool,
     _entry: PoolEntry,
+    /// The request's exchange, if the reactor fences its writers. Dropping a
+    /// started exchange without its ending closes the connection.
+    exchange: Option<Exchange>,
 }
 
 impl Reservation {
@@ -240,6 +248,34 @@ impl<K: Eq + Hash> Reservations<K> {
         cap: ResponseCap,
         entry: PoolEntry,
     ) -> Result<(), ReserveRefused> {
+        self.insert(key, request_type, cap, entry, None)
+    }
+
+    /// Reserve as [`Self::reserve`] does, and keep `exchange` until the
+    /// response's ending ends it.
+    ///
+    /// The session owns this map, so the session's end drops every exchange
+    /// still live. One whose request's first byte was written then closes the
+    /// connection.
+    pub(crate) fn reserve_fenced(
+        &mut self,
+        key: K,
+        request_type: u16,
+        cap: ResponseCap,
+        entry: PoolEntry,
+        exchange: Exchange,
+    ) -> Result<(), ReserveRefused> {
+        self.insert(key, request_type, cap, entry, Some(exchange))
+    }
+
+    fn insert(
+        &mut self,
+        key: K,
+        request_type: u16,
+        cap: ResponseCap,
+        entry: PoolEntry,
+        exchange: Option<Exchange>,
+    ) -> Result<(), ReserveRefused> {
         if !matches!(
             MessageRule::find(self.rules, request_type).map(|row| row.role),
             Some(MessageRole::Request { .. })
@@ -266,6 +302,7 @@ impl<K: Eq + Hash> Reservations<K> {
             bytes: 0,
             abandoned: false,
             _entry: entry,
+            exchange,
         };
         self.track(request_type, reservation.remaining_bytes());
         self.live.insert(key, reservation);
@@ -345,10 +382,13 @@ impl<K: Eq + Hash> Reservations<K> {
     ) -> Result<Ended, ClaimRefused> {
         let (request, before, _, _) = self.charge(key, message_type, payload_len, true)?;
         self.untrack(request, before);
-        let reservation = self
+        let mut reservation = self
             .live
             .remove(key)
             .expect("charge found this reservation and nothing removed it since");
+        if let Some(exchange) = &mut reservation.exchange {
+            exchange.end();
+        }
         Ok(Ended {
             frames: reservation.frames,
             bytes: reservation.bytes,

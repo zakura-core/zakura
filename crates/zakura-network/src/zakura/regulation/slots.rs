@@ -75,6 +75,12 @@ impl SlotBudget {
             .map(|permit| SlotPermit { _permit: permit })
     }
 
+    /// Take every free slot.
+    #[cfg(test)]
+    pub(crate) fn hold_free(&self) -> Vec<SlotPermit> {
+        std::iter::from_fn(|| self.try_reserve()).collect()
+    }
+
     /// Wait for a slot and return its ownership in semaphore queue order.
     ///
     /// Keep the returned permit while owning the resource. Cancelling this
@@ -147,6 +153,17 @@ impl OutputByteBudget {
             .await
             .expect("output budget semaphore stays open because this type never closes it");
         OutputGrant { _permit: permit }
+    }
+
+    /// Take every free byte, up to 4 GiB.
+    #[cfg(test)]
+    pub(crate) fn hold_free(&self) -> Option<OutputGrant> {
+        let free = u32::try_from(self.bytes.available_permits()).unwrap_or(u32::MAX);
+        self.bytes
+            .clone()
+            .try_acquire_many_owned(free)
+            .ok()
+            .map(|permit| OutputGrant { _permit: permit })
     }
 
     pub(super) fn downgrade(&self) -> WeakOutputByteBudget {

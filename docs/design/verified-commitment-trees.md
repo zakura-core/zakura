@@ -932,7 +932,9 @@ publisher then atomically replaces the mutable `release-state/latest.json` point
 
 The `update-release-state.yml` workflow (manual dispatch plus a weekly cron) and
 `prepare-release-pr.yml` both resolve the pointer once over a pinned HTTPS host with no
-redirects, bounded reads, digest verification at every hop, and a maximum bundle age. They
+redirects, bounded reads, and digest verification at every hop. Bundle age does not invalidate
+the checkpoint/frontier pairing; generation timestamps must still parse and cannot be in the
+future beyond the allowed clock skew. They
 exit green without release-state changes when the bundle does not advance the committed
 list. Otherwise their shared importer verifies the committed `main-checkpoints.txt` is a
 byte-identical prefix of the bundle's list, requires each pool's subtree bytes to retain the

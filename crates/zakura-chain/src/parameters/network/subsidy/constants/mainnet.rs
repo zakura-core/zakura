@@ -6,9 +6,10 @@ use crate::parameters::{
     constants::activation_heights,
     network::{Amount, Height, NonNegative},
     subsidy::{
-        constants::POST_NU6_FUNDING_STREAM_NUM_BLOCKS, FundingStreamReceiver,
-        FundingStreamRecipient, FundingStreams,
+        constants::POST_NU6_FUNDING_STREAM_NUM_BLOCKS, funding_stream_address_period,
+        FundingStreamReceiver, FundingStreamRecipient, FundingStreams,
     },
+    Network, NetworkUpgrade,
 };
 
 /// The start height of post-NU6 funding streams on Mainnet as described in [ZIP-1015](https://zips.z.cash/zip-1015).
@@ -192,6 +193,33 @@ pub(crate) const POST_NU6_1_FUNDING_STREAM_FPF_ADDRESSES: [&str;
     POST_NU6_1_FUNDING_STREAMS_NUM_ADDRESSES] =
     ["t3cFfPt1Bcvgez9ZbMBFWeZsskxTkPzGCow"; POST_NU6_1_FUNDING_STREAMS_NUM_ADDRESSES];
 
+/// ZIP 2008's proposed mainnet recipient. Keep this change in draft until NU7
+/// deployment and the recipient address receive final confirmation.
+const NU7_FPF_ADDRESS: &str = "t1MkHnkxVjNpNbCrSs3AJ8J7ZSp6NTYiUcG";
+
+/// Rotates the H3 stream at the first funding period beginning at or after NU7.
+/// See <https://zips.z.cash/zip-2008>.
+fn nu7_fpf_addresses(
+    nu7: Option<Height>,
+) -> [&'static str; POST_NU6_1_FUNDING_STREAMS_NUM_ADDRESSES] {
+    let mut addresses = POST_NU6_1_FUNDING_STREAM_FPF_ADDRESSES;
+    let Some(nu7) = nu7 else {
+        return addresses;
+    };
+    let previous = nu7.previous().expect("NU7 activates after genesis");
+    let first_new_index = usize::try_from(
+        funding_stream_address_period(previous, &Network::Mainnet)
+            - funding_stream_address_period(activation_heights::mainnet::NU6_1, &Network::Mainnet)
+            + 1,
+    )
+    .expect("NU7 activates after the H3 funding stream starts");
+    // An activation after the stream ends leaves every historical address intact.
+    for address in addresses.iter_mut().skip(first_new_index) {
+        *address = NU7_FPF_ADDRESS;
+    }
+    addresses
+}
+
 lazy_static! {
     /// The funding streams for Mainnet as described in:
     /// - [protocol specification §7.10.1][7.10.1]
@@ -244,7 +272,10 @@ lazy_static! {
                 ),
                 (
                     FundingStreamReceiver::MajorGrants,
-                    FundingStreamRecipient::new(8, POST_NU6_1_FUNDING_STREAM_FPF_ADDRESSES),
+                    FundingStreamRecipient::new(
+                        8,
+                        nu7_fpf_addresses(NetworkUpgrade::Nu7.activation_height(&Network::Mainnet)),
+                    ),
                 ),
             ]
             .into_iter()
@@ -252,4 +283,37 @@ lazy_static! {
         },
     ];
 
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nu7_fpf_rotation_boundaries() {
+        // Mainnet periods contain 35,000 blocks and align with the first halving.
+        // 3,146,400 starts H3; 3,566,400 starts its thirteenth period.
+        for (activation, first_new) in [(3_566_400, 12), (3_566_401, 13), (3_601_399, 13)] {
+            let addresses = nu7_fpf_addresses(Some(Height(activation)));
+            assert_eq!(
+                &addresses[..first_new],
+                &POST_NU6_1_FUNDING_STREAM_FPF_ADDRESSES[..first_new]
+            );
+            assert!(addresses[first_new..]
+                .iter()
+                .all(|address| *address == NU7_FPF_ADDRESS));
+            let address: crate::transparent::Address = addresses[first_new].parse().unwrap();
+            assert_eq!(address.to_string(), NU7_FPF_ADDRESS);
+        }
+    }
+
+    #[test]
+    fn nu7_fpf_rotation_without_remaining_periods() {
+        for activation in [None, Some(Height(4_406_400)), Some(Height(4_406_401))] {
+            assert_eq!(
+                nu7_fpf_addresses(activation),
+                POST_NU6_1_FUNDING_STREAM_FPF_ADDRESSES
+            );
+        }
+    }
 }

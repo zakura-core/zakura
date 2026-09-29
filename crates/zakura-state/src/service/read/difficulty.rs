@@ -311,7 +311,7 @@ fn adjust_difficulty_and_time_for_testnet(
     // On testnet, changing the block time can also change the difficulty,
     // due to the minimum difficulty consensus rule:
     // > if the block time of a block at height `height ≥ 299188`
-    // > is greater than 6 * PoWTargetSpacing(height) seconds after that of the preceding block,
+    // > is greater than the minimum difficulty gap for that height after the preceding block,
     // > then the block is a minimum-difficulty block.
     //
     // When the first minimum difficulty time fits within the consensus maximum time, testnet
@@ -461,10 +461,9 @@ mod tests {
             .into(),
         );
 
-        // The template keeps the standard difficulty for the whole minimum difficulty gap of
-        // 6 target spacings.
+        // The template keeps standard difficulty for the whole minimum difficulty gap.
         let pre_nu7_offset = 6 * 75;
-        let post_nu7_offset = 6 * 25;
+        let post_nu7_offset = 18 * 25;
 
         let testnet = Network::new_default_testnet();
         assert_eq!(

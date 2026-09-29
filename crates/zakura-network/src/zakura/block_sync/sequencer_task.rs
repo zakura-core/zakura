@@ -1486,14 +1486,14 @@ mod tests {
 
     // Use a real serialized block. Only the scheduling height is synthetic.
     fn received_test_body(task: &mut SequencerTask, height: u32, estimate: u64) -> SequencedBody {
-        use zakura_chain::serialization::ZcashSerialize;
         let block: Arc<block::Block> = Arc::new(
             zakura_test::vectors::BLOCK_MAINNET_982681_BYTES
                 .zcash_deserialize_into()
                 .unwrap(),
         );
-        let raw: Arc<[u8]> = block.zcash_serialize_to_vec().unwrap().into();
-        let bytes = u64::try_from(raw.len()).unwrap();
+        let raw = super::super::tests::raw_block_payload(&block);
+        let bytes =
+            u64::try_from(raw.len() - super::super::wire::BLOCK_SYNC_MESSAGE_TYPE_BYTES).unwrap();
         let height = block::Height(height);
         task.work.extend(
             super::test_work_scope(),

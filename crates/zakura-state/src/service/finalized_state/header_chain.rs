@@ -806,18 +806,20 @@ fn any_deferral_is_due(plan: &zakura_header_chain::RecoveryPlan) -> bool {
     plan.deferred_entries.iter().any(|(until, _)| *until <= now)
 }
 
-/// Restore the integrated auxiliary reserve and reevaluate due deferrals before publication.
+/// Reevaluate due recovered deferrals before constructing a publisher.
 ///
-/// The planner reclaims unprotected branches even when full-state reconciliation changed nothing
-/// and no deferral is due. The durable commit precedes publisher construction. Planner failures
-/// prevent publication; a no-change plan leaves the recovered engine unchanged.
-fn settle_before_publication(
+/// The function uses the normal planner and durable commit path. It leaves the recovered engine
+/// unchanged when no deferral is due or when the planner derives no change. It propagates planner
+/// failures because the runtime would immediately repeat the due transition. Any retryable
+/// planning failure needs an explicit classification and a bounded retry policy. On success, the
+/// returned engine matches the durable state that the caller may publish.
+fn settle_deferred_before_publication(
     store: &HeaderChainStore,
     config: &EngineConfig,
     has_due_deferred: bool,
 ) -> Result<HeaderChainEngine, HeaderChainStoreError> {
     let mut engine = load_transition_engine(store)?;
-    if !has_due_deferred && engine.auxiliary_reserve_is_satisfied(config.limits) {
+    if !has_due_deferred {
         return Ok(engine);
     }
     let before = engine.snapshot();
@@ -1707,15 +1709,6 @@ impl HeaderChainReader {
         .map_err(HeaderChainStoreError::Store)
     }
 
-    /// Return the current input capacity outside the selected commit reserve.
-    pub(crate) fn speculative_auxiliary_capacity(&self) -> Result<usize, HeaderChainStoreError> {
-        let engine = self
-            .transition_engine
-            .lock()
-            .map_err(|_| HeaderChainStoreError::WriterPoisoned)?;
-        Ok(engine.speculative_auxiliary_capacity(self.config.limits))
-    }
-
     /// Resolve an exact, still-current VCT repair owner to one selected header request.
     pub(crate) fn vct_repair_context(
         &self,
@@ -1794,6 +1787,7 @@ impl HeaderChainReader {
             .transition_engine
             .lock()
             .map_err(|_| HeaderChainStoreError::WriterPoisoned)?;
+        // Aggregate pressure evicts lower-priority input, so only the target's bucket can refuse.
         let admission_capacity_available = engine
             .auxiliary_admission_capacity(target_hash, self.config.limits)
             && !snapshot.alarms.resource_stalled;
@@ -1809,16 +1803,7 @@ impl HeaderChainReader {
             return Ok(Some(context));
         }
 
-        let available_aggregate_capacity =
-            engine.speculative_auxiliary_capacity(self.config.limits);
-        // Under capacity pressure, repair the prerequisite without a speculative suffix.
-        let range_limit = if available_aggregate_capacity
-            < self.config.limits.max_headers_per_transition.get()
-        {
-            1
-        } else {
-            available_aggregate_capacity.min(self.config.limits.max_headers_per_transition.get())
-        };
+        let range_limit = self.config.limits.max_headers_per_transition.get();
         if range_limit <= 1 {
             return Ok(Some(context));
         }
@@ -3097,26 +3082,18 @@ impl HeaderChainRuntime {
                     .get(1)
                     .map(|successor| successor.hash)
                     .or(terminal_boundary_hash);
-                let aggregate_capacity_available = transition_engine
-                    .aux_delivery_count()
-                    .checked_add(repair_range.len())
-                    .is_some_and(|count| {
-                        count <= context.config.limits.max_aux_deliveries_total.get()
-                    });
                 let mut current = zakura_header_chain::VctRepairContext::from_durable_rows(
                     first_target,
                     HeaderLocator::for_continuation(common_ancestor),
                     before.state_version,
                     first_boundary_hash,
-                    aggregate_capacity_available
-                        && transition_engine.aux_deliveries(first_target.hash).len()
-                            < context.config.limits.max_aux_deliveries_per_header.get()
+                    transition_engine
+                        .auxiliary_admission_capacity(first_target.hash, context.config.limits)
                         && !before.alarms.resource_stalled,
                     &durable_rows_by_target[0],
                 )?;
                 if repair_range.len() > 1 {
                     if durable_rows_by_target.iter().any(|rows| !rows.is_empty())
-                        || !aggregate_capacity_available
                         || before.alarms.resource_stalled
                     {
                         return Ok(ApplyResult::Stale(StaleReceipt {
@@ -3933,7 +3910,8 @@ impl HeaderChainStore {
             fault(FaultPoint::AfterCommit)?;
         }
         let has_due_deferred = any_deferral_is_due(&plan);
-        let transition_engine = settle_before_publication(&self, config, has_due_deferred)?;
+        let transition_engine =
+            settle_deferred_before_publication(&self, config, has_due_deferred)?;
         let current = transition_engine.snapshot();
         let transition_engine = Arc::new(Mutex::new(transition_engine));
         let report = StartupReport {
@@ -4019,7 +3997,7 @@ impl HeaderChainStore {
         }
         let has_due_deferred = any_deferral_is_due(&target);
         let transition_engine =
-            settle_before_publication(&self, integrated_config, has_due_deferred)?;
+            settle_deferred_before_publication(&self, integrated_config, has_due_deferred)?;
         let current = transition_engine.snapshot();
         let transition_engine = Arc::new(Mutex::new(transition_engine));
         let report = StartupReport {
@@ -4097,7 +4075,8 @@ impl HeaderChainStore {
             self.db.write(self.recovery_batch(&final_audit)?)?;
         }
         let has_due_deferred = any_deferral_is_due(&final_audit);
-        let transition_engine = settle_before_publication(&self, config, has_due_deferred)?;
+        let transition_engine =
+            settle_deferred_before_publication(&self, config, has_due_deferred)?;
         let current = transition_engine.snapshot();
         let transition_engine = Arc::new(Mutex::new(transition_engine));
         let report = StartupReport {
@@ -4313,7 +4292,8 @@ impl HeaderChainStore {
         }
         self.clear_reconstruction_progress()?;
         let has_due_deferred = any_deferral_is_due(&final_audit);
-        let transition_engine = settle_before_publication(&self, config, has_due_deferred)?;
+        let transition_engine =
+            settle_deferred_before_publication(&self, config, has_due_deferred)?;
         let current = transition_engine.snapshot();
         let transition_engine = Arc::new(Mutex::new(transition_engine));
         let report = StartupReport {

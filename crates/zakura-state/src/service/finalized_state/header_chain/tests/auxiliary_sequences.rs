@@ -85,6 +85,10 @@ impl Sequence {
                     .copied()
             })
             .collect();
+        let window_before: Vec<(block::Hash, Vec<EvidenceId>)> = (0..3)
+            .filter_map(|offset| self.selected(offset))
+            .map(|node| (node.hash, node.aux_delivery_ids))
+            .collect();
         let authority = event.idempotency_key().map(Authority);
         let mut canonical = DiskWriteBatch::new();
         if let TransitionEvent::VerifiedChainChanged(change) = &event {
@@ -140,6 +144,26 @@ impl Sequence {
                 );
             }
         }
+        if committed {
+            let window_after: Vec<HeaderNode> =
+                (0..3).filter_map(|offset| self.selected(offset)).collect();
+            for (hash, before_ids) in window_before {
+                let Some(node) = window_after.iter().find(|node| node.hash == hash) else {
+                    continue;
+                };
+                let replaced = node
+                    .aux_delivery_ids
+                    .iter()
+                    .any(|delivery_id| !before_ids.contains(delivery_id));
+                assert!(
+                    replaced
+                        || before_ids
+                            .iter()
+                            .all(|delivery_id| node.aux_delivery_ids.contains(delivery_id)),
+                    "aggregate eviction cannot remove commit-window input"
+                );
+            }
+        }
         self.check();
         committed
     }
@@ -147,14 +171,8 @@ impl Sequence {
     fn check(&self) {
         let rows = self.runtime().store.load_aux_deliveries().unwrap();
         let bucket = self.config.limits.max_aux_deliveries_per_header.get();
-        let occupied: usize = (0..3)
-            .filter_map(|offset| self.selected(offset))
-            .map(|node| node.aux_delivery_ids.len())
-            .sum();
-        // This oracle uses durable rows and the published selected window, not engine capacity helpers.
-        assert!(
-            rows.len() + 3 * bucket - occupied <= self.config.limits.max_aux_deliveries_total.get()
-        );
+        // This oracle uses durable rows, not engine capacity helpers.
+        assert!(rows.len() <= self.config.limits.max_aux_deliveries_total.get());
         for row in &rows {
             let delivery = row.delivery();
             let node = self
@@ -258,9 +276,12 @@ impl Sequence {
         let parent = Frontier::new(node.height.previous().unwrap(), node.parent_hash);
         let owner = body_owner(&snapshot, 2, self.serial);
         let reader = self.runtime().reader();
+        // Header sync shortens the context to the prefix that one supplier serves.
         let context = reader
             .vct_repair_context(owner, node.height)
             .unwrap()
+            .unwrap()
+            .bounded_prefix(1)
             .unwrap();
         let lease = reader.validation_context(parent.hash).unwrap().unwrap();
         let rules = HeaderRules::for_validation_lease(&lease).unwrap();
@@ -315,19 +336,27 @@ impl Sequence {
             batch,
             aux: vec![delivery],
         })));
-        if repair && context.admission_capacity_available {
+        if repair && offset < 3 && context.admission_capacity_available {
             assert!(
                 committed,
-                "eligible selected repair must fit when preflight grants capacity"
+                "a commit-window repair must fit when preflight grants capacity"
             );
-        } else if repair && committed {
-            // Preflight does not predict space that settlement can reclaim from other branches.
-            assert!(prior_rows.iter().any(|row| self
+            assert!(self
+                .runtime()
+                .store
+                .load_aux_deliveries()
+                .unwrap()
+                .iter()
+                .any(|row| row.delivery().delivery_id == id));
+        }
+        if committed {
+            // Aggregate pressure evicts input rows, never their headers.
+            assert!(prior_rows.iter().all(|row| self
                 .runtime()
                 .store
                 .header_node(row.delivery().header_hash)
                 .unwrap()
-                .is_none()));
+                .is_some()));
         }
     }
 
@@ -425,7 +454,6 @@ proptest! {
         }
         sequence.deliver(3, false);
         sequence.deliver(4, false);
-        assert_eq!(sequence.runtime().reader().speculative_auxiliary_capacity().unwrap(), 0);
         sequence.deliver(5, true);
         sequence.observe(1, true);
         sequence.observe(1, false);

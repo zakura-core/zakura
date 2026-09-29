@@ -317,7 +317,7 @@ pub(super) fn admit_prepared_headers(
         if rooted_source_exists {
             continue;
         }
-        projected.make_aux_delivery_room(
+        if !projected.make_aux_delivery_room(
             engine,
             delivery.header_hash,
             context.config.limits,
@@ -325,7 +325,11 @@ pub(super) fn admit_prepared_headers(
                 event.completion,
                 TargetCompletion::SelectedAuxiliaryRepair { .. }
             ),
-        )?;
+        )? {
+            // Only authenticated or unchecked input fills this bucket. Drop the new input and
+            // keep its header, because auxiliary input is advisory.
+            continue;
+        }
         let index = projected.record_aux_delivery(*delivery)?;
         admitted_semantic_payloads.insert(semantic_key, index);
         if delivery.tree_aux.is_some() {

@@ -481,7 +481,7 @@ fn vct_repair_task(
 }
 
 fn vct_repair_predecessor(task: &RepairRequirement) -> Option<zakura_header_chain::Frontier> {
-    let context = match task.state() {
+    let context = match &task.state {
         RepairPolicyState::Ready { context }
         | RepairPolicyState::LocalBackoff { context, .. }
         | RepairPolicyState::StateBlocked { context, .. }
@@ -749,11 +749,6 @@ impl HeaderSyncReactor {
                 .vct_local_operation
                 .as_ref()
                 .is_some_and(|operation| operation.fatal_sent)
-                || self
-                    .vct_repair
-                    .current()
-                    .and_then(RepairRequirement::capacity_wait)
-                    .is_some_and(|wait| wait.fatal_sent)
             {
                 self.startup.shutdown.cancelled().await;
                 break HeaderRequestTerminal::Shutdown;
@@ -1363,7 +1358,7 @@ impl HeaderSyncReactor {
                 .body_owner()
                 .expect("an auxiliary repair has body authority");
             let context = self.vct_repair.get(repair_owner).and_then(|task| {
-                let RepairPolicyState::Assigned { context } = task.state() else {
+                let RepairPolicyState::Assigned { context } = &task.state else {
                     return None;
                 };
                 Some(context)
@@ -1411,7 +1406,7 @@ impl HeaderSyncReactor {
                 .tree_aux
                 .expect("a repair response has schema-1 auxiliary input");
             let excluded = self.vct_repair.get(repair_owner).is_some_and(|task| {
-                let RepairPolicyState::Assigned { context } = task.state() else {
+                let RepairPolicyState::Assigned { context } = &task.state else {
                     return false;
                 };
                 context.target == *selected_target
@@ -1573,7 +1568,7 @@ impl HeaderSyncReactor {
                     self.retire_peer_work(&peer, HeaderRequestTerminal::RepairObsolete);
                     return;
                 };
-                if !matches!(task.state(), RepairPolicyState::Assigned { .. }) {
+                if !matches!(task.state, RepairPolicyState::Assigned { .. }) {
                     self.retry_vct_repair(
                         owner,
                         VctRepairRetry::local(source, HeaderRequestTerminal::RepairObsolete),
@@ -1786,7 +1781,7 @@ impl HeaderSyncReactor {
         let repair_header_count = owner
             .body_owner()
             .and_then(|repair_owner| self.vct_repair.get(repair_owner))
-            .and_then(|task| match task.state() {
+            .and_then(|task| match &task.state {
                 RepairPolicyState::Assigned { context } => Some(context.selected_header_count()),
                 _ => None,
             });
@@ -1861,7 +1856,7 @@ impl HeaderSyncReactor {
                             .map(|snapshot| snapshot.state_version)
                             .or_else(|| {
                                 self.vct_repair.get(repair_owner).and_then(|task| {
-                                    let RepairPolicyState::Assigned { context } = task.state()
+                                    let RepairPolicyState::Assigned { context } = &task.state
                                     else {
                                         return None;
                                     };
@@ -1870,8 +1865,7 @@ impl HeaderSyncReactor {
                             });
                         let blocked = blocked_at.is_some_and(|state_version| {
                             self.vct_repair.get_mut(repair_owner).is_some_and(|task| {
-                                task.wait_for_state_change(state_version, Instant::now())
-                                    .is_ok()
+                                task.wait_for_state_change(state_version).is_ok()
                             })
                         });
                         if blocked {
@@ -1883,7 +1877,6 @@ impl HeaderSyncReactor {
                                     Some("auxiliary_capacity"),
                                 );
                             }
-                            self.request_vct_repair_context();
                         } else {
                             self.retry_vct_repair(
                                 repair_owner,
@@ -1902,15 +1895,13 @@ impl HeaderSyncReactor {
                 }
                 HeaderTargetAdmissionResult::ResourceStalled(receipt) => {
                     let blocked = self.vct_repair.get_mut(repair_owner).is_some_and(|task| {
-                        task.wait_for_state_change(receipt.state_version, Instant::now())
-                            .is_ok()
+                        task.wait_for_state_change(receipt.state_version).is_ok()
                     });
                     if blocked {
                         self.replay_committed_state_version(repair_owner);
                         if let Some(task) = self.vct_repair.get(repair_owner) {
                             self.emit_vct_repair_state(task, "wait", Some("resource_state_change"));
                         }
-                        self.request_vct_repair_context();
                     }
                     metrics::counter!("sync.header.vct.repair.resource_stalled.total").increment(1);
                 }
@@ -1980,7 +1971,7 @@ impl HeaderSyncReactor {
                         .body_owner()
                         .expect("an auxiliary repair preparation has body authority");
                     let valid = self.vct_repair.get(repair_owner).is_some_and(|task| {
-                        let RepairPolicyState::Assigned { context } = task.state() else {
+                        let RepairPolicyState::Assigned { context } = &task.state else {
                             return false;
                         };
                         target.target_tip_hash() == context.request_target().hash
@@ -2082,10 +2073,9 @@ impl HeaderSyncReactor {
 
     /// Replay the newest committed state version against one just-blocked repair.
     ///
-    /// A refusal can name a version the reactor already observed. Replay that version
-    /// immediately so the repair does not wait for a snapshot that already arrived. The caller
-    /// then requests context: the capacity deadline replaces the idle maintenance wake, so no
-    /// timer would dispatch the recheck.
+    /// Repair state changes are edge-triggered. A refusal can name a version the reactor has
+    /// already observed, and `StateBlocked` has no maintenance deadline, so a task blocked at a
+    /// superseded coordinate would wait for a snapshot that already arrived.
     fn replay_committed_state_version(&mut self, owner: zakura_header_chain::BodyWorkOwner) {
         let Some(state_version) = self
             .committed_snapshot
@@ -3113,7 +3103,7 @@ impl HeaderSyncReactor {
         if self
             .vct_repair
             .get(owner)
-            .is_none_or(|task| !matches!(task.state(), RepairPolicyState::QueryingContext { .. }))
+            .is_none_or(|task| !matches!(task.state, RepairPolicyState::QueryingContext { .. }))
         {
             return;
         }
@@ -3127,7 +3117,7 @@ impl HeaderSyncReactor {
                     .vct_repair
                     .get_mut(owner)
                     .expect("the exact scheduled repair was checked above")
-                    .resolve(context, Instant::now())
+                    .resolve(context)
                     .is_err()
                 {
                     self.vct_repair.remove(owner);
@@ -3181,7 +3171,7 @@ impl HeaderSyncReactor {
         let Some(task) = self.vct_repair.ready().cloned() else {
             return;
         };
-        let RepairPolicyState::Ready { context } = task.state() else {
+        let RepairPolicyState::Ready { context } = &task.state else {
             return;
         };
         let Some(predecessor) = context.locator.entries().first().copied() else {
@@ -3532,7 +3522,7 @@ impl HeaderSyncReactor {
 
     fn refresh_statuses(&mut self) {
         let now = Instant::now();
-        if self.report_fatal_vct_local_operation(now) || self.report_fatal_vct_capacity_wait(now) {
+        if self.report_fatal_vct_local_operation(now) {
             return;
         }
         self.refresh_vct_repair_stall(now);
@@ -3602,79 +3592,6 @@ impl HeaderSyncReactor {
         }) {
             self.vct_local_operation = None;
         }
-    }
-
-    /// Bound a continuous capacity wait, including unsuccessful context rechecks.
-    fn report_fatal_vct_capacity_wait(&mut self, now: Instant) -> bool {
-        let Some(wait) = self
-            .vct_repair
-            .current()
-            .and_then(RepairRequirement::capacity_wait)
-        else {
-            return false;
-        };
-        if wait.fatal_sent {
-            return true;
-        }
-        if now < wait.deadline() {
-            return false;
-        }
-        let latest_repair = self
-            .startup
-            .vct_root_repairs
-            .as_ref()
-            .map(|repairs| *repairs.borrow())
-            .filter(|status| *status != self.vct_repair_status);
-        if let Some(status) = latest_repair {
-            self.observe_vct_root_repair(status);
-        }
-        // A new snapshot requests a recheck; it does not prove capacity recovered.
-        let latest = self
-            .startup
-            .committed_snapshots
-            .as_ref()
-            .and_then(|snapshots| snapshots.borrow().clone())
-            .filter(|snapshot| {
-                self.committed_snapshot
-                    .as_ref()
-                    .is_none_or(|observed| snapshot.state_version > observed.state_version)
-            });
-        if let Some(snapshot) = latest {
-            self.observe_latest_committed_snapshot(snapshot);
-        }
-        let Some(wait) = self
-            .vct_repair
-            .current()
-            .and_then(RepairRequirement::capacity_wait)
-        else {
-            return false;
-        };
-        if wait.fatal_sent {
-            return true;
-        }
-        if now < wait.deadline() {
-            return false;
-        }
-        let task = self
-            .vct_repair
-            .current_mut()
-            .expect("the capacity wait has a repair owner");
-        let Some(wait) = task.take_capacity_expiry(now) else {
-            return false;
-        };
-        let event = HeaderSyncFatalEvent {
-            phase: "auxiliary_capacity",
-            owner: task.owner.into(),
-            repair_generation: task.repair_generation,
-            target: wait.target,
-            elapsed: now.saturating_duration_since(wait.since),
-        };
-        tracing::error!(%event, "VCT repair cannot acquire storage capacity; terminating the node");
-        metrics::counter!("sync.header.vct.repair.capacity_fatal.total").increment(1);
-        if let Some(events) = self.startup.fatal_events.as_ref() {
-            let _ = events.send(event);
-        }
-        true
     }
 
     /// Report one fatal event while retaining the original operation future until shutdown.

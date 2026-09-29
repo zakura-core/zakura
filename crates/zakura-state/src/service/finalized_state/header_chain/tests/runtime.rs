@@ -802,48 +802,26 @@ fn reconciled_store_with_finalized_prefix(
 }
 
 #[test]
-fn repair_context_uses_one_prerequisite_when_only_reserved_capacity_remains() {
-    let (mut runtime, _db, _genesis, path) = reconciled_store_with_finalized_prefix(5);
-    let snapshot = runtime.publisher().snapshot();
-    let owner = zakura_header_chain::BodyWorkAuthority::for_snapshot(&snapshot)
-        .bind(7, NonZeroU64::new(8).unwrap());
-    let target = &path[3];
-    let context = runtime
-        .reader()
-        .vct_repair_context(owner, target.height)
-        .unwrap()
-        .unwrap();
-    assert_eq!(context.selected_header_count(), 2);
-
-    runtime.config.limits.max_aux_deliveries_per_header = std::num::NonZeroUsize::new(1).unwrap();
-    runtime.config.limits.max_aux_deliveries_total = std::num::NonZeroUsize::new(3).unwrap();
-    let context = runtime
-        .reader()
-        .vct_repair_context(owner, target.height)
-        .unwrap()
-        .unwrap();
-    assert!(context.admission_capacity_available);
-    assert_eq!(context.selected_header_count(), 1);
-    assert_eq!(context.target, Frontier::new(target.height, target.hash));
-    assert_eq!(context.boundary_hash, Some(path[4].hash));
-}
-
-#[test]
-fn repair_context_does_not_grant_the_commit_reserve_to_a_speculative_target() {
+fn repair_context_range_ignores_aggregate_occupancy() {
     let (mut runtime, _db, _genesis, path) = reconciled_store_with_finalized_prefix(6);
-    runtime.set_auxiliary_limits_for_test(1, 3);
+    // Aggregate pressure evicts lower-priority input, so a one-slot store still grants the
+    // blocking target and its empty selected suffix.
+    runtime.set_auxiliary_limits_for_test(1, 1);
     let snapshot = runtime.publisher().snapshot();
     let owner = zakura_header_chain::BodyWorkAuthority::for_snapshot(&snapshot)
         .bind(7, NonZeroU64::new(8).unwrap());
-    let reader = runtime.reader();
-    assert_eq!(reader.speculative_auxiliary_capacity().unwrap(), 0);
     for index in [3, 4, 5] {
-        let context = reader
+        let context = runtime
+            .reader()
             .vct_repair_context(owner, path[index].height)
             .unwrap()
             .unwrap();
-        assert_eq!(context.admission_capacity_available, index < 5);
-        assert_eq!(context.selected_header_count(), 1);
+        assert!(context.admission_capacity_available);
+        assert_eq!(context.selected_header_count(), 6 - index);
+        assert_eq!(
+            context.target,
+            Frontier::new(path[index].height, path[index].hash)
+        );
     }
 }
 

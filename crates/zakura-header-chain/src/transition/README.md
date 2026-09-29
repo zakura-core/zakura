@@ -148,37 +148,34 @@ success changed state.
 
 Keep these three resource-limit outcomes separate:
 
-1. `TransitionFailure::AuxiliaryLimitExceeded` refuses the event before any
-   mutation and does not raise the resource-stall alarm.
+1. `TransitionFailure::AuxiliaryLimitExceeded` means protected auxiliary input
+   alone exceeds the aggregate bound after eviction. It refuses the event before
+   any mutation and does not raise the resource-stall alarm.
 2. A verified `resource_stalled` effect means retention cannot meet limits
    without evicting protected state. The plan keeps or raises the alarm.
 3. `InvariantViolation::Limits` means verification found a projected graph
    above frozen limits. Planning fails with no effects and does not return a
    resource-stall plan.
 
-## Recovery audit
+## Auxiliary capacity
 
-Every integrated transition reserves auxiliary capacity for the finalized header and its two
-selected successors. When a fork change would consume the new window's reserve, retention
-evicts unprotected headers that hold input, with their descendants. It evicts no other header.
-The planner and independent verifier check the post-retention bound.
-The planner refuses admission when protected evidence prevents reserve recovery.
-A store that already lacks the reserve can commit transitions that keep or reduce the deficit,
-but not ones that increase it.
-Finality releases old deliveries through the existing retention rules.
+Auxiliary input is advisory, so aggregate pressure evicts input rows, never headers, and never
+refuses header admission. After retention, the planner evicts input until the aggregate bound
+holds. It never evicts authenticated input or input for the finalized header and its two selected
+successors. It evicts input off the selected path first, then one row at a time from the fullest
+bucket, then from the highest header. Within a bucket, rejected input goes first, then disputed,
+then input without roots, then unchecked roots. New input competes on the same terms, so
+low-priority input is dropped. The independent verifier rejects deletion of commit-window input
+unless the plan admits replacement input for that header. A commit-window repair therefore fits
+unless its bucket holds only authenticated input, including in a store saturated before this rule.
 
 At a full per-header bucket, admission can replace rejected or disputed input. A selected repair
 can also replace unchecked input, including recovered rows whose outcome claims recovery
 has discarded. The row and header index change atomically. Authenticated input on a retained
-header cannot be deleted. Input replacement grants no header validity or root authority.
+header cannot be deleted. When nothing is replaceable, admission drops the new input and keeps
+its header. Input replacement grants no header validity or root authority.
 
-Startup settlement applies the same retention policy to an older saturated database. It cannot
-reconstruct inconsistent authoritative data or discard protected paths. When protected input
-keeps the reserve short, startup publishes the remaining deficit and finality drains it. Header sync starts its
-absolute capacity deadline on blockage. Failed context reads preserve the deadline. A positive
-capacity result clears it before assignment. A new blockage starts a new deadline. Expiry reports
-one fatal event after thirty continuous minutes. The sweep withdraws speculative requests when
-only the commit reserve remains.
+## Recovery audit
 
 Recovery reads a coherent durable snapshot and audits every authoritative row. It fails closed on contradictions in
 node identity, ancestry, work, validation, body authority, trust pins, eligibility roots, auxiliary provenance,

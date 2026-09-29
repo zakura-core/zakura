@@ -50,8 +50,8 @@ pub(crate) fn verify_aux<G: HeaderGraphView>(
         }
     }
     let deleted_ids: HashSet<_> = deletes
-        .into_iter()
-        .map(|(_, delivery_id)| delivery_id)
+        .iter()
+        .map(|(_, delivery_id)| *delivery_id)
         .collect();
     let puts: HashMap<_, _> = plan
         .change_set
@@ -73,46 +73,32 @@ pub(crate) fn verify_aux<G: HeaderGraphView>(
     if projected_aux_count > plan.limits.max_aux_deliveries_total.get() {
         return Err(InvariantViolation::Limits);
     }
-    let window_capacity = plan
-        .limits
-        .max_aux_deliveries_per_header
-        .get()
-        .saturating_mul(3);
-    if plan.change_set.metadata.mode == crate::EngineMode::Integrated
-        && projected_aux_count.saturating_add(window_capacity)
-            > plan.limits.max_aux_deliveries_total.get()
+    // Aggregate eviction never removes the next commit's input. Deleting retained input on the
+    // finalized header or its two selected successors is legal only when a full bucket admits
+    // a replacement in the same plan.
+    let frontiers = plan.change_set.metadata.frontiers;
+    for (header_hash, _) in deletes
+        .iter()
+        .filter(|(header_hash, _)| graph.view_header_node(*header_hash).is_some())
     {
-        let frontiers = plan.change_set.metadata.frontiers;
-        let mut occupied = 0usize;
-        for offset in 0..3 {
-            let Some(height) = frontiers
-                .finalized
-                .height
-                .0
-                .checked_add(offset)
-                .map(zakura_chain::block::Height)
-            else {
-                break;
-            };
-            if height > frontiers.header_best.height {
-                break;
-            }
-            let frontier = graph
-                .view_header_ancestor(frontiers.header_best.hash, height)
+        let node = graph
+            .view_header_node(*header_hash)
+            .ok_or(InvariantViolation::Auxiliary(*header_hash))?;
+        let in_commit_window = node.height.0.saturating_sub(frontiers.finalized.height.0) < 3
+            && node.height >= frontiers.finalized.height
+            && node.height <= frontiers.header_best.height
+            && graph
+                .view_header_ancestor(frontiers.header_best.hash, node.height)
                 .map_err(|_| InvariantViolation::Limits)?
-                .ok_or(InvariantViolation::Limits)?;
-            occupied = occupied.saturating_add(
-                graph
-                    .view_header_node(frontier.hash)
-                    .ok_or(InvariantViolation::Auxiliary(frontier.hash))?
-                    .aux_delivery_ids
-                    .len(),
-            );
-        }
-        if projected_aux_count.saturating_add(window_capacity.saturating_sub(occupied))
-            > engine_before_commit.auxiliary_reserve_ceiling(plan.limits)
-        {
-            return Err(InvariantViolation::Limits);
+                .is_some_and(|frontier| frontier.hash == *header_hash);
+        let replaced = puts.values().any(|delivery| {
+            delivery.header_hash == *header_hash
+                && engine_before_commit
+                    .aux_delivery(delivery.delivery_id)
+                    .is_none()
+        });
+        if in_commit_window && !replaced {
+            return Err(InvariantViolation::Auxiliary(*header_hash));
         }
     }
     let mut nodes: Vec<&HeaderNode> = match mode {
@@ -227,48 +213,58 @@ mod tests {
     }
 
     #[test]
-    fn projected_commit_reserve_includes_missing_successors() {
-        let fixture = fixture(EngineMode::Integrated);
-        // A side branch holds input outside the selected window. The window's second
-        // successor has not arrived, so its slot stays reserved.
-        let mut side_header = *fixture
-            .engine
-            .graph()
-            .header_node(fixture.child.hash)
-            .unwrap()
-            .header;
-        side_header.nonce.0[0] = 2;
-        let mut overlay = GraphOverlay::new(fixture.engine.graph());
-        let side = match overlay
-            .insert(
-                std::sync::Arc::new(side_header),
-                crate::HeaderValidationState::Valid,
-                [],
-                crate::BodyValidationState::Unknown,
-            )
-            .unwrap()
-        {
-            crate::InsertResult::Inserted(frontier)
-            | crate::InsertResult::AlreadyPresent(frontier) => frontier,
-        };
+    fn commit_window_input_is_deleted_only_for_a_replacement() {
+        let base = fixture(EngineMode::Integrated);
         let row = delivery(
-            &fixture.engine,
-            side.hash,
-            EvidenceId::from_digest([0x79; 32]),
+            &base.engine,
+            base.child.hash,
+            EvidenceId::from_digest([0x7a; 32]),
         );
+        let mut graph = base.engine.graph().clone();
+        graph
+            .record_auxiliary_evidence_delivery(base.child.hash, row.delivery_id)
+            .unwrap();
+        let engine = HeaderChainEngine::from_audited_state(
+            graph,
+            base.engine.metadata().clone(),
+            vec![base.anchor, base.child],
+            vec![base.anchor],
+            [row],
+        )
+        .unwrap();
+        let fixture = super::super::super::test_support::Fixture {
+            engine,
+            anchor: base.anchor,
+            child: base.child,
+        };
+        let delete = AuxDelta::Delete {
+            header_hash: fixture.child.hash,
+            delivery_id: row.delivery_id,
+        };
+
+        // Aggregate eviction may not remove the selected successor's input.
+        let mut overlay = GraphOverlay::new(fixture.engine.graph());
         overlay
-            .record_auxiliary_evidence_delivery(side.hash, row.delivery_id)
+            .remove_auxiliary_evidence_delivery(fixture.child.hash, row.delivery_id)
             .unwrap();
         let mut plan = candidate_with_delta(&fixture.engine, overlay.delta());
-        plan.change_set.aux_changes = vec![AuxDelta::Put(Box::new(row))];
-        plan.limits.max_aux_deliveries_per_header = NonZeroUsize::new(1).unwrap();
-        // The empty store exactly holds the reserve for the anchor, child, and missing successor.
-        plan.limits.max_aux_deliveries_total = NonZeroUsize::new(3).unwrap();
+        plan.change_set.aux_changes = vec![delete.clone()];
         assert_eq!(
             verify_in_both_modes(&fixture, &plan),
-            [Err(InvariantViolation::Limits); 2]
+            [Err(InvariantViolation::Auxiliary(fixture.child.hash)); 2]
         );
-        plan.limits.max_aux_deliveries_total = NonZeroUsize::new(4).unwrap();
+
+        // A full bucket may replace it with new input.
+        let replacement = delivery(
+            &fixture.engine,
+            fixture.child.hash,
+            EvidenceId::from_digest([0x7b; 32]),
+        );
+        overlay
+            .record_auxiliary_evidence_delivery(fixture.child.hash, replacement.delivery_id)
+            .unwrap();
+        let mut plan = candidate_with_delta(&fixture.engine, overlay.delta());
+        plan.change_set.aux_changes = vec![delete, AuxDelta::Put(Box::new(replacement))];
         assert_eq!(verify_in_both_modes(&fixture, &plan), [Ok(()); 2]);
     }
 

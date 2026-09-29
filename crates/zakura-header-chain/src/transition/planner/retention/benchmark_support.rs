@@ -80,7 +80,6 @@ impl RetentionBenchmarkFixture {
             self.finalized,
             [],
             limits,
-            None,
         )?;
         Ok(RetentionBenchmarkResult {
             admission_refused: plan.admission_refused,

@@ -77,11 +77,11 @@ features = [
 default-release-binaries = ["release_max_level_info", "progress-bar", "prometheus", "sentry", "opentelemetry"]
 
 
-# Default local builds retain common's automatic native CPU optimization.
+# Local builds use the compiler's target features for Pasta arithmetic.
 default = ["default-release-binaries"]
 
-# Disable build-host-specific x86-64 Pasta assembly for redistributable binaries.
-# Keep this out of the defaults so local builds can use BMI2+ADX automatically.
+# Disable x86-64 Pasta assembly for redistributable binaries.
+# Local builds can use BMI2+ADX when enabled by the Rust target.
 portable = ["dep:orchard", "orchard/portable"]
 
 # Production features that activate extra dependencies, or extra features in dependencies

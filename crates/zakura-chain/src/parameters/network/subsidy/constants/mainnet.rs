@@ -193,8 +193,7 @@ pub(crate) const POST_NU6_1_FUNDING_STREAM_FPF_ADDRESSES: [&str;
     POST_NU6_1_FUNDING_STREAMS_NUM_ADDRESSES] =
     ["t3cFfPt1Bcvgez9ZbMBFWeZsskxTkPzGCow"; POST_NU6_1_FUNDING_STREAMS_NUM_ADDRESSES];
 
-/// ZIP 2008's proposed mainnet recipient. Keep this change in draft until NU7
-/// deployment and the recipient address receive final confirmation.
+/// ZIP 2008's mainnet recipient. Confirm NU7 deployment before merging.
 const NU7_FPF_ADDRESS: &str = "t1MkHnkxVjNpNbCrSs3AJ8J7ZSp6NTYiUcG";
 
 /// Rotates the H3 stream at the first funding period beginning at or after NU7.

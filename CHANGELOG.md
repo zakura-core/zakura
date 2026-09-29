@@ -62,6 +62,9 @@ support-height adjustment. Published library crates are versioned independently.
   select Pasta assembly from Rust target features; use `-C target-cpu=native`
   on a supported CPU to enable BMI2 and ADX automatically
   ([#1206](https://github.com/zakura-core/zakura/pull/1206)).
+- Keep Testnet's minimum-difficulty waiting period at 7.5 minutes after NU7 by
+  requiring a gap of more than 18 target spacings
+  ([#1209](https://github.com/zakura-core/zakura/pull/1209)).
 
 ### Fixed
 

@@ -51,12 +51,11 @@ support-height adjustment. Published library crates are versioned independently.
 - Use zakura-common for Equihash proof verification and optional CPU mining,
   replacing the miner's C backend with a pure Rust solver
   ([#1191](https://github.com/zakura-core/zakura/pull/1191)).
-- Updated the estimated release height to 3,499,242, moving Mainnet's last
-  supported height from 3,528,681 to 3,533,802 while retaining the 30-day
-  support window and three-day warning lead
+- Updated the estimated release height to 3,498,435, moving Mainnet's last
+  supported height from 3,528,681 to 3,532,995 (about 3.74 days later) while
+  retaining the 30-day support window and three-day warning lead
   ([#1197](https://github.com/zakura-core/zakura/pull/1197),
-  [#1198](https://github.com/zakura-core/zakura/pull/1198),
-  [#1207](https://github.com/zakura-core/zakura/pull/1207)).
+  [#1198](https://github.com/zakura-core/zakura/pull/1198)).
 - Prepare the ZIP 2008 mainnet FPF/ZCG address rotation for NU7. Deployment requires final confirmation
   ([#1201](https://github.com/zakura-core/zakura/pull/1201)).
 - Updated Zakura Common from 2.1.0-rc.0 to 2.1.0. Local x86-64 builds now

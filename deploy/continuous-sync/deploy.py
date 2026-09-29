@@ -276,6 +276,7 @@ install -m 644 /tmp/zakura-monitor.service /etc/systemd/system/zakura-monitor.se
 install -m 644 /tmp/zakura-monitor.timer /etc/systemd/system/zakura-monitor.timer
 install -m 644 /tmp/zakura-continuous-logrotate /etc/logrotate.d/zakura-continuous-sync
 install -m 644 /tmp/zakura-continuous-tmpfiles.conf /etc/tmpfiles.d/zakura-continuous-sync.conf
+install -m 644 /tmp/zakura-network-sysctl.conf /etc/sysctl.d/60-zakura-network.conf
 
 touch "$wipe_sentinel"
 chmod 644 "$wipe_sentinel"
@@ -293,8 +294,11 @@ rm -f /tmp/zakura-continuous-sync.py \
   /tmp/zakura-monitor.service \
   /tmp/zakura-monitor.timer \
   /tmp/zakura-continuous-logrotate \
-  /tmp/zakura-continuous-tmpfiles.conf
+  /tmp/zakura-continuous-tmpfiles.conf \
+  /tmp/zakura-network-sysctl.conf
 
+# The node picks up the UDP buffer defaults when it next opens its socket.
+sysctl --load /etc/sysctl.d/60-zakura-network.conf >/dev/null
 systemd-tmpfiles --create /etc/tmpfiles.d/zakura-continuous-sync.conf || true
 systemctl daemon-reload
 systemctl enable "$node_service" >/dev/null
@@ -331,6 +335,7 @@ def deploy_node(node: Node, args: argparse.Namespace) -> tuple[str, bool, str]:
         "zakura-monitor.timer": tmp_dir / "zakura-monitor.timer",
         "logrotate": tmp_dir / "logrotate",
         "tmpfiles.conf": tmp_dir / "tmpfiles.conf",
+        "network-sysctl.conf": SCRIPT_DIR.parent / "sysctl" / "60-zakura-network.conf",
     }
     for name, content in rendered.items():
         staged[name].write_text(content, encoding="utf-8")
@@ -349,6 +354,7 @@ def deploy_node(node: Node, args: argparse.Namespace) -> tuple[str, bool, str]:
         (staged["zakura-monitor.timer"], "/tmp/zakura-monitor.timer"),
         (staged["logrotate"], "/tmp/zakura-continuous-logrotate"),
         (staged["tmpfiles.conf"], "/tmp/zakura-continuous-tmpfiles.conf"),
+        (staged["network-sysctl.conf"], "/tmp/zakura-network-sysctl.conf"),
     ]
     try:
         if args.dry_run:

@@ -186,6 +186,49 @@ class NodeBuilder:
         return deploy.Node(**data)
 
 
+class NetworkSysctlTests(NodeBuilder, unittest.TestCase):
+    def test_sysctl_file_raises_udp_socket_buffers(self):
+        settings = {}
+        for line in deploy.NETWORK_SYSCTL_CONF.read_text().splitlines():
+            if line.strip() and not line.startswith("#"):
+                key, value = (part.strip() for part in line.split("=", 1))
+                settings[key] = int(value)
+        # 212992 bytes is the stock Linux default for every one of these keys.
+        for key in ("rmem_default", "wmem_default", "rmem_max", "wmem_max"):
+            self.assertGreater(settings[f"net.core.{key}"], 212992)
+        self.assertLessEqual(settings["net.core.rmem_default"], settings["net.core.rmem_max"])
+        self.assertLessEqual(settings["net.core.wmem_default"], settings["net.core.wmem_max"])
+        self.assertEqual(settings["net.ipv4.tcp_slow_start_after_idle"], 0)
+
+    def test_deploy_installs_sysctls_before_the_node(self):
+        node = self.node(manage_config=False)
+        events = []
+
+        def fake_ssh(_node, script):
+            events.append("sysctl" if "sysctl --load" in script else "install")
+            return mock.Mock(returncode=0)
+
+        with mock.patch.object(deploy, "load_nodes", return_value=[node]), \
+                mock.patch.object(deploy, "build_nodes", return_value={"": Path("/bin/true")}), \
+                mock.patch.object(deploy, "build_publishers", return_value={}), \
+                mock.patch.object(deploy, "run"), \
+                mock.patch.object(deploy, "ssh_with_stdin", side_effect=fake_ssh):
+            args = mock.Mock(config="nodes.toml", node=None, force=False, no_restart=False)
+            self.assertEqual(deploy.cmd_deploy(args), 0)
+        self.assertEqual(events, ["sysctl", "install"])
+
+    def test_sysctl_failure_fails_the_node(self):
+        node = self.node(manage_config=False)
+        with mock.patch.object(deploy, "load_nodes", return_value=[node]), \
+                mock.patch.object(deploy, "build_nodes", return_value={"": Path("/bin/true")}), \
+                mock.patch.object(deploy, "build_publishers", return_value={}), \
+                mock.patch.object(deploy, "run"), \
+                mock.patch.object(deploy, "ssh_with_stdin", return_value=mock.Mock(returncode=1)) as ssh:
+            args = mock.Mock(config="nodes.toml", node=None, force=False, no_restart=False)
+            self.assertEqual(deploy.cmd_deploy(args), 1)
+        ssh.assert_called_once()
+
+
 class MountRenderingTests(NodeBuilder, unittest.TestCase):
     def test_render_service_requires_data_mount_for_data_paths(self):
         service = deploy.render_service(self.node(

@@ -14,6 +14,7 @@ use std::{
     time::Duration,
 };
 
+use indexmap::IndexSet;
 use thiserror::Error;
 use tokio::{
     sync::{mpsc, oneshot, Mutex, OwnedSemaphorePermit, Semaphore},
@@ -2019,7 +2020,7 @@ fn record_block_response_source(
     trace: &ZakuraTrace,
     response: Response,
     source: BlockBodySource,
-    requested_hashes: Option<&HashSet<block::Hash>>,
+    requested_hashes: Option<&IndexSet<block::Hash>>,
 ) -> Response {
     if let (Response::Blocks(blocks), Some(requested_hashes)) = (&response, requested_hashes) {
         for block in blocks {
@@ -3887,7 +3888,7 @@ mod tests {
         let adapter = LegacyRequestAdapter::new(node_b.supervisor());
         let response = adapter
             .request_from_source(
-                Request::BlocksByHash(HashSet::from([hash])),
+                Request::BlocksByHash(IndexSet::from([hash])),
                 Some(PeerSource::Zakura(a_peer_id)),
             )
             .await?;
@@ -3924,7 +3925,7 @@ mod tests {
         let adapter = LegacyRequestAdapter::new(node_b.supervisor());
         let response = adapter
             .request_from_source(
-                Request::BlocksByHash(HashSet::from([block.hash()])),
+                Request::BlocksByHash(IndexSet::from([block.hash()])),
                 Some(PeerSource::Zakura(a_peer_id)),
             )
             .await?;
@@ -4989,6 +4990,20 @@ mod tests {
             block_request
         );
 
+        let requested_hashes = vec![block_hash(2), block_hash(1), block_hash(2)];
+        let peer_id = ZakuraPeerId::new(vec![1; 32]).expect("test peer id is within bounds");
+        let Request::BlocksByHash(hashes) = LegacyRequestFrame::BlocksByHash(requested_hashes)
+            .into_service_request(peer_id)
+            .expect("block request has a service request")
+        else {
+            panic!("block request must produce BlocksByHash");
+        };
+        assert_eq!(
+            hashes.into_iter().collect::<Vec<_>>(),
+            vec![block_hash(2), block_hash(1)],
+            "block request conversion must preserve first-seen hash order",
+        );
+
         let tx_request =
             LegacyRequestFrame::TransactionsById(vec![legacy_tx_id(3), witnessed_tx_id(4)]);
         assert_eq!(
@@ -5568,7 +5583,7 @@ mod tests {
     fn unsupported_requests_fail_loudly() {
         let unsupported = [
             (
-                Request::BlocksByHash(HashSet::from([block_hash(1)])),
+                Request::BlocksByHash(IndexSet::from([block_hash(1)])),
                 "BlocksByHash",
             ),
             (
@@ -5749,7 +5764,7 @@ mod tests {
 
         let adapter = LegacyRequestAdapter::new(node.supervisor());
         let request = adapter.request_from_source(
-            Request::BlocksByHash(HashSet::from([block_hash(1)])),
+            Request::BlocksByHash(IndexSet::from([block_hash(1)])),
             Some(PeerSource::Zakura(hostile_id)),
         );
         let responder = hostile.respond_to_next_request(vec![response]);
@@ -5781,7 +5796,7 @@ mod tests {
         let adapter =
             LegacyRequestAdapter::new_with_timeout(node.supervisor(), Duration::from_millis(100));
         let first_request = adapter.request_from_source(
-            Request::BlocksByHash(HashSet::from([block_hash(1)])),
+            Request::BlocksByHash(IndexSet::from([block_hash(1)])),
             Some(PeerSource::Zakura(hostile_id.clone())),
         );
         let hold_first = hostile.accept_next_request_without_response();
@@ -5797,7 +5812,7 @@ mod tests {
 
         let second_hash = block_hash(2);
         let second_request = adapter.request_from_source(
-            Request::BlocksByHash(HashSet::from([second_hash])),
+            Request::BlocksByHash(IndexSet::from([second_hash])),
             Some(PeerSource::Zakura(hostile_id)),
         );
         let second_response = hostile.respond_to_next_request_with(|request_id| {
@@ -5827,7 +5842,7 @@ mod tests {
 
         let adapter = LegacyRequestAdapter::new(node.supervisor());
         let request = adapter.request_from_source(
-            Request::BlocksByHash(HashSet::from([block_hash(1)])),
+            Request::BlocksByHash(IndexSet::from([block_hash(1)])),
             Some(PeerSource::Zakura(hostile_id)),
         );
         let responder = hostile.respond_to_next_request_with(|request_id| {
@@ -5875,7 +5890,7 @@ mod tests {
 
         let adapter = LegacyRequestAdapter::new(node.supervisor());
         let request = adapter.request_from_source(
-            Request::BlocksByHash(HashSet::from([block_hash(1)])),
+            Request::BlocksByHash(IndexSet::from([block_hash(1)])),
             Some(PeerSource::Zakura(hostile_id)),
         );
         let responder = hostile.respond_to_next_request_with(|request_id| {
@@ -6027,7 +6042,7 @@ mod tests {
         let response = composite
             .ready()
             .await?
-            .call(Request::BlocksByHash(HashSet::from([hash])))
+            .call(Request::BlocksByHash(IndexSet::from([hash])))
             .await?;
         assert!(matches!(
             response,
@@ -6067,7 +6082,7 @@ mod tests {
         let response = composite
             .ready()
             .await?
-            .call(Request::BlocksByHash(HashSet::from([hash])))
+            .call(Request::BlocksByHash(IndexSet::from([hash])))
             .await?;
         assert!(matches!(
             response,
@@ -6089,7 +6104,7 @@ mod tests {
             BLOCK_TESTNET_141042_BYTES.as_slice(),
         )?);
         let received_hash = block.hash();
-        let requested_hashes = HashSet::from([block_hash(250)]);
+        let requested_hashes = IndexSet::from([block_hash(250)]);
         assert!(!requested_hashes.contains(&received_hash));
         let trace = ZakuraTrace::noop();
 

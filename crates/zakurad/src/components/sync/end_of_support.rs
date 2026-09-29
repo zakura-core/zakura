@@ -13,7 +13,10 @@ use zakura_chain::{
 use crate::application::release_version;
 
 /// The estimated height that this release will be published.
-pub const ESTIMATED_RELEASE_HEIGHT: u32 = 3_494_121;
+///
+/// Projected to 2026-09-28 23:37 UTC from the committed release-state bundle
+/// using `scripts/release-readiness.py` at the Mainnet target spacing.
+pub const ESTIMATED_RELEASE_HEIGHT: u32 = 3_498_435;
 
 /// The estimated number of blocks per day after Blossom.
 ///
@@ -21,18 +24,18 @@ pub const ESTIMATED_RELEASE_HEIGHT: u32 = 3_494_121;
 /// every reachable tip height.
 pub const ESTIMATED_BLOCKS_PER_DAY: u32 = 24 * 60 * 60 / POST_BLOSSOM_POW_TARGET_SPACING;
 
-/// The maximum number of days after `ESTIMATED_RELEASE_HEIGHT` where a Zebra server will run
-/// without halting.
+/// The maximum number of days after [`ESTIMATED_RELEASE_HEIGHT`] that a Zakura
+/// server will run without halting.
 ///
 /// Notes:
 ///
-/// - Zebra will exit with a panic if the current tip height is bigger than the
-///   `ESTIMATED_RELEASE_HEIGHT` plus this number of days.
+/// - Zakura will exit with a panic if the current tip height is bigger than
+///   [`ESTIMATED_RELEASE_HEIGHT`] plus this number of days at the target spacing.
 /// - Currently set to 30 days
 ///
-/// Note: v1.5.0 is planned for 2026-09-23, but its release-height floor is
-/// 3,494,121 (~2026-09-25). This window halts after height 3,528,681
-/// (~2026-10-25), about 32 days after the planned release.
+/// With this release's [`ESTIMATED_RELEASE_HEIGHT`], Mainnet is supported through
+/// height 3,532,995 and halts after it (~2026-10-28). Calendar dates are estimates;
+/// enforcement follows the chain tip height.
 pub const EOS_PANIC_AFTER: u32 = 30;
 
 /// The number of days before the end of support where Zebra will display warnings.

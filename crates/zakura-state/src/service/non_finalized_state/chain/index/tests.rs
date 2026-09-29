@@ -33,31 +33,40 @@ fn cloned_chain_keeps_transparent_address_history_isolated() {
         Default::default(),
         ValueBalance::<NonNegative>::zero(),
     );
-    chain
+    *chain
         .partial_transparent_transfers
-        .insert(address, Arc::new(transfers));
+        .get_or_insert_mut(address) = transfers;
     let original = Arc::new(chain);
     let mut candidate = Arc::unwrap_or_clone(Arc::clone(&original));
+    let history = |chain: &Chain| {
+        chain
+            .partial_transparent_transfers
+            .get(&address)
+            .expect("the address was inserted above")
+            .clone()
+    };
 
-    let original_transfers = &original.partial_transparent_transfers[&address];
-    let candidate_transfers = &candidate.partial_transparent_transfers[&address];
-    assert!(Arc::ptr_eq(original_transfers, candidate_transfers));
+    assert!(std::ptr::eq(
+        original
+            .partial_transparent_transfers
+            .get(&address)
+            .unwrap(),
+        candidate
+            .partial_transparent_transfers
+            .get(&address)
+            .unwrap(),
+    ));
 
-    let candidate_transfers = candidate
+    candidate
         .partial_transparent_transfers
         .get_mut(&address)
-        .expect("the address was inserted above");
-    Arc::make_mut(candidate_transfers).tx_ids.insert(added);
+        .expect("the address was inserted above")
+        .tx_ids
+        .insert(added);
 
-    assert!(candidate.partial_transparent_transfers[&address]
-        .tx_ids
-        .contains(&added));
-    assert!(!original.partial_transparent_transfers[&address]
-        .tx_ids
-        .contains(&added));
-    assert!(original.partial_transparent_transfers[&address]
-        .tx_ids
-        .contains(&existing));
+    assert!(history(&candidate).tx_ids.contains(&added));
+    assert!(!history(&original).tx_ids.contains(&added));
+    assert!(history(&original).tx_ids.contains(&existing));
 }
 
 #[test]
@@ -103,10 +112,11 @@ fn compare_address_index_clone() {
         Default::default(),
         ValueBalance::<NonNegative>::zero(),
     );
-    chain.partial_transparent_transfers = old_index
-        .iter()
-        .map(|(address, transfers)| (*address, Arc::new(transfers.clone())))
-        .collect();
+    for (address, transfers) in &old_index {
+        *chain
+            .partial_transparent_transfers
+            .get_or_insert_mut(*address) = transfers.clone();
+    }
     let chain = Arc::new(chain);
 
     let measure = |mut operation: Box<dyn FnMut()>| {
@@ -161,14 +171,12 @@ fn compare_address_index_clone() {
     let shared_clone_and_update = measure(Box::new(|| {
         let mut candidate = Arc::unwrap_or_clone(Arc::clone(&chain));
         for address in &touched {
-            Arc::make_mut(
-                candidate
-                    .partial_transparent_transfers
-                    .get_mut(address)
-                    .expect("the address was inserted above"),
-            )
-            .tx_ids
-            .insert(added);
+            candidate
+                .partial_transparent_transfers
+                .get_mut(address)
+                .expect("the address was inserted above")
+                .tx_ids
+                .insert(added);
         }
         black_box(candidate);
     }));

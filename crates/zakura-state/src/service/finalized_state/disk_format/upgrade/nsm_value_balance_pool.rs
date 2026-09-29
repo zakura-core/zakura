@@ -1015,6 +1015,23 @@ mod database_tests {
         check_batch_boundary_retry_and_idempotence(BATCH_BLOCKS + 1, 48, 1);
     }
 
+    /// Migrates rows past the third halving, so the checked balances come from several
+    /// eras of the issuance schedule rather than only the first.
+    #[test]
+    fn migration_balances_span_halvings() {
+        let network = accounting_network(0);
+        let rows = (1..)
+            .find(|height| {
+                zakura_chain::parameters::subsidy::halving(Height(*height), &network) == 3
+            })
+            .expect("the regtest schedule halves within u32 heights")
+            + 1;
+        let db = legacy_db(rows, 48);
+        let (_tx, rx) = crossbeam_channel::bounded(1);
+        Upgrade.run(Some(Height(rows - 1)), &db, &rx).unwrap();
+        assert_upgraded(&db, rows);
+    }
+
     #[test]
     fn migration_cancellation_between_batches_is_retryable() {
         let db = legacy_db(BATCH_BLOCKS + 3, 48);

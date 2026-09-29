@@ -15,6 +15,7 @@ use futures::{
     sink::SinkMapErr,
     FutureExt, SinkExt, StreamExt,
 };
+use indexmap::IndexSet;
 use tower::load_shed::error::Overloaded;
 use tracing::Span;
 
@@ -1043,16 +1044,20 @@ async fn protected_connection_attributes_inbound_block_request() {
     let (connection, _client_tx, mut inbound_service, _peer_messages, _error_slot) =
         new_protected_test_connection();
     let connection_handle = tokio::spawn(connection.run(peer_rx));
-    let hash = block::Hash([0x11; 32]);
+    let parent_hash = block::Hash([0x11; 32]);
+    let child_hash = block::Hash([0x22; 32]);
 
     peer_tx
-        .send(Ok(Message::GetData(vec![hash.into()])))
+        .send(Ok(Message::GetData(vec![
+            parent_hash.into(),
+            child_hash.into(),
+        ])))
         .await
         .expect("test peer channel is open");
 
     inbound_service
         .expect_request(Request::BlocksByHashFrom {
-            hashes: HashSet::from([hash]),
+            hashes: IndexSet::from([parent_hash, child_hash]),
             source: PeerSource::LegacySocket(
                 "127.0.0.1:4"
                     .parse()

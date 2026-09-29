@@ -6,6 +6,7 @@ FROM ${UBUNTU_IMAGE} AS build
 ARG DEBIAN_FRONTEND=noninteractive
 ARG RUST_VERSION=1.97
 ARG FEATURES="default-release-binaries"
+# Exported packages must not inherit the build host's x86-64 Pasta backend.
 
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
@@ -35,7 +36,7 @@ RUN --mount=type=cache,target=/root/.cargo/registry \
     --mount=type=cache,target=/root/.cargo/git \
     --mount=type=cache,target=/workspace/target \
 #     RUSTFLAGS="${RUSTFLAGS}" \
-    cargo build --locked --release --features "${FEATURES}" --package zakura --bin zakurad && \
+    cargo build --locked --release --features "${FEATURES},portable" --package zakura --bin zakurad && \
     install -D target/release/zakurad /out/zakurad
 
 FROM scratch AS artifact

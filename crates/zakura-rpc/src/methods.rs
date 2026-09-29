@@ -3037,7 +3037,8 @@ where
                 // The loop finishes if:
                 // - the client didn't pass a long poll ID,
                 // - the server long poll ID is different to the client long poll ID, or
-                // - the previous loop iteration reached the template refresh time.
+                // - the previous loop iteration reached the template refresh
+                //   time.
                 if Some(&server_long_poll_id) != client_long_poll_id.as_ref()
                     || time_refresh_reached
                 {
@@ -3216,7 +3217,8 @@ where
                         continue 'rebuild;
                     }
 
-                    // Testnet refreshes one target spacing before minimum difficulty.
+                    // Testnet refreshes one target spacing before the first
+                    // minimum-difficulty timestamp.
                     // Mainnet only reaches this limit after a long stall.
                     Some(_elapsed) = wait_for_time_refresh => {
                         // This log is very rare so it's ok to be info.

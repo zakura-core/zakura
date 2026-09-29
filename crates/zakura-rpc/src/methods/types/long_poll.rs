@@ -51,8 +51,8 @@ pub struct LongPollInput {
     /// A changed or expired time range requires fresh work. On testnet, the
     /// range changes when the timestamp selects a different difficulty.
     ///
-    /// Ideally, a new template should be provided at least one target block interval before
-    /// the max time. This avoids wasted work.
+    /// Testnet offers minimum-difficulty work one target spacing before its
+    /// first valid timestamp.
     pub max_time: DateTime32,
 
     // Fields that allow old work:
@@ -157,8 +157,8 @@ pub struct LongPollId {
     /// A changed or expired time range requires fresh work. On testnet, the
     /// range changes when the timestamp selects a different difficulty.
     ///
-    /// Ideally, a new template should be provided at least one target block interval before
-    /// the max time. This avoids wasted work.
+    /// Testnet offers minimum-difficulty work one target spacing before its
+    /// first valid timestamp.
     ///
     /// Zcash times are limited to 32 bits by the consensus rules.
     pub(crate) max_timestamp: u32,

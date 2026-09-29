@@ -526,15 +526,17 @@ mod tests {
         let mut header = *block.header;
         header.time = median_time.to_chrono();
         header.difficulty_threshold = (limit / 4_u32).to_compact();
+        let shared_header = Arc::new(header);
 
-        // The first minimum timestamp can equal the ceiling, but cannot exceed it.
+        // The first minimum timestamp can equal the ceiling, but cannot exceed
+        // it.
         for first_minimum_time in [
             consensus_max,
             consensus_max
                 .checked_add(Duration32::from_seconds(1))
                 .unwrap(),
         ] {
-            let mut relevant_chain = vec![Arc::new(header); span];
+            let mut relevant_chain = vec![shared_header.clone(); span];
             let mut parent = header;
             parent.time = first_minimum_time
                 .checked_sub(gap)

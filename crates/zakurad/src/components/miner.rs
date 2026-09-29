@@ -761,7 +761,7 @@ mod tests {
     }
 
     #[test]
-    fn mining_template_replaces_harder_work_after_testnet_timeout() {
+    fn mining_template_replaces_harder_work_at_testnet_switch() {
         use zakura_chain::work::difficulty::ParameterDifficulty;
 
         let block = zakura_test::vectors::BLOCK_MAINNET_1_BYTES

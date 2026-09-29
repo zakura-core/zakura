@@ -698,7 +698,7 @@ pub struct GetBlockTemplateChainInfo {
     /// The suggested block timestamp within [`min_time`](Self::min_time) and
     /// [`max_time`](Self::max_time). Testnet may advance it by up to one target
     /// spacing to select minimum difficulty early.
-    /// Always depends on the local clock and the `tip_hash`.
+    /// Always depends on the local clock and [`tip_hash`](Self::tip_hash).
     pub cur_time: DateTime32,
 
     /// The minimum timestamp compatible with the candidate block's difficulty.
@@ -711,8 +711,9 @@ pub struct GetBlockTemplateChainInfo {
 
     /// The local clock time at which mining work should be refreshed.
     ///
-    /// For normal-difficulty testnet work, this is one target spacing before the
-    /// first minimum-difficulty timestamp if that timestamp is consensus-valid.
+    /// For normal-difficulty testnet work, this is one target spacing before
+    /// the first minimum-difficulty timestamp if that timestamp is
+    /// consensus-valid.
     /// Otherwise, testnet refreshes one second after the consensus ceiling.
     /// On mainnet, it is [`max_time`](Self::max_time).
     pub time_refresh_at: DateTime32,

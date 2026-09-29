@@ -1799,7 +1799,9 @@ impl HeaderChainReader {
             admission_capacity_available,
             &durable_rows,
         )?;
-        if !durable_rows.is_empty() || !admission_capacity_available {
+        if zakura_header_chain::VctRepairContext::rows_constrain_repair(&durable_rows)
+            || !admission_capacity_available
+        {
             return Ok(Some(context));
         }
 
@@ -1860,7 +1862,9 @@ impl HeaderChainReader {
                 )
                 .into());
             }
-            if !candidate_rows.is_empty() {
+            if zakura_header_chain::VctRepairContext::rows_constrain_repair(&candidate_rows)
+                || !engine.auxiliary_admission_capacity(candidate.hash, self.config.limits)
+            {
                 break;
             }
             suffix.push(candidate);
@@ -3093,8 +3097,12 @@ impl HeaderChainRuntime {
                     &durable_rows_by_target[0],
                 )?;
                 if repair_range.len() > 1 {
-                    if durable_rows_by_target.iter().any(|rows| !rows.is_empty())
-                        || before.alarms.resource_stalled
+                    if durable_rows_by_target.iter().any(|rows| {
+                        zakura_header_chain::VctRepairContext::rows_constrain_repair(rows)
+                    }) || repair_range.iter().any(|target| {
+                        !transition_engine
+                            .auxiliary_admission_capacity(target.hash, context.config.limits)
+                    }) || before.alarms.resource_stalled
                     {
                         return Ok(ApplyResult::Stale(StaleReceipt {
                             current_version: before.state_version,
@@ -3103,8 +3111,9 @@ impl HeaderChainRuntime {
                     }
                     current = current
                         .extend_empty_selected_range(&repair_range[1..], terminal_boundary_hash)?;
-                } else if durable_rows_by_target[0].is_empty()
-                    && current.admission_capacity_available
+                } else if !zakura_header_chain::VctRepairContext::rows_constrain_repair(
+                    &durable_rows_by_target[0],
+                ) && current.admission_capacity_available
                     && current.episode != episode
                 {
                     current = current.extend_empty_selected_range(&[], terminal_boundary_hash)?;

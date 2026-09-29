@@ -253,6 +253,46 @@ fn nu6_3_keeps_post_blossom_timing_rules() {
     );
 }
 
+/// Testnet keeps the historical gap until its configured NU7 activation, then
+/// requires 18 target spacings before minimum difficulty applies.
+#[test]
+fn nu7_testnet_minimum_difficulty_gap_starts_at_activation() {
+    const NU7: u32 = 400_000;
+    let network = Network::new_regtest(
+        ConfiguredActivationHeights {
+            nu7: Some(NU7),
+            ..Default::default()
+        }
+        .into(),
+    );
+    let previous_time =
+        chrono::DateTime::from_timestamp(2_000_000_000, 0).expect("the test timestamp is in range");
+
+    for (height, expected_gap) in [(NU7 - 1, 6 * 75), (NU7, 18 * 25), (NU7 + 1, 18 * 25)] {
+        let height = Height(height);
+        assert_eq!(
+            NetworkUpgrade::minimum_difficulty_spacing_for_height(&network, height)
+                .expect("the testnet rule is active at the test height")
+                .num_seconds(),
+            expected_gap,
+        );
+        for (seconds, expected_minimum_difficulty) in
+            [(expected_gap, false), (expected_gap + 1, true)]
+        {
+            assert_eq!(
+                NetworkUpgrade::is_testnet_min_difficulty_block(
+                    &network,
+                    height,
+                    previous_time + chrono::Duration::seconds(seconds),
+                    previous_time,
+                ),
+                expected_minimum_difficulty,
+                "unexpected minimum difficulty at height {height:?} and gap {seconds}",
+            );
+        }
+    }
+}
+
 /// Pins the BIP-70 network names, which appear in payment URIs and RPC
 /// responses: Regtest deliberately shares Testnet's "test" name.
 #[test]

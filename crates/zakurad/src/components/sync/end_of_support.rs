@@ -14,9 +14,9 @@ use crate::application::release_version;
 
 /// The estimated height that this release will be published.
 ///
-/// Projected to 2026-09-28 23:37 UTC from the committed release-state bundle
-/// using `scripts/release-readiness.py` at the Mainnet target spacing.
-pub const ESTIMATED_RELEASE_HEIGHT: u32 = 3_498_435;
+/// Projected for 2026-09-29 from a verified release-state bundle using
+/// `scripts/release-readiness.py` at the Mainnet target spacing.
+pub const ESTIMATED_RELEASE_HEIGHT: u32 = 3_499_242;
 
 /// The estimated number of blocks per day after Blossom.
 ///
@@ -34,17 +34,17 @@ pub const ESTIMATED_BLOCKS_PER_DAY: u32 = 24 * 60 * 60 / POST_BLOSSOM_POW_TARGET
 /// - Currently set to 30 days
 ///
 /// With this release's [`ESTIMATED_RELEASE_HEIGHT`], Mainnet is supported through
-/// height 3,532,995 and halts after it (~2026-10-28). Calendar dates are estimates;
-/// enforcement follows the chain tip height.
+/// height 3,533,802 and halts after it (~2026-10-29). Calendar dates are
+/// estimates; enforcement follows the chain tip height.
 pub const EOS_PANIC_AFTER: u32 = 30;
 
-/// The number of days before the end of support where Zebra will display warnings.
+/// The number of days before the end of support where Zakura displays warnings.
 pub const EOS_WARN_AFTER: u32 = EOS_PANIC_AFTER - 3;
 
-/// A string which is part of the panic that will be displayed if Zebra halts.
+/// A string which is part of the panic displayed if Zakura halts.
 pub const EOS_PANIC_MESSAGE_HEADER: &str = "Zakura refuses to run";
 
-/// A string which is part of the warning that will be displayed if Zebra release is close to halting.
+/// A string which is part of the warning displayed near Zakura's halt height.
 pub const EOS_WARN_MESSAGE_HEADER: &str = "Your Zakura release is too old and it will stop running";
 
 /// The amount of time between end of support checks.

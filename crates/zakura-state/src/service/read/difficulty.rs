@@ -28,6 +28,25 @@ use crate::{
     BoxError, GetBlockTemplateChainInfo,
 };
 
+/// The number of target block spacings we allow for a miner to mine a standard
+/// difficulty block on testnet.
+///
+/// This is a Zebra-specific standard rule.
+const EXTRA_SPACINGS_TO_MINE_A_BLOCK: i32 = 1;
+
+/// Returns the amount of extra time we allow for a miner to mine a standard
+/// difficulty block on testnet, for a block at `height`.
+///
+/// The time scales with the target spacing at `height`, so it stays below the
+/// minimum difficulty gap after ZIP 218 shortens the spacing at NU7. Before NU7
+/// it is 75 seconds.
+fn extra_time_to_mine_a_block(network: &Network, height: Height) -> Result<Duration32, BoxError> {
+    let extra_time =
+        NetworkUpgrade::target_spacing_for_height(network, height) * EXTRA_SPACINGS_TO_MINE_A_BLOCK;
+
+    Ok(extra_time.try_into()?)
+}
+
 fn finalized_state_query_interrupted_error() -> BoxError {
     "Zakura is committing too many blocks to the state, \
      wait until it syncs to the chain tip"
@@ -256,7 +275,7 @@ fn difficulty_time_and_history_tree(
             .collect(),
     ))?;
 
-    let mut min_time = median_time_past
+    let min_time = median_time_past
         .checked_add(Duration32::from_seconds(1))
         .expect("a valid block time plus a small constant is in-range");
 
@@ -264,54 +283,22 @@ fn difficulty_time_and_history_tree(
     // > MUST be less than or equal to the median-time-past of that block plus 90 * 60 seconds.
     //
     // We ignore the height as we are checkpointing on Canopy or higher in Mainnet and Testnet.
-    let mut max_time = median_time_past
+    let max_time = median_time_past
         .checked_add(Duration32::from_seconds(BLOCK_MAX_TIME_SINCE_MEDIAN))
         .expect("a valid block time plus a small constant is in-range");
 
-    let mut cur_time = cur_time.clamp(min_time, max_time);
-    let mut time_refresh_at = max_time;
+    let cur_time = cur_time.clamp(min_time, max_time);
 
-    let candidate_height = tip_height.next()?;
-    if let Some(gap) =
-        NetworkUpgrade::minimum_difficulty_spacing_for_height(network, candidate_height)
-    {
-        let parent_time = DateTime32::try_from(relevant_chain[0].time)?;
-        let standard_difficulty_max_time = parent_time
-            .checked_add(gap.try_into()?)
-            .ok_or("testnet difficulty timeout exceeds the timestamp range")?;
-        let first_minimum_time = standard_difficulty_max_time
-            .checked_add(Duration32::from_seconds(1))
-            .ok_or("testnet minimum-difficulty time exceeds the timestamp range")?;
-        let spacing = NetworkUpgrade::target_spacing_for_height(network, candidate_height);
-        let minimum_difficulty_refresh_time =
-            first_minimum_time
-                .checked_sub(spacing.try_into()?)
-                .ok_or("testnet minimum-difficulty refresh precedes the timestamp range")?;
-
-        time_refresh_at = max_time.saturating_add(Duration32::from_seconds(1));
-        // Offer minimum-difficulty work one target spacing early, but only if
-        // its timestamp fits within the full consensus range. Keep every time
-        // mutation compatible with the difficulty selected below.
-        if first_minimum_time <= max_time && cur_time >= minimum_difficulty_refresh_time {
-            min_time = min_time.max(first_minimum_time);
-            cur_time = cur_time.max(min_time);
-        } else {
-            if first_minimum_time <= max_time {
-                time_refresh_at = minimum_difficulty_refresh_time;
-            }
-            max_time = max_time.min(standard_difficulty_max_time);
-        }
-    }
-
+    // Now that we have a valid time, get the difficulty for that time.
     let difficulty_adjustment = AdjustedDifficulty::new_from_header_time(
         cur_time.into(),
         tip_height,
         network,
-        relevant_data,
+        relevant_data.iter().cloned(),
     )?;
     let expected_difficulty = difficulty_adjustment.expected_difficulty_threshold();
 
-    Ok(GetBlockTemplateChainInfo {
+    let mut result = GetBlockTemplateChainInfo {
         tip_hash,
         tip_height,
         chain_history_root: history_tree.hash(),
@@ -319,9 +306,124 @@ fn difficulty_time_and_history_tree(
         cur_time,
         min_time,
         max_time,
-        time_refresh_at,
+        time_refresh_at: max_time,
         value_pools,
-    })
+    };
+
+    adjust_difficulty_and_time_for_testnet(&mut result, network, tip_height, relevant_data)?;
+
+    Ok(result)
+}
+
+/// Adjust the difficulty and time for the testnet minimum difficulty rule.
+///
+/// The `relevant_data` has recent block difficulties and times in reverse order from the tip.
+fn adjust_difficulty_and_time_for_testnet(
+    result: &mut GetBlockTemplateChainInfo,
+    network: &Network,
+    previous_block_height: Height,
+    relevant_data: Vec<(CompactDifficulty, DateTime<Utc>)>,
+) -> Result<(), BoxError> {
+    if network == &Network::Mainnet {
+        return Ok(());
+    }
+
+    // On testnet, changing the block time can also change the difficulty,
+    // due to the minimum difficulty consensus rule:
+    // > if the block time of a block at height `height ≥ 299188`
+    // > is greater than 6 * PoWTargetSpacing(height) seconds after that of the preceding block,
+    // > then the block is a minimum-difficulty block.
+    //
+    // When the first minimum-difficulty timestamp fits within the consensus
+    // ceiling, testnet blocks have two valid time ranges with different
+    // difficulties, shown here before NU7:
+    // * 1s - 7m30s: standard difficulty
+    // * 7m31s - 90m: minimum difficulty
+    //
+    // In rare cases, this could make some testnet miners produce invalid blocks,
+    // if they use the full 90 minute time gap in the consensus rules.
+    // (The zcashd getblocktemplate RPC reference doesn't have a max_time field,
+    // so there is no standard way of telling miners that the max_time is smaller.)
+    //
+    // So Zebra adjusts the min or max times to produce a valid time range for the difficulty.
+    // There is still a small chance that miners will produce an invalid block, if they are
+    // just below the max time, and don't check it.
+
+    // The tip is the first relevant data block, because they are in reverse order.
+    let previous_block_time = relevant_data.first().expect("has at least one block").1;
+    let previous_block_time: DateTime32 = previous_block_time.try_into()?;
+
+    // The consensus rule uses the spacing at the candidate block's height, which differs from the
+    // previous block's spacing at an upgrade that changes the spacing.
+    let candidate_height = (previous_block_height + 1).ok_or("candidate height is out of range")?;
+
+    let Some(minimum_difficulty_spacing) =
+        NetworkUpgrade::minimum_difficulty_spacing_for_height(network, candidate_height)
+    else {
+        // Returns early if the testnet minimum difficulty consensus rule is not active
+        return Ok(());
+    };
+
+    let minimum_difficulty_spacing: Duration32 = minimum_difficulty_spacing.try_into()?;
+
+    // The first minimum difficulty time is strictly greater than the spacing.
+    let std_difficulty_max_time = previous_block_time
+        .checked_add(minimum_difficulty_spacing)
+        .ok_or("testnet difficulty timeout exceeds the timestamp range")?;
+    let min_difficulty_min_time = std_difficulty_max_time
+        .checked_add(Duration32::from_seconds(1))
+        .ok_or("testnet minimum-difficulty time exceeds the timestamp range")?;
+
+    // Offer minimum-difficulty work one target spacing before its first valid
+    // timestamp, but only if that timestamp fits within the consensus ceiling.
+    //
+    // This is a Zebra-specific standard rule.
+    //
+    // We don't need to undo the clamping here:
+    // - if cur_time is clamped to min_time, then we're more likely to have a minimum
+    //    difficulty block, which makes mining easier;
+    // - if cur_time gets clamped to max_time, this is almost always a minimum difficulty block.
+    let local_std_difficulty_limit = std_difficulty_max_time
+        .checked_sub(extra_time_to_mine_a_block(network, candidate_height)?)
+        .ok_or("testnet minimum-difficulty refresh precedes the timestamp range")?;
+
+    result.time_refresh_at = result.max_time.saturating_add(Duration32::from_seconds(1));
+    if result.cur_time <= local_std_difficulty_limit || min_difficulty_min_time > result.max_time {
+        if min_difficulty_min_time <= result.max_time {
+            result.time_refresh_at = local_std_difficulty_limit
+                .checked_add(Duration32::from_seconds(1))
+                .expect("the refresh time is below the first minimum-difficulty time");
+        }
+
+        // Standard difficulty: the cur and max time need to exclude min difficulty blocks
+
+        // The maximum time can only be decreased, and only as far as min_time.
+        // The old minimum is still required by other consensus rules.
+        result.max_time = std_difficulty_max_time.clamp(result.min_time, result.max_time);
+
+        // The current time only needs to be decreased if the max_time decreased past it.
+        // Decreasing the current time can't change the difficulty.
+        result.cur_time = result.cur_time.clamp(result.min_time, result.max_time);
+    } else {
+        // Minimum difficulty: the min and cur time need to exclude std difficulty blocks
+
+        // The minimum time can only be increased, and only as far as max_time.
+        // The old maximum is still required by other consensus rules.
+        result.min_time = min_difficulty_min_time.clamp(result.min_time, result.max_time);
+
+        // The current time only needs to be increased if the min_time increased past it.
+        result.cur_time = result.cur_time.clamp(result.min_time, result.max_time);
+
+        // And then the difficulty needs to be updated for cur_time.
+        result.expected_difficulty = AdjustedDifficulty::new_from_header_time(
+            result.cur_time.into(),
+            previous_block_height,
+            network,
+            relevant_data.iter().cloned(),
+        )?
+        .expected_difficulty_threshold();
+    }
+    Ok(())
 }
 
 #[cfg(test)]

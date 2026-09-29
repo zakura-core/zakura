@@ -78,6 +78,7 @@
 
 mod capacity;
 mod lease;
+mod push;
 mod sink;
 
 #[cfg(test)]
@@ -97,6 +98,7 @@ use tokio_util::sync::CancellationToken;
 
 pub(crate) use capacity::{ServeCapacity, ServeConfigError, ServeLimits};
 pub(crate) use lease::WorkLease;
+pub(crate) use push::{Push, PushPermit};
 pub(crate) use sink::{Responded, ResponseCap, ResponseSink, SinkError, SinkProgress};
 
 use capacity::{PeerBudgets, ServeMetrics};

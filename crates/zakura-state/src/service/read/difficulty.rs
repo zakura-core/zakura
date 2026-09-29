@@ -28,24 +28,6 @@ use crate::{
     BoxError, GetBlockTemplateChainInfo,
 };
 
-/// The number of target block spacings we allow for a miner to mine a standard difficulty block
-/// on testnet.
-///
-/// This is a Zebra-specific standard rule.
-const EXTRA_SPACINGS_TO_MINE_A_BLOCK: i32 = 2;
-
-/// Returns the amount of extra time we allow for a miner to mine a standard difficulty block on
-/// testnet, for a block at `height`.
-///
-/// The time scales with the target spacing at `height`, so it stays below the minimum difficulty
-/// gap after ZIP 218 shortens the spacing at NU7. Before NU7 it is 150 seconds.
-fn extra_time_to_mine_a_block(network: &Network, height: Height) -> Result<Duration32, BoxError> {
-    let extra_time =
-        NetworkUpgrade::target_spacing_for_height(network, height) * EXTRA_SPACINGS_TO_MINE_A_BLOCK;
-
-    Ok(extra_time.try_into()?)
-}
-
 fn finalized_state_query_interrupted_error() -> BoxError {
     "Zakura is committing too many blocks to the state, \
      wait until it syncs to the chain tip"
@@ -97,6 +79,7 @@ pub fn get_block_template_chain_info(
         best_tip_height,
         best_tip_hash,
         network,
+        DateTime32::now(),
         best_tip_history_tree,
         value_pools,
     )
@@ -240,7 +223,7 @@ fn best_relevant_chain_and_history_tree(
 }
 
 /// Returns the [`GetBlockTemplateChainInfo`] for the supplied `relevant_chain`, tip, `network`,
-/// and `history_tree`.
+/// local clock time `cur_time`, and `history_tree`.
 ///
 /// The `relevant_chain` has recent block headers in reverse height order from the tip.
 ///
@@ -250,6 +233,7 @@ fn difficulty_time_and_history_tree(
     tip_height: Height,
     tip_hash: block::Hash,
     network: &Network,
+    cur_time: DateTime32,
     history_tree: Arc<HistoryTree>,
     value_pools: ValueBalance<NonNegative>,
 ) -> Result<GetBlockTemplateChainInfo, BoxError> {
@@ -260,8 +244,6 @@ fn difficulty_time_and_history_tree(
         .iter()
         .map(|header| (header.difficulty_threshold, header.time))
         .collect();
-
-    let cur_time = DateTime32::now();
 
     // > For each block other than the genesis block , nTime MUST be strictly greater than
     // > the median-time-past of that block.
@@ -332,10 +314,8 @@ fn adjust_difficulty_and_time_for_testnet(
     // > is greater than 6 * PoWTargetSpacing(height) seconds after that of the preceding block,
     // > then the block is a minimum-difficulty block.
     //
-    // The max time is always a minimum difficulty block, because the minimum difficulty
-    // gap is 7.5 minutes (2.5 minutes after ZIP 218 activates at NU7), but the maximum gap
-    // is 90 minutes. This means that testnet blocks have two valid time ranges with different
-    // difficulties, shown here before NU7:
+    // When the first minimum difficulty time fits within the consensus maximum time, testnet
+    // blocks have two valid time ranges with different difficulties, shown here before NU7:
     // * 1s - 7m30s: standard difficulty
     // * 7m31s - 90m: minimum difficulty
     //
@@ -373,21 +353,13 @@ fn adjust_difficulty_and_time_for_testnet(
         .checked_add(Duration32::from_seconds(1))
         .expect("a valid block time plus a small constant is in-range");
 
-    // If a miner is likely to find a block with the cur_time and standard difficulty
-    // within a target block interval or two, keep the original difficulty.
-    // Otherwise, try to use the minimum difficulty.
+    // Offer minimum difficulty work only once `cur_time` is past the last standard difficulty
+    // time. Switching earlier would mean moving `cur_time` into the future, and each extra
+    // minimum difficulty block drags the averaged difficulty far below its target.
     //
-    // This is a Zebra-specific standard rule.
-    //
-    // We don't need to undo the clamping here:
-    // - if cur_time is clamped to min_time, then we're more likely to have a minimum
-    //    difficulty block, which makes mining easier;
-    // - if cur_time gets clamped to max_time, this is almost always a minimum difficulty block.
-    let local_std_difficulty_limit = std_difficulty_max_time
-        .checked_sub(extra_time_to_mine_a_block(network, candidate_height)?)
-        .expect("a valid block time minus a small constant is in-range");
-
-    if result.cur_time <= local_std_difficulty_limit {
+    // The caller already clamped `cur_time` to the consensus range, so the difficulty
+    // selected here is valid for it.
+    if result.cur_time <= std_difficulty_max_time {
         // Standard difficulty: the cur and max time need to exclude min difficulty blocks
 
         // The maximum time can only be decreased, and only as far as min_time.
@@ -427,7 +399,7 @@ mod tests {
     };
     use zakura_chain::{
         parameters::testnet::{
-            ConfiguredActivationHeights, ConfiguredCheckpoints, RegtestParameters,
+            ConfiguredActivationHeights, ConfiguredCheckpoints, Parameters, RegtestParameters,
         },
         serialization::ZcashDeserializeInto,
         work::difficulty::ParameterDifficulty,
@@ -489,10 +461,10 @@ mod tests {
             .into(),
         );
 
-        // The minimum difficulty gap is 6 target spacings, and the template keeps the standard
-        // difficulty for the first 4 of them.
-        let pre_nu7_offset = 4 * 75;
-        let post_nu7_offset = 4 * 25;
+        // The template keeps the standard difficulty for the whole minimum difficulty gap of
+        // 6 target spacings.
+        let pre_nu7_offset = 6 * 75;
+        let post_nu7_offset = 6 * 25;
 
         let testnet = Network::new_default_testnet();
         assert_eq!(
@@ -533,17 +505,215 @@ mod tests {
         });
         assert_eq!(
             last_standard_difficulty_offset(&network, Height(BLOSSOM - 2)),
-            600
+            900
         );
         // The parent is pre-Blossom but the candidate already uses 75 seconds.
         assert_eq!(
             last_standard_difficulty_offset(&network, Height(BLOSSOM - 1)),
-            300
+            450
         );
         assert_eq!(
             last_standard_difficulty_offset(&network, Height(BLOSSOM)),
-            300
+            450
         );
+    }
+
+    /// Testnet templates keep `cur_time` at the clock, switch to minimum difficulty only after
+    /// the consensus gap, and advertise only timestamps that are valid for the template bits.
+    #[test]
+    fn mining_template_testnet_uses_clock_at_difficulty_timeout() {
+        let _init_guard = zakura_test::init();
+        const NU7: u32 = 800_000;
+        let configured_testnet = Parameters::build()
+            .with_activation_heights(ConfiguredActivationHeights {
+                blossom: Some(1),
+                nu7: Some(NU7),
+                ..Default::default()
+            })
+            .unwrap()
+            .clear_funding_streams()
+            .to_network()
+            .unwrap();
+        let block: block::Block = zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
+            .zcash_deserialize_into()
+            .expect("the genesis vector is valid");
+        let tip_time = DateTime32::from(1_700_000_000);
+
+        for (network, tip_height) in [
+            (Network::new_default_testnet(), Height(3_000_000)),
+            (configured_testnet.clone(), Height(NU7 - 2)),
+            (configured_testnet.clone(), Height(NU7 - 1)),
+            (configured_testnet, Height(NU7)),
+        ] {
+            assert!(!network.disable_pow());
+            let candidate_height = tip_height.next().unwrap();
+            let gap: Duration32 =
+                NetworkUpgrade::minimum_difficulty_spacing_for_height(&network, candidate_height)
+                    .expect("the minimum difficulty rule is active at the test height")
+                    .try_into()
+                    .unwrap();
+            let spacing: Duration32 =
+                NetworkUpgrade::target_spacing_for_height(&network, candidate_height)
+                    .try_into()
+                    .unwrap();
+            let limit = network.target_difficulty_limit();
+            let mut header = *block.header;
+            header.time = tip_time.to_chrono();
+            header.difficulty_threshold = (limit / 4_u32).to_compact();
+            let span = pow_adjustment_block_span_for_height(&network, candidate_height);
+            let relevant_chain: Vec<_> = (0..span)
+                .map(|index| {
+                    let mut header = header;
+                    let age = u32::try_from(index).unwrap() * spacing.seconds();
+                    header.time = tip_time
+                        .checked_sub(Duration32::from_seconds(age))
+                        .unwrap()
+                        .to_chrono();
+                    Arc::new(header)
+                })
+                .collect();
+            let median_time = tip_time
+                .checked_sub(Duration32::from_seconds(
+                    u32::try_from(POW_MEDIAN_BLOCK_SPAN / 2).unwrap() * spacing.seconds(),
+                ))
+                .unwrap();
+            let consensus_min = median_time
+                .checked_add(Duration32::from_seconds(1))
+                .unwrap();
+            let consensus_max = median_time
+                .checked_add(Duration32::from_seconds(BLOCK_MAX_TIME_SINCE_MEDIAN))
+                .unwrap();
+            let last_standard_time = tip_time.checked_add(gap).unwrap();
+            let first_minimum_time = last_standard_time
+                .checked_add(Duration32::from_seconds(1))
+                .unwrap();
+
+            // Cover the old two-spacing and one-spacing early-switch windows, and the strict
+            // consensus timeout.
+            for offset in [
+                gap.seconds() - 2 * spacing.seconds() + 1,
+                gap.seconds() - spacing.seconds() + 1,
+                gap.seconds() - 1,
+                gap.seconds(),
+                gap.seconds() + 1,
+            ] {
+                let now = tip_time
+                    .checked_add(Duration32::from_seconds(offset))
+                    .unwrap();
+                let result = difficulty_time_and_history_tree(
+                    relevant_chain.clone(),
+                    tip_height,
+                    block.hash(),
+                    &network,
+                    now,
+                    Arc::new(HistoryTree::default()),
+                    ValueBalance::zero(),
+                )
+                .expect("the template context is complete");
+
+                assert_eq!(result.cur_time, now, "tip={tip_height:?}, offset={offset}");
+                assert_eq!(
+                    result.min_time,
+                    if offset > gap.seconds() {
+                        first_minimum_time
+                    } else {
+                        consensus_min
+                    }
+                );
+                assert_eq!(
+                    result.max_time,
+                    if offset > gap.seconds() {
+                        consensus_max
+                    } else {
+                        last_standard_time
+                    }
+                );
+                assert_eq!(
+                    result.expected_difficulty == limit.to_compact(),
+                    offset > gap.seconds(),
+                    "tip={tip_height:?}, offset={offset}"
+                );
+
+                // Miners may mutate time without changing the template's bits.
+                // Validate both bounds and the clock against the shared header
+                // validator, including the candidate block's upgrade spacing.
+                for time in [result.min_time, result.cur_time, result.max_time] {
+                    let adjustment = AdjustedDifficulty::new_from_header_time(
+                        time.to_chrono(),
+                        tip_height,
+                        &network,
+                        relevant_chain
+                            .iter()
+                            .map(|header| (header.difficulty_threshold, header.time)),
+                    )
+                    .unwrap();
+                    zakura_header_chain::validate_contextual_difficulty_and_time(
+                        result.expected_difficulty,
+                        adjustment,
+                    )
+                    .expect("every advertised timestamp must match the template bits");
+                }
+            }
+        }
+    }
+
+    /// Testnet selects the same template time as mainnet, including when the clock is clamped
+    /// to the consensus range.
+    #[test]
+    fn mining_template_time_matches_on_mainnet_and_testnet() {
+        let _init_guard = zakura_test::init();
+        let block: block::Block = zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
+            .zcash_deserialize_into()
+            .expect("the genesis vector is valid");
+        let tip_time = DateTime32::from(1_700_000_000);
+        let after_tip = |seconds: u32| {
+            tip_time
+                .checked_add(Duration32::from_seconds(seconds))
+                .unwrap()
+        };
+        let min_time = after_tip(1);
+        let max_time = after_tip(BLOCK_MAX_TIME_SINCE_MEDIAN);
+        let tip_height = Height(3_000_000);
+        let mut header = *block.header;
+        header.time = tip_time.to_chrono();
+        let header = Arc::new(header);
+
+        for network in [Network::Mainnet, Network::new_default_testnet()] {
+            let span = pow_adjustment_block_span_for_height(&network, tip_height.next().unwrap());
+            for (now, expected_time) in [
+                (tip_time, min_time),
+                (min_time, min_time),
+                // Inside the old two-spacing and one-spacing early-switch windows, and the
+                // first minimum difficulty time.
+                (after_tip(360), after_tip(360)),
+                (after_tip(400), after_tip(400)),
+                (after_tip(451), after_tip(451)),
+                (max_time, max_time),
+                (after_tip(BLOCK_MAX_TIME_SINCE_MEDIAN + 1), max_time),
+            ] {
+                let result = difficulty_time_and_history_tree(
+                    vec![header.clone(); span],
+                    tip_height,
+                    block.hash(),
+                    &network,
+                    now,
+                    Arc::new(HistoryTree::default()),
+                    ValueBalance::zero(),
+                )
+                .expect("the template context is complete");
+
+                assert_eq!(
+                    result.cur_time, expected_time,
+                    "network={network}, now={now:?}"
+                );
+                assert!(result.min_time <= result.cur_time);
+                assert!(result.cur_time <= result.max_time);
+                if network == Network::Mainnet {
+                    assert_eq!(result.min_time, min_time);
+                    assert_eq!(result.max_time, max_time);
+                }
+            }
+        }
     }
 
     #[test]
@@ -564,6 +734,7 @@ mod tests {
                         Height(tip),
                         block.hash(),
                         &network,
+                        DateTime32::now(),
                         Arc::new(HistoryTree::default()),
                         ValueBalance::zero(),
                     );

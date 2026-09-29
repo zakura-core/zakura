@@ -1127,6 +1127,8 @@ fn raw_worker_context(client: &Endpoint, slots: Arc<Semaphore>) -> StreamWorkerC
         session_resources: None,
         outbound_frame_cap: DATA.frame_cap,
         message_bucket: Arc::new(std::sync::Mutex::new(TokenBucket::new(128))),
+        cadence: None,
+        precheck: PrecheckSlot::default(),
         connection_token: cancel.clone(),
         stream_token: cancel.child_token(),
         close_cause: CloseCause::new(),

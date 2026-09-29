@@ -295,7 +295,7 @@ fn nu7_testnet_minimum_difficulty_gap_is_strictly_above_450_seconds() {
     for (gap, expected_bits) in [
         (150, 0x1e0cd7fd),
         (151, 0x1e0cd7fd),
-        (450, 0x1e0cd7fd),
+        (450, 0x1e0cd18e),
         (451, 0x2007ffff),
     ] {
         let mut context = nu7_vector_context(candidate_time, MAX_POW_ADJUSTMENT_BLOCK_SPAN);

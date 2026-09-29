@@ -287,7 +287,7 @@ fn nu7_testnet_minimum_difficulty_gap_starts_at_activation() {
                     previous_time,
                 ),
                 expected_minimum_difficulty,
-                "unexpected minimum difficulty at height {height} and gap {seconds}",
+                "unexpected minimum difficulty at height {height:?} and gap {seconds}",
             );
         }
     }

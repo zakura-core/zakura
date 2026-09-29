@@ -449,7 +449,7 @@ mod tests {
     }
 
     #[test]
-    fn testnet_template_standard_difficulty_window_follows_target_spacing() {
+    fn testnet_template_standard_difficulty_window_uses_nu7_consensus_gap() {
         let _init_guard = zakura_test::init();
 
         const NU7: u32 = 400_000;

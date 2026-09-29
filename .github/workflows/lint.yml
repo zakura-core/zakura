@@ -228,11 +228,12 @@ jobs:
         if: ${{ !cancelled() }}
         run: python3 deploy/continuous-sync/tests/test_daily_summary.py
 
-      - name: Cluster dashboard and watchdog tests
+      - name: Cluster dashboard, watchdog and fork monitor tests
         if: ${{ !cancelled() }}
         run: |
           python3 deploy/runner/test_zakura_cluster_status.py
           python3 deploy/runner/test_zakura_cluster_watchdog.py
+          python3 -m unittest discover -s deploy/fork-monitor/tests -t deploy/fork-monitor
 
       - name: Release-state coupling
         if: ${{ !cancelled() }}

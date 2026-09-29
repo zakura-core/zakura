@@ -1,0 +1,58 @@
+network = "testnet"
+db = "/var/lib/zakura-fork-monitor/monitor.sqlite3"   # CLI --db overrides
+
+[http]
+host = "127.0.0.1"
+port = 8093
+
+[chain]
+backfill_blocks = 20000
+memory_window = 30000
+settle_depth = 3
+
+[[rpc]]
+name = "zakura-testnet-1"
+url = "http://167.99.103.111:18232/"
+kind = "zakura"
+interval = 1.0
+fleet = true
+
+[[rpc]]
+name = "zakura-testnet-as"
+url = "http://206.189.148.0:18232/"
+kind = "zakura"
+interval = 1.0
+fleet = true
+
+[[rpc]]
+name = "zakura-testnet-eu"
+url = "http://164.92.209.78:18232/"
+kind = "zakura"
+interval = 1.0
+fleet = true
+
+[[rpc]]
+name = "tazminer"
+url = "http://lwd.tazminer.com:18232/"
+kind = "zakura"
+interval = 5.0
+fleet = false
+backfill = false
+
+[p2p]
+enabled = true
+max_peers = 300
+connect_rate = 5.0
+poll_interval = 15.0
+probe_sample = 0.2
+dns_seeds = ["dnsseed.testnet.z.cash", "testnet.seeder.zfnd.org"]
+static_peers = []
+
+[cipherscan]
+enabled = true
+base_url = "https://api.testnet.cipherscan.app"
+interval = 60.0
+backfill_pages = 0     # 0 = only recent; N = N pages of 200 on startup
+
+[retention]
+days = 30

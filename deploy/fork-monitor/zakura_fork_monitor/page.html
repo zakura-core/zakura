@@ -1,0 +1,2145 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="Zakura fork monitor: orphan blocks, reorgs, network splits and the testnet difficulty sawtooth">
+<meta name="referrer" content="no-referrer">
+<title>Zakura Fork Monitor</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='9' fill='%23c2457a'/%3E%3Cpath d='M12 7v18M12 17c0-5 9-4 9-10M21 25v-5' stroke='white' stroke-width='3' fill='none' stroke-linecap='round'/%3E%3C/svg%3E">
+<style>
+:root {
+  color-scheme: dark;
+  --void: #07060e;
+  --base: #0d0b16;
+  --surface: #12101d;
+  --raised: #191627;
+  --line: #221f33;
+  --line-hi: #322d49;
+  --ink: #ebe8f7;
+  --ink-2: #b6b0d0;
+  --muted: #837ca0;
+  --dim: #4f4870;
+  --pink: #c2457a;
+  --pink-hi: #e8709f;
+  --pink-soft: rgba(194, 69, 122, 0.12);
+  --ok: #5fd7a6;
+  --ok-soft: rgba(95, 215, 166, 0.10);
+  --ok-line: rgba(95, 215, 166, 0.32);
+  --warn: #efc255;
+  --warn-soft: rgba(239, 194, 85, 0.10);
+  --warn-line: rgba(239, 194, 85, 0.32);
+  --bad: #ff7b72;
+  --bad-soft: rgba(255, 123, 114, 0.10);
+  --bad-line: rgba(255, 123, 114, 0.32);
+  --r-lg: 16px;
+  --r-md: 12px;
+  --r-sm: 8px;
+  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+}
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+body {
+  margin: 0;
+  min-height: 100vh;
+  color: var(--ink);
+  background:
+    radial-gradient(1100px 520px at 12% -8%, rgba(194, 69, 122, 0.14), transparent 70%),
+    radial-gradient(900px 480px at 92% 0%, rgba(88, 74, 173, 0.12), transparent 70%),
+    var(--void);
+  background-attachment: fixed;
+  font: 15px/1.6 'Inter', ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+h1, h2, h3, p { margin: 0; }
+a { color: var(--pink-hi); }
+button { font: inherit; }
+
+/* ---------- primitives ---------- */
+.shell {
+  width: min(100% - 40px, 1560px);
+  margin: 0 auto;
+  padding: 24px 0 56px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+.panel {
+  min-width: 0;
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.022), transparent 120px), var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--r-lg);
+}
+.pad { padding: 20px 22px; }
+.eyebrow {
+  color: var(--muted);
+  font-size: 0.68rem;
+  font-weight: 650;
+  letter-spacing: 0.10em;
+  text-transform: uppercase;
+}
+.label {
+  color: var(--muted);
+  font-size: 0.66rem;
+  font-weight: 650;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+}
+.mono { font-family: var(--mono); font-variant-ligatures: none; }
+.num { font-variant-numeric: tabular-nums; }
+.muted { color: var(--muted); }
+.dim { color: var(--dim); }
+.bad-text { color: var(--bad); }
+.warn-text { color: var(--warn); }
+.ok-text { color: var(--ok); }
+.grid-2 { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
+.split-2 { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px 26px; }
+
+/* ---------- header ---------- */
+.topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 20px;
+  flex-wrap: wrap;
+  padding: 16px 22px;
+}
+.brand { display: flex; align-items: center; gap: 14px; min-width: 0; }
+.brand .mark {
+  width: 40px;
+  height: 40px;
+  flex-shrink: 0;
+  border-radius: 50%;
+  box-shadow: 0 0 0 4px var(--pink-soft);
+}
+.brand h1 {
+  font-size: clamp(1.15rem, 2.2vw, 1.5rem);
+  font-weight: 680;
+  letter-spacing: -0.02em;
+  line-height: 1.15;
+}
+.brand .eyebrow { display: flex; align-items: center; gap: 8px; }
+.chip {
+  display: inline-flex;
+  align-items: center;
+  height: 18px;
+  padding: 0 7px;
+  border: 1px solid var(--line-hi);
+  border-radius: 5px;
+  background: var(--base);
+  color: var(--ink-2);
+  font-size: 0.62rem;
+  font-weight: 650;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  white-space: nowrap;
+  vertical-align: middle;
+}
+.chip.is-pink { border-color: rgba(194, 69, 122, 0.4); color: var(--pink-hi); background: var(--pink-soft); }
+.header-right { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.tipbox { display: flex; flex-direction: column; align-items: flex-end; min-width: 0; line-height: 1.25; }
+.tipbox b { font-size: 1.08rem; font-weight: 660; font-variant-numeric: tabular-nums; }
+.tipbox small { color: var(--muted); font-size: 0.72rem; white-space: nowrap; }
+.state-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  height: 34px;
+  padding: 0 15px;
+  border-radius: 999px;
+  border: 1px solid var(--line-hi);
+  background: var(--base);
+  color: var(--ink-2);
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+.state-pill::before {
+  content: '';
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: currentColor;
+  box-shadow: 0 0 9px currentColor;
+  animation: pulse 2.6s ease-in-out infinite;
+}
+.state-pill.is-ok { border-color: var(--ok-line); background: var(--ok-soft); color: var(--ok); }
+.state-pill.is-warn { border-color: var(--warn-line); background: var(--warn-soft); color: var(--warn); }
+.state-pill.is-bad { border-color: var(--bad-line); background: var(--bad-soft); color: var(--bad); }
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.25; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .state-pill::before { animation: none; }
+}
+.ghost-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  height: 32px;
+  padding: 0 13px;
+  border: 1px solid var(--line-hi);
+  border-radius: 999px;
+  background: var(--base);
+  color: var(--ink-2);
+  font-size: 0.76rem;
+  font-weight: 550;
+  text-decoration: none;
+  cursor: pointer;
+  transition: border-color 0.15s, color 0.15s, background 0.15s;
+  white-space: nowrap;
+}
+.ghost-button:hover { border-color: var(--pink); color: var(--pink-hi); background: var(--pink-soft); }
+.ghost-button.is-on { border-color: var(--warn-line); background: var(--warn-soft); color: var(--warn); }
+.freshness { font-size: 0.76rem; color: var(--muted); white-space: nowrap; }
+.banner {
+  padding: 11px 16px;
+  border: 1px solid var(--bad-line);
+  border-radius: var(--r-md);
+  background: var(--bad-soft);
+  color: var(--bad);
+  font-size: 0.84rem;
+}
+.banner.is-warn { border-color: var(--warn-line); background: var(--warn-soft); color: var(--warn); }
+body.is-stale .dimmable { opacity: 0.55; transition: opacity 0.3s; }
+
+/* ---------- stat tiles ---------- */
+.stats {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+  gap: 12px;
+}
+.stat {
+  padding: 13px 15px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  min-width: 0;
+}
+.stat.is-bad { border-color: var(--bad-line); }
+.stat.is-warn { border-color: var(--warn-line); }
+.stat-value {
+  margin-top: 5px;
+  font-size: 1.35rem;
+  font-weight: 660;
+  letter-spacing: -0.02em;
+  line-height: 1.15;
+  font-variant-numeric: tabular-nums;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.stat small {
+  display: block;
+  margin-top: 4px;
+  color: var(--dim);
+  font-size: 0.74rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.facts {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: 10px;
+  margin-top: 14px;
+}
+.fact {
+  padding: 10px 12px;
+  min-width: 0;
+  background: var(--base);
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+}
+.fact strong {
+  display: block;
+  margin-top: 3px;
+  font-size: 0.94rem;
+  font-weight: 620;
+  font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
+}
+.fact small { display: block; margin-top: 2px; color: var(--dim); font-size: 0.7rem; overflow-wrap: anywhere; }
+
+/* ---------- badges ---------- */
+.badge {
+  display: inline-flex;
+  align-items: center;
+  height: 21px;
+  padding: 0 8px;
+  border-radius: 6px;
+  border: 1px solid var(--line-hi);
+  background: var(--base);
+  color: var(--ink-2);
+  font-size: 0.66rem;
+  font-weight: 680;
+  letter-spacing: 0.045em;
+  text-transform: uppercase;
+  white-space: nowrap;
+  vertical-align: middle;
+}
+.badge.tone-ok { border-color: var(--ok-line); background: var(--ok-soft); color: var(--ok); }
+.badge.tone-warn { border-color: var(--warn-line); background: var(--warn-soft); color: var(--warn); }
+.badge.tone-bad { border-color: var(--bad-line); background: var(--bad-soft); color: var(--bad); }
+.badge.tone-info { border-color: rgba(194, 69, 122, 0.32); background: var(--pink-soft); color: var(--pink-hi); }
+.badge.pair { height: auto; min-height: 21px; padding: 2px 8px; white-space: normal; overflow-wrap: anywhere; text-transform: none; letter-spacing: 0.01em; font-size: 0.72rem; }
+.cluster { display: inline-flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+
+/* ---------- sections ---------- */
+.section-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  flex-wrap: wrap;
+  margin-bottom: 14px;
+}
+.section-head h2 { font-size: 1rem; font-weight: 640; letter-spacing: -0.01em; margin-top: 3px; }
+.section-note { color: var(--muted); font-size: 0.83rem; }
+.section-error { margin: 0 0 12px; color: var(--bad); font-size: 0.8rem; }
+.subhead { display: flex; align-items: center; gap: 10px; margin: 20px 0 10px; }
+.subhead::after { content: ''; flex: 1; height: 1px; background: var(--line); }
+.toolbar { display: flex; align-items: center; gap: 9px; flex-wrap: wrap; }
+.seg {
+  display: inline-flex;
+  gap: 2px;
+  padding: 2px;
+  border: 1px solid var(--line-hi);
+  border-radius: 999px;
+  background: var(--base);
+}
+.seg button {
+  padding: 4px 11px;
+  border: 0;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--muted);
+  font-size: 0.72rem;
+  font-weight: 620;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.seg button:hover { color: var(--ink-2); }
+.seg button.is-on { background: var(--pink-soft); color: var(--pink-hi); }
+.search {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 32px;
+  padding: 0 12px;
+  border: 1px solid var(--line-hi);
+  border-radius: 999px;
+  background: var(--base);
+}
+.search:focus-within { border-color: var(--pink); }
+.search svg { width: 14px; height: 14px; stroke: var(--muted); fill: none; stroke-width: 2; }
+.search input {
+  width: 200px;
+  border: 0;
+  background: transparent;
+  color: var(--ink);
+  font-size: 0.82rem;
+  outline: none;
+}
+.search input::placeholder { color: var(--dim); }
+.empty {
+  padding: 18px;
+  border: 1px dashed var(--line-hi);
+  border-radius: var(--r-md);
+  color: var(--muted);
+  font-size: 0.84rem;
+  text-align: center;
+}
+
+/* ---------- lists ---------- */
+.list { display: grid; gap: 8px; }
+.item {
+  padding: 10px 13px;
+  background: var(--base);
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--dim);
+  border-radius: var(--r-md);
+  font-size: 0.8rem;
+  color: var(--ink-2);
+  min-width: 0;
+}
+.item.is-ok { border-left-color: var(--ok); }
+.item.is-warn { border-left-color: var(--warn); }
+.item.is-bad { border-left-color: var(--bad); }
+.item-top { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.item-top b { color: var(--ink); font-weight: 620; overflow-wrap: anywhere; }
+.item-detail { margin-top: 4px; color: var(--muted); font-size: 0.76rem; overflow-wrap: anywhere; }
+.callout {
+  display: grid;
+  gap: 10px;
+  margin-bottom: 14px;
+  padding: 13px 16px;
+  border: 1px solid var(--line-hi);
+  border-radius: var(--r-md);
+  background: var(--base);
+  font-size: 0.84rem;
+  color: var(--ink-2);
+}
+.callout.is-ok { border-color: var(--ok-line); background: var(--ok-soft); }
+.callout.is-warn { border-color: var(--warn-line); background: var(--warn-soft); }
+.callout.is-bad { border-color: var(--bad-line); background: var(--bad-soft); }
+.callout-title { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; color: var(--ink); font-weight: 640; }
+.sides { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 10px; }
+.side {
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  background: var(--surface);
+  min-width: 0;
+}
+.side .item-detail { margin-top: 3px; }
+
+/* ---------- tables ---------- */
+.table-wrap {
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  background: var(--base);
+  overflow: auto;
+  max-height: 72vh;
+}
+table { width: 100%; min-width: 720px; border-collapse: separate; border-spacing: 0; }
+table.t-wide { min-width: 1060px; }
+table.t-compact { min-width: 420px; }
+thead th {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  padding: 9px 10px;
+  background: var(--raised);
+  border-bottom: 1px solid var(--line-hi);
+  color: var(--muted);
+  font-size: 0.63rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  text-align: left;
+  white-space: nowrap;
+  user-select: none;
+}
+thead th.sortable { cursor: pointer; }
+thead th.sortable:hover { color: var(--ink-2); }
+thead th .arrow { margin-left: 4px; opacity: 0.35; font-size: 0.6rem; }
+thead th.is-sorted { color: var(--pink-hi); }
+thead th.is-sorted .arrow { opacity: 1; }
+tbody td {
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--line);
+  font-size: 0.79rem;
+  vertical-align: middle;
+  font-variant-numeric: tabular-nums;
+}
+tbody tr:last-child td { border-bottom: 0; }
+tbody tr:hover td { background: rgba(50, 45, 73, 0.2); }
+tbody tr.clickable { cursor: pointer; }
+tbody tr.is-open td { background: rgba(50, 45, 73, 0.34); }
+tbody tr.row-warn td:first-child { box-shadow: inset 3px 0 0 var(--warn); }
+tbody tr.row-bad td:first-child { box-shadow: inset 3px 0 0 var(--bad); }
+tbody tr.row-dim td { color: var(--muted); }
+th.col-num, td.col-num { text-align: right; }
+td.wrap { white-space: normal; overflow-wrap: anywhere; max-width: 320px; }
+td.col-name { min-width: 160px; max-width: 300px; }
+td.nowrap { white-space: nowrap; }
+.twisty { display: inline-block; width: 12px; color: var(--dim); font-size: 0.6rem; transition: transform 0.15s; }
+tr.is-open .twisty { transform: rotate(90deg); color: var(--pink-hi); }
+.stack { display: flex; flex-direction: column; align-items: flex-start; gap: 2px; min-width: 0; }
+.cell-main { display: inline-flex; align-items: center; gap: 6px; font-weight: 600; color: var(--ink); overflow-wrap: anywhere; }
+.sub { color: var(--dim); font-size: 0.7rem; }
+.table-note { margin-top: 8px; color: var(--muted); font-size: 0.76rem; }
+tbody tr.drawer > td { padding: 0; background: var(--surface); }
+tbody tr.drawer:hover > td { background: var(--surface); }
+.drawer-inner {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+  gap: 14px 24px;
+  padding: 14px 18px 16px 30px;
+}
+.field { min-width: 0; }
+.field .label { font-size: 0.61rem; }
+.field-value { margin-top: 3px; font-size: 0.78rem; color: var(--ink-2); overflow-wrap: anywhere; }
+.kv { display: grid; gap: 3px; margin-top: 4px; }
+.kv-row { display: flex; justify-content: space-between; gap: 12px; font-size: 0.76rem; }
+.kv-row > span { color: var(--muted); white-space: nowrap; }
+.kv-row > b { color: var(--ink-2); font-weight: 600; text-align: right; min-width: 0; overflow-wrap: anywhere; }
+.hash { color: var(--ink-2); font-size: 0.74rem; cursor: copy; border-radius: 4px; white-space: nowrap; }
+.hash:hover, .hash:focus-visible { color: var(--pink-hi); outline: none; }
+.hash.is-copied { color: var(--ok); }
+.states {
+  display: flex;
+  gap: 2px;
+  width: 120px;
+  height: 8px;
+  margin-bottom: 4px;
+  border-radius: 3px;
+  overflow: hidden;
+  background: var(--line);
+}
+.states span { min-width: 3px; }
+.seg-ok { background: var(--ok); }
+.seg-warn { background: var(--warn); }
+.seg-bad { background: var(--bad); }
+.seg-stuck { background: #b0413b; }
+.seg-neutral { background: var(--dim); }
+.seg-inactive { background: var(--line-hi); }
+
+/* ---------- charts ---------- */
+.chart { position: relative; min-width: 0; }
+.chart svg { display: block; width: 100%; height: auto; overflow: visible; }
+.axis-line { stroke: var(--line-hi); stroke-width: 1; }
+.grid-line { stroke: var(--line); stroke-width: 1; }
+.axis-text { fill: var(--muted); font-size: 10px; font-variant-numeric: tabular-nums; }
+.axis-text.faint { fill: var(--dim); }
+.diff-line { fill: none; stroke: var(--pink-hi); stroke-width: 1.4; stroke-linejoin: round; }
+.diff-area { fill: url(#saw-fill); }
+.grad-top { stop-color: var(--pink); stop-opacity: 0.30; }
+.grad-bottom { stop-color: var(--pink); stop-opacity: 0; }
+.fast-band { fill: rgba(239, 194, 85, 0.07); }
+.reset-line { stroke: var(--warn); stroke-width: 1; stroke-dasharray: 3 3; opacity: 0.75; }
+.reset-cap { fill: var(--warn); }
+.orphan-tick { stroke: var(--bad); stroke-width: 1.6; }
+.guide { stroke: var(--ink-2); stroke-width: 1; opacity: 0.45; }
+.hover-dot { fill: var(--pink-hi); stroke: var(--void); stroke-width: 2; }
+.overlay { fill: transparent; cursor: crosshair; }
+.bar { fill: var(--pink); transition: fill 0.12s; }
+.bar.is-muted { fill: var(--dim); }
+.bar-group:hover .bar { fill: var(--pink-hi); }
+.bar-hit { fill: transparent; }
+.bar-value { fill: var(--ink-2); font-size: 10.5px; font-weight: 600; text-anchor: middle; font-variant-numeric: tabular-nums; }
+.reset-dot { fill: var(--warn); }
+.hbar-label { fill: var(--ink-2); font-size: 11px; font-weight: 600; }
+.hbar-value { fill: var(--muted); font-size: 10.5px; font-variant-numeric: tabular-nums; }
+.hbar-track { fill: var(--line); }
+.s-block { fill: var(--ok); }
+.s-notfound { fill: var(--bad); }
+.s-timeout { fill: var(--warn); }
+.s-error { fill: var(--dim); }
+.legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 16px;
+  margin-top: 10px;
+  font-size: 0.74rem;
+  color: var(--muted);
+}
+.legend span { display: inline-flex; align-items: center; gap: 7px; }
+.sw { display: inline-block; width: 12px; height: 8px; border-radius: 2px; }
+.sw-line { height: 2px; background: var(--pink-hi); }
+.sw-fast { background: rgba(239, 194, 85, 0.22); }
+.sw-reset { width: 0; height: 10px; border-left: 1px dashed var(--warn); border-radius: 0; }
+.sw-orphan { width: 2px; height: 10px; background: var(--bad); border-radius: 0; }
+.sw-block { background: var(--ok); }
+.sw-notfound { background: var(--bad); }
+.sw-timeout { background: var(--warn); }
+.sw-error { background: var(--dim); }
+.tooltip {
+  position: absolute;
+  z-index: 5;
+  min-width: 190px;
+  padding: 9px 11px;
+  pointer-events: none;
+  background: rgba(25, 22, 39, 0.97);
+  border: 1px solid var(--line-hi);
+  border-radius: var(--r-sm);
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.45);
+  font-size: 0.74rem;
+  line-height: 1.5;
+}
+.tt-head { margin-bottom: 3px; color: var(--ink); font-weight: 650; }
+.tt-row { display: flex; justify-content: space-between; gap: 16px; color: var(--muted); }
+.tt-row b { color: var(--ink-2); font-weight: 600; font-variant-numeric: tabular-nums; }
+.tt-flag { margin-top: 4px; color: var(--warn); font-weight: 600; }
+
+/* ---------- peers ---------- */
+details.collapsible > summary { list-style: none; cursor: pointer; }
+details.collapsible > summary::-webkit-details-marker { display: none; }
+details.collapsible > summary .section-head { margin-bottom: 0; }
+details.collapsible[open] > summary .section-head { margin-bottom: 14px; }
+details.collapsible > summary .toggle-label::before { content: 'Show'; }
+details.collapsible[open] > summary .toggle-label::before { content: 'Hide'; }
+.chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
+footer {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 6px 14px;
+  padding-top: 6px;
+  color: var(--muted);
+  font-size: 0.78rem;
+}
+footer a { color: var(--muted); text-decoration: none; font-family: var(--mono); font-size: 0.72rem; }
+footer a:hover { color: var(--pink-hi); }
+
+@media (max-width: 1100px) {
+  .split-2 { grid-template-columns: minmax(0, 1fr); }
+}
+@media (max-width: 720px) {
+  .shell { width: calc(100% - 22px); padding-top: 12px; gap: 12px; }
+  .pad { padding: 16px; }
+  .topbar { align-items: flex-start; padding: 14px 16px; }
+  .header-right { width: 100%; justify-content: flex-start; }
+  .tipbox { align-items: flex-start; }
+  .grid-2 { grid-template-columns: minmax(0, 1fr); }
+  .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+  .stat-value { font-size: 1.15rem; }
+  .search input { width: 140px; }
+  table { min-width: 600px; }
+  table.t-wide { min-width: 900px; }
+  .drawer-inner { padding-left: 16px; }
+}
+</style>
+</head>
+<body>
+<main class="shell">
+  <header class="panel topbar">
+    <div class="brand">
+      <svg class="mark" viewBox="0 0 40 40" aria-hidden="true">
+        <circle cx="20" cy="20" r="19.5" fill="#12101d" stroke="#c2457a"></circle>
+        <path d="M15 9v22M15 21c0-6 10-5 10-12M25 31v-6" stroke="#e8709f" stroke-width="2.6" fill="none" stroke-linecap="round"></path>
+        <circle cx="25" cy="22" r="2.4" fill="#ff7b72"></circle>
+      </svg>
+      <div>
+        <p class="eyebrow"><span class="chip" id="network-chip">network</span> Orphans, reorgs and splits</p>
+        <h1>Zakura Fork Monitor</h1>
+      </div>
+    </div>
+    <div class="header-right">
+      <div class="tipbox">
+        <span class="label">Best tip</span>
+        <b id="tip-height">&#8230;</b>
+        <small id="tip-detail">waiting for the monitor</small>
+      </div>
+      <span class="state-pill" id="phase-pill">Phase</span>
+      <span class="state-pill" id="split-pill">Network</span>
+      <span class="freshness" id="freshness">connecting&#8230;</span>
+    </div>
+  </header>
+
+  <div class="banner" id="banner" role="status" hidden></div>
+
+  <section class="stats dimmable" aria-label="Headline numbers">
+    <div class="stat" id="tile-rate1h"><span class="label">Orphan rate 1h</span><div class="stat-value">&#8230;</div><small>&#8230;</small></div>
+    <div class="stat" id="tile-rate24h"><span class="label">Orphan rate 24h</span><div class="stat-value">&#8230;</div><small>&#8230;</small></div>
+    <div class="stat" id="tile-forks"><span class="label">Forks 24h</span><div class="stat-value">&#8230;</div><small>&#8230;</small></div>
+    <div class="stat" id="tile-reorg"><span class="label">Deepest reorg 24h</span><div class="stat-value">&#8230;</div><small>&#8230;</small></div>
+    <div class="stat" id="tile-resets"><span class="label">Resets 24h</span><div class="stat-value">&#8230;</div><small>&#8230;</small></div>
+    <div class="stat" id="tile-peers"><span class="label">Peers connected</span><div class="stat-value">&#8230;</div><small>&#8230;</small></div>
+  </section>
+
+  <section class="panel pad dimmable" id="network-panel">
+    <div class="section-head">
+      <div>
+        <p class="eyebrow">Network view</p>
+        <h2>Implementation groups and their branches</h2>
+      </div>
+      <p class="section-note" id="network-note"></p>
+    </div>
+    <p class="section-error" id="err-snapshot" hidden></p>
+    <div id="split-callout"></div>
+    <div id="groups-table"></div>
+    <div class="split-2">
+      <div>
+        <div class="subhead"><p class="eyebrow">Stuck on dead forks</p></div>
+        <div id="stuck-list"></div>
+      </div>
+      <div>
+        <div class="subhead"><p class="eyebrow">Collectors</p></div>
+        <div id="collectors"></div>
+      </div>
+    </div>
+    <div class="subhead"><p class="eyebrow">Recent reorgs seen by vantage points</p></div>
+    <div id="reorg-list"></div>
+  </section>
+
+  <section class="panel pad dimmable">
+    <div class="section-head">
+      <div>
+        <p class="eyebrow">Difficulty sawtooth</p>
+        <h2 id="saw-title">Canonical difficulty, log scale</h2>
+      </div>
+      <div class="toolbar">
+        <div class="seg" id="saw-range" role="group" aria-label="Blocks shown">
+          <button type="button" data-n="500">500</button>
+          <button type="button" data-n="1500">1,500</button>
+          <button type="button" data-n="5000">5,000</button>
+        </div>
+      </div>
+    </div>
+    <p class="section-error" id="err-sawtooth" hidden></p>
+    <div class="chart" id="sawtooth-chart"></div>
+    <div class="legend">
+      <span><i class="sw sw-line"></i>difficulty</span>
+      <span><i class="sw sw-fast"></i>fast phase</span>
+      <span><i class="sw sw-reset"></i>min-difficulty reset</span>
+      <span><i class="sw sw-orphan"></i>orphan at height</span>
+    </div>
+    <div class="facts" id="saw-facts"></div>
+  </section>
+
+  <div class="grid-2 dimmable">
+    <section class="panel pad">
+      <div class="section-head">
+        <div>
+          <p class="eyebrow">Orphan rate by phase</p>
+          <h2 id="phase-title">By blocks since reset</h2>
+        </div>
+        <div class="seg" id="phase-view" role="group" aria-label="Bucketing">
+          <button type="button" data-view="by_k">k</button>
+          <button type="button" data-view="by_k_fine">near reset</button>
+          <button type="button" data-view="by_ratio">D/D_pre</button>
+          <button type="button" data-view="by_phase">phase</button>
+        </div>
+      </div>
+      <p class="section-error" id="err-orphans" hidden></p>
+      <div class="chart" id="phase-chart"></div>
+      <p class="section-note" id="orphans-note"></p>
+    </section>
+    <section class="panel pad">
+      <div class="section-head">
+        <div>
+          <p class="eyebrow">Hourly orphans</p>
+          <h2>Last 72 hours</h2>
+        </div>
+        <p class="section-note" id="hourly-note"></p>
+      </div>
+      <div class="chart" id="hourly-chart"></div>
+      <div class="legend">
+        <span><i class="sw sw-line"></i>orphans per hour (by winner header time)</span>
+        <span><i class="sw sw-reset"></i>hour with a reset</span>
+      </div>
+    </section>
+  </div>
+
+  <section class="panel pad dimmable">
+    <div class="section-head">
+      <div>
+        <p class="eyebrow">Fork events</p>
+        <h2>Races, self-orphans and reorgs</h2>
+      </div>
+      <p class="section-note" id="forks-note">Click a row for branch details.</p>
+    </div>
+    <p class="section-error" id="err-forks" hidden></p>
+    <div id="forks-table"></div>
+  </section>
+
+  <section class="panel pad dimmable">
+    <div class="section-head">
+      <div>
+        <p class="eyebrow">Miners</p>
+        <h2>Stale rates and races</h2>
+      </div>
+      <div class="toolbar">
+        <p class="section-note" id="miners-note"></p>
+        <div class="seg" id="miner-since" role="group" aria-label="Period">
+          <button type="button" data-since="-86400">24h</button>
+          <button type="button" data-since="-604800">7d</button>
+          <button type="button" data-since="">window</button>
+        </div>
+      </div>
+    </div>
+    <p class="section-error" id="err-miners" hidden></p>
+    <div id="miners-table"></div>
+    <div class="subhead"><p class="eyebrow">Most frequent loser &#8594; winner pairs</p></div>
+    <div id="miner-pairs"></div>
+  </section>
+
+  <section class="panel pad dimmable">
+    <div class="section-head">
+      <div>
+        <p class="eyebrow">Difficulty resets</p>
+        <h2>Min-difficulty blocks on the best chain</h2>
+      </div>
+      <p class="section-note" id="resets-note"></p>
+    </div>
+    <p class="section-error" id="err-resets" hidden></p>
+    <div id="resets-table"></div>
+  </section>
+
+  <section class="panel pad dimmable">
+    <div class="section-head">
+      <div>
+        <p class="eyebrow">Availability probes</p>
+        <h2>getdata after inv, by implementation</h2>
+      </div>
+      <p class="section-note" id="probes-note"></p>
+    </div>
+    <p class="section-error" id="err-probes" hidden></p>
+    <div class="split-2">
+      <div>
+        <p class="eyebrow">Announce probes: the first announcer of a block new here</p>
+        <div class="chart" id="probes-chart"></div>
+        <p class="eyebrow">Sampled reprobes: Zebra announcers of blocks already held</p>
+        <div class="chart" id="probes-reprobe-chart"></div>
+        <div class="legend">
+          <span><i class="sw sw-block"></i>block served</span>
+          <span><i class="sw sw-notfound"></i>notfound</span>
+          <span><i class="sw sw-timeout"></i>timeout</span>
+          <span><i class="sw sw-error"></i>error / other</span>
+        </div>
+      </div>
+      <div id="probes-reasons"></div>
+    </div>
+    <div class="subhead"><p class="eyebrow" id="incidents-title">Announced, then notfound by the same peer</p></div>
+    <div id="incidents-table"></div>
+  </section>
+
+  <section class="panel pad dimmable">
+    <div class="section-head">
+      <div>
+        <p class="eyebrow">Propagation</p>
+        <h2>First-seen delay by group</h2>
+      </div>
+      <p class="section-note" id="propagation-note"></p>
+    </div>
+    <p class="section-error" id="err-propagation" hidden></p>
+    <div id="propagation-table"></div>
+    <div class="subhead"><p class="eyebrow">Recent blocks</p></div>
+    <div id="propagation-recent"></div>
+  </section>
+
+  <section class="panel pad dimmable">
+    <details class="collapsible" id="peers-details">
+      <summary>
+        <div class="section-head">
+          <div>
+            <p class="eyebrow">Vantage points</p>
+            <h2>Peers <span class="muted" id="peers-count"></span></h2>
+          </div>
+          <span class="ghost-button"><span class="toggle-label"></span></span>
+        </div>
+      </summary>
+      <div class="section-head">
+        <p class="section-note" id="peers-note"></p>
+        <div class="toolbar">
+          <label class="search">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"></circle><path d="m20 20-3.6-3.6"></path></svg>
+            <input id="peer-filter" type="search" placeholder="Filter source, group, state" autocomplete="off" spellcheck="false">
+          </label>
+          <button class="ghost-button" id="peer-issues" type="button">Issues only</button>
+        </div>
+      </div>
+      <p class="section-error" id="err-peers" hidden></p>
+      <div id="peers-table"></div>
+    </details>
+  </section>
+
+  <section class="panel pad dimmable">
+    <div class="section-head">
+      <div>
+        <p class="eyebrow">Cross-check</p>
+        <h2>External orphan records vs this monitor</h2>
+      </div>
+      <p class="section-note" id="crosscheck-note"></p>
+    </div>
+    <p class="section-error" id="err-crosscheck" hidden></p>
+    <div class="facts" id="crosscheck-facts"></div>
+    <div class="subhead"><p class="eyebrow">By day</p></div>
+    <div id="crosscheck-days"></div>
+    <div class="split-2">
+      <div>
+        <div class="subhead"><p class="eyebrow">Only in external records</p></div>
+        <div id="crosscheck-theirs"></div>
+      </div>
+      <div>
+        <div class="subhead"><p class="eyebrow">Only seen by this monitor</p></div>
+        <div id="crosscheck-ours"></div>
+      </div>
+    </div>
+  </section>
+
+  <footer>
+    <span>JSON API:</span>
+    <a href="/api/snapshot">/api/snapshot</a>
+    <a href="/api/summary">/api/summary</a>
+    <a href="/api/forks">/api/forks</a>
+    <a href="/api/orphans/stats">/api/orphans/stats</a>
+    <a href="/api/miners">/api/miners</a>
+    <a href="/api/sawtooth">/api/sawtooth</a>
+    <a href="/api/resets">/api/resets</a>
+    <a href="/api/propagation">/api/propagation</a>
+    <a href="/api/probes">/api/probes</a>
+    <a href="/api/peers">/api/peers</a>
+    <a href="/api/crosscheck">/api/crosscheck</a>
+  </footer>
+</main>
+<script>
+'use strict';
+(function () {
+  const SNAPSHOT_MS = 5000;
+  const HISTORY_MS = 30000;
+  const PEERS_MS = 5000;
+  const FETCH_TIMEOUT_MS = 12000;
+  // The loop republishes every 2 s; a snapshot this old means the monitor is stalled.
+  const STALE_SNAPSHOT_S = 20;
+  const MAX_PEER_ROWS = 400;
+  const SVG_NS = 'http://www.w3.org/2000/svg';
+  const DASH = '—';
+
+  const state = {
+    snapshot: null,
+    snapshotOkAt: null,
+    snapshotError: null,
+    skew: 0,
+    data: {},
+    sawN: 1500,
+    phaseView: 'by_k',
+    minerSince: '-86400',
+    sorts: {},
+    openForks: new Set(),
+    peers: null,
+    peerFilter: '',
+    peerIssues: false,
+  };
+
+  const $ = (id) => document.getElementById(id);
+
+  /* ---------- DOM builders: all data goes in as text nodes or attribute values ---------- */
+  function append(el, kids) {
+    for (const kid of kids) {
+      if (kid == null || kid === false) continue;
+      if (Array.isArray(kid)) append(el, kid);
+      else el.append(kid instanceof Node ? kid : String(kid));
+    }
+    return el;
+  }
+  function h(tag, props, ...kids) {
+    const el = document.createElement(tag);
+    for (const [key, value] of Object.entries(props || {})) {
+      if (value == null || value === false) continue;
+      if (key === 'class') el.className = value;
+      else el.setAttribute(key, value === true ? '' : String(value));
+    }
+    return append(el, kids);
+  }
+  function s(tag, attrs, ...kids) {
+    const el = document.createElementNS(SVG_NS, tag);
+    for (const [key, value] of Object.entries(attrs || {})) {
+      if (value != null) el.setAttribute(key, String(value));
+    }
+    return append(el, kids);
+  }
+  function has(map, key) { return Object.prototype.hasOwnProperty.call(map, key); }
+  function pick(map, key, fallback) { return has(map, key) ? map[key] : fallback; }
+  function list(value) { return Array.isArray(value) ? value : []; }
+  function obj(value) { return value && typeof value === 'object' && !Array.isArray(value) ? value : {}; }
+
+  /* ---------- formatting ---------- */
+  const isNum = (v) => typeof v === 'number' && Number.isFinite(v);
+  const nowS = () => Date.now() / 1000 + state.skew;
+  function num(v) { return isNum(v) ? v.toLocaleString('en-US') : DASH; }
+  function pct(v, digits) { return isNum(v) ? (v * 100).toFixed(digits == null ? 2 : digits) + '%' : DASH; }
+  function compact(v) {
+    if (!isNum(v)) return DASH;
+    const a = Math.abs(v);
+    const trim = (x) => x.replace(/\.0+$/, '');
+    if (a >= 1e9) return trim((v / 1e9).toFixed(2)) + 'G';
+    if (a >= 1e6) return trim((v / 1e6).toFixed(2)) + 'M';
+    if (a >= 1e4) return trim((v / 1e3).toFixed(1)) + 'k';
+    if (a >= 100) return v.toFixed(0);
+    if (a >= 1) return v.toFixed(2).replace(/\.?0+$/, '');
+    if (a === 0) return '0';
+    return v.toPrecision(2);
+  }
+  function dur(sec) {
+    if (!isNum(sec)) return DASH;
+    const sign = sec < 0 ? '-' : '';
+    const a = Math.abs(sec);
+    if (a < 10) return sign + (Number.isInteger(a) ? a : a.toFixed(1)) + 's';
+    if (a < 60) return sign + Math.round(a) + 's';
+    if (a < 3600) return sign + Math.floor(a / 60) + 'm ' + String(Math.floor(a % 60)).padStart(2, '0') + 's';
+    if (a < 86400) return sign + Math.floor(a / 3600) + 'h ' + String(Math.floor((a % 3600) / 60)).padStart(2, '0') + 'm';
+    return sign + Math.floor(a / 86400) + 'd ' + Math.floor((a % 86400) / 3600) + 'h';
+  }
+  function ago(t) { return isNum(t) ? dur(Math.max(0, nowS() - t)) + ' ago' : DASH; }
+  function clock(t) {
+    if (!isNum(t)) return DASH;
+    return new Date(t * 1000).toLocaleString(undefined, {
+      month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit',
+    });
+  }
+  function hourLabel(t) {
+    const d = new Date(t * 1000);
+    if (d.getHours() === 0) return d.toLocaleDateString(undefined, {month: 'short', day: 'numeric'});
+    return String(d.getHours()).padStart(2, '0') + ':00';
+  }
+  function text(v) { return v == null || v === '' ? DASH : String(v); }
+  function shortHash(x) { return x.length > 18 ? x.slice(0, 8) + '…' + x.slice(-6) : x; }
+  function yesNo(v) { return v === true ? 'yes' : v === false ? 'no' : 'unknown'; }
+  function plural(n, word) { return num(n) + ' ' + word + (n === 1 ? '' : 's'); }
+
+  /* ---------- small components ---------- */
+  const TONE_CLASS = {ok: 'tone-ok', warn: 'tone-warn', bad: 'tone-bad', info: 'tone-info'};
+  const STATE_TONE = {synced: 'ok', lagging: 'warn', fork: 'bad', stuck: 'bad'};
+  const STATUS_TONE = {ok: 'ok', connected: 'ok', idle: 'ok', backoff: 'warn', starting: 'warn', error: 'bad', unreachable: 'bad'};
+  const CLASS_TONE = {self: 'info', race: 'warn'};
+  const TIEBREAK_TONE = {hash: 'info', first_seen: 'info', both: 'ok', neither: 'warn'};
+  const TIEBREAK_LABEL = {work: 'more work', hash: 'greater hash', first_seen: 'first seen', both: 'hash + first seen', neither: 'later blocks'};
+  const PHASE_TONE = {fast: 'warn', slow: 'ok'};
+  const STATE_ORDER = [['synced', 'seg-ok'], ['lagging', 'seg-warn'], ['fork', 'seg-bad'], ['stuck', 'seg-stuck'], ['unknown', 'seg-neutral'], ['inactive', 'seg-inactive']];
+
+  function badge(label, tone) { return h('span', {class: 'badge ' + pick(TONE_CLASS, tone, '')}, label); }
+  function chip(label, pink) { return h('span', {class: pink ? 'chip is-pink' : 'chip'}, label); }
+  function empty(message) { return h('div', {class: 'empty'}, message); }
+  function dash() { return h('span', {class: 'dim'}, DASH); }
+  function templateChip(template) {
+    if (template === 'zakura') return chip('zakura', true);
+    if (template === 'zebra') return chip('zebra');
+    return null;
+  }
+  function hashEl(value, full) {
+    if (typeof value !== 'string' || !value) return dash();
+    const el = h('span', {class: 'hash mono', title: value + ' (click to copy)', tabindex: '0', role: 'button'}, full ? value : shortHash(value));
+    const copy = (event) => { event.stopPropagation(); copyText(value, el); };
+    el.addEventListener('click', copy);
+    el.addEventListener('keydown', (event) => { if (event.key === 'Enter') copy(event); });
+    return el;
+  }
+  async function copyText(value, el) {
+    try {
+      await navigator.clipboard.writeText(value);
+      el.classList.add('is-copied');
+      setTimeout(() => el.classList.remove('is-copied'), 1200);
+    } catch (err) {
+      const range = document.createRange();
+      range.selectNodeContents(el);
+      const selection = window.getSelection();
+      selection.removeAllRanges();
+      selection.addRange(range);
+    }
+  }
+  function fact(label, value, detail) {
+    return h('div', {class: 'fact'}, h('span', {class: 'label'}, label), h('strong', null, value), detail ? h('small', null, detail) : null);
+  }
+  function field(label, ...value) {
+    return h('div', {class: 'field'}, h('span', {class: 'label'}, label), h('div', {class: 'field-value'}, ...value));
+  }
+  function kv(rows) {
+    return h('div', {class: 'kv'}, rows.map(([label, value]) => h('div', {class: 'kv-row'}, h('span', null, label), h('b', null, value))));
+  }
+  function relationText(rel) {
+    rel = obj(rel);
+    switch (rel.kind) {
+      case 'same': return 'at best tip';
+      case 'behind': return num(rel.n) + ' behind';
+      case 'ahead': return num(rel.n) + ' ahead';
+      case 'fork': return 'fork at ' + num(rel.fork_height) + ' (' + num(rel.depth_theirs) + ' vs ' + num(rel.depth_ours) + ')';
+      default: return 'unknown';
+    }
+  }
+  function phaseCell(phase) {
+    if (!phase) return dash();
+    return h('span', {class: 'cluster'}, badge(text(phase.label), pick(PHASE_TONE, phase.label, null)),
+      h('span', {class: 'muted'}, 'k ' + (phase.k == null ? DASH : num(phase.k))));
+  }
+  function blockCell(block) {
+    block = obj(block);
+    return h('div', {class: 'stack'}, h('span', {class: 'cell-main'}, text(block.miner), templateChip(block.template)), hashEl(block.hash));
+  }
+  function statesBar(states) {
+    const bar = h('div', {class: 'states', role: 'img'});
+    const parts = [];
+    for (const [key, cls] of STATE_ORDER) {
+      const n = isNum(states[key]) ? states[key] : 0;
+      if (!n) continue;
+      const span = h('span', {class: cls, title: n + ' ' + key});
+      span.style.flexGrow = String(n);
+      bar.append(span);
+      parts.push(n + ' ' + key);
+    }
+    bar.setAttribute('aria-label', parts.join(', ') || 'no members');
+    return h('div', null, bar, h('span', {class: 'sub'}, parts.join(' · ') || 'no members'));
+  }
+  function showError(key, err) {
+    const el = $('err-' + key);
+    if (!el) return;
+    el.hidden = !err;
+    el.textContent = err ? 'Could not load: ' + (err.message || String(err)) : '';
+  }
+  function safely(key, render, data) {
+    try {
+      render(data);
+    } catch (err) {
+      console.error(key, err);
+      showError(key, new Error('rendering failed (' + err.message + ')'));
+    }
+  }
+
+  /* ---------- sortable tables ---------- */
+  function sortCompare(a, b, dir) {
+    const aMissing = a == null || (typeof a === 'number' && !Number.isFinite(a));
+    const bMissing = b == null || (typeof b === 'number' && !Number.isFinite(b));
+    if (aMissing || bMissing) return aMissing === bMissing ? 0 : aMissing ? 1 : -1;
+    if (typeof a === 'number' && typeof b === 'number') return (a - b) * dir;
+    return String(a).localeCompare(String(b)) * dir;
+  }
+  function dataTable(box, id, columns, rows, opts) {
+    opts = opts || {};
+    const sort = state.sorts[id] || null;
+    const sortCol = sort ? columns.find((c) => c.key === sort.key && c.sort) : null;
+    let shown = rows.slice();
+    if (sortCol) shown.sort((x, y) => sortCompare(sortCol.sort(x), sortCol.sort(y), sort.dir));
+    const total = shown.length;
+    if (!total) {
+      box.replaceChildren(empty(opts.empty || 'Nothing recorded yet.'));
+      return;
+    }
+    if (opts.limit && shown.length > opts.limit) shown = shown.slice(0, opts.limit);
+    const headRow = h('tr');
+    for (const col of columns) {
+      const sorted = sortCol === col;
+      const classes = [col.num ? 'col-num' : '', col.sort ? 'sortable' : '', sorted ? 'is-sorted' : ''].join(' ').trim();
+      const th = h('th', {class: classes || null, title: col.title || null, scope: 'col'}, col.label);
+      if (col.sort) {
+        th.append(h('span', {class: 'arrow'}, sorted ? (sort.dir > 0 ? '▲' : '▼') : '↕'));
+        th.addEventListener('click', () => {
+          state.sorts[id] = {key: col.key, dir: sorted ? -sort.dir : (col.desc ? -1 : 1)};
+          dataTable(box, id, columns, rows, opts);
+        });
+      }
+      headRow.append(th);
+    }
+    const body = h('tbody');
+    for (const row of shown) {
+      const tr = h('tr', {class: opts.rowClass ? opts.rowClass(row) || null : null});
+      for (const col of columns) tr.append(h('td', {class: col.num ? 'col-num' : col.cls || null}, col.cell(row)));
+      if (opts.onRow) opts.onRow(tr, row);
+      body.append(tr);
+      const drawer = opts.drawer ? opts.drawer(row) : null;
+      if (drawer) body.append(h('tr', {class: 'drawer'}, h('td', {colspan: columns.length}, drawer)));
+    }
+    const nodes = [h('div', {class: 'table-wrap'}, h('table', {class: opts.tableClass || null}, h('thead', null, headRow), body))];
+    if (total > shown.length) nodes.push(h('p', {class: 'table-note'}, 'Showing ' + num(shown.length) + ' of ' + num(total) + ' rows; narrow the filter to see more.'));
+    box.replaceChildren(...nodes);
+  }
+
+  /* ---------- fetching ---------- */
+  async function getJSON(path) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+    try {
+      let response;
+      try {
+        response = await fetch(path, {cache: 'no-store', signal: controller.signal, headers: {Accept: 'application/json'}});
+      } catch (err) {
+        throw new Error(err.name === 'AbortError' ? 'request timed out' : 'network error');
+      }
+      let body = null;
+      try { body = await response.json(); } catch (err) { body = null; }
+      if (!response.ok) {
+        const error = new Error((body && typeof body.message === 'string' && body.message) || 'HTTP ' + response.status);
+        error.status = response.status;
+        error.code = body && body.error;
+        throw error;
+      }
+      if (body == null) throw new Error('invalid JSON from ' + path);
+      return body;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  /* ---------- live snapshot (every 5 s) ---------- */
+  async function loadSnapshot() {
+    try {
+      const snap = await getJSON('/api/snapshot');
+      state.snapshot = snap;
+      state.snapshotOkAt = Date.now();
+      state.snapshotError = null;
+      if (isNum(snap.served_at)) state.skew = snap.served_at - Date.now() / 1000;
+      showError('snapshot', null);
+      safely('snapshot', renderLive, snap);
+    } catch (err) {
+      state.snapshotError = err;
+    }
+    renderBanner();
+    renderClock();
+  }
+
+  function renderLive(snap) {
+    renderHeader(snap);
+    renderPeerTile(snap);
+    renderNetwork(snap);
+    const count = isNum(snap.peer_count) ? snap.peer_count : 0;
+    $('peers-count').textContent = '· ' + num(count) + ' sources';
+  }
+
+  function renderHeader(snap) {
+    $('network-chip').textContent = text(snap.network);
+    const tip = snap.tip;
+    if (tip) {
+      $('tip-height').textContent = num(tip.height);
+      $('tip-height').title = text(tip.hash);
+    } else {
+      $('tip-height').textContent = DASH;
+    }
+    const phase = snap.phase;
+    const phasePill = $('phase-pill');
+    if (phase && phase.label !== 'unknown') {
+      phasePill.className = 'state-pill ' + (phase.label === 'fast' ? 'is-warn' : 'is-ok');
+      phasePill.textContent = (phase.label === 'fast' ? 'Fast' : 'Slow') + ' phase · k ' + num(phase.k);
+      phasePill.title = 'D/D_pre ' + compact(phase.d_ratio) + ', last reset at ' + num(phase.reset_height);
+    } else {
+      phasePill.className = 'state-pill';
+      phasePill.textContent = 'Phase unknown';
+      phasePill.title = 'no reset in the window';
+    }
+    // Only `split_event` alarms: the service admits a candidate once each side is 2+ blocks past the
+    // fork and opens the event after 30 s. A bare `split_candidate` can be a one-block orphan (lag).
+    const event = snap.split_event;
+    const splitPill = $('split-pill');
+    const groups = list(snap.groups);
+    if (event) {
+      splitPill.className = 'state-pill ' + (event.open ? 'is-bad' : 'is-warn');
+      splitPill.textContent = (event.open ? 'Split' : 'Possible split') + ' · fork at ' + num(event.fork_height);
+      splitPill.title = splitEventDetail(event, snap.generated_at);
+    } else if (groups.some((g) => g.branch)) {
+      splitPill.className = 'state-pill is-ok';
+      splitPill.textContent = 'No split';
+      splitPill.title = snap.split_candidate
+        ? 'groups on different branches, one side less than 2 blocks past the fork: lag, not a split'
+        : 'every active group is on the best chain or only lagging';
+    } else {
+      splitPill.className = 'state-pill';
+      splitPill.textContent = 'No peers yet';
+      splitPill.title = '';
+    }
+    document.title = (event && event.open ? 'SPLIT · ' : '') + (tip ? num(tip.height) + ' · ' : '') + 'Zakura Fork Monitor';
+  }
+
+  /** Describe a `split_event`: how long it has lasted and its depth past its own fork point. */
+  function splitEventDetail(event, now) {
+    const lasted = isNum(now) && isNum(event.since) ? dur(now - event.since) : DASH;
+    return (event.open ? 'split for ' + lasted : 'seen for ' + lasted + '; becomes a split after 30 s')
+      + ' · longest side ' + plural(event.depth, 'block') + ' past its fork (max ' + num(event.max_depth) + ')';
+  }
+
+  function renderClock() {
+    const snap = state.snapshot;
+    const tip = snap && snap.tip;
+    if (tip) {
+      const seen = isNum(tip.first_seen_at) ? tip.first_seen_at : tip.time;
+      const parts = [shortHash(text(tip.hash)), text(tip.miner), ago(seen)];
+      $('tip-detail').textContent = parts.join(' · ');
+    }
+    const fresh = $('freshness');
+    if (state.snapshotOkAt) {
+      fresh.textContent = 'updated ' + dur((Date.now() - state.snapshotOkAt) / 1000) + ' ago';
+    } else if (state.snapshotError) {
+      fresh.textContent = 'no data';
+    }
+  }
+
+  function renderBanner() {
+    const banner = $('banner');
+    const err = state.snapshotError;
+    const snap = state.snapshot;
+    let message = '';
+    let warn = false;
+    if (err && err.status === 503 && err.code === 'starting') {
+      message = 'The monitor is starting (loading and backfilling blocks); live data appears once the first snapshot is published.';
+      warn = true;
+    } else if (err) {
+      message = state.snapshotOkAt
+        ? 'Monitor unreachable (' + err.message + '). Showing data from ' + dur((Date.now() - state.snapshotOkAt) / 1000) + ' ago; retrying every 5 s.'
+        : 'Cannot reach the monitor API (' + err.message + '); retrying every 5 s.';
+    } else if (snap && isNum(snap.generated_at) && isNum(snap.served_at) && snap.served_at - snap.generated_at > STALE_SNAPSHOT_S) {
+      message = 'The live snapshot is ' + dur(snap.served_at - snap.generated_at) + ' old: the monitor’s event loop may be stalled.';
+      warn = true;
+    }
+    banner.hidden = !message;
+    banner.textContent = message;
+    banner.className = warn ? 'banner is-warn' : 'banner';
+    document.body.classList.toggle('is-stale', Boolean(message) && !warn);
+  }
+
+  function setTile(id, value, detail, tone) {
+    const tile = $(id);
+    tile.className = 'stat' + (tone ? ' is-' + tone : '');
+    tile.querySelector('.stat-value').textContent = value;
+    const small = tile.querySelector('small');
+    small.textContent = detail || ' ';
+    small.title = detail || '';
+  }
+
+  function renderPeerTile(snap) {
+    const p2p = obj(obj(snap.collectors).p2p);
+    const byGroup = Object.entries(obj(p2p.connected_by_group)).filter(([, n]) => isNum(n)).sort((a, b) => b[1] - a[1]);
+    const detail = byGroup.length ? byGroup.slice(0, 4).map(([g, n]) => g + ' ' + n).join(' · ') : (p2p.enabled ? 'no peers connected' : 'P2P observer disabled');
+    setTile('tile-peers', num(isNum(p2p.connected) ? p2p.connected : 0), detail, p2p.error ? 'warn' : null);
+  }
+
+  function renderNetwork(snap) {
+    const groups = list(snap.groups);
+    const split = snap.split_candidate;
+    const event = snap.split_event;
+    const members = groups.reduce((n, g) => n + (isNum(g.members) ? g.members : 0), 0);
+    const active = groups.reduce((n, g) => n + (isNum(g.active) ? g.active : 0), 0);
+    const chain = obj(snap.chain);
+    $('network-note').textContent = num(members) + ' vantage points, ' + num(active) + ' active · '
+      + num(chain.blocks) + ' blocks in memory (' + num(chain.from_height) + '–' + num(chain.to_height) + ')'
+      + (chain.missing_parents ? ' · ' + num(chain.missing_parents) + ' missing parents' : '');
+    renderSplit(event, split, groups, snap.generated_at);
+    const sideOf = obj(split ? split.groups : event && event.groups);
+    const columns = [
+      {key: 'group', label: 'Group', sort: (g) => g.key, cell: (g) => h('span', {class: 'cell-main'}, text(g.key), g.fleet ? chip('fleet ' + g.fleet, true) : null)},
+      {key: 'members', label: 'Active', num: true, desc: true, sort: (g) => g.active, cell: (g) => num(g.active) + ' / ' + num(g.members)},
+      {key: 'states', label: 'States', cell: (g) => statesBar(obj(g.states))},
+      {key: 'branch', label: 'Branch', cell: (g) => branchCell(g)},
+      {key: 'tip', label: 'Branch tip', num: true, sort: (g) => g.branch && g.branch.tip_height, cell: (g) => g.branch ? h('div', {class: 'stack'}, num(g.branch.tip_height), hashEl(g.branch.tip_hash)) : dash()},
+      {key: 'relation', label: 'Relation to best tip', cell: (g) => g.branch ? relationText(g.branch.relation) : dash()},
+      {key: 'stuck', label: 'Stuck', num: true, desc: true, sort: (g) => g.stuck, cell: (g) => g.stuck ? h('span', {class: 'bad-text'}, num(g.stuck)) : '0'},
+    ];
+    dataTable($('groups-table'), 'groups', columns, groups, {
+      empty: 'No vantage points yet: RPC collectors and P2P peers appear here as they report.',
+      rowClass: (g) => {
+        const side = has(sideOf, g.key) ? sideOf[g.key] : null;
+        if (side && side !== 'canonical') return event && event.open ? 'row-bad' : 'row-warn';
+        if (g.stuck) return 'row-warn';
+        return g.active ? null : 'row-dim';
+      },
+    });
+    renderStuck(list(snap.stuck));
+    renderCollectors(obj(snap.collectors));
+    renderReorgs(list(snap.recent_reorgs));
+  }
+
+  function branchCell(group) {
+    const branch = group.branch;
+    if (!branch) return dash();
+    const others = list(group.branches).length - 1;
+    const main = branch.key === 'canonical'
+      ? badge('canonical', 'ok')
+      : h('span', {class: 'cluster'}, badge('side branch', 'bad'), h('span', {class: 'muted'}, 'fork at ' + num(branch.fork_height)));
+    return h('div', {class: 'stack'}, main,
+      h('span', {class: 'sub'}, num(branch.members) + ' on it' + (others > 0 ? ' · ' + others + ' other branch' + (others > 1 ? 'es' : '') : '')));
+  }
+
+  function renderSplit(event, split, groups, now) {
+    const box = $('split-callout');
+    if (!event && !split) {
+      box.replaceChildren(groups.some((g) => g.branch)
+        ? h('div', {class: 'callout is-ok'}, h('div', {class: 'callout-title'}, badge('agreed', 'ok'), 'Every active group is on the best chain (or only lagging behind it).'))
+        : '');
+      return;
+    }
+    // A side branch's depth counts from its own fork point, which can sit above the split's lowest one.
+    const ownFork = {};
+    for (const g of groups) {
+      const branch = obj(g.branch);
+      if (branch.key && branch.key !== 'canonical' && isNum(branch.fork_height)) ownFork[branch.key] = branch.fork_height;
+    }
+    const sides = list(split && split.sides).map((side) => {
+      const fork = has(ownFork, side.branch) ? ownFork[side.branch] : null;
+      const past = isNum(fork) && isNum(side.tip_height)
+        ? plural(side.tip_height - fork, 'block') + ' past its fork at ' + num(fork)
+        : plural(side.blocks_past_fork, 'block') + ' past ' + num(split.fork_height);
+      return h('div', {class: 'side'},
+        h('div', {class: 'item-top'}, side.branch === 'canonical' ? badge('best chain', 'ok') : badge('side branch', event && event.open ? 'bad' : 'warn'),
+          side.branch === 'canonical' ? null : hashEl(side.branch)),
+        h('div', {class: 'item-detail'}, list(side.groups).join(', ') || DASH),
+        h('div', {class: 'item-detail'}, plural(side.members, 'member') + ' · tip ' + num(side.tip_height) + ' · ' + past));
+    });
+    const title = event
+      ? h('div', {class: 'callout-title'}, badge(event.open ? 'split' : 'possible split', event.open ? 'bad' : 'warn'),
+        'Groups sit on conflicting branches from height ' + num(event.fork_height), hashEl(event.fork_hash),
+        h('span', {class: 'muted'}, splitEventDetail(event, now)))
+      : h('div', {class: 'callout-title'}, badge('lag', 'warn'),
+        'Groups sit on different branches from height ' + num(split.fork_height), hashEl(split.fork_hash),
+        h('span', {class: 'muted'}, 'one side is less than 2 blocks past the fork: lag, not a split'));
+    const neutral = list(split && split.neutral_groups);
+    box.replaceChildren(h('div', {class: event ? 'callout ' + (event.open ? 'is-bad' : 'is-warn') : 'callout'}, title,
+      sides.length ? h('div', {class: 'sides'}, sides)
+        : h('div', {class: 'item-detail'}, 'The branches no longer conflict; the split closes after 30 s without one.'),
+      neutral.length ? h('div', {class: 'item-detail'}, 'Not involved: ' + neutral.join(', ')) : null));
+  }
+
+  function renderStuck(stuck) {
+    const box = $('stuck-list');
+    if (!stuck.length) {
+      box.replaceChildren(empty('No active source is stuck on a dead fork.'));
+      return;
+    }
+    box.replaceChildren(h('div', {class: 'list'}, stuck.slice(0, 50).map((v) => h('div', {class: 'item is-bad'},
+      h('div', {class: 'item-top'}, h('b', {class: 'mono'}, text(v.source)), badge(text(v.group), null), badge(text(v.state), 'bad')),
+      h('div', {class: 'item-detail'}, 'tip ' + num(v.tip_height) + ' · ' + relationText(v.relation)
+        + (isNum(v.behind) && obj(v.relation).kind !== 'behind' ? ' · ' + num(v.behind) + ' behind the best tip' : '')
+        + ' · tip age ' + dur(v.tip_age_s))))));
+  }
+
+  function renderCollectors(collectors) {
+    const items = [];
+    for (const rpc of list(collectors.rpc)) {
+      const r = obj(rpc);
+      const status = text(r.status || r.state);
+      const tone = pick(STATUS_TONE, r.status, null);
+      items.push(h('div', {class: 'item ' + (tone === 'ok' ? 'is-ok' : tone === 'bad' ? 'is-bad' : tone === 'warn' ? 'is-warn' : '')},
+        h('div', {class: 'item-top'}, h('b', {class: 'mono'}, text(r.source)), badge(status, tone),
+          h('span', {class: 'muted'}, 'tip ' + num(r.tip_height) + (isNum(r.behind) ? ' · ' + num(r.behind) + ' behind' : ''))),
+        r.last_error ? h('div', {class: 'item-detail bad-text'}, text(r.last_error) + (isNum(r.last_error_at) ? ' (' + ago(r.last_error_at) + ')' : '')) : null));
+    }
+    if (collectors.rpc_error) items.push(h('div', {class: 'item is-bad'}, 'RPC status failed: ' + text(collectors.rpc_error)));
+    const p2p = obj(collectors.p2p);
+    items.push(h('div', {class: 'item ' + (p2p.error ? 'is-bad' : p2p.enabled ? 'is-ok' : '')},
+      h('div', {class: 'item-top'}, h('b', null, 'P2P observer'), badge(p2p.enabled ? 'enabled' : 'disabled', p2p.enabled ? 'ok' : null),
+        h('span', {class: 'muted'}, num(p2p.connected) + ' connected of ' + num(p2p.peers) + ' known')),
+      p2p.error ? h('div', {class: 'item-detail bad-text'}, text(p2p.error)) : null));
+    $('collectors').replaceChildren(h('div', {class: 'list'}, items));
+  }
+
+  function renderReorgs(reorgs) {
+    const box = $('reorg-list');
+    if (!reorgs.length) {
+      box.replaceChildren(empty('No vantage point has reorged recently.'));
+      return;
+    }
+    box.replaceChildren(h('div', {class: 'list'}, reorgs.slice(0, 12).map((r) => h('div', {class: 'item ' + (r.disconnected > 1 ? 'is-bad' : 'is-warn')},
+      h('div', {class: 'item-top'}, h('b', {class: 'mono'}, text(r.source)),
+        badge(plural(r.disconnected, 'block') + ' reorged', r.disconnected > 1 ? 'bad' : 'warn'),
+        h('span', {class: 'muted', title: clock(r.at)}, ago(r.at))),
+      h('div', {class: 'item-detail'}, 'fork at ' + num(r.fork_height) + ' · ', hashEl(r.old_hash),
+        isNum(r.old_height) ? ' (' + num(r.old_height) + ')' : '', ' → ', hashEl(r.new_hash),
+        isNum(r.new_height) ? ' (' + num(r.new_height) + ')' : '', ', ' + num(r.connected) + ' connected')))));
+  }
+
+  /* ---------- history (every 30 s) ---------- */
+  const HISTORY = {
+    summary: {url: () => '/api/summary', render: renderSummary},
+    sawtooth: {url: () => '/api/sawtooth?n=' + state.sawN, render: renderSawtooth},
+    orphans: {url: () => '/api/orphans/stats', render: renderOrphans},
+    forks: {url: () => '/api/forks?limit=50', render: renderForks},
+    miners: {url: () => '/api/miners' + (state.minerSince ? '?since=' + encodeURIComponent(state.minerSince) : ''), render: renderMiners},
+    resets: {url: () => '/api/resets?limit=50', render: renderResets},
+    probes: {url: () => '/api/probes?since=-86400', render: renderProbes},
+    propagation: {url: () => '/api/propagation?since=-21600', render: renderPropagation},
+    crosscheck: {url: () => '/api/crosscheck', render: renderCrosscheck},
+  };
+
+  async function loadHistory(keys) {
+    await Promise.all((keys || Object.keys(HISTORY)).map(async (key) => {
+      const entry = HISTORY[key];
+      try {
+        const data = await getJSON(entry.url());
+        state.data[key] = data;
+        showError(key, null);
+        safely(key, entry.render, data);
+      } catch (err) {
+        showError(key, err);
+      }
+    }));
+  }
+
+  function renderSummary(sum) {
+    const periods = obj(sum.periods);
+    for (const [name, tile] of [['1h', 'tile-rate1h'], ['24h', 'tile-rate24h']]) {
+      const p = obj(periods[name]);
+      const detail = num(p.orphans) + ' orphans / ' + num(p.blocks) + ' blocks'
+        + (p.unobserved ? ' · ' + num(p.unobserved) + ' not watched live' : p.partial ? ' (partial window)' : '');
+      setTile(tile, pct(p.orphan_rate), detail, isNum(p.orphan_rate) && p.orphan_rate >= 0.05 ? 'warn' : null);
+    }
+    const day = obj(periods['24h']);
+    setTile('tile-forks', num(day.forks), 'deepest ' + plural(day.deepest_fork, 'block') + ' · ' + num(day.self_orphans) + ' self-orphans');
+    const deepest = sum.deepest_reorg_24h;
+    if (deepest) {
+      setTile('tile-reorg', plural(deepest.disconnected, 'block'),
+        text(deepest.source) + ' · ' + ago(deepest.at), deepest.disconnected > 1 ? 'bad' : null);
+    } else {
+      setTile('tile-reorg', isNum(day.reorgs) ? '0' : DASH, isNum(day.reorgs) ? 'no vantage point reorged' : 'no store');
+    }
+    const reset = sum.last_reset;
+    setTile('tile-resets', num(day.resets), reset ? 'last ' + num(reset.height) + ' by ' + text(reset.miner) + ', ' + ago(reset.time) : 'none in the window');
+  }
+
+  function renderSawtooth(data) {
+    const box = $('sawtooth-chart');
+    const blocks = list(data.blocks).filter((b) => b && isNum(b.height) && isNum(b.difficulty) && b.difficulty > 0);
+    $('saw-title').textContent = blocks.length
+      ? 'Last ' + num(blocks.length) + ' canonical blocks (' + num(blocks[0].height) + '–' + num(blocks[blocks.length - 1].height) + ')'
+      : 'Canonical difficulty, log scale';
+    renderSawFacts(data, blocks);
+    if (blocks.length < 2) {
+      box.replaceChildren(empty('Not enough canonical blocks yet.'));
+      return;
+    }
+    const W = Math.max(300, Math.round(box.clientWidth || 800));
+    const H = W < 560 ? 230 : 300;
+    const m = {l: 46, r: 12, t: 14, b: 40};
+    const iw = W - m.l - m.r;
+    const ih = H - m.t - m.b;
+    const h0 = blocks[0].height;
+    const h1 = blocks[blocks.length - 1].height;
+    const step = iw / Math.max(1, h1 - h0);
+    const X = (height) => m.l + (height - h0) * step;
+    let lo = Infinity;
+    let hi = -Infinity;
+    for (const b of blocks) {
+      const v = Math.log10(b.difficulty);
+      lo = Math.min(lo, v);
+      hi = Math.max(hi, v);
+    }
+    lo = Math.floor(lo);
+    hi = Math.max(lo + 1, Math.ceil(hi));
+    const Y = (d) => m.t + ((hi - Math.log10(d)) / (hi - lo)) * ih;
+    const base = H - m.b;
+    const root = s('svg', {viewBox: '0 0 ' + W + ' ' + H, role: 'img', 'aria-label': 'Difficulty by height (log scale) with resets and orphans'});
+    root.append(s('defs', null, s('linearGradient', {id: 'saw-fill', x1: 0, y1: 0, x2: 0, y2: 1},
+      s('stop', {offset: '0%', class: 'grad-top'}), s('stop', {offset: '100%', class: 'grad-bottom'}))));
+
+    const bands = s('g');
+    let start = -1;
+    for (let i = 0; i <= blocks.length; i++) {
+      const fast = i < blocks.length && blocks[i].fast === true;
+      if (fast && start < 0) start = i;
+      if (!fast && start >= 0) {
+        const x0 = Math.max(m.l, X(blocks[start].height) - step / 2);
+        const x1 = Math.min(W - m.r, X(blocks[i - 1].height) + step / 2);
+        bands.append(s('rect', {class: 'fast-band', x: x0.toFixed(1), y: m.t, width: Math.max(1, x1 - x0).toFixed(1), height: ih}));
+        start = -1;
+      }
+    }
+    root.append(bands);
+
+    const axes = s('g');
+    for (let p = lo; p <= hi; p++) {
+      const y = Y(10 ** p).toFixed(1);
+      axes.append(s('line', {class: 'grid-line', x1: m.l, x2: W - m.r, y1: y, y2: y}));
+      axes.append(s('text', {class: 'axis-text', x: m.l - 6, y: Number(y) + 3, 'text-anchor': 'end'}, compact(10 ** p)));
+    }
+    axes.append(s('line', {class: 'axis-line', x1: m.l, x2: W - m.r, y1: base, y2: base}));
+    const tickCount = Math.max(2, Math.min(8, Math.floor(iw / 130)));
+    for (let i = 0; i <= tickCount; i++) {
+      const b = blocks[Math.round((i / tickCount) * (blocks.length - 1))];
+      const x = X(b.height).toFixed(1);
+      const anchor = i === 0 ? 'start' : i === tickCount ? 'end' : 'middle';
+      axes.append(s('line', {class: 'axis-line', x1: x, x2: x, y1: base, y2: base + 4}));
+      axes.append(s('text', {class: 'axis-text', x, y: base + 15, 'text-anchor': anchor}, num(b.height)));
+      axes.append(s('text', {class: 'axis-text faint', x, y: base + 27, 'text-anchor': anchor}, isNum(b.time) ? new Date(b.time * 1000).toLocaleTimeString(undefined, {hour: '2-digit', minute: '2-digit'}) : ''));
+    }
+    root.append(axes);
+
+    let path = '';
+    for (let i = 0; i < blocks.length; i++) {
+      path += (i ? 'L' : 'M') + X(blocks[i].height).toFixed(1) + ' ' + Y(blocks[i].difficulty).toFixed(1);
+    }
+    root.append(s('path', {class: 'diff-area', d: path + 'L' + X(h1).toFixed(1) + ' ' + base + 'L' + X(h0).toFixed(1) + ' ' + base + 'Z'}));
+    root.append(s('path', {class: 'diff-line', d: path}));
+
+    const marks = s('g');
+    for (const b of blocks) {
+      if (b.min_diff) {
+        const x = X(b.height).toFixed(1);
+        marks.append(s('line', {class: 'reset-line', x1: x, x2: x, y1: m.t, y2: base}));
+        marks.append(s('path', {class: 'reset-cap', d: 'M' + (x - 4) + ' ' + (m.t - 6) + 'h8l-4 6z'}));
+      }
+      if (isNum(b.orphans) && b.orphans > 0) {
+        const x = X(b.height).toFixed(1);
+        marks.append(s('line', {class: 'orphan-tick', x1: x, x2: x, y1: base, y2: base - 5 - 3 * Math.min(3, b.orphans)}));
+      }
+    }
+    root.append(marks);
+
+    const guide = s('line', {class: 'guide', y1: m.t, y2: base, visibility: 'hidden'});
+    const dot = s('circle', {class: 'hover-dot', r: 4, visibility: 'hidden'});
+    const overlay = s('rect', {class: 'overlay', x: m.l, y: m.t, width: iw, height: ih});
+    root.append(guide, dot, overlay);
+    const tip = h('div', {class: 'tooltip', hidden: true, role: 'status'});
+
+    function nearest(target) {
+      let a = 0;
+      let z = blocks.length - 1;
+      while (a < z) {
+        const mid = (a + z) >> 1;
+        if (blocks[mid].height < target) a = mid + 1;
+        else z = mid;
+      }
+      if (a > 0 && Math.abs(blocks[a - 1].height - target) <= Math.abs(blocks[a].height - target)) a -= 1;
+      return blocks[a];
+    }
+    function show(event) {
+      const rect = root.getBoundingClientRect();
+      if (!rect.width) return;
+      const scale = rect.width / W;
+      const b = nearest(h0 + ((event.clientX - rect.left) / scale - m.l) / step);
+      const x = X(b.height);
+      const y = Y(b.difficulty);
+      guide.setAttribute('x1', x.toFixed(1));
+      guide.setAttribute('x2', x.toFixed(1));
+      guide.setAttribute('visibility', 'visible');
+      dot.setAttribute('cx', x.toFixed(1));
+      dot.setAttribute('cy', y.toFixed(1));
+      dot.setAttribute('visibility', 'visible');
+      const row = (label, value) => h('div', {class: 'tt-row'}, label, h('b', null, value));
+      tip.replaceChildren();
+      append(tip, [
+        h('div', {class: 'tt-head'}, 'Block ' + num(b.height)),
+        row('Time', clock(b.time)),
+        row('Interval', b.dt == null ? DASH : dur(b.dt)),
+        row('Difficulty', compact(b.difficulty)),
+        row('Since reset', b.k == null ? DASH : num(b.k) + ' blocks'),
+        row('Phase', b.fast === true ? 'fast' : b.fast === false ? 'slow' : 'unknown'),
+        row('Orphans here', num(b.orphans)),
+        b.min_diff ? h('div', {class: 'tt-flag'}, 'Min-difficulty reset') : null]);
+      tip.hidden = false;
+      const boxRect = box.getBoundingClientRect();
+      const px = rect.left - boxRect.left + x * scale;
+      const py = rect.top - boxRect.top + y * scale;
+      const width = tip.offsetWidth;
+      const left = px + 14 + width > box.clientWidth ? px - 14 - width : px + 14;
+      tip.style.left = Math.max(0, left) + 'px';
+      tip.style.top = Math.max(0, Math.min(py - 24, box.clientHeight - tip.offsetHeight)) + 'px';
+    }
+    function hide() {
+      tip.hidden = true;
+      guide.setAttribute('visibility', 'hidden');
+      dot.setAttribute('visibility', 'hidden');
+    }
+    overlay.addEventListener('pointermove', show);
+    overlay.addEventListener('pointerdown', show);
+    overlay.addEventListener('pointerleave', hide);
+    box.replaceChildren(root, tip);
+  }
+
+  function renderSawFacts(data, blocks) {
+    const phase = data.tip_phase;
+    const resets = list(data.resets);
+    const last = resets.length ? resets[resets.length - 1] : null;
+    const recent = blocks.slice(-17).map((b) => b.dt).filter(isNum);
+    const mean = recent.length ? recent.reduce((a, b) => a + b, 0) / recent.length : null;
+    $('saw-facts').replaceChildren(
+      fact('Phase', phase ? text(phase.label) : DASH, phase ? 'k = ' + num(phase.k) + ' blocks since reset' : 'no reset in the window'),
+      fact('Difficulty', phase ? compact(phase.difficulty) : DASH, phase ? 'D/D_pre ' + compact(phase.d_ratio) : null),
+      fact('Pre-reset level', phase ? compact(phase.d_pre) : DASH, 'difficulty before the last reset'),
+      fact('Mean interval', mean == null ? DASH : dur(mean), 'last 17 blocks; target ' + dur(data.target_spacing)),
+      fact('Last reset', last ? num(last.height) : DASH, last ? text(last.miner) + ', gap ' + dur(last.gap) + ', next ' + dur(last.next_dt) : 'none in range'),
+      fact('Resets shown', num(resets.length), 'within the plotted range'));
+  }
+
+  const PHASE_VIEWS = {
+    by_k: {title: 'By blocks since reset (k)', label: 'k'},
+    by_k_fine: {title: 'Near the reset (k ≤ 30)', label: 'k'},
+    by_ratio: {title: 'By difficulty relative to the pre-reset level', label: 'D/D_pre'},
+    by_phase: {title: 'Fast vs slow phase', label: 'phase'},
+  };
+
+  function renderOrphans(stats) {
+    const view = pick(PHASE_VIEWS, state.phaseView, PHASE_VIEWS.by_k);
+    $('phase-title').textContent = view.title;
+    const totals = obj(stats.totals);
+    $('orphans-note').textContent = num(totals.orphans) + ' orphans in ' + num(totals.blocks) + ' settled blocks (' + pct(totals.rate) + ') · '
+      + num(totals.self) + ' self-orphans, ' + num(totals.race) + ' races, ' + num(totals.unknown) + ' unattributed · heights '
+      + num(stats.from_height) + '–' + num(stats.to_height)
+      + (totals.unobserved ? ' · ' + num(totals.unobserved) + ' blocks not watched live left out' : '');
+    const rows = list(stats[state.phaseView]);
+    barChart($('phase-chart'), rows, {
+      aria: 'Orphan rate by ' + view.label,
+      value: (r) => r.rate,
+      axis: (v) => pct(v, v < 0.01 ? 2 : 1),
+      label: (r) => text(r.key),
+      showValues: true,
+      valueText: (r) => (isNum(r.rate) ? pct(r.rate, 2) : ''),
+      muted: (r) => !r.blocks,
+      title: (r) => view.label + ' ' + text(r.key) + ': ' + num(r.orphans) + ' orphans / ' + num(r.blocks) + ' blocks = ' + pct(r.rate)
+        + '; ' + pct(r.share, 1) + ' of all orphans; ' + compact(r.forks_per_1000) + ' forks per 1000 blocks',
+      empty: 'No settled blocks yet.',
+    });
+    const hours = list(stats.by_hour);
+    const orphans = hours.reduce((n, r) => n + (isNum(r.orphans) ? r.orphans : 0), 0);
+    const blocks = hours.reduce((n, r) => n + (isNum(r.blocks) ? r.blocks : 0), 0);
+    $('hourly-note').textContent = num(orphans) + ' orphans / ' + num(blocks) + ' blocks';
+    barChart($('hourly-chart'), hours, {
+      aria: 'Orphans per hour, last 72 hours',
+      value: (r) => r.orphans,
+      axis: (v) => num(Math.round(v)),
+      label: (r) => hourLabel(r.start),
+      labelEvery: 12,
+      marker: (r) => r.resets > 0,
+      muted: () => false,
+      title: (r) => clock(r.start) + ': ' + num(r.orphans) + ' orphans / ' + num(r.blocks) + ' blocks (' + pct(r.rate) + '), '
+        + num(r.forks) + ' forks, ' + num(r.resets) + ' resets',
+      empty: 'No blocks in the last 72 hours.',
+    });
+  }
+
+  function niceCeil(v) {
+    const p = 10 ** Math.floor(Math.log10(v));
+    for (const k of [1, 2, 2.5, 5, 10]) if (k * p >= v) return k * p;
+    return 10 * p;
+  }
+
+  function barChart(box, rows, o) {
+    if (!rows.length) {
+      box.replaceChildren(empty(o.empty));
+      return;
+    }
+    const W = Math.max(280, Math.round(box.clientWidth || 600));
+    const H = 230;
+    const m = {l: 46, r: 8, t: 20, b: 34};
+    const iw = W - m.l - m.r;
+    const ih = H - m.t - m.b;
+    let max = 0;
+    for (const r of rows) if (isNum(o.value(r))) max = Math.max(max, o.value(r));
+    const top = max > 0 ? niceCeil(max) : 1;
+    const band = iw / rows.length;
+    const width = Math.max(1, Math.min(58, band * 0.72));
+    const root = s('svg', {viewBox: '0 0 ' + W + ' ' + H, role: 'img', 'aria-label': o.aria});
+    for (const f of [0, 0.5, 1]) {
+      const y = (m.t + ih - f * ih).toFixed(1);
+      root.append(s('line', {class: f ? 'grid-line' : 'axis-line', x1: m.l, x2: W - m.r, y1: y, y2: y}));
+      root.append(s('text', {class: 'axis-text', x: m.l - 6, y: Number(y) + 3, 'text-anchor': 'end'}, o.axis(top * f)));
+    }
+    rows.forEach((r, i) => {
+      const value = isNum(o.value(r)) ? o.value(r) : 0;
+      const height = (value / top) * ih;
+      const x = m.l + i * band + (band - width) / 2;
+      const y = m.t + ih - height;
+      const g = s('g', {class: 'bar-group'});
+      g.append(s('title', null, o.title(r)));
+      g.append(s('rect', {class: 'bar-hit', x: (m.l + i * band).toFixed(1), y: m.t, width: band.toFixed(1), height: ih + 16}));
+      g.append(s('rect', {class: o.muted(r) ? 'bar is-muted' : 'bar', x: x.toFixed(1), y: y.toFixed(1), width: width.toFixed(1),
+        height: Math.max(value > 0 ? 1 : 0, height).toFixed(1), rx: Math.min(3, width / 4).toFixed(1)}));
+      if (o.showValues) g.append(s('text', {class: 'bar-value', x: (x + width / 2).toFixed(1), y: (y - 5).toFixed(1)}, o.valueText(r)));
+      if (!o.labelEvery || i % o.labelEvery === 0) {
+        g.append(s('text', {class: 'axis-text', x: (x + width / 2).toFixed(1), y: H - m.b + 14, 'text-anchor': 'middle'}, o.label(r)));
+      }
+      if (o.marker && o.marker(r)) g.append(s('circle', {class: 'reset-dot', cx: (x + width / 2).toFixed(1), cy: H - m.b + 24, r: 2.5}));
+      root.append(g);
+    });
+    box.replaceChildren(root);
+  }
+
+  function forkKey(e) { return String(e.fork_hash) + ':' + String(e.height); }
+
+  function renderForks(data) {
+    const forks = list(data.forks);
+    $('forks-note').textContent = forks.length ? num(forks.length) + ' most recent · click a row for branch details' : '';
+    const columns = [
+      {key: 'height', label: 'Height', sort: (e) => e.height, desc: true,
+        cell: (e) => h('span', {class: 'cluster'}, h('span', {class: 'twisty', 'aria-hidden': 'true'}, '▶'), h('b', null, num(e.height)))},
+      {key: 'when', label: 'When', cls: 'nowrap', sort: (e) => obj(e.winner).time, desc: true,
+        cell: (e) => h('span', {title: clock(obj(e.winner).time)}, ago(obj(e.winner).time))},
+      {key: 'depth', label: 'Depth', num: true, sort: (e) => e.depth, desc: true, title: 'canonical blocks it took to beat the losing branch',
+        cell: (e) => (e.depth > 1 ? h('b', {class: 'warn-text'}, num(e.depth)) : num(e.depth))},
+      {key: 'kind', label: 'Kind', sort: (e) => e.classification,
+        cell: (e) => h('span', {class: 'cluster'}, badge(text(e.classification), pick(CLASS_TONE, e.classification, null)),
+          e.same_job ? h('span', {class: 'chip', title: 'same parent, time and miner: one job solved twice'}, 'same job') : null)},
+      {key: 'tiebreak', label: 'Decided by', sort: (e) => e.tiebreak,
+        cell: (e) => badge(pick(TIEBREAK_LABEL, e.tiebreak, text(e.tiebreak)), pick(TIEBREAK_TONE, e.tiebreak, null))},
+      {key: 'winner', label: 'Winner', sort: (e) => obj(e.winner).miner, cell: (e) => blockCell(e.winner)},
+      {key: 'loser', label: 'Loser', cell: (e) => loserCell(e)},
+      {key: 'phase', label: 'Phase', sort: (e) => obj(e.phase).k, cell: (e) => phaseCell(e.phase)},
+      {key: 'reorgs', label: 'Reorged', num: true, desc: true, title: 'vantage points that reorged at this fork', sort: (e) => obj(e.reorgs).count,
+        cell: (e) => (e.reorgs ? num(e.reorgs.count) : DASH)},
+      {key: 'settled', label: 'Status', cell: (e) => (e.settled ? badge('settled', null) : badge('open', 'warn'))},
+    ];
+    dataTable($('forks-table'), 'forks', columns, forks, {
+      tableClass: 't-wide',
+      empty: 'No fork events in the window yet.',
+      rowClass: (e) => 'clickable' + (state.openForks.has(forkKey(e)) ? ' is-open' : '') + (e.depth > 1 ? ' row-warn' : ''),
+      onRow: (tr, e) => {
+        tr.tabIndex = 0;
+        tr.setAttribute('aria-expanded', String(state.openForks.has(forkKey(e))));
+        const toggle = () => {
+          const key = forkKey(e);
+          if (state.openForks.has(key)) state.openForks.delete(key);
+          else state.openForks.add(key);
+          renderForks(data);
+        };
+        tr.addEventListener('click', toggle);
+        tr.addEventListener('keydown', (event) => {
+          if (event.target === tr && (event.key === 'Enter' || event.key === ' ')) {
+            event.preventDefault();
+            toggle();
+          }
+        });
+      },
+      drawer: (e) => (state.openForks.has(forkKey(e)) ? forkDrawer(e) : null),
+    });
+  }
+
+  function loserCell(e) {
+    const losers = list(e.losers);
+    if (!losers.length) return dash();
+    const first = obj(losers[0]);
+    const block = obj(first.block);
+    return h('div', {class: 'stack'},
+      h('span', {class: 'cell-main'}, text(block.miner), templateChip(block.template),
+        first.length > 1 ? chip(first.length + ' blocks') : null,
+        e.loser_count > 1 ? h('span', {class: 'muted'}, '+' + (e.loser_count - 1)) : null),
+      hashEl(block.hash));
+  }
+
+  function probeSummary(p) {
+    if (!p) return 'no store';
+    const parts = [];
+    for (const key of ['block', 'notfound', 'timeout', 'error', 'other']) if (p[key]) parts.push(num(p[key]) + ' ' + key);
+    if (p.notfound_same_announcer) parts.push(num(p.notfound_same_announcer) + ' notfound from the announcer');
+    return parts.join(', ') || 'not probed';
+  }
+
+  function adoptionSummary(a) {
+    if (!a) return 'no store';
+    const groups = Object.entries(obj(a.by_group)).sort((x, y) => y[1] - x[1]);
+    return groups.length ? groups.map(([g, n]) => g + ' ' + n).join(', ') : 'no sightings';
+  }
+
+  function forkDrawer(e) {
+    const winner = obj(e.winner);
+    const reorgs = obj(e.reorgs);
+    const fields = [
+      field('Fork point', kv([
+        ['height', num(e.fork_height)],
+        ['hash', hashEl(e.fork_hash)],
+        ['header time', clock(e.fork_time)],
+        ['depth (work)', plural(e.depth, 'block') + ' (' + compact(e.depth_work) + ')'],
+      ])),
+      field('Tie-break', kv([
+        ['equal work', yesNo(e.equal_work)],
+        ['winner seen first', yesNo(e.winner_first_seen)],
+        ['winner has greater hash', yesNo(e.winner_greater_raw_hash)],
+        ['decided by', pick(TIEBREAK_LABEL, e.tiebreak, text(e.tiebreak))],
+      ])),
+      field('Winner', kv([
+        ['block', hashEl(winner.hash)],
+        ['miner', h('span', {class: 'cluster'}, text(winner.miner), templateChip(winner.template))],
+        ['first seen', clock(winner.first_seen_at)],
+        ['probes', probeSummary(winner.probes)],
+        ['adopted by', adoptionSummary(winner.adopted_by)],
+      ])),
+    ];
+    list(e.losers).forEach((raw, index) => {
+      const loser = obj(raw);
+      const block = obj(loser.block);
+      fields.push(field('Loser ' + (index + 1) + ' · ' + text(loser.classification), kv([
+        ['block', hashEl(block.hash)],
+        ['branch', plural(loser.length, 'block') + ', work ' + compact(loser.work)],
+        ['miners', list(loser.miners).slice(0, 8).join(', ') || DASH],
+        ['first seen', clock(block.first_seen_at) + (loser.seen_first ? ' (before the winner)' : '')],
+        ['greater hash', yesNo(loser.greater_raw_hash)],
+        ['beaten after', plural(loser.winner_len, 'canonical block')],
+        ['probes', probeSummary(loser.probes)],
+        ['adopted by', adoptionSummary(loser.adopted_by)],
+      ])));
+    });
+    if (e.loser_count > list(e.losers).length) fields.push(field('More losers', num(e.loser_count - list(e.losers).length) + ' not shown'));
+    const sources = list(reorgs.sources);
+    if (sources.length) {
+      fields.push(field('Reorged vantage points (' + num(reorgs.count) + ')', h('div', {class: 'kv'}, sources.map((r) => h('div', {class: 'kv-row'},
+        h('span', {class: 'mono'}, text(r.source)), h('b', null, num(r.disconnected) + ' out, ' + num(r.connected) + ' in · ' + ago(r.at)))))));
+    }
+    return h('div', {class: 'drawer-inner'}, fields);
+  }
+
+  function renderMiners(data) {
+    const miners = list(data.miners);
+    $('miners-note').textContent = num(data.blocks) + ' canonical, ' + num(data.stale) + ' stale'
+      + (data.unobserved ? ' · ' + num(data.unobserved) + ' not watched live left out' : '');
+    const fastRate = (m) => {
+      const f = obj(obj(m.by_phase).fast);
+      const total = (f.canonical || 0) + (f.stale || 0);
+      return total ? f.stale / total : null;
+    };
+    const slowRate = (m) => {
+      const f = obj(obj(m.by_phase).slow);
+      const total = (f.canonical || 0) + (f.stale || 0);
+      return total ? f.stale / total : null;
+    };
+    const columns = [
+      {key: 'miner', label: 'Miner', cls: 'col-name', sort: (m) => m.miner, cell: (m) => h('span', {class: 'cell-main'}, text(m.miner))},
+      {key: 'canonical', label: 'Canonical', num: true, desc: true, sort: (m) => m.canonical, cell: (m) => num(m.canonical)},
+      {key: 'share', label: 'Share', num: true, desc: true, sort: (m) => m.share, cell: (m) => pct(m.share, 1)},
+      {key: 'stale', label: 'Stale', num: true, desc: true, sort: (m) => m.stale, cell: (m) => num(m.stale)},
+      {key: 'stale_rate', label: 'Stale rate', num: true, desc: true, sort: (m) => m.stale_rate,
+        cell: (m) => (isNum(m.stale_rate) && m.stale_rate >= 0.05 ? h('b', {class: 'warn-text'}, pct(m.stale_rate)) : pct(m.stale_rate))},
+      {key: 'fast', label: 'Fast stale', num: true, desc: true, sort: fastRate, title: 'stale rate during fast phases', cell: (m) => pct(fastRate(m))},
+      {key: 'slow', label: 'Slow stale', num: true, desc: true, sort: slowRate, title: 'stale rate during slow phases', cell: (m) => pct(slowRate(m))},
+      {key: 'self', label: 'Self', num: true, desc: true, sort: (m) => m.self_orphans, title: 'orphaned by its own block', cell: (m) => num(m.self_orphans)},
+      {key: 'lost', label: 'Lost', num: true, desc: true, sort: (m) => m.races_lost, title: 'races lost to another miner', cell: (m) => num(m.races_lost)},
+      {key: 'won', label: 'Won', num: true, desc: true, sort: (m) => m.races_won, title: 'races won against another miner', cell: (m) => num(m.races_won)},
+      {key: 'unattributed', label: 'Unattr.', num: true, desc: true, sort: (m) => m.unattributed_losses, title: 'losses where a miner is unknown', cell: (m) => num(m.unattributed_losses)},
+      {key: 'resets', label: 'Resets', num: true, desc: true, sort: (m) => m.resets, cell: (m) => num(m.resets)},
+      {key: 'templates', label: 'Templates', cell: (m) => {
+        const entries = Object.entries(obj(m.templates)).filter(([, n]) => n).sort((a, b) => b[1] - a[1]);
+        return h('span', {class: 'sub'}, entries.map(([t, n]) => t + ' ' + num(n)).join(' · ') || DASH);
+      }},
+    ];
+    dataTable($('miners-table'), 'miners', columns, miners, {tableClass: 't-wide', empty: 'No settled blocks in this period.'});
+    const pairs = list(data.pairs).slice(0, 12);
+    $('miner-pairs').replaceChildren(pairs.length
+      ? h('div', {class: 'chips'}, pairs.map((p) => h('span', {class: 'badge pair ' + pick(TONE_CLASS, pick(CLASS_TONE, p.kind, null), '')},
+        text(p.loser) + ' → ' + text(p.winner) + ' × ' + num(p.n))))
+      : empty('No settled orphans in this period.'));
+  }
+
+  function renderResets(data) {
+    const resets = list(data.resets);
+    $('resets-note').textContent = resets.length ? num(resets.length) + ' most recent' : '';
+    const columns = [
+      {key: 'height', label: 'Height', sort: (r) => r.height, desc: true, cell: (r) => h('div', {class: 'stack'}, h('b', null, num(r.height)), hashEl(r.hash))},
+      {key: 'time', label: 'When', cls: 'nowrap', sort: (r) => r.time, desc: true, cell: (r) => h('span', {title: clock(r.time)}, ago(r.time))},
+      {key: 'miner', label: 'Miner', sort: (r) => r.miner, cell: (r) => h('span', {class: 'cluster'}, text(r.miner), templateChip(r.template))},
+      {key: 'gap', label: 'Gap', num: true, sort: (r) => r.gap, title: 'header time minus parent time (451 s = future-dated template)',
+        cell: (r) => (isNum(r.gap) && r.gap >= 450 ? h('span', {class: 'warn-text'}, dur(r.gap)) : dur(r.gap))},
+      {key: 'next', label: 'Next Δt', num: true, sort: (r) => r.next_dt, title: 'next canonical header time minus this one',
+        cell: (r) => (isNum(r.next_dt) && r.next_dt < 0 ? h('span', {class: 'bad-text'}, dur(r.next_dt)) : dur(r.next_dt))},
+      {key: 'fwd', label: 'Forward-dated', num: true, sort: (r) => r.forward_dating, title: 'header time minus first seen', cell: (r) => dur(r.forward_dating)},
+      {key: 'dpre', label: 'D_pre', num: true, sort: (r) => r.d_pre, cell: (r) => compact(r.d_pre)},
+      {key: 'fast', label: 'Fast blocks', num: true, sort: (r) => r.fast_blocks, cell: (r) => (r.fast_blocks == null ? h('span', {class: 'warn-text'}, 'fast') : num(r.fast_blocks))},
+      {key: 'cycle', label: 'Cycle', num: true, sort: (r) => r.cycle_blocks, cell: (r) => (r.cycle_blocks == null ? h('span', {class: 'muted'}, 'open') : num(r.cycle_blocks))},
+      {key: 'orphans', label: 'Orphans', num: true, desc: true, sort: (r) => r.orphans, cell: (r) => num(r.orphans)},
+    ];
+    dataTable($('resets-table'), 'resets', columns, resets, {empty: 'No min-difficulty resets in the window.', tableClass: 't-wide'});
+  }
+
+  const PROBE_SEGMENTS = [['block', 's-block'], ['notfound', 's-notfound'], ['timeout', 's-timeout'], ['error', 's-error'], ['other', 's-error']];
+
+  /** Draw one stacked bar per probe group (block / notfound / timeout / error shares) into `box`. */
+  function probeBars(box, groups, aria, emptyText) {
+    if (!groups.length) {
+      box.replaceChildren(empty(emptyText));
+      return;
+    }
+    const shown = groups.slice(0, 16);
+    const W = Math.max(280, Math.round(box.clientWidth || 500));
+    const narrow = W < 520;
+    const labelW = narrow ? 92 : 124;
+    const valueW = narrow ? 88 : 150;
+    const rowH = 30;
+    const barW = W - labelW - valueW;
+    const root = s('svg', {viewBox: '0 0 ' + W + ' ' + (shown.length * rowH + 4), role: 'img', 'aria-label': aria});
+    shown.forEach((g, i) => {
+      const y = i * rowH + 6;
+      const total = isNum(g.probes) && g.probes > 0 ? g.probes : 0;
+      const row = s('g', {class: 'bar-group'});
+      row.append(s('title', null, text(g.group) + ': ' + PROBE_SEGMENTS.filter(([key]) => g[key]).map(([key]) => num(g[key]) + ' ' + key).join(', ')
+        + (isNum(g.latency_p50_ms) ? '; p50 ' + num(g.latency_p50_ms) + ' ms' : '')));
+      const name = text(g.group);
+      row.append(s('text', {class: 'hbar-label', x: 0, y: y + 13}, name.length > 16 ? name.slice(0, 15) + '…' : name));
+      row.append(s('rect', {class: 'hbar-track', x: labelW, y, width: barW, height: 18, rx: 3}));
+      let x = labelW;
+      for (const [key, cls] of PROBE_SEGMENTS) {
+        const n = isNum(g[key]) ? g[key] : 0;
+        if (!n || !total) continue;
+        const w = (n / total) * barW;
+        row.append(s('rect', {class: cls, x: x.toFixed(1), y, width: Math.max(1, w).toFixed(1), height: 18}));
+        x += w;
+      }
+      row.append(s('text', {class: 'hbar-value', x: labelW + barW + 8, y: y + 13},
+        pct(g.notfound_rate, 1) + ' notfound' + (narrow ? '' : ' · ' + num(g.probes) + ' probes')));
+      root.append(row);
+    });
+    box.replaceChildren(root);
+  }
+
+  function renderProbes(data) {
+    $('probes-note').textContent = num(data.probes) + ' probes since ' + clock(data.since);
+    probeBars($('probes-chart'), list(data.by_group), 'Announce probe results by implementation',
+      'No announce probes in the last 24 hours.');
+    probeBars($('probes-reprobe-chart'), list(data.reprobe_by_group), 'Reprobe results by implementation',
+      'No sampled reprobes in the last 24 hours.');
+    const reasons = list(data.by_reason);
+    dataTable($('probes-reasons'), 'probe-reasons', [
+      {key: 'reason', label: 'Reason', cell: (r) => text(r.reason)},
+      {key: 'probes', label: 'Probes', num: true, cell: (r) => num(r.probes)},
+      {key: 'block', label: 'Served', num: true, cell: (r) => num(r.block)},
+      {key: 'notfound', label: 'Notfound', num: true, cell: (r) => num(r.notfound)},
+      {key: 'timeout', label: 'Timeout', num: true, cell: (r) => num(r.timeout)},
+    ], reasons, {tableClass: 't-compact', empty: 'No probes yet.'});
+    const incidents = list(data.incidents);
+    $('incidents-title').textContent = 'Announced, then notfound by the same peer · ' + num(data.incident_count);
+    dataTable($('incidents-table'), 'incidents', [
+      {key: 'at', label: 'When', cls: 'nowrap', sort: (r) => r.at, desc: true, cell: (r) => h('span', {title: clock(r.at)}, ago(r.at))},
+      {key: 'source', label: 'Peer', sort: (r) => r.source, cell: (r) => h('span', {class: 'mono'}, text(r.source))},
+      {key: 'group', label: 'Group', sort: (r) => r.group, cell: (r) => text(r.group)},
+      {key: 'hash', label: 'Block', cell: (r) => hashEl(r.hash)},
+      {key: 'height', label: 'Height', num: true, sort: (r) => r.height, cell: (r) => num(r.height)},
+      {key: 'canonical', label: 'Block is', cell: (r) => (r.canonical === true ? badge('canonical', 'ok') : r.canonical === false ? badge('stale', 'bad') : badge('unknown', null))},
+      {key: 'reason', label: 'Reason', cell: (r) => text(r.reason)},
+      {key: 'peer_tip', label: 'Peer tip', cell: (r) => hashEl(r.peer_tip_hash)},
+    ], incidents, {empty: 'No peer announced a block and then answered notfound for it.'});
+  }
+
+  function renderPropagation(data) {
+    $('propagation-note').textContent = num(data.blocks) + ' blocks, ' + num(data.sightings) + ' timely sightings since ' + clock(data.since);
+    dataTable($('propagation-table'), 'propagation', [
+      {key: 'group', label: 'Group', sort: (r) => r.group, cell: (r) => h('span', {class: 'cell-main'}, text(r.group), r.kind === 'rpc' ? chip('rpc') : null)},
+      {key: 'sources', label: 'Sources', num: true, desc: true, sort: (r) => r.sources, cell: (r) => num(r.sources)},
+      {key: 'sightings', label: 'Sightings', num: true, desc: true, sort: (r) => r.sightings, cell: (r) => num(r.sightings)},
+      {key: 'first', label: 'Saw first', num: true, desc: true, sort: (r) => r.first, title: 'blocks this group announced before anyone else', cell: (r) => num(r.first)},
+      {key: 'p50', label: 'p50 delay', num: true, sort: (r) => r.p50_s, cell: (r) => dur(r.p50_s)},
+      {key: 'p90', label: 'p90 delay', num: true, sort: (r) => r.p90_s, cell: (r) => dur(r.p90_s)},
+      {key: 'max', label: 'Max', num: true, sort: (r) => r.max_s, cell: (r) => dur(r.max_s)},
+      {key: 'coverage', label: 'Coverage', num: true, desc: true, sort: (r) => r.coverage, title: 'mean share of blocks each member announced', cell: (r) => pct(r.coverage, 1)},
+    ], list(data.by_group), {empty: 'No inv or RPC tip sightings in this period.'});
+    dataTable($('propagation-recent'), 'propagation-recent', [
+      {key: 'height', label: 'Height', cell: (r) => h('b', null, num(r.height))},
+      {key: 'hash', label: 'Block', cell: (r) => hashEl(r.hash)},
+      {key: 'seen', label: 'First seen', cell: (r) => h('span', {title: clock(r.first_seen_at)}, ago(r.first_seen_at))},
+      {key: 'first', label: 'First source', cell: (r) => h('span', {class: 'mono'}, text(r.first_source))},
+      {key: 'sources', label: 'Sources', num: true, cell: (r) => num(r.sources)},
+      {key: 'p50', label: 'p50', num: true, cell: (r) => dur(r.p50_s)},
+      {key: 'p90', label: 'p90', num: true, cell: (r) => dur(r.p90_s)},
+      {key: 'max', label: 'Max', num: true, cell: (r) => dur(r.max_s)},
+    ], list(data.recent).slice(0, 12), {empty: 'No recent blocks with timely sightings.'});
+  }
+
+  function renderCrosscheck(data) {
+    const totals = obj(data.totals);
+    const sources = list(data.sources);
+    $('crosscheck-note').textContent = sources.length
+      ? 'sources: ' + sources.join(', ') + ' · heights ' + num(data.from_height) + '–' + num(data.to_height)
+      : 'no external records (importer disabled or nothing imported yet)';
+    $('crosscheck-facts').replaceChildren(
+      fact('Both', num(totals.both), 'orphans recorded by both'),
+      fact('Only external', num(totals.only_theirs), 'missing here at heights watched live: parent unknown or never relayed'),
+      fact('Not watched live', num(totals.unwatched), 'external orphans at heights this monitor only backfilled'),
+      fact('Only ours', num(totals.only_ours), 'missing from the external records'),
+      fact('Flip-flops', num(totals.theirs_canonical), 'external "orphans" that are canonical here'),
+      fact('Out of window', num(totals.out_of_window), 'outside the in-memory heights'));
+    dataTable($('crosscheck-days'), 'crosscheck-days', [
+      {key: 'day', label: 'Day (UTC)', sort: (r) => r.start, desc: true, cell: (r) => text(r.day)},
+      {key: 'both', label: 'Both', num: true, cell: (r) => num(r.both)},
+      {key: 'theirs', label: 'Only external', num: true, cell: (r) => num(r.only_theirs)},
+      {key: 'ours', label: 'Only ours', num: true, cell: (r) => num(r.only_ours)},
+      {key: 'flip', label: 'Flip-flops', num: true, cell: (r) => num(r.theirs_canonical)},
+      {key: 'unwatched', label: 'Not watched', num: true, cell: (r) => num(r.unwatched)},
+    ], list(data.by_day).slice().reverse().slice(0, 14), {tableClass: 't-compact', empty: 'Nothing to compare yet.'});
+    dataTable($('crosscheck-theirs'), 'crosscheck-theirs', [
+      {key: 'height', label: 'Height', cell: (r) => num(r.height)},
+      {key: 'hash', label: 'Block', cell: (r) => hashEl(r.hash)},
+      {key: 'source', label: 'Source', cell: (r) => text(r.source)},
+      {key: 'miner', label: 'Miner address', cls: 'wrap', cell: (r) => h('span', {class: 'mono sub'}, text(r.miner_address))},
+    ], list(data.only_theirs), {tableClass: 't-compact', empty: 'None.'});
+    dataTable($('crosscheck-ours'), 'crosscheck-ours', [
+      {key: 'height', label: 'Height', cell: (r) => num(r.height)},
+      {key: 'hash', label: 'Block', cell: (r) => hashEl(r.hash)},
+      {key: 'miner', label: 'Miner', cell: (r) => h('span', {class: 'cluster'}, text(r.miner), templateChip(r.template))},
+      {key: 'seen', label: 'First seen', cell: (r) => clock(r.first_seen_at)},
+    ], list(data.only_ours), {tableClass: 't-compact', empty: 'None.'});
+  }
+
+  /* ---------- peers (collapsible, every 5 s while open) ---------- */
+  async function loadPeers() {
+    if (!$('peers-details').open) return;
+    try {
+      const data = await getJSON('/api/peers');
+      state.peers = list(data.peers);
+      showError('peers', null);
+      safely('peers', renderPeers, state.peers);
+    } catch (err) {
+      showError('peers', err);
+    }
+  }
+
+  function isIssue(v) {
+    return ['fork', 'stuck', 'lagging', 'unknown'].includes(v.state) || Boolean(v.last_error);
+  }
+
+  function renderPeers(peers) {
+    const needle = state.peerFilter.trim().toLowerCase();
+    const rows = peers.filter((v) => {
+      if (state.peerIssues && !isIssue(v)) return false;
+      if (!needle) return true;
+      return [v.source, v.group, v.state, v.status, v.user_agent].some((x) => typeof x === 'string' && x.toLowerCase().includes(needle));
+    });
+    const active = peers.filter((v) => v.active).length;
+    $('peers-note').textContent = num(peers.length) + ' sources, ' + num(active) + ' active' + (rows.length !== peers.length ? ' · ' + num(rows.length) + ' match' : '');
+    dataTable($('peers-table'), 'peers', [
+      {key: 'source', label: 'Source', cls: 'col-name', sort: (v) => v.source,
+        cell: (v) => h('div', {class: 'stack'}, h('span', {class: 'cell-main mono'}, text(v.source), v.fleet ? chip('fleet', true) : null),
+          v.user_agent ? h('span', {class: 'sub', title: v.user_agent}, v.user_agent.length > 48 ? v.user_agent.slice(0, 47) + '…' : v.user_agent) : null)},
+      {key: 'group', label: 'Group', sort: (v) => v.group, cell: (v) => text(v.group)},
+      {key: 'state', label: 'State', sort: (v) => v.state, cell: (v) => badge(text(v.state), pick(STATE_TONE, v.state, null))},
+      {key: 'status', label: 'Status', sort: (v) => v.status, cell: (v) => h('span', {class: 'muted'}, text(v.status))},
+      {key: 'tip', label: 'Tip', num: true, desc: true, sort: (v) => v.tip_height, cell: (v) => h('div', {class: 'stack'}, num(v.tip_height), hashEl(v.tip_hash))},
+      {key: 'behind', label: 'Behind', num: true, desc: true, sort: (v) => v.behind, cell: (v) => num(v.behind)},
+      {key: 'relation', label: 'Relation', sort: (v) => obj(v.relation).kind, cell: (v) => relationText(v.relation)},
+      {key: 'age', label: 'Tip age', num: true, sort: (v) => v.tip_age_s, cell: (v) => dur(v.tip_age_s)},
+      {key: 'rtt', label: 'RTT', num: true, sort: (v) => obj(v.live).rtt_ms, cell: (v) => (isNum(obj(v.live).rtt_ms) ? num(obj(v.live).rtt_ms) + ' ms' : DASH)},
+      {key: 'ok', label: 'Last OK', sort: (v) => v.last_ok_at, desc: true, cell: (v) => ago(v.last_ok_at)},
+      {key: 'error', label: 'Last error', cls: 'wrap', cell: (v) => (v.last_error ? h('span', {class: 'sub', title: clock(v.last_error_at)}, v.last_error) : dash())},
+    ], rows, {
+      tableClass: 't-wide',
+      limit: MAX_PEER_ROWS,
+      empty: peers.length ? 'No source matches the filter.' : 'No vantage points yet.',
+      rowClass: (v) => (v.state === 'fork' || v.state === 'stuck' ? 'row-bad' : v.state === 'lagging' ? 'row-warn' : v.active ? null : 'row-dim'),
+    });
+  }
+
+  /* ---------- controls ---------- */
+  function markOn(group, attr, value) {
+    for (const button of group.querySelectorAll('button')) button.classList.toggle('is-on', button.getAttribute(attr) === value);
+  }
+  function wireControls() {
+    const range = $('saw-range');
+    markOn(range, 'data-n', String(state.sawN));
+    range.addEventListener('click', (event) => {
+      const button = event.target.closest('button');
+      if (!button) return;
+      state.sawN = Number(button.getAttribute('data-n'));
+      markOn(range, 'data-n', String(state.sawN));
+      loadHistory(['sawtooth']);
+    });
+    const views = $('phase-view');
+    markOn(views, 'data-view', state.phaseView);
+    views.addEventListener('click', (event) => {
+      const button = event.target.closest('button');
+      if (!button) return;
+      state.phaseView = button.getAttribute('data-view');
+      markOn(views, 'data-view', state.phaseView);
+      if (state.data.orphans) safely('orphans', renderOrphans, state.data.orphans);
+    });
+    const since = $('miner-since');
+    markOn(since, 'data-since', state.minerSince);
+    since.addEventListener('click', (event) => {
+      const button = event.target.closest('button');
+      if (!button) return;
+      state.minerSince = button.getAttribute('data-since');
+      markOn(since, 'data-since', state.minerSince);
+      loadHistory(['miners']);
+    });
+    $('peers-details').addEventListener('toggle', () => { if ($('peers-details').open) loadPeers(); });
+    $('peer-filter').addEventListener('input', (event) => {
+      state.peerFilter = event.target.value;
+      if (state.peers) safely('peers', renderPeers, state.peers);
+    });
+    $('peer-issues').addEventListener('click', (event) => {
+      state.peerIssues = !state.peerIssues;
+      event.currentTarget.classList.toggle('is-on', state.peerIssues);
+      if (state.peers) safely('peers', renderPeers, state.peers);
+    });
+    let resizeTimer = null;
+    window.addEventListener('resize', () => {
+      clearTimeout(resizeTimer);
+      resizeTimer = setTimeout(() => {
+        if (state.data.sawtooth) safely('sawtooth', renderSawtooth, state.data.sawtooth);
+        if (state.data.orphans) safely('orphans', renderOrphans, state.data.orphans);
+        if (state.data.probes) safely('probes', renderProbes, state.data.probes);
+      }, 150);
+    });
+  }
+
+  function every(ms, task) {
+    let busy = false;
+    const run = async () => {
+      if (busy || document.hidden) return;
+      busy = true;
+      try { await task(); } finally { busy = false; }
+    };
+    setInterval(run, ms);
+    return run;
+  }
+
+  wireControls();
+  const tasks = [every(SNAPSHOT_MS, loadSnapshot), every(HISTORY_MS, () => loadHistory()), every(PEERS_MS, loadPeers)];
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) tasks.forEach((run) => run()); });
+  setInterval(() => { renderClock(); renderBanner(); }, 1000);
+  tasks.forEach((run) => run());
+})();
+</script>
+</body>
+</html>

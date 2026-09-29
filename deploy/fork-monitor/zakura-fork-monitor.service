@@ -1,0 +1,54 @@
+# Template for the Zakura fork monitor; not installed by any deploy workflow yet.
+# Install steps are in deploy/fork-monitor/README.md ("Deploying on a new host").
+# Run it from an IP that no fleet node uses: peers keep one connection per IP.
+
+[Unit]
+Description=Zakura fork monitor (orphans, reorgs and network splits)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=zakura-fork-monitor
+Group=zakura-fork-monitor
+WorkingDirectory=/opt/zakura-fork-monitor
+ExecStart=/usr/bin/python3 -m zakura_fork_monitor run --config /etc/zakura-fork-monitor/config.toml --db /var/lib/zakura-fork-monitor/monitor.sqlite3
+# /var/lib/zakura-fork-monitor, owned by the service user and writable under ProtectSystem=strict.
+StateDirectory=zakura-fork-monitor
+StateDirectoryMode=0750
+Restart=on-failure
+RestartSec=10
+# SIGTERM closes peers, commits the database and ends any open split event.
+TimeoutStopSec=30
+
+# Up to 300 peers plus dashboard clients.
+LimitNOFILE=4096
+MemoryMax=1G
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectProc=invisible
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+CapabilityBoundingSet=
+AmbientCapabilities=
+UMask=0027
+
+[Install]
+WantedBy=multi-user.target

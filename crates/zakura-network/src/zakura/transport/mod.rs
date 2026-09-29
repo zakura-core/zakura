@@ -30,7 +30,7 @@ pub(crate) use message_rule::frame_filter::{FrameFilter, InboundReader};
 #[cfg(test)]
 pub(crate) use message_rule::frame_suite::check_frame_filter;
 pub use message_rule::{
-    frame_filter::FrameRejection, layout::LayoutError, Cadence, MessageRole, MessageRule,
+    frame_filter::FrameRejection, layout::LayoutError, Cadence, Credit, MessageRole, MessageRule,
     PayloadLen,
 };
 pub(crate) use pipe::{

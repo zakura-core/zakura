@@ -478,8 +478,8 @@ the sender retains headers.
   - `initial_target_tip_hash` and `tree_aux_schema` remain fixed
   - the acknowledged cursor and counters equal the current acknowledgement or advance to a prefix
     in the sent-cursor ring (capacity = `HS_SENT_CURSOR_RING`)
-  - remaining header credit <= 4,000
-  - remaining byte credit <= 8 MiB
+  - granted minus acknowledged header credit <= 4,000
+  - granted minus acknowledged byte credit <= 8 MiB
   - terminal tombstone capacity = 1
 - **Capacity**
   - one live or closing subscription per peer
@@ -528,8 +528,9 @@ capacity so exhausted data credit cannot prevent closure.
 The publisher MUST split output into frames that satisfy its advertised per-response count and byte
 limits. It MAY send several frames without another `Grant` while credit remains. It MUST NOT treat
 bytes sent on the ordered stream as new credit. The sent-cursor ring MUST hold at least the
-maximum number of unacknowledged pages. The header credit bound limits that number to 4,000
-one-header pages, so `HS_SENT_CURSOR_RING` always suffices.
+maximum number of unacknowledged pages. Granted minus acknowledged header credit MUST NOT exceed
+4,000, and granted minus acknowledged byte credit MUST NOT exceed 8 MiB. Every page carries at least
+one header, so at most 4,000 pages are unacknowledged and `HS_SENT_CURSOR_RING` always suffices.
 
 #### `Headers` — Response, discriminator 3
 

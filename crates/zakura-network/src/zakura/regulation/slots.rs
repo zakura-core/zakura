@@ -56,6 +56,11 @@ impl SlotBudget {
             .saturating_sub(self.permits.available_permits())
     }
 
+    /// Free slots now. Another owner can take them at any time.
+    pub(crate) fn available(&self) -> usize {
+        self.permits.available_permits()
+    }
+
     /// Create a non-owning handle to this same pool for registry bookkeeping.
     /// This does not change capacity or release any reserved slots.
     pub(super) fn downgrade(&self) -> WeakSlotBudget {
@@ -75,6 +80,12 @@ impl SlotBudget {
             .map(|permit| SlotPermit { _permit: permit })
     }
 
+    /// Take every free slot.
+    #[cfg(test)]
+    pub(crate) fn hold_free(&self) -> Vec<SlotPermit> {
+        std::iter::from_fn(|| self.try_reserve()).collect()
+    }
+
     /// Wait for a slot and return its ownership in semaphore queue order.
     ///
     /// Keep the returned permit while owning the resource. Cancelling this
@@ -87,6 +98,107 @@ impl SlotBudget {
             .await
             .expect("slot budget semaphore stays open because this type never closes it");
         SlotPermit { _permit: permit }
+    }
+}
+
+/// A byte budget for response output that is reserved but not yet written.
+///
+/// Serving takes a grant for a response's whole cap before it produces the
+/// response. The grant returns when the response's last frame finishes its
+/// transport write, so a peer that stops reading stops at this bound.
+#[derive(Clone, Debug)]
+pub(crate) struct OutputByteBudget {
+    capacity: u64,
+    bytes: Arc<Semaphore>,
+}
+
+impl OutputByteBudget {
+    /// A budget of `capacity` bytes.
+    pub(crate) fn new(capacity: u64) -> Result<Self, SlotBudgetCapacityError> {
+        let permits = usize::try_from(capacity)
+            .ok()
+            .filter(|permits| (1..=Semaphore::MAX_PERMITS).contains(permits))
+            .ok_or(SlotBudgetCapacityError {
+                requested: usize::try_from(capacity).unwrap_or(usize::MAX),
+                maximum: Semaphore::MAX_PERMITS,
+            })?;
+        Ok(Self {
+            capacity,
+            bytes: Arc::new(Semaphore::new(permits)),
+        })
+    }
+
+    /// Total bytes this budget can grant.
+    pub(crate) fn capacity(&self) -> u64 {
+        self.capacity
+    }
+
+    /// Bytes currently granted.
+    #[cfg(test)]
+    pub(crate) fn granted(&self) -> u64 {
+        // Widening usize to u64 is lossless on supported targets.
+        self.capacity
+            .saturating_sub(self.bytes.available_permits() as u64)
+    }
+
+    /// The largest grant [`Self::grant`] can complete: the whole budget, or
+    /// 4 GiB, whichever is smaller.
+    pub(crate) fn clamp(&self, bytes: u64) -> u32 {
+        u32::try_from(bytes.min(self.capacity)).unwrap_or(u32::MAX)
+    }
+
+    /// Wait for `bytes` in FIFO order. Cancelling the wait takes nothing.
+    ///
+    /// Pass a value from [`Self::clamp`]; a larger grant never completes.
+    pub(crate) async fn grant(&self, bytes: u32) -> OutputGrant {
+        let permit = self
+            .bytes
+            .clone()
+            .acquire_many_owned(bytes)
+            .await
+            .expect("output budget semaphore stays open because this type never closes it");
+        OutputGrant { _permit: permit }
+    }
+
+    /// Take every free byte, up to 4 GiB.
+    #[cfg(test)]
+    pub(crate) fn hold_free(&self) -> Option<OutputGrant> {
+        let free = u32::try_from(self.bytes.available_permits()).unwrap_or(u32::MAX);
+        self.bytes
+            .clone()
+            .try_acquire_many_owned(free)
+            .ok()
+            .map(|permit| OutputGrant { _permit: permit })
+    }
+
+    pub(super) fn downgrade(&self) -> WeakOutputByteBudget {
+        WeakOutputByteBudget {
+            capacity: self.capacity,
+            bytes: Arc::downgrade(&self.bytes),
+        }
+    }
+}
+
+/// Granted output bytes. Dropping the grant returns them.
+#[derive(Debug)]
+#[must_use = "dropping an output grant releases its bytes"]
+pub(crate) struct OutputGrant {
+    _permit: OwnedSemaphorePermit,
+}
+
+/// A registry handle to an output budget that does not keep it alive.
+#[derive(Debug)]
+pub(super) struct WeakOutputByteBudget {
+    capacity: u64,
+    bytes: Weak<Semaphore>,
+}
+
+impl WeakOutputByteBudget {
+    pub(super) fn upgrade(&self) -> Option<OutputByteBudget> {
+        Some(OutputByteBudget {
+            capacity: self.capacity,
+            bytes: self.bytes.upgrade()?,
+        })
     }
 }
 

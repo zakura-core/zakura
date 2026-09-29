@@ -71,8 +71,7 @@ use zakura_chain::{
         ConsensusBranchId, Network, NetworkUpgrade,
     },
     serialization::{
-        BytesInDisplayOrder, DateTime32, Duration32, ZcashDeserialize, ZcashDeserializeInto,
-        ZcashSerialize,
+        BytesInDisplayOrder, DateTime32, ZcashDeserialize, ZcashDeserializeInto, ZcashSerialize,
     },
     subtree::NoteCommitmentSubtreeIndex,
     transaction::{self, SerializedTransaction, Transaction, UnminedTx},
@@ -2959,7 +2958,7 @@ where
         // for that makes miners drop their current job (the internal miner backs off for
         // 20 seconds) even though fresh work is one read away, so rebuild from current
         // state instead. The bound guards against pathological tip or rejection churn.
-        let mut max_time_reached = false;
+        let mut time_refresh_reached = false;
         'rebuild: for rebuild in 0..=MAX_TEMPLATE_REBUILDS {
             if rebuild > 0 {
                 metrics::counter!("mining.template.rebuilt").increment(1);
@@ -3038,10 +3037,12 @@ where
                 // The loop finishes if:
                 // - the client didn't pass a long poll ID,
                 // - the server long poll ID is different to the client long poll ID, or
-                // - the previous loop iteration waited until the max time.
-                if Some(&server_long_poll_id) != client_long_poll_id.as_ref() || max_time_reached {
-                    // Refresh work when its time range expires.
-                    let submit_old = if max_time_reached {
+                // - the previous loop iteration reached the template refresh time.
+                if Some(&server_long_poll_id) != client_long_poll_id.as_ref()
+                    || time_refresh_reached
+                {
+                    // Refresh work when its scheduled refresh time is reached.
+                    let submit_old = if time_refresh_reached {
                         Some(false)
                     } else {
                         client_long_poll_id.as_ref().map(|old_long_poll_id| {
@@ -3119,31 +3120,31 @@ where
                     Ok::<_, ErrorObject<'static>>(precomputed_coinbase)
                 };
 
-                // Testnet's difficulty timeout is strict: the last standard
-                // timestamp is still valid, so refresh one second after it.
-                // Measure from the wall clock to keep a clamped cur_time from
-                // repeatedly scheduling a timer after the time limit expires.
-                let duration_until_max_time =
+                // State selects testnet's early minimum-difficulty refresh.
+                // Measure from the wall clock because cur_time can be advanced
+                // or clamped, and must not repeatedly restart this timer.
+                let duration_until_time_refresh =
                     if NetworkUpgrade::minimum_difficulty_spacing_for_height(
                         &self.network,
                         chain_info.tip_height.next().map_misc_error()?,
                     )
                     .is_some()
                     {
-                        max_time
-                            .saturating_add(Duration32::from_seconds(1))
+                        chain_info
+                            .time_refresh_at
                             .saturating_duration_since(DateTime32::now())
                     } else {
                         max_time.saturating_duration_since(cur_time)
                     };
 
                 // An elapsed limit waits for another change to avoid spinning.
-                let wait_for_max_time: OptionFuture<_> = if duration_until_max_time.seconds() > 0 {
-                    Some(tokio::time::sleep(duration_until_max_time.to_std()))
-                } else {
-                    None
-                }
-                .into();
+                let wait_for_time_refresh: OptionFuture<_> =
+                    if duration_until_time_refresh.seconds() > 0 {
+                        Some(tokio::time::sleep(duration_until_time_refresh.to_std()))
+                    } else {
+                        None
+                    }
+                    .into();
 
                 // Optional TODO:
                 // `zcashd` generates the next coinbase transaction while waiting for changes.
@@ -3215,19 +3216,19 @@ where
                         continue 'rebuild;
                     }
 
-                    // Testnet refreshes when the difficulty time range expires.
+                    // Testnet refreshes one target spacing before minimum difficulty.
                     // Mainnet only reaches this limit after a long stall.
-                    Some(_elapsed) = wait_for_max_time => {
+                    Some(_elapsed) = wait_for_time_refresh => {
                         // This log is very rare so it's ok to be info.
                         tracing::info!(
                             ?max_time,
                             ?cur_time,
                             ?server_long_poll_id,
                             ?client_long_poll_id,
-                            "returning from long poll because max time was reached"
+                            "returning from long poll because the template refresh time was reached"
                         );
 
-                        max_time_reached = true;
+                        time_refresh_reached = true;
                     }
                 }
             };

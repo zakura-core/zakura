@@ -290,6 +290,9 @@ pub struct BlockTemplateResponse {
     /// > note this is not necessarily the system clock, and must fall within the mintime/maxtime rules
     ///
     /// <https://en.bitcoin.it/wiki/BIP_0022#Block_Template_Request>
+    ///
+    /// Testnet may advance this timestamp to select minimum difficulty one
+    /// target spacing before its timeout.
     #[serde(rename = "curtime")]
     #[getter(copy)]
     pub(crate) cur_time: DateTime32,
@@ -309,7 +312,7 @@ pub struct BlockTemplateResponse {
     ///
     /// On testnet, this also restricts timestamp mutations to the range that
     /// matches the template's difficulty. Long polling refreshes the template
-    /// when the minimum difficulty timeout changes that range.
+    /// one target spacing before the minimum difficulty timeout.
     #[serde(rename = "maxtime")]
     #[getter(copy)]
     pub(crate) max_time: DateTime32,

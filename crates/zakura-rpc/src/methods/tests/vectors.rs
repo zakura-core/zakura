@@ -233,6 +233,7 @@ async fn rpc_getinfo() {
             cur_time: zakura_chain::serialization::DateTime32::now(),
             min_time: zakura_chain::serialization::DateTime32::now(),
             max_time: zakura_chain::serialization::DateTime32::now(),
+            time_refresh_at: zakura_chain::serialization::DateTime32::now(),
         },
     ));
 
@@ -3387,6 +3388,7 @@ async fn zip234_mining_rpcs_include_the_reissuance_bonus() {
                 cur_time: DateTime32::from(1_654_008_617),
                 min_time: DateTime32::from(1_654_008_606),
                 max_time: DateTime32::from(1_654_008_728),
+                time_refresh_at: DateTime32::from(1_654_008_728),
                 chain_history_root: fake_history_tree(&Mainnet).hash(),
             };
             let respond_chain_info = {
@@ -3487,6 +3489,7 @@ async fn check_template_rejection_recovery(reject_before_poll: bool) {
         cur_time: 1654008617.into(),
         min_time: 1654008606.into(),
         max_time: 1654008728.into(),
+        time_refresh_at: 1654008728.into(),
         chain_history_root: fake_history_tree(&Mainnet).hash(),
     };
     let read_state = tower::service_fn(move |request| {
@@ -3704,6 +3707,7 @@ async fn gbt_with(net: Network, addr: ZcashAddress) {
                     cur_time: fake_cur_time,
                     min_time: fake_min_time,
                     max_time: fake_max_time,
+                    time_refresh_at: fake_max_time,
                     chain_history_root: fake_history_tree(&Mainnet).hash(),
                 }));
         }
@@ -4465,6 +4469,7 @@ async fn rpc_getdifficulty() {
                 cur_time: fake_cur_time,
                 min_time: fake_min_time,
                 max_time: fake_max_time,
+                time_refresh_at: fake_max_time,
                 chain_history_root: fake_history_tree(&Mainnet).hash(),
             }));
     };
@@ -4492,6 +4497,7 @@ async fn rpc_getdifficulty() {
                 cur_time: fake_cur_time,
                 min_time: fake_min_time,
                 max_time: fake_max_time,
+                time_refresh_at: fake_max_time,
                 chain_history_root: fake_history_tree(&Mainnet).hash(),
             }));
     };
@@ -4516,6 +4522,7 @@ async fn rpc_getdifficulty() {
                 cur_time: fake_cur_time,
                 min_time: fake_min_time,
                 max_time: fake_max_time,
+                time_refresh_at: fake_max_time,
                 chain_history_root: fake_history_tree(&Mainnet).hash(),
             }));
     };
@@ -4540,6 +4547,7 @@ async fn rpc_getdifficulty() {
                 cur_time: fake_cur_time,
                 min_time: fake_min_time,
                 max_time: fake_max_time,
+                time_refresh_at: fake_max_time,
                 chain_history_root: fake_history_tree(&Mainnet).hash(),
             }));
     };

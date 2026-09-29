@@ -12,6 +12,7 @@ use zakura_chain::{
     chain_sync_status::MockSyncStatus,
     chain_tip::mock::MockChainTip,
     parameters::testnet::{ConfiguredActivationHeights, RegtestParameters},
+    serialization::Duration32,
 };
 use zakura_network::address_book_peers::MockAddressBookPeers;
 use zakura_node_services::BoxError;
@@ -239,6 +240,7 @@ fn chain_info(height: u32, hash: u8, balance: i64) -> GetBlockTemplateChainInfo 
         cur_time: 1654008617.into(),
         min_time: 1654008606.into(),
         max_time: 1654008728.into(),
+        time_refresh_at: 1654008728.into(),
         chain_history_root: fake_history_tree(&Network::Mainnet).hash(),
     }
 }
@@ -763,7 +765,7 @@ fn long_poll_builds_on_new_parent_without_blocking_runtime() {
 }
 
 #[test]
-fn long_poll_refreshes_testnet_difficulty_after_time_limit() {
+fn long_poll_refreshes_testnet_difficulty_one_spacing_early() {
     use std::sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
@@ -809,6 +811,7 @@ fn long_poll_refreshes_testnet_difficulty_after_time_limit() {
         // one-second refresh loop after that ceiling has expired.
         let mut expired = chain_info(300_000, 1, 0);
         expired.cur_time = expired.max_time;
+        expired.time_refresh_at = expired.max_time.saturating_add(Duration32::from_seconds(1));
         expired.expected_difficulty = network().target_difficulty_limit().to_compact();
         info_tx.send_replace(expired.clone());
         {
@@ -824,12 +827,12 @@ fn long_poll_refreshes_testnet_difficulty_after_time_limit() {
             assert_eq!(read_count.load(Ordering::SeqCst), reads);
         }
 
-        // Start within one mempool polling interval of the difficulty timeout,
-        // so a fresh state read proves the time-limit timer woke this request.
+        // Start within one mempool polling interval of the early switch, so a
+        // fresh state read proves the refresh timer woke this request.
         let clock = DateTime32::now();
         let mut standard = chain_info(300_000, 1, 0);
         standard.cur_time = clock;
-        standard.max_time = clock.checked_add(Duration32::from_seconds(3)).unwrap();
+        standard.time_refresh_at = clock.checked_add(Duration32::from_seconds(3)).unwrap();
         let gap: Duration32 = NetworkUpgrade::minimum_difficulty_spacing_for_height(
             &network(),
             standard.tip_height.next().unwrap(),
@@ -843,6 +846,12 @@ fn long_poll_refreshes_testnet_difficulty_after_time_limit() {
         )
         .try_into()
         .unwrap();
+        standard.max_time = standard
+            .time_refresh_at
+            .checked_add(spacing)
+            .unwrap()
+            .checked_sub(Duration32::from_seconds(1))
+            .unwrap();
         let parent_time = standard.max_time.checked_sub(gap).unwrap();
         let median_time = parent_time
             .checked_sub(Duration32::from_seconds(5 * spacing.seconds()))
@@ -873,9 +882,10 @@ fn long_poll_refreshes_testnet_difficulty_after_time_limit() {
         minimum.max_time = median_time
             .checked_add(Duration32::from_minutes(90))
             .unwrap();
+        minimum.time_refresh_at = minimum.max_time.saturating_add(Duration32::from_seconds(1));
         minimum.expected_difficulty = network().target_difficulty_limit().to_compact();
         info_tx.send_replace(minimum.clone());
-        tokio::time::advance(Duration::from_secs(3) + Duration::from_millis(1)).await;
+        tokio::time::advance(Duration::from_secs(2) + Duration::from_millis(1)).await;
         assert!(futures::poll!(&mut request).is_pending());
         assert!(
             read_count.load(Ordering::SeqCst) > reads_before_expiry,

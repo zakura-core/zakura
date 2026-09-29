@@ -95,6 +95,7 @@ fn nsm_fee_templates_pay_miner_and_credit_balance_once() {
                 cur_time: DateTime32::from(1_654_008_617),
                 min_time: DateTime32::from(1_654_008_606),
                 max_time: DateTime32::from(1_654_008_728),
+                time_refresh_at: DateTime32::from(1_654_008_728),
                 chain_history_root: Some(
                     zakura_chain::block::CHAIN_HISTORY_ACTIVATION_RESERVED.into(),
                 ),

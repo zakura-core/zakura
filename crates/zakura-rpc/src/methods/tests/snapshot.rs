@@ -1189,6 +1189,7 @@ pub async fn test_mining_rpcs<State, ReadState>(
                     cur_time: fake_cur_time,
                     min_time: fake_min_time,
                     max_time: fake_max_time,
+                    time_refresh_at: fake_max_time,
                     chain_history_root: fake_history_tree(network).hash(),
                 }));
         }

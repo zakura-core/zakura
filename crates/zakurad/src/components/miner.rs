@@ -1013,6 +1013,7 @@ mod tests {
                     cur_time: 2_000_000_000.into(),
                     min_time: 1_999_999_999.into(),
                     max_time: 2_000_005_000.into(),
+                    time_refresh_at: 2_000_005_000.into(),
                     chain_history_root: Some([0; 32].into()),
                 },
             ))

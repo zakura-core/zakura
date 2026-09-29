@@ -427,7 +427,8 @@ proptest! {
                             expected_difficulty: Default::default(),
                             cur_time: DateTime32::now(),
                             min_time: DateTime32::now(),
-                            max_time: DateTime32::now()
+                            max_time: DateTime32::now(),
+                            time_refresh_at: DateTime32::now(),
                         }));
                 }
             };
@@ -548,7 +549,8 @@ proptest! {
                             expected_difficulty: Default::default(),
                             cur_time: DateTime32::now(),
                             min_time: DateTime32::now(),
-                            max_time: DateTime32::now()
+                            max_time: DateTime32::now(),
+                            time_refresh_at: DateTime32::now(),
                         }));
                 }
             };

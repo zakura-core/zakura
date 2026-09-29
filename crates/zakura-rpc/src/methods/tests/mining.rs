@@ -2,6 +2,7 @@
 
 use std::{
     future::Future,
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
     task::{Context, Poll},
 };
 
@@ -12,6 +13,7 @@ use zakura_chain::{
     chain_sync_status::MockSyncStatus,
     chain_tip::mock::MockChainTip,
     parameters::testnet::{ConfiguredActivationHeights, RegtestParameters},
+    serialization::{DateTime32, Duration32},
 };
 use zakura_network::address_book_peers::MockAddressBookPeers;
 use zakura_node_services::BoxError;
@@ -278,6 +280,55 @@ fn mining_rpc(
     });
     let (rpc, verifier) = rpc(network(), mempool, read, tip);
     (rpc, sender, verifier)
+}
+
+/// Returns a mining RPC whose state reads come from `info`, with its tip sender, a count of
+/// chain info reads, and a flag that makes the next mempool fetch last one mempool poll interval.
+fn counting_mining_rpc(
+    info: watch::Receiver<GetBlockTemplateChainInfo>,
+) -> (
+    TestRpc<impl MempoolService, impl ReadStateService>,
+    zakura_chain::chain_tip::mock::MockChainTipSender,
+    Arc<AtomicUsize>,
+    Arc<AtomicBool>,
+) {
+    let (tip, sender) = MockChainTip::new();
+    sender.send_best_tip_height(info.borrow().tip_height);
+    sender.send_best_tip_hash(info.borrow().tip_hash);
+    let read_count = Arc::new(AtomicUsize::new(0));
+    let reads = read_count.clone();
+    let read_info = info.clone();
+    let read = tower::service_fn(move |request| {
+        let info = read_info.borrow().clone();
+        if matches!(request, ReadRequest::ChainInfo) {
+            reads.fetch_add(1, Ordering::SeqCst);
+        }
+        async move {
+            Ok::<_, BoxError>(match request {
+                ReadRequest::ChainInfo => ReadResponse::ChainInfo(info),
+                ReadRequest::Tip => ReadResponse::Tip(Some((info.tip_height, info.tip_hash))),
+                other => unreachable!("unexpected read request: {other:?}"),
+            })
+        }
+    });
+    let slow_mempool = Arc::new(AtomicBool::new(false));
+    let slow = slow_mempool.clone();
+    let mempool = tower::service_fn(move |_| {
+        let hash = info.borrow().tip_hash;
+        let slow = slow.swap(false, Ordering::SeqCst);
+        async move {
+            if slow {
+                tokio::time::sleep(Duration::from_secs(MEMPOOL_LONG_POLL_INTERVAL)).await;
+            }
+            Ok::<_, BoxError>(mempool::Response::FullTransactions {
+                transactions: vec![],
+                transaction_dependencies: Default::default(),
+                last_seen_tip_hash: hash,
+            })
+        }
+    });
+    let (rpc, _) = rpc(network(), mempool, read, tip);
+    (rpc, sender, read_count, slow_mempool)
 }
 
 async fn bounded<T>(future: impl Future<Output = T>) -> T {
@@ -759,6 +810,166 @@ fn long_poll_builds_on_new_parent_without_blocking_runtime() {
             assert_eq!(template.height, new_height + 1);
             assert_reward(&template, 400_000_000);
         }
+    });
+}
+
+/// Testnet long polling fetches fresh state when minimum difficulty becomes valid, before the
+/// next mempool poll, and an already expired time range doesn't cause a refresh loop.
+#[test]
+fn long_poll_refreshes_testnet_difficulty_after_time_limit() {
+    mining_runtime(async {
+        let (info_tx, info) = watch::channel(chain_info(300_000, 1, 0));
+        let (rpc, _tip, read_count, _) = counting_mining_rpc(info);
+        bounded(rpc.get_block_template(None)).await.unwrap();
+        let gate = BlockingPoolGate::new().await;
+        tokio::time::pause();
+
+        // A timestamp clamped at a past consensus ceiling must not cause a
+        // one-second refresh loop after that ceiling has expired.
+        let mut expired = chain_info(300_000, 1, 0);
+        expired.cur_time = expired.max_time;
+        expired.expected_difficulty = network().target_difficulty_limit().to_compact();
+        info_tx.send_replace(expired.clone());
+        {
+            let request = rpc.get_block_template(Some(GetBlockTemplateParameters {
+                long_poll_id: Some(template_id(&expired)),
+                ..Default::default()
+            }));
+            tokio::pin!(request);
+            assert!(futures::poll!(&mut request).is_pending());
+            let reads = read_count.load(Ordering::SeqCst);
+            tokio::time::advance(Duration::from_secs(2)).await;
+            assert!(futures::poll!(&mut request).is_pending());
+            assert_eq!(read_count.load(Ordering::SeqCst), reads);
+        }
+
+        // Start within one mempool polling interval of the difficulty timeout,
+        // so a fresh state read proves the time-limit timer woke this request.
+        let clock = DateTime32::now();
+        let mut standard = chain_info(300_000, 1, 0);
+        standard.cur_time = clock;
+        standard.max_time = clock.checked_add(Duration32::from_seconds(3)).unwrap();
+        let gap: Duration32 = NetworkUpgrade::minimum_difficulty_spacing_for_height(
+            &network(),
+            standard.tip_height.next().unwrap(),
+        )
+        .unwrap()
+        .try_into()
+        .unwrap();
+        let spacing: Duration32 = NetworkUpgrade::target_spacing_for_height(
+            &network(),
+            standard.tip_height.next().unwrap(),
+        )
+        .try_into()
+        .unwrap();
+        let parent_time = standard.max_time.checked_sub(gap).unwrap();
+        let median_time = parent_time
+            .checked_sub(Duration32::from_seconds(5 * spacing.seconds()))
+            .unwrap();
+        standard.min_time = median_time
+            .checked_add(Duration32::from_seconds(1))
+            .unwrap();
+        standard.expected_difficulty = (network().target_difficulty_limit() / 4_u32).to_compact();
+        let old_id = template_id(&standard);
+        info_tx.send_replace(standard.clone());
+        let request = rpc.get_block_template(Some(GetBlockTemplateParameters {
+            long_poll_id: Some(old_id),
+            ..Default::default()
+        }));
+        tokio::pin!(request);
+        assert!(futures::poll!(&mut request).is_pending());
+        let reads_before_expiry = read_count.load(Ordering::SeqCst);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(futures::poll!(&mut request).is_pending());
+        assert_eq!(read_count.load(Ordering::SeqCst), reads_before_expiry);
+
+        let mut minimum = standard.clone();
+        minimum.cur_time = standard
+            .max_time
+            .checked_add(Duration32::from_seconds(1))
+            .unwrap();
+        minimum.min_time = minimum.cur_time;
+        minimum.max_time = median_time
+            .checked_add(Duration32::from_minutes(90))
+            .unwrap();
+        minimum.expected_difficulty = network().target_difficulty_limit().to_compact();
+        info_tx.send_replace(minimum.clone());
+        tokio::time::advance(Duration::from_secs(3) + Duration::from_millis(1)).await;
+        assert!(futures::poll!(&mut request).is_pending());
+        assert!(
+            read_count.load(Ordering::SeqCst) > reads_before_expiry,
+            "the time-limit timer must fetch fresh state before the mempool timer"
+        );
+        tokio::time::resume();
+        gate.release().await;
+        let template = bounded(request).await.unwrap().try_into_template().unwrap();
+        assert_eq!(template.previous_block_hash, standard.tip_hash);
+        assert_eq!(template.cur_time, minimum.cur_time);
+        assert!(template.cur_time > standard.max_time);
+        assert_ne!(template.bits, standard.expected_difficulty);
+        assert_eq!(template.bits, minimum.expected_difficulty);
+        assert_ne!(template.long_poll_id, old_id);
+        assert_eq!(template.submit_old, Some(false));
+    });
+}
+
+/// A testnet refresh deadline that passes during a slow mempool fetch refreshes the template as
+/// soon as the fetch returns, instead of waiting for the next mempool poll.
+#[test]
+fn long_poll_refresh_deadline_survives_slow_mempool_fetch() {
+    mining_runtime(async {
+        let (info_tx, info) = watch::channel(chain_info(300_000, 1, 0));
+        let (rpc, _tip, read_count, slow_mempool) = counting_mining_rpc(info);
+        bounded(rpc.get_block_template(None)).await.unwrap();
+        let gate = BlockingPoolGate::new().await;
+        tokio::time::pause();
+
+        // Minimum difficulty becomes valid a few seconds from now, before the slow
+        // mempool fetch below finishes.
+        let clock = DateTime32::now();
+        let mut standard = chain_info(300_000, 1, 0);
+        standard.cur_time = clock;
+        standard.max_time = clock.checked_add(Duration32::from_seconds(3)).unwrap();
+        let old_id = template_id(&standard);
+        info_tx.send_replace(standard.clone());
+        let mut minimum = standard.clone();
+        minimum.cur_time = standard
+            .max_time
+            .checked_add(Duration32::from_seconds(1))
+            .unwrap();
+        minimum.min_time = minimum.cur_time;
+        minimum.max_time = minimum
+            .cur_time
+            .checked_add(Duration32::from_minutes(90))
+            .unwrap();
+        minimum.expected_difficulty = network().target_difficulty_limit().to_compact();
+
+        slow_mempool.store(true, Ordering::SeqCst);
+        let request = rpc.get_block_template(Some(GetBlockTemplateParameters {
+            long_poll_id: Some(old_id),
+            ..Default::default()
+        }));
+        tokio::pin!(request);
+        assert!(futures::poll!(&mut request).is_pending());
+        let reads_before_expiry = read_count.load(Ordering::SeqCst);
+        info_tx.send_replace(minimum.clone());
+        tokio::time::advance(
+            Duration::from_secs(MEMPOOL_LONG_POLL_INTERVAL) + Duration::from_millis(1),
+        )
+        .await;
+        assert!(futures::poll!(&mut request).is_pending());
+        assert!(
+            read_count.load(Ordering::SeqCst) > reads_before_expiry,
+            "a deadline that passed during the mempool fetch must refresh right away"
+        );
+
+        tokio::time::resume();
+        gate.release().await;
+        let template = bounded(request).await.unwrap().try_into_template().unwrap();
+        assert_eq!(template.cur_time, minimum.cur_time);
+        assert_eq!(template.bits, minimum.expected_difficulty);
+        assert_ne!(template.long_poll_id, old_id);
+        assert_eq!(template.submit_old, Some(false));
     });
 }
 

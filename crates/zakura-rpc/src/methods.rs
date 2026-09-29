@@ -70,7 +70,9 @@ use zakura_chain::{
         },
         ConsensusBranchId, Network, NetworkUpgrade,
     },
-    serialization::{BytesInDisplayOrder, ZcashDeserialize, ZcashDeserializeInto, ZcashSerialize},
+    serialization::{
+        BytesInDisplayOrder, Duration32, ZcashDeserialize, ZcashDeserializeInto, ZcashSerialize,
+    },
     subtree::NoteCommitmentSubtreeIndex,
     transaction::{self, SerializedTransaction, Transaction, UnminedTx},
     transparent::{self, Address, OutputIndex},
@@ -2992,6 +2994,8 @@ where
                 //
                 // We always return after 90 minutes on mainnet, even if we have the same response,
                 // because the max time has been reached.
+                let fetch_wall_time = Utc::now();
+                let fetch_instant = tokio::time::Instant::now();
                 let chain_info @ zakura_state::GetBlockTemplateChainInfo {
                     tip_hash,
                     tip_height,
@@ -3040,9 +3044,10 @@ where
                 // - the server long poll ID is different to the client long poll ID, or
                 // - the previous loop iteration waited until the max time.
                 if Some(&server_long_poll_id) != client_long_poll_id.as_ref() || max_time_reached {
-                    // On testnet, the max time changes the block difficulty, so old shares are invalid.
-                    // On mainnet, this means there has been 90 minutes without a new block or mempool
-                    // transaction, which is very unlikely. So the miner should probably reset anyway.
+                    // The template's time range has expired. On testnet, this usually means
+                    // minimum difficulty work is now available. On mainnet, this means there has
+                    // been 90 minutes without a new block or mempool transaction, which is very
+                    // unlikely. So the miner should probably reset anyway.
                     let submit_old = if max_time_reached {
                         Some(false)
                     } else {
@@ -3121,24 +3126,35 @@ where
                     Ok::<_, ErrorObject<'static>>(precomputed_coinbase)
                 };
 
-                // Wait for the maximum block time to elapse. This can change the block header
-                // on testnet. (On mainnet it can happen due to a network disconnection, or a
-                // rapid drop in hash rate.)
+                // Wait for the template's time range to expire. On testnet, minimum difficulty
+                // becomes valid one second after `max_time`, because the last standard difficulty
+                // second is still valid. Testnet measures that deadline from the wall clock at the
+                // state fetch, so a clamped `cur_time` can't restart it and a slow fetch can't
+                // skip it. (On mainnet the time range only expires after a network disconnection,
+                // or a rapid drop in hash rate.)
                 //
-                // This duration might be slightly lower than the actual maximum,
-                // if cur_time was clamped to min_time. In that case the wait is very long,
-                // and it's ok to return early.
-                //
-                // It can also be zero if cur_time was clamped to max_time. In that case,
-                // we want to wait for another change, and ignore this timeout. So we use an
-                // `OptionFuture::None`.
-                let duration_until_max_time = max_time.saturating_duration_since(cur_time);
-                let wait_for_max_time: OptionFuture<_> = if duration_until_max_time.seconds() > 0 {
-                    Some(tokio::time::sleep(duration_until_max_time.to_std()))
+                // A deadline that passed before the fetch, or a zero mainnet wait because
+                // `cur_time` was clamped to `max_time`, disables the timer. The request then
+                // waits for another change instead of spinning.
+                let wait_until_max_time = if NetworkUpgrade::minimum_difficulty_spacing_for_height(
+                    &self.network,
+                    tip_height.next().map_misc_error()?,
+                )
+                .is_some()
+                {
+                    (max_time
+                        .saturating_add(Duration32::from_seconds(1))
+                        .to_chrono()
+                        - fetch_wall_time)
+                        .to_std()
+                        .ok()
                 } else {
-                    None
-                }
-                .into();
+                    Some(max_time.saturating_duration_since(cur_time).to_std())
+                };
+                let wait_for_max_time: OptionFuture<_> = wait_until_max_time
+                    .filter(|wait| !wait.is_zero())
+                    .map(|wait| tokio::time::sleep_until(fetch_instant + wait))
+                    .into();
 
                 // Optional TODO:
                 // `zcashd` generates the next coinbase transaction while waiting for changes.
@@ -3210,8 +3226,8 @@ where
                         continue 'rebuild;
                     }
 
-                    // The max time does not elapse during normal operation on mainnet,
-                    // and it rarely elapses on testnet.
+                    // Testnet reaches this when minimum difficulty becomes valid.
+                    // Mainnet only reaches it after a long stall.
                     Some(_elapsed) = wait_for_max_time => {
                         // This log is very rare so it's ok to be info.
                         tracing::info!(

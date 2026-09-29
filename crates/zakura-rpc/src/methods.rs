@@ -3136,24 +3136,27 @@ where
                 // A deadline that passed before the fetch, or a zero mainnet wait because
                 // `cur_time` was clamped to `max_time`, disables the timer. The request then
                 // waits for another change instead of spinning.
-                let wait_until_max_time = if NetworkUpgrade::minimum_difficulty_spacing_for_height(
-                    &self.network,
-                    tip_height.next().map_misc_error()?,
-                )
-                .is_some()
-                {
-                    (max_time
-                        .saturating_add(Duration32::from_seconds(1))
-                        .to_chrono()
-                        - fetch_wall_time)
-                        .to_std()
-                        .ok()
-                } else {
-                    Some(max_time.saturating_duration_since(cur_time).to_std())
-                };
-                let wait_for_max_time: OptionFuture<_> = wait_until_max_time
-                    .filter(|wait| !wait.is_zero())
-                    .map(|wait| tokio::time::sleep_until(fetch_instant + wait))
+                let wait_for_max_time: OptionFuture<_> =
+                    if NetworkUpgrade::minimum_difficulty_spacing_for_height(
+                        &self.network,
+                        tip_height.next().map_misc_error()?,
+                    )
+                    .is_some()
+                    {
+                        let wait = (max_time
+                            .saturating_add(Duration32::from_seconds(1))
+                            .to_chrono()
+                            - fetch_wall_time)
+                            .to_std()
+                            .ok();
+                        wait.filter(|wait| !wait.is_zero())
+                            .map(|wait| tokio::time::sleep_until(fetch_instant + wait))
+                    } else {
+                        // Preserve Mainnet's relative wait after the fetches. Its clock sample
+                        // can be later than `fetch_instant` if the state read was slow.
+                        let wait = max_time.saturating_duration_since(cur_time).to_std();
+                        (!wait.is_zero()).then(|| tokio::time::sleep(wait))
+                    }
                     .into();
 
                 // Optional TODO:

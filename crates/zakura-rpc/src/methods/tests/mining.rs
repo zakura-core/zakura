@@ -20,7 +20,6 @@ use zakura_node_services::BoxError;
 use zakura_state::GetBlockTemplateChainInfo;
 use zakura_test::mock_service::{MockService, PanicAssertion};
 use zcash_address::{ToAddress, ZcashAddress};
-use zcash_protocol::consensus::NetworkType;
 
 use super::super::*;
 use super::utils::fake_history_tree;
@@ -59,14 +58,14 @@ fn rpc<M: MempoolService, R: ReadStateService>(
     let verifier: Verifier = MockService::build()
         .with_max_request_delay(Duration::from_secs(10))
         .for_unit_tests();
+    let miner_address = ZcashAddress::from_transparent_p2pkh(network.network_type(), [0x7e; 20]);
+    let mut sync_status = MockSyncStatus::default();
+    sync_status.set_is_close_to_tip(true);
     let (_, rx) = watch::channel(None);
     let (rpc, queue) = RpcImpl::new(
         network,
         config::mining::Config {
-            miner_address: Some(ZcashAddress::from_transparent_p2pkh(
-                NetworkType::Regtest,
-                [0x7e; 20],
-            )),
+            miner_address: Some(miner_address),
             internal_miner: true,
             optimistic_block_inventory: true,
             ..Default::default()
@@ -78,7 +77,7 @@ fn rpc<M: MempoolService, R: ReadStateService>(
         MockService::build().for_unit_tests(),
         read,
         verifier.clone(),
-        MockSyncStatus::default(),
+        sync_status,
         tip,
         MockAddressBookPeers::default(),
         rx,
@@ -969,6 +968,90 @@ fn long_poll_refresh_deadline_survives_slow_mempool_fetch() {
         assert_eq!(template.cur_time, minimum.cur_time);
         assert_eq!(template.bits, minimum.expected_difficulty);
         assert_ne!(template.long_poll_id, old_id);
+        assert_eq!(template.submit_old, Some(false));
+    });
+}
+
+/// Mainnet starts its relative timeout after fetching the clock sample from state.
+#[test]
+fn long_poll_mainnet_deadline_survives_slow_state_fetch() {
+    mining_runtime(async {
+        let clock = DateTime32::now();
+        let mut original = chain_info(3_000_000, 1, 0);
+        original.cur_time = clock;
+        original.max_time = clock.checked_add(Duration32::from_seconds(10)).unwrap();
+        original.min_time = original
+            .max_time
+            .checked_sub(Duration32::from_seconds(90 * 60 - 1))
+            .unwrap();
+        let (info_tx, info) = watch::channel(original.clone());
+        let (tip, sender) = MockChainTip::new();
+        sender.send_best_tip_height(original.tip_height);
+        sender.send_best_tip_hash(original.tip_hash);
+        sender.send_estimated_distance_to_network_chain_tip(0);
+        let read_count = Arc::new(AtomicUsize::new(0));
+        let reads = read_count.clone();
+        let slow_read = Arc::new(AtomicBool::new(false));
+        let slow = slow_read.clone();
+        let read = tower::service_fn(move |request| {
+            assert!(matches!(request, ReadRequest::ChainInfo));
+            reads.fetch_add(1, Ordering::SeqCst);
+            let slow = slow.swap(false, Ordering::SeqCst);
+            let info = info.clone();
+            async move {
+                if slow {
+                    tokio::time::sleep(Duration::from_secs(6)).await;
+                }
+                // State samples the clock after its potentially slow database reads.
+                Ok::<_, BoxError>(ReadResponse::ChainInfo(info.borrow().clone()))
+            }
+        });
+        let mempool = tower::service_fn(move |_| async move {
+            Ok::<_, BoxError>(mempool::Response::FullTransactions {
+                transactions: vec![],
+                transaction_dependencies: Default::default(),
+                last_seen_tip_hash: original.tip_hash,
+            })
+        });
+        let (rpc, _) = rpc(Network::Mainnet, mempool, read, tip);
+        let initial = bounded(rpc.get_block_template(None))
+            .await
+            .unwrap()
+            .try_into_template()
+            .unwrap();
+        let gate = BlockingPoolGate::new().await;
+        tokio::time::pause();
+        slow_read.store(true, Ordering::SeqCst);
+
+        let request = rpc.get_block_template(Some(GetBlockTemplateParameters {
+            long_poll_id: Some(initial.long_poll_id),
+            ..Default::default()
+        }));
+        tokio::pin!(request);
+        assert!(futures::poll!(&mut request).is_pending());
+        let reads_before_deadline = read_count.load(Ordering::SeqCst);
+        tokio::time::advance(Duration::from_secs(6) + Duration::from_millis(1)).await;
+        let mut sampled = info_tx.borrow().clone();
+        sampled.cur_time = clock.checked_add(Duration32::from_seconds(6)).unwrap();
+        info_tx.send_replace(sampled.clone());
+        assert!(futures::poll!(&mut request).is_pending());
+
+        // Four seconds remain after the fetch. Starting that wait before the fetch
+        // would already have expired it and forced a premature replacement.
+        tokio::time::advance(Duration::from_secs(3)).await;
+        assert!(futures::poll!(&mut request).is_pending());
+        assert_eq!(read_count.load(Ordering::SeqCst), reads_before_deadline);
+
+        sampled.cur_time = sampled.max_time;
+        info_tx.send_replace(sampled);
+        tokio::time::advance(Duration::from_secs(1) + Duration::from_millis(1)).await;
+        assert!(futures::poll!(&mut request).is_pending());
+        assert!(read_count.load(Ordering::SeqCst) > reads_before_deadline);
+        tokio::time::resume();
+        gate.release().await;
+        let template = bounded(request).await.unwrap().try_into_template().unwrap();
+        assert_eq!(template.long_poll_id, initial.long_poll_id);
+        assert_eq!(template.cur_time, initial.max_time);
         assert_eq!(template.submit_old, Some(false));
     });
 }

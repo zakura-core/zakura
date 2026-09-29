@@ -854,6 +854,7 @@ where
 mod tests {
     use super::*;
     use futures::StreamExt as _;
+    use indexmap::IndexSet;
     use std::{collections::HashSet, future, time::Duration};
     use tower::{service_fn, util::BoxCloneService};
     use zakura_chain::{block::Block, parameters::Network, serialization::ZcashDeserializeInto};
@@ -1147,7 +1148,7 @@ mod tests {
         assert_eq!(
             first_request,
             zn::Request::BlocksByHashFrom {
-                hashes: HashSet::from([hash_one]),
+                hashes: IndexSet::from([hash_one]),
                 source: zn::PeerSource::Zakura(peer_id.clone()),
             }
         );
@@ -1177,7 +1178,7 @@ mod tests {
         assert_eq!(
             second_request,
             zn::Request::BlocksByHashFrom {
-                hashes: HashSet::from([hash_two]),
+                hashes: IndexSet::from([hash_two]),
                 source: zn::PeerSource::Zakura(peer_id),
             }
         );
@@ -1254,7 +1255,7 @@ mod tests {
         assert_eq!(
             request,
             zn::Request::BlocksByHashFrom {
-                hashes: HashSet::from([hash]),
+                hashes: IndexSet::from([hash]),
                 source: zn::PeerSource::Zakura(peer_id),
             }
         );

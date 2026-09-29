@@ -406,14 +406,18 @@ async fn inbound_pruned_block_is_not_advertised_and_getdata_logs_error(
     );
 
     let unknown_hash = block::Hash([0x11; 32]);
+    let second_unknown_hash = block::Hash([0x22; 32]);
     let unknown_response = inbound_service
         .clone()
-        .oneshot(Request::BlocksByHash(iter::once(unknown_hash).collect()))
+        .oneshot(Request::BlocksByHash(IndexSet::from([
+            unknown_hash,
+            second_unknown_hash,
+        ])))
         .await?;
     assert_eq!(
         unknown_response,
-        Response::Blocks(vec![Missing(unknown_hash)]),
-        "an unknown hash maps to missing inventory"
+        Response::Blocks(vec![Missing(unknown_hash), Missing(second_unknown_hash)]),
+        "unknown hashes map to missing inventory in request order"
     );
     assert!(
         !captured_logs.contains(super::super::ZCASHD_COMPAT_PRUNED_BLOCK_ERROR),

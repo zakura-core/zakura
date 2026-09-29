@@ -43,7 +43,7 @@ use crate::{
 use crate::request::Spend;
 
 use self::{counted_set::CountedSet, index::TransparentTransfers};
-use super::CreatedUtxos;
+use super::{AddressTransfers, CreatedUtxos};
 
 mod counted_set;
 pub mod index;
@@ -92,7 +92,9 @@ pub struct ChainInner {
     // Blocks, heights, hashes, and transaction locations
     //
     /// The contextually valid blocks which form this non-finalized partial chain, in height order.
-    pub(crate) blocks: BTreeMap<block::Height, ContextuallyVerifiedBlock>,
+    ///
+    /// Blocks are immutable once pushed, so chain snapshots share each block record.
+    pub(crate) blocks: BTreeMap<block::Height, Arc<ContextuallyVerifiedBlock>>,
 
     /// An index of block heights for each block hash in `blocks`.
     pub height_by_hash: HashMap<block::Hash, block::Height>,
@@ -241,10 +243,9 @@ pub struct ChainInner {
     //
     /// Partial transparent address index data from `blocks`.
     ///
-    /// Share each address's history across chain snapshots. Updating a block
-    /// clones only the histories for addresses touched by that block.
-    pub(super) partial_transparent_transfers:
-        HashMap<transparent::Address, Arc<TransparentTransfers>>,
+    /// Share index partitions and each address's history across chain snapshots.
+    /// Updating a block copies only the partitions and histories it touches.
+    pub(super) partial_transparent_transfers: AddressTransfers,
 
     // Chain Work
     //
@@ -374,7 +375,7 @@ impl Chain {
         self.update_chain_tip_with(&block)?;
 
         tracing::debug!(block = %block.block, "adding block to chain");
-        self.blocks.insert(block.height, block);
+        self.blocks.insert(block.height, Arc::new(block));
 
         Ok(self)
     }
@@ -382,7 +383,7 @@ impl Chain {
     /// Pops the lowest height block of the non-finalized portion of a chain,
     /// and returns it with its associated treestate.
     #[instrument(level = "debug", skip(self))]
-    pub(crate) fn pop_root(&mut self) -> (ContextuallyVerifiedBlock, Treestate) {
+    pub(crate) fn pop_root(&mut self) -> (Arc<ContextuallyVerifiedBlock>, Treestate) {
         // Obtain the lowest height.
         let block_height = self.non_finalized_root_height();
 
@@ -410,7 +411,7 @@ impl Chain {
             .expect("only called while blocks is populated");
 
         // Update cumulative data members.
-        self.revert_chain_with(&block, RevertPosition::Root);
+        self.revert_chain_with(block.as_ref(), RevertPosition::Root);
 
         (block, treestate)
     }
@@ -419,7 +420,7 @@ impl Chain {
     pub fn child_blocks(&self, block_height: &block::Height) -> Vec<ContextuallyVerifiedBlock> {
         self.blocks
             .range(block_height..)
-            .map(|(_h, b)| b.clone())
+            .map(|(_h, b)| b.as_ref().clone())
             .collect()
     }
 
@@ -474,7 +475,7 @@ impl Chain {
         let height =
             hash_or_height.height_or_else(|hash| self.height_by_hash.get(&hash).cloned())?;
 
-        self.blocks.get(&height)
+        self.blocks.get(&height).map(Arc::as_ref)
     }
 
     /// Returns the [`Transaction`] with [`transaction::Hash`], if it exists in this chain.
@@ -1487,7 +1488,7 @@ impl Chain {
             "Non-finalized chains must have at least one block to be valid"
         );
 
-        self.revert_chain_with(&block, RevertPosition::Tip);
+        self.revert_chain_with(block.as_ref(), RevertPosition::Tip);
     }
 
     /// Return the non-finalized tip height for this chain.
@@ -1510,7 +1511,7 @@ impl Chain {
     /// Return the non-finalized tip block for this chain,
     /// or `None` if `self.blocks` is empty.
     pub fn tip_block(&self) -> Option<&ContextuallyVerifiedBlock> {
-        self.blocks.values().next_back()
+        self.blocks.values().next_back().map(Arc::as_ref)
     }
 
     /// Returns true if the non-finalized part of this chain is empty.
@@ -1579,11 +1580,9 @@ impl Chain {
         &'a self,
         addresses: &'a HashSet<transparent::Address>,
     ) -> impl Iterator<Item = &'a TransparentTransfers> {
-        addresses.iter().filter_map(|address| {
-            self.partial_transparent_transfers
-                .get(address)
-                .map(Arc::as_ref)
-        })
+        addresses
+            .iter()
+            .filter_map(|address| self.partial_transparent_transfers.get(address))
     }
 
     /// Returns a tuple of the transparent balance change and the total received funds for
@@ -2180,12 +2179,8 @@ impl
 
             // Update the address index with this UTXO
             if let Some(receiving_address) = created_utxo.utxo.output.address(&self.network) {
-                let address_transfers = self
-                    .partial_transparent_transfers
-                    .entry(receiving_address)
-                    .or_default();
-
-                Arc::make_mut(address_transfers)
+                self.partial_transparent_transfers
+                    .get_or_insert_mut(receiving_address)
                     .update_chain_tip_with(&(&outpoint, created_utxo))?;
             }
         }
@@ -2225,8 +2220,7 @@ impl
                     .get_mut(&receiving_address)
                     .expect("block has previously been applied to the chain");
 
-                Arc::make_mut(address_transfers)
-                    .revert_chain_with(&(&outpoint, created_utxo), position);
+                address_transfers.revert_chain_with(&(&outpoint, created_utxo), position);
 
                 // Remove this transfer if it is now empty
                 if address_transfers.is_empty() {
@@ -2293,16 +2287,9 @@ impl
 
             // Index the spent output for the address
             if let Some(spending_address) = spent_output.utxo.output.address(&self.network) {
-                let address_transfers = self
-                    .partial_transparent_transfers
-                    .entry(spending_address)
-                    .or_default();
-
-                Arc::make_mut(address_transfers).update_chain_tip_with(&(
-                    spending_input,
-                    spending_tx_hash,
-                    spent_output,
-                ))?;
+                self.partial_transparent_transfers
+                    .get_or_insert_mut(spending_address)
+                    .update_chain_tip_with(&(spending_input, spending_tx_hash, spent_output))?;
             }
         }
 
@@ -2350,7 +2337,7 @@ impl
                     .get_mut(&receiving_address)
                     .expect("block has previously been applied to the chain");
 
-                Arc::make_mut(address_transfers)
+                address_transfers
                     .revert_chain_with(&(spending_input, spending_tx_hash, spent_output), position);
 
                 // Remove this transfer if it is now empty

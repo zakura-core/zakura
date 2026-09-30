@@ -1,6 +1,7 @@
 import copy
 import io
 import json
+import subprocess
 from pathlib import Path
 import sys
 import tarfile
@@ -264,6 +265,24 @@ class BoundaryTests(unittest.TestCase):
                 with self.subTest(port=port), patch.dict("os.environ", {**environment, "MAC_VERIFIER_SSH_PORT": port}):
                     with self.assertRaises(Unavailable):
                         SSH("MAC_VERIFIER_", directory)
+
+    def test_transfer_replaces_atomically_without_changing_open_reader(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "script with spaces.sh"
+            target.write_text("original script")
+            environment = {"MAC_VERIFIER_HOST": "192.0.2.10", "MAC_VERIFIER_USER": "operator",
+                           "MAC_VERIFIER_SSH_KEY": "fixture-key", "MAC_VERIFIER_KNOWN_HOSTS": "fixture-host"}
+            with patch.dict("os.environ", environment):
+                ssh = SSH("MAC_VERIFIER_", directory)
+            execute = subprocess.run
+            def local_transfer(args, **kwargs):
+                return execute(["bash", "-c", args[-1]], **kwargs)
+            with target.open() as reader, patch("subprocess.run", side_effect=local_transfer):
+                ssh.put("replacement script", str(target))
+                self.assertEqual(reader.read(), "original script")
+            self.assertEqual(target.read_text(), "replacement script")
+            self.assertEqual(target.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(list(Path(directory).glob("script with spaces.sh.*")), [])
 
     def test_missing_pool_and_malformed_hex(self):
         value = record(10)

@@ -4,6 +4,7 @@ set -euo pipefail
 source_dir=${1:?source checkout}
 output_dir=${2:?output directory outside source}
 package_dir=$(cd "$(dirname "$0")" && pwd)
+source_dir=$(cd "$source_dir" && pwd)
 [[ "$(uname -s)" == Darwin && "$(uname -m)" == arm64 ]] || { echo 'Native Apple Silicon required' >&2; exit 1; }
 [[ "$(git -C "$source_dir" rev-parse HEAD)" == af944f5194ef2e9921bc96af017629450375013c ]] || exit 1
 [[ -z "$(git -C "$source_dir" status --porcelain)" ]] || exit 1
@@ -12,6 +13,7 @@ if pgrep -x zakurad >/dev/null; then
   exit 1
 fi
 mkdir -p "$output_dir"
+output_dir=$(cd "$output_dir" && pwd)
 export CARGO_BUILD_JOBS=1 CARGO_TERM_COLOR=never
 unset CARGO_BUILD_TARGET RUSTFLAGS CARGO_ENCODED_RUSTFLAGS
 unset ROCKSDB_LIB_DIR ROCKSDB_INCLUDE_DIR ROCKSDB_STATIC

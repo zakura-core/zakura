@@ -57,7 +57,10 @@ class SSH:
 
     def put(self, data, path):
         # Content travels over stdin, never arguments, logs or uploaded artifacts.
-        command = "umask 077; cat > " + shlex.quote(path)
+        # Atomic replacement preserves a running reader's original inode.
+        command = ("set -eu; umask 077; verifier_temp=$(mktemp " + shlex.quote(path + ".XXXXXX") + "); "
+                   "trap 'rm -f \"$verifier_temp\"' EXIT; cat > \"$verifier_temp\"; "
+                   "mv -f \"$verifier_temp\" " + shlex.quote(path))
         result = subprocess.run(["ssh", *self.options, self.destination, command],
                                 input=data, capture_output=True, text=True, timeout=60)
         if result.returncode:

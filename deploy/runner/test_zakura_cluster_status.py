@@ -108,14 +108,47 @@ class PrivateVerifierTests(unittest.TestCase):
         self.assertEqual(self.read({"verifier_id": "192.0.2.10"}), {"available": False})
         self.assertEqual(self.read(["private-host"]), {"available": False})
 
-    def test_verifier_is_separate_from_fleet_counts_and_testnet(self):
+    def test_private_mac_is_thirteenth_node_with_detail_and_no_direct_probe(self):
+        collector = status.ClusterCollector([node("node-%02d" % n) for n in range(12)], 10, 300, "mainnet")
+        sample = {"available": True, "verifier_id": "verifier-" + "a" * 32,
+                  "mac_tip": 100, "mac_tip_hash": "b" * 64, "source_sha": "c" * 40,
+                  "compared_through": 90, "pending_alerts": 2, "node_rss_bytes": 1000}
+        with mock.patch.dict(os.environ, {"ZAKURA_PRIVATE_VERIFIER_STATUS": "1"}), \
+                mock.patch.object(status, "private_verifier_status", return_value=sample), \
+                mock.patch.object(status, "probe_node", return_value={}) as probe:
+            collector.poll_once()
+        snapshot = collector.snapshot()
+        self.assertEqual(snapshot["total"], 13)
+        self.assertEqual(probe.call_count, 12)
+        self.assertNotIn("verifiers", snapshot)
+        mac = next(row for row in snapshot["rows"] if row["name"] == "zakura-mac-os")
+        self.assertEqual(mac["height"], 100)
+        self.assertTrue(mac["healthy"])
+        self.assertEqual(mac["ssh"], "")
+        self.assertEqual(mac["node_id"], sample["verifier_id"])
+        detail = collector.node_snapshot("zakura-mac-os")
+        self.assertEqual(detail["node"]["host"]["rss_bytes"], 1000)
+        self.assertEqual(len(detail["history"]), 1)
+
+    def test_private_mac_is_mainnet_only_and_unavailable_sample_is_unhealthy(self):
         for network, enabled in (("mainnet", True), ("testnet", False)):
             collector = status.ClusterCollector([node()], 10, 300, network)
             with mock.patch.dict(os.environ, {"ZAKURA_PRIVATE_VERIFIER_STATUS": "1"}), \
-                    mock.patch.object(status, "private_verifier_status", return_value={"available": False}):
-                snapshot = collector.snapshot()
-            self.assertEqual("verifiers" in snapshot, enabled)
-            self.assertEqual(snapshot["total"], len(snapshot["rows"]))
+                    mock.patch.object(status, "private_verifier_status", return_value={"available": False}), \
+                    mock.patch.object(status, "probe_node", return_value={}):
+                collector.poll_once()
+            snapshot = collector.snapshot()
+            self.assertEqual(snapshot["total"], 2 if enabled else 1)
+            if enabled:
+                mac = next(row for row in snapshot["rows"] if row["name"] == "zakura-mac-os")
+                self.assertFalse(mac["healthy"])
+                self.assertIsNone(mac["height"])
+            self.assertNotIn("verifiers", snapshot)
+
+    def test_separate_verifier_section_is_removed(self):
+        source = SCRIPT_PATH.read_text()
+        self.assertNotIn('id="verifier-panel"', source)
+        self.assertNotIn("Native macOS consensus verifier</h2>", source)
 
 
 class NodeConfigTests(unittest.TestCase):

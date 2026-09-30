@@ -1067,11 +1067,15 @@ def private_verifier_status() -> dict:
             raise ValueError("invalid verifier identifier")
         result = {"verifier_id": identifier, "available": True}
         for key in ("sample_time", "coverage_start", "compared_through", "healthy_since",
-                    "active_incidents", "pending_alerts", "mac_tip", "linux_tip"):
+                    "active_incidents", "pending_alerts", "mac_tip", "linux_tip", "node_rss_bytes", "free_disk_bytes"):
             value = data.get(key)
             result[key] = value if type(value) in (int, float) and math.isfinite(value) else None
         for key in ("caught_up", "qualified"):
             result[key] = data.get(key) is True
+        for key in ("mac_tip_hash", "source_sha"):
+            value = data.get(key)
+            size = 64 if key == "mac_tip_hash" else 40
+            result[key] = value if isinstance(value, str) and re.fullmatch(r"[a-fA-F0-9]{%d}" % size, value) else ""
         stamp = result["sample_time"]
         result["available"] = stamp is not None and 0 <= time.time() - stamp <= 90
         return result
@@ -1107,6 +1111,7 @@ class ClusterCollector:
         self.ironwood_activation_height = IRONWOOD_ACTIVATION_HEIGHTS[network]
         self.lock = threading.Lock()
         restored_progress = load_progress(state_file)
+        self.private_mac_progress = restored_progress.get("zakura-mac-os", {})
         self.last_height: dict[str, int | None] = {
             node.name: restored_progress.get(node.name, {}).get("height") for node in nodes
         }
@@ -1156,6 +1161,25 @@ class ClusterCollector:
                     probe = {"error": str(error)}
                 rows.append(self.row_for(node, probe, time.time()))
 
+        if self.network == "mainnet" and os.environ.get("ZAKURA_PRIVATE_VERIFIER_STATUS") == "1":
+            sample = private_verifier_status()
+            self.last_height.setdefault("zakura-mac-os", self.private_mac_progress.get("height"))
+            self.last_advanced_at.setdefault("zakura-mac-os", self.private_mac_progress.get("last_advanced_at"))
+            self.history.setdefault("zakura-mac-os", deque())
+            mac = Node(name="zakura-mac-os", ssh_string="", node_id=sample.get("verifier_id", ""), probe_kind="private-loopback",
+                       service_name="", bin_path="", log_file="", rpc_listen_addr="", rpc_auth="",
+                       rpc_config_path="", rpc_user="", rpc_password="", process_pattern="", container_name="")
+            probe = {"height": sample.get("mac_tip") if sample.get("available") else None,
+                     "block_hash": sample.get("mac_tip_hash"), "commit": sample.get("source_sha"),
+                     "active_state": "active" if sample.get("available") else "unknown",
+                     "client_name": "Zakura macOS ARM64", "rpc_chain": "main", "rpc_testnet": False,
+                     "host": {"disk_free_bytes": sample.get("free_disk_bytes"),
+                              "rss_bytes": sample.get("node_rss_bytes")}}
+            row = self.row_for(mac, probe, time.time())
+            row["detail"] += " · Compared through " + str(sample.get("compared_through") or "—")
+            if sample.get("pending_alerts"):
+                row["detail"] += " · Alerts pending"
+            rows.append(row)
         rows.sort(key=lambda row: row["name"])
         now = time.time()
         with self.lock:
@@ -1481,8 +1505,6 @@ class ClusterCollector:
             "chain": chain,
             "rows": rows,
         }
-        if self.network == "mainnet" and os.environ.get("ZAKURA_PRIVATE_VERIFIER_STATUS") == "1":
-            payload["verifiers"] = [private_verifier_status()]
         return payload
 
     def ironwood_status(self, now: float | None = None) -> tuple[int, dict]:
@@ -2612,10 +2634,7 @@ footer {
   </header>
 
   <div class="banner" id="banner" hidden></div>
-  <section class="panel pad" id="verifier-panel" hidden>
-    <h2>Native macOS consensus verifier</h2>
-    <p id="verifier-summary"></p>
-  </section>
+
 
   <section class="panel pad" data-view="fleet">
     <div class="card-head">
@@ -3680,19 +3699,6 @@ function render() {
   }
   renderHeader(state.data);
   renderFleet(state.data);
-  const verifier = (state.data.verifiers || [])[0];
-  el('verifier-panel').hidden = !verifier;
-  if (verifier) {
-    el('verifier-summary').textContent = (verifier.verifier_id || 'Verifier') + ' · '
-      + (verifier.available ? (verifier.active_incidents ? 'Incident' :
-          (!verifier.caught_up ? 'Catching up' : (verifier.qualified ? 'Qualified' : 'Qualifying'))) : 'Status unavailable')
-      + ' · Mac tip ' + (verifier.mac_tip ?? '—')
-      + ' · Linux tip ' + (verifier.linux_tip ?? '—')
-      + ' · Compared through ' + (verifier.compared_through ?? '—')
-      + ' · Coverage begins ' + (verifier.coverage_start ?? '—')
-      + ' · Active incidents ' + (verifier.active_incidents ?? '—')
-      + ' · Pending alerts ' + (verifier.pending_alerts ?? '—');
-  }
   renderStats(state.data);
   renderChain(state.data);
   renderTable(state.data);

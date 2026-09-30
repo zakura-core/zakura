@@ -24,6 +24,18 @@ def public_status(status, identifier):
         tip = sample.get("tip", {}) if key == "mac_tip" else sample
         value = tip.get("height") if isinstance(tip, dict) else None
         result[key] = value if type(value) is int and value >= 0 else None
+    sample = status.get("verifier")
+    sample = sample if isinstance(sample, dict) else {}
+    tip = sample.get("tip") or {}
+    value = tip.get("hash") if isinstance(tip, dict) else None
+    result["mac_tip_hash"] = value if isinstance(value, str) and re.fullmatch(r"[a-fA-F0-9]{64}", value) else ""
+    receipt = sample.get("receipt") or {}
+    value = receipt.get("source_sha") if isinstance(receipt, dict) else None
+    result["source_sha"] = value if isinstance(value, str) and re.fullmatch(r"[a-f0-9]{40}", value) else ""
+    resources = sample.get("resources") or {}
+    for key in ("node_rss_bytes", "free_disk_bytes"):
+        value = resources.get(key) if isinstance(resources, dict) else None
+        result[key] = value if type(value) is int and value >= 0 else None
     result["active_incidents"] = len(status.get("incidents", {}))
     result["pending_alerts"] = status.get("pending_alerts") if type(status.get("pending_alerts")) is int else None
     return result

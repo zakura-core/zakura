@@ -210,13 +210,15 @@ rebootstrap. The monitor records coverage gaps, never treating an unavailable
 sample as equality. The JSON status and bounded audit logs are the reporting
 interface. The private dashboard is served on Linux loopback port `28236` by
 `zakura-mac-verifier-dashboard.service`, used only as an internal status bridge.
-The existing mainnet dashboard renders a consensus-verifier panel and includes
-an allowlisted `verifiers` summary in `/data`. The bridge `/v1/status` contains only the opaque verifier ID,
-coverage, qualification, alert count and incident count; it excludes raw errors,
-receipts, host addresses, OS labels and peer IDs. Do not add this Mac to the public
-fleet nodes TOML or proxy its raw adapter into the fleet dashboard. The installer enables this
-integration through a service environment override and restarts only the existing
-mainnet dashboard; its fleet configuration and watchdog remain unchanged.
+The existing mainnet dashboard includes `zakura-mac-os` as its thirteenth node
+in the normal table, fleet totals, chain summary and node detail view. Testnet is
+unaffected. The bridge supplies an opaque identifier, tip hash/height, source
+commit, numeric resource samples and comparison/alert counters. It excludes raw
+errors, receipts, host addresses and peer identities. The node uses the existing
+loopback bridge; keep its private endpoint out of the public fleet TOML and do not
+proxy the raw adapter. The installer enables this integration through a service
+environment override and restarts only the existing mainnet dashboard; the
+managed SSH inventory and watchdog configuration remain unchanged.
 
 Alerts cover availability, missing coverage, resource samples, disk below 20 GB,
 memory pressure, tip stalls, prolonged catch-up, unexpected build/configuration,

@@ -40,7 +40,7 @@ before setting their secrets; do not copy credentials from other projects:
 | `/mac-verifier-poc/tunnel` | Dedicated Mac forwarding private key | Operator only |
 | `/mac-verifier-poc/monitor` | `MAC_VERIFIER_SLACK_BOT_TOKEN` | Dedicated monitor identity, read only |
 
-Create a dedicated Slack bot with `im:write` and `chat:write` in workspace
+Use `slack-app-manifest.json` to create a dedicated Slack bot with `im:write` and `chat:write` in workspace
 `T0A80TZAXK5`. Alerts target Roman `U0A81KAPYMR`; workspace identity and DM channel
 are checked before sending. Never deploy an existing broadly scoped operator bot.
 
@@ -48,7 +48,12 @@ Use a dedicated Infisical Universal Auth identity restricted to read secrets in
 `prod:/mac-verifier-poc/monitor`. On DO install its client ID/secret as JSON with
 keys `client_id` and `client_secret`, root-owned mode `0600`, at
 `/etc/zakura-mac-verifier/identity.json`. Systemd `LoadCredential` delivers it
-privately to the unprivileged runner. Secrets are fetched at startup and are not
+privately to the unprivileged runner. `identity.py create --receipt <private-path>`
+creates this identity, records its resource IDs, restricts authentication to the
+DO IP, and vaults `MAC_VERIFIER_MONITOR_IDENTITY_JSON` in the operator-only root
+folder. The client secret expires after 96 hours; create it when provisioning
+succeeds. `identity.py revoke --receipt <same-path>` revokes only that recorded
+identity. Secrets are fetched at startup and are not
 written to the runtime environment file or repository. Restart the monitor after
 credential rotation. Do not print CLI token/secret output.
 
@@ -73,7 +78,8 @@ before POST, records the resource ID before vaulting credentials, and reconciles
 an uncertain creation by inventory lookup. It never automatically repeats a POST
 whose outcome is unknown. If a same-named resource predates the recorded attempt,
 inspect it and use `adopt --server-id <verified-id>` explicitly. Every operation
-checks project, name, and machine type. `inspect` returns safe inventory; `reboot`
+checks project, name, and machine type. Destruction also requires a recorded
+creation request owned by this POC; adopted resources cannot be destroyed. `inspect` returns safe inventory; `reboot`
 uses the provider API. Raw API responses include passwords and must not be logged.
 
 On the Mac install official Homebrew packages `python@3.12 protobuf zstd`. The
@@ -84,8 +90,7 @@ mutable system RocksDB library.
 Transfer the tooling package and a source bundle made with:
 
 ```bash
-git bundle create /private/operator/zakura-source.bundle \
-  af944f5194ef2e9921bc96af017629450375013c
+git -C <clean-pinned-source> bundle create /private/operator/zakura-source.bundle HEAD
 ```
 
 Clone the bundle on the Mac, detach at that SHA, and run:
@@ -124,7 +129,7 @@ checkout. `build.sh` uses one Cargo job and refuses to run alongside `zakurad`.
    Install the scoped identity file. Preparation validates SSH configuration before
    reloading SSH; it does not restart the node or its fleet watchdog.
 6. Run `sudo python3 install.py mac-activate`, then on DO run
-   `python3 install.py linux-activate`. Verify all three launchd jobs and the
+   `python3 install.py linux-activate`. Verify the node, adapter, tunnel, and log-rotation launchd jobs and the
    systemd service, tunnel reconnection, live status, and advancing comparison.
 
 Preparation is repeatable for the same deployment. Activation requires a bootstrap

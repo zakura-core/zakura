@@ -74,7 +74,13 @@ def serve(base, rpc=None):
             self.end_headers()
             self.wfile.write(payload)
 
-    server = HTTPServer(("127.0.0.1", 28233), Handler)
+    class BoundedServer(HTTPServer):
+        def get_request(self):
+            connection, address = super().get_request()
+            connection.settimeout(10)
+            return connection, address
+
+    server = BoundedServer(("127.0.0.1", 28233), Handler)
     server.timeout = 10
     server.serve_forever()
 

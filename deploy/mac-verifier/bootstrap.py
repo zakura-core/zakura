@@ -113,14 +113,14 @@ def main():
     archive = base / "snapshot.tar.zst"
     if not archive.exists():
         partial = base / "snapshot.partial"
-        req = urllib.request.Request(manifest["url"])
-        with urllib.request.urlopen(req, timeout=30) as response, partial.open("wb") as stream:
-            size = 0
-            for chunk in iter(lambda: response.read(1024 * 1024), b""):
-                size += len(chunk)
-                if size > manifest["size_bytes"]:
-                    raise Unavailable("archive exceeds manifest size")
-                stream.write(chunk)
+        result = subprocess.run(
+            ["curl", "--fail", "--location", "--proto", "=https", "--proto-redir", "=https",
+             "--connect-timeout", "30", "--max-time", "1800", "--max-filesize",
+             str(manifest["size_bytes"]), "--output", str(partial), manifest["url"]],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=1810,
+        )
+        if result.returncode:
+            raise Unavailable("snapshot download failed or exceeded its 30-minute budget")
         os.rename(partial, archive)
     if archive.stat().st_size != manifest["size_bytes"] or digest(archive) != manifest["sha256"].lower():
         raise Unavailable("snapshot size/checksum mismatch")

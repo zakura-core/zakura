@@ -16,14 +16,14 @@ def main():
     token = client.json("https://app.infisical.com/api/v1/auth/universal-auth/login",
                         {"clientId": identity["client_id"], "clientSecret": identity["client_secret"]})["accessToken"]
     query = urllib.parse.urlencode({"workspaceId": metadata["project_id"], "environment": "prod",
-                                   "secretPath": "/mac-verifier-poc/monitor", "include_imports": "false"})
-    result = client.json("https://app.infisical.com/api/v3/secrets/raw?" + query,
+                                   "secretPath": "/mac-verifier-poc/monitor", "include_imports": "false",
+                                   "type": "shared"})
+    result = client.json("https://app.infisical.com/api/v3/secrets/raw/MAC_VERIFIER_SLACK_BOT_TOKEN?" + query,
                          headers={"Authorization": "Bearer " + token})
-    matches = [s["secretValue"] for s in result["secrets"]
-               if s["secretKey"] == "MAC_VERIFIER_SLACK_BOT_TOKEN"]
-    if len(matches) != 1:
+    secret = result["secret"]
+    if secret["secretKey"] != "MAC_VERIFIER_SLACK_BOT_TOKEN" or not secret["secretValue"]:
         raise SystemExit("Dedicated monitor Slack token unavailable")
-    environment = {**os.environ, "MAC_VERIFIER_SLACK_BOT_TOKEN": matches[0]}
+    environment = {**os.environ, "MAC_VERIFIER_SLACK_BOT_TOKEN": secret["secretValue"]}
     os.execve(sys.executable, [sys.executable, str(Path(__file__).with_name("monitor.py")), "run"], environment)
 
 

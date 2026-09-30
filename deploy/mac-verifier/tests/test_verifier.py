@@ -14,6 +14,8 @@ from bootstrap import finalized_member, verify_manifest
 from common import RPC, Unavailable, canonical_record
 from monitor import Monitor, Remote, Slack
 from provider import Provider, public_inventory
+from rotate_logs import rotate
+import identity
 
 
 def record(height, fork=0):
@@ -66,6 +68,13 @@ class MonitorTests(unittest.TestCase):
         self.assertEqual(self.monitor.state["cursor"], 27)
         events = [json.loads(line) for line in (Path(self.temp.name) / "audit.jsonl").read_text().splitlines()]
         self.assertEqual([x["height"] for x in events], list(range(11, 28)))
+
+    def test_small_peer_propagation_lag_is_healthy_after_all_eligible_heights(self):
+        self.mac.height = 28
+        self.step()
+        self.assertEqual(self.monitor.state["cursor"], 25)
+        self.assertTrue(self.monitor.state["caught_up"])
+        self.assertIsNotNone(self.monitor.state["healthy_since"])
 
     def test_confirmed_root_mismatch_latches_until_ack(self):
         self.mac.records[12] = record(12)
@@ -230,6 +239,38 @@ class BoundaryTests(unittest.TestCase):
         with patch.object(slack, "call", return_value={"ok": True}) as api:
             self.assertTrue(slack.send(item, 180))
             self.assertEqual(api.call_args[0][1]["client_msg_id"], "fixed")
+
+    def test_identity_definitive_quota_rejection_can_retry_after_resolution(self):
+        for code, expected_attempt in [(400, False), (503, True)]:
+            with self.subTest(code=code), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "identity-receipt.json"
+                rejection = urllib.error.HTTPError("https://app.infisical.com", code,
+                                                    "fixture", {}, io.BytesIO())
+                class API:
+                    def json(inner, url, data=None, headers=None, method=None):
+                        if data is None:
+                            return {"identities": [], "totalCount": 0}
+                        raise rejection
+                with patch.object(identity, "Transport", return_value=API()), \
+                        patch.object(identity, "user_token", return_value="fixture"), \
+                        patch.object(sys, "argv", ["identity.py", "create", "--receipt", str(path)]):
+                    with self.assertRaises(urllib.error.HTTPError):
+                        identity.main()
+                self.assertEqual(json.loads(path.read_text())["create_attempted"], expected_attempt)
+                rejection.close()
+
+    def test_rotation_preserves_open_child_descriptor_and_bounds_backups(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "child.log"
+            with path.open("a") as child:
+                for _ in range(8):
+                    child.write("diagnostic\n")
+                    child.flush()
+                    rotate(path, 1)
+                child.write("still writing\n")
+                child.flush()
+            self.assertEqual(path.read_text(), "still writing\n")
+            self.assertEqual(len(list(Path(directory).glob("child.log.*"))), 4)
 
     def test_provider_unknown_creation_never_posts_twice(self):
         with tempfile.TemporaryDirectory() as directory:

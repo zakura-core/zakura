@@ -65,11 +65,16 @@ def digest(path):
     return result.hexdigest()
 
 
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, request, response, code, message, headers, new_url):
+        raise urllib.error.HTTPError(request.full_url, code, "redirect refused", headers, response)
+
+
 class Transport:
     def __init__(self, timeout=10):
         self.timeout = timeout
         # Do not send loopback requests through operator-defined HTTP proxies.
-        self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
 
     def json(self, url, payload=None, headers=None, method=None):
         data = None if payload is None else json.dumps(payload).encode()

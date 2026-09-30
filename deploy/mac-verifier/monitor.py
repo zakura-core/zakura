@@ -251,12 +251,13 @@ class Monitor:
                 self.reorg(now)
                 raise Unavailable("tips behind comparison cursor")
             self.compare(target, now)
-            caught_up = self.state["cursor"] >= reference["height"] - 3 and mac_height >= reference["height"] - 3
+            caught_up = self.state["cursor"] >= target and mac_height >= reference["height"] - 3
             self.state["caught_up"] = caught_up
             self.incident("catch-up exceeds two hours", not caught_up
                           and now - self.expected["deployed_at"] > 7200, now)
             self.incident("coverage incomplete", False, now)
         except (Unavailable, OSError, ValueError, KeyError, TypeError) as exc:
+            self.state["caught_up"] = False
             error = type(exc).__name__ + ": " + str(exc)
             self.incident("coverage incomplete", True, now)
             since = self.state["unavailable_since"]

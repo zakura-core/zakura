@@ -14,6 +14,7 @@ fi
 mkdir -p "$output_dir"
 export CARGO_BUILD_JOBS=1 CARGO_TERM_COLOR=never
 unset CARGO_BUILD_TARGET RUSTFLAGS CARGO_ENCODED_RUSTFLAGS
+unset ROCKSDB_LIB_DIR ROCKSDB_INCLUDE_DIR ROCKSDB_STATIC
 export CARGO_TARGET_DIR="$output_dir/target"
 # Cargo builds its bundled RocksDB; protobuf is required for generated RPC types.
 command -v protoc >/dev/null

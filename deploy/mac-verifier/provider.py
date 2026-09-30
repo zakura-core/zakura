@@ -64,6 +64,9 @@ class Provider:
                 raise Unavailable("unrecorded POC exists: inspect and explicitly adopt its ID")
             if existing["type"] != KIND:
                 raise Unavailable("existing POC has wrong server type")
+            created = datetime.fromisoformat(existing["created_at"].replace("Z", "+00:00")).timestamp()
+            if created < prior["create_attempted_at"] - 10:
+                raise Unavailable("existing POC predates this creation attempt")
             persist_inventory(path, existing)
             return existing
         if prior.get("create_attempted_at"):
@@ -77,7 +80,8 @@ class Provider:
             raise Unavailable("provider memory does not match 16 GiB offer")
         if offer.get("default_os", {}).get("is_beta") is not False:
             raise Unavailable("default OS is not confirmed stable")
-        atomic_json(path, {"project_id": self.project, "create_attempted_at": time.time()})
+        atomic_json(path, {"project_id": self.project, "create_attempted_at": time.time(),
+                           "managed": True, "request_id": str(uuid.uuid4())})
         server = self.call("servers", {"project_id": self.project, "name": NAME, "type": KIND,
                                        "commitment_type": "duration_24h", "enable_vpc": False,
                                        "enable_kext": False})
@@ -97,7 +101,10 @@ def public_inventory(server):
 
 
 def persist_inventory(path, server):
-    atomic_json(path, public_inventory(server))
+    prior = read_json(path) if Path(path).exists() else {}
+    inventory = {k: prior[k] for k in ("managed", "request_id", "create_attempted_at") if k in prior}
+    inventory.update(public_inventory(server))
+    atomic_json(path, inventory)
 
 
 def store_credentials(server, project, secret_path):
@@ -137,11 +144,15 @@ def main():
         if not args.server_id:
             parser.error("adopt requires an explicitly selected --server-id")
         server = provider.get(args.server_id)
+        atomic_json(args.inventory, {"managed": False})
     else:
         server = provider.get(read_json(args.inventory)["server_id"])
         if args.command == "reboot":
             provider.call("servers/" + server["id"] + "/reboot", {}, "POST")
         elif args.command == "destroy":
+            saved = read_json(args.inventory)
+            if saved.get("managed") is not True or not saved.get("request_id"):
+                raise Unavailable("only recorded resources created by this POC can be destroyed")
             evidence = Path(args.evidence_export or "")
             for name in ("receipt.json", "status.json", "cursor.json", "audit.jsonl"):
                 if not args.evidence_export or not (evidence / name).is_file():

@@ -24,7 +24,7 @@ LINUX_HOME = Path("/var/lib/zakura-mac-verifier")
 LINUX_CODE = Path("/opt/zakura-mac-verifier")
 ETC = Path("/etc/zakura-mac-verifier")
 LABELS = ("dev.valargroup.zakura-verifier-node", "dev.valargroup.zakura-verifier-adapter",
-          "dev.valargroup.zakura-verifier-tunnel")
+          "dev.valargroup.zakura-verifier-tunnel", "dev.valargroup.zakura-verifier-log-rotation")
 
 
 def call(*args):
@@ -115,6 +115,7 @@ def install_mac(args):
          "-o", "StrictHostKeyChecking=yes", "-o", "UserKnownHostsFile=" + str(known_hosts),
          "-R", "127.0.0.1:28233:127.0.0.1:28233", TUNNEL_USER + "@159.65.183.89"],
     ]
+    commands.append([python, str(BASE / "code/rotate_logs.py")])
     for label, command in zip(LABELS, commands):
         job = {"Label": label, "ProgramArguments": command, "UserName": MAC_USER,
                "RunAtLoad": True, "KeepAlive": True, "ThrottleInterval": 10,
@@ -122,12 +123,14 @@ def install_mac(args):
                "EnvironmentVariables": {"HOME": str(BASE / "home"), "PYTHONDONTWRITEBYTECODE": "1"},
                "StandardOutPath": str(BASE / "logs" / (label + ".out.log")),
                "StandardErrorPath": str(BASE / "logs" / (label + ".err.log"))}
+        if label == LABELS[-1]:
+            job["KeepAlive"] = False
+            job["StartInterval"] = 60
+            job["StandardOutPath"] = "/dev/null"
+            job["StandardErrorPath"] = "/dev/null"
         path = Path("/Library/LaunchDaemons") / (label + ".plist")
         path.write_bytes(plistlib.dumps(job))
         path.chmod(0o644)
-    rotation = '\n'.join(f'"{BASE}/logs/{label}.{suffix}.log" {MAC_USER}:staff 600 4 10240 * J'
-                         for label in LABELS for suffix in ("out", "err"))
-    write("/etc/newsyslog.d/zakura-verifier.conf", rotation + "\n")
     call("pmset", "-a", "sleep", "0", "autorestart", "1")
     print("Prepared Mac services; bootstrap and anchor before activation.")
 
@@ -274,7 +277,7 @@ def main():
         identity = read_json(ETC / "identity.json")
         if set(identity) != {"client_id", "client_secret"}:
             raise ValueError("invalid Universal Auth identity file")
-        if (ETC / "identity.json").stat().st_mode & 0o077:
+        if (ETC / "identity.json").stat().st_uid != 0 or (ETC / "identity.json").stat().st_mode & 0o077:
             raise ValueError("identity.json must be root-owned mode 0600")
         call("systemctl", "enable", "--now", "zakura-mac-verifier")
     elif args.command in ("linux-stop", "linux-uninstall"):

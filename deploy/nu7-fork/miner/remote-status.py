@@ -32,10 +32,11 @@ def service_active(name):
         return False
 
 
-def accepted_blocks_24h(name):
+def accepted_blocks_24h(name, since=0):
     try:
+        start = max(int(time.time()) - 86400, since)
         result = subprocess.run(
-            ["journalctl", "--unit", name, "--since", "24 hours ago",
+            ["journalctl", "--unit", name, "--since", f"@{start}",
              "--grep", "block accepted", "--output", "cat", "--no-pager", "--quiet"],
             capture_output=True, text=True, timeout=3, check=False,
         )
@@ -46,12 +47,12 @@ def accepted_blocks_24h(name):
         return None
 
 
-def sample(rpc_port, miner_service, node_service):
+def sample(rpc_port, miner_service, node_service, since=0):
     result = {
         "observedAt": time.time(),
         "minerActive": service_active(miner_service),
         "nodeActive": service_active(node_service),
-        "acceptedBlocks24h": accepted_blocks_24h(miner_service),
+        "acceptedBlocks24h": accepted_blocks_24h(miner_service, since),
     }
     try:
         info = rpc(rpc_port, "getblockchaininfo")
@@ -83,12 +84,13 @@ class Handler(BaseHTTPRequestHandler):
     rpc_port = 18232
     miner_service = "zakura-fork-miner.service"
     node_service = "zakurad.service"
+    since = 0
 
     def do_GET(self):
         if self.path != "/v1/miner":
             self.send_error(404)
             return
-        body = json.dumps(sample(self.rpc_port, self.miner_service, self.node_service)).encode()
+        body = json.dumps(sample(self.rpc_port, self.miner_service, self.node_service, self.since)).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Cache-Control", "no-store")
@@ -105,10 +107,15 @@ def main():
     parser.add_argument("--rpc-port", type=int, default=18232)
     parser.add_argument("--miner-service", default="zakura-fork-miner.service")
     parser.add_argument("--node-service", default="zakurad.service")
+    parser.add_argument("--since", type=int, default=0,
+                        help="Unix timestamp of the current network generation")
     args = parser.parse_args()
+    if not 0 <= args.since <= time.time():
+        parser.error("--since must be a non-negative timestamp in the past")
     Handler.rpc_port = args.rpc_port
     Handler.miner_service = args.miner_service
     Handler.node_service = args.node_service
+    Handler.since = args.since
     ThreadingHTTPServer((args.host, args.port), Handler).serve_forever()
 
 

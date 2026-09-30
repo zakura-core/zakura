@@ -18,9 +18,14 @@ pre-NU7 history and the measured NSM value balance rather than starting empty.
 for the exact node revision, activation height, network identity, participant
 configuration, and matching snapshot/checksum. The manifest is generated from the
 running node's configuration and checked against its RPC upgrade list; these
-values are not maintained separately in the website. The September 26 rerun uses
-the rebased PR and main's consensus rules, including 100-block coinbase maturity.
-Do not reuse state from the earlier fork.
+values are not maintained separately in the website. The September 30 reset uses
+`Nu7StagingV3`, magic `7a6b7539`, and the pinned rebased build
+`61efe76c62645e22ca7d29a8cacfbfe77e35059a`. It starts at the recorded, freshly
+caught-up public Testnet tip 4,420,648 and activates NU7 four blocks later at
+4,420,652. V2 balances and transactions do not carry over; use a fresh cache.
+There are five validators, four miners (solver IDs 1, 3, 4, 5), and one local
+observer without a miner. V2 state, executables, configuration, publication, and
+faucet claims remain retained together for rollback.
 
 Current main includes PR #1209, which changes minimum-difficulty validation
 from the configured NU7 activation height. The existing `Nu7StagingV2` history
@@ -43,11 +48,13 @@ The Caddy configuration exposes `/v1/network`, `/v1/config`, and the snapshot;
 
 The current seed is served directly by Caddy on `zakura-nu7-fork-1`
 (`api.nu7.valargroup.dev`), from
-`/mnt/snapshots/nu7-public/snapshots/nu7-v2-seed-4398752.tar.zst`.
-It is a fixed, pruned seed at height **4,398,752**, published on
-**2026-09-26 at 19:18:24 UTC**, before NU7 activation. Its database format is
-**29.1.0** and compressed size is **9,618,204,704 bytes**. There is no daily
-refresh job. The website presents this artifact separately from Mainnet snapshots.
+`/mnt/snapshots/nu7-public/snapshots/nu7-v3-seed-4420648.tar.zst`.
+It is a fixed, pruned seed at height **4,420,648**, published on
+**2026-09-30 at 09:34:35 UTC**, before fork mining. Its database format is
+**29.1.0** and compressed size is **9,945,546,169 bytes**.
+SHA-256: `b9d92831e7fbd7dee81471f779fde86b77146df6b49a903e26909f0de978db68`. The V2 archive remains unchanged at its distinct URL.
+There is no daily refresh job. The website presents this artifact separately
+from Mainnet snapshots.
 
 The manifest's `snapshot` object includes `url`, `sha256`, `height`, `sizeBytes`,
 `publishedAt` (Unix seconds, UTC), `storageMode` (`pruned`), and `dbVersion`

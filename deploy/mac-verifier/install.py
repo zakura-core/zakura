@@ -114,7 +114,7 @@ def install_mac(args):
         ["/usr/bin/ssh", "-NT", "-i", str(key), "-o", "IdentitiesOnly=yes",
          "-o", "BatchMode=yes", "-o", "ExitOnForwardFailure=yes", "-o", "ConnectTimeout=10",
          "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3",
-         "-o", "StrictHostKeyChecking=yes", "-o", "UserKnownHostsFile=" + str(known_hosts),
+         "-o", "StrictHostKeyChecking=yes", "-o", "UserKnownHostsFile=" + json.dumps(str(known_hosts)),
          "-R", "127.0.0.1:28233:127.0.0.1:28233", TUNNEL_USER + "@" + reference_host],
     ]
     commands.append([python, str(BASE / "code/rotate_logs.py")])

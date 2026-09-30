@@ -26,7 +26,12 @@ use crate::service::finalized_state::{DiskWriteBatch, ZakuraDb};
 use super::{CancelFormatChange, DiskFormatUpgrade, FormatChangeError};
 
 /// The number of block info records to rewrite per database batch.
+#[cfg(not(test))]
 const BATCH_BLOCKS: u32 = 10_000;
+/// A small batch for unit tests that cross batch boundaries: every row recomputes cumulative
+/// issuance, so 10,000-row cases take minutes in debug builds.
+#[cfg(test)]
+const BATCH_BLOCKS: u32 = 100;
 
 /// Implements [`DiskFormatUpgrade`] for the NSM value balance backfill.
 pub struct Upgrade;
@@ -937,54 +942,110 @@ mod database_tests {
         assert!(Upgrade.validate(&db, &rx).unwrap().is_ok());
     }
 
-    #[test]
-    fn migration_batch_boundaries_retry_and_idempotence() {
-        for (affected, pool_len) in [(9_999, 40), (10_000, 48), (10_001, 48)] {
-            // Genesis is the only unaffected row; the seed row is always rewritten.
-            let rows = affected + 1;
-            for fail_write in [0, 1] {
-                let db = legacy_db(rows, pool_len);
-                let (_tx, rx) = crossbeam_channel::bounded(1);
-                let mut writes = 0;
-                let result = backfill(Some(Height(rows - 1)), &db, &rx, |batch| {
-                    let current = writes;
-                    writes += 1;
-                    if current == fail_write {
-                        return Err(FormatChangeError::MigrationStorage(
-                            "injected failure".into(),
-                        ));
-                    }
-                    db.write_batch(batch).unwrap();
-                    Ok(())
-                });
-                if fail_write == 0 || affected >= BATCH_BLOCKS {
-                    assert!(matches!(
-                        result,
-                        Err(FormatChangeError::MigrationStorage(_))
-                    ));
-                } else {
-                    result.unwrap();
-                }
-                Upgrade.run(Some(Height(rows - 1)), &db, &rx).unwrap();
-                assert_upgraded(&db, rows);
-                Upgrade.run(Some(Height(rows - 1)), &db, &rx).unwrap();
-                assert_upgraded(&db, rows);
+    /// Backfills a legacy database whose `affected` rows need rewriting, injecting a storage
+    /// failure at batch write `fail_write`, then checks that the upgrade retries to completion
+    /// and that a second run is a no-op.
+    ///
+    /// Fewer than [`BATCH_BLOCKS`] rows fit in one write, so a later injected failure never
+    /// fires. Each case runs as its own test so nextest can schedule them in parallel.
+    fn check_batch_boundary_retry_and_idempotence(affected: u32, pool_len: usize, fail_write: u32) {
+        // Genesis is the only unaffected row; the seed row is always rewritten.
+        let rows = affected + 1;
+        let db = legacy_db(rows, pool_len);
+        let (_tx, rx) = crossbeam_channel::bounded(1);
+        let mut writes = 0;
+        let result = backfill(Some(Height(rows - 1)), &db, &rx, |batch| {
+            let current = writes;
+            writes += 1;
+            if current == fail_write {
+                return Err(FormatChangeError::MigrationStorage(
+                    "injected failure".into(),
+                ));
             }
+            db.write_batch(batch).unwrap();
+            Ok(())
+        });
+        if fail_write == 0 || affected >= BATCH_BLOCKS {
+            assert!(matches!(
+                result,
+                Err(FormatChangeError::MigrationStorage(_))
+            ));
+        } else {
+            result.unwrap();
         }
+        Upgrade.run(Some(Height(rows - 1)), &db, &rx).unwrap();
+        assert_upgraded(&db, rows);
+        Upgrade.run(Some(Height(rows - 1)), &db, &rx).unwrap();
+        assert_upgraded(&db, rows);
+    }
+
+    /// One row short of a full batch, failing its only write.
+    #[test]
+    fn migration_below_batch_boundary_first_write_fails() {
+        check_batch_boundary_retry_and_idempotence(BATCH_BLOCKS - 1, 40, 0);
+    }
+
+    /// One row short of a full batch, so the injected second-write failure never fires.
+    #[test]
+    fn migration_below_batch_boundary_second_write_not_reached() {
+        check_batch_boundary_retry_and_idempotence(BATCH_BLOCKS - 1, 40, 1);
+    }
+
+    /// Exactly one full batch, failing the batch write.
+    #[test]
+    fn migration_at_batch_boundary_first_write_fails() {
+        check_batch_boundary_retry_and_idempotence(BATCH_BLOCKS, 48, 0);
+    }
+
+    /// Exactly one full batch, failing the trailing tip-pool write.
+    #[test]
+    fn migration_at_batch_boundary_second_write_fails() {
+        check_batch_boundary_retry_and_idempotence(BATCH_BLOCKS, 48, 1);
+    }
+
+    /// One row past a full batch, failing the full-batch write.
+    #[test]
+    fn migration_above_batch_boundary_first_write_fails() {
+        check_batch_boundary_retry_and_idempotence(BATCH_BLOCKS + 1, 48, 0);
+    }
+
+    /// One row past a full batch, failing the write that carries the extra row.
+    #[test]
+    fn migration_above_batch_boundary_second_write_fails() {
+        check_batch_boundary_retry_and_idempotence(BATCH_BLOCKS + 1, 48, 1);
+    }
+
+    /// Migrates rows past the third halving, so the checked balances come from several
+    /// eras of the issuance schedule rather than only the first.
+    #[test]
+    fn migration_balances_span_halvings() {
+        let network = accounting_network(0);
+        let rows = (1..)
+            .find(|height| {
+                zakura_chain::parameters::subsidy::halving(Height(*height), &network) == 3
+            })
+            .expect("the regtest schedule halves within u32 heights")
+            + 1;
+        let db = legacy_db(rows, 48);
+        let (_tx, rx) = crossbeam_channel::bounded(1);
+        Upgrade.run(Some(Height(rows - 1)), &db, &rx).unwrap();
+        assert_upgraded(&db, rows);
     }
 
     #[test]
     fn migration_cancellation_between_batches_is_retryable() {
-        let db = legacy_db(10_003, 48);
+        let db = legacy_db(BATCH_BLOCKS + 3, 48);
         let (tx, rx) = crossbeam_channel::bounded(1);
-        let result = backfill(Some(Height(10_002)), &db, &rx, |batch| {
+        let result = backfill(Some(Height(BATCH_BLOCKS + 2)), &db, &rx, |batch| {
             db.write_batch(batch).unwrap();
             tx.send(CancelFormatChange).unwrap();
             Ok(())
         });
         assert!(matches!(result, Err(FormatChangeError::Cancelled)));
-        Upgrade.run(Some(Height(10_002)), &db, &rx).unwrap();
-        assert_upgraded(&db, 10_003);
+        Upgrade
+            .run(Some(Height(BATCH_BLOCKS + 2)), &db, &rx)
+            .unwrap();
+        assert_upgraded(&db, BATCH_BLOCKS + 3);
     }
 
     #[test]

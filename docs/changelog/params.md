@@ -32,6 +32,7 @@ Keep entries **newest-first**. Each row records:
 
 | Parameter | Location | Old → New | PR | Why |
 | --- | --- | --- | --- | --- |
+| `ESTIMATED_RELEASE_HEIGHT` | `crates/zakurad/src/components/sync/end_of_support.rs` | `3,498,435` → `3,501,907` | [#1234](https://github.com/zakura-core/zakura/pull/1234) | Project the September 22 bundle to the end of October 1 UTC for the release planned that day. Retain the 30-day window and three-day warning lead; support through height 3,536,467 and halt at 3,536,468, estimated at November 1, 2026 at 00:00:24 UTC. |
 | `BLOCK_PRODUCTION_WEIGHT_RATIO_CAP` | `crates/zakura-chain/src/transaction/unmined/zip317.rs` | 10 → 13 | [#1218](https://github.com/zakura-core/zakura/pull/1218) | Preserve the 12.5-fold selection weight of transactions paying 5,000 zatoshis per action against the new 400-zatoshi baseline. |
 | `MARGINAL_FEE` | `crates/zakura-chain/src/transaction/unmined/zip317.rs` | 5,000 → 400 zatoshis per action | [#1218](https://github.com/zakura-core/zakura/pull/1218) | Lower Zakura's conventional fee for mempool admission, GBT weighting, and eviction policy. |
 | `MEMPOOL_TX_FEE_REQUIREMENT_CAP` | `crates/zakura-chain/src/transaction/unmined/zip317.rs` | 1,000 → 800 zatoshis | [#1218](https://github.com/zakura-core/zakura/pull/1218) | Keep the legacy size-based relay fee below the new minimum for two grace actions. |

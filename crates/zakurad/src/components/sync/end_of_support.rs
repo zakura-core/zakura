@@ -14,9 +14,10 @@ use crate::application::release_version;
 
 /// The estimated height that this release will be published.
 ///
-/// Projected to 2026-09-28 23:37 UTC from the committed release-state bundle
-/// using `scripts/release-readiness.py` at the Mainnet target spacing.
-pub const ESTIMATED_RELEASE_HEIGHT: u32 = 3_498_435;
+/// Projected to the end of October 1, 2026 UTC from the committed September 22
+/// release-state bundle at the Mainnet target spacing. With the 30-day support
+/// window, the first unsupported block is estimated at November 1, 00:00 UTC.
+pub const ESTIMATED_RELEASE_HEIGHT: u32 = 3_501_907;
 
 /// The estimated number of blocks per day after Blossom.
 ///
@@ -34,8 +35,8 @@ pub const ESTIMATED_BLOCKS_PER_DAY: u32 = 24 * 60 * 60 / POST_BLOSSOM_POW_TARGET
 /// - Currently set to 30 days
 ///
 /// With this release's [`ESTIMATED_RELEASE_HEIGHT`], Mainnet is supported through
-/// height 3,532,995 and halts after it (~2026-10-28). Calendar dates are estimates;
-/// enforcement follows the chain tip height.
+/// height 3,536,467 and halts after it (~2026-11-01 00:00 UTC). Calendar dates
+/// are estimates; enforcement follows the chain tip height.
 pub const EOS_PANIC_AFTER: u32 = 30;
 
 /// The number of days before the end of support where Zebra will display warnings.

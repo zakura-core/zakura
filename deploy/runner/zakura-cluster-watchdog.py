@@ -1287,19 +1287,24 @@ class Watchdog:
             return
         if fleet.name != "mainnet":
             return
+        previous = state.get("mac_forks", {}).get(fleet.name, {})
         mac = next((row for row in rows if row.get("name") == "zakura-mac-os"), None)
         if mac is None or not tip_is_verifiable(mac):
+            mac_recovery_ready(previous, now, False)
             return
         anchor = mac.get("fork_anchor")
         if not isinstance(anchor, dict):
+            mac_recovery_ready(previous, now, False)
             return
         height = coerce_height(anchor.get("height"))
         block_hash = validated_block_hash(anchor.get("hash"))
         tip = coerce_height(mac.get("height"))
         if height is None or block_hash is None or tip - height < 10:
+            mac_recovery_ready(previous, now, False)
             return
         others = [row for row in rows if row.get("name") != "zakura-mac-os"]
         if not others:
+            mac_recovery_ready(previous, now, False)
             return
         groups = {}
         for row in others:
@@ -1519,6 +1524,9 @@ class Watchdog:
         bad_since: float | None = None,
     ) -> None:
         key = fleet.name
+        if fleet.name == "mainnet":
+            mac_recovery_ready(state.get("nodes", {}).get("mainnet/zakura-mac-os", {}), now, False)
+            mac_recovery_ready(state.get("mac_forks", {}).get("mainnet", {}), now, False)
         bucket = state.setdefault("fleets", {})
         entry = bucket.get(key, {})
         previous_bad_since = coerce_float(entry.get("bad_since"))

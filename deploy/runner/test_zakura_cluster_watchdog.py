@@ -2094,6 +2094,19 @@ class MacForkAlertTests(unittest.TestCase):
         self.assertFalse(watchdog.mac_recovery_ready(entry, 230, True))
         self.assertTrue(watchdog.mac_recovery_ready(entry, 260, True))
 
+    def test_missing_fork_evidence_resets_recovery_streak(self):
+        state, _ = self.check(self.rows())
+        state, _ = self.check(self.rows(agreeing=0), state, now=1030)
+        missing = self.rows(agreeing=0)
+        missing[0].pop("fork_anchor")
+        state, _ = self.check(missing, state, now=1060)
+        state, sent = self.check(self.rows(agreeing=0), state, now=1090)
+        self.assertEqual(sent, [])
+        state, sent = self.check(self.rows(agreeing=0), state, now=1120)
+        self.assertEqual(sent, [])
+        state, sent = self.check(self.rows(agreeing=0), state, now=1150)
+        self.assertEqual(len(sent), 1)
+
     def test_mute_suppresses_mac_forks_without_altering_state(self):
         with patch.dict(watchdog.os.environ, {"MAC_VERIFIER_ALERTS_MUTED": "1"}):
             state, sent = self.check(self.rows())

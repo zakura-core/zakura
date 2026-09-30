@@ -113,7 +113,7 @@ class RPC:
 
     def tip(self):
         info = self.call("getblockchaininfo")
-        if info.get("chain") != "main":
+        if not isinstance(info, dict) or info.get("chain") != "main":
             raise Unavailable("reference is not mainnet")
         height = integer(info.get("blocks"))
         return {"height": height, "hash": hex_bytes(self.call("getblockhash", height), 32)}
@@ -123,6 +123,8 @@ class RPC:
         before = hex_bytes(self.call("getblockhash", height), 32)
         tree = self.call("z_gettreestate", before)
         record = {"height": height, "hash": before, "pools": {}}
+        if not isinstance(tree, dict):
+            raise Unavailable("malformed tree state")
         if integer(tree.get("height")) != height or hex_bytes(tree.get("hash"), 32) != before:
             raise Unavailable("tree state identity mismatch")
         # The bootstrap gate is above all three pools' activation heights.
@@ -141,6 +143,8 @@ class RPC:
 
 
 def canonical_record(record, height):
+    if not isinstance(record, dict):
+        raise Unavailable("malformed block record")
     if integer(record.get("height")) != height:
         raise Unavailable("wrong height returned")
     result = {"height": height, "hash": hex_bytes(record.get("hash"), 32), "pools": {}}

@@ -45,6 +45,8 @@ def copy_package(target):
     for source in PACKAGE.glob("*.py"):
         shutil.copyfile(source, target / source.name)
         (target / source.name).chmod(0o644)
+    # Remove the retired bridge module during upgrades.
+    (target / "dashboard.py").unlink(missing_ok=True)
 
 
 def mac_account():
@@ -139,8 +141,18 @@ def install_mac(args):
 
 def stop_mac():
     for label in LABELS:
+        call("launchctl", "disable", "system/" + label)
         subprocess.run(["launchctl", "bootout", "system/" + label],
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60)
+
+
+def activate_mac():
+    read_json(BASE / "receipt.json")
+    for label in LABELS:
+        call("launchctl", "enable", "system/" + label)
+        result = subprocess.run(["launchctl", "print", "system/" + label], capture_output=True, timeout=30)
+        if result.returncode:
+            call("launchctl", "bootstrap", "system", "/Library/LaunchDaemons/" + label + ".plist")
 
 
 def linux_account(name, home):
@@ -232,13 +244,13 @@ WantedBy=multi-user.target
     write("/etc/systemd/system/zakura-mainnet-dashboard.service.d/70-private-verifier.conf",
           "[Service]\nEnvironment=ZAKURA_PRIVATE_VERIFIER_STATUS=1\n")
     write("/etc/systemd/system/zakura-mac-verifier-dashboard.service", f'''[Unit]
-Description=Opaque verifier status dashboard
+Description=Loopback verifier status bridge
 After=network-online.target
 
 [Service]
 User={LINUX_USER}
 Group={LINUX_USER}
-ExecStart=/usr/bin/python3 {LINUX_CODE}/dashboard.py
+ExecStart=/usr/bin/python3 {LINUX_CODE}/status_bridge.py
 Restart=always
 RestartSec=15
 NoNewPrivileges=true
@@ -297,11 +309,7 @@ def main():
     if args.command == "mac-prepare":
         install_mac(args)
     elif args.command == "mac-activate":
-        read_json(BASE / "receipt.json")
-        for label in LABELS:
-            result = subprocess.run(["launchctl", "print", "system/" + label], capture_output=True, timeout=30)
-            if result.returncode:
-                call("launchctl", "bootstrap", "system", "/Library/LaunchDaemons/" + label + ".plist")
+        activate_mac()
     elif args.command in ("mac-stop", "mac-uninstall"):
         stop_mac()
         if args.command == "mac-uninstall":

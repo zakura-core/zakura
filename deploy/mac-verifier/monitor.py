@@ -158,6 +158,10 @@ class Monitor:
         self.save()
 
     def validate_status(self, status, now):
+        if not isinstance(status, dict):
+            raise Unavailable("malformed status sample")
+        if not isinstance(status.get("resources"), dict):
+            raise Unavailable("malformed resource sample")
         if (status.get("schema_version") != 1
                 or status.get("architecture") not in ("arm64", "aarch64")
                 or status.get("receipt") != self.expected

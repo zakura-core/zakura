@@ -10,6 +10,8 @@ from common import read_json
 
 
 def public_status(status, identifier):
+    if not isinstance(status, dict):
+        raise ValueError("malformed status")
     if not re.fullmatch(r"verifier-[a-f0-9]{32}", identifier):
         raise ValueError("invalid opaque identifier")
     result = {"verifier_id": identifier, "schema_version": 1}

@@ -172,7 +172,8 @@ checkout. `build.sh` uses one Cargo job and refuses to run alongside `zakurad`.
 5. Copy the Mac's nonsecret `receipt.json` to DO, then run
    `python3 install.py linux-prepare --tunnel-public-key <key.pub> --receipt
    <receipt.json> --infisical-project c57a6889-6a7c-4d05-a54a-e4a4c0b14ee7
-   --fleet-dashboard-script <updated-zakura-cluster-status.py>` as root.
+   --fleet-dashboard-script <updated-zakura-cluster-status.py>
+   --fleet-watchdog-script <updated-zakura-cluster-watchdog.py>` as root.
    Install the scoped identity file. Preparation validates SSH configuration before
    reloading SSH; it does not restart the node or its fleet watchdog.
 6. Run `sudo python3 install.py mac-activate`, then on DO run
@@ -208,7 +209,7 @@ replay comparisons but cannot skip them. Reorgs rewind to a saved common block
 within 1,000 heights and replay; deeper or unavailable history requires an explicit
 rebootstrap. The monitor records coverage gaps, never treating an unavailable
 sample as equality. The JSON status and bounded audit logs are the reporting
-interface. The private dashboard is served on Linux loopback port `28236` by
+interface. `status_bridge.py` serves sanitized JSON on Linux loopback port `28236` through
 `zakura-mac-verifier-dashboard.service`, used only as an internal status bridge.
 The existing mainnet dashboard includes `zakura-mac-os` as its thirteenth node
 in the normal table, fleet totals, chain summary and node detail view. Testnet is
@@ -290,3 +291,9 @@ Alerts and recovery transitions use the watchdog's persistent state and delivery
 queue. The Mac endpoint, SSH credentials and peer identity are never included.
 These channel alerts are independent of the comparator's dedicated Slack DM
 credentials and do not establish the full comparator qualification gate.
+
+`mac-stop` persistently disables the verifier launchd jobs before unloading them,
+so they stay stopped after reboot. `mac-activate` explicitly enables them again.
+Bootstrap publishes its activation receipt only after cleanup, disk headroom and
+state ownership checks succeed. Failed imports require operator inspection; they
+are never automatically overwritten.

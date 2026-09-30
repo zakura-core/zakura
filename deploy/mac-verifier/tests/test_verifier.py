@@ -12,12 +12,13 @@ from unittest.mock import patch
 import urllib.error
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from bootstrap import finalized_member, verify_manifest
+from bootstrap import finalized_member, verify_manifest, finalize_bootstrap
+import install
 from common import RPC, Unavailable, canonical_record
 from monitor import Monitor, Remote, Slack
 from rotate_logs import rotate
 import identity
-from dashboard import public_status
+from status_bridge import public_status
 from adapter import fork_anchor
 from private_deploy import validate_host, SSH
 import github_secrets
@@ -65,6 +66,21 @@ class MonitorTests(unittest.TestCase):
     def step(self, now=30):
         self.mac.now = now
         self.monitor.step(now)
+
+    def test_malformed_status_becomes_incomplete_coverage(self):
+        for sample in (None, [], {"resources": []}):
+            with self.subTest(sample=sample), patch.object(self.mac, "status", return_value=sample):
+                self.step()
+                self.assertIn("coverage incomplete", self.monitor.state["incidents"])
+                self.assertFalse(self.monitor.state["caught_up"])
+                self.assertEqual(self.monitor.state["cursor"], 10)
+
+    def test_malformed_remote_blocks_become_incomplete_coverage(self):
+        for sample in (None, [], "invalid"):
+            with self.subTest(sample=sample), patch.object(self.mac, "block", side_effect=lambda h: canonical_record(sample, h)):
+                self.step()
+                self.assertIn("coverage incomplete", self.monitor.state["incidents"])
+                self.assertEqual(self.monitor.state["cursor"], 10)
 
     def test_every_height_and_batch_limit(self):
         self.step()
@@ -429,6 +445,80 @@ class BoundaryTests(unittest.TestCase):
             self.assertEqual(path.read_text(), "still writing\n")
             self.assertEqual(len(list(Path(directory).glob("child.log.*"))), 4)
 
+
+
+
+class MalformedBoundaryTests(unittest.TestCase):
+    def test_rpc_rejects_non_object_info_and_tree_state(self):
+        rpc = RPC("http://127.0.0.1:8232")
+        for value in (None, [], "invalid"):
+            with self.subTest(value=value), patch.object(rpc, "call", return_value=value):
+                with self.assertRaises(Unavailable):
+                    rpc.tip()
+            with self.subTest(value=value), patch.object(rpc, "call", side_effect=["aa" * 32, value]):
+                with self.assertRaises(Unavailable):
+                    rpc.block(10)
+
+    def test_bridge_rejects_non_object_status(self):
+        for value in (None, [], "invalid"):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                public_status(value, "verifier-" + "a" * 32)
+
+
+class LifecycleTests(unittest.TestCase):
+    def test_stop_disables_jobs_before_unloading(self):
+        with patch.object(install, "call") as call, patch.object(install.subprocess, "run") as run:
+            install.stop_mac()
+        self.assertEqual(call.call_count, len(install.LABELS))
+        for label in install.LABELS:
+            call.assert_any_call("launchctl", "disable", "system/" + label)
+            self.assertIn(["launchctl", "bootout", "system/" + label], [c.args[0] for c in run.call_args_list])
+
+    def test_activation_requires_receipt_and_reenables_stopped_jobs(self):
+        with patch.object(install, "read_json", side_effect=OSError("missing receipt")), patch.object(install, "call") as call:
+            with self.assertRaises(OSError):
+                install.activate_mac()
+            call.assert_not_called()
+        unloaded = type("Result", (), {"returncode": 1})()
+        with patch.object(install, "read_json", return_value=receipt()), patch.object(install, "call") as call, patch.object(install.subprocess, "run", return_value=unloaded):
+            install.activate_mac()
+            for label in install.LABELS:
+                call.assert_any_call("launchctl", "enable", "system/" + label)
+                call.assert_any_call("launchctl", "bootstrap", "system", "/Library/LaunchDaemons/" + label + ".plist")
+
+    def test_bootstrap_receipt_is_not_published_on_cleanup_failure(self):
+        for failure in ("disk", "ownership"):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as directory:
+                base = Path(directory)
+                archive = base / "snapshot.tar.zst"
+                archive.touch()
+                (base / "state").mkdir()
+                disk = type("Disk", (), {"free": 0 if failure == "disk" else 80 * 10**9})()
+                account = type("Account", (), {"pw_uid": 1, "pw_gid": 1})()
+                with patch("bootstrap.shutil.disk_usage", return_value=disk), patch("bootstrap.pwd.getpwnam", return_value=account), patch("bootstrap.os.chown", side_effect=OSError("ownership failure")):
+                    with self.assertRaises((Unavailable, OSError)):
+                        finalize_bootstrap(base, archive, receipt())
+                self.assertFalse((base / "receipt.json").exists())
+
+    def test_bootstrap_receipt_is_published_after_successful_cleanup(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            archive = base / "snapshot.tar.zst"
+            archive.touch()
+            (base / "state").mkdir()
+            account = type("Account", (), {"pw_uid": 1, "pw_gid": 1})()
+            with patch("bootstrap.shutil.disk_usage", return_value=type("Disk", (), {"free": 80 * 10**9})()), patch("bootstrap.pwd.getpwnam", return_value=account), patch("bootstrap.os.chown"):
+                finalize_bootstrap(base, archive, receipt())
+            self.assertFalse(archive.exists())
+            self.assertEqual(json.loads((base / "receipt.json").read_text()), receipt())
+
+    def test_package_upgrade_removes_retired_bridge(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory)
+            (target / "dashboard.py").touch()
+            install.copy_package(target)
+            self.assertFalse((target / "dashboard.py").exists())
+            self.assertTrue((target / "status_bridge.py").exists())
 
 
 if __name__ == "__main__":

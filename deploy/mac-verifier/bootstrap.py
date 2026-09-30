@@ -87,6 +87,19 @@ def restore(archive, base):
             process.wait()
 
 
+def finalize_bootstrap(base, archive, receipt):
+    """Publish activation evidence only after cleanup and ownership succeed."""
+    archive.unlink()
+    if shutil.disk_usage(base).free < 50 * 10**9:
+        raise Unavailable("less than 50 GB free after cleanup")
+    account = pwd.getpwnam("_zakuraverifier")
+    for path in [base / "state", *(base / "state").rglob("*")]:
+        os.chown(path, account.pw_uid, account.pw_gid)
+        path.chmod(0o700 if path.is_dir() else 0o600)
+    atomic_json(base / "receipt.json", receipt)
+    (base / "receipt.json").chmod(0o644)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--base", default="/Library/Application Support/ZakuraVerifier")
@@ -164,7 +177,6 @@ def main():
                        "bootstrap_height": height, "bootstrap_record": anchor,
                        "checkpoint_max": checkpoint, "snapshot": manifest,
                        "corpus": corpus, "deployed_at": time.time()}
-            atomic_json(base / "receipt.json", receipt)
         finally:
             node.terminate()
             try:
@@ -172,14 +184,7 @@ def main():
             except subprocess.TimeoutExpired:
                 node.kill()
                 node.wait()
-    archive.unlink()
-    if shutil.disk_usage(base).free < 50 * 10**9:
-        raise Unavailable("less than 50 GB free after cleanup")
-    account = pwd.getpwnam("_zakuraverifier")
-    for path in [base / "state", *(base / "state").rglob("*")]:
-        os.chown(path, account.pw_uid, account.pw_gid)
-        path.chmod(0o700 if path.is_dir() else 0o600)
-    (base / "receipt.json").chmod(0o644)
+    finalize_bootstrap(base, archive, receipt)
     print("Bootstrap anchored; continuous coverage starts at", height + 1)
 
 

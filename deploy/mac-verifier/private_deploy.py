@@ -168,7 +168,7 @@ sudo -n python3 {REMOTE}/tooling/install.py linux-activate
             linux.run(f"sudo -n python3 {REMOTE}/tooling/install.py linux-stop")
         else:
             # Public Actions output uses the same allowlist as the dashboard.
-            from dashboard import public_status
+            from status_bridge import public_status
             raw = linux.run("sudo -n cat /var/lib/zakura-mac-verifier/status.json")
             print(json.dumps(public_status(json.loads(raw), identifier)))
         print(identifier + ": " + args.command + " completed")

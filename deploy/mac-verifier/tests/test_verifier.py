@@ -14,6 +14,7 @@ import urllib.error
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from bootstrap import finalized_member, verify_manifest, finalize_bootstrap
 import install
+from alert_preflight import prepare as prepare_alerts
 from common import RPC, Unavailable, canonical_record
 from monitor import Monitor, Remote, Slack, ChannelWebhook
 from rotate_logs import rotate
@@ -162,7 +163,7 @@ class MonitorTests(unittest.TestCase):
         self.assertIn("coverage gap: rebootstrap required", self.monitor.state["incidents"])
         self.assertEqual(self.monitor.state["cursor"], 1020)
 
-    def test_unavailable_three_minutes_then_two_good_samples(self):
+    def test_unavailable_three_minutes_then_three_good_samples(self):
         with patch.object(self.mac, "status", side_effect=Unavailable("offline")):
             self.step(30)
             self.step(210)
@@ -170,6 +171,8 @@ class MonitorTests(unittest.TestCase):
         self.step(240)
         self.assertIn("verifier unavailable", self.monitor.state["incidents"])
         self.step(270)
+        self.assertIn("verifier unavailable", self.monitor.state["incidents"])
+        self.step(300)
         self.assertNotIn("verifier unavailable", self.monitor.state["incidents"])
 
     def test_gap_breaks_qualification_clock(self):
@@ -602,11 +605,13 @@ class GroupedChannelTests(unittest.TestCase):
         self.assertEqual(len(m.state["outbox"]), 1)
         m.incident("disk below 20 GB", False, 60)
         m.incident("disk below 20 GB", False, 90)
+        m.incident("disk below 20 GB", False, 120)
         m.channel_episode(90, {})
         self.assertEqual(len(m.state["outbox"]), 1)
         m.incident("memory pressure", False, 120)
         m.incident("memory pressure", False, 150)
-        m.channel_episode(150, {})
+        m.incident("memory pressure", False, 180)
+        m.channel_episode(180, {})
         self.assertEqual(len(m.state["outbox"]), 2)
         self.assertIn("recovered", m.state["outbox"][1]["text"])
 
@@ -635,7 +640,8 @@ class GroupedChannelTests(unittest.TestCase):
         self.assertEqual(len(m.state["outbox"]), 1)
         m.incident("coverage incomplete", False, 240)
         m.incident("coverage incomplete", False, 270)
-        m.channel_episode(270, {})
+        m.incident("coverage incomplete", False, 300)
+        m.channel_episode(300, {})
         self.assertEqual(len(m.state["outbox"]), 2)
 
     def test_episode_survives_restart_without_duplicate_page(self):
@@ -655,6 +661,88 @@ class GroupedChannelTests(unittest.TestCase):
         current = Monitor(self.temp.name, receipt(), Chain(), Mac(), self.monitor.slack)
         self.assertEqual(current.state["outbox"], [])
         self.assertIsNone(current.state["healthy_since"])
+
+
+class QuietEnablementTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.mac = Mac()
+        self.monitor = Monitor(self.temp.name, receipt(), Chain(), self.mac, observation_only=True)
+        for now in (30, 60, 90, 120, 150, 180):
+            self.mac.now = now
+            self.monitor.step(now)
+        anchor = {"height": 20, "hash": "a" * 64}
+        self.fleet = {"nodes": [{"name": "zakura-mac-os", "health": "healthy", "fork_anchor": anchor}]
+                      + [{"name": "other-" + str(n), "health": "healthy", "fork_anchor": anchor} for n in range(12)]}
+
+    def test_read_only_preflight_reports_zero_messages_without_network_or_mutation(self):
+        before = (Path(self.temp.name) / "cursor.json").read_bytes()
+        with patch("urllib.request.urlopen", side_effect=AssertionError("network forbidden")):
+            report = prepare_alerts(self.temp.name, receipt(), 181, self.fleet)
+        self.assertTrue(report["allowed_to_enable"])
+        self.assertEqual(report["pending_messages_on_enable"], 0)
+        self.assertEqual((Path(self.temp.name) / "cursor.json").read_bytes(), before)
+
+    def test_apply_archives_stale_messages_and_resets_window_without_delivery(self):
+        with patch("urllib.request.urlopen", side_effect=AssertionError("network forbidden")):
+            report = prepare_alerts(self.temp.name, receipt(), 181, self.fleet, apply=True)
+        state = json.loads((Path(self.temp.name) / "cursor.json").read_text())
+        self.assertGreater(report["historical_messages_to_archive"], 0)
+        self.assertEqual(state["outbox"], [])
+        self.assertIsNone(state["healthy_since"])
+        self.assertNotIn("alert delivery unavailable", state["incidents"])
+        self.assertTrue(list((Path(self.temp.name) / "incidents").glob("enablement-*.json")))
+
+    def test_stale_insufficient_samples_and_latched_incident_block_enablement(self):
+        for kind in ("stale", "samples", "incident", "overflow", "unknown queue"):
+            with self.subTest(kind=kind):
+                state = copy.deepcopy(self.monitor.state)
+                status_path = Path(self.temp.name) / "status.json"
+                status = json.loads(status_path.read_text())
+                if kind == "samples": status["enablement_good_samples"] = 4
+                if kind == "incident": state["incidents"]["confirmed tree state mismatch"] = {"latched": True}
+                if kind == "overflow": state["outbox_overflow"] = True
+                if kind == "unknown queue": state["outbox"].append({"text": "unknown", "id": "fixture"})
+                (Path(self.temp.name) / "cursor.json").write_text(json.dumps(state))
+                status_path.write_text(json.dumps(status))
+                with self.assertRaises(Unavailable):
+                    prepare_alerts(self.temp.name, receipt(), 241 if kind == "stale" else 181, self.fleet)
+                status_path.write_text(json.dumps({**status, "enablement_good_samples": 5}))
+
+    def test_missing_quorum_or_wrong_identity_blocks_enablement(self):
+        bad = copy.deepcopy(self.fleet)
+        for row in bad["nodes"][1:5]:row.pop("fork_anchor")
+        with self.assertRaises(Unavailable):
+            prepare_alerts(self.temp.name, receipt(), 181, bad)
+        wrong = receipt();wrong["config_sha256"] = "c" * 64
+        with self.assertRaises(Unavailable):
+            prepare_alerts(self.temp.name, wrong, 181, self.fleet)
+
+    def test_fleet_preflight_preserves_other_nodes_and_refuses_pending_batches(self):
+        path = Path(self.temp.name) / "fleet.json"
+        fleet_state = {"nodes": {"mainnet/zakura-mac-os": {"alerting": True}, "mainnet/other": {"alerting": True}},
+                       "mac_forks": {"mainnet": {"alerting": True}}, "pending_delivery": {"mainnet": {"messages": ["fixture"]}}}
+        path.write_text(json.dumps(fleet_state))
+        with self.assertRaises(Unavailable):
+            prepare_alerts(self.temp.name, receipt(), 181, self.fleet, True, path)
+        fleet_state["pending_delivery"] = {}
+        path.write_text(json.dumps(fleet_state))
+        prepare_alerts(self.temp.name, receipt(), 181, self.fleet, True, path)
+        current = json.loads(path.read_text())
+        self.assertEqual(current["nodes"], {"mainnet/other": {"alerting": True}})
+        self.assertEqual(current["mac_forks"], {})
+
+    def test_flap_gap_and_duplicate_samples_cannot_produce_recovery(self):
+        m = self.monitor
+        m.incident("fixture", True, 0)
+        for now in (30, 30, 60):m.incident("fixture", False, now)
+        self.assertIn("fixture", m.state["incidents"])
+        m.incident("fixture", True, 70)
+        for now in (90, 120, 240, 270):m.incident("fixture", False, now)
+        self.assertIn("fixture", m.state["incidents"])
+        m.incident("fixture", False, 300)
+        self.assertNotIn("fixture", m.state["incidents"])
 
 
 if __name__ == "__main__":

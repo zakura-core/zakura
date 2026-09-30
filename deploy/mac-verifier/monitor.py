@@ -181,9 +181,19 @@ class Monitor:
                     self.notify(f"Zakura Mac verifier: {name}")
             else:
                 item["good_samples"] = 0
+                item.pop("good_since", None)
+                item.pop("last_good_sample", None)
         elif item and not item["latched"]:
+            last = item.get("last_good_sample")
+            if last is not None and now <= last:
+                return
+            if last is not None and now - last > 90:
+                item["good_samples"] = 0
+                item.pop("good_since", None)
+            item.setdefault("good_since", now)
+            item["last_good_sample"] = now
             item["good_samples"] += 1
-            if item["good_samples"] >= 2:
+            if item["good_samples"] >= 3 and now - item["good_since"] >= 60:
                 del incidents[name]
                 if not self.grouped_channel:
                     self.notify(f"Zakura Mac verifier recovered: {name}")
@@ -363,6 +373,17 @@ class Monitor:
                 since = now
                 self.state["unavailable_since"] = since
             self.incident("verifier unavailable", now - since >= 180, now)
+        ready = (error is None and self.state["caught_up"] and not self.state["outbox_overflow"]
+                 and not (set(self.state["incidents"]) - {"alert delivery unavailable"}))
+        recent = self.state["last_sample"] is not None and 0 < now - self.state["last_sample"] <= 90
+        if ready:
+            if not recent or self.state.get("enablement_ready_since") is None:
+                self.state["enablement_ready_since"] = now
+                self.state["enablement_good_samples"] = 0
+            self.state["enablement_good_samples"] = self.state.get("enablement_good_samples", 0) + 1
+        else:
+            self.state["enablement_ready_since"] = None
+            self.state["enablement_good_samples"] = 0
         self.channel_episode(now, status)
         gap = self.state["last_sample"] is None or now - self.state["last_sample"] > 90
         healthy = (error is None and not self.state["incidents"] and self.state["caught_up"]
@@ -393,6 +414,8 @@ class Monitor:
             "incidents": self.state["incidents"], "error": error,
             "healthy_since": self.state["healthy_since"], "qualified": self.state["qualified"],
             "pending_alerts": len(self.state["outbox"]),
+            "enablement_ready_since": self.state.get("enablement_ready_since"),
+            "enablement_good_samples": self.state.get("enablement_good_samples", 0),
             "alert_overflow": self.state["outbox_overflow"],
         })
 

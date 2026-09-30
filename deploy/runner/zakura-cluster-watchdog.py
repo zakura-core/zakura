@@ -475,6 +475,21 @@ def slack_webhook_url() -> str:
     )
 
 
+def mac_recovery_ready(entry, now, good):
+    """Require three distinct fresh good samples spanning a minute."""
+    if not good:
+        entry.pop("mac_recovery", None)
+        return False
+    sample = entry.setdefault("mac_recovery", {"since": now, "last": now, "count": 0})
+    if now - sample["last"] > 90:
+        sample.update(since=now, count=0)
+    if sample["count"] and now <= sample["last"]:
+        return False
+    sample["last"] = now
+    sample["count"] += 1
+    return sample["count"] >= 3 and now - sample["since"] >= 60
+
+
 def post_slack(text: str, args: argparse.Namespace) -> bool:
     text = bounded_slack_message(text)
     webhook = slack_webhook_url()
@@ -1297,8 +1312,16 @@ class Watchdog:
         quorum = (7 * len(others) + 9) // 10
         agreed = next((value for value, count in groups.items() if count >= quorum), None)
         if agreed is None:
+            previous = state.get("mac_forks", {}).get(fleet.name, {})
+            mac_recovery_ready(previous, now, False)
             return
         bucket = state.setdefault("mac_forks", {})
+        previous = bucket.get(fleet.name, {})
+        if previous.get("alerting") and agreed == block_hash:
+            if not mac_recovery_ready(previous, now, True):
+                return
+        elif previous:
+            mac_recovery_ready(previous, now, False)
         update_alert_state(
             bucket, fleet.name, "fork" if agreed != block_hash else "ok", now, 0,
             f":rotating_light: *Zakura mainnet* - `zakura-mac-os` forked for more than 10 blocks\n"
@@ -1580,6 +1603,8 @@ class Watchdog:
     ) -> bool:
         bucket = state.setdefault("nodes", {})
         for observation in observations:
+            if observation.name == "zakura-mac-os":
+                continue
             key = f"{fleet.name}/{observation.name}"
             previous = dict(bucket.get(key, {}))
             if not previous.get("alerting"):
@@ -1897,6 +1922,12 @@ class Watchdog:
         key = f"{fleet.name}/{observation.name}"
         bucket = state.setdefault("nodes", {})
         previous = dict(bucket.get(key, {}))
+        if observation.name == "zakura-mac-os" and previous.get("alerting"):
+            good = observation.condition == "ok" and tip_is_verifiable(observation.row)
+            ready = mac_recovery_ready(previous, now, good)
+            bucket[key] = previous
+            if observation.condition == "ok" and not ready:
+                return
         previous_height = self.node_event_height(previous)
         same_stall_event = (
             observation.condition == "stalled"

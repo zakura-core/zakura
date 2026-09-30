@@ -2024,12 +2024,12 @@ class MacForkAlertTests(unittest.TestCase):
                     "fork_anchor": {"height": 110-depth, "hash": value * 64}}
         return [row("zakura-mac-os", "a")] + [row("other-%d" % i, "b" if i < agreeing else "a") for i in range(12)]
 
-    def check(self, rows, state=None, fleet="mainnet"):
+    def check(self, rows, state=None, fleet="mainnet", now=1000):
         state = {} if state is None else state
         agent = watchdog.Watchdog([], make_args())
         sent=[]
         agent.notify=lambda text,args:(sent.append(text),True)[1]
-        agent.handle_mac_fork(state,watchdog.Fleet(fleet,"http://localhost/data","https://status.mainnet.zakura.valargroup.dev/"),rows,1000,False)
+        agent.handle_mac_fork(state,watchdog.Fleet(fleet,"http://localhost/data","https://status.mainnet.zakura.valargroup.dev/"),rows,now,False)
         return state,sent
 
     def test_nine_of_twelve_and_eleven_divergent_blocks_alert_once_and_recover(self):
@@ -2038,6 +2038,10 @@ class MacForkAlertTests(unittest.TestCase):
         state,sent=self.check(self.rows(),state)
         self.assertEqual(sent,[])
         state,sent=self.check(self.rows(agreeing=0),state)
+        self.assertEqual(sent, [])
+        state,sent=self.check(self.rows(agreeing=0),state,now=1030)
+        self.assertEqual(sent, [])
+        state,sent=self.check(self.rows(agreeing=0),state,now=1060)
         self.assertEqual(len(sent),1)
         self.assertIn("recovered",sent[0])
 
@@ -2078,6 +2082,17 @@ class MacForkAlertTests(unittest.TestCase):
         self.assertEqual(send.call_count,1)
         self.assertTrue(state["mac_forks"]["mainnet"]["alerting"])
         self.assertNotIn("mainnet",state["pending_delivery"])
+
+    def test_recovery_hysteresis_resets_on_flap_or_sample_gap(self):
+        entry = {}
+        self.assertFalse(watchdog.mac_recovery_ready(entry, 0, True))
+        self.assertFalse(watchdog.mac_recovery_ready(entry, 30, True))
+        self.assertFalse(watchdog.mac_recovery_ready(entry, 40, False))
+        self.assertFalse(watchdog.mac_recovery_ready(entry, 60, True))
+        self.assertFalse(watchdog.mac_recovery_ready(entry, 200, True))
+        self.assertFalse(watchdog.mac_recovery_ready(entry, 230, True))
+        self.assertFalse(watchdog.mac_recovery_ready(entry, 230, True))
+        self.assertTrue(watchdog.mac_recovery_ready(entry, 260, True))
 
     def test_mute_suppresses_mac_forks_without_altering_state(self):
         with patch.dict(watchdog.os.environ, {"MAC_VERIFIER_ALERTS_MUTED": "1"}):

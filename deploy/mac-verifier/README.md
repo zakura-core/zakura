@@ -329,3 +329,24 @@ service to exclude Mac notifications while retaining other nodes' alerting. Run
 The node and comparison continue; observation mode cannot qualify. Re-enable
 only after explicit operator authorization; do not treat a code deployment as
 permission to remove the mute.
+
+## Quiet re-enable preflight
+
+Keep alerts muted while qualifying with fixtures and observing live samples.
+`alert_preflight.py` never contacts Slack. It requires five fresh healthy samples
+spanning two minutes, complete coverage, matching receipt identity, no actionable
+incident or overflow, and a matching fleet quorum. It reports zero pending
+messages on enablement; unknown queued messages block activation.
+
+Stop the comparator, then run `alert_preflight.py --apply` as its service user.
+This archives known historical notifications privately before clearing their
+queue and resets qualification to a new baseline. Re-run if the sample became
+stale; a failed check keeps alerts muted. After successful preflight, activate
+channel mode and remove only the Mac watchdog mute. Reconcile old Mac watchdog
+alert state against the healthy fleet sample before restart, preserving all
+other nodes' state. Recovery requires three consecutive good samples spanning
+at least one minute; bad or missing evidence resets that sequence.
+
+Notification qualification uses a fake delivery sink and isolated state, with
+network delivery blocked. It is separate from the subsequent 24 healthy hours
+and 100 newly compared blocks with live delivery enabled.

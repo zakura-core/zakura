@@ -1,0 +1,15 @@
+{
+  "source_sha": "af944f5194ef2e9921bc96af017629450375013c",
+  "toolchain": "1.97.1",
+  "crate": "zakura-consensus",
+  "tests": [
+    "block::tests::difficulty_validation_failure",
+    "block::tests::coinbase_validation_failure",
+    "block::tests::funding_stream_validation_failure",
+    "block::tests::miner_fees_validation_failure",
+    "block::tests::missing_input_requires_committed_parent_evidence",
+    "block::tests::prepared_mined_commit_rechecks_equihash",
+    "block::tests::prepared_mined_commit_rechecks_header_time",
+    "primitives::halo2::tests::pre_nu6_2_proof_only_verifies_under_pre_nu6_2_key"
+  ]
+}

@@ -44,6 +44,20 @@ zcashd assigns tie priority only once the block and its ancestor data are
 available. Zakura uses the tip's full-block verifier receipt instead. Reconsidering
 this policy is tracked separately in [#1127](https://github.com/zakura-core/zakura/issues/1127).
 
+## Operator preference
+
+The admin `preciousblock` RPC treats a chain tip as if it were received before
+every other tip with equal work, like Bitcoin Core's method of the same name. It
+ranks above receipt order, and a later call overrides an earlier one. Greater
+work still wins, so a block with less work than the best tip is left unchanged.
+The preference belongs to the tip: descendants do not inherit it, and it applies
+again if invalidation reverts the chain to that tip. When the best tip changes,
+the writer publishes the new tip as a verified chain reset, and operator
+invalidation and reconsideration keep it through the full-state verified tip.
+
+The preference is local. It is not stored in backups, so it does not survive a
+restart, and trusted secondaries do not receive it.
+
 ## Header sync
 
 The header engine still uses greatest work and raw hash to select downloads.

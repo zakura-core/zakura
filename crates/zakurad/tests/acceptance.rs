@@ -172,7 +172,7 @@ use zakura_node_services::rpc_client::RpcRequestClient;
 use zakura_rpc::client::GetBlockHashResponse;
 use zakura_rpc::{
     client::{
-        BlockTemplateResponse, DefaultRoots, GetBlockTemplateParameters,
+        BlockTemplateResponse, BlockTemplateTimeSource, DefaultRoots, GetBlockTemplateParameters,
         GetBlockTemplateRequestMode, GetBlockTemplateResponse, SubmitBlockErrorResponse,
         SubmitBlockResponse, TransactionTemplate,
     },
@@ -4243,6 +4243,68 @@ async fn invalidate_and_reconsider_block() -> Result<()> {
     // Make sure the command was killed
     output.assert_was_killed()?;
 
+    output.assert_failure()?;
+
+    Ok(())
+}
+
+/// `preciousblock` switches the best tip between equal-work siblings, and rejects unknown hashes.
+#[tokio::test(flavor = "multi_thread")]
+async fn precious_block_prefers_equal_work_siblings() -> Result<()> {
+    use common::regtest::MiningRpcMethods;
+
+    let _init_guard = zakura_test::init();
+    let net = Network::new_regtest(Default::default());
+    let mut config = os_assigned_rpc_port_config(false, &net)?;
+    config.mempool.debug_enable_at_height = Some(0);
+    let test_dir = testdir()?.with_config(&mut config)?;
+
+    let mut child = test_dir
+        .spawn_child(args!["start"])?
+        .with_timeout(EXTENDED_LAUNCH_DELAY);
+    let rpc_address = read_listen_addr_from_logs(&mut child, OPENED_RPC_ENDPOINT_MSG)?;
+    child.expect_stdout_line_matches("activating mempool")?;
+    let rpc_client = RpcRequestClient::new(rpc_address);
+    rpc_client.generate(2).await?;
+
+    // Two blocks from one template differ only in their header time, so they have equal work.
+    let template: BlockTemplateResponse = rpc_client
+        .json_result_from_call("getblocktemplate", "[]".to_string())
+        .await
+        .map_err(|err| eyre!(err))?;
+    let first = proposal_block_from_template(&template, BlockTemplateTimeSource::MinTime, &net)?;
+    let second = proposal_block_from_template(&template, BlockTemplateTimeSource::MaxTime, &net)?;
+    assert_ne!(first.hash(), second.hash());
+    rpc_client.submit_block(first.clone()).await?;
+    rpc_client.submit_block(second.clone()).await?;
+
+    let best_block_hash = || async {
+        rpc_client
+            .json_result_from_call::<String>("getbestblockhash", "[]")
+            .await
+            .map_err(|err| eyre!(err))
+    };
+    assert_eq!(best_block_hash().await?, first.hash().to_string());
+
+    for preferred in [&second, &first] {
+        let params = serde_json::to_string(&[preferred.hash().to_string()])?;
+        let _: () = rpc_client
+            .json_result_from_call("preciousblock", &params)
+            .await
+            .map_err(|err| eyre!(err))?;
+        assert_eq!(best_block_hash().await?, preferred.hash().to_string());
+    }
+
+    let unknown = serde_json::to_string(&[block::Hash([0x11; 32]).to_string()])?;
+    let error = rpc_client
+        .json_result_from_call::<()>("preciousblock", &unknown)
+        .await
+        .expect_err("an unknown block hash is rejected");
+    assert!(error.to_string().contains("Block not found"), "{error}");
+
+    child.kill(false)?;
+    let output = child.wait_with_output()?;
+    output.assert_was_killed()?;
     output.assert_failure()?;
 
     Ok(())

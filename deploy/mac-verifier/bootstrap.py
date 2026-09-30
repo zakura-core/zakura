@@ -127,7 +127,7 @@ def main():
         raise Unavailable("snapshot size/checksum mismatch")
     restore(archive, base)
     result = subprocess.check_output([str(base / "bin/zakurad"), "-c", str(base / "zakurad.toml"),
-                                      "tip-height", "--cache-dir", str(base / "state"),
+                                      "tip-height", "--cache-dir", str(base),
                                       "--network", "Mainnet"], text=True, timeout=120)
     numeric = [line for line in result.splitlines() if re.fullmatch(r"[0-9]+", line)]
     if len(numeric) != 1:

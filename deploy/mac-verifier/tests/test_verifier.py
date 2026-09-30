@@ -6,6 +6,7 @@ from pathlib import Path
 import sys
 import tarfile
 import tempfile
+import tomllib
 import unittest
 from unittest.mock import patch
 import urllib.error
@@ -283,6 +284,14 @@ class BoundaryTests(unittest.TestCase):
             self.assertEqual(target.read_text(), "replacement script")
             self.assertEqual(target.stat().st_mode & 0o777, 0o600)
             self.assertEqual(list(Path(directory).glob("script with spaces.sh.*")), [])
+
+    def test_config_cache_root_matches_finalized_snapshot_layout(self):
+        package = Path(__file__).resolve().parents[1]
+        config = tomllib.loads((package / "templates/zakurad.toml").read_text())
+        member = tarfile.TarInfo("cache/state/v29/mainnet/CURRENT")
+        restored = finalized_member(member)
+        self.assertEqual(Path(config["state"]["cache_dir"]) / restored,
+                         Path("/Library/Application Support/ZakuraVerifier/state/v29/mainnet/CURRENT"))
 
     def test_missing_pool_and_malformed_hex(self):
         value = record(10)

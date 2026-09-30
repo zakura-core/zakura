@@ -38,6 +38,7 @@ jobs:
         with:
           persist-credentials: false
       - run: python3 -m unittest discover -s deploy/mac-verifier/tests -v
+      - run: python3 -m unittest discover -s deploy/mac-verifier/cranelift -p 'test_*.py' -v
       - run: python3 deploy/runner/test_zakura_cluster_status.py
       - run: python3 deploy/runner/test_zakura_cluster_watchdog.py
       - run: bash -n deploy/mac-verifier/build.sh

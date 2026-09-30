@@ -350,3 +350,11 @@ at least one minute; bad or missing evidence resets that sequence.
 Notification qualification uses a fake delivery sink and isolated state, with
 network delivery blocked. It is separate from the subsequent 24 healthy hours
 and 100 newly compared blocks with live delivery enabled.
+
+## Alternate Rust code generation
+
+The optional [Cranelift profile](cranelift/README.md) records the pinned backend
+patch, static standard-library recipe, acceptance cases and explicit binary
+transition requirements. It does not change the default builder or notification
+policy. Compiler runtime observation while notifications are muted remains
+separate from the monitor's full operational qualification.

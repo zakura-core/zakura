@@ -188,7 +188,6 @@ const TEST_ONLY_MAINNET_NU7: u32 = 3_543_000;
 /// A configured Testnet with Mainnet's activation schedule and synthetic P2SH
 /// grants recipients. The separate Mainnet constants test checks the real ZIP
 /// 2008 P2PKH recipient, which configured Testnets cannot accept.
-#[cfg(not(zakura_test_mainnet_nu7))]
 fn test_only_mainnet_schedule_with_stream() -> (Network, Vec<transparent::Address>) {
     use zakura_chain::parameters::testnet::{
         ConfiguredActivationHeights, ConfiguredFundingStreamRecipient, ConfiguredFundingStreams,
@@ -236,33 +235,12 @@ fn test_only_mainnet_coinbase_boundaries_match_fixed_oracle() -> Result<(), Repo
     const OLD_END: u32 = 4_406_400;
     const MOVED_END: u32 = 6_133_200;
 
-    #[cfg(not(zakura_test_mainnet_nu7))]
     let (network, addresses) = test_only_mainnet_schedule_with_stream();
-    #[cfg(zakura_test_mainnet_nu7)]
-    let (network, addresses) = {
-        let network = Network::Mainnet;
-        assert_eq!(
-            Nu7.activation_height(&network),
-            Some(Height(TEST_ONLY_MAINNET_NU7))
-        );
-        assert_eq!(network.kind(), NetworkKind::Mainnet);
-        let addresses = network.all_funding_streams()[2]
-            .recipient(FundingStreamReceiver::MajorGrants)
-            .expect("the built-in H3 stream pays FPF")
-            .addresses()
-            .to_vec();
-        assert_eq!(addresses.len(), 36);
-        assert_eq!(
-            addresses[11].to_string(),
-            "t3cFfPt1Bcvgez9ZbMBFWeZsskxTkPzGCow"
-        );
-        assert_eq!(
-            addresses[12].to_string(),
-            "t1MkHnkxVjNpNbCrSs3AJ8J7ZSp6NTYiUcG"
-        );
-        assert!(!addresses[12].is_script_hash());
-        (network, addresses)
-    };
+    assert_eq!(Nu7.activation_height(&Network::Mainnet), None);
+    assert_eq!(
+        Nu7.activation_height(&network),
+        Some(Height(TEST_ONLY_MAINNET_NU7))
+    );
     let output = |value: i64, script: transparent::Script| transparent::Output {
         value: Amount::try_from(value).expect("oracle amount is valid"),
         lock_script: script,

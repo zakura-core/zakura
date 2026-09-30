@@ -12,10 +12,6 @@
 // into type aliases would not make the code clearer.
 #![allow(clippy::type_complexity)]
 
-// A release library must never carry the hypothetical Mainnet activation.
-#[cfg(all(zakura_test_mainnet_nu7, not(debug_assertions)))]
-compile_error!("the test-only Mainnet NU7 activation cannot be built in a release profile");
-
 #[macro_use]
 extern crate bitflags;
 

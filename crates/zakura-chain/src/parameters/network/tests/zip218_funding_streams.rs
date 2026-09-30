@@ -26,7 +26,6 @@ use crate::{
     },
 };
 
-#[cfg(not(zakura_test_mainnet_nu7))]
 use crate::{parameters::NetworkKind, transparent::Address};
 
 /// Test-only Mainnet NU7 activation height, projected for November 5, 2026.
@@ -43,7 +42,8 @@ const MAINNET_THIRD_HALVING: u32 = 4_406_400;
 /// The Testnet third halving before ZIP 218.
 const TESTNET_THIRD_HALVING: u32 = 4_476_000;
 
-/// The index of the ZIP 214 Revision 2 funding streams in the built-in lists.
+/// ZIP 214 Revision 2's funding stream index in the built-in lists.
+/// "Revision 2" names the ZIP 214 stream rules, not a revision of Mainnet.
 const REVISION_2: usize = 2;
 
 /// Returns a configured network with the Mainnet activation heights and NU7 at `nu7`.
@@ -62,10 +62,9 @@ fn mainnet_with_nu7(nu7: Option<u32>) -> Network {
         .expect("configured network is valid")
 }
 
-/// A configured Testnet with Mainnet's activation schedule and a synthetic P2SH
-/// Revision 2 stream. Configured Testnets reject the actual Mainnet P2PKH ZIP 2008
-/// address, so this fixture checks the Mainnet amounts and periods, not its scripts.
-#[cfg(not(zakura_test_mainnet_nu7))]
+/// An explicit configured Testnet with Mainnet's activation schedule and a synthetic P2SH
+/// Revision 2 stream. This does not change `Network::Mainnet`: configured Testnets reject
+/// the actual Mainnet P2PKH ZIP 2008 address, which is checked separately.
 fn test_only_mainnet_schedule_with_stream() -> Network {
     let mut activation_heights: testnet::ConfiguredActivationHeights =
         Network::Mainnet.activation_list().into();
@@ -107,18 +106,16 @@ fn test_only_mainnet_nu7_boundaries_match_fixed_oracle() {
     const OLD_END: u32 = 4_406_400;
     const MOVED_END: u32 = 6_133_200;
 
-    #[cfg(not(zakura_test_mainnet_nu7))]
     let network = test_only_mainnet_schedule_with_stream();
-    #[cfg(zakura_test_mainnet_nu7)]
-    let network = {
-        let network = Network::Mainnet;
-        assert_eq!(
-            crate::parameters::NetworkUpgrade::Nu7.activation_height(&network),
-            Some(Height(ACTIVATION)),
-        );
-        assert_eq!(network.kind(), crate::parameters::NetworkKind::Mainnet);
-        network
-    };
+    assert_eq!(
+        crate::parameters::NetworkUpgrade::Nu7.activation_height(&Network::Mainnet),
+        None,
+        "the hypothetical height must not modify built-in Mainnet",
+    );
+    assert_eq!(
+        crate::parameters::NetworkUpgrade::Nu7.activation_height(&network),
+        Some(Height(ACTIVATION)),
+    );
     let stream = network.funding_streams(Height(STREAM_START)).unwrap();
     assert_eq!(
         stream.height_range(),
@@ -139,22 +136,6 @@ fn test_only_mainnet_nu7_boundaries_match_fixed_oracle() {
             .numerator(),
         12
     );
-    #[cfg(zakura_test_mainnet_nu7)]
-    {
-        let addresses = stream
-            .recipient(FundingStreamReceiver::MajorGrants)
-            .unwrap()
-            .addresses();
-        assert_eq!(
-            addresses[11].to_string(),
-            "t3cFfPt1Bcvgez9ZbMBFWeZsskxTkPzGCow"
-        );
-        assert_eq!(
-            addresses[12].to_string(),
-            "t1MkHnkxVjNpNbCrSs3AJ8J7ZSp6NTYiUcG"
-        );
-        assert!(!addresses[12].is_script_hash());
-    }
 
     // ZIP 218 keeps the current address period at activation, moves the next
     // rotation, and leaves the old end inside the funding stream.

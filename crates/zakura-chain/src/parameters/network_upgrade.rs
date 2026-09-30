@@ -116,11 +116,6 @@ pub(super) const MAINNET_ACTIVATION_HEIGHTS: &[(block::Height, NetworkUpgrade)] 
         (NU6_1, Nu6_1),
         (NU6_2, Nu6_2),
         (NU6_3, Nu6_3),
-        // Test-only projection for November 5, 2026. Requires an explicit
-        // compiler flag; standard release and node builds reject that flag.
-        // TODO(zip-259): replace this fixture and revalidate every boundary.
-        #[cfg(zakura_test_mainnet_nu7)]
-        (block::Height(3_543_000), Nu7),
     ]
 };
 /// Testnet network upgrade activation heights.

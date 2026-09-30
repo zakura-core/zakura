@@ -74,7 +74,7 @@ features = [
 
 [features]
 # In release builds, don't compile debug logging code, to improve performance.
-default-release-binaries = ["release_max_level_info", "progress-bar", "prometheus", "sentry", "opentelemetry"]
+default-release-binaries = ["release_max_level_info", "progress-bar", "prometheus", "opentelemetry"]
 
 
 # Local builds use the compiler's target features for Pasta arithmetic.
@@ -104,6 +104,7 @@ internal-miner = [
 ]
 
 # Tracing and monitoring
+# Opt in explicitly: the tracing layer has overhead even without a SENTRY_DSN.
 sentry = ["dep:sentry"]
 journald = ["tracing-journald"]
 filter-reload = []

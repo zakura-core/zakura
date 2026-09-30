@@ -496,6 +496,9 @@ impl PeerRoutine {
             Notified::enable(available.as_mut());
             Notified::enable(floor_ranking.as_mut());
 
+            // Check before the biased receive arm so incoming traffic cannot
+            // keep abandoned authorization alive indefinitely.
+            self.check_request_liveness(Instant::now())?;
             self.flush_pending_status();
             let retry_filter_deadline = if self.session.outbound_capacity() > 0 {
                 self.try_fill().await
@@ -862,6 +865,9 @@ impl PeerRoutine {
         let earliest = [
             earliest_deadline,
             liveness_deadline,
+            self.requester.as_ref().and_then(|requester| {
+                requester.retirement_deadline(self.config.effective_liveness_timeout())
+            }),
             local_retry_avoid,
             floor_watchdog_avoid,
             body_retry_avoid,
@@ -944,7 +950,9 @@ impl PeerRoutine {
             let authorization = if let Some(requester) = &self.requester {
                 // Count unanswered exchanges, including scheduler-abandoned work.
                 // The peer's u32 advertised limit fits usize on supported targets.
-                if requester.len() >= self.window.max_inflight_requests as usize {
+                if requester.at_capacity()
+                    || requester.len() >= self.window.max_inflight_requests as usize
+                {
                     break FillStop::CwndSaturated;
                 }
                 let Some(entry) = requester.pool.try_entry() else {
@@ -1118,7 +1126,7 @@ impl PeerRoutine {
                     !self
                         .requester
                         .as_ref()
-                        .is_some_and(|requester| requester.contains_height(*height))
+                        .is_some_and(|requester| requester.blocks_retry(*height))
                         && !self.retry_avoid.contains_key(height)
                         && !self
                             .registry
@@ -1464,7 +1472,15 @@ impl PeerRoutine {
 
     // ===================== own-timeout arm (ports `expire_due_timeouts`) =====
 
+    fn check_request_liveness(&self, now: Instant) -> Result<(), SinkReject> {
+        if let Some(requester) = &self.requester {
+            requester.check_liveness(now, self.config.effective_liveness_timeout())?;
+        }
+        Ok(())
+    }
+
     async fn handle_deadlines(&mut self, now: Instant) -> Result<(), SinkReject> {
+        self.check_request_liveness(now)?;
         let rescued_timed_out = self.expire_due_timeouts(now);
         if rescued_timed_out && self.session.outbound_capacity() > 0 {
             let _ = self.try_fill().await;

@@ -238,6 +238,12 @@ pub fn spawn_block_sync_reactor(
     // The shared download primitives every pipe-routine is wired with at spawn
     // (`service::add_peer`), carried through the handle.
     let routine_wiring = RoutineWiring {
+        // Preserve one full protocol window while bounding authorization state
+        // across every active and draining session. The count fits usize.
+        request_pool: crate::zakura::regulation::ReservationPool::new(
+            MAX_BS_INFLIGHT_REQUESTS as usize,
+        )
+        .expect("the protocol request ceiling is positive and representable"),
         serving: startup.range_source.clone().map(|source| {
             Arc::new(super::regulated::session::Serving::new(
                 source,

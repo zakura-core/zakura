@@ -2,6 +2,8 @@
 //!
 //! Zakura uses a 400-zatoshi marginal fee for mempool and block production
 //! policy, rather than ZIP-317's 5,000-zatoshi conventional fee.
+//!
+//! [ZIP-317]: https://zips.z.cash/zip-0317
 
 use std::cmp::max;
 

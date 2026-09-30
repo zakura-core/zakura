@@ -72,7 +72,7 @@ fn selects_transaction_at_400_zatoshis_per_action() {
         .next()
         .expect("test network has an unmined transaction")
         .transaction;
-    let actions = transaction::zip317::conventional_actions(&unmined_tx.transaction);
+    let actions = transaction::zip317::conventional_actions(unmined_tx.transaction());
     let miner_fee = Amount::try_from(i64::from(actions) * 400).expect("fee fits in amount");
     let verified_tx = transaction::VerifiedUnminedTx::new(
         unmined_tx,

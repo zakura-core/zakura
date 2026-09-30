@@ -194,7 +194,7 @@ impl Drop for Commitment {
     fn drop(&mut self) {
         self.0.open.fetch_sub(1, Ordering::AcqRel);
         if let Some(completed) = &self.1 {
-            completed.send_replace(true);
+            completed.send_if_modified(|done| !std::mem::replace(done, true));
         }
     }
 }

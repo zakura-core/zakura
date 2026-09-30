@@ -680,7 +680,7 @@ if [ "$no_crates" = 0 ]; then
   )
 fi
 
-# The workflow projects the release height from a fresh, digest-verified
+# The workflow projects the release height from a digest-verified
 # release-state bundle. Local callers retain the committed checkpoint plus
 # three days as a fail-safe floor.
 eos_file="crates/zakurad/src/components/sync/end_of_support.rs"
@@ -709,7 +709,7 @@ eos_basis="committed checkpoint ${committed_height} + 3456"
 if [ -n "$estimated_release_height" ] \
   && [ "$estimated_release_height" -gt "$eos_target" ]; then
   eos_target="$estimated_release_height"
-  eos_basis="fresh verified release-state projection"
+  eos_basis="verified release-state projection"
 fi
 eos_floored=0
 [ "$eos_old" -lt "$eos_target" ] && eos_floored=1

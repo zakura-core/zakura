@@ -41,6 +41,5 @@ jobs:
           MAC_VERIFIER_REFERENCE_SSH_KEY: ${{ secrets.MAC_VERIFIER_REFERENCE_SSH_KEY }}
           MAC_VERIFIER_REFERENCE_KNOWN_HOSTS: ${{ secrets.MAC_VERIFIER_REFERENCE_KNOWN_HOSTS }}
           MAC_VERIFIER_TUNNEL_KEY: ${{ secrets.MAC_VERIFIER_TUNNEL_KEY }}
-          MAC_VERIFIER_MONITOR_IDENTITY_JSON: ${{ secrets.MAC_VERIFIER_MONITOR_IDENTITY_JSON }}
           MAC_VERIFIER_ID: ${{ secrets.MAC_VERIFIER_ID }}
         run: python3 deploy/mac-verifier/private_deploy.py "$OPERATION"

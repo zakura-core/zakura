@@ -38,11 +38,11 @@ before setting their secrets; do not copy credentials from other projects:
 | `/mac-verifier/tunnel` | Dedicated Mac forwarding private key | Operator only |
 | `/mac-verifier/monitor` | `MAC_VERIFIER_SLACK_BOT_TOKEN` | Dedicated monitor identity, read only |
 
-Use `slack-app-manifest.json` to create a dedicated Slack bot with `im:write` and `chat:write` in workspace
+For the optional dedicated DM mode, use `slack-app-manifest.json` to create a dedicated Slack bot with `im:write` and `chat:write` in workspace
 `T0A80TZAXK5`. Alerts target Roman `U0A81KAPYMR`; workspace identity and DM channel
 are checked before sending. Never deploy an existing broadly scoped operator bot.
 
-Use a dedicated Infisical Universal Auth identity restricted to read secrets in
+For DM mode, use a dedicated Infisical Universal Auth identity restricted to read secrets in
 `prod:/mac-verifier/monitor`. On DO install its client ID/secret as JSON with
 keys `client_id` and `client_secret`, root-owned mode `0600`, at
 `/etc/zakura-mac-verifier/identity.json`. Systemd `LoadCredential` delivers it
@@ -109,7 +109,8 @@ services. `stop` stops only the verifier services; it never destroys the private
 If dedicated alert credentials are not yet available, `install.py linux-observe`
 starts continuous comparison and the existing dashboard with an explicit alert
 delivery incident. This mode cannot qualify or start the healthy observation
-window. After installing the scoped identity, `linux-activate` removes the
+window. Channel activation uses the existing fleet webhook. Optional DM activation uses
+the scoped identity. `linux-activate` removes the
 observation override and restarts the comparator with Slack delivery enabled.
 Provision tooling first; obtain the private IP only after review and checks.
 
@@ -253,7 +254,7 @@ After deployment, exercise and record:
 2. Reverse tunnel outage and automatic reconnection.
 3. Comparator restart with unchanged durable cursor.
 4. Controlled Mac reboot after confirming unrelated workloads allow it; verify node, adapter, and tunnel recover without login.
-5. Real Slack incident and recovery DMs; invalid-token/rate-limit behavior remains
+5. Real Slack incident and recovery channel messages; invalid-token/rate-limit behavior remains
    covered by isolated tests rather than modifying production credentials.
 6. Divergence through isolated fixtures, preserving live databases.
 
@@ -297,3 +298,19 @@ so they stay stopped after reboot. `mac-activate` explicitly enables them again.
 Bootstrap publishes its activation receipt only after cleanup, disk headroom and
 state ownership checks succeed. Failed imports require operator inspection; they
 are never automatically overwritten.
+
+## Comparator alerts through the existing channel
+
+The default private-host activation reuses the existing `#zakura-alerts` webhook
+from the root-private `/etc/zakura-fleet-watchdog/env`. It materializes only that
+secret into a root-owned mode 0600 verifier credential. Systemd `LoadCredential`
+delivers it to the unprivileged comparator; endpoints and credential values are
+never emitted. The existing Infisical-backed fleet credential remains the source
+of truth. No new bot or Universal Auth identity is required for channel mode.
+
+For an existing installation run `install.py linux-activate --alert-webhook-env
+/etc/zakura-fleet-watchdog/env` as root. This removes observation mode, enables
+actual transition delivery and permits qualification after its durable queue has
+drained. The optional dedicated DM setup above remains available to operators.
+Webhook retries are bounded and persistent queue IDs prevent repeat transitions;
+ambiguous network failures can still produce duplicate Slack messages.

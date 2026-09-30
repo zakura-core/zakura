@@ -9,6 +9,8 @@ import os
 from pathlib import Path
 import time
 import urllib.error
+import urllib.request
+import urllib.parse
 import uuid
 
 from common import (RPC, Transport, Unavailable, atomic_json, canonical_record,
@@ -72,6 +74,39 @@ class Slack:
                 delay = 60
             self.retry_at = now + min(3600, max(30, delay))
         except (Unavailable, KeyError, TypeError):
+            self.retry_at = now + 60
+        return False
+
+
+class ChannelWebhook:
+    """Deliver comparator transitions through the existing fleet channel webhook."""
+    def __init__(self, url):
+        parsed = urllib.parse.urlsplit(url)
+        if (parsed.scheme != "https" or parsed.hostname != "hooks.slack.com"
+                or parsed.username or parsed.password or not parsed.path.startswith("/services/")):
+            raise ValueError("invalid channel webhook")
+        self.url = url
+        self.retry_at = 0
+
+    def send(self, item, now):
+        if now < self.retry_at:
+            return False
+        request = urllib.request.Request(self.url, json.dumps({"text": item["text"],
+            "unfurl_links": False, "unfurl_media": False}).encode(),
+            {"Content-Type": "application/json"}, method="POST")
+        try:
+            with urllib.request.urlopen(request, timeout=10) as response:
+                if response.read(32).strip() != b"ok":
+                    raise Unavailable("channel delivery rejected")
+            self.retry_at = 0
+            return True
+        except urllib.error.HTTPError as error:
+            try:
+                delay = int(error.headers.get("Retry-After", "60"))
+            except (TypeError, ValueError):
+                delay = 60
+            self.retry_at = now + min(3600, max(30, delay))
+        except (OSError, Unavailable):
             self.retry_at = now + 60
         return False
 
@@ -300,6 +335,7 @@ class Monitor:
         self.save()
         if self.slack and self.state["outbox"]:
             if self.slack.send(self.state["outbox"][0], now):
+                self.audit({"event": "notification delivered", "id": self.state["outbox"][0]["id"], "time": now})
                 self.state["outbox"].pop(0)
                 self.save()
         atomic_json(self.directory / "status.json", {
@@ -323,7 +359,7 @@ def exclusive(directory):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("command", choices=["run", "observe", "once", "status", "ack"])
+    parser.add_argument("command", choices=["run", "channel", "observe", "once", "status", "ack"])
     parser.add_argument("--directory", default="/var/lib/zakura-mac-verifier")
     parser.add_argument("--receipt", default="/etc/zakura-mac-verifier/receipt.json")
     parser.add_argument("--incident")
@@ -335,6 +371,8 @@ def main():
         slack = None
         if args.command == "run":
             slack = Slack(os.environ["MAC_VERIFIER_SLACK_BOT_TOKEN"], "U0A81KAPYMR", "T0A80TZAXK5")
+        elif args.command == "channel":
+            slack = ChannelWebhook((Path(os.environ["CREDENTIALS_DIRECTORY"]) / "slack-webhook").read_text().strip())
         monitor = Monitor(args.directory, read_json(args.receipt), slack=slack,
                           observation_only=args.command == "observe")
         if args.command == "ack":

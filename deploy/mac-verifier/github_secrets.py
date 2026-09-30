@@ -65,7 +65,6 @@ def main():
         return
     # Fetch all values before mutating GitHub; an incomplete vault fails closed.
     values = {key: get(key) for key in KEYS}
-    values["MAC_VERIFIER_MONITOR_IDENTITY_JSON"] = get("MAC_VERIFIER_MONITOR_IDENTITY_JSON", "/mac-verifier")
     result = subprocess.run(["gh", "api", "--method", "PUT", f"repos/{REPO}/environments/{ENVIRONMENT}"],
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60)
     if result.returncode:

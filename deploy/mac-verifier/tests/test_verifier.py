@@ -8,14 +8,14 @@ import tarfile
 import tempfile
 import tomllib
 import unittest
-from unittest.mock import patch
+from unittest.mock import patch, MagicMock
 import urllib.error
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from bootstrap import finalized_member, verify_manifest, finalize_bootstrap
 import install
 from common import RPC, Unavailable, canonical_record
-from monitor import Monitor, Remote, Slack
+from monitor import Monitor, Remote, Slack, ChannelWebhook
 from rotate_logs import rotate
 import identity
 from status_bridge import public_status
@@ -519,6 +519,56 @@ class LifecycleTests(unittest.TestCase):
             install.copy_package(target)
             self.assertFalse((target / "dashboard.py").exists())
             self.assertTrue((target / "status_bridge.py").exists())
+
+
+class ChannelDeliveryTests(unittest.TestCase):
+    def client(self):
+        return ChannelWebhook("https://hooks.slack.com/services/fixture")
+
+    def test_success_requires_slack_acknowledgement(self):
+        client = self.client()
+        response = MagicMock()
+        response.__enter__.return_value.read.return_value = b"ok"
+        with patch("monitor.urllib.request.urlopen", return_value=response) as send:
+            self.assertTrue(client.send({"id": "fixture", "text": "qualification fixture"}, 30))
+            self.assertEqual(send.call_args.kwargs["timeout"], 10)
+        response.__enter__.return_value.read.return_value = b"rejected"
+        with patch("monitor.urllib.request.urlopen", return_value=response):
+            self.assertFalse(client.send({"text": "fixture"}, 60))
+            self.assertEqual(client.retry_at, 120)
+
+    def test_rate_limit_and_retry_are_bounded(self):
+        client = self.client()
+        error = urllib.error.HTTPError("fixture", 429, "rate limited", {"Retry-After": "9000"}, None)
+        with patch("monitor.urllib.request.urlopen", side_effect=error) as send:
+            self.assertFalse(client.send({"text": "fixture"}, 30))
+            self.assertEqual(client.retry_at, 3630)
+            self.assertFalse(client.send({"text": "fixture"}, 60))
+            self.assertEqual(send.call_count, 1)
+
+    def test_network_failure_remains_pending(self):
+        client = self.client()
+        with patch("monitor.urllib.request.urlopen", side_effect=OSError("fixture")):
+            self.assertFalse(client.send({"text": "fixture"}, 30))
+        self.assertEqual(client.retry_at, 90)
+
+    def test_rejects_untrusted_destinations(self):
+        for url in ("http://hooks.slack.com/services/fixture", "https://example.com/services/fixture", "https://user@hooks.slack.com/services/fixture"):
+            with self.subTest(url=url), self.assertRaises(ValueError):
+                ChannelWebhook(url)
+
+    def test_channel_configuration_exposes_only_webhook_credential(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "env"
+            source.write_text('SLACK_WEB_HOOK="https://hooks.slack.com/services/fixture"\nOTHER_SECRET=fixture\n')
+            source.chmod(0o600)
+            stat = type("Stat", (), {"st_uid": 0, "st_mode": 0o600})()
+            with patch.object(Path, "stat", return_value=stat), patch.object(install, "write") as write:
+                install.configure_channel_alerts(source)
+            self.assertEqual(write.call_args_list[0].args[1], "https://hooks.slack.com/services/fixture\n")
+            self.assertNotIn("OTHER_SECRET", str(write.call_args_list))
+            self.assertIn("monitor.py channel", write.call_args_list[1].args[1])
+            self.assertEqual(write.call_args_list[0].args[2], 0o600)
 
 
 if __name__ == "__main__":

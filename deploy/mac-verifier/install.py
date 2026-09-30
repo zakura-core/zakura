@@ -9,6 +9,7 @@ import plistlib
 import pwd
 import re
 import shutil
+import shlex
 import subprocess
 import sys
 import tarfile
@@ -155,6 +156,30 @@ def activate_mac():
             call("launchctl", "bootstrap", "system", "/Library/LaunchDaemons/" + label + ".plist")
 
 
+def configure_channel_alerts(source):
+    """Materialize only the existing channel secret as a root-private credential."""
+    source = Path(source)
+    stat = source.stat()
+    if stat.st_uid != 0 or stat.st_mode & 0o077:
+        raise ValueError("webhook source must be root-owned and private")
+    webhook = None
+    for line in source.read_text().splitlines():
+        if "=" not in line or line.lstrip().startswith("#"):
+            continue
+        key, value = line.split("=", 1)
+        if key.strip() in ("SLACK_WEB_HOOK", "SLACK_WEBHOOK_URL", "SLACK_WEBHOOK"):
+            values = shlex.split(value)
+            webhook = values[0] if len(values) == 1 else None
+    if not webhook:
+        raise ValueError("existing channel webhook unavailable")
+    from monitor import ChannelWebhook
+    ChannelWebhook(webhook)
+    write(ETC / "slack-webhook", webhook + "\n", 0o600)
+    write("/etc/systemd/system/zakura-mac-verifier.service.d/65-channel.conf",
+          f"[Service]\nLoadCredential=\nLoadCredential=slack-webhook:{ETC}/slack-webhook\n"
+          f"ExecStart=\nExecStart=/usr/bin/python3 {LINUX_CODE}/monitor.py channel\n")
+
+
 def linux_account(name, home):
     try:
         return pwd.getpwnam(name)
@@ -299,6 +324,7 @@ def main():
     parser.add_argument("--fleet-dashboard-script")
     parser.add_argument("--fleet-watchdog-script")
     parser.add_argument("--output")
+    parser.add_argument("--alert-webhook-env", help="root-private existing fleet webhook environment file")
     args = parser.parse_args()
     if os.geteuid() != 0:
         parser.error("installer requires root")
@@ -320,6 +346,7 @@ def main():
     elif args.command == "linux-prepare":
         install_linux(args)
     elif args.command == "linux-observe":
+        Path("/etc/systemd/system/zakura-mac-verifier.service.d/65-channel.conf").unlink(missing_ok=True)
         read_json(ETC / "receipt.json")
         write("/etc/systemd/system/zakura-mac-verifier.service.d/60-observation.conf",
               f"[Service]\nLoadCredential=\nExecStart=\nExecStart=/usr/bin/python3 {LINUX_CODE}/monitor.py observe\n")
@@ -328,11 +355,15 @@ def main():
         call("systemctl", "restart", "zakura-mainnet-dashboard")
         call("systemctl", "restart", "zakura-fleet-watchdog")
     elif args.command == "linux-activate":
-        identity = read_json(ETC / "identity.json")
-        if set(identity) != {"client_id", "client_secret"}:
-            raise ValueError("invalid Universal Auth identity file")
-        if (ETC / "identity.json").stat().st_uid != 0 or (ETC / "identity.json").stat().st_mode & 0o077:
-            raise ValueError("identity.json must be root-owned mode 0600")
+        if args.alert_webhook_env:
+            configure_channel_alerts(args.alert_webhook_env)
+        else:
+            identity = read_json(ETC / "identity.json")
+            if set(identity) != {"client_id", "client_secret"}:
+                raise ValueError("invalid Universal Auth identity file")
+            if (ETC / "identity.json").stat().st_uid != 0 or (ETC / "identity.json").stat().st_mode & 0o077:
+                raise ValueError("identity.json must be root-owned mode 0600")
+            Path("/etc/systemd/system/zakura-mac-verifier.service.d/65-channel.conf").unlink(missing_ok=True)
         Path("/etc/systemd/system/zakura-mac-verifier.service.d/60-observation.conf").unlink(missing_ok=True)
         call("systemctl", "daemon-reload")
         call("systemctl", "enable", "--now", "zakura-mac-verifier", "zakura-mac-verifier-dashboard")
@@ -343,6 +374,8 @@ def main():
         call("systemctl", "disable", "--now", "zakura-mac-verifier", "zakura-mac-verifier-dashboard")
         if args.command == "linux-uninstall":
             Path("/etc/systemd/system/zakura-mac-verifier.service.d/60-observation.conf").unlink(missing_ok=True)
+            Path("/etc/systemd/system/zakura-mac-verifier.service.d/65-channel.conf").unlink(missing_ok=True)
+            (ETC / "slack-webhook").unlink(missing_ok=True)
             Path("/etc/systemd/system/zakura-mac-verifier.service").unlink(missing_ok=True)
             Path("/etc/systemd/system/zakura-mac-verifier-dashboard.service").unlink(missing_ok=True)
             Path("/etc/systemd/system/zakura-mainnet-dashboard.service.d/70-private-verifier.conf").unlink(missing_ok=True)

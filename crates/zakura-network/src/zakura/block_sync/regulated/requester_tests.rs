@@ -160,7 +160,7 @@ fn invalid_endings_preserve_authorization_and_started_exchange_ownership() {
     assert!(writer.publish(|| {}));
     assert!(writer.try_start(|| true));
     assert!(book
-        .finish(&Message::RangeUnavailable(range(1, 1)))
+        .finish(&Message::RangeUnavailable(range(1, 3)))
         .is_err());
     assert!(book
         .finish(&Message::BlocksDone {
@@ -262,4 +262,38 @@ fn pool_and_session_counts_bound_bookkeeping_without_byte_funding() {
     assert!(pool.try_entry().is_none());
     drop(a);
     assert_eq!(pool.held(), 1);
+}
+
+#[test]
+fn shortened_unavailable_ends_the_whole_requested_range() {
+    let (fence, connection) = fence();
+    let pool = ReservationPool::new(1).unwrap();
+    let mut book = Requester::new(1);
+    let requested = range(10, 3);
+    let writer = book
+        .reserve(
+            requested,
+            &[hash(1), hash(2), hash(3)],
+            100,
+            pool.try_entry().unwrap(),
+            fence.open().unwrap(),
+        )
+        .unwrap();
+    assert!(writer.publish(|| {}));
+    assert!(writer.try_start(|| true));
+    assert!(book
+        .finish(&Message::RangeUnavailable(Range {
+            start: Height(10),
+            count: 0,
+        }))
+        .is_err());
+    assert_eq!(pool.held(), 1);
+
+    let (retry, _) = book
+        .finish(&Message::RangeUnavailable(range(10, 1)))
+        .unwrap();
+    assert_eq!(retry, requested);
+    assert_eq!(pool.held(), 0);
+    assert!(fence.retire());
+    assert!(!connection.is_cancelled());
 }

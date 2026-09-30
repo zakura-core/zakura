@@ -183,7 +183,7 @@ impl Requester {
         let pending = self.ranges.get(&start).ok_or(ResponseError::Ending)?;
         // Counts fit usize on supported targets.
         if (tag == 4 && (count == 0 || count as usize != pending.received))
-            || (tag == 5 && (pending.received != 0 || count != pending.range.count))
+            || (tag == 5 && (pending.received != 0 || count == 0 || count > pending.range.count))
         {
             return Err(ResponseError::Ending);
         }

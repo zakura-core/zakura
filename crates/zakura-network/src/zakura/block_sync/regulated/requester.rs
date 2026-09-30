@@ -1,6 +1,9 @@
 //! Exact GetBlocks identity and ending checks around shared reservations.
 
-use std::collections::{BTreeMap, HashMap};
+use std::{
+    collections::{BTreeMap, BTreeSet, HashMap},
+    time::{Duration, Instant},
+};
 
 use thiserror::Error;
 use zakura_chain::block::{Hash, Height};
@@ -47,6 +50,7 @@ struct Pending {
     received: usize,
     body_bytes: usize,
     max_body_bytes: u32,
+    abandoned_at: Option<Instant>,
 }
 
 /// Each range owns one node pool entry and at most 128 expected hashes.
@@ -60,15 +64,25 @@ pub(super) struct Requester {
     reservations: Reservations<Height>,
     ranges: BTreeMap<Height, Pending>,
     next: HashMap<Hash, Height>,
+    // Only incomplete ranges and completed ranges blocking a retry need a timer.
+    abandoned: BTreeSet<(Instant, Height)>,
+    awaiting_end: usize,
+    capacity: usize,
 }
 
 impl Requester {
+    /// `capacity` is a local share of the node pool, independent of the peer's
+    /// advertisement. Abandoned and fully received ranges still consume it.
     pub(super) fn new(capacity: usize) -> Self {
         // The protocol ceiling of 32,768 fits usize on supported targets.
+        let capacity = capacity.min(MAX_BS_INFLIGHT_REQUESTS as usize);
         Self {
-            reservations: Reservations::new(RULES, capacity.min(MAX_BS_INFLIGHT_REQUESTS as usize)),
+            reservations: Reservations::new(RULES, capacity),
             ranges: BTreeMap::new(),
             next: HashMap::new(),
+            abandoned: BTreeSet::new(),
+            awaiting_end: 0,
+            capacity,
         }
     }
 
@@ -76,19 +90,40 @@ impl Requester {
         self.reservations.len()
     }
 
-    pub(super) fn contains_height(&self, height: Height) -> bool {
-        self.ranges
-            .range(..=height)
-            .next_back()
-            .is_some_and(|(_, pending)| {
-                u64::from(pending.range.start.0) + u64::from(pending.range.count)
-                    > u64::from(height.0)
-            })
+    pub(super) fn at_capacity(&self) -> bool {
+        self.len() >= self.capacity
+    }
+
+    /// Old abandoned work must not pin a height forever while other work advances.
+    pub(super) fn retirement_deadline(&self, grace: Duration) -> Option<Instant> {
+        self.abandoned.first().map(|(at, _)| *at + grace)
+    }
+
+    pub(super) fn endings_at_capacity(&self) -> bool {
+        self.awaiting_end >= self.capacity
+    }
+
+    /// An unended range also blocks a new request after a reorg. Arm cleanup
+    /// even if its old bodies all arrived, because the height is needed again.
+    pub(super) fn blocks_retry(&mut self, height: Height) -> bool {
+        let Some((start, pending)) = self.ranges.range_mut(..=height).next_back() else {
+            return false;
+        };
+        if u64::from(pending.range.start.0) + u64::from(pending.range.count) <= u64::from(height.0)
+        {
+            return false;
+        }
+        if let Some(at) = pending.abandoned_at {
+            self.abandoned.insert((at, *start));
+        }
+        true
     }
 
     /// Reserve before publishing the request. `expected` must come from the
     /// already validated header chain, in ascending height order. The request
     /// must also fit the peer's advertised block count and download window.
+    /// `max_body_bytes` must equal the peer's advertised, clamped response-byte
+    /// limit when issuing this request, not a smaller local download budget.
     /// On a failed publication call `retract`; after publication use `abandon`.
     pub(super) fn reserve(
         &mut self,
@@ -135,6 +170,7 @@ impl Requester {
                 received: 0,
                 body_bytes: 0,
                 max_body_bytes,
+                abandoned_at: None,
             },
         );
         Ok(writer)
@@ -150,6 +186,12 @@ impl Requester {
     /// A scheduler timeout changes local interest, never the peer's authority.
     pub(super) fn abandon(&mut self, start: Height) {
         self.reservations.abandon(&start);
+        if let Some(pending) = self.ranges.get_mut(&start) {
+            let at = *pending.abandoned_at.get_or_insert_with(Instant::now);
+            if pending.received < pending.expected.len() {
+                self.abandoned.insert((at, start));
+            }
+        }
     }
 
     /// Header-only gate for the transport, before allocating a frame payload.
@@ -183,7 +225,16 @@ impl Requester {
         pending.received += 1;
         pending.body_bytes += body_len;
         if let Some(next) = pending.expected.get(pending.received) {
-            self.next.insert(*next, start);
+            let previous = self.next.insert(*next, start);
+            debug_assert!(
+                previous.is_none(),
+                "live ranges expect distinct next hashes"
+            );
+        } else {
+            self.awaiting_end += 1;
+            if let Some(at) = pending.abandoned_at {
+                self.abandoned.remove(&(at, start));
+            }
         }
         Ok((height, claimed))
     }
@@ -199,7 +250,7 @@ impl Requester {
         let pending = self.ranges.get(&start).ok_or(ResponseError::Ending)?;
         // Counts fit usize on supported targets.
         if (tag == 4 && (count == 0 || count as usize != pending.received))
-            || (tag == 5 && (pending.received != 0 || count != pending.range.count))
+            || (tag == 5 && (pending.received != 0 || count == 0 || count > pending.range.count))
         {
             return Err(ResponseError::Ending);
         }
@@ -213,6 +264,11 @@ impl Requester {
         if let Some(pending) = self.ranges.remove(&start) {
             if let Some(next) = pending.expected.get(pending.received) {
                 self.next.remove(next);
+            } else {
+                self.awaiting_end -= 1;
+            }
+            if let Some(at) = pending.abandoned_at {
+                self.abandoned.remove(&(at, start));
             }
         }
     }

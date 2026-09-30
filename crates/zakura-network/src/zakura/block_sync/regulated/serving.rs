@@ -116,7 +116,7 @@ fn encode_response(
 ) -> Result<Responded, ServeEnd> {
     let mut returned = 0;
     let mut body_bytes = 0_u64;
-    for (height, block, _) in &result.blocks {
+    for (height, block) in &result.blocks {
         if result.lease.is_cancelled() {
             return Err(ServeEnd::Cancelled);
         }

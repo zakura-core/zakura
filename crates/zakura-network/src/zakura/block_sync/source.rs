@@ -34,8 +34,8 @@ pub struct BlockRangeRead {
 /// A bounded result that drops its blocks before releasing execution capacity.
 #[derive(Debug)]
 pub struct BlockRangeReadResult {
-    /// Contiguous committed blocks, each paired with its height and encoded size.
-    pub blocks: Vec<(block::Height, Arc<block::Block>, usize)>,
+    /// Contiguous committed blocks, each paired with its height.
+    pub blocks: Vec<(block::Height, Arc<block::Block>)>,
     /// The same lease supplied with the read.
     pub lease: BlockRangeReadLease,
 }

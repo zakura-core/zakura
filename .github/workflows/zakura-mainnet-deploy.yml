@@ -617,7 +617,9 @@ jobs:
             }
           ' "$RUNNER_TEMP/dashboard.nodes.toml" > "$RUNNER_TEMP/dashboard.nodes.toml.tmp"
           mv "$RUNNER_TEMP/dashboard.nodes.toml.tmp" "$RUNNER_TEMP/dashboard.nodes.toml"
-          cat >> "$RUNNER_TEMP/dashboard.nodes.toml" <<'EOF'
+          # The managed install caches each sidecar release under its tag.
+          zcashd_compat_tag="$(python3 -c 'import json; print(json.load(open("crates/zakurad/zcashd-compat-manifest.json"))["release_tag"])')"
+          cat >> "$RUNNER_TEMP/dashboard.nodes.toml" <<EOF
 
           [[nodes]]
           name       = "zcashd-compat"
@@ -625,8 +627,8 @@ jobs:
           probe_kind = "zcashd"
           service_name = ""
           metrics_endpoint = ""
-          # Managed/path install from zcashd-compat-manifest.json (v1.0.0-compat-rc0).
-          bin_path = "/mnt/data/import-zebra/zcashd-compat/bin/v1.0.0-compat-rc0/x86_64-pc-linux-gnu/zcashd"
+          # Managed install of the release zcashd-compat-manifest.json pins.
+          bin_path = "/mnt/data/import-zebra/zcashd-compat/bin/${zcashd_compat_tag}/x86_64-pc-linux-gnu/zcashd"
           log_file = ""
           rpc_listen_addr = "[::1]:8232"
           rpc_auth = "cookie"

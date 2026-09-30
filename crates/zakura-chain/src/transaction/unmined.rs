@@ -452,7 +452,7 @@ impl VerifiedUnminedTx {
         let conventional_actions = zip317::conventional_actions(&transaction.transaction);
         let unpaid_actions = zip317::unpaid_actions(&transaction, miner_fee);
 
-        zip317::mempool_checks(&transaction, miner_fee)?;
+        zip317::mempool_checks(unpaid_actions, miner_fee, transaction.size)?;
 
         Ok(Self {
             transaction,
@@ -558,6 +558,6 @@ mod tests {
             Arc::new(Vec::new()),
         );
 
-        assert_eq!(result, Err(zip317::Error::FeeBelowMinimumRate));
+        assert_eq!(result, Err(zip317::Error::UnpaidActions));
     }
 }

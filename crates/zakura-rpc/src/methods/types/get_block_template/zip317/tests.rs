@@ -65,7 +65,7 @@ fn reserves_network_specific_header_and_transaction_count_sizes() {
 }
 
 #[test]
-fn selects_transaction_at_minimum_relay_fee() {
+fn selects_transaction_at_400_zatoshis_per_action() {
     let network = Network::Mainnet;
     let unmined_tx = network
         .unmined_transactions_in_blocks(..)
@@ -81,9 +81,9 @@ fn selects_transaction_at_minimum_relay_fee() {
         0,
         std::sync::Arc::new(Vec::new()),
     )
-    .expect("transaction pays the minimum relay fee");
-    assert!(!verified_tx.pays_conventional_fee());
-    assert!(verified_tx.unpaid_actions > 0);
+    .expect("transaction pays Zakura's conventional fee");
+    assert!(verified_tx.pays_conventional_fee());
+    assert_eq!(verified_tx.unpaid_actions, 0);
 
     let miner_params =
         MinerParams::from(Address::from(TransparentAddress::PublicKeyHash([0x7e; 20])));
@@ -446,6 +446,7 @@ mod zip218_template_limits {
         BlockTemplateLimits {
             remaining_bytes: usize::MAX,
             remaining_sigops: u32::MAX,
+            remaining_unpaid_actions: u32::MAX,
             remaining_orchard_actions: ORCHARD_PROTOCOL_BLOCK_ACTION_LIMIT,
             remaining_ironwood_actions: ORCHARD_PROTOCOL_BLOCK_ACTION_LIMIT,
             remaining_sapling_ios: SAPLING_BLOCK_IO_LIMIT,

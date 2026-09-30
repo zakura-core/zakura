@@ -21,7 +21,9 @@ use zakura_chain::{
         SAPLING_BLOCK_IO_LIMIT, SPROUT_BLOCK_JOINSPLIT_LIMIT,
     },
     serialization::{CompactSizeMessage, TrustedPreallocate, ZcashSerialize},
-    transaction::{self, ShieldedActionCounts, VerifiedUnminedTx},
+    transaction::{
+        self, zip317::BLOCK_UNPAID_ACTION_LIMIT, ShieldedActionCounts, VerifiedUnminedTx,
+    },
     work::equihash::Solution,
 };
 use zakura_consensus::{error::TransactionError, MAX_BLOCK_SIGOPS};
@@ -294,15 +296,16 @@ fn checked_add_transaction_weighted_random(
 }
 
 /// Tracks the remaining capacity of a block template against every limit a
-/// candidate mempool transaction can exhaust: the block byte and sigop limits
-/// and, once ZIP 218 is active, the per-pool shielded action limits and the
-/// global shielded budget.
+/// candidate mempool transaction can exhaust: the ZIP-317 byte, sigop, and
+/// unpaid-action limits, and, once ZIP 218 is active, the per-pool shielded
+/// action limits and the global shielded budget.
 ///
 /// The shielded fields start at [`u32::MAX`] while ZIP 218 is inactive, so the
 /// new limits have no effect on those templates.
 struct BlockTemplateLimits {
     remaining_bytes: usize,
     remaining_sigops: u32,
+    remaining_unpaid_actions: u32,
     remaining_orchard_actions: u32,
     remaining_ironwood_actions: u32,
     remaining_sapling_ios: u32,
@@ -330,6 +333,7 @@ impl BlockTemplateLimits {
             remaining_sigops: MAX_BLOCK_SIGOPS
                 .checked_sub(coinbase.sigops)
                 .expect("coinbase sigops fit within the block limit"),
+            remaining_unpaid_actions: BLOCK_UNPAID_ACTION_LIMIT,
             remaining_orchard_actions: shielded_limits.orchard_actions,
             remaining_ironwood_actions: shielded_limits.ironwood_actions,
             remaining_sapling_ios: shielded_limits.sapling_ios,
@@ -376,7 +380,15 @@ impl BlockTemplateLimits {
     /// Adds `tx` to the block template and returns `true` if it fits within
     /// every remaining limit. Otherwise leaves `self` unchanged and returns
     /// `false`.
-    /// The sigop count is the full block-level count (legacy + P2SH), so template
+    ///
+    /// > If the block template with this transaction included
+    /// > would be within the block size limit and block sigop limit,
+    /// > and block_unpaid_actions <= block_unpaid_action_limit,
+    /// > add the transaction to the block template
+    ///
+    /// Unpaid actions are always zero for transactions that pay the conventional
+    /// fee, so the unpaid action check always passes for those transactions. The
+    /// sigop count is the full block-level count (legacy + P2SH), so template
     /// selection cannot produce blocks the block verifier would reject for
     /// exceeding `MAX_BLOCK_SIGOPS`. The shielded counts come from the same
     /// [`ShieldedActionCounts`](zakura_chain::transaction::ShieldedActionCounts)
@@ -389,6 +401,7 @@ impl BlockTemplateLimits {
 
         if tx.transaction.size() > self.remaining_bytes
             || tx_block_sigops > self.remaining_sigops
+            || tx.unpaid_actions > self.remaining_unpaid_actions
             || counts.orchard_actions > self.remaining_orchard_actions
             || counts.ironwood_actions > self.remaining_ironwood_actions
             || counts.sapling_ios > self.remaining_sapling_ios
@@ -400,6 +413,7 @@ impl BlockTemplateLimits {
 
         self.remaining_bytes -= tx.transaction.size();
         self.remaining_sigops -= tx_block_sigops;
+        self.remaining_unpaid_actions -= tx.unpaid_actions;
         self.remaining_orchard_actions -= counts.orchard_actions;
         self.remaining_ironwood_actions -= counts.ironwood_actions;
         self.remaining_sapling_ios -= counts.sapling_ios;

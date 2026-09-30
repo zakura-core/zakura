@@ -12,7 +12,28 @@ use crate::{
 };
 
 #[test]
-fn mempool_fee_floor_is_400_per_action() {
+fn zip317_unpaid_actions_err() {
+    let check = mempool_checks(1, Amount::try_from(1).unwrap(), 1);
+
+    assert!(check.is_err());
+    assert_eq!(check.err(), Some(Error::UnpaidActions));
+}
+
+#[test]
+fn zip317_minimum_rate_fee_err() {
+    let check = mempool_checks(0, Amount::try_from(1).unwrap(), 1000);
+
+    assert!(check.is_err());
+    assert_eq!(check.err(), Some(Error::FeeBelowMinimumRate));
+}
+
+#[test]
+fn zip317_mempool_checks_ok() {
+    assert!(mempool_checks(0, Amount::try_from(100).unwrap(), 1000).is_ok())
+}
+
+#[test]
+fn zakura_conventional_fee_is_400_per_action() {
     let transaction = UnminedTx::from(Transaction::V5 {
         network_upgrade: NetworkUpgrade::Nu5,
         lock_time: LockTime::unlocked(),
@@ -26,17 +47,26 @@ fn mempool_fee_floor_is_400_per_action() {
     assert_eq!(conventional_actions(&transaction.transaction), 2);
     assert_eq!(
         conventional_fee(&transaction.transaction),
-        Amount::try_from(10_000).unwrap()
+        Amount::try_from(800).unwrap()
     );
     assert_eq!(
-        mempool_checks(&transaction, Amount::try_from(799).unwrap()),
-        Err(Error::FeeBelowMinimumRate)
+        unpaid_actions(&transaction, Amount::try_from(799).unwrap()),
+        1
     );
-    assert!(mempool_checks(&transaction, Amount::try_from(800).unwrap()).is_ok());
     assert_eq!(
         unpaid_actions(&transaction, Amount::try_from(800).unwrap()),
-        2
+        0
     );
+    assert_eq!(
+        mempool_checks(1, Amount::try_from(799).unwrap(), transaction.size),
+        Err(Error::UnpaidActions)
+    );
+    assert!(mempool_checks(0, Amount::try_from(800).unwrap(), transaction.size).is_ok());
+}
+
+#[test]
+fn legacy_relay_fee_cannot_exceed_two_action_fee() {
+    assert!(mempool_checks(0, Amount::try_from(800).unwrap(), 2_000_000).is_ok());
 }
 
 #[test]
@@ -95,11 +125,8 @@ fn zip317_counts_ironwood_actions() {
     };
 
     assert_eq!(conventional_actions(&transaction), 3);
-
-    let transaction = UnminedTx::from(transaction);
     assert_eq!(
-        mempool_checks(&transaction, Amount::try_from(1_199).unwrap()),
-        Err(Error::FeeBelowMinimumRate)
+        conventional_fee(&transaction),
+        Amount::try_from(1_200).unwrap()
     );
-    assert!(mempool_checks(&transaction, Amount::try_from(1_200).unwrap()).is_ok());
 }

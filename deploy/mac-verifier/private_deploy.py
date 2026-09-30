@@ -99,7 +99,7 @@ def main():
                 relative = path.relative_to(package)
                 mac.put(path.read_text(), REMOTE + "/tooling/" + str(relative))
             mac.put(os.environ["MAC_VERIFIER_REFERENCE_KNOWN_HOSTS"], REMOTE + "/reference-hosts")
-            mac.put(os.environ["MAC_VERIFIER_TUNNEL_KEY"], REMOTE + "/tunnel")
+            mac.put(os.environ["MAC_VERIFIER_TUNNEL_KEY"].rstrip("\n") + "\n", REMOTE + "/tunnel")
             # Endpoints are root-private input data, not substituted into script text.
             mac.put(json.dumps({"reference_host": linux.host}), REMOTE + "/endpoints.json")
             mac.run(f'''set -eu
@@ -110,7 +110,8 @@ git -C source checkout --detach {SOURCE}
 bash tooling/build.sh source build
 sudo -n mkdir -p "{BASE}/ssh"
 sudo -n install -m 600 tunnel "{BASE}/ssh/tunnel"
-sudo -n ssh-keygen -y -f "{BASE}/ssh/tunnel" | sudo -n tee "{BASE}/ssh/tunnel.pub" >/dev/null
+sudo -n ssh-keygen -y -f "{BASE}/ssh/tunnel" > tunnel.pub
+sudo -n install -m 600 tunnel.pub "{BASE}/ssh/tunnel.pub"
 sudo -n {MAC_PYTHON} - <<'PY'
 import json,os,sys
 os.environ['MAC_VERIFIER_REFERENCE_HOST']=json.load(open('{REMOTE}/endpoints.json'))['reference_host']

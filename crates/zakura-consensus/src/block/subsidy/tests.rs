@@ -108,7 +108,7 @@ fn test_funding_stream_values() -> Result<(), Report> {
     Ok(())
 }
 
-/// Check mainnet and testnet funding stream addresses are valid transparent P2SH addresses.
+/// Check public funding stream addresses have the specified network and script type.
 #[test]
 fn test_funding_stream_addresses() -> Result<(), Report> {
     let _init_guard = zakura_test::init();
@@ -131,9 +131,15 @@ fn test_funding_stream_addresses() -> Result<(), Report> {
                     "incorrect network for {receiver:?} funding stream address constant: {address}",
                 );
 
+                // ZIP 2008 changes only Mainnet's NU7 FPF recipient to P2PKH.
+                // TODO(zip-259): verify the built-in stream contains this recipient
+                // once the final Mainnet activation height is assigned.
+                let zip_2008_mainnet_fpf = network.kind() == NetworkKind::Mainnet
+                    && *receiver == FundingStreamReceiver::MajorGrants
+                    && address.to_string() == "t1MkHnkxVjNpNbCrSs3AJ8J7ZSp6NTYiUcG";
                 assert!(
-                    address.is_script_hash(),
-                    "funding stream address is not P2SH: {address}"
+                    address.is_script_hash() || zip_2008_mainnet_fpf,
+                    "unexpected funding stream address type: {address}"
                 );
 
                 let _script = address.script();
@@ -174,6 +180,267 @@ const TESTNET_THIRD_HALVING: u32 = 4_476_000;
 
 /// The Testnet third halving after ZIP 218 with NU7 at [`TESTNET_NU7`].
 const TESTNET_ZIP_218_THIRD_HALVING: u32 = 4_656_000;
+
+/// Test-only projected November 5 Mainnet activation, not a consensus parameter.
+// TODO(zip-259): replace this fixture once the ZIP assigns Mainnet NU7.
+const TEST_ONLY_MAINNET_NU7: u32 = 3_543_000;
+
+/// A configured Testnet with Mainnet's activation schedule and synthetic P2SH
+/// grants recipients. The separate Mainnet constants test checks the real ZIP
+/// 2008 P2PKH recipient, which configured Testnets cannot accept.
+fn test_only_mainnet_schedule_with_stream() -> (Network, Vec<transparent::Address>) {
+    use zakura_chain::parameters::testnet::{
+        ConfiguredActivationHeights, ConfiguredFundingStreamRecipient, ConfiguredFundingStreams,
+        Parameters,
+    };
+
+    let mut activations: ConfiguredActivationHeights = Network::Mainnet.activation_list().into();
+    activations.nu7 = Some(TEST_ONLY_MAINNET_NU7);
+    let addresses: Vec<_> = (0..36)
+        .map(|index| transparent::Address::from_script_hash(NetworkKind::Testnet, [index; 20]))
+        .collect();
+    let network = Parameters::build()
+        .with_activation_heights(activations)
+        .expect("activation heights are valid")
+        .with_funding_streams(vec![ConfiguredFundingStreams {
+            height_range: Some(Height(3_146_400)..Height(6_133_200)),
+            recipients: Some(vec![
+                ConfiguredFundingStreamRecipient {
+                    receiver: FundingStreamReceiver::Deferred,
+                    numerator: 12,
+                    addresses: None,
+                },
+                ConfiguredFundingStreamRecipient {
+                    receiver: FundingStreamReceiver::MajorGrants,
+                    numerator: 8,
+                    addresses: Some(addresses.iter().map(ToString::to_string).collect()),
+                },
+            ]),
+        }])
+        .to_network()
+        .expect("test-only Mainnet schedule is valid");
+    (network, addresses)
+}
+
+#[test]
+fn test_only_mainnet_coinbase_boundaries_match_fixed_oracle() -> Result<(), Report> {
+    use crate::{
+        block::check::{miner_fees_are_valid, subsidy_is_valid},
+        checkpoint::deferred_pool_balance_change as checkpoint_deferred,
+        BlockError,
+    };
+
+    let _init_guard = zakura_test::init();
+    const ROTATION: u32 = 3_613_200;
+    const OLD_END: u32 = 4_406_400;
+    const MOVED_END: u32 = 6_133_200;
+
+    let (network, addresses) = test_only_mainnet_schedule_with_stream();
+    let output = |value: i64, script: transparent::Script| transparent::Output {
+        value: Amount::try_from(value).expect("oracle amount is valid"),
+        lock_script: script,
+    };
+    let miner_script = transparent::Script::new(&[0]);
+
+    // Height, subsidy, grants, deferred, miner, zero-based recipient slot.
+    for (height, subsidy_zats, grants_zats, deferred_zats, miner_zats, slot) in [
+        (
+            TEST_ONLY_MAINNET_NU7 - 1,
+            156_250_000,
+            12_500_000,
+            18_750_000,
+            125_000_000,
+            Some(11),
+        ),
+        (
+            TEST_ONLY_MAINNET_NU7,
+            52_083_333,
+            4_166_666,
+            6_249_999,
+            41_666_668,
+            Some(11),
+        ),
+        (
+            TEST_ONLY_MAINNET_NU7 + 1,
+            52_083_333,
+            4_166_666,
+            6_249_999,
+            41_666_668,
+            Some(11),
+        ),
+        (
+            ROTATION - 1,
+            52_083_333,
+            4_166_666,
+            6_249_999,
+            41_666_668,
+            Some(11),
+        ),
+        (
+            ROTATION,
+            52_083_333,
+            4_166_666,
+            6_249_999,
+            41_666_668,
+            Some(12),
+        ),
+        (
+            ROTATION + 1,
+            52_083_333,
+            4_166_666,
+            6_249_999,
+            41_666_668,
+            Some(12),
+        ),
+        (
+            OLD_END - 1,
+            52_083_333,
+            4_166_666,
+            6_249_999,
+            41_666_668,
+            Some(19),
+        ),
+        (
+            OLD_END,
+            52_083_333,
+            4_166_666,
+            6_249_999,
+            41_666_668,
+            Some(19),
+        ),
+        (
+            OLD_END + 1,
+            52_083_333,
+            4_166_666,
+            6_249_999,
+            41_666_668,
+            Some(19),
+        ),
+        (
+            MOVED_END - 1,
+            52_083_333,
+            4_166_666,
+            6_249_999,
+            41_666_668,
+            Some(35),
+        ),
+        (MOVED_END, 26_041_666, 0, 0, 26_041_666, None),
+        (MOVED_END + 1, 26_041_666, 0, 0, 26_041_666, None),
+    ] {
+        let height = Height(height);
+        let subsidy = block_subsidy(height, &network, Some(Amount::zero()))?;
+        assert_eq!(i64::from(subsidy), subsidy_zats, "subsidy at {height:?}");
+        let address = funding_stream_address(height, &network, FundingStreamReceiver::MajorGrants);
+        assert_eq!(
+            address,
+            slot.map(|slot| &addresses[slot]),
+            "recipient at {height:?}"
+        );
+
+        let mut outputs = vec![output(miner_zats, miner_script.clone())];
+        if let Some(address) = address {
+            outputs.push(output(grants_zats, address.script()));
+        }
+        let block = coinbase_block(height, outputs);
+        let deferred = subsidy_is_valid(&block, &network, subsidy)?;
+        assert_eq!(
+            i64::from(deferred.value()),
+            deferred_zats,
+            "deferred at {height:?}"
+        );
+        assert_eq!(
+            checkpoint_deferred(height, &network, Some(Amount::zero()))?,
+            Some(deferred)
+        );
+        miner_fees_are_valid(
+            &block.transactions[0],
+            height,
+            Amount::zero(),
+            subsidy,
+            deferred,
+            &network,
+        )?;
+
+        if height.0 == ROTATION {
+            let stale = coinbase_block(
+                height,
+                vec![
+                    output(miner_zats, miner_script.clone()),
+                    output(grants_zats, addresses[11].script()),
+                ],
+            );
+            assert_eq!(
+                subsidy_is_valid(&stale, &network, subsidy),
+                Err(BlockError::Transaction(
+                    crate::error::TransactionError::Subsidy(SubsidyError::FundingStreamNotFound)
+                ))
+            );
+        }
+    }
+
+    // A missing or one-zatoshi-wrong grants output must not be accepted in
+    // any active era, including the last block before the moved end.
+    let missing_grants = Err(BlockError::Transaction(
+        crate::error::TransactionError::Subsidy(SubsidyError::FundingStreamNotFound),
+    ));
+    for (height, grants) in [
+        (TEST_ONLY_MAINNET_NU7 - 1, 12_500_000),
+        (TEST_ONLY_MAINNET_NU7, 4_166_666),
+        (ROTATION, 4_166_666),
+        (MOVED_END - 1, 4_166_666),
+    ] {
+        let height = Height(height);
+        let subsidy = block_subsidy(height, &network, Some(Amount::zero()))?;
+        let address = funding_stream_address(height, &network, FundingStreamReceiver::MajorGrants)
+            .expect("grants are active");
+        let missing = coinbase_block(height, vec![output(1, miner_script.clone())]);
+        assert_eq!(
+            subsidy_is_valid(&missing, &network, subsidy),
+            missing_grants
+        );
+        let wrong_amount = coinbase_block(height, vec![output(grants + 1, address.script())]);
+        assert_eq!(
+            subsidy_is_valid(&wrong_amount, &network, subsidy),
+            missing_grants
+        );
+    }
+
+    // The miner receives all 17 fee zatoshi before NU7, then only 7 after
+    // floor(17 * 6 / 10) = 10 goes to NSM, even at the stream's end.
+    let fees = Amount::try_from(17)?;
+    for (height, fee_share, miner, grants) in [
+        (TEST_ONLY_MAINNET_NU7 - 1, 17, 125_000_000, Some(12_500_000)),
+        (TEST_ONLY_MAINNET_NU7, 7, 41_666_668, Some(4_166_666)),
+        (MOVED_END - 1, 7, 41_666_668, Some(4_166_666)),
+        (MOVED_END, 7, 26_041_666, None),
+    ] {
+        let height = Height(height);
+        assert_eq!(
+            i64::from(miner_fee_share(height, &network, fees)),
+            fee_share
+        );
+        let subsidy = block_subsidy(height, &network, Some(Amount::zero()))?;
+        let mut outputs = vec![output(miner + fee_share, miner_script.clone())];
+        if let Some(grants) = grants {
+            let address =
+                funding_stream_address(height, &network, FundingStreamReceiver::MajorGrants)
+                    .expect("grants are active");
+            outputs.push(output(grants, address.script()));
+        }
+        let block = coinbase_block(height, outputs);
+        let deferred = subsidy_is_valid(&block, &network, subsidy)?;
+        miner_fees_are_valid(
+            &block.transactions[0],
+            height,
+            fees,
+            subsidy,
+            deferred,
+            &network,
+        )?;
+    }
+
+    Ok(())
+}
 
 /// Returns the default Testnet parameters with NU7 at [`TESTNET_NU7`] and the given
 /// Revision 2 grants addresses, or the built-in ones.

@@ -321,13 +321,15 @@ class Monitor:
         gap = self.state["last_sample"] is None or now - self.state["last_sample"] > 90
         healthy = (error is None and not self.state["incidents"] and self.state["caught_up"]
                    and not self.state["outbox_overflow"] and not self.state["outbox"])
-        if not healthy or gap:
+        if not healthy or gap or self.state.get("healthy_start_height") is None:
             self.state["healthy_since"] = now if healthy else None
+            self.state["healthy_start_height"] = reference["height"] if healthy else None
         elif self.state["healthy_since"] is None:
             self.state["healthy_since"] = now
+            self.state["healthy_start_height"] = reference["height"]
         if (healthy and not self.state["qualified"]
                 and now - self.state["healthy_since"] >= 86400
-                and self.state["cursor"] >= self.state["initial_tip"] + 100):
+                and self.state["cursor"] >= self.state["healthy_start_height"] + 100):
             self.state["qualified"] = True
             self.notify("Zakura Mac verifier qualified: 24 healthy hours and 100 new mainnet blocks")
         self.state["last_sample"] = now

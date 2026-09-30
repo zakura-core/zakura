@@ -184,7 +184,7 @@ class MonitorTests(unittest.TestCase):
         self.step(60)
         self.monitor.state["healthy_since"] = 0
         self.monitor.state["last_sample"] = 86400
-        self.monitor.state["initial_tip"] = 0
+        self.monitor.state["healthy_start_height"] = 0
         self.linux.height = self.mac.height = 131
         self.monitor.state["cursor"] = 127
         self.monitor.state["history"]["127"] = record(127)["hash"]
@@ -193,6 +193,21 @@ class MonitorTests(unittest.TestCase):
         self.assertEqual(len([x for x in self.monitor.state["outbox"] if "qualified" in x["text"]]), 1)
         self.step(86460)
         self.assertEqual(len([x for x in self.monitor.state["outbox"] if "qualified" in x["text"]]), 1)
+
+    def test_qualification_does_not_count_blocks_before_healthy_window(self):
+        self.step()
+        self.step(60)
+        self.monitor.state["healthy_since"] = 0
+        self.monitor.state["last_sample"] = 86400
+        self.monitor.state["healthy_start_height"] = 100
+        self.linux.height = self.mac.height = 202
+        self.monitor.state["cursor"] = 198
+        self.monitor.state["history"]["198"] = record(198)["hash"]
+        self.step(86430)
+        self.assertFalse(self.monitor.state["qualified"])
+        self.linux.height = self.mac.height = 203
+        self.step(86460)
+        self.assertTrue(self.monitor.state["qualified"])
 
     def test_wrong_binary_and_missing_memory_cannot_qualify(self):
         self.mac.now = 30

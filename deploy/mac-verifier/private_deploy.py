@@ -15,6 +15,7 @@ from common import Unavailable
 SOURCE = "af944f5194ef2e9921bc96af017629450375013c"
 REMOTE = "/var/tmp/zakura-verifier"
 BASE = "/Library/Application Support/ZakuraVerifier"
+MAC_PYTHON = "/opt/homebrew/opt/python@3.12/bin/python3.12"
 
 
 def validate_host(value):
@@ -85,8 +86,8 @@ def main():
         if args.command == "preflight":
             mac.run('set -eu\nexport PATH="/opt/homebrew/bin:$HOME/.cargo/bin:$PATH"\n[ "$(uname -s)" = Darwin ]\n[ "$(uname -m)" = arm64 ]\n'
                     '[ "$(sysctl -n hw.memsize)" -ge 16000000000 ]\nsudo -n true\n'
-                    'command -v python3; command -v rustup; command -v protoc; command -v zstd\n'
-                    'python3 -c "import shutil; assert shutil.disk_usage(\'/var/tmp\').free >= 120*10**9"\n')
+                    'test -x /opt/homebrew/opt/python@3.12/bin/python3.12; command -v rustup; command -v protoc; command -v zstd\n'
+                    '/opt/homebrew/opt/python@3.12/bin/python3.12 -c "import shutil; assert shutil.disk_usage(\'/var/tmp\').free >= 120*10**9"\n')
             linux.run('set -eu\nsudo -n true\ncommand -v python3; command -v systemctl\n')
         elif args.command == "prepare":
             mac.run(f"set -eu\numask 077\nmkdir -p {REMOTE}/tooling/templates\n")
@@ -107,7 +108,7 @@ bash tooling/build.sh source build
 sudo -n mkdir -p "{BASE}/ssh"
 sudo -n install -m 600 tunnel "{BASE}/ssh/tunnel"
 sudo -n ssh-keygen -y -f "{BASE}/ssh/tunnel" | sudo -n tee "{BASE}/ssh/tunnel.pub" >/dev/null
-sudo -n /opt/homebrew/bin/python3 - <<'PY'
+sudo -n {MAC_PYTHON} - <<'PY'
 import json,os,sys
 os.environ['MAC_VERIFIER_REFERENCE_HOST']=json.load(open('{REMOTE}/endpoints.json'))['reference_host']
 sys.path.insert(0,'{REMOTE}/tooling')
@@ -123,7 +124,7 @@ sudo -n cp build/evidence/* "{BASE}/evidence/"
             try:
                 mac.run(f'''set -eu
 export PATH="/opt/homebrew/bin:$HOME/.cargo/bin:$PATH"
-sudo -n /opt/homebrew/bin/python3 {REMOTE}/tooling/bootstrap.py --source {REMOTE}/source --tooling-sha {revision}
+sudo -n {MAC_PYTHON} {REMOTE}/tooling/bootstrap.py --source {REMOTE}/source --tooling-sha {revision}
 ''', timeout=3600)
                 if any(p.poll() is not None for p in forwards):
                     raise Unavailable("bootstrap forwarding failed")
@@ -155,9 +156,9 @@ sudo -n install -m 644 {REMOTE}/dashboard.json /etc/zakura-mac-verifier/dashboar
 rm -f {REMOTE}/identity.json
 sudo -n python3 {REMOTE}/tooling/install.py linux-activate
 ''')
-            mac.run(f"sudo -n /opt/homebrew/bin/python3 {REMOTE}/tooling/install.py mac-activate")
+            mac.run(f"sudo -n {MAC_PYTHON} {REMOTE}/tooling/install.py mac-activate")
         elif args.command == "stop":
-            mac.run(f"sudo -n /opt/homebrew/bin/python3 {REMOTE}/tooling/install.py mac-stop")
+            mac.run(f"sudo -n {MAC_PYTHON} {REMOTE}/tooling/install.py mac-stop")
             linux.run(f"sudo -n python3 {REMOTE}/tooling/install.py linux-stop")
         else:
             # Public Actions output uses the same allowlist as the dashboard.

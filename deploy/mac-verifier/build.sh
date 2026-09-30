@@ -19,6 +19,6 @@ export CARGO_TARGET_DIR="$output_dir/target"
 # Cargo builds its bundled RocksDB; protobuf is required for generated RPC types.
 command -v protoc >/dev/null
 rustup toolchain install 1.97.1 --profile minimal
-python3 "$package_dir/corpus.py" --source "$source_dir" --output "$output_dir/evidence"
+/opt/homebrew/opt/python@3.12/bin/python3.12 "$package_dir/corpus.py" --source "$source_dir" --output "$output_dir/evidence"
 (cd "$source_dir" && cargo +1.97.1 build --locked --release -p zakura --bin zakurad)
 cp "$CARGO_TARGET_DIR/release/zakurad" "$output_dir/zakurad"

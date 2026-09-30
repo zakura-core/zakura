@@ -4705,6 +4705,34 @@ async fn disconnects_from_misbehaving_peers() -> Result<()> {
 //   TEST_ZCASHD_COMPAT=1 TEST_ZCASHD_PATH=/path/to/zcashd \
 //     cargo nextest run --profile zcashd-compat-integration --run-ignored=only
 
+/// The NU7 sidecar follows zakurad across NU7 activation on regtest.
+///
+/// See [`common::zcashd_compat::nu7::activation_follows_zakurad`] for details.
+#[tokio::test]
+#[ignore]
+async fn zcashd_compat_nu7_activation_follows_zakurad() -> Result<()> {
+    common::zcashd_compat::nu7::activation_follows_zakurad().await
+}
+
+/// Both nodes split a post-NU7 block's fees as ZIP 235 requires, and zcashd's wallet
+/// builds v5 transactions with the post-NU7 expiry.
+///
+/// See [`common::zcashd_compat::nu7::fee_burn_and_wallet_transactions`] for details.
+#[tokio::test]
+#[ignore]
+async fn zcashd_compat_nu7_fee_burn_and_wallet_transactions() -> Result<()> {
+    common::zcashd_compat::nu7::fee_burn_and_wallet_transactions().await
+}
+
+/// The NU7 sidecar syncs a burst of blocks across activation and survives a restart.
+///
+/// See [`common::zcashd_compat::nu7::burst_sync_and_restart`] for details.
+#[tokio::test]
+#[ignore]
+async fn zcashd_compat_nu7_burst_sync_and_restart() -> Result<()> {
+    common::zcashd_compat::nu7::burst_sync_and_restart().await
+}
+
 /// Verifies that both zakurad and zcashd start and respond to basic RPC calls.
 ///
 /// See [`common::zcashd_compat::startup::both_processes_start`] for details.

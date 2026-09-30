@@ -19,7 +19,7 @@ use crate::zakura::{
 };
 
 struct Store {
-    blocks: Vec<(block::Height, Arc<block::Block>, usize)>,
+    blocks: Vec<(block::Height, Arc<block::Block>)>,
     started: Arc<Semaphore>,
     release: Arc<Semaphore>,
     fail: bool,
@@ -65,7 +65,6 @@ fn store(blocks: &[&[u8]], open: bool) -> Arc<Store> {
                 (
                     block::Height(u32::try_from(index + 1).unwrap()),
                     Arc::new(bytes.zcash_deserialize_into().unwrap()),
-                    bytes.len(),
                 )
             })
             .collect(),

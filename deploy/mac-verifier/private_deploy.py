@@ -146,6 +146,8 @@ sudo -n {MAC_PYTHON} {REMOTE}/tooling/bootstrap.py --source {REMOTE}/source --to
                 linux.put(path.read_text(), REMOTE + "/tooling/" + path.name)
             fleet_script = Path(__file__).resolve().parents[1] / "runner/zakura-cluster-status.py"
             linux.put(fleet_script.read_text(), REMOTE + "/fleet-dashboard.py")
+            watchdog_script = fleet_script.with_name("zakura-cluster-watchdog.py")
+            linux.put(watchdog_script.read_text(), REMOTE + "/fleet-watchdog.py")
             linux.put(mac.run(f"sudo -n cat '{BASE}/receipt.json'"), REMOTE + "/receipt.json")
             linux.put(mac.run(f"sudo -n cat '{BASE}/ssh/tunnel.pub'"), REMOTE + "/tunnel.pub")
             credential = json.loads(os.environ["MAC_VERIFIER_MONITOR_IDENTITY_JSON"])
@@ -154,7 +156,7 @@ sudo -n {MAC_PYTHON} {REMOTE}/tooling/bootstrap.py --source {REMOTE}/source --to
             linux.put(json.dumps(credential), REMOTE + "/identity.json")
             linux.put(json.dumps({"verifier_id": identifier}), REMOTE + "/dashboard.json")
             linux.run(f'''set -eu
-sudo -n python3 {REMOTE}/tooling/install.py linux-prepare --receipt {REMOTE}/receipt.json --tunnel-public-key {REMOTE}/tunnel.pub --infisical-project c57a6889-6a7c-4d05-a54a-e4a4c0b14ee7 --fleet-dashboard-script {REMOTE}/fleet-dashboard.py
+sudo -n python3 {REMOTE}/tooling/install.py linux-prepare --receipt {REMOTE}/receipt.json --tunnel-public-key {REMOTE}/tunnel.pub --infisical-project c57a6889-6a7c-4d05-a54a-e4a4c0b14ee7 --fleet-dashboard-script {REMOTE}/fleet-dashboard.py --fleet-watchdog-script {REMOTE}/fleet-watchdog.py
 sudo -n install -m 600 {REMOTE}/identity.json /etc/zakura-mac-verifier/identity.json
 sudo -n install -m 644 {REMOTE}/dashboard.json /etc/zakura-mac-verifier/dashboard.json
 rm -f {REMOTE}/identity.json

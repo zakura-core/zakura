@@ -2061,6 +2061,24 @@ class MacForkAlertTests(unittest.TestCase):
         for row in rows[1:]:row["height"]=120
         self.assertEqual(self.check(rows)[1],[])
 
+    def test_fork_delivery_retry_and_restart_preserve_incident(self):
+        state={}
+        agent=watchdog.Watchdog([watchdog.Fleet("mainnet","http://localhost/data","https://status.mainnet.zakura.valargroup.dev/")],make_args())
+        snapshot={"rows":self.rows(),"last_poll":1000}
+        with patch.object(watchdog,"fetch_json",return_value=snapshot), \
+                patch.object(watchdog.time,"time",return_value=1000), \
+                patch.object(watchdog,"post_slack",return_value=False):
+            agent.run_once(state)
+        self.assertEqual(len(state["pending_delivery"]["mainnet"]["messages"]),1)
+        state=json.loads(json.dumps(state))
+        with patch.object(watchdog,"fetch_json",return_value=snapshot), \
+                patch.object(watchdog.time,"time",return_value=1060), \
+                patch.object(watchdog,"post_slack",return_value=True) as send:
+            agent.run_once(state)
+        self.assertEqual(send.call_count,1)
+        self.assertTrue(state["mac_forks"]["mainnet"]["alerting"])
+        self.assertNotIn("mainnet",state["pending_delivery"])
+
     def test_mac_offline_uses_three_minutes_without_changing_other_nodes(self):
         self.assertEqual(watchdog.node_condition({"name":"zakura-mac-os","health":"down"},1000,0,make_args())[2],180)
         self.assertEqual(watchdog.node_condition({"name":"other","health":"down"},1000,0,make_args())[2],600)

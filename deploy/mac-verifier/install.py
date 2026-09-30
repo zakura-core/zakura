@@ -157,6 +157,9 @@ def install_linux(args):
     fleet_script = Path("/opt/zakura-mainnet-dashboard/zakura-cluster-status.py")
     if not args.fleet_dashboard_script or not fleet_script.is_file():
         raise ValueError("existing mainnet dashboard and updated --fleet-dashboard-script required")
+    watchdog_script = Path("/opt/zakura-fleet-watchdog/zakura-cluster-watchdog.py")
+    if not args.fleet_watchdog_script or not watchdog_script.is_file():
+        raise ValueError("existing fleet watchdog and updated --fleet-watchdog-script required")
     linux_account(LINUX_USER, LINUX_HOME)
     linux_account(TUNNEL_USER, ETC / "tunnel")
     ETC.mkdir(parents=True, exist_ok=True)
@@ -224,6 +227,8 @@ WantedBy=multi-user.target
     call("systemctl", "daemon-reload")
     shutil.copyfile(args.fleet_dashboard_script, fleet_script)
     fleet_script.chmod(0o755)
+    shutil.copyfile(args.fleet_watchdog_script, watchdog_script)
+    watchdog_script.chmod(0o755)
     write("/etc/systemd/system/zakura-mainnet-dashboard.service.d/70-private-verifier.conf",
           "[Service]\nEnvironment=ZAKURA_PRIVATE_VERIFIER_STATUS=1\n")
     write("/etc/systemd/system/zakura-mac-verifier-dashboard.service", f'''[Unit]
@@ -280,6 +285,7 @@ def main():
     parser.add_argument("--receipt")
     parser.add_argument("--infisical-project")
     parser.add_argument("--fleet-dashboard-script")
+    parser.add_argument("--fleet-watchdog-script")
     parser.add_argument("--output")
     args = parser.parse_args()
     if os.geteuid() != 0:
@@ -312,6 +318,7 @@ def main():
         call("systemctl", "daemon-reload")
         call("systemctl", "enable", "--now", "zakura-mac-verifier", "zakura-mac-verifier-dashboard")
         call("systemctl", "restart", "zakura-mainnet-dashboard")
+        call("systemctl", "restart", "zakura-fleet-watchdog")
     elif args.command == "linux-activate":
         identity = read_json(ETC / "identity.json")
         if set(identity) != {"client_id", "client_secret"}:
@@ -323,6 +330,7 @@ def main():
         call("systemctl", "enable", "--now", "zakura-mac-verifier", "zakura-mac-verifier-dashboard")
         call("systemctl", "restart", "zakura-mac-verifier")
         call("systemctl", "restart", "zakura-mainnet-dashboard")
+        call("systemctl", "restart", "zakura-fleet-watchdog")
     elif args.command in ("linux-stop", "linux-uninstall"):
         call("systemctl", "disable", "--now", "zakura-mac-verifier", "zakura-mac-verifier-dashboard")
         if args.command == "linux-uninstall":
@@ -335,6 +343,7 @@ def main():
             call("systemctl", "reload", "ssh")
             call("systemctl", "daemon-reload")
             call("systemctl", "restart", "zakura-mainnet-dashboard")
+            call("systemctl", "restart", "zakura-fleet-watchdog")
             print("Verifier services removed; evidence retained and mainnet services unchanged.")
     else:
         if not args.output:

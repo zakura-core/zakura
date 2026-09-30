@@ -217,8 +217,8 @@ commit, numeric resource samples and comparison/alert counters. It excludes raw
 errors, receipts, host addresses and peer identities. The node uses the existing
 loopback bridge; keep its private endpoint out of the public fleet TOML and do not
 proxy the raw adapter. The installer enables this integration through a service
-environment override and restarts only the existing mainnet dashboard; the
-managed SSH inventory and watchdog configuration remain unchanged.
+environment override and restarts the existing mainnet dashboard and fleet watchdog; the
+managed SSH inventory, webhook and other node thresholds remain unchanged.
 
 Alerts cover availability, missing coverage, resource samples, disk below 20 GB,
 memory pressure, tip stalls, prolonged catch-up, unexpected build/configuration,
@@ -275,7 +275,6 @@ verifier Slack credential after teardown. Do not revoke existing node credential
 Keep the implementation PR draft. Deployment, native receipts, delivered alerts,
 reboot recovery, and the qualification window must all have direct evidence before
 claiming the verification complete.
-
 
 ## Fleet channel alerts
 

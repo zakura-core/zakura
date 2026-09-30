@@ -2,12 +2,22 @@
 """Fail closed before quiet alert enablement; never contact Slack."""
 import argparse
 import math
+import os
 from pathlib import Path
 import time
 import uuid
 
 from common import Transport, Unavailable, atomic_json, read_json
 from monitor import Monitor, exclusive
+
+
+def replace_owned_json(path, value):
+    """Retain service ownership when a root operator replaces its state."""
+    path = Path(path)
+    stat = path.stat()
+    atomic_json(path, value)
+    os.chown(path, stat.st_uid, stat.st_gid)
+    path.chmod(stat.st_mode & 0o777)
 
 
 def inspect(directory, expected, now, fleet):
@@ -60,12 +70,12 @@ def prepare(directory, expected, now, fleet, apply=False, fleet_state_path=None)
             state["incidents"].pop("alert delivery unavailable", None)
             state.update(channel_episode_version=1, channel_episode_active=False, channel_episode_findings=[],
                          healthy_since=None, healthy_start_height=None, qualified=False)
-            atomic_json(Path(directory) / "cursor.json", state)
+            replace_owned_json(Path(directory) / "cursor.json", state)
             if fleet_state is not None:
                 atomic_json(Path(directory) / "incidents" / ("fleet-before-enablement-" + uuid.uuid4().hex + ".json"), fleet_state)
                 fleet_state.get("nodes", {}).pop("mainnet/zakura-mac-os", None)
                 fleet_state.get("mac_forks", {}).pop("mainnet", None)
-                atomic_json(fleet_state_path, fleet_state)
+                replace_owned_json(fleet_state_path, fleet_state)
         return report
 
 

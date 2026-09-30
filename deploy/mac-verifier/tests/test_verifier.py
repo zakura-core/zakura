@@ -690,6 +690,7 @@ class QuietEnablementTests(unittest.TestCase):
         state = json.loads((Path(self.temp.name) / "cursor.json").read_text())
         self.assertGreater(report["historical_messages_to_archive"], 0)
         self.assertEqual(state["outbox"], [])
+        self.assertEqual((Path(self.temp.name) / "cursor.json").stat().st_uid, __import__("os").getuid())
         self.assertIsNone(state["healthy_since"])
         self.assertNotIn("alert delivery unavailable", state["incidents"])
         self.assertTrue(list((Path(self.temp.name) / "incidents").glob("enablement-*.json")))

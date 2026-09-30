@@ -385,6 +385,7 @@ lto = "off"
 unexpected_cfgs = { level = "warn", check-cfg = [
     'cfg(tokio_unstable)', # Used by tokio-console
     'cfg(zcash_unstable, values("zfuture", "nu6.1", "nu7"))', # Used in Zakura and librustzcash
+    'cfg(zakura_test_mainnet_nu7)', # Explicit test build for the hypothetical Mainnet NU7 activation
 ] }
 
 # High-risk code

@@ -125,6 +125,10 @@
 // them into type aliases would not make the code clearer.
 #![allow(clippy::type_complexity)]
 
+// Never allow a node executable to contain the hypothetical Mainnet activation.
+#[cfg(zakura_test_mainnet_nu7)]
+compile_error!("the test-only Mainnet NU7 activation cannot be built into zakurad");
+
 #[macro_use]
 extern crate tracing;
 

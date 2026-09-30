@@ -1,0 +1,45 @@
+name: Test-only Mainnet NU7 funding
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - .github/workflows/test-mainnet-nu7-fixture.yml
+      - Cargo.toml
+      - crates/zakura-chain/src/lib.rs
+      - crates/zakura-chain/src/parameters/network_upgrade.rs
+      - crates/zakura-chain/src/parameters/network/subsidy.rs
+      - crates/zakura-chain/src/parameters/network/subsidy/**
+      - crates/zakura-chain/src/parameters/network/tests/zip218_funding_streams.rs
+      - crates/zakura-consensus/src/block/check.rs
+      - crates/zakura-consensus/src/block/subsidy.rs
+      - crates/zakura-consensus/src/block/subsidy/tests.rs
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  mainnet-nu7-funding:
+    name: Mainnet funding and coinbase boundaries (test fixture)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      # Inject the hypothetical height into the real Mainnet parameter path.
+      # The node and release builds refuse this flag.
+      RUSTFLAGS: --cfg zakura_test_mainnet_nu7
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+        with:
+          toolchain: stable
+          cache-shared-key: mainnet-nu7-fixture
+      - uses: ./.github/actions/setup-zakura-build
+      - name: Mainnet funding schedule and built-in recipients
+        run: cargo test --locked -p zakura-chain --lib test_only_mainnet_nu7_boundaries_match_fixed_oracle
+      - name: Mainnet coinbase boundary acceptance and rejection
+        run: cargo test --locked -p zakura-consensus --lib test_only_mainnet_coinbase_boundaries_match_fixed_oracle
+      - name: Built-in Mainnet funding address types
+        run: cargo test --locked -p zakura-consensus --lib test_funding_stream_addresses

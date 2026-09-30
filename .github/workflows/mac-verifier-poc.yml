@@ -5,11 +5,13 @@ on:
     paths:
       - 'deploy/mac-verifier/**'
       - '.github/workflows/mac-verifier-poc.yml'
+      - '.github/workflows/deploy-mac-verifier.yml'
   push:
     branches: [main]
     paths:
       - 'deploy/mac-verifier/**'
       - '.github/workflows/mac-verifier-poc.yml'
+      - '.github/workflows/deploy-mac-verifier.yml'
   workflow_dispatch:
 
 permissions:

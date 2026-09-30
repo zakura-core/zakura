@@ -2,7 +2,7 @@
 
 This package runs the same pinned Zakura consensus source on native macOS ARM64,
 with conservative verification settings, and compares live committed results
-against the Linux x86_64 mainnet node `us-east-0` (`159.65.183.89`).
+against the existing Linux x86_64 mainnet reference. Endpoint addresses are private runtime configuration.
 
 The Mac imports trusted finalized snapshot state. Its assurance boundary starts
 at the recorded restored finalized height plus one. It does not independently
@@ -10,14 +10,12 @@ audit imported UTXOs/nullifiers or eliminate bugs shared by both implementations
 
 ## Fixed deployment
 
-- Scaleway `M2-M`, `fr-par-1`, 16 GB RAM, 256 GB SSD, default stable macOS.
-- Server name `zakura-mainnet-mac-verifier-poc`; Valargroup organization,
-  account owner `roman@valargroup.dev`.
-- Source `af944f5194ef2e9921bc96af017629450375013c`, Rust `1.97.1`, default features.
-- A 72-hour trial: €0.17/hour before tax, approximately €12.24 plus deletion time.
-  Check [current pricing](https://www.scaleway.com/en/pricing/apple-silicon/)
-  before ordering. `duration_24h` is the mandatory initial lease; do not select
-  `renewed_monthly`. Private networking and bandwidth upgrades are excluded.
+- Existing privately owned Apple Silicon Mac with at least 16 GB RAM and sufficient
+  SSD headroom. No provider ordering, billing, renewal, or automatic host deletion.
+- Pin consensus source `af944f5194ef2e9921bc96af017629450375013c` and Rust 1.97.1;
+  record the tooling revision separately. Build with one Cargo job.
+- Observe a 72-hour initial POC window; review at hour 60. Stop only POC services
+  at completion, retaining the private host and its unrelated workloads.
 - Mac RPC `127.0.0.1:28232`; adapter `127.0.0.1:28233`; P2P `127.0.0.1:28234`.
   Outbound peer discovery remains enabled. Mac-to-DO reverse SSH forwards only
   the adapter to DO loopback `28233`.
@@ -35,8 +33,8 @@ before setting their secrets; do not copy credentials from other projects:
 
 | Folder | Credentials | Access |
 | --- | --- | --- |
-| `/mac-verifier-poc` | Provider-returned sudo password and VNC URL | Operator only |
-| `/mac-verifier-poc/provisioner` | `SCW_SECRET_KEY`, `SCW_PROJECT_ID`, `INFISICAL_PROJECT_ID` | Operator only |
+| `/mac-verifier-poc` | Dedicated monitor identity JSON | Operator only |
+| `/mac-verifier-poc/provisioner` | Private deployment endpoint and SSH secrets | Operator only |
 | `/mac-verifier-poc/tunnel` | Dedicated Mac forwarding private key | Operator only |
 | `/mac-verifier-poc/monitor` | `MAC_VERIFIER_SLACK_BOT_TOKEN` | Dedicated monitor identity, read only |
 
@@ -50,40 +48,64 @@ keys `client_id` and `client_secret`, root-owned mode `0600`, at
 `/etc/zakura-mac-verifier/identity.json`. Systemd `LoadCredential` delivers it
 privately to the unprivileged runner. `identity.py create --receipt <private-path>`
 creates this identity, records its resource IDs, restricts authentication to the
-DO IP, and vaults `MAC_VERIFIER_MONITOR_IDENTITY_JSON` in the operator-only root
+reference egress CIDR (`MAC_VERIFIER_REFERENCE_CIDR` at runtime), and vaults `MAC_VERIFIER_MONITOR_IDENTITY_JSON` in the operator-only root
 folder. The client secret expires after 96 hours; create it when provisioning
 succeeds. `identity.py revoke --receipt <same-path>` revokes only that recorded
 identity. Secrets are fetched at startup and are not
 written to the runtime environment file or repository. Restart the monitor after
 credential rotation. Do not print CLI token/secret output.
 
-Install Roman's `~/.ssh/id_ed25519.pub` through Scaleway's SSH key management.
+Install Roman's public SSH key for administration. Use a separate deployment key
+for Actions and a separate tunnel key; never mirror Roman's personal private key.
 Do not install Roman's personal private key on either workload.
 
-## Provision and build
+## Private deployment configuration
 
-Run operator commands from this package. Keep inventory and evidence outside the
-checkout in a private operator directory. Only nonsecret inventory is printed:
+The manual `.github/workflows/deploy-mac-verifier.yml` workflow reads secrets only
+from GitHub environment `mac-verifier-private`. It has no host/IP input. Only
+`main` and the POC branch in the upstream repository can execute it. The Mac is
+never registered as a general Actions self-hosted runner.
 
-```bash
-infisical run --env=prod \
-  --projectId=c57a6889-6a7c-4d05-a54a-e4a4c0b14ee7 \
-  --path=/mac-verifier-poc/provisioner -- \
-  python3 provider.py create --inventory /private/operator/scw-inventory.json \
-  --confirmed-hourly-eur 0.17
-```
+Infisical remains the source of truth. Store deployment secrets in
+`prod:/mac-verifier-poc/provisioner`:
 
-`create` checks stock, RAM, and stable default OS, records the creation attempt
-before POST, records the resource ID before vaulting credentials, and reconciles
-an uncertain creation by inventory lookup. It never automatically repeats a POST
-whose outcome is unknown. If a same-named resource predates the recorded attempt,
-inspect it and use `adopt --server-id <verified-id>` explicitly. Every operation
-checks project, name, and machine type. Destruction also requires a recorded
-creation request owned by this POC; adopted resources cannot be destroyed. `inspect` returns safe inventory; `reboot`
-uses the provider API. Raw API responses include passwords and must not be logged.
+- `MAC_VERIFIER_HOST`, `MAC_VERIFIER_USER`, `MAC_VERIFIER_SSH_KEY`,
+  `MAC_VERIFIER_KNOWN_HOSTS`: private Mac IP, admin user, dedicated deployment key,
+  and authenticated pinned host keys.
+- `MAC_VERIFIER_REFERENCE_HOST`, `MAC_VERIFIER_REFERENCE_USER`,
+  `MAC_VERIFIER_REFERENCE_SSH_KEY`, `MAC_VERIFIER_REFERENCE_KNOWN_HOSTS`: reference
+  endpoint and dedicated deployment access. Both admin identities need
+  passwordless sudo for the installer. Keep these identities operator controlled.
+- `MAC_VERIFIER_TUNNEL_KEY`: a dedicated ed25519 private key, vaulted before use.
+- `MAC_VERIFIER_ID`: randomly generated `verifier-<32 hexadecimal characters>`;
+  no hostname, IP, hardware serial number or peer identity is used as its label.
+
+Initialize the opaque identifier with `python3 github_secrets.py init`. When the
+operator provides the IP, read it from a private local file with
+`python3 github_secrets.py bind-host --host-file <private-file>`; the value is
+vaulted without printing it. Run `python3 github_secrets.py sync` to propagate
+vaulted values to GitHub environment secrets through stdin. Never use Actions
+inputs, repository variables, workflow literals or command-line IP arguments.
+The runtime monitor identity stays in `prod:/mac-verifier-poc`, and its Slack
+secret stays in the monitor folder described above.
+
+Dispatch operations in order: `preflight`, `prepare`, `bootstrap`, `activate`,
+then `status`. Preparation builds the pinned source natively and installs inactive
+Mac services. Bootstrap imports and anchors state through temporary SSH forwards.
+Activation installs the Linux comparator and dashboard before starting Mac
+services. `stop` stops only the POC services; it never destroys the private host.
+Provision tooling first; obtain the private IP only after review and checks.
+
+SSH output and errors are captured privately and never relayed to Actions logs.
+No remote logs or endpoint-bearing receipts are uploaded as public artifacts.
+The `status` operation emits only the dashboard allowlist. Inspect failures over
+an authenticated private SSH session. Use hashed known-host entries when possible;
+verify keys through an existing trusted session, never unauthenticated keyscan.
+
+## Native build and bootstrap
 
 On the Mac install official Homebrew packages `python@3.12 protobuf zstd`. The
-provider supplies Xcode; verify its compiler is usable before building. This
+host must have Xcode command-line tools; verify its compiler is usable before building. This
 package builds bundled RocksDB, avoiding an implicit runtime dependency on a
 mutable system RocksDB library.
 
@@ -107,7 +129,8 @@ checkout. `build.sh` uses one Cargo job and refuses to run alongside `zakurad`.
 ## Install, bootstrap, activate
 
 1. On the Mac run `sudo python3 install.py mac-prepare --binary <built-zakurad>
-   --known-hosts <authenticated-DO-known-hosts>`. Obtain host keys from Roman's
+   --known-hosts <authenticated-reference-known-hosts>` (supply
+   `MAC_VERIFIER_REFERENCE_HOST` through the root installer environment). Obtain host keys from Roman's
    existing trusted SSH configuration or another authenticated source; an
    unauthenticated `ssh-keyscan` is insufficient. This creates a nonadmin service
    account, private state/log directories, launchd definitions, and a tunnel key.
@@ -115,11 +138,11 @@ checkout. `build.sh` uses one Cargo job and refuses to run alongside `zakurad`.
    using it. Copy only its public key to DO. Copy the native corpus evidence into
    `/Library/Application Support/ZakuraVerifier/evidence/`.
 3. From Roman's operator machine, open two temporary SSH sessions:
-   `ssh -NT -L 127.0.0.1:28235:127.0.0.1:8232 root@159.65.183.89`, then
+   `ssh -NT -L 127.0.0.1:28235:127.0.0.1:8232 <reference-admin>@<private-reference-host>`, then
    `ssh -NT -R 127.0.0.1:28235:127.0.0.1:28235 <Mac-admin>@<Mac-IP>`.
    Together they expose Linux's local RPC only at Mac loopback `28235`, without
    copying Roman's private key to the Mac. Verify the new Mac's SSH fingerprint
-   through the authenticated provider console before pinning its host key.
+   through the existing trusted administrative session before pinning its host key.
 4. Run `sudo python3 bootstrap.py --source <pinned-source> --tooling-sha <PR-head>`.
    The script pins the manifest, checks compressed size/checksum, bounds expanded
    extraction by free disk, excludes copied identity/nonfinalized state, reads
@@ -164,7 +187,12 @@ replay comparisons but cannot skip them. Reorgs rewind to a saved common block
 within 1,000 heights and replay; deeper or unavailable history requires an explicit
 rebootstrap. The monitor records coverage gaps, never treating an unavailable
 sample as equality. The JSON status and bounded audit logs are the reporting
-interface; there is no dashboard.
+interface. The private dashboard is served on Linux loopback port `28236` by
+`zakura-mac-verifier-dashboard.service`. Reach it through an authenticated SSH
+local forward. Its `/v1/status` response contains only the opaque verifier ID,
+coverage, qualification, alert count and incident count; it excludes raw errors,
+receipts, host addresses, OS labels and peer IDs. Do not add this Mac to the public
+fleet nodes TOML or proxy its raw adapter into the fleet dashboard.
 
 Alerts cover availability, missing coverage, resource samples, disk below 20 GB,
 memory pressure, tip stalls, prolonged catch-up, unexpected build/configuration,
@@ -197,7 +225,7 @@ After deployment, exercise and record:
 1. Mac node outage, recovery, and receipt-preserving restart.
 2. Reverse tunnel outage and automatic reconnection.
 3. Comparator restart with unchanged durable cursor.
-4. Provider API Mac reboot; verify node, adapter, and tunnel recover without login.
+4. Controlled Mac reboot after confirming unrelated workloads allow it; verify node, adapter, and tunnel recover without login.
 5. Real Slack incident and recovery DMs; invalid-token/rate-limit behavior remains
    covered by isolated tests rather than modifying production credentials.
 6. Divergence through isolated fixtures, preserving live databases.
@@ -209,26 +237,10 @@ Record actual peak RSS, memory availability, disk headroom, coverage boundary,
 source/configuration identity, and final compared height. `qualified` records that
 this gate has been achieved; current health remains separately visible in status.
 
-Export evidence regularly to DO and review by hour 60. `install.py export --output
-<new-directory>` exports local nonsecret receipts, logs, and monitor evidence;
-combine the two host exports in a private operator directory. By hour 72, unless
-explicitly extended, stop the Mac/monitor services, export final evidence, then:
-
-```bash
-infisical run --env=prod \
-  --projectId=c57a6889-6a7c-4d05-a54a-e4a4c0b14ee7 \
-  --path=/mac-verifier-poc/provisioner -- \
-  python3 provider.py destroy --inventory /private/operator/scw-inventory.json \
-  --evidence-export /private/operator/final-evidence
-```
-
-Deletion requires saved receipt/status/cursor/audit files and an elapsed minimum
-lease. Run `provider.py verify-deleted --inventory /private/operator/scw-inventory.json`
-through the same Infisical command afterward. It records confirmation only when
-the provider returns 404; repeat while deletion is pending and preserve the receipt. Billing
-continues until deletion completes. Power-off does not stop billing. The deadline
-is an operator responsibility, not an automatic provider TTL; schedule the trial
-follow-up when provisioning succeeds.
+Export evidence regularly to the reference and review by hour 60. Run
+`install.py export --output <new-directory>` locally on each host and keep exports
+private. After 72 hours, stop POC services unless explicitly extended; preserve
+the host, state, and evidence. This private-host POC has no provider teardown.
 
 `mac-uninstall` and `linux-uninstall` remove only POC service/SSH definitions and
 preserve state/evidence. Revoke the forwarding key, scoped monitor identity, and

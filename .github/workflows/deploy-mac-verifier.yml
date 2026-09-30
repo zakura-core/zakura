@@ -1,0 +1,45 @@
+name: Deploy private Mac verifier
+
+on:
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: Private host operation
+        type: choice
+        required: true
+        default: preflight
+        options: [preflight, prepare, bootstrap, activate, status, stop]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: private-mac-verifier-deployment
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    if: github.repository == 'zakura-core/zakura' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/codex/mac-verifier-poc')
+    environment: mac-verifier-private
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Execute private operation
+        env:
+          OPERATION: ${{ inputs.operation }}
+          MAC_VERIFIER_TOOLING_SHA: ${{ github.sha }}
+          MAC_VERIFIER_HOST: ${{ secrets.MAC_VERIFIER_HOST }}
+          MAC_VERIFIER_USER: ${{ secrets.MAC_VERIFIER_USER }}
+          MAC_VERIFIER_SSH_KEY: ${{ secrets.MAC_VERIFIER_SSH_KEY }}
+          MAC_VERIFIER_KNOWN_HOSTS: ${{ secrets.MAC_VERIFIER_KNOWN_HOSTS }}
+          MAC_VERIFIER_REFERENCE_HOST: ${{ secrets.MAC_VERIFIER_REFERENCE_HOST }}
+          MAC_VERIFIER_REFERENCE_USER: ${{ secrets.MAC_VERIFIER_REFERENCE_USER }}
+          MAC_VERIFIER_REFERENCE_SSH_KEY: ${{ secrets.MAC_VERIFIER_REFERENCE_SSH_KEY }}
+          MAC_VERIFIER_REFERENCE_KNOWN_HOSTS: ${{ secrets.MAC_VERIFIER_REFERENCE_KNOWN_HOSTS }}
+          MAC_VERIFIER_TUNNEL_KEY: ${{ secrets.MAC_VERIFIER_TUNNEL_KEY }}
+          MAC_VERIFIER_MONITOR_IDENTITY_JSON: ${{ secrets.MAC_VERIFIER_MONITOR_IDENTITY_JSON }}
+          MAC_VERIFIER_ID: ${{ secrets.MAC_VERIFIER_ID }}
+        run: python3 deploy/mac-verifier/private_deploy.py "$OPERATION"

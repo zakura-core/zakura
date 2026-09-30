@@ -13,9 +13,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from bootstrap import finalized_member, verify_manifest
 from common import RPC, Unavailable, canonical_record
 from monitor import Monitor, Remote, Slack
-from provider import Provider, public_inventory
 from rotate_logs import rotate
 import identity
+from dashboard import public_status
+from private_deploy import validate_host, SSH
 
 
 def record(height, fork=0):
@@ -186,6 +187,43 @@ class MonitorTests(unittest.TestCase):
 
 
 class BoundaryTests(unittest.TestCase):
+    def test_dashboard_allowlist_excludes_private_identity_everywhere(self):
+        private = {"host": "192.0.2.10", "error": "ssh to 192.0.2.10 failed",
+                   "verifier": {"receipt": {"os": "private-host.local", "peer_id": "secret-peer"}},
+                   "incidents": {"host-private": {"message": "private-host.local"}},
+                   "coverage_start": 11, "compared_through": 40, "qualified": True,
+                   "pending_alerts": 0, "sample_time": "192.0.2.10"}
+        result = public_status(private, "verifier-" + "a" * 32)
+        encoded = json.dumps(result)
+        for forbidden in ("192.0.2.10", "private-host", "secret-peer", "receipt", "error"):
+            self.assertNotIn(forbidden, encoded)
+        self.assertEqual(result["active_incidents"], 1)
+        self.assertEqual(result["compared_through"], 40)
+        self.assertIsNone(result["sample_time"])
+        with self.assertRaises(ValueError):
+            public_status(private, "192.0.2.10")
+
+    def test_secret_host_rejects_options_and_shell_injection(self):
+        self.assertEqual(validate_host("192.0.2.10"), "192.0.2.10")
+        for value in ("-oProxyCommand=bad", "host; command", "user@192.0.2.10", "192.0.2.10\n"):
+            with self.assertRaises(ValueError):
+                validate_host(value)
+
+    def test_ssh_captures_endpoint_bearing_output_and_never_relays_errors(self):
+        with tempfile.TemporaryDirectory() as directory:
+            environment = {"MAC_VERIFIER_HOST": "192.0.2.10", "MAC_VERIFIER_USER": "operator",
+                           "MAC_VERIFIER_SSH_KEY": "fixture-key", "MAC_VERIFIER_KNOWN_HOSTS": "fixture-host"}
+            with patch.dict("os.environ", environment):
+                ssh = SSH("MAC_VERIFIER_", directory)
+            with patch("subprocess.run") as run:
+                run.return_value.returncode = 1
+                run.return_value.stderr = "192.0.2.10 private diagnostic"
+                with self.assertRaises(Unavailable) as error:
+                    ssh.run("true")
+                self.assertNotIn("192.0.2.10", str(error.exception))
+                self.assertTrue(run.call_args.kwargs["capture_output"])
+                self.assertIn("StrictHostKeyChecking=yes", run.call_args.args[0])
+
     def test_missing_pool_and_malformed_hex(self):
         value = record(10)
         del value["pools"]["ironwood"]
@@ -258,6 +296,7 @@ class BoundaryTests(unittest.TestCase):
                         raise rejection
                 with patch.object(identity, "Transport", return_value=API()), \
                         patch.object(identity, "user_token", return_value="fixture"), \
+                        patch.dict("os.environ", {"MAC_VERIFIER_REFERENCE_CIDR": "192.0.2.1/32"}), \
                         patch.object(sys, "argv", ["identity.py", "create", "--receipt", str(path)]):
                     with self.assertRaises(urllib.error.HTTPError):
                         identity.main()
@@ -277,48 +316,6 @@ class BoundaryTests(unittest.TestCase):
             self.assertEqual(path.read_text(), "still writing\n")
             self.assertEqual(len(list(Path(directory).glob("child.log.*"))), 4)
 
-    def test_provider_unknown_creation_never_posts_twice(self):
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "inventory.json"
-            path.write_text(json.dumps({"create_attempted_at": 1}))
-            provider = Provider("00000000-0000-0000-0000-000000000001", "fixture")
-            with patch.object(provider, "find", return_value=None), patch.object(provider, "call") as api:
-                with self.assertRaises(Unavailable):
-                    provider.create(path, "0.17")
-                api.assert_not_called()
-
-    def test_provider_inventory_never_contains_password_or_vnc(self):
-        server = {"id": "fixture", "name": "fixture", "project_id": "fixture", "type": "M2-M",
-                  "zone": "fr-par-1", "status": "ready", "created_at": "2026-09-30T00:00:00Z",
-                  "deletable_at": "2026-10-01T00:00:00Z", "sudo_password": "fixture-private",
-                  "vnc_url": "fixture-private"}
-        self.assertNotIn("fixture-private", json.dumps(public_inventory(server)))
-
-    def test_deletion_only_confirmed_by_recorded_resource_404(self):
-        project = "00000000-0000-0000-0000-000000000001"
-        provider = Provider(project, "fixture")
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "inventory.json"
-            saved = {"project_id": project, "server_id": "fixture", "deletion_requested_at": 1}
-            path.write_text(json.dumps(saved))
-            with patch.object(provider, "get", return_value={"status": "deleting"}):
-                self.assertFalse(provider.verify_deleted(path)["billing_stopped"])
-            for code in (403, 503):
-                error = urllib.error.HTTPError("fixture", code, "fixture", {}, None)
-                with patch.object(provider, "get", side_effect=error):
-                    with self.assertRaises(urllib.error.HTTPError):
-                        provider.verify_deleted(path)
-                self.assertNotIn("deletion_confirmed_at", json.loads(path.read_text()))
-                error.close()
-            error = urllib.error.HTTPError("fixture", 404, "fixture", {}, None)
-            with patch.object(provider, "get", side_effect=error):
-                self.assertTrue(provider.verify_deleted(path)["billing_stopped"])
-            self.assertIn("deletion_confirmed_at", json.loads(path.read_text()))
-            error.close()
-            saved.pop("deletion_requested_at")
-            path.write_text(json.dumps(saved))
-            with self.assertRaises(Unavailable):
-                provider.verify_deleted(path)
 
 
 if __name__ == "__main__":

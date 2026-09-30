@@ -64,6 +64,8 @@ def mac_account():
 def install_mac(args):
     if sys.platform != "darwin":
         raise ValueError("Mac installer requires macOS")
+    from private_deploy import validate_host
+    reference_host = validate_host(os.environ["MAC_VERIFIER_REFERENCE_HOST"])
     account = mac_account()
     BASE.mkdir(parents=True, exist_ok=True)
     BASE.chmod(0o755)
@@ -113,7 +115,7 @@ def install_mac(args):
          "-o", "BatchMode=yes", "-o", "ExitOnForwardFailure=yes", "-o", "ConnectTimeout=10",
          "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3",
          "-o", "StrictHostKeyChecking=yes", "-o", "UserKnownHostsFile=" + str(known_hosts),
-         "-R", "127.0.0.1:28233:127.0.0.1:28233", TUNNEL_USER + "@159.65.183.89"],
+         "-R", "127.0.0.1:28233:127.0.0.1:28233", TUNNEL_USER + "@" + reference_host],
     ]
     commands.append([python, str(BASE / "code/rotate_logs.py")])
     for label, command in zip(LABELS, commands):
@@ -217,6 +219,26 @@ UMask=0077
 WantedBy=multi-user.target
 ''')
     call("systemctl", "daemon-reload")
+    write("/etc/systemd/system/zakura-mac-verifier-dashboard.service", f'''[Unit]
+Description=Opaque verifier status dashboard
+After=network-online.target
+
+[Service]
+User={LINUX_USER}
+Group={LINUX_USER}
+ExecStart=/usr/bin/python3 {LINUX_CODE}/dashboard.py
+Restart=always
+RestartSec=15
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
+''')
+    call("systemctl", "daemon-reload")
     print("Prepared Linux monitor; install scoped identity.json before activation.")
 
 
@@ -281,11 +303,12 @@ def main():
             raise ValueError("invalid Universal Auth identity file")
         if (ETC / "identity.json").stat().st_uid != 0 or (ETC / "identity.json").stat().st_mode & 0o077:
             raise ValueError("identity.json must be root-owned mode 0600")
-        call("systemctl", "enable", "--now", "zakura-mac-verifier")
+        call("systemctl", "enable", "--now", "zakura-mac-verifier", "zakura-mac-verifier-dashboard")
     elif args.command in ("linux-stop", "linux-uninstall"):
-        call("systemctl", "disable", "--now", "zakura-mac-verifier")
+        call("systemctl", "disable", "--now", "zakura-mac-verifier", "zakura-mac-verifier-dashboard")
         if args.command == "linux-uninstall":
             Path("/etc/systemd/system/zakura-mac-verifier.service").unlink(missing_ok=True)
+            Path("/etc/systemd/system/zakura-mac-verifier-dashboard.service").unlink(missing_ok=True)
             Path("/etc/ssh/sshd_config.d/70-zakura-mac-verifier.conf").unlink(missing_ok=True)
             call("sshd", "-t")
             call("systemctl", "reload", "ssh")

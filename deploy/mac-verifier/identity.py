@@ -2,6 +2,8 @@
 """Create a no-access identity plus one narrowly scoped monitor permission."""
 import argparse
 import json
+import os
+import ipaddress
 from pathlib import Path
 import re
 import subprocess
@@ -44,6 +46,7 @@ def main():
         atomic_json(path, state)
         print("POC monitor identity revoked")
         return
+    trusted_cidr = str(ipaddress.ip_network(os.environ["MAC_VERIFIER_REFERENCE_CIDR"], strict=True))
     if state.get("complete") or state.get("revoked"):
         print("Recorded identity already configured or revoked; inspect its receipt")
         return
@@ -87,8 +90,8 @@ def main():
         atomic_json(path, state)
     if not state.get("client_id"):
         result = api(f"/v1/auth/universal-auth/identities/{identity}", {
-            "clientSecretTrustedIps": [{"ipAddress": "159.65.183.89/32"}],
-            "accessTokenTrustedIps": [{"ipAddress": "159.65.183.89/32"}],
+            "clientSecretTrustedIps": [{"ipAddress": trusted_cidr}],
+            "accessTokenTrustedIps": [{"ipAddress": trusted_cidr}],
             "accessTokenTTL": 300, "accessTokenMaxTTL": 300,
         })
         state["client_id"] = result["identityUniversalAuth"]["clientId"]

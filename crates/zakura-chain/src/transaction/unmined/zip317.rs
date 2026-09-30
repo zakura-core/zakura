@@ -21,6 +21,15 @@ mod tests;
 // TODO: allow Amount<NonNegative> in constants
 const MARGINAL_FEE: u64 = 5_000;
 
+/// Zakura's minimum relay fee in zatoshis per conventional action.
+const MIN_MEMPOOL_FEE_PER_ACTION: u64 = 400;
+
+/// Nominal per-kilobyte relay fee reported by legacy RPC responses.
+///
+/// The actual mempool minimum is [`MIN_MEMPOOL_FEE_PER_ACTION`] per logical
+/// action, so this informational value does not represent that minimum.
+pub const MIN_MEMPOOL_TX_FEE_RATE: usize = 100;
+
 /// The number of grace logical actions allowed by the ZIP-317 fee calculation.
 const GRACE_ACTIONS: u32 = 2;
 
@@ -39,31 +48,6 @@ const BLOCK_PRODUCTION_WEIGHT_RATIO_CAP: f32 = 10.0;
 ///
 /// This avoids special handling for transactions with zero weight.
 const MIN_BLOCK_PRODUCTION_SUBSTITUTE_FEE: i64 = 1;
-
-/// If a tx has more than `BLOCK_UNPAID_ACTION_LIMIT` "unpaid actions", it will never be mined by
-/// the [_Recommended algorithm for block template construction_][alg-def], implemented in Zebra
-/// [here][alg-impl].
-///
-/// [alg-def]: https://zips.z.cash/zip-0317#recommended-algorithm-for-block-template-construction
-/// [alg-impl]: https://github.com/zcashfoundation/zebra/blob/95e4d0973caac075b47589f6a05f9d744acd3db3/zakura-rpc/src/methods/get_block_template_rpcs/zip317.rs#L39
-pub const BLOCK_UNPAID_ACTION_LIMIT: u32 = 0;
-
-/// The minimum fee per kilobyte for Zebra mempool transactions.
-/// Also used as the minimum fee for a mempool transaction.
-///
-/// Based on `DEFAULT_MIN_RELAY_TX_FEE` in `zcashd`:
-/// <https://github.com/zcash/zcash/blob/f512291ff20098291442e83713de89bcddc07546/src/main.h#L71-L72>
-///
-/// This is a `usize` to simplify transaction size-based calculation code.
-pub const MIN_MEMPOOL_TX_FEE_RATE: usize = 100;
-
-/// The fee cap for [`MIN_MEMPOOL_TX_FEE_RATE`] minimum required mempool fees.
-///
-/// Based on `LEGACY_DEFAULT_FEE` in `zcashd`:
-/// <https://github.com/zcash/zcash/blob/9e856cfc5b81aa2607a16a23ff5584ea10014de6/src/amount.h#L35-L36>
-///
-/// This is a `usize` to simplify transaction size-based calculation code.
-pub const MEMPOOL_TX_FEE_REQUIREMENT_CAP: usize = 1000;
 
 /// Returns the conventional fee for `transaction`, as defined by [ZIP-317].
 ///
@@ -170,60 +154,15 @@ pub fn conventional_actions(transaction: &Transaction) -> u32 {
     max(GRACE_ACTIONS, logical_actions)
 }
 
-/// Make ZIP-317 checks before inserting a transaction into the mempool.
+/// Check Zakura's minimum fee before inserting a transaction into the mempool.
 pub fn mempool_checks(
-    unpaid_actions: u32,
+    transaction: &UnminedTx,
     miner_fee: Amount<NonNegative>,
-    transaction_size: usize,
 ) -> Result<(), Error> {
-    // # Standard Rule
-    //
-    // > If a transaction has more than `block_unpaid_action_limit` "unpaid actions" as defined by the
-    // > Recommended algorithm for block template construction, it will never be mined by that algorithm.
-    // > Nodes MAY drop these transactions.
-    //
-    // <https://zips.z.cash/zip-0317#transaction-relaying>
-    if unpaid_actions > BLOCK_UNPAID_ACTION_LIMIT {
-        return Err(Error::UnpaidActions);
-    }
-
-    // # Standard Rule
-    //
-    // > Nodes that normally relay transactions are expected to do so for transactions that pay at least the
-    // > conventional fee as specified in this ZIP.
-    //
-    // <https://zips.z.cash/zip-0317#transaction-relaying>
-    //
-    // In Zebra, we use a similar minimum fee rate to `zcashd` v5.5.0 and later.
-    // Transactions must pay a fee of at least 100 zatoshis per 1000 bytes of serialized size,
-    // with a maximum fee of 1000 zatoshis.
-    //
-    // <https://github.com/zcash/zcash/blob/9e856cfc5b81aa2607a16a23ff5584ea10014de6/src/amount.cpp#L24-L37>
-    //
-    // In zcashd this is `DEFAULT_MIN_RELAY_TX_FEE` and `LEGACY_DEFAULT_FEE`:
-    // <https://github.com/zcash/zcash/blob/f512291ff20098291442e83713de89bcddc07546/src/main.h#L71-L72>
-    // <https://github.com/zcash/zcash/blob/9e856cfc5b81aa2607a16a23ff5584ea10014de6/src/amount.h#L35-L36>
-    //
-    // ## Note
-    //
-    // If the check above for the maximum number of unpaid actions passes with
-    // [`BLOCK_UNPAID_ACTION_LIMIT`] set to zero, then there is no way for the legacy check below to
-    // fail. This renders the legacy check redundant in that case.
-
-    const KILOBYTE: usize = 1000;
-
-    let max_block_size = usize::try_from(MAX_BLOCK_BYTES).map_err(|_| Error::InvalidMinFee)?;
-
-    // Blocks, and therefore, txs are limited to 2 MB and usize is at least 4 GB, implying that we
-    // can multiply MIN_MEMPOOL_TX_FEE_RATE by transaction_size without overflow.
-    assert!(MIN_MEMPOOL_TX_FEE_RATE < usize::MAX / max_block_size);
-
-    let min_fee: u64 = (MIN_MEMPOOL_TX_FEE_RATE * transaction_size / KILOBYTE)
-        .clamp(MIN_MEMPOOL_TX_FEE_RATE, MEMPOOL_TX_FEE_REQUIREMENT_CAP)
-        .try_into()
-        .map_err(|_| Error::InvalidMinFee)?;
-
-    let min_fee = Amount::<NonNegative>::try_from(min_fee).map_err(|_| Error::InvalidMinFee)?;
+    let fee_per_action =
+        Amount::<NonNegative>::try_from(MIN_MEMPOOL_FEE_PER_ACTION).expect("fee fits in amount");
+    let min_fee = (fee_per_action * conventional_actions(&transaction.transaction).into())
+        .expect("minimum fee is limited by the transaction size limit");
 
     if miner_fee < min_fee {
         return Err(Error::FeeBelowMinimumRate);
@@ -232,16 +171,10 @@ pub fn mempool_checks(
     Ok(())
 }
 
-/// Errors related to ZIP-317.
+/// Errors related to mempool fee policy.
 #[derive(Error, Clone, Debug, PartialEq, Eq)]
 #[allow(missing_docs)]
 pub enum Error {
-    #[error("Unpaid actions is higher than the limit")]
-    UnpaidActions,
-
-    #[error("Transaction fee is below the minimum fee rate")]
+    #[error("Transaction fee is below the minimum relay fee")]
     FeeBelowMinimumRate,
-
-    #[error("Minimum fee could not be calculated")]
-    InvalidMinFee,
 }

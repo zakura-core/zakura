@@ -65,6 +65,42 @@ fn reserves_network_specific_header_and_transaction_count_sizes() {
 }
 
 #[test]
+fn selects_transaction_at_minimum_relay_fee() {
+    let network = Network::Mainnet;
+    let unmined_tx = network
+        .unmined_transactions_in_blocks(..)
+        .next()
+        .expect("test network has an unmined transaction")
+        .transaction;
+    let actions = transaction::zip317::conventional_actions(&unmined_tx.transaction);
+    let miner_fee = Amount::try_from(i64::from(actions) * 400).expect("fee fits in amount");
+    let verified_tx = transaction::VerifiedUnminedTx::new(
+        unmined_tx,
+        miner_fee,
+        0,
+        0,
+        std::sync::Arc::new(Vec::new()),
+    )
+    .expect("transaction pays the minimum relay fee");
+    assert!(!verified_tx.pays_conventional_fee());
+    assert!(verified_tx.unpaid_actions > 0);
+
+    let miner_params =
+        MinerParams::from(Address::from(TransparentAddress::PublicKeyHash([0x7e; 20])));
+    let selected = select_mempool_transactions(
+        &network,
+        Height(1_000_000),
+        &miner_params,
+        None,
+        vec![verified_tx],
+        TransactionDependencies::default(),
+    )
+    .expect("block template is valid");
+
+    assert_eq!(selected.len(), 1);
+}
+
+#[test]
 fn reserves_serialized_block_and_pool_tag_overhead() {
     let network = Network::Mainnet;
     let height = Height(1_000_000);
@@ -410,7 +446,6 @@ mod zip218_template_limits {
         BlockTemplateLimits {
             remaining_bytes: usize::MAX,
             remaining_sigops: u32::MAX,
-            remaining_unpaid_actions: u32::MAX,
             remaining_orchard_actions: ORCHARD_PROTOCOL_BLOCK_ACTION_LIMIT,
             remaining_ironwood_actions: ORCHARD_PROTOCOL_BLOCK_ACTION_LIMIT,
             remaining_sapling_ios: SAPLING_BLOCK_IO_LIMIT,

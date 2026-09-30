@@ -588,13 +588,11 @@ where
             let mempool_transaction = req.mempool_transaction();
             let mut miner_fee = None;
             if let Some(unmined_tx) = mempool_transaction.as_ref() {
-                // Apply ZIP-317 policy before expensive cryptographic verification.
+                // Apply the mempool fee policy before expensive cryptographic verification.
                 // VerifiedUnminedTx::new() repeats this check to preserve its constructor
                 // invariant.
                 let fee = Self::miner_fee(tx.as_ref(), &spent_utxos)?;
-                let unpaid_actions = transaction::zip317::unpaid_actions(unmined_tx, fee);
-
-                transaction::zip317::mempool_checks(unpaid_actions, fee, unmined_tx.size())?;
+                transaction::zip317::mempool_checks(unmined_tx, fee)?;
                 miner_fee = Some(fee);
             }
 

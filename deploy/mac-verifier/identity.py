@@ -15,7 +15,7 @@ from common import Transport, Unavailable, atomic_json, read_json
 
 PROJECT = "c57a6889-6a7c-4d05-a54a-e4a4c0b14ee7"
 ORGANIZATION = "a0ad6bcd-d39f-4295-bd0d-ee09c97a1ea8"
-NAME = "zakura-mainnet-mac-verifier-poc-monitor"
+NAME = "zakura-mainnet-mac-verifier-monitor"
 
 
 def user_token():
@@ -40,11 +40,11 @@ def main():
     state = read_json(path) if path.exists() else {"request_id": str(uuid.uuid4())}
     if args.command == "revoke":
         if not state.get("identity_id"):
-            raise Unavailable("no recorded POC identity")
+            raise Unavailable("no recorded verifier identity")
         api("/v1/identities/" + state["identity_id"], method="DELETE")
         state["revoked"] = True
         atomic_json(path, state)
-        print("POC monitor identity revoked")
+        print("Verifier monitor identity revoked")
         return
     trusted_cidr = str(ipaddress.ip_network(os.environ["MAC_VERIFIER_REFERENCE_CIDR"], strict=True))
     if state.get("complete") or state.get("revoked"):
@@ -62,7 +62,7 @@ def main():
         atomic_json(path, state)
         try:
             result = api("/v1/identities", {"name": NAME, "organizationId": ORGANIZATION,
-                                           "role": "no-access", "metadata": [{"key": "poc_request",
+                                           "role": "no-access", "metadata": [{"key": "verifier_request",
                                                                                  "value": state["request_id"]}]})
         except urllib.error.HTTPError as error:
             if error.code in (400, 401, 402, 403, 404, 405, 409, 422):
@@ -82,7 +82,7 @@ def main():
             "identityId": identity, "projectId": PROJECT, "slug": "mac-verifier-monitor-read",
             "type": {"isTemporary": False}, "permissions": [
                 {"subject": "secrets", "action": "read", "conditions": {
-                    "environment": "prod", "secretPath": "/mac-verifier-poc/monitor",
+                    "environment": "prod", "secretPath": "/mac-verifier/monitor",
                     "secretName": "MAC_VERIFIER_SLACK_BOT_TOKEN"}},
             ],
         })
@@ -101,14 +101,14 @@ def main():
     state["secret_creation_attempted"] = True
     atomic_json(path, state)
     result = api(f"/v1/auth/universal-auth/identities/{identity}/client-secrets", {
-        "description": "72-hour POC " + state["request_id"], "ttl": 96 * 3600, "numUsesLimit": 0,
+        "description": "72-hour verification " + state["request_id"], "ttl": 96 * 3600, "numUsesLimit": 0,
     })
     try:
         with tempfile.TemporaryDirectory(prefix="zakura-monitor-identity-") as directory:
             credential = Path(directory) / "identity.json"
             atomic_json(credential, {"client_id": state["client_id"], "client_secret": result["clientSecret"]})
             command = ["infisical", "secrets", "set", "--env=prod", "--projectId=" + PROJECT,
-                       "--path=/mac-verifier-poc", "--silent",
+                       "--path=/mac-verifier", "--silent",
                        "MAC_VERIFIER_MONITOR_IDENTITY_JSON=@" + str(credential)]
             saved = subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60)
             if saved.returncode:

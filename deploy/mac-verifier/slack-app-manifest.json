@@ -1,7 +1,7 @@
 {
   "display_information": {
     "name": "Zakura Mac Verifier",
-    "description": "Direct incident alerts for the native Mac mainnet verifier POC",
+    "description": "Direct incident alerts for the native Mac mainnet verifier",
     "background_color": "#243447"
   },
   "features": {

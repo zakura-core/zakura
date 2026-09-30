@@ -1,4 +1,4 @@
-# Native Mac mainnet verifier POC
+# Native Mac mainnet verifier
 
 This package runs the same pinned Zakura consensus source on native macOS ARM64,
 with conservative verification settings, and compares live committed results
@@ -14,7 +14,7 @@ audit imported UTXOs/nullifiers or eliminate bugs shared by both implementations
   SSD headroom. No provider ordering, billing, renewal, or automatic host deletion.
 - Pin consensus source `af944f5194ef2e9921bc96af017629450375013c` and Rust 1.97.1;
   record the tooling revision separately. Build with one Cargo job.
-- Observe a 72-hour initial POC window; review at hour 60. Stop only POC services
+- Observe a 72-hour initial verification window; review at hour 60. Stop only verifier services
   at completion, retaining the private host and its unrelated workloads.
 - Mac RPC `127.0.0.1:28232`; adapter `127.0.0.1:28233`; P2P `127.0.0.1:28234`.
   Outbound peer discovery remains enabled. Mac-to-DO reverse SSH forwards only
@@ -33,17 +33,17 @@ before setting their secrets; do not copy credentials from other projects:
 
 | Folder | Credentials | Access |
 | --- | --- | --- |
-| `/mac-verifier-poc` | Dedicated monitor identity JSON | Operator only |
-| `/mac-verifier-poc/provisioner` | Private deployment endpoint and SSH secrets | Operator only |
-| `/mac-verifier-poc/tunnel` | Dedicated Mac forwarding private key | Operator only |
-| `/mac-verifier-poc/monitor` | `MAC_VERIFIER_SLACK_BOT_TOKEN` | Dedicated monitor identity, read only |
+| `/mac-verifier` | Dedicated monitor identity JSON | Operator only |
+| `/mac-verifier/provisioner` | Private deployment endpoint and SSH secrets | Operator only |
+| `/mac-verifier/tunnel` | Dedicated Mac forwarding private key | Operator only |
+| `/mac-verifier/monitor` | `MAC_VERIFIER_SLACK_BOT_TOKEN` | Dedicated monitor identity, read only |
 
 Use `slack-app-manifest.json` to create a dedicated Slack bot with `im:write` and `chat:write` in workspace
 `T0A80TZAXK5`. Alerts target Roman `U0A81KAPYMR`; workspace identity and DM channel
 are checked before sending. Never deploy an existing broadly scoped operator bot.
 
 Use a dedicated Infisical Universal Auth identity restricted to read secrets in
-`prod:/mac-verifier-poc/monitor`. On DO install its client ID/secret as JSON with
+`prod:/mac-verifier/monitor`. On DO install its client ID/secret as JSON with
 keys `client_id` and `client_secret`, root-owned mode `0600`, at
 `/etc/zakura-mac-verifier/identity.json`. Systemd `LoadCredential` delivers it
 privately to the unprivileged runner. `identity.py create --receipt <private-path>`
@@ -63,11 +63,13 @@ Do not install Roman's personal private key on either workload.
 
 The manual `.github/workflows/deploy-mac-verifier.yml` workflow reads secrets only
 from GitHub environment `mac-verifier-private`. It has no host/IP input. Only
-`main` and the POC branch in the upstream repository can execute it. The Mac is
+`main` and the approved branch configured in repository variable
+`MAC_VERIFIER_DEPLOY_BRANCH` can execute it; keep the environment branch policy
+restricted to those same branches. The Mac is
 never registered as a general Actions self-hosted runner.
 
 Infisical remains the source of truth. Store deployment secrets in
-`prod:/mac-verifier-poc/provisioner`:
+`prod:/mac-verifier/provisioner`:
 
 - `MAC_VERIFIER_HOST`, `MAC_VERIFIER_USER`, `MAC_VERIFIER_SSH_KEY`,
   `MAC_VERIFIER_KNOWN_HOSTS`: private Mac IP, admin user, dedicated deployment key,
@@ -86,7 +88,7 @@ operator provides the IP, read it from a private local file with
 vaulted without printing it. Run `python3 github_secrets.py sync` to propagate
 vaulted values to GitHub environment secrets through stdin. Never use Actions
 inputs, repository variables, workflow literals or command-line IP arguments.
-The runtime monitor identity stays in `prod:/mac-verifier-poc`, and its Slack
+The runtime monitor identity stays in `prod:/mac-verifier`, and its Slack
 secret stays in the monitor folder described above.
 
 Dispatch operations in order: `preflight`, `prepare`, `bootstrap`, `activate`,
@@ -94,11 +96,14 @@ then `status`. Preparation builds the pinned source natively and installs inacti
 Mac services. Bootstrap imports and anchors state through temporary SSH forwards.
 Activation installs the Linux comparator and a loopback status bridge, updates
 the existing mainnet dashboard, and starts Mac
-services. `stop` stops only the POC services; it never destroys the private host.
+services. `stop` stops only the verifier services; it never destroys the private host.
 Provision tooling first; obtain the private IP only after review and checks.
 
 SSH output and errors are captured privately and never relayed to Actions logs.
 No remote logs or endpoint-bearing receipts are uploaded as public artifacts.
+Native corpus CI uploads only the structured receipt, never raw test logs. The
+existing dashboard redacts IPv4 and IPv6 literals across all public JSON responses,
+in addition to the verifier field allowlist.
 The `status` operation emits only the dashboard allowlist. Inspect failures over
 an authenticated private SSH session. Use hashed known-host entries when possible;
 verify keys through an existing trusted session, never unauthenticated keyscan.
@@ -216,7 +221,7 @@ The alert outbox persists stable message IDs before delivery, retries rate limit
 and caps pending messages at 128. An overflow is exposed in status and prevents a
 clean qualification; investigate instead of silently discarding incident evidence.
 Slack delivery failures remain pending. Slack's handling of retried IDs is not an
-exactly-once delivery guarantee. DO or Slack outages are dependencies of this POC;
+exactly-once delivery guarantee. DO or Slack outages are dependencies of this verification;
 there is no independent monitor of the comparator host yet.
 
 ## Qualification and trial end
@@ -244,13 +249,13 @@ this gate has been achieved; current health remains separately visible in status
 
 Export evidence regularly to the reference and review by hour 60. Run
 `install.py export --output <new-directory>` locally on each host and keep exports
-private. After 72 hours, stop POC services unless explicitly extended; preserve
-the host, state, and evidence. This private-host POC has no provider teardown.
+private. After 72 hours, stop verifier services unless explicitly extended; preserve
+the host, state, and evidence. This private-host verification has no provider teardown.
 
-`mac-uninstall` and `linux-uninstall` remove only POC service/SSH definitions and
+`mac-uninstall` and `linux-uninstall` remove only verifier service/SSH definitions and
 preserve state/evidence. Revoke the forwarding key, scoped monitor identity, and
-POC Slack credential after teardown. Do not revoke existing node credentials.
+verifier Slack credential after teardown. Do not revoke existing node credentials.
 
 Keep the implementation PR draft. Deployment, native receipts, delivered alerts,
 reboot recovery, and the qualification window must all have direct evidence before
-claiming the POC complete.
+claiming the verification complete.

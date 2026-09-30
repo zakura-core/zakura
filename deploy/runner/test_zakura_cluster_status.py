@@ -1140,6 +1140,27 @@ class RateLimiterTests(unittest.TestCase):
         self.assertTrue(limiter.allow("client-a", now=11))
 
 
+class AddressPrivacyTests(unittest.TestCase):
+    def test_nested_addresses_and_keys_are_redacted(self):
+        addresses = ["192.0.2.17", "2001:db8::17", "::1", "::ffff:192.0.2.17", "fe80::17%en0"]
+        for address in addresses:
+            with self.subTest(address=address):
+                payload = {address: [{"error": f"connection to [{address}]:8232 failed"}]}
+                encoded = json.dumps(status.redact_public_addresses(payload))
+                self.assertNotIn(address, encoded)
+                self.assertIn("[redacted-address]", encoded)
+                self.assertNotIn(address, status.redact_public_addresses(f"peer={address}."))
+
+    def test_non_address_values_survive(self):
+        payload = {"time": "2026-09-30T11:25:27Z", "version": "1.97.1", "height": 3500000,
+                   "hash": "a" * 64, "bad": "999.999.999.999", "available": True}
+        self.assertEqual(status.redact_public_addresses(payload), payload)
+
+    def test_bridge_refuses_redirects(self):
+        with self.assertRaises(ValueError):
+            status.NoVerifierRedirect().redirect_request(None, None, 302, "", {}, "https://example.org")
+
+
 class HttpHandlerTests(unittest.TestCase):
     def setUp(self):
         self.original_collector = status.COLLECTOR
@@ -1186,6 +1207,14 @@ class HttpHandlerTests(unittest.TestCase):
         self.assertEqual(response.headers["Cache-Control"], "no-store")
         self.assertEqual(response.headers["X-Content-Type-Options"], "nosniff")
         self.assertEqual(payload["network"], "testnet")
+
+    def test_public_response_redacts_diagnostic_addresses(self):
+        status.COLLECTOR.rows[0]["rpc_metadata_error"] = "peer 192.0.2.17 and [2001:db8::17] failed"
+        with urllib.request.urlopen(f"{self.base_url}/data") as response:
+            body = response.read().decode()
+        self.assertNotIn("192.0.2.17", body)
+        self.assertNotIn("2001:db8::17", body)
+        self.assertIn("[redacted-address]", body)
 
     def test_options_returns_204_for_allowed_origin(self):
         request = urllib.request.Request(

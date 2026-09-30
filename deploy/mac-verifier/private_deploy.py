@@ -13,7 +13,7 @@ import tempfile
 from common import Unavailable
 
 SOURCE = "af944f5194ef2e9921bc96af017629450375013c"
-REMOTE = "/var/tmp/zakura-verifier-poc"
+REMOTE = "/var/tmp/zakura-verifier"
 BASE = "/Library/Application Support/ZakuraVerifier"
 
 

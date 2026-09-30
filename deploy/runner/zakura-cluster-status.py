@@ -1023,11 +1023,40 @@ class RateLimiter:
             return True
 
 
+def redact_public_addresses(value):
+    """Remove address literals from every public JSON string, including keys."""
+    if isinstance(value, dict):
+        return {redact_public_addresses(key): redact_public_addresses(item)
+                for key, item in value.items()}
+    if isinstance(value, list):
+        return [redact_public_addresses(item) for item in value]
+    if not isinstance(value, str):
+        return value
+
+    def redact(match):
+        literal = match.group()
+        candidate = literal.rstrip(".")
+        try:
+            ipaddress.ip_address(candidate)
+        except ValueError:
+            return literal
+        return "[redacted-address]" + literal[len(candidate):]
+
+    # Match IPv6 before IPv4 so mapped addresses are removed as one literal.
+    pattern = r"(?:[a-fA-F0-9]*:){2,}[a-fA-F0-9:.]*(?:%[\w.-]+)?|(?:\d{1,3}\.){3}\d{1,3}"
+    return re.sub(pattern, redact, value)
+
+
+class NoVerifierRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise ValueError("verifier bridge redirect refused")
+
+
 def private_verifier_status() -> dict:
     """Read only the local sanitized bridge; never poll a private host directly."""
     try:
         request = urllib.request.Request("http://127.0.0.1:28236/v1/status")
-        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoVerifierRedirect())
         with opener.open(request, timeout=1) as response:
             raw = response.read(65537)
         if len(raw) > 65536:
@@ -3778,6 +3807,8 @@ class Handler(BaseHTTPRequestHandler):
         content_type: str,
         headers: dict[str, str] | None = None,
     ) -> None:
+        if body and content_type.startswith("application/json"):
+            body = json.dumps(redact_public_addresses(json.loads(body)), separators=(",", ":")).encode()
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))

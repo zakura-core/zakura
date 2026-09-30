@@ -1,4 +1,4 @@
-name: Mac verifier POC
+name: Mac verifier
 
 on:
   pull_request:
@@ -6,7 +6,7 @@ on:
       - 'deploy/mac-verifier/**'
       - 'deploy/runner/zakura-cluster-status.py'
       - 'deploy/runner/test_zakura_cluster_status.py'
-      - '.github/workflows/mac-verifier-poc.yml'
+      - '.github/workflows/mac-verifier.yml'
       - '.github/workflows/deploy-mac-verifier.yml'
   push:
     branches: [main]
@@ -14,7 +14,7 @@ on:
       - 'deploy/mac-verifier/**'
       - 'deploy/runner/zakura-cluster-status.py'
       - 'deploy/runner/test_zakura_cluster_status.py'
-      - '.github/workflows/mac-verifier-poc.yml'
+      - '.github/workflows/mac-verifier.yml'
       - '.github/workflows/deploy-mac-verifier.yml'
   workflow_dispatch:
 
@@ -62,9 +62,9 @@ jobs:
           export CARGO_TARGET_DIR="${RUNNER_TEMP}/mac-verifier-target"
           python3 deploy/mac-verifier/corpus.py \
             --source consensus-source --output "${RUNNER_TEMP}/corpus-evidence"
-      - name: Upload native receipts and logs
+      - name: Upload native receipt only
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: mac-verifier-linux-corpus
-          path: ${{ runner.temp }}/corpus-evidence
+          path: ${{ runner.temp }}/corpus-evidence/corpus-receipt.json

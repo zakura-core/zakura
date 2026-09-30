@@ -19,7 +19,7 @@ concurrency:
 
 jobs:
   deploy:
-    if: github.repository == 'zakura-core/zakura' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/codex/mac-verifier-poc')
+    if: github.repository == 'zakura-core/zakura' && (github.ref == 'refs/heads/main' || github.ref_name == vars.MAC_VERIFIER_DEPLOY_BRANCH)
     environment: mac-verifier-private
     runs-on: ubuntu-24.04
     timeout-minutes: 300

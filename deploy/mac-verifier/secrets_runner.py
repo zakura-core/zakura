@@ -16,7 +16,7 @@ def main():
     token = client.json("https://app.infisical.com/api/v1/auth/universal-auth/login",
                         {"clientId": identity["client_id"], "clientSecret": identity["client_secret"]})["accessToken"]
     query = urllib.parse.urlencode({"workspaceId": metadata["project_id"], "environment": "prod",
-                                   "secretPath": "/mac-verifier-poc/monitor", "include_imports": "false",
+                                   "secretPath": "/mac-verifier/monitor", "include_imports": "false",
                                    "type": "shared"})
     result = client.json("https://app.infisical.com/api/v3/secrets/raw/MAC_VERIFIER_SLACK_BOT_TOKEN?" + query,
                          headers={"Authorization": "Bearer " + token})

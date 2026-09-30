@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Install only POC-owned files/services; preserve existing mainnet services."""
+"""Install only verifier-owned files/services; preserve existing mainnet services."""
 import argparse
 import grp
 import json
@@ -324,7 +324,7 @@ def main():
             call("systemctl", "reload", "ssh")
             call("systemctl", "daemon-reload")
             call("systemctl", "restart", "zakura-mainnet-dashboard")
-            print("POC services removed; evidence retained and mainnet services unchanged.")
+            print("Verifier services removed; evidence retained and mainnet services unchanged.")
     else:
         if not args.output:
             parser.error("export requires --output")

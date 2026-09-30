@@ -13,7 +13,7 @@ from common import Unavailable, Transport
 from private_deploy import validate_host
 
 PROJECT = "c57a6889-6a7c-4d05-a54a-e4a4c0b14ee7"
-FOLDER = "/mac-verifier-poc/provisioner"
+FOLDER = "/mac-verifier/provisioner"
 REPO = "zakura-core/zakura"
 ENVIRONMENT = "mac-verifier-private"
 KEYS = ("MAC_VERIFIER_HOST", "MAC_VERIFIER_USER", "MAC_VERIFIER_SSH_KEY", "MAC_VERIFIER_KNOWN_HOSTS",
@@ -65,7 +65,7 @@ def main():
         return
     # Fetch all values before mutating GitHub; an incomplete vault fails closed.
     values = {key: get(key) for key in KEYS}
-    values["MAC_VERIFIER_MONITOR_IDENTITY_JSON"] = get("MAC_VERIFIER_MONITOR_IDENTITY_JSON", "/mac-verifier-poc")
+    values["MAC_VERIFIER_MONITOR_IDENTITY_JSON"] = get("MAC_VERIFIER_MONITOR_IDENTITY_JSON", "/mac-verifier")
     result = subprocess.run(["gh", "api", "--method", "PUT", f"repos/{REPO}/environments/{ENVIRONMENT}"],
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60)
     if result.returncode:

@@ -22,6 +22,14 @@ values are not maintained separately in the website. The September 26 rerun uses
 the rebased PR and main's consensus rules, including 100-block coinbase maturity.
 Do not reuse state from the earlier fork.
 
+Current main includes PR #1209, which changes minimum-difficulty validation
+from the configured NU7 activation height. The existing `Nu7StagingV2` history
+contains minimum-difficulty blocks only 151 seconds after their parents, beginning
+at activation height 4,398,756. It must not be upgraded in place to these rules.
+Use a separately identified fork from the preserved pre-NU7 seed, or first design
+and review an explicit consensus migration. Updating every operator binary alone
+does not make the old history valid under the new rule.
+
 After a reset, publish the manifest with `publish_network.py --help`. Supply the
 built binary's exact revision, explicit public peers, the recorded `seed-tip.json`,
 and snapshot metadata (see the one-time snapshot below). Archive only the
@@ -105,13 +113,14 @@ tip**, not a wall-clock time. On an isolated fork we mine every one of those
 blocks ourselves, so the offset sets the schedule.
 
 Proof of work stays enabled, and the pace comes from the Testnet
-minimum-difficulty rule: when a block arrives more than `target spacing * 6`
-after its parent, difficulty resets to the network's PoW limit. That gap is
+minimum-difficulty rule: when a block arrives more than the consensus gap
+after its parent, difficulty resets to the network's PoW limit. The multiplier
+is six target spacings before NU7 and eighteen afterwards (PR #1209). That gap is
 
 | | target spacing | minimum-difficulty gap |
 | --- | --- | --- |
 | before NU7 | 75s | **450s** (7.5 min) |
-| after NU7 | 25s | **150s** (2.5 min) |
+| after NU7 | 25s | **450s** (7.5 min) |
 
 So an offset of 10 is about 75 minutes to activation, and 100 would be most of a
 day. `./fork.py plan` prints the estimate before you commit to it.

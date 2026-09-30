@@ -20,8 +20,8 @@ network_magic = [0x7A, 0x6B, 0x75, 0x37]
 # NU7 activates this many blocks above the seeded tip.
 #
 # On an isolated fork we mine every one of these blocks ourselves, and the
-# Testnet minimum-difficulty rule sets the pace: the gap is target spacing x 6,
-# so 450s per block before NU7 and 150s after. An offset of 10 is therefore
+# Testnet minimum-difficulty rule sets the pace: six spacings before NU7 and
+# eighteen afterwards, so the gap is 450s on both sides of activation. An offset of 10 is therefore
 # about 75 minutes to activation. Raise it only if you want to wait longer.
 activation_offset = 10
 

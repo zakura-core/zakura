@@ -9,9 +9,9 @@
 //!
 //! Proof of work stays enabled on the fork, so blocks must clear the real
 //! difficulty — except that Testnet resets difficulty to the network's PoW limit
-//! whenever a block arrives more than `target spacing * 6` after its parent (see
-//! `NetworkUpgrade::minimum_difficulty_spacing_for_height`). That gap is 450s
-//! before NU7 and 150s after it.
+//! whenever a block arrives more than the consensus minimum-difficulty gap
+//! after its parent (see `NetworkUpgrade::minimum_difficulty_spacing_for_height`).
+//! That gap is 450s both before and after NU7.
 //!
 //! By default, a solo miner waits out the gap and then solves a
 //! minimum-difficulty block. The wait must happen *before* the template is
@@ -45,9 +45,6 @@ use zakura_rpc::{
     proposal_block_from_template,
 };
 
-/// Multiplier applied to the target spacing to reach the Testnet
-/// minimum-difficulty gap, matching `TESTNET_MINIMUM_DIFFICULTY_GAP_MULTIPLIER`.
-const MINIMUM_DIFFICULTY_GAP_MULTIPLIER: u32 = 6;
 const TIP_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Parser, Debug)]
@@ -150,13 +147,11 @@ fn network_from_config(path: &PathBuf) -> Result<Network> {
 }
 
 /// The minimum-difficulty gap that applies to the block after `tip`.
-fn minimum_difficulty_gap(network: &Network, tip: Height) -> Duration {
+fn minimum_difficulty_gap(network: &Network, tip: Height) -> Result<Duration> {
     let next = Height(tip.0.saturating_add(1));
-    let spacing = NetworkUpgrade::current(network, next).target_spacing();
-    // Safe: `max(0)` clamps away the only values a u64 cannot represent, and
-    // every target spacing is a small positive number of seconds.
-    let seconds = spacing.num_seconds().max(0) as u64;
-    Duration::from_secs(seconds.saturating_mul(u64::from(MINIMUM_DIFFICULTY_GAP_MULTIPLIER)))
+    let gap = NetworkUpgrade::minimum_difficulty_spacing_for_height(network, next)
+        .ok_or_else(|| eyre!("network has no minimum-difficulty rule at height {next:?}"))?;
+    Ok(gap.to_std()?)
 }
 
 /// Read the tip height with `getblockcount` rather than `getblockchaininfo`.
@@ -286,7 +281,7 @@ async fn main() -> Result<()> {
         let parent_hash = tip_hash(&client).await?;
 
         if !args.no_gap_wait {
-            let gap = minimum_difficulty_gap(&network, tip)
+            let gap = minimum_difficulty_gap(&network, tip)?
                 + Duration::from_secs(u64::from(args.gap_margin_secs));
             tracing::info!(
                 tip = tip.0,
@@ -374,6 +369,20 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn minimum_difficulty_wait_follows_configured_nu7_activation() -> Result<()> {
+        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("testdata/fork-node.toml");
+        let network = network_from_config(&fixture)?;
+        for tip in [4_400_008, 4_400_009, 4_400_010] {
+            assert_eq!(
+                minimum_difficulty_gap(&network, Height(tip))?,
+                Duration::from_secs(450)
+            );
+        }
+        assert!(minimum_difficulty_gap(&Network::Mainnet, Height(4_400_010)).is_err());
+        Ok(())
+    }
 
     #[test]
     fn refreshed_templates_use_distinct_nonce_ranges() {

@@ -800,9 +800,25 @@ where
     /// Checks if the minimum peer version has changed, and disconnects from outdated peers.
     fn disconnect_from_outdated_peers(&mut self) {
         if let Some(minimum_version) = self.minimum_peer_version.changed() {
+            let block_gossip_peer_ips = &self.block_gossip_peer_ips;
             // It is ok to drop ready services, they don't need anything cancelled.
-            self.ready_services
-                .retain(|_address, peer| peer.remote_version() >= minimum_version);
+            self.ready_services.retain(|_address, peer| {
+                let outdated = peer.remote_version() < minimum_version;
+                if outdated
+                    && block_gossip_peer_ips
+                        .iter()
+                        .any(|ip| peer.is_inbound_direct_from_ip(ip))
+                {
+                    warn!(
+                        remote_version = ?peer.remote_version(),
+                        ?minimum_version,
+                        "disconnecting the protected zcashd-compat sidecar: a network upgrade \
+                         raised the minimum protocol version above its version, so its wallet \
+                         stops updating until it is upgraded",
+                    );
+                }
+                !outdated
+            });
         }
     }
 

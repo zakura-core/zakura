@@ -40,7 +40,7 @@ use crate::{
     constants,
     meta_addr::MetaAddrChange,
     peer::{
-        CancelHeartbeatTask, Client, ClientRequest, Connection, ErrorSlot, HandshakeError,
+        sidecar, CancelHeartbeatTask, Client, ClientRequest, Connection, ErrorSlot, HandshakeError,
         MinimumPeerVersion, PeerError,
     },
     peer_registry::PeerRegistry,
@@ -701,6 +701,9 @@ fn configured_advertised_services(config: &Config, mut services: PeerServices) -
     services
 }
 
+/// Rate-limits warnings about a protected sidecar with an obsolete protocol version.
+static OBSOLETE_SIDECAR_WARNINGS: sidecar::WarningLimiter = sidecar::WarningLimiter::new();
+
 fn inbound_error_address_change(
     addr: PeerSocketAddr,
     remote_services: PeerServices,
@@ -816,7 +819,7 @@ where
         // Version messages require an address, so we use
         // an unspecified address for Isolated connections
         Isolated => {
-            let unspec_ipv4 = get_unspecified_ipv4_addr(config.network);
+            let unspec_ipv4 = get_unspecified_ipv4_addr(config.network.clone());
             (unspec_ipv4.into(), PeerServices::empty(), unspec_ipv4)
         }
         _ => {
@@ -930,13 +933,27 @@ where
     // network upgrades and could lead to chain forks or slower block propagation.
     let min_version = minimum_peer_version.current();
     if remote.version < min_version {
-        debug!(
-            remote_ip = %addr_label,
-            ?remote.version,
-            ?min_version,
-            ?remote.user_agent,
-            "disconnecting from peer with obsolete network protocol version",
-        );
+        if is_protected_peer {
+            if OBSOLETE_SIDECAR_WARNINGS.allow() {
+                warn!(
+                    remote_ip = %addr_label,
+                    ?remote.version,
+                    ?min_version,
+                    ?remote.user_agent,
+                    "disconnecting the protected zcashd-compat sidecar: its network protocol \
+                     version is below the minimum for the current network upgrade, so it cannot \
+                     follow the chain until it is upgraded",
+                );
+            }
+        } else {
+            debug!(
+                remote_ip = %addr_label,
+                ?remote.version,
+                ?min_version,
+                ?remote.user_agent,
+                "disconnecting from peer with obsolete network protocol version",
+            );
+        }
 
         // Handshake rejects by protocol version. Not labeled by peer address or
         // user-agent: the Prometheus exporter never prunes series.
@@ -951,6 +968,14 @@ where
 
         // Disconnect if peer is using an obsolete version.
         return Err(HandshakeError::ObsoleteVersion(remote.version));
+    }
+
+    if is_protected_peer {
+        sidecar::check_upgrade_readiness(
+            &config.network,
+            minimum_peer_version.chain_tip().best_tip_height(),
+            remote.version,
+        );
     }
 
     let negotiated_version = min(constants::CURRENT_NETWORK_PROTOCOL_VERSION, remote.version);

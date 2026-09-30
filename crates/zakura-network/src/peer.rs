@@ -8,6 +8,7 @@ mod handshake;
 mod load_tracked_client;
 mod minimum_peer_version;
 mod priority;
+pub(crate) mod sidecar;
 
 #[cfg(any(test, feature = "proptest-impl"))]
 #[allow(unused_imports)]

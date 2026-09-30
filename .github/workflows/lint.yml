@@ -153,7 +153,9 @@ jobs:
           persist-credentials: false
       - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f #v1.17.0 # zizmor: ignore[cache-poisoning] -- CI docs job; builds rustdoc only, nothing published/released
         with:
-          toolchain: nightly
+          # Later nightlies hit the rustdoc ICE described at `PUBLIC_API_NIGHTLY` in
+          # semver-checks.yml. Keep the two pins in step.
+          toolchain: nightly-2026-09-06
           cache-on-failure: true
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: ./.github/actions/setup-zakura-build

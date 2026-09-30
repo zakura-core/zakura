@@ -104,6 +104,37 @@ async fn receive(recv: &mut crate::zakura::FramedRecv) -> Message {
 }
 
 #[test]
+fn envelopes_enforce_height_bounds_without_restricting_terminal_ranges() {
+    for height in [block::Height::MAX, block::Height(block::Height::MAX.0 + 1)] {
+        for message in [
+            Message::Status(BlockSyncStatus {
+                servable_high: height,
+                ..BlockSyncStatus::default()
+            }),
+            Message::GetBlocks(Range {
+                start: height,
+                count: 1,
+            }),
+            Message::BlocksDone {
+                start: height,
+                returned: 128,
+            },
+            Message::RangeUnavailable(Range {
+                start: height,
+                count: 128,
+            }),
+        ] {
+            let encoded = encode_frame(&message);
+            if height == block::Height::MAX {
+                assert_eq!(decode_frame::<Message>(&encoded.unwrap()).unwrap(), message);
+            } else {
+                assert!(encoded.is_err(), "out-of-range height in {message:?}");
+            }
+        }
+    }
+}
+
+#[test]
 fn envelopes_preserve_version_two_bytes() {
     let range = Range::new(block::Height(1), 2).unwrap();
     let block = Arc::new(

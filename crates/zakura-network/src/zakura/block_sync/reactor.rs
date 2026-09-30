@@ -2048,7 +2048,12 @@ impl BlockSyncReactor {
         let result = session.try_send_status(status);
         match &result {
             Ok(()) => peer_state.status_delivery.queued(status, now),
-            Err(OrderedSendError::Full) => peer_state.status_delivery.queue_full(now),
+            Err(OrderedSendError::Full) => {
+                peer_state.status_delivery.queue_full(now);
+                if let Some(deadline) = session.status_next_due() {
+                    peer_state.status_delivery.defer_until(deadline);
+                }
+            }
             Err(_) => {}
         }
         match result {

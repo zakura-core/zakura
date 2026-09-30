@@ -364,9 +364,19 @@ fn revision_2_funding_streams_end_at_the_zip_218_third_halving() {
         testnet_network_with_nu7(None).all_funding_streams(),
         &*testnet_constants::FUNDING_STREAMS,
     );
+    // Default Testnet now schedules NU7, moving the third halving and the
+    // inherited Revision 2 end while leaving earlier streams unchanged.
+    let default_testnet = Network::new_default_testnet();
+    let default_streams = default_testnet.all_funding_streams();
     assert_eq!(
-        Network::new_default_testnet().all_funding_streams(),
-        &*testnet_constants::FUNDING_STREAMS,
+        default_streams[..REVISION_2],
+        testnet_constants::FUNDING_STREAMS[..REVISION_2],
+    );
+    let third_halving = Height(4_497_948);
+    assert_eq!(height_for_halving(3, &default_testnet), Some(third_halving));
+    assert_eq!(
+        default_streams[REVISION_2].height_range().end,
+        third_halving
     );
 
     // Testnet with NU7 moves only the Revision 2 end height.

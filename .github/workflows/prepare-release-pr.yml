@@ -129,8 +129,7 @@ jobs:
           python3 .github/scripts/fetch-release-state.py \
             --latest-url "$LATEST_URL" \
             --output-dir "$RUNNER_TEMP/release-state-bundle" \
-            --metadata-out "$RUNNER_TEMP/release-state-resolution.json" \
-            --max-age-hours 48
+            --metadata-out "$RUNNER_TEMP/release-state-resolution.json"
           report="$(
             python3 scripts/release-readiness.py height \
               --resolution "$RUNNER_TEMP/release-state-resolution.json" \

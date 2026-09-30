@@ -1,3 +1,4 @@
+use crate::serialization::ZcashReader;
 use serde::{Deserialize, Serialize};
 use std::{fmt, io};
 
@@ -36,8 +37,10 @@ impl ZcashSerialize for Halo2Proof {
 }
 
 impl ZcashDeserialize for Halo2Proof {
-    fn zcash_deserialize<R: io::Read>(mut reader: R) -> Result<Self, SerializationError> {
-        let proof = Vec::zcash_deserialize(&mut reader)?;
+    fn zcash_deserialize_from<R: io::Read>(
+        reader: &mut ZcashReader<R>,
+    ) -> Result<Self, SerializationError> {
+        let proof = reader.read_value::<Vec<_>>()?;
 
         Ok(Self(proof))
     }

@@ -1,5 +1,7 @@
 //! Transparent Address types.
 
+use crate::serialization::ZcashReader;
+use std::io::Read as _;
 use std::{fmt, io};
 
 use crate::{
@@ -203,7 +205,9 @@ impl ZcashSerialize for Address {
 }
 
 impl ZcashDeserialize for Address {
-    fn zcash_deserialize<R: io::Read>(mut reader: R) -> Result<Self, SerializationError> {
+    fn zcash_deserialize_from<R: io::Read>(
+        reader: &mut ZcashReader<R>,
+    ) -> Result<Self, SerializationError> {
         let mut version_bytes = [0; 2];
         reader.read_exact(&mut version_bytes)?;
 

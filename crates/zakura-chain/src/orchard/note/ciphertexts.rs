@@ -1,5 +1,7 @@
 //! Encrypted parts of Orchard notes.
 
+use crate::serialization::ZcashReader;
+use std::io::Read as _;
 use std::{fmt, io};
 
 use serde_big_array::BigArray;
@@ -59,7 +61,9 @@ impl ZcashSerialize for EncryptedNote {
 }
 
 impl ZcashDeserialize for EncryptedNote {
-    fn zcash_deserialize<R: io::Read>(mut reader: R) -> Result<Self, SerializationError> {
+    fn zcash_deserialize_from<R: io::Read>(
+        reader: &mut ZcashReader<R>,
+    ) -> Result<Self, SerializationError> {
         let mut bytes = [0; 580];
         reader.read_exact(&mut bytes[..])?;
         Ok(Self(bytes))
@@ -118,7 +122,9 @@ impl ZcashSerialize for WrappedNoteKey {
 }
 
 impl ZcashDeserialize for WrappedNoteKey {
-    fn zcash_deserialize<R: io::Read>(mut reader: R) -> Result<Self, SerializationError> {
+    fn zcash_deserialize_from<R: io::Read>(
+        reader: &mut ZcashReader<R>,
+    ) -> Result<Self, SerializationError> {
         let mut bytes = [0; 80];
         reader.read_exact(&mut bytes[..])?;
         Ok(Self(bytes))

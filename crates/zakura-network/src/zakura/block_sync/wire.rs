@@ -1,4 +1,24 @@
 use super::{config::*, error::*, *};
+use zakura_chain::serialization::ZcashDecoder;
+
+/// Already decoded block bytes, kept with the same rules for buffered replay.
+#[derive(Clone, Debug)]
+pub(super) struct RawBlockPayload {
+    bytes: Arc<[u8]>,
+    decoder: ZcashDecoder,
+}
+
+impl RawBlockPayload {
+    pub(super) fn len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    pub(super) fn decode_block(&self) -> Arc<block::Block> {
+        self.decoder
+            .decode(&mut &self.bytes[BLOCK_SYNC_MESSAGE_TYPE_BYTES..])
+            .expect("raw block bytes already decoded successfully with these same rules")
+    }
+}
 
 /// Zakura stream kind reserved for native block sync.
 pub const ZAKURA_STREAM_BLOCK_SYNC: u16 = 6;
@@ -112,8 +132,16 @@ impl BlockSyncMessage {
         Ok(bytes)
     }
 
-    /// Decode a stream-6 message.
+    /// Decode a stream-6 message from any network. Live peer routines use their
+    /// configured decoder through `decode_with` instead.
     pub fn decode(bytes: &[u8]) -> Result<Self, BlockSyncWireError> {
+        Self::decode_with(ZcashDecoder::any_network(), bytes)
+    }
+
+    pub(super) fn decode_with(
+        decoder: ZcashDecoder,
+        bytes: &[u8],
+    ) -> Result<Self, BlockSyncWireError> {
         validate_payload_len(bytes.len())?;
         let mut reader = Cursor::new(bytes);
         let message_type = reader.read_u8()?;
@@ -131,9 +159,13 @@ impl BlockSyncMessage {
             MSG_BS_BLOCK => {
                 let block_start = usize::try_from(reader.position())
                     .map_err(|_| BlockSyncWireError::NumericOverflow("block payload offset"))?;
-                let block = Arc::new(block::Block::zcash_deserialize(&mut reader)?);
-                let block_end = usize::try_from(reader.position())
-                    .map_err(|_| BlockSyncWireError::NumericOverflow("block payload end"))?;
+                let mut block_bytes = &bytes[block_start..];
+                let block = decoder.decode(&mut block_bytes)?;
+                let block_end = bytes.len() - block_bytes.len();
+                reader.set_position(
+                    u64::try_from(block_end)
+                        .map_err(|_| BlockSyncWireError::NumericOverflow("block payload end"))?,
+                );
                 validate_encoded_block_len(block_end.saturating_sub(block_start))?;
                 Self::Block(block)
             }
@@ -172,7 +204,8 @@ impl BlockSyncMessage {
 
     /// Decode this message from a Zakura frame after checking flags and type agreement.
     pub fn decode_frame(frame: Frame) -> Result<Self, BlockSyncWireError> {
-        Self::decode_frame_with_raw_block_payload(frame).map(|(message, _)| message)
+        Self::decode_frame_with_raw_block_payload(frame, ZcashDecoder::any_network())
+            .map(|(message, _)| message)
     }
 
     /// Decode this message and return the raw frame payload for block bodies.
@@ -183,7 +216,8 @@ impl BlockSyncMessage {
     /// [`BLOCK_SYNC_MESSAGE_TYPE_BYTES`] before deserializing the block body.
     pub(super) fn decode_frame_with_raw_block_payload(
         frame: Frame,
-    ) -> Result<(Self, Option<Arc<[u8]>>), BlockSyncWireError> {
+        decoder: ZcashDecoder,
+    ) -> Result<(Self, Option<RawBlockPayload>), BlockSyncWireError> {
         if frame.flags != 0 {
             return Err(BlockSyncWireError::UnsupportedFlags(frame.flags));
         }
@@ -194,10 +228,14 @@ impl BlockSyncMessage {
         // it can be stored in compact form in the reorder backlog.
         let (message, raw_block_payload) = if frame_message_type == MSG_BS_BLOCK {
             let raw_block_payload = Arc::<[u8]>::from(frame.payload.into_boxed_slice());
-            let message = Self::decode(&raw_block_payload)?;
-            (message, Some(raw_block_payload))
+            let message = Self::decode_with(decoder, &raw_block_payload)?;
+            let payload = RawBlockPayload {
+                bytes: raw_block_payload,
+                decoder,
+            };
+            (message, Some(payload))
         } else {
-            (Self::decode(&frame.payload)?, None)
+            (Self::decode_with(decoder, &frame.payload)?, None)
         };
 
         if frame_message_type != message.message_type() {
@@ -283,3 +321,6 @@ pub(super) fn reject_trailing(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod bounded_decoding;

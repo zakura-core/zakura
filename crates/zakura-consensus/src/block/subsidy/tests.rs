@@ -178,6 +178,10 @@ const TESTNET_ZIP_218_THIRD_HALVING: u32 = 4_656_000;
 /// Returns the default Testnet parameters with NU7 at [`TESTNET_NU7`] and the given
 /// Revision 2 grants addresses, or the built-in ones.
 fn testnet_with_nu7(grants_addresses: Option<Vec<String>>) -> Network {
+    testnet_with_nu7_at(TESTNET_NU7, grants_addresses)
+}
+
+fn testnet_with_nu7_at(nu7: u32, grants_addresses: Option<Vec<String>>) -> Network {
     use zakura_chain::parameters::testnet::{
         ConfiguredActivationHeights, ConfiguredFundingStreamRecipient, ConfiguredFundingStreams,
         Parameters,
@@ -188,7 +192,7 @@ fn testnet_with_nu7(grants_addresses: Option<Vec<String>>) -> Network {
         .expect("Testnet has parameters")
         .activation_heights()
         .into();
-    activation_heights.nu7 = Some(TESTNET_NU7);
+    activation_heights.nu7 = Some(nu7);
 
     let mut builder = Parameters::build()
         .with_activation_heights(activation_heights)
@@ -217,6 +221,295 @@ fn testnet_with_nu7(grants_addresses: Option<Vec<String>>) -> Network {
     }
 
     builder.to_network().expect("configured network is valid")
+}
+
+/// Fixed oracle for the configured NU7 fork activation, not a final public
+/// Testnet activation height. In particular, the distinct P2SH addresses make
+/// address-period mistakes observable when the built-in addresses are identical.
+#[test]
+fn configured_nu7_fork_coinbase_boundaries_match_fixed_oracle() -> Result<(), Report> {
+    use crate::{
+        block::check::{miner_fees_are_valid, subsidy_is_valid},
+        checkpoint::deferred_pool_balance_change as checkpoint_deferred,
+        BlockError,
+    };
+
+    let _init_guard = zakura_test::init();
+
+    const ACTIVATION: u32 = 4_398_756;
+    const FIRST_ADDRESS_CHANGE: u32 = 4_420_488;
+    const SECOND_ADDRESS_CHANGE: u32 = 4_525_488;
+    const STREAM_END: u32 = 4_630_488;
+
+    let addresses: Vec<transparent::Address> = (1..=27)
+        .map(|index| transparent::Address::from_script_hash(NetworkKind::Testnet, [index; 20]))
+        .collect();
+    let network = testnet_with_nu7_at(
+        ACTIVATION,
+        Some(addresses.iter().map(ToString::to_string).collect()),
+    );
+    let stream = &network.all_funding_streams()[2];
+    assert_eq!(
+        stream.height_range(),
+        &(Height(3_536_500)..Height(STREAM_END))
+    );
+    assert_eq!(height_for_halving(3, &network), Some(Height(STREAM_END)));
+
+    let miner_script = transparent::Script::new(&[0]);
+    let output = |value: i64, lock_script: transparent::Script| transparent::Output {
+        value: Amount::try_from(value).expect("fixed oracle values are valid amounts"),
+        lock_script,
+    };
+
+    // height, block subsidy, grants output, deferred contribution, miner output,
+    // and the zero-based grants address slot. All amounts are zatoshi, with zero fees.
+    let cases = [
+        (
+            ACTIVATION - 1,
+            156_250_000,
+            12_500_000,
+            18_750_000,
+            125_000_000,
+            Some(24),
+        ),
+        (
+            ACTIVATION,
+            52_083_333,
+            4_166_666,
+            6_249_999,
+            41_666_668,
+            Some(24),
+        ),
+        (
+            ACTIVATION + 1,
+            52_083_333,
+            4_166_666,
+            6_249_999,
+            41_666_668,
+            Some(24),
+        ),
+        (
+            FIRST_ADDRESS_CHANGE - 1,
+            52_083_333,
+            4_166_666,
+            6_249_999,
+            41_666_668,
+            Some(24),
+        ),
+        (
+            FIRST_ADDRESS_CHANGE,
+            52_083_333,
+            4_166_666,
+            6_249_999,
+            41_666_668,
+            Some(25),
+        ),
+        (
+            FIRST_ADDRESS_CHANGE + 1,
+            52_083_333,
+            4_166_666,
+            6_249_999,
+            41_666_668,
+            Some(25),
+        ),
+        (
+            4_476_000 - 1,
+            52_083_333,
+            4_166_666,
+            6_249_999,
+            41_666_668,
+            Some(25),
+        ),
+        (
+            4_476_000,
+            52_083_333,
+            4_166_666,
+            6_249_999,
+            41_666_668,
+            Some(25),
+        ),
+        (
+            4_476_000 + 1,
+            52_083_333,
+            4_166_666,
+            6_249_999,
+            41_666_668,
+            Some(25),
+        ),
+        (
+            SECOND_ADDRESS_CHANGE - 1,
+            52_083_333,
+            4_166_666,
+            6_249_999,
+            41_666_668,
+            Some(25),
+        ),
+        (
+            SECOND_ADDRESS_CHANGE,
+            52_083_333,
+            4_166_666,
+            6_249_999,
+            41_666_668,
+            Some(26),
+        ),
+        (
+            SECOND_ADDRESS_CHANGE + 1,
+            52_083_333,
+            4_166_666,
+            6_249_999,
+            41_666_668,
+            Some(26),
+        ),
+        (
+            STREAM_END - 1,
+            52_083_333,
+            4_166_666,
+            6_249_999,
+            41_666_668,
+            Some(26),
+        ),
+        (STREAM_END, 26_041_666, 0, 0, 26_041_666, None),
+        (STREAM_END + 1, 26_041_666, 0, 0, 26_041_666, None),
+    ];
+
+    for (height, subsidy_zats, grants_zats, deferred_zats, miner_zats, address_slot) in cases {
+        let height = Height(height);
+        let subsidy = block_subsidy(height, &network, Some(Amount::zero()))?;
+        assert_eq!(i64::from(subsidy), subsidy_zats, "subsidy at {height:?}");
+
+        let grants_address =
+            funding_stream_address(height, &network, FundingStreamReceiver::MajorGrants);
+        assert_eq!(
+            grants_address,
+            address_slot.map(|slot| &addresses[slot]),
+            "address at {height:?}"
+        );
+        let mut outputs = vec![output(miner_zats, miner_script.clone())];
+        if let Some(address) = grants_address {
+            outputs.push(output(grants_zats, address.script()));
+        }
+
+        let block = coinbase_block(height, outputs);
+        let deferred = subsidy_is_valid(&block, &network, subsidy)?;
+        assert_eq!(
+            i64::from(deferred.value()),
+            deferred_zats,
+            "deferred at {height:?}"
+        );
+        assert_eq!(
+            checkpoint_deferred(height, &network, Some(Amount::zero()))?,
+            Some(deferred)
+        );
+        miner_fees_are_valid(
+            &block.transactions[0],
+            height,
+            Amount::zero(),
+            subsidy,
+            deferred,
+            &network,
+        )?;
+
+        // At the first block of each new address period, the prior address is invalid.
+        if height.0 == FIRST_ADDRESS_CHANGE || height.0 == SECOND_ADDRESS_CHANGE {
+            let prior = if height.0 == FIRST_ADDRESS_CHANGE {
+                24
+            } else {
+                25
+            };
+            let stale = coinbase_block(
+                height,
+                vec![
+                    output(miner_zats, miner_script.clone()),
+                    output(grants_zats, addresses[prior].script()),
+                ],
+            );
+            assert_eq!(
+                subsidy_is_valid(&stale, &network, subsidy),
+                Err(BlockError::Transaction(
+                    crate::error::TransactionError::Subsidy(SubsidyError::FundingStreamNotFound)
+                )),
+            );
+        }
+    }
+
+    // Seventeen aggregate fee zatoshi give the miner all 17 before NU7, but
+    // only 7 at and after activation: floor(17 * 6 / 10) = 10 goes to NSM.
+    let fees = Amount::try_from(17)?;
+    for (height, fee_share, subsidy_zats, grants_zats, miner_zats) in [
+        (ACTIVATION - 1, 17, 156_250_000, 12_500_000, 125_000_000),
+        (ACTIVATION, 7, 52_083_333, 4_166_666, 41_666_668),
+        (ACTIVATION + 1, 7, 52_083_333, 4_166_666, 41_666_668),
+    ] {
+        let height = Height(height);
+        assert_eq!(
+            i64::from(miner_fee_share(height, &network, fees)),
+            fee_share
+        );
+        let subsidy = block_subsidy(height, &network, Some(Amount::zero()))?;
+        assert_eq!(i64::from(subsidy), subsidy_zats);
+        let grants_script =
+            funding_stream_address(height, &network, FundingStreamReceiver::MajorGrants)
+                .expect("the grants stream is active across activation")
+                .script();
+        let block = coinbase_block(
+            height,
+            vec![
+                output(grants_zats, grants_script.clone()),
+                output(miner_zats + fee_share, miner_script.clone()),
+            ],
+        );
+        let deferred = subsidy_is_valid(&block, &network, subsidy)?;
+        miner_fees_are_valid(
+            &block.transactions[0],
+            height,
+            fees,
+            subsidy,
+            deferred,
+            &network,
+        )?;
+
+        if height.0 == ACTIVATION {
+            let overclaim = coinbase_block(
+                height,
+                vec![
+                    output(grants_zats, grants_script),
+                    output(miner_zats + fee_share + 1, miner_script.clone()),
+                ],
+            );
+            assert_eq!(
+                miner_fees_are_valid(
+                    &overclaim.transactions[0],
+                    height,
+                    fees,
+                    subsidy,
+                    deferred,
+                    &network,
+                ),
+                Err(BlockError::Transaction(
+                    crate::error::TransactionError::Subsidy(SubsidyError::InvalidMinerFees)
+                )),
+            );
+        }
+    }
+
+    // An independent, whole-stream issuance check catches a schedule that is
+    // individually correct at boundaries but wrong in duration.
+    let issued_before = scheduled_issuance_zatoshis(Height(3_536_500 - 1), &network)?;
+    let issued_through = scheduled_issuance_zatoshis(Height(STREAM_END - 1), &network)?;
+    assert_eq!(issued_through - issued_before, 146_796_874_922_756);
+    let mut gross_grants = 0u128;
+    let mut gross_deferred = 0u128;
+    for height in 3_536_500..STREAM_END {
+        let height = Height(height);
+        let subsidy = block_subsidy(height, &network, Some(Amount::zero()))?;
+        let values = funding_stream_values(height, &network, subsidy)?;
+        gross_grants += u128::try_from(i64::from(values[&FundingStreamReceiver::MajorGrants]))?;
+        gross_deferred += u128::try_from(i64::from(values[&FundingStreamReceiver::Deferred]))?;
+    }
+    assert_eq!(gross_grants, 11_743_749_845_512);
+    assert_eq!(gross_deferred, 17_615_624_768_268);
+
+    Ok(())
 }
 
 /// Grants recipients rotate every `3 · 35,000` blocks after NU7, so the 27 built-in

@@ -6,6 +6,7 @@ use super::{
 };
 
 use crate::{
+    amount::NonNegative,
     block::Height,
     parameters::NetworkUpgrade,
     transaction::{LockTime, Transaction, UnminedTx},
@@ -47,7 +48,7 @@ fn zakura_conventional_fee_is_400_per_action() {
     assert_eq!(conventional_actions(&transaction.transaction), 2);
     assert_eq!(
         conventional_fee(&transaction.transaction),
-        Amount::try_from(800).unwrap()
+        Amount::<NonNegative>::try_from(800).unwrap()
     );
     assert_eq!(
         unpaid_actions(&transaction, Amount::try_from(799).unwrap()),
@@ -127,6 +128,6 @@ fn zip317_counts_ironwood_actions() {
     assert_eq!(conventional_actions(&transaction), 3);
     assert_eq!(
         conventional_fee(&transaction),
-        Amount::try_from(1_200).unwrap()
+        Amount::<NonNegative>::try_from(1_200).unwrap()
     );
 }

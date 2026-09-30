@@ -79,12 +79,21 @@ type DiscoveredPeer = (PeerSocketAddr, peer::Client);
 /// batching to make bans immediate.
 const MISBEHAVIOR_BATCH_INTERVAL: Duration = Duration::from_secs(5);
 
+/// The shortest time between warnings about ignored sidecar misbehavior.
+const SIDECAR_MISBEHAVIOR_WARNING_INTERVAL: Duration = Duration::from_secs(60);
+
 /// Batches peer misbehavior reports before forwarding them to the address book updater.
+///
+/// Reports about `protected_peer_ips` (the operator's block-gossip and zcashd-compat
+/// sidecars) are dropped, because banning a sidecar would cut it off from its only peer.
+/// Each dropped report increments `zcashd_compat.sidecar.misbehavior_ignored`.
 async fn batch_misbehavior_reports(
     mut misbehavior_rx: mpsc::Receiver<(PeerSocketAddr, u32)>,
     address_book_updater: mpsc::Sender<MetaAddrChange>,
+    protected_peer_ips: Arc<HashSet<IpAddr>>,
 ) {
     let mut misbehaviors: HashMap<PeerSocketAddr, u32> = HashMap::new();
+    let mut last_sidecar_warning: Option<Instant> = None;
     // Coalesce repeated reports so invalid blocks or transactions cannot turn
     // every report into address book queue and mutex pressure.
     let mut flush_timer = IntervalStream::new(tokio::time::interval_at(
@@ -95,6 +104,23 @@ async fn batch_misbehavior_reports(
     loop {
         tokio::select! {
             msg = misbehavior_rx.recv() => match msg {
+                Some((peer_addr, score_increment))
+                    if protected_peer_ips.contains(&canonical_socket_addr(*peer_addr).ip()) =>
+                {
+                    metrics::counter!("zcashd_compat.sidecar.misbehavior_ignored").increment(1);
+                    if last_sidecar_warning
+                        .is_none_or(|last| last.elapsed() >= SIDECAR_MISBEHAVIOR_WARNING_INTERVAL)
+                    {
+                        last_sidecar_warning = Some(Instant::now());
+                        tracing::warn!(
+                            ?peer_addr,
+                            score_increment,
+                            "ignoring misbehavior by a protected sidecar peer; if it is a \
+                             zcashd-compat sidecar, check that its version supports the current \
+                             network upgrade"
+                        );
+                    }
+                }
                 Some((peer_addr, score_increment)) => *misbehaviors
                     .entry(peer_addr)
                     .or_default()
@@ -274,6 +300,17 @@ where
             peer_registry.clone(),
         );
 
+    // Inbound peers exempt from the inbound-overload connection drop and from misbehavior
+    // bans: the operator-configured block-gossip / zcashd-compat sidecars. Canonicalized
+    // (IPv4-mapped IPv6 -> IPv4) so an inbound `::ffff:` address still matches,
+    // exactly like the reserved-slot accounting in `accept_inbound_connections`.
+    let protected_peer_ips: Arc<HashSet<IpAddr>> = Arc::new(
+        block_gossip_peer_ips
+            .iter()
+            .map(|&ip| canonical_socket_addr(SocketAddr::new(ip, 0)).ip())
+            .collect(),
+    );
+
     let (misbehavior_tx, misbehavior_rx) = mpsc::channel(
         // Leave enough room for a misbehaviour update on every peer connection
         // before the channel is drained.
@@ -283,7 +320,12 @@ where
     );
 
     tokio::spawn(
-        batch_misbehavior_reports(misbehavior_rx, address_book_updater.clone()).in_current_span(),
+        batch_misbehavior_reports(
+            misbehavior_rx,
+            address_book_updater.clone(),
+            protected_peer_ips.clone(),
+        )
+        .in_current_span(),
     );
 
     // Create a broadcast channel for peer inventory advertisements.
@@ -299,17 +341,6 @@ where
     // handshakes. These use the same handshake service internally to detect
     // self-connection attempts. Both are decorated with a tower TimeoutLayer to
     // enforce timeouts as specified in the Config.
-
-    // Inbound peers exempt from the inbound-overload connection drop: the
-    // operator-configured block-gossip / zcashd-compat sidecars. Canonicalized
-    // (IPv4-mapped IPv6 -> IPv4) so an inbound `::ffff:` address still matches,
-    // exactly like the reserved-slot accounting in `accept_inbound_connections`.
-    let protected_peer_ips: Arc<HashSet<IpAddr>> = Arc::new(
-        block_gossip_peer_ips
-            .iter()
-            .map(|&ip| canonical_socket_addr(SocketAddr::new(ip, 0)).ip())
-            .collect(),
-    );
 
     let (listen_handshaker, outbound_connector) = {
         use tower::timeout::TimeoutLayer;

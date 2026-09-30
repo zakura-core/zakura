@@ -88,6 +88,7 @@ fn noncanonical_shielded_proof_size_gets_ban_score() {
         addr,
         PeerServices::NODE_NETWORK,
         &SerializationError::NonCanonicalShieldedProofSize,
+        false,
     );
 
     assert_eq!(change.addr(), addr);
@@ -100,8 +101,19 @@ fn noncanonical_shielded_proof_size_gets_ban_score() {
         addr,
         PeerServices::NODE_NETWORK,
         &SerializationError::Parse("test parser error"),
+        false,
     );
     assert_eq!(ordinary_parser_error.misbehavior_score(), 0);
+
+    // A protected sidecar is never banned.
+    let protected = inbound_error_address_change(
+        addr,
+        PeerServices::NODE_NETWORK,
+        &SerializationError::NonCanonicalShieldedProofSize,
+        true,
+    );
+    assert_eq!(protected.addr(), addr);
+    assert_eq!(protected.misbehavior_score(), 0);
 }
 
 fn test_config(p2p_stack: P2pStack) -> Config {

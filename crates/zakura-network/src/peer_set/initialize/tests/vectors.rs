@@ -14,6 +14,7 @@
 //! skip all the network tests by setting the `SKIP_NETWORK_TESTS` environmental variable.
 
 use std::{
+    collections::HashSet,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -116,6 +117,7 @@ async fn misbehavior_reports_are_batched_for_five_seconds() {
     let batcher = tokio::spawn(batch_misbehavior_reports(
         misbehavior_rx,
         address_book_updater,
+        Arc::new(HashSet::new()),
     ));
 
     misbehavior_tx
@@ -155,6 +157,49 @@ async fn misbehavior_reports_are_batched_for_five_seconds() {
     batcher
         .await
         .expect("misbehavior batcher task should not panic");
+}
+
+/// Misbehavior by a protected sidecar is dropped, and other peers are still scored.
+#[tokio::test(start_paused = true)]
+async fn protected_sidecar_misbehavior_is_ignored() {
+    let sidecar: PeerSocketAddr = "127.0.0.1:18233".parse().unwrap();
+    let mapped_sidecar: PeerSocketAddr = "[::ffff:127.0.0.1]:18234".parse().unwrap();
+    let other: PeerSocketAddr = "192.0.2.1:8233".parse().unwrap();
+    let (misbehavior_tx, misbehavior_rx) = tokio::sync::mpsc::channel(4);
+    let (address_book_updater, mut address_book_updates) = tokio::sync::mpsc::channel(4);
+    let protected = Arc::new(HashSet::from(["127.0.0.1".parse().unwrap()]));
+    let batcher = tokio::spawn(batch_misbehavior_reports(
+        misbehavior_rx,
+        address_book_updater,
+        protected,
+    ));
+
+    for addr in [sidecar, mapped_sidecar, other] {
+        misbehavior_tx
+            .send((addr, constants::MAX_PEER_MISBEHAVIOR_SCORE))
+            .await
+            .expect("misbehavior batcher is running");
+    }
+    tokio::time::advance(MISBEHAVIOR_BATCH_INTERVAL).await;
+
+    let update = address_book_updates
+        .recv()
+        .await
+        .expect("misbehavior batcher should flush the other peer's report");
+    assert_eq!(update.addr(), other);
+    assert_eq!(
+        update.misbehavior_score(),
+        constants::MAX_PEER_MISBEHAVIOR_SCORE
+    );
+
+    drop(misbehavior_tx);
+    batcher
+        .await
+        .expect("misbehavior batcher task should not panic");
+    assert!(
+        address_book_updates.try_recv().is_err(),
+        "no report about the protected sidecar should reach the address book"
+    );
 }
 
 /// Test that zakura-network discovers dynamic bind-to-all-interfaces listener ports,

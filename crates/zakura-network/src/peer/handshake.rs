@@ -701,18 +701,23 @@ fn configured_advertised_services(config: &Config, mut services: PeerServices) -
     services
 }
 
+/// Returns the address book change for an inbound message that failed to parse.
 fn inbound_error_address_change(
     addr: PeerSocketAddr,
     remote_services: PeerServices,
     error: &SerializationError,
+    is_protected_peer: bool,
 ) -> MetaAddrChange {
     // Strict parsing rejects this fault before semantic verification can assign
-    // its existing ban score, so preserve the same peer penalty here.
+    // its existing ban score, so preserve the same peer penalty here, except for a
+    // protected sidecar, which is never banned (see `batch_misbehavior_reports`).
     if matches!(error, SerializationError::NonCanonicalShieldedProofSize) {
-        MetaAddr::new_misbehavior(addr, constants::MAX_PEER_MISBEHAVIOR_SCORE)
-    } else {
-        MetaAddr::new_errored(addr, remote_services)
+        if !is_protected_peer {
+            return MetaAddr::new_misbehavior(addr, constants::MAX_PEER_MISBEHAVIOR_SCORE);
+        }
+        metrics::counter!("zcashd_compat.sidecar.misbehavior_ignored").increment(1);
     }
+    MetaAddr::new_errored(addr, remote_services)
 }
 
 /// Returns true when the legacy handshake should try to route this peer to Zakura P2P v2.
@@ -1788,6 +1793,7 @@ where
                                         book_addr,
                                         remote_services,
                                         err,
+                                        is_protected_peer,
                                     );
                                     let _ = inbound_ts_collector.send(change).await;
                                 }

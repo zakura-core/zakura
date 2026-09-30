@@ -73,6 +73,8 @@ impl Requester {
     /// Reserve before publishing the request. `expected` must come from the
     /// already validated header chain, in ascending height order. The request
     /// must also fit the peer's advertised block count and download window.
+    /// `max_body_bytes` must equal the peer's advertised, clamped response-byte
+    /// limit when issuing this request, not a smaller local download budget.
     /// On a failed publication call `retract`; after publication use `abandon`.
     pub(super) fn reserve(
         &mut self,

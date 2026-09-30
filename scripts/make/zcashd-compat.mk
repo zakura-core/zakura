@@ -9,6 +9,7 @@
 	compat-zcashd-status \
 	compat-status-sync \
 	compat-test-regtest \
+	compat-test-nu7 \
 	compat-test-soak \
 	compat-test-mainnet \
 	compat-test-testnet
@@ -203,6 +204,14 @@ compat-test-regtest:
 	TEST_ZCASHD_COMPAT=1 \
 	TEST_ZCASHD_PATH="$(TEST_ZCASHD_PATH)" \
 	cargo nextest run --profile zcashd-compat-integration --run-ignored=only
+
+# Run the NU7 activation tests against a fresh regtest environment with NU7 at 210.
+# They need a zcashd with NU7 support: set TEST_ZCASHD_PATH until the embedded sidecar has it.
+compat-test-nu7:
+	TEST_ZCASHD_COMPAT=1 \
+	TEST_ZCASHD_COMPAT_NU7=1 \
+	TEST_ZCASHD_PATH="$(TEST_ZCASHD_PATH)" \
+	cargo nextest run --profile zcashd-compat-nu7 --run-ignored=only
 
 # Run a long zcashd-compat reorg churn soak against a fresh regtest environment.
 # Override TEST_ZCASHD_COMPAT_REORG_ITERATIONS for shorter local smoke runs.

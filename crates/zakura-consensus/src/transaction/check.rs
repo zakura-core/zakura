@@ -431,6 +431,8 @@ fn check_for_duplicates<'t, T>(
 where
     T: Clone + Eq + Hash + 't,
 {
+    const MAX_INITIAL_CAPACITY: usize = 1_024;
+
     let mut items = items.into_iter();
     // Avoid allocating a hash table for groups with at most four items.
     let mut small: [Option<Cow<'t, T>>; 4] = [None, None, None, None];
@@ -449,11 +451,13 @@ where
             continue;
         }
 
-        // The upper bound comes from the transaction's stored inputs or actions.
+        // An early duplicate in a large untrusted transaction should not
+        // allocate for every later input or action before it is rejected.
         let capacity = small
             .len()
             .saturating_add(1)
-            .saturating_add(items.size_hint().1.unwrap_or(0));
+            .saturating_add(items.size_hint().1.unwrap_or(0))
+            .min(MAX_INITIAL_CAPACITY);
         let mut hash_set = HashSet::with_capacity(capacity);
         hash_set.extend(small.into_iter().flatten());
 

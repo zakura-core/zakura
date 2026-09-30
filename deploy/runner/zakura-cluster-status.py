@@ -2613,7 +2613,7 @@ footer {
 
   <div class="banner" id="banner" hidden></div>
   <section class="panel pad" id="verifier-panel" hidden>
-    <h2>Consensus verifier</h2>
+    <h2>Native macOS consensus verifier</h2>
     <p id="verifier-summary"></p>
   </section>
 

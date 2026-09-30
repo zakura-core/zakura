@@ -77,13 +77,14 @@ class Slack:
 
 
 class Monitor:
-    def __init__(self, directory, expected, linux=None, remote=None, slack=None):
+    def __init__(self, directory, expected, linux=None, remote=None, slack=None, observation_only=False):
         self.directory = Path(directory)
         self.directory.mkdir(parents=True, exist_ok=True)
         self.expected = expected
         self.linux = linux or RPC("http://127.0.0.1:8232")
         self.remote = remote or Remote()
         self.slack = slack
+        self.observation_only = observation_only
         state = self.directory / "cursor.json"
         self.state = read_json(state) if state.exists() else {
             "schema_version": 1, "bootstrap": expected["bootstrap_height"],
@@ -240,6 +241,9 @@ class Monitor:
 
     def step(self, now=None):
         now = time.time() if now is None else now
+        self.incident("alert delivery unavailable", self.observation_only, now)
+        if self.observation_only:
+            self.state["qualified"] = False
         status, reference, error = None, None, None
         try:
             reference = self.linux.tip()
@@ -315,7 +319,7 @@ def exclusive(directory):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("command", choices=["run", "once", "status", "ack"])
+    parser.add_argument("command", choices=["run", "observe", "once", "status", "ack"])
     parser.add_argument("--directory", default="/var/lib/zakura-mac-verifier")
     parser.add_argument("--receipt", default="/etc/zakura-mac-verifier/receipt.json")
     parser.add_argument("--incident")
@@ -327,7 +331,8 @@ def main():
         slack = None
         if args.command == "run":
             slack = Slack(os.environ["MAC_VERIFIER_SLACK_BOT_TOKEN"], "U0A81KAPYMR", "T0A80TZAXK5")
-        monitor = Monitor(args.directory, read_json(args.receipt), slack=slack)
+        monitor = Monitor(args.directory, read_json(args.receipt), slack=slack,
+                          observation_only=args.command == "observe")
         if args.command == "ack":
             monitor.ack(args.incident)
         elif args.command == "once":

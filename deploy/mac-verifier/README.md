@@ -106,6 +106,11 @@ Mac services. Bootstrap imports and anchors state through temporary SSH forwards
 Activation installs the Linux comparator and a loopback status bridge, updates
 the existing mainnet dashboard, and starts Mac
 services. `stop` stops only the verifier services; it never destroys the private host.
+If dedicated alert credentials are not yet available, `install.py linux-observe`
+starts continuous comparison and the existing dashboard with an explicit alert
+delivery incident. This mode cannot qualify or start the healthy observation
+window. After installing the scoped identity, `linux-activate` removes the
+observation override and restarts the comparator with Slack delivery enabled.
 Provision tooling first; obtain the private IP only after review and checks.
 
 SSH output and errors are captured privately and never relayed to Actions logs.

@@ -273,7 +273,7 @@ def export_evidence(args):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("command", choices=["mac-prepare", "mac-activate", "mac-stop", "mac-uninstall",
-                                           "linux-prepare", "linux-activate", "linux-stop", "linux-uninstall", "export"])
+                                           "linux-prepare", "linux-observe", "linux-activate", "linux-stop", "linux-uninstall", "export"])
     parser.add_argument("--binary")
     parser.add_argument("--known-hosts")
     parser.add_argument("--tunnel-public-key")
@@ -305,17 +305,28 @@ def main():
             print("Services removed; state and evidence preserved for export.")
     elif args.command == "linux-prepare":
         install_linux(args)
+    elif args.command == "linux-observe":
+        read_json(ETC / "receipt.json")
+        write("/etc/systemd/system/zakura-mac-verifier.service.d/60-observation.conf",
+              f"[Service]\nLoadCredential=\nExecStart=\nExecStart=/usr/bin/python3 {LINUX_CODE}/monitor.py observe\n")
+        call("systemctl", "daemon-reload")
+        call("systemctl", "enable", "--now", "zakura-mac-verifier", "zakura-mac-verifier-dashboard")
+        call("systemctl", "restart", "zakura-mainnet-dashboard")
     elif args.command == "linux-activate":
         identity = read_json(ETC / "identity.json")
         if set(identity) != {"client_id", "client_secret"}:
             raise ValueError("invalid Universal Auth identity file")
         if (ETC / "identity.json").stat().st_uid != 0 or (ETC / "identity.json").stat().st_mode & 0o077:
             raise ValueError("identity.json must be root-owned mode 0600")
+        Path("/etc/systemd/system/zakura-mac-verifier.service.d/60-observation.conf").unlink(missing_ok=True)
+        call("systemctl", "daemon-reload")
         call("systemctl", "enable", "--now", "zakura-mac-verifier", "zakura-mac-verifier-dashboard")
+        call("systemctl", "restart", "zakura-mac-verifier")
         call("systemctl", "restart", "zakura-mainnet-dashboard")
     elif args.command in ("linux-stop", "linux-uninstall"):
         call("systemctl", "disable", "--now", "zakura-mac-verifier", "zakura-mac-verifier-dashboard")
         if args.command == "linux-uninstall":
+            Path("/etc/systemd/system/zakura-mac-verifier.service.d/60-observation.conf").unlink(missing_ok=True)
             Path("/etc/systemd/system/zakura-mac-verifier.service").unlink(missing_ok=True)
             Path("/etc/systemd/system/zakura-mac-verifier-dashboard.service").unlink(missing_ok=True)
             Path("/etc/systemd/system/zakura-mainnet-dashboard.service.d/70-private-verifier.conf").unlink(missing_ok=True)

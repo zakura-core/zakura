@@ -73,6 +73,17 @@ class MonitorTests(unittest.TestCase):
         events = [json.loads(line) for line in (Path(self.temp.name) / "audit.jsonl").read_text().splitlines()]
         self.assertEqual([x["height"] for x in events], list(range(11, 28)))
 
+    def test_observation_compares_but_never_qualifies_without_alert_delivery(self):
+        self.monitor.observation_only = True
+        self.monitor.state["qualified"] = True
+        self.step()
+        self.step(60)
+        self.assertEqual(self.monitor.state["cursor"], 27)
+        self.assertIn("alert delivery unavailable", self.monitor.state["incidents"])
+        self.assertIsNone(self.monitor.state["healthy_since"])
+        self.assertFalse(self.monitor.state["qualified"])
+        self.assertEqual(len(self.monitor.state["outbox"]), 1)
+
     def test_small_peer_propagation_lag_is_healthy_after_all_eligible_heights(self):
         self.mac.height = 28
         self.step()

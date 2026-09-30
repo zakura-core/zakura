@@ -107,7 +107,8 @@ def main():
     if corpus.get("passed") is not True or corpus.get("source_sha") != SOURCE_SHA or corpus.get("architecture") != "arm64":
         raise Unavailable("native pinned corpus has not passed")
     pinned = base / "snapshot-manifest.json"
-    manifest = verify_manifest(read_json(pinned) if pinned.exists() else Transport().json(MANIFEST))
+    manifest = verify_manifest(read_json(pinned) if pinned.exists() else Transport().json(
+        MANIFEST, headers={"User-Agent": "zakura-mac-verifier/1"}))
     if not pinned.exists():
         atomic_json(pinned, manifest)
     archive = base / "snapshot.tar.zst"

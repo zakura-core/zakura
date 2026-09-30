@@ -236,6 +236,8 @@ def export_evidence(args):
             shutil.copyfile(LINUX_HOME / name, dest / name)
         for source in LINUX_HOME.glob("audit.jsonl*"):
             shutil.copyfile(source, dest / source.name)
+        if (LINUX_HOME / "incidents").exists():
+            shutil.copytree(LINUX_HOME / "incidents", dest / "incidents")
     print("Exported evidence to", dest)
 
 

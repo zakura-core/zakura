@@ -138,6 +138,16 @@ class Monitor:
                 del incidents[name]
                 self.notify(f"Zakura Mac verifier recovered: {name}")
 
+    def confirmed_mismatch(self, height, left, right, now):
+        name = "confirmed tree state mismatch"
+        if name not in self.state["incidents"]:
+            evidence = {"event": name, "time": now, "height": height,
+                        "linux": left, "mac": right, "receipt": self.expected}
+            atomic_json(self.directory / "incidents" / (str(uuid.uuid4()) + ".json"), evidence)
+            self.audit(evidence)
+            self.incident(name, True, now, latched=True)
+            self.state["incidents"][name]["height"] = height
+
     def ack(self, name):
         if name not in self.state["incidents"]:
             raise ValueError("unknown incident")
@@ -186,7 +196,7 @@ class Monitor:
             if left != right:
                 left2, right2 = self.pair(cursor)
                 if left2 == left and right2 == right:
-                    self.incident("confirmed tree state mismatch", True, now, latched=True)
+                    self.confirmed_mismatch(cursor, left, right, now)
                     raise Unavailable("tree state mismatch")
                 raise Unavailable("unstable cursor read")
             return
@@ -216,7 +226,7 @@ class Monitor:
             if left != right:
                 left2, right2 = self.pair(height)
                 if left2 == left and right2 == right:
-                    self.incident("confirmed tree state mismatch", True, now, latched=True)
+                    self.confirmed_mismatch(height, left, right, now)
                 raise Unavailable("tree state mismatch or racing read")
             # An audit record precedes its durable cursor: a crash can replay, never skip.
             self.audit({"event": "matched", "time": now, "height": height, "record": left})

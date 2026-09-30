@@ -223,7 +223,9 @@ infisical run --env=prod \
 ```
 
 Deletion requires saved receipt/status/cursor/audit files and an elapsed minimum
-lease. Confirm API lookup returns 404 afterward and preserve that receipt: billing
+lease. Run `provider.py verify-deleted --inventory /private/operator/scw-inventory.json`
+through the same Infisical command afterward. It records confirmation only when
+the provider returns 404; repeat while deletion is pending and preserve the receipt. Billing
 continues until deletion completes. Power-off does not stop billing. The deadline
 is an operator responsibility, not an automatic provider TTL; schedule the trial
 follow-up when provisioning succeeds.

@@ -53,6 +53,23 @@ class Provider:
             raise Unavailable("resource ownership/type does not match POC")
         return server
 
+    def verify_deleted(self, state_path):
+        saved = read_json(state_path)
+        if saved.get("project_id") != self.project or not saved.get("deletion_requested_at"):
+            raise Unavailable("recorded deletion request required before confirming termination")
+        try:
+            self.get(saved["server_id"])
+        except urllib.error.HTTPError as error:
+            if error.code != 404:
+                raise
+            saved["deletion_confirmed_at"] = time.time()
+            saved["billing_stopped"] = True
+            atomic_json(state_path, saved)
+            return {"server_id": saved["server_id"], "deletion_confirmed": True,
+                    "billing_stopped": True}
+        return {"server_id": saved["server_id"], "deletion_confirmed": False,
+                "billing_stopped": False}
+
     def create(self, state_path, price_confirmed):
         path = Path(state_path)
         prior = read_json(path) if path.exists() else {}
@@ -130,13 +147,16 @@ def store_credentials(server, project, secret_path):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("command", choices=["inspect", "create", "adopt", "reboot", "destroy"])
+    parser.add_argument("command", choices=["inspect", "create", "adopt", "reboot", "destroy", "verify-deleted"])
     parser.add_argument("--inventory", required=True)
     parser.add_argument("--confirmed-hourly-eur")
     parser.add_argument("--server-id")
     parser.add_argument("--evidence-export", help="required durable evidence directory before deletion")
     args = parser.parse_args()
     provider = Provider(os.environ["SCW_PROJECT_ID"], os.environ["SCW_SECRET_KEY"])
+    if args.command == "verify-deleted":
+        print(json.dumps(provider.verify_deleted(args.inventory)))
+        return
     if args.command == "create":
         server = provider.create(args.inventory, args.confirmed_hourly_eur)
         store_credentials(server, os.environ["INFISICAL_PROJECT_ID"], "/mac-verifier-poc")

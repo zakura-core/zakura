@@ -294,6 +294,32 @@ class BoundaryTests(unittest.TestCase):
                   "vnc_url": "fixture-private"}
         self.assertNotIn("fixture-private", json.dumps(public_inventory(server)))
 
+    def test_deletion_only_confirmed_by_recorded_resource_404(self):
+        project = "00000000-0000-0000-0000-000000000001"
+        provider = Provider(project, "fixture")
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "inventory.json"
+            saved = {"project_id": project, "server_id": "fixture", "deletion_requested_at": 1}
+            path.write_text(json.dumps(saved))
+            with patch.object(provider, "get", return_value={"status": "deleting"}):
+                self.assertFalse(provider.verify_deleted(path)["billing_stopped"])
+            for code in (403, 503):
+                error = urllib.error.HTTPError("fixture", code, "fixture", {}, None)
+                with patch.object(provider, "get", side_effect=error):
+                    with self.assertRaises(urllib.error.HTTPError):
+                        provider.verify_deleted(path)
+                self.assertNotIn("deletion_confirmed_at", json.loads(path.read_text()))
+                error.close()
+            error = urllib.error.HTTPError("fixture", 404, "fixture", {}, None)
+            with patch.object(provider, "get", side_effect=error):
+                self.assertTrue(provider.verify_deleted(path)["billing_stopped"])
+            self.assertIn("deletion_confirmed_at", json.loads(path.read_text()))
+            error.close()
+            saved.pop("deletion_requested_at")
+            path.write_text(json.dumps(saved))
+            with self.assertRaises(Unavailable):
+                provider.verify_deleted(path)
+
 
 if __name__ == "__main__":
     unittest.main()

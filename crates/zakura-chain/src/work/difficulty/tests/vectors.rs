@@ -448,7 +448,7 @@ fn testnet_minimum_difficulty() -> Result<(), Report> {
         block::Height(299_188),
         block::Height(299_189),
         block::Height(299_202),
-        // block time gaps greater than 7.5 minutes (Blossom and later)
+        // block time gaps greater than 7.5 minutes (Blossom, before NU7)
         block::Height(584_000),
         // these 3 blocks have gaps greater than 7.5 minutes and less than 15 minutes
         block::Height(903_800),
@@ -505,8 +505,8 @@ fn check_testnet_minimum_difficulty_block(height: block::Height) -> Result<(), R
             .time
             .signed_duration_since(previous_block.header.time);
 
-        // zcashd requires a gap that's strictly greater than 6 times the target
-        // threshold, as documented in ZIP-205 and ZIP-208:
+        // These historical blocks use a gap strictly greater than six target
+        // spacings, as documented in ZIPs 205 and 208:
         // https://zips.z.cash/zip-0205#change-to-difficulty-adjustment-on-testnet
         // https://zips.z.cash/zip-0208#minimum-difficulty-blocks-on-testnet
         match NetworkUpgrade::minimum_difficulty_spacing_for_height(
@@ -515,7 +515,7 @@ fn check_testnet_minimum_difficulty_block(height: block::Height) -> Result<(), R
         ) {
             None => Err(eyre!("the minimum difficulty rule is not active"))?,
             Some(spacing) if (time_gap <= spacing) => Err(eyre!(
-                "minimum difficulty block times must be more than 6 target spacing intervals apart"
+                "minimum difficulty block times must exceed the consensus gap"
             ))?,
             _ => {}
         };

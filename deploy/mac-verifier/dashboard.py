@@ -36,6 +36,10 @@ def public_status(status, identifier):
     for key in ("node_rss_bytes", "free_disk_bytes"):
         value = resources.get(key) if isinstance(resources, dict) else None
         result[key] = value if type(value) is int and value >= 0 else None
+    anchor = sample.get("fork_anchor")
+    if (isinstance(anchor, dict) and type(anchor.get("height")) is int and anchor["height"] >= 0
+            and isinstance(anchor.get("hash"), str) and re.fullmatch(r"[a-fA-F0-9]{64}", anchor["hash"])):
+        result["fork_anchor"] = {"height": anchor["height"], "hash": anchor["hash"]}
     result["active_incidents"] = len(status.get("incidents", {}))
     result["pending_alerts"] = status.get("pending_alerts") if type(status.get("pending_alerts")) is int else None
     return result

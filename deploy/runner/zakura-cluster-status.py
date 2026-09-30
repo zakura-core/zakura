@@ -303,6 +303,7 @@ import urllib.request
     state_cache_dir,
     want_metrics,
 ) = sys.argv[1:16]
+fork_height = int(sys.argv[16]) if len(sys.argv) > 16 and sys.argv[16] else None
 
 out = {
     "service": service,
@@ -852,6 +853,13 @@ if rpc_url:
                     except Exception:
                         pass
         out["ancestor_hashes"] = ancestor_hashes
+        if fork_height is not None and tip_height is not None and 0 <= fork_height <= tip_height:
+            try:
+                anchor_hash = rpc_call("getblockhash", [fork_height])
+                if rpc_call("getblockhash", [tip_height]) == out["block_hash"]:
+                    out["fork_anchor"] = {"height": fork_height, "hash": anchor_hash}
+            except Exception:
+                pass
 
         best_hash = out.get("block_hash")
         if best_hash:
@@ -953,7 +961,7 @@ def ssh_capture_script(node: Node, script: str) -> subprocess.CompletedProcess:
     return subprocess.run(node.ssh_cmd("bash", "-s"), input=script, text=True, capture_output=True)
 
 
-def probe_node(node: Node, want_metrics: bool = True) -> dict:
+def probe_node(node: Node, want_metrics: bool = True, fork_height: int | None = None) -> dict:
     rpc_url = rpc_url_for(node.rpc_listen_addr)
     script = (
         "python3 - "
@@ -971,7 +979,8 @@ def probe_node(node: Node, want_metrics: bool = True) -> dict:
         f"{shlex.quote(node.metrics_endpoint)} "
         f"{shlex.quote(node.health_listen_addr)} "
         f"{shlex.quote(node.state_cache_dir)} "
-        f"{shlex.quote('1' if want_metrics else '')} <<'PY'\n"
+        f"{shlex.quote('1' if want_metrics else '')} "
+        f"{shlex.quote(str(fork_height) if fork_height is not None else '')} <<'PY'\n"
         f"{REMOTE_PROBE}\n"
         "PY\n"
     )
@@ -1076,6 +1085,10 @@ def private_verifier_status() -> dict:
             value = data.get(key)
             size = 64 if key == "mac_tip_hash" else 40
             result[key] = value if isinstance(value, str) and re.fullmatch(r"[a-fA-F0-9]{%d}" % size, value) else ""
+        anchor = data.get("fork_anchor")
+        if (isinstance(anchor, dict) and type(anchor.get("height")) is int and anchor["height"] >= 0
+                and isinstance(anchor.get("hash"), str) and re.fullmatch(r"[a-fA-F0-9]{64}", anchor["hash"])):
+            result["fork_anchor"] = {"height": anchor["height"], "hash": anchor["hash"]}
         stamp = result["sample_time"]
         result["available"] = stamp is not None and 0 <= time.time() - stamp <= 90
         return result
@@ -1148,9 +1161,13 @@ class ClusterCollector:
     def poll_once(self) -> None:
         rows = []
         started = time.time()
+        private_enabled = self.network == "mainnet" and os.environ.get("ZAKURA_PRIVATE_VERIFIER_STATUS") == "1"
+        sample = private_verifier_status() if private_enabled else {}
+        anchor = sample.get("fork_anchor") if sample.get("available") else None
+        fork_height = anchor["height"] if isinstance(anchor, dict) else None
         with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(self.nodes))) as pool:
             futures = {
-                pool.submit(probe_node, node, self.should_scrape_metrics(node.name, started)): node
+                pool.submit(probe_node, node, self.should_scrape_metrics(node.name, started), fork_height): node
                 for node in self.nodes
             }
             for future in concurrent.futures.as_completed(futures):
@@ -1161,8 +1178,7 @@ class ClusterCollector:
                     probe = {"error": str(error)}
                 rows.append(self.row_for(node, probe, time.time()))
 
-        if self.network == "mainnet" and os.environ.get("ZAKURA_PRIVATE_VERIFIER_STATUS") == "1":
-            sample = private_verifier_status()
+        if private_enabled:
             self.last_height.setdefault("zakura-mac-os", self.private_mac_progress.get("height"))
             self.last_advanced_at.setdefault("zakura-mac-os", self.private_mac_progress.get("last_advanced_at"))
             self.history.setdefault("zakura-mac-os", deque())
@@ -1176,6 +1192,7 @@ class ClusterCollector:
                      "host": {"disk_free_bytes": sample.get("free_disk_bytes"),
                               "rss_bytes": sample.get("node_rss_bytes")}}
             row = self.row_for(mac, probe, time.time())
+            row["fork_anchor"] = anchor
             row["detail"] += " · Compared through " + str(sample.get("compared_through") or "—")
             if sample.get("pending_alerts"):
                 row["detail"] += " · Alerts pending"
@@ -1429,6 +1446,7 @@ class ClusterCollector:
             "block_hash": block_hash,
             "previous_hash": previous_block_hash,
             "ancestor_hashes": ancestor_hashes,
+            "fork_anchor": probe.get("fork_anchor"),
             "node_id": node.node_id or probe.get("node_id") or "",
             "version": probe.get("version") or "",
             "last_restarted": probe.get("last_restarted") or "",

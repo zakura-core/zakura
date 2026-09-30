@@ -533,7 +533,7 @@ def node_condition(
         return ("ok", now, 0)
 
     if health in DOWN_HEALTH:
-        return ("down", now, args.down_after)
+        return ("down", now, 180.0 if row.get("name") == "zakura-mac-os" else args.down_after)
 
     if (
         seconds_since_advanced is not None
@@ -1151,7 +1151,7 @@ class Watchdog:
     def fleet_state(state: dict[str, Any], fleet: Fleet) -> dict[str, Any]:
         """Copy only this fleet's state so delivery cannot overwrite another fleet."""
         result = {}
-        for bucket in ("nodes", "fleets", "shared_stalls", "propagation", "decisions"):
+        for bucket in ("nodes", "fleets", "shared_stalls", "propagation", "decisions", "mac_forks"):
             entries = state.get(bucket, {})
             result[bucket] = copy.deepcopy({
                 key: value for key, value in entries.items()
@@ -1219,6 +1219,7 @@ class Watchdog:
 
         if not self.handle_fleet_recovered(state, fleet, now):
             return
+        self.handle_mac_fork(state, fleet, node_rows, now, suppressed)
         grace_since = max(
             self.started_at, self.fetch_recovered_at.get(fleet.name, 0)
         )
@@ -1258,6 +1259,51 @@ class Watchdog:
                 observation.condition == "stalled"
                 and observation.name in (shared_nodes | propagation_nodes),
             )
+
+    def handle_mac_fork(self, state, fleet, rows, now, suppressed):
+        """Alert on proven >10-block divergence against 70% of all other nodes.
+
+        Missing or racing samples cannot prove a fork or clear an existing one.
+        Offline peers remain in the denominator, preventing a reduced quorum.
+        """
+        if fleet.name != "mainnet":
+            return
+        mac = next((row for row in rows if row.get("name") == "zakura-mac-os"), None)
+        if mac is None or not tip_is_verifiable(mac):
+            return
+        anchor = mac.get("fork_anchor")
+        if not isinstance(anchor, dict):
+            return
+        height = coerce_height(anchor.get("height"))
+        block_hash = validated_block_hash(anchor.get("hash"))
+        tip = coerce_height(mac.get("height"))
+        if height is None or block_hash is None or tip - height < 10:
+            return
+        others = [row for row in rows if row.get("name") != "zakura-mac-os"]
+        if not others:
+            return
+        groups = {}
+        for row in others:
+            sample = row.get("fork_anchor")
+            if not tip_is_verifiable(row) or not isinstance(sample, dict) or sample.get("height") != height:
+                continue
+            value = validated_block_hash(sample.get("hash"))
+            if value is not None:
+                groups[value] = groups.get(value, 0) + 1
+        quorum = (7 * len(others) + 9) // 10
+        agreed = next((value for value, count in groups.items() if count >= quorum), None)
+        if agreed is None:
+            return
+        bucket = state.setdefault("mac_forks", {})
+        update_alert_state(
+            bucket, fleet.name, "fork" if agreed != block_hash else "ok", now, 0,
+            f":rotating_light: *Zakura mainnet* - `zakura-mac-os` forked for more than 10 blocks\n"
+            f"{groups[agreed]}/{len(others)} other nodes agree at height {height}\n"
+            "dashboard: https://status.mainnet.zakura.valargroup.dev/",
+            ":white_check_mark: *Zakura mainnet* - `zakura-mac-os` fork recovered\n"
+            "dashboard: https://status.mainnet.zakura.valargroup.dev/",
+            now, suppressed, self.args, tip, notify=self.notify,
+        )
 
     def propagation_grace(
         self, state: dict[str, Any], fleet: Fleet, rows: list[dict[str, Any]], now: float

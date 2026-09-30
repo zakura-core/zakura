@@ -18,6 +18,7 @@ from monitor import Monitor, Remote, Slack
 from rotate_logs import rotate
 import identity
 from dashboard import public_status
+from adapter import fork_anchor
 from private_deploy import validate_host, SSH
 import github_secrets
 
@@ -198,6 +199,28 @@ class MonitorTests(unittest.TestCase):
         self.step(60)
         self.assertEqual(len([x for x in self.monitor.state["outbox"] if x["text"].endswith("test")]), 1)
         self.assertEqual(len(self.monitor.state["outbox"]), 1)
+
+
+class ForkSampleTests(unittest.TestCase):
+    def test_anchor_is_ten_ancestors_back_and_tip_race_fails(self):
+        from unittest.mock import Mock
+        rpc = Mock()
+        rpc.call.side_effect = ["a" * 64, "b" * 64]
+        self.assertEqual(fork_anchor(rpc, {"height": 100, "hash": "b" * 64}),
+                         {"height": 90, "hash": "a" * 64})
+        self.assertEqual(rpc.call.call_args_list[0].args, ("getblockhash", 90))
+        rpc.call.side_effect = ["a" * 64, "c" * 64]
+        with self.assertRaises(Unavailable):
+            fork_anchor(rpc, {"height": 100, "hash": "b" * 64})
+        self.assertIsNone(fork_anchor(rpc, {"height": 9, "hash": "b" * 64}))
+
+    def test_bridge_drops_malformed_anchor_and_private_fields(self):
+        identifier = "verifier-" + "a" * 32
+        result = public_status({"verifier": {"fork_anchor": {"height": 90, "hash": "b" * 64,
+                                                               "host": "192.0.2.10"}}}, identifier)
+        self.assertEqual(result["fork_anchor"], {"height": 90, "hash": "b" * 64})
+        for anchor in (None, [], {"height": True, "hash": "b" * 64}, {"height": 90, "hash": "bad"}):
+            self.assertNotIn("fork_anchor", public_status({"verifier": {"fork_anchor": anchor}}, identifier))
 
 
 class BoundaryTests(unittest.TestCase):

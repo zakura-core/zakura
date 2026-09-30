@@ -275,3 +275,19 @@ verifier Slack credential after teardown. Do not revoke existing node credential
 Keep the implementation PR draft. Deployment, native receipts, delivered alerts,
 reboot recovery, and the qualification window must all have direct evidence before
 claiming the verification complete.
+
+
+## Fleet channel alerts
+
+The existing fleet watchdog sends Mac offline and fork transitions to
+`#zakura-alerts` using its existing incoming webhook. Mac downtime alerts after
+three minutes; other node thresholds remain unchanged. A fork alert requires
+at least 70% of all other configured mainnet nodes (nine of the current twelve)
+to agree on a different hash at the same height ten blocks behind the Mac tip.
+That proves at least eleven divergent blocks. Offline or missing peers remain
+in the denominator. Missing or racing evidence cannot trigger a fork alert or
+clear an existing one. Ordinary height lag on the same chain is not a fork.
+Alerts and recovery transitions use the watchdog's persistent state and delivery
+queue. The Mac endpoint, SSH credentials and peer identity are never included.
+These channel alerts are independent of the comparator's dedicated Slack DM
+credentials and do not establish the full comparator qualification gate.

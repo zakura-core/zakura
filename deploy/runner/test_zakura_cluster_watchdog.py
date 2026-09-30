@@ -2014,5 +2014,56 @@ class ReleaseStateConfigTests(unittest.TestCase):
             self.load('[[release_state]]\nname = "m"\n')
 
 
+
+
+class MacForkAlertTests(unittest.TestCase):
+    def rows(self, agreeing=9, depth=10):
+        def row(name, value):
+            return {"name": name, "health": "healthy", "height": 110,
+                    "seconds_since_advanced": 0, "block_hash": "c" * 64,
+                    "fork_anchor": {"height": 110-depth, "hash": value * 64}}
+        return [row("zakura-mac-os", "a")] + [row("other-%d" % i, "b" if i < agreeing else "a") for i in range(12)]
+
+    def check(self, rows, state=None, fleet="mainnet"):
+        state = {} if state is None else state
+        agent = watchdog.Watchdog([], make_args())
+        sent=[]
+        agent.notify=lambda text,args:(sent.append(text),True)[1]
+        agent.handle_mac_fork(state,watchdog.Fleet(fleet,"http://localhost/data","https://status.mainnet.zakura.valargroup.dev/"),rows,1000,False)
+        return state,sent
+
+    def test_nine_of_twelve_and_eleven_divergent_blocks_alert_once_and_recover(self):
+        state,sent=self.check(self.rows())
+        self.assertEqual(len(sent),1)
+        state,sent=self.check(self.rows(),state)
+        self.assertEqual(sent,[])
+        state,sent=self.check(self.rows(agreeing=0),state)
+        self.assertEqual(len(sent),1)
+        self.assertIn("recovered",sent[0])
+
+    def test_less_than_seventy_percent_and_ten_blocks_do_not_alert(self):
+        for rows in (self.rows(agreeing=8),self.rows(depth=9)):
+            self.assertEqual(self.check(rows)[1],[])
+
+    def test_missing_evidence_keeps_offline_peers_in_denominator_and_does_not_recover(self):
+        rows=self.rows(agreeing=8)
+        rows[-1]["health"]="down"
+        self.assertEqual(self.check(rows)[1],[])
+        state,_=self.check(self.rows())
+        for row in rows:row.pop("fork_anchor",None)
+        state,sent=self.check(rows,state)
+        self.assertEqual(sent,[])
+        self.assertTrue(state["mac_forks"]["mainnet"]["alerting"])
+
+    def test_testnet_ignored_and_lag_on_same_chain_does_not_alert(self):
+        self.assertEqual(self.check(self.rows(),fleet="testnet")[1],[])
+        rows=self.rows(agreeing=0)
+        for row in rows[1:]:row["height"]=120
+        self.assertEqual(self.check(rows)[1],[])
+
+    def test_mac_offline_uses_three_minutes_without_changing_other_nodes(self):
+        self.assertEqual(watchdog.node_condition({"name":"zakura-mac-os","health":"down"},1000,0,make_args())[2],180)
+        self.assertEqual(watchdog.node_condition({"name":"other","health":"down"},1000,0,make_args())[2],600)
+
 if __name__ == "__main__":
     unittest.main()

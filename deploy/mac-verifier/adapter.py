@@ -10,7 +10,7 @@ import shutil
 import subprocess
 import time
 
-from common import RPC, Unavailable, digest, read_json
+from common import RPC, Unavailable, digest, hex_bytes, read_json
 
 
 def resources(base):
@@ -28,6 +28,17 @@ def resources(base):
     except (OSError, ValueError, subprocess.SubprocessError):
         pass
     return result
+
+
+def fork_anchor(rpc, tip):
+    """Sample eleven-block fork evidence without accepting a racing tip read."""
+    if tip["height"] < 10:
+        return None
+    height = tip["height"] - 10
+    block_hash = hex_bytes(rpc.call("getblockhash", height), 32)
+    if hex_bytes(rpc.call("getblockhash", tip["height"]), 32) != tip["hash"]:
+        raise Unavailable("chain changed during fork sample")
+    return {"height": height, "hash": block_hash}
 
 
 def serve(base, rpc=None):
@@ -50,8 +61,10 @@ def serve(base, rpc=None):
                     current = (stat.st_ino, stat.st_size, stat.st_mtime_ns)
                     if current != signature:
                         binary_digest, signature = digest(binary), current
+                    tip = rpc.tip()
+                    anchor = fork_anchor(rpc, tip)
                     result = {"schema_version": 1, "sample_time": time.time(),
-                              "receipt": receipt, "tip": rpc.tip(),
+                              "receipt": receipt, "tip": tip, "fork_anchor": anchor,
                               "resources": resources(base),
                               "binary_sha256": binary_digest,
                               "config_sha256": digest(base / "zakurad.toml"),

@@ -5,6 +5,8 @@ on:
     paths:
       - 'deploy/mac-verifier/**'
       - 'deploy/runner/zakura-cluster-status.py'
+      - 'deploy/runner/zakura-cluster-watchdog.py'
+      - 'deploy/runner/test_zakura_cluster_watchdog.py'
       - 'deploy/runner/test_zakura_cluster_status.py'
       - '.github/workflows/mac-verifier.yml'
       - '.github/workflows/deploy-mac-verifier.yml'
@@ -13,6 +15,8 @@ on:
     paths:
       - 'deploy/mac-verifier/**'
       - 'deploy/runner/zakura-cluster-status.py'
+      - 'deploy/runner/zakura-cluster-watchdog.py'
+      - 'deploy/runner/test_zakura_cluster_watchdog.py'
       - 'deploy/runner/test_zakura_cluster_status.py'
       - '.github/workflows/mac-verifier.yml'
       - '.github/workflows/deploy-mac-verifier.yml'
@@ -35,6 +39,7 @@ jobs:
           persist-credentials: false
       - run: python3 -m unittest discover -s deploy/mac-verifier/tests -v
       - run: python3 deploy/runner/test_zakura_cluster_status.py
+      - run: python3 deploy/runner/test_zakura_cluster_watchdog.py
       - run: bash -n deploy/mac-verifier/build.sh
 
   native-linux-corpus:

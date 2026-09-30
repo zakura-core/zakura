@@ -125,6 +125,8 @@ impl VctFastSyncedChain {
                 nu6_2: Some(47),
                 nu6_3: Some(48),
                 nu7: Some(50),
+                #[cfg(zcash_unstable = "nutachyon")]
+                nu_tachyon: None,
             })
             .expect("the fixture activation heights are ordered")
             .extend_funding_streams()

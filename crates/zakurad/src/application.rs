@@ -171,6 +171,44 @@ fn vergen_build_version() -> Option<Version> {
     semver.parse().ok()
 }
 
+/// Returns the last release tag recorded by Git, or an empty string when unavailable.
+pub fn last_known_release_tag() -> &'static str {
+    release_tag_from_describe(option_env!("VERGEN_GIT_DESCRIBE").unwrap_or_default())
+}
+
+fn release_tag_from_describe(describe: &str) -> &str {
+    let describe = describe.strip_suffix("-dirty").unwrap_or(describe);
+    let mut parts = describe.rsplitn(3, '-');
+    let tag = match (parts.next(), parts.next(), parts.next()) {
+        (Some(commit), Some(count), Some(tag))
+            if commit.starts_with('g') && count.parse::<u64>().is_ok() =>
+        {
+            tag
+        }
+        _ => describe,
+    };
+    match tag.strip_prefix('v') {
+        Some(version) if Version::parse(version).is_ok() => tag,
+        _ => "",
+    }
+}
+
+#[test]
+fn release_tag_from_describe_preserves_tags_without_inventing_them() {
+    for (describe, expected) in [
+        ("v1.2.3", "v1.2.3"),
+        ("v1.2.3-dirty", "v1.2.3"),
+        ("v1.2.3-4-gabcdef-dirty", "v1.2.3"),
+        ("v1.2.3-rc.1-4-gabcdef", "v1.2.3-rc.1"),
+        ("v1.2.3-rc-extra-4-gabcdef", "v1.2.3-rc-extra"),
+        ("abcdef", ""),
+        ("VERGEN_IDEMPOTENT_OUTPUT", ""),
+        ("", ""),
+    ] {
+        assert_eq!(release_tag_from_describe(describe), expected);
+    }
+}
+
 /// The Zebra current release version, without any build metadata.
 pub fn release_version() -> Version {
     let mut release_version = build_version();

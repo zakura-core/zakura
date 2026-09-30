@@ -274,6 +274,8 @@ const NETWORK_UPGRADES_IN_ORDER: &[NetworkUpgrade] = &[
     #[cfg(any(test, feature = "zakura-test"))]
     Nu6_3,
     Nu7,
+    #[cfg(zcash_unstable = "nutachyon")]
+    NuTachyon,
 ];
 
 #[test]
@@ -289,7 +291,9 @@ fn full_activation_list_contains_all_upgrades() {
     let network = Network::Mainnet;
     let full_list = network.full_activation_list();
 
-    // NU7 is unscheduled on Mainnet (no activation height committed), so it is absent from the
-    // full activation list even though it is always present in the iter.
+    // Unscheduled upgrades are absent from the full activation list.
+    #[cfg(zcash_unstable = "nutachyon")]
+    assert_eq!(full_list.len(), NetworkUpgrade::iter().count() - 2);
+    #[cfg(not(zcash_unstable = "nutachyon"))]
     assert_eq!(full_list.len(), NetworkUpgrade::iter().count() - 1);
 }

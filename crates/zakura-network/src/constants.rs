@@ -346,6 +346,11 @@ pub const MAX_ADDRS_IN_ADDRESS_BOOK: usize =
 /// messages from each of our peers.
 pub const TIMESTAMP_TRUNCATION_SECONDS: u32 = 30 * 60;
 
+// TODO: The NuTachyon protocol versions are provisional. Update this constant and the mapping
+// in `Version::min_specified_for_upgrade` when its deployment ZIP is published.
+#[cfg(zcash_unstable = "nutachyon")]
+const CURRENT_NETWORK_PROTOCOL_VERSION_VALUE: u32 = 170_210; // NuTachyon (Mainnet + Testnet).
+#[cfg(not(zcash_unstable = "nutachyon"))]
 // ZIP 204 assigns NU7 the protocol version 170_180 on Testnet and 170_190 on Mainnet.
 // `Version::min_specified_for_upgrade` holds the same values. Mainnet and Testnet both have
 // an NU7 height, so one binary advertises the Mainnet value, which also meets the Testnet

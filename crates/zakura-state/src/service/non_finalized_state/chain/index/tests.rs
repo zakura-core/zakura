@@ -31,6 +31,7 @@ fn cloned_chain_keeps_transparent_address_history_isolated() {
         Default::default(),
         Default::default(),
         Default::default(),
+        Default::default(),
         ValueBalance::<NonNegative>::zero(),
     );
     *chain
@@ -105,6 +106,7 @@ fn compare_address_index_clone() {
     let mut chain = Chain::new(
         &Network::Mainnet,
         Height(0),
+        Default::default(),
         Default::default(),
         Default::default(),
         Default::default(),

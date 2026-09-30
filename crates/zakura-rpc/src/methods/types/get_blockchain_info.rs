@@ -9,6 +9,8 @@ use zakura_chain::{
 
 use zec::Zec;
 
+use crate::methods::BlockchainValuePoolBalances;
+
 use super::*;
 
 /// A value pool's balance in Zec and Zatoshis
@@ -37,9 +39,8 @@ pub struct GetBlockchainInfoBalance {
 }
 
 impl GetBlockchainInfoBalance {
-    /// Returns zero-value transparent, Sprout, Sapling, Orchard, Lockbox, and
-    /// Ironwood value pools.
-    pub fn zero_pools() -> [Self; 6] {
+    /// Returns zero-value entries for every tracked value pool.
+    pub fn zero_pools() -> BlockchainValuePoolBalances {
         Self::value_pools(Default::default(), None)
     }
 
@@ -88,18 +89,22 @@ impl GetBlockchainInfoBalance {
         Self::new_internal("ironwood", amount, delta)
     }
 
+    /// Creates a [`GetBlockchainInfoBalance`] for the Tachyon pool.
+    #[cfg(zcash_unstable = "nutachyon")]
+    pub fn tachyon(amount: Amount<NonNegative>, delta: Option<Amount<NegativeAllowed>>) -> Self {
+        Self::new_internal("tachyon", amount, delta)
+    }
+
     /// Creates a [`GetBlockchainInfoBalance`] for the Lockbox pool.
     pub fn deferred(amount: Amount<NonNegative>, delta: Option<Amount<NegativeAllowed>>) -> Self {
         Self::new_internal("lockbox", amount, delta)
     }
 
-    /// Converts a [`ValueBalance`] to transparent, Sprout, Sapling, Orchard,
-    /// Lockbox, and Ironwood value pool entries, keeping the pre-Ironwood pool
-    /// indexes stable.
+    /// Converts a [`ValueBalance`] to RPC value pool entries in activation order.
     pub fn value_pools(
         value_balance: ValueBalance<NonNegative>,
         delta_balance: Option<ValueBalance<NegativeAllowed>>,
-    ) -> [Self; 6] {
+    ) -> BlockchainValuePoolBalances {
         [
             Self::transparent(
                 value_balance.transparent_amount(),
@@ -125,6 +130,11 @@ impl GetBlockchainInfoBalance {
                 value_balance.ironwood_amount(),
                 delta_balance.map(|b| b.ironwood_amount()),
             ),
+            #[cfg(zcash_unstable = "nutachyon")]
+            Self::tachyon(
+                value_balance.tachyon_amount(),
+                delta_balance.map(|b| b.tachyon_amount()),
+            ),
         ]
     }
 
@@ -141,5 +151,42 @@ impl GetBlockchainInfoBalance {
                 )
             })
             .expect("at least one pool")
+    }
+}
+
+#[cfg(all(test, zcash_unstable = "nutachyon"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tachyon_pool_is_included_in_rpc_balances_and_chain_supply() {
+        let tachyon_amount = Amount::try_from(123_456_u64).expect("test amount is valid");
+        let value_balance = ValueBalance::from_tachyon_amount(tachyon_amount);
+
+        let pools = GetBlockchainInfoBalance::value_pools(value_balance, None);
+
+        assert_eq!(pools.len(), 7);
+        assert_eq!(pools[6].id().as_str(), "tachyon");
+        assert_eq!(pools[6].chain_value_zat(), tachyon_amount);
+        assert_eq!(
+            GetBlockchainInfoBalance::chain_supply(value_balance).chain_value_zat(),
+            tachyon_amount,
+        );
+    }
+
+    #[test]
+    fn legacy_rpc_balances_decode_with_an_empty_tachyon_pool() {
+        let legacy_pools = GetBlockchainInfoBalance::value_pools(ValueBalance::zero(), None)
+            .into_iter()
+            .take(6)
+            .collect();
+
+        let pools = crate::methods::blockchain_value_pool_balances_from_vec::<
+            serde::de::value::Error,
+        >(legacy_pools)
+        .expect("six-pool RPC balances remain compatible");
+
+        assert_eq!(pools[6].id().as_str(), "tachyon");
+        assert_eq!(pools[6].chain_value_zat(), Amount::<NonNegative>::zero());
     }
 }

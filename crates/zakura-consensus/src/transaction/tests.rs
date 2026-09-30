@@ -54,6 +54,8 @@ use super::{check, Request, Verifier};
 
 #[cfg(test)]
 mod prop;
+#[cfg(all(test, zcash_unstable = "nutachyon"))]
+mod tachyon;
 
 /// Returns the timeout duration for tests, extended when running under coverage
 /// instrumentation to account for the performance overhead.
@@ -4610,6 +4612,8 @@ fn configured_network_with_nu7(nu7: Option<Height>) -> Network {
             nu6_2: Some(10),
             nu6_3: Some(11),
             nu7: nu7.map(|height| height.0),
+            #[cfg(zcash_unstable = "nutachyon")]
+            nu_tachyon: None,
             #[cfg(zcash_unstable = "zfuture")]
             zfuture: None,
         })

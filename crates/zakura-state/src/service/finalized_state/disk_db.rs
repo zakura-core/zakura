@@ -1447,7 +1447,8 @@ impl DiskDb {
     /// If the current db version belongs to `restorable_db_versions`, the function moves a previous
     /// db to a new path so it can be used again. It does so by merely trying to rename the path
     /// corresponding to the db version directly preceding the current version to the path that is
-    /// used by the current db. If successful, it also deletes the db version file.
+    /// used by the current db. If successful, it records the previous format version at the new
+    /// path so startup can apply the remaining upgrades.
     ///
     /// Returns the old disk version if one existed and the db directory was renamed, or None otherwise.
     // TODO: Update this function to rename older major db format version to the current version (#9565).
@@ -1473,6 +1474,27 @@ impl DiskDb {
             }
 
             let new_path = config.db_path(db_kind, major_db_ver, network);
+
+            // A directory name cannot establish compatibility if someone moved a newer database.
+            let disk_version = match database_format_version_on_disk(
+                config,
+                db_kind,
+                old_major_db_ver,
+                network,
+            ) {
+                Ok(Some(version))
+                    if version.major <= old_major_db_ver
+                        && (version.major + 1..=old_major_db_ver)
+                            .all(|major| restorable_db_versions.contains(&major)) =>
+                {
+                    version
+                }
+                other => {
+                    warn!(?old_path, version = ?other,
+                        "skipping database reuse because its recorded format has no supported upgrade path");
+                    return None;
+                }
+            };
 
             let old_path = match fs::canonicalize(&old_path) {
                 Ok(canonicalized_old_path) => canonicalized_old_path,
@@ -1526,25 +1548,25 @@ impl DiskDb {
                     }
                 };
 
+                // Preserve the source major before moving legacy or missing version markers.
+                // A destination opener must never infer the new major for unmigrated data.
+                if let Err(error) = write_database_format_version_to_disk(
+                    config,
+                    db_kind,
+                    old_major_db_ver,
+                    &disk_version,
+                    network,
+                ) {
+                    warn!(
+                        ?error,
+                        "could not preserve source database format before reuse"
+                    );
+                    return None;
+                }
+
                 match fs::rename(&old_path, &new_path) {
                     Ok(()) => {
                         info!("moved state cache from {old_path:?} to {new_path:?}");
-
-                        let mut disk_version =
-                            database_format_version_on_disk(config, db_kind, major_db_ver, network)
-                                .expect("unable to read database format version file")
-                                .expect("unable to parse database format version");
-
-                        disk_version.major = old_major_db_ver;
-
-                        write_database_format_version_to_disk(
-                            config,
-                            db_kind,
-                            major_db_ver,
-                            &disk_version,
-                            network,
-                        )
-                        .expect("unable to write database format version file to disk");
 
                         // Get the parent of the old path, e.g. `state/v25/` and delete it if it is
                         // empty.

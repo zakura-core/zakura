@@ -14,3 +14,7 @@ pub const TX_V5_VERSION_GROUP_ID: u32 = 0x26A7_270A;
 
 /// The version group ID for version 6 transactions.
 pub const TX_V6_VERSION_GROUP_ID: u32 = 0xD884_B698;
+
+/// The placeholder version group ID for version 7 transactions ("tach" in ASCII).
+#[cfg(zcash_unstable = "nutachyon")]
+pub const TX_V7_VERSION_GROUP_ID: u32 = 0x7461_6368;

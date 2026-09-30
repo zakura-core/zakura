@@ -705,7 +705,7 @@ async fn test_mocked_rpc_response_data_for_network(network: &Network) {
 /// Snapshot `getinfo` response, using `cargo insta` and JSON serialization.
 fn snapshot_rpc_getinfo(info: GetInfoResponse, settings: &insta::Settings) {
     settings.bind(|| {
-        insta::assert_json_snapshot!("get_info", info, {
+        insta::assert_json_snapshot!(build_snapshot_name("get_info"), info, {
             ".subversion" => dynamic_redaction(|value, _path| {
                 // assert that the subversion value is user agent
                 assert_eq!(value.as_str().unwrap(), "RPC test");
@@ -726,7 +726,7 @@ fn snapshot_rpc_getblockchaininfo(
     settings: &insta::Settings,
 ) {
     settings.bind(|| {
-        insta::assert_json_snapshot!(format!("get_blockchain_info{variant_suffix}"), info, {
+        insta::assert_json_snapshot!(build_snapshot_name(&format!("get_blockchain_info{variant_suffix}")), info, {
             ".estimatedheight" => dynamic_redaction(|value, _path| {
                 // assert that the value looks like a valid height here
                 assert!(u32::try_from(value.as_u64().unwrap()).unwrap() < Height::MAX_AS_U32);
@@ -781,7 +781,12 @@ fn snapshot_rpc_getblock_verbose(
     block: GetBlockResponse,
     settings: &insta::Settings,
 ) {
-    settings.bind(|| insta::assert_json_snapshot!(format!("get_block_verbose_{variant}"), block));
+    settings.bind(|| {
+        insta::assert_json_snapshot!(
+            build_snapshot_name(&format!("get_block_verbose_{variant}")),
+            block
+        )
+    });
 }
 
 /// Check valid `getblockheader` response using `cargo insta`.
@@ -918,7 +923,9 @@ fn snapshot_rpc_getnetworkinfo(
     get_network_info: GetNetworkInfoResponse,
     settings: &insta::Settings,
 ) {
-    settings.bind(|| insta::assert_json_snapshot!("get_network_info", get_network_info));
+    settings.bind(|| {
+        insta::assert_json_snapshot!(build_snapshot_name("get_network_info"), get_network_info)
+    });
 }
 
 /// Snapshot `getpeerinfo` response, using `cargo insta` and JSON serialization.
@@ -1479,4 +1486,12 @@ pub async fn test_mining_rpcs<State, ReadState>(
         .expect("unexpected error in z_list_unified_receivers RPC call");
 
     snapshot_rpc_z_listunifiedreceivers("ua2", z_list_unified_receivers, &settings);
+}
+
+fn build_snapshot_name(name: &str) -> String {
+    if cfg!(zcash_unstable = "nutachyon") {
+        format!("{name}_tachyon")
+    } else {
+        name.to_owned()
+    }
 }

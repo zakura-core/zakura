@@ -22,6 +22,8 @@ pub fn fake_history_tree(network: &Network) -> Arc<HistoryTree> {
         &first_sapling_root,
         &Default::default(),
         &Default::default(),
+        #[cfg(zcash_unstable = "nutachyon")]
+        &Default::default(),
     )
     .unwrap();
 

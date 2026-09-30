@@ -38,6 +38,7 @@ fn funded_chain() -> (Chain, Arc<Block>, transparent::OutPoint) {
         Default::default(),
         Default::default(),
         Default::default(),
+        Default::default(),
         ValueBalance::fake_populated_pool(),
     )
     .push(block.clone().prepare().test_with_zero_spent_utxos())

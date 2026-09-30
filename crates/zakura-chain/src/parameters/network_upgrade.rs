@@ -67,6 +67,9 @@ pub enum NetworkUpgrade {
     /// The Zcash protocol after the NU7 upgrade.
     #[serde(rename = "NU7")]
     Nu7,
+    /// The Zcash protocol after the NuTachyon upgrade.
+    #[cfg(zcash_unstable = "nutachyon")]
+    NuTachyon,
 
     #[cfg(zcash_unstable = "zfuture")]
     ZFuture,
@@ -240,6 +243,8 @@ pub(crate) const CONSENSUS_BRANCH_IDS: &[(NetworkUpgrade, ConsensusBranchId)] = 
     (Nu6_3, ConsensusBranchId(0x37a5165b)),
     // The NU7 consensus branch ID from ZIP 259, matching zcash_protocol's `BranchId::Nu7`.
     (Nu7, ConsensusBranchId(0x77190ad9)),
+    #[cfg(zcash_unstable = "nutachyon")]
+    (NuTachyon, ConsensusBranchId(0xfffffffc)),
     #[cfg(zcash_unstable = "zfuture")]
     (ZFuture, ConsensusBranchId(0xfffffffd)),
 ];
@@ -479,6 +484,9 @@ impl NetworkUpgrade {
             }
             Nu7 => POST_NU7_POW_TARGET_SPACING.into(),
 
+            #[cfg(zcash_unstable = "nutachyon")]
+            NuTachyon => POST_BLOSSOM_POW_TARGET_SPACING.into(),
+
             #[cfg(zcash_unstable = "zfuture")]
             ZFuture => POST_NU7_POW_TARGET_SPACING.into(),
         };
@@ -583,6 +591,9 @@ impl NetworkUpgrade {
             | Nu5 | Nu6 | Nu6_1 | Nu6_2 | Nu6_3 => PRE_NU7_POW_AVERAGING_WINDOW,
             Nu7 => POST_NU7_POW_AVERAGING_WINDOW,
 
+            #[cfg(zcash_unstable = "nutachyon")]
+            NuTachyon => POST_NU7_POW_AVERAGING_WINDOW,
+
             #[cfg(zcash_unstable = "zfuture")]
             ZFuture => POST_NU7_POW_AVERAGING_WINDOW,
         }
@@ -642,6 +653,8 @@ impl From<zcash_protocol::consensus::NetworkUpgrade> for NetworkUpgrade {
             zcash_protocol::consensus::NetworkUpgrade::Nu6_2 => Self::Nu6_2,
             zcash_protocol::consensus::NetworkUpgrade::Nu6_3 => Self::Nu6_3,
             zcash_protocol::consensus::NetworkUpgrade::Nu7 => Self::Nu7,
+            #[cfg(zcash_unstable = "nutachyon")]
+            zcash_protocol::consensus::NetworkUpgrade::NuTachyon => Self::NuTachyon,
             #[cfg(zcash_unstable = "zfuture")]
             zcash_protocol::consensus::NetworkUpgrade::ZFuture => Self::ZFuture,
         }

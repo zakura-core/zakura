@@ -32,6 +32,7 @@ Keep entries **newest-first**. Each row records:
 
 | Parameter | Location | Old → New | PR | Why |
 | --- | --- | --- | --- | --- |
+| `BLOCK_PRODUCTION_WEIGHT_RATIO_CAP` | `crates/zakura-chain/src/transaction/unmined/zip317.rs` | 10 → 13 | [#1218](https://github.com/zakura-core/zakura/pull/1218) | Preserve the 12.5-fold selection weight of transactions paying 5,000 zatoshis per action against the new 400-zatoshi baseline. |
 | `MARGINAL_FEE` | `crates/zakura-chain/src/transaction/unmined/zip317.rs` | 5,000 → 400 zatoshis per action | [#1218](https://github.com/zakura-core/zakura/pull/1218) | Lower Zakura's conventional fee for mempool admission, GBT weighting, and eviction policy. |
 | `MEMPOOL_TX_FEE_REQUIREMENT_CAP` | `crates/zakura-chain/src/transaction/unmined/zip317.rs` | 1,000 → 800 zatoshis | [#1218](https://github.com/zakura-core/zakura/pull/1218) | Keep the legacy size-based relay fee below the new minimum for two grace actions. |
 | Testnet template mining allowance (`EXTRA_SPACINGS_TO_MINE_A_BLOCK`) | `crates/zakura-state/src/service/read/difficulty.rs` | 2 candidate target spacings → removed | [#1203](https://github.com/zakura-core/zakura/pull/1203) | Offer minimum-difficulty work only once it is valid instead of future-dating template timestamps; long polling refreshes work at that time. |

@@ -33,9 +33,8 @@ const P2PKH_STANDARD_INPUT_SIZE: usize = 150;
 /// The standard size of p2pkh outputs for the ZIP-317 fee calculation, in bytes.
 const P2PKH_STANDARD_OUTPUT_SIZE: usize = 34;
 
-/// The recommended weight ratio cap for ZIP-317 block production.
-/// `weight_ratio_cap` in ZIP-317.
-const BLOCK_PRODUCTION_WEIGHT_RATIO_CAP: f32 = 10.0;
+/// Maximum fee weight ratio for Zakura's block template selection.
+const BLOCK_PRODUCTION_WEIGHT_RATIO_CAP: f32 = 13.0;
 
 /// The minimum fee for the block production weight ratio calculation, in zatoshis.
 /// If a transaction has a lower fee, this value is used instead.

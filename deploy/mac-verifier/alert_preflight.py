@@ -34,7 +34,12 @@ def inspect(directory, expected, now, fleet):
     actionable = set(state.get("incidents", {})) - {"alert delivery unavailable"}
     if actionable or not status.get("caught_up") or state.get("outbox_overflow"):
         raise Unavailable("active incident, incomplete coverage or queue overflow")
-    rows = fleet.get("nodes", [])
+    poll = fleet.get("last_poll")
+    rows = fleet.get("rows")
+    if (fleet.get("network") != "mainnet" or type(poll) not in (int, float)
+            or not 0 <= now - poll <= 90 or not isinstance(rows, list)
+            or any(not isinstance(row, dict) for row in rows)):
+        raise Unavailable("fresh mainnet dashboard rows required")
     mac = next((r for r in rows if r.get("name") == "zakura-mac-os"), None)
     if mac is None or mac.get("health") != "healthy":
         raise Unavailable("Mac fleet row is not healthy")

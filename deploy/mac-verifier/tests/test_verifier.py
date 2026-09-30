@@ -673,7 +673,7 @@ class QuietEnablementTests(unittest.TestCase):
             self.mac.now = now
             self.monitor.step(now)
         anchor = {"height": 20, "hash": "a" * 64}
-        self.fleet = {"nodes": [{"name": "zakura-mac-os", "health": "healthy", "fork_anchor": anchor}]
+        self.fleet = {"network": "mainnet", "last_poll": 180, "rows": [{"name": "zakura-mac-os", "health": "healthy", "fork_anchor": anchor}]
                       + [{"name": "other-" + str(n), "health": "healthy", "fork_anchor": anchor} for n in range(12)]}
 
     def test_read_only_preflight_reports_zero_messages_without_network_or_mutation(self):
@@ -713,7 +713,7 @@ class QuietEnablementTests(unittest.TestCase):
 
     def test_missing_quorum_or_wrong_identity_blocks_enablement(self):
         bad = copy.deepcopy(self.fleet)
-        for row in bad["nodes"][1:5]:row.pop("fork_anchor")
+        for row in bad["rows"][1:5]:row.pop("fork_anchor")
         with self.assertRaises(Unavailable):
             prepare_alerts(self.temp.name, receipt(), 181, bad)
         wrong = receipt();wrong["config_sha256"] = "c" * 64
@@ -733,6 +733,11 @@ class QuietEnablementTests(unittest.TestCase):
         current = json.loads(path.read_text())
         self.assertEqual(current["nodes"], {"mainnet/other": {"alerting": True}})
         self.assertEqual(current["mac_forks"], {})
+
+    def test_wrong_dashboard_schema_network_and_stale_poll_are_rejected(self):
+        for changes in ({"network": "testnet"}, {"last_poll": 0}, {"rows": None}):
+            with self.subTest(changes=changes), self.assertRaises(Unavailable):
+                prepare_alerts(self.temp.name, receipt(), 181, {**self.fleet, **changes})
 
     def test_flap_gap_and_duplicate_samples_cannot_produce_recovery(self):
         m = self.monitor

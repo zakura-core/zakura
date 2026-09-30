@@ -101,6 +101,7 @@ indexmap = "2.8"
 indicatif = "0.17"
 inferno = { version = "0.12", default-features = false }
 insta = "1.42"
+ipnet = "2.12"
 itertools = "0.14"
 jsonrpsee = "0.24.8"
 jsonrpsee-proc-macros = "0.24.9"

@@ -43,11 +43,13 @@ use crate::{
 };
 
 mod cache_dir;
+mod unconditional_peers;
 
 #[cfg(test)]
 mod tests;
 
 pub use cache_dir::CacheDir;
+pub use unconditional_peers::UnconditionalPeers;
 
 pub(crate) use cache_dir::{
     default_network_identity_dir, zakura_node_secret_key_file_path as zakura_secret_key_file_path,
@@ -352,6 +354,27 @@ pub struct Config {
     /// Enabling this setting reveals peer topology in logs and trace files. Restrict access
     /// to logs, trace directories, and downstream monitoring systems.
     pub expose_peer_addresses: bool,
+
+    /// Peer IP addresses and CIDR ranges that Zakura never scores or bans.
+    ///
+    /// Each entry is an IP address, such as `"192.0.2.1"`, or a CIDR range, such as
+    /// `"2001:db8::/32"`. Zakura ignores misbehavior reports for these peers, so their
+    /// misbehavior score stays at zero and Zakura never bans their IP address. Use this
+    /// setting for peers you operate, such as your own nodes, miners, or sidecars, so
+    /// that tip lag, upgrade boundaries, or bugs cannot get them banned.
+    ///
+    /// This setting only exempts peers from misbehavior scores and bans. Zakura still
+    /// applies connection limits to these peers, and still disconnects them on protocol
+    /// errors or inbound overload.
+    ///
+    /// Entries match legacy peer IP addresses. An IPv4 entry also matches the
+    /// IPv4-mapped IPv6 form of the same address. The default is empty.
+    ///
+    /// # Security
+    ///
+    /// Zakura never bans a listed peer, even if it sends invalid blocks or transactions.
+    /// Only list peers you trust.
+    pub unconditional_peers: UnconditionalPeers,
 }
 
 impl Config {
@@ -913,6 +936,7 @@ impl Default for Config {
             peerset_initial_target_size: DEFAULT_PEERSET_INITIAL_TARGET_SIZE,
             max_connections_per_ip: DEFAULT_MAX_CONNS_PER_IP,
             expose_peer_addresses: false,
+            unconditional_peers: UnconditionalPeers::default(),
         }
     }
 }
@@ -1039,6 +1063,7 @@ struct DConfig {
     crawl_new_peer_interval: Duration,
     max_connections_per_ip: Option<usize>,
     expose_peer_addresses: bool,
+    unconditional_peers: UnconditionalPeers,
 }
 
 impl Default for DConfig {
@@ -1062,6 +1087,7 @@ impl Default for DConfig {
             crawl_new_peer_interval: config.crawl_new_peer_interval,
             max_connections_per_ip: Some(config.max_connections_per_ip),
             expose_peer_addresses: config.expose_peer_addresses,
+            unconditional_peers: config.unconditional_peers,
         }
     }
 }
@@ -1128,6 +1154,7 @@ impl From<Config> for DConfig {
             crawl_new_peer_interval,
             max_connections_per_ip,
             expose_peer_addresses,
+            unconditional_peers,
         }: Config,
     ) -> Self {
         let dnetwork = match network.kind() {
@@ -1169,6 +1196,7 @@ impl From<Config> for DConfig {
             crawl_new_peer_interval,
             max_connections_per_ip: Some(max_connections_per_ip),
             expose_peer_addresses,
+            unconditional_peers,
         }
     }
 }
@@ -1196,6 +1224,7 @@ impl<'de> Deserialize<'de> for Config {
             crawl_new_peer_interval,
             max_connections_per_ip,
             expose_peer_addresses,
+            unconditional_peers,
         } = DConfig::deserialize(deserializer)?;
 
         let p2p_stack = p2p_stack_from_config::<D>(p2p_stack, legacy_p2p, v2_p2p)?;
@@ -1321,6 +1350,7 @@ impl<'de> Deserialize<'de> for Config {
             crawl_new_peer_interval,
             max_connections_per_ip,
             expose_peer_addresses,
+            unconditional_peers,
         })
     }
 }

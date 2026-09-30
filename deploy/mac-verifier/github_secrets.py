@@ -6,8 +6,10 @@ import subprocess
 import tempfile
 from pathlib import Path
 import uuid
+import urllib.error
+import urllib.parse
 
-from common import Unavailable
+from common import Unavailable, Transport
 from private_deploy import validate_host
 
 PROJECT = "c57a6889-6a7c-4d05-a54a-e4a4c0b14ee7"
@@ -46,9 +48,14 @@ def main():
     parser.add_argument("--host-file", help="private local file; never pass the IP as an argument")
     args = parser.parse_args()
     if args.command == "init":
+        from identity import user_token
+        query = urllib.parse.urlencode({"workspaceId": PROJECT, "environment": "prod", "secretPath": FOLDER})
         try:
-            get("MAC_VERIFIER_ID")
-        except Unavailable:
+            Transport().json("https://app.infisical.com/api/v3/secrets/raw/MAC_VERIFIER_ID?" + query,
+                             headers={"Authorization": "Bearer " + user_token()})
+        except urllib.error.HTTPError as error:
+            if error.code != 404:
+                raise
             set_secret("MAC_VERIFIER_ID", "verifier-" + uuid.uuid4().hex)
         return
     if args.command == "bind-host":

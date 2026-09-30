@@ -17,6 +17,7 @@ from rotate_logs import rotate
 import identity
 from dashboard import public_status
 from private_deploy import validate_host, SSH
+import github_secrets
 
 
 def record(height, fork=0):
@@ -187,6 +188,23 @@ class MonitorTests(unittest.TestCase):
 
 
 class BoundaryTests(unittest.TestCase):
+    def test_opaque_identity_init_never_overwrites_on_auth_or_network_error(self):
+        for code in (401, 503, 404):
+            error = urllib.error.HTTPError("fixture", code, "fixture", {}, None)
+            with patch.object(identity, "user_token", return_value="fixture"), \
+                    patch.object(github_secrets.Transport, "json", side_effect=error), \
+                    patch.object(github_secrets, "set_secret") as store, \
+                    patch.object(sys, "argv", ["github_secrets.py", "init"]):
+                if code == 404:
+                    github_secrets.main()
+                    store.assert_called_once()
+                    self.assertRegex(store.call_args.args[1], r"^verifier-[a-f0-9]{32}$")
+                else:
+                    with self.assertRaises(urllib.error.HTTPError):
+                        github_secrets.main()
+                    store.assert_not_called()
+            error.close()
+
     def test_dashboard_allowlist_excludes_private_identity_everywhere(self):
         private = {"host": "192.0.2.10", "error": "ssh to 192.0.2.10 failed",
                    "verifier": {"receipt": {"os": "private-host.local", "peer_id": "secret-peer"}},

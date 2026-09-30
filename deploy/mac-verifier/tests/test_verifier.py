@@ -240,6 +240,16 @@ class BoundaryTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 validate_host(value)
 
+    def test_dashboard_tip_fields_are_integer_only(self):
+        result = public_status({"verifier": {"tip": {"height": 100}}, "reference": {"height": 105}},
+                               "verifier-" + "a" * 32)
+        self.assertEqual((result["mac_tip"], result["linux_tip"]), (100, 105))
+        for value in ("192.0.2.10", True, -1, None):
+            result = public_status({"verifier": {"tip": {"height": value}}, "reference": {"height": value}},
+                                   "verifier-" + "a" * 32)
+            self.assertIsNone(result["mac_tip"])
+            self.assertIsNone(result["linux_tip"])
+
     def test_ssh_captures_endpoint_bearing_output_and_never_relays_errors(self):
         with tempfile.TemporaryDirectory() as directory:
             environment = {"MAC_VERIFIER_HOST": "192.0.2.10", "MAC_VERIFIER_USER": "operator",

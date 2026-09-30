@@ -19,6 +19,11 @@ def public_status(status, identifier):
         result[key] = value if type(value) in (int, float) else None
     for key in ("caught_up", "qualified"):
         result[key] = status.get(key) is True
+    for key, sample in (("mac_tip", status.get("verifier")), ("linux_tip", status.get("reference"))):
+        sample = sample if isinstance(sample, dict) else {}
+        tip = sample.get("tip", {}) if key == "mac_tip" else sample
+        value = tip.get("height") if isinstance(tip, dict) else None
+        result[key] = value if type(value) is int and value >= 0 else None
     result["active_incidents"] = len(status.get("incidents", {}))
     result["pending_alerts"] = status.get("pending_alerts") if type(status.get("pending_alerts")) is int else None
     return result

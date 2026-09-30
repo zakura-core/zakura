@@ -98,7 +98,7 @@ def main():
             for path in list(package.glob("*.py")) + [package / "build.sh", package / "corpus.json", package / "templates/zakurad.toml"]:
                 relative = path.relative_to(package)
                 mac.put(path.read_text(), REMOTE + "/tooling/" + str(relative))
-            mac.put(os.environ["MAC_VERIFIER_REFERENCE_KNOWN_HOSTS"], REMOTE + "/reference-hosts")
+            mac.put(os.environ["MAC_VERIFIER_REFERENCE_KNOWN_HOSTS"].rstrip("\n") + "\n", REMOTE + "/reference-hosts")
             mac.put(os.environ["MAC_VERIFIER_TUNNEL_KEY"].rstrip("\n") + "\n", REMOTE + "/tunnel")
             # Endpoints are root-private input data, not substituted into script text.
             mac.put(json.dumps({"reference_host": linux.host}), REMOTE + "/endpoints.json")

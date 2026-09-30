@@ -1067,7 +1067,7 @@ def private_verifier_status() -> dict:
             raise ValueError("invalid verifier identifier")
         result = {"verifier_id": identifier, "available": True}
         for key in ("sample_time", "coverage_start", "compared_through", "healthy_since",
-                    "active_incidents", "pending_alerts"):
+                    "active_incidents", "pending_alerts", "mac_tip", "linux_tip"):
             value = data.get(key)
             result[key] = value if type(value) in (int, float) and math.isfinite(value) else None
         for key in ("caught_up", "qualified"):
@@ -3686,9 +3686,12 @@ function render() {
     el('verifier-summary').textContent = (verifier.verifier_id || 'Verifier') + ' · '
       + (verifier.available ? (verifier.active_incidents ? 'Incident' :
           (!verifier.caught_up ? 'Catching up' : (verifier.qualified ? 'Qualified' : 'Qualifying'))) : 'Status unavailable')
+      + ' · Mac tip ' + (verifier.mac_tip ?? '—')
+      + ' · Linux tip ' + (verifier.linux_tip ?? '—')
       + ' · Compared through ' + (verifier.compared_through ?? '—')
       + ' · Coverage begins ' + (verifier.coverage_start ?? '—')
-      + ' · Active incidents ' + (verifier.active_incidents ?? '—');
+      + ' · Active incidents ' + (verifier.active_incidents ?? '—')
+      + ' · Pending alerts ' + (verifier.pending_alerts ?? '—');
   }
   renderStats(state.data);
   renderChain(state.data);

@@ -1,4 +1,4 @@
-//! The version-2 envelope, before authorization and full block decoding.
+//! The existing stream-6 version-2 codec, before authorization and full block decoding.
 
 use std::time::Duration;
 

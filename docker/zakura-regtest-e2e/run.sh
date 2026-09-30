@@ -783,44 +783,58 @@ wait_for_native_suffix_coverage() {
         --arg process "${CHECKPOINT_HANDOFF_PROCESS_TRACE_ID}" \
         --argjson ancestor_height "$(( suffix_start - 1 ))" \
         --argjson suffix_end "${suffix_end}" \
-        --argjson expected_count "$(( suffix_end - suffix_start + 1 ))" \
         --argjson first_request_ts "${first_request_ts}" '
-          . as $rows
+          [ .[] | select(.process_trace_id == $process) ] as $rows
+          | [ $rows[] | select(.event == "header_request_sent") ] as $requests
           | [ $rows[] as $snapshot
               | select(
-                  $snapshot.process_trace_id == $process
-                  and $snapshot.event == "header_snapshot_observed"
+                  $snapshot.event == "header_snapshot_observed"
                   and $snapshot.cause == "advance"
                   and $snapshot.new_selected_height == $suffix_end
                   and $snapshot.ts < $first_request_ts
                 )
-              | $rows[] as $response
-              | select(
-                  $response.process_trace_id == $process
-                  and $response.event == "header_response_received"
-                  and $response.branch_anchor == $snapshot.branch_anchor
-                  and $response.branch_target == $snapshot.branch_target
-                  and $response.target_hash == $snapshot.new_selected_hash
-                  and $response.common_ancestor_hash == $response.branch_anchor
-                  and $response.common_ancestor_height == $ancestor_height
-                  and $response.header_count == $expected_count
-                  and $response.complete == true
-                  and $response.ts < $snapshot.ts
-                )
-              | $rows[] as $request
-              | select(
-                  $request.process_trace_id == $process
-                  and $request.event == "header_request_sent"
-                  and $request.request_id == $response.request_id
-                  and $request.session_id == $response.session_id
-                  and $request.peer == $response.peer
-                  and $request.branch_anchor == $response.branch_anchor
-                  and $request.branch_target == $response.branch_target
-                  and $request.locator_head == $response.common_ancestor_hash
-                  and $request.target_hash == $response.target_hash
-                  and $request.header_count >= $expected_count
-                  and $request.ts < $response.ts
-                )
+              # A long branch arrives as bounded pages and is admitted once,
+              # after its final page. Keep each page answered for this branch
+              # before the snapshot, together with the request that asked for it.
+              | [ $rows[]
+                  | select(
+                      .event == "header_response_received"
+                      and .branch_anchor == $snapshot.branch_anchor
+                      and .branch_target == $snapshot.branch_target
+                      and .target_hash == $snapshot.new_selected_hash
+                      and (.header_count | type == "number")
+                      and .header_count > 0
+                      and .ts < $snapshot.ts
+                    )
+                  | . as $response
+                  | select(any($requests[];
+                      .request_id == $response.request_id
+                      and .session_id == $response.session_id
+                      and .peer == $response.peer
+                      and .branch_anchor == $response.branch_anchor
+                      and .branch_target == $response.branch_target
+                      and .locator_head == $response.common_ancestor_hash
+                      and .target_hash == $response.target_hash
+                      and .header_count >= $response.header_count
+                      and .ts < $response.ts
+                    ))
+                ] as $pages
+              # The first page extends the branch anchor at the checkpoint
+              # boundary, each later page starts where the previous one ended,
+              # and only the page that reaches the snapshot height is complete.
+              | def covers($height; $hash):
+                  any(
+                    $pages[]
+                    | select(
+                        .common_ancestor_height == $height
+                        and ($hash == null or .common_ancestor_hash == $hash)
+                      );
+                    (.common_ancestor_height + .header_count) as $end
+                    | if .complete == true then $end == $suffix_end
+                      else $end < $suffix_end and covers($end; null)
+                      end
+                  );
+                select(covers($ancestor_height; $snapshot.branch_anchor))
           ] | length
         ')
   (( lifecycle_count >= 1 )) \
@@ -895,20 +909,36 @@ node2_logs_after() {
   docker logs zakura-node-2 2>&1 | awk -v lines_before="${lines_before}" 'NR > lines_before'
 }
 
+# The state service logs its initial tip once the database and any
+# non-finalized backup are loaded, before sync starts. The legacy sync round
+# log is not a reopen signal: it is skipped once the native header runtime is
+# ready. Require the reopened tip to be the exact block the debug stop flushed.
 wait_for_node2_exact_reopen() {
   local height="$1" lines_before="$2" label="$3" timeout="$4"
-  local deadline=$((SECONDS + timeout)) logs
+  local deadline=$((SECONDS + timeout)) logs loaded_tip stopped_hash expected_tip
+  local stop_log="${ZAKURA_E2E_TRACE_DIR}/debug-stops/node2-height-${height}/docker.log"
+
+  stopped_hash=$(sed -n \
+      "s/.*stopping at configured height, flushing database to disk height=Height(${height}) hash=block::Hash(\"\([0-9a-f]\{64\}\)\").*/\1/p" \
+      "${stop_log}" \
+    | tail -1)
+  [[ -n "${stopped_hash}" ]] \
+    || fail "node2 ${label} debug stop did not log the block it flushed at height ${height}"
+  expected_tip="Some((block::Hash(\"${stopped_hash}\"), Height(${height})))"
 
   while (( SECONDS < deadline )); do
     logs=$(node2_logs_after "${lines_before}")
-    if printf '%s\n' "${logs}" \
-      | grep -F "starting sync, obtaining new tips state_tip=Some(Height(${height}))" >/dev/null
-    then
+    loaded_tip=$(printf '%s\n' "${logs}" \
+      | sed -n 's/.*loaded Zakura state cache chain_tip=\(.*\)$/\1/p' \
+      | sed -n '1p')
+    if [[ -n "${loaded_tip}" ]]; then
       if printf '%s\n' "${logs}" \
         | grep -F "starting genesis block download and verify" >/dev/null
       then
         fail "node2 ${label} replayed genesis instead of reopening durable height ${height}"
       fi
+      [[ "${loaded_tip}" == "${expected_tip}" ]] \
+        || fail "node2 ${label} reopened at chain_tip=${loaded_tip}, not its durable stop ${expected_tip}"
       printf '  node2 %s reopened the existing database at exact height %s without genesis replay\n' \
         "${label}" "${height}"
       return 0

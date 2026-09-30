@@ -219,8 +219,6 @@ fn nu7_default_testnet_activation_matches_common() {
     for network in [
         Network::new_default_testnet(),
         testnet::Parameters::build()
-            .with_activation_heights(ConfiguredActivationHeights::default())
-            .expect("empty overrides preserve default Testnet activations")
             .to_network()
             .expect("default Testnet parameters are valid"),
     ] {

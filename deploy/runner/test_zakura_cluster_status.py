@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import importlib.util
 import json
+import io
 import os
 import re
 import subprocess
@@ -81,6 +82,40 @@ def public_row(
         "last_seen_at": observed_at,
         "rpc_metadata_error": None,
     }
+
+
+class PrivateVerifierTests(unittest.TestCase):
+    def read(self, payload):
+        opener = mock.Mock()
+        opener.open.return_value = io.BytesIO(json.dumps(payload).encode())
+        with mock.patch.object(status.urllib.request, "build_opener", return_value=opener):
+            return status.private_verifier_status()
+
+    def test_existing_dashboard_does_not_publish_private_endpoint_or_diagnostics(self):
+        payload = {"verifier_id": "verifier-" + "a" * 32, "sample_time": time.time(),
+                   "host": "192.0.2.10", "error": "private-host.local failed",
+                   "receipt": {"peer_id": "private-peer"}, "compared_through": 100,
+                   "coverage_start": 11, "active_incidents": 0, "qualified": True}
+        result = self.read(payload)
+        self.assertTrue(result["available"])
+        self.assertEqual(result["compared_through"], 100)
+        for private in ("192.0.2.10", "private-host", "private-peer", "receipt", "error"):
+            self.assertNotIn(private, json.dumps(result))
+
+    def test_stale_or_malformed_bridge_never_reports_fresh_status(self):
+        self.assertFalse(self.read({"verifier_id": "verifier-" + "a" * 32,
+                                    "sample_time": time.time() - 1000})["available"])
+        self.assertEqual(self.read({"verifier_id": "192.0.2.10"}), {"available": False})
+        self.assertEqual(self.read(["private-host"]), {"available": False})
+
+    def test_verifier_is_separate_from_fleet_counts_and_testnet(self):
+        for network, enabled in (("mainnet", True), ("testnet", False)):
+            collector = status.ClusterCollector([node()], 10, 300, network)
+            with mock.patch.dict(os.environ, {"ZAKURA_PRIVATE_VERIFIER_STATUS": "1"}), \
+                    mock.patch.object(status, "private_verifier_status", return_value={"available": False}):
+                snapshot = collector.snapshot()
+            self.assertEqual("verifiers" in snapshot, enabled)
+            self.assertEqual(snapshot["total"], len(snapshot["rows"]))
 
 
 class NodeConfigTests(unittest.TestCase):

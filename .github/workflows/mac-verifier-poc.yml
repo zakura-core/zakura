@@ -4,12 +4,16 @@ on:
   pull_request:
     paths:
       - 'deploy/mac-verifier/**'
+      - 'deploy/runner/zakura-cluster-status.py'
+      - 'deploy/runner/test_zakura_cluster_status.py'
       - '.github/workflows/mac-verifier-poc.yml'
       - '.github/workflows/deploy-mac-verifier.yml'
   push:
     branches: [main]
     paths:
       - 'deploy/mac-verifier/**'
+      - 'deploy/runner/zakura-cluster-status.py'
+      - 'deploy/runner/test_zakura_cluster_status.py'
       - '.github/workflows/mac-verifier-poc.yml'
       - '.github/workflows/deploy-mac-verifier.yml'
   workflow_dispatch:
@@ -30,6 +34,7 @@ jobs:
         with:
           persist-credentials: false
       - run: python3 -m unittest discover -s deploy/mac-verifier/tests -v
+      - run: python3 deploy/runner/test_zakura_cluster_status.py
       - run: bash -n deploy/mac-verifier/build.sh
 
   native-linux-corpus:

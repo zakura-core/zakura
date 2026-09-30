@@ -92,7 +92,8 @@ secret stays in the monitor folder described above.
 Dispatch operations in order: `preflight`, `prepare`, `bootstrap`, `activate`,
 then `status`. Preparation builds the pinned source natively and installs inactive
 Mac services. Bootstrap imports and anchors state through temporary SSH forwards.
-Activation installs the Linux comparator and dashboard before starting Mac
+Activation installs the Linux comparator and a loopback status bridge, updates
+the existing mainnet dashboard, and starts Mac
 services. `stop` stops only the POC services; it never destroys the private host.
 Provision tooling first; obtain the private IP only after review and checks.
 
@@ -151,7 +152,8 @@ checkout. `build.sh` uses one Cargo job and refuses to run alongside `zakurad`.
    Close both temporary operator forwards after anchoring.
 5. Copy the Mac's nonsecret `receipt.json` to DO, then run
    `python3 install.py linux-prepare --tunnel-public-key <key.pub> --receipt
-   <receipt.json> --infisical-project c57a6889-6a7c-4d05-a54a-e4a4c0b14ee7` as root.
+   <receipt.json> --infisical-project c57a6889-6a7c-4d05-a54a-e4a4c0b14ee7
+   --fleet-dashboard-script <updated-zakura-cluster-status.py>` as root.
    Install the scoped identity file. Preparation validates SSH configuration before
    reloading SSH; it does not restart the node or its fleet watchdog.
 6. Run `sudo python3 install.py mac-activate`, then on DO run
@@ -188,11 +190,14 @@ within 1,000 heights and replay; deeper or unavailable history requires an expli
 rebootstrap. The monitor records coverage gaps, never treating an unavailable
 sample as equality. The JSON status and bounded audit logs are the reporting
 interface. The private dashboard is served on Linux loopback port `28236` by
-`zakura-mac-verifier-dashboard.service`. Reach it through an authenticated SSH
-local forward. Its `/v1/status` response contains only the opaque verifier ID,
+`zakura-mac-verifier-dashboard.service`, used only as an internal status bridge.
+The existing mainnet dashboard renders a consensus-verifier panel and includes
+an allowlisted `verifiers` summary in `/data`. The bridge `/v1/status` contains only the opaque verifier ID,
 coverage, qualification, alert count and incident count; it excludes raw errors,
 receipts, host addresses, OS labels and peer IDs. Do not add this Mac to the public
-fleet nodes TOML or proxy its raw adapter into the fleet dashboard.
+fleet nodes TOML or proxy its raw adapter into the fleet dashboard. The installer enables this
+integration through a service environment override and restarts only the existing
+mainnet dashboard; its fleet configuration and watchdog remain unchanged.
 
 Alerts cover availability, missing coverage, resource samples, disk below 20 GB,
 memory pressure, tip stalls, prolonged catch-up, unexpected build/configuration,

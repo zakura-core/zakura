@@ -17,6 +17,7 @@ import concurrent.futures
 import ipaddress
 import json
 import math
+import os
 import re
 import shlex
 import subprocess
@@ -24,6 +25,7 @@ import threading
 import time
 import tomllib
 import urllib.parse
+import urllib.request
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -1021,6 +1023,33 @@ class RateLimiter:
             return True
 
 
+def private_verifier_status() -> dict:
+    """Read only the local sanitized bridge; never poll a private host directly."""
+    try:
+        request = urllib.request.Request("http://127.0.0.1:28236/v1/status")
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with opener.open(request, timeout=1) as response:
+            raw = response.read(65537)
+        if len(raw) > 65536:
+            raise ValueError("oversized status")
+        data = json.loads(raw)
+        identifier = data.get("verifier_id")
+        if not isinstance(identifier, str) or not re.fullmatch(r"verifier-[a-f0-9]{32}", identifier):
+            raise ValueError("invalid verifier identifier")
+        result = {"verifier_id": identifier, "available": True}
+        for key in ("sample_time", "coverage_start", "compared_through", "healthy_since",
+                    "active_incidents", "pending_alerts"):
+            value = data.get(key)
+            result[key] = value if type(value) in (int, float) and math.isfinite(value) else None
+        for key in ("caught_up", "qualified"):
+            result[key] = data.get(key) is True
+        stamp = result["sample_time"]
+        result["available"] = stamp is not None and 0 <= time.time() - stamp <= 90
+        return result
+    except (OSError, ValueError, TypeError, AttributeError):
+        return {"available": False}
+
+
 class ClusterCollector:
     def __init__(
         self,
@@ -1413,7 +1442,7 @@ class ClusterCollector:
                 dict(event) for event in chain.get("recent_reorgs", [])
             ]
         healthy = sum(1 for row in rows if row.get("healthy"))
-        return {
+        payload = {
             "generated_at": time.time(),
             "last_poll": last_poll,
             "stale_after": self.stale_after,
@@ -1423,6 +1452,9 @@ class ClusterCollector:
             "chain": chain,
             "rows": rows,
         }
+        if self.network == "mainnet" and os.environ.get("ZAKURA_PRIVATE_VERIFIER_STATUS") == "1":
+            payload["verifiers"] = [private_verifier_status()]
+        return payload
 
     def ironwood_status(self, now: float | None = None) -> tuple[int, dict]:
         now = time.time() if now is None else now
@@ -2551,6 +2583,10 @@ footer {
   </header>
 
   <div class="banner" id="banner" hidden></div>
+  <section class="panel pad" id="verifier-panel" hidden>
+    <h2>Consensus verifier</h2>
+    <p id="verifier-summary"></p>
+  </section>
 
   <section class="panel pad" data-view="fleet">
     <div class="card-head">
@@ -3615,6 +3651,16 @@ function render() {
   }
   renderHeader(state.data);
   renderFleet(state.data);
+  const verifier = (state.data.verifiers || [])[0];
+  el('verifier-panel').hidden = !verifier;
+  if (verifier) {
+    el('verifier-summary').textContent = (verifier.verifier_id || 'Verifier') + ' · '
+      + (verifier.available ? (verifier.active_incidents ? 'Incident' :
+          (!verifier.caught_up ? 'Catching up' : (verifier.qualified ? 'Qualified' : 'Qualifying'))) : 'Status unavailable')
+      + ' · Compared through ' + (verifier.compared_through ?? '—')
+      + ' · Coverage begins ' + (verifier.coverage_start ?? '—')
+      + ' · Active incidents ' + (verifier.active_incidents ?? '—');
+  }
   renderStats(state.data);
   renderChain(state.data);
   renderTable(state.data);

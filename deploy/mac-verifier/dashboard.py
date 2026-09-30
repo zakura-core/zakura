@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Loopback dashboard with an allowlisted, opaque verifier identity."""
+"""Loopback status bridge for the existing fleet dashboard."""
 import argparse
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import json
@@ -30,19 +30,13 @@ def serve(directory, identifier):
             pass
 
         def do_GET(self):
-            if self.path not in ("/", "/v1/status"):
+            if self.path != "/v1/status":
                 self.send_error(404)
                 return
             try:
                 data = public_status(read_json(Path(directory) / "status.json"), identifier)
                 payload = json.dumps(data).encode()
                 content_type = "application/json"
-                if self.path == "/":
-                    payload = (b'<!doctype html><title>Verifier status</title><h1>Verifier status</h1>'
-                               b'<pre id="status"></pre><script>async function refresh(){'
-                               b'const r=await fetch("/v1/status");document.getElementById("status").textContent='
-                               b'JSON.stringify(await r.json(),null,2)}refresh();setInterval(refresh,30000)</script>')
-                    content_type = "text/html; charset=utf-8"
                 self.send_response(200)
             except (OSError, ValueError, TypeError):
                 payload, content_type = b'{"error":"status unavailable"}', "application/json"

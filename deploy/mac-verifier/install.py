@@ -154,6 +154,9 @@ def linux_account(name, home):
 def install_linux(args):
     if sys.platform != "linux":
         raise ValueError("Linux installer requires Linux")
+    fleet_script = Path("/opt/zakura-mainnet-dashboard/zakura-cluster-status.py")
+    if not args.fleet_dashboard_script or not fleet_script.is_file():
+        raise ValueError("existing mainnet dashboard and updated --fleet-dashboard-script required")
     linux_account(LINUX_USER, LINUX_HOME)
     linux_account(TUNNEL_USER, ETC / "tunnel")
     ETC.mkdir(parents=True, exist_ok=True)
@@ -219,6 +222,10 @@ UMask=0077
 WantedBy=multi-user.target
 ''')
     call("systemctl", "daemon-reload")
+    shutil.copyfile(args.fleet_dashboard_script, fleet_script)
+    fleet_script.chmod(0o755)
+    write("/etc/systemd/system/zakura-mainnet-dashboard.service.d/70-private-verifier.conf",
+          "[Service]\nEnvironment=ZAKURA_PRIVATE_VERIFIER_STATUS=1\n")
     write("/etc/systemd/system/zakura-mac-verifier-dashboard.service", f'''[Unit]
 Description=Opaque verifier status dashboard
 After=network-online.target
@@ -272,6 +279,7 @@ def main():
     parser.add_argument("--tunnel-public-key")
     parser.add_argument("--receipt")
     parser.add_argument("--infisical-project")
+    parser.add_argument("--fleet-dashboard-script")
     parser.add_argument("--output")
     args = parser.parse_args()
     if os.geteuid() != 0:
@@ -304,15 +312,18 @@ def main():
         if (ETC / "identity.json").stat().st_uid != 0 or (ETC / "identity.json").stat().st_mode & 0o077:
             raise ValueError("identity.json must be root-owned mode 0600")
         call("systemctl", "enable", "--now", "zakura-mac-verifier", "zakura-mac-verifier-dashboard")
+        call("systemctl", "restart", "zakura-mainnet-dashboard")
     elif args.command in ("linux-stop", "linux-uninstall"):
         call("systemctl", "disable", "--now", "zakura-mac-verifier", "zakura-mac-verifier-dashboard")
         if args.command == "linux-uninstall":
             Path("/etc/systemd/system/zakura-mac-verifier.service").unlink(missing_ok=True)
             Path("/etc/systemd/system/zakura-mac-verifier-dashboard.service").unlink(missing_ok=True)
+            Path("/etc/systemd/system/zakura-mainnet-dashboard.service.d/70-private-verifier.conf").unlink(missing_ok=True)
             Path("/etc/ssh/sshd_config.d/70-zakura-mac-verifier.conf").unlink(missing_ok=True)
             call("sshd", "-t")
             call("systemctl", "reload", "ssh")
             call("systemctl", "daemon-reload")
+            call("systemctl", "restart", "zakura-mainnet-dashboard")
             print("POC services removed; evidence retained and mainnet services unchanged.")
     else:
         if not args.output:

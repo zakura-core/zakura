@@ -1150,7 +1150,7 @@ mod tests {
                         break;
                     };
                     remaining = bytes;
-                    selected.push((height, block.clone(), usize::try_from(size).unwrap()));
+                    selected.push((height, block.clone()));
                 }
             }
             Box::pin(async move {

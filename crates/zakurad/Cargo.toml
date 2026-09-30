@@ -210,7 +210,6 @@ toml = { workspace = true }
 futures = { workspace = true }
 rayon = { workspace = true }
 tokio = { workspace = true, features = ["time", "rt-multi-thread", "macros", "tracing", "signal", "process", "io-util"] }
-tokio-stream = { workspace = true, features = ["time"] }
 tokio-util = { workspace = true }
 tower = { workspace = true, features = ["hedge", "limit"] }
 pin-project = { workspace = true }
@@ -287,7 +286,6 @@ proptest-derive = { workspace = true, optional = true }
 console-subscriber = { workspace = true, optional = true }
 
 derive-new.workspace = true
-hex.workspace = true
 
 [build-dependencies]
 # test feature lightwalletd-grpc-tests
@@ -295,6 +293,7 @@ tonic-prost-build = { workspace = true, optional = true }
 
 [dev-dependencies]
 abscissa_core = { workspace = true, default-features = false, features = ["testing"] }
+hex = { workspace = true }
 hex-literal = { workspace = true }
 jsonrpsee-types = { workspace = true }
 regex = { workspace = true }

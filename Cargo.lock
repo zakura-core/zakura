@@ -8325,7 +8325,6 @@ dependencies = [
  "tracing-subscriber",
  "zakura-chain",
  "zakura-node-services",
- "zakura-primitives",
  "zakura-state",
 ]
 

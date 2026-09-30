@@ -1,13 +1,15 @@
 # Fork-aware headers-only chain engine specification
 
 Status: normative design oracle for the replacement of PR #229<br>
-Version: 1.5<br>
+Version: 1.6<br>
 Date: 2026-09-21<br>
 Scope: Zakura native (v2 P2P) header sync and its integration with Zakura full state
 
 Version 1.4 removes every backward-compatibility surface from this engine. There is exactly one header-sync message set, one codec, one status message, and one supported stream version. The previous native stream version 7, its dual-version negotiation, and the legacy Zcash `getheaders` fallback are not implemented, not served, and not tested. The legacy Zcash P2P stack is out of scope entirely: this engine neither reads, writes, nor changes it.
 
 Version 1.5 makes full-state fork eviction recoverable. Newly accepted branches remain available for extension within the existing full-state fork limit. Atomic block acceptance and reconsideration clear verification markers for evicted bodies while leaving their headers eligible. This adds no wire or disk fields.
+
+Version 1.6 separates header scheduling from full-state equal-work selection. Headers retain deterministic raw-hash ordering. Full state prefers the first-received valid leaf block and supplies that choice through the authenticated atomic transition, including operator changes. This adds no header wire or disk fields. Restored full-state blocks lack receipt metadata and use the hash fallback, and startup reconciles that restored path before publication.
 
 ## Document overview
 
@@ -36,8 +38,8 @@ Describes how headers are validated, how trusted checkpoints constrain acceptabl
 
 - **MUST** validate framing, linkage, commitments, proof of work, difficulty, and time rules before admitting a header.
 - **MUST** treat trusted anchors as absolute and fail closed without the required settled-upgrade pin on Mainnet or Testnet.
-- **MUST** select the eligible chain with greatest cumulative work and use the raw tip hash as the deterministic equal-work tie-breaker.
-- **MUST NOT** let arrival order, incumbent reorg depth, peer claims, or body availability change fork choice.
+- **MUST** select the eligible header chain with greatest cumulative work and use the raw tip hash as the deterministic equal-work tie-breaker.
+- **MUST NOT** let arrival order, incumbent reorg depth, peer claims, or body availability change header fork choice.
 - **MUST** bound retained forks and nodes without evicting the selected header or verified paths; eviction is not evidence of invalidity.
 
 **4. Full-state integration and failures**
@@ -66,7 +68,7 @@ Identifies which behavior must exactly match full Zakura validation and which di
 
 - **MUST** share implementations or use differential tests for every observable header rule that must match full state.
 - **MUST** represent intentional headers-only differences as explicit typed outcomes with dedicated tests.
-- **MUST** test Zakura's raw-tip-hash equal-work policy separately from Zcash header-validity rules.
+- **MUST** test the header raw-tip-hash and full-state first-received equal-work policies separately from Zcash header-validity rules.
 
 **7. Conformance and acceptance tests**
 
@@ -274,7 +276,7 @@ Eligibility reasons are a set, not a single overwritable flag. Permanent reasons
 
 **LC-SELECT-02 [ZC] — Greatest-work selection.** The primary comparison MUST be cumulative work over complete suffixes from the shared work anchor. Greater cumulative work wins. Only locally validated targets and LC-WORKCALC-01 sums are inputs to this comparison.
 
-**LC-SELECT-03 [ZF] — Raw-hash tie-breaker.** If cumulative work is equal, the engine MUST compare the tips’ raw internal `block::Hash.0` byte arrays lexicographically and select the greater array, exactly as `zakura-state::service::non_finalized_state::Chain::cmp`. Display-order hex, first-seen time, arrival order, peer identity, response range, and response partitioning MUST NOT break the tie.
+**LC-SELECT-03 [ZF] — Raw-hash tie-breaker.** If cumulative work is equal, the engine MUST compare the tips’ raw internal `block::Hash.0` byte arrays lexicographically and select the greater array for `header_best`. Full-state `Chain::cmp` instead prefers the earlier verifier receipt for `verified_best`. Unstamped restored tips precede live receipts. Equal receipt orders, including two missing orders, use raw hash. Display-order hex, first-seen time, arrival order, peer identity, response range, and response partitioning MUST NOT break the header tie.
 
 <a id="lc-select-04"></a>
 **LC-SELECT-04 [LS] — Deterministic selection.** For a fixed finalized anchor, selection MUST be a pure deterministic function of the admitted DAG, eligibility set, and the comparator in LC-SELECT-02/03. Replaying any permutation of equivalent insertions and completions before the same durable finalization event MUST yield the same `header_best`. A headers-only finality event deliberately makes its chosen ancestor a new trust pin under LC-FINAL-03; discovery after that event cannot revise history at or below the pin.
@@ -325,7 +327,7 @@ Protected-path retention pressure that cannot admit work without evicting `heade
 
 **LC-INT-03 [ZW] — Full-block integration.** A full-block commit MUST ensure its exact header node exists in the DAG with correct parent linkage, update body-validation state, update `verified_best` from full state, apply any body-derived eligibility evidence, and then independently reevaluate `header_best`.
 
-**LC-INT-04 [ZW] — Atomic invalidate and reconsider.** Invalidate or reconsider MUST complete its durable eligibility and both-frontier transition before returning externally complete or publishing watches. If full state has no non-finalized chain, `verified_best` MUST become `finalized`; the header DAG remains independently selected subject to its eligibility set.
+**LC-INT-04 [ZW] — Atomic invalidate and reconsider.** Invalidate or reconsider MUST complete its durable eligibility and both-frontier transition before returning externally complete or publishing watches. If full state has no non-finalized chain, `verified_best` MUST become `finalized`; the header DAG remains independently selected subject to its eligibility set. When the full-state writer supplies an authenticated verified tip, the planner MUST validate its connected verified ancestry, eligibility, and greatest cumulative work, then preserve its receipt-based preference on equal work. It MUST NOT replace that preference with the header hash tie-breaker.
 
 **LC-INT-05 [LS] — Owner-qualified freshness.** Header-range insertion and auxiliary-evidence events that carry a typed work owner MUST admit or reject based on that owner's generation, branch identity, and ownership checks. They MUST NOT treat a mismatched `state_version` alone as authorization failure when the owner remains current.
 
@@ -557,7 +559,7 @@ A peer that does not offer stream version 8 has no header-sync relationship with
 | Local sync checkpoints | Exact configured hash plus absolute trust pin | Checkpoint verifier / finalized state | Trusted local policy; normal post-anchor validation |
 | Finality | Automatic 1,000-deep disclosed local pin | Only fully verified full-state finalization | Deliberate mode-specific trust policy |
 | Work | Same target-derived formula | Same | Zcash consensus ordering input |
-| Equal-work tie | Greater raw `block::Hash.0` | Greater raw `block::Hash.0` | Zakura deterministic policy; differs from protocol first-seen guidance |
+| Equal-work tie | Greater raw `block::Hash.0` | Earlier tip receipt, with unstamped tips first and raw hash for equal receipt orders | Separate header and full-state policies under LC-SELECT-03 |
 | Transaction Merkle/body matching | Cannot validate without body/proof | Validated | Deliberate impossibility boundary |
 | Coinbase height and subsidy | Cannot validate | Validated | Deliberate difference |
 | Transactions, signatures, scripts, proofs | Cannot validate | Validated | Deliberate difference |
@@ -569,7 +571,7 @@ A peer that does not offer stream version 8 has no header-sync relationship with
 
 **LC-PARITY-02 [LS] — Typed intentional differences.** Intentional differences MUST be represented as typed states and explicit differential tests; they MUST NOT appear as unexplained mismatches or be papered over by selecting `verified_best`.
 
-**LC-PARITY-03 [ZF] — Tie-break policy isolation.** Equal-work ordering MUST be differential-tested separately against Zakura’s raw-tip-hash comparator; neither this Zakura policy nor any header-sync discovery behavior may be described or tested as a Zcash header-validity rule.
+**LC-PARITY-03 [ZF] — Tie-break policy isolation.** Equal-work ordering MUST test both the raw-tip-hash header comparator and the first-received full-state comparator, including deliberate differences between their selected tips; neither this Zakura policy nor any header-sync discovery behavior may be described or tested as a Zcash header-validity rule.
 
 ## 7. Executable conformance and acceptance matrix
 
@@ -622,7 +624,7 @@ Each named test below is a deterministic test target or parameterized suite. Mod
 - **PW-06 `aux_schema_and_body_hints`:** schema mask/selector negotiation, exact schema-1 156-byte golden vectors, every field and root encoding, height mismatch, preactivation defaults, NU5/NU6.3/NU7 boundaries, all-or-none parallel counts, unavailable metadata fallback, unknown/future schemas, `0`/`1`/`2,000,000`/`2,000,001` body hints, and proof that hints cannot drive allocation or admission credit.
 - **PW-07 `status_propagation`:** initial status immediately after the stream opens, change-driven updates for tip/anchor/retention/cap changes, burst coalescing with the two-second freshness and one-per-second floor, configured periodic refresh, snapshot atomicity against concurrent selection changes, and non-punitive handling of silent or stale-status peers.
 - **PW-08 `single_protocol_surface`:** a peer without stream version 8 is given no header-sync stream and no score; no compatibility, predecessor, or legacy `getheaders` code path exists in the header-sync module tree or its public API; and the legacy Zcash P2P message handlers are byte-identical to their pre-engine behavior.
-- **DF-01 `header_full_state_parity`:** body-valid generated fork graphs fed to the integrated header engine and full state from the same finalized anchor; require identical observable-header acceptance, work, raw-hash tie order, and selected tip before a full-state finalization event.
+- **DF-01 `header_full_state_parity`:** body-valid generated fork graphs fed to the integrated header engine and full state from the same finalized anchor; require identical observable-header acceptance and work before a full-state finalization event. With missing receipt metadata, selected tips MUST agree by raw hash. With receipt metadata, equal-work tips may differ and the atomic verified frontier MUST follow full state.
 - **DF-02 `intentional_difference_vectors`:** coinbase height, Merkle/body mismatch, transaction/proof/script failure, nullifier/anchor/value-pool/state-transition failure, local future time, and header-valid/body-invalid outcomes, each with an asserted typed explanation.
 
 ### 7.3 Audit closure and incident scenarios
@@ -635,7 +637,7 @@ The following matrix supersedes the old audit invariant that the verified chain 
 | Covered heights are branch-blind | generation- and branch-keyed coverage retired on change | IN-05/AUD-08 |
 | Invalidate/reconsider bypass reconciliation | one durable transition for every eligibility/selection mutation | IN-01, IN-04/AUD-10..12 |
 | VCT repair survives reset | branch/generation-scoped repair ownership and retirement | IN-06/AUD-09 |
-| Equal-work header/full-state mismatch | exact raw `block::Hash.0` comparator | HV-07, DF-01/AUD-03 |
+| Incorrect equal-work verified frontier | separate header and full-state comparators; atomic verified frontier follows full state | HV-07, DF-01/AUD-03 |
 | Single-chain overlay cannot retain candidates | hash-addressed bounded DAG plus selected projection | DG-01, DG-06/AUD-01..04 |
 | Headers cannot prove full validity | independent frontiers and evidence-based body feedback | DG-02, IN-02, DF-02 |
 | Missing durable anchor / `UnknownAnchor` incident | atomic hash DAG/projection, durable-before-publish, local bounded recovery | DG-03, IN-07/AUD-INCIDENT |
@@ -726,13 +728,13 @@ The “architecture dependency check” asserts that wallet scanning, FlyClient 
 
 **LC-ACCEPT-01 [LS] — Complete regression coverage.** The redesign MUST NOT be accepted until every normative rule maps to a passing deterministic test, every audit finding maps to a prevention rule and regression, and all 15 audit scenarios plus `AUD-INCIDENT` pass.
 
-**LC-ACCEPT-02 [LS] — Durable deterministic frontiers.** In every test and crash point, each published frontier MUST be durable and walkable to `finalized`. For the same finalized anchor and admitted candidates, event order and response partitioning MUST NOT change fork choice. Headers-only finality changes that anchor irreversibly and is accepted only with the explicit policy, proof, and disclosure in LC-FINAL-03, LC-FINAL-04, and LC-SCOPE-08.
+**LC-ACCEPT-02 [LS] — Durable deterministic frontiers.** In every test and crash point, each published frontier MUST be durable and walkable to `finalized`. For the same finalized anchor and admitted candidates, event order and response partitioning MUST NOT change `header_best`. For `verified_best`, verification and commit completion order MUST NOT change selection when candidate receipt metadata is fixed. Different receipt orders MAY change equal-work full-state selection under LC-SELECT-03. Headers-only finality changes that anchor irreversibly and is accepted only with the explicit policy, proof, and disclosure in LC-FINAL-03, LC-FINAL-04, and LC-SCOPE-08.
 
 **LC-ACCEPT-03 [LS] — Zero stale-generation effects.** Stale generations MUST have zero frontier, coverage, retry, repair, scheduling, publication, body-task, and peer-score effects.
 
 **LC-ACCEPT-04 [LS] — Terminating body-failure handling.** Body-invalid and body-unavailable cases MUST terminate each retry episode in either deterministic reselection or an explicit persistent alarm; neither may produce an infinite silent retry.
 
-**LC-ACCEPT-05 [LS] — Explained parity differences.** The full-state/header differential suite MUST enumerate and explain every intentional difference. Version 1.5 acceptance MUST contain no unresolved design placeholders.
+**LC-ACCEPT-05 [LS] — Explained parity differences.** The full-state/header differential suite MUST enumerate and explain every intentional difference. Version 1.6 acceptance MUST contain no unresolved design placeholders.
 
 ## 8. Implementation oracle and source authority
 
@@ -747,7 +749,7 @@ The implementation must share code with or remain differential-test equivalent t
 | Compact target, work formula, and integer ordering | `crates/zakura-chain/src/work/difficulty.rs`; its target conversion remains authoritative, but the redesign replaces the existing `u128` `Work` and `PartialCumulativeWork` storage with the exact 256-bit representation required by LC-VAL-10 and LC-WORKCALC-01 |
 | Equihash and context-free PoW checks | `crates/zakura-consensus/src/block/check.rs` |
 | Contextual 28-header difficulty, 11-header MTP, and MTP+90-minute rule | `crates/zakura-state/src/service/check/difficulty.rs`, `crates/zakura-state/src/service/check.rs` |
-| Full-state greatest-work/raw-tip-hash ordering | `crates/zakura-state/src/service/non_finalized_state/chain.rs` (`impl Ord for Chain`) |
+| Full-state greatest-work/first-received ordering with raw-tip-hash fallback | `crates/zakura-state/src/service/non_finalized_state/chain.rs` (`impl Ord for Chain`) |
 | Local 1,000-block finality horizon | `crates/zakura-chain/src/parameters/constants.rs`, `crates/zakura-state/src/constants.rs` |
 | Shared non-finalized fork cap | `MAX_NON_FINALIZED_CHAIN_FORKS` (today `crates/zakura-state/src/constants.rs`; the redesign MUST hoist one shared definition into `zakura-chain::parameters` consumed by both full state and the header engine) |
 | Checkpoint hashes and verification | `crates/zakura-chain/src/parameters/checkpoint/`, `crates/zakura-consensus/src/checkpoint.rs` |
@@ -787,6 +789,6 @@ This table covers every part of the cited Zcash sources that this engine impleme
 
 ### 8.4 Fixed design decisions
 
-This version fixes the following choices: one integrated reusable engine; linear verification of all candidate headers; exactly one native fork-discovery protocol at one supported stream version, with no predecessor compatibility, no fallback header exchange, and no change to the legacy Zcash P2P stack; independent `header_best`, `verified_best`, and `finalized`; exact 256-bit work with 32-byte little-endian wire encoding; Zakura’s greater-raw-tip-hash equal-work policy; integrated finality sourced only from fully verified state; headers-only automatic local finality 1,000 descendants behind `header_best`; an eligible-candidate-tip cap one greater than the shared non-finalized fork-cap constant, currently 11; 65,536 non-finalized DAG nodes; body-invalid branch disqualification; body-unavailable selection plus alarm; independent mandatory settled-upgrade pins in every deployment mode as a deliberate strengthening of the Zcash deployment requirement; absolute local checkpoint pins with observable header checks; auxiliary schema 1 and no block-relay message in header sync; and authenticated-only use of VCT/tree-aux metadata.
+This version fixes the following choices: one integrated reusable engine; linear verification of all candidate headers; exactly one native fork-discovery protocol at one supported stream version, with no predecessor compatibility, no fallback header exchange, and no change to the legacy Zcash P2P stack; independent `header_best`, `verified_best`, and `finalized`; exact 256-bit work with 32-byte little-endian wire encoding; greater-raw-tip-hash header ordering and first-received full-state ordering; integrated finality sourced only from fully verified state; headers-only automatic local finality 1,000 descendants behind `header_best`; an eligible-candidate-tip cap one greater than the shared non-finalized fork-cap constant, currently 11; 65,536 non-finalized DAG nodes; body-invalid branch disqualification; body-unavailable selection plus alarm; independent mandatory settled-upgrade pins in every deployment mode as a deliberate strengthening of the Zcash deployment requirement; absolute local checkpoint pins with observable header checks; auxiliary schema 1 and no block-relay message in header sync; and authenticated-only use of VCT/tree-aux metadata.
 
 Any future change to one of these choices requires a new specification version, explicit migration and compatibility rules, and corresponding updates to the conformance manifest. It is not an implementation detail.

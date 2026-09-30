@@ -73,6 +73,8 @@ impl Requester {
     /// Reserve before publishing the request. `expected` must come from the
     /// already validated header chain, in ascending height order. The request
     /// must also fit the peer's advertised block count and download window.
+    /// `max_body_bytes` must equal the peer's advertised, clamped response-byte
+    /// limit when issuing this request, not a smaller local download budget.
     /// On a failed publication call `retract`; after publication use `abandon`.
     pub(super) fn reserve(
         &mut self,
@@ -167,7 +169,11 @@ impl Requester {
         pending.received += 1;
         pending.body_bytes += body_len;
         if let Some(next) = pending.expected.get(pending.received) {
-            self.next.insert(*next, start);
+            let previous = self.next.insert(*next, start);
+            debug_assert!(
+                previous.is_none(),
+                "live ranges expect distinct next hashes"
+            );
         }
         Ok((height, claimed))
     }
@@ -183,7 +189,7 @@ impl Requester {
         let pending = self.ranges.get(&start).ok_or(ResponseError::Ending)?;
         // Counts fit usize on supported targets.
         if (tag == 4 && (count == 0 || count as usize != pending.received))
-            || (tag == 5 && (pending.received != 0 || count != pending.range.count))
+            || (tag == 5 && (pending.received != 0 || count == 0 || count > pending.range.count))
         {
             return Err(ResponseError::Ending);
         }

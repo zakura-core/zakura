@@ -114,15 +114,18 @@ checkout. `build.sh` uses one Cargo job and refuses to run alongside `zakurad`.
 2. Vault the newly generated forwarding private key in the tunnel folder before
    using it. Copy only its public key to DO. Copy the native corpus evidence into
    `/Library/Application Support/ZakuraVerifier/evidence/`.
-3. Establish a temporary operator SSH local forward on the Mac:
-   `ssh -NT -L 127.0.0.1:28235:127.0.0.1:8232 root@159.65.183.89`.
-   This gives bootstrap read-only access to Linux's existing local RPC.
+3. From Roman's operator machine, open two temporary SSH sessions:
+   `ssh -NT -L 127.0.0.1:28235:127.0.0.1:8232 root@159.65.183.89`, then
+   `ssh -NT -R 127.0.0.1:28235:127.0.0.1:28235 <Mac-admin>@<Mac-IP>`.
+   Together they expose Linux's local RPC only at Mac loopback `28235`, without
+   copying Roman's private key to the Mac. Verify the new Mac's SSH fingerprint
+   through the authenticated provider console before pinning its host key.
 4. Run `sudo python3 bootstrap.py --source <pinned-source> --tooling-sha <PR-head>`.
    The script pins the manifest, checks compressed size/checksum, bounds expanded
    extraction by free disk, excludes copied identity/nonfinalized state, reads
    the actual finalized height offline, and compares its hash and all three pool
    roots/frontiers against Linux. It records source/build/configuration receipts.
-   Close the temporary operator forward after anchoring.
+   Close both temporary operator forwards after anchoring.
 5. Copy the Mac's nonsecret `receipt.json` to DO, then run
    `python3 install.py linux-prepare --tunnel-public-key <key.pub> --receipt
    <receipt.json> --infisical-project c57a6889-6a7c-4d05-a54a-e4a4c0b14ee7` as root.

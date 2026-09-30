@@ -286,13 +286,18 @@ fn nu7_moves_the_pow_limit_cutoff_to_height_102() {
 }
 
 #[test]
-fn nu7_testnet_minimum_difficulty_gap_is_strictly_above_150_seconds() {
+fn nu7_testnet_minimum_difficulty_gap_is_strictly_above_450_seconds() {
     let network = configured_nu7_testnet(200);
     let candidate_height = block::Height(300_000);
     let candidate_time =
         DateTime::from_timestamp(2_000_000_000, 0).expect("test timestamp is in range");
 
-    for (gap, expected_bits) in [(150, 0x1e0cd7fd), (151, 0x2007ffff)] {
+    for (gap, expected_bits) in [
+        (150, 0x1e0cd7fd),
+        (151, 0x1e0cd7fd),
+        (450, 0x1e0cd18e),
+        (451, 0x2007ffff),
+    ] {
         let mut context = nu7_vector_context(candidate_time, MAX_POW_ADJUSTMENT_BLOCK_SPAN);
         context[0].1 = candidate_time - Duration::seconds(gap);
         let actual = AdjustedDifficulty::new_from_header_time(

@@ -11,7 +11,7 @@ independently.
 
 ## [Unreleased]
 
-## [1.5.1-rc0] - 2026-09-29
+## [1.5.1] - 2026-09-29
 
 ### Added
 
@@ -56,6 +56,15 @@ support-height adjustment. Published library crates are versioned independently.
   retaining the 30-day support window and three-day warning lead
   ([#1197](https://github.com/zakura-core/zakura/pull/1197),
   [#1198](https://github.com/zakura-core/zakura/pull/1198)).
+- Prepare the ZIP 2008 mainnet FPF/ZCG address rotation for NU7. Deployment requires final confirmation
+  ([#1201](https://github.com/zakura-core/zakura/pull/1201)).
+- Updated Zakura Common from 2.1.0-rc.0 to 2.1.0. Local x86-64 builds now
+  select Pasta assembly from Rust target features; use `-C target-cpu=native`
+  on a supported CPU to enable BMI2 and ADX automatically
+  ([#1206](https://github.com/zakura-core/zakura/pull/1206)).
+- Keep Testnet's minimum-difficulty waiting period at 7.5 minutes after NU7 by
+  requiring a gap of more than 18 target spacings
+  ([#1209](https://github.com/zakura-core/zakura/pull/1209)).
 
 ### Fixed
 
@@ -112,6 +121,13 @@ support-height adjustment. Published library crates are versioned independently.
   ([#1194](https://github.com/zakura-core/zakura/pull/1194)).
 - Zakura block sync now reserves each body's advertised or committed size instead of the 2 MB worst case: suppliers publish committed sizes when serving headers from finalized state, and requesters read the size hints carried by retained header deliveries again. A later known size can fill a missing hint once, updating queued estimates without replacing verification evidence. Fills are stored in a new state column family, so the database format moves to 29.1.0 without a migration ([#982](https://github.com/zakura-core/zakura/pull/982)).
 - A block body matching its requested header hash can exceed its advertised size hint when actual retention capacity is available. Speculative bodies that do not fit are retried after commit progress with their measured size, while the checkpoint window stays fundable ([#982](https://github.com/zakura-core/zakura/pull/982)).
+- Validate required coinbase payments against the configured address and amount
+  without a P2SH-only assertion, supporting the ZIP 2008 recipient
+  ([#1201](https://github.com/zakura-core/zakura/pull/1201)).
+- Testnet `getblocktemplate` no longer offers minimum-difficulty work early by
+  moving the template timestamp into the future. It offers that work only once
+  it is valid, and long polling returns it one second after `maxtime`. Mainnet
+  is unchanged ([#1203](https://github.com/zakura-core/zakura/pull/1203)).
 
 ## [1.5.0] - 2026-09-24
 

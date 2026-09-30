@@ -307,8 +307,8 @@ pub struct BlockTemplateResponse {
     ///
     /// <https://en.bitcoin.it/wiki/BIP_0023#Mutations>
     ///
-    /// Zebra adjusts the minimum and current times for testnet minimum difficulty blocks,
-    /// so we need to tell miners what the maximum valid time is.
+    /// On testnet, the minimum and maximum times are narrowed to the range that matches the
+    /// template's difficulty, so we need to tell miners what the maximum valid time is.
     ///
     /// This field is not in `zcashd` or the Zcash RPC reference yet.
     ///

@@ -560,6 +560,30 @@ trace_rows_after() {
   awk -v lines_before="${lines_before}" 'NR > lines_before' "${file}"
 }
 
+# A reorg reaches block sync as a destructive reset of its body pipeline, traced
+# as `block_chain_tip_reset` at the new tip. Header-driven resets do not bump
+# `sync.block.reorg.reset`, which then counts only a reset at process startup.
+wait_for_block_sync_reset() {
+  local node="$1" height="$2" lines_before="$3" timeout="${4:-${READY_TIMEOUT}}"
+  local file="${ZAKURA_E2E_TRACE_DIR}/${node}/block_sync.jsonl"
+  local deadline=$((SECONDS + timeout)) resets
+
+  while (( SECONDS < deadline )); do
+    resets=$(trace_rows_after "${file}" "${lines_before}" \
+      | jq -sc --argjson height "${height}" '
+          [ .[] | select(
+              .event == "block_chain_tip_reset"
+              and .verified_block_tip == $height
+            )
+          ] | length
+        ')
+    printf '  %s block_chain_tip_reset at height %s: %s\n' "${node}" "${height}" "${resets}"
+    (( resets >= 1 )) && return 0
+    sleep 3
+  done
+  fail "${node} block sync did not reset its body pipeline to reorg base ${height} within ${timeout}s"
+}
+
 # The compatibility downloader fetches only genesis. Follow the append-only
 # legacy trace from this restart and validate the exact durable handoff boundary.
 wait_for_genesis_handoff() {
@@ -1649,6 +1673,8 @@ fi
 log "asserting non-finalized reorg survival with no block-sync budget leak"
 old_tip_hash=$(block_hash 18232 "${target}")
 [[ -n "${old_tip_hash}" ]] || fail "could not read old tip hash at height ${target}"
+node1_block_lines_before_reorg=$(trace_line_count "${ZAKURA_E2E_TRACE_DIR}/node1/block_sync.jsonl")
+node2_block_lines_before_reorg=$(trace_line_count "${ZAKURA_E2E_TRACE_DIR}/node2/block_sync.jsonl")
 invalidate_block_if_present 18232 "${target}" "${old_tip_hash}" node1
 invalidate_block_if_present 18332 "${target}" "${old_tip_hash}" node2
 invalidate_block_if_present 18432 "${target}" "${old_tip_hash}" node3
@@ -1679,8 +1705,8 @@ for replacement in 1 2; do
   fi
 done
 wait_zakura_body_frontiers_at_tip "${target}" "post-reorg"
-wait_metric_at_least 19001 sync_block_reorg_reset 1 node1
-wait_metric_at_least 19002 sync_block_reorg_reset 1 node2
+wait_for_block_sync_reset node1 "${reorg_base}" "${node1_block_lines_before_reorg}"
+wait_for_block_sync_reset node2 "${reorg_base}" "${node2_block_lines_before_reorg}"
 assert_block_sync_budget_empty "post-reorg"
 snapshot_timeline "post-reorg"
 

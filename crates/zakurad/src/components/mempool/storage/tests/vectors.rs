@@ -159,11 +159,8 @@ fn mempool_storage_crud_exact_mainnet() {
 fn mempool_storage_basic() -> Result<()> {
     let _init_guard = zakura_test::init();
 
-    // Test multiple times to catch intermittent bugs since eviction is randomized
-    for _ in 0..10 {
-        for network in Network::iter() {
-            mempool_storage_basic_for_network(network)?;
-        }
+    for network in Network::iter() {
+        mempool_storage_basic_for_network(network)?;
     }
 
     Ok(())
@@ -203,16 +200,12 @@ fn mempool_storage_basic_for_network(network: Network) -> Result<()> {
                 maybe_inserted_transactions.push(unmined_transaction);
             }
             Err(_) => {
-                // Other transactions can be rejected on a successful insert,
+                // Other transactions can be evicted on a successful insert,
                 // so not all rejected transactions will be added.
-                // Note that `some_rejected_transactions` can be empty since `insert` only
-                // returns a rejection error if the transaction being inserted is the one
-                // that was randomly evicted.
                 some_rejected_transactions.push(unmined_transaction);
             }
         }
     }
-    // Since transactions are rejected randomly we can't test exact numbers.
     // We know the first MEMPOOL_TX_COUNT must have been inserted successfully.
     assert!(maybe_inserted_transactions.len() >= MEMPOOL_TX_COUNT);
     assert_eq!(

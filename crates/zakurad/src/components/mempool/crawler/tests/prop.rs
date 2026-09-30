@@ -69,8 +69,11 @@ fn mempool_error_strategy() -> BoxedStrategy<MempoolError> {
         Just(MempoolError::StorageEffectsTip(
             SameEffectsTipRejectionError::MissingOutput
         )),
+        Just(MempoolError::StorageEffectsTip(
+            SameEffectsTipRejectionError::Evicted
+        )),
         Just(MempoolError::StorageEffectsChain(
-            SameEffectsChainRejectionError::RandomlyEvicted
+            SameEffectsChainRejectionError::Expired
         )),
         Just(MempoolError::NonStandardTransaction(
             NonStandardTransactionError::IsDust

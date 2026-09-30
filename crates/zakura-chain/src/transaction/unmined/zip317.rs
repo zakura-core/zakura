@@ -19,7 +19,7 @@ mod tests;
 /// The marginal fee for the ZIP-317 fee calculation, in zatoshis per logical action.
 //
 // TODO: allow Amount<NonNegative> in constants
-const MARGINAL_FEE: u64 = 5_000;
+pub const MARGINAL_FEE: u64 = 5_000;
 
 /// The number of grace logical actions allowed by the ZIP-317 fee calculation.
 const GRACE_ACTIONS: u32 = 2;
@@ -70,7 +70,7 @@ pub const MEMPOOL_TX_FEE_REQUIREMENT_CAP: usize = 1000;
 /// [ZIP-317]: https://zips.z.cash/zip-0317#fee-calculation
 pub fn conventional_fee(transaction: &Transaction) -> Amount<NonNegative> {
     // zcash_primitives checks for non-p2pkh inputs, but Zebra doesn't.
-    // Conventional fees are only used in the standard rules for mempool eviction
+    // Conventional fees are only used in the standard rules for mempool admission
     // and block production, so these implementations are compatible.
     //
     // <https://github.com/zcash/librustzcash/blob/main/zcash_primitives/src/transaction/fees/zip317.rs#L135>

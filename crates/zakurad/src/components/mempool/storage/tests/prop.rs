@@ -85,7 +85,7 @@ fn reject_lists_enforce_production_capacity() {
     for index in 0..=production_capacity {
         let id = cheap_rejection_id(index);
         tip_rejected.reject(id, SameEffectsTipRejectionError::SpendConflict.into());
-        chain_rejected.reject(id, SameEffectsChainRejectionError::RandomlyEvicted.into());
+        chain_rejected.reject(id, SameEffectsChainRejectionError::Expired.into());
 
         if index == production_capacity - 1 {
             assert_eq!(
@@ -202,7 +202,7 @@ proptest! {
             (0..test_capacity).map(|index| rejection_id_with_index(rejection_template, index));
 
         for rejection in unique_ids {
-            storage.reject(rejection, SameEffectsChainRejectionError::RandomlyEvicted.into());
+            storage.reject(rejection, SameEffectsTipRejectionError::Evicted.into());
         }
 
         // Make sure there were no duplicates
@@ -221,8 +221,8 @@ proptest! {
                     Ok(tx_id)
                 );
             } else {
-                // The final transaction will cause a random eviction,
-                // which might return an error if this transaction is chosen
+                // The final transaction either evicts cheaper transactions, or is rejected
+                // because it pays too little to evict them.
                 let result = storage.insert(transaction.clone(), Vec::new(), None);
 
                 if result.is_ok() {
@@ -233,22 +233,18 @@ proptest! {
                 } else {
                     prop_assert_eq!(
                         result,
-                        Err(MempoolError::StorageEffectsChain(SameEffectsChainRejectionError::RandomlyEvicted))
+                        Err(MempoolError::StorageEffectsTip(SameEffectsTipRejectionError::BelowEvictionCost))
                     );
                 }
             }
         }
 
-        // Check if at least one transaction was evicted.
-        // (More than one an be evicted to meet the limit.)
         prop_assert!(storage.transaction_count() <= MEMPOOL_TX_COUNT);
+        prop_assert!(storage.total_cost() <= cost_limit);
 
-        // Since we inserted more than the configured capacity,
-        // the storage should have removed the older entries and kept its size
-        prop_assert_eq!(
-            storage.rejected_transaction_count(),
-            TEST_REJECTION_LIST_CAPACITY
-        );
+        // The eviction or the rejection pushed the tip rejection list over its capacity, so
+        // the storage cleared it.
+        prop_assert!(storage.rejected_transaction_count() < TEST_REJECTION_LIST_CAPACITY);
     }
 
     /// Test that the reject list length limits are applied when directly rejecting transactions.
@@ -327,9 +323,9 @@ proptest! {
             rejection_template
         }).collect();
 
-        storage.reject(unique_ids[0], SameEffectsChainRejectionError::RandomlyEvicted.into());
+        storage.reject(unique_ids[0], SameEffectsChainRejectionError::Expired.into());
         thread::sleep(Duration::from_millis(11));
-        storage.reject(unique_ids[1], SameEffectsChainRejectionError::RandomlyEvicted.into());
+        storage.reject(unique_ids[1], SameEffectsChainRejectionError::Expired.into());
 
         prop_assert_eq!(storage.rejected_transaction_count(), 1);
     }

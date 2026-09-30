@@ -241,7 +241,6 @@ hyper-util = { workspace = true, features = ["service", "server", "tokio"] }
 # Configuration management
 config = { workspace = true }
 
-rand = { workspace = true }
 nix = { workspace = true, features = ["fs"] }
 
 # prod feature internal-miner
@@ -297,6 +296,7 @@ tonic-prost-build = { workspace = true, optional = true }
 abscissa_core = { workspace = true, default-features = false, features = ["testing"] }
 hex-literal = { workspace = true }
 jsonrpsee-types = { workspace = true }
+rand = { workspace = true }
 regex = { workspace = true }
 insta = { workspace = true, features = ["json"] }
 

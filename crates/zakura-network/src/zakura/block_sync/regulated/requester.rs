@@ -169,7 +169,11 @@ impl Requester {
         pending.received += 1;
         pending.body_bytes += body_len;
         if let Some(next) = pending.expected.get(pending.received) {
-            self.next.insert(*next, start);
+            let previous = self.next.insert(*next, start);
+            debug_assert!(
+                previous.is_none(),
+                "live ranges expect distinct next hashes"
+            );
         }
         Ok((height, claimed))
     }

@@ -20,5 +20,5 @@ export CARGO_TARGET_DIR="$output_dir/target"
 command -v protoc >/dev/null
 rustup toolchain install 1.97.1 --profile minimal
 python3 "$package_dir/corpus.py" --source "$source_dir" --output "$output_dir/evidence"
-(cd "$source_dir" && cargo +1.97.1 build --locked --release -p zakurad --bin zakurad)
+(cd "$source_dir" && cargo +1.97.1 build --locked --release -p zakura --bin zakurad)
 cp "$CARGO_TARGET_DIR/release/zakurad" "$output_dir/zakurad"

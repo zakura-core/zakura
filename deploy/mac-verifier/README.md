@@ -68,6 +68,13 @@ from GitHub environment `mac-verifier-private`. It has no host/IP input. Only
 restricted to those same branches. The Mac is
 never registered as a general Actions self-hosted runner.
 
+GitHub registers a new manual workflow only after it reaches the default branch.
+For the initial deployment while this PR remains draft, use the same
+`private_deploy.py` operator entry point with credentials fetched at runtime from
+Infisical. Record the clean tooling commit before running it; keep child output
+captured privately. The environment secrets are already mirrored for subsequent
+workflow execution. Do not merge solely to make deployment dispatch available.
+
 Infisical remains the source of truth. Store deployment secrets in
 `prod:/mac-verifier/provisioner`:
 

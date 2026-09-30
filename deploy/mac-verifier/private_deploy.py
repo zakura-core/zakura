@@ -37,10 +37,13 @@ class SSH:
         user = os.environ[prefix + "USER"]
         if not re.fullmatch(r"[a-zA-Z_][a-zA-Z0-9_-]{0,31}", user):
             raise Unavailable("invalid SSH user")
+        port = os.environ.get(prefix + "SSH_PORT", "22")
+        if not re.fullmatch(r"[0-9]{1,5}", port) or not 1 <= int(port) <= 65535:
+            raise Unavailable("invalid SSH port")
         self.destination = user + "@" + self.host
         key = secret_file(directory, prefix + "key", os.environ[prefix + "SSH_KEY"])
         hosts = secret_file(directory, prefix + "hosts", os.environ[prefix + "KNOWN_HOSTS"])
-        self.options = ["-i", str(key), "-o", "BatchMode=yes", "-o", "IdentitiesOnly=yes",
+        self.options = ["-i", str(key), "-p", port, "-o", "BatchMode=yes", "-o", "IdentitiesOnly=yes",
                         "-o", "StrictHostKeyChecking=yes", "-o", "UserKnownHostsFile=" + str(hosts),
                         "-o", "ConnectTimeout=10", "-o", "LogLevel=ERROR"]
 

@@ -242,6 +242,29 @@ class BoundaryTests(unittest.TestCase):
                 self.assertTrue(run.call_args.kwargs["capture_output"])
                 self.assertIn("StrictHostKeyChecking=yes", run.call_args.args[0])
 
+    def test_secret_ssh_port_is_used_for_commands_and_tunnels(self):
+        with tempfile.TemporaryDirectory() as directory:
+            environment = {"MAC_VERIFIER_HOST": "192.0.2.10", "MAC_VERIFIER_USER": "operator",
+                           "MAC_VERIFIER_SSH_KEY": "fixture-key", "MAC_VERIFIER_KNOWN_HOSTS": "fixture-host",
+                           "MAC_VERIFIER_SSH_PORT": "2207"}
+            with patch.dict("os.environ", environment):
+                ssh = SSH("MAC_VERIFIER_", directory)
+            with patch("subprocess.run") as run, patch("subprocess.Popen") as tunnel:
+                run.return_value.returncode = 0
+                ssh.run("true")
+                ssh.tunnel([])
+                for command in (run.call_args.args[0], tunnel.call_args.args[0]):
+                    self.assertEqual(command[command.index("-p") + 1], "2207")
+
+    def test_invalid_ssh_ports_fail_before_connecting(self):
+        with tempfile.TemporaryDirectory() as directory:
+            environment = {"MAC_VERIFIER_HOST": "192.0.2.10", "MAC_VERIFIER_USER": "operator",
+                           "MAC_VERIFIER_SSH_KEY": "fixture-key", "MAC_VERIFIER_KNOWN_HOSTS": "fixture-host"}
+            for port in ("", "0", "65536", "-1", "22 -oProxyCommand=bad", "22\n"):
+                with self.subTest(port=port), patch.dict("os.environ", {**environment, "MAC_VERIFIER_SSH_PORT": port}):
+                    with self.assertRaises(Unavailable):
+                        SSH("MAC_VERIFIER_", directory)
+
     def test_missing_pool_and_malformed_hex(self):
         value = record(10)
         del value["pools"]["ironwood"]

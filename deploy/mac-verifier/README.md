@@ -74,6 +74,8 @@ Infisical remains the source of truth. Store deployment secrets in
 - `MAC_VERIFIER_HOST`, `MAC_VERIFIER_USER`, `MAC_VERIFIER_SSH_KEY`,
   `MAC_VERIFIER_KNOWN_HOSTS`: private Mac IP, admin user, dedicated deployment key,
   and authenticated pinned host keys.
+- `MAC_VERIFIER_SSH_PORT`: SSH port from private runtime configuration, including
+  the standard port when applicable; validate the range before connecting.
 - `MAC_VERIFIER_REFERENCE_HOST`, `MAC_VERIFIER_REFERENCE_USER`,
   `MAC_VERIFIER_REFERENCE_SSH_KEY`, `MAC_VERIFIER_REFERENCE_KNOWN_HOSTS`: reference
   endpoint and dedicated deployment access. Both admin identities need

@@ -1,11 +1,11 @@
-//! The version-2 envelope, before authorization and full block decoding.
+//! The existing stream-6 version-2 codec, before authorization and full block decoding.
 
 use std::time::Duration;
 
 use super::super::{config::MAX_BS_INFLIGHT_REQUESTS, wire::*, *};
 use crate::zakura::{
     regulation::ResponseCap,
-    wire_codec::{BoundedReader, HeightLe, LeU32, WireError, WireMessage, U8},
+    wire_codec::{BoundedReader, HeightLe, LeU32, Wire, WireError, WireMessage, U8},
     Cadence, MessageRole, MessageRule, PayloadLen,
 };
 
@@ -111,31 +111,28 @@ impl WireMessage for Message {
         match self {
             Self::Status(status) => {
                 validate_status(status)?;
-                out.extend_from_slice(&status.servable_low.0.to_le_bytes());
-                out.extend_from_slice(&status.servable_high.0.to_le_bytes());
+                <(HeightLe, HeightLe)>::encode(&(status.servable_low, status.servable_high), out)?;
                 out.extend_from_slice(&status.tip_hash.0);
                 for value in [
                     status.max_blocks_per_response,
                     status.max_inflight_requests,
                     status.max_response_bytes,
                 ] {
-                    out.extend_from_slice(&value.to_le_bytes());
+                    LeU32::encode(&value, out)?;
                 }
             }
             Self::Block(bytes) => out.extend_from_slice(bytes),
             Self::GetBlocks(range) => {
                 Range::new(range.start, range.count)?;
-                encode_range(out, range.start, range.count);
+                encode_range(out, range.start, range.count)?;
             }
             Self::RangeUnavailable(range) => {
-                validate_height(range.start)?;
                 validate_count(range.count)?;
-                encode_range(out, range.start, range.count);
+                encode_range(out, range.start, range.count)?;
             }
             Self::BlocksDone { start, returned } => {
-                validate_height(*start)?;
                 validate_count(*returned)?;
-                encode_range(out, *start, *returned);
+                encode_range(out, *start, *returned)?;
             }
         }
         Ok(())
@@ -190,9 +187,8 @@ impl WireMessage for Message {
     }
 }
 
-fn encode_range(out: &mut Vec<u8>, start: block::Height, count: u32) {
-    out.extend_from_slice(&start.0.to_le_bytes());
-    out.extend_from_slice(&count.to_le_bytes());
+fn encode_range(out: &mut Vec<u8>, start: block::Height, count: u32) -> Result<(), WireError> {
+    <(HeightLe, LeU32)>::encode(&(start, count), out)
 }
 
 fn validate_count(count: u32) -> Result<(), WireError> {
@@ -205,18 +201,10 @@ fn validate_count(count: u32) -> Result<(), WireError> {
 fn validate_status(status: &BlockSyncStatus) -> Result<(), WireError> {
     validate_count(status.max_blocks_per_response)?;
     if status.servable_low > status.servable_high
-        || status.servable_high > block::Height::MAX
         || !(1..=MAX_BS_INFLIGHT_REQUESTS).contains(&status.max_inflight_requests)
         || !(1..=MAX_BS_RESPONSE_BYTES).contains(&status.max_response_bytes)
     {
         return Err(WireError::OutOfRange("block-sync status"));
-    }
-    Ok(())
-}
-
-fn validate_height(height: block::Height) -> Result<(), WireError> {
-    if height > block::Height::MAX {
-        return Err(WireError::OutOfRange("block height"));
     }
     Ok(())
 }

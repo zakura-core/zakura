@@ -39,7 +39,13 @@ impl BlockRangeSource for StateBlockRangeSource {
             )
             .await??;
             let (blocks, lease) = result.into_parts();
-            Ok(BlockRangeReadResult { blocks, lease })
+            Ok(BlockRangeReadResult {
+                blocks: blocks
+                    .into_iter()
+                    .map(|(height, block, _)| (height, block))
+                    .collect(),
+                lease,
+            })
         })
     }
 }

@@ -11,6 +11,7 @@ use zakura_chain::{
 };
 
 use crate::{
+    config::UnconditionalPeers,
     constants::{DEFAULT_MAX_CONNS_PER_IP, MAX_ADDRS_IN_ADDRESS_BOOK, MAX_PEER_MISBEHAVIOR_SCORE},
     meta_addr::{MetaAddr, MetaAddrChange},
     protocol::external::types::PeerServices,
@@ -300,4 +301,133 @@ fn test_reconnection_peers_skips_recently_updated_ip<
     } else {
         assert_ne!(next_reconnection_peer, None,);
     }
+}
+
+/// Helper: build an address book with `unconditional_peers`, containing a
+/// responded entry for each of `addrs`.
+fn address_book_with_unconditional_peers(
+    unconditional_peers: &[&str],
+    addrs: &[crate::PeerSocketAddr],
+) -> AddressBook {
+    let unconditional_peers: UnconditionalPeers = unconditional_peers
+        .iter()
+        .map(|net| net.parse::<ipnet::IpNet>().unwrap())
+        .collect();
+
+    let mut address_book =
+        AddressBook::new("0.0.0.0:0".parse().unwrap(), &Mainnet, 2, Span::current())
+            .with_unconditional_peers(unconditional_peers);
+
+    for &addr in addrs {
+        address_book.update(gossiped_change(
+            addr,
+            PeerServices::NODE_NETWORK,
+            DateTime32::MIN,
+        ));
+        address_book.update(MetaAddr::new_reconnect(addr));
+        address_book.update(MetaAddr::new_responded(addr, None));
+        assert!(address_book.get(addr).is_some());
+    }
+
+    address_book
+}
+
+/// A ban-threshold misbehavior report for an unconditional peer leaves its
+/// score at zero and does not ban it, while other peers are still banned.
+#[test]
+fn unconditional_peer_misbehavior_is_ignored() {
+    let unconditional_addr: crate::PeerSocketAddr = "127.0.0.1:8233".parse().unwrap();
+    let other_addr: crate::PeerSocketAddr = "127.0.0.2:8233".parse().unwrap();
+
+    let mut address_book =
+        address_book_with_unconditional_peers(&["127.0.0.1/32"], &[unconditional_addr, other_addr]);
+    let bans = address_book.bans();
+
+    let updated = address_book.update(MetaAddr::new_misbehavior(
+        unconditional_addr,
+        MAX_PEER_MISBEHAVIOR_SCORE,
+    ));
+    address_book.peers.assert_consistent();
+
+    assert_eq!(updated, None, "the misbehavior report should be dropped");
+    assert!(!bans.contains(unconditional_addr.ip()));
+    assert_eq!(
+        address_book
+            .get(unconditional_addr)
+            .expect("unconditional peer should stay in the address book")
+            .misbehavior(),
+        0,
+    );
+
+    address_book.update(MetaAddr::new_misbehavior(
+        other_addr,
+        MAX_PEER_MISBEHAVIOR_SCORE,
+    ));
+
+    assert!(
+        bans.contains(other_addr.ip()),
+        "peers that are not unconditional should still be banned"
+    );
+    assert!(address_book.get(other_addr).is_none());
+    assert!(address_book.get(unconditional_addr).is_some());
+}
+
+/// Repeated sub-threshold misbehavior reports for an unconditional peer never
+/// add up to a ban.
+#[test]
+fn unconditional_peer_misbehavior_does_not_accumulate() {
+    let unconditional_addr: crate::PeerSocketAddr = "127.0.0.1:8233".parse().unwrap();
+
+    let mut address_book =
+        address_book_with_unconditional_peers(&["127.0.0.1/32"], &[unconditional_addr]);
+    let bans = address_book.bans();
+
+    for _ in 0..10 {
+        address_book.update(MetaAddr::new_misbehavior(
+            unconditional_addr,
+            MAX_PEER_MISBEHAVIOR_SCORE / 2,
+        ));
+    }
+
+    assert!(!bans.contains(unconditional_addr.ip()));
+    assert_eq!(
+        address_book
+            .get(unconditional_addr)
+            .expect("unconditional peer should stay in the address book")
+            .misbehavior(),
+        0,
+    );
+}
+
+/// Unconditional CIDR ranges cover their inner addresses, including reports
+/// that use the IPv4-mapped IPv6 form, and do not cover outer addresses.
+#[test]
+fn unconditional_peer_ranges_match_inner_and_mapped_addresses() {
+    let inner_addr: crate::PeerSocketAddr = "127.0.0.3:8233".parse().unwrap();
+    let mapped_inner_addr: crate::PeerSocketAddr = "[::ffff:127.0.0.3]:8233".parse().unwrap();
+    let outer_addr: crate::PeerSocketAddr = "127.0.0.4:8233".parse().unwrap();
+
+    let mut address_book =
+        address_book_with_unconditional_peers(&["127.0.0.0/30"], &[inner_addr, outer_addr]);
+    let bans = address_book.bans();
+
+    address_book.update(MetaAddr::new_misbehavior(
+        inner_addr,
+        MAX_PEER_MISBEHAVIOR_SCORE,
+    ));
+    address_book.update(MetaAddr::new_misbehavior(
+        mapped_inner_addr,
+        MAX_PEER_MISBEHAVIOR_SCORE,
+    ));
+    address_book.update(MetaAddr::new_misbehavior(
+        outer_addr,
+        MAX_PEER_MISBEHAVIOR_SCORE,
+    ));
+
+    assert!(!bans.contains(inner_addr.ip()));
+    assert!(!bans.contains(mapped_inner_addr.ip()));
+    assert!(address_book.get(inner_addr).is_some());
+
+    assert!(bans.contains(outer_addr.ip()));
+    assert!(address_book.get(outer_addr).is_none());
 }

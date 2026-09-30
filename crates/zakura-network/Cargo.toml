@@ -55,6 +55,7 @@ dirs = { workspace = true }
 hex = { workspace = true }
 humantime-serde = { workspace = true }
 indexmap = { workspace = true, features = ["serde"] }
+ipnet = { workspace = true }
 iroh = { workspace = true }
 itertools = { workspace = true }
 lazy_static = { workspace = true }

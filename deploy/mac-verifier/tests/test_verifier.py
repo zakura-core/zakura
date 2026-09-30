@@ -586,5 +586,76 @@ class ChannelDeliveryTests(unittest.TestCase):
             self.assertEqual(write.call_args_list[0].args[2], 0o600)
 
 
+class GroupedChannelTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.monitor = Monitor(self.temp.name, receipt(), Chain(), Mac(),
+                               ChannelWebhook("https://hooks.slack.com/services/fixture"))
+
+    def test_one_alert_and_one_recovery_for_multiple_findings(self):
+        m = self.monitor
+        m.incident("disk below 20 GB", True, 0)
+        m.channel_episode(0, {})
+        m.incident("memory pressure", True, 30)
+        m.channel_episode(30, {})
+        self.assertEqual(len(m.state["outbox"]), 1)
+        m.incident("disk below 20 GB", False, 60)
+        m.incident("disk below 20 GB", False, 90)
+        m.channel_episode(90, {})
+        self.assertEqual(len(m.state["outbox"]), 1)
+        m.incident("memory pressure", False, 120)
+        m.incident("memory pressure", False, 150)
+        m.channel_episode(150, {})
+        self.assertEqual(len(m.state["outbox"]), 2)
+        self.assertIn("recovered", m.state["outbox"][1]["text"])
+
+    def test_availability_and_quorum_forks_are_owned_by_fleet(self):
+        m = self.monitor
+        for name in ("coverage incomplete", "verifier unavailable", "verifier stalled", "persistent chain disagreement"):
+            m.incident(name, True, 0)
+        m.channel_episode(300, None)
+        m.channel_episode(300, {})
+        self.assertEqual(m.state["outbox"], [])
+
+    def test_coverage_requires_three_minutes_and_a_live_status(self):
+        m = self.monitor
+        m.incident("coverage incomplete", True, 0)
+        m.channel_episode(179, {})
+        m.channel_episode(180, None)
+        self.assertEqual(m.state["outbox"], [])
+        m.channel_episode(180, {})
+        self.assertEqual(len(m.state["outbox"]), 1)
+
+    def test_missing_status_cannot_clear_an_active_coverage_episode(self):
+        m = self.monitor
+        m.incident("coverage incomplete", True, 0)
+        m.channel_episode(180, {})
+        m.channel_episode(210, None)
+        self.assertEqual(len(m.state["outbox"]), 1)
+        m.incident("coverage incomplete", False, 240)
+        m.incident("coverage incomplete", False, 270)
+        m.channel_episode(270, {})
+        self.assertEqual(len(m.state["outbox"]), 2)
+
+    def test_episode_survives_restart_without_duplicate_page(self):
+        m = self.monitor
+        m.incident("disk below 20 GB", True, 0)
+        m.channel_episode(0, {})
+        m.save()
+        restarted = Monitor(self.temp.name, receipt(), Chain(), Mac(), m.slack)
+        restarted.channel_episode(30, {})
+        self.assertEqual(len(restarted.state["outbox"]), 1)
+
+    def test_historical_observation_notifications_are_coalesced(self):
+        old = Monitor(self.temp.name, receipt(), Chain(), Mac(), observation_only=True)
+        old.notify("Zakura Mac verifier: alert delivery unavailable")
+        old.notify("Zakura Mac verifier recovered: coverage incomplete")
+        old.save()
+        current = Monitor(self.temp.name, receipt(), Chain(), Mac(), self.monitor.slack)
+        self.assertEqual(current.state["outbox"], [])
+        self.assertIsNone(current.state["healthy_since"])
+
+
 if __name__ == "__main__":
     unittest.main()

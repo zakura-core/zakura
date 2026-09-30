@@ -314,3 +314,18 @@ actual transition delivery and permits qualification after its durable queue has
 drained. The optional dedicated DM setup above remains available to operators.
 Webhook retries are bounded and persistent queue IDs prevent repeat transitions;
 ambiguous network failures can still produce duplicate Slack messages.
+
+Channel notifications are grouped into one detailed-incident episode and one
+recovery, even when several findings overlap. The fleet watchdog exclusively
+owns Mac offline/stall and quorum-fork pages. The comparator suppresses transient
+coverage gaps; a live Mac with incomplete comparison coverage must persist for
+three minutes before it pages. Historical observation-mode notifications are
+coalesced during the migration rather than replayed as stale Slack messages.
+All findings remain in the incident state and qualification still fails closed.
+
+Operator mute: set `MAC_VERIFIER_ALERTS_MUTED=1` on the existing fleet watchdog
+service to exclude Mac notifications while retaining other nodes' alerting. Run
+`install.py linux-observe` and restart the comparator to disable its delivery.
+The node and comparison continue; observation mode cannot qualify. Re-enable
+only after explicit operator authorization; do not treat a code deployment as
+permission to remove the mute.

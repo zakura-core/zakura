@@ -1219,6 +1219,8 @@ class Watchdog:
 
         if not self.handle_fleet_recovered(state, fleet, now):
             return
+        if os.environ.get("MAC_VERIFIER_ALERTS_MUTED") == "1":
+            node_rows = [row for row in node_rows if row.get("name") != "zakura-mac-os"]
         self.handle_mac_fork(state, fleet, node_rows, now, suppressed)
         grace_since = max(
             self.started_at, self.fetch_recovered_at.get(fleet.name, 0)
@@ -1266,6 +1268,8 @@ class Watchdog:
         Missing or racing samples cannot prove a fork or clear an existing one.
         Offline peers remain in the denominator, preventing a reduced quorum.
         """
+        if os.environ.get("MAC_VERIFIER_ALERTS_MUTED") == "1":
+            return
         if fleet.name != "mainnet":
             return
         mac = next((row for row in rows if row.get("name") == "zakura-mac-os"), None)
@@ -1888,6 +1892,8 @@ class Watchdog:
         suppressed: bool,
         coalesced: bool = False,
     ) -> None:
+        if observation.name == "zakura-mac-os" and os.environ.get("MAC_VERIFIER_ALERTS_MUTED") == "1":
+            return
         key = f"{fleet.name}/{observation.name}"
         bucket = state.setdefault("nodes", {})
         previous = dict(bucket.get(key, {}))

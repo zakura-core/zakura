@@ -2079,6 +2079,27 @@ class MacForkAlertTests(unittest.TestCase):
         self.assertTrue(state["mac_forks"]["mainnet"]["alerting"])
         self.assertNotIn("mainnet",state["pending_delivery"])
 
+    def test_mute_suppresses_mac_forks_without_altering_state(self):
+        with patch.dict(watchdog.os.environ, {"MAC_VERIFIER_ALERTS_MUTED": "1"}):
+            state, sent = self.check(self.rows())
+        self.assertEqual(sent, [])
+        self.assertEqual(state, {})
+
+    def test_mute_suppresses_only_mac_node_alerts(self):
+        agent = watchdog.Watchdog([], make_args())
+        sent = []
+        agent.notify = lambda text, args: (sent.append(text), True)[1]
+        fleet = watchdog.Fleet("mainnet", "http://localhost/data", "https://status.mainnet.zakura.valargroup.dev/")
+        state = {}
+        with patch.dict(watchdog.os.environ, {"MAC_VERIFIER_ALERTS_MUTED": "1"}):
+            for name in ("zakura-mac-os", "other"):
+                row = {"name": name, "health": "down", "height": 110}
+                observation = watchdog.NodeObservation(name, row, "down", 0, 180, 110, "a" * 64)
+                agent.handle_node_observation(state, fleet, observation, 1000, False)
+        self.assertEqual(len(sent), 1)
+        self.assertIn("other", sent[0])
+        self.assertNotIn("mainnet/zakura-mac-os", state.get("nodes", {}))
+
     def test_mac_offline_uses_three_minutes_without_changing_other_nodes(self):
         self.assertEqual(watchdog.node_condition({"name":"zakura-mac-os","health":"down"},1000,0,make_args())[2],180)
         self.assertEqual(watchdog.node_condition({"name":"other","health":"down"},1000,0,make_args())[2],600)

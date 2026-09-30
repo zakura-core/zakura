@@ -120,6 +120,7 @@ class Monitor:
         self.remote = remote or Remote()
         self.slack = slack
         self.observation_only = observation_only
+        self.grouped_channel = isinstance(slack, ChannelWebhook)
         state = self.directory / "cursor.json"
         self.state = read_json(state) if state.exists() else {
             "schema_version": 1, "bootstrap": expected["bootstrap_height"],
@@ -133,6 +134,17 @@ class Monitor:
         if (self.state.get("receipt_digest") != self.receipt_digest(expected)
                 or self.state.get("bootstrap") != expected["bootstrap_height"]):
             raise ValueError("receipt changed: explicit rebootstrap required")
+        if self.grouped_channel and self.state.get("channel_episode_version") != 1:
+            pending = self.state["outbox"]
+            self.state["outbox"] = [item for item in pending if not item["text"].startswith(
+                ("Zakura Mac verifier: ", "Zakura Mac verifier recovered: "))]
+            self.audit({"event": "coalesced historical incident notifications", "time": time.time(),
+                        "count": len(pending) - len(self.state["outbox"])})
+            self.state["channel_episode_version"] = 1
+            self.state["channel_episode_active"] = False
+            self.state["healthy_since"] = None
+            self.state["healthy_start_height"] = None
+
 
     @staticmethod
     def receipt_digest(receipt):
@@ -165,14 +177,47 @@ class Monitor:
         if active:
             if item is None:
                 incidents[name] = {"since": now, "latched": latched, "good_samples": 0}
-                self.notify(f"Zakura Mac verifier: {name}")
+                if not self.grouped_channel:
+                    self.notify(f"Zakura Mac verifier: {name}")
             else:
                 item["good_samples"] = 0
         elif item and not item["latched"]:
             item["good_samples"] += 1
             if item["good_samples"] >= 2:
                 del incidents[name]
-                self.notify(f"Zakura Mac verifier recovered: {name}")
+                if not self.grouped_channel:
+                    self.notify(f"Zakura Mac verifier recovered: {name}")
+
+    def channel_episode(self, now, status):
+        """Page once per detailed incident episode; fleet owns availability/forks."""
+        if not self.grouped_channel:
+            return
+        delegated = {"alert delivery unavailable", "verifier unavailable", "verifier stalled",
+                     "persistent chain disagreement"}
+        active = []
+        for name, item in self.state["incidents"].items():
+            if name in delegated:
+                continue
+            if name == "coverage incomplete":
+                if status is None or now - item["since"] < 180:
+                    continue
+                # A known chain disagreement is handled by the fleet's quorum rule.
+                if "persistent chain disagreement" in self.state["incidents"]:
+                    continue
+            active.append(name)
+        was_active = self.state.get("channel_episode_active", False)
+        prior = set(self.state.get("channel_episode_findings", []))
+        if active and not was_active:
+            self.notify("Zakura Mac verifier needs attention: " + ", ".join(sorted(active))
+                        + "\nhttps://status.mainnet.zakura.valargroup.dev/")
+            self.state["channel_episode_active"] = True
+        if active:
+            self.state["channel_episode_findings"] = sorted(prior | set(active))
+        elif was_active and not prior.intersection(self.state["incidents"]):
+            self.notify("Zakura Mac verifier recovered: detailed incident cleared"
+                        + "\nhttps://status.mainnet.zakura.valargroup.dev/")
+            self.state["channel_episode_active"] = False
+            self.state["channel_episode_findings"] = []
 
     def confirmed_mismatch(self, height, left, right, now):
         name = "confirmed tree state mismatch"
@@ -318,6 +363,7 @@ class Monitor:
                 since = now
                 self.state["unavailable_since"] = since
             self.incident("verifier unavailable", now - since >= 180, now)
+        self.channel_episode(now, status)
         gap = self.state["last_sample"] is None or now - self.state["last_sample"] > 90
         healthy = (error is None and not self.state["incidents"] and self.state["caught_up"]
                    and not self.state["outbox_overflow"] and not self.state["outbox"])

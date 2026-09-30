@@ -670,7 +670,7 @@ there.
 - **Cadence**
   - capacity = 22
   - refill = 1 message / 15 seconds
-  - on_empty = `Disconnect`
+  - on_empty = record and forward (exhaustion is not a violation)
 
 The sender MUST send at most one `Status` every 30 seconds, including range corrections. It MAY
 send one immediate `Status` when the connection opens. The handler MUST retain bounded latest-status

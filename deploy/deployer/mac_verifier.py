@@ -280,7 +280,7 @@ def check_address_history():
 
 def status(mac, linux, identifier):
     mac_info = json.loads(mac.run(f'''sudo -n {MAC_PYTHON} - <<'REMOTE'
-import hashlib, json, pathlib, platform, subprocess, tomllib
+import hashlib, json, pathlib, platform, socket, subprocess, tomllib
 base = pathlib.Path({BASE!r})
 result = {{'architecture': platform.machine(), 'receipt_present': (base / 'receipt.json').is_file()}}
 receipt = json.loads((base / 'receipt.json').read_text())
@@ -304,15 +304,34 @@ for path in (base / 'evidence').rglob('*.json'):
 for name in ['node', 'adapter', 'tunnel']:
     check = subprocess.run(['launchctl', 'print', 'system/dev.valargroup.zakura-verifier-' + name], capture_output=True, text=True, timeout=10)
     result[name + '_running'] = check.returncode == 0 and 'state = running' in check.stdout
+try:
+    with socket.create_connection(('127.0.0.1', 28233), timeout=2):
+        result['adapter_listener_closed'] = False
+except OSError:
+    result['adapter_listener_closed'] = True
 print(json.dumps(result))
 REMOTE
 '''))
     info = json.loads(linux.run('''sudo -n python3 - <<'REMOTE'
-import json, pathlib, subprocess
+import json, pathlib, pwd, socket, subprocess
 result = {}
-for name in ['zakura-mac-verifier', 'zakura-mac-verifier-dashboard', 'zakura-mainnet-dashboard']:
+for name in ['zakura-mac-verifier', 'zakura-fleet-watchdog', 'zakura-mac-verifier-dashboard', 'zakura-mainnet-dashboard']:
     check = subprocess.run(['systemctl', 'is-active', name], capture_output=True, text=True, timeout=10)
     result[name] = check.stdout.strip()
+ssh = pathlib.Path('/etc/zakura-mac-verifier/ssh')
+if ssh.exists():
+    account = pwd.getpwnam('zakura-mac-verifier')
+    paths = [ssh, *(ssh / name for name in ['config', 'id_ed25519', 'known_hosts'])]
+    result['monitoring_config_private'] = all(path.stat().st_uid == account.pw_uid
+        and not path.stat().st_mode & 0o077 for path in paths)
+    check = subprocess.run(['sudo', '-n', '-u', 'zakura-mac-verifier', 'ssh', '-F', str(ssh / 'config'),
+                            '-T', 'mac-verifier', 'id'], input=b'', capture_output=True, timeout=8)
+    result['monitoring_key_restricted'] = check.returncode == 0 and check.stdout == b''
+try:
+    with socket.create_connection(('127.0.0.1', 28233), timeout=2):
+        result['reverse_listener_closed'] = False
+except OSError:
+    result['reverse_listener_closed'] = True
 path = pathlib.Path('/var/lib/zakura-mac-verifier/status.json')
 result['status'] = json.loads(path.read_text()) if path.exists() else None
 script = pathlib.Path('/opt/zakura-mainnet-dashboard/zakura-cluster-status.py')

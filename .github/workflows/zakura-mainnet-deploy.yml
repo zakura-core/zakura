@@ -50,6 +50,11 @@ on:
         required: false
         type: boolean
         default: false
+      mac_operation:
+        description: "Operation for the existing zakura-mac-os verifier"
+        type: choice
+        options: [status]
+        default: status
 
 permissions:
   contents: read
@@ -59,7 +64,32 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  mac-verifier:
+    if: inputs.node == 'zakura-mac-os' && (github.ref == 'refs/heads/main' || github.ref_name == vars.MAC_VERIFIER_DEPLOY_BRANCH)
+    runs-on: ubuntu-24.04
+    environment: mac-verifier-private
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Inspect private Mac verifier
+        env:
+          MAC_OPERATION: ${{ inputs.mac_operation }}
+          MAC_VERIFIER_HOST: ${{ secrets.MAC_VERIFIER_HOST }}
+          MAC_VERIFIER_USER: ${{ secrets.MAC_VERIFIER_USER }}
+          MAC_VERIFIER_SSH_PORT: ${{ secrets.MAC_VERIFIER_SSH_PORT }}
+          MAC_VERIFIER_SSH_KEY: ${{ secrets.MAC_VERIFIER_SSH_KEY }}
+          MAC_VERIFIER_KNOWN_HOSTS: ${{ secrets.MAC_VERIFIER_KNOWN_HOSTS }}
+          MAC_VERIFIER_REFERENCE_HOST: ${{ secrets.MAC_VERIFIER_REFERENCE_HOST }}
+          MAC_VERIFIER_REFERENCE_USER: ${{ secrets.MAC_VERIFIER_REFERENCE_USER }}
+          MAC_VERIFIER_REFERENCE_SSH_KEY: ${{ secrets.MAC_VERIFIER_REFERENCE_SSH_KEY }}
+          MAC_VERIFIER_REFERENCE_KNOWN_HOSTS: ${{ secrets.MAC_VERIFIER_REFERENCE_KNOWN_HOSTS }}
+          MAC_VERIFIER_ID: ${{ secrets.MAC_VERIFIER_ID }}
+        run: python3 deploy/deployer/mac_verifier.py "$MAC_OPERATION"
+
   deploy:
+    if: inputs.node != 'zakura-mac-os'
     name: "Deploy Zakura mainnet ${{ inputs.ref }}"
     runs-on: [self-hosted, "${{ vars.ZAKURA_MAINNET_RUNNER_LABEL || 'zakura-mainnet-deployer' }}"]
     timeout-minutes: 600

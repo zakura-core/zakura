@@ -98,7 +98,22 @@ impl AddressBookUpdater {
             span!(Level::TRACE, "address book"),
         )
         .with_local_listener_services(advertised_services)
-        .with_expose_peer_addresses(config.expose_peer_addresses);
+        .with_expose_peer_addresses(config.expose_peer_addresses)
+        .with_unconditional_peers(config.unconditional_peers.clone());
+        if !config.unconditional_peers.is_empty() {
+            if config.expose_peer_addresses {
+                let unconditional_peers: Vec<_> = config.unconditional_peers.iter().collect();
+                info!(
+                    ?unconditional_peers,
+                    "ignoring misbehavior reports from unconditional peers"
+                );
+            } else {
+                info!(
+                    unconditional_peers = config.unconditional_peers.len(),
+                    "ignoring misbehavior reports from unconditional peers"
+                );
+            }
+        }
         if let Some(peer_registry) = peer_registry {
             address_book = address_book.with_peer_registry(peer_registry);
         }

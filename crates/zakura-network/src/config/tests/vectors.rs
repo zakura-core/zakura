@@ -1,6 +1,11 @@
 //! Fixed test vectors for zakura-network configuration.
 
-use std::{collections::HashSet, fs, net::SocketAddr, time::Duration};
+use std::{
+    collections::HashSet,
+    fs,
+    net::{IpAddr, SocketAddr},
+    time::Duration,
+};
 
 use zakura_chain::{
     amount::Amount,
@@ -21,7 +26,7 @@ use crate::{
         DEFAULT_HS_RANGE, DEFAULT_TESTNET_ZAKURA_BOOTSTRAP_PEERS, DEFAULT_ZAKURA_BOOTSTRAP_PEERS,
         DEFAULT_ZAKURA_LISTEN_ADDR, DEFAULT_ZAKURA_MAX_CONNS_PER_IP,
     },
-    CacheDir, Config, P2pStack,
+    CacheDir, Config, P2pStack, UnconditionalPeers,
 };
 
 use super::super::load_or_generate_zakura_secret_key;
@@ -1228,4 +1233,96 @@ fn regtest_accepts_checkpoints_covering_delayed_canopy() {
         config.network.checkpoint_list().max_height(),
         zakura_chain::block::Height(9)
     );
+}
+
+#[test]
+fn unconditional_peers_default_to_empty() {
+    assert!(Config::default().unconditional_peers.is_empty());
+
+    let config: Config = toml::from_str("").unwrap();
+    assert!(config.unconditional_peers.is_empty());
+}
+
+#[test]
+fn unconditional_peers_parse_ips_and_cidr_ranges_and_roundtrip() {
+    let config: Config = toml::from_str(
+        "unconditional_peers = ['192.0.2.1', '198.51.100.0/24', '2001:db8::1', '2001:db8:1::/48']",
+    )
+    .expect("IP addresses and CIDR ranges parse");
+
+    assert_eq!(config.unconditional_peers.len(), 4);
+
+    let serialized = toml::to_string(&config).expect("config serializes");
+    assert!(
+        serialized.contains(
+            r#"unconditional_peers = ["192.0.2.1", "198.51.100.0/24", "2001:db8::1", "2001:db8:1::/48"]"#
+        ),
+        "plain IP addresses serialize without a prefix length:\n{serialized}"
+    );
+
+    let roundtrip: Config = toml::from_str(&serialized).expect("serialized config parses");
+    assert_eq!(roundtrip.unconditional_peers, config.unconditional_peers);
+}
+
+#[test]
+fn unconditional_peers_reject_invalid_entries() {
+    for entry in [
+        "not an ip",
+        "zakura.example.com",
+        "192.0.2.1:8233",
+        "192.0.2.0/33",
+        "",
+    ] {
+        let error = toml::from_str::<Config>(&format!("unconditional_peers = ['{entry}']"))
+            .expect_err("invalid unconditional peer entries must fail config load");
+
+        assert!(
+            error
+                .to_string()
+                .contains("invalid network.unconditional_peers entry"),
+            "unexpected error for {entry:?}: {error}"
+        );
+    }
+}
+
+#[test]
+fn unconditional_peers_match_addresses_in_configured_ranges() {
+    let peers: UnconditionalPeers = toml::from_str::<Config>(
+        "unconditional_peers = ['192.0.2.1', '198.51.100.0/24', '2001:db8:1::/48']",
+    )
+    .unwrap()
+    .unconditional_peers;
+
+    let ip = |ip: &str| ip.parse::<IpAddr>().unwrap();
+
+    assert!(peers.contains(ip("192.0.2.1")));
+    assert!(!peers.contains(ip("192.0.2.2")));
+
+    assert!(peers.contains(ip("198.51.100.0")));
+    assert!(peers.contains(ip("198.51.100.255")));
+    assert!(!peers.contains(ip("198.51.101.0")));
+
+    assert!(peers.contains(ip("2001:db8:1:ffff::1")));
+    assert!(!peers.contains(ip("2001:db8:2::1")));
+}
+
+#[test]
+fn unconditional_peers_match_ipv4_mapped_ipv6_forms() {
+    let ip = |ip: &str| ip.parse::<IpAddr>().unwrap();
+
+    let ipv4_entry: Config = toml::from_str("unconditional_peers = ['192.0.2.0/24']").unwrap();
+    assert!(ipv4_entry
+        .unconditional_peers
+        .contains(ip("::ffff:192.0.2.7")));
+    assert!(!ipv4_entry
+        .unconditional_peers
+        .contains(ip("::ffff:192.0.3.7")));
+
+    let mapped_entry: Config =
+        toml::from_str("unconditional_peers = ['::ffff:192.0.2.1']").unwrap();
+    assert!(mapped_entry.unconditional_peers.contains(ip("192.0.2.1")));
+    assert!(mapped_entry
+        .unconditional_peers
+        .contains(ip("::ffff:192.0.2.1")));
+    assert!(!mapped_entry.unconditional_peers.contains(ip("192.0.2.2")));
 }

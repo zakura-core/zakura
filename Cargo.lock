@@ -7838,6 +7838,7 @@ dependencies = [
  "howudoin",
  "humantime-serde",
  "indexmap 2.14.0",
+ "ipnet",
  "itertools 0.14.0",
  "lazy_static",
  "metrics",

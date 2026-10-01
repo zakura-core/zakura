@@ -48,7 +48,8 @@ Its block hash and height are unavailable.
 No historical range or full semantic block replay has run.
 
 The Criterion release benchmark compares both implementations in one binary.
-The final benchmark results will be recorded after the run completes.
+The [benchmark estimates](benchmark-results.json) retain the final run's means,
+batch medians, and confidence intervals.
 The benchmark uses 30 samples, a one-second warmup, and two-second measurement
 windows. It passes inputs through `black_box` and checks fixture results before
 measurement. It does not measure transaction hashing, full blocks, allocations,
@@ -57,3 +58,21 @@ binary size, or transaction latency percentiles.
 The [remaining gates](README.md#gates-before-merge) block merge and rollout.
 The private vendored package and workspace patch do not complete crates.io
 package delivery. No package publication, merge, or deployment has occurred.
+
+
+| Execution case | Rust mean | C++ mean | Rust change |
+| --- | ---: | ---: | ---: |
+| p2pkh | 27.946 µs | 26.789 µs | +4.3% |
+| p2sh-p2pkh | 28.080 µs | 27.257 µs | +3.0% |
+| p2sh-multisig | 54.542 µs | 53.552 µs | +1.8% |
+| late-fail | 27.259 µs | 26.782 µs | +1.8% |
+| malformed | 0.073 µs | 0.026 µs | +184.8% |
+
+The signed-script means increased by roughly 2–4% on this host.
+The malformed-script mean increased from 25.5 ns to 72.7 ns (about 2.85×).
+The first exploratory run also showed this early-failure slowdown.
+That result requires review under the proposed performance gate before merge.
+The raw counting means for one complete push followed by CHECKSIG were about
+3–4 ns in Rust, versus 422–431 ns in C++ for 520/521-byte pushes and 7.60 µs
+for a 10,000-byte push. These counts exclude transaction script collection and
+hashing. These results establish no whole-node speedup.

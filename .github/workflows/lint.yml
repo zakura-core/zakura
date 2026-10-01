@@ -219,6 +219,10 @@ jobs:
         if: ${{ !cancelled() }}
         run: python3 .github/workflows/scripts/test_affected_semver_packages.py
 
+      - name: CI alert tests
+        if: ${{ !cancelled() }}
+        run: python3 .github/workflows/scripts/test_ci_alert.py
+
       - name: Deployer tests
         if: ${{ !cancelled() }}
         run: python3 -m unittest discover -s deploy/deployer -p 'test_*.py'

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build and test a pinned candidate on an isolated native Apple Silicon host."""
+"""Build and test a selected source commit on an isolated native Apple Silicon host."""
 import argparse
 import hashlib
 import json
@@ -53,7 +53,14 @@ def verify_backend_patch(backend, accepted):
             raise ValueError('backend tracked contents differ from accepted profile')
 
 
-def qualify(backend, source, output):
+def verify_source(source, source_sha):
+    if (not re.fullmatch(r'[a-f0-9]{40}', source_sha)
+            or git(source, 'rev-parse', 'HEAD') != source_sha
+            or git(source, 'status', '--porcelain')):
+        raise ValueError('clean checkout of the requested source commit required')
+
+
+def qualify(backend, source, output, source_sha):
     backend, source, output = [Path(p).resolve() for p in (backend, source, output)]
     if (platform.system(), platform.machine()) != ('Darwin', 'arm64'):
         raise ValueError('native Apple Silicon build host required')
@@ -61,8 +68,7 @@ def qualify(backend, source, output):
                       timeout=30).returncode != 1:
         raise ValueError('build host must have no running zakurad')
     manifest = json.loads((RECIPE.parent / 'corpus.json').read_text())
-    if git(source, 'rev-parse', 'HEAD') != manifest['source_sha'] or git(source, 'status', '--porcelain'):
-        raise ValueError('clean pinned consensus source required')
+    verify_source(source, source_sha)
     if git(backend, 'rev-parse', 'HEAD') != UPSTREAM:
         raise ValueError('unexpected backend revision')
     # Verify the exact accepted patch, not merely its presence in a checkout.
@@ -80,7 +86,7 @@ def qualify(backend, source, output):
                CARGO_TARGET_DIR=str(output / 'target'), CARGO_PROFILE_RELEASE_LTO='false',
                RUSTFLAGS='-Cpanic=unwind -Clink-arg=-Wl,-ld_classic')
     cargo = str(backend / 'dist/cargo-clif')
-    receipt = dict(source_sha=manifest['source_sha'], cargo_lock_sha256=digest(source / 'Cargo.lock'),
+    receipt = dict(source_sha=source_sha, cargo_lock_sha256=digest(source / 'Cargo.lock'),
                    patch_sha256=digest(RECIPE / 'macos-unwind.patch'),
                    backend_sha256=digest(backend / 'dist/lib/librustc_codegen_cranelift.dylib'),
                    started=time.time(), passed=False, production_ready=False, checks=[])
@@ -142,7 +148,7 @@ def qualify(backend, source, output):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
-    for argument in ['backend', 'source', 'output']:
+    for argument in ['backend', 'source', 'output', 'source-sha']:
         parser.add_argument('--' + argument, required=True)
     args = parser.parse_args()
-    qualify(args.backend, args.source, args.output)
+    qualify(args.backend, args.source, args.output, args.source_sha)

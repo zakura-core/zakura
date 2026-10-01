@@ -56,7 +56,7 @@ on:
         options: [deploy, status, dashboard]
         default: deploy
       mac_candidate_run_id:
-        description: "Successful Mac verifier candidate run to install (Mac deploy only)"
+        description: "Optional accepted candidate run; blank builds the requested ref"
         type: string
         default: ""
 
@@ -68,8 +68,46 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  mac-source:
+    if: inputs.node == 'zakura-mac-os' && inputs.mac_operation == 'deploy' && (github.ref == 'refs/heads/main' || github.ref_name == vars.MAC_VERIFIER_DEPLOY_BRANCH)
+    runs-on: ubuntu-24.04
+    outputs:
+      sha: ${{ steps.source.outputs.sha }}
+      lock_sha256: ${{ steps.source.outputs.lock_sha256 }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Resolve requested Mac source
+        id: source
+        env:
+          REF: ${{ inputs.ref }}
+          NO_RESTART: ${{ inputs.no_restart }}
+          FORCE_REBUILD: ${{ inputs.force_rebuild }}
+          CANDIDATE_RUN: ${{ inputs.mac_candidate_run_id }}
+        run: |
+          set -euo pipefail
+          [[ "$REF" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*$ ]]
+          if [[ "$NO_RESTART" == true || ( "$FORCE_REBUILD" == true && -n "$CANDIDATE_RUN" ) ]]; then
+            echo "Mac deployment requires a restart; force_rebuild cannot reuse a candidate." >&2
+            exit 1
+          fi
+          git fetch --no-tags origin "$REF"
+          commit=$(git rev-parse 'FETCH_HEAD^{commit}')
+          echo "sha=$commit" >> "$GITHUB_OUTPUT"
+          git show "$commit:Cargo.lock" > "$RUNNER_TEMP/source.Cargo.lock"
+          echo "lock_sha256=$(sha256sum "$RUNNER_TEMP/source.Cargo.lock" | cut -d ' ' -f 1)" >> "$GITHUB_OUTPUT"
+
+  mac-build:
+    needs: mac-source
+    if: inputs.mac_candidate_run_id == ''
+    uses: ./.github/workflows/deploy-mac-verifier.yml
+    with:
+      ref: ${{ needs.mac-source.outputs.sha }}
+
   mac-verifier:
-    if: inputs.node == 'zakura-mac-os' && (github.ref == 'refs/heads/main' || github.ref_name == vars.MAC_VERIFIER_DEPLOY_BRANCH)
+    needs: [mac-source, mac-build]
+    if: ${{ !cancelled() && inputs.node == 'zakura-mac-os' && (github.ref == 'refs/heads/main' || github.ref_name == vars.MAC_VERIFIER_DEPLOY_BRANCH) && (inputs.mac_operation != 'deploy' || (needs.mac-source.result == 'success' && (needs.mac-build.result == 'success' || (inputs.mac_candidate_run_id != '' && needs.mac-build.result == 'skipped')))) }}
     runs-on: ubuntu-24.04
     environment: mac-verifier-private
     timeout-minutes: 180
@@ -81,10 +119,18 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 0
+      - name: Download candidate built for this deployment
+        if: inputs.mac_operation == 'deploy' && inputs.mac_candidate_run_id == ''
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: mac-verifier-cranelift-${{ github.sha }}
+          path: ${{ runner.temp }}/mac-candidate
       - name: Operate private Mac verifier
         env:
           MAC_OPERATION: ${{ inputs.mac_operation }}
-          MAC_SOURCE_REF: ${{ inputs.ref }}
+          MAC_SOURCE_SHA: ${{ needs.mac-source.outputs.sha }}
+          MAC_SOURCE_LOCK_SHA256: ${{ needs.mac-source.outputs.lock_sha256 }}
+          MAC_CANDIDATE_DIR: ${{ runner.temp }}/mac-candidate
           MAC_CANDIDATE_RUN_ID: ${{ inputs.mac_candidate_run_id }}
           MAC_VERIFIER_DEPLOY_BRANCH: ${{ vars.MAC_VERIFIER_DEPLOY_BRANCH }}
           GH_TOKEN: ${{ github.token }}

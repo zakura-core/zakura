@@ -3,7 +3,7 @@ import unittest
 from pathlib import Path
 import subprocess
 import tempfile
-from qualify import qualifies, verify_backend_patch
+from qualify import qualifies, verify_backend_patch, verify_source
 
 
 class AcceptanceTests(unittest.TestCase):
@@ -21,6 +21,31 @@ class AcceptanceTests(unittest.TestCase):
     def test_process_failure_cannot_be_accepted(self):
         self.assertFalse(qualifies(1, 'test result: ok. 1 passed; 0 failed; 0 ignored;', True))
         self.assertFalse(qualifies(1, '', False))
+
+    def test_source_requires_requested_commit_and_clean_checkout(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory)
+            def git(*args):
+                return subprocess.check_output(['git', '-C', directory, *args], text=True).strip()
+            git('init', '-q')
+            (source / 'Cargo.lock').write_text('first lockfile\n')
+            git('add', '.')
+            git('-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid',
+                'commit', '-qm', 'first source')
+            first = git('rev-parse', 'HEAD')
+            verify_source(source, first)
+            (source / 'Cargo.lock').write_text('updated lockfile\n')
+            with self.assertRaises(ValueError):
+                verify_source(source, first)
+            git('add', '.')
+            git('-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid',
+                'commit', '-qm', 'second source')
+            second = git('rev-parse', 'HEAD')
+            verify_source(source, second)
+            with self.assertRaises(ValueError):
+                verify_source(source, first)
+            with self.assertRaises(ValueError):
+                verify_source(source, 'main')
 
     def test_backend_rejects_extra_staged_and_unstaged_changes(self):
         with tempfile.TemporaryDirectory() as directory:

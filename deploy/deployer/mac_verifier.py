@@ -185,7 +185,7 @@ REMOTE
     public_report({'mac': mac_info, 'reference': info})
 
 
-def validate_candidate(directory, source_sha):
+def validate_candidate(directory, source_sha, lock_sha256):
     """Require the complete compiler acceptance receipt for these exact bytes."""
     from common import digest
     receipt = json.loads((directory / 'receipt.json').read_text())
@@ -196,7 +196,10 @@ def validate_candidate(directory, source_sha):
     checks = receipt.get('checks', [])
     configuration = dict(panic='unwind', lto=False, build_jobs=1,
                          linker='apple-classic', standard_library='cranelift-static')
-    if (source_sha != manifest['source_sha'] or receipt.get('source_sha') != source_sha
+    if (not re.fullmatch(r'[a-f0-9]{40}', source_sha)
+            or not re.fullmatch(r'[a-f0-9]{64}', lock_sha256)
+            or receipt.get('source_sha') != source_sha
+            or receipt.get('cargo_lock_sha256') != lock_sha256
             or receipt.get('passed') is not True
             or receipt.get('configuration') != configuration
             or receipt.get('patch_sha256') != digest(PACKAGE / 'cranelift/macos-unwind.patch')
@@ -219,7 +222,8 @@ def download_candidate(run_id, directory):
     run = api('')
     if (run.get('head_repository', {}).get('full_name') != repository
             or run.get('head_branch') not in ['main', os.environ.get('MAC_VERIFIER_DEPLOY_BRANCH')]
-            or run.get('path') not in ['.github/workflows/mac-verifier.yml', '.github/workflows/deploy-mac-verifier.yml']):
+            or run.get('path') not in ['.github/workflows/mac-verifier.yml', '.github/workflows/deploy-mac-verifier.yml',
+                                       '.github/workflows/zakura-mainnet-deploy.yml']):
         raise ValueError('candidate must come from successful trusted Mac verifier CI')
     if run.get('status') != 'completed':
         print('Waiting for the selected Cranelift candidate to finish acceptance', flush=True)
@@ -243,10 +247,9 @@ def download_candidate(run_id, directory):
 
 
 def transitioned_receipt(old, candidate, now):
-    if (old['source_sha'] != candidate['source_sha']
-            or old['cargo_lock_sha256'] != candidate['cargo_lock_sha256']):
-        raise ValueError('this deployment requires the same pinned source and lockfile')
-    new = dict(old, binary_sha256=candidate['binary_sha256'], deployed_at=now,
+    new = dict(old, source_sha=candidate['source_sha'],
+               cargo_lock_sha256=candidate['cargo_lock_sha256'],
+               binary_sha256=candidate['binary_sha256'], deployed_at=now,
                compiler=candidate, toolchain=candidate['toolchain'])
     return new
 
@@ -368,8 +371,9 @@ def main():
     parser.add_argument('operation', choices=['status', 'dashboard', 'deploy'])
     args = parser.parse_args()
     check_address_history()
-    if os.environ.get('NO_RESTART') == 'true' or os.environ.get('FORCE_REBUILD') == 'true':
-        raise ValueError('Mac deployment consumes an accepted artifact and requires a restart')
+    if os.environ.get('NO_RESTART') == 'true' or (
+            os.environ.get('FORCE_REBUILD') == 'true' and os.environ.get('MAC_CANDIDATE_RUN_ID')):
+        raise ValueError('Mac deployment requires a restart; force_rebuild cannot reuse a candidate')
     identifier = os.environ['MAC_VERIFIER_ID']
     if not re.fullmatch(r'verifier-[a-f0-9]{32}', identifier):
         raise ValueError('invalid verifier identity')
@@ -377,9 +381,14 @@ def main():
         mac = SSH('MAC_VERIFIER_', directory)
         linux = SSH('MAC_VERIFIER_REFERENCE_', directory)
         if args.operation == 'deploy':
-            candidate_dir = Path(directory) / 'candidate'
-            download_candidate(os.environ['MAC_CANDIDATE_RUN_ID'], candidate_dir)
-            candidate = validate_candidate(candidate_dir, os.environ['MAC_SOURCE_REF'])
+            if os.environ.get('MAC_CANDIDATE_RUN_ID'):
+                candidate_dir = Path(directory) / 'candidate'
+                download_candidate(os.environ['MAC_CANDIDATE_RUN_ID'], candidate_dir)
+            else:
+                candidate_dir = Path(os.environ['MAC_CANDIDATE_DIR'])
+                (candidate_dir / 'target/release/zakurad').rename(candidate_dir / 'zakurad')
+            candidate = validate_candidate(candidate_dir, os.environ['MAC_SOURCE_SHA'],
+                                           os.environ['MAC_SOURCE_LOCK_SHA256'])
             deploy_candidate(mac, linux, candidate_dir, candidate)
         if args.operation in ('dashboard', 'deploy'):
             dashboard(linux)

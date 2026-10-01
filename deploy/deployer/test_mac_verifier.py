@@ -31,7 +31,7 @@ class CandidateTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.path = Path(self.temp.name)
         (self.path / 'zakurad').write_bytes(b'candidate binary')
-        self.source = json.loads((deploy.PACKAGE / 'corpus.json').read_text())['source_sha']
+        self.source = 'f' * 40
         names = ['unwind-probe-build', 'unwind-probe', 'double-panic', 'native-node-build']
         names += ['zakura-consensus-' + str(i) for i in range(8)]
         names += ['zakura-network-' + str(i) for i in range(2)]
@@ -45,7 +45,7 @@ class CandidateTests(unittest.TestCase):
 
     def validate(self, receipt=None):
         (self.path / 'receipt.json').write_text(json.dumps(receipt or self.receipt))
-        return deploy.validate_candidate(self.path, self.source)
+        return deploy.validate_candidate(self.path, self.source, 'a' * 64)
 
     def test_complete_candidate_accepts_only_the_recorded_binary(self):
         self.assertEqual(self.validate(), self.receipt)
@@ -55,7 +55,7 @@ class CandidateTests(unittest.TestCase):
 
     def test_partial_or_different_acceptance_is_rejected(self):
         changes = [dict(passed=False), dict(source_sha='b' * 40),
-                   dict(patch_sha256='c' * 64), dict(binary_architecture='x86_64'),
+                   dict(cargo_lock_sha256='b' * 64), dict(patch_sha256='c' * 64), dict(binary_architecture='x86_64'),
                    dict(checks=self.receipt['checks'][:-1]),
                    dict(configuration={**self.receipt['configuration'], 'panic': 'abort'})]
         failed = copy.deepcopy(self.receipt['checks'])
@@ -66,7 +66,7 @@ class CandidateTests(unittest.TestCase):
                 self.validate({**self.receipt, **change})
 
     def test_upgrade_preserves_bootstrap_and_configuration(self):
-        old = dict(source_sha=self.source, cargo_lock_sha256='a' * 64,
+        old = dict(source_sha='b' * 40, cargo_lock_sha256='c' * 64,
                    bootstrap_height=100, bootstrap_record={'hash': 'original anchor'},
                    config_sha256='d' * 64, binary_sha256='e' * 64, deployed_at=1,
                    snapshot={'original': 'snapshot'}, compiler='previous compiler')
@@ -76,8 +76,9 @@ class CandidateTests(unittest.TestCase):
         self.assertEqual(new['binary_sha256'], self.receipt['binary_sha256'])
         self.assertEqual(old['binary_sha256'], 'e' * 64)
         for key in ['source_sha', 'cargo_lock_sha256']:
-            with self.subTest(key=key), self.assertRaises(ValueError):
-                deploy.transitioned_receipt({**old, key: 'different'}, self.receipt, 2)
+            self.assertEqual(new[key], self.receipt[key])
+            self.assertNotEqual(new[key], old[key])
+
 
 
 if __name__ == '__main__':

@@ -2,7 +2,17 @@ name: Build Cranelift Mac verifier deployment candidate
 
 on:
   workflow_dispatch:
+    inputs:
+      ref:
+        description: "Zakura branch, tag, or SHA to build (blank uses workflow commit)"
+        type: string
+        default: ""
   workflow_call:
+    inputs:
+      ref:
+        description: "Zakura source ref; callers should pass a resolved commit"
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -24,7 +34,7 @@ jobs:
           persist-credentials: false
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: af944f5194ef2e9921bc96af017629450375013c
+          ref: ${{ inputs.ref || github.sha }}
           path: consensus-source
           persist-credentials: false
       - name: Prepare pinned native compiler
@@ -68,6 +78,7 @@ jobs:
         run: |
           python3 deploy/mac-verifier/cranelift/qualify.py \
             --backend "$RUNNER_TEMP/backend" --source "$GITHUB_WORKSPACE/consensus-source" \
+            --source-sha "$(git -C consensus-source rev-parse HEAD)" \
             --output "$RUNNER_TEMP/qualification"
       - name: Publish accepted binary and provenance
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

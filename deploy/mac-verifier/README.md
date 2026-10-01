@@ -6,8 +6,8 @@ runtime services, comparison tests and compiler acceptance evidence. Host setup,
 secret provisioning and snapshot import are outside this package. A CI
 workflow builds qualified Cranelift deployment candidates on an isolated Mac.
 
-The verifier uses pinned consensus source
-`af944f5194ef2e9921bc96af017629450375013c`. Imported finalized snapshot history is
+The verifier builds the branch, tag or SHA supplied as the deployment `ref`,
+resolved once to an immutable commit. Imported finalized snapshot history is
 trusted. Coverage starts at the recorded bootstrap height plus one; matching live
 results do not independently audit imported UTXOs/nullifiers or eliminate bugs
 shared by both nodes.
@@ -74,26 +74,39 @@ state or erase a gap to manufacture qualification.
 
 The existing mainnet deploy workflow accepts `node=zakura-mac-os` and uses the
 `mac-verifier-private` environment. It never sends the Mac through the Linux
-fleet deployer. Dispatch from the reviewed tooling branch with the full pinned
-consensus source SHA as `ref`:
+fleet deployer. Supply the same release tag or commit used for the reference
+nodes as `ref`. The workflow resolves it once, builds and qualifies that exact
+source on an isolated ARM64 runner, then installs the accepted artifact.
+For example, to deploy a chosen release tag from the reviewed tooling branch:
 
 ```sh
 gh workflow run zakura-mainnet-deploy.yml --repo zakura-core/zakura \
   --ref codex/mac-verifier-poc \
-  -f ref=af944f5194ef2e9921bc96af017629450375013c \
-  -f node=zakura-mac-os -f mac_operation=deploy \
-  -f mac_candidate_run_id=SUCCESSFUL_CANDIDATE_RUN_ID
+  -f ref=YOUR_RELEASE_TAG \
+  -f node=zakura-mac-os -f mac_operation=deploy
 ```
 
 Use `mac_operation=status` for read-only checks, or `mac_operation=dashboard`
 to restore the dashboard integration without restarting the node. Binary
-deployment requires a successful trusted candidate run, verifies its exact
-binary and acceptance receipt, and runs the executable on the destination
+deployment requires every compiler acceptance gate to pass, verifies the exact
+binary, source commit and lockfile against the requested ref, and runs the executable on the destination
 before replacement. It coordinates the Mac and Linux receipts, preserves the
 bootstrap anchor, configuration, comparison cursor, incidents and alert queue,
 and verifies new block progress and comparison before succeeding. A failed
 runtime check rolls back the binary and receipts while retaining observations.
-It preserves alert settings and rejects `no_restart` and `force_rebuild`.
+It preserves alert settings and rejects `no_restart`. Builds are fresh, including
+when `force_rebuild=true`. To reuse an accepted artifact, optionally supply
+`mac_candidate_run_id`; its source commit and lockfile must match the requested
+ref, and it cannot be combined with `force_rebuild=true`.
+
+Upgrades update the source and lockfile identity in both runtime receipts while
+preserving the original bootstrap evidence and comparison history. Qualification
+starts again for the new binary; earlier comparisons remain historical evidence,
+not proof that the new version reverified those blocks. Choose releases compatible
+with the existing node configuration and database; a binary rollback does not undo
+database migrations. The Rust nightly and Cranelift backend remain separately
+pinned. A release incompatible with that compiler or the required acceptance
+tests fails before any live installation.
 
 Until this PR is merged, a regular mainnet deployment from `main` can replace the
 dashboard script with a version that has no Mac support. The dashboard operation

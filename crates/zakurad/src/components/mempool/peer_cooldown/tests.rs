@@ -155,23 +155,36 @@ fn history_stays_bounded() {
 
     assert_eq!(cooldowns.len(), MAX_COOLDOWN_PEERS);
 
+    // The newest peer replaced the peer whose cooldown ends first.
     let first = IpAddr::V4(Ipv4Addr::from(0x0a00_0000));
     let last = IpAddr::V4(Ipv4Addr::from(
         0x0a00_0000 + u32::try_from(MAX_COOLDOWN_PEERS).expect("the peer bound fits in u32"),
     ));
-    assert!(cooldowns.is_cooling_down(first, start));
+    assert!(!cooldowns.peers().peers.contains_key(&first));
     assert!(cooldowns.is_cooling_down(last, start + Duration::from_secs(1)));
-    assert!(!cooldowns.peers().peers.contains_key(&last));
+    assert_eq!(cooldowns.peers().expirations.len(), MAX_COOLDOWN_PEERS);
+}
 
-    // The untracked peer can acquire a slot once the earliest cooldown ends.
-    assert!(!cooldowns.is_cooling_down(last, start + BASE_COOLDOWN));
+#[test]
+fn a_full_history_does_not_pause_untracked_peers() {
+    let start = Instant::now();
+    let cooldowns = PeerCooldowns::default();
+
+    for index in 0..MAX_COOLDOWN_PEERS {
+        let index = u32::try_from(index).expect("the peer bound fits in u32");
+        cooldowns
+            .record_invalid_transaction(IpAddr::V4(Ipv4Addr::from(0x0a00_0000 + index)), start);
+    }
+
+    // Every history holds an active cooldown, but a peer that never relayed an
+    // invalid transaction is not paused.
+    assert!(!cooldowns.is_cooling_down(PEER, start));
     assert_eq!(
-        cooldowns.record_invalid_transaction(last, start + BASE_COOLDOWN),
+        cooldowns.record_invalid_transaction(PEER, start),
         Some(BASE_COOLDOWN)
     );
-    assert!(!cooldowns.peers().peers.contains_key(&first));
-    assert!(cooldowns.peers().peers.contains_key(&last));
-    assert_eq!(cooldowns.peers().expirations.len(), MAX_COOLDOWN_PEERS);
+    assert!(cooldowns.is_cooling_down(PEER, start));
+    assert_eq!(cooldowns.len(), MAX_COOLDOWN_PEERS);
 }
 
 #[test]

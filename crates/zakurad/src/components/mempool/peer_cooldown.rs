@@ -77,27 +77,24 @@ impl Cooldown {
 impl PeerCooldowns {
     /// Returns true if transactions from `ip` should be ignored at `now`.
     pub fn is_cooling_down(&self, ip: IpAddr, now: Instant) -> bool {
-        let state = self.peers();
-        match state.peers.get(&ip.to_canonical()) {
-            Some(cooldown) => now < cooldown.until,
-            // Preserve active entries at capacity. Pause untracked peers until
-            // an expired entry can make room for their cooldown history.
-            None => {
-                state.peers.len() == MAX_COOLDOWN_PEERS
-                    && state
-                        .expirations
-                        .first()
-                        .is_some_and(|(until, _)| now < *until)
-            }
-        }
+        self.peers()
+            .peers
+            .get(&ip.to_canonical())
+            .is_some_and(|cooldown| now < cooldown.until)
     }
 
     /// Records an invalid transaction from `ip` at `now`.
     ///
     /// Returns the length of the cooldown this failure started, or `None` if
-    /// `ip` was already cooling down or all history slots hold active cooldowns.
-    /// Failures during a cooldown come from
+    /// `ip` was already cooling down. Failures during a cooldown come from
     /// transactions queued before it started, so they do not add strikes.
+    ///
+    /// When the history is full, a new IP address replaces the history whose
+    /// cooldown ends first, even if that cooldown is still active. Refusing
+    /// new addresses instead would let an attacker who fills the history
+    /// pause every honest peer it does not hold. An attacker with enough
+    /// addresses to evict a chosen entry can already rotate to fresh
+    /// addresses, so eviction gives it nothing new.
     pub fn record_invalid_transaction(&self, ip: IpAddr, now: Instant) -> Option<Duration> {
         let ip = ip.to_canonical();
         let mut state = self.peers();
@@ -105,12 +102,8 @@ impl PeerCooldowns {
         if !state.peers.contains_key(&ip) && state.peers.len() >= MAX_COOLDOWN_PEERS {
             // Each cooldown has one expiration, so a full history has a first
             // expiration.
-            let &(until, oldest) = state.expirations.first()?;
-            if now < until {
-                return None;
-            }
-            state.expirations.remove(&(until, oldest));
-            state.peers.remove(&oldest);
+            let (_until, earliest) = state.expirations.pop_first()?;
+            state.peers.remove(&earliest);
         }
 
         let mut cooldown = state.peers.get(&ip).copied().unwrap_or(Cooldown {

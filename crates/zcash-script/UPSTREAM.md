@@ -21,3 +21,6 @@ and forbids unsafe code in the owned interpreter.
 Zakura also adds raw P2SH redeem extraction. The counter accepts complete
 oversized pushes and clears pushed data after small-integer opcodes, matching
 C++ GetOp. Execution still applies the original push limit.
+
+Zakura omits the upstream release changelog because this private crate has no
+independent publication flow. CI preserves spelling in the pinned source.

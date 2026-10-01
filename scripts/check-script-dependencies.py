@@ -8,7 +8,7 @@ root = Path(__file__).resolve().parent.parent
 owned = root / "crates/zcash-script"
 for features in ["default-release-binaries", "default-release-binaries,portable"]:
     result = subprocess.run(
-        ["cargo", "tree", "--locked", "-p", "zakura", "--features", features,
+        ["cargo", "tree", "--color", "never", "--locked", "-p", "zakura", "--features", features,
          "--edges", "normal,build", "--prefix", "none", "--format", "{p}"],
         cwd=root, text=True, capture_output=True, check=True,
     )

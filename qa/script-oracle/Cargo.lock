@@ -3591,7 +3591,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-script"
-version = "4.0.0"
+version = "5.0.0"
 dependencies = [
  "thiserror",
  "zakura-chain",

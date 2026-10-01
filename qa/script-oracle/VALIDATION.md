@@ -17,7 +17,7 @@ Other builds ran on the host, so these runs do not qualify deployment performanc
 | Chain transaction unit tests | 93 passed |
 | Consensus unit tests | 274 passed; 1 ignored |
 | RPC `methods::types::` unit tests | 43 passed; 1 ignored |
-| Clippy for owned script, adapter, consensus, all targets | Passed with `-D warnings` |
+| Clippy for the complete workspace, all targets | Passed with `-D warnings` |
 | Clippy for oracle workspace, all targets | Passed with `-D warnings` |
 | Node release-feature check | Passed |
 | Node release-feature + portable check | Passed |
@@ -59,7 +59,6 @@ The [remaining gates](README.md#gates-before-merge) block merge and rollout.
 The private vendored package and workspace patch do not complete crates.io
 package delivery. No package publication, merge, or deployment has occurred.
 
-
 | Execution case | Rust mean | C++ mean | Rust change |
 | --- | ---: | ---: | ---: |
 | p2pkh | 27.946 µs | 26.789 µs | +4.3% |
@@ -76,3 +75,17 @@ The raw counting means for one complete push followed by CHECKSIG were about
 3–4 ns in Rust, versus 422–431 ns in C++ for 520/521-byte pushes and 7.60 µs
 for a 10,000-byte push. These counts exclude transaction script collection and
 hashing. These results establish no whole-node speedup.
+
+CI exposed integration gaps after the first push. The dependency check disables
+Cargo tree color. Node tests retain the adapter as a dev-dependency. Docker
+mounts the owned crate. Generated semver rustdoc workspaces apply the owned
+patch. The C++ counting wrapper suppresses
+an unused-parameter warning from its pinned header. Markdown and spelling checks
+pass locally. The source spelling check excludes the pinned upstream source and
+binary fuzz corpora. The adapter bumps to 5.0.0 for its error and sigops API changes.
+Consensus bumps to 11.0.0 because it removes the public FFI error conversion.
+These version bumps do not publish either crate or complete package delivery.
+
+Semver checks built the current and published baseline versions of both crates.
+The tool accepted the declared major bumps and skipped breaking-change lints
+for those major releases. Workspace Clippy checks all node test targets.

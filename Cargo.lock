@@ -7367,6 +7367,7 @@ dependencies = [
  "zakura-node-services",
  "zakura-orchard",
  "zakura-rpc",
+ "zakura-script",
  "zakura-state",
  "zakura-test",
  "zakura-utils",
@@ -7494,7 +7495,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-consensus"
-version = "10.0.0"
+version = "11.0.0"
 dependencies = [
  "blake2b_simd",
  "chrono",
@@ -8130,7 +8131,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-script"
-version = "4.0.0"
+version = "5.0.0"
 dependencies = [
  "hex",
  "lazy_static",

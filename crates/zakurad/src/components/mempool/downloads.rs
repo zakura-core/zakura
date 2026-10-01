@@ -174,6 +174,9 @@ pub enum TransactionDownloadVerifyError {
         /// The network upgrade that the transaction declares in its consensus
         /// branch ID, if any.
         transaction_network_upgrade: Option<NetworkUpgrade>,
+        /// True if the mempool queued this verification again after a chain tip
+        /// reset. The peer relayed the transaction before the reset.
+        retried_after_tip_reset: bool,
     },
 
     #[error("transaction was served by a peer in a transaction cooldown")]
@@ -389,16 +392,39 @@ where
     /// When `source` is `Some`, the per-peer cap
     /// [`MAX_INBOUND_CONCURRENCY_PER_PEER`] is enforced; crawler-driven and
     /// locally-pushed transactions pass `None` and are not capped per peer.
+    pub fn download_if_needed_and_verify(
+        &mut self,
+        gossiped_tx: Gossip,
+        source: Option<QueueSource>,
+        rsp_tx: Option<oneshot::Sender<Result<(), BoxError>>>,
+    ) -> Result<(), MempoolError> {
+        self.queue(gossiped_tx, source, rsp_tx, false)
+    }
+
+    /// Queue a transaction that was pending before a chain tip reset for
+    /// download (if needed) and verification.
+    ///
+    /// A failure can still ban `source`, but it does not start a cooldown,
+    /// because the peer relayed the transaction before the reset.
+    pub fn retry_after_tip_reset(
+        &mut self,
+        gossiped_tx: Gossip,
+        source: Option<QueueSource>,
+    ) -> Result<(), MempoolError> {
+        self.queue(gossiped_tx, source, None, true)
+    }
+
     #[instrument(
         skip(self, gossiped_tx, source, rsp_tx),
         fields(txid = %gossiped_tx.id(), source = tracing::field::Empty)
     )]
     #[allow(clippy::unwrap_in_result)]
-    pub fn download_if_needed_and_verify(
+    fn queue(
         &mut self,
         gossiped_tx: Gossip,
         source: Option<QueueSource>,
         mut rsp_tx: Option<oneshot::Sender<Result<(), BoxError>>>,
+        retried_after_tip_reset: bool,
     ) -> Result<(), MempoolError> {
         let txid = gossiped_tx.id();
         let source_label = source
@@ -580,6 +606,7 @@ where
                 tip_height,
                 transaction_version,
                 transaction_network_upgrade,
+                retried_after_tip_reset,
             })
         }
         .map_ok(|(tx, spent_mempool_outpoints, tip_height)| {
@@ -1279,6 +1306,14 @@ mod tests {
     /// the push-path attribution gap.
     #[tokio::test]
     async fn pushed_transaction_attributes_invalid_error_to_peer() {
+        for retried in [false, true] {
+            pushed_transaction_failure_attribution(retried).await;
+        }
+    }
+
+    /// Checks the peer attribution of a pushed transaction's verification
+    /// failure, after a chain tip reset if `retried`.
+    async fn pushed_transaction_failure_attribution(retried: bool) {
         use zakura_consensus::error::TransactionError;
 
         let peer_addr = PeerSocketAddr::from(([203, 0, 113, 7], 8233));
@@ -1305,15 +1340,16 @@ mod tests {
             PeerCooldowns::default(),
         );
 
-        downloads
-            .download_if_needed_and_verify(
-                Gossip::Tx(transaction),
-                Some(QueueSource::LegacySocket(
-                    peer_addr.remove_socket_addr_privacy(),
-                )),
-                None,
-            )
-            .expect("download is queued");
+        let gossip = Gossip::Tx(transaction);
+        let source = Some(QueueSource::LegacySocket(
+            peer_addr.remove_socket_addr_privacy(),
+        ));
+        if retried {
+            downloads.retry_after_tip_reset(gossip, source)
+        } else {
+            downloads.download_if_needed_and_verify(gossip, source, None)
+        }
+        .expect("download is queued");
 
         let result = tokio::time::timeout(Duration::from_secs(1), downloads.next())
             .await
@@ -1331,8 +1367,9 @@ mod tests {
                     advertiser_addr: Some(addr),
                     transaction_version: 5,
                     transaction_network_upgrade: Some(NetworkUpgrade::Nu5),
+                    retried_after_tip_reset,
                     ..
-                } if addr == peer_addr
+                } if addr == peer_addr && retried_after_tip_reset == retried
             ),
             "expected the pushed transaction failure to carry the peer address, version, and upgrade, got {error:?}"
         );

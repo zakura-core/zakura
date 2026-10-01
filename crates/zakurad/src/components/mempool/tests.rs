@@ -49,6 +49,7 @@ fn transaction_error_peer_log_labels_require_explicit_opt_in() {
         tip_height: None,
         transaction_version: 4,
         transaction_network_upgrade: None,
+        retried_after_tip_reset: false,
     };
 
     assert_eq!(
@@ -81,6 +82,7 @@ fn lock_time_and_maturity_failures_start_no_cooldown() {
         tip_height,
         transaction_version: 4,
         transaction_network_upgrade: None,
+        retried_after_tip_reset: false,
     };
 
     assert_eq!(
@@ -157,6 +159,7 @@ fn lock_time_and_maturity_failures_start_no_cooldown() {
         tip_height,
         transaction_version: 4,
         transaction_network_upgrade: None,
+        retried_after_tip_reset: false,
     };
     assert_eq!(
         transaction_cooldown_peer(
@@ -218,6 +221,7 @@ fn unshielded_coinbase_spends_ban_the_peer() {
         tip_height,
         transaction_version: 5,
         transaction_network_upgrade: None,
+        retried_after_tip_reset: false,
     };
     assert_eq!(transaction_ban_peer(&failure), Some(peer), "{error:?}");
     assert_eq!(

@@ -63,6 +63,7 @@ fn policy_rejection_does_not_start_a_cooldown() {
         tip_height: Some(block::Height(100)),
         transaction_version: 4,
         transaction_network_upgrade: None,
+        retried_after_tip_reset: false,
     };
     assert_eq!(
         transaction_cooldown_peer(
@@ -83,6 +84,7 @@ fn stale_verification_failures_do_not_start_cooldowns() {
         tip_height: Some(block::Height(100)),
         transaction_version: 4,
         transaction_network_upgrade: None,
+        retried_after_tip_reset: false,
     };
 
     assert_eq!(
@@ -115,12 +117,72 @@ fn context_dependent_failures_do_not_start_cooldowns() {
             tip_height: Some(block::Height(100)),
             transaction_version: 5,
             transaction_network_upgrade: None,
+            retried_after_tip_reset: false,
         };
         assert_eq!(
             transaction_cooldown_peer(&error, Some(block::Height(100)), NetworkUpgrade::Nu6_3),
             None
         );
     }
+}
+
+/// A chain tip reset can activate an upgrade or expire a pending transaction
+/// that was valid when the peer relayed it.
+#[test]
+fn failures_retried_after_a_tip_reset_ban_but_start_no_cooldown() {
+    let retried = |error, transaction_version| match relayed_transaction_failure(
+        error,
+        transaction_version,
+    ) {
+        TransactionDownloadVerifyError::Invalid {
+            error,
+            advertiser_addr,
+            tip_height,
+            transaction_version,
+            transaction_network_upgrade,
+            ..
+        } => TransactionDownloadVerifyError::Invalid {
+            error,
+            advertiser_addr,
+            tip_height,
+            transaction_version,
+            transaction_network_upgrade,
+            retried_after_tip_reset: true,
+        },
+        _ => unreachable!("relayed_transaction_failure returns an Invalid error"),
+    };
+
+    for (error, transaction_version) in [
+        (
+            TransactionError::UnsupportedByNetworkUpgrade(4, NetworkUpgrade::Nu7),
+            4,
+        ),
+        (
+            expired_transaction(block::Height(99), block::Height(101)),
+            5,
+        ),
+        (
+            TransactionError::Script(zakura_script::Error::ScriptInvalid),
+            4,
+        ),
+    ] {
+        let fresh = relayed_transaction_failure(error.clone(), transaction_version);
+        assert_eq!(
+            transaction_cooldown_peer(&fresh, Some(block::Height(100)), NetworkUpgrade::Nu6_3),
+            Some(test_peer()),
+            "{error:?}"
+        );
+
+        let failure = retried(error.clone(), transaction_version);
+        assert_eq!(
+            transaction_cooldown_peer(&failure, Some(block::Height(100)), NetworkUpgrade::Nu6_3),
+            None,
+            "{error:?}"
+        );
+    }
+
+    let failure = retried(TransactionError::NoInputs, 5);
+    assert_eq!(transaction_ban_peer(&failure), Some(test_peer()));
 }
 
 /// Returns a verification failure for a transaction that [`test_peer`] relayed.
@@ -134,6 +196,7 @@ fn relayed_transaction_failure(
         tip_height: Some(block::Height(100)),
         transaction_version,
         transaction_network_upgrade: None,
+        retried_after_tip_reset: false,
     }
 }
 
@@ -306,6 +369,35 @@ fn tip_dependent_failures_start_cooldowns() {
     }
 }
 
+/// Below NU5, the verifier does not check branch IDs, so a v5 transaction from
+/// a peer ahead of this node fails as an unsupported version.
+#[test]
+fn transactions_declaring_a_later_upgrade_start_no_cooldown() {
+    let failure = |transaction_network_upgrade| TransactionDownloadVerifyError::Invalid {
+        error: TransactionError::UnsupportedByNetworkUpgrade(5, NetworkUpgrade::Canopy),
+        advertiser_addr: Some(test_peer()),
+        tip_height: Some(block::Height(100)),
+        transaction_version: 5,
+        transaction_network_upgrade,
+        retried_after_tip_reset: false,
+    };
+
+    for (transaction_network_upgrade, cooldown_peer) in [
+        (Some(NetworkUpgrade::Nu5), None),
+        (Some(NetworkUpgrade::Canopy), Some(test_peer())),
+    ] {
+        assert_eq!(
+            transaction_cooldown_peer(
+                &failure(transaction_network_upgrade),
+                Some(block::Height(100)),
+                NetworkUpgrade::Canopy
+            ),
+            cooldown_peer,
+            "{transaction_network_upgrade:?}"
+        );
+    }
+}
+
 /// A node whose tip is before an upgrade can pass the tip distance check, so a
 /// transaction that declares a later upgrade starts no cooldown.
 #[test]
@@ -317,6 +409,7 @@ fn branch_id_mismatches_only_cool_down_peers_behind_the_tip() {
         tip_height,
         transaction_version: 5,
         transaction_network_upgrade,
+        retried_after_tip_reset: false,
     };
 
     for (transaction_network_upgrade, cooldown_peer) in [

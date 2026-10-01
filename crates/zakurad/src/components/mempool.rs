@@ -188,10 +188,17 @@ fn transaction_cooldown_peer(
         tip_height,
         transaction_version,
         transaction_network_upgrade,
+        retried_after_tip_reset,
     } = error
     else {
         return None;
     };
+
+    // A reset can activate an upgrade or expire a transaction, so a retried
+    // transaction can fail where it was valid when the peer relayed it.
+    if *retried_after_tip_reset {
+        return None;
+    }
 
     let cools_down = match peer_action(error) {
         PeerAction::Cooldown => true,
@@ -206,11 +213,16 @@ fn transaction_cooldown_peer(
     // Tip timestamps can be up to two hours in the future, so this node can
     // pass the tip distance check while its tip is before an upgrade that the
     // network has activated. A transaction that declares a later upgrade than
-    // the tip's shows that this node can be behind, so only a transaction that
-    // declares an earlier upgrade starts a cooldown.
-    if *error == TransactionError::WrongConsensusBranchId
-        && !transaction_network_upgrade.is_some_and(|upgrade| upgrade < tip_upgrade)
-    {
+    // the tip's shows that this node can be behind, so it starts no cooldown.
+    // Below NU5, the verifier does not check branch IDs, so such a transaction
+    // can fail with other errors.
+    if transaction_network_upgrade.is_some_and(|upgrade| upgrade > tip_upgrade) {
+        return None;
+    }
+
+    // A branch ID mismatch only starts a cooldown when the transaction declares
+    // an earlier upgrade than the tip's.
+    if *error == TransactionError::WrongConsensusBranchId && transaction_network_upgrade.is_none() {
         return None;
     }
 
@@ -1029,7 +1041,7 @@ impl Service<Request> for Mempool {
                 for (tx, source) in tx_retries {
                     // This is just an efficiency optimisation, so we don't care if queueing
                     // transaction requests fails.
-                    let _result = tx_downloads.download_if_needed_and_verify(tx, source, None);
+                    let _result = tx_downloads.retry_after_tip_reset(tx, source);
                 }
             }
 

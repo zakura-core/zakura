@@ -279,6 +279,7 @@ proptest! {
             tip_height: Some(block::Height(100)),
             transaction_version: 5,
             transaction_network_upgrade: None,
+            retried_after_tip_reset: false,
         };
 
         let should_ban = (error.mempool_misbehavior_score() != 0 && !is_scored_but_never_bans(&error))

@@ -1,9 +1,10 @@
 # Native Apple Silicon Cranelift build
 
-This optional compiler profile uses Cranelift for Rust machine-code generation,
+The Mac verifier compiler profile uses Cranelift for Rust machine-code generation,
 including the static standard library, with panic unwinding enabled. Zakura's
 consensus source stays at `af944f5194ef2e9921bc96af017629450375013c`.
-The default verifier builder continues to use Rust 1.97.1.
+The deployment candidate workflow uses this profile; there is no stable-Rust
+fallback for the Mac verifier.
 
 Build on an isolated Apple Silicon development host with no running verifier.
 The deployed Mac is not a compiler experiment host or a general CI runner.
@@ -38,14 +39,25 @@ rustup toolchain install nightly-2026-09-30 --profile minimal --component rust-s
 git clone https://github.com/rust-lang/rustc_codegen_cranelift.git "$backend_dir"
 git -C "$backend_dir" checkout --detach 05409775adc5f87a3aae12184486301f70ca519d
 git -C "$backend_dir" apply "$recipe_dir/macos-unwind.patch"
-python3 "$recipe_dir/prepare_std.py" --backend "$backend_dir"
+```
+
+Prepare a fresh `build/stdlib` directory in the backend checkout. Copy the pinned
+Rustup toolchain's `lib/rustlib/src/rust/library` directory into it as `library`,
+initialize a Git repository in that staging directory, and apply the backend's
+`patches/*-stdlib*.patch` files in filename order. In the staged
+`library/std/Cargo.toml`, change the sole
+`crate-type = ["dylib", "rlib"]` entry to `crate-type = ["rlib"]`.
+Do not modify Rustup's installed source or reuse an old staging directory.
+
+Then build the patched backend and prepared static standard library:
+
+```sh
 (cd "$backend_dir" && CARGO_BUILD_JOBS=1 ./y.sh build --panic-unwind-support --keep-sysroot)
 ```
 
-`prepare_std.py` copies the pinned Rust source, applies the upstream standard
-library patches and selects an rlib-only standard library. It refuses an existing
-staging directory and does not edit Rustup's installed source. The shared
-standard-library build is outside this qualified profile.
+The deployment candidate workflow performs these steps inline; there is no
+standalone host setup script in this package. Retain the prepared manifest and source/patch provenance with the
+acceptance evidence. The shared standard-library build is outside this profile.
 
 ## Acceptance and deployment
 
@@ -102,3 +114,13 @@ blocks. Full compiler conformance, independent review and sustained operational
 qualification remain separate gates. The compiler patch has not been submitted
 upstream. The verifier PR remains draft until its review and qualification gates
 are complete.
+
+## Deployment candidate CI
+
+The `Build Cranelift Mac verifier deployment candidate` workflow runs through
+Mac verifier PR CI and can also be dispatched manually. It uses a
+GitHub-hosted ARM64 Mac, never the live verifier. It builds the pinned backend and
+static standard library, invokes `qualify.py`, and publishes only `zakurad` and
+its acceptance receipt after every gate passes. A failed or timed-out build
+publishes no deployment artifact. Installation and identity coordination remain
+operator actions; an artifact is not evidence of deployment or live health.

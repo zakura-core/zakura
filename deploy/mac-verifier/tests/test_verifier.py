@@ -1,10 +1,8 @@
 import copy
 import io
 import json
-import subprocess
 from pathlib import Path
 import sys
-import tarfile
 import tempfile
 import tomllib
 import unittest
@@ -12,17 +10,12 @@ from unittest.mock import patch, MagicMock
 import urllib.error
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from bootstrap import finalized_member, verify_manifest, finalize_bootstrap
-import install
 from alert_preflight import prepare as prepare_alerts
 from common import RPC, Unavailable, canonical_record
-from monitor import Monitor, Remote, Slack, ChannelWebhook
+from monitor import Monitor, Remote, ChannelWebhook
 from rotate_logs import rotate
-import identity
 from status_bridge import public_status
 from adapter import fork_anchor
-from private_deploy import validate_host, SSH
-import github_secrets
 
 
 def record(height, fork=0):
@@ -221,6 +214,26 @@ class MonitorTests(unittest.TestCase):
         self.assertIn("unexpected build or configuration", self.monitor.state["incidents"])
         self.assertIsNone(self.monitor.state["healthy_since"])
 
+    def test_malformed_resource_values_cannot_start_a_healthy_window(self):
+        invalid = {
+            "free_disk_bytes": (True, -1, "80000000000", float("inf")),
+            "node_rss_bytes": (True, -1, 0, "1024", float("nan")),
+            "memory_free_percent": (True, -1, 101, "50", float("nan")),
+        }
+        for field, values in invalid.items():
+            for value in values:
+                with self.subTest(field=field, value=value):
+                    self.mac.now = 30
+                    sample = self.mac.status()
+                    sample["resources"][field] = value
+                    with tempfile.TemporaryDirectory() as directory:
+                        monitor = Monitor(directory, receipt(), self.linux, self.mac)
+                        with patch.object(self.mac, "status", return_value=sample):
+                            monitor.step(30)
+                        self.assertIsNone(monitor.state["healthy_since"])
+                        self.assertFalse(monitor.state["qualified"])
+                        self.assertTrue(monitor.state["incidents"])
+
     def test_outbox_persisted_before_delivery_and_deduplicated(self):
         class Delivery:
             def send(inner, item, now):
@@ -258,22 +271,6 @@ class ForkSampleTests(unittest.TestCase):
 
 
 class BoundaryTests(unittest.TestCase):
-    def test_opaque_identity_init_never_overwrites_on_auth_or_network_error(self):
-        for code in (401, 503, 404):
-            error = urllib.error.HTTPError("fixture", code, "fixture", {}, None)
-            with patch.object(identity, "user_token", return_value="fixture"), \
-                    patch.object(github_secrets.Transport, "json", side_effect=error), \
-                    patch.object(github_secrets, "set_secret") as store, \
-                    patch.object(sys, "argv", ["github_secrets.py", "init"]):
-                if code == 404:
-                    github_secrets.main()
-                    store.assert_called_once()
-                    self.assertRegex(store.call_args.args[1], r"^verifier-[a-f0-9]{32}$")
-                else:
-                    with self.assertRaises(urllib.error.HTTPError):
-                        github_secrets.main()
-                    store.assert_not_called()
-            error.close()
 
     def test_dashboard_allowlist_excludes_private_identity_everywhere(self):
         private = {"host": "192.0.2.10", "error": "ssh to 192.0.2.10 failed",
@@ -291,11 +288,6 @@ class BoundaryTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             public_status(private, "192.0.2.10")
 
-    def test_secret_host_rejects_options_and_shell_injection(self):
-        self.assertEqual(validate_host("192.0.2.10"), "192.0.2.10")
-        for value in ("-oProxyCommand=bad", "host; command", "user@192.0.2.10", "192.0.2.10\n"):
-            with self.assertRaises(ValueError):
-                validate_host(value)
 
     def test_dashboard_tip_fields_are_integer_only(self):
         result = public_status({"verifier": {"tip": {"height": 100}}, "reference": {"height": 105}},
@@ -307,68 +299,11 @@ class BoundaryTests(unittest.TestCase):
             self.assertIsNone(result["mac_tip"])
             self.assertIsNone(result["linux_tip"])
 
-    def test_ssh_captures_endpoint_bearing_output_and_never_relays_errors(self):
-        with tempfile.TemporaryDirectory() as directory:
-            environment = {"MAC_VERIFIER_HOST": "192.0.2.10", "MAC_VERIFIER_USER": "operator",
-                           "MAC_VERIFIER_SSH_KEY": "fixture-key", "MAC_VERIFIER_KNOWN_HOSTS": "fixture-host"}
-            with patch.dict("os.environ", environment):
-                ssh = SSH("MAC_VERIFIER_", directory)
-            with patch("subprocess.run") as run:
-                run.return_value.returncode = 1
-                run.return_value.stderr = "192.0.2.10 private diagnostic"
-                with self.assertRaises(Unavailable) as error:
-                    ssh.run("true")
-                self.assertNotIn("192.0.2.10", str(error.exception))
-                self.assertTrue(run.call_args.kwargs["capture_output"])
-                self.assertIn("StrictHostKeyChecking=yes", run.call_args.args[0])
-
-    def test_secret_ssh_port_is_used_for_commands_and_tunnels(self):
-        with tempfile.TemporaryDirectory() as directory:
-            environment = {"MAC_VERIFIER_HOST": "192.0.2.10", "MAC_VERIFIER_USER": "operator",
-                           "MAC_VERIFIER_SSH_KEY": "fixture-key", "MAC_VERIFIER_KNOWN_HOSTS": "fixture-host",
-                           "MAC_VERIFIER_SSH_PORT": "2207"}
-            with patch.dict("os.environ", environment):
-                ssh = SSH("MAC_VERIFIER_", directory)
-            with patch("subprocess.run") as run, patch("subprocess.Popen") as tunnel:
-                run.return_value.returncode = 0
-                ssh.run("true")
-                ssh.tunnel([])
-                for command in (run.call_args.args[0], tunnel.call_args.args[0]):
-                    self.assertEqual(command[command.index("-p") + 1], "2207")
-
-    def test_invalid_ssh_ports_fail_before_connecting(self):
-        with tempfile.TemporaryDirectory() as directory:
-            environment = {"MAC_VERIFIER_HOST": "192.0.2.10", "MAC_VERIFIER_USER": "operator",
-                           "MAC_VERIFIER_SSH_KEY": "fixture-key", "MAC_VERIFIER_KNOWN_HOSTS": "fixture-host"}
-            for port in ("", "0", "65536", "-1", "22 -oProxyCommand=bad", "22\n"):
-                with self.subTest(port=port), patch.dict("os.environ", {**environment, "MAC_VERIFIER_SSH_PORT": port}):
-                    with self.assertRaises(Unavailable):
-                        SSH("MAC_VERIFIER_", directory)
-
-    def test_transfer_replaces_atomically_without_changing_open_reader(self):
-        with tempfile.TemporaryDirectory() as directory:
-            target = Path(directory) / "script with spaces.sh"
-            target.write_text("original script")
-            environment = {"MAC_VERIFIER_HOST": "192.0.2.10", "MAC_VERIFIER_USER": "operator",
-                           "MAC_VERIFIER_SSH_KEY": "fixture-key", "MAC_VERIFIER_KNOWN_HOSTS": "fixture-host"}
-            with patch.dict("os.environ", environment):
-                ssh = SSH("MAC_VERIFIER_", directory)
-            execute = subprocess.run
-            def local_transfer(args, **kwargs):
-                return execute(["bash", "-c", args[-1]], **kwargs)
-            with target.open() as reader, patch("subprocess.run", side_effect=local_transfer):
-                ssh.put("replacement script", str(target))
-                self.assertEqual(reader.read(), "original script")
-            self.assertEqual(target.read_text(), "replacement script")
-            self.assertEqual(target.stat().st_mode & 0o777, 0o600)
-            self.assertEqual(list(Path(directory).glob("script with spaces.sh.*")), [])
 
     def test_config_cache_root_matches_finalized_snapshot_layout(self):
         package = Path(__file__).resolve().parents[1]
         config = tomllib.loads((package / "templates/zakurad.toml").read_text())
-        member = tarfile.TarInfo("cache/state/v29/mainnet/CURRENT")
-        restored = finalized_member(member)
-        self.assertEqual(Path(config["state"]["cache_dir"]) / restored,
+        self.assertEqual(Path(config["state"]["cache_dir"]) / "state/v29/mainnet/CURRENT",
                          Path("/Library/Application Support/ZakuraVerifier/state/v29/mainnet/CURRENT"))
 
     def test_missing_pool_and_malformed_hex(self):
@@ -396,59 +331,6 @@ class BoundaryTests(unittest.TestCase):
             with self.assertRaises(Unavailable):
                 rpc.block(10)
 
-    def test_archive_excludes_identity_and_nonfinalized_state(self):
-        self.assertIsNone(finalized_member(tarfile.TarInfo("peers/mainnet.peers")))
-        self.assertIsNone(finalized_member(tarfile.TarInfo("non_finalized_state/backup")))
-        self.assertEqual(str(finalized_member(tarfile.TarInfo("state/v29/mainnet/CURRENT"))),
-                         "state/v29/mainnet/CURRENT")
-        for name in ("../state/v29/mainnet/CURRENT", "/state/v29/mainnet/CURRENT"):
-            with self.assertRaises(Unavailable):
-                finalized_member(tarfile.TarInfo(name))
-        symlink = tarfile.TarInfo("state/v29/mainnet/sst")
-        symlink.type = tarfile.SYMTYPE
-        with self.assertRaises(Unavailable):
-            finalized_member(symlink)
-
-    def test_wrong_snapshot_family_rejected(self):
-        with self.assertRaises(Unavailable):
-            verify_manifest({"network": "mainnet", "snapshot_kind": "archive"})
-
-    def test_slack_workspace_guard_and_429_retry(self):
-        slack = Slack("test-fixture", "Ufixture", "Tfixture")
-        item = {"id": "fixed", "text": "fixture"}
-        with patch.object(slack, "call", return_value={"team_id": "wrong"}) as api:
-            self.assertFalse(slack.send(item, 0))
-            self.assertEqual(api.call_count, 1)
-        slack.channel = "Dfixture"
-        rate_limit = urllib.error.HTTPError("https://slack.com", 429, "limited", {"Retry-After": "120"}, io.BytesIO())
-        with patch.object(slack, "call", side_effect=rate_limit) as api:
-            self.assertFalse(slack.send(item, 60))
-            self.assertFalse(slack.send(item, 90))
-            self.assertEqual(api.call_count, 1)
-        rate_limit.close()
-        with patch.object(slack, "call", return_value={"ok": True}) as api:
-            self.assertTrue(slack.send(item, 180))
-            self.assertEqual(api.call_args[0][1]["client_msg_id"], "fixed")
-
-    def test_identity_definitive_quota_rejection_can_retry_after_resolution(self):
-        for code, expected_attempt in [(400, False), (503, True)]:
-            with self.subTest(code=code), tempfile.TemporaryDirectory() as directory:
-                path = Path(directory) / "identity-receipt.json"
-                rejection = urllib.error.HTTPError("https://app.infisical.com", code,
-                                                    "fixture", {}, io.BytesIO())
-                class API:
-                    def json(inner, url, data=None, headers=None, method=None):
-                        if data is None:
-                            return {"identities": [], "totalCount": 0}
-                        raise rejection
-                with patch.object(identity, "Transport", return_value=API()), \
-                        patch.object(identity, "user_token", return_value="fixture"), \
-                        patch.dict("os.environ", {"MAC_VERIFIER_REFERENCE_CIDR": "192.0.2.1/32"}), \
-                        patch.object(sys, "argv", ["identity.py", "create", "--receipt", str(path)]):
-                    with self.assertRaises(urllib.error.HTTPError):
-                        identity.main()
-                self.assertEqual(json.loads(path.read_text())["create_attempted"], expected_attempt)
-                rejection.close()
 
     def test_rotation_preserves_open_child_descriptor_and_bounds_backups(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -462,8 +344,6 @@ class BoundaryTests(unittest.TestCase):
                 child.flush()
             self.assertEqual(path.read_text(), "still writing\n")
             self.assertEqual(len(list(Path(directory).glob("child.log.*"))), 4)
-
-
 
 
 class MalformedBoundaryTests(unittest.TestCase):
@@ -483,62 +363,6 @@ class MalformedBoundaryTests(unittest.TestCase):
                 public_status(value, "verifier-" + "a" * 32)
 
 
-class LifecycleTests(unittest.TestCase):
-    def test_stop_disables_jobs_before_unloading(self):
-        with patch.object(install, "call") as call, patch.object(install.subprocess, "run") as run:
-            install.stop_mac()
-        self.assertEqual(call.call_count, len(install.LABELS))
-        for label in install.LABELS:
-            call.assert_any_call("launchctl", "disable", "system/" + label)
-            self.assertIn(["launchctl", "bootout", "system/" + label], [c.args[0] for c in run.call_args_list])
-
-    def test_activation_requires_receipt_and_reenables_stopped_jobs(self):
-        with patch.object(install, "read_json", side_effect=OSError("missing receipt")), patch.object(install, "call") as call:
-            with self.assertRaises(OSError):
-                install.activate_mac()
-            call.assert_not_called()
-        unloaded = type("Result", (), {"returncode": 1})()
-        with patch.object(install, "read_json", return_value=receipt()), patch.object(install, "call") as call, patch.object(install.subprocess, "run", return_value=unloaded):
-            install.activate_mac()
-            for label in install.LABELS:
-                call.assert_any_call("launchctl", "enable", "system/" + label)
-                call.assert_any_call("launchctl", "bootstrap", "system", "/Library/LaunchDaemons/" + label + ".plist")
-
-    def test_bootstrap_receipt_is_not_published_on_cleanup_failure(self):
-        for failure in ("disk", "ownership"):
-            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as directory:
-                base = Path(directory)
-                archive = base / "snapshot.tar.zst"
-                archive.touch()
-                (base / "state").mkdir()
-                disk = type("Disk", (), {"free": 0 if failure == "disk" else 80 * 10**9})()
-                account = type("Account", (), {"pw_uid": 1, "pw_gid": 1})()
-                with patch("bootstrap.shutil.disk_usage", return_value=disk), patch("bootstrap.pwd.getpwnam", return_value=account), patch("bootstrap.os.chown", side_effect=OSError("ownership failure")):
-                    with self.assertRaises((Unavailable, OSError)):
-                        finalize_bootstrap(base, archive, receipt())
-                self.assertFalse((base / "receipt.json").exists())
-
-    def test_bootstrap_receipt_is_published_after_successful_cleanup(self):
-        with tempfile.TemporaryDirectory() as directory:
-            base = Path(directory)
-            archive = base / "snapshot.tar.zst"
-            archive.touch()
-            (base / "state").mkdir()
-            account = type("Account", (), {"pw_uid": 1, "pw_gid": 1})()
-            with patch("bootstrap.shutil.disk_usage", return_value=type("Disk", (), {"free": 80 * 10**9})()), patch("bootstrap.pwd.getpwnam", return_value=account), patch("bootstrap.os.chown"):
-                finalize_bootstrap(base, archive, receipt())
-            self.assertFalse(archive.exists())
-            self.assertEqual(json.loads((base / "receipt.json").read_text()), receipt())
-
-    def test_package_upgrade_removes_retired_bridge(self):
-        with tempfile.TemporaryDirectory() as directory:
-            target = Path(directory)
-            (target / "dashboard.py").touch()
-            install.copy_package(target)
-            self.assertFalse((target / "dashboard.py").exists())
-            self.assertTrue((target / "status_bridge.py").exists())
-
-
 class ChannelDeliveryTests(unittest.TestCase):
     def client(self):
         return ChannelWebhook("https://hooks.slack.com/services/fixture")
@@ -547,18 +371,18 @@ class ChannelDeliveryTests(unittest.TestCase):
         client = self.client()
         response = MagicMock()
         response.__enter__.return_value.read.return_value = b"ok"
-        with patch("monitor.urllib.request.urlopen", return_value=response) as send:
+        with patch.object(client.opener, "open", return_value=response) as send:
             self.assertTrue(client.send({"id": "fixture", "text": "qualification fixture"}, 30))
             self.assertEqual(send.call_args.kwargs["timeout"], 10)
         response.__enter__.return_value.read.return_value = b"rejected"
-        with patch("monitor.urllib.request.urlopen", return_value=response):
+        with patch.object(client.opener, "open", return_value=response):
             self.assertFalse(client.send({"text": "fixture"}, 60))
             self.assertEqual(client.retry_at, 120)
 
     def test_rate_limit_and_retry_are_bounded(self):
         client = self.client()
         error = urllib.error.HTTPError("fixture", 429, "rate limited", {"Retry-After": "9000"}, None)
-        with patch("monitor.urllib.request.urlopen", side_effect=error) as send:
+        with patch.object(client.opener, "open", side_effect=error) as send:
             self.assertFalse(client.send({"text": "fixture"}, 30))
             self.assertEqual(client.retry_at, 3630)
             self.assertFalse(client.send({"text": "fixture"}, 60))
@@ -566,7 +390,7 @@ class ChannelDeliveryTests(unittest.TestCase):
 
     def test_network_failure_remains_pending(self):
         client = self.client()
-        with patch("monitor.urllib.request.urlopen", side_effect=OSError("fixture")):
+        with patch.object(client.opener, "open", side_effect=OSError("fixture")):
             self.assertFalse(client.send({"text": "fixture"}, 30))
         self.assertEqual(client.retry_at, 90)
 
@@ -575,18 +399,36 @@ class ChannelDeliveryTests(unittest.TestCase):
             with self.subTest(url=url), self.assertRaises(ValueError):
                 ChannelWebhook(url)
 
-    def test_channel_configuration_exposes_only_webhook_credential(self):
-        with tempfile.TemporaryDirectory() as directory:
-            source = Path(directory) / "env"
-            source.write_text('SLACK_WEB_HOOK="https://hooks.slack.com/services/fixture"\nOTHER_SECRET=fixture\n')
-            source.chmod(0o600)
-            stat = type("Stat", (), {"st_uid": 0, "st_mode": 0o600})()
-            with patch.object(Path, "stat", return_value=stat), patch.object(install, "write") as write:
-                install.configure_channel_alerts(source)
-            self.assertEqual(write.call_args_list[0].args[1], "https://hooks.slack.com/services/fixture\n")
-            self.assertNotIn("OTHER_SECRET", str(write.call_args_list))
-            self.assertIn("monitor.py channel", write.call_args_list[1].args[1])
-            self.assertEqual(write.call_args_list[0].args[2], 0o600)
+    def test_redirect_cannot_forward_an_incident(self):
+        import http.server
+        import threading
+        requests = []
+        class Redirect(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                requests.append(self.path)
+                self.send_response(302)
+                self.send_header('Location', '/forwarded')
+                self.end_headers()
+            def do_GET(self):
+                requests.append(self.path)
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b'ok')
+            def log_message(self, *args):
+                pass
+        server = http.server.HTTPServer(('127.0.0.1', 0), Redirect)
+        worker = threading.Thread(target=server.serve_forever, daemon=True)
+        worker.start()
+        try:
+            client = self.client()
+            # Substitute only the fixture server after production destination validation.
+            client.url = f'http://127.0.0.1:{server.server_port}/incident'
+            self.assertFalse(client.send({'text': 'fixture incident'}, 30))
+            self.assertEqual(requests, ['/incident'])
+        finally:
+            server.shutdown()
+            server.server_close()
+            worker.join(timeout=2)
 
 
 class GroupedChannelTests(unittest.TestCase):

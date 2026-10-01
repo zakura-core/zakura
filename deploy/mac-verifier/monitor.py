@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Durable sequential comparison, incident transitions and Slack DM delivery."""
+"""Durable sequential comparison and incident delivery to the fleet channel."""
 import argparse
 import contextlib
 import fcntl
@@ -36,48 +36,6 @@ class Remote:
         return canonical_record(self.get(f"/v1/block/{height}"), height)
 
 
-class Slack:
-    def __init__(self, token, user, team, transport=None):
-        self.token, self.user, self.team = token, user, team
-        self.transport = transport or Transport()
-        self.channel = None
-        self.retry_at = 0
-
-    def call(self, method, data):
-        result = self.transport.json("https://slack.com/api/" + method, data,
-                                     {"Authorization": "Bearer " + self.token})
-        if not result.get("ok"):
-            raise Unavailable("Slack delivery rejected")
-        return result
-
-    def send(self, item, now):
-        if now < self.retry_at:
-            return False
-        try:
-            if self.channel is None:
-                auth = self.call("auth.test", {})
-                if auth.get("team_id") != self.team:
-                    raise Unavailable("unexpected Slack workspace")
-                channel = self.call("conversations.open", {"users": self.user})["channel"]
-                if not channel["id"].startswith("D"):
-                    raise Unavailable("Slack destination is not a DM")
-                self.channel = channel["id"]
-            self.call("chat.postMessage", {"channel": self.channel, "text": item["text"],
-                                           "client_msg_id": item["id"],
-                                           "unfurl_links": False, "unfurl_media": False})
-            self.retry_at = 0
-            return True
-        except urllib.error.HTTPError as error:
-            try:
-                delay = int(error.headers.get("Retry-After", "60"))
-            except ValueError:
-                delay = 60
-            self.retry_at = now + min(3600, max(30, delay))
-        except (Unavailable, KeyError, TypeError):
-            self.retry_at = now + 60
-        return False
-
-
 class ChannelWebhook:
     """Deliver comparator transitions through the existing fleet channel webhook."""
     def __init__(self, url):
@@ -86,6 +44,7 @@ class ChannelWebhook:
                 or parsed.username or parsed.password or not parsed.path.startswith("/services/")):
             raise ValueError("invalid channel webhook")
         self.url = url
+        self.opener = Transport().opener
         self.retry_at = 0
 
     def send(self, item, now):
@@ -95,7 +54,7 @@ class ChannelWebhook:
             "unfurl_links": False, "unfurl_media": False}).encode(),
             {"Content-Type": "application/json"}, method="POST")
         try:
-            with urllib.request.urlopen(request, timeout=10) as response:
+            with self.opener.open(request, timeout=10) as response:
                 if response.read(32).strip() != b"ok":
                     raise Unavailable("channel delivery rejected")
             self.retry_at = 0
@@ -264,14 +223,19 @@ class Monitor:
             raise Unavailable("stale sample")
         integer(status["tip"]["height"])
         hex_bytes(status["tip"]["hash"], 32)
-        if status["resources"]["free_disk_bytes"] < 20 * 10**9:
+        disk = status["resources"].get("free_disk_bytes")
+        if type(disk) is not int or disk < 0:
+            raise Unavailable("invalid disk resource sample")
+        if disk < 20 * 10**9:
             self.incident("disk below 20 GB", True, now)
         else:
             self.incident("disk below 20 GB", False, now)
         memory = status["resources"].get("memory_free_percent")
         rss = status["resources"].get("node_rss_bytes")
-        self.incident("resource sample incomplete", memory is None or rss is None, now)
-        self.incident("memory pressure", memory is not None and memory < 10, now)
+        valid_memory = type(memory) is int and 0 <= memory <= 100
+        valid_rss = type(rss) is int and rss > 0
+        self.incident("resource sample incomplete", not (valid_memory and valid_rss), now)
+        self.incident("memory pressure", valid_memory and memory < 10, now)
 
     def pair(self, height):
         return self.linux.block(height), self.remote.block(height)
@@ -430,7 +394,7 @@ def exclusive(directory):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("command", choices=["run", "channel", "observe", "once", "status", "ack"])
+    parser.add_argument("command", choices=["channel", "observe", "once", "status", "ack"])
     parser.add_argument("--directory", default="/var/lib/zakura-mac-verifier")
     parser.add_argument("--receipt", default="/etc/zakura-mac-verifier/receipt.json")
     parser.add_argument("--incident")
@@ -440,9 +404,7 @@ def main():
         return
     with exclusive(args.directory):
         slack = None
-        if args.command == "run":
-            slack = Slack(os.environ["MAC_VERIFIER_SLACK_BOT_TOKEN"], "U0A81KAPYMR", "T0A80TZAXK5")
-        elif args.command == "channel":
+        if args.command == "channel":
             slack = ChannelWebhook((Path(os.environ["CREDENTIALS_DIRECTORY"]) / "slack-webhook").read_text().strip())
         monitor = Monitor(args.directory, read_json(args.receipt), slack=slack,
                           observation_only=args.command == "observe")

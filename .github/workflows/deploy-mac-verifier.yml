@@ -1,45 +1,80 @@
-name: Deploy private Mac verifier
+name: Build Cranelift Mac verifier deployment candidate
 
 on:
   workflow_dispatch:
-    inputs:
-      operation:
-        description: Private host operation
-        type: choice
-        required: true
-        default: preflight
-        options: [preflight, prepare, bootstrap, activate, status, stop]
+  workflow_call:
 
 permissions:
   contents: read
 
 concurrency:
-  group: private-mac-verifier-deployment
+  group: mac-verifier-candidate-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
-  deploy:
-    if: github.repository == 'zakura-core/zakura' && (github.ref == 'refs/heads/main' || github.ref_name == vars.MAC_VERIFIER_DEPLOY_BRANCH)
-    environment: mac-verifier-private
-    runs-on: ubuntu-24.04
-    timeout-minutes: 300
+  cranelift-macos:
+    runs-on: macos-15
+    timeout-minutes: 360
+    env:
+      CARGO_BUILD_JOBS: '1'
+      CARGO_TERM_COLOR: never
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Execute private operation
-        env:
-          OPERATION: ${{ inputs.operation }}
-          MAC_VERIFIER_TOOLING_SHA: ${{ github.sha }}
-          MAC_VERIFIER_HOST: ${{ secrets.MAC_VERIFIER_HOST }}
-          MAC_VERIFIER_USER: ${{ secrets.MAC_VERIFIER_USER }}
-          MAC_VERIFIER_SSH_PORT: ${{ secrets.MAC_VERIFIER_SSH_PORT }}
-          MAC_VERIFIER_SSH_KEY: ${{ secrets.MAC_VERIFIER_SSH_KEY }}
-          MAC_VERIFIER_KNOWN_HOSTS: ${{ secrets.MAC_VERIFIER_KNOWN_HOSTS }}
-          MAC_VERIFIER_REFERENCE_HOST: ${{ secrets.MAC_VERIFIER_REFERENCE_HOST }}
-          MAC_VERIFIER_REFERENCE_USER: ${{ secrets.MAC_VERIFIER_REFERENCE_USER }}
-          MAC_VERIFIER_REFERENCE_SSH_KEY: ${{ secrets.MAC_VERIFIER_REFERENCE_SSH_KEY }}
-          MAC_VERIFIER_REFERENCE_KNOWN_HOSTS: ${{ secrets.MAC_VERIFIER_REFERENCE_KNOWN_HOSTS }}
-          MAC_VERIFIER_TUNNEL_KEY: ${{ secrets.MAC_VERIFIER_TUNNEL_KEY }}
-          MAC_VERIFIER_ID: ${{ secrets.MAC_VERIFIER_ID }}
-        run: python3 deploy/mac-verifier/private_deploy.py "$OPERATION"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: af944f5194ef2e9921bc96af017629450375013c
+          path: consensus-source
+          persist-credentials: false
+      - name: Prepare pinned native compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -s)" = Darwin
+          test "$(uname -m)" = arm64
+          brew install cmake protobuf
+          rustup toolchain install nightly-2026-09-30 --profile minimal \
+            --component rust-src --component rustc-dev --component llvm-tools --component rustfmt
+          git clone https://github.com/rust-lang/rustc_codegen_cranelift.git "$RUNNER_TEMP/backend"
+          git -C "$RUNNER_TEMP/backend" checkout --detach 05409775adc5f87a3aae12184486301f70ca519d
+          git -C "$RUNNER_TEMP/backend" apply "$GITHUB_WORKSPACE/deploy/mac-verifier/cranelift/macos-unwind.patch"
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          import shutil
+          import subprocess
+          backend = Path(os.environ['RUNNER_TEMP']) / 'backend'
+          sysroot = Path(subprocess.check_output(
+              ['rustc', '+nightly-2026-09-30', '--print', 'sysroot'], text=True).strip())
+          target = backend / 'build/stdlib'
+          target.mkdir(parents=True, exist_ok=False)
+          shutil.copytree(sysroot / 'lib/rustlib/src/rust/library', target / 'library')
+          subprocess.run(['git', 'init', '-q', str(target)], check=True)
+          patches = sorted(p for p in (backend / 'patches').glob('*.patch')
+                           if p.name.partition('-')[2].startswith('stdlib'))
+          for patch in patches:
+              subprocess.run(['git', '-C', str(target), 'apply', str(patch)], check=True)
+          manifest = target / 'library/std/Cargo.toml'
+          contents = manifest.read_text()
+          original = 'crate-type = ["dylib", "rlib"]'
+          if contents.count(original) != 1:
+              raise SystemExit('unexpected pinned standard-library manifest')
+          manifest.write_text(contents.replace(original, 'crate-type = ["rlib"]'))
+          PY
+          cd "$RUNNER_TEMP/backend"
+          ./y.sh build --panic-unwind-support --keep-sysroot
+      - name: Build and qualify the Cranelift deployment candidate
+        run: |
+          python3 deploy/mac-verifier/cranelift/qualify.py \
+            --backend "$RUNNER_TEMP/backend" --source "$GITHUB_WORKSPACE/consensus-source" \
+            --output "$RUNNER_TEMP/qualification"
+      - name: Publish accepted binary and provenance
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: mac-verifier-cranelift-${{ github.sha }}
+          if-no-files-found: error
+          retention-days: 7
+          path: |
+            ${{ runner.temp }}/qualification/target/release/zakurad
+            ${{ runner.temp }}/qualification/receipt.json

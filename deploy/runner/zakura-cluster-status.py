@@ -1513,7 +1513,7 @@ class ClusterCollector:
                 dict(event) for event in chain.get("recent_reorgs", [])
             ]
         healthy = sum(1 for row in rows if row.get("healthy"))
-        payload = {
+        return {
             "generated_at": time.time(),
             "last_poll": last_poll,
             "stale_after": self.stale_after,
@@ -1523,7 +1523,6 @@ class ClusterCollector:
             "chain": chain,
             "rows": rows,
         }
-        return payload
 
     def ironwood_status(self, now: float | None = None) -> tuple[int, dict]:
         now = time.time() if now is None else now
@@ -2652,7 +2651,6 @@ footer {
   </header>
 
   <div class="banner" id="banner" hidden></div>
-
 
   <section class="panel pad" data-view="fleet">
     <div class="card-head">

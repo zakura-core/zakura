@@ -35,6 +35,14 @@ def qualifies(exit_code, output, exact=False):
     return exit_code == 0 and (not exact or EXACT_RESULT.search(output) is not None)
 
 
+def verify_backend_patch(backend, accepted):
+    """Reject tracked changes outside the accepted patch, including staged changes."""
+    patch = subprocess.check_output(['git', '-C', str(backend), 'diff', 'HEAD', '--'],
+                                    timeout=30)
+    if patch != Path(accepted).read_bytes():
+        raise ValueError('backend patch differs from accepted profile')
+
+
 def qualify(backend, source, output):
     backend, source, output = [Path(p).resolve() for p in (backend, source, output)]
     if (platform.system(), platform.machine()) != ('Darwin', 'arm64'):
@@ -48,11 +56,7 @@ def qualify(backend, source, output):
     if git(backend, 'rev-parse', 'HEAD') != UPSTREAM:
         raise ValueError('unexpected backend revision')
     # Verify the exact accepted patch, not merely its presence in a checkout.
-    patch = subprocess.check_output(['git', '-C', str(backend), 'diff', '--',
-                                    'src/debuginfo/unwind.rs', 'src/debuginfo/object.rs'],
-                                   timeout=30)
-    if patch != (RECIPE / 'macos-unwind.patch').read_bytes():
-        raise ValueError('backend patch differs from accepted profile')
+    verify_backend_patch(backend, RECIPE / 'macos-unwind.patch')
     if output == source or source in output.parents or output == backend or backend in output.parents:
         raise ValueError('output must be a fresh directory outside source checkouts')
     output.mkdir(parents=True, exist_ok=False)

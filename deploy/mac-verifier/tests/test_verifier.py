@@ -13,7 +13,7 @@ from common import RPC, Unavailable, canonical_record
 from comparison import Comparison, Remote, migrate
 from rotate_logs import rotate
 from status_bridge import public_status
-from adapter import fork_anchor
+from ssh_probe import fork_anchor
 
 
 def record(height, fork=0):

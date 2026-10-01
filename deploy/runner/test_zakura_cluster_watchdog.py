@@ -2149,11 +2149,9 @@ class MacComparisonLaneTests(unittest.TestCase):
 
     def observe(self, condition, now):
         def run(*args, **kwargs):
-            self.assertEqual(kwargs["timeout"], 15)
-            self.assertEqual(kwargs["stderr"], watchdog.subprocess.DEVNULL)
             (self.root / "status.json").write_text(json.dumps({
                 "condition": condition, "sample_time": now, "caught_up": condition == "matching"}))
-        with patch.object(watchdog.subprocess, "run", side_effect=run), patch.object(watchdog.time, "time", return_value=now):
+        with patch.object(watchdog, "run_comparison", side_effect=run), patch.object(watchdog.time, "time", return_value=now):
             self.lane.handle_mac_comparison(self.state, now, False)
 
     def test_existing_alert_lifecycle_deduplicates_and_recovers(self):
@@ -2177,7 +2175,7 @@ class MacComparisonLaneTests(unittest.TestCase):
         self.observe("matching", 1000)
         self.lane.release_state = [object()]
         with patch.object(self.lane, "handle_release_state") as other, \
-             patch.object(watchdog.subprocess, "run", side_effect=watchdog.subprocess.TimeoutExpired("private endpoint", 15)):
+             patch.object(watchdog, "run_comparison", side_effect=watchdog.subprocess.TimeoutExpired("private endpoint", 15)):
             self.lane.run_once(self.state)
         other.assert_called_once()
         sample = json.loads((self.root / "status.json").read_text())
@@ -2185,9 +2183,19 @@ class MacComparisonLaneTests(unittest.TestCase):
         self.assertEqual(sample["condition"], "unavailable")
         self.assertNotIn("private endpoint", json.dumps(sample))
 
+    def test_timeout_kills_entire_ssh_process_group(self):
+        with patch.object(watchdog.subprocess, "Popen") as launch, patch.object(watchdog.os, "killpg") as kill:
+            process = launch.return_value.__enter__.return_value
+            process.pid = 12345
+            process.wait.side_effect = [watchdog.subprocess.TimeoutExpired("comparison", 15), 0]
+            with self.assertRaises(watchdog.subprocess.TimeoutExpired):
+                watchdog.run_comparison(["comparison"])
+            self.assertTrue(launch.call_args.kwargs["start_new_session"])
+            kill.assert_called_once_with(12345, watchdog.signal.SIGKILL)
+
     def test_stale_success_is_unavailable(self):
         (self.root / "status.json").write_text(json.dumps({"sample_time": 1, "condition": "matching"}))
-        with patch.object(watchdog.subprocess, "run"):
+        with patch.object(watchdog, "run_comparison"):
             self.lane.handle_mac_comparison(self.state, 1000, False)
         self.assertEqual(self.state["mac_comparison"]["mainnet"]["condition"], "unavailable")
 

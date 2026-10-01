@@ -4,8 +4,7 @@ from pathlib import Path
 import shutil
 
 BASE = Path("/Library/Application Support/ZakuraVerifier/logs")
-LABELS = ("dev.valargroup.zakura-verifier-node", "dev.valargroup.zakura-verifier-adapter",
-          "dev.valargroup.zakura-verifier-tunnel")
+LABELS = ("dev.valargroup.zakura-verifier-node",)
 
 
 def rotate(path, limit=10 * 1024 * 1024):

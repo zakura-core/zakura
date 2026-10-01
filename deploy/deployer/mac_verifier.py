@@ -107,94 +107,155 @@ REMOTE
 
 
 
-def migrate_watchdog(linux):
-    """Shadow-check the new comparator, then transfer ownership with rollback."""
-    linux.run('sudo -n test ! -f /etc/systemd/system/zakura-fleet-watchdog.service.d/70-mac-comparison.conf')
-    runner = PACKAGE.parent / 'runner'
-    stage = linux.run('mktemp -d /var/tmp/zakura-comparison-ci.XXXXXX').strip()
-    if not re.fullmatch(r'/var/tmp/zakura-comparison-ci\.[A-Za-z0-9]+', stage):
+def probe_program():
+    source = (PACKAGE / 'ssh_probe.py').read_text()
+    shared_import = 'from common import RPC, Transport, Unavailable, MAX_JSON, digest, integer, read_json, hex_bytes\n'
+    if source.count(shared_import) != 1:
+        raise ValueError('unexpected probe imports')
+    return ((PACKAGE / 'common.py').read_text() + '\n' + source.replace(shared_import, '')).encode()
+
+
+def monitoring_config():
+    host = str(ipaddress.ip_address(os.environ['MAC_VERIFIER_HOST']))
+    user = os.environ['MAC_VERIFIER_USER']
+    port = os.environ.get('MAC_VERIFIER_SSH_PORT') or '22'
+    if not re.fullmatch(r'[a-zA-Z_][a-zA-Z0-9_-]{0,31}', user) or not port.isdecimal() or not 1 <= int(port) <= 65535:
+        raise ValueError('invalid private SSH configuration')
+    return (f'Host mac-verifier\n  HostName {host}\n  User {user}\n  Port {port}\n'
+            '  IdentityFile /etc/zakura-mac-verifier/ssh/id_ed25519\n'
+            '  UserKnownHostsFile /etc/zakura-mac-verifier/ssh/known_hosts\n'
+            '  StrictHostKeyChecking yes\n  IdentitiesOnly yes\n  BatchMode yes\n'
+            '  ConnectTimeout 4\n  ConnectionAttempts 1\n  ServerAliveInterval 3\n'
+            '  ServerAliveCountMax 1\n  LogLevel ERROR\n').encode()
+
+
+def migrate_ssh(mac, linux):
+    """Validate direct private SSH, preserve state, then retire the HTTP adapter."""
+    linux.run('sudo -n test -f /etc/systemd/system/zakura-fleet-watchdog.service.d/70-mac-comparison.conf')
+    stage = linux.run('mktemp -d /var/tmp/zakura-ssh-ci.XXXXXX').strip()
+    if not re.fullmatch(r'/var/tmp/zakura-ssh-ci\.[A-Za-z0-9]+', stage):
         raise ValueError('unexpected migration staging path')
-    for name, source in [('comparison.py', PACKAGE / 'comparison.py'),
-                         ('common.py', PACKAGE / 'common.py'),
-                         ('status_bridge.py', PACKAGE / 'status_bridge.py'),
-                         ('watchdog.py', runner / 'zakura-cluster-watchdog.py')]:
+    for name, source in [('comparison.py', PACKAGE / 'comparison.py'), ('common.py', PACKAGE / 'common.py'),
+                         ('watchdog.py', PACKAGE.parent / 'runner/zakura-cluster-watchdog.py')]:
         linux.put(source.read_bytes(), stage + '/' + name)
-    # No host output or private evidence is returned. Shadow work uses a copy.
-    print('Checking comparison against a copy of the current cursor', flush=True)
-    linux.run(f"""set -eu
+    # Generate a separate monitoring key on Linux; its private half never leaves.
+    linux.run('''set -eu
+sudo -n install -d -m 700 -o zakura-mac-verifier /etc/zakura-mac-verifier/ssh
+if ! sudo -n test -f /etc/zakura-mac-verifier/ssh/id_ed25519; then
+  sudo -n -u zakura-mac-verifier ssh-keygen -q -t ed25519 -N '' -f /etc/zakura-mac-verifier/ssh/id_ed25519
+fi
+''')
+    public_key = linux.run('sudo -n cat /etc/zakura-mac-verifier/ssh/id_ed25519.pub').strip()
+    if not re.fullmatch(r'ssh-ed25519 [A-Za-z0-9+/=]+(?: [^\r\n]*)?', public_key):
+        raise ValueError('invalid monitoring public key')
+    linux.put(monitoring_config(), '/etc/zakura-mac-verifier/ssh/config')
+    linux.put(os.environ['MAC_VERIFIER_KNOWN_HOSTS'].encode(), '/etc/zakura-mac-verifier/ssh/known_hosts')
+    linux.run('sudo -n chown zakura-mac-verifier /etc/zakura-mac-verifier/ssh/config /etc/zakura-mac-verifier/ssh/known_hosts\n'
+              'sudo -n chmod 600 /etc/zakura-mac-verifier/ssh/config /etc/zakura-mac-verifier/ssh/known_hosts')
+    mac.put(probe_program(), BASE + '/ssh_probe.py')
+    forced = f'sudo -n {MAC_PYTHON} -I -u ' + shlex.quote(BASE + '/ssh_probe.py')
+    entry = 'restrict,command="' + forced.replace('\\', '\\\\').replace('"', '\\"') + '" '
+    entry += ' '.join(public_key.split()[:2]) + ' zakura-comparison-readonly'
+    user = os.environ['MAC_VERIFIER_USER']
+    mac.run(f'''sudo -n {MAC_PYTHON} - <<'REMOTE'
+import os, pathlib, pwd
+base = pathlib.Path({BASE!r})
+assert base.stat().st_uid == 0 and not base.stat().st_mode & 0o022
+probe = base / 'ssh_probe.py'
+os.chown(probe, 0, 0)
+probe.chmod(0o644)
+account = pwd.getpwnam({user!r})
+directory = pathlib.Path(account.pw_dir) / '.ssh'
+directory.mkdir(mode=0o700, exist_ok=True)
+os.chown(directory, account.pw_uid, account.pw_gid)
+path = directory / 'authorized_keys'
+old = path.read_text() if path.exists() else ''
+lines = [line for line in old.splitlines() if not line.endswith(' zakura-comparison-readonly')]
+lines.append({entry!r})
+tmp = directory / 'authorized_keys.zakura-next'
+tmp.write_text('\\n'.join(lines) + '\\n')
+tmp.chmod(0o600)
+os.chown(tmp, account.pw_uid, account.pw_gid)
+tmp.replace(path)
+REMOTE
+''')
+    print('Checking direct SSH probe against the live adapter and Linux reference', flush=True)
+    linux.run(f'''set -eu
 sudo -n chmod 755 {stage}
-sudo -n mkdir {stage}/shadow
-sudo -n cp /var/lib/zakura-mac-verifier/cursor.json {stage}/shadow/cursor.json
-sudo -n python3 {stage}/comparison.py migrate --directory {stage}/shadow
-sudo -n timeout 20 python3 {stage}/comparison.py once --directory {stage}/shadow
-sudo -n python3 - <<'REMOTE'
-import json, pathlib
+sudo -n install -d -m 700 -o zakura-mac-verifier {stage}/shadow
+sudo -n cp -a /var/lib/zakura-mac-verifier/cursor.json {stage}/shadow/cursor.json
+sudo -n -u zakura-mac-verifier timeout 20 python3 {stage}/comparison.py once --directory {stage}/shadow
+sudo -n -u zakura-mac-verifier python3 - <<'REMOTE'
+import json, pathlib, sys
+sys.path.insert(0, '{stage}')
+from common import Transport
+from comparison import Remote
 sample = json.loads(pathlib.Path('{stage}/shadow/status.json').read_text())
 assert sample['condition'] in ('matching', 'catching_up')
+old = Transport().json('http://127.0.0.1:28233/v1/status')
+assert old['receipt'] == sample['verifier']['receipt']
+assert old['binary_sha256'] == sample['verifier']['binary_sha256']
+height = sample['compared_through']
+remote = Remote()
+try:
+    assert remote.block(height) == Transport().json(f'http://127.0.0.1:28233/v1/block/{{height}}')
+finally:
+    remote.close()
 REMOTE
-""", timeout=60)
-    print('Transferring comparison ownership to the fleet watchdog', flush=True)
-    # Back up at rest after stopping both possible writers. Keep these files for
-    # operator recovery; the old notification queue is never delivered.
-    linux.run(f"""set -eu
-trap 'sudo -n systemctl start zakura-mac-verifier zakura-fleet-watchdog' ERR
-sudo -n systemctl stop zakura-mac-verifier zakura-fleet-watchdog
+''', timeout=60)
+    linux.run(f'''set -eu
 sudo -n mkdir {stage}/backup
-sudo -n cp -a /var/lib/zakura-mac-verifier/cursor.json {stage}/backup/cursor.json
-sudo -n cp -a /var/lib/zakura-mac-verifier/status.json {stage}/backup/status.json
-sudo -n cp -a /opt/zakura-fleet-watchdog/zakura-cluster-watchdog.py {stage}/backup/watchdog.py
+sudo -n cp -a /opt/zakura-mac-verifier/comparison.py {stage}/backup/comparison.py
 sudo -n cp -a /opt/zakura-mac-verifier/common.py {stage}/backup/common.py
-sudo -n cp -a /opt/zakura-mac-verifier/status_bridge.py {stage}/backup/status_bridge.py
-sudo -n systemctl is-enabled zakura-mac-verifier > {stage}/backup/old-enabled || true
-""")
+sudo -n cp -a /opt/zakura-fleet-watchdog/zakura-cluster-watchdog.py {stage}/backup/watchdog.py
+sudo -n cp -a /var/lib/zakura-mac-verifier/cursor.json {stage}/backup/cursor.json
+''')
     try:
-        linux.run(f"""set -eu
+        linux.run(f'''set -eu
+sudo -n systemctl stop zakura-fleet-watchdog
 sudo -n install -m 644 {stage}/comparison.py /opt/zakura-mac-verifier/comparison.py
 sudo -n install -m 644 {stage}/common.py /opt/zakura-mac-verifier/common.py
-sudo -n install -m 644 {stage}/status_bridge.py /opt/zakura-mac-verifier/status_bridge.py
 sudo -n install -m 755 {stage}/watchdog.py /opt/zakura-fleet-watchdog/zakura-cluster-watchdog.py
-sudo -n -u zakura-mac-verifier python3 /opt/zakura-mac-verifier/comparison.py migrate
-sudo -n install -d -m 755 /etc/systemd/system/zakura-fleet-watchdog.service.d
-printf '[Service]\\nEnvironment=ZAKURA_MAC_COMPARISON=1\\nEnvironment=ZAKURA_MAC_COMPARISON_ALERTS=0\\n' | sudo -n tee /etc/systemd/system/zakura-fleet-watchdog.service.d/70-mac-comparison.conf >/dev/null
-sudo -n systemctl daemon-reload
-sudo -n systemctl disable zakura-mac-verifier
-sudo -n systemctl restart zakura-mac-verifier-dashboard
 sudo -n systemctl start zakura-fleet-watchdog
-""")
-        deadline = time.monotonic() + 600
+''')
+        # Only disable the old services after shadow checks proved direct access.
+        mac.run('''set -eu
+sudo -n launchctl bootout system/dev.valargroup.zakura-verifier-adapter
+sudo -n launchctl disable system/dev.valargroup.zakura-verifier-adapter
+sudo -n launchctl bootout system/dev.valargroup.zakura-verifier-tunnel
+sudo -n launchctl disable system/dev.valargroup.zakura-verifier-tunnel
+''')
         baseline = None
+        deadline = time.monotonic() + 600
         while time.monotonic() < deadline:
-            sample = json.loads(linux.run("sudo -n cat /var/lib/zakura-mac-verifier/status.json"))
-            if sample.get('condition') == 'matching' and sample.get('alerts_muted') is True:
+            sample = json.loads(linux.run('sudo -n cat /var/lib/zakura-mac-verifier/status.json'))
+            if sample.get('condition') == 'matching' and sample.get('verifier', {}).get('node_active') is True:
                 height = sample['compared_through']
                 if baseline is not None and height > baseline:
-                    linux.run('set -eu\nsudo -n systemctl is-active --quiet zakura-fleet-watchdog\n'
-                              '! sudo -n systemctl is-active --quiet zakura-mac-verifier')
-                    print('Fleet watchdog owns comparison; new blocks match; alerts remain muted')
+                    linux.run('sudo -n systemctl is-active --quiet zakura-fleet-watchdog')
+                    print('Direct SSH comparison advanced with adapter and tunnel disabled', flush=True)
                     return
                 baseline = height if baseline is None else baseline
             time.sleep(10)
-        raise RuntimeError('watchdog comparison did not advance')
+        raise RuntimeError('SSH comparison did not advance')
     except Exception:
-        print('Restoring previous comparison owner; retained migration evidence privately', flush=True)
-        linux.run(f"""set -eu
+        print('Restoring prior comparison transport; keeping all comparison history', flush=True)
+        mac.run('''set -eu
+for label in dev.valargroup.zakura-verifier-adapter dev.valargroup.zakura-verifier-tunnel; do
+  sudo -n launchctl enable system/$label
+  sudo -n launchctl print system/$label >/dev/null 2>&1 || sudo -n launchctl bootstrap system /Library/LaunchDaemons/$label.plist
+  sudo -n launchctl kickstart -k system/$label
+done
+''')
+        linux.run(f'''set -eu
 sudo -n systemctl stop zakura-fleet-watchdog
-sudo -n cp -a {stage}/backup/watchdog.py /opt/zakura-fleet-watchdog/zakura-cluster-watchdog.py
+sudo -n cp -a {stage}/backup/comparison.py /opt/zakura-mac-verifier/comparison.py
 sudo -n cp -a {stage}/backup/common.py /opt/zakura-mac-verifier/common.py
-sudo -n cp -a {stage}/backup/status_bridge.py /opt/zakura-mac-verifier/status_bridge.py
-sudo -n cp -a /var/lib/zakura-mac-verifier/cursor.json {stage}/backup/failed-cursor.json
-sudo -n cp -a {stage}/backup/cursor.json /var/lib/zakura-mac-verifier/cursor.json
-sudo -n cp -a {stage}/backup/status.json /var/lib/zakura-mac-verifier/status.json
-if sudo -n test -f /var/lib/zakura-mac-verifier/legacy-cursor.json; then
-  sudo -n mv /var/lib/zakura-mac-verifier/legacy-cursor.json {stage}/backup/legacy-cursor.json
-fi
-sudo -n rm -f /etc/systemd/system/zakura-fleet-watchdog.service.d/70-mac-comparison.conf
-sudo -n systemctl daemon-reload
-if grep -qx enabled {stage}/backup/old-enabled; then sudo -n systemctl enable zakura-mac-verifier; fi
-sudo -n systemctl start zakura-mac-verifier zakura-fleet-watchdog
-sudo -n systemctl restart zakura-mac-verifier-dashboard
-""")
+sudo -n cp -a {stage}/backup/watchdog.py /opt/zakura-fleet-watchdog/zakura-cluster-watchdog.py
+sudo -n systemctl start zakura-fleet-watchdog
+''')
         raise
+
 
 
 def public_report(value):
@@ -376,7 +437,7 @@ sudo -n {stage}/zakurad --version >/dev/null
     linux.run('set -eu\nsudo -n cp -p /etc/zakura-mac-verifier/receipt.json /etc/zakura-mac-verifier/receipt.json.previous\n'
               'sudo -n systemctl stop zakura-fleet-watchdog')
     try:
-        print('Replacing the Mac binary and restarting its node and adapter', flush=True)
+        print('Replacing the Mac binary and restarting its node', flush=True)
         mac.run(f'''set -eu
 sudo -n cp -p '{BASE}/bin/zakurad' '{BASE}/bin/zakurad.previous'
 sudo -n cp -p '{BASE}/receipt.json' '{BASE}/receipt.json.previous'
@@ -385,7 +446,6 @@ sudo -n mv -f '{BASE}/bin/zakurad.next' '{BASE}/bin/zakurad'
 sudo -n cp {stage}/receipt.json '{BASE}/receipt.json'
 sudo -n install -m 644 {stage}/acceptance.json '{BASE}/evidence/ci-acceptance.json'
 sudo -n launchctl kickstart -k system/dev.valargroup.zakura-verifier-node
-sudo -n launchctl kickstart -k system/dev.valargroup.zakura-verifier-adapter
 ''', timeout=300)
         print('Updating the Linux receipt while retaining comparison state', flush=True)
         linux.put((json.dumps(new) + '\n').encode(), '/etc/zakura-mac-verifier/receipt.json')
@@ -431,7 +491,6 @@ sudo -n cp -p '{BASE}/bin/zakurad.previous' '{BASE}/bin/zakurad.next'
 sudo -n mv -f '{BASE}/bin/zakurad.next' '{BASE}/bin/zakurad'
 sudo -n cp -p '{BASE}/receipt.json.previous' '{BASE}/receipt.json'
 sudo -n launchctl kickstart -k system/dev.valargroup.zakura-verifier-node
-sudo -n launchctl kickstart -k system/dev.valargroup.zakura-verifier-adapter
 ''', timeout=300)
         linux.run('''set -eu
 sudo -n cp -p /etc/zakura-mac-verifier/receipt.json.previous /etc/zakura-mac-verifier/receipt.json
@@ -469,7 +528,7 @@ def main():
         mac = SSH('MAC_VERIFIER_', directory)
         linux = SSH('MAC_VERIFIER_REFERENCE_', directory)
         if args.operation == 'migrate':
-            migrate_watchdog(linux)
+            migrate_ssh(mac, linux)
         if args.operation == 'deploy':
             if os.environ.get('MAC_CANDIDATE_RUN_ID'):
                 candidate_dir = Path(directory) / 'candidate'

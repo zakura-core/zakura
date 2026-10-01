@@ -16,6 +16,7 @@ import math
 import os
 import sys
 import subprocess
+import signal
 import time
 import tomllib
 import urllib.error
@@ -1118,6 +1119,23 @@ def record_decision(
     del history[:-MAX_DECISION_HISTORY]
 
 
+def run_comparison(command):
+    """Bound and reap both the comparison process and its SSH child."""
+    with subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                          user="zakura-mac-verifier", start_new_session=True) as process:
+        try:
+            code = process.wait(timeout=15)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.wait()
+            raise
+        if code:
+            raise subprocess.CalledProcessError(code, command)
+
+
 class Watchdog:
     def __init__(
         self,
@@ -1172,11 +1190,9 @@ class Watchdog:
         started = time.time()
         condition = "unavailable"
         try:
-            subprocess.run([sys.executable, str(self.args.mac_comparison), "once",
+            run_comparison([sys.executable, str(self.args.mac_comparison), "once",
                             "--directory", str(self.args.mac_comparison_state),
-                            "--receipt", str(self.args.mac_comparison_receipt)],
-                           check=True, timeout=15, stdout=subprocess.DEVNULL,
-                           stderr=subprocess.DEVNULL, user="zakura-mac-verifier")
+                            "--receipt", str(self.args.mac_comparison_receipt)])
             sample = json.loads(status_path.read_text())
             if not isinstance(sample, dict):
                 raise ValueError("malformed comparison result")

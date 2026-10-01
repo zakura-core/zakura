@@ -86,40 +86,63 @@ class MigrationTests(unittest.TestCase):
     class Host:
         def __init__(self, fail_install=False):
             self.scripts = []
+            self.files = {}
             self.height = 100
             self.fail_install = fail_install
         def put(self, data, path):
-            pass
+            self.files[path] = data
         def run(self, script, **kwargs):
             self.scripts.append(script)
             subprocess.run(['bash', '-n'], input=script, text=True, check=True, capture_output=True)
             if script.startswith('mktemp'):
-                return '/var/tmp/zakura-comparison-ci.fixture'
+                return '/var/tmp/zakura-ssh-ci.fixture'
+            if script.endswith('/ssh/id_ed25519.pub'):
+                return 'ssh-ed25519 AAAA fixture'
             if script == 'sudo -n cat /var/lib/zakura-mac-verifier/status.json':
                 self.height += 1
-                return json.dumps(dict(condition='matching', alerts_muted=True, compared_through=self.height))
+                return json.dumps(dict(condition='matching', verifier={'node_active': True}, compared_through=self.height))
             if self.fail_install and 'install -m 755' in script:
                 raise RuntimeError('fixture install failed')
             return ''
 
-    def test_migration_shadow_checks_before_cutover_and_disables_old_owner(self):
-        host = self.Host()
-        with patch.object(deploy.time, 'sleep'):
-            deploy.migrate_watchdog(host)
-        joined = '\n'.join(host.scripts)
-        self.assertLess(joined.index('/shadow/cursor.json'), joined.index('systemctl stop'))
-        self.assertIn('systemctl disable zakura-mac-verifier', joined)
-        self.assertIn('ZAKURA_MAC_COMPARISON_ALERTS=0', joined)
-        self.assertNotIn('launchctl', joined)
+    def setUp(self):
+        self.env = patch.dict(os.environ, {'MAC_VERIFIER_HOST': '198.51.100.42',
+                             'MAC_VERIFIER_USER': 'fixture', 'MAC_VERIFIER_SSH_PORT': '22',
+                             'MAC_VERIFIER_KNOWN_HOSTS': 'fixture-host-key'})
+        self.env.start()
+        self.addCleanup(self.env.stop)
 
-    def test_failed_cutover_restores_prior_owner_and_retains_evidence(self):
-        host = self.Host(fail_install=True)
+    def test_migration_shadow_checks_before_cutover_and_disables_old_owner(self):
+        mac, linux = self.Host(), self.Host()
+        with patch.object(deploy.time, 'sleep'):
+            deploy.migrate_ssh(mac, linux)
+        joined = '\n'.join(linux.scripts)
+        self.assertLess(joined.index('/shadow/cursor.json'), joined.index('systemctl stop'))
+        self.assertIn('bootout system/dev.valargroup.zakura-verifier-adapter', '\n'.join(mac.scripts))
+        self.assertIn('restrict,command=', '\n'.join(mac.scripts))
+        self.assertNotIn('SSH_KEY', ''.join(linux.files))
+        self.assertNotIn('198.51.100.42', '\n'.join(linux.scripts + mac.scripts))
+        self.assertIn(b'198.51.100.42', linux.files['/etc/zakura-mac-verifier/ssh/config'])
+        for script in mac.scripts + linux.scripts:
+            if "<<'REMOTE'\n" in script:
+                code = script.split("<<'REMOTE'\n", 1)[1].split('\nREMOTE', 1)[0]
+                compile(code, '<remote>', 'exec')
+
+    def test_failed_cutover_restores_transport_without_rewinding_coverage(self):
+        mac, linux = self.Host(), self.Host(fail_install=True)
         with self.assertRaises(RuntimeError):
-            deploy.migrate_watchdog(host)
-        rollback = host.scripts[-1]
-        self.assertIn('failed-cursor.json', rollback)
-        self.assertIn('systemctl start zakura-mac-verifier zakura-fleet-watchdog', rollback)
-        self.assertIn('/backup/cursor.json /var/lib/zakura-mac-verifier/cursor.json', rollback)
+            deploy.migrate_ssh(mac, linux)
+        rollback = linux.scripts[-1]
+        self.assertIn('/backup/comparison.py /opt/zakura-mac-verifier/comparison.py', rollback)
+        self.assertNotIn('cursor.json', rollback)
+        self.assertIn('launchctl bootstrap', mac.scripts[-1])
+
+    def test_assembled_probe_runs_in_isolated_python_without_repo_imports(self):
+        import sys
+        result = subprocess.run([sys.executable, '-I', '-c', deploy.probe_program().decode()],
+                                input='', text=True, capture_output=True, timeout=5)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, '')
 
 
 if __name__ == '__main__':

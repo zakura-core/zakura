@@ -13,18 +13,26 @@ audit imported UTXOs/nullifiers or eliminate bugs shared by both nodes.
 
 | Component | Responsibility |
 | --- | --- |
-| `adapter.py` | Mac loopback API for node samples, build identity and resources |
+| `ssh_probe.py` | Bounded read-only Mac probe invoked over SSH; no daemon or listener |
 | `comparison.py` | Bounded comparison invoked by the fleet watchdog |
 | `status_bridge.py` | Allowlisted status for the public dashboard |
 | `common.py` | Bounded RPC, canonical records and atomic state writes |
 | `rotate_logs.py` | Bound Mac launchd diagnostic logs |
 | `cranelift/qualify.py` | Build and test compiler acceptance candidates in CI |
 
-The adapter listens only on Mac loopback port `28233`; node RPC uses `28232`.
-The existing private SSH tunnel exposes the adapter on the reference host's
-loopback. Linux RPC uses loopback `8232`. No Mac address belongs in repository
-configuration, logs, alerts or public status. Deployment credentials remain in
-the existing private CI environment.
+The US reference host opens one SSH session per comparison cycle. A dedicated
+monitoring key is restricted to the root-owned read-only probe: no interactive
+shell, arbitrary command or port forwarding. The private key is generated on
+Linux and never leaves it. CI installs only its public half on the Mac. The probe
+uses the Mac node's existing loopback RPC on port `28232`; Linux RPC uses loopback
+`8232`. The adapter HTTP service and reverse tunnel are retired.
+
+Private connection settings and pinned host keys live under
+`/etc/zakura-mac-verifier/ssh`, readable only by the monitoring account/root.
+The dashboard reuses the resulting sample through the existing allowlisted status
+bridge; it never receives the SSH destination or adds it to public inventory.
+Deployment credentials stay in the private CI environment, and are not copied to
+the reference host.
 
 ## Comparison and alerts
 
@@ -38,7 +46,8 @@ search progress is saved across bounded invocations. Missing historical data
 cannot establish agreement, and an exhausted reorg window records a coverage gap.
 
 Network requests share a ten-second budget and individual two-second timeouts.
-The watchdog kills a comparison child exceeding fifteen seconds. Other fleet
+The watchdog kills the entire comparison/SSH process group after fifteen seconds.
+The remote probe also has a fifteen-second lifetime and bounded request count. Other fleet
 checks run first. Comparison outcomes are matching, catching up, unavailable,
 chain disagreement, confirmed tree mismatch and coverage gap.
 
@@ -59,17 +68,17 @@ addresses and peer identities never pass through the bridge.
 
 ## CI migration
 
-The mainnet workflow supports `node=zakura-mac-os` and `mac_operation=migrate`.
-It stages the new code and checks a copy of the existing cursor without sending
-notifications. It then stops the old comparator and watchdog, saves recovery
-copies, archives legacy alert state, and transfers comparison ownership to the
-watchdog. The old comparator service is disabled. Configuration, node binary,
-bootstrap anchor, cursor/history and mismatch evidence remain intact.
+The mainnet workflow supports `node=zakura-mac-os` and `mac_operation=migrate`
+to replace the HTTP adapter with direct SSH on the existing watchdog deployment.
+It installs the restricted monitoring key and probe, checks a copy of the existing
+cursor against Linux, and compares SSH results with the still-running adapter.
+Only after those checks pass does it switch the comparison client and disable
+the Mac adapter and reverse-tunnel launchd jobs. It never restarts the node.
 
-Migration succeeds only after the watchdog compares new blocks. Failure restores
-the previous scripts, cursor and service owner while retaining migration evidence
-privately. This operation is a one-time transition; subsequent binary deployments
-require the migrated lane. Do not run the retired service beside the watchdog.
+Migration succeeds only after new blocks are compared over SSH with both old
+services disabled. Failure restores the prior transport and services while
+retaining all comparison progress and evidence. Recovery files remain private.
+The node binary, configuration, database and alert settings are unchanged.
 
 ## Binary deployment
 

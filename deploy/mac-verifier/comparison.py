@@ -8,7 +8,8 @@ import json
 import os
 from pathlib import Path
 import time
-import urllib.error
+import select
+import subprocess
 
 from common import (RPC, Transport, Unavailable, atomic_json, canonical_record,
                     hex_bytes, integer, read_json)
@@ -23,22 +24,52 @@ class Disagreement(Unavailable):
 
 
 class Remote:
-    def __init__(self, url="http://127.0.0.1:28233", transport=None):
-        if url != "http://127.0.0.1:28233":
-            raise ValueError("adapter must use pinned loopback tunnel")
-        self.url, self.transport = url, transport or Transport()
+    """One private SSH session per cycle; no host addresses in diagnostics."""
+    def __init__(self, config="/etc/zakura-mac-verifier/ssh/config", deadline=None):
+        self.deadline = deadline or time.monotonic() + 10
+        self.buffer = b""
+        self.process = subprocess.Popen(
+            ["ssh", "-F", str(config), "-T", "mac-verifier"], stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
 
-    def get(self, path):
+    def close(self):
+        with contextlib.suppress(OSError):
+            self.process.stdin.close()
+        self.process.terminate()
         try:
-            return self.transport.json(self.url + path)
-        except urllib.error.HTTPError as error:
-            raise Unavailable(f"adapter HTTP {error.code}") from None
+            self.process.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            self.process.kill()
+            self.process.wait(timeout=1)
+        self.process.stdout.close()
+
+    def get(self, request):
+        if time.monotonic() >= self.deadline:
+            raise Unavailable("SSH sample unavailable")
+        try:
+            self.process.stdin.write((json.dumps(request) + "\n").encode())
+            self.process.stdin.flush()
+            while b"\n" not in self.buffer:
+                remaining = self.deadline - time.monotonic()
+                if remaining <= 0 or not select.select([self.process.stdout], [], [], remaining)[0]:
+                    raise Unavailable("SSH sample unavailable")
+                part = os.read(self.process.stdout.fileno(), 4096)
+                if not part or len(self.buffer) + len(part) > 256 * 1024:
+                    raise Unavailable("SSH sample unavailable")
+                self.buffer += part
+            line, self.buffer = self.buffer.split(b"\n", 1)
+            result = json.loads(line)
+            if not isinstance(result, dict) or "error" in result:
+                raise Unavailable("SSH sample unavailable")
+            return result
+        except (OSError, ValueError):
+            raise Unavailable("SSH sample unavailable") from None
 
     def status(self):
-        return self.get("/v1/status")
+        return self.get({"operation": "status"})
 
     def block(self, height):
-        return canonical_record(self.get(f"/v1/block/{height}"), height)
+        return canonical_record(self.get({"operation": "block", "height": integer(height)}), height)
 
 
 class Comparison:
@@ -230,6 +261,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command", choices=["once", "migrate"])
     parser.add_argument("--directory", default="/var/lib/zakura-mac-verifier")
+    parser.add_argument("--ssh-config", default="/etc/zakura-mac-verifier/ssh/config")
     parser.add_argument("--receipt", default="/etc/zakura-mac-verifier/receipt.json")
     args = parser.parse_args()
     with exclusive(args.directory):
@@ -238,8 +270,11 @@ def main():
             migrate(args.directory, expected)
         else:
             transport = Transport(timeout=2, deadline=time.monotonic() + 10)
-            Comparison(args.directory, expected, RPC("http://127.0.0.1:8232", transport),
-                       Remote(transport=transport)).step()
+            remote = Remote(args.ssh_config, deadline=transport.deadline)
+            try:
+                Comparison(args.directory, expected, RPC("http://127.0.0.1:8232", transport), remote).step()
+            finally:
+                remote.close()
 
 
 if __name__ == "__main__":

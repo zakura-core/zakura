@@ -10,6 +10,7 @@ import shlex
 import subprocess
 import sys
 import tempfile
+import time
 
 PACKAGE = Path(__file__).resolve().parents[1] / 'mac-verifier'
 sys.path.insert(0, str(PACKAGE))
@@ -51,12 +52,63 @@ class SSH:
             raise RuntimeError('remote operation failed (private output withheld)')
         return result.stdout
 
+    def put(self, data, path):
+        command = ('set -eu; umask 077; staged=$(mktemp); '
+                   'trap \'rm -f "$staged"\' EXIT; cat > "$staged"; '
+                   'sudo -n install -m 644 "$staged" ' + shlex.quote(path))
+        result = subprocess.run(self.command + [command], input=data,
+                                capture_output=True, timeout=120)
+        if result.returncode:
+            raise RuntimeError('private transfer failed')
+
+
+def dashboard(linux):
+    """Restore the integration that a regular fleet deployment can overwrite."""
+    target = '/opt/zakura-mainnet-dashboard/zakura-cluster-status.py'
+    linux.run('set -eu\nsudo -n test -f ' + target + '\nsudo -n cp -p ' + target + ' ' + target + '.previous')
+    linux.put((PACKAGE.parent / 'runner/zakura-cluster-status.py').read_bytes(), target)
+    try:
+        linux.run('''set -eu
+sudo -n install -d -m 755 /etc/systemd/system/zakura-mainnet-dashboard.service.d
+printf '[Service]\\nEnvironment=ZAKURA_PRIVATE_VERIFIER_STATUS=1\\n' | sudo -n tee /etc/systemd/system/zakura-mainnet-dashboard.service.d/70-private-verifier.conf >/dev/null
+sudo -n systemctl daemon-reload
+sudo -n systemctl restart zakura-mainnet-dashboard
+''')
+        deadline = time.monotonic() + 120
+        while time.monotonic() < deadline:
+            result = linux.run('''python3 - <<'REMOTE'
+import json, urllib.request
+try:
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    with opener.open('http://127.0.0.1:8090/data', timeout=10) as response:
+        rows = json.load(response)['rows']
+    print(json.dumps(any(row['name'] == 'zakura-mac-os' and row.get('height') for row in rows)))
+except Exception:
+    print('false')
+REMOTE
+''')
+            if json.loads(result):
+                print('Dashboard deployment verified: Mac row has a live height')
+                return
+            time.sleep(5)
+        raise RuntimeError('Mac row did not become available')
+    except Exception:
+        linux.run('set -eu\nsudo -n cp -p ' + target + '.previous ' + target + '\nsudo -n systemctl restart zakura-mainnet-dashboard')
+        raise
+
 
 def status(mac, linux, identifier):
     mac_info = json.loads(mac.run(f'''sudo -n {MAC_PYTHON} - <<'REMOTE'
-import json, pathlib, platform, subprocess
+import hashlib, json, pathlib, platform, subprocess
 base = pathlib.Path({BASE!r})
 result = {{'architecture': platform.machine(), 'receipt_present': (base / 'receipt.json').is_file()}}
+receipt = json.loads((base / 'receipt.json').read_text())
+with (base / 'bin/zakurad').open('rb') as stream:
+    actual = hashlib.file_digest(stream, 'sha256').hexdigest()
+result['binary_matches_receipt'] = actual == receipt.get('binary_sha256')
+result['binary_sha256'] = actual
+result['receipt_fields'] = sorted(receipt)
+result['compiler_evidence_files'] = sorted(str(p.relative_to(base / 'evidence')) for p in (base / 'evidence').rglob('*.json'))
 for name in ['node', 'adapter', 'tunnel']:
     check = subprocess.run(['launchctl', 'print', 'system/dev.valargroup.zakura-verifier-' + name], capture_output=True, text=True, timeout=10)
     result[name + '_running'] = check.returncode == 0 and 'state = running' in check.stdout
@@ -86,7 +138,7 @@ REMOTE
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('operation', choices=['status'])
+    parser.add_argument('operation', choices=['status', 'dashboard'])
     args = parser.parse_args()
     identifier = os.environ['MAC_VERIFIER_ID']
     if not re.fullmatch(r'verifier-[a-f0-9]{32}', identifier):
@@ -94,6 +146,8 @@ def main():
     with tempfile.TemporaryDirectory(prefix='mac-verifier-') as directory:
         mac = SSH('MAC_VERIFIER_', directory)
         linux = SSH('MAC_VERIFIER_REFERENCE_', directory)
+        if args.operation == 'dashboard':
+            dashboard(linux)
         status(mac, linux, identifier)
 
 

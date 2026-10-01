@@ -53,7 +53,7 @@ on:
       mac_operation:
         description: "Operation for the existing zakura-mac-os verifier"
         type: choice
-        options: [status]
+        options: [status, dashboard]
         default: status
 
 permissions:
@@ -73,7 +73,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Inspect private Mac verifier
+      - name: Operate private Mac verifier
         env:
           MAC_OPERATION: ${{ inputs.mac_operation }}
           MAC_VERIFIER_HOST: ${{ secrets.MAC_VERIFIER_HOST }}

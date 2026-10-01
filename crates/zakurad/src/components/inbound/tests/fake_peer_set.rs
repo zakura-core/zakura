@@ -1420,6 +1420,7 @@ async fn setup_with_misbehavior_receiver(
         latest_chain_tip.clone(),
         chain_tip_change.clone(),
         misbehavior_sender.clone(),
+        Vec::new(),
     );
 
     // Pretend we're close to tip

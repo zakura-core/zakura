@@ -560,6 +560,7 @@ fn setup(
         latest_chain_tip,
         chain_tip_change,
         tokio::sync::mpsc::channel(1).0,
+        Vec::new(),
     );
 
     let mut transaction_receiver = mempool_transaction_subscriber.subscribe();

@@ -1047,6 +1047,7 @@ async fn setup(
         latest_chain_tip.clone(),
         chain_tip_change.clone(),
         misbehavior_sender.clone(),
+        Vec::new(),
     );
 
     // Enable the mempool

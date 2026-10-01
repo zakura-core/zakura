@@ -2,7 +2,11 @@
 
 #![allow(clippy::unwrap_in_result)]
 
-use std::{sync::Arc, time::Duration};
+use std::{
+    net::{IpAddr, Ipv4Addr},
+    sync::Arc,
+    time::Duration,
+};
 
 use color_eyre::Report;
 use tokio::time::{self, timeout};
@@ -697,6 +701,124 @@ async fn assert_peer_error_starts_no_cooldown(
     );
 
     Ok(())
+}
+
+/// Check that the mempool never bans, cools down, or disconnects a
+/// zcashd-compat sidecar, whose tip trails this node's tip.
+#[tokio::test(flavor = "multi_thread")]
+async fn zcashd_compat_peer_is_never_penalized() -> Result<(), Report> {
+    let sidecar = PeerSocketAddr::from(([127, 0, 0, 1], 40000));
+    let mapped_sidecar = PeerSocketAddr::from((Ipv4Addr::LOCALHOST.to_ipv6_mapped(), 40001));
+    let other_peer = PeerSocketAddr::from(([203, 0, 113, 7], 8233));
+
+    // Test vectors from early Mainnet blocks are v1 and v2 transactions, so a
+    // script failure starts a cooldown and a missing input bans.
+    let script_invalid = TransactionError::Script(zakura_script::Error::ScriptInvalid);
+    for peer in [sidecar, mapped_sidecar] {
+        assert_eq!(
+            peer_penalties(peer, script_invalid.clone()).await,
+            (false, false)
+        );
+        assert_eq!(
+            peer_penalties(peer, TransactionError::NoInputs).await,
+            (false, false)
+        );
+    }
+
+    assert_eq!(
+        peer_penalties(other_peer, script_invalid).await,
+        (true, false)
+    );
+    assert_eq!(
+        peer_penalties(other_peer, TransactionError::NoInputs).await,
+        (false, true)
+    );
+
+    Ok(())
+}
+
+/// Relays a transaction from `peer` that fails with `error`, on a mempool
+/// configured with a zcashd-compat sidecar at `127.0.0.1`.
+///
+/// Returns whether the mempool started a cooldown for `peer`, and whether it
+/// banned `peer`.
+async fn peer_penalties(peer: PeerSocketAddr, error: TransactionError) -> (bool, bool) {
+    let network = Network::Mainnet;
+    let transaction = network
+        .unmined_transactions_in_blocks(2..)
+        .next()
+        .expect("mainnet test vectors contain an unmined transaction")
+        .transaction
+        .clone();
+    let (
+        mut mempool,
+        mut peer_set,
+        _state_service,
+        _chain_tip_change,
+        mut tx_verifier,
+        mut recent_syncs,
+        _mempool_transaction_receiver,
+    ) = setup_with_mempool_config(&network, mempool::Config::default(), true).await;
+    let (misbehavior_sender, mut misbehavior_receiver) = tokio::sync::mpsc::channel(1);
+    mempool.misbehavior_sender = misbehavior_sender;
+    mempool.zcashd_compat_peer_ips = [IpAddr::V4(Ipv4Addr::LOCALHOST)].into_iter().collect();
+    // Cooldowns only start when the mempool's validation context is current.
+    let _chain_tip_sender = mempool.use_current_chain_tip(&network);
+    mempool.enable(&mut recent_syncs).await;
+
+    let transaction_id = transaction.id();
+    let response = mempool
+        .ready()
+        .await
+        .expect("mempool service becomes ready")
+        .call(Request::QueueFromPeer {
+            transactions: vec![transaction_id.into()],
+            source: QueueSource::LegacySocket(peer.remove_socket_addr_privacy()),
+        })
+        .await
+        .expect("mempool service queues the peer transaction");
+    assert!(matches!(response, Response::Queued(results) if results.is_empty()));
+
+    peer_set
+        .expect_request_that(|request| {
+            matches!(request, zn::Request::TransactionsById(ids) if ids.contains(&transaction_id))
+        })
+        .await
+        .respond(zn::Response::Transactions(vec![
+            zn::InventoryResponse::Available((transaction, Some(peer))),
+        ]));
+    tx_verifier
+        .expect_request_that(|request| {
+            matches!(
+                request,
+                tx::Request::Mempool { transaction, .. } if transaction.id() == transaction_id
+            )
+        })
+        .await
+        .respond(Err(error));
+
+    timeout(Duration::from_secs(3), async {
+        while mempool.tx_downloads().in_flight() != 0 {
+            mempool.dummy_call().await;
+            time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("invalid transaction verification should finish");
+
+    let cooling_down = mempool
+        .peer_cooldowns
+        .is_cooling_down(peer.ip(), std::time::Instant::now());
+    let banned = match misbehavior_receiver.try_recv() {
+        Ok((banned_peer, score)) => {
+            assert_eq!(banned_peer, peer);
+            assert_eq!(score, zn::constants::MAX_PEER_MISBEHAVIOR_SCORE);
+            true
+        }
+        Err(_) => false,
+    };
+
+    (cooling_down, banned)
 }
 
 /// Check that an oversized peer transaction does not start a peer cooldown, but
@@ -3446,6 +3568,7 @@ async fn setup_with_mempool_config(
         latest_chain_tip,
         chain_tip_change.clone(),
         tokio::sync::mpsc::channel(1).0,
+        Vec::new(),
     );
 
     let mut mempool_transaction_receiver = mempool_transaction_subscriber.subscribe();

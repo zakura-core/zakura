@@ -22,6 +22,7 @@ use std::{
     collections::HashSet,
     future::Future,
     iter,
+    net::IpAddr,
     pin::{pin, Pin},
     task::{Context, Poll},
     time::{Duration, Instant},
@@ -410,6 +411,14 @@ fn peer_action(error: &TransactionError) -> PeerAction {
     }
 }
 
+/// Returns true if `peer` is a zcashd-compat sidecar in `zcashd_compat_peer_ips`.
+///
+/// A sidecar syncs from this node, so its tip trails this node's tip. It
+/// relays transactions that its wallet built for that older tip.
+fn is_zcashd_compat_peer(zcashd_compat_peer_ips: &HashSet<IpAddr>, peer: PeerSocketAddr) -> bool {
+    zcashd_compat_peer_ips.contains(&peer.ip().to_canonical())
+}
+
 /// The longest time the mempool waits for the peer set to accept a disconnect.
 const DISCONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -637,6 +646,10 @@ pub struct Mempool {
     /// depend on this node's tip.
     misbehavior_sender: mpsc::Sender<(PeerSocketAddr, u32)>,
 
+    /// The canonical IPs of zcashd-compat sidecars. The mempool never bans,
+    /// cools down, or disconnects these peers.
+    zcashd_compat_peer_ips: HashSet<IpAddr>,
+
     // Diagnostics
     //
     /// Queued transactions pending download or verification transmitter.
@@ -673,6 +686,7 @@ impl Mempool {
         latest_chain_tip: zs::LatestChainTip,
         chain_tip_change: ChainTipChange,
         misbehavior_sender: mpsc::Sender<(PeerSocketAddr, u32)>,
+        zcashd_compat_peer_ips: Vec<IpAddr>,
     ) -> (Self, MempoolTxSubscriber) {
         let (transaction_sender, _) =
             tokio::sync::broadcast::channel(gossip::MEMPOOL_CHANGE_CHANNEL_CAPACITY);
@@ -693,6 +707,10 @@ impl Mempool {
             transaction_sender,
             peer_cooldowns: peer_cooldown::PeerCooldowns::default(),
             misbehavior_sender,
+            zcashd_compat_peer_ips: zcashd_compat_peer_ips
+                .into_iter()
+                .map(|ip| ip.to_canonical())
+                .collect(),
             #[cfg(feature = "progress-bar")]
             queued_count_bar: None,
             #[cfg(feature = "progress-bar")]
@@ -1128,7 +1146,10 @@ impl Service<Request> for Mempool {
                     }
                     Ok(Err(boxed_err)) => {
                         let (tx_id, error) = *boxed_err;
-                        if let Some(peer) = transaction_ban_peer(&error) {
+                        let zcashd_compat_peer_ips = &self.zcashd_compat_peer_ips;
+                        let ban_peer = transaction_ban_peer(&error)
+                            .filter(|peer| !is_zcashd_compat_peer(zcashd_compat_peer_ips, *peer));
+                        if let Some(peer) = ban_peer {
                             let _ = self
                                 .misbehavior_sender
                                 .try_send((peer, zn::constants::MAX_PEER_MISBEHAVIOR_SCORE));
@@ -1140,7 +1161,8 @@ impl Service<Request> for Mempool {
                             .then(|| {
                                 transaction_cooldown_peer(&error, best_tip_height, tip_upgrade)
                             })
-                            .flatten();
+                            .flatten()
+                            .filter(|peer| !is_zcashd_compat_peer(zcashd_compat_peer_ips, *peer));
                         if let Some(peer) = cooldown_peer {
                             start_peer_cooldown(
                                 &self.peer_cooldowns,

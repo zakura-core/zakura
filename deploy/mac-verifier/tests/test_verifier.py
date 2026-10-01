@@ -271,6 +271,16 @@ class ForkSampleTests(unittest.TestCase):
 
 class BoundaryTests(unittest.TestCase):
 
+    def test_comparison_health_excludes_muting_but_includes_verification_failures(self):
+        base = {"caught_up": True, "error": None, "incidents": {"alert delivery unavailable": {}}}
+        identifier = "verifier-" + "a" * 32
+        self.assertTrue(public_status(base, identifier)["comparison_healthy"])
+        self.assertTrue(public_status(base, identifier)["alerts_muted"])
+        for change in [{"caught_up": False}, {"error": "unexpected build or configuration"},
+                       {"incidents": {"confirmed tree state mismatch": {}}}]:
+            with self.subTest(change=change):
+                self.assertFalse(public_status({**base, **change}, identifier)["comparison_healthy"])
+
     def test_dashboard_allowlist_excludes_private_identity_everywhere(self):
         private = {"host": "192.0.2.10", "error": "ssh to 192.0.2.10 failed",
                    "verifier": {"receipt": {"os": "private-host.local", "peer_id": "secret-peer"}},

@@ -65,13 +65,17 @@ class SSH:
 def dashboard(linux):
     """Restore the integration that a regular fleet deployment can overwrite."""
     target = '/opt/zakura-mainnet-dashboard/zakura-cluster-status.py'
+    bridge = '/opt/zakura-mac-verifier/status_bridge.py'
     linux.run('set -eu\nsudo -n test -f ' + target + '\nsudo -n cp -p ' + target + ' ' + target + '.previous')
-    linux.put((PACKAGE.parent / 'runner/zakura-cluster-status.py').read_bytes(), target)
+    linux.run('set -eu\nsudo -n cp -p ' + bridge + ' ' + bridge + '.previous')
     try:
+        linux.put((PACKAGE / 'status_bridge.py').read_bytes(), bridge)
+        linux.put((PACKAGE.parent / 'runner/zakura-cluster-status.py').read_bytes(), target)
         linux.run('''set -eu
 sudo -n install -d -m 755 /etc/systemd/system/zakura-mainnet-dashboard.service.d
 printf '[Service]\\nEnvironment=ZAKURA_PRIVATE_VERIFIER_STATUS=1\\n' | sudo -n tee /etc/systemd/system/zakura-mainnet-dashboard.service.d/70-private-verifier.conf >/dev/null
 sudo -n systemctl daemon-reload
+sudo -n systemctl restart zakura-mac-verifier-dashboard
 sudo -n systemctl restart zakura-mainnet-dashboard
 ''')
         deadline = time.monotonic() + 120
@@ -93,13 +97,14 @@ REMOTE
             time.sleep(5)
         raise RuntimeError('Mac row did not become available')
     except Exception:
+        linux.run('set -eu\nsudo -n cp -p ' + bridge + '.previous ' + bridge + '\nsudo -n systemctl restart zakura-mac-verifier-dashboard')
         linux.run('set -eu\nsudo -n cp -p ' + target + '.previous ' + target + '\nsudo -n systemctl restart zakura-mainnet-dashboard')
         raise
 
 
 def status(mac, linux, identifier):
     mac_info = json.loads(mac.run(f'''sudo -n {MAC_PYTHON} - <<'REMOTE'
-import hashlib, json, pathlib, platform, subprocess
+import hashlib, json, pathlib, platform, subprocess, tomllib
 base = pathlib.Path({BASE!r})
 result = {{'architecture': platform.machine(), 'receipt_present': (base / 'receipt.json').is_file()}}
 receipt = json.loads((base / 'receipt.json').read_text())
@@ -108,6 +113,11 @@ with (base / 'bin/zakurad').open('rb') as stream:
 result['binary_matches_receipt'] = actual == receipt.get('binary_sha256')
 result['binary_sha256'] = actual
 result['receipt_fields'] = sorted(receipt)
+compiler = receipt.get('compiler')
+result['compiler_metadata'] = compiler
+config = tomllib.loads((base / 'zakurad.toml').read_text())
+result['full_verification_enabled'] = (config.get('consensus', {{}}).get('checkpoint_sync') is False
+    and config.get('consensus', {{}}).get('vct_fast_sync') is False)
 result['compiler_evidence_files'] = sorted(str(p.relative_to(base / 'evidence')) for p in (base / 'evidence').rglob('*.json'))
 result['compiler_acceptance'] = []
 for path in (base / 'evidence').rglob('receipt.json'):
@@ -137,6 +147,14 @@ print(json.dumps(result))
 REMOTE
 '''))
     raw = info.pop('status')
+    # Compiler metadata is private input. Publish only recognized profile fields.
+    compiler = mac_info.pop('compiler_metadata')
+    if isinstance(compiler, dict):
+        mac_info['compiler_metadata_fields'] = sorted(compiler)
+        mac_info['compiler_profile'] = {key: compiler.get(key) for key in
+            ['backend_commit', 'patch_sha256', 'binary_sha256', 'panic', 'lto', 'build_jobs']}
+    else:
+        mac_info['compiler_metadata_type'] = type(compiler).__name__
     if raw:
         info['status'] = public_status(raw, identifier)
     print(json.dumps({'mac': mac_info, 'reference': info}, indent=2))

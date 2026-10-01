@@ -43,6 +43,10 @@ def public_status(status, identifier):
             and isinstance(anchor.get("hash"), str) and re.fullmatch(r"[a-fA-F0-9]{64}", anchor["hash"])):
         result["fork_anchor"] = {"height": anchor["height"], "hash": anchor["hash"]}
     result["active_incidents"] = len(status.get("incidents", {}))
+    result["comparison_healthy"] = (status.get("caught_up") is True
+        and status.get("error") is None
+        and not (set(status.get("incidents", {})) - {"alert delivery unavailable"}))
+    result["alerts_muted"] = "alert delivery unavailable" in status.get("incidents", {})
     result["pending_alerts"] = status.get("pending_alerts") if type(status.get("pending_alerts")) is int else None
     return result
 

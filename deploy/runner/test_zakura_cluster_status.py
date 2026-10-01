@@ -112,6 +112,7 @@ class PrivateVerifierTests(unittest.TestCase):
         collector = status.ClusterCollector([node("node-%02d" % n) for n in range(12)], 10, 300, "mainnet")
         sample = {"available": True, "verifier_id": "verifier-" + "a" * 32,
                   "mac_tip": 100, "mac_tip_hash": "b" * 64, "source_sha": "c" * 40,
+                  "comparison_healthy": True,
                   "compared_through": 90, "pending_alerts": 2, "node_rss_bytes": 1000}
         with mock.patch.dict(os.environ, {"ZAKURA_PRIVATE_VERIFIER_STATUS": "1"}), \
                 mock.patch.object(status, "private_verifier_status", return_value=sample), \
@@ -144,6 +145,20 @@ class PrivateVerifierTests(unittest.TestCase):
                 self.assertFalse(mac["healthy"])
                 self.assertIsNone(mac["height"])
             self.assertNotIn("verifiers", snapshot)
+
+    def test_advancing_mac_with_failed_comparison_is_not_healthy(self):
+        collector = status.ClusterCollector([node()], 10, 300, "mainnet")
+        sample = {"available": True, "mac_tip": 100, "mac_tip_hash": "b" * 64,
+                  "comparison_healthy": False, "compared_through": 90, "alerts_muted": True}
+        with mock.patch.dict(os.environ, {"ZAKURA_PRIVATE_VERIFIER_STATUS": "1"}), \
+                mock.patch.object(status, "private_verifier_status", return_value=sample), \
+                mock.patch.object(status, "probe_node", return_value={}):
+            collector.poll_once()
+        mac = next(row for row in collector.snapshot()["rows"] if row["name"] == "zakura-mac-os")
+        self.assertEqual(mac["height"], 100)
+        self.assertFalse(mac["healthy"])
+        self.assertEqual(mac["health"], "verification_error")
+        self.assertIn("Alerts muted", mac["detail"])
 
     def test_separate_verifier_section_is_removed(self):
         source = SCRIPT_PATH.read_text()

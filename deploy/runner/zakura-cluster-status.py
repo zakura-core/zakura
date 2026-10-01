@@ -1079,7 +1079,7 @@ def private_verifier_status() -> dict:
                     "active_incidents", "pending_alerts", "mac_tip", "linux_tip", "node_rss_bytes", "free_disk_bytes"):
             value = data.get(key)
             result[key] = value if type(value) in (int, float) and math.isfinite(value) else None
-        for key in ("caught_up", "qualified"):
+        for key in ("caught_up", "qualified", "comparison_healthy", "alerts_muted"):
             result[key] = data.get(key) is True
         for key in ("mac_tip_hash", "source_sha"):
             value = data.get(key)
@@ -1193,8 +1193,13 @@ class ClusterCollector:
                               "rss_bytes": sample.get("node_rss_bytes")}}
             row = self.row_for(mac, probe, time.time())
             row["fork_anchor"] = anchor
+            row["comparison_healthy"] = sample.get("comparison_healthy") is True
+            if row["healthy"] and not row["comparison_healthy"]:
+                row.update(healthy=False, health="verification_error", detail="Verification incomplete or inconsistent")
             row["detail"] += " · Compared through " + str(sample.get("compared_through") or "—")
-            if sample.get("pending_alerts"):
+            if sample.get("alerts_muted"):
+                row["detail"] += " · Alerts muted"
+            elif sample.get("pending_alerts"):
                 row["detail"] += " · Alerts pending"
             rows.append(row)
         rows.sort(key=lambda row: row["name"])
@@ -2935,7 +2940,7 @@ function formatRestarted(value) {
 
 /* ---------- tone mapping ---------- */
 const HEALTH_TONE = {
-  healthy: 'ok', stale: 'warn', rpc_error: 'bad', down: 'bad', starting: 'neutral',
+  healthy: 'ok', stale: 'warn', verification_error: 'bad', rpc_error: 'bad', down: 'bad', starting: 'neutral',
 };
 const CHAIN_TONE = {
   majority: 'ok', behind: 'warn', ahead: 'warn', fork: 'bad', unknown: 'neutral',
@@ -3045,7 +3050,7 @@ function renderFleet(data) {
     ? 'every node is active, serving RPC, and advancing'
     : unhealthy + ' node' + (unhealthy === 1 ? '' : 's') + ' need attention';
 
-  const order = ['healthy', 'stale', 'rpc_error', 'down', 'starting'];
+  const order = ['healthy', 'stale', 'verification_error', 'rpc_error', 'down', 'starting'];
   const present = order.filter((key) => counts[key]);
   for (const key of Object.keys(counts)) {
     if (!present.includes(key)) present.push(key);
@@ -3426,7 +3431,7 @@ function renderNodeHeader(data) {
     + (row.tip_event ? badge(tipEventLabel(row.tip_event) || row.tip_event, 'bad') : '');
 
   const pill = el('state-pill');
-  pill.textContent = { healthy: 'Healthy', stale: 'Stale', rpc_error: 'RPC error', down: 'Down' }[row.health]
+  pill.textContent = { healthy: 'Healthy', stale: 'Stale', verification_error: 'Verification error', rpc_error: 'RPC error', down: 'Down' }[row.health]
     || 'Starting';
   pill.className = 'state-pill is-' + (healthTone === 'neutral' ? 'warn' : healthTone);
 }

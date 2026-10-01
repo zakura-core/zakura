@@ -1138,9 +1138,7 @@ pub async fn test_mining_rpcs<State, ReadState>(
         .expect("We should have a success response");
     snapshot_rpc_getblocksubsidy("tip_height", get_block_subsidy, &settings);
 
-    let get_block_subsidy = rpc
-        .get_block_subsidy(Some(EXCESSIVE_BLOCK_HEIGHT))
-        .await;
+    let get_block_subsidy = rpc.get_block_subsidy(Some(EXCESSIVE_BLOCK_HEIGHT)).await;
     if is_zip234_active(network, block::Height(EXCESSIVE_BLOCK_HEIGHT)) {
         // Reissuance requires the parent's NSM balance, which this state lacks.
         let error = get_block_subsidy.expect_err("the requested parent is not in the state");

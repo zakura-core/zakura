@@ -105,6 +105,11 @@ class CandidateTests(unittest.TestCase):
 
 
 class DashboardTests(unittest.TestCase):
+    def setUp(self):
+        environment = patch.dict(os.environ, {'ZAKURA_MAC_CRANELIFT_HOST': '198.51.100.42'})
+        environment.start()
+        self.addCleanup(environment.stop)
+
     class Host:
         def __init__(self, fail_install=False):
             self.scripts, self.files = [], {}
@@ -135,6 +140,10 @@ class DashboardTests(unittest.TestCase):
         self.assertLess(commands.index("with opener.open"), commands.index("disable --now"))
         self.assertIn('/opt/zakura-fleet-watchdog/mac_cranelift_status.py', host.files)
         self.assertNotIn('receipt.json', ''.join(host.files))
+        self.assertEqual(json.loads(host.files['/etc/zakura-mainnet-dashboard/private/addresses.json']), ['198.51.100.42'])
+        self.assertIn('install -d -m 700', commands)
+        self.assertIn('chmod 600', commands)
+        self.assertNotIn('198.51.100.42', commands)
         self.assertNotIn('cursor.json', commands)
         self.assertNotIn('launchctl', commands)
         self.assertIn('/opt/zakura-mac-verifier/common.py', host.files)
@@ -173,6 +182,24 @@ class DashboardTests(unittest.TestCase):
         self.assertIn('ssh_probe.py.previous', '\n'.join(mac.scripts))
 
 
+class PublicAuditTests(unittest.TestCase):
+    def test_private_address_leak_fails_without_echoing_address(self):
+        for private, leaked in [('198.51.100.42', '198.51.100.42'),
+                                ('198.51.100.42', '::ffff:c633:642a'),
+                                ('2001:db8::42', '2001:0db8:0000:0000:0000:0000:0000:0042')]:
+            with self.subTest(leaked=leaked), patch.dict(os.environ, {'ZAKURA_MAC_CRANELIFT_HOST': private}), \
+                    patch('urllib.request.urlopen', return_value=io.BytesIO(json.dumps({'error':leaked}).encode())):
+                with self.assertRaises(ValueError) as caught:
+                    deploy.audit_public_privacy()
+                self.assertNotIn(private, str(caught.exception))
+                self.assertNotIn(leaked, str(caught.exception))
+
+    def test_linux_addresses_are_allowed_by_private_audit(self):
+        with patch.dict(os.environ, {'ZAKURA_MAC_CRANELIFT_HOST': '198.51.100.42'}), \
+                patch('urllib.request.urlopen', side_effect=lambda *a, **k: io.BytesIO(b'{"linux":"192.0.2.17"}')):
+            deploy.audit_public_privacy()
+
+
 class AlertEnablementTests(unittest.TestCase):
     def test_enablement_uses_watchdog_delivery_and_ephemeral_test_state(self):
         from unittest.mock import Mock
@@ -198,7 +225,7 @@ class HealthTests(unittest.TestCase):
             'full_verification_enabled', 'node_running', 'adapter_listener_closed']}
         self.mac.update(architecture='arm64', adapter_running=False, tunnel_running=False,
                         compiler_acceptance=[{'passed': True}])
-        self.reference = {name: True for name in ['monitoring_config_private', 'monitoring_key_restricted',
+        self.reference = {name: True for name in ['private_address_config_private', 'monitoring_config_private', 'monitoring_key_restricted',
             'reverse_listener_closed', 'dashboard_bridge_closed', 'dashboard_file_present',
             'dashboard_file_fresh', 'dashboard_file_healthy', 'dashboard_identity_matches',
             'dashboard_row_healthy', 'dashboard_mac_enabled', 'dashboard_supports_mac']}

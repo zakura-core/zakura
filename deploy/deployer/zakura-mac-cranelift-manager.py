@@ -90,7 +90,8 @@ def dashboard(mac, linux):
         '/opt/zakura-mac-verifier/common.py': PACKAGE / 'common.py',
     }
     dropin = '/etc/systemd/system/zakura-mainnet-dashboard.service.d/70-private-verifier.conf'
-    targets = [*files, dropin]
+    private_config = '/etc/zakura-mainnet-dashboard/private/addresses.json'
+    targets = [*files, dropin, private_config]
     for index, target in enumerate(targets):
         linux.run(f'''set -eu
 if sudo -n test -f {target}; then
@@ -110,6 +111,10 @@ fi
     started = time.time()
     try:
         linux.run('sudo -n systemctl stop zakura-fleet-watchdog')
+        linux.run('sudo -n install -d -m 700 -o root -g root /etc/zakura-mainnet-dashboard/private')
+        private_host = str(ipaddress.ip_address(os.environ['ZAKURA_MAC_CRANELIFT_HOST']))
+        linux.put(json.dumps([private_host]).encode(), private_config)
+        linux.run('sudo -n chmod 600 ' + private_config)
         for target, source in files.items():
             linux.put(source.read_bytes(), target)
         for name in mac_files:
@@ -305,6 +310,10 @@ try:
         result['dashboard_bridge_closed'] = False
 except OSError:
     result['dashboard_bridge_closed'] = True
+guard = pathlib.Path('/etc/zakura-mainnet-dashboard/private/addresses.json')
+result['private_address_config_private'] = guard.is_file() and all(
+    path.stat().st_uid == 0 and not path.stat().st_mode & 0o077
+    for path in [guard.parent, guard])
 public = pathlib.Path('/var/lib/zakura-mac-cranelift-public/status.json')
 result['dashboard_file_present'] = public.is_file()
 try:
@@ -346,13 +355,59 @@ REMOTE
         info['status'] = public_status(raw, identifier)
     public_report({'mac': mac_info, 'reference': info})
     require_healthy(mac_info, info)
+    configured = json.loads(linux.run('sudo -n cat /etc/zakura-mainnet-dashboard/private/addresses.json'))
+    expected_address = ipaddress.ip_address(os.environ['ZAKURA_MAC_CRANELIFT_HOST'])
+    if not isinstance(configured, list) or expected_address not in [ipaddress.ip_address(value) for value in configured]:
+        raise ValueError('private address protection does not match deployment secret')
+    audit_public_privacy()
+
+
+def audit_public_privacy():
+    import urllib.request
+    import urllib.parse
+    from html.parser import HTMLParser
+    private = ipaddress.ip_address(os.environ['ZAKURA_MAC_CRANELIFT_HOST'])
+    variants = {str(private), private.exploded}
+    if isinstance(private, ipaddress.IPv4Address):
+        mapped = ipaddress.ip_address('::ffff:' + str(private))
+        variants.update([str(mapped), mapped.exploded, '::ffff:' + str(private)])
+    class Scripts(HTMLParser):
+        def __init__(self):
+            super().__init__()
+            self.sources = []
+        def handle_starttag(self, tag, attrs):
+            if tag == 'script' and dict(attrs).get('src'):
+                self.sources.append(dict(attrs)['src'])
+    base = 'https://status.mainnet.zakura.valargroup.dev'
+    routes = ['/', '/node/zakura-mac-os', '/data', '/data/node/zakura-mac-os', '/ironwood-status.json']
+    for route in routes:
+        url = urllib.parse.urljoin(base, route)
+        with urllib.request.urlopen(url, timeout=15) as response:
+            payload = response.read(8 * 1024 * 1024 + 1)
+        if len(payload) > 8 * 1024 * 1024:
+            raise ValueError('public privacy audit response too large')
+        text = payload.decode()
+        try:
+            text = json.dumps(json.loads(text), ensure_ascii=False)
+        except ValueError:
+            pass
+        text = urllib.parse.unquote(text)
+        if any(value.lower() in text.lower() for value in variants):
+            raise ValueError('private Mac address found in public response; content withheld')
+        if route == '/':
+            parser = Scripts()
+            parser.feed(text)
+            if len(parser.sources) > 16:
+                raise ValueError('unexpected number of dashboard scripts')
+            routes.extend(parser.sources)
+    print('Exact private Mac address absent from public HTML, JavaScript and JSON', flush=True)
 
 
 def require_healthy(mac, reference):
     """A successful CI status check must establish current end-to-end health."""
     required_mac = ['receipt_present', 'binary_matches_receipt', 'full_verification_enabled',
                     'node_running', 'adapter_listener_closed']
-    required_reference = ['monitoring_config_private', 'monitoring_key_restricted',
+    required_reference = ['private_address_config_private', 'monitoring_config_private', 'monitoring_key_restricted',
         'reverse_listener_closed', 'dashboard_bridge_closed', 'dashboard_file_present',
         'dashboard_file_fresh', 'dashboard_file_healthy', 'dashboard_identity_matches',
         'dashboard_row_healthy', 'dashboard_mac_enabled', 'dashboard_supports_mac']

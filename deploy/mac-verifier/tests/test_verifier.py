@@ -141,6 +141,47 @@ class ComparisonTests(unittest.TestCase):
         self.assertEqual(json.loads((path.parent / "legacy-cursor.json").read_text()), old)
         migrate(self.temp.name, receipt())
 
+    def test_racing_tree_read_is_not_recorded_as_confirmed_mismatch(self):
+        original = self.mac.block
+        calls = 0
+        def changing(height):
+            nonlocal calls
+            value = original(height)
+            if height == 12:
+                calls += 1
+                if calls == 1:
+                    value["pools"]["orchard"]["root"] = "cd" * 32
+            return value
+        with patch.object(self.mac, "block", side_effect=changing):
+            self.step()
+        self.assertEqual(self.monitor.state["cursor"], 11)
+        self.assertFalse((Path(self.temp.name) / "incidents").exists())
+        self.step(60)
+        self.assertEqual(self.monitor.state["cursor"], 27)
+
+    def test_reorg_search_resumes_after_budget_exhaustion(self):
+        self.step()
+        self.step(60)
+        for chain in (self.linux, self.mac):
+            for height in range(15, 31):
+                chain.records[height] = record(height, 100)
+        original = self.monitor.pair
+        calls = 0
+        def limited(height):
+            nonlocal calls
+            calls += 1
+            if calls == 4:
+                raise Unavailable("time budget")
+            return original(height)
+        with patch.object(self.monitor, "pair", side_effect=limited):
+            self.step(90)
+        self.assertEqual(self.monitor.state["cursor"], 27)
+        self.assertIn("reorg_search", self.monitor.state)
+        self.monitor = Comparison(self.temp.name, receipt(), self.linux, self.mac)
+        self.step(120)
+        self.assertNotIn("reorg_search", self.monitor.state)
+        self.assertEqual(self.monitor.state["history"]["15"], record(15, 100)["hash"])
+
     def test_transport_budget_prevents_further_requests(self):
         from common import Transport
         transport = Transport(deadline=0)

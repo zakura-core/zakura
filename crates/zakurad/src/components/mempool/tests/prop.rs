@@ -265,7 +265,8 @@ proptest! {
     #![proptest_config(proptest::test_runner::Config::with_cases(2048))]
 
     /// Checks that every failure with a mempool misbehavior score bans the
-    /// relaying peer, except the failures in [`is_scored_but_never_bans`].
+    /// relaying peer, except the failures in [`is_scored_but_never_bans`], and
+    /// that the failures in [`is_unscored_but_bans`] also ban.
     ///
     /// The strategy skips script and signature errors.
     /// `upgrade_dependent_failures_ban_only_v5_and_later` covers them.
@@ -277,9 +278,11 @@ proptest! {
             advertiser_addr: Some(peer),
             tip_height: Some(block::Height(100)),
             transaction_version: 5,
+            transaction_network_upgrade: None,
         };
 
-        let should_ban = error.mempool_misbehavior_score() != 0 && !is_scored_but_never_bans(&error);
+        let should_ban = (error.mempool_misbehavior_score() != 0 && !is_scored_but_never_bans(&error))
+            || is_unscored_but_bans(&error);
         prop_assert_eq!(transaction_ban_peer(&failure), should_ban.then_some(peer), "{:?}", error);
     }
 }
@@ -295,11 +298,9 @@ fn is_scored_but_never_bans(error: &TransactionError) -> bool {
         WrongConsensusBranchId
             | MissingConsensusBranchId
             | DisabledAddToSproutPool
-            | DisabledAddToOrchardPool
             | LockedUntilAfterBlockHeight(_)
             | LockedUntilAfterBlockTime(_)
             | ImmatureTransparentCoinbaseSpend { .. }
-            | UnshieldedTransparentCoinbaseSpend { .. }
             // Only block verification returns these.
             | CoinbasePosition
             | CoinbaseAfterFirst
@@ -312,6 +313,22 @@ fn is_scored_but_never_bans(error: &TransactionError) -> bool {
             | CoinbaseOutputsNotDecryptable
             | CoinbaseExpiryBlockHeight { .. }
             | Subsidy(_)
+    )
+}
+
+/// Returns true for failures that have no mempool misbehavior score but ban the
+/// relaying peer, because they only depend on the transaction.
+fn is_unscored_but_bans(error: &TransactionError) -> bool {
+    use TransactionError::*;
+
+    matches!(
+        error,
+        DuplicateTransparentSpend(_)
+            | DuplicateSproutNullifier(_)
+            | DuplicateSaplingNullifier(_)
+            | DuplicateOrchardNullifier(_)
+            | DuplicateIronwoodNullifier(_)
+            | MaximumExpiryHeight { .. }
     )
 }
 

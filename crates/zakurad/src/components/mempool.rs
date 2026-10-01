@@ -40,6 +40,7 @@ use zakura_chain::{
     block::{self, Height},
     chain_sync_status::ChainSyncStatus,
     chain_tip::ChainTip,
+    parameters::NetworkUpgrade,
     transaction::UnminedTxId,
 };
 use zakura_consensus::{error::TransactionError, transaction};
@@ -149,7 +150,7 @@ pub(crate) fn is_estimated_close_to_network_tip(chain_tip_change: &ChainTipChang
 /// Returns the peer to ban for `error`, if the failure does not depend on this
 /// node's chain tip.
 ///
-/// [`ban_scope`] decides which transaction versions ban for each failure.
+/// [`peer_action`] decides which failures ban.
 fn transaction_ban_peer(error: &TransactionDownloadVerifyError) -> Option<PeerSocketAddr> {
     let TransactionDownloadVerifyError::Invalid {
         error,
@@ -161,46 +162,101 @@ fn transaction_ban_peer(error: &TransactionDownloadVerifyError) -> Option<PeerSo
         return None;
     };
 
-    let bans = match ban_scope(error) {
-        BanScope::EveryVersion => true,
-        BanScope::V5AndLater => *transaction_version >= 5,
-        BanScope::Never => false,
+    let bans = match peer_action(error) {
+        PeerAction::Ban => true,
+        PeerAction::BanV5AndLater => *transaction_version >= 5,
+        PeerAction::Cooldown | PeerAction::Ignore => false,
     };
 
     bans.then_some(*advertiser_addr)
 }
 
-/// The transaction versions for which a verification failure bans the
-/// relaying peer.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum BanScope {
-    /// The failure only depends on the transaction and the outputs it spends.
-    EveryVersion,
+/// Returns the peer to put in a transaction cooldown for `error`, if any.
+///
+/// [`peer_action`] decides which failures start a cooldown. Failures without a
+/// legacy advertiser address do not, and neither do failures verified against
+/// a tip other than `best_tip_height`. `tip_upgrade` is the network upgrade of
+/// the block after `best_tip_height`.
+fn transaction_cooldown_peer(
+    error: &TransactionDownloadVerifyError,
+    best_tip_height: Option<block::Height>,
+    tip_upgrade: NetworkUpgrade,
+) -> Option<PeerSocketAddr> {
+    let TransactionDownloadVerifyError::Invalid {
+        error,
+        advertiser_addr: Some(advertiser_addr),
+        tip_height,
+        transaction_version,
+        transaction_network_upgrade,
+    } = error
+    else {
+        return None;
+    };
 
-    /// The failure depends on the network upgrade that this node verifies the
-    /// transaction under.
+    let cools_down = match peer_action(error) {
+        PeerAction::Cooldown => true,
+        PeerAction::BanV5AndLater => *transaction_version < 5,
+        PeerAction::Ban | PeerAction::Ignore => false,
+    };
+
+    if !cools_down || tip_height.is_none() || *tip_height != best_tip_height {
+        return None;
+    }
+
+    // Tip timestamps can be up to two hours in the future, so this node can
+    // pass the tip distance check while its tip is before an upgrade that the
+    // network has activated. A transaction that declares a later upgrade than
+    // the tip's shows that this node can be behind, so only a transaction that
+    // declares an earlier upgrade starts a cooldown.
+    if *error == TransactionError::WrongConsensusBranchId
+        && !transaction_network_upgrade.is_some_and(|upgrade| upgrade < tip_upgrade)
+    {
+        return None;
+    }
+
+    Some(*advertiser_addr)
+}
+
+/// What the mempool does to the peer that relayed a transaction that failed
+/// verification.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PeerAction {
+    /// Ban the peer. The failure only depends on the transaction and the
+    /// outputs it spends.
+    Ban,
+
+    /// Ban the peer for a v5 or later transaction, and start a cooldown for a
+    /// v4 transaction.
     ///
-    /// A v4 transaction does not encode a consensus branch ID. A node whose
-    /// tip lags the network at an upgrade activation verifies it under the
-    /// wrong upgrade, so these failures can reject a valid v4 transaction.
+    /// The failure depends on the network upgrade that this node verifies the
+    /// transaction under. A v4 transaction does not encode a consensus branch
+    /// ID. A node whose tip lags the network at an upgrade activation verifies
+    /// it under the wrong upgrade, so these failures can reject a valid v4
+    /// transaction.
     ///
     /// A v5 or later transaction encodes its branch ID. The verifier rejects a
     /// branch ID that differs from this node's upgrade, or a transaction
     /// version that the upgrade does not support, before it runs these checks.
     /// So these failures only reach a v5 or later transaction that this node
     /// verifies under the upgrade the transaction declares.
-    V5AndLater,
+    BanV5AndLater,
 
-    /// The failure does not show that the relaying peer misbehaved.
-    Never,
+    /// Start a transaction cooldown. The failure depends on this node's tip,
+    /// which can differ from the relaying peer's tip.
+    Cooldown,
+
+    /// Do nothing. The failure does not show that the relaying peer
+    /// misbehaved.
+    Ignore,
 }
 
-/// Returns the transaction versions for which `error` bans the relaying peer.
+/// Returns what the mempool does to the peer that relayed a transaction that
+/// failed with `error`.
 ///
 /// The match lists every error, so each new verification failure needs a
 /// decision.
-fn ban_scope(error: &TransactionError) -> BanScope {
-    use BanScope::*;
+fn peer_action(error: &TransactionError) -> PeerAction {
+    use PeerAction::*;
     use TransactionError::*;
 
     match error {
@@ -222,50 +278,88 @@ fn ban_scope(error: &TransactionError) -> BanScope {
         | OrchardProofSize
         | IronwoodProofSize
         | CoinbaseInMempool
-        | NonCoinbaseHasCoinbaseInput => EveryVersion,
+        | NonCoinbaseHasCoinbaseInput => Ban,
 
-        // Signature hashes commit to the verifying upgrade's branch ID, and
-        // Halo2 proofs use that upgrade's verifying key. The Sapling verifier
-        // checks proofs and signatures together. Only v4 transactions have
-        // Sprout signatures, so Ed25519 failures never ban.
-        Script(script_error) if script_error.is_script_failure() => V5AndLater,
-        SaplingVerificationFailed
-        | Halo2VerificationFailed
-        | Ed25519(_)
-        | RedJubjub(_)
-        | RedPallas(_) => V5AndLater,
-
-        // These rules depend on the tip's height, time, or network upgrade.
-        WrongConsensusBranchId
-        | WrongConsensusBranchIdNu6_3GracePeriod
-        | MissingConsensusBranchId
-        | UnsupportedByNetworkUpgrade(..)
-        | DisabledAddToSproutPool
-        | DisabledAddToOrchardPool
-        | LockedUntilAfterBlockHeight(_)
-        | LockedUntilAfterBlockTime(_)
-        | ValidateMempoolLockTimeError(_)
-        | ExpiredTransaction { .. }
-        | ImmatureTransparentCoinbaseSpend { .. }
-        | UnshieldedTransparentCoinbaseSpend { .. } => Never,
-
-        // These rules depend on the chain state.
-        TransparentInputNotFound | ValidateContextError(_) => Never,
-
-        // Policy rejections: blocks can contain these transactions.
-        Zip317(_)
-        | NonStandardScriptSigSize { .. }
-        | NonStandardScriptSigNotPushOnly { .. }
-        | NonStandardInputs => Never,
-
-        // The mempool has never banned for these rules, although they only
-        // depend on the transaction.
+        // Spends that repeat inside one transaction, and an expiry height above
+        // the maximum. Spends that conflict with the chain or the mempool fail
+        // with other errors. zcashd scores these failures 100.
         DuplicateTransparentSpend(_)
         | DuplicateSproutNullifier(_)
         | DuplicateSaplingNullifier(_)
         | DuplicateOrchardNullifier(_)
         | DuplicateIronwoodNullifier(_)
-        | MaximumExpiryHeight { .. } => Never,
+        | MaximumExpiryHeight { .. } => Ban,
+
+        // A transaction that spends a transparent coinbase output must only
+        // have shielded outputs. The outpoint fixes whether the spent output
+        // is a coinbase output, so the rule does not depend on the tip.
+        // zcashd does not score this failure.
+        UnshieldedTransparentCoinbaseSpend { .. } => Ban,
+        ValidateContextError(error) => match **error {
+            zs::ValidateContextError::UnshieldedTransparentCoinbaseSpend { .. } => Ban,
+
+            // Spends and anchors in the chain, and coinbase maturity, depend
+            // on the tip. zcashd does not score spent inputs or unknown
+            // anchors, so that an attacker cannot make honest nodes
+            // disconnect each other.
+            _ => Ignore,
+        },
+
+        // Signature hashes commit to the verifying upgrade's branch ID, and
+        // Halo2 proofs use that upgrade's verifying key. The Sapling verifier
+        // checks proofs and signatures together. Only v4 transactions have
+        // Sprout signatures, so Ed25519 failures never ban.
+        Script(script_error) if script_error.is_script_failure() => BanV5AndLater,
+        SaplingVerificationFailed
+        | Halo2VerificationFailed
+        | Ed25519(_)
+        | RedJubjub(_)
+        | RedPallas(_) => BanV5AndLater,
+
+        // Only v5 and later transactions contain Orchard actions.
+        DisabledAddToOrchardPool => BanV5AndLater,
+
+        // These rules depend on the tip's network upgrade. zcashd scores these
+        // failures 10 in its mempool. [`transaction_cooldown_peer`] only
+        // starts a cooldown for a branch ID mismatch when the transaction
+        // declares an earlier upgrade than the tip's.
+        WrongConsensusBranchId | UnsupportedByNetworkUpgrade(..) | DisabledAddToSproutPool => {
+            Cooldown
+        }
+
+        // A peer whose tip is one block behind this node's tip can relay a
+        // transaction that expires at this node's next block. zcashd does not
+        // score that case, and scores older expiries 10.
+        ExpiredTransaction {
+            expiry_height,
+            block_height,
+            ..
+        } => {
+            if block_height.0 > expiry_height.0.saturating_add(1) {
+                Cooldown
+            } else {
+                Ignore
+            }
+        }
+
+        // Honest peers relay these transactions near the tip. zcashd does not
+        // score non-final transactions. A branch ID that this node does not
+        // know can belong to an upgrade that this node's software predates.
+        WrongConsensusBranchIdNu6_3GracePeriod
+        | MissingConsensusBranchId
+        | LockedUntilAfterBlockHeight(_)
+        | LockedUntilAfterBlockTime(_)
+        | ImmatureTransparentCoinbaseSpend { .. } => Ignore,
+
+        // Parents can arrive late or never, and this node's own state lookup
+        // can fail.
+        TransparentInputNotFound | ValidateMempoolLockTimeError(_) => Ignore,
+
+        // Policy rejections: blocks can contain these transactions.
+        Zip317(_)
+        | NonStandardScriptSigSize { .. }
+        | NonStandardScriptSigNotPushOnly { .. }
+        | NonStandardInputs => Ignore,
 
         // Only block verification returns these. The mempool rejects coinbase
         // transactions before their coinbase checks.
@@ -281,7 +375,7 @@ fn ban_scope(error: &TransactionError) -> BanScope {
         | NotCoinbase
         | CoinbaseExpiryBlockHeight { .. }
         | CoinbaseConstruction(_)
-        | Subsidy(_) => Never,
+        | Subsidy(_) => Ignore,
 
         // The verifier failed, or the error does not name the rule that failed.
         Script(_)
@@ -290,55 +384,8 @@ fn ban_scope(error: &TransactionError) -> BanScope {
         | TryFromSlice(_)
         | Amount(_)
         | Balance(_)
-        | Other(_) => Never,
+        | Other(_) => Ignore,
     }
-}
-
-/// Returns the peer to put in a transaction cooldown for `error`, if any.
-///
-/// Only consensus failures that would otherwise count as peer misbehavior
-/// start a cooldown. Failures that ban the peer do not, and neither do policy
-/// rejections, duplicate spends, failures without a legacy advertiser address,
-/// and failures verified against a tip other than `best_tip_height`. Branch ID
-/// and lock time failures do not either, because they depend on this node's
-/// tip, which can lag the relaying peer's.
-fn transaction_cooldown_peer(
-    error: &TransactionDownloadVerifyError,
-    best_tip_height: Option<block::Height>,
-) -> Option<PeerSocketAddr> {
-    if transaction_ban_peer(error).is_some() {
-        return None;
-    }
-
-    let TransactionDownloadVerifyError::Invalid {
-        error,
-        advertiser_addr: Some(advertiser_addr),
-        tip_height,
-        ..
-    } = error
-    else {
-        return None;
-    };
-
-    if tip_height.is_none() || *tip_height != best_tip_height {
-        return None;
-    }
-
-    // Tip timestamps only estimate freshness. Honest peers can use a different
-    // branch or lock context even when this node passes the distance gate. The
-    // verifier checks lock times before any proof or script, so a peer that
-    // triggers them costs little.
-    if matches!(
-        error,
-        TransactionError::WrongConsensusBranchId
-            | TransactionError::WrongConsensusBranchIdNu6_3GracePeriod
-            | TransactionError::LockedUntilAfterBlockHeight(_)
-            | TransactionError::LockedUntilAfterBlockTime(_)
-    ) {
-        return None;
-    }
-
-    (error.mempool_misbehavior_score() != 0).then_some(*advertiser_addr)
 }
 
 /// The longest time the mempool waits for the peer set to accept a disconnect.
@@ -996,6 +1043,12 @@ impl Service<Request> for Mempool {
             let mut mined_mempool_ids = HashSet::<_>::new();
 
             let best_tip_height = self.latest_chain_tip.best_tip_height();
+            let tip_upgrade = NetworkUpgrade::current(
+                self.chain_tip_change.network(),
+                best_tip_height
+                    .and_then(|height| height + 1)
+                    .unwrap_or(Height(0)),
+            );
 
             // Clean up completed download tasks and add to mempool if successful.
             while let Poll::Ready(Some(result)) = pin!(&mut *tx_downloads).poll_next(cx) {
@@ -1062,7 +1115,9 @@ impl Service<Request> for Mempool {
                         // Only start cooldowns while this node's validation context is
                         // current. A stale node verifies transactions against old rules.
                         let cooldown_peer = is_current_enough_for_mempool
-                            .then(|| transaction_cooldown_peer(&error, best_tip_height))
+                            .then(|| {
+                                transaction_cooldown_peer(&error, best_tip_height, tip_upgrade)
+                            })
                             .flatten();
                         if let Some(peer) = cooldown_peer {
                             start_peer_cooldown(

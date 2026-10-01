@@ -48,6 +48,7 @@ fn transaction_error_peer_log_labels_require_explicit_opt_in() {
         advertiser_addr: Some("192.0.2.1:8233".parse().expect("valid test socket")),
         tip_height: None,
         transaction_version: 4,
+        transaction_network_upgrade: None,
     };
 
     assert_eq!(
@@ -79,6 +80,7 @@ fn lock_time_and_maturity_failures_start_no_cooldown() {
         advertiser_addr: Some(peer),
         tip_height,
         transaction_version: 4,
+        transaction_network_upgrade: None,
     };
 
     assert_eq!(
@@ -86,7 +88,8 @@ fn lock_time_and_maturity_failures_start_no_cooldown() {
             &invalid(TransactionError::Script(
                 zakura_script::Error::ScriptInvalid
             )),
-            tip_height
+            tip_height,
+            NetworkUpgrade::Nu6_3
         ),
         Some(peer)
     );
@@ -120,7 +123,11 @@ fn lock_time_and_maturity_failures_start_no_cooldown() {
     )
     .expect_err("the coinbase output is immature at height 2");
     assert_eq!(
-        transaction_cooldown_peer(&invalid(immature_spend.clone()), tip_height),
+        transaction_cooldown_peer(
+            &invalid(immature_spend.clone()),
+            tip_height,
+            NetworkUpgrade::Nu6_3
+        ),
         None,
         "{immature_spend:?}"
     );
@@ -137,7 +144,7 @@ fn lock_time_and_maturity_failures_start_no_cooldown() {
     for error in lock_times {
         assert_ne!(error.mempool_misbehavior_score(), 0, "{error:?}");
         assert_eq!(
-            transaction_cooldown_peer(&invalid(error.clone()), tip_height),
+            transaction_cooldown_peer(&invalid(error.clone()), tip_height, NetworkUpgrade::Nu6_3),
             None,
             "{error:?}"
         );
@@ -149,6 +156,7 @@ fn lock_time_and_maturity_failures_start_no_cooldown() {
         advertiser_addr: None,
         tip_height,
         transaction_version: 4,
+        transaction_network_upgrade: None,
     };
     assert_eq!(
         transaction_cooldown_peer(
@@ -156,11 +164,64 @@ fn lock_time_and_maturity_failures_start_no_cooldown() {
                 zakura_script::Error::ScriptInvalid
             )),
             tip_height,
+            NetworkUpgrade::Nu6_3
         ),
         None
     );
     assert_eq!(
         transaction_ban_peer(&unattributed(TransactionError::WrongVersion)),
+        None
+    );
+}
+
+#[test]
+fn unshielded_coinbase_spends_ban_the_peer() {
+    use std::{collections::HashMap, sync::Arc};
+
+    use zakura_chain::{
+        parameters::{Network, NetworkUpgrade},
+        transaction::{Hash, LockTime},
+    };
+    use zakura_consensus::transaction::check;
+
+    // A mature spend of a coinbase output to a transparent output.
+    let outpoint = transparent::OutPoint::from_usize(Hash([0; 32]), 0);
+    let output = transparent::Output::new(Amount::zero(), transparent::Script::new(&[]));
+    let spend = Arc::new(Transaction::V5 {
+        network_upgrade: NetworkUpgrade::Nu5,
+        lock_time: LockTime::unlocked(),
+        expiry_height: Height(0),
+        inputs: vec![transparent::Input::PrevOut {
+            outpoint,
+            unlock_script: transparent::Script::new(&[]),
+            sequence: 0,
+        }],
+        outputs: vec![output.clone()],
+        sapling_shielded_data: None,
+        orchard_shielded_data: None,
+    });
+    let coinbase_utxo = transparent::Utxo::new(output, Height(1), true);
+    let error = check::tx_transparent_coinbase_spends_maturity(
+        &Network::Mainnet,
+        spend,
+        Height(1_000),
+        Arc::new(HashMap::new()),
+        &HashMap::from([(outpoint, coinbase_utxo)]),
+    )
+    .expect_err("a coinbase output cannot be spent to a transparent output");
+
+    let peer = "192.0.2.1:8233".parse().expect("valid test socket");
+    let tip_height = Some(Height(999));
+    let failure = TransactionDownloadVerifyError::Invalid {
+        error: error.clone(),
+        advertiser_addr: Some(peer),
+        tip_height,
+        transaction_version: 5,
+        transaction_network_upgrade: None,
+    };
+    assert_eq!(transaction_ban_peer(&failure), Some(peer), "{error:?}");
+    assert_eq!(
+        transaction_cooldown_peer(&failure, tip_height, NetworkUpgrade::Nu6_3),
         None
     );
 }

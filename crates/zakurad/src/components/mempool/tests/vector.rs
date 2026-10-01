@@ -45,7 +45,10 @@ fn policy_rejection_does_not_start_a_cooldown() {
             max_bytes: 250_000,
         },
     );
-    assert_eq!(transaction_cooldown_peer(&policy_error, None), None);
+    assert_eq!(
+        transaction_cooldown_peer(&policy_error, None, NetworkUpgrade::Nu6_3),
+        None
+    );
 
     let advertiser_addr = PeerSocketAddr::from(([203, 0, 113, 7], 8233));
     let consensus_error = TransactionError::Script(zakura_script::Error::ScriptInvalid);
@@ -59,9 +62,14 @@ fn policy_rejection_does_not_start_a_cooldown() {
         advertiser_addr: Some(advertiser_addr),
         tip_height: Some(block::Height(100)),
         transaction_version: 4,
+        transaction_network_upgrade: None,
     };
     assert_eq!(
-        transaction_cooldown_peer(&invalid_error, Some(block::Height(100))),
+        transaction_cooldown_peer(
+            &invalid_error,
+            Some(block::Height(100)),
+            NetworkUpgrade::Nu6_3
+        ),
         Some(advertiser_addr)
     );
 }
@@ -74,15 +82,19 @@ fn stale_verification_failures_do_not_start_cooldowns() {
         advertiser_addr: Some(peer),
         tip_height: Some(block::Height(100)),
         transaction_version: 4,
+        transaction_network_upgrade: None,
     };
 
     assert_eq!(
-        transaction_cooldown_peer(&error, Some(block::Height(101))),
+        transaction_cooldown_peer(&error, Some(block::Height(101)), NetworkUpgrade::Nu6_3),
         None
     );
-    assert_eq!(transaction_cooldown_peer(&error, None), None);
     assert_eq!(
-        transaction_cooldown_peer(&error, Some(block::Height(100))),
+        transaction_cooldown_peer(&error, None, NetworkUpgrade::Nu6_3),
+        None
+    );
+    assert_eq!(
+        transaction_cooldown_peer(&error, Some(block::Height(100)), NetworkUpgrade::Nu6_3),
         Some(peer)
     );
 }
@@ -90,19 +102,22 @@ fn stale_verification_failures_do_not_start_cooldowns() {
 #[test]
 fn context_dependent_failures_do_not_start_cooldowns() {
     for error in [
-        TransactionError::WrongConsensusBranchId,
         TransactionError::WrongConsensusBranchIdNu6_3GracePeriod,
         TransactionError::LockedUntilAfterBlockHeight(block::Height(101)),
         TransactionError::LockedUntilAfterBlockTime(chrono::Utc::now()),
+        TransactionError::TransparentInputNotFound,
+        // A peer whose tip is one block behind can relay this transaction.
+        expired_transaction(block::Height(100), block::Height(101)),
     ] {
         let error = TransactionDownloadVerifyError::Invalid {
             error,
             advertiser_addr: Some(PeerSocketAddr::from(([203, 0, 113, 7], 8233))),
             tip_height: Some(block::Height(100)),
             transaction_version: 5,
+            transaction_network_upgrade: None,
         };
         assert_eq!(
-            transaction_cooldown_peer(&error, Some(block::Height(100))),
+            transaction_cooldown_peer(&error, Some(block::Height(100)), NetworkUpgrade::Nu6_3),
             None
         );
     }
@@ -118,6 +133,19 @@ fn relayed_transaction_failure(
         advertiser_addr: Some(test_peer()),
         tip_height: Some(block::Height(100)),
         transaction_version,
+        transaction_network_upgrade: None,
+    }
+}
+
+/// Returns an expiry failure for a transaction verified at `block_height`.
+fn expired_transaction(
+    expiry_height: block::Height,
+    block_height: block::Height,
+) -> TransactionError {
+    TransactionError::ExpiredTransaction {
+        expiry_height,
+        block_height,
+        transaction_hash: zakura_chain::transaction::Hash([0; 32]),
     }
 }
 
@@ -145,6 +173,16 @@ fn transaction_data_failures_ban_every_version() {
         TransactionError::IronwoodProofSize,
         TransactionError::CoinbaseInMempool,
         TransactionError::NonCoinbaseHasCoinbaseInput,
+        TransactionError::DuplicateTransparentSpend(OutPoint::from_usize(
+            zakura_chain::transaction::Hash([0; 32]),
+            0,
+        )),
+        TransactionError::MaximumExpiryHeight {
+            expiry_height: block::Height(block::Height::MAX_EXPIRY_HEIGHT.0 + 1),
+            is_coinbase: false,
+            block_height: block::Height(101),
+            transaction_hash: zakura_chain::transaction::Hash([0; 32]),
+        },
     ] {
         for transaction_version in [4, 5, 6] {
             let failure = relayed_transaction_failure(error.clone(), transaction_version);
@@ -155,7 +193,11 @@ fn transaction_data_failures_ban_every_version() {
                 "{error:?}"
             );
             assert_eq!(
-                transaction_cooldown_peer(&failure, Some(block::Height(100))),
+                transaction_cooldown_peer(
+                    &failure,
+                    Some(block::Height(100)),
+                    NetworkUpgrade::Nu6_3
+                ),
                 None,
                 "a banned peer does not also start a cooldown"
             );
@@ -177,11 +219,12 @@ fn upgrade_dependent_failures_ban_only_v5_and_later() {
         TransactionError::Ed25519(ed25519::Error::InvalidSignature),
         TransactionError::RedJubjub(redjubjub::Error::InvalidSignature),
         TransactionError::RedPallas(reddsa::Error::InvalidSignature),
+        TransactionError::DisabledAddToOrchardPool,
     ] {
         let v4_failure = relayed_transaction_failure(error.clone(), 4);
         assert_eq!(transaction_ban_peer(&v4_failure), None, "{error:?}");
         assert_eq!(
-            transaction_cooldown_peer(&v4_failure, Some(block::Height(100))),
+            transaction_cooldown_peer(&v4_failure, Some(block::Height(100)), NetworkUpgrade::Nu6_3),
             Some(test_peer()),
             "{error:?}"
         );
@@ -204,9 +247,8 @@ fn tip_dependent_failures_never_ban() {
         TransactionError::WrongConsensusBranchIdNu6_3GracePeriod,
         TransactionError::LockedUntilAfterBlockHeight(block::Height(101)),
         TransactionError::LockedUntilAfterBlockTime(chrono::Utc::now()),
-        // An honest peer whose tip is before the upgrade can relay these.
+        // An honest peer whose tip is before the upgrade can relay this.
         TransactionError::DisabledAddToSproutPool,
-        TransactionError::DisabledAddToOrchardPool,
         // The verifier failed to run the script, so the script is not at fault.
         TransactionError::Script(zakura_script::Error::TxIndex),
     ] {
@@ -215,6 +257,77 @@ fn tip_dependent_failures_never_ban() {
             assert_eq!(transaction_ban_peer(&failure), None, "{error:?}");
         }
     }
+}
+
+#[test]
+fn tip_dependent_failures_start_cooldowns() {
+    for error in [
+        TransactionError::UnsupportedByNetworkUpgrade(
+            4,
+            zakura_chain::parameters::NetworkUpgrade::Nu7,
+        ),
+        TransactionError::DisabledAddToSproutPool,
+        expired_transaction(block::Height(99), block::Height(101)),
+    ] {
+        for transaction_version in [4, 5, 6] {
+            let failure = relayed_transaction_failure(error.clone(), transaction_version);
+            assert_eq!(transaction_ban_peer(&failure), None, "{error:?}");
+            assert_eq!(
+                transaction_cooldown_peer(
+                    &failure,
+                    Some(block::Height(100)),
+                    NetworkUpgrade::Nu6_3
+                ),
+                Some(test_peer()),
+                "{error:?}"
+            );
+        }
+    }
+}
+
+/// A node whose tip is before an upgrade can pass the tip distance check, so a
+/// transaction that declares a later upgrade starts no cooldown.
+#[test]
+fn branch_id_mismatches_only_cool_down_peers_behind_the_tip() {
+    let tip_height = Some(block::Height(100));
+    let failure = |transaction_network_upgrade| TransactionDownloadVerifyError::Invalid {
+        error: TransactionError::WrongConsensusBranchId,
+        advertiser_addr: Some(test_peer()),
+        tip_height,
+        transaction_version: 5,
+        transaction_network_upgrade,
+    };
+
+    for (transaction_network_upgrade, cooldown_peer) in [
+        (Some(NetworkUpgrade::Nu6_2), Some(test_peer())),
+        (Some(NetworkUpgrade::Nu7), None),
+        (None, None),
+    ] {
+        let failure = failure(transaction_network_upgrade);
+        assert_eq!(transaction_ban_peer(&failure), None);
+        assert_eq!(
+            transaction_cooldown_peer(&failure, tip_height, NetworkUpgrade::Nu6_3),
+            cooldown_peer,
+            "{transaction_network_upgrade:?}"
+        );
+    }
+
+    // A branch ID that this node does not know starts nothing.
+    let failure = relayed_transaction_failure(TransactionError::MissingConsensusBranchId, 5);
+    assert_eq!(
+        transaction_cooldown_peer(&failure, tip_height, NetworkUpgrade::Nu6_3),
+        None
+    );
+}
+
+#[test]
+fn unrun_scripts_start_no_cooldown() {
+    let failure =
+        relayed_transaction_failure(TransactionError::Script(zakura_script::Error::TxIndex), 4);
+    assert_eq!(
+        transaction_cooldown_peer(&failure, Some(block::Height(100)), NetworkUpgrade::Nu6_3),
+        None
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -46,6 +46,7 @@ use tracing::Instrument;
 
 use zakura_chain::{
     block::Height,
+    parameters::NetworkUpgrade,
     transaction::{self, UnminedTxId, VerifiedUnminedTx},
     transparent,
 };
@@ -170,6 +171,9 @@ pub enum TransactionDownloadVerifyError {
         tip_height: Option<Height>,
         /// The version of the transaction that failed verification.
         transaction_version: u32,
+        /// The network upgrade that the transaction declares in its consensus
+        /// branch ID, if any.
+        transaction_network_upgrade: Option<NetworkUpgrade>,
     },
 
     #[error("transaction was served by a peer in a transaction cooldown")]
@@ -552,6 +556,7 @@ where
             }
 
             let transaction_version = tx.transaction().version();
+            let transaction_network_upgrade = tx.transaction().network_upgrade();
             let result = verifier
                 .oneshot(tx::Request::Mempool {
                     transaction: tx.clone(),
@@ -574,6 +579,7 @@ where
                 advertiser_addr,
                 tip_height,
                 transaction_version,
+                transaction_network_upgrade,
             })
         }
         .map_ok(|(tx, spent_mempool_outpoints, tip_height)| {
@@ -1324,10 +1330,11 @@ mod tests {
                 TransactionDownloadVerifyError::Invalid {
                     advertiser_addr: Some(addr),
                     transaction_version: 5,
+                    transaction_network_upgrade: Some(NetworkUpgrade::Nu5),
                     ..
                 } if addr == peer_addr
             ),
-            "expected the pushed transaction failure to carry the peer address and version, got {error:?}"
+            "expected the pushed transaction failure to carry the peer address, version, and upgrade, got {error:?}"
         );
     }
 

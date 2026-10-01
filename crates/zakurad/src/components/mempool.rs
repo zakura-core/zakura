@@ -650,6 +650,9 @@ pub struct Mempool {
     /// cools down, or disconnects these peers.
     zcashd_compat_peer_ips: HashSet<IpAddr>,
 
+    /// Peers that the mempool never bans, cools down, or disconnects.
+    unconditional_peers: zn::UnconditionalPeers,
+
     // Diagnostics
     //
     /// Queued transactions pending download or verification transmitter.
@@ -687,6 +690,7 @@ impl Mempool {
         chain_tip_change: ChainTipChange,
         misbehavior_sender: mpsc::Sender<(PeerSocketAddr, u32)>,
         zcashd_compat_peer_ips: Vec<IpAddr>,
+        unconditional_peers: zn::UnconditionalPeers,
     ) -> (Self, MempoolTxSubscriber) {
         let (transaction_sender, _) =
             tokio::sync::broadcast::channel(gossip::MEMPOOL_CHANGE_CHANNEL_CAPACITY);
@@ -707,6 +711,7 @@ impl Mempool {
             transaction_sender,
             peer_cooldowns: peer_cooldown::PeerCooldowns::default(),
             misbehavior_sender,
+            unconditional_peers,
             zcashd_compat_peer_ips: zcashd_compat_peer_ips
                 .into_iter()
                 .map(|ip| ip.to_canonical())
@@ -1147,8 +1152,10 @@ impl Service<Request> for Mempool {
                     Ok(Err(boxed_err)) => {
                         let (tx_id, error) = *boxed_err;
                         let zcashd_compat_peer_ips = &self.zcashd_compat_peer_ips;
-                        let ban_peer = transaction_ban_peer(&error)
-                            .filter(|peer| !is_zcashd_compat_peer(zcashd_compat_peer_ips, *peer));
+                        let ban_peer = transaction_ban_peer(&error).filter(|peer| {
+                            !is_zcashd_compat_peer(zcashd_compat_peer_ips, *peer)
+                                && !self.unconditional_peers.contains(peer.ip())
+                        });
                         if let Some(peer) = ban_peer {
                             let _ = self
                                 .misbehavior_sender
@@ -1162,7 +1169,10 @@ impl Service<Request> for Mempool {
                                 transaction_cooldown_peer(&error, best_tip_height, tip_upgrade)
                             })
                             .flatten()
-                            .filter(|peer| !is_zcashd_compat_peer(zcashd_compat_peer_ips, *peer));
+                            .filter(|peer| {
+                                !is_zcashd_compat_peer(zcashd_compat_peer_ips, *peer)
+                                    && !self.unconditional_peers.contains(peer.ip())
+                            });
                         if let Some(peer) = cooldown_peer {
                             start_peer_cooldown(
                                 &self.peer_cooldowns,

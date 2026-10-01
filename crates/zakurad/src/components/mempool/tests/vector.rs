@@ -737,6 +737,23 @@ async fn zcashd_compat_peer_is_never_penalized() -> Result<(), Report> {
     Ok(())
 }
 
+/// Unconditional ranges exempt IPv4 and mapped peers from bans and cooldowns.
+#[tokio::test(flavor = "multi_thread")]
+async fn unconditional_peer_is_never_penalized() -> Result<(), Report> {
+    for peer in [
+        PeerSocketAddr::from(([192, 0, 2, 7], 8233)),
+        PeerSocketAddr::from((Ipv4Addr::new(192, 0, 2, 7).to_ipv6_mapped(), 8233)),
+    ] {
+        for error in [
+            TransactionError::Script(zakura_script::Error::ScriptInvalid),
+            TransactionError::NoInputs,
+        ] {
+            assert_eq!(peer_penalties(peer, error).await, (false, false));
+        }
+    }
+    Ok(())
+}
+
 /// Relays a transaction from `peer` that fails with `error`, on a mempool
 /// configured with a zcashd-compat sidecar at `127.0.0.1`.
 ///
@@ -762,6 +779,9 @@ async fn peer_penalties(peer: PeerSocketAddr, error: TransactionError) -> (bool,
     let (misbehavior_sender, mut misbehavior_receiver) = tokio::sync::mpsc::channel(1);
     mempool.misbehavior_sender = misbehavior_sender;
     mempool.zcashd_compat_peer_ips = [IpAddr::V4(Ipv4Addr::LOCALHOST)].into_iter().collect();
+    mempool.unconditional_peers = ["192.0.2.0/24".parse().expect("valid test CIDR")]
+        .into_iter()
+        .collect();
     // Cooldowns only start when the mempool's validation context is current.
     let _chain_tip_sender = mempool.use_current_chain_tip(&network);
     mempool.enable(&mut recent_syncs).await;
@@ -3561,6 +3581,7 @@ async fn setup_with_mempool_config(
         chain_tip_change.clone(),
         tokio::sync::mpsc::channel(1).0,
         Vec::new(),
+        zakura_network::UnconditionalPeers::default(),
     );
 
     let mut mempool_transaction_receiver = mempool_transaction_subscriber.subscribe();

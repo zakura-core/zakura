@@ -19,6 +19,7 @@ Other builds ran on the host, so these runs do not qualify deployment performanc
 | RPC `methods::types::` unit tests | 43 passed; 1 ignored |
 | Clippy for the complete workspace, all targets | Passed with `-D warnings` |
 | Clippy for oracle workspace, all targets | Passed with `-D warnings` |
+| Owned script check and Clippy without default features | Passed with warnings denied |
 | Node release-feature check | Passed |
 | Node release-feature + portable check | Passed |
 | Both release dependency graphs | One owned script crate; no `libzcash_script` |
@@ -89,3 +90,10 @@ These version bumps do not publish either crate or complete package delivery.
 Semver checks built the current and published baseline versions of both crates.
 The tool accepted the declared major bumps and skipped breaking-change lints
 for those major releases. Workspace Clippy checks all node test targets.
+
+The compatibility CI passed on Rust 1.99. It checked both release dependency
+graphs, passed the Rust and oracle tests, and replayed the saved fixture.
+The owned crate now gates signature assembly imports and mutation behind its
+signature-validation feature. Its no-default-features check and Clippy pass.
+The branch integrates main `3ef9f45f2e5067a50e990e179ef3cd88fdf8f74e`, which
+contains the existing Rust 1.99 workspace warning fixes from PR #1245.

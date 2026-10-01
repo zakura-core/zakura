@@ -9,7 +9,9 @@ use alloc::{
 
 use bounded_vec::{BoundedVec, EmptyBoundedVec};
 
-use crate::{num, opcode, script::Asm, signature};
+#[cfg(feature = "signature-validation")]
+use crate::signature;
+use crate::{num, opcode, script::Asm};
 
 /// Data values that aren’t represented within their opcode byte.
 ///
@@ -219,17 +221,26 @@ impl Asm for LargeValue {
         // The logic below follows the zcashd implementation in its
         // `ScriptToAsmStr()`
         // https://github.com/zcash/zcash/blob/2352fbc1ed650ac4369006bea11f7f20ee046b84/src/core_write.cpp#L73-L115
-        let mut value = self.value().to_vec();
-        let mut hash_type = String::new();
+        let value = self.value().to_vec();
         #[cfg(feature = "signature-validation")]
-        if attempt_sighash_decode && value.len() > 4 {
-            if let signature::Validity::Valid(signature) =
-                signature::Decoded::from_bytes(&value, false, true)
-            {
-                value = signature.sig().serialize_der().to_vec();
-                hash_type = format!("[{}]", signature.sighash_type().to_asm(false));
+        let (value, hash_type) = {
+            let mut value = value;
+            let mut hash_type = String::new();
+            if attempt_sighash_decode && value.len() > 4 {
+                if let signature::Validity::Valid(signature) =
+                    signature::Decoded::from_bytes(&value, false, true)
+                {
+                    value = signature.sig().serialize_der().to_vec();
+                    hash_type = format!("[{}]", signature.sighash_type().to_asm(false));
+                }
             }
-        }
+            (value, hash_type)
+        };
+        #[cfg(not(feature = "signature-validation"))]
+        let hash_type = {
+            let _ = attempt_sighash_decode;
+            String::new()
+        };
         if value.len() <= 4 {
             // zcashd ultimately uses `CScriptNum()`-> `set_vch()`, which was
             // replaced with `num::parse()` in this crate

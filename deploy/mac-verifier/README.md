@@ -3,7 +3,7 @@
 This package observes an existing native macOS ARM64 Zakura verifier and compares
 its committed results against a Linux x86_64 mainnet reference. It contains the
 runtime services, comparison tests and compiler acceptance evidence. Host setup,
-secret provisioning, snapshot import and remote installation are outside this package. A CI
+secret provisioning and snapshot import are outside this package. A CI
 workflow builds qualified Cranelift deployment candidates on an isolated Mac.
 
 The verifier uses pinned consensus source
@@ -69,6 +69,35 @@ Unexpected receipt, binary or configuration changes invalidate monitoring.
 Preserve the starting anchor, cursor/history, incidents and outbox across reviewed
 identity transitions; establish a fresh qualification baseline. Never overwrite
 state or erase a gap to manufacture qualification.
+
+## Deployment through CI
+
+The existing mainnet deploy workflow accepts `node=zakura-mac-os` and uses the
+`mac-verifier-private` environment. It never sends the Mac through the Linux
+fleet deployer. Dispatch from the reviewed tooling branch with the full pinned
+consensus source SHA as `ref`:
+
+```sh
+gh workflow run zakura-mainnet-deploy.yml --repo zakura-core/zakura \
+  --ref codex/mac-verifier-poc \
+  -f ref=af944f5194ef2e9921bc96af017629450375013c \
+  -f node=zakura-mac-os -f mac_operation=deploy \
+  -f mac_candidate_run_id=SUCCESSFUL_CANDIDATE_RUN_ID
+```
+
+Use `mac_operation=status` for read-only checks, or `mac_operation=dashboard`
+to restore the dashboard integration without restarting the node. Binary
+deployment requires a successful trusted candidate run, verifies its exact
+binary and acceptance receipt, and runs the executable on the destination
+before replacement. It coordinates the Mac and Linux receipts, preserves the
+bootstrap anchor, configuration, comparison cursor, incidents and alert queue,
+and verifies new block progress and comparison before succeeding. A failed
+runtime check rolls back the binary and receipts while retaining observations.
+It preserves alert settings and rejects `no_restart` and `force_rebuild`.
+
+Until this PR is merged, a regular mainnet deployment from `main` can replace the
+dashboard script with a version that has no Mac support. The dashboard operation
+restores the reviewed script and its existing enablement drop-in.
 
 ## Private and public status
 

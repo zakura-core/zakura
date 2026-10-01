@@ -53,8 +53,12 @@ on:
       mac_operation:
         description: "Operation for the existing zakura-mac-os verifier"
         type: choice
-        options: [status, dashboard]
-        default: status
+        options: [deploy, status, dashboard]
+        default: deploy
+      mac_candidate_run_id:
+        description: "Successful Mac verifier candidate run to install (Mac deploy only)"
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -69,6 +73,9 @@ jobs:
     runs-on: ubuntu-24.04
     environment: mac-verifier-private
     timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -76,6 +83,12 @@ jobs:
       - name: Operate private Mac verifier
         env:
           MAC_OPERATION: ${{ inputs.mac_operation }}
+          MAC_SOURCE_REF: ${{ inputs.ref }}
+          MAC_CANDIDATE_RUN_ID: ${{ inputs.mac_candidate_run_id }}
+          MAC_VERIFIER_DEPLOY_BRANCH: ${{ vars.MAC_VERIFIER_DEPLOY_BRANCH }}
+          GH_TOKEN: ${{ github.token }}
+          NO_RESTART: ${{ inputs.no_restart }}
+          FORCE_REBUILD: ${{ inputs.force_rebuild }}
           MAC_VERIFIER_HOST: ${{ secrets.MAC_VERIFIER_HOST }}
           MAC_VERIFIER_USER: ${{ secrets.MAC_VERIFIER_USER }}
           MAC_VERIFIER_SSH_PORT: ${{ secrets.MAC_VERIFIER_SSH_PORT }}

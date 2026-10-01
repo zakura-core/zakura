@@ -41,8 +41,9 @@ only the binary and receipt after every gate passes. Receipts record source,
 lockfile, compiler patch, backend, binary, SDK and configuration provenance.
 Failed builds publish no deployment candidate.
 
-Installation and coordinated receipt changes remain operator actions. Preserve
-comparison cursors, incident history and queued alerts across reviewed binary
+Installation uses the mainnet CI workflow's explicit `zakura-mac-os` target and
+a successful candidate run ID, as described in the [runtime README](../README.md).
+It preserves comparison cursors, incident history and queued alerts across binary
 changes. Compiler acceptance does not establish live health, sustained runtime
 qualification or permission to enable alerts. Independent compiler review and
 operational qualification remain required.

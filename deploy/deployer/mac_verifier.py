@@ -109,6 +109,12 @@ result['binary_matches_receipt'] = actual == receipt.get('binary_sha256')
 result['binary_sha256'] = actual
 result['receipt_fields'] = sorted(receipt)
 result['compiler_evidence_files'] = sorted(str(p.relative_to(base / 'evidence')) for p in (base / 'evidence').rglob('*.json'))
+result['compiler_acceptance'] = []
+for path in (base / 'evidence').rglob('receipt.json'):
+    evidence = json.loads(path.read_text())
+    if evidence.get('binary_sha256') == actual:
+        result['compiler_acceptance'].append({{key: evidence.get(key) for key in
+            ['passed', 'source_sha', 'patch_sha256', 'binary_architecture', 'configuration', 'checks']}})
 for name in ['node', 'adapter', 'tunnel']:
     check = subprocess.run(['launchctl', 'print', 'system/dev.valargroup.zakura-verifier-' + name], capture_output=True, text=True, timeout=10)
     result[name + '_running'] = check.returncode == 0 and 'state = running' in check.stdout
@@ -136,17 +142,191 @@ REMOTE
     print(json.dumps({'mac': mac_info, 'reference': info}, indent=2))
 
 
+def validate_candidate(directory, source_sha):
+    """Require the complete compiler acceptance receipt for these exact bytes."""
+    from common import digest
+    receipt = json.loads((directory / 'receipt.json').read_text())
+    manifest = json.loads((PACKAGE / 'corpus.json').read_text())
+    expected = {'unwind-probe-build', 'unwind-probe', 'double-panic', 'native-node-build'}
+    expected.update('zakura-consensus-' + str(i) for i in range(len(manifest['tests'])))
+    expected.update('zakura-network-' + str(i) for i in range(2))
+    checks = receipt.get('checks', [])
+    configuration = dict(panic='unwind', lto=False, build_jobs=1,
+                         linker='apple-classic', standard_library='cranelift-static')
+    if (source_sha != manifest['source_sha'] or receipt.get('source_sha') != source_sha
+            or receipt.get('passed') is not True
+            or receipt.get('configuration') != configuration
+            or receipt.get('patch_sha256') != digest(PACKAGE / 'cranelift/macos-unwind.patch')
+            or receipt.get('binary_sha256') != digest(directory / 'zakurad')
+            or 'arm64' not in receipt.get('binary_architecture', '')
+            or len(checks) != len(expected)
+            or {c.get('name') for c in checks} != expected
+            or any(c.get('passed') is not True for c in checks)):
+        raise ValueError('candidate does not satisfy the pinned Cranelift acceptance profile')
+    return receipt
+
+
+def download_candidate(run_id, directory):
+    if not re.fullmatch(r'[0-9]+', run_id):
+        raise ValueError('a successful candidate run ID is required')
+    repository = 'zakura-core/zakura'
+    def api(suffix):
+        return json.loads(subprocess.check_output(
+            ['gh', 'api', f'repos/{repository}/actions/runs/{run_id}' + suffix], timeout=30))
+    run = api('')
+    if (run.get('conclusion') != 'success'
+            or run.get('head_repository', {}).get('full_name') != repository
+            or run.get('head_branch') not in ['main', os.environ.get('MAC_VERIFIER_DEPLOY_BRANCH')]
+            or run.get('path') not in ['.github/workflows/mac-verifier.yml', '.github/workflows/deploy-mac-verifier.yml']):
+        raise ValueError('candidate must come from successful trusted Mac verifier CI')
+    artifacts = [a for a in api('/artifacts')['artifacts']
+                 if a['name'].startswith('mac-verifier-cranelift-') and not a['expired']]
+    if len(artifacts) != 1:
+        raise ValueError('exactly one accepted candidate artifact required')
+    subprocess.run(['gh', 'run', 'download', run_id, '--repo', repository,
+                    '--name', artifacts[0]['name'], '--dir', str(directory)],
+                   check=True, capture_output=True, timeout=180)
+    # upload-artifact preserves the common ancestor of the binary and receipt.
+    binary = directory / 'target/release/zakurad'
+    if binary.is_file():
+        binary.rename(directory / 'zakurad')
+
+
+def transitioned_receipt(old, candidate, now):
+    if (old['source_sha'] != candidate['source_sha']
+            or old['cargo_lock_sha256'] != candidate['cargo_lock_sha256']):
+        raise ValueError('this deployment requires the same pinned source and lockfile')
+    new = dict(old, binary_sha256=candidate['binary_sha256'], deployed_at=now,
+               compiler=candidate, toolchain=candidate['toolchain'])
+    return new
+
+
+def deploy_candidate(mac, linux, candidate_dir, candidate):
+    """Coordinate binary/receipt replacement while preserving comparison history."""
+    from common import digest
+    old_mac = json.loads(mac.run(f'sudo -n cat {shlex.quote(BASE + "/receipt.json")}'))
+    old_linux = json.loads(linux.run('sudo -n cat /etc/zakura-mac-verifier/receipt.json'))
+    if old_mac != old_linux:
+        raise ValueError('live receipts disagree; deployment refused')
+    new = transitioned_receipt(old_mac, candidate, time.time())
+    stage = mac.run('mktemp -d /var/tmp/zakura-verifier-ci.XXXXXX').strip()
+    if not re.fullmatch(r'/var/tmp/zakura-verifier-ci\.[A-Za-z0-9]+', stage):
+        raise ValueError('unexpected staging path')
+    binary = candidate_dir / 'zakurad'
+    mac.put(binary.read_bytes(), stage + '/zakurad')
+    mac.put((json.dumps(new) + '\n').encode(), stage + '/receipt.json')
+    mac.put((json.dumps(candidate) + '\n').encode(), stage + '/acceptance.json')
+    # Execute on the destination before touching its running node. This also
+    # catches unavailable dylibs / an incompatible deployment target.
+    mac.run(f'''set -eu
+sudo -n chmod 755 {stage}/zakurad
+sudo -n {MAC_PYTHON} - <<'REMOTE'
+import hashlib, pathlib
+with pathlib.Path('{stage}/zakurad').open('rb') as stream:
+    assert hashlib.file_digest(stream, 'sha256').hexdigest() == '{digest(binary)}'
+REMOTE
+sudo -n {stage}/zakurad --version >/dev/null
+''')
+    linux.run('set -eu\nsudo -n cp -p /etc/zakura-mac-verifier/receipt.json /etc/zakura-mac-verifier/receipt.json.previous\n'
+              'sudo -n systemctl stop zakura-mac-verifier')
+    try:
+        mac.run(f'''set -eu
+sudo -n cp -p '{BASE}/bin/zakurad' '{BASE}/bin/zakurad.previous'
+sudo -n cp -p '{BASE}/receipt.json' '{BASE}/receipt.json.previous'
+sudo -n launchctl bootout system/dev.valargroup.zakura-verifier-node
+sudo -n launchctl bootout system/dev.valargroup.zakura-verifier-adapter
+sudo -n install -m 755 {stage}/zakurad '{BASE}/bin/zakurad'
+sudo -n cp {stage}/receipt.json '{BASE}/receipt.json'
+sudo -n install -m 644 {stage}/acceptance.json '{BASE}/evidence/ci-acceptance.json'
+sudo -n launchctl bootstrap system /Library/LaunchDaemons/dev.valargroup.zakura-verifier-node.plist
+sudo -n launchctl bootstrap system /Library/LaunchDaemons/dev.valargroup.zakura-verifier-adapter.plist
+''')
+        linux.put((json.dumps(new) + '\n').encode(), '/etc/zakura-mac-verifier/receipt.json')
+        linux.run('''sudo -n python3 - <<'REMOTE'
+import hashlib, json, os, pathlib, sys
+sys.path.insert(0, '/opt/zakura-mac-verifier')
+from common import atomic_json
+path = pathlib.Path('/var/lib/zakura-mac-verifier/cursor.json')
+stat = path.stat()
+state = json.loads(path.read_text())
+receipt = json.loads(pathlib.Path('/etc/zakura-mac-verifier/receipt.json').read_text())
+state.update(receipt_digest=hashlib.sha256(json.dumps(receipt, sort_keys=True).encode()).hexdigest(),
+             healthy_since=None, healthy_start_height=None, qualified=False,
+             enablement_ready_since=None, enablement_good_samples=0)
+atomic_json(path, state)
+os.chown(path, stat.st_uid, stat.st_gid)
+REMOTE
+sudo -n systemctl start zakura-mac-verifier
+''')
+        deadline = time.monotonic() + 600
+        previous_height = None
+        while time.monotonic() < deadline:
+            raw = json.loads(linux.run('sudo -n cat /var/lib/zakura-mac-verifier/status.json'))
+            verifier = raw.get('verifier') or {}
+            tip = (verifier.get('tip') or {}).get('height')
+            if (raw.get('sample_time', 0) >= new['deployed_at']
+                    and verifier.get('binary_sha256') == new['binary_sha256']
+                    and verifier.get('receipt') == new and raw.get('caught_up')
+                    and raw.get('error') is None
+                    and not (set(raw.get('incidents', {})) - {'alert delivery unavailable'})):
+                if previous_height is not None and tip > previous_height:
+                    print('Accepted Cranelift binary installed; mainnet height advanced and comparison caught up')
+                    return
+                if previous_height is None:
+                    previous_height = tip
+            time.sleep(15)
+        raise RuntimeError('deployed node did not advance with healthy comparison')
+    except Exception:
+        linux.run('sudo -n systemctl stop zakura-mac-verifier')
+        mac.run(f'''set -eu
+sudo -n launchctl bootout system/dev.valargroup.zakura-verifier-node || true
+sudo -n launchctl bootout system/dev.valargroup.zakura-verifier-adapter || true
+sudo -n cp -p '{BASE}/bin/zakurad.previous' '{BASE}/bin/zakurad'
+sudo -n cp -p '{BASE}/receipt.json.previous' '{BASE}/receipt.json'
+sudo -n launchctl bootstrap system /Library/LaunchDaemons/dev.valargroup.zakura-verifier-node.plist
+sudo -n launchctl bootstrap system /Library/LaunchDaemons/dev.valargroup.zakura-verifier-adapter.plist
+''')
+        linux.run('''set -eu
+sudo -n cp -p /etc/zakura-mac-verifier/receipt.json.previous /etc/zakura-mac-verifier/receipt.json
+sudo -n python3 - <<'REMOTE'
+import hashlib, json, os, pathlib, sys
+sys.path.insert(0, '/opt/zakura-mac-verifier')
+from common import atomic_json
+path = pathlib.Path('/var/lib/zakura-mac-verifier/cursor.json')
+stat = path.stat()
+state = json.loads(path.read_text())
+receipt = json.loads(pathlib.Path('/etc/zakura-mac-verifier/receipt.json').read_text())
+state.update(receipt_digest=hashlib.sha256(json.dumps(receipt, sort_keys=True).encode()).hexdigest(),
+             healthy_since=None, healthy_start_height=None, qualified=False,
+             enablement_ready_since=None, enablement_good_samples=0)
+atomic_json(path, state)
+os.chown(path, stat.st_uid, stat.st_gid)
+REMOTE
+sudo -n systemctl start zakura-mac-verifier
+''')
+        raise
+    finally:
+        mac.run('rm -rf -- ' + shlex.quote(stage))
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('operation', choices=['status', 'dashboard'])
+    parser.add_argument('operation', choices=['status', 'dashboard', 'deploy'])
     args = parser.parse_args()
+    if os.environ.get('NO_RESTART') == 'true' or os.environ.get('FORCE_REBUILD') == 'true':
+        raise ValueError('Mac deployment consumes an accepted artifact and requires a restart')
     identifier = os.environ['MAC_VERIFIER_ID']
     if not re.fullmatch(r'verifier-[a-f0-9]{32}', identifier):
         raise ValueError('invalid verifier identity')
     with tempfile.TemporaryDirectory(prefix='mac-verifier-') as directory:
         mac = SSH('MAC_VERIFIER_', directory)
         linux = SSH('MAC_VERIFIER_REFERENCE_', directory)
-        if args.operation == 'dashboard':
+        if args.operation == 'deploy':
+            candidate_dir = Path(directory) / 'candidate'
+            download_candidate(os.environ['MAC_CANDIDATE_RUN_ID'], candidate_dir)
+            candidate = validate_candidate(candidate_dir, os.environ['MAC_SOURCE_REF'])
+            deploy_candidate(mac, linux, candidate_dir, candidate)
+        if args.operation in ('dashboard', 'deploy'):
             dashboard(linux)
         status(mac, linux, identifier)
 

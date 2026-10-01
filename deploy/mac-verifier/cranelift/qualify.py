@@ -98,6 +98,7 @@ def qualify(backend, source, output):
         temporary.replace(output / 'receipt.json')
 
     def run(name, args, cwd, exact=False, expected_exit=0, timeout=4 * 3600):
+        print('Starting acceptance check: ' + name, flush=True)
         receipt['phase'] = name
         save()
         log = output / (name + '.log')
@@ -114,7 +115,9 @@ def qualify(backend, source, output):
                                       log_sha256=digest(log)))
         save()
         if not passed:
+            print('Acceptance check failed: ' + name, flush=True)
             raise RuntimeError('acceptance failed; inspect private log: ' + name)
+        print('Acceptance check passed: ' + name, flush=True)
 
     run('unwind-probe-build', [cargo, 'build', '--manifest-path',
         str(RECIPE / 'probes/Cargo.toml'), '--locked', '--release'], RECIPE)

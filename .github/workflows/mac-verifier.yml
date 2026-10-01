@@ -4,6 +4,9 @@ on:
   pull_request:
     paths:
       - 'deploy/mac-verifier/**'
+      - 'deploy/deployer/mac_verifier.py'
+      - 'deploy/deployer/test_mac_verifier.py'
+      - '.github/workflows/zakura-mainnet-deploy.yml'
       - 'deploy/runner/zakura-cluster-status.py'
       - 'deploy/runner/zakura-cluster-watchdog.py'
       - 'deploy/runner/test_zakura_cluster_watchdog.py'
@@ -14,6 +17,9 @@ on:
     branches: [main]
     paths:
       - 'deploy/mac-verifier/**'
+      - 'deploy/deployer/mac_verifier.py'
+      - 'deploy/deployer/test_mac_verifier.py'
+      - '.github/workflows/zakura-mainnet-deploy.yml'
       - 'deploy/runner/zakura-cluster-status.py'
       - 'deploy/runner/zakura-cluster-watchdog.py'
       - 'deploy/runner/test_zakura_cluster_watchdog.py'
@@ -44,3 +50,4 @@ jobs:
       - run: python3 -m unittest discover -s deploy/mac-verifier/cranelift -p 'test_*.py' -v
       - run: python3 deploy/runner/test_zakura_cluster_status.py
       - run: python3 deploy/runner/test_zakura_cluster_watchdog.py
+      - run: python3 deploy/deployer/test_mac_verifier.py

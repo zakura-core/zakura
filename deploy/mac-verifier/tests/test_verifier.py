@@ -4,7 +4,6 @@ import json
 from pathlib import Path
 import sys
 import tempfile
-import tomllib
 import unittest
 from unittest.mock import patch, MagicMock
 import urllib.error
@@ -299,12 +298,6 @@ class BoundaryTests(unittest.TestCase):
             self.assertIsNone(result["mac_tip"])
             self.assertIsNone(result["linux_tip"])
 
-
-    def test_config_cache_root_matches_finalized_snapshot_layout(self):
-        package = Path(__file__).resolve().parents[1]
-        config = tomllib.loads((package / "templates/zakurad.toml").read_text())
-        self.assertEqual(Path(config["state"]["cache_dir"]) / "state/v29/mainnet/CURRENT",
-                         Path("/Library/Application Support/ZakuraVerifier/state/v29/mainnet/CURRENT"))
 
     def test_missing_pool_and_malformed_hex(self):
         value = record(10)

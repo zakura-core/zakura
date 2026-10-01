@@ -39,8 +39,22 @@ class AcceptanceTests(unittest.TestCase):
             accepted = root / 'accepted.patch'
             accepted.write_bytes(git('diff', 'HEAD', '--'))
             verify_backend_patch(backend, accepted)
+            for key, value in [('core.abbrev', '12'), ('diff.context', '5')]:
+                git('config', key, value)
+                self.assertNotEqual(git('diff', 'HEAD', '--'), accepted.read_bytes())
+                verify_backend_patch(backend, accepted)
             git('add', 'unwind.rs')
             verify_backend_patch(backend, accepted)
+            (backend / 'unwind.rs').chmod(0o755)
+            with self.assertRaises(ValueError):
+                verify_backend_patch(backend, accepted)
+            (backend / 'unwind.rs').chmod(0o644)
+            (backend / 'new.rs').write_text('unapproved new file\n')
+            git('add', 'new.rs')
+            with self.assertRaises(ValueError):
+                verify_backend_patch(backend, accepted)
+            git('reset', '-q', 'HEAD', '--', 'new.rs')
+            (backend / 'new.rs').unlink()
             (backend / 'other.rs').write_text('unapproved\n')
             with self.assertRaises(ValueError):
                 verify_backend_patch(backend, accepted)

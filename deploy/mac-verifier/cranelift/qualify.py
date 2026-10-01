@@ -11,6 +11,7 @@ import resource
 import signal
 import subprocess
 import time
+import tempfile
 
 RECIPE = Path(__file__).resolve().parent
 UPSTREAM = '05409775adc5f87a3aae12184486301f70ca519d'
@@ -37,10 +38,19 @@ def qualifies(exit_code, output, exact=False):
 
 def verify_backend_patch(backend, accepted):
     """Reject tracked changes outside the accepted patch, including staged changes."""
-    patch = subprocess.check_output(['git', '-C', str(backend), 'diff', 'HEAD', '--'],
-                                    timeout=30)
-    if patch != Path(accepted).read_bytes():
-        raise ValueError('backend patch differs from accepted profile')
+    with tempfile.TemporaryDirectory() as directory:
+        env = dict(os.environ, GIT_INDEX_FILE=str(Path(directory) / 'index'))
+        command = ['git', '-C', str(backend)]
+        subprocess.run(command + ['read-tree', 'HEAD'], env=env, check=True, timeout=30)
+        subprocess.run(command + ['apply', '--cached', str(Path(accepted).resolve())],
+                       env=env, check=True, timeout=30)
+        expected = subprocess.check_output(command + ['write-tree'], env=env,
+                                           text=True, timeout=30).strip()
+        result = subprocess.run(command + ['-c', 'core.filemode=true', 'diff',
+            '--quiet', '--no-ext-diff', '--no-textconv', '--ignore-submodules=none',
+            expected, '--'], timeout=30)
+        if result.returncode != 0:
+            raise ValueError('backend tracked contents differ from accepted profile')
 
 
 def qualify(backend, source, output):
@@ -106,22 +116,12 @@ def qualify(backend, source, output):
         if not passed:
             raise RuntimeError('acceptance failed; inspect private log: ' + name)
 
-    for optimization in ['0', '2']:
-        for probe in ['unwind_probe', 'unwind_extended']:
-            name = probe + '-' + optimization
-            executable = output / name
-            run(name + '-build', [str(backend / 'dist/rustc-clif'),
-                str(RECIPE / 'probes' / (probe + '.rs')), '-Cpanic=unwind',
-                '-Copt-level=' + optimization, '-Clink-arg=-Wl,-ld_classic',
-                '-o', str(executable)], RECIPE, timeout=120)
-            run(name, [str(executable)], output, timeout=30)
-            if probe == 'unwind_extended':
-                run(name + '-double-panic', [str(executable), 'double-panic'], output,
-                    expected_exit=-signal.SIGABRT, timeout=30)
-    run('async-probe-build', [cargo, 'build', '--manifest-path',
-        str(RECIPE / 'probes/async/Cargo.toml'), '--locked', '--release'], RECIPE)
-    run('async-probe', [str(output / 'target/release/cranelift-async-unwind-probe')],
-        output, timeout=30)
+    run('unwind-probe-build', [cargo, 'build', '--manifest-path',
+        str(RECIPE / 'probes/Cargo.toml'), '--locked', '--release'], RECIPE)
+    executable = output / 'target/release/cranelift-unwind-probe'
+    run('unwind-probe', [str(executable)], output, timeout=30)
+    run('double-panic', [str(executable), 'double-panic'], output,
+        expected_exit=-signal.SIGABRT, timeout=30)
     run('native-node-build', [cargo, 'build', '--locked', '--release', '-p',
                              'zakura', '--bin', 'zakurad'], source)
     for package, cases in [('zakura-consensus', manifest['tests']), ('zakura-network', CONTAINMENT)]:

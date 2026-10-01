@@ -1,5 +1,5 @@
 [package]
-name = "cranelift-async-unwind-probe"
+name = "cranelift-unwind-probe"
 version = "0.1.0"
 edition = "2021"
 [dependencies]

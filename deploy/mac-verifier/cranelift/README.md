@@ -1,126 +1,48 @@
-# Native Apple Silicon Cranelift build
+# Native Apple Silicon Cranelift candidate
 
-The Mac verifier compiler profile uses Cranelift for Rust machine-code generation,
-including the static standard library, with panic unwinding enabled. Zakura's
-consensus source stays at `af944f5194ef2e9921bc96af017629450375013c`.
-The deployment candidate workflow uses this profile; there is no stable-Rust
-fallback for the Mac verifier.
+The deployment candidate workflow builds Rust code, including its static standard
+library, with a patched Cranelift backend on an isolated ARM64 Mac. It uses
+consensus source `af944f5194ef2e9921bc96af017629450375013c`, backend
+`05409775adc5f87a3aae12184486301f70ca519d` and `nightly-2026-09-30`.
 
-Build on an isolated Apple Silicon development host with no running verifier.
-The deployed Mac is not a compiler experiment host or a general CI runner.
-The recipe does not provision hosts, change live databases or enable alerts.
+`macos-unwind.patch` corrects ARM64 Mach-O personality encoding and pointer-to-GOT
+relocation. It keeps exception tables in a shared read-only section while each
+frame references its own exception-table symbol. The compiler profile uses
+Apple's classic linker, `panic=unwind`, disabled LTO and one Cargo build job.
+Compiler bootstrap, native C dependencies and system libraries use their normal
+toolchains; this does not establish an entirely LLVM-free build.
 
-## Compiler provenance
+## Compiler acceptance
 
-Pin [rustc_codegen_cranelift](https://github.com/rust-lang/rustc_codegen_cranelift/tree/05409775adc5f87a3aae12184486301f70ca519d)
-to `05409775adc5f87a3aae12184486301f70ca519d` and Rust to
-`nightly-2026-09-30`. Apply `macos-unwind.patch` before building the backend.
-It corrects the ARM64 Mach-O personality encoding and pointer-to-GOT relocation.
-Mach-O exception tables use a shared read-only section: each frame description
-still references its own exception-table symbol. Allocating a custom section per
-function produced more than 72,000 sections in one network test object and
-exhausted the classic linker worker stack.
+`probes/` is one small release-mode crate. It checks nested destructor order,
+panic payload preservation, cleanup across an async suspension point, async lock
+release, healthy-task survival and Tokio panic reporting. A separate invocation
+must abort with `SIGABRT` when cleanup itself panics. These checks exercise the
+unwinding metadata modified by the backend patch; compilation alone cannot do so.
 
-The accepted profile uses Apple's classic linker, static Cranelift standard
-library, `panic=unwind`, disabled LTO and one Cargo build job. The compiler and
-build tooling use their normal bootstrap compiler. Native C dependencies,
-system libraries and the runtime unwinder retain their normal toolchain.
-This profile does not establish an entirely LLVM-free toolchain.
-
-## Rebuild the backend and standard library
-
-Install Xcode command-line tools, Python 3, Git, Rustup, CMake and Protobuf.
-Choose a fresh build directory outside the repository. In the commands below,
-`recipe_dir` is this directory and `backend_dir` is the new backend checkout.
-Keep build logs and receipts private; never put host configuration in them.
-
-```sh
-rustup toolchain install nightly-2026-09-30 --profile minimal --component rust-src
-git clone https://github.com/rust-lang/rustc_codegen_cranelift.git "$backend_dir"
-git -C "$backend_dir" checkout --detach 05409775adc5f87a3aae12184486301f70ca519d
-git -C "$backend_dir" apply "$recipe_dir/macos-unwind.patch"
-```
-
-Prepare a fresh `build/stdlib` directory in the backend checkout. Copy the pinned
-Rustup toolchain's `lib/rustlib/src/rust/library` directory into it as `library`,
-initialize a Git repository in that staging directory, and apply the backend's
-`patches/*-stdlib*.patch` files in filename order. In the staged
-`library/std/Cargo.toml`, change the sole
-`crate-type = ["dylib", "rlib"]` entry to `crate-type = ["rlib"]`.
-Do not modify Rustup's installed source or reuse an old staging directory.
-
-Then build the patched backend and prepared static standard library:
-
-```sh
-(cd "$backend_dir" && CARGO_BUILD_JOBS=1 ./y.sh build --panic-unwind-support --keep-sysroot)
-```
-
-The deployment candidate workflow performs these steps inline; there is no
-standalone host setup script in this package. Retain the prepared manifest and source/patch provenance with the
-acceptance evidence. The shared standard-library build is outside this profile.
-
-## Acceptance and deployment
-
-Require the four standalone probe configurations in `probes/` (debug and
-optimized basic/extended unwinding), double-panic abort, and the async probe's
-100 Tokio task panics. Build every Rust dependency with this backend and static
-sysroot. Use `-Cpanic=unwind -Clink-arg=-Wl,-ld_classic`, locked dependencies,
-`CARGO_BUILD_JOBS=1` and `CARGO_PROFILE_RELEASE_LTO=false`.
-
-Build `zakurad` from the clean pinned source and execute all eight cases in
-`../corpus.json` by exact name. Also execute these exact network library tests,
-requiring one passed, zero failed and zero ignored for each invocation:
+`qualify.py` builds the node and executes all eight existing consensus cases in
+`../corpus.json`, plus these actual network panic-containment tests:
 
 - `zakura::transport::pipe::tests::supervised_pipe_runs_teardown_on_panic`
 - `zakura::transport::pipe::tests::supervised_peer_task_runs_teardown_and_disconnect_on_panic`
 
-The broad `supervised_` filter also selects a normal-exit case, so a fixed
-expectation of two selected tests is incorrect. Never accept a zero-test run.
-Record source, lockfile, patch, backend, binary, SDK and configuration digests.
-No acceptance gate authorizes notification enablement.
+Each invocation must report exactly one passed test, zero failed and zero ignored.
+The driver checks the clean pinned consensus source and the complete tracked
+backend contents against the pinned backend plus accepted patch. Git diff
+formatting does not affect that comparison. It refuses a build host with a
+running `zakurad` and requires fresh output outside both source checkouts.
 
-Run the probes, node build and exact-case gates with a fresh private output
-directory outside both checkouts:
+## Candidate CI and runtime boundary
 
-```sh
-python3 "$recipe_dir/qualify.py" --backend "$backend_dir" \
-  --source "$source_dir" --output "$qualification_dir"
-```
+The `Build Cranelift Mac verifier deployment candidate` workflow runs in PR CI
+and supports manual dispatch. It prepares the pinned backend and static standard
+library, runs the acceptance driver, verifies native ARM64 output and uploads
+only the binary and receipt after every gate passes. Receipts record source,
+lockfile, compiler patch, backend, binary, SDK and configuration provenance.
+Failed builds publish no deployment candidate.
 
-The driver refuses a host with a running `zakurad`, source revision drift,
-modified consensus source, a different backend patch and zero-test successes.
-It records the candidate binary digest and individual gate results. Double panic
-must abort with `SIGABRT`; each exact corpus and containment case must execute.
-The driver does not deploy the binary.
-
-For a binary change, preserve and verify the current rollback binary and receipts,
-stop the comparator, and coordinate the Mac binary/receipt, adapter restart and
-Linux receipt identity. Preserve the bootstrap anchor, comparison cursor, retained
-history, incidents and outbox. Reset qualification counters for the new compiler.
-The monitor deliberately rejects an unexpected receipt change; do not erase its
-state to get past that guard. Configuration, consensus source or bootstrap changes
-require their own reviewed coverage boundary.
-
-After switching, verify the actual running native binary, startup replay, new
-mainnet advancement, hashes and decoded Sapling/Orchard/Ironwood state against the
-Linux reference, resource headroom and recovery. Historical finalized state stays
-trusted. Count new compiler coverage conservatively after the post-switch
-reference baseline. Short startup checks do not establish sustained qualification.
-
-The initial deployed candidate passed the full build, all eight exact consensus
-cases, both exact containment cases and five unwind probe configurations. Its
-initial live check passed 14 consecutive healthy samples and three new compared
-blocks. Full compiler conformance, independent review and sustained operational
-qualification remain separate gates. The compiler patch has not been submitted
-upstream. The verifier PR remains draft until its review and qualification gates
-are complete.
-
-## Deployment candidate CI
-
-The `Build Cranelift Mac verifier deployment candidate` workflow runs through
-Mac verifier PR CI and can also be dispatched manually. It uses a
-GitHub-hosted ARM64 Mac, never the live verifier. It builds the pinned backend and
-static standard library, invokes `qualify.py`, and publishes only `zakurad` and
-its acceptance receipt after every gate passes. A failed or timed-out build
-publishes no deployment artifact. Installation and identity coordination remain
-operator actions; an artifact is not evidence of deployment or live health.
+Installation and coordinated receipt changes remain operator actions. Preserve
+comparison cursors, incident history and queued alerts across reviewed binary
+changes. Compiler acceptance does not establish live health, sustained runtime
+qualification or permission to enable alerts. Independent compiler review and
+operational qualification remain required.

@@ -22,7 +22,6 @@ shared by both nodes.
 | `rotate_logs.py` | Mac | Bound launchd diagnostic logs without reopening child descriptors |
 | `common.py` | Both hosts | Bounded transport, canonical records and atomic state writes |
 | `alert_preflight.py` | Linux reference | Quiet alert enablement checks and historical-message archival |
-| `corpus.py` | Isolated build/CI host | Execute the exact pinned consensus acceptance cases |
 
 The adapter accepts only `GET /v1/status` and `GET /v1/block/<height>` on Mac
 loopback port `28233`; the node RPC stays on loopback `28232`. A dedicated reverse
@@ -52,31 +51,20 @@ CI runners and preserve its unrelated workloads. Use dedicated forwarding keys
 and authenticated pinned host keys; never copy a personal private key onto a host.
 Infisical remains the source of truth for private configuration and credentials.
 
-The Mac runtime base is `/Library/Application Support/ZakuraVerifier`. It contains
-`bin/zakurad`, `zakurad.toml`, `receipt.json`, `run/node.pid`, finalized state,
-private logs and acceptance evidence. The retained
-[`templates/zakurad.toml`](templates/zakurad.toml) records the verifier settings:
-pruned mainnet storage, checkpoint/VCT fast sync disabled and bounded concurrency.
+The Mac runtime base is `/Library/Application Support/ZakuraVerifier`. The node
+uses pruned mainnet storage with checkpoint/VCT fast sync disabled and bounded
+concurrency. Its RPC and adapter remain on loopback.
 
-Before activation, the operator must establish:
+The runtime consumes a private receipt containing `bootstrap_height`,
+`bootstrap_record`, `deployed_at`, `binary_sha256` and `config_sha256`. The starting
+anchor must agree with the Linux reference on block hash and all three tree
+roots/frontiers. The Linux expected receipt at
+`/etc/zakura-mac-verifier/receipt.json` must match the Mac receipt exactly.
 
-- A clean pinned consensus checkout and native ARM64 binary with locked dependency
-  provenance, configuration digest and passed native acceptance corpus.
-- A compatible finalized-only snapshot whose compressed size/checksum were checked,
-  whose extraction excluded peer identity and non-finalized state, and whose actual
-  finalized height exceeds the mandatory checkpoint range.
-- Agreement at the restored height on block hash and all three commitment-tree
-  roots/frontiers, plus sufficient disk headroom and correct service ownership.
-
-Record this evidence in a private receipt. The runtime consumes
-`bootstrap_height`, `bootstrap_record`, `deployed_at`, `binary_sha256` and
-`config_sha256`; retain consensus/tooling revisions, lockfile/toolchain provenance,
-snapshot identity and native corpus evidence alongside them. The Linux expected
-receipt at `/etc/zakura-mac-verifier/receipt.json` must match the Mac receipt exactly.
-An unexpected receipt, binary or configuration change must not silently replace
-comparison state. Preserve the bootstrap anchor, cursor/history, incidents and
-outbox across reviewed identity transitions; establish a fresh qualification
-baseline. Never overwrite state or erase a gap to manufacture qualification.
+Unexpected receipt, binary or configuration changes invalidate monitoring.
+Preserve the starting anchor, cursor/history, incidents and outbox across reviewed
+identity transitions; establish a fresh qualification baseline. Never overwrite
+state or erase a gap to manufacture qualification.
 
 ## Private and public status
 
@@ -141,18 +129,16 @@ Acknowledgement does not restore qualification or repair a divergent node.
 
 ## Acceptance and qualification
 
-Run the tooling tests and exact native corpus:
+Run the runtime tooling tests with:
 
 ```sh
 python3 -m unittest discover -s deploy/mac-verifier/tests -v
-python3 deploy/mac-verifier/corpus.py --source <clean-pinned-source> --output <private-evidence-directory>
 ```
 
-CI runs the corpus on native Linux x86_64; the actual Mac produces its own native
-ARM64 receipt. Every selected case must execute exactly once with zero failed or
-ignored tests. Neither a zero-test Cargo success nor a dashboard row is acceptance
-proof. Compiler-specific acceptance is described in
-[`cranelift/README.md`](cranelift/README.md).
+Native Cranelift CI executes the eight pinned consensus cases and two actual
+node panic-containment tests. Every case must execute exactly once with zero
+failed or ignored tests. Compiler acceptance is described in
+[`cranelift/README.md`](cranelift/README.md); a dashboard row does not prove it.
 
 Record node/tunnel outage and recovery, comparator restart preserving its cursor,
 controlled host-reboot recovery when unrelated workloads permit it, and real
@@ -166,17 +152,3 @@ Missing or stale samples, resource problems and falling behind reset the window.
 `qualified` records a historical achievement; current health, incidents and
 coverage remain separate status fields. It must not be interpreted as perpetual
 health. Muted compiler shadow observation is a separate runtime assurance gate.
-
-## Trial end and evidence preservation
-
-Review the private-host trial by hour 60 and stop verifier services after 72 hours
-unless explicitly extended. Export the Mac receipt, snapshot/native/compiler
-receipts and diagnostic logs; export the Linux expected receipt, cursor, status,
-audit journals and incident evidence into a new private directory before stopping.
-Keep the host, databases and unrelated workloads intact.
-
-Stop only the owned Linux comparator/bridge services and disable/unload only the
-owned Mac launchd jobs for the node, adapter, tunnel and log rotation. Confirm
-process ownership before stopping anything. Retain the state/evidence and revoke
-only the verifier's dedicated forwarding access when the trial is retired. Never
-destroy the host or revoke other nodes' credentials.

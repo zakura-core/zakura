@@ -38,7 +38,7 @@ use crate::{
     constants::{state_database_format_version_in_code, STATE_DATABASE_KIND},
     error::CommitCheckpointVerifiedError,
     request::{FinalizableBlock, FinalizedBlock, Treestate},
-    service::{check, QueuedCheckpointVerified},
+    service::{check, queued_blocks::CheckpointCommit, QueuedCheckpointVerified},
     CheckpointVerifiedBlock, Config, StateInitError, ValidateContextError,
 };
 
@@ -180,6 +180,7 @@ pub const STATE_COLUMN_FAMILIES_IN_CODE: &[&str] = &[
     HEADER_VERIFIED,
     HEADER_ELIGIBILITY_ROOT,
     HEADER_AUX_DELIVERY,
+    HEADER_AUX_BODY_SIZE,
     HEADER_DEFERRED,
     HEADER_FINALITY_HISTORY,
     HEADER_FINALITY_WITNESS,
@@ -242,6 +243,9 @@ pub const HEADER_VERIFIED: &str = "header_verified_v1";
 pub const HEADER_ELIGIBILITY_ROOT: &str = "header_eligibility_root_v1";
 /// Hash-keyed auxiliary deliveries.
 pub const HEADER_AUX_DELIVERY: &str = "header_aux_delivery_v1";
+
+/// Advisory size corrections keyed by the original auxiliary delivery.
+pub const HEADER_AUX_BODY_SIZE: &str = "header_aux_body_size_v1";
 /// Ordered future-time deferral index.
 pub const HEADER_DEFERRED: &str = "header_deferred_v1";
 /// Authoritative append-only finality history.
@@ -446,14 +450,17 @@ impl FinalizedState {
         // source to resume. Without it, the legacy committer would refuse every
         // remaining checkpoint block.
         if enforce_resume_guard
+            && !read_only
             && new_state.vct.is_below_last_checkpoint()
-            && new_state.vct.source().is_none()
+            && (new_state.vct.source().is_none()
+                || !config.enable_zakura_header_seed_from_committed_blocks)
         {
             panic!(
                 "this database was previously synced in verified commitment tree mode that was \
                  interrupted below the last checkpoint height. the fast path that supplies \
                  the verified roots needed to resume the VCT sync is disabled. Set \
-                 `consensus.checkpoint_sync = true` and `consensus.vct_fast_sync = true` to \
+                 `consensus.checkpoint_sync = true`, `consensus.vct_fast_sync = true`, and \
+                 `network.p2p_stack = \"zakura\"` or `\"dual\"` to \
                  finish the VCT sync, or delete the cache directory and re-sync from genesis"
             );
         }
@@ -617,19 +624,21 @@ impl FinalizedState {
     /// order.
     pub fn commit_finalized(
         &mut self,
-        ordered_block: QueuedCheckpointVerified,
+        ordered_block: CheckpointCommit,
         prev_note_commitment_trees: Option<NoteCommitmentTrees>,
         vct_successor_witness: Option<VctSuccessorWitness>,
     ) -> Result<
         (CheckpointVerifiedBlock, NoteCommitmentTrees),
-        (QueuedCheckpointVerified, CommitCheckpointVerifiedError),
+        (CheckpointCommit, CommitCheckpointVerifiedError),
     > {
+        let (block, response) = ordered_block;
         self.commit_finalized_inner(
-            ordered_block,
+            (block, response, 0),
             prev_note_commitment_trees,
             vct_successor_witness,
             None,
         )
+        .map_err(|((block, response, _attempt), error)| ((block, response), error))
     }
 
     /// Commit a checkpoint block and delegate its exact full-state batch to `commit`.
@@ -704,7 +713,7 @@ impl FinalizedState {
             VctAuthenticationProof,
         ) -> Result<(), CommitCheckpointVerifiedError>,
     {
-        let (checkpoint_verified, rsp_tx) = ordered_block;
+        let (checkpoint_verified, rsp_tx, attempt) = ordered_block;
         let result = self.commit_finalized_direct_with_aux(
             checkpoint_verified.clone().into(),
             prev_note_commitment_trees,
@@ -736,7 +745,7 @@ impl FinalizedState {
                 let _ = rsp_tx.send(Ok(hash));
                 Ok((checkpoint_verified, note_commitment_trees))
             }
-            Err(error) => Err(((checkpoint_verified, rsp_tx), error)),
+            Err(error) => Err(((checkpoint_verified, rsp_tx, attempt), error)),
         }
     }
 
@@ -1480,6 +1489,14 @@ impl FinalizedState {
         error: ValidateContextError,
         failure: crate::error::VctCommitFailure,
     ) -> CommitCheckpointVerifiedError {
+        if matches!(
+            error,
+            ValidateContextError::HistoryTreeError(ref error)
+                if matches!(error.as_ref(), zakura_chain::history_tree::HistoryTreeError::MissingBranchId { .. })
+        ) {
+            return error.into();
+        }
+
         metrics::counter!("state.vct.root.rejected.count").increment(1);
         tracing::warn!(
             ?height,

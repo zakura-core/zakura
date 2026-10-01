@@ -11,12 +11,13 @@ use zakura_chain::{
     block::{Block, Hash, Header, Height},
     parameters::{
         subsidy::{
-            founders_reward, founders_reward_address, funding_stream_values, FundingStreamReceiver,
-            ParameterSubsidy, SubsidyError,
+            founders_reward, founders_reward_address, funding_stream_values, miner_fee_share,
+            FundingStreamReceiver, ParameterSubsidy, SubsidyError,
         },
-        Network, NetworkUpgrade,
+        Network, NetworkUpgrade, GLOBAL_SHIELDED_BUDGET, ORCHARD_PROTOCOL_BLOCK_ACTION_LIMIT,
+        SAPLING_BLOCK_IO_LIMIT, SPROUT_BLOCK_JOINSPLIT_LIMIT,
     },
-    transaction::{self, Transaction},
+    transaction::{self, ShieldedActionCounts, Transaction},
     transparent::{Address, Output},
     work::{difficulty::ExpandedDifficulty, equihash},
 };
@@ -47,6 +48,11 @@ impl UnmatchedCoinbaseOutputs {
 
         self.outputs.remove(index);
         true
+    }
+
+    /// Removes one output paying the required amount to the configured address.
+    fn remove_payment(&mut self, address: &Address, amount: Amount<NonNegative>) -> bool {
+        self.remove(&Output::new(amount, address.script()))
     }
 }
 
@@ -188,12 +194,6 @@ pub fn subsidy_is_valid(
             .outputs(),
     );
 
-    let mut has_amount = |addr: &Address, amount| {
-        assert!(addr.is_script_hash(), "address must be P2SH");
-
-        coinbase_outputs.remove(&Output::new(amount, addr.script()))
-    };
-
     // # Note
     //
     // Canopy activation is at the first halving on Mainnet, but not on Testnet. [ZIP-1014] only
@@ -221,7 +221,7 @@ pub fn subsidy_is_valid(
                 "founders reward address must be defined for height: {height:?}"
             )))?;
 
-            if !has_amount(&addr, founders_reward(net, height)) {
+            if !coinbase_outputs.remove_payment(&addr, founders_reward(net, height)) {
                 Err(SubsidyError::FoundersRewardNotFound)?;
             }
         }
@@ -285,7 +285,7 @@ pub fn subsidy_is_valid(
             deferred_pool_balance_change = lockbox_disbursements.into_iter().try_fold(
                 deferred_pool_balance_change,
                 |balance, (addr, expected_amount)| {
-                    if !has_amount(&addr, expected_amount) {
+                    if !coinbase_outputs.remove_payment(&addr, expected_amount) {
                         Err(SubsidyError::OneTimeLockboxDisbursementNotFound)?;
                     }
 
@@ -305,7 +305,7 @@ pub fn subsidy_is_valid(
                             .to_string(),
                     ))?;
 
-                if !has_amount(addr, expected_amount) {
+                if !coinbase_outputs.remove_payment(addr, expected_amount) {
                     Err(SubsidyError::FundingStreamNotFound)?;
                 }
 
@@ -319,11 +319,14 @@ pub fn subsidy_is_valid(
 
 /// Returns `Ok(())` if the miner fees consensus rule is valid.
 ///
+/// `block_transaction_fees` is the aggregate fee before the NU7 NSM contribution.
+/// The coinbase must claim the remaining miner share from NU7 onward.
+///
 /// [7.1.2]: https://zips.z.cash/protocol/protocol.pdf#txnconsensus
 pub fn miner_fees_are_valid(
     coinbase_tx: &Transaction,
     height: Height,
-    block_miner_fees: Amount<NonNegative>,
+    block_transaction_fees: Amount<NonNegative>,
     expected_block_subsidy: Amount<NonNegative>,
     expected_deferred_pool_balance_change: DeferredPoolBalanceChange,
     network: &Network,
@@ -359,6 +362,9 @@ pub fn miner_fees_are_valid(
         + expected_deferred_pool_balance_change.value())
     .map_err(|_| SubsidyError::Overflow)?;
 
+    // NU7 modifies ZIP 236's full-claim rule by excluding the NSM fee contribution.
+    // Round once over the aggregate fees, independently of the reissuance start height.
+    let block_miner_fees = miner_fee_share(height, network, block_transaction_fees);
     let total_input_value =
         (expected_block_subsidy + block_miner_fees).map_err(|_| SubsidyError::Overflow)?;
 
@@ -404,6 +410,99 @@ pub fn time_is_valid_at(
     zakura_header_chain::validate_future_time(header, now, *height, *hash)
 }
 
+/// Returns `Ok(())` if the ZIP 218 per-block shielded limits hold for the sum of
+/// `transactions` on `network` at `height`.
+///
+/// The block verifier passes every transaction in the block. The transaction
+/// verifier passes a single transaction, because a transaction whose own counts
+/// exceed a per-block limit can never be mined, so the mempool rejects it on
+/// submission.
+///
+/// The limits apply only once NU7 is active, so this is a no-op on any network
+/// without an NU7 activation height.
+///
+/// # Consensus
+///
+/// > For each block at height `height` where `IsNU7Activated(height)`, the
+/// > following limits MUST be satisfied:
+/// >
+/// > - The total number of Orchard actions across all transactions in the block
+/// >   MUST NOT exceed `OrchardProtocolBlockActionLimit`.
+/// > - The total number of Ironwood actions across all transactions in the block
+/// >   MUST NOT exceed `OrchardProtocolBlockActionLimit`.
+/// > - The total number of Sapling inputs and outputs across all transactions in
+/// >   the block MUST NOT exceed `SaplingBlockIOLimit`.
+/// > - The total number of Sprout JoinSplits across all transactions in the
+/// >   block MUST NOT exceed `SproutBlockJoinSplitLimit`.
+/// > - The total shielded cost across all pools MUST NOT exceed
+/// >   `GlobalShieldedBudget`, where that cost is
+/// >   `Σ (orchard_actions + ironwood_actions) + Σ (sapling_spends +
+/// >   sapling_outputs) + 2 * Σ joinsplits`.
+///
+/// <https://zips.z.cash/zip-0218#shielded-pool-action-limits>
+///
+/// Orchard and Ironwood each get their own per-pool limit, and both draw on the
+/// single global shielded budget.
+///
+/// ZIP 218 sets `SproutBlockJoinSplitLimit` to zero. Zakura rejects any
+/// JoinSplit at or after NU7, because ZIP 2003 disallows the only transaction
+/// versions that can carry one. See [`SPROUT_BLOCK_JOINSPLIT_LIMIT`].
+pub fn shielded_action_limits_are_valid<'a>(
+    transactions: impl IntoIterator<Item = &'a Arc<Transaction>>,
+    height: Height,
+    network: &Network,
+) -> Result<(), TransactionError> {
+    if !NetworkUpgrade::is_nu7_active(network, height) {
+        return Ok(());
+    }
+
+    let totals = transactions
+        .into_iter()
+        .map(|tx| tx.shielded_action_counts())
+        .fold(
+            ShieldedActionCounts::default(),
+            ShieldedActionCounts::saturating_add,
+        );
+
+    if totals.orchard_actions > ORCHARD_PROTOCOL_BLOCK_ACTION_LIMIT {
+        return Err(TransactionError::OrchardActionsExceedBlockLimit {
+            actions: totals.orchard_actions,
+            limit: ORCHARD_PROTOCOL_BLOCK_ACTION_LIMIT,
+        });
+    }
+
+    if totals.ironwood_actions > ORCHARD_PROTOCOL_BLOCK_ACTION_LIMIT {
+        return Err(TransactionError::IronwoodActionsExceedBlockLimit {
+            actions: totals.ironwood_actions,
+            limit: ORCHARD_PROTOCOL_BLOCK_ACTION_LIMIT,
+        });
+    }
+
+    if totals.sapling_ios > SAPLING_BLOCK_IO_LIMIT {
+        return Err(TransactionError::SaplingIOsExceedBlockLimit {
+            ios: totals.sapling_ios,
+            limit: SAPLING_BLOCK_IO_LIMIT,
+        });
+    }
+
+    if totals.sprout_joinsplits > SPROUT_BLOCK_JOINSPLIT_LIMIT {
+        return Err(TransactionError::SproutJoinSplitsExceedBlockLimit {
+            joinsplits: totals.sprout_joinsplits,
+            limit: SPROUT_BLOCK_JOINSPLIT_LIMIT,
+        });
+    }
+
+    let cost = totals.cost();
+    if cost > GLOBAL_SHIELDED_BUDGET {
+        return Err(TransactionError::ShieldedCostExceedsBlockBudget {
+            cost,
+            limit: GLOBAL_SHIELDED_BUDGET,
+        });
+    }
+
+    Ok(())
+}
+
 /// Check Merkle root validity.
 ///
 /// `transaction_hashes` is a precomputed list of transaction hashes.
@@ -426,11 +525,8 @@ pub fn merkle_root_validity(
     block: &Block,
     transaction_hashes: &[transaction::Hash],
 ) -> Result<(), BlockError> {
-    // TODO: deduplicate zakura-chain and zakura-consensus errors (#2908)
-    block
-        .check_transaction_network_upgrade_consistency(network)
-        .map_err(|_| BlockError::WrongTransactionConsensusBranchId)?;
-
+    // Check the header commitments first. The network upgrade check trusts the coinbase height,
+    // which a peer can rewrite without changing a V5 block's hash.
     let merkle_root = transaction_hashes.iter().cloned().collect();
 
     if block.header.merkle_root != merkle_root {
@@ -462,6 +558,11 @@ pub fn merkle_root_validity(
         return Err(BlockError::DuplicateTransaction);
     }
 
+    // TODO: deduplicate zakura-chain and zakura-consensus errors (#2908)
+    block
+        .check_transaction_network_upgrade_consistency(network)
+        .map_err(|_| BlockError::WrongTransactionConsensusBranchId)?;
+
     Ok(())
 }
 
@@ -469,7 +570,8 @@ pub fn merkle_root_validity(
 mod tests {
     use zakura_chain::{
         amount::{Amount, NonNegative},
-        transparent::{Output, Script},
+        parameters::NetworkKind,
+        transparent::{Address, Output, Script},
     };
 
     use super::UnmatchedCoinbaseOutputs;
@@ -493,5 +595,25 @@ mod tests {
         assert!(outputs.remove(&repeated_output));
         assert!(!outputs.remove(&repeated_output));
         assert!(outputs.remove(&distinct_output));
+    }
+
+    #[test]
+    fn coinbase_payment_matches_configured_address_and_amount() {
+        let nu7_fpf_address: Address = "t1MkHnkxVjNpNbCrSs3AJ8J7ZSp6NTYiUcG"
+            .parse()
+            .expect("ZIP 2008 specifies a valid transparent address");
+        let p2sh_address = Address::from_script_hash(NetworkKind::Mainnet, [0; 20]);
+        let wrong_address = Address::from_pub_key_hash(NetworkKind::Mainnet, [0; 20]);
+        let amount = Amount::<NonNegative>::new(1);
+
+        for address in [p2sh_address, nu7_fpf_address] {
+            let mut outputs =
+                UnmatchedCoinbaseOutputs::new(&[Output::new(amount, address.script())]);
+
+            assert!(!outputs.remove_payment(&wrong_address, amount));
+            assert!(!outputs.remove_payment(&address, Amount::new(2)));
+            assert!(outputs.remove_payment(&address, amount));
+            assert!(!outputs.remove_payment(&address, amount));
+        }
     }
 }

@@ -84,6 +84,9 @@ pub(in crate::zakura::header_sync) struct RepairRequirement {
     pub tried_sources: HashSet<SourceId>,
     /// Connected suppliers that returned input excluded by this durable episode.
     pub excluded_input_sources: HashSet<SourceId>,
+    /// Suppliers waiting for a later status from their current session after Busy.
+    /// Live peer admission limits bound this set.
+    busy_sources: HashSet<SourceId>,
 }
 
 impl RepairRequirement {
@@ -97,6 +100,7 @@ impl RepairRequirement {
             attempts: 0,
             tried_sources: HashSet::new(),
             excluded_input_sources: HashSet::new(),
+            busy_sources: HashSet::new(),
         }
     }
 
@@ -183,9 +187,33 @@ impl RepairRequirement {
             _ => return Err(RepairPolicyError::IllegalState),
         };
         self.attempts = self.attempts.saturating_add(1);
+        self.busy_sources.remove(&source);
         self.tried_sources.insert(source);
         self.state = RepairPolicyState::Ready { context };
         Ok(())
+    }
+
+    /// Wait for this supplier's next status without blocking other suppliers.
+    pub fn wait_for_supplier_status(&mut self, source: SourceId) -> Result<(), RepairPolicyError> {
+        let RepairPolicyState::Assigned { context } = &self.state else {
+            return Err(RepairPolicyError::IllegalState);
+        };
+        self.busy_sources.insert(source);
+        self.attempts = self.attempts.saturating_add(1);
+        self.state = RepairPolicyState::Ready {
+            context: context.clone(),
+        };
+        Ok(())
+    }
+
+    /// Whether a temporary refusal still requires a later status from this session.
+    pub fn supplier_is_waiting_for_status(&self, source: SourceId) -> bool {
+        self.busy_sources.contains(&source)
+    }
+
+    /// Release only a Busy wait after the reactor validates the status's session.
+    pub fn observe_supplier_status(&mut self, source: SourceId) {
+        self.busy_sources.remove(&source);
     }
 
     /// Rotate away from a supplier that returned semantic input excluded by durable state.
@@ -201,19 +229,30 @@ impl RepairRequirement {
             return Err(RepairPolicyError::IllegalState);
         }
         self.attempts = self.attempts.saturating_add(1);
+        self.busy_sources.remove(&source);
         self.tried_sources.insert(source);
         Ok(())
+    }
+
+    /// Forget one supplier's failure history when its session is replaced.
+    ///
+    /// Durable semantic exclusions remain in the repair context and committed state.
+    pub fn forget_source(&mut self, source: SourceId) {
+        self.tried_sources.remove(&source);
+        self.excluded_input_sources.remove(&source);
+        self.busy_sources.remove(&source);
     }
 
     /// Forget supplier identities that no longer have a live session.
     ///
     /// Durable state retains rejected and disputed semantic input. The reactor only needs the
-    /// identity sets to prevent repeated requests to a supplier while that supplier stays
-    /// connected.
+    /// identity sets to prevent repeated requests within a supplier's current session.
     pub fn retain_connected_sources(&mut self, connected_sources: &HashSet<SourceId>) {
         self.tried_sources
             .retain(|source| connected_sources.contains(source));
         self.excluded_input_sources
+            .retain(|source| connected_sources.contains(source));
+        self.busy_sources
             .retain(|source| connected_sources.contains(source));
     }
 
@@ -468,6 +507,47 @@ mod tests {
         let completed = task.clone();
         assert_eq!(task.retry(source), Err(RepairPolicyError::IllegalState));
         assert_eq!(task, completed, "completed work cannot transition again");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn busy_status_wait_preserves_semantic_exclusions() {
+        let mut task = task(&snapshot());
+        let source = SourceId::from_digest([8; 32]);
+        let excluded = SourceId::from_digest([9; 32]);
+        let context = context();
+        mark_context_requested(&mut task);
+        task.resolve(context.clone())
+            .expect("the selected context resolves");
+        task.assign(task.owner, context.clone())
+            .expect("the excluded supplier is assigned");
+        task.exclude_input(excluded)
+            .expect("semantic input is excluded");
+
+        for _ in 0..3 {
+            task.assign(task.owner, context.clone())
+                .expect("the busy supplier is assigned");
+            task.wait_for_supplier_status(source)
+                .expect("Busy waits for another status");
+            assert_eq!(task.next_deadline(), None);
+            tokio::time::advance(std::time::Duration::from_secs(300)).await;
+            task.resume_retry(Instant::now());
+            assert_eq!(task.next_deadline(), None);
+            assert!(task.supplier_is_waiting_for_status(source));
+            task.observe_supplier_status(excluded);
+            assert!(task.supplier_is_waiting_for_status(source));
+            task.observe_supplier_status(source);
+            assert!(!task.supplier_is_waiting_for_status(source));
+            assert!(!task.tried_sources.contains(&source));
+            assert!(task.tried_sources.contains(&excluded));
+            assert!(task.excluded_input_sources.contains(&excluded));
+        }
+        task.assign(task.owner, context)
+            .expect("the supplier can be assigned again");
+        task.wait_for_supplier_status(source)
+            .expect("a later Busy restores the wait");
+        task.retain_connected_sources(&[excluded].into_iter().collect());
+        assert!(task.busy_sources.is_empty());
+        assert!(task.excluded_input_sources.contains(&excluded));
     }
 
     #[test]

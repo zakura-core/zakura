@@ -1065,7 +1065,7 @@ where
                     .map(|()|
                          Handler::BlocksByHash {
                              blocks: Vec::with_capacity(hashes.len()),
-                             pending_hashes: hashes,
+                             pending_hashes: hashes.into_iter().collect(),
                          }
                     )
             }

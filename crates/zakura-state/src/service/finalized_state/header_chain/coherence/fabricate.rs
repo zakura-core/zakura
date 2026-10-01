@@ -9,7 +9,7 @@ use zakura_chain::{
     serialization::ZcashDeserializeInto,
     work::difficulty::{CompactDifficulty, ParameterDifficulty, U256},
 };
-use zakura_header_chain::{AdjustedDifficulty, POW_ADJUSTMENT_BLOCK_SPAN};
+use zakura_header_chain::{AdjustedDifficulty, MAX_POW_ADJUSTMENT_BLOCK_SPAN};
 use zakura_test::vectors::MAINNET_BLOCKS;
 
 type DifficultyContext = Vec<(CompactDifficulty, DateTime<Utc>)>;
@@ -90,7 +90,7 @@ fn fabricate_headers(
             previous_height = height;
             previous_hash = hash;
             context.insert(0, (header.difficulty_threshold, header.time));
-            context.truncate(POW_ADJUSTMENT_BLOCK_SPAN);
+            context.truncate(MAX_POW_ADJUSTMENT_BLOCK_SPAN);
 
             FabHeader {
                 height,
@@ -105,7 +105,7 @@ fn extend_context(mut context: DifficultyContext, headers: &[FabHeader]) -> Diff
     for header in headers {
         context.insert(0, (header.header.difficulty_threshold, header.header.time));
     }
-    context.truncate(POW_ADJUSTMENT_BLOCK_SPAN);
+    context.truncate(MAX_POW_ADJUSTMENT_BLOCK_SPAN);
     context
 }
 

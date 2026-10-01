@@ -160,6 +160,8 @@ pub(super) struct BlockTraceFields {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub returned_count: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub committed_count: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub already_pending_count: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub released_count: Option<u64>,
@@ -354,36 +356,6 @@ impl QueueSendFailedEvent {
             queue_capacity,
             queue_max_capacity,
             MessageFields::new(message),
-        )
-    }
-
-    /// Peer routines historically projected range fields only for GetBlocks.
-    pub(super) fn peer_routine(
-        peer: &ZakuraPeerId,
-        message: &BlockSyncMessage,
-        error: &OrderedSendError,
-        queue_capacity: usize,
-        queue_max_capacity: usize,
-    ) -> Self {
-        let message_fields = match message {
-            BlockSyncMessage::GetBlocks {
-                start_height,
-                count,
-            } => MessageFields {
-                range_start: Some(height(*start_height)),
-                range_count: Some(u64::from(*count)),
-                ..MessageFields::default()
-            },
-            _ => MessageFields::default(),
-        };
-        Self::build(
-            peer,
-            message,
-            error,
-            None,
-            queue_capacity,
-            queue_max_capacity,
-            message_fields,
         )
     }
 

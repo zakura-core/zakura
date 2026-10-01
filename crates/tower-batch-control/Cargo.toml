@@ -14,7 +14,6 @@ repository.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 
-homepage.workspace = true
 # crates.io is limited to 5 keywords and categories
 keywords = ["tower", "batch"]
 # Must be one of <https://crates.io/category_slugs>
@@ -45,7 +44,7 @@ tokio-test = { workspace = true }
 tower-fallback = { package = "zakura-tower-fallback", path = "../tower-fallback/", version = "1.2.0" }
 tower-test = { workspace = true }
 
-zakura-test = { path = "../zakura-test/", version = "2.1.0" }
+zakura-test = { path = "../zakura-test/", version = "2.2.0" }
 
 [lints]
 workspace = true

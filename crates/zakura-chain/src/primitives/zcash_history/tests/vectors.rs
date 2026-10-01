@@ -252,3 +252,42 @@ fn compact_size(value: u64) -> usize {
         _ => 9,
     }
 }
+
+#[test]
+fn constructors_reject_missing_branch_ids() {
+    let _init_guard = zakura_test::init();
+    // BeforeOverwinter has no branch ID in unit tests or production builds.
+    let network = Network::Mainnet;
+    let error = Tree::<V1>::new_from_cache(
+        &network,
+        NetworkUpgrade::BeforeOverwinter,
+        1,
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+    )
+    .expect_err("a branchless upgrade must fail before cache decoding");
+    assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+
+    let block = Arc::new(
+        zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
+            .zcash_deserialize_into::<Block>()
+            .expect("the genesis vector is valid"),
+    );
+    let sapling_root = sapling::tree::NoteCommitmentTree::default().root();
+    let orchard_root = orchard::tree::NoteCommitmentTree::default().root();
+    let ironwood_root = ironwood::tree::NoteCommitmentTree::default().root();
+    let error = Tree::<V3>::new_from_block(
+        &network,
+        block.clone(),
+        &sapling_root,
+        &orchard_root,
+        &ironwood_root,
+    )
+    .expect_err("a branchless upgrade must fail before building a leaf");
+    assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    let parts =
+        HistoryTreeBlockParts::from_block(&block, &sapling_root, &orchard_root, &ironwood_root);
+    let error = Tree::<V3>::new_from_parts(&network, parts)
+        .expect_err("a branchless upgrade must fail before building a leaf from parts");
+    assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+}

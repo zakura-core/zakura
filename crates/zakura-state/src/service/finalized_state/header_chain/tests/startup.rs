@@ -932,7 +932,7 @@ fn version_one_migration_rejects_an_ambiguous_network_policy_without_writing() {
     let (engine_config, anchor, metadata) = fixture();
     let changed_network = Network::new_regtest(RegtestParameters {
         activation_heights: ConfiguredActivationHeights {
-            canopy: Some(10),
+            nu5: Some(10),
             ..Default::default()
         },
         ..Default::default()
@@ -1085,7 +1085,7 @@ fn version_two_migration_rejects_an_ambiguous_network_policy_without_writing() {
     let (engine_config, anchor, metadata) = fixture();
     let changed_network = Network::new_regtest(RegtestParameters {
         activation_heights: ConfiguredActivationHeights {
-            canopy: Some(10),
+            nu5: Some(10),
             ..Default::default()
         },
         ..Default::default()
@@ -1311,51 +1311,60 @@ fn a_newer_header_chain_disk_format_does_not_classify_as_initialized() {
     ));
 }
 
+/// Version-three stores preserve their diagnostic digest until startup audits the rows.
 #[test]
-fn version_three_migration_rejects_a_network_policy_mismatch_atomically() {
-    let db_config = Config::ephemeral();
-    let (engine_config, anchor, mut metadata) = mainnet_fixture();
-    metadata.network_policy_digest = [0x73; 32];
-    let metadata_value = mark_metadata_as_v3(&metadata);
-    let db = open(&db_config, engine_config.network());
-    let store = HeaderChainStore::new(db);
-    store
-        .initialize(
-            EngineMetadata {
-                disk_format: HeaderChainDiskVersion::CURRENT,
-                network_policy_digest: engine_config.network_policy_digest(),
-                ..metadata.clone()
-            },
-            anchor,
-        )
-        .expect("the current fixture initializes");
-    let mut batch = DiskWriteBatch::new();
-    store
-        .put_raw(
-            &mut batch,
-            HEADER_ENGINE_META,
-            METADATA_KEY,
-            &metadata_value,
-        )
-        .expect("the mismatched version-three metadata stages");
-    store.db.write(batch).expect("the legacy fixture commits");
-
-    assert!(matches!(
-        store.migrate_to_current(&engine_config),
-        Err(HeaderChainStoreError::Incoherent(
-            "legacy network policy does not match the configured policy"
-        ))
-    ));
-    let metadata_cf = store
-        .cf(HEADER_ENGINE_META)
-        .expect("the metadata column family exists");
-    assert_eq!(
+fn version_three_migration_keeps_a_policy_change_for_startup() {
+    for (engine_config, anchor, mut metadata) in [mainnet_fixture(), fixture()] {
+        let db_config = Config::ephemeral();
+        metadata.network_policy_digest = [0x73; 32];
+        let metadata_value = mark_metadata_as_v3(&metadata);
+        let db = open(&db_config, engine_config.network());
+        let store = HeaderChainStore::new(db.clone());
         store
-            .db
-            .raw_get_cf(&metadata_cf, METADATA_KEY)
-            .expect("the metadata remains readable"),
-        Some(metadata_value)
-    );
+            .initialize(
+                EngineMetadata {
+                    disk_format: HeaderChainDiskVersion::CURRENT,
+                    ..metadata.clone()
+                },
+                anchor,
+            )
+            .expect("the current fixture initializes");
+        let mut batch = DiskWriteBatch::new();
+        store
+            .put_raw(
+                &mut batch,
+                HEADER_ENGINE_META,
+                METADATA_KEY,
+                &metadata_value,
+            )
+            .expect("the earlier release's version-three metadata stages");
+        stage_full_state_canonical_hash(&store, &mut batch, metadata.frontiers.finalized);
+        store.db.write(batch).expect("the legacy fixture commits");
+
+        assert!(store
+            .migrate_to_current(&engine_config)
+            .expect("migration accepts a diagnostic policy change"));
+        assert_eq!(
+            store
+                .metadata()
+                .expect("the migrated metadata is readable")
+                .network_policy_digest,
+            [0x73; 32],
+            "migration keeps the durable digest for the startup audit",
+        );
+
+        let (_, report) = HeaderChainStore::new(db.clone())
+            .startup(&engine_config)
+            .expect("startup updates the migrated policy digest");
+        assert_eq!(
+            report.repairs,
+            BTreeSet::from([RecoveryRepair::NetworkPolicyConfiguration])
+        );
+        let (_, reopened) = HeaderChainStore::new(db)
+            .startup(&engine_config)
+            .expect("the rebound policy and its migration record pass the audit");
+        assert!(reopened.repairs.is_empty());
+    }
 }
 
 #[test]
@@ -1574,6 +1583,95 @@ fn startup_atomically_rebinds_an_extended_checkpoint_manifest() {
         .startup(&updated_config)
         .expect("the rebound manifest persists atomically");
     assert!(reopened.repairs.is_empty());
+}
+
+/// A release that sets an activation height changes the Mainnet policy digest. Startup must
+/// keep the store, audit it under the new policy, and rebind the digest.
+#[test]
+fn release_network_startup_atomically_rebinds_a_changed_network_policy() {
+    let db_config = Config::ephemeral();
+    let (engine_config, anchor, mut metadata) = mainnet_fixture();
+    let previous_state_version = metadata.state_version;
+    // The store was written by a release with different Mainnet parameters.
+    metadata.network_policy_digest = [0xab; 32];
+    let db = open(&db_config, engine_config.network());
+    let store = HeaderChainStore::new(db.clone());
+    store
+        .initialize(metadata, anchor)
+        .expect("the previous release's policy initializes the fixture");
+
+    let (runtime, report) = store
+        .startup(&engine_config)
+        .expect("startup rebinds a fully audited release policy change");
+    assert_eq!(
+        report.repairs,
+        BTreeSet::from([RecoveryRepair::NetworkPolicyConfiguration])
+    );
+    assert_eq!(
+        report.current.state_version,
+        previous_state_version
+            .checked_next()
+            .expect("the fixture state version can advance")
+    );
+    assert_eq!(
+        runtime
+            .store
+            .metadata()
+            .expect("the metadata is readable")
+            .network_policy_digest,
+        engine_config.network_policy_digest()
+    );
+    drop(runtime);
+
+    let (_, reopened) = HeaderChainStore::new(db)
+        .startup(&engine_config)
+        .expect("the rebound policy persists atomically");
+    assert!(reopened.repairs.is_empty());
+}
+
+/// Startup accepts a future activation change on a configured network after auditing.
+#[test]
+fn configured_network_startup_rebinds_a_changed_network_policy() {
+    let db_config = Config::ephemeral();
+    let (engine_config, anchor, metadata) = fixture();
+    let changed_config = EngineConfig::new(
+        engine_config.mode,
+        Network::new_regtest(RegtestParameters {
+            activation_heights: ConfiguredActivationHeights {
+                nu5: Some(10),
+                ..Default::default()
+            },
+            ..Default::default()
+        }),
+        engine_config.bootstrap_anchor().clone(),
+        CheckpointSet::default(),
+    )
+    .expect("the changed policy accepts the same bootstrap anchor");
+    assert_ne!(
+        engine_config.network_policy_digest(),
+        changed_config.network_policy_digest()
+    );
+    let db = open(&db_config, engine_config.network());
+    let store = HeaderChainStore::new(db);
+    store
+        .initialize(metadata, anchor)
+        .expect("the current fixture initializes");
+
+    let (runtime, report) = store
+        .startup(&changed_config)
+        .expect("a future activation change passes the source audit");
+    assert_eq!(
+        report.repairs,
+        BTreeSet::from([RecoveryRepair::NetworkPolicyConfiguration])
+    );
+    assert_eq!(
+        runtime
+            .store
+            .metadata()
+            .expect("the audited metadata is readable")
+            .network_policy_digest,
+        changed_config.network_policy_digest()
+    );
 }
 
 #[test]

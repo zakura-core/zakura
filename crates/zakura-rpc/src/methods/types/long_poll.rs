@@ -49,10 +49,10 @@ pub struct LongPollInput {
     /// The max time in the same template as this long poll ID.
     ///
     /// If the max time is reached, a new template must be provided.
-    /// Old work is no longer valid.
+    /// Work with a later timestamp is not valid for this template.
     ///
-    /// Ideally, a new template should be provided at least one target block interval before
-    /// the max time. This avoids wasted work.
+    /// On testnet, long polling provides minimum difficulty work one second after the
+    /// max time, when it becomes valid.
     pub max_time: DateTime32,
 
     // Fields that allow old work:
@@ -154,11 +154,7 @@ pub struct LongPollId {
 
     /// The max time in the same template as this long poll ID.
     ///
-    /// If the max time is reached, a new template must be provided.
-    /// Old work is no longer valid.
-    ///
-    /// Ideally, a new template should be provided at least one target block interval before
-    /// the max time. This avoids wasted work.
+    /// See [`LongPollInput::max_time`] for how it is used.
     ///
     /// Zcash times are limited to 32 bits by the consensus rules.
     pub(crate) max_timestamp: u32,

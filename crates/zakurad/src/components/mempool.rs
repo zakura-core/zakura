@@ -319,6 +319,16 @@ fn peer_action(error: &TransactionError) -> PeerAction {
         // Only v5 and later transactions contain Orchard actions.
         DisabledAddToOrchardPool => BanV5AndLater,
 
+        // ZIP 218 limits apply from NU7. A v5 or later transaction declares
+        // its upgrade, and a branch ID mismatch fails first. A v4 transaction
+        // declares none, so a peer behind NU7 can relay one that exceeds a
+        // limit.
+        OrchardActionsExceedBlockLimit { .. }
+        | IronwoodActionsExceedBlockLimit { .. }
+        | SaplingIOsExceedBlockLimit { .. }
+        | SproutJoinSplitsExceedBlockLimit { .. }
+        | ShieldedCostExceedsBlockBudget { .. } => BanV5AndLater,
+
         // These rules depend on the tip's network upgrade. zcashd scores these
         // failures 10 in its mempool. [`transaction_cooldown_peer`] only
         // starts a cooldown for a branch ID mismatch when the transaction

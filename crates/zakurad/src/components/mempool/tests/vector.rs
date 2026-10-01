@@ -220,6 +220,27 @@ fn upgrade_dependent_failures_ban_only_v5_and_later() {
         TransactionError::RedJubjub(redjubjub::Error::InvalidSignature),
         TransactionError::RedPallas(reddsa::Error::InvalidSignature),
         TransactionError::DisabledAddToOrchardPool,
+        // ZIP 218 limits apply from NU7, and v4 transactions declare no upgrade.
+        TransactionError::OrchardActionsExceedBlockLimit {
+            actions: 301,
+            limit: 300,
+        },
+        TransactionError::IronwoodActionsExceedBlockLimit {
+            actions: 301,
+            limit: 300,
+        },
+        TransactionError::SaplingIOsExceedBlockLimit {
+            ios: 301,
+            limit: 300,
+        },
+        TransactionError::SproutJoinSplitsExceedBlockLimit {
+            joinsplits: 1,
+            limit: 0,
+        },
+        TransactionError::ShieldedCostExceedsBlockBudget {
+            cost: 331,
+            limit: 330,
+        },
     ] {
         let v4_failure = relayed_transaction_failure(error.clone(), 4);
         assert_eq!(transaction_ban_peer(&v4_failure), None, "{error:?}");

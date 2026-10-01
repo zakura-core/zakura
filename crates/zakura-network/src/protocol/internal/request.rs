@@ -1,5 +1,6 @@
 use std::{collections::HashSet, fmt};
 
+use indexmap::IndexSet;
 use zakura_chain::{
     block,
     transaction::{UnminedTx, UnminedTxId},
@@ -9,7 +10,14 @@ use super::super::types::Nonce;
 use crate::{zakura::ZakuraPeerId, PeerSocketAddr};
 
 #[cfg(any(test, feature = "proptest-impl"))]
+use proptest::{arbitrary::any, collection::vec, strategy::Strategy};
+#[cfg(any(test, feature = "proptest-impl"))]
 use proptest_derive::Arbitrary;
+
+#[cfg(any(test, feature = "proptest-impl"))]
+fn arbitrary_block_hashes() -> impl Strategy<Value = IndexSet<block::Hash>> {
+    vec(any::<block::Hash>(), 0..100).prop_map(|hashes| hashes.into_iter().collect())
+}
 
 /// Authenticated source for inventory advertised through Zebra's internal network API.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -71,14 +79,9 @@ pub enum Request {
 
     /// Request block data by block hashes.
     ///
-    /// This uses a `HashSet` rather than a `Vec` for two reasons. First, it
-    /// automatically deduplicates the requested blocks. Second, the internal
-    /// protocol translator needs to maintain a `HashSet` anyways, in order to
-    /// keep track of which requested blocks have been received and when the
-    /// request is ready. Rather than force the internals to always convert into
-    /// a `HashSet`, we require the caller to pass one, so that if the caller
-    /// didn't start with a `Vec` but with, e.g., an iterator, they can collect
-    /// directly into a `HashSet` and save work.
+    /// The ordered set deduplicates block hashes while preserving request order.
+    /// Inbound services use that order when applying response limits, and
+    /// outbound services separately track pending responses in a `HashSet`.
     ///
     /// If this requests a recently-advertised block, the peer set will make a
     /// best-effort attempt to route the request to a peer that advertised the
@@ -90,7 +93,13 @@ pub enum Request {
     /// # Returns
     ///
     /// Returns [`Response::Blocks`](super::Response::Blocks).
-    BlocksByHash(HashSet<block::Hash>),
+    BlocksByHash(
+        #[cfg_attr(
+            any(test, feature = "proptest-impl"),
+            proptest(strategy = "arbitrary_block_hashes()")
+        )]
+        IndexSet<block::Hash>,
+    ),
 
     /// Request block data by block hashes from a known advertising peer.
     ///
@@ -102,7 +111,11 @@ pub enum Request {
     /// Returns [`Response::Blocks`](super::Response::Blocks).
     BlocksByHashFrom {
         /// Requested block hashes.
-        hashes: HashSet<block::Hash>,
+        #[cfg_attr(
+            any(test, feature = "proptest-impl"),
+            proptest(strategy = "arbitrary_block_hashes()")
+        )]
+        hashes: IndexSet<block::Hash>,
         /// Peer that advertised the inventory.
         source: PeerSource,
     },
@@ -112,7 +125,8 @@ pub enum Request {
     /// v4 transactions use a legacy transaction ID, and
     /// v5 transactions use a witnessed transaction ID.
     ///
-    /// This uses a `HashSet` for the same reason as [`Request::BlocksByHash`].
+    /// The set deduplicates transaction IDs and supports pending-response
+    /// membership checks.
     ///
     /// If this requests a recently-advertised transaction, the peer set will
     /// make a best-effort attempt to route the request to a peer that advertised
@@ -350,7 +364,7 @@ impl Request {
             | Request::BlocksByHashFrom {
                 hashes: block_hashes,
                 ..
-            } => block_hashes.clone(),
+            } => block_hashes.iter().copied().collect(),
             _ => HashSet::new(),
         }
     }

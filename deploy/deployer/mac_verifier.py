@@ -110,6 +110,18 @@ def public_report(value):
     print(payload)
 
 
+def check_address_history():
+    """Check the secret's exact value without ever echoing it or matching lines."""
+    private = ipaddress.ip_address(os.environ['MAC_VERIFIER_HOST'])
+    for address in {str(private), private.exploded}:
+        for selector in [['-S', address], ['--fixed-strings', '--grep', address]]:
+            result = subprocess.run(['git', 'log', '--all', '--format=%H', *selector, '--'],
+                                    capture_output=True, timeout=120)
+            if result.returncode or result.stdout.strip():
+                raise ValueError('private Mac address history audit failed; no content published')
+    print('Private Mac address absent from tracked content and commit messages', flush=True)
+
+
 def status(mac, linux, identifier):
     mac_info = json.loads(mac.run(f'''sudo -n {MAC_PYTHON} - <<'REMOTE'
 import hashlib, json, pathlib, platform, subprocess, tomllib
@@ -347,6 +359,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('operation', choices=['status', 'dashboard', 'deploy'])
     args = parser.parse_args()
+    check_address_history()
     if os.environ.get('NO_RESTART') == 'true' or os.environ.get('FORCE_REBUILD') == 'true':
         raise ValueError('Mac deployment consumes an accepted artifact and requires a restart')
     identifier = os.environ['MAC_VERIFIER_ID']

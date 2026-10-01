@@ -1,15 +1,31 @@
 """Artifact acceptance and receipt-transition regressions for Mac deployment."""
 import copy
+import contextlib
+import io
 import json
+import os
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 import mac_verifier as deploy
 from common import digest
 
 
 class CandidateTests(unittest.TestCase):
+    def test_private_mac_address_is_never_printed(self):
+        for address, leak in [('198.51.100.42', '198.51.100.42'),
+                              ('2001:db8::42', '2001:0db8:0000:0000:0000:0000:0000:0042')]:
+            output = io.StringIO()
+            with self.subTest(address=address), patch.dict(os.environ, {'MAC_VERIFIER_HOST': address}), \
+                    contextlib.redirect_stdout(output):
+                with self.assertRaises(ValueError):
+                    deploy.public_report({'compiler': 'unexpected address: ' + leak})
+                self.assertEqual(output.getvalue(), '')
+                deploy.public_report({'architecture': 'arm64'})
+                self.assertNotIn(address, output.getvalue())
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)

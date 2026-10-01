@@ -102,6 +102,14 @@ REMOTE
         raise
 
 
+def public_report(value):
+    payload = json.dumps(value, indent=2)
+    private = ipaddress.ip_address(os.environ['MAC_VERIFIER_HOST'])
+    if any(address in payload for address in (str(private), private.exploded)):
+        raise ValueError('refusing a status report containing the private Mac address')
+    print(payload)
+
+
 def status(mac, linux, identifier):
     mac_info = json.loads(mac.run(f'''sudo -n {MAC_PYTHON} - <<'REMOTE'
 import hashlib, json, pathlib, platform, subprocess, tomllib
@@ -158,7 +166,7 @@ REMOTE
         mac_info['compiler_metadata_type'] = type(compiler).__name__
     if raw:
         info['status'] = public_status(raw, identifier)
-    print(json.dumps({'mac': mac_info, 'reference': info}, indent=2))
+    public_report({'mac': mac_info, 'reference': info})
 
 
 def validate_candidate(directory, source_sha):

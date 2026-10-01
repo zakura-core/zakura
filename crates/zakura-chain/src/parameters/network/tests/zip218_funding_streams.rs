@@ -368,6 +368,17 @@ fn revision_2_funding_streams_end_at_the_zip_218_third_halving() {
     // inherited Revision 2 end while leaving earlier streams unchanged.
     let default_testnet = Network::new_default_testnet();
     let default_streams = default_testnet.all_funding_streams();
+    let num_periods =
+        required_addresses(default_streams[REVISION_2].height_range(), &default_testnet);
+    assert_eq!(num_periods, 27);
+    assert_eq!(
+        default_streams[REVISION_2]
+            .recipient(FundingStreamReceiver::MajorGrants)
+            .expect("Revision 2 has an FPF recipient")
+            .addresses()
+            .len(),
+        num_periods,
+    );
     assert_eq!(
         default_streams[..REVISION_2],
         testnet_constants::FUNDING_STREAMS[..REVISION_2],

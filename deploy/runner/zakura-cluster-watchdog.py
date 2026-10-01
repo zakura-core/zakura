@@ -1190,7 +1190,7 @@ class Watchdog:
         started = time.time()
         condition = "unavailable"
         try:
-            run_comparison([sys.executable, str(self.args.mac_comparison), "once",
+            run_comparison([sys.executable, str(self.args.mac_comparison),
                             "--directory", str(self.args.mac_comparison_state),
                             "--receipt", str(self.args.mac_comparison_receipt)])
             sample = json.loads(status_path.read_text())

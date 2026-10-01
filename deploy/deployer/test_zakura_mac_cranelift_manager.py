@@ -120,7 +120,7 @@ class DashboardTests(unittest.TestCase):
                 program = script.split("<<'REMOTE'\n", 1)[1].split("\nREMOTE", 1)[0]
                 compile(program, "remote-check", "exec")
             if script.startswith('mktemp'):
-                return '/var/tmp/zakura-dashboard-ci.fixture'
+                return '/var/tmp/zakura-tools-ci.fixture' if 'zakura-tools-ci' in script else '/var/tmp/zakura-dashboard-ci.fixture'
             if script.startswith('systemctl is-active'):
                 return 'active'
             if "with opener.open" in script:
@@ -129,23 +129,99 @@ class DashboardTests(unittest.TestCase):
 
     def test_bridge_retired_only_after_file_and_dashboard_validation(self):
         host = self.Host()
-        deploy.dashboard(host)
+        mac = self.Host()
+        deploy.dashboard(mac, host)
         commands = "\n".join(host.scripts)
         self.assertLess(commands.index("with opener.open"), commands.index("disable --now"))
         self.assertIn('/opt/zakura-fleet-watchdog/mac_cranelift_status.py', host.files)
         self.assertNotIn('receipt.json', ''.join(host.files))
         self.assertNotIn('cursor.json', commands)
         self.assertNotIn('launchctl', commands)
+        self.assertIn('/opt/zakura-mac-verifier/common.py', host.files)
+        self.assertIn('/var/tmp/zakura-tools-ci.fixture/ssh_probe.py', mac.files)
+        self.assertIn('/var/tmp/zakura-tools-ci.fixture/rotate_logs.py', mac.files)
+        self.assertIn('sudo -n mv', '\n'.join(mac.scripts))
+
+    def test_failed_mac_update_rolls_back_both_hosts(self):
+        mac, linux = self.Host(), self.Host()
+        original = mac.run
+        failed = False
+        def run(script, **kwargs):
+            nonlocal failed
+            result = original(script, **kwargs)
+            if not failed and 'sudo -n mv' in script:
+                failed = True
+                raise RuntimeError('fixture Mac replacement failure')
+            return result
+        with patch.object(mac, 'run', side_effect=run), self.assertRaises(RuntimeError):
+            deploy.dashboard(mac, linux)
+        self.assertIn('else sudo -n cp -p', '\n'.join(mac.scripts))
+        self.assertIn('common.py', '\n'.join(linux.scripts))
+        self.assertIn('systemctl start zakura-fleet-watchdog', linux.scripts[-1])
+        self.assertNotIn('cursor.json', '\n'.join(linux.scripts))
 
     def test_failed_install_restores_services_without_rewinding_state(self):
         host = self.Host(fail_install=True)
+        mac = self.Host()
         with self.assertRaises(RuntimeError):
-            deploy.dashboard(host)
+            deploy.dashboard(mac, host)
         commands = "\n".join(host.scripts)
         self.assertIn('.previous', commands)
         self.assertIn('enable --now zakura-mac-verifier-dashboard', commands)
         self.assertIn('systemctl start zakura-fleet-watchdog', commands)
         self.assertNotIn('cursor.json', commands)
+        self.assertIn('ssh_probe.py.previous', '\n'.join(mac.scripts))
+
+
+class HealthTests(unittest.TestCase):
+    def setUp(self):
+        self.mac = {name: True for name in ['receipt_present', 'binary_matches_receipt',
+            'full_verification_enabled', 'node_running', 'adapter_listener_closed']}
+        self.mac.update(architecture='arm64', adapter_running=False, tunnel_running=False,
+                        compiler_acceptance=[{'passed': True}])
+        self.reference = {name: True for name in ['monitoring_config_private', 'monitoring_key_restricted',
+            'reverse_listener_closed', 'dashboard_bridge_closed', 'dashboard_file_present',
+            'dashboard_file_fresh', 'dashboard_file_healthy', 'dashboard_identity_matches',
+            'dashboard_row_healthy', 'dashboard_mac_enabled', 'dashboard_supports_mac']}
+        self.reference.update({'zakura-fleet-watchdog': 'active', 'zakura-mainnet-dashboard': 'active',
+            'zakura-mac-verifier': 'inactive', 'zakura-mac-verifier-dashboard': 'inactive',
+            'status': {'comparison_healthy': True, 'condition': 'matching', 'sample_time': deploy.time.time()}})
+
+    def test_only_healthy_fresh_checks_pass(self):
+        deploy.require_healthy(self.mac, self.reference)
+        for target, fixture in [('mac', self.mac), ('reference', self.reference)]:
+            for key in fixture:
+                with self.subTest(target=target, key=key):
+                    broken = dict(fixture)
+                    broken.pop(key)
+                    with self.assertRaises(RuntimeError):
+                        deploy.require_healthy(broken if target == 'mac' else self.mac,
+                                               broken if target == 'reference' else self.reference)
+        for change in [{'comparison_healthy': False}, {'condition': 'catching_up'},
+                       {'sample_time': 1}, {'sample_time': float('nan')},
+                       {'sample_time': deploy.time.time() + 1000}]:
+            with self.subTest(change=change), self.assertRaises(RuntimeError):
+                deploy.require_healthy(self.mac, {**self.reference,
+                    'status': {**self.reference['status'], **change}})
+
+    def test_status_command_does_not_return_success_for_unhealthy_hosts(self):
+        class Host:
+            def __init__(self, data): self.data = data
+            def run(self, *args, **kwargs): return json.dumps(self.data)
+        mac = Host({'compiler_metadata': None, 'node_running': False})
+        linux = Host({'status': None, 'zakura-fleet-watchdog': 'inactive'})
+        with patch.object(deploy, 'public_report') as report, self.assertRaises(RuntimeError):
+            deploy.status(mac, linux, 'verifier-' + 'a' * 32)
+        report.assert_called_once()
+
+    def test_installed_probe_is_standalone_and_read_only(self):
+        import sys
+        program = deploy.probe_program().decode()
+        result = subprocess.run([sys.executable, '-I', '-c', program],
+            input='{"operation":"exec","command":"id"}\n', text=True,
+            capture_output=True, timeout=5)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), {'error': 'sample unavailable'})
 
 
 if __name__ == '__main__':

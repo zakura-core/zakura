@@ -44,7 +44,7 @@ def public_status(status, identifier):
     result["active_incidents"] = len(status.get("incidents", {}))
     result["comparison_healthy"] = (status.get("caught_up") is True
         and status.get("error") is None
-        and not (set(status.get("incidents", {})) - {"alert delivery unavailable"}))
+        and not status.get("incidents", {}))
     result["alerts_muted"] = status.get("alerts_muted", True) is True
     condition = status.get("condition")
     if condition in {"matching", "catching_up", "unavailable", "chain_disagreement", "tree_mismatch", "coverage_gap"}:

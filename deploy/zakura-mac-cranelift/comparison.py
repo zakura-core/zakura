@@ -237,7 +237,6 @@ def exclusive(directory):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=["once"])
     parser.add_argument("--directory", default="/var/lib/zakura-mac-verifier")
     parser.add_argument("--ssh-config", default="/etc/zakura-mac-verifier/ssh/config")
     parser.add_argument("--receipt", default="/etc/zakura-mac-verifier/receipt.json")

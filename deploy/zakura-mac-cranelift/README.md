@@ -36,7 +36,7 @@ the reference host.
 
 ## Comparison and alerts
 
-The fleet watchdog invokes `comparison.py once` after its existing fleet checks.
+The fleet watchdog invokes `comparison.py` after its existing fleet checks.
 Each invocation compares at most 16 successive heights, three blocks behind the
 shorter tip, using block hashes and canonical Sapling, Orchard and Ironwood
 commitment-tree roots and frontiers. It re-reads mismatches to distinguish stable
@@ -92,7 +92,8 @@ remain stable so existing history and dashboard consumers continue to work.
 ## Monitoring deployment
 
 Use `node=zakura-mac-os` and `mac_operation=dashboard` to deploy the watchdog,
-comparison client, field-filter library and dashboard together. The watchdog
+comparison client and shared library, field-filter library, Mac SSH probe, log
+rotation helper and dashboard together. The watchdog
 atomically writes `/var/lib/zakura-mac-cranelift-public/status.json`; the dashboard
 reads that bounded, sanitized file. Raw comparison state and connection settings
 remain in their private directories. There is no dashboard bridge service.
@@ -125,7 +126,7 @@ database, original bootstrap evidence, cursor and incident evidence. A binary
 rollback does not undo database migrations. Historical comparisons are not proof
 that a new version reverified old blocks.
 
-Use `mac_operation=status` for inspection and `mac_operation=dashboard` to restore
+Use `mac_operation=status` for a strict health check (unhealthy or stale results fail CI) and `mac_operation=dashboard` to restore
 the dashboard integration. Until this PR merges, a dashboard deployment from main
 can overwrite the Mac integration.
 

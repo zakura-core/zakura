@@ -427,6 +427,11 @@ print_stderr = "warn"
 # Code styles we want to accept
 try_err = "allow"
 
+# Clippy 1.99 reports these in code that `derive-new`, `thiserror`, `jsonrpsee` and `tonic`
+# generate, which we can't change.
+double_must_use = "allow"
+redundant_field_names = "allow"
+
 # Panics
 fallible_impl_from = "warn"
 unwrap_in_result = "warn"

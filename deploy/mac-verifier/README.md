@@ -12,6 +12,10 @@ trusted. Coverage starts at the recorded bootstrap height plus one; matching liv
 results do not independently audit imported UTXOs/nullifiers or eliminate bugs
 shared by both nodes.
 
+The independent logger acceptance-test fix is tracked in
+[PR1239](https://github.com/zakura-core/zakura/pull/1239), the prerequisite for
+this monitoring change.
+
 ## Runtime components
 
 | Component | Location | Responsibility |

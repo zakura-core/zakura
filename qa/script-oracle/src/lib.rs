@@ -17,6 +17,7 @@ use zcash_script::{
 
 pub mod baseline;
 pub mod cxx;
+pub mod generate;
 
 /// The flags Zakura passes to the interpreter.
 pub const FLAGS: Flags = Flags::P2SH.union(Flags::CHECKLOCKTIMEVERIFY);
@@ -163,11 +164,15 @@ pub fn check_p2sh_sigops(script_sig: &[u8]) {
     }
 }
 
-/// Returns a P2SH scriptPubKey that commits to the last 20 bytes of a hash of `seed`.
-fn p2sh_script_pubkey(seed: &[u8]) -> Vec<u8> {
+/// Returns the P2SH scriptPubKey `OP_HASH160 <hash160(redeem)> OP_EQUAL`.
+pub fn p2sh_script_pubkey(redeem: &[u8]) -> Vec<u8> {
+    [&[0xa9, 0x14][..], &hash160(redeem), &[0x87]].concat()
+}
+
+/// Returns `RIPEMD160(SHA256(bytes))`, as computed by `OP_HASH160`.
+pub fn hash160(bytes: &[u8]) -> [u8; 20] {
     use ripemd::Digest as _;
-    let hash = ripemd::Ripemd160::digest(sha2::Sha256::digest(seed));
-    [&[0xa9, 0x14][..], &hash, &[0x87]].concat()
+    ripemd::Ripemd160::digest(sha2::Sha256::digest(bytes)).into()
 }
 
 /// Verifies every transparent input of `transaction` with the candidate and the baseline adapter.

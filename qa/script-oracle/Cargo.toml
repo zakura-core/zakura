@@ -11,13 +11,10 @@ description = "Differential tests of Zakura's Rust script verification against t
 [package.metadata]
 cargo-fuzz = true
 
-[features]
-fuzzing = ["dep:libfuzzer-sys"]
-
 [dependencies]
 arbitrary = "1"
 hex = "0.4"
-libfuzzer-sys = { version = "0.4", optional = true }
+libfuzzer-sys = "0.4"
 libzcash_script = { version = "=0.1.0", features = ["test-dependencies"] }
 rand = "0.8"
 ripemd = "0.1"
@@ -35,3 +32,24 @@ cc = "1"
 # Build the baseline C++ like a release build, so uninitialized buffers behave as in production.
 [profile.dev.package.libzcash_script]
 opt-level = 3
+
+[[bin]]
+name = "script"
+path = "fuzz_targets/script.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sigops"
+path = "fuzz_targets/sigops.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "transaction"
+path = "fuzz_targets/transaction.rs"
+test = false
+doc = false
+bench = false

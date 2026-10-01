@@ -173,6 +173,25 @@ class DashboardTests(unittest.TestCase):
         self.assertIn('ssh_probe.py.previous', '\n'.join(mac.scripts))
 
 
+class AlertEnablementTests(unittest.TestCase):
+    def test_enablement_uses_watchdog_delivery_and_ephemeral_test_state(self):
+        from unittest.mock import Mock
+        host = Mock()
+        deploy.enable_alerts(host)
+        host.run.assert_called_once()
+        script = host.run.call_args.args[0]
+        subprocess.run(['bash', '-n'], input=script, text=True, check=True, capture_output=True)
+        program = script.split("<<'REMOTE'\n", 1)[1].split("\nREMOTE", 1)[0]
+        compile(program, 'alert-enablement', 'exec')
+        self.assertIn('ZAKURA_MAC_CRANELIFT_COMPARISON_ALERTS=1', program)
+        self.assertIn('ZAKURA_MAC_CRANELIFT_ALERTS_MUTED=0', program)
+        self.assertIn('TEST', program)
+        self.assertEqual(program.count('watchdog.update_alert_state('), 1)
+        self.assertNotIn('state.json', program)
+        self.assertNotIn('cursor.json', program)
+        self.assertNotIn('launchctl', program)
+
+
 class HealthTests(unittest.TestCase):
     def setUp(self):
         self.mac = {name: True for name in ['receipt_present', 'binary_matches_receipt',

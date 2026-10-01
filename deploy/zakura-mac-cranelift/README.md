@@ -60,7 +60,10 @@ queue, alert-enablement script or 24-hour qualification state.
 The lane is enabled with `ZAKURA_MAC_CRANELIFT_COMPARISON=1` on the existing watchdog.
 Notifications remain muted by default; `ZAKURA_MAC_CRANELIFT_COMPARISON_ALERTS=1` enables
 this lane through the existing watchdog channel. Monitoring deployment preserves
-muted operation and does not replay historical messages.
+the configured alert settings and does not replay historical messages.
+Use `mac_operation=enable-alerts` to enable comparison and Mac node alerts and
+send one explicitly labeled test through the existing watchdog Slack channel.
+The test uses ephemeral alert state and does not manufacture a real incident.
 
 The watchdog only publishes approved status fields. The dashboard distinguishes
 comparison failure from node availability. Private receipts, diagnostics, host

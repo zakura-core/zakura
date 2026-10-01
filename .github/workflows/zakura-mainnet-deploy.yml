@@ -64,7 +64,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: zakura-mainnet-deploy
+  group: ${{ inputs.node == 'zakura-mac-os' && inputs.mac_operation == 'status' && format('zakura-mac-status-{0}', github.run_id) || 'zakura-mainnet-deploy' }}
   cancel-in-progress: false
 
 jobs:

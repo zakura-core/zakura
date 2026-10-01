@@ -32,7 +32,6 @@ tokio = { workspace = true, features = ["time", "sync", "tracing", "macros"] }
 tokio-util = { workspace = true }
 tower = { workspace = true, features = ["util", "buffer"] }
 tracing = { workspace = true }
-tracing-futures = { workspace = true }
 
 [dev-dependencies]
 color-eyre = { workspace = true }

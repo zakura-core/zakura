@@ -627,6 +627,49 @@ impl ConfiguredActivationHeights {
             zfuture,
         }
     }
+
+    /// Returns every configured activation height, in upgrade order.
+    fn heights(&self) -> Vec<u32> {
+        [
+            self.before_overwinter,
+            self.overwinter,
+            self.sapling,
+            self.blossom,
+            self.heartwood,
+            self.canopy,
+            self.nu5,
+            self.nu6,
+            self.nu6_1,
+            self.nu6_2,
+            self.nu6_3,
+            self.nu7,
+            #[cfg(zcash_unstable = "zfuture")]
+            self.zfuture,
+        ]
+        .into_iter()
+        .flatten()
+        .collect()
+    }
+
+    /// Returns these activation heights, with any upgrade they omit taken from `base`.
+    fn or(self, base: Self) -> Self {
+        Self {
+            before_overwinter: self.before_overwinter.or(base.before_overwinter),
+            overwinter: self.overwinter.or(base.overwinter),
+            sapling: self.sapling.or(base.sapling),
+            blossom: self.blossom.or(base.blossom),
+            heartwood: self.heartwood.or(base.heartwood),
+            canopy: self.canopy.or(base.canopy),
+            nu5: self.nu5.or(base.nu5),
+            nu6: self.nu6.or(base.nu6),
+            nu6_1: self.nu6_1.or(base.nu6_1),
+            nu6_2: self.nu6_2.or(base.nu6_2),
+            nu6_3: self.nu6_3.or(base.nu6_3),
+            nu7: self.nu7.or(base.nu7),
+            #[cfg(zcash_unstable = "zfuture")]
+            zfuture: self.zfuture.or(base.zfuture),
+        }
+    }
 }
 
 /// Configurable checkpoints, either a path to a checkpoints file, a "default" keyword to indicate
@@ -904,6 +947,28 @@ impl ParametersBuilder {
         self.activation_heights.extend(activation_heights);
 
         Ok(self)
+    }
+
+    /// Overlays `overlay` on the activation heights already being built, then checks and
+    /// sets the result like [`Self::with_activation_heights`].
+    ///
+    /// Upgrades that `overlay` omits keep their current heights. Starting from
+    /// [`Parameters::build()`], a configured Testnet can therefore set only `NU7` and
+    /// inherit every public Testnet upgrade below it.
+    ///
+    /// Returns [`ParametersBuilderError::InvalidActivationHeight`] if an overlaid height
+    /// equals another upgrade's height, which would silently drop that upgrade.
+    pub fn with_activation_height_overlay(
+        self,
+        overlay: ConfiguredActivationHeights,
+    ) -> Result<Self, ParametersBuilderError> {
+        let current = ConfiguredActivationHeights::from(&self.activation_heights);
+        let combined = overlay.or(current);
+        let heights = combined.heights();
+        if heights.iter().collect::<HashSet<_>>().len() != heights.len() {
+            return Err(ParametersBuilderError::InvalidActivationHeight);
+        }
+        self.with_activation_heights(combined)
     }
 
     /// Sets the slow start interval to be used in the [`Parameters`] being built.

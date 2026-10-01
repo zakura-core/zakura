@@ -203,13 +203,22 @@ impl SinkCore {
         {
             return Err(over);
         }
-        frames
-            .send(ResponseFrame {
+        let publish = || {
+            frames.send(ResponseFrame {
                 frame,
                 guard: FrameGuard::new(self.grants.clone()),
                 ends,
             })
-            .map_err(|_| SinkError::Closed)?;
+        };
+        if ends {
+            self.commitment
+                .as_ref()
+                .expect("an open sink keeps its commitment")
+                .queue_ending(publish)
+        } else {
+            publish()
+        }
+        .map_err(|_| SinkError::Closed)?;
         self.progress.bytes = bytes;
         if ends {
             // The ending is in the ordered output: the exchange is complete on

@@ -18,13 +18,16 @@ use thiserror::Error;
 
 use zakura_chain::{
     block::Height,
-    transaction::{self, Hash, Transaction, UnminedTx, UnminedTxId, VerifiedUnminedTx},
+    transaction::{self, zip317, Hash, Transaction, UnminedTx, UnminedTxId, VerifiedUnminedTx},
     transparent,
 };
 use zakura_node_services::mempool::TransactionDependencies;
 use zcash_script::solver;
 
-use self::{eviction_list::EvictionList, verified_set::VerifiedSet};
+use self::{
+    eviction_list::EvictionList,
+    verified_set::{VerifiedSet, MAX_MEMPOOL_ANCESTORS},
+};
 use super::{
     config, downloads::TransactionDownloadVerifyError, pending_outputs::PendingOutputs,
     MempoolError,
@@ -36,6 +39,7 @@ use proptest_derive::Arbitrary;
 #[cfg(test)]
 pub mod tests;
 
+mod eviction_cost;
 mod eviction_list;
 mod policy;
 mod verified_set;
@@ -51,9 +55,10 @@ mod verified_set;
 pub(crate) const MAX_EVICTION_MEMORY_ENTRIES: usize = 40_000;
 
 /// Transactions rejected based on transaction authorizing data (scripts, proofs, signatures),
-/// or lock times. These rejections are only valid for the current tip.
+/// lock times, or the fee per unit of cost. These rejections are only valid for the current tip.
 ///
-/// Each committed block clears these rejections, because new blocks can supply missing inputs.
+/// Each committed block clears these rejections, because new blocks can supply missing inputs,
+/// and free mempool space.
 #[derive(Error, Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(any(test, feature = "proptest-impl"), derive(Arbitrary))]
 #[allow(dead_code)]
@@ -65,12 +70,30 @@ pub enum ExactTipRejectionError {
     FailedVerification(#[from] zakura_consensus::error::TransactionError),
     #[error("transaction did not pass standard validation: {0}")]
     FailedStandard(#[from] NonStandardTransactionError),
+
+    /// A transaction that paid more per unit of cost evicted this transaction from the full
+    /// mempool.
+    ///
+    /// The cost depends on the transaction size, which includes the authorizing data, so the
+    /// rejection covers only the exact transaction. A smaller transaction with the same effects
+    /// pays more per unit of cost.
+    #[error("transaction evicted from the full mempool by a transaction that pays a higher fee")]
+    Evicted,
+
+    /// The mempool is full, and the transaction does not pay enough to evict other
+    /// transactions.
+    ///
+    /// Like [`ExactTipRejectionError::Evicted`], this rejection covers only the exact
+    /// transaction.
+    #[error("transaction rejected because the mempool is full and it pays too low a fee")]
+    BelowEvictionCost,
 }
 
 /// Transactions rejected based only on their effects (spends, outputs, transaction header).
 /// These rejections are only valid for the current tip.
 ///
-/// Each committed block clears these rejections, because new blocks can evict other transactions.
+/// Each committed block clears these rejections, because new blocks can remove other
+/// transactions from the mempool, and free mempool space.
 #[derive(Error, Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(any(test, feature = "proptest-impl"), derive(Arbitrary))]
 #[allow(dead_code)]
@@ -86,6 +109,14 @@ pub enum SameEffectsTipRejectionError {
         another transaction in the mempool"
     )]
     MissingOutput,
+
+    /// The transaction spends outputs of more than [`MAX_MEMPOOL_ANCESTORS`] mempool
+    /// transactions, directly or indirectly.
+    #[error(
+        "transaction rejected because it depends on more than {MAX_MEMPOOL_ANCESTORS} \
+        unconfirmed transactions in the mempool"
+    )]
+    TooManyAncestors,
 }
 
 /// Transactions rejected based only on their effects (spends, outputs, transaction header).
@@ -105,16 +136,6 @@ pub enum SameEffectsChainRejectionError {
 
     #[error("transaction was committed to the best chain")]
     Mined,
-
-    /// Otherwise valid transaction removed from mempool due to [ZIP-401] random
-    /// eviction.
-    ///
-    /// Consensus rule:
-    /// > The txid (rather than the wtxid ...) is used even for version 5 transactions
-    ///
-    /// [ZIP-401]: https://zips.z.cash/zip-0401#specification
-    #[error("transaction evicted from the mempool due to ZIP-401 denial of service limits")]
-    RandomlyEvicted,
 }
 
 /// Storage error that combines all other specific error types.
@@ -204,13 +225,7 @@ pub struct Storage {
     ///
     /// Any transaction with the same [`transaction::Hash`] is invalid.
     ///
-    /// An [`EvictionList`] is used for both randomly evicted and expired
-    /// transactions, even if it is only needed for the evicted ones. This was
-    /// done just to simplify the existing code; there is no harm in having a
-    /// timeout for expired transactions too since re-checking expired
-    /// transactions is cheap.
-    // If this code is ever refactored and the lists are split in different
-    // fields, then we can use an `EvictionList` just for the evicted list.
+    /// Each [`EvictionList`] bounds its list by size and age.
     chain_rejected_same_effects: HashMap<SameEffectsChainRejectionError, EvictionList>,
 
     /// The mempool transaction eviction age limit.
@@ -220,8 +235,8 @@ pub struct Storage {
     /// Maximum entries retained in each rejection list.
     rejection_list_capacity: usize,
 
-    /// Max total cost of the verified mempool set, beyond which transactions
-    /// are evicted to make room.
+    /// Max total cost of the verified mempool set. A full mempool evicts its cheapest
+    /// transactions to make room for a transaction that pays more.
     tx_cost_limit: u64,
 
     /// Maximum allowed size of OP_RETURN scripts, in bytes.
@@ -424,9 +439,8 @@ impl Storage {
     /// prevent this transaction from being inserted.
     /// These errors should not be propagated to peers, because the transactions are valid.
     ///
-    /// If inserting this transaction evicts other transactions, the selected
-    /// ZIP-401 victims will be tracked as
-    /// [`SameEffectsChainRejectionError::RandomlyEvicted`].
+    /// If the mempool is full, this transaction can only evict transactions that pay less. See
+    /// [`Storage::insert_with_evicted_ids`].
     #[allow(clippy::unwrap_in_result)]
     pub fn insert(
         &mut self,
@@ -438,10 +452,31 @@ impl Storage {
             .0
     }
 
-    /// Insert a transaction and return all IDs removed by ZIP-401 eviction.
+    /// Insert a transaction and return the IDs of the transactions it evicted.
     ///
-    /// The returned IDs include dependents of the selected eviction victim and
-    /// the inserted transaction if it is selected for eviction.
+    /// If the transaction does not fit under the mempool cost limit, the mempool evicts its
+    /// cheapest packages first. See [`VerifiedSet::select_eviction_victims`]. The mempool admits
+    /// the transaction only if its own eviction cost is at least the highest victim's plus an
+    /// increment. See [`exceeds_by_increment`](eviction_cost::EvictionCost::exceeds_by_increment).
+    /// Otherwise it rejects the transaction as
+    /// [`ExactTipRejectionError::BelowEvictionCost`], and the mempool does not change.
+    ///
+    /// The mempool rejects each evicted transaction as [`ExactTipRejectionError::Evicted`].
+    /// The returned IDs include the victims and their descendants.
+    ///
+    /// # Fee floor
+    ///
+    /// While the mempool is full, the lowest fee it admits is the cheapest package plus the
+    /// increment. The node does not store this floor. Any event that frees space, such as a
+    /// committed block, an expiry, or a reorg, lowers it immediately.
+    ///
+    /// This departs from [ZIP-401], which evicts at random. ZIP-401 chose random eviction when
+    /// every transaction paid the same fee. [ZIP-317] fees vary with transaction size, so
+    /// ranking by fee protects transactions that pay more. Eviction is relay policy, not
+    /// consensus.
+    ///
+    /// [ZIP-401]: https://zips.z.cash/zip-0401
+    /// [ZIP-317]: https://zips.z.cash/zip-0317
     #[allow(clippy::unwrap_in_result)]
     pub(super) fn insert_with_evicted_ids(
         &mut self,
@@ -486,71 +521,106 @@ impl Storage {
             return (Err(error), HashSet::new());
         }
 
-        // Then, we try to insert into the pool. If this fails the transaction is rejected.
-        let mut result = Ok(unmined_tx_id);
-        let mut evicted_ids = HashSet::new();
-        if let Err(rejection_error) = self.verified.insert(
+        // Check for conflicts before evicting anything, so a rejected transaction leaves the
+        // mempool unchanged.
+        let ancestors = match self
+            .verified
+            .check_insert(&tx.transaction, &spent_mempool_outpoints)
+        {
+            Ok(ancestors) => ancestors,
+            Err(rejection_error) => {
+                return (
+                    Err(self.reject_insert(unmined_tx_id, rejection_error)),
+                    HashSet::new(),
+                );
+            }
+        };
+
+        let evicted_ids = match self.make_room(&tx, &ancestors) {
+            Ok(evicted_ids) => evicted_ids,
+            Err(rejection_error) => {
+                return (
+                    Err(self.reject_insert(unmined_tx_id, rejection_error)),
+                    HashSet::new(),
+                );
+            }
+        };
+
+        // Eviction only removes transactions, and it never removes the transaction's mempool
+        // ancestors, so the checks above still hold.
+        let result = match self.verified.insert(
             tx,
             spent_mempool_outpoints,
             &mut self.pending_outputs,
             height,
         ) {
-            tracing::debug!(
-                ?tx_id,
-                ?rejection_error,
-                stored_transaction_count = ?self.verified.transaction_count(),
-                "insertion error for transaction",
-            );
-
-            // We could return here, but we still want to check the mempool size
-            self.reject(unmined_tx_id, rejection_error.clone().into());
-            result = Err(rejection_error.into());
-        }
-
-        // Once inserted, we evict transactions over the pool size limit per [ZIP-401];
-        //
-        // > On receiving a transaction: (...)
-        // > Calculate its cost. If the total cost of transactions in the mempool including this
-        // > one would `exceed mempooltxcostlimit`, then the node MUST repeatedly call
-        // > EvictTransaction (with the new transaction included as a candidate to evict) until the
-        // > total cost does not exceed `mempooltxcostlimit`.
-        //
-        // 'EvictTransaction' is equivalent to [`VerifiedSet::evict_one()`] in
-        // our implementation.
-        //
-        // [ZIP-401]: https://zips.z.cash/zip-0401
-        while self.verified.total_cost() > self.tx_cost_limit {
-            // > EvictTransaction MUST do the following:
-            // > Select a random transaction to evict, with probability in direct proportion to
-            // > eviction weight. (...) Remove it from the mempool.
-            // > Add the txid and the current time to RecentlyEvicted, dropping
-            // > the oldest entry in RecentlyEvicted if necessary to keep it to
-            // > at most `eviction_memory_entries entries`.
-            let victim_txs = self
-                .verified
-                .evict_one()
-                .expect("mempool is empty, but was expected to be full");
-
-            let victim_tx_id = victim_txs
-                .last()
-                .expect("eviction removes at least the selected transaction")
-                .transaction
-                .id();
-
-            self.reject(
-                victim_tx_id,
-                SameEffectsChainRejectionError::RandomlyEvicted.into(),
-            );
-
-            // If this transaction gets evicted, set its result to the same error
-            if victim_tx_id == unmined_tx_id {
-                result = Err(SameEffectsChainRejectionError::RandomlyEvicted.into());
-            }
-
-            evicted_ids.extend(victim_txs.into_iter().map(|tx| tx.transaction.id()));
-        }
+            Ok(()) => Ok(unmined_tx_id),
+            Err(rejection_error) => Err(self.reject_insert(unmined_tx_id, rejection_error)),
+        };
 
         (result, evicted_ids)
+    }
+
+    /// Evicts the packages that `tx` must replace to fit under the mempool cost limit.
+    ///
+    /// `ancestors` are the mempool ancestors of `tx`, which the mempool never evicts for it.
+    ///
+    /// Returns the IDs of the evicted transactions. Returns an error, and evicts nothing, if
+    /// `tx` does not pay enough to evict them.
+    fn make_room(
+        &mut self,
+        tx: &VerifiedUnminedTx,
+        ancestors: &HashSet<transaction::Hash>,
+    ) -> Result<HashSet<UnminedTxId>, ExactTipRejectionError> {
+        if self.verified.total_cost().saturating_add(tx.cost()) <= self.tx_cost_limit {
+            metrics::gauge!("zcash.mempool.eviction_cost.floor").set(0.0);
+            return Ok(HashSet::new());
+        }
+
+        let victims = self
+            .verified
+            .select_eviction_victims(tx, ancestors, self.tx_cost_limit);
+
+        if let Some(cheapest) = victims.cheapest {
+            // In zatoshis per `MEMPOOL_TRANSACTION_COST_THRESHOLD` of cost, the increment is
+            // one `MARGINAL_FEE`. Metrics tolerate the precision loss of converting to `f64`.
+            metrics::gauge!("zcash.mempool.eviction_cost.floor")
+                .set(cheapest.zat_per_threshold_cost() + zip317::MARGINAL_FEE as f64);
+        }
+
+        let roots = victims.roots.ok_or_else(|| {
+            metrics::counter!("zcash.mempool.rejected.below_eviction_cost").increment(1);
+            ExactTipRejectionError::BelowEvictionCost
+        })?;
+
+        let mut evicted_ids = HashSet::new();
+        for root in roots {
+            for evicted_tx in self.verified.remove(&root) {
+                let evicted_id = evicted_tx.transaction.id();
+                self.reject(evicted_id, ExactTipRejectionError::Evicted.into());
+                evicted_ids.insert(evicted_id);
+            }
+        }
+        // A `usize` always fits in a `u64` on supported platforms.
+        metrics::counter!("zcash.mempool.evicted").increment(evicted_ids.len() as u64);
+
+        Ok(evicted_ids)
+    }
+
+    /// Rejects a transaction that failed to insert, and returns the error for the caller.
+    fn reject_insert<E>(&mut self, unmined_tx_id: UnminedTxId, rejection_error: E) -> MempoolError
+    where
+        E: Clone + std::fmt::Debug + Into<RejectionError> + Into<MempoolError>,
+    {
+        tracing::debug!(
+            tx_id = ?unmined_tx_id.mined_id(),
+            ?rejection_error,
+            stored_transaction_count = ?self.verified.transaction_count(),
+            "insertion error for transaction",
+        );
+
+        self.reject(unmined_tx_id, rejection_error.clone().into());
+        rejection_error.into()
     }
 
     /// Remove transactions from the mempool via exact [`UnminedTxId`].

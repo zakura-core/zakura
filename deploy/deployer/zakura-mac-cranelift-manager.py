@@ -174,6 +174,58 @@ fi
         raise
 
 
+def enable_alerts(linux):
+    """Enable the existing watchdog lanes and send one explicitly labeled test."""
+    linux.run('''sudo -n python3 - <<'REMOTE'
+import importlib.util, json, os, pathlib, subprocess, sys, time, types
+path = pathlib.Path('/etc/systemd/system/zakura-fleet-watchdog.service.d/80-mac-alerts.conf')
+path.parent.mkdir(parents=True, exist_ok=True)
+path.write_text('[Service]\\nEnvironment=ZAKURA_MAC_CRANELIFT_COMPARISON=1\\n'
+                'Environment=ZAKURA_MAC_CRANELIFT_COMPARISON_ALERTS=1\\n'
+                'Environment=ZAKURA_MAC_CRANELIFT_ALERTS_MUTED=0\\n')
+path.chmod(0o644)
+started = time.time()
+subprocess.run(['systemctl', 'daemon-reload'], check=True, timeout=30)
+subprocess.run(['systemctl', 'restart', 'zakura-fleet-watchdog'], check=True, timeout=30)
+deadline = time.monotonic() + 150
+while time.monotonic() < deadline:
+    sample = json.loads(pathlib.Path('/var/lib/zakura-mac-verifier/status.json').read_text())
+    if (sample.get('sample_time', 0) >= started and sample.get('alerts_muted') is False
+            and sample.get('condition') == 'matching'):
+        break
+    time.sleep(2)
+else:
+    raise RuntimeError('enabled watchdog did not publish a fresh matching sample')
+pid = int(subprocess.check_output(['systemctl', 'show', 'zakura-fleet-watchdog',
+                                  '-p', 'MainPID', '--value'], timeout=10))
+environment = dict(item.split(b'=', 1) for item in pathlib.Path(f'/proc/{pid}/environ').read_bytes().split(b'\\0') if b'=' in item)
+assert environment.get(b'ZAKURA_MAC_CRANELIFT_COMPARISON_ALERTS') == b'1'
+assert environment.get(b'ZAKURA_MAC_CRANELIFT_ALERTS_MUTED') == b'0'
+for name in ['SLACK_WEB_HOOK', 'SLACK_WEBHOOK_URL', 'SLACK_WEBHOOK']:
+    if name.encode() in environment:
+        os.environ[name] = environment[name.encode()].decode()
+spec = importlib.util.spec_from_file_location('watchdog', '/opt/zakura-fleet-watchdog/zakura-cluster-watchdog.py')
+watchdog = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = watchdog
+spec.loader.exec_module(watchdog)
+message = (':test_tube: *TEST — zakura-mac-cranelift alerts enabled*\\n'
+           'Requested delivery test through the existing fleet watchdog. No real fault is being reported.\\n'
+           'Mac/Linux comparison is currently matching. Comparison and Mac node alerts are enabled.\\n'
+           '<https://status.mainnet.zakura.valargroup.dev/|Open mainnet status dashboard>')
+# Exercise normal incident delivery using ephemeral state; never create a real
+# incident or recovery, change comparison history, or replay pending messages.
+state = {}
+now = time.time()
+watchdog.update_alert_state(state, 'mac-alert-test', 'test', now, 0, message, '', now,
+                           False, types.SimpleNamespace(dry_run=False, slack_timeout=10))
+if not state['mac-alert-test'].get('alerting'):
+    raise RuntimeError('test alert was not accepted by Slack')
+print('Mac alerts enabled; one TEST alert accepted by the existing watchdog Slack webhook')
+REMOTE
+''', timeout=240)
+    print('Mac comparison and node alerts enabled; one labeled test delivered', flush=True)
+
+
 def public_report(value):
     payload = json.dumps(value, indent=2)
     private = ipaddress.ip_address(os.environ['ZAKURA_MAC_CRANELIFT_HOST'])
@@ -502,7 +554,7 @@ sudo -n systemctl start zakura-fleet-watchdog
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('operation', choices=['status', 'dashboard', 'deploy'])
+    parser.add_argument('operation', choices=['status', 'dashboard', 'deploy', 'enable-alerts'])
     args = parser.parse_args()
     check_address_history()
     if os.environ.get('NO_RESTART') == 'true' or (
@@ -514,6 +566,9 @@ def main():
     with tempfile.TemporaryDirectory(prefix='zakura-mac-cranelift-') as directory:
         mac = SSH('ZAKURA_MAC_CRANELIFT_', directory)
         linux = SSH('ZAKURA_MAC_CRANELIFT_REFERENCE_', directory)
+        if args.operation == 'enable-alerts':
+            status(mac, linux, identifier)
+            enable_alerts(linux)
         if args.operation == 'deploy':
             if os.environ.get('MAC_CANDIDATE_RUN_ID'):
                 candidate_dir = Path(directory) / 'candidate'

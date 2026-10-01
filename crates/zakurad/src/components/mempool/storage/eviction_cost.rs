@@ -32,11 +32,33 @@ impl EvictionCost {
     }
 
     /// Returns the eviction cost of `self` combined with `other`.
+    ///
+    /// The mempool combines each transaction once per package. Mempool transactions never
+    /// spend the same funds, so a package's fees stay below `MAX_MONEY`, and its cost stays
+    /// below the mempool cost limit.
     pub fn combine(self, other: Self) -> Self {
         Self {
             fee: self.fee.saturating_add(other.fee),
             cost: self.cost.saturating_add(other.cost),
         }
+    }
+
+    /// Returns the eviction cost of `self` without `other`, which `self` combined earlier.
+    pub fn without(self, other: Self) -> Self {
+        debug_assert!(
+            self.fee >= other.fee && self.cost > other.cost,
+            "a package includes the transactions removed from it, and its own transaction"
+        );
+
+        Self {
+            fee: self.fee.saturating_sub(other.fee),
+            cost: self.cost.saturating_sub(other.cost),
+        }
+    }
+
+    /// Returns the ZIP-401 cost.
+    pub fn cost(self) -> u64 {
+        self.cost
     }
 
     /// Returns `true` if `self` is at least `victim` plus the eviction cost increment.
@@ -122,6 +144,17 @@ mod tests {
         assert!(large.exceeds_by_increment(victim));
         let large_short = EvictionCost::new(2 * (10_000 + MARGINAL_FEE) - 1, 20_000);
         assert!(!large_short.exceeds_by_increment(victim));
+    }
+
+    #[test]
+    fn without_reverses_combine() {
+        let parent = EvictionCost::new(10_000, 10_000);
+        let child = EvictionCost::new(50_000, 20_000);
+        let package = parent.combine(child);
+
+        assert_eq!(package.cost(), 30_000);
+        assert_eq!(package.without(child).cost(), 10_000);
+        assert_eq!(package.without(child), parent);
     }
 
     #[test]

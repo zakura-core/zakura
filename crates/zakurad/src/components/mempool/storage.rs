@@ -24,7 +24,10 @@ use zakura_chain::{
 use zakura_node_services::mempool::TransactionDependencies;
 use zcash_script::solver;
 
-use self::{eviction_list::EvictionList, verified_set::VerifiedSet};
+use self::{
+    eviction_list::EvictionList,
+    verified_set::{VerifiedSet, MAX_MEMPOOL_ANCESTORS},
+};
 use super::{
     config, downloads::TransactionDownloadVerifyError, pending_outputs::PendingOutputs,
     MempoolError,
@@ -52,9 +55,10 @@ mod verified_set;
 pub(crate) const MAX_EVICTION_MEMORY_ENTRIES: usize = 40_000;
 
 /// Transactions rejected based on transaction authorizing data (scripts, proofs, signatures),
-/// or lock times. These rejections are only valid for the current tip.
+/// lock times, or the fee per unit of cost. These rejections are only valid for the current tip.
 ///
-/// Each committed block clears these rejections, because new blocks can supply missing inputs.
+/// Each committed block clears these rejections, because new blocks can supply missing inputs,
+/// and free mempool space.
 #[derive(Error, Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(any(test, feature = "proptest-impl"), derive(Arbitrary))]
 #[allow(dead_code)]
@@ -66,6 +70,23 @@ pub enum ExactTipRejectionError {
     FailedVerification(#[from] zakura_consensus::error::TransactionError),
     #[error("transaction did not pass standard validation: {0}")]
     FailedStandard(#[from] NonStandardTransactionError),
+
+    /// A transaction that paid more per unit of cost evicted this transaction from the full
+    /// mempool.
+    ///
+    /// The cost depends on the transaction size, which includes the authorizing data, so the
+    /// rejection covers only the exact transaction. A smaller transaction with the same effects
+    /// pays more per unit of cost.
+    #[error("transaction evicted from the full mempool by a transaction that pays a higher fee")]
+    Evicted,
+
+    /// The mempool is full, and the transaction does not pay enough to evict other
+    /// transactions.
+    ///
+    /// Like [`ExactTipRejectionError::Evicted`], this rejection covers only the exact
+    /// transaction.
+    #[error("transaction rejected because the mempool is full and it pays too low a fee")]
+    BelowEvictionCost,
 }
 
 /// Transactions rejected based only on their effects (spends, outputs, transaction header).
@@ -89,18 +110,13 @@ pub enum SameEffectsTipRejectionError {
     )]
     MissingOutput,
 
-    /// A transaction that paid more per unit of cost evicted this transaction from the full
-    /// mempool.
-    ///
-    /// The transaction id determines the fee, so the rejection covers the non-malleable
-    /// transaction id.
-    #[error("transaction evicted from the full mempool by a transaction that pays a higher fee")]
-    Evicted,
-
-    /// The mempool is full, and the transaction does not pay enough to evict other
-    /// transactions.
-    #[error("transaction rejected because the mempool is full and it pays too low a fee")]
-    BelowEvictionCost,
+    /// The transaction spends outputs of more than [`MAX_MEMPOOL_ANCESTORS`] mempool
+    /// transactions, directly or indirectly.
+    #[error(
+        "transaction rejected because it depends on more than {MAX_MEMPOOL_ANCESTORS} \
+        unconfirmed transactions in the mempool"
+    )]
+    TooManyAncestors,
 }
 
 /// Transactions rejected based only on their effects (spends, outputs, transaction header).
@@ -443,9 +459,9 @@ impl Storage {
     /// the transaction only if its own eviction cost is at least the highest victim's plus an
     /// increment. See [`exceeds_by_increment`](eviction_cost::EvictionCost::exceeds_by_increment).
     /// Otherwise it rejects the transaction as
-    /// [`SameEffectsTipRejectionError::BelowEvictionCost`], and the mempool does not change.
+    /// [`ExactTipRejectionError::BelowEvictionCost`], and the mempool does not change.
     ///
-    /// The mempool rejects each evicted transaction as [`SameEffectsTipRejectionError::Evicted`].
+    /// The mempool rejects each evicted transaction as [`ExactTipRejectionError::Evicted`].
     /// The returned IDs include the victims and their descendants.
     ///
     /// # Fee floor
@@ -507,17 +523,20 @@ impl Storage {
 
         // Check for conflicts before evicting anything, so a rejected transaction leaves the
         // mempool unchanged.
-        if let Err(rejection_error) = self
+        let ancestors = match self
             .verified
             .check_insert(&tx.transaction, &spent_mempool_outpoints)
         {
-            return (
-                Err(self.reject_insert(unmined_tx_id, rejection_error)),
-                HashSet::new(),
-            );
-        }
+            Ok(ancestors) => ancestors,
+            Err(rejection_error) => {
+                return (
+                    Err(self.reject_insert(unmined_tx_id, rejection_error)),
+                    HashSet::new(),
+                );
+            }
+        };
 
-        let evicted_ids = match self.make_room(&tx, &spent_mempool_outpoints) {
+        let evicted_ids = match self.make_room(&tx, &ancestors) {
             Ok(evicted_ids) => evicted_ids,
             Err(rejection_error) => {
                 return (
@@ -544,50 +563,41 @@ impl Storage {
 
     /// Evicts the packages that `tx` must replace to fit under the mempool cost limit.
     ///
+    /// `ancestors` are the mempool ancestors of `tx`, which the mempool never evicts for it.
+    ///
     /// Returns the IDs of the evicted transactions. Returns an error, and evicts nothing, if
     /// `tx` does not pay enough to evict them.
     fn make_room(
         &mut self,
         tx: &VerifiedUnminedTx,
-        spent_mempool_outpoints: &[transparent::OutPoint],
-    ) -> Result<HashSet<UnminedTxId>, SameEffectsTipRejectionError> {
-        let cost = tx.cost();
-
-        if self.verified.total_cost().saturating_add(cost) <= self.tx_cost_limit {
+        ancestors: &HashSet<transaction::Hash>,
+    ) -> Result<HashSet<UnminedTxId>, ExactTipRejectionError> {
+        if self.verified.total_cost().saturating_add(tx.cost()) <= self.tx_cost_limit {
             metrics::gauge!("zcash.mempool.eviction_cost.floor").set(0.0);
             return Ok(HashSet::new());
         }
 
-        let victims = self.verified.select_eviction_victims(
-            spent_mempool_outpoints,
-            cost,
-            self.tx_cost_limit,
-        );
+        let victims = self
+            .verified
+            .select_eviction_victims(tx, ancestors, self.tx_cost_limit);
 
-        if let Some(cheapest) = victims.as_ref().and_then(|victims| victims.cheapest) {
+        if let Some(cheapest) = victims.cheapest {
             // In zatoshis per `MEMPOOL_TRANSACTION_COST_THRESHOLD` of cost, the increment is
             // one `MARGINAL_FEE`. Metrics tolerate the precision loss of converting to `f64`.
             metrics::gauge!("zcash.mempool.eviction_cost.floor")
                 .set(cheapest.zat_per_threshold_cost() + zip317::MARGINAL_FEE as f64);
         }
 
-        let incoming = VerifiedSet::eviction_cost(tx);
-        let victims = victims
-            .filter(|victims| {
-                victims
-                    .highest
-                    .is_some_and(|highest| incoming.exceeds_by_increment(highest))
-            })
-            .ok_or_else(|| {
-                metrics::counter!("zcash.mempool.rejected.below_eviction_cost").increment(1);
-                SameEffectsTipRejectionError::BelowEvictionCost
-            })?;
+        let roots = victims.roots.ok_or_else(|| {
+            metrics::counter!("zcash.mempool.rejected.below_eviction_cost").increment(1);
+            ExactTipRejectionError::BelowEvictionCost
+        })?;
 
         let mut evicted_ids = HashSet::new();
-        for root in victims.roots {
+        for root in roots {
             for evicted_tx in self.verified.remove(&root) {
                 let evicted_id = evicted_tx.transaction.id();
-                self.reject(evicted_id, SameEffectsTipRejectionError::Evicted.into());
+                self.reject(evicted_id, ExactTipRejectionError::Evicted.into());
                 evicted_ids.insert(evicted_id);
             }
         }
@@ -598,11 +608,10 @@ impl Storage {
     }
 
     /// Rejects a transaction that failed to insert, and returns the error for the caller.
-    fn reject_insert(
-        &mut self,
-        unmined_tx_id: UnminedTxId,
-        rejection_error: SameEffectsTipRejectionError,
-    ) -> MempoolError {
+    fn reject_insert<E>(&mut self, unmined_tx_id: UnminedTxId, rejection_error: E) -> MempoolError
+    where
+        E: Clone + std::fmt::Debug + Into<RejectionError> + Into<MempoolError>,
+    {
         tracing::debug!(
             tx_id = ?unmined_tx_id.mined_id(),
             ?rejection_error,

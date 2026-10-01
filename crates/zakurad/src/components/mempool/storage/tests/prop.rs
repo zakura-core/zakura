@@ -26,8 +26,8 @@ use crate::components::mempool::tests::{
 use crate::components::mempool::{
     config::Config,
     storage::{
-        eviction_list::EvictionList, MempoolError, RejectionError, SameEffectsTipRejectionError,
-        Storage, MAX_EVICTION_MEMORY_ENTRIES,
+        eviction_list::EvictionList, ExactTipRejectionError, MempoolError, RejectionError,
+        SameEffectsTipRejectionError, Storage, MAX_EVICTION_MEMORY_ENTRIES,
     },
     SameEffectsChainRejectionError,
 };
@@ -202,7 +202,7 @@ proptest! {
             (0..test_capacity).map(|index| rejection_id_with_index(rejection_template, index));
 
         for rejection in unique_ids {
-            storage.reject(rejection, SameEffectsTipRejectionError::Evicted.into());
+            storage.reject(rejection, ExactTipRejectionError::Evicted.into());
         }
 
         // Make sure there were no duplicates
@@ -233,7 +233,7 @@ proptest! {
                 } else {
                     prop_assert_eq!(
                         result,
-                        Err(MempoolError::StorageEffectsTip(SameEffectsTipRejectionError::BelowEvictionCost))
+                        Err(MempoolError::StorageExactTip(ExactTipRejectionError::BelowEvictionCost))
                     );
                 }
             }

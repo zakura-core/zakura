@@ -526,19 +526,23 @@ fn mempool_removes_dependent_transactions() -> Result<()> {
         ..Default::default()
     });
 
+    // Each transaction spends the previous one, so the chain stops at the ancestor limit.
     let unmined_txs_with_transparent_outputs = || {
-        network.unmined_transactions_in_blocks(..).filter(|tx| {
-            // treat outputs < 100 zatoshis as "dust" for these tests, we want them out
-            let dust_threshold: Amount<NonNegative> =
-                Amount::try_from(100u64).expect("valid amount");
-            !tx.transaction.transaction().outputs().is_empty()
-                && tx
-                    .transaction
-                    .transaction()
-                    .outputs()
-                    .iter()
-                    .all(|out| out.value >= dust_threshold)
-        })
+        network
+            .unmined_transactions_in_blocks(..)
+            .filter(|tx| {
+                // treat outputs < 100 zatoshis as "dust" for these tests, we want them out
+                let dust_threshold: Amount<NonNegative> =
+                    Amount::try_from(100u64).expect("valid amount");
+                !tx.transaction.transaction().outputs().is_empty()
+                    && tx
+                        .transaction
+                        .transaction()
+                        .outputs()
+                        .iter()
+                        .all(|out| out.value >= dust_threshold)
+            })
+            .take(MAX_MEMPOOL_ANCESTORS + 1)
     };
 
     let mut fake_spent_outpoints: Vec<OutPoint> = Vec::new();

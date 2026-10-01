@@ -27,8 +27,8 @@ use crate::{
             crawler::{Crawler, SyncStatus, FANOUT, RATE_LIMIT_DELAY},
             error::MempoolError,
             storage::{
-                NonStandardTransactionError, SameEffectsChainRejectionError,
-                SameEffectsTipRejectionError,
+                ExactTipRejectionError, NonStandardTransactionError,
+                SameEffectsChainRejectionError, SameEffectsTipRejectionError,
             },
             Config,
         },
@@ -69,8 +69,8 @@ fn mempool_error_strategy() -> BoxedStrategy<MempoolError> {
         Just(MempoolError::StorageEffectsTip(
             SameEffectsTipRejectionError::MissingOutput
         )),
-        Just(MempoolError::StorageEffectsTip(
-            SameEffectsTipRejectionError::Evicted
+        Just(MempoolError::StorageExactTip(
+            ExactTipRejectionError::Evicted
         )),
         Just(MempoolError::StorageEffectsChain(
             SameEffectsChainRejectionError::Expired

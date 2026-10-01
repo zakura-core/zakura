@@ -765,9 +765,8 @@ async fn mempool_queue() -> Result<(), Report> {
     let mut evicted_count = 0;
     for response in queued_responses {
         match response.unbox_mempool_error() {
-            MempoolError::StorageEffectsTip(
-                SameEffectsTipRejectionError::Evicted
-                | SameEffectsTipRejectionError::BelowEvictionCost,
+            MempoolError::StorageExactTip(
+                ExactTipRejectionError::Evicted | ExactTipRejectionError::BelowEvictionCost,
             ) => evicted_count += 1,
             MempoolError::InMempool => in_mempool_count += 1,
             error => panic!("transaction should not be rejected with reason {error:?}"),

@@ -391,9 +391,11 @@ def download_candidate(run_id, directory):
         return json.loads(subprocess.check_output(
             ['gh', 'api', f'repos/{repository}/actions/runs/{run_id}' + suffix], timeout=30))
     run = api('')
+    # Keep the former builder path valid for artifacts from historical runs.
     if (run.get('head_repository', {}).get('full_name') != repository
             or run.get('head_branch') not in ['main', os.environ.get('MAC_VERIFIER_DEPLOY_BRANCH')]
-            or run.get('path') not in ['.github/workflows/mac-verifier.yml', '.github/workflows/deploy-mac-verifier.yml',
+            or run.get('path') not in ['.github/workflows/mac-verifier.yml', '.github/workflows/build-mac-verifier.yml',
+                                       '.github/workflows/deploy-mac-verifier.yml',
                                        '.github/workflows/zakura-mainnet-deploy.yml']):
         raise ValueError('candidate must come from successful trusted Mac verifier CI')
     if run.get('status') != 'completed':

@@ -101,7 +101,7 @@ jobs:
   mac-build:
     needs: mac-source
     if: inputs.mac_candidate_run_id == ''
-    uses: ./.github/workflows/deploy-mac-verifier.yml
+    uses: ./.github/workflows/build-mac-verifier.yml
     with:
       ref: ${{ needs.mac-source.outputs.sha }}
 

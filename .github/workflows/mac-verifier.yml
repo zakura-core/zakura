@@ -12,7 +12,7 @@ on:
       - 'deploy/runner/test_zakura_cluster_watchdog.py'
       - 'deploy/runner/test_zakura_cluster_status.py'
       - '.github/workflows/mac-verifier.yml'
-      - '.github/workflows/deploy-mac-verifier.yml'
+      - '.github/workflows/build-mac-verifier.yml'
   push:
     branches: [main]
     paths:
@@ -25,7 +25,7 @@ on:
       - 'deploy/runner/test_zakura_cluster_watchdog.py'
       - 'deploy/runner/test_zakura_cluster_status.py'
       - '.github/workflows/mac-verifier.yml'
-      - '.github/workflows/deploy-mac-verifier.yml'
+      - '.github/workflows/build-mac-verifier.yml'
   workflow_dispatch:
 
 permissions:
@@ -37,7 +37,7 @@ concurrency:
 
 jobs:
   cranelift-candidate:
-    uses: ./.github/workflows/deploy-mac-verifier.yml
+    uses: ./.github/workflows/build-mac-verifier.yml
 
   tooling:
     runs-on: ubuntu-24.04

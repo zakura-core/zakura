@@ -120,12 +120,12 @@ class MacCraneliftTests(unittest.TestCase):
         self.assertEqual(snapshot["total"], 13)
         self.assertEqual(probe.call_count, 12)
         self.assertNotIn("verifiers", snapshot)
-        mac = next(row for row in snapshot["rows"] if row["name"] == "zakura-mac-os")
+        mac = next(row for row in snapshot["rows"] if row["name"] == "mac-os-cranelift")
         self.assertEqual(mac["height"], 100)
         self.assertTrue(mac["healthy"])
         self.assertEqual(mac["ssh"], "")
         self.assertEqual(mac["node_id"], sample["verifier_id"])
-        detail = collector.node_snapshot("zakura-mac-os")
+        detail = collector.node_snapshot("mac-os-cranelift")
         self.assertEqual(detail["node"]["host"]["rss_bytes"], 1000)
         self.assertEqual(len(detail["history"]), 1)
 
@@ -147,7 +147,7 @@ class MacCraneliftTests(unittest.TestCase):
             snapshot = collector.snapshot()
             self.assertEqual(snapshot["total"], 2 if enabled else 1)
             if enabled:
-                mac = next(row for row in snapshot["rows"] if row["name"] == "zakura-mac-os")
+                mac = next(row for row in snapshot["rows"] if row["name"] == "mac-os-cranelift")
                 self.assertFalse(mac["healthy"])
                 self.assertIsNone(mac["height"])
             self.assertNotIn("verifiers", snapshot)
@@ -160,7 +160,7 @@ class MacCraneliftTests(unittest.TestCase):
                 mock.patch.object(status, "mac_cranelift_status", return_value=sample), \
                 mock.patch.object(status, "probe_node", return_value={}):
             collector.poll_once()
-        mac = next(row for row in collector.snapshot()["rows"] if row["name"] == "zakura-mac-os")
+        mac = next(row for row in collector.snapshot()["rows"] if row["name"] == "mac-os-cranelift")
         self.assertEqual(mac["height"], 100)
         self.assertFalse(mac["healthy"])
         self.assertEqual(mac["health"], "verification_error")
@@ -1263,6 +1263,27 @@ class HttpHandlerTests(unittest.TestCase):
         self.thread.join(timeout=2)
         status.COLLECTOR = self.original_collector
         status.RATE_LIMITER = self.original_limiter
+
+    def test_synthetic_mac_detail_page_and_data_are_available(self):
+        sample = {"available": True, "verifier_id": "verifier-" + "a" * 32,
+                  "mac_tip": 100, "mac_tip_hash": "b" * 64,
+                  "comparison_healthy": True}
+        status.COLLECTOR.network = "mainnet"
+        with mock.patch.dict(os.environ, {"ZAKURA_MAC_CRANELIFT_STATUS": "1"}), \
+                mock.patch.object(status, "mac_cranelift_status", return_value=sample), \
+                mock.patch.object(status, "probe_node", return_value={}):
+            status.COLLECTOR.poll_once()
+        self.assertNotIn("mac-os-cranelift", status.COLLECTOR.nodes_by_name)
+        with urllib.request.urlopen(f"{self.base_url}/node/mac-os-cranelift") as response:
+            self.assertEqual(response.read(), status.PAGE.encode())
+        with urllib.request.urlopen(f"{self.base_url}/data/node/mac-os-cranelift") as response:
+            detail = json.load(response)
+        self.assertEqual(detail["node"]["name"], "mac-os-cranelift")
+        self.assertEqual(detail["node"]["ssh"], "")
+        self.assertTrue(all(value == "" for value in detail["config"].values()))
+        with self.assertRaises(urllib.error.HTTPError) as caught:
+            urllib.request.urlopen(f"{self.base_url}/node/unknown")
+        self.assertEqual(caught.exception.code, 404)
 
     def test_get_status_sets_public_headers(self):
         request = urllib.request.Request(

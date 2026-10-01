@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import traceback
 
 PACKAGE = Path(__file__).resolve().parents[1] / 'mac-verifier'
 sys.path.insert(0, str(PACKAGE))
@@ -49,6 +50,9 @@ class SSH:
         result = subprocess.run(self.command + ['bash -s'], input=script,
                                 capture_output=True, text=True, timeout=timeout)
         if result.returncode:
+            hints = [hint for hint in ['Bootstrap failed', 'Boot-out failed', 'Permission denied',
+                      'FileNotFoundError', 'SyntaxError', 'ModuleNotFoundError'] if hint in result.stderr]
+            print('Remote exit code:', result.returncode, 'diagnostic categories:', hints, flush=True)
             raise RuntimeError('remote operation failed (private output withheld)')
         return result.stdout
 
@@ -250,6 +254,7 @@ def transitioned_receipt(old, candidate, now):
 def deploy_candidate(mac, linux, candidate_dir, candidate):
     """Coordinate binary/receipt replacement while preserving comparison history."""
     from common import digest
+    print('Checking live receipts and staging the accepted binary', flush=True)
     old_mac = json.loads(mac.run(f'sudo -n cat {shlex.quote(BASE + "/receipt.json")}'))
     old_linux = json.loads(linux.run('sudo -n cat /etc/zakura-mac-verifier/receipt.json'))
     if old_mac != old_linux:
@@ -276,6 +281,7 @@ sudo -n {stage}/zakurad --version >/dev/null
     linux.run('set -eu\nsudo -n cp -p /etc/zakura-mac-verifier/receipt.json /etc/zakura-mac-verifier/receipt.json.previous\n'
               'sudo -n systemctl stop zakura-mac-verifier')
     try:
+        print('Replacing the Mac binary and restarting its node and adapter', flush=True)
         mac.run(f'''set -eu
 sudo -n cp -p '{BASE}/bin/zakurad' '{BASE}/bin/zakurad.previous'
 sudo -n cp -p '{BASE}/receipt.json' '{BASE}/receipt.json.previous'
@@ -286,9 +292,11 @@ sudo -n cp {stage}/receipt.json '{BASE}/receipt.json'
 sudo -n install -m 644 {stage}/acceptance.json '{BASE}/evidence/ci-acceptance.json'
 sudo -n launchctl bootstrap system /Library/LaunchDaemons/dev.valargroup.zakura-verifier-node.plist
 sudo -n launchctl bootstrap system /Library/LaunchDaemons/dev.valargroup.zakura-verifier-adapter.plist
-''')
+''', timeout=300)
+        print('Updating the Linux receipt while retaining comparison state', flush=True)
         linux.put((json.dumps(new) + '\n').encode(), '/etc/zakura-mac-verifier/receipt.json')
-        linux.run('''sudo -n python3 - <<'REMOTE'
+        linux.run('''set -eu
+sudo -n python3 - <<'REMOTE'
 import hashlib, json, os, pathlib, sys
 sys.path.insert(0, '/opt/zakura-mac-verifier')
 from common import atomic_json
@@ -305,6 +313,7 @@ REMOTE
 sudo -n systemctl start zakura-mac-verifier
 ''')
         deadline = time.monotonic() + 600
+        print('Waiting for new mainnet progress and matching state comparison', flush=True)
         previous_height = None
         while time.monotonic() < deadline:
             raw = json.loads(linux.run('sudo -n cat /var/lib/zakura-mac-verifier/status.json'))
@@ -323,6 +332,7 @@ sudo -n systemctl start zakura-mac-verifier
             time.sleep(15)
         raise RuntimeError('deployed node did not advance with healthy comparison')
     except Exception:
+        print('Restoring the previous binary and receipt identity', flush=True)
         linux.run('sudo -n systemctl stop zakura-mac-verifier')
         mac.run(f'''set -eu
 sudo -n launchctl bootout system/dev.valargroup.zakura-verifier-node || true
@@ -331,7 +341,7 @@ sudo -n cp -p '{BASE}/bin/zakurad.previous' '{BASE}/bin/zakurad'
 sudo -n cp -p '{BASE}/receipt.json.previous' '{BASE}/receipt.json'
 sudo -n launchctl bootstrap system /Library/LaunchDaemons/dev.valargroup.zakura-verifier-node.plist
 sudo -n launchctl bootstrap system /Library/LaunchDaemons/dev.valargroup.zakura-verifier-adapter.plist
-''')
+''', timeout=300)
         linux.run('''set -eu
 sudo -n cp -p /etc/zakura-mac-verifier/receipt.json.previous /etc/zakura-mac-verifier/receipt.json
 sudo -n python3 - <<'REMOTE'
@@ -381,5 +391,8 @@ def main():
 if __name__ == '__main__':
     try:
         main()
-    except Exception:
-        raise SystemExit('Mac verifier operation failed; private remote output withheld') from None
+    except Exception as error:
+        frames = ' -> '.join(f'{Path(frame.filename).name}:{frame.lineno}'
+                             for frame in traceback.extract_tb(error.__traceback__))
+        raise SystemExit(f'Mac verifier operation failed ({type(error).__name__}, {frames}); '
+                         'private remote output withheld') from None

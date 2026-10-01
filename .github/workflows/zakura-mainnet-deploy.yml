@@ -896,6 +896,7 @@ jobs:
         env:
           SLACK_WEB_HOOK: ${{ secrets.SLACK_WEB_HOOK }}
           SHA: ${{ github.sha }}
+          PAGERDUTY_ROUTING_KEY: ${{ secrets.PAGERDUTY_ROUTING_KEY }}
         run: |
           set -euo pipefail
 

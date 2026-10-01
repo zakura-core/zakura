@@ -1,4 +1,4 @@
-name: Build Cranelift Mac verifier deployment candidate
+name: Build zakura-mac-cranelift deployment candidate
 
 on:
   workflow_dispatch:
@@ -18,7 +18,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: mac-verifier-candidate-${{ github.ref }}
+  group: zakura-mac-cranelift-candidate-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -48,7 +48,7 @@ jobs:
             --component rust-src --component rustc-dev --component llvm-tools --component rustfmt
           git clone https://github.com/rust-lang/rustc_codegen_cranelift.git "$RUNNER_TEMP/backend"
           git -C "$RUNNER_TEMP/backend" checkout --detach 05409775adc5f87a3aae12184486301f70ca519d
-          git -C "$RUNNER_TEMP/backend" apply "$GITHUB_WORKSPACE/deploy/mac-verifier/cranelift/macos-unwind.patch"
+          git -C "$RUNNER_TEMP/backend" apply "$GITHUB_WORKSPACE/deploy/zakura-mac-cranelift/cranelift/macos-unwind.patch"
           python3 - <<'PY'
           import os
           from pathlib import Path
@@ -76,14 +76,14 @@ jobs:
           ./y.sh build --panic-unwind-support --keep-sysroot
       - name: Build and qualify the Cranelift deployment candidate
         run: |
-          python3 deploy/mac-verifier/cranelift/qualify.py \
+          python3 deploy/zakura-mac-cranelift/cranelift/qualify.py \
             --backend "$RUNNER_TEMP/backend" --source "$GITHUB_WORKSPACE/consensus-source" \
             --source-sha "$(git -C consensus-source rev-parse HEAD)" \
             --output "$RUNNER_TEMP/qualification"
       - name: Publish accepted binary and provenance
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: mac-verifier-cranelift-${{ github.sha }}
+          name: zakura-mac-cranelift-candidate-${{ github.sha }}
           if-no-files-found: error
           retention-days: 7
           path: |
@@ -93,7 +93,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: mac-verifier-diagnostics-${{ github.sha }}
+          name: zakura-mac-cranelift-diagnostics-${{ github.sha }}
           if-no-files-found: warn
           retention-days: 7
           path: |

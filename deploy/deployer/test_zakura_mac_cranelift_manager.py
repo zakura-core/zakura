@@ -10,7 +10,12 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-import mac_verifier as deploy
+import importlib.util
+
+spec = importlib.util.spec_from_file_location(
+    "zakura_mac_cranelift_manager", Path(__file__).with_name("zakura-mac-cranelift-manager.py"))
+deploy = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(deploy)
 from common import digest
 
 
@@ -19,13 +24,30 @@ class CandidateTests(unittest.TestCase):
         for address, leak in [('198.51.100.42', '198.51.100.42'),
                               ('2001:db8::42', '2001:0db8:0000:0000:0000:0000:0000:0042')]:
             output = io.StringIO()
-            with self.subTest(address=address), patch.dict(os.environ, {'MAC_VERIFIER_HOST': address}), \
+            with self.subTest(address=address), patch.dict(os.environ, {'ZAKURA_MAC_CRANELIFT_HOST': address}), \
                     contextlib.redirect_stdout(output):
                 with self.assertRaises(ValueError):
                     deploy.public_report({'compiler': 'unexpected address: ' + leak})
                 self.assertEqual(output.getvalue(), '')
                 deploy.public_report({'architecture': 'arm64'})
                 self.assertNotIn(address, output.getvalue())
+
+    def test_renamed_and_historical_candidate_runs_remain_usable(self):
+        paths = ['zakura-mac-cranelift.yml', 'build-zakura-mac-cranelift.yml',
+                 'mac-verifier.yml', 'build-mac-verifier.yml', 'deploy-mac-verifier.yml',
+                 'zakura-mainnet-deploy.yml']
+        for workflow in paths:
+            for prefix in ['zakura-mac-cranelift-candidate-', 'mac-verifier-cranelift-']:
+                run = dict(head_repository={'full_name': 'zakura-core/zakura'}, head_branch='main',
+                           path='.github/workflows/' + workflow, status='completed', conclusion='success')
+                artifacts = {'artifacts': [dict(name=prefix + 'a' * 40, expired=False),
+                    dict(name='zakura-mac-cranelift-diagnostics-' + 'a' * 40, expired=False)]}
+                with self.subTest(workflow=workflow, prefix=prefix), tempfile.TemporaryDirectory() as tmp, \
+                        patch.object(deploy.subprocess, 'check_output',
+                                     side_effect=[json.dumps(run), json.dumps(artifacts)]), \
+                        patch.object(deploy.subprocess, 'run') as download:
+                    deploy.download_candidate('123', Path(tmp))
+                    self.assertIn(prefix + 'a' * 40, download.call_args.args[0])
 
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -106,9 +128,9 @@ class MigrationTests(unittest.TestCase):
             return ''
 
     def setUp(self):
-        self.env = patch.dict(os.environ, {'MAC_VERIFIER_HOST': '198.51.100.42',
-                             'MAC_VERIFIER_USER': 'fixture', 'MAC_VERIFIER_SSH_PORT': '22',
-                             'MAC_VERIFIER_KNOWN_HOSTS': 'fixture-host-key'})
+        self.env = patch.dict(os.environ, {'ZAKURA_MAC_CRANELIFT_HOST': '198.51.100.42',
+                             'ZAKURA_MAC_CRANELIFT_USER': 'fixture', 'ZAKURA_MAC_CRANELIFT_SSH_PORT': '22',
+                             'ZAKURA_MAC_CRANELIFT_KNOWN_HOSTS': 'fixture-host-key'})
         self.env.start()
         self.addCleanup(self.env.stop)
 

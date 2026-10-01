@@ -1061,7 +1061,7 @@ class NoVerifierRedirect(urllib.request.HTTPRedirectHandler):
         raise ValueError("verifier bridge redirect refused")
 
 
-def private_verifier_status() -> dict:
+def mac_cranelift_status() -> dict:
     """Read only the local sanitized bridge; never poll a private host directly."""
     try:
         request = urllib.request.Request("http://127.0.0.1:28236/v1/status")
@@ -1161,8 +1161,8 @@ class ClusterCollector:
     def poll_once(self) -> None:
         rows = []
         started = time.time()
-        private_enabled = self.network == "mainnet" and os.environ.get("ZAKURA_PRIVATE_VERIFIER_STATUS") == "1"
-        sample = private_verifier_status() if private_enabled else {}
+        private_enabled = self.network == "mainnet" and os.environ.get("ZAKURA_MAC_CRANELIFT_STATUS", os.environ.get("ZAKURA_PRIVATE_VERIFIER_STATUS")) == "1"
+        sample = mac_cranelift_status() if private_enabled else {}
         anchor = sample.get("fork_anchor") if sample.get("available") else None
         fork_height = anchor["height"] if isinstance(anchor, dict) else None
         with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(self.nodes))) as pool:

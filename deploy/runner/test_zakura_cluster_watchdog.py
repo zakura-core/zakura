@@ -2108,7 +2108,7 @@ class MacForkAlertTests(unittest.TestCase):
         self.assertEqual(len(sent), 1)
 
     def test_mute_suppresses_mac_forks_without_altering_state(self):
-        with patch.dict(watchdog.os.environ, {"MAC_VERIFIER_ALERTS_MUTED": "1"}):
+        with patch.dict(watchdog.os.environ, {"ZAKURA_MAC_CRANELIFT_ALERTS_MUTED": "1"}):
             state, sent = self.check(self.rows())
         self.assertEqual(sent, [])
         self.assertEqual(state, {})
@@ -2119,7 +2119,7 @@ class MacForkAlertTests(unittest.TestCase):
         agent.notify = lambda text, args: (sent.append(text), True)[1]
         fleet = watchdog.Fleet("mainnet", "http://localhost/data", "https://status.mainnet.zakura.valargroup.dev/")
         state = {}
-        with patch.dict(watchdog.os.environ, {"MAC_VERIFIER_ALERTS_MUTED": "1"}):
+        with patch.dict(watchdog.os.environ, {"ZAKURA_MAC_CRANELIFT_ALERTS_MUTED": "1"}):
             for name in ("zakura-mac-os", "other"):
                 row = {"name": name, "health": "down", "height": 110}
                 observation = watchdog.NodeObservation(name, row, "down", 0, 180, 110, "a" * 64)

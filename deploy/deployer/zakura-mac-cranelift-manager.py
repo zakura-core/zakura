@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Deploy an accepted CI artifact to the existing private Mac verifier."""
+"""Deploy an accepted CI artifact to the existing private zakura-mac-cranelift."""
 import argparse
 import ipaddress
 import json
@@ -13,10 +13,12 @@ import tempfile
 import time
 import traceback
 
-PACKAGE = Path(__file__).resolve().parents[1] / 'mac-verifier'
+PACKAGE = Path(__file__).resolve().parents[1] / 'zakura-mac-cranelift'
 sys.path.insert(0, str(PACKAGE))
 from status_bridge import public_status
 
+# Installed paths, launchd labels and service accounts are persistent deployment
+# bindings. Keep them stable across the repository/CI naming change.
 BASE = '/Library/Application Support/ZakuraVerifier'
 MAC_PYTHON = '/opt/homebrew/opt/python@3.12/bin/python3.12'
 
@@ -77,7 +79,7 @@ def dashboard(linux):
         linux.put((PACKAGE.parent / 'runner/zakura-cluster-status.py').read_bytes(), target)
         linux.run('''set -eu
 sudo -n install -d -m 755 /etc/systemd/system/zakura-mainnet-dashboard.service.d
-printf '[Service]\\nEnvironment=ZAKURA_PRIVATE_VERIFIER_STATUS=1\\n' | sudo -n tee /etc/systemd/system/zakura-mainnet-dashboard.service.d/70-private-verifier.conf >/dev/null
+printf '[Service]\\nEnvironment=ZAKURA_MAC_CRANELIFT_STATUS=1\\n' | sudo -n tee /etc/systemd/system/zakura-mainnet-dashboard.service.d/70-private-verifier.conf >/dev/null
 sudo -n systemctl daemon-reload
 sudo -n systemctl restart zakura-mac-verifier-dashboard
 sudo -n systemctl restart zakura-mainnet-dashboard
@@ -116,9 +118,9 @@ def probe_program():
 
 
 def monitoring_config():
-    host = str(ipaddress.ip_address(os.environ['MAC_VERIFIER_HOST']))
-    user = os.environ['MAC_VERIFIER_USER']
-    port = os.environ.get('MAC_VERIFIER_SSH_PORT') or '22'
+    host = str(ipaddress.ip_address(os.environ['ZAKURA_MAC_CRANELIFT_HOST']))
+    user = os.environ['ZAKURA_MAC_CRANELIFT_USER']
+    port = os.environ.get('ZAKURA_MAC_CRANELIFT_SSH_PORT') or '22'
     if not re.fullmatch(r'[a-zA-Z_][a-zA-Z0-9_-]{0,31}', user) or not port.isdecimal() or not 1 <= int(port) <= 65535:
         raise ValueError('invalid private SSH configuration')
     return (f'Host mac-verifier\n  HostName {host}\n  User {user}\n  Port {port}\n'
@@ -149,14 +151,14 @@ fi
     if not re.fullmatch(r'ssh-ed25519 [A-Za-z0-9+/=]+(?: [^\r\n]*)?', public_key):
         raise ValueError('invalid monitoring public key')
     linux.put(monitoring_config(), '/etc/zakura-mac-verifier/ssh/config')
-    linux.put(os.environ['MAC_VERIFIER_KNOWN_HOSTS'].encode(), '/etc/zakura-mac-verifier/ssh/known_hosts')
+    linux.put(os.environ['ZAKURA_MAC_CRANELIFT_KNOWN_HOSTS'].encode(), '/etc/zakura-mac-verifier/ssh/known_hosts')
     linux.run('sudo -n chown zakura-mac-verifier /etc/zakura-mac-verifier/ssh/config /etc/zakura-mac-verifier/ssh/known_hosts\n'
               'sudo -n chmod 600 /etc/zakura-mac-verifier/ssh/config /etc/zakura-mac-verifier/ssh/known_hosts')
     mac.put(probe_program(), BASE + '/ssh_probe.py')
     forced = f'sudo -n {MAC_PYTHON} -I -u ' + shlex.quote(BASE + '/ssh_probe.py')
     entry = 'restrict,command="' + forced.replace('\\', '\\\\').replace('"', '\\"') + '" '
     entry += ' '.join(public_key.split()[:2]) + ' zakura-comparison-readonly'
-    user = os.environ['MAC_VERIFIER_USER']
+    user = os.environ['ZAKURA_MAC_CRANELIFT_USER']
     mac.run(f'''sudo -n {MAC_PYTHON} - <<'REMOTE'
 import os, pathlib, pwd
 base = pathlib.Path({BASE!r})
@@ -260,7 +262,7 @@ sudo -n systemctl start zakura-fleet-watchdog
 
 def public_report(value):
     payload = json.dumps(value, indent=2)
-    private = ipaddress.ip_address(os.environ['MAC_VERIFIER_HOST'])
+    private = ipaddress.ip_address(os.environ['ZAKURA_MAC_CRANELIFT_HOST'])
     if any(address in payload for address in (str(private), private.exploded)):
         raise ValueError('refusing a status report containing the private Mac address')
     print(payload)
@@ -268,7 +270,7 @@ def public_report(value):
 
 def check_address_history():
     """Check the secret's exact value without ever echoing it or matching lines."""
-    private = ipaddress.ip_address(os.environ['MAC_VERIFIER_HOST'])
+    private = ipaddress.ip_address(os.environ['ZAKURA_MAC_CRANELIFT_HOST'])
     for address in {str(private), private.exploded}:
         for selector in [['-S', address], ['--fixed-strings', '--grep', address]]:
             result = subprocess.run(['git', 'log', '--all', '--format=%H', *selector, '--'],
@@ -335,9 +337,11 @@ except OSError:
 path = pathlib.Path('/var/lib/zakura-mac-verifier/status.json')
 result['status'] = json.loads(path.read_text()) if path.exists() else None
 script = pathlib.Path('/opt/zakura-mainnet-dashboard/zakura-cluster-status.py')
-result['dashboard_supports_mac'] = 'ZAKURA_PRIVATE_VERIFIER_STATUS' in script.read_text()
+result['dashboard_supports_mac'] = any(name in script.read_text() for name in
+    ['ZAKURA_MAC_CRANELIFT_STATUS', 'ZAKURA_PRIVATE_VERIFIER_STATUS'])
 check = subprocess.run(['systemctl', 'show', 'zakura-mainnet-dashboard', '-p', 'Environment', '--value'], capture_output=True, text=True, timeout=10)
-result['dashboard_mac_enabled'] = 'ZAKURA_PRIVATE_VERIFIER_STATUS=1' in check.stdout
+result['dashboard_mac_enabled'] = any(name in check.stdout for name in
+    ['ZAKURA_MAC_CRANELIFT_STATUS=1', 'ZAKURA_PRIVATE_VERIFIER_STATUS=1'])
 print(json.dumps(result))
 REMOTE
 '''))
@@ -393,11 +397,12 @@ def download_candidate(run_id, directory):
     run = api('')
     # Keep the former builder path valid for artifacts from historical runs.
     if (run.get('head_repository', {}).get('full_name') != repository
-            or run.get('head_branch') not in ['main', os.environ.get('MAC_VERIFIER_DEPLOY_BRANCH')]
-            or run.get('path') not in ['.github/workflows/mac-verifier.yml', '.github/workflows/build-mac-verifier.yml',
+            or run.get('head_branch') not in ['main', os.environ.get('ZAKURA_MAC_CRANELIFT_DEPLOY_BRANCH')]
+            or run.get('path') not in ['.github/workflows/zakura-mac-cranelift.yml', '.github/workflows/build-zakura-mac-cranelift.yml',
                                        '.github/workflows/deploy-mac-verifier.yml',
+                                       '.github/workflows/mac-verifier.yml', '.github/workflows/build-mac-verifier.yml',
                                        '.github/workflows/zakura-mainnet-deploy.yml']):
-        raise ValueError('candidate must come from successful trusted Mac verifier CI')
+        raise ValueError('candidate must come from successful trusted zakura-mac-cranelift CI')
     if run.get('status') != 'completed':
         print('Waiting for the selected Cranelift candidate to finish acceptance', flush=True)
         subprocess.run(['gh', 'run', 'watch', run_id, '--repo', repository,
@@ -407,7 +412,7 @@ def download_candidate(run_id, directory):
     if run.get('conclusion') != 'success':
         raise ValueError('candidate CI did not pass; live binary unchanged')
     artifacts = [a for a in api('/artifacts')['artifacts']
-                 if a['name'].startswith('mac-verifier-cranelift-') and not a['expired']]
+                 if a['name'].startswith(('zakura-mac-cranelift-candidate-', 'mac-verifier-cranelift-')) and not a['expired']]
     if len(artifacts) != 1:
         raise ValueError('exactly one accepted candidate artifact required')
     subprocess.run(['gh', 'run', 'download', run_id, '--repo', repository,
@@ -542,12 +547,12 @@ def main():
     if os.environ.get('NO_RESTART') == 'true' or (
             os.environ.get('FORCE_REBUILD') == 'true' and os.environ.get('MAC_CANDIDATE_RUN_ID')):
         raise ValueError('Mac deployment requires a restart; force_rebuild cannot reuse a candidate')
-    identifier = os.environ['MAC_VERIFIER_ID']
+    identifier = os.environ['ZAKURA_MAC_CRANELIFT_ID']
     if not re.fullmatch(r'verifier-[a-f0-9]{32}', identifier):
         raise ValueError('invalid verifier identity')
-    with tempfile.TemporaryDirectory(prefix='mac-verifier-') as directory:
-        mac = SSH('MAC_VERIFIER_', directory)
-        linux = SSH('MAC_VERIFIER_REFERENCE_', directory)
+    with tempfile.TemporaryDirectory(prefix='zakura-mac-cranelift-') as directory:
+        mac = SSH('ZAKURA_MAC_CRANELIFT_', directory)
+        linux = SSH('ZAKURA_MAC_CRANELIFT_REFERENCE_', directory)
         if args.operation == 'migrate':
             migrate_ssh(mac, linux)
         if args.operation == 'deploy':
@@ -571,5 +576,5 @@ if __name__ == '__main__':
     except Exception as error:
         frames = ' -> '.join(f'{Path(frame.filename).name}:{frame.lineno}'
                              for frame in traceback.extract_tb(error.__traceback__))
-        raise SystemExit(f'Mac verifier operation failed ({type(error).__name__}, {frames}); '
+        raise SystemExit(f'zakura-mac-cranelift operation failed ({type(error).__name__}, {frames}); '
                          'private remote output withheld') from None

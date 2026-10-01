@@ -760,6 +760,70 @@ def update_alert_state(
     state_bucket[key] = next_entry
 
 
+def mac_comparison_alert_text(sample: dict, condition: str, age: float, now: float,
+                              previous_condition: str = "") -> str:
+    """Render only allowlisted comparison facts; never publish remote diagnostics."""
+    descriptions = {
+        "tree_mismatch": ("Confirmed commitment-tree mismatch",
+                          "Repeated reads disagree on commitment-tree state for the same block.",
+                          "Inspect the private mismatch evidence and compare builds; this does not establish a compiler bug."),
+        "chain_disagreement": ("Mac and Linux disagree on the chain",
+                               "The nodes returned different block hashes at a compared height.",
+                               "Check chain tips and reorg activity on both nodes."),
+        "catching_up": ("Comparison is catching up",
+                        "The Mac or the comparison cursor is behind; agreement is not yet established through the target.",
+                        "Check node sync progress and whether the comparison cursor is advancing."),
+        "coverage_gap": ("Comparison coverage needs attention",
+                         "A reorg exceeded retained comparison history; continuous coverage cannot be established.",
+                         "Inspect the private cursor and audit history before repairing coverage."),
+        "unavailable": ("Comparison is unavailable",
+                        "A fresh, valid comparison could not be obtained; agreement is unknown.",
+                        "Check the watchdog, restricted SSH probe and both local RPC services."),
+        "matching": ("Comparison recovered", "Blocks and commitment trees match through the reported height.",
+                     "No immediate action. Retained mismatch evidence remains available privately."),
+    }
+    title, meaning, action = descriptions.get(condition, descriptions["unavailable"])
+    recovered = condition == "matching"
+    icon = ":white_check_mark:" if recovered else ":rotating_light:" if condition == "tree_mismatch" else ":warning:"
+    duration = format_duration(max(0, age))
+    timing = f"Recovered after {duration}" if recovered else f"Observed for {duration}"
+    if recovered and previous_condition in descriptions and previous_condition != "matching":
+        timing += " · Previous: " + descriptions[previous_condition][0].lower()
+    lines = [f"{icon} *Zakura mainnet · {title}*",
+             "`zakura-mac-cranelift` · Mac ARM64 / Cranelift ↔ Linux reference",
+             timing, meaning]
+
+    def mapping(value):
+        return value if isinstance(value, dict) else {}
+
+    def height(value):
+        return value if type(value) is int and 0 <= value <= 2**63 - 1 else None
+
+    def display(value):
+        return f"{value:,}" if value is not None else "unknown"
+
+    mac = mapping(sample.get("verifier"))
+    mac_height = height(mapping(mac.get("tip")).get("height"))
+    linux_height = height(mapping(sample.get("reference")).get("height"))
+    compared = height(sample.get("compared_through"))
+    start = height(sample.get("coverage_start"))
+    stamp = sample.get("sample_time")
+    fresh = type(stamp) in (int, float) and math.isfinite(stamp) and -10 <= now - stamp <= 60
+    freshness = f"{format_duration(max(0, now - stamp))} old" if fresh else "stale or unknown; values below are last reported"
+    lines += [f"*Sample:* {freshness}",
+              f"*Reported tips:* Mac {display(mac_height)} · Linux {display(linux_height)}",
+              f"*Comparison cursor:* {display(compared)} · Coverage starts at {display(start)}"]
+    if fresh and mac_height is not None and linux_height is not None and compared is not None:
+        backlog = max(0, min(mac_height, linux_height) - 3 - compared)
+        lines.append(f"*Comparison backlog:* {backlog:,} blocks (target: 3 behind the shorter tip)")
+    source = mapping(mac.get("receipt")).get("source_sha")
+    if isinstance(source, str) and len(source) == 40 and all(c in "0123456789abcdef" for c in source):
+        lines.append(f"*Mac source:* `{source[:12]}`")
+    lines += [f"*Next step:* {action}",
+              "<https://status.mainnet.zakura.valargroup.dev/|Open mainnet status dashboard>"]
+    return "\n".join(lines)
+
+
 def node_alert_text(fleet: Fleet, row: dict[str, Any], condition: str, age: float) -> str:
     fleet_name = slack_identity(fleet.name, MAX_ALERT_NAME_CHARS, "unknown")
     name = slack_identity(row.get("name"), MAX_ALERT_NAME_CHARS, "unknown")
@@ -1234,8 +1298,9 @@ class Watchdog:
         since = entry.get("bad_since", now) if entry.get("condition") == alert_condition else now
         update_alert_state(bucket, "mainnet", alert_condition, since,
                            0 if condition == "tree_mismatch" else 180,
-                           "Zakura compiler comparison: " + condition,
-                           "Zakura compiler comparison recovered: matching blocks and commitment trees",
+                           mac_comparison_alert_text(sample, condition, now - since, now),
+                           mac_comparison_alert_text(sample, "matching", now - entry.get("bad_since", now),
+                                                     now, entry.get("condition", "")),
                            now, suppressed or muted, self.args,
                            notify=(lambda *_: False) if suppressed or muted else self.notify)
 
@@ -1311,7 +1376,7 @@ class Watchdog:
 
         if not self.handle_fleet_recovered(state, fleet, now):
             return
-        if os.environ.get("MAC_VERIFIER_ALERTS_MUTED") == "1":
+        if os.environ.get("ZAKURA_MAC_CRANELIFT_ALERTS_MUTED", os.environ.get("MAC_VERIFIER_ALERTS_MUTED")) == "1":
             node_rows = [row for row in node_rows if row.get("name") != "zakura-mac-os"]
         self.handle_mac_fork(state, fleet, node_rows, now, suppressed)
         grace_since = max(
@@ -1360,7 +1425,7 @@ class Watchdog:
         Missing or racing samples cannot prove a fork or clear an existing one.
         Offline peers remain in the denominator, preventing a reduced quorum.
         """
-        if os.environ.get("MAC_VERIFIER_ALERTS_MUTED") == "1":
+        if os.environ.get("ZAKURA_MAC_CRANELIFT_ALERTS_MUTED", os.environ.get("MAC_VERIFIER_ALERTS_MUTED")) == "1":
             return
         if fleet.name != "mainnet":
             return
@@ -2002,7 +2067,7 @@ class Watchdog:
         suppressed: bool,
         coalesced: bool = False,
     ) -> None:
-        if observation.name == "zakura-mac-os" and os.environ.get("MAC_VERIFIER_ALERTS_MUTED") == "1":
+        if observation.name == "zakura-mac-os" and os.environ.get("ZAKURA_MAC_CRANELIFT_ALERTS_MUTED", os.environ.get("MAC_VERIFIER_ALERTS_MUTED")) == "1":
             return
         key = f"{fleet.name}/{observation.name}"
         bucket = state.setdefault("nodes", {})
@@ -2124,13 +2189,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--mac-comparison", type=Path,
                         default=(Path("/opt/zakura-mac-verifier/comparison.py")
-                                 if os.environ.get("ZAKURA_MAC_COMPARISON") == "1" else None))
+                                 if os.environ.get("ZAKURA_MAC_CRANELIFT_COMPARISON", os.environ.get("ZAKURA_MAC_COMPARISON")) == "1" else None))
     parser.add_argument("--mac-comparison-state", type=Path,
                         default=Path("/var/lib/zakura-mac-verifier"))
     parser.add_argument("--mac-comparison-receipt", type=Path,
                         default=Path("/etc/zakura-mac-verifier/receipt.json"))
     parser.add_argument("--mac-comparison-alerts", action="store_true",
-                        default=os.environ.get("ZAKURA_MAC_COMPARISON_ALERTS") == "1")
+                        default=os.environ.get("ZAKURA_MAC_CRANELIFT_COMPARISON_ALERTS", os.environ.get("ZAKURA_MAC_COMPARISON_ALERTS")) == "1")
     parser.add_argument("--once", action="store_true", help="poll once, update state, and exit")
     parser.add_argument("--dry-run", action="store_true", help="log Slack messages instead")
     return parser.parse_args()

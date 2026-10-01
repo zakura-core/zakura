@@ -35,7 +35,7 @@ running `zakurad` and requires fresh output outside both source checkouts.
 
 ## Candidate CI and runtime boundary
 
-The `Build Cranelift Mac verifier deployment candidate` workflow runs in PR CI
+The `Build zakura-mac-cranelift deployment candidate` workflow runs in PR CI
 and supports manual dispatch with a source `ref`. It prepares the pinned backend and static standard
 library, runs the acceptance driver, verifies native ARM64 output and uploads
 only the binary and receipt after every gate passes. Receipts record source,

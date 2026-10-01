@@ -84,12 +84,12 @@ def public_row(
     }
 
 
-class PrivateVerifierTests(unittest.TestCase):
+class MacCraneliftTests(unittest.TestCase):
     def read(self, payload):
         opener = mock.Mock()
         opener.open.return_value = io.BytesIO(json.dumps(payload).encode())
         with mock.patch.object(status.urllib.request, "build_opener", return_value=opener):
-            return status.private_verifier_status()
+            return status.mac_cranelift_status()
 
     def test_existing_dashboard_does_not_publish_private_endpoint_or_diagnostics(self):
         payload = {"verifier_id": "verifier-" + "a" * 32, "sample_time": time.time(),
@@ -114,8 +114,8 @@ class PrivateVerifierTests(unittest.TestCase):
                   "mac_tip": 100, "mac_tip_hash": "b" * 64, "source_sha": "c" * 40,
                   "comparison_healthy": True,
                   "compared_through": 90, "pending_alerts": 2, "node_rss_bytes": 1000}
-        with mock.patch.dict(os.environ, {"ZAKURA_PRIVATE_VERIFIER_STATUS": "1"}), \
-                mock.patch.object(status, "private_verifier_status", return_value=sample), \
+        with mock.patch.dict(os.environ, {"ZAKURA_MAC_CRANELIFT_STATUS": "1"}), \
+                mock.patch.object(status, "mac_cranelift_status", return_value=sample), \
                 mock.patch.object(status, "probe_node", return_value={}) as probe:
             collector.poll_once()
         snapshot = collector.snapshot()
@@ -131,11 +131,19 @@ class PrivateVerifierTests(unittest.TestCase):
         self.assertEqual(detail["node"]["host"]["rss_bytes"], 1000)
         self.assertEqual(len(detail["history"]), 1)
 
+    def test_legacy_dashboard_setting_still_enables_the_node(self):
+        collector = status.ClusterCollector([node()], 10, 300, "mainnet")
+        with mock.patch.dict(os.environ, {"ZAKURA_PRIVATE_VERIFIER_STATUS": "1"}, clear=True), \
+                mock.patch.object(status, "mac_cranelift_status", return_value={"available": False}), \
+                mock.patch.object(status, "probe_node", return_value={}):
+            collector.poll_once()
+        self.assertEqual(collector.snapshot()["total"], 2)
+
     def test_private_mac_is_mainnet_only_and_unavailable_sample_is_unhealthy(self):
         for network, enabled in (("mainnet", True), ("testnet", False)):
             collector = status.ClusterCollector([node()], 10, 300, network)
-            with mock.patch.dict(os.environ, {"ZAKURA_PRIVATE_VERIFIER_STATUS": "1"}), \
-                    mock.patch.object(status, "private_verifier_status", return_value={"available": False}), \
+            with mock.patch.dict(os.environ, {"ZAKURA_MAC_CRANELIFT_STATUS": "1"}), \
+                    mock.patch.object(status, "mac_cranelift_status", return_value={"available": False}), \
                     mock.patch.object(status, "probe_node", return_value={}):
                 collector.poll_once()
             snapshot = collector.snapshot()
@@ -150,8 +158,8 @@ class PrivateVerifierTests(unittest.TestCase):
         collector = status.ClusterCollector([node()], 10, 300, "mainnet")
         sample = {"available": True, "mac_tip": 100, "mac_tip_hash": "b" * 64,
                   "comparison_healthy": False, "compared_through": 90, "alerts_muted": True}
-        with mock.patch.dict(os.environ, {"ZAKURA_PRIVATE_VERIFIER_STATUS": "1"}), \
-                mock.patch.object(status, "private_verifier_status", return_value=sample), \
+        with mock.patch.dict(os.environ, {"ZAKURA_MAC_CRANELIFT_STATUS": "1"}), \
+                mock.patch.object(status, "mac_cranelift_status", return_value=sample), \
                 mock.patch.object(status, "probe_node", return_value={}):
             collector.poll_once()
         mac = next(row for row in collector.snapshot()["rows"] if row["name"] == "zakura-mac-os")

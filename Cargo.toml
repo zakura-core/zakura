@@ -6,7 +6,6 @@ members = [
         "crates/zakura-network",
         "crates/zakura-state",
         "crates/zakura-script",
-        "crates/zcash-script",
         "crates/zakura-consensus",
         "crates/zakura-rpc",
         "crates/zakura-node-services",
@@ -22,7 +21,7 @@ members = [
 # The asset packaging crate publishes on the release-state cadence rather than with the
 # workspace, and its payload is generated rather than committed, so it is deliberately not a
 # member. Zakura consumes the published crate from crates.io like any other dependency.
-exclude = ["crates/zakura-assets", "qa/script-oracle"]
+exclude = ["crates/zakura-assets"]
 
 # Use the edition 2021 dependency resolver in the workspace, to match the crates
 resolver = "2"
@@ -184,7 +183,7 @@ opentelemetry-otlp = { version = "0.32", default-features = false }
 uint = "0.10"
 x25519-dalek = "2.0.1"
 zcash_note_encryption = "0.4.1"
-zcash_script = { version = "0.4.5", path = "crates/zcash-script" }
+zcash_script = "0.4.5"
 config = { version = "0.15.14", default-features = false, features = ["toml"] }
 
 # All cargo-release configuration lives in this table. Do not add a root
@@ -424,6 +423,3 @@ unwrap_in_result = "warn"
 
 # TODOs: fix this lint eventually
 result_large_err = "allow"
-
-[patch.crates-io]
-zcash_script = { path = "crates/zcash-script" }

@@ -1,4 +1,4 @@
-//! Zakura transparent script verification with the owned Rust interpreter.
+//! Zakura transparent script verification with the Rust `zcash_script` interpreter.
 #![doc(html_favicon_url = "https://zakura.com/assets/rustdoc/zakura-favicon-128.png")]
 #![doc(html_logo_url = "https://zakura.com/assets/rustdoc/zakura-icon.png")]
 #![doc(html_root_url = "https://docs.rs/zakura_script")]
@@ -17,7 +17,12 @@ use zakura_chain::{
     transaction::{HashType, SigHasher},
     transparent,
 };
-use zcash_script::{script, script::Evaluable as _};
+use zcash_script::{
+    interpreter::{CallbackTransactionSignatureChecker, Flags},
+    opcode::{Operation, PossiblyBad},
+    script::{self, Evaluable as _},
+    Opcode,
+};
 
 /// Errors from transaction preparation and script verification.
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
@@ -29,7 +34,7 @@ pub enum Error {
     TxIndex,
     /// tx is a coinbase transaction and should not be verified
     TxCoinbase,
-    /// The Rust interpreter rejected a script component.
+    /// The interpreter rejected a script component.
     Interpreter {
         /// The component that failed.
         component: script::ComponentType,
@@ -73,7 +78,7 @@ fn parse_zip244_hash_type(raw_hash_type: i32) -> Option<HashType> {
 /// Transaction.
 #[derive(Debug)]
 pub struct CachedFfiTransaction {
-    /// The deserialized transaction.
+    /// The deserialized Zebra transaction.
     ///
     /// This field is private so that `transaction`, and `all_previous_outputs` always match.
     transaction: Arc<zakura_chain::transaction::Transaction>,
@@ -137,7 +142,6 @@ impl CachedFfiTransaction {
 
     /// Verify if the script in the input at `input_index` of a transaction correctly spends the
     /// matching [`transparent::Output`] it refers to.
-    #[allow(clippy::unwrap_in_result)]
     pub fn is_valid(&self, input_index: usize) -> Result<(), Error> {
         let previous_output = self
             .all_previous_outputs
@@ -152,8 +156,7 @@ impl CachedFfiTransaction {
         } = previous_output;
         let script_pub_key: &[u8] = lock_script.as_raw_bytes();
 
-        let flags = zcash_script::interpreter::Flags::P2SH
-            | zcash_script::interpreter::Flags::CHECKLOCKTIMEVERIFY;
+        let flags = Flags::P2SH | Flags::CHECKLOCKTIMEVERIFY;
 
         let lock_time = self.transaction.raw_lock_time();
         let is_final = self.transaction.inputs()[input_index].sequence() == u32::MAX;
@@ -169,6 +172,8 @@ impl CachedFfiTransaction {
         let script =
             script::Raw::from_raw_parts(signature_script.to_vec(), script_pub_key.to_vec());
 
+        // Returning `None` fails only this signature check, like zcashd's `CheckSig`: the
+        // interpreter pushes false, which later opcodes such as `OP_NOT` may consume.
         let calculate_sighash =
             |script_code: &script::Code, hash_type: &zcash_script::signature::HashType| {
                 let script_code_vec = script_code.0.clone();
@@ -205,7 +210,7 @@ impl CachedFfiTransaction {
                         .0,
                 )
             };
-        let checker = zcash_script::interpreter::CallbackTransactionSignatureChecker {
+        let checker = CallbackTransactionSignatureChecker {
             sighash: &calculate_sighash,
             lock_time: i64::from(lock_time),
             is_final,
@@ -231,11 +236,8 @@ impl CachedFfiTransaction {
 pub trait Sigops {
     /// Returns the number of transparent signature operations in the
     /// transparent inputs and outputs of the given transaction.
-    fn sigops(&self) -> Result<u32, Error> {
-        Ok(self
-            .scripts()
-            .map(|s| script::Code(s).sig_op_count(false))
-            .sum())
+    fn sigops(&self) -> u32 {
+        self.scripts().map(|script| legacy_sigop_count(&script)).sum()
     }
 
     /// Returns an iterator over the input and output scripts in the transaction.
@@ -298,6 +300,86 @@ impl Sigops for zcash_primitives::transaction::Transaction {
     }
 }
 
+/// Counts the signature operations in `script` like zcashd's `CScript::GetSigOpCount(false)`.
+///
+/// zcashd reads opcodes with `GetOp` and applies no execution limits. This function therefore
+/// counts sigops after pushes larger than the 520-byte execution limit, which output scripts can
+/// contain because creating an output never executes its script. Every `CHECKMULTISIG` counts as
+/// the maximum key count. A truncated push ends the count, like a `GetOp` failure.
+pub fn legacy_sigop_count(mut script: &[u8]) -> u32 {
+    // `Operation` is `repr(u8)`, so each cast yields the opcode byte.
+    const CHECKSIG: u8 = Operation::OP_CHECKSIG as u8;
+    const CHECKSIGVERIFY: u8 = Operation::OP_CHECKSIGVERIFY as u8;
+    const CHECKMULTISIG: u8 = Operation::OP_CHECKMULTISIG as u8;
+    const CHECKMULTISIGVERIFY: u8 = Operation::OP_CHECKMULTISIGVERIFY as u8;
+    /// zcashd's `MAX_PUBKEYS_PER_MULTISIG`.
+    const MAX_PUBKEYS_PER_MULTISIG: u32 = 20;
+
+    let mut count = 0;
+    while let Some((&opcode, rest)) = script.split_first() {
+        let Some(rest) = skip_push_data(opcode, rest) else {
+            break;
+        };
+        script = rest;
+        count += match opcode {
+            CHECKSIG | CHECKSIGVERIFY => 1,
+            CHECKMULTISIG | CHECKMULTISIGVERIFY => MAX_PUBKEYS_PER_MULTISIG,
+            _ => 0,
+        };
+    }
+    count
+}
+
+/// Returns `script` after the push data of `opcode`, or `None` if the push data is truncated.
+///
+/// `script` starts after `opcode`. Opcodes that push no data return `script` unchanged.
+fn skip_push_data(opcode: u8, script: &[u8]) -> Option<&[u8]> {
+    /// Splits a little-endian length of `N` bytes off the front of `script`.
+    fn length<const N: usize>(script: &[u8]) -> Option<(usize, &[u8])> {
+        let (length, rest) = script.split_first_chunk::<N>()?;
+        let mut bytes = [0; 4];
+        bytes[..N].copy_from_slice(length);
+        Some((usize::try_from(u32::from_le_bytes(bytes)).ok()?, rest))
+    }
+
+    let (length, script) = match opcode {
+        // Direct pushes of 0 to 75 bytes, then OP_PUSHDATA1, OP_PUSHDATA2, and OP_PUSHDATA4.
+        0x00..=0x4b => (usize::from(opcode), script),
+        0x4c => length::<1>(script)?,
+        0x4d => length::<2>(script)?,
+        0x4e => length::<4>(script)?,
+        _ => (0, script),
+    };
+    script.get(length..)
+}
+
+/// Extract the redeem script bytes from a P2SH scriptSig.
+///
+/// Mirrors zcashd's P2SH redeem-script extraction in
+/// [`CScript::GetSigOpCount(const CScript& scriptSig)`].
+///
+/// Iterates the scriptSig opcodes and returns the last successfully pushed data value. Returns
+/// `None` if any opcode fails to parse, OR if any opcode is not a push value (zcashd: `opcode >
+/// OP_16`). This matches zcashd's behavior of returning 0 P2SH sigops for malformed or
+/// non-push-only scriptSigs.
+///
+/// [`CScript::GetSigOpCount(const CScript& scriptSig)`]: https://github.com/zcash/zcash/blob/v6.11.0/src/script/script.cpp#L176-L199
+fn extract_p2sh_redeem_script(unlock_script: &transparent::Script) -> Option<Vec<u8>> {
+    let code = script::Code(unlock_script.as_raw_bytes().to_vec());
+    let mut last_push_data: Option<Vec<u8>> = None;
+    for opcode in code.parse() {
+        match opcode {
+            Ok(PossiblyBad::Good(Opcode::PushValue(pv))) => {
+                last_push_data = Some(pv.value());
+            }
+            // Non-push opcode (operation, control, or bad) or parse error: zcashd returns 0 sigops
+            // in this case. Match that behavior by discarding any data collected so far.
+            _ => return None,
+        }
+    }
+    last_push_data
+}
+
 /// Returns the P2SH sigop count for a single input.
 ///
 /// `spent_output` must be the output spent by `input`.
@@ -324,7 +406,15 @@ pub fn p2sh_input_sigop_count(
         return 0;
     }
 
-    lock_code.p2sh_sig_op_count(&script::Code(unlock_script.as_raw_bytes().to_vec()))
+    let Some(redeemed_bytes) = extract_p2sh_redeem_script(unlock_script) else {
+        return 0;
+    };
+
+    // Count the redeem script's sigops in zcashd's "accurate" mode, matching
+    // `GetP2SHSigOpCount` -> `CScript::GetSigOpCount(scriptSig)` -> `subscript.GetSigOpCount(true)`.
+    // The redeem script is at most 520 bytes, so `zcash_script`'s execution push limit cannot stop
+    // this count early. Disabled opcodes, including OP_CODESEPARATOR, do not stop it either.
+    script::Code(redeemed_bytes).sig_op_count(true)
 }
 
 /// Returns the total number of P2SH sigops across all inputs of `tx`.

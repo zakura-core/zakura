@@ -19,8 +19,6 @@ set -euo pipefail
 #   version in our workspace lock file. Path-patched crates are not lint-capped,
 #   so also drop the unused `stunt_attribute_impl` re-export that fails under
 #   CARGO_BUILD_WARNINGS=deny.
-# The generated rustdoc workspaces also need the owned script patch to unify
-# the direct path dependency with primitives/transparent registry consumers.
 readonly original_cargo_home="${CARGO_HOME:-$HOME/.cargo}"
 patch_root=$(mktemp -d "$RUNNER_TEMP/semver-registry.XXXXXX")
 readonly patch_root
@@ -100,7 +98,6 @@ cat > "$patched_cargo_home/config.toml" <<EOF
 tinyvec = { path = "$tinyvec_source" }
 librocksdb-sys = { path = "$librocksdb_sys_source" }
 stun-rs = { path = "$stun_rs_source" }
-zcash_script = { path = "$(pwd)/crates/zcash-script" }
 EOF
 
 echo "CARGO_HOME=$patched_cargo_home" >> "$GITHUB_ENV"

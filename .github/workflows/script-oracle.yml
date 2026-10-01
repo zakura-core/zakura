@@ -1,45 +1,47 @@
-name: Rust script compatibility
+name: Script compatibility
 
 on:
   pull_request:
     paths:
-      - 'crates/zcash-script/**'
-      - 'crates/zakura-script/**'
-      - 'crates/zakura-consensus/**'
-      - 'qa/script-oracle/**'
-      - 'scripts/check-script-dependencies.py'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - '.github/workflows/script-oracle.yml'
+      - crates/zakura-chain/src/transaction/**
+      - crates/zakura-chain/src/transparent/**
+      - crates/zakura-script/**
+      - qa/script-oracle/**
+      - Cargo.lock
+      - .github/workflows/script-oracle.yml
   workflow_dispatch:
-
-permissions:
-  contents: read
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  CXXFLAGS: -include cstdint
+
 jobs:
   compatibility:
+    name: Compare with the C++ adapter
     runs-on: ubuntu-latest
     timeout-minutes: 60
-    env:
-      CXXFLAGS: -include cstdint
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
         with:
           persist-credentials: false
-      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f #v2.0.0
         with:
-          toolchain: stable
-          cache-key: script-oracle
+          cache-on-failure: true
       - uses: ./.github/actions/setup-zakura-build
-      - name: Check release script dependencies
-        run: python3 scripts/check-script-dependencies.py
-      - name: Test Rust execution and counting
-        run: cargo test --locked -p zcash_script -p zakura-script
-      - name: Compare C++ and Rust
-        run: cargo test --locked --manifest-path qa/script-oracle/Cargo.toml
-      - name: Replay the saved transaction fixture
-        run: cargo run --locked --manifest-path qa/script-oracle/Cargo.toml --example replay -- qa/script-oracle/fixtures/script-tx.jsonl
+      - name: Keep the C++ interpreter out of the node
+        run: |
+          if grep -qx 'name = "libzcash_script"' Cargo.lock; then
+            echo "::error::libzcash_script is back in the node's dependency graph"
+            exit 1
+          fi
+      - name: Run the differential tests
+        working-directory: qa/script-oracle
+        run: cargo test --locked --release

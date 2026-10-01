@@ -162,7 +162,6 @@ RUN --mount=type=bind,source=crates/tower-batch-control,target=crates/tower-batc
     --mount=type=bind,source=crates/zakura-node-services,target=crates/zakura-node-services \
     --mount=type=bind,source=crates/zakura-rpc,target=crates/zakura-rpc \
     --mount=type=bind,source=crates/zakura-script,target=crates/zakura-script \
-    --mount=type=bind,source=crates/zcash-script,target=crates/zcash-script \
     --mount=type=bind,source=crates/zakura-state,target=crates/zakura-state \
     --mount=type=bind,source=crates/zakura-test,target=crates/zakura-test \
     --mount=type=bind,source=crates/zakura-utils,target=crates/zakura-utils \

@@ -1,4 +1,9 @@
-// Baseline adapter from Zakura 8014ead3ff13913a6447d94db70e110254598b99.
+//! The production adapter from Zakura commit 3ef9f45f2e5067a50e990e179ef3cd88fdf8f74e, before the
+//! switch to the Rust interpreter. Only the crate attributes, the test module, and the
+//! `comparison-interpreter` feature branch are removed. Do not edit the logic: this file is the
+//! baseline that the candidate must match.
+#![allow(missing_docs, unreachable_pub)]
+
 use core::fmt;
 use std::sync::Arc;
 
@@ -50,7 +55,7 @@ impl From<libzcash_script::Error> for Error {
     }
 }
 
-pub(crate) fn parse_zip244_hash_type(raw_hash_type: i32) -> Option<HashType> {
+fn parse_zip244_hash_type(raw_hash_type: i32) -> Option<HashType> {
     match raw_hash_type {
         0x01 => Some(HashType::ALL),
         0x02 => Some(HashType::NONE),

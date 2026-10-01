@@ -8365,12 +8365,13 @@ dependencies = [
 [[package]]
 name = "zcash_script"
 version = "0.4.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2f872800287d118be71bdf6fe8c869c6a6ff6fb0a5762f68fb2af54c97edf0f2"
 dependencies = [
  "bip32",
  "bitflags",
  "bounded-vec",
  "hex",
- "lazy_static",
  "ripemd 0.1.3",
  "secp256k1",
  "sha1",

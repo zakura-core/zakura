@@ -4,6 +4,7 @@ import contextlib
 import io
 import json
 import os
+import subprocess
 from pathlib import Path
 import tempfile
 import unittest
@@ -79,6 +80,46 @@ class CandidateTests(unittest.TestCase):
             self.assertEqual(new[key], self.receipt[key])
             self.assertNotEqual(new[key], old[key])
 
+
+
+class MigrationTests(unittest.TestCase):
+    class Host:
+        def __init__(self, fail_install=False):
+            self.scripts = []
+            self.height = 100
+            self.fail_install = fail_install
+        def put(self, data, path):
+            pass
+        def run(self, script, **kwargs):
+            self.scripts.append(script)
+            subprocess.run(['bash', '-n'], input=script, text=True, check=True, capture_output=True)
+            if script.startswith('mktemp'):
+                return '/var/tmp/zakura-comparison-ci.fixture'
+            if script == 'sudo -n cat /var/lib/zakura-mac-verifier/status.json':
+                self.height += 1
+                return json.dumps(dict(condition='matching', alerts_muted=True, compared_through=self.height))
+            if self.fail_install and 'install -m 755' in script:
+                raise RuntimeError('fixture install failed')
+            return ''
+
+    def test_migration_shadow_checks_before_cutover_and_disables_old_owner(self):
+        host = self.Host()
+        with patch.object(deploy.time, 'sleep'):
+            deploy.migrate_watchdog(host)
+        joined = '\n'.join(host.scripts)
+        self.assertLess(joined.index('/shadow/cursor.json'), joined.index('systemctl stop'))
+        self.assertIn('systemctl disable zakura-mac-verifier', joined)
+        self.assertIn('ZAKURA_MAC_COMPARISON_ALERTS=0', joined)
+        self.assertNotIn('launchctl', joined)
+
+    def test_failed_cutover_restores_prior_owner_and_retains_evidence(self):
+        host = self.Host(fail_install=True)
+        with self.assertRaises(RuntimeError):
+            deploy.migrate_watchdog(host)
+        rollback = host.scripts[-1]
+        self.assertIn('failed-cursor.json', rollback)
+        self.assertIn('systemctl start zakura-mac-verifier zakura-fleet-watchdog', rollback)
+        self.assertIn('/backup/cursor.json /var/lib/zakura-mac-verifier/cursor.json', rollback)
 
 
 if __name__ == '__main__':

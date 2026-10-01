@@ -15,6 +15,7 @@ import json
 import math
 import os
 import sys
+import subprocess
 import time
 import tomllib
 import urllib.error
@@ -1162,6 +1163,66 @@ class Watchdog:
         for target in self.release_state:
             self.handle_release_state(state, target, now, suppressed)
 
+        if getattr(self.args, "mac_comparison", None):
+            self.handle_mac_comparison(state, now, suppressed)
+
+    def handle_mac_comparison(self, state, now, suppressed):
+        """One bounded child isolates comparison I/O from the other alert lanes."""
+        status_path = self.args.mac_comparison_state / "status.json"
+        started = time.time()
+        condition = "unavailable"
+        try:
+            subprocess.run([sys.executable, str(self.args.mac_comparison), "once",
+                            "--directory", str(self.args.mac_comparison_state),
+                            "--receipt", str(self.args.mac_comparison_receipt)],
+                           check=True, timeout=15, stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL, user="zakura-mac-verifier")
+            sample = json.loads(status_path.read_text())
+            if not isinstance(sample, dict):
+                raise ValueError("malformed comparison result")
+            if (type(sample.get("sample_time")) not in (int, float)
+                    or not started <= sample["sample_time"] <= time.time() + 10):
+                raise ValueError("stale comparison result")
+            if sample.get("condition") in {"matching", "catching_up", "chain_disagreement",
+                                            "tree_mismatch", "coverage_gap", "unavailable"}:
+                condition = sample["condition"]
+        except (OSError, ValueError, TypeError, subprocess.SubprocessError):
+            # Never publish remote errors or treat a previous healthy sample as fresh.
+            try:
+                sample = json.loads(status_path.read_text())
+            except (OSError, ValueError):
+                sample = {}
+            if not isinstance(sample, dict):
+                sample = {}
+            sample.update(condition="unavailable", caught_up=False, error="unavailable")
+        muted = not self.args.mac_comparison_alerts
+        sample.update(alerts_muted=muted, condition=condition,
+                      caught_up=condition == "matching",
+                      error=None if condition == "matching" else condition)
+        try:
+            # Preserve private file access for the bridge and comparison account.
+            previous = status_path.stat() if status_path.exists() else None
+            temporary = status_path.with_suffix(".watchdog.tmp")
+            with temporary.open("w") as stream:
+                os.chmod(temporary, 0o600)
+                json.dump(sample, stream)
+            if previous is not None:
+                os.chmod(temporary, previous.st_mode & 0o777)
+                os.chown(temporary, previous.st_uid, previous.st_gid)
+            temporary.replace(status_path)
+        except OSError:
+            condition = "unavailable"
+        bucket = state.setdefault("mac_comparison", {})
+        entry = bucket.get("mainnet", {})
+        alert_condition = "ok" if condition == "matching" else condition
+        since = entry.get("bad_since", now) if entry.get("condition") == alert_condition else now
+        update_alert_state(bucket, "mainnet", alert_condition, since,
+                           0 if condition == "tree_mismatch" else 180,
+                           "Zakura compiler comparison: " + condition,
+                           "Zakura compiler comparison recovered: matching blocks and commitment trees",
+                           now, suppressed or muted, self.args,
+                           notify=(lambda *_: False) if suppressed or muted else self.notify)
+
     @staticmethod
     def fleet_state(state: dict[str, Any], fleet: Fleet) -> dict[str, Any]:
         """Copy only this fleet's state so delivery cannot overwrite another fleet."""
@@ -2045,6 +2106,15 @@ def parse_args() -> argparse.Namespace:
         default=20.0,
         help="Slack webhook request timeout seconds",
     )
+    parser.add_argument("--mac-comparison", type=Path,
+                        default=(Path("/opt/zakura-mac-verifier/comparison.py")
+                                 if os.environ.get("ZAKURA_MAC_COMPARISON") == "1" else None))
+    parser.add_argument("--mac-comparison-state", type=Path,
+                        default=Path("/var/lib/zakura-mac-verifier"))
+    parser.add_argument("--mac-comparison-receipt", type=Path,
+                        default=Path("/etc/zakura-mac-verifier/receipt.json"))
+    parser.add_argument("--mac-comparison-alerts", action="store_true",
+                        default=os.environ.get("ZAKURA_MAC_COMPARISON_ALERTS") == "1")
     parser.add_argument("--once", action="store_true", help="poll once, update state, and exit")
     parser.add_argument("--dry-run", action="store_true", help="log Slack messages instead")
     return parser.parse_args()

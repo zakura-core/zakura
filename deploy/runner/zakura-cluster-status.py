@@ -1075,11 +1075,11 @@ def private_verifier_status() -> dict:
         if not isinstance(identifier, str) or not re.fullmatch(r"verifier-[a-f0-9]{32}", identifier):
             raise ValueError("invalid verifier identifier")
         result = {"verifier_id": identifier, "available": True}
-        for key in ("sample_time", "coverage_start", "compared_through", "healthy_since",
-                    "active_incidents", "pending_alerts", "mac_tip", "linux_tip", "node_rss_bytes", "free_disk_bytes"):
+        for key in ("sample_time", "coverage_start", "compared_through",
+                    "active_incidents", "mac_tip", "linux_tip", "node_rss_bytes", "free_disk_bytes"):
             value = data.get(key)
             result[key] = value if type(value) in (int, float) and math.isfinite(value) else None
-        for key in ("caught_up", "qualified", "comparison_healthy", "alerts_muted"):
+        for key in ("caught_up", "comparison_healthy", "alerts_muted"):
             result[key] = data.get(key) is True
         for key in ("mac_tip_hash", "source_sha"):
             value = data.get(key)
@@ -1199,8 +1199,6 @@ class ClusterCollector:
             row["detail"] += " · Compared through " + str(sample.get("compared_through") or "—")
             if sample.get("alerts_muted"):
                 row["detail"] += " · Alerts muted"
-            elif sample.get("pending_alerts"):
-                row["detail"] += " · Alerts pending"
             rows.append(row)
         rows.sort(key=lambda row: row["name"])
         now = time.time()

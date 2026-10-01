@@ -106,6 +106,97 @@ REMOTE
         raise
 
 
+
+def migrate_watchdog(linux):
+    """Shadow-check the new comparator, then transfer ownership with rollback."""
+    linux.run('sudo -n test ! -f /etc/systemd/system/zakura-fleet-watchdog.service.d/70-mac-comparison.conf')
+    runner = PACKAGE.parent / 'runner'
+    stage = linux.run('mktemp -d /var/tmp/zakura-comparison-ci.XXXXXX').strip()
+    if not re.fullmatch(r'/var/tmp/zakura-comparison-ci\.[A-Za-z0-9]+', stage):
+        raise ValueError('unexpected migration staging path')
+    for name, source in [('comparison.py', PACKAGE / 'comparison.py'),
+                         ('common.py', PACKAGE / 'common.py'),
+                         ('status_bridge.py', PACKAGE / 'status_bridge.py'),
+                         ('watchdog.py', runner / 'zakura-cluster-watchdog.py')]:
+        linux.put(source.read_bytes(), stage + '/' + name)
+    # No host output or private evidence is returned. Shadow work uses a copy.
+    print('Checking comparison against a copy of the current cursor', flush=True)
+    linux.run(f"""set -eu
+sudo -n chmod 755 {stage}
+sudo -n mkdir {stage}/shadow
+sudo -n cp /var/lib/zakura-mac-verifier/cursor.json {stage}/shadow/cursor.json
+sudo -n python3 {stage}/comparison.py migrate --directory {stage}/shadow
+sudo -n timeout 20 python3 {stage}/comparison.py once --directory {stage}/shadow
+sudo -n python3 - <<'REMOTE'
+import json, pathlib
+sample = json.loads(pathlib.Path('{stage}/shadow/status.json').read_text())
+assert sample['condition'] in ('matching', 'catching_up')
+REMOTE
+""", timeout=60)
+    print('Transferring comparison ownership to the fleet watchdog', flush=True)
+    # Back up at rest after stopping both possible writers. Keep these files for
+    # operator recovery; the old notification queue is never delivered.
+    linux.run(f"""set -eu
+trap 'sudo -n systemctl start zakura-mac-verifier zakura-fleet-watchdog' ERR
+sudo -n systemctl stop zakura-mac-verifier zakura-fleet-watchdog
+sudo -n mkdir {stage}/backup
+sudo -n cp -a /var/lib/zakura-mac-verifier/cursor.json {stage}/backup/cursor.json
+sudo -n cp -a /var/lib/zakura-mac-verifier/status.json {stage}/backup/status.json
+sudo -n cp -a /opt/zakura-fleet-watchdog/zakura-cluster-watchdog.py {stage}/backup/watchdog.py
+sudo -n cp -a /opt/zakura-mac-verifier/common.py {stage}/backup/common.py
+sudo -n cp -a /opt/zakura-mac-verifier/status_bridge.py {stage}/backup/status_bridge.py
+sudo -n systemctl is-enabled zakura-mac-verifier > {stage}/backup/old-enabled || true
+""")
+    try:
+        linux.run(f"""set -eu
+sudo -n install -m 644 {stage}/comparison.py /opt/zakura-mac-verifier/comparison.py
+sudo -n install -m 644 {stage}/common.py /opt/zakura-mac-verifier/common.py
+sudo -n install -m 644 {stage}/status_bridge.py /opt/zakura-mac-verifier/status_bridge.py
+sudo -n install -m 755 {stage}/watchdog.py /opt/zakura-fleet-watchdog/zakura-cluster-watchdog.py
+sudo -n -u zakura-mac-verifier python3 /opt/zakura-mac-verifier/comparison.py migrate
+sudo -n install -d -m 755 /etc/systemd/system/zakura-fleet-watchdog.service.d
+printf '[Service]\\nEnvironment=ZAKURA_MAC_COMPARISON=1\\nEnvironment=ZAKURA_MAC_COMPARISON_ALERTS=0\\n' | sudo -n tee /etc/systemd/system/zakura-fleet-watchdog.service.d/70-mac-comparison.conf >/dev/null
+sudo -n systemctl daemon-reload
+sudo -n systemctl disable zakura-mac-verifier
+sudo -n systemctl restart zakura-mac-verifier-dashboard
+sudo -n systemctl start zakura-fleet-watchdog
+""")
+        deadline = time.monotonic() + 600
+        baseline = None
+        while time.monotonic() < deadline:
+            sample = json.loads(linux.run("sudo -n cat /var/lib/zakura-mac-verifier/status.json"))
+            if sample.get('condition') == 'matching' and sample.get('alerts_muted') is True:
+                height = sample['compared_through']
+                if baseline is not None and height > baseline:
+                    linux.run('set -eu\nsudo -n systemctl is-active --quiet zakura-fleet-watchdog\n'
+                              '! sudo -n systemctl is-active --quiet zakura-mac-verifier')
+                    print('Fleet watchdog owns comparison; new blocks match; alerts remain muted')
+                    return
+                baseline = height if baseline is None else baseline
+            time.sleep(10)
+        raise RuntimeError('watchdog comparison did not advance')
+    except Exception:
+        print('Restoring previous comparison owner; retained migration evidence privately', flush=True)
+        linux.run(f"""set -eu
+sudo -n systemctl stop zakura-fleet-watchdog
+sudo -n cp -a {stage}/backup/watchdog.py /opt/zakura-fleet-watchdog/zakura-cluster-watchdog.py
+sudo -n cp -a {stage}/backup/common.py /opt/zakura-mac-verifier/common.py
+sudo -n cp -a {stage}/backup/status_bridge.py /opt/zakura-mac-verifier/status_bridge.py
+sudo -n cp -a /var/lib/zakura-mac-verifier/cursor.json {stage}/backup/failed-cursor.json
+sudo -n cp -a {stage}/backup/cursor.json /var/lib/zakura-mac-verifier/cursor.json
+sudo -n cp -a {stage}/backup/status.json /var/lib/zakura-mac-verifier/status.json
+if sudo -n test -f /var/lib/zakura-mac-verifier/legacy-cursor.json; then
+  sudo -n mv /var/lib/zakura-mac-verifier/legacy-cursor.json {stage}/backup/legacy-cursor.json
+fi
+sudo -n rm -f /etc/systemd/system/zakura-fleet-watchdog.service.d/70-mac-comparison.conf
+sudo -n systemctl daemon-reload
+if grep -qx enabled {stage}/backup/old-enabled; then sudo -n systemctl enable zakura-mac-verifier; fi
+sudo -n systemctl start zakura-mac-verifier zakura-fleet-watchdog
+sudo -n systemctl restart zakura-mac-verifier-dashboard
+""")
+        raise
+
+
 def public_report(value):
     payload = json.dumps(value, indent=2)
     private = ipaddress.ip_address(os.environ['MAC_VERIFIER_HOST'])
@@ -257,6 +348,7 @@ def transitioned_receipt(old, candidate, now):
 def deploy_candidate(mac, linux, candidate_dir, candidate):
     """Coordinate binary/receipt replacement while preserving comparison history."""
     from common import digest
+    linux.run('sudo -n test -f /etc/systemd/system/zakura-fleet-watchdog.service.d/70-mac-comparison.conf')
     print('Checking live receipts and staging the accepted binary', flush=True)
     old_mac = json.loads(mac.run(f'sudo -n cat {shlex.quote(BASE + "/receipt.json")}'))
     old_linux = json.loads(linux.run('sudo -n cat /etc/zakura-mac-verifier/receipt.json'))
@@ -282,7 +374,7 @@ REMOTE
 sudo -n {stage}/zakurad --version >/dev/null
 ''')
     linux.run('set -eu\nsudo -n cp -p /etc/zakura-mac-verifier/receipt.json /etc/zakura-mac-verifier/receipt.json.previous\n'
-              'sudo -n systemctl stop zakura-mac-verifier')
+              'sudo -n systemctl stop zakura-fleet-watchdog')
     try:
         print('Replacing the Mac binary and restarting its node and adapter', flush=True)
         mac.run(f'''set -eu
@@ -306,13 +398,11 @@ path = pathlib.Path('/var/lib/zakura-mac-verifier/cursor.json')
 stat = path.stat()
 state = json.loads(path.read_text())
 receipt = json.loads(pathlib.Path('/etc/zakura-mac-verifier/receipt.json').read_text())
-state.update(receipt_digest=hashlib.sha256(json.dumps(receipt, sort_keys=True).encode()).hexdigest(),
-             healthy_since=None, healthy_start_height=None, qualified=False,
-             enablement_ready_since=None, enablement_good_samples=0)
+state.update(receipt_digest=hashlib.sha256(json.dumps(receipt, sort_keys=True).encode()).hexdigest())
 atomic_json(path, state)
 os.chown(path, stat.st_uid, stat.st_gid)
 REMOTE
-sudo -n systemctl start zakura-mac-verifier
+sudo -n systemctl start zakura-fleet-watchdog
 ''')
         deadline = time.monotonic() + 600
         print('Waiting for new mainnet progress and matching state comparison', flush=True)
@@ -335,7 +425,7 @@ sudo -n systemctl start zakura-mac-verifier
         raise RuntimeError('deployed node did not advance with healthy comparison')
     except Exception:
         print('Restoring the previous binary and receipt identity', flush=True)
-        linux.run('sudo -n systemctl stop zakura-mac-verifier')
+        linux.run('sudo -n systemctl stop zakura-fleet-watchdog')
         mac.run(f'''set -eu
 sudo -n cp -p '{BASE}/bin/zakurad.previous' '{BASE}/bin/zakurad.next'
 sudo -n mv -f '{BASE}/bin/zakurad.next' '{BASE}/bin/zakurad'
@@ -353,13 +443,11 @@ path = pathlib.Path('/var/lib/zakura-mac-verifier/cursor.json')
 stat = path.stat()
 state = json.loads(path.read_text())
 receipt = json.loads(pathlib.Path('/etc/zakura-mac-verifier/receipt.json').read_text())
-state.update(receipt_digest=hashlib.sha256(json.dumps(receipt, sort_keys=True).encode()).hexdigest(),
-             healthy_since=None, healthy_start_height=None, qualified=False,
-             enablement_ready_since=None, enablement_good_samples=0)
+state.update(receipt_digest=hashlib.sha256(json.dumps(receipt, sort_keys=True).encode()).hexdigest())
 atomic_json(path, state)
 os.chown(path, stat.st_uid, stat.st_gid)
 REMOTE
-sudo -n systemctl start zakura-mac-verifier
+sudo -n systemctl start zakura-fleet-watchdog
 ''')
         raise
     finally:
@@ -368,7 +456,7 @@ sudo -n systemctl start zakura-mac-verifier
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('operation', choices=['status', 'dashboard', 'deploy'])
+    parser.add_argument('operation', choices=['status', 'dashboard', 'deploy', 'migrate'])
     args = parser.parse_args()
     check_address_history()
     if os.environ.get('NO_RESTART') == 'true' or (
@@ -380,6 +468,8 @@ def main():
     with tempfile.TemporaryDirectory(prefix='mac-verifier-') as directory:
         mac = SSH('MAC_VERIFIER_', directory)
         linux = SSH('MAC_VERIFIER_REFERENCE_', directory)
+        if args.operation == 'migrate':
+            migrate_watchdog(linux)
         if args.operation == 'deploy':
             if os.environ.get('MAC_CANDIDATE_RUN_ID'):
                 candidate_dir = Path(directory) / 'candidate'
@@ -390,7 +480,7 @@ def main():
             candidate = validate_candidate(candidate_dir, os.environ['MAC_SOURCE_SHA'],
                                            os.environ['MAC_SOURCE_LOCK_SHA256'])
             deploy_candidate(mac, linux, candidate_dir, candidate)
-        if args.operation in ('dashboard', 'deploy'):
+        if args.operation in ('dashboard', 'deploy', 'migrate'):
             dashboard(linux)
         status(mac, linux, identifier)
 

@@ -2132,5 +2132,64 @@ class MacForkAlertTests(unittest.TestCase):
         self.assertEqual(watchdog.node_condition({"name":"zakura-mac-os","health":"down"},1000,0,make_args())[2],180)
         self.assertEqual(watchdog.node_condition({"name":"other","health":"down"},1000,0,make_args())[2],600)
 
+
+class MacComparisonLaneTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.args = make_args(mac_comparison=self.root / "comparison.py",
+                              mac_comparison_state=self.root,
+                              mac_comparison_receipt=self.root / "receipt.json",
+                              mac_comparison_alerts=True)
+        self.lane = watchdog.Watchdog([], self.args)
+        self.messages = []
+        self.lane.notify = lambda text, _: (self.messages.append(text), True)[1]
+        self.state = {}
+
+    def observe(self, condition, now):
+        def run(*args, **kwargs):
+            self.assertEqual(kwargs["timeout"], 15)
+            self.assertEqual(kwargs["stderr"], watchdog.subprocess.DEVNULL)
+            (self.root / "status.json").write_text(json.dumps({
+                "condition": condition, "sample_time": now, "caught_up": condition == "matching"}))
+        with patch.object(watchdog.subprocess, "run", side_effect=run), patch.object(watchdog.time, "time", return_value=now):
+            self.lane.handle_mac_comparison(self.state, now, False)
+
+    def test_existing_alert_lifecycle_deduplicates_and_recovers(self):
+        self.observe("tree_mismatch", 1000)
+        self.observe("tree_mismatch", 1060)
+        self.assertEqual(self.messages, ["Zakura compiler comparison: tree_mismatch"])
+        self.observe("matching", 1120)
+        self.assertEqual(len(self.messages), 2)
+        self.assertIn("recovered", self.messages[-1])
+
+    def test_muting_blocks_both_new_alerts_and_recoveries(self):
+        self.observe("tree_mismatch", 1000)
+        self.args.mac_comparison_alerts = False
+        self.observe("matching", 1060)
+        self.observe("chain_disagreement", 1120)
+        self.observe("chain_disagreement", 1400)
+        self.assertEqual(len(self.messages), 1)
+        self.assertTrue(json.loads((self.root / "status.json").read_text())["alerts_muted"])
+
+    def test_timeout_does_not_use_stale_health_or_skip_other_lanes(self):
+        self.observe("matching", 1000)
+        self.lane.release_state = [object()]
+        with patch.object(self.lane, "handle_release_state") as other, \
+             patch.object(watchdog.subprocess, "run", side_effect=watchdog.subprocess.TimeoutExpired("private endpoint", 15)):
+            self.lane.run_once(self.state)
+        other.assert_called_once()
+        sample = json.loads((self.root / "status.json").read_text())
+        self.assertFalse(sample["caught_up"])
+        self.assertEqual(sample["condition"], "unavailable")
+        self.assertNotIn("private endpoint", json.dumps(sample))
+
+    def test_stale_success_is_unavailable(self):
+        (self.root / "status.json").write_text(json.dumps({"sample_time": 1, "condition": "matching"}))
+        with patch.object(watchdog.subprocess, "run"):
+            self.lane.handle_mac_comparison(self.state, 1000, False)
+        self.assertEqual(self.state["mac_comparison"]["mainnet"]["condition"], "unavailable")
+
 if __name__ == "__main__":
     unittest.main()

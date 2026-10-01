@@ -53,7 +53,7 @@ on:
       mac_operation:
         description: "Operation for the existing zakura-mac-os verifier"
         type: choice
-        options: [deploy, status, dashboard]
+        options: [deploy, status, dashboard, migrate]
         default: deploy
       mac_candidate_run_id:
         description: "Optional accepted candidate run; blank builds the requested ref"

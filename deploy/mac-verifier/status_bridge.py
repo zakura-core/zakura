@@ -16,10 +16,10 @@ def public_status(status, identifier):
         raise ValueError("invalid opaque identifier")
     result = {"verifier_id": identifier, "schema_version": 1}
     # Never forward receipts, diagnostic strings, OS metadata, peer IDs or hosts.
-    for key in ("sample_time", "coverage_start", "compared_through", "healthy_since"):
+    for key in ("sample_time", "coverage_start", "compared_through"):
         value = status.get(key)
         result[key] = value if type(value) in (int, float) else None
-    for key in ("caught_up", "qualified"):
+    for key in ("caught_up",):
         result[key] = status.get(key) is True
     for key, sample in (("mac_tip", status.get("verifier")), ("linux_tip", status.get("reference"))):
         sample = sample if isinstance(sample, dict) else {}
@@ -46,8 +46,10 @@ def public_status(status, identifier):
     result["comparison_healthy"] = (status.get("caught_up") is True
         and status.get("error") is None
         and not (set(status.get("incidents", {})) - {"alert delivery unavailable"}))
-    result["alerts_muted"] = "alert delivery unavailable" in status.get("incidents", {})
-    result["pending_alerts"] = status.get("pending_alerts") if type(status.get("pending_alerts")) is int else None
+    result["alerts_muted"] = status.get("alerts_muted", True) is True
+    condition = status.get("condition")
+    if condition in {"matching", "catching_up", "unavailable", "chain_disagreement", "tree_mismatch", "coverage_gap"}:
+        result["condition"] = condition
     return result
 
 

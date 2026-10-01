@@ -46,7 +46,7 @@ Installation uses the mainnet CI workflow's explicit `zakura-mac-os` target and
 the requested source `ref`, as described in the [runtime README](../README.md).
 CI builds a candidate automatically; a matching successful candidate run ID can
 optionally be reused.
-It preserves comparison cursors, incident history and queued alerts across binary
-changes. Compiler acceptance does not establish live health, sustained runtime
-qualification or permission to enable alerts. Independent compiler review and
-operational qualification remain required.
+It preserves comparison cursors and mismatch evidence across binary changes.
+The fleet watchdog owns comparison alerts; no separate alert queue or runtime
+qualification service is required. Compiler acceptance does not establish live
+health or prove the absence of shared verifier bugs.

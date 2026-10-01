@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import re
 import tempfile
+import time
 import urllib.error
 import urllib.request
 
@@ -71,8 +72,8 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
 
 
 class Transport:
-    def __init__(self, timeout=10):
-        self.timeout = timeout
+    def __init__(self, timeout=10, deadline=None):
+        self.timeout, self.deadline = timeout, deadline
         # Do not send loopback requests through operator-defined HTTP proxies.
         self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
 
@@ -82,8 +83,13 @@ class Transport:
             url, data=data,
             headers={"Content-Type": "application/json", **(headers or {})}, method=method,
         )
+        timeout = self.timeout
+        if self.deadline is not None:
+            timeout = min(timeout, self.deadline - time.monotonic())
+            if timeout <= 0:
+                raise Unavailable("comparison time budget exhausted")
         try:
-            with self.opener.open(request, timeout=self.timeout) as response:
+            with self.opener.open(request, timeout=timeout) as response:
                 body = response.read(MAX_JSON + 1)
                 if len(body) > MAX_JSON:
                     raise Unavailable("oversize JSON response")

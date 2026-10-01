@@ -1,200 +1,104 @@
 # Native Mac mainnet verifier
 
-This package observes an existing native macOS ARM64 Zakura verifier and compares
-its committed results against a Linux x86_64 mainnet reference. It contains the
-runtime services, comparison tests and compiler acceptance evidence. Host setup,
-secret provisioning and snapshot import are outside this package. A CI
-workflow builds qualified Cranelift deployment candidates on an isolated Mac.
+A native ARM64 Mac runs Zakura compiled with Cranelift. The existing fleet
+watchdog compares its committed mainnet results against a Linux reference.
+Rust performs consensus and cryptographic verification; Python observes the
+results and reports disagreement.
 
-The verifier builds the branch, tag or SHA supplied as the deployment `ref`,
-resolved once to an immutable commit. Imported finalized snapshot history is
-trusted. Coverage starts at the recorded bootstrap height plus one; matching live
-results do not independently audit imported UTXOs/nullifiers or eliminate bugs
-shared by both nodes.
+Imported finalized snapshot history is trusted. Comparison coverage starts at
+the recorded bootstrap height plus one. Matching results do not independently
+audit imported UTXOs/nullifiers or eliminate bugs shared by both nodes.
 
-The independent logger acceptance-test fix is tracked in
-[PR1239](https://github.com/zakura-core/zakura/pull/1239), the prerequisite for
-this monitoring change.
+## Components
 
-## Runtime components
+| Component | Responsibility |
+| --- | --- |
+| `adapter.py` | Mac loopback API for node samples, build identity and resources |
+| `comparison.py` | Bounded comparison invoked by the fleet watchdog |
+| `status_bridge.py` | Allowlisted status for the public dashboard |
+| `common.py` | Bounded RPC, canonical records and atomic state writes |
+| `rotate_logs.py` | Bound Mac launchd diagnostic logs |
+| `cranelift/qualify.py` | Build and test compiler acceptance candidates in CI |
 
-| Component | Location | Responsibility |
-| --- | --- | --- |
-| `adapter.py` | Mac | Read-only node samples, build identity and resources |
-| `monitor.py` | Linux reference | Sequential comparison, durable cursor and incidents |
-| `status_bridge.py` | Linux reference | Allowlisted status for the existing dashboard |
-| `rotate_logs.py` | Mac | Bound launchd diagnostic logs without reopening child descriptors |
-| `common.py` | Both hosts | Bounded transport, canonical records and atomic state writes |
-| `alert_preflight.py` | Linux reference | Quiet alert enablement checks and historical-message archival |
+The adapter listens only on Mac loopback port `28233`; node RPC uses `28232`.
+The existing private SSH tunnel exposes the adapter on the reference host's
+loopback. Linux RPC uses loopback `8232`. No Mac address belongs in repository
+configuration, logs, alerts or public status. Deployment credentials remain in
+the existing private CI environment.
 
-The adapter accepts only `GET /v1/status` and `GET /v1/block/<height>` on Mac
-loopback port `28233`; the node RPC stays on loopback `28232`. A dedicated reverse
-SSH tunnel exposes only that adapter on the Linux reference's loopback. The
-reference RPC stays on loopback `8232`. Requests have ten-second timeouts and
-bounded JSON responses; redirects and operator HTTP proxies are refused by the
-comparison transport.
+## Comparison and alerts
 
-The comparator checks block hashes and canonical hexadecimal bytes for the
-Sapling, Orchard and Ironwood commitment-tree roots and frontiers. Missing pools,
-malformed records, changed hashes during reads and stale samples invalidate the
-sample. It polls every 30 seconds, compares at most 16 heights per iteration and
-stays three blocks behind the shorter tip. This delay is an observation policy,
-not a consensus finality guarantee.
+The fleet watchdog invokes `comparison.py once` after its existing fleet checks.
+Each invocation compares at most 16 successive heights, three blocks behind the
+shorter tip, using block hashes and canonical Sapling, Orchard and Ironwood
+commitment-tree roots and frontiers. It re-reads mismatches to distinguish stable
+differences from racing reads. A durable cursor prevents silently skipping blocks
+across restarts; recent history supports rewinding up to 1,000 blocks. Reorg
+search progress is saved across bounded invocations. Missing historical data
+cannot establish agreement, and an exhausted reorg window records a coverage gap.
 
-Audit writes precede atomic cursor advancement, so a crash can replay comparisons
-but cannot skip heights. A reorganization rewinds to a saved common block within
-1,000 heights and replays. Deeper or unavailable history latches a coverage-gap
-incident that requires operator investigation. Stable repeated tree-state
-mismatches are preserved privately and remain latched until acknowledged.
+Network requests share a ten-second budget and individual two-second timeouts.
+The watchdog kills a comparison child exceeding fifteen seconds. Other fleet
+checks run first. Comparison outcomes are matching, catching up, unavailable,
+chain disagreement, confirmed tree mismatch and coverage gap.
 
-## Required deployment evidence
+The watchdog owns notification delivery, suppression and recovery. Confirmed tree
+mismatches are immediately actionable; other failures have a three-minute grace
+period. Matching results recover through the existing alert lifecycle. Private
+mismatch evidence remains after recovery. There is no separate notification
+queue, alert-enablement script or 24-hour qualification state.
 
-The runtime assumes operator-managed accounts, launchd/systemd supervision and
-restricted forwarding are already installed. Keep the Mac separate from general
-CI runners and preserve its unrelated workloads. Use dedicated forwarding keys
-and authenticated pinned host keys; never copy a personal private key onto a host.
-Infisical remains the source of truth for private configuration and credentials.
+The lane is enabled with `ZAKURA_MAC_COMPARISON=1` on the existing watchdog.
+Notifications remain muted by default; `ZAKURA_MAC_COMPARISON_ALERTS=1` enables
+this lane through the existing watchdog channel. Migration preserves muted
+operation and does not replay historical messages.
 
-The Mac runtime base is `/Library/Application Support/ZakuraVerifier`. The node
-uses pruned mainnet storage with checkpoint/VCT fast sync disabled and bounded
-concurrency. Its RPC and adapter remain on loopback.
+The bridge only publishes approved status fields. The dashboard distinguishes
+comparison failure from node availability. Private receipts, diagnostics, host
+addresses and peer identities never pass through the bridge.
 
-The runtime consumes a private receipt containing `bootstrap_height`,
-`bootstrap_record`, `deployed_at`, `binary_sha256` and `config_sha256`. The starting
-anchor must agree with the Linux reference on block hash and all three tree
-roots/frontiers. The Linux expected receipt at
-`/etc/zakura-mac-verifier/receipt.json` must match the Mac receipt exactly.
+## CI migration
 
-Unexpected receipt, binary or configuration changes invalidate monitoring.
-Preserve the starting anchor, cursor/history, incidents and outbox across reviewed
-identity transitions; establish a fresh qualification baseline. Never overwrite
-state or erase a gap to manufacture qualification.
+The mainnet workflow supports `node=zakura-mac-os` and `mac_operation=migrate`.
+It stages the new code and checks a copy of the existing cursor without sending
+notifications. It then stops the old comparator and watchdog, saves recovery
+copies, archives legacy alert state, and transfers comparison ownership to the
+watchdog. The old comparator service is disabled. Configuration, node binary,
+bootstrap anchor, cursor/history and mismatch evidence remain intact.
 
-## Deployment through CI
+Migration succeeds only after the watchdog compares new blocks. Failure restores
+the previous scripts, cursor and service owner while retaining migration evidence
+privately. This operation is a one-time transition; subsequent binary deployments
+require the migrated lane. Do not run the retired service beside the watchdog.
 
-The existing mainnet deploy workflow accepts `node=zakura-mac-os` and uses the
-`mac-verifier-private` environment. It never sends the Mac through the Linux
-fleet deployer. Supply the same release tag or commit used for the reference
-nodes as `ref`. The workflow resolves it once, builds and qualifies that exact
-source on an isolated ARM64 runner, then installs the accepted artifact.
-For example, to deploy a chosen release tag from the reviewed tooling branch:
+## Binary deployment
+
+Use the existing mainnet deployment's `ref` input for a tag, branch or SHA:
 
 ```sh
 gh workflow run zakura-mainnet-deploy.yml --repo zakura-core/zakura \
   --ref codex/mac-verifier-poc \
-  -f ref=YOUR_RELEASE_TAG \
-  -f node=zakura-mac-os -f mac_operation=deploy
+  -f ref=YOUR_RELEASE_TAG -f node=zakura-mac-os -f mac_operation=deploy
 ```
 
-Use `mac_operation=status` for read-only checks, or `mac_operation=dashboard`
-to restore the dashboard integration without restarting the node. Binary
-deployment requires every compiler acceptance gate to pass, verifies the exact
-binary, source commit and lockfile against the requested ref, and runs the executable on the destination
-before replacement. It coordinates the Mac and Linux receipts, preserves the
-bootstrap anchor, configuration, comparison cursor, incidents and alert queue,
-and verifies new block progress and comparison before succeeding. A failed
-runtime check rolls back the binary and receipts while retaining observations.
-It preserves alert settings and rejects `no_restart`. Builds are fresh, including
-when `force_rebuild=true`. To reuse an accepted artifact, optionally supply
-`mac_candidate_run_id`; its source commit and lockfile must match the requested
-ref, and it cannot be combined with `force_rebuild=true`.
+CI resolves the ref once, builds and tests that source on an isolated hosted
+ARM64 Mac, and verifies the candidate's source, lockfile and binary hashes before
+installation. The Cranelift backend and Rust nightly are pinned separately.
+An optional `mac_candidate_run_id` can reuse an accepted artifact matching the
+requested source and lockfile. Fresh builds support `force_rebuild`; artifact
+reuse cannot be combined with it. `no_restart` is unsupported.
 
-Upgrades update the source and lockfile identity in both runtime receipts while
-preserving the original bootstrap evidence and comparison history. Qualification
-starts again for the new binary; earlier comparisons remain historical evidence,
-not proof that the new version reverified those blocks. Choose releases compatible
-with the existing node configuration and database; a binary rollback does not undo
-database migrations. The Rust nightly and Cranelift backend remain separately
-pinned. A release incompatible with that compiler or the required acceptance
-tests fails before any live installation.
+Installation pauses the watchdog while changing the binary and expected receipts,
+then checks block progress and healthy comparison. It preserves configuration,
+database, original bootstrap evidence, cursor and incident evidence. A binary
+rollback does not undo database migrations. Historical comparisons are not proof
+that a new version reverified old blocks.
 
-Until this PR is merged, a regular mainnet deployment from `main` can replace the
-dashboard script with a version that has no Mac support. The dashboard operation
-restores the reviewed script and its existing enablement drop-in.
+Use `mac_operation=status` for inspection and `mac_operation=dashboard` to restore
+the dashboard integration. Until this PR merges, a dashboard deployment from main
+can overwrite the Mac integration.
 
-## Private and public status
-
-Linux comparison state lives in `/var/lib/zakura-mac-verifier`: `cursor.json`,
-`status.json`, bounded fsynced `audit.jsonl` journals and private incident evidence.
-Inspect these only in a private operator session:
-
-```sh
-sudo -u zakura-mac-verifier python3 /opt/zakura-mac-verifier/monitor.py status
-journalctl -u zakura-mac-verifier
-```
-
-`status_bridge.py` exposes only approved fields on Linux loopback port `28236`.
-The existing mainnet dashboard consumes this bridge with
-`ZAKURA_PRIVATE_VERIFIER_STATUS=1` and displays the Mac as an ordinary fleet node,
-using an opaque `verifier-<32 hexadecimal characters>` identifier. It includes
-numeric resources, tip identity and comparison counters; it excludes raw errors,
-receipts, private host addresses and peer identity. Public JSON additionally
-redacts address literals. Do not put the private endpoint in the public fleet
-inventory or proxy the raw adapter through the dashboard. Testnet is unaffected.
-
-## Alerts and quiet enablement
-
-`monitor.py observe` continues comparison without delivery or operational
-qualification. `monitor.py channel` uses only the existing fleet channel webhook,
-provided as a root-private systemd `LoadCredential` named `slack-webhook`.
-There is no dedicated Slack bot or DM identity path.
-
-The fleet watchdog owns Mac offline/stall and quorum-fork alerts. Mac downtime
-alerts after three minutes. A fork alert requires at least 70% of all other
-configured mainnet nodes to agree on a different hash at the same height ten
-blocks behind the Mac tip. Offline or missing peers remain in the denominator.
-Missing evidence cannot prove a fork or clear an existing incident.
-
-The comparator groups resource, build-identity and persistent coverage findings
-into one detailed-incident episode and one recovery. Transient coverage gaps do
-not page immediately, but all gaps affect qualification. Recovery requires three
-distinct good samples spanning at least one minute; bad evidence or a gap over
-90 seconds resets that sequence. Critical incidents remain latched.
-
-Notification IDs are persisted before delivery. Rate-limit retries are bounded;
-failed delivery remains queued, and a 128-message overflow blocks qualification.
-Incoming webhooks do not provide exactly-once delivery: an ambiguous failure can
-produce duplicate messages. Linux reference and Slack availability are operational
-dependencies; this package has no independent observer of the comparator host.
-
-Keep `MAC_VERIFIER_ALERTS_MUTED=1` on the fleet watchdog and the comparator in
-observation mode while alerts are muted. Changing code does not authorize unmuting.
-After explicit operator authorization, stop the comparator and run
-`alert_preflight.py` as its service user. It requires five fresh healthy samples
-spanning two minutes, complete coverage, matching receipt, no actionable incident
-or overflow, recognized queued messages and a matching fleet quorum. It never
-contacts Slack. `--apply` archives historical messages before clearing their queue
-and resets the qualification baseline. If reconciling watchdog state, stop that
-service too and supply `--fleet-state`; other nodes' state must be preserved.
-
-Only after a successful fresh preflight may the operator select channel mode and
-remove the Mac mute. Never replay historical observation notifications. To
-acknowledge an investigated latched incident, stop the comparator, preserve its
-evidence and run `monitor.py ack --incident '<incident name>'` as the service user.
-Acknowledgement does not restore qualification or repair a divergent node.
-
-## Acceptance and qualification
-
-Run the runtime tooling tests with:
-
-```sh
-python3 -m unittest discover -s deploy/mac-verifier/tests -v
-```
-
-Native Cranelift CI executes the eight pinned consensus cases and two actual
-node panic-containment tests. Every case must execute exactly once with zero
-failed or ignored tests. Compiler acceptance is described in
-[`cranelift/README.md`](cranelift/README.md); a dashboard row does not prove it.
-
-Record node/tunnel outage and recovery, comparator restart preserving its cursor,
-controlled host-reboot recovery when unrelated workloads permit it, and real
-channel incident/recovery delivery. Test divergence in isolated fixtures, never
-by altering live databases. Evidence from a different compiler remains distinct.
-
-Operational qualification requires 24 uninterrupted healthy hours and at least
-100 newly compared blocks beyond the reference tip recorded at the start of that
-healthy window, with delivery available and no pending incidents/notifications.
-Missing or stale samples, resource problems and falling behind reset the window.
-`qualified` records a historical achievement; current health, incidents and
-coverage remain separate status fields. It must not be interpreted as perpetual
-health. Muted compiler shadow observation is a separate runtime assurance gate.
+Compiler acceptance retains the unwind and double-panic probes, eight exact
+consensus cases and two network panic-containment cases. See the
+[compiler README](cranelift/README.md). Build acceptance and live comparison are
+separate checks; neither proves the absence of shared verifier bugs.

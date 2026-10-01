@@ -2150,12 +2150,12 @@ class MacComparisonLaneTests(unittest.TestCase):
         self.lane.notify = lambda text, _: (self.messages.append(text), True)[1]
         self.state = {}
 
-    def observe(self, condition, now):
+    def observe(self, condition, now, suppressed=False):
         def run(*args, **kwargs):
             (self.root / "status.json").write_text(json.dumps({
                 "condition": condition, "sample_time": now, "caught_up": condition == "matching"}))
         with patch.object(watchdog, "run_comparison", side_effect=run), patch.object(watchdog.time, "time", return_value=now):
-            self.lane.handle_mac_comparison(self.state, now, False)
+            self.lane.handle_mac_comparison(self.state, now, suppressed)
 
     def test_existing_alert_lifecycle_deduplicates_and_recovers(self):
         self.observe("tree_mismatch", 1000)
@@ -2201,6 +2201,143 @@ class MacComparisonLaneTests(unittest.TestCase):
         with patch.object(watchdog, "run_comparison"):
             self.lane.handle_mac_comparison(self.state, 1000, False)
         self.assertEqual(self.state["mac_comparison"]["mainnet"]["condition"], "unavailable")
+
+class PagerDutyEscalationTests(unittest.TestCase):
+    """Only mainnet divergence and fleet-wide stalls page, level-triggered."""
+
+    class Response:
+        def __init__(self, status=202):
+            self.status = status
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        @staticmethod
+        def read():
+            return b'{"status":"success"}'
+
+    def setUp(self):
+        self.args = make_args(dry_run=False)
+        self.agent = watchdog.Watchdog([], self.args)
+        self.state = {"pagerduty": {}}
+        env = patch.dict(watchdog.os.environ, {"PAGERDUTY_ROUTING_KEY": "test-routing-key"})
+        env.start()
+        self.addCleanup(env.stop)
+
+    def reconcile(self, status=202, error=None):
+        side_effect = error if error is not None else (lambda *_a, **_k: self.Response(status))
+        with patch.object(watchdog.urllib.request, "urlopen", side_effect=side_effect) as urlopen:
+            self.agent.reconcile_pagerduty(self.state, 1_000.0)
+        return [json.loads(call.args[0].data.decode("utf-8")) for call in urlopen.call_args_list]
+
+    def set_entry(self, bucket, condition, alerting, key="mainnet", **extra):
+        self.state.setdefault(bucket, {})[key] = {
+            "condition": condition, "alerting": alerting, "bad_since": 900.0, **extra,
+        }
+
+    def test_divergence_triggers_once_with_stable_dedup_key(self):
+        self.set_entry("mac_comparison", "tree_mismatch", True)
+        events = self.reconcile()
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["event_action"], "trigger")
+        self.assertEqual(events[0]["dedup_key"], "zakura/mainnet/mac-comparison")
+        self.assertEqual(events[0]["routing_key"], "test-routing-key")
+        self.assertEqual(events[0]["payload"]["severity"], "critical")
+        self.assertIn("tree_mismatch", events[0]["payload"]["summary"])
+        self.assertEqual(self.reconcile(), [])
+
+    def test_lost_visibility_never_pages_and_holds_an_open_page(self):
+        for condition in ("coverage_gap", "unavailable", "catching_up"):
+            self.set_entry("mac_comparison", condition, True)
+            self.assertEqual(self.reconcile(), [])
+        self.set_entry("mac_comparison", "chain_disagreement", True)
+        self.assertEqual(len(self.reconcile()), 1)
+        self.set_entry("mac_comparison", "unavailable", False)
+        self.assertEqual(self.reconcile(), [])
+        self.set_entry("mac_comparison", "ok", False)
+        self.assertEqual(self.reconcile(), [{
+            "event_action": "resolve",
+            "dedup_key": "zakura/mainnet/mac-comparison",
+            "routing_key": "test-routing-key",
+        }])
+        self.assertEqual(self.state["pagerduty"], {})
+
+    def test_mac_fork_pages_and_resolves_after_existing_recovery(self):
+        rows = MacForkAlertTests().rows
+        fleet = watchdog.Fleet("mainnet", "http://localhost/data", "https://status.invalid/")
+        self.agent.notify = lambda text, args: True
+        self.agent.handle_mac_fork(self.state, fleet, rows(), 1_000, False)
+        self.assertEqual(
+            [event["dedup_key"] for event in self.reconcile()], ["zakura/mainnet/mac-fork"]
+        )
+        for now in (1_000, 1_030):
+            self.agent.handle_mac_fork(self.state, fleet, rows(agreeing=0), now, False)
+            self.assertEqual(self.reconcile(), [])
+        self.agent.handle_mac_fork(self.state, fleet, rows(agreeing=0), 1_060, False)
+        self.assertEqual([event["event_action"] for event in self.reconcile()], ["resolve"])
+
+    def test_only_mainnet_shared_stall_pages(self):
+        self.set_entry("shared_stalls", "stalled", True, key="testnet")
+        self.state["nodes"] = {"mainnet/node-a": {"condition": "down", "alerting": True}}
+        self.state["fleets"] = {"mainnet": {"condition": "unreachable", "alerting": True}}
+        self.assertEqual(self.reconcile(), [])
+        self.set_entry("shared_stalls", "stalled", True, event_height=4_302_737,
+                       node_names=["node-a", "node-b"])
+        events = self.reconcile()
+        self.assertEqual(events[0]["dedup_key"], "zakura/mainnet/shared-stall")
+        self.assertIn("height 4302737 (2 nodes)", events[0]["payload"]["summary"])
+        self.assertEqual(events[0]["payload"]["custom_details"]["height"], 4_302_737)
+        # A new tip leaves the entry stalled but not alerting, as Slack recovery does.
+        self.set_entry("shared_stalls", "stalled", False)
+        self.assertEqual([event["event_action"] for event in self.reconcile()], ["resolve"])
+
+    def test_undelivered_slack_batch_still_pages(self):
+        self.set_entry("shared_stalls", "ok", False)
+        self.state["pending_delivery"] = {"mainnet": {"messages": ["stall"], "state": {
+            "shared_stalls": {"mainnet": {"condition": "stalled", "alerting": True}},
+        }}}
+        self.assertEqual([event["event_action"] for event in self.reconcile()], ["trigger"])
+
+    def test_failed_post_records_nothing_and_retries(self):
+        self.set_entry("mac_comparison", "tree_mismatch", True)
+        self.assertEqual(len(self.reconcile(status=400)), 1)
+        self.assertEqual(self.state["pagerduty"], {})
+        self.assertEqual(len(self.reconcile(error=watchdog.urllib.error.URLError("down"))), 1)
+        self.assertEqual(self.state["pagerduty"], {})
+        self.assertEqual(len(self.reconcile()), 1)
+        self.assertIn("zakura/mainnet/mac-comparison", self.state["pagerduty"])
+
+    def test_missing_routing_key_sends_nothing(self):
+        self.set_entry("mac_comparison", "tree_mismatch", True)
+        with patch.dict(watchdog.os.environ, {"PAGERDUTY_ROUTING_KEY": ""}):
+            self.assertEqual(self.reconcile(), [])
+        self.assertEqual(self.state["pagerduty"], {})
+
+    def test_muted_and_suppressed_lanes_never_latch_so_never_page(self):
+        lane = MacComparisonLaneTests()
+        lane.setUp()
+        self.addCleanup(lane.temp.cleanup)
+        lane.state = self.state
+        lane.args.mac_comparison_alerts = False
+        lane.observe("tree_mismatch", 1_000)
+        self.assertEqual(self.reconcile(), [])
+        lane.args.mac_comparison_alerts = True
+        lane.observe("tree_mismatch", 1_400, suppressed=True)
+        self.assertEqual(self.reconcile(), [])
+        self.assertEqual(lane.messages, [])
+
+    def test_dry_run_prints_without_routing_key_and_sends_nothing(self):
+        self.args.dry_run = True
+        self.set_entry("mac_comparison", "tree_mismatch", True)
+        with patch("sys.stdout") as stdout:
+            self.assertEqual(self.reconcile(), [])
+        printed = "".join(call.args[0] for call in stdout.write.call_args_list)
+        self.assertIn("dry-run PagerDuty event", printed)
+        self.assertNotIn("test-routing-key", printed)
+
 
 if __name__ == "__main__":
     unittest.main()

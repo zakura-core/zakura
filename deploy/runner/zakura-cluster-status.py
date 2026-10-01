@@ -1156,13 +1156,36 @@ class RateLimiter:
             return True
 
 
-def redact_public_addresses(value):
-    """Remove address literals from every public JSON string, including keys."""
+PRIVATE_ADDRESS_FILE = Path("/etc/zakura-mainnet-dashboard/private/addresses.json")
+
+
+def address_key(value):
+    address = ipaddress.ip_address(value)
+    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped:
+        address = address.ipv4_mapped
+    return address.version, address.packed
+
+
+def private_addresses():
+    try:
+        with PRIVATE_ADDRESS_FILE.open("rb") as stream:
+            data = json.loads(stream.read(4097))
+    except FileNotFoundError:
+        if os.environ.get("ZAKURA_MAC_CRANELIFT_STATUS", os.environ.get("ZAKURA_PRIVATE_VERIFIER_STATUS")) == "1":
+            raise ValueError("private address configuration required") from None
+        return frozenset()
+    if not isinstance(data, list) or not 1 <= len(data) <= 16 or any(not isinstance(item, str) for item in data):
+        raise ValueError("invalid private address configuration")
+    return frozenset(address_key(item) for item in data)
+
+
+def redact_private_addresses(value, protected):
+    """Remove only protected Mac addresses, including from Linux peer diagnostics."""
     if isinstance(value, dict):
-        return {redact_public_addresses(key): redact_public_addresses(item)
+        return {redact_private_addresses(key, protected): redact_private_addresses(item, protected)
                 for key, item in value.items()}
     if isinstance(value, list):
-        return [redact_public_addresses(item) for item in value]
+        return [redact_private_addresses(item, protected) for item in value]
     if not isinstance(value, str):
         return value
 
@@ -1170,7 +1193,8 @@ def redact_public_addresses(value):
         literal = match.group()
         candidate = literal.rstrip(".")
         try:
-            ipaddress.ip_address(candidate)
+            if address_key(candidate) not in protected:
+                return literal
         except ValueError:
             return literal
         return "[redacted-address]" + literal[len(candidate):]
@@ -4243,7 +4267,12 @@ class Handler(BaseHTTPRequestHandler):
         headers: dict[str, str] | None = None,
     ) -> None:
         if body and content_type.startswith("application/json"):
-            body = json.dumps(redact_public_addresses(json.loads(body)), separators=(",", ":")).encode()
+            try:
+                body = json.dumps(redact_private_addresses(json.loads(body), private_addresses()),
+                                  separators=(",", ":")).encode()
+            except (OSError, ValueError, TypeError):
+                status = 503
+                body = b'{"error":"privacy configuration unavailable"}'
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))

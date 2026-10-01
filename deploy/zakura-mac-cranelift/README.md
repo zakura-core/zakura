@@ -29,8 +29,13 @@ uses the Mac node's existing loopback RPC on port `28232`; Linux RPC uses loopba
 
 Private connection settings and pinned host keys live under
 `/etc/zakura-mac-verifier/ssh`, readable only by the monitoring account/root.
-The dashboard reads the watchdog's sanitized status file; it never receives the
-SSH destination or adds it to public inventory.
+The dashboard reads the watchdog's sanitized status file. Linux addresses remain
+visible. A root-only server-side file at
+`/etc/zakura-mainnet-dashboard/private/addresses.json` protects the Mac address
+if it appears in any public JSON field, including Linux peer diagnostics. This
+file is populated from the CI secret, never served or embedded in JavaScript.
+Missing or invalid protection settings make the Mac-enabled dashboard refuse
+JSON responses. The Mac is never added to the public SSH inventory.
 Deployment credentials stay in the private CI environment, and are not copied to
 the reference host.
 

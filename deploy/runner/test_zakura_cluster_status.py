@@ -1201,15 +1201,42 @@ class AddressPrivacyTests(unittest.TestCase):
         for address in addresses:
             with self.subTest(address=address):
                 payload = {address: [{"error": f"connection to [{address}]:8232 failed"}]}
-                encoded = json.dumps(status.redact_public_addresses(payload))
+                encoded = json.dumps(status.redact_private_addresses(payload, {status.address_key(address)}))
                 self.assertNotIn(address, encoded)
                 self.assertIn("[redacted-address]", encoded)
-                self.assertNotIn(address, status.redact_public_addresses(f"peer={address}."))
+                self.assertNotIn(address, status.redact_private_addresses(f"peer={address}.", {status.address_key(address)}))
+
+    def test_canonical_mac_address_forms_are_redacted_without_hiding_linux(self):
+        for private, variants in [
+            ("2001:db8::17", ["2001:0db8:0:0:0:0:0:0017", "2001:DB8::17", "2001:db8::17%en0"]),
+            ("192.0.2.17", ["::ffff:192.0.2.17", "::ffff:c000:211", "192.0.2.17"]),
+        ]:
+            for variant in variants:
+                with self.subTest(variant=variant):
+                    value = {variant: [f"peer=[{variant}]:8232; linux=192.0.2.18"]}
+                    result = json.dumps(status.redact_private_addresses(value, {status.address_key(private)}))
+                    self.assertNotIn(variant, result)
+                    self.assertIn("192.0.2.18", result)
+                    self.assertIn("[redacted-address]", result)
+
+    def test_missing_or_invalid_config_fails_closed_for_mac_dashboard(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "private.json"
+            with mock.patch.object(status, "PRIVATE_ADDRESS_FILE", path), \
+                    mock.patch.dict(os.environ, {"ZAKURA_MAC_CRANELIFT_STATUS": "1"}):
+                with self.assertRaises(ValueError):
+                    status.private_addresses()
+                for value in [[], {}, ["not an address"], [1]]:
+                    path.write_text(json.dumps(value))
+                    with self.assertRaises(ValueError):
+                        status.private_addresses()
+                path.write_text(json.dumps(["192.0.2.17"]))
+                self.assertEqual(status.private_addresses(), {status.address_key("192.0.2.17")})
 
     def test_non_address_values_survive(self):
         payload = {"time": "2026-09-30T11:25:27Z", "version": "1.97.1", "height": 3500000,
                    "hash": "a" * 64, "bad": "999.999.999.999", "available": True}
-        self.assertEqual(status.redact_public_addresses(payload), payload)
+        self.assertEqual(status.redact_private_addresses(payload, {status.address_key("192.0.2.17")}), payload)
 
 
 
@@ -1260,13 +1287,28 @@ class HttpHandlerTests(unittest.TestCase):
         self.assertEqual(response.headers["X-Content-Type-Options"], "nosniff")
         self.assertEqual(payload["network"], "testnet")
 
-    def test_public_response_redacts_diagnostic_addresses(self):
-        status.COLLECTOR.rows[0]["rpc_metadata_error"] = "peer 192.0.2.17 and [2001:db8::17] failed"
-        with urllib.request.urlopen(f"{self.base_url}/data") as response:
-            body = response.read().decode()
+    def test_public_response_preserves_linux_but_redacts_mac_in_any_row(self):
+        status.COLLECTOR.rows[0]["ssh"] = "operator@192.0.2.18"
+        status.COLLECTOR.rows[0]["rpc_metadata_error"] = "peer 192.0.2.17 and [2001:db8::17] failed; Linux [2001:db8::18]"
+        protected = {status.address_key(value) for value in ["192.0.2.17", "2001:db8::17"]}
+        with mock.patch.object(status, "private_addresses", return_value=protected):
+            with urllib.request.urlopen(f"{self.base_url}/data") as response:
+                body = response.read().decode()
         self.assertNotIn("192.0.2.17", body)
         self.assertNotIn("2001:db8::17", body)
+        self.assertIn("operator@192.0.2.18", body)
+        self.assertIn("2001:db8::18", body)
         self.assertIn("[redacted-address]", body)
+
+    def test_private_configuration_failure_never_serves_unfiltered_json(self):
+        status.COLLECTOR.rows[0]["rpc_metadata_error"] = "private 192.0.2.17"
+        with mock.patch.object(status, "private_addresses", side_effect=ValueError("private fixture")):
+            with self.assertRaises(urllib.error.HTTPError) as caught:
+                urllib.request.urlopen(f"{self.base_url}/data")
+        self.assertEqual(caught.exception.code, 503)
+        body = caught.exception.read().decode()
+        self.assertNotIn("192.0.2.17", body)
+        self.assertNotIn("private fixture", body)
 
     def test_options_returns_204_for_allowed_origin(self):
         request = urllib.request.Request(

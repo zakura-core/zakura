@@ -1267,7 +1267,7 @@ class ClusterCollector:
         self.ironwood_activation_height = IRONWOOD_ACTIVATION_HEIGHTS[network]
         self.lock = threading.Lock()
         restored_progress = load_progress(state_file)
-        self.private_mac_progress = restored_progress.get("zakura-mac-os", {})
+        self.private_mac_progress = restored_progress.get("mac-os-cranelift", restored_progress.get("zakura-mac-os", {}))
         self.last_height: dict[str, int | None] = {
             node.name: restored_progress.get(node.name, {}).get("height") for node in nodes
         }
@@ -1322,10 +1322,10 @@ class ClusterCollector:
                 rows.append(self.row_for(node, probe, time.time()))
 
         if private_enabled:
-            self.last_height.setdefault("zakura-mac-os", self.private_mac_progress.get("height"))
-            self.last_advanced_at.setdefault("zakura-mac-os", self.private_mac_progress.get("last_advanced_at"))
-            self.history.setdefault("zakura-mac-os", deque())
-            mac = Node(name="zakura-mac-os", ssh_string="", node_id=sample.get("verifier_id", ""), probe_kind="private-loopback",
+            self.last_height.setdefault("mac-os-cranelift", self.private_mac_progress.get("height"))
+            self.last_advanced_at.setdefault("mac-os-cranelift", self.private_mac_progress.get("last_advanced_at"))
+            self.history.setdefault("mac-os-cranelift", deque())
+            mac = Node(name="mac-os-cranelift", ssh_string="", node_id=sample.get("verifier_id", ""), probe_kind="private-loopback",
                        service_name="", bin_path="", log_file="", rpc_listen_addr="", rpc_auth="",
                        rpc_config_path="", rpc_user="", rpc_password="", process_pattern="", container_name="")
             probe = {"height": sample.get("mac_tip") if sample.get("available") else None,
@@ -4349,7 +4349,7 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path.startswith("/node/"):
             assert COLLECTOR is not None
             name = urllib.parse.unquote(parsed.path[len("/node/"):])
-            if name not in COLLECTOR.nodes_by_name:
+            if name not in COLLECTOR.nodes_by_name and COLLECTOR.node_snapshot(name) is None:
                 return self.send_body(
                     404,
                     b'not found\n\nUnknown node. Return to the fleet: <a href="/">/</a>\n',

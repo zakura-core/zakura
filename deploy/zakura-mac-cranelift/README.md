@@ -81,6 +81,7 @@ The component is named `zakura-mac-cranelift`. Its CI entry points are
 compiler acceptance), and the existing `zakura-mainnet-deploy.yml` (deployment).
 The deployment helper is `deploy/deployer/zakura-mac-cranelift-manager.py`.
 
+The fleet dashboard names the node `mac-os-cranelift`.
 The installed node ID `zakura-mac-os`, `/Library/Application Support/ZakuraVerifier`,
 `dev.valargroup.zakura-verifier-*` launchd labels, `zakura-mac-verifier` Linux
 account/services/directories and SSH alias `mac-verifier` remain compatibility

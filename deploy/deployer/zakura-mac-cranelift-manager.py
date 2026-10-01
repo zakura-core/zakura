@@ -138,7 +138,7 @@ try:
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({{}}))
     with opener.open('http://127.0.0.1:8090/data', timeout=10) as response:
         rows = json.load(response)['rows']
-    print(json.dumps(any(row['name'] == 'zakura-mac-os' and row.get('height') and row.get('healthy') for row in rows)))
+    print(json.dumps(any(row['name'] == 'mac-os-cranelift' and row.get('height') and row.get('healthy') for row in rows)))
 except Exception:
     print('false')
 REMOTE
@@ -326,7 +326,7 @@ try:
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     with opener.open('http://127.0.0.1:8090/data', timeout=10) as response:
         rows = json.load(response)['rows']
-    result['dashboard_row_healthy'] = any(row.get('name') == 'zakura-mac-os'
+    result['dashboard_row_healthy'] = any(row.get('name') == 'mac-os-cranelift'
         and row.get('healthy') is True and type(row.get('height')) is int and row['height'] > 0 for row in rows)
 except (OSError, ValueError, KeyError, TypeError):
     result['dashboard_row_healthy'] = False
@@ -379,7 +379,7 @@ def audit_public_privacy():
             if tag == 'script' and dict(attrs).get('src'):
                 self.sources.append(dict(attrs)['src'])
     base = 'https://status.mainnet.zakura.valargroup.dev'
-    routes = ['/', '/node/zakura-mac-os', '/data', '/data/node/zakura-mac-os', '/ironwood-status.json']
+    routes = ['/', '/node/mac-os-cranelift', '/data', '/data/node/mac-os-cranelift', '/ironwood-status.json']
     for route in routes:
         url = urllib.parse.urljoin(base, route)
         with urllib.request.urlopen(url, timeout=15) as response:

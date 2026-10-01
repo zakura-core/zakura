@@ -86,7 +86,7 @@ class Monitor:
             "receipt_digest": self.receipt_digest(expected),
             "cursor": expected["bootstrap_height"], "history": {}, "incidents": {},
             "outbox": [], "outbox_overflow": False, "healthy_since": None,
-            "qualified": False, "last_sample": None, "initial_tip": None,
+            "qualified": False, "last_sample": None,
             "unavailable_since": None, "disagreement_count": 0,
             "tip_watch": None, "caught_up": False,
         }
@@ -309,8 +309,6 @@ class Monitor:
             self.validate_status(status, now)
             self.state["unavailable_since"] = None
             self.incident("verifier unavailable", False, now)
-            if self.state["initial_tip"] is None:
-                self.state["initial_tip"] = reference["height"]
             mac_height = status["tip"]["height"]
             watch = self.state["tip_watch"]
             if watch is None or watch["height"] != mac_height:

@@ -1,7 +1,5 @@
 {
   "source_sha": "af944f5194ef2e9921bc96af017629450375013c",
-  "toolchain": "1.97.1",
-  "crate": "zakura-consensus",
   "tests": [
     "block::tests::difficulty_validation_failure",
     "block::tests::coinbase_validation_failure",

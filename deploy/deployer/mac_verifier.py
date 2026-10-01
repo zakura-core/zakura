@@ -120,7 +120,7 @@ result['full_verification_enabled'] = (config.get('consensus', {{}}).get('checkp
     and config.get('consensus', {{}}).get('vct_fast_sync') is False)
 result['compiler_evidence_files'] = sorted(str(p.relative_to(base / 'evidence')) for p in (base / 'evidence').rglob('*.json'))
 result['compiler_acceptance'] = []
-for path in (base / 'evidence').rglob('receipt.json'):
+for path in (base / 'evidence').rglob('*.json'):
     evidence = json.loads(path.read_text())
     if evidence.get('binary_sha256') == actual:
         result['compiler_acceptance'].append({{key: evidence.get(key) for key in
@@ -152,7 +152,8 @@ REMOTE
     if isinstance(compiler, dict):
         mac_info['compiler_metadata_fields'] = sorted(compiler)
         mac_info['compiler_profile'] = {key: compiler.get(key) for key in
-            ['backend_commit', 'patch_sha256', 'binary_sha256', 'panic', 'lto', 'build_jobs']}
+            ['backend', 'upstream_sha', 'patch_sha256', 'backend_sha256', 'panic',
+             'standard_library', 'linker', 'acceptance_passed', 'acceptance_receipt_sha256']}
     else:
         mac_info['compiler_metadata_type'] = type(compiler).__name__
     if raw:

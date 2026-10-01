@@ -7,7 +7,7 @@ name = "zakura"
 # [package.metadata.release] below does it automatically, but only under the
 # full `cargo release` flow (`cargo release version` skips the replace step) -
 # keep the two in sync when bumping by hand.
-version = "1.5.1"
+version = "1.6.0"
 authors.workspace = true
 description = "Zakura, an independent, consensus-compatible implementation of a Zcash node"
 license.workspace = true
@@ -74,7 +74,7 @@ features = [
 
 [features]
 # In release builds, don't compile debug logging code, to improve performance.
-default-release-binaries = ["release_max_level_info", "progress-bar", "prometheus", "sentry", "opentelemetry"]
+default-release-binaries = ["release_max_level_info", "progress-bar", "prometheus", "opentelemetry"]
 
 
 # Local builds use the compiler's target features for Pasta arithmetic.
@@ -104,6 +104,7 @@ internal-miner = [
 ]
 
 # Tracing and monitoring
+# Opt in explicitly: the tracing layer has overhead even without a SENTRY_DSN.
 sentry = ["dep:sentry"]
 journald = ["tracing-journald"]
 filter-reload = []

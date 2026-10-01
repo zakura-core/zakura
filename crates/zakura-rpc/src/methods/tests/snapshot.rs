@@ -1138,11 +1138,21 @@ pub async fn test_mining_rpcs<State, ReadState>(
         .expect("We should have a success response");
     snapshot_rpc_getblocksubsidy("tip_height", get_block_subsidy, &settings);
 
-    let get_block_subsidy = rpc
-        .get_block_subsidy(Some(EXCESSIVE_BLOCK_HEIGHT))
-        .await
-        .expect("We should have a success response");
-    snapshot_rpc_getblocksubsidy("excessive_height", get_block_subsidy, &settings);
+    let get_block_subsidy = rpc.get_block_subsidy(Some(EXCESSIVE_BLOCK_HEIGHT)).await;
+    if is_zip234_active(network, block::Height(EXCESSIVE_BLOCK_HEIGHT)) {
+        // Reissuance requires the parent's NSM balance, which this state lacks.
+        let error = get_block_subsidy.expect_err("the requested parent is not in the state");
+        assert!(error
+            .message()
+            .contains("at most one block above the best chain tip"));
+        settings.bind(|| insta::assert_json_snapshot!("get_block_subsidy_excessive_height", error));
+    } else {
+        snapshot_rpc_getblocksubsidy(
+            "excessive_height",
+            get_block_subsidy.expect("the halving subsidy does not need parent state"),
+            &settings,
+        );
+    }
 
     // `getnetworkinfo`
     let get_network_info = rpc

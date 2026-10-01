@@ -202,7 +202,7 @@ class ForkSampleTests(unittest.TestCase):
 class BoundaryTests(unittest.TestCase):
 
     def test_comparison_health_excludes_muting_but_includes_verification_failures(self):
-        base = {"caught_up": True, "error": None, "incidents": {"alert delivery unavailable": {}}}
+        base = {"caught_up": True, "error": None, "incidents": {}}
         identifier = "verifier-" + "a" * 32
         self.assertTrue(public_status(base, identifier)["comparison_healthy"])
         self.assertTrue(public_status(base, identifier)["alerts_muted"])

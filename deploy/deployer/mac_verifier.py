@@ -285,13 +285,12 @@ sudo -n {stage}/zakurad --version >/dev/null
         mac.run(f'''set -eu
 sudo -n cp -p '{BASE}/bin/zakurad' '{BASE}/bin/zakurad.previous'
 sudo -n cp -p '{BASE}/receipt.json' '{BASE}/receipt.json.previous'
-sudo -n launchctl bootout system/dev.valargroup.zakura-verifier-node
-sudo -n launchctl bootout system/dev.valargroup.zakura-verifier-adapter
-sudo -n install -m 755 {stage}/zakurad '{BASE}/bin/zakurad'
+sudo -n install -m 755 {stage}/zakurad '{BASE}/bin/zakurad.next'
+sudo -n mv -f '{BASE}/bin/zakurad.next' '{BASE}/bin/zakurad'
 sudo -n cp {stage}/receipt.json '{BASE}/receipt.json'
 sudo -n install -m 644 {stage}/acceptance.json '{BASE}/evidence/ci-acceptance.json'
-sudo -n launchctl bootstrap system /Library/LaunchDaemons/dev.valargroup.zakura-verifier-node.plist
-sudo -n launchctl bootstrap system /Library/LaunchDaemons/dev.valargroup.zakura-verifier-adapter.plist
+sudo -n launchctl kickstart -k system/dev.valargroup.zakura-verifier-node
+sudo -n launchctl kickstart -k system/dev.valargroup.zakura-verifier-adapter
 ''', timeout=300)
         print('Updating the Linux receipt while retaining comparison state', flush=True)
         linux.put((json.dumps(new) + '\n').encode(), '/etc/zakura-mac-verifier/receipt.json')
@@ -335,12 +334,11 @@ sudo -n systemctl start zakura-mac-verifier
         print('Restoring the previous binary and receipt identity', flush=True)
         linux.run('sudo -n systemctl stop zakura-mac-verifier')
         mac.run(f'''set -eu
-sudo -n launchctl bootout system/dev.valargroup.zakura-verifier-node || true
-sudo -n launchctl bootout system/dev.valargroup.zakura-verifier-adapter || true
-sudo -n cp -p '{BASE}/bin/zakurad.previous' '{BASE}/bin/zakurad'
+sudo -n cp -p '{BASE}/bin/zakurad.previous' '{BASE}/bin/zakurad.next'
+sudo -n mv -f '{BASE}/bin/zakurad.next' '{BASE}/bin/zakurad'
 sudo -n cp -p '{BASE}/receipt.json.previous' '{BASE}/receipt.json'
-sudo -n launchctl bootstrap system /Library/LaunchDaemons/dev.valargroup.zakura-verifier-node.plist
-sudo -n launchctl bootstrap system /Library/LaunchDaemons/dev.valargroup.zakura-verifier-adapter.plist
+sudo -n launchctl kickstart -k system/dev.valargroup.zakura-verifier-node
+sudo -n launchctl kickstart -k system/dev.valargroup.zakura-verifier-adapter
 ''', timeout=300)
         linux.run('''set -eu
 sudo -n cp -p /etc/zakura-mac-verifier/receipt.json.previous /etc/zakura-mac-verifier/receipt.json

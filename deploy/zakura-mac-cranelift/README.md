@@ -15,7 +15,7 @@ audit imported UTXOs/nullifiers or eliminate bugs shared by both nodes.
 | --- | --- |
 | `ssh_probe.py` | Bounded read-only Mac probe invoked over SSH; no daemon or listener |
 | `comparison.py` | Bounded comparison invoked by the fleet watchdog |
-| `status_bridge.py` | Allowlisted status for the public dashboard |
+| `../runner/mac_cranelift_status.py` | Shared field filter and atomic public-file writer; no service |
 | `common.py` | Bounded RPC, canonical records and atomic state writes |
 | `rotate_logs.py` | Bound Mac launchd diagnostic logs |
 | `cranelift/qualify.py` | Build and test compiler acceptance candidates in CI |
@@ -23,14 +23,14 @@ audit imported UTXOs/nullifiers or eliminate bugs shared by both nodes.
 The US reference host opens one SSH session per comparison cycle. A dedicated
 monitoring key is restricted to the root-owned read-only probe: no interactive
 shell, arbitrary command or port forwarding. The private key is generated on
-Linux and never leaves it. CI installs only its public half on the Mac. The probe
+Linux and never leaves it. Only its public half is installed on the Mac. The probe
 uses the Mac node's existing loopback RPC on port `28232`; Linux RPC uses loopback
 `8232`. The adapter HTTP service and reverse tunnel are retired.
 
 Private connection settings and pinned host keys live under
 `/etc/zakura-mac-verifier/ssh`, readable only by the monitoring account/root.
-The dashboard reuses the resulting sample through the existing allowlisted status
-bridge; it never receives the SSH destination or adds it to public inventory.
+The dashboard reads the watchdog's sanitized status file; it never receives the
+SSH destination or adds it to public inventory.
 Deployment credentials stay in the private CI environment, and are not copied to
 the reference host.
 
@@ -59,12 +59,12 @@ queue, alert-enablement script or 24-hour qualification state.
 
 The lane is enabled with `ZAKURA_MAC_CRANELIFT_COMPARISON=1` on the existing watchdog.
 Notifications remain muted by default; `ZAKURA_MAC_CRANELIFT_COMPARISON_ALERTS=1` enables
-this lane through the existing watchdog channel. Migration preserves muted
-operation and does not replay historical messages.
+this lane through the existing watchdog channel. Monitoring deployment preserves
+muted operation and does not replay historical messages.
 
-The bridge only publishes approved status fields. The dashboard distinguishes
+The watchdog only publishes approved status fields. The dashboard distinguishes
 comparison failure from node availability. Private receipts, diagnostics, host
-addresses and peer identities never pass through the bridge.
+addresses and peer identities never enter the public status file.
 
 ## Names and deployment compatibility
 
@@ -89,19 +89,18 @@ Dashboard and watchdog settings use the `ZAKURA_MAC_CRANELIFT_` prefix. Existing
 when their replacement is unset. Opaque receipt IDs and serialized status fields
 remain stable so existing history and dashboard consumers continue to work.
 
-## CI migration
+## Monitoring deployment
 
-The mainnet workflow supports `node=zakura-mac-os` and `mac_operation=migrate`
-to replace the HTTP adapter with direct SSH on the existing watchdog deployment.
-It installs the restricted monitoring key and probe, checks a copy of the existing
-cursor against Linux, and compares SSH results with the still-running adapter.
-Only after those checks pass does it switch the comparison client and disable
-the Mac adapter and reverse-tunnel launchd jobs. It never restarts the node.
+Use `node=zakura-mac-os` and `mac_operation=dashboard` to deploy the watchdog,
+comparison client, field-filter library and dashboard together. The watchdog
+atomically writes `/var/lib/zakura-mac-cranelift-public/status.json`; the dashboard
+reads that bounded, sanitized file. Raw comparison state and connection settings
+remain in their private directories. There is no dashboard bridge service.
 
-Migration succeeds only after new blocks are compared over SSH with both old
-services disabled. Failure restores the prior transport and services while
-retaining all comparison progress and evidence. Recovery files remain private.
-The node binary, configuration, database and alert settings are unchanged.
+Deployment checks a fresh matching sample and a healthy dashboard row before
+disabling the former bridge. Failure restores the prior scripts and services
+without rewinding comparison history. The Mac node is not restarted. Completed
+adapter/tunnel and cursor-schema migrations are no longer supported operations.
 
 ## Binary deployment
 

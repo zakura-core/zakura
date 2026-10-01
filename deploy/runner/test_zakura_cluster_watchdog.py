@@ -2141,7 +2141,10 @@ class MacComparisonLaneTests(unittest.TestCase):
         self.args = make_args(mac_comparison=self.root / "comparison.py",
                               mac_comparison_state=self.root,
                               mac_comparison_receipt=self.root / "receipt.json",
-                              mac_comparison_alerts=True)
+                              mac_comparison_alerts=True,
+                              mac_comparison_identity=self.root / "identity.json",
+                              mac_comparison_public_status=self.root / "public.json")
+        (self.root / "identity.json").write_text(json.dumps({"verifier_id": "verifier-" + "a" * 32}))
         self.lane = watchdog.Watchdog([], self.args)
         self.messages = []
         self.lane.notify = lambda text, _: (self.messages.append(text), True)[1]

@@ -89,7 +89,7 @@ class Comparison:
                 or self.state.get("bootstrap") != expected["bootstrap_height"]):
             raise ValueError("receipt changed: explicit transition required")
         if self.state.get("schema_version") != 2:
-            raise ValueError("legacy state requires explicit migration")
+            raise ValueError("unsupported comparison state schema")
 
     @staticmethod
     def receipt_digest(receipt):
@@ -227,28 +227,6 @@ class Comparison:
         return result
 
 
-def migrate(directory, expected):
-    """Archive legacy alerts/evidence without delivering them; retain coverage."""
-    directory = Path(directory)
-    path = directory / "cursor.json"
-    if not path.exists():
-        raise ValueError("existing comparison cursor required")
-    old = read_json(path)
-    if (old.get("receipt_digest") != Comparison.receipt_digest(expected)
-            or old.get("bootstrap") != expected["bootstrap_height"]):
-        raise ValueError("migration receipt mismatch")
-    if old.get("schema_version") == 2:
-        return
-    backup = directory / "legacy-cursor.json"
-    if backup.exists():
-        raise ValueError("legacy backup exists; inspect before retrying migration")
-    atomic_json(backup, old)
-    new = {key: old[key] for key in ("bootstrap", "receipt_digest", "cursor", "history")}
-    new.update(schema_version=2, coverage_gap=any("coverage gap" in name
-               for name in old.get("incidents", {})))
-    atomic_json(path, new)
-
-
 @contextlib.contextmanager
 def exclusive(directory):
     Path(directory).mkdir(parents=True, exist_ok=True)
@@ -259,22 +237,19 @@ def exclusive(directory):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=["once", "migrate"])
+    parser.add_argument("command", choices=["once"])
     parser.add_argument("--directory", default="/var/lib/zakura-mac-verifier")
     parser.add_argument("--ssh-config", default="/etc/zakura-mac-verifier/ssh/config")
     parser.add_argument("--receipt", default="/etc/zakura-mac-verifier/receipt.json")
     args = parser.parse_args()
     with exclusive(args.directory):
         expected = read_json(args.receipt)
-        if args.command == "migrate":
-            migrate(args.directory, expected)
-        else:
-            transport = Transport(timeout=2, deadline=time.monotonic() + 10)
-            remote = Remote(args.ssh_config, deadline=transport.deadline)
-            try:
-                Comparison(args.directory, expected, RPC("http://127.0.0.1:8232", transport), remote).step()
-            finally:
-                remote.close()
+        transport = Transport(timeout=2, deadline=time.monotonic() + 10)
+        remote = Remote(args.ssh_config, deadline=transport.deadline)
+        try:
+            Comparison(args.directory, expected, RPC("http://127.0.0.1:8232", transport), remote).step()
+        finally:
+            remote.close()
 
 
 if __name__ == "__main__":

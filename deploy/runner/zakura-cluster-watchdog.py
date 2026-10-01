@@ -1216,7 +1216,7 @@ class Watchdog:
                       caught_up=condition == "matching",
                       error=None if condition == "matching" else condition)
         try:
-            # Preserve private file access for the bridge and comparison account.
+            # Preserve private file access for the comparison account.
             previous = status_path.stat() if status_path.exists() else None
             temporary = status_path.with_suffix(".watchdog.tmp")
             with temporary.open("w") as stream:
@@ -1227,6 +1227,14 @@ class Watchdog:
                 os.chown(temporary, previous.st_uid, previous.st_gid)
             temporary.replace(status_path)
         except OSError:
+            condition = "unavailable"
+        sample.update(condition=condition, caught_up=condition == "matching",
+                      error=None if condition == "matching" else condition)
+        try:
+            from mac_cranelift_status import publish_status
+            publish_status(sample, self.args.mac_comparison_identity,
+                           self.args.mac_comparison_public_status)
+        except (OSError, ValueError, TypeError, KeyError):
             condition = "unavailable"
         bucket = state.setdefault("mac_comparison", {})
         entry = bucket.get("mainnet", {})
@@ -2129,6 +2137,10 @@ def parse_args() -> argparse.Namespace:
                         default=Path("/var/lib/zakura-mac-verifier"))
     parser.add_argument("--mac-comparison-receipt", type=Path,
                         default=Path("/etc/zakura-mac-verifier/receipt.json"))
+    parser.add_argument("--mac-comparison-identity", type=Path,
+                        default=Path("/etc/zakura-mac-verifier/dashboard.json"))
+    parser.add_argument("--mac-comparison-public-status", type=Path,
+                        default=Path("/var/lib/zakura-mac-cranelift-public/status.json"))
     parser.add_argument("--mac-comparison-alerts", action="store_true",
                         default=os.environ.get("ZAKURA_MAC_CRANELIFT_COMPARISON_ALERTS", os.environ.get("ZAKURA_MAC_COMPARISON_ALERTS")) == "1")
     parser.add_argument("--once", action="store_true", help="poll once, update state, and exit")

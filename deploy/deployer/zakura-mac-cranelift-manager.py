@@ -15,7 +15,8 @@ import traceback
 
 PACKAGE = Path(__file__).resolve().parents[1] / 'zakura-mac-cranelift'
 sys.path.insert(0, str(PACKAGE))
-from status_bridge import public_status
+sys.path.insert(0, str(PACKAGE.parent / "runner"))
+from mac_cranelift_status import public_status
 
 # Installed paths, launchd labels and service accounts are persistent deployment
 # bindings. Keep them stable across the repository/CI naming change.
@@ -69,195 +70,88 @@ class SSH:
 
 
 def dashboard(linux):
-    """Restore the integration that a regular fleet deployment can overwrite."""
-    target = '/opt/zakura-mainnet-dashboard/zakura-cluster-status.py'
-    bridge = '/opt/zakura-mac-verifier/status_bridge.py'
-    linux.run('set -eu\nsudo -n test -f ' + target + '\nsudo -n cp -p ' + target + ' ' + target + '.previous')
-    linux.run('set -eu\nsudo -n cp -p ' + bridge + ' ' + bridge + '.previous')
+    """Deploy the watchdog's sanitized file handoff and retire the bridge service."""
+    stage = linux.run('mktemp -d /var/tmp/zakura-dashboard-ci.XXXXXX').strip()
+    if not re.fullmatch(r'/var/tmp/zakura-dashboard-ci\.[A-Za-z0-9]+', stage):
+        raise ValueError('unexpected dashboard staging path')
+    files = {
+        '/opt/zakura-fleet-watchdog/zakura-cluster-watchdog.py': PACKAGE.parent / 'runner/zakura-cluster-watchdog.py',
+        '/opt/zakura-fleet-watchdog/mac_cranelift_status.py': PACKAGE.parent / 'runner/mac_cranelift_status.py',
+        '/opt/zakura-mainnet-dashboard/zakura-cluster-status.py': PACKAGE.parent / 'runner/zakura-cluster-status.py',
+        '/opt/zakura-mac-verifier/comparison.py': PACKAGE / 'comparison.py',
+    }
+    dropin = '/etc/systemd/system/zakura-mainnet-dashboard.service.d/70-private-verifier.conf'
+    targets = [*files, dropin]
+    for index, target in enumerate(targets):
+        linux.run(f'''set -eu
+if sudo -n test -f {target}; then
+  sudo -n cp -p {target} {stage}/{index}.previous
+else
+  sudo -n touch {stage}/{index}.absent
+fi
+''')
+    bridge_active = linux.run('systemctl is-active zakura-mac-verifier-dashboard || true').strip() == 'active'
+    started = time.time()
     try:
-        linux.put((PACKAGE / 'status_bridge.py').read_bytes(), bridge)
-        linux.put((PACKAGE.parent / 'runner/zakura-cluster-status.py').read_bytes(), target)
+        linux.run('sudo -n systemctl stop zakura-fleet-watchdog')
+        for target, source in files.items():
+            linux.put(source.read_bytes(), target)
         linux.run('''set -eu
+sudo -n install -d -m 755 /var/lib/zakura-mac-cranelift-public
 sudo -n install -d -m 755 /etc/systemd/system/zakura-mainnet-dashboard.service.d
 printf '[Service]\\nEnvironment=ZAKURA_MAC_CRANELIFT_STATUS=1\\n' | sudo -n tee /etc/systemd/system/zakura-mainnet-dashboard.service.d/70-private-verifier.conf >/dev/null
 sudo -n systemctl daemon-reload
-sudo -n systemctl restart zakura-mac-verifier-dashboard
+sudo -n systemctl start zakura-fleet-watchdog
 sudo -n systemctl restart zakura-mainnet-dashboard
 ''')
-        deadline = time.monotonic() + 120
+        deadline = time.monotonic() + 180
         while time.monotonic() < deadline:
-            result = linux.run('''python3 - <<'REMOTE'
-import json, urllib.request
+            result = linux.run(f'''python3 - <<'REMOTE'
+import json, pathlib, time, urllib.request
 try:
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    sample = json.loads(pathlib.Path('/var/lib/zakura-mac-cranelift-public/status.json').read_text())
+    assert sample['sample_time'] >= {started!r} and time.time() - sample['sample_time'] <= 90
+    assert sample['comparison_healthy'] and sample['condition'] == 'matching'
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({{}}))
     with opener.open('http://127.0.0.1:8090/data', timeout=10) as response:
         rows = json.load(response)['rows']
-    print(json.dumps(any(row['name'] == 'zakura-mac-os' and row.get('height') for row in rows)))
+    print(json.dumps(any(row['name'] == 'zakura-mac-os' and row.get('height') and row.get('healthy') for row in rows)))
 except Exception:
     print('false')
 REMOTE
 ''')
             if json.loads(result):
-                print('Dashboard deployment verified: Mac row has a live height')
+                linux.run('''set -eu
+sudo -n systemctl disable --now zakura-mac-verifier-dashboard
+sudo -n python3 - <<'REMOTE'
+import socket
+try:
+    connection = socket.create_connection(('127.0.0.1', 28236), timeout=2)
+except OSError:
+    pass
+else:
+    connection.close()
+    raise RuntimeError('retired bridge is still listening')
+REMOTE
+''')
+                print('Dashboard verified: fresh matching comparison via sanitized file; bridge disabled')
                 return
             time.sleep(5)
-        raise RuntimeError('Mac row did not become available')
+        raise RuntimeError('dashboard did not report a fresh healthy comparison')
     except Exception:
-        linux.run('set -eu\nsudo -n cp -p ' + bridge + '.previous ' + bridge + '\nsudo -n systemctl restart zakura-mac-verifier-dashboard')
-        linux.run('set -eu\nsudo -n cp -p ' + target + '.previous ' + target + '\nsudo -n systemctl restart zakura-mainnet-dashboard')
-        raise
-
-
-
-def probe_program():
-    source = (PACKAGE / 'ssh_probe.py').read_text()
-    shared_import = 'from common import RPC, Transport, Unavailable, MAX_JSON, digest, integer, read_json, hex_bytes\n'
-    if source.count(shared_import) != 1:
-        raise ValueError('unexpected probe imports')
-    return ((PACKAGE / 'common.py').read_text() + '\n' + source.replace(shared_import, '')).encode()
-
-
-def monitoring_config():
-    host = str(ipaddress.ip_address(os.environ['ZAKURA_MAC_CRANELIFT_HOST']))
-    user = os.environ['ZAKURA_MAC_CRANELIFT_USER']
-    port = os.environ.get('ZAKURA_MAC_CRANELIFT_SSH_PORT') or '22'
-    if not re.fullmatch(r'[a-zA-Z_][a-zA-Z0-9_-]{0,31}', user) or not port.isdecimal() or not 1 <= int(port) <= 65535:
-        raise ValueError('invalid private SSH configuration')
-    return (f'Host mac-verifier\n  HostName {host}\n  User {user}\n  Port {port}\n'
-            '  IdentityFile /etc/zakura-mac-verifier/ssh/id_ed25519\n'
-            '  UserKnownHostsFile /etc/zakura-mac-verifier/ssh/known_hosts\n'
-            '  StrictHostKeyChecking yes\n  IdentitiesOnly yes\n  BatchMode yes\n'
-            '  ConnectTimeout 4\n  ConnectionAttempts 1\n  ServerAliveInterval 3\n'
-            '  ServerAliveCountMax 1\n  LogLevel ERROR\n').encode()
-
-
-def migrate_ssh(mac, linux):
-    """Validate direct private SSH, preserve state, then retire the HTTP adapter."""
-    linux.run('sudo -n test -f /etc/systemd/system/zakura-fleet-watchdog.service.d/70-mac-comparison.conf')
-    stage = linux.run('mktemp -d /var/tmp/zakura-ssh-ci.XXXXXX').strip()
-    if not re.fullmatch(r'/var/tmp/zakura-ssh-ci\.[A-Za-z0-9]+', stage):
-        raise ValueError('unexpected migration staging path')
-    for name, source in [('comparison.py', PACKAGE / 'comparison.py'), ('common.py', PACKAGE / 'common.py'),
-                         ('watchdog.py', PACKAGE.parent / 'runner/zakura-cluster-watchdog.py')]:
-        linux.put(source.read_bytes(), stage + '/' + name)
-    # Generate a separate monitoring key on Linux; its private half never leaves.
-    linux.run('''set -eu
-sudo -n install -d -m 700 -o zakura-mac-verifier /etc/zakura-mac-verifier/ssh
-if ! sudo -n test -f /etc/zakura-mac-verifier/ssh/id_ed25519; then
-  sudo -n -u zakura-mac-verifier ssh-keygen -q -t ed25519 -N '' -f /etc/zakura-mac-verifier/ssh/id_ed25519
+        linux.run('sudo -n systemctl stop zakura-fleet-watchdog')
+        for index, target in enumerate(targets):
+            linux.run(f'''set -eu
+if sudo -n test -f {stage}/{index}.absent; then
+  sudo -n rm -f {target}
+else
+  sudo -n cp -p {stage}/{index}.previous {target}
 fi
 ''')
-    public_key = linux.run('sudo -n cat /etc/zakura-mac-verifier/ssh/id_ed25519.pub').strip()
-    if not re.fullmatch(r'ssh-ed25519 [A-Za-z0-9+/=]+(?: [^\r\n]*)?', public_key):
-        raise ValueError('invalid monitoring public key')
-    linux.put(monitoring_config(), '/etc/zakura-mac-verifier/ssh/config')
-    linux.put(os.environ['ZAKURA_MAC_CRANELIFT_KNOWN_HOSTS'].encode(), '/etc/zakura-mac-verifier/ssh/known_hosts')
-    linux.run('sudo -n chown zakura-mac-verifier /etc/zakura-mac-verifier/ssh/config /etc/zakura-mac-verifier/ssh/known_hosts\n'
-              'sudo -n chmod 600 /etc/zakura-mac-verifier/ssh/config /etc/zakura-mac-verifier/ssh/known_hosts')
-    mac.put(probe_program(), BASE + '/ssh_probe.py')
-    forced = f'sudo -n {MAC_PYTHON} -I -u ' + shlex.quote(BASE + '/ssh_probe.py')
-    entry = 'restrict,command="' + forced.replace('\\', '\\\\').replace('"', '\\"') + '" '
-    entry += ' '.join(public_key.split()[:2]) + ' zakura-comparison-readonly'
-    user = os.environ['ZAKURA_MAC_CRANELIFT_USER']
-    mac.run(f'''sudo -n {MAC_PYTHON} - <<'REMOTE'
-import os, pathlib, pwd
-base = pathlib.Path({BASE!r})
-assert base.stat().st_uid == 0 and not base.stat().st_mode & 0o022
-probe = base / 'ssh_probe.py'
-os.chown(probe, 0, 0)
-probe.chmod(0o644)
-account = pwd.getpwnam({user!r})
-directory = pathlib.Path(account.pw_dir) / '.ssh'
-directory.mkdir(mode=0o700, exist_ok=True)
-os.chown(directory, account.pw_uid, account.pw_gid)
-path = directory / 'authorized_keys'
-old = path.read_text() if path.exists() else ''
-lines = [line for line in old.splitlines() if not line.endswith(' zakura-comparison-readonly')]
-lines.append({entry!r})
-tmp = directory / 'authorized_keys.zakura-next'
-tmp.write_text('\\n'.join(lines) + '\\n')
-tmp.chmod(0o600)
-os.chown(tmp, account.pw_uid, account.pw_gid)
-tmp.replace(path)
-REMOTE
-''')
-    print('Checking direct SSH probe against the live adapter and Linux reference', flush=True)
-    linux.run(f'''set -eu
-sudo -n chmod 755 {stage}
-sudo -n install -d -m 700 -o zakura-mac-verifier {stage}/shadow
-sudo -n cp -a /var/lib/zakura-mac-verifier/cursor.json {stage}/shadow/cursor.json
-sudo -n -u zakura-mac-verifier timeout 20 python3 {stage}/comparison.py once --directory {stage}/shadow
-sudo -n -u zakura-mac-verifier python3 - <<'REMOTE'
-import json, pathlib, sys
-sys.path.insert(0, '{stage}')
-from common import Transport
-from comparison import Remote
-sample = json.loads(pathlib.Path('{stage}/shadow/status.json').read_text())
-assert sample['condition'] in ('matching', 'catching_up')
-old = Transport().json('http://127.0.0.1:28233/v1/status')
-assert old['receipt'] == sample['verifier']['receipt']
-assert old['binary_sha256'] == sample['verifier']['binary_sha256']
-height = sample['compared_through']
-remote = Remote()
-try:
-    assert remote.block(height) == Transport().json(f'http://127.0.0.1:28233/v1/block/{{height}}')
-finally:
-    remote.close()
-REMOTE
-''', timeout=60)
-    linux.run(f'''set -eu
-sudo -n mkdir {stage}/backup
-sudo -n cp -a /opt/zakura-mac-verifier/comparison.py {stage}/backup/comparison.py
-sudo -n cp -a /opt/zakura-mac-verifier/common.py {stage}/backup/common.py
-sudo -n cp -a /opt/zakura-fleet-watchdog/zakura-cluster-watchdog.py {stage}/backup/watchdog.py
-sudo -n cp -a /var/lib/zakura-mac-verifier/cursor.json {stage}/backup/cursor.json
-''')
-    try:
-        linux.run(f'''set -eu
-sudo -n systemctl stop zakura-fleet-watchdog
-sudo -n install -m 644 {stage}/comparison.py /opt/zakura-mac-verifier/comparison.py
-sudo -n install -m 644 {stage}/common.py /opt/zakura-mac-verifier/common.py
-sudo -n install -m 755 {stage}/watchdog.py /opt/zakura-fleet-watchdog/zakura-cluster-watchdog.py
-sudo -n systemctl start zakura-fleet-watchdog
-''')
-        # Only disable the old services after shadow checks proved direct access.
-        mac.run('''set -eu
-sudo -n launchctl bootout system/dev.valargroup.zakura-verifier-adapter
-sudo -n launchctl disable system/dev.valargroup.zakura-verifier-adapter
-sudo -n launchctl bootout system/dev.valargroup.zakura-verifier-tunnel
-sudo -n launchctl disable system/dev.valargroup.zakura-verifier-tunnel
-''')
-        baseline = None
-        deadline = time.monotonic() + 600
-        while time.monotonic() < deadline:
-            sample = json.loads(linux.run('sudo -n cat /var/lib/zakura-mac-verifier/status.json'))
-            if sample.get('condition') == 'matching' and sample.get('verifier', {}).get('node_active') is True:
-                height = sample['compared_through']
-                if baseline is not None and height > baseline:
-                    linux.run('sudo -n systemctl is-active --quiet zakura-fleet-watchdog')
-                    print('Direct SSH comparison advanced with adapter and tunnel disabled', flush=True)
-                    return
-                baseline = height if baseline is None else baseline
-            time.sleep(10)
-        raise RuntimeError('SSH comparison did not advance')
-    except Exception:
-        print('Restoring prior comparison transport; keeping all comparison history', flush=True)
-        mac.run('''set -eu
-for label in dev.valargroup.zakura-verifier-adapter dev.valargroup.zakura-verifier-tunnel; do
-  sudo -n launchctl enable system/$label
-  sudo -n launchctl print system/$label >/dev/null 2>&1 || sudo -n launchctl bootstrap system /Library/LaunchDaemons/$label.plist
-  sudo -n launchctl kickstart -k system/$label
-done
-''')
-        linux.run(f'''set -eu
-sudo -n systemctl stop zakura-fleet-watchdog
-sudo -n cp -a {stage}/backup/comparison.py /opt/zakura-mac-verifier/comparison.py
-sudo -n cp -a {stage}/backup/common.py /opt/zakura-mac-verifier/common.py
-sudo -n cp -a {stage}/backup/watchdog.py /opt/zakura-fleet-watchdog/zakura-cluster-watchdog.py
-sudo -n systemctl start zakura-fleet-watchdog
-''')
+        if bridge_active:
+            linux.run('sudo -n systemctl enable --now zakura-mac-verifier-dashboard')
+        linux.run('sudo -n systemctl daemon-reload\nsudo -n systemctl start zakura-fleet-watchdog\nsudo -n systemctl restart zakura-mainnet-dashboard')
         raise
-
 
 
 def public_report(value):
@@ -334,6 +228,13 @@ try:
         result['reverse_listener_closed'] = False
 except OSError:
     result['reverse_listener_closed'] = True
+try:
+    with socket.create_connection(('127.0.0.1', 28236), timeout=2):
+        result['dashboard_bridge_closed'] = False
+except OSError:
+    result['dashboard_bridge_closed'] = True
+public = pathlib.Path('/var/lib/zakura-mac-cranelift-public/status.json')
+result['dashboard_file_present'] = public.is_file()
 path = pathlib.Path('/var/lib/zakura-mac-verifier/status.json')
 result['status'] = json.loads(path.read_text()) if path.exists() else None
 script = pathlib.Path('/opt/zakura-mainnet-dashboard/zakura-cluster-status.py')
@@ -541,7 +442,7 @@ sudo -n systemctl start zakura-fleet-watchdog
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('operation', choices=['status', 'dashboard', 'deploy', 'migrate'])
+    parser.add_argument('operation', choices=['status', 'dashboard', 'deploy'])
     args = parser.parse_args()
     check_address_history()
     if os.environ.get('NO_RESTART') == 'true' or (
@@ -553,8 +454,6 @@ def main():
     with tempfile.TemporaryDirectory(prefix='zakura-mac-cranelift-') as directory:
         mac = SSH('ZAKURA_MAC_CRANELIFT_', directory)
         linux = SSH('ZAKURA_MAC_CRANELIFT_REFERENCE_', directory)
-        if args.operation == 'migrate':
-            migrate_ssh(mac, linux)
         if args.operation == 'deploy':
             if os.environ.get('MAC_CANDIDATE_RUN_ID'):
                 candidate_dir = Path(directory) / 'candidate'
@@ -565,7 +464,7 @@ def main():
             candidate = validate_candidate(candidate_dir, os.environ['MAC_SOURCE_SHA'],
                                            os.environ['MAC_SOURCE_LOCK_SHA256'])
             deploy_candidate(mac, linux, candidate_dir, candidate)
-        if args.operation in ('dashboard', 'deploy', 'migrate'):
+        if args.operation in ('dashboard', 'deploy'):
             dashboard(linux)
         status(mac, linux, identifier)
 

@@ -89,7 +89,7 @@ def qualify(backend, source, output, source_sha):
     receipt = dict(source_sha=source_sha, cargo_lock_sha256=digest(source / 'Cargo.lock'),
                    patch_sha256=digest(RECIPE / 'macos-unwind.patch'),
                    backend_sha256=digest(backend / 'dist/lib/librustc_codegen_cranelift.dylib'),
-                   started=time.time(), passed=False, production_ready=False, checks=[])
+                   started=time.time(), passed=False, checks=[])
     receipt['toolchain'] = subprocess.check_output(
         ['rustc', '+nightly-2026-09-30', '-Vv'], text=True, timeout=30).strip()
     receipt['sdk_version'] = subprocess.check_output(
@@ -142,7 +142,7 @@ def qualify(backend, source, output, source_sha):
     if 'arm64' not in architecture:
         raise ValueError('candidate is not native ARM64')
     receipt.update(binary_sha256=digest(binary), binary_architecture=architecture,
-                   passed=True, phase='awaiting-runtime-qualification', completed=time.time())
+                   passed=True, phase='build-accepted', completed=time.time())
     save()
 
 

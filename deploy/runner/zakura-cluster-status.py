@@ -1056,18 +1056,11 @@ def redact_public_addresses(value):
     return re.sub(pattern, redact, value)
 
 
-class NoVerifierRedirect(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        raise ValueError("verifier bridge redirect refused")
-
-
 def mac_cranelift_status() -> dict:
-    """Read only the local sanitized bridge; never poll a private host directly."""
+    """Read only the watchdog's sanitized file, never the private comparison state."""
     try:
-        request = urllib.request.Request("http://127.0.0.1:28236/v1/status")
-        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoVerifierRedirect())
-        with opener.open(request, timeout=1) as response:
-            raw = response.read(65537)
+        with Path("/var/lib/zakura-mac-cranelift-public/status.json").open("rb") as stream:
+            raw = stream.read(65537)
         if len(raw) > 65536:
             raise ValueError("oversized status")
         data = json.loads(raw)

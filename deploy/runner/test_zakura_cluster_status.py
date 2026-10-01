@@ -86,9 +86,7 @@ def public_row(
 
 class MacCraneliftTests(unittest.TestCase):
     def read(self, payload):
-        opener = mock.Mock()
-        opener.open.return_value = io.BytesIO(json.dumps(payload).encode())
-        with mock.patch.object(status.urllib.request, "build_opener", return_value=opener):
+        with mock.patch.object(Path, "open", return_value=io.BytesIO(json.dumps(payload).encode())):
             return status.mac_cranelift_status()
 
     def test_existing_dashboard_does_not_publish_private_endpoint_or_diagnostics(self):
@@ -102,7 +100,7 @@ class MacCraneliftTests(unittest.TestCase):
         for private in ("192.0.2.10", "private-host", "private-peer", "receipt", "error"):
             self.assertNotIn(private, json.dumps(result))
 
-    def test_stale_or_malformed_bridge_never_reports_fresh_status(self):
+    def test_stale_or_malformed_file_never_reports_fresh_status(self):
         self.assertFalse(self.read({"verifier_id": "verifier-" + "a" * 32,
                                     "sample_time": time.time() - 1000})["available"])
         self.assertEqual(self.read({"verifier_id": "192.0.2.10"}), {"available": False})
@@ -1212,9 +1210,6 @@ class AddressPrivacyTests(unittest.TestCase):
                    "hash": "a" * 64, "bad": "999.999.999.999", "available": True}
         self.assertEqual(status.redact_public_addresses(payload), payload)
 
-    def test_bridge_refuses_redirects(self):
-        with self.assertRaises(ValueError):
-            status.NoVerifierRedirect().redirect_request(None, None, 302, "", {}, "https://example.org")
 
 
 class HttpHandlerTests(unittest.TestCase):

@@ -10,9 +10,10 @@ import urllib.error
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from common import RPC, Unavailable, canonical_record
-from comparison import Comparison, Remote, migrate
+from comparison import Comparison, Remote
 from rotate_logs import rotate
-from status_bridge import public_status
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "runner"))
+from mac_cranelift_status import public_status, publish_status
 from ssh_probe import fork_anchor
 
 
@@ -127,20 +128,6 @@ class ComparisonTests(unittest.TestCase):
         self.assertEqual(self.monitor.state["cursor"], 10)
         self.assertEqual(json.loads((Path(self.temp.name) / "status.json").read_text())["condition"], "chain_disagreement")
 
-    def test_migration_archives_queue_and_preserves_coverage(self):
-        old = dict(self.monitor.state, schema_version=1, outbox=[{"text": "historical message"}],
-                   incidents={"coverage gap: rebootstrap required": {}})
-        path = Path(self.temp.name) / "cursor.json"
-        path.write_text(json.dumps(old))
-        migrate(self.temp.name, receipt())
-        new = json.loads(path.read_text())
-        self.assertNotIn("outbox", new)
-        self.assertTrue(new["coverage_gap"])
-        self.assertEqual(new["cursor"], old["cursor"])
-        self.assertEqual(new["history"], old["history"])
-        self.assertEqual(json.loads((path.parent / "legacy-cursor.json").read_text()), old)
-        migrate(self.temp.name, receipt())
-
     def test_racing_tree_read_is_not_recorded_as_confirmed_mismatch(self):
         original = self.mac.block
         calls = 0
@@ -203,7 +190,7 @@ class ForkSampleTests(unittest.TestCase):
             fork_anchor(rpc, {"height": 100, "hash": "b" * 64})
         self.assertIsNone(fork_anchor(rpc, {"height": 9, "hash": "b" * 64}))
 
-    def test_bridge_drops_malformed_anchor_and_private_fields(self):
+    def test_public_status_drops_malformed_anchor_and_private_fields(self):
         identifier = "verifier-" + "a" * 32
         result = public_status({"verifier": {"fork_anchor": {"height": 90, "hash": "b" * 64,
                                                                "host": "192.0.2.10"}}}, identifier)
@@ -303,10 +290,36 @@ class MalformedBoundaryTests(unittest.TestCase):
                 with self.assertRaises(Unavailable):
                     rpc.block(10)
 
-    def test_bridge_rejects_non_object_status(self):
+    def test_public_status_rejects_non_object_status(self):
         for value in (None, [], "invalid"):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 public_status(value, "verifier-" + "a" * 32)
+
+
+class PublicFileTests(unittest.TestCase):
+    def test_file_contains_only_allowlisted_fields_and_is_readable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            identity = root / "identity.json"
+            identity.write_text(json.dumps({"verifier_id": "verifier-" + "a" * 32}))
+            target = root / "public.json"
+            private = "198.51.100.42 secret-key"
+            raw = {"sample_time": 123, "caught_up": True, "condition": "matching",
+                   "verifier": {"tip": {"height": 15, "hash": "a" * 64},
+                                "receipt": {"host": private}, "resources": {"host": private}},
+                   "reference": {"height": 15, "host": private}, "private": private}
+            publish_status(raw, identity, target)
+            content = target.read_text()
+            self.assertNotIn(private, content)
+            self.assertNotIn("receipt", content)
+            self.assertTrue(json.loads(content)["comparison_healthy"])
+            self.assertEqual(target.stat().st_mode & 0o777, 0o644)
+            self.assertFalse(list(root.glob(".status-*")))
+            # A failed write cannot truncate the previously published sample.
+            with patch("mac_cranelift_status.os.replace", side_effect=OSError("fixture")), self.assertRaises(OSError):
+                publish_status(dict(raw, caught_up=False), identity, target)
+            self.assertEqual(target.read_text(), content)
+            self.assertFalse(list(root.glob(".status-*")))
 
 
 if __name__ == "__main__":

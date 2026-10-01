@@ -672,7 +672,7 @@ where
                 miner_fee = Some(Self::miner_fee(tx.as_ref(), &spent_utxos)?);
             }
 
-            let sigops = tx.sigops().map_err(zakura_script::Error::from)?;
+            let sigops = tx.sigops()?;
 
             let rsp = match req {
                 Request::Block { .. } => Response::Block {

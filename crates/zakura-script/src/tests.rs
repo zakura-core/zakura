@@ -245,10 +245,24 @@ fn build_and_verify_v5_p2pkh(
     canonical_hash_type: HashType,
     sig_hash_type_byte: u8,
 ) -> std::result::Result<(), crate::Error> {
+    build_and_verify_zip244_p2pkh(5, false, canonical_hash_type, sig_hash_type_byte)
+}
+
+fn build_and_verify_zip244_p2pkh(
+    version: u32,
+    invert_checksig: bool,
+    canonical_hash_type: HashType,
+    sig_hash_type_byte: u8,
+) -> std::result::Result<(), crate::Error> {
     use ripemd::{Digest as _, Ripemd160};
     use secp256k1::{Message, Secp256k1, SecretKey};
     use sha2::Sha256;
 
+    let nu = match version {
+        5 => NetworkUpgrade::Nu5,
+        6 => NetworkUpgrade::Nu6_3,
+        _ => panic!("fixture supports ZIP-244 transaction versions"),
+    };
     let secp = Secp256k1::new();
 
     // Deterministic keypair (32 bytes, nonzero)
@@ -267,6 +281,9 @@ fn build_and_verify_v5_p2pkh(
     lock_script_bytes.extend_from_slice(&pub_key_hash);
     lock_script_bytes.push(0x88); // OP_EQUALVERIFY
     lock_script_bytes.push(0xac); // OP_CHECKSIG
+    if invert_checksig {
+        lock_script_bytes.push(0x91); // OP_NOT consumes a failed CHECKSIG.
+    }
     let lock_script = transparent::Script::new(&lock_script_bytes);
 
     let previous_output = transparent::Output {
@@ -278,7 +295,7 @@ fn build_and_verify_v5_p2pkh(
     // For v5/ZIP-244, the sighash does NOT depend on the unlock script contents,
     // so we can compute the sighash with a placeholder, sign, then rebuild.
     let placeholder_tx = Transaction::V5 {
-        network_upgrade: NetworkUpgrade::Nu5,
+        network_upgrade: nu,
         lock_time: LockTime::unlocked(),
         expiry_height: block::Height(0),
         inputs: vec![transparent::Input::PrevOut {
@@ -298,8 +315,34 @@ fn build_and_verify_v5_p2pkh(
     };
 
     // Compute the sighash for the canonical hash type
+    let to_version = |tx| match (version, tx) {
+        (5, tx) => tx,
+        (
+            6,
+            Transaction::V5 {
+                network_upgrade,
+                lock_time,
+                expiry_height,
+                inputs,
+                outputs,
+                sapling_shielded_data,
+                orchard_shielded_data,
+            },
+        ) => Transaction::V6 {
+            network_upgrade,
+            lock_time,
+            expiry_height,
+            inputs,
+            outputs,
+            sapling_shielded_data,
+            orchard_shielded_data,
+            ironwood_shielded_data: None,
+        },
+        _ => unreachable!("fixture starts from V5"),
+    };
+    let placeholder_tx = to_version(placeholder_tx);
     let all_previous_outputs = Arc::new(vec![previous_output.clone()]);
-    let sighasher = SigHasher::new(&placeholder_tx, NetworkUpgrade::Nu5, all_previous_outputs)
+    let sighasher = SigHasher::new(&placeholder_tx, nu, all_previous_outputs)
         .expect("sighasher creation should succeed");
     let sighash = sighasher.sighash(canonical_hash_type, Some((0, lock_script_bytes.clone())));
 
@@ -321,7 +364,7 @@ fn build_and_verify_v5_p2pkh(
 
     // Rebuild the V5 transaction with the real unlock script
     let final_tx = Transaction::V5 {
-        network_upgrade: NetworkUpgrade::Nu5,
+        network_upgrade: nu,
         lock_time: LockTime::unlocked(),
         expiry_height: block::Height(0),
         inputs: vec![transparent::Input::PrevOut {
@@ -341,9 +384,9 @@ fn build_and_verify_v5_p2pkh(
     };
 
     let verifier = super::CachedFfiTransaction::new(
-        Arc::new(final_tx),
+        Arc::new(to_version(final_tx)),
         Arc::new(vec![previous_output]),
-        NetworkUpgrade::Nu5,
+        nu,
     )
     .expect("network upgrade should be valid for v5 tx");
 
@@ -1444,13 +1487,6 @@ fn is_valid_rejects_out_of_range_input_index() {
 /// type would have been rejected, so the second signature fails to verify
 /// and `is_valid` returns an error — matching `zcashd`.
 ///
-/// The bypass requires release-grade C++ optimizations in `libzcash_script`
-/// (so the stack buffer is not zero-initialized and the prior digest
-/// lingers between callbacks). The workspace `Cargo.toml` forces
-/// `[profile.dev.package.libzcash_script]` to `opt-level = 3` in all
-/// profiles so that `cargo test` exercises the vulnerable code path and
-/// this regression test catches any re-introduction of the bug in both
-/// dev and release builds.
 #[test]
 fn stale_sighash_buffer_v5_two_checksig_rejected() {
     use secp256k1::{Message, Secp256k1, SecretKey};
@@ -1756,4 +1792,56 @@ fn poc_p2sh_1001_accurate_multisigs_should_stay_below_block_sigop_limit() -> Res
     );
 
     Ok(())
+}
+
+#[test]
+fn v4_all_raw_hash_bytes_verify() {
+    for raw in 0u8..=255 {
+        build_and_verify_v4_p2pkh(raw)
+            .unwrap_or_else(|error| panic!("V4 hash byte {raw:#04x} failed: {error}"));
+    }
+}
+
+#[test]
+fn zip244_canonical_signatures_verify_for_v5_and_v6() {
+    for version in [5, 6] {
+        for (hash_type, raw) in [
+            (HashType::ALL, 0x01),
+            (HashType::NONE, 0x02),
+            (HashType::SINGLE, 0x03),
+            (HashType::ALL_ANYONECANPAY, 0x81),
+            (HashType::NONE_ANYONECANPAY, 0x82),
+            (HashType::SINGLE_ANYONECANPAY, 0x83),
+        ] {
+            build_and_verify_zip244_p2pkh(version, false, hash_type, raw)
+                .unwrap_or_else(|error| panic!("V{version} hash byte {raw:#04x}: {error}"));
+        }
+    }
+}
+
+#[test]
+fn zip244_failed_callback_can_be_consumed_by_not() {
+    for version in [5, 6] {
+        for raw in [0x00, 0x50, 0x80, 0x84, 0xff] {
+            assert!(build_and_verify_zip244_p2pkh(version, false, HashType::ALL, raw).is_err());
+            build_and_verify_zip244_p2pkh(version, true, HashType::ALL, raw)
+                .expect("OP_NOT consumes the false result from a failed signature callback");
+        }
+    }
+}
+
+#[test]
+fn legacy_transaction_counts_sigop_after_oversized_output_push() {
+    let mut tx = SCRIPT_TX.zcash_deserialize_into::<Transaction>().unwrap();
+    let Transaction::V4 { outputs, .. } = &mut tx else {
+        panic!("fixture is V4")
+    };
+    let mut script = vec![0x4d, 0x09, 0x02];
+    script.extend([0xac; 521]);
+    script.push(0xac);
+    *outputs = vec![Output {
+        value: 0u64.try_into().unwrap(),
+        lock_script: transparent::Script::new(&script),
+    }];
+    assert_eq!(tx.sigops().unwrap(), 1);
 }

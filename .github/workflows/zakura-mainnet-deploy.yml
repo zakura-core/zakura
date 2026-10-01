@@ -72,7 +72,7 @@ jobs:
     if: inputs.node == 'zakura-mac-os' && (github.ref == 'refs/heads/main' || github.ref_name == vars.MAC_VERIFIER_DEPLOY_BRANCH)
     runs-on: ubuntu-24.04
     environment: mac-verifier-private
-    timeout-minutes: 30
+    timeout-minutes: 180
     permissions:
       contents: read
       actions: read

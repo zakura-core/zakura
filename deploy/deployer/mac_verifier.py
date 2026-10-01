@@ -192,11 +192,18 @@ def download_candidate(run_id, directory):
         return json.loads(subprocess.check_output(
             ['gh', 'api', f'repos/{repository}/actions/runs/{run_id}' + suffix], timeout=30))
     run = api('')
-    if (run.get('conclusion') != 'success'
-            or run.get('head_repository', {}).get('full_name') != repository
+    if (run.get('head_repository', {}).get('full_name') != repository
             or run.get('head_branch') not in ['main', os.environ.get('MAC_VERIFIER_DEPLOY_BRANCH')]
             or run.get('path') not in ['.github/workflows/mac-verifier.yml', '.github/workflows/deploy-mac-verifier.yml']):
         raise ValueError('candidate must come from successful trusted Mac verifier CI')
+    if run.get('status') != 'completed':
+        print('Waiting for the selected Cranelift candidate to finish acceptance', flush=True)
+        subprocess.run(['gh', 'run', 'watch', run_id, '--repo', repository,
+                        '--exit-status', '--interval', '30'],
+                       check=True, capture_output=True, timeout=2 * 3600)
+        run = api('')
+    if run.get('conclusion') != 'success':
+        raise ValueError('candidate CI did not pass; live binary unchanged')
     artifacts = [a for a in api('/artifacts')['artifacts']
                  if a['name'].startswith('mac-verifier-cranelift-') and not a['expired']]
     if len(artifacts) != 1:

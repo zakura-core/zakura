@@ -1,0 +1,72 @@
+[package]
+name = "zakura-script-oracle"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[features]
+fuzzing = ["dep:libfuzzer-sys"]
+
+[workspace]
+
+[dependencies]
+libfuzzer-sys = { version = "=0.4.13", optional = true }
+libzcash_script = { version = "=0.1.0", features = ["test-dependencies"] }
+zcash_script = { version = "=0.4.5", path = "../../crates/zcash-script", features = ["test-dependencies"] }
+zakura-script = { path = "../../crates/zakura-script" }
+zakura-chain = { path = "../../crates/zakura-chain" }
+zcash_primitives = { version = "=2.2.0", package = "zakura-primitives" }
+rand = "0.8"
+thiserror = "2"
+hex = "0.4"
+lazy_static = "1"
+ripemd = "0.1"
+secp256k1 = "0.29"
+sha2 = "0.10"
+zakura-test = { path = "../../crates/zakura-test" }
+
+[patch.crates-io]
+zcash_script = { path = "../../crates/zcash-script" }
+
+# Keep the baseline stale-buffer regression representative of release C++.
+[profile.dev.package.libzcash_script]
+opt-level = 3
+
+[[bin]]
+name = "execution"
+path = "fuzz_targets/execution.rs"
+test = false
+doc = false
+bench = false
+required-features = ["fuzzing"]
+
+[[bin]]
+name = "sigops"
+path = "fuzz_targets/sigops.rs"
+test = false
+doc = false
+bench = false
+required-features = ["fuzzing"]
+
+[[bin]]
+name = "transaction_callbacks"
+path = "fuzz_targets/transaction_callbacks.rs"
+test = false
+doc = false
+bench = false
+required-features = ["fuzzing"]
+
+[dev-dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+criterion = "=0.5.1"
+
+[[bench]]
+name = "script"
+harness = false
+
+[build-dependencies]
+cc = "1"

@@ -561,8 +561,7 @@ trace_rows_after() {
 }
 
 # A reorg reaches block sync as a destructive reset of its body pipeline, traced
-# as `block_chain_tip_reset` at the new tip. Header-driven resets do not bump
-# `sync.block.reorg.reset`, which then counts only a reset at process startup.
+# as `block_chain_tip_reset` at the new tip.
 wait_for_block_sync_reset() {
   local node="$1" height="$2" lines_before="$3" timeout="${4:-${READY_TIMEOUT}}"
   local file="${ZAKURA_E2E_TRACE_DIR}/${node}/block_sync.jsonl"

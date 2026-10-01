@@ -588,11 +588,14 @@ impl SequencerTask {
     }
 
     /// Reset the body pipeline and queued work above `tip` under one reset epoch.
+    /// Every reset that discards body work comes through here, so this is where
+    /// `sync.block.reorg.reset` counts it.
     fn destructive_reset_to(&mut self, tip: block::Height, keep_submitted_applies: bool) {
         let _ = self.sequencer.reset_to(tip, keep_submitted_applies);
         let released = self.work.reset_above(tip);
         self.budget.release(released);
         self.reset_epoch = self.reset_epoch.saturating_add(1);
+        metrics::counter!("sync.block.reorg.reset").increment(1);
     }
 
     /// Apply a verified-tip frontier advance: fold finalized height forward, drop
@@ -667,8 +670,6 @@ impl SequencerTask {
             self.handle_frontier_advance(frontiers, true).await;
             return;
         }
-
-        metrics::counter!("sync.block.reorg.reset").increment(1);
 
         // A `Reset` can also be a stale or coalesced state update for a tip
         // already inside our contiguous submitted/downloaded body floor. Do not
@@ -1295,6 +1296,7 @@ fn view_schedulable_ne(a: &SequencerView, b: &SequencerView) -> bool {
 #[cfg(test)]
 mod tests {
     mod commit_metrics;
+    mod reset_metrics;
 
     use zakura_chain::serialization::ZcashDeserializeInto;
     use zakura_test::vectors::BLOCK_MAINNET_1_BYTES;

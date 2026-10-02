@@ -8,8 +8,8 @@ decision. "PLAN" and "DESIGN" below name the planning notes that hold the
 evidence and step order; they live outside this repository.
 
 Version 0.2 matches the first implementation (zakura draft PR). It changes
-DEP-6, SOCK-1, WIRE-9, ADM-1, ADM-3, PATH-3, OBS-3, API-2, API-3 and API-6;
-§17a lists each change.
+DEP-6, SOCK-1, WIRE-9, ADM-1, ADM-3, PATH-3, OBS-3, API-2, API-3, API-6 and
+API-7; §17a lists each change.
 
 ## 0. Conventions
 
@@ -432,6 +432,10 @@ The public surface of `zakura-quic`. Changing it is a semver change of the crate
   2. close every connection with application code 0;
   3. wait on `Endpoint::wait_idle` for at most 3 s;
   4. drop the sockets.
+
+  Dropping the last `QuicEndpoint` handle without `shutdown` MUST still stop
+  accepting, close every connection with code 0 and free the sockets, without
+  the wait. Spawned tasks MUST NOT hold a handle that keeps the endpoint alive.
 - **API-8.** The testkit's `LocalEndpointFactory` MUST build `zakura-quic`
   endpoints bound to `127.0.0.1:0` with production settings, except where a test
   overrides a `QuicConfig` field.
@@ -546,7 +550,7 @@ and the legacy stack bridges old and new `p2p_stack = "dual"` nodes (COMPAT-7).
 | Config round trip, defaults, range errors, `nat_traversal` error | CTRL-0–CTRL-25 |
 | Congestion controller is Cubic when unset, checked through `Connection::congestion_state` | CTRL-3 |
 | Metrics presence and no per-peer labels | OBS-1, OBS-2 |
-| Shutdown order and the 3 s bound | API-7 |
+| Shutdown order and the 3 s bound; drop without `shutdown` frees the port | API-7 |
 | `tools/iroh-interop` matrix | COMPAT-1–COMPAT-3 |
 | Fork regression tests (gapped frames, retired-CID flood, oversized token) | NOQ-1, SEC-7 |
 | The 239 focused `zakura-network` tests and the full workspace suite with Iroh deleted | No regression |
@@ -586,3 +590,6 @@ The first implementation changed these requirements:
 - **API-3.** `admit` takes `&IncomingInfo`; `handle` returns a boxed future and
   takes only the `Conn`; `is_banned` is added.
 - **API-6.** `ConnectError` adds `Endpoint` and `Tls`.
+- **API-7.** Dropping the last handle also closes the endpoint. An embedded
+  node that drops its future without calling `shutdown` got its port back
+  under Iroh and must still get it back.

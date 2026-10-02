@@ -6,7 +6,7 @@ use std::{
     net::{IpAddr, SocketAddr},
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc, Mutex, PoisonError,
+        Arc, Mutex, PoisonError, Weak,
     },
     time::{Duration, Instant},
 };
@@ -122,6 +122,18 @@ struct SocketSlot {
     rebinds: Arc<AtomicU64>,
 }
 
+/// Dropping the last `QuicEndpoint` handle closes every connection and frees
+/// the sockets, as dropping an Iroh endpoint did. Dropping `shutdown` also
+/// ends the accept loops, socket supervisors and drop pollers.
+impl Drop for Inner {
+    fn drop(&mut self) {
+        for slot in &self.sockets {
+            slot.endpoint.set_server_config(None);
+            slot.endpoint.close(VarInt::from_u32(0), b"");
+        }
+    }
+}
+
 impl QuicEndpoint {
     /// Binds one socket per address in `bind` (API-2).
     pub fn bind(
@@ -216,7 +228,8 @@ impl QuicEndpoint {
         for slot in &self.inner.sockets {
             slot.endpoint.set_server_config(Some(server.clone()));
             tokio::spawn(accept_loop(
-                self.clone(),
+                Arc::downgrade(&self.inner),
+                self.shutdown_signal(),
                 slot.endpoint.clone(),
                 acceptor.clone(),
             ));
@@ -553,8 +566,15 @@ async fn kernel_drop_poller(
 }
 
 /// Accepts connection attempts on one socket (SPEC §7).
-async fn accept_loop(endpoint: QuicEndpoint, socket: noq::Endpoint, acceptor: Arc<dyn Acceptor>) {
-    let mut shutdown = endpoint.shutdown_signal();
+///
+/// The loop holds the endpoint weakly, so dropping every `QuicEndpoint` handle
+/// ends it.
+async fn accept_loop(
+    weak: Weak<Inner>,
+    mut shutdown: watch::Receiver<bool>,
+    socket: noq::Endpoint,
+    acceptor: Arc<dyn Acceptor>,
+) {
     let mut tasks = JoinSet::new();
     loop {
         let incoming = tokio::select! {
@@ -565,6 +585,10 @@ async fn accept_loop(endpoint: QuicEndpoint, socket: noq::Endpoint, acceptor: Ar
             Some(_) = tasks.join_next(), if !tasks.is_empty() => continue,
             _ = shutdown.wait_for(|stop| *stop) => break,
         };
+        let Some(inner) = weak.upgrade() else {
+            break;
+        };
+        let endpoint = QuicEndpoint { inner };
         let info = IncomingInfo {
             remote: canonical_addr(incoming.remote_address()),
             validated: incoming.remote_address_validated(),
@@ -675,6 +699,8 @@ async fn handshake(
         return;
     };
     let conn = endpoint.register_conn(connection, remote_id, remote, alpn);
+    // A connection handler must not keep a dropped endpoint alive.
+    drop(endpoint);
     acceptor.handle(conn).await;
 }
 

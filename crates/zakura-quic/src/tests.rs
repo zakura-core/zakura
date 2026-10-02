@@ -462,6 +462,31 @@ async fn shutdown_closes_connections_within_the_bound() {
     .unwrap();
 }
 
+/// An embedder that drops its node without calling `shutdown` must still get
+/// its port back.
+#[tokio::test]
+async fn dropping_the_last_handle_closes_connections_and_frees_the_port() {
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        let mut server = server();
+        let port = server.endpoint.local_addrs()[0];
+        let client = client();
+        let conn = client.connect(server.addr(), ALPN).await.unwrap();
+        let inbound = server.handled.recv().await.unwrap();
+
+        drop(server);
+        conn.closed().await;
+        drop(inbound);
+        loop {
+            if std::net::UdpSocket::bind(port).is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
 #[tokio::test]
 async fn buffers_are_read_back() {
     let client = client();

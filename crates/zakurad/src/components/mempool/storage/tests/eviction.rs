@@ -23,7 +23,10 @@ use zakura_chain::{
 };
 
 use crate::components::mempool::storage::{
-    eviction_cost::EvictionCost, policy::p2pkh_lock_script, verified_set::MAX_MEMPOOL_ANCESTORS, *,
+    eviction_cost::EvictionCost,
+    policy::p2pkh_lock_script,
+    verified_set::{MAX_MEMPOOL_ANCESTORS, MAX_MEMPOOL_PACKAGE_TRANSACTIONS},
+    *,
 };
 
 /// The ZIP-401 cost of every transaction that [`TxFactory`] builds without padding.
@@ -295,7 +298,7 @@ fn insert_chain(
 }
 
 #[test]
-fn long_chain_evicts_its_cheap_tail() {
+fn four_transaction_chain_evicts_its_cheap_tail() {
     let _init_guard = zakura_test::init();
     const CHAIN_LEN: usize = MAX_MEMPOOL_ANCESTORS + 1;
 
@@ -310,14 +313,14 @@ fn long_chain_evicts_its_cheap_tail() {
             20_000
         }
     });
-    storage.verified.assert_packages_are_exact();
+    storage.verified.assert_dependency_groups_are_bounded();
 
     let newcomer = factory.tx(10_000 + MARGINAL_FEE);
     let (result, evicted) = storage.insert_with_evicted_ids(newcomer.clone(), vec![], None);
 
     assert_eq!(result, Ok(newcomer.transaction.id()));
     assert_eq!(evicted, [tail.transaction.id()].into());
-    storage.verified.assert_packages_are_exact();
+    storage.verified.assert_dependency_groups_are_bounded();
 }
 
 #[test]
@@ -422,38 +425,28 @@ fn output(tx: &VerifiedUnminedTx, index: usize) -> OutPoint {
     OutPoint::from_usize(tx.transaction.id().mined_id(), index)
 }
 
-/// Inserts a root, then `layers` layers of two transactions that each spend both transactions
-/// in the previous layer, then a child of the last layer that pays `child_fee`.
+/// Inserts a four-transaction diamond whose leaf pays `child_fee`.
 ///
-/// Every other transaction pays 10,000 zatoshis. Each descendant of the root is reachable
-/// along many paths. Returns the root.
-fn insert_branching_dag(
+/// Every other transaction pays 10,000 zatoshis. The leaf is reachable through
+/// both children of the root. Returns the root.
+fn insert_diamond(
     storage: &mut Storage,
     factory: &mut TxFactory,
-    layers: usize,
     child_fee: u64,
 ) -> VerifiedUnminedTx {
     let root = factory.tx_with(10_000, 2, 0);
     insert(storage, &root, vec![]);
 
-    let mut previous = vec![root.clone(), root.clone()];
-    for _ in 0..layers {
-        let layer: Vec<_> = (0..2)
-            .map(|index| {
-                let tx = factory.tx_with(10_000, 2, 0);
-                let spent = previous
-                    .iter()
-                    .map(|parent| output(parent, index))
-                    .collect();
-                insert(storage, &tx, spent);
-                tx
-            })
-            .collect();
-        previous = layer;
-    }
+    let children: Vec<_> = (0..2)
+        .map(|index| {
+            let tx = factory.tx_with(10_000, 1, 0);
+            insert(storage, &tx, vec![output(&root, index)]);
+            tx
+        })
+        .collect();
 
     let child = factory.tx(child_fee);
-    let spent = previous.iter().map(|parent| output(parent, 0)).collect();
+    let spent = children.iter().map(first_output).collect();
     insert(storage, &child, spent);
 
     root
@@ -467,9 +460,9 @@ fn diamond_counts_shared_descendant_once() {
 
     // The root package pays 130,000 over four costs: 32,500 per cost.
     // Counting the high-fee descendant twice would give 46,000 per cost.
-    let root = insert_branching_dag(&mut storage, &mut factory, 1, 100_000);
+    let root = insert_diamond(&mut storage, &mut factory, 100_000);
     insert(&mut storage, &factory.tx(50_000), vec![]);
-    storage.verified.assert_packages_are_exact();
+    storage.verified.assert_dependency_groups_are_bounded();
     let before = ids(&storage);
 
     let underpaying = factory.tx(32_500 + MARGINAL_FEE - 1);
@@ -486,59 +479,143 @@ fn diamond_counts_shared_descendant_once() {
     assert_eq!(result, Ok(newcomer.transaction.id()));
     assert_eq!(evicted.len(), 4);
     assert!(evicted.contains(&root.transaction.id()));
-    storage.verified.assert_packages_are_exact();
+    storage.verified.assert_dependency_groups_are_bounded();
 }
 
 #[test]
-fn branching_dag_counts_each_descendant_once() {
+fn dense_four_transaction_group_is_accepted_but_not_a_fifth_member() {
     let _init_guard = zakura_test::init();
-    const LAYERS: usize = 40;
-    const DAG_TXS: u64 = 2 * LAYERS as u64 + 2;
-    const CHILD_FEE: u64 = 5_000_000;
-
     let mut factory = TxFactory::new();
-    let mut storage = storage_for(DAG_TXS + 1);
-
-    // A cheap independent transaction is the first victim.
-    let cheap = insert(&mut storage, &factory.tx(20_000), vec![]);
-    let root = insert_branching_dag(&mut storage, &mut factory, LAYERS, CHILD_FEE);
-    storage.verified.assert_packages_are_exact();
-
-    // A newcomer below the cheap transaction's rate plus the increment cannot evict the
-    // high-fee package instead.
-    let before = ids(&storage);
-    let underpaying = factory.tx(15_000);
-    let (result, _) = storage.insert_with_evicted_ids(underpaying, vec![], None);
+    let mut storage = storage_for(10);
+    let mut previous = Vec::new();
+    for index in 0..MAX_MEMPOOL_PACKAGE_TRANSACTIONS {
+        let tx = factory.tx_with(10_000, MAX_MEMPOOL_PACKAGE_TRANSACTIONS, 0);
+        let spent = previous
+            .iter()
+            .map(|parent| output(parent, index))
+            .collect();
+        insert(&mut storage, &tx, spent);
+        previous.push(tx);
+    }
+    // Every earlier member is a parent: this DAG has all six possible edges.
     assert_eq!(
-        result,
-        Err(ExactTipRejectionError::BelowEvictionCost.into())
+        storage
+            .verified
+            .transaction_dependencies()
+            .dependencies()
+            .values()
+            .map(HashSet::len)
+            .sum::<usize>(),
+        6
+    );
+    storage.verified.assert_dependency_groups_are_bounded();
+    let before = ids(&storage);
+    let child = factory.tx(100_000);
+    assert_eq!(
+        storage.insert(child, previous.iter().map(first_output).collect(), None),
+        Err(SameEffectsTipRejectionError::TooManyAncestors.into()),
     );
     assert_eq!(ids(&storage), before);
+}
 
-    // A high-fee newcomer evicts the cheap transaction, and is not a victim itself later.
-    let newcomer = factory.tx(10 * CHILD_FEE);
-    let (result, evicted) = storage.insert_with_evicted_ids(newcomer.clone(), vec![], None);
-    assert_eq!(result, Ok(newcomer.transaction.id()));
-    assert_eq!(evicted, [cheap].into());
-
-    // The root package is now the cheapest. It pays the child fee plus 10,000 per other
-    // transaction, over one cost per transaction.
-    let package_fee = CHILD_FEE + 10_000 * (DAG_TXS - 1);
-    let package_rate = package_fee / DAG_TXS;
-    let at_rate = factory.tx(package_rate + MARGINAL_FEE);
-    let (result, _) = storage.insert_with_evicted_ids(at_rate, vec![], None);
+#[test]
+fn fourth_child_is_rejected_without_changing_the_pool() {
+    let _init_guard = zakura_test::init();
+    let mut factory = TxFactory::new();
+    let mut storage = storage_for(10);
+    let parent = factory.tx_with(10_000, 4, 0);
+    insert(&mut storage, &parent, vec![]);
+    for index in 0..3 {
+        let child = factory.tx(10_000);
+        insert(&mut storage, &child, vec![output(&parent, index)]);
+    }
+    let before = ids(&storage);
+    let child = factory.tx(100_000);
+    let (result, evicted) = storage.insert_with_evicted_ids(child, vec![output(&parent, 3)], None);
     assert_eq!(
         result,
-        Err(ExactTipRejectionError::BelowEvictionCost.into()),
-        "the package pays a fraction of a zatoshi more than {package_rate} per cost",
+        Err(SameEffectsTipRejectionError::TooManyPackageTransactions.into())
     );
+    assert!(evicted.is_empty());
+    assert_eq!(ids(&storage), before);
+}
 
-    let above_rate = factory.tx(package_rate + 1 + MARGINAL_FEE);
-    let (result, evicted) = storage.insert_with_evicted_ids(above_rate.clone(), vec![], None);
-    assert_eq!(result, Ok(above_rate.transaction.id()));
-    assert!(evicted.contains(&root.transaction.id()));
-    assert_eq!(evicted.len() as u64, DAG_TXS);
-    storage.verified.assert_packages_are_exact();
+#[test]
+fn merging_groups_counts_siblings_and_preserves_both_groups() {
+    let _init_guard = zakura_test::init();
+    let mut factory = TxFactory::new();
+    let mut storage = storage_for(10);
+    let mut parents = Vec::new();
+    for _ in 0..2 {
+        let parent = factory.tx_with(10_000, 2, 0);
+        insert(&mut storage, &parent, vec![]);
+        let child = factory.tx(10_000);
+        insert(&mut storage, &child, vec![output(&parent, 0)]);
+        parents.push(parent);
+    }
+    let before = ids(&storage);
+    let joined = factory.tx(100_000);
+    // Only two ancestors, but the two siblings make the joined group too big.
+    assert_eq!(
+        storage.insert(
+            joined,
+            parents.iter().map(|parent| output(parent, 1)).collect(),
+            None
+        ),
+        Err(SameEffectsTipRejectionError::TooManyPackageTransactions.into()),
+    );
+    assert_eq!(ids(&storage), before);
+    storage.verified.assert_dependency_groups_are_bounded();
+}
+
+#[test]
+fn shared_descendants_connect_other_parents_into_the_group() {
+    let _init_guard = zakura_test::init();
+    let mut factory = TxFactory::new();
+    let mut storage = storage_for(10);
+    let a = factory.tx_with(10_000, 2, 0);
+    let b = factory.tx_with(10_000, 2, 0);
+    insert(&mut storage, &a, vec![]);
+    insert(&mut storage, &b, vec![]);
+    let shared = factory.tx(10_000);
+    insert(&mut storage, &shared, vec![output(&a, 0), output(&b, 0)]);
+    let child = factory.tx(10_000);
+    insert(&mut storage, &child, vec![output(&a, 1)]);
+    let before = ids(&storage);
+    let child = factory.tx(100_000);
+    // Walking B's child must reach A and A's other child, despite depth two.
+    assert_eq!(
+        storage.insert(child, vec![output(&b, 1)], None),
+        Err(SameEffectsTipRejectionError::TooManyPackageTransactions.into()),
+    );
+    assert_eq!(ids(&storage), before);
+}
+
+#[test]
+fn mining_a_parent_releases_group_capacity() {
+    let _init_guard = zakura_test::init();
+    let mut factory = TxFactory::new();
+    let mut storage = storage_for(10);
+    let parent = factory.tx_with(10_000, 3, 0);
+    insert(&mut storage, &parent, vec![]);
+    let children: Vec<_> = (0..3)
+        .map(|index| {
+            let child = factory.tx_with(10_000, 1, 0);
+            insert(&mut storage, &child, vec![output(&parent, index)]);
+            child
+        })
+        .collect();
+    let mined = [parent.transaction.id().mined_id()].into();
+    storage.clear_mined_dependencies(&mined);
+    storage.reject_and_remove_same_effects(&mined, vec![]);
+    // The children are now separate groups, so one can grow another chain.
+    let mut tail = children[0].clone();
+    for _ in 0..3 {
+        let child = factory.tx_with(10_000, 1, 0);
+        insert(&mut storage, &child, vec![first_output(&tail)]);
+        tail = child;
+    }
+    storage.verified.assert_dependency_groups_are_bounded();
 }
 
 /// Returns `tx` with `padding` more bytes of authorizing data.
@@ -593,13 +670,13 @@ fn rejecting_a_padded_variant_does_not_reject_the_original() {
     );
 }
 
-/// Returns the transactions that eviction would remove to admit `incoming`, or `None` if the
-/// mempool would reject it, by recomputing every package from scratch for each victim.
+/// Returns the eviction victims or admission error for `incoming`, recomputing
+/// every package from scratch for each victim.
 fn reference_eviction(
     storage: &Storage,
     incoming: &VerifiedUnminedTx,
     parents: &[transaction::Hash],
-) -> Option<HashSet<transaction::Hash>> {
+) -> Result<HashSet<transaction::Hash>, MempoolError> {
     let transactions = storage.verified.transactions();
     let dependencies = storage.verified.transaction_dependencies().dependencies();
     let dependents = storage.verified.transaction_dependencies().dependents();
@@ -625,6 +702,22 @@ fn reference_eviction(
         unavailable.extend(walk(parent, dependencies, &HashSet::new()));
     }
 
+    if unavailable.len() > MAX_MEMPOOL_ANCESTORS {
+        return Err(SameEffectsTipRejectionError::TooManyAncestors.into());
+    }
+    let mut connected = dependencies.clone();
+    for (&parent, children) in dependents {
+        connected.entry(parent).or_default().extend(children);
+    }
+    let mut group = HashSet::new();
+    for &parent in parents {
+        group.insert(parent);
+        group.extend(walk(parent, &connected, &HashSet::new()));
+    }
+    if group.len() >= MAX_MEMPOOL_PACKAGE_TRANSACTIONS {
+        return Err(SameEffectsTipRejectionError::TooManyPackageTransactions.into());
+    }
+
     let needed = (storage.total_cost() + incoming.cost()).saturating_sub(storage.tx_cost_limit);
     let incoming = VerifiedSet::eviction_cost(incoming);
     let mut evicted = HashSet::new();
@@ -645,10 +738,11 @@ fn reference_eviction(
                 let score = VerifiedSet::eviction_cost(tx).max(combined);
                 (score, Reverse(tx.time), tx_id, package)
             })
-            .min_by(|a, b| (a.0, a.1, a.2).cmp(&(b.0, b.1, b.2)))?;
+            .min_by(|a, b| (a.0, a.1, a.2).cmp(&(b.0, b.1, b.2)))
+            .ok_or(ExactTipRejectionError::BelowEvictionCost)?;
 
         if !incoming.exceeds_by_increment(score) {
-            return None;
+            return Err(ExactTipRejectionError::BelowEvictionCost.into());
         }
 
         freed += package
@@ -659,7 +753,7 @@ fn reference_eviction(
         evicted.extend(package);
     }
 
-    Some(evicted)
+    Ok(evicted)
 }
 
 proptest! {
@@ -705,8 +799,8 @@ proptest! {
         }
     }
 
-    /// Eviction matches a brute-force reference on random transaction graphs, and every
-    /// package stays exact after inserts, evictions, and mined transactions.
+    /// Admission and eviction match a brute-force reference on random graphs.
+    /// Dependency groups stay bounded after inserts, evictions, and mining.
     #[test]
     fn eviction_matches_reference_on_random_graphs(
         steps in vec(
@@ -745,7 +839,7 @@ proptest! {
                 let mined: HashSet<_> = [mined].into();
                 storage.clear_mined_dependencies(&mined);
                 storage.reject_and_remove_same_effects(&mined, vec![]);
-                storage.verified.assert_packages_are_exact();
+                storage.verified.assert_dependency_groups_are_bounded();
                 continue;
             }
 
@@ -766,21 +860,18 @@ proptest! {
             let before = ids(&storage);
 
             let (result, evicted) = storage.insert_with_evicted_ids(tx.clone(), spent, None);
-            storage.verified.assert_packages_are_exact();
+            storage.verified.assert_dependency_groups_are_bounded();
             prop_assert!(storage.total_cost() <= limit_txs * COST);
 
             match expected {
-                Some(expected) => {
+                Ok(expected) => {
                     prop_assert_eq!(result, Ok(tx.transaction.id()));
                     let evicted: HashSet<_> =
                         evicted.iter().map(UnminedTxId::mined_id).collect();
                     prop_assert_eq!(evicted, expected);
                 }
-                None => {
-                    prop_assert_eq!(
-                        result,
-                        Err(ExactTipRejectionError::BelowEvictionCost.into())
-                    );
+                Err(error) => {
+                    prop_assert_eq!(result, Err(error));
                     prop_assert!(evicted.is_empty());
                     prop_assert_eq!(ids(&storage), before);
                 }

@@ -26,7 +26,7 @@ use zcash_script::solver;
 
 use self::{
     eviction_list::EvictionList,
-    verified_set::{VerifiedSet, MAX_MEMPOOL_ANCESTORS},
+    verified_set::{VerifiedSet, MAX_MEMPOOL_ANCESTORS, MAX_MEMPOOL_PACKAGE_TRANSACTIONS},
 };
 use super::{
     config, downloads::TransactionDownloadVerifyError, pending_outputs::PendingOutputs,
@@ -117,6 +117,14 @@ pub enum SameEffectsTipRejectionError {
         unconfirmed transactions in the mempool"
     )]
     TooManyAncestors,
+
+    /// Adding the transaction would exceed the limit for a connected group of
+    /// unconfirmed parents and children.
+    #[error(
+        "transaction rejected because its connected unconfirmed dependency group \
+        would exceed {MAX_MEMPOOL_PACKAGE_TRANSACTIONS} transactions"
+    )]
+    TooManyPackageTransactions,
 }
 
 /// Transactions rejected based only on their effects (spends, outputs, transaction header).

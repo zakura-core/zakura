@@ -22,7 +22,7 @@ use zakura_quic::{NodeAddr, NodeId, NodeSecretKey};
 use crate::zakura::{
     canonical_ip, BlockSyncStatus, ServiceAdmissionDecision, ServicePeerDirection,
     ServicePeerLimits, ServicePeerSnapshot, ZakuraConnId, ZakuraNetworkId, ZakuraPeerId,
-    MAX_BS_BLOCKS_PER_REQUEST, MAX_BS_RESPONSE_BYTES,
+    MAX_BS_BLOCKS_PER_REQUEST, MAX_BS_RESPONSE_BYTES, ZAKURA_ALPN_MISMATCH_BACKOFF,
 };
 
 /// Native discovery stream kind.
@@ -848,6 +848,8 @@ pub struct ZakuraDiscoveryEntry {
     last_short_lived_exchange: Option<u64>,
     last_confirmed: Option<u64>,
     failure_count: u32,
+    /// No dial before this Unix time after an ALPN mismatch (zakura-quic DIAL-5).
+    alpn_backoff_until: Option<u64>,
 }
 
 impl ZakuraDiscoveryEntry {
@@ -2458,6 +2460,12 @@ impl ZakuraDiscoveryHandle {
         inner.book.mark_dial_failure(node_id, current_unix_secs());
     }
 
+    /// Marks a dial that failed on an ALPN mismatch (zakura-quic DIAL-5).
+    pub async fn mark_alpn_mismatch(&self, node_id: &NodeId) {
+        let mut inner = self.inner.lock().await;
+        inner.book.mark_alpn_mismatch(node_id, current_unix_secs());
+    }
+
     /// Marks a completed short-lived discovery exchange for local redial backoff.
     pub async fn mark_short_lived_exchange(&self, node_id: &NodeId) {
         let mut inner = self.inner.lock().await;
@@ -2734,6 +2742,7 @@ impl ZakuraDiscoveryBook {
                 last_success: None,
                 last_short_lived_exchange: None,
                 failure_count: 0,
+                alpn_backoff_until: None,
             });
         candidate.direct_addrs.extend(direct_addrs);
         candidate.direct_addrs.sort_unstable();
@@ -2923,6 +2932,7 @@ impl ZakuraDiscoveryBook {
                     && self.local_node_id != Some(entry.record.body.node_id)
                     && !entry_is_expired(entry, now)
                     && !entry_in_dial_backoff(entry, now, dial_backoff.0, dial_backoff.1)
+                    && !in_alpn_backoff(entry.alpn_backoff_until, now)
                     && !entry_in_short_lived_exchange_backoff(
                         entry,
                         now,
@@ -2939,6 +2949,7 @@ impl ZakuraDiscoveryBook {
                     || in_flight_node_ids.contains(&candidate.node_id)
                     || self.local_node_id == Some(candidate.node_id)
                     || self.entries.contains_key(&candidate.node_id)
+                    || in_alpn_backoff(candidate.alpn_backoff_until, now)
                     || entry_metadata_in_dial_backoff(
                         candidate.last_dial_attempt,
                         candidate.failure_count,
@@ -3025,6 +3036,20 @@ impl ZakuraDiscoveryBook {
         }
         if let Some(candidate) = self.static_candidates.get_mut(node_id) {
             candidate.failure_count = candidate.failure_count.saturating_add(1);
+        }
+    }
+
+    /// Marks a dial that failed on an ALPN mismatch. The node isn't dialed again
+    /// for [`ZAKURA_ALPN_MISMATCH_BACKOFF`], whatever addresses it advertises
+    /// next (zakura-quic DIAL-5).
+    pub fn mark_alpn_mismatch(&mut self, node_id: &NodeId, now: u64) {
+        let until = now.saturating_add(ZAKURA_ALPN_MISMATCH_BACKOFF.as_secs());
+        self.mark_dial_failure(node_id, now);
+        if let Some(entry) = self.entries.get_mut(node_id) {
+            entry.alpn_backoff_until = Some(until);
+        }
+        if let Some(candidate) = self.static_candidates.get_mut(node_id) {
+            candidate.alpn_backoff_until = Some(until);
         }
     }
 
@@ -3187,6 +3212,7 @@ impl ZakuraDiscoveryBook {
                 last_short_lived_exchange: None,
                 last_confirmed: metadata.last_confirmed,
                 failure_count: metadata.failure_count,
+                alpn_backoff_until: None,
             },
         );
         self.evict_to_limits(now);
@@ -3298,6 +3324,8 @@ struct ZakuraStaticDiscoveryCandidate {
     last_success: Option<u64>,
     last_short_lived_exchange: Option<u64>,
     failure_count: u32,
+    /// No dial before this Unix time after an ALPN mismatch (zakura-quic DIAL-5).
+    alpn_backoff_until: Option<u64>,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -3837,6 +3865,10 @@ fn entry_metadata_in_dial_backoff(
         dial_backoff_max.as_secs(),
     );
     now < last_dial_attempt.saturating_add(backoff)
+}
+
+fn in_alpn_backoff(alpn_backoff_until: Option<u64>, now: u64) -> bool {
+    alpn_backoff_until.is_some_and(|until| now < until)
 }
 
 fn entry_in_short_lived_exchange_backoff(
@@ -6734,6 +6766,56 @@ mod tests {
                 &mut rng,
             ),
             vec![candidate_for(&failed, false)]
+        );
+    }
+
+    // V12 F-305594: an ALPN mismatch used to count as an ordinary failure on
+    // the node, so a record rotated to a fresh address became dialable after
+    // 60 s. The node now waits out the ten-minute floor whatever it advertises.
+    #[test]
+    fn discovery_book_alpn_backoff_survives_an_address_rotation() {
+        let mut book = ZakuraDiscoveryBook::default();
+        let secret_key = secret_key();
+        let record_at = |sequence, addr| {
+            let mut body = body(&secret_key);
+            body.sequence = sequence;
+            body.direct_addrs = vec![addr];
+            body.services = vec![service(1)];
+            body.expires_at_unix_secs = NOW + DEFAULT_DISCOVERY_MAX_RECORD_TTL.as_secs();
+            ZakuraNodeRecord::sign(body, &secret_key).expect("test record signs")
+        };
+        let first = record_at(1, test_addr(1));
+        let node_id = first.body.node_id;
+        import_confirmed_record(&mut book, first).unwrap();
+        book.mark_dial_attempt(&node_id, NOW);
+        book.mark_alpn_mismatch(&node_id, NOW);
+
+        let rotated = record_at(2, test_addr(2));
+        assert_eq!(
+            import_confirmed_record(&mut book, rotated.clone()).unwrap(),
+            ImportOutcome::Updated
+        );
+
+        let candidates_at = |book: &ZakuraDiscoveryBook, now: u64| {
+            book.dial_candidates(
+                10,
+                &[service(1)],
+                &[],
+                DialCandidateExclusions {
+                    connected_node_ids: &[],
+                    in_flight_node_ids: &[],
+                },
+                now,
+                (Duration::from_secs(60), Duration::from_secs(3_600)),
+                &mut StdRng::seed_from_u64(7),
+            )
+        };
+        let floor = ZAKURA_ALPN_MISMATCH_BACKOFF.as_secs();
+        assert!(candidates_at(&book, NOW + 61).is_empty());
+        assert!(candidates_at(&book, NOW + floor - 1).is_empty());
+        assert_eq!(
+            candidates_at(&book, NOW + floor),
+            vec![candidate_for(&rotated, false)]
         );
     }
 

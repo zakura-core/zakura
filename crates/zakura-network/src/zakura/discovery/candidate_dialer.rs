@@ -24,7 +24,7 @@ use super::redial::ZAKURA_REDIAL_HEALTHY_CONNECTION;
 use super::trace::DiscoveryDialResultEvent;
 use crate::zakura::{
     canonical_ip, ZakuraEndpoint, ZakuraHandlerError, ZakuraLocalLimits, ZakuraPeerId,
-    ZakuraServiceId, ZAKURA_ALPN_MISMATCH_BACKOFF,
+    ZakuraServiceId,
 };
 
 /// How often the discovery dialer wakes to look for new candidates.
@@ -364,16 +364,14 @@ fn apply_discovery_ip_dial_result(
                 dial_backoff_by_node_ip.remove(&(node_id, *ip));
             }
         }
+        // The ALPN mismatch floor applies to the node, not to each address: an
+        // aggregate dial error doesn't say which address mismatched (DIAL-5).
         DiscoveryDialResult::Failed | DiscoveryDialResult::AlpnMismatch => {
             for ip in ips {
                 let failure_count = dial_backoff_by_node_ip
                     .get(&(node_id, *ip))
                     .map_or(1, |backoff| backoff.failure_count.saturating_add(1));
-                let mut wait =
-                    discovery_ip_dial_backoff(failure_count, dial_backoff.0, dial_backoff.1);
-                if result == DiscoveryDialResult::AlpnMismatch {
-                    wait = wait.max(ZAKURA_ALPN_MISMATCH_BACKOFF);
-                }
+                let wait = discovery_ip_dial_backoff(failure_count, dial_backoff.0, dial_backoff.1);
                 dial_backoff_by_node_ip.insert(
                     (node_id, *ip),
                     DiscoveryIpBackoff {
@@ -552,7 +550,7 @@ async fn apply_discovery_dial_result(
             metrics::counter!("zakura.p2p.discovery.dial.failed").increment(1);
         }
         DiscoveryDialResult::AlpnMismatch => {
-            discovery.mark_dial_failure(node_id).await;
+            discovery.mark_alpn_mismatch(node_id).await;
             metrics::counter!("zakura.p2p.discovery.dial.alpn_mismatch").increment(1);
         }
         DiscoveryDialResult::LocalResourceLimit => {
@@ -724,34 +722,41 @@ mod tests {
         );
     }
 
+    // V12 F-305587: an ALPN mismatch from one stale address used to put every
+    // address of the record into the ten-minute floor. The floor now lives on
+    // the node in the discovery book, and each address gets the ordinary backoff.
     #[test]
-    fn alpn_mismatch_backs_off_at_least_ten_minutes() {
+    fn alpn_mismatch_gives_each_address_the_ordinary_backoff() {
         let node = node_id(1);
-        let ip = IpAddr::from([93, 184, 216, 34]);
+        let ips = [
+            IpAddr::from([93, 184, 216, 34]),
+            IpAddr::from([198, 51, 100, 7]),
+        ];
         let now = Instant::now();
         let mut backoff_by_node_ip = HashMap::new();
 
         apply_discovery_ip_dial_result(
             &mut backoff_by_node_ip,
             node,
-            &[ip],
+            &ips,
             DiscoveryDialResult::AlpnMismatch,
             (Duration::from_secs(60), Duration::from_secs(3_600)),
             now,
         );
 
-        let just_before = now + ZAKURA_ALPN_MISMATCH_BACKOFF - Duration::from_secs(1);
-        assert!(discovery_ip_is_in_backoff(
-            &backoff_by_node_ip,
-            node,
-            ip,
-            just_before
-        ));
-        assert!(!discovery_ip_is_in_backoff(
-            &backoff_by_node_ip,
-            node,
-            ip,
-            now + ZAKURA_ALPN_MISMATCH_BACKOFF
-        ));
+        for ip in ips {
+            assert!(discovery_ip_is_in_backoff(
+                &backoff_by_node_ip,
+                node,
+                ip,
+                now + Duration::from_secs(59)
+            ));
+            assert!(!discovery_ip_is_in_backoff(
+                &backoff_by_node_ip,
+                node,
+                ip,
+                now + Duration::from_secs(60)
+            ));
+        }
     }
 }

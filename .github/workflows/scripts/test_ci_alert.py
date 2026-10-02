@@ -30,11 +30,23 @@ def run(number, conclusion, event="push", attempt=1):
     }
 
 
-def kind(current, runs, attempts_before=(), newer_attempt=None):
-    """Returns the alert kind for `current`, given its earlier attempts (newest first) and runs."""
+def kind(current, runs, attempts_before=(), attempts_after=(), retried=None):
+    """Returns the alert kind for `current`, given its other attempts and the completed runs.
+
+    Attempts are newest first. `retried` maps a run number to the conclusions of
+    that run's attempts before its latest one, newest first.
+    """
+    retried = retried or {}
+
+    def resolve(run):
+        """Returns `run`'s verdict, looking behind an undecided latest attempt."""
+        if ci_alert.is_decided(run["conclusion"]):
+            return run["conclusion"]
+        return ci_alert.newest_verdict(retried.get(run["run_number"], []))
+
     newest_first = sorted(runs, key=lambda other: other["run_number"], reverse=True)
     previous, contradicted = ci_alert.verdicts(
-        current, iter(attempts_before), newer_attempt, newest_first
+        current, iter(attempts_before), iter(attempts_after), newest_first, resolve
     )
     return ci_alert.alert_kind(current, previous, contradicted)
 
@@ -108,11 +120,30 @@ class AlertKindTest(unittest.TestCase):
             kind(run(2, "failure"), [run(1, "success"), run(3, "cancelled")]), "failure"
         )
 
-    def test_a_newer_attempt_with_the_opposite_verdict_suppresses_the_alert(self):
+    def test_a_later_attempt_with_the_opposite_verdict_suppresses_the_alert(self):
         history = [run(4, "success")]
-        self.assertIsNone(kind(run(5, "failure"), history, newer_attempt="success"))
-        self.assertEqual(kind(run(5, "failure"), history, newer_attempt="failure"), "failure")
-        self.assertEqual(kind(run(5, "failure"), history, newer_attempt="cancelled"), "failure")
+        self.assertIsNone(kind(run(5, "failure"), history, attempts_after=["success"]))
+        self.assertEqual(kind(run(5, "failure"), history, attempts_after=["failure"]), "failure")
+        self.assertEqual(kind(run(5, "failure"), history, attempts_after=["cancelled"]), "failure")
+        # A cancelled newest attempt does not hide a passing attempt before it.
+        self.assertIsNone(
+            kind(run(5, "failure"), history, attempts_after=["cancelled", "success"])
+        )
+
+    def test_a_cancelled_retry_keeps_the_runs_earlier_verdict(self):
+        # Run 101 failed, then its retry was cancelled: 102 still recovers from it.
+        history = [run(100, "success"), run(101, "cancelled", attempt=2)]
+        self.assertEqual(
+            kind(run(102, "success"), history, retried={101: ["failure"]}), "recovery"
+        )
+        # Run 100 passed, then its retry was cancelled: 101's failure is fresh.
+        history = [run(99, "failure"), run(100, "cancelled", attempt=2)]
+        self.assertEqual(
+            kind(run(101, "failure"), history, retried={100: ["success"]}), "failure"
+        )
+        # A newer run whose retry was cancelled still passed, so main moved on.
+        history = [run(100, "success"), run(102, "cancelled", attempt=2)]
+        self.assertIsNone(kind(run(101, "failure"), history, retried={102: ["success"]}))
 
     def test_rerun_follows_its_newest_decided_attempt(self):
         # Attempt 2 was cancelled, attempt 1 failed.
@@ -148,6 +179,29 @@ class AlertTextTest(unittest.TestCase):
         }
         self.assertIn("failed on `main`", self.alert(responses, 50, 1))
         self.assertIsNone(self.alert(responses, 50, 2))
+
+    def test_a_cancelled_retry_of_an_older_run_keeps_its_failure(self):
+        current = run(102, "success")
+        responses = {
+            f"{BASE}/runs/102/attempts/1": current,
+            f"{BASE}/runs/102": current,
+            history_path(1): {
+                "workflow_runs": [current, run(101, "cancelled", attempt=2), run(100, "success")]
+            },
+            f"{BASE}/runs/101/attempts/1": run(101, "failure"),
+        }
+        self.assertIn("is passing again on `main`", self.alert(responses, 102, 1))
+
+    def test_a_passing_attempt_behind_a_cancelled_retry_suppresses_the_failure(self):
+        failed, passed = run(50, "failure"), run(50, "success", attempt=2)
+        cancelled = run(50, "cancelled", attempt=3)
+        responses = {
+            f"{BASE}/runs/50/attempts/1": failed,
+            f"{BASE}/runs/50/attempts/2": passed,
+            f"{BASE}/runs/50": cancelled,
+            history_path(1): {"workflow_runs": [cancelled, run(49, "success")]},
+        }
+        self.assertIsNone(self.alert(responses, 50, 1))
 
     def test_previous_verdict_is_found_beyond_the_first_history_page(self):
         size = ci_alert.HISTORY_PAGE_SIZE

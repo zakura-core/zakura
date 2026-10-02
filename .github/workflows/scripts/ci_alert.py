@@ -4,8 +4,9 @@
 `ci-alerts.yml` runs this after a watched workflow completes on `main`, once per
 completed attempt. Each attempt is judged against the verdict before it: the
 newest earlier attempt of the same run that reached a verdict, or else the
-newest such run of the same workflow and event. Cancelled, skipped and stale
-attempts never count as a verdict.
+newest earlier run of the same workflow and event that has one. A run's verdict
+is that of its newest attempt that reached one. Cancelled, skipped and stale
+attempts never count as a verdict, so a cancelled re-run cannot erase one.
 
 A push failure is posted only when the previous verdict was not a failure, so a
 broken `main` is reported once rather than on every merge. Every scheduled
@@ -50,10 +51,37 @@ def is_failure(conclusion):
     return conclusion in FAILED
 
 
+def newest_verdict(conclusions):
+    """Returns the first decided conclusion in `conclusions` (newest first), or `None`."""
+    return next((conclusion for conclusion in conclusions if is_decided(conclusion)), None)
+
+
 def earlier_attempts(api, base, run_id, attempt):
     """Yields the conclusions of the run's attempts before `attempt`, newest first."""
     for earlier in range(attempt - 1, 0, -1):
         yield api(f"{base}/runs/{run_id}/attempts/{earlier}")["conclusion"]
+
+
+def later_attempts(api, base, latest, attempt):
+    """Yields the conclusions of the run's attempts after `attempt`, newest first.
+
+    `latest` is the run as its newest attempt reports it.
+    """
+    if latest["run_attempt"] <= attempt:
+        return
+    yield latest["conclusion"] if latest["status"] == "completed" else None
+    for later in range(latest["run_attempt"] - 1, attempt, -1):
+        yield api(f"{base}/runs/{latest['id']}/attempts/{later}")["conclusion"]
+
+
+def run_verdict(api, base, run):
+    """Returns the verdict of a completed run: its newest decided attempt's conclusion, or `None`.
+
+    A cancelled re-run does not erase the verdict of an attempt before it.
+    """
+    if is_decided(run["conclusion"]):
+        return run["conclusion"]
+    return newest_verdict(earlier_attempts(api, base, run["id"], run["run_attempt"]))
 
 
 def history(api, base, run):
@@ -68,25 +96,28 @@ def history(api, base, run):
             return
 
 
-def verdicts(current, attempts_before, newer_attempt, runs):
+def verdicts(current, attempts_before, attempts_after, runs, resolve):
     """Returns `(previous, contradicted)` for the attempt `current`.
 
-    `previous` is the verdict `current` follows: the first decided conclusion in
-    `attempts_before` (newest first), or else the newest decided run in `runs`
-    (newest first) older than `current`. It is `None` when nothing decided came
-    first. `contradicted` says whether `newer_attempt` or a newer decided run
-    reached the opposite verdict.
+    `previous` is the verdict `current` follows: the newest decided conclusion in
+    `attempts_before`, or else the verdict of the newest older run in `runs` that
+    has one. It is `None` when nothing decided came first. `contradicted` says
+    whether a later attempt of the same run, or a newer run, reached the opposite
+    verdict. Attempts and runs are newest first, and `resolve` gives a run's
+    verdict.
     """
     failed = is_failure(current["conclusion"])
-    contradicted = is_decided(newer_attempt) and is_failure(newer_attempt) != failed
-    previous = next((conclusion for conclusion in attempts_before if is_decided(conclusion)), None)
+    later = newest_verdict(attempts_after)
+    contradicted = is_decided(later) and is_failure(later) != failed
+    previous = newest_verdict(attempts_before)
     for other in runs:
         if other["run_number"] > current["run_number"]:
-            if is_decided(other["conclusion"]) and is_failure(other["conclusion"]) != failed:
+            verdict = resolve(other)
+            if is_decided(verdict) and is_failure(verdict) != failed:
                 contradicted = True
         elif other["run_number"] < current["run_number"]:
-            if previous is None and is_decided(other["conclusion"]):
-                previous = other["conclusion"]
+            if previous is None:
+                previous = resolve(other)
             if previous is not None:
                 break
     return previous, contradicted
@@ -149,16 +180,12 @@ def alert_text(repository, run_id, attempt, api=gh_api):
     base = f"repos/{repository}/actions"
     current = api(f"{base}/runs/{run_id}/attempts/{attempt}")
     latest = api(f"{base}/runs/{run_id}")
-    newer_attempt = (
-        latest["conclusion"]
-        if latest["run_attempt"] > attempt and latest["status"] == "completed"
-        else None
-    )
     previous, contradicted = verdicts(
         current,
         earlier_attempts(api, base, run_id, attempt),
-        newer_attempt,
+        later_attempts(api, base, latest, attempt),
         history(api, base, current),
+        lambda run: run_verdict(api, base, run),
     )
     kind = alert_kind(current, previous, contradicted)
     if kind is None:

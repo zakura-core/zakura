@@ -1,6 +1,6 @@
 # Spec: `zakura-quic` transport
 
-Status: draft for review, 2026-10-02. Version 0.2.
+Status: draft for review, 2026-10-02. Version 0.3.
 This document is authoritative for the `zakura-quic` crate, its configuration,
 its wire behavior and the Zakura noq fork.
 [Decision 0003](../decisions/zakura/0003-zakura-quic-transport.md) records the
@@ -9,7 +9,9 @@ evidence and step order; they live outside this repository.
 
 Version 0.2 matches the first implementation (zakura draft PR). It changes
 DEP-6, SOCK-1, WIRE-9, ADM-1, ADM-3, PATH-3, OBS-3, API-2, API-3, API-6 and
-API-7; §17a lists each change.
+API-7; §17a lists each change. Version 0.3 answers the V12 audit of that
+implementation. It changes SOCK-11, ADM-3, PATH-2, DIAL-4, DIAL-5, CTRL-17,
+CTRL-22 and API-7; §17b lists each change.
 
 ## 0. Conventions
 
@@ -182,7 +184,9 @@ at fork tag `zakura-iroh-v1.1.0-rc.1`, and it keeps their MIT/Apache-2.0 notices
   bind, the advertised-address logic in `zakura-network` lists interfaces itself
   (`getifaddrs`), replacing netwatch.
 - **SOCK-11.** Every `SocketAddr` that crosses the `zakura-quic` boundary MUST be
-  canonical: an `::ffff:a.b.c.d` address becomes `a.b.c.d`.
+  canonical: an `::ffff:a.b.c.d` address becomes `a.b.c.d`. Other IPv6
+  addresses keep their scope ID and flow info, because a link-local address
+  needs its scope ID to be dialable.
 
 ## 7. Admission
 
@@ -208,16 +212,21 @@ work. Stage 2 runs after TLS proves the `NodeId` and is today's Zakura logic.
      handshakes in progress;
   4. `Refuse` when the endpoint has `max_pending_handshakes` handshakes in progress;
   5. `Retry` when `retry_threshold` is set, `validated` is false, and pending
-     handshakes exceed `retry_threshold`;
+     handshakes reach `retry_threshold`;
   6. `Accept` otherwise.
   Rules apply in that order. Zakura's acceptor applies rules 1, 2 and 4: it
-  counts `pending_from_ip` with the IP's established connections, and counts
+  counts `pending_from_ip` with the IP's control handshakes and established
+  connections, and counts
   `pending_total` with the control handshakes holding `max_pending_handshakes`
   permits. The endpoint applies rules 3 and 5 after the acceptor returns
   `Accept`. Rules 3 and 4 both refuse, so their order doesn't change the result.
   Zakura's acceptor also refuses when the `max_connections` cap is full, and
   ignores attempts once shutdown starts. Zakura has no IP ban list yet, so
   rule 1 never fires.
+
+  A control handshake is an inbound connection past TLS that hasn't
+  registered yet. The transport stops counting a connection when TLS
+  finishes, so Zakura counts it against its IP from then until registration.
 - **ADM-4.** `admit` MUST NOT block. It reads in-memory state only.
 - **ADM-5.** The endpoint MUST set:
   - `ServerConfig::max_incoming` to `max_incoming`;
@@ -252,9 +261,15 @@ work. Stage 2 runs after TLS proves the `NodeId` and is today's Zakura logic.
   handshake that completes and close the others with application code 0. It
   fails only when all attempts fail.
 - **DIAL-4.** The handshake deadline (ADM-6) also applies to each dial attempt.
+  A caller's timeout around the whole dial MUST cover the last attempt:
+  `dial_stagger` × (addresses − 1) plus the handshake deadline, or the idle
+  timeout when the deadline is unset.
 - **DIAL-5.** An ALPN mismatch MUST surface as `ConnectFailed(AlpnMismatch)`.
   `zakura-network` MUST back off from that peer for at least 10 minutes, so the
-  node doesn't redial another cohort in a loop.
+  node doesn't redial another cohort in a loop. The backoff applies to the
+  node ID, whatever addresses its later records advertise. Each address keeps
+  the ordinary dial backoff, because the dial error doesn't say which address
+  mismatched.
 - **DIAL-6.** The dialer's admitted IP is the address of the winning attempt.
 - **DIAL-7.** The dialer MUST NOT open extra multipath paths. It MAY do so in a
   later spec version.
@@ -292,12 +307,12 @@ Rules for every key:
 | CTRL-14 | `mtu_discovery` | bool | `true` | — | `mtu_discovery_config` (`None` when off) | |
 | CTRL-15 | `path_keep_alive_interval_secs` | u32 | 5 | 1 – 60 | `default_path_keep_alive_interval` | Today's value (Iroh forces 5 s) |
 | CTRL-16 | `path_idle_timeout_secs` | u32 | 15 | 5 – CTRL-10 | `default_path_max_idle_timeout` | Today's value (Iroh forces 15 s). noq never idles out the last path; CTRL-10 governs it. |
-| CTRL-17 | `handshake_timeout_secs` | optional u32 | unset | 2 – 60 | tokio timeout around `Connecting` | **New**, off by default. Unset matches today: only the 150 s idle timeout bounds a handshake. |
+| CTRL-17 | `handshake_timeout_secs` | optional u32 | 10 | 2 – 60 | tokio timeout around `Connecting` | **New**. Iroh had no deadline: only the 150 s idle timeout bounded a handshake. ADM-3 rule 4 makes a stalled handshake hold an admission slot, so a 10 s default bounds it. |
 | CTRL-18 | `max_incoming` | u32 | 65,536 | 16 – 65,536 | `ServerConfig::max_incoming` | Today's value (noq default; Iroh has no endpoint-level setter) |
 | CTRL-19 | `incoming_buffer_bytes` | u64 | 10 MiB | 4,096 – 10 MiB | `incoming_buffer_size` | Today's value (noq default). 0-RTT is refused, so only Initial packets wait here. |
 | CTRL-20 | `incoming_buffer_total_bytes` | u64 | 100 MiB | ≥ CTRL-19, ≤ 100 MiB | `incoming_buffer_size_total` | Today's value (noq default) |
 | CTRL-21 | `max_pending_per_ip` | optional u32 | unset | 1 – 64 | acceptor (ADM-3) | **New**, off by default |
-| CTRL-22 | `retry_threshold` | optional u32 | unset | 0 – CTRL-18 | acceptor (ADM-3); 0 = always Retry unvalidated sources | **New**, off by default: the acceptor never sends Retry |
+| CTRL-22 | `retry_threshold` | optional u32 | 8 | 0 – CTRL-18 | acceptor (ADM-3); 0 = always Retry unvalidated sources; CTRL-18 = never | **New**. Iroh never sent Retry. With 8, spoofed sources hold at most 8 of the `max_pending_handshakes` slots, and honest peers pay one extra round trip only while 8 handshakes are pending. |
 | CTRL-23 | `dial_stagger_ms` | u32 | 250 | 0 – 5,000 | dialer (DIAL-3) | **New** |
 | CTRL-24 | `kernel_drop_poll_secs` | u32 | 10 | 1 – 300 | SOCK-7 | **New**, Linux only |
 | CTRL-25 | `qlog_dir` | optional path | unset | — | `qlog_from_path` | Only with the `qlog` cargo feature; startup MUST fail if set without it |
@@ -338,6 +353,9 @@ These are not configurable. Changing one needs a spec change.
   `Path::close()`.
   - If `close` returns `LastOpenPath`, the endpoint MUST close the connection.
   - Peer-opened paths from IPs that aren't banned stay open.
+  - When path events lag, the endpoint MUST rebuild its set of open paths from
+    `Connection::path` and apply this check to each path it finds. A peer can
+    cause the lag on purpose.
 - **PATH-3.** A migration of path 0 to a new address MUST get the same ban check
   as PATH-2. noq 1.2 emits no event when path 0 migrates. The endpoint therefore
   MUST compare path 0's `remote_address()` with the last seen value at each
@@ -436,6 +454,8 @@ The public surface of `zakura-quic`. Changing it is a semver change of the crate
   Dropping the last `QuicEndpoint` handle without `shutdown` MUST still stop
   accepting, close every connection with code 0 and free the sockets, without
   the wait. Spawned tasks MUST NOT hold a handle that keeps the endpoint alive.
+  That includes a task waiting on a peer's handshake. After `shutdown`, other
+  handles stay valid but can no longer dial or serve.
 - **API-8.** The testkit's `LocalEndpointFactory` MUST build `zakura-quic`
   endpoints bound to `127.0.0.1:0` with production settings, except where a test
   overrides a `QuicConfig` field.
@@ -593,3 +613,22 @@ The first implementation changed these requirements:
 - **API-7.** Dropping the last handle also closes the endpoint. An embedded
   node that drops its future without calling `shutdown` got its port back
   under Iroh and must still get it back.
+
+## 17b. Changes in version 0.3
+
+The V12 audit of the first implementation (run 8760) changed these
+requirements:
+
+- **SOCK-11.** Canonicalization keeps IPv6 scope IDs (F-305595).
+- **ADM-3.** Rule 2 counts control handshakes against their IP (F-305585), and
+  rule 5 fires when pending handshakes reach the threshold, as implemented.
+- **PATH-2.** Lagged path events trigger a rebuild of the open path set
+  (F-305586).
+- **DIAL-4.** A whole-dial timeout covers the last staggered attempt (F-305593).
+- **DIAL-5.** The 10-minute backoff applies to the node ID, not to each address
+  (F-305587, F-305594).
+- **CTRL-17, CTRL-22.** The handshake deadline defaults to 10 s and the Retry
+  threshold to 8 (F-305590). Without them, spoofed Initials held every
+  admission slot for 150 s and Zakura refused every honest inbound peer.
+- **API-7.** Handshake tasks hold the endpoint weakly (F-305588), and
+  `shutdown` drops its sockets while other handles live (F-305596).

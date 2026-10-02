@@ -21,10 +21,9 @@ use super::{super::SameEffectsTipRejectionError, eviction_cost::EvictionCost};
 
 /// The most transactions in a connected group of unconfirmed dependencies.
 ///
-/// Counting parents, children, and siblings bounds both package width and depth.
-/// Four transactions have at most six dependency edges, so package scores can
-/// be recomputed directly without cached ancestor totals.
-pub(super) const MAX_MEMPOOL_PACKAGE_TRANSACTIONS: usize = 4;
+/// A group is a standalone transaction or one parent and one child. This bounds
+/// unconfirmed dependency depth to one edge and excludes branches and joins.
+pub(super) const MAX_MEMPOOL_PACKAGE_TRANSACTIONS: usize = 2;
 
 /// The most ancestors of a transaction in a bounded dependency group.
 pub(super) const MAX_MEMPOOL_ANCESTORS: usize = MAX_MEMPOOL_PACKAGE_TRANSACTIONS - 1;
@@ -185,18 +184,27 @@ impl VerifiedSet {
             .iter()
             .map(|outpoint| outpoint.hash)
             .collect();
-        let ancestors = self.ancestors(parents);
-        if ancestors.len() > MAX_MEMPOOL_ANCESTORS {
+        let dependencies = self.transaction_dependencies.dependencies();
+        if parents.len() > MAX_MEMPOOL_ANCESTORS
+            || parents.iter().any(|parent| {
+                dependencies
+                    .get(parent)
+                    .is_some_and(|ancestors| !ancestors.is_empty())
+            })
+        {
             return Err(SameEffectsTipRejectionError::TooManyAncestors);
         }
 
-        if self.dependency_group(ancestors.iter().copied()).len()
-            >= MAX_MEMPOOL_PACKAGE_TRANSACTIONS
-        {
+        let dependents = self.transaction_dependencies.dependents();
+        if parents.iter().any(|parent| {
+            dependents
+                .get(parent)
+                .is_some_and(|children| !children.is_empty())
+        }) {
             return Err(SameEffectsTipRejectionError::TooManyPackageTransactions);
         }
 
-        Ok(ancestors)
+        Ok(parents)
     }
 
     /// Insert a `transaction` into the set.
@@ -262,7 +270,7 @@ impl VerifiedSet {
     /// # Performance
     ///
     /// Selection builds a heap once. Each score walks at most
-    /// [`MAX_MEMPOOL_PACKAGE_TRANSACTIONS`] transactions and six dependency edges.
+    /// [`MAX_MEMPOOL_PACKAGE_TRANSACTIONS`] transactions and one dependency edge.
     /// Removing a package only requires rescoring survivors in its dependency
     /// group. The mempool only calls this method when it is full.
     pub(super) fn select_eviction_victims(
@@ -323,7 +331,7 @@ impl VerifiedSet {
             let mut removed = self.descendants(root, &unavailable);
             removed.insert(root);
 
-            let group = self.dependency_group([root]);
+            let group = self.dependency_group(root);
             unavailable.extend(removed);
             candidates.extend(
                 group
@@ -374,82 +382,45 @@ impl VerifiedSet {
         EvictionCost::new(transaction.miner_fee.into(), transaction.cost())
     }
 
-    /// Returns the transactions connected to `starts` through parents or children.
-    /// Stops at the group limit, which suffices to reject another member.
-    fn dependency_group(
-        &self,
-        starts: impl IntoIterator<Item = transaction::Hash>,
-    ) -> HashSet<transaction::Hash> {
-        let dependencies = self.transaction_dependencies.dependencies();
-        let dependents = self.transaction_dependencies.dependents();
-        let mut group = HashSet::new();
-        let mut pending: Vec<_> = starts.into_iter().collect();
-
-        while let Some(tx_id) = pending.pop() {
-            if !group.insert(tx_id) {
-                continue;
-            }
-            if group.len() >= MAX_MEMPOOL_PACKAGE_TRANSACTIONS {
-                break;
-            }
-            pending.extend(dependencies.get(&tx_id).into_iter().flatten());
-            pending.extend(dependents.get(&tx_id).into_iter().flatten());
-        }
-
+    /// Returns `tx_id` and its parent or child, if any.
+    /// Admission excludes longer chains, branches, and joins.
+    fn dependency_group(&self, tx_id: transaction::Hash) -> HashSet<transaction::Hash> {
+        let mut group = HashSet::from([tx_id]);
+        group.extend(
+            self.transaction_dependencies
+                .dependencies()
+                .get(&tx_id)
+                .into_iter()
+                .flatten(),
+        );
+        group.extend(
+            self.transaction_dependencies
+                .dependents()
+                .get(&tx_id)
+                .into_iter()
+                .flatten(),
+        );
         group
     }
 
-    /// Returns the transactions in the set that directly or indirectly spend outputs of `tx_id`,
-    /// skipping transactions in `removed`.
+    /// Returns the child of `tx_id`, if any, skipping transactions in `removed`.
     ///
-    /// Every returned transaction is in the set.
+    /// Admission excludes grandchildren. Every returned transaction is in the set.
     fn descendants(
         &self,
         tx_id: transaction::Hash,
         removed: &HashSet<transaction::Hash>,
     ) -> HashSet<transaction::Hash> {
-        let dependents = self.transaction_dependencies.dependents();
-        let mut descendants = HashSet::new();
-        let mut pending = vec![tx_id];
-
-        while let Some(tx_id) = pending.pop() {
-            for &dependent in dependents.get(&tx_id).into_iter().flatten() {
-                if !removed.contains(&dependent)
-                    && self.transactions.contains_key(&dependent)
-                    && descendants.insert(dependent)
-                {
-                    pending.push(dependent);
-                }
-            }
-        }
-
-        descendants
-    }
-
-    /// Returns `parents` and the transactions in the set that they directly or indirectly
-    /// spend outputs of.
-    ///
-    /// The walk stops after it finds more than [`MAX_MEMPOOL_ANCESTORS`] transactions, so its
-    /// cost stays bounded. Transactions already in the set have at most that many ancestors.
-    fn ancestors(
-        &self,
-        parents: impl IntoIterator<Item = transaction::Hash>,
-    ) -> HashSet<transaction::Hash> {
-        let dependencies = self.transaction_dependencies.dependencies();
-        let mut ancestors = HashSet::new();
-        let mut pending: Vec<_> = parents.into_iter().collect();
-
-        while let Some(tx_id) = pending.pop() {
-            if ancestors.len() > MAX_MEMPOOL_ANCESTORS {
-                break;
-            }
-
-            if ancestors.insert(tx_id) {
-                pending.extend(dependencies.get(&tx_id).into_iter().flatten());
-            }
-        }
-
-        ancestors
+        self.transaction_dependencies
+            .dependents()
+            .get(&tx_id)
+            .into_iter()
+            .flatten()
+            .filter(|dependent| {
+                !removed.contains(*dependent) && self.transactions.contains_key(*dependent)
+            })
+            .copied()
+            .collect()
     }
 
     /// Clears a list of mined transaction ids from the lists of dependencies for

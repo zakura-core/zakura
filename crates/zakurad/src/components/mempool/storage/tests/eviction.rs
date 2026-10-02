@@ -298,7 +298,7 @@ fn insert_chain(
 }
 
 #[test]
-fn four_transaction_chain_evicts_its_cheap_tail() {
+fn parent_child_pair_evicts_its_cheap_child() {
     let _init_guard = zakura_test::init();
     const CHAIN_LEN: usize = MAX_MEMPOOL_ANCESTORS + 1;
 
@@ -425,113 +425,19 @@ fn output(tx: &VerifiedUnminedTx, index: usize) -> OutPoint {
     OutPoint::from_usize(tx.transaction.id().mined_id(), index)
 }
 
-/// Inserts a four-transaction diamond whose leaf pays `child_fee`.
-///
-/// Every other transaction pays 10,000 zatoshis. The leaf is reachable through
-/// both children of the root. Returns the root.
-fn insert_diamond(
-    storage: &mut Storage,
-    factory: &mut TxFactory,
-    child_fee: u64,
-) -> VerifiedUnminedTx {
-    let root = factory.tx_with(10_000, 2, 0);
-    insert(storage, &root, vec![]);
-
-    let children: Vec<_> = (0..2)
-        .map(|index| {
-            let tx = factory.tx_with(10_000, 1, 0);
-            insert(storage, &tx, vec![output(&root, index)]);
-            tx
-        })
-        .collect();
-
-    let child = factory.tx(child_fee);
-    let spent = children.iter().map(first_output).collect();
-    insert(storage, &child, spent);
-
-    root
-}
-
 #[test]
-fn diamond_counts_shared_descendant_once() {
-    let _init_guard = zakura_test::init();
-    let mut factory = TxFactory::new();
-    let mut storage = storage_for(5);
-
-    // The root package pays 130,000 over four costs: 32,500 per cost.
-    // Counting the high-fee descendant twice would give 46,000 per cost.
-    let root = insert_diamond(&mut storage, &mut factory, 100_000);
-    insert(&mut storage, &factory.tx(50_000), vec![]);
-    storage.verified.assert_dependency_groups_are_bounded();
-    let before = ids(&storage);
-
-    let underpaying = factory.tx(32_500 + MARGINAL_FEE - 1);
-    let (result, evicted) = storage.insert_with_evicted_ids(underpaying, vec![], None);
-    assert_eq!(
-        result,
-        Err(ExactTipRejectionError::BelowEvictionCost.into())
-    );
-    assert!(evicted.is_empty());
-    assert_eq!(ids(&storage), before);
-
-    let newcomer = factory.tx(32_500 + MARGINAL_FEE);
-    let (result, evicted) = storage.insert_with_evicted_ids(newcomer.clone(), vec![], None);
-    assert_eq!(result, Ok(newcomer.transaction.id()));
-    assert_eq!(evicted.len(), 4);
-    assert!(evicted.contains(&root.transaction.id()));
-    storage.verified.assert_dependency_groups_are_bounded();
-}
-
-#[test]
-fn dense_four_transaction_group_is_accepted_but_not_a_fifth_member() {
+fn second_child_is_rejected_without_changing_the_pool() {
     let _init_guard = zakura_test::init();
     let mut factory = TxFactory::new();
     let mut storage = storage_for(10);
-    let mut previous = Vec::new();
-    for index in 0..MAX_MEMPOOL_PACKAGE_TRANSACTIONS {
-        let tx = factory.tx_with(10_000, MAX_MEMPOOL_PACKAGE_TRANSACTIONS, 0);
-        let spent = previous
-            .iter()
-            .map(|parent| output(parent, index))
-            .collect();
-        insert(&mut storage, &tx, spent);
-        previous.push(tx);
-    }
-    // Every earlier member is a parent: this DAG has all six possible edges.
-    assert_eq!(
-        storage
-            .verified
-            .transaction_dependencies()
-            .dependencies()
-            .values()
-            .map(HashSet::len)
-            .sum::<usize>(),
-        6
-    );
-    storage.verified.assert_dependency_groups_are_bounded();
-    let before = ids(&storage);
-    let child = factory.tx(100_000);
-    assert_eq!(
-        storage.insert(child, previous.iter().map(first_output).collect(), None),
-        Err(SameEffectsTipRejectionError::TooManyAncestors.into()),
-    );
-    assert_eq!(ids(&storage), before);
-}
-
-#[test]
-fn fourth_child_is_rejected_without_changing_the_pool() {
-    let _init_guard = zakura_test::init();
-    let mut factory = TxFactory::new();
-    let mut storage = storage_for(10);
-    let parent = factory.tx_with(10_000, 4, 0);
+    let parent = factory.tx_with(10_000, 2, 0);
     insert(&mut storage, &parent, vec![]);
-    for index in 0..3 {
-        let child = factory.tx(10_000);
-        insert(&mut storage, &child, vec![output(&parent, index)]);
-    }
+    let child = factory.tx(10_000);
+    insert(&mut storage, &child, vec![first_output(&parent)]);
     let before = ids(&storage);
-    let child = factory.tx(100_000);
-    let (result, evicted) = storage.insert_with_evicted_ids(child, vec![output(&parent, 3)], None);
+    let sibling = factory.tx(100_000);
+    let (result, evicted) =
+        storage.insert_with_evicted_ids(sibling, vec![output(&parent, 1)], None);
     assert_eq!(
         result,
         Err(SameEffectsTipRejectionError::TooManyPackageTransactions.into())
@@ -541,80 +447,75 @@ fn fourth_child_is_rejected_without_changing_the_pool() {
 }
 
 #[test]
-fn merging_groups_counts_siblings_and_preserves_both_groups() {
+fn joining_two_unconfirmed_parents_is_rejected() {
     let _init_guard = zakura_test::init();
     let mut factory = TxFactory::new();
     let mut storage = storage_for(10);
-    let mut parents = Vec::new();
-    for _ in 0..2 {
-        let parent = factory.tx_with(10_000, 2, 0);
-        insert(&mut storage, &parent, vec![]);
-        let child = factory.tx(10_000);
-        insert(&mut storage, &child, vec![output(&parent, 0)]);
-        parents.push(parent);
-    }
+    let a = factory.tx_with(10_000, 1, 0);
+    let b = factory.tx_with(10_000, 1, 0);
+    insert(&mut storage, &a, vec![]);
+    insert(&mut storage, &b, vec![]);
     let before = ids(&storage);
     let joined = factory.tx(100_000);
-    // Only two ancestors, but the two siblings make the joined group too big.
+    let (result, evicted) =
+        storage.insert_with_evicted_ids(joined, vec![first_output(&a), first_output(&b)], None);
     assert_eq!(
-        storage.insert(
-            joined,
-            parents.iter().map(|parent| output(parent, 1)).collect(),
-            None
-        ),
-        Err(SameEffectsTipRejectionError::TooManyPackageTransactions.into()),
+        result,
+        Err(SameEffectsTipRejectionError::TooManyAncestors.into())
     );
+    assert!(evicted.is_empty());
     assert_eq!(ids(&storage), before);
+}
+
+#[test]
+fn spending_multiple_outputs_of_one_parent_is_accepted() {
+    let _init_guard = zakura_test::init();
+    let mut factory = TxFactory::new();
+    let mut storage = storage_for(10);
+    let parent = factory.tx_with(10_000, 2, 0);
+    insert(&mut storage, &parent, vec![]);
+    let child = factory.tx(10_000);
+    insert(
+        &mut storage,
+        &child,
+        vec![output(&parent, 0), output(&parent, 1)],
+    );
+    assert_eq!(
+        storage.transaction_count(),
+        MAX_MEMPOOL_PACKAGE_TRANSACTIONS
+    );
     storage.verified.assert_dependency_groups_are_bounded();
 }
 
 #[test]
-fn shared_descendants_connect_other_parents_into_the_group() {
+fn mining_a_parent_allows_its_child_to_become_a_parent() {
     let _init_guard = zakura_test::init();
     let mut factory = TxFactory::new();
     let mut storage = storage_for(10);
-    let a = factory.tx_with(10_000, 2, 0);
-    let b = factory.tx_with(10_000, 2, 0);
-    insert(&mut storage, &a, vec![]);
-    insert(&mut storage, &b, vec![]);
-    let shared = factory.tx(10_000);
-    insert(&mut storage, &shared, vec![output(&a, 0), output(&b, 0)]);
-    let child = factory.tx(10_000);
-    insert(&mut storage, &child, vec![output(&a, 1)]);
-    let before = ids(&storage);
-    let child = factory.tx(100_000);
-    // Walking B's child must reach A and A's other child, despite depth two.
-    assert_eq!(
-        storage.insert(child, vec![output(&b, 1)], None),
-        Err(SameEffectsTipRejectionError::TooManyPackageTransactions.into()),
-    );
-    assert_eq!(ids(&storage), before);
-}
-
-#[test]
-fn mining_a_parent_releases_group_capacity() {
-    let _init_guard = zakura_test::init();
-    let mut factory = TxFactory::new();
-    let mut storage = storage_for(10);
-    let parent = factory.tx_with(10_000, 3, 0);
+    let parent = factory.tx_with(10_000, 1, 0);
     insert(&mut storage, &parent, vec![]);
-    let children: Vec<_> = (0..3)
-        .map(|index| {
-            let child = factory.tx_with(10_000, 1, 0);
-            insert(&mut storage, &child, vec![output(&parent, index)]);
-            child
-        })
-        .collect();
+    let child = factory.tx_with(10_000, 1, 0);
+    insert(&mut storage, &child, vec![first_output(&parent)]);
     let mined = [parent.transaction.id().mined_id()].into();
     storage.clear_mined_dependencies(&mined);
     storage.reject_and_remove_same_effects(&mined, vec![]);
-    // The children are now separate groups, so one can grow another chain.
-    let mut tail = children[0].clone();
-    for _ in 0..3 {
-        let child = factory.tx_with(10_000, 1, 0);
-        insert(&mut storage, &child, vec![first_output(&tail)]);
-        tail = child;
-    }
+    let next = factory.tx(10_000);
+    insert(&mut storage, &next, vec![first_output(&child)]);
+    storage.verified.assert_dependency_groups_are_bounded();
+}
+
+#[test]
+fn removing_a_child_releases_its_parents_child_slot() {
+    let _init_guard = zakura_test::init();
+    let mut factory = TxFactory::new();
+    let mut storage = storage_for(10);
+    let parent = factory.tx_with(10_000, 2, 0);
+    insert(&mut storage, &parent, vec![]);
+    let child = factory.tx(10_000);
+    insert(&mut storage, &child, vec![first_output(&parent)]);
+    assert_eq!(storage.remove_exact(&[child.transaction.id()].into()), 1);
+    let next = factory.tx(10_000);
+    insert(&mut storage, &next, vec![output(&parent, 1)]);
     storage.verified.assert_dependency_groups_are_bounded();
 }
 

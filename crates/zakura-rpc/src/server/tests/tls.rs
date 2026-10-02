@@ -73,7 +73,7 @@ impl TestTlsListener {
         }
     }
 
-    async fn ping(&self) {
+    async fn ping(&self) -> reqwest::Client {
         let client = reqwest::Client::builder()
             .add_root_certificate(
                 reqwest::Certificate::from_pem(HANDSHAKE_CERT.as_bytes()).unwrap(),
@@ -94,6 +94,7 @@ impl TestTlsListener {
         let body: serde_json::Value =
             serde_json::from_str(&response.text().await.unwrap()).unwrap();
         assert_eq!(body["result"], "pong");
+        client
     }
 
     async fn stop(self) {
@@ -153,12 +154,23 @@ async fn tls_handshake_admission_is_bounded_and_recovers_after_failure() {
 }
 
 #[tokio::test]
+async fn completed_tls_handshake_releases_capacity_with_http_connection_open() {
+    let listener = TestTlsListener::start(1, TLS_HANDSHAKE_TIMEOUT).await;
+    // Keep the first client's HTTP connection pooled while another handshakes.
+    let client = listener.ping().await;
+    listener.ping().await;
+    listener.stop().await;
+    drop(client);
+}
+
+#[tokio::test]
 async fn tls_listener_shutdown_cancels_silent_handshakes() {
     let listener = TestTlsListener::start(MAX_PENDING_TLS_HANDSHAKES, TLS_HANDSHAKE_TIMEOUT).await;
     let mut silent = TcpStream::connect(listener.address).await.unwrap();
-    listener.ping().await;
+    let client = listener.ping().await;
     listener.stop().await;
     assert_socket_closed(&mut silent).await;
+    drop(client);
 }
 
 #[tokio::test]

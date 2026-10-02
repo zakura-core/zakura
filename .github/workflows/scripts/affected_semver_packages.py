@@ -10,7 +10,9 @@ import sys
 
 # `zakura` is the node binary package, rather than a supported Rust library API.
 # Its command and configuration types can change without library SemVer bumps.
-SEMVER_ENFORCEMENT_EXCLUSIONS = {"zakura"}
+# `zakura-quic` has no crates.io release yet, so it has no baseline to check
+# against. Remove it after its first publish.
+SEMVER_ENFORCEMENT_EXCLUSIONS = {"zakura", "zakura-quic"}
 
 
 def is_publishable(package):

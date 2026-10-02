@@ -20,9 +20,8 @@ p2p_stack   = "zakura"  # pure Zakura P2P v2: block/header sync + tree_aux → V
                         # without replace_legacy_syncer it falls back to legacy obtain_tips and hard-stalls).
 
 [network.zakura]
-# Bind on all interfaces — iroh uses one UDP socket for send+recv, so a loopback
-# bind breaks OUTBOUND to external peers. Bad inbound peers (iroh disco AEAD spam)
-# are cosmetic and silenced via the tracing filter; Zakura v1 has no peer denylist.
+# Bind on all interfaces — the QUIC endpoint uses one UDP socket for send+recv, so a loopback
+# bind breaks OUTBOUND to external peers. Zakura v1 has no peer denylist.
 listen_addr     = "0.0.0.0:8234"
 # Private cohort: peer ONLY with our two controlled serving nodes. `perf.sh run`
 # substitutes @@COHORT@@ / @@BOOTSTRAP@@ from deploy/runner/cohort.env (the same
@@ -61,6 +60,6 @@ debug_stop_at_height = @@STOP@@
 
 [tracing]
 # Full-pipeline tracing: Zakura block-sync (BLOCK_SYNC_STATE + limiter), checkpoint
-# verifier, and the committer at debug. iroh + byte-budget-guard WARN spam silenced.
+# verifier, and the committer at debug. QUIC UDP + byte-budget-guard WARN spam silenced.
 # Output lands in the run's log: /mnt/roman-dev-2-data/feedrun-<LABEL>.log
-filter = "info,zakura_network::zakura=debug,zakura_network::zakura::transport::guard=error,zakurad::commands::start::zakura=debug,iroh=error,iroh::magicsock=error,iroh_quinn_udp=error"
+filter = "info,zakura_network::zakura=debug,zakura_network::zakura::transport::guard=error,zakurad::commands::start::zakura=debug,noq_udp=error"

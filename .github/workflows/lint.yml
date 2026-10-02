@@ -333,6 +333,18 @@ jobs:
         if: ${{ !cancelled() }}
         run: cargo deny --workspace check bans licenses sources --allow unmatched-skip-root
 
+      # zakura-quic DEP-1: the Iroh wrapper packages must not return to zakurad.
+      - name: Check zakurad has no Iroh wrapper packages
+        if: ${{ !cancelled() }}
+        run: |
+          denied='^(zakura-iroh|zakura-iroh-base|zakura-iroh-dns|zakura-iroh-relay|netwatch|netdev|netlink-.*|n0-.*|hickory-.*|papaya|seize|iroh-metrics|tokio-websockets) '
+          hits=$(cargo tree --locked -p zakura -e normal --prefix none | grep -E "$denied" | sort -u || true)
+          if [ -n "$hits" ]; then
+            echo "zakurad's dependency graph contains packages that docs/specs/zakura-quic.md DEP-1 forbids:"
+            echo "$hits"
+            exit 1
+          fi
+
       # Prevent a newly announced advisory from suddenly failing CI.
       - name: Check default dependency advisories
         if: ${{ !cancelled() }}

@@ -2,10 +2,12 @@
 
 use std::{future::Future, pin::Pin, time::Duration};
 
-use iroh::EndpointAddr;
 use tokio::time::Instant;
+use zakura_quic::NodeAddr;
 
-use crate::zakura::{ZakuraEndpoint, ZakuraLocalLimits, ZakuraPeerId};
+use crate::zakura::{
+    ZakuraEndpoint, ZakuraLocalLimits, ZakuraPeerId, ZAKURA_ALPN_MISMATCH_BACKOFF,
+};
 
 /// A connection that served at least this long is treated as healthy, so the
 /// next re-dial after it drops starts from the initial (fast) backoff again
@@ -75,6 +77,9 @@ enum DialResult {
     Healthy,
     /// Failed to establish, or served only briefly (e.g. a duplicate was closed).
     Failed,
+    /// The peer speaks another ALPN; wait at least
+    /// [`ZAKURA_ALPN_MISMATCH_BACKOFF`] before the next dial.
+    AlpnMismatch,
 }
 
 /// Maintain a Zakura connection to `node_addr`, re-dialing with bounded backoff.
@@ -87,7 +92,7 @@ enum DialResult {
 /// supplies the real dial attempt and the supervisor's registration watch.
 pub(crate) async fn native_dial_supervised(
     endpoint: ZakuraEndpoint,
-    node_addr: EndpointAddr,
+    node_addr: NodeAddr,
     limits: ZakuraLocalLimits,
     policy: RedialPolicy,
 ) {
@@ -109,6 +114,13 @@ pub(crate) async fn native_dial_supervised(
                     DialResult::Healthy
                 }
                 Ok(()) => DialResult::Failed,
+                Err(error) if error.is_alpn_mismatch() => {
+                    tracing::debug!(
+                        ?error,
+                        "Zakura peer speaks another protocol version; backing off"
+                    );
+                    DialResult::AlpnMismatch
+                }
                 Err(error) => {
                     tracing::debug!(?error, "Zakura native dial failed; will retry");
                     DialResult::Failed
@@ -231,7 +243,7 @@ async fn run_dial_supervisor<F>(
                 failures = 0;
                 continue;
             }
-            DialResult::Failed => {}
+            DialResult::Failed | DialResult::AlpnMismatch => {}
         }
 
         failures += 1;
@@ -243,7 +255,12 @@ async fn run_dial_supervisor<F>(
         // from another connection. Ignore unrelated peer-set changes,
         // including the deregistration from the failed attempt we just
         // observed.
-        let sleep = tokio::time::sleep(backoff);
+        let wait = if attempt == DialResult::AlpnMismatch {
+            backoff.max(ZAKURA_ALPN_MISMATCH_BACKOFF)
+        } else {
+            backoff
+        };
+        let sleep = tokio::time::sleep(wait);
         tokio::pin!(sleep);
         loop {
             tokio::select! {
@@ -541,5 +558,34 @@ mod tests {
             6,
             "a peer that closes every connection must use one backoff step per dial",
         );
+    }
+
+    /// A peer on another ALPN is redialed no sooner than
+    /// [`ZAKURA_ALPN_MISMATCH_BACKOFF`], however short the policy's backoff
+    /// (zakura-quic DIAL-5).
+    #[tokio::test(start_paused = true)]
+    async fn dial_supervisor_backs_off_ten_minutes_after_alpn_mismatch() {
+        let (_tx, registered) = tokio::sync::watch::channel(Vec::<ZakuraPeerId>::new());
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let supervisor = tokio::spawn(run_dial_supervisor(
+            redial_test_peer_id(),
+            registered,
+            RedialPolicy::maintain(Duration::from_secs(1), Duration::from_secs(30)),
+            count_dial(&calls, DialResult::AlpnMismatch),
+        ));
+
+        tokio::time::sleep(ZAKURA_ALPN_MISMATCH_BACKOFF - Duration::from_secs(1)).await;
+        assert_eq!(
+            dial_count(&calls),
+            1,
+            "the redial must wait out the ALPN backoff"
+        );
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(
+            dial_count(&calls),
+            2,
+            "the redial runs once the ALPN backoff ends"
+        );
+        supervisor.abort();
     }
 }

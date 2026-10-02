@@ -58,7 +58,7 @@ DEFAULTS = {
     "state_cache_dir": "/var/lib/zakura",
     "network": "Mainnet",
     "listen_addr": "[::]:8233",
-    "identity_dir": "",     # e.g. "/root/.zakura" -> pins the iroh node_id; "" uses zakurad default
+    "identity_dir": "",     # e.g. "/root/.zakura" -> pins the Zakura node_id; "" uses zakurad default
     "network_cache_dir": "",
     "rpc_listen_addr": "",  # empty -> RPC stays disabled
     "rpc_enable_cookie_auth": None,

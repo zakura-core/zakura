@@ -2,8 +2,10 @@
 
 Plan: `/home/evan/src/valar/art/inbox/zakura_p2p/00.0_iroh_dependency.md`
 
-> **Status:** This decision contributes to the experimental Zakura P2P v2
-> stack.
+> **Status:** Superseded by
+> [0003: Replace Iroh with a Zakura-owned QUIC transport on noq](0003-zakura-quic-transport.md)
+> for the transport. The privacy posture below (direct-only, no relay, no
+> external address lookup, no port mapping) still holds.
 
 ## Decision
 

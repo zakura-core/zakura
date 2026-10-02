@@ -634,44 +634,51 @@ mod tests {
     #[tokio::test]
     async fn quic_backpressure_holds_producer_and_preserves_another_stream() {
         use crate::zakura::testkit::LocalEndpointFactory;
-        use iroh::{
-            endpoint::{Connection, QuicTransportConfig, VarInt},
-            protocol::{AcceptError, ProtocolHandler, Router},
-        };
+        use futures::future::BoxFuture;
         use std::time::Duration;
+        use zakura_quic::{Acceptor, Admit, Conn, IncomingInfo, QuicConfig};
+
+        const ALPN: &[u8] = b"/zakura/test/producer-backpressure";
 
         #[derive(Debug)]
-        struct AcceptConnection(mpsc::Sender<Connection>);
-        impl ProtocolHandler for AcceptConnection {
-            async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
-                let _ = self.0.send(connection).await;
-                Ok(())
+        struct AcceptConnection(mpsc::Sender<Conn>);
+        impl Acceptor for AcceptConnection {
+            fn admit(&self, _incoming: &IncomingInfo) -> Admit {
+                Admit::Accept
+            }
+
+            fn alpns(&self) -> Vec<Vec<u8>> {
+                vec![ALPN.to_vec()]
+            }
+
+            fn handle(&self, connection: Conn) -> BoxFuture<'static, ()> {
+                let accepted = self.0.clone();
+                Box::pin(async move {
+                    let _ = accepted.send(connection).await;
+                })
             }
         }
 
-        const ALPN: &[u8] = b"/zakura/test/producer-backpressure";
         // Scale down the windows so a single bounded frame reaches flow control.
-        let transport_config = || {
-            QuicTransportConfig::builder()
-                .max_remote_nat_traversal_addresses(0)
-                .stream_receive_window(VarInt::from_u32(16 * 1024))
-                .receive_window(VarInt::from_u32(128 * 1024))
-                .send_window(128 * 1024)
-                .build()
+        let quic_config = || QuicConfig {
+            stream_receive_window_bytes: 64 * 1024,
+            receive_window_bytes: 128 * 1024,
+            send_window_bytes: 128 * 1024,
+            ..QuicConfig::default()
         };
-        let server = LocalEndpointFactory::with_transport_config(transport_config())
+        let server = LocalEndpointFactory::new()
+            .quic_config(quic_config())
             .endpoint(92_001)
             .await
             .unwrap();
-        let client = LocalEndpointFactory::with_transport_config(transport_config())
+        let client = LocalEndpointFactory::new()
+            .quic_config(quic_config())
             .endpoint(92_002)
             .await
             .unwrap();
         let (accepted, mut incoming) = mpsc::channel(1);
-        let router = Router::builder(server)
-            .accept(ALPN, AcceptConnection(accepted))
-            .spawn();
-        let address = LocalEndpointFactory::node_addr(router.endpoint()).await;
+        server.serve(AcceptConnection(accepted)).unwrap();
+        let address = LocalEndpointFactory::node_addr(&server).await;
         let connection = client.connect(address, ALPN).await.unwrap();
         let remote = tokio::time::timeout(Duration::from_secs(5), incoming.recv())
             .await
@@ -730,7 +737,7 @@ mod tests {
         .expect("draining the peer resumes the write");
         assert!(producer.try_reserve().is_some());
         connection.close(0u32.into(), b"done");
-        client.close().await;
-        router.shutdown().await.unwrap();
+        client.shutdown().await;
+        server.shutdown().await;
     }
 }

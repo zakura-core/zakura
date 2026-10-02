@@ -1133,6 +1133,51 @@ fn zakura_secret_key_honors_configured_key_and_disabled_cache() {
     );
 }
 
+/// Key files written before the move off Iroh's key type, and both text forms
+/// of the config override, must keep yielding the same node ID.
+#[test]
+fn zakura_secret_key_text_forms_keep_their_node_id() {
+    let _init_guard = zakura_test::init();
+
+    // RFC 8032 §7.1 test 1: the seed and the public key it derives.
+    const SEED_HEX: &str = "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60";
+    const SEED_BASE32: &str = "TVQ3DHPP7VNGBOUEJL2JF3BMYRCETRLJPMZGSGLQHOWAGHFOP5QA";
+    const NODE_ID: &str = "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a";
+
+    let key_dir = tempfile::tempdir().expect("failed to create temp key dir");
+    let key_file = key_dir.path().join("mainnet.zakura-iroh-secret-key");
+    fs::write(&key_file, format!("{SEED_HEX}\n")).expect("write existing key file");
+    let from_file = load_or_generate_zakura_secret_key(&key_file);
+    assert_eq!(from_file.public().to_string(), NODE_ID);
+    assert_eq!(
+        fs::read_to_string(&key_file).expect("read key file"),
+        format!("{SEED_HEX}\n"),
+        "loading an existing key file must not rewrite it",
+    );
+
+    for configured in [SEED_HEX, SEED_BASE32, &SEED_BASE32.to_lowercase()] {
+        let config: Config = toml::from_str(&format!("zakura_node_secret_key = '{configured}'"))
+            .expect("valid configured key parses");
+        let secret_key = config
+            .zakura_secret_key()
+            .expect("configured key should resolve");
+        assert_eq!(secret_key.public().to_string(), NODE_ID);
+    }
+
+    // A fresh key file holds 64 lowercase hex characters and reloads to the same node ID.
+    let fresh_file = key_dir.path().join("testnet.zakura-iroh-secret-key");
+    let fresh = load_or_generate_zakura_secret_key(&fresh_file);
+    let contents = fs::read_to_string(&fresh_file).expect("read fresh key file");
+    assert_eq!(contents.len(), 64);
+    assert!(contents
+        .bytes()
+        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)));
+    assert_eq!(
+        load_or_generate_zakura_secret_key(&fresh_file).public(),
+        fresh.public()
+    );
+}
+
 #[test]
 fn configured_nsm_seed_roundtrip_distinguishes_derived_and_explicit_zero() {
     for seed in [None, Some(0), Some(123)] {

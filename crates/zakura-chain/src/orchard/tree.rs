@@ -706,7 +706,7 @@ impl NoteCommitmentTree {
     /// Checks `roots`, the completed subtree roots in index order, against this tree's frontier.
     ///
     /// Returns how many roots were checked. See
-    /// [`subtree_verify`](crate::subtree_verify) for what this proves.
+    /// [`subtree_verify`] for what this proves.
     ///
     /// Ironwood re-exports this module, so this also serves Ironwood trees.
     pub fn verify_completed_subtree_roots(

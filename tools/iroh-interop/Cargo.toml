@@ -1,0 +1,28 @@
+# Iroh interop probe (SPEC COMPAT-1 to COMPAT-3, DEP-5).
+#
+# This directory is its own Cargo workspace with its own Cargo.lock, so the Iroh
+# crates it pins never enter the zakurad graph, `cargo deny` or `cargo vet`.
+# `upstream/` is a second, nested workspace for the newest released Iroh 1.x:
+# that release needs noq ^1.3, which can't share a lockfile with zakura-quic's
+# exact noq pin.
+[workspace]
+exclude = ["upstream"]
+
+[package]
+name = "iroh-interop"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+anyhow = "1"
+futures = "0.3.31"
+hex = "0.4.3"
+# The Iroh backend of the previous Zakura release, pinned like the zakura workspace pins it.
+iroh = { package = "zakura-iroh", version = "=1.1.0-rc.1", default-features = false, features = ["tls-ring", "qlog"] }
+# Only for `noq::PathEvent`; the lockfile keeps it on the version zakura-quic pins.
+noq = { version = "1.2", default-features = false, features = ["rustls", "ring", "runtime-tokio", "qlog"] }
+serde_json = "1"
+tokio = { version = "1.44", features = ["full"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+zakura-quic = { path = "../../crates/zakura-quic", features = ["qlog"] }

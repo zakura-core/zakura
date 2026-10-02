@@ -61,10 +61,10 @@ mod pending_outputs;
 mod queue_checker;
 mod storage;
 
-/// Runs the Criterion benchmarks for verified mempool storage.
+/// Supplies named, timed storage operations to a benchmark harness.
 #[cfg(feature = "mempool-bench")]
-pub fn mempool_eviction_benchmarks(c: &mut criterion::Criterion) {
-    storage::mempool_eviction_benchmarks(c);
+pub fn mempool_eviction_benchmarks(run: impl FnMut(&str, &mut dyn FnMut() -> std::time::Duration)) {
+    storage::mempool_eviction_benchmarks(run);
 }
 
 #[cfg(test)]

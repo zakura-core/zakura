@@ -5,10 +5,10 @@
 
 use std::{
     collections::BinaryHeap,
+    hint::black_box,
     time::{Duration, Instant},
 };
 
-use criterion::{black_box, BenchmarkId, Criterion};
 use zakura_chain::{transaction::MEMPOOL_TRANSACTION_COST_THRESHOLD, transparent::OutPoint};
 
 use super::super::{fixtures::TxFactory, Storage};
@@ -155,7 +155,7 @@ impl Fixture {
 
 /// Benchmarks indexed selection against the previous full-heap implementation,
 /// then measures actual storage admission with setup and restoration excluded.
-pub fn mempool_eviction_benchmarks(c: &mut Criterion) {
+pub fn mempool_eviction_benchmarks(mut run: impl FnMut(&str, &mut dyn FnMut() -> Duration)) {
     let mut factory = TxFactory::new();
     let rejected = factory.tx(BASE_FEE);
     let small = factory.tx(1_000_000);
@@ -178,7 +178,6 @@ pub fn mempool_eviction_benchmarks(c: &mut Criterion) {
         Shape::Join,
         Shape::Triangle,
     ] {
-        let mut group = c.benchmark_group(format!("mempool_eviction/{}", shape.name()));
         for count in [default_count / 8, default_count] {
             let mut fixture = Fixture::new(&mut factory, count, shape);
             for (name, tx, accepted) in [
@@ -198,56 +197,36 @@ pub fn mempool_eviction_benchmarks(c: &mut Criterion) {
                         .select_eviction_victims_by_heap(tx, &none, fixture.storage.tx_cost_limit,)
                         .roots,
                 );
-                group.bench_with_input(
-                    BenchmarkId::new(format!("indexed/{name}"), count),
-                    tx,
-                    |b, tx| {
-                        b.iter(|| {
-                            black_box(fixture.storage.verified.select_eviction_victims(
-                                black_box(tx),
-                                &none,
-                                fixture.storage.tx_cost_limit,
-                            ))
-                        });
-                    },
-                );
-                group.bench_with_input(
-                    BenchmarkId::new(format!("heap_baseline/{name}"), count),
-                    tx,
-                    |b, tx| {
-                        b.iter(|| {
-                            black_box(fixture.storage.verified.select_eviction_victims_by_heap(
-                                black_box(tx),
-                                &none,
-                                fixture.storage.tx_cost_limit,
-                            ))
-                        });
-                    },
-                );
-                group.bench_with_input(
-                    BenchmarkId::new(format!("admission/{name}"), count),
-                    tx,
-                    |b, tx| {
-                        b.iter_custom(|iterations| {
-                            (0..iterations).map(|_| fixture.admit(tx, accepted)).sum()
-                        });
-                    },
-                );
+                let id = |path| format!("mempool_eviction/{}/{path}/{name}/{count}", shape.name());
+                run(&id("indexed"), &mut || {
+                    let start = Instant::now();
+                    black_box(fixture.storage.verified.select_eviction_victims(
+                        black_box(tx),
+                        &none,
+                        fixture.storage.tx_cost_limit,
+                    ));
+                    start.elapsed()
+                });
+                run(&id("heap_baseline"), &mut || {
+                    let start = Instant::now();
+                    black_box(fixture.storage.verified.select_eviction_victims_by_heap(
+                        black_box(tx),
+                        &none,
+                        fixture.storage.tx_cost_limit,
+                    ));
+                    start.elapsed()
+                });
+                run(&id("admission"), &mut || fixture.admit(tx, accepted));
             }
             fixture.storage.tx_cost_limit += large.cost();
             for (name, tx) in [("one", &small), ("250kb", &large)] {
-                group.bench_with_input(
-                    BenchmarkId::new(format!("admission_with_room/{name}"), count),
-                    tx,
-                    |b, tx| {
-                        b.iter_custom(|iterations| {
-                            (0..iterations).map(|_| fixture.admit(tx, true)).sum()
-                        });
-                    },
+                let id = format!(
+                    "mempool_eviction/{}/admission_with_room/{name}/{count}",
+                    shape.name()
                 );
+                run(&id, &mut || fixture.admit(tx, true));
             }
         }
-        group.finish();
     }
 }
 

@@ -42,6 +42,10 @@ Rejections clear between measured admissions so the benchmark exercises actual
 admission rather than measuring a rejection-cache hit. Setup, restoration, and
 correctness assertions are excluded from admission timings.
 
+Criterion remains a development dependency. The feature-gated storage runner
+uses standard timing types and passes named samples to the benchmark binary.
+Every selection sample uses an `Instant` timer; its overhead is included.
+
 Criterion writes reports beneath `target/criterion`. The shared benchmark
 workflow includes this target, including PR comparisons with the `C-benchmark`
 label. Compare the 1,000- and 8,000-entry results to detect a return to full-pool
@@ -54,10 +58,10 @@ produced these small-newcomer timings (microseconds, rounded):
 
 | Shape | Heap selection | Indexed selection | Storage admission |
 | --- | ---: | ---: | ---: |
-| independent | 505.3 | 0.052 | 1.02 |
-| chain | 1723.4 | 0.206 | 2.66 |
-| join | 1481.2 | 0.127 | 2.44 |
-| triangle | 2043.2 | 0.252 | 2.84 |
+| independent | 782.3 | 0.092 | 1.60 |
+| chain | 2760.5 | 0.331 | 4.01 |
+| join | 3384.9 | 0.308 | 5.22 |
+| triangle | 3523.6 | 0.428 | 4.31 |
 
 These are warm storage measurements, excluding cryptographic verification.
 Admission includes committing the eviction and inserting the newcomer; heap

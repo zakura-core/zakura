@@ -248,7 +248,7 @@ The workflow is manual (`workflow_dispatch`) with the same inputs as testnet
 **Binary-only deploy (`manage_config = false`).** The mainnet nodes were
 provisioned by hand with rich, per-node configs — `external_addr`, custom peers,
 mempool/sync tuning, and an inline `zakura_node_secret_key` that pins each node's
-iroh identity (the node ids hardcoded as bootstrap peers in
+Zakura identity (the node ids hardcoded as bootstrap peers in
 `crates/zakura-network/src/zakura/handler.rs`) — and their state DB lives at
 `/root/.cache/zebra`. Rendering the deployer's managed config over that would
 change every node id and drop the tuning. So the generated CI config sets

@@ -4211,7 +4211,7 @@ async fn non_tip_child_keeps_the_behind_tip_policy() {
 /// leaving the newest block for the next discovery round.
 #[tokio::test]
 async fn poisoned_body_requeues_and_scores_its_supplier() -> Result<(), crate::BoxError> {
-    for error_kind in 0..3 {
+    for error_kind in 0..4 {
         let (
             mut chain_sync,
             _sync_status,
@@ -4248,7 +4248,7 @@ async fn poisoned_body_requeues_and_scores_its_supplier() -> Result<(), crate::B
                 hash: block_hash,
                 advertiser_addr: Some(addr),
             },
-            _ => BlockDownloadVerifyError::Invalid {
+            2 => BlockDownloadVerifyError::Invalid {
                 error: RouterError::Checkpoint {
                     source: Box::new(zakura_consensus::VerifyCheckpointError::VerifyBlock(
                         VerifyBlockError::Block {
@@ -4263,6 +4263,16 @@ async fn poisoned_body_requeues_and_scores_its_supplier() -> Result<(), crate::B
                 hash: block_hash,
                 advertiser_addr: Some(addr),
             },
+            _ => checkpoint_commit_error(
+                zs::ValidateContextError::InvalidBlockCommitment(
+                    block::CommitmentError::InvalidChainHistoryBlockTxAuthCommitment {
+                        expected: [0; 32],
+                        actual: [1; 32],
+                    },
+                ),
+                block_hash,
+                addr,
+            ),
         };
 
         let requeue = tokio::spawn(async move {
@@ -4293,6 +4303,80 @@ async fn poisoned_body_requeues_and_scores_its_supplier() -> Result<(), crate::B
 
         block_verifier_router.expect_no_requests().await;
     }
+    Ok(())
+}
+
+/// Wraps a contextual error the way a failed checkpoint commit reports it to the syncer.
+fn checkpoint_commit_error(
+    error: zs::ValidateContextError,
+    hash: block::Hash,
+    addr: PeerSocketAddr,
+) -> BlockDownloadVerifyError {
+    let source: crate::BoxError = Box::new(zs::CommitCheckpointVerifiedError::from(
+        zs::CommitBlockError::ValidateContextError(Box::new(error)),
+    ));
+    BlockDownloadVerifyError::Invalid {
+        error: RouterError::Checkpoint {
+            source: Box::new(
+                zakura_consensus::VerifyCheckpointError::CommitCheckpointVerified(source),
+            ),
+        },
+        height: Height(1_687_106),
+        hash,
+        advertiser_addr: Some(addr),
+    }
+}
+
+/// A block the state dropped behind a forged ancestor body is requeued without restarting the
+/// round, and its supplier is not scored.
+#[tokio::test]
+async fn rejected_body_descendant_requeues_without_scoring() -> Result<(), crate::BoxError> {
+    let (
+        mut chain_sync,
+        _sync_status,
+        mut block_verifier_router,
+        mut peer_set,
+        _state_service,
+        _mock_chain_tip_sender,
+    ) = setup_chain_sync();
+
+    let (misbehavior_tx, mut misbehavior_rx) = tokio::sync::mpsc::channel(1);
+    chain_sync.misbehavior_sender = misbehavior_tx;
+
+    let block_hash = block::Hash::from([0xAC; 32]);
+    let addr: PeerSocketAddr = "127.0.0.1:8233".parse().expect("valid peer address");
+    let error = checkpoint_commit_error(
+        zs::ValidateContextError::AncestorBodyRejected(block::Hash::from([0xAB; 32])),
+        block_hash,
+        addr,
+    );
+
+    let requeue = tokio::spawn(async move {
+        let result = chain_sync
+            .handle_block_response_with_missing_retry(Err(error))
+            .await;
+        (result, chain_sync)
+    });
+
+    peer_set
+        .expect_request(zn::Request::BlocksByHash(iter::once(block_hash).collect()))
+        .await
+        .respond(Err(not_found_block_error(block_hash)));
+
+    let (result, chain_sync) = requeue.await.expect("the retry task should not panic");
+    result?;
+
+    assert!(
+        misbehavior_rx.try_recv().is_err(),
+        "the supplier of a descendant did not cause its ancestor's failure"
+    );
+    assert_eq!(
+        chain_sync.poisoned_block_retry_counts.get(&block_hash),
+        Some(&1),
+        "the requeue must be counted against the retry budget"
+    );
+
+    block_verifier_router.expect_no_requests().await;
     Ok(())
 }
 

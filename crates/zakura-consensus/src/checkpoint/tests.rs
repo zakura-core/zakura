@@ -1836,6 +1836,43 @@ fn state_commit_duplicate_errors_are_duplicate_requests() {
     assert_eq!(err.misbehavior_score(), 0);
 }
 
+/// A checkpoint body whose authorizing data does not match its header's commitment can only
+/// come from its supplier, so the score must reach the syncer through the state's wrapper.
+#[test]
+fn state_checkpoint_auth_commitment_mismatch_is_scored() {
+    let mismatch = zs::CommitBlockError::ValidateContextError(Box::new(
+        zs::ValidateContextError::InvalidBlockCommitment(
+            zakura_chain::block::CommitmentError::InvalidChainHistoryBlockTxAuthCommitment {
+                expected: [0; 32],
+                actual: [1; 32],
+            },
+        ),
+    ));
+    let source: BoxError = Box::new(zs::CommitCheckpointVerifiedError::from(mismatch));
+
+    let err = VerifyCheckpointError::CommitCheckpointVerified(source);
+
+    assert!(err.is_auth_commitment_mismatch());
+    assert!(!err.is_duplicate_request());
+    assert_eq!(err.misbehavior_score(), 100);
+}
+
+/// Blocks the state drops behind a forged ancestor body were served by peers that did nothing
+/// wrong, so they stay unscored and are recognized for a retry.
+#[test]
+fn state_checkpoint_rejected_body_descendants_are_unscored() {
+    let descendant = zs::CommitBlockError::ValidateContextError(Box::new(
+        zs::ValidateContextError::AncestorBodyRejected(zakura_chain::block::Hash([9; 32])),
+    ));
+    let source: BoxError = Box::new(zs::CommitCheckpointVerifiedError::from(descendant));
+
+    let err = VerifyCheckpointError::CommitCheckpointVerified(source);
+
+    assert!(err.is_descendant_of_auth_commitment_mismatch());
+    assert!(!err.is_auth_commitment_mismatch());
+    assert_eq!(err.misbehavior_score(), 0);
+}
+
 /// Checkpoint commit failures can depend on auxiliary roots supplied by a
 /// different peer, so they must not be attributed to the block supplier.
 #[test]

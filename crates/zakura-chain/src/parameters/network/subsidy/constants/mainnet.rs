@@ -312,6 +312,53 @@ mod tests {
     }
 
     #[test]
+    fn test_only_november_mainnet_activation_rotates_to_zip_2008_recipient() {
+        // Test-only November 5 fixture; ZIP 259 has not assigned Mainnet NU7.
+        // TODO(zip-259): use the assigned height and recheck the first new slot.
+        const ACTIVATION: u32 = 3_543_000;
+        const ROTATION: u32 = 3_613_200;
+        const STREAM_END: u32 = 6_133_200;
+        let addresses = nu7_fpf_addresses(Some(Height(ACTIVATION)));
+        let old = "t3cFfPt1Bcvgez9ZbMBFWeZsskxTkPzGCow";
+        let new = "t1MkHnkxVjNpNbCrSs3AJ8J7ZSp6NTYiUcG";
+
+        let mut activation_heights: crate::parameters::testnet::ConfiguredActivationHeights =
+            Network::Mainnet.activation_list().into();
+        activation_heights.nu7 = Some(ACTIVATION);
+        let network = crate::parameters::testnet::Parameters::build()
+            .with_activation_heights(activation_heights)
+            .unwrap()
+            .clear_funding_streams()
+            .to_network()
+            .unwrap();
+        let start_period = funding_stream_address_period(Height(3_146_400), &network);
+
+        assert!(addresses[..12].iter().all(|address| *address == old));
+        assert!(addresses[12..].iter().all(|address| *address == new));
+        for (height, expected_index, expected_address) in [
+            (ACTIVATION - 1, 11, old),
+            (ACTIVATION, 11, old),
+            (ACTIVATION + 1, 11, old),
+            (ROTATION - 1, 11, old),
+            (ROTATION, 12, new),
+            (ROTATION + 1, 12, new),
+            (STREAM_END - 1, 35, new),
+        ] {
+            let index = usize::try_from(
+                funding_stream_address_period(Height(height), &network) - start_period,
+            )
+            .unwrap();
+            assert_eq!(index, expected_index, "index at {height}");
+            assert_eq!(addresses[index], expected_address, "address at {height}");
+        }
+        let old_address: crate::transparent::Address = old.parse().unwrap();
+        let new_address: crate::transparent::Address = new.parse().unwrap();
+        assert!(old_address.is_script_hash());
+        assert!(!new_address.is_script_hash());
+        assert_ne!(old_address.script(), new_address.script());
+    }
+
+    #[test]
     fn nu7_fpf_rotation_without_remaining_periods() {
         for activation in [None, Some(Height(4_406_400)), Some(Height(4_406_401))] {
             assert_eq!(

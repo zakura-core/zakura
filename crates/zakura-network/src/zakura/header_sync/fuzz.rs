@@ -88,6 +88,8 @@ enum ModelWork {
         target: block::Hash,
         scope: HeaderWorkAuthority,
         priority: PeerWorkPriority,
+        /// The staged advisory status. A start request must carry it exactly.
+        status: Status,
     },
     Active {
         session_id: u64,
@@ -95,6 +97,8 @@ enum ModelWork {
         owner: HeaderSyncWorkOwner,
         phase: HeaderTargetPhase,
         ancestor_bound: bool,
+        /// The head of the locator the request sent. A well-formed first page returns it.
+        locator_head: Frontier,
     },
 }
 
@@ -184,12 +188,10 @@ impl PursuitHarness {
         let target = target(marker);
         let priority = priority(flags);
         let scope = HeaderWorkAuthority::for_target(&self.snapshot, target);
-        let actual = self.queue.stage(
-            peer(peer_key),
-            advertisement(&self.snapshot, session_id, marker),
-            priority,
-        );
-        let expected = self.model_stage(peer_key, session_id, target, scope, priority);
+        let advertised = advertisement(&self.snapshot, session_id, marker);
+        let status = advertised.status.clone();
+        let actual = self.queue.stage(peer(peer_key), advertised, priority);
+        let expected = self.model_stage(peer_key, session_id, target, scope, priority, status);
         assert_eq!(actual, expected, "queue admission diverged from the model");
     }
 
@@ -200,6 +202,7 @@ impl PursuitHarness {
         target: block::Hash,
         scope: HeaderWorkAuthority,
         priority: PeerWorkPriority,
+        status: Status,
     ) -> QueueWorkResult {
         if let Some(work) = self.model.get_mut(&peer_key) {
             return match work {
@@ -208,11 +211,13 @@ impl PursuitHarness {
                     target: current_target,
                     scope: current_scope,
                     priority: current_priority,
+                    status: current_status,
                 } => {
                     *current_session = session_id;
                     *current_target = target;
                     *current_scope = scope;
                     *current_priority = priority;
+                    *current_status = status;
                     QueueWorkResult::NeedsLocator
                 }
                 ModelWork::Active { .. } => QueueWorkResult::AlreadyActive,
@@ -246,6 +251,7 @@ impl PursuitHarness {
                 target,
                 scope,
                 priority,
+                status,
             },
         );
         QueueWorkResult::NeedsLocator
@@ -255,18 +261,20 @@ impl PursuitHarness {
         let supplied_session = session(flags);
         let supplied_target = target(marker);
         let supplied_scope = HeaderWorkAuthority::for_target(&self.snapshot, supplied_target);
+        let request = request(&self.snapshot, peer_key, supplied_session, marker);
         let model_match = matches!(
             self.model.get(&peer_key),
             Some(ModelWork::Awaiting {
                 session_id,
                 target,
                 scope,
+                status,
                 ..
             }) if *session_id == supplied_session
                 && *target == supplied_target
                 && *scope == supplied_scope
+                && *status == request.target.status
         );
-        let request = request(&self.snapshot, peer_key, supplied_session, marker);
         let owner = request.owner;
         if model_match {
             assert!(
@@ -290,6 +298,8 @@ impl PursuitHarness {
                     owner,
                     phase: HeaderTargetPhase::Receiving,
                     ancestor_bound: false,
+                    // `request` builds its locator from this frontier.
+                    locator_head: self.snapshot.frontiers.header_best,
                 },
             );
         } else {
@@ -300,24 +310,32 @@ impl PursuitHarness {
     fn deliver_page(&mut self, peer_key: u8, marker: u8, flags: u8) {
         let supplied_session = session(flags);
         let supplied_target = target(marker);
+        // A branch reset moves the best header away from the finalized frontier, so answer
+        // from the locator the request actually sent.
+        let sent_ancestor = match self.model.get(&peer_key) {
+            Some(ModelWork::Active { locator_head, .. }) => *locator_head,
+            _ => self.snapshot.frontiers.header_best,
+        };
         let returned_ancestor = if flags & 0x20 == 0 {
-            self.snapshot.frontiers.finalized
+            sent_ancestor
         } else {
             Frontier::new(
-                block::Height(self.snapshot.frontiers.finalized.height.0.saturating_add(1)),
-                self.snapshot.frontiers.finalized.hash,
+                block::Height(sent_ancestor.height.0.saturating_add(1)),
+                sent_ancestor.hash,
             )
         };
         let production_accepts = self.queue.active(&peer(peer_key)).is_some_and(|request| {
             request.target.session_id == supplied_session
                 && request.matches_response_page(supplied_target, returned_ancestor)
         });
+        // A bound page stages no headers here, so no later page can continue from it.
         let matches = matches!(
             self.model.get(&peer_key),
             Some(ModelWork::Active {
                 session_id,
                 target,
                 phase: HeaderTargetPhase::Receiving,
+                ancestor_bound: false,
                 ..
             }) if *session_id == supplied_session
                 && *target == supplied_target
@@ -391,6 +409,7 @@ impl PursuitHarness {
             owner,
             phase: HeaderTargetPhase::Preparing,
             ancestor_bound: true,
+            ..
         }) = self.model.get(&peer_key).cloned()
         else {
             self.summary.refused_operations += 1;
@@ -413,10 +432,12 @@ impl PursuitHarness {
     fn explicit_outcome(&mut self, peer_key: u8, marker: u8, flags: u8) {
         let supplied_session = session(flags);
         let supplied_target = target(marker);
+        // Only a request still receiving pages accepts an explicit outcome.
         let Some(ModelWork::Active {
             session_id,
             target,
             owner,
+            phase: HeaderTargetPhase::Receiving,
             ..
         }) = self.model.get(&peer_key).cloned()
         else {
@@ -461,6 +482,7 @@ impl PursuitHarness {
             owner,
             phase: HeaderTargetPhase::Preparing,
             ancestor_bound: true,
+            ..
         }) = self.model.get(&peer_key).cloned()
         else {
             self.summary.refused_operations += 1;
@@ -523,8 +545,9 @@ impl PursuitHarness {
         if advertised.is_discovery_eligible(&self.snapshot) {
             let priority =
                 PeerWorkPriority::from_work_order(advertised.claimed_work_order(&self.snapshot));
+            let status = advertised.status.clone();
             let actual = self.queue.stage(peer(peer_key), advertised, priority);
-            let expected = self.model_stage(peer_key, session_id, target, scope, priority);
+            let expected = self.model_stage(peer_key, session_id, target, scope, priority, status);
             assert_eq!(
                 actual, expected,
                 "advisory mutation changed queue semantics"
@@ -615,6 +638,7 @@ impl PursuitHarness {
             owner,
             phase: HeaderTargetPhase::Preparing,
             ancestor_bound: true,
+            ..
         }) = self.model.get(&peer_key).cloned()
         else {
             self.summary.refused_operations += 1;
@@ -873,13 +897,16 @@ impl PursuitHarness {
                     session_id,
                     target,
                     scope,
+                    status,
                     ..
                 }) => {
-                    assert!(
-                        self.queue
-                            .awaiting(&peer(peer_key), *session_id, *target, *scope)
-                            .is_some(),
-                        "the queue's exact awaiting target matches the model"
+                    let awaiting = self
+                        .queue
+                        .awaiting(&peer(peer_key), *session_id, *target, *scope)
+                        .expect("the queue's exact awaiting target matches the model");
+                    assert_eq!(
+                        &awaiting.status, status,
+                        "the queue keeps the exact advisory status the model staged"
                     );
                     assert!(self.queue.active(&peer(peer_key)).is_none());
                 }
@@ -889,6 +916,7 @@ impl PursuitHarness {
                     owner,
                     phase,
                     ancestor_bound,
+                    locator_head,
                 }) => {
                     let request = self
                         .queue
@@ -899,6 +927,7 @@ impl PursuitHarness {
                     assert_eq!(request.owner, *owner);
                     assert_eq!(request.phase, *phase);
                     assert_eq!(request.common_ancestor.is_some(), *ancestor_bound);
+                    assert_eq!(request.sent_locator.entries().first(), Some(locator_head));
                 }
                 None => {
                     assert!(self.queue.active(&peer(peer_key)).is_none());
@@ -1038,6 +1067,51 @@ mod tests {
         let summary = replay_header_pursuit_bytes(&stale);
         assert_eq!(summary.state_submissions, 0);
         assert!(summary.refused_operations > 0);
+    }
+
+    #[test]
+    fn start_refuses_a_request_without_the_staged_advisory_status() {
+        let summary = replay_header_pursuit_bytes(&[
+            10, 13, 3, 1, // stage an advisory with a mutated work anchor and claimed work
+            1, 13, 3, 1, // start the canonical request for the same session and target
+        ]);
+        assert_eq!(summary.advisory_mutations, 1);
+        assert_eq!(summary.refused_operations, 1);
+    }
+
+    #[test]
+    fn a_second_page_cannot_rebind_the_ancestry() {
+        let summary = replay_header_pursuit_bytes(&[
+            0, 0, 42, 0, // advertise session 1, target 42
+            1, 0, 42, 0, // start exact request
+            2, 0, 42, 0, // bind authenticated ancestry
+            2, 0, 42, 0, // repeat the binding page with nothing staged after it
+        ]);
+        assert_eq!(summary.refused_operations, 1);
+    }
+
+    #[test]
+    fn first_page_returns_the_ancestor_from_the_sent_locator() {
+        let summary = replay_header_pursuit_bytes(&[
+            11, 0, 0, 0, // move the best header off the finalized frontier
+            0, 0, 42, 0, // advertise session 1, target 42
+            1, 0, 42, 0, // start exact request
+            2, 0, 42, 0, // bind the ancestor the request's locator named
+        ]);
+        assert_eq!(summary.refused_operations, 0);
+    }
+
+    #[test]
+    fn explicit_outcome_is_refused_once_the_target_is_preparing() {
+        let summary = replay_header_pursuit_bytes(&[
+            0, 0, 42, 0, // advertise session 1, target 42
+            1, 0, 42, 0, // start exact request
+            2, 0, 42, 0, // bind authenticated ancestry
+            3, 0, 42, 0, // prepare the complete target
+            5, 0, 42, 0, // send an explicit outcome after receiving ended
+        ]);
+        assert_eq!(summary.explicit_outcomes, 0);
+        assert_eq!(summary.refused_operations, 1);
     }
 
     #[test]

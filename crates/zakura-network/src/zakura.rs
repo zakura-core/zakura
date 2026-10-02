@@ -5,10 +5,11 @@
 
 use std::time::Duration;
 
-use iroh::{endpoint, Endpoint, EndpointAddr, EndpointId, RelayMode, SecretKey};
+use iroh::{endpoint, Endpoint, RelayMode};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
+use zakura_quic::{NodeAddr, NodeId, NodeSecretKey};
 
 use crate::{
     meta_addr::{MetaAddr, MetaAddrChange},
@@ -23,6 +24,7 @@ mod handler;
 mod handshake;
 mod header_sync;
 mod ip;
+mod iroh_compat;
 mod legacy_gossip;
 mod regulation;
 #[cfg(any(test, feature = "zakura-testkit"))]
@@ -203,12 +205,12 @@ const ZAKURA_LIVENESS_REFRESH_INTERVAL: Duration = Duration::from_secs(45);
 /// Returns an iroh endpoint builder with relays and external address lookup disabled.
 ///
 /// Callers must add explicit direct bind addresses before binding.
-pub fn direct_endpoint_builder(secret_key: SecretKey) -> endpoint::Builder {
+pub fn direct_endpoint_builder(secret_key: NodeSecretKey) -> endpoint::Builder {
     Endpoint::builder(endpoint::presets::Minimal)
         .relay_mode(RelayMode::Disabled)
         .clear_address_lookup()
         .clear_ip_transports()
-        .secret_key(secret_key)
+        .secret_key(iroh_compat::to_iroh_secret(&secret_key))
 }
 
 /// The result of routing a mutually P2P-v2-capable legacy handshake.
@@ -464,18 +466,17 @@ impl ZakuraHandshakeConnector {
     }
 }
 
-/// Builds an iroh dial address from the node id and direct-address hints a peer
+/// Builds a dial address from the node id and direct-address hints a peer
 /// advertised in a legacy upgrade prelude.
 ///
 /// Direct addresses are carried as `SocketAddr` strings (the same encoding used
 /// by configured bootstrap peers), so each entry is parsed back into a
 /// `SocketAddr`. Returns `None` if the node id is malformed or no direct address
 /// parses, since a peer with no reachable address cannot be dialed.
-fn node_addr_from_hints(node_id: &[u8], direct_addresses: &[Vec<u8>]) -> Option<EndpointAddr> {
-    let node_id_bytes: [u8; 32] = node_id.try_into().ok()?;
-    let node_id = EndpointId::from_bytes(&node_id_bytes).ok()?;
+fn node_addr_from_hints(node_id: &[u8], direct_addresses: &[Vec<u8>]) -> Option<NodeAddr> {
+    let node_id = NodeId::try_from(node_id).ok()?;
 
-    let direct: Vec<std::net::SocketAddr> = direct_addresses
+    let mut direct: Vec<std::net::SocketAddr> = direct_addresses
         .iter()
         .filter_map(|address| std::str::from_utf8(address).ok()?.parse().ok())
         .collect();
@@ -483,8 +484,11 @@ fn node_addr_from_hints(node_id: &[u8], direct_addresses: &[Vec<u8>]) -> Option<
     if direct.is_empty() {
         return None;
     }
+    // Keep the sorted, duplicate-free order Iroh's address set used to give.
+    direct.sort_unstable();
+    direct.dedup();
 
-    Some(EndpointAddr::new(node_id).with_addrs((direct).into_iter().map(iroh::TransportAddr::Ip)))
+    Some(NodeAddr::with_addrs(node_id, direct))
 }
 
 /// Refresh an upgraded peer's legacy `Responded` liveness while its maintained
@@ -530,7 +534,6 @@ mod tests {
     use iroh::{
         endpoint::Connection,
         protocol::{AcceptError, ProtocolHandler, Router},
-        SecretKey,
     };
 
     use super::*;
@@ -547,7 +550,7 @@ mod tests {
 
     #[tokio::test]
     async fn iroh_endpoint_starts_without_relay_or_discovery() -> Result<(), Box<dyn Error>> {
-        let secret_key = SecretKey::from_bytes(&[7; 32]);
+        let secret_key = NodeSecretKey::from_bytes(&[7; 32]);
 
         let endpoint = direct_endpoint_builder(secret_key)
             .bind_addr(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))?

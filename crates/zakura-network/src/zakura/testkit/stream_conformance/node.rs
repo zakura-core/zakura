@@ -2,9 +2,10 @@
 
 use std::sync::{Arc, Mutex, PoisonError};
 
-use iroh::{protocol::Router, Endpoint, EndpointAddr};
+use iroh::{protocol::Router, Endpoint};
 use tokio_util::task::AbortOnDropHandle;
 use zakura_chain::parameters::Network;
+use zakura_quic::NodeAddr;
 
 use super::{
     service::LayoutShared, LayoutService, LayoutSession, SiblingService, StreamConformance,
@@ -12,9 +13,10 @@ use super::{
 };
 use crate::{
     zakura::{
-        handler::serve_native_dial_connection, testkit::LocalEndpointFactory, Service,
-        ServiceRegistry, Stream, ZakuraEndpoint, ZakuraHandshakeConfig, ZakuraLocalLimits,
-        ZakuraPeerId, ZakuraProtocolHandler, ZakuraSupervisorHandle, P2P_V2_ALPN,
+        handler::serve_native_dial_connection, iroh_compat::from_iroh_addr,
+        testkit::LocalEndpointFactory, Service, ServiceRegistry, Stream, ZakuraEndpoint,
+        ZakuraHandshakeConfig, ZakuraLocalLimits, ZakuraPeerId, ZakuraProtocolHandler,
+        ZakuraSupervisorHandle, P2P_V2_ALPN,
     },
     BoxError, Config,
 };
@@ -83,8 +85,8 @@ impl<A: StreamConformance> LayoutNode<A> {
     }
 
     /// This node's address.
-    pub(crate) async fn addr(&self) -> EndpointAddr {
-        LocalEndpointFactory::node_addr(&self.endpoint).await
+    pub(crate) async fn addr(&self) -> NodeAddr {
+        from_iroh_addr(&LocalEndpointFactory::node_addr(&self.endpoint).await)
     }
 
     /// The layout service's shared state.

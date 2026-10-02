@@ -7889,6 +7889,7 @@ dependencies = [
  "zakura-iroh",
  "zakura-jsonl-trace",
  "zakura-node-services",
+ "zakura-quic",
  "zakura-test",
 ]
 

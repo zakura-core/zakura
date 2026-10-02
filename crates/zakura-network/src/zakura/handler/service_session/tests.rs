@@ -1,4 +1,5 @@
 use super::*;
+use crate::zakura::iroh_compat::from_iroh_id;
 use crate::zakura::testkit::LocalEndpointFactory;
 use crate::zakura::{MessageRole, PayloadLen, StreamQueueDepths};
 use tokio_util::task::AbortOnDropHandle;
@@ -262,7 +263,8 @@ impl Fixture {
             )
             .with_endpoint(endpoint)
         };
-        let server_opens = i_open_collision_winner(&server.id(), &client.id());
+        let server_opens =
+            i_open_collision_winner(&from_iroh_id(&server.id()), &from_iroh_id(&client.id()));
         let server_handler = handler(
             server_tx,
             server_sibling_tx,
@@ -665,8 +667,8 @@ impl RawFixture {
         let peer_id = ZakuraPeerId::new(client.id().as_bytes().to_vec())?;
         let transcript_hash = native_connection_transcript_hash(
             ServicePeerDirection::Inbound,
-            &router.endpoint().id(),
-            &client.id(),
+            &from_iroh_id(&router.endpoint().id()),
+            &from_iroh_id(&client.id()),
         );
         let remote_ip = confirmed_remote_ip(&remote);
         let serving = AbortOnDropHandle::new(tokio::spawn(async move {

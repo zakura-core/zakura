@@ -2,8 +2,8 @@
 
 use std::{future::Future, pin::Pin, time::Duration};
 
-use iroh::EndpointAddr;
 use tokio::time::Instant;
+use zakura_quic::NodeAddr;
 
 use crate::zakura::{ZakuraEndpoint, ZakuraLocalLimits, ZakuraPeerId};
 
@@ -87,7 +87,7 @@ enum DialResult {
 /// supplies the real dial attempt and the supervisor's registration watch.
 pub(crate) async fn native_dial_supervised(
     endpoint: ZakuraEndpoint,
-    node_addr: EndpointAddr,
+    node_addr: NodeAddr,
     limits: ZakuraLocalLimits,
     policy: RedialPolicy,
 ) {

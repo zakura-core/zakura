@@ -3,7 +3,8 @@
 use std::net::{Ipv4Addr, SocketAddrV4};
 
 use blake2b_simd::Params as Blake2bParams;
-use iroh::{endpoint::QuicTransportConfig, Endpoint, EndpointAddr, SecretKey};
+use iroh::{endpoint::QuicTransportConfig, Endpoint, EndpointAddr};
+use zakura_quic::NodeSecretKey;
 
 use crate::{zakura::direct_endpoint_builder, BoxError};
 
@@ -28,8 +29,8 @@ impl LocalEndpointFactory {
         }
     }
 
-    /// Deterministically derive an Iroh secret key from a small seed.
-    pub fn secret_key(seed: u64) -> SecretKey {
+    /// Deterministically derive a node secret key from a small seed.
+    pub fn secret_key(seed: u64) -> NodeSecretKey {
         let mut seed_bytes = [0; 8];
         seed_bytes.copy_from_slice(&seed.to_le_bytes());
         let digest = Blake2bParams::new()
@@ -40,7 +41,7 @@ impl LocalEndpointFactory {
             .finalize();
         let mut key_bytes = [0; 32];
         key_bytes.copy_from_slice(digest.as_bytes());
-        SecretKey::from_bytes(&key_bytes)
+        NodeSecretKey::from_bytes(&key_bytes)
     }
 
     /// Bind a relay-free endpoint to an OS-assigned loopback port.
@@ -55,7 +56,7 @@ impl LocalEndpointFactory {
         Ok(endpoint)
     }
 
-    /// Return a fully initialized direct node address.
+    /// Return a fully initialized direct Iroh endpoint address.
     pub async fn node_addr(endpoint: &Endpoint) -> EndpointAddr {
         endpoint.addr()
     }

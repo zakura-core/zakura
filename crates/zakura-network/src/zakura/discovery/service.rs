@@ -17,9 +17,9 @@ use std::{
     time::Duration,
 };
 
-use iroh::EndpointId;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
+use zakura_quic::NodeId;
 
 use crate::zakura::{
     handle_pipe_exit, spawn_supervised_peer_task, spawn_supervised_pipe, BlockSyncHandle,
@@ -99,7 +99,7 @@ impl DiscoveryPeerSession {
         &self,
         limit: u16,
         wanted_services: Vec<ZakuraServiceId>,
-        exclude_node_ids: Vec<EndpointId>,
+        exclude_node_ids: Vec<NodeId>,
     ) -> Result<(), OrderedSendError> {
         self.try_send_message(DiscoveryMessage::GetPeers {
             limit,
@@ -504,7 +504,7 @@ struct DiscoveryExchangeStart {
     header_sync: Option<HeaderSyncHandle>,
     block_sync: Option<BlockSyncHandle>,
     connection_owners: Vec<Arc<dyn Service>>,
-    peer_node_id: EndpointId,
+    peer_node_id: NodeId,
     discovery_session: DiscoveryPeerSession,
     conn_id: ZakuraConnId,
     session_id: u64,
@@ -635,7 +635,7 @@ struct DiscoverySink {
     handle: ZakuraDiscoveryHandle,
     header_sync: Option<HeaderSyncHandle>,
     block_sync: Option<BlockSyncHandle>,
-    peer_node_id: EndpointId,
+    peer_node_id: NodeId,
     session: DiscoveryPeerSession,
     conn_id: ZakuraConnId,
     session_id: u64,
@@ -998,11 +998,11 @@ fn discovery_exchange_interval(record_refresh_interval: Duration) -> Duration {
     record_refresh_interval.min(DEFAULT_LIVE_SERVICE_SUMMARY_TTL / 2)
 }
 
-/// Returns the iroh node id encoded by a discovery peer id, if it is a 32-byte
+/// Returns the node id encoded by a discovery peer id, if it is a 32-byte
 /// node id.
-fn node_id_from_peer_id(peer_id: &ZakuraPeerId) -> Option<EndpointId> {
+fn node_id_from_peer_id(peer_id: &ZakuraPeerId) -> Option<NodeId> {
     let bytes: [u8; 32] = peer_id.as_bytes().try_into().ok()?;
-    EndpointId::from_bytes(&bytes).ok()
+    NodeId::from_bytes(&bytes).ok()
 }
 
 /// A peer-hello import error that should be logged and ignored rather than
@@ -1028,8 +1028,8 @@ mod tests {
         time::{Duration, SystemTime, UNIX_EPOCH},
     };
 
-    use iroh::SecretKey;
     use tokio::{sync::watch, task::JoinHandle};
+    use zakura_quic::NodeSecretKey;
 
     use super::*;
     use crate::zakura::block_sync::BlockSyncService;
@@ -1137,7 +1137,7 @@ mod tests {
     }
 
     fn signed_discovery_record(
-        secret_key: &SecretKey,
+        secret_key: &NodeSecretKey,
         handshake: &ZakuraHandshakeConfig,
     ) -> Result<ZakuraNodeRecord, crate::BoxError> {
         let body = ZakuraNodeRecordBody {
@@ -1160,7 +1160,7 @@ mod tests {
     async fn complete_peer_side_discovery_exchange(
         peer_send: &FramedSend,
         peer_recv: &mut FramedRecv,
-        peer_secret: &SecretKey,
+        peer_secret: &NodeSecretKey,
         handshake: &ZakuraHandshakeConfig,
     ) -> Result<(), crate::BoxError> {
         let mut saw_hello = false;
@@ -1222,7 +1222,7 @@ mod tests {
     ) -> Result<(), crate::BoxError> {
         let (_connected_tx, connected_rx) = watch::channel(Vec::new());
         let handshake = ZakuraHandshakeConfig::for_network(&Network::Mainnet);
-        let local_secret = SecretKey::from_bytes(&[21u8; 32]);
+        let local_secret = NodeSecretKey::from_bytes(&[21u8; 32]);
         let handle = ZakuraDiscoveryHandle::new(
             ZakuraDiscoveryLocalConfig {
                 secret_key: local_secret.clone(),
@@ -1244,7 +1244,7 @@ mod tests {
             connected_rx,
         )?;
         let service = DiscoveryService::new(handle.clone());
-        let peer_node_id = SecretKey::from_bytes(&[22u8; 32]).public();
+        let peer_node_id = NodeSecretKey::from_bytes(&[22u8; 32]).public();
         let peer_id = ZakuraPeerId::new(peer_node_id.as_bytes().to_vec())?;
         let (peer_send, service_recv) = framed_channel(8);
         let (service_send, mut peer_recv) = framed_channel(8);
@@ -1306,7 +1306,7 @@ mod tests {
     ) -> Result<(), crate::BoxError> {
         let (_connected_tx, connected_rx) = watch::channel(Vec::new());
         let handshake = ZakuraHandshakeConfig::for_network(&Network::Mainnet);
-        let local_secret = SecretKey::from_bytes(&[24u8; 32]);
+        let local_secret = NodeSecretKey::from_bytes(&[24u8; 32]);
         let discovery_handle = ZakuraDiscoveryHandle::new(
             ZakuraDiscoveryLocalConfig {
                 secret_key: local_secret.clone(),
@@ -1340,7 +1340,7 @@ mod tests {
             header_sync,
             Some(block_sync.clone()),
         );
-        let peer_node_id = SecretKey::from_bytes(&[25u8; 32]).public();
+        let peer_node_id = NodeSecretKey::from_bytes(&[25u8; 32]).public();
         let peer_id = ZakuraPeerId::new(peer_node_id.as_bytes().to_vec())?;
         let (peer_send, service_recv) = framed_channel(8);
         let (service_send, mut peer_recv) = framed_channel(8);
@@ -1409,7 +1409,7 @@ mod tests {
     {
         let (connected_tx, connected_rx) = watch::channel(Vec::new());
         let handshake = ZakuraHandshakeConfig::for_network(&Network::Mainnet);
-        let local_secret = SecretKey::from_bytes(&[23u8; 32]);
+        let local_secret = NodeSecretKey::from_bytes(&[23u8; 32]);
         let handle = ZakuraDiscoveryHandle::new(
             ZakuraDiscoveryLocalConfig {
                 secret_key: local_secret,
@@ -1425,7 +1425,7 @@ mod tests {
             connected_rx,
         )?;
         let service = DiscoveryService::new(handle.clone());
-        let peer_node_id = SecretKey::from_bytes(&[24u8; 32]).public();
+        let peer_node_id = NodeSecretKey::from_bytes(&[24u8; 32]).public();
         let peer_id = ZakuraPeerId::new(peer_node_id.as_bytes().to_vec())?;
         connected_tx.send_replace(vec![peer_id.clone()]);
 
@@ -1486,7 +1486,7 @@ mod tests {
     ) -> Result<(), crate::BoxError> {
         let (connected_tx, connected_rx) = watch::channel(Vec::new());
         let handshake = ZakuraHandshakeConfig::for_network(&Network::Mainnet);
-        let local_secret = SecretKey::from_bytes(&[40u8; 32]);
+        let local_secret = NodeSecretKey::from_bytes(&[40u8; 32]);
         let handle = ZakuraDiscoveryHandle::new(
             ZakuraDiscoveryLocalConfig {
                 secret_key: local_secret,
@@ -1502,7 +1502,7 @@ mod tests {
             connected_rx,
         )?;
         let service = DiscoveryService::new(handle.clone());
-        let peer_secret = SecretKey::from_bytes(&[41u8; 32]);
+        let peer_secret = NodeSecretKey::from_bytes(&[41u8; 32]);
         let peer_node_id = peer_secret.public();
         let peer_id = ZakuraPeerId::new(peer_node_id.as_bytes().to_vec())?;
         connected_tx.send_replace(vec![peer_id.clone()]);
@@ -1542,7 +1542,7 @@ mod tests {
     ) -> Result<(), crate::BoxError> {
         let (connected_tx, connected_rx) = watch::channel(Vec::new());
         let handshake = ZakuraHandshakeConfig::for_network(&Network::Mainnet);
-        let local_secret = SecretKey::from_bytes(&[42u8; 32]);
+        let local_secret = NodeSecretKey::from_bytes(&[42u8; 32]);
         let discovery_handle = ZakuraDiscoveryHandle::new(
             ZakuraDiscoveryLocalConfig {
                 secret_key: local_secret,
@@ -1563,7 +1563,7 @@ mod tests {
             header_sync.clone(),
             None,
         );
-        let peer_secret = SecretKey::from_bytes(&[43u8; 32]);
+        let peer_secret = NodeSecretKey::from_bytes(&[43u8; 32]);
         let peer_node_id = peer_secret.public();
         let peer_id = ZakuraPeerId::new(peer_node_id.as_bytes().to_vec())?;
         connected_tx.send_replace(vec![peer_id.clone()]);
@@ -1633,7 +1633,7 @@ mod tests {
     fn discovery_sink_for_session(
         handle: &ZakuraDiscoveryHandle,
         peer_id: &ZakuraPeerId,
-        peer_node_id: EndpointId,
+        peer_node_id: NodeId,
         conn_id: ZakuraConnId,
         session_id: u64,
     ) -> (DiscoverySink, FramedRecv) {
@@ -1668,7 +1668,7 @@ mod tests {
     ) -> Result<(), crate::BoxError> {
         let (_connected_tx, connected_rx) = watch::channel(Vec::new());
         let handshake = ZakuraHandshakeConfig::for_network(&Network::Mainnet);
-        let local_secret = SecretKey::from_bytes(&[44u8; 32]);
+        let local_secret = NodeSecretKey::from_bytes(&[44u8; 32]);
         let handle = ZakuraDiscoveryHandle::new(
             ZakuraDiscoveryLocalConfig {
                 secret_key: local_secret,
@@ -1684,7 +1684,7 @@ mod tests {
             connected_rx,
         )?;
 
-        let peer_secret = SecretKey::from_bytes(&[45u8; 32]);
+        let peer_secret = NodeSecretKey::from_bytes(&[45u8; 32]);
         let peer_node_id = peer_secret.public();
         let peer_id = ZakuraPeerId::new(peer_node_id.as_bytes().to_vec())?;
         let conn_id: ZakuraConnId = 0;
@@ -1709,7 +1709,7 @@ mod tests {
 
         // A hello from another peer violates the protocol.
         // The sink exposes that rejection directly.
-        let imposter_secret = SecretKey::from_bytes(&[46u8; 32]);
+        let imposter_secret = NodeSecretKey::from_bytes(&[46u8; 32]);
         let imposter_record = signed_discovery_record(&imposter_secret, &handshake)?;
 
         // Positive control: the current session does reject it. Without this the
@@ -1919,7 +1919,7 @@ mod tests {
         let handshake = ZakuraHandshakeConfig::for_network(&Network::Mainnet);
         let handle = ZakuraDiscoveryHandle::new(
             ZakuraDiscoveryLocalConfig {
-                secret_key: SecretKey::from_bytes(&[48u8; 32]),
+                secret_key: NodeSecretKey::from_bytes(&[48u8; 32]),
                 direct_addrs: Vec::new(),
                 services: vec![ZakuraServiceId::discovery()],
                 zakura_protocol_min: handshake.zakura_protocol_min,
@@ -1932,7 +1932,7 @@ mod tests {
             connected_rx,
         )?;
         let service = DiscoveryService::new(handle.clone());
-        let peer_secret = SecretKey::from_bytes(&[49u8; 32]);
+        let peer_secret = NodeSecretKey::from_bytes(&[49u8; 32]);
         let peer_id = ZakuraPeerId::new(peer_secret.public().as_bytes().to_vec())?;
         connected_tx.send_replace(vec![peer_id.clone()]);
 
@@ -1987,7 +1987,7 @@ mod tests {
         let handshake = ZakuraHandshakeConfig::for_network(&Network::Mainnet);
         let handle = ZakuraDiscoveryHandle::new(
             ZakuraDiscoveryLocalConfig {
-                secret_key: SecretKey::from_bytes(&[50u8; 32]),
+                secret_key: NodeSecretKey::from_bytes(&[50u8; 32]),
                 direct_addrs: Vec::new(),
                 services: vec![ZakuraServiceId::discovery()],
                 zakura_protocol_min: handshake.zakura_protocol_min,
@@ -2000,7 +2000,7 @@ mod tests {
             connected_rx,
         )?;
         let service = DiscoveryService::new(handle.clone());
-        let peer_secret = SecretKey::from_bytes(&[51u8; 32]);
+        let peer_secret = NodeSecretKey::from_bytes(&[51u8; 32]);
         let peer_id = ZakuraPeerId::new(peer_secret.public().as_bytes().to_vec())?;
         connected_tx.send_replace(vec![peer_id.clone()]);
 
@@ -2050,7 +2050,7 @@ mod tests {
         let handshake = ZakuraHandshakeConfig::for_network(&Network::Mainnet);
         let handle = ZakuraDiscoveryHandle::new(
             ZakuraDiscoveryLocalConfig {
-                secret_key: SecretKey::from_bytes(&[38u8; 32]),
+                secret_key: NodeSecretKey::from_bytes(&[38u8; 32]),
                 direct_addrs: Vec::new(),
                 services: vec![ZakuraServiceId::discovery()],
                 zakura_protocol_min: handshake.zakura_protocol_min,
@@ -2062,7 +2062,7 @@ mod tests {
             ZakuraDiscoveryConfig::default(),
             connected_rx,
         )?;
-        let peer_node_id = SecretKey::from_bytes(&[39u8; 32]).public();
+        let peer_node_id = NodeSecretKey::from_bytes(&[39u8; 32]).public();
         let peer_id = ZakuraPeerId::new(peer_node_id.as_bytes().to_vec())?;
         assert_eq!(
             handle
@@ -2108,7 +2108,7 @@ mod tests {
         let handshake = ZakuraHandshakeConfig::for_network(&Network::Mainnet);
         let handle = ZakuraDiscoveryHandle::new(
             ZakuraDiscoveryLocalConfig {
-                secret_key: SecretKey::from_bytes(&[48u8; 32]),
+                secret_key: NodeSecretKey::from_bytes(&[48u8; 32]),
                 direct_addrs: Vec::new(),
                 services: vec![ZakuraServiceId::discovery()],
                 zakura_protocol_min: handshake.zakura_protocol_min,
@@ -2120,7 +2120,7 @@ mod tests {
             ZakuraDiscoveryConfig::default(),
             connected_rx,
         )?;
-        let peer_node_id = SecretKey::from_bytes(&[49u8; 32]).public();
+        let peer_node_id = NodeSecretKey::from_bytes(&[49u8; 32]).public();
         let peer_id = ZakuraPeerId::new(peer_node_id.as_bytes().to_vec())?;
         assert_eq!(
             handle
@@ -2170,7 +2170,7 @@ mod tests {
         let handshake = ZakuraHandshakeConfig::for_network(&Network::Mainnet);
         let handle = ZakuraDiscoveryHandle::new(
             ZakuraDiscoveryLocalConfig {
-                secret_key: SecretKey::from_bytes(&[50u8; 32]),
+                secret_key: NodeSecretKey::from_bytes(&[50u8; 32]),
                 direct_addrs: Vec::new(),
                 services: vec![ZakuraServiceId::discovery()],
                 zakura_protocol_min: handshake.zakura_protocol_min,
@@ -2182,7 +2182,7 @@ mod tests {
             ZakuraDiscoveryConfig::default(),
             connected_rx,
         )?;
-        let peer_node_id = SecretKey::from_bytes(&[51u8; 32]).public();
+        let peer_node_id = NodeSecretKey::from_bytes(&[51u8; 32]).public();
         let peer_id = ZakuraPeerId::new(peer_node_id.as_bytes().to_vec())?;
         assert_eq!(
             handle
@@ -2270,7 +2270,7 @@ mod tests {
     ) -> Result<(), crate::BoxError> {
         let (connected_tx, connected_rx) = watch::channel(Vec::new());
         let handshake = ZakuraHandshakeConfig::for_network(&Network::Mainnet);
-        let local_secret = SecretKey::from_bytes(&[40u8; 32]);
+        let local_secret = NodeSecretKey::from_bytes(&[40u8; 32]);
         let handle = ZakuraDiscoveryHandle::new(
             ZakuraDiscoveryLocalConfig {
                 secret_key: local_secret,
@@ -2286,7 +2286,7 @@ mod tests {
             connected_rx,
         )?;
         let service = DiscoveryService::new(handle.clone());
-        let peer_secret = SecretKey::from_bytes(&[41u8; 32]);
+        let peer_secret = NodeSecretKey::from_bytes(&[41u8; 32]);
         let peer_node_id = peer_secret.public();
         let peer_id = ZakuraPeerId::new(peer_node_id.as_bytes().to_vec())?;
         connected_tx.send_replace(vec![peer_id.clone()]);
@@ -2339,7 +2339,7 @@ mod tests {
         let handshake = ZakuraHandshakeConfig::for_network(&Network::Mainnet);
         let handle = ZakuraDiscoveryHandle::new(
             ZakuraDiscoveryLocalConfig {
-                secret_key: SecretKey::from_bytes(&[46u8; 32]),
+                secret_key: NodeSecretKey::from_bytes(&[46u8; 32]),
                 direct_addrs: Vec::new(),
                 services: vec![ZakuraServiceId::discovery()],
                 zakura_protocol_min: handshake.zakura_protocol_min,
@@ -2355,7 +2355,7 @@ mod tests {
             connected_rx,
         )?;
         let service = DiscoveryService::new(handle.clone());
-        let peer_secret = SecretKey::from_bytes(&[47u8; 32]);
+        let peer_secret = NodeSecretKey::from_bytes(&[47u8; 32]);
         let peer_node_id = peer_secret.public();
         let peer_id = ZakuraPeerId::new(peer_node_id.as_bytes().to_vec())?;
         service.set_connection_owners(vec![Arc::new(TestConnectionOwner {
@@ -2398,7 +2398,7 @@ mod tests {
         let handshake = ZakuraHandshakeConfig::for_network(&Network::Mainnet);
         let handle = ZakuraDiscoveryHandle::new(
             ZakuraDiscoveryLocalConfig {
-                secret_key: SecretKey::from_bytes(&[44u8; 32]),
+                secret_key: NodeSecretKey::from_bytes(&[44u8; 32]),
                 direct_addrs: Vec::new(),
                 services: vec![ZakuraServiceId::discovery(), ZakuraServiceId::block_sync()],
                 zakura_protocol_min: handshake.zakura_protocol_min,
@@ -2419,7 +2419,7 @@ mod tests {
         let block_sync = Arc::new(block_sync);
         service.set_connection_owners(vec![block_sync.clone()]);
 
-        let peer_secret = SecretKey::from_bytes(&[45u8; 32]);
+        let peer_secret = NodeSecretKey::from_bytes(&[45u8; 32]);
         let peer_node_id = peer_secret.public();
         let peer_id = ZakuraPeerId::new(peer_node_id.as_bytes().to_vec())?;
         connected_tx.send_replace(vec![peer_id.clone()]);
@@ -2470,7 +2470,7 @@ mod tests {
     {
         let (connected_tx, connected_rx) = watch::channel(Vec::new());
         let handshake = ZakuraHandshakeConfig::for_network(&Network::Mainnet);
-        let local_secret = SecretKey::from_bytes(&[42u8; 32]);
+        let local_secret = NodeSecretKey::from_bytes(&[42u8; 32]);
         let discovery_handle = ZakuraDiscoveryHandle::new(
             ZakuraDiscoveryLocalConfig {
                 secret_key: local_secret,
@@ -2496,7 +2496,7 @@ mod tests {
         );
         let header_service = Arc::new(HeaderSyncService::new(header_sync.clone()));
         service.set_connection_owners(vec![header_service.clone()]);
-        let peer_secret = SecretKey::from_bytes(&[43u8; 32]);
+        let peer_secret = NodeSecretKey::from_bytes(&[43u8; 32]);
         let peer_node_id = peer_secret.public();
         let peer_id = ZakuraPeerId::new(peer_node_id.as_bytes().to_vec())?;
         connected_tx.send_replace(vec![peer_id.clone()]);

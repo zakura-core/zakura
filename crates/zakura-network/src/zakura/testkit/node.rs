@@ -2,13 +2,14 @@
 
 use std::{fmt, net::SocketAddr, sync::Arc, time::Duration};
 
-use iroh::{endpoint::QuicTransportConfig, protocol::Router, EndpointAddr, EndpointId};
+use iroh::{endpoint::QuicTransportConfig, protocol::Router};
 use tokio::{
     sync::{mpsc, Mutex},
     task::JoinHandle,
 };
 use tokio_util::sync::CancellationToken;
 use zakura_jsonl_trace::JsonlTracer;
+use zakura_quic::{NodeAddr, NodeId};
 
 use super::{InboundRecorder, LocalEndpointFactory, WaitError};
 use crate::{
@@ -48,8 +49,8 @@ impl ZakuraTestNode {
         self.seed
     }
 
-    /// Current Iroh node address.
-    pub async fn node_addr(&self) -> EndpointAddr {
+    /// Current node address.
+    pub async fn node_addr(&self) -> NodeAddr {
         self.endpoint.node_addr().await
     }
 
@@ -114,11 +115,11 @@ impl ZakuraTestNode {
     }
 
     /// Insert `peer` as a trusted static discovery candidate (loopback allowed)
-    /// and teach iroh its route, so the candidate dialer can connect to it.
+    /// and record its route, so the candidate dialer can connect to it.
     pub async fn insert_static_discovery_candidate(
         &self,
         peer: &ZakuraTestNode,
-    ) -> Result<EndpointId, BoxError> {
+    ) -> Result<NodeId, BoxError> {
         let node_addr = peer.node_addr().await;
         let node_id = node_addr.id;
 
@@ -136,12 +137,12 @@ impl ZakuraTestNode {
         self.connect_native_to_addr(peer_addr, timeout).await
     }
 
-    /// Start a native dial to an explicit [`EndpointAddr`] and wait until this node
+    /// Start a native dial to an explicit [`NodeAddr`] and wait until this node
     /// registers it. Lets tests advertise a specific direct-address list (for
     /// example a decoy address ahead of the reachable one).
     pub async fn connect_native_to_addr(
         &self,
-        peer_addr: EndpointAddr,
+        peer_addr: NodeAddr,
         timeout: Duration,
     ) -> Result<(), BoxError> {
         let mut handle = self.endpoint.spawn_native_dial(peer_addr.clone());
@@ -681,16 +682,17 @@ mod tests {
 
     // Pin a peer's advertised addresses to its IPv4 loopback path so same-host
     // dials share one source IP (test nodes also bind an IPv6 loopback socket).
-    fn ipv4_loopback_addr(peer_addr: &EndpointAddr) -> EndpointAddr {
-        let addr = EndpointAddr::new(peer_addr.id).with_addrs(
-            (peer_addr
-                .ip_addrs()
+    fn ipv4_loopback_addr(peer_addr: &NodeAddr) -> NodeAddr {
+        let addr = NodeAddr::with_addrs(
+            peer_addr.id,
+            peer_addr
+                .direct
+                .iter()
                 .copied()
-                .filter(|addr| addr.is_ipv4() && addr.ip().is_loopback()))
-            .map(iroh::TransportAddr::Ip),
+                .filter(|addr| addr.is_ipv4() && addr.ip().is_loopback()),
         );
         assert!(
-            addr.ip_addrs().next().is_some(),
+            !addr.direct.is_empty(),
             "test peer must advertise an IPv4 loopback direct address",
         );
         addr
@@ -716,18 +718,19 @@ mod tests {
         // Advertise an unreachable address before peer1's loopback address.
         // Charge the confirmed loopback path instead of the advertised address.
         //
-        // `EndpointAddr::direct_addresses` stores addresses in a `BTreeSet`.
+        // Iroh stores dial addresses in a `BTreeSet`, so the transport reorders them.
         // The decoy must sort below 127.0.0.1 to expose the previous behavior.
         // RFC 6598 shared address space meets that requirement and is not routable.
         let peer1_loopback = ipv4_loopback_addr(&peer1.node_addr().await);
         let decoy = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 1)), 1);
-        let decoy_first = EndpointAddr::new(peer1_loopback.id).with_addrs(
-            std::iter::once(decoy)
-                .chain(peer1_loopback.ip_addrs().copied())
-                .map(iroh::TransportAddr::Ip),
+        let decoy_first = NodeAddr::with_addrs(
+            peer1_loopback.id,
+            std::iter::once(decoy).chain(peer1_loopback.direct.iter().copied()),
         );
         assert_eq!(
-            decoy_first.ip_addrs().next(),
+            crate::zakura::iroh_compat::to_iroh_addr(&decoy_first)
+                .ip_addrs()
+                .next(),
             Some(&decoy),
             "the decoy must sort first, or this test cannot discriminate",
         );

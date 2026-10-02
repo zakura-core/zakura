@@ -6,9 +6,9 @@ use crate::zakura::{
     OrderedSendError, ServiceAdmissionDecision, ServicePeerDirection, ServicePeerSnapshot,
     ZakuraBlockSyncCandidateState,
 };
-use iroh::EndpointId;
 use rand::{rngs::OsRng, RngCore};
 use std::num::NonZeroU64;
+use zakura_quic::NodeId;
 
 mod trace;
 
@@ -2528,9 +2528,9 @@ impl BlockSyncReactor {
     }
 }
 
-pub(super) fn node_id_from_block_peer_id(peer_id: &ZakuraPeerId) -> Option<EndpointId> {
+pub(super) fn node_id_from_block_peer_id(peer_id: &ZakuraPeerId) -> Option<NodeId> {
     let bytes: [u8; 32] = peer_id.as_bytes().try_into().ok()?;
-    EndpointId::from_bytes(&bytes).ok()
+    NodeId::from_bytes(&bytes).ok()
 }
 
 fn elapsed_ms_u64(duration: Duration) -> u64 {

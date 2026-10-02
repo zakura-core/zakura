@@ -9,11 +9,11 @@ use tokio::sync::Mutex;
 use super::{LocalEndpointFactory, ZakuraTestNode};
 use crate::{
     zakura::{
-        legacy_gossip::ZAKURA_STREAM_GOSSIP, run_native_initiator_handshake, Frame,
-        HeaderSyncCodec, HeaderSyncMessage, StreamPrelude, ZakuraHandshakeConfig,
-        ZakuraLocalLimits, ZakuraPeerId, FRAME_HEADER_BYTES, LEGACY_GOSSIP_VERSION, P2P_V2_ALPN,
-        STREAM_PRELUDE_MAGIC, ZAKURA_BLOCK_SYNC_STREAM_VERSION, ZAKURA_CAP_HEADER_SYNC,
-        ZAKURA_CAP_LEGACY_GOSSIP, ZAKURA_DISCOVERY_STREAM_VERSION,
+        iroh_compat::to_iroh_addr, legacy_gossip::ZAKURA_STREAM_GOSSIP,
+        run_native_initiator_handshake, Frame, HeaderSyncCodec, HeaderSyncMessage, StreamPrelude,
+        ZakuraHandshakeConfig, ZakuraLocalLimits, ZakuraPeerId, FRAME_HEADER_BYTES,
+        LEGACY_GOSSIP_VERSION, P2P_V2_ALPN, STREAM_PRELUDE_MAGIC, ZAKURA_BLOCK_SYNC_STREAM_VERSION,
+        ZAKURA_CAP_HEADER_SYNC, ZAKURA_CAP_LEGACY_GOSSIP, ZAKURA_DISCOVERY_STREAM_VERSION,
         ZAKURA_HEADER_SYNC_STREAM_VERSION, ZAKURA_STREAM_BLOCK_SYNC, ZAKURA_STREAM_DISCOVERY,
         ZAKURA_STREAM_HEADER_SYNC,
     },
@@ -53,7 +53,9 @@ impl HostilePeer {
             .await?;
         let victim_addr = victim.node_addr().await;
 
-        let connection = endpoint.connect(victim_addr, P2P_V2_ALPN).await?;
+        let connection = endpoint
+            .connect(to_iroh_addr(&victim_addr), P2P_V2_ALPN)
+            .await?;
         let mut config = ZakuraHandshakeConfig::for_network(&Config::default().network);
         config.supported_capabilities = capabilities;
         let local_peer_id = ZakuraPeerId::new(endpoint.id().as_bytes().to_vec())?;

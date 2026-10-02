@@ -7,14 +7,16 @@
 
 use iroh::{
     endpoint::{Connection, RecvStream, SendStream},
-    Endpoint, EndpointAddr,
+    Endpoint,
 };
 use zakura_chain::parameters::Network;
+use zakura_quic::NodeAddr;
 
 use super::CONFORMANCE_DEADLINE;
 use crate::{
     zakura::{
         handler::{i_open_collision_winner, run_native_initiator_handshake_without_trace},
+        iroh_compat::{from_iroh_id, to_iroh_addr},
         testkit::{HostilePeer, LocalEndpointFactory},
         Frame, Stream, StreamPrelude, ZakuraHandshakeConfig, ZakuraLocalLimits, ZakuraPeerId,
         P2P_V2_ALPN, STREAM_PRELUDE_MAGIC,
@@ -47,7 +49,7 @@ impl RawLayoutPeer {
     /// Connect to `victim` and run the native handshake, offering
     /// `capabilities`.
     pub(crate) async fn connect(
-        victim: EndpointAddr,
+        victim: NodeAddr,
         limits: &ZakuraLocalLimits,
         seed: u64,
         capabilities: u64,
@@ -56,7 +58,7 @@ impl RawLayoutPeer {
             .endpoint(seed)
             .await?;
         let connection = within("connect", async {
-            Ok(endpoint.connect(victim, P2P_V2_ALPN).await?)
+            Ok(endpoint.connect(to_iroh_addr(&victim), P2P_V2_ALPN).await?)
         })
         .await?;
         let mut config = ZakuraHandshakeConfig::for_network(&Network::Mainnet);
@@ -109,7 +111,10 @@ impl RawLayoutPeer {
     pub(crate) async fn open_layout(&mut self, layout: &[Stream]) -> Result<(), BoxError> {
         self.members.clear();
         let multi = layout.len() > 1;
-        if i_open_collision_winner(&self.endpoint.id(), &self.connection.remote_id()) {
+        if i_open_collision_winner(
+            &from_iroh_id(&self.endpoint.id()),
+            &from_iroh_id(&self.connection.remote_id()),
+        ) {
             let wire_id: u64 = rand::random::<u64>().max(1);
             for member in layout {
                 let (mut send, recv) = self.open_stream(member.kind, member.version).await?;

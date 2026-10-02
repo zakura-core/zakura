@@ -8,13 +8,13 @@ use std::{
 };
 
 use futures::{stream::FuturesUnordered, FutureExt, StreamExt};
-use iroh::EndpointId;
 use tokio::{
     sync::{mpsc, watch},
     task::JoinHandle,
     time::{self, Instant},
 };
 use zakura_chain::block;
+use zakura_quic::NodeId;
 
 use super::{
     events::{HeaderPortOperation, PortDispatch},
@@ -5175,9 +5175,9 @@ fn next_height(height: block::Height) -> block::Height {
     block::Height(height.0.saturating_add(1).min(block::Height::MAX.0))
 }
 
-fn node_id_from_peer(peer: &ZakuraPeerId) -> Option<EndpointId> {
+fn node_id_from_peer(peer: &ZakuraPeerId) -> Option<NodeId> {
     let bytes: [u8; 32] = peer.as_bytes().try_into().ok()?;
-    EndpointId::from_bytes(&bytes).ok()
+    NodeId::from_bytes(&bytes).ok()
 }
 
 fn header_direction_label(direction: ServicePeerDirection) -> &'static str {

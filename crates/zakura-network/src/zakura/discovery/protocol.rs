@@ -11,13 +11,13 @@ use std::{
 };
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
-use iroh::{EndpointAddr, EndpointId, SecretKey};
 use thiserror::Error;
 use tokio::sync::{watch, Mutex};
 use zakura_chain::{
     block,
     primitives::ed25519::{Signature, SigningKey, VerificationKey},
 };
+use zakura_quic::{NodeAddr, NodeId, NodeSecretKey};
 
 use crate::zakura::{
     canonical_ip, BlockSyncStatus, ServiceAdmissionDecision, ServicePeerDirection,
@@ -220,8 +220,8 @@ impl TryFrom<String> for ZakuraServiceId {
 /// The signed fields in a Zakura node record.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ZakuraNodeRecordBody {
-    /// The authoring iroh node id.
-    pub node_id: EndpointId,
+    /// The authoring node id.
+    pub node_id: NodeId,
     /// Direct dial addresses advertised by the author.
     pub direct_addrs: Vec<SocketAddr>,
     /// Native services advertised by the author.
@@ -269,10 +269,10 @@ pub struct ZakuraNodeRecord {
 }
 
 impl ZakuraNodeRecord {
-    /// Signs `body` with the iroh secret key matching `body.node_id`.
+    /// Signs `body` with the node secret key matching `body.node_id`.
     pub fn sign(
         body: ZakuraNodeRecordBody,
-        secret_key: &SecretKey,
+        secret_key: &NodeSecretKey,
     ) -> Result<Self, DiscoveryWireError> {
         if body.node_id != secret_key.public() {
             return Err(DiscoveryWireError::SigningKeyMismatch);
@@ -331,7 +331,7 @@ pub struct GetServices {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Services {
     /// Node id of the responder that authored these live summaries.
-    pub node_id: EndpointId,
+    pub node_id: NodeId,
     /// Unix timestamp after which these live summaries are stale.
     pub expires_at_unix_secs: u64,
     /// Length-delimited live summaries for this responder only.
@@ -574,7 +574,7 @@ pub enum DiscoveryMessage {
         /// Optional service filter.
         wanted_services: Vec<ZakuraServiceId>,
         /// Node ids the responder should not return.
-        exclude_node_ids: Vec<EndpointId>,
+        exclude_node_ids: Vec<NodeId>,
     },
     /// Bounded signed peer records.
     Peers {
@@ -710,7 +710,7 @@ pub enum DiscoveryWireError {
     #[error("invalid Zakura discovery socket address family {0}")]
     InvalidAddressFamily(u8),
 
-    /// A node id did not decode into a valid iroh public key.
+    /// A node id did not decode into a valid Ed25519 public key.
     #[error("invalid Zakura discovery node id")]
     InvalidNodeId,
 
@@ -840,7 +840,7 @@ impl Default for ZakuraDiscoveryBookLimits {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ZakuraDiscoveryEntry {
     record: ZakuraNodeRecord,
-    source: Option<EndpointId>,
+    source: Option<NodeId>,
     is_static: bool,
     last_seen: u64,
     last_dial_attempt: Option<u64>,
@@ -857,7 +857,7 @@ impl ZakuraDiscoveryEntry {
     }
 
     /// Returns the peer that supplied this record, if any.
-    pub fn source(&self) -> Option<EndpointId> {
+    pub fn source(&self) -> Option<NodeId> {
         self.source
     }
 
@@ -912,7 +912,7 @@ pub struct ZakuraDiscoveryPersistedEntry {
     /// The signed node record.
     pub record: ZakuraNodeRecord,
     /// The peer that supplied the record, if any.
-    pub source: Option<EndpointId>,
+    pub source: Option<NodeId>,
     /// Whether this entry came from static/bootstrap configuration.
     pub is_static: bool,
     /// Last seen Unix timestamp.
@@ -934,8 +934,8 @@ pub struct ZakuraDiscoveryPersistedEntry {
 /// are local dial hints.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ZakuraDiscoveryDialCandidate {
-    /// Candidate iroh node id.
-    pub node_id: EndpointId,
+    /// Candidate node id.
+    pub node_id: NodeId,
     /// Direct addresses to pass to iroh for dialing.
     pub direct_addrs: Vec<SocketAddr>,
     /// Whether this candidate came from static/operator configuration.
@@ -943,13 +943,9 @@ pub struct ZakuraDiscoveryDialCandidate {
 }
 
 impl ZakuraDiscoveryDialCandidate {
-    /// Converts this candidate into an iroh dial address.
-    pub fn node_addr(&self) -> EndpointAddr {
-        EndpointAddr::new(self.node_id).with_addrs(
-            (self.direct_addrs.clone())
-                .into_iter()
-                .map(iroh::TransportAddr::Ip),
-        )
+    /// Converts this candidate into a dial address.
+    pub fn node_addr(&self) -> NodeAddr {
+        NodeAddr::with_addrs(self.node_id, self.direct_addrs.clone())
     }
 }
 
@@ -957,7 +953,7 @@ impl ZakuraDiscoveryDialCandidate {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ZakuraServiceCandidates {
     /// Connected peers whose latest valid `Hello` advertised the requested service.
-    pub connected: Vec<EndpointId>,
+    pub connected: Vec<NodeId>,
     /// Dialable discovered peers whose signed record advertised the requested service.
     pub discovered: Vec<ZakuraDiscoveryDialCandidate>,
     /// Whether discovered candidates came from explicit fallback to general peers.
@@ -970,9 +966,9 @@ pub struct ZakuraHeaderSyncCandidateState {
     /// Lowest header height that would make a new peer useful.
     pub target_height: block::Height,
     /// Peers already admitted by header sync; advisory "full" summaries do not remove them.
-    pub admitted_node_ids: Vec<EndpointId>,
+    pub admitted_node_ids: Vec<NodeId>,
     /// Peers in local, non-punitive advisory backoff after failing to confirm usefulness.
-    pub backed_off_node_ids: Vec<EndpointId>,
+    pub backed_off_node_ids: Vec<NodeId>,
 }
 
 impl Default for ZakuraHeaderSyncCandidateState {
@@ -991,7 +987,7 @@ pub struct ZakuraBlockSyncCandidateState {
     /// Header-known body heights currently missing from local state.
     pub missing_block_bodies: Vec<block::Height>,
     /// Peers already admitted by block sync; advisory "full" summaries do not remove them.
-    pub admitted_node_ids: Vec<EndpointId>,
+    pub admitted_node_ids: Vec<NodeId>,
 }
 
 /// The result of importing one signed discovery record.
@@ -1078,10 +1074,10 @@ pub enum DiscoveryBookError {
 /// In-memory storage for signed Zakura discovery records.
 #[derive(Clone, Debug)]
 pub struct ZakuraDiscoveryBook {
-    entries: HashMap<EndpointId, ZakuraDiscoveryEntry>,
-    static_candidates: HashMap<EndpointId, ZakuraStaticDiscoveryCandidate>,
+    entries: HashMap<NodeId, ZakuraDiscoveryEntry>,
+    static_candidates: HashMap<NodeId, ZakuraStaticDiscoveryCandidate>,
     limits: ZakuraDiscoveryBookLimits,
-    local_node_id: Option<EndpointId>,
+    local_node_id: Option<NodeId>,
     /// Process-local SipHash key for per-requester peer-sample disclosure ranking.
     ///
     /// Never leaves this process; a remote peer must not be able to predict — or grind a
@@ -1144,8 +1140,8 @@ impl Default for ZakuraDiscoveryConfig {
 /// Construction inputs for the locally authored Zakura discovery self-record.
 #[derive(Clone)]
 pub struct ZakuraDiscoveryLocalConfig {
-    /// Local iroh secret key used to sign self-records.
-    pub secret_key: SecretKey,
+    /// Local node secret key used to sign self-records.
+    pub secret_key: NodeSecretKey,
     /// Configured direct listener addresses to advertise if routable.
     pub direct_addrs: Vec<SocketAddr>,
     /// Locally supported native Zakura services.
@@ -1241,9 +1237,9 @@ impl fmt::Debug for ZakuraDiscoveryHandle {
 #[derive(Debug)]
 struct ZakuraDiscoveryInner {
     book: ZakuraDiscoveryBook,
-    active_services: HashMap<EndpointId, ZakuraActiveServiceEntry>,
+    active_services: HashMap<NodeId, ZakuraActiveServiceEntry>,
     admitted_peers: HashMap<ZakuraPeerId, ZakuraDiscoveryAdmittedPeer>,
-    last_connected_node_ids: HashSet<EndpointId>,
+    last_connected_node_ids: HashSet<NodeId>,
     local: ZakuraLocalDiscoveryState,
     config: ZakuraDiscoveryConfig,
 }
@@ -1459,8 +1455,8 @@ pub enum ZakuraLiveServiceSummary {
 
 #[derive(Clone)]
 struct ZakuraLocalDiscoveryState {
-    secret_key: SecretKey,
-    node_id: EndpointId,
+    secret_key: NodeSecretKey,
+    node_id: NodeId,
     direct_addrs: Vec<SocketAddr>,
     services: Vec<ZakuraServiceId>,
     zakura_protocol_min: u16,
@@ -1590,7 +1586,7 @@ impl ZakuraDiscoveryHandle {
     }
 
     /// Returns the local node id used in authored self-records.
-    pub fn local_node_id(&self) -> EndpointId {
+    pub fn local_node_id(&self) -> NodeId {
         self.self_record.borrow().body.node_id
     }
 
@@ -1760,7 +1756,7 @@ impl ZakuraDiscoveryHandle {
     /// Returns bounded node ids to exclude from a peer-sample request.
     ///
     /// Exclusions include the local node, currently connected peers, and recent known records.
-    pub async fn peer_sample_exclusions(&self) -> Vec<EndpointId> {
+    pub async fn peer_sample_exclusions(&self) -> Vec<NodeId> {
         let connected = connected_peer_node_ids(&self.connected.borrow());
         let inner = self.inner.lock().await;
         let mut excluded = Vec::with_capacity(inner.config.max_excluded_node_ids);
@@ -1821,7 +1817,7 @@ impl ZakuraDiscoveryHandle {
     pub async fn import_peer_records(
         &self,
         records: impl IntoIterator<Item = ZakuraNodeRecord>,
-        source: Option<EndpointId>,
+        source: Option<NodeId>,
     ) -> ImportBatchOutcome {
         let now = current_unix_secs();
         let context = self.import_validation.context(now);
@@ -1855,7 +1851,7 @@ impl ZakuraDiscoveryHandle {
     pub async fn import_peer_record(
         &self,
         record: ZakuraNodeRecord,
-        source: Option<EndpointId>,
+        source: Option<NodeId>,
     ) -> Result<ImportOutcome, DiscoveryBookError> {
         let now = current_unix_secs();
         let mut inner = self.inner.lock().await;
@@ -1870,7 +1866,7 @@ impl ZakuraDiscoveryHandle {
     pub async fn import_connected_peer_services(
         &self,
         services: Services,
-        peer_node_id: EndpointId,
+        peer_node_id: NodeId,
     ) -> Result<(), DiscoveryWireError> {
         self.import_connected_peer_services_at(services, peer_node_id, current_unix_secs())
             .await
@@ -1879,7 +1875,7 @@ impl ZakuraDiscoveryHandle {
     async fn import_connected_peer_services_at(
         &self,
         services: Services,
-        peer_node_id: EndpointId,
+        peer_node_id: NodeId,
         now: u64,
     ) -> Result<(), DiscoveryWireError> {
         if services.node_id != peer_node_id {
@@ -1948,7 +1944,7 @@ impl ZakuraDiscoveryHandle {
     pub async fn import_connected_peer_record(
         &self,
         record: ZakuraNodeRecord,
-        peer_node_id: EndpointId,
+        peer_node_id: NodeId,
     ) -> Result<ImportOutcome, DiscoveryBookError> {
         if record.body.node_id != peer_node_id {
             return Err(DiscoveryBookError::MismatchedConnectedPeerRecord);
@@ -1998,7 +1994,7 @@ impl ZakuraDiscoveryHandle {
     /// Inserts a trusted static/bootstrap dial candidate.
     pub async fn insert_static_candidate(
         &self,
-        node_addr: EndpointAddr,
+        node_addr: NodeAddr,
     ) -> Result<(), DiscoveryBookError> {
         let mut inner = self.inner.lock().await;
         inner
@@ -2012,10 +2008,10 @@ impl ZakuraDiscoveryHandle {
     /// per-epoch disclosure set; see [`ZakuraDiscoveryBook::sample_peers`].
     pub async fn sample_peers(
         &self,
-        requester: EndpointId,
+        requester: NodeId,
         limit: usize,
         wanted_services: &[ZakuraServiceId],
-        exclude_node_ids: &[EndpointId],
+        exclude_node_ids: &[NodeId],
     ) -> Vec<ZakuraNodeRecord> {
         let now = current_unix_secs();
         let inner = self.inner.lock().await;
@@ -2035,7 +2031,7 @@ impl ZakuraDiscoveryHandle {
     pub async fn dial_candidates(
         &self,
         wanted_services: &[ZakuraServiceId],
-        in_flight_node_ids: &[EndpointId],
+        in_flight_node_ids: &[NodeId],
     ) -> Vec<ZakuraDiscoveryDialCandidate> {
         let connected = self.connected.borrow().clone();
         let (limit, dial_backoff_base, dial_backoff_max, book_limits) = {
@@ -2080,7 +2076,7 @@ impl ZakuraDiscoveryHandle {
     pub(crate) async fn dial_candidates_preferring_any_service(
         &self,
         preferred_services: &[ZakuraServiceId],
-        in_flight_node_ids: &[EndpointId],
+        in_flight_node_ids: &[NodeId],
     ) -> Vec<ZakuraDiscoveryDialCandidate> {
         let connected = self.connected.borrow().clone();
         let (limit, dial_backoff_base, dial_backoff_max) = {
@@ -2132,7 +2128,7 @@ impl ZakuraDiscoveryHandle {
         &self,
         service: &ZakuraServiceId,
         allow_fallback: bool,
-        in_flight_node_ids: &[EndpointId],
+        in_flight_node_ids: &[NodeId],
     ) -> ZakuraServiceCandidates {
         let connected = self.connected.borrow().clone();
         let connected_node_ids = connected_peer_node_ids(&connected);
@@ -2172,7 +2168,7 @@ impl ZakuraDiscoveryHandle {
             .collect();
         connected_entries
             .sort_by_key(|(_, preference, sort_key)| (Reverse(*preference), *sort_key));
-        let connected: Vec<EndpointId> = connected_entries
+        let connected: Vec<NodeId> = connected_entries
             .into_iter()
             .map(|(node_id, _, _)| node_id)
             .collect();
@@ -2222,7 +2218,7 @@ impl ZakuraDiscoveryHandle {
         &self,
         header_sync: &ZakuraHeaderSyncCandidateState,
         allow_fallback: bool,
-        in_flight_node_ids: &[EndpointId],
+        in_flight_node_ids: &[NodeId],
     ) -> ZakuraServiceCandidates {
         let connected = self.connected.borrow().clone();
         let connected_node_ids = connected_peer_node_ids(&connected);
@@ -2278,7 +2274,7 @@ impl ZakuraDiscoveryHandle {
             .collect();
         connected_entries
             .sort_by_key(|(_, preference, sort_key)| (Reverse(*preference), *sort_key));
-        let connected: Vec<EndpointId> = connected_entries
+        let connected: Vec<NodeId> = connected_entries
             .into_iter()
             .map(|(node_id, _, _)| node_id)
             .collect();
@@ -2342,7 +2338,7 @@ impl ZakuraDiscoveryHandle {
         &self,
         block_sync: &ZakuraBlockSyncCandidateState,
         allow_fallback: bool,
-        in_flight_node_ids: &[EndpointId],
+        in_flight_node_ids: &[NodeId],
     ) -> ZakuraServiceCandidates {
         let connected = self.connected.borrow().clone();
         let connected_node_ids = connected_peer_node_ids(&connected);
@@ -2401,7 +2397,7 @@ impl ZakuraDiscoveryHandle {
             .collect();
         connected_entries
             .sort_by_key(|(_, preference, sort_key)| (Reverse(*preference), *sort_key));
-        let connected: Vec<EndpointId> = connected_entries
+        let connected: Vec<NodeId> = connected_entries
             .into_iter()
             .map(|(node_id, _, _)| node_id)
             .collect();
@@ -2445,25 +2441,25 @@ impl ZakuraDiscoveryHandle {
     }
 
     /// Marks a discovery dial attempt for `node_id`.
-    pub async fn mark_dial_attempt(&self, node_id: &EndpointId) {
+    pub async fn mark_dial_attempt(&self, node_id: &NodeId) {
         let mut inner = self.inner.lock().await;
         inner.book.mark_dial_attempt(node_id, current_unix_secs());
     }
 
     /// Marks a successful discovery dial for `node_id`.
-    pub async fn mark_dial_success(&self, node_id: &EndpointId) {
+    pub async fn mark_dial_success(&self, node_id: &NodeId) {
         let mut inner = self.inner.lock().await;
         inner.book.mark_dial_success(node_id, current_unix_secs());
     }
 
     /// Marks a failed discovery dial for `node_id`.
-    pub async fn mark_dial_failure(&self, node_id: &EndpointId) {
+    pub async fn mark_dial_failure(&self, node_id: &NodeId) {
         let mut inner = self.inner.lock().await;
         inner.book.mark_dial_failure(node_id, current_unix_secs());
     }
 
     /// Marks a completed short-lived discovery exchange for local redial backoff.
-    pub async fn mark_short_lived_exchange(&self, node_id: &EndpointId) {
+    pub async fn mark_short_lived_exchange(&self, node_id: &NodeId) {
         let mut inner = self.inner.lock().await;
         inner
             .book
@@ -2471,7 +2467,7 @@ impl ZakuraDiscoveryHandle {
     }
 
     /// Returns a connected peer's advertised services as a derived supervisor-watch projection.
-    pub async fn active_services(&self, node_id: EndpointId) -> Option<Vec<ZakuraServiceId>> {
+    pub async fn active_services(&self, node_id: NodeId) -> Option<Vec<ZakuraServiceId>> {
         let connected = connected_peer_node_ids(&self.connected.borrow());
         let now = current_unix_secs();
         let mut inner = self.inner.lock().await;
@@ -2489,7 +2485,7 @@ impl ZakuraDiscoveryHandle {
     /// Returns fresh first-party live summaries cached for a connected peer.
     pub async fn live_service_summaries(
         &self,
-        node_id: EndpointId,
+        node_id: NodeId,
     ) -> Option<Vec<ZakuraCachedLiveServiceSummary>> {
         self.live_service_summaries_at(node_id, current_unix_secs())
             .await
@@ -2497,7 +2493,7 @@ impl ZakuraDiscoveryHandle {
 
     async fn live_service_summaries_at(
         &self,
-        node_id: EndpointId,
+        node_id: NodeId,
         now: u64,
     ) -> Option<Vec<ZakuraCachedLiveServiceSummary>> {
         let connected = connected_peer_node_ids(&self.connected.borrow());
@@ -2514,7 +2510,7 @@ impl ZakuraDiscoveryHandle {
     }
 
     /// Returns a stored discovery record for `node_id`, if present.
-    pub async fn record_for(&self, node_id: EndpointId) -> Option<ZakuraNodeRecord> {
+    pub async fn record_for(&self, node_id: NodeId) -> Option<ZakuraNodeRecord> {
         let inner = self.inner.lock().await;
         inner.book.get(&node_id).map(|entry| entry.record().clone())
     }
@@ -2539,7 +2535,7 @@ impl ZakuraDiscoveryInner {
         }
     }
 
-    fn sync_active_services(&mut self, connected_node_ids: &[EndpointId], now_unix_secs: u64) {
+    fn sync_active_services(&mut self, connected_node_ids: &[NodeId], now_unix_secs: u64) {
         let connected_node_ids: HashSet<_> = connected_node_ids.iter().copied().collect();
         self.active_services
             .retain(|node_id, _| connected_node_ids.contains(node_id));
@@ -2561,7 +2557,7 @@ impl ZakuraDiscoveryInner {
 
     fn update_active_services_from_connected_record(
         &mut self,
-        node_id: EndpointId,
+        node_id: NodeId,
         record: ZakuraNodeRecord,
         services: Vec<ZakuraServiceId>,
         import_result: &Result<ImportOutcome, DiscoveryBookError>,
@@ -2662,10 +2658,7 @@ impl ZakuraDiscoveryBook {
     }
 
     /// Creates an empty discovery book that rejects the local node's record.
-    pub fn with_local_node_id(
-        limits: ZakuraDiscoveryBookLimits,
-        local_node_id: EndpointId,
-    ) -> Self {
+    pub fn with_local_node_id(limits: ZakuraDiscoveryBookLimits, local_node_id: NodeId) -> Self {
         Self {
             local_node_id: Some(local_node_id),
             ..Self::new(limits)
@@ -2701,7 +2694,7 @@ impl ZakuraDiscoveryBook {
     }
 
     /// Returns the entry for `node_id`, if present.
-    pub fn get(&self, node_id: &EndpointId) -> Option<&ZakuraDiscoveryEntry> {
+    pub fn get(&self, node_id: &NodeId) -> Option<&ZakuraDiscoveryEntry> {
         self.entries.get(node_id)
     }
 
@@ -2711,14 +2704,14 @@ impl ZakuraDiscoveryBook {
     /// from peer-supplied records and are never returned in peer samples.
     pub fn insert_static_candidate(
         &mut self,
-        node_addr: EndpointAddr,
+        node_addr: NodeAddr,
         now: u64,
     ) -> Result<(), DiscoveryBookError> {
         if self.local_node_id == Some(node_addr.id) {
             return Err(DiscoveryBookError::SelfRecord);
         }
 
-        let mut direct_addrs: Vec<_> = node_addr.ip_addrs().copied().collect();
+        let mut direct_addrs = node_addr.direct;
         direct_addrs.sort_unstable();
         direct_addrs.dedup();
         if direct_addrs.is_empty() {
@@ -2753,7 +2746,7 @@ impl ZakuraDiscoveryBook {
     pub fn import_record(
         &mut self,
         record: ZakuraNodeRecord,
-        source: Option<EndpointId>,
+        source: Option<NodeId>,
         now: u64,
         context: &DiscoveryRecordValidationContext,
     ) -> Result<ImportOutcome, DiscoveryBookError> {
@@ -2785,7 +2778,7 @@ impl ZakuraDiscoveryBook {
     fn import_pre_verified_records(
         &mut self,
         records: impl IntoIterator<Item = ZakuraNodeRecord>,
-        source: Option<EndpointId>,
+        source: Option<NodeId>,
         now: u64,
         context: &DiscoveryRecordValidationContext,
         outcome: &mut ImportBatchOutcome,
@@ -2802,7 +2795,7 @@ impl ZakuraDiscoveryBook {
     pub fn import_records(
         &mut self,
         records: impl IntoIterator<Item = ZakuraNodeRecord>,
-        source: Option<EndpointId>,
+        source: Option<NodeId>,
         now: u64,
         context: &DiscoveryRecordValidationContext,
     ) -> ImportBatchOutcome {
@@ -2842,9 +2835,9 @@ impl ZakuraDiscoveryBook {
         &self,
         limit: usize,
         wanted_services: &[ZakuraServiceId],
-        exclude_node_ids: &[EndpointId],
+        exclude_node_ids: &[NodeId],
         now: u64,
-        requester: EndpointId,
+        requester: NodeId,
     ) -> Vec<ZakuraNodeRecord> {
         let exclude_node_ids: HashSet<_> = exclude_node_ids.iter().copied().collect();
         let disclosure_limit = self.limits.max_imported_records_per_response;
@@ -2895,7 +2888,7 @@ impl ZakuraDiscoveryBook {
     /// with a random 128-bit key, so the secret keys the hash rather than sitting in the
     /// hashed message; a requester that collects its own rank ordering across many epochs
     /// still cannot solve for the key and predict another requester's set.
-    fn disclosure_rank(&self, requester: EndpointId, epoch: u64, node_id: &EndpointId) -> u64 {
+    fn disclosure_rank(&self, requester: NodeId, epoch: u64, node_id: &NodeId) -> u64 {
         use std::hash::{BuildHasher, Hasher};
 
         let mut hasher = self.disclosure_key.build_hasher();
@@ -3003,7 +2996,7 @@ impl ZakuraDiscoveryBook {
     }
 
     /// Marks a dial attempt for `node_id`.
-    pub fn mark_dial_attempt(&mut self, node_id: &EndpointId, now: u64) {
+    pub fn mark_dial_attempt(&mut self, node_id: &NodeId, now: u64) {
         if let Some(entry) = self.entries.get_mut(node_id) {
             entry.last_dial_attempt = Some(now);
         }
@@ -3013,7 +3006,7 @@ impl ZakuraDiscoveryBook {
     }
 
     /// Marks a successful dial for `node_id`, confirming its record for peer samples.
-    pub fn mark_dial_success(&mut self, node_id: &EndpointId, now: u64) {
+    pub fn mark_dial_success(&mut self, node_id: &NodeId, now: u64) {
         if let Some(entry) = self.entries.get_mut(node_id) {
             entry.last_success = Some(now);
             entry.last_confirmed = Some(now);
@@ -3026,7 +3019,7 @@ impl ZakuraDiscoveryBook {
     }
 
     /// Marks a failed dial for `node_id` without blacklisting it.
-    pub fn mark_dial_failure(&mut self, node_id: &EndpointId, _now: u64) {
+    pub fn mark_dial_failure(&mut self, node_id: &NodeId, _now: u64) {
         if let Some(entry) = self.entries.get_mut(node_id) {
             entry.failure_count = entry.failure_count.saturating_add(1);
         }
@@ -3036,7 +3029,7 @@ impl ZakuraDiscoveryBook {
     }
 
     /// Marks a successful short-lived discovery exchange for `node_id`.
-    pub fn mark_short_lived_exchange(&mut self, node_id: &EndpointId, now: u64) {
+    pub fn mark_short_lived_exchange(&mut self, node_id: &NodeId, now: u64) {
         if let Some(entry) = self.entries.get_mut(node_id) {
             entry.last_short_lived_exchange = Some(now);
         }
@@ -3046,13 +3039,13 @@ impl ZakuraDiscoveryBook {
     }
 
     /// Returns the advertised services for `node_id`.
-    pub fn services_for(&self, node_id: &EndpointId) -> Option<Vec<ZakuraServiceId>> {
+    pub fn services_for(&self, node_id: &NodeId) -> Option<Vec<ZakuraServiceId>> {
         self.entries
             .get(node_id)
             .map(|entry| entry.record.body.services.clone())
     }
 
-    fn recent_node_ids(&self, limit: usize) -> Vec<EndpointId> {
+    fn recent_node_ids(&self, limit: usize) -> Vec<NodeId> {
         let mut entries: Vec<_> = self.entries.values().collect();
         entries.sort_by_key(|entry| {
             (
@@ -3126,7 +3119,7 @@ impl ZakuraDiscoveryBook {
     fn import_record_inner(
         &mut self,
         record: ZakuraNodeRecord,
-        source: Option<EndpointId>,
+        source: Option<NodeId>,
         is_static: bool,
         pre_verified: bool,
         now: u64,
@@ -3241,7 +3234,7 @@ impl ZakuraDiscoveryBook {
         }
     }
 
-    fn next_eviction_candidate(&self, now: u64) -> Option<EndpointId> {
+    fn next_eviction_candidate(&self, now: u64) -> Option<NodeId> {
         self.entries
             .iter()
             .filter(|(_, entry)| !entry.is_static && entry_is_expired(entry, now))
@@ -3287,7 +3280,7 @@ impl ZakuraDiscoveryBook {
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 struct DiscoveryEntryMetadata {
-    source: Option<EndpointId>,
+    source: Option<NodeId>,
     is_static: bool,
     last_seen: u64,
     last_dial_attempt: Option<u64>,
@@ -3298,7 +3291,7 @@ struct DiscoveryEntryMetadata {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ZakuraStaticDiscoveryCandidate {
-    node_id: EndpointId,
+    node_id: NodeId,
     direct_addrs: Vec<SocketAddr>,
     last_seen: u64,
     last_dial_attempt: Option<u64>,
@@ -3309,8 +3302,8 @@ struct ZakuraStaticDiscoveryCandidate {
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(crate) struct DialCandidateExclusions<'a> {
-    connected_node_ids: &'a [EndpointId],
-    in_flight_node_ids: &'a [EndpointId],
+    connected_node_ids: &'a [NodeId],
+    in_flight_node_ids: &'a [NodeId],
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -3325,7 +3318,7 @@ enum DialCandidateRef<'a> {
 }
 
 impl DialCandidateRef<'_> {
-    fn node_id(&self) -> EndpointId {
+    fn node_id(&self) -> NodeId {
         match self {
             Self::SignedRecord(entry) => entry.record.body.node_id,
             Self::StaticConfigured(candidate) => candidate.node_id,
@@ -3592,22 +3585,22 @@ fn bounded_services(
         .collect()
 }
 
-fn bounded_node_ids(node_ids: &[EndpointId], max_node_ids: usize) -> Vec<EndpointId> {
+fn bounded_node_ids(node_ids: &[NodeId], max_node_ids: usize) -> Vec<NodeId> {
     node_ids.iter().take(max_node_ids).copied().collect()
 }
 
-fn push_excluded_node_id(excluded: &mut Vec<EndpointId>, node_id: EndpointId, max_node_ids: usize) {
+fn push_excluded_node_id(excluded: &mut Vec<NodeId>, node_id: NodeId, max_node_ids: usize) {
     if excluded.len() < max_node_ids && !excluded.contains(&node_id) {
         excluded.push(node_id);
     }
 }
 
-fn connected_peer_node_ids(connected: &[ZakuraPeerId]) -> Vec<EndpointId> {
+fn connected_peer_node_ids(connected: &[ZakuraPeerId]) -> Vec<NodeId> {
     connected
         .iter()
         .filter_map(|peer_id| {
             let bytes: [u8; NODE_ID_BYTES] = peer_id.as_bytes().try_into().ok()?;
-            EndpointId::from_bytes(&bytes).ok()
+            NodeId::from_bytes(&bytes).ok()
         })
         .collect()
 }
@@ -3882,7 +3875,7 @@ fn dial_backoff_secs(failure_count: u32, base_secs: u64, max_secs: u64) -> u64 {
     base_secs.saturating_mul(1u64 << shift).min(max_secs)
 }
 
-fn node_id_sort_key(node_id: &EndpointId) -> [u8; NODE_ID_BYTES] {
+fn node_id_sort_key(node_id: &NodeId) -> [u8; NODE_ID_BYTES] {
     *node_id.as_bytes()
 }
 
@@ -3946,7 +3939,7 @@ fn validate_record_body_bounds(body: &ZakuraNodeRecordBody) -> Result<(), Discov
 fn validate_query_fields(
     limit: u16,
     wanted_services: &[ZakuraServiceId],
-    exclude_node_ids: &[EndpointId],
+    exclude_node_ids: &[NodeId],
 ) -> Result<(), DiscoveryWireError> {
     if usize::from(limit) > MAX_DISCOVERY_RECORDS_PER_RESPONSE {
         return Err(DiscoveryWireError::OversizedPayload {
@@ -4157,7 +4150,7 @@ fn decode_record_list(
 fn encode_query_fields(
     limit: u16,
     wanted_services: &[ZakuraServiceId],
-    exclude_node_ids: &[EndpointId],
+    exclude_node_ids: &[NodeId],
     writer: &mut impl Write,
 ) -> Result<(), DiscoveryWireError> {
     writer.write_u16::<LittleEndian>(limit)?;
@@ -4168,7 +4161,7 @@ fn encode_query_fields(
 
 fn decode_query_fields(
     reader: &mut impl Read,
-) -> Result<(u16, Vec<ZakuraServiceId>, Vec<EndpointId>), DiscoveryWireError> {
+) -> Result<(u16, Vec<ZakuraServiceId>, Vec<NodeId>), DiscoveryWireError> {
     let limit = reader.read_u16::<LittleEndian>()?;
     let wanted_services = decode_service_ids(reader, MAX_SERVICES_PER_RECORD)?;
     let exclude_node_ids = decode_node_ids(reader, MAX_DISCOVERY_EXCLUDED_NODE_IDS)?;
@@ -4292,7 +4285,7 @@ fn decode_record_body(bytes: &[u8]) -> Result<ZakuraNodeRecordBody, DiscoveryWir
     let mut node_id_bytes = [0u8; NODE_ID_BYTES];
     reader.read_exact(&mut node_id_bytes)?;
     let node_id =
-        EndpointId::from_bytes(&node_id_bytes).map_err(|_| DiscoveryWireError::InvalidNodeId)?;
+        NodeId::from_bytes(&node_id_bytes).map_err(|_| DiscoveryWireError::InvalidNodeId)?;
     let direct_addrs = decode_socket_addrs(&mut reader)?;
     let services = decode_service_ids(&mut reader, MAX_SERVICES_PER_RECORD)?;
     let zakura_protocol_min = reader.read_u16::<LittleEndian>()?;
@@ -4454,10 +4447,7 @@ fn decode_service_id(reader: &mut impl Read) -> Result<ZakuraServiceId, Discover
     Ok(ZakuraServiceId(service))
 }
 
-fn encode_node_ids(
-    node_ids: &[EndpointId],
-    writer: &mut impl Write,
-) -> Result<(), DiscoveryWireError> {
+fn encode_node_ids(node_ids: &[NodeId], writer: &mut impl Write) -> Result<(), DiscoveryWireError> {
     if node_ids.len() > MAX_DISCOVERY_EXCLUDED_NODE_IDS {
         return Err(DiscoveryWireError::OversizedPayload {
             actual: node_ids.len(),
@@ -4474,7 +4464,7 @@ fn encode_node_ids(
 fn decode_node_ids(
     reader: &mut impl Read,
     max_count: usize,
-) -> Result<Vec<EndpointId>, DiscoveryWireError> {
+) -> Result<Vec<NodeId>, DiscoveryWireError> {
     let count = usize::from(reader.read_u16::<LittleEndian>()?);
     if count > max_count {
         return Err(DiscoveryWireError::OversizedPayload {
@@ -4489,10 +4479,10 @@ fn decode_node_ids(
     Ok(node_ids)
 }
 
-fn decode_node_id(reader: &mut impl Read) -> Result<EndpointId, DiscoveryWireError> {
+fn decode_node_id(reader: &mut impl Read) -> Result<NodeId, DiscoveryWireError> {
     let mut bytes = [0u8; NODE_ID_BYTES];
     reader.read_exact(&mut bytes)?;
-    EndpointId::from_bytes(&bytes).map_err(|_| DiscoveryWireError::InvalidNodeId)
+    NodeId::from_bytes(&bytes).map_err(|_| DiscoveryWireError::InvalidNodeId)
 }
 
 fn network_id_from_code(value: u32) -> Result<ZakuraNetworkId, DiscoveryWireError> {
@@ -4738,16 +4728,16 @@ fn u16_from_usize(value: usize, field: &'static str) -> Result<u16, DiscoveryWir
 mod tests {
     use std::{net::IpAddr, time::Duration};
 
-    use iroh::SecretKey;
     use rand::{rngs::StdRng, SeedableRng};
+    use zakura_quic::NodeSecretKey;
 
     use super::*;
 
     const NOW: u64 = 1_700_000_000;
     const CHAIN_ID: [u8; 32] = [7; 32];
 
-    fn secret_key() -> SecretKey {
-        SecretKey::generate()
+    fn secret_key() -> NodeSecretKey {
+        NodeSecretKey::generate()
     }
 
     fn service(index: usize) -> ZakuraServiceId {
@@ -4766,7 +4756,7 @@ mod tests {
         }
     }
 
-    fn body(secret_key: &SecretKey) -> ZakuraNodeRecordBody {
+    fn body(secret_key: &NodeSecretKey) -> ZakuraNodeRecordBody {
         ZakuraNodeRecordBody {
             node_id: secret_key.public(),
             direct_addrs: vec![
@@ -4797,7 +4787,7 @@ mod tests {
 
     fn sign_record_with_prefix(
         body: ZakuraNodeRecordBody,
-        secret_key: &SecretKey,
+        secret_key: &NodeSecretKey,
         domain: &[u8],
         record_format_version: u16,
     ) -> ZakuraNodeRecord {
@@ -4853,7 +4843,7 @@ mod tests {
     }
 
     fn record_with_secret(
-        secret_key: &SecretKey,
+        secret_key: &NodeSecretKey,
         sequence: u64,
         service: ZakuraServiceId,
     ) -> ZakuraNodeRecord {
@@ -4888,7 +4878,7 @@ mod tests {
     /// The disclosure ranking is keyed by a per-book random `RandomState`, so tests assert
     /// the set properties — stability within an epoch, rotation across epochs, and the
     /// disclosure bound — rather than any specific node id ordering.
-    fn test_requester() -> EndpointId {
+    fn test_requester() -> NodeId {
         secret_key().public()
     }
 
@@ -4928,7 +4918,7 @@ mod tests {
     }
 
     fn runtime_record_with_secret(
-        secret_key: &SecretKey,
+        secret_key: &NodeSecretKey,
         sequence: u64,
         service: ZakuraServiceId,
         addr: SocketAddr,
@@ -4937,7 +4927,7 @@ mod tests {
     }
 
     fn runtime_record_with_secret_and_addrs(
-        secret_key: &SecretKey,
+        secret_key: &NodeSecretKey,
         sequence: u64,
         service: ZakuraServiceId,
         addrs: Vec<SocketAddr>,
@@ -4951,7 +4941,7 @@ mod tests {
     }
 
     fn local_config_with(
-        secret_key: SecretKey,
+        secret_key: NodeSecretKey,
         direct_addrs: Vec<SocketAddr>,
         services: Vec<ZakuraServiceId>,
     ) -> ZakuraDiscoveryLocalConfig {
@@ -5003,7 +4993,7 @@ mod tests {
         )
     }
 
-    fn peer_id_for(node_id: EndpointId) -> ZakuraPeerId {
+    fn peer_id_for(node_id: NodeId) -> ZakuraPeerId {
         ZakuraPeerId::new(node_id.as_bytes().to_vec()).expect("node id is a valid peer id")
     }
 
@@ -5070,7 +5060,7 @@ mod tests {
     }
 
     fn first_party_services(
-        node_id: EndpointId,
+        node_id: NodeId,
         expires_at_unix_secs: u64,
         summaries: Vec<ServiceSummaryEnvelope>,
     ) -> Services {
@@ -6312,17 +6302,12 @@ mod tests {
         let node_id = secret_key().public();
         let loopback_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8233);
         let second_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8234);
-        let node_addr = EndpointAddr::new(node_id)
-            .with_addrs(([loopback_addr]).into_iter().map(iroh::TransportAddr::Ip));
+        let node_addr = NodeAddr::with_addrs(node_id, [loopback_addr]);
 
         book.insert_static_candidate(node_addr, NOW)
             .expect("configured static loopback candidate imports");
-        book.insert_static_candidate(
-            EndpointAddr::new(node_id)
-                .with_addrs(([second_addr]).into_iter().map(iroh::TransportAddr::Ip)),
-            NOW + 1,
-        )
-        .expect("additional address for the same static identity imports");
+        book.insert_static_candidate(NodeAddr::with_addrs(node_id, [second_addr]), NOW + 1)
+            .expect("additional address for the same static identity imports");
 
         assert!(book
             .sample_peers(10, &[], &[], NOW, test_requester())
@@ -6365,8 +6350,7 @@ mod tests {
 
         for bad_addr in bad_addrs {
             let mut book = ZakuraDiscoveryBook::default();
-            let node_addr = EndpointAddr::new(secret_key().public())
-                .with_addrs(([bad_addr]).into_iter().map(iroh::TransportAddr::Ip));
+            let node_addr = NodeAddr::with_addrs(secret_key().public(), [bad_addr]);
 
             assert!(matches!(
                 book.insert_static_candidate(node_addr, NOW),

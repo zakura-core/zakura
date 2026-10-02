@@ -467,7 +467,7 @@ fn assert_coinbase_resource_usage(
         resources.max_serialized_size,
         transaction.zcash_serialized_size() + MAX_COINBASE_SCRIPT_LEN - coinbase_script_len,
     );
-    assert_eq!(resources.sigops, transaction.sigops()?);
+    assert_eq!(resources.sigops, transaction.sigops());
     assert_eq!(
         resources.shielded_action_counts,
         transaction.shielded_action_counts(),

@@ -3005,19 +3005,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "libzcash_script"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3f8ce05b56f3cbc65ec7d0908adb308ed91281e022f61c8c3a0c9388b5380b17"
-dependencies = [
- "bindgen",
- "cc",
- "thiserror 2.0.18",
- "tracing",
- "zcash_script",
-]
-
-[[package]]
 name = "linux-raw-sys"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7508,7 +7495,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-consensus"
-version = "10.0.0"
+version = "11.0.0"
 dependencies = [
  "blake2b_simd",
  "chrono",
@@ -7520,7 +7507,6 @@ dependencies = [
  "hex",
  "howudoin",
  "lazy_static",
- "libzcash_script",
  "metrics",
  "once_cell",
  "proptest",
@@ -8145,12 +8131,10 @@ dependencies = [
 
 [[package]]
 name = "zakura-script"
-version = "4.0.0"
+version = "5.0.0"
 dependencies = [
  "hex",
  "lazy_static",
- "libzcash_script",
- "rand 0.8.6",
  "ripemd 0.1.3",
  "secp256k1",
  "sha2 0.10.9",

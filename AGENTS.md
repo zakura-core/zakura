@@ -70,7 +70,7 @@ Zakura is a Zcash full node implementation in Rust. It is a validator node — i
 ```text
 zakurad (CLI orchestration)
   ├── zakura-consensus (block/transaction verification)
-  │     └── zakura-script (script validation via FFI)
+  │     └── zakura-script (script validation in Rust)
   ├── zakura-state (finalized + non-finalized storage)
   ├── zakura-network (P2P, peer management)
   └── zakura-rpc (JSON-RPC + gRPC)
@@ -95,7 +95,7 @@ zakurad (CLI orchestration)
 | `zakura-consensus` | Verification completeness, error handling, checkpoint vs semantic paths |
 | `zakura-state` | Read/write separation (`ReadRequest` vs `Request`), database migrations |
 | `zakura-rpc` | zcashd compatibility, error responses, timeout handling |
-| `zakura-script` | FFI safety, memory management, lifetime/ownership across boundaries |
+| `zakura-script` | Script execution, signature callbacks, consensus sigop accounting |
 
 ## Coding Style & Naming Conventions
 

@@ -11,7 +11,7 @@ use zakura_chain::{
 };
 use zakura_test::prelude::*;
 
-use crate::{p2sh_sigop_count, Sigops};
+use crate::{legacy_sigop_count, p2sh_sigop_count, Sigops};
 
 lazy_static::lazy_static! {
     pub static ref SCRIPT_PUBKEY: Vec<u8> = <Vec<u8>>::from_hex("76a914f47cac1e6fec195c055994e8064ffccce0044dd788ac")
@@ -54,7 +54,7 @@ fn count_legacy_sigops() -> Result<()> {
 
     let tx = SCRIPT_TX.zcash_deserialize_into::<Arc<zakura_chain::transaction::Transaction>>()?;
 
-    assert_eq!(tx.sigops()?, 1);
+    assert_eq!(tx.sigops(), 1);
 
     Ok(())
 }
@@ -245,10 +245,24 @@ fn build_and_verify_v5_p2pkh(
     canonical_hash_type: HashType,
     sig_hash_type_byte: u8,
 ) -> std::result::Result<(), crate::Error> {
+    build_and_verify_zip244_p2pkh(5, false, canonical_hash_type, sig_hash_type_byte)
+}
+
+fn build_and_verify_zip244_p2pkh(
+    version: u32,
+    invert_checksig: bool,
+    canonical_hash_type: HashType,
+    sig_hash_type_byte: u8,
+) -> std::result::Result<(), crate::Error> {
     use ripemd::{Digest as _, Ripemd160};
     use secp256k1::{Message, Secp256k1, SecretKey};
     use sha2::Sha256;
 
+    let nu = match version {
+        5 => NetworkUpgrade::Nu5,
+        6 => NetworkUpgrade::Nu6_3,
+        _ => panic!("fixture supports ZIP-244 transaction versions"),
+    };
     let secp = Secp256k1::new();
 
     // Deterministic keypair (32 bytes, nonzero)
@@ -267,6 +281,9 @@ fn build_and_verify_v5_p2pkh(
     lock_script_bytes.extend_from_slice(&pub_key_hash);
     lock_script_bytes.push(0x88); // OP_EQUALVERIFY
     lock_script_bytes.push(0xac); // OP_CHECKSIG
+    if invert_checksig {
+        lock_script_bytes.push(0x91); // OP_NOT consumes a failed CHECKSIG.
+    }
     let lock_script = transparent::Script::new(&lock_script_bytes);
 
     let previous_output = transparent::Output {
@@ -278,7 +295,7 @@ fn build_and_verify_v5_p2pkh(
     // For v5/ZIP-244, the sighash does NOT depend on the unlock script contents,
     // so we can compute the sighash with a placeholder, sign, then rebuild.
     let placeholder_tx = Transaction::V5 {
-        network_upgrade: NetworkUpgrade::Nu5,
+        network_upgrade: nu,
         lock_time: LockTime::unlocked(),
         expiry_height: block::Height(0),
         inputs: vec![transparent::Input::PrevOut {
@@ -298,8 +315,34 @@ fn build_and_verify_v5_p2pkh(
     };
 
     // Compute the sighash for the canonical hash type
+    let to_version = |tx| match (version, tx) {
+        (5, tx) => tx,
+        (
+            6,
+            Transaction::V5 {
+                network_upgrade,
+                lock_time,
+                expiry_height,
+                inputs,
+                outputs,
+                sapling_shielded_data,
+                orchard_shielded_data,
+            },
+        ) => Transaction::V6 {
+            network_upgrade,
+            lock_time,
+            expiry_height,
+            inputs,
+            outputs,
+            sapling_shielded_data,
+            orchard_shielded_data,
+            ironwood_shielded_data: None,
+        },
+        _ => unreachable!("fixture starts from V5"),
+    };
+    let placeholder_tx = to_version(placeholder_tx);
     let all_previous_outputs = Arc::new(vec![previous_output.clone()]);
-    let sighasher = SigHasher::new(&placeholder_tx, NetworkUpgrade::Nu5, all_previous_outputs)
+    let sighasher = SigHasher::new(&placeholder_tx, nu, all_previous_outputs)
         .expect("sighasher creation should succeed");
     let sighash = sighasher.sighash(canonical_hash_type, Some((0, lock_script_bytes.clone())));
 
@@ -321,7 +364,7 @@ fn build_and_verify_v5_p2pkh(
 
     // Rebuild the V5 transaction with the real unlock script
     let final_tx = Transaction::V5 {
-        network_upgrade: NetworkUpgrade::Nu5,
+        network_upgrade: nu,
         lock_time: LockTime::unlocked(),
         expiry_height: block::Height(0),
         inputs: vec![transparent::Input::PrevOut {
@@ -341,9 +384,9 @@ fn build_and_verify_v5_p2pkh(
     };
 
     let verifier = super::CachedFfiTransaction::new(
-        Arc::new(final_tx),
+        Arc::new(to_version(final_tx)),
         Arc::new(vec![previous_output]),
-        NetworkUpgrade::Nu5,
+        nu,
     )
     .expect("network upgrade should be valid for v5 tx");
 
@@ -961,7 +1004,7 @@ fn count_coinbase_legacy_sigops_includes_coinbase_script() -> Result<()> {
     // Before the fix, Zebra's `Sigops` impl skipped the coinbase input and returned 0 for a
     // coinbase with no OP_CHECKSIG in its outputs. After the fix, every OP_CHECKSIG in the coinbase
     // `scriptSig` must be counted.
-    let sigops = tx.sigops().expect("sigop count is finite");
+    let sigops = tx.sigops();
     assert_eq!(
         sigops, 80,
         "coinbase scriptSig OP_CHECKSIG bytes must be counted against \
@@ -1328,8 +1371,8 @@ fn block_sigop_total_includes_coinbase_and_p2sh() -> Result<()> {
     const N_P2SH_TXS: u32 = 1334;
     let spent_outputs = std::slice::from_ref(&p2sh_spent_output);
 
-    let coinbase_legacy = coinbase_tx.sigops().expect("sigop count is finite");
-    let p2sh_legacy = p2sh_tx_template.sigops().expect("sigop count is finite");
+    let coinbase_legacy = coinbase_tx.sigops();
+    let p2sh_legacy = p2sh_tx_template.sigops();
     let p2sh_per_tx = p2sh_sigop_count(&p2sh_tx_template, spent_outputs);
     assert_eq!(coinbase_legacy, 80, "coinbase legacy sigops (Surface A)");
     assert_eq!(p2sh_per_tx, 15, "per-tx P2SH sigops (Surface B)");
@@ -1439,18 +1482,9 @@ fn is_valid_rejects_out_of_range_input_index() {
 ///    SIGHASH_ALL digest from step 1 — accepting a spend that `zcashd`
 ///    rejects and splitting Zebra nodes from `zcashd` nodes.
 ///
-/// With the defense-in-depth fix in `zakura-script::calculate_sighash`, the
-/// callback now returns a per-call CSPRNG-derived sighash when the hash
-/// type would have been rejected, so the second signature fails to verify
-/// and `is_valid` returns an error — matching `zcashd`.
-///
-/// The bypass requires release-grade C++ optimizations in `libzcash_script`
-/// (so the stack buffer is not zero-initialized and the prior digest
-/// lingers between callbacks). The workspace `Cargo.toml` forces
-/// `[profile.dev.package.libzcash_script]` to `opt-level = 3` in all
-/// profiles so that `cargo test` exercises the vulnerable code path and
-/// this regression test catches any re-introduction of the bug in both
-/// dev and release builds.
+/// The Rust interpreter has no shared sighash buffer. When the callback rejects
+/// the hash type, the interpreter fails that signature check, so `is_valid`
+/// returns an error — matching `zcashd`.
 #[test]
 fn stale_sighash_buffer_v5_two_checksig_rejected() {
     use secp256k1::{Message, Secp256k1, SecretKey};
@@ -1756,4 +1790,110 @@ fn poc_p2sh_1001_accurate_multisigs_should_stay_below_block_sigop_limit() -> Res
     );
 
     Ok(())
+}
+
+#[test]
+fn v4_all_raw_hash_bytes_verify() {
+    for raw in 0u8..=255 {
+        build_and_verify_v4_p2pkh(raw)
+            .unwrap_or_else(|error| panic!("V4 hash byte {raw:#04x} failed: {error}"));
+    }
+}
+
+#[test]
+fn zip244_canonical_signatures_verify_for_v5_and_v6() {
+    for version in [5, 6] {
+        for (hash_type, raw) in [
+            (HashType::ALL, 0x01),
+            (HashType::NONE, 0x02),
+            (HashType::SINGLE, 0x03),
+            (HashType::ALL_ANYONECANPAY, 0x81),
+            (HashType::NONE_ANYONECANPAY, 0x82),
+            (HashType::SINGLE_ANYONECANPAY, 0x83),
+        ] {
+            build_and_verify_zip244_p2pkh(version, false, hash_type, raw)
+                .unwrap_or_else(|error| panic!("V{version} hash byte {raw:#04x}: {error}"));
+        }
+    }
+}
+
+#[test]
+fn zip244_failed_callback_can_be_consumed_by_not() {
+    for version in [5, 6] {
+        for raw in [0x00, 0x50, 0x80, 0x84, 0xff] {
+            assert!(build_and_verify_zip244_p2pkh(version, false, HashType::ALL, raw).is_err());
+            build_and_verify_zip244_p2pkh(version, true, HashType::ALL, raw)
+                .expect("OP_NOT consumes the false result from a failed signature callback");
+        }
+    }
+}
+
+#[test]
+fn legacy_transaction_counts_sigop_after_oversized_output_push() {
+    let mut tx = SCRIPT_TX.zcash_deserialize_into::<Transaction>().unwrap();
+    let Transaction::V4 { outputs, .. } = &mut tx else {
+        panic!("fixture is V4")
+    };
+    let mut script = vec![0x4d, 0x09, 0x02];
+    script.extend([0xac; 521]);
+    script.push(0xac);
+    *outputs = vec![Output {
+        value: 0u64.try_into().unwrap(),
+        lock_script: transparent::Script::new(&script),
+    }];
+    assert_eq!(tx.sigops(), 1);
+}
+
+/// Checks each `GetOp` rule that zcashd's `CScript::GetSigOpCount(false)` depends on.
+#[test]
+fn legacy_sigop_count_follows_zcashd_get_op() {
+    let push = |prefix: &[u8], len: usize| [prefix, &vec![0xac; len], &[0xac]].concat();
+    let cases: Vec<(&str, Vec<u8>, u32)> = vec![
+        ("empty", vec![], 0),
+        ("CHECKSIG", vec![0xac], 1),
+        ("CHECKSIGVERIFY", vec![0xad], 1),
+        ("CHECKMULTISIG", vec![0xae], 20),
+        ("CHECKMULTISIGVERIFY", vec![0xaf], 20),
+        ("legacy mode ignores OP_N", vec![0x52, 0xae], 20),
+        ("direct push payload", push(&[0x4b], 75), 1),
+        ("PUSHDATA1 payload", push(&[0x4c, 0xff], 255), 1),
+        (
+            "PUSHDATA2 520-byte payload",
+            push(&[0x4d, 0x08, 0x02], 520),
+            1,
+        ),
+        (
+            "PUSHDATA2 521-byte payload",
+            push(&[0x4d, 0x09, 0x02], 521),
+            1,
+        ),
+        (
+            "PUSHDATA4 payload",
+            push(&[0x4e, 0x00, 0x01, 0x00, 0x00], 256),
+            1,
+        ),
+        ("truncated direct push", vec![0xac, 0x02, 0xac], 1),
+        ("truncated PUSHDATA1 length", vec![0xac, 0x4c], 1),
+        ("truncated PUSHDATA2 length", vec![0xac, 0x4d, 0x01], 1),
+        (
+            "truncated PUSHDATA4 length",
+            vec![0xac, 0x4e, 0x00, 0x00, 0x00],
+            1,
+        ),
+        (
+            "PUSHDATA4 maximum length",
+            vec![0xac, 0x4e, 0xff, 0xff, 0xff, 0xff, 0xac],
+            1,
+        ),
+        ("disabled OP_CAT", vec![0x7e, 0xac], 1),
+        ("OP_CODESEPARATOR", vec![0xab, 0xac], 1),
+        (
+            "reserved and invalid opcodes",
+            vec![0x50, 0xba, 0xff, 0xac],
+            1,
+        ),
+    ];
+    for (name, script, expected) in cases {
+        assert_eq!(legacy_sigop_count(&script), expected, "{name}");
+    }
 }

@@ -102,7 +102,35 @@ The generators rarely reach the negative-zero branch of `cast_to_bool`: the
 final `script` corpus executes it 43 times. `audit_vectors_agree` pins it with
 four vectors.
 
+## Mainnet replay
+
+`src/bin/replay.rs` ran every Mainnet transaction from genesis to height
+3,490,665 through both adapters on a 4-vCPU machine. It read a finalized state
+that an ordinary Zakura archive sync wrote. The run took 4 hours 4 minutes in
+two parts: 0 to 1,753,999, then 1,754,000 to the end from a checkpoint.
+
+| Count | Value |
+| --- | --- |
+| Blocks | 3,490,666 |
+| Transactions | 18,368,580 |
+| Transparent inputs | 163,084,685 |
+| Inputs verified with signatures | 90,401,828 |
+| Inputs compared without signature success | 72,682,857 |
+| Outputs | 190,417,214 |
+| Legacy sigops | 181,219,516 |
+| P2SH sigops | 26,393,795 |
+| Largest block sigop count | 18,491 |
+| Findings | 0 |
+
+Neither adapter can compute a pre-Overwinter (V1 or V2) sighash, so every input
+below height 347,500 ran through both interpreters with a failing sighash
+callback. That compares parsing and evaluation but not signature success.
+Zakura checkpoints those blocks and does not verify their scripts.
+
+The output count equals the count in the spentness artifact that zakura#962
+generated from the same state.
+
 ## Divergences
 
-None. Neither the seeded tests nor the campaign found an input on which the
+None. Neither the seeded tests, the campaign, nor the Mainnet replay found an input on which the
 Rust and C++ adapters disagree.

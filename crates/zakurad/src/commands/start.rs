@@ -1253,7 +1253,21 @@ impl StartCmd {
             "exiting Zakura: all tasks have been asked to stop, waiting for remaining tasks to finish"
         );
 
-        exit_status
+        Self::finish_shutdown(exit_status, writer_health.writer_failure())
+    }
+
+    fn finish_shutdown(
+        exit_status: Result<(), Report>,
+        writer_failure: Option<zakura_state::BoxError>,
+    ) -> Result<(), Report> {
+        // Another ready task can win the select after the writer publishes its failure.
+        exit_status?;
+        if let Some(failure) = writer_failure {
+            tracing::error!(%failure, "block writer failed during shutdown");
+            Err(eyre!(failure))
+        } else {
+            Ok(())
+        }
     }
 
     /// Returns `false` so Zebra keeps running if zcashd-compat supervision exits unexpectedly.
@@ -1426,6 +1440,28 @@ mod tests {
     use zakura_network::types::PeerServices;
     use zakura_network::P2pStack;
     use zakura_state::{PruningConfig, StorageMode};
+
+    #[tokio::test]
+    async fn shutdown_cannot_mask_a_ready_writer_failure() {
+        let shutdown = CancellationToken::new();
+        shutdown.cancel();
+        let failure: zakura_state::BoxError = "terminal writer failure".into();
+        // Force the interleaving where shutdown wins even though writer failure is ready.
+        let result = tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => Ok(()),
+            _ = std::future::ready(()) => panic!("shutdown wins this interleaving"),
+        };
+        let error = StartCmd::finish_shutdown(result, Some(failure)).unwrap_err();
+        assert!(error.to_string().contains("terminal writer failure"));
+        assert!(StartCmd::finish_shutdown(Ok(()), None).is_ok());
+        assert_eq!(
+            StartCmd::finish_shutdown(Err(eyre!("task failed")), None)
+                .unwrap_err()
+                .to_string(),
+            "task failed"
+        );
+    }
 
     #[test]
     fn zcashd_compat_advertises_node_network_when_pruned() {

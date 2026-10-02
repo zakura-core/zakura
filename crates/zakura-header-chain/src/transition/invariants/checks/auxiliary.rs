@@ -77,7 +77,7 @@ pub(crate) fn verify_aux<G: HeaderGraphView>(
     // finalized header or its two selected successors is legal only when a full bucket admits
     // a replacement in the same plan.
     let frontiers = plan.change_set.metadata.frontiers;
-    for (header_hash, _) in deletes
+    for (header_hash, delivery_id) in deletes
         .iter()
         .filter(|(header_hash, _)| graph.view_header_node(*header_hash).is_some())
     {
@@ -91,8 +91,12 @@ pub(crate) fn verify_aux<G: HeaderGraphView>(
                 .view_header_ancestor(frontiers.header_best.hash, node.height)
                 .map_err(|_| InvariantViolation::Limits)?
                 .is_some_and(|frontier| frontier.hash == *header_hash);
+        let needs_roots = engine_before_commit
+            .aux_delivery(*delivery_id)
+            .is_some_and(|delivery| delivery.tree_aux.is_some() && !delivery.is_rejected());
         let replaced = puts.values().any(|delivery| {
             delivery.header_hash == *header_hash
+                && (!needs_roots || delivery.tree_aux.is_some())
                 && engine_before_commit
                     .aux_delivery(delivery.delivery_id)
                     .is_none()

@@ -21,6 +21,222 @@ fn unauthenticated_delivery(
     )
 }
 
+fn repair_roots(height: block::Height, marker: u8) -> crate::TreeAuxRecordV1 {
+    crate::TreeAuxRecordV1 {
+        height,
+        sapling_root: Default::default(),
+        orchard_root: Default::default(),
+        ironwood_root: Default::default(),
+        sapling_tx_count: u64::from(marker),
+        orchard_tx_count: 0,
+        ironwood_tx_count: 0,
+        auth_data_root: [marker; 32].into(),
+    }
+}
+
+#[test]
+fn rootless_input_cannot_replace_disputed_commit_window_roots() {
+    let (mut store, mut config) = TestStore::new(EngineMode::Integrated);
+    config.limits.max_aux_deliveries_per_header = std::num::NonZeroUsize::new(1).unwrap();
+    let clock = ManualClock(Utc::now());
+    let anchor = store.metadata.frontiers.finalized;
+    let initial = insertion(&store, 2, EvidenceId::from_digest([0x31; 32]));
+    let TransitionEvent::InsertHeaders(mut insert) = initial.event.clone() else {
+        unreachable!();
+    };
+    let target = insert.batch.headers()[0].clone();
+    let successor = insert.batch.headers()[1].hash;
+    let plan = apply_transition(&store, initial, &context(&config, &clock, None)).unwrap();
+    store.commit(&plan);
+    let disputed = crate::AuxDelivery::new(
+        EvidenceId::from_digest([0x32; 32]),
+        target.hash,
+        insert.source,
+        insert.owner,
+        crate::BodySizeHint::Unknown,
+        Some(repair_roots(target.height, 1)),
+    )
+    .promote_recovered_outcome(3, [Some([0x33; 32]), None], Some(successor))
+    .unwrap();
+    store
+        .graph
+        .record_auxiliary_evidence_delivery(target.hash, disputed.delivery_id)
+        .unwrap();
+    store.aux.push(disputed);
+    store.lease.parent = anchor;
+    insert.owner = crate::HeaderWorkAuthority::for_target(&store.snapshot(), successor)
+        .bind(2, NonZeroU64::new(2).unwrap())
+        .into();
+    insert.source = SourceId::from_digest([0x34; 32]);
+    let replacement = crate::AuxDelivery::new(
+        EvidenceId::from_digest([0x35; 32]),
+        target.hash,
+        insert.source,
+        insert.owner,
+        crate::BodySizeHint::Known(std::num::NonZeroU32::new(100).unwrap()),
+        None,
+    );
+    insert.aux = vec![replacement];
+    let request = |insert| TransitionRequest {
+        expected_version: store.metadata.state_version,
+        event: TransitionEvent::InsertHeaders(insert),
+    };
+    let plan = apply_transition(
+        &store,
+        request(insert.clone()),
+        &context(&config, &clock, None),
+    )
+    .expect("ordinary rootless delivery preserves the retained candidate");
+    assert!(plan.is_no_change());
+    assert!(plan.change_set.aux_changes.is_empty());
+
+    insert.aux[0].tree_aux = Some(repair_roots(target.height, 2));
+    let mut plan = apply_transition(&store, request(insert), &context(&config, &clock, None))
+        .expect("new roots can replace the disputed candidate");
+    assert!(plan.change_set.aux_changes.iter().any(|change| matches!(
+        change, AuxDelta::Delete { delivery_id, .. } if *delivery_id == disputed.delivery_id
+    )));
+    // The independent verifier must reject a forged rootless substitution too.
+    for change in &mut plan.change_set.aux_changes {
+        if let AuxDelta::Put(delivery) = change {
+            delivery.tree_aux = None;
+        }
+    }
+    assert_eq!(
+        verify_plan(&test_engine(&store), &plan),
+        Err(InvariantViolation::Auxiliary(target.hash))
+    );
+}
+
+#[test]
+fn saturated_repair_preflight_matches_retained_input() {
+    // (target index, occupied index, authenticated, expected capacity, range length)
+    for (target_index, occupied_index, authenticated, capacity, range_len) in [
+        (0, 3, true, 0, 1),
+        (3, 0, false, 0, 1),
+        (3, 2, false, 1, 1),
+        (0, 0, false, 1, 1),
+        (0, 0, true, 0, 1),
+        (2, 0, false, 1, 2),
+        (2, 4, false, 2, 2),
+    ] {
+        let (mut store, mut config) = TestStore::new(EngineMode::Integrated);
+        config.limits.max_aux_deliveries_per_header = std::num::NonZeroUsize::new(1).unwrap();
+        config.limits.max_aux_deliveries_total = std::num::NonZeroUsize::new(range_len).unwrap();
+        let clock = ManualClock(Utc::now());
+        let anchor = store.metadata.frontiers.finalized;
+        let initial = insertion(&store, 5, EvidenceId::from_digest([0x21; 32]));
+        let TransitionEvent::InsertHeaders(insert) = &initial.event else {
+            unreachable!()
+        };
+        let headers = insert.batch.headers().to_vec();
+        let owner = insert.owner;
+        let plan = apply_transition(&store, initial, &context(&config, &clock, None)).unwrap();
+        store.commit(&plan);
+        let occupied = &headers[occupied_index];
+        let mut old = crate::AuxDelivery::new(
+            EvidenceId::from_digest([0x22; 32]),
+            occupied.hash,
+            SourceId::from_digest([0x23; 32]),
+            owner,
+            crate::BodySizeHint::Unknown,
+            Some(repair_roots(occupied.height, 1)),
+        );
+        if authenticated {
+            old = old
+                .promote_recovered_outcome(
+                    1,
+                    [Some([0x24; 32]), None],
+                    Some(headers[occupied_index + 1].hash),
+                )
+                .unwrap();
+        }
+        store
+            .graph
+            .record_auxiliary_evidence_delivery(occupied.hash, old.delivery_id)
+            .unwrap();
+        store.aux.push(old);
+        let target = &headers[target_index];
+        assert_eq!(
+            test_engine(&store).auxiliary_repair_capacity(target.hash, config.limits),
+            capacity
+        );
+        let parent = if target_index == 0 {
+            anchor
+        } else {
+            Frontier::new(
+                headers[target_index - 1].height,
+                headers[target_index - 1].hash,
+            )
+        };
+        store.lease.parent = parent;
+        let owner = body_owner(&store.snapshot(), 2, 2);
+        let source = SourceId::from_digest([0x25; 32]);
+        let repair_headers = &headers[target_index..target_index + range_len];
+        let replacements: Vec<_> = repair_headers
+            .iter()
+            .enumerate()
+            .map(|(index, header)| {
+                crate::AuxDelivery::new(
+                    EvidenceId::from_digest([0x26 + u8::try_from(index).unwrap(); 32]),
+                    header.hash,
+                    source,
+                    owner.into(),
+                    crate::BodySizeHint::Unknown,
+                    Some(repair_roots(header.height, 2)),
+                )
+            })
+            .collect();
+        let last = repair_headers.last().unwrap();
+        let selected_target = Frontier::new(last.height, last.hash);
+        let result = apply_transition(
+            &store,
+            TransitionRequest {
+                expected_version: store.metadata.state_version,
+                event: TransitionEvent::InsertHeaders(Box::new(crate::InsertHeaders {
+                    owner: owner.into(),
+                    source,
+                    parent_hash: parent.hash,
+                    target_tip_hash: last.hash,
+                    completion: TargetCompletion::SelectedAuxiliaryRepair {
+                        common_ancestor: parent,
+                        selected_target,
+                        episode: crate::VctRepairContext::unconstrained(
+                            selected_target,
+                            crate::HeaderLocator::for_continuation(parent),
+                            None,
+                        )
+                        .episode,
+                    },
+                    batch: PreparedHeaderBatch::new(
+                        repair_headers.to_vec(),
+                        parent,
+                        config.network().clone(),
+                        config.trust_anchor_digest(),
+                        EvidenceId::from_digest([0x27; 32]),
+                    )
+                    .unwrap(),
+                    aux: replacements.clone(),
+                })),
+            },
+            &context(&config, &clock, None),
+        );
+        if capacity < range_len {
+            assert!(
+                matches!(result, Err(TransitionFailure::AuxiliaryLimitExceeded)),
+                "{result:?}"
+            );
+            assert_eq!(store.aux, vec![old]);
+        } else {
+            let plan = result.expect("advertised repair capacity retains the supplied roots");
+            assert!(!plan.is_no_change());
+            store.commit(&plan);
+            assert_eq!(store.aux, replacements);
+            assert!(store.graph.header_node(occupied.hash).is_some());
+        }
+    }
+}
+
 #[test]
 fn auxiliary_delivery_ids_are_globally_unique_across_headers() {
     let (mut store, config) = TestStore::new(EngineMode::Integrated);

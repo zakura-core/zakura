@@ -1560,6 +1560,11 @@ impl StateService {
 }
 
 impl ReadStateService {
+    /// Return the retained terminal writer failure, including during daemon shutdown.
+    pub fn writer_failure(&self) -> Option<BoxError> {
+        self.block_write_failure.get().cloned().map(Into::into)
+    }
+
     /// Wait for an unrecoverable writer failure, including failures published before this call.
     pub async fn wait_for_writer_failure(&self) -> BoxError {
         self.block_write_failure.wait().await.into()

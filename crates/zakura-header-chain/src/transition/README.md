@@ -148,9 +148,9 @@ success changed state.
 
 Keep these three resource-limit outcomes separate:
 
-1. `TransitionFailure::AuxiliaryLimitExceeded` means protected auxiliary input
-   alone exceeds the aggregate bound after eviction. It refuses the event before
-   any mutation and does not raise the resource-stall alarm.
+1. `TransitionFailure::AuxiliaryLimitExceeded` means the event exceeds auxiliary
+   limits, including when a selected repair cannot retain all its input after eviction.
+   It refuses the event before any mutation and does not raise the resource-stall alarm.
 2. A verified `resource_stalled` effect means retention cannot meet limits
    without evicting protected state. The plan keeps or raises the alarm.
 3. `InvariantViolation::Limits` means verification found a projected graph
@@ -162,18 +162,23 @@ Keep these three resource-limit outcomes separate:
 Auxiliary input is advisory, so aggregate pressure evicts input rows, never headers, and never
 refuses header admission. After retention, the planner evicts input until the aggregate bound
 holds. It never evicts authenticated input or input for the finalized header and its two selected
-successors. It evicts input off the selected path first, then one row at a time from the fullest
+successors. It also protects new selected-repair input for the current transition.
+It evicts input off the selected path first, then one row at a time from the fullest
 bucket, then from the highest header. Within a bucket, rejected input goes first, then disputed,
-then input without roots, then unchecked roots. New input competes on the same terms, so
-low-priority input is dropped. The independent verifier rejects deletion of commit-window input
-unless the plan admits replacement input for that header. A commit-window repair therefore fits
-unless its bucket holds only authenticated input, including in a store saturated before this rule.
+then input without roots, then unchecked roots. New ordinary input competes on the same terms,
+so low-priority input is dropped. The independent verifier rejects deletion of commit-window input
+unless the plan admits replacement input for that header. A usable rooted candidate requires a
+rooted replacement. Repair preflight counts free slots and evictable input, and bounds empty
+ranges to that capacity. A full target bucket can instead replace one non-authenticated input.
+If no legal replacement or eviction can retain a repair, the transition refuses it atomically.
 
-At a full per-header bucket, admission can replace rejected or disputed input. A selected repair
+At a full per-header bucket, admission can replace rejected or disputed input. Rootless input
+cannot replace usable rooted input. A selected repair
 can also replace unchecked input, including recovered rows whose outcome claims recovery
 has discarded. The row and header index change atomically. Authenticated input on a retained
-header cannot be deleted. When nothing is replaceable, admission drops the new input and keeps
-its header. Input replacement grants no header validity or root authority.
+header cannot be deleted. When nothing is replaceable, ordinary admission drops the new input
+and keeps its header. A selected repair refuses the event instead of reporting success without
+retaining its roots. Input replacement grants no header validity or root authority.
 
 ## Recovery audit
 

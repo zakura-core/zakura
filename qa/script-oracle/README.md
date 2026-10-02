@@ -74,6 +74,19 @@ target/x86_64-unknown-linux-gnu/release/script corpus/script \
 Reproduce a crash with
 `cargo +nightly-2026-07-15 fuzz run --fuzz-dir . <target> artifacts/<target>/<crash>`.
 
+## Replay a finalized state
+
+`src/bin/replay.rs` runs every transaction in a Zakura finalized state through
+both adapters. It opens the state read-only and needs the `replay` feature:
+
+```sh
+cargo run --release --features replay --bin replay -- \
+  <state>/v30/mainnet --network mainnet --checkpoint mainnet.checkpoint
+```
+
+Any input that a finalized chain contains but either adapter rejects is a
+finding. A restart with the same checkpoint file resumes the run.
+
 ## Measure coverage
 
 ```sh

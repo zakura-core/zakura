@@ -11,13 +11,21 @@ description = "Differential tests of Zakura's Rust script verification against t
 [package.metadata]
 cargo-fuzz = true
 
+[features]
+# The historical replay reads a Zakura state database.
+replay = ["dep:rayon", "dep:rocksdb"]
+
 [dependencies]
 arbitrary = "1"
 hex = "0.4"
 libfuzzer-sys = "0.4"
 libzcash_script = { version = "=0.1.0", features = ["test-dependencies"] }
 rand = "0.8"
+rayon = { version = "1", optional = true }
 ripemd = "0.1"
+# Match zakura-state: lz4 reads its column families, and bindgen-runtime keeps librocksdb-sys
+# buildable next to other bindgen users.
+rocksdb = { version = "0.24", default-features = false, features = ["bindgen-runtime", "lz4"], optional = true }
 secp256k1 = "0.29"
 sha2 = "0.10"
 thiserror = "2"
@@ -25,6 +33,10 @@ zakura-chain = { path = "../../crates/zakura-chain" }
 zakura-script = { path = "../../crates/zakura-script" }
 zcash_primitives = { version = "=2.2.0", package = "zakura-primitives" }
 zcash_script = { version = "=0.4.5", features = ["test-dependencies"] }
+
+[dev-dependencies]
+tempfile = "3"
+zakura-test = { path = "../../crates/zakura-test" }
 
 [build-dependencies]
 cc = "1"
@@ -53,3 +65,7 @@ path = "fuzz_targets/transaction.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "replay"
+required-features = ["replay"]

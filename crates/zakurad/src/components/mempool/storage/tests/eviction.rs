@@ -298,7 +298,7 @@ fn insert_chain(
 }
 
 #[test]
-fn parent_child_pair_evicts_its_cheap_child() {
+fn three_transaction_chain_evicts_its_cheap_tail() {
     let _init_guard = zakura_test::init();
     const CHAIN_LEN: usize = MAX_MEMPOOL_ANCESTORS + 1;
 
@@ -426,18 +426,23 @@ fn output(tx: &VerifiedUnminedTx, index: usize) -> OutPoint {
 }
 
 #[test]
-fn second_child_is_rejected_without_changing_the_pool() {
+fn third_child_is_rejected_without_changing_the_pool() {
     let _init_guard = zakura_test::init();
     let mut factory = TxFactory::new();
     let mut storage = storage_for(10);
-    let parent = factory.tx_with(10_000, 2, 0);
+    let parent = factory.tx_with(10_000, MAX_MEMPOOL_PACKAGE_TRANSACTIONS, 0);
     insert(&mut storage, &parent, vec![]);
-    let child = factory.tx(10_000);
-    insert(&mut storage, &child, vec![first_output(&parent)]);
+    for index in 0..MAX_MEMPOOL_ANCESTORS {
+        let child = factory.tx(10_000);
+        insert(&mut storage, &child, vec![output(&parent, index)]);
+    }
     let before = ids(&storage);
     let sibling = factory.tx(100_000);
-    let (result, evicted) =
-        storage.insert_with_evicted_ids(sibling, vec![output(&parent, 1)], None);
+    let (result, evicted) = storage.insert_with_evicted_ids(
+        sibling,
+        vec![output(&parent, MAX_MEMPOOL_ANCESTORS)],
+        None,
+    );
     assert_eq!(
         result,
         Err(SameEffectsTipRejectionError::TooManyPackageTransactions.into())
@@ -447,7 +452,7 @@ fn second_child_is_rejected_without_changing_the_pool() {
 }
 
 #[test]
-fn joining_two_unconfirmed_parents_is_rejected() {
+fn joining_two_unconfirmed_parents_is_accepted() {
     let _init_guard = zakura_test::init();
     let mut factory = TxFactory::new();
     let mut storage = storage_for(10);
@@ -455,16 +460,74 @@ fn joining_two_unconfirmed_parents_is_rejected() {
     let b = factory.tx_with(10_000, 1, 0);
     insert(&mut storage, &a, vec![]);
     insert(&mut storage, &b, vec![]);
+    let joined = factory.tx(100_000);
+    insert(
+        &mut storage,
+        &joined,
+        vec![first_output(&a), first_output(&b)],
+    );
+    assert_eq!(
+        storage.transaction_count(),
+        MAX_MEMPOOL_PACKAGE_TRANSACTIONS
+    );
+    storage.verified.assert_dependency_groups_are_bounded();
+}
+
+#[test]
+fn joining_groups_counts_existing_children_and_rejects_atomically() {
+    let _init_guard = zakura_test::init();
+    let mut factory = TxFactory::new();
+    let mut storage = storage_for(10);
+    let a = factory.tx_with(10_000, 2, 0);
+    let b = factory.tx_with(10_000, 1, 0);
+    insert(&mut storage, &a, vec![]);
+    insert(&mut storage, &b, vec![]);
+    let child = factory.tx(10_000);
+    insert(&mut storage, &child, vec![first_output(&a)]);
     let before = ids(&storage);
     let joined = factory.tx(100_000);
     let (result, evicted) =
-        storage.insert_with_evicted_ids(joined, vec![first_output(&a), first_output(&b)], None);
+        storage.insert_with_evicted_ids(joined, vec![output(&a, 1), first_output(&b)], None);
     assert_eq!(
         result,
-        Err(SameEffectsTipRejectionError::TooManyAncestors.into())
+        Err(SameEffectsTipRejectionError::TooManyPackageTransactions.into())
     );
     assert!(evicted.is_empty());
     assert_eq!(ids(&storage), before);
+}
+
+#[test]
+fn triangle_counts_shared_grandchild_once() {
+    let _init_guard = zakura_test::init();
+    let mut factory = TxFactory::new();
+    let mut storage = storage_for(4);
+    let parent = factory.tx_with(10_000, 2, 0);
+    let child = factory.tx_with(10_000, 1, 0);
+    let grandchild = factory.tx(100_000);
+    let parent_id = insert(&mut storage, &parent, vec![]);
+    let child_id = insert(&mut storage, &child, vec![first_output(&parent)]);
+    let grandchild_id = insert(
+        &mut storage,
+        &grandchild,
+        vec![output(&parent, 1), first_output(&child)],
+    );
+    insert(&mut storage, &factory.tx(100_000), vec![]);
+    storage.verified.assert_dependency_groups_are_bounded();
+    // All three possible edges exist. The package pays 120,000 / 3 = 40,000,
+    // despite the grandchild being reachable through two paths.
+    let before = ids(&storage);
+    let underpaying = factory.tx(40_000 + MARGINAL_FEE - 1);
+    let (result, evicted) = storage.insert_with_evicted_ids(underpaying, vec![], None);
+    assert_eq!(
+        result,
+        Err(ExactTipRejectionError::BelowEvictionCost.into())
+    );
+    assert!(evicted.is_empty());
+    assert_eq!(ids(&storage), before);
+    let newcomer = factory.tx(40_000 + MARGINAL_FEE);
+    let (result, evicted) = storage.insert_with_evicted_ids(newcomer.clone(), vec![], None);
+    assert_eq!(result, Ok(newcomer.transaction.id()));
+    assert_eq!(evicted, [parent_id, child_id, grandchild_id].into());
 }
 
 #[test]
@@ -480,15 +543,12 @@ fn spending_multiple_outputs_of_one_parent_is_accepted() {
         &child,
         vec![output(&parent, 0), output(&parent, 1)],
     );
-    assert_eq!(
-        storage.transaction_count(),
-        MAX_MEMPOOL_PACKAGE_TRANSACTIONS
-    );
+    assert_eq!(storage.transaction_count(), 2);
     storage.verified.assert_dependency_groups_are_bounded();
 }
 
 #[test]
-fn mining_a_parent_allows_its_child_to_become_a_parent() {
+fn mining_a_parent_releases_capacity_for_another_grandchild() {
     let _init_guard = zakura_test::init();
     let mut factory = TxFactory::new();
     let mut storage = storage_for(10);
@@ -496,27 +556,74 @@ fn mining_a_parent_allows_its_child_to_become_a_parent() {
     insert(&mut storage, &parent, vec![]);
     let child = factory.tx_with(10_000, 1, 0);
     insert(&mut storage, &child, vec![first_output(&parent)]);
+    let grandchild = factory.tx_with(10_000, 1, 0);
+    insert(&mut storage, &grandchild, vec![first_output(&child)]);
     let mined = [parent.transaction.id().mined_id()].into();
     storage.clear_mined_dependencies(&mined);
     storage.reject_and_remove_same_effects(&mined, vec![]);
     let next = factory.tx(10_000);
-    insert(&mut storage, &next, vec![first_output(&child)]);
+    insert(&mut storage, &next, vec![first_output(&grandchild)]);
     storage.verified.assert_dependency_groups_are_bounded();
 }
 
 #[test]
-fn removing_a_child_releases_its_parents_child_slot() {
+fn removing_a_grandchild_releases_group_capacity() {
     let _init_guard = zakura_test::init();
     let mut factory = TxFactory::new();
     let mut storage = storage_for(10);
-    let parent = factory.tx_with(10_000, 2, 0);
+    let parent = factory.tx_with(10_000, 1, 0);
     insert(&mut storage, &parent, vec![]);
-    let child = factory.tx(10_000);
+    let child = factory.tx_with(10_000, 2, 0);
     insert(&mut storage, &child, vec![first_output(&parent)]);
-    assert_eq!(storage.remove_exact(&[child.transaction.id()].into()), 1);
+    let grandchild = factory.tx(10_000);
+    insert(&mut storage, &grandchild, vec![first_output(&child)]);
+    assert_eq!(
+        storage.remove_exact(&[grandchild.transaction.id()].into()),
+        1
+    );
     let next = factory.tx(10_000);
-    insert(&mut storage, &next, vec![output(&parent, 1)]);
+    insert(&mut storage, &next, vec![output(&child, 1)]);
     storage.verified.assert_dependency_groups_are_bounded();
+}
+
+#[test]
+fn higher_fee_conflicting_transaction_does_not_replace_or_evict() {
+    let _init_guard = zakura_test::init();
+    let mut factory = TxFactory::new();
+    let outpoint = OutPoint::from_usize(transaction::Hash([7; 32]), 0);
+    // Neither final sequence numbers nor Bitcoin-style replacement signaling
+    // permit replacing an existing spend in this mempool.
+    for sequence in [u32::MAX, u32::MAX - 2] {
+        let spending = |mut tx: VerifiedUnminedTx| {
+            let mut transaction = Transaction::clone(tx.transaction.transaction());
+            let Transaction::V6 { inputs, .. } = &mut transaction else {
+                unreachable!("TxFactory builds V6 transactions");
+            };
+            inputs.push(transparent::Input::PrevOut {
+                outpoint,
+                unlock_script: transparent::Script::new(&[]),
+                sequence,
+            });
+            tx.transaction = Arc::new(transaction).into();
+            tx
+        };
+        let mut storage = storage_for(3);
+        let original = spending(factory.tx_with(10_000, 1, 0));
+        insert(&mut storage, &original, vec![]);
+        let child = factory.tx_with(10_000, 1, 0);
+        insert(&mut storage, &child, vec![first_output(&original)]);
+        let grandchild = factory.tx(10_000);
+        insert(&mut storage, &grandchild, vec![first_output(&child)]);
+        let before = ids(&storage);
+        let replacement = spending(factory.tx_with(1_000_000, 1, 0));
+        let (result, evicted) = storage.insert_with_evicted_ids(replacement, vec![], None);
+        assert_eq!(
+            result,
+            Err(SameEffectsTipRejectionError::SpendConflict.into())
+        );
+        assert!(evicted.is_empty());
+        assert_eq!(ids(&storage), before);
+    }
 }
 
 /// Returns `tx` with `padding` more bytes of authorizing data.

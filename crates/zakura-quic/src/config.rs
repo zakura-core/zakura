@@ -241,6 +241,16 @@ impl QuicConfig {
         Ok(())
     }
 
+    /// The connection idle timeout (CTRL-10).
+    pub fn idle_timeout(&self) -> Duration {
+        Duration::from_secs(u64::from(self.idle_timeout_secs))
+    }
+
+    /// The connection keepalive interval (CTRL-11).
+    pub fn keep_alive_interval(&self) -> Duration {
+        Duration::from_secs(u64::from(self.keep_alive_interval_secs))
+    }
+
     /// The handshake deadline, if set (ADM-6, DIAL-4).
     pub fn handshake_timeout(&self) -> Option<Duration> {
         self.handshake_timeout_secs

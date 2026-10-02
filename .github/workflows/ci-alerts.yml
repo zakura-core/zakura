@@ -6,7 +6,8 @@ name: CI alerts
 #
 # Watch every workflow that runs on `main` pushes or schedules, except those that
 # already alert Slack themselves: the PR node bake and reaper, the continuous
-# genesis sync fleet, and the VCT handoff canary. Each entry must match its
+# genesis sync fleet, and the VCT handoff canary. The hourly upstream PR triage
+# pilot is also left out until it passes again. Each entry must match its
 # workflow's `name:`, which `scripts/test_ci_alert.py` checks.
 #
 # Run it manually to post a test message and check the webhook.
@@ -26,7 +27,6 @@ on:
       - Test Docker Config
       - Unit Tests
       - Update Mainnet release state
-      - Upstream PR Triage Pilot
       - Zakura E2E
     types: [completed]
     branches: [main]

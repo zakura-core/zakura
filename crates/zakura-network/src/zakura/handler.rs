@@ -961,7 +961,33 @@ pub struct ZakuraSupervisorHandle {
     /// Lock-free-to-await mirror of `active_by_ip` and the per-IP cap, read by
     /// the QUIC acceptor, which must not block (zakura-quic ADM-4).
     ip_counts: Arc<StdMutex<HashMap<IpAddr, usize>>>,
+    /// Inbound connections past TLS whose control handshake hasn't registered
+    /// yet, per IP. The acceptor counts them with `ip_counts` (zakura-quic
+    /// ADM-3 rule 2).
+    control_handshakes_by_ip: Arc<StdMutex<HashMap<IpAddr, usize>>>,
     max_connections_per_ip: usize,
+}
+
+/// Counts one inbound control handshake against its IP until dropped.
+#[derive(Debug)]
+struct ControlHandshakeGuard {
+    counts: Arc<StdMutex<HashMap<IpAddr, usize>>>,
+    ip: IpAddr,
+}
+
+impl Drop for ControlHandshakeGuard {
+    fn drop(&mut self) {
+        let mut counts = self
+            .counts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(count) = counts.get_mut(&self.ip) {
+            *count -= 1;
+            if *count == 0 {
+                counts.remove(&self.ip);
+            }
+        }
+    }
 }
 
 /// One exact authenticated connection generation published by the supervisor.
@@ -1212,21 +1238,41 @@ impl ZakuraSupervisorHandle {
             pending_handoffs: Arc::new(StdMutex::new(HashMap::new())),
             peer_registry,
             ip_counts,
+            control_handshakes_by_ip: Arc::new(StdMutex::new(HashMap::new())),
             max_connections_per_ip,
         }
     }
 
-    /// Returns whether `remote_ip` has reached the per-IP cap once
-    /// `pending` QUIC handshakes from it are counted. Never awaits.
+    /// Returns whether `remote_ip` has reached the per-IP cap once `pending`
+    /// QUIC handshakes and its control handshakes are counted. Never awaits.
     fn ip_at_capacity(&self, remote_ip: IpAddr, pending: usize) -> bool {
-        let established = self
-            .ip_counts
+        let remote_ip = canonical_ip(remote_ip);
+        let count = |map: &StdMutex<HashMap<IpAddr, usize>>| {
+            map.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(&remote_ip)
+                .copied()
+                .unwrap_or_default()
+        };
+        let established = count(&self.ip_counts);
+        let control = count(&self.control_handshakes_by_ip);
+        established.saturating_add(control).saturating_add(pending) >= self.max_connections_per_ip
+    }
+
+    /// Counts an inbound control handshake against `remote_ip` until the guard
+    /// drops at registration (zakura-quic ADM-3 rule 2).
+    fn enter_control_handshake(&self, remote_ip: IpAddr) -> ControlHandshakeGuard {
+        let ip = canonical_ip(remote_ip);
+        *self
+            .control_handshakes_by_ip
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(&canonical_ip(remote_ip))
-            .copied()
-            .unwrap_or_default();
-        established.saturating_add(pending) >= self.max_connections_per_ip
+            .entry(ip)
+            .or_default() += 1;
+        ControlHandshakeGuard {
+            counts: self.control_handshakes_by_ip.clone(),
+            ip,
+        }
     }
 
     /// Returns the currently registered authenticated Zakura peer ids.
@@ -1618,6 +1664,8 @@ struct ConnectionServeContext {
     /// so the two ends always agree: `local_node_id < remote_node_id`.
     i_open_collision_winner: bool,
     conn: ZakuraConnTrace,
+    /// Counts an inbound connection against its IP until registration.
+    control_handshake: Option<ControlHandshakeGuard>,
 }
 
 struct RegisteredConnectionServeContext {
@@ -2221,6 +2269,10 @@ impl ZakuraProtocolHandler {
             connection.close(VarInt::from_u32(ZAKURA_CLOSE_RESOURCE), b"admission");
             return;
         };
+        // The transport stopped counting this connection when TLS finished.
+        let control_handshake = self
+            .supervisor
+            .enter_control_handshake(connection.admitted_ip());
 
         let remote_node_id = connection.remote_id();
         let remote_peer_id = match ZakuraPeerId::new(remote_node_id.as_bytes().to_vec()) {
@@ -2272,6 +2324,7 @@ impl ZakuraProtocolHandler {
                         &remote_node_id,
                     ),
                     conn,
+                    control_handshake: Some(control_handshake),
                 },
             )
             .await;
@@ -3414,6 +3467,8 @@ impl ZakuraProtocolHandler {
                 context.accepted_capabilities,
             )
             .await;
+        // A registered connection now counts in `ip_counts`.
+        drop(context.control_handshake);
 
         match registration {
             ZakuraRegistration::Registered {
@@ -4039,6 +4094,18 @@ async fn spawn_zakura_endpoint_inner(
     Ok(Some(endpoint))
 }
 
+/// Bounds a whole multi-address dial so the transport's own limits decide it:
+/// the last attempt starts after the stagger and ends at the handshake
+/// deadline (zakura-quic DIAL-3, DIAL-4). `control_timeout` is the floor.
+fn native_dial_timeout(config: &QuicConfig, addrs: usize, control_timeout: Duration) -> Duration {
+    let later_attempts = u32::try_from(addrs.saturating_sub(1)).unwrap_or(u32::MAX);
+    let last_start = config.dial_stagger().saturating_mul(later_attempts);
+    let attempt = config
+        .handshake_timeout()
+        .unwrap_or_else(|| config.idle_timeout());
+    control_timeout.max(last_start.saturating_add(attempt))
+}
+
 pub(crate) async fn serve_native_dial_connection(
     endpoint: &ZakuraEndpoint,
     node_addr: NodeAddr,
@@ -4054,12 +4121,14 @@ pub(crate) async fn serve_native_dial_connection(
         .clone()
         .try_acquire_owned()
         .map_err(|_| ZakuraHandlerError::ResourceLimit("admission"))?;
-    let connection = timeout(
+    let dial_timeout = native_dial_timeout(
+        endpoint.quic.config(),
+        node_addr.direct.len(),
         limits.control_timeout,
-        endpoint.quic.connect(node_addr, P2P_V2_ALPN),
-    )
-    .await
-    .map_err(|_| ZakuraHandlerError::Timeout("native dial"))??;
+    );
+    let connection = timeout(dial_timeout, endpoint.quic.connect(node_addr, P2P_V2_ALPN))
+        .await
+        .map_err(|_| ZakuraHandlerError::Timeout("native dial"))??;
     let remote_node_id = connection.remote_id();
     let peer_id = ZakuraPeerId::new(remote_node_id.as_bytes().to_vec())?;
     let conn = ZakuraConnTrace::new(&endpoint.handler.trace, conn_id, &peer_id);
@@ -4108,6 +4177,7 @@ pub(crate) async fn serve_native_dial_connection(
                 ),
                 i_open_collision_winner: i_open_collision_winner(&local_node_id, &remote_node_id),
                 conn,
+                control_handshake: None,
             },
         )
         .await
@@ -10676,7 +10746,10 @@ mod tests {
                 }
             }
             let limits = ZakuraLocalLimits::from_config(&Config::default());
-            let supervisor = ZakuraSupervisorHandle::new(1);
+            // Both same-identity connections sit in their control handshakes at
+            // once, and each counts against the IP (zakura-quic ADM-3), so the
+            // cap must hold two.
+            let supervisor = ZakuraSupervisorHandle::new(2);
             let server = LocalEndpointFactory::with_limits(&limits)
                 .endpoint(883)
                 .await?;
@@ -10735,16 +10808,34 @@ mod tests {
                 "closing the duplicate must preserve the incumbent's IP slot"
             );
 
+            // A second identity takes the IP's other slot.
             let third = LocalEndpointFactory::with_limits(&limits)
                 .endpoint(885)
                 .await?;
-            let third_conn = third.connect(server_addr, P2P_V2_ALPN).await;
+            let third_conn = third.connect(server_addr.clone(), P2P_V2_ALPN).await?;
+            let third_peer = ZakuraPeerId::new(third.local_id().as_bytes().to_vec())?;
+            run_native_initiator_handshake_without_trace(
+                &third_conn,
+                &limits,
+                &config,
+                &third_peer,
+            )
+            .await?;
+            while supervisor.registered_ids().await.len() < 2 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+
+            let fourth = LocalEndpointFactory::with_limits(&limits)
+                .endpoint(886)
+                .await?;
+            let fourth_conn = fourth.connect(server_addr, P2P_V2_ALPN).await;
             assert!(
-                matches!(third_conn, Err(zakura_quic::ConnectError::Refused)),
+                matches!(fourth_conn, Err(zakura_quic::ConnectError::Refused)),
                 "a new identity from the same IP must be refused before the handshake at the IP \
-                 cap: {third_conn:?}"
+                 cap: {fourth_conn:?}"
             );
-            assert_eq!(supervisor.registered_ids().await.len(), 1);
+            assert_eq!(supervisor.registered_ids().await.len(), 2);
+            fourth.shutdown().await;
             third.shutdown().await;
             first.shutdown().await;
             second.shutdown().await;
@@ -10912,6 +11003,109 @@ mod tests {
              passed remote_ip = None, so both identities registered and one source IP could \
              exhaust the connection budget",
         );
+
+        server_ep.shutdown().await;
+        Ok(())
+    }
+
+    // V12 F-305593: the whole-dial timeout used to be a fixed 10 s, which cut
+    // off staggered attempts and longer handshake deadlines.
+    #[test]
+    fn native_dial_timeout_covers_the_last_staggered_attempt() {
+        let control_timeout = Duration::from_secs(10);
+        let slow = QuicConfig {
+            dial_stagger_ms: 5_000,
+            handshake_timeout_secs: Some(60),
+            ..QuicConfig::default()
+        };
+        assert_eq!(
+            native_dial_timeout(&slow, 4, control_timeout),
+            Duration::from_secs(75)
+        );
+        let unset = QuicConfig {
+            handshake_timeout_secs: None,
+            ..QuicConfig::default()
+        };
+        assert_eq!(
+            native_dial_timeout(&unset, 1, control_timeout),
+            unset.idle_timeout()
+        );
+        assert_eq!(
+            native_dial_timeout(&QuicConfig::default(), 1, control_timeout),
+            control_timeout
+        );
+    }
+
+    // V12 F-305585: the transport stops counting an inbound connection when TLS
+    // finishes, and the control handshake that follows used to count only
+    // against the global `pending_handshakes` budget. One IP could therefore
+    // stall many TLS-complete connections and exceed its per-IP cap. Those
+    // connections now count against their IP until registration.
+    #[tokio::test]
+    async fn stalled_control_handshakes_count_against_the_per_ip_cap() -> Result<(), BoxError> {
+        let _guard = zakura_test::init();
+        let limits = ZakuraLocalLimits::from_config(&Config::default());
+        let server_ep = LocalEndpointFactory::with_limits(&limits)
+            .endpoint(890)
+            .await?;
+        let supervisor = ZakuraSupervisorHandle::new(2);
+        let handler = ZakuraProtocolHandler::new(
+            supervisor.clone(),
+            Network::Mainnet,
+            ZakuraHandshakeConfig::for_network(&Network::Mainnet),
+            limits.clone(),
+        )
+        .with_local_node_id(server_ep.local_id());
+        server_ep.serve(handler)?;
+        let server_addr = LocalEndpointFactory::node_addr(&server_ep).await;
+
+        // Two identities from 127.0.0.1 finish TLS and never send the control hello.
+        let mut stalled = Vec::new();
+        for seed in [891, 892] {
+            let endpoint = LocalEndpointFactory::with_limits(&limits)
+                .endpoint(seed)
+                .await?;
+            let connection = endpoint.connect(server_addr.clone(), P2P_V2_ALPN).await?;
+            stalled.push((endpoint, connection));
+        }
+        let loopback: IpAddr = Ipv4Addr::LOCALHOST.into();
+        let control_count = || {
+            supervisor
+                .control_handshakes_by_ip
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(&loopback)
+                .copied()
+                .unwrap_or_default()
+        };
+        await_until(
+            "two stalled control handshakes",
+            Duration::from_secs(5),
+            || control_count() == 2,
+        )
+        .await?;
+
+        // A third identity from the same IP is refused before TLS.
+        let third = LocalEndpointFactory::with_limits(&limits)
+            .endpoint(893)
+            .await?;
+        let refused = matches!(
+            third.connect(server_addr.clone(), P2P_V2_ALPN).await,
+            Err(zakura_quic::ConnectError::Refused)
+        );
+        assert!(
+            refused,
+            "stalled control handshakes must fill the per-IP cap"
+        );
+
+        // Closing the stalled connections releases their per-IP slots.
+        drop(stalled);
+        await_until(
+            "released control handshakes",
+            Duration::from_secs(15),
+            || control_count() == 0,
+        )
+        .await?;
 
         server_ep.shutdown().await;
         Ok(())

@@ -55,7 +55,7 @@ def history_path(page):
     """Returns the API path `ci_alert.history` requests for one page of push history."""
     return (
         f"{BASE}/workflows/7/runs?branch=main&event=push"
-        f"&status=completed&per_page={ci_alert.HISTORY_PAGE_SIZE}&page={page}"
+        f"&per_page={ci_alert.HISTORY_PAGE_SIZE}&page={page}"
     )
 
 
@@ -188,6 +188,18 @@ class AlertTextTest(unittest.TestCase):
             history_path(1): {
                 "workflow_runs": [current, run(101, "cancelled", attempt=2), run(100, "success")]
             },
+            f"{BASE}/runs/101/attempts/1": run(101, "failure"),
+        }
+        self.assertIn("is passing again on `main`", self.alert(responses, 102, 1))
+
+    def test_a_run_being_retried_keeps_its_earlier_failure(self):
+        # Run 101 failed and is being retried while 102 passes.
+        current = run(102, "success")
+        retrying = dict(run(101, None, attempt=2), status="in_progress")
+        responses = {
+            f"{BASE}/runs/102/attempts/1": current,
+            f"{BASE}/runs/102": current,
+            history_path(1): {"workflow_runs": [current, retrying, run(100, "success")]},
             f"{BASE}/runs/101/attempts/1": run(101, "failure"),
         }
         self.assertIn("is passing again on `main`", self.alert(responses, 102, 1))

@@ -75,21 +75,26 @@ def later_attempts(api, base, latest, attempt):
 
 
 def run_verdict(api, base, run):
-    """Returns the verdict of a completed run: its newest decided attempt's conclusion, or `None`.
+    """Returns a run's verdict: its newest decided attempt's conclusion, or `None`.
 
-    A cancelled re-run does not erase the verdict of an attempt before it.
+    A cancelled or still-active retry does not erase the verdict of an attempt
+    before it.
     """
-    if is_decided(run["conclusion"]):
+    if run["status"] == "completed" and is_decided(run["conclusion"]):
         return run["conclusion"]
     return newest_verdict(earlier_attempts(api, base, run["id"], run["run_attempt"]))
 
 
 def history(api, base, run):
-    """Yields completed runs of `run`'s workflow and event on `main`, newest first."""
+    """Yields runs of `run`'s workflow and event on `main`, newest first.
+
+    Active runs are included: a run being retried still has the verdict of its
+    earlier attempts.
+    """
     for page in range(1, HISTORY_MAX_PAGES + 1):
         runs = api(
             f"{base}/workflows/{run['workflow_id']}/runs?branch=main&event={run['event']}"
-            f"&status=completed&per_page={HISTORY_PAGE_SIZE}&page={page}"
+            f"&per_page={HISTORY_PAGE_SIZE}&page={page}"
         )["workflow_runs"]
         yield from runs
         if len(runs) < HISTORY_PAGE_SIZE:

@@ -571,9 +571,12 @@ queue**. The writer continues to process header-chain control messages while it 
 An `ApplyHeaderChainInsert` completion retries the parked block immediately. The writer defers
 unrelated block-write messages in their original order. The write loop also publishes a bounded
 repair request (`VctRootRepairRequested`) back to header sync. Header sync fetches a contiguous
-selected prefix through the root-authentication lane. Durable evidence at the blocking height
-keeps the existing one-height repair. An empty gap can use one atomic range up to the selected
-tip, checkpoint handoff, 4,000-header transition limit, aggregate capacity, or first durable row.
+selected prefix through the root-authentication lane. A rooted or judged row at the blocking
+height keeps the existing one-height repair. Otherwise one atomic range covers the gap up to the
+selected tip, checkpoint handoff, 4,000-header transition limit, or first rooted or judged row.
+Rootless rows do not end the range. Suppliers attach roots only to their finalized prefix, so
+every header a node received near the network tip holds one. A handoff that later rises above
+those headers therefore repairs them in one request, not one request per block.
 The retry is satisfied once a verifiable row is stored.
 If no repair delivery fills the hole, the node stays parked
 fail-closed at that height (§8.1). A peer-supplied root that has no buffered successor to

@@ -143,6 +143,30 @@ class ContinuousSyncTests(unittest.TestCase):
                     sync.archive_traces(config, run_dir, {})
             self.assertTrue((traces / "events.jsonl").exists())
 
+    def test_archive_accepts_space_limited_key_that_reaches_the_space(self):
+        denied = subprocess.CompletedProcess([], 254, "", "An error occurred (AccessDenied) when calling "
+                                             "the GetBucketLifecycleConfiguration operation")
+        env = {"ZAKURA_TRACE_SPACE": "test", "ZAKURA_TRACE_ENDPOINT": "https://nyc3.digitaloceanspaces.com"}
+        with patch.dict(os.environ, env), patch.object(
+                sync, "run", side_effect=[denied, subprocess.CompletedProcess([], 0, "")]) as command:
+            sync.trace_archive_destination()
+        self.assertEqual(command.call_args_list[1].args[0][-4:], ["s3api", "head-bucket", "--bucket", "test"])
+        with patch.dict(os.environ, env), patch.object(
+                sync, "run", side_effect=[denied, sync.ControllerError("command failed (254): head-bucket")]):
+            with self.assertRaisesRegex(sync.ControllerError, "head-bucket"):
+                sync.trace_archive_destination()
+
+    def test_archive_reports_missing_or_unreadable_lifecycle(self):
+        env = {"ZAKURA_TRACE_SPACE": "test", "ZAKURA_TRACE_ENDPOINT": "https://nyc3.digitaloceanspaces.com"}
+        for stderr, message in (
+            ("An error occurred (NoSuchLifecycleConfiguration)", "seven-day"),
+            ("Could not connect to the endpoint URL", "cannot read Space lifecycle rules"),
+        ):
+            with self.subTest(message=message), patch.dict(os.environ, env), patch.object(
+                    sync, "run", return_value=subprocess.CompletedProcess([], 254, "", stderr)):
+                with self.assertRaisesRegex(sync.ControllerError, message):
+                    sync.trace_archive_destination()
+
     def test_archive_streams_compressed_traces_and_records_link(self):
         import gzip
         import tarfile
@@ -648,7 +672,7 @@ class ContinuousSyncTests(unittest.TestCase):
 
             self.assertEqual(
                 [call.args[0] for call in which.call_args_list],
-                ["cargo", "git", "systemctl", "logrotate"],
+                ["cargo", "git", "systemctl", "logrotate", "gzip"],
             )
 
     def test_safe_wipe_state_removes_only_allowlisted_entries(self):
@@ -764,26 +788,29 @@ class ContinuousSyncTests(unittest.TestCase):
             self.assertEqual([path.exists() for path in paths], [True, True, False])
 
     @unittest.skipUnless(sync.shutil.which("logrotate"), "logrotate is required on the canaries")
-    def test_trace_rotation_preserves_recent_segments_and_open_writer(self):
+    def test_trace_rotation_compresses_segments_and_keeps_open_writer(self):
+        import gzip
         with tempfile.TemporaryDirectory() as tmp:
-            config = make_config(Path(tmp), policy=sync.Policy(trace_file_bytes=64))
+            config = make_config(Path(tmp), policy=sync.Policy(trace_file_bytes=64, trace_segments=3))
             run_dir = config.paths.runs_dir / "current"
             traces = run_dir / "traces"
             traces.mkdir(parents=True)
             trace = traces / "block_sync.jsonl"
             with trace.open("ab", buffering=0) as writer:
                 inode = trace.stat().st_ino
-                for batch in range(3):
+                for batch in range(4):
                     writer.write((json.dumps({"batch": batch, "detail": "x" * 100}) + "\n").encode())
                     sync.rotate_run_logs(config, run_dir)
                     self.assertEqual(trace.stat().st_ino, inode)
                     self.assertEqual(trace.stat().st_size, 0)
-                writer.write(b'{"batch": 3}\n')
-            history = [json.loads(path.read_text())["batch"] for path in (
-                traces / "block_sync.jsonl.2", traces / "block_sync.jsonl.1", trace,
+                writer.write(b'{"batch": 4}\n')
+            history = [json.loads(gzip.decompress(path.read_bytes()))["batch"] for path in (
+                traces / "block_sync.jsonl.3.gz", traces / "block_sync.jsonl.2.gz",
+                traces / "block_sync.jsonl.1.gz",
             )]
-            self.assertEqual(history, [1, 2, 3])
-            self.assertFalse((traces / "block_sync.jsonl.3").exists())
+            history.append(json.loads(trace.read_text())["batch"])
+            self.assertEqual(history, [1, 2, 3, 4])
+            self.assertFalse((traces / "block_sync.jsonl.4.gz").exists())
 
     def test_cleanup_bounds_binary_cache_and_removes_interrupted_builds(self):
         with tempfile.TemporaryDirectory() as tmp:

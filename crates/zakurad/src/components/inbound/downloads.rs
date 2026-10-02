@@ -24,12 +24,14 @@ use tracing::Instrument;
 use zakura_chain::{
     block::{self, HeightDiff},
     chain_tip::ChainTip,
+    parameters::Network,
 };
 use zakura_network::{self as zn, PeerSocketAddr};
 use zakura_state as zs;
 
 use crate::components::{
-    auth_download_height::parent_height_mismatch, sync::MIN_CONCURRENCY_LIMIT,
+    auth_download_height::parent_height_mismatch,
+    sync::{lookahead_limit_multiplier, MIN_CONCURRENCY_LIMIT},
 };
 
 type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
@@ -143,6 +145,29 @@ pub const MAX_INBOUND_BLOCK_CONCURRENCY_PER_PEER: usize = 5;
 /// queued rather than applied immediately, so a replacement request can still route back to it.
 pub const POISONED_GOSSIP_BLOCK_RETRY_LIMIT: usize = 3;
 
+/// Returns the highest gossiped block height accepted above `tip_height`.
+///
+/// The configured limit counts blocks, so this height window scales with the
+/// target spacing at the tip, like the syncer's lookahead limit. The queue
+/// capacity stays unscaled, because [`MAX_INBOUND_CONCURRENCY`] bounds its RAM.
+pub(crate) fn max_lookahead_height(
+    network: &Network,
+    tip_height: Option<block::Height>,
+    full_verify_concurrency_limit: usize,
+) -> block::Height {
+    if let Some(tip_height) = tip_height {
+        let lookahead = HeightDiff::try_from(
+            full_verify_concurrency_limit * lookahead_limit_multiplier(network, tip_height),
+        )
+        .expect("fits in HeightDiff");
+        (tip_height + lookahead).expect("tip is much lower than Height::MAX")
+    } else {
+        let genesis_lookahead =
+            u32::try_from(full_verify_concurrency_limit - 1).expect("fits in u32");
+        block::Height(genesis_lookahead)
+    }
+}
+
 /// The action taken in response to a peer's gossiped block hash.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum DownloadAction {
@@ -240,6 +265,9 @@ where
 
     /// Allows efficient access to the best tip of the blockchain.
     latest_chain_tip: zs::LatestChainTip,
+
+    /// The network whose target spacing scales the gossip lookahead window.
+    chain_network: Network,
 
     // Internal downloads state
     //
@@ -352,6 +380,7 @@ where
         verifier: ZV,
         state: ZS,
         latest_chain_tip: zs::LatestChainTip,
+        chain_network: Network,
     ) -> Self {
         // The syncer already warns about the minimum.
         let full_verify_concurrency_limit =
@@ -364,6 +393,7 @@ where
             verifier,
             state,
             latest_chain_tip,
+            chain_network,
             pending: FuturesUnordered::new(),
             cancel_handles: HashMap::new(),
             source_locks: HashMap::new(),
@@ -566,6 +596,7 @@ where
         let (cancel_tx, mut cancel_rx) = oneshot::channel::<()>();
 
         let network = self.network.clone();
+        let chain_network = self.chain_network.clone();
         let verifier = self.verifier.clone();
         let state = self.state.clone();
         let latest_chain_tip = self.latest_chain_tip.clone();
@@ -660,15 +691,8 @@ where
             // height but not yet a hash would fall into the no-tip regime.
             let best_tip = latest_chain_tip.best_tip_height_and_hash();
 
-            let max_lookahead_height = if let Some(tip_height) = tip_height {
-                let lookahead = HeightDiff::try_from(full_verify_concurrency_limit)
-                    .expect("fits in HeightDiff");
-                (tip_height + lookahead).expect("tip is much lower than Height::MAX")
-            } else {
-                let genesis_lookahead =
-                    u32::try_from(full_verify_concurrency_limit - 1).expect("fits in u32");
-                block::Height(genesis_lookahead)
-            };
+            let max_lookahead_height =
+                max_lookahead_height(&chain_network, tip_height, full_verify_concurrency_limit);
 
             // Get the finalized tip height, assuming we're using the non-finalized state.
             //
@@ -784,6 +808,7 @@ where
 mod tests {
     use super::*;
     use futures::StreamExt as _;
+    use indexmap::IndexSet;
     use std::{collections::HashSet, future, time::Duration};
     use tower::{service_fn, util::BoxCloneService};
     use zakura_chain::{block::Block, parameters::Network, serialization::ZcashDeserializeInto};
@@ -835,6 +860,7 @@ mod tests {
                 future::pending::<Result<zs::Response, BoxError>>()
             })),
             latest_chain_tip,
+            Network::Mainnet,
         )
     }
 
@@ -955,6 +981,7 @@ mod tests {
                 future::pending::<Result<zs::Response, BoxError>>()
             })),
             latest_chain_tip,
+            Network::Mainnet,
         );
 
         for index in 0..MIN_CONCURRENCY_LIMIT {
@@ -1057,6 +1084,7 @@ mod tests {
                 }
             })),
             latest_chain_tip,
+            Network::Mainnet,
         );
 
         assert_eq!(
@@ -1075,7 +1103,7 @@ mod tests {
         assert_eq!(
             first_request,
             zn::Request::BlocksByHashFrom {
-                hashes: HashSet::from([hash_one]),
+                hashes: IndexSet::from([hash_one]),
                 source: zn::PeerSource::Zakura(peer_id.clone()),
             }
         );
@@ -1105,7 +1133,7 @@ mod tests {
         assert_eq!(
             second_request,
             zn::Request::BlocksByHashFrom {
-                hashes: HashSet::from([hash_two]),
+                hashes: IndexSet::from([hash_two]),
                 source: zn::PeerSource::Zakura(peer_id),
             }
         );
@@ -1166,6 +1194,7 @@ mod tests {
                 }
             })),
             latest_chain_tip,
+            Network::Mainnet,
         );
 
         assert_eq!(
@@ -1182,7 +1211,7 @@ mod tests {
         assert_eq!(
             request,
             zn::Request::BlocksByHashFrom {
-                hashes: HashSet::from([hash]),
+                hashes: IndexSet::from([hash]),
                 source: zn::PeerSource::Zakura(peer_id),
             }
         );
@@ -1241,6 +1270,7 @@ mod tests {
                 }
             })),
             latest_chain_tip,
+            Network::Mainnet,
         );
 
         assert_eq!(
@@ -1343,6 +1373,7 @@ mod tests {
                 }
             })),
             latest_chain_tip,
+            Network::Mainnet,
         )
     }
 

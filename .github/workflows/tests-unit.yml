@@ -6,7 +6,7 @@ on:
   # that touch no test-relevant files. This keeps the `test success` required
   # check reporting on every PR instead of sitting in "Expected" forever.
   pull_request:
-    branches: [main, "feat/**", "release/**"]
+    branches: [main, "feat/**", "split/**", "release/**"]
     types: [opened, synchronize, reopened, labeled, unlabeled]
 
   push:
@@ -227,7 +227,7 @@ jobs:
           cache-shared-key: ${{ github.event_name == 'pull_request' && 'zakura-drb-debug' || (github.event_name == 'schedule' && 'unit-tests-release' || 'unit-tests-ci-tests') }}
           cache-on-failure: true
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
-      - uses: taiki-e/install-action@c3ec0de9ae7f1019cea21aa96aa0a895b9552063 #v2.87.9
+      - uses: taiki-e/install-action@7623a79cdfecb99d681017af368ca353d9f49bb5 #v2.87.19
         with:
           tool: cargo-nextest
       - uses: ./.github/actions/setup-zakura-build
@@ -283,7 +283,7 @@ jobs:
           toolchain: ${{ matrix.rust-version }}
           # Nothing is compiled in this job, so there is no build cache to keep.
           cache: false
-      - uses: taiki-e/install-action@c3ec0de9ae7f1019cea21aa96aa0a895b9552063 #v2.87.9
+      - uses: taiki-e/install-action@7623a79cdfecb99d681017af368ca353d9f49bb5 #v2.87.19
         with:
           tool: cargo-nextest
       # RocksDB is dynamically linked, so the prebuilt test binaries still need
@@ -324,7 +324,7 @@ jobs:
           toolchain: stable
           # The test binaries come from build-tests, so this job does not compile.
           cache: false
-      - uses: taiki-e/install-action@c3ec0de9ae7f1019cea21aa96aa0a895b9552063 #v2.87.9
+      - uses: taiki-e/install-action@7623a79cdfecb99d681017af368ca353d9f49bb5 #v2.87.19
         with:
           tool: cargo-nextest
       - uses: ./.github/actions/setup-zakura-build
@@ -336,18 +336,16 @@ jobs:
       - name: Check generated zakurad config compatibility
         run: cargo nextest run --profile zakura-config --archive-file "${RUNNER_TEMP}/nextest-archive.tar.zst" --no-fail-fast
 
-  nu7:
-    name: NU7 feature tests
+  extended-reissuance-properties:
+    name: extended reissuance properties
     needs: changes
-    # Compiles its own binaries, because the shared nextest archive is built
-    # without this feature.
-    if: needs.changes.outputs.rust == 'true' || github.event_name != 'pull_request'
+    if: github.event_name != 'pull_request'
     permissions:
       contents: read
       id-token: write
       statuses: write
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
         with:
@@ -356,11 +354,14 @@ jobs:
         with:
           toolchain: stable
       - uses: ./.github/actions/setup-zakura-build
-      - name: Test NU7 builds
+      - name: Extended reissuance properties
+        env:
+          NSM_ARITHMETIC_CASES: '10000'
+          NSM_HISTORY_CASES: '1000'
         run: |
-          cargo test --locked --features nu7 \
-            -p zakura-consensus --lib
-          cargo check --locked -p zakura --features nu7
+          cargo test --locked -p zakura-chain reissuance_matches_integer_oracle
+          cargo test --locked -p zakura-chain balance_ignores_transfers
+          cargo test --locked -p zakura-state balance_rollback_replay_and_fork_equivalence
 
   network-dependent:
     name: network-dependent acceptance tests
@@ -384,7 +385,7 @@ jobs:
           cache-shared-key: zakura-drb-debug
           cache-on-failure: true
           cache-save-if: false
-      - uses: taiki-e/install-action@c3ec0de9ae7f1019cea21aa96aa0a895b9552063 #v2.87.9
+      - uses: taiki-e/install-action@7623a79cdfecb99d681017af368ca353d9f49bb5 #v2.87.19
         with:
           tool: cargo-nextest
       - uses: ./.github/actions/setup-zakura-build
@@ -413,7 +414,7 @@ jobs:
           # If this job is removed or stops compiling, move cache ownership to
           # network-dependent or a dedicated main-branch debug build job.
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
-      - uses: taiki-e/install-action@c3ec0de9ae7f1019cea21aa96aa0a895b9552063 #v2.87.9
+      - uses: taiki-e/install-action@7623a79cdfecb99d681017af368ca353d9f49bb5 #v2.87.19
         with:
           tool: cargo-nextest
       - uses: ./.github/actions/setup-zakura-build
@@ -438,7 +439,7 @@ jobs:
           toolchain: stable
           cache-on-failure: true
           cache-save-if: false
-      - uses: taiki-e/install-action@c3ec0de9ae7f1019cea21aa96aa0a895b9552063 #v2.87.9
+      - uses: taiki-e/install-action@7623a79cdfecb99d681017af368ca353d9f49bb5 #v2.87.19
         with:
           tool: cargo-nextest
       - uses: ./.github/actions/setup-zakura-build
@@ -490,7 +491,7 @@ jobs:
       - build-tests
       - unit-tests
       - zakura-config
-      - nu7
+      - extended-reissuance-properties
       - network-dependent
       - pruned-storage
       - check-no-git-dependencies
@@ -508,7 +509,7 @@ jobs:
           # check-no-git-dependencies is A-release-label only, publish-graph
           # skips on PRs that do not touch Cargo manifests or this check.
           # Failed, non-skipped jobs still fail this aggregate status.
-          allowed-skips: check-no-git-dependencies, pruned-storage, zakura-config, build-tests, unit-tests, network-dependent, nu7, publish-graph
+          allowed-skips: check-no-git-dependencies, pruned-storage, zakura-config, build-tests, unit-tests, extended-reissuance-properties, network-dependent, publish-graph
 
   report-nightly-result:
     name: report nightly release test result

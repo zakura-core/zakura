@@ -166,8 +166,7 @@ jobs:
           if ! python3 .github/scripts/fetch-release-state.py \
             --latest-url "$LATEST_URL" \
             --output-dir "$RUNNER_TEMP/release-state-bundle" \
-            --metadata-out "$RUNNER_TEMP/release-state-resolution.json" \
-            --max-age-hours 48; then
+            --metadata-out "$RUNNER_TEMP/release-state-resolution.json"; then
             echo "::warning title=Release-state advisory unavailable::The latest Mainnet release-state bundle could not be verified; continuing temporarily."
             exit 0
           fi

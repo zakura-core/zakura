@@ -164,19 +164,24 @@ async fn test_z_get_treestate() {
         .z_get_treestate(blocks[0].hash().to_string())
         .await
         .expect("genesis treestate = no treestate");
-    settings.bind(|| insta::assert_json_snapshot!("z_get_treestate_by_hash", treestate));
+    settings.bind(|| {
+        insta::assert_json_snapshot!("z_get_treestate_by_hash", treestate);
+    });
 
     // Request the treestate by a hash for a block which is not in the state.
     let treestate = rpc.z_get_treestate(block::Hash([0; 32]).to_string()).await;
-    settings
-        .bind(|| insta::assert_json_snapshot!("z_get_treestate_by_non_existent_hash", treestate));
+    settings.bind(|| {
+        insta::assert_json_snapshot!("z_get_treestate_by_non_existent_hash", treestate);
+    });
 
     // Request the treestate before Sapling activation.
     let treestate = rpc
         .z_get_treestate((SAPLING_ACTIVATION_HEIGHT - 1).to_string())
         .await
         .expect("no Sapling treestate and no Orchard treestate");
-    settings.bind(|| insta::assert_json_snapshot!("z_get_treestate_no_treestate", treestate));
+    settings.bind(|| {
+        insta::assert_json_snapshot!("z_get_treestate_no_treestate", treestate);
+    });
 
     // Request the treestate at Sapling activation.
     let treestate = rpc
@@ -184,20 +189,21 @@ async fn test_z_get_treestate() {
         .await
         .expect("empty Sapling treestate and no Orchard treestate");
     settings.bind(|| {
-        insta::assert_json_snapshot!("z_get_treestate_empty_Sapling_treestate", treestate)
+        insta::assert_json_snapshot!("z_get_treestate_empty_Sapling_treestate", treestate);
     });
 
     // Request the treestate for an invalid height.
     let treestate = rpc
         .z_get_treestate(EXCESSIVE_BLOCK_HEIGHT.to_string())
         .await;
-    settings
-        .bind(|| insta::assert_json_snapshot!("z_get_treestate_excessive_block_height", treestate));
+    settings.bind(|| {
+        insta::assert_json_snapshot!("z_get_treestate_excessive_block_height", treestate);
+    });
 
     // Request the treestate for an unparsable hash or height.
     let treestate = rpc.z_get_treestate("Do you even shield?".to_string()).await;
     settings.bind(|| {
-        insta::assert_json_snapshot!("z_get_treestate_unparsable_hash_or_height", treestate)
+        insta::assert_json_snapshot!("z_get_treestate_unparsable_hash_or_height", treestate);
     });
 
     // TODO:
@@ -474,7 +480,9 @@ async fn test_rpc_response_data_for_network(network: &Network) {
 
     match rsp {
         Ok(GetRawMempoolResponse::Verbose(rsp)) => {
-            settings.bind(|| insta::assert_json_snapshot!("get_raw_mempool_verbose", rsp));
+            settings.bind(|| {
+                insta::assert_json_snapshot!("get_raw_mempool_verbose", rsp);
+            });
         }
         _ => panic!("getrawmempool RPC must return `GetRawMempool::Verbose`"),
     }
@@ -489,7 +497,9 @@ async fn test_rpc_response_data_for_network(network: &Network) {
 
     match rsp {
         Ok(GetRawMempoolResponse::TxIds(ref rsp)) => {
-            settings.bind(|| insta::assert_json_snapshot!("get_raw_mempool", rsp));
+            settings.bind(|| {
+                insta::assert_json_snapshot!("get_raw_mempool", rsp);
+            });
         }
         _ => panic!("getrawmempool RPC must return `GetRawMempool::TxIds`"),
     }
@@ -511,8 +521,9 @@ async fn test_rpc_response_data_for_network(network: &Network) {
 
     let rpc_req = rpc.get_raw_transaction(txid.clone(), Some(0u8), None);
     let (rsp, _) = futures::join!(rpc_req, mempool_req);
-    settings
-        .bind(|| insta::assert_json_snapshot!("getrawtransaction_verbosity=0".to_string(), rsp));
+    settings.bind(|| {
+        insta::assert_json_snapshot!("getrawtransaction_verbosity=0".to_string(), rsp);
+    });
 
     // `getrawtransaction` verbosity=1
     let mempool_req = mempool
@@ -525,8 +536,9 @@ async fn test_rpc_response_data_for_network(network: &Network) {
 
     let rpc_req = rpc.get_raw_transaction(txid, Some(1u8), None);
     let (rsp, _) = futures::join!(rpc_req, mempool_req);
-    settings
-        .bind(|| insta::assert_json_snapshot!("getrawtransaction_verbosity=1".to_string(), rsp));
+    settings.bind(|| {
+        insta::assert_json_snapshot!("getrawtransaction_verbosity=1".to_string(), rsp);
+    });
 
     // `getrawtransaction` with unknown txid
     let mempool_req = mempool
@@ -540,15 +552,17 @@ async fn test_rpc_response_data_for_network(network: &Network) {
     let rpc_req =
         rpc.get_raw_transaction(transaction::Hash::from([0; 32]).encode_hex(), Some(1), None);
     let (rsp, _) = futures::join!(rpc_req, mempool_req);
-    settings
-        .bind(|| insta::assert_json_snapshot!("getrawtransaction_unknown_txid".to_string(), rsp));
+    settings.bind(|| {
+        insta::assert_json_snapshot!("getrawtransaction_unknown_txid".to_string(), rsp);
+    });
 
     // `getrawtransaction` with an invalid TXID
     let rsp = rpc
         .get_raw_transaction("aBadC0de".to_owned(), Some(1), None)
         .await;
-    settings
-        .bind(|| insta::assert_json_snapshot!("getrawtransaction_invalid_txid".to_string(), rsp));
+    settings.bind(|| {
+        insta::assert_json_snapshot!("getrawtransaction_invalid_txid".to_string(), rsp);
+    });
 
     // Each awaited RPC has finished all of its causal mempool work, and each
     // expected request above was consumed by its paired handler. One absence
@@ -670,7 +684,7 @@ async fn test_mocked_rpc_response_data_for_network(network: &Network) {
 
     // Check the response.
     settings.bind(|| {
-        insta::assert_json_snapshot!("z_get_subtrees_by_index_for_sapling".to_string(), subtrees)
+        insta::assert_json_snapshot!("z_get_subtrees_by_index_for_sapling".to_string(), subtrees);
     });
 
     // Test the response format from `z_getsubtreesbyindex` for Orchard.
@@ -698,7 +712,7 @@ async fn test_mocked_rpc_response_data_for_network(network: &Network) {
 
     // Check the response.
     settings.bind(|| {
-        insta::assert_json_snapshot!("z_get_subtrees_by_index_for_orchard".to_string(), subtrees)
+        insta::assert_json_snapshot!("z_get_subtrees_by_index_for_orchard".to_string(), subtrees);
     });
 }
 
@@ -715,7 +729,7 @@ fn snapshot_rpc_getinfo(info: GetInfoResponse, settings: &insta::Settings) {
             ".errorstimestamp" => dynamic_redaction(|_value, _path| {
                 "[LastErrorTimestamp]"
             }),
-        })
+        });
     });
 }
 
@@ -739,7 +753,7 @@ fn snapshot_rpc_getblockchaininfo(
                 // replace with:
                 "[f64]"
             }),
-        })
+        });
     });
 }
 
@@ -748,7 +762,9 @@ fn snapshot_rpc_getaddressbalance(
     address_balance: GetAddressBalanceResponse,
     settings: &insta::Settings,
 ) {
-    settings.bind(|| insta::assert_json_snapshot!("get_address_balance", address_balance));
+    settings.bind(|| {
+        insta::assert_json_snapshot!("get_address_balance", address_balance);
+    });
 }
 
 /// Check valid `getblock` data response with verbosity=0, using `cargo insta`, JSON serialization,
@@ -771,7 +787,7 @@ fn snapshot_rpc_getblock_data(
                 // replace with:
                 "[BlockData]"
             }),
-        })
+        });
     });
 }
 
@@ -781,7 +797,9 @@ fn snapshot_rpc_getblock_verbose(
     block: GetBlockResponse,
     settings: &insta::Settings,
 ) {
-    settings.bind(|| insta::assert_json_snapshot!(format!("get_block_verbose_{variant}"), block));
+    settings.bind(|| {
+        insta::assert_json_snapshot!(format!("get_block_verbose_{variant}"), block);
+    });
 }
 
 /// Check valid `getblockheader` response using `cargo insta`.
@@ -790,7 +808,9 @@ fn snapshot_rpc_getblockheader(
     block: GetBlockHeaderResponse,
     settings: &insta::Settings,
 ) {
-    settings.bind(|| insta::assert_json_snapshot!(format!("get_block_header_{variant}"), block));
+    settings.bind(|| {
+        insta::assert_json_snapshot!(format!("get_block_header_{variant}"), block);
+    });
 }
 
 /// Check invalid height `getblock` response using `cargo insta`.
@@ -799,13 +819,16 @@ fn snapshot_rpc_getblock_invalid(
     response: Result<GetBlockResponse>,
     settings: &insta::Settings,
 ) {
-    settings
-        .bind(|| insta::assert_json_snapshot!(format!("get_block_invalid_{variant}"), response));
+    settings.bind(|| {
+        insta::assert_json_snapshot!(format!("get_block_invalid_{variant}"), response);
+    });
 }
 
 /// Snapshot `getbestblockhash` response, using `cargo insta` and JSON serialization.
 fn snapshot_rpc_getbestblockhash(tip_hash: GetBlockHashResponse, settings: &insta::Settings) {
-    settings.bind(|| insta::assert_json_snapshot!("get_best_block_hash", tip_hash));
+    settings.bind(|| {
+        insta::assert_json_snapshot!("get_best_block_hash", tip_hash);
+    });
 }
 
 /// Snapshot valid `getaddressbalance` response, using `cargo insta` and JSON serialization.
@@ -815,7 +838,7 @@ fn snapshot_rpc_getaddresstxids_valid(
     settings: &insta::Settings,
 ) {
     settings.bind(|| {
-        insta::assert_json_snapshot!(format!("get_address_tx_ids_valid_{variant}"), transactions)
+        insta::assert_json_snapshot!(format!("get_address_tx_ids_valid_{variant}"), transactions);
     });
 }
 
@@ -829,23 +852,29 @@ fn snapshot_rpc_getaddresstxids_invalid(
         insta::assert_json_snapshot!(
             format!("get_address_tx_ids_invalid_{variant}"),
             transactions
-        )
+        );
     });
 }
 
 /// Snapshot `getaddressutxos` response, using `cargo insta` and JSON serialization.
 fn snapshot_rpc_getaddressutxos(utxos: Vec<Utxo>, settings: &insta::Settings) {
-    settings.bind(|| insta::assert_json_snapshot!("get_address_utxos", utxos));
+    settings.bind(|| {
+        insta::assert_json_snapshot!("get_address_utxos", utxos);
+    });
 }
 
 /// Snapshot `getblockcount` response, using `cargo insta` and JSON serialization.
 fn snapshot_rpc_getblockcount(block_count: u32, settings: &insta::Settings) {
-    settings.bind(|| insta::assert_json_snapshot!("get_block_count", block_count));
+    settings.bind(|| {
+        insta::assert_json_snapshot!("get_block_count", block_count);
+    });
 }
 
 /// Snapshot valid `getblockhash` response, using `cargo insta` and JSON serialization.
 fn snapshot_rpc_getblockhash_valid(block_hash: GetBlockHashResponse, settings: &insta::Settings) {
-    settings.bind(|| insta::assert_json_snapshot!("get_block_hash_valid", block_hash));
+    settings.bind(|| {
+        insta::assert_json_snapshot!("get_block_hash_valid", block_hash);
+    });
 }
 
 /// Snapshot invalid `getblockhash` response, using `cargo insta` and JSON serialization.
@@ -855,7 +884,7 @@ fn snapshot_rpc_getblockhash_invalid(
     settings: &insta::Settings,
 ) {
     settings.bind(|| {
-        insta::assert_json_snapshot!(format!("get_block_hash_invalid_{variant}"), block_hash)
+        insta::assert_json_snapshot!(format!("get_block_hash_invalid_{variant}"), block_hash);
     });
 }
 
@@ -874,7 +903,7 @@ fn snapshot_rpc_getblocktemplate(
                 assert!(work_id.bytes().all(|byte| byte.is_ascii_hexdigit()));
                 "[WorkId]"
             }),
-        })
+        });
     });
 
     if let Some(coinbase_tx) = coinbase_tx {
@@ -882,7 +911,7 @@ fn snapshot_rpc_getblocktemplate(
             insta::assert_ron_snapshot!(
                 format!("get_block_template_{variant}.coinbase_tx"),
                 coinbase_tx
-            )
+            );
         });
     };
 }
@@ -893,13 +922,15 @@ fn snapshot_rpc_submit_block_invalid(
     settings: &insta::Settings,
 ) {
     settings.bind(|| {
-        insta::assert_json_snapshot!("snapshot_rpc_submit_block_invalid", submit_block_response)
+        insta::assert_json_snapshot!("snapshot_rpc_submit_block_invalid", submit_block_response);
     });
 }
 
 /// Snapshot `getmininginfo` response, using `cargo insta` and JSON serialization.
 fn snapshot_rpc_getmininginfo(get_mining_info: GetMiningInfoResponse, settings: &insta::Settings) {
-    settings.bind(|| insta::assert_json_snapshot!("get_mining_info", get_mining_info));
+    settings.bind(|| {
+        insta::assert_json_snapshot!("get_mining_info", get_mining_info);
+    });
 }
 
 /// Snapshot `getblocksubsidy` response, using `cargo insta` and JSON serialization.
@@ -909,7 +940,7 @@ fn snapshot_rpc_getblocksubsidy(
     settings: &insta::Settings,
 ) {
     settings.bind(|| {
-        insta::assert_json_snapshot!(format!("get_block_subsidy_{variant}"), get_block_subsidy)
+        insta::assert_json_snapshot!(format!("get_block_subsidy_{variant}"), get_block_subsidy);
     });
 }
 
@@ -918,17 +949,23 @@ fn snapshot_rpc_getnetworkinfo(
     get_network_info: GetNetworkInfoResponse,
     settings: &insta::Settings,
 ) {
-    settings.bind(|| insta::assert_json_snapshot!("get_network_info", get_network_info));
+    settings.bind(|| {
+        insta::assert_json_snapshot!("get_network_info", get_network_info);
+    });
 }
 
 /// Snapshot `getpeerinfo` response, using `cargo insta` and JSON serialization.
 fn snapshot_rpc_getpeerinfo(get_peer_info: Vec<PeerInfo>, settings: &insta::Settings) {
-    settings.bind(|| insta::assert_json_snapshot!("get_peer_info", get_peer_info));
+    settings.bind(|| {
+        insta::assert_json_snapshot!("get_peer_info", get_peer_info);
+    });
 }
 
 /// Snapshot `getnetworksolps` response, using `cargo insta` and JSON serialization.
 fn snapshot_rpc_getnetworksolps(get_network_sol_ps: u64, settings: &insta::Settings) {
-    settings.bind(|| insta::assert_json_snapshot!("get_network_sol_ps", get_network_sol_ps));
+    settings.bind(|| {
+        insta::assert_json_snapshot!("get_network_sol_ps", get_network_sol_ps);
+    });
 }
 
 /// Snapshot `validateaddress` response, using `cargo insta` and JSON serialization.
@@ -938,7 +975,7 @@ fn snapshot_rpc_validateaddress(
     settings: &insta::Settings,
 ) {
     settings.bind(|| {
-        insta::assert_json_snapshot!(format!("validate_address_{variant}"), validate_address)
+        insta::assert_json_snapshot!(format!("validate_address_{variant}"), validate_address);
     });
 }
 
@@ -949,7 +986,7 @@ fn snapshot_rpc_z_validateaddress(
     settings: &insta::Settings,
 ) {
     settings.bind(|| {
-        insta::assert_json_snapshot!(format!("z_validate_address_{variant}"), z_validate_address)
+        insta::assert_json_snapshot!(format!("z_validate_address_{variant}"), z_validate_address);
     });
 }
 
@@ -960,7 +997,7 @@ fn snapshot_rpc_getdifficulty_valid(
     settings: &insta::Settings,
 ) {
     settings.bind(|| {
-        insta::assert_json_snapshot!(format!("get_difficulty_valid_{variant}"), difficulty)
+        insta::assert_json_snapshot!(format!("get_difficulty_valid_{variant}"), difficulty);
     });
 }
 
@@ -971,7 +1008,7 @@ fn snapshot_rpc_z_listunifiedreceivers(
     settings: &insta::Settings,
 ) {
     settings.bind(|| {
-        insta::assert_json_snapshot!(format!("z_list_unified_receivers_{variant}"), response)
+        insta::assert_json_snapshot!(format!("z_list_unified_receivers_{variant}"), response);
     });
 }
 
@@ -1138,11 +1175,23 @@ pub async fn test_mining_rpcs<State, ReadState>(
         .expect("We should have a success response");
     snapshot_rpc_getblocksubsidy("tip_height", get_block_subsidy, &settings);
 
-    let get_block_subsidy = rpc
-        .get_block_subsidy(Some(EXCESSIVE_BLOCK_HEIGHT))
-        .await
-        .expect("We should have a success response");
-    snapshot_rpc_getblocksubsidy("excessive_height", get_block_subsidy, &settings);
+    let get_block_subsidy = rpc.get_block_subsidy(Some(EXCESSIVE_BLOCK_HEIGHT)).await;
+    if is_zip234_active(network, block::Height(EXCESSIVE_BLOCK_HEIGHT)) {
+        // Reissuance requires the parent's NSM balance, which this state lacks.
+        let error = get_block_subsidy.expect_err("the requested parent is not in the state");
+        assert!(error
+            .message()
+            .contains("at most one block above the best chain tip"));
+        settings.bind(|| {
+            insta::assert_json_snapshot!("get_block_subsidy_excessive_height", error);
+        });
+    } else {
+        snapshot_rpc_getblocksubsidy(
+            "excessive_height",
+            get_block_subsidy.expect("the halving subsidy does not need parent state"),
+            &settings,
+        );
+    }
 
     // `getnetworkinfo`
     let get_network_info = rpc
@@ -1182,6 +1231,7 @@ pub async fn test_mining_rpcs<State, ReadState>(
                 .expect_request_that(|req| matches!(req, ReadRequest::ChainInfo))
                 .await
                 .respond(ReadResponse::ChainInfo(GetBlockTemplateChainInfo {
+                    value_pools: Default::default(),
                     expected_difficulty: fake_difficulty,
                     tip_height: fake_tip_height,
                     tip_hash: fake_tip_hash,

@@ -276,7 +276,7 @@ impl Input {
     }
 
     /// Get the value spent by this input from any UTXO index whose values
-    /// reference [`Utxo`](utxo::Utxo).
+    /// reference [`Utxo`].
     pub(crate) fn value_from_utxos<U>(&self, utxos: &HashMap<OutPoint, U>) -> Amount<NonNegative>
     where
         U: AsRef<utxo::Utxo>,

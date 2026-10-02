@@ -3,11 +3,11 @@
 use std::{
     collections::{BTreeMap, HashSet},
     fmt,
-    sync::Arc,
+    sync::{Arc, OnceLock},
 };
 
 use crate::{
-    amount::{Amount, NonNegative},
+    amount::{Amount, NonNegative, MAX_MONEY},
     block::{self, Height, HeightDiff},
     parameters::{
         checkpoint::list::{CheckpointList, TESTNET_CHECKPOINT_LIST},
@@ -20,9 +20,10 @@ use crate::{
             constants::{
                 BLOSSOM_POW_TARGET_SPACING_RATIO, FUNDING_STREAM_RECEIVER_DENOMINATOR,
                 MAX_BLOCK_SUBSIDY, POST_BLOSSOM_HALVING_INTERVAL, PRE_BLOSSOM_HALVING_INTERVAL,
+                REVISION_2_FUNDING_STREAMS_INDEX,
             },
-            funding_stream_address_period, FundingStreamReceiver, FundingStreamRecipient,
-            FundingStreams, ParameterSubsidy,
+            funding_stream_address_period, scheduled_issuance_zatoshis, FundingStreamReceiver,
+            FundingStreamRecipient, FundingStreams, ParameterSubsidy,
         },
         Network, NetworkKind, NetworkUpgrade,
     },
@@ -361,6 +362,30 @@ fn check_funding_stream_address_period(funding_streams: &FundingStreams, network
     }
 }
 
+/// Rejects overlapping funding stream ranges, because [`Network::funding_streams`] returns only
+/// the first matching stream and would silently ignore every later match.
+fn check_funding_stream_ranges_do_not_overlap(
+    funding_streams: &[FundingStreams],
+) -> Result<(), ParametersBuilderError> {
+    for (first_index, first) in funding_streams.iter().enumerate() {
+        for (second_index, second) in funding_streams.iter().enumerate().skip(first_index + 1) {
+            let first_range = first.height_range();
+            let second_range = second.height_range();
+
+            if first_range.start < second_range.end && second_range.start < first_range.end {
+                return Err(ParametersBuilderError::OverlappingFundingStreams {
+                    first_index,
+                    first_range: first_range.clone(),
+                    second_index,
+                    second_range: second_range.clone(),
+                });
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// Checks that every funding stream recipient address in the provided [`FundingStreams`]
 /// is a P2SH address.
 ///
@@ -423,6 +448,42 @@ fn check_lockbox_disbursements(
 
         total = (total + *amount)
             .map_err(|_| ParametersBuilderError::InvalidLockboxDisbursementTotal)?;
+    }
+
+    Ok(())
+}
+
+/// Checks that an omitted NSM seed is bounded for every possible valid monetary-pool total.
+///
+/// The derived seed subtracts the issued supply, which is non-negative, from the cumulative
+/// schedule. Bounding the schedule at the seed height therefore guarantees that the result
+/// cannot exceed the existing `Amount` representation.
+fn check_derived_nsm_seed_schedule(network: &Network) -> Result<(), ParametersBuilderError> {
+    let Network::Testnet(params) = network else {
+        return Ok(());
+    };
+    if params.configured_initial_nsm_value_balance().is_some() {
+        return Ok(());
+    }
+    let Some(seed_height) = NetworkUpgrade::Nu7
+        .activation_height(network)
+        .and_then(|activation| activation.previous().ok())
+    else {
+        return Ok(());
+    };
+
+    let scheduled_issuance =
+        scheduled_issuance_zatoshis(seed_height, network).map_err(|source| {
+            ParametersBuilderError::InvalidDerivedNsmSeedSchedule {
+                seed_height,
+                source,
+            }
+        })?;
+    if scheduled_issuance > u128::from(MAX_MONEY.unsigned_abs()) {
+        return Err(ParametersBuilderError::DerivedNsmSeedExceedsMaxMoney {
+            seed_height,
+            scheduled_issuance,
+        });
     }
 
     Ok(())
@@ -614,6 +675,10 @@ pub struct ParametersBuilder {
     slow_start_interval: Height,
     /// Funding streams for this network
     funding_streams: Vec<FundingStreams>,
+    /// Whether each funding stream in `funding_streams` inherited its height range from the
+    /// built-in Testnet funding streams. Only an inherited Revision 2 range moves with NU7,
+    /// see [`FundingStreams::with_nu7_adjusted_end_height`].
+    inherited_funding_stream_ranges: Vec<bool>,
     /// A flag indicating whether to allow changes to fields that affect
     /// the funding stream address period.
     should_lock_funding_stream_address_period: bool,
@@ -636,6 +701,12 @@ pub struct ParametersBuilder {
     checkpoints: Arc<CheckpointList>,
     /// Height at which the soft-fork to temporarily disable Orchard in transactions activates
     temporary_orchard_disabling_soft_fork_height: Option<Height>,
+    /// The configured NSM reissuance start height, see [`Parameters::test_nsm_reissuance_height`].
+    #[cfg(any(test, feature = "proptest-impl"))]
+    test_nsm_reissuance_height: Option<Height>,
+    /// The NSM value balance immediately before NU7, see
+    /// [`Parameters::initial_nsm_value_balance`].
+    initial_nsm_value_balance: Option<Amount<NonNegative>>,
 }
 
 impl Default for ParametersBuilder {
@@ -664,6 +735,7 @@ impl Default for ParametersBuilder {
             disable_pow: false,
             max_block_time_start_height: None,
             funding_streams: testnet::FUNDING_STREAMS.clone(),
+            inherited_funding_stream_ranges: vec![true; testnet::FUNDING_STREAMS.len()],
             should_lock_funding_stream_address_period: false,
             pre_blossom_halving_interval: PRE_BLOSSOM_HALVING_INTERVAL,
             post_blossom_halving_interval: POST_BLOSSOM_HALVING_INTERVAL,
@@ -676,6 +748,10 @@ impl Default for ParametersBuilder {
             temporary_orchard_disabling_soft_fork_height: Some(
                 super::TESTNET_TEMPORARY_ORCHARD_DISABLING_SOFT_FORK_HEIGHT,
             ),
+            #[cfg(any(test, feature = "proptest-impl"))]
+            test_nsm_reissuance_height: None,
+            // Configured networks derive their seed unless an override is supplied.
+            initial_nsm_value_balance: None,
         }
     }
 }
@@ -843,14 +919,18 @@ impl ParametersBuilder {
     /// If `funding_streams` is longer than `testnet::FUNDING_STREAMS`, and one
     /// of the extra streams requires a default value.
     pub fn with_funding_streams(mut self, funding_streams: Vec<ConfiguredFundingStreams>) -> Self {
-        self.funding_streams = funding_streams
+        (self.funding_streams, self.inherited_funding_stream_ranges) = funding_streams
             .into_iter()
             .enumerate()
             .map(|(idx, streams)| {
+                let is_range_inherited = streams.height_range.is_none();
                 let default_streams = testnet::FUNDING_STREAMS.get(idx).cloned();
-                streams.convert_with_default(default_streams)
+                (
+                    streams.convert_with_default(default_streams),
+                    is_range_inherited,
+                )
             })
-            .collect();
+            .unzip();
         self.should_lock_funding_stream_address_period = true;
         self
     }
@@ -858,6 +938,7 @@ impl ParametersBuilder {
     /// Clears funding streams from the [`Parameters`] being built.
     pub fn clear_funding_streams(mut self) -> Self {
         self.funding_streams = vec![];
+        self.inherited_funding_stream_ranges = vec![];
         self
     }
 
@@ -868,10 +949,15 @@ impl ParametersBuilder {
     pub fn extend_funding_streams(mut self) -> Self {
         let network = self.to_network_unchecked();
 
-        for funding_streams in &mut self.funding_streams {
+        // The network holds the height ranges after NU7 moves the inherited ones.
+        for (funding_streams, network_funding_streams) in self
+            .funding_streams
+            .iter_mut()
+            .zip(network.all_funding_streams())
+        {
             funding_streams.extend_recipient_addresses(
                 num_funding_stream_addresses_required_for_height_range(
-                    funding_streams.height_range(),
+                    network_funding_streams.height_range(),
                     &network,
                 ),
             );
@@ -915,7 +1001,10 @@ impl ParametersBuilder {
         self
     }
 
-    /// Sets the pre and post Blosssom halving intervals to be used in the [`Parameters`] being built.
+    /// Sets the pre- and post-Blossom halving intervals in the [`Parameters`] being built.
+    ///
+    /// Returns an error if funding streams are already configured, or if the interval is not
+    /// positive or cannot be represented as a [`HeightDiff`] in pre-Blossom target seconds.
     pub fn with_halving_interval(
         mut self,
         pre_blossom_halving_interval: HeightDiff,
@@ -924,9 +1013,16 @@ impl ParametersBuilder {
             return Err(ParametersBuilderError::HalvingIntervalAfterFundingStreams);
         }
 
+        pre_blossom_halving_interval
+            .checked_mul(NetworkUpgrade::Genesis.target_spacing().num_seconds())
+            .filter(|seconds| *seconds > 0)
+            .ok_or(ParametersBuilderError::InvalidHalvingInterval)?;
+        let post_blossom_halving_interval = pre_blossom_halving_interval
+            .checked_mul(HeightDiff::from(BLOSSOM_POW_TARGET_SPACING_RATIO))
+            .ok_or(ParametersBuilderError::InvalidHalvingInterval)?;
+
         self.pre_blossom_halving_interval = pre_blossom_halving_interval;
-        self.post_blossom_halving_interval =
-            self.pre_blossom_halving_interval * (BLOSSOM_POW_TARGET_SPACING_RATIO as HeightDiff);
+        self.post_blossom_halving_interval = post_blossom_halving_interval;
         Ok(self)
     }
 
@@ -996,6 +1092,25 @@ impl ParametersBuilder {
         self
     }
 
+    /// Sets an artificial reissuance height for short-chain test fixtures only.
+    /// This hook is unavailable in production builds and cannot be configured by a node.
+    #[cfg(any(test, feature = "proptest-impl"))]
+    pub fn with_test_nsm_reissuance_height(mut self, height: Height) -> Self {
+        self.test_nsm_reissuance_height = Some(height);
+        self
+    }
+
+    /// Sets zips#1354's `INITIAL_NSM_VALUE_BALANCE`, the value the NSM value balance holds
+    /// immediately before NU7 activates.
+    ///
+    /// Configured networks derive their seed from chain state unless this override is set.
+    /// Derivation requires cumulative scheduled issuance through the block before NU7 to fit
+    /// in `MAX_MONEY`.
+    pub fn with_initial_nsm_value_balance(mut self, balance: Amount<NonNegative>) -> Self {
+        self.initial_nsm_value_balance = Some(balance);
+        self
+    }
+
     /// Converts the builder to a [`Parameters`] struct
     fn finish(self) -> Parameters {
         // The builder defaults to public Testnet consensus parameters, so an unset
@@ -1011,6 +1126,7 @@ impl ParametersBuilder {
             activation_heights,
             slow_start_interval,
             funding_streams,
+            inherited_funding_stream_ranges,
             should_lock_funding_stream_address_period: _,
             target_difficulty_limit,
             disable_pow,
@@ -1021,8 +1137,11 @@ impl ParametersBuilder {
             lockbox_disbursements,
             checkpoints,
             temporary_orchard_disabling_soft_fork_height,
+            #[cfg(any(test, feature = "proptest-impl"))]
+            test_nsm_reissuance_height,
+            initial_nsm_value_balance,
         } = self;
-        Parameters {
+        let mut parameters = Parameters {
             network_name,
             network_magic,
             genesis_hash,
@@ -1039,7 +1158,31 @@ impl ParametersBuilder {
             lockbox_disbursements,
             checkpoints,
             temporary_orchard_disabling_soft_fork_height,
+            #[cfg(any(test, feature = "proptest-impl"))]
+            test_nsm_reissuance_height,
+            nsm_reissuance_crossing_height: DerivedHeight::default(),
+            initial_nsm_value_balance,
+        };
+
+        // ZIP 218 moves the third halving, and ZIP 214 Revision 3 moves the end of the
+        // Revision 2 streams there. Explicitly configured height ranges stay as configured.
+        let nu7_activation = NetworkUpgrade::Nu7
+            .activation_height(&Network::new_configured_testnet(parameters.clone()));
+        if let Some(funding_streams) = parameters
+            .funding_streams
+            .get_mut(REVISION_2_FUNDING_STREAMS_INDEX)
+            .filter(|_| {
+                inherited_funding_stream_ranges
+                    .get(REVISION_2_FUNDING_STREAMS_INDEX)
+                    .is_some_and(|is_range_inherited| *is_range_inherited)
+            })
+        {
+            *funding_streams = funding_streams
+                .clone()
+                .with_nu7_adjusted_end_height(nu7_activation);
         }
+
+        parameters
     }
 
     /// Converts the builder to a configured [`Network::Testnet`]
@@ -1047,12 +1190,15 @@ impl ParametersBuilder {
         Network::new_configured_testnet(self.clone().finish())
     }
 
-    /// Checks funding streams and converts the builder to a configured [`Network::Testnet`]
+    /// Checks that funding stream ranges do not overlap, validates each stream, and converts the
+    /// builder to a configured [`Network::Testnet`].
     pub fn to_network(self) -> Result<Network, ParametersBuilderError> {
         let network = self.to_network_unchecked();
 
         // Final check that the configured funding streams will be valid for these Testnet parameters.
-        for fs in &self.funding_streams {
+        // The network holds the height ranges after NU7 moves the inherited ones.
+        check_funding_stream_ranges_do_not_overlap(network.all_funding_streams())?;
+        for fs in network.all_funding_streams() {
             // Check that the funding streams are valid for the configured Testnet parameters.
             check_funding_stream_address_period(fs, &network);
             check_funding_stream_address_types(fs)?;
@@ -1060,20 +1206,20 @@ impl ParametersBuilder {
 
         check_founders_reward_is_exact(&network)?;
         check_lockbox_disbursements(&self.lockbox_disbursements)?;
+        check_derived_nsm_seed_schedule(&network)?;
 
-        // Final check that the configured checkpoints are valid for this network.
-        if network.checkpoint_list().hash(Height(0)) != Some(network.genesis_hash()) {
-            return Err(ParametersBuilderError::CheckpointGenesisMismatch);
-        }
-        if network.checkpoint_list().max_height() < network.mandatory_checkpoint_height() {
-            return Err(ParametersBuilderError::InsufficientCheckpointCoverage);
-        }
+        check_checkpoint_coverage(&network)?;
 
         Ok(network)
     }
 
     /// Returns true if these [`Parameters`] should be compatible with the default Testnet parameters.
     pub fn is_compatible_with_default_parameters(&self) -> bool {
+        #[cfg(any(test, feature = "proptest-impl"))]
+        if self.test_nsm_reissuance_height.is_some() {
+            return false;
+        }
+
         let max_block_time_start_height = self
             .max_block_time_start_height
             .unwrap_or(TESTNET_MAX_TIME_START_HEIGHT);
@@ -1083,7 +1229,8 @@ impl ParametersBuilder {
             genesis_hash,
             activation_heights,
             slow_start_interval,
-            funding_streams,
+            funding_streams: _,
+            inherited_funding_stream_ranges: _,
             should_lock_funding_stream_address_period: _,
             target_difficulty_limit,
             disable_pow,
@@ -1094,13 +1241,19 @@ impl ParametersBuilder {
             lockbox_disbursements,
             checkpoints: _,
             temporary_orchard_disabling_soft_fork_height: _,
+            // Artificial activation heights are only used by test fixtures.
+            #[cfg(any(test, feature = "proptest-impl"))]
+                test_nsm_reissuance_height: _,
+            initial_nsm_value_balance: _,
         } = Self::default();
 
+        // Compare the height ranges after NU7 moves the inherited ones, so an explicit copy
+        // of the built-in ranges is compatible exactly when it matches them.
         self.activation_heights == activation_heights
             && self.network_magic == network_magic
             && self.genesis_hash == genesis_hash
             && self.slow_start_interval == slow_start_interval
-            && self.funding_streams == funding_streams
+            && self.clone().finish().funding_streams == Self::default().finish().funding_streams
             && self.target_difficulty_limit == target_difficulty_limit
             && self.disable_pow == disable_pow
             && max_block_time_start_height == TESTNET_MAX_TIME_START_HEIGHT
@@ -1109,7 +1262,21 @@ impl ParametersBuilder {
             && self.pre_blossom_halving_interval == pre_blossom_halving_interval
             && self.post_blossom_halving_interval == post_blossom_halving_interval
             && self.lockbox_disbursements == lockbox_disbursements
+            && self.initial_nsm_value_balance == Some(testnet::INITIAL_NSM_VALUE_BALANCE)
     }
+}
+
+/// Checks that the trusted checkpoint list starts at genesis and covers blocks that
+/// cannot be verified semantically.
+fn check_checkpoint_coverage(network: &Network) -> Result<(), ParametersBuilderError> {
+    let checkpoints = network.checkpoint_list();
+    if checkpoints.hash(Height(0)) != Some(network.genesis_hash()) {
+        return Err(ParametersBuilderError::CheckpointGenesisMismatch);
+    }
+    if checkpoints.max_height() < network.mandatory_checkpoint_height() {
+        return Err(ParametersBuilderError::InsufficientCheckpointCoverage);
+    }
+    Ok(())
 }
 
 /// A struct of parameters for configuring Regtest in Zebra.
@@ -1121,12 +1288,20 @@ pub struct RegtestParameters {
     pub funding_streams: Option<Vec<ConfiguredFundingStreams>>,
     /// Expected one-time lockbox disbursement outputs in NU6.1 activation block coinbase for Regtest
     pub lockbox_disbursements: Option<Vec<ConfiguredLockboxDisbursement>>,
-    /// Configured checkpointed block heights and hashes.
+    /// Configured checkpointed block heights and hashes, covering the mandatory checkpoint
+    /// before Canopy activation. Omitting this list is valid when Canopy activates at height 1.
     pub checkpoints: Option<ConfiguredCheckpoints>,
     /// Local activation height for the MTP-plus-90-minutes rule.
     pub max_block_time_start_height: Option<Height>,
     /// Whether funding stream addresses should be repeated to fill all required funding stream periods.
     pub extend_funding_stream_addresses_as_required: Option<bool>,
+    /// Artificial reissuance height for short-chain test fixtures, see
+    /// [`ParametersBuilder::with_test_nsm_reissuance_height`].
+    #[cfg(any(test, feature = "proptest-impl"))]
+    pub test_nsm_reissuance_height: Option<Height>,
+    /// The NSM value balance immediately before NU7, see
+    /// [`ParametersBuilder::with_initial_nsm_value_balance`].
+    pub initial_nsm_value_balance: Option<Amount<NonNegative>>,
 }
 
 impl From<ConfiguredActivationHeights> for RegtestParameters {
@@ -1174,7 +1349,35 @@ pub struct Parameters {
     checkpoints: Arc<CheckpointList>,
     /// Height at which the soft-fork to temporarily disable Orchard in transactions activates
     temporary_orchard_disabling_soft_fork_height: Option<Height>,
+    /// Artificial reissuance height for short-chain test fixtures only.
+    #[cfg(any(test, feature = "proptest-impl"))]
+    test_nsm_reissuance_height: Option<Height>,
+    /// Cached reference crossing derived from the immutable network parameters.
+    nsm_reissuance_crossing_height: DerivedHeight,
+    /// The NSM value balance immediately before NU7 activates.
+    initial_nsm_value_balance: Option<Amount<NonNegative>>,
 }
+
+/// A height derived from the other [`Parameters`] fields and computed on first use.
+///
+/// Equality ignores it, because equal parameters derive equal heights.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct DerivedHeight(OnceLock<Option<Height>>);
+
+impl DerivedHeight {
+    /// Returns the height, computing it with `derive` on first use.
+    pub(crate) fn get_or_init(&self, derive: impl FnOnce() -> Option<Height>) -> Option<Height> {
+        *self.0.get_or_init(derive)
+    }
+}
+
+impl PartialEq for DerivedHeight {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for DerivedHeight {}
 
 impl Default for Parameters {
     /// Returns an instance of the default public testnet [`Parameters`].
@@ -1182,6 +1385,9 @@ impl Default for Parameters {
         Self {
             network_name: "Testnet".to_string(),
             max_block_time_start_height: TESTNET_MAX_TIME_START_HEIGHT,
+            #[cfg(any(test, feature = "proptest-impl"))]
+            test_nsm_reissuance_height: None,
+            initial_nsm_value_balance: Some(testnet::INITIAL_NSM_VALUE_BALANCE),
             ..Self::build().finish()
         }
     }
@@ -1196,6 +1402,9 @@ impl Parameters {
     /// Accepts a [`ConfiguredActivationHeights`].
     ///
     /// Creates an instance of [`Parameters`] with `Regtest` values.
+    ///
+    /// Returns an error if the checkpoints do not match genesis or cover the mandatory
+    /// checkpoint before Canopy activation, or if another parameter is invalid.
     pub fn new_regtest(
         RegtestParameters {
             activation_heights,
@@ -1204,6 +1413,9 @@ impl Parameters {
             checkpoints,
             extend_funding_stream_addresses_as_required,
             max_block_time_start_height,
+            #[cfg(any(test, feature = "proptest-impl"))]
+            test_nsm_reissuance_height,
+            initial_nsm_value_balance,
         }: RegtestParameters,
     ) -> Result<Self, ParametersBuilderError> {
         let mut parameters = Self::build()
@@ -1233,6 +1445,15 @@ impl Parameters {
             parameters = parameters.extend_funding_streams();
         }
 
+        #[cfg(any(test, feature = "proptest-impl"))]
+        if let Some(height) = test_nsm_reissuance_height {
+            parameters = parameters.with_test_nsm_reissuance_height(height);
+        }
+
+        if let Some(balance) = initial_nsm_value_balance {
+            parameters = parameters.with_initial_nsm_value_balance(balance);
+        }
+
         // Regtest does not run the `to_network()` checks, so run them here: block validation
         // panics on a funding stream or lockbox disbursement address that is not P2SH.
         for funding_stream in &parameters.funding_streams {
@@ -1240,11 +1461,14 @@ impl Parameters {
         }
         check_lockbox_disbursements(&parameters.lockbox_disbursements)?;
 
-        Ok(Self {
+        let parameters = Self {
             network_name: "Regtest".to_string(),
             network_magic: magics::REGTEST,
             ..parameters.finish()
-        })
+        };
+        check_derived_nsm_seed_schedule(&Network::new_configured_testnet(parameters.clone()))?;
+        check_checkpoint_coverage(&Network::new_configured_testnet(parameters.clone()))?;
+        Ok(parameters)
     }
 
     /// Returns true if the instance of [`Parameters`] represents the default public Testnet.
@@ -1279,6 +1503,14 @@ impl Parameters {
             lockbox_disbursements: _,
             checkpoints: _,
             temporary_orchard_disabling_soft_fork_height: _,
+            // Artificial reissuance heights are only used by test fixtures
+            #[cfg(any(test, feature = "proptest-impl"))]
+                test_nsm_reissuance_height: _,
+            nsm_reissuance_crossing_height: _,
+            // Regtest chains start empty, so the seed is always zero. It stays out of the
+            // identity check for the same reason the halving interval stays in: it is
+            // derived from the defaults above, not chosen.
+            initial_nsm_value_balance: _,
         } = Self::new_regtest(Default::default()).expect("default regtest parameters are valid");
 
         self.network_name == network_name
@@ -1390,6 +1622,30 @@ impl Parameters {
     /// transactions activates.
     pub fn temporary_orchard_disabling_soft_fork_height(&self) -> Option<Height> {
         self.temporary_orchard_disabling_soft_fork_height
+    }
+
+    /// Returns the artificial height used only by short-chain test fixtures.
+    #[cfg(any(test, feature = "proptest-impl"))]
+    pub fn test_nsm_reissuance_height(&self) -> Option<Height> {
+        self.test_nsm_reissuance_height
+    }
+
+    /// Returns the cached crossing derived from this network's subsidy schedule.
+    pub(crate) fn nsm_reissuance_crossing_height(&self) -> &DerivedHeight {
+        &self.nsm_reissuance_crossing_height
+    }
+
+    /// Returns the expected public seed or configured override, or zero when unset.
+    /// Use [`Self::configured_initial_nsm_value_balance`] to distinguish derivation from zero.
+    ///
+    /// See [`ParametersBuilder::with_initial_nsm_value_balance`].
+    pub fn initial_nsm_value_balance(&self) -> Amount<NonNegative> {
+        self.initial_nsm_value_balance.unwrap_or_default()
+    }
+
+    /// Returns an explicit seed override, or `None` to derive it from chain state.
+    pub fn configured_initial_nsm_value_balance(&self) -> Option<Amount<NonNegative>> {
+        self.initial_nsm_value_balance
     }
 }
 

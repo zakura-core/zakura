@@ -15,11 +15,13 @@ use std::{
 
 use color_eyre::Report;
 use futures::{Future, FutureExt, StreamExt};
+use indexmap::IndexSet;
 use tower::{timeout::Timeout, Service};
 
 use zakura_chain::{
     block::{self, Block, Height},
     chain_tip::mock::{MockChainTip, MockChainTipSender},
+    parameters::{testnet::ConfiguredActivationHeights, Network},
     serialization::ZcashDeserializeInto,
 };
 use zakura_consensus::{
@@ -38,7 +40,10 @@ use crate::{
         auth_download_height::poison_coinbase_height,
         sync::{
             self,
-            downloads::{BlockDownloadVerifyError, Downloads},
+            downloads::{
+                lookahead_heights, BlockDownloadVerifyError, Downloads,
+                VERIFICATION_PIPELINE_DROP_LIMIT,
+            },
             legacy_trace::LegacySyncTrace,
             SyncStatus,
         },
@@ -2395,8 +2400,8 @@ async fn transient_download_failure_preserves_sync_round() -> Result<(), crate::
             let response = peer_set
                 .expect_request_that(|request| match request {
                     zn::Request::BlocksByHash(hashes) => {
-                        hashes == &HashSet::from([retried_hash])
-                            || hashes == &HashSet::from([unrelated_hash])
+                        hashes == &IndexSet::from([retried_hash])
+                            || hashes == &IndexSet::from([unrelated_hash])
                     }
                     _ => false,
                 })
@@ -3884,6 +3889,7 @@ async fn empty_block_response_is_retryable_download_failure() {
         chain_tip,
         past_lookahead_limit_sender,
         sync::MIN_CONCURRENCY_LIMIT,
+        Network::Mainnet,
         Height(0),
         LegacySyncTrace::new(None, false),
     );
@@ -3932,6 +3938,7 @@ async fn block_download_network_readiness_times_out() {
         chain_tip,
         past_lookahead_limit_sender,
         sync::MIN_CONCURRENCY_LIMIT,
+        Network::Mainnet,
         Height(0),
         LegacySyncTrace::new(None, false),
     );
@@ -3967,6 +3974,7 @@ fn setup_downloads(
         chain_tip,
         past_lookahead_limit_sender,
         sync::MIN_CONCURRENCY_LIMIT,
+        Network::Mainnet,
         Height(0),
         LegacySyncTrace::new(None, false),
     )
@@ -4509,5 +4517,134 @@ async fn pending_duplicate_requeues_without_clearing_verification_retry_budgets(
             .respond_error("finish the test download".into());
         assert!(chain_sync.downloads.next().await.unwrap().is_err());
         peers.expect_no_requests().await;
+    }
+}
+
+/// Returns the syncer's lookahead limit on `network` when the verified tip is `tip`.
+fn lookahead_limit_at(network: &Network, max_checkpoint_height: Height, tip: Height) -> usize {
+    let config = ZakuradConfig {
+        network: zn::Config {
+            network: network.clone(),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let (chain_tip, chain_tip_sender) = MockChainTip::new();
+    chain_tip_sender.send_best_tip_height(tip);
+
+    let (misbehavior_tx, _misbehavior_rx) = tokio::sync::mpsc::channel(1);
+    let (chain_sync, _sync_status): (TestChainSync, _) = ChainSync::new(
+        &config,
+        max_checkpoint_height,
+        MockService::build().for_unit_tests(),
+        MockService::build().for_unit_tests(),
+        MockService::build().for_unit_tests(),
+        chain_tip,
+        misbehavior_tx,
+    );
+
+    chain_sync.lookahead_limit(0)
+}
+
+/// ZIP 218 scales the block-count lookahead limits where the target spacing is 25 seconds.
+#[tokio::test]
+async fn lookahead_limit_scales_with_target_spacing() {
+    let _init_guard = zakura_test::init();
+
+    const NU7: u32 = 5_000;
+    let regtest = Network::new_regtest(
+        ConfiguredActivationHeights {
+            nu7: Some(NU7),
+            ..Default::default()
+        }
+        .into(),
+    );
+    let multiplier = 3;
+
+    let sync_config = ZakuradConfig::default().sync;
+    let checkpoint_limit = sync_config.checkpoint_verify_concurrency_limit;
+    let full_limit = sync_config.full_verify_concurrency_limit;
+
+    // Mainnet has no NU7 height, so its limits stay unscaled.
+    let mainnet_checkpoint = Height(3_000_000);
+    assert_eq!(
+        lookahead_limit_at(&Network::Mainnet, mainnet_checkpoint, Height(2_000_000)),
+        checkpoint_limit
+    );
+    assert_eq!(
+        lookahead_limit_at(&Network::Mainnet, mainnet_checkpoint, Height(3_500_000)),
+        full_limit
+    );
+
+    // Checkpoint verification continues past NU7.
+    let checkpoint = Height(NU7 * 2);
+    assert_eq!(
+        lookahead_limit_at(&regtest, checkpoint, Height(NU7 - 1)),
+        checkpoint_limit
+    );
+    assert_eq!(
+        lookahead_limit_at(&regtest, checkpoint, Height(NU7)),
+        checkpoint_limit * multiplier
+    );
+
+    // Full verification starts at genesis.
+    assert_eq!(
+        lookahead_limit_at(&regtest, Height(0), Height(NU7 - 1)),
+        full_limit
+    );
+    assert_eq!(
+        lookahead_limit_at(&regtest, Height(0), Height(NU7)),
+        full_limit * multiplier
+    );
+
+    // Inbound gossip reads the same configured value as a height window above the
+    // tip, so it scales by the same factor as the syncer.
+    for tip in [Height(NU7 - 1), Height(NU7)] {
+        let window = crate::components::inbound::downloads::max_lookahead_height(
+            &regtest,
+            Some(tip),
+            full_limit,
+        ) - tip;
+        assert_eq!(
+            usize::try_from(window).expect("the window is positive"),
+            lookahead_limit_at(&regtest, Height(0), tip),
+            "tip {tip:?}"
+        );
+    }
+}
+
+/// The downloader must not drop blocks inside the syncer's scaled request window.
+#[test]
+fn scaled_lookahead_stays_below_the_drop_height() {
+    let _init_guard = zakura_test::init();
+
+    // A large but valid configured concurrency limit.
+    const LOOKAHEAD_LIMIT: usize = 20_000;
+    let tip = Height(1_000_000);
+
+    let (drop_height, _, _) = lookahead_heights(Some(tip), LOOKAHEAD_LIMIT, 1);
+    assert_eq!(
+        drop_height,
+        (tip + VERIFICATION_PIPELINE_DROP_LIMIT).expect("the test height is valid"),
+        "the drop limit is unchanged at 75 second spacing",
+    );
+
+    for multiplier in [1, 3] {
+        let request_height = (tip
+            + block::HeightDiff::try_from(LOOKAHEAD_LIMIT * multiplier)
+                .expect("the test lookahead fits"))
+        .expect("the test height is valid");
+
+        let (drop_height, pause_height, reset_height) =
+            lookahead_heights(Some(tip), LOOKAHEAD_LIMIT, multiplier);
+        assert!(request_height <= drop_height, "multiplier {multiplier}");
+        assert!(reset_height <= pause_height, "multiplier {multiplier}");
+
+        let (genesis_drop, _, _) = lookahead_heights(None, LOOKAHEAD_LIMIT, multiplier);
+        assert!(
+            Height(u32::try_from(LOOKAHEAD_LIMIT * multiplier).expect("fits")) <= genesis_drop,
+            "multiplier {multiplier}"
+        );
     }
 }

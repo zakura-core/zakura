@@ -237,7 +237,9 @@ pub trait Sigops {
     /// Returns the number of transparent signature operations in the
     /// transparent inputs and outputs of the given transaction.
     fn sigops(&self) -> u32 {
-        self.scripts().map(|script| legacy_sigop_count(&script)).sum()
+        self.scripts()
+            .map(|script| legacy_sigop_count(&script))
+            .sum()
     }
 
     /// Returns an iterator over the input and output scripts in the transaction.

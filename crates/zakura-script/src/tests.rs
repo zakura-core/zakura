@@ -1857,17 +1857,41 @@ fn legacy_sigop_count_follows_zcashd_get_op() {
         ("legacy mode ignores OP_N", vec![0x52, 0xae], 20),
         ("direct push payload", push(&[0x4b], 75), 1),
         ("PUSHDATA1 payload", push(&[0x4c, 0xff], 255), 1),
-        ("PUSHDATA2 520-byte payload", push(&[0x4d, 0x08, 0x02], 520), 1),
-        ("PUSHDATA2 521-byte payload", push(&[0x4d, 0x09, 0x02], 521), 1),
-        ("PUSHDATA4 payload", push(&[0x4e, 0x00, 0x01, 0x00, 0x00], 256), 1),
+        (
+            "PUSHDATA2 520-byte payload",
+            push(&[0x4d, 0x08, 0x02], 520),
+            1,
+        ),
+        (
+            "PUSHDATA2 521-byte payload",
+            push(&[0x4d, 0x09, 0x02], 521),
+            1,
+        ),
+        (
+            "PUSHDATA4 payload",
+            push(&[0x4e, 0x00, 0x01, 0x00, 0x00], 256),
+            1,
+        ),
         ("truncated direct push", vec![0xac, 0x02, 0xac], 1),
         ("truncated PUSHDATA1 length", vec![0xac, 0x4c], 1),
         ("truncated PUSHDATA2 length", vec![0xac, 0x4d, 0x01], 1),
-        ("truncated PUSHDATA4 length", vec![0xac, 0x4e, 0x00, 0x00, 0x00], 1),
-        ("PUSHDATA4 maximum length", vec![0xac, 0x4e, 0xff, 0xff, 0xff, 0xff, 0xac], 1),
+        (
+            "truncated PUSHDATA4 length",
+            vec![0xac, 0x4e, 0x00, 0x00, 0x00],
+            1,
+        ),
+        (
+            "PUSHDATA4 maximum length",
+            vec![0xac, 0x4e, 0xff, 0xff, 0xff, 0xff, 0xac],
+            1,
+        ),
         ("disabled OP_CAT", vec![0x7e, 0xac], 1),
         ("OP_CODESEPARATOR", vec![0xab, 0xac], 1),
-        ("reserved and invalid opcodes", vec![0x50, 0xba, 0xff, 0xac], 1),
+        (
+            "reserved and invalid opcodes",
+            vec![0x50, 0xba, 0xff, 0xac],
+            1,
+        ),
     ];
     for (name, script, expected) in cases {
         assert_eq!(legacy_sigop_count(&script), expected, "{name}");

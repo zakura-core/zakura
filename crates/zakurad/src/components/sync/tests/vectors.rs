@@ -37,7 +37,7 @@ use zakura_state as zs;
 
 use crate::{
     components::{
-        auth_download_height::poison_coinbase_height,
+        auth_download_height::{poison_coinbase_height, poison_coinbase_height_and_expiry},
         sync::{
             self,
             downloads::{
@@ -56,28 +56,10 @@ use InventoryResponse::*;
 
 type TestChainSync = ChainSync<
     MockService<zn::Request, zn::Response, PanicAssertion>,
-    MockParentState,
+    MockService<zs::Request, zs::Response, PanicAssertion>,
     MockService<zakura_consensus::Request, block::Hash, PanicAssertion>,
     MockChainTip,
 >;
-
-/// Existing scheduling fixtures have no committed parent bodies.
-#[derive(Clone)]
-struct MockParentState(MockService<zs::Request, zs::Response, PanicAssertion>);
-impl Service<zs::Request> for MockParentState {
-    type Response = zs::Response;
-    type Error = crate::BoxError;
-    type Future = futures::future::BoxFuture<'static, Result<Self::Response, Self::Error>>;
-    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        self.0.poll_ready(cx)
-    }
-    fn call(&mut self, request: zs::Request) -> Self::Future {
-        if matches!(request, zs::Request::AnyChainHeight(_)) {
-            return async { Ok(zs::Response::AnyChainHeight(None)) }.boxed();
-        }
-        self.0.call(request).boxed()
-    }
-}
 
 #[derive(Clone, Debug)]
 struct NeverReadyNetwork;
@@ -2975,7 +2957,7 @@ async fn build_extend_discovers_hashes_without_dispatching() -> Result<(), crate
     let tip_network = Timeout::new(peer_set.clone(), sync::TIPS_RESPONSE_TIMEOUT);
     let extend_handle = tokio::spawn(TestChainSync::build_extend(
         tip_network,
-        MockParentState(state_service.clone()),
+        state_service.clone(),
         tips,
     ));
 
@@ -3137,7 +3119,7 @@ async fn build_extend_ignores_malformed_find_blocks_responses() -> Result<(), cr
     let tips = HashSet::from([sync::CheckedTip { tip, expected_next }]);
     let extend_handle = tokio::spawn(TestChainSync::build_extend(
         Timeout::new(peer_set.clone(), sync::TIPS_RESPONSE_TIMEOUT),
-        MockParentState(state_service.clone()),
+        state_service.clone(),
         tips,
     ));
 
@@ -3225,7 +3207,7 @@ async fn build_extend_rejects_oversized_response_before_state_queries(
     let tips = HashSet::from([sync::CheckedTip { tip, expected_next }]);
     let extend_handle = tokio::spawn(TestChainSync::build_extend(
         Timeout::new(peer_set.clone(), sync::TIPS_RESPONSE_TIMEOUT),
-        MockParentState(state_service.clone()),
+        state_service.clone(),
         tips,
     ));
 
@@ -3281,7 +3263,7 @@ async fn build_extend_rejects_locator_echo_before_state_queries() -> Result<(), 
     let tips = HashSet::from([sync::CheckedTip { tip, expected_next }]);
     let extend_handle = tokio::spawn(TestChainSync::build_extend(
         Timeout::new(peer_set.clone(), sync::TIPS_RESPONSE_TIMEOUT),
-        MockParentState(state_service.clone()),
+        state_service.clone(),
         tips,
     ));
 
@@ -3341,7 +3323,7 @@ async fn build_extend_ignores_known_trailing_find_blocks_hash() -> Result<(), cr
     let tips = HashSet::from([sync::CheckedTip { tip, expected_next }]);
     let extend_handle = tokio::spawn(TestChainSync::build_extend(
         Timeout::new(peer_set.clone(), sync::TIPS_RESPONSE_TIMEOUT),
-        MockParentState(state_service.clone()),
+        state_service.clone(),
         tips,
     ));
 
@@ -3800,7 +3782,7 @@ fn setup_chain_sync_with_options(
         max_checkpoint_height,
         peer_set.clone(),
         block_verifier_router.clone(),
-        MockParentState(state_service.clone()),
+        state_service.clone(),
         mock_chain_tip,
         misbehavior_tx,
     );
@@ -3885,7 +3867,6 @@ async fn empty_block_response_is_retryable_download_failure() {
     let mut downloads = Downloads::new(
         peer_set.clone(),
         verifier,
-        unknown_parent_state(),
         chain_tip,
         past_lookahead_limit_sender,
         sync::MIN_CONCURRENCY_LIMIT,
@@ -3934,7 +3915,6 @@ async fn block_download_network_readiness_times_out() {
     let mut downloads = Downloads::new(
         NeverReadyNetwork,
         verifier,
-        unknown_parent_state(),
         chain_tip,
         past_lookahead_limit_sender,
         sync::MIN_CONCURRENCY_LIMIT,
@@ -3962,7 +3942,6 @@ fn setup_downloads(
     MockService<zn::Request, zn::Response, PanicAssertion>,
     MockService<zakura_consensus::Request, block::Hash, PanicAssertion>,
     MockChainTip,
-    tower::util::BoxCloneService<zs::Request, zs::Response, crate::BoxError>,
 > {
     let (past_lookahead_limit_sender, _past_lookahead_limit_receiver) =
         tokio::sync::watch::channel(false);
@@ -3970,7 +3949,6 @@ fn setup_downloads(
     Downloads::new(
         peer_set,
         verifier,
-        unknown_parent_state(),
         chain_tip,
         past_lookahead_limit_sender,
         sync::MIN_CONCURRENCY_LIMIT,
@@ -4054,9 +4032,8 @@ async fn tip_child_rejects_poisoned_coinbase_height() {
     assert!(
         matches!(
             result,
-            Err(BlockDownloadVerifyError::ParentHeightMismatch {
-                height: Some(Height(1)),
-                expected_height: Height(1_687_107),
+            Err(BlockDownloadVerifyError::UnboundHeight {
+                height: Height(1),
                 hash,
                 advertiser_addr: Some(error_addr),
             }) if hash == canonical_hash && error_addr == addr
@@ -4115,16 +4092,85 @@ async fn tip_child_rejects_forged_high_coinbase_height() {
     assert!(
         matches!(
             result,
-            Err(BlockDownloadVerifyError::ParentHeightMismatch {
-                height: Some(Height(2_000_000)),
-                expected_height: Height(1_687_107),
+            Err(BlockDownloadVerifyError::UnboundHeight {
+                height: Height(2_000_000),
                 ..
             })
         ),
-        "a forged high height on a tip child must be caught by the tip check, got {result:?}"
+        "a forged high height on a tip child must be rejected, got {result:?}"
     );
 
     verifier.expect_no_requests().await;
+}
+
+/// A forged height is rejected without our tip or the block's parent.
+///
+/// During checkpoint sync, most downloads arrive before their parent commits. A forged far-ahead or
+/// behind-tip height on those blocks would otherwise be dropped unscored and not requeued.
+#[tokio::test]
+async fn unknown_parent_rejects_forged_heights() {
+    let _init_guard = zakura_test::init();
+
+    let canonical: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1687107_BYTES
+        .zcash_deserialize_into()
+        .expect("test vector deserializes");
+    let canonical_hash = canonical.hash();
+
+    for poisoned in [
+        poison_coinbase_height(&canonical, Height(1)),
+        poison_coinbase_height(&canonical, Height(2_000_000)),
+        poison_coinbase_height_and_expiry(&canonical, Height(1)),
+        poison_coinbase_height_and_expiry(&canonical, Height(2_000_000)),
+    ] {
+        let height = poisoned
+            .coinbase_height()
+            .expect("the poisoned body has a height");
+        let mut peer_set = MockService::build().for_unit_tests::<zn::Request, zn::Response, _>();
+        let mut verifier =
+            MockService::build().for_unit_tests::<zakura_consensus::Request, block::Hash, _>();
+        let (chain_tip, chain_tip_sender) = MockChainTip::new();
+
+        // Our tip is not the block's parent, and the parent is unknown.
+        chain_tip_sender.send_best_tip_height(Height(1_600_000));
+        chain_tip_sender.send_best_tip_hash(block::Hash([0x11; 32]));
+
+        let addr: PeerSocketAddr = "127.0.0.1:8233".parse().expect("valid peer address");
+        let mut downloads = setup_downloads(peer_set.clone(), verifier.clone(), chain_tip);
+
+        downloads
+            .download_and_verify(canonical_hash)
+            .await
+            .expect("queuing a fresh hash succeeds");
+
+        peer_set
+            .expect_request(zn::Request::BlocksByHash(
+                iter::once(canonical_hash).collect(),
+            ))
+            .await
+            .respond(zn::Response::Blocks(vec![Available((
+                poisoned,
+                Some(addr),
+            ))]));
+
+        let result = downloads
+            .next()
+            .await
+            .expect("the download task produces a result instead of panicking");
+
+        assert!(
+            matches!(
+                result,
+                Err(BlockDownloadVerifyError::UnboundHeight {
+                    height: result_height,
+                    hash,
+                    advertiser_addr: Some(error_addr),
+                }) if result_height == height && hash == canonical_hash && error_addr == addr
+            ),
+            "a forged height must be attributed to its supplier, got {result:?}"
+        );
+
+        verifier.expect_no_requests().await;
+    }
 }
 
 /// The canonical tip child is unaffected: its coinbase height matches the tip, so it reaches
@@ -4250,9 +4296,8 @@ async fn poisoned_body_requeues_and_scores_its_supplier() -> Result<(), crate::B
         let addr: PeerSocketAddr = "127.0.0.1:8233".parse().expect("valid peer address");
 
         let error = match error_kind {
-            0 => BlockDownloadVerifyError::ParentHeightMismatch {
-                height: Some(Height(1)),
-                expected_height: Height(1_687_107),
+            0 => BlockDownloadVerifyError::UnboundHeight {
+                height: Height(1),
                 hash: block_hash,
                 advertiser_addr: Some(addr),
             },
@@ -4337,9 +4382,8 @@ async fn poisoned_tip_child_preserves_round_after_retry_limit() {
         .poisoned_block_retry_counts
         .insert(block_hash, sync::POISONED_BLOCK_RETRY_LIMIT);
 
-    let error = BlockDownloadVerifyError::ParentHeightMismatch {
-        height: Some(Height(1)),
-        expected_height: Height(1_687_107),
+    let error = BlockDownloadVerifyError::UnboundHeight {
+        height: Height(1),
         hash: block_hash,
         advertiser_addr: Some("127.0.0.1:8233".parse().expect("valid peer address")),
     };
@@ -4420,14 +4464,6 @@ async fn tip_height_without_a_tip_hash_keeps_the_behind_tip_policy() {
     verifier.expect_no_requests().await;
 }
 
-fn unknown_parent_state() -> tower::util::BoxCloneService<zs::Request, zs::Response, crate::BoxError>
-{
-    tower::util::BoxCloneService::new(tower::service_fn(|request| async move {
-        assert!(matches!(request, zs::Request::AnyChainHeight(_)));
-        Ok(zs::Response::AnyChainHeight(None))
-    }))
-}
-
 #[tokio::test]
 async fn poisoned_body_budget_table_is_bounded() {
     let (mut chain_sync, _, _, mut peer_set, _, _) = setup_chain_sync();
@@ -4439,14 +4475,11 @@ async fn poisoned_body_budget_table_is_bounded() {
             .insert(block::Hash(bytes), sync::POISONED_BLOCK_RETRY_LIMIT);
     }
     let result = chain_sync
-        .handle_block_response_with_missing_retry(Err(
-            BlockDownloadVerifyError::ParentHeightMismatch {
-                height: Some(Height(1)),
-                expected_height: Height(2),
-                hash: block::Hash([255; 32]),
-                advertiser_addr: None,
-            },
-        ))
+        .handle_block_response_with_missing_retry(Err(BlockDownloadVerifyError::UnboundHeight {
+            height: Height(1),
+            hash: block::Hash([255; 32]),
+            advertiser_addr: None,
+        }))
         .await;
     assert!(result.is_ok());
     assert_eq!(

@@ -33,7 +33,7 @@ use zakura_network::{self as zn, PeerSocketAddr};
 use zakura_state as zs;
 
 use crate::components::{
-    auth_download_height::parent_height_mismatch,
+    auth_download_height::height_is_unbound,
     sync::{
         legacy_trace::{
             LegacyBlockOutcome, LegacyDiagnosticSnapshot, LegacySyncTrace, LegacyTaskState,
@@ -165,11 +165,17 @@ pub enum BlockDownloadVerifyError {
         hash: block::Hash,
     },
 
-    /// The supplied body claims a height inconsistent with its committed parent.
-    #[error("downloaded block claimed height {height:?} instead of {expected_height:?}: {hash:?}")]
-    ParentHeightMismatch {
-        height: Option<block::Height>,
-        expected_height: block::Height,
+    /// A downloaded body claims a coinbase height that its header does not commit to.
+    ///
+    /// V5+ coinbase `scriptSig`s are not covered by the mined transaction ID, the transaction
+    /// merkle root, or the block hash, so a peer can rewrite the claimed height of an otherwise
+    /// canonical body without changing the requested hash. The body is not the block its header
+    /// names, so only its supplier is at fault. See `crate::components::auth_download_height`.
+    #[error(
+        "downloaded block claimed a height its header does not commit to: {height:?} {hash:?}"
+    )]
+    UnboundHeight {
+        height: block::Height,
         hash: block::Hash,
         advertiser_addr: Option<PeerSocketAddr>,
     },
@@ -251,7 +257,7 @@ impl BlockDownloadVerifyError {
             Self::AboveLookaheadHeightLimit {
                 advertiser_addr, ..
             }
-            | Self::ParentHeightMismatch {
+            | Self::UnboundHeight {
                 advertiser_addr, ..
             }
             | Self::InvalidHeight {
@@ -304,7 +310,7 @@ impl From<tokio::time::error::Elapsed> for BlockDownloadVerifyError {
 /// Represents a [`Stream`] of download and verification tasks during chain sync.
 #[pin_project]
 #[derive(Debug)]
-pub struct Downloads<ZN, ZV, ZSTip, ZS>
+pub struct Downloads<ZN, ZV, ZSTip>
 where
     ZN: Service<zn::Request, Response = zn::Response, Error = BoxError> + Send + Sync + 'static,
     ZN::Future: Send,
@@ -315,8 +321,6 @@ where
         + 'static,
     ZV::Future: Send,
     ZSTip: ChainTip + Clone + Send + 'static,
-    ZS: Service<zs::Request, Response = zs::Response, Error = BoxError> + Clone + Send + 'static,
-    ZS::Future: Send,
 {
     // Services
     //
@@ -326,7 +330,6 @@ where
 
     /// A service that verifies downloaded blocks.
     verifier: ZV,
-    state: ZS,
 
     /// Allows efficient access to the best tip of the blockchain.
     latest_chain_tip: ZSTip,
@@ -380,7 +383,7 @@ fn take_task_state(
         .remove(&hash)
 }
 
-impl<ZN, ZV, ZSTip, ZS> Stream for Downloads<ZN, ZV, ZSTip, ZS>
+impl<ZN, ZV, ZSTip> Stream for Downloads<ZN, ZV, ZSTip>
 where
     ZN: Service<zn::Request, Response = zn::Response, Error = BoxError> + Send + Sync + 'static,
     ZN::Future: Send,
@@ -391,8 +394,6 @@ where
         + 'static,
     ZV::Future: Send,
     ZSTip: ChainTip + Clone + Send + 'static,
-    ZS: Service<zs::Request, Response = zs::Response, Error = BoxError> + Clone + Send + 'static,
-    ZS::Future: Send,
 {
     type Item = Result<(Height, block::Hash), BlockDownloadVerifyError>;
 
@@ -435,7 +436,7 @@ where
     }
 }
 
-impl<ZN, ZV, ZSTip, ZS> Downloads<ZN, ZV, ZSTip, ZS>
+impl<ZN, ZV, ZSTip> Downloads<ZN, ZV, ZSTip>
 where
     ZN: Service<zn::Request, Response = zn::Response, Error = BoxError> + Send + Sync + 'static,
     ZN::Future: Send,
@@ -446,8 +447,6 @@ where
         + 'static,
     ZV::Future: Send,
     ZSTip: ChainTip + Clone + Send + 'static,
-    ZS: Service<zs::Request, Response = zs::Response, Error = BoxError> + Clone + Send + 'static,
-    ZS::Future: Send,
 {
     /// Initialize a new download stream with the provided `network` and
     /// `verifier` services.
@@ -464,7 +463,6 @@ where
     pub fn new(
         network: ZN,
         verifier: ZV,
-        state: ZS,
         latest_chain_tip: ZSTip,
         past_lookahead_limit_sender: watch::Sender<bool>,
         lookahead_limit: usize,
@@ -478,7 +476,6 @@ where
         Self {
             network,
             verifier,
-            state,
             latest_chain_tip,
             lookahead_limit,
             chain_network,
@@ -606,7 +603,6 @@ where
         let (cancel_tx, mut cancel_rx) = oneshot::channel::<()>();
 
         let mut verifier = self.verifier.clone();
-        let state = self.state.clone();
         let latest_chain_tip = self.latest_chain_tip.clone();
 
         let lookahead_limit = self.lookahead_limit;
@@ -696,12 +692,6 @@ where
                 // that will timeout before being verified.
                 let tip_height = latest_chain_tip.best_tip_height();
 
-                // Read separately from `tip_height`, and used only by the new tip-child height
-                // check below. Deriving `tip_height` from this pair instead would couple the
-                // existing lookahead and behind-tip policies to hash availability: a chain tip
-                // reporting a height but not yet a hash would fall into the no-tip regime.
-                let best_tip = latest_chain_tip.best_tip_height_and_hash();
-
                 // The target spacing at the tip scales the lookahead limit.
                 let multiplier =
                     tip_height.map_or(1, |tip_height| lookahead_limit_multiplier(&chain_network, tip_height));
@@ -723,30 +713,37 @@ where
                     })
                     .unwrap_or(block::Height(0));
 
-                let claimed_height = block.coinbase_height();
-                if let Some(expected_height) = parent_height_mismatch(
-                    state,
-                    block.header.previous_block_hash,
-                    claimed_height,
-                    best_tip,
-                ).await {
-                    if let Some(feedback) = &supplier_feedback { feedback.reject(); }
-                    return Err(BlockDownloadVerifyError::ParentHeightMismatch {
-                        height: claimed_height,
-                        expected_height,
-                        hash,
-                        advertiser_addr,
-                    });
-                }
                 // A body with no coinbase height cannot be the block this header commits to.
                 // The block identifier comes from the header, so the response still satisfies
                 // the requested hash: only the supplier is implicated, and without excluding it
                 // the same peer stays eligible for this hash on every retry. The advertiser
                 // stays unattributed, because it did not choose the body.
-                let Some(block_height) = claimed_height else {
+                let Some(block_height) = block.coinbase_height() else {
                     if let Some(feedback) = &supplier_feedback { feedback.reject(); }
                     return Err(BlockDownloadVerifyError::InvalidHeight { hash, advertiser_addr: None });
                 };
+
+                // Security: authenticate the claimed coinbase height before any height policy
+                // below uses it. Otherwise a rewritten height would make those policies drop
+                // the requested hash as a benign old or far-ahead block: unattributed,
+                // unscored, and not requeued. See `crate::components::auth_download_height`.
+                let policy_uses_height =
+                    block_height > lookahead_pause_height || block_height < min_accepted_height;
+                if height_is_unbound(&block, block_height, policy_uses_height) {
+                    debug!(
+                        ?hash,
+                        ?block_height,
+                        "body claimed a height its header does not commit to: rejected poisoned block"
+                    );
+                    metrics::counter!("sync.unbound.height.count").increment(1);
+
+                    if let Some(feedback) = &supplier_feedback { feedback.reject(); }
+                    return Err(BlockDownloadVerifyError::UnboundHeight {
+                        height: block_height,
+                        hash,
+                        advertiser_addr,
+                    });
+                }
 
                 trace.block_downloaded(
                     hash,

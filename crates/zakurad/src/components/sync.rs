@@ -116,8 +116,8 @@ const MAX_TRANSIENT_BLOCK_PEER_REQUESTS_PER_SYNC_ROUND: usize =
     (TRANSIENT_BLOCK_DOWNLOAD_RETRY_LIMIT + 1) * MAX_BLOCK_PEER_REQUESTS_PER_QUEUE_ATTEMPT;
 
 /// Controls how many times the syncer immediately requeues a required block after a peer supplies
-/// a body whose coinbase height contradicts our own tip
-/// ([`BlockDownloadVerifyError::ParentHeightMismatch`]).
+/// a body whose coinbase height its header does not commit to
+/// ([`BlockDownloadVerifyError::UnboundHeight`]).
 ///
 /// A poisoned body satisfies the network request without delivering a usable block, so the hash
 /// must be requeued rather than left for the next discovery round — otherwise a peer can keep the
@@ -904,9 +904,8 @@ where
 
     /// A service which downloads and verifies blocks, using the provided
     /// network and verifier services.
-    downloads: Pin<
-        Box<Downloads<Hedge<ConcurrencyLimit<Timeout<ZN>>, AlwaysHedge>, Timeout<ZV>, ZSTip, ZS>>,
-    >,
+    downloads:
+        Pin<Box<Downloads<Hedge<ConcurrencyLimit<Timeout<ZN>>, AlwaysHedge>, Timeout<ZV>, ZSTip>>>,
 
     /// The cached block chain state.
     state: ZS,
@@ -1074,7 +1073,6 @@ where
         let downloads = Box::pin(Downloads::new(
             block_network,
             verifier,
-            state.clone(),
             latest_chain_tip.clone(),
             past_lookahead_limit_sender,
             max(
@@ -2498,11 +2496,11 @@ where
             }
 
             // Unlike `AboveLookaheadHeightLimit` below, this one *is* scored. The
-            // claimed height is checked against our own committed tip, so the body
+            // header commits to a different height than the body claims, so the body
             // is provably malformed, and the peer being scored is the one that
             // served that body — not a peer that merely supplied a hash. There is
             // no misattribution to avoid here.
-            Err(BlockDownloadVerifyError::ParentHeightMismatch {
+            Err(BlockDownloadVerifyError::UnboundHeight {
                 advertiser_addr: Some(advertiser_addr),
                 ..
             }) => {
@@ -2535,7 +2533,7 @@ where
     /// Handles a downloaded block response and requeues a required hash when retrying one block can
     /// preserve the rest of the round.
     ///
-    /// A [`BlockDownloadVerifyError::ParentHeightMismatch`] means a peer returned a body under
+    /// A [`BlockDownloadVerifyError::UnboundHeight`] means a peer returned a body under
     /// the correct block hash but with a rewritten coinbase height. That satisfies the network
     /// request without delivering a usable block, so the supplier is scored for a ban and the hash
     /// is requeued immediately, bounded by [`POISONED_BLOCK_RETRY_LIMIT`]. Without the requeue the
@@ -2671,7 +2669,7 @@ where
 
         if let Some((hash, advertiser_addr)) = response.as_ref().err().and_then(|error| match error
         {
-            BlockDownloadVerifyError::ParentHeightMismatch {
+            BlockDownloadVerifyError::UnboundHeight {
                 hash,
                 advertiser_addr,
                 ..
@@ -3079,13 +3077,14 @@ where
                 );
                 false
             }
-            BlockDownloadVerifyError::ParentHeightMismatch { .. } => {
+            BlockDownloadVerifyError::UnboundHeight { .. } => {
                 // `handle_block_response_with_missing_retry` handles every mismatch itself and
                 // returns success even once the requeue budget is exhausted, so that an
                 // exhausted budget keeps the round's other downloads. This arm is therefore
                 // only reached by a caller that bypasses the retry handler. The round's stall
-                // deadline is what recovers an exhausted hash: a swallowed completion is not
-                // verified progress, so the round restarts and obtains fresh tips and peers.
+                // deadline recovers an exhausted hash: once the other downloads drain, no block
+                // completes within `BLOCK_VERIFY_TIMEOUT`, so the round restarts and obtains
+                // fresh tips and peers.
                 warn!(
                     error = ?e,
                     %peer,

@@ -3955,7 +3955,7 @@ mod tests {
         victim.connect_native(&node_b, TEST_NET_TIMEOUT).await?;
         let source = PeerSource::Zakura(node_peer_id(&node_a).await?);
         let adapter = LegacyRequestAdapter::new(victim.supervisor());
-        let request = Request::BlocksByHash(HashSet::from([block.hash()]));
+        let request = Request::BlocksByHash(IndexSet::from([block.hash()]));
         let first = adapter
             .request_from_source(request.clone(), Some(source.clone()))
             .await?;

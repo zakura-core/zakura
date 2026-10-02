@@ -2196,7 +2196,6 @@ impl Service<Request> for StateService {
             | Request::CheckParentInputs { .. }
             | Request::Block(_)
             | Request::BlockInfo(_)
-            | Request::AnyChainHeight(_)
             | Request::AnyChainBlock(_)
             | Request::BlockHeader(_)
             | Request::FindBlockHashes { .. }
@@ -2927,14 +2926,6 @@ impl Service<ReadRequest> for ReadStateService {
                 hash_or_height,
             ))),
 
-            ReadRequest::AnyChainHeight(hash) => {
-                let chains = state.latest_non_finalized_state();
-                let height = chains
-                    .chain_iter()
-                    .find_map(|chain| chain.height_by_hash(hash))
-                    .or_else(|| state.db.height(hash));
-                Ok(ReadResponse::AnyChainHeight(height))
-            }
             ReadRequest::AnyChainBlock(hash_or_height) => Ok(ReadResponse::Block(read::any_block(
                 state.latest_non_finalized_state().chain_iter(),
                 &state.db,

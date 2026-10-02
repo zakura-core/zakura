@@ -109,9 +109,6 @@ pub enum Response {
     /// specified block's chain value pools.
     BlockInfo(Option<BlockInfo>),
 
-    /// The committed height for an `AnyChainHeight` request.
-    AnyChainHeight(Option<block::Height>),
-
     /// The response to a `BlockHeader` request.
     BlockHeader {
         /// The header of the requested block
@@ -494,9 +491,6 @@ pub enum ReadResponse {
     /// Response to [`ReadRequest::Block`] with the specified block.
     Block(Option<Arc<Block>>),
 
-    /// The committed height for an `AnyChainHeight` request.
-    AnyChainHeight(Option<block::Height>),
-
     /// Response to [`ReadRequest::BlockAndSize`] with the specified block and
     /// serialized size.
     BlockAndSize(Option<(Arc<Block>, usize)>),
@@ -737,7 +731,6 @@ impl TryFrom<ReadResponse> for Response {
             ReadResponse::BlockHash(hash) => Ok(Response::BlockHash(hash)),
 
             ReadResponse::Block(block) => Ok(Response::Block(block)),
-            ReadResponse::AnyChainHeight(height) => Ok(Response::AnyChainHeight(height)),
             ReadResponse::BlockAndSize(_) => {
                 Err("there is no corresponding Response for this ReadResponse")
             }

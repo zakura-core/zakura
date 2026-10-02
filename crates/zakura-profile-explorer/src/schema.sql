@@ -52,6 +52,8 @@ CREATE TABLE IF NOT EXISTS cpu (
  deleting INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS cpu_window ON cpu(run,start_us,end_us);
+-- Homepage sample totals must not read the large symbol metadata in each CPU row.
+CREATE INDEX IF NOT EXISTS cpu_summary ON cpu(run,start_us,end_us,samples);
 -- Retention accounting must not scan the large symbol metadata in every CPU row.
 CREATE INDEX IF NOT EXISTS cpu_bytes ON cpu(bytes);
 CREATE TABLE IF NOT EXISTS status (

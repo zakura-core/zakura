@@ -1642,3 +1642,52 @@ fn existing_cpu_catalogue_gets_covering_storage_accounting_index() -> Result<()>
     );
     Ok(())
 }
+
+#[test]
+fn retained_cpu_summary_uses_covering_index() -> Result<()> {
+    let db = Connection::open_in_memory()?;
+    let schema = include_str!("../schema.sql");
+    db.execute_batch(schema)?;
+    db.execute_batch("DROP INDEX cpu_summary")?;
+    db.execute(
+        "INSERT INTO runs(id,metadata,utc_ms,seen_ms) VALUES(?, '{}', 0, 0)",
+        [RUN],
+    )?;
+    // Include a capture crossing the cutoff and one entirely before it.
+    for (id, start, end, samples) in [
+        ("old", 0, 900_000, 99),
+        ("crossing", 900_000, 1_100_000, 3),
+        ("new", 1_100_000, 1_200_000, 5),
+    ] {
+        db.execute(
+            "INSERT INTO cpu(id,run,start_us,end_us,samples,bytes,metadata) VALUES(?,?,?,?,?,4096,?)",
+            params![id, RUN, start, end, samples, "x".repeat(30_000)],
+        )?;
+    }
+    // Opening a retained store adds the index without removing captures.
+    db.execute_batch(schema)?;
+    let args = params![RUN, 1000, RUN, 1000, RUN];
+    let plan = db
+        .prepare(&format!("EXPLAIN QUERY PLAN {CPU_SUMMARY}"))?
+        .query_map(args, |row| row.get::<_, String>(3))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    assert!(
+        plan.iter()
+            .any(|step| step.contains("COVERING INDEX cpu_summary")),
+        "{plan:?}"
+    );
+    let summary = db.query_row(CPU_SUMMARY, args, |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, i64>(2)?,
+            row.get::<_, i64>(3)?,
+        ))
+    })?;
+    assert_eq!(summary, (2, 8, 900_000, 1_200_000));
+    assert_eq!(
+        db.query_row("SELECT count(*) FROM cpu", [], |row| row.get::<_, i64>(0))?,
+        3
+    );
+    Ok(())
+}

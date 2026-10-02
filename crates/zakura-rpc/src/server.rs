@@ -7,18 +7,26 @@
 //! See the full list of
 //! [Differences between JSON-RPC 1.0 and 2.0.](https://www.simple-is-better.org/rpc/#differences-between-1-0-and-2-0)
 
-use std::{collections::BTreeSet, fmt, fs::File, io::Read, panic, path::Path, sync::Arc};
+use std::{
+    collections::BTreeSet, fmt, fs::File, future::Future, io::Read, net::SocketAddr, panic,
+    path::Path, sync::Arc, time::Duration,
+};
 
 use chrono::{TimeZone, Utc};
 use cookie::Cookie;
 use der::{asn1::GeneralizedTime, Decode, Header, Reader, SliceReader, Tag};
 use jsonrpsee::server::{
     middleware::rpc::RpcServiceBuilder, serve_with_graceful_shutdown, stop_channel, Server,
-    ServerHandle,
+    ServerHandle, StopHandle,
 };
 use rustls::pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
-use tokio::{net::TcpListener, task::JoinHandle};
-use tokio_rustls::{rustls::ServerConfig as RustlsServerConfig, TlsAcceptor};
+use tokio::{
+    net::{TcpListener, TcpStream},
+    sync::Semaphore,
+    task::{JoinHandle, JoinSet},
+    time::{timeout, timeout_at, Instant},
+};
+use tokio_rustls::{rustls::ServerConfig as RustlsServerConfig, server::TlsStream, TlsAcceptor};
 use tracing::*;
 
 use zakura_chain::{
@@ -90,6 +98,15 @@ pub const OPENED_RPC_ENDPOINT_MSG: &str = "Opened RPC endpoint at ";
 pub const OPENED_ADMIN_RPC_ENDPOINT_MSG: &str = "Opened admin RPC endpoint at ";
 
 type ServerTask = JoinHandle<Result<(), tower::BoxError>>;
+
+/// Maximum number of TCP connections waiting for a TLS handshake per listener.
+const MAX_PENDING_TLS_HANDSHAKES: usize = 64;
+
+/// Time allowed for a TLS handshake, measured from TCP acceptance.
+const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Time allowed for established TLS connections to finish during shutdown.
+const TLS_CONNECTION_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 
 impl RpcServer {
     /// Starts the primary RPC server.
@@ -245,46 +262,35 @@ impl RpcServer {
             info!("{opened_endpoint_msg}{local_addr}");
 
             return Ok(tokio::spawn(async move {
-                loop {
-                    let (socket, remote_addr) = tokio::select! {
-                        result = listener.accept() => match result {
-                            Ok(connection) => connection,
-                            Err(error) => return Err(error.into()),
-                        },
-                        _ = stop_handle.clone().shutdown() => break,
-                    };
-
-                    let acceptor = acceptor.clone();
-                    let service = service_builder
-                        .clone()
-                        .build(methods.clone(), stop_handle.clone());
-                    let stopped = stop_handle.clone().shutdown();
-
-                    tokio::spawn(async move {
-                        match acceptor.accept(socket).await {
-                            Ok(stream) => {
-                                if let Err(error) =
-                                    serve_with_graceful_shutdown(stream, service, stopped).await
-                                {
-                                    warn!(
-                                        ?error,
-                                        %remote_addr,
-                                        "TLS RPC connection terminated with an error"
-                                    );
-                                }
-                            }
-                            Err(error) => {
+                run_tls_listener(
+                    listener,
+                    acceptor,
+                    stop_handle,
+                    server_handle,
+                    MAX_PENDING_TLS_HANDSHAKES,
+                    TLS_HANDSHAKE_TIMEOUT,
+                    move |stream, remote_addr, stop_handle| {
+                        let service = service_builder
+                            .clone()
+                            .build(methods.clone(), stop_handle.clone());
+                        async move {
+                            if let Err(error) = serve_with_graceful_shutdown(
+                                stream,
+                                service,
+                                stop_handle.shutdown(),
+                            )
+                            .await
+                            {
                                 warn!(
                                     ?error,
                                     %remote_addr,
-                                    "TLS RPC handshake failed"
+                                    "TLS RPC connection terminated with an error"
                                 );
                             }
                         }
-                    });
-                }
-
-                drop(server_handle);
+                    },
+                )
+                .await?;
                 Ok(())
             }));
         }
@@ -364,6 +370,95 @@ impl RpcServer {
             Err(panic_object) => panic::resume_unwind(panic_object),
         })
     }
+}
+
+/// Accepts TLS connections with bounded handshake work and owned tasks.
+///
+/// Keeping the [`JoinSet`] inside this future also cancels connections if the
+/// listener task is aborted. Established connections get a bounded grace period
+/// on normal shutdown or an accept error.
+async fn run_tls_listener<F, Fut>(
+    listener: TcpListener,
+    acceptor: TlsAcceptor,
+    stop_handle: StopHandle,
+    server_handle: ServerHandle,
+    max_pending_handshakes: usize,
+    handshake_timeout: Duration,
+    serve_connection: F,
+) -> Result<(), std::io::Error>
+where
+    F: Fn(TlsStream<TcpStream>, SocketAddr, StopHandle) -> Fut + Clone + Send + 'static,
+    Fut: Future<Output = ()> + Send + 'static,
+{
+    let permits = Arc::new(Semaphore::new(max_pending_handshakes));
+    let mut connections = JoinSet::new();
+    let stopped = stop_handle.clone().shutdown();
+    tokio::pin!(stopped);
+
+    let result = loop {
+        let (socket, remote_addr) = tokio::select! {
+            biased;
+            _ = &mut stopped => break Ok(()),
+            completed = connections.join_next(), if !connections.is_empty() => {
+                if let Some(Err(error)) = completed {
+                    warn!(?error, "TLS RPC connection task failed");
+                }
+                continue;
+            }
+            accepted = listener.accept() => match accepted {
+                Ok(connection) => connection,
+                Err(error) => break Err(error),
+            },
+        };
+        let deadline = Instant::now() + handshake_timeout;
+
+        // Reject excess sockets before spawning, rather than accumulating tasks
+        // waiting for capacity. The permit is held only during the handshake.
+        let Ok(permit) = permits.clone().try_acquire_owned() else {
+            drop(socket);
+            continue;
+        };
+        let acceptor = acceptor.clone();
+        let stop_handle = stop_handle.clone();
+        let serve_connection = serve_connection.clone();
+
+        connections.spawn(async move {
+            let handshake = tokio::select! {
+                biased;
+                _ = stop_handle.clone().shutdown() => return,
+                handshake = timeout_at(deadline, acceptor.accept(socket)) => handshake,
+            };
+            drop(permit);
+
+            match handshake {
+                Ok(Ok(stream)) => serve_connection(stream, remote_addr, stop_handle).await,
+                Ok(Err(error)) => {
+                    warn!(?error, %remote_addr, "TLS RPC handshake failed");
+                }
+                Err(_) => {
+                    warn!(%remote_addr, "TLS RPC handshake timed out");
+                }
+            }
+        });
+    };
+
+    drop(listener);
+    let _ = server_handle.stop();
+    let drain = async {
+        while let Some(completed) = connections.join_next().await {
+            if let Err(error) = completed {
+                warn!(?error, "TLS RPC connection task failed during shutdown");
+            }
+        }
+    };
+    if timeout(TLS_CONNECTION_SHUTDOWN_TIMEOUT, drain)
+        .await
+        .is_err()
+    {
+        connections.shutdown().await;
+    }
+
+    result
 }
 
 /// Validates the RPC method classification and removes methods that are not

@@ -349,10 +349,7 @@ mod tests {
         let small_order = NodeId::from_bytes(&identity).unwrap();
         let mut sig = [0u8; 64];
         sig[0] = 1;
-        assert_eq!(
-            small_order.verify_strict(b"msg", &sig),
-            Err(SignatureError)
-        );
+        assert_eq!(small_order.verify_strict(b"msg", &sig), Err(SignatureError));
 
         // A valid signature with S + L (non-canonical scalar).
         let secret: NodeSecretKey = RFC8032_SEED.parse().unwrap();

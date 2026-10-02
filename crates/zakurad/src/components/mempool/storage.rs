@@ -41,8 +41,13 @@ pub mod tests;
 
 mod eviction_cost;
 mod eviction_list;
+#[cfg(any(test, feature = "mempool-bench"))]
+mod fixtures;
 mod policy;
 mod verified_set;
+
+#[cfg(feature = "mempool-bench")]
+pub(super) use verified_set::benchmarks::mempool_eviction_benchmarks;
 
 /// The size limit for mempool transaction rejection lists per [ZIP-401].
 ///

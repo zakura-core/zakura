@@ -7314,6 +7314,7 @@ dependencies = [
  "color-eyre",
  "config",
  "console-subscriber",
+ "criterion",
  "derive-new",
  "dirs",
  "flate2",

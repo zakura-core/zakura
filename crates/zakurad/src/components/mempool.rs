@@ -61,6 +61,12 @@ mod pending_outputs;
 mod queue_checker;
 mod storage;
 
+/// Runs the Criterion benchmarks for verified mempool storage.
+#[cfg(feature = "mempool-bench")]
+pub fn mempool_eviction_benchmarks(c: &mut criterion::Criterion) {
+    storage::mempool_eviction_benchmarks(c);
+}
+
 #[cfg(test)]
 mod tests;
 

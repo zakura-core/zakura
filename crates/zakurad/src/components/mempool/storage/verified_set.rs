@@ -3,7 +3,7 @@
 use std::{
     borrow::Cow,
     cmp::Reverse,
-    collections::{BinaryHeap, HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     hash::Hash,
 };
 
@@ -29,6 +29,16 @@ pub(super) const MAX_MEMPOOL_PACKAGE_TRANSACTIONS: usize = 3;
 /// The most ancestors of a transaction in a bounded dependency group.
 pub(super) const MAX_MEMPOOL_ANCESTORS: usize = MAX_MEMPOOL_PACKAGE_TRANSACTIONS - 1;
 
+/// An eviction score, followed by the newest-first insertion time and hash.
+type EvictionCandidate = (
+    EvictionCost,
+    Reverse<Option<chrono::DateTime<chrono::Utc>>>,
+    transaction::Hash,
+);
+
+#[cfg(feature = "mempool-bench")]
+pub(super) mod benchmarks;
+
 // Imports for doc links
 #[allow(unused_imports)]
 use zakura_chain::transaction::MEMPOOL_TRANSACTION_COST_THRESHOLD;
@@ -49,6 +59,12 @@ use zakura_chain::transaction::MEMPOOL_TRANSACTION_COST_THRESHOLD;
 pub struct VerifiedSet {
     /// The set of verified transactions in the mempool.
     transactions: HashMap<transaction::Hash, VerifiedUnminedTx>,
+
+    /// One current eviction candidate per transaction, ordered cheapest first.
+    eviction_order: BTreeSet<EvictionCandidate>,
+
+    #[cfg(test)]
+    eviction_score_evaluations: std::sync::atomic::AtomicUsize,
 
     /// A map of dependencies between transactions in the mempool that
     /// spend or create outputs of other transactions in the mempool.
@@ -145,6 +161,7 @@ impl VerifiedSet {
     /// Also clears all internal caches.
     pub fn clear(&mut self) {
         self.transactions.clear();
+        self.eviction_order.clear();
         self.transaction_dependencies.clear();
         self.spent_outpoints.clear();
         self.sprout_nullifiers.clear();
@@ -214,7 +231,9 @@ impl VerifiedSet {
         pending_outputs: &mut PendingOutputs,
         height: Option<Height>,
     ) -> Result<(), SameEffectsTipRejectionError> {
-        self.check_insert(&transaction.transaction, &spent_mempool_outpoints)?;
+        let ancestors = self.check_insert(&transaction.transaction, &spent_mempool_outpoints)?;
+        let affected = self.dependency_group(ancestors);
+        self.remove_eviction_candidates(&affected);
 
         let tx_id = transaction.transaction.id().mined_id();
         self.transaction_dependencies
@@ -239,6 +258,7 @@ impl VerifiedSet {
         transaction.height = height;
         self.metrics.add_transaction(&transaction);
         self.transactions.insert(tx_id, transaction);
+        self.insert_eviction_candidates(&self.dependency_group([tx_id]));
 
         self.report_metrics();
 
@@ -261,10 +281,11 @@ impl VerifiedSet {
     ///
     /// # Performance
     ///
-    /// Selection builds a heap once. Each score walks at most
-    /// [`MAX_MEMPOOL_PACKAGE_TRANSACTIONS`] transactions and three dependency edges.
-    /// Removing a package only requires rescoring survivors in its dependency
-    /// group. The mempool only calls this method when it is full.
+    /// Selection reads the ordered index without scanning the whole mempool.
+    /// Each selected victim updates at most three local candidates. For `k`
+    /// victims and `n` stored transactions, selection is O(log n + k log k), and
+    /// committing the evictions is O(k log n). The index has one entry per
+    /// transaction.
     pub(super) fn select_eviction_victims(
         &self,
         incoming: &VerifiedUnminedTx,
@@ -277,37 +298,34 @@ impl VerifiedSet {
             .saturating_sub(tx_cost_limit);
         let incoming = Self::eviction_cost(incoming);
 
-        // Victims and their descendants, plus the incoming transaction's ancestors.
+        // Victim planning leaves the persistent index and transactions unchanged.
         let mut unavailable = incoming_ancestors.clone();
-
-        let candidate = |tx_id: transaction::Hash, unavailable: &HashSet<_>| {
-            Reverse((
-                self.package_score(&tx_id, unavailable),
-                Reverse(self.transactions[&tx_id].time),
-                tx_id,
-            ))
-        };
-        let mut candidates: BinaryHeap<_> = self
-            .transactions
-            .keys()
-            .filter(|tx_id| !unavailable.contains(*tx_id))
-            .map(|&tx_id| candidate(tx_id, &unavailable))
-            .collect();
-
+        let mut changed: HashSet<transaction::Hash> = HashSet::new();
+        let mut updated = BTreeSet::new();
+        let mut candidates = self.eviction_order.iter().peekable();
         let mut victims = EvictionVictims::default();
         let mut roots = Vec::new();
         let mut freed = 0;
 
         while freed < needed {
-            let Some(Reverse((score, _, root))) = candidates.pop() else {
-                // Evicting every other package does not free enough space.
+            // Changed groups use the local index. At most three original entries
+            // are skipped per victim, plus the incoming transaction's ancestors.
+            while candidates
+                .peek()
+                .is_some_and(|(_, _, id)| unavailable.contains(id) || changed.contains(id))
+            {
+                candidates.next();
+            }
+
+            let candidate = match (candidates.peek(), updated.first()) {
+                (Some(original), Some(local)) if *original <= local => candidates.next().copied(),
+                (Some(_), Some(_)) | (None, Some(_)) => updated.pop_first(),
+                (Some(_), None) => candidates.next().copied(),
+                (None, None) => None,
+            };
+            let Some((score, _, root)) = candidate else {
                 return victims;
             };
-
-            // Skip evicted transactions, and scores that an earlier victim changed.
-            if unavailable.contains(&root) || score != self.package_score(&root, &unavailable) {
-                continue;
-            }
 
             victims.cheapest.get_or_insert(score);
             if !incoming.exceeds_by_increment(score) {
@@ -320,21 +338,66 @@ impl VerifiedSet {
                 break;
             }
 
+            let group = self.dependency_group([root]);
+            // Remove earlier local scores before changing the simulated graph.
+            for &id in &group {
+                if changed.contains(&id) && !unavailable.contains(&id) {
+                    updated.remove(&self.eviction_candidate(id, &unavailable));
+                }
+            }
             let mut removed = self.descendants(root, &unavailable);
             removed.insert(root);
-
-            let group = self.dependency_group([root]);
             unavailable.extend(removed);
-            candidates.extend(
+            changed.extend(&group);
+            updated.extend(
                 group
                     .into_iter()
-                    .filter(|tx_id| !unavailable.contains(tx_id))
-                    .map(|tx_id| candidate(tx_id, &unavailable)),
+                    .filter(|id| !unavailable.contains(id))
+                    .map(|id| self.eviction_candidate(id, &unavailable)),
             );
         }
 
         victims.roots = Some(roots);
         victims
+    }
+
+    /// Returns the candidate for a transaction in the simulated remaining pool.
+    fn eviction_candidate(
+        &self,
+        id: transaction::Hash,
+        removed: &HashSet<transaction::Hash>,
+    ) -> EvictionCandidate {
+        (
+            self.package_score(&id, removed),
+            Reverse(self.transactions[&id].time),
+            id,
+        )
+    }
+
+    /// Removes a group's candidates before mutating transactions or dependencies.
+    fn remove_eviction_candidates(&mut self, group: &HashSet<transaction::Hash>) {
+        let removed = HashSet::new();
+        for &id in group {
+            let candidate = self.eviction_candidate(id, &removed);
+            assert!(
+                self.eviction_order.remove(&candidate),
+                "every stored transaction has its current eviction candidate"
+            );
+        }
+    }
+
+    /// Restores candidates for the group's survivors after a mutation.
+    fn insert_eviction_candidates(&mut self, group: &HashSet<transaction::Hash>) {
+        let removed = HashSet::new();
+        for &id in group {
+            if self.transactions.contains_key(&id) {
+                let candidate = self.eviction_candidate(id, &removed);
+                assert!(
+                    self.eviction_order.insert(candidate),
+                    "a group's old candidates were removed before its mutation"
+                );
+            }
+        }
     }
 
     /// Returns the eviction score of `tx_id`, excluding removed descendants.
@@ -350,6 +413,10 @@ impl VerifiedSet {
         tx_id: &transaction::Hash,
         removed: &HashSet<transaction::Hash>,
     ) -> EvictionCost {
+        #[cfg(test)]
+        self.eviction_score_evaluations
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
         Self::eviction_cost(&self.transactions[tx_id]).max(self.package(tx_id, removed))
     }
 
@@ -455,8 +522,15 @@ impl VerifiedSet {
     /// Clears a list of mined transaction ids from the lists of dependencies for
     /// any other transactions in the mempool and removes their dependents.
     pub fn clear_mined_dependencies(&mut self, mined_ids: &HashSet<transaction::Hash>) {
+        let affected: HashSet<_> = mined_ids
+            .iter()
+            .filter(|id| self.transactions.contains_key(id))
+            .flat_map(|&id| self.dependency_group([id]))
+            .collect();
+        self.remove_eviction_candidates(&affected);
         self.transaction_dependencies
             .clear_mined_dependencies(mined_ids);
+        self.insert_eviction_candidates(&affected);
     }
 
     /// Removes all transactions in the set that match the `predicate`.
@@ -500,6 +574,8 @@ impl VerifiedSet {
     ///
     /// Also removes the outputs of any removed transactions from the internal caches.
     pub(super) fn remove(&mut self, key_to_remove: &transaction::Hash) -> Vec<VerifiedUnminedTx> {
+        let affected = self.dependency_group([*key_to_remove]);
+        self.remove_eviction_candidates(&affected);
         let removed_transactions: Vec<_> = self
             .transaction_dependencies
             .remove_all(key_to_remove)
@@ -520,6 +596,7 @@ impl VerifiedSet {
             })
             .collect();
 
+        self.insert_eviction_candidates(&affected);
         self.report_metrics();
         removed_transactions
     }
@@ -527,6 +604,13 @@ impl VerifiedSet {
     /// Panics if any dependency group exceeds the admission limit.
     #[cfg(test)]
     pub(super) fn assert_dependency_groups_are_bounded(&self) {
+        let removed = HashSet::new();
+        let expected: BTreeSet<_> = self
+            .transactions
+            .keys()
+            .map(|&id| self.eviction_candidate(id, &removed))
+            .collect();
+        assert_eq!(self.eviction_order, expected);
         for &start in self.transactions.keys() {
             let mut group = HashSet::new();
             let mut pending = vec![start];
@@ -785,6 +869,59 @@ impl MempoolMetrics {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn selection_rescores_only_changed_groups() {
+        use std::sync::atomic::Ordering;
+
+        use super::super::fixtures::TxFactory;
+
+        let mut factory = TxFactory::new();
+        let mut verified = VerifiedSet::default();
+        let mut pending = PendingOutputs::default();
+        for _ in 0..1_000 {
+            let parent = factory.tx_with(10_000, 1, 0);
+            let child = factory.tx_with(20_000, 1, 0);
+            let grandchild = factory.tx(30_000);
+            let output = |tx: &VerifiedUnminedTx| {
+                transparent::OutPoint::from_usize(tx.transaction.id().mined_id(), 0)
+            };
+            verified
+                .insert(parent.clone(), vec![], &mut pending, None)
+                .unwrap();
+            verified
+                .insert(child.clone(), vec![output(&parent)], &mut pending, None)
+                .unwrap();
+            verified
+                .insert(grandchild, vec![output(&child)], &mut pending, None)
+                .unwrap();
+        }
+        let limit = verified.total_cost();
+        let before = verified.eviction_order.clone();
+        verified
+            .eviction_score_evaluations
+            .store(0, Ordering::Relaxed);
+        let rejected =
+            verified.select_eviction_victims(&factory.tx(10_000), &HashSet::new(), limit);
+        assert!(rejected.roots.is_none());
+        assert_eq!(
+            verified.eviction_score_evaluations.load(Ordering::Relaxed),
+            0
+        );
+
+        let incoming = factory.tx_with(1_000_000, 0, 240_000);
+        let victims = verified.select_eviction_victims(&incoming, &HashSet::new(), limit);
+        let roots = victims.roots.expect("high fee selects enough victims");
+        let max_victims = usize::try_from(
+            super::super::super::config::DEFAULT_MAX_TRANSACTION_BYTES
+                .div_ceil(MEMPOOL_TRANSACTION_COST_THRESHOLD),
+        )
+        .expect("default transaction limit fits in usize");
+        assert!(roots.len() <= max_victims);
+        let local_score_budget = 2 * (MAX_MEMPOOL_PACKAGE_TRANSACTIONS - 1) * roots.len();
+        assert!(verified.eviction_score_evaluations.load(Ordering::Relaxed) <= local_score_budget);
+        assert_eq!(verified.eviction_order, before);
+    }
 
     #[test]
     fn clear_removes_ironwood_nullifiers() {

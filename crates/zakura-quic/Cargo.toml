@@ -41,6 +41,7 @@ nix = { workspace = true, features = ["net"] }
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util"] }
 tempfile = { workspace = true }
+toml = { workspace = true }
 
 [lints]
 workspace = true

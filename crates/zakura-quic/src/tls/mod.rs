@@ -17,8 +17,8 @@ use rustls_pki_types::{alg_id, SubjectPublicKeyInfoDer};
 
 use crate::key::{NodeId, NodeSecretKey, KEY_LENGTH};
 
-mod resolver;
-mod verifier;
+pub(crate) mod resolver;
+pub(crate) mod verifier;
 
 /// The server name passed to noq for every dial.
 ///

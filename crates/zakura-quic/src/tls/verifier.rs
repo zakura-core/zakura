@@ -22,7 +22,7 @@ use rustls_pki_types::{
 use crate::key::NodeId;
 
 /// TLS 1.3 is the only version (TLS-1).
-pub(super) const PROTOCOL_VERSIONS: &[&SupportedProtocolVersion] = &[&rustls::version::TLS13];
+pub(crate) const PROTOCOL_VERSIONS: &[&SupportedProtocolVersion] = &[&rustls::version::TLS13];
 
 const ED25519_STRICT: Ed25519Strict = Ed25519Strict;
 const SUPPORTED_SIG_ALGS: WebPkiSupportedAlgorithms = WebPkiSupportedAlgorithms {
@@ -32,12 +32,12 @@ const SUPPORTED_SIG_ALGS: WebPkiSupportedAlgorithms = WebPkiSupportedAlgorithms 
 
 /// Accepts the server only if its raw public key equals the dialed node ID (TLS-7).
 #[derive(Debug)]
-pub(super) struct ServerCertificateVerifier {
+pub(crate) struct ServerCertificateVerifier {
     expected: NodeId,
 }
 
 impl ServerCertificateVerifier {
-    pub(super) fn new(expected: NodeId) -> Self {
+    pub(crate) fn new(expected: NodeId) -> Self {
         Self { expected }
     }
 }

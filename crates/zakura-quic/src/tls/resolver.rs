@@ -10,12 +10,12 @@ use rustls_pki_types::{CertificateDer, SubjectPublicKeyInfoDer};
 use crate::key::NodeSecretKey;
 
 #[derive(Debug)]
-pub(super) struct ResolveRawPublicKeyCert {
+pub(crate) struct ResolveRawPublicKeyCert {
     key: Arc<rustls::sign::CertifiedKey>,
 }
 
 impl ResolveRawPublicKeyCert {
-    pub(super) fn new(secret_key: &NodeSecretKey) -> Self {
+    pub(crate) fn new(secret_key: &NodeSecretKey) -> Self {
         let signing_key = Arc::new(Ed25519SigningKey(secret_key.clone()));
         let public_key_as_cert = CertificateDer::from(signing_key.spki().to_vec());
         let key = Arc::new(rustls::sign::CertifiedKey::new(

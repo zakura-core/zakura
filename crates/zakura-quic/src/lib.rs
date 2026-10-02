@@ -16,3 +16,27 @@ mod tls;
 
 pub use key::{KeyParsingError, NodeAddr, NodeId, NodeSecretKey, SignatureError, KEY_LENGTH};
 pub use tls::TlsConfigError;
+
+mod config;
+mod conn;
+mod endpoint;
+mod error;
+mod socket;
+pub mod sys;
+
+pub use config::{
+    ConfigError, CongestionController, QuicBindConfig, QuicConfig, MAX_MULTIPATH_PATHS,
+};
+pub use conn::{BanCheck, Conn, ConnObserver, ConnSample, ConnStats};
+pub use endpoint::{Acceptor, Admit, IncomingInfo, QuicEndpoint, SocketStats};
+pub use error::{BindError, ConnectError};
+pub use socket::SocketBuffers;
+
+// API-5: stream types and the errors Zakura matches on.
+pub use noq::{
+    ClosedStream, ConnectionError, PathId, ReadError, ReadExactError, ReadToEndError, RecvStream,
+    SendStream, VarInt, WriteError,
+};
+
+#[cfg(test)]
+mod tests;

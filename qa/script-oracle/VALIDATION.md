@@ -130,6 +130,39 @@ Zakura checkpoints those blocks and does not verify their scripts.
 The output count equals the count in the spentness artifact that zakura#962
 generated from the same state.
 
+## Performance
+
+`src/bin/perf.rs` timed both adapters on every other 2,000-block batch of
+Mainnet from height 347,500 to 3,490,665, on the same 4-vCPU machine and state
+as the replay, with 3 threads. One thread runs both adapters back to back on
+each transaction, alternating which runs first. Verification is `is_valid` for
+every input plus `p2sh_sigops`; preparation builds the `SigHasher`, which both
+adapters share, so the tool times it once.
+
+```text
+| Group | Txs | Inputs | Rust µs/input | C++ µs/input | Rust/C++ | Prepare µs/tx |
+| --- | --- | --- | --- | --- | --- | --- |
+| V3 Mixed | 272 | 291 | 98.81 | 98.15 | 1.007 | 64.61 |
+| V3 P2pkh | 234843 | 4622119 | 101.26 | 97.33 | 1.040 | 146.50 |
+| V3 P2sh | 1356 | 26286 | 281.89 | 275.54 | 1.023 | 215.59 |
+| V4 Mixed | 9550 | 23578 | 104.31 | 100.30 | 1.040 | 49.77 |
+| V4 P2pkh | 3496631 | 34940733 | 89.76 | 86.84 | 1.034 | 95.75 |
+| V4 P2sh | 189215 | 2520080 | 231.20 | 225.38 | 1.026 | 148.01 |
+| V5 Mixed | 6 | 14 | 154.98 | 147.90 | 1.048 | 39.12 |
+| V5 P2pkh | 658127 | 1922513 | 91.10 | 88.06 | 1.035 | 95.40 |
+| V5 P2sh | 4045 | 1761811 | 200.31 | 194.96 | 1.027 | 1815.75 |
+| V6 P2pkh | 30632 | 76161 | 92.25 | 88.94 | 1.037 | 136.58 |
+| V6 P2sh | 18 | 10027 | 181.54 | 182.23 | 0.996 | 2343.27 |
+| All | 4624695 | 45903613 | 103.12 | 99.84 | 1.033 | 102.14 |
+
+Per-transaction Rust/C++ verify ratio: p1=0.781 p10=0.947 median=1.032 p90=1.122 p99=1.370
+Legacy sigops over 5918486 transactions: Rust 1474 ns/tx, C++ 5060 ns/tx, Rust/C++ 0.291
+Totals: Rust verify 4733.7 s, C++ verify 4583.0 s, shared preparation 472.4 s
+```
+
+The Rust adapter verifies scripts 3.3% slower and counts legacy sigops 3.4
+times faster.
+
 ## Divergences
 
 None. Neither the seeded tests, the campaign, nor the Mainnet replay found an input on which the

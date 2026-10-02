@@ -69,3 +69,7 @@ bench = false
 [[bin]]
 name = "replay"
 required-features = ["replay"]
+
+[[bin]]
+name = "perf"
+required-features = ["replay"]

@@ -703,7 +703,7 @@ fn p2p_v2_config_roundtrip_keeps_dconfig_zakura_fields() {
         [zakura.quic]
         recv_buffer_bytes = 16777216
         congestion_controller = "new_reno"
-        handshake_timeout_secs = 10
+        handshake_timeout_secs = 20
         "#,
     )
     .unwrap();
@@ -715,7 +715,7 @@ fn p2p_v2_config_roundtrip_keeps_dconfig_zakura_fields() {
     assert!(serialized.contains("[zakura.quic]"));
     assert!(serialized.contains("recv_buffer_bytes = 16777216"));
     assert!(serialized.contains("congestion_controller = \"new_reno\""));
-    assert!(serialized.contains("handshake_timeout_secs = 10"));
+    assert!(serialized.contains("handshake_timeout_secs = 20"));
     assert!(serialized.contains("max_connections = 7"));
     assert!(serialized.contains("max_connections_per_ip = 5"));
     assert!(serialized.contains("trace_dir = \"target/zakura-test-traces\""));

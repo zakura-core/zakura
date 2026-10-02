@@ -4,8 +4,17 @@
 use std::net::{IpAddr, SocketAddr};
 
 /// Canonicalizes an address at the crate boundary (SOCK-11).
+///
+/// Only IPv4-mapped addresses change. Other IPv6 addresses keep their scope
+/// ID, which a link-local address needs to be dialable.
 pub fn canonical_addr(addr: SocketAddr) -> SocketAddr {
-    SocketAddr::new(canonical_ip(addr.ip()), addr.port())
+    match addr {
+        SocketAddr::V6(v6) => v6
+            .ip()
+            .to_ipv4_mapped()
+            .map_or(addr, |v4| SocketAddr::new(IpAddr::V4(v4), v6.port())),
+        v4 => v4,
+    }
 }
 
 /// Maps an IPv4-mapped IPv6 address to IPv4 (SOCK-11).
@@ -96,6 +105,14 @@ mod tests {
         assert_eq!(canonical_addr(mapped), "192.0.2.1:8234".parse().unwrap());
         let v6: SocketAddr = "[2001:db8::1]:8234".parse().unwrap();
         assert_eq!(canonical_addr(v6), v6);
+    }
+
+    #[test]
+    fn link_local_v6_keeps_its_scope() {
+        let SocketAddr::V6(scoped) = canonical_addr("[fe80::1%3]:8234".parse().unwrap()) else {
+            panic!("an IPv6 address stays IPv6");
+        };
+        assert_eq!(scoped.scope_id(), 3);
     }
 
     #[test]

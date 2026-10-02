@@ -123,6 +123,70 @@ fn client() -> QuicEndpoint {
     QuicEndpoint::bind(NodeSecretKey::generate(), &loopback(), &test_config()).unwrap()
 }
 
+/// A handshake that never finishes. A proxy forwards only the client's first
+/// datagram, so the server sees one Initial and its replies, including any
+/// Retry, go nowhere. This is what a spoofed source looks like to the server.
+struct StalledHandshake {
+    _client: noq::Endpoint,
+    _connecting: noq::Connecting,
+    proxy: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for StalledHandshake {
+    fn drop(&mut self) {
+        self.proxy.abort();
+    }
+}
+
+async fn stalled_handshake(server: &Server) -> StalledHandshake {
+    let target = server.endpoint.local_addrs()[0];
+    let proxy = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy.local_addr().unwrap();
+    let proxy = tokio::spawn(async move {
+        let mut buf = vec![0; 65_536];
+        let Ok((len, _)) = proxy.recv_from(&mut buf).await else {
+            return;
+        };
+        let _ = proxy.send_to(&buf[..len], target).await;
+        // Absorb everything else.
+        while proxy.recv_from(&mut buf).await.is_ok() {}
+    });
+    let client = noq::Endpoint::new(
+        noq::EndpointConfig::default(),
+        None,
+        std::net::UdpSocket::bind("127.0.0.1:0").unwrap(),
+        Arc::new(noq::TokioRuntime),
+    )
+    .unwrap();
+    let client_tls = crate::tls::TlsConfig::new(&NodeSecretKey::generate())
+        .client_config(server.endpoint.local_id(), ALPN)
+        .unwrap();
+    let connecting = client
+        .connect_with(
+            noq::ClientConfig::new(Arc::new(client_tls)),
+            proxy_addr,
+            crate::tls::UNSENT_SERVER_NAME,
+        )
+        .unwrap();
+    StalledHandshake {
+        _client: client,
+        _connecting: connecting,
+        proxy,
+    }
+}
+
+async fn wait_for_attempts(server: &Server, count: usize) {
+    while server.seen.lock().unwrap().len() < count {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+async fn wait_until_bindable(addr: SocketAddr) {
+    while std::net::UdpSocket::bind(addr).is_err() {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
 async fn echo(conn: &Conn, payload: &[u8]) -> Vec<u8> {
     let (mut send, mut recv) = conn.open_bi().await.unwrap();
     send.write_all(payload).await.unwrap();
@@ -271,6 +335,43 @@ async fn retry_threshold_validates_before_accepting() {
         assert_eq!(seen.len(), 2, "one Retry, then the validated attempt");
         assert!(!seen[0].validated);
         assert!(seen[1].validated);
+    })
+    .await
+    .unwrap();
+}
+
+/// V12 F-305590: without Retry, spoofed Initials held every pending slot until
+/// the idle timeout, and an acceptor that refuses at its budget then refused
+/// every honest peer. The default threshold sends unvalidated sources a Retry
+/// once 8 handshakes are pending, so spoofed sources hold at most 8 slots.
+#[tokio::test]
+async fn spoofed_handshakes_cannot_fill_the_pending_budget() {
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        let mut server = server_with(&test_config(), &loopback(), &[ALPN], |info| {
+            if info.pending_total >= 32 {
+                Admit::Refuse
+            } else {
+                Admit::Accept
+            }
+        });
+        let mut stalled = Vec::new();
+        for _ in 0..40 {
+            stalled.push(stalled_handshake(&server).await);
+        }
+        wait_for_attempts(&server, 40).await;
+        let most_pending = server
+            .seen
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|info| info.pending_total)
+            .max();
+        assert_eq!(most_pending, Some(8));
+
+        let client = client();
+        client.connect(server.addr(), ALPN).await.unwrap();
+        server.handled.recv().await.unwrap();
+        assert!(server.seen.lock().unwrap().last().unwrap().validated);
     })
     .await
     .unwrap();
@@ -436,6 +537,64 @@ async fn peer_opened_path_from_a_banned_ip_closes() {
     .unwrap();
 }
 
+/// V12 F-305586: when path events lag, the monitor rebuilds its path set and
+/// applies the PATH-2 ban check to paths whose events it lost.
+#[tokio::test]
+async fn lagged_path_events_resync_the_open_paths() {
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        let mut server = server();
+        let client = QuicEndpoint::bind(
+            NodeSecretKey::generate(),
+            &QuicBindConfig {
+                addrs: vec!["0.0.0.0:0".parse().unwrap()],
+                max_bidi_streams: 64,
+            },
+            &test_config(),
+        )
+        .unwrap();
+        let conn = client.connect(server.addr(), ALPN).await.unwrap();
+        let inbound = server.handled.recv().await.unwrap();
+        let server_addr = server.endpoint.local_addrs()[0];
+        let peer_ip = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 3));
+        let tuple = noq::FourTuple::new(server_addr, Some(peer_ip));
+        let mut opened = None;
+        for _ in 0..50 {
+            if let Ok(path) = conn
+                .noq()
+                .open_path(tuple, noq::PathStatus::Available)
+                .await
+            {
+                opened = Some(path);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let opened = opened.expect("the server accepted a second path");
+        while inbound.stats().paths.len() < 2 {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        // A monitor that lost the Established event knows only path 0.
+        let paths = crate::conn::OpenPaths::new();
+        crate::conn::resync_paths(inbound.noq(), &paths, noq::PathId::ZERO, 8, None);
+        assert_eq!(paths.snapshot().len(), 2, "the resync finds the lost path");
+
+        // The resync applies the ban check to the path it finds.
+        let ban: crate::conn::BanCheck = Arc::new(move |ip| ip == peer_ip);
+        let paths = crate::conn::OpenPaths::new();
+        crate::conn::resync_paths(inbound.noq(), &paths, noq::PathId::ZERO, 8, Some(&ban));
+        for _ in 0..50 {
+            if opened.status().is_err() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(opened.status().is_err(), "the banned path is still open");
+    })
+    .await
+    .unwrap();
+}
+
 #[tokio::test]
 async fn shutdown_closes_connections_within_the_bound() {
     tokio::time::timeout(TEST_TIMEOUT, async {
@@ -457,6 +616,56 @@ async fn shutdown_closes_connections_within_the_bound() {
             .connect(NodeAddr::with_addrs(client.local_id(), client.local_addrs()), ALPN)
             .await
             .is_err());
+    })
+    .await
+    .unwrap();
+}
+
+/// V12 F-305596: API-7 step 4. `shutdown` releases the sockets even while
+/// other handles to the endpoint live.
+#[tokio::test]
+async fn shutdown_releases_the_socket_while_handles_live() {
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        let mut server = server();
+        let port = server.endpoint.local_addrs()[0];
+        let client = client();
+        let conn = client.connect(server.addr(), ALPN).await.unwrap();
+        let inbound = server.handled.recv().await.unwrap();
+        let handle = server.endpoint.clone();
+
+        server.endpoint.shutdown().await;
+        conn.closed().await;
+        drop(inbound);
+        wait_until_bindable(port).await;
+        assert!(handle
+            .connect(
+                NodeAddr::with_addrs(client.local_id(), client.local_addrs()),
+                ALPN
+            )
+            .await
+            .is_err());
+    })
+    .await
+    .unwrap();
+}
+
+/// V12 F-305588: a handshake task used to hold a strong endpoint handle, so a
+/// peer that stalled its handshake kept a dropped endpoint and its port alive.
+#[tokio::test]
+async fn a_stalled_handshake_does_not_keep_a_dropped_endpoint_alive() {
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        // A deadline longer than the test, so only the fix can free the port.
+        let config = QuicConfig {
+            handshake_timeout_secs: Some(60),
+            ..test_config()
+        };
+        let server = server_with(&config, &loopback(), &[ALPN], |_| Admit::Accept);
+        let port = server.endpoint.local_addrs()[0];
+        let _stalled = stalled_handshake(&server).await;
+        wait_for_attempts(&server, 1).await;
+
+        drop(server);
+        wait_until_bindable(port).await;
     })
     .await
     .unwrap();

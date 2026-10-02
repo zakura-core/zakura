@@ -16,6 +16,10 @@ const GIB: u64 = 1024 * MIB;
 
 /// Multipath path budget, matching Iroh 1.1 (CTRL-30, WIRE-3).
 pub const MAX_MULTIPATH_PATHS: u32 = 8;
+/// Default handshake deadline in seconds (CTRL-17).
+pub const DEFAULT_HANDSHAKE_TIMEOUT_SECS: u32 = 10;
+/// Default pending handshakes above which unvalidated sources get a Retry (CTRL-22).
+pub const DEFAULT_RETRY_THRESHOLD: u32 = 8;
 
 /// Congestion controller choice (CTRL-3).
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -32,7 +36,8 @@ pub enum CongestionController {
 
 /// `[network.zakura.quic]`: every QUIC setting Zakura controls (SPEC §9.1).
 ///
-/// Defaults reproduce the Iroh backend's behavior (CTRL-0).
+/// Defaults reproduce the Iroh backend's behavior, except the handshake
+/// deadline (CTRL-17) and the Retry threshold (CTRL-22) (CTRL-0).
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct QuicConfig {
@@ -68,8 +73,8 @@ pub struct QuicConfig {
     pub path_keep_alive_interval_secs: u32,
     /// Per-path idle timeout in seconds (CTRL-16).
     pub path_idle_timeout_secs: u32,
-    /// Deadline for a QUIC handshake in seconds; unset means only the idle
-    /// timeout bounds it (CTRL-17).
+    /// Deadline for a QUIC handshake in seconds, 10 by default; unset means
+    /// only the idle timeout bounds it (CTRL-17).
     pub handshake_timeout_secs: Option<u32>,
     /// Maximum connection attempts waiting for a decision (CTRL-18).
     pub max_incoming: u32,
@@ -79,8 +84,8 @@ pub struct QuicConfig {
     pub incoming_buffer_total_bytes: u64,
     /// Handshakes in progress allowed per source IP; unset means no limit (CTRL-21).
     pub max_pending_per_ip: Option<u32>,
-    /// Pending handshakes above which unvalidated sources get a Retry; unset
-    /// means never (CTRL-22).
+    /// Pending handshakes at which unvalidated sources get a Retry, 8 by
+    /// default; unset means never (CTRL-22).
     pub retry_threshold: Option<u32>,
     /// Delay between dial attempts to a node's addresses (CTRL-23).
     pub dial_stagger_ms: u32,
@@ -109,12 +114,12 @@ impl Default for QuicConfig {
             mtu_discovery: true,
             path_keep_alive_interval_secs: 5,
             path_idle_timeout_secs: 15,
-            handshake_timeout_secs: None,
+            handshake_timeout_secs: Some(DEFAULT_HANDSHAKE_TIMEOUT_SECS),
             max_incoming: 65_536,
             incoming_buffer_bytes: 10 * MIB,
             incoming_buffer_total_bytes: 100 * MIB,
             max_pending_per_ip: None,
-            retry_threshold: None,
+            retry_threshold: Some(DEFAULT_RETRY_THRESHOLD),
             dial_stagger_ms: 250,
             kernel_drop_poll_secs: 10,
             qlog_dir: None,
@@ -392,8 +397,8 @@ mod tests {
         assert_eq!(config.incoming_buffer_total_bytes, 100 * MIB);
         assert_eq!(config.path_keep_alive_interval_secs, 5);
         assert_eq!(config.path_idle_timeout_secs, 15);
-        assert_eq!(config.handshake_timeout_secs, None);
-        assert_eq!(config.retry_threshold, None);
+        assert_eq!(config.handshake_timeout_secs, Some(10));
+        assert_eq!(config.retry_threshold, Some(8));
         assert_eq!(config.congestion_controller, CongestionController::Cubic);
     }
 

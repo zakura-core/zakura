@@ -16,6 +16,10 @@ use crate::{key::NodeId, sys::canonical_ip};
 
 /// How often the monitor samples stats and re-checks path 0's address.
 pub(crate) const SAMPLE_INTERVAL: Duration = Duration::from_secs(10);
+/// How many path IDs on each side of the highest seen one a resync probes after
+/// lost events. A path whose events were lost opened recently, so its ID sits
+/// near the top; the cap bounds the work when a peer floods events.
+const MAX_LAG_PROBE: u32 = 1024;
 
 /// Decides whether a peer-opened path or a migrated address must close (PATH-2, PATH-3).
 pub type BanCheck = Arc<dyn Fn(IpAddr) -> bool + Send + Sync>;
@@ -179,7 +183,7 @@ impl OpenPaths {
         Self(Arc::new(Mutex::new(BTreeSet::from([PathId::ZERO]))))
     }
 
-    fn snapshot(&self) -> Vec<PathId> {
+    pub(crate) fn snapshot(&self) -> Vec<PathId> {
         self.0
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -225,6 +229,7 @@ pub(crate) async fn monitor(
         .unwrap_or(admitted_ip);
     // Drop the strong handle so the monitor never keeps the connection open.
     drop(conn);
+    let mut max_seen = PathId::ZERO;
     let mut previous = Counters::default();
     let mut ticker = tokio::time::interval(SAMPLE_INTERVAL);
     ticker.tick().await;
@@ -244,14 +249,18 @@ pub(crate) async fn monitor(
             event = events.next() => {
                 let event = match event {
                     Some(Ok(event)) => event,
-                    // Lagged: resynchronize from the next stats sample.
-                    Some(Err(_)) => continue,
+                    Some(Err(noq::Lagged(lost))) => {
+                        let Some(conn) = weak.upgrade() else { continue };
+                        resync_paths(&conn, &paths, max_seen, lost, ban.as_ref());
+                        continue;
+                    }
                     // The connection's state is gone; `closed` resolves next.
                     None => {
                         events = futures::stream::pending().boxed();
                         continue;
                     }
                 };
+                max_seen = max_seen.max(event_path_id(&event));
                 let Some(conn) = weak.upgrade() else { continue };
                 on_path_event(&conn, event, &paths, ban.as_ref());
             }
@@ -279,18 +288,76 @@ fn on_path_event(
     match event {
         PathEvent::Abandoned { id, .. } | PathEvent::Discarded { id, .. } => paths.remove(id),
         PathEvent::Established { id, .. } if id != PathId::ZERO => {
-            // DIAL-7: Zakura never opens extra paths, so every other path is peer-opened.
-            paths.insert(id);
-            metrics::counter!("zakura.quic.paths.peer_opened").increment(1);
-            let Some(path) = conn.path(id) else { return };
-            let Ok(remote) = path.remote_address() else {
-                return;
-            };
-            if ban.is_some_and(|banned| banned(canonical_ip(remote.ip()))) {
-                close_banned_path(conn, &path);
+            if let Some(path) = conn.path(id) {
+                track_peer_path(conn, &path, paths, ban);
             }
         }
         _ => {}
+    }
+}
+
+/// Starts tracking a peer-opened path and applies the PATH-2 ban check.
+fn track_peer_path(
+    conn: &noq::Connection,
+    path: &noq::Path,
+    paths: &OpenPaths,
+    ban: Option<&BanCheck>,
+) {
+    // DIAL-7: Zakura never opens extra paths, so every other path is peer-opened.
+    paths.insert(path.id());
+    metrics::counter!("zakura.quic.paths.peer_opened").increment(1);
+    let Ok(remote) = path.remote_address() else {
+        return;
+    };
+    if ban.is_some_and(|banned| banned(canonical_ip(remote.ip()))) {
+        close_banned_path(conn, path);
+    }
+}
+
+fn event_path_id(event: &PathEvent) -> PathId {
+    match event {
+        PathEvent::Established { id, .. }
+        | PathEvent::Abandoned { id, .. }
+        | PathEvent::Discarded { id, .. }
+        | PathEvent::RemoteStatus { id, .. }
+        | PathEvent::ObservedAddr { id, .. } => *id,
+        _ => PathId::ZERO,
+    }
+}
+
+/// Rebuilds the open path set after `lost` path events were dropped (PATH-2).
+///
+/// noq assigns path IDs in increasing order, so every path whose events were
+/// lost has an ID at most `lost` above the highest ID seen.
+pub(crate) fn resync_paths(
+    conn: &noq::Connection,
+    paths: &OpenPaths,
+    max_seen: PathId,
+    lost: u64,
+    ban: Option<&BanCheck>,
+) {
+    metrics::counter!("zakura.quic.paths.events_lagged").increment(1);
+    let tracked = paths.snapshot();
+    for id in &tracked {
+        if *id != PathId::ZERO && conn.path(*id).is_none() {
+            paths.remove(*id);
+        }
+    }
+    let above = u32::try_from(lost).unwrap_or(u32::MAX).min(MAX_LAG_PROBE);
+    let last = max_seen.saturating_add(above);
+    let mut id = max_seen
+        .saturating_sub(MAX_LAG_PROBE)
+        .max(PathId::from(1u32));
+    while id <= last {
+        if !tracked.contains(&id) {
+            if let Some(path) = conn.path(id) {
+                track_peer_path(conn, &path, paths, ban);
+            }
+        }
+        if id == PathId::MAX {
+            break;
+        }
+        id = id.saturating_add(1u32);
     }
 }
 

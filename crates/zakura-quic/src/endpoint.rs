@@ -116,7 +116,8 @@ struct Inner {
 }
 
 struct SocketSlot {
-    endpoint: noq::Endpoint,
+    /// `None` once [`QuicEndpoint::shutdown`] has released the socket (API-7).
+    endpoint: Mutex<Option<noq::Endpoint>>,
     local_addr: SocketAddr,
     buffers: SocketBuffers,
     rebinds: Arc<AtomicU64>,
@@ -127,10 +128,19 @@ struct SocketSlot {
 /// ends the accept loops, socket supervisors and drop pollers.
 impl Drop for Inner {
     fn drop(&mut self) {
-        for slot in &self.sockets {
-            slot.endpoint.set_server_config(None);
-            slot.endpoint.close(VarInt::from_u32(0), b"");
+        for endpoint in self.sockets.iter().filter_map(SocketSlot::endpoint) {
+            endpoint.set_server_config(None);
+            endpoint.close(VarInt::from_u32(0), b"");
         }
+    }
+}
+
+impl SocketSlot {
+    fn endpoint(&self) -> Option<noq::Endpoint> {
+        self.endpoint
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 }
 
@@ -225,12 +235,12 @@ impl QuicEndpoint {
             .serve
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = Some(acceptor.clone());
-        for slot in &self.inner.sockets {
-            slot.endpoint.set_server_config(Some(server.clone()));
+        for endpoint in self.inner.sockets.iter().filter_map(SocketSlot::endpoint) {
+            endpoint.set_server_config(Some(server.clone()));
             tokio::spawn(accept_loop(
                 Arc::downgrade(&self.inner),
                 self.shutdown_signal(),
-                slot.endpoint.clone(),
+                endpoint,
                 acceptor.clone(),
             ));
         }
@@ -320,22 +330,32 @@ impl QuicEndpoint {
         Err(error)
     }
 
-    /// Stops accepting, closes every connection and waits up to 3 s for them
-    /// to drain (API-7).
+    /// Stops accepting, closes every connection, waits up to 3 s for them to
+    /// drain and releases the sockets (API-7).
+    ///
+    /// Other handles stay valid, but they can no longer dial or serve.
     pub async fn shutdown(&self) {
         self.inner.shutdown.send_replace(true);
-        for slot in &self.inner.sockets {
-            slot.endpoint.set_server_config(None);
-            slot.endpoint.close(VarInt::from_u32(0), b"");
+        let endpoints: Vec<noq::Endpoint> = self
+            .inner
+            .sockets
+            .iter()
+            .filter_map(SocketSlot::endpoint)
+            .collect();
+        for endpoint in &endpoints {
+            endpoint.set_server_config(None);
+            endpoint.close(VarInt::from_u32(0), b"");
         }
-        let drain = futures::future::join_all(
-            self.inner
-                .sockets
-                .iter()
-                .map(|slot| slot.endpoint.wait_idle()),
-        );
+        let drain = futures::future::join_all(endpoints.iter().map(noq::Endpoint::wait_idle));
         if tokio::time::timeout(SHUTDOWN_DRAIN, drain).await.is_err() {
             tracing::debug!(target: "zakura_quic", "connections didn't drain within 3 s");
+        }
+        // Step 4: the socket closes once noq's driver drops its last handle.
+        for slot in &self.inner.sockets {
+            slot.endpoint
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take();
         }
     }
 
@@ -356,7 +376,7 @@ impl QuicEndpoint {
             .iter()
             .find(|slot| reaches(slot))
             .or_else(|| family.first())
-            .map(|slot| slot.endpoint.clone())
+            .and_then(|slot| slot.endpoint())
     }
 
     fn finish_dial(
@@ -471,7 +491,7 @@ fn bind_slot(
     ));
 
     Ok(SocketSlot {
-        endpoint,
+        endpoint: Mutex::new(Some(endpoint)),
         local_addr: bound.local_addr,
         buffers: bound.buffers,
         rebinds,
@@ -588,6 +608,8 @@ async fn accept_loop(
         let Some(inner) = weak.upgrade() else {
             break;
         };
+        // This strong handle lives for one attempt only; the handshake task
+        // gets the weak one (API-7).
         let endpoint = QuicEndpoint { inner };
         let info = IncomingInfo {
             remote: canonical_addr(incoming.remote_address()),
@@ -608,7 +630,8 @@ async fn accept_loop(
                     Ok(connecting) => {
                         metrics::counter!("zakura.quic.incoming.accepted").increment(1);
                         tasks.spawn(handshake(
-                            endpoint.clone(),
+                            weak.clone(),
+                            endpoint.inner.config.handshake_timeout(),
                             connecting,
                             info.remote,
                             pending,
@@ -670,15 +693,19 @@ fn decide(config: &QuicConfig, acceptor: &dyn Acceptor, info: &IncomingInfo) -> 
 }
 
 /// Finishes one inbound handshake and hands the connection to the acceptor.
+///
+/// The task holds the endpoint weakly: a peer that stalls its handshake must
+/// not keep a dropped endpoint and its sockets alive (API-7).
 async fn handshake(
-    endpoint: QuicEndpoint,
+    weak: Weak<Inner>,
+    deadline: Option<Duration>,
     connecting: noq::Connecting,
     remote: SocketAddr,
     pending: PendingGuard,
     acceptor: Arc<dyn Acceptor>,
 ) {
     let started = Instant::now();
-    let result = match endpoint.inner.config.handshake_timeout() {
+    let result = match deadline {
         Some(deadline) => match tokio::time::timeout(deadline, connecting).await {
             Ok(result) => result.map_err(ConnectError::from_handshake),
             // ADM-6: dropping `connecting` closes the connection.
@@ -698,6 +725,11 @@ async fn handshake(
         connection.close(VarInt::from_u32(0), b"identity");
         return;
     };
+    let Some(inner) = weak.upgrade() else {
+        connection.close(VarInt::from_u32(0), b"");
+        return;
+    };
+    let endpoint = QuicEndpoint { inner };
     let conn = endpoint.register_conn(connection, remote_id, remote, alpn);
     // A connection handler must not keep a dropped endpoint alive.
     drop(endpoint);

@@ -860,6 +860,17 @@ fn nu7_diff_dump() {
         ),
         (
             Scenario {
+                name: "testnet-real",
+                a: 4_465_026,
+                lo: 4_463_026,
+                hi: 16_465_026,
+                is_testnet: true,
+                do_difficulty: true,
+            },
+            Ok(Network::new_default_testnet()),
+        ),
+        (
+            Scenario {
                 name: "regtest-R",
                 a: 300,
                 lo: 1,

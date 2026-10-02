@@ -20,6 +20,7 @@ DEP-6, SOCK-1, WIRE-9, ADM-1, ADM-3, PATH-3, OBS-3, API-2, API-3 and API-6;
   changed IDs.
 
 Terms:
+
 - **Endpoint**: one `QuicEndpoint`. It owns one noq endpoint per bound socket.
 - **Iroh backend**: today's transport, Zakura's fork of Iroh 1.1.
 - **Direct backend**: `zakura-quic`.
@@ -264,6 +265,7 @@ All keys live in `[network.zakura.quic]`. `zakurad` reads them at startup.
 Changing a key needs a restart.
 
 Rules for every key:
+
 - **CTRL-0.** Defaults MUST reproduce today's Iroh-backend behavior, except where
   a row says otherwise. Startup MUST fail with a clear error when a value is
   out of range. Only `zakura-quic/src/config.rs` may call noq config setters.
@@ -492,7 +494,7 @@ and the legacy stack bridges old and new `p2p_stack = "dual"` nodes (COMPAT-7).
   (PATH-2), and that the admitted IP stays the same.
 - **SEC-6.** No early data reaches noq buffers (TLS-10).
 - **SEC-7.** The fork's regression tests for NOQ-1 MUST pass on every bump.
-- **SEC-8.** A change to `tls/`, `key/`, ADM-* or PATH-* needs approval from
+- **SEC-8.** A change to `tls/`, `key/`, `ADM-*` or `PATH-*` needs approval from
   both transport owners (PLAN §9). An AI-assisted review counts as one reviewer at most.
 
 ## 14a. Platforms
@@ -554,6 +556,7 @@ and the legacy stack bridges old and new `p2p_stack = "dual"` nodes (COMPAT-7).
 ## 17. Feature priority
 
 Every requirement above is P0 except these:
+
 - **P1** (after the default flips, each gated by a measurement): changing the
   CTRL-3 default, CTRL-8, CTRL-9, CTRL-40 and the CTRL-25 qlog feature. The
   keys and their mappings ship in P0; only their use waits for the measurement.
@@ -564,6 +567,7 @@ Every requirement above is P0 except these:
 ## 17a. Changes in version 0.2
 
 The first implementation changed these requirements:
+
 - **DEP-6.** The audit backlog file lives under `qa/supply-chain/`.
 - **SOCK-1.** States that a peer-opened path to a second socket never
   validates. The interop probe found this with a node bound to both loopback

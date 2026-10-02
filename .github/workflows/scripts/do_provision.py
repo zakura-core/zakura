@@ -98,6 +98,26 @@ def newest(items):
 def select_state(snapshots, region, network, mode, checkpoint=None, snapshot_id=""):
     """Pick a regional fixture, preserving exact IDs and the handoff boundary."""
     regional = [s for s in snapshots if region in s["regions"]]
+    if mode == "vct-handoff":
+        if network != "mainnet" or not checkpoint or checkpoint <= 0:
+            raise ValueError("vct-handoff requires mainnet and a positive checkpoint")
+        # Ordinary finalized snapshots may cross C by recomputing every tree.
+        # Only dedicated approach fixtures are candidates for this canary. A
+        # validation bake is eligible only when explicitly selected by ID.
+        prefixes = ("zakura-vct-approach-mainnet-",)
+        if snapshot_id:
+            prefixes += ("zakura-pr-validation-approach-mainnet-",)
+        regional = [
+            s for s in regional
+            if s["name"].startswith(prefixes)
+            and height(s) is not None
+            and height(s) < checkpoint
+        ]
+        if snapshot_id:
+            return next((s for s in regional if str(s["id"]) == snapshot_id), None)
+        return max(
+            regional, key=lambda s: (height(s), s.get("created_at", "")), default=None
+        )
     if snapshot_id:
         selected = next((s for s in regional if str(s["id"]) == snapshot_id), None)
         if selected and mode == "pre-checkpoint":
@@ -411,7 +431,7 @@ def parser():
     cli.add_argument("--network", choices=("", "mainnet", "testnet"), default="")
     cli.add_argument(
         "--mode",
-        choices=("tip", "sandblast", "pre-checkpoint", "genesis"),
+        choices=("tip", "sandblast", "pre-checkpoint", "vct-handoff", "genesis"),
         default="tip",
     )
     cli.add_argument("--checkpoint", type=int)

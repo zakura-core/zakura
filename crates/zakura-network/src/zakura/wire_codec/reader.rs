@@ -22,6 +22,11 @@ impl<'a> BoundedReader<'a> {
         self.unread.len()
     }
 
+    /// Consume the remaining payload as opaque bytes without allocating.
+    pub(crate) fn take_remaining(&mut self) -> &'a [u8] {
+        std::mem::take(&mut self.unread)
+    }
+
     /// Read one typed item.
     pub fn read<T: Wire>(&mut self) -> Result<T::Value, WireError> {
         T::decode(self)

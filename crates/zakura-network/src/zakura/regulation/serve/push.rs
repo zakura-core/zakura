@@ -75,7 +75,7 @@ impl Push {
         .await;
         PushPermit {
             grants,
-            execution: ExecutionSlots::new(peer, node),
+            execution: ExecutionSlots::new(peer, node, self.peer.clone()),
         }
     }
 }

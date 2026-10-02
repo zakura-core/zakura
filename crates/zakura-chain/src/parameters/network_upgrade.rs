@@ -143,6 +143,7 @@ pub(super) const TESTNET_ACTIVATION_HEIGHTS: &[(block::Height, NetworkUpgrade)] 
         (NU6_1, Nu6_1),
         (NU6_2, Nu6_2),
         (NU6_3, Nu6_3),
+        (NU7, Nu7),
     ]
 };
 
@@ -324,11 +325,15 @@ pub const SPROUT_BLOCK_JOINSPLIT_LIMIT: u32 = 0;
 /// outputs.
 pub const GLOBAL_SHIELDED_BUDGET: u32 = 330;
 
-/// The multiplier used to derive the testnet minimum difficulty block time gap
-/// threshold.
+/// The multiplier used to derive the Testnet minimum difficulty time gap before
+/// NU7.
 ///
 /// Based on <https://zips.z.cash/zip-0208#minimum-difficulty-blocks-on-the-test-network>
-const TESTNET_MINIMUM_DIFFICULTY_GAP_MULTIPLIER: i32 = 6;
+const PRE_NU7_TESTNET_MINIMUM_DIFFICULTY_GAP_MULTIPLIER: i32 = 6;
+
+/// The multiplier used to derive the Testnet minimum difficulty time gap from
+/// NU7 onwards, preserving the pre-NU7 gap of 450 seconds.
+const POST_NU7_TESTNET_MINIMUM_DIFFICULTY_GAP_MULTIPLIER: i32 = 18;
 
 /// The start height for the testnet minimum difficulty consensus rule.
 ///
@@ -512,7 +517,8 @@ impl NetworkUpgrade {
     /// Returns the minimum difficulty block spacing for `network` and `height`.
     /// Returns `None` if the testnet minimum difficulty consensus rule is not active.
     ///
-    /// Based on <https://zips.z.cash/zip-0208#minimum-difficulty-blocks-on-the-test-network>
+    /// Uses six target spacings before NU7, as specified by ZIP 208, and 18
+    /// target spacings from NU7 onwards on Testnet.
     pub fn minimum_difficulty_spacing_for_height(
         network: &Network,
         height: block::Height,
@@ -527,7 +533,12 @@ impl NetworkUpgrade {
             (Network::Mainnet, _) => None,
             (Network::Testnet(_params), _) => {
                 let network_upgrade = NetworkUpgrade::current(network, height);
-                Some(network_upgrade.target_spacing() * TESTNET_MINIMUM_DIFFICULTY_GAP_MULTIPLIER)
+                let multiplier = if network_upgrade >= NetworkUpgrade::Nu7 {
+                    POST_NU7_TESTNET_MINIMUM_DIFFICULTY_GAP_MULTIPLIER
+                } else {
+                    PRE_NU7_TESTNET_MINIMUM_DIFFICULTY_GAP_MULTIPLIER
+                };
+                Some(network_upgrade.target_spacing() * multiplier)
             }
         }
     }

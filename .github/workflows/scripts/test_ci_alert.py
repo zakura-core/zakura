@@ -9,13 +9,17 @@ import ci_alert
 
 
 WORKFLOWS = Path(__file__).resolve().parent.parent
+BASE = "repos/o/r/actions"
 
 
 def run(number, conclusion, event="push", attempt=1):
-    """Returns a minimal workflow run, shaped like the GitHub API's."""
+    """Returns a minimal workflow run attempt, shaped like the GitHub API's."""
     return {
+        "id": number,
+        "workflow_id": 7,
         "run_number": number,
         "run_attempt": attempt,
+        "status": "completed",
         "conclusion": conclusion,
         "event": event,
         "name": "Unit Tests",
@@ -24,6 +28,23 @@ def run(number, conclusion, event="push", attempt=1):
         "head_commit": {"message": "fix(x): y\n\nbody", "author": {"name": "A <B>"}},
         "repository": {"html_url": "https://github.com/o/r"},
     }
+
+
+def kind(current, runs, attempts_before=(), newer_attempt=None):
+    """Returns the alert kind for `current`, given its earlier attempts (newest first) and runs."""
+    newest_first = sorted(runs, key=lambda other: other["run_number"], reverse=True)
+    previous, contradicted = ci_alert.verdicts(
+        current, iter(attempts_before), newer_attempt, newest_first
+    )
+    return ci_alert.alert_kind(current, previous, contradicted)
+
+
+def history_path(page):
+    """Returns the API path `ci_alert.history` requests for one page of push history."""
+    return (
+        f"{BASE}/workflows/7/runs?branch=main&event=push"
+        f"&status=completed&per_page={ci_alert.HISTORY_PAGE_SIZE}&page={page}"
+    )
 
 
 def watched_workflows():
@@ -39,58 +60,109 @@ def watched_workflows():
 
 
 class AlertKindTest(unittest.TestCase):
-    def kind(self, current, history, previous_attempt=None):
-        """Returns the alert kind for `current`, given the completed runs in `history`."""
-        return ci_alert.alert_kind(
-            current,
-            ci_alert.previous_conclusion(current, history, previous_attempt),
-            ci_alert.superseded(current, history),
-        )
-
     def test_push_failure_alerts_once_per_breakage(self):
-        self.assertEqual(self.kind(run(2, "failure"), [run(1, "success")]), "failure")
-        self.assertIsNone(self.kind(run(3, "failure"), [run(1, "success"), run(2, "failure")]))
+        self.assertEqual(kind(run(2, "failure"), [run(1, "success")]), "failure")
+        self.assertIsNone(kind(run(3, "failure"), [run(1, "success"), run(2, "failure")]))
 
     def test_scheduled_failure_alerts_every_time(self):
         history = [run(1, "failure", "schedule")]
-        self.assertEqual(self.kind(run(2, "failure", "schedule"), history), "failure")
+        self.assertEqual(kind(run(2, "failure", "schedule"), history), "failure")
 
     def test_first_failure_alerts(self):
-        self.assertEqual(self.kind(run(1, "failure"), []), "failure")
+        self.assertEqual(kind(run(1, "failure"), []), "failure")
 
     def test_timeouts_and_startup_failures_count_as_failures(self):
         for conclusion in ("timed_out", "startup_failure"):
-            self.assertEqual(self.kind(run(2, conclusion), [run(1, "success")]), "failure")
+            self.assertEqual(kind(run(2, conclusion), [run(1, "success")]), "failure")
 
     def test_pass_after_failure_is_a_recovery(self):
-        self.assertEqual(self.kind(run(2, "success"), [run(1, "failure")]), "recovery")
-        self.assertIsNone(self.kind(run(2, "success"), [run(1, "success")]))
+        self.assertEqual(kind(run(2, "success"), [run(1, "failure")]), "recovery")
+        self.assertIsNone(kind(run(2, "success"), [run(1, "success")]))
 
     def test_the_run_itself_in_history_is_ignored(self):
         current = run(2, "failure")
-        self.assertEqual(self.kind(current, [run(1, "success"), current]), "failure")
+        self.assertEqual(kind(current, [run(1, "success"), current]), "failure")
 
     def test_cancelled_runs_neither_alert_nor_count(self):
-        self.assertIsNone(self.kind(run(3, "cancelled"), [run(1, "success")]))
+        self.assertIsNone(kind(run(3, "cancelled"), [run(1, "success")]))
         history = [run(1, "failure"), run(2, "cancelled")]
-        self.assertIsNone(self.kind(run(3, "failure"), history))
-        self.assertEqual(self.kind(run(3, "success"), history), "recovery")
+        self.assertIsNone(kind(run(3, "failure"), history))
+        self.assertEqual(kind(run(3, "success"), history), "recovery")
 
-    def test_superseded_runs_are_not_reported(self):
-        self.assertIsNone(self.kind(run(2, "failure"), [run(1, "success"), run(3, "success")]))
-        # A newer run without a verdict does not supersede.
+    def test_failures_that_finish_together_alert_once(self):
+        # Both runs completed before either alert ran.
+        history = [run(100, "success"), run(101, "failure"), run(102, "failure")]
+        self.assertEqual(kind(run(101, "failure"), history), "failure")
+        self.assertIsNone(kind(run(102, "failure"), history))
+
+    def test_recoveries_that_finish_together_report_once(self):
+        history = [run(1, "failure"), run(2, "success"), run(3, "success")]
+        self.assertEqual(kind(run(2, "success"), history), "recovery")
+        self.assertIsNone(kind(run(3, "success"), history))
+
+    def test_a_newer_opposite_verdict_suppresses_the_alert(self):
+        self.assertIsNone(kind(run(2, "failure"), [run(1, "success"), run(3, "success")]))
+        self.assertIsNone(kind(run(2, "success"), [run(1, "failure"), run(3, "failure")]))
+        # A newer run without a verdict does not count.
         self.assertEqual(
-            self.kind(run(2, "failure"), [run(1, "success"), run(3, "cancelled")]), "failure"
+            kind(run(2, "failure"), [run(1, "success"), run(3, "cancelled")]), "failure"
         )
 
-    def test_rerun_follows_its_previous_attempt(self):
-        history = [run(1, "success")]
+    def test_a_newer_attempt_with_the_opposite_verdict_suppresses_the_alert(self):
+        history = [run(4, "success")]
+        self.assertIsNone(kind(run(5, "failure"), history, newer_attempt="success"))
+        self.assertEqual(kind(run(5, "failure"), history, newer_attempt="failure"), "failure")
+        self.assertEqual(kind(run(5, "failure"), history, newer_attempt="cancelled"), "failure")
+
+    def test_rerun_follows_its_newest_decided_attempt(self):
+        # Attempt 2 was cancelled, attempt 1 failed.
+        attempts = ["cancelled", "failure"]
+        history = [run(4, "success")]
         self.assertEqual(
-            self.kind(run(2, "success", attempt=2), history, previous_attempt="failure"),
-            "recovery",
+            kind(run(5, "success", attempt=3), history, attempts_before=attempts), "recovery"
         )
-        self.assertIsNone(
-            self.kind(run(2, "failure", attempt=2), history, previous_attempt="failure")
+        self.assertIsNone(kind(run(5, "failure", attempt=3), history, attempts_before=attempts))
+
+    def test_rerun_without_an_earlier_verdict_falls_back_to_earlier_runs(self):
+        current = run(5, "failure", attempt=2)
+        self.assertEqual(kind(current, [run(4, "success")], attempts_before=["cancelled"]), "failure")
+        self.assertIsNone(kind(current, [run(4, "failure")], attempts_before=["cancelled"]))
+
+
+class AlertTextTest(unittest.TestCase):
+    def alert(self, responses, run_id, attempt):
+        """Returns `ci_alert.alert_text` for one attempt, answered from `responses`."""
+        return ci_alert.alert_text("o/r", run_id, attempt, api=lambda path: responses[path])
+
+    def test_each_attempt_is_judged_on_its_own_conclusion(self):
+        # Attempt 2 had already failed again before attempt 1's alert ran.
+        first, second = run(50, "failure"), run(50, "failure", attempt=2)
+        responses = {
+            f"{BASE}/runs/50/attempts/1": first,
+            f"{BASE}/runs/50/attempts/2": second,
+            f"{BASE}/runs/50": second,
+            history_path(1): {"workflow_runs": [second, run(49, "success")]},
+            f"{BASE}/runs/50/attempts/1/jobs?per_page=100": {
+                "jobs": [{"name": "lint", "conclusion": "failure"}]
+            },
+        }
+        self.assertIn("failed on `main`", self.alert(responses, 50, 1))
+        self.assertIsNone(self.alert(responses, 50, 2))
+
+    def test_previous_verdict_is_found_beyond_the_first_history_page(self):
+        size = ci_alert.HISTORY_PAGE_SIZE
+        current = run(200, "success")
+        cancelled = [run(200 - offset, "cancelled") for offset in range(1, size)]
+        responses = {
+            f"{BASE}/runs/200/attempts/1": current,
+            f"{BASE}/runs/200": current,
+            history_path(1): {"workflow_runs": [current] + cancelled},
+            history_path(2): {"workflow_runs": [run(200 - size, "failure")]},
+        }
+        self.assertEqual(
+            self.alert(responses, 200, 1),
+            ":large_green_circle: *Unit Tests* is passing again on `main` (push): "
+            "<https://github.com/o/r/actions/runs/200|run 200>",
         )
 
 

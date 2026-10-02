@@ -1,12 +1,19 @@
 #!/usr/bin/env python3
 """Post failures and recoveries of watched workflows on `main` to Slack.
 
-`ci-alerts.yml` runs this after a watched workflow completes on `main`. A push
-failure is posted only when the previous push run did not fail, so a broken
-`main` is reported once rather than on every merge. Every scheduled failure is
-posted, because nothing else surfaces those runs. A pass that follows a failure
-is posted as a recovery. A run that a newer run of the same workflow and event
-has already superseded is not reported.
+`ci-alerts.yml` runs this after a watched workflow completes on `main`, once per
+completed attempt. Each attempt is judged against the verdict before it: the
+newest earlier attempt of the same run that reached a verdict, or else the
+newest such run of the same workflow and event. Cancelled, skipped and stale
+attempts never count as a verdict.
+
+A push failure is posted only when the previous verdict was not a failure, so a
+broken `main` is reported once rather than on every merge. Every scheduled
+failure is posted, because nothing else surfaces those runs. A pass after a
+failure is posted as a recovery. An attempt is not reported when a newer
+attempt or run already reached the opposite verdict, because `main` has moved
+on. A newer verdict that agrees does not suppress it, so a burst of failures
+that complete before their alerts run is still reported once.
 """
 
 import argparse
@@ -19,11 +26,13 @@ import urllib.request
 FAILED = {"failure", "startup_failure", "timed_out"}
 # Conclusions that say nothing about the workflow's health.
 UNDECIDED = {"cancelled", "skipped", "stale"}
+HISTORY_PAGE_SIZE = 100
+HISTORY_MAX_PAGES = 5
 MAX_LISTED_JOBS = 8
 MAX_TITLE_CHARS = 100
 
 
-def api(path):
+def gh_api(path):
     """Returns the decoded JSON of a GitHub REST API `GET` request, made through `gh`."""
     output = subprocess.run(
         ["gh", "api", path], check=True, capture_output=True, text=True
@@ -31,43 +40,68 @@ def api(path):
     return json.loads(output)
 
 
-def previous_conclusion(run, history, previous_attempt_conclusion):
-    """Returns the conclusion `run` follows, or `None` when nothing came before it.
+def is_decided(conclusion):
+    """Returns whether `conclusion` is a verdict on the workflow's health."""
+    return conclusion is not None and conclusion not in UNDECIDED
 
-    A re-run follows its own earlier attempt. Otherwise the run follows the
-    newest earlier run in `history` that reached a verdict.
+
+def is_failure(conclusion):
+    """Returns whether `conclusion` is a failure."""
+    return conclusion in FAILED
+
+
+def earlier_attempts(api, base, run_id, attempt):
+    """Yields the conclusions of the run's attempts before `attempt`, newest first."""
+    for earlier in range(attempt - 1, 0, -1):
+        yield api(f"{base}/runs/{run_id}/attempts/{earlier}")["conclusion"]
+
+
+def history(api, base, run):
+    """Yields completed runs of `run`'s workflow and event on `main`, newest first."""
+    for page in range(1, HISTORY_MAX_PAGES + 1):
+        runs = api(
+            f"{base}/workflows/{run['workflow_id']}/runs?branch=main&event={run['event']}"
+            f"&status=completed&per_page={HISTORY_PAGE_SIZE}&page={page}"
+        )["workflow_runs"]
+        yield from runs
+        if len(runs) < HISTORY_PAGE_SIZE:
+            return
+
+
+def verdicts(current, attempts_before, newer_attempt, runs):
+    """Returns `(previous, contradicted)` for the attempt `current`.
+
+    `previous` is the verdict `current` follows: the first decided conclusion in
+    `attempts_before` (newest first), or else the newest decided run in `runs`
+    (newest first) older than `current`. It is `None` when nothing decided came
+    first. `contradicted` says whether `newer_attempt` or a newer decided run
+    reached the opposite verdict.
     """
-    if run["run_attempt"] > 1:
-        return previous_attempt_conclusion
-    earlier = [
-        other
-        for other in history
-        if other["run_number"] < run["run_number"]
-        and other["conclusion"] not in UNDECIDED
-    ]
-    if not earlier:
+    failed = is_failure(current["conclusion"])
+    contradicted = is_decided(newer_attempt) and is_failure(newer_attempt) != failed
+    previous = next((conclusion for conclusion in attempts_before if is_decided(conclusion)), None)
+    for other in runs:
+        if other["run_number"] > current["run_number"]:
+            if is_decided(other["conclusion"]) and is_failure(other["conclusion"]) != failed:
+                contradicted = True
+        elif other["run_number"] < current["run_number"]:
+            if previous is None and is_decided(other["conclusion"]):
+                previous = other["conclusion"]
+            if previous is not None:
+                break
+    return previous, contradicted
+
+
+def alert_kind(current, previous, contradicted):
+    """Returns `"failure"`, `"recovery"`, or `None` for a completed attempt."""
+    conclusion = current["conclusion"]
+    if contradicted or not is_decided(conclusion):
         return None
-    return max(earlier, key=lambda other: other["run_number"])["conclusion"]
-
-
-def superseded(run, history):
-    """Returns whether a newer run in `history` has already reached a verdict."""
-    return any(
-        other["run_number"] > run["run_number"]
-        and other["conclusion"] not in UNDECIDED
-        for other in history
-    )
-
-
-def alert_kind(run, previous, is_superseded):
-    """Returns `"failure"`, `"recovery"`, or `None` for a completed run."""
-    if is_superseded or run["conclusion"] in UNDECIDED:
-        return None
-    if run["conclusion"] in FAILED:
-        if run["event"] == "schedule" or previous not in FAILED:
+    if is_failure(conclusion):
+        if current["event"] == "schedule" or not is_failure(previous):
             return "failure"
         return None
-    if run["conclusion"] == "success" and previous in FAILED:
+    if conclusion == "success" and is_failure(previous):
         return "recovery"
     return None
 
@@ -78,7 +112,7 @@ def failed_jobs(jobs):
     A workflow's `... success` summary job fails whenever another job does, so it
     is left out unless it is the only failure.
     """
-    failed = [job["name"] for job in jobs if job["conclusion"] in FAILED]
+    failed = [job["name"] for job in jobs if is_failure(job["conclusion"])]
     return [name for name in failed if not name.endswith(" success")] or failed
 
 
@@ -110,33 +144,31 @@ def message(kind, run, jobs):
     return "\n".join(lines)
 
 
-def alert_text(repository, run_id):
-    """Returns the Slack text for a completed run, or `None` when it needs no alert."""
+def alert_text(repository, run_id, attempt, api=gh_api):
+    """Returns the Slack text for one completed attempt, or `None` when it needs no alert."""
     base = f"repos/{repository}/actions"
-    run = api(f"{base}/runs/{run_id}")
-    history = api(
-        f"{base}/workflows/{run['workflow_id']}/runs"
-        f"?branch=main&event={run['event']}&status=completed&per_page=20"
-    )["workflow_runs"]
-    previous_attempt = None
-    if run["run_attempt"] > 1:
-        previous_attempt = api(f"{base}/runs/{run_id}/attempts/{run['run_attempt'] - 1}")[
-            "conclusion"
-        ]
-
-    kind = alert_kind(
-        run,
-        previous_conclusion(run, history, previous_attempt),
-        superseded(run, history),
+    current = api(f"{base}/runs/{run_id}/attempts/{attempt}")
+    latest = api(f"{base}/runs/{run_id}")
+    newer_attempt = (
+        latest["conclusion"]
+        if latest["run_attempt"] > attempt and latest["status"] == "completed"
+        else None
     )
+    previous, contradicted = verdicts(
+        current,
+        earlier_attempts(api, base, run_id, attempt),
+        newer_attempt,
+        history(api, base, current),
+    )
+    kind = alert_kind(current, previous, contradicted)
     if kind is None:
         return None
     jobs = []
     if kind == "failure":
         jobs = failed_jobs(
-            api(f"{base}/runs/{run_id}/attempts/{run['run_attempt']}/jobs?per_page=100")["jobs"]
+            api(f"{base}/runs/{run_id}/attempts/{attempt}/jobs?per_page=100")["jobs"]
         )
-    return message(kind, run, jobs)
+    return message(kind, current, jobs)
 
 
 def post(webhook, text):
@@ -152,21 +184,24 @@ def post(webhook, text):
 
 
 def main():
-    """Posts the alert for one completed run, or a test message."""
+    """Posts the alert for one completed attempt, or a test message."""
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--repository", required=True, help="owner/name of the repository")
     mode = parser.add_mutually_exclusive_group(required=True)
-    mode.add_argument("--run-id", type=int, help="completed workflow run to report")
+    mode.add_argument("--run-id", type=int, help="workflow run to report")
     mode.add_argument("--test", metavar="RUN_URL", help="post a test message linking RUN_URL")
+    parser.add_argument("--attempt", type=int, help="completed attempt of --run-id to report")
     parser.add_argument("--dry-run", action="store_true", help="print the alert instead of posting it")
     args = parser.parse_args()
 
     if args.test:
         text = f":large_blue_circle: CI alerts test message from <{args.test}|this run>"
     else:
-        text = alert_text(args.repository, args.run_id)
+        if args.attempt is None:
+            parser.error("--run-id needs --attempt")
+        text = alert_text(args.repository, args.run_id, args.attempt)
         if text is None:
-            print("No alert for this run.")
+            print("No alert for this attempt.")
             return
     if args.dry_run:
         print(text)

@@ -36,8 +36,9 @@ permissions:
   contents: read
 
 concurrency:
-  # Judge one watched workflow's completions in order.
-  group: ci-alerts-${{ github.event.workflow_run.workflow_id || github.run_id }}
+  # One group per watched attempt. A shared group would hold only one pending
+  # alert and cancel the rest; each alert judges the run history on its own.
+  group: ci-alerts-${{ github.event.workflow_run.id || github.run_id }}-${{ github.event.workflow_run.run_attempt }}
   cancel-in-progress: false
 
 jobs:
@@ -67,8 +68,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REPOSITORY: ${{ github.repository }}
           RUN_ID: ${{ github.event.workflow_run.id }}
+          RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
           SLACK_WEB_HOOK: ${{ secrets.SLACK_WEB_HOOK }}
-        run: python3 .github/workflows/scripts/ci_alert.py --repository "$REPOSITORY" --run-id "$RUN_ID"
+        run: >-
+          python3 .github/workflows/scripts/ci_alert.py --repository "$REPOSITORY"
+          --run-id "$RUN_ID" --attempt "$RUN_ATTEMPT"
 
       - name: Post test message
         if: github.event_name == 'workflow_dispatch'

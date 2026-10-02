@@ -11,6 +11,33 @@ independently.
 
 ## [Unreleased]
 
+## [1.6.0] - 2026-10-01
+
+### Changed
+
+- Disabled Sentry in default node builds and release binaries. To enable Sentry
+  reporting, build with `--features sentry` and set `SENTRY_DSN` at runtime
+  ([#1216](https://github.com/zakura-core/zakura/pull/1216)).
+- Reduced the work spent detecting duplicate inputs and nullifiers during
+  transaction verification
+  ([#1217](https://github.com/zakura-core/zakura/pull/1217)).
+- Lowered Zakura's conventional fee to 400 zatoshis per logical action for
+  mempool admission, block template selection, and mempool eviction
+  ([#1218](https://github.com/zakura-core/zakura/pull/1218)).
+- Raised the block template fee weight ratio cap from 10 to 13
+  ([#1218](https://github.com/zakura-core/zakura/pull/1218)).
+- Scheduled NU7 on Testnet at block height 4,465,026 and updated the Zakura Common
+  libraries to v2.2.0. The existing NSM calculation schedules reissuance at
+  height 7,305,222
+  ([#1235](https://github.com/zakura-core/zakura/pull/1235)).
+
+### Fixed
+
+- Aligned Mainnet end of support for the October 1 release with approximately
+  November 1, 2026 at 00:00 UTC, supporting through height 3,536,467. Guarded
+  against extending estimated support to November 2 unless Mainnet NU7 has an
+  activation height ([#1234](https://github.com/zakura-core/zakura/pull/1234)).
+
 ## [1.5.1] - 2026-09-29
 
 ### Added

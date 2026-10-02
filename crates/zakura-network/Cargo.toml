@@ -1,6 +1,6 @@
 [package]
 name = "zakura-network"
-version = "9.0.0"
+version = "10.0.0"
 authors.workspace = true
 description = "Networking code for the Zakura node. Internal crate, published to support cargo install zakura"
 # # Legal
@@ -55,7 +55,6 @@ dirs = { workspace = true }
 hex = { workspace = true }
 humantime-serde = { workspace = true }
 indexmap = { workspace = true, features = ["serde"] }
-iroh = { workspace = true }
 itertools = { workspace = true }
 lazy_static = { workspace = true }
 pin-project = { workspace = true }
@@ -70,7 +69,7 @@ thiserror = { workspace = true }
 futures = { workspace = true }
 tokio = { workspace = true, features = ["fs", "io-util", "net", "time", "tracing", "macros", "rt-multi-thread"] }
 tokio-stream = { workspace = true, features = ["sync", "time"] }
-tokio-util = { workspace = true, features = ["codec"] }
+tokio-util = { workspace = true, features = ["codec", "rt"] }
 tower = { workspace = true, features = ["retry", "discover", "load", "load-shed", "timeout", "util", "buffer"] }
 
 metrics = { workspace = true }

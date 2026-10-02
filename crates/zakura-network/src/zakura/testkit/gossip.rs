@@ -1,7 +1,7 @@
 //! Lightweight in-process gossip mesh for multi-node Zakura tests.
 //!
 //! This is deliberately a *toy* flood-sub protocol layered directly on the
-//! relay-free loopback Iroh endpoints from [`LocalEndpointFactory`]. It reuses
+//! loopback `zakura-quic` endpoints from [`LocalEndpointFactory`]. It reuses
 //! the production [`Frame`] wire type, but not the production handler or
 //! supervisor, so it can prove multi-node mesh formation and message
 //! propagation cheaply and deterministically while the real P2P-v2 gossip path
@@ -17,12 +17,9 @@
 
 use std::{collections::HashSet, sync::Arc};
 
-use iroh::{
-    endpoint::Connection,
-    protocol::{AcceptError, ProtocolHandler, Router},
-    EndpointAddr,
-};
+use futures::future::BoxFuture;
 use tokio::sync::Mutex;
+use zakura_quic::{Acceptor, Admit, Conn as Connection, IncomingInfo, NodeAddr, QuicEndpoint};
 
 use super::{InboundRecorder, LocalEndpointFactory};
 use crate::{
@@ -117,18 +114,28 @@ struct GossipHandler {
     core: Arc<GossipCore>,
 }
 
-impl ProtocolHandler for GossipHandler {
-    async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
-        self.core.register_conn(connection.clone()).await;
-        self.core.clone().serve(connection).await;
-        Ok(())
+impl Acceptor for GossipHandler {
+    fn admit(&self, _incoming: &IncomingInfo) -> Admit {
+        Admit::Accept
+    }
+
+    fn alpns(&self) -> Vec<Vec<u8>> {
+        vec![GOSSIP_ALPN.to_vec()]
+    }
+
+    fn handle(&self, connection: Connection) -> BoxFuture<'static, ()> {
+        let core = self.core.clone();
+        Box::pin(async move {
+            core.register_conn(connection.clone()).await;
+            core.serve(connection).await;
+        })
     }
 }
 
-/// A lightweight in-process gossip node over a relay-free loopback endpoint.
+/// A lightweight in-process gossip node over a loopback endpoint.
 #[derive(Debug)]
 pub struct GossipNode {
-    router: Router,
+    endpoint: QuicEndpoint,
     core: Arc<GossipCore>,
 }
 
@@ -137,15 +144,13 @@ impl GossipNode {
     pub async fn spawn(seed: u64) -> Result<Self, BoxError> {
         let endpoint = LocalEndpointFactory::new().endpoint(seed).await?;
         let core = Arc::new(GossipCore::new(InboundRecorder::new(1024)));
-        let router = Router::builder(endpoint)
-            .accept(GOSSIP_ALPN, GossipHandler { core: core.clone() })
-            .spawn();
-        Ok(Self { router, core })
+        endpoint.serve(GossipHandler { core: core.clone() })?;
+        Ok(Self { endpoint, core })
     }
 
-    /// Current Iroh node address.
-    pub async fn node_addr(&self) -> EndpointAddr {
-        LocalEndpointFactory::node_addr(self.router.endpoint()).await
+    /// Current node address.
+    pub async fn node_addr(&self) -> NodeAddr {
+        LocalEndpointFactory::node_addr(&self.endpoint).await
     }
 
     /// Bounded inbound recorder of received gossip frames.
@@ -156,7 +161,7 @@ impl GossipNode {
     /// Dial `peer` and keep the connection for sending and receiving gossip.
     pub async fn connect(&self, peer: &GossipNode) -> Result<(), BoxError> {
         let peer_addr = peer.node_addr().await;
-        let endpoint = self.router.endpoint();
+        let endpoint = &self.endpoint;
 
         let conn = endpoint.connect(peer_addr, GOSSIP_ALPN).await?;
         self.core.register_conn(conn.clone()).await;
@@ -182,7 +187,7 @@ impl GossipNode {
 
     /// Shut the node down.
     pub async fn shutdown(&self) {
-        let _ = self.router.shutdown().await;
+        self.endpoint.shutdown().await;
     }
 }
 

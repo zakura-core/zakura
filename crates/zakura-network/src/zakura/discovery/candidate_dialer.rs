@@ -24,7 +24,7 @@ use super::redial::ZAKURA_REDIAL_HEALTHY_CONNECTION;
 use super::trace::DiscoveryDialResultEvent;
 use crate::zakura::{
     canonical_ip, ZakuraEndpoint, ZakuraHandlerError, ZakuraLocalLimits, ZakuraPeerId,
-    ZakuraServiceId,
+    ZakuraServiceId, ZAKURA_ALPN_MISMATCH_BACKOFF,
 };
 
 /// How often the discovery dialer wakes to look for new candidates.
@@ -36,6 +36,7 @@ pub(super) enum DiscoveryDialResult {
     ConnectedElsewhere,
     ShortLivedRegistered,
     Failed,
+    AlpnMismatch,
     LocalResourceLimit,
 }
 
@@ -46,6 +47,7 @@ impl DiscoveryDialResult {
             Self::ConnectedElsewhere => "connected_elsewhere",
             Self::ShortLivedRegistered => "short_lived_registered",
             Self::Failed => "failed",
+            Self::AlpnMismatch => "alpn_mismatch",
             Self::LocalResourceLimit => "local_resource_limit",
         }
     }
@@ -362,21 +364,21 @@ fn apply_discovery_ip_dial_result(
                 dial_backoff_by_node_ip.remove(&(node_id, *ip));
             }
         }
-        DiscoveryDialResult::Failed => {
+        DiscoveryDialResult::Failed | DiscoveryDialResult::AlpnMismatch => {
             for ip in ips {
                 let failure_count = dial_backoff_by_node_ip
                     .get(&(node_id, *ip))
                     .map_or(1, |backoff| backoff.failure_count.saturating_add(1));
+                let mut wait =
+                    discovery_ip_dial_backoff(failure_count, dial_backoff.0, dial_backoff.1);
+                if result == DiscoveryDialResult::AlpnMismatch {
+                    wait = wait.max(ZAKURA_ALPN_MISMATCH_BACKOFF);
+                }
                 dial_backoff_by_node_ip.insert(
                     (node_id, *ip),
                     DiscoveryIpBackoff {
                         failure_count,
-                        retry_at: now
-                            + discovery_ip_dial_backoff(
-                                failure_count,
-                                dial_backoff.0,
-                                dial_backoff.1,
-                            ),
+                        retry_at: now + wait,
                     },
                 );
             }
@@ -453,6 +455,10 @@ async fn run_discovery_dial_once(
                     }
                     Ok(Err(ZakuraHandlerError::ResourceLimit(_))) => {
                         DiscoveryDialResult::LocalResourceLimit
+                    }
+                    Ok(Err(error)) if error.is_alpn_mismatch() => {
+                        debug!(?error, "Zakura discovery peer speaks another protocol version");
+                        DiscoveryDialResult::AlpnMismatch
                     }
                     Ok(Err(error)) => {
                         debug!(?error, "Zakura discovery dial failed");
@@ -544,6 +550,10 @@ async fn apply_discovery_dial_result(
         DiscoveryDialResult::Failed => {
             discovery.mark_dial_failure(node_id).await;
             metrics::counter!("zakura.p2p.discovery.dial.failed").increment(1);
+        }
+        DiscoveryDialResult::AlpnMismatch => {
+            discovery.mark_dial_failure(node_id).await;
+            metrics::counter!("zakura.p2p.discovery.dial.alpn_mismatch").increment(1);
         }
         DiscoveryDialResult::LocalResourceLimit => {
             metrics::counter!("zakura.p2p.discovery.dial.local_resource_limit").increment(1);
@@ -712,5 +722,36 @@ mod tests {
                 .await,
             DiscoveryDialResult::ConnectedElsewhere
         );
+    }
+
+    #[test]
+    fn alpn_mismatch_backs_off_at_least_ten_minutes() {
+        let node = node_id(1);
+        let ip = IpAddr::from([93, 184, 216, 34]);
+        let now = Instant::now();
+        let mut backoff_by_node_ip = HashMap::new();
+
+        apply_discovery_ip_dial_result(
+            &mut backoff_by_node_ip,
+            node,
+            &[ip],
+            DiscoveryDialResult::AlpnMismatch,
+            (Duration::from_secs(60), Duration::from_secs(3_600)),
+            now,
+        );
+
+        let just_before = now + ZAKURA_ALPN_MISMATCH_BACKOFF - Duration::from_secs(1);
+        assert!(discovery_ip_is_in_backoff(
+            &backoff_by_node_ip,
+            node,
+            ip,
+            just_before
+        ));
+        assert!(!discovery_ip_is_in_backoff(
+            &backoff_by_node_ip,
+            node,
+            ip,
+            now + ZAKURA_ALPN_MISMATCH_BACKOFF
+        ));
     }
 }

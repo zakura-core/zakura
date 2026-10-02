@@ -684,7 +684,6 @@ fn p2p_v2_config_roundtrip_keeps_dconfig_zakura_fields() {
 
         [zakura]
         bootstrap_peers = ["ae58ff8833241ac82d6ff7611046ed67b5072d142c588d0063e942d9a75502b6@127.0.0.1:8233"]
-        nat_traversal = true
         max_connections = 7
         max_connections_per_ip = 5
         max_pending_handshakes = 3
@@ -700,6 +699,11 @@ fn p2p_v2_config_roundtrip_keeps_dconfig_zakura_fields() {
         replace_legacy_syncer = true
         max_blocks_per_response = 5
         status_refresh_interval = "12s"
+
+        [zakura.quic]
+        recv_buffer_bytes = 16777216
+        congestion_controller = "new_reno"
+        handshake_timeout_secs = 10
         "#,
     )
     .unwrap();
@@ -708,8 +712,10 @@ fn p2p_v2_config_roundtrip_keeps_dconfig_zakura_fields() {
     assert!(serialized.contains("p2p_stack = \"dual\""));
     assert!(serialized.contains("[zakura]"));
     assert!(serialized.contains("bootstrap_peers"));
-    assert!(config.zakura.nat_traversal);
-    assert!(serialized.contains("nat_traversal = true"));
+    assert!(serialized.contains("[zakura.quic]"));
+    assert!(serialized.contains("recv_buffer_bytes = 16777216"));
+    assert!(serialized.contains("congestion_controller = \"new_reno\""));
+    assert!(serialized.contains("handshake_timeout_secs = 10"));
     assert!(serialized.contains("max_connections = 7"));
     assert!(serialized.contains("max_connections_per_ip = 5"));
     assert!(serialized.contains("trace_dir = \"target/zakura-test-traces\""));
@@ -725,6 +731,36 @@ fn p2p_v2_config_roundtrip_keeps_dconfig_zakura_fields() {
         !config.zakura.block_sync.replace_legacy_syncer,
         "deprecated replace_legacy_syncer config is accepted but ignored"
     );
+}
+
+#[test]
+fn zakura_nat_traversal_fails_and_names_the_transport_spec() {
+    let _init_guard = zakura_test::init();
+
+    let error = toml::from_str::<Config>("[zakura]\nnat_traversal = true\n")
+        .expect_err("nat_traversal = true must fail at startup")
+        .to_string();
+    assert!(error.contains("hole punching"), "{error}");
+    assert!(error.contains("docs/specs/zakura-quic.md"), "{error}");
+
+    let config: Config = toml::from_str("[zakura]\nnat_traversal = false\n")
+        .expect("nat_traversal = false keeps parsing");
+    assert!(!config.zakura.nat_traversal);
+}
+
+#[test]
+fn zakura_quic_out_of_range_value_fails_and_names_the_key() {
+    let _init_guard = zakura_test::init();
+
+    let error = toml::from_str::<Config>("[zakura.quic]\nidle_timeout_secs = 5\n")
+        .expect_err("an out-of-range transport value must fail at startup")
+        .to_string();
+    assert!(error.contains("idle_timeout_secs"), "{error}");
+
+    let error = toml::from_str::<Config>("[zakura.quic]\nnot_a_key = 1\n")
+        .expect_err("an unknown transport key must fail at startup")
+        .to_string();
+    assert!(error.contains("not_a_key"), "{error}");
 }
 
 #[test]

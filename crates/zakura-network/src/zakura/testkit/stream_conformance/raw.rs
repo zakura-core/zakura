@@ -5,18 +5,13 @@
 //! following the transport's opener tiebreak. A multi-stream layout carries
 //! its eight-byte session wire id after each member's prelude.
 
-use iroh::{
-    endpoint::{Connection, RecvStream, SendStream},
-    Endpoint,
-};
 use zakura_chain::parameters::Network;
-use zakura_quic::NodeAddr;
+use zakura_quic::{Conn as Connection, NodeAddr, QuicEndpoint, RecvStream, SendStream};
 
 use super::CONFORMANCE_DEADLINE;
 use crate::{
     zakura::{
         handler::{i_open_collision_winner, run_native_initiator_handshake_without_trace},
-        iroh_compat::{from_iroh_id, to_iroh_addr},
         testkit::{HostilePeer, LocalEndpointFactory},
         Frame, Stream, StreamPrelude, ZakuraHandshakeConfig, ZakuraLocalLimits, ZakuraPeerId,
         P2P_V2_ALPN, STREAM_PRELUDE_MAGIC,
@@ -27,7 +22,7 @@ use crate::{
 /// A raw connection to a victim node, with the members of one layout.
 #[derive(Debug)]
 pub(crate) struct RawLayoutPeer {
-    endpoint: Endpoint,
+    endpoint: QuicEndpoint,
     pub(crate) connection: Connection,
     limits: ZakuraLocalLimits,
     /// The layout's members, in layout order, once opened.
@@ -54,16 +49,16 @@ impl RawLayoutPeer {
         seed: u64,
         capabilities: u64,
     ) -> Result<Self, BoxError> {
-        let endpoint = LocalEndpointFactory::with_transport_config(limits.transport_config())
+        let endpoint = LocalEndpointFactory::with_limits(limits)
             .endpoint(seed)
             .await?;
         let connection = within("connect", async {
-            Ok(endpoint.connect(to_iroh_addr(&victim), P2P_V2_ALPN).await?)
+            Ok(endpoint.connect(victim, P2P_V2_ALPN).await?)
         })
         .await?;
         let mut config = ZakuraHandshakeConfig::for_network(&Network::Mainnet);
         config.supported_capabilities = capabilities;
-        let local = ZakuraPeerId::new(endpoint.id().as_bytes().to_vec())?;
+        let local = ZakuraPeerId::new(endpoint.local_id().as_bytes().to_vec())?;
         within("handshake", async {
             run_native_initiator_handshake_without_trace(&connection, limits, &config, &local)
                 .await?;
@@ -81,7 +76,7 @@ impl RawLayoutPeer {
 
     /// This peer's identity.
     pub(crate) fn id(&self) -> ZakuraPeerId {
-        ZakuraPeerId::new(self.endpoint.id().as_bytes().to_vec())
+        ZakuraPeerId::new(self.endpoint.local_id().as_bytes().to_vec())
             .expect("an endpoint id is a valid peer id")
     }
 
@@ -111,10 +106,7 @@ impl RawLayoutPeer {
     pub(crate) async fn open_layout(&mut self, layout: &[Stream]) -> Result<(), BoxError> {
         self.members.clear();
         let multi = layout.len() > 1;
-        if i_open_collision_winner(
-            &from_iroh_id(&self.endpoint.id()),
-            &from_iroh_id(&self.connection.remote_id()),
-        ) {
+        if i_open_collision_winner(&self.endpoint.local_id(), &self.connection.remote_id()) {
             let wire_id: u64 = rand::random::<u64>().max(1);
             for member in layout {
                 let (mut send, recv) = self.open_stream(member.kind, member.version).await?;
@@ -261,6 +253,6 @@ impl RawLayoutPeer {
     /// Close the connection and the endpoint.
     pub(crate) async fn shutdown(self) {
         self.connection.close(0u32.into(), b"done");
-        self.endpoint.close().await;
+        self.endpoint.shutdown().await;
     }
 }

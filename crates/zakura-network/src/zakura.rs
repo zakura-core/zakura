@@ -1,15 +1,15 @@
 //! Zakura P2P dependency, identity, handshake, and protocol-handler scaffolding.
 //!
-//! This module reserves the iroh dependency, privacy-preserving endpoint posture,
-//! persistent identity storage surface, and bounded Zakura handshake wire types.
+//! This module holds the privacy-preserving endpoint posture, persistent
+//! identity storage surface, and bounded Zakura handshake wire types. The QUIC
+//! transport lives in `zakura-quic`.
 
 use std::time::Duration;
 
-use iroh::{endpoint, Endpoint, RelayMode};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
-use zakura_quic::{NodeAddr, NodeId, NodeSecretKey};
+use zakura_quic::{NodeAddr, NodeId};
 
 use crate::{
     meta_addr::{MetaAddr, MetaAddrChange},
@@ -24,7 +24,6 @@ mod handler;
 mod handshake;
 mod header_sync;
 mod ip;
-mod iroh_compat;
 mod legacy_gossip;
 mod regulation;
 #[cfg(any(test, feature = "zakura-testkit"))]
@@ -44,7 +43,7 @@ pub use trace::{
     commit_state_trace, peer_label as zakura_trace_peer_label,
     reject_reason_label as zakura_trace_reject_reason_label, ZakuraTrace, ZakuraTraceEvent,
     BLOCK_SYNC_TABLE, COMMIT_STATE_TABLE, CONN_TABLE, HANDSHAKE_TABLE, HEADER_SYNC_TABLE,
-    LEGACY_REQUEST_TABLE, QUEUE_SEND_TABLE, RATELIMIT_TABLE, STREAM_TABLE,
+    LEGACY_REQUEST_TABLE, QUEUE_SEND_TABLE, QUIC_CONN_TABLE, RATELIMIT_TABLE, STREAM_TABLE,
 };
 pub use transport::*;
 
@@ -56,9 +55,6 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc,
 };
-
-/// The pinned iroh version the Zakura P2P plan was verified against.
-pub const IROH_VERSION: &str = "0.92.0";
 
 /// Capability bit for the legacy gossip compatibility service.
 pub const ZAKURA_CAP_LEGACY_GOSSIP: u64 = 1 << 0;
@@ -201,17 +197,6 @@ const ZAKURA_LIVENESS_APPEAR_TIMEOUT: Duration = Duration::from_secs(15);
 /// so the `Responded` liveness never ages into a reconnection candidate while
 /// the Zakura connection is alive.
 const ZAKURA_LIVENESS_REFRESH_INTERVAL: Duration = Duration::from_secs(45);
-
-/// Returns an iroh endpoint builder with relays and external address lookup disabled.
-///
-/// Callers must add explicit direct bind addresses before binding.
-pub fn direct_endpoint_builder(secret_key: NodeSecretKey) -> endpoint::Builder {
-    Endpoint::builder(endpoint::presets::Minimal)
-        .relay_mode(RelayMode::Disabled)
-        .clear_address_lookup()
-        .clear_ip_transports()
-        .secret_key(iroh_compat::to_iroh_secret(&secret_key))
-}
 
 /// The result of routing a mutually P2P-v2-capable legacy handshake.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -526,52 +511,8 @@ async fn run_legacy_liveness_keeper(
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        error::Error,
-        net::{Ipv4Addr, SocketAddrV4},
-    };
-
-    use iroh::{
-        endpoint::Connection,
-        protocol::{AcceptError, ProtocolHandler, Router},
-    };
-
     use super::*;
     use crate::{CacheDir, Config};
-
-    #[derive(Debug, Clone)]
-    struct SmokeProtocolHandler;
-
-    impl ProtocolHandler for SmokeProtocolHandler {
-        async fn accept(&self, _connection: Connection) -> Result<(), AcceptError> {
-            Ok(())
-        }
-    }
-
-    #[tokio::test]
-    async fn iroh_endpoint_starts_without_relay_or_discovery() -> Result<(), Box<dyn Error>> {
-        let secret_key = NodeSecretKey::from_bytes(&[7; 32]);
-
-        let endpoint = direct_endpoint_builder(secret_key)
-            .bind_addr(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))?
-            .bind()
-            .await?;
-
-        let router = Router::builder(endpoint)
-            .accept(b"/zakura/smoke/0", SmokeProtocolHandler)
-            .spawn();
-
-        let addr = router.endpoint().addr();
-
-        assert_eq!(addr.id, router.endpoint().id());
-        assert!(addr.ip_addrs().next().is_some());
-        assert!(addr.relay_urls().next().is_none());
-        assert!(router.endpoint().address_lookup()?.is_empty());
-
-        router.shutdown().await?;
-
-        Ok(())
-    }
 
     #[test]
     fn zakura_secret_key_path_uses_identity_dir() {

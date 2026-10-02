@@ -1302,6 +1302,12 @@ impl<'de> Deserialize<'de> for Config {
         zakura.block_sync.validate().map_err(|error| {
             de::Error::custom(format!("invalid zakura.block_sync config: {error}"))
         })?;
+        if zakura.nat_traversal {
+            return Err(de::Error::custom(
+                crate::zakura::ZAKURA_NAT_TRAVERSAL_REMOVED,
+            ));
+        }
+        zakura.quic.validate().map_err(de::Error::custom)?;
 
         Ok(Config {
             listen_addr: canonical_socket_addr(listen_addr),

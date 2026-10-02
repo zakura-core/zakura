@@ -1,0 +1,47 @@
+name: Script compatibility
+
+on:
+  pull_request:
+    paths:
+      - crates/zakura-chain/src/transaction/**
+      - crates/zakura-chain/src/transparent/**
+      - crates/zakura-script/**
+      - qa/script-oracle/**
+      - Cargo.lock
+      - .github/workflows/script-oracle.yml
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  CXXFLAGS: -include cstdint
+
+jobs:
+  compatibility:
+    name: Compare with the C++ adapter
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f #v2.0.0
+        with:
+          cache-on-failure: true
+      - uses: ./.github/actions/setup-zakura-build
+      - name: Keep the C++ interpreter out of the node
+        run: |
+          if grep -qx 'name = "libzcash_script"' Cargo.lock; then
+            echo "::error::libzcash_script is back in the node's dependency graph"
+            exit 1
+          fi
+      - name: Run the differential tests
+        working-directory: qa/script-oracle
+        run: cargo test --locked --release

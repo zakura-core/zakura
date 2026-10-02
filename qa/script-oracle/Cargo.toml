@@ -1,0 +1,55 @@
+[package]
+name = "zakura-script-oracle"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "Differential tests of Zakura's Rust script verification against the C++ adapter it replaced"
+
+# This workspace builds the C++ interpreter, so it stays out of the node's dependency graph.
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+arbitrary = "1"
+hex = "0.4"
+libfuzzer-sys = "0.4"
+libzcash_script = { version = "=0.1.0", features = ["test-dependencies"] }
+rand = "0.8"
+ripemd = "0.1"
+secp256k1 = "0.29"
+sha2 = "0.10"
+thiserror = "2"
+zakura-chain = { path = "../../crates/zakura-chain" }
+zakura-script = { path = "../../crates/zakura-script" }
+zcash_primitives = { version = "=2.2.0", package = "zakura-primitives" }
+zcash_script = { version = "=0.4.5", features = ["test-dependencies"] }
+
+[build-dependencies]
+cc = "1"
+
+# Build the baseline C++ like a release build, so uninitialized buffers behave as in production.
+[profile.dev.package.libzcash_script]
+opt-level = 3
+
+[[bin]]
+name = "script"
+path = "fuzz_targets/script.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sigops"
+path = "fuzz_targets/sigops.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "transaction"
+path = "fuzz_targets/transaction.rs"
+test = false
+doc = false
+bench = false

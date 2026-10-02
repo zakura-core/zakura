@@ -99,7 +99,8 @@ fn warn_if_clamped(addr: SocketAddr, buffers: &SocketBuffers) {
             target: "zakura_quic",
             %addr,
             requested = buffers.recv_requested,
-            effective = buffers.recv_effective,
+            granted = granted(buffers.recv_effective),
+            reported = buffers.recv_effective,
             "kernel clamped SO_RCVBUF below the request; raise net.core.rmem_max",
         );
     }
@@ -108,7 +109,8 @@ fn warn_if_clamped(addr: SocketAddr, buffers: &SocketBuffers) {
             target: "zakura_quic",
             %addr,
             requested = buffers.send_requested,
-            effective = buffers.send_effective,
+            granted = granted(buffers.send_effective),
+            reported = buffers.send_effective,
             "kernel clamped SO_SNDBUF below the request; raise net.core.wmem_max",
         );
     }

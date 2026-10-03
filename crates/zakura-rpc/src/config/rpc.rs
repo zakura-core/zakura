@@ -99,16 +99,6 @@ pub struct Config {
     /// address. Clients must present a certificate signed by `client_ca_file`.
     pub indexer_tls: Option<IndexerTlsConfig>,
 
-    /// The number of threads used to process RPC requests and responses.
-    ///
-    /// This field is deprecated and could be removed in a future release.
-    /// We keep it just for backward compatibility but it actually do nothing.
-    /// It was something configurable when the RPC server was based in the jsonrpc-core crate,
-    /// not anymore since we migrated to jsonrpsee.
-    // TODO: Prefix this field name with an underscore so it's clear that it's now unused, and
-    //       use serde(rename) to continue successfully deserializing old configs.
-    pub parallel_cpu_threads: usize,
-
     /// Test-only option that makes Zebra say it is at the chain tip,
     /// no matter what the estimated height or local clock is.
     pub debug_force_finished_sync: bool,
@@ -172,9 +162,6 @@ impl Default for Config {
             // Disable indexer RPCs by default.
             indexer_listen_addr: None,
             indexer_tls: None,
-
-            // Use multiple threads, because we pause requests during getblocktemplate long polling
-            parallel_cpu_threads: 0,
 
             // Debug options are always off by default.
             debug_force_finished_sync: false,

@@ -108,35 +108,19 @@ pub fn config_file_full_path(config_file: PathBuf) -> PathBuf {
 }
 
 /// Returns a `zakurad` config with a random known RPC port.
-///
-/// Set `parallel_cpu_threads` to true to auto-configure based on the number of CPU cores.
-pub fn random_known_rpc_port_config(
-    parallel_cpu_threads: bool,
-    network: &Network,
-) -> Result<ZakuradConfig> {
+pub fn random_known_rpc_port_config(network: &Network) -> Result<ZakuradConfig> {
     // [Note on port conflict](#Note on port conflict)
     let listen_port = random_known_port();
-    rpc_port_config(listen_port, parallel_cpu_threads, network)
+    rpc_port_config(listen_port, network)
 }
 
 /// Returns a `zakurad` config with an OS-assigned RPC port.
-///
-/// Set `parallel_cpu_threads` to true to auto-configure based on the number of CPU cores.
-pub fn os_assigned_rpc_port_config(
-    parallel_cpu_threads: bool,
-    network: &Network,
-) -> Result<ZakuradConfig> {
-    rpc_port_config(0, parallel_cpu_threads, network)
+pub fn os_assigned_rpc_port_config(network: &Network) -> Result<ZakuradConfig> {
+    rpc_port_config(0, network)
 }
 
 /// Returns a `zakurad` config with the provided RPC port.
-///
-/// Set `parallel_cpu_threads` to true to auto-configure based on the number of CPU cores.
-pub fn rpc_port_config(
-    listen_port: u16,
-    parallel_cpu_threads: bool,
-    network: &Network,
-) -> Result<ZakuradConfig> {
+pub fn rpc_port_config(listen_port: u16, network: &Network) -> Result<ZakuradConfig> {
     let listen_ip = "127.0.0.1".parse()?;
     let zakura_rpc_listener = SocketAddr::new(listen_ip, listen_port);
 
@@ -144,13 +128,6 @@ pub fn rpc_port_config(
     // TODO: split this config into another function?
     let mut config = default_test_config(network);
     config.rpc.listen_addr = Some(zakura_rpc_listener);
-    if parallel_cpu_threads {
-        // Auto-configure to the number of CPU cores: most users configure this
-        config.rpc.parallel_cpu_threads = 0;
-    } else {
-        // Default config, users who want to detect port conflicts configure this
-        config.rpc.parallel_cpu_threads = 1;
-    }
     config.rpc.enable_cookie_auth = false;
 
     Ok(config)

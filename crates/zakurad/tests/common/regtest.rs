@@ -47,7 +47,7 @@ pub(crate) async fn submit_blocks_test() -> Result<()> {
         }
         .into(),
     );
-    let mut config = os_assigned_rpc_port_config(false, &net)?;
+    let mut config = os_assigned_rpc_port_config(&net)?;
     config.mempool.debug_enable_at_height = Some(0);
 
     let mut zakurad = testdir()?

@@ -63,7 +63,7 @@ pub(crate) async fn regtest_coinbase() -> eyre::Result<()> {
             ..Default::default()
         });
 
-        let mut config = os_assigned_rpc_port_config(false, &net)?.with(addr_type);
+        let mut config = os_assigned_rpc_port_config(&net)?.with(addr_type);
         config.mempool.debug_enable_at_height = Some(0);
 
         let mut zakurad = testdir()?

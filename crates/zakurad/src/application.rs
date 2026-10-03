@@ -271,10 +271,14 @@ impl Application for ZakuradApp {
 
         // Load config *after* framework components so that we can
         // report an error to the terminal if it occurs (unless used with a command that doesn't need the config).
-        let config = match ZakuradConfig::load(command.config_path()) {
+        let (config, unsupported_rpc_threads) = match ZakuradConfig::load_with_warnings(
+            command.config_path(),
+        ) {
             Ok(config) => config,
             // Ignore errors loading the config for some commands.
-            Err(_e) if command.cmd().should_ignore_load_config_error() => Default::default(),
+            Err(_e) if command.cmd().should_ignore_load_config_error() => {
+                (Default::default(), false)
+            }
             Err(e) => {
                 status_err!(
                     "Zakura could not load the provided configuration file and/or environment variables.\
@@ -484,6 +488,13 @@ impl Application for ZakuradApp {
             tracing_config,
             command.cmd().uses_intro(),
         )?));
+
+        if unsupported_rpc_threads {
+            warn!(
+                "rpc.parallel_cpu_threads is no longer supported and is ignored; \
+                 remove it from your configuration"
+            );
+        }
 
         // Log git metadata and platform info when zakurad starts up
         if is_server {

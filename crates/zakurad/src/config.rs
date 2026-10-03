@@ -117,16 +117,25 @@ impl ZakuradConfig {
     /// - `ZAKURA_NETWORK__NETWORK=Testnet` sets `network.network = "Testnet"`
     /// - `ZAKURA_RPC__LISTEN_ADDR=127.0.0.1:8232` sets `rpc.listen_addr = "127.0.0.1:8232"`
     pub fn load(config_path: Option<PathBuf>) -> Result<Self, config::ConfigError> {
+        Self::load_with_warnings(config_path).map(|(config, _)| config)
+    }
+
+    /// Loads config and reports whether the unsupported RPC thread key was set.
+    ///
+    /// The caller logs the warning after initializing tracing.
+    pub(crate) fn load_with_warnings(
+        config_path: Option<PathBuf>,
+    ) -> Result<(Self, bool), config::ConfigError> {
         Self::load_with_env_prefixes(config_path, &["ZEBRA", "ZAKURA"])
     }
 
     /// Loads configuration using caller-provided environment variable prefixes.
     ///
     /// Prefixes are applied in order, so later prefixes override earlier prefixes.
-    pub(crate) fn load_with_env_prefixes(
+    fn load_with_env_prefixes(
         config_path: Option<PathBuf>,
         env_prefixes: &[&str],
-    ) -> Result<Self, config::ConfigError> {
+    ) -> Result<(Self, bool), config::ConfigError> {
         // 1. Start with an empty `config::Config` builder (no pre-populated values).
         // We merge sources, then deserialize into `ZakuradConfig`, which uses
         // `ZakuradConfig::default()` wherever keys are missing.
@@ -163,9 +172,18 @@ impl ZakuradConfig {
         }
 
         // Build the configuration
-        let config = builder.build()?;
-        // Deserialize into our struct, which will use defaults for any missing fields
-        config.try_deserialize()
+        let mut values = config::Source::collect(&builder.build()?)?;
+        let unsupported_rpc_threads = match values.get_mut("rpc") {
+            Some(config::Value {
+                kind: config::ValueKind::Table(rpc),
+                ..
+            }) => rpc.remove("parallel_cpu_threads").is_some(),
+            _ => false,
+        };
+
+        // Remove only the retired key; all other unknown fields stay errors.
+        let config = config::Value::new(None, values).try_deserialize()?;
+        Ok((config, unsupported_rpc_threads))
     }
 }
 
@@ -206,5 +224,42 @@ impl With<MinerAddressType> for ZakuradConfig {
         );
 
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ZakuradConfig;
+
+    #[test]
+    fn retired_rpc_threads_are_accepted_but_not_serialized() {
+        for source in [
+            "",
+            "[rpc]\nparallel_cpu_threads = 0",
+            "[rpc]\nparallel_cpu_threads = 4",
+        ] {
+            let file = tempfile::NamedTempFile::new().expect("temporary config is created");
+            std::fs::write(file.path(), source).expect("temporary config is writable");
+            let (config, warn) =
+                ZakuradConfig::load_with_env_prefixes(Some(file.path().to_owned()), &[])
+                    .expect("retired RPC setting is accepted");
+            assert_eq!(warn, !source.is_empty());
+            assert_eq!(config.rpc, zakura_rpc::config::rpc::Config::default());
+            let rpc = toml::Value::try_from(&config.rpc).expect("RPC config serializes");
+            assert!(rpc.get("parallel_cpu_threads").is_none());
+        }
+    }
+
+    #[test]
+    fn retired_rpc_threads_do_not_allow_other_unknown_settings() {
+        let file = tempfile::NamedTempFile::new().expect("temporary config is created");
+        std::fs::write(
+            file.path(),
+            "[rpc]\nparallel_cpu_threads = 4\nunknown_setting = true",
+        )
+        .expect("temporary config is writable");
+        let error = ZakuradConfig::load_with_env_prefixes(Some(file.path().to_owned()), &[])
+            .expect_err("other unknown RPC settings remain errors");
+        assert!(error.to_string().contains("unknown_setting"));
     }
 }

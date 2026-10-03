@@ -7305,7 +7305,7 @@ dependencies = [
 
 [[package]]
 name = "zakura"
-version = "1.6.0"
+version = "1.6.1"
 dependencies = [
  "abscissa_core",
  "bytes",
@@ -8043,7 +8043,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-rpc"
-version = "12.0.0"
+version = "13.0.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",

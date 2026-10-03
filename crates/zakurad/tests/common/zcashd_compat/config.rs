@@ -62,9 +62,8 @@ pub fn build_zcashd_compat_config(work_dir: PathBuf) -> Result<ZcashdCompatConfi
     // after importing MINER_PRIV_WIF into zcashd's wallet.
     config.mining.miner_address = Some(MINER_T_ADDR.parse().expect("valid miner address"));
 
-    // Main RPC: no cookie auth, single-threaded for test determinism
+    // Main RPC: no cookie auth.
     config.rpc.listen_addr = Some(zakura_rpc_addr);
-    config.rpc.parallel_cpu_threads = 1;
     config.rpc.enable_cookie_auth = false;
 
     // Enable mempool from genesis so tx-flow tests work immediately

@@ -157,6 +157,17 @@ endpoint_addr = "127.0.0.1:9999"
     assert!(config.network.expose_peer_addresses);
 }
 
+#[test]
+fn config_ignores_retired_rpc_threads_from_env() {
+    let env = EnvGuard::new();
+    env.set_var("ZAKURA_RPC__PARALLEL_CPU_THREADS", "4");
+
+    let config = ZakuradConfig::load(None).expect("retired RPC setting is accepted");
+    assert_eq!(config.rpc, zakura_rpc::config::rpc::Config::default());
+    let rpc = toml::Value::try_from(&config.rpc).expect("RPC config serializes");
+    assert!(rpc.get("parallel_cpu_threads").is_none());
+}
+
 /// The NU6.3 activation height must be configurable from a zakurad config
 /// file. The serde key contains a dot ("NU6.3"), so the TOML key must be
 /// quoted — this pins the exact spelling an operator has to write.

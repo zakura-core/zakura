@@ -1213,7 +1213,7 @@ async fn sync_checkpoints_local() -> Result<()> {
 
     let producer_network = Network::new_regtest(RegtestParameters::default());
     let producer_p2p_addr = format!("127.0.0.1:{}", random_known_port()).parse()?;
-    let mut producer_config = os_assigned_rpc_port_config(false, &producer_network)?;
+    let mut producer_config = os_assigned_rpc_port_config(&producer_network)?;
     producer_config.mempool.debug_enable_at_height = Some(0);
     producer_config.network.listen_addr = producer_p2p_addr;
     producer_config.network.initial_testnet_peers = [].into();
@@ -1679,15 +1679,28 @@ async fn rpc_endpoints() -> Result<()> {
 
 /// Test that the JSON-RPC endpoint responds to a request.
 ///
-/// Set `parallel_cpu_threads` to true to auto-configure based on the number of CPU cores.
+/// Set `unsupported_rpc_threads` to test acceptance of the retired config key.
 #[tracing::instrument]
-async fn rpc_endpoint(parallel_cpu_threads: bool, check_content_types: bool) -> Result<()> {
+async fn rpc_endpoint(unsupported_rpc_threads: bool, check_content_types: bool) -> Result<()> {
     // Write a configuration that has RPC listen_addr set
     // [Note on port conflict](#Note on port conflict)
-    let mut config = os_assigned_rpc_port_config(parallel_cpu_threads, &Mainnet)?;
+    let mut config = os_assigned_rpc_port_config(&Mainnet)?;
 
     let dir = testdir()?.with_config(&mut config)?;
+    if unsupported_rpc_threads {
+        let config_path = dir.path().join("zakura.toml");
+        let source = std::fs::read_to_string(&config_path)?;
+        std::fs::write(
+            config_path,
+            source.replace("[rpc]", "[rpc]\nparallel_cpu_threads = 4"),
+        )?;
+    }
     let mut child = dir.spawn_child(args!["start"])?;
+    if unsupported_rpc_threads {
+        child.expect_stdout_line_matches(
+            "rpc.parallel_cpu_threads is no longer supported and is ignored",
+        )?;
+    }
 
     // Wait until port is open.
     let rpc_address = read_listen_addr_from_logs(&mut child, OPENED_RPC_ENDPOINT_MSG)?;
@@ -1800,7 +1813,7 @@ async fn check_rpc_endpoint_content_types(client: &RpcRequestClient) -> Result<(
 async fn non_blocking_logger() -> Result<()> {
     use std::time::Duration;
 
-    let mut config = common::config::random_known_rpc_port_config(false, &Mainnet)?;
+    let mut config = common::config::random_known_rpc_port_config(&Mainnet)?;
     config.tracing.filter = Some("trace".to_string());
     config.tracing.buffer_limit = 100;
     let rpc_address = config
@@ -2344,9 +2357,7 @@ fn zakura_rpc_conflict() -> Result<()> {
 
     // Write a configuration that has RPC listen_addr set
     // [Note on port conflict](#Note on port conflict)
-    //
-    // This is the required setting to detect port conflicts.
-    let mut config = common::config::random_known_rpc_port_config(false, &Mainnet)?;
+    let mut config = common::config::random_known_rpc_port_config(&Mainnet)?;
 
     let dir1 = testdir()?.with_config(&mut config)?;
     let regex1 = regex::escape(&format!(
@@ -3048,7 +3059,7 @@ async fn rejected_block_does_not_reject_same_hash_block_children() -> Result<()>
         }
         .into(),
     );
-    let mut config = os_assigned_rpc_port_config(false, &network)?;
+    let mut config = os_assigned_rpc_port_config(&network)?;
     config.mempool.debug_enable_at_height = Some(0);
     config.mining.extra_coinbase_data =
         Some(ExtraCoinbaseData::try_from(EXTRA_COINBASE_DATA.to_owned())?);
@@ -3176,7 +3187,7 @@ async fn getrawtransaction_confirmations_include_non_finalized_blocks() -> Resul
         }
         .into(),
     );
-    let mut config = os_assigned_rpc_port_config(false, &network_without_checkpoints)?;
+    let mut config = os_assigned_rpc_port_config(&network_without_checkpoints)?;
     config.mempool.debug_enable_at_height = Some(0);
 
     let mut zakurad = testdir()?
@@ -3211,7 +3222,7 @@ async fn getrawtransaction_confirmations_include_non_finalized_blocks() -> Resul
         checkpoints: Some(checkpoints),
         ..Default::default()
     });
-    let mut config = os_assigned_rpc_port_config(false, &network)?;
+    let mut config = os_assigned_rpc_port_config(&network)?;
     config.mempool.debug_enable_at_height = Some(0);
 
     let mut zakurad = testdir()?
@@ -3290,7 +3301,7 @@ async fn pruned_storage_mode_prunes_during_regtest_sync() -> Result<()> {
     // node will accept on Regtest.
     let tx_retention = min_pruning_retention(&network);
 
-    let mut config = os_assigned_rpc_port_config(false, &network)?;
+    let mut config = os_assigned_rpc_port_config(&network)?;
     config.mempool.debug_enable_at_height = Some(0);
     // Pruning operates on the finalized database, so we need a persistent state.
     config.state.ephemeral = false;
@@ -3395,7 +3406,7 @@ async fn trusted_chain_sync_handles_forks_correctly() -> Result<()> {
         }
         .into(),
     );
-    let mut config = os_assigned_rpc_port_config(false, &net)?;
+    let mut config = os_assigned_rpc_port_config(&net)?;
 
     config.state.ephemeral = false;
     config.rpc.indexer_listen_addr = Some(std::net::SocketAddr::from(([127, 0, 0, 1], 0)));
@@ -3615,7 +3626,7 @@ async fn trusted_chain_sync_handles_forks_correctly() -> Result<()> {
 
     output.assert_failure()?;
 
-    let mut config = os_assigned_rpc_port_config(false, &net)?;
+    let mut config = os_assigned_rpc_port_config(&net)?;
     config.state.ephemeral = false;
     config.rpc.indexer_listen_addr = Some(std::net::SocketAddr::from(([127, 0, 0, 1], 0)));
     let test_dir = testdir()?.with_config(&mut config)?;
@@ -4157,7 +4168,7 @@ async fn invalidate_and_reconsider_block() -> Result<()> {
         }
         .into(),
     );
-    let mut config = os_assigned_rpc_port_config(false, &net)?;
+    let mut config = os_assigned_rpc_port_config(&net)?;
     config.state.ephemeral = false;
     config.mempool.debug_enable_at_height = Some(0);
 
@@ -4256,7 +4267,7 @@ async fn restores_non_finalized_state_and_commits_new_blocks() -> Result<()> {
 
     let network = Network::new_regtest(Default::default());
 
-    let mut config = os_assigned_rpc_port_config(false, &network)?;
+    let mut config = os_assigned_rpc_port_config(&network)?;
     config.state.ephemeral = false;
     config.state.debug_skip_non_finalized_state_backup_task = true;
     config.mempool.debug_enable_at_height = Some(0);
@@ -4355,7 +4366,7 @@ async fn restores_non_finalized_state_and_commits_new_blocks() -> Result<()> {
         checkpoints: Some(configured_checkpoints),
         ..Default::default()
     });
-    let mut config = os_assigned_rpc_port_config(false, &network)?;
+    let mut config = os_assigned_rpc_port_config(&network)?;
     config.state.ephemeral = false;
     config.mempool.debug_enable_at_height = Some(0);
     let mut child = test_dir

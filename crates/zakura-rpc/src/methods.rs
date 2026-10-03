@@ -153,6 +153,8 @@ where
     service.oneshot(request).await.map_misc_error()
 }
 
+mod openrpc;
+
 include!("methods/rpc_openrpc.rs");
 
 /// The access class assigned to an RPC method.
@@ -941,7 +943,7 @@ pub trait Rpc {
 
     /// Returns an OpenRPC schema as a description of this service.
     #[method(name = "rpc.discover")]
-    fn openrpc(&self) -> openrpsee::openrpc::Response;
+    fn openrpc(&self) -> Result<serde_json::Value>;
     /// Returns details about an unspent transaction output.
     ///
     /// zcashd reference: [`gettxout`](https://zcash.github.io/rpc/gettxout.html)
@@ -3944,25 +3946,8 @@ where
         }
     }
 
-    fn openrpc(&self) -> openrpsee::openrpc::Response {
-        let mut generator = openrpsee::openrpc::Generator::new();
-
-        let methods = METHODS
-            .into_iter()
-            .filter(|(name, _)| self.rpc_surface.exposes(name))
-            .map(|(name, method)| method.generate(&mut generator, name))
-            .collect();
-
-        Ok(openrpsee::openrpc::OpenRpc {
-            openrpc: "1.3.2",
-            info: openrpsee::openrpc::Info {
-                title: env!("CARGO_PKG_NAME"),
-                description: env!("CARGO_PKG_DESCRIPTION"),
-                version: env!("CARGO_PKG_VERSION"),
-            },
-            methods,
-            components: generator.into_components(),
-        })
+    fn openrpc(&self) -> Result<serde_json::Value> {
+        Ok(openrpc::render(self.rpc_surface))
     }
     async fn get_tx_out(
         &self,

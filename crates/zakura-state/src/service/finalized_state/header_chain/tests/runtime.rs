@@ -802,8 +802,32 @@ fn reconciled_store_with_finalized_prefix(
 }
 
 #[test]
+fn repair_context_range_is_bounded_by_reclaimable_capacity() {
+    let (mut runtime, _db, _genesis, path) = reconciled_store_with_finalized_prefix(6);
+    // Even an empty store cannot retain a range larger than its aggregate limit.
+    runtime.set_auxiliary_limits_for_test(1, 1);
+    let snapshot = runtime.publisher().snapshot();
+    let owner = zakura_header_chain::BodyWorkAuthority::for_snapshot(&snapshot)
+        .bind(7, NonZeroU64::new(8).unwrap());
+    for index in [3, 4, 5] {
+        let context = runtime
+            .reader()
+            .vct_repair_context(owner, path[index].height)
+            .unwrap()
+            .unwrap();
+        assert!(context.admission_capacity_available);
+        assert_eq!(context.selected_header_count(), 1);
+        assert_eq!(
+            context.target,
+            Frontier::new(path[index].height, path[index].hash)
+        );
+    }
+}
+
+#[test]
 fn repair_context_reconstructs_rejected_input_after_engine_hydration() {
-    let (runtime, db, _genesis, path) = reconciled_store_with_finalized_prefix(5);
+    let (mut runtime, db, _genesis, path) = reconciled_store_with_finalized_prefix(5);
+    runtime.set_auxiliary_limits_for_test(1, 3);
     let target = Frontier::new(path[3].height, path[3].hash);
     let snapshot = runtime.publisher().snapshot();
     let owner = zakura_header_chain::BodyWorkAuthority::for_snapshot(&snapshot)
@@ -880,6 +904,10 @@ fn repair_context_reconstructs_rejected_input_after_engine_hydration() {
         .expect("the recovered selected target still needs repair");
 
     assert_ne!(recovered.episode, before.episode);
+    assert!(
+        recovered.admission_capacity_available,
+        "a full recovered input bucket permits a selected replacement"
+    );
     assert!(recovered.excludes(input));
     assert!(recovered.retains_payload(input));
     assert!(recovered.retains_source(rejected.source));

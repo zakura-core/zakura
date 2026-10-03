@@ -21,7 +21,7 @@ use std::{
     ops::Bound,
     path::PathBuf,
     pin::Pin,
-    sync::{Arc, Mutex, OnceLock},
+    sync::{Arc, Mutex},
     task::{Context, Poll},
     time::{Duration, Instant},
 };
@@ -305,7 +305,7 @@ pub struct ReadStateService {
     /// Used to check for panics when writing blocks.
     block_write_task: Option<Arc<std::thread::JoinHandle<write::BlockWriteTaskExit>>>,
     /// Shared fail-closed attachment result, visible to every clone without joining the worker.
-    block_write_failure: Arc<OnceLock<write::BlockWriteTaskFailure>>,
+    block_write_failure: Arc<write::BlockWriteFailure>,
 
     /// Note commitment frontiers this service has derived and root-checked for heights in a
     /// verified-commitment-trees fast-synced database's absent band.
@@ -1560,6 +1560,16 @@ impl StateService {
 }
 
 impl ReadStateService {
+    /// Return the retained terminal writer failure, including during daemon shutdown.
+    pub fn writer_failure(&self) -> Option<BoxError> {
+        self.block_write_failure.get().cloned().map(Into::into)
+    }
+
+    /// Wait for an unrecoverable writer failure, including failures published before this call.
+    pub async fn wait_for_writer_failure(&self) -> BoxError {
+        self.block_write_failure.wait().await.into()
+    }
+
     /// Creates a new read-only state service, using the provided finalized state and
     /// block write task handle.
     ///
@@ -1568,7 +1578,7 @@ impl ReadStateService {
     fn new(
         finalized_state: &FinalizedState,
         block_write_task: Option<Arc<std::thread::JoinHandle<write::BlockWriteTaskExit>>>,
-        block_write_failure: Arc<OnceLock<write::BlockWriteTaskFailure>>,
+        block_write_failure: Arc<write::BlockWriteFailure>,
         non_finalized_state_receiver: WatchReceiver<NonFinalizedState>,
         vct_root_repair_receiver: tokio::sync::watch::Receiver<VctRootRepairStatus>,
         header_chain: HeaderChainSubscriptions,
@@ -3891,7 +3901,7 @@ pub fn init_read_only(
         ReadStateService::new(
             &finalized_state,
             None,
-            Arc::new(OnceLock::new()),
+            Arc::new(crate::service::write::BlockWriteFailure::default()),
             WatchReceiver::new(non_finalized_state_receiver),
             vct_root_repair_receiver,
             HeaderChainSubscriptions {

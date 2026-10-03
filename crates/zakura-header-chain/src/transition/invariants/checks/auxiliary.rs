@@ -39,17 +39,19 @@ pub(crate) fn verify_aux<G: HeaderGraphView>(
         })
         .collect();
     for (header_hash, delivery_id) in &deletes {
-        let exists = engine_before_commit
+        let existing = engine_before_commit
             .aux_deliveries(*header_hash)
             .iter()
-            .any(|delivery| delivery.delivery_id == *delivery_id);
-        if !exists {
+            .find(|delivery| delivery.delivery_id == *delivery_id);
+        if existing.is_none_or(|delivery| {
+            graph.view_header_node(*header_hash).is_some() && delivery.is_authenticated()
+        }) {
             return Err(InvariantViolation::Auxiliary(*header_hash));
         }
     }
     let deleted_ids: HashSet<_> = deletes
-        .into_iter()
-        .map(|(_, delivery_id)| delivery_id)
+        .iter()
+        .map(|(_, delivery_id)| *delivery_id)
         .collect();
     let puts: HashMap<_, _> = plan
         .change_set
@@ -70,6 +72,38 @@ pub(crate) fn verify_aux<G: HeaderGraphView>(
         );
     if projected_aux_count > plan.limits.max_aux_deliveries_total.get() {
         return Err(InvariantViolation::Limits);
+    }
+    // Aggregate eviction never removes the next commit's input. Deleting retained input on the
+    // finalized header or its two selected successors is legal only when a full bucket admits
+    // a replacement in the same plan.
+    let frontiers = plan.change_set.metadata.frontiers;
+    for (header_hash, delivery_id) in deletes
+        .iter()
+        .filter(|(header_hash, _)| graph.view_header_node(*header_hash).is_some())
+    {
+        let node = graph
+            .view_header_node(*header_hash)
+            .ok_or(InvariantViolation::Auxiliary(*header_hash))?;
+        let in_commit_window = node.height.0.saturating_sub(frontiers.finalized.height.0) < 3
+            && node.height >= frontiers.finalized.height
+            && node.height <= frontiers.header_best.height
+            && graph
+                .view_header_ancestor(frontiers.header_best.hash, node.height)
+                .map_err(|_| InvariantViolation::Limits)?
+                .is_some_and(|frontier| frontier.hash == *header_hash);
+        let needs_roots = engine_before_commit
+            .aux_delivery(*delivery_id)
+            .is_some_and(|delivery| delivery.tree_aux.is_some() && !delivery.is_rejected());
+        let replaced = puts.values().any(|delivery| {
+            delivery.header_hash == *header_hash
+                && (!needs_roots || delivery.tree_aux.is_some())
+                && engine_before_commit
+                    .aux_delivery(delivery.delivery_id)
+                    .is_none()
+        });
+        if in_commit_window && !replaced {
+            return Err(InvariantViolation::Auxiliary(*header_hash));
+        }
     }
     let mut nodes: Vec<&HeaderNode> = match mode {
         #[cfg(any(test, feature = "fuzz-impl"))]
@@ -180,6 +214,62 @@ mod tests {
             verify_aux(&fixture.engine, &graph, plan, VerificationMode::Production),
             verify_aux(&fixture.engine, &graph, plan, VerificationMode::Exhaustive),
         ]
+    }
+
+    #[test]
+    fn commit_window_input_is_deleted_only_for_a_replacement() {
+        let base = fixture(EngineMode::Integrated);
+        let row = delivery(
+            &base.engine,
+            base.child.hash,
+            EvidenceId::from_digest([0x7a; 32]),
+        );
+        let mut graph = base.engine.graph().clone();
+        graph
+            .record_auxiliary_evidence_delivery(base.child.hash, row.delivery_id)
+            .unwrap();
+        let engine = HeaderChainEngine::from_audited_state(
+            graph,
+            base.engine.metadata().clone(),
+            vec![base.anchor, base.child],
+            vec![base.anchor],
+            [row],
+        )
+        .unwrap();
+        let fixture = super::super::super::test_support::Fixture {
+            engine,
+            anchor: base.anchor,
+            child: base.child,
+        };
+        let delete = AuxDelta::Delete {
+            header_hash: fixture.child.hash,
+            delivery_id: row.delivery_id,
+        };
+
+        // Aggregate eviction may not remove the selected successor's input.
+        let mut overlay = GraphOverlay::new(fixture.engine.graph());
+        overlay
+            .remove_auxiliary_evidence_delivery(fixture.child.hash, row.delivery_id)
+            .unwrap();
+        let mut plan = candidate_with_delta(&fixture.engine, overlay.delta());
+        plan.change_set.aux_changes = vec![delete.clone()];
+        assert_eq!(
+            verify_in_both_modes(&fixture, &plan),
+            [Err(InvariantViolation::Auxiliary(fixture.child.hash)); 2]
+        );
+
+        // A full bucket may replace it with new input.
+        let replacement = delivery(
+            &fixture.engine,
+            fixture.child.hash,
+            EvidenceId::from_digest([0x7b; 32]),
+        );
+        overlay
+            .record_auxiliary_evidence_delivery(fixture.child.hash, replacement.delivery_id)
+            .unwrap();
+        let mut plan = candidate_with_delta(&fixture.engine, overlay.delta());
+        plan.change_set.aux_changes = vec![delete, AuxDelta::Put(Box::new(replacement))];
+        assert_eq!(verify_in_both_modes(&fixture, &plan), [Ok(()); 2]);
     }
 
     #[test]

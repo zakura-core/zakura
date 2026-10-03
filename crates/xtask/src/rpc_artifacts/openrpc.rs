@@ -18,9 +18,8 @@ pub(super) fn generate(source: &Path, output_dir: &Path) -> Result<(), BoxError>
         })
         .ok_or("RPC methods source must contain the Rpc trait")?;
     let mut output = String::from(
-        "/// Lookup table for JSON-RPC methods.\n\
-         #[allow(unused_qualifications)]\n\
-         pub(crate) static METHODS: ::phf::Map<&str, openrpc::RpcMethod> = ::phf::phf_map! {\n",
+        "/// JSON-RPC methods in declaration order.\n\
+         pub(crate) static METHODS: &[(&str, openrpc::RpcMethod)] = &[\n",
     );
 
     for item in &rpc.items {
@@ -60,7 +59,7 @@ pub(super) fn generate(source: &Path, output_dir: &Path) -> Result<(), BoxError>
             }
         }
 
-        writeln!(output, "{name:?} => openrpc::RpcMethod {{")?;
+        writeln!(output, "({name:?}, openrpc::RpcMethod {{")?;
         writeln!(output, "    description: {description:?},")?;
         writeln!(output, "    params: |_g| vec![")?;
         for input in &method.sig.inputs {
@@ -103,10 +102,10 @@ pub(super) fn generate(source: &Path, output_dir: &Path) -> Result<(), BoxError>
             .iter()
             .any(|attr| attr.path().is_ident("deprecated"));
         writeln!(output, "    deprecated: {deprecated},")?;
-        writeln!(output, "}},")?;
+        writeln!(output, "}}),")?;
     }
 
-    output.push_str("};");
+    output.push_str("];");
     fs::write(output_dir.join("rpc_openrpc.rs"), output)?;
     Ok(())
 }

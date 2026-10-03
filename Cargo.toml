@@ -114,7 +114,6 @@ metrics-exporter-prometheus = { version = "0.16", default-features = false }
 nix = "0.31"
 once_cell = "1.21"
 owo-colors = "4.2.0"
-phf = "0.12"
 pin-project = "1.1.10"
 primitive-types = "0.12"
 proptest = "1.6"

@@ -40,7 +40,7 @@ fn classified_module() -> RpcModule<()> {
 #[test]
 fn access_policy_matches_the_openrpc_method_set() {
     let classified: BTreeSet<_> = RPC_METHOD_ACCESS.iter().map(|(name, _)| *name).collect();
-    let documented: BTreeSet<_> = METHODS.keys().copied().collect();
+    let documented: BTreeSet<_> = METHODS.iter().map(|(name, _)| *name).collect();
 
     assert_eq!(
         classified.len(),

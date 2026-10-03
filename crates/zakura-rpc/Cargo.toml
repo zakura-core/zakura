@@ -92,7 +92,6 @@ serde = { workspace = true, features = ["serde_derive"] }
 nix = { workspace = true, features = ["signal"] }
 
 # For openrpc
-phf = { workspace = true, features = ["macros"] }
 schemars = { workspace = true }
 
 orchard = { workspace = true }

@@ -72,3 +72,15 @@ These are warm storage measurements, excluding cryptographic verification.
 Admission includes committing the eviction and inserting the newcomer; heap
 and indexed selection timings cover victim planning only. Machine-dependent
 latencies are evidence for this change, not fixed performance requirements.
+
+With ancestor-inclusive admission pricing, the same machine produced these
+warm timings for a child with two protected ancestors (microseconds, rounded):
+
+| Pool entries | Rejected child | Admitted child |
+| ---: | ---: | ---: |
+| 1,000 | 0.55 | 3.14 |
+| 8,000 | 0.56 | 3.09 |
+
+These cases include policy checks and, on success, victim removal, cache
+updates, and insertion. Their similar timings at both sizes exercise the
+bounded ancestor calculation and indexed selection without a full-pool scan.

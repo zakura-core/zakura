@@ -59,6 +59,14 @@ slot lets a reconnect authenticate while its incumbent is still present. Raw per
 selects the default of 16, giving 17 transport slots per source. Ports do not create new sources,
 IPv4-mapped aliases share their IPv4 count, and distinct IPv6 addresses remain distinct sources.
 
+Control handshakes have a separate global budget `H` with the same inbound share formula.
+The default allows 28 inbound control handshakes out of 32 total. Inbound acquires both budgets
+only for the control exchange. Outbound can use all free global handshake slots. Raw handshake
+zero still selects one effective shared slot. A single source's default 17 transport slots cannot
+fill the 28 inbound control slots. With custom settings, other-source inbound progress requires
+the per-source transport allowance to be smaller than both inbound shares. There is no such
+guarantee for one shared slot or for a source allowed to fill either share.
+
 These limits protect outbound capacity from inbound work. They do not prioritize one outbound
 purpose over another. Discovery still uses the smaller of its available connection target and
 available concurrent dial count. Its default headroom of four is a soft target based on registered

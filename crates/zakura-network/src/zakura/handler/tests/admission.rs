@@ -59,11 +59,21 @@ async fn configured_node(
     per_ip: usize,
     handshakes: usize,
 ) -> Result<(tempfile::TempDir, ZakuraEndpoint, ZakuraLocalLimits), BoxError> {
+    configured_node_with_nat(total, per_ip, handshakes, false).await
+}
+
+async fn configured_node_with_nat(
+    total: usize,
+    per_ip: usize,
+    handshakes: usize,
+    nat: bool,
+) -> Result<(tempfile::TempDir, ZakuraEndpoint, ZakuraLocalLimits), BoxError> {
     let identity = tempfile::tempdir()?;
     let mut config = Config::for_test(P2pStack::Dual);
     config.identity_dir = identity.path().to_owned();
     config.zakura.bootstrap_peers.clear();
     config.zakura.listen_addr = None;
+    config.zakura.nat_traversal = nat;
     config.zakura.max_connections = total;
     config.zakura.max_connections_per_ip = per_ip;
     config.zakura.max_pending_handshakes = handshakes;
@@ -413,5 +423,185 @@ async fn duplicate_reconnect_cleans_blackholed_incumbent() -> Result<(), BoxErro
     timeout(WAIT, replacement.close()).await?;
     timeout(WAIT, incumbent.close()).await?;
     timeout(WAIT, node.shutdown()).await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn inbound_control_stalls_preserve_outbound_and_release_both_permits() -> Result<(), BoxError>
+{
+    let _guard = zakura_test::init();
+    let (_identity, node, limits) = configured_node(8, 4, 4).await?;
+    let client = native_client(985_000, false, &limits).await?;
+    let stalled = timeout(WAIT, client.connect(address_for(&node, false), P2P_V2_ALPN)).await??;
+    // Independent identities make separate QUIC connections, not reused dials.
+    let second = native_client(985_001, false, &limits).await?;
+    let third = native_client(985_002, true, &limits).await?;
+    let two = timeout(WAIT, second.connect(address_for(&node, false), P2P_V2_ALPN)).await??;
+    let three = timeout(WAIT, third.connect(address_for(&node, true), P2P_V2_ALPN)).await??;
+    wait_permits(&node.handler.incoming_handshakes, 0).await;
+    assert_eq!(node.handler.pending_handshakes.available_permits(), 1);
+    let denied = native_client(985_003, true, &limits).await?;
+    let excess = timeout(WAIT, denied.connect(address_for(&node, true), P2P_V2_ALPN)).await??;
+    timeout(WAIT, excess.closed()).await?;
+    assert_eq!(node.handler.pending_handshakes.available_permits(), 1);
+    let peer = ZakuraTestNode::builder(985_004).spawn().await?;
+    let dial = node.spawn_native_dial(peer.node_addr().await);
+    wait_peers(&node, 1).await?;
+    assert_eq!(node.handler.pending_handshakes.available_permits(), 1);
+    stalled.close(0u32.into(), b"retry after capacity returns");
+    drop(stalled);
+    wait_permits(&node.handler.incoming_handshakes, 1).await;
+    drop(excess);
+    let retry = timeout(WAIT, denied.connect(address_for(&node, true), P2P_V2_ALPN)).await??;
+    complete_control(&denied, &retry, &node, &limits).await?;
+    wait_peers(&node, 2).await?;
+    dial.abort();
+    drop((two, three, retry));
+    for endpoint in [client, second, third, denied] {
+        timeout(WAIT, endpoint.close()).await?;
+    }
+    timeout(WAIT, peer.shutdown()).await?;
+    timeout(WAIT, node.shutdown()).await?;
+    assert_eq!(node.handler.pending_handshakes.available_permits(), 4);
+    assert_eq!(node.handler.incoming_handshakes.available_permits(), 3);
+    assert_eq!(node.handler.incoming_transport.snapshot(), (7, 0, 0, 0));
+    Ok(())
+}
+
+#[derive(Debug)]
+struct HoldControl(mpsc::Sender<Connection>);
+
+impl ProtocolHandler for HoldControl {
+    async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
+        self.0
+            .send(connection.clone())
+            .await
+            .map_err(AcceptError::from_err)?;
+        connection.closed().await;
+        Ok(())
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn outbound_handshakes_borrow_the_entire_global_budget() -> Result<(), BoxError> {
+    let _guard = zakura_test::init();
+    let (_identity, node, limits) = configured_node(8, 4, 2).await?;
+    let mut routers = Vec::new();
+    let mut dials = Vec::new();
+    let mut connections = Vec::new();
+    for seed in 985_010..985_012 {
+        let server = native_client(seed, false, &limits).await?;
+        let (tx, mut rx) = mpsc::channel(1);
+        let router = Router::builder(server)
+            .accept(P2P_V2_ALPN, HoldControl(tx))
+            .spawn();
+        dials.push(node.spawn_native_dial(router.endpoint().addr()));
+        connections.push(
+            timeout(WAIT, rx.recv())
+                .await?
+                .ok_or("missing outbound connection")?,
+        );
+        routers.push(router);
+    }
+    wait_permits(&node.handler.pending_handshakes, 0).await;
+    assert_eq!(node.handler.incoming_handshakes.available_permits(), 1);
+    let client = native_client(985_013, true, &limits).await?;
+    let rejected = timeout(WAIT, client.connect(address_for(&node, true), P2P_V2_ALPN)).await??;
+    timeout(WAIT, rejected.closed()).await?;
+    // The failed global acquisition must return the inbound permit.
+    assert_eq!(node.handler.incoming_handshakes.available_permits(), 1);
+    for dial in dials {
+        dial.abort();
+        let _ = dial.await;
+    }
+    for connection in &connections {
+        connection.close(0u32.into(), b"done");
+    }
+    drop((connections, rejected));
+    wait_permits(&node.handler.pending_handshakes, 2).await;
+    timeout(WAIT, client.close()).await?;
+    for router in routers {
+        timeout(WAIT, router.shutdown()).await??;
+    }
+    timeout(WAIT, node.shutdown()).await?;
+    assert_eq!(node.handler.transport_admission.available_permits(), 8);
+    assert_eq!(node.handler.incoming_transport.snapshot(), (7, 0, 0, 0));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retry_dual_stack_nat_toggle_smoke() -> Result<(), BoxError> {
+    let _guard = zakura_test::init();
+    for nat in [false, true] {
+        let (_identity, node, limits) = configured_node_with_nat(4, 1, 4, nat).await?;
+        for ipv6 in [false, true] {
+            let client = native_client(985_020, ipv6, &limits).await?;
+            for _ in 0..25 {
+                let connection =
+                    timeout(WAIT, client.connect(address_for(&node, ipv6), P2P_V2_ALPN)).await??;
+                complete_control(&client, &connection, &node, &limits).await?;
+                wait_peers(&node, 1).await?;
+                connection.close(0u32.into(), b"smoke complete");
+                drop(connection);
+                wait_peers(&node, 0).await?;
+                wait_permits(&node.handler.transport_admission, 4).await;
+                assert_eq!(node.handler.pending_handshakes.available_permits(), 4);
+                assert_eq!(node.handler.incoming_handshakes.available_permits(), 3);
+                assert_eq!(node.handler.incoming_transport.snapshot(), (3, 0, 0, 0));
+            }
+            timeout(WAIT, client.close()).await?;
+        }
+        timeout(WAIT, node.shutdown()).await?;
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn discovery_dials_with_registered_inbound_share_full() -> Result<(), BoxError> {
+    let _guard = zakura_test::init();
+    // Six outbound slots, with the normal discovery headroom of four.
+    let mut limits = ZakuraLocalLimits::from_config(&Config::default());
+    limits.max_connections = 48;
+    let owner = ZakuraTestNode::builder(986_000)
+        .limits(limits.clone())
+        .max_connections_per_ip(48)
+        .spawn()
+        .await?;
+    let node = owner.endpoint();
+    let mut clients = Vec::new();
+    let mut connections = Vec::new();
+    for seed in 986_001..986_043 {
+        let client = native_client(seed, false, &limits).await?;
+        let connection =
+            timeout(WAIT, client.connect(owner.node_addr().await, P2P_V2_ALPN)).await??;
+        complete_control(&client, &connection, &node, &limits).await?;
+        clients.push(client);
+        connections.push(connection);
+    }
+    wait_peers(&node, 42).await?;
+    assert_eq!(node.handler.incoming_transport.snapshot(), (0, 1, 42, 0));
+    assert_eq!(node.handler.transport_admission.available_permits(), 6);
+    let remote = ZakuraTestNode::builder(986_050).spawn().await?;
+    owner.insert_static_discovery_candidate(&remote).await?;
+    let mut registrations = node.supervisor.registration_tx.subscribe();
+    let discovery = owner.spawn_discovery_dialer();
+    let event = timeout(WAIT, registrations.recv()).await??;
+    assert_eq!(
+        event.peer_id.as_bytes(),
+        remote.node_addr().await.id.as_bytes()
+    );
+    assert!(node.handler.transport_admission.available_permits() >= 4);
+    discovery.abort();
+    let _ = discovery.await;
+    drop(connections);
+    timeout(
+        WAIT,
+        futures::future::join_all(clients.iter().map(Endpoint::close)),
+    )
+    .await?;
+    timeout(WAIT, remote.shutdown()).await?;
+    timeout(WAIT, owner.shutdown()).await?;
+    assert_eq!(node.handler.transport_admission.available_permits(), 48);
+    assert_eq!(node.handler.incoming_transport.snapshot(), (42, 0, 0, 0));
     Ok(())
 }

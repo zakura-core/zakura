@@ -166,6 +166,13 @@ mod tests {
             config.max_connections_per_ip(),
         );
         assert_eq!(budget.0.per_source, 17);
+        assert!(budget.0.per_source < inbound_capacity(32));
+        let mut config = crate::Config::for_test(crate::P2pStack::Dual);
+        config.zakura.max_connections = 0;
+        config.zakura.max_pending_handshakes = 0;
+        let limits = crate::zakura::ZakuraLocalLimits::from_config(&config);
+        assert_eq!(limits.max_connections, 1);
+        assert_eq!(limits.max_pending_handshakes, 1);
         let saturated = IncomingTransportBudget::new(Arc::new(Semaphore::new(4)), 4, usize::MAX);
         assert_eq!(saturated.0.per_source, 3);
     }

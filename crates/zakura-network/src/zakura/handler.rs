@@ -312,6 +312,9 @@ pub struct ZakuraConfig {
     /// the primary eclipse-resistance controls.
     pub max_connections_per_ip: usize,
     /// Connections concurrently running the control handshake.
+    ///
+    /// Incoming handshakes use the same inbound share formula as connections.
+    /// Outbound handshakes may use any free global slot.
     pub max_pending_handshakes: usize,
     /// New streams per second admitted per connection after a valid prelude.
     pub stream_open_rate_per_second: u32,
@@ -2059,6 +2062,7 @@ pub struct ZakuraProtocolHandler {
     transport_admission: Arc<Semaphore>,
     incoming_transport: IncomingTransportBudget,
     pending_handshakes: Arc<Semaphore>,
+    incoming_handshakes: Arc<Semaphore>,
     shutdown: CancellationToken,
     // Bound endpoint supplies the local identity for connection collision handling.
     endpoint: Option<Endpoint>,
@@ -2184,6 +2188,9 @@ impl ZakuraProtocolHandler {
             transport_admission,
             incoming_transport,
             pending_handshakes: Arc::new(Semaphore::new(limits.max_pending_handshakes)),
+            incoming_handshakes: Arc::new(Semaphore::new(admission::inbound_capacity(
+                limits.max_pending_handshakes,
+            ))),
             shutdown: CancellationToken::new(),
             limits,
             endpoint: None,
@@ -2340,7 +2347,18 @@ impl ZakuraProtocolHandler {
         remote_peer_id: &ZakuraPeerId,
         conn: &ZakuraConnTrace,
     ) -> Result<NativeHandshakeNegotiated, ZakuraHandlerError> {
-        let Ok(_handshake) = self.pending_handshakes.clone().try_acquire_owned() else {
+        // Inbound takes its share first. Both permits end with the control exchange.
+        let permits = self
+            .incoming_handshakes
+            .clone()
+            .try_acquire_owned()
+            .and_then(|incoming| {
+                self.pending_handshakes
+                    .clone()
+                    .try_acquire_owned()
+                    .map(|global| (incoming, global))
+            });
+        let Ok(_handshake) = permits else {
             metrics::counter!("zakura.p2p.conn.rejected.pending_handshake").increment(1);
             conn.trace_connection(
                 "rejected.admission",

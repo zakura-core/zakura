@@ -1,4 +1,11 @@
-# NU7 fork testnet parameters.
+# NU7 fork testnet parameters: a TEMPLATE for provisioning a fresh fork.
+#
+# This is not the live network's configuration. The running fork is
+# Nu7StagingV3 (magic 7a6b7539, NU7 at 4,420,652); its facts are in README.md and
+# its exact values in the public manifest. `Nu7Fork` and magic 0x7A6B7537 below
+# are placeholders from the first run: copy this file, and give every new fork
+# its own name and magic before `fork.py up`, so it never shares an identity or a
+# state directory with an earlier one.
 #
 # Read by deploy/nu7-fork/fork.py. Every value here is safe to change between
 # runs: `fork.py up` re-seeds the chain state and re-renders the node config from

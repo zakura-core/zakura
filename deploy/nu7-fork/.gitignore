@@ -1,2 +1,4 @@
 # Rendered per-run by fork.py from fork.toml; the inputs are committed, not the output.
 nodes.generated.toml
+# An operator's copy of the fork.toml template, with real hosts.
+fork.local.toml

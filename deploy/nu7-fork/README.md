@@ -120,12 +120,17 @@ x86_64 host, not a Mac.
 ```sh
 cd deploy/nu7-fork
 
-./fork.py provision            # droplet + a clone of the newest Testnet state snapshot
-$EDITOR fork.toml              # set host.ssh_string to the new droplet
-./fork.py catch-up             # sync the seed to the public Testnet tip
-./fork.py plan                 # what heights would this fork use?
-./fork.py up                   # seed, render, deploy; the primary starts mining
-./fork.py status               # height and NU7 status
+# The committed fork.toml is a template, not the live V3 config.
+cp fork.toml fork.local.toml   # ignored by Git
+$EDITOR fork.local.toml        # a new network_name and network_magic for this fork
+fork="./fork.py --config fork.local.toml"
+
+$fork provision                # droplet + a clone of the newest Testnet state snapshot
+$EDITOR fork.local.toml        # set host.ssh_string to the new droplet
+$fork catch-up                 # sync the seed to the public Testnet tip
+$fork plan                     # what heights would this fork use?
+$fork up                       # seed, render, deploy; the primary starts mining
+$fork status                   # height and NU7 status
 ```
 
 Until NU7 activates, the fork mines about one block per 7.5 minutes.
@@ -489,7 +494,7 @@ sync before advertising a build as join-ready.
 
 | Path | Purpose |
 | --- | --- |
-| `fork.toml` | Every fork parameter, safe to edit between runs |
+| `fork.toml` | Template parameters for a fresh fork, not the live V3 configuration |
 | `fork.py` | Provision, seed, plan, render, deploy, status, reconfigure |
 | `miner/` | Remote mining node health endpoint and its unit |
 | `txload/` | Drives fee-bearing transactions (`zakura-fork-txload`) |

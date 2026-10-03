@@ -33,7 +33,7 @@ use zakura_network::{self as zn, PeerSocketAddr};
 use zakura_state as zs;
 
 use crate::components::{
-    auth_download_height::tip_child_mismatch,
+    auth_download_height::height_is_unbound,
     sync::{
         legacy_trace::{
             LegacyBlockOutcome, LegacyDiagnosticSnapshot, LegacySyncTrace, LegacyTaskState,
@@ -165,19 +165,17 @@ pub enum BlockDownloadVerifyError {
         hash: block::Hash,
     },
 
-    /// A downloaded block claims our best tip as its parent, but its coinbase height is not
-    /// one above the tip height.
+    /// A downloaded body claims a coinbase height that its header does not commit to.
     ///
     /// V5+ coinbase `scriptSig`s are not covered by the mined transaction ID, the transaction
     /// merkle root, or the block hash, so a peer can rewrite the claimed height of an otherwise
-    /// canonical body without changing the requested hash. A tip child's real height is known
-    /// from our own committed tip, so a mismatch is definitively a poisoned body.
+    /// canonical body without changing the requested hash. The body is not the block its header
+    /// names, so only its supplier is at fault. See `crate::components::auth_download_height`.
     #[error(
-        "downloaded tip child claimed height {height:?} instead of {expected_height:?}: {hash:?}"
+        "downloaded block claimed a height its header does not commit to: {height:?} {hash:?}"
     )]
-    TipChildHeightMismatch {
+    UnboundHeight {
         height: block::Height,
-        expected_height: block::Height,
         hash: block::Hash,
         advertiser_addr: Option<PeerSocketAddr>,
     },
@@ -259,7 +257,7 @@ impl BlockDownloadVerifyError {
             Self::AboveLookaheadHeightLimit {
                 advertiser_addr, ..
             }
-            | Self::TipChildHeightMismatch {
+            | Self::UnboundHeight {
                 advertiser_addr, ..
             }
             | Self::InvalidHeight {
@@ -640,6 +638,7 @@ where
                     None,
                 );
 
+                let (rsp, supplier_feedback) = rsp.split_block_feedback();
                 let (block, advertiser_addr) = if let zn::Response::Blocks(blocks) = rsp {
                     // A cooperating peer returns exactly one available block for a
                     // single-hash request. A response with a different count, or a
@@ -693,12 +692,6 @@ where
                 // that will timeout before being verified.
                 let tip_height = latest_chain_tip.best_tip_height();
 
-                // Read separately from `tip_height`, and used only by the new tip-child height
-                // check below. Deriving `tip_height` from this pair instead would couple the
-                // existing lookahead and behind-tip policies to hash availability: a chain tip
-                // reporting a height but not yet a hash would fall into the no-tip regime.
-                let best_tip = latest_chain_tip.best_tip_height_and_hash();
-
                 // The target spacing at the tip scales the lookahead limit.
                 let multiplier =
                     tip_height.map_or(1, |tip_height| lookahead_limit_multiplier(&chain_network, tip_height));
@@ -720,38 +713,37 @@ where
                     })
                     .unwrap_or(block::Height(0));
 
-                let block_height = if let Some(block_height) = block.coinbase_height() {
-                    block_height
-                } else {
-                    debug!(
-                        ?hash,
-                        "synced block with no height: dropped downloaded block"
-                    );
-                    metrics::counter!("sync.no.height.dropped.block.count").increment(1);
-
-                    return Err(BlockDownloadVerifyError::InvalidHeight { hash, advertiser_addr });
+                // A body with no coinbase height cannot be the block this header commits to.
+                // The block identifier comes from the header, so the response still satisfies
+                // the requested hash: only the supplier is implicated, and without excluding it
+                // the same peer stays eligible for this hash on every retry. The advertiser
+                // stays unattributed, because it did not choose the body.
+                let Some(block_height) = block.coinbase_height() else {
+                    if let Some(feedback) = &supplier_feedback { feedback.reject(); }
+                    return Err(BlockDownloadVerifyError::InvalidHeight { hash, advertiser_addr: None });
                 };
 
-                // Security: authenticate the claimed coinbase height against our own tip before
-                // any height-based policy runs below. Otherwise `min_accepted_height` would
-                // discard a height-rewritten body as a benign old block: unattributed,
+                // Security: authenticate the claimed coinbase height before any height policy
+                // below uses it. Otherwise a rewritten height would make those policies drop
+                // the requested hash as a benign old or far-ahead block: unattributed,
                 // unscored, and not requeued. See `crate::components::auth_download_height`.
-                if let Some(expected_height) = tip_child_mismatch(
-                    block.header.previous_block_hash,
-                    block_height,
-                    best_tip,
-                ) {
+                // A block at or below the reset height clears the lookahead pause, so a forged
+                // height there would release backpressure the syncer still needs.
+                let policy_uses_height = block_height > lookahead_pause_height
+                    || block_height < min_accepted_height
+                    || (block_height <= lookahead_reset_height
+                        && past_lookahead_limit_receiver.cloned_watch_data());
+                if height_is_unbound(&block, block_height, policy_uses_height) {
                     debug!(
                         ?hash,
                         ?block_height,
-                        ?expected_height,
-                        "tip child claimed the wrong coinbase height: rejected poisoned block"
+                        "body claimed a height its header does not commit to: rejected poisoned block"
                     );
-                    metrics::counter!("sync.tip.child.height.mismatch.count").increment(1);
+                    metrics::counter!("sync.unbound.height.count").increment(1);
 
-                    return Err(BlockDownloadVerifyError::TipChildHeightMismatch {
+                    if let Some(feedback) = &supplier_feedback { feedback.reject(); }
+                    return Err(BlockDownloadVerifyError::UnboundHeight {
                         height: block_height,
-                        expected_height,
                         hash,
                         advertiser_addr,
                     });

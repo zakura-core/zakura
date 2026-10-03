@@ -30,27 +30,21 @@ use zakura_network::{self as zn, PeerSocketAddr};
 use zakura_state as zs;
 
 use crate::components::{
-    auth_download_height::tip_child_mismatch,
+    auth_download_height::height_is_unbound,
     sync::{lookahead_limit_multiplier, MIN_CONCURRENCY_LIMIT},
 };
 
 type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
-/// A gossiped block claims our best tip as its parent, but its coinbase height is not one
-/// above the tip height.
+/// A gossiped body claims a coinbase height that its header does not commit to.
 ///
-/// V5+ coinbase `scriptSig`s are not covered by the mined transaction ID, the transaction
-/// merkle root, or the block hash, so a peer can rewrite the claimed height of an otherwise
-/// canonical body without changing the advertised hash. A tip child's real height is known
-/// from our own committed tip, so a mismatch is definitively a poisoned body.
-///
-/// This is a distinct type rather than a string error so [`super::Inbound`] can score the
-/// supplying peer for it.
+/// The body is not the block its header names, so only its supplier is at fault. See
+/// `crate::components::auth_download_height`. Inbound uses this typed evidence to score the
+/// supplier and retry the hash.
 #[derive(Copy, Clone, Debug, thiserror::Error)]
-#[error("gossiped tip child claimed height {height:?} instead of {expected_height:?}: {hash:?}")]
-pub struct GossipedTipChildHeightMismatch {
+#[error("gossiped block claimed a height its header does not commit to: {height:?} {hash:?}")]
+pub struct GossipedUnboundHeight {
     pub height: block::Height,
-    pub expected_height: block::Height,
     pub hash: block::Hash,
 }
 
@@ -194,33 +188,8 @@ pub enum DownloadAction {
     FullQueue,
 }
 
-/// Per-hash re-request budgets for gossiped blocks rejected as poisoned, scoped to one tip.
-///
-/// The counts and the tip they belong to are paired here because neither is meaningful alone:
-/// a count only bounds anything while it is read against the tip it was recorded under.
-///
-/// # Lifetime
-///
-/// An exhausted budget is *not* released on exhaustion. Doing so would re-arm it, letting a peer
-/// buy a fresh set of re-requests by poisoning the same hash again. Budgets are released in
-/// exactly two places:
-///
-/// - [`Self::release`], when the block is finally downloaded — the only outcome that means the
-///   budget did its job.
-/// - [`Self::consume`], for *every* hash, on the first call after the tip moves.
-///
-/// The second is what actually bounds the map, because gossip usually is not the path that
-/// resolves the block: exhaustion explicitly leaves it to the syncer, whose downloads never
-/// reach [`Self::release`]. It is sound because this check only ever fires for children of the
-/// current tip, so an entry recorded under an older tip could never be read again.
-///
-/// That is also why a tip change cannot re-arm an exhausted budget: once the tip moves, the
-/// exhausted hash is no longer a tip child and can never produce a mismatch, so its fresh budget
-/// is unreachable. The one exception is a reorg back to the original tip, which costs the
-/// attacker further bannable addresses to exploit.
-///
-/// The clear is lazy — it happens on the next rejection, not when the tip moves — so a node whose
-/// attacker has stopped keeps one tip's worth of entries until the next rejection or process exit.
+/// Bounded per-hash retry budgets. A tip change starts a new recovery epoch.
+/// Exhausted entries remain until that epoch ends so repeated gossip cannot rearm them.
 #[derive(Debug, Default)]
 struct PoisonedRetryBudgets {
     /// Re-requests already spent, keyed by block hash.
@@ -241,6 +210,9 @@ impl PoisonedRetryBudgets {
             self.tip = tip_hash;
         }
 
+        if self.counts.len() >= MAX_INBOUND_CONCURRENCY && !self.counts.contains_key(&hash) {
+            return None;
+        }
         let spent = self.counts.entry(hash).or_default();
 
         if *spent >= POISONED_GOSSIP_BLOCK_RETRY_LIMIT {
@@ -653,9 +625,9 @@ where
                 None => zn::Request::BlocksByHash(request_hashes),
             };
 
-            let (block, advertiser_addr) = if let zn::Response::Blocks(blocks) =
-                network.oneshot(request).await.map_err(|e| (e, None))?
-            {
+            let response = network.oneshot(request).await.map_err(|e| (e, None))?;
+            let (response, supplier_feedback) = response.split_block_feedback();
+            let (block, advertiser_addr) = if let zn::Response::Blocks(blocks) = response {
                 // A peer must answer a single-hash block request with exactly one
                 // block entry. A malformed or empty response is a peer fault (e.g.
                 // a Zakura peer that tore its connection down mid-response), not a
@@ -711,12 +683,6 @@ where
             // that will timeout before being verified, and low blocks that can never be finalized.
             let tip_height = latest_chain_tip.best_tip_height();
 
-            // Read separately from `tip_height`, and used only by the new tip-child height check
-            // below. Deriving `tip_height` from this pair instead would couple the existing
-            // lookahead and behind-tip policies to hash availability: a chain tip reporting a
-            // height but not yet a hash would fall into the no-tip regime.
-            let best_tip = latest_chain_tip.best_tip_height_and_hash();
-
             let max_lookahead_height =
                 max_lookahead_height(&chain_network, tip_height, full_verify_concurrency_limit);
 
@@ -737,19 +703,10 @@ where
 
             let block_height = block
                 .coinbase_height()
-                .ok_or_else(|| {
-                    debug!(
-                        ?hash,
-                        "gossiped block with no height: dropped downloaded block"
-                    );
-                    metrics::counter!("gossip.no.height.dropped.block.count").increment(1);
+                .ok_or_else(|| (BoxError::from("gossiped block with no height"), None))?;
 
-                    BoxError::from("gossiped block with no height")
-                })
-                .map_err(|e| (e, None))?;
-
-            // Security: authenticate the claimed coinbase height against our own tip before the
-            // height policies below run. See `crate::components::auth_download_height`.
+            // Security: authenticate the claimed coinbase height before the height policies
+            // below run. See `crate::components::auth_download_height`.
             //
             // This matters more here than on the syncer path: an `inv` for the new tip normally
             // reaches gossip before the syncer asks for it, and `download_and_verify` drops
@@ -757,26 +714,29 @@ where
             // outstanding. So a single poisoned response can consume the node's only chance at
             // the new block until the next sync round, which is what leaves a mining backend
             // issuing work on an obsolete tip.
-            if let Some(expected_height) =
-                tip_child_mismatch(block.header.previous_block_hash, block_height, best_tip)
-            {
+            //
+            // Gossip carries about one block per target spacing, so this path checks the Merkle
+            // root of every body. That also rejects an in-window rewrite here, where it can be
+            // re-requested, instead of in the verifier, which reports it without a retry.
+            if height_is_unbound(&block, block_height, true) {
                 debug!(
                     ?hash,
                     ?block_height,
-                    ?expected_height,
-                    "gossiped tip child claimed the wrong coinbase height: \
+                    "gossiped body claimed a height its header does not commit to: \
                      dropped downloaded block"
                 );
-                metrics::counter!("gossip.tip.child.height.mismatch.count").increment(1);
+                metrics::counter!("gossip.unbound.height.count").increment(1);
 
-                Err((
-                    BoxError::from(GossipedTipChildHeightMismatch {
+                if let Some(feedback) = &supplier_feedback {
+                    feedback.reject();
+                }
+                return Err((
+                    BoxError::from(GossipedUnboundHeight {
                         height: block_height,
-                        expected_height,
                         hash,
                     }),
                     advertiser_addr,
-                ))?;
+                ));
             }
 
             if block_height > max_lookahead_height {
@@ -860,7 +820,9 @@ mod tests {
     use zakura_chain::{block::Block, parameters::Network, serialization::ZcashDeserializeInto};
     use zakura_network::InventoryResponse::Available;
 
-    use crate::components::auth_download_height::poison_coinbase_height;
+    use crate::components::auth_download_height::{
+        poison_coinbase_height, poison_coinbase_height_and_expiry,
+    };
 
     type PendingNetwork = BoxCloneService<zn::Request, zn::Response, BoxError>;
     type PendingVerifier = BoxCloneService<zakura_consensus::Request, block::Hash, BoxError>;
@@ -1466,16 +1428,43 @@ mod tests {
         );
 
         let mismatch = error
-            .downcast_ref::<GossipedTipChildHeightMismatch>()
+            .downcast_ref::<GossipedUnboundHeight>()
             .expect("the error must be the typed mismatch that Inbound scores");
 
         assert_eq!(mismatch.height, block::Height(1));
-        assert_eq!(mismatch.expected_height, block::Height(1_687_107));
         assert_eq!(mismatch.hash, canonical_hash);
     }
 
-    /// A gossiped block that is not a tip child keeps the existing behind-tip policy, and stays
-    /// unattributed as before.
+    /// The stateless check also covers blocks whose parent is not our tip, including blocks
+    /// whose parent we do not have yet.
+    #[tokio::test]
+    async fn gossiped_non_tip_child_rejects_poisoned_coinbase_height() {
+        let canonical: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1687107_BYTES
+            .zcash_deserialize_into()
+            .unwrap();
+        let addr: PeerSocketAddr = "192.0.2.1:8233".parse().unwrap();
+        for poisoned in [
+            poison_coinbase_height(&canonical, block::Height(1)),
+            poison_coinbase_height(&canonical, block::Height(4_000_000)),
+            poison_coinbase_height_and_expiry(&canonical, block::Height(1)),
+            poison_coinbase_height_and_expiry(&canonical, block::Height(4_000_000)),
+        ] {
+            let height = poisoned.coinbase_height().unwrap();
+            let (_sender, tip) = chain_tip_at(block::Height(1_687_110), hash(42));
+            let mut downloads = downloads_returning(poisoned, addr, tip);
+            assert_eq!(
+                downloads.download_and_verify(canonical.hash(), None),
+                DownloadAction::AddedToQueue
+            );
+            let (error, supplier) = downloads.next().await.unwrap().unwrap_err();
+            let mismatch = error.downcast_ref::<GossipedUnboundHeight>().unwrap();
+            assert_eq!(mismatch.height, height);
+            assert_eq!(supplier, Some(addr));
+        }
+    }
+
+    /// A genuine old gossiped block keeps the existing behind-tip policy, and stays unattributed
+    /// as before.
     #[tokio::test]
     async fn gossiped_non_tip_child_keeps_the_behind_tip_policy() {
         let block1: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
@@ -1504,10 +1493,8 @@ mod tests {
             .expect_err("a block behind the finalized tip is still dropped");
 
         assert!(
-            error
-                .downcast_ref::<GossipedTipChildHeightMismatch>()
-                .is_none(),
-            "a non-tip-child must not be reported as a height mismatch"
+            error.downcast_ref::<GossipedUnboundHeight>().is_none(),
+            "a genuine old block must not be reported as a height mismatch"
         );
         assert_eq!(addr, None, "the behind-tip policy is unchanged");
     }

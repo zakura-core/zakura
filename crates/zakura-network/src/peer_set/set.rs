@@ -234,6 +234,7 @@ where
     ///
     /// Used to route inventory requests to peers that are likely to have it.
     inventory_registry: InventoryRegistry,
+    block_suppliers: crate::block_feedback::BlockSuppliers,
 
     /// Stores requests that should be routed to peers once they are ready.
     queued_broadcast_all: VecDeque<(
@@ -389,6 +390,7 @@ where
             ready_services: HashMap::new(),
             // Request Routing
             inventory_registry: InventoryRegistry::new(inv_stream, config.expose_peer_addresses),
+            block_suppliers: Default::default(),
             queued_broadcast_all: VecDeque::new(),
             block_gossip_peer_ips: block_gossip_peer_ips.into_iter().collect(),
             legacy_peer_trace: LegacyPeerTrace::new(config.zakura.trace_dir.clone()),
@@ -1115,10 +1117,14 @@ where
         req: Request,
         hash: InventoryHash,
     ) -> <Self as tower::Service<Request>>::Future {
+        let supplier_allowed = |addr: &PeerSocketAddr| match hash {
+            InventoryHash::Block(hash) => !self.block_suppliers.rejected(hash, &(*addr).into()),
+            _ => true,
+        };
         let advertising_peer_list = self
             .inventory_registry
             .advertising_peers(hash)
-            .filter(|&addr| self.ready_services.contains_key(addr))
+            .filter(|&addr| self.ready_services.contains_key(addr) && supplier_allowed(addr))
             .copied()
             .collect();
 
@@ -1149,7 +1155,19 @@ where
                 )),
                 _ => None,
             };
+            let feedback = match hash {
+                InventoryHash::Block(hash) => {
+                    Some(self.block_suppliers.feedback(hash, peer.into()))
+                }
+                _ => None,
+            };
             let fut = svc.call(req);
+            let fut = async move {
+                fut.await.map(|response| match feedback {
+                    Some(feedback) => feedback.attach(response),
+                    None => response,
+                })
+            };
             self.push_unready(peer, svc);
             if let Some((request_id, peer, hash, started)) = trace_context {
                 let trace = self.legacy_peer_trace.clone();
@@ -1178,7 +1196,15 @@ where
         let maybe_peer_list = self
             .ready_services
             .keys()
-            .filter(|addr| !missing_peer_list.contains(addr))
+            .filter(|addr| {
+                !missing_peer_list.contains(addr)
+                    && match hash {
+                        InventoryHash::Block(hash) => {
+                            !self.block_suppliers.rejected(hash, &(**addr).into())
+                        }
+                        _ => true,
+                    }
+            })
             .copied()
             .collect();
 
@@ -1202,7 +1228,19 @@ where
                 )),
                 _ => None,
             };
+            let feedback = match hash {
+                InventoryHash::Block(hash) => {
+                    Some(self.block_suppliers.feedback(hash, peer.into()))
+                }
+                _ => None,
+            };
             let fut = svc.call(req);
+            let fut = async move {
+                fut.await.map(|response| match feedback {
+                    Some(feedback) => feedback.attach(response),
+                    None => response,
+                })
+            };
             self.push_unready(peer, svc);
             if let Some((request_id, peer, hash, started)) = trace_context {
                 let trace = self.legacy_peer_trace.clone();

@@ -1512,7 +1512,7 @@ where
                     }
                 }
             }
-            Response::Blocks(blocks) => {
+            Response::Blocks(blocks) | Response::BlocksWithFeedback { blocks, .. } => {
                 // Generate one tx message per block,
                 // then a notfound message with all the missing block hashes.
                 let mut missing_hashes = Vec::new();

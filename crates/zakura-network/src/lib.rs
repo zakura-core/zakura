@@ -159,6 +159,7 @@ pub mod constants;
 
 mod address_book;
 mod address_book_updater;
+mod block_feedback;
 #[cfg(any(test, feature = "proptest-impl"))]
 mod isolated;
 mod meta_addr;
@@ -166,6 +167,7 @@ mod peer;
 mod peer_cache_updater;
 mod peer_registry;
 mod peer_set;
+pub use block_feedback::BlockFeedback;
 mod policies;
 mod protocol;
 pub mod zakura;

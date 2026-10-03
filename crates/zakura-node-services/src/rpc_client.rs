@@ -44,7 +44,7 @@ impl RpcRequestClient {
                 .tls_backend_preconfigured(tls)
                 .timeout(timeout)
                 .build()
-                .expect("reqwest::Client build should not fail when only setting timeout"),
+                .expect("bundled trust roots and the default TLS configuration are valid"),
             rpc_address,
         }
     }

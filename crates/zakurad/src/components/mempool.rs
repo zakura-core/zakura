@@ -201,8 +201,8 @@ fn transaction_cooldown_peer(
         return None;
     };
 
-    // A reset can activate an upgrade or expire a transaction, so a retried
-    // transaction can fail where it was valid when the peer relayed it.
+    // A reset can activate an upgrade, so a retried transaction can fail
+    // where it was valid when the peer relayed it.
     if *retried_after_tip_reset {
         return None;
     }
@@ -224,12 +224,6 @@ fn transaction_cooldown_peer(
     // Below NU5, the verifier does not check branch IDs, so such a transaction
     // can fail with other errors.
     if transaction_network_upgrade.is_some_and(|upgrade| upgrade > tip_upgrade) {
-        return None;
-    }
-
-    // A branch ID mismatch only starts a cooldown when the transaction declares
-    // an earlier upgrade than the tip's.
-    if *error == TransactionError::WrongConsensusBranchId && transaction_network_upgrade.is_none() {
         return None;
     }
 
@@ -348,27 +342,14 @@ fn peer_action(error: &TransactionError) -> PeerAction {
         | SproutJoinSplitsExceedBlockLimit { .. }
         | ShieldedCostExceedsBlockBudget { .. } => BanV5AndLater,
 
-        // These rules depend on the tip's network upgrade. zcashd scores these
-        // failures 10 in its mempool. [`transaction_cooldown_peer`] only
-        // starts a cooldown for a branch ID mismatch when the transaction
-        // declares an earlier upgrade than the tip's.
-        WrongConsensusBranchId | UnsupportedByNetworkUpgrade(..) | DisabledAddToSproutPool => {
-            Cooldown
-        }
+        // Canopy forbids Sprout deposits. Replace the previous ban with a
+        // cooldown because an honest peer can still be before activation.
+        DisabledAddToSproutPool => Cooldown,
 
-        // A peer whose tip is one block behind this node's tip can relay a
-        // transaction that expires at this node's next block. zcashd does not
-        // score that case, and scores older expiries 10.
-        ExpiredTransaction {
-            expiry_height,
-            block_height,
-            ..
-        } => {
-            if block_height.0 > expiry_height.0.saturating_add(1) {
-                Cooldown
-            } else {
-                Ignore
-            }
+        // These failures already received no mempool penalty. Preserve that
+        // policy when peers disagree about the tip or network upgrade.
+        WrongConsensusBranchId | UnsupportedByNetworkUpgrade(..) | ExpiredTransaction { .. } => {
+            Ignore
         }
 
         // Honest peers relay these transactions near the tip. zcashd does not

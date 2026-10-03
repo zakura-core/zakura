@@ -31,8 +31,8 @@ use zs::CheckpointVerifiedBlock;
 use crate::components::{
     mempool::tests::standard_verified_unmined_tx_strategy,
     mempool::{
-        config::Config, downloads::TransactionDownloadVerifyError, transaction_ban_peer, Mempool,
-        MAX_ESTIMATED_DISTANCE_TO_ENABLE,
+        config::Config, downloads::TransactionDownloadVerifyError, transaction_ban_peer,
+        transaction_cooldown_peer, Mempool, MAX_ESTIMATED_DISTANCE_TO_ENABLE,
     },
     sync::{RecentSyncLengths, SyncStatus},
 };
@@ -285,6 +285,32 @@ proptest! {
         let should_ban = (error.mempool_misbehavior_score() != 0 && !is_scored_but_never_bans(&error))
             || is_unscored_but_bans(&error);
         prop_assert_eq!(transaction_ban_peer(&failure), should_ban.then_some(peer), "{:?}", error);
+    }
+
+    /// Cooldowns only replace failures that the previous mempool policy banned.
+    #[test]
+    fn cooldowns_only_replace_previous_bans(error in any::<TransactionError>()) {
+        for transaction_version in [4, 5, 6] {
+            let failure = TransactionDownloadVerifyError::Invalid {
+                error: error.clone(),
+                advertiser_addr: Some(zn::PeerSocketAddr::from(([203, 0, 113, 7], 8233))),
+                tip_height: Some(block::Height(100)),
+                transaction_version,
+                transaction_network_upgrade: None,
+                retried_after_tip_reset: false,
+            };
+
+            if transaction_cooldown_peer(&failure, Some(block::Height(100)), NetworkUpgrade::Nu7).is_some() {
+                prop_assert_ne!(error.mempool_misbehavior_score(), 0, "{:?}", error);
+                // The previous mempool policy exempted these despite their score.
+                prop_assert!(!matches!(error,
+                    TransactionError::WrongConsensusBranchId
+                    | TransactionError::WrongConsensusBranchIdNu6_3GracePeriod
+                    | TransactionError::LockedUntilAfterBlockHeight(_)
+                    | TransactionError::LockedUntilAfterBlockTime(_)
+                ), "{:?}", error);
+            }
+        }
     }
 }
 

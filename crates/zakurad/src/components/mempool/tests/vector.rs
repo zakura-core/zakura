@@ -108,12 +108,16 @@ fn stale_verification_failures_do_not_start_cooldowns() {
 #[test]
 fn context_dependent_failures_do_not_start_cooldowns() {
     for error in [
+        TransactionError::WrongConsensusBranchId,
         TransactionError::WrongConsensusBranchIdNu6_3GracePeriod,
+        TransactionError::UnsupportedByNetworkUpgrade(4, NetworkUpgrade::Nu7),
         TransactionError::LockedUntilAfterBlockHeight(block::Height(101)),
         TransactionError::LockedUntilAfterBlockTime(chrono::Utc::now()),
         TransactionError::TransparentInputNotFound,
         // A peer whose tip is one block behind can relay this transaction.
         expired_transaction(block::Height(100), block::Height(101)),
+        expired_transaction(block::Height(99), block::Height(101)),
+        expired_transaction(block::Height(1), block::Height(101)),
     ] {
         let error = TransactionDownloadVerifyError::Invalid {
             error,
@@ -130,8 +134,8 @@ fn context_dependent_failures_do_not_start_cooldowns() {
     }
 }
 
-/// A chain tip reset can activate an upgrade or expire a pending transaction
-/// that was valid when the peer relayed it.
+/// A chain tip reset can activate an upgrade and invalidate a pending
+/// transaction that was valid when the peer relayed it.
 #[test]
 fn failures_retried_after_a_tip_reset_ban_but_start_no_cooldown() {
     let retried = |error, transaction_version| match relayed_transaction_failure(
@@ -157,14 +161,7 @@ fn failures_retried_after_a_tip_reset_ban_but_start_no_cooldown() {
     };
 
     for (error, transaction_version) in [
-        (
-            TransactionError::UnsupportedByNetworkUpgrade(4, NetworkUpgrade::Nu7),
-            4,
-        ),
-        (
-            expired_transaction(block::Height(99), block::Height(101)),
-            5,
-        ),
+        (TransactionError::DisabledAddToSproutPool, 4),
         (
             TransactionError::Script(zakura_script::Error::ScriptInvalid),
             4,
@@ -331,6 +328,8 @@ fn upgrade_dependent_failures_ban_only_v5_and_later() {
 #[test]
 fn tip_dependent_failures_never_ban() {
     for error in [
+        TransactionError::UnsupportedByNetworkUpgrade(4, NetworkUpgrade::Nu7),
+        expired_transaction(block::Height(99), block::Height(101)),
         TransactionError::WrongConsensusBranchId,
         TransactionError::WrongConsensusBranchIdNu6_3GracePeriod,
         TransactionError::LockedUntilAfterBlockHeight(block::Height(101)),
@@ -348,37 +347,24 @@ fn tip_dependent_failures_never_ban() {
 }
 
 #[test]
-fn tip_dependent_failures_start_cooldowns() {
-    for error in [
-        TransactionError::UnsupportedByNetworkUpgrade(
-            4,
-            zakura_chain::parameters::NetworkUpgrade::Nu7,
-        ),
-        TransactionError::DisabledAddToSproutPool,
-        expired_transaction(block::Height(99), block::Height(101)),
-    ] {
-        for transaction_version in [4, 5, 6] {
-            let failure = relayed_transaction_failure(error.clone(), transaction_version);
-            assert_eq!(transaction_ban_peer(&failure), None, "{error:?}");
-            assert_eq!(
-                transaction_cooldown_peer(
-                    &failure,
-                    Some(block::Height(100)),
-                    NetworkUpgrade::Nu6_3
-                ),
-                Some(test_peer()),
-                "{error:?}"
-            );
-        }
+fn sprout_deposits_start_cooldowns() {
+    let error = TransactionError::DisabledAddToSproutPool;
+    for transaction_version in [4, 5, 6] {
+        let failure = relayed_transaction_failure(error.clone(), transaction_version);
+        assert_eq!(transaction_ban_peer(&failure), None, "{error:?}");
+        assert_eq!(
+            transaction_cooldown_peer(&failure, Some(block::Height(100)), NetworkUpgrade::Nu6_3),
+            Some(test_peer()),
+            "{error:?}"
+        );
     }
 }
 
-/// Below NU5, the verifier does not check branch IDs, so a v5 transaction from
-/// a peer ahead of this node fails as an unsupported version.
+/// A later declared upgrade suppresses even an otherwise eligible cooldown.
 #[test]
 fn transactions_declaring_a_later_upgrade_start_no_cooldown() {
     let failure = |transaction_network_upgrade| TransactionDownloadVerifyError::Invalid {
-        error: TransactionError::UnsupportedByNetworkUpgrade(5, NetworkUpgrade::Canopy),
+        error: TransactionError::DisabledAddToSproutPool,
         advertiser_addr: Some(test_peer()),
         tip_height: Some(block::Height(100)),
         transaction_version: 5,
@@ -402,10 +388,9 @@ fn transactions_declaring_a_later_upgrade_start_no_cooldown() {
     }
 }
 
-/// A node whose tip is before an upgrade can pass the tip distance check, so a
-/// transaction that declares a later upgrade starts no cooldown.
+/// Branch mismatches receive no penalty in either direction.
 #[test]
-fn branch_id_mismatches_only_cool_down_peers_behind_the_tip() {
+fn branch_id_mismatches_never_start_cooldowns() {
     let tip_height = Some(block::Height(100));
     let failure = |transaction_network_upgrade| TransactionDownloadVerifyError::Invalid {
         error: TransactionError::WrongConsensusBranchId,
@@ -417,7 +402,8 @@ fn branch_id_mismatches_only_cool_down_peers_behind_the_tip() {
     };
 
     for (transaction_network_upgrade, cooldown_peer) in [
-        (Some(NetworkUpgrade::Nu6_2), Some(test_peer())),
+        (Some(NetworkUpgrade::Nu6_2), None),
+        (Some(NetworkUpgrade::Nu6_3), None),
         (Some(NetworkUpgrade::Nu7), None),
         (None, None),
     ] {

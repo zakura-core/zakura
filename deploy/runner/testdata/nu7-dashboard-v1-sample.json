@@ -25,7 +25,10 @@
       "difficulty": 3,
       "meanIntervalSeconds": 25,
       "medianIntervalSeconds": 25.0,
-      "intervalSampleBlocks": 2
+      "intervalSampleBlocks": 2,
+      "timestampGapSeconds": 25,
+      "minimumDifficultyEligible": false,
+      "minimumDifficultyBlock": null
     },
     "nsm": {
       "balanceZat": 700,
@@ -36,7 +39,7 @@
       "validatorsConfigured": 3,
       "validatorsAgree": true,
       "localNodesAgree": true,
-      "validatorsAgreeing": 2,
+      "validatorsAgreeing": 3,
       "blocks24h": null,
       "reorgs24h": null,
       "reorgRate24h": null,
@@ -103,6 +106,7 @@
   },
   "rules": {
     "atTip": {
+      "network": "Testnet",
       "effectiveHeight": 102,
       "networkMagic": "fa1af9bf",
       "activationHeight": 100,
@@ -127,6 +131,7 @@
       }
     },
     "nextBlock": {
+      "network": "Testnet",
       "effectiveHeight": 103,
       "networkMagic": "fa1af9bf",
       "activationHeight": 100,
@@ -155,5 +160,5 @@
     "faucet": null,
     "snapshot": null
   },
-  "generation": "f493f3950de89cfe7ebba6e8e534562df8191374b2f038c352dc6d15986aac1f"
+  "generation": "20e5dbd6be4993469dbc35eefeaf2bac82224518b672ca29b8f010f86a0cb6f3"
 }

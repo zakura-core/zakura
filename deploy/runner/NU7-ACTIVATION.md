@@ -23,10 +23,8 @@ Required shape:
   "armed": false,
   "dispatch": false,
   "stateFile": "/var/lib/zakura-nu7-activation/selection.json",
-  "staleAfter": 300,
   "staging": {
     "statusUrl": "https://api.nu7.valargroup.dev/v1/status",
-    "rpcUrl": "http://167.99.146.155:18232/",
     "manifest": {},
     "capabilities": {"faucet": null, "snapshot": null}
   },
@@ -70,7 +68,8 @@ public-Testnet joining.
 1. Upgrade all three existing public nodes to the approved full SHA/checksum,
    validate their public identity and advancing common chain. Restrict regional
    RPC inbound traffic to the collector primary; prove other sources cannot use
-   it. The staging RPC needs the same restriction for the new collector.
+   it. Staging RPC remains loopback-only: its existing status collector embeds
+   optional pinned-tip consensus exports in /v1/status over HTTPS.
 2. Configure an independent NU7-compatible reference. The verified Zec.rocks
    Testnet lightwalletd endpoint uses GetLightdInfo/GetBlock through the pinned
    absolute grpcurl executable, TLS and reflection. Its CompactBlock hash is
@@ -116,7 +115,8 @@ has been prepared. Difficulty tests belong to the node's consensus export:
 450 seconds must not qualify for minimum difficulty; 451 must qualify.
 
 Do not claim the system armed while a reference endpoint, node revision,
-public faucet, publication token, or codeowner approval is pending. After real
+publication path or codeowner approval is pending. Public faucet/snapshot
+capabilities may remain null when those services are not prepared. After real
 activation observe at least one full 102-block post-activation window and verify
 common hashes and website generation; random block intervals need not average
 exactly 25 seconds.

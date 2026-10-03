@@ -103,6 +103,8 @@ class ActivationFeed:
                     and self.state["selectionState"] != "selected")):
             self.owner.close()
             raise ValueError("invalid persisted selection")
+        if self.state["selectedProfile"] == "staging":
+            self.state["selectionState"] = "armed" if self.config["armed"] else "staging"
         # A restart always requires fresh consecutive observations.
         self.state["consecutivePasses"] = 0
         self.lock = threading.Lock()
@@ -124,8 +126,10 @@ class ActivationFeed:
             manifest = profile["manifest"]
             if hashlib.sha256(manifest["config"].encode()).hexdigest() != manifest["configSha256"]:
                 raise ValueError("joining configuration checksum mismatch")
-        if public["identityCheckpoint"]["height"] >= public["manifest"]["network"]["activationHeight"]:
-            raise ValueError("identity checkpoint must precede activation")
+        if not (self.config["staging"]["manifest"]["network"]["activationHeight"]
+                < public["identityCheckpoint"]["height"]
+                < public["manifest"]["network"]["activationHeight"]):
+            raise ValueError("identity checkpoint must follow staging divergence and precede public activation")
 
     def observe(self, node, now, parameters=True):
         """Verify network history and retain local progress age for every source."""
@@ -148,7 +152,7 @@ class ActivationFeed:
             changed = now if previous is None or previous[:2] != tip else previous[2]
             self.progress[node["name"]] = (*tip, changed)
             result = {"name": node["name"], "url": url, "source": node, "height": tip[0], "hash": tip[1],
-                      "observedAt": now, "fresh": now - changed <= self.config.get("staleAfter", 300),
+                      "observedAt": now, "fresh": True, "progressAgeSeconds": max(0, now - changed),
                       "active": upgrade["status"] == "active"}
             if parameters:
                 current = self.rpc(url, "getnetworkparameters", [tip[0]])
@@ -162,6 +166,9 @@ class ActivationFeed:
                         or following["activationHeight"] != activation
                         or following["nu7BranchId"] != branch):
                     raise ValueError("parameter export identity mismatch")
+                pinned = self.rpc(url, "getblockchaininfo")
+                if (pinned["blocks"], pinned["bestblockhash"]) != tip:
+                    raise ValueError("tip moved during parameter observation")
                 result["rules"] = {"atTip": rules(current), "nextBlock": rules(following)}
             return result
         except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as exc:
@@ -227,7 +234,7 @@ class ActivationFeed:
         changed = now if previous is None or previous[:2] != tip else previous[2]
         self.progress[node["name"]] = (*tip, changed)
         return {"name": node["name"], "source": node, "height": height, "hash": block_hash,
-                "observedAt": now, "fresh": now - changed <= self.config.get("staleAfter", 300),
+                "observedAt": now, "fresh": True, "progressAgeSeconds": max(0, now - changed),
                 "active": info["consensusBranchId"] == public["manifest"]["network"]["branchId"]}
 
     def agreement(self, nodes, reference, now):
@@ -246,9 +253,19 @@ class ActivationFeed:
             try:
                 activation_hashes = [self.source_hash(n, activation) for n in sources]
                 common_hashes = [self.source_hash(n, common) for n in sources]
-                if len(set(activation_hashes)) == len(set(common_hashes)) == 1:
+                if (len(set(activation_hashes)) == len(set(common_hashes)) == 1
+                        and all(0 <= self.clock() - n["observedAt"] <= 60 for n in sources)):
+                    agreeing = [n["name"] for n in pair]
+                    for candidate in candidates:
+                        if candidate["name"] not in agreeing:
+                            try:
+                                if (self.source_hash(candidate, activation) == activation_hashes[0]
+                                        and self.source_hash(candidate, common) == common_hashes[0]):
+                                    agreeing.append(candidate["name"])
+                            except (OSError, ValueError, KeyError, TypeError):
+                                pass
                     return {"activationHash": activation_hashes[0], "commonHeight": common,
-                            "commonHash": common_hashes[0], "nodes": [n["name"] for n in pair]}
+                            "commonHash": common_hashes[0], "nodes": agreeing}
             except (OSError, ValueError, KeyError, TypeError):
                 continue
         return None
@@ -283,6 +300,10 @@ class ActivationFeed:
         if info["blocks"] != height or info["bestblockhash"] != primary["hash"]:
             raise ValueError("tip moved during coherent response collection")
         balance = info.get("nsmValueBalanceZat")
+        threshold = primary["rules"]["atTip"]["minimumDifficulty"]["thresholdSeconds"]
+        gap = max(0, headers[-1]["time"] - headers[-2]["time"]) if len(headers) > 1 else None
+        bits = tip.get("bits")
+        limit = primary["rules"]["atTip"].get("powLimitCompact")
         status = {
             "schemaVersion": 1, "observedAt": now, "status": "live" if agreement else "degraded",
             "network": {**manifest["network"], "targetSpacingSeconds": primary["rules"]["atTip"]["targetSpacingSeconds"],
@@ -293,14 +314,18 @@ class ActivationFeed:
                       "tipAgeSeconds": max(0, int(now - tip["time"])), "difficulty": tip.get("difficulty"),
                       "meanIntervalSeconds": round(statistics.mean(intervals), 1) if intervals else None,
                       "medianIntervalSeconds": round(statistics.median(intervals), 1) if intervals else None,
-                      "intervalSampleBlocks": len(intervals)},
+                      "intervalSampleBlocks": len(intervals),
+                      "timestampGapSeconds": gap,
+                      "minimumDifficultyEligible": (gap > threshold if gap is not None and threshold is not None else None),
+                      "minimumDifficultyBlock": (str(bits).lower().removeprefix("0x") == str(limit).lower().removeprefix("0x")
+                                                 if bits is not None and limit is not None else None)},
             "nsm": {"balanceZat": balance, "available": balance is not None, "seedZat": None},
-            "observation": {"validatorsConfigured": 3, "validatorsAgree": bool(agreement),
+            "observation": {"validatorsConfigured": 3, "validatorsAgree": bool(agreement and len(agreement["nodes"]) == 3),
                             "localNodesAgree": bool(agreement), "validatorsAgreeing": len(agreement["nodes"]) if agreement else 0,
                             "blocks24h": None, "reorgs24h": None, "reorgRate24h": None,
                             "since": now, "scope": "Three public-Testnet validators and independent reference"},
             "mining": {"operatorMinersActive": 0, "operatorMinersConfigured": 0, "remoteMiners": []},
-            "nodes": [{"name": n["name"], "healthy": n.get("fresh", False),
+            "nodes": [{"name": n["name"], "healthy": bool(agreement and n["name"] in agreement["nodes"]),
                        **({"height": n["height"], "hash": n["hash"]} if n.get("height") is not None else {})}
                       for n in nodes],
             "recentBlocks": [{"height": header["height"], "hash": header["hash"],
@@ -364,9 +389,17 @@ class ActivationFeed:
                 status = (self.staging_status.response()[1] if self.staging_status else
                           read_json(self.config["staging"]["statusUrl"]))
                 height = status["chain"]["height"]
-                current = self.rpc(self.config["staging"]["rpcUrl"], "getnetworkparameters", [height])
-                following = self.rpc(self.config["staging"]["rpcUrl"], "getnetworkparameters", [height + 1])
-                if current["networkMagic"] != self.config["staging"]["manifest"]["network"]["magic"]:
+                exported = status.get("rules")
+                if exported:
+                    current, following = exported["atTip"], exported["nextBlock"]
+                elif self.config["staging"].get("rpcUrl"):
+                    current = self.rpc(self.config["staging"]["rpcUrl"], "getnetworkparameters", [height])
+                    following = self.rpc(self.config["staging"]["rpcUrl"], "getnetworkparameters", [height + 1])
+                else:
+                    raise ValueError("staging consensus export unavailable")
+                if (current["networkMagic"] != self.config["staging"]["manifest"]["network"]["magic"]
+                        or current["effectiveHeight"] != height
+                        or following["effectiveHeight"] != height + 1):
                     raise ValueError("staging parameter network mismatch")
                 parameters = {"atTip": rules(current), "nextBlock": rules(following)}
             payload = self.envelope(profile, status, parameters, now)

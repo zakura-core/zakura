@@ -172,14 +172,19 @@ thread runs at the lowest priority, so it yields the shared vCPU to validation.
 Deploy the same revision and network parameters to every participant; changing
 consensus requires a coordinated new run.
 
-The remote configs are derived from the live node config with
-`miner/render-remote-config.py`. All three currently mine to the existing
-primary miner address, so their matured rewards remain available to the faucet
-without distributing its spending key. The dashboard attributes **accepted
-submissions**, not canonical blocks, from each miner's journal; a reorg may
+Each remote miner is a `[[remote]]` entry in the fork config. `fork.py` renders
+it as one more deployer node, so `deploy.py` installs the same binary, its config
+and the deployer's standard `zakurad.service` template, exactly as on the primary.
+The node inherits the primary's paths, ports, fork parameters and miner address
+from the rendered `[defaults]`; only its host, P2P peers and coinbase tag differ.
+`deploy.py` does not copy chain state, so a new remote host needs restored state
+(below) before its first deploy. Mining to a shared address keeps the spending
+key off every remote host. The dashboard attributes **accepted
+submissions**, not canonical blocks, from each node's log; a reorg may
 displace an accepted block. Each remote miner has its own full node and
 `miner/remote-status.py` reports service health, tip, NU7 branch ID, and the
-internal miner's accepted blocks over 24 hours, read from the node's log file. The primary collector polls those endpoints using
+internal miner's accepted blocks over 24 hours, read from the node's log file.
+The primary collector polls those endpoints using
 `miner/remote-miners.json`, requires a fresh report on the same chain within two
 blocks of the primary, and exposes the result in `/v1/status`. The DigitalOcean
 firewall allows the status port only from the primary host; P2P port 18233 is
@@ -187,11 +192,11 @@ public. No GitHub SSH key is stored on the remote hosts.
 
 For a replacement host, stop a local observer briefly to archive its `state`
 and `non_finalized_state` directories consistently. Verify the archive hash
-after transfer before extraction. Install the pinned internal-miner node binary, the rendered config, and the
-`zakurad.service` and `zakura-nu7-miner-status.service` units, and apply
-`miner/99-zakura-nu7.conf` for prompt block propagation. Start the node and
-status service, then confirm its reported hash agrees with the primary at the
-same height. Update `miner/remote-miners.json` if the replacement
+after transfer before extraction. Add the host as a `[[remote]]` entry and deploy
+it with `fork.py render` and `fork.py deploy`. Install the
+`zakura-nu7-miner-status.service` unit, and apply `miner/99-zakura-nu7.conf` for
+prompt block propagation. Start the status service, then confirm its reported
+hash agrees with the primary at the same height. Update `miner/remote-miners.json` if the replacement
 IP changes.
 
 To move an existing remote miner between DigitalOcean regions, stop and

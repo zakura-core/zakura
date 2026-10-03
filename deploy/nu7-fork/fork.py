@@ -343,7 +343,34 @@ def render_nodes_toml(config: dict, plan: dict) -> str:
             ])
         lines.append("")
 
+    for remote in config.get("remote", []):
+        lines.extend(render_remote_node(config, remote))
+
     return "\n".join(lines)
+
+
+def render_remote_node(config: dict, remote: dict) -> list[str]:
+    """A mining validator on its own host, deployed with the deployer's standard unit.
+
+    It shares the primary's paths, ports and fork parameters from [defaults], and
+    differs only in its host, its P2P peers and its coinbase tag.
+    """
+    for key in ("name", "ssh_string", "initial_testnet_peers"):
+        if not remote.get(key):
+            raise ForkError(f"[[remote]] {remote.get('name', '?')}: {key} is required")
+    peers = remote["initial_testnet_peers"]
+    if any(not re.fullmatch(r"[A-Za-z0-9.-]+:[0-9]+", peer) for peer in peers):
+        raise ForkError(f"[[remote]] {remote['name']}: peers must be host:port")
+    return [
+        "[[nodes]]",
+        f'name = "{remote["name"]}"',
+        f'ssh_string = "{remote["ssh_string"]}"',
+        f'commit = "{config["host"]["commit"]}"',
+        f"initial_testnet_peers = {json.dumps(peers)}",
+        "internal_miner = true",
+        f'extra_coinbase_data = "{remote["name"]}"',
+        "",
+    ]
 
 
 def peer_dial_addr(listen_addr: str) -> str:

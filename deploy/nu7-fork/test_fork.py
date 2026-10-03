@@ -200,44 +200,53 @@ class SshOptions(unittest.TestCase):
         self.assertIn("ServerAliveCountMax=4", fork.SSH_OPTS)
 
 
-def load_remote_config_renderer():
-    path = Path(__file__).parent / "miner" / "render-remote-config.py"
-    spec = importlib.util.spec_from_file_location("render_remote_config", path)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+REMOTE = {
+    "name": "zakura-nu7-miner-eu",
+    "ssh_string": "root@203.0.113.7",
+    "initial_testnet_peers": ["seed.example:18233", "203.0.113.8:18233"],
+}
 
 
-class RemoteMinerConfig(unittest.TestCase):
-    PARAMETERS = (
-        'network_name = "Nu7Fork"\n'
-        'network_magic = [122, 107, 117, 55]\n'
-        '[{table}.activation_heights]\n'
-        'NU7 = 4382859\n'
-    )
+class RemoteMiners(unittest.TestCase):
+    def nodes(self, *remotes):
+        config = base_config(PEER)
+        config["remote"] = list(remotes)
+        return __import__("tomllib").loads(render(config))["nodes"]
 
-    def render(self, table: str) -> str:
-        base = (
-            '[network]\n'
-            'initial_testnet_peers = ["127.0.0.1:18333"]\n'
-            f'[{table}]\n' + self.PARAMETERS.format(table=table)
-            + '[mining]\nminer_address = "tmOld"\n'
-        )
-        renderer = load_remote_config_renderer()
-        return renderer.render(base, ["seed.example:18233"], "t" + "A" * 34)
+    def test_a_remote_miner_is_a_deployer_node_with_its_own_peers_and_tag(self):
+        remote = self.nodes(REMOTE)[-1]
+        self.assertEqual(remote, {
+            "name": "zakura-nu7-miner-eu",
+            "ssh_string": "root@203.0.113.7",
+            "commit": "main",
+            "initial_testnet_peers": ["seed.example:18233", "203.0.113.8:18233"],
+            "internal_miner": True,
+            "extra_coinbase_data": "zakura-nu7-miner-eu",
+        })
 
-    def test_a_config_without_nu7_is_refused(self):
-        renderer = load_remote_config_renderer()
-        base = '[network]\nnetwork = "Testnet"\ninitial_testnet_peers = []\n'
-        with self.assertRaises(ValueError):
-            renderer.render(base, ["seed.example:18233"], "t" + "A" * 34)
+    def test_a_remote_miner_installs_the_deployers_standard_unit(self):
+        fork.sys.path.insert(0, str(fork.DEPLOYER.parent))
+        import deploy  # noqa: E402  (path is set immediately above)
 
-    def test_reads_both_config_forms(self):
-        # The running fork predates #1147's `network = { ... }` form; a new fork uses it.
-        for table in ("network.testnet_parameters", "network.network"):
-            rendered = self.render(table)
-            self.assertIn('"seed.example:18233"', rendered, table)
-            self.assertIn('miner_address = "t' + "A" * 34 + '"', rendered, table)
+        config = base_config(PEER)
+        config["remote"] = [REMOTE]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "nodes.toml"
+            path.write_text(render(config))
+            node = deploy.load_nodes(path, ["zakura-nu7-miner-eu"])[0]
+        unit = deploy.render_service(node)
+        self.assertIn("ExecStart=/usr/local/bin/zakurad -c /etc/zakura/zakura.toml start", unit)
+        rendered = __import__("tomllib").loads(deploy.render_node_config(node))
+        self.assertEqual(rendered["mining"]["miner_address"], "tmGkvoQGmvJu6H5Wp22wUFAsBuX6SPGHnMq")
+        self.assertEqual(rendered["network"]["network"]["activation_heights"], {"NU7": 4_400_010})
+        self.assertFalse((Path(fork.__file__).parent / "miner" / "zakurad.service").exists())
+
+    def test_a_remote_miner_without_peers_is_refused(self):
+        for broken in ({**REMOTE, "initial_testnet_peers": []},
+                       {**REMOTE, "initial_testnet_peers": ["no port"]},
+                       {**REMOTE, "ssh_string": ""}):
+            with self.assertRaises(fork.ForkError):
+                self.nodes(broken)
 
 
 class FakeHost:

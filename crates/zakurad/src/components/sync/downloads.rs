@@ -727,8 +727,12 @@ where
                 // below uses it. Otherwise a rewritten height would make those policies drop
                 // the requested hash as a benign old or far-ahead block: unattributed,
                 // unscored, and not requeued. See `crate::components::auth_download_height`.
-                let policy_uses_height =
-                    block_height > lookahead_pause_height || block_height < min_accepted_height;
+                // A block at or below the reset height clears the lookahead pause, so a forged
+                // height there would release backpressure the syncer still needs.
+                let policy_uses_height = block_height > lookahead_pause_height
+                    || block_height < min_accepted_height
+                    || (block_height <= lookahead_reset_height
+                        && past_lookahead_limit_receiver.cloned_watch_data());
                 if height_is_unbound(&block, block_height, policy_uses_height) {
                     debug!(
                         ?hash,

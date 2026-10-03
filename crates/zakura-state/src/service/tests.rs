@@ -2901,6 +2901,37 @@ async fn unpublished_writer_transitions_block_optimistic_relay_and_bound_bodies(
     );
 }
 
+/// A missing parent can retain a semantic commit for the lifetime of the state service.
+#[tokio::test(flavor = "multi_thread")]
+async fn missing_parent_commit_waits_until_state_shutdown() {
+    let _guard = zakura_test::init();
+    let block: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1687107_BYTES
+        .zcash_deserialize_into()
+        .unwrap();
+    let parent = block.header.previous_block_hash;
+    let (mut state, _, _, _) =
+        StateService::new(Config::ephemeral(), &Network::Mainnet, Height::MAX, 0)
+            .await
+            .unwrap();
+    let mut response = state.queue_and_commit_to_non_finalized_state(block.into(), None);
+    assert!(state
+        .non_finalized_state_queued_blocks
+        .has_queued_children(parent));
+    assert!(timeout(Duration::from_millis(20), &mut response)
+        .await
+        .is_err());
+    assert!(state
+        .non_finalized_state_queued_blocks
+        .has_queued_children(parent));
+    drop(state);
+    let error = timeout(Duration::from_secs(1), response)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(error.inner(), &crate::CommitBlockError::WriteTaskExited);
+}
+
 /// The sent cache must not hide a completed commit from a same-hash retry.
 #[tokio::test]
 async fn known_block_prefers_committed_state_over_sent_cache() {

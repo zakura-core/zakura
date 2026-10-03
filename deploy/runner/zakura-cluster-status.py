@@ -2475,6 +2475,24 @@ class Nu7Status:
     def update(self, rows: list[dict], now: float) -> None:
         try:
             payload = self.build(rows, now)
+            if payload["status"] != "unavailable":
+                # Optional consensus export for the coherent selector. Legacy
+                # readers keep the status schema; nodes without the new RPC do
+                # not fabricate rules or expose their private RPC externally.
+                try:
+                    height = payload["chain"]["height"]
+                    current = self.rpc("getnetworkparameters", [height])
+                    following = self.rpc("getnetworkparameters", [height + 1])
+                    pinned = self.rpc("getblockchaininfo")
+                    if (pinned["blocks"] != height
+                            or pinned["bestblockhash"] != payload["chain"]["hash"]
+                            or current["effectiveHeight"] != height
+                            or following["effectiveHeight"] != height + 1
+                            or current["networkMagic"] != self.network["magic"]):
+                        raise ValueError("tip or consensus identity changed during sampling")
+                    payload["rules"] = {"atTip": current, "nextBlock": following}
+                except (OSError, RuntimeError, ValueError, KeyError, TypeError):
+                    logging.warning("NU7 consensus export unavailable; retaining status without rules")
         except Exception:
             # The public payload stays generic; the journal keeps the cause.
             logging.exception("NU7 status collection failed")

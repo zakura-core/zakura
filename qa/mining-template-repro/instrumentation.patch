@@ -1,0 +1,218 @@
+diff --git a/crates/zakura-rpc/src/methods.rs b/crates/zakura-rpc/src/methods.rs
+index a3cb27a90..b3d9cdd87 100644
+--- a/crates/zakura-rpc/src/methods.rs
++++ b/crates/zakura-rpc/src/methods.rs
+@@ -106,6 +106,44 @@ use crate::{
+     },
+ };
+ 
++/// zakura#1080 repro instrumentation. NOT FOR MERGE.
++///
++/// Classifies a `getblocktemplate` withhold by comparing the tip the template was
++/// built for (`info_*`, read from the `NonFinalizedState` watch channel via
++/// `ReadRequest::ChainInfo`) against the best-tip watch channel (`watch`). The two
++/// are published non-atomically in `zakura_state::service::write`, so the height
++/// comparison is what separates an equal-height sideways flip from an ordinary
++/// forward advance.
++fn gbt_withhold_probe(
++    site: &'static str,
++    work_id: Option<&str>,
++    parent: Option<block::Hash>,
++    info_hash: block::Hash,
++    info_height: Height,
++    watch: Option<(Height, block::Hash)>,
++) {
++    let kind = match watch {
++        None => "no_watch_tip",
++        Some((h, _)) if h == info_height => "sideways",
++        Some((h, _)) if h < info_height => "watch_behind",
++        Some(_) => "watch_ahead",
++    };
++
++    metrics::counter!("gbt_withhold.total", "site" => site, "kind" => kind).increment(1);
++    tracing::warn!(
++        target: "gbt_withhold",
++        site,
++        kind,
++        work_id = work_id.unwrap_or("-"),
++        parent = ?parent,
++        info_hash = ?info_hash,
++        info_height = info_height.0,
++        watch_hash = ?watch.map(|(_, h)| h),
++        watch_height = watch.map(|(h, _)| h.0),
++        "getblocktemplate withheld work"
++    );
++}
++
+ pub(crate) mod hex_data;
+ pub(crate) mod trees;
+ pub(crate) mod types;
+@@ -1242,13 +1280,29 @@ where
+         miner_params: &types::get_block_template::MinerParams,
+     ) -> Result<GetBlockTemplateResponse> {
+         let state = self.gbt.template_rejections.borrow().clone();
+-        if state.parent != Some(chain_info.tip_hash)
+-            || self
+-                .latest_chain_tip
+-                .best_tip_hash()
+-                .is_some_and(|tip| tip != chain_info.tip_hash)
+-            || (!state.needs_fallback() && state.revision != template.long_poll_id.revision)
+-        {
++        // zakura#1080 repro instrumentation. NOT FOR MERGE. The three disjuncts are
++        // split out so the probe can report which one actually withheld the work.
++        let watch = self.latest_chain_tip.best_tip_height_and_hash();
++        let parent_changed = state.parent != Some(chain_info.tip_hash);
++        let tip_moved = watch.is_some_and(|(_, tip)| tip != chain_info.tip_hash);
++        let revision_stale =
++            !state.needs_fallback() && state.revision != template.long_poll_id.revision;
++        if parent_changed || tip_moved || revision_stale {
++            let site = if tip_moved {
++                "parent_check.tip_moved"
++            } else if parent_changed {
++                "parent_check.parent_changed"
++            } else {
++                "parent_check.revision_stale"
++            };
++            gbt_withhold_probe(
++                site,
++                Some(template.work_id().as_str()),
++                state.parent,
++                chain_info.tip_hash,
++                chain_info.tip_height,
++                watch,
++            );
+             return Err(ErrorObject::owned(
+                 0,
+                 "template parent changed; retry",
+@@ -1257,6 +1311,15 @@ where
+         }
+         if state.needs_fallback() {
+             if state.saturated {
++                // zakura#1080 repro instrumentation. NOT FOR MERGE.
++                gbt_withhold_probe(
++                    "saturated",
++                    Some(template.work_id().as_str()),
++                    state.parent,
++                    chain_info.tip_hash,
++                    chain_info.tip_height,
++                    self.latest_chain_tip.best_tip_height_and_hash(),
++                );
+                 return Err(ErrorObject::owned(
+                     0,
+                     "template rejection limit reached; wait for a new tip",
+@@ -1305,6 +1368,15 @@ where
+                     .best_tip_hash()
+                     .is_some_and(|tip| tip != chain_info.tip_hash)
+             {
++                // zakura#1080 repro instrumentation. NOT FOR MERGE.
++                gbt_withhold_probe(
++                    "recovery_recheck",
++                    Some(template.work_id().as_str()),
++                    current.parent,
++                    chain_info.tip_hash,
++                    chain_info.tip_height,
++                    self.latest_chain_tip.best_tip_height_and_hash(),
++                );
+                 return Err(ErrorObject::owned(
+                     0,
+                     "template changed during recovery; retry",
+@@ -2909,11 +2981,13 @@ where
+                 cur_time,
+                 ..
+             } = fetch_chain_info(read_state.clone()).await?;
+-            if latest_chain_tip
+-                .best_tip_hash()
+-                .is_some_and(|tip| tip != tip_hash)
+             {
+-                continue;
++                // zakura#1080 repro instrumentation. NOT FOR MERGE.
++                let watch = latest_chain_tip.best_tip_height_and_hash();
++                if watch.is_some_and(|(_, tip)| tip != tip_hash) {
++                    gbt_withhold_probe("guard_a", None, None, tip_hash, tip_height, watch);
++                    continue;
++                }
+             }
+             self.gbt.template_rejections.send_if_modified(|state| {
+                 let changed = state.parent != Some(tip_hash);
+@@ -3085,7 +3159,17 @@ where
+                 precomputed_coinbase = wait_for_new_tip => {
+                     let precomputed_coinbase = precomputed_coinbase?;
+                     let chain_info = fetch_chain_info(read_state.clone()).await?;
+-                    if latest_chain_tip.best_tip_hash().is_some_and(|tip| tip != chain_info.tip_hash) {
++                    // zakura#1080 repro instrumentation. NOT FOR MERGE.
++                    let watch = latest_chain_tip.best_tip_height_and_hash();
++                    if watch.is_some_and(|(_, tip)| tip != chain_info.tip_hash) {
++                        gbt_withhold_probe(
++                            "guard_b",
++                            None,
++                            None,
++                            chain_info.tip_hash,
++                            chain_info.tip_height,
++                            watch,
++                        );
+                         continue;
+                     }
+ 
+diff --git a/crates/zakura-state/src/service.rs b/crates/zakura-state/src/service.rs
+index f5ad3c8b6..3be820425 100644
+--- a/crates/zakura-state/src/service.rs
++++ b/crates/zakura-state/src/service.rs
+@@ -3528,6 +3528,15 @@ impl Service<ReadRequest> for ReadStateService {
+                 };
+ 
+                 if semantically_verified.block.header.previous_block_hash != best_tip_hash {
++                    // zakura#1080 repro instrumentation. NOT FOR MERGE.
++                    tracing::warn!(
++                        target: "gbt_withhold",
++                        site = "check_proposal_validity",
++                        proposal_parent = ?semantically_verified.block.header.previous_block_hash,
++                        best_tip_hash = ?best_tip_hash,
++                        best_tip_height = _best_tip_height.0,
++                        "block proposal rejected: not based on the current best chain tip"
++                    );
+                     return Err("proposal is not based on the current best chain tip: \
+                                     previous block hash must be the best chain tip"
+                         .into());
+diff --git a/crates/zakura-state/src/service/write.rs b/crates/zakura-state/src/service/write.rs
+index a3f7c3b1c..2b70c2d87 100644
+--- a/crates/zakura-state/src/service/write.rs
++++ b/crates/zakura-state/src/service/write.rs
+@@ -1507,16 +1507,38 @@ fn update_latest_chain_channels(
+     let tip_block = ChainTipBlock::from(tip_block);
+ 
+     let tip_block_height = tip_block.height;
++    // zakura#1080 repro instrumentation. NOT FOR MERGE.
++    let tip_block_hash = tip_block.hash;
+ 
+     if let Some(backup_dir_path) = backup_dir_path {
+         non_finalized_state.write_to_backup(backup_dir_path);
+     }
+ 
++    // zakura#1080 repro instrumentation. NOT FOR MERGE. These two publications are
++    // not atomic; a getblocktemplate reader landing between them sees the new
++    // ChainInfo tip with the old best-tip watch value.
++    tracing::warn!(
++        target: "gbt_withhold",
++        site = "publish.non_finalized_state",
++        height = tip_block_height.0,
++        hash = ?tip_block_hash,
++        "publishing non-finalized state"
++    );
++
+     // If the final receiver was just dropped, ignore the error.
+     let _ = non_finalized_state_sender.send(non_finalized_state.clone());
+ 
+     chain_tip_sender.set_best_non_finalized_tip(tip_block);
+ 
++    // zakura#1080 repro instrumentation. NOT FOR MERGE.
++    tracing::warn!(
++        target: "gbt_withhold",
++        site = "publish.best_tip",
++        height = tip_block_height.0,
++        hash = ?tip_block_hash,
++        "published best chain tip"
++    );
++
+     tip_block_height
+ }
+ 

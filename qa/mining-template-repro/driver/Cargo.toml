@@ -1,0 +1,21 @@
+[package]
+name = "gbt-repro-driver"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Its own workspace root: this is a test tool, not a workspace member, and it is
+# built on demand by run/lever-b.sh rather than by `cargo build --workspace`.
+[workspace]
+
+[dependencies]
+anyhow = "1"
+hex = "0.4"
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+
+zakura-chain = { path = "../../../crates/zakura-chain", features = ["internal-miner"] }
+zakura-rpc = { path = "../../../crates/zakura-rpc" }
+zakura-node-services = { path = "../../../crates/zakura-node-services", features = [
+    "rpc-client",
+] }

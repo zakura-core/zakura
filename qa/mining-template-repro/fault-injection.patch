@@ -1,0 +1,73 @@
+diff --git a/crates/zakura-rpc/src/methods.rs b/crates/zakura-rpc/src/methods.rs
+index b15ce89cd..6411749ed 100644
+--- a/crates/zakura-rpc/src/methods.rs
++++ b/crates/zakura-rpc/src/methods.rs
+@@ -106,6 +106,35 @@ use crate::{
+     },
+ };
+ 
++/// Lever E fault injection. NOT FOR MERGE.
++///
++/// Returns true while forced rejections remain, counting down from
++/// `GBT_REPRO_FORCE_TEMPLATE_REJECTIONS`. One rejection puts the parent into
++/// fallback-only mode; 64 on a single parent saturate it.
++fn debug_take_forced_template_rejection() -> bool {
++    use std::sync::atomic::{AtomicI64, Ordering};
++    static REMAINING: AtomicI64 = AtomicI64::new(i64::MIN);
++
++    if REMAINING.load(Ordering::Relaxed) == i64::MIN {
++        let configured = std::env::var("GBT_REPRO_FORCE_TEMPLATE_REJECTIONS")
++            .ok()
++            .and_then(|value| value.parse().ok())
++            .unwrap_or(0);
++        let _ = REMAINING.compare_exchange(
++            i64::MIN,
++            configured,
++            Ordering::Relaxed,
++            Ordering::Relaxed,
++        );
++    }
++
++    REMAINING
++        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
++            (current > 0).then_some(current - 1)
++        })
++        .is_ok()
++}
++
+ pub(crate) mod hex_data;
+ pub(crate) mod trees;
+ pub(crate) mod types;
+@@ -1403,10 +1432,28 @@ where
+                             }
+                         };
+                         if let Some(Ok(_)) = &result {
+-                            gbt.template_rejections.send_if_modified(|state| {
+-                                state.mark_prepared(parent, template.work_id());
+-                                false
+-                            });
++                            // Lever E fault injection. NOT FOR MERGE. The node builds its
++                            // own templates, so they are valid by construction and the
++                            // fallback branch cannot be reached without forcing a rejection.
++                            if debug_take_forced_template_rejection() {
++                                gbt.template_rejections.send_if_modified(|state| {
++                                    state.reject(parent, template.work_id())
++                                });
++                                metrics::counter!("mining.template_preparation.rejected")
++                                    .increment(1);
++                                tracing::warn!(
++                                    target: "gbt_withhold",
++                                    site = "injected_rejection",
++                                    work_id = %template.work_id(),
++                                    ?parent,
++                                    "forced a template rejection"
++                                );
++                            } else {
++                                gbt.template_rejections.send_if_modified(|state| {
++                                    state.mark_prepared(parent, template.work_id());
++                                    false
++                                });
++                            }
+                         }
+                         if let Some(Err(error)) = result {
+                             let rejects_template = error

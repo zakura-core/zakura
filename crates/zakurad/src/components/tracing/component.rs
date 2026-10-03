@@ -289,9 +289,8 @@ impl Tracing {
                     .and_then(|s| s.parse().ok())
             });
 
-            // Capture resolved values for logging
+            // Keep only non-endpoint values for status logging. URLs can contain credentials.
             let resolved_config = (
-                endpoint.clone(),
                 service_name.clone().unwrap_or_else(|| "zakura".to_string()),
                 sample_percent.unwrap_or(100),
             );
@@ -362,9 +361,8 @@ impl Tracing {
         // Log OpenTelemetry status
         #[cfg(feature = "opentelemetry")]
         if otel_provider.is_some() {
-            let (ref endpoint, ref service_name, sample_percent) = otel_resolved_config;
+            let (ref service_name, sample_percent) = otel_resolved_config;
             info!(
-                ?endpoint,
                 %service_name,
                 sample_percent,
                 "installed OpenTelemetry tracing layer",
@@ -375,7 +373,6 @@ impl Tracing {
         #[cfg(not(feature = "opentelemetry"))]
         if config.opentelemetry_endpoint.is_some() {
             warn!(
-                endpoint = ?config.opentelemetry_endpoint,
                 "unable to activate OpenTelemetry tracing: \
                  enable the 'opentelemetry' feature when compiling zakurad",
             );

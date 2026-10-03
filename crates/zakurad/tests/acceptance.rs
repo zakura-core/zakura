@@ -265,6 +265,49 @@ fn opentelemetry_endpoint_does_not_panic_on_startup() -> Result<()> {
 }
 
 #[test]
+fn opentelemetry_status_does_not_log_endpoint() -> Result<()> {
+    let _init_guard = zakura_test::init();
+
+    let mut config = default_test_config(&Mainnet);
+    // Synthetic values cover every URL component that could contain credentials.
+    config.tracing.opentelemetry_endpoint = Some(
+        "http://test-user:test-password@127.0.0.1:1/test-path?token=test-token#test-fragment"
+            .to_owned(),
+    );
+    config.tracing.filter = Some("info".to_owned());
+    config.tracing.opentelemetry_sample_percent = Some(0);
+    let testdir = testdir()?.with_config(&mut config)?;
+    let output = (&testdir)
+        .spawn_child(args!["generate", "-o", "generated.toml"])?
+        .wait_with_output_or_timeout(Duration::from_secs(30))?
+        .assert_success()?;
+
+    #[cfg(feature = "opentelemetry")]
+    output.stdout_line_contains("installed OpenTelemetry tracing layer")?;
+    #[cfg(not(feature = "opentelemetry"))]
+    output.stdout_line_contains("unable to activate OpenTelemetry tracing")?;
+
+    for stream in [&output.output.stdout, &output.output.stderr] {
+        let text = String::from_utf8_lossy(stream);
+        for private_value in [
+            "test-user",
+            "test-password",
+            "127.0.0.1:1",
+            "test-path",
+            "test-token",
+            "test-fragment",
+        ] {
+            assert!(
+                !text.contains(private_value),
+                "endpoint value appeared in logs"
+            );
+        }
+    }
+
+    Ok(())
+}
+
+#[test]
 fn generate_args() -> Result<()> {
     let _init_guard = zakura_test::init();
 

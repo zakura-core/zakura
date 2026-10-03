@@ -199,6 +199,9 @@ pub struct InnerConfig {
     ///
     /// When `None` (default), OpenTelemetry is completely disabled with zero runtime overhead.
     /// When set, traces are exported via OTLP HTTP protocol.
+    /// The URL must use HTTP or HTTPS. Its path is extended with `/v1/traces`
+    /// unless it already ends with that suffix, ignoring trailing slashes.
+    /// Query parameters are preserved, and fragments are discarded.
     ///
     /// Example: `"http://localhost:4318"`
     ///

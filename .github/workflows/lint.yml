@@ -229,6 +229,8 @@ jobs:
         if: ${{ !cancelled() }}
         run: python3 -m unittest discover -s deploy/deployer -p 'test_*.py'
 
+      # Kept deliberately while the NU7 fork tooling exists: these stdlib tests run
+      # in seconds and guard the fork renderer, faucet and health endpoint.
       - name: NU7 fork tooling tests
         if: ${{ !cancelled() }}
         run: python3 -m unittest discover -s deploy/nu7-fork -p 'test_*.py'

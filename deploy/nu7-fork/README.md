@@ -523,6 +523,26 @@ the public status API, and redirects every `nu7.valargroup.dev` request to the
 canonical page at `https://zakura.com/nu7/`; it proxies no third-party site. Keep the fork's source revision and participant config in
 sync before advertising a build as join-ready.
 
+## Tests
+
+The fork's Python tests run on every pull request in `lint.yml`, beside the
+deployer's and the status collector's. That is kept deliberately while this
+tooling exists: they use only the standard library, run in a few seconds, and
+cover what Rust tests cannot.
+
+| Suite | Covers |
+| --- | --- |
+| `deploy/nu7-fork/test_fork.py` | fleet rendering, the activation overlay, remote miners, faucet address separation, seeding and catch-up |
+| `deploy/nu7-fork/test_faucet.py` | claim limits, queueing, CORS, and that the sender uses only the faucet key |
+| `deploy/nu7-fork/test_remote_status.py` | mined-block counts, generation boundaries, endpoint bounds, unprivileged units |
+| `deploy/nu7-fork/test_publish_network.py` | the participant manifest, including the published V3 config digest |
+| `deploy/runner/test_zakura_cluster_status.py` | the `/v1/status` schema version 1 contract and five-validator agreement |
+| `deploy/deployer/test_deploy.py` | nested config round trips and parallel same-host staging |
+
+The Rust side is `cargo test -p zakura-network --lib config::tests` for the
+rendered fixture and the activation overlay, and `cargo test -p zakura-fork-txload`.
+As the tooling shrinks, so does this CI cost.
+
 ## Layout
 
 | Path | Purpose |

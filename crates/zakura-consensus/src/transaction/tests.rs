@@ -6688,6 +6688,89 @@ fn cache_test_verifier() -> (CacheTestVerifier, CacheTestState) {
     (verifier, state)
 }
 
+/// Unknown anchors return [`TransactionError::ValidateContextError`] before
+/// the proof service is called. Once the anchor check passes, an invalid proof
+/// must still return [`TransactionError::Halo2VerificationFailed`].
+#[test]
+fn mempool_unknown_anchor_skips_cryptographic_verification() {
+    let _init_guard = zakura_test::init();
+    zakura_test::MULTI_THREADED_RUNTIME.block_on(async {
+        let mut tx = cacheable_mainnet_orchard_transaction();
+        let data = orchard_shielded_data_for_mutation(&mut tx);
+        *data
+            .proof
+            .0
+            .last_mut()
+            .expect("the selected transaction has a non-empty Orchard proof") ^= 1;
+        let height = tx
+            .expiry_height()
+            .expect("the selected v5 transaction has an expiry height");
+        let upgrade = tx
+            .network_upgrade()
+            .expect("the selected v5 transaction declares its upgrade");
+        assert_eq!(NetworkUpgrade::current(&Network::Mainnet, height), upgrade);
+        let item = orchard_item(&tx, upgrade);
+
+        let (_real_state, read_state, _tip, _tip_change) = zakura_state::init(
+            zakura_state::Config::ephemeral(),
+            &Network::Mainnet,
+            Height::MAX,
+            0,
+        )
+        .await
+        .expect("the test uses a fresh ephemeral database and Mainnet parameters");
+        let context_error = read_state
+            .oneshot(
+                zakura_state::ReadRequest::CheckBestChainTipNullifiersAndAnchors(tx.clone().into()),
+            )
+            .await
+            .expect_err("the empty state does not contain this historical anchor")
+            .downcast::<ValidateContextError>()
+            .expect("unknown anchors return a contextual verification error");
+        assert!(matches!(
+            context_error.as_ref(),
+            ValidateContextError::UnknownOrchardAnchor { .. }
+        ));
+
+        let (mut verifier, mut state) = cache_test_verifier();
+        let state_response = context_error.clone();
+        let responder = tokio::spawn(async move {
+            state
+                .expect_request_that(|request| {
+                    matches!(
+                        request,
+                        zakura_state::Request::CheckBestChainTipNullifiersAndAnchors(_)
+                    )
+                })
+                .await
+                .expect("mempool admission checks anchors and nullifiers")
+                .respond_error(state_response);
+        });
+        let request = Request::Mempool {
+            transaction: tx.into(),
+            height,
+        };
+        assert_eq!(primitives::halo2::inner_calls_for(upgrade, &item), 0);
+        let error = tokio::time::timeout(test_timeout(), verify(&mut verifier, request.clone()))
+            .await
+            .expect("the mock state responds immediately to the anchor check")
+            .expect_err("unknown anchors reject the transaction");
+        responder
+            .await
+            .expect("the verifier has received this responder's state result");
+        assert_eq!(error, TransactionError::ValidateContextError(context_error));
+        assert_eq!(primitives::halo2::inner_calls_for(upgrade, &item), 0);
+
+        respond_to_nullifier_and_anchor_check(&state);
+        let crypto_error = tokio::time::timeout(test_timeout(), verify(&mut verifier, request))
+            .await
+            .expect("the admitted proof is flushed within the verifier timeout")
+            .expect_err("the corrupted proof is invalid even with a known anchor");
+        assert_eq!(crypto_error, TransactionError::Halo2VerificationFailed);
+        assert_eq!(primitives::halo2::inner_calls_for(upgrade, &item), 1);
+    });
+}
+
 /// Answers the one state query that verifying a shielded-only transaction from the mempool makes.
 ///
 /// Block requests make none: this transaction has no transparent inputs to look up, and the

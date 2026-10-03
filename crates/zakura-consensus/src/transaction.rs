@@ -585,17 +585,28 @@ where
                 check::mempool_standard_input_scripts(tx.as_ref(), &spent_outputs)?;
             }
 
-            let mempool_transaction = req.mempool_transaction();
             let mut miner_fee = None;
-            if let Some(unmined_tx) = mempool_transaction.as_ref() {
+            if let Some(unmined_tx) = req.mempool_transaction() {
                 // Apply ZIP-317 policy before expensive cryptographic verification.
                 // VerifiedUnminedTx::new() repeats this check to preserve its constructor
                 // invariant.
                 let fee = Self::miner_fee(tx.as_ref(), &spent_utxos)?;
-                let unpaid_actions = transaction::zip317::unpaid_actions(unmined_tx, fee);
+                let unpaid_actions = transaction::zip317::unpaid_actions(&unmined_tx, fee);
 
                 transaction::zip317::mempool_checks(unpaid_actions, fee, unmined_tx.size())?;
                 miner_fee = Some(fee);
+
+                // Reject unknown anchors and spent nullifiers before queuing
+                // cryptography. Dropping a proof future does not cancel work
+                // already admitted to a batch verifier.
+                let response = state
+                    .clone()
+                    .oneshot(zs::Request::CheckBestChainTipNullifiersAndAnchors(unmined_tx))
+                    .await?;
+                assert!(
+                    response == zs::Response::ValidBestChainTipNullifiersAndAnchors,
+                    "unexpected response to CheckBestChainTipNullifiersAndAnchors request"
+                );
             }
 
             let nu = req.upgrade(&network);
@@ -604,7 +615,7 @@ where
 
             tracing::trace!(?tx_id, "got state UTXOs");
 
-            let mut async_checks = match tx.as_ref() {
+            let async_checks = match tx.as_ref() {
                 Transaction::V1 { .. } | Transaction::V2 { .. } | Transaction::V3 { .. } => {
                     tracing::debug!(?tx, "got transaction with wrong version");
                     return Err(TransactionError::WrongVersion);
@@ -639,24 +650,6 @@ where
                     wtx_id.expect("a v6 transaction has a witnessed transaction ID"),
                 )?,
             };
-
-            if let Some(unmined_tx) = mempool_transaction {
-                let check_anchors_and_revealed_nullifiers_query = state
-                    .clone()
-                    .oneshot(zs::Request::CheckBestChainTipNullifiersAndAnchors(
-                        unmined_tx,
-                    ))
-                    .map(|res| {
-                        assert!(
-                            res? == zs::Response::ValidBestChainTipNullifiersAndAnchors,
-                            "unexpected response to CheckBestChainTipNullifiersAndAnchors request"
-                        );
-                        Ok(())
-                    }
-                    );
-
-                async_checks.push(check_anchors_and_revealed_nullifiers_query);
-            }
 
             let block_batch_flush_key = req.block_verifier_batch_flush_key();
 

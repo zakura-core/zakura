@@ -1,7 +1,7 @@
 //! Response type for the `validateaddress` RPC.
 
-use derive_getters::Getters;
 use derive_new::new;
+use getset::{CopyGetters, Getters};
 use jsonrpsee::core::RpcResult;
 use zakura_chain::{
     parameters::{Network, NetworkKind},
@@ -12,23 +12,34 @@ use crate::methods::types::validate_address;
 
 /// `validateaddress` response
 #[derive(
-    Clone, Default, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, Getters, new,
+    Clone,
+    Default,
+    Debug,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    Getters,
+    CopyGetters,
+    new,
 )]
 pub struct ValidateAddressResponse {
     /// Whether the address is valid.
     ///
     /// If not, this is the only property returned.
     #[serde(rename = "isvalid")]
+    #[getset(get_copy = "pub")]
     pub(crate) is_valid: bool,
 
     /// The zcash address that has been validated.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[getset(get = "pub")]
     pub(crate) address: Option<String>,
 
     /// If the key is a script.
     #[serde(rename = "isscript")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     pub(crate) is_script: Option<bool>,
 }
 

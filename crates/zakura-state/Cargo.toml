@@ -83,7 +83,7 @@ howudoin = { workspace = true, optional = true }
 # test feature proptest-impl
 proptest = { workspace = true, optional = true }
 proptest-derive = { workspace = true, optional = true }
-derive-getters.workspace = true
+getset.workspace = true
 derive-new.workspace = true
 
 [dev-dependencies]

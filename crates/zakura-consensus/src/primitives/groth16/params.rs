@@ -2,7 +2,7 @@
 
 use bellman::groth16::{prepare_verifying_key, PreparedVerifyingKey, VerifyingKey};
 use bls12_381::Bls12;
-use derive_getters::Getters;
+use getset::Getters;
 
 lazy_static::lazy_static! {
     /// Spend parameters for the Sprout circuit.
@@ -20,6 +20,7 @@ lazy_static::lazy_static! {
 /// Note that adding value to the Sprout pool was disabled by the Canopy network upgrade.
 #[derive(Getters)]
 pub struct SproutParams {
+    #[getset(get = "pub")]
     prepared_verifying_key: PreparedVerifyingKey<Bls12>,
 }
 

@@ -8,7 +8,8 @@ Slice=zakura-profile.slice
 Type=simple
 User=zakura-profile
 Group=zakura-profile
-ExecStart=/usr/bin/python3 /opt/zakura-profile/sample.py --store /srv/zakura-profile/data --node-service zakurad --executable /usr/local/bin/zakurad --frequency 2000 --stack-bytes 32768 --duration-seconds 0
+# Restart gracefully to release deleted perf captures still held by memory mappings.
+ExecStart=/usr/bin/python3 /opt/zakura-profile/sample.py --store /srv/zakura-profile/data --node-service zakurad --executable /usr/local/bin/zakurad --frequency 2000 --stack-bytes 32768 --duration-seconds 1800
 Restart=always
 RestartSec=5
 TimeoutStopSec=90

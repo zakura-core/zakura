@@ -199,6 +199,11 @@ struct PeerState {
     session: PeerSession,
     status_publisher: Option<StatusPublisher>,
     last_status: Option<Status>,
+    /// Target of this session's last retired ordinary work.
+    ///
+    /// A status replay skips this peer for that target, so two peers that both answer Busy
+    /// wait for a fresh status instead of handing the target back and forth.
+    retired_target: Option<block::Hash>,
     /// Consecutive requests this session answered with nothing usable.
     unproductive_requests: u32,
 }
@@ -982,6 +987,7 @@ impl HeaderSyncReactor {
                 session,
                 status_publisher,
                 last_status: None,
+                retired_target: None,
                 unproductive_requests: 0,
             },
         ) {
@@ -4994,7 +5000,73 @@ impl HeaderSyncReactor {
         self.unproductive_peer_cooldowns.len() != before
     }
 
+    /// Retires `peer`'s work and offers a freed ordinary slot to the statuses other peers
+    /// already sent.
     fn retire_peer_work(&mut self, peer: &ZakuraPeerId, terminal_outcome: HeaderRequestTerminal) {
+        let retired_target = match self.peer_work_queue.active(peer) {
+            Some(active) if active.purpose == HeaderTargetPurpose::Normal => {
+                Some(active.target.status.selected_tip_hash)
+            }
+            Some(_) => None,
+            None => self
+                .peer_work_queue
+                .awaiting_target(peer)
+                .map(|target| target.status.selected_tip_hash),
+        };
+        self.retire_peer_work_without_replay(peer, terminal_outcome);
+        if let Some(retired_target) = retired_target {
+            if let Some(state) = self.peer_state.get_mut(peer) {
+                state.retired_target = Some(retired_target);
+            }
+            self.replay_retained_statuses(peer);
+        }
+    }
+
+    /// Reconsiders the retained status of every other idle peer.
+    ///
+    /// The queue drops a status that names an owned target or arrives at capacity.
+    /// Without this replay, an owner that answers Busy and re-sends its status takes the
+    /// target back before any alternate refreshes, and refused peers wait for their next
+    /// refresh. Skipping a peer is a scheduling preference, not a penalty: its own next
+    /// status still stages normally.
+    fn replay_retained_statuses(&mut self, retired_peer: &ZakuraPeerId) {
+        let Some(current) = self.committed_snapshot.as_ref() else {
+            return;
+        };
+        let claimed = self.peer_work_queue.claimed_header_count();
+        let targets: Vec<_> = self
+            .peer_state
+            .iter()
+            .filter(|(peer, _)| {
+                *peer != retired_peer
+                    && self.peer_work_queue.active(peer).is_none()
+                    && self.peer_work_queue.awaiting_target(peer).is_none()
+            })
+            .filter_map(|(peer, state)| {
+                state
+                    .last_status
+                    .as_ref()
+                    .filter(|status| {
+                        state.retired_target != Some(status.selected_tip_hash)
+                            && Self::request_header_prefix_remaining(
+                                current,
+                                claimed,
+                                status.selected_tip_height,
+                            ) > 0
+                    })
+                    .map(|status| (peer.clone(), state.session.session_id(), status.clone()))
+            })
+            .collect();
+        for (peer, session_id, status) in targets {
+            self.consider_advertised_header_target(peer, session_id, status);
+        }
+    }
+
+    fn retire_peer_work_without_replay(
+        &mut self,
+        peer: &ZakuraPeerId,
+        terminal_outcome: HeaderRequestTerminal,
+    ) {
         self.request_deadlines.remove(peer);
         let reserved = self.peer_work_queue.reserved_header_count(peer);
         let owned = self.peer_work_queue.owned_header_count(peer);
@@ -5024,8 +5096,9 @@ impl HeaderSyncReactor {
 
     fn retire_all_peer_work(&mut self, terminal_outcome: HeaderRequestTerminal) {
         let peers: Vec<_> = self.peer_state.keys().cloned().collect();
+        // Shutdown frees every slot, so a replay would only stage work this loop discards.
         for peer in peers {
-            self.retire_peer_work(&peer, terminal_outcome);
+            self.retire_peer_work_without_replay(&peer, terminal_outcome);
         }
     }
 

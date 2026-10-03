@@ -9,6 +9,7 @@ pub mod get_mining_info;
 pub mod get_raw_mempool;
 pub mod long_poll;
 pub mod network_info;
+pub(crate) mod network_parameters;
 pub mod peer_info;
 pub mod submit_block;
 pub mod subsidy;

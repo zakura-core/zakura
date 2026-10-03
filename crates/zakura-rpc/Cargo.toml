@@ -108,6 +108,7 @@ zakura-chain = { path = "../zakura-chain", version = "10.0.0", features = [
     "json-conversion",
 ] }
 zakura-consensus = { path = "../zakura-consensus", version = "10.0.1" }
+zakura-header-chain = { path = "../zakura-header-chain", version = "4.0.1" }
 zakura-network = { path = "../zakura-network", version = "10.0.0" }
 zakura-node-services = { path = "../zakura-node-services", version = "5.0.0", features = [
     "rpc-client",

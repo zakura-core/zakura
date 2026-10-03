@@ -789,6 +789,32 @@
           "$ref": "#/components/schemas/OpenRPC%20Schema"
         }
       }
+    },
+    {
+      "name": "getnetworkparameters",
+      "summary": "Returns the configured consensus rules for a block at `height`.",
+      "description": "Returns the configured consensus rules for a block at `height`.\nThis does not require that the block has been mined.",
+      "params": [
+        {
+          "name": "height",
+          "summary": "The height of the block to return.",
+          "description": "The height of the block to return.",
+          "required": true,
+          "schema": {
+            "type": "integer",
+            "format": "uint32",
+            "minimum": 0.0
+          }
+        }
+      ],
+      "result": {
+        "name": "getnetworkparameters_result",
+        "summary": "An OpenRPC document.",
+        "description": "An OpenRPC document.",
+        "schema": {
+          "$ref": "#/components/schemas/OpenRPC%20Schema"
+        }
+      }
     }
   ],
   "components": {

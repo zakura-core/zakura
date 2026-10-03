@@ -27,6 +27,7 @@ use zakura_state::{self as zs};
 
 use zakura_chain::{
     block::{self, Block},
+    parameters::Network,
     serialization::ZcashSerialize,
     transaction::UnminedTxId,
 };
@@ -50,7 +51,7 @@ use cached_peer_addr_response::CachedPeerAddrResponse;
 #[cfg(test)]
 mod tests;
 
-use downloads::{Downloads as BlockDownloads, GossipedParentHeightMismatch};
+use downloads::{Downloads as BlockDownloads, GossipedUnboundHeight};
 
 /// The maximum response time for block-body requests that can wait for a mined-block commit.
 ///
@@ -71,6 +72,11 @@ const DEFAULT_INBOUND_RESPONSE_TIME: Duration = Duration::from_secs(5);
 /// <https://github.com/zcash/zcash/blob/829dd94f9d253bb705f9e194f13cb8ca8e545e1e/src/net.h#L84>
 /// as used in `ProcessGetData()`:
 /// <https://github.com/zcash/zcash/blob/829dd94f9d253bb705f9e194f13cb8ca8e545e1e/src/main.cpp#L6410-L6412>
+///
+/// Unlike `zcashd`, which answers the rest of a request once its send buffer drains, the
+/// ignored IDs are never answered. Block requests from zcashd-compat sidecar peers skip this
+/// limit: a sidecar fetches every block from this node, and waits for an ignored block until its
+/// download timeout disconnects it.
 pub const GETDATA_SENT_BYTES_LIMIT: usize = 1_000_000;
 
 /// The maximum number of blocks the [`Inbound`] service will queue in response to a block request,
@@ -143,12 +149,7 @@ impl PrunedBlockNotFoundLogger {
     }
 
     fn is_enabled_for(&self, source: Option<&zn::PeerSource>) -> bool {
-        let Some(zn::PeerSource::LegacySocket(addr)) = source else {
-            return false;
-        };
-        let source_ip = canonical_ip(addr.remove_socket_addr_privacy().ip());
-
-        self.tx_retention.is_some() && self.peer_ips.contains(&source_ip)
+        self.tx_retention.is_some() && is_zcashd_compat_source(&self.peer_ips, source)
     }
 
     /// Reserves the current log interval and returns the configured retention.
@@ -172,6 +173,16 @@ impl PrunedBlockNotFoundLogger {
         *last_log = Some(now);
         Some(tx_retention)
     }
+}
+
+/// Returns whether `source` is a legacy connection from one of the canonical zcashd-compat
+/// `peer_ips`.
+fn is_zcashd_compat_source(peer_ips: &HashSet<IpAddr>, source: Option<&zn::PeerSource>) -> bool {
+    let Some(zn::PeerSource::LegacySocket(addr)) = source else {
+        return false;
+    };
+
+    peer_ips.contains(&canonical_ip(addr.remove_socket_addr_privacy().ip()))
 }
 
 fn canonical_ip(ip: IpAddr) -> IpAddr {
@@ -251,6 +262,9 @@ pub struct InboundSetupData {
 
     /// Allows efficient access to the best tip of the blockchain.
     pub latest_chain_tip: zs::LatestChainTip,
+
+    /// The network whose target spacing scales the gossip lookahead window.
+    pub network: Network,
 
     /// A channel to send misbehavior reports to the [`AddressBook`].
     pub misbehavior_sender: tokio::sync::mpsc::Sender<(PeerSocketAddr, u32)>,
@@ -364,6 +378,10 @@ pub struct Inbound {
     /// Diagnostics for zcashd-compat requests that need pruned block bodies.
     pruned_block_not_found_logger: Arc<PrunedBlockNotFoundLogger>,
 
+    /// Canonical zcashd-compat sidecar IPs, whose block requests skip
+    /// [`GETDATA_SENT_BYTES_LIMIT`].
+    zcashd_compat_peer_ips: HashSet<IpAddr>,
+
     /// Early-advertised mined blocks waiting for contextual commit.
     pending_blocks: PendingBlockRegistry,
 }
@@ -404,6 +422,11 @@ impl Inbound {
                 setup,
             },
             expose_peer_addresses,
+            zcashd_compat_peer_ips: zcashd_compat_peer_ips
+                .iter()
+                .copied()
+                .map(canonical_ip)
+                .collect(),
             pruned_block_not_found_logger: Arc::new(PrunedBlockNotFoundLogger::new(
                 zcashd_compat_pruning_retention,
                 zcashd_compat_peer_ips,
@@ -449,6 +472,7 @@ impl Service<zn::Request> for Inbound {
                         mempool,
                         state,
                         latest_chain_tip,
+                        network,
                         misbehavior_sender,
                     } = setup_data;
 
@@ -461,6 +485,7 @@ impl Service<zn::Request> for Inbound {
                         Timeout::new(block_verifier, BLOCK_VERIFY_TIMEOUT),
                         state.clone(),
                         latest_chain_tip,
+                        network,
                     ));
 
                     result = Ok(());
@@ -529,7 +554,7 @@ impl Service<zn::Request> for Inbound {
                     // Scoring and re-requesting are kept together here rather than split across
                     // `block_misbehavior`, because the re-request needs `block_downloads` and
                     // the two decisions are the same decision.
-                    if let Some(mismatch) = err.downcast_ref::<GossipedParentHeightMismatch>() {
+                    if let Some(mismatch) = err.downcast_ref::<GossipedUnboundHeight>() {
                         if let Some(advertiser_addr) = advertiser_addr {
                             let _ = misbehavior_sender.try_send((
                                 advertiser_addr,
@@ -647,6 +672,12 @@ impl Service<zn::Request> for Inbound {
                 };
                 let log_pruned_block =
                     pruned_block_not_found_logger.is_enabled_for(source.as_ref());
+                let byte_limit =
+                    if is_zcashd_compat_source(&self.zcashd_compat_peer_ips, source.as_ref()) {
+                        usize::MAX
+                    } else {
+                        GETDATA_SENT_BYTES_LIMIT
+                    };
 
                 // We return an available or missing response to each inventory request,
                 // unless the request is empty, or it reaches a response limit.
@@ -664,7 +695,7 @@ impl Service<zn::Request> for Inbound {
                     let mut lookup_results = Vec::new();
 
                     for (index, &hash) in hashes.iter().take(GETDATA_MAX_BLOCK_COUNT).enumerate() {
-                        if state_lookup_bytes >= GETDATA_SENT_BYTES_LIMIT {
+                        if state_lookup_bytes >= byte_limit {
                             break;
                         }
 
@@ -689,7 +720,7 @@ impl Service<zn::Request> for Inbound {
                     lookup_results.sort_unstable_by_key(|(index, _, _)| *index);
 
                     for (_, hash, block) in lookup_results {
-                        if total_size >= GETDATA_SENT_BYTES_LIMIT {
+                        if total_size >= byte_limit {
                             break;
                         }
 

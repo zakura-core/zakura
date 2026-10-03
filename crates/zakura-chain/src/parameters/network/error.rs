@@ -1,10 +1,13 @@
 //! Error types for `ParametersBuilder`.
 
-use std::path::PathBuf;
+use std::{ops::Range, path::PathBuf};
 
 use thiserror::Error;
 
-use crate::{block::Height, parameters::subsidy::FundingStreamReceiver};
+use crate::{
+    block::Height,
+    parameters::subsidy::{FundingStreamReceiver, SubsidyError},
+};
 
 /// An error that can occur when building `Parameters` using `ParametersBuilder`.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
@@ -61,6 +64,31 @@ pub enum ParametersBuilderError {
     #[non_exhaustive]
     HalvingIntervalAfterFundingStreams,
 
+    #[error("halving interval must be positive and fit in i64 as both target seconds and post-Blossom blocks")]
+    #[non_exhaustive]
+    InvalidHalvingInterval,
+
+    #[error(
+        "cannot derive the NSM seed at {seed_height:?}, because its scheduled issuance is invalid: {source}"
+    )]
+    #[non_exhaustive]
+    InvalidDerivedNsmSeedSchedule {
+        seed_height: Height,
+        #[source]
+        source: SubsidyError,
+    },
+
+    #[error(
+        "cannot derive the NSM seed at {seed_height:?}: scheduled issuance \
+         {scheduled_issuance} exceeds MAX_MONEY; configure an explicit \
+         initial_nsm_value_balance or change the subsidy schedule"
+    )]
+    #[non_exhaustive]
+    DerivedNsmSeedExceedsMaxMoney {
+        seed_height: Height,
+        scheduled_issuance: u128,
+    },
+
     #[error("checkpoints file format must be valid")]
     #[non_exhaustive]
     InvalidCheckpointsFormat,
@@ -99,6 +127,18 @@ pub enum ParametersBuilderError {
     FundingStreamAddressNotP2SH {
         receiver: FundingStreamReceiver,
         address: String,
+    },
+
+    #[error(
+        "configured funding stream ranges must not overlap: stream {first_index} {first_range:?} \
+         overlaps stream {second_index} {second_range:?}"
+    )]
+    #[non_exhaustive]
+    OverlappingFundingStreams {
+        first_index: usize,
+        first_range: Range<Height>,
+        second_index: usize,
+        second_range: Range<Height>,
     },
 
     #[error(

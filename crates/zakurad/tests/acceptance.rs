@@ -139,14 +139,13 @@ mod common;
 use std::{
     cmp::Ordering,
     collections::HashSet,
-    env, fs,
-    net::SocketAddr,
-    panic,
-    path::Path,
+    env, fs, panic,
     path::PathBuf,
     sync::Arc,
     time::{Duration, Instant},
 };
+#[cfg(not(target_os = "windows"))]
+use std::{net::SocketAddr, path::Path};
 
 use color_eyre::{
     eyre::{eyre, WrapErr},
@@ -169,9 +168,11 @@ use zakura_chain::{
     transparent,
 };
 use zakura_node_services::rpc_client::RpcRequestClient;
+#[cfg(not(target_os = "windows"))]
+use zakura_rpc::client::GetBlockHashResponse;
 use zakura_rpc::{
     client::{
-        BlockTemplateResponse, DefaultRoots, GetBlockHashResponse, GetBlockTemplateParameters,
+        BlockTemplateResponse, DefaultRoots, GetBlockTemplateParameters,
         GetBlockTemplateRequestMode, GetBlockTemplateResponse, SubmitBlockErrorResponse,
         SubmitBlockResponse, TransactionTemplate,
     },
@@ -1794,65 +1795,55 @@ async fn check_rpc_endpoint_content_types(client: &RpcRequestClient) -> Result<(
 /// Then make sure Zebra drops excess log lines. (Previously, it would block waiting for logs to be read.)
 ///
 /// This test is unreliable and sometimes hangs on macOS.
-#[test]
+#[tokio::test]
 #[cfg(not(target_os = "macos"))]
-fn non_blocking_logger() -> Result<()> {
-    use futures::FutureExt;
-    use std::{sync::mpsc, time::Duration};
+async fn non_blocking_logger() -> Result<()> {
+    use std::time::Duration;
 
-    let rt = tokio::runtime::Runtime::new().unwrap();
-    let (done_tx, done_rx) = mpsc::channel();
+    let mut config = common::config::random_known_rpc_port_config(false, &Mainnet)?;
+    config.tracing.filter = Some("trace".to_string());
+    config.tracing.buffer_limit = 100;
+    let rpc_address = config
+        .rpc
+        .listen_addr
+        .expect("random known RPC port config sets a listen address");
 
-    let test_task_handle: tokio::task::JoinHandle<Result<()>> = rt.spawn(async move {
-        let mut config = os_assigned_rpc_port_config(false, &Mainnet)?;
-        config.tracing.filter = Some("trace".to_string());
-        config.tracing.buffer_limit = 100;
+    let dir = testdir()?.with_config(&mut config)?;
+    let mut child = dir.spawn_child(args!["start"])?;
+    let client = RpcRequestClient::new_with_timeout(rpc_address, Duration::from_secs(3));
 
-        let dir = testdir()?.with_config(&mut config)?;
-        let mut child = dir
-            .spawn_child(args!["start"])?
-            .with_timeout(TINY_CHECKPOINT_TIMEOUT);
-
-        // Wait until port is open.
-        let rpc_address = read_listen_addr_from_logs(&mut child, OPENED_RPC_ENDPOINT_MSG)?;
-
-        // Create an http client
-        let client = RpcRequestClient::new(rpc_address);
-
-        // Most of Zebra's lines are 100-200 characters long, so 500 requests should print enough to fill the unix pipe,
-        // fill the channel that tracing logs are queued onto, and drop logs rather than block execution.
-        for _ in 0..500 {
-            let res = client.call("getinfo", "[]".to_string()).await?;
-
-            // Test that zakurad rpc endpoint is still responding to requests
-            assert!(res.status().is_success());
+    let requests = tokio::time::timeout(Duration::from_secs(90), async {
+        // Readiness must not depend on a startup message in the lossy logger being tested.
+        // Leave stdout unread from startup so the pipe and tracing queue can fill.
+        loop {
+            if let Ok(response) = client.call("getinfo", "[]").await {
+                if response.status().is_success() {
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
 
-        child.kill(false)?;
+        // Most log lines are 100-200 characters long, so 500 requests fill the pipe
+        // and tracing queue. RPC must keep responding while excess logs are dropped.
+        for _ in 0..500 {
+            let response = client.call("getinfo", "[]").await?;
+            assert!(response.status().is_success());
+        }
 
-        let output = child.wait_with_output()?;
-        let output = output.assert_failure()?;
+        Ok::<(), color_eyre::Report>(())
+    })
+    .await;
 
-        // [Note on port conflict](#Note on port conflict)
-        output
-            .assert_was_killed()
-            .wrap_err("Possible port conflict. Are there other acceptance tests running?")?;
+    // Kill before collecting output, including when readiness or the requests time out.
+    child.kill(false)?;
+    let output = child.wait_with_output()?.assert_failure()?;
+    output
+        .assert_was_killed()
+        .wrap_err("Possible port conflict. Are there other acceptance tests running?")?;
 
-        done_tx.send(())?;
-
-        Ok(())
-    });
-
-    // Wait until the spawned task finishes up to 45 seconds before shutting down tokio runtime
-    if done_rx.recv_timeout(Duration::from_secs(90)).is_ok() {
-        rt.shutdown_timeout(Duration::from_secs(3));
-    }
-
-    match test_task_handle.now_or_never() {
-        Some(Ok(result)) => result,
-        Some(Err(error)) => Err(eyre!("join error: {:?}", error)),
-        None => Err(eyre!("unexpected test task hang")),
-    }
+    requests.wrap_err("RPC readiness and 500 requests must complete within 90 seconds")??;
+    Ok(())
 }
 
 /// Make sure `lightwalletd` works with Zebra, when both their states are empty.
@@ -3877,6 +3868,7 @@ async fn nu6_funding_streams_and_coinbase_balance() -> Result<()> {
         Height(block_template.height()),
         &miner_params,
         Amount::zero(),
+        None,
     )
     .expect("coinbase transaction should be valid under the given parameters");
 
@@ -3943,6 +3935,7 @@ async fn nu6_funding_streams_and_coinbase_balance() -> Result<()> {
         Height(block_template.height()),
         &miner_params,
         Amount::zero(),
+        None,
     )
     .expect("coinbase transaction should be valid under the given parameters");
 
@@ -4443,6 +4436,7 @@ async fn wake_debug_mempool(rpc_client: &RpcRequestClient) -> Result<()> {
 }
 
 /// Generates blocks through a cookie-authenticated test RPC listener.
+#[cfg(not(target_os = "windows"))]
 async fn generate_with_cookie(
     rpc_address: SocketAddr,
     cookie_path: &Path,

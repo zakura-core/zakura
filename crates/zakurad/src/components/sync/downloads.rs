@@ -27,17 +27,18 @@ use tracing::Instrument;
 use zakura_chain::{
     block::{self, Height, HeightDiff},
     chain_tip::ChainTip,
+    parameters::Network,
 };
 use zakura_network::{self as zn, PeerSocketAddr};
 use zakura_state as zs;
 
 use crate::components::{
-    auth_download_height::parent_height_mismatch,
+    auth_download_height::height_is_unbound,
     sync::{
         legacy_trace::{
             LegacyBlockOutcome, LegacyDiagnosticSnapshot, LegacySyncTrace, LegacyTaskState,
         },
-        BLOCK_DOWNLOAD_TIMEOUT, FINAL_CHECKPOINT_BLOCK_VERIFY_TIMEOUT,
+        lookahead_limit_multiplier, BLOCK_DOWNLOAD_TIMEOUT, FINAL_CHECKPOINT_BLOCK_VERIFY_TIMEOUT,
         FINAL_CHECKPOINT_BLOCK_VERIFY_TIMEOUT_LIMIT,
     },
 };
@@ -65,6 +66,45 @@ pub const VERIFICATION_PIPELINE_SCALING_MULTIPLIER: usize = 2;
 /// The maximum height difference between Zebra's state tip and a downloaded block.
 /// Blocks higher than this will get dropped and return an error.
 pub const VERIFICATION_PIPELINE_DROP_LIMIT: HeightDiff = 50_000;
+
+/// Returns the downloader's drop, pause, and reset heights for `tip_height`.
+///
+/// `multiplier` scales `lookahead_limit` and [`VERIFICATION_PIPELINE_DROP_LIMIT`]
+/// together, so the syncer never requests blocks that the downloader would drop
+/// just because they arrived before earlier blocks were committed.
+pub(super) fn lookahead_heights(
+    tip_height: Option<block::Height>,
+    lookahead_limit: usize,
+    multiplier: usize,
+) -> (block::Height, block::Height, block::Height) {
+    let lookahead_limit = lookahead_limit * multiplier;
+    let drop_limit = VERIFICATION_PIPELINE_DROP_LIMIT
+        * HeightDiff::try_from(multiplier).expect("the lookahead multiplier fits in HeightDiff");
+
+    if let Some(tip_height) = tip_height {
+        // Scale the height limit with the lookahead limit,
+        // so users with low capacity or under DoS can reduce them both.
+        let lookahead_pause = HeightDiff::try_from(
+            lookahead_limit + lookahead_limit * VERIFICATION_PIPELINE_SCALING_MULTIPLIER,
+        )
+        .expect("fits in HeightDiff");
+
+        (
+            (tip_height + drop_limit).expect("tip is much lower than Height::MAX"),
+            (tip_height + lookahead_pause).expect("tip is much lower than Height::MAX"),
+            (tip_height + lookahead_pause / 2).expect("tip is much lower than Height::MAX"),
+        )
+    } else {
+        let genesis_drop = drop_limit.try_into().expect("fits in u32");
+        let genesis_lookahead = u32::try_from(lookahead_limit - 1).expect("fits in u32");
+
+        (
+            block::Height(genesis_drop),
+            block::Height(genesis_lookahead),
+            block::Height(genesis_lookahead / 2),
+        )
+    }
+}
 
 #[derive(Copy, Clone, Debug)]
 pub(super) struct AlwaysHedge;
@@ -125,11 +165,17 @@ pub enum BlockDownloadVerifyError {
         hash: block::Hash,
     },
 
-    /// The supplied body claims a height inconsistent with its committed parent.
-    #[error("downloaded block claimed height {height:?} instead of {expected_height:?}: {hash:?}")]
-    ParentHeightMismatch {
-        height: Option<block::Height>,
-        expected_height: block::Height,
+    /// A downloaded body claims a coinbase height that its header does not commit to.
+    ///
+    /// V5+ coinbase `scriptSig`s are not covered by the mined transaction ID, the transaction
+    /// merkle root, or the block hash, so a peer can rewrite the claimed height of an otherwise
+    /// canonical body without changing the requested hash. The body is not the block its header
+    /// names, so only its supplier is at fault. See `crate::components::auth_download_height`.
+    #[error(
+        "downloaded block claimed a height its header does not commit to: {height:?} {hash:?}"
+    )]
+    UnboundHeight {
+        height: block::Height,
         hash: block::Hash,
         advertiser_addr: Option<PeerSocketAddr>,
     },
@@ -211,7 +257,7 @@ impl BlockDownloadVerifyError {
             Self::AboveLookaheadHeightLimit {
                 advertiser_addr, ..
             }
-            | Self::ParentHeightMismatch {
+            | Self::UnboundHeight {
                 advertiser_addr, ..
             }
             | Self::InvalidHeight {
@@ -264,7 +310,7 @@ impl From<tokio::time::error::Elapsed> for BlockDownloadVerifyError {
 /// Represents a [`Stream`] of download and verification tasks during chain sync.
 #[pin_project]
 #[derive(Debug)]
-pub struct Downloads<ZN, ZV, ZSTip, ZS>
+pub struct Downloads<ZN, ZV, ZSTip>
 where
     ZN: Service<zn::Request, Response = zn::Response, Error = BoxError> + Send + Sync + 'static,
     ZN::Future: Send,
@@ -275,8 +321,6 @@ where
         + 'static,
     ZV::Future: Send,
     ZSTip: ChainTip + Clone + Send + 'static,
-    ZS: Service<zs::Request, Response = zs::Response, Error = BoxError> + Clone + Send + 'static,
-    ZS::Future: Send,
 {
     // Services
     //
@@ -286,7 +330,6 @@ where
 
     /// A service that verifies downloaded blocks.
     verifier: ZV,
-    state: ZS,
 
     /// Allows efficient access to the best tip of the blockchain.
     latest_chain_tip: ZSTip,
@@ -295,6 +338,9 @@ where
     //
     /// The configured lookahead limit, after applying the minimum limit.
     lookahead_limit: usize,
+
+    /// The configured network, which sets the target spacing for the lookahead limit.
+    chain_network: Network,
 
     /// The largest block height for the checkpoint verifier, based on the current config.
     max_checkpoint_height: Height,
@@ -337,7 +383,7 @@ fn take_task_state(
         .remove(&hash)
 }
 
-impl<ZN, ZV, ZSTip, ZS> Stream for Downloads<ZN, ZV, ZSTip, ZS>
+impl<ZN, ZV, ZSTip> Stream for Downloads<ZN, ZV, ZSTip>
 where
     ZN: Service<zn::Request, Response = zn::Response, Error = BoxError> + Send + Sync + 'static,
     ZN::Future: Send,
@@ -348,8 +394,6 @@ where
         + 'static,
     ZV::Future: Send,
     ZSTip: ChainTip + Clone + Send + 'static,
-    ZS: Service<zs::Request, Response = zs::Response, Error = BoxError> + Clone + Send + 'static,
-    ZS::Future: Send,
 {
     type Item = Result<(Height, block::Hash), BlockDownloadVerifyError>;
 
@@ -392,7 +436,7 @@ where
     }
 }
 
-impl<ZN, ZV, ZSTip, ZS> Downloads<ZN, ZV, ZSTip, ZS>
+impl<ZN, ZV, ZSTip> Downloads<ZN, ZV, ZSTip>
 where
     ZN: Service<zn::Request, Response = zn::Response, Error = BoxError> + Send + Sync + 'static,
     ZN::Future: Send,
@@ -403,14 +447,13 @@ where
         + 'static,
     ZV::Future: Send,
     ZSTip: ChainTip + Clone + Send + 'static,
-    ZS: Service<zs::Request, Response = zs::Response, Error = BoxError> + Clone + Send + 'static,
-    ZS::Future: Send,
 {
     /// Initialize a new download stream with the provided `network` and
     /// `verifier` services.
     ///
     /// Uses the `latest_chain_tip` and `lookahead_limit` to drop blocks
-    /// that are too far ahead of the current state tip.
+    /// that are too far ahead of the current state tip. The `chain_network`
+    /// target spacing at the tip scales the `lookahead_limit`.
     /// Uses `max_checkpoint_height` to work around a known block timeout (#5125).
     ///
     /// The [`Downloads`] stream is agnostic to the network policy, so retry and
@@ -420,10 +463,10 @@ where
     pub fn new(
         network: ZN,
         verifier: ZV,
-        state: ZS,
         latest_chain_tip: ZSTip,
         past_lookahead_limit_sender: watch::Sender<bool>,
         lookahead_limit: usize,
+        chain_network: Network,
         max_checkpoint_height: Height,
         trace: LegacySyncTrace,
     ) -> Self {
@@ -433,9 +476,9 @@ where
         Self {
             network,
             verifier,
-            state,
             latest_chain_tip,
             lookahead_limit,
+            chain_network,
             max_checkpoint_height,
             past_lookahead_limit_sender: Arc::new(std::sync::Mutex::new(
                 past_lookahead_limit_sender,
@@ -560,10 +603,10 @@ where
         let (cancel_tx, mut cancel_rx) = oneshot::channel::<()>();
 
         let mut verifier = self.verifier.clone();
-        let state = self.state.clone();
         let latest_chain_tip = self.latest_chain_tip.clone();
 
         let lookahead_limit = self.lookahead_limit;
+        let chain_network = self.chain_network.clone();
         let max_checkpoint_height = self.max_checkpoint_height;
 
         let past_lookahead_limit_sender = self.past_lookahead_limit_sender.clone();
@@ -649,33 +692,11 @@ where
                 // that will timeout before being verified.
                 let tip_height = latest_chain_tip.best_tip_height();
 
-                // Read separately from `tip_height`, and used only by the new tip-child height
-                // check below. Deriving `tip_height` from this pair instead would couple the
-                // existing lookahead and behind-tip policies to hash availability: a chain tip
-                // reporting a height but not yet a hash would fall into the no-tip regime.
-                let best_tip = latest_chain_tip.best_tip_height_and_hash();
-
-                let (lookahead_drop_height, lookahead_pause_height, lookahead_reset_height) = if let Some(tip_height) = tip_height {
-                    // Scale the height limit with the lookahead limit,
-                    // so users with low capacity or under DoS can reduce them both.
-                    let lookahead_pause = HeightDiff::try_from(
-                        lookahead_limit + lookahead_limit * VERIFICATION_PIPELINE_SCALING_MULTIPLIER,
-                    )
-                        .expect("fits in HeightDiff");
-
-
-                    ((tip_height + VERIFICATION_PIPELINE_DROP_LIMIT).expect("tip is much lower than Height::MAX"),
-                     (tip_height + lookahead_pause).expect("tip is much lower than Height::MAX"),
-                     (tip_height + lookahead_pause/2).expect("tip is much lower than Height::MAX"))
-                } else {
-                    let genesis_drop = VERIFICATION_PIPELINE_DROP_LIMIT.try_into().expect("fits in u32");
-                    let genesis_lookahead =
-                        u32::try_from(lookahead_limit - 1).expect("fits in u32");
-
-                    (block::Height(genesis_drop),
-                     block::Height(genesis_lookahead),
-                     block::Height(genesis_lookahead/2))
-                };
+                // The target spacing at the tip scales the lookahead limit.
+                let multiplier =
+                    tip_height.map_or(1, |tip_height| lookahead_limit_multiplier(&chain_network, tip_height));
+                let (lookahead_drop_height, lookahead_pause_height, lookahead_reset_height) =
+                    lookahead_heights(tip_height, lookahead_limit, multiplier);
 
                 // Get the finalized tip height, assuming we're using the non-finalized state.
                 //
@@ -692,30 +713,37 @@ where
                     })
                     .unwrap_or(block::Height(0));
 
-                let claimed_height = block.coinbase_height();
-                if let Some(expected_height) = parent_height_mismatch(
-                    state,
-                    block.header.previous_block_hash,
-                    claimed_height,
-                    best_tip,
-                ).await {
-                    if let Some(feedback) = &supplier_feedback { feedback.reject(); }
-                    return Err(BlockDownloadVerifyError::ParentHeightMismatch {
-                        height: claimed_height,
-                        expected_height,
-                        hash,
-                        advertiser_addr,
-                    });
-                }
                 // A body with no coinbase height cannot be the block this header commits to.
                 // The block identifier comes from the header, so the response still satisfies
                 // the requested hash: only the supplier is implicated, and without excluding it
                 // the same peer stays eligible for this hash on every retry. The advertiser
                 // stays unattributed, because it did not choose the body.
-                let Some(block_height) = claimed_height else {
+                let Some(block_height) = block.coinbase_height() else {
                     if let Some(feedback) = &supplier_feedback { feedback.reject(); }
                     return Err(BlockDownloadVerifyError::InvalidHeight { hash, advertiser_addr: None });
                 };
+
+                // Security: authenticate the claimed coinbase height before any height policy
+                // below uses it. Otherwise a rewritten height would make those policies drop
+                // the requested hash as a benign old or far-ahead block: unattributed,
+                // unscored, and not requeued. See `crate::components::auth_download_height`.
+                let policy_uses_height =
+                    block_height > lookahead_pause_height || block_height < min_accepted_height;
+                if height_is_unbound(&block, block_height, policy_uses_height) {
+                    debug!(
+                        ?hash,
+                        ?block_height,
+                        "body claimed a height its header does not commit to: rejected poisoned block"
+                    );
+                    metrics::counter!("sync.unbound.height.count").increment(1);
+
+                    if let Some(feedback) = &supplier_feedback { feedback.reject(); }
+                    return Err(BlockDownloadVerifyError::UnboundHeight {
+                        height: block_height,
+                        hash,
+                        advertiser_addr,
+                    });
+                }
 
                 trace.block_downloaded(
                     hash,

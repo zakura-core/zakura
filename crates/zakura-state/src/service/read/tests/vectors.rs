@@ -501,15 +501,6 @@ async fn any_chain_block_test() -> Result<()> {
 
     // Test: AnyChainBlock should find blocks by hash (same as Block)
     for block in &blocks {
-        let height = read_state
-            .clone()
-            .oneshot(ReadRequest::AnyChainHeight(block.hash()))
-            .await
-            .expect("height lookup succeeds");
-        assert_eq!(
-            height,
-            ReadResponse::AnyChainHeight(block.coinbase_height())
-        );
         let request = ReadRequest::AnyChainBlock(block.hash().into());
         let response = read_state
             .clone()
@@ -543,41 +534,8 @@ async fn any_chain_block_test() -> Result<()> {
         );
     }
 
-    // Pruning removes bodies but retains the committed height index.
-    let mut batch = DiskWriteBatch::new();
-    batch.prepare_prune_batch(&read_state.db, Height(1), Height(2));
-    read_state
-        .db
-        .write_batch(batch)
-        .expect("test pruning succeeds");
-    let pruned_hash = blocks[1].hash();
-    assert_eq!(
-        read_state
-            .clone()
-            .oneshot(ReadRequest::AnyChainBlock(pruned_hash.into()))
-            .await
-            .unwrap(),
-        ReadResponse::Block(None)
-    );
-    assert_eq!(
-        read_state
-            .clone()
-            .oneshot(ReadRequest::AnyChainHeight(pruned_hash))
-            .await
-            .unwrap(),
-        ReadResponse::AnyChainHeight(Some(Height(1)))
-    );
-
     // Test: Non-existent block should return None
     let fake_hash = zakura_chain::block::Hash([0xff; 32]);
-    assert_eq!(
-        read_state
-            .clone()
-            .oneshot(ReadRequest::AnyChainHeight(fake_hash))
-            .await
-            .expect("height lookup succeeds"),
-        ReadResponse::AnyChainHeight(None),
-    );
     let request = ReadRequest::AnyChainBlock(fake_hash.into());
     let response = read_state
         .clone()
@@ -588,6 +546,77 @@ async fn any_chain_block_test() -> Result<()> {
         matches!(response, ReadResponse::Block(None)),
         "AnyChainBlock should return None for non-existent block"
     );
+
+    Ok(())
+}
+
+/// Block info resolves hashes on side chains, but heights only on the best chain, even when a
+/// lower-work side chain is taller.
+#[tokio::test(flavor = "multi_thread")]
+async fn block_info_heights_resolve_on_the_best_chain() -> Result<()> {
+    use crate::{
+        arbitrary::Prepare,
+        service::{
+            finalized_state::FinalizedState, non_finalized_state::NonFinalizedState,
+            read::block_info_by_hash_or_best_chain_height,
+        },
+        tests::FakeChainHelper,
+    };
+    use zakura_chain::{amount::NonNegative, value_balance::ValueBalance};
+
+    let _init_guard = zakura_test::init();
+
+    let network = Mainnet;
+
+    // Use pre-Heartwood blocks to avoid history tree complications
+    let genesis: Arc<Block> = Arc::new(network.test_block(653599, 583999).unwrap());
+    let best_block = genesis.make_fake_child().set_work(100);
+    let side_block = genesis.make_fake_child().set_work(40);
+    let taller_side_block = side_block.make_fake_child().set_work(40);
+
+    let mut non_finalized_state = NonFinalizedState::new(&network);
+    let finalized_state = FinalizedState::new(&Config::ephemeral(), &network)
+        .expect("opening an ephemeral database should succeed");
+    finalized_state.set_finalized_value_pool(ValueBalance::<NonNegative>::fake_populated_pool());
+
+    non_finalized_state.commit_new_chain(genesis.prepare(), &finalized_state)?;
+    non_finalized_state.commit_block(best_block.clone().prepare(), &finalized_state)?;
+    non_finalized_state.commit_block(side_block.prepare(), &finalized_state)?;
+    non_finalized_state.commit_block(taller_side_block.clone().prepare(), &finalized_state)?;
+
+    assert_eq!(non_finalized_state.chain_count(), 2);
+    assert_eq!(
+        non_finalized_state
+            .best_tip()
+            .expect("the best chain has a tip")
+            .1,
+        best_block.hash()
+    );
+
+    let taller_height = taller_side_block
+        .coinbase_height()
+        .expect("fake blocks have a height");
+    assert!(block_info_by_hash_or_best_chain_height(
+        &non_finalized_state,
+        &finalized_state.db,
+        taller_side_block.hash().into(),
+    )
+    .is_some());
+    assert!(block_info_by_hash_or_best_chain_height(
+        &non_finalized_state,
+        &finalized_state.db,
+        taller_height.into(),
+    )
+    .is_none());
+    assert!(block_info_by_hash_or_best_chain_height(
+        &non_finalized_state,
+        &finalized_state.db,
+        best_block
+            .coinbase_height()
+            .expect("fake blocks have a height")
+            .into(),
+    )
+    .is_some());
 
     Ok(())
 }
@@ -649,20 +678,6 @@ async fn any_chain_block_finds_side_chain_blocks() -> Result<()> {
         2,
         "Should have 2 competing chains"
     );
-
-    let (_state, mut height_state, _tip, _tip_change) = init_test_services(&network).await;
-    let (_sender, receiver) = tokio::sync::watch::channel(non_finalized_state.clone());
-    height_state.non_finalized_state_receiver = crate::WatchReceiver::new(receiver);
-    for block in [&best_chain_block, &side_chain_block] {
-        assert_eq!(
-            height_state
-                .clone()
-                .oneshot(ReadRequest::AnyChainHeight(block.hash()))
-                .await
-                .unwrap(),
-            ReadResponse::AnyChainHeight(block.coinbase_height())
-        );
-    }
 
     // Now test with the read interface
     // We'll use the low-level block lookup functions directly
@@ -2159,4 +2174,52 @@ async fn parent_context_is_bound_to_the_requested_committed_parent() {
             "unavailable history must not substitute the current tip"
         );
     }
+}
+
+#[tokio::test]
+async fn block_sizes_by_hash_report_committed_sizes_and_none_for_unknown_hashes() -> Result<()> {
+    use tower::ServiceExt;
+    use zakura_chain::serialization::ZcashSerialize;
+
+    let _init_guard = zakura_test::init();
+    let blocks: Vec<Arc<Block>> = zakura_test::vectors::CONTINUOUS_MAINNET_BLOCKS
+        .values()
+        .map(|block_bytes| block_bytes.zcash_deserialize_into().unwrap())
+        .collect();
+    let (_state, read_state, _latest_chain_tip, _chain_tip_change) =
+        populated_state(blocks.clone(), &Mainnet).await;
+
+    let first = &blocks[0];
+    let last = blocks.last().expect("the continuous vectors are nonempty");
+    let unknown = zakura_chain::block::Hash([0xAA; 32]);
+    let expected_size = |block: &Arc<Block>| {
+        u32::try_from(block.zcash_serialized_size()).expect("mainnet test blocks fit u32")
+    };
+
+    let cases = vec![(
+        ReadRequest::BlockSizesByHash {
+            hashes: vec![first.hash(), unknown, last.hash()],
+        },
+        Ok(ReadResponse::BlockSizesByHash(vec![
+            Some(expected_size(first)),
+            None,
+            Some(expected_size(last)),
+        ])),
+    )];
+    Transcript::from(cases).check(read_state.clone()).await?;
+
+    let over_cap = usize::try_from(crate::constants::MAX_HEADER_SYNC_HEIGHT_RANGE)
+        .expect("u32 fits usize on supported targets")
+        + 1;
+    let rejected = read_state
+        .clone()
+        .oneshot(ReadRequest::BlockSizesByHash {
+            hashes: vec![unknown; over_cap],
+        })
+        .await;
+    assert!(
+        rejected.is_err(),
+        "size queries above the header range cap are rejected"
+    );
+    Ok(())
 }

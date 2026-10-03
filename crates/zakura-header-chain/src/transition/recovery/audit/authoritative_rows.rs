@@ -89,7 +89,7 @@ pub(super) fn check_authoritative_rows<S: StoreAuditSnapshot>(
 
     let mut contexts = validation_contexts.to_vec();
     contexts.sort_unstable_by_key(|record| record.height);
-    let predecessor_span = u32::try_from(crate::POW_PREDECESSOR_CONTEXT_SPAN)
+    let predecessor_span = u32::try_from(crate::MAX_POW_PREDECESSOR_CONTEXT_SPAN)
         .map_err(|_| StoreError::Incoherent("validation context bound does not fit in u32"))?;
     let required_contexts = usize::try_from(
         metadata.frontiers.finalized.height.0.min(predecessor_span),
@@ -409,25 +409,20 @@ fn source_matches_mode(
             _,
             FinalitySource::DiskMigration {
                 from_version,
-                network_policy_digest,
                 authentication: crate::DiskMigrationAuthentication::FullState,
+                ..
             },
-        ) => {
-            (1..=3).contains(&from_version.0)
-                && network_policy_digest == metadata.network_policy_digest
-                && record.previous == record.current
-        }
+        ) => (1..=3).contains(&from_version.0) && record.previous == record.current,
         (
             EngineMode::HeadersOnly,
             None,
             FinalitySource::DiskMigration {
                 from_version,
-                network_policy_digest,
                 authentication: crate::DiskMigrationAuthentication::HeadersOnlyDepth { .. },
+                ..
             },
         ) => {
             (1..=3).contains(&from_version.0)
-                && network_policy_digest == metadata.network_policy_digest
                 && record.previous == record.current
                 && record
                     .headers_only_depth_witness(config.limits.local_finality_depth.get())

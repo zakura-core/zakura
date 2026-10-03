@@ -167,6 +167,8 @@ pub struct TrustedChainSync {
     /// The finalized-tip updater, retained so `sync()` can wait for any in-flight
     /// secondary database catch-up before committing a streamed block.
     finalized_tip_updater: Option<JoinHandle<()>>,
+    /// Primary process that assigned the retained receipt orders.
+    receipt_session: Option<String>,
 }
 
 /// Signals the finalized-tip updater to stop, then waits for it to finish.
@@ -380,6 +382,7 @@ impl TrustedChainSync {
             non_finalized_state_sender,
             started_sync_sender,
             finalized_tip_updater: Some(finalized_tip_updater),
+            receipt_session: None,
         };
 
         let sync_task = tokio::spawn(async move {
@@ -414,30 +417,43 @@ impl TrustedChainSync {
             self.chain_tip_sender.set_finalized_tip(finalized_tip_block);
         }
 
+        let mut empty_state_refresh = tokio::time::interval(POLL_DELAY);
+        empty_state_refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut message_deadline = tokio::time::Instant::now() + STREAM_MESSAGE_TIMEOUT;
         loop {
             let Some(ref mut non_finalized_state_change) = non_finalized_blocks_listener else {
                 non_finalized_blocks_listener = match self
                     .subscribe_to_non_finalized_state_change()
                     .await
                 {
-                    Ok(listener) => Some(listener),
+                    Ok(listener) => listener,
                     Err(err) => {
                         tracing::warn!(?err, "failed to subscribe to non-finalized state changes");
                         tokio::time::sleep(POLL_DELAY).await;
                         None
                     }
                 };
+                message_deadline = tokio::time::Instant::now() + STREAM_MESSAGE_TIMEOUT;
 
                 continue;
             };
 
-            let message = match tokio::time::timeout(
-                STREAM_MESSAGE_TIMEOUT,
-                non_finalized_state_change.message(),
-            )
-            .await
-            {
-                Ok(Ok(Some(block_and_hash))) => block_and_hash,
+            let next_message = tokio::select! {
+                message = tokio::time::timeout_at(message_deadline, non_finalized_state_change.message()) => message,
+                _ = empty_state_refresh.tick(), if self.finalized_tip_updater.is_none()
+                    && self.non_finalized_state.is_chain_set_empty() => {
+                    // A changed session can clear all forks without sending a block.
+                    // Keep the finalized tip current while the replacement is idle.
+                    self.try_catch_up_with_primary().await;
+                    self.publish_current_state().await;
+                    continue;
+                }
+            };
+            let message = match next_message {
+                Ok(Ok(Some(block_and_hash))) => {
+                    message_deadline = tokio::time::Instant::now() + STREAM_MESSAGE_TIMEOUT;
+                    block_and_hash
+                }
                 Ok(Ok(None)) => {
                     tracing::warn!("non-finalized state change stream ended unexpectedly");
                     non_finalized_blocks_listener = None;
@@ -455,6 +471,8 @@ impl TrustedChainSync {
                 }
             };
 
+            // Orders are meaningful only when the primary identifies their session.
+            let receipt_order = self.receipt_session.as_ref().and(message.receipt_order);
             let Some((block, hash)) = message.decode() else {
                 tracing::warn!("received malformed non-finalized state change message");
                 non_finalized_blocks_listener = None;
@@ -477,7 +495,8 @@ impl TrustedChainSync {
                 continue;
             }
 
-            let block = SemanticallyVerifiedBlock::with_hash(Arc::new(block), hash);
+            let mut block = SemanticallyVerifiedBlock::with_hash(Arc::new(block), hash);
+            block.receipt_order = receipt_order;
             match self.try_commit(block).await {
                 Ok(CommitOutcome::Committed) => {
                     last_failed_commit_hash = None;
@@ -661,22 +680,25 @@ impl TrustedChainSync {
     }
 
     /// Subscribes to non-finalized state changes and returns the response stream.
+    /// Returns `None` when the primary's identity is new or unknown and local
+    /// forks must be cleared, so the caller resubscribes with empty tips.
     ///
     /// Passes every local chain tip so the server only streams missing blocks,
     /// rather than the whole state on each subscription. With no local chains,
     /// the server streams every non-finalized block.
     async fn subscribe_to_non_finalized_state_change(
         &mut self,
-    ) -> Result<Streaming<BlockAndHash>, Status> {
+    ) -> Result<Option<Streaming<BlockAndHash>>, Status> {
         let request = NonFinalizedStateChangeRequest {
             chain_tip_hashes: self
                 .non_finalized_state
                 .chain_iter()
                 .map(|c| c.non_finalized_tip_hash().bytes_in_display_order().to_vec())
                 .collect(),
+            receipt_session: self.receipt_session.clone(),
         };
 
-        tokio::time::timeout(
+        let response = tokio::time::timeout(
             SUBSCRIBE_TIMEOUT,
             self.indexer_rpc_client
                 .clone()
@@ -685,8 +707,26 @@ impl TrustedChainSync {
         .await
         .map_err(|_| {
             Status::deadline_exceeded("non_finalized_state_change subscription timed out")
-        })?
-        .map(|a| a.into_inner())
+        })??;
+        let session = response
+            .metadata()
+            .get(crate::indexer::RECEIPT_SESSION_HEADER)
+            .map(|value| value.to_str().map(str::to_owned))
+            .transpose()
+            .map_err(|_| Status::internal("invalid receipt session"))?;
+        if session != self.receipt_session {
+            // Discard the old receipt domain before accepting new blocks. Resubscribe
+            // with empty tips because this response may have honored stale tips.
+            self.non_finalized_state = NonFinalizedState::new(&self.non_finalized_state.network);
+            self.receipt_session = session;
+            if self.finalized_tip_updater.is_none() {
+                // Only the sync loop owns finalized updates after the first block.
+                self.try_catch_up_with_primary().await;
+                self.publish_current_state().await;
+            }
+            return Ok(None);
+        }
+        Ok(Some(response.into_inner()))
     }
 
     /// Catches up to the primary database, then prunes and publishes any blocks
@@ -809,6 +849,8 @@ pub fn init_read_state_with_syncer(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod subscriptions;
 
     #[test]
     fn rejects_non_loopback_plaintext_indexer_connection() {

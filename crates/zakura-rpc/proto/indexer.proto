@@ -20,6 +20,10 @@ message BlockAndHash {
   
   // The encoded block data.
   bytes data = 2;
+
+  // Source-local verifier receipt order. Compare only within the response's
+  // receipt session. Absent for restored blocks and older primaries.
+  optional uint64 receipt_order = 3;
 };
 
 // An encoded block and its height.
@@ -62,6 +66,11 @@ message NonFinalizedStateChangeRequest {
   // If empty, every block currently in the non-finalized state is sent, so an
   // empty request is equivalent to the previous no-argument behavior.
   repeated bytes chain_tip_hashes = 1;
+
+  // Session from the previous response's x-zakura-receipt-session metadata.
+  // A different session requests all non-finalized blocks again. Omitting the
+  // session preserves known tips for clients that predate receipt ordering.
+  optional string receipt_session = 2;
 };
 
 // Represents a change in the mempool.

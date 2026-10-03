@@ -32,6 +32,7 @@ use tower::{
 use zakura_chain::{
     block::{self, Height, HeightDiff},
     chain_tip::ChainTip,
+    parameters::{Network, NetworkUpgrade, POST_BLOSSOM_POW_TARGET_SPACING},
 };
 use zakura_consensus::{error::TransactionError, RouterError, VerifyBlockError};
 use zakura_network::{self as zn, PeerSocketAddr};
@@ -115,8 +116,8 @@ const MAX_TRANSIENT_BLOCK_PEER_REQUESTS_PER_SYNC_ROUND: usize =
     (TRANSIENT_BLOCK_DOWNLOAD_RETRY_LIMIT + 1) * MAX_BLOCK_PEER_REQUESTS_PER_QUEUE_ATTEMPT;
 
 /// Controls how many times the syncer immediately requeues a required block after a peer supplies
-/// a body whose coinbase height contradicts our own tip
-/// ([`BlockDownloadVerifyError::ParentHeightMismatch`]).
+/// a body whose coinbase height its header does not commit to
+/// ([`BlockDownloadVerifyError::UnboundHeight`]).
 ///
 /// A poisoned body satisfies the network request without delivering a usable block, so the hash
 /// must be requeued rather than left for the next discovery round — otherwise a peer can keep the
@@ -164,6 +165,13 @@ const REGISTRY_MISS_RETRY_BACKOFF: Duration = Duration::from_secs(2);
 /// [`super::inbound::downloads::MAX_INBOUND_CONCURRENCY`] and #1880 for details.
 /// So we want to keep the lookahead limit reasonably small.
 ///
+/// The configured limits count blocks, so the syncer multiplies them by
+/// [`lookahead_limit_multiplier`] to keep the same time window at shorter target
+/// spacings. After NU7, the in-flight bound and its RAM bound are three times the
+/// configured value. ZIP 218 scales `BLOCK_DOWNLOAD_WINDOW` and
+/// `MAX_BLOCKS_IN_TRANSIT_PER_PEER` by the same factor:
+/// <https://zips.z.cash/zip-0218#block-count-based-constants>
+///
 /// Once these malicious blocks start failing validation, the syncer will cancel all
 /// the pending download and verify tasks, drop all the blocks, and start a new
 /// ObtainTips with a new set of peers.
@@ -189,6 +197,16 @@ pub const DEFAULT_ZAKURA_BLOCK_APPLY_CONCURRENCY_LIMIT: usize = 32;
 ///
 /// If the concurrency limit is 0, Zebra can't download or verify any blocks.
 pub const MIN_CONCURRENCY_LIMIT: usize = 1;
+
+/// Returns the lookahead multiplier needed to preserve the post-Blossom time window.
+///
+/// Existing 150- and 75-second eras retain the configured limits. Shorter future
+/// target spacings increase the number of blocks in the same time window.
+pub(crate) fn lookahead_limit_multiplier(network: &Network, height: Height) -> usize {
+    let spacing = NetworkUpgrade::target_spacing_for_height(network, height).num_seconds();
+    usize::try_from((i64::from(POST_BLOSSOM_POW_TARGET_SPACING) / spacing).max(1))
+        .expect("the spacing ratio fits in usize")
+}
 
 /// The expected maximum number of hashes in an ObtainTips or ExtendTips response.
 ///
@@ -228,16 +246,6 @@ const MIN_UNREQUESTED_HASHES_BEFORE_EXTEND: usize = MAX_TIPS_RESPONSE_HASH_COUNT
 /// If this timeout is set too low, the syncer will sometimes get stuck in a
 /// failure loop.
 pub const TIPS_RESPONSE_TIMEOUT: Duration = Duration::from_secs(6);
-
-/// Controls how long we wait between gossiping successive blocks or transactions.
-///
-/// ## Correctness
-///
-/// If this timeout is set too high, blocks and transactions won't propagate through
-/// the network efficiently.
-///
-/// If this timeout is set too low, the peer set and remote peers can get overloaded.
-pub const PEER_GOSSIP_DELAY: Duration = Duration::from_secs(7);
 
 /// Controls how long we wait for a block download request to complete.
 ///
@@ -871,6 +879,9 @@ where
     /// The genesis hash for the configured network
     genesis_hash: block::Hash,
 
+    /// The configured network, which sets the target spacing for the lookahead limits.
+    network: Network,
+
     /// The largest block height for the checkpoint verifier, based on the current config.
     max_checkpoint_height: Height,
 
@@ -896,9 +907,8 @@ where
 
     /// A service which downloads and verifies blocks, using the provided
     /// network and verifier services.
-    downloads: Pin<
-        Box<Downloads<Hedge<ConcurrencyLimit<Timeout<ZN>>, AlwaysHedge>, Timeout<ZV>, ZSTip, ZS>>,
-    >,
+    downloads:
+        Pin<Box<Downloads<Hedge<ConcurrencyLimit<Timeout<ZN>>, AlwaysHedge>, Timeout<ZV>, ZSTip>>>,
 
     /// The cached block chain state.
     state: ZS,
@@ -1068,19 +1078,20 @@ where
         let downloads = Box::pin(Downloads::new(
             block_network,
             verifier,
-            state.clone(),
             latest_chain_tip.clone(),
             past_lookahead_limit_sender,
             max(
                 checkpoint_verify_concurrency_limit,
                 full_verify_concurrency_limit,
             ),
+            config.network.network.clone(),
             max_checkpoint_height,
             trace.clone(),
         ));
 
         let new_syncer = Self {
             genesis_hash: config.network.network.genesis_hash(),
+            network: config.network.network.clone(),
             max_checkpoint_height,
             checkpoint_verify_concurrency_limit,
             full_verify_concurrency_limit,
@@ -2461,6 +2472,8 @@ where
 
     /// The configured lookahead limit, based on the currently verified height,
     /// and the number of hashes we haven't queued yet.
+    ///
+    /// The configured limits scale with [`lookahead_limit_multiplier`] at the verified height.
     fn lookahead_limit(&self, new_hashes: usize) -> usize {
         let max_checkpoint_height: usize = self
             .max_checkpoint_height
@@ -2469,24 +2482,20 @@ where
             .expect("fits in usize");
 
         // When the state is empty, we want to verify using checkpoints
-        let verified_height: usize = self
-            .latest_chain_tip
-            .best_tip_height()
-            .unwrap_or(Height(0))
-            .0
-            .try_into()
-            .expect("fits in usize");
+        let verified_height = self.latest_chain_tip.best_tip_height().unwrap_or(Height(0));
+        let multiplier = lookahead_limit_multiplier(&self.network, verified_height);
+        let verified_height: usize = verified_height.0.try_into().expect("fits in usize");
 
         if verified_height >= max_checkpoint_height {
-            self.full_verify_concurrency_limit
+            self.full_verify_concurrency_limit * multiplier
         } else if (verified_height + new_hashes) >= max_checkpoint_height {
             // If we're just about to start full verification, allow enough for the remaining checkpoint,
             // and also enough for a separate full verification lookahead.
             let checkpoint_hashes = verified_height + new_hashes - max_checkpoint_height;
 
-            self.full_verify_concurrency_limit + checkpoint_hashes
+            self.full_verify_concurrency_limit * multiplier + checkpoint_hashes
         } else {
-            self.checkpoint_verify_concurrency_limit
+            self.checkpoint_verify_concurrency_limit * multiplier
         }
     }
 
@@ -2517,11 +2526,11 @@ where
             }
 
             // Unlike `AboveLookaheadHeightLimit` below, this one *is* scored. The
-            // claimed height is checked against our own committed tip, so the body
+            // header commits to a different height than the body claims, so the body
             // is provably malformed, and the peer being scored is the one that
             // served that body — not a peer that merely supplied a hash. There is
             // no misattribution to avoid here.
-            Err(BlockDownloadVerifyError::ParentHeightMismatch {
+            Err(BlockDownloadVerifyError::UnboundHeight {
                 advertiser_addr: Some(advertiser_addr),
                 ..
             }) => {
@@ -2554,7 +2563,7 @@ where
     /// Handles a downloaded block response and requeues a required hash when retrying one block can
     /// preserve the rest of the round.
     ///
-    /// A [`BlockDownloadVerifyError::ParentHeightMismatch`] means a peer returned a body under
+    /// A [`BlockDownloadVerifyError::UnboundHeight`] means a peer returned a body under
     /// the correct block hash but with a rewritten coinbase height. That satisfies the network
     /// request without delivering a usable block, so the supplier is scored for a ban and the hash
     /// is requeued immediately, bounded by [`POISONED_BLOCK_RETRY_LIMIT`]. Without the requeue the
@@ -2735,7 +2744,7 @@ where
 
         if let Some((hash, advertiser_addr)) = response.as_ref().err().and_then(|error| match error
         {
-            BlockDownloadVerifyError::ParentHeightMismatch {
+            BlockDownloadVerifyError::UnboundHeight {
                 hash,
                 advertiser_addr,
                 ..
@@ -3146,13 +3155,14 @@ where
                 );
                 false
             }
-            BlockDownloadVerifyError::ParentHeightMismatch { .. } => {
+            BlockDownloadVerifyError::UnboundHeight { .. } => {
                 // `handle_block_response_with_missing_retry` handles every mismatch itself and
                 // returns success even once the requeue budget is exhausted, so that an
                 // exhausted budget keeps the round's other downloads. This arm is therefore
                 // only reached by a caller that bypasses the retry handler. The round's stall
-                // deadline is what recovers an exhausted hash: a swallowed completion is not
-                // verified progress, so the round restarts and obtains fresh tips and peers.
+                // deadline recovers an exhausted hash: once the other downloads drain, no block
+                // completes within `BLOCK_VERIFY_TIMEOUT`, so the round restarts and obtains
+                // fresh tips and peers.
                 warn!(
                     error = ?e,
                     %peer,

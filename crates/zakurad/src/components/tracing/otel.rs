@@ -150,6 +150,9 @@ mod tests {
             ("https://collector.example/prefix/v1/traces?sig=example#fragment", "https://collector.example/prefix/v1/traces?sig=example"),
             ("https://collector.example/tenant%2Fname/", "https://collector.example/tenant%2Fname/v1/traces"),
             ("https://collector.example/v1/traces-other", "https://collector.example/v1/traces-other/v1/traces"),
+            ("http://[::1]:4318/prefix/", "http://[::1]:4318/prefix/v1/traces"),
+            ("HTTPS://COLLECTOR.EXAMPLE:443/prefix", "https://collector.example/prefix/v1/traces"),
+            ("https://collector.example?value='example'", "https://collector.example/v1/traces?value=%27example%27"),
             ("https://test-user:test-password@collector.example/test-path?token=test-token#test-fragment", "https://test-user:test-password@collector.example/test-path/v1/traces?token=test-token"),
         ] {
             let normalized = traces_endpoint(input).expect("valid HTTP endpoint");
@@ -161,6 +164,7 @@ mod tests {
     #[test]
     fn reject_invalid_traces_endpoints_without_echoing_them() {
         for input in [
+            "",
             "test-secret",
             "/test-secret",
             "http://[test-secret",

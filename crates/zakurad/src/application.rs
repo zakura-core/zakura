@@ -495,7 +495,13 @@ impl Application for ZakuradApp {
                 info!("No config file provided, using default configuration");
             }
 
-            info!("{config:?}");
+            // Log only selected diagnostics. The full config can contain credentials.
+            info!(
+                network = %config.network.network,
+                p2p_stack = ?config.network.p2p_stack,
+                ephemeral_state = config.state.ephemeral,
+                "loaded node configuration",
+            );
 
             // Explicitly log the configured miner address so CI can assert env override
             if let Some(miner_address) = &config.mining.miner_address {

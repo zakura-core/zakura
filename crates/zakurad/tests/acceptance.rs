@@ -186,7 +186,7 @@ use zakura_rpc::{
 use zakura_state::{constants::LOCK_FILE_ERROR, state_database_format_version_in_code};
 use zakura_test::{
     args,
-    command::{to_regex::CollectRegexSet, ContextFrom},
+    command::{to_regex::CollectRegexSet, ContextFrom, NO_MATCHES_REGEX_ITER},
     net::random_known_port,
     prelude::*,
 };
@@ -264,16 +264,24 @@ fn opentelemetry_endpoint_does_not_panic_on_startup() -> Result<()> {
     Ok(())
 }
 
+// Synthetic values cover every URL component that could contain credentials.
+const OTEL_TEST_ENDPOINT: &str =
+    "http://test-user:test-password@otel-host.invalid/test-path?token=test-token#test-fragment";
+const OTEL_TEST_PRIVATE_VALUES: [&str; 6] = [
+    "test-user",
+    "test-password",
+    "otel-host.invalid",
+    "test-path",
+    "test-token",
+    "test-fragment",
+];
+
 #[test]
 fn opentelemetry_status_does_not_log_endpoint() -> Result<()> {
     let _init_guard = zakura_test::init();
 
     let mut config = default_test_config(&Mainnet);
-    // Synthetic values cover every URL component that could contain credentials.
-    config.tracing.opentelemetry_endpoint = Some(
-        "http://test-user:test-password@127.0.0.1:1/test-path?token=test-token#test-fragment"
-            .to_owned(),
-    );
+    config.tracing.opentelemetry_endpoint = Some(OTEL_TEST_ENDPOINT.to_owned());
     config.tracing.opentelemetry_sample_percent = Some(0);
     let testdir = testdir()?.with_config(&mut config)?;
     // Utility commands use their own filter. Verbose output includes the INFO status.
@@ -289,20 +297,52 @@ fn opentelemetry_status_does_not_log_endpoint() -> Result<()> {
 
     for stream in [&output.output.stdout, &output.output.stderr] {
         let text = String::from_utf8_lossy(stream);
-        for private_value in [
-            "test-user",
-            "test-password",
-            "127.0.0.1:1",
-            "test-path",
-            "test-token",
-            "test-fragment",
-        ] {
+        for private_value in OTEL_TEST_PRIVATE_VALUES {
             assert!(
                 !text.contains(private_value),
                 "endpoint value appeared in logs"
             );
         }
     }
+
+    Ok(())
+}
+
+#[test]
+fn opentelemetry_start_does_not_log_endpoint() -> Result<()> {
+    let _init_guard = zakura_test::init();
+
+    let mut config = default_test_config(&Mainnet);
+    config.network.initial_mainnet_peers.clear();
+    config.network.initial_testnet_peers.clear();
+    config.network.cache_dir = false.into();
+    config.tracing.opentelemetry_endpoint = Some(OTEL_TEST_ENDPOINT.to_owned());
+    config.tracing.opentelemetry_sample_percent = Some(0);
+    config.tracing.filter = Some("info".to_owned());
+    let testdir = testdir()?.with_config(&mut config)?;
+    let mut child = testdir
+        .spawn_child(args!["start"])?
+        .with_timeout(EXTENDED_LAUNCH_DELAY)
+        .with_failure_regex_iter(
+            OTEL_TEST_PRIVATE_VALUES
+                .iter()
+                .map(|value| regex::escape(value)),
+            NO_MATCHES_REGEX_ITER.iter().copied(),
+        );
+
+    #[cfg(feature = "opentelemetry")]
+    child.expect_stdout_line_matches("installed OpenTelemetry tracing layer")?;
+    #[cfg(not(feature = "opentelemetry"))]
+    child.expect_stdout_line_matches("unable to activate OpenTelemetry tracing")?;
+
+    let summary = child.expect_stdout_line_matches("loaded node configuration")?;
+    for diagnostic in ["Mainnet", "Legacy", "ephemeral_state"] {
+        assert!(summary.contains(diagnostic));
+    }
+    // This event follows configuration logging, so the negative assertions cover that path.
+    child.expect_stdout_line_matches("initialized rayon thread pool")?;
+    // Check unread stdout and stderr too, including any output queued before the kill.
+    child.kill_and_consume_output(false)?;
 
     Ok(())
 }

@@ -2044,6 +2044,8 @@ class MacForkAlertTests(unittest.TestCase):
         state,sent=self.check(self.rows(agreeing=0),state,now=1060)
         self.assertEqual(len(sent),1)
         self.assertIn("recovered",sent[0])
+        self.assertIn("`mac-os-cranelift`", sent[0])
+        self.assertNotIn("{MAC_NODE_NAME}", sent[0])
 
     def test_less_than_seventy_percent_and_ten_blocks_do_not_alert(self):
         for rows in (self.rows(agreeing=8),self.rows(depth=9)):

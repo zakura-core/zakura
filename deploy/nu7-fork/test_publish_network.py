@@ -34,6 +34,26 @@ class ManifestTests(unittest.TestCase):
         self.assertNotIn("operator", result["config"])
         self.assertEqual(result["configSha256"], hashlib.sha256(result["config"].encode()).hexdigest())
 
+    def test_the_published_v3_participant_config_is_reproduced_byte_for_byte(self):
+        # Published at https://api.nu7.valargroup.dev/v1/network for Nu7StagingV3.
+        heights = {"BeforeOverwinter": 1, "Overwinter": 207500, "Sapling": 280000,
+                   "Blossom": 584000, "Heartwood": 903800, "Canopy": 1028500,
+                   "NU5": 1842420, "NU6": 2976000, "NU6.1": 3536500, "NU6.2": 4052000,
+                   "NU6.3": 4134000, "NU7": 4420652}
+        config = {"network": {"network": {
+            "network_name": "Nu7StagingV3", "network_magic": [122, 107, 117, 57],
+            "checkpoints": True, "initial_nsm_value_balance": 55768414957,
+            "activation_heights": heights}}}
+        info = {"chain": "test", "upgrades": {
+            "77190ad9": {"name": "NU7", "activationheight": 4420652}}}
+        peers = ["seed.nu7.valargroup.dev:18233", "134.199.239.83:18233",
+                 "157.245.69.251:18233", "165.22.255.181:18233"]
+        result = publish_network.manifest(config, info, "61efe76c62645e22ca7d29a8cacfbfe77e35059a",
+                                          peers, {"height": 4420648, "hash": "a" * 64, "time": 1})
+        self.assertEqual(result["configSha256"],
+                         "12c94fe866bf4de38e187aba6526b5623559db82b55de1cc6e3960d503835ce1")
+        self.assertIn('[network.network.activation_heights]\n', result["config"])
+
     def test_reconfigured_height_is_derived_and_rpc_mismatch_is_rejected(self):
         self.config["network"]["network"]["activation_heights"]["NU7"] += 3
         with self.assertRaisesRegex(ValueError, "disagree"):

@@ -368,8 +368,8 @@ waiting for that sweep.
 
 **`network = { ... }`, not `network = "Testnet"`.** The public Testnet's
 parameters are fixed: `zakurad` rejects `[network.testnet_parameters]` beside
-`network = "Testnet"`. The deployer writes the fork parameters as the
-`[network.network]` table instead. `test_fork.py` keeps
+`network = "Testnet"`. The deployer writes the fork parameters as the value of
+`network` itself, one inline table: `network = { network_name = ..., activation_heights = { ... } }`. `test_fork.py` keeps
 `crates/zakura-network/src/config/tests/data/nu7-fork-node.toml` equal to the
 deployer's output, and zakura-network's `rendered_nu7_fork_config_loads` test
 loads that file with `zakurad`'s own config type.

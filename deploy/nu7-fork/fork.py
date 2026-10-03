@@ -334,10 +334,8 @@ def render_nodes_toml(config: dict, plan: dict) -> str:
         "checkpoint_sync = true",
         "vct_fast_sync = false",
         f'tracing_filter = "{host.get("tracing_filter", "info")}"',
-        "",
+        f"testnet_parameters = {deploy.toml_scalar(params)}",
     ]
-
-    lines.extend(deploy.render_toml_table("defaults.testnet_parameters", params))
 
     peer = config.get("peer", {})
     peer_enabled = bool(peer.get("enabled", False))

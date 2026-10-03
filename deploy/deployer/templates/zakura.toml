@@ -8,7 +8,7 @@ listen_addr = "{{LISTEN_ADDR}}"
 {{NETWORK_CACHE_DIR}}
 {{INITIAL_TESTNET_PEERS}}
 p2p_stack = "{{P2P_STACK}}"
-{{TESTNET_PARAMS_BLOCK}}{{ZAKURA_BLOCK}}
+{{ZAKURA_BLOCK}}
 [state]
 cache_dir = "{{STATE_CACHE_DIR}}"
 storage_mode = "{{STORAGE_MODE}}"

@@ -97,8 +97,8 @@ DEFAULTS = {
     # Optional fleet-wide [defaults.zakura] table -> rendered [network.zakura].
     # Keys: dev_network, listen_addr, bootstrap_peers. Absent -> no section.
     "zakura": None,
-    # Optional [defaults.testnet_parameters] table -> rendered
-    # [network.network], for configured testnets such as the NU7 fork.
+    # Optional [defaults.testnet_parameters] table -> rendered as the inline
+    # `network = { ... }` value, for configured testnets such as the NU7 fork.
     # Absent -> no section, so the node runs the default public network.
     "testnet_parameters": None,
     # Process deploys are for manually supervised nodes, like the testnet
@@ -149,7 +149,7 @@ class Node:
     checkpoint_sync: bool
     vct_fast_sync: bool
     zakura: object  # dict | None: fleet-wide [network.zakura] settings
-    testnet_parameters: object  # dict | None: configured testnet [network.network] settings
+    testnet_parameters: object  # dict | None: configured testnet `network = { ... }` settings
     working_dir: str
     start_command: str
     process_pattern: str
@@ -508,8 +508,8 @@ def render_template(name: str, subst: dict[str, str]) -> str:
 def toml_scalar(value: object) -> str:
     """Render one TOML value. Booleans must be checked before ints.
 
-    Strings use JSON escaping, which is also a valid TOML basic string. Tables and
-    arrays nested below the top level render inline.
+    Strings use JSON escaping, which is also a valid TOML basic string. Tables
+    render as inline tables, which nest, including inside arrays.
     """
     if value is None:
         raise DeployError("TOML has no null value; omit the key instead")
@@ -546,32 +546,6 @@ def render_toml_pair(key: str, value: object) -> str:
     return f"{toml_key(key)} = {toml_scalar(value)}"
 
 
-def is_table_array(value: object) -> bool:
-    return isinstance(value, list) and bool(value) and all(isinstance(i, dict) for i in value)
-
-
-def render_toml_table(header: str, table: dict) -> list[str]:
-    """Render `[header]` and its contents, recursing into nested tables.
-
-    Scalars are emitted before any sub-table, because in TOML every key after a
-    sub-table header belongs to that sub-table.
-    """
-    lines = [f"[{header}]"]
-    for key, value in table.items():
-        if isinstance(value, dict) or is_table_array(value):
-            continue
-        lines.append(render_toml_pair(key, value))
-    for key, value in table.items():
-        if is_table_array(value):
-            for entry in value:
-                lines.append(f"[[{header}.{toml_key(key)}]]")
-                for sub_key, sub_value in entry.items():
-                    lines.append(render_toml_pair(sub_key, sub_value))
-        elif isinstance(value, dict):
-            lines.extend(render_toml_table(f"{header}.{toml_key(key)}", value))
-    return lines
-
-
 def render_zakura_block(zakura: object) -> str:
     """Render a fleet-wide [network.zakura] section from a dict, or "" if unset.
 
@@ -589,34 +563,22 @@ def render_zakura_block(zakura: object) -> str:
 
 
 def render_network_line(node: Node) -> str:
-    """Render the `network` key, or a pointer to the configured-testnet table.
+    """Render the `network` key: a public network name, or a configured testnet's table.
 
-    A configured testnet is `network = { ... }` itself, rendered as the
-    [network.network] table, so it has no `network = "..."` line: zakurad rejects
+    A configured testnet is `network = { ... }` itself. zakurad rejects
     `[network.testnet_parameters]` beside `network = "Testnet"`, because the
-    public Testnet's parameters are fixed.
-    """
-    if node.testnet_parameters:
-        return "# network: configured testnet, see [network.network]"
-    return f'network = "{node.network}"'
-
-
-def render_testnet_params_block(node: Node) -> str:
-    """Render a configured testnet's [network.network] table, or "" if unset.
-
-    Keys pass through verbatim, so the deployer does not need to learn every
-    field of `DTestnetParameters` in crates/zakura-network/src/config.rs. Nested
-    tables (`activation_heights`) and arrays of tables (`lockbox_disbursements`)
-    are rendered as such.
+    public Testnet's parameters are fixed. Keys pass through verbatim, so the
+    deployer does not need to learn every field of `DTestnetParameters` in
+    crates/zakura-network/src/config.rs; nested tables such as
+    `activation_heights` and `lockbox_disbursements` render inline.
     """
     if not node.testnet_parameters:
-        return ""
+        return f'network = "{node.network}"'
     if node.network != "Testnet":
         raise DeployError(
             f"{node.name}: testnet_parameters configure a Testnet, but network = {node.network!r}"
         )
-    lines = render_toml_table("network.network", dict(node.testnet_parameters))
-    return "\n" + "\n".join(lines) + "\n"
+    return f"network = {toml_scalar(dict(node.testnet_parameters))}"
 
 
 def render_node_config(node: Node) -> str:
@@ -663,7 +625,6 @@ def render_node_config(node: Node) -> str:
         "STATE_CACHE_DIR": node.state_cache_dir,
         "STORAGE_MODE": node.storage_mode,
         "P2P_STACK": node.p2p_stack,
-        "TESTNET_PARAMS_BLOCK": render_testnet_params_block(node),
         "ZAKURA_BLOCK": render_zakura_block(node.zakura),
         "METRICS_BLOCK": metrics_block,
         "HEALTH_BLOCK": health_block,

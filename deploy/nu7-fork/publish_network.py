@@ -17,7 +17,23 @@ from pathlib import Path
 import dashboard
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "deployer"))
-from deploy import render_toml_table  # noqa: E402
+from deploy import render_toml_pair, toml_key  # noqa: E402
+
+
+def render_table(header, table):
+    """Render `[header]` with its sub-tables as headed sections, for people to read.
+
+    The published participant config keeps this layout, so its bytes and
+    `configSha256` stay stable across publications of the same parameters. Scalars
+    come before sub-tables, because every key after a TOML header belongs to it.
+    """
+    lines = [f"[{header}]"]
+    lines += [render_toml_pair(key, value) for key, value in table.items()
+              if not isinstance(value, dict)]
+    for key, value in table.items():
+        if isinstance(value, dict):
+            lines += render_table(f"{header}.{toml_key(key)}", value)
+    return lines
 
 
 def validate_snapshot(snapshot):
@@ -61,7 +77,7 @@ def manifest(config, info, revision, peers, seed, snapshot=None):
         "rpc": {"listen_addr": "127.0.0.1:18232", "enable_cookie_auth": False},
         "state": {"cache_dir": "./nu7-state", "storage_mode": "pruned"},
     }
-    rendered = "\n\n".join("\n".join(render_toml_table(key, value))
+    rendered = "\n\n".join("\n".join(render_table(key, value))
                             for key, value in participant.items()) + "\n"
     result = {
         "schemaVersion": 1, "nodeRevision": revision,

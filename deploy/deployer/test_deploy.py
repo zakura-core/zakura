@@ -298,7 +298,7 @@ class ObservabilityRenderingTests(NodeBuilder, unittest.TestCase):
 
 
 class TestnetParametersRenderingTests(NodeBuilder, unittest.TestCase):
-    """A configured testnet such as the NU7 fork renders as the [network.network] table."""
+    """A configured testnet such as the NU7 fork renders as one `network = { ... }` value."""
 
     FORK_PARAMS = {
         "network_name": "Nu7Fork",
@@ -377,6 +377,39 @@ class TestnetParametersRenderingTests(NodeBuilder, unittest.TestCase):
 
         disbursements = config["network"]["network"]["lockbox_disbursements"]
         self.assertEqual(disbursements, [{"address": "t2Lockbox", "amount": 0}])
+
+    def test_nested_parameters_round_trip_exactly(self):
+        params = {
+            **self.FORK_PARAMS,
+            "lockbox_disbursements": [
+                {"address": "t2Lockbox1", "amount": 78_750_000_000_000},
+                {"address": "t2Lockbox2", "amount": 0},
+            ],
+        }
+        rendered = deploy.render_node_config(self.node(testnet_parameters=params))
+
+        self.assertEqual(tomllib.loads(rendered)["network"]["network"], params)
+        # One inline line: no [network.network] tables that could capture later keys.
+        self.assertNotIn("[network.network", rendered)
+        self.assertIn('"NU6.1" = 3536500', rendered)
+
+    def test_the_fleet_config_round_trips_through_load_nodes(self):
+        params = {**self.FORK_PARAMS,
+                  "lockbox_disbursements": [{"address": "t2Lockbox", "amount": 1}]}
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "nodes.toml"
+            path.write_text(
+                "[defaults]\n"
+                'network = "Testnet"\n'
+                f"testnet_parameters = {deploy.toml_scalar(params)}\n"
+                '[[nodes]]\nname = "node-a"\nssh_string = "root@example"\ncommit = "main"\n'
+            )
+            node = deploy.load_nodes(path, None)[0]
+
+        self.assertEqual(node.testnet_parameters, params)
+        self.assertEqual(
+            tomllib.loads(deploy.render_node_config(node))["network"]["network"], params
+        )
 
     def test_tables_nested_in_an_array_of_tables_render_inline(self):
         streams = [{

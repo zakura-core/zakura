@@ -765,18 +765,24 @@ pub struct Output {
     Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, Getters, CopyGetters, new,
 )]
 pub struct OutputObject {
+    /// The best chain tip hash, hex-encoded.
     #[serde(rename = "bestblock")]
     #[getset(get = "pub")]
     best_block: String,
+    /// The number of confirmations for this output.
     #[getset(get_copy = "pub")]
     confirmations: u32,
+    /// The value of this output in ZEC.
     #[getset(get_copy = "pub")]
     value: f64,
+    /// The locking script for this output.
     #[serde(rename = "scriptPubKey")]
     #[getset(get = "pub")]
     script_pub_key: ScriptPubKey,
+    /// The version of the transaction containing this output.
     #[getset(get_copy = "pub")]
     version: u32,
+    /// Whether the output was created by a coinbase transaction.
     #[getset(get_copy = "pub")]
     coinbase: bool,
 }

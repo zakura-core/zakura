@@ -20,6 +20,7 @@ lazy_static::lazy_static! {
 /// Note that adding value to the Sprout pool was disabled by the Canopy network upgrade.
 #[derive(Getters)]
 pub struct SproutParams {
+    /// The prepared verifying key for Sprout Groth16 proofs.
     #[getset(get = "pub")]
     prepared_verifying_key: PreparedVerifyingKey<Bls12>,
 }

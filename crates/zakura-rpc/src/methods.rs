@@ -5373,11 +5373,14 @@ pub enum GetAddressUtxosResponse {
     Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize, Getters, CopyGetters, new,
 )]
 pub struct GetAddressUtxosResponseObject {
+    /// The unspent transparent outputs.
     #[getset(get = "pub")]
     utxos: Vec<Utxo>,
+    /// The best chain tip hash when these outputs were queried.
     #[serde(with = "hex")]
     #[getset(get_copy = "pub")]
     hash: block::Hash,
+    /// The best chain tip height when these outputs were queried.
     #[getset(get_copy = "pub")]
     height: block::Height,
 }
@@ -5470,10 +5473,10 @@ pub struct GetAddressTxIdsRequest {
     /// funds to or from these addresses.
     #[getset(get = "pub")]
     addresses: Vec<String>,
-    // The height to start looking for transactions.
+    /// The height to start looking for transactions.
     #[getset(get = "pub")]
     start: Option<u32>,
-    // The height to end looking for transactions.
+    /// The height to end looking for transactions.
     #[getset(get = "pub")]
     end: Option<u32>,
 }

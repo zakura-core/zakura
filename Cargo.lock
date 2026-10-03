@@ -7663,7 +7663,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-network"
-version = "9.0.1"
+version = "10.0.0"
 dependencies = [
  "bitflags",
  "blake2b_simd",

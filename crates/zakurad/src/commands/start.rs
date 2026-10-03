@@ -577,7 +577,7 @@ impl StartCmd {
                 latest_chain_tip.clone(),
                 user_agent(),
                 advertised_services,
-                zcashd_compat_block_gossip_peer_ips,
+                zcashd_compat_block_gossip_peer_ips.clone(),
                 zakura_header_sync_driver_startup,
                 custom_services,
             )
@@ -683,6 +683,7 @@ impl StartCmd {
             latest_chain_tip.clone(),
             chain_tip_change.clone(),
             misbehavior_sender.clone(),
+            zcashd_compat_block_gossip_peer_ips.clone(),
         );
         let mempool = BoxService::new(mempool);
         let mempool = ServiceBuilder::new()

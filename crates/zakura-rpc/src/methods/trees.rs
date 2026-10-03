@@ -196,16 +196,23 @@ impl Default for Treestate {
 /// `finalRoot` and `finalState` are omitted when a specific tree state is not
 /// available.
 ///
-#[serde_with::serde_as]
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize, Getters, new)]
 pub struct Commitments {
     /// Shielded serialized note commitment tree root, hex-encoded.
-    #[serde_as(as = "Option<serde_with::hex::Hex>")]
+    #[serde(
+        default,
+        serialize_with = "super::hex_serde::serialize_option",
+        deserialize_with = "super::hex_serde::deserialize_option"
+    )]
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(rename = "finalRoot")]
     final_root: Option<Vec<u8>>,
     /// Shielded serialized note commitment tree, hex-encoded.
-    #[serde_as(as = "Option<serde_with::hex::Hex>")]
+    #[serde(
+        default,
+        serialize_with = "super::hex_serde::serialize_option",
+        deserialize_with = "super::hex_serde::deserialize_option"
+    )]
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(rename = "finalState")]
     final_state: Option<Vec<u8>>,

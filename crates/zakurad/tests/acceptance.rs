@@ -244,6 +244,26 @@ fn generate_no_args() -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "opentelemetry")]
+#[test]
+fn opentelemetry_endpoint_does_not_panic_on_startup() -> Result<()> {
+    let _init_guard = zakura_test::init();
+
+    let mut config = default_test_config(&Mainnet);
+    config.tracing.opentelemetry_endpoint = Some("http://127.0.0.1:1".to_owned());
+    let testdir = testdir()?.with_config(&mut config)?;
+
+    // A fresh process exercises tracing startup before a TLS provider or Tokio runtime exists.
+    let child = (&testdir).spawn_child(args!["generate", "-o", "generated.toml"])?;
+    child
+        .wait_with_output_or_timeout(Duration::from_secs(30))?
+        .assert_success()?;
+    let generated = fs::read_to_string(testdir.path().join("generated.toml"))?;
+    assert!(generated.starts_with("# Default configuration for zakurad"));
+
+    Ok(())
+}
+
 #[test]
 fn generate_args() -> Result<()> {
     let _init_guard = zakura_test::init();

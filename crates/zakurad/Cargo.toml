@@ -108,7 +108,7 @@ internal-miner = [
 sentry = ["dep:sentry"]
 journald = ["tracing-journald"]
 filter-reload = []
-opentelemetry = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "dep:tracing-opentelemetry"]
+opentelemetry = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "dep:tracing-opentelemetry", "dep:rustls"]
 
 progress-bar = [
     "howudoin",
@@ -264,6 +264,7 @@ opentelemetry = { workspace = true, optional = true }
 opentelemetry_sdk = { workspace = true, features = ["rt-tokio"], optional = true }
 opentelemetry-otlp = { workspace = true, features = ["http-proto", "reqwest-blocking-client"], optional = true }
 tracing-opentelemetry = { workspace = true, optional = true }
+rustls = { version = "0.23.40", default-features = false, features = ["ring", "std", "tls12"], optional = true }
 
 # prod feature filter-reload
 bytes = { workspace = true }

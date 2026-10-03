@@ -1566,6 +1566,88 @@ fn find_blocks_stall_count_preserved_across_tip_transition() {
     });
 }
 
+/// Check that a peer that fails after a stall leaves no stall count behind, so a
+/// reconnect at the same address starts fresh.
+#[test]
+fn find_blocks_stall_count_dropped_when_peer_fails() {
+    let peer_version = Version::min_specified_for_upgrade(&Network::Mainnet, NetworkUpgrade::Nu6_2);
+    let peer_versions = PeerVersions {
+        peer_versions: vec![peer_version],
+    };
+
+    let (runtime, _init_guard) = zakura_test::init_async();
+    let _guard = runtime.enter();
+
+    let (discovered_peers, handles) = peer_versions.mock_peer_discovery();
+    let (minimum_peer_version, _best_tip) =
+        MinimumPeerVersion::with_mock_chain_tip(&Network::Mainnet);
+
+    let mut handle = handles.into_iter().next().expect("there is one peer");
+
+    runtime.block_on(async move {
+        let (mut peer_set, _peer_set_guard) = PeerSetBuilder::new()
+            .with_discover(discovered_peers)
+            .with_minimum_peer_version(minimum_peer_version)
+            .build();
+
+        let peer_ready = peer_set.ready().await.expect("peer set is ready");
+        let response_fut = peer_ready.call(Request::FindBlocks {
+            known_blocks: vec![],
+            stop: None,
+        });
+        let client_request = handle
+            .try_to_receive_outbound_client_request()
+            .request()
+            .expect("peer received the request");
+        let _ = client_request.tx.send(Ok(Response::BlockHashes(vec![])));
+        response_fut.await.expect("response received");
+
+        let _ = peer_set.ready().now_or_never();
+        assert_eq!(peer_set.find_response_stalls.len(), 1);
+
+        handle.set_error(crate::PeerError::ConnectionClosed);
+        let _ = peer_set.ready().now_or_never();
+
+        assert!(peer_set.ready_services.is_empty());
+        assert_eq!(
+            peer_set.find_response_stalls.len(),
+            0,
+            "a departed peer's stall count must not outlive its connection"
+        );
+    });
+}
+
+/// Check that a stall event for an address that is no longer in the peer set is
+/// ignored instead of starting a count that a reconnect would inherit.
+#[test]
+fn find_blocks_stall_event_for_departed_peer_is_ignored() {
+    let (runtime, _init_guard) = zakura_test::init_async();
+    let _guard = runtime.enter();
+
+    let (discovered_peers, _handles) = PeerVersions {
+        peer_versions: vec![],
+    }
+    .mock_peer_discovery();
+    let (minimum_peer_version, _best_tip) =
+        MinimumPeerVersion::with_mock_chain_tip(&Network::Mainnet);
+
+    runtime.block_on(async move {
+        let (mut peer_set, _peer_set_guard) = PeerSetBuilder::new()
+            .with_discover(discovered_peers)
+            .with_minimum_peer_version(minimum_peer_version)
+            .build();
+
+        let departed: PeerSocketAddr = "127.0.0.1:8233".parse().expect("valid address");
+        peer_set
+            .stall_event_tx
+            .send((departed, super::super::StallOutcome::Stall))
+            .expect("the peer set holds the receiver");
+        let _ = peer_set.ready().now_or_never();
+
+        assert_eq!(peer_set.find_response_stalls.len(), 0);
+    });
+}
+
 /// Returns the block hash of the next `AdvertiseBlock` request the mock peer
 /// received, or `None` if it received nothing. Panics on any other request.
 fn recv_advertise_block(handle: &mut ClientTestHarness) -> Option<block::Hash> {

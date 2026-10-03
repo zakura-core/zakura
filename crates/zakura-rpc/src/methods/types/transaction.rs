@@ -824,7 +824,6 @@ pub struct ScriptSig {
 
 /// A Sprout JoinSplit of a transaction.
 #[allow(clippy::too_many_arguments)]
-#[serde_with::serde_as]
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, Getters, new)]
 pub struct JoinSplit {
     /// Public input value in ZEC.
@@ -844,10 +843,16 @@ pub struct JoinSplit {
     #[getter(copy)]
     anchor: [u8; 32],
     /// The nullifier of the input notes.
-    #[serde_as(as = "Vec<serde_with::hex::Hex>")]
+    #[serde(
+        serialize_with = "crate::methods::hex_serde::serialize_vec",
+        deserialize_with = "crate::methods::hex_serde::deserialize_vec"
+    )]
     nullifiers: Vec<[u8; 32]>,
     /// The commitments of the output notes.
-    #[serde_as(as = "Vec<serde_with::hex::Hex>")]
+    #[serde(
+        serialize_with = "crate::methods::hex_serde::serialize_vec",
+        deserialize_with = "crate::methods::hex_serde::deserialize_vec"
+    )]
     commitments: Vec<[u8; 32]>,
     /// The onetime public key used to encrypt the ciphertexts
     #[serde(rename = "onetimePubKey")]
@@ -860,13 +865,19 @@ pub struct JoinSplit {
     #[getter(copy)]
     random_seed: [u8; 32],
     /// The input notes MACs.
-    #[serde_as(as = "Vec<serde_with::hex::Hex>")]
+    #[serde(
+        serialize_with = "crate::methods::hex_serde::serialize_vec",
+        deserialize_with = "crate::methods::hex_serde::deserialize_vec"
+    )]
     macs: Vec<[u8; 32]>,
     /// A zero-knowledge proof using the Sprout circuit.
     #[serde(with = "hex")]
     proof: Vec<u8>,
     /// The output notes ciphertexts.
-    #[serde_as(as = "Vec<serde_with::hex::Hex>")]
+    #[serde(
+        serialize_with = "crate::methods::hex_serde::serialize_vec",
+        deserialize_with = "crate::methods::hex_serde::deserialize_vec"
+    )]
     ciphertexts: Vec<Vec<u8>>,
 }
 
@@ -924,7 +935,6 @@ pub struct ShieldedOutput {
 }
 
 /// Object with Orchard or Ironwood action information.
-#[serde_with::serde_as]
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, Getters, new)]
 pub struct Orchard {
     /// Array of Orchard or Ironwood actions.
@@ -939,18 +949,30 @@ pub struct Orchard {
     #[serde(skip_serializing_if = "Option::is_none")]
     flags: Option<OrchardFlags>,
     /// A root of the Orchard or Ironwood note commitment tree at some block height in the past.
-    #[serde_as(as = "Option<serde_with::hex::Hex>")]
+    #[serde(
+        default,
+        serialize_with = "crate::methods::hex_serde::serialize_option",
+        deserialize_with = "crate::methods::hex_serde::deserialize_option"
+    )]
     #[serde(skip_serializing_if = "Option::is_none")]
     #[getter(copy)]
     anchor: Option<[u8; 32]>,
     /// Encoding of aggregated zk-SNARK proofs for Orchard or Ironwood actions.
-    #[serde_as(as = "Option<serde_with::hex::Hex>")]
+    #[serde(
+        default,
+        serialize_with = "crate::methods::hex_serde::serialize_option",
+        deserialize_with = "crate::methods::hex_serde::deserialize_option"
+    )]
     #[serde(skip_serializing_if = "Option::is_none")]
     proof: Option<Vec<u8>>,
     /// An Orchard or Ironwood binding signature on the SIGHASH transaction hash.
     #[serde(rename = "bindingSig")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde_as(as = "Option<serde_with::hex::Hex>")]
+    #[serde(
+        default,
+        serialize_with = "crate::methods::hex_serde::serialize_option",
+        deserialize_with = "crate::methods::hex_serde::deserialize_option"
+    )]
     #[getter(copy)]
     binding_sig: Option<[u8; 64]>,
 }

@@ -16,6 +16,7 @@ on:
       - .github/workflows/lint.yml
       - .github/workflows/zakura-mainnet-deploy.yml
       - .github/workflows/cross-platform.yml
+      - .github/workflows/ci-alerts.yml
       - docs/specs/fork-aware-header-chain-engine.md
       - qa/supply-chain/**
       - "scripts/**.sh"
@@ -41,6 +42,7 @@ on:
       - .github/workflows/lint.yml
       - .github/workflows/zakura-mainnet-deploy.yml
       - .github/workflows/cross-platform.yml
+      - .github/workflows/ci-alerts.yml
       - docs/specs/fork-aware-header-chain-engine.md
       - qa/supply-chain/**
       - "scripts/**.sh"
@@ -218,6 +220,10 @@ jobs:
       - name: Affected semver package tests
         if: ${{ !cancelled() }}
         run: python3 .github/workflows/scripts/test_affected_semver_packages.py
+
+      - name: CI alert tests
+        if: ${{ !cancelled() }}
+        run: python3 .github/workflows/scripts/test_ci_alert.py
 
       - name: Deployer tests
         if: ${{ !cancelled() }}

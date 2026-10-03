@@ -7,7 +7,7 @@ name = "zakura"
 # [package.metadata.release] below does it automatically, but only under the
 # full `cargo release` flow (`cargo release version` skips the replace step) -
 # keep the two in sync when bumping by hand.
-version = "1.6.0"
+version = "1.6.1"
 authors.workspace = true
 description = "Zakura, an independent, consensus-compatible implementation of a Zcash node"
 license.workspace = true
@@ -108,7 +108,7 @@ internal-miner = [
 sentry = ["dep:sentry"]
 journald = ["tracing-journald"]
 filter-reload = []
-opentelemetry = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "dep:tracing-opentelemetry"]
+opentelemetry = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "dep:tracing-opentelemetry", "dep:rustls"]
 
 progress-bar = [
     "howudoin",
@@ -149,6 +149,9 @@ proptest-impl = [
     "zakura-chain/proptest-impl",
 ]
 
+# Criterion benchmarks for verified mempool storage, without network or crypto.
+mempool-bench = ["proptest-impl"]
+
 # Build the zakura-checkpoints utility for checkpoint generation tests
 zakura-checkpoints = [
     "zakura-utils/zakura-checkpoints",
@@ -175,18 +178,18 @@ tokio-console = ["console-subscriber"]
 comparison-interpreter = ["zakura-script/comparison-interpreter"]
 
 [dependencies]
-zakura-chain = { path = "../zakura-chain", version = "9.0.0" }
-zakura-consensus = { path = "../zakura-consensus", version = "10.0.0" }
-zakura-header-chain = { path = "../zakura-header-chain", version = "4.0.0" }
+zakura-chain = { path = "../zakura-chain", version = "10.0.0" }
+zakura-consensus = { path = "../zakura-consensus", version = "10.0.1" }
+zakura-header-chain = { path = "../zakura-header-chain", version = "4.0.1" }
 zakura-jsonl-trace = { path = "../zakura-jsonl-trace", version = "1.2.0" }
 zakura-network = { path = "../zakura-network", version = "10.0.0" }
-zakura-node-services = { path = "../zakura-node-services", version = "4.0.0", features = ["rpc-client"] }
-zakura-rpc = { path = "../zakura-rpc", version = "12.0.0" }
-zakura-state = { path = "../zakura-state", version = "10.0.0" }
+zakura-node-services = { path = "../zakura-node-services", version = "4.0.1", features = ["rpc-client"] }
+zakura-rpc = { path = "../zakura-rpc", version = "13.0.0" }
+zakura-state = { path = "../zakura-state", version = "10.0.1" }
 # zakura-script is not used directly, but we list it here to enable the
 # "comparison-interpreter" feature. (Feature unification will take care of
 # enabling it in the other imports of zcash-script.)
-zakura-script = { path = "../zakura-script", version = "4.0.0" }
+zakura-script = { path = "../zakura-script", version = "4.0.1" }
 zcash_script = { workspace = true }
 
 # Only used to forward portable arithmetic through Orchard and Halo 2. Cargo
@@ -194,7 +197,7 @@ zcash_script = { workspace = true }
 orchard = { workspace = true, optional = true }
 
 # Required for crates.io publishing, but it's only used in tests
-zakura-utils = { path = "../zakura-utils", version = "2.2.6", optional = true }
+zakura-utils = { path = "../zakura-utils", version = "2.2.7", optional = true }
 
 abscissa_core = { workspace = true, default-features = false, features = ["application"] }
 clap = { workspace = true, features = ["cargo"] }
@@ -241,7 +244,6 @@ hyper-util = { workspace = true, features = ["service", "server", "tokio"] }
 # Configuration management
 config = { workspace = true }
 
-rand = { workspace = true }
 nix = { workspace = true, features = ["fs"] }
 
 # prod feature internal-miner
@@ -262,6 +264,7 @@ opentelemetry = { workspace = true, optional = true }
 opentelemetry_sdk = { workspace = true, features = ["rt-tokio"], optional = true }
 opentelemetry-otlp = { workspace = true, features = ["http-proto", "reqwest-blocking-client"], optional = true }
 tracing-opentelemetry = { workspace = true, optional = true }
+rustls = { version = "0.23.40", default-features = false, features = ["ring", "std", "tls12"], optional = true }
 
 # prod feature filter-reload
 bytes = { workspace = true }
@@ -294,9 +297,11 @@ hex.workspace = true
 tonic-prost-build = { workspace = true, optional = true }
 
 [dev-dependencies]
+criterion = { workspace = true }
 abscissa_core = { workspace = true, default-features = false, features = ["testing"] }
 hex-literal = { workspace = true }
 jsonrpsee-types = { workspace = true }
+rand = { workspace = true }
 regex = { workspace = true }
 insta = { workspace = true, features = ["json"] }
 
@@ -316,12 +321,12 @@ tonic-prost = { workspace = true }
 proptest = { workspace = true }
 proptest-derive = { workspace = true }
 
-zakura-chain = { path = "../zakura-chain", version = "9.0.0", features = ["proptest-impl"] }
-zakura-consensus = { path = "../zakura-consensus", version = "10.0.0", features = ["proptest-impl"] }
-zakura-header-chain = { path = "../zakura-header-chain", version = "4.0.0", features = ["test-support"] }
+zakura-chain = { path = "../zakura-chain", version = "10.0.0", features = ["proptest-impl"] }
+zakura-consensus = { path = "../zakura-consensus", version = "10.0.1", features = ["proptest-impl"] }
+zakura-header-chain = { path = "../zakura-header-chain", version = "4.0.1", features = ["test-support"] }
 zakura-network = { path = "../zakura-network", version = "10.0.0", features = ["proptest-impl", "zakura-testkit"] }
-zakura-state = { path = "../zakura-state", version = "10.0.0", features = ["proptest-impl"] }
-zakura-rpc = { path = "../zakura-rpc", version = "12.0.0", features = ["proptest-impl"] }
+zakura-state = { path = "../zakura-state", version = "10.0.1", features = ["proptest-impl"] }
+zakura-rpc = { path = "../zakura-rpc", version = "13.0.0", features = ["proptest-impl"] }
 
 zakura-test = { path = "../zakura-test", version = "2.2.0" }
 
@@ -334,7 +339,7 @@ zakura-test = { path = "../zakura-test", version = "2.2.0" }
 # When `-Z bindeps` is stabilised, enable this binary dependency instead:
 # https://github.com/rust-lang/cargo/issues/9096
 # zakura-utils { path = "../zakura-utils", artifact = "bin:zakura-checkpoints" }
-zakura-utils = { path = "../zakura-utils", version = "2.2.6" }
+zakura-utils = { path = "../zakura-utils", version = "2.2.7" }
 
 [package.metadata.cargo-udeps.ignore]
 # These dependencies are false positives - they are actually used
@@ -366,3 +371,8 @@ enum_variant_missing = "warn"
 
 [target.'cfg(all(target_os = "linux", target_env = "gnu"))'.dependencies]
 libc = "0.2.186"
+
+[[bench]]
+name = "mempool_eviction"
+harness = false
+required-features = ["mempool-bench"]

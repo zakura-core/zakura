@@ -32,6 +32,9 @@ pub type OtelError = Box<dyn std::error::Error + Send + Sync + 'static>;
 /// Returns `(None, None)` with ZERO overhead when endpoint is `None` -
 /// no SDK objects are created, no background tasks are spawned.
 ///
+/// When enabled, preserves any installed Rustls crypto provider, or installs
+/// `ring` as the process default before creating the HTTP client.
+///
 /// # Arguments
 ///
 /// * `endpoint` - OTLP HTTP endpoint URL (e.g., "http://localhost:4318")
@@ -54,6 +57,10 @@ where
         Some(ep) => ep,
         None => return Ok((None, None)), // No SDK objects created
     };
+
+    // Iroh enables Reqwest's rustls-no-provider feature for the shared dependency.
+    // An install error only means another provider is already installed.
+    let _ = rustls::crypto::ring::default_provider().install_default();
 
     // HTTP transport requires the /v1/traces path suffix.
     // Append it if not already present.

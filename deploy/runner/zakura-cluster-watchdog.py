@@ -30,6 +30,7 @@ from typing import Any, Callable
 
 DOWN_HEALTH = {"down", "rpc_error"}
 STATE_VERSION = 1
+MAC_NODE_NAME = "mac-os-cranelift"
 PROPAGATION_GRACE_SECONDS = 120
 MAX_DECISION_HISTORY = 16
 MAX_DECISION_ROWS = 64
@@ -207,6 +208,13 @@ def load_fleets(config_path: Path) -> list[Fleet]:
         raise SystemExit(f"no [[fleets]] defined in {config_path}")
 
     return fleets
+
+
+def node_state_key(fleet_name: str, node_name: str) -> str:
+    """Keep the installed Mac incident key stable across its dashboard rename."""
+    if fleet_name == "mainnet" and node_name == MAC_NODE_NAME:
+        return "mainnet/zakura-mac-os"
+    return f"{fleet_name}/{node_name}"
 
 
 def load_state(state_path: Path) -> dict[str, Any]:
@@ -550,7 +558,7 @@ def node_condition(
         return ("ok", now, 0)
 
     if health in DOWN_HEALTH:
-        return ("down", now, 180.0 if row.get("name") == "zakura-mac-os" else args.down_after)
+        return ("down", now, 180.0 if row.get("name") == MAC_NODE_NAME else args.down_after)
 
     if (
         seconds_since_advanced is not None
@@ -1320,7 +1328,7 @@ class Watchdog:
         if not self.handle_fleet_recovered(state, fleet, now):
             return
         if os.environ.get("ZAKURA_MAC_CRANELIFT_ALERTS_MUTED", os.environ.get("MAC_VERIFIER_ALERTS_MUTED")) == "1":
-            node_rows = [row for row in node_rows if row.get("name") != "zakura-mac-os"]
+            node_rows = [row for row in node_rows if row.get("name") != MAC_NODE_NAME]
         self.handle_mac_fork(state, fleet, node_rows, now, suppressed)
         grace_since = max(
             self.started_at, self.fetch_recovered_at.get(fleet.name, 0)
@@ -1373,7 +1381,7 @@ class Watchdog:
         if fleet.name != "mainnet":
             return
         previous = state.get("mac_forks", {}).get(fleet.name, {})
-        mac = next((row for row in rows if row.get("name") == "zakura-mac-os"), None)
+        mac = next((row for row in rows if row.get("name") == MAC_NODE_NAME), None)
         if mac is None or not tip_is_verifiable(mac):
             mac_recovery_ready(previous, now, False)
             return
@@ -1387,7 +1395,7 @@ class Watchdog:
         if height is None or block_hash is None or tip - height < 10:
             mac_recovery_ready(previous, now, False)
             return
-        others = [row for row in rows if row.get("name") != "zakura-mac-os"]
+        others = [row for row in rows if row.get("name") != MAC_NODE_NAME]
         if not others:
             mac_recovery_ready(previous, now, False)
             return
@@ -1414,10 +1422,10 @@ class Watchdog:
             mac_recovery_ready(previous, now, False)
         update_alert_state(
             bucket, fleet.name, "fork" if agreed != block_hash else "ok", now, 0,
-            f":rotating_light: *Zakura mainnet* - `zakura-mac-os` forked for more than 10 blocks\n"
+            f":rotating_light: *Zakura mainnet* - `{MAC_NODE_NAME}` forked for more than 10 blocks\n"
             f"{groups[agreed]}/{len(others)} other nodes agree at height {height}\n"
             "dashboard: https://status.mainnet.zakura.valargroup.dev/",
-            ":white_check_mark: *Zakura mainnet* - `zakura-mac-os` fork recovered\n"
+            ":white_check_mark: *Zakura mainnet* - `{MAC_NODE_NAME}` fork recovered\n"
             "dashboard: https://status.mainnet.zakura.valargroup.dev/",
             now, suppressed, self.args, tip, notify=self.notify,
         )
@@ -1532,7 +1540,7 @@ class Watchdog:
         if references is not None:
             for name in previous.get("node_names", []):
                 row = current.get(name)
-                old_alert = state.get("nodes", {}).get(f"{fleet.name}/{name}", {})
+                old_alert = state.get("nodes", {}).get(node_state_key(fleet.name, name), {})
                 if (
                     row and not old_alert.get("alerting")
                     and coerce_height(row["height"]) == height
@@ -1610,7 +1618,7 @@ class Watchdog:
     ) -> None:
         key = fleet.name
         if fleet.name == "mainnet":
-            mac_recovery_ready(state.get("nodes", {}).get("mainnet/zakura-mac-os", {}), now, False)
+            mac_recovery_ready(state.get("nodes", {}).get(node_state_key("mainnet", MAC_NODE_NAME), {}), now, False)
             mac_recovery_ready(state.get("mac_forks", {}).get("mainnet", {}), now, False)
         bucket = state.setdefault("fleets", {})
         entry = bucket.get(key, {})
@@ -1696,9 +1704,9 @@ class Watchdog:
     ) -> bool:
         bucket = state.setdefault("nodes", {})
         for observation in observations:
-            if observation.name == "zakura-mac-os":
+            if observation.name == MAC_NODE_NAME:
                 continue
-            key = f"{fleet.name}/{observation.name}"
+            key = node_state_key(fleet.name, observation.name)
             previous = dict(bucket.get(key, {}))
             if not previous.get("alerting"):
                 continue
@@ -1752,7 +1760,7 @@ class Watchdog:
         bucket = state.setdefault("nodes", {})
         owners = []
         for observation in observations:
-            entry = bucket.get(f"{fleet.name}/{observation.name}", {})
+            entry = bucket.get(node_state_key(fleet.name, observation.name), {})
             alert_height = cls.node_event_height(entry)
             if (
                 entry.get("condition") == "stalled"
@@ -1825,7 +1833,7 @@ class Watchdog:
             )
             if not self.notify(text, self.args):
                 return False
-            bucket[f"{fleet.name}/{duplicate.name}"] = {
+            bucket[node_state_key(fleet.name, duplicate.name)] = {
                 "condition": "ok",
                 "alerting": False,
             }
@@ -2010,12 +2018,12 @@ class Watchdog:
         suppressed: bool,
         coalesced: bool = False,
     ) -> None:
-        if observation.name == "zakura-mac-os" and os.environ.get("ZAKURA_MAC_CRANELIFT_ALERTS_MUTED", os.environ.get("MAC_VERIFIER_ALERTS_MUTED")) == "1":
+        if observation.name == MAC_NODE_NAME and os.environ.get("ZAKURA_MAC_CRANELIFT_ALERTS_MUTED", os.environ.get("MAC_VERIFIER_ALERTS_MUTED")) == "1":
             return
-        key = f"{fleet.name}/{observation.name}"
+        key = node_state_key(fleet.name, observation.name)
         bucket = state.setdefault("nodes", {})
         previous = dict(bucket.get(key, {}))
-        if observation.name == "zakura-mac-os" and previous.get("alerting"):
+        if observation.name == MAC_NODE_NAME and previous.get("alerting"):
             good = observation.condition == "ok" and tip_is_verifiable(observation.row)
             ready = mac_recovery_ready(previous, now, good)
             bucket[key] = previous

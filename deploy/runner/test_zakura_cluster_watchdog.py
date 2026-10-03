@@ -2022,7 +2022,7 @@ class MacForkAlertTests(unittest.TestCase):
             return {"name": name, "health": "healthy", "height": 110,
                     "seconds_since_advanced": 0, "block_hash": "c" * 64,
                     "fork_anchor": {"height": 110-depth, "hash": value * 64}}
-        return [row("zakura-mac-os", "a")] + [row("other-%d" % i, "b" if i < agreeing else "a") for i in range(12)]
+        return [row("mac-os-cranelift", "a")] + [row("other-%d" % i, "b" if i < agreeing else "a") for i in range(12)]
 
     def check(self, rows, state=None, fleet="mainnet", now=1000):
         state = {} if state is None else state
@@ -2120,7 +2120,7 @@ class MacForkAlertTests(unittest.TestCase):
         fleet = watchdog.Fleet("mainnet", "http://localhost/data", "https://status.mainnet.zakura.valargroup.dev/")
         state = {}
         with patch.dict(watchdog.os.environ, {"ZAKURA_MAC_CRANELIFT_ALERTS_MUTED": "1"}):
-            for name in ("zakura-mac-os", "other"):
+            for name in ("mac-os-cranelift", "other"):
                 row = {"name": name, "health": "down", "height": 110}
                 observation = watchdog.NodeObservation(name, row, "down", 0, 180, 110, "a" * 64)
                 agent.handle_node_observation(state, fleet, observation, 1000, False)
@@ -2128,8 +2128,54 @@ class MacForkAlertTests(unittest.TestCase):
         self.assertIn("other", sent[0])
         self.assertNotIn("mainnet/zakura-mac-os", state.get("nodes", {}))
 
+    def test_muted_dashboard_row_is_removed_before_fleet_classification(self):
+        agent = watchdog.Watchdog([], make_args())
+        fleet = watchdog.Fleet("mainnet", "http://localhost/data", "https://example.com/")
+        rows = self.rows()
+        with patch.dict(watchdog.os.environ, {"ZAKURA_MAC_CRANELIFT_ALERTS_MUTED": "1"}), \
+                patch.object(watchdog, "fetch_json", return_value={"rows": rows}), \
+                patch.object(agent, "handle_mac_fork") as fork, \
+                patch.object(watchdog, "classify_node_observations", return_value=()) as classify:
+            agent.observe_fleet({}, fleet, 1000, False)
+        self.assertEqual([row["name"] for row in fork.call_args.args[2]],
+                         [row["name"] for row in rows[1:]])
+        self.assertEqual(classify.call_args.args[0], rows[1:])
+
+    def test_existing_mac_incident_survives_rename_and_requires_sustained_recovery(self):
+        agent = watchdog.Watchdog([], make_args())
+        sent = []
+        agent.notify = lambda text, args: (sent.append(text), True)[1]
+        fleet = watchdog.Fleet("mainnet", "http://localhost/data", "https://example.com/")
+        key = "mainnet/zakura-mac-os"
+        state = {"nodes": {key: {"condition": "down", "alerting": True, "bad_since": 0}}}
+        row = self.rows()[0]
+        observation = watchdog.NodeObservation(row["name"], row, "ok", 1000, 0, 110, "c" * 64)
+        with patch.dict(watchdog.os.environ, {"ZAKURA_MAC_CRANELIFT_ALERTS_MUTED": "0"}):
+            agent.reconcile_obsolete_node_alerts(state, fleet, (observation,))
+            for now in (1000, 1030):
+                agent.handle_node_observation(state, fleet, observation, now, False)
+                self.assertTrue(state["nodes"][key]["alerting"])
+                self.assertEqual(sent, [])
+            agent.handle_node_observation(state, fleet, observation, 1060, False)
+        self.assertFalse(state["nodes"][key]["alerting"])
+        self.assertEqual(len(sent), 1)
+        self.assertIn("mac-os-cranelift", sent[0])
+        self.assertNotIn("mainnet/mac-os-cranelift", state["nodes"])
+
+    def test_dashboard_failure_resets_existing_mac_recovery(self):
+        agent = watchdog.Watchdog([], make_args())
+        agent.notify = lambda *_: True
+        key = "mainnet/zakura-mac-os"
+        state = {"nodes": {key: {"alerting": True, "mac_recovery": {"since": 0}}}}
+        fleet = watchdog.Fleet("mainnet", "http://localhost/data", "https://example.com/")
+        agent.handle_fleet_error(state, fleet, ValueError("unavailable"), 1000, False)
+        self.assertNotIn("mac_recovery", state["nodes"][key])
+        self.assertTrue(state["nodes"][key]["alerting"])
+        self.assertEqual(watchdog.node_state_key("testnet", "mac-os-cranelift"),
+                         "testnet/mac-os-cranelift")
+
     def test_mac_offline_uses_three_minutes_without_changing_other_nodes(self):
-        self.assertEqual(watchdog.node_condition({"name":"zakura-mac-os","health":"down"},1000,0,make_args())[2],180)
+        self.assertEqual(watchdog.node_condition({"name":"mac-os-cranelift","health":"down"},1000,0,make_args())[2],180)
         self.assertEqual(watchdog.node_condition({"name":"other","health":"down"},1000,0,make_args())[2],600)
 
 

@@ -16,7 +16,7 @@ use zakura_header_chain::{
     POW_DAMPING_FACTOR, POW_MAX_ADJUST_DOWN_PERCENT, POW_MAX_ADJUST_UP_PERCENT,
     POW_MEDIAN_BLOCK_SPAN,
 };
-use zakura_network::protocol::external::types::Version;
+use zakura_network::Version;
 
 /// Returns the rules consensus validation applies to a block at `height`.
 ///

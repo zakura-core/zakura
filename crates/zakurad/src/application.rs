@@ -263,9 +263,7 @@ impl Application for ZakuradApp {
     #[allow(clippy::print_stderr)]
     #[allow(clippy::unwrap_in_result)]
     fn register_components(&mut self, command: &Self::Cmd) -> Result<(), FrameworkError> {
-        use crate::components::{
-            metrics::MetricsEndpoint, tokio::TokioComponent, tracing::TracingEndpoint,
-        };
+        use crate::components::{metrics::MetricsEndpoint, tokio::TokioComponent};
 
         let mut components = self.framework_components(command)?;
 
@@ -529,7 +527,6 @@ impl Application for ZakuradApp {
         // Launch network and async endpoints only for long-running commands.
         if is_server {
             components.push(Box::new(TokioComponent::new()?));
-            components.push(Box::new(TracingEndpoint::new(&config)?));
             components.push(Box::new(MetricsEndpoint::new(&metrics_config)?));
         }
 

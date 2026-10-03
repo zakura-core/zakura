@@ -63,7 +63,6 @@ pre-release-replacements = [
 # <https://docs.rs/about/metadata>
 features = [
     "default-release-binaries",
-    "filter-reload",
     "flamegraph",
     "journald",
     "opentelemetry",
@@ -107,7 +106,6 @@ internal-miner = [
 # Opt in explicitly: the tracing layer has overhead even without a SENTRY_DSN.
 sentry = ["dep:sentry"]
 journald = ["tracing-journald"]
-filter-reload = []
 opentelemetry = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "dep:tracing-opentelemetry"]
 
 progress-bar = [
@@ -156,9 +154,6 @@ mempool-bench = ["proptest-impl"]
 zakura-checkpoints = [
     "zakura-utils/zakura-checkpoints",
 ]
-
-# The gRPC tests also need an installed lightwalletd binary
-lightwalletd-grpc-tests = ["tonic-prost-build"]
 
 # tokio-console support
 #
@@ -265,7 +260,6 @@ opentelemetry_sdk = { workspace = true, features = ["rt-tokio"], optional = true
 opentelemetry-otlp = { workspace = true, features = ["http-proto", "reqwest-blocking-client"], optional = true }
 tracing-opentelemetry = { workspace = true, optional = true }
 
-# prod feature filter-reload
 bytes = { workspace = true }
 
 # prod feature prometheus
@@ -291,10 +285,6 @@ console-subscriber = { workspace = true, optional = true }
 derive-new.workspace = true
 hex.workspace = true
 
-[build-dependencies]
-# test feature lightwalletd-grpc-tests
-tonic-prost-build = { workspace = true, optional = true }
-
 [dev-dependencies]
 criterion = { workspace = true }
 abscissa_core = { workspace = true, default-features = false, features = ["testing"] }
@@ -310,12 +300,6 @@ hyper = { workspace = true, features = ["http1", "http2", "server"] }
 tracing-test = { workspace = true, features = ["no-env-filter"] }
 
 tokio = { workspace = true, features = ["full", "tracing", "test-util"] }
-tokio-stream = { workspace = true }
-
-# test feature lightwalletd-grpc-tests
-prost = { workspace = true }
-tonic = { workspace = true }
-tonic-prost = { workspace = true }
 
 proptest = { workspace = true }
 proptest-derive = { workspace = true }

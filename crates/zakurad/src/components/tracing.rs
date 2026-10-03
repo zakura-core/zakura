@@ -2,7 +2,6 @@
 
 use std::{
     io::IsTerminal,
-    net::SocketAddr,
     ops::{Deref, DerefMut},
     path::PathBuf,
 };
@@ -10,7 +9,6 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 mod component;
-mod endpoint;
 
 #[cfg(feature = "flamegraph")]
 mod flame;
@@ -19,7 +17,6 @@ mod flame;
 mod otel;
 
 pub use component::Tracing;
-pub use endpoint::TracingEndpoint;
 
 #[cfg(feature = "flamegraph")]
 pub use flame::{layer, Grapher};
@@ -123,13 +120,6 @@ pub struct InnerConfig {
     ///
     /// Defaults to 128,000 with a minimum of 100.
     pub buffer_limit: usize,
-
-    /// The address used for an ad-hoc RPC endpoint allowing dynamic control of the tracing filter.
-    ///
-    /// Install Zebra using `cargo install --features=filter-reload` to enable this config.
-    ///
-    /// If this is set to None, the endpoint is disabled.
-    pub endpoint_addr: Option<SocketAddr>,
 
     /// Controls whether to write a flamegraph of tracing spans.
     ///
@@ -275,7 +265,6 @@ impl Default for InnerConfig {
             force_use_color: false,
             filter: None,
             buffer_limit: 128_000,
-            endpoint_addr: None,
             flamegraph: None,
             progress_bar,
             log_file: runtime_default_log_file(None, progress_bar),

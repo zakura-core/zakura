@@ -9,15 +9,11 @@ use abscissa_core::{Component, FrameworkError, Shutdown};
 
 use tokio::sync::watch;
 use tracing::{field::Visit, Level};
-use tracing_appender::non_blocking::{NonBlocking, NonBlockingBuilder, WorkerGuard};
+use tracing_appender::non_blocking::{NonBlockingBuilder, WorkerGuard};
 use tracing_error::ErrorLayer;
-use tracing_subscriber::{
-    fmt::{format, Formatter},
-    layer::SubscriberExt,
-    reload::Handle,
-    util::SubscriberInitExt,
-    EnvFilter, Layer,
-};
+#[cfg(all(feature = "tokio-console", tokio_unstable))]
+use tracing_subscriber::EnvFilter;
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, Layer};
 use zakura_chain::parameters::Network;
 
 use crate::{application::build_version, components::tracing::Config};
@@ -51,19 +47,6 @@ pub type BoxWrite = Box<dyn Write + Send + Sync + 'static>;
 
 /// Abscissa component for initializing the `tracing` subsystem
 pub struct Tracing {
-    /// The installed filter reloading handle, if enabled.
-    //
-    // TODO: when fmt::Subscriber supports per-layer filtering, remove the Option
-    filter_handle: Option<
-        Handle<
-            EnvFilter,
-            Formatter<format::DefaultFields, format::Format<format::Full>, NonBlocking>,
-        >,
-    >,
-
-    /// The originally configured filter.
-    initial_filter: String,
-
     /// The installed flame graph collector, if enabled.
     #[cfg(feature = "flamegraph")]
     flamegrapher: Option<flame::Grapher>,
@@ -168,12 +151,11 @@ impl Tracing {
             .buffered_lines_limit(config.buffer_limit.max(100))
             .finish(writer);
 
-        // Construct a format subscriber with the supplied global logging filter,
-        // and optionally enable reloading.
+        // Construct a format subscriber with the supplied global logging filter.
         //
         // TODO: when fmt::Subscriber supports per-layer filtering, always enable this code
         #[cfg(not(all(feature = "tokio-console", tokio_unstable)))]
-        let (subscriber, filter_handle) = {
+        let subscriber = {
             use tracing_subscriber::FmtSubscriber;
 
             let logger = FmtSubscriber::builder()
@@ -181,35 +163,21 @@ impl Tracing {
                 .with_writer(non_blocking)
                 .with_env_filter(&filter);
 
-            // Enable reloading if that feature is selected.
-            #[cfg(feature = "filter-reload")]
-            let (filter_handle, logger) = {
-                let logger = logger.with_filter_reloading();
-
-                (Some(logger.reload_handle()), logger)
-            };
-
-            #[cfg(not(feature = "filter-reload"))]
-            let filter_handle = None;
-
             let warn_error_layer = LastWarnErrorLayer {
                 last_warn_error_sender: crate::application::LAST_WARN_ERROR_LOG_SENDER.clone(),
             };
-            let subscriber = logger
+            logger
                 .finish()
                 .with(warn_error_layer)
-                .with(ErrorLayer::default());
-
-            (subscriber, filter_handle)
+                .with(ErrorLayer::default())
         };
 
-        // Construct a tracing registry with the supplied per-layer logging filter,
-        // and disable filter reloading.
+        // Construct a tracing registry with the supplied per-layer logging filter.
         //
         // TODO: when fmt::Subscriber supports per-layer filtering,
         //       remove this registry code, and layer tokio-console on top of fmt::Subscriber
         #[cfg(all(feature = "tokio-console", tokio_unstable))]
-        let (subscriber, filter_handle) = {
+        let subscriber = {
             use tracing_subscriber::{fmt, Layer};
 
             let subscriber = tracing_subscriber::registry();
@@ -227,9 +195,7 @@ impl Tracing {
             let subscriber = subscriber.with(logger);
 
             let span_logger = ErrorLayer::default().with_filter(EnvFilter::from(&filter));
-            let subscriber = subscriber.with(span_logger);
-
-            (subscriber, None)
+            subscriber.with(span_logger)
         };
 
         // Add optional layers based on dynamic and compile-time configs
@@ -403,8 +369,6 @@ impl Tracing {
         }
 
         Ok(Self {
-            filter_handle,
-            initial_filter: filter,
             #[cfg(feature = "flamegraph")]
             flamegrapher,
             #[cfg(feature = "opentelemetry")]
@@ -416,8 +380,6 @@ impl Tracing {
     /// Drops guard for worker thread of non-blocking logger,
     /// to flush any remaining logs when the program terminates.
     pub fn shutdown(&mut self) {
-        self.filter_handle.take();
-
         #[cfg(feature = "flamegraph")]
         self.flamegrapher.take();
 
@@ -429,44 +391,6 @@ impl Tracing {
         }
 
         self._guard.take();
-    }
-
-    /// Return the currently-active tracing filter.
-    pub fn filter(&self) -> String {
-        if let Some(filter_handle) = self.filter_handle.as_ref() {
-            filter_handle
-                .with_current(|filter| filter.to_string())
-                .expect("the subscriber is not dropped before the component is")
-        } else {
-            self.initial_filter.clone()
-        }
-    }
-
-    /// Reload the currently-active filter with the supplied value.
-    ///
-    /// This can be used to provide a dynamic tracing filter endpoint.
-    pub fn reload_filter(&self, filter: impl Into<EnvFilter>) {
-        let filter = filter.into();
-
-        if let Some(filter_handle) = self.filter_handle.as_ref() {
-            tracing::info!(
-                ?filter,
-                TRACING_STATIC_MAX_LEVEL = ?tracing::level_filters::STATIC_MAX_LEVEL,
-                LOG_STATIC_MAX_LEVEL = ?log::STATIC_MAX_LEVEL,
-                "reloading tracing filter",
-            );
-
-            filter_handle
-                .reload(filter)
-                .expect("the subscriber is not dropped before the component is");
-        } else {
-            tracing::warn!(
-                ?filter,
-                TRACING_STATIC_MAX_LEVEL = ?tracing::level_filters::STATIC_MAX_LEVEL,
-                LOG_STATIC_MAX_LEVEL = ?log::STATIC_MAX_LEVEL,
-                "attempted to reload tracing filter, but filter reloading is disabled",
-            );
-        }
     }
 }
 

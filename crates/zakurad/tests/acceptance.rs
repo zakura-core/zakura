@@ -54,36 +54,6 @@
 //!
 //! Please refer to the documentation of each test for more information.
 //!
-//! ## Lightwalletd tests
-//!
-//! The lightwalletd software is an interface service that uses zakurad or zcashd RPC methods to serve wallets or other applications with blockchain content in an efficient manner.
-//!
-//! Zebra's lightwalletd tests are executed using nextest profiles.
-//! Some tests require environment variables to be set:
-//!
-//! - `TEST_LIGHTWALLETD`: Must be set to run any of the lightwalletd tests.
-//! - `ZAKURA_STATE__CACHE_DIR`: The path to a Zakura cached state directory.
-//! - `LWD_CACHE_DIR`: The path to a lightwalletd database.
-//!
-//! Here are some examples of running each test:
-//!
-//! ```console
-//! # Run the lightwalletd integration test
-//! $ TEST_LIGHTWALLETD=1 cargo nextest run --profile lwd-integration
-//!
-//! # Run the lightwalletd update sync test
-//! $ TEST_LIGHTWALLETD=1 ZAKURA_STATE__CACHE_DIR="/path/to/zakura/state" LWD_CACHE_DIR="/path/to/lightwalletd/database" cargo nextest run --profile lwd-sync-update
-//!
-//! # Run the lightwalletd full sync test
-//! $ TEST_LIGHTWALLETD=1 ZAKURA_STATE__CACHE_DIR="/path/to/zakura/state" cargo nextest run --profile lwd-sync-full
-//!
-//! # Run the lightwalletd gRPC wallet test (requires --features lightwalletd-grpc-tests)
-//! $ TEST_LIGHTWALLETD=1 ZAKURA_STATE__CACHE_DIR="/path/to/zakura/state" LWD_CACHE_DIR="/path/to/lightwalletd/database" cargo nextest run --profile lwd-grpc-wallet --features lightwalletd-grpc-tests
-//!
-//! # Run the lightwalletd send transaction test (requires --features lightwalletd-grpc-tests)
-//! $ TEST_LIGHTWALLETD=1 ZAKURA_STATE__CACHE_DIR="/path/to/zakura/state" LWD_CACHE_DIR="/path/to/lightwalletd/database" cargo nextest run --profile lwd-rpc-send-tx --features lightwalletd-grpc-tests
-//! ```
-//!
 //! ## Getblocktemplate tests
 //!
 //! Example of how to run the rpc_get_block_template test:
@@ -124,7 +94,7 @@
 //!
 //! ## Disk Space for Testing
 //!
-//! The full sync and lightwalletd tests with cached state expect a temporary directory with
+//! The full sync tests with cached state expect a temporary directory with
 //! at least 300 GB of disk space (2 copies of the full chain). To use another disk for the
 //! temporary test files:
 //!
@@ -208,7 +178,6 @@ use common::{
         spawn_zakurad_for_rpc, spawn_zakurad_without_rpc, ZakuradTestDirExt, EXTENDED_LAUNCH_DELAY,
         LAUNCH_DELAY,
     },
-    lightwalletd::{can_spawn_lightwalletd_for_rpc, spawn_lightwalletd_for_rpc},
     sync::{
         create_cached_database_height, sync_until, sync_until_with_config, MempoolBehavior,
         LARGE_CHECKPOINT_TIMEOUT, MEDIUM_CHECKPOINT_TEST_HEIGHT, STOP_AT_HEIGHT_REGEX,
@@ -1548,119 +1517,6 @@ async fn metrics_endpoint() -> Result<()> {
     Ok(())
 }
 
-#[cfg(all(feature = "filter-reload", not(target_os = "windows")))]
-#[tokio::test]
-async fn tracing_endpoint() -> Result<()> {
-    use bytes::Bytes;
-    use http_body_util::BodyExt;
-    use http_body_util::Full;
-    use hyper_util::{client::legacy::Client, rt::TokioExecutor};
-    use std::io::Write;
-
-    let _init_guard = zakura_test::init();
-
-    // [Note on port conflict](#Note on port conflict)
-    let port = random_known_port();
-    let endpoint = format!("127.0.0.1:{port}");
-    let url_default = format!("http://{endpoint}");
-    let url_filter = format!("{url_default}/filter");
-
-    // Write a configuration that has tracing endpoint_addr option set
-    let mut config = default_test_config(&Mainnet);
-    config.tracing.endpoint_addr = Some(endpoint.parse().unwrap());
-
-    let dir = testdir()?.with_config(&mut config)?;
-    let mut child = dir
-        .spawn_child(args!["start"])?
-        .with_timeout(EXTENDED_LAUNCH_DELAY);
-    child.expect_stdout_line_matches(format!("Opened tracing endpoint at {endpoint}"))?;
-
-    // Create an http client
-    let client: Client<_, Full<Bytes>> = Client::builder(TokioExecutor::new()).build_http();
-
-    // Test tracing endpoint
-    let res = client
-        .get(url_default.try_into().expect("url_default is valid"))
-        .await;
-    let (res, child) = child.kill_on_error(res)?;
-    assert!(res.status().is_success());
-
-    // Get the body of the response
-    let mut body = Vec::new();
-    let mut body_stream = res.into_body();
-    while let Some(next) = body_stream.frame().await {
-        body.write_all(next?.data_ref().unwrap())?;
-    }
-
-    let (body, child) = child.kill_on_error::<Vec<u8>, hyper::Error>(Ok(body))?;
-
-    // Set a filter and make sure it was changed
-    let request = hyper::Request::post(url_filter.clone())
-        .body("zakurad=debug".to_string().into())
-        .unwrap();
-
-    let post = client.request(request).await;
-    let (_post, child) = child.kill_on_error(post)?;
-
-    let tracing_res = client
-        .get(url_filter.try_into().expect("url_filter is valid"))
-        .await;
-
-    let (tracing_res, child) = child.kill_on_error(tracing_res)?;
-    assert!(tracing_res.status().is_success());
-
-    // Get the body of the response
-    let mut tracing_body = Vec::new();
-    let mut body_stream = tracing_res.into_body();
-    while let Some(next) = body_stream.frame().await {
-        tracing_body.write_all(next?.data_ref().unwrap())?;
-    }
-
-    let (tracing_body, mut child) =
-        child.kill_on_error::<Vec<u8>, hyper::Error>(Ok(tracing_body.clone()))?;
-
-    child.kill(false)?;
-
-    let output = child.wait_with_output()?;
-    let output = output.assert_failure()?;
-
-    // Make sure the endpoint header is correct
-    // The header is split over two lines. But we don't want to require line
-    // breaks at a specific word, so we run two checks for different substrings.
-
-    output.any_output_line_contains(
-        "HTTP endpoint allows dynamic control of the filter",
-        &body,
-        "tracing filter endpoint response",
-        "the tracing response header",
-    )?;
-    output.any_output_line_contains(
-        "tracing events",
-        &body,
-        "tracing filter endpoint response",
-        "the tracing response header",
-    )?;
-    std::str::from_utf8(&tracing_body)
-        .expect("unexpected invalid UTF-8 in tracing filter response");
-
-    // Make sure endpoint requests change the filter
-    output.any_output_line_contains(
-        "zakurad=debug",
-        &tracing_body,
-        "tracing filter endpoint response",
-        "the modified tracing filter",
-    )?;
-    std::str::from_utf8(&tracing_body)
-        .expect("unexpected invalid UTF-8 in modified tracing filter response");
-
-    // [Note on port conflict](#Note on port conflict)
-    output
-        .assert_was_killed()
-        .wrap_err("Possible port conflict. Are there other acceptance tests running?")?;
-
-    Ok(())
-}
-
 /// Test the JSON-RPC endpoint with single- and multi-threaded configurations.
 ///
 /// The multi-threaded node also checks zcashd-compatible content types, avoiding
@@ -1846,398 +1702,53 @@ async fn non_blocking_logger() -> Result<()> {
     Ok(())
 }
 
-/// Make sure `lightwalletd` works with Zebra, when both their states are empty.
+/// Sync a persistent Mainnet state to the tip without RPCs.
 ///
-/// This test only runs when the `TEST_LIGHTWALLETD` env var is set.
-///
-/// This test doesn't work on Windows, so it is always skipped on that platform.
-#[test]
-#[cfg(not(target_os = "windows"))]
-fn lwd_integration() -> Result<()> {
-    lwd_integration_test(LaunchWithEmptyState {
-        launches_lightwalletd: true,
-    })
-}
-
-/// Make sure `zakurad` can sync from peers, but don't actually launch `lightwalletd`.
-///
-/// This test only runs when a persistent cached state directory path is configured
-/// (for example, by setting `ZAKURA_STATE__CACHE_DIR`).
-///
-/// This test might work on Windows.
+/// Skips the test unless a persistent cached state is configured.
 #[test]
 #[ignore]
 fn sync_update_mainnet() -> Result<()> {
-    lwd_integration_test(UpdateZebraCachedStateNoRpc)
-}
-
-/// Make sure `lightwalletd` can sync from Zebra, in update sync mode.
-///
-/// This test only runs when:
-/// - `TEST_LIGHTWALLETD` is set,
-/// - a persistent cached state directory path is configured (e.g., via `ZAKURA_STATE__CACHE_DIR`), and
-/// - Zebra is compiled with `--features=lightwalletd-grpc-tests`.
-///
-/// This test doesn't work on Windows, so it is always skipped on that platform.
-#[test]
-#[cfg(not(target_os = "windows"))]
-#[cfg(feature = "lightwalletd-grpc-tests")]
-fn lwd_sync_update() -> Result<()> {
-    lwd_integration_test(UpdateCachedState)
-}
-
-/// Make sure `lightwalletd` can fully sync from genesis using Zebra.
-///
-/// This test only runs when:
-/// - `TEST_LIGHTWALLETD` is set,
-/// - a persistent cached state is configured (e.g., via `ZAKURA_STATE__CACHE_DIR`), and
-/// - Zebra is compiled with `--features=lightwalletd-grpc-tests`.
-///
-///
-/// This test doesn't work on Windows, so it is always skipped on that platform.
-#[test]
-#[ignore]
-#[cfg(not(target_os = "windows"))]
-#[cfg(feature = "lightwalletd-grpc-tests")]
-fn lwd_sync_full() -> Result<()> {
-    lwd_integration_test(FullSyncFromGenesis {
-        allow_lightwalletd_cached_state: false,
-    })
-}
-
-/// Make sure `lightwalletd` can sync from Zebra, in all available modes.
-///
-/// Runs the tests in this order:
-/// - launch lightwalletd with empty states,
-/// - if a cached Zebra state directory path is configured:
-///   - run a full sync
-/// - if a cached Zebra state directory path is configured:
-///   - run a quick update sync,
-///   - run a send transaction gRPC test,
-///   - run read-only gRPC tests.
-///
-/// The lightwalletd full, update, and gRPC tests only run with `--features=lightwalletd-grpc-tests`.
-///
-/// These tests don't work on Windows, so they are always skipped on that platform.
-#[tokio::test]
-#[ignore]
-#[cfg(not(target_os = "windows"))]
-async fn lightwalletd_test_suite() -> Result<()> {
-    lwd_integration_test(LaunchWithEmptyState {
-        launches_lightwalletd: true,
-    })?;
-
-    // Only runs when a cached Zebra state directory path is configured with an environment variable.
-    lwd_integration_test(UpdateZebraCachedStateNoRpc)?;
-
-    // These tests need the compile-time gRPC feature
-    #[cfg(feature = "lightwalletd-grpc-tests")]
-    {
-        // Do the quick tests first
-
-        // Only runs when a cached Zebra state is configured
-        lwd_integration_test(UpdateCachedState)?;
-
-        // Only runs when a cached Zebra state is configured
-        common::lightwalletd::wallet_grpc_test::run().await?;
-
-        // Then do the slow tests
-
-        // Only runs when a cached Zebra state is configured.
-        // When manually running the test suite, allow cached state in the full sync test.
-        lwd_integration_test(FullSyncFromGenesis {
-            allow_lightwalletd_cached_state: true,
-        })?;
-
-        // Only runs when a cached Zebra state is configured
-        common::lightwalletd::send_transaction_test::run().await?;
-    }
-
-    Ok(())
-}
-
-/// Run a lightwalletd integration test with a configuration for `test_type`.
-///
-/// Tests that sync `lightwalletd` to the chain tip require the `lightwalletd-grpc-tests` feature`:
-/// - [`FullSyncFromGenesis`]
-/// - [`UpdateCachedState`]
-///
-/// Set `FullSyncFromGenesis { allow_lightwalletd_cached_state: true }` to speed up manual full sync tests.
-///
-/// # Reliability
-///
-/// The random ports in this test can cause [rare port conflicts.](#Note on port conflict)
-///
-/// # Panics
-///
-/// If the `test_type` requires `--features=lightwalletd-grpc-tests`,
-/// but Zebra was not compiled with that feature.
-#[tracing::instrument]
-fn lwd_integration_test(test_type: TestType) -> Result<()> {
     let _init_guard = zakura_test::init();
-
-    // We run these sync tests with a network connection, for better test coverage.
-    let use_internet_connection = true;
-    let network = Mainnet;
-    let test_name = "lwd_integration_test";
-
-    if test_type.launches_lightwalletd() && !can_spawn_lightwalletd_for_rpc(test_name, test_type) {
-        tracing::info!("skipping test due to missing lightwalletd network or cached state");
-        return Ok(());
-    }
-
-    // Launch zebra with peers and using a predefined zakurad state path.
-    let (mut zakurad, zakura_rpc_address) = if let Some(zakurad_and_address) =
-        spawn_zakurad_for_rpc(
-            network.clone(),
-            test_name,
-            test_type,
-            use_internet_connection,
-        )? {
-        tracing::info!(
-            ?test_type,
-            "running lightwalletd & zakurad integration test, launching zakurad...",
-        );
-
-        zakurad_and_address
-    } else {
-        // Skip the test, we don't have the required cached state
+    let Some((mut zakurad, _)) = spawn_zakurad_for_rpc(
+        Mainnet,
+        "sync_update_mainnet",
+        UpdateZebraCachedStateNoRpc,
+        true,
+    )?
+    else {
         return Ok(());
     };
 
-    // Store the state version message so we can wait for the upgrade later if needed.
     let state_version_message = wait_for_state_version_message(&mut zakurad)?;
+    zakurad
+        .expect_stdout_line_matches(r"loaded Zakura state cache .*tip.*=.*Height\([0-9]{7}\)")?;
 
-    if test_type.needs_zakura_cached_state() {
-        zakurad.expect_stdout_line_matches(
-            r"loaded Zakura state cache .*tip.*=.*Height\([0-9]{7}\)",
-        )?;
-    } else {
-        // Timeout the test if we're somehow accidentally using a cached state
-        zakurad.expect_stdout_line_matches("loaded Zakura state cache .*tip.*=.*None")?;
-    }
-
-    // Wait for the state to upgrade and the RPC port, if the upgrade is short.
-    //
-    // If incompletely upgraded states get written to the CI cache,
-    // change DATABASE_FORMAT_UPGRADE_IS_LONG to true.
     if !DATABASE_FORMAT_UPGRADE_IS_LONG {
-        if test_type.launches_lightwalletd() {
-            tracing::info!(
-                ?test_type,
-                ?zakura_rpc_address,
-                "waiting for zakurad to open its RPC port..."
-            );
-            wait_for_state_version_upgrade(
-                &mut zakurad,
-                &state_version_message,
-                state_database_format_version_in_code(),
-                [format!(
-                    "Opened RPC endpoint at {}",
-                    zakura_rpc_address.expect("lightwalletd test must have RPC port")
-                )],
-            )?;
-        } else {
-            wait_for_state_version_upgrade(
-                &mut zakurad,
-                &state_version_message,
-                state_database_format_version_in_code(),
-                None,
-            )?;
-        }
-    }
-
-    // Wait for zakurad to sync the genesis block before launching lightwalletd,
-    // if lightwalletd is launched and zakurad starts with an empty state.
-    // This prevents lightwalletd from exiting early due to an empty state.
-    if test_type.launches_lightwalletd() && !test_type.needs_zakura_cached_state() {
-        tracing::info!(
-            ?test_type,
-            "waiting for zakurad to sync genesis block before launching lightwalletd...",
-        );
-        // Wait for zakurad to commit the genesis block to the state.
-        // Use the syncer's state tip log message, as the specific commit log might not appear reliably.
-        zakurad.expect_stdout_line_matches(
-            "starting sync, obtaining new tips state_tip=Some\\(Height\\(0\\)\\)",
+        wait_for_state_version_upgrade(
+            &mut zakurad,
+            &state_version_message,
+            state_database_format_version_in_code(),
+            None,
         )?;
     }
 
-    // Launch lightwalletd, if needed
-    let lightwalletd_and_port = if test_type.launches_lightwalletd() {
-        tracing::info!(
-            ?zakura_rpc_address,
-            "launching lightwalletd connected to zakurad",
-        );
+    zakurad.expect_stdout_line_matches(SYNC_FINISHED_REGEX)?;
 
-        // Launch lightwalletd
-        let (mut lightwalletd, lightwalletd_rpc_port) = spawn_lightwalletd_for_rpc(
-            network,
-            test_name,
-            test_type,
-            zakura_rpc_address.expect("lightwalletd test must have RPC port"),
-        )?
-        .expect("already checked for lightwalletd cached state and network");
-
-        tracing::info!(
-            ?lightwalletd_rpc_port,
-            "spawned lightwalletd connected to zakurad",
-        );
-
-        // Check that `lightwalletd` is calling the expected Zebra RPCs
-
-        // getblockchaininfo
-        if test_type.needs_zakura_cached_state() {
-            lightwalletd.expect_stdout_line_matches(
-                "Got sapling height 419200 block height [0-9]{7} chain main branchID [0-9a-f]{8}",
-            )?;
-        } else {
-            // Timeout the test if we're somehow accidentally using a cached state in our temp dir
-            lightwalletd.expect_stdout_line_matches(
-                "Got sapling height 419200 block height [0-9]{1,6} chain main branchID 00000000",
-            )?;
-        }
-
-        if test_type.needs_lightwalletd_cached_state() {
-            lightwalletd
-                .expect_stdout_line_matches("Done reading [0-9]{7} blocks from disk cache")?;
-        } else if !test_type.allow_lightwalletd_cached_state() {
-            // Timeout the test if we're somehow accidentally using a cached state in our temp dir
-            lightwalletd.expect_stdout_line_matches("Done reading 0 blocks from disk cache")?;
-        }
-
-        // getblock with the first Sapling block in Zebra's state
-        //
-        // zcash/lightwalletd calls getbestblockhash here, but
-        // adityapk00/lightwalletd calls getblock
-        //
-        // The log also depends on what is in Zebra's state:
-        //
-        // # Cached Zebra State
-        //
-        // lightwalletd ingests blocks into its cache.
-        //
-        // # Empty Zebra State
-        //
-        // lightwalletd tries to download the Sapling activation block, but it's not in the state.
-        //
-        // Until the Sapling activation block has been downloaded,
-        // lightwalletd will keep retrying getblock.
-        if !test_type.allow_lightwalletd_cached_state() {
-            if test_type.needs_zakura_cached_state() {
-                lightwalletd.expect_stdout_line_matches(
-                    "([Aa]dding block to cache)|([Ww]aiting for block)",
-                )?;
-            } else {
-                lightwalletd.expect_stdout_line_matches(regex::escape(
-                    "Waiting for zcashd height to reach Sapling activation height (419200)",
-                ))?;
-            }
-        }
-
-        Some((lightwalletd, lightwalletd_rpc_port))
-    } else {
-        None
-    };
-
-    // Wait for zakurad and lightwalletd to sync, if needed.
-    let (mut zakurad, lightwalletd) = if test_type.needs_zakura_cached_state() {
-        if let Some((lightwalletd, lightwalletd_rpc_port)) = lightwalletd_and_port {
-            #[cfg(feature = "lightwalletd-grpc-tests")]
-            {
-                use common::lightwalletd::sync::wait_for_zakurad_and_lightwalletd_sync;
-
-                tracing::info!(
-                    ?lightwalletd_rpc_port,
-                    "waiting for zakurad and lightwalletd to sync...",
-                );
-
-                let (lightwalletd, mut zakurad) = wait_for_zakurad_and_lightwalletd_sync(
-                    lightwalletd,
-                    lightwalletd_rpc_port,
-                    zakurad,
-                    zakura_rpc_address.expect("lightwalletd test must have RPC port"),
-                    test_type,
-                    // We want to wait for the mempool and network for better coverage
-                    true,
-                    use_internet_connection,
-                )?;
-
-                // Wait for the state to upgrade, if the upgrade is long.
-                // If this line hangs, change DATABASE_FORMAT_UPGRADE_IS_LONG to false,
-                // or combine "wait for sync" with "wait for state version upgrade".
-                if DATABASE_FORMAT_UPGRADE_IS_LONG {
-                    wait_for_state_version_upgrade(
-                        &mut zakurad,
-                        &state_version_message,
-                        state_database_format_version_in_code(),
-                        None,
-                    )?;
-                }
-
-                (zakurad, Some(lightwalletd))
-            }
-
-            #[cfg(not(feature = "lightwalletd-grpc-tests"))]
-            panic!(
-                "the {test_type:?} test requires `cargo test --feature lightwalletd-grpc-tests`\n\
-                 zakurad: {zakurad:?}\n\
-                 lightwalletd: {lightwalletd:?}\n\
-                 lightwalletd_rpc_port: {lightwalletd_rpc_port:?}"
-            );
-        } else {
-            // We're just syncing Zebra, so there's no lightwalletd to check
-            tracing::info!(?test_type, "waiting for zakurad to sync to the tip");
-            zakurad.expect_stdout_line_matches(SYNC_FINISHED_REGEX)?;
-
-            // Wait for the state to upgrade, if the upgrade is long.
-            // If this line hangs, change DATABASE_FORMAT_UPGRADE_IS_LONG to false.
-            if DATABASE_FORMAT_UPGRADE_IS_LONG {
-                wait_for_state_version_upgrade(
-                    &mut zakurad,
-                    &state_version_message,
-                    state_database_format_version_in_code(),
-                    None,
-                )?;
-            }
-
-            (zakurad, None)
-        }
-    } else {
-        let lightwalletd = lightwalletd_and_port.map(|(lightwalletd, _port)| lightwalletd);
-
-        // We don't have a cached state, so we don't do any tip checks for Zebra or lightwalletd
-        (zakurad, lightwalletd)
-    };
-
-    tracing::info!(
-        ?test_type,
-        "cleaning up child processes and checking for errors",
-    );
-
-    // Cleanup both processes
-    //
-    // If the test fails here, see the [note on port conflict](#Note on port conflict)
-    //
-    // zcash/lightwalletd exits by itself, but
-    // adityapk00/lightwalletd keeps on going, so it gets killed by the test harness.
-    zakurad.kill(false)?;
-
-    if let Some(mut lightwalletd) = lightwalletd {
-        lightwalletd.kill(false)?;
-
-        let lightwalletd_output = lightwalletd.wait_with_output()?.assert_failure()?;
-
-        lightwalletd_output
-            .assert_was_killed()
-            .wrap_err("Possible port conflict. Are there other acceptance tests running?")?;
+    if DATABASE_FORMAT_UPGRADE_IS_LONG {
+        wait_for_state_version_upgrade(
+            &mut zakurad,
+            &state_version_message,
+            state_database_format_version_in_code(),
+            None,
+        )?;
     }
 
-    let zakurad_output = zakurad.wait_with_output()?.assert_failure()?;
-
-    zakurad_output
+    zakurad.kill(false)?;
+    zakurad
+        .wait_with_output()?
+        .assert_failure()?
         .assert_was_killed()
         .wrap_err("Possible port conflict. Are there other acceptance tests running?")?;
-
     Ok(())
 }
 
@@ -2290,35 +1801,6 @@ fn zakura_metrics_conflict() -> Result<()> {
 
     // From another folder create a configuration with the same endpoint.
     // `metrics.endpoint_addr` will be the same in the 2 nodes.
-    // But they will have different Zcash listeners (auto port) and states (ephemeral)
-    let dir2 = testdir()?.with_config(&mut config)?;
-
-    check_config_conflict(dir1, regex1.as_str(), dir2, PORT_IN_USE_ERROR.as_str())?;
-
-    Ok(())
-}
-
-/// Start 2 zakurad nodes using the same tracing listener port, but different
-/// state directories and Zcash listener ports. The first node should get
-/// exclusive use of the port. The second node will panic with the Zcash tracing
-/// conflict hint added in #1535.
-#[test]
-#[cfg(all(feature = "filter-reload", not(target_os = "windows")))]
-fn zakura_tracing_conflict() -> Result<()> {
-    let _init_guard = zakura_test::init();
-
-    // [Note on port conflict](#Note on port conflict)
-    let port = random_known_port();
-    let listen_addr = format!("127.0.0.1:{port}");
-
-    // Write a configuration that has our created tracing endpoint_addr
-    let mut config = default_test_config(&Mainnet);
-    config.tracing.endpoint_addr = Some(listen_addr.parse().unwrap());
-    let dir1 = testdir()?.with_config(&mut config)?;
-    let regex1 = regex::escape(&format!(r"Opened tracing endpoint at {listen_addr}"));
-
-    // From another folder create a configuration with the same endpoint.
-    // `tracing.endpoint_addr` will be the same in the 2 nodes.
     // But they will have different Zcash listeners (auto port) and states (ephemeral)
     let dir2 = testdir()?.with_config(&mut config)?;
 
@@ -2459,52 +1941,6 @@ where
     Ok(())
 }
 
-#[tokio::test]
-#[ignore]
-async fn lwd_rpc_test() -> Result<()> {
-    let _init_guard = zakura_test::init();
-
-    // We're only using cached Zebra state here, so this test type is the most similar
-    let test_type = TestType::UpdateCachedState;
-    let network = Network::Mainnet;
-
-    let (mut zakurad, zakura_rpc_address) = if let Some(zakurad_and_address) =
-        spawn_zakurad_for_rpc(network, "lwd_rpc_test", test_type, false)?
-    {
-        tracing::info!("running fully synced zakurad RPC test");
-
-        zakurad_and_address
-    } else {
-        // Skip the test, we don't have the required cached state
-        return Ok(());
-    };
-
-    let zakura_rpc_address = zakura_rpc_address.expect("lightwalletd test must have RPC port");
-
-    zakurad.expect_stdout_line_matches(format!("Opened RPC endpoint at {zakura_rpc_address}"))?;
-
-    let client = RpcRequestClient::new(zakura_rpc_address);
-
-    // Make a getblock test that works only on synced node (high block number).
-    // The block is before the mandatory checkpoint, so the checkpoint cached state can be used
-    // if desired.
-    let res = client
-        .text_from_call("getblock", r#"["1180900", 0]"#.to_string())
-        .await?;
-
-    // Simple textual check to avoid fully parsing the response, for simplicity
-    let expected_bytes = zakura_test::vectors::MAINNET_BLOCKS
-        .get(&1_180_900)
-        .expect("test block must exist");
-    let expected_hex = hex::encode(expected_bytes);
-    assert!(
-        res.contains(&expected_hex),
-        "response did not contain the desired block: {res}"
-    );
-
-    Ok(())
-}
-
 #[test]
 #[cfg(not(target_os = "windows"))]
 fn delete_old_databases() -> Result<()> {
@@ -2576,32 +2012,6 @@ fn delete_old_databases() -> Result<()> {
         .wrap_err("Possible port conflict. Are there other acceptance tests running?")?;
 
     Ok(())
-}
-
-/// Test sending transactions using a lightwalletd instance connected to a zakurad instance.
-///
-/// See [`common::lightwalletd::send_transaction_test`] for more information.
-///
-/// This test doesn't work on Windows, so it is always skipped on that platform.
-#[tokio::test]
-#[ignore]
-#[cfg(feature = "lightwalletd-grpc-tests")]
-#[cfg(not(target_os = "windows"))]
-async fn lwd_rpc_send_tx() -> Result<()> {
-    common::lightwalletd::send_transaction_test::run().await
-}
-
-/// Test all the rpc methods a wallet connected to lightwalletd can call.
-///
-/// See [`common::lightwalletd::wallet_grpc_test`] for more information.
-///
-/// This test doesn't work on Windows, so it is always skipped on that platform.
-#[tokio::test]
-#[ignore]
-#[cfg(feature = "lightwalletd-grpc-tests")]
-#[cfg(not(target_os = "windows"))]
-async fn lwd_grpc_wallet() -> Result<()> {
-    common::lightwalletd::wallet_grpc_test::run().await
 }
 
 /// Test successful getpeerinfo rpc call
@@ -4504,9 +3914,7 @@ async fn disconnects_from_misbehaving_peers() -> Result<()> {
         .to_network()
         .expect("failed to build configured network");
 
-    let test_type = LaunchWithEmptyState {
-        launches_lightwalletd: false,
-    };
+    let test_type = LaunchWithEmptyState;
     let test_name = "disconnects_from_misbehaving_peers_test";
 
     if !common::launch::can_spawn_zakurad_for_test_type(test_name, test_type, false) {

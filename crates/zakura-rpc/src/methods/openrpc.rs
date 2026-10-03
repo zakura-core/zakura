@@ -103,7 +103,7 @@ pub(super) fn render(surface: RpcSurface) -> Value {
         .map(|(name, method)| {
             let description = method.description.trim();
             Method {
-                name: *name,
+                name,
                 summary: summary(description),
                 description,
                 params: (method.params)(&mut generator),

@@ -387,11 +387,14 @@ incompatible with the public Testnet, and adding NU7 makes them incompatible.
 `build_configured_testnet` applies it unconditionally. Omitting it would make the
 node fully verify four million blocks it already trusts.
 
-**The complete activation-height list.** `with_activation_heights` discards every
-configured height at or above `Height(1)` before applying the new set, so a
-partial list silently disables Sapling through NU6.3. `fork.py` parses the real
-heights out of `crates/zakura-chain/src/parameters/constants.rs` rather than
-restating them, so they cannot drift.
+**`inherit_activation_heights = true` with only `NU7`.** A configured
+`activation_heights` list normally replaces every public Testnet height at or
+above `Height(1)`, so a partial list would silently disable Sapling through NU6.3.
+With `inherit_activation_heights`, `zakurad` overlays the configured heights on the
+public Testnet defaults instead, and validates the combined list. The fork
+therefore names only NU7 and cannot drift from the heights in the binary it runs.
+Configs that list every height keep working unchanged; the two forms describe
+the same network.
 
 **`initial_nsm_value_balance`.** Set to the measured Testnet constant
 (`55_768_414_957`). The builder default is zero, which is only correct for a

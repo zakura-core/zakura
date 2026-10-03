@@ -142,6 +142,24 @@ class RenderedNodes(unittest.TestCase):
             render(config)
 
 
+class ActivationHeights(unittest.TestCase):
+    def test_only_nu7_is_configured_and_the_public_heights_are_inherited(self):
+        nodes = __import__("tomllib").loads(render(base_config()))
+        params = nodes["defaults"]["testnet_parameters"]
+        self.assertIs(params["inherit_activation_heights"], True)
+        self.assertEqual(params["activation_heights"], {"NU7": 4_400_010})
+
+    def test_the_heights_are_not_parsed_from_rust_sources(self):
+        self.assertFalse(hasattr(fork, "testnet_activation_heights"))
+        self.assertNotIn("parameters/constants.rs", Path(fork.__file__).read_text())
+
+    def test_activation_must_follow_the_seed_tip(self):
+        config = base_config()
+        config["fork"]["activation_offset"] = 0
+        with self.assertRaises(fork.ForkError):
+            render(config)
+
+
 class Provision(unittest.TestCase):
     DROPLET = {
         "name": "zakura-nu7-fork-1",

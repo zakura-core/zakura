@@ -37,9 +37,6 @@ REPO_ROOT = SCRIPT_DIR.parent.parent
 DEPLOYER = REPO_ROOT / "deploy" / "deployer" / "deploy.py"
 DO_PROVISION = REPO_ROOT / ".github" / "workflows" / "scripts" / "do_provision.py"
 STATE_CONSTANTS = REPO_ROOT / "crates" / "zakura-state" / "src" / "constants.rs"
-ACTIVATION_CONSTANTS = (
-    REPO_ROOT / "crates" / "zakura-chain" / "src" / "parameters" / "constants.rs"
-)
 
 # The measured Testnet NSM value balance immediately before NU7, from
 # crates/zakura-chain/src/parameters/network/subsidy/constants/testnet.rs.
@@ -58,23 +55,6 @@ SSH_OPTS = [
     "-o", "StrictHostKeyChecking=accept-new",
 ]
 
-# Upgrade names as ConfiguredActivationHeights serialises them, paired with the
-# Rust constant that carries each height.
-UPGRADE_CONSTANTS = [
-    ("BeforeOverwinter", "BEFORE_OVERWINTER"),
-    ("Overwinter", "OVERWINTER"),
-    ("Sapling", "SAPLING"),
-    ("Blossom", "BLOSSOM"),
-    ("Heartwood", "HEARTWOOD"),
-    ("Canopy", "CANOPY"),
-    ("NU5", "NU5"),
-    ("NU6", "NU6"),
-    ("NU6.1", "NU6_1"),
-    ("NU6.2", "NU6_2"),
-    ("NU6.3", "NU6_3"),
-]
-
-
 class ForkError(Exception):
     """Operator-facing failure; printed without a traceback."""
 
@@ -90,33 +70,6 @@ def db_format_version() -> int:
     if not match:
         raise ForkError(f"could not read DATABASE_FORMAT_VERSION from {STATE_CONSTANTS}")
     return int(match[1])
-
-
-def testnet_activation_heights() -> dict[str, int]:
-    """Parse the public Testnet activation heights out of the source tree.
-
-    Read rather than duplicated: `with_activation_heights` discards every height
-    at or above Height(1) before applying the configured set, so an incomplete
-    or stale list silently disables Sapling through NU6.3 on the fork.
-    """
-    text = ACTIVATION_CONSTANTS.read_text()
-    match = re.search(r"pub mod testnet \{(.*?)\n    \}", text, re.DOTALL)
-    if not match:
-        raise ForkError(f"could not find the testnet module in {ACTIVATION_CONSTANTS}")
-    body = match[1]
-
-    heights: dict[str, int] = {}
-    for name, constant in UPGRADE_CONSTANTS:
-        found = re.search(
-            rf"pub const {constant}: Height = Height\(([\d_]+)\)", body
-        )
-        if not found:
-            raise ForkError(
-                f"{constant} missing from {ACTIVATION_CONSTANTS}; "
-                f"the fork config would silently drop upgrades above it"
-            )
-        heights[name] = int(found[1].replace("_", ""))
-    return heights
 
 
 def load_fork_config(path: Path) -> dict:
@@ -255,21 +208,17 @@ def seeded_tip_height(config: dict) -> int:
 def fork_plan(config: dict, tip: int) -> dict:
     """Resolve the concrete heights this fork will run with."""
     fork = config["fork"]
-    activation = tip + int(fork["activation_offset"])
+    offset = int(fork["activation_offset"])
+    if offset < 1:
+        raise ForkError("fork.activation_offset must be at least one block above the seed tip")
+    activation = tip + offset
 
-    heights = testnet_activation_heights()
-    highest_public = max(heights.values())
-    if activation <= highest_public:
-        raise ForkError(
-            f"NU7 activation {activation} is not above NU6.3 ({highest_public}); "
-            f"activation heights must be strictly increasing"
-        )
-    heights["NU7"] = activation
-
+    # Only NU7 is configured. The node overlays it on the public Testnet heights,
+    # and rejects a NU7 height that does not follow the inherited NU6.3.
     return {
         "seeded_tip": tip,
         "activation": activation,
-        "activation_heights": heights,
+        "activation_heights": {"NU7": activation},
     }
 
 
@@ -282,6 +231,9 @@ def testnet_parameters(config: dict, plan: dict) -> dict:
         # node would fully verify millions of blocks it already trusts.
         "checkpoints": True,
         "initial_nsm_value_balance": TESTNET_INITIAL_NSM_VALUE_BALANCE,
+        # Keep every public Testnet activation height and add only the fork's NU7.
+        # Without this, the configured list would replace the public heights.
+        "inherit_activation_heights": True,
         "activation_heights": plan["activation_heights"],
     }
     # NSM reissuance has no configurable start height on this base, so it stays

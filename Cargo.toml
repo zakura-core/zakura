@@ -107,7 +107,7 @@ jsonrpsee-proc-macros = "0.24.9"
 jsonrpsee-types = "0.24.9"
 jubjub = { version = "2.2", package = "zakura-jubjub" }
 lazy_static = "1.4"
-libzcash_script = "0.1"
+libzcash_script = "0.2"
 log = "0.4.27"
 metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.16", default-features = false }
@@ -140,7 +140,7 @@ rlimit = "0.10"
 # librocksdb-sys build script panics with "a `libclang` shared library is not
 # loaded on this thread".
 rocksdb = { version = "0.24", default-features = false, features = ["bindgen-runtime"] }
-secp256k1 = "0.29"
+secp256k1 = "0.33"
 semver = "1.0.26"
 sentry = { version = "0.47", default-features = false }
 serde = "1.0.219"
@@ -184,8 +184,35 @@ opentelemetry-otlp = { version = "0.32", default-features = false }
 uint = "0.10"
 x25519-dalek = "2.0.1"
 zcash_note_encryption = "0.4.1"
-zcash_script = "0.4.5"
+zcash_script = "0.6"
 config = { version = "0.15.14", default-features = false, features = ["toml"] }
+
+# The published Zakura 2.2 crates pin the pre-release `bip32 =0.6.0-pre.1` and
+# `secp256k1 0.29`, which cannot share a lockfile with crates on the stable
+# `bip32 0.6` / `secp256k1 0.33` / `zcash_script 0.6` stack. Use the migrated
+# revision until zakura-core/common#538 is released, then remove this table.
+[patch.crates-io]
+zakura-address = { git = "https://github.com/zodl-inc/zakura-common", rev = "9d873d0812fcb07b87921a312e77b865b2a3cbe0" }
+zakura-bellman = { git = "https://github.com/zodl-inc/zakura-common", rev = "9d873d0812fcb07b87921a312e77b865b2a3cbe0" }
+zakura-bls12-381 = { git = "https://github.com/zodl-inc/zakura-common", rev = "9d873d0812fcb07b87921a312e77b865b2a3cbe0" }
+zakura-equihash = { git = "https://github.com/zodl-inc/zakura-common", rev = "9d873d0812fcb07b87921a312e77b865b2a3cbe0" }
+zakura-halo2-gadgets = { git = "https://github.com/zodl-inc/zakura-common", rev = "9d873d0812fcb07b87921a312e77b865b2a3cbe0" }
+zakura-halo2-legacy-pdqsort = { git = "https://github.com/zodl-inc/zakura-common", rev = "9d873d0812fcb07b87921a312e77b865b2a3cbe0" }
+zakura-halo2-poseidon = { git = "https://github.com/zodl-inc/zakura-common", rev = "9d873d0812fcb07b87921a312e77b865b2a3cbe0" }
+zakura-halo2-proofs = { git = "https://github.com/zodl-inc/zakura-common", rev = "9d873d0812fcb07b87921a312e77b865b2a3cbe0" }
+zakura-jubjub = { git = "https://github.com/zodl-inc/zakura-common", rev = "9d873d0812fcb07b87921a312e77b865b2a3cbe0" }
+zakura-keys = { git = "https://github.com/zodl-inc/zakura-common", rev = "9d873d0812fcb07b87921a312e77b865b2a3cbe0" }
+zakura-orchard = { git = "https://github.com/zodl-inc/zakura-common", rev = "9d873d0812fcb07b87921a312e77b865b2a3cbe0" }
+zakura-pairing = { git = "https://github.com/zodl-inc/zakura-common", rev = "9d873d0812fcb07b87921a312e77b865b2a3cbe0" }
+zakura-pasta-curves = { git = "https://github.com/zodl-inc/zakura-common", rev = "9d873d0812fcb07b87921a312e77b865b2a3cbe0" }
+zakura-primitives = { git = "https://github.com/zodl-inc/zakura-common", rev = "9d873d0812fcb07b87921a312e77b865b2a3cbe0" }
+zakura-proofs = { git = "https://github.com/zodl-inc/zakura-common", rev = "9d873d0812fcb07b87921a312e77b865b2a3cbe0" }
+zakura-protocol = { git = "https://github.com/zodl-inc/zakura-common", rev = "9d873d0812fcb07b87921a312e77b865b2a3cbe0" }
+zakura-reddsa = { git = "https://github.com/zodl-inc/zakura-common", rev = "9d873d0812fcb07b87921a312e77b865b2a3cbe0" }
+zakura-redjubjub = { git = "https://github.com/zodl-inc/zakura-common", rev = "9d873d0812fcb07b87921a312e77b865b2a3cbe0" }
+zakura-sapling-crypto = { git = "https://github.com/zodl-inc/zakura-common", rev = "9d873d0812fcb07b87921a312e77b865b2a3cbe0" }
+zakura-sinsemilla = { git = "https://github.com/zodl-inc/zakura-common", rev = "9d873d0812fcb07b87921a312e77b865b2a3cbe0" }
+zakura-transparent = { git = "https://github.com/zodl-inc/zakura-common", rev = "9d873d0812fcb07b87921a312e77b865b2a3cbe0" }
 
 # All cargo-release configuration lives in this table. Do not add a root
 # release.toml: it would silently shadow every setting here (cargo-release

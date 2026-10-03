@@ -1707,6 +1707,7 @@ fn transient_failure_kind_label(
         }
         zakura_header_chain::TransientBodyFailureKind::Timeout => "timeout",
         zakura_header_chain::TransientBodyFailureKind::ResourceExhausted => "resource_exhausted",
+        zakura_header_chain::TransientBodyFailureKind::NoBindingBody => "no_binding_body",
     }
 }
 

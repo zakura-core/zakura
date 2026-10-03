@@ -60,6 +60,11 @@ pub enum TransientBodyFailureKind {
     Timeout,
     /// The node temporarily exhausted local resources.
     ResourceExhausted,
+    /// No supplier delivered a body matching this header's commitments. The
+    /// mismatches themselves score their suppliers under LC-BODY-01; this kind
+    /// records only that a valid body remains unacquired, so LC-AVAIL-02 can
+    /// alarm instead of probing silently.
+    NoBindingBody,
 }
 
 /// Retryable body failure evidence.

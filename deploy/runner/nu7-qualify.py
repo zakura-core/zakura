@@ -28,8 +28,23 @@ receipt = {'checkedAt': time.time(), 'armed': config['armed'], 'dispatch': confi
            'referenceIdentityVerified': reference.get('fresh', False),
            'referenceHeight': reference.get('height'), 'referenceNu7Active': reference.get('active'),
            'nodeSources': [{k: n[k] for k in ('name', 'fresh', 'height', 'error', 'sourceRevision', 'buildVersion') if k in n} for n in nodes],
-           'sourceRevision': config['public']['manifest']['nodeRevision'],
-           'grpcurlSha256': hashlib.sha256(Path(config['public']['reference']['grpcurlPath']).read_bytes()).hexdigest()}
-receipt['prepared'] = bool(receipt['referenceIdentityVerified'] and all(n.get('fresh') for n in nodes))
+           'sourceRevision': config['public']['manifest']['nodeRevision']}
+reference_source = config['public']['reference']
+receipt['referenceNu7ScheduleVerified'] = bool(reference.get('fresh') and reference_source.get('adapter') != 'grpcurl')
+receipt['referenceTransport'] = reference_source.get('adapter', 'json-rpc')
+if reference_source.get('adapter') == 'grpcurl':
+    receipt['grpcurlSha256'] = hashlib.sha256(Path(reference_source['grpcurlPath']).read_bytes()).hexdigest()
+elif reference.get('fresh'):
+    reference_info = rpc(reference_source['rpcUrl'], 'getinfo')
+    receipt['referenceBuildVersion'] = reference_info.get('build', reference_info.get('subversion'))
+    receipt['referenceProtocolVersion'] = reference_info.get('protocolversion')
+receipt['preparedChainAgreement'] = False
+if reference.get('fresh') and all(n.get('fresh') for n in nodes):
+    sources = nodes + [reference]
+    common = min(n['height'] for n in sources)
+    hashes = [feed.source_hash(n, common) for n in sources]
+    receipt.update(commonHeight=common, commonHash=hashes[0], preparedChainAgreement=len(set(hashes)) == 1)
+receipt['activationReferencePrepared'] = bool(receipt['preparedChainAgreement'] and receipt['referenceNu7ScheduleVerified'])
+receipt['prepared'] = receipt['preparedChainAgreement']
 print(json.dumps(receipt, indent=2))
 sys.exit(0 if receipt['prepared'] else 1)

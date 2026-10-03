@@ -672,20 +672,24 @@ impl MetaAddr {
         address_is_valid_for_outbound_connections(self.addr, network.clone()).is_ok()
     }
 
+    /// Returns `true` unless this peer's last known services say it does not
+    /// serve full block history.
+    ///
+    /// A peer without [`PeerServices::NODE_NETWORK`] is usually a pruned node,
+    /// which only serves recent blocks. Unknown services are treated as a full
+    /// node, matching how configured initial peers are handled.
+    pub fn is_full_node(&self) -> bool {
+        self.services
+            .is_none_or(|services| services.contains(PeerServices::NODE_NETWORK))
+    }
+
     /// Is the last known information for this peer valid for outbound
     /// connections?
     ///
     /// The last known info might be outdated or untrusted, so this check can
-    /// only be used to:
-    /// - reject `NeverAttempted...` [`MetaAddrChange`]s, and
-    /// - temporarily stop outbound connections to a [`MetaAddr`].
+    /// only be used to temporarily stop outbound connections to a [`MetaAddr`].
     pub fn last_known_info_is_valid_for_outbound(&self, network: &Network) -> bool {
-        let is_node = match self.services {
-            Some(services) => services.contains(PeerServices::NODE_NETWORK),
-            None => true,
-        };
-
-        is_node && self.address_is_valid_for_outbound(network)
+        self.is_full_node() && self.address_is_valid_for_outbound(network)
     }
 
     /// Should this peer considered reachable?
@@ -728,9 +732,13 @@ impl MetaAddr {
     /// Return a sanitized version of this `MetaAddr`, for sending to a remote peer.
     ///
     /// Returns `None` if this `MetaAddr` should not be sent to remote peers.
+    ///
+    /// Peers without [`PeerServices::NODE_NETWORK`], such as pruned nodes, are
+    /// still sanitized, and keep their services so receivers can tell them apart
+    /// from full nodes.
     #[allow(clippy::unwrap_in_result)]
     pub fn sanitize(&self, network: &Network) -> Option<MetaAddr> {
-        if !self.last_known_info_is_valid_for_outbound(network) {
+        if !self.address_is_valid_for_outbound(network) {
             return None;
         }
 

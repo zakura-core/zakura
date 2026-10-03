@@ -11,7 +11,7 @@ use zakura_chain::{parameters::Network::*, serialization::Duration32};
 use crate::{
     constants::{
         ADDR_RESPONSE_LIMIT_DENOMINATOR, DEFAULT_MAX_CONNS_PER_IP, MAX_ADDRS_IN_ADDRESS_BOOK,
-        MAX_ADDRS_IN_MESSAGE, MAX_PEER_ACTIVE_FOR_GOSSIP,
+        MAX_ADDRS_IN_MESSAGE, MAX_PEER_ACTIVE_FOR_GOSSIP, PRUNED_ADDR_RESPONSE_SHARE_DENOMINATOR,
     },
     meta_addr::{arbitrary::MAX_META_ADDR, MetaAddr, MetaAddrChange},
     AddressBook,
@@ -44,10 +44,16 @@ proptest! {
         let sanitized = address_book.sanitized(chrono_now);
         let gossiped = address_book.fresh_get_addr_response();
 
-        let expected_num_gossiped = sanitized.len().div_ceil(ADDR_RESPONSE_LIMIT_DENOMINATOR).min(MAX_ADDRS_IN_MESSAGE);
+        let address_limit = sanitized.len().div_ceil(ADDR_RESPONSE_LIMIT_DENOMINATOR).min(MAX_ADDRS_IN_MESSAGE);
+        let pruned_limit = address_limit.div_ceil(PRUNED_ADDR_RESPONSE_SHARE_DENOMINATOR);
+        let sanitized_full = sanitized.iter().filter(|addr| addr.is_full_node()).count();
+        let sanitized_pruned = sanitized.len() - sanitized_full;
+        let expected_num_gossiped = address_limit.min(sanitized_full + sanitized_pruned.min(pruned_limit));
         let num_gossiped = gossiped.len();
+        let num_gossiped_pruned = gossiped.iter().filter(|addr| !addr.is_full_node()).count();
 
         prop_assert_eq!(expected_num_gossiped, num_gossiped);
+        prop_assert!(num_gossiped_pruned <= pruned_limit);
 
         for sanitized_address in sanitized {
             let duration_since_last_seen = sanitized_address

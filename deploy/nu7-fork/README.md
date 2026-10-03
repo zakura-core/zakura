@@ -18,22 +18,40 @@ pre-NU7 history and the measured NSM value balance rather than starting empty.
 for the exact node revision, activation height, network identity, participant
 configuration, and matching snapshot/checksum. The manifest is generated from the
 running node's configuration and checked against its RPC upgrade list; these
-values are not maintained separately in the website. The September 30 reset uses
-`Nu7StagingV3`, magic `7a6b7539`, and the pinned rebased build
-`61efe76c62645e22ca7d29a8cacfbfe77e35059a`. It starts at the recorded, freshly
-caught-up public Testnet tip 4,420,648 and activates NU7 four blocks later at
-4,420,652. V2 balances and transactions do not carry over; use a fresh cache.
-There are five validators, four miners (solver IDs 1, 3, 4, 5), and one local
-observer without a miner. V2 state, executables, configuration, publication, and
-faucet claims remain retained together for rollback.
+values are not maintained separately in the website. V2 balances and
+transactions do not carry over; use a fresh cache.
 
-Current main includes PR #1209, which changes minimum-difficulty validation
-from the configured NU7 activation height. The existing `Nu7StagingV2` history
-contains minimum-difficulty blocks only 151 seconds after their parents, beginning
-at activation height 4,398,756. It must not be upgraded in place to these rules.
-Use a separately identified fork from the preserved pre-NU7 seed, or first design
-and review an explicit consensus migration. Updating every operator binary alone
-does not make the old history valid under the new rule.
+### `Nu7StagingV3` facts
+
+The September 30, 2026 reset launched the current network. These facts are its
+identity; a later redeploy must preserve them, and a new fork must change the name,
+magic and snapshot URL.
+
+| Fact | Value |
+| --- | --- |
+| Network name / magic | `Nu7StagingV3` / `7a6b7539` (`[122, 107, 117, 57]`) |
+| NU7 consensus branch ID | `77190ad9` |
+| Seed (caught-up public Testnet tip) | 4,420,648, `0002d46ac1fe7f29f6a8f76396eac63895f595f1811b54060e7b46030e6583d0` |
+| NU7 activation | 4,420,652, `000b1414a4fa968bd8e21853d1b9b07aba73ff2d8ad83b929c68850091b8a9e0` |
+| Launch build | `61efe76c62645e22ca7d29a8cacfbfe77e35059a`, rebased on main `af944f5194ef2e9921bc96af017629450375013c` |
+| Participant config digest | `12c94fe866bf4de38e187aba6526b5623559db82b55de1cc6e3960d503835ce1` |
+| Bootstrap snapshot | immutable; see [One-time bootstrap snapshot](#one-time-bootstrap-snapshot) |
+
+All five validators and an independently restored participant agreed on that
+activation hash. The validators are the primary and a local observer on
+`167.99.146.155`, and remote miners in San Francisco (`134.199.239.83`), Amsterdam
+(`157.245.69.251`) and Singapore (`165.22.255.181`). Each host keeps
+`/root/nu7-v3-rollback` with the V2 executables, configuration and units; V2 chain
+directories and faucet claims are retained, and V2 claims are never replayed.
+
+**Compatibility.** Main's PR #1209 requires a gap of more than 450 seconds, from
+the configured NU7 activation, before a Testnet block may use minimum difficulty.
+`Nu7StagingV2` activated at 4,398,756 (hash
+`035144c0ff852897608979e863e0210809ee08c3fe9bf35cfab4a9c09649e08d`) with a
+minimum-difficulty block 151 seconds after its parent, so its history is invalid
+under current rules. It must not be upgraded in place: use a separately
+identified fork from a preserved pre-NU7 seed, or first design and review an
+explicit consensus migration. V3 was launched under the 450-second rule.
 
 After a reset, publish the manifest with `publish_network.py --help`. Supply the
 built binary's exact revision, explicit public peers, the recorded `seed-tip.json`,
@@ -297,8 +315,7 @@ when deploying UI/CORS changes; restart the worker only when no claim is process
 
 Build the sender from the same revision as the node with
 `cargo build --release --locked -p zakura-fork-txload`. No protocol dependency
-patch is needed for the current run. `build-live-faucet.sh` is retained only for
-reproducing the retired fork and must not be used for the current network.
+patch is needed.
 After a reset, preserve the old claims database for audit and use a fresh one.
 Wait for coinbase maturity before reopening the faucet.
 

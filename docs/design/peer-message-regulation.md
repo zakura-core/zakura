@@ -44,6 +44,26 @@ connection at 500 ms round-trip time, and a test checks each default against its
 local capacity limit makes the node wait; it never faults a peer. QUIC flow control binds first
 today: a 32 MiB connection send window carries about 540 Mbps at 500 ms.
 
+## Native connection admission
+
+Direct incoming connections complete QUIC Retry address validation before they reserve transport
+capacity. One global budget covers inbound and outbound QUIC state from construction through final
+cleanup. Closing a connection does not return its capacity while a retained stream still owns it.
+
+For an effective total `C > 1`, incoming transports may use `C - max(1, floor(C / 8))` slots.
+The default is 224 inbound slots out of 256 total. Outbound dials may use any free global slot.
+A single effective slot stays shared. Raw `max_connections = 0` still selects one effective slot.
+Each validated source IP may own at most `min(P + 1, inbound share)` incoming transports, where
+`P` is the existing established per-IP cap. This includes pending and closing transports. The extra
+slot lets a reconnect authenticate while its incumbent is still present. Raw per-IP zero still
+selects the default of 16, giving 17 transport slots per source. Ports do not create new sources,
+IPv4-mapped aliases share their IPv4 count, and distinct IPv6 addresses remain distinct sources.
+
+These limits protect outbound capacity from inbound work. They do not prioritize one outbound
+purpose over another. Discovery still uses the smaller of its available connection target and
+available concurrent dial count. Its default headroom of four is a soft target based on registered
+connections. Pending and closing transports can consume that headroom.
+
 ## Message checks and handler policy
 
 The implementation may use existing codecs, handlers, and validators. It need not introduce a

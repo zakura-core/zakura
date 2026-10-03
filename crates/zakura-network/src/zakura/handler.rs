@@ -1,6 +1,8 @@
 //! Zakura P2P v2 endpoint, protocol handler, and bounded connection serving.
 
+mod admission;
 mod service_session;
+use admission::IncomingTransportBudget;
 mod trace;
 use service_session::{spawn_service_session, PendingSessions, PreparedStream, SetupIo};
 
@@ -294,9 +296,15 @@ pub struct ZakuraConfig {
     ///
     /// A slot is reserved before QUIC construction and retained through handshake
     /// failure and final transport cleanup. Closing connections still use a slot
-    /// while stream handles retain their state.
+    /// while stream handles retain their state. Incoming transports can use at
+    /// most `C - max(1, floor(C / 8))` slots when the effective total C is at
+    /// least two. A single slot stays shared. Outbound may use any free global slot.
     pub max_connections: usize,
     /// Maximum established Zakura connections admitted from one source IP.
+    ///
+    /// Incoming transports from one validated IP, including handshakes and
+    /// closing connections, are additionally limited to this value plus one
+    /// for reconnect overlap, capped by the total inbound transport allowance.
     ///
     /// Zakura allows a small number of same-IP peers by default so NATed nodes
     /// and co-hosted fleets can connect without hitting the legacy TCP crawler's
@@ -969,6 +977,7 @@ impl ZakuraEndpoint {
 pub struct ZakuraSupervisorHandle {
     id: u64,
     inner: Arc<Mutex<ZakuraSupervisorState>>,
+    max_connections_per_ip: usize,
     shutdown: CancellationToken,
     peer_set_tx: watch::Sender<Vec<ZakuraPeerId>>,
     registration_tx: broadcast::Sender<ZakuraConnectionRegistration>,
@@ -1052,7 +1061,6 @@ struct ZakuraSupervisorState {
     active_by_peer: HashMap<ZakuraPeerId, ZakuraPeerConnectionEntry>,
     active_by_ip: HashMap<IpAddr, usize>,
     next_handoff_id: ZakuraHandoffId,
-    max_connections_per_ip: usize,
     next_registration_id: ZakuraConnId,
 }
 
@@ -1192,12 +1200,12 @@ impl ZakuraSupervisorHandle {
         let (registration_tx, _) = broadcast::channel(ZAKURA_REGISTRATION_EVENT_CAPACITY);
         Self {
             id: NEXT_SUPERVISOR_ID.fetch_add(1, Ordering::Relaxed),
+            max_connections_per_ip: max_connections_per_ip.max(1),
             inner: Arc::new(Mutex::new(ZakuraSupervisorState {
                 supervisor: ZakuraPeerSupervisor::default(),
                 active_by_peer: HashMap::new(),
                 active_by_ip: HashMap::new(),
                 next_handoff_id: 1,
-                max_connections_per_ip: max_connections_per_ip.max(1),
                 next_registration_id: 1,
             })),
             shutdown: CancellationToken::new(),
@@ -1317,7 +1325,7 @@ impl ZakuraSupervisorHandle {
                     .get(&remote_ip)
                     .copied()
                     .unwrap_or_default();
-                if ip_count >= state.max_connections_per_ip {
+                if ip_count >= self.max_connections_per_ip {
                     metrics::counter!("zakura.p2p.conn.rejected.admission").increment(1);
                     return ZakuraRegistration::Rejected(ZakuraRejectReason::ResourceLimit);
                 }
@@ -1462,7 +1470,7 @@ impl ZakuraSupervisorHandle {
             .get(&remote_ip)
             .copied()
             .unwrap_or_default();
-        active_count.saturating_add(in_flight_count) < state.max_connections_per_ip
+        active_count.saturating_add(in_flight_count) < self.max_connections_per_ip
     }
 }
 
@@ -2049,6 +2057,7 @@ pub struct ZakuraProtocolHandler {
     admission: Arc<Semaphore>,
     /// Retained until transport state is destroyed, including failed handshakes.
     transport_admission: Arc<Semaphore>,
+    incoming_transport: IncomingTransportBudget,
     pending_handshakes: Arc<Semaphore>,
     shutdown: CancellationToken,
     // Bound endpoint supplies the local identity for connection collision handling.
@@ -2154,6 +2163,12 @@ impl ZakuraProtocolHandler {
         handshake_config.supported_capabilities = registry.supported_capabilities();
         let supported_capabilities =
             Arc::new(AtomicU64::new(handshake_config.supported_capabilities));
+        let transport_admission = Arc::new(Semaphore::new(limits.max_connections));
+        let incoming_transport = IncomingTransportBudget::new(
+            transport_admission.clone(),
+            limits.max_connections,
+            supervisor.max_connections_per_ip,
+        );
         Self {
             supervisor,
             handshake_config,
@@ -2166,7 +2181,8 @@ impl ZakuraProtocolHandler {
             // and late completions from colliding after a node restart.
             next_stream_id: Arc::new(AtomicU64::new(random_stream_session_seed())),
             admission: Arc::new(Semaphore::new(limits.max_connections)),
-            transport_admission: Arc::new(Semaphore::new(limits.max_connections)),
+            transport_admission,
+            incoming_transport,
             pending_handshakes: Arc::new(Semaphore::new(limits.max_pending_handshakes)),
             shutdown: CancellationToken::new(),
             limits,
@@ -2239,13 +2255,10 @@ impl ZakuraProtocolHandler {
             {
                 return None;
             }
-            match handler.reserve_transport() {
-                Ok(owner) => Some(owner),
-                Err(_) => {
-                    metrics::counter!("zakura.p2p.conn.rejected.transport_admission").increment(1);
-                    None
-                }
-            }
+            let iroh::endpoint::IncomingAddr::Ip(address) = incoming.remote_addr() else {
+                return None;
+            };
+            handler.incoming_transport.reserve(address.ip())
         })
     }
 

@@ -17,8 +17,9 @@ use super::storage::{
 #[derive(Error, Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(any(test, feature = "proptest-impl"), derive(Arbitrary))]
 pub enum MempoolError {
-    /// Transaction rejected based on its authorizing data (scripts, proofs,
-    /// signatures). The rejection is valid for the current chain tip.
+    /// Transaction rejected by verification, standardness, or fee policy.
+    /// The rejection is valid for the current chain tip. Verification and
+    /// standardness match exact authorizing data; fee rejections match effects.
     ///
     /// See [`ExactTipRejectionError`] for more details.
     ///

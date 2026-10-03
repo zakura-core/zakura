@@ -59,8 +59,11 @@ pub(super) use verified_set::benchmarks::mempool_eviction_benchmarks;
 /// [ZIP-401]: https://zips.z.cash/zip-0401#specification
 pub(crate) const MAX_EVICTION_MEMORY_ENTRIES: usize = 40_000;
 
-/// Transactions rejected based on transaction authorizing data (scripts, proofs, signatures),
-/// lock times, or the fee per unit of cost. These rejections are only valid for the current tip.
+/// Tip-scoped verification, standardness, and fee-policy rejection reasons.
+///
+/// Verification and standardness rejections match exact authorizing data. Fee
+/// rejections match the effects ID, so changing authorizing data cannot bypass
+/// them. The error variants retain their existing API names.
 ///
 /// Each committed block clears these rejections, because new blocks can supply missing inputs,
 /// and free mempool space.
@@ -79,17 +82,16 @@ pub enum ExactTipRejectionError {
     /// A transaction that paid more per unit of cost evicted this transaction from the full
     /// mempool.
     ///
-    /// The cost depends on the transaction size, which includes the authorizing data, so the
-    /// rejection covers only the exact transaction. A smaller transaction with the same effects
-    /// pays more per unit of cost.
+    /// Until the next block, this rejection covers every authorization variant
+    /// with the same effects, including smaller variants with a higher fee rate.
     #[error("transaction evicted from the full mempool by a transaction that pays a higher fee")]
     Evicted,
 
     /// The mempool is full, and the transaction does not pay enough to evict other
     /// transactions.
     ///
-    /// Like [`ExactTipRejectionError::Evicted`], this rejection covers only the exact
-    /// transaction.
+    /// Like [`ExactTipRejectionError::Evicted`], this rejection covers every
+    /// authorization variant with the same effects until the next block.
     #[error("transaction rejected because the mempool is full and it pays too low a fee")]
     BelowEvictionCost,
 }
@@ -212,6 +214,15 @@ impl RemovedTransactionIds {
     }
 }
 
+/// The identity matched by a tip-scoped verification or fee rejection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum TipRejectionId {
+    /// Bad authorizing data must not suppress a differently authorized variant.
+    Exact(UnminedTxId),
+    /// Fee rejection must not be bypassed by differently authorizing the effects.
+    SameEffects(transaction::Hash),
+}
+
 /// Hold mempool verified and rejected mempool transactions.
 pub struct Storage {
     /// The set of verified transactions in the mempool.
@@ -220,12 +231,11 @@ pub struct Storage {
     /// The set of outpoints with pending requests for their associated transparent::Output.
     pub(super) pending_outputs: PendingOutputs,
 
-    /// The set of transactions rejected due to bad authorizations, or for other
-    /// reasons, and their rejection reasons. These rejections only apply to the
-    /// current tip.
+    /// Tip-scoped verification, standardness, and fee-policy rejections.
     ///
-    /// Only transactions with the exact [`UnminedTxId`] are invalid.
-    tip_rejected_exact: HashMap<UnminedTxId, ExactTipRejectionError>,
+    /// Verification and standardness match the exact [`UnminedTxId`]. Fee
+    /// rejections match the mined ID, including all authorization variants.
+    tip_rejected_by_id: HashMap<TipRejectionId, ExactTipRejectionError>,
 
     /// A set of transactions rejected for their effects, and their rejection
     /// reasons. These rejections only apply to the current tip.
@@ -291,7 +301,7 @@ impl Storage {
                 .unwrap_or(config::DEFAULT_MAX_DATACARRIER_BYTES),
             verified: Default::default(),
             pending_outputs: Default::default(),
-            tip_rejected_exact: Default::default(),
+            tip_rejected_by_id: Default::default(),
             tip_rejected_same_effects: Default::default(),
             chain_rejected_same_effects: Default::default(),
         }
@@ -762,7 +772,7 @@ impl Storage {
     #[allow(dead_code)]
     pub fn clear(&mut self) {
         self.verified.clear();
-        self.tip_rejected_exact.clear();
+        self.tip_rejected_by_id.clear();
         self.pending_outputs.clear();
         self.tip_rejected_same_effects.clear();
         self.chain_rejected_same_effects.clear();
@@ -771,7 +781,7 @@ impl Storage {
 
     /// Clears rejections that only apply to the current tip.
     pub fn clear_tip_rejections(&mut self) {
-        self.tip_rejected_exact.clear();
+        self.tip_rejected_by_id.clear();
         self.tip_rejected_same_effects.clear();
         self.update_rejected_metrics();
     }
@@ -784,8 +794,8 @@ impl Storage {
     /// Otherwise, peers could make our reject lists use a lot of RAM.
     fn limit_rejection_list_memory(&mut self) {
         // These lists are an optimisation - it's ok to totally clear them as needed.
-        if self.tip_rejected_exact.len() > self.rejection_list_capacity {
-            self.tip_rejected_exact.clear();
+        if self.tip_rejected_by_id.len() > self.rejection_list_capacity {
+            self.tip_rejected_by_id.clear();
         }
         if self.tip_rejected_same_effects.len() > self.rejection_list_capacity {
             self.tip_rejected_same_effects.clear();
@@ -905,7 +915,7 @@ impl Storage {
     /// Transactions on multiple rejected lists are counted multiple times.
     #[allow(dead_code)]
     pub fn rejected_transaction_count(&mut self) -> usize {
-        self.tip_rejected_exact.len()
+        self.tip_rejected_by_id.len()
             + self.tip_rejected_same_effects.len()
             + self
                 .chain_rejected_same_effects
@@ -918,7 +928,13 @@ impl Storage {
     pub fn reject(&mut self, tx_id: UnminedTxId, reason: RejectionError) {
         match reason {
             RejectionError::ExactTip(e) => {
-                self.tip_rejected_exact.insert(tx_id, e);
+                let id = match e {
+                    ExactTipRejectionError::Evicted | ExactTipRejectionError::BelowEvictionCost => {
+                        TipRejectionId::SameEffects(tx_id.mined_id())
+                    }
+                    _ => TipRejectionId::Exact(tx_id),
+                };
+                self.tip_rejected_by_id.insert(id, e);
             }
             RejectionError::SameEffectsTip(e) => {
                 self.tip_rejected_same_effects.insert(tx_id.mined_id(), e);
@@ -936,8 +952,10 @@ impl Storage {
             RejectionError::NonStandardTransaction(e) => {
                 // Non-standard transactions are rejected based on their exact
                 // transaction data.
-                self.tip_rejected_exact
-                    .insert(tx_id, ExactTipRejectionError::from(e));
+                self.tip_rejected_by_id.insert(
+                    TipRejectionId::Exact(tx_id),
+                    ExactTipRejectionError::from(e),
+                );
             }
         }
         self.limit_rejection_list_memory();
@@ -950,8 +968,13 @@ impl Storage {
     ///
     /// Returns an arbitrary error if the transaction is in multiple lists.
     pub fn rejection_error(&self, txid: &UnminedTxId) -> Option<MempoolError> {
-        if let Some(error) = self.tip_rejected_exact.get(txid) {
-            return Some(error.clone().into());
+        for id in [
+            TipRejectionId::Exact(*txid),
+            TipRejectionId::SameEffects(txid.mined_id()),
+        ] {
+            if let Some(error) = self.tip_rejected_by_id.get(&id) {
+                return Some(error.clone().into());
+            }
         }
 
         if let Some(error) = self.tip_rejected_same_effects.get(&txid.mined_id()) {

@@ -316,11 +316,13 @@ fn opentelemetry_start_does_not_log_endpoint() -> Result<()> {
     config.network.initial_mainnet_peers.clear();
     config.network.initial_testnet_peers.clear();
     config.network.cache_dir = false.into();
-    config.network.p2p_stack = Default::default();
     config.network.peerset_initial_target_size = 25;
     config.tracing.opentelemetry_endpoint = Some(OTEL_TEST_ENDPOINT.to_owned());
     config.tracing.opentelemetry_sample_percent = Some(0);
     config.tracing.filter = Some("info".to_owned());
+    // Keep exact field assertions stable even when FORCE_USE_COLOR is set for tests.
+    config.tracing.use_color = false;
+    config.tracing.force_use_color = false;
     let testdir = testdir()?.with_config(&mut config)?;
     let mut child = testdir
         .spawn_child(args!["start"])?
@@ -339,10 +341,10 @@ fn opentelemetry_start_does_not_log_endpoint() -> Result<()> {
 
     let summary = child.expect_stdout_line_matches("loaded node configuration")?;
     for diagnostic in [
-        "Mainnet",
-        "Legacy",
+        "network=Mainnet",
+        "p2p_stack=Legacy",
         "peerset_initial_target_size=25",
-        "ephemeral_state",
+        "ephemeral_state=true",
     ] {
         assert!(summary.contains(diagnostic));
     }

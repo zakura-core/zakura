@@ -15,6 +15,7 @@ import itertools
 import json
 import logging
 import os
+import re
 from pathlib import Path
 import statistics
 import subprocess
@@ -124,6 +125,8 @@ class ActivationFeed:
             raise ValueError("public Testnet magic mismatch")
         for profile in (self.config["staging"], public):
             manifest = profile["manifest"]
+            if not re.fullmatch(r"[0-9a-f]{40}", manifest["nodeRevision"]):
+                raise ValueError("manifest requires full source revision")
             if hashlib.sha256(manifest["config"].encode()).hexdigest() != manifest["configSha256"]:
                 raise ValueError("joining configuration checksum mismatch")
         if not (self.config["staging"]["manifest"]["network"]["activationHeight"]
@@ -166,6 +169,12 @@ class ActivationFeed:
                         or following["activationHeight"] != activation
                         or following["nu7BranchId"] != branch):
                     raise ValueError("parameter export identity mismatch")
+                version = self.rpc(url, "getinfo").get("build")
+                expected = public["manifest"]["nodeRevision"]
+                if not isinstance(version, str) or expected[:9] not in version.lower():
+                    raise ValueError("running binary revision does not match approved manifest")
+                result["buildVersion"] = version
+                result["sourceRevision"] = expected
                 pinned = self.rpc(url, "getblockchaininfo")
                 if (pinned["blocks"], pinned["bestblockhash"]) != tip:
                     raise ValueError("tip moved during parameter observation")

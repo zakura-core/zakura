@@ -85,5 +85,8 @@ and a hand-written frame-type table (removing enum-assoc and syn 3).
 - Bad: Zakura owns about 3,000 lines of transport code and the noq pin. Changes
   to `tls/`, key parsing, admission or path handling need both transport owners'
   review.
-- Bad: nodes lose Iroh's network-change rebinding beyond one rebind after a
-  fatal socket error.
+- Neutral: when a node's address changes (a laptop joins another Wi-Fi
+  network, say), the connections it dialed move to the new address, as under
+  Iroh. Connections that peers dialed to the old address still end and get
+  redialed. Iroh learned of the change from OS events; zakura-quic polls the
+  interface list every 5 s, so recovery can start up to 5 s later (SOCK-12).

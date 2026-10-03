@@ -12,7 +12,7 @@ use std::{
 };
 
 use futures::{future::BoxFuture, stream::FuturesUnordered, StreamExt as _};
-use noq::{Runtime, VarInt};
+use noq::{PathId, Runtime, VarInt};
 use tokio::{sync::watch, task::JoinSet};
 
 use crate::{
@@ -21,7 +21,7 @@ use crate::{
     error::{BindError, ConnectError},
     key::{NodeAddr, NodeId, NodeSecretKey},
     socket::{bind_udp, RebindOnError, SocketBuffers},
-    sys::canonical_addr,
+    sys::{canonical_addr, local_interface_ips},
     tls::{self, TlsConfig},
 };
 
@@ -29,6 +29,9 @@ use crate::{
 const SHUTDOWN_DRAIN: Duration = Duration::from_secs(3);
 /// A second socket failure within this window stops the endpoint (SOCK-9).
 const REBIND_WINDOW: Duration = Duration::from_secs(60);
+/// How often a wildcard-bound endpoint lists the host's interface addresses to
+/// notice a network change (SOCK-12).
+const INTERFACE_POLL: Duration = Duration::from_secs(5);
 
 /// What to do with a connection attempt before any handshake work (ADM-2).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -113,6 +116,7 @@ struct Inner {
     shutdown: watch::Sender<bool>,
     serve: Mutex<Option<Arc<dyn Acceptor>>>,
     observer: Mutex<Option<ConnObserver>>,
+    network_changes: Arc<AtomicU64>,
 }
 
 struct SocketSlot {
@@ -161,6 +165,21 @@ impl QuicEndpoint {
         for addr in &bind.addrs {
             sockets.push(bind_slot(*addr, config, &runtime, &shutdown)?);
         }
+        let network_changes = Arc::new(AtomicU64::new(0));
+        // SOCK-12: a socket bound to a specific address keeps sending from it,
+        // so only a wildcard bind needs to follow interface changes.
+        if sockets
+            .iter()
+            .any(|slot| slot.local_addr.ip().is_unspecified())
+        {
+            tokio::spawn(watch_interfaces(
+                sockets.iter().filter_map(SocketSlot::endpoint).collect(),
+                local_interface_ips,
+                INTERFACE_POLL,
+                network_changes.clone(),
+                shutdown.subscribe(),
+            ));
+        }
         let inner = Inner {
             id: secret.public(),
             config: config.clone(),
@@ -171,6 +190,7 @@ impl QuicEndpoint {
             shutdown,
             serve: Mutex::new(None),
             observer: Mutex::new(None),
+            network_changes,
         };
         Ok(Self {
             inner: Arc::new(inner),
@@ -202,6 +222,11 @@ impl QuicEndpoint {
                 rebinds: slot.rebinds.load(Ordering::Relaxed),
             })
             .collect()
+    }
+
+    /// Network changes the endpoint has passed to noq (SOCK-12).
+    pub fn network_changes(&self) -> u64 {
+        self.inner.network_changes.load(Ordering::Relaxed)
     }
 
     /// The validated transport configuration.
@@ -424,6 +449,16 @@ impl QuicEndpoint {
         Conn::new(connection, remote_id, admitted, alpn, paths)
     }
 
+    /// The live noq endpoints, for tests that drive endpoint tasks directly.
+    #[cfg(test)]
+    pub(crate) fn noq_endpoints(&self) -> Vec<noq::Endpoint> {
+        self.inner
+            .sockets
+            .iter()
+            .filter_map(SocketSlot::endpoint)
+            .collect()
+    }
+
     fn ban_check(&self) -> Option<BanCheck> {
         let acceptor = self
             .inner
@@ -549,6 +584,54 @@ async fn socket_supervisor(
                 endpoint.close(VarInt::from_u32(0), b"socket failed");
                 return;
             }
+        }
+    }
+}
+
+/// Every path may recover in place after a network change, so noq clears its
+/// local address and pings it. Zakura never opens replacement paths (DIAL-7).
+#[derive(Debug)]
+struct RecoverInPlace;
+
+impl noq::NetworkChangeHint for RecoverInPlace {
+    fn is_path_recoverable(&self, _path_id: PathId, _network_path: noq::FourTuple) -> bool {
+        true
+    }
+}
+
+/// Tells noq when the host's interface addresses change (SOCK-12).
+///
+/// noq pins each path to the local address that first received its packets.
+/// When that address disappears, every send on the path fails until the path
+/// idles out. A notified connection forgets the address and pings its peer
+/// from whichever address the kernel now picks.
+pub(crate) async fn watch_interfaces(
+    endpoints: Vec<noq::Endpoint>,
+    list_ips: impl Fn() -> Vec<IpAddr> + Send + 'static,
+    interval: Duration,
+    changes: Arc<AtomicU64>,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    let mut known = list_ips();
+    let mut ticker = tokio::time::interval(interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    ticker.tick().await;
+    loop {
+        tokio::select! {
+            _ = ticker.tick() => {}
+            _ = shutdown.wait_for(|stop| *stop) => return,
+        }
+        let current = list_ips();
+        if current == known {
+            continue;
+        }
+        tracing::info!(target: "zakura_quic", from = ?known, to = ?current, "interface addresses changed");
+        known = current;
+        changes.fetch_add(1, Ordering::Relaxed);
+        metrics::counter!("zakura.quic.network_changes").increment(1);
+        let hint: Arc<dyn noq::NetworkChangeHint + Send + Sync> = Arc::new(RecoverInPlace);
+        for endpoint in &endpoints {
+            endpoint.handle_network_change(Some(hint.clone()));
         }
     }
 }

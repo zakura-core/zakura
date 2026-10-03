@@ -1,5 +1,5 @@
 //! Operating-system helpers: kernel drop counters (SOCK-7) and interface
-//! listing (SOCK-10).
+//! listing (SOCK-10, SOCK-12).
 
 use std::net::{IpAddr, SocketAddr};
 
@@ -31,7 +31,8 @@ pub fn canonical_ip(ip: IpAddr) -> IpAddr {
 /// Lists the IP addresses of the host's interfaces that are up.
 ///
 /// Zakura uses this for wildcard binds, where the bound address isn't
-/// advertisable. Returns an empty list where the platform has no `getifaddrs`.
+/// advertisable, and the endpoint polls it to notice network changes. Returns
+/// an empty list where the platform has no `getifaddrs`.
 pub fn local_interface_ips() -> Vec<IpAddr> {
     #[cfg(unix)]
     {

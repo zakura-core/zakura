@@ -30,7 +30,7 @@ pub enum CongestionController {
     Cubic,
     /// NewReno.
     NewReno,
-    /// BBRv3. Changing the default needs the PLAN step 12 fleet A/B.
+    /// BBRv3. Changing the default needs a fleet A/B (SPEC §17, P1).
     Bbr3,
 }
 

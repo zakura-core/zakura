@@ -1,6 +1,6 @@
 # Spec: `zakura-quic` transport
 
-Status: draft for review, 2026-10-02. Version 0.3.
+Status: draft for review, 2026-10-03. Version 0.4.
 This document is authoritative for the `zakura-quic` crate, its configuration,
 its wire behavior and the Zakura noq fork.
 [Decision 0003](../decisions/zakura/0003-zakura-quic-transport.md) records the
@@ -11,7 +11,8 @@ Version 0.2 matches the first implementation (zakura draft PR). It changes
 DEP-6, SOCK-1, WIRE-9, ADM-1, ADM-3, PATH-3, OBS-3, API-2, API-3, API-6 and
 API-7; §17a lists each change. Version 0.3 answers the V12 audit of that
 implementation. It changes SOCK-11, ADM-3, PATH-2, DIAL-4, DIAL-5, CTRL-17,
-CTRL-22 and API-7; §17b lists each change.
+CTRL-22 and API-7; §17b lists each change. Version 0.4 adds SOCK-12; §17c
+explains it.
 
 ## 0. Conventions
 
@@ -187,6 +188,13 @@ at fork tag `zakura-iroh-v1.1.0-rc.1`, and it keeps their MIT/Apache-2.0 notices
   canonical: an `::ffff:a.b.c.d` address becomes `a.b.c.d`. Other IPv6
   addresses keep their scope ID and flow info, because a link-local address
   needs its scope ID to be dialable.
+- **SOCK-12.** When a socket is bound to an unspecified address, the endpoint
+  MUST list the host's interface addresses every 5 s. When the list changes, it
+  MUST call `noq::Endpoint::handle_network_change` on every socket with a hint
+  that marks each path recoverable. Each connection then forgets the local
+  address its paths send from and pings its peer from the address the kernel
+  now picks. The endpoint MUST NOT rebind a socket or open a replacement path
+  (DIAL-7) for a network change.
 
 ## 7. Admission
 
@@ -382,6 +390,7 @@ These are not configurable. Changing one needs a spec change.
 | `zakura.quic.socket.send_buffer_bytes` | gauge | Effective `SO_SNDBUF` |
 | `zakura.quic.socket.kernel_drops` | counter | `/proc/net/udp` drops for this socket (SOCK-7) |
 | `zakura.quic.socket.rebinds` | counter | SOCK-9 rebinds |
+| `zakura.quic.network_changes` | counter | SOCK-12 interface changes passed to noq |
 | `zakura.quic.incoming.accepted` / `.refused` / `.retried` / `.ignored` | counter | ADM-2 outcomes |
 | `zakura.quic.handshake.completed` / `.failed` / `.timed_out` | counter | Handshake results |
 | `zakura.quic.handshake.duration_seconds` | histogram | Accept or dial to handshake complete |
@@ -564,6 +573,7 @@ and the legacy stack bridges old and new `p2p_stack = "dual"` nodes (COMPAT-7).
 | Buffer read-back and clamp warning: bind under a lowered `rmem_max` in a user namespace | SOCK-3–SOCK-5 |
 | Busy-socket loopback run: zero `lost_packets` caused by the sender, bidirectional, 64 MiB | SOCK-6, G7 |
 | `/proc/net/udp` drop counter with a deliberately slow receiver | SOCK-7 |
+| A changed interface list notifies noq once, and an open connection keeps working | SOCK-12 |
 | Admission ordering, refuse, ignore, retry, timeout | ADM-1–ADM-7, SEC-3, SEC-4 |
 | Happy-eyeballs dial with mixed v4/v6 addresses and one black-holed address | DIAL-1–DIAL-6 |
 | Path ban and admitted-IP invariance | PATH-1–PATH-5, SEC-5 |
@@ -584,9 +594,9 @@ Every requirement above is P0 except these:
 - **P1** (after the default flips, each gated by a measurement): changing the
   CTRL-3 default, CTRL-8, CTRL-9, CTRL-40 and the CTRL-25 qlog feature. The
   keys and their mappings ship in P0; only their use waits for the measurement.
-- **P2** (on demand only): several `SO_REUSEPORT` sockets, rebinding on network
-  change beyond SOCK-9, extra paths opened by the dialer (DIAL-7), hole
-  punching (COMPAT-6) and Noise (COMPAT-5).
+- **P2** (on demand only): several `SO_REUSEPORT` sockets, rebinding a socket
+  on a network change (SOCK-12 only notifies noq), extra paths opened by the
+  dialer (DIAL-7), hole punching (COMPAT-6) and Noise (COMPAT-5).
 
 ## 17a. Changes in version 0.2
 
@@ -632,3 +642,14 @@ requirements:
   admission slot for 150 s and Zakura refused every honest inbound peer.
 - **API-7.** Handshake tasks hold the endpoint weakly (F-305588), and
   `shutdown` drops its sockets while other handles live (F-305596).
+
+## 17c. Changes in version 0.4
+
+- **SOCK-12.** Added. Version 0.3 dropped Iroh's network-change handling on the
+  premise that servers bind explicit addresses. The default `listen_addr` is
+  `0.0.0.0:8234`, an unspecified address, and noq pins each path to the local
+  address that first received its packets. Without SOCK-12, a node whose
+  address changed kept sending from the vanished address until its
+  connections idled out and it redialed. Iroh learned of changes from OS
+  events; polling every 5 s needs no new dependency, because SOCK-10 already
+  lists interfaces.

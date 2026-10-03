@@ -1,7 +1,7 @@
 //! Direct QUIC transport for Zakura's native P2P stack.
 //!
 //! `zakura-quic` runs Zakura's `p2p-v2/*` protocols over [noq] without Iroh's
-//! socket layer. `docs/zakura-quic/SPEC.md` is authoritative for its behavior;
+//! socket layer. `docs/specs/zakura-quic.md` is authoritative for its behavior;
 //! code comments cite requirement IDs such as `ADM-3`.
 //!
 //! The crate provides:

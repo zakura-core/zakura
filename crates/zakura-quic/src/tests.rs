@@ -3,7 +3,10 @@
 use std::{
     collections::HashSet,
     net::{IpAddr, Ipv4Addr, SocketAddr},
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    },
     time::Duration,
 };
 
@@ -11,8 +14,8 @@ use futures::future::BoxFuture;
 use tokio::sync::mpsc;
 
 use crate::{
-    Acceptor, Admit, Conn, ConnectError, IncomingInfo, NodeAddr, NodeSecretKey, QuicBindConfig,
-    QuicConfig, QuicEndpoint, VarInt,
+    endpoint::watch_interfaces, Acceptor, Admit, Conn, ConnectError, IncomingInfo, NodeAddr,
+    NodeSecretKey, QuicBindConfig, QuicConfig, QuicEndpoint, VarInt,
 };
 
 const ALPN: &[u8] = b"p2p-v2/2";
@@ -216,6 +219,56 @@ async fn dial_authenticates_both_sides_and_echoes() {
         assert_eq!(seen[0].remote.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
         assert!(!seen[0].validated);
         assert_eq!(seen[0].pending_total, 0);
+    })
+    .await
+    .unwrap();
+}
+
+// SOCK-12: an interface change reaches noq once, and a connection keeps
+// working after noq drops its pinned local address.
+#[tokio::test]
+async fn interface_change_notifies_noq_and_keeps_connections() {
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        let server = server();
+        let client = QuicEndpoint::bind(
+            NodeSecretKey::generate(),
+            &QuicBindConfig {
+                addrs: vec![SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))],
+                max_bidi_streams: 64,
+            },
+            &test_config(),
+        )
+        .unwrap();
+        let conn = client.connect(server.addr(), ALPN).await.unwrap();
+        assert_eq!(echo(&conn, b"before").await, b"before");
+
+        let ips = Arc::new(Mutex::new(vec![IpAddr::from([192, 0, 2, 1])]));
+        let list_ips = {
+            let ips = ips.clone();
+            move || ips.lock().unwrap().clone()
+        };
+        let changes = Arc::new(AtomicU64::new(0));
+        let (stop, stop_rx) = tokio::sync::watch::channel(false);
+        let watcher = tokio::spawn(watch_interfaces(
+            client.noq_endpoints(),
+            list_ips,
+            Duration::from_millis(20),
+            changes.clone(),
+            stop_rx,
+        ));
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(changes.load(Ordering::Relaxed), 0, "no change, no notice");
+
+        ips.lock().unwrap().push(IpAddr::from([198, 51, 100, 1]));
+        while changes.load(Ordering::Relaxed) == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(echo(&conn, b"after").await, b"after");
+        assert_eq!(changes.load(Ordering::Relaxed), 1);
+
+        stop.send_replace(true);
+        watcher.await.unwrap();
     })
     .await
     .unwrap();

@@ -263,9 +263,7 @@ impl Application for ZakuradApp {
     #[allow(clippy::print_stderr)]
     #[allow(clippy::unwrap_in_result)]
     fn register_components(&mut self, command: &Self::Cmd) -> Result<(), FrameworkError> {
-        use crate::components::{
-            metrics::MetricsEndpoint, tokio::TokioComponent, tracing::TracingEndpoint,
-        };
+        use crate::components::{metrics::MetricsEndpoint, tokio::TokioComponent};
 
         let mut components = self.framework_components(command)?;
 
@@ -495,7 +493,14 @@ impl Application for ZakuradApp {
                 info!("No config file provided, using default configuration");
             }
 
-            info!("{config:?}");
+            // Log only selected diagnostics. The full config can contain credentials.
+            info!(
+                network = %config.network.network,
+                p2p_stack = ?config.network.p2p_stack.resolve(&config.network.network),
+                peerset_initial_target_size = config.network.peerset_initial_target_size,
+                ephemeral_state = config.state.ephemeral,
+                "loaded node configuration",
+            );
 
             // Explicitly log the configured miner address so CI can assert env override
             if let Some(miner_address) = &config.mining.miner_address {
@@ -529,7 +534,6 @@ impl Application for ZakuradApp {
         // Launch network and async endpoints only for long-running commands.
         if is_server {
             components.push(Box::new(TokioComponent::new()?));
-            components.push(Box::new(TracingEndpoint::new(&config)?));
             components.push(Box::new(MetricsEndpoint::new(&metrics_config)?));
         }
 

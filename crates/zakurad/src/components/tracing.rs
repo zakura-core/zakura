@@ -2,7 +2,6 @@
 
 use std::{
     io::IsTerminal,
-    net::SocketAddr,
     ops::{Deref, DerefMut},
     path::PathBuf,
 };
@@ -10,7 +9,6 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 mod component;
-mod endpoint;
 
 #[cfg(feature = "flamegraph")]
 mod flame;
@@ -19,7 +17,6 @@ mod flame;
 mod otel;
 
 pub use component::Tracing;
-pub use endpoint::TracingEndpoint;
 
 #[cfg(feature = "flamegraph")]
 pub use flame::{layer, Grapher};
@@ -124,13 +121,6 @@ pub struct InnerConfig {
     /// Defaults to 128,000 with a minimum of 100.
     pub buffer_limit: usize,
 
-    /// The address used for an ad-hoc RPC endpoint allowing dynamic control of the tracing filter.
-    ///
-    /// Install Zebra using `cargo install --features=filter-reload` to enable this config.
-    ///
-    /// If this is set to None, the endpoint is disabled.
-    pub endpoint_addr: Option<SocketAddr>,
-
     /// Controls whether to write a flamegraph of tracing spans.
     ///
     /// Install Zebra using `cargo install --features=flamegraph` to enable this config.
@@ -199,6 +189,9 @@ pub struct InnerConfig {
     ///
     /// When `None` (default), OpenTelemetry is completely disabled with zero runtime overhead.
     /// When set, traces are exported via OTLP HTTP protocol.
+    /// The URL must use HTTP or HTTPS. Its path is extended with `/v1/traces`
+    /// unless it already ends with that suffix, ignoring trailing slashes.
+    /// Query parameters are preserved, and fragments are discarded.
     ///
     /// Example: `"http://localhost:4318"`
     ///
@@ -275,7 +268,6 @@ impl Default for InnerConfig {
             force_use_color: false,
             filter: None,
             buffer_limit: 128_000,
-            endpoint_addr: None,
             flamegraph: None,
             progress_bar,
             log_file: runtime_default_log_file(None, progress_bar),

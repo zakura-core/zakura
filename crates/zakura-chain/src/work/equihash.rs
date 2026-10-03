@@ -1,5 +1,6 @@
 //! Equihash Solution and related items.
 
+use crate::serialization::ZcashReader;
 use std::{fmt, io};
 
 use hex::{FromHex, FromHexError, ToHex};
@@ -9,8 +10,8 @@ use crate::{
     block::Header,
     parameters::Network,
     serialization::{
-        zcash_deserialize_bytes_external_count, zcash_serialize_bytes, CompactSizeMessage,
-        SerializationError, ZcashDeserialize, ZcashDeserializeInto, ZcashSerialize,
+        zcash_serialize_bytes, CompactSizeMessage, SerializationError, ZcashDeserialize,
+        ZcashSerialize,
     },
 };
 
@@ -340,20 +341,22 @@ impl ZcashSerialize for Solution {
 }
 
 impl ZcashDeserialize for Solution {
-    fn zcash_deserialize<R: io::Read>(mut reader: R) -> Result<Self, SerializationError> {
-        let len: CompactSizeMessage = (&mut reader).zcash_deserialize_into()?;
+    fn zcash_deserialize_from<R: io::Read>(
+        reader: &mut ZcashReader<R>,
+    ) -> Result<Self, SerializationError> {
+        let len: CompactSizeMessage = reader.read_value()?;
         let len: usize = len.into();
 
-        // Validate the length against the consensus-required sizes before
-        // allocating, so an attacker-controlled CompactSize cannot force a
-        // multi-megabyte allocation.
-        if len > SOLUTION_SIZE {
+        // Match the rules used to bound header collections, before reading or
+        // allocating solution bytes. The peer cannot select Regtest's smaller
+        // encoding when this decoder was configured for Mainnet or Testnet.
+        if !reader.decoder().accepts_equihash_solution_size(len) {
             return Err(SerializationError::Parse(
                 "incorrect equihash solution size",
             ));
         }
 
-        let solution = zcash_deserialize_bytes_external_count(len, &mut reader)?;
+        let solution = reader.read_bytes(len)?;
         Self::from_bytes(&solution)
     }
 }

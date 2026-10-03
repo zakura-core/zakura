@@ -153,16 +153,13 @@ use zakura_rpc::{
     server::OPENED_RPC_ENDPOINT_MSG,
     MinedBlockEvent, MinerParams, SubmitBlockChannel,
 };
-use zakura_state::{constants::LOCK_FILE_ERROR, state_database_format_version_in_code};
+use zakura_state::state_database_format_version_in_code;
 use zakura_test::{
     args,
     command::{to_regex::CollectRegexSet, ContextFrom, NO_MATCHES_REGEX_ITER},
     net::random_known_port,
     prelude::*,
 };
-
-#[cfg(not(target_os = "windows"))]
-use zakura_network::constants::PORT_IN_USE_ERROR;
 
 use common::{
     cached_state::{
@@ -1887,7 +1884,7 @@ fn zakura_zcash_listener_conflict() -> Result<()> {
     // (But since the config is ephemeral, they will have different state paths.)
     let dir2 = testdir()?.with_config(&mut config)?;
 
-    check_config_conflict(dir1, regex1.as_str(), dir2, PORT_IN_USE_ERROR.as_str())?;
+    check_config_conflict(dir1, regex1.as_str(), dir2, "already in use")?;
 
     Ok(())
 }
@@ -1916,7 +1913,7 @@ fn zakura_metrics_conflict() -> Result<()> {
     // But they will have different Zcash listeners (auto port) and states (ephemeral)
     let dir2 = testdir()?.with_config(&mut config)?;
 
-    check_config_conflict(dir1, regex1.as_str(), dir2, PORT_IN_USE_ERROR.as_str())?;
+    check_config_conflict(dir1, regex1.as_str(), dir2, "already in use")?;
 
     Ok(())
 }
@@ -1993,7 +1990,7 @@ fn zakura_state_conflict() -> Result<()> {
         dir_conflict.path(),
         regex::escape(&contains).as_str(),
         dir_conflict.path(),
-        LOCK_FILE_ERROR.as_str(),
+        "(lock file).*(temporarily unavailable)|(in use)|(being used by another process)|(Database likely already open)|(database lock)",
     )?;
 
     Ok(())

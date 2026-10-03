@@ -1117,6 +1117,66 @@ async fn inbound_block_height_lookahead_limit() -> Result<(), crate::BoxError> {
     Ok(())
 }
 
+/// Checks that `FindHeaders` at tip-parity responds with an empty header list
+/// rather than `Nil`.
+///
+/// `Nil` sends nothing on the wire, but the `getheaders` protocol expects a
+/// `headers` reply even when it is empty: a zcashd-lineage peer treats the
+/// missing reply as a timeout and disconnects, so a single-peer zcashd-compat
+/// sidecar churns through reconnects instead of settling at the tip (#198).
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn find_headers_at_tip_responds_with_empty_headers() -> Result<(), crate::BoxError> {
+    let (
+        inbound_service,
+        _mempool_guard,
+        committed_blocks,
+        _added_transactions,
+        _mock_tx_verifier,
+        mut peer_set,
+        _state_guard,
+        _chain_tip_change,
+        sync_gossip_task_handle,
+        tx_gossip_task_handle,
+    ) = setup(false).await;
+
+    let tip_hash = committed_blocks
+        .last()
+        .expect("setup committed at least one block")
+        .hash();
+
+    // A locator that already knows the tip yields no headers to send back.
+    let response = inbound_service
+        .clone()
+        .oneshot(Request::FindHeaders {
+            known_blocks: vec![tip_hash],
+            stop: None,
+        })
+        .await?;
+
+    assert_eq!(
+        response,
+        Response::BlockHeaders(Vec::new()),
+        "an empty `FindHeaders` result must still be an (empty) `headers` reply, not `Nil`",
+    );
+
+    // check that nothing unexpected happened
+    peer_set.expect_no_requests().await;
+
+    let sync_gossip_result = sync_gossip_task_handle.now_or_never();
+    assert!(
+        sync_gossip_result.is_none(),
+        "unexpected error or panic in sync gossip task: {sync_gossip_result:?}",
+    );
+
+    let tx_gossip_result = tx_gossip_task_handle.now_or_never();
+    assert!(
+        tx_gossip_result.is_none(),
+        "unexpected error or panic in transaction gossip task: {tx_gossip_result:?}",
+    );
+
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 /// Checks that Zebra won't give out its entire address book over a short duration.
 async fn caches_getaddr_response() {

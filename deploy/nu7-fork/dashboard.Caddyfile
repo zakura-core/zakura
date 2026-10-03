@@ -27,7 +27,7 @@ api.nu7.valargroup.dev {
 
     # zakura-cluster-status answers CORS for its own zakura.com allowlist, including
     # preflight. Only these two paths are public; its fleet page and /data are not.
-    @status path /v1/status /healthz
+    @status path /v1/status /v1/dashboard /healthz
     handle @status {
         reverse_proxy 127.0.0.1:8093
     }

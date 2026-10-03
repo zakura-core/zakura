@@ -4095,6 +4095,7 @@ setInterval(renderFreshness, 1000);
 
 
 COLLECTOR: ClusterCollector | None = None
+ACTIVATION_FEED = None
 RATE_LIMITER = RateLimiter()
 # The page and its data both change every poll, and the HTML carries no
 # fingerprint. Without this a browser heuristically caches the page and keeps
@@ -4254,6 +4255,14 @@ class Handler(BaseHTTPRequestHandler):
                 )
             status, payload = COLLECTOR.ironwood_status()
             return self.send_json(status, payload, headers)
+        if parsed.path == "/v1/dashboard" and ACTIVATION_FEED is not None:
+            headers = self.public_headers()
+            if not RATE_LIMITER.allow(self.rate_limit_client()):
+                headers["Retry-After"] = str(int(PUBLIC_RATE_WINDOW))
+                return self.send_json(429, {"schemaVersion": 1, "error": "Request rate limit exceeded"}, headers)
+            code, payload = ACTIVATION_FEED.response()
+            headers["Cache-Control"] = "public, max-age=10" if code == 200 else "no-store"
+            return self.send_json(code, payload, headers)
         if parsed.path == "/v1/status" and COLLECTOR.nu7 is not None:
             headers = self.public_headers()
             if not RATE_LIMITER.allow(self.rate_limit_client()):
@@ -4294,6 +4303,8 @@ class Handler(BaseHTTPRequestHandler):
         public_paths = {"/ironwood-status.json"}
         if COLLECTOR is not None and COLLECTOR.nu7 is not None:
             public_paths.add("/v1/status")
+        if ACTIVATION_FEED is not None:
+            public_paths.add("/v1/dashboard")
         if parsed.path not in public_paths:
             return self.send_body(
                 404,
@@ -4310,7 +4321,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main() -> None:
-    global COLLECTOR
+    global COLLECTOR, ACTIVATION_FEED
 
     parser = argparse.ArgumentParser(description="Serve a Zakura fleet status dashboard.")
     parser.add_argument("--config", required=True, help="path to deploy/deployer nodes TOML")
@@ -4362,6 +4373,8 @@ def main() -> None:
         default=None,
         help="seconds between metric scrapes; omit to adapt to the last scrape's cost",
     )
+    parser.add_argument("--nu7-activation-config", default="",
+                        help="approved profile/selector JSON; serves coherent /v1/dashboard")
     args = parser.parse_args()
 
     nodes = load_nodes(Path(args.config))
@@ -4381,6 +4394,10 @@ def main() -> None:
         nu7=nu7,
     )
     threading.Thread(target=COLLECTOR.loop, daemon=True).start()
+    if args.nu7_activation_config:
+        from nu7_activation import ActivationFeed
+        ACTIVATION_FEED = ActivationFeed(args.nu7_activation_config, nu7)
+        threading.Thread(target=ACTIVATION_FEED.loop, daemon=True).start()
 
     print(
         f"cluster status dashboard bound on {args.host}:{args.port}; "

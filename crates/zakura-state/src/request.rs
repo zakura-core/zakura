@@ -1405,6 +1405,9 @@ pub enum Request {
     /// with the current best chain tip.
     Tip,
 
+    /// Return immutable history context for a committed parent on any retained branch.
+    BlockParentContext(block::Hash),
+
     /// Reconciles durable checkpoint completion with queued semantic writes, including when
     /// no further requests would drive the buffered state service.
     ///
@@ -1647,6 +1650,7 @@ impl Request {
             Request::AwaitUtxo(_) => "await_utxo",
             Request::Depth(_) => "depth",
             Request::Tip => "tip",
+            Request::BlockParentContext(_) => "block_parent_context",
             Request::CheckCheckpointHandoff => "check_checkpoint_handoff",
             Request::BlockLocator => "block_locator",
             Request::Transaction(_) => "transaction",
@@ -1704,6 +1708,9 @@ pub enum ReadRequest {
     /// Returns [`ReadResponse::Tip(Option<(Height, block::Hash)>)`](ReadResponse::Tip)
     /// with the current best chain tip.
     Tip,
+
+    /// Return immutable history context for a committed parent on any retained branch.
+    BlockParentContext(block::Hash),
 
     /// Returns [`ReadResponse::FinalizedTip(Option<(Height, block::Hash)>)`](ReadResponse::FinalizedTip)
     /// with the durable finalized chain tip.
@@ -2214,6 +2221,7 @@ impl ReadRequest {
             ReadRequest::UsageInfo => "usage_info",
             ReadRequest::PruningInfo => "pruning_info",
             ReadRequest::Tip => "tip",
+            ReadRequest::BlockParentContext(_) => "block_parent_context",
             ReadRequest::FinalizedTip => "finalized_tip",
             ReadRequest::TipPoolValues => "tip_pool_values",
             ReadRequest::BlockInfo(_) => "block_info",
@@ -2295,6 +2303,7 @@ impl TryFrom<Request> for ReadRequest {
     fn try_from(request: Request) -> Result<ReadRequest, Self::Error> {
         match request {
             Request::Tip => Ok(ReadRequest::Tip),
+            Request::BlockParentContext(hash) => Ok(ReadRequest::BlockParentContext(hash)),
             Request::Depth(hash) => Ok(ReadRequest::Depth(hash)),
             Request::BestChainNextMedianTimePast => Ok(ReadRequest::BestChainNextMedianTimePast),
             Request::BestChainBlockHash(hash) => Ok(ReadRequest::BestChainBlockHash(hash)),

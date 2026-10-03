@@ -551,9 +551,10 @@ async fn semantic_child_cannot_end_checkpoint_sync_early() {
 
         // Both heights and the Merkle root agree, so this block passes semantic checks.
         // Its height gap is only detectable using the parent, after the state queues it.
+        // A V4 coinbase keeps the block on that path: the semantic verifier reads the
+        // parent context, and rejects the gap itself, only for V5+ transactions.
         let height = Height(3);
-        let coinbase = Transaction::V5 {
-            network_upgrade: NetworkUpgrade::Nu5,
+        let coinbase = Transaction::V4 {
             lock_time: LockTime::unlocked(),
             expiry_height: height,
             inputs: vec![transparent::Input::Coinbase {
@@ -565,8 +566,8 @@ async fn semantic_child_cannot_end_checkpoint_sync_early() {
                 value: block_subsidy(height, &network, None).unwrap(),
                 lock_script: transparent::Script::new(&[0]),
             }],
+            joinsplit_data: None,
             sapling_shielded_data: None,
-            orchard_shielded_data: None,
         };
         let mut candidate = generated.blocks[0].clone();
         candidate.transactions = vec![Arc::new(coinbase)];
@@ -804,6 +805,11 @@ async fn forged_expiry_with_authentic_height_is_a_payload_mismatch() {
         let unknown_block_state = service_fn(|request: zs::Request| match request {
             zs::Request::KnownBlock(_) => {
                 std::future::ready(Ok::<_, BoxError>(zs::Response::KnownBlock(None)))
+            }
+            // The parent is not committed here, so its context is unavailable. The body's
+            // Merkle root is still decided without it, which is what this test asserts.
+            zs::Request::BlockParentContext(_) => {
+                std::future::ready(Ok::<_, BoxError>(zs::Response::BlockParentContext(None)))
             }
             request => panic!("unexpected state request: {request:?}"),
         });

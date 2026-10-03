@@ -274,11 +274,11 @@ fn opentelemetry_status_does_not_log_endpoint() -> Result<()> {
         "http://test-user:test-password@127.0.0.1:1/test-path?token=test-token#test-fragment"
             .to_owned(),
     );
-    config.tracing.filter = Some("info".to_owned());
     config.tracing.opentelemetry_sample_percent = Some(0);
     let testdir = testdir()?.with_config(&mut config)?;
+    // Utility commands use their own filter. Verbose output includes the INFO status.
     let output = (&testdir)
-        .spawn_child(args!["generate", "-o", "generated.toml"])?
+        .spawn_child(args!["-v", "generate", "-o", "generated.toml"])?
         .wait_with_output_or_timeout(Duration::from_secs(30))?
         .assert_success()?;
 

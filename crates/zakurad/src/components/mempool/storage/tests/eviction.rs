@@ -572,7 +572,7 @@ fn pad_authorizing_data(tx: &VerifiedUnminedTx, padding: usize) -> VerifiedUnmin
 }
 
 #[test]
-fn rejecting_a_padded_variant_does_not_reject_the_original() {
+fn rejecting_a_padded_variant_rejects_the_original_until_next_block() {
     let _init_guard = zakura_test::init();
     let mut factory = TxFactory::new();
     let mut storage = storage_for(2);
@@ -594,10 +594,133 @@ fn rejecting_a_padded_variant_does_not_reject_the_original() {
         storage.insert(padded, vec![], None),
         Err(ExactTipRejectionError::BelowEvictionCost.into())
     );
+    let error = MempoolError::from(ExactTipRejectionError::BelowEvictionCost);
+    let original_id = original.transaction.id();
+    // The smaller variant qualifies, but effects-based rejection takes priority.
+    assert!(storage
+        .verified
+        .select_eviction_victims(&original, &HashSet::new(), storage.tx_cost_limit,)
+        .roots
+        .is_some());
     assert_eq!(
-        storage.insert(original.clone(), vec![], None),
-        Ok(original.transaction.id())
+        storage.should_download_or_verify(original_id),
+        Err(error.clone())
     );
+    assert_eq!(storage.insert(original.clone(), vec![], None), Err(error));
+
+    storage.clear_tip_rejections();
+    assert_eq!(storage.should_download_or_verify(original_id), Ok(()));
+    assert_eq!(storage.insert(original, vec![], None), Ok(original_id));
+}
+
+/// Changes a fixture's fixed-size authorizing data without changing its effects.
+/// The fixture's signatures are placeholders; this tests rejection before crypto.
+fn change_authorization(tx: &VerifiedUnminedTx) -> VerifiedUnminedTx {
+    let mut transaction = Transaction::clone(tx.transaction.transaction());
+    let Transaction::V6 {
+        ironwood_shielded_data: Some(shielded_data),
+        ..
+    } = &mut transaction
+    else {
+        unreachable!("TxFactory builds V6 transactions with Ironwood data");
+    };
+    shielded_data.binding_sig = [1; 64].into();
+    let mut variant = tx.clone();
+    variant.transaction = Arc::new(transaction).into();
+    assert_eq!(variant.transaction.size(), tx.transaction.size());
+    assert_eq!(
+        variant.transaction.id().mined_id(),
+        tx.transaction.id().mined_id()
+    );
+    assert_ne!(variant.transaction.id(), tx.transaction.id());
+    variant
+}
+
+#[test]
+fn fee_rejections_suppress_authorization_variants_before_download() {
+    let _init_guard = zakura_test::init();
+    let mut factory = TxFactory::new();
+    let original = factory.tx(10_000);
+    let variant = change_authorization(&original);
+    let padded = pad_authorizing_data(&variant, 10_000);
+    let variants = [original, variant, padded];
+    for reason in [
+        ExactTipRejectionError::Evicted,
+        ExactTipRejectionError::BelowEvictionCost,
+    ] {
+        let mut storage = storage_for(2);
+        storage.reject(variants[0].transaction.id(), reason.clone().into());
+        let error = MempoolError::from(reason.clone());
+        for tx in &variants {
+            let id = tx.transaction.id();
+            assert_eq!(storage.should_download_or_verify(id), Err(error.clone()));
+            let (result, evicted) = storage.insert_with_evicted_ids(tx.clone(), vec![], None);
+            assert_eq!(result, Err(error.clone()));
+            assert!(evicted.is_empty());
+            assert_eq!(storage.transaction_count(), 0);
+            storage.reject(id, reason.clone().into());
+            assert_eq!(storage.rejected_transaction_count(), 1);
+        }
+        let ids: HashSet<_> = variants.iter().map(|tx| tx.transaction.id()).collect();
+        assert_eq!(
+            storage
+                .rejected_transactions(ids.clone())
+                .collect::<HashSet<_>>(),
+            ids
+        );
+        storage.clear_tip_rejections();
+        for tx in &variants {
+            assert_eq!(
+                storage.should_download_or_verify(tx.transaction.id()),
+                Ok(())
+            );
+        }
+    }
+}
+
+#[test]
+fn evicted_transactions_suppress_authorization_variants() {
+    let _init_guard = zakura_test::init();
+    let mut factory = TxFactory::new();
+    let mut storage = storage_for(1);
+    let original = factory.tx(10_000);
+    insert(&mut storage, &original, vec![]);
+    let variant = change_authorization(&original);
+    let (result, evicted) =
+        storage.insert_with_evicted_ids(factory.tx(10_000 + MARGINAL_FEE), vec![], None);
+    assert!(result.is_ok());
+    assert_eq!(evicted, [original.transaction.id()].into());
+    assert_eq!(
+        storage.should_download_or_verify(variant.transaction.id()),
+        Err(ExactTipRejectionError::Evicted.into())
+    );
+}
+
+#[test]
+fn verification_and_standardness_rejections_still_match_exact_authorizing_data() {
+    let _init_guard = zakura_test::init();
+    let mut factory = TxFactory::new();
+    let original = factory.tx(10_000);
+    let variant = change_authorization(&original);
+    for reason in [
+        RejectionError::ExactTip(ExactTipRejectionError::FailedVerification(
+            zakura_consensus::error::TransactionError::WrongVersion,
+        )),
+        RejectionError::ExactTip(ExactTipRejectionError::FailedStandard(
+            NonStandardTransactionError::IsDust,
+        )),
+        RejectionError::NonStandardTransaction(NonStandardTransactionError::IsDust),
+    ] {
+        let mut storage = storage_for(2);
+        storage.reject(original.transaction.id(), reason);
+        assert!(storage
+            .should_download_or_verify(original.transaction.id())
+            .is_err());
+        assert_eq!(
+            storage.should_download_or_verify(variant.transaction.id()),
+            Ok(())
+        );
+    }
 }
 
 /// Returns the eviction victims or admission error for `incoming`, recomputing

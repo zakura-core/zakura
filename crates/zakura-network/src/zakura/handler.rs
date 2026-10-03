@@ -958,35 +958,91 @@ pub struct ZakuraSupervisorHandle {
     registration_tx: broadcast::Sender<ZakuraConnectionRegistration>,
     pending_handoffs: Arc<StdMutex<HashMap<ZakuraPeerId, ZakuraHandoffId>>>,
     peer_registry: Option<PeerRegistry>,
-    /// Lock-free-to-await mirror of `active_by_ip` and the per-IP cap, read by
-    /// the QUIC acceptor, which must not block (zakura-quic ADM-4).
-    ip_counts: Arc<StdMutex<HashMap<IpAddr, usize>>>,
-    /// Inbound connections past TLS whose control handshake hasn't registered
-    /// yet, per IP. The acceptor counts them with `ip_counts` (zakura-quic
-    /// ADM-3 rule 2).
-    control_handshakes_by_ip: Arc<StdMutex<HashMap<IpAddr, usize>>>,
+    /// The same counts the supervisor state charges, read by the QUIC acceptor.
+    ip_slots: IpSlots,
     max_connections_per_ip: usize,
 }
 
-/// Counts one inbound control handshake against its IP until dropped.
+/// Connections charged to each source IP: registered connections, and inbound
+/// connections still in their control handshake (zakura-quic ADM-3 rule 2).
+///
+/// A std mutex guards the counts, so the QUIC acceptor, which must not block,
+/// reads them without the supervisor's async lock (zakura-quic ADM-4).
+#[derive(Clone, Debug, Default)]
+struct IpSlots(Arc<StdMutex<IpSlotCounts>>);
+
+#[derive(Debug, Default)]
+struct IpSlotCounts {
+    registered: HashMap<IpAddr, usize>,
+    handshaking: HashMap<IpAddr, usize>,
+}
+
+impl IpSlots {
+    fn counts(&self) -> std::sync::MutexGuard<'_, IpSlotCounts> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Registered connections from `ip`.
+    fn registered(&self, ip: IpAddr) -> usize {
+        self.counts()
+            .registered
+            .get(&ip)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    /// Registered connections and control handshakes from `ip`.
+    fn charged(&self, ip: IpAddr) -> usize {
+        let counts = self.counts();
+        let registered = counts.registered.get(&ip).copied().unwrap_or_default();
+        let handshaking = counts.handshaking.get(&ip).copied().unwrap_or_default();
+        registered.saturating_add(handshaking)
+    }
+
+    #[cfg(any(test, debug_assertions))]
+    fn registered_total(&self) -> usize {
+        self.counts().registered.values().sum()
+    }
+
+    fn add_registered(&self, ip: IpAddr) {
+        *self.counts().registered.entry(ip).or_default() += 1;
+    }
+
+    fn remove_registered(&self, ip: IpAddr) {
+        decrement_ip_count(&mut self.counts().registered, ip);
+    }
+
+    /// Charges a control handshake to `ip` until the guard drops.
+    fn enter_handshake(&self, ip: IpAddr) -> ControlHandshakeGuard {
+        *self.counts().handshaking.entry(ip).or_default() += 1;
+        ControlHandshakeGuard {
+            slots: self.clone(),
+            ip,
+        }
+    }
+}
+
+fn decrement_ip_count(counts: &mut HashMap<IpAddr, usize>, ip: IpAddr) {
+    if let Some(count) = counts.get_mut(&ip) {
+        *count = count.saturating_sub(1);
+        if *count == 0 {
+            counts.remove(&ip);
+        }
+    }
+}
+
+/// Charges one inbound control handshake to its IP until dropped.
 #[derive(Debug)]
 struct ControlHandshakeGuard {
-    counts: Arc<StdMutex<HashMap<IpAddr, usize>>>,
+    slots: IpSlots,
     ip: IpAddr,
 }
 
 impl Drop for ControlHandshakeGuard {
     fn drop(&mut self) {
-        let mut counts = self
-            .counts
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(count) = counts.get_mut(&self.ip) {
-            *count -= 1;
-            if *count == 0 {
-                counts.remove(&self.ip);
-            }
-        }
+        decrement_ip_count(&mut self.slots.counts().handshaking, self.ip);
     }
 }
 
@@ -1064,9 +1120,7 @@ static NEXT_SUPERVISOR_ID: AtomicU64 = AtomicU64::new(1);
 struct ZakuraSupervisorState {
     supervisor: ZakuraPeerSupervisor,
     active_by_peer: HashMap<ZakuraPeerId, ZakuraPeerConnectionEntry>,
-    active_by_ip: HashMap<IpAddr, usize>,
-    /// Copy of `active_by_ip` shared with [`ZakuraSupervisorHandle::ip_counts`].
-    ip_counts: Arc<StdMutex<HashMap<IpAddr, usize>>>,
+    ip_slots: IpSlots,
     next_handoff_id: ZakuraHandoffId,
     max_connections_per_ip: usize,
     next_registration_id: ZakuraConnId,
@@ -1086,44 +1140,25 @@ struct ZakuraPeerConnectionEntry {
 impl ZakuraSupervisorState {
     fn increment_ip(&mut self, remote_ip: Option<IpAddr>) {
         if let Some(remote_ip) = remote_ip {
-            *self.active_by_ip.entry(remote_ip).or_default() += 1;
-            self.mirror_ip(remote_ip);
+            self.ip_slots.add_registered(remote_ip);
         }
     }
 
     fn decrement_ip(&mut self, remote_ip: Option<IpAddr>) {
         if let Some(remote_ip) = remote_ip {
-            if let Some(count) = self.active_by_ip.get_mut(&remote_ip) {
-                *count = count.saturating_sub(1);
-                if *count == 0 {
-                    self.active_by_ip.remove(&remote_ip);
-                }
-            }
-            self.mirror_ip(remote_ip);
+            self.ip_slots.remove_registered(remote_ip);
         }
-    }
-
-    fn mirror_ip(&self, remote_ip: IpAddr) {
-        let mut ip_counts = self
-            .ip_counts
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match self.active_by_ip.get(&remote_ip) {
-            Some(count) => ip_counts.insert(remote_ip, *count),
-            None => ip_counts.remove(&remote_ip),
-        };
     }
 
     #[cfg(debug_assertions)]
     fn debug_assert_accounting(&self) {
-        let active_by_ip_total: usize = self.active_by_ip.values().sum();
         debug_assert_eq!(
-            active_by_ip_total,
+            self.ip_slots.registered_total(),
             self.active_by_peer
                 .values()
                 .filter(|entry| entry.remote_ip.is_some())
                 .count(),
-            "Zakura active_by_ip totals must match active peer registrations with known IPs",
+            "Zakura per-IP registered totals must match active peer registrations with known IPs",
         );
     }
 
@@ -1219,15 +1254,14 @@ impl ZakuraSupervisorHandle {
 
     fn new_inner(max_connections_per_ip: usize, peer_registry: Option<PeerRegistry>) -> Self {
         let (registration_tx, _) = broadcast::channel(ZAKURA_REGISTRATION_EVENT_CAPACITY);
-        let ip_counts = Arc::new(StdMutex::new(HashMap::new()));
+        let ip_slots = IpSlots::default();
         let max_connections_per_ip = max_connections_per_ip.max(1);
         Self {
             id: NEXT_SUPERVISOR_ID.fetch_add(1, Ordering::Relaxed),
             inner: Arc::new(Mutex::new(ZakuraSupervisorState {
                 supervisor: ZakuraPeerSupervisor::default(),
                 active_by_peer: HashMap::new(),
-                active_by_ip: HashMap::new(),
-                ip_counts: ip_counts.clone(),
+                ip_slots: ip_slots.clone(),
                 next_handoff_id: 1,
                 max_connections_per_ip,
                 next_registration_id: 1,
@@ -1237,8 +1271,7 @@ impl ZakuraSupervisorHandle {
             registration_tx,
             pending_handoffs: Arc::new(StdMutex::new(HashMap::new())),
             peer_registry,
-            ip_counts,
-            control_handshakes_by_ip: Arc::new(StdMutex::new(HashMap::new())),
+            ip_slots,
             max_connections_per_ip,
         }
     }
@@ -1246,33 +1279,16 @@ impl ZakuraSupervisorHandle {
     /// Returns whether `remote_ip` has reached the per-IP cap once `pending`
     /// QUIC handshakes and its control handshakes are counted. Never awaits.
     fn ip_at_capacity(&self, remote_ip: IpAddr, pending: usize) -> bool {
-        let remote_ip = canonical_ip(remote_ip);
-        let count = |map: &StdMutex<HashMap<IpAddr, usize>>| {
-            map.lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .get(&remote_ip)
-                .copied()
-                .unwrap_or_default()
-        };
-        let established = count(&self.ip_counts);
-        let control = count(&self.control_handshakes_by_ip);
-        established.saturating_add(control).saturating_add(pending) >= self.max_connections_per_ip
+        self.ip_slots
+            .charged(canonical_ip(remote_ip))
+            .saturating_add(pending)
+            >= self.max_connections_per_ip
     }
 
     /// Counts an inbound control handshake against `remote_ip` until the guard
     /// drops at registration (zakura-quic ADM-3 rule 2).
     fn enter_control_handshake(&self, remote_ip: IpAddr) -> ControlHandshakeGuard {
-        let ip = canonical_ip(remote_ip);
-        *self
-            .control_handshakes_by_ip
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .entry(ip)
-            .or_default() += 1;
-        ControlHandshakeGuard {
-            counts: self.control_handshakes_by_ip.clone(),
-            ip,
-        }
+        self.ip_slots.enter_handshake(canonical_ip(remote_ip))
     }
 
     /// Returns the currently registered authenticated Zakura peer ids.
@@ -1378,16 +1394,11 @@ impl ZakuraSupervisorHandle {
             .get(&peer_id)
             .is_some_and(|entry| entry.remote_ip == remote_ip);
         if let Some(remote_ip) = remote_ip {
-            if !same_ip_duplicate_redial {
-                let ip_count = state
-                    .active_by_ip
-                    .get(&remote_ip)
-                    .copied()
-                    .unwrap_or_default();
-                if ip_count >= state.max_connections_per_ip {
-                    metrics::counter!("zakura.p2p.conn.rejected.admission").increment(1);
-                    return ZakuraRegistration::Rejected(ZakuraRejectReason::ResourceLimit);
-                }
+            if !same_ip_duplicate_redial
+                && state.ip_slots.registered(remote_ip) >= state.max_connections_per_ip
+            {
+                metrics::counter!("zakura.p2p.conn.rejected.admission").increment(1);
+                return ZakuraRegistration::Rejected(ZakuraRejectReason::ResourceLimit);
             }
         }
         if state.next_registration_id == u64::MAX {
@@ -1524,12 +1535,11 @@ impl ZakuraSupervisorHandle {
     ) -> bool {
         let remote_ip = canonical_ip(remote_ip);
         let state = self.inner.lock().await;
-        let active_count = state
-            .active_by_ip
-            .get(&remote_ip)
-            .copied()
-            .unwrap_or_default();
-        active_count.saturating_add(in_flight_count) < state.max_connections_per_ip
+        state
+            .ip_slots
+            .registered(remote_ip)
+            .saturating_add(in_flight_count)
+            < state.max_connections_per_ip
     }
 }
 
@@ -3467,7 +3477,7 @@ impl ZakuraProtocolHandler {
                 context.accepted_capabilities,
             )
             .await;
-        // A registered connection now counts in `ip_counts`.
+        // A registered connection now counts as registered in `ip_slots`.
         drop(context.control_handshake);
 
         match registration {
@@ -6682,7 +6692,7 @@ mod tests {
                 .expect("winner remains registered after loser cleanup");
             assert_eq!(entry.conn_id, winning_conn);
             assert_eq!(entry.remote_ip, Some(remote_ip));
-            assert_eq!(state.active_by_ip.get(&remote_ip), Some(&1));
+            assert_eq!(state.ip_slots.registered(remote_ip), 1);
             state.debug_assert_accounting();
         }
         assert_eq!(supervisor.registered_ids().await, vec![peer.clone()]);
@@ -6691,7 +6701,7 @@ mod tests {
         supervisor.deregister(&peer, winning_conn).await;
         let state = supervisor.inner.lock().await;
         assert!(state.active_by_peer.is_empty());
-        assert!(state.active_by_ip.is_empty());
+        assert_eq!(state.ip_slots.registered_total(), 0);
         state.debug_assert_accounting();
     }
 
@@ -6781,8 +6791,8 @@ mod tests {
                 .conn_id,
             peer_b_generation
         );
-        assert_eq!(state.active_by_ip.get(&ip1), Some(&1));
-        assert_eq!(state.active_by_ip.get(&ip2), Some(&1));
+        assert_eq!(state.ip_slots.registered(ip1), 1);
+        assert_eq!(state.ip_slots.registered(ip2), 1);
         state.debug_assert_accounting();
     }
 
@@ -6900,7 +6910,7 @@ mod tests {
                 .get(&peer)
                 .expect("winner remains registered after loser cleanup");
             assert_eq!(entry.conn_id, winning_conn);
-            assert_eq!(state.active_by_ip.get(&remote_ip), Some(&1));
+            assert_eq!(state.ip_slots.registered(remote_ip), 1);
             state.debug_assert_accounting();
         }
 
@@ -10789,8 +10799,8 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
             assert_eq!(
-                supervisor.inner.lock().await.active_by_ip.get(&ip),
-                Some(&1),
+                supervisor.inner.lock().await.ip_slots.registered(ip),
+                1,
                 "the registered connection must consume the IP slot"
             );
             // Duplicate admission can close the transport before the client reads the ack.
@@ -10803,8 +10813,8 @@ mod tests {
                         && close.reason.as_ref() == b"duplicate"));
             assert_eq!(supervisor.registered_ids().await, vec![peer]);
             assert_eq!(
-                supervisor.inner.lock().await.active_by_ip.get(&ip),
-                Some(&1),
+                supervisor.inner.lock().await.ip_slots.registered(ip),
+                1,
                 "closing the duplicate must preserve the incumbent's IP slot"
             );
 
@@ -10850,7 +10860,7 @@ mod tests {
     // codex-inbound-per-ip-cap-bypass): SR-4 admission.
     //
     // `accept_connection` used to register every inbound peer with
-    // `remote_ip = None`, and `register` only consults `active_by_ip` when
+    // `remote_ip = None`, and `register` only consults the per-IP counts when
     // `remote_ip` is `Some`, so the per-IP connection cap was enforced for native
     // outbound dials (which pass a real IP) but entirely bypassed for inbound
     // accepts: one source IP could authenticate as many distinct node ids and
@@ -11069,15 +11079,7 @@ mod tests {
             stalled.push((endpoint, connection));
         }
         let loopback: IpAddr = Ipv4Addr::LOCALHOST.into();
-        let control_count = || {
-            supervisor
-                .control_handshakes_by_ip
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .get(&loopback)
-                .copied()
-                .unwrap_or_default()
-        };
+        let control_count = || supervisor.ip_slots.charged(loopback);
         await_until(
             "two stalled control handshakes",
             Duration::from_secs(5),

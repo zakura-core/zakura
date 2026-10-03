@@ -4,6 +4,7 @@ mod eviction;
 mod peer_faults;
 mod port_panics;
 mod serving;
+mod status_replay;
 mod terminal_trace;
 mod timeouts;
 mod vct_repair;

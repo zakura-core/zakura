@@ -577,7 +577,7 @@ impl PeerWorkQueue {
     ///
     /// All peers derive locators from shared local state.
     /// Two peers pursuing one target would download and authenticate overlapping prefixes.
-    /// The reactor retains the alternate peer's status until the owner retires.
+    /// The reactor retains the alternate peer's status and replays it when the owner retires.
     pub(in crate::zakura::header_sync) fn stage_distinct_target(
         &mut self,
         peer: ZakuraPeerId,

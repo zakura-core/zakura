@@ -282,6 +282,8 @@ pub(super) const PARAM_N_DESC: &str = "The output index in the transaction.";
 pub(super) const PARAM_INCLUDE_MEMPOOL_DESC: &str =
     "Whether to include mempool transactions in the response.";
 
+mod hex_serde;
+
 #[cfg(test)]
 mod tests;
 

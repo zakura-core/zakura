@@ -36,15 +36,7 @@ api.nu7.valargroup.dev {
 }
 
 nu7.valargroup.dev {
-    encode zstd gzip
-
-    # Serve the Sites publication through a public edge that does not challenge
-    # link preview clients such as Slackbot.
-    reverse_proxy https://zakura-nu7-testnet.akhtariev.chatgpt.site {
-        header_up Host zakura-nu7-testnet.akhtariev.chatgpt.site
-        # The Sites edge challenges some non-browser user agents. Keep the
-        # visitor's user agent at this public edge and use a browser agent
-        # only for the upstream request.
-        header_up User-Agent "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-    }
+    # The NU7 page lives at zakura.com. Keep this older public hostname, and links
+    # to any path on it, useful by sending visitors to the canonical page.
+    redir https://zakura.com/nu7/ 302
 }

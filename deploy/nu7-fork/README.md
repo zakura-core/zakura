@@ -485,9 +485,8 @@ Create unproxied A records for `seed.nu7.valargroup.dev`,
 P2P cannot use an ordinary HTTP proxy. Install Caddy, copy
 `dashboard.Caddyfile` to `/etc/caddy/Caddyfile`, validate it with
 `caddy validate --config /etc/caddy/Caddyfile`, and restart Caddy. Caddy serves
-the public status API and proxies the dashboard to its Sites publication. The
-page proxy allows link preview clients to read its metadata without the Sites
-edge's bot challenge. Keep the fork's source revision and participant config in
+the public status API, and redirects every `nu7.valargroup.dev` request to the
+canonical page at `https://zakura.com/nu7/`; it proxies no third-party site. Keep the fork's source revision and participant config in
 sync before advertising a build as join-ready.
 
 ## Layout

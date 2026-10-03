@@ -2,10 +2,12 @@
 
 use serde_json::{json, Value};
 use zakura_chain::{
+    amount::Amount,
     block::Height,
     parameters::{
-        subsidy::nsm_reissuance_height, Network, NetworkUpgrade, GLOBAL_SHIELDED_BUDGET,
-        ORCHARD_PROTOCOL_BLOCK_ACTION_LIMIT, SAPLING_BLOCK_IO_LIMIT, SPROUT_BLOCK_JOINSPLIT_LIMIT,
+        subsidy::{halving_block_subsidy, miner_fee_share, nsm_reissuance_height},
+        Network, NetworkUpgrade, GLOBAL_SHIELDED_BUDGET, ORCHARD_PROTOCOL_BLOCK_ACTION_LIMIT,
+        SAPLING_BLOCK_IO_LIMIT, SPROUT_BLOCK_JOINSPLIT_LIMIT,
     },
     transparent::MIN_TRANSPARENT_COINBASE_MATURITY,
     work::difficulty::ParameterDifficulty,
@@ -29,6 +31,13 @@ pub(crate) fn network_parameters(network: &Network, height: Height, build_versio
         .map(|duration| duration.num_seconds());
     let pow_limit = network.target_difficulty_limit();
     let nu7_active = NetworkUpgrade::is_nu7_active(network, height);
+    // A 100-zatoshi aggregate has no fractional rounding, so this gives the
+    // percentage from the same allocation function used by block validation.
+    let miner_fee_percent = i64::from(miner_fee_share(
+        height,
+        network,
+        Amount::try_from(100).expect("100 zatoshis is a valid nonnegative amount"),
+    ));
 
     json!({
         "schemaVersion": 1,
@@ -44,6 +53,12 @@ pub(crate) fn network_parameters(network: &Network, height: Height, build_versio
         "minimumProtocolVersion": Version::min_remote_for_height(network, Some(height)).0,
         "nsmReissuanceHeight": nsm_reissuance_height(network).map(|height| height.0),
         "coinbaseMaturityBlocks": MIN_TRANSPARENT_COINBASE_MATURITY,
+        "baseSubsidyZat": halving_block_subsidy(height, network).ok().map(i64::from),
+        "fees": {
+            "minerPercent": miner_fee_percent,
+            "nsmPercent": 100 - miner_fee_percent,
+            "nsmRounding": "floor-on-block-aggregate",
+        },
         "difficulty": {
             "averagingWindowBlocks": upgrade.averaging_window(),
             "averagingTimespanSeconds": upgrade.averaging_window_timespan().num_seconds(),
@@ -82,6 +97,8 @@ mod tests {
         assert_eq!(before["difficulty"]["averagingWindowBlocks"], 17);
         assert_eq!(before["difficulty"]["minimumDifficultyGapMultiplier"], 6);
         assert!(before["actionLimits"].is_null());
+        assert_eq!(before["fees"]["minerPercent"], 100);
+        assert_eq!(before["fees"]["nsmPercent"], 0);
         for rules in [at, after] {
             assert_eq!(rules["networkMagic"], "fa1af9bf");
             assert_eq!(rules["targetSpacingSeconds"], 25);
@@ -89,6 +106,8 @@ mod tests {
             assert_eq!(rules["difficulty"]["minimumDifficultyGapSeconds"], 450);
             assert_eq!(rules["difficulty"]["minimumDifficultyGapMultiplier"], 18);
             assert_eq!(rules["branchId"], "77190ad9");
+            assert_eq!(rules["fees"]["minerPercent"], 40);
+            assert_eq!(rules["fees"]["nsmPercent"], 60);
             assert_eq!(rules["actionLimits"]["globalShieldedBudget"], 330);
         }
         let parent_time = Utc.timestamp_opt(1_700_000_000, 0).unwrap();

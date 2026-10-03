@@ -51,8 +51,8 @@ impl EvictionCost {
     /// Returns `true` if `self` is at least `victim` plus the eviction cost increment.
     ///
     /// The increment is one [`MARGINAL_FEE`] per [`MEMPOOL_TRANSACTION_COST_THRESHOLD`] of cost.
-    /// Each eviction therefore raises the price of the next one, so an attacker who churns the
-    /// mempool pays more with every round.
+    /// Full-pool admission applies this comparison to both the incoming
+    /// transaction and its package with all protected unconfirmed ancestors.
     pub fn exceeds_by_increment(self, victim: Self) -> bool {
         let threshold = u128::from(MEMPOOL_TRANSACTION_COST_THRESHOLD);
 

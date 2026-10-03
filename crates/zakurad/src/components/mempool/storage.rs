@@ -479,9 +479,11 @@ impl Storage {
     ///
     /// # Fee floor
     ///
-    /// While the mempool is full, the lowest fee it admits is the cheapest package plus the
-    /// increment. The node does not store this floor. Any event that frees space, such as a
-    /// committed block, an expiry, or a reorg, lowers it immediately.
+    /// While the mempool is full, both the incoming transaction's own fee rate
+    /// and its rate combined with all unconfirmed ancestors must exceed every
+    /// selected victim's score by the increment. The node does not store a floor.
+    /// Events that free space, such as a committed block, expiry, or reorg, can
+    /// lower the admission threshold immediately.
     ///
     /// This departs from [ZIP-401], which evicts at random. ZIP-401 chose random eviction when
     /// every transaction paid the same fee. [ZIP-317] fees vary with transaction size, so

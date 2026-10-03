@@ -82,12 +82,22 @@ impl Fixture {
         fixture
     }
 
-    fn admit(&mut self, incoming: &VerifiedUnminedTx, expected_success: bool) -> Duration {
+    fn admit(
+        &mut self,
+        incoming: &VerifiedUnminedTx,
+        spent: &[OutPoint],
+        expected_success: bool,
+    ) -> Duration {
         let before_cost = self.storage.total_cost();
         // Snapshot only the victims, outside the timed admission. No pool clone.
+        let ancestors = self
+            .storage
+            .verified
+            .check_insert(&incoming.transaction, spent)
+            .expect("the benchmark newcomer fits its dependency group");
         let victims = self.storage.verified.select_eviction_victims(
             incoming,
-            &HashSet::new(),
+            &ancestors,
             self.storage.tx_cost_limit,
         );
         let mut ids = HashSet::new();
@@ -108,7 +118,7 @@ impl Fixture {
         let start = Instant::now();
         let (result, evicted) = black_box(self.storage.insert_with_evicted_ids(
             black_box(incoming.clone()),
-            vec![],
+            spent.to_vec(),
             None,
         ));
         let elapsed = start.elapsed();
@@ -216,7 +226,7 @@ pub fn mempool_eviction_benchmarks(mut run: impl FnMut(&str, &mut dyn FnMut() ->
                     ));
                     start.elapsed()
                 });
-                run(&id("admission"), &mut || fixture.admit(tx, accepted));
+                run(&id("admission"), &mut || fixture.admit(tx, &[], accepted));
             }
             fixture.storage.tx_cost_limit += large.cost();
             for (name, tx) in [("one", &small), ("250kb", &large)] {
@@ -224,8 +234,52 @@ pub fn mempool_eviction_benchmarks(mut run: impl FnMut(&str, &mut dyn FnMut() ->
                     "mempool_eviction/{}/admission_with_room/{name}/{count}",
                     shape.name()
                 );
-                run(&id, &mut || fixture.admit(tx, true));
+                run(&id, &mut || fixture.admit(tx, &[], true));
             }
+        }
+    }
+
+    // Exercise the added rate check with the maximum two protected ancestors.
+    for count in [default_count / 8, default_count] {
+        let mut fixture = Fixture::new(&mut factory, count, Shape::Independent);
+        let mut old: Vec<_> = fixture.storage.transactions().keys().copied().collect();
+        old.sort();
+        for id in old.into_iter().take(MAX_MEMPOOL_ANCESTORS) {
+            fixture.storage.verified.remove(&id);
+            fixture.spent.remove(&id);
+        }
+        let parent = factory.tx_with(BASE_FEE, 1, 0);
+        let child = factory.tx_with(BASE_FEE, 1, 0);
+        for (tx, spent) in [
+            (&parent, vec![]),
+            (
+                &child,
+                vec![OutPoint::from_usize(parent.transaction.id().mined_id(), 0)],
+            ),
+        ] {
+            fixture
+                .storage
+                .insert(tx.clone(), spent.clone(), None)
+                .unwrap();
+            fixture.spent.insert(tx.transaction.id().mined_id(), spent);
+        }
+        let spent = [OutPoint::from_usize(child.transaction.id().mined_id(), 0)];
+        assert_eq!(fixture.storage.total_cost(), fixture.storage.tx_cost_limit);
+        for (name, fee, accepted) in [
+            (
+                "reject",
+                BASE_FEE + transaction::zip317::MARGINAL_FEE,
+                false,
+            ),
+            (
+                "one",
+                BASE_FEE + 3 * transaction::zip317::MARGINAL_FEE,
+                true,
+            ),
+        ] {
+            let tx = factory.tx(fee);
+            let id = format!("mempool_eviction/ancestor_chain/admission/{name}/{count}");
+            run(&id, &mut || fixture.admit(&tx, &spent, accepted));
         }
     }
 }

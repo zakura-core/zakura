@@ -46,6 +46,11 @@ Criterion remains a development dependency. The feature-gated storage runner
 uses standard timing types and passes named samples to the benchmark binary.
 Every selection sample uses an `Instant` timer; its overhead is included.
 
+The `ancestor_chain/admission` cases add a child to a two-transaction chain in
+an otherwise full pool at both sizes. They measure successful admission and
+rejection when the child outbids a victim but its ancestor-inclusive rate does
+not. These cases include the maximum two protected ancestors.
+
 Criterion writes reports beneath `target/criterion`. The shared benchmark
 workflow includes this target, including PR comparisons with the `C-benchmark`
 label. Compare the 1,000- and 8,000-entry results to detect a return to full-pool

@@ -8268,7 +8268,6 @@ dependencies = [
  "tower 0.4.13",
  "tower-test",
  "tracing",
- "tracing-futures",
  "zakura-test",
  "zakura-tower-fallback",
 ]

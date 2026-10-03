@@ -4,7 +4,11 @@
 as one coherent generation. Install `nu7_activation.py` beside it and use
 `nu7-activation.service` on the existing public-Testnet primary. Port 8096 is a
 read-only collector endpoint: allow only the existing API gateway and localhost
-in the host firewall. Add `/v1/dashboard` to that gateway's Caddy allowlist.
+in the host firewall. `nu7-activation-firewall.service` loads the dedicated
+nftables table before the collector starts; it only filters port 8096. Both units
+are enabled for boot. The service trusts forwarded client addresses only from
+that explicit gateway IP, so visitors have separate rate-limit quotas. Add
+`/v1/dashboard` to that gateway's Caddy allowlist.
 The ordinary status API and staging services continue independently.
 
 ## Runtime configuration
@@ -120,3 +124,13 @@ capabilities may remain null when those services are not prepared. After real
 activation observe at least one full 102-block post-activation window and verify
 common hashes and website generation; random block intervals need not average
 exactly 25 seconds.
+
+Run read-only runtime qualification without taking the selector state lock:
+
+```bash
+ssh root@167.99.103.111 'runuser -u nu7-activation -- python3 /opt/zakura-nu7-status/nu7-qualify.py'
+```
+
+It exits nonzero until all three node sources expose the expected public NU7
+schedule and consensus export; successful reference identity alone is insufficient.
+The command does not arm the selector or mutate persisted selection.

@@ -34,6 +34,7 @@ BUILD_CACHE_DIR_ENV = "ZAKURA_DEPLOYER_BUILD_CACHE_DIR"
 BUILD_CACHE_RETAIN_ENV = "ZAKURA_DEPLOYER_BUILD_CACHE_RETAIN"
 DEFAULT_BUILD_CACHE_RETAIN = 12
 DATA_MOUNT = Path("/mnt/data")
+NETWORK_SYSCTL_CONF = SCRIPT_DIR.parent / "sysctl" / "60-zakura-network.conf"
 
 # ssh/scp options shared by every remote call. BatchMode avoids interactive
 # password prompts hanging a parallel deploy; accept-new pins unknown host keys
@@ -812,6 +813,25 @@ docker exec "$CONTAINER" "$BIN_PATH" --version || true
 """
 
 
+NETWORK_SYSCTL_SCRIPT = r"""
+set -euo pipefail
+install -m 644 /tmp/zakura-network-sysctl.conf /etc/sysctl.d/60-zakura-network.conf
+rm -f /tmp/zakura-network-sysctl.conf
+sysctl --load /etc/sysctl.d/60-zakura-network.conf >/dev/null
+"""
+
+
+def install_network_sysctls(node: Node) -> None:
+    """Install and load the shared network sysctls on the node's host.
+
+    The sysctls set the default UDP socket buffer sizes, so zakurad picks them
+    up the next time it opens its QUIC socket.
+    """
+    run(node.scp_to(str(NETWORK_SYSCTL_CONF), "/tmp/zakura-network-sysctl.conf"), capture=True)
+    if ssh_with_stdin(node, NETWORK_SYSCTL_SCRIPT).returncode != 0:
+        raise DeployError("network sysctl install failed")
+
+
 def ssh_with_stdin(node: Node, script: str) -> subprocess.CompletedProcess:
     """Run an install script on the node via `ssh ... bash -s`, feeding it on stdin."""
     return subprocess.run(node.ssh_cmd("bash", "-s"), input=script, text=True)
@@ -905,6 +925,7 @@ def cmd_deploy(args) -> int:
                 return (node.name, True, f"deployed node and exporter {node.sha[:9]}, publication verified")
             if node.deploy_kind not in ("systemd", "process", "docker"):
                 return (node.name, False, f"unknown deploy_kind: {node.deploy_kind}")
+            install_network_sysctls(node)
 
             # Binary-only: don't render or ship a config/unit; just swap the
             # binary and restart the existing service or container.

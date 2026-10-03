@@ -403,6 +403,11 @@ for new hosts.
   `[tracing] log_file` pointed at `log_file`.
 - Unit at `/etc/systemd/system/<service_name>.service` running
   `zakurad -c <config_path> start` with `Restart=always`.
+- Network sysctls from `deploy/sysctl/60-zakura-network.conf` at
+  `/etc/sysctl.d/60-zakura-network.conf`, loaded on every deploy. They raise
+  the default UDP socket buffers that zakurad's QUIC socket inherits. zakurad
+  picks them up at its next restart. The release-state publisher skips this
+  step.
 
 The deterministic `log_file` is the single source of truth shared by the running
 node (writer) and `logs fetch`/`logs follow` (reader).

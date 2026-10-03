@@ -91,7 +91,8 @@ fn lock_time_and_maturity_failures_start_no_cooldown() {
                 zakura_script::Error::ScriptInvalid
             )),
             tip_height,
-            NetworkUpgrade::Nu6_3
+            NetworkUpgrade::Nu6_3,
+            None
         ),
         Some(peer)
     );
@@ -128,7 +129,8 @@ fn lock_time_and_maturity_failures_start_no_cooldown() {
         transaction_cooldown_peer(
             &invalid(immature_spend.clone()),
             tip_height,
-            NetworkUpgrade::Nu6_3
+            NetworkUpgrade::Nu6_3,
+            None
         ),
         None,
         "{immature_spend:?}"
@@ -146,7 +148,12 @@ fn lock_time_and_maturity_failures_start_no_cooldown() {
     for error in lock_times {
         assert_ne!(error.mempool_misbehavior_score(), 0, "{error:?}");
         assert_eq!(
-            transaction_cooldown_peer(&invalid(error.clone()), tip_height, NetworkUpgrade::Nu6_3),
+            transaction_cooldown_peer(
+                &invalid(error.clone()),
+                tip_height,
+                NetworkUpgrade::Nu6_3,
+                None
+            ),
             None,
             "{error:?}"
         );
@@ -167,7 +174,8 @@ fn lock_time_and_maturity_failures_start_no_cooldown() {
                 zakura_script::Error::ScriptInvalid
             )),
             tip_height,
-            NetworkUpgrade::Nu6_3
+            NetworkUpgrade::Nu6_3,
+            None
         ),
         None
     );
@@ -225,7 +233,7 @@ fn unshielded_coinbase_spends_ban_the_peer() {
     };
     assert_eq!(transaction_ban_peer(&failure), Some(peer), "{error:?}");
     assert_eq!(
-        transaction_cooldown_peer(&failure, tip_height, NetworkUpgrade::Nu6_3),
+        transaction_cooldown_peer(&failure, tip_height, NetworkUpgrade::Nu6_3, None),
         None
     );
 }

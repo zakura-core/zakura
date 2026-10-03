@@ -93,6 +93,19 @@ const MAX_SERVICE_REQUEST_DELAY: Duration = Duration::from_millis(1000);
 /// unrelated failure. These tests pause time, so a long delay costs no wall-clock time.
 const STALLED_SERVICE_REQUEST_DELAY: Duration = Duration::from_secs(30 * 60);
 
+/// One peer padding its `FindBlocks` reply cannot move the sync-length sample.
+#[test]
+fn sync_length_sample_is_the_median_fanout_reply() {
+    let _init_guard = zakura_test::init();
+
+    assert_eq!(sync::median_fanout_reply_length(vec![500, 1, 1]), 1);
+    assert_eq!(sync::median_fanout_reply_length(vec![500, 500, 1]), 500);
+    // Failed or unusable replies count as 0.
+    assert_eq!(sync::median_fanout_reply_length(vec![500]), 0);
+    assert_eq!(sync::median_fanout_reply_length(vec![500, 500]), 500);
+    assert_eq!(sync::median_fanout_reply_length(Vec::new()), 0);
+}
+
 #[test]
 fn oversized_find_blocks_response_is_rejected() {
     let hash = block::Hash([0; 32]);
@@ -3006,8 +3019,8 @@ async fn build_extend_discovers_hashes_without_dispatching() -> Result<(), crate
         "build_extend should discover the inner hashes in response order",
     );
     assert_eq!(
-        discovered, 2,
-        "discovered count should match the download set length",
+        discovered, 0,
+        "one reply out of the fanout must not move the sync-length sample",
     );
 
     // The new prospective tip extends from block3, expecting block4 next.
@@ -3366,7 +3379,10 @@ async fn build_extend_ignores_known_trailing_find_blocks_hash() -> Result<(), cr
         vec![unknown_a, unknown_b],
         "build_extend should keep valid inner hashes and discard the trailing known hash",
     );
-    assert_eq!(discovered, 2);
+    assert_eq!(
+        discovered, 0,
+        "one reply out of the fanout must not move the sync-length sample",
+    );
     assert_eq!(
         prospective_tips,
         HashSet::from([sync::CheckedTip {

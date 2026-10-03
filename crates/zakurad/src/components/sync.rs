@@ -223,6 +223,18 @@ fn has_valid_tips_response_hash_count(hashes: &[block::Hash]) -> bool {
     hashes.len() <= MAX_TIPS_RESPONSE_HASH_COUNT
 }
 
+/// Returns the median unknown-hash count of one `FindBlocks` fanout.
+///
+/// A fanout request that failed or returned nothing usable counts as 0. The
+/// sync-length sample uses this median, not the size of the union of all
+/// replies, so a single peer cannot pad its reply with fabricated hashes to make
+/// the node look far from the tip.
+fn median_fanout_reply_length(mut reply_lengths: Vec<usize>) -> usize {
+    reply_lengths.resize(FANOUT.max(reply_lengths.len()), 0);
+    reply_lengths.sort_unstable();
+    reply_lengths[reply_lengths.len() / 2]
+}
+
 /// Start asking peers for more block hashes before we run out of hashes to download.
 ///
 /// The syncer keeps a list of block hashes it has learned from `FindBlocks`
@@ -1810,7 +1822,7 @@ where
                     }
 
                     extended = OptionFuture::from(extend.as_mut()), if extend.is_some() => {
-                        let (mut download_set, mut new_tips, _discovered) =
+                        let (mut download_set, mut new_tips, sync_length) =
                             extended.expect("only polled while an extension is in flight")?;
                         let reached_checkpoint = self.cap_checkpoint_bootstrap_downloads(
                             &mut download_set,
@@ -1822,9 +1834,10 @@ where
                         let discovered = download_set.len();
                         self.trace.tips_extended(discovered, new_tips.len());
                         self.prospective_tips = new_tips;
-                        // security: use the actual number of new downloads from all peers, so the
-                        // last peer to respond can't toggle our mempool.
-                        self.recent_syncs.push_extend_tips_length(discovered);
+                        // security: use the median replies, so one peer can't toggle our
+                        // mempool or mining by padding its reply with fabricated hashes.
+                        self.recent_syncs
+                            .push_extend_tips_length(sync_length.min(discovered));
                         reserve.extend(download_set);
                         extend = None;
                         last_progress = Instant::now();
@@ -2015,6 +2028,7 @@ where
         }
 
         let mut download_set = IndexSet::new();
+        let mut reply_lengths = Vec::with_capacity(FANOUT);
         while let Some(res) = requests.next().await {
             match res
                 .unwrap_or_else(|e @ JoinError { .. }| {
@@ -2084,6 +2098,7 @@ where
                     } else {
                         continue;
                     };
+                    reply_lengths.push(unknown_hashes.len());
 
                     trace!(?unknown_hashes);
 
@@ -2148,9 +2163,10 @@ where
         debug!(new_downloads, "queueing new downloads");
         metrics::gauge!("sync.obtain.queued.hash.count").set(new_downloads as f64);
 
-        // security: use the actual number of new downloads from all peers,
-        // so the last peer to respond can't toggle our mempool
-        self.recent_syncs.push_obtain_tips_length(new_downloads);
+        // security: use the median reply, so one peer can't toggle our mempool
+        // or mining by padding its reply with fabricated hashes
+        self.recent_syncs
+            .push_obtain_tips_length(median_fanout_reply_length(reply_lengths).min(new_downloads));
 
         let response = self.request_blocks(download_set).await;
 
@@ -2198,9 +2214,11 @@ where
 
         let mut prospective_tips: HashSet<CheckedTip> = HashSet::new();
         let mut download_set = IndexSet::new();
+        let mut sync_length: usize = 0;
         debug!(tips = ?tips.len(), "trying to extend chain tips");
         for tip in tips {
             debug!(?tip, "asking peers to extend chain tip");
+            let mut reply_lengths = Vec::with_capacity(FANOUT);
             let mut responses = FuturesUnordered::new();
             for attempt in 0..FANOUT {
                 if attempt > 0 {
@@ -2248,6 +2266,7 @@ where
                             );
                             continue;
                         }
+                        reply_lengths.push(unknown_hashes.len());
 
                         trace!(?unknown_hashes);
 
@@ -2291,6 +2310,7 @@ where
                     Err(e) => debug!(?e),
                 }
             }
+            sync_length = sync_length.saturating_add(median_fanout_reply_length(reply_lengths));
         }
 
         let new_downloads = download_set.len();
@@ -2300,9 +2320,9 @@ where
         metrics::histogram!("sync.stage.duration_seconds", "stage" => "extend_tips")
             .record(stage_start.elapsed().as_secs_f64());
 
-        // The caller records `new_downloads` via `recent_syncs.push_extend_tips_length` on
-        // write-back, preserving the "last peer can't toggle our mempool" security property.
-        Ok((download_set, prospective_tips, new_downloads))
+        // The caller records `sync_length` via `recent_syncs.push_extend_tips_length`.
+        // It sums each tip's median reply, so one peer can't toggle our mempool or mining.
+        Ok((download_set, prospective_tips, sync_length))
     }
 
     /// Download and verify the genesis block, if it isn't currently known to

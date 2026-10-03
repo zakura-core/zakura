@@ -79,7 +79,6 @@ async function refresh() {
     if (data.startup_pending) notices.push('Node is warming up. Startup blocks are excluded from slow blocks.');
     if (!fresh) notices.push('Collector updates are delayed or unavailable. Recent profiles may be incomplete.');
     if (fresh && run && !nodeFresh) notices.push('No recent node observations have reached the collector.');
-    if (health?.errors) notices.push(`${number(health.errors)} collector errors. Detail may be incomplete.`);
     if (data.excluded_timings) notices.push(`${number(data.excluded_timings)} recordings excluded from timing statistics because of known measurement interference.`);
     note(notices.join(' '));
     for (const key of ['latest','outliers','failures']) table(key,key==='outliers' ? data[key].filter(row=>!reviewedOutliers.has(row.hash)) : data[key]);

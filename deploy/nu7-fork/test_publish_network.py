@@ -7,10 +7,13 @@ from pathlib import Path
 
 import publish_network
 
+FORK_NODE_FIXTURE = (Path(__file__).resolve().parents[2] / "crates" / "zakura-network" / "src"
+                     / "config" / "tests" / "data" / "nu7-fork-node.toml")
+
 
 class ManifestTests(unittest.TestCase):
     def setUp(self):
-        self.config = tomllib.loads((Path(__file__).parent / "miner/testdata/fork-node.toml").read_text())
+        self.config = tomllib.loads(FORK_NODE_FIXTURE.read_text())
         self.activation = self.config["network"]["network"]["activation_heights"]["NU7"]
         self.info = {"chain": "test", "upgrades": {
             "77190ad9": {"name": "NU7", "activationheight": self.activation}}}

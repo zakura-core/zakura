@@ -1,0 +1,22 @@
+[Unit]
+Description=NU7 remote mining node health endpoint
+After=network-online.target zakurad.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Blocks mined before the current network generation started are not counted.
+Environment=NU7_GENERATION_START=0
+EnvironmentFile=-/etc/zakura/nu7-generation.env
+ExecStart=/usr/bin/python3 /opt/zakura-nu7-miner/remote-status.py --config /etc/zakura/zakura.toml --since ${NU7_GENERATION_START}
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

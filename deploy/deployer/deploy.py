@@ -78,9 +78,18 @@ DEFAULTS = {
     # Both endpoints are unauthenticated, so keep them on loopback.
     "health_listen_addr": "",
     # Transparent address receiving coinbase output, rendered as [mining].
-    # Required before the node will serve getblocktemplate, so an external miner
-    # (deploy/nu7-fork/miner) cannot produce blocks without it. "" omits it.
+    # Required before the node will serve getblocktemplate or run its internal
+    # miner. "" omits it.
     "miner_address": "",
+    # Renders `internal_miner = true`, so the node mines its own templates. The
+    # binary must be built with `build_features = ["internal-miner"]`.
+    "internal_miner": False,
+    # Optional coinbase tag after Zakura's marker. Distinct tags give miners that
+    # share a miner address different coinbase transactions, and so different work.
+    "extra_coinbase_data": "",
+    # Extra cargo features for this node's zakurad build, e.g. ["internal-miner"].
+    # Each distinct (commit, features) pair is built and cached separately.
+    "build_features": [],
     "tracing_filter": "",    # e.g. "info,zakura_network::zakura=debug"; "" uses zakurad default
     "checkpoint_sync": True,
     # Setting this false keeps checkpoint sync on while selecting the legacy non-VCT path.
@@ -133,6 +142,9 @@ class Node:
     metrics_endpoint: str
     health_listen_addr: str
     miner_address: str
+    internal_miner: bool
+    extra_coinbase_data: str
+    build_features: list
     tracing_filter: str
     checkpoint_sync: bool
     vct_fast_sync: bool
@@ -240,6 +252,20 @@ def load_nodes(config_path: Path, only: list[str] | None) -> list[Node]:
         merged = dict(defaults)
         merged.update(raw)
         publisher = merged["release_state_publisher"]
+        build_features = merged["build_features"]
+        if (not isinstance(build_features, list)
+                or not all(isinstance(f, str) and re.fullmatch(r"[a-z0-9-]+", f)
+                           for f in build_features)):
+            raise DeployError(f"{name}: build_features must be a list of cargo feature names")
+        build_features = sorted(set(build_features))
+        if not isinstance(merged["internal_miner"], bool):
+            raise DeployError(f"{name}: internal_miner must be a boolean")
+        if merged["internal_miner"] and (not merged["miner_address"]
+                                         or "internal-miner" not in build_features):
+            raise DeployError(
+                f"{name}: internal_miner needs a miner_address and "
+                f'build_features = ["internal-miner"]'
+            )
         if not isinstance(publisher, bool):
             raise DeployError(f"{name}: release_state_publisher must be a boolean")
         if publisher and (merged["deploy_kind"] != "systemd" or merged["manage_config"]
@@ -270,6 +296,9 @@ def load_nodes(config_path: Path, only: list[str] | None) -> list[Node]:
             metrics_endpoint=merged["metrics_endpoint"],
             health_listen_addr=merged["health_listen_addr"],
             miner_address=merged["miner_address"],
+            internal_miner=merged["internal_miner"],
+            extra_coinbase_data=merged["extra_coinbase_data"],
+            build_features=build_features,
             tracing_filter=merged["tracing_filter"],
             checkpoint_sync=merged["checkpoint_sync"],
             vct_fast_sync=merged["vct_fast_sync"],
@@ -396,13 +425,20 @@ def binary_is_runnable(binary: Path) -> bool:
         return False
 
 
-def build_commit(root: Path, sha: str, *, force: bool = False, exporter: bool = False) -> Path:
+def build_key(sha: str, features: list[str] | tuple[str, ...] = ()) -> str:
+    """The cache key for a zakurad build: its commit, plus any extra cargo features."""
+    return "-".join([sha, *sorted(features)])
+
+
+def build_commit(root: Path, sha: str, *, force: bool = False, exporter: bool = False,
+                 features: list[str] | tuple[str, ...] = ()) -> Path:
     """Build one binary at an exact commit, with a separate cache for the exporter."""
     binary = "zakura-checkpoints" if exporter else "zakurad"
     cache_dir = build_cache_dir()
     ensure_data_mount_for_path(cache_dir, purpose="build cache")
     cache_dir.mkdir(parents=True, exist_ok=True)
-    target = cached_binary(sha, binary)
+    key = build_key(sha, features)
+    target = cached_binary(key, binary)
     if target.exists() and not force:
         if binary_is_runnable(target):
             print(f"[build] reusing cached binary for {sha[:9]} -> {target.name}")
@@ -420,6 +456,8 @@ def build_commit(root: Path, sha: str, *, force: bool = False, exporter: bool = 
     try:
         package_args = (["-p", "zakura-utils", "--features", "zakura-checkpoints-offline",
                          "--bin", "zakura-checkpoints"] if exporter else ["-p", "zakura"])
+        if features:
+            package_args += ["--features", ",".join(sorted(features))]
         print(f"[build] {binary} ({sha[:9]}) ...")
         run(["cargo", "build", "--release", "--locked", *package_args], cwd=work)
         # Respect CARGO_TARGET_DIR (set per-worktree or shared) when locating the
@@ -433,7 +471,7 @@ def build_commit(root: Path, sha: str, *, force: bool = False, exporter: bool = 
         os.chmod(tmp, 0o755)
         tmp.replace(target)
         print(f"[build] cached -> {target}")
-        prune_cached_binaries(cache_dir, sha, binary)
+        prune_cached_binaries(cache_dir, key, binary)
     finally:
         run(["git", "worktree", "remove", "--force", str(work)], cwd=root, check=False)
         shutil.rmtree(work, ignore_errors=True)
@@ -441,14 +479,19 @@ def build_commit(root: Path, sha: str, *, force: bool = False, exporter: bool = 
 
 
 def build_nodes(nodes: list[Node], *, force: bool = False) -> dict[str, Path]:
-    """Resolve + build every distinct commit once. Returns sha -> binary path."""
+    """Resolve + build every distinct commit and feature set once.
+
+    Returns build_key(sha, features) -> binary path; a featureless build's key is its sha.
+    """
     root = repo_root()
-    by_sha: dict[str, Path] = {}
+    builds: dict[str, Path] = {}
     for node in nodes:
         node.sha = resolve_sha(root, node.commit)
-    for sha in dict.fromkeys(n.sha for n in nodes):  # unique, order-preserving
-        by_sha[sha] = build_commit(root, sha, force=force)
-    return by_sha
+    for node in nodes:
+        key = build_key(node.sha, node.build_features)
+        if key not in builds:
+            builds[key] = build_commit(root, node.sha, force=force, features=node.build_features)
+    return builds
 
 
 # --------------------------------------------------------------------------- #
@@ -591,9 +634,14 @@ def render_node_config(node: Node) -> str:
     health_block = (
         f'[health]\nlisten_addr = "{node.health_listen_addr}"\n' if node.health_listen_addr else ""
     )
-    mining_block = (
-        f'[mining]\nminer_address = "{node.miner_address}"\n' if node.miner_address else ""
-    )
+    mining_lines = []
+    if node.miner_address:
+        mining_lines.append(f'miner_address = "{node.miner_address}"')
+    if node.extra_coinbase_data:
+        mining_lines.append(f"extra_coinbase_data = {toml_scalar(node.extra_coinbase_data)}")
+    if node.internal_miner:
+        mining_lines.append("internal_miner = true")
+    mining_block = "[mining]\n" + "\n".join(mining_lines) + "\n" if mining_lines else ""
     filter_line = f'filter = "{node.tracing_filter}"' if node.tracing_filter else "# filter unset (zakurad default)"
     network_cache_line = (
         f'cache_dir = "{node.network_cache_dir}"' if node.network_cache_dir else "# cache_dir unset (zakurad default)"
@@ -1016,7 +1064,7 @@ def cmd_deploy(args) -> int:
     results: list[tuple[str, bool, str]] = []
 
     def work(node: Node) -> tuple[str, bool, str]:
-        binary = by_sha[node.sha]
+        binary = by_sha[build_key(node.sha, node.build_features)]
         try:
             if node.release_state_publisher:
                 deploy_publisher(node, binary, exporters[node.sha])

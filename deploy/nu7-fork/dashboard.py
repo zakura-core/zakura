@@ -77,9 +77,18 @@ def external_peer_count(peers: list[dict]) -> int:
     return count
 
 
-def active_miners() -> int:
+def internal_miner_enabled(path: Path) -> bool:
+    """The primary mines with zakurad's internal miner when its config enables it."""
+    with path.open("rb") as stream:
+        mining = tomllib.load(stream).get("mining", {})
+    return mining.get("internal_miner") is True and bool(mining.get("miner_address"))
+
+
+def active_miners(miner_enabled: bool) -> int:
+    if not miner_enabled:
+        return 0
     result = subprocess.run(
-        ["systemctl", "is-active", "zakura-fork-miner.service"],
+        ["systemctl", "is-active", "zakurad.service"],
         capture_output=True, text=True, timeout=3, check=False,
     )
     return sum(line == "active" for line in result.stdout.splitlines())
@@ -158,6 +167,7 @@ class Collector:
     def __init__(self, config: Path, primary_port: int, observer_port: int,
                  remote_miners: list[dict] | None = None):
         self.network = network_parameters(config)
+        self.miner_enabled = internal_miner_enabled(config)
         self.ports = (("primary", primary_port), ("local observer", observer_port))
         self.remote_miners = remote_miners or []
         self.lock = threading.Lock()
@@ -289,7 +299,7 @@ class Collector:
                                              if self.observed_blocks else None),
                             "since": self.started_at,
                             "scope": "two nodes on one host; observed tip replacements only"},
-            "mining": {"operatorMinersActive": active_miners() + sum(
+            "mining": {"operatorMinersActive": active_miners(self.miner_enabled) + sum(
                            miner["healthy"] for miner in remote_miners),
                        "operatorMinersConfigured": 1 + len(remote_miners),
                        "remoteMiners": remote_miners},

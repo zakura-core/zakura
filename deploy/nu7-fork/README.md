@@ -106,12 +106,11 @@ cd deploy/nu7-fork
 $EDITOR fork.toml              # set host.ssh_string to the new droplet
 ./fork.py catch-up             # sync the seed to the public Testnet tip
 ./fork.py plan                 # what heights would this fork use?
-./fork.py up                   # seed, render, deploy
+./fork.py up                   # seed, render, deploy; the primary starts mining
 ./fork.py status               # height and NU7 status
-
-# Produce blocks. Until NU7 activates this mines one block per ~7.5 minutes.
-cargo run --release -p zakura-fork-miner -- --rpc 127.0.0.1:18232
 ```
+
+Until NU7 activates, the fork mines about one block per 7.5 minutes.
 
 ## How the activation height is chosen
 
@@ -132,44 +131,46 @@ is six target spacings before NU7 and eighteen afterwards (PR #1209). That gap i
 So an offset of 10 is about 75 minutes to activation, and 100 would be most of a
 day. `./fork.py plan` prints the estimate before you commit to it.
 
-## Continuous mining on the primary node
+## Mining
 
-After NU7 activates, use the primary service unit in `miner/` to mine
-continuously against the primary RPC. The local observer remains a validator
-without a miner. The miner polls the tip once per second and refreshes its
-block template every 15 seconds. It cancels work when the tip changes,
-including a same-height reorganization. A refreshed template can pick up the
-Testnet minimum-difficulty rule after a long gap; the miner does not
-deliberately wait for that gap.
+Every mining node runs `zakurad`'s own internal miner: there is no separate
+miner process or unit. `fork.py` renders `build_features = ["internal-miner"]`,
+so the deployer builds one `zakurad --features internal-miner` binary per commit,
+and sets `[mining] internal_miner = true` on the primary. The local observer
+uses the same binary without that setting, so it remains a validator that never
+mines. A stock workspace build does not compile the Equihash solver.
 
-Build the miner from the same source revision as the running fork nodes and
-install its unit on the fork host:
+The internal miner long-polls `getblocktemplate` inside the node. Its solver is
+cancelled when the tip changes, including a same-height reorganization, and when
+a template is withdrawn. Testnet long polling hands out minimum-difficulty work
+once the 450-second gap has passed, so no miner waits for the gap deliberately.
 
-```sh
-CARGO_TARGET_DIR=/root/cargo-target cargo build --release --locked -p zakura-fork-miner
-sudo install -m 644 deploy/nu7-fork/miner/zakura-fork-miner.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl restart zakura-fork-miner.service
-```
+The internal miner runs **one solver thread per node**, at the lowest thread
+priority, so validation on the same host takes precedence. Today's fork has four
+mining nodes: the primary and the US, EU and AP nodes. The primary's former second
+miner process is inactive and is not replaced; adding mining capacity means adding
+mining nodes, not threads. Miners that share one miner address must render
+distinct `extra_coinbase_data`. Each solver starts from the same nonce, so only a
+different coinbase transaction keeps two nodes from repeating each other's work.
+`fork.py` tags each node with its name.
 
-Keep node RPC bound to localhost. Watch accepted blocks, template refreshes,
-CPU use,
-the observed block intervals, and tip replacements during the trial. The
-25-second protocol target is an average; the dashboard's median is a different
-statistic. Observe at least one 102-block DAA window before judging whether
-this host can sustain the target without the Testnet minimum-difficulty fallback.
+Keep node RPC bound to localhost. Watch accepted blocks, CPU use, the observed
+block intervals, and tip replacements. The 25-second protocol target is an
+average; the dashboard's median is a different statistic. Observe at least one
+102-block DAA window before judging whether the miners sustain the target without
+the Testnet minimum-difficulty fallback.
 
 ## Geographic miners on the running fork
 
 Three additional validating nodes mine in SFO3, AMS3, and SGP1. Each is a
 DigitalOcean `s-1vcpu-2gb` Droplet (1 shared vCPU, 2 GiB RAM, 50 GiB disk;
-$12/month), assigned to the `zakura-testnet` project. One original miner
-remains on the NYC1 fork host. The remote nodes use the same pinned live source
-revision from the manifest, network magic, activation heights, and NSM seed, with
-different P2P peers and solver IDs 3, 4, and 5. Their RPC servers bind only to
-localhost. The miner service has a 70% CPU quota to leave capacity for node
-validation on a shared CPU plan. Deploy the same revision and network parameters
-to every participant; changing consensus requires a coordinated new run.
+$12/month), assigned to the `zakura-testnet` project. The primary on the NYC1
+fork host also mines. The remote nodes use the same pinned source revision,
+network magic, activation heights, and NSM seed, with different P2P peers and
+coinbase tags. Their RPC servers bind only to localhost. Their single solver
+thread runs at the lowest priority, so it yields the shared vCPU to validation.
+Deploy the same revision and network parameters to every participant; changing
+consensus requires a coordinated new run.
 
 The remote configs are derived from the live node config with
 `miner/render-remote-config.py`. All three currently mine to the existing
@@ -177,8 +178,8 @@ primary miner address, so their matured rewards remain available to the faucet
 without distributing its spending key. The dashboard attributes **accepted
 submissions**, not canonical blocks, from each miner's journal; a reorg may
 displace an accepted block. Each remote miner has its own full node and
-`miner/remote-status.py` reports service health, tip, NU7 branch ID, and accepted
-submissions over 24 hours. The primary collector polls those endpoints using
+`miner/remote-status.py` reports service health, tip, NU7 branch ID, and the
+internal miner's accepted blocks over 24 hours, read from the node's log file. The primary collector polls those endpoints using
 `miner/remote-miners.json`, requires a fresh report on the same chain within two
 blocks of the primary, and exposes the result in `/v1/status`. The DigitalOcean
 firewall allows the status port only from the primary host; P2P port 18233 is
@@ -186,21 +187,19 @@ public. No GitHub SSH key is stored on the remote hosts.
 
 For a replacement host, stop a local observer briefly to archive its `state`
 and `non_finalized_state` directories consistently. Verify the archive hash
-after transfer before extraction. Install the pinned live node and miner
-binaries, the rendered config, and the `zakurad.service`,
-`zakura-nu7-remote-miner@.service`, and
-`zakura-nu7-miner-status@.service` units, and apply
-`miner/99-zakura-nu7.conf` for prompt block propagation. Start the matching
-miner and status instances, then confirm its reported hash agrees with the
-primary at the same height. Update `miner/remote-miners.json` if the replacement
+after transfer before extraction. Install the pinned internal-miner node binary, the rendered config, and the
+`zakurad.service` and `zakura-nu7-miner-status.service` units, and apply
+`miner/99-zakura-nu7.conf` for prompt block propagation. Start the node and
+status service, then confirm its reported hash agrees with the primary at the
+same height. Update `miner/remote-miners.json` if the replacement
 IP changes.
 
 To move an existing remote miner between DigitalOcean regions, stop and
-disable its node, miner, and status services before powering it off and taking
+disable its node and status services before powering it off and taking
 a disk snapshot. Transfer the snapshot image to the destination region, create
 the replacement Droplet with the operator's SSH key in the `zakura-testnet`
 project, and attach the geo-miner firewall. Start the node first; compare its
-tip hash and NU7 branch ID with the primary before enabling the miner. Update
+tip hash and NU7 branch ID with the primary before setting `internal_miner`. Update
 the other remote nodes' seed lists, the collector URL, and the downloadable
 join config. Remove the old Droplet and temporary snapshot after the new node
 is healthy.
@@ -312,9 +311,10 @@ shielded change spending is implemented.
 
 ## Running multiple miners
 
-Set `peer.miner_address` on an additional node to let it mine. Leaving it empty
-keeps that node a pure validator: without a miner address a node refuses
-`getblocktemplate`, so it can only accept blocks another node produced.
+Set `peer.miner_address` on the local observer to let it run the internal miner
+too. Leaving it empty keeps that node a pure validator: without a miner address
+a node refuses `getblocktemplate`, so it can only accept blocks another node
+produced.
 
 One node that both mines and validates cannot catch a block it builds wrong and
 accepts wrong in the same way. Two competing miners additionally exercise
@@ -370,9 +370,9 @@ waiting for that sweep.
 parameters are fixed: `zakurad` rejects `[network.testnet_parameters]` beside
 `network = "Testnet"`. The deployer writes the fork parameters as the
 `[network.network]` table instead. `test_fork.py` keeps
-`miner/testdata/fork-node.toml` equal to the deployer's output, and the miner's
-`rendered_fork_config_loads_in_zakurad` test loads that file with `zakurad`'s own
-config type.
+`crates/zakura-network/src/config/tests/data/nu7-fork-node.toml` equal to the
+deployer's output, and zakura-network's `rendered_nu7_fork_config_loads` test
+loads that file with `zakurad`'s own config type.
 
 **Distinct `network_magic`.** Without it the fork dials real Testnet peers,
 rejects their blocks once NU7 activates, and bans them. The magic is what makes
@@ -458,7 +458,7 @@ sync before advertising a build as join-ready.
 | --- | --- |
 | `fork.toml` | Every fork parameter, safe to edit between runs |
 | `fork.py` | Provision, seed, plan, render, deploy, status, reconfigure |
-| `miner/` | The external miner (`zakura-fork-miner`) |
+| `miner/` | Remote mining node health endpoint and its unit |
 | `txload/` | Drives fee-bearing transactions (`zakura-fork-txload`) |
 | `nodes.generated.toml` | Generated `deploy.py` fleet config; not committed |
 

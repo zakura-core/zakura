@@ -95,6 +95,37 @@ class BuildCacheTests(unittest.TestCase):
 
             binary_is_runnable.assert_not_called()
 
+    def test_feature_builds_are_cached_separately_from_the_stock_build(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cache_dir = root / "cache"
+            cache_dir.mkdir()
+            sha = "e" * 40
+            (cache_dir / f"zakurad-{sha}").write_text("stock")
+            calls = []
+
+            def fake_run(cmd, *, cwd=None, capture=False, check=True):
+                calls.append(cmd)
+                if cmd[:3] == ["git", "worktree", "add"]:
+                    Path(cmd[-2]).mkdir(parents=True)
+                if cmd[:2] == ["cargo", "build"]:
+                    built = Path(cwd) / "target" / "release" / "zakurad"
+                    built.parent.mkdir(parents=True)
+                    built.write_text("miner")
+                return mock.Mock(returncode=0, stdout="")
+
+            with mock.patch.dict(os.environ, {deploy.BUILD_CACHE_DIR_ENV: str(cache_dir)}), \
+                    mock.patch.object(deploy, "binary_is_runnable", return_value=True), \
+                    mock.patch.object(deploy, "run", side_effect=fake_run):
+                built = deploy.build_commit(root, sha, features=["internal-miner"])
+
+            # The stock binary for the same commit must not satisfy a miner build.
+            self.assertEqual(built, cache_dir / f"zakurad-{sha}-internal-miner")
+            self.assertEqual(built.read_text(), "miner")
+            self.assertEqual((cache_dir / f"zakurad-{sha}").read_text(), "stock")
+            self.assertIn(["cargo", "build", "--release", "--locked", "-p", "zakura",
+                           "--features", "internal-miner"], calls)
+
     def test_prune_cached_binaries_keeps_current_and_recent(self):
         with tempfile.TemporaryDirectory() as tmp:
             cache_dir = Path(tmp)
@@ -175,6 +206,9 @@ class NodeBuilder:
             "metrics_endpoint": "",
             "health_listen_addr": "",
             "miner_address": "",
+            "internal_miner": False,
+            "extra_coinbase_data": "",
+            "build_features": [],
             "tracing_filter": "",
             "checkpoint_sync": True,
             "vct_fast_sync": True,
@@ -234,6 +268,20 @@ class ObservabilityRenderingTests(NodeBuilder, unittest.TestCase):
         self.assertEqual(
             config["mining"], {"miner_address": "tmJymvcUCn1ctbghvTJpXBwHiMEB8P6wxNV"}
         )
+
+    def test_internal_miner_renders_with_a_distinct_coinbase_tag(self):
+        config = tomllib.loads(deploy.render_node_config(self.node(
+            miner_address="tmJymvcUCn1ctbghvTJpXBwHiMEB8P6wxNV",
+            internal_miner=True,
+            extra_coinbase_data="nu7-us",
+            build_features=["internal-miner"],
+        )))
+
+        self.assertEqual(config["mining"], {
+            "miner_address": "tmJymvcUCn1ctbghvTJpXBwHiMEB8P6wxNV",
+            "extra_coinbase_data": "nu7-us",
+            "internal_miner": True,
+        })
 
     def test_mining_section_omitted_when_unset(self):
         config = tomllib.loads(deploy.render_node_config(self.node()))
@@ -421,6 +469,22 @@ class ConfigKeyTests(unittest.TestCase):
             self.assertEqual(
                 nodes[0].testnet_parameters["activation_heights"]["NU7"], 4_376_000
             )
+
+    def test_internal_miner_requires_an_address_and_the_miner_build(self):
+        for extra in ('build_features = ["internal-miner"]',
+                      'miner_address = "tmJymvcUCn1ctbghvTJpXBwHiMEB8P6wxNV"'):
+            with tempfile.TemporaryDirectory() as tmp:
+                path = self.write_config(tmp, f"""
+                    [[nodes]]
+                    name = "node-a"
+                    ssh_string = "root@example"
+                    commit = "main"
+                    internal_miner = true
+                    {extra}
+                """.replace("                    ", ""))
+
+                with self.assertRaises(deploy.DeployError, msg=extra):
+                    deploy.load_nodes(path, None)
 
     def test_unknown_key_still_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:

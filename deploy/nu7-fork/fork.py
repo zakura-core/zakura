@@ -322,9 +322,12 @@ def render_nodes_toml(config: dict, plan: dict) -> str:
         "initial_testnet_peers = []",
         f'log_file = "{host.get("log_file", "/var/log/zakura/zakura-fork.log")}"',
         f'metrics_endpoint = "{host["metrics_endpoint"]}"',
-        # Without a miner address the node refuses getblocktemplate, so the
-        # external miner cannot produce a single block.
+        # Without a miner address the node refuses getblocktemplate and its
+        # internal miner, so the fork cannot produce a single block.
         f'miner_address = "{miner_address}"',
+        # One binary for every fork node. The solver only runs on nodes whose
+        # config sets internal_miner.
+        'build_features = ["internal-miner"]',
         f'storage_mode = "{host.get("storage_mode", "pruned")}"',
         # The fork has no Zakura v2 peers and must not dial the public network.
         'p2p_stack = "legacy"',
@@ -345,6 +348,10 @@ def render_nodes_toml(config: dict, plan: dict) -> str:
         f'name = "{config["droplet"]["name"]}"',
         f'ssh_string = "{host["ssh_string"]}"',
         f'commit = "{host["commit"]}"',
+        "internal_miner = true",
+        # Miners sharing one address need distinct coinbase data, or nodes that build
+        # the same template in the same second would search the same nonces.
+        f'extra_coinbase_data = "{config["droplet"]["name"]}"',
     ])
     if peer_enabled:
         # Dial the validator so the miner does not depend on inbound-only
@@ -378,8 +385,13 @@ def render_nodes_toml(config: dict, plan: dict) -> str:
             # Setting one makes the two nodes compete, which is what exercises losing a
             # race and re-templating on a tip someone else mined.
             f'miner_address = "{peer.get("miner_address", "")}"',
-            "",
         ])
+        if peer.get("miner_address"):
+            lines.extend([
+                "internal_miner = true",
+                f'extra_coinbase_data = "{peer["name"]}"',
+            ])
+        lines.append("")
 
     return "\n".join(lines)
 
@@ -725,8 +737,8 @@ def cmd_up(config: dict, args) -> int:
     print(f"[up] NU7 activates at {plan['activation']} (seed tip {tip})")
     args.nodes = args.out
     cmd_deploy(config, args)
-    print("[up] deployed; `fork.py status` to watch. To produce blocks, run "
-          "zakura-fork-miner (see README.md, \"Continuous mining on the primary node\")")
+    print("[up] deployed; `fork.py status` to watch. The primary mines with "
+          "zakurad's internal miner")
     return 0
 
 

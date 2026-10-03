@@ -1229,3 +1229,33 @@ fn regtest_accepts_checkpoints_covering_delayed_canopy() {
         zakura_chain::block::Height(9)
     );
 }
+
+/// The deployer's rendered NU7 fork node config, kept in sync with the renderer by
+/// `deploy/nu7-fork/test_fork.py`. Loading it here proves zakurad accepts the shape
+/// the deployer writes, which a TOML parser alone cannot.
+#[test]
+fn rendered_nu7_fork_config_loads() {
+    use zakura_chain::parameters::NetworkUpgrade;
+
+    let document: toml::Value = toml::from_str(include_str!("data/nu7-fork-node.toml"))
+        .expect("the rendered fork config is TOML");
+    let config: Config = document
+        .get("network")
+        .expect("the rendered fork config has a [network] section")
+        .clone()
+        .try_into()
+        .expect("the rendered [network] section deserializes");
+
+    assert_eq!(config.network.to_string(), "Nu7Fork");
+    assert!(!config.network.is_default_testnet());
+    assert_eq!(
+        NetworkUpgrade::Nu7.activation_height(&config.network),
+        Some(Height(4_400_010)),
+    );
+    // The public Testnet upgrades survive: a partial activation list would
+    // silently drop them.
+    assert_eq!(
+        NetworkUpgrade::Nu6_3.activation_height(&config.network),
+        Some(Height(4_134_000)),
+    );
+}

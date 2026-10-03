@@ -44,6 +44,8 @@ endpoint_addr = "127.0.0.1:9999"
 
 [mining]
 miner_address = "tmGkvoQGmvJu6H5Wp22wUFAsBuX6SPGHnMq"
+extra_coinbase_data = "zakura-nu7-fork-1"
+internal_miner = true
 
 [consensus]
 checkpoint_sync = true

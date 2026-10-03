@@ -15,10 +15,11 @@ from unittest import mock
 
 import fork
 
-# The rendered primary node config, loaded by zakurad's own config deserializer in
-# the fork miner's `rendered_fork_config_loads_in_zakurad` test. Regenerate it with
+# The rendered primary node config, loaded by zakura-network's own config deserializer
+# in its `rendered_nu7_fork_config_loads` test. Regenerate it with
 # `ZAKURA_REGENERATE_FIXTURES=1 python3 -m unittest test_fork` after an intended change.
-RENDERED_NODE_FIXTURE = Path(__file__).parent / "miner" / "testdata" / "fork-node.toml"
+RENDERED_NODE_FIXTURE = (Path(__file__).resolve().parents[2] / "crates" / "zakura-network"
+                         / "src" / "config" / "tests" / "data" / "nu7-fork-node.toml")
 
 
 def base_config(peer=None):
@@ -119,6 +120,20 @@ class RenderedNodes(unittest.TestCase):
         rendered = render(base_config({**PEER, "miner_address": "tmA1eXkKigWig8xmeDBJdLGPiyhrmKcTxnq"}))
         self.assertIn('miner_address = "tmA1eXkKigWig8xmeDBJdLGPiyhrmKcTxnq"', rendered)
         self.assertIn('miner_address = "tmGkvoQGmvJu6H5Wp22wUFAsBuX6SPGHnMq"', rendered)
+
+    def test_the_primary_runs_the_internal_miner_and_the_observer_does_not(self):
+        nodes = __import__("tomllib").loads(render(base_config(PEER)))
+        self.assertEqual(nodes["defaults"]["build_features"], ["internal-miner"])
+        primary, observer = nodes["nodes"]
+        self.assertIs(primary["internal_miner"], True)
+        self.assertEqual(primary["extra_coinbase_data"], "zakura-nu7-fork-1")
+        self.assertNotIn("internal_miner", observer)
+
+    def test_a_mining_peer_gets_its_own_coinbase_data(self):
+        peer = {**PEER, "miner_address": "tmA1eXkKigWig8xmeDBJdLGPiyhrmKcTxnq"}
+        _, observer = __import__("tomllib").loads(render(base_config(peer)))["nodes"]
+        self.assertIs(observer["internal_miner"], True)
+        self.assertEqual(observer["extra_coinbase_data"], "zakura-nu7-fork-2")
 
     def test_a_missing_miner_address_is_refused(self):
         config = base_config(PEER)
@@ -327,7 +342,7 @@ class RenderedNodeConfig(unittest.TestCase):
     """The deployer's output for a fork node must be a config zakurad accepts.
 
     tomllib only proves the output is TOML. The fixture is what the Rust side loads,
-    so a shape zakurad rejects fails `cargo test -p zakura-fork-miner`.
+    so a shape zakurad rejects fails `cargo test -p zakura-network rendered_nu7_fork`.
     """
 
     def render_primary(self) -> str:
@@ -348,7 +363,7 @@ class RenderedNodeConfig(unittest.TestCase):
         self.assertEqual(
             rendered, RENDERED_NODE_FIXTURE.read_text(),
             "the rendered fork config changed; regenerate the fixture with "
-            "ZAKURA_REGENERATE_FIXTURES=1 and run cargo test -p zakura-fork-miner",
+            "ZAKURA_REGENERATE_FIXTURES=1 and run cargo test -p zakura-network",
         )
 
 

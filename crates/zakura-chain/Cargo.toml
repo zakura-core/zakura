@@ -47,7 +47,7 @@ bench = ["zakura-test"]
 
 [dependencies]
 
-derive-getters = { workspace = true, features = ["auto_copy_getters"] }
+getset = { workspace = true }
 lazy_static = { workspace = true }
 tempfile = { workspace = true }
 bitvec = { workspace = true }

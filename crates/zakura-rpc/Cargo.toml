@@ -53,7 +53,7 @@ http-body-util = { workspace = true }
 semver = { workspace = true }
 serde_json = { workspace = true, features = ["raw_value"] }
 indexmap = { workspace = true, features = ["serde"] }
-derive-getters = { workspace = true, features = ["auto_copy_getters"] }
+getset = { workspace = true }
 derive-new = { workspace = true }
 thiserror = { workspace = true }
 lazy_static = { workspace = true }

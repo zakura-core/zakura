@@ -607,11 +607,31 @@ impl LegacyResponseCodec {
         Ok(frames)
     }
 
+    /// Decode a response with no transaction ID binding.
+    #[cfg(test)]
     pub(super) fn decode_response(
         request_id: u64,
         request_kind: LegacyRequestKind,
         frames: Vec<Frame>,
         requested_block_hashes: Option<&HashSet<block::Hash>>,
+    ) -> Result<Response, LegacyGossipError> {
+        Self::decode_bound_response(
+            request_id,
+            request_kind,
+            frames,
+            requested_block_hashes,
+            None,
+        )
+    }
+
+    /// Decode a response, and reject any block or transaction that is not in the
+    /// matching requested set.
+    pub(super) fn decode_bound_response(
+        request_id: u64,
+        request_kind: LegacyRequestKind,
+        frames: Vec<Frame>,
+        requested_block_hashes: Option<&HashSet<block::Hash>>,
+        requested_transaction_ids: Option<&HashSet<UnminedTxId>>,
     ) -> Result<Response, LegacyGossipError> {
         let mut blocks = Vec::new();
         let mut transactions = Vec::new();
@@ -655,12 +675,20 @@ impl LegacyResponseCodec {
                         return Err(LegacyGossipError::UnexpectedResponse("Transactions"));
                     }
                     if let Some(bytes) = reassembler.accept(&frame.payload)? {
-                        let transaction =
-                            Transaction::zcash_deserialize(&mut Cursor::new(bytes.as_slice()))?;
-                        transactions.push(InventoryResponse::Available((
-                            UnminedTx::from(transaction),
-                            None,
-                        )));
+                        let transaction = UnminedTx::from(Transaction::zcash_deserialize(
+                            &mut Cursor::new(bytes.as_slice()),
+                        )?);
+                        // Bind the delivered transaction to an ID we requested, as
+                        // the TCP connection does. A substituted transaction would
+                        // leave the requested ID queued in the mempool downloader.
+                        if let Some(requested) = requested_transaction_ids {
+                            if !requested.contains(&transaction.id()) {
+                                return Err(LegacyGossipError::UnexpectedResponse(
+                                    "unrequested transaction",
+                                ));
+                            }
+                        }
+                        transactions.push(InventoryResponse::Available((transaction, None)));
                     }
                 }
                 MSG_RESPONSE_MISSING_BLOCKS => {
@@ -684,6 +712,14 @@ impl LegacyResponseCodec {
                     }
                     reassembler.reject_if_active()?;
                     for id in decode_tx_ids_response(request_id, frame.payload)? {
+                        // A peer may only report transactions we requested as missing.
+                        if let Some(requested) = requested_transaction_ids {
+                            if !requested.contains(&id) {
+                                return Err(LegacyGossipError::UnexpectedResponse(
+                                    "unrequested missing transaction",
+                                ));
+                            }
+                        }
                         transactions.push(InventoryResponse::Missing(id));
                     }
                 }
@@ -2192,10 +2228,14 @@ impl ZakuraRequestClient {
     ) -> Result<Response, BoxError> {
         self.wait_for_request_slot().await;
         let request_id = NEXT_LEGACY_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
-        // Capture the requested block hashes (if any) before consuming the frame,
-        // so the response can be bound to a hash we actually asked for.
+        // Capture the requested block hashes or transaction IDs (if any) before
+        // consuming the frame, so the response can be bound to what we asked for.
         let requested_block_hashes: Option<HashSet<block::Hash>> = match &frame {
             LegacyRequestFrame::BlocksByHash(hashes) => Some(hashes.iter().copied().collect()),
+            _ => None,
+        };
+        let requested_transaction_ids: Option<HashSet<UnminedTxId>> = match &frame {
+            LegacyRequestFrame::TransactionsById(ids) => Some(ids.iter().copied().collect()),
             _ => None,
         };
         let frame = frame.encode_frame()?;
@@ -2252,11 +2292,12 @@ impl ZakuraRequestClient {
                 return Err(error);
             }
         };
-        let mut response = match LegacyResponseCodec::decode_response(
+        let mut response = match LegacyResponseCodec::decode_bound_response(
             request_id,
             request_kind,
             response,
             requested_block_hashes.as_ref(),
+            requested_transaction_ids.as_ref(),
         ) {
             Ok(response) => response,
             Err(error) => {
@@ -5367,6 +5408,71 @@ mod tests {
                     blocks.as_slice(),
                     [InventoryResponse::Available((received, None))]
                         if received.hash() == block.hash()
+                )
+        ));
+
+        Ok(())
+    }
+
+    /// A transaction response must be bound to an ID we actually requested.
+    ///
+    /// A peer that answers a request for transaction A with transaction B would
+    /// otherwise leave A queued in the mempool downloader, which then refuses A
+    /// from every peer and from RPC.
+    #[test]
+    fn decode_response_binds_transactions_to_requested_ids() -> Result<(), BoxError> {
+        let block = Block::zcash_deserialize(BLOCK_TESTNET_141042_BYTES.as_slice())?;
+        let delivered = UnminedTx::from(block.transactions[0].clone());
+        let other = UnminedTx::from(block.transactions[1].clone()).id();
+        let frame_cap = u32::try_from(MAX_PROTOCOL_MESSAGE_LEN)?;
+        let available = LegacyResponseCodec::encode_response(
+            7,
+            Response::Transactions(vec![InventoryResponse::Available((
+                delivered.clone(),
+                None,
+            ))]),
+            frame_cap,
+            frame_cap,
+        )?;
+        let missing = LegacyResponseCodec::encode_response(
+            7,
+            Response::Transactions(vec![InventoryResponse::Missing(delivered.id())]),
+            frame_cap,
+            frame_cap,
+        )?;
+
+        let unrelated: HashSet<UnminedTxId> = std::iter::once(other).collect();
+        for frames in [available.clone(), missing] {
+            assert!(
+                matches!(
+                    LegacyResponseCodec::decode_bound_response(
+                        7,
+                        LegacyRequestKind::Transactions,
+                        frames,
+                        None,
+                        Some(&unrelated),
+                    ),
+                    Err(LegacyGossipError::UnexpectedResponse(_)),
+                ),
+                "a transaction whose ID was not requested must be rejected",
+            );
+        }
+
+        let requested: HashSet<UnminedTxId> = std::iter::once(delivered.id()).collect();
+        let response = LegacyResponseCodec::decode_bound_response(
+            7,
+            LegacyRequestKind::Transactions,
+            available,
+            None,
+            Some(&requested),
+        )?;
+        assert!(matches!(
+            response,
+            Response::Transactions(transactions)
+                if matches!(
+                    transactions.as_slice(),
+                    [InventoryResponse::Available((received, None))]
+                        if received.id() == delivered.id()
                 )
         ));
 

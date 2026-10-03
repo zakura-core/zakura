@@ -1,6 +1,6 @@
 [package]
 name = "zakura-network"
-version = "9.0.1"
+version = "10.0.0"
 authors.workspace = true
 description = "Networking code for the Zakura node. Internal crate, published to support cargo install zakura"
 # # Legal
@@ -61,7 +61,6 @@ lazy_static = { workspace = true }
 pin-project = { workspace = true }
 rand = { workspace = true }
 rayon = { workspace = true }
-regex = { workspace = true }
 schemars = { workspace = true }
 serde = { workspace = true, features = ["serde_derive"] }
 serde_json = { workspace = true }

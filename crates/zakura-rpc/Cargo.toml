@@ -110,7 +110,7 @@ zakura-chain = { path = "../zakura-chain", version = "10.0.0", features = [
 ] }
 zakura-consensus = { path = "../zakura-consensus", version = "10.0.1" }
 zakura-network = { path = "../zakura-network", version = "9.0.1" }
-zakura-node-services = { path = "../zakura-node-services", version = "4.0.1", features = [
+zakura-node-services = { path = "../zakura-node-services", version = "5.0.0", features = [
     "rpc-client",
 ] }
 zakura-script = { path = "../zakura-script", version = "4.0.1" }
@@ -125,7 +125,7 @@ bytes = { workspace = true }
 http-body = { workspace = true }
 insta = { workspace = true, features = ["redactions", "json", "ron"] }
 anyhow = { workspace = true }
-reqwest = { workspace = true, features = ["rustls-tls"] }
+reqwest = { workspace = true, features = ["rustls-no-provider"] }
 tempfile = { workspace = true }
 toml = { workspace = true }
 

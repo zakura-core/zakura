@@ -178,6 +178,7 @@ async fn segmented_listeners_enforce_methods_and_cookie_auth() {
         .await
         .expect("admin RPC listener should start");
 
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let client = Client::builder()
         .timeout(Duration::from_secs(5))
         .build()

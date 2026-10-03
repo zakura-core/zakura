@@ -3970,6 +3970,7 @@ async fn generate_with_cookie(
         .trim()
         .split_once(':')
         .ok_or_else(|| eyre!("RPC cookie does not contain basic-auth credentials"))?;
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let response = reqwest::Client::builder()
         .timeout(EXTENDED_LAUNCH_DELAY)
         .build()?

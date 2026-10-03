@@ -31,6 +31,8 @@ impl RpcRequestClient {
     ///
     /// Use [`RpcRequestClient::new()`] for the default timeout.
     pub fn new_with_timeout(rpc_address: SocketAddr, timeout: Duration) -> Self {
+        // Reqwest uses the process TLS provider; retain an existing provider.
+        let _ = rustls::crypto::ring::default_provider().install_default();
         Self {
             client: Client::builder()
                 .timeout(timeout)

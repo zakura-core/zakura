@@ -129,7 +129,7 @@ rayon = "1.10"
 reddsa = { version = "=2.2.0", package = "zakura-reddsa" }
 redjubjub = { version = "=2.2.0", package = "zakura-redjubjub" }
 regex = "1.11"
-reqwest = { version = "0.12", default-features = false }
+reqwest = { version = "0.13", default-features = false }
 ripemd = "0.1"
 rlimit = "0.10"
 # `bindgen-runtime` makes librocksdb-sys's bindgen load libclang itself. Without
@@ -150,8 +150,8 @@ schemars = "1"
 sinsemilla = { version = "=2.2.0", package = "zakura-sinsemilla" }
 spandoc = "0.2"
 anyhow = "1.0"
-strum = "0.27"
-strum_macros = "0.27"
+strum = "0.28"
+strum_macros = "0.28"
 subtle = { version = "2.6", default-features = false }
 tempfile = "3.20"
 thiserror = "2.0"

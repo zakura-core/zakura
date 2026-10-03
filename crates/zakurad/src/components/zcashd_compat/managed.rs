@@ -239,6 +239,8 @@ fn download_archive(url: &str, out: &mut fs::File) -> Result<(), Report> {
         }
     }
 
+    // Reqwest uses the process TLS provider; retain an existing provider.
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let client = Client::builder()
         .redirect(Policy::limited(5))
         .timeout(MANAGED_DOWNLOAD_TIMEOUT)

@@ -215,6 +215,7 @@ pub(crate) struct BlockSyncService {
 
 #[derive(Debug)]
 struct BlockSyncServiceInner {
+    sessions: crate::zakura::regulation::SessionCapacity,
     config: ZakuraBlockSyncConfig,
     lifecycle: mpsc::UnboundedSender<BlockSyncEvent>,
     /// Shared download primitives every per-peer pipe-routine is wired with at
@@ -290,6 +291,10 @@ impl BlockSyncService {
     pub(crate) fn new_with_handle(config: ZakuraBlockSyncConfig, handle: BlockSyncHandle) -> Self {
         Self {
             inner: Arc::new(BlockSyncServiceInner {
+                sessions: crate::zakura::regulation::SessionCapacity::new(
+                    "block-sync",
+                    &config.peer_limits,
+                ),
                 config,
                 lifecycle: handle.lifecycle.clone(),
                 routine_wiring: handle.routine_wiring.clone(),
@@ -328,6 +333,10 @@ impl BlockSyncService {
         let (handle, _actions, reactor_task) = spawn_block_sync_reactor(startup);
         Self {
             inner: Arc::new(BlockSyncServiceInner {
+                sessions: crate::zakura::regulation::SessionCapacity::new(
+                    "block-sync",
+                    &config.peer_limits,
+                ),
                 config,
                 lifecycle: handle.lifecycle.clone(),
                 routine_wiring: handle.routine_wiring.clone(),
@@ -361,6 +370,10 @@ impl BlockSyncService {
         (
             Self {
                 inner: Arc::new(BlockSyncServiceInner {
+                    sessions: crate::zakura::regulation::SessionCapacity::new(
+                        "block-sync",
+                        &config.peer_limits,
+                    ),
                     config,
                     lifecycle,
                     routine_wiring: None,
@@ -455,6 +468,22 @@ impl Service for BlockSyncService {
         block_sync_streams()
     }
 
+    fn reserve_session(
+        &self,
+        direction: ServicePeerDirection,
+    ) -> Result<Option<Arc<dyn crate::zakura::SessionResources>>, crate::zakura::SessionFull> {
+        if self
+            .inner
+            .routine_wiring
+            .as_ref()
+            .is_some_and(|wiring| wiring.serving.is_some())
+        {
+            self.inner.sessions.reserve(direction).map(Some)
+        } else {
+            Ok(None)
+        }
+    }
+
     fn session_policy(&self) -> SessionPolicy {
         SessionPolicy {
             opening: SessionOpening::EitherSide,
@@ -471,6 +500,18 @@ impl Service for BlockSyncService {
     ) -> SessionDemand {
         if let Some(deadline) = self.peer_park_deadline(peer) {
             return SessionDemand::RetryAt(deadline);
+        }
+
+        if self
+            .inner
+            .routine_wiring
+            .as_ref()
+            .is_some_and(|wiring| wiring.serving.is_some())
+        {
+            let demand = self.inner.sessions.demand(direction);
+            if !matches!(demand, SessionDemand::OpenNow) {
+                return demand;
+            }
         }
 
         let mut peer_snapshot = self.inner.peer_snapshot.clone();
@@ -695,6 +736,13 @@ impl Service for BlockSyncService {
                         let generation = routine_generation.expect(
                             "production block-sync wiring allocates a routine generation before spawn",
                         );
+                        let serving = wiring.serving.as_ref().map(|serving| {
+                            serving.session(
+                                &peer_id,
+                                block_sync_session.request_sender(),
+                                run_cancel.clone(),
+                            )
+                        });
                         let routine = super::peer_routine::PeerRoutine::new(
                             peer_id,
                             conn_id,
@@ -714,7 +762,8 @@ impl Service for BlockSyncService {
                             wiring.view,
                             run_cancel,
                             wiring.trace,
-                        );
+                        )
+                        .with_serving(serving);
                         tokio::select! {
                             biased;
                             () = connection_cancel_token.cancelled() => Ok(()),

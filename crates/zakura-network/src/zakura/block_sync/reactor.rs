@@ -238,6 +238,12 @@ pub fn spawn_block_sync_reactor(
     // The shared download primitives every pipe-routine is wired with at spawn
     // (`service::add_peer`), carried through the handle.
     let routine_wiring = RoutineWiring {
+        serving: startup.range_source.clone().map(|source| {
+            Arc::new(super::regulated::session::Serving::new(
+                source,
+                &startup.config,
+            ))
+        }),
         config: startup.config.clone(),
         budget: state.budget.clone(),
         work: state.work_queue.clone(),

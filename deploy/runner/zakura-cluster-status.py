@@ -4114,6 +4114,7 @@ setInterval(renderFreshness, 1000);
 
 COLLECTOR: ClusterCollector | None = None
 ACTIVATION_FEED = None
+TRUSTED_PROXY_IPS = set()
 RATE_LIMITER = RateLimiter()
 # The page and its data both change every poll, and the HTML carries no
 # fingerprint. Without this a browser heuristically caches the page and keeps
@@ -4215,7 +4216,7 @@ class Handler(BaseHTTPRequestHandler):
             return peer
 
         forwarded_for = self.headers.get("X-Forwarded-For")
-        if peer_address.is_loopback and forwarded_for:
+        if (peer_address.is_loopback or peer_address in TRUSTED_PROXY_IPS) and forwarded_for:
             candidate = forwarded_for.rsplit(",", 1)[-1].strip()
             try:
                 return str(ipaddress.ip_address(candidate))
@@ -4339,7 +4340,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main() -> None:
-    global COLLECTOR, ACTIVATION_FEED
+    global COLLECTOR, ACTIVATION_FEED, TRUSTED_PROXY_IPS
 
     parser = argparse.ArgumentParser(description="Serve a Zakura fleet status dashboard.")
     parser.add_argument("--config", required=True, help="path to deploy/deployer nodes TOML")
@@ -4393,7 +4394,10 @@ def main() -> None:
     )
     parser.add_argument("--nu7-activation-config", default="",
                         help="approved profile/selector JSON; serves coherent /v1/dashboard")
+    parser.add_argument("--trusted-proxy", action="append", default=[], type=ipaddress.ip_address,
+                        help="explicit reverse-proxy IP allowed to supply X-Forwarded-For; repeat per IP")
     args = parser.parse_args()
+    TRUSTED_PROXY_IPS = set(args.trusted_proxy)
 
     nodes = load_nodes(Path(args.config))
     state_file = Path(args.state_file) if args.state_file else None

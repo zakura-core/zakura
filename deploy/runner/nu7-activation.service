@@ -1,7 +1,8 @@
 [Unit]
 Description=Coherent NU7 feed and automatic public-Testnet selection
 Wants=network-online.target
-After=network-online.target zakurad.service
+After=network-online.target zakurad.service nu7-activation-firewall.service
+Requires=nu7-activation-firewall.service
 
 [Service]
 Type=simple
@@ -9,7 +10,7 @@ DynamicUser=yes
 SupplementaryGroups=systemd-journal
 StateDirectory=zakura-nu7-activation
 EnvironmentFile=-/etc/zakura/nu7-publication.env
-ExecStart=/usr/bin/python3 /opt/zakura-nu7-status/zakura-cluster-status.py --config /etc/zakura/public-testnet-nodes.toml --network testnet --host 0.0.0.0 --port 8096 --nu7-activation-config /etc/zakura/nu7-activation.json
+ExecStart=/usr/bin/python3 /opt/zakura-nu7-status/zakura-cluster-status.py --config /etc/zakura/public-testnet-nodes.toml --network testnet --host 0.0.0.0 --port 8096 --trusted-proxy 167.99.146.155 --nu7-activation-config /etc/zakura/nu7-activation.json
 Restart=always
 RestartSec=5
 NoNewPrivileges=true

@@ -1616,6 +1616,23 @@ class Nu7SourceTests(unittest.TestCase):
         self.assertEqual(out["peer_external"], 2)
 
 
+class TrustedProxyTests(unittest.TestCase):
+    def client(self, peer, forwarded):
+        handler = object.__new__(status.Handler)
+        handler.client_address = (peer, 1234)
+        handler.headers = {"X-Forwarded-For": forwarded}
+        return handler.rate_limit_client()
+
+    def test_only_explicit_proxy_or_loopback_can_forward_client_identity(self):
+        import ipaddress
+        with mock.patch.object(status, "TRUSTED_PROXY_IPS", {ipaddress.ip_address("167.99.146.155")}):
+            self.assertEqual(self.client("167.99.146.155", "198.51.100.20"), "198.51.100.20")
+            self.assertEqual(self.client("127.0.0.1", "198.51.100.21"), "198.51.100.21")
+            self.assertEqual(self.client("203.0.113.7", "198.51.100.20"), "203.0.113.7")
+            self.assertEqual(self.client("167.99.146.155", "invalid"), "167.99.146.155")
+            self.assertEqual(self.client("167.99.146.155", "spoofed, 198.51.100.22"), "198.51.100.22")
+
+
 class Nu7HttpTests(unittest.TestCase):
     def setUp(self):
         self.original_collector = status.COLLECTOR

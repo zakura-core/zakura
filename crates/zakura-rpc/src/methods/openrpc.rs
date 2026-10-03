@@ -1,5 +1,7 @@
 //! Renders the generated method table as an OpenRPC document.
 
+use std::borrow::Cow;
+
 use schemars::{generate::SchemaSettings, JsonSchema, Schema, SchemaGenerator};
 use serde::Serialize;
 use serde_json::Value;
@@ -11,6 +13,18 @@ const RESULT_DESCRIPTION: &str = "An OpenRPC document.";
 const RESULT_SCHEMA: &str =
     "https://raw.githubusercontent.com/open-rpc/meta-schema/master/schema.json";
 
+struct ResultSchema;
+
+impl JsonSchema for ResultSchema {
+    fn schema_name() -> Cow<'static, str> {
+        "OpenRPC Schema".into()
+    }
+
+    fn json_schema(_: &mut SchemaGenerator) -> Schema {
+        Schema::new_ref(RESULT_SCHEMA.into())
+    }
+}
+
 /// Callbacks and documentation emitted by the method-table generator.
 pub(crate) struct RpcMethod {
     pub(super) description: &'static str,
@@ -20,7 +34,7 @@ pub(crate) struct RpcMethod {
 }
 
 /// Parameter schemas shared across one listener's OpenRPC document.
-pub(crate) struct Generator(SchemaGenerator);
+pub(super) struct Generator(SchemaGenerator);
 
 impl Generator {
     pub(super) fn param<T: JsonSchema>(
@@ -47,7 +61,7 @@ impl Generator {
             summary: RESULT_DESCRIPTION,
             description: RESULT_DESCRIPTION,
             required: false,
-            schema: Schema::new_ref(RESULT_SCHEMA.into()),
+            schema: self.0.subschema_for::<ResultSchema>(),
             deprecated: false,
         }
     }
@@ -55,7 +69,7 @@ impl Generator {
 
 #[derive(Serialize)]
 /// The serialized description of one parameter or result.
-pub(crate) struct ContentDescriptor {
+pub(super) struct ContentDescriptor {
     name: &'static str,
     summary: &'static str,
     description: &'static str,

@@ -106,7 +106,7 @@ internal-miner = [
 # Opt in explicitly: the tracing layer has overhead even without a SENTRY_DSN.
 sentry = ["dep:sentry"]
 journald = ["tracing-journald"]
-opentelemetry = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "dep:tracing-opentelemetry", "dep:rustls"]]
+opentelemetry = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "dep:tracing-opentelemetry", "dep:rustls"]
 
 progress-bar = [
     "howudoin",

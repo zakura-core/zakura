@@ -4173,6 +4173,70 @@ async fn unknown_parent_rejects_forged_heights() {
     }
 }
 
+/// While the lookahead limit is paused, a forged height at or below the reset height cannot
+/// clear the pause: the downloader authenticates it first.
+#[tokio::test]
+async fn forged_reset_height_keeps_the_lookahead_pause() {
+    let _init_guard = zakura_test::init();
+
+    let canonical: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1687107_BYTES
+        .zcash_deserialize_into()
+        .expect("test vector deserializes");
+    let canonical_hash = canonical.hash();
+    // Rewrite both heights, so only the Merkle root reveals the forgery.
+    let poisoned = poison_coinbase_height_and_expiry(&canonical, Height(1_600_001));
+
+    let mut peer_set = MockService::build().for_unit_tests::<zn::Request, zn::Response, _>();
+    let mut verifier =
+        MockService::build().for_unit_tests::<zakura_consensus::Request, block::Hash, _>();
+    let (chain_tip, chain_tip_sender) = MockChainTip::new();
+    chain_tip_sender.send_best_tip_height(Height(1_600_000));
+    chain_tip_sender.send_best_tip_hash(block::Hash([0x11; 32]));
+
+    let (past_lookahead_limit_sender, past_lookahead_limit_receiver) =
+        tokio::sync::watch::channel(true);
+    let mut downloads = Downloads::new(
+        peer_set.clone(),
+        verifier.clone(),
+        chain_tip,
+        past_lookahead_limit_sender,
+        sync::MIN_CONCURRENCY_LIMIT,
+        Network::Mainnet,
+        Height(0),
+        LegacySyncTrace::new(None, false),
+    );
+
+    downloads
+        .download_and_verify(canonical_hash)
+        .await
+        .expect("queuing a fresh hash succeeds");
+    let addr: PeerSocketAddr = "127.0.0.1:8233".parse().expect("valid peer address");
+    peer_set
+        .expect_request(zn::Request::BlocksByHash(
+            iter::once(canonical_hash).collect(),
+        ))
+        .await
+        .respond(zn::Response::Blocks(vec![Available((
+            poisoned,
+            Some(addr),
+        ))]));
+
+    // Without the check, the forged body waits on the verifier forever.
+    let result = tokio::time::timeout(Duration::from_secs(10), downloads.next())
+        .await
+        .expect("the downloader rejects the body without verifying it")
+        .expect("the download task produces a result instead of panicking");
+    assert!(
+        matches!(result, Err(BlockDownloadVerifyError::UnboundHeight { .. })),
+        "a forged reset height must be rejected, got {result:?}"
+    );
+    assert!(
+        *past_lookahead_limit_receiver.borrow(),
+        "a forged reset height must not clear the lookahead pause"
+    );
+    verifier.expect_no_requests().await;
+}
+
 /// The canonical tip child is unaffected: its coinbase height matches the tip, so it reaches
 /// the verifier as before.
 #[tokio::test]

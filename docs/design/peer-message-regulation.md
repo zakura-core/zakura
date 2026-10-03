@@ -44,6 +44,40 @@ connection at 500 ms round-trip time, and a test checks each default against its
 local capacity limit makes the node wait; it never faults a peer. QUIC flow control binds first
 today: a 32 MiB connection send window carries about 540 Mbps at 500 ms.
 
+## Native connection admission
+
+Direct incoming connections complete QUIC Retry address validation before they reserve transport
+capacity. One global budget covers inbound and outbound QUIC state from construction through final
+cleanup. Closing a connection does not return its capacity while a retained stream still owns it.
+
+For an effective total `C > 1`, incoming transports may use `C - max(1, floor(C / 8))` slots.
+The default is 224 inbound slots out of 256 total. Outbound dials may use any free global slot.
+A single effective slot stays shared. Raw `max_connections = 0` still selects one effective slot.
+Each validated source IP may own at most `min(P + 1, inbound share)` incoming transports, where
+`P` is the existing established per-IP cap. This includes pending and closing transports. The extra
+slot lets a reconnect authenticate while its incumbent is still present. Raw per-IP zero still
+selects the default of 16, giving 17 transport slots per source. Ports do not create new sources,
+IPv4-mapped aliases share their IPv4 count, and distinct IPv6 addresses remain distinct sources.
+An attacker with enough source addresses can fill the inbound share. This policy protects outbound
+progress, not guaranteed inbound availability against a distributed or IPv6-prefix attacker.
+
+Control handshakes have a separate global budget `H` with the same inbound share formula.
+The default allows 28 inbound control handshakes out of 32 total. Inbound acquires both budgets
+only for the control exchange. Outbound can use all free global handshake slots. Raw handshake
+zero still selects one effective shared slot. A single source's default 17 transport slots cannot
+fill the 28 inbound control slots. With custom settings, other-source inbound progress requires
+the per-source transport allowance to be smaller than both inbound shares. There is no such
+guarantee for one shared slot or for a source allowed to fill either share.
+
+These limits protect outbound capacity from inbound work. They do not prioritize one outbound
+purpose over another. Discovery still uses the smaller of its available connection target and
+available concurrent dial count. Its headroom is the larger of four and the number of remote bootstrap identities, which is nine
+with the default mainnet bootstrap list. Discovery can dial beyond a full registered inbound share
+only when the outbound reserve exceeds this headroom. With the default total of 256, there are
+23 such discovery slots. This is a soft target based on registered connections. Pending and closing
+transports can consume that headroom. Maintained bootstrap and upgrade dials do not use this soft
+cap, but still need free global transport and handshake capacity.
+
 ## Message checks and handler policy
 
 The implementation may use existing codecs, handlers, and validators. It need not introduce a

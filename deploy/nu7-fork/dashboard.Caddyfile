@@ -25,18 +25,10 @@ api.nu7.valargroup.dev {
         }
     }
 
-    handle /v1/status {
-        header {
-            Access-Control-Allow-Origin https://zakura.com
-            Access-Control-Allow-Methods "GET, OPTIONS"
-            Access-Control-Allow-Headers Content-Type
-        }
-        @preflight method OPTIONS
-        respond @preflight 204
-        reverse_proxy 127.0.0.1:8093
-    }
-
-    handle /healthz {
+    # zakura-cluster-status answers CORS for its own zakura.com allowlist, including
+    # preflight. Only these two paths are public; its fleet page and /data are not.
+    @status path /v1/status /healthz
+    handle @status {
         reverse_proxy 127.0.0.1:8093
     }
 

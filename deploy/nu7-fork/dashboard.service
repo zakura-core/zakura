@@ -1,12 +1,15 @@
 [Unit]
-Description=Public NU7 fork status feed
+Description=Public NU7 fork status feed (zakura-cluster-status)
 After=network-online.target zakurad.service
 Wants=network-online.target
 
 [Service]
 Type=simple
 User=root
-ExecStart=/usr/bin/python3 /opt/zakura-nu7-dashboard/dashboard.py --config /etc/zakura/zakura.toml
+# Observations from before the current network generation are not counted.
+Environment=NU7_GENERATION_START=0
+EnvironmentFile=-/etc/zakura/nu7-generation.env
+ExecStart=/usr/bin/python3 /opt/zakura-nu7-status/zakura-cluster-status.py --config /etc/zakura/nu7-nodes.toml --network testnet --host 127.0.0.1 --port 8093 --nu7-config /etc/zakura/zakura.toml --nu7-generation-start ${NU7_GENERATION_START}
 Restart=always
 RestartSec=5
 NoNewPrivileges=true

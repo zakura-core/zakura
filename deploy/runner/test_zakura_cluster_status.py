@@ -7,6 +7,7 @@ import importlib.util
 import json
 import os
 import re
+import socket
 import subprocess
 import sys
 import tempfile
@@ -1260,6 +1261,467 @@ class HttpHandlerTests(unittest.TestCase):
 
         self.assertEqual(context.exception.code, 404)
         context.exception.close()
+
+
+# --------------------------------------------------------------------------- #
+# NU7 configured-network status
+# --------------------------------------------------------------------------- #
+
+NU7_SAMPLE = json.loads((Path(__file__).parent / "testdata" / "nu7-status-v1-sample.json")
+                        .read_text())
+NU7_ACTIVATION = 10
+NU7_BRANCH = "77190ad9"
+
+
+def nu7_node(name, **overrides):
+    values = dict(
+        name=name, ssh_string=f"root@{name}", probe_kind="zebra", service_name="zakurad",
+        bin_path="/usr/local/bin/zakurad", log_file="", rpc_listen_addr="",
+        rpc_auth="", rpc_config_path="", rpc_user="", rpc_password="",
+        process_pattern="", container_name="", node_id="",
+    )
+    values.update(overrides)
+    return status.Node(**values)
+
+
+def nu7_validators():
+    return [
+        nu7_node("fork-1", local=True, label="primary", rpc_listen_addr="127.0.0.1:18232",
+                 internal_miner=True),
+        nu7_node("fork-2", local=True, label="local observer",
+                 rpc_listen_addr="127.0.0.1:18242"),
+        nu7_node("us", status_url="http://203.0.113.1:8094/v1/miner", miner_id="us",
+                 region="San Francisco, US", internal_miner=True),
+        nu7_node("eu", status_url="http://203.0.113.2:8094/v1/miner", miner_id="eu",
+                 region="Amsterdam, NL", internal_miner=True),
+        nu7_node("ap", status_url="http://203.0.113.3:8094/v1/miner", miner_id="ap",
+                 region="Singapore, SG", internal_miner=True),
+    ]
+
+
+def chain_hash(number):
+    return f"{number:064x}"
+
+
+def nu7_row(name, height=12, *, block_hash=None, local=True, miner_active=True, **extra):
+    row = {
+        "name": name, "healthy": True, "rpc_ok": True, "active_state": "active",
+        "rpc_chain": "test",
+        "height": height, "block_hash": block_hash or chain_hash(height),
+        "ancestor_hashes": {"1": chain_hash(height - 1), "2": chain_hash(height - 2)},
+        "nu7": {"branch_id": NU7_BRANCH, "activation_height": NU7_ACTIVATION},
+        "peer_count": 5 if local else None, "peer_external": 4 if local else None,
+        "nsm_value_balance_zat": 125, "nsm_reissuance_known": False,
+        "nsm_reissuance_height": None,
+        "miner": None if local else {"active": miner_active, "accepted_blocks_24h": 3,
+                                     "observed_at": 1000.0},
+    }
+    row.update(extra)
+    return row
+
+
+def nu7_rows(**overrides):
+    rows = {name: nu7_row(name, local=name.startswith("fork"))
+            for name in ("fork-1", "fork-2", "us", "eu", "ap")}
+    rows.update(overrides)
+    return list(rows.values())
+
+
+class Nu7StatusTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.config = Path(self.temp.name) / "zakura.toml"
+        self.config.write_text(
+            "[network]\n"
+            'network = { network_name = "Nu7StagingV3", network_magic = [122, 107, 117, 57], '
+            "initial_nsm_value_balance = 55768414957, inherit_activation_heights = true, "
+            f"activation_heights = {{ NU7 = {NU7_ACTIVATION} }} }}\n"
+        )
+        self.view = status.Nu7Status(nu7_validators(), self.config)
+        self.rpc_calls = []
+        self.rpc_patch = mock.patch.object(self.view, "rpc", side_effect=self.fake_rpc)
+        self.rpc_patch.start()
+        self.addCleanup(self.rpc_patch.stop)
+
+    def fake_rpc(self, method, params=None):
+        self.rpc_calls.append((method, params))
+        if method == "getblockhash":
+            return chain_hash(params[0])
+        if method == "getblockheader":
+            number = int(params[0], 16)
+            return {"height": number, "hash": params[0], "time": 1000 + 30 * number,
+                    "difficulty": 3.0}
+        raise AssertionError(method)
+
+    def test_payload_keeps_the_schema_version_1_contract(self):
+        payload = self.view.build(nu7_rows(), 2000)
+
+        def keys(value):
+            return set(value) if isinstance(value, dict) else set()
+
+        self.assertEqual(payload["schemaVersion"], 1)
+        self.assertLessEqual(keys(NU7_SAMPLE), keys(payload))
+        for section in ("network", "chain", "nsm", "observation", "mining"):
+            self.assertLessEqual(keys(NU7_SAMPLE[section]), keys(payload[section]), section)
+        self.assertLessEqual(keys(NU7_SAMPLE["mining"]["remoteMiners"][0]),
+                             keys(payload["mining"]["remoteMiners"][0]))
+        self.assertLessEqual(keys(NU7_SAMPLE["nodes"][0]), keys(payload["nodes"][0]))
+        self.assertEqual(keys(NU7_SAMPLE["recentBlocks"][0]), keys(payload["recentBlocks"][0]))
+        # The fields the website parser requires, with the types it checks.
+        chain = payload["chain"]
+        self.assertTrue(re.fullmatch(r"[0-9a-f]{64}", chain["hash"]))
+        self.assertGreater(chain["height"], 0)
+        self.assertGreater(chain["blockTime"], 0)
+        self.assertGreater(chain["difficulty"], 0)
+        self.assertIsInstance(chain["intervalSampleBlocks"], int)
+        self.assertIsInstance(payload["observation"]["reorgs24h"], int)
+
+    def test_network_identity_and_nsm_balance(self):
+        payload = self.view.build(nu7_rows(), 2000)
+
+        self.assertEqual(payload["network"], {
+            "name": "Nu7StagingV3", "magic": "7a6b7539", "activationHeight": NU7_ACTIVATION,
+            "nsmSeedZat": 55768414957, "targetSpacingSeconds": 25, "daaWindowBlocks": 102,
+            "branchId": NU7_BRANCH, "reissuanceHeight": None, "reissuanceKnown": False,
+        })
+        self.assertEqual(payload["nsm"], {"balanceZat": 125, "available": True,
+                                          "seedZat": 55768414957})
+
+    def test_five_validators_agree_and_remote_miners_are_healthy(self):
+        payload = self.view.build(nu7_rows(), 2000)
+
+        self.assertEqual(payload["status"], "live")
+        self.assertTrue(payload["observation"]["validatorsAgree"])
+        self.assertEqual(payload["observation"]["validatorsAgreeing"], 5)
+        self.assertEqual(payload["observation"]["validatorsConfigured"], 5)
+        self.assertEqual([node["name"] for node in payload["nodes"]],
+                         ["primary", "local observer", "us", "eu", "ap"])
+        self.assertEqual(payload["mining"]["operatorMinersActive"], 4)
+        self.assertEqual(payload["mining"]["operatorMinersConfigured"], 4)
+        self.assertEqual([miner["id"] for miner in payload["mining"]["remoteMiners"]],
+                         ["us", "eu", "ap"])
+        self.assertTrue(all(m["healthy"] for m in payload["mining"]["remoteMiners"]))
+
+    def test_one_remote_validator_on_another_chain_degrades_the_network(self):
+        payload = self.view.build(nu7_rows(eu=nu7_row("eu", local=False,
+                                                      block_hash="f" * 64)), 2000)
+
+        self.assertEqual(payload["status"], "degraded")
+        self.assertTrue(payload["observation"]["localNodesAgree"])
+        self.assertFalse(payload["observation"]["validatorsAgree"])
+        self.assertEqual(payload["observation"]["validatorsAgreeing"], 4)
+        eu = next(m for m in payload["mining"]["remoteMiners"] if m["id"] == "eu")
+        self.assertFalse(eu["healthy"])
+        self.assertEqual(payload["mining"]["operatorMinersActive"], 3)
+
+    def test_lagging_and_leading_validators_are_compared_on_the_common_chain(self):
+        rows = nu7_rows(
+            us=nu7_row("us", 10, local=False),      # two behind, same chain
+            eu=nu7_row("eu", 13, local=False),      # one ahead, extends the tip
+            ap=nu7_row("ap", 9, local=False),       # three behind: too far
+        )
+        payload = self.view.build(rows, 2000)
+
+        lags = {m["id"]: (m["healthy"], m["lagBlocks"]) for m in payload["mining"]["remoteMiners"]}
+        self.assertEqual(lags, {"us": (True, 2), "eu": (True, -1), "ap": (False, 3)})
+
+    def test_an_inactive_remote_miner_is_not_counted(self):
+        payload = self.view.build(nu7_rows(ap=nu7_row("ap", local=False, miner_active=False)),
+                                  2000)
+
+        self.assertEqual(payload["status"], "live")
+        self.assertEqual(payload["mining"]["operatorMinersActive"], 3)
+
+    def test_a_stalled_chain_still_publishes_its_tip(self):
+        # Fleet health also needs recent progress; the public feed must not turn a
+        # stalled but reachable primary into an RPC outage.
+        rows = nu7_rows(**{name: nu7_row(name, local=name.startswith("fork"), healthy=False)
+                           for name in ("fork-1", "fork-2", "us", "eu", "ap")})
+        payload = self.view.build(rows, 9000)
+
+        self.assertEqual(payload["status"], "live")
+        self.assertEqual(payload["chain"]["height"], 12)
+        self.assertEqual(payload["chain"]["tipAgeSeconds"], 9000 - (1000 + 30 * 12))
+
+    def test_a_stopped_or_unreachable_primary_is_unavailable(self):
+        for broken in ({"active_state": "inactive"}, {"rpc_ok": False}):
+            rows = nu7_rows(**{"fork-1": nu7_row("fork-1", **broken)})
+            self.assertEqual(self.view.build(rows, 2000)["status"], "unavailable", broken)
+
+    def test_mismatched_activation_is_unavailable(self):
+        rows = nu7_rows()
+        rows[0]["nu7"] = {"branch_id": NU7_BRANCH, "activation_height": NU7_ACTIVATION + 1}
+        payload = self.view.build(rows, 2000)
+
+        self.assertEqual(payload["status"], "unavailable")
+        self.assertEqual(payload["error"], "Primary node RPC unavailable")
+        self.view.update(rows, 2000)
+        self.assertEqual(self.view.response(2000)[0], 503)
+
+    def test_interval_window_uses_300_intervals_and_caches_headers(self):
+        first = self.view.build(nu7_rows(**{"fork-1": nu7_row("fork-1", 400)}), 2000)
+        fetched = len(self.rpc_calls)
+        self.assertEqual(first["chain"]["intervalSampleBlocks"], 300)
+        self.assertEqual(first["chain"]["medianIntervalSeconds"], 30)
+        self.assertEqual(len(first["recentBlocks"]), 8)
+
+        self.rpc_calls.clear()
+        self.view.build(nu7_rows(**{"fork-1": nu7_row("fork-1", 401)}), 2010)
+        header_calls = [call for call in self.rpc_calls if call[0] == "getblockheader"]
+        self.assertEqual(len(header_calls), 1)
+        self.assertGreater(fetched, 600)
+
+    def test_interval_window_starts_at_nu7_activation(self):
+        payload = self.view.build(nu7_rows(), 2000)
+
+        self.assertEqual(payload["chain"]["intervalSampleBlocks"], 2)
+
+    def test_generation_boundary_counters_exclude_the_previous_network(self):
+        view = status.Nu7Status(nu7_validators(), self.config, generation_start=5000)
+        view.started_at = 3000
+        with mock.patch.object(view, "rpc", side_effect=self.fake_rpc):
+            view.build(nu7_rows(), 4000)
+            payload = view.build(nu7_rows(**{"fork-1": nu7_row("fork-1", 13)}), 4500)
+            self.assertEqual(payload["observation"]["blocks24h"], 0)
+            self.assertEqual(payload["observation"]["since"], 5000)
+            payload = view.build(nu7_rows(**{"fork-1": nu7_row("fork-1", 14)}), 5100)
+        self.assertEqual(payload["observation"]["blocks24h"], 1)
+
+    def test_a_lower_tip_is_a_reorg_that_drops_cached_headers(self):
+        self.view.build(nu7_rows(**{"fork-1": nu7_row("fork-1", 12)}), 2000)
+        payload = self.view.build(nu7_rows(**{"fork-1": nu7_row("fork-1", 11)}), 2010)
+
+        self.assertEqual(payload["observation"]["reorgs24h"], 1)
+
+    def test_failures_are_logged_and_the_public_payload_stays_generic(self):
+        self.rpc_patch.stop()
+        with mock.patch.object(self.view, "rpc", side_effect=OSError("private host 10.0.0.1")), \
+                self.assertLogs(level="ERROR") as logs:
+            self.view.update(nu7_rows(), time.time())
+        self.rpc_patch.start()
+        code, payload = self.view.response()
+        self.assertEqual(code, 503)
+        self.assertNotIn("10.0.0.1", json.dumps(payload))
+        self.assertIn("10.0.0.1", "\n".join(logs.output))
+
+    def test_stale_observations_are_unavailable(self):
+        self.view.update(nu7_rows(), 1000)
+
+        self.assertEqual(self.view.response(1000)[0], 200)
+        self.assertEqual(self.view.response(1000 + status.PUBLIC_STATUS_MAX_AGE + 1)[0], 503)
+
+    def test_the_primary_must_be_local_with_rpc(self):
+        nodes = nu7_validators()
+        nodes[0].local = False
+        with self.assertRaises(SystemExit):
+            status.Nu7Status(nodes, self.config)
+
+
+class Nu7SourceTests(unittest.TestCase):
+    REPORT = {"observedAt": 1000.0, "minerActive": True, "nodeActive": True,
+              "acceptedBlocks24h": 7, "nodeHealthy": True, "height": 12,
+              "hash": chain_hash(12), "branchId": NU7_BRANCH, "activationHeight": 10,
+              "recentHashes": {"10": chain_hash(10), "11": chain_hash(11), "12": chain_hash(12)}}
+
+    def test_a_remote_report_becomes_probe_fields(self):
+        probe = status.status_report_probe(self.REPORT, 1010)
+
+        self.assertEqual(probe["height"], 12)
+        self.assertEqual(probe["active_state"], "active")
+        self.assertEqual(probe["ancestor_hashes"], {"1": chain_hash(11), "2": chain_hash(10)})
+        self.assertEqual(probe["nu7"], {"branch_id": NU7_BRANCH, "activation_height": 10})
+        self.assertEqual(probe["miner"]["accepted_blocks_24h"], 7)
+
+    def test_stale_or_malformed_reports_are_errors(self):
+        self.assertIn("error", status.status_report_probe(self.REPORT, 1000 + 91))
+        for key, value in (("height", "12"), ("height", -1), ("hash", "x"),
+                           ("recentHashes", [])):
+            with self.subTest(key=key):
+                self.assertIn("error", status.status_report_probe({**self.REPORT, key: value},
+                                                                  1010))
+        self.assertIn("error", status.status_report_probe("not an object", 1010))
+
+    def test_a_node_without_rpc_reports_its_service_state_only(self):
+        probe = status.status_report_probe({**self.REPORT, "nodeHealthy": False}, 1010)
+
+        self.assertIn("rpc_error", probe)
+        self.assertNotIn("height", probe)
+
+    def test_monitor_tables_select_local_and_status_endpoint_sources(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "nodes.toml"
+            path.write_text(
+                "[defaults]\ninternal_miner = false\n"
+                'testnet_parameters = { network_name = "Nu7StagingV3" }\n'
+                '[[nodes]]\nname = "fork-1"\nssh_string = "root@primary"\ncommit = "main"\n'
+                "internal_miner = true\n"
+                'monitor = { local = true, label = "primary" }\n'
+                '[[nodes]]\nname = "eu"\nssh_string = "root@203.0.113.2"\ncommit = "main"\n'
+                'monitor = { status_url = "http://203.0.113.2:8094/v1/miner", id = "eu", '
+                'region = "Amsterdam, NL" }\n'
+            )
+            primary, remote = status.load_nodes(path)
+            path.write_text(path.read_text().replace(
+                'monitor = { local = true, label = "primary" }',
+                'monitor = { local = true, status_url = "http://x/v1/miner" }'))
+            with self.assertRaises(SystemExit):
+                status.load_nodes(path)
+
+        self.assertTrue(primary.local and primary.internal_miner)
+        self.assertEqual(primary.ssh_cmd("bash", "-s"), ["bash", "-s"])
+        self.assertEqual(remote.status_url, "http://203.0.113.2:8094/v1/miner")
+        self.assertEqual((remote.miner_id, remote.region), ("eu", "Amsterdam, NL"))
+        with mock.patch.object(status, "probe_status_endpoint", return_value={"ok": 1}) as probe:
+            self.assertEqual(status.probe_node(remote), {"ok": 1})
+        probe.assert_called_once_with(remote)
+
+    def test_the_probe_reports_nu7_nsm_and_external_peers(self):
+        probe = RemoteProbeTests("run_probe")
+        probe.setUp()
+        self.addCleanup(probe.tearDown)
+        probe.rpc_results = {
+            "getblockchaininfo": {
+                "blocks": 12, "bestblockhash": chain_hash(12), "chain": "test",
+                "nsmValueBalanceZat": 125,
+                "upgrades": {NU7_BRANCH: {"name": "NU7", "activationheight": 10}},
+            },
+            "getpeerinfo": [{"addr": "127.0.0.1:18333"}, {"addr": "203.0.113.1:18233"},
+                            {"addr": "[2001:db8::1]:18233"}],
+        }
+        out = probe.run_probe(rpc_url=f"http://{probe.endpoint}/")
+
+        self.assertEqual(out["nu7"], {"branch_id": NU7_BRANCH, "activation_height": 10})
+        self.assertEqual(out["nsm_value_balance_zat"], 125)
+        self.assertNotIn("nsm_reissuance_height", out)
+        self.assertEqual(out["peer_count"], 3)
+        self.assertEqual(out["peer_external"], 2)
+
+
+class Nu7HttpTests(unittest.TestCase):
+    def setUp(self):
+        self.original_collector = status.COLLECTOR
+        self.original_limiter = status.RATE_LIMITER
+        status.RATE_LIMITER = status.RateLimiter(limit=100, window=60)
+        self.server = status.ThreadingHTTPServer(("127.0.0.1", 0), status.Handler)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.base_url = f"http://127.0.0.1:{self.server.server_port}"
+        self.addCleanup(self.restore)
+
+    def restore(self):
+        self.server.shutdown()
+        self.server.server_close()
+        status.COLLECTOR = self.original_collector
+        status.RATE_LIMITER = self.original_limiter
+
+    def use(self, nu7):
+        status.COLLECTOR = collector()
+        status.COLLECTOR.nu7 = nu7
+
+    def get(self, path, origin="https://zakura.com"):
+        request = urllib.request.Request(self.base_url + path, headers={"Origin": origin})
+        try:
+            with urllib.request.urlopen(request) as response:
+                return response.status, response.headers, json.load(response)
+        except urllib.error.HTTPError as error:
+            body = error.read()
+            try:
+                return error.code, error.headers, json.loads(body)
+            except ValueError:
+                return error.code, error.headers, body
+
+    def test_status_is_served_with_the_zakura_cors_allowlist(self):
+        view = mock.Mock()
+        view.response.return_value = (200, {"schemaVersion": 1, "status": "live"})
+        self.use(view)
+
+        code, headers, payload = self.get("/v1/status")
+        self.assertEqual((code, payload["status"]), (200, "live"))
+        self.assertEqual(headers["Access-Control-Allow-Origin"], "https://zakura.com")
+        self.assertEqual(headers["Access-Control-Allow-Headers"], "Content-Type")
+        self.assertEqual(headers["Cache-Control"], "public, max-age=10")
+        self.assertIsNone(self.get("/v1/status", "https://untrusted.example")[1]
+                          ["Access-Control-Allow-Origin"])
+
+    def test_unavailable_status_is_503_and_not_cached(self):
+        view = mock.Mock()
+        view.response.return_value = (503, {"schemaVersion": 1, "status": "unavailable"})
+        self.use(view)
+
+        code, headers, _ = self.get("/v1/status")
+        self.assertEqual(code, 503)
+        self.assertEqual(headers["Cache-Control"], "no-store")
+        self.assertEqual(headers["Access-Control-Allow-Origin"], "https://zakura.com")
+
+    def test_status_route_is_absent_without_the_nu7_view(self):
+        self.use(None)
+
+        self.assertEqual(self.get("/v1/status")[0], 404)
+
+
+
+class BoundedServerTests(unittest.TestCase):
+    def serve(self, handler, max_concurrent):
+        server = status.BoundedHTTPServer(("127.0.0.1", 0), handler, max_concurrent=max_concurrent)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        return server
+
+    def test_concurrent_requests_are_capped(self):
+        release, lock = threading.Event(), threading.Lock()
+        state = {"active": 0, "peak": 0}
+
+        class Slow(BaseHTTPRequestHandler):
+            def do_GET(self):
+                with lock:
+                    state["active"] += 1
+                    state["peak"] = max(state["peak"], state["active"])
+                release.wait(5)
+                with lock:
+                    state["active"] -= 1
+                self.send_response(204)
+                self.end_headers()
+
+            def log_message(self, *args):
+                pass
+
+        server = self.serve(Slow, 2)
+
+        def request():
+            with socket.create_connection(server.server_address, timeout=10) as conn:
+                conn.sendall(b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+                conn.recv(64)
+
+        threads = [threading.Thread(target=request) for _ in range(6)]
+        for thread in threads:
+            thread.start()
+        time.sleep(0.5)
+        release.set()
+        for thread in threads:
+            thread.join(10)
+        self.assertEqual(state["peak"], 2)
+
+    def test_a_stalled_client_frees_its_slot_after_the_timeout(self):
+        quick = type("Quick", (status.Handler,), {"timeout": 0.3})
+        server = self.serve(quick, 1)
+        original = status.COLLECTOR
+        status.COLLECTOR = collector()
+        self.addCleanup(setattr, status, "COLLECTOR", original)
+
+        with socket.create_connection(server.server_address, timeout=5) as stalled:
+            stalled.sendall(b"GET /healthz HTTP/1.1\r\n")  # never finishes its headers
+            started = time.monotonic()
+            with urllib.request.urlopen(
+                    f"http://127.0.0.1:{server.server_port}/healthz", timeout=5) as response:
+                self.assertEqual(response.status, 200)
+            # The only slot was held until the stalled client timed out.
+            self.assertGreaterEqual(time.monotonic() - started, 0.25)
+
+    def test_the_entry_point_uses_the_bounded_server_and_timeout(self):
+        self.assertEqual(status.Handler.timeout, status.REQUEST_TIMEOUT_SECONDS)
+        self.assertIn("BoundedHTTPServer((args.host, args.port), Handler)",
+                      SCRIPT_PATH.read_text())
 
 
 if __name__ == "__main__":

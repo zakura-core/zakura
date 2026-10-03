@@ -2,15 +2,58 @@
 
 import http.client
 import json
+import socket
 import threading
 import tempfile
+import time
 import unittest
+from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 from unittest.mock import patch
 
 import faucet
 from faucet import Faucet, PAYOUT_ZAT
-from test_dashboard import max_concurrent_handlers
+
+
+def max_concurrent_handlers(server_class, limit: int, clients: int) -> int:
+    """Serve `clients` parallel requests through `server_class` and count the peak."""
+    release = threading.Event()
+    lock = threading.Lock()
+    active = peak = 0
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            nonlocal active, peak
+            with lock:
+                active += 1
+                peak = max(peak, active)
+            release.wait(5)
+            with lock:
+                active -= 1
+            self.send_response(204)
+            self.end_headers()
+
+        def log_message(self, *args):
+            pass
+
+    server = server_class(("127.0.0.1", 0), Handler, max_concurrent=limit)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+
+    def request():
+        with socket.create_connection(server.server_address, timeout=10) as conn:
+            conn.sendall(b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+            conn.recv(64)
+
+    threads = [threading.Thread(target=request) for _ in range(clients)]
+    for thread in threads:
+        thread.start()
+    time.sleep(0.5)
+    release.set()
+    for thread in threads:
+        thread.join(10)
+    server.shutdown()
+    server.server_close()
+    return peak
 
 
 class FaucetClaimsTest(unittest.TestCase):

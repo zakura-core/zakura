@@ -184,9 +184,10 @@ submissions**, not canonical blocks, from each node's log; a reorg may
 displace an accepted block. Each remote miner has its own full node and
 `miner/remote-status.py` reports service health, tip, NU7 branch ID, and the
 internal miner's accepted blocks over 24 hours, read from the node's log file.
-The primary collector polls those endpoints using
-`miner/remote-miners.json`, requires a fresh report on the same chain within two
-blocks of the primary, and exposes the result in `/v1/status`. The DigitalOcean
+The primary's status collector polls those endpoints, using each node's
+`monitor.status_url` from the same rendered fleet config, requires a fresh report
+on the same chain within two blocks of the primary, and exposes the result in
+`/v1/status`. The DigitalOcean
 firewall allows the status port only from the primary host; P2P port 18233 is
 public. No GitHub SSH key is stored on the remote hosts.
 
@@ -196,8 +197,8 @@ after transfer before extraction. Add the host as a `[[remote]]` entry and deplo
 it with `fork.py render` and `fork.py deploy`. Install the
 `zakura-nu7-miner-status.service` unit, and apply `miner/99-zakura-nu7.conf` for
 prompt block propagation. Start the status service, then confirm its reported
-hash agrees with the primary at the same height. Update `miner/remote-miners.json` if the replacement
-IP changes.
+hash agrees with the primary at the same height. Re-render the fleet config if the replacement IP changes; the
+collector reads its status URL from it.
 
 To move an existing remote miner between DigitalOcean regions, stop and
 disable its node and status services before powering it off and taking
@@ -424,28 +425,34 @@ path rejects a mismatch outright.
 
 ## Public dashboard status feed
 
-`dashboard.py` is a read-only collector for the public NU7 page. It polls the two
-local RPC servers and the three regional miner status endpoints, verifies that
-the nodes report the configured NU7 activation, and
-serves a small JSON response on `127.0.0.1:8093/v1/status`. The accompanying
-systemd unit and Caddyfile publish `/v1/status` and `/healthz` at
-`api.nu7.valargroup.dev`; node RPC remains bound to localhost. The API has no
-block or transaction explorer routes: the website reads only `/v1/status`,
-`/v1/network`, and `/v1/faucet/*`.
+The public NU7 page reads `/v1/status` from the existing fleet collector,
+`deploy/runner/zakura-cluster-status.py`, run on the primary host with
+`--nu7-config`. It reads the same rendered fleet config `deploy.py` deploys, so
+the five validators are listed once. Nodes with `monitor = { local = true }` (the
+primary and the local observer) are probed on the host itself without SSH; the
+three remote miners are read from their `monitor.status_url` health reports, so
+the primary holds no SSH key for them. The collector serves a small JSON response
+on `127.0.0.1:8093/v1/status` with the zakura.com CORS allowlist, and the
+Caddyfile publishes only `/v1/status` and `/healthz` at `api.nu7.valargroup.dev`;
+node RPC remains bound to localhost. The API has no block or transaction explorer
+routes: the website reads only `/v1/status`, `/v1/network`, and `/v1/faucet/*`.
 
-The response includes current tip, header timestamps, recent intervals,
-difficulty, external peer count, local node agreement, regional miner health,
-and the live NSM
-balance when the deployed node reports `nsmValueBalanceZat`. The reorg count
-includes only tip replacements observed while the collector is running. That
-measurement comes from the primary host, so it is not a network-wide orphan
-rate.
+The response keeps schema version 1: current tip, header timestamps, recent
+intervals, difficulty, external peer count, local node agreement, regional miner
+health, and the live NSM balance when the deployed node reports
+`nsmValueBalanceZat`. `status` is `live` only while all five validators are on
+the primary's chain within two blocks; `observation.validatorsAgree`,
+`validatorsAgreeing` and `validatorsConfigured` report that agreement. The reorg
+count includes only tip replacements observed while the collector is running,
+and never observations from before `--nu7-generation-start`. That measurement
+comes from the primary host, so it is not a network-wide orphan rate.
 
-Install from the repository root on the fork host:
+Install from the repository root on the fork host, with the rendered fleet config:
 
 ```sh
-sudo install -d -m 755 /opt/zakura-nu7-dashboard
-sudo install -m 755 deploy/nu7-fork/dashboard.py /opt/zakura-nu7-dashboard/dashboard.py
+sudo install -d -m 755 /opt/zakura-nu7-status
+sudo install -m 755 deploy/runner/zakura-cluster-status.py /opt/zakura-nu7-status/
+sudo install -m 644 deploy/nu7-fork/nodes.generated.toml /etc/zakura/nu7-nodes.toml
 sudo install -m 644 deploy/nu7-fork/dashboard.service /etc/systemd/system/zakura-nu7-dashboard.service
 sudo systemctl daemon-reload
 sudo systemctl enable --now zakura-nu7-dashboard.service

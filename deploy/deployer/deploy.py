@@ -111,6 +111,9 @@ DEFAULTS = {
     "container_name": "",
     # Couple the offline exporter to a binary-only archive node deployment.
     "release_state_publisher": False,
+    # Monitoring metadata read by deploy/runner/zakura-cluster-status.py, such as
+    # `{ local = true }` or a remote node's `status_url`. Ignored by deploy.py.
+    "monitor": None,
 }
 
 

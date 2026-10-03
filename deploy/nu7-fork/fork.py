@@ -116,6 +116,9 @@ def state_dir_name(network_name: str) -> str:
     return network_name.lower()
 
 
+# miner/remote-status.py's port on each remote mining node.
+REMOTE_STATUS_PORT = 8094
+
 # Written into the pristine cache by `catch-up`, once the temporary node has stopped.
 SEED_TIP_FILE = "seed-tip.json"
 
@@ -302,6 +305,8 @@ def render_nodes_toml(config: dict, plan: dict) -> str:
         # Miners sharing one address need distinct coinbase data, or nodes that build
         # the same template in the same second would search the same nonces.
         f'extra_coinbase_data = "{config["droplet"]["name"]}"',
+        # zakura-cluster-status runs on this host and probes it without SSH.
+        'monitor = { local = true, label = "primary" }',
     ])
     if peer_enabled:
         # Dial the validator so the miner does not depend on inbound-only
@@ -335,6 +340,7 @@ def render_nodes_toml(config: dict, plan: dict) -> str:
             # Setting one makes the two nodes compete, which is what exercises losing a
             # race and re-templating on a tip someone else mined.
             f'miner_address = "{peer.get("miner_address", "")}"',
+            'monitor = { local = true, label = "local observer" }',
         ])
         if peer.get("miner_address"):
             lines.extend([
@@ -361,6 +367,13 @@ def render_remote_node(config: dict, remote: dict) -> list[str]:
     peers = remote["initial_testnet_peers"]
     if any(not re.fullmatch(r"[A-Za-z0-9.-]+:[0-9]+", peer) for peer in peers):
         raise ForkError(f"[[remote]] {remote['name']}: peers must be host:port")
+    address = remote["ssh_string"].rsplit("@", 1)[-1]
+    # The status collector reads the node's health report; it never SSHes in.
+    monitor = {
+        "status_url": f"http://{address}:{REMOTE_STATUS_PORT}/v1/miner",
+        "id": remote.get("id", remote["name"]),
+        "region": remote.get("region", ""),
+    }
     return [
         "[[nodes]]",
         f'name = "{remote["name"]}"',
@@ -369,6 +382,7 @@ def render_remote_node(config: dict, remote: dict) -> list[str]:
         f"initial_testnet_peers = {json.dumps(peers)}",
         "internal_miner = true",
         f'extra_coinbase_data = "{remote["name"]}"',
+        f"monitor = {{ {', '.join(f'{key} = {json.dumps(value)}' for key, value in monitor.items())} }}",
         "",
     ]
 

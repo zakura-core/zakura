@@ -12,9 +12,8 @@ import re
 import sys
 import time
 import tomllib
+import urllib.request
 from pathlib import Path
-
-import dashboard
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "deployer"))
 from deploy import render_toml_pair, toml_key  # noqa: E402
@@ -34,6 +33,24 @@ def render_table(header, table):
         if isinstance(value, dict):
             lines += render_table(f"{header}.{toml_key(key)}", value)
     return lines
+
+
+# NU7's target spacing and difficulty-adjustment window, as published to participants.
+TARGET_SPACING_SECONDS = 25
+DAA_WINDOW_BLOCKS = 102
+
+
+def rpc(port, method):
+    request = urllib.request.Request(
+        f"http://127.0.0.1:{port}/",
+        json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": []}).encode(),
+        {"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(request, timeout=5) as response:
+        result = json.load(response)
+    if result.get("error") is not None:
+        raise RuntimeError(f"{method}: {result['error']}")
+    return result["result"]
 
 
 def validate_snapshot(snapshot):
@@ -85,8 +102,8 @@ def manifest(config, info, revision, peers, seed, snapshot=None):
             "name": parameters["network_name"],
             "magic": "".join(f"{byte:02x}" for byte in parameters["network_magic"]),
             "activationHeight": activation, "branchId": branch,
-            "targetSpacingSeconds": dashboard.TARGET_SPACING_SECONDS,
-            "daaWindowBlocks": dashboard.DAA_WINDOW_BLOCKS,
+            "targetSpacingSeconds": TARGET_SPACING_SECONDS,
+            "daaWindowBlocks": DAA_WINDOW_BLOCKS,
         },
         "peers": peers, "seed": seed, "config": rendered,
         "configSha256": hashlib.sha256(rendered.encode()).hexdigest(),
@@ -110,7 +127,7 @@ def main():
     parser.add_argument("--out", type=Path, required=True)
     args = parser.parse_args()
     result = manifest(
-        tomllib.loads(args.config.read_text()), dashboard.rpc(args.rpc_port, "getblockchaininfo"),
+        tomllib.loads(args.config.read_text()), rpc(args.rpc_port, "getblockchaininfo"),
         args.revision, args.peer, json.loads(args.seed.read_text()),
         json.loads(args.snapshot.read_text()) if args.snapshot else None,
     )

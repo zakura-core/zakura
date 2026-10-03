@@ -7,6 +7,7 @@ import importlib.util
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import types
 import unittest
@@ -236,6 +237,8 @@ class RemoteMiners(unittest.TestCase):
             "initial_testnet_peers": ["seed.example:18233", "203.0.113.8:18233"],
             "internal_miner": True,
             "extra_coinbase_data": "zakura-nu7-miner-eu",
+            "monitor": {"status_url": "http://203.0.113.7:8094/v1/miner",
+                        "id": "zakura-nu7-miner-eu", "region": ""},
         })
 
     def test_a_remote_miner_installs_the_deployers_standard_unit(self):
@@ -254,6 +257,27 @@ class RemoteMiners(unittest.TestCase):
         self.assertEqual(rendered["mining"]["miner_address"], "tmGkvoQGmvJu6H5Wp22wUFAsBuX6SPGHnMq")
         self.assertEqual(rendered["network"]["network"]["activation_heights"], {"NU7": 4_400_010})
         self.assertFalse((Path(fork.__file__).parent / "miner" / "zakurad.service").exists())
+
+    def test_the_status_collector_reads_the_same_fleet_config(self):
+        spec = importlib.util.spec_from_file_location(
+            "cluster_status", fork.REPO_ROOT / "deploy" / "runner" / "zakura-cluster-status.py")
+        status = importlib.util.module_from_spec(spec)
+        # The collector's dataclasses resolve annotations through sys.modules.
+        sys.modules[spec.name] = status
+        self.addCleanup(sys.modules.pop, spec.name)
+        spec.loader.exec_module(status)
+        config = base_config(PEER)
+        config["remote"] = [{**REMOTE, "id": "eu", "region": "Amsterdam, NL"}]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "nodes.toml"
+            path.write_text(render(config))
+            primary, observer, remote = status.load_nodes(path)
+        self.assertTrue(primary.local and primary.internal_miner)
+        self.assertEqual(primary.label, "primary")
+        self.assertTrue(observer.local and not observer.internal_miner)
+        self.assertEqual(remote.status_url, "http://203.0.113.7:8094/v1/miner")
+        self.assertEqual((remote.miner_id, remote.region), ("eu", "Amsterdam, NL"))
+        self.assertTrue(remote.internal_miner)
 
     def test_a_remote_miner_without_peers_is_refused(self):
         for broken in ({**REMOTE, "initial_testnet_peers": []},

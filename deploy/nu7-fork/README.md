@@ -210,16 +210,23 @@ internal miner's accepted blocks over 24 hours, read from the node's log file.
 The primary's status collector polls those endpoints, using each node's
 `monitor.status_url` from the same rendered fleet config, requires a fresh report
 on the same chain within two blocks of the primary, and exposes the result in
-`/v1/status`. The DigitalOcean
-firewall allows the status port only from the primary host; P2P port 18233 is
-public. No GitHub SSH key is stored on the remote hosts.
+`/v1/status`. The health service runs as a transient unprivileged user with no
+journal access, serves at most four requests at once, shares one node sample per
+five seconds, and times out stalled clients. Only the primary may reach port 8094:
+the DigitalOcean firewall allows it from the primary host alone, and the unit's
+`IPAddressDeny=any` with the `miner/collector-allowlist.conf` drop-in adds the
+same allowlist on each host. systemd ignores those directives unless it was built
+with `+BPF_FRAMEWORK`, so on hosts without it an nftables rule admitting port
+8094 only from the primary takes their place; a refused request from any other
+host is the check. P2P port 18233 is public. No GitHub SSH key is
+stored on the remote hosts.
 
 For a replacement host, stop a local observer briefly to archive its `state`
 and `non_finalized_state` directories consistently. Verify the archive hash
 after transfer before extraction. Add the host as a `[[remote]]` entry and deploy
 it with `fork.py render` and `fork.py deploy`. Install the
-`zakura-nu7-miner-status.service` unit, and apply `miner/99-zakura-nu7.conf` for
-prompt block propagation. Start the status service, then confirm its reported
+`zakura-nu7-miner-status.service` unit with its `collector-allowlist.conf` drop-in,
+and apply `miner/99-zakura-nu7.conf` for prompt block propagation. Start the status service, then confirm its reported
 hash agrees with the primary at the same height. Re-render the fleet config if the replacement IP changes; the
 collector reads its status URL from it.
 
@@ -455,7 +462,11 @@ primary and the local observer) are probed on the host itself without SSH; the
 three remote miners are read from their `monitor.status_url` health reports, so
 the primary holds no SSH key for them. The collector serves a small JSON response
 on `127.0.0.1:8093/v1/status` with the zakura.com CORS allowlist, and the
-Caddyfile publishes only `/v1/status` and `/healthz` at `api.nu7.valargroup.dev`;
+Caddyfile publishes only `/v1/status` and `/healthz` at `api.nu7.valargroup.dev`.
+Its fleet page stays on localhost; reach it through an SSH tunnel. The unit runs
+as a transient unprivileged user whose only extra permission is the
+`systemd-journal` group, which the node probe uses for zakurad's commit and node
+ID and for kernel OOM counts;
 node RPC remains bound to localhost. The API has no block or transaction explorer
 routes: the website reads only `/v1/status`, `/v1/network`, and `/v1/faucet/*`.
 

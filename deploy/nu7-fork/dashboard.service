@@ -5,10 +5,16 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=root
+# No root. The journal group is the only extra permission: the node probe reads
+# the zakurad units' journals for the commit and node ID, and the kernel log for
+# OOM kills. Node configs and logs are world-readable, and RPC is on localhost.
+DynamicUser=yes
+SupplementaryGroups=systemd-journal
 # Observations from before the current network generation are not counted.
 Environment=NU7_GENERATION_START=0
 EnvironmentFile=-/etc/zakura/nu7-generation.env
+# Bound to localhost: Caddy publishes only /v1/status and /healthz. Reach the
+# fleet page over an SSH tunnel, for example `ssh -L 8093:127.0.0.1:8093 <host>`.
 ExecStart=/usr/bin/python3 /opt/zakura-nu7-status/zakura-cluster-status.py --config /etc/zakura/nu7-nodes.toml --network testnet --host 127.0.0.1 --port 8093 --nu7-config /etc/zakura/zakura.toml --nu7-generation-start ${NU7_GENERATION_START}
 Restart=always
 RestartSec=5
@@ -16,6 +22,10 @@ NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 
 [Install]
 WantedBy=multi-user.target

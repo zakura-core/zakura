@@ -49,6 +49,8 @@ class FakeRPC:
             return {"height": int(params[0], 16), "hash": params[0], "time": 990 - (102 - int(params[0], 16)) * 25, "difficulty": 3}
         if method == "getnetworkparameters":
             return parameters(params[0])
+        if method == "getinfo":
+            return {"build": "test-" + "a" * 12}
         raise AssertionError(method)
 
 
@@ -152,6 +154,15 @@ class ActivationTests(unittest.TestCase):
         reference = self.feed.observe(self.config["public"]["reference"], self.now, False)
         self.feed.clock = lambda: self.now + 61
         self.assertIsNone(self.feed.agreement(nodes, reference, self.now))
+
+    def test_manifest_revision_is_verified_against_running_binary(self):
+        original = self.rpc
+        def wrong_binary(url, method, params=None):
+            return {"build": "test-" + "b" * 12} if method == "getinfo" else original(url, method, params)
+        self.feed.rpc = wrong_binary
+        observed = self.feed.observe(self.config["public"]["nodes"][0], self.now)
+        self.assertFalse(observed["fresh"])
+        self.assertNotIn("sourceRevision", observed)
 
     def test_rpc_tip_change_excludes_parameter_source(self):
         original = self.rpc

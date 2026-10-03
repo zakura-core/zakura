@@ -134,3 +134,15 @@ ssh root@167.99.103.111 'runuser -u nu7-activation -- python3 /opt/zakura-nu7-st
 It exits nonzero until all three node sources expose the expected public NU7
 schedule and consensus export; successful reference identity alone is insufficient.
 The command does not arm the selector or mutate persisted selection.
+
+Runtime qualification checks each getinfo.build for the approved full revision's
+nine-character prefix in addition to the consensus export and chain identity.
+For an approved new deployment, qualify it read-only before changing the manifest:
+
+```bash
+ssh root@167.99.103.111 'runuser -u nu7-activation -- python3 /opt/zakura-nu7-status/nu7-qualify.py --expected-revision FULL_APPROVED_SHA'
+```
+
+The override applies only to that command's in-memory configuration; it never
+changes the selector or runtime manifest. Retain deployment artifact checksum
+evidence as well: a short build identifier is not a full binary attestation.

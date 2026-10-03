@@ -18,7 +18,7 @@ use std::{
 use zakura_chain::{
     amount::{Amount, NonNegative},
     block::{Block, Height, MAX_BLOCK_BYTES},
-    parameters::NetworkUpgrade,
+    parameters::{Network, NetworkUpgrade},
     serialization::{ZcashDeserialize, ZcashSerialize},
     transaction::{self, LockTime, Transaction},
     transparent,
@@ -61,6 +61,7 @@ fn main() {
 
         let start = Instant::now();
         black_box(ContextuallyVerifiedBlock::with_block_and_spent_utxos(
+            black_box(&Network::Mainnet),
             black_box(prepared),
             black_box(spent_utxos),
         ))
@@ -165,6 +166,7 @@ fn benchmark_fixture(
         transaction_hashes: vec![transaction::Hash([0; 32]); transaction_count + 1].into(),
         deferred_pool_balance_change: None,
         auth_data_root: None,
+        receipt_order: None,
     };
 
     (block, prepared, spent_utxos)

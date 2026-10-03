@@ -67,6 +67,10 @@ impl<'a> HistoryTreeBlockParts<'a> {
 /// A trait to represent a version of `Tree`.
 pub trait Version: zcash_history::Version {
     /// Convert a block into the NodeData for this version.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the block's network upgrade has no consensus branch ID.
     fn block_to_history_node(
         block: Arc<Block>,
         network: &Network,
@@ -81,6 +85,10 @@ pub trait Version: zcash_history::Version {
     }
 
     /// Build the NodeData leaf for this version from block parts.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the height's network upgrade has no consensus branch ID.
     fn parts_to_history_node(parts: HistoryTreeBlockParts<'_>, network: &Network)
         -> Self::NodeData;
 }
@@ -181,6 +189,8 @@ impl<V: Version> Tree<V> {
     /// Note that the length is usually larger than the length of `peaks` and `extra`, since
     /// you don't need to pass every node, just the peaks of the tree (plus extra).
     ///
+    /// Returns an error if `network_upgrade` has no consensus branch ID.
+    ///
     /// # Panics
     ///
     /// Will panic if `peaks` is empty.
@@ -192,9 +202,9 @@ impl<V: Version> Tree<V> {
         peaks: &BTreeMap<u32, Entry>,
         extra: &BTreeMap<u32, Entry>,
     ) -> Result<Self, io::Error> {
-        let branch_id = network_upgrade
-            .branch_id()
-            .expect("unexpected pre-Overwinter MMR history tree");
+        let branch_id = network_upgrade.branch_id().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "missing consensus branch ID")
+        })?;
         let mut peaks_vec = Vec::new();
         for (idx, entry) in peaks {
             let inner_entry = zcash_history::Entry::from_bytes(branch_id.into(), entry.inner)?;
@@ -232,6 +242,12 @@ impl<V: Version> Tree<V> {
             .coinbase_height()
             .expect("block must have coinbase height during contextual verification");
         let network_upgrade = NetworkUpgrade::current(network, height);
+        if network_upgrade.branch_id().is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "missing consensus branch ID",
+            ));
+        }
         let entry0 =
             Entry::new_leaf::<V>(block, network, sapling_root, orchard_root, ironwood_root);
         let mut peaks = BTreeMap::new();
@@ -251,6 +267,12 @@ impl<V: Version> Tree<V> {
         parts: HistoryTreeBlockParts<'_>,
     ) -> Result<(Self, Entry), io::Error> {
         let network_upgrade = NetworkUpgrade::current(network, parts.height);
+        if network_upgrade.branch_id().is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "missing consensus branch ID",
+            ));
+        }
         let entry0 = Entry::new_leaf_parts::<V>(parts, network);
         let mut peaks = BTreeMap::new();
         peaks.insert(0u32, entry0);
@@ -390,7 +412,7 @@ impl Version for zcash_history::V1 {
         let network_upgrade = NetworkUpgrade::current(network, height);
         let branch_id = network_upgrade
             .branch_id()
-            .expect("must have branch ID for chain history network upgrades");
+            .expect("history trees only exist for network upgrades with a branch ID");
         let block_hash = header.hash().0;
         let time: u32 = header
             .time

@@ -2,7 +2,7 @@ name: Test Crate Build
 
 on:
   pull_request:
-    branches: [main, "feat/**", "release/**"]
+    branches: [main, "feat/**", "split/**", "release/**"]
     paths:
       - "**/*.rs"
       - "**/Cargo.toml"
@@ -90,7 +90,7 @@ jobs:
           cache-on-failure: true
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      - uses: taiki-e/install-action@c3ec0de9ae7f1019cea21aa96aa0a895b9552063 #v2.87.9
+      - uses: taiki-e/install-action@7623a79cdfecb99d681017af368ca353d9f49bb5 #v2.87.19
         with:
           tool: cargo-hack
 

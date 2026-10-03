@@ -1249,3 +1249,40 @@ proptest! {
         );
     }
 }
+
+#[test]
+fn missing_branch_id_does_not_implicate_auxiliary_deliveries() {
+    use zakura_chain::history_tree::HistoryTreeError;
+
+    let _init_guard = zakura_test::init();
+    let mut fixture = Fixture::new();
+    fixture.insert_headers(None, None);
+    let height = Height(NU7);
+    let hash =
+        fixture.chain[usize::try_from(NU7).expect("the fixture height fits in usize")].hash();
+    let VctAuxiliaryWindowRead::Ready(window) = fixture
+        .writer
+        .vct_auxiliary_window(height, hash)
+        .expect("the NU7 delivery window is available")
+    else {
+        panic!("expected ready window")
+    };
+    let successor = height.next().expect("NU7 is below the maximum height");
+    let error = SuppliedRootsError::HistoryTree(Arc::new(HistoryTreeError::MissingBranchId {
+        network_upgrade: NetworkUpgrade::Nu7,
+    }));
+    for failed_height in [height, successor] {
+        assert!(
+            attribute_verification_failure(&window, height, successor, failed_height, &error)
+                .is_none()
+        );
+    }
+    let malformed_tree =
+        SuppliedRootsError::HistoryTree(Arc::new(HistoryTreeError::InvalidCachedTree {
+            reason: "invalid peer-supplied history tree",
+        }));
+    assert!(
+        attribute_verification_failure(&window, height, successor, height, &malformed_tree)
+            .is_some()
+    );
+}

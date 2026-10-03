@@ -24,23 +24,27 @@ use tracing::Instrument;
 use zakura_chain::{
     block::{self, HeightDiff},
     chain_tip::ChainTip,
+    parameters::Network,
 };
 use zakura_network::{self as zn, PeerSocketAddr};
 use zakura_state as zs;
 
 use crate::components::{
-    auth_download_height::parent_height_mismatch, sync::MIN_CONCURRENCY_LIMIT,
+    auth_download_height::height_is_unbound,
+    sync::{lookahead_limit_multiplier, MIN_CONCURRENCY_LIMIT},
 };
 
 type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
-/// A supplied body claims a height inconsistent with its committed parent.
-/// Inbound uses this typed evidence to score the supplier and retry the hash.
+/// A gossiped body claims a coinbase height that its header does not commit to.
+///
+/// The body is not the block its header names, so only its supplier is at fault. See
+/// `crate::components::auth_download_height`. Inbound uses this typed evidence to score the
+/// supplier and retry the hash.
 #[derive(Copy, Clone, Debug, thiserror::Error)]
-#[error("gossiped block claimed height {height:?} instead of {expected_height:?}: {hash:?}")]
-pub struct GossipedParentHeightMismatch {
-    pub height: Option<block::Height>,
-    pub expected_height: block::Height,
+#[error("gossiped block claimed a height its header does not commit to: {height:?} {hash:?}")]
+pub struct GossipedUnboundHeight {
+    pub height: block::Height,
     pub hash: block::Hash,
 }
 
@@ -152,6 +156,29 @@ pub const MAX_INBOUND_BLOCK_CONCURRENCY_PER_PEER: usize = 5;
 /// queued rather than applied immediately, so a replacement request can still route back to it.
 pub const POISONED_GOSSIP_BLOCK_RETRY_LIMIT: usize = 3;
 
+/// Returns the highest gossiped block height accepted above `tip_height`.
+///
+/// The configured limit counts blocks, so this height window scales with the
+/// target spacing at the tip, like the syncer's lookahead limit. The queue
+/// capacity stays unscaled, because [`MAX_INBOUND_CONCURRENCY`] bounds its RAM.
+pub(crate) fn max_lookahead_height(
+    network: &Network,
+    tip_height: Option<block::Height>,
+    full_verify_concurrency_limit: usize,
+) -> block::Height {
+    if let Some(tip_height) = tip_height {
+        let lookahead = HeightDiff::try_from(
+            full_verify_concurrency_limit * lookahead_limit_multiplier(network, tip_height),
+        )
+        .expect("fits in HeightDiff");
+        (tip_height + lookahead).expect("tip is much lower than Height::MAX")
+    } else {
+        let genesis_lookahead =
+            u32::try_from(full_verify_concurrency_limit - 1).expect("fits in u32");
+        block::Height(genesis_lookahead)
+    }
+}
+
 /// The action taken in response to a peer's gossiped block hash.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum DownloadAction {
@@ -249,6 +276,9 @@ where
 
     /// Allows efficient access to the best tip of the blockchain.
     latest_chain_tip: zs::LatestChainTip,
+
+    /// The network whose target spacing scales the gossip lookahead window.
+    chain_network: Network,
 
     // Internal downloads state
     //
@@ -364,6 +394,7 @@ where
         verifier: ZV,
         state: ZS,
         latest_chain_tip: zs::LatestChainTip,
+        chain_network: Network,
     ) -> Self {
         // The syncer already warns about the minimum.
         let full_verify_concurrency_limit =
@@ -376,6 +407,7 @@ where
             verifier,
             state,
             latest_chain_tip,
+            chain_network,
             pending: FuturesUnordered::new(),
             cancel_handles: HashMap::new(),
             source_locks: HashMap::new(),
@@ -581,6 +613,7 @@ where
         let (cancel_tx, mut cancel_rx) = oneshot::channel::<()>();
 
         let network = self.network.clone();
+        let chain_network = self.chain_network.clone();
         let verifier = self.verifier.clone();
         let missing_parent_slots = self.missing_parent_slots.clone();
         let state = self.state.clone();
@@ -591,11 +624,7 @@ where
             // Check if the full block body is already in the state. `KnownBlock`
             // can be true for header-only Zakura sync state, but inbound gossip
             // still needs to fetch and verify the block body in that case.
-            match state
-                .clone()
-                .oneshot(zs::Request::AnyChainBlock(hash.into()))
-                .await
-            {
+            match state.oneshot(zs::Request::AnyChainBlock(hash.into())).await {
                 Ok(zs::Response::Block(None)) => Ok(()),
                 Ok(zs::Response::Block(Some(_))) => Err("already present".into()),
                 Ok(_) => unreachable!("wrong response"),
@@ -670,21 +699,8 @@ where
             // that will timeout before being verified, and low blocks that can never be finalized.
             let tip_height = latest_chain_tip.best_tip_height();
 
-            // Read separately from `tip_height`, and used only by the new tip-child height check
-            // below. Deriving `tip_height` from this pair instead would couple the existing
-            // lookahead and behind-tip policies to hash availability: a chain tip reporting a
-            // height but not yet a hash would fall into the no-tip regime.
-            let best_tip = latest_chain_tip.best_tip_height_and_hash();
-
-            let max_lookahead_height = if let Some(tip_height) = tip_height {
-                let lookahead = HeightDiff::try_from(full_verify_concurrency_limit)
-                    .expect("fits in HeightDiff");
-                (tip_height + lookahead).expect("tip is much lower than Height::MAX")
-            } else {
-                let genesis_lookahead =
-                    u32::try_from(full_verify_concurrency_limit - 1).expect("fits in u32");
-                block::Height(genesis_lookahead)
-            };
+            let max_lookahead_height =
+                max_lookahead_height(&chain_network, tip_height, full_verify_concurrency_limit);
 
             // Get the finalized tip height, assuming we're using the non-finalized state.
             //
@@ -701,29 +717,43 @@ where
                 })
                 .unwrap_or(block::Height(0));
 
-            let claimed_height = block.coinbase_height();
-            if let Some(expected_height) = parent_height_mismatch(
-                state,
-                block.header.previous_block_hash,
-                claimed_height,
-                best_tip,
-            )
-            .await
-            {
+            let block_height = block
+                .coinbase_height()
+                .ok_or_else(|| (BoxError::from("gossiped block with no height"), None))?;
+
+            // Security: authenticate the claimed coinbase height before the height policies
+            // below run. See `crate::components::auth_download_height`.
+            //
+            // This matters more here than on the syncer path: an `inv` for the new tip normally
+            // reaches gossip before the syncer asks for it, and `download_and_verify` drops
+            // honest peers' `inv`s for the same hash as `AlreadyQueued` while a download is
+            // outstanding. So a single poisoned response can consume the node's only chance at
+            // the new block until the next sync round, which is what leaves a mining backend
+            // issuing work on an obsolete tip.
+            //
+            // Gossip carries about one block per target spacing, so this path checks the Merkle
+            // root of every body. That also rejects an in-window rewrite here, where it can be
+            // re-requested, instead of in the verifier, which reports it without a retry.
+            if height_is_unbound(&block, block_height, true) {
+                debug!(
+                    ?hash,
+                    ?block_height,
+                    "gossiped body claimed a height its header does not commit to: \
+                     dropped downloaded block"
+                );
+                metrics::counter!("gossip.unbound.height.count").increment(1);
+
                 if let Some(feedback) = &supplier_feedback {
                     feedback.reject();
                 }
                 return Err((
-                    BoxError::from(GossipedParentHeightMismatch {
-                        height: claimed_height,
-                        expected_height,
+                    BoxError::from(GossipedUnboundHeight {
+                        height: block_height,
                         hash,
                     }),
                     advertiser_addr,
                 ));
             }
-            let block_height = claimed_height
-                .ok_or_else(|| (BoxError::from("gossiped block with no height"), None))?;
 
             if block_height > max_lookahead_height {
                 debug!(
@@ -849,12 +879,15 @@ where
 mod tests {
     use super::*;
     use futures::StreamExt as _;
+    use indexmap::IndexSet;
     use std::{collections::HashSet, future, time::Duration};
     use tower::{service_fn, util::BoxCloneService};
     use zakura_chain::{block::Block, parameters::Network, serialization::ZcashDeserializeInto};
     use zakura_network::InventoryResponse::Available;
 
-    use crate::components::auth_download_height::poison_coinbase_height;
+    use crate::components::auth_download_height::{
+        poison_coinbase_height, poison_coinbase_height_and_expiry,
+    };
 
     type PendingNetwork = BoxCloneService<zn::Request, zn::Response, BoxError>;
     type PendingVerifier = BoxCloneService<zakura_consensus::Request, block::Hash, BoxError>;
@@ -900,6 +933,7 @@ mod tests {
                 future::pending::<Result<zs::Response, BoxError>>()
             })),
             latest_chain_tip,
+            Network::Mainnet,
         )
     }
 
@@ -1020,6 +1054,7 @@ mod tests {
                 future::pending::<Result<zs::Response, BoxError>>()
             })),
             latest_chain_tip,
+            Network::Mainnet,
         );
 
         for index in 0..MIN_CONCURRENCY_LIMIT {
@@ -1117,11 +1152,11 @@ mod tests {
             BoxCloneService::new(service_fn(|request| async move {
                 match request {
                     zs::Request::AnyChainBlock(_) => Ok(zs::Response::Block(None)),
-                    zs::Request::AnyChainHeight(_) => Ok(zs::Response::AnyChainHeight(None)),
                     request => Err(format!("unexpected state request: {request:?}").into()),
                 }
             })),
             latest_chain_tip,
+            Network::Mainnet,
         );
 
         assert_eq!(
@@ -1140,7 +1175,7 @@ mod tests {
         assert_eq!(
             first_request,
             zn::Request::BlocksByHashFrom {
-                hashes: HashSet::from([hash_one]),
+                hashes: IndexSet::from([hash_one]),
                 source: zn::PeerSource::Zakura(peer_id.clone()),
             }
         );
@@ -1170,7 +1205,7 @@ mod tests {
         assert_eq!(
             second_request,
             zn::Request::BlocksByHashFrom {
-                hashes: HashSet::from([hash_two]),
+                hashes: IndexSet::from([hash_two]),
                 source: zn::PeerSource::Zakura(peer_id),
             }
         );
@@ -1226,11 +1261,11 @@ mod tests {
             BoxCloneService::new(service_fn(|request| async move {
                 match request {
                     zs::Request::AnyChainBlock(_) => Ok(zs::Response::Block(None)),
-                    zs::Request::AnyChainHeight(_) => Ok(zs::Response::AnyChainHeight(None)),
                     request => Err(format!("unexpected state request: {request:?}").into()),
                 }
             })),
             latest_chain_tip,
+            Network::Mainnet,
         );
 
         assert_eq!(
@@ -1247,7 +1282,7 @@ mod tests {
         assert_eq!(
             request,
             zn::Request::BlocksByHashFrom {
-                hashes: HashSet::from([hash]),
+                hashes: IndexSet::from([hash]),
                 source: zn::PeerSource::Zakura(peer_id),
             }
         );
@@ -1301,11 +1336,11 @@ mod tests {
             BoxCloneService::new(service_fn(|request| async move {
                 match request {
                     zs::Request::AnyChainBlock(_) => Ok(zs::Response::Block(None)),
-                    zs::Request::AnyChainHeight(_) => Ok(zs::Response::AnyChainHeight(None)),
                     request => Err(format!("unexpected state request: {request:?}").into()),
                 }
             })),
             latest_chain_tip,
+            Network::Mainnet,
         );
 
         assert_eq!(
@@ -1403,11 +1438,11 @@ mod tests {
             BoxCloneService::new(service_fn(|request| async move {
                 match request {
                     zs::Request::AnyChainBlock(_) => Ok(zs::Response::Block(None)),
-                    zs::Request::AnyChainHeight(_) => Ok(zs::Response::AnyChainHeight(None)),
                     request => Err(format!("unexpected state request: {request:?}").into()),
                 }
             })),
             latest_chain_tip,
+            Network::Mainnet,
         )
     }
 
@@ -1458,51 +1493,37 @@ mod tests {
         );
 
         let mismatch = error
-            .downcast_ref::<GossipedParentHeightMismatch>()
+            .downcast_ref::<GossipedUnboundHeight>()
             .expect("the error must be the typed mismatch that Inbound scores");
 
-        assert_eq!(mismatch.height, Some(block::Height(1)));
-        assert_eq!(mismatch.expected_height, block::Height(1_687_107));
+        assert_eq!(mismatch.height, block::Height(1));
         assert_eq!(mismatch.hash, canonical_hash);
     }
 
+    /// The stateless check also covers blocks whose parent is not our tip, including blocks
+    /// whose parent we do not have yet.
     #[tokio::test]
-    async fn gossiped_non_tip_parent_proves_rewritten_height() {
-        let parent: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1687106_BYTES
-            .zcash_deserialize_into()
-            .unwrap();
+    async fn gossiped_non_tip_child_rejects_poisoned_coinbase_height() {
         let canonical: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1687107_BYTES
             .zcash_deserialize_into()
             .unwrap();
         let addr: PeerSocketAddr = "192.0.2.1:8233".parse().unwrap();
-        for height in [block::Height(1), block::Height(4_000_000)] {
+        for poisoned in [
+            poison_coinbase_height(&canonical, block::Height(1)),
+            poison_coinbase_height(&canonical, block::Height(4_000_000)),
+            poison_coinbase_height_and_expiry(&canonical, block::Height(1)),
+            poison_coinbase_height_and_expiry(&canonical, block::Height(4_000_000)),
+        ] {
+            let height = poisoned.coinbase_height().unwrap();
             let (_sender, tip) = chain_tip_at(block::Height(1_687_110), hash(42));
-            let mut downloads =
-                downloads_returning(poison_coinbase_height(&canonical, height), addr, tip);
-            let parent = parent.clone();
-            downloads.state = BoxCloneService::new(service_fn(move |request| {
-                let parent = parent.clone();
-                async move {
-                    match request {
-                        zs::Request::AnyChainHeight(key) if key == parent.hash() => {
-                            Ok(zs::Response::AnyChainHeight(parent.coinbase_height()))
-                        }
-                        zs::Request::AnyChainBlock(_) => Ok(zs::Response::Block(None)),
-                        zs::Request::AnyChainHeight(_) => Ok(zs::Response::AnyChainHeight(None)),
-                        _ => panic!("unexpected state request"),
-                    }
-                }
-            }));
+            let mut downloads = downloads_returning(poisoned, addr, tip);
             assert_eq!(
                 downloads.download_and_verify(canonical.hash(), None),
                 DownloadAction::AddedToQueue
             );
             let (error, supplier) = downloads.next().await.unwrap().unwrap_err();
-            let mismatch = error
-                .downcast_ref::<GossipedParentHeightMismatch>()
-                .unwrap();
-            assert_eq!(mismatch.height, Some(height));
-            assert_eq!(mismatch.expected_height, block::Height(1_687_107));
+            let mismatch = error.downcast_ref::<GossipedUnboundHeight>().unwrap();
+            assert_eq!(mismatch.height, height);
             assert_eq!(supplier, Some(addr));
         }
     }
@@ -1642,8 +1663,8 @@ mod tests {
         );
     }
 
-    /// A gossiped block that is not a tip child keeps the existing behind-tip policy, and stays
-    /// unattributed as before.
+    /// A genuine old gossiped block keeps the existing behind-tip policy, and stays unattributed
+    /// as before.
     #[tokio::test]
     async fn gossiped_non_tip_child_keeps_the_behind_tip_policy() {
         let block1: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
@@ -1672,10 +1693,8 @@ mod tests {
             .expect_err("a block behind the finalized tip is still dropped");
 
         assert!(
-            error
-                .downcast_ref::<GossipedParentHeightMismatch>()
-                .is_none(),
-            "a non-tip-child must not be reported as a height mismatch"
+            error.downcast_ref::<GossipedUnboundHeight>().is_none(),
+            "a genuine old block must not be reported as a height mismatch"
         );
         assert_eq!(addr, None, "the behind-tip policy is unchanged");
     }

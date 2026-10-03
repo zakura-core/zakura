@@ -81,6 +81,24 @@ impl<'a> ProjectedTransitionState<'a> {
         Ok(())
     }
 
+    /// Drop evicted bodies outside the surviving full-state verified path.
+    pub(super) fn forget_evicted_bodies(
+        &mut self,
+        hashes: &[block::Hash],
+    ) -> Result<(), TransitionFailure> {
+        for &hash in hashes {
+            if self.graph.view_header_node(hash).is_some_and(|node| {
+                matches!(
+                    node.body_validation_state,
+                    BodyValidationState::Verified { .. }
+                )
+            }) {
+                self.set_body_validation_state(hash, BodyValidationState::Unknown)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Replace one retained header's time-dependent validation state.
     pub(super) fn set_header_validation_state(
         &mut self,
@@ -96,16 +114,34 @@ impl<'a> ProjectedTransitionState<'a> {
     pub(super) fn record_aux_delivery(
         &mut self,
         delivery: crate::AuxDelivery,
-    ) -> Result<(), TransitionFailure> {
+    ) -> Result<usize, TransitionFailure> {
         self.graph
             .edit_record_auxiliary_evidence_delivery(delivery.header_hash, delivery.delivery_id)?;
-        self.aux_changes.push(AuxDelta::Put(Box::new(delivery)));
-        Ok(())
+        Ok(self.update_aux_delivery(delivery))
     }
 
-    /// Stage an updated auxiliary delivery row.
-    pub(super) fn update_aux_delivery(&mut self, delivery: crate::AuxDelivery) {
+    /// Stage an updated auxiliary delivery row and return its batch-local index.
+    pub(super) fn update_aux_delivery(&mut self, delivery: crate::AuxDelivery) -> usize {
+        let index = self.aux_changes.len();
         self.aux_changes.push(AuxDelta::Put(Box::new(delivery)));
+        index
+    }
+
+    /// Read a staged row while header admission coalesces semantic duplicates.
+    pub(super) fn staged_aux_delivery(&self, index: usize) -> crate::AuxDelivery {
+        let AuxDelta::Put(delivery) = &self.aux_changes[index] else {
+            unreachable!("admission indices refer to staged delivery puts");
+        };
+        **delivery
+    }
+
+    /// Replace a staged correction without adding a second write for its evidence ID.
+    pub(super) fn replace_staged_aux_delivery(
+        &mut self,
+        index: usize,
+        delivery: crate::AuxDelivery,
+    ) {
+        self.aux_changes[index] = AuxDelta::Put(Box::new(delivery));
     }
 
     /// Add an operator invalidation and dirty verified selection when it changes state.
@@ -139,10 +175,8 @@ impl<'a> ProjectedTransitionState<'a> {
         Ok(())
     }
 
-    /// Reselect the strongest fully verified eligible path when operator policy dirtied it.
-    pub(super) fn refresh_verified_after_operator_change(
-        &mut self,
-    ) -> Result<(), TransitionFailure> {
+    /// Reselect after operator policy changes, with evicted bodies already removed.
+    pub(super) fn refresh_verified_selection(&mut self) -> Result<(), TransitionFailure> {
         if self.verified_selection_dirty {
             self.verified = Cow::Owned(select_fully_verified_path(&self.graph)?);
             self.verified_selection_dirty = false;

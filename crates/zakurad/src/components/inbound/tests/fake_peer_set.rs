@@ -34,12 +34,13 @@ use crate::{
     components::{
         auth_download_height::poison_coinbase_height,
         inbound::{downloads::MAX_INBOUND_CONCURRENCY, Inbound, InboundSetupData},
+        mempool::gossip::TRANSACTION_GOSSIP_DELAY,
         mempool::{
             downloads::MAX_INBOUND_CONCURRENCY_PER_PEER, run_mempool_transaction_id_gossip,
             Config as MempoolConfig, Mempool, MempoolError, SameEffectsChainRejectionError,
             UnboxMempoolError,
         },
-        sync::{self, BlockGossipError, SyncStatus, PEER_GOSSIP_DELAY},
+        sync::{self, BlockGossipError, SyncStatus},
     },
     BoxError,
 };
@@ -48,8 +49,8 @@ use InventoryResponse::*;
 
 /// How long the mock peer set waits for an expected request before panicking.
 ///
-/// Must comfortably exceed [`PEER_GOSSIP_DELAY`]: after that sleep the gossip task still needs a tip
-/// change notification and a short submission delay before it advertises. A tight 500ms bound
+/// Must comfortably exceed [`TRANSACTION_GOSSIP_DELAY`]: after that sleep the gossip tasks still
+/// need a tip change or mempool notification before they advertise. A tight 500ms bound
 /// races under CI scheduling and fails with `timeout while waiting for a request` even though the
 /// advertise would arrive a moment later. The dedicated gossip tests use the same 30s budget;
 /// with a paused runtime the extra headroom does not slow the happy path.
@@ -59,7 +60,7 @@ async fn wait_for_gossip() {
     // Let background gossip tasks arm their timers before this paused runtime
     // advances to the next gossip deadline.
     tokio::task::yield_now().await;
-    tokio::time::sleep(PEER_GOSSIP_DELAY).await;
+    tokio::time::sleep(TRANSACTION_GOSSIP_DELAY).await;
 }
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
@@ -755,8 +756,7 @@ async fn mempool_transaction_expiration() -> Result<(), crate::BoxError> {
         .await
         .unwrap();
 
-    // Test the block is gossiped, after waiting for the multi-gossip delay
-    wait_for_gossip().await;
+    // Test the block is gossiped
     peer_set
         .expect_request(Request::AdvertiseBlock(block_three.hash(), None))
         .await
@@ -865,8 +865,7 @@ async fn mempool_transaction_expiration() -> Result<(), crate::BoxError> {
             .await
             .unwrap();
 
-        // Test the block is gossiped, after waiting for the multi-gossip delay
-        wait_for_gossip().await;
+        // Test the block is gossiped
         peer_set
             .expect_request(Request::AdvertiseBlock(block.hash(), None))
             .await
@@ -914,7 +913,7 @@ async fn mempool_transaction_expiration() -> Result<(), crate::BoxError> {
 /// that the block is re-requested instead of being left for the syncer.
 ///
 /// This pins the *consumer* side of the check. `Inbound::poll_ready` identifies the rejection by
-/// downcasting the boxed error to [`GossipedParentHeightMismatch`], so it depends on the inbound
+/// downcasting the boxed error to [`GossipedUnboundHeight`], so it depends on the inbound
 /// downloader passing that error through unwrapped. If it were ever wrapped in context — the way
 /// the syncer wraps its errors into `BlockDownloadVerifyError` — the downcast would silently stop
 /// matching, scoring would stop, and every other test would stay green.
@@ -1200,6 +1199,7 @@ async fn caches_getaddr_response() {
             mempool: buffered_mempool_service.clone(),
             state: state_service.clone(),
             latest_chain_tip,
+            network: network.clone(),
             misbehavior_sender,
         };
         let r = setup_tx.send(setup_data);
@@ -1441,8 +1441,6 @@ async fn setup_with_misbehavior_receiver(
     //
     // (The genesis block gets skipped, because block 1 is committed before the task is spawned.)
     for block in committed_blocks.iter().skip(1) {
-        tokio::time::sleep(PEER_GOSSIP_DELAY).await;
-
         peer_set
             .expect_request(Request::AdvertiseBlock(block.hash(), None))
             .await
@@ -1459,7 +1457,10 @@ async fn setup_with_misbehavior_receiver(
     // Add transactions to the mempool, skipping verification and broadcast
     let mut added_transactions = Vec::new();
     if add_transactions {
-        added_transactions.extend(add_some_stuff_to_mempool(&mut mempool_service, network));
+        added_transactions.extend(add_some_stuff_to_mempool(
+            &mut mempool_service,
+            network.clone(),
+        ));
     }
 
     let mempool_service = BoxService::new(mempool_service);
@@ -1491,6 +1492,7 @@ async fn setup_with_misbehavior_receiver(
         mempool: mempool_service.clone(),
         state: state_service.clone(),
         latest_chain_tip,
+        network: network.clone(),
         misbehavior_sender,
     };
     let r = setup_tx.send(setup_data);

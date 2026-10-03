@@ -22,6 +22,7 @@ pub(super) struct PreAuditStoreRows {
     pub(super) consensus_invalid_body_tombstones: Vec<ConsensusInvalidBodyTombstone>,
     pub(super) validation_contexts: Vec<ValidationContextRecord>,
     pub(super) trust_anchor_changed: bool,
+    pub(super) network_policy_changed: bool,
     pub(super) early_violations: Vec<AuditViolation>,
 }
 
@@ -32,6 +33,7 @@ pub(super) struct AuditedSource {
     pub(super) source_header_nodes: Vec<HeaderNode>,
     pub(super) consensus_invalid_body_tombstones: Vec<ConsensusInvalidBodyTombstone>,
     pub(super) trust_anchor_changed: bool,
+    pub(super) network_policy_changed: bool,
 }
 
 /// Deterministic derived views reconstructed only from an audited source.
@@ -61,11 +63,11 @@ pub(super) fn load_pre_audit_store_rows<S: StoreAuditSnapshot>(
     let snapshot_before_repair = store.snapshot()?;
     let metadata = store.metadata()?;
     let trust_anchor_changed = metadata.anchor_manifest_digest != config.trust_anchor_digest();
+    let network_policy_changed = metadata.network_policy_digest != config.network_policy_digest();
     if snapshot_before_repair != metadata.snapshot()
         || metadata.disk_format != crate::HeaderChainDiskVersion::CURRENT
         || metadata.mode != config.mode
         || metadata.network_id != config.network().kind()
-        || metadata.network_policy_digest != config.network_policy_digest()
         || trust_anchor_changed && !allow_trust_anchor_update
     {
         return Err(source_failure(AuditViolation::Configuration));
@@ -130,9 +132,9 @@ pub(super) fn load_pre_audit_store_rows<S: StoreAuditSnapshot>(
             early_violations.push(AuditViolation::BodyValidationEvidenceAuthority(node.hash));
         }
     }
-    let mut validation_contexts = Vec::with_capacity(crate::POW_PREDECESSOR_CONTEXT_SPAN);
+    let mut validation_contexts = Vec::with_capacity(crate::MAX_POW_PREDECESSOR_CONTEXT_SPAN);
     store.visit_validation_context_records(
-        RowLimit::new(crate::POW_PREDECESSOR_CONTEXT_SPAN),
+        RowLimit::new(crate::MAX_POW_PREDECESSOR_CONTEXT_SPAN),
         &mut |record| {
             validation_contexts.push(record);
             Ok(())
@@ -145,6 +147,7 @@ pub(super) fn load_pre_audit_store_rows<S: StoreAuditSnapshot>(
         consensus_invalid_body_tombstones,
         validation_contexts,
         trust_anchor_changed,
+        network_policy_changed,
         early_violations,
     })
 }

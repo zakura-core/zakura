@@ -457,17 +457,20 @@ Protected runs may exceed the target; cleanup never discards them to meet it.
 
 During sync, the controller checks trace files with logrotate every polling
 interval (10 seconds for native runs, 30 seconds for legacy). Each stream rotates
-at 128 MiB and keeps two older
-segments beside the current file. Files can exceed that size between checks.
-This preserves recent detailed history, not necessarily the entire sync.
+at 128 MiB into a gzip-compressed segment beside the current file. The controller
+keeps up to 1,000 segments per stream, which covers a full genesis sync. Files can
+exceed 128 MiB between checks. Compression shrinks the large trace streams 13 to
+18 times, so a full sync's roughly 20 GB of traces takes 1 to 2 GiB of disk.
 `copytruncate` keeps the existing append-only writer working without a restart;
 a small number of records can be lost at the copy/truncate boundary. Only the
 controller rotates traces, so retention cannot race a separate trace cleaner.
 
-For example, read `block_sync.jsonl.2`, then `.1`, then `block_sync.jsonl` for
-chronological history. To use tools that expect one file, concatenate those
-segments into a separate analysis directory. The stopped failure's files remain
-unchanged until a newer failure replaces its protected status.
+The highest-numbered segment is the oldest. For example, read
+`block_sync.jsonl.N.gz` down to `block_sync.jsonl.1.gz`, then `block_sync.jsonl`
+for chronological history. To use tools that expect one file, decompress and
+concatenate those segments into a separate analysis directory. The stopped
+failure's files remain unchanged until a newer failure replaces its protected
+status.
 
 The controller also retains two cached binaries and removes interrupted
 controller build worktrees and temporary binary copies. The cache is reserved
@@ -560,7 +563,14 @@ For a shared Space, merge the supplied rule with its existing rules first.
 aws --endpoint-url https://YOUR_REGION.digitaloceanspaces.com s3api put-bucket-lifecycle-configuration --bucket YOUR_SPACE --lifecycle-configuration file://deploy/continuous-sync/spaces-lifecycle.json
 ```
 
-The controller verifies seven-day expiration before uploading. It streams gzip
+Give the hosts a key limited to the trace Space, for example
+`doctl spaces keys create zakura-sync-traces --grants 'bucket=YOUR_SPACE;permission=readwrite'`.
+A limited key cannot read lifecycle rules, so run the lifecycle command with an
+account key and confirm the rule with `get-bucket-lifecycle-configuration`.
+
+Before each sync and upload, the controller verifies seven-day expiration when
+its key can read lifecycle rules. With a limited key, it only confirms that the
+key reaches the Space. It streams gzip
 compressed tar archives into `sync-traces/<hostname>/<run-id>.tar.gz` after the
 node stops. Upload failures halt the next run and preserve local traces.
 Daily reports and failure alerts include private download links valid for

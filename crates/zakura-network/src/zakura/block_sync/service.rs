@@ -2,7 +2,7 @@ use super::{config::*, events::*, peer_registry::SessionAdmission, wire::*, *};
 use crate::zakura::{
     handle_pipe_exit, spawn_supervised_pipe, FramedRecv, FramedSend, OrderedSendError, Peer,
     PeerStreamSession, Service, ServicePeerSnapshot, SessionDemand, SessionOpening, SessionPolicy,
-    SinkReject, Stream, StreamMode, ZakuraBlockSyncCandidateState, ZakuraConnId, ZakuraPeerId,
+    SinkReject, Stream, ZakuraBlockSyncCandidateState, ZakuraConnId, ZakuraPeerId,
     FRAME_HEADER_BYTES,
 };
 use std::{
@@ -26,7 +26,7 @@ const BLOCK_SYNC_SERVICE_STREAMS: [Stream; 1] = [Stream {
     version: ZAKURA_BLOCK_SYNC_STREAM_VERSION,
     frame_cap: MAX_BS_FRAME_BYTES,
     capability: ZAKURA_CAP_BLOCK_SYNC,
-    mode: StreamMode::Persistent,
+    ..Stream::PERSISTENT
 }];
 
 /// Service-declared streams for native block sync.

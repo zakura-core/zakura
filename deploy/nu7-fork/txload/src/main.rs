@@ -95,7 +95,9 @@ fn faucet_recipient(encoded: &str, network: &Network) -> Result<orchard::Address
             orchard: Some(receiver),
             ..
         } => Ok(receiver),
-        _ => bail!("recipient must be a Unified Address with an Orchard receiver"),
+        _ => {
+            bail!("recipient must be a Unified Address with an Orchard receiver");
+        }
     }
 }
 
@@ -112,7 +114,7 @@ fn change_recipient(secret: &secp256k1::SecretKey) -> Result<orchard::Address> {
             return Ok(FullViewingKey::from(&key).address_at(0u32, Scope::External));
         }
     }
-    bail!("could not derive a valid shielded change key")
+    bail!("could not derive a valid shielded change key");
 }
 
 fn throwaway_recipient() -> Result<orchard::Address> {
@@ -452,7 +454,9 @@ async fn main() -> Result<()> {
         (Some(key), None) => key.clone(),
         (None, Some(path)) => std::fs::read_to_string(path)
             .wrap_err_with(|| format!("could not read key file at {}", path.display()))?,
-        _ => bail!("supply exactly one of --secret-key and --secret-key-file"),
+        _ => {
+            bail!("supply exactly one of --secret-key and --secret-key-file");
+        }
     };
     let secret = secp256k1::SecretKey::from_slice(
         &hex::decode(secret_text.trim()).wrap_err("the secret key is not hex")?,
@@ -604,7 +608,9 @@ async fn main() -> Result<()> {
         };
         match verified {
             Ok(()) => tracing::info!("local proof verification passed"),
-            Err(error) => bail!("local proof verification FAILED: {error:?}"),
+            Err(error) => {
+                bail!("local proof verification FAILED: {error:?}");
+            }
         }
 
         // P2PKH scriptSig: <DER signature || hash type> <compressed public key>.
@@ -660,14 +666,16 @@ async fn main() -> Result<()> {
         let vk = orchard::circuit::VerifyingKey::build(CIRCUIT_VERSION);
         match reparsed_bundle.verify_proof(&vk) {
             Ok(()) => tracing::info!("re-parsed proof verification passed"),
-            Err(error) => bail!(
-                "re-parsed proof verification FAILED: {error:?}; the bundle changed across \
+            Err(error) => {
+                bail!(
+                    "re-parsed proof verification FAILED: {error:?}; the bundle changed across \
                  serialization (flags {:?} -> {:?}, anchor {} -> {})",
-                authorized.flags(),
-                reparsed_bundle.flags(),
-                hex::encode(authorized.anchor().to_bytes()),
-                hex::encode(reparsed_bundle.anchor().to_bytes()),
-            ),
+                    authorized.flags(),
+                    reparsed_bundle.flags(),
+                    hex::encode(authorized.anchor().to_bytes()),
+                    hex::encode(reparsed_bundle.anchor().to_bytes()),
+                );
+            }
         }
 
         let raw = hex::encode(&wire);

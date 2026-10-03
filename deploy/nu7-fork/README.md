@@ -359,6 +359,14 @@ sender does not spend those change notes; retain the faucet key for future
 recovery tooling. This limits the faucet to fresh mature coinbase outputs until
 shielded change spending is implemented.
 
+### Why the faucet and sender stay
+
+`faucet.py` and `zakura-fork-txload` overlap with `valar-testnet-faucet` and
+zecd. zecd cannot sync a configured network yet, so it cannot follow
+`Nu7StagingV3`, and the existing faucet cannot pay Ironwood on this fork. They are
+kept deliberately until zecd supports configured networks; that support is a
+separate follow-up, and nothing here depends on it.
+
 ## Running multiple miners
 
 Set `peer.miner_address` on the local observer to let it run the internal miner

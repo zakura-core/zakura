@@ -7138,6 +7138,7 @@ dependencies = [
  "tracing-opentelemetry",
  "tracing-subscriber",
  "tracing-test",
+ "webpki-roots",
  "zakura-chain",
  "zakura-consensus",
  "zakura-header-chain",

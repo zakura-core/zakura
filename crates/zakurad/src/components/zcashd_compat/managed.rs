@@ -2,6 +2,7 @@ use std::{
     fs::{self, OpenOptions},
     io::{BufReader, Read, Write},
     path::{Path, PathBuf},
+    sync::Arc,
     thread::sleep,
     time::{Duration, Instant},
 };
@@ -239,9 +240,18 @@ fn download_archive(url: &str, out: &mut fs::File) -> Result<(), Report> {
         }
     }
 
-    // Reqwest uses the process TLS provider; retain an existing provider.
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    // Retain the bundled trust roots and ring provider across reqwest upgrades.
+    let tls = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .map_err(|err| eyre!("failed configuring managed zcashd TLS versions: {err}"))?
+    .with_root_certificates(rustls::RootCertStore {
+        roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+    })
+    .with_no_client_auth();
     let client = Client::builder()
+        .tls_backend_preconfigured(tls)
         .redirect(Policy::limited(5))
         .timeout(MANAGED_DOWNLOAD_TIMEOUT)
         .build()

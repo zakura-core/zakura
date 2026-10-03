@@ -193,6 +193,7 @@ async fn closing_inbound_transport_blocks_native_dial_until_last_handle_retires(
     let (connection_tx, mut connection_rx) = mpsc::channel(1);
     let (stream_tx, mut stream_rx) = mpsc::channel(1);
     let router = Router::builder(server)
+        .incoming_filter(ZakuraProtocolHandler::incoming_transport_filter())
         .incoming_admission(node.handler.incoming_transport_admission())
         .accept(
             ALPN,

@@ -2221,19 +2221,37 @@ impl ZakuraProtocolHandler {
             .map_err(|_| ZakuraHandlerError::ResourceLimit("transport admission"))
     }
 
+    fn incoming_transport_filter() -> iroh::protocol::IncomingFilter {
+        Arc::new(|incoming| match incoming.remote_addr() {
+            iroh::endpoint::IncomingAddr::Ip(_) if !incoming.remote_addr_validated() => {
+                iroh::protocol::IncomingFilterOutcome::Retry
+            }
+            iroh::endpoint::IncomingAddr::Ip(_) => iroh::protocol::IncomingFilterOutcome::Accept,
+            _ => iroh::protocol::IncomingFilterOutcome::Reject,
+        })
+    }
+
     fn incoming_transport_admission(&self) -> iroh::protocol::IncomingAdmission {
         let handler = self.clone();
-        Arc::new(move |_| match handler.reserve_transport() {
-            Ok(owner) => Some(owner),
-            Err(_) => {
-                metrics::counter!("zakura.p2p.conn.rejected.transport_admission").increment(1);
-                None
+        Arc::new(move |incoming| {
+            if !incoming.remote_addr_validated()
+                || !matches!(incoming.remote_addr(), iroh::endpoint::IncomingAddr::Ip(_))
+            {
+                return None;
+            }
+            match handler.reserve_transport() {
+                Ok(owner) => Some(owner),
+                Err(_) => {
+                    metrics::counter!("zakura.p2p.conn.rejected.transport_admission").increment(1);
+                    None
+                }
             }
         })
     }
 
     pub(crate) fn spawn_router(&self, endpoint: Endpoint) -> Router {
         Router::builder(endpoint)
+            .incoming_filter(Self::incoming_transport_filter())
             .incoming_admission(self.incoming_transport_admission())
             .accept(P2P_V2_ALPN, self.clone())
             .spawn()
@@ -5858,6 +5876,7 @@ impl ZakuraHandlerError {
 
 #[cfg(test)]
 mod tests {
+    mod admission;
     pub(super) mod connection;
     mod quic_progress;
     mod transport_ownership;

@@ -33,8 +33,15 @@ impl RpcRequestClient {
     pub fn new_with_timeout(rpc_address: SocketAddr, timeout: Duration) -> Self {
         // Reqwest uses the process TLS provider; retain an existing provider.
         let _ = rustls::crypto::ring::default_provider().install_default();
+        // Bundled roots keep even HTTP-only clients independent of system CAs.
+        let tls = rustls::ClientConfig::builder()
+            .with_root_certificates(rustls::RootCertStore {
+                roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+            })
+            .with_no_client_auth();
         Self {
             client: Client::builder()
+                .tls_backend_preconfigured(tls)
                 .timeout(timeout)
                 .build()
                 .expect("reqwest::Client build should not fail when only setting timeout"),

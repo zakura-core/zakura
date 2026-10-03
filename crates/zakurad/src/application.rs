@@ -498,7 +498,8 @@ impl Application for ZakuradApp {
             // Log only selected diagnostics. The full config can contain credentials.
             info!(
                 network = %config.network.network,
-                p2p_stack = ?config.network.p2p_stack,
+                p2p_stack = ?config.network.p2p_stack.resolve(&config.network.network),
+                peerset_initial_target_size = config.network.peerset_initial_target_size,
                 ephemeral_state = config.state.ephemeral,
                 "loaded node configuration",
             );

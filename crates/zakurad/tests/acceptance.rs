@@ -266,14 +266,14 @@ fn opentelemetry_endpoint_does_not_panic_on_startup() -> Result<()> {
 
 // Synthetic values cover every URL component that could contain credentials.
 const OTEL_TEST_ENDPOINT: &str =
-    "http://test-user:test-password@otel-host.invalid/test-path?token=test-token#test-fragment";
+    "http://otel-sentinel-user-1273c:otel-sentinel-password-1273c@otel-sentinel-host-1273c.invalid/otel-sentinel-path-1273c?token=otel-sentinel-token-1273c#otel-sentinel-fragment-1273c";
 const OTEL_TEST_PRIVATE_VALUES: [&str; 6] = [
-    "test-user",
-    "test-password",
-    "otel-host.invalid",
-    "test-path",
-    "test-token",
-    "test-fragment",
+    "otel-sentinel-user-1273c",
+    "otel-sentinel-password-1273c",
+    "otel-sentinel-host-1273c.invalid",
+    "otel-sentinel-path-1273c",
+    "otel-sentinel-token-1273c",
+    "otel-sentinel-fragment-1273c",
 ];
 
 #[test]
@@ -316,6 +316,8 @@ fn opentelemetry_start_does_not_log_endpoint() -> Result<()> {
     config.network.initial_mainnet_peers.clear();
     config.network.initial_testnet_peers.clear();
     config.network.cache_dir = false.into();
+    config.network.p2p_stack = Default::default();
+    config.network.peerset_initial_target_size = 25;
     config.tracing.opentelemetry_endpoint = Some(OTEL_TEST_ENDPOINT.to_owned());
     config.tracing.opentelemetry_sample_percent = Some(0);
     config.tracing.filter = Some("info".to_owned());
@@ -336,7 +338,12 @@ fn opentelemetry_start_does_not_log_endpoint() -> Result<()> {
     child.expect_stdout_line_matches("unable to activate OpenTelemetry tracing")?;
 
     let summary = child.expect_stdout_line_matches("loaded node configuration")?;
-    for diagnostic in ["Mainnet", "Legacy", "ephemeral_state"] {
+    for diagnostic in [
+        "Mainnet",
+        "Legacy",
+        "peerset_initial_target_size=25",
+        "ephemeral_state",
+    ] {
         assert!(summary.contains(diagnostic));
     }
     // This event follows configuration logging, so the negative assertions cover that path.

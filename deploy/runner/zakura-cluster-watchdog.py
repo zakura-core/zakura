@@ -210,11 +210,15 @@ def load_fleets(config_path: Path) -> list[Fleet]:
     return fleets
 
 
-def node_state_key(fleet_name: str, node_name: str) -> str:
-    """Keep the installed Mac incident key stable across its dashboard rename."""
+def node_state_key(fleet_name: str, node_name: str, state: dict[str, Any]) -> str:
+    """Reuse an existing Mac incident key, including pre-rename alert state."""
+    key = f"{fleet_name}/{node_name}"
     if fleet_name == "mainnet" and node_name == MAC_NODE_NAME:
-        return "mainnet/zakura-mac-os"
-    return f"{fleet_name}/{node_name}"
+        legacy_key = "mainnet/zakura-mac-os"
+        nodes = state.get("nodes", {})
+        if legacy_key in nodes and (nodes[legacy_key].get("alerting") or key not in nodes):
+            return legacy_key
+    return key
 
 
 def load_state(state_path: Path) -> dict[str, Any]:
@@ -1540,7 +1544,7 @@ class Watchdog:
         if references is not None:
             for name in previous.get("node_names", []):
                 row = current.get(name)
-                old_alert = state.get("nodes", {}).get(node_state_key(fleet.name, name), {})
+                old_alert = state.get("nodes", {}).get(node_state_key(fleet.name, name, state), {})
                 if (
                     row and not old_alert.get("alerting")
                     and coerce_height(row["height"]) == height
@@ -1618,7 +1622,7 @@ class Watchdog:
     ) -> None:
         key = fleet.name
         if fleet.name == "mainnet":
-            mac_recovery_ready(state.get("nodes", {}).get(node_state_key("mainnet", MAC_NODE_NAME), {}), now, False)
+            mac_recovery_ready(state.get("nodes", {}).get(node_state_key("mainnet", MAC_NODE_NAME, state), {}), now, False)
             mac_recovery_ready(state.get("mac_forks", {}).get("mainnet", {}), now, False)
         bucket = state.setdefault("fleets", {})
         entry = bucket.get(key, {})
@@ -1706,7 +1710,7 @@ class Watchdog:
         for observation in observations:
             if observation.name == MAC_NODE_NAME:
                 continue
-            key = node_state_key(fleet.name, observation.name)
+            key = node_state_key(fleet.name, observation.name, state)
             previous = dict(bucket.get(key, {}))
             if not previous.get("alerting"):
                 continue
@@ -1760,7 +1764,7 @@ class Watchdog:
         bucket = state.setdefault("nodes", {})
         owners = []
         for observation in observations:
-            entry = bucket.get(node_state_key(fleet.name, observation.name), {})
+            entry = bucket.get(node_state_key(fleet.name, observation.name, state), {})
             alert_height = cls.node_event_height(entry)
             if (
                 entry.get("condition") == "stalled"
@@ -1833,7 +1837,7 @@ class Watchdog:
             )
             if not self.notify(text, self.args):
                 return False
-            bucket[node_state_key(fleet.name, duplicate.name)] = {
+            bucket[node_state_key(fleet.name, duplicate.name, state)] = {
                 "condition": "ok",
                 "alerting": False,
             }
@@ -2020,7 +2024,7 @@ class Watchdog:
     ) -> None:
         if observation.name == MAC_NODE_NAME and os.environ.get("ZAKURA_MAC_CRANELIFT_ALERTS_MUTED", os.environ.get("MAC_VERIFIER_ALERTS_MUTED")) == "1":
             return
-        key = node_state_key(fleet.name, observation.name)
+        key = node_state_key(fleet.name, observation.name, state)
         bucket = state.setdefault("nodes", {})
         previous = dict(bucket.get(key, {}))
         if observation.name == MAC_NODE_NAME and previous.get("alerting"):

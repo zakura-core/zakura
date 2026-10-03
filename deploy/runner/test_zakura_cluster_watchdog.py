@@ -2162,6 +2162,17 @@ class MacForkAlertTests(unittest.TestCase):
         self.assertIn("mac-os-cranelift", sent[0])
         self.assertNotIn("mainnet/mac-os-cranelift", state["nodes"])
 
+    def test_existing_canonical_mac_incident_is_reused(self):
+        legacy = "mainnet/zakura-mac-os"
+        canonical = "mainnet/mac-os-cranelift"
+        for nodes in ({canonical: {"alerting": True}},
+                      {canonical: {"alerting": True}, legacy: {"alerting": False}}):
+            self.assertEqual(watchdog.node_state_key("mainnet", "mac-os-cranelift",
+                                                    {"nodes": nodes}), canonical)
+        self.assertEqual(watchdog.node_state_key("mainnet", "mac-os-cranelift",
+                                                {"nodes": {legacy: {"alerting": True},
+                                                           canonical: {"alerting": False}}}), legacy)
+
     def test_dashboard_failure_resets_existing_mac_recovery(self):
         agent = watchdog.Watchdog([], make_args())
         agent.notify = lambda *_: True
@@ -2171,7 +2182,7 @@ class MacForkAlertTests(unittest.TestCase):
         agent.handle_fleet_error(state, fleet, ValueError("unavailable"), 1000, False)
         self.assertNotIn("mac_recovery", state["nodes"][key])
         self.assertTrue(state["nodes"][key]["alerting"])
-        self.assertEqual(watchdog.node_state_key("testnet", "mac-os-cranelift"),
+        self.assertEqual(watchdog.node_state_key("testnet", "mac-os-cranelift", {}),
                          "testnet/mac-os-cranelift")
 
     def test_mac_offline_uses_three_minutes_without_changing_other_nodes(self):

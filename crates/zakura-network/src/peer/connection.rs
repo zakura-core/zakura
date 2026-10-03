@@ -28,9 +28,9 @@ use crate::{
     },
     meta_addr::MetaAddr,
     peer::{
-        connection::peer_tx::PeerTx, error::AlreadyErrored, ClientRequest, ClientRequestReceiver,
-        ConnectionInfo, ErrorSlot, InProgressClientRequest, MustUseClientResponseSender, PeerError,
-        SharedPeerError,
+        connection::peer_tx::PeerTx, error::AlreadyErrored, sidecar::WarningLimiter, ClientRequest,
+        ClientRequestReceiver, ConnectionInfo, ErrorSlot, InProgressClientRequest,
+        MustUseClientResponseSender, PeerError, SharedPeerError,
     },
     peer_set::ConnectionTracker,
     protocol::{
@@ -43,6 +43,9 @@ use crate::{
 use InventoryResponse::*;
 
 mod peer_tx;
+
+/// Rate-limits warnings about blocks that the protected zcashd-compat sidecar rejects.
+static SIDECAR_BLOCK_REJECT_WARNINGS: WarningLimiter = WarningLimiter::new();
 
 #[cfg(test)]
 mod tests;
@@ -1211,6 +1214,21 @@ where
             // could be a response, so if we see them here, they were either
             // sent unsolicited, or they were sent in response to a canceled request
             // that we've already forgotten about.
+            // A zcashd-compat sidecar rejects a block it considers invalid, for example
+            // because it does not support the current network upgrade.
+            Message::Reject { ref message, .. }
+                if self.connection_info.is_protected_peer && message == "block" =>
+            {
+                metrics::counter!("zcashd_compat.sidecar.block_rejects").increment(1);
+                if SIDECAR_BLOCK_REJECT_WARNINGS.allow() {
+                    warn!(
+                        %msg,
+                        "the zcashd-compat sidecar rejected a block: check that its version \
+                         supports the current network upgrade"
+                    );
+                }
+                Unused
+            }
             Message::Reject { .. } => {
                 debug!(%msg, "got reject message unsolicited or from canceled request");
                 Unused

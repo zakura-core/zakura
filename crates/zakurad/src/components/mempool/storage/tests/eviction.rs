@@ -697,12 +697,15 @@ fn evicted_transactions_suppress_authorization_variants() {
 }
 
 #[test]
-fn standardness_rejections_still_match_exact_authorizing_data() {
+fn verification_and_standardness_rejections_still_match_exact_authorizing_data() {
     let _init_guard = zakura_test::init();
     let mut factory = TxFactory::new();
     let original = factory.tx(10_000);
     let variant = change_authorization(&original);
     for reason in [
+        RejectionError::ExactTip(ExactTipRejectionError::FailedVerification(
+            zakura_consensus::error::TransactionError::WrongVersion,
+        )),
         RejectionError::ExactTip(ExactTipRejectionError::FailedStandard(
             NonStandardTransactionError::IsDust,
         )),

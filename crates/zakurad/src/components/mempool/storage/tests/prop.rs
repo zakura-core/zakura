@@ -77,6 +77,7 @@ fn reject_lists_enforce_production_capacity() {
         ..Default::default()
     };
     let mut tip_rejected = Storage::new(&config);
+    let mut fee_rejected = Storage::new(&config);
     let mut chain_rejected = Storage::new(&config);
     let production_capacity: u32 = MAX_EVICTION_MEMORY_ENTRIES
         .try_into()
@@ -85,11 +86,16 @@ fn reject_lists_enforce_production_capacity() {
     for index in 0..=production_capacity {
         let id = cheap_rejection_id(index);
         tip_rejected.reject(id, SameEffectsTipRejectionError::SpendConflict.into());
+        fee_rejected.reject(id, ExactTipRejectionError::BelowEvictionCost.into());
         chain_rejected.reject(id, SameEffectsChainRejectionError::Expired.into());
 
         if index == production_capacity - 1 {
             assert_eq!(
                 tip_rejected.rejected_transaction_count(),
+                MAX_EVICTION_MEMORY_ENTRIES
+            );
+            assert_eq!(
+                fee_rejected.rejected_transaction_count(),
                 MAX_EVICTION_MEMORY_ENTRIES
             );
             assert_eq!(
@@ -102,6 +108,7 @@ fn reject_lists_enforce_production_capacity() {
     let oldest = cheap_rejection_id(0);
     let newest = cheap_rejection_id(production_capacity);
     assert_eq!(tip_rejected.rejected_transaction_count(), 0);
+    assert_eq!(fee_rejected.rejected_transaction_count(), 0);
     assert_eq!(
         chain_rejected.rejected_transaction_count(),
         MAX_EVICTION_MEMORY_ENTRIES

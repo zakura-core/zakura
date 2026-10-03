@@ -4995,6 +4995,7 @@ dependencies = [
  "zakura-bls12-381",
  "zakura-chain",
  "zakura-consensus",
+ "zakura-header-chain",
  "zakura-jubjub",
  "zakura-network",
  "zakura-node-services",

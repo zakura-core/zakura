@@ -591,7 +591,9 @@ async fn peer_mempool_full_queue_is_refused_without_disconnect() -> Result<(), c
     Ok(())
 }
 
-#[tokio::test(flavor = "current_thread", start_paused = true)]
+// The state writer acknowledges checkpoint commits before publishing the tip.
+// Use real time so the mock deadline cannot advance past that writer thread.
+#[tokio::test(flavor = "current_thread")]
 async fn mempool_transaction_expiration() -> Result<(), crate::BoxError> {
     // Get a block that has at least one non coinbase transaction
     let block: Block = zakura_test::vectors::BLOCK_MAINNET_982681_BYTES.zcash_deserialize_into()?;
@@ -891,7 +893,8 @@ async fn mempool_transaction_expiration() -> Result<(), crate::BoxError> {
         };
     }
 
-    // check that nothing unexpected happened
+    // All commits and broadcasts have finished, so skip the idle mock timeout.
+    tokio::time::pause();
     peer_set.expect_no_requests().await;
 
     let sync_gossip_result = sync_gossip_task_handle.now_or_never();

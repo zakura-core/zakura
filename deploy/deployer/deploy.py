@@ -664,6 +664,7 @@ def render_service(node: Node) -> str:
 INSTALL_SCRIPT = r"""
 set -euo pipefail
 
+STAGE={stage}
 BIN_PATH={bin_path}
 CONFIG_PATH={config_path}
 SERVICE={service}
@@ -688,16 +689,15 @@ require_data_mount_for "$(dirname "$LOG_FILE")"
 
 mkdir -p "$(dirname "$BIN_PATH")" "$(dirname "$CONFIG_PATH")" "$(dirname "$LOG_FILE")"
 
-# Stage uploaded artifacts (uploaded to /tmp by the deploy step).
-install -m 644 /tmp/zakurad-deploy.service "/etc/systemd/system/${{SERVICE}}.service"
-install -m 644 /tmp/zakurad-deploy.toml "$CONFIG_PATH"
+# Install the artifacts this deploy uploaded to its own staging directory.
+install -m 644 "$STAGE/zakurad.service" "/etc/systemd/system/${{SERVICE}}.service"
+install -m 644 "$STAGE/zakura.toml" "$CONFIG_PATH"
 
 # Back up the currently installed binary before replacing it.
 if [ -x "$BIN_PATH" ]; then
     cp -a "$BIN_PATH" "${{BIN_PATH}}.bak"
 fi
-install -m 755 /tmp/zakurad-deploy.new "$BIN_PATH"
-rm -f /tmp/zakurad-deploy.new /tmp/zakurad-deploy.service /tmp/zakurad-deploy.toml
+install -m 755 "$STAGE/zakurad.new" "$BIN_PATH"
 
 systemctl daemon-reload
 
@@ -755,6 +755,7 @@ systemctl is-active "$SERVICE"
 PROCESS_INSTALL_SCRIPT = r"""
 set -euo pipefail
 
+STAGE={stage}
 BIN_PATH={bin_path}
 CONFIG_PATH={config_path}
 LOG_FILE={log_file}
@@ -788,13 +789,12 @@ if [ -n "$WORKING_DIR" ]; then
     mkdir -p "$WORKING_DIR"
 fi
 
-install -m 644 /tmp/zakurad-deploy.toml "$CONFIG_PATH"
+install -m 644 "$STAGE/zakura.toml" "$CONFIG_PATH"
 
 if [ -x "$BIN_PATH" ]; then
     cp -a "$BIN_PATH" "${{BIN_PATH}}.bak"
 fi
-install -m 755 /tmp/zakurad-deploy.new "$BIN_PATH"
-rm -f /tmp/zakurad-deploy.new /tmp/zakurad-deploy.toml
+install -m 755 "$STAGE/zakurad.new" "$BIN_PATH"
 
 if [ "$NO_RESTART" = "1" ]; then
     mkdir -p "$STATE_DIR"
@@ -848,6 +848,7 @@ fi
 BINARY_ONLY_INSTALL_SCRIPT = r"""
 set -euo pipefail
 
+STAGE={stage}
 BIN_PATH={bin_path}
 SERVICE={service}
 NO_RESTART={no_restart}
@@ -857,8 +858,7 @@ mkdir -p "$(dirname "$BIN_PATH")"
 if [ -x "$BIN_PATH" ]; then
     cp -a "$BIN_PATH" "${{BIN_PATH}}.bak"
 fi
-install -m 755 /tmp/zakurad-deploy.new "$BIN_PATH"
-rm -f /tmp/zakurad-deploy.new
+install -m 755 "$STAGE/zakurad.new" "$BIN_PATH"
 
 if [ "$NO_RESTART" = "1" ]; then
     echo "installed binary (restart skipped)"
@@ -897,13 +897,13 @@ systemctl is-active "$SERVICE"
 DOCKER_BINARY_ONLY_INSTALL_SCRIPT = r"""
 set -euo pipefail
 
+STAGE={stage}
 CONTAINER={container}
 BIN_PATH={bin_path}
 NO_RESTART={no_restart}
 
 docker inspect "$CONTAINER" >/dev/null
-docker cp /tmp/zakurad-deploy.new "$CONTAINER:/tmp/zakurad-deploy.new"
-rm -f /tmp/zakurad-deploy.new
+docker cp "$STAGE/zakurad.new" "$CONTAINER:/tmp/zakurad-deploy.new"
 
 docker exec --user 0 "$CONTAINER" sh -c \
     'if [ -x "$1" ]; then cp -a "$1" "$1.bak"; fi
@@ -927,9 +927,8 @@ if [ "$restart_failed" = "1" ] ||
    ! docker inspect --format '{{{{.State.Running}}}}' "$CONTAINER" | grep -qx true; then
     echo "container unhealthy after deploy; rolling back to $BIN_PATH.bak" >&2
     docker stop "$CONTAINER" >/dev/null || true
-    if docker cp "$CONTAINER:$BIN_PATH.bak" /tmp/zakurad-deploy.rollback; then
-        docker cp /tmp/zakurad-deploy.rollback "$CONTAINER:$BIN_PATH"
-        rm -f /tmp/zakurad-deploy.rollback
+    if docker cp "$CONTAINER:$BIN_PATH.bak" "$STAGE/zakurad.rollback"; then
+        docker cp "$STAGE/zakurad.rollback" "$CONTAINER:$BIN_PATH"
     fi
     docker start "$CONTAINER" >/dev/null || true
     exit 1
@@ -937,6 +936,26 @@ fi
 
 docker exec "$CONTAINER" "$BIN_PATH" --version || true
 """
+
+
+REMOTE_STAGE = re.compile(r"/tmp/zakurad-deploy\.[A-Za-z0-9]+")
+
+
+def make_remote_stage(node: Node) -> str:
+    """Create this deploy's own remote staging directory.
+
+    Nodes that share a host, or overlapping deploy runs, must never install each
+    other's binary, config or unit, so nothing is staged at a fixed /tmp path.
+    """
+    stage = run(node.ssh_cmd("mktemp -d /tmp/zakurad-deploy.XXXXXXXX"),
+                capture=True).stdout.strip()
+    if not REMOTE_STAGE.fullmatch(stage):
+        raise DeployError(f"unexpected remote staging directory: {stage!r}")
+    return stage
+
+
+def remove_remote_stage(node: Node, stage: str) -> None:
+    run(node.ssh_cmd(f"rm -rf -- {shlex.quote(stage)}"), capture=True, check=False)
 
 
 def ssh_with_stdin(node: Node, script: str) -> subprocess.CompletedProcess:
@@ -1008,6 +1027,92 @@ def deploy_publisher(node: Node, binary: Path, exporter: Path) -> None:
         run(node.ssh_cmd(f"rm -rf -- {shlex.quote(stage)}"), capture=True, check=False)
 
 
+def local_stage_file(prefix: str, suffix: str, content: str) -> Path:
+    """Write a rendered file to a unique local path, so concurrent deploys never share one."""
+    cache = build_cache_dir()
+    cache.mkdir(parents=True, exist_ok=True)
+    fd, name = tempfile.mkstemp(prefix=prefix, suffix=suffix, dir=cache)
+    with os.fdopen(fd, "w") as stream:
+        stream.write(content)
+    return Path(name)
+
+
+def install_node(node: Node, binary: Path, stage: str, *, no_restart: bool) -> tuple[str, bool, str]:
+    """Upload one node's artifacts into `stage` on its host, then install and restart."""
+    # Binary-only: don't render or ship a config/unit; just swap the
+    # binary and restart the existing service or container.
+    if not node.manage_config:
+        if node.deploy_kind not in ("systemd", "docker"):
+            return (
+                node.name,
+                False,
+                "manage_config=false requires deploy_kind=systemd or docker",
+            )
+        if node.deploy_kind == "docker" and not node.container_name:
+            return (node.name, False, "docker deploy requires container_name")
+        run(node.scp_to(str(binary), f"{stage}/zakurad.new"), capture=True)
+        if node.deploy_kind == "docker":
+            script = DOCKER_BINARY_ONLY_INSTALL_SCRIPT.format(
+                stage=shlex.quote(stage),
+                container=shlex.quote(node.container_name),
+                bin_path=shlex.quote(node.bin_path),
+                no_restart="1" if no_restart else "0",
+            )
+        else:
+            script = BINARY_ONLY_INSTALL_SCRIPT.format(
+                stage=shlex.quote(stage),
+                bin_path=shlex.quote(node.bin_path),
+                service=shlex.quote(node.service_name),
+                no_restart="1" if no_restart else "0",
+            )
+        proc = ssh_with_stdin(node, script)
+        if proc.returncode != 0:
+            return (node.name, False, f"install/restart failed (rc={proc.returncode})")
+        return (node.name, True, f"deployed {node.sha[:9]} (binary-only)")
+
+    cfg = render_node_config(node)
+    cfg_tmp = local_stage_file(f".cfg-{node.name}-", ".toml", cfg)
+    try:
+        run(node.scp_to(str(binary), f"{stage}/zakurad.new"), capture=True)
+        run(node.scp_to(str(cfg_tmp), f"{stage}/zakura.toml"), capture=True)
+        if node.deploy_kind == "systemd":
+            unit = render_service(node)
+            unit_tmp = local_stage_file(f".unit-{node.name}-", ".service", unit)
+            try:
+                run(node.scp_to(str(unit_tmp), f"{stage}/zakurad.service"), capture=True)
+            finally:
+                unit_tmp.unlink(missing_ok=True)
+    finally:
+        cfg_tmp.unlink(missing_ok=True)
+
+    if node.deploy_kind == "systemd":
+        script = INSTALL_SCRIPT.format(
+            stage=shlex.quote(stage),
+            bin_path=shlex.quote(node.bin_path),
+            config_path=shlex.quote(node.config_path),
+            service=shlex.quote(node.service_name),
+            log_file=shlex.quote(node.log_file),
+            state_dir=shlex.quote(node.state_cache_dir),
+            no_restart="1" if no_restart else "0",
+        )
+    else:
+        script = PROCESS_INSTALL_SCRIPT.format(
+            stage=shlex.quote(stage),
+            bin_path=shlex.quote(node.bin_path),
+            config_path=shlex.quote(node.config_path),
+            log_file=shlex.quote(node.log_file),
+            state_dir=shlex.quote(node.state_cache_dir),
+            working_dir=shlex.quote(node.working_dir),
+            start_command=shlex.quote(node.start_command),
+            process_pattern=shlex.quote(node.process_pattern),
+            no_restart="1" if no_restart else "0",
+        )
+    proc = ssh_with_stdin(node, script)
+    if proc.returncode != 0:
+        return (node.name, False, f"install/restart failed (rc={proc.returncode})")
+    return (node.name, True, f"deployed {node.sha[:9]}")
+
+
 def cmd_build(args) -> int:
     nodes = load_nodes(Path(args.config), args.node)
     build_nodes(nodes, force=args.force)
@@ -1032,77 +1137,11 @@ def cmd_deploy(args) -> int:
                 return (node.name, True, f"deployed node and exporter {node.sha[:9]}, publication verified")
             if node.deploy_kind not in ("systemd", "process", "docker"):
                 return (node.name, False, f"unknown deploy_kind: {node.deploy_kind}")
-
-            # Binary-only: don't render or ship a config/unit; just swap the
-            # binary and restart the existing service or container.
-            if not node.manage_config:
-                if node.deploy_kind not in ("systemd", "docker"):
-                    return (
-                        node.name,
-                        False,
-                        "manage_config=false requires deploy_kind=systemd or docker",
-                    )
-                if node.deploy_kind == "docker" and not node.container_name:
-                    return (node.name, False, "docker deploy requires container_name")
-                run(node.scp_to(str(binary), "/tmp/zakurad-deploy.new"), capture=True)
-                if node.deploy_kind == "docker":
-                    script = DOCKER_BINARY_ONLY_INSTALL_SCRIPT.format(
-                        container=shlex.quote(node.container_name),
-                        bin_path=shlex.quote(node.bin_path),
-                        no_restart="1" if args.no_restart else "0",
-                    )
-                else:
-                    script = BINARY_ONLY_INSTALL_SCRIPT.format(
-                        bin_path=shlex.quote(node.bin_path),
-                        service=shlex.quote(node.service_name),
-                        no_restart="1" if args.no_restart else "0",
-                    )
-                proc = ssh_with_stdin(node, script)
-                if proc.returncode != 0:
-                    return (node.name, False, f"install/restart failed (rc={proc.returncode})")
-                return (node.name, True, f"deployed {node.sha[:9]} (binary-only)")
-
-            cfg = render_node_config(node)
-            cfg_tmp = build_cache_dir() / f".cfg-{node.name}.toml"
-            cfg_tmp.write_text(cfg)
+            stage = make_remote_stage(node)
             try:
-                run(node.scp_to(str(binary), "/tmp/zakurad-deploy.new"), capture=True)
-                run(node.scp_to(str(cfg_tmp), "/tmp/zakurad-deploy.toml"), capture=True)
-                if node.deploy_kind == "systemd":
-                    unit = render_service(node)
-                    unit_tmp = build_cache_dir() / f".unit-{node.name}.service"
-                    unit_tmp.write_text(unit)
-                    try:
-                        run(node.scp_to(str(unit_tmp), "/tmp/zakurad-deploy.service"), capture=True)
-                    finally:
-                        unit_tmp.unlink(missing_ok=True)
+                return install_node(node, binary, stage, no_restart=args.no_restart)
             finally:
-                cfg_tmp.unlink(missing_ok=True)
-
-            if node.deploy_kind == "systemd":
-                script = INSTALL_SCRIPT.format(
-                    bin_path=shlex.quote(node.bin_path),
-                    config_path=shlex.quote(node.config_path),
-                    service=shlex.quote(node.service_name),
-                    log_file=shlex.quote(node.log_file),
-                    state_dir=shlex.quote(node.state_cache_dir),
-                    no_restart="1" if args.no_restart else "0",
-                )
-            else:
-                script = PROCESS_INSTALL_SCRIPT.format(
-                    bin_path=shlex.quote(node.bin_path),
-                    config_path=shlex.quote(node.config_path),
-                    log_file=shlex.quote(node.log_file),
-                    state_dir=shlex.quote(node.state_cache_dir),
-                    working_dir=shlex.quote(node.working_dir),
-                    start_command=shlex.quote(node.start_command),
-                    process_pattern=shlex.quote(node.process_pattern),
-                    no_restart="1" if args.no_restart else "0",
-                )
-            proc = ssh_with_stdin(node, script)
-            if proc.returncode != 0:
-                return (node.name, False, f"install/restart failed (rc={proc.returncode})")
-            return (node.name, True, f"deployed {node.sha[:9]}")
+                remove_remote_stage(node, stage)
         except DeployError as exc:
             return (node.name, False, str(exc))
 

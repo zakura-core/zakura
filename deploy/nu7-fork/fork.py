@@ -693,16 +693,10 @@ def cmd_render(config: dict, args) -> int:
 def cmd_deploy(config: dict, args) -> int:
     if not args.nodes.is_file():
         raise ForkError(f"{args.nodes} not found; run `fork.py render` first")
-    names = [node["name"] for node in tomllib.loads(args.nodes.read_text())["nodes"]]
-    # deploy.py takes --config after the subcommand, not before it.
-    deployer = [sys.executable, str(DEPLOYER)]
-    run([*deployer, "build", "--config", str(args.nodes)], cwd=DEPLOYER.parent)
-    # One node at a time: deploy.py deploys in parallel and stages every node at the
-    # same /tmp/zakurad-deploy.* paths, so co-located fork nodes would install each
-    # other's binary, config, or unit.
-    for name in names:
-        run([*deployer, "deploy", "--config", str(args.nodes), "--node", name],
-            cwd=DEPLOYER.parent)
+    # deploy.py takes --config after the subcommand, not before it. It stages each
+    # node in its own remote directory, so co-located fork nodes deploy in parallel.
+    run([sys.executable, str(DEPLOYER), "deploy", "--config", str(args.nodes)],
+        cwd=DEPLOYER.parent)
     return 0
 
 

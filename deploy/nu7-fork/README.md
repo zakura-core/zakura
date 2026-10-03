@@ -346,9 +346,10 @@ the fork's `non_finalized_state` backup, so the previous run's blocks are not
 reloaded. `fork.py` refuses a `network_name` of `Mainnet`, `Testnet` or
 `Regtest`, and a cache directory that overlaps the pristine seed.
 
-`fork.py deploy` deploys the nodes one at a time. `deploy.py` deploys in
-parallel and stages every node at the same `/tmp` paths, so two nodes on one
-host would otherwise install each other's files.
+`fork.py deploy` hands the whole rendered fleet to one `deploy.py deploy`, which
+deploys in parallel. Each node is staged in its own `mktemp -d` directory on its
+host and that directory is removed afterwards, so the two nodes on the primary
+host never install each other's files.
 
 ## Tearing down
 

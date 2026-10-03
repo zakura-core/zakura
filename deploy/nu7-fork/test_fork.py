@@ -193,6 +193,20 @@ class Provision(unittest.TestCase):
         self.assertEqual(cmd[cmd.index("--ssh-fingerprint") + 1], "aa:bb")
 
 
+class Deploy(unittest.TestCase):
+    def test_the_fleet_deploys_in_one_parallel_deployer_run(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            nodes = Path(tmp) / "nodes.toml"
+            nodes.write_text(render(base_config(PEER)))
+            done = subprocess.CompletedProcess([], 0, "", "")
+            with mock.patch.object(fork, "run", return_value=done) as run:
+                fork.cmd_deploy({}, types.SimpleNamespace(nodes=nodes))
+        commands = [call.args[0] for call in run.call_args_list]
+        self.assertEqual(len(commands), 1)
+        self.assertEqual(commands[0][2:], ["deploy", "--config", str(nodes)])
+        self.assertNotIn("--node", commands[0])
+
+
 class SshOptions(unittest.TestCase):
     def test_an_unresponsive_connected_host_is_dropped(self):
         # ConnectTimeout only bounds the handshake; keepalives bound every later wait.

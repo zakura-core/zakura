@@ -1,8 +1,11 @@
 import importlib.util
 import os
+import re
 import sys
+import threading
 import tempfile
 import tomllib
+import types
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -533,6 +536,125 @@ class ConfigKeyTests(unittest.TestCase):
 
             with self.assertRaises(deploy.DeployError):
                 deploy.load_nodes(path, None)
+
+
+
+
+class SharedHostStagingTests(unittest.TestCase):
+    """Two nodes on one host, deployed in parallel, must each install their own files."""
+
+    NODES = """
+        [defaults]
+        network = "Testnet"
+        initial_testnet_peers = []
+
+        [[nodes]]
+        name = "fork-1"
+        ssh_string = "root@shared-host"
+        commit = "main"
+        listen_addr = "0.0.0.0:18233"
+
+        [[nodes]]
+        name = "fork-2"
+        ssh_string = "root@shared-host"
+        commit = "main"
+        service_name = "zakurad-fork2"
+        config_path = "/etc/zakura/zakura-fork2.toml"
+        bin_path = "/usr/local/bin/zakurad-fork2"
+        listen_addr = "0.0.0.0:18333"
+    """.replace("        ", "")
+
+    def deploy_in_parallel(self, fail_install_for=None):
+        host_files: dict[str, bytes] = {}
+        installed: dict[str, dict[str, str]] = {}
+        stages: list[str] = []
+        removed: list[str] = []
+        lock = threading.Lock()
+        # Both uploads finish before either install starts, as in the original race.
+        uploaded = threading.Barrier(2, timeout=5)
+
+        def fake_run(cmd, *, cwd=None, capture=False, check=True):
+            if cmd[0] == "ssh" and cmd[-1].startswith("mktemp -d /tmp/zakurad-deploy."):
+                with lock:
+                    stage = f"/tmp/zakurad-deploy.{len(stages):08d}"
+                    stages.append(stage)
+                return mock.Mock(returncode=0, stdout=stage + "\n")
+            if cmd[0] == "ssh" and cmd[-1].startswith("rm -rf -- "):
+                with lock:
+                    removed.append(cmd[-1].removeprefix("rm -rf -- "))
+                    for path in [path for path in host_files
+                                 if path.startswith(removed[-1] + "/")]:
+                        del host_files[path]
+                return mock.Mock(returncode=0, stdout="")
+            if cmd[0] == "scp":
+                local, remote = cmd[-2], cmd[-1].split(":", 1)[1]
+                with lock:
+                    host_files[remote] = Path(local).read_bytes()
+                return mock.Mock(returncode=0, stdout="")
+            raise AssertionError(f"unexpected command: {cmd}")
+
+        def fake_install(node, script):
+            uploaded.wait()
+            stage = re.search(r"^STAGE=(\S+)$", script, re.MULTILINE)[1]
+            config_path = re.search(r"^CONFIG_PATH=(\S+)$", script, re.MULTILINE)[1]
+            with lock:
+                installed[node.name] = {
+                    "config_path": config_path,
+                    "config": host_files[f"{stage}/zakura.toml"].decode(),
+                    "unit": host_files[f"{stage}/zakurad.service"].decode(),
+                    "binary": host_files[f"{stage}/zakurad.new"].decode(),
+                }
+            return mock.Mock(returncode=1 if node.name == fail_install_for else 0)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Path(tmp) / "nodes.toml"
+            config.write_text(self.NODES)
+            binary = Path(tmp) / "zakurad"
+            binary.write_text("binary for main")
+            args = types.SimpleNamespace(config=str(config), node=None, force=False,
+                                         no_restart=False)
+            with mock.patch.dict(os.environ, {deploy.BUILD_CACHE_DIR_ENV: tmp}), \
+                    mock.patch.object(deploy, "build_nodes", side_effect=lambda nodes, force:
+                                      [setattr(n, "sha", "a" * 40) for n in nodes]
+                                      and {"a" * 40: binary}), \
+                    mock.patch.object(deploy, "build_publishers", return_value={}), \
+                    mock.patch.object(deploy, "run", side_effect=fake_run), \
+                    mock.patch.object(deploy, "ssh_with_stdin", side_effect=fake_install):
+                status = deploy.cmd_deploy(args)
+            leftovers = [path.name for path in Path(tmp).iterdir()
+                         if path.name.startswith((".cfg-", ".unit-"))]
+        return status, installed, stages, removed, host_files, leftovers
+
+    def test_each_node_installs_its_own_config_and_unit(self):
+        status, installed, stages, _, _, _ = self.deploy_in_parallel()
+
+        self.assertEqual(status, 0)
+        self.assertEqual(len(set(stages)), 2)
+        self.assertEqual(installed["fork-1"]["config_path"], "/etc/zakura/zakura.toml")
+        self.assertIn('listen_addr = "0.0.0.0:18233"', installed["fork-1"]["config"])
+        self.assertIn("Description=Zakura full node (zakurad)", installed["fork-1"]["unit"])
+        self.assertEqual(installed["fork-2"]["config_path"], "/etc/zakura/zakura-fork2.toml")
+        self.assertIn('listen_addr = "0.0.0.0:18333"', installed["fork-2"]["config"])
+        self.assertIn("Description=Zakura full node (zakurad-fork2)", installed["fork-2"]["unit"])
+
+    def test_staging_is_removed_even_when_an_install_fails(self):
+        status, _, stages, removed, host_files, leftovers = self.deploy_in_parallel(
+            fail_install_for="fork-2")
+
+        self.assertEqual(status, 1)
+        self.assertEqual(sorted(removed), sorted(stages))
+        self.assertEqual(host_files, {})
+        self.assertEqual(leftovers, [])
+
+    def test_install_scripts_read_only_their_staging_directory(self):
+        for script in (deploy.INSTALL_SCRIPT, deploy.PROCESS_INSTALL_SCRIPT,
+                       deploy.BINARY_ONLY_INSTALL_SCRIPT,
+                       deploy.DOCKER_BINARY_ONLY_INSTALL_SCRIPT):
+            self.assertIn("STAGE={stage}", script)
+            host_side = script.replace('"$CONTAINER:/tmp/zakurad-deploy.new"', "")
+            host_side = host_side.split("docker exec --user 0", 1)[0]
+            self.assertNotIn("/tmp/zakurad-deploy.", host_side)
+
 
 
 if __name__ == "__main__":

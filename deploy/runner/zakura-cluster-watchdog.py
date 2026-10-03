@@ -1429,7 +1429,7 @@ class Watchdog:
             f":rotating_light: *Zakura mainnet* - `{MAC_NODE_NAME}` forked for more than 10 blocks\n"
             f"{groups[agreed]}/{len(others)} other nodes agree at height {height}\n"
             "dashboard: https://status.mainnet.zakura.valargroup.dev/",
-            ":white_check_mark: *Zakura mainnet* - `{MAC_NODE_NAME}` fork recovered\n"
+            f":white_check_mark: *Zakura mainnet* - `{MAC_NODE_NAME}` fork recovered\n"
             "dashboard: https://status.mainnet.zakura.valargroup.dev/",
             now, suppressed, self.args, tip, notify=self.notify,
         )

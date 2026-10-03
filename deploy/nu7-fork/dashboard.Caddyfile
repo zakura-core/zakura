@@ -36,8 +36,7 @@ api.nu7.valargroup.dev {
         reverse_proxy 127.0.0.1:8093
     }
 
-    @status path /v1/block/* /v1/tx/* /healthz
-    handle @status {
+    handle /healthz {
         reverse_proxy 127.0.0.1:8093
     }
 

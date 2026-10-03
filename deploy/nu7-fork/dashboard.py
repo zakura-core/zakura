@@ -7,7 +7,6 @@ import argparse
 import ipaddress
 import json
 import logging
-import re
 import statistics
 import subprocess
 import threading
@@ -24,13 +23,9 @@ TARGET_SPACING_SECONDS = 25
 DAA_WINDOW_BLOCKS = 102
 RECENT_HEADER_COUNT = 301  # 300 adjacent post-NU7 block intervals.
 MAX_OBSERVATION_AGE_SECONDS = 120
-# Bounds for the public HTTP server: explorer requests each hold a thread and a
-# node RPC call, on the host that also validates and mines the fork.
+# Bounds for the public HTTP server, on the host that also validates and mines the fork.
 MAX_CONCURRENT_REQUESTS = 16
 REQUEST_TIMEOUT_SECONDS = 10
-EXPLORER_ORIGINS = frozenset({"https://zakura.com", "https://nu7.valargroup.dev"})
-BLOCK_ID = re.compile(r"(?:[0-9]{1,10}|[0-9a-fA-F]{64})\Z")
-TX_ID = re.compile(r"[0-9a-fA-F]{64}\Z")
 
 
 def rpc(port: int, method: str, params: list | None = None):
@@ -92,75 +87,6 @@ def active_miners(miner_enabled: bool) -> int:
         capture_output=True, text=True, timeout=3, check=False,
     )
     return sum(line == "active" for line in result.stdout.splitlines())
-
-
-def transaction_summary(transaction: dict) -> dict:
-    inputs = transaction.get("vin") or []
-    outputs = transaction.get("vout") or []
-    orchard = transaction.get("orchard") or {}
-    ironwood = transaction.get("ironwood") or {}
-    return {
-        "txid": transaction["txid"],
-        "coinbase": any("coinbase" in item for item in inputs),
-        "inputCount": len(inputs),
-        "outputCount": len(outputs),
-        "transparentOutputZat": sum(item.get("valueZat", 0) for item in outputs),
-        "saplingSpends": len(transaction.get("vShieldedSpend") or []),
-        "saplingOutputs": len(transaction.get("vShieldedOutput") or []),
-        "orchardActions": len(orchard.get("actions") or []),
-        "ironwoodActions": len(ironwood.get("actions") or []),
-    }
-
-
-def block_detail(block: dict) -> dict:
-    return {
-        "hash": block["hash"], "height": block["height"],
-        "confirmations": block.get("confirmations"), "time": block["time"],
-        "size": block.get("size"), "version": block.get("version"),
-        "difficulty": block.get("difficulty"), "bits": block.get("bits"),
-        "nonce": block.get("nonce"), "merkleRoot": block.get("merkleroot"),
-        "previousHash": block.get("previousblockhash"),
-        "nextHash": block.get("nextblockhash"),
-        "transactions": [transaction_summary(tx) for tx in block.get("tx", [])],
-    }
-
-
-def transaction_detail(transaction: dict) -> dict:
-    summary = transaction_summary(transaction)
-    return {
-        **summary,
-        "blockHash": transaction.get("blockhash"),
-        "height": transaction.get("height"),
-        "confirmations": transaction.get("confirmations"),
-        "time": transaction.get("blocktime") or transaction.get("time"),
-        "size": transaction.get("size"), "version": transaction.get("version"),
-        "expiryHeight": transaction.get("expiryheight"),
-        "inputs": [
-            {key: item[key] for key in ("txid", "vout", "coinbase", "sequence") if key in item}
-            for item in transaction.get("vin") or []
-        ],
-        "outputs": [
-            {"index": item.get("n"), "valueZat": item.get("valueZat"),
-             "addresses": item.get("scriptPubKey", {}).get("addresses") or [],
-             "scriptType": item.get("scriptPubKey", {}).get("type")}
-            for item in transaction.get("vout") or []
-        ],
-    }
-
-
-def explorer_response(port: int, kind: str, identifier: str) -> tuple[int, dict]:
-    """Read selected public fields; distinguish unavailable history from RPC outages."""
-    valid = BLOCK_ID.fullmatch(identifier) if kind == "block" else TX_ID.fullmatch(identifier)
-    if not valid or (kind == "block" and len(identifier) <= 10 and int(identifier) > 2**32 - 1):
-        return 400, {"error": "Invalid explorer identifier"}
-    try:
-        if kind == "block":
-            return 200, block_detail(rpc(port, "getblock", [identifier, 2]))
-        return 200, transaction_detail(rpc(port, "getrawtransaction", [identifier, 1]))
-    except (OSError, urllib.error.URLError):
-        return 503, {"error": "Explorer is temporarily unavailable"}
-    except (ValueError, KeyError, RuntimeError):
-        return 404, {"error": "Block or transaction unavailable on this node"}
 
 
 class Collector:
@@ -373,11 +299,6 @@ class Handler(BaseHTTPRequestHandler):
             status = 200 if payload["status"] != "unavailable" else 503
             body = json.dumps(payload, separators=(",", ":")).encode()
             content_type = "application/json"
-        elif self.path.startswith("/v1/block/") or self.path.startswith("/v1/tx/"):
-            kind, identifier = self.path.removeprefix("/v1/").split("/", 1)
-            status, payload = explorer_response(self.collector.ports[0][1], kind, identifier)
-            body = json.dumps(payload, separators=(",", ":")).encode()
-            content_type = "application/json"
         else:
             self.send_error(404)
             return
@@ -386,11 +307,6 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "public, max-age=10" if status == 200 else "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
-        if self.path.startswith(("/v1/block/", "/v1/tx/")):
-            self.send_header("Vary", "Origin")
-            origin = self.headers.get("Origin")
-            if origin in EXPLORER_ORIGINS:
-                self.send_header("Access-Control-Allow-Origin", origin)
         self.end_headers()
         self.wfile.write(body)
 

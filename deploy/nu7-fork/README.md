@@ -419,10 +419,10 @@ path rejects a mismatch outright.
 local RPC servers and the three regional miner status endpoints, verifies that
 the nodes report the configured NU7 activation, and
 serves a small JSON response on `127.0.0.1:8093/v1/status`. The accompanying
-systemd unit and Caddyfile publish `/v1/status`, `/v1/block/<height-or-hash>`,
-`/v1/tx/<txid>`, and `/healthz` at `api.nu7.valargroup.dev`; node RPC remains
-bound to localhost. Explorer responses include only selected public block and
-transaction fields; older records may be unavailable from pruned storage.
+systemd unit and Caddyfile publish `/v1/status` and `/healthz` at
+`api.nu7.valargroup.dev`; node RPC remains bound to localhost. The API has no
+block or transaction explorer routes: the website reads only `/v1/status`,
+`/v1/network`, and `/v1/faucet/*`.
 
 The response includes current tip, header timestamps, recent intervals,
 difficulty, external peer count, local node agreement, regional miner health,
@@ -465,22 +465,6 @@ sync before advertising a build as join-ready.
 `fork.py` renders a fleet config for `deploy/deployer/deploy.py` rather than
 deploying by itself, so the fork node is built, shipped and supervised by exactly
 the same path as every other managed node.
-
-## Website explorer
-
-The NU7 page links recent blocks and faucet receipts into its inline explorer.
-Read-only `GET /v1/block/<height-or-hash>` and `GET /v1/tx/<txid>` return selected
-public fields, transaction summaries, transparent inputs/outputs, and shielded
-action counts. Raw transaction hex, proofs, and shielded receiver details are
-not exposed. Browser reads allow the exact Zakura and existing Valargroup
-frontend origins, including on JSON errors.
-
-Invalid identifiers return 400 before RPC. Missing or pruned records return 404;
-RPC transport failures return 503. These endpoints use the existing bounded
-HTTP server and RPC timeouts. A missing record does not prove a transaction is
-invalid: older history may be pruned, or it may belong to another network.
-The website paginates long lists and uses fragment links for shareable views.
-No database index or node configuration change is needed.
 
 ## Block interval sample
 

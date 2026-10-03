@@ -80,31 +80,6 @@ class DashboardTests(unittest.TestCase):
             {"name": "local observer", "healthy": False},
         ])
 
-    def test_explorer_details_omit_raw_hex_and_link_transactions(self):
-        transaction = {
-            "txid": "a" * 64, "hex": "private raw bytes", "height": 11,
-            "blockhash": "b" * 64, "confirmations": 3,
-            "vin": [{"coinbase": "abcd", "sequence": 1}],
-            "vout": [{"n": 0, "valueZat": 125, "scriptPubKey": {
-                "type": "pubkeyhash", "addresses": ["test-address"]}}],
-            "orchard": {"actions": [{"nullifier": "hidden detail"}]},
-        }
-        block = {
-            "hash": "b" * 64, "height": 11, "time": 1000,
-            "solution": "large proof", "tx": [transaction],
-        }
-        detail = dashboard.block_detail(block)
-        self.assertEqual(detail["transactions"][0]["txid"], "a" * 64)
-        self.assertEqual(detail["transactions"][0]["orchardActions"], 1)
-        self.assertNotIn("solution", detail)
-        self.assertNotIn("hex", detail["transactions"][0])
-
-        tx_detail = dashboard.transaction_detail(transaction)
-        self.assertEqual(tx_detail["outputs"][0]["valueZat"], 125)
-        self.assertEqual(tx_detail["outputs"][0]["addresses"], ["test-address"])
-        self.assertNotIn("hex", tx_detail)
-        self.assertNotIn("actions", tx_detail)
-
     def test_remote_miner_requires_fresh_matching_chain_and_active_services(self):
         miner = {"id": "eu", "region": "Amsterdam", "url": "http://example/v1/miner"}
         primary = {"height": 11, "hash": "hash11", "branch": "77190ad9"}
@@ -312,10 +287,10 @@ def max_concurrent_handlers(server_class, limit: int, clients: int) -> int:
     return peak
 
 
-class ExplorerHttpTests(unittest.TestCase):
+class RemovedRouteTests(unittest.TestCase):
     def setUp(self):
         collector = mock.Mock(ports=[("primary", 18232)])
-        handler = type("ExplorerHandler", (dashboard.Handler,), {
+        handler = type("StatusHandler", (dashboard.Handler,), {
             "collector": collector, "log_message": lambda *args: None})
         self.server = dashboard.BoundedHTTPServer(("127.0.0.1", 0), handler)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
@@ -327,44 +302,19 @@ class ExplorerHttpTests(unittest.TestCase):
         self.server.server_close()
         self.thread.join(timeout=2)
 
-    def get(self, path, origin="https://zakura.com"):
-        connection = http.client.HTTPConnection(*self.server.server_address, timeout=3)
-        try:
-            connection.request("GET", path, headers={"Origin": origin})
-            response = connection.getresponse()
-            return response.status, dict(response.getheaders()), json.loads(response.read())
-        finally:
-            connection.close()
-
-    def test_blocks_transactions_and_errors_have_scoped_cors(self):
-        block = {"hash": "b" * 64, "height": 123, "time": 1000,
-                 "tx": [{"txid": "a" * 64}]}
-        with mock.patch.object(dashboard, "rpc", return_value=block):
-            for origin in dashboard.EXPLORER_ORIGINS:
-                code, headers, payload = self.get("/v1/block/123", origin)
-                self.assertEqual(code, 200)
-                self.assertEqual(headers["Access-Control-Allow-Origin"], origin)
-                self.assertEqual(payload["transactions"][0]["txid"], "a" * 64)
-            self.assertNotIn("Access-Control-Allow-Origin", self.get("/v1/block/123", "https://untrusted.example")[1])
-        with mock.patch.object(dashboard, "rpc", return_value={"txid": "a" * 64}):
-            self.assertEqual(self.get("/v1/tx/" + "a" * 64)[2]["txid"], "a" * 64)
-
-    def test_invalid_identifiers_do_not_reach_rpc(self):
+    def test_explorer_routes_are_not_served(self):
         with mock.patch.object(dashboard, "rpc") as rpc:
-            for path in ["/v1/block/4294967296", "/v1/block/-1", "/v1/block/x", "/v1/tx/123", "/v1/block/123/extra"]:
-                code, headers, _ = self.get(path)
-                self.assertEqual(code, 400)
-                self.assertEqual(headers["Access-Control-Allow-Origin"], "https://zakura.com")
+            for path in ["/v1/block/123", "/v1/tx/" + "a" * 64]:
+                connection = http.client.HTTPConnection(*self.server.server_address, timeout=3)
+                try:
+                    connection.request("GET", path, headers={"Origin": "https://zakura.com"})
+                    response = connection.getresponse()
+                    response.read()
+                    self.assertEqual(response.status, 404, path)
+                    self.assertIsNone(response.getheader("Access-Control-Allow-Origin"))
+                finally:
+                    connection.close()
             rpc.assert_not_called()
-
-    def test_pruned_or_unknown_data_and_transport_outages_are_distinct(self):
-        for error, expected in [(ValueError("internal RPC error"), 404), (TimeoutError("private host"), 503)]:
-            with mock.patch.object(dashboard, "rpc", side_effect=error):
-                code, headers, payload = self.get("/v1/block/123")
-                self.assertEqual(code, expected)
-                self.assertEqual(headers["Cache-Control"], "no-store")
-                self.assertEqual(headers["Access-Control-Allow-Origin"], "https://zakura.com")
-                self.assertNotIn(str(error), payload["error"])
 
 
 class BoundedServerTests(unittest.TestCase):

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import contextlib
 import importlib.util
 import json
@@ -129,6 +130,36 @@ class MacCraneliftTests(unittest.TestCase):
         detail = collector.node_snapshot("mac-os-cranelift")
         self.assertEqual(detail["node"]["host"]["rss_bytes"], 1000)
         self.assertEqual(len(detail["history"]), 1)
+
+    def test_dashboard_mac_row_reaches_watchdog_fork_and_offline_policies(self):
+        spec = importlib.util.spec_from_file_location(
+            "dashboard_watchdog", SCRIPT_PATH.with_name("zakura-cluster-watchdog.py"))
+        watchdog = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = watchdog
+        spec.loader.exec_module(watchdog)
+        collector = status.ClusterCollector([node()], 10, 300, "mainnet")
+        sample = {"available": True, "mac_tip": 110, "mac_tip_hash": "c" * 64,
+                  "comparison_healthy": True,
+                  "fork_anchor": {"height": 100, "hash": "a" * 64}}
+        with mock.patch.dict(os.environ, {"ZAKURA_MAC_CRANELIFT_STATUS": "1"}), \
+                mock.patch.object(status, "mac_cranelift_status", return_value=sample), \
+                mock.patch.object(status, "probe_node", return_value={}):
+            collector.poll_once()
+        mac = next(row for row in collector.snapshot()["rows"]
+                   if row["name"] == "mac-os-cranelift")
+        args = argparse.Namespace(down_after=600, dry_run=False)
+        agent = watchdog.Watchdog([], args)
+        sent = []
+        agent.notify = lambda text, args: (sent.append(text), True)[1]
+        others = [dict(mac, name=f"linux-{i}",
+                       fork_anchor={"height": 100, "hash": "b" * 64}) for i in range(12)]
+        fleet = watchdog.Fleet("mainnet", "http://localhost/data", "https://example.com/")
+        with mock.patch.dict(os.environ, {"ZAKURA_MAC_CRANELIFT_ALERTS_MUTED": "0"}):
+            agent.handle_mac_fork({}, fleet, [mac, *others], time.time(), False)
+        self.assertEqual(len(sent), 1)
+        self.assertIn("mac-os-cranelift", sent[0])
+        self.assertEqual(watchdog.node_condition(dict(mac, health="down"),
+                                               time.time(), 0, args)[2], 180)
 
     def test_legacy_dashboard_setting_still_enables_the_node(self):
         collector = status.ClusterCollector([node()], 10, 300, "mainnet")

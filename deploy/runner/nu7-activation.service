@@ -1,0 +1,27 @@
+[Unit]
+Description=Coherent NU7 feed and automatic public-Testnet selection
+Wants=network-online.target
+After=network-online.target zakurad.service
+
+[Service]
+Type=simple
+DynamicUser=yes
+SupplementaryGroups=systemd-journal
+StateDirectory=zakura-nu7-activation
+EnvironmentFile=-/etc/zakura/nu7-publication.env
+ExecStart=/usr/bin/python3 /opt/zakura-nu7-status/zakura-cluster-status.py --config /etc/zakura/public-testnet-nodes.toml --network testnet --host 0.0.0.0 --port 8096 --nu7-activation-config /etc/zakura/nu7-activation.json
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+# Restrict port 8096 to the staging API gateway and localhost using the host
+# firewall. This process also makes outbound reference/dispatch HTTPS requests.
+
+[Install]
+WantedBy=multi-user.target

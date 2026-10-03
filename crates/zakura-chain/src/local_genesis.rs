@@ -129,7 +129,6 @@ pub fn generate_local_testnet_with_funded_keys(
         .saturating_add(1);
 
     // Generate funded keys.
-    let secp = secp256k1::Secp256k1::new();
     let mut rng = OsRng;
 
     let funded_keys: Vec<FundedKey> = miner_names
@@ -139,18 +138,18 @@ pub fn generate_local_testnet_with_funded_keys(
                 let mut secret_bytes = [0u8; 32];
                 rng.fill_bytes(&mut secret_bytes);
 
-                if let Ok(secret_key) = secp256k1::SecretKey::from_slice(&secret_bytes) {
+                if let Ok(secret_key) = secp256k1::SecretKey::from_secret_bytes(secret_bytes) {
                     break secret_key;
                 }
             };
-            let public_key = secp256k1::PublicKey::from_secret_key(&secp, &secret_key);
+            let public_key = secp256k1::PublicKey::from_secret_key(&secret_key);
             let pub_key_bytes = public_key.serialize();
             let pub_key_hash = hash160(&pub_key_bytes);
             let address =
                 transparent::Address::from_pub_key_hash(NetworkKind::Testnet, pub_key_hash);
             FundedKey {
                 name,
-                secret_key_hex: hex::encode(secret_key.secret_bytes()),
+                secret_key_hex: hex::encode(secret_key.to_secret_bytes()),
                 public_key_hex: hex::encode(pub_key_bytes),
                 address,
             }

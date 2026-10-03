@@ -58,6 +58,8 @@ Each validated source IP may own at most `min(P + 1, inbound share)` incoming tr
 slot lets a reconnect authenticate while its incumbent is still present. Raw per-IP zero still
 selects the default of 16, giving 17 transport slots per source. Ports do not create new sources,
 IPv4-mapped aliases share their IPv4 count, and distinct IPv6 addresses remain distinct sources.
+An attacker with enough source addresses can fill the inbound share. This policy protects outbound
+progress, not guaranteed inbound availability against a distributed or IPv6-prefix attacker.
 
 Control handshakes have a separate global budget `H` with the same inbound share formula.
 The default allows 28 inbound control handshakes out of 32 total. Inbound acquires both budgets
@@ -69,8 +71,12 @@ guarantee for one shared slot or for a source allowed to fill either share.
 
 These limits protect outbound capacity from inbound work. They do not prioritize one outbound
 purpose over another. Discovery still uses the smaller of its available connection target and
-available concurrent dial count. Its default headroom of four is a soft target based on registered
-connections. Pending and closing transports can consume that headroom.
+available concurrent dial count. Its headroom is the larger of four and the number of remote bootstrap identities, which is nine
+with the default mainnet bootstrap list. Discovery can dial beyond a full registered inbound share
+only when the outbound reserve exceeds this headroom. With the default total of 256, there are
+23 such discovery slots. This is a soft target based on registered connections. Pending and closing
+transports can consume that headroom. Maintained bootstrap and upgrade dials do not use this soft
+cap, but still need free global transport and handshake capacity.
 
 ## Message checks and handler policy
 

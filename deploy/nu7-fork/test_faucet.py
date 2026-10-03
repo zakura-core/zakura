@@ -1,4 +1,4 @@
-"""Tests for public claim allocation, without a node or miner key."""
+"""Tests for public claim allocation, without a node or a real key."""
 
 import http.client
 import json
@@ -61,7 +61,7 @@ class FaucetClaimsTest(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
         self.faucet = Faucet(
-            Path(self.temporary.name) / "claims.sqlite3", 18232, "miner", Path("sender"), Path("config")
+            Path(self.temporary.name) / "claims.sqlite3", 18232, "tmFaucet", Path("sender"), Path("config")
         )
         self.address = "utest1" + "a" * 100
         self.patches = [
@@ -94,7 +94,7 @@ class FaucetClaimsTest(unittest.TestCase):
         claim = self.faucet.reserve(self.address, "192.0.2.1")
         with self.faucet.connect() as connection:
             connection.execute("UPDATE claims SET status = 'processing' WHERE id = ?", (claim,))
-        restarted = Faucet(self.faucet.db, 18232, "miner", Path("sender"), Path("config"))
+        restarted = Faucet(self.faucet.db, 18232, "tmFaucet", Path("sender"), Path("config"))
         self.assertEqual(restarted.claim(claim)["status"], "review")
 
     def test_invalid_requests_are_throttled_before_rpc_validation(self):
@@ -182,6 +182,35 @@ class BoundedServerTest(unittest.TestCase):
 
     def test_stalled_clients_time_out(self):
         self.assertEqual(faucet.Handler.timeout, faucet.REQUEST_TIMEOUT_SECONDS)
+
+
+
+class FaucetKeyIsolationTest(unittest.TestCase):
+    def test_the_sender_signs_with_the_faucet_key_for_the_faucet_address(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            claims = Faucet(Path(tmp) / "claims.sqlite3", 18232, "tmFaucet",
+                            Path("/usr/local/bin/zakura-fork-txload"), Path("/etc/zakura/zakura.toml"))
+            with claims.connect() as connection:
+                connection.execute("INSERT INTO claims (id, address, ip, created_at, status) "
+                                   "VALUES ('c1', 'utest1recipient', '203.0.113.1', 1, 'queued')")
+            done = __import__("subprocess").CompletedProcess([], 0, "txid " + "a" * 64, "")
+            with patch.dict("os.environ", {"CREDENTIALS_DIRECTORY": "/run/credentials/faucet"}), \
+                    patch.object(faucet.subprocess, "run", return_value=done) as run:
+                claims.process_next()
+        command = run.call_args.args[0]
+        self.assertEqual(command[command.index("--address") + 1], "tmFaucet")
+        self.assertEqual(command[command.index("--secret-key-file") + 1],
+                         "/run/credentials/faucet/faucet-key.hex")
+        self.assertNotIn("miner", " ".join(command))
+
+    def test_the_unit_loads_only_the_faucet_credential(self):
+        unit = (Path(__file__).parent / "faucet.service").read_text()
+        credentials = [line for line in unit.splitlines() if line.startswith("LoadCredential=")]
+        self.assertEqual(credentials,
+                         ["LoadCredential=faucet-key.hex:/etc/zakura-nu7-faucet/faucet-key.hex"])
+        self.assertNotIn("miner-key", unit)
+        self.assertNotIn("/root/", unit)
+        self.assertIn("--faucet-address ${FAUCET_ADDRESS}", unit)
 
 
 if __name__ == "__main__":

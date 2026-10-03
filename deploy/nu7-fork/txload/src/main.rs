@@ -58,6 +58,33 @@ fn bundle_version() -> BundleVersion {
 
 const CIRCUIT_VERSION: OrchardCircuitVersion = OrchardCircuitVersion::PostNu6_3;
 
+/// The transparent P2PKH address that `secret` controls, with a compressed public key.
+fn controlled_address(secret: &secp256k1::SecretKey, network: &Network) -> transparent::Address {
+    use ripemd::{Digest, Ripemd160};
+    use sha2::Sha256;
+
+    let public_key = secp256k1::PublicKey::from_secret_key_global(secret).serialize();
+    let mut hash = [0; 20];
+    hash.copy_from_slice(&Ripemd160::digest(Sha256::digest(public_key)));
+    transparent::Address::from_pub_key_hash(network.kind(), hash)
+}
+
+/// Refuses a key that does not control `address`, before any transaction is built.
+///
+/// The faucet and the miners use different keys. A mixed-up key file would
+/// otherwise only surface as a consensus rejection, or sign for the wrong funds.
+fn ensure_key_controls(
+    secret: &secp256k1::SecretKey,
+    address: &str,
+    network: &Network,
+) -> Result<()> {
+    let controlled = controlled_address(secret, network).to_string();
+    if controlled != address {
+        bail!("the secret key controls {controlled}, not --address {address}");
+    }
+    Ok(())
+}
+
 fn faucet_recipient(encoded: &str, network: &Network) -> Result<orchard::Address> {
     let parsed: ZcashAddress = encoded.parse().wrap_err("recipient address is invalid")?;
     let converted: Address = parsed
@@ -107,8 +134,14 @@ struct Args {
     config: std::path::PathBuf,
 
     /// The transparent address whose coinbase outputs are shielded.
+    #[arg(long, required_unless_present = "print_address")]
+    address: Option<String>,
+
+    /// Print the transparent address the secret key controls, then exit.
+    ///
+    /// Derives a new faucet's address from its key file without sending anything.
     #[arg(long)]
-    address: String,
+    print_address: bool,
 
     /// The WIF-less secret key for `address`, hex encoded (32 bytes).
     #[arg(long, env = "ZAKURA_FORK_KEY", conflicts_with = "secret_key_file")]
@@ -425,6 +458,15 @@ async fn main() -> Result<()> {
         &hex::decode(secret_text.trim()).wrap_err("the secret key is not hex")?,
     )
     .wrap_err("the secret key is not a valid secp256k1 key")?;
+    if args.print_address {
+        println!("{}", controlled_address(&secret, &network));
+        return Ok(());
+    }
+    let address = args
+        .address
+        .as_deref()
+        .expect("clap requires --address unless --print-address is given");
+    ensure_key_controls(&secret, address, &network)?;
     let recipient = args
         .recipient
         .as_deref()
@@ -454,7 +496,7 @@ async fn main() -> Result<()> {
             bail!("the fork is at {tip:?}, below NU7 activation {nu7:?}; fees would not recycle");
         }
 
-        let utxo = newest_spendable_utxo(&client, &args.address, tip).await?;
+        let utxo = newest_spendable_utxo(&client, address, tip).await?;
         let spendable_value = u64::try_from(i64::from(utxo.value))
             .wrap_err("a UTXO value does not fit in a note value")?
             .checked_sub(args.fee)
@@ -649,6 +691,42 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn printing_the_address_needs_no_address_argument() {
+        let parsed = Args::try_parse_from([
+            "zakura-fork-txload",
+            "--secret-key-file",
+            "/etc/zakura-nu7-faucet/faucet-key.hex",
+            "--print-address",
+        ])
+        .expect("--print-address stands in for --address");
+        assert!(parsed.print_address && parsed.address.is_none());
+        assert!(Args::try_parse_from(["zakura-fork-txload", "--secret-key", "00"]).is_err());
+    }
+
+    #[test]
+    fn a_key_is_used_only_for_the_address_it_controls() -> Result<()> {
+        let network = Network::new_default_testnet();
+        let one = secp256k1::SecretKey::from_slice(&[[0; 31].as_slice(), &[1]].concat())?;
+        // The well-known hash160 of the compressed secp256k1 generator point.
+        assert_eq!(
+            hex::encode(controlled_address(&one, &network).hash_bytes()),
+            "751e76e8199196d454941c45d1b3a323f1433bd6"
+        );
+        let faucet = controlled_address(&one, &network).to_string();
+        assert!(ensure_key_controls(&one, &faucet, &network).is_ok());
+
+        let miner = secp256k1::SecretKey::from_slice(&[7; 32])?;
+        assert!(ensure_key_controls(&miner, &faucet, &network).is_err());
+        assert!(ensure_key_controls(
+            &one,
+            &controlled_address(&miner, &network).to_string(),
+            &network
+        )
+        .is_err());
+        Ok(())
+    }
 
     #[test]
     fn spent_outpoints_reads_prevouts_and_skips_coinbase() -> Result<()> {

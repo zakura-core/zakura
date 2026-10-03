@@ -33,6 +33,9 @@ ALLOWED_ORIGINS = frozenset({"https://zakura.com", "https://nu7.valargroup.dev"}
 # Bounds for the public HTTP server, so parallel or stalled clients cannot exhaust
 # threads on the fork host.
 MAX_CONCURRENT_REQUESTS = 16
+# The systemd credential holding the faucet's own key. It is never the operator
+# mining key, so a leaked faucet host exposes only the faucet's balance.
+FAUCET_KEY_CREDENTIAL = "faucet-key.hex"
 REQUEST_TIMEOUT_SECONDS = 10
 CLAIM_ID = re.compile(r"[A-Za-z0-9_-]{20,40}\Z")
 TXID = re.compile(r"FAUCET_TXID=([0-9a-f]{64})\b")
@@ -59,10 +62,10 @@ def client_ip(text: str) -> str:
 
 
 class Faucet:
-    def __init__(self, db: Path, rpc_port: int, miner_address: str, sender: Path, config: Path):
+    def __init__(self, db: Path, rpc_port: int, faucet_address: str, sender: Path, config: Path):
         self.db = db
         self.rpc_port = rpc_port
-        self.miner_address = miner_address
+        self.faucet_address = faucet_address
         self.sender = sender
         self.config = config
         self.lock = threading.Lock()
@@ -101,7 +104,7 @@ class Faucet:
             if self.funds_cache and time.time() - self.funds_cache[0] < 20:
                 return self.funds_cache[1]
         tip = rpc(self.rpc_port, "getblockcount")
-        utxos = rpc(self.rpc_port, "getaddressutxos", [{"addresses": [self.miner_address]}])
+        utxos = rpc(self.rpc_port, "getaddressutxos", [{"addresses": [self.faucet_address]}])
         # The sender leaves two confirmations beyond the 100-block maturity rule.
         matured = sum(item["height"] <= tip - 102 and item["satoshis"] >= PAYOUT_ZAT + FEE_ZAT
                       for item in utxos)
@@ -164,7 +167,7 @@ class Faucet:
         self.throttle_attempt(ip)
         self.validate_address(address)
         if not self.funding_status()["ready"]:
-            raise RuntimeError("Faucet is waiting for mature miner rewards")
+            raise RuntimeError("Faucet is waiting for mature mining rewards")
         now = int(time.time())
         day_start = int(datetime.now(timezone.utc).replace(hour=0, minute=0, second=0,
                                                            microsecond=0).timestamp())
@@ -215,11 +218,11 @@ class Faucet:
             return
         credential_dir = os.environ.get("CREDENTIALS_DIRECTORY")
         if not credential_dir:
-            raise RuntimeError("systemd did not provide the miner key credential")
+            raise RuntimeError("systemd did not provide the faucet key credential")
         command = [
             str(self.sender), "--rpc", f"127.0.0.1:{self.rpc_port}",
-            "--config", str(self.config), "--address", self.miner_address,
-            "--secret-key-file", str(Path(credential_dir) / "miner-key.hex"),
+            "--config", str(self.config), "--address", self.faucet_address,
+            "--secret-key-file", str(Path(credential_dir) / FAUCET_KEY_CREDENTIAL),
             "--recipient", row["address"], "--amount-zat", str(PAYOUT_ZAT),
             "--fee", str(FEE_ZAT), "--count", "1",
         ]
@@ -344,14 +347,15 @@ class Handler(BaseHTTPRequestHandler):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--db", type=Path, required=True)
-    parser.add_argument("--miner-address", required=True)
+    parser.add_argument("--faucet-address", required=True,
+                        help="the faucet's own transparent address, funded by its node's coinbase")
     parser.add_argument("--sender", type=Path, required=True)
     parser.add_argument("--config", type=Path, default=Path("/etc/zakura/zakura.toml"))
     parser.add_argument("--rpc-port", type=int, default=18232)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8094)
     args = parser.parse_args()
-    faucet = Faucet(args.db, args.rpc_port, args.miner_address, args.sender, args.config)
+    faucet = Faucet(args.db, args.rpc_port, args.faucet_address, args.sender, args.config)
     Handler.faucet = faucet
     threading.Thread(target=faucet.run_worker, daemon=True).start()
     BoundedHTTPServer((args.host, args.port), Handler).serve_forever()

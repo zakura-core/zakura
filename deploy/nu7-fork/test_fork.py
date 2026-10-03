@@ -136,6 +136,24 @@ class RenderedNodes(unittest.TestCase):
         self.assertIs(observer["internal_miner"], True)
         self.assertEqual(observer["extra_coinbase_data"], "zakura-nu7-fork-2")
 
+    def test_the_primary_funds_a_separate_faucet_address(self):
+        config = base_config(PEER)
+        config["faucet"] = {"address": "tmFaucetAddressXXXXXXXXXXXXXXXXXXXX"}
+        config["remote"] = [{"name": "eu", "ssh_string": "root@203.0.113.7",
+                             "initial_testnet_peers": ["seed.example:18233"]}]
+        nodes = __import__("tomllib").loads(render(config))
+        primary, observer, remote = nodes["nodes"]
+        self.assertEqual(nodes["defaults"]["miner_address"], "tmGkvoQGmvJu6H5Wp22wUFAsBuX6SPGHnMq")
+        self.assertEqual(primary["miner_address"], "tmFaucetAddressXXXXXXXXXXXXXXXXXXXX")
+        self.assertNotIn("miner_address", remote)
+        self.assertEqual(observer["miner_address"], "")
+
+    def test_the_faucet_may_not_share_the_miner_address(self):
+        config = base_config(PEER)
+        config["faucet"] = {"address": config["miner"]["address"]}
+        with self.assertRaises(fork.ForkError):
+            render(config)
+
     def test_a_missing_miner_address_is_refused(self):
         config = base_config(PEER)
         config["miner"]["address"] = ""

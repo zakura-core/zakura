@@ -95,7 +95,14 @@ volume_name = "zakura-pr-nu7-fork-state"
 
 [miner]
 # Transparent address receiving the fork's coinbase. Testnet-encoded, because a
-# configured testnet keeps NetworkKind::Testnet address prefixes.
+# configured testnet keeps NetworkKind::Testnet address prefixes. Its key stays
+# with the operator, off every fork host.
+address = ""
+
+[faucet]
+# The faucet's own transparent address. The primary mines to it, and the faucet
+# spends only that coinbase, so its host holds this key and never the miner key.
+# Must differ from miner.address. Leave empty to run without a faucet.
 address = ""
 
 [peer]

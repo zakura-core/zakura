@@ -8,8 +8,14 @@ Type=simple
 DynamicUser=yes
 StateDirectory=zakura-nu7-faucet
 WorkingDirectory=/opt/zakura-nu7-faucet
-LoadCredential=miner-key.hex:/root/fork-miner-key.hex
-ExecStart=/usr/bin/python3 /opt/zakura-nu7-faucet/faucet.py --db /var/lib/zakura-nu7-faucet/claims.sqlite3 --miner-address tmGkvoQGmvJu6H5Wp22wUFAsBuX6SPGHnMq --sender /usr/local/bin/zakura-fork-txload --config /etc/zakura/zakura.toml
+# The faucet's own key and address, never the operator mining key. The primary
+# node mines to FAUCET_ADDRESS, so a leaked faucet host exposes only that balance.
+# faucet.env holds no secret: FAUCET_ADDRESS=t... and, to keep an existing
+# generation's claims database, FAUCET_DB=<its path>.
+Environment=FAUCET_DB=/var/lib/zakura-nu7-faucet/claims.sqlite3
+EnvironmentFile=/etc/zakura-nu7-faucet/faucet.env
+LoadCredential=faucet-key.hex:/etc/zakura-nu7-faucet/faucet-key.hex
+ExecStart=/usr/bin/python3 /opt/zakura-nu7-faucet/faucet.py --db ${FAUCET_DB} --faucet-address ${FAUCET_ADDRESS} --sender /usr/local/bin/zakura-fork-txload --config /etc/zakura/zakura.toml
 Restart=always
 RestartSec=10
 Nice=10

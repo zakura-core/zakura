@@ -305,8 +305,8 @@ for its first ~100 blocks.
 ## Public faucet
 
 `faucet.py` accepts Testnet Unified Addresses with an Orchard receiver and uses
-`zakura-fork-txload` to send **0.1 testnet ZEC in Ironwood** from mature miner
-coinbase. It allows one claim per address and two per client IP every 24 hours,
+`zakura-fork-txload` to send **0.1 testnet ZEC in Ironwood** from mature
+coinbase at the faucet's own address. It allows one claim per address and two per client IP every 24 hours,
 at most 100 claims (10 ZEC) per UTC day. Claims are queued persistently in
 SQLite, spaced at least 30 seconds apart, and in-flight claims become
 `review` after a restart so a broadcast is never repeated automatically.
@@ -333,14 +333,29 @@ Wait for coinbase maturity before reopening the faucet.
 
 Install the release build as `/usr/local/bin/zakura-fork-txload`, install
 `faucet.py` under `/opt/zakura-nu7-faucet`, and install `faucet.service` as
-`zakura-nu7-faucet.service`. The service uses systemd `LoadCredential` to give
-the existing miner key file to an isolated worker. Edit the service's miner
-address and key path together if mining moves to another host. Add the faucet
-route in `dashboard.Caddyfile`, validate Caddy, then start the service.
+`zakura-nu7-faucet.service`.
+
+**The faucet has its own key.** It never holds the operator mining key. The
+fork config's `faucet.address` is a separate transparent address, and the primary
+node mines to it, while the remote miners keep mining to `miner.address`, whose
+key stays off every fork host. The faucet therefore spends only the primary's
+coinbase, and a leaked faucet host exposes only that balance. Coinbase cannot be
+moved to another transparent address (it must have no transparent outputs), so
+mining to the faucet address is how it is funded. `fork.py` refuses a faucet
+address equal to the miner address, and `zakura-fork-txload` refuses a key that
+does not control `--address`.
+
+The service loads `/etc/zakura-nu7-faucet/faucet-key.hex` (root-owned, mode
+0600) through systemd `LoadCredential`, and reads `FAUCET_ADDRESS`, and
+optionally an existing `FAUCET_DB`, from `/etc/zakura-nu7-faucet/faucet.env`,
+which holds no secret. Add the faucet route in `dashboard.Caddyfile`, validate
+Caddy, then start the service. After switching the primary to a new faucet
+address, the faucet reports itself unavailable until that address has mature
+coinbase, about 100 primary-mined blocks.
 
 The output beyond the exact payout and the 100,000-zatoshi fee goes to a
-deterministic Ironwood change address derived from the miner key. The current
-sender does not spend those change notes; retain the miner key for future
+deterministic Ironwood change address derived from the faucet key. The current
+sender does not spend those change notes; retain the faucet key for future
 recovery tooling. This limits the faucet to fresh mature coinbase outputs until
 shielded change spending is implemented.
 

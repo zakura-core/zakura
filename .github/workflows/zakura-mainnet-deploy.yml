@@ -787,6 +787,7 @@ jobs:
         if: always()
         env:
           SLACK_WEB_HOOK: ${{ secrets.SLACK_WEB_HOOK }}
+          PAGERDUTY_ROUTING_KEY: ${{ secrets.PAGERDUTY_ROUTING_KEY }}
         run: |
           set -euo pipefail
 
@@ -799,19 +800,30 @@ jobs:
           sudo install -m 644 deploy/runner/fleet-watchdog.toml "$watchdog_dir/fleets.toml"
           sudo install -m 644 deploy/runner/zakura-fleet-watchdog.service /etc/systemd/system/zakura-fleet-watchdog.service
 
-          # Incoming webhook for #zakura-alerts.
+          # Incoming webhook for #zakura-alerts and the PagerDuty Events API v2
+          # integration key for paged incidents. A deploy that omits a secret
+          # keeps that secret's existing line.
           tmp_env="$(mktemp)"
+          keep_env() {
+            if sudo test -f /etc/zakura-fleet-watchdog/env; then
+              sudo grep -E "$1" /etc/zakura-fleet-watchdog/env >> "$tmp_env" || :
+            fi
+          }
           if [ -n "${SLACK_WEB_HOOK}" ]; then
-            printf 'SLACK_WEB_HOOK=%s\n' "${SLACK_WEB_HOOK}" > "$tmp_env"
-          elif sudo test -f /etc/zakura-fleet-watchdog/env; then
-            # Keep an existing webhook env across deploys that omit the secret.
-            sudo grep -E '^(SLACK_WEB_HOOK|SLACK_WEBHOOK_URL|SLACK_WEBHOOK)=' \
-              /etc/zakura-fleet-watchdog/env | tee "$tmp_env" >/dev/null || : > "$tmp_env"
+            printf 'SLACK_WEB_HOOK=%s\n' "${SLACK_WEB_HOOK}" >> "$tmp_env"
           else
-            : > "$tmp_env"
+            keep_env '^(SLACK_WEB_HOOK|SLACK_WEBHOOK_URL|SLACK_WEBHOOK)='
+          fi
+          if [ -n "${PAGERDUTY_ROUTING_KEY}" ]; then
+            printf 'PAGERDUTY_ROUTING_KEY=%s\n' "${PAGERDUTY_ROUTING_KEY}" >> "$tmp_env"
+          else
+            keep_env '^PAGERDUTY_ROUTING_KEY='
           fi
           if ! grep -qE '^(SLACK_WEB_HOOK|SLACK_WEBHOOK_URL|SLACK_WEBHOOK)=' "$tmp_env"; then
             echo "::warning::SLACK_WEB_HOOK is not set; fleet watchdog cannot post to Slack"
+          fi
+          if ! grep -qE '^PAGERDUTY_ROUTING_KEY=' "$tmp_env"; then
+            echo "::warning::PAGERDUTY_ROUTING_KEY is not set; fleet watchdog cannot page"
           fi
           sudo install -m 600 "$tmp_env" /etc/zakura-fleet-watchdog/env
           rm -f "$tmp_env"

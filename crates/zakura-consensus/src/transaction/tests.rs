@@ -6732,10 +6732,11 @@ fn mempool_unknown_anchor_skips_cryptographic_verification() {
             ValidateContextError::UnknownOrchardAnchor { .. }
         ));
 
-        let (mut verifier, mut state) = cache_test_verifier();
+        let (mut verifier, state) = cache_test_verifier();
+        let mut responder_state = state.clone();
         let state_response = context_error.clone();
         let responder = tokio::spawn(async move {
-            state
+            responder_state
                 .expect_request_that(|request| {
                     matches!(
                         request,
@@ -6759,6 +6760,7 @@ fn mempool_unknown_anchor_skips_cryptographic_verification() {
             .await
             .expect("the verifier has received this responder's state result");
         assert_eq!(error, TransactionError::ValidateContextError(context_error));
+        assert_eq!(error.mempool_misbehavior_score(), 0);
         assert_eq!(primitives::halo2::inner_calls_for(upgrade, &item), 0);
 
         respond_to_nullifier_and_anchor_check(&state);

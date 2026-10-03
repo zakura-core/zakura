@@ -16,7 +16,11 @@ use tower::{util::ServiceFn, Service};
 use tower_batch_control::{Batch, BatchControl, RequestWeight};
 use tower_fallback::Fallback;
 
-use sapling_crypto::{bundle::Authorized, BatchValidator, Bundle};
+use sapling_crypto::{
+    bundle::Authorized,
+    circuit::{OutputVerifyingKey, SpendVerifyingKey},
+    BatchValidator, Bundle, PreparedBatchVerifyingKeys,
+};
 use zakura_chain::transaction::{SigHash, UnminedTxId};
 use zcash_proofs::prover::LocalTxProver;
 use zcash_protocol::value::ZatBalance;
@@ -49,6 +53,30 @@ static SAPLING: Lazy<LocalTxProver> = Lazy::new(LocalTxProver::bundled);
 /// reused for proof construction and verification for the lifetime of the process.
 pub fn sapling_prover() -> &'static LocalTxProver {
     Lazy::force(&SAPLING)
+}
+
+/// The Sapling Spend and Output verifying keys, shared by every batch validation in the process.
+///
+/// Each key prepares its fixed G2 pairing terms on first use and keeps them, so sharing one pair
+/// prepares them once per process. [`LocalTxProver::verifying_keys`] returns new, unprepared keys
+/// on every call, so calling it per batch would redo that preparation for every batch.
+///
+/// The keys are derived from the same bundled parameters as [`SAPLING`], so they are the keys
+/// the Sapling circuit has always been verified under.
+static VERIFYING_KEYS: Lazy<(SpendVerifyingKey, OutputVerifyingKey)> =
+    Lazy::new(|| SAPLING.verifying_keys());
+
+/// Returns the process-wide Sapling verifying keys, borrowed for batch validation.
+fn prepared_verifying_keys() -> PreparedBatchVerifyingKeys<'static> {
+    let (spend_vk, output_vk) = Lazy::force(&VERIFYING_KEYS);
+    PreparedBatchVerifyingKeys::new(spend_vk, output_vk)
+}
+
+/// Validates every proof and signature queued in `batch` under the process-wide verifying keys.
+///
+/// This is CPU-intensive, so callers run it off the async executor.
+fn validate(batch: BatchValidator) -> bool {
+    batch.validate_prepared(&prepared_verifying_keys(), thread_rng())
 }
 
 /// A Sapling verification item, used as the request type of the service.
@@ -154,11 +182,8 @@ impl Drop for Verifier {
 
         // The validation is CPU-intensive; do it on a dedicated thread so it does not block.
         rayon::spawn_fifo(move || {
-            let (spend_vk, output_vk) = SAPLING.verifying_keys();
-
             // Validate the batch and send the result through the channel.
-            let res = batch.validate(&spend_vk, &output_vk, thread_rng());
-            let _ = tx.send(Some(res));
+            let _ = tx.send(Some(validate(batch)));
         });
     }
 }
@@ -215,11 +240,7 @@ impl Service<BatchControl<Item>> for Verifier {
 
                 async move {
                     let start = std::time::Instant::now();
-                    let spawn_result = tokio::task::spawn_blocking(move || {
-                        let (spend_vk, output_vk) = SAPLING.verifying_keys();
-                        batch.validate(&spend_vk, &output_vk, thread_rng())
-                    })
-                    .await;
+                    let spawn_result = tokio::task::spawn_blocking(move || validate(batch)).await;
                     let duration = start.elapsed().as_secs_f64();
 
                     let result_label = match &spawn_result {
@@ -258,13 +279,10 @@ pub fn verify_single(
             .ok_or(TransactionError::SaplingVerificationFailed);
         check.map_err(BoxError::from)?;
 
-        let is_valid = tokio::task::spawn_blocking(move || {
-            let (spend_vk, output_vk) = SAPLING.verifying_keys();
-
-            mem::take(&mut verifier.batch).validate(&spend_vk, &output_vk, thread_rng())
-        })
-        .await
-        .map_err(|_| BoxError::from("Sapling bundle validation thread panicked"))?;
+        let is_valid =
+            tokio::task::spawn_blocking(move || validate(mem::take(&mut verifier.batch)))
+                .await
+                .map_err(|_| BoxError::from("Sapling bundle validation thread panicked"))?;
 
         if is_valid {
             Ok(())

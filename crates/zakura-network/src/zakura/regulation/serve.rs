@@ -534,7 +534,7 @@ async fn write_in_order(
             let slot = tokio::select! {
                 biased;
                 () = cancel.cancelled() => return,
-                slot = send.reserve_guarded() => slot,
+                slot = send.reserve_response_guarded() => slot,
             };
             match slot {
                 Ok(slot) => slot.send(frame, guard),

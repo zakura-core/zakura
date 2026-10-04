@@ -16,7 +16,7 @@
 use tokio::sync::mpsc;
 
 use super::Frame;
-use crate::zakura::regulation::{PrecheckSlot, ResponsePrecheck};
+use crate::zakura::regulation::{PrecheckSlot, ResponsePrecheck, SlotBudget, SlotPermit};
 use std::sync::{Arc, OnceLock};
 
 /// Why a persistent stream ended before local cancellation.
@@ -146,6 +146,7 @@ impl FramedRecv {
 #[derive(Clone, Debug)]
 pub struct FramedSend {
     sender: FramedSender,
+    response_slots: Option<SlotBudget>,
     session_resources: Option<Arc<dyn super::service::SessionResources>>,
 }
 
@@ -160,12 +161,16 @@ impl FramedSend {
     pub fn new(sender: mpsc::Sender<Frame>) -> Self {
         Self {
             sender: FramedSender::Plain(sender),
+            response_slots: None,
             session_resources: None,
         }
     }
 
     fn queued(sender: mpsc::Sender<QueuedFrame>) -> Self {
+        let response_slots = SlotBudget::new(sender.max_capacity().saturating_sub(1).max(1))
+            .expect("a transport queue has a positive semaphore-bounded capacity");
         Self {
+            response_slots: Some(response_slots),
             sender: FramedSender::Queued(sender),
             session_resources: None,
         }
@@ -229,6 +234,21 @@ impl FramedSend {
             .map_err(|_| GuardedReserveError::Closed)
     }
 
+    /// Reserve a response without consuming the last queue slot for control.
+    /// The response allowance is shared by all sender clones and held through
+    /// the write. A one-slot test queue cannot provide independent headroom.
+    pub(crate) async fn reserve_response_guarded(
+        &self,
+    ) -> Result<ResponseFrameSlot<'_>, GuardedReserveError> {
+        let budget = self
+            .response_slots
+            .as_ref()
+            .ok_or(GuardedReserveError::Unsupported)?;
+        let response = budget.reserve().await;
+        let slot = self.reserve_guarded().await?;
+        Ok(ResponseFrameSlot { slot, response })
+    }
+
     /// Current free slots in the bounded transport queue.
     pub fn capacity(&self) -> usize {
         match &self.sender {
@@ -272,6 +292,20 @@ impl GuardedFrameSlot<'_> {
             claim: Some(claim),
         });
         !self.sender.is_closed()
+    }
+}
+
+/// A response queue slot that leaves space for independent control traffic.
+#[derive(Debug)]
+pub(crate) struct ResponseFrameSlot<'a> {
+    slot: GuardedFrameSlot<'a>,
+    response: SlotPermit,
+}
+
+impl ResponseFrameSlot<'_> {
+    pub(crate) fn send(self, frame: Frame, guard: FrameGuard) {
+        self.slot
+            .send(frame, FrameGuard::new(Arc::new((guard, self.response))));
     }
 }
 

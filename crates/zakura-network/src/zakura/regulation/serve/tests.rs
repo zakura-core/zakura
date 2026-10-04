@@ -906,3 +906,35 @@ async fn queued_requests_allocate_only_commitments_until_dispatch() {
     assert_eq!(serve.open(), 0, "cancelled jobs release their commitments");
     assert!(completions.iter().all(|completed| *completed.borrow()));
 }
+
+#[tokio::test]
+async fn serving_output_keeps_a_queue_slot_for_control_messages() {
+    let capacity = capacity(LIMITS);
+    let (send, mut output) = framed_channel(4);
+    let cancel = CancellationToken::new();
+    let serve = capacity.session(
+        Arc::new(Scripted),
+        &peer(1),
+        4,
+        send.clone(),
+        cancel.clone(),
+    );
+    serve
+        .admit(Job {
+            parts: 10,
+            part_len: 1,
+            ..job()
+        })
+        .unwrap();
+    settle().await;
+    let control = crate::zakura::wire_codec::encode_frame(&Probe::Ping(7)).unwrap();
+    send.try_send(control)
+        .expect("serving must leave room for our control traffic");
+    let mut messages = Vec::new();
+    for _ in 0..12 {
+        messages.push(next(&mut output).await);
+    }
+    assert!(messages[..4].contains(&Probe::Ping(7)));
+    assert_eq!(messages.last(), Some(&Probe::Done(10)));
+    cancel.cancel();
+}

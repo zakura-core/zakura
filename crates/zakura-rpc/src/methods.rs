@@ -17,14 +17,11 @@
 //!   has an appropriate API for accessing any relevant data.
 //!
 //!   This should be achieved, wherever possible, by:
-//!   - Using `derive(Getters, new)` to keep new code succinct and consistent.
-//!     Ensure that fields on response types that implement `Copy` are tagged
-//!     with `#[getter(copy)]` field attributes to avoid unnecessary references.
-//!     This should be easily noticeable in the `serialization_tests` test crate, where
-//!     any fields implementing `Copy` but not tagged with `#[getter(Copy)]` will
-//!     be returned by reference, and will require dereferencing with the dereference
-//!     operator, `*`. If a value returned by a getter method requires dereferencing,
-//!     the associated field in the response type should likely be tagged with `#[getter(Copy)]`.
+//!   - Use [`getset::Getters`] and [`getset::CopyGetters`] with `new` to keep
+//!     response accessors consistent. Select `#[getset(get = "pub")]` for
+//!     borrowed fields and `#[getset(get_copy = "pub")]` for fields returned
+//!     by value. Check the `serialization_tests` test crate for the expected
+//!     return types.
 //!   - If a field is added, use `#[new(...)]` so that it's not added to the
 //!     constructor. If that is unavoidable, then it will require a major
 //!     version bump.
@@ -41,9 +38,9 @@ use std::{
 };
 
 use chrono::Utc;
-use derive_getters::Getters;
 use derive_new::new;
 use futures::{future::OptionFuture, stream::FuturesOrdered, StreamExt, TryFutureExt};
+use getset::{CopyGetters, Getters};
 use hex::{FromHex, ToHex};
 use indexmap::IndexMap;
 use jsonrpsee::core::{async_trait, RpcResult as Result};
@@ -65,13 +62,14 @@ use zakura_chain::{
     chain_tip::{ChainTip, NetworkChainTipHeightEstimator},
     parameters::{
         subsidy::{
-            block_subsidy, founders_reward, funding_stream_values, miner_subsidy,
-            FundingStreamReceiver,
+            block_subsidy, founders_reward, funding_stream_values, is_zip234_active, miner_subsidy,
+            parent_nsm_value_balance, FundingStreamReceiver,
         },
-        ConsensusBranchId, Network, NetworkUpgrade, POST_BLOSSOM_POW_TARGET_SPACING,
-        POW_AVERAGING_WINDOW,
+        ConsensusBranchId, Network, NetworkUpgrade,
     },
-    serialization::{BytesInDisplayOrder, ZcashDeserialize, ZcashDeserializeInto, ZcashSerialize},
+    serialization::{
+        BytesInDisplayOrder, Duration32, ZcashDeserialize, ZcashDeserializeInto, ZcashSerialize,
+    },
     subtree::NoteCommitmentSubtreeIndex,
     transaction::{self, SerializedTransaction, Transaction, UnminedTx},
     transparent::{self, Address, OutputIndex},
@@ -117,7 +115,7 @@ use types::{
     chain_tips::{self, GetChainTipsResponse},
     get_block_template::{
         constants::{
-            DEFAULT_SOLUTION_RATE_WINDOW_SIZE, MEMPOOL_LONG_POLL_INTERVAL,
+            DEFAULT_SOLUTION_RATE_WINDOW_SIZE, MAX_TEMPLATE_REBUILDS, MEMPOOL_LONG_POLL_INTERVAL,
             ZCASHD_FUNDING_STREAM_ORDER,
         },
         proposal::proposal_block_from_template,
@@ -151,6 +149,8 @@ where
 {
     service.oneshot(request).await.map_misc_error()
 }
+
+mod openrpc;
 
 include!("methods/rpc_openrpc.rs");
 
@@ -280,6 +280,8 @@ pub(super) const PARAM_VERBOSITY_DESC: &str = "Whether to include verbose output
 pub(super) const PARAM_N_DESC: &str = "The output index in the transaction.";
 pub(super) const PARAM_INCLUDE_MEMPOOL_DESC: &str =
     "Whether to include mempool transactions in the response.";
+
+mod hex_serde;
 
 #[cfg(test)]
 mod tests;
@@ -755,7 +757,7 @@ pub trait Rpc {
     /// `height`.
     ///
     /// If `num_blocks` is not supplied, uses 120 blocks. If it is 0 or -1, uses the difficulty
-    /// averaging window.
+    /// averaging window at `height`, which ZIP 218 widens at NU7.
     /// If `height` is not supplied or is -1, uses the tip height.
     ///
     /// zcashd reference: [`getnetworksolps`](https://zcash.github.io/rpc/getnetworksolps.html)
@@ -854,6 +856,9 @@ pub trait Rpc {
     /// # Notes
     ///
     /// If `height` is not supplied, uses the tip height.
+    ///
+    /// From the ZIP 234 reissuance start height, the subsidy depends on the parent block's
+    /// chain value pools, so `height` must be at most one block above the best chain tip.
     #[method(name = "getblocksubsidy")]
     async fn get_block_subsidy(&self, height: Option<u32>) -> Result<GetBlockSubsidyResponse>;
 
@@ -937,7 +942,7 @@ pub trait Rpc {
 
     /// Returns an OpenRPC schema as a description of this service.
     #[method(name = "rpc.discover")]
-    fn openrpc(&self) -> openrpsee::openrpc::Response;
+    fn openrpc(&self) -> Result<serde_json::Value>;
     /// Returns details about an unspent transaction output.
     ///
     /// zcashd reference: [`gettxout`](https://zcash.github.io/rpc/gettxout.html)
@@ -1203,19 +1208,92 @@ where
         }
     }
 
+    /// Builds proofs on the blocking pool and maps construction or worker failures to RPC errors.
+    #[allow(clippy::too_many_arguments)]
+    async fn build_mining_template(
+        &self,
+        precomputed_coinbase: Option<TransactionTemplate<zakura_chain::amount::NegativeOrZero>>,
+        miner_params: &types::get_block_template::MinerParams,
+        chain_info: &zakura_state::GetBlockTemplateChainInfo,
+        long_poll_id: types::long_poll::LongPollId,
+        mempool_txs: Vec<types::get_block_template::zip317::SelectedMempoolTx>,
+        submit_old: Option<bool>,
+    ) -> Result<BlockTemplateResponse> {
+        // An empty template with a completed coinbase has no proof work to queue.
+        if precomputed_coinbase.is_some() && mempool_txs.is_empty() {
+            return BlockTemplateResponse::new_internal(
+                &self.network,
+                precomputed_coinbase,
+                miner_params,
+                chain_info,
+                long_poll_id,
+                mempool_txs,
+                submit_old,
+            )
+            .map_misc_error();
+        }
+
+        let network = self.network.clone();
+        let miner_params = miner_params.clone();
+        let chain_info = chain_info.clone();
+        self.gbt
+            .run_template_build(move || {
+                BlockTemplateResponse::new_internal(
+                    &network,
+                    precomputed_coinbase,
+                    &miner_params,
+                    &chain_info,
+                    long_poll_id,
+                    mempool_txs,
+                    submit_old,
+                )
+            })
+            .await?
+            .map_misc_error()
+    }
+
+    /// Selects `parent` for new templates, but only while it is still the best tip.
+    ///
+    /// The tip check and the parent update happen under the rejection-state write lock,
+    /// so a caller that fetched its chain info before a tip change cannot overwrite the
+    /// parent (and clear the rejection records) that a faster caller already selected.
+    fn select_mining_template_parent(&self, parent: block::Hash) -> bool {
+        let mut selected = false;
+        self.gbt.template_rejections.send_if_modified(|state| {
+            if self
+                .latest_chain_tip
+                .best_tip_hash()
+                .is_some_and(|tip| tip != parent)
+            {
+                return false;
+            }
+            selected = true;
+            let changed = state.parent != Some(parent);
+            state.set_parent(parent);
+            changed
+        });
+        selected
+    }
+
+    /// Returns `Ok(None)` when the template was superseded while it was being built:
+    /// the tip moved, a concurrent caller selected a newer parent, or the rejection
+    /// revision changed outside fallback mode. The caller must rebuild from fresh state
+    /// rather than surface a transient error to the miner.
     async fn finish_mining_template(
         &self,
         mut template: BlockTemplateResponse,
         chain_info: &zakura_state::GetBlockTemplateChainInfo,
         miner_params: &types::get_block_template::MinerParams,
-    ) -> Result<GetBlockTemplateResponse> {
+    ) -> Result<Option<GetBlockTemplateResponse>> {
         let state = self.gbt.template_rejections.borrow().clone();
-        if state.parent != Some(chain_info.tip_hash) {
-            return Err(ErrorObject::owned(
-                0,
-                "template parent changed; retry",
-                None::<()>,
-            ));
+        if state.parent != Some(chain_info.tip_hash)
+            || self
+                .latest_chain_tip
+                .best_tip_hash()
+                .is_some_and(|tip| tip != chain_info.tip_hash)
+            || (!state.needs_fallback() && state.revision != template.long_poll_id.revision)
+        {
+            return Ok(None);
         }
         if state.needs_fallback() {
             if state.saturated {
@@ -1232,19 +1310,23 @@ where
                 template.submit_old
             };
             long_poll_id.revision = state.revision;
-            template = BlockTemplateResponse::new_internal(
-                &self.network,
-                None,
-                miner_params,
-                chain_info,
-                long_poll_id,
-                vec![],
-                submit_old,
-            );
+            template = self
+                .build_mining_template(
+                    None,
+                    miner_params,
+                    chain_info,
+                    long_poll_id,
+                    vec![],
+                    submit_old,
+                )
+                .await?;
             let block =
                 proposal_block_from_template(&template, None, &self.network).map_misc_error()?;
-            tokio::time::timeout(
-                Duration::from_secs(30),
+            // One deadline covers validation and the committed-tip check that follows it,
+            // so a slow validation cannot hand the tip read an already-expired budget.
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+            let validation = tokio::time::timeout_at(
+                deadline,
                 self.gbt
                     .block_verifier_router()
                     .oneshot(zakura_consensus::Request::Prepare {
@@ -1253,34 +1335,56 @@ where
                         source: zakura_consensus::PreparedCandidateSource::ServerTemplate,
                     }),
             )
-            .await
-            .map_misc_error()?
-            .map_misc_error()?;
-            // A fallback must still belong to the context we just validated.
-            let current = self.gbt.template_rejections.borrow();
-            if current.parent != state.parent
-                || current.revision != state.revision
-                || current.contains(template.work_id())
-                || self
-                    .latest_chain_tip
-                    .best_tip_hash()
-                    .is_some_and(|tip| tip != chain_info.tip_hash)
-            {
-                return Err(ErrorObject::owned(
-                    0,
-                    "template changed during recovery; retry",
-                    None::<()>,
-                ));
-            }
-            drop(current);
-            self.gbt.template_rejections.send_if_modified(|state| {
-                state.mark_prepared(chain_info.tip_hash, template.work_id());
+            .await;
+            // A fallback must still belong to the context it was validated against.
+            // Check that and record success under one write lock, so a rejection cannot
+            // land between the two and leave this work marked prepared for a stale parent.
+            let mut current_context = false;
+            self.gbt.template_rejections.send_if_modified(|current| {
+                if current.parent != state.parent
+                    || current.revision != state.revision
+                    || current.contains(template.work_id())
+                    || self
+                        .latest_chain_tip
+                        .best_tip_hash()
+                        .is_some_and(|tip| tip != chain_info.tip_hash)
+                {
+                    return false;
+                }
+                current_context = true;
+                if matches!(validation, Ok(Ok(_))) {
+                    current.mark_prepared(chain_info.tip_hash, template.work_id());
+                }
                 false
             });
+            if !current_context {
+                return Ok(None);
+            }
+            if !matches!(validation, Ok(Ok(_))) {
+                // State commits precede tip notifications, so a proposal can fail against
+                // a parent that both watches still name. Confirm against committed state
+                // before surfacing a verifier error the caller can do nothing about.
+                let response = tokio::time::timeout_at(
+                    deadline,
+                    call_service(self.read_state.clone(), zakura_state::ReadRequest::Tip),
+                )
+                .await
+                .map_misc_error()??;
+                match response {
+                    zakura_state::ReadResponse::Tip(Some((_, tip)))
+                        if tip != chain_info.tip_hash =>
+                    {
+                        return Ok(None);
+                    }
+                    zakura_state::ReadResponse::Tip(_) => {}
+                    _ => unreachable!("unmatched response to a tip request"),
+                }
+            }
+            validation.map_misc_error()?.map_misc_error()?;
         } else {
             self.prepare_template_in_background(&template);
         }
-        Ok(template.into())
+        Ok(Some(template.into()))
     }
 
     fn prepare_template_in_background(&self, template: &BlockTemplateResponse) {
@@ -1477,12 +1581,14 @@ where
                     .latest_chain_tip
                     .best_tip_height()
                     .unwrap_or_else(|| self.network.checkpoint_list().max_height());
-                let remaining_blocks = i64::from(end_of_support_height.0) - i64::from(tip_height.0);
+                let remaining_seconds = target_seconds_between_heights(
+                    &self.network,
+                    tip_height,
+                    end_of_support_height,
+                );
                 let estimated_time = Utc::now()
                     .timestamp()
-                    .saturating_add(
-                        remaining_blocks.saturating_mul(i64::from(POST_BLOSSOM_POW_TARGET_SPACING)),
-                    )
+                    .saturating_add(remaining_seconds)
                     .saturating_sub(END_OF_SERVICE_ESTIMATE_SAFETY_MARGIN)
                     .max(0);
 
@@ -1524,6 +1630,7 @@ where
             prune_height,
             (tip_height, tip_hash),
             value_balance,
+            nsm_value_balance_zat,
             difficulty,
         ) = {
             use zakura_state::ReadResponse::*;
@@ -1540,14 +1647,25 @@ where
                 unreachable!("unmatched response to a PruningInfo request")
             };
 
-            let (tip, value_balance) = match tip_pool_values_rsp {
+            // TipPoolValues soft-fails to genesis + a synthetic zero ValueBalance. The NSM
+            // counter is optional and distinguishes "not reported" from a legitimate zero, so
+            // only populate it when the query succeeded.
+            let (tip, value_balance, nsm_value_balance_zat) = match tip_pool_values_rsp {
                 Ok(TipPoolValues {
                     tip_height,
                     tip_hash,
                     value_balance,
-                }) => ((tip_height, tip_hash), value_balance),
+                }) => (
+                    (tip_height, tip_hash),
+                    value_balance,
+                    Some(value_balance.nsm_value_balance_amount()),
+                ),
                 Ok(_) => unreachable!("unmatched response to a TipPoolValues request"),
-                Err(_) => ((Height::MIN, network.genesis_hash()), Default::default()),
+                Err(_) => (
+                    (Height::MIN, network.genesis_hash()),
+                    Default::default(),
+                    None,
+                ),
             };
 
             let difficulty = chain_tip_difficulty
@@ -1559,6 +1677,7 @@ where
                 prune_height,
                 tip,
                 value_balance,
+                nsm_value_balance_zat,
                 difficulty,
             )
         };
@@ -1652,6 +1771,7 @@ where
             estimated_height,
             chain_supply: GetBlockchainInfoBalance::chain_supply(value_balance),
             value_pools: GetBlockchainInfoBalance::value_pools(value_balance, None),
+            nsm_value_balance_zat,
             upgrades,
             consensus,
             headers: header_height,
@@ -2833,309 +2953,367 @@ where
             .miner_params()
             .ok_or_error(0, "miner parameters are required for get_block_template")?;
 
-        // - Checks and fetches that can change during long polling
-        //
-        // Set up the loop.
+        // A template can be superseded while it is being built: the tip moves (a new
+        // block, or an equal-height reorg), a concurrent caller selects a newer parent,
+        // or the rejection revision changes outside fallback mode. Returning an error
+        // for that makes miners drop their current job (the internal miner backs off for
+        // 20 seconds) even though fresh work is one read away, so rebuild from current
+        // state instead. The bound guards against pathological tip or rejection churn.
         let mut max_time_reached = false;
-
-        // The loop returns the server long poll ID, which should be different to the client one.
-        let (server_long_poll_id, chain_info, mempool_txs, mempool_tx_deps, submit_old) = loop {
-            // Check if we are synced to the tip.
-            // The result of this check can change during long polling.
-            //
-            // Optional TODO:
-            // - add `async changed()` method to ChainSyncStatus (like `ChainTip`)
-            check_synced_to_tip(&self.network, latest_chain_tip.clone(), sync_status.clone())?;
-            // TODO: return an error if we have no peers, like `zcashd` does,
-            //       and add a developer config that mines regardless of how many peers we have.
-            // https://github.com/zcash/zcash/blob/6fdd9f1b81d3b228326c9826fa10696fc516444b/src/miner.cpp#L865-L880
-
-            // We're just about to fetch state data, then maybe wait for any changes.
-            // Mark all the changes before the fetch as seen.
-            // Changes are also ignored in any clones made after the mark.
-            latest_chain_tip.mark_best_tip_seen();
-
-            // Fetch the state data and local time for the block template:
-            // - if the tip block hash changes, we must return from long polling,
-            // - if the local clock changes on testnet, we might return from long polling
-            //
-            // We always return after 90 minutes on mainnet, even if we have the same response,
-            // because the max time has been reached.
-            let chain_info @ zakura_state::GetBlockTemplateChainInfo {
-                tip_hash,
-                tip_height,
-                max_time,
-                cur_time,
-                ..
-            } = fetch_chain_info(read_state.clone()).await?;
-            if latest_chain_tip
-                .best_tip_hash()
-                .is_some_and(|tip| tip != tip_hash)
-            {
-                continue;
-            }
-            self.gbt.template_rejections.send_if_modified(|state| {
-                let changed = state.parent != Some(tip_hash);
-                state.set_parent(tip_hash);
-                changed
-            });
-            let rejection_state = template_rejections.borrow_and_update().clone();
-
-            // Fetch the mempool data for the block template:
-            // - if the mempool transactions change, we might return from long polling.
-            //
-            // If the chain fork has just changed, miners want to get the new block as fast
-            // as possible, rather than wait for transactions to re-verify. This increases
-            // miner profits (and any delays can cause chain forks). So we don't wait between
-            // the chain tip changing and getting mempool transactions.
-            //
-            // Optional TODO:
-            // - add a `MempoolChange` type with an `async changed()` method (like `ChainTip`)
-            let Some((mempool_txs, mempool_tx_deps)) =
-                fetch_mempool_transactions(mempool.clone(), tip_hash)
-                    .await?
-                    // If the mempool and state responses are out of sync:
-                    // - if we are not long polling, omit mempool transactions from the template,
-                    // - if we are long polling, continue to the next iteration of the loop to make fresh state and mempool requests.
-                    .or_else(|| client_long_poll_id.is_none().then(Default::default))
-            else {
-                continue;
-            };
-
-            // - Long poll ID calculation
-            let mut server_long_poll_id = LongPollInput::new(
-                tip_height,
-                tip_hash,
-                max_time,
-                mempool_txs.iter().map(|tx| tx.transaction.id()),
-            )
-            .generate_id();
-            server_long_poll_id.revision = rejection_state.revision;
-
-            // The loop finishes if:
-            // - the client didn't pass a long poll ID,
-            // - the server long poll ID is different to the client long poll ID, or
-            // - the previous loop iteration waited until the max time.
-            if Some(&server_long_poll_id) != client_long_poll_id.as_ref() || max_time_reached {
-                // On testnet, the max time changes the block difficulty, so old shares are invalid.
-                // On mainnet, this means there has been 90 minutes without a new block or mempool
-                // transaction, which is very unlikely. So the miner should probably reset anyway.
-                let submit_old = if max_time_reached {
-                    Some(false)
-                } else {
-                    client_long_poll_id
-                        .as_ref()
-                        .map(|old_long_poll_id| server_long_poll_id.submit_old(old_long_poll_id))
-                };
-
-                break (
-                    server_long_poll_id,
-                    chain_info,
-                    mempool_txs,
-                    mempool_tx_deps,
-                    submit_old,
+        'rebuild: for rebuild in 0..=MAX_TEMPLATE_REBUILDS {
+            if rebuild > 0 {
+                metrics::counter!("mining.template.rebuilt").increment(1);
+                tracing::debug!(
+                    rebuild,
+                    "template superseded before it was returned; rebuilding on the current tip"
                 );
             }
 
-            // - Polling wait conditions
+            // - Checks and fetches that can change during long polling
             //
-            // TODO: when we're happy with this code, split it into a function.
-            //
-            // Periodically check the mempool for changes.
-            //
-            // Optional TODO:
-            // Remove this polling wait if we switch to using futures to detect sync status
-            // and mempool changes.
-            let wait_for_mempool_request =
-                tokio::time::sleep(Duration::from_secs(MEMPOOL_LONG_POLL_INTERVAL));
+            // Set up the loop.
+            // The loop returns the server long poll ID, which should be different to the client one.
+            let (server_long_poll_id, chain_info, mempool_txs, mempool_tx_deps, submit_old) = loop {
+                // Check if we are synced to the tip.
+                // The result of this check can change during long polling.
+                //
+                // Optional TODO:
+                // - add `async changed()` method to ChainSyncStatus (like `ChainTip`)
+                check_synced_to_tip(&self.network, latest_chain_tip.clone(), sync_status.clone())?;
+                // TODO: return an error if we have no peers, like `zcashd` does,
+                //       and add a developer config that mines regardless of how many peers we have.
+                // https://github.com/zcash/zcash/blob/6fdd9f1b81d3b228326c9826fa10696fc516444b/src/miner.cpp#L865-L880
 
-            // Return immediately if the chain tip has changed.
-            // The clone preserves the seen status of the chain tip.
-            let mut wait_for_new_tip = latest_chain_tip.clone();
-            let wait_for_new_tip = wait_for_new_tip.best_tip_changed();
-            // `+2`: we expect the tip to advance by one block before waking us up.
-            let precomputed_height = Height(chain_info.tip_height.0 + 2);
-            let wait_for_new_tip = async {
-                // Precompute the coinbase tx for an empty block that will sit on the new tip. We
-                // will return this provisional block upon a chain tip change so that miners can
-                // mine on the newest tip, and don't waste their effort on a shorter chain while we
-                // compute a new template for a properly filled block. We do this precomputation
-                // before we start waiting for a new tip since computing the coinbase tx takes a few
-                // seconds if the miner mines to a shielded address, and we want to return fast
-                // when the tip changes.
-                let precompute_coinbase = |network, height, params| {
-                    tokio::task::spawn_blocking(move || {
-                        TransactionTemplate::new_coinbase(&network, height, &params, Amount::zero())
-                            .expect("valid coinbase tx")
-                    })
+                // We're just about to fetch state data, then maybe wait for any changes.
+                // Mark all the changes before the fetch as seen.
+                // Changes are also ignored in any clones made after the mark.
+                latest_chain_tip.mark_best_tip_seen();
+
+                // Fetch the state data and local time for the block template:
+                // - if the tip block hash changes, we must return from long polling,
+                // - if the local clock changes on testnet, we might return from long polling
+                //
+                // We always return after 90 minutes on mainnet, even if we have the same response,
+                // because the max time has been reached.
+                let fetch_wall_time = Utc::now();
+                let fetch_instant = tokio::time::Instant::now();
+                let chain_info @ zakura_state::GetBlockTemplateChainInfo {
+                    tip_hash,
+                    tip_height,
+                    max_time,
+                    cur_time,
+                    ..
+                } = fetch_chain_info(read_state.clone()).await?;
+                if !self.select_mining_template_parent(tip_hash) {
+                    continue;
+                }
+                let rejection_state = template_rejections.borrow_and_update().clone();
+
+                // Fetch the mempool data for the block template:
+                // - if the mempool transactions change, we might return from long polling.
+                //
+                // If the chain fork has just changed, miners want to get the new block as fast
+                // as possible, rather than wait for transactions to re-verify. This increases
+                // miner profits (and any delays can cause chain forks). So we don't wait between
+                // the chain tip changing and getting mempool transactions.
+                //
+                // Optional TODO:
+                // - add a `MempoolChange` type with an `async changed()` method (like `ChainTip`)
+                let Some((mempool_txs, mempool_tx_deps)) =
+                    fetch_mempool_transactions(mempool.clone(), tip_hash)
+                        .await?
+                        // If the mempool and state responses are out of sync:
+                        // - if we are not long polling, omit mempool transactions from the template,
+                        // - if we are long polling, continue to the next iteration of the loop to make fresh state and mempool requests.
+                        .or_else(|| client_long_poll_id.is_none().then(Default::default))
+                else {
+                    continue;
                 };
 
-                let precomputed_coinbase = precompute_coinbase(
-                    self.network.clone(),
-                    precomputed_height,
-                    miner_params.clone(),
+                // - Long poll ID calculation
+                let mut server_long_poll_id = LongPollInput::new(
+                    tip_height,
+                    tip_hash,
+                    max_time,
+                    mempool_txs.iter().map(|tx| tx.transaction.id()),
                 )
-                .await
-                .expect("valid coinbase tx");
+                .generate_id();
+                server_long_poll_id.revision = rejection_state.revision;
 
-                let _ = wait_for_new_tip.await;
+                // The loop finishes if:
+                // - the client didn't pass a long poll ID,
+                // - the server long poll ID is different to the client long poll ID, or
+                // - the previous loop iteration waited until the max time.
+                if Some(&server_long_poll_id) != client_long_poll_id.as_ref() || max_time_reached {
+                    // The template's time range has expired. On testnet, this usually means
+                    // minimum difficulty work is now available. On mainnet, this means there has
+                    // been 90 minutes without a new block or mempool transaction, which is very
+                    // unlikely. So the miner should probably reset anyway.
+                    let submit_old = if max_time_reached {
+                        Some(false)
+                    } else {
+                        client_long_poll_id.as_ref().map(|old_long_poll_id| {
+                            server_long_poll_id.submit_old(old_long_poll_id)
+                        })
+                    };
 
-                precomputed_coinbase
-            };
-
-            // Wait for the maximum block time to elapse. This can change the block header
-            // on testnet. (On mainnet it can happen due to a network disconnection, or a
-            // rapid drop in hash rate.)
-            //
-            // This duration might be slightly lower than the actual maximum,
-            // if cur_time was clamped to min_time. In that case the wait is very long,
-            // and it's ok to return early.
-            //
-            // It can also be zero if cur_time was clamped to max_time. In that case,
-            // we want to wait for another change, and ignore this timeout. So we use an
-            // `OptionFuture::None`.
-            let duration_until_max_time = max_time.saturating_duration_since(cur_time);
-            let wait_for_max_time: OptionFuture<_> = if duration_until_max_time.seconds() > 0 {
-                Some(tokio::time::sleep(duration_until_max_time.to_std()))
-            } else {
-                None
-            }
-            .into();
-
-            // Optional TODO:
-            // `zcashd` generates the next coinbase transaction while waiting for changes.
-            // When Zebra supports shielded coinbase, we might want to do this in parallel.
-            // But the coinbase value depends on the selected transactions, so this needs
-            // further analysis to check if it actually saves us any time.
-
-            tokio::select! {
-                // Poll the futures in the listed order, for efficiency.
-                // We put the most frequent conditions first.
-                biased;
-
-                _ = template_rejections.changed() => { continue; }
-
-                // This timer elapses every few seconds
-                _elapsed = wait_for_mempool_request => {
-                    tracing::debug!(
-                        ?max_time,
-                        ?cur_time,
-                        ?server_long_poll_id,
-                        ?client_long_poll_id,
-                        MEMPOOL_LONG_POLL_INTERVAL,
-                        "checking for a new mempool change after waiting a few seconds"
-                    );
-                }
-
-                precomputed_coinbase = wait_for_new_tip => {
-                    let chain_info = fetch_chain_info(read_state.clone()).await?;
-                    if latest_chain_tip.best_tip_hash().is_some_and(|tip| tip != chain_info.tip_hash) {
-                        continue;
-                    }
-
-                    self.gbt.template_rejections.send_if_modified(|state| {
-                        let changed = state.parent != Some(chain_info.tip_hash);
-                        state.set_parent(chain_info.tip_hash);
-                        changed
-                    });
-                    let mut server_long_poll_id = LongPollInput::new(
-                        chain_info.tip_height,
-                        chain_info.tip_hash,
-                        chain_info.max_time,
-                        vec![]
-                    )
-                    .generate_id();
-                    server_long_poll_id.revision = self.gbt.template_rejections.borrow().revision;
-
-                    let submit_old = client_long_poll_id
-                        .as_ref()
-                        .map(|old_long_poll_id| server_long_poll_id.submit_old(old_long_poll_id));
-
-                    // Discard the precomputed coinbase if our `+2` guess was wrong
-                    // (multi-block advance, reorg, or spurious notification) — its
-                    // BIP-34 height and subsidies wouldn't match the block.
-                    let next_height = chain_info.tip_height.next().map_misc_error()?;
-                    let precomputed_coinbase = (next_height == precomputed_height)
-                        .then_some(precomputed_coinbase);
-
-                    // Respond instantly with an empty block upon a chain tip change so that
-                    // the miner doesn't waste their effort trying to extend a shorter
-                    // chain.
-                    let template = BlockTemplateResponse::new_internal(
-                        &self.network,
-                        precomputed_coinbase,
-                        miner_params,
-                        &chain_info,
+                    break (
                         server_long_poll_id,
-                        vec![],
+                        chain_info,
+                        mempool_txs,
+                        mempool_tx_deps,
                         submit_old,
                     );
-                    return self.finish_mining_template(template, &chain_info, miner_params).await;
                 }
 
-                // The max time does not elapse during normal operation on mainnet,
-                // and it rarely elapses on testnet.
-                Some(_elapsed) = wait_for_max_time => {
-                    // This log is very rare so it's ok to be info.
-                    tracing::info!(
-                        ?max_time,
-                        ?cur_time,
-                        ?server_long_poll_id,
-                        ?client_long_poll_id,
-                        "returning from long poll because max time was reached"
-                    );
+                // - Polling wait conditions
+                //
+                // TODO: when we're happy with this code, split it into a function.
+                //
+                // Periodically check the mempool for changes.
+                //
+                // Optional TODO:
+                // Remove this polling wait if we switch to using futures to detect sync status
+                // and mempool changes.
+                let wait_for_mempool_request =
+                    tokio::time::sleep(Duration::from_secs(MEMPOOL_LONG_POLL_INTERVAL));
 
-                    max_time_reached = true;
+                // Return immediately if the chain tip has changed.
+                // The clone preserves the seen status of the chain tip.
+                let mut wait_for_new_tip = latest_chain_tip.clone();
+                let wait_for_new_tip = wait_for_new_tip.best_tip_changed();
+                // `+2`: we expect the tip to advance by one block before waking us up.
+                let precomputed_height = Height(chain_info.tip_height.0 + 2);
+                let wait_for_new_tip = async {
+                    // Precompute the coinbase tx for an empty block that will sit on the new tip. We
+                    // will return this provisional block upon a chain tip change so that miners can
+                    // mine on the newest tip, and don't waste their effort on a shorter chain while we
+                    // compute a new template for a properly filled block. We do this precomputation
+                    // before we start waiting for a new tip since computing the coinbase tx takes a few
+                    // seconds if the miner mines to a shielded address, and we want to return fast
+                    // when the tip changes.
+                    let precompute_coinbase = |network, height, params| {
+                        self.gbt.run_template_build(move || {
+                            TransactionTemplate::new_coinbase(
+                                &network,
+                                height,
+                                &params,
+                                Amount::zero(),
+                                None,
+                            )
+                        })
+                    };
+
+                    // ZIP 234 derives the subsidy from the new tip's value pools. Those pools
+                    // are unknown until the tip arrives, so this optimization cannot construct
+                    // a valid post-activation coinbase in advance.
+                    let precomputed_coinbase =
+                        if is_zip234_active(&self.network, precomputed_height) {
+                            None
+                        } else {
+                            Some(
+                                precompute_coinbase(
+                                    self.network.clone(),
+                                    precomputed_height,
+                                    miner_params.clone(),
+                                )
+                                .await?
+                                .map_misc_error()?,
+                            )
+                        };
+
+                    let _ = wait_for_new_tip.await;
+
+                    Ok::<_, ErrorObject<'static>>(precomputed_coinbase)
+                };
+
+                // Wait for the template's time range to expire. On testnet, minimum difficulty
+                // becomes valid one second after `max_time`, because the last standard difficulty
+                // second is still valid. Testnet measures that deadline from the wall clock at the
+                // state fetch, so a clamped `cur_time` can't restart it and a slow fetch can't
+                // skip it. (On mainnet the time range only expires after a network disconnection,
+                // or a rapid drop in hash rate.)
+                //
+                // A deadline that passed before the fetch, or a zero mainnet wait because
+                // `cur_time` was clamped to `max_time`, disables the timer. The request then
+                // waits for another change instead of spinning.
+                let wait_for_max_time: OptionFuture<_> =
+                    if NetworkUpgrade::minimum_difficulty_spacing_for_height(
+                        &self.network,
+                        tip_height.next().map_misc_error()?,
+                    )
+                    .is_some()
+                    {
+                        let wait = (max_time
+                            .saturating_add(Duration32::from_seconds(1))
+                            .to_chrono()
+                            - fetch_wall_time)
+                            .to_std()
+                            .ok();
+                        wait.filter(|wait| !wait.is_zero())
+                            .map(|wait| tokio::time::sleep_until(fetch_instant + wait))
+                    } else {
+                        // Preserve Mainnet's relative wait after the fetches. Its clock sample
+                        // can be later than `fetch_instant` if the state read was slow.
+                        let wait = max_time.saturating_duration_since(cur_time).to_std();
+                        (!wait.is_zero()).then(|| tokio::time::sleep(wait))
+                    }
+                    .into();
+
+                // Optional TODO:
+                // `zcashd` generates the next coinbase transaction while waiting for changes.
+                // When Zebra supports shielded coinbase, we might want to do this in parallel.
+                // But the coinbase value depends on the selected transactions, so this needs
+                // further analysis to check if it actually saves us any time.
+
+                tokio::select! {
+                    // Poll the futures in the listed order, for efficiency.
+                    // We put the most frequent conditions first.
+                    biased;
+
+                    _ = template_rejections.changed() => { continue; }
+
+                    // This timer elapses every few seconds
+                    _elapsed = wait_for_mempool_request => {
+                        tracing::debug!(
+                            ?max_time,
+                            ?cur_time,
+                            ?server_long_poll_id,
+                            ?client_long_poll_id,
+                            MEMPOOL_LONG_POLL_INTERVAL,
+                            "checking for a new mempool change after waiting a few seconds"
+                        );
+                    }
+
+                    precomputed_coinbase = wait_for_new_tip => {
+                        let precomputed_coinbase = precomputed_coinbase?;
+                        let chain_info = fetch_chain_info(read_state.clone()).await?;
+                        if !self.select_mining_template_parent(chain_info.tip_hash) {
+                            continue;
+                        }
+                        let mut server_long_poll_id = LongPollInput::new(
+                            chain_info.tip_height,
+                            chain_info.tip_hash,
+                            chain_info.max_time,
+                            vec![]
+                        )
+                        .generate_id();
+                        server_long_poll_id.revision = self.gbt.template_rejections.borrow().revision;
+
+                        let submit_old = client_long_poll_id
+                            .as_ref()
+                            .map(|old_long_poll_id| server_long_poll_id.submit_old(old_long_poll_id));
+
+                        // Discard the precomputed coinbase if our `+2` guess was wrong
+                        // (multi-block advance, reorg, or spurious notification) — its
+                        // BIP-34 height and subsidies wouldn't match the block.
+                        let next_height = chain_info.tip_height.next().map_misc_error()?;
+                        let precomputed_coinbase = (next_height == precomputed_height)
+                            .then_some(precomputed_coinbase)
+                            .flatten();
+
+                        // Build an empty block on the new tip. After ZIP 234 activation,
+                        // its proof must wait for the new parent's pools; build it off the
+                        // async worker so other RPC requests can continue.
+                        let template = self.build_mining_template(
+                            precomputed_coinbase,
+                            miner_params,
+                            &chain_info,
+                            server_long_poll_id,
+                            vec![],
+                            submit_old,
+                        )
+                        .await?;
+                        if let Some(template) = self.finish_mining_template(template, &chain_info, miner_params).await? {
+                            return Ok(template);
+                        }
+                        continue 'rebuild;
+                    }
+
+                    // Testnet reaches this when minimum difficulty becomes valid.
+                    // Mainnet only reaches it after a long stall.
+                    Some(_elapsed) = wait_for_max_time => {
+                        // This log is very rare so it's ok to be info.
+                        tracing::info!(
+                            ?max_time,
+                            ?cur_time,
+                            ?server_long_poll_id,
+                            ?client_long_poll_id,
+                            "returning from long poll because max time was reached"
+                        );
+
+                        max_time_reached = true;
+                    }
                 }
+            };
+
+            // - Processing fetched data to create a transaction template
+            //
+            // Apart from random weighted transaction selection,
+            // the template only depends on the previously fetched data.
+            // This processing fails only if the coinbase transaction cannot be built.
+
+            tracing::debug!(
+                mempool_tx_hashes = ?mempool_txs
+                    .iter()
+                    .map(|tx| tx.transaction.id().mined_id())
+                    .collect::<Vec<_>>(),
+                "selecting transactions for the template from the mempool"
+            );
+
+            let height = chain_info.tip_height.next().map_misc_error()?;
+
+            // Randomly select some mempool transactions.
+            let mempool_txs = select_mempool_transactions(
+                &self.network,
+                height,
+                miner_params,
+                if is_zip234_active(&self.network, height) {
+                    Some(
+                        parent_nsm_value_balance(chain_info.value_pools.nsm_value_balance_amount())
+                            .map_misc_error()?,
+                    )
+                } else {
+                    None
+                },
+                mempool_txs,
+                mempool_tx_deps,
+            )
+            .map_misc_error()?;
+
+            tracing::debug!(
+                selected_mempool_tx_hashes = ?mempool_txs
+                    .iter()
+                    .map(|#[cfg(not(test))] tx, #[cfg(test)] (_, tx)| tx.transaction.id().mined_id())
+                    .collect::<Vec<_>>(),
+                "selected transactions for the template from the mempool"
+            );
+
+            // - After this point, the template only depends on the previously fetched data.
+
+            let template = self
+                .build_mining_template(
+                    None,
+                    miner_params,
+                    &chain_info,
+                    server_long_poll_id,
+                    mempool_txs,
+                    submit_old,
+                )
+                .await?;
+            if let Some(template) = self
+                .finish_mining_template(template, &chain_info, miner_params)
+                .await?
+            {
+                return Ok(template);
             }
-        };
+        }
 
-        // - Processing fetched data to create a transaction template
-        //
-        // Apart from random weighted transaction selection,
-        // the template only depends on the previously fetched data.
-        // This processing never fails.
-
-        tracing::debug!(
-            mempool_tx_hashes = ?mempool_txs
-                .iter()
-                .map(|tx| tx.transaction.id().mined_id())
-                .collect::<Vec<_>>(),
-            "selecting transactions for the template from the mempool"
-        );
-
-        let height = chain_info.tip_height.next().map_misc_error()?;
-
-        // Randomly select some mempool transactions.
-        let mempool_txs = select_mempool_transactions(
-            &self.network,
-            height,
-            miner_params,
-            mempool_txs,
-            mempool_tx_deps,
-        );
-
-        tracing::debug!(
-            selected_mempool_tx_hashes = ?mempool_txs
-                .iter()
-                .map(|#[cfg(not(test))] tx, #[cfg(test)] (_, tx)| tx.transaction.id().mined_id())
-                .collect::<Vec<_>>(),
-            "selected transactions for the template from the mempool"
-        );
-
-        // - After this point, the template only depends on the previously fetched data.
-
-        let template = BlockTemplateResponse::new_internal(
-            &self.network,
-            None,
-            miner_params,
-            &chain_info,
-            server_long_poll_id,
-            mempool_txs,
-            submit_old,
-        );
-        self.finish_mining_template(template, &chain_info, miner_params)
-            .await
+        Err(ErrorObject::owned(
+            0,
+            "template parent changed; retry",
+            None::<()>,
+        ))
     }
 
     async fn submit_block(
@@ -3370,18 +3548,25 @@ where
         num_blocks: Option<i32>,
         height: Option<i32>,
     ) -> Result<u64> {
-        // Default number of blocks is 120 if not supplied.
-        let mut num_blocks = num_blocks.unwrap_or(DEFAULT_SOLUTION_RATE_WINDOW_SIZE);
-        // But if it is 0 or negative, it uses the proof of work averaging window.
-        if num_blocks < 1 {
-            num_blocks = i32::try_from(POW_AVERAGING_WINDOW).expect("fits in i32");
-        }
-        let num_blocks =
-            usize::try_from(num_blocks).expect("just checked for negatives, i32 fits in usize");
-
         // Default height is the tip height if not supplied. Negative values also mean the tip
         // height. Since negative values aren't valid heights, we can just use the conversion.
         let height = height.and_then(|height| height.try_into_height().ok());
+
+        // Default number of blocks is 120 if not supplied.
+        let num_blocks = num_blocks.unwrap_or(DEFAULT_SOLUTION_RATE_WINDOW_SIZE);
+        let num_blocks = match usize::try_from(num_blocks) {
+            Ok(num_blocks) if num_blocks >= 1 => num_blocks,
+            // But if it is 0 or negative, it uses the proof of work averaging window at the
+            // requested height. The state starts at the tip if the height is above it.
+            _ => {
+                let window_height = height
+                    .into_iter()
+                    .chain(self.latest_chain_tip.best_tip_height())
+                    .min()
+                    .unwrap_or(Height(0));
+                NetworkUpgrade::averaging_window_for_height(&self.network, window_height)
+            }
+        };
 
         let mut read_state = self.read_state.clone();
 
@@ -3497,7 +3682,43 @@ where
             None => best_chain_tip_height(&self.latest_chain_tip)?,
         };
 
-        let subsidy = block_subsidy(height, &net).map_misc_error()?;
+        // ZIP 234 derives the block subsidy from the NSM value balance after the parent
+        // block, so look the parent's chain value pools up when the rules apply.
+        let nsm_value_balance = if is_zip234_active(&net, height) {
+            let parent = height.previous().map_misc_error()?;
+
+            let zakura_state::ReadResponse::BlockInfo(parent_info) = tokio::time::timeout(
+                Duration::from_secs(30),
+                call_service(
+                    self.read_state.clone(),
+                    zakura_state::ReadRequest::BlockInfo(parent.into()),
+                ),
+            )
+            .await
+            .map_err(|_| {
+                ErrorObject::owned(
+                    server::error::LegacyCode::Misc.into(),
+                    "timed out waiting for parent block information",
+                    None::<()>,
+                )
+            })??
+            else {
+                unreachable!("unmatched response to a BlockInfo request");
+            };
+
+            let parent_info = parent_info.ok_or_misc_error(
+                "the ZIP 234 subsidy needs the parent block, which is not in the best chain; \
+                 heights can be at most one block above the best chain tip",
+            )?;
+            Some(
+                parent_nsm_value_balance(parent_info.value_pools().nsm_value_balance_amount())
+                    .map_misc_error()?,
+            )
+        } else {
+            None
+        };
+
+        let subsidy = block_subsidy(height, &net, nsm_value_balance).map_misc_error()?;
 
         let (lockbox_streams, mut funding_streams): (Vec<_>, Vec<_>) =
             funding_stream_values(height, &net, subsidy)
@@ -3724,25 +3945,8 @@ where
         }
     }
 
-    fn openrpc(&self) -> openrpsee::openrpc::Response {
-        let mut generator = openrpsee::openrpc::Generator::new();
-
-        let methods = METHODS
-            .into_iter()
-            .filter(|(name, _)| self.rpc_surface.exposes(name))
-            .map(|(name, method)| method.generate(&mut generator, name))
-            .collect();
-
-        Ok(openrpsee::openrpc::OpenRpc {
-            openrpc: "1.3.2",
-            info: openrpsee::openrpc::Info {
-                title: env!("CARGO_PKG_NAME"),
-                description: env!("CARGO_PKG_DESCRIPTION"),
-                version: env!("CARGO_PKG_VERSION"),
-            },
-            methods,
-            components: generator.into_components(),
-        })
+    fn openrpc(&self) -> Result<serde_json::Value> {
+        Ok(openrpc::render(self.rpc_surface))
     }
     async fn get_tx_out(
         &self,
@@ -3874,52 +4078,72 @@ where
 ///
 /// See the notes for the [`Rpc::get_info` method].
 #[allow(clippy::too_many_arguments)]
-#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, Getters, new)]
+#[derive(
+    Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, Getters, CopyGetters, new,
+)]
 pub struct GetInfoResponse {
     /// The node version
-    #[getter(rename = "raw_version")]
     version: u64,
 
     /// The node version build number
+    #[getset(get = "pub")]
     build: String,
 
     /// The server sub-version identifier, used as the network protocol user-agent
+    #[getset(get = "pub")]
     subversion: String,
 
     /// The protocol version
     #[serde(rename = "protocolversion")]
+    #[getset(get_copy = "pub")]
     protocol_version: u32,
 
     /// The current number of blocks processed in the server
+    #[getset(get_copy = "pub")]
     blocks: u32,
 
     /// The total (inbound and outbound) number of connections the node has
+    #[getset(get_copy = "pub")]
     connections: usize,
 
     /// The proxy (if any) used by the server. Currently always `None` in Zebra.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[getset(get = "pub")]
     proxy: Option<String>,
 
     /// The current network difficulty
+    #[getset(get_copy = "pub")]
     difficulty: f64,
 
     /// True if the server is running in testnet mode, false otherwise
+    #[getset(get_copy = "pub")]
     testnet: bool,
 
     /// The minimum transaction fee in ZEC/kB
     #[serde(rename = "paytxfee")]
+    #[getset(get_copy = "pub")]
     pay_tx_fee: f64,
 
     /// The minimum relay fee for non-free transactions in ZEC/kB
     #[serde(rename = "relayfee")]
+    #[getset(get_copy = "pub")]
     relay_fee: f64,
 
     /// The last error or warning message, or "no errors" if there are no errors
+    #[getset(get = "pub")]
     errors: String,
 
     /// The time of the last error or warning message, or "no errors timestamp" if there are no errors
     #[serde(rename = "errorstimestamp")]
+    #[getset(get_copy = "pub")]
     errors_timestamp: i64,
+}
+
+impl GetInfoResponse {
+    /// The node version.
+    pub fn raw_version(&self) -> u64 {
+        self.version
+    }
 }
 
 impl Default for GetInfoResponse {
@@ -4005,6 +4229,39 @@ impl GetInfoResponse {
 /// estimate. Reporting it a day early gives consumers time to act.
 const END_OF_SERVICE_ESTIMATE_SAFETY_MARGIN: i64 = 24 * 60 * 60;
 
+/// Returns the target time to mine the blocks above `from` up to `to` on
+/// `network`, in seconds.
+///
+/// Each block counts with the target spacing at its height. The result is
+/// negative when `to` is below `from`.
+fn target_seconds_between_heights(network: &Network, from: Height, to: Height) -> i64 {
+    let low = i64::from(from.0.min(to.0));
+    let high = i64::from(from.0.max(to.0));
+
+    let target_spacings: Vec<_> = NetworkUpgrade::target_spacings(network).collect();
+    let seconds: i64 = target_spacings
+        .iter()
+        .enumerate()
+        .map(|(index, (start_height, target_spacing))| {
+            // The heights in `low + 1..=high` that use this target spacing.
+            let first = i64::from(start_height.0).max(low + 1);
+            let last = target_spacings
+                .get(index + 1)
+                .map_or(high, |(next_height, _)| {
+                    (i64::from(next_height.0) - 1).min(high)
+                });
+
+            (last - first + 1).max(0) * target_spacing.num_seconds()
+        })
+        .sum();
+
+    if to < from {
+        -seconds
+    } else {
+        seconds
+    }
+}
+
 /// Response to a `getdeprecationinfo` RPC request.
 ///
 /// See the notes for [`RpcServer::get_deprecation_info`].
@@ -4012,23 +4269,24 @@ const END_OF_SERVICE_ESTIMATE_SAFETY_MARGIN: i64 = 24 * 60 * 60;
 pub struct GetDeprecationInfoResponse {
     /// End-of-service information, only present on Mainnet.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[getset(get = "pub")]
     end_of_service: Option<EndOfService>,
 }
 
 /// The `end_of_service` object in a [`GetDeprecationInfoResponse`].
-#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, Getters, new)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, CopyGetters, new)]
 pub struct EndOfService {
     /// The estimated last height this server version supports.
     ///
     /// The node halts when the chain tip goes past this height.
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     block_height: u32,
 
     /// Approximate halt time in seconds since the Unix epoch.
     ///
     /// This is reported 24 hours earlier than the spacing-based estimate, so
     /// consumers are warned early when block times vary.
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     estimated_time: i64,
 }
 
@@ -4086,33 +4344,38 @@ where
 /// Response to a `getblockchaininfo` RPC request.
 ///
 /// See the notes for the [`Rpc::get_blockchain_info` method].
-#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, Getters)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, Getters, CopyGetters)]
 pub struct GetBlockchainInfoResponse {
     /// Current network name as defined in BIP70 (main, test, regtest)
+    #[getset(get = "pub")]
     chain: String,
 
     /// The current number of blocks processed in the server, numeric
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     blocks: Height,
 
     /// The current number of headers we have validated in the best chain, that is,
     /// the height of the best chain.
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     headers: Height,
 
     /// The estimated network solution rate in Sol/s.
+    #[getset(get_copy = "pub")]
     difficulty: f64,
 
     /// The verification progress relative to the estimated network chain tip.
     #[serde(rename = "verificationprogress")]
+    #[getset(get_copy = "pub")]
     verification_progress: f64,
 
     /// The total amount of work in the best chain, hex-encoded.
     #[serde(rename = "chainwork")]
+    #[getset(get_copy = "pub")]
     chain_work: u64,
 
     /// Whether this node's blocks are subject to pruning, that is, whether it
     /// runs in pruned storage mode or has already pruned historical data.
+    #[getset(get_copy = "pub")]
     pruned: bool,
 
     /// The lowest height whose block body this node still stores, omitted when
@@ -4127,114 +4390,159 @@ pub struct GetBlockchainInfoResponse {
         rename = "pruneheight",
         skip_serializing_if = "Option::is_none"
     )]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     prune_height: Option<Height>,
 
     /// The estimated size of the block and undo files on disk
+    #[getset(get_copy = "pub")]
     size_on_disk: u64,
 
     /// The current number of note commitments in the commitment tree
+    #[getset(get_copy = "pub")]
     commitments: u64,
 
     /// The hash of the currently best block, in big-endian order, hex-encoded
     #[serde(rename = "bestblockhash", with = "hex")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     best_block_hash: block::Hash,
 
     /// If syncing, the estimated height of the chain, else the current best height, numeric.
     ///
     /// In Zebra, this is always the height estimate, so it might be a little inaccurate.
     #[serde(rename = "estimatedheight")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     estimated_height: Height,
 
     /// Chain supply balance
     #[serde(rename = "chainSupply")]
+    #[getset(get = "pub")]
     chain_supply: GetBlockchainInfoBalance,
 
     /// Value pool balances
     #[serde(rename = "valuePools")]
     #[serde(deserialize_with = "deserialize_blockchain_value_pool_balances")]
+    #[getset(get = "pub")]
     value_pools: BlockchainValuePoolBalances,
 
+    /// The ZIP 234 NSM value balance, in zatoshis.
+    ///
+    /// This is an accounting counter rather than a pool of spendable value: it tracks
+    /// historical unclaimed issuance plus scheduled issuance, minus issuance since NU7, and
+    /// is what funds reissuance. It is deliberately absent from
+    /// [`chain_supply`](Self::chain_supply) and [`value_pools`](Self::value_pools), which
+    /// report monetary supply, so that summing those fields still yields the supply.
+    ///
+    /// The stored counter is signed. Contextual validation requires it to stay non-negative
+    /// from NU7 onward, but it carries no such guarantee before then, so clients must accept
+    /// a negative value.
+    ///
+    /// Reported in zatoshis only. There is no `zcashd` field to stay compatible with, and a
+    /// ZEC `f64` cannot represent every zatoshi amount exactly.
+    ///
+    /// `None` means the responding node does not report the counter, which is not the same
+    /// as reporting zero: zero is a legitimate balance. Nodes that know the value always
+    /// send it. When tip pool values are unavailable, the field is omitted.
+    #[serde(
+        rename = "nsmValueBalanceZat",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[getset(get_copy = "pub")]
+    nsm_value_balance_zat: Option<Amount<NegativeAllowed>>,
+
     /// Status of network upgrades
+    #[getset(get = "pub")]
     upgrades: IndexMap<ConsensusBranchIdHex, NetworkUpgradeInfo>,
 
     /// Branch IDs of the current and upcoming consensus rules
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     consensus: TipConsensusBranch,
 
     /// Zakura's authoritative header-chain state after semantic handoff.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[getset(get = "pub")]
     header_chain: Option<HeaderChainInfo>,
 }
 
 /// One hash-qualified frontier in the authoritative header-chain state.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, Getters)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, CopyGetters)]
 pub struct HeaderChainFrontierInfo {
     /// Exact frontier height.
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     height: Height,
     /// Exact frontier hash.
     #[serde(with = "hex")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     hash: block::Hash,
 }
 
 /// Persistent selected-tip body-unavailability alarm details.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, Getters)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, CopyGetters)]
 pub struct HeaderChainBodyUnavailableInfo {
     /// Exact selected header whose body is unavailable.
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     height: Height,
     /// Exact selected header hash.
     #[serde(with = "hex")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     hash: block::Hash,
     /// Current retry episode age in seconds.
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     age_seconds: u64,
     /// Failed deliveries in the current episode.
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     attempts: u32,
     /// Currently known eligible body suppliers.
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     suppliers: u32,
 }
 
 /// Persistent alarms from the authoritative header-chain state.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, Getters)]
+#[derive(
+    Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, Getters, CopyGetters,
+)]
 pub struct HeaderChainAlarmInfo {
     /// Protected paths prevented resource-bound enforcement.
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     resource_stalled: bool,
     /// The selected header exhausted its current body-supplier retry episode.
+    #[getset(get = "pub")]
     header_best_body_unavailable: Option<HeaderChainBodyUnavailableInfo>,
     /// Deterministic body validation refuted an imported headers-only trust pin.
+    #[getset(get = "pub")]
     migrated_pin_refuted: Option<HeaderChainFrontierInfo>,
 }
 
 /// User-facing view of the sole committed header-chain publisher.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, Getters)]
+#[derive(
+    Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, Getters, CopyGetters,
+)]
 pub struct HeaderChainInfo {
     /// `integrated` or `headers-only`.
+    #[getset(get = "pub")]
     mode: String,
     /// Monotonic durable state version.
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     state_version: u64,
     /// Meaning and validity boundary of `header_best`.
+    #[getset(get = "pub")]
     header_best_semantics: String,
     /// Best locally header-valid frontier.
     /// The header frontier does not claim body validity.
+    #[getset(get = "pub")]
     header_best: HeaderChainFrontierInfo,
     /// Best fully body-verified frontier on the selected path.
+    #[getset(get = "pub")]
     verified_best: HeaderChainFrontierInfo,
     /// Irreversible local finality frontier.
+    #[getset(get = "pub")]
     finalized: HeaderChainFrontierInfo,
     /// Headers-only mode's irreversible local trust warning.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[getset(get = "pub")]
     finality_warning: Option<String>,
     /// Persistent engine alarms.
+    #[getset(get = "pub")]
     alarms: HeaderChainAlarmInfo,
 }
 
@@ -4304,6 +4612,7 @@ impl Default for GetBlockchainInfoResponse {
             estimated_height: Height(1),
             chain_supply: GetBlockchainInfoBalance::chain_supply(Default::default()),
             value_pools: GetBlockchainInfoBalance::zero_pools(),
+            nsm_value_balance_zat: None,
             upgrades: IndexMap::new(),
             consensus: TipConsensusBranch {
                 chain_tip: ConsensusBranchIdHex(ConsensusBranchId::default()),
@@ -4352,6 +4661,9 @@ impl GetBlockchainInfoResponse {
             estimated_height,
             chain_supply,
             value_pools,
+            // Left unset so this constructor's signature stays stable; callers that
+            // report the ZIP 234 counter set it with `with_nsm_value_balance_zat`.
+            nsm_value_balance_zat: None,
             upgrades,
             consensus,
             headers,
@@ -4364,6 +4676,18 @@ impl GetBlockchainInfoResponse {
             commitments,
             header_chain: None,
         }
+    }
+
+    /// Sets the ZIP 234 NSM value balance, in zatoshis.
+    ///
+    /// [`GetBlockchainInfoResponse::new`] predates this field and leaves it unset, so that
+    /// adding the field did not change its argument list.
+    pub fn with_nsm_value_balance_zat(
+        mut self,
+        nsm_value_balance_zat: Amount<NegativeAllowed>,
+    ) -> Self {
+        self.nsm_value_balance_zat = Some(nsm_value_balance_zat);
+        self
     }
 }
 
@@ -4447,27 +4771,40 @@ impl GetAddressBalanceRequest {
     Hash,
     serde::Serialize,
     serde::Deserialize,
-    Getters,
+    CopyGetters,
     new,
 )]
 pub struct GetAddressBalanceResponse {
     /// The total transparent balance.
+    #[getset(get_copy = "pub")]
     balance: u64,
     /// The total received balance, including change.
+    #[getset(get_copy = "pub")]
     pub received: u64,
 }
 
 /// Parameters of [`RpcServer::get_address_utxos`] RPC method.
 #[derive(
-    Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize, Getters, new, JsonSchema,
+    Clone,
+    Debug,
+    Eq,
+    PartialEq,
+    serde::Deserialize,
+    serde::Serialize,
+    Getters,
+    CopyGetters,
+    new,
+    JsonSchema,
 )]
 #[serde(from = "DGetAddressUtxosRequest")]
 pub struct GetAddressUtxosRequest {
     /// A list of addresses to get transactions from.
+    #[getset(get = "pub")]
     addresses: Vec<String>,
     /// The height to start looking for transactions.
     #[serde(default)]
     #[serde(rename = "chainInfo")]
+    #[getset(get_copy = "pub")]
     chain_info: bool,
 }
 
@@ -4680,43 +5017,46 @@ impl Default for GetBlockResponse {
 
 /// A Block object returned by the `getblock` RPC request.
 #[allow(clippy::too_many_arguments)]
-#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, Getters, new)]
+#[derive(
+    Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, Getters, CopyGetters, new,
+)]
 pub struct BlockObject {
     /// The hash of the requested block.
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     #[serde(with = "hex")]
     hash: block::Hash,
 
     /// The number of confirmations of this block in the best chain,
     /// or -1 if it is not in the best chain.
+    #[getset(get_copy = "pub")]
     confirmations: i64,
 
     /// The block size. TODO: fill it
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     size: Option<i64>,
 
     /// The height of the requested block.
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     height: Option<Height>,
 
     /// The version field of the requested block.
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     version: Option<u32>,
 
     /// The merkle root of the requested block.
     #[serde(with = "opthex", rename = "merkleroot")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     merkle_root: Option<block::merkle::Root>,
 
     /// The blockcommitments field of the requested block. Its interpretation changes
     /// depending on the network and height.
     #[serde(with = "opthex", rename = "blockcommitments")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     block_commitments: Option<[u8; 32]>,
 
     // `authdataroot` would be here. Undocumented. TODO: decide if we want to support it
@@ -4724,53 +5064,55 @@ pub struct BlockObject {
     /// The root of the Sapling commitment tree after applying this block.
     #[serde(with = "opthex", rename = "finalsaplingroot")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     final_sapling_root: Option<[u8; 32]>,
 
     /// The root of the Orchard commitment tree after applying this block.
     #[serde(with = "opthex", rename = "finalorchardroot")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     final_orchard_root: Option<[u8; 32]>,
 
     // `chainhistoryroot` would be here. Undocumented. TODO: decide if we want to support it
     //
     /// The number of transactions in this block.
     #[serde(rename = "nTx")]
+    #[getset(get_copy = "pub")]
     n_tx: usize,
 
     /// List of transactions in block order, hex-encoded if verbosity=1 or
     /// as objects if verbosity=2.
+    #[getset(get = "pub")]
     tx: Vec<GetBlockTransaction>,
 
     /// The height of the requested block.
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     time: Option<i64>,
 
     /// The nonce of the requested block header.
     #[serde(with = "opthex")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     nonce: Option<[u8; 32]>,
 
     /// The Equihash solution in the requested block header.
     /// Note: presence of this field in getblock is not documented in zcashd.
     #[serde(with = "opthex")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     solution: Option<Solution>,
 
     /// The difficulty threshold of the requested block header displayed in compact form.
     #[serde(with = "opthex")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     bits: Option<CompactDifficulty>,
 
     /// Floating point number that represents the difficulty limit for this block as a multiple
     /// of the minimum difficulty for the network.
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     difficulty: Option<f64>,
 
     // `chainwork` would be here, but we don't plan on supporting it
@@ -4779,6 +5121,7 @@ pub struct BlockObject {
     /// Chain supply balance
     #[serde(rename = "chainSupply")]
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[getset(get = "pub")]
     chain_supply: Option<GetBlockchainInfoBalance>,
 
     /// Value pool balances
@@ -4788,22 +5131,23 @@ pub struct BlockObject {
         skip_serializing_if = "Option::is_none",
         deserialize_with = "deserialize_optional_blockchain_value_pool_balances"
     )]
+    #[getset(get = "pub")]
     value_pools: Option<BlockchainValuePoolBalances>,
 
     /// Information about the note commitment trees.
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     trees: GetBlockTrees,
 
     /// The previous block hash of the requested block header.
     #[serde(rename = "previousblockhash", skip_serializing_if = "Option::is_none")]
     #[serde(with = "opthex")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     previous_block_hash: Option<block::Hash>,
 
     /// The next block hash after the requested block header.
     #[serde(rename = "nextblockhash", skip_serializing_if = "Option::is_none")]
     #[serde(with = "opthex")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     next_block_hash: Option<block::Hash>,
 }
 
@@ -4832,79 +5176,84 @@ pub enum GetBlockHeaderResponse {
 }
 
 #[allow(clippy::too_many_arguments)]
-#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, Getters, new)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, CopyGetters, new)]
 /// Verbose response to a `getblockheader` RPC request.
 ///
 /// See the notes for the [`RpcServer::get_block_header`] method.
 pub struct BlockHeaderObject {
     /// The hash of the requested block.
     #[serde(with = "hex")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     hash: block::Hash,
 
     /// The number of confirmations of this block in the best chain,
     /// or -1 if it is not in the best chain.
+    #[getset(get_copy = "pub")]
     confirmations: i64,
 
     /// The height of the requested block.
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     height: Height,
 
     /// The version field of the requested block.
+    #[getset(get_copy = "pub")]
     version: u32,
 
     /// The merkle root of the requesteed block.
     #[serde(with = "hex", rename = "merkleroot")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     merkle_root: block::merkle::Root,
 
     /// The blockcommitments field of the requested block. Its interpretation changes
     /// depending on the network and height.
     #[serde(with = "hex", rename = "blockcommitments")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     block_commitments: [u8; 32],
 
     /// The root of the Sapling commitment tree after applying this block.
     #[serde(with = "hex", rename = "finalsaplingroot")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     final_sapling_root: [u8; 32],
 
     /// The number of Sapling notes in the Sapling note commitment tree
     /// after applying this block. Used by the `getblock` RPC method.
     #[serde(skip)]
+    #[getset(get_copy = "pub")]
     sapling_tree_size: u64,
 
     /// The block time of the requested block header in non-leap seconds since Jan 1 1970 GMT.
+    #[getset(get_copy = "pub")]
     time: i64,
 
     /// The nonce of the requested block header.
     #[serde(with = "hex")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     nonce: [u8; 32],
 
     /// The Equihash solution in the requested block header.
     #[serde(with = "hex")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     solution: Solution,
 
     /// The difficulty threshold of the requested block header displayed in compact form.
     #[serde(with = "hex")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     bits: CompactDifficulty,
 
     /// Floating point number that represents the difficulty limit for this block as a multiple
     /// of the minimum difficulty for the network.
+    #[getset(get_copy = "pub")]
     difficulty: f64,
 
     /// The previous block hash of the requested block header.
     #[serde(rename = "previousblockhash")]
     #[serde(with = "hex")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     previous_block_hash: block::Hash,
 
     /// The next block hash after the requested block header.
     #[serde(rename = "nextblockhash", skip_serializing_if = "Option::is_none")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     #[serde(with = "opthex")]
     next_block_hash: Option<block::Hash>,
 }
@@ -4964,13 +5313,15 @@ impl GetBlockHashResponse {
 pub type Hash = GetBlockHashResponse;
 
 /// Response to a `getbestblockheightandhash` RPC request.
-#[derive(Copy, Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize, Getters, new)]
+#[derive(
+    Copy, Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize, CopyGetters, new,
+)]
 pub struct GetBlockHeightAndHashResponse {
     /// The best chain tip block height
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     height: block::Height,
     /// The best chain tip block hash
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     hash: block::Hash,
 }
 
@@ -5018,45 +5369,56 @@ pub enum GetAddressUtxosResponse {
 }
 
 /// Response to a `getaddressutxos` RPC request, when `chainInfo` is true.
-#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize, Getters, new)]
+#[derive(
+    Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize, Getters, CopyGetters, new,
+)]
 pub struct GetAddressUtxosResponseObject {
+    /// The unspent transparent outputs.
+    #[getset(get = "pub")]
     utxos: Vec<Utxo>,
+    /// The best chain tip hash when these outputs were queried.
     #[serde(with = "hex")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     hash: block::Hash,
-    #[getter(copy)]
+    /// The best chain tip height when these outputs were queried.
+    #[getset(get_copy = "pub")]
     height: block::Height,
 }
 
 /// A UTXO returned by the `getaddressutxos` RPC request.
 ///
 /// See the notes for the [`Rpc::get_address_utxos` method].
-#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize, Getters, new)]
+#[derive(
+    Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize, Getters, CopyGetters, new,
+)]
 pub struct Utxo {
     /// The transparent address, base58check encoded
+    #[getset(get = "pub")]
     address: transparent::Address,
 
     /// The output txid, in big-endian order, hex-encoded
     #[serde(with = "hex")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     txid: transaction::Hash,
 
     /// The transparent output index, numeric
     #[serde(rename = "outputIndex")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     output_index: OutputIndex,
 
     /// The transparent output script, hex encoded
     #[serde(with = "hex")]
+    #[getset(get = "pub")]
     script: transparent::Script,
 
     /// The amount of zatoshis in the transparent output
+    #[getset(get_copy = "pub")]
     satoshis: u64,
 
     /// The block height, numeric.
     ///
     /// We put this field last, to match the zcashd order.
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     height: Height,
 }
 
@@ -5109,10 +5471,13 @@ impl Utxo {
 pub struct GetAddressTxIdsRequest {
     /// A list of addresses. The RPC method will get transactions IDs that sent or received
     /// funds to or from these addresses.
+    #[getset(get = "pub")]
     addresses: Vec<String>,
-    // The height to start looking for transactions.
+    /// The height to start looking for transactions.
+    #[getset(get = "pub")]
     start: Option<u32>,
-    // The height to end looking for transactions.
+    /// The height to end looking for transactions.
+    #[getset(get = "pub")]
     end: Option<u32>,
 }
 

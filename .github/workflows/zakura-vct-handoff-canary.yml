@@ -1,8 +1,8 @@
 name: VCT handoff canary
 
-# Boots a Mainnet node from the newest retained state below the embedded VCT
+# Boots a Mainnet node from a dedicated approach fixture below the embedded VCT
 # frontier, forces the Zakura P2P/tree_aux path, and succeeds only after C is
-# finalized, the best chain reaches C+1, and VCT fast-path metrics increment.
+# finalized, the best chain reaches C+1, and VCT commits succeed.
 on:
   pull_request:
     branches: [main]
@@ -61,7 +61,7 @@ jobs:
       pull-requests: write
     with:
       ref: ${{ inputs.target_ref || github.event.pull_request.head.sha || 'main' }}
-      snapshot_mode: pre-checkpoint
+      snapshot_mode: vct-handoff
       network: mainnet
       duration_minutes: "60"
       droplet_size: c-8

@@ -12,7 +12,6 @@ use color_eyre::Report;
 use futures::{stream::FuturesUnordered, StreamExt};
 use thread_priority::{ThreadBuilder, ThreadPriority};
 use tokio::{select, sync::watch, task::JoinHandle, time::sleep};
-use tower::Service;
 use tracing::{Instrument, Span};
 
 use zakura_chain::{
@@ -24,8 +23,9 @@ use zakura_chain::{
     shutdown::is_shutting_down,
     work::equihash::{Solution, SolverCancelled},
 };
+use zakura_consensus::router::service_trait::BlockVerifierService;
 use zakura_network::AddressBookPeers;
-use zakura_node_services::mempool;
+use zakura_node_services::mempool::MempoolService;
 use zakura_rpc::{
     client::{
         BlockTemplateTimeSource,
@@ -37,7 +37,7 @@ use zakura_rpc::{
     methods::{RpcImpl, RpcServer},
     proposal_block_from_template,
 };
-use zakura_state::WatchReceiver;
+use zakura_state::{ReadState as ReadStateService, State as StateService, WatchReceiver};
 
 use crate::components::metrics::Config;
 
@@ -92,6 +92,13 @@ fn cancel_if_mining_template_changed(
     }
 }
 
+/// Waits for a template update or channel closure, with a timeout for shutdown checks.
+async fn wait_for_mining_template_change(
+    template_receiver: &mut WatchReceiver<Option<Arc<Block>>>,
+) {
+    let _ = tokio::time::timeout(BLOCK_TEMPLATE_WAIT_TIME, template_receiver.changed()).await;
+}
+
 /// Initialize the miner based on its config, and spawn a task for it.
 ///
 /// This method is CPU and memory-intensive. It uses 144 MB of RAM and one CPU core per configured
@@ -102,45 +109,12 @@ pub fn spawn_init<Mempool, State, ReadState, Tip, AddressBook, BlockVerifierRout
     config: &Config,
     rpc: RpcImpl<Mempool, State, ReadState, Tip, AddressBook, BlockVerifierRouter, SyncStatus>,
 ) -> JoinHandle<Result<(), Report>>
-// TODO: simplify or avoid repeating these generics (how?)
 where
-    Mempool: Service<
-            mempool::Request,
-            Response = mempool::Response,
-            Error = zakura_node_services::BoxError,
-        > + Clone
-        + Send
-        + Sync
-        + 'static,
-    Mempool::Future: Send,
-    State: Service<
-            zakura_state::Request,
-            Response = zakura_state::Response,
-            Error = zakura_state::BoxError,
-        > + Clone
-        + Send
-        + Sync
-        + 'static,
-    <State as Service<zakura_state::Request>>::Future: Send,
-    ReadState: Service<
-            zakura_state::ReadRequest,
-            Response = zakura_state::ReadResponse,
-            Error = zakura_state::BoxError,
-        > + Clone
-        + Send
-        + Sync
-        + 'static,
-    <ReadState as Service<zakura_state::ReadRequest>>::Future: Send,
+    Mempool: MempoolService,
+    State: StateService,
+    ReadState: ReadStateService,
     Tip: ChainTip + Clone + Send + Sync + 'static,
-    BlockVerifierRouter: Service<
-            zakura_consensus::Request,
-            Response = block::Hash,
-            Error = zakura_consensus::BoxError,
-        > + Clone
-        + Send
-        + Sync
-        + 'static,
-    <BlockVerifierRouter as Service<zakura_consensus::Request>>::Future: Send,
+    BlockVerifierRouter: BlockVerifierService,
     SyncStatus: ChainSyncStatus + Clone + Send + Sync + 'static,
     AddressBook: AddressBookPeers + Clone + Send + Sync + 'static,
 {
@@ -159,43 +133,11 @@ pub async fn init<Mempool, State, ReadState, Tip, BlockVerifierRouter, SyncStatu
     rpc: RpcImpl<Mempool, State, ReadState, Tip, AddressBook, BlockVerifierRouter, SyncStatus>,
 ) -> Result<(), Report>
 where
-    Mempool: Service<
-            mempool::Request,
-            Response = mempool::Response,
-            Error = zakura_node_services::BoxError,
-        > + Clone
-        + Send
-        + Sync
-        + 'static,
-    Mempool::Future: Send,
-    State: Service<
-            zakura_state::Request,
-            Response = zakura_state::Response,
-            Error = zakura_state::BoxError,
-        > + Clone
-        + Send
-        + Sync
-        + 'static,
-    <State as Service<zakura_state::Request>>::Future: Send,
-    ReadState: Service<
-            zakura_state::ReadRequest,
-            Response = zakura_state::ReadResponse,
-            Error = zakura_state::BoxError,
-        > + Clone
-        + Send
-        + Sync
-        + 'static,
-    <ReadState as Service<zakura_state::ReadRequest>>::Future: Send,
+    Mempool: MempoolService,
+    State: StateService,
+    ReadState: ReadStateService,
     Tip: ChainTip + Clone + Send + Sync + 'static,
-    BlockVerifierRouter: Service<
-            zakura_consensus::Request,
-            Response = block::Hash,
-            Error = zakura_consensus::BoxError,
-        > + Clone
-        + Send
-        + Sync
-        + 'static,
-    <BlockVerifierRouter as Service<zakura_consensus::Request>>::Future: Send,
+    BlockVerifierRouter: BlockVerifierService,
     SyncStatus: ChainSyncStatus + Clone + Send + Sync + 'static,
     AddressBook: AddressBookPeers + Clone + Send + Sync + 'static,
 {
@@ -281,43 +223,11 @@ pub async fn generate_block_templates<
     template_sender: watch::Sender<Option<Arc<Block>>>,
 ) -> Result<(), Report>
 where
-    Mempool: Service<
-            mempool::Request,
-            Response = mempool::Response,
-            Error = zakura_node_services::BoxError,
-        > + Clone
-        + Send
-        + Sync
-        + 'static,
-    Mempool::Future: Send,
-    State: Service<
-            zakura_state::Request,
-            Response = zakura_state::Response,
-            Error = zakura_state::BoxError,
-        > + Clone
-        + Send
-        + Sync
-        + 'static,
-    <State as Service<zakura_state::Request>>::Future: Send,
-    ReadState: Service<
-            zakura_state::ReadRequest,
-            Response = zakura_state::ReadResponse,
-            Error = zakura_state::BoxError,
-        > + Clone
-        + Send
-        + Sync
-        + 'static,
-    <ReadState as Service<zakura_state::ReadRequest>>::Future: Send,
+    Mempool: MempoolService,
+    State: StateService,
+    ReadState: ReadStateService,
     Tip: ChainTip + Clone + Send + Sync + 'static,
-    BlockVerifierRouter: Service<
-            zakura_consensus::Request,
-            Response = block::Hash,
-            Error = zakura_consensus::BoxError,
-        > + Clone
-        + Send
-        + Sync
-        + 'static,
-    <BlockVerifierRouter as Service<zakura_consensus::Request>>::Future: Send,
+    BlockVerifierRouter: BlockVerifierService,
     SyncStatus: ChainSyncStatus + Clone + Send + Sync + 'static,
     AddressBook: AddressBookPeers + Clone + Send + Sync + 'static,
 {
@@ -485,43 +395,11 @@ pub async fn run_mining_solver<
     rpc: RpcImpl<Mempool, State, ReadState, Tip, AddressBook, BlockVerifierRouter, SyncStatus>,
 ) -> Result<(), Report>
 where
-    Mempool: Service<
-            mempool::Request,
-            Response = mempool::Response,
-            Error = zakura_node_services::BoxError,
-        > + Clone
-        + Send
-        + Sync
-        + 'static,
-    Mempool::Future: Send,
-    State: Service<
-            zakura_state::Request,
-            Response = zakura_state::Response,
-            Error = zakura_state::BoxError,
-        > + Clone
-        + Send
-        + Sync
-        + 'static,
-    <State as Service<zakura_state::Request>>::Future: Send,
-    ReadState: Service<
-            zakura_state::ReadRequest,
-            Response = zakura_state::ReadResponse,
-            Error = zakura_state::BoxError,
-        > + Clone
-        + Send
-        + Sync
-        + 'static,
-    <ReadState as Service<zakura_state::ReadRequest>>::Future: Send,
+    Mempool: MempoolService,
+    State: StateService,
+    ReadState: ReadStateService,
     Tip: ChainTip + Clone + Send + Sync + 'static,
-    BlockVerifierRouter: Service<
-            zakura_consensus::Request,
-            Response = block::Hash,
-            Error = zakura_consensus::BoxError,
-        > + Clone
-        + Send
-        + Sync
-        + 'static,
-    <BlockVerifierRouter as Service<zakura_consensus::Request>>::Future: Send,
+    BlockVerifierRouter: BlockVerifierService,
     SyncStatus: ChainSyncStatus + Clone + Send + Sync + 'static,
     AddressBook: AddressBookPeers + Clone + Send + Sync + 'static,
 {
@@ -549,7 +427,7 @@ where
 
             // Skip the wait if we didn't get a template because we are shutting down.
             if !is_shutting_down() {
-                sleep(BLOCK_TEMPLATE_WAIT_TIME).await;
+                wait_for_mining_template_change(&mut template_receiver).await;
             }
 
             continue;
@@ -716,6 +594,7 @@ mod tests {
         serialization::ZcashDeserializeInto,
     };
     use zakura_network::address_book_peers::MockAddressBookPeers;
+    use zakura_node_services::mempool;
     use zakura_rpc::config::mining::{default_miner_address, MinerAddressType};
     use zakura_test::mock_service::MockService;
 
@@ -753,6 +632,31 @@ mod tests {
         ));
     }
 
+    /// The internal miner switches from standard to minimum difficulty work on the same parent.
+    #[test]
+    fn mining_template_replaces_harder_work_at_testnet_switch() {
+        use zakura_chain::work::difficulty::ParameterDifficulty;
+
+        let block = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
+            .zcash_deserialize_into::<Arc<Block>>()
+            .expect("block 1 deserializes");
+        let mut standard = *block.header;
+        let limit = Network::new_default_testnet().target_difficulty_limit();
+        standard.difficulty_threshold = (limit / 4_u32).to_compact();
+        let mut minimum = standard;
+        minimum.time += chrono::Duration::seconds(1);
+        minimum.difficulty_threshold = limit.to_compact();
+
+        // The GBT time-range change sets submitold=false on the same parent.
+        // It must replace the harder header even though that fixed header would
+        // still be valid to submit.
+        assert!(should_replace_mining_template(
+            Some(standard),
+            minimum,
+            Some(false),
+        ));
+    }
+
     #[test]
     fn unavailable_mining_template_cancels_current_work() {
         let block = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
@@ -774,6 +678,71 @@ mod tests {
             cancel_if_mining_template_changed(&mut template_receiver, old_header),
             Err(SolverCancelled)
         ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_solver_wakes_when_template_arrives() {
+        let block = zakura_chain::block::genesis::regtest_genesis_block();
+        let (sender, receiver) = watch::channel(None);
+        let mut receiver = WatchReceiver::new(receiver);
+        {
+            let wait = wait_for_mining_template_change(&mut receiver);
+            tokio::pin!(wait);
+            assert!(futures::poll!(&mut wait).is_pending());
+            tokio::time::advance(Duration::from_secs(1)).await;
+            sender.send(Some(block.clone())).unwrap();
+            tokio::time::timeout(Duration::from_millis(1), wait)
+                .await
+                .expect("new work must wake an idle solver before the 20-second timer");
+        }
+        assert_eq!(receiver.cloned_watch_data(), Some(block));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_solver_observes_template_arriving_before_wait() {
+        let block = zakura_chain::block::genesis::regtest_genesis_block();
+        let (sender, receiver) = watch::channel(None);
+        let mut receiver = WatchReceiver::new(receiver);
+        receiver.mark_as_seen();
+        assert!(receiver.cloned_watch_data().is_none());
+        sender.send(Some(block.clone())).unwrap();
+        tokio::time::timeout(
+            Duration::from_millis(1),
+            wait_for_mining_template_change(&mut receiver),
+        )
+        .await
+        .expect("a template arriving between the read and wait must not be missed");
+        assert_eq!(receiver.cloned_watch_data(), Some(block));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_solver_wakes_when_template_sender_closes() {
+        let (sender, receiver) = watch::channel(None);
+        let mut receiver = WatchReceiver::new(receiver);
+        {
+            let wait = wait_for_mining_template_change(&mut receiver);
+            tokio::pin!(wait);
+            assert!(futures::poll!(&mut wait).is_pending());
+            drop(sender);
+            tokio::time::timeout(Duration::from_millis(1), wait)
+                .await
+                .expect("channel closure must wake an idle solver promptly");
+        }
+        assert!(receiver.has_changed().is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_solver_wait_is_bounded_for_shutdown_checks() {
+        let (_sender, receiver) = watch::channel(None);
+        let mut receiver = WatchReceiver::new(receiver);
+        let started = tokio::time::Instant::now();
+        tokio::time::timeout(
+            BLOCK_TEMPLATE_WAIT_TIME + Duration::from_secs(1),
+            wait_for_mining_template_change(&mut receiver),
+        )
+        .await
+        .expect("an idle solver must periodically recheck shutdown without channel updates");
+        assert!(started.elapsed() >= BLOCK_TEMPLATE_WAIT_TIME);
     }
 
     #[tokio::test]
@@ -910,6 +879,7 @@ mod tests {
             assert!(matches!(request, zakura_state::ReadRequest::ChainInfo));
             Ok::<_, zakura_state::BoxError>(zakura_state::ReadResponse::ChainInfo(
                 zakura_state::GetBlockTemplateChainInfo {
+                    value_pools: Default::default(),
                     expected_difficulty: difficulty,
                     tip_height: height,
                     tip_hash: parent,

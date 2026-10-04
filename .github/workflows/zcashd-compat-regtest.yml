@@ -3,16 +3,23 @@ name: zcashd-compat Regtest
 # Runs the managed zcashd-compat Regtest integration suite.
 #
 # The test harness spawns a fresh zakurad and zcashd on randomised ports, so no
-# external infrastructure is required.
+# external infrastructure is required. It uses the P2P sidecar zcashd that
+# crates/zakurad/zcashd-compat-manifest.json pins.
 #
-# TEMPORARILY manual-only: the suite now requires a P2P-sidecar zcashd build
-# (miner RPCs removed, -regtestacceptunvalidatedpow support), but the managed
-# download manifest still pins the previous RPC-ingest build. Re-enable the
-# push trigger once a sidecar zcashd release is cut and
-# crates/zakurad/zcashd-compat-manifest.json is bumped. Until then run locally with
-# `make compat-test-regtest TEST_ZCASHD_PATH=/path/to/sidecar/zcashd`.
+# It runs for pull requests that change the zcashd-compat code, its tests or the
+# manifest, nightly, and on demand.
 on:
   workflow_dispatch:
+  schedule:
+    - cron: "17 6 * * *"
+  pull_request:
+    paths:
+      - ".github/workflows/zcashd-compat-regtest.yml"
+      - "crates/zakurad/src/components/zcashd_compat/**"
+      - "crates/zakurad/tests/common/zcashd_compat/**"
+      - "crates/zakurad/tests/common/zcashd_compat.rs"
+      - "crates/zakurad/zcashd-compat-manifest.json"
+      - "scripts/make/zcashd-compat.mk"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
@@ -41,14 +48,14 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 #v1.17.0
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f #v2.0.0
         with:
           toolchain: stable
           cache-key: zcashd-compat-regtest
           cache-on-failure: true
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      - uses: taiki-e/install-action@e67fa11c4b9316fa714ddf0abed07a0c3143b95b #v2.87.4
+      - uses: taiki-e/install-action@7623a79cdfecb99d681017af368ca353d9f49bb5 #v2.87.19
         with:
           tool: cargo-nextest
 

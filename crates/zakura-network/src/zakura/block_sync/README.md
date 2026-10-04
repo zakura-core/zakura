@@ -35,6 +35,40 @@ The distinction matters: anything anchored to the download floor is self-propell
 (downloading moves the floor, which permits more downloading),
 while anything anchored to the verified tip is pinned until real progress commits.
 
+## Retained serving range
+
+Native block-sync status advertises the range of retained, verified block bodies.
+The node initializes its lower bound from the persisted pruning marker. Storage
+publishes each new floor after the durable write and before the corresponding tip,
+so even a tip notification handled first uses the current floor. Archive nodes
+advertise from height zero. Requests for pruned heights return `RangeUnavailable`
+without querying storage. Genesis remains servable separately, and a request starting
+there stops before the pruned gap.
+
+Incoming status changes allow one extra range update per rate-limit window.
+Further range changes are coalesced and applied when the window expires, even
+if no new message arrives. Status replies remain rate limited.
+Each peer tracks the last status queued on its ordered stream. Changes that raise
+the lower bound or reduce the upper bound use a separate window of at most one
+second, including when pruning and tip growth happen together. All other changes
+use the configured refresh interval, so pruning does not wait behind tip-only growth.
+Further changes coalesce into the latest range. Full queues back off for at most
+100 ms without consuming a range-change allowance. One deadline calculation schedules
+range changes, queue retries, and incomplete status exchanges.
+
+Checkpoint retention can put the lower bound above the verified tip. Until retained
+bodies reach that height, the node advertises only genesis, which is always retained.
+This storage boundary does not advance the node's download floor or discard blocks
+it still needs from other peers. Embedders using pruned state should pass its retained
+height watch in `ZakuraHeaderSyncDriverStartup`, which every production endpoint
+initializer forwards. Direct reactor users attach it with
+`BlockSyncStartup::with_retention`.
+
+Advertisements describe current availability and do not reserve block bodies.
+A request already in flight can overlap pruning before its database read. That
+pre-existing race can still return `RangeUnavailable`; preventing it requires a
+separate serving/read reservation contract.
+
 ## The two lanes: Floor vs AboveFloor
 
 `RequestPriority` classifies a request by its start height
@@ -59,7 +93,7 @@ defers and the floor still moves.
 
 ## Look-ahead rules: `admit()` and the commit window
 
-All admission decisions go through one pure function, `admission::admit(config,
+Request admission decisions go through one pure function, `admission::admit(config,
 snapshot, start_height, servable_high, response_byte_cap)`. It is the single authority
 for the commit-window exemption, the resident-memory gate, and request sizing — the
 fill loop feeds its grant verbatim to the work queue and may not substitute its own
@@ -138,8 +172,22 @@ Two gates, checked together in `lookahead_over_budget`:
 This is separate from the **in-flight request budget** (`max_inflight_block_bytes`,
 default 6 GiB, tracked by `ByteBudget`): that bounds outstanding request
 reservations — charged at issuance, released at receipt (or timeout/watchdog/
-reset/floor GC) — while the look-ahead gate is the single authority over bytes
-_retained_ by the pipeline.
+reset/floor GC) — while the request look-ahead gate paces incoming work.
+
+The sequencer also checks actual serialized bytes before retaining **every** new body,
+including matched replies and late winners. Above the verified checkpoint window,
+reorder plus applying bytes plus the incoming body must fit the same look-ahead limit
+and block-count cap. This check uses the sequencer's current counters, so suppliers
+cannot concurrently spend a stale snapshot or accumulate bodies using understated
+hints. Transfers between reorder and applying retain their charge. Removal releases
+it. The bounded decoded submission window accounts for detached verifier work.
+
+At pressure, the body is released and its exact attempt returns to pending with the
+measured size as a minimum for retry. It waits for verified progress to avoid repeated
+downloads while full. The checkpoint window remains exempt so commit can advance.
+Request reservations and queued copies do not consume this final backlog allowance
+twice. Input, transport, and decoded submission windows remain separate bounded
+pools. The configured look-ahead limit is not a hard cap on total process RSS.
 
 ### Config clamps
 
@@ -226,3 +274,18 @@ borrowed a bypass slot.
 - **Block gate does not count the sequencer input channel** (its bytes are charged, its
   count is not); the channel is bounded by the submit window (401 by default), which is
   noise against the 262,144 default cap.
+
+## Size corrections
+
+A later known hint for the same header and auxiliary payload can fill an unknown size
+once, but never replaces a known one. State keeps the fill in a sparse
+`header_aux_body_size_v1` row beside the original delivery evidence and removes it
+when that delivery is pruned. Committed block sizes still take precedence.
+
+Committed corrections publish bounded batches of affected hashes. The queue updates
+matching pending items and saves newer hints for retries without changing issued
+reservations. A local measured size remains a minimum for a pressure retry. If a
+consumer misses the retained update history, it refreshes its existing queued window
+in bounded state queries. Accurate first deliveries add no correction writes or
+refresh queries. Size-only changes leave verification observations, header generations,
+and body-work epochs intact.

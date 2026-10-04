@@ -71,11 +71,12 @@
 //! Sending traces to different subscribers:
 //! * configuring a `tracing.log_file`: appends traces to a file on disk.
 //! * `journald`: send tracing spans and events to `systemd-journald`.
-//! * `sentry`: send crash and panic events to sentry.io.
+//! * `sentry`: enable Sentry reporting and tracing integration. Disabled by default, including
+//!   in release binaries. Build with `cargo build --release -p zakura --features sentry`, then
+//!   set `SENTRY_DSN` at runtime to enable reporting.
 //! * `flamegraph`: generate a flamegraph of tracing spans.
 //!
 //! Changing the traces that are collected:
-//! * `filter-reload`: dynamically reload tracing filters at runtime.
 //! * `error-debug`: enable extra debugging in release builds.
 //! * `tokio-console`: enable tokio's `console-subscriber` (needs [specific compiler flags])
 //! * A set of features that [skip verbose tracing].
@@ -87,7 +88,6 @@
 //! ### Testing
 //!
 //! * `proptest-impl`: enable randomised test data generation.
-//! * `lightwalletd-grpc-tests`: enable Zakura JSON-RPC tests that query `lightwalletd` using gRPC.
 //!
 //! ### Experimental
 //!

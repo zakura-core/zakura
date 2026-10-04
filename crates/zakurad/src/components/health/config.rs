@@ -23,7 +23,7 @@ pub struct Config {
     /// If `false`, `/ready` always returns 200 on regtest and testnets.
     pub enforce_on_test_networks: bool,
     /// Maximum age of the last committed block before readiness fails.
-    #[serde(with = "humantime_serde")]
+    #[serde(with = "zakura_chain::serialization::serde_adapters::duration")]
     pub ready_max_tip_age: Duration,
 }
 

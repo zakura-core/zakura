@@ -8,7 +8,6 @@ repository.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 
-homepage.workspace = true
 # crates.io is limited to 5 keywords and categories
 keywords = ["tower", "fallback"]
 # Must be one of <https://crates.io/category_slugs>
@@ -27,7 +26,7 @@ tracing = { workspace = true }
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "tracing", "test-util"] }
 
-zakura-test = { path = "../zakura-test/", version = "2.1.0" }
+zakura-test = { path = "../zakura-test/", version = "3.0.0" }
 
 [lints]
 workspace = true

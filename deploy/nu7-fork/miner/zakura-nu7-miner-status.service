@@ -7,6 +7,9 @@ Wants=network-online.target
 Type=simple
 # No root and no journal access: the report reads only the world-readable node
 # config and log file, node RPC on localhost, and `systemctl is-active`.
+# Pre-create the dedicated system user matching this unit name on hosts whose
+# system D-Bus rejects transient UIDs; DynamicUser then reuses that unprivileged
+# identity, so real systemctl health remains available without root.
 DynamicUser=yes
 # Blocks mined before the current network generation started are not counted.
 Environment=NU7_GENERATION_START=0

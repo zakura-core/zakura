@@ -1,0 +1,164 @@
+{
+  "schemaVersion": 1,
+  "selectedProfile": "public-testnet",
+  "selectionState": "selected",
+  "generatedAt": 1020,
+  "status": {
+    "schemaVersion": 1,
+    "observedAt": 1020,
+    "status": "live",
+    "network": {
+      "name": "Testnet",
+      "magic": "fa1af9bf",
+      "activationHeight": 100,
+      "branchId": "77190ad9",
+      "targetSpacingSeconds": 25,
+      "daaWindowBlocks": 102,
+      "reissuanceHeight": null,
+      "reissuanceKnown": false
+    },
+    "chain": {
+      "height": 102,
+      "hash": "0000000000000000000000000000000000000000000000000000000000000066",
+      "blockTime": 990,
+      "tipAgeSeconds": 30,
+      "difficulty": 3,
+      "meanIntervalSeconds": 25,
+      "medianIntervalSeconds": 25.0,
+      "intervalSampleBlocks": 2,
+      "timestampGapSeconds": 25,
+      "minimumDifficultyEligible": false,
+      "minimumDifficultyBlock": null
+    },
+    "nsm": {
+      "balanceZat": 700,
+      "available": true,
+      "seedZat": null
+    },
+    "observation": {
+      "validatorsConfigured": 3,
+      "validatorsAgree": true,
+      "localNodesAgree": true,
+      "validatorsAgreeing": 3,
+      "blocks24h": null,
+      "reorgs24h": null,
+      "reorgRate24h": null,
+      "since": 1020,
+      "scope": "Three public-Testnet validators and independent reference"
+    },
+    "mining": {
+      "operatorMinersActive": 0,
+      "operatorMinersConfigured": 0,
+      "remoteMiners": []
+    },
+    "nodes": [
+      {
+        "name": "0",
+        "healthy": true,
+        "height": 102,
+        "hash": "0000000000000000000000000000000000000000000000000000000000000066"
+      },
+      {
+        "name": "1",
+        "healthy": true,
+        "height": 102,
+        "hash": "0000000000000000000000000000000000000000000000000000000000000066"
+      },
+      {
+        "name": "2",
+        "healthy": true,
+        "height": 102,
+        "hash": "0000000000000000000000000000000000000000000000000000000000000066"
+      }
+    ],
+    "recentBlocks": [
+      {
+        "height": 102,
+        "hash": "0000000000000000000000000000000000000000000000000000000000000066",
+        "time": 990,
+        "difficulty": 3
+      },
+      {
+        "height": 101,
+        "hash": "0000000000000000000000000000000000000000000000000000000000000065",
+        "time": 965,
+        "difficulty": 3
+      },
+      {
+        "height": 100,
+        "hash": "0000000000000000000000000000000000000000000000000000000000000064",
+        "time": 940,
+        "difficulty": 3
+      }
+    ]
+  },
+  "network": {
+    "schemaVersion": 1,
+    "nodeRevision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "config": "[network]\nnetwork = \"Testnet\"\n",
+    "configSha256": "62a97f66bce81509652abdddcc1c5387fb92ff14ee0871810f91443f3bd6dcc3",
+    "network": {
+      "name": "Testnet",
+      "magic": "fa1af9bf",
+      "activationHeight": 100,
+      "branchId": "77190ad9"
+    }
+  },
+  "rules": {
+    "atTip": {
+      "network": "Testnet",
+      "effectiveHeight": 102,
+      "networkMagic": "fa1af9bf",
+      "activationHeight": 100,
+      "branchId": "77190ad9",
+      "nu7BranchId": "77190ad9",
+      "targetSpacingSeconds": 25,
+      "difficulty": {
+        "averagingWindowBlocks": 102,
+        "minimumDifficultyGapMultiplier": 18,
+        "minimumDifficultyGapSeconds": 450,
+        "minimumDifficultyStrictlyGreater": true
+      },
+      "averagingWindowBlocks": 102,
+      "minimumDifficultyGapMultiplier": 18,
+      "minimumDifficultyGapSeconds": 450,
+      "minimumDifficultyStrictlyGreater": true,
+      "daaWindowBlocks": 102,
+      "minimumDifficulty": {
+        "gapMultiplier": 18,
+        "thresholdSeconds": 450,
+        "comparison": "strictly-greater"
+      }
+    },
+    "nextBlock": {
+      "network": "Testnet",
+      "effectiveHeight": 103,
+      "networkMagic": "fa1af9bf",
+      "activationHeight": 100,
+      "branchId": "77190ad9",
+      "nu7BranchId": "77190ad9",
+      "targetSpacingSeconds": 25,
+      "difficulty": {
+        "averagingWindowBlocks": 102,
+        "minimumDifficultyGapMultiplier": 18,
+        "minimumDifficultyGapSeconds": 450,
+        "minimumDifficultyStrictlyGreater": true
+      },
+      "averagingWindowBlocks": 102,
+      "minimumDifficultyGapMultiplier": 18,
+      "minimumDifficultyGapSeconds": 450,
+      "minimumDifficultyStrictlyGreater": true,
+      "daaWindowBlocks": 102,
+      "minimumDifficulty": {
+        "gapMultiplier": 18,
+        "thresholdSeconds": 450,
+        "comparison": "strictly-greater"
+      }
+    }
+  },
+  "capabilities": {
+    "faucet": null,
+    "snapshot": null
+  },
+  "generation": "20e5dbd6be4993469dbc35eefeaf2bac82224518b672ca29b8f010f86a0cb6f3"
+}

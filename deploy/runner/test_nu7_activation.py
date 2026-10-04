@@ -189,6 +189,32 @@ class ActivationTests(unittest.TestCase):
         with self.assertRaises(json.JSONDecodeError):
             ActivationFeed(self.config_path, Staging(), lambda: self.now, self.rpc)
 
+    def test_missing_selected_state_fails_closed(self):
+        for _ in range(3):
+            self.poll()
+        self.feed.owner.close()
+        self.feed.path.unlink()
+        with self.assertRaisesRegex(ValueError, "operator repair"):
+            ActivationFeed(self.config_path, Staging(), lambda: self.now, self.rpc)
+        self.assertFalse(self.feed.path.exists())
+
+    def test_intact_legacy_selection_is_adopted_without_reset(self):
+        for _ in range(3):
+            self.poll()
+        self.feed.owner.close()
+        marker = self.feed.path.with_suffix(".initialized")
+        marker.unlink()
+        self.feed = ActivationFeed(self.config_path, Staging(), lambda: self.now, self.rpc)
+        self.assertEqual(self.feed.state["selectedProfile"], "public-testnet")
+        self.assertTrue(marker.exists())
+
+    def test_missing_legacy_state_with_existing_lock_fails_closed(self):
+        self.feed.owner.close()
+        self.feed.path.unlink()
+        self.feed.path.with_suffix(".initialized").unlink()
+        with self.assertRaisesRegex(ValueError, "operator repair"):
+            ActivationFeed(self.config_path, Staging(), lambda: self.now, self.rpc)
+
     def test_wrong_identity_and_manifest_checksum_rejected(self):
         self.config["public"]["manifest"]["configSha256"] = "bad"
         self.config_path.write_text(json.dumps(self.config))

@@ -90,9 +90,14 @@ class ActivationFeed:
         self.path = Path(self.config["stateFile"])
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.validate_config()
-        self.owner = self.path.with_suffix(".lock").open("a")
+        owner_path = self.path.with_suffix(".lock")
+        previously_initialized = owner_path.exists()
+        marker_path = self.path.with_suffix(".initialized")
+        self.owner = owner_path.open("a")
         try:
             fcntl.flock(self.owner, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            if not self.path.exists() and (marker_path.exists() or previously_initialized):
+                raise ValueError("selection state missing from initialized directory; operator repair required")
             self.state = (json.loads(self.path.read_text()) if self.path.exists() else
                           {"selectionState": "armed" if self.config["armed"] else "staging",
                            "selectedProfile": "staging", "consecutivePasses": 0})
@@ -114,6 +119,9 @@ class ActivationFeed:
         self.headers = {}
         self.last_tips = {}
         atomic_json(self.path, self.state)
+        # Adopt intact legacy selection safely; the marker survives loss of the
+        # selection file and is never an automatic reset authorization.
+        atomic_json(marker_path, {"schemaVersion": 1})
 
     def validate_config(self):
         public = self.config["public"]

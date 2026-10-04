@@ -150,7 +150,7 @@ impl<U> SendResponse<U> {
 
 #[cfg(test)]
 mod tests {
-    use tokio_test::{assert_pending, assert_ready, assert_ready_err, task};
+    use tokio_test::{assert_pending, assert_ready, task};
     use tower::ServiceExt;
 
     use super::*;
@@ -159,7 +159,7 @@ mod tests {
     fn permitting_requests_wakes_readiness_and_call_consumes_the_permit() {
         let (mut service, mut handle) = pair::<(), ()>();
         handle.allow(0);
-        let mut readiness = task::spawn(service.ready());
+        let mut readiness = task::spawn(async { service.ready().await.map(|_| ()) });
         assert_pending!(readiness.poll());
         handle.allow(1);
         assert!(readiness.is_woken());
@@ -179,18 +179,18 @@ mod tests {
     fn dropping_handle_wakes_readiness_and_fails_queued_responses() {
         let (mut service, mut handle) = pair::<(), ()>();
         handle.allow(1);
-        let mut readiness = task::spawn(service.ready());
+        let mut readiness = task::spawn(async { service.ready().await.map(|_| ()) });
         assert_ready!(readiness.poll()).expect("one request is permitted");
         drop(readiness);
         let mut response = task::spawn(service.call(()));
         assert_pending!(response.poll());
 
-        let mut readiness = task::spawn(service.ready());
+        let mut readiness = task::spawn(async { service.ready().await.map(|_| ()) });
         assert_pending!(readiness.poll());
         drop(handle);
         assert!(readiness.is_woken());
         assert!(response.is_woken());
-        assert_ready_err!(readiness.poll());
-        assert_ready_err!(response.poll());
+        assert!(assert_ready!(readiness.poll()).is_err());
+        assert!(assert_ready!(response.poll()).is_err());
     }
 }

@@ -14,7 +14,7 @@ use libc::{getrlimit64 as getrlimit, rlimit64 as Rlimit, setrlimit64 as setrlimi
 /// System-call errors propagate to the database's existing fallback policy.
 #[cfg(unix)]
 // Resource-limit widths vary across Unix targets.
-#[allow(clippy::useless_conversion)]
+#[allow(clippy::unnecessary_cast)]
 pub(super) fn increase_nofile_limit(requested: u64) -> io::Result<u64> {
     let mut limits = open_file_limits()?;
     // Unix resource-limit types are unsigned integers of at most 64 bits.
@@ -36,9 +36,8 @@ pub(super) fn increase_nofile_limit(requested: u64) -> io::Result<u64> {
     ))]
     let requested = requested.min(kernel_open_file_limit()?);
 
-    limits.rlim_cur = requested
-        .try_into()
-        .expect("the requested limit is bounded by the same type's hard limit");
+    // The requested limit is bounded by the same type's hard limit.
+    limits.rlim_cur = requested as _;
     set_open_file_limits(&limits)?;
     Ok(requested)
 }
@@ -83,6 +82,8 @@ fn set_open_file_limits(limits: &Rlimit) -> io::Result<()> {
 #[allow(unsafe_code)]
 fn kernel_open_file_limit() -> io::Result<u64> {
     let mut mib = [libc::CTL_KERN, libc::KERN_MAXFILESPERPROC];
+    // The MIB has two elements, so its length fits in c_uint.
+    let mib_length = mib.len() as libc::c_uint;
     let mut limit: libc::c_int = 0;
     let mut length = std::mem::size_of_val(&limit);
     // SAFETY: The MIB describes a single integer. Its length and the writable
@@ -91,7 +92,7 @@ fn kernel_open_file_limit() -> io::Result<u64> {
     if unsafe {
         libc::sysctl(
             mib.as_mut_ptr(),
-            mib.len().try_into().expect("the MIB has only two elements"),
+            mib_length,
             std::ptr::from_mut(&mut limit).cast(),
             &mut length,
             std::ptr::null_mut(),

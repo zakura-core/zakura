@@ -33,6 +33,20 @@ fn open_file_limits_in_child() {
 
     let mut limits = open_file_limits().unwrap();
     assert!(limits.rlim_max >= 256, "the child needs 256 open files");
+    #[cfg(any(
+        target_vendor = "apple",
+        target_os = "freebsd",
+        target_os = "dragonfly"
+    ))]
+    {
+        let kernel_limit = kernel_open_file_limit().unwrap();
+        // Unix resource-limit types are unsigned integers of at most 64 bits.
+        let expected_limit = kernel_limit.min(limits.rlim_max as u64);
+        limits.rlim_cur = 64;
+        set_open_file_limits(&limits).unwrap();
+        assert_eq!(increase_nofile_limit(u64::MAX).unwrap(), expected_limit);
+        assert_eq!(open_file_limits().unwrap().rlim_max, limits.rlim_max);
+    }
     limits.rlim_cur = 64;
     limits.rlim_max = 256;
     set_open_file_limits(&limits).unwrap();

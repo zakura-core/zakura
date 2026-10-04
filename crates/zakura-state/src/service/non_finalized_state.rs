@@ -13,7 +13,7 @@ use std::{
 use indexmap::IndexMap;
 use tokio::sync::watch;
 use zakura_chain::{
-    block::{self, Block, Hash, Height},
+    block::{self, Hash, Height},
     parameters::Network,
     sprout::{self},
     transparent,

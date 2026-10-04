@@ -7,7 +7,7 @@ use std::{
 
 use color_eyre::{
     eyre::{eyre, Report},
-    section::SectionExt,
+    section::{Section, SectionExt},
 };
 use futures::future::{ready, Ready};
 use tower::{Service, ServiceExt};

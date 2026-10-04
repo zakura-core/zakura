@@ -349,12 +349,15 @@ def main():
     parser.add_argument("--db", type=Path, required=True)
     parser.add_argument("--faucet-address", required=True,
                         help="the faucet's own transparent address, funded by its node's coinbase")
-    parser.add_argument("--sender", type=Path, required=True)
+    parser.add_argument("--sender", type=Path, required=True,
+                        help="a separately installed executable implementing the faucet sender interface")
     parser.add_argument("--config", type=Path, default=Path("/etc/zakura/zakura.toml"))
     parser.add_argument("--rpc-port", type=int, default=18232)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8094)
     args = parser.parse_args()
+    if not args.sender.is_absolute() or not args.sender.is_file() or not os.access(args.sender, os.X_OK):
+        parser.error("--sender must name an installed executable using an absolute path")
     faucet = Faucet(args.db, args.rpc_port, args.faucet_address, args.sender, args.config)
     Handler.faucet = faucet
     threading.Thread(target=faucet.run_worker, daemon=True).start()

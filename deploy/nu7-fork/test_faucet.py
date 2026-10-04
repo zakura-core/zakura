@@ -1,6 +1,7 @@
 """Tests for public claim allocation, without a node or a real key."""
 
 import http.client
+import io
 import json
 import socket
 import threading
@@ -189,14 +190,15 @@ class FaucetKeyIsolationTest(unittest.TestCase):
     def test_the_sender_signs_with_the_faucet_key_for_the_faucet_address(self):
         with tempfile.TemporaryDirectory() as tmp:
             claims = Faucet(Path(tmp) / "claims.sqlite3", 18232, "tmFaucet",
-                            Path("/usr/local/bin/zakura-fork-txload"), Path("/etc/zakura/zakura.toml"))
+                            Path("/usr/local/bin/faucet-sender"), Path("/etc/zakura/zakura.toml"))
             with claims.connect() as connection:
                 connection.execute("INSERT INTO claims (id, address, ip, created_at, status) "
                                    "VALUES ('c1', 'utest1recipient', '203.0.113.1', 1, 'queued')")
-            done = __import__("subprocess").CompletedProcess([], 0, "txid " + "a" * 64, "")
+            done = __import__("subprocess").CompletedProcess([], 0, "FAUCET_TXID=" + "a" * 64, "")
             with patch.dict("os.environ", {"CREDENTIALS_DIRECTORY": "/run/credentials/faucet"}), \
                     patch.object(faucet.subprocess, "run", return_value=done) as run:
                 claims.process_next()
+            self.assertEqual(claims.claim("c1")["status"], "sent")
         command = run.call_args.args[0]
         self.assertEqual(command[command.index("--address") + 1], "tmFaucet")
         self.assertEqual(command[command.index("--secret-key-file") + 1],
@@ -211,6 +213,48 @@ class FaucetKeyIsolationTest(unittest.TestCase):
         self.assertNotIn("miner-key", unit)
         self.assertNotIn("/root/", unit)
         self.assertIn("--faucet-address ${FAUCET_ADDRESS}", unit)
+        self.assertIn("--sender ${FAUCET_SENDER}", unit)
+
+
+class FaucetSenderStartupTest(unittest.TestCase):
+    def arguments(self, db, sender):
+        return ["faucet.py", "--db", str(db), "--faucet-address", "tmFaucet",
+                "--sender", str(sender)]
+
+    def test_an_explicit_external_executable_starts_the_faucet(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sender = Path(tmp) / "sender"
+            sender.write_text("#!/bin/sh\nexit 0\n")
+            sender.chmod(0o755)
+            db = Path(tmp) / "claims.sqlite3"
+            with patch("sys.argv", self.arguments(db, sender)), \
+                    patch.object(faucet, "Faucet") as factory, \
+                    patch.object(faucet.threading, "Thread") as worker, \
+                    patch.object(faucet, "BoundedHTTPServer") as server:
+                faucet.main()
+            self.assertEqual(factory.call_args.args[3], sender)
+            worker.return_value.start.assert_called_once()
+            server.return_value.serve_forever.assert_called_once()
+
+    def test_invalid_senders_are_refused_before_opening_claims(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            non_executable = root / "not-executable"
+            non_executable.touch(mode=0o600)
+            db = root / "claims.sqlite3"
+            for sender in (root / "missing", non_executable, root, Path("relative-sender")):
+                with self.subTest(sender=sender), \
+                        patch("sys.argv", self.arguments(db, sender)), \
+                        patch("sys.stderr", new_callable=io.StringIO) as stderr, \
+                        patch.object(faucet, "Faucet") as factory, \
+                        patch.object(faucet.threading, "Thread") as worker:
+                    with self.assertRaises(SystemExit) as error:
+                        faucet.main()
+                    self.assertEqual(error.exception.code, 2)
+                    self.assertIn("installed executable using an absolute path", stderr.getvalue())
+                    factory.assert_not_called()
+                    worker.assert_not_called()
+            self.assertFalse(db.exists())
 
 
 if __name__ == "__main__":

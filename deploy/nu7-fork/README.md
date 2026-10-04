@@ -230,35 +230,11 @@ That snapshot is taken in `tip` mode, which is a **pruned** database, so
 `host.storage_mode` defaults to `pruned` to match. Describing a pruned seed as an
 archive node would misreport what the node actually holds.
 
-## Producing fees
-
-A fork whose every block is coinbase-only has no fees, so NU7 fee recycling
-never engages: the 60% that should reach the NSM balance and the 40% the miner
-should claim are both zero. `txload/` creates those fees.
-
-```sh
-cargo run --release -p zakura-fork-txload -- \
-  --address <miner-address> --secret-key-file <protected-key-file> --fee 10000000
-```
-
-Each transaction shields one matured coinbase output into the **Ironwood** pool
-and leaves the fee behind as the gap between the input value and the note
-value. Two consensus rules force that shape:
-
-- a transaction spending transparent coinbase **must have no transparent
-  outputs**, so the value has to leave the transparent pool entirely, and
-- the Orchard pool is closed to new value after NU6.3, so Ironwood is where it
-  can go.
-
-The only spendable value on a fork is its own coinbase, and transparent
-coinbase needs 100 confirmations, so a freshly seeded fork cannot produce a fee
-for its first ~100 blocks.
-
 ## Public faucet
 
-`faucet.py` accepts Testnet Unified Addresses with an Orchard receiver and uses
-`zakura-fork-txload` to send **0.1 testnet ZEC in Ironwood** from mature
-coinbase at the faucet's own address. It allows one claim per address and two per client IP every 24 hours,
+`faucet.py` accepts Testnet Unified Addresses with an Orchard receiver and
+queues **0.1 testnet ZEC Ironwood** payouts through a separately installed sender
+that spends mature coinbase at the faucet's own address. It allows one claim per address and two per client IP every 24 hours,
 at most 100 claims (10 ZEC) per UTC day. Claims are queued persistently in
 SQLite, spaced at least 30 seconds apart, and in-flight claims become
 `review` after a restart so a broadcast is never repeated automatically.
@@ -277,15 +253,24 @@ ID indicates broadcast. `review` requires operator attention and must not be
 resent automatically. Keep the existing claim limits and persistent database
 when deploying UI/CORS changes; restart the worker only when no claim is processing.
 
-Build the sender from the same revision as the node with
-`cargo build --release --locked -p zakura-fork-txload`. No protocol dependency
-patch is needed.
-After a reset, preserve the old claims database for audit and use a fresh one.
-Wait for coinbase maturity before reopening the faucet.
+The repository does not provide a transaction sender. Install an executable that
+supports this fork's configured network and Ironwood transactions, and set its
+absolute path as `FAUCET_SENDER` in `/etc/zakura-nu7-faucet/faucet.env`. The wrapper
+refuses to start if the executable is missing or not executable. Retain an
+existing deployed sender until a replacement has been independently validated.
 
-Install the release build as `/usr/local/bin/zakura-fork-txload`, install
-`faucet.py` under `/opt/zakura-nu7-faucet`, and install `faucet.service` as
-`zakura-nu7-faucet.service`.
+Install `faucet.py` under `/opt/zakura-nu7-faucet` and `faucet.service` as
+`zakura-nu7-faucet.service`. Preserve the old claims database for audit after a
+reset, and wait for coinbase maturity before reopening the faucet.
+
+The sender must accept `--rpc`, `--config`, `--address`, `--secret-key-file`,
+`--recipient`, `--amount-zat`, `--fee`, and `--count 1`. It must validate that the
+key controls the source address, create a valid Ironwood payout with no transparent
+outputs when spending coinbase, and exit successfully with
+`FAUCET_TXID=<64-character transaction hash>` on stdout only after broadcast.
+The wrapper passes a payout of 10,000,000 zatoshis and a fee of 100,000 zatoshis.
+Any failed, timed-out or ambiguous submission becomes `review`; it is never
+retried automatically.
 
 **The faucet has its own key.** It never holds the operator mining key. The
 fork config's `faucet.address` is a separate transparent address, and the primary
@@ -294,30 +279,19 @@ key stays off every fork host. The faucet therefore spends only the primary's
 coinbase, and a leaked faucet host exposes only that balance. Coinbase cannot be
 moved to another transparent address (it must have no transparent outputs), so
 mining to the faucet address is how it is funded. `fork.py` refuses a faucet
-address equal to the miner address, and `zakura-fork-txload` refuses a key that
-does not control `--address`.
+address equal to the miner address. Key-to-address validation is also required
+of the external sender.
 
 The service loads `/etc/zakura-nu7-faucet/faucet-key.hex` (root-owned, mode
-0600) through systemd `LoadCredential`, and reads `FAUCET_ADDRESS`, and
+0600) through systemd `LoadCredential`, and reads `FAUCET_ADDRESS`, `FAUCET_SENDER`, and
 optionally an existing `FAUCET_DB`, from `/etc/zakura-nu7-faucet/faucet.env`,
 which holds no secret. Add the faucet route in `dashboard.Caddyfile`, validate
 Caddy, then start the service. After switching the primary to a new faucet
 address, the faucet reports itself unavailable until that address has mature
 coinbase, about 100 primary-mined blocks.
 
-The output beyond the exact payout and the 100,000-zatoshi fee goes to a
-deterministic Ironwood change address derived from the faucet key. The current
-sender does not spend those change notes; retain the faucet key for future
-recovery tooling. This limits the faucet to fresh mature coinbase outputs until
-shielded change spending is implemented.
-
-### Why the faucet and sender stay
-
-`faucet.py` and `zakura-fork-txload` overlap with `valar-testnet-faucet` and
-zecd. zecd cannot sync a configured network yet, so it cannot follow
-`Nu7StagingV3`, and the existing faucet cannot pay Ironwood on this fork. They are
-kept deliberately until zecd supports configured networks; that support is a
-separate follow-up, and nothing here depends on it.
+Retain the faucet key and any sender-specific wallet state for recovery of
+shielded change. Change-note management belongs to the external sender.
 
 ## Reconfiguring
 
@@ -478,7 +452,7 @@ cover what Rust tests cannot.
 | `deploy/deployer/test_deploy.py` | nested config round trips and parallel same-host staging |
 
 The Rust side is `cargo test -p zakura-network --lib config::tests` for the
-rendered fixture and the activation overlay, and `cargo test -p zakura-fork-txload`.
+rendered fixture and the activation overlay.
 As the tooling shrinks, so does this CI cost.
 
 ## Layout
@@ -488,7 +462,6 @@ As the tooling shrinks, so does this CI cost.
 | `fork.toml` | Template parameters for a fresh fork, not the live V3 configuration |
 | `fork.py` | Provision, seed, plan, render, deploy, status, reconfigure |
 | `miner/` | Remote mining node health endpoint and its unit |
-| `txload/` | Drives fee-bearing transactions (`zakura-fork-txload`) |
 | `nodes.generated.toml` | Generated `deploy.py` fleet config; not committed |
 
 `fork.py` renders a fleet config for `deploy/deployer/deploy.py` rather than

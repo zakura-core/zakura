@@ -11,7 +11,9 @@ use tokio::sync::oneshot;
 use tokio_test::{assert_pending, assert_ready, assert_ready_err, task};
 use tower::{Service, ServiceExt};
 use tower_batch_control::{error, Batch, BatchControl, RequestWeight};
-use tower_test::mock;
+
+#[path = "worker/mock.rs"]
+mod mock;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
 

@@ -2,7 +2,7 @@ name: Test Docker Config
 
 on:
   pull_request:
-    branches: [main, "feat/**", "split/**", "release/**"]
+    branches: [main, "feat/**", "split/**", "adam/**", "release/**"]
     types: [opened, synchronize, reopened]
     paths:
       - "crates/zakurad/src/**"

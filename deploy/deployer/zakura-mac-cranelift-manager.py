@@ -268,11 +268,9 @@ def download_candidate(run_id, directory):
         return json.loads(subprocess.check_output(
             ['gh', 'api', f'repos/{repository}/actions/runs/{run_id}' + suffix], timeout=30))
     run = api('')
-    # The installed accepted binary's unexpired artifact uses mac-verifier.yml.
     if (run.get('head_repository', {}).get('full_name') != repository
             or run.get('head_branch') not in ['main', os.environ.get('ZAKURA_MAC_CRANELIFT_DEPLOY_BRANCH')]
             or run.get('path') not in ['.github/workflows/zakura-mac-cranelift.yml', '.github/workflows/build-zakura-mac-cranelift.yml',
-                                       '.github/workflows/mac-verifier.yml',
                                        '.github/workflows/zakura-mainnet-deploy.yml']):
         raise ValueError('candidate must come from successful trusted zakura-mac-cranelift CI')
     if run.get('status') != 'completed':
@@ -284,7 +282,7 @@ def download_candidate(run_id, directory):
     if run.get('conclusion') != 'success':
         raise ValueError('candidate CI did not pass; live binary unchanged')
     artifacts = [a for a in api('/artifacts')['artifacts']
-                 if a['name'].startswith(('zakura-mac-cranelift-candidate-', 'mac-verifier-cranelift-')) and not a['expired']]
+                 if a['name'].startswith('zakura-mac-cranelift-candidate-') and not a['expired']]
     if len(artifacts) != 1:
         raise ValueError('exactly one accepted candidate artifact required')
     subprocess.run(['gh', 'run', 'download', run_id, '--repo', repository,

@@ -479,6 +479,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn optional_duration_preserves_config_toml() {
+        let config: Config =
+            toml::from_str(r#"debug_validity_check_interval = "15 seconds""#).unwrap();
+        assert_eq!(
+            config.debug_validity_check_interval,
+            Some(Duration::from_secs(15))
+        );
+        assert!(toml::to_string(&config)
+            .unwrap()
+            .contains(r#"debug_validity_check_interval = "15s""#));
+        assert_eq!(
+            toml::from_str::<Config>("")
+                .unwrap()
+                .debug_validity_check_interval,
+            None
+        );
+        assert!(!toml::to_string(&Config::default())
+            .unwrap()
+            .contains("debug_validity_check_interval"));
+        assert!(toml::from_str::<Config>("debug_validity_check_interval = 15").is_err());
+    }
+
+    #[test]
     fn storage_mode_deserializes_from_documented_toml() {
         assert!(
             Config::default().vct_fast_sync,

@@ -552,7 +552,6 @@ As the tooling shrinks, so does this CI cost.
 | `miner/` | Remote mining node health endpoint and its unit |
 | `txload/` | Drives fee-bearing transactions (`zakura-fork-txload`) |
 | `nodes.generated.toml` | Generated `deploy.py` fleet config; not committed |
-| `ROLLOUT.md` | Redeploying `Nu7StagingV3` with this layout, with acceptance checks |
 
 `fork.py` renders a fleet config for `deploy/deployer/deploy.py` rather than
 deploying by itself, so the fork node is built, shipped and supervised by exactly

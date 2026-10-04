@@ -9,12 +9,11 @@ from unittest.mock import patch, MagicMock
 import urllib.error
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from common import RPC, Unavailable, canonical_record
-from comparison import Comparison, Remote
+from common import RPC, Unavailable, canonical_record, public_status, atomic_json
+from comparison import Comparison, Remote, publish_result
 from rotate_logs import rotate
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "runner"))
-from mac_cranelift_status import public_status, publish_status
-from ssh_probe import fork_anchor
+from ssh_probe import ancestors
 
 
 def record(height, fork=0):
@@ -110,8 +109,63 @@ class ComparisonTests(unittest.TestCase):
         self.assertEqual(len(evidence), 1)
         self.mac.records.clear()
         self.step(60)
-        self.assertTrue(json.loads((Path(self.temp.name) / "status.json").read_text())["caught_up"])
+        self.assertEqual(json.loads((Path(self.temp.name) / "status.json").read_text())["condition"], "matching")
         self.assertTrue(evidence[0].exists())
+
+    def test_confirmed_mismatch_survives_evidence_and_status_storage_failures(self):
+        for at_cursor in (False, True):
+            for fault in ("evidence", "audit", "cursor", "status", "all"):
+                with self.subTest(at_cursor=at_cursor, fault=fault), tempfile.TemporaryDirectory() as directory:
+                    linux, mac = Chain(), Mac()
+                    mac.now = 30
+                    outcomes = []
+                    monitor = Comparison(directory, receipt(), linux, mac,
+                                         report=lambda *value: outcomes.append(value))
+                    if at_cursor:
+                        monitor.step(30)
+                        height = monitor.state["cursor"]
+                    else:
+                        height = 11
+                    mac.records[height] = record(height)
+                    mac.records[height]["pools"]["ironwood"]["root"] = "cc" * 32
+                    def write(path, value, **kwargs):
+                        path = Path(path)
+                        if (fault == "all" or fault == "evidence" and path.parent.name == "incidents"
+                                or fault == "cursor" and path.name == "cursor.json"
+                                or fault == "status" and path.name == "status.json"):
+                            self.assertEqual(outcomes, [("tree_mismatch", 30)])
+                            raise OSError("fixture storage failure")
+                        atomic_json(path, value, **kwargs)
+                    with patch("comparison.atomic_json", side_effect=write), \
+                            patch.object(monitor, "audit", side_effect=OSError("audit") if fault == "audit" else monitor.audit):
+                        result = monitor.step(30)
+                    self.assertEqual(outcomes, [("tree_mismatch", 30)])
+                    self.assertEqual(result["condition"], "tree_mismatch")
+                    self.assertEqual(result["compared_through"], height if at_cursor else 10)
+
+    def test_matching_requires_successful_cursor_and_private_status_writes(self):
+        self.mac.now = 30
+        for method in ("save",):
+            with patch.object(self.monitor, method, side_effect=OSError("fixture")):
+                self.assertEqual(self.monitor.step(30)["condition"], "unavailable")
+        original = atomic_json
+        def fail_status(path, value, **kwargs):
+            if Path(path).name == "status.json":
+                raise OSError("fixture")
+            return original(path, value, **kwargs)
+        with patch("comparison.atomic_json", side_effect=fail_status):
+            self.assertEqual(self.monitor.step(30)["condition"], "unavailable")
+
+    def test_validated_sample_drops_unused_fields_and_rejects_bad_ancestry(self):
+        self.mac.now = 30
+        sample = self.mac.status()
+        sample['ancestor_hashes'] = {'10': 'a' * 64}
+        normalized = self.monitor.validate_status(sample, 30)
+        self.assertNotIn('memory_free_percent', normalized['resources'])
+        self.assertEqual(normalized['ancestor_hashes'], {'10': 'a' * 64})
+        for ancestors_sample in ([], {'0': 'a' * 64}, {'10': 'bad'}, {'32': 'a' * 64}):
+            with self.subTest(ancestors=ancestors_sample), self.assertRaises(Unavailable):
+                self.monitor.validate_status(dict(sample, ancestor_hashes=ancestors_sample), 30)
 
     def test_failed_or_wrong_identity_samples_do_not_advance(self):
         for sample in [None, [], {"receipt": {}}, {}]:
@@ -178,38 +232,39 @@ class ComparisonTests(unittest.TestCase):
 
 
 class ForkSampleTests(unittest.TestCase):
-    def test_anchor_is_ten_ancestors_back_and_tip_race_fails(self):
-        from unittest.mock import Mock
-        rpc = Mock()
-        rpc.call.side_effect = ["a" * 64, "b" * 64]
-        self.assertEqual(fork_anchor(rpc, {"height": 100, "hash": "b" * 64}),
-                         {"height": 90, "hash": "a" * 64})
-        self.assertEqual(rpc.call.call_args_list[0].args, ("getblockhash", 90))
-        rpc.call.side_effect = ["a" * 64, "c" * 64]
+    def test_ancestors_reuse_dashboard_depths_and_tip_race_fails(self):
+        rpc = MagicMock()
+        rpc.call.side_effect = ["a" * 64] * 5 + ["b" * 64]
+        self.assertEqual(ancestors(rpc, {"height": 100, "hash": "b" * 64}),
+                         {str(depth): "a" * 64 for depth in (1, 2, 5, 10, 32)})
+        self.assertEqual([call.args for call in rpc.call.call_args_list],
+                         [("getblockhash", height) for height in (99, 98, 95, 90, 68, 100)])
+        rpc.call.side_effect = ["a" * 64] * 5 + ["c" * 64]
         with self.assertRaises(Unavailable):
-            fork_anchor(rpc, {"height": 100, "hash": "b" * 64})
-        self.assertIsNone(fork_anchor(rpc, {"height": 9, "hash": "b" * 64}))
+            ancestors(rpc, {"height": 100, "hash": "b" * 64})
+        rpc.call.side_effect = ["a" * 64] * 3 + ["b" * 64]
+        self.assertEqual(set(ancestors(rpc, {"height": 9, "hash": "b" * 64})), {"1", "2", "5"})
 
-    def test_public_status_drops_malformed_anchor_and_private_fields(self):
+    def test_public_status_drops_malformed_ancestors_and_private_fields(self):
         identifier = "verifier-" + "a" * 32
-        result = public_status({"verifier": {"fork_anchor": {"height": 90, "hash": "b" * 64,
-                                                               "host": "192.0.2.10"}}}, identifier)
-        self.assertEqual(result["fork_anchor"], {"height": 90, "hash": "b" * 64})
-        for anchor in (None, [], {"height": True, "hash": "b" * 64}, {"height": 90, "hash": "bad"}):
-            self.assertNotIn("fork_anchor", public_status({"verifier": {"fork_anchor": anchor}}, identifier))
+        raw = {"verifier": {"ancestor_hashes": {"10": "b" * 64, "host": "192.0.2.10", "2": "bad"}}}
+        self.assertEqual(public_status(raw, identifier)["ancestor_hashes"], {"10": "b" * 64})
+        for value in (None, [], {"0": "b" * 64}, {"9" * 5000: "b" * 64}):
+            self.assertEqual(public_status({"verifier": {"ancestor_hashes": value}}, identifier)["ancestor_hashes"], {})
 
 
 class BoundaryTests(unittest.TestCase):
 
-    def test_comparison_health_excludes_muting_but_includes_verification_failures(self):
-        base = {"caught_up": True, "error": None, "incidents": {}}
+    def test_condition_is_the_only_comparison_health_signal(self):
         identifier = "verifier-" + "a" * 32
-        self.assertTrue(public_status(base, identifier)["comparison_healthy"])
-        self.assertTrue(public_status(base, identifier)["alerts_muted"])
-        for change in [{"caught_up": False}, {"error": "unexpected build or configuration"},
-                       {"incidents": {"confirmed tree state mismatch": {}}}]:
-            with self.subTest(change=change):
-                self.assertFalse(public_status({**base, **change}, identifier)["comparison_healthy"])
+        for condition in ("matching", "catching_up", "tree_mismatch", "unavailable", "chain_disagreement", "coverage_gap"):
+            result = public_status({"condition": condition}, identifier)
+            self.assertEqual(result["condition"], condition)
+            self.assertTrue(result["alerts_muted"])
+            for field in ("caught_up", "error", "incidents", "comparison_healthy"):
+                self.assertNotIn(field, result)
+        with self.assertRaises(ValueError):
+            public_status({"condition": "192.0.2.10"}, identifier)
 
     def test_dashboard_allowlist_excludes_private_identity_everywhere(self):
         private = {"host": "192.0.2.10", "error": "ssh to 192.0.2.10 failed",
@@ -221,7 +276,7 @@ class BoundaryTests(unittest.TestCase):
         encoded = json.dumps(result)
         for forbidden in ("192.0.2.10", "private-host", "secret-peer", "receipt", "error"):
             self.assertNotIn(forbidden, encoded)
-        self.assertEqual(result["active_incidents"], 1)
+        self.assertNotIn("active_incidents", result)
         self.assertEqual(result["compared_through"], 40)
         self.assertIsNone(result["sample_time"])
         with self.assertRaises(ValueError):
@@ -231,12 +286,13 @@ class BoundaryTests(unittest.TestCase):
     def test_dashboard_tip_fields_are_integer_only(self):
         result = public_status({"verifier": {"tip": {"height": 100}}, "reference": {"height": 105}},
                                "verifier-" + "a" * 32)
-        self.assertEqual((result["mac_tip"], result["linux_tip"]), (100, 105))
+        self.assertEqual(result["mac_tip"], 100)
+        self.assertNotIn("linux_tip", result)
         for value in ("192.0.2.10", True, -1, None):
             result = public_status({"verifier": {"tip": {"height": value}}, "reference": {"height": value}},
                                    "verifier-" + "a" * 32)
             self.assertIsNone(result["mac_tip"])
-            self.assertIsNone(result["linux_tip"])
+            self.assertNotIn("linux_tip", result)
 
 
     def test_missing_pool_and_malformed_hex(self):
@@ -308,18 +364,19 @@ class PublicFileTests(unittest.TestCase):
                    "verifier": {"tip": {"height": 15, "hash": "a" * 64},
                                 "receipt": {"host": private}, "resources": {"host": private}},
                    "reference": {"height": 15, "host": private}, "private": private}
-            publish_status(raw, identity, target)
+            self.assertEqual(publish_result(raw, identity, target, False), "matching")
             content = target.read_text()
             self.assertNotIn(private, content)
             self.assertNotIn("receipt", content)
-            self.assertTrue(json.loads(content)["comparison_healthy"])
+            self.assertEqual(json.loads(content)["condition"], "matching")
             self.assertEqual(target.stat().st_mode & 0o777, 0o644)
-            self.assertFalse(list(root.glob(".status-*")))
+            self.assertFalse(list(root.glob(".pending-*")))
             # A failed write cannot truncate the previously published sample.
-            with patch("mac_cranelift_status.os.replace", side_effect=OSError("fixture")), self.assertRaises(OSError):
-                publish_status(dict(raw, caught_up=False), identity, target)
+            with patch("common.os.replace", side_effect=OSError("fixture")):
+                self.assertEqual(publish_result(raw, identity, target, False), "unavailable")
+                self.assertEqual(publish_result(dict(raw, condition="tree_mismatch"), identity, target, False), "tree_mismatch")
             self.assertEqual(target.read_text(), content)
-            self.assertFalse(list(root.glob(".status-*")))
+            self.assertFalse(list(root.glob(".pending-*")))
 
 
 if __name__ == "__main__":

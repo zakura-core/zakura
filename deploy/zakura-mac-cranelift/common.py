@@ -1,9 +1,11 @@
 """Bounded JSON transport and canonical mainnet comparison records."""
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
+import shutil
 import tempfile
 import time
 import urllib.error
@@ -32,13 +34,14 @@ def hex_bytes(value, length=None):
     return result.hex()
 
 
-def atomic_json(path, value):
+def atomic_json(path, value, mode=0o600):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".pending-")
     try:
         with os.fdopen(fd, "w") as stream:
-            json.dump(value, stream, sort_keys=True)
+            os.fchmod(stream.fileno(), mode)
+            json.dump(value, stream, sort_keys=True, allow_nan=False)
             stream.write("\n")
             stream.flush()
             os.fsync(stream.fileno())
@@ -162,3 +165,58 @@ def canonical_record(record, height):
     except (KeyError, TypeError):
         raise Unavailable("missing activated pool") from None
     return result
+
+
+def public_status(status, identifier, alerts_muted=True):
+    if not isinstance(status, dict):
+        raise ValueError("malformed status")
+    if not re.fullmatch(r"verifier-[a-f0-9]{32}", identifier):
+        raise ValueError("invalid opaque identifier")
+    result = {"verifier_id": identifier, "schema_version": 1}
+    # Never forward receipts, diagnostic strings, OS metadata, peer IDs or hosts.
+    for key in ("sample_time", "compared_through"):
+        value = status.get(key)
+        result[key] = value if type(value) in (int, float) and math.isfinite(value) else None
+    sample = status.get("verifier")
+    sample = sample if isinstance(sample, dict) else {}
+    tip = sample.get("tip")
+    tip = tip if isinstance(tip, dict) else {}
+    value = tip.get("height")
+    result["mac_tip"] = value if type(value) is int and value >= 0 else None
+    value = tip.get("hash") if isinstance(tip, dict) else None
+    result["mac_tip_hash"] = value if isinstance(value, str) and re.fullmatch(r"[a-fA-F0-9]{64}", value) else ""
+    receipt = sample.get("receipt") or {}
+    value = receipt.get("source_sha") if isinstance(receipt, dict) else None
+    result["source_sha"] = value if isinstance(value, str) and re.fullmatch(r"[a-f0-9]{40}", value) else ""
+    resources = sample.get("resources") or {}
+    for key in ("node_rss_bytes", "free_disk_bytes"):
+        value = resources.get(key) if isinstance(resources, dict) else None
+        result[key] = value if type(value) is int and value >= 0 else None
+    ancestors = sample.get("ancestor_hashes") or {}
+    result["ancestor_hashes"] = {depth: value for depth, value in ancestors.items()
+        if isinstance(depth, str) and len(depth) <= 10 and depth.isdecimal() and 0 < int(depth) <= 0xFFFFFFFF
+        and isinstance(value, str) and re.fullmatch(r"[a-fA-F0-9]{64}", value)} if isinstance(ancestors, dict) else {}
+    result["alerts_muted"] = alerts_muted
+    condition = status.get("condition", "unavailable")
+    if condition in {"matching", "catching_up", "unavailable", "chain_disagreement", "tree_mismatch", "coverage_gap"}:
+        result["condition"] = condition
+    else:
+        raise ValueError("invalid comparison condition")
+    return result
+
+
+def rotate(path, limit, segments=3, copy_truncate=False):
+    """Bound backups; copy/truncate only for logs whose producer keeps an open FD."""
+    path = Path(path)
+    if not path.exists() or path.stat().st_size < limit:
+        return
+    for index in range(segments, 1, -1):
+        previous = Path(str(path) + f".{index - 1}")
+        if previous.exists():
+            previous.replace(str(path) + f".{index}")
+    if copy_truncate:
+        shutil.copyfile(path, str(path) + ".1")
+        with path.open("r+") as stream:
+            stream.truncate(0)
+    else:
+        path.replace(str(path) + ".1")

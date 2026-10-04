@@ -12,7 +12,7 @@ import select
 import subprocess
 
 from common import (RPC, Transport, Unavailable, atomic_json, canonical_record,
-                    hex_bytes, integer, read_json)
+                    hex_bytes, integer, read_json, public_status, rotate)
 
 
 class Mismatch(Unavailable):
@@ -73,10 +73,11 @@ class Remote:
 
 
 class Comparison:
-    def __init__(self, directory, expected, linux=None, remote=None):
+    def __init__(self, directory, expected, linux=None, remote=None, report=None):
         self.directory = Path(directory)
         self.directory.mkdir(parents=True, exist_ok=True)
         self.expected = expected
+        self.report = report
         self.linux = linux or RPC("http://127.0.0.1:8232")
         self.remote = remote or Remote()
         path = self.directory / "cursor.json"
@@ -100,15 +101,21 @@ class Comparison:
 
     def audit(self, event):
         path = self.directory / "audit.jsonl"
-        if path.exists() and path.stat().st_size >= 16 * 1024 * 1024:
-            for index in range(3, 0, -1):
-                src = path if index == 1 else Path(str(path) + f".{index - 1}")
-                if src.exists():
-                    os.replace(src, str(path) + f".{index}")
+        rotate(path, 16 * 1024 * 1024)
         with path.open("a") as stream:
             stream.write(json.dumps(event, sort_keys=True) + "\n")
             stream.flush()
             os.fsync(stream.fileno())
+
+    def mismatch(self, height, left, right, now):
+        # Report confirmation before persistence; evidence failures must not mask it.
+        if self.report is not None:
+            self.report("tree_mismatch", now)
+        try:
+            self.confirmed_mismatch(height, left, right, now)
+        except (OSError, ValueError):
+            pass
+        raise Mismatch("tree state mismatch")
 
     def confirmed_mismatch(self, height, left, right, now):
         evidence = {"height": height, "linux": left, "mac": right, "receipt": self.expected}
@@ -129,8 +136,23 @@ class Comparison:
         stamp = status.get("sample_time")
         if type(stamp) not in (int, float) or not -10 <= now - stamp <= 60:
             raise Unavailable("stale sample")
-        integer(status["tip"]["height"])
-        hex_bytes(status["tip"]["hash"], 32)
+        tip = {"height": integer(status["tip"]["height"]),
+               "hash": hex_bytes(status["tip"]["hash"], 32)}
+        ancestors = status.get("ancestor_hashes", {})
+        if not isinstance(ancestors, dict) or len(ancestors) > 5:
+            raise Unavailable("invalid ancestor sample")
+        validated = {}
+        for depth, value in ancestors.items():
+            if depth not in {"1", "2", "5", "10", "32"} or int(depth) > tip["height"]:
+                raise Unavailable("invalid ancestor depth")
+            validated[depth] = hex_bytes(value, 32)
+        resources = status.get("resources")
+        resources = resources if isinstance(resources, dict) else {}
+        return {"schema_version": 1, "sample_time": stamp, "architecture": status["architecture"],
+                "receipt": self.expected, "binary_sha256": self.expected["binary_sha256"],
+                "config_sha256": self.expected["config_sha256"], "tip": tip,
+                "ancestor_hashes": validated, "resources": {key: value for key, value in resources.items()
+                    if key in {"node_rss_bytes", "free_disk_bytes"} and type(value) is int and value >= 0}}
 
     def pair(self, height):
         return self.linux.block(height), self.remote.block(height)
@@ -150,8 +172,7 @@ class Comparison:
             if left != right:
                 left2, right2 = self.pair(cursor)
                 if left2 == left and right2 == right:
-                    self.confirmed_mismatch(cursor, left, right, now)
-                    raise Mismatch("tree state mismatch")
+                    self.mismatch(cursor, left, right, now)
                 raise Unavailable("unstable cursor read")
             return
         lower = max(self.state["bootstrap"], cursor - 1000)
@@ -182,8 +203,7 @@ class Comparison:
             if left != right:
                 left2, right2 = self.pair(height)
                 if left2 == left and right2 == right:
-                    self.confirmed_mismatch(height, left, right, now)
-                    raise Mismatch("tree state mismatch")
+                    self.mismatch(height, left, right, now)
                 raise Unavailable("unstable tree read")
             # An audit record precedes its durable cursor: a crash can replay, never skip.
             self.audit({"event": "matched", "time": now, "height": height, "record": left})
@@ -199,7 +219,7 @@ class Comparison:
         try:
             reference = self.linux.tip()
             status = self.remote.status()
-            self.validate_status(status, now)
+            status = self.validate_status(status, now)
             if self.state["coverage_gap"]:
                 condition = "coverage_gap"
             else:
@@ -216,14 +236,20 @@ class Comparison:
             condition = "chain_disagreement"
         except (Unavailable, OSError, ValueError, KeyError, TypeError):
             condition = "coverage_gap" if self.state["coverage_gap"] else "unavailable"
-        self.save()
+        try:
+            self.save()
+        except (OSError, ValueError):
+            if condition == "matching":
+                condition = "unavailable"
         result = {"schema_version": 1, "sample_time": now, "reference": reference,
-                  "verifier": status, "coverage_start": self.state["bootstrap"] + 1,
-                  "compared_through": self.state["cursor"], "caught_up": condition == "matching",
-                  "condition": condition, "error": None if condition == "matching" else condition,
-                  "incidents": {} if condition == "matching" else {condition: {}},
-                  "alerts_muted": True}
-        atomic_json(self.directory / "status.json", result)
+                  "verifier": status, "compared_through": self.state["cursor"],
+                  "condition": condition}
+        try:
+            atomic_json(self.directory / "status.json", result)
+        except (OSError, ValueError):
+            if condition == "matching":
+                result["condition"] = "unavailable"
+
         return result
 
 
@@ -235,18 +261,42 @@ def exclusive(directory):
         yield
 
 
+def publish_result(result, identity_path, destination, alerts_muted):
+    """Publish only approved fields; a failed publication cannot establish health."""
+    condition = result["condition"]
+    try:
+        identity = read_json(identity_path)["verifier_id"]
+        atomic_json(destination, public_status(result, identity, alerts_muted), mode=0o644)
+    except (OSError, ValueError, KeyError, TypeError):
+        if condition == "matching":
+            condition = "unavailable"
+    return condition
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--directory", default="/var/lib/zakura-mac-verifier")
     parser.add_argument("--ssh-config", default="/etc/zakura-mac-verifier/ssh/config")
     parser.add_argument("--receipt", default="/etc/zakura-mac-verifier/receipt.json")
+    parser.add_argument("--identity", default="/etc/zakura-mac-verifier/dashboard.json")
+    parser.add_argument("--public-status", default="/var/lib/zakura-mac-cranelift-public/status.json")
+    parser.add_argument("--alerts-enabled", action="store_true")
     args = parser.parse_args()
+    reported = False
+    def report(condition, sample_time):
+        nonlocal reported
+        if not reported:
+            print(json.dumps({"condition": condition, "sample_time": sample_time}), flush=True)
+            reported = True
     with exclusive(args.directory):
         expected = read_json(args.receipt)
         transport = Transport(timeout=2, deadline=time.monotonic() + 10)
         remote = Remote(args.ssh_config, deadline=transport.deadline)
         try:
-            Comparison(args.directory, expected, RPC("http://127.0.0.1:8232", transport), remote).step()
+            result = Comparison(args.directory, expected, RPC("http://127.0.0.1:8232", transport), remote,
+                                report=report).step()
+            condition = publish_result(result, args.identity, args.public_status, not args.alerts_enabled)
+            report(condition, result["sample_time"])
         finally:
             remote.close()
 

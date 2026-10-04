@@ -303,7 +303,7 @@ import urllib.request
     state_cache_dir,
     want_metrics,
 ) = sys.argv[1:16]
-fork_height = int(sys.argv[16]) if len(sys.argv) > 16 and sys.argv[16] else None
+ancestor_height = int(sys.argv[16]) if len(sys.argv) > 16 and sys.argv[16] else None
 
 out = {
     "service": service,
@@ -853,13 +853,19 @@ if rpc_url:
                     except Exception:
                         pass
         out["ancestor_hashes"] = ancestor_hashes
-        if fork_height is not None and tip_height is not None and 0 <= fork_height <= tip_height:
+        if ancestor_height is not None and tip_height is not None and 0 <= ancestor_height <= tip_height:
+            depth = str(tip_height - ancestor_height)
+            if depth not in ancestor_hashes:
+                try:
+                    ancestor_hashes[depth] = rpc_call("getblockhash", [ancestor_height])
+                except Exception:
+                    pass
+        if tip_height is not None:
             try:
-                anchor_hash = rpc_call("getblockhash", [fork_height])
-                if rpc_call("getblockhash", [tip_height]) == out["block_hash"]:
-                    out["fork_anchor"] = {"height": fork_height, "hash": anchor_hash}
+                if rpc_call("getblockhash", [tip_height]) != out["block_hash"]:
+                    out["ancestor_hashes"] = {}
             except Exception:
-                pass
+                out["ancestor_hashes"] = {}
 
         best_hash = out.get("block_hash")
         if best_hash:
@@ -961,7 +967,7 @@ def ssh_capture_script(node: Node, script: str) -> subprocess.CompletedProcess:
     return subprocess.run(node.ssh_cmd("bash", "-s"), input=script, text=True, capture_output=True)
 
 
-def probe_node(node: Node, want_metrics: bool = True, fork_height: int | None = None) -> dict:
+def probe_node(node: Node, want_metrics: bool = True, ancestor_height: int | None = None) -> dict:
     rpc_url = rpc_url_for(node.rpc_listen_addr)
     script = (
         "python3 - "
@@ -980,7 +986,7 @@ def probe_node(node: Node, want_metrics: bool = True, fork_height: int | None = 
         f"{shlex.quote(node.health_listen_addr)} "
         f"{shlex.quote(node.state_cache_dir)} "
         f"{shlex.quote('1' if want_metrics else '')} "
-        f"{shlex.quote(str(fork_height) if fork_height is not None else '')} <<'PY'\n"
+        f"{shlex.quote(str(ancestor_height) if ancestor_height is not None else '')} <<'PY'\n"
         f"{REMOTE_PROBE}\n"
         "PY\n"
     )
@@ -1047,7 +1053,7 @@ def private_addresses():
         with PRIVATE_ADDRESS_FILE.open("rb") as stream:
             data = json.loads(stream.read(4097))
     except FileNotFoundError:
-        if os.environ.get("ZAKURA_MAC_CRANELIFT_STATUS", os.environ.get("ZAKURA_PRIVATE_VERIFIER_STATUS")) == "1":
+        if os.environ.get("ZAKURA_MAC_CRANELIFT_STATUS") == "1":
             raise ValueError("private address configuration required") from None
         return frozenset()
     if not isinstance(data, list) or not 1 <= len(data) <= 16 or any(not isinstance(item, str) for item in data):
@@ -1086,10 +1092,11 @@ def monitoring_snapshot(value, node_names):
         for field in ("block_hash", "previous_hash"):
             if block_hash(row.get(field)):
                 safe[field] = row[field]
-        anchor = row.get("fork_anchor")
-        if (isinstance(anchor, dict) and type(anchor.get("height")) is int
-                and anchor["height"] >= 0 and block_hash(anchor.get("hash"))):
-            safe["fork_anchor"] = {"height": anchor["height"], "hash": anchor["hash"]}
+        ancestors = row.get("ancestor_hashes")
+        if isinstance(ancestors, dict):
+            safe["ancestor_hashes"] = {depth: value for depth, value in ancestors.items()
+                if isinstance(depth, str) and depth.isdecimal() and len(depth) <= 10
+                and 0 < int(depth) <= 0xFFFFFFFF and block_hash(value)}
         rows.append(safe)
     result = {"rows": rows, "total": len(rows),
               "healthy": sum(row["healthy"] for row in rows), "chain": {}}
@@ -1111,23 +1118,52 @@ def redact_private_addresses(value, protected):
     if not isinstance(value, str):
         return value
 
-    def redact(match):
+    def ipv4(match):
         literal = match.group()
-        candidate = literal.rstrip(".")
         try:
-            if address_key(candidate) not in protected:
-                return literal
+            if address_key(literal) in protected:
+                return "[redacted-address]"
         except ValueError:
-            return literal
-        return "[redacted-address]" + literal[len(candidate):]
+            pass
+        return literal
 
-    # Match IPv6 before IPv4 so mapped addresses are removed as one literal.
-    pattern = r"(?:[a-fA-F0-9]*:){2,}[a-fA-F0-9:.]*(?:%[\w.-]+)?|(?:\d{1,3}\.){3}\d{1,3}"
-    return re.sub(pattern, redact, value)
+    # An invalid outer IPv6 token must not swallow a protected dotted address.
+    value = re.sub(r"(?:\d{1,3}\.){3}\d{1,3}", ipv4, value)
+
+    # Overlapping bounded windows prevent a long hexadecimal prefix from
+    # consuming the beginning of an expanded protected IPv6 address.
+    pattern = r"(?<![a-fA-F0-9])(?=((?:[a-fA-F0-9]{0,4}:){2,8}[a-fA-F0-9]{0,4}(?:%[\w.-]{1,32})?))"
+    parts, previous = [], 0
+    for match in re.finditer(pattern, value):
+        if match.start() < previous:
+            continue
+        literal = match.group(1)
+        starts = [0] + [i + 1 for i, char in enumerate(literal) if char == ":"]
+        ends = sorted([len(literal)] + [i for i, char in enumerate(literal) if char == ":"], reverse=True)
+        found = None
+        for start in starts:
+            for end in ends:
+                candidate = literal[start:end]
+                if end <= start or candidate.count(":") < 2:
+                    continue
+                try:
+                    if address_key(candidate) in protected:
+                        found = (match.start() + start, match.start() + end)
+                        break
+                except ValueError:
+                    pass
+            if found is not None:
+                break
+        if found is not None:
+            start, end = found
+            parts.extend((value[previous:start], "[redacted-address]"))
+            previous = end
+    parts.append(value[previous:])
+    return "".join(parts)
 
 
 def mac_cranelift_status() -> dict:
-    """Read only the watchdog's sanitized file, never the private comparison state."""
+    """Read only the comparator's sanitized file, never the private comparison state."""
     try:
         with Path("/var/lib/zakura-mac-cranelift-public/status.json").open("rb") as stream:
             raw = stream.read(65537)
@@ -1138,20 +1174,21 @@ def mac_cranelift_status() -> dict:
         if not isinstance(identifier, str) or not re.fullmatch(r"verifier-[a-f0-9]{32}", identifier):
             raise ValueError("invalid verifier identifier")
         result = {"verifier_id": identifier, "available": True}
-        for key in ("sample_time", "coverage_start", "compared_through",
-                    "active_incidents", "mac_tip", "linux_tip", "node_rss_bytes", "free_disk_bytes"):
+        for key in ("sample_time", "compared_through", "mac_tip", "node_rss_bytes", "free_disk_bytes"):
             value = data.get(key)
             result[key] = value if type(value) in (int, float) and math.isfinite(value) else None
-        for key in ("caught_up", "comparison_healthy", "alerts_muted"):
+        for key in ("alerts_muted",):
             result[key] = data.get(key) is True
         for key in ("mac_tip_hash", "source_sha"):
             value = data.get(key)
             size = 64 if key == "mac_tip_hash" else 40
             result[key] = value if isinstance(value, str) and re.fullmatch(r"[a-fA-F0-9]{%d}" % size, value) else ""
-        anchor = data.get("fork_anchor")
-        if (isinstance(anchor, dict) and type(anchor.get("height")) is int and anchor["height"] >= 0
-                and isinstance(anchor.get("hash"), str) and re.fullmatch(r"[a-fA-F0-9]{64}", anchor["hash"])):
-            result["fork_anchor"] = {"height": anchor["height"], "hash": anchor["hash"]}
+        result["comparison_healthy"] = data.get("condition") == "matching"
+        ancestors = data.get("ancestor_hashes") or {}
+        result["ancestor_hashes"] = {depth: value for depth, value in ancestors.items()
+            if isinstance(depth, str) and depth.isdecimal() and len(depth) <= 10
+            and 0 < int(depth) <= 0xFFFFFFFF
+            and isinstance(value, str) and re.fullmatch(r"[a-fA-F0-9]{64}", value)} if isinstance(ancestors, dict) else {}
         stamp = result["sample_time"]
         result["available"] = stamp is not None and 0 <= time.time() - stamp <= 90
         return result
@@ -1187,7 +1224,7 @@ class ClusterCollector:
         self.ironwood_activation_height = IRONWOOD_ACTIVATION_HEIGHTS[network]
         self.lock = threading.Lock()
         restored_progress = load_progress(state_file)
-        self.private_mac_progress = restored_progress.get("mac-os-cranelift", restored_progress.get("zakura-mac-os", {}))
+        self.private_mac_progress = restored_progress.get("mac-os-cranelift", {})
         self.last_height: dict[str, int | None] = {
             node.name: restored_progress.get(node.name, {}).get("height") for node in nodes
         }
@@ -1224,13 +1261,13 @@ class ClusterCollector:
     def poll_once(self) -> None:
         rows = []
         started = time.time()
-        private_enabled = self.network == "mainnet" and os.environ.get("ZAKURA_MAC_CRANELIFT_STATUS", os.environ.get("ZAKURA_PRIVATE_VERIFIER_STATUS")) == "1"
+        private_enabled = self.network == "mainnet" and os.environ.get("ZAKURA_MAC_CRANELIFT_STATUS") == "1"
         sample = mac_cranelift_status() if private_enabled else {}
-        anchor = sample.get("fork_anchor") if sample.get("available") else None
-        fork_height = anchor["height"] if isinstance(anchor, dict) else None
+        tip = sample.get("mac_tip") if sample.get("available") else None
+        ancestor_height = max(0, tip - 10) if type(tip) is int else None
         with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(self.nodes))) as pool:
             futures = {
-                pool.submit(probe_node, node, self.should_scrape_metrics(node.name, started), fork_height): node
+                pool.submit(probe_node, node, self.should_scrape_metrics(node.name, started), ancestor_height): node
                 for node in self.nodes
             }
             for future in concurrent.futures.as_completed(futures):
@@ -1250,12 +1287,13 @@ class ClusterCollector:
                        rpc_config_path="", rpc_user="", rpc_password="", process_pattern="", container_name="")
             probe = {"height": sample.get("mac_tip") if sample.get("available") else None,
                      "block_hash": sample.get("mac_tip_hash"), "commit": sample.get("source_sha"),
+                     "ancestor_hashes": sample.get("ancestor_hashes") or {},
+                     "previous_hash": (sample.get("ancestor_hashes") or {}).get("1", ""),
                      "active_state": "active" if sample.get("available") else "unknown",
                      "client_name": "Zakura macOS ARM64", "rpc_chain": "main", "rpc_testnet": False,
                      "host": {"disk_free_bytes": sample.get("free_disk_bytes"),
                               "rss_bytes": sample.get("node_rss_bytes")}}
             row = self.row_for(mac, probe, time.time())
-            row["fork_anchor"] = anchor
             row["comparison_healthy"] = sample.get("comparison_healthy") is True
             if row["healthy"] and not row["comparison_healthy"]:
                 row.update(healthy=False, health="verification_error", detail="Verification incomplete or inconsistent")
@@ -1512,7 +1550,6 @@ class ClusterCollector:
             "block_hash": block_hash,
             "previous_hash": previous_block_hash,
             "ancestor_hashes": ancestor_hashes,
-            "fork_anchor": probe.get("fork_anchor"),
             "node_id": node.node_id or probe.get("node_id") or "",
             "version": probe.get("version") or "",
             "last_restarted": probe.get("last_restarted") or "",

@@ -101,6 +101,14 @@ class MacCraneliftTests(unittest.TestCase):
         for private in ("192.0.2.10", "private-host", "private-peer", "receipt", "error"):
             self.assertNotIn(private, json.dumps(result))
 
+    def test_public_condition_drives_health_without_redundant_flags(self):
+        for condition in ('matching', 'unavailable', 'tree_mismatch', 'chain_disagreement'):
+            result = self.read({'verifier_id': 'verifier-' + 'a' * 32, 'sample_time': time.time(),
+                                'condition': condition, 'comparison_healthy': True,
+                                'ancestor_hashes': {'10': 'b' * 64, 'host': '192.0.2.10'}})
+            self.assertEqual(result['comparison_healthy'], condition == 'matching')
+            self.assertEqual(result['ancestor_hashes'], {'10': 'b' * 64})
+
     def test_stale_or_malformed_file_never_reports_fresh_status(self):
         self.assertFalse(self.read({"verifier_id": "verifier-" + "a" * 32,
                                     "sample_time": time.time() - 1000})["available"])
@@ -139,7 +147,7 @@ class MacCraneliftTests(unittest.TestCase):
         collector = status.ClusterCollector([node()], 10, 300, "mainnet")
         sample = {"available": True, "mac_tip": 110, "mac_tip_hash": "c" * 64,
                   "comparison_healthy": True,
-                  "fork_anchor": {"height": 100, "hash": "a" * 64}}
+                  "ancestor_hashes": {"10": "a" * 64}}
         with mock.patch.dict(os.environ, {"ZAKURA_MAC_CRANELIFT_STATUS": "1"}), \
                 mock.patch.object(status, "mac_cranelift_status", return_value=sample), \
                 mock.patch.object(status, "probe_node", return_value={}):
@@ -151,7 +159,7 @@ class MacCraneliftTests(unittest.TestCase):
         sent = []
         agent.notify = lambda text, args: (sent.append(text), True)[1]
         others = [dict(mac, name=f"linux-{i}",
-                       fork_anchor={"height": 100, "hash": "b" * 64}) for i in range(12)]
+                       ancestor_hashes={"10": "b" * 64}) for i in range(12)]
         fleet = watchdog.Fleet("mainnet", "http://localhost/data", "https://example.com/")
         with mock.patch.dict(os.environ, {"ZAKURA_MAC_CRANELIFT_ALERTS_MUTED": "0"}):
             agent.handle_mac_fork({}, fleet, [mac, *others], time.time(), False)
@@ -160,9 +168,9 @@ class MacCraneliftTests(unittest.TestCase):
         self.assertEqual(watchdog.node_condition(dict(mac, health="down"),
                                                time.time(), 0, args)[2], 180)
 
-    def test_legacy_dashboard_setting_still_enables_the_node(self):
+    def test_canonical_dashboard_setting_enables_the_node(self):
         collector = status.ClusterCollector([node()], 10, 300, "mainnet")
-        with mock.patch.dict(os.environ, {"ZAKURA_PRIVATE_VERIFIER_STATUS": "1"}, clear=True), \
+        with mock.patch.dict(os.environ, {"ZAKURA_MAC_CRANELIFT_STATUS": "1"}, clear=True), \
                 mock.patch.object(status, "mac_cranelift_status", return_value={"available": False}), \
                 mock.patch.object(status, "probe_node", return_value={}):
             collector.poll_once()
@@ -1249,6 +1257,31 @@ class AddressPrivacyTests(unittest.TestCase):
                     self.assertIn("192.0.2.18", result)
                     self.assertIn("[redacted-address]", result)
 
+    def test_multiple_protected_addresses_in_one_detail_are_removed(self):
+        protected = {status.address_key('2001:db8:1:2:3:4:5:17'), status.address_key('192.0.2.17')}
+        value = 'dead:beef:2001:db8:1:2:3:4:5:17 / peer:::ffff:c000:211 / ::ffff:192.0.2.17:8233'
+        result = status.redact_private_addresses(value, protected)
+        self.assertEqual(result.count('[redacted-address]'), 3)
+        self.assertNotIn('2001:db8:1:2:3:4:5:17', result)
+        self.assertNotIn('192.0.2.17', result)
+
+    def test_private_addresses_in_invalid_outer_tokens_are_redacted(self):
+        for private, variants in [
+            ("192.0.2.17", ["peer:::ffff:192.0.2.17", "::ffff:192.0.2.17:8233",
+                            "peer:::ffff:c000:211", "::ffff:c000:211:8233"]),
+            ("2001:db8::17", ["peer:2001:db8::17", "2001:db8::17:8233",
+                             "face:2001:0db8:0:0:0:0:0:0017"]),
+            ("2001:db8:1:2:3:4:5:17", ["dead:beef:2001:db8:1:2:3:4:5:17",
+                                        "dead:beef:2001:0db8:0001:0002:0003:0004:0005:0017:8233"]),
+        ]:
+            for variant in variants:
+                with self.subTest(variant=variant):
+                    value = {"diagnostic": variant, "linux": "192.0.2.18"}
+                    result = json.dumps(status.redact_private_addresses(value, {status.address_key(private)}))
+                    self.assertNotIn(variant, result)
+                    self.assertIn("[redacted-address]", result)
+                    self.assertIn("192.0.2.18", result)
+
     def test_missing_or_invalid_config_fails_closed_for_mac_dashboard(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "private.json"
@@ -1351,6 +1384,17 @@ class HttpHandlerTests(unittest.TestCase):
         self.assertIn("2001:db8::18", body)
         self.assertIn("[redacted-address]", body)
 
+    def test_colon_prefixed_peer_details_do_not_expose_private_addresses(self):
+        status.COLLECTOR.rows[0]["peer_subversions"] = [
+            ["peer:::ffff:192.0.2.17", 1], ["peer:2001:db8::17", 1]]
+        protected = {status.address_key("192.0.2.17"), status.address_key("2001:db8::17")}
+        with mock.patch.object(status, "private_addresses", return_value=protected):
+            with urllib.request.urlopen(f"{self.base_url}/data/node/node-a") as response:
+                body = response.read().decode()
+        self.assertNotIn("192.0.2.17", body)
+        self.assertNotIn("2001:db8::17", body)
+        self.assertIn("[redacted-address]", body)
+
     def test_private_configuration_failure_never_serves_unfiltered_json(self):
         status.COLLECTOR.rows[0]["rpc_metadata_error"] = "private 192.0.2.17"
         with mock.patch.object(status, "private_addresses", side_effect=ValueError("private fixture")):
@@ -1393,7 +1437,7 @@ class HttpHandlerTests(unittest.TestCase):
         value = {"network": "testnet", "last_poll": 1000, "chain": {"error": "private 192.0.2.17"},
                  "rows": [{"name": "node-a", "health": "healthy", "height": 100,
                            "block_hash": "a" * 64, "seconds_since_advanced": 30,
-                           "fork_anchor": {"height": 90, "hash": "b" * 64, "host": "192.0.2.17"},
+                           "ancestor_hashes": {"10": "b" * 64, "host": "192.0.2.17"},
                            "ssh": "192.0.2.17", "detail": "192.0.2.17"},
                           {"name": "mac-os-cranelift", "health": "private 192.0.2.17",
                            "height": "192.0.2.17", "block_hash": "192.0.2.17",
@@ -1402,7 +1446,7 @@ class HttpHandlerTests(unittest.TestCase):
         result = status.monitoring_snapshot(value, {"node-a", "192.0.2.17"})
         self.assertNotIn("192.0.2.17", json.dumps(result))
         self.assertEqual(result["total"], 2)
-        self.assertEqual(result["rows"][0]["fork_anchor"], {"height": 90, "hash": "b" * 64})
+        self.assertEqual(result["rows"][0]["ancestor_hashes"], {"10": "b" * 64})
         self.assertEqual(result["rows"][1]["health"], "down")
         self.assertNotIn("height", result["rows"][1])
         self.assertNotIn("seconds_since_advanced", result["rows"][1])

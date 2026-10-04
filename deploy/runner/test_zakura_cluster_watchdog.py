@@ -2021,7 +2021,7 @@ class MacForkAlertTests(unittest.TestCase):
         def row(name, value):
             return {"name": name, "health": "healthy", "height": 110,
                     "seconds_since_advanced": 0, "block_hash": "c" * 64,
-                    "fork_anchor": {"height": 110-depth, "hash": value * 64}}
+                    "ancestor_hashes": {str(depth): value * 64}}
         return [row("mac-os-cranelift", "a")] + [row("other-%d" % i, "b" if i < agreeing else "a") for i in range(12)]
 
     def check(self, rows, state=None, fleet="mainnet", now=1000):
@@ -2056,7 +2056,7 @@ class MacForkAlertTests(unittest.TestCase):
         rows[-1]["health"]="down"
         self.assertEqual(self.check(rows)[1],[])
         state,_=self.check(self.rows())
-        for row in rows:row.pop("fork_anchor",None)
+        for row in rows:row.pop("ancestor_hashes",None)
         state,sent=self.check(rows,state)
         self.assertEqual(sent,[])
         self.assertTrue(state["mac_forks"]["mainnet"]["alerting"])
@@ -2100,7 +2100,7 @@ class MacForkAlertTests(unittest.TestCase):
         state, _ = self.check(self.rows())
         state, _ = self.check(self.rows(agreeing=0), state, now=1030)
         missing = self.rows(agreeing=0)
-        missing[0].pop("fork_anchor")
+        missing[0].pop("ancestor_hashes")
         state, _ = self.check(missing, state, now=1060)
         state, sent = self.check(self.rows(agreeing=0), state, now=1090)
         self.assertEqual(sent, [])
@@ -2143,13 +2143,13 @@ class MacForkAlertTests(unittest.TestCase):
                          [row["name"] for row in rows[1:]])
         self.assertEqual(classify.call_args.args[0], rows[1:])
 
-    def test_existing_mac_incident_survives_rename_and_requires_sustained_recovery(self):
+    def test_existing_mac_incident_survives_restart_and_requires_sustained_recovery(self):
         agent = watchdog.Watchdog([], make_args())
         sent = []
         agent.notify = lambda text, args: (sent.append(text), True)[1]
         fleet = watchdog.Fleet("mainnet", "http://localhost/data", "https://example.com/")
         key = "mainnet/mac-os-cranelift"
-        state = {"nodes": {"mainnet/zakura-mac-os": {"condition": "down", "alerting": True, "bad_since": 0}}}
+        state = {"nodes": {"mainnet/mac-os-cranelift": {"condition": "down", "alerting": True, "bad_since": 0}}}
         row = self.rows()[0]
         observation = watchdog.NodeObservation(row["name"], row, "ok", 1000, 0, 110, "c" * 64)
         with patch.dict(watchdog.os.environ, {"ZAKURA_MAC_CRANELIFT_ALERTS_MUTED": "0"}):
@@ -2165,55 +2165,34 @@ class MacForkAlertTests(unittest.TestCase):
         self.assertNotIn("mainnet/zakura-mac-os", state["nodes"])
 
     def test_existing_canonical_mac_incident_is_reused(self):
-        legacy = "mainnet/zakura-mac-os"
         canonical = "mainnet/mac-os-cranelift"
-        for nodes in ({canonical: {"alerting": True}},
-                      {canonical: {"alerting": True}, legacy: {"alerting": False}}):
-            self.assertEqual(watchdog.node_state_key("mainnet", "mac-os-cranelift",
-                                                    {"nodes": nodes}), canonical)
-        self.assertEqual(watchdog.node_state_key("mainnet", "mac-os-cranelift",
-                                                {"nodes": {legacy: {"alerting": True},
-                                                           canonical: {"alerting": False}}}), canonical)
+        self.assertEqual(watchdog.node_state_key("mainnet", "mac-os-cranelift"), canonical)
 
     def test_dashboard_failure_resets_existing_mac_recovery(self):
         agent = watchdog.Watchdog([], make_args())
         agent.notify = lambda *_: True
         key = "mainnet/mac-os-cranelift"
-        state = {"nodes": {"mainnet/zakura-mac-os": {"alerting": True, "mac_recovery": {"since": 0}}}}
+        state = {"nodes": {"mainnet/mac-os-cranelift": {"alerting": True, "mac_recovery": {"since": 0}}}}
         fleet = watchdog.Fleet("mainnet", "http://localhost/data", "https://example.com/")
         agent.handle_fleet_error(state, fleet, ValueError("unavailable"), 1000, False)
         self.assertNotIn("mac_recovery", state["nodes"][key])
         self.assertTrue(state["nodes"][key]["alerting"])
-        self.assertEqual(watchdog.node_state_key("testnet", "mac-os-cranelift", {}),
+        self.assertEqual(watchdog.node_state_key("testnet", "mac-os-cranelift"),
                          "testnet/mac-os-cranelift")
 
-    def test_duplicate_mac_keys_recover_only_once(self):
-        agent = watchdog.Watchdog([], make_args())
-        sent = []
-        agent.notify = lambda text, args: (sent.append(text), True)[1]
-        fleet = watchdog.Fleet("mainnet", "http://localhost/data", "https://example.com/")
-        state = {"nodes": {name: {"condition": "down", "alerting": True, "bad_since": since}
-                           for name, since in (("mainnet/zakura-mac-os", 0),
-                                               ("mainnet/mac-os-cranelift", 10))}}
-        row = self.rows()[0]
-        observation = watchdog.NodeObservation(row["name"], row, "ok", 1000, 0, 110, "c" * 64)
-        with patch.dict(watchdog.os.environ, {"ZAKURA_MAC_CRANELIFT_ALERTS_MUTED": "0"}):
-            for now in (1000, 1030, 1060, 1100, 1130, 1160):
-                agent.handle_node_observation(state, fleet, observation, now, False)
-        self.assertEqual(len(sent), 1)
-        self.assertEqual(list(state["nodes"]), ["mainnet/mac-os-cranelift"])
+    def test_fork_quorum_uses_common_height_for_nodes_with_different_tips(self):
+        rows = self.rows()
+        for row in rows[1:]:
+            row['height'] = 120
+            row['ancestor_hashes'] = {'20': row['ancestor_hashes']['10']}
+        self.assertEqual(len(self.check(rows)[1]), 1)
 
-    def test_duplicate_keys_preserve_delivered_stall_height(self):
+    def test_delivered_stall_height_survives_restart(self):
         canonical = "mainnet/mac-os-cranelift"
-        legacy = "mainnet/zakura-mac-os"
-        state = {"nodes": {canonical: {"condition": "down", "alerting": True, "bad_since": 10},
-                           legacy: {"condition": "stalled", "alerting": True,
-                                    "bad_since": 0, "alert_height": 110}}}
-        self.assertEqual(watchdog.node_state_key("mainnet", "mac-os-cranelift", state), canonical)
-        self.assertFalse(watchdog.stall_cleared(state["nodes"][canonical], 110))
-        self.assertTrue(watchdog.stall_cleared(state["nodes"][canonical], 111))
-        self.assertEqual(state["nodes"][canonical]["bad_since"], 0)
-        self.assertNotIn(legacy, state["nodes"])
+        state = json.loads(json.dumps({'nodes': {canonical: {'condition': 'stalled',
+            'alerting': True, 'bad_since': 0, 'alert_height': 110}}}))
+        self.assertFalse(watchdog.stall_cleared(state['nodes'][canonical], 110))
+        self.assertTrue(watchdog.stall_cleared(state['nodes'][canonical], 111))
 
     def test_mac_offline_uses_three_minutes_without_changing_other_nodes(self):
         self.assertEqual(watchdog.node_condition({"name":"mac-os-cranelift","health":"down"},1000,0,make_args())[2],180)
@@ -2238,10 +2217,8 @@ class MacComparisonLaneTests(unittest.TestCase):
         self.state = {}
 
     def observe(self, condition, now):
-        def run(*args, **kwargs):
-            (self.root / "status.json").write_text(json.dumps({
-                "condition": condition, "sample_time": now, "caught_up": condition == "matching"}))
-        with patch.object(watchdog, "run_comparison", side_effect=run), patch.object(watchdog.time, "time", return_value=now):
+        with patch.object(watchdog, "run_comparison", return_value={"condition": condition, "sample_time": now}), \
+                patch.object(watchdog.time, "time", return_value=now):
             self.lane.handle_mac_comparison(self.state, now, False)
 
     def test_existing_alert_lifecycle_deduplicates_and_recovers(self):
@@ -2252,16 +2229,13 @@ class MacComparisonLaneTests(unittest.TestCase):
         self.assertEqual(len(self.messages), 2)
         self.assertIn("recovered", self.messages[-1])
 
-    def test_status_publication_failure_does_not_mask_mismatch(self):
-        with patch("mac_cranelift_status.publish_status", side_effect=OSError("private fixture")):
-            self.observe("tree_mismatch", 1000)
+    def test_outcome_does_not_depend_on_private_or_public_status_files(self):
+        self.assertFalse((self.root / 'status.json').exists())
+        self.assertFalse((self.root / 'public.json').exists())
+        self.observe("tree_mismatch", 1000)
         self.assertEqual(self.messages, ["Zakura compiler comparison: tree_mismatch"])
-        self.assertNotIn("private fixture", str(self.state))
-
-    def test_private_status_failure_does_not_mask_mismatch(self):
-        with patch.object(watchdog.os, "chown", side_effect=OSError("fixture")):
-            self.observe("tree_mismatch", 1000)
-        self.assertEqual(self.messages, ["Zakura compiler comparison: tree_mismatch"])
+        self.assertFalse((self.root / 'status.json').exists())
+        self.assertFalse((self.root / 'public.json').exists())
 
     def test_alternating_failure_reasons_share_one_grace_period(self):
         for now, reason in ((1000, "unavailable"), (1060, "catching_up"),
@@ -2304,10 +2278,9 @@ class MacComparisonLaneTests(unittest.TestCase):
         self.assertEqual(len(self.messages), 2)
         self.assertIn("recovered", self.messages[-1])
 
-    def test_publication_failure_does_not_claim_recovery(self):
+    def test_unavailable_outcome_does_not_claim_recovery(self):
         self.observe("tree_mismatch", 1000)
-        with patch("mac_cranelift_status.publish_status", side_effect=OSError("fixture")):
-            self.observe("matching", 1060)
+        self.observe("unavailable", 1060)
         self.assertEqual(len(self.messages), 1)
         self.assertTrue(self.state["mac_comparison"]["mainnet"]["alerting"])
         self.observe("matching", 1120)
@@ -2320,7 +2293,9 @@ class MacComparisonLaneTests(unittest.TestCase):
         self.observe("chain_disagreement", 1120)
         self.observe("chain_disagreement", 1400)
         self.assertEqual(len(self.messages), 1)
-        self.assertTrue(json.loads((self.root / "status.json").read_text())["alerts_muted"])
+        with patch.object(watchdog, 'run_comparison', return_value={'sample_time': 1400, 'condition': 'matching'}) as run:
+            self.lane.handle_mac_comparison(self.state, 1400, False)
+        self.assertNotIn('--alerts-enabled', run.call_args.args[0])
 
     def test_timeout_does_not_use_stale_health_or_skip_other_lanes(self):
         self.observe("matching", 1000)
@@ -2329,8 +2304,7 @@ class MacComparisonLaneTests(unittest.TestCase):
              patch.object(watchdog, "run_comparison", side_effect=watchdog.subprocess.TimeoutExpired("private endpoint", 15)):
             self.lane.run_once(self.state)
         other.assert_called_once()
-        sample = json.loads((self.root / "status.json").read_text())
-        self.assertFalse(sample["caught_up"])
+        sample = self.state['mac_comparison']['mainnet']
         self.assertEqual(sample["condition"], "unavailable")
         self.assertNotIn("private endpoint", json.dumps(sample))
 
@@ -2338,17 +2312,95 @@ class MacComparisonLaneTests(unittest.TestCase):
         with patch.object(watchdog.subprocess, "Popen") as launch, patch.object(watchdog.os, "killpg") as kill:
             process = launch.return_value.__enter__.return_value
             process.pid = 12345
+            process.stdout.read.return_value = b""
             process.wait.side_effect = [watchdog.subprocess.TimeoutExpired("comparison", 15), 0]
             with self.assertRaises(watchdog.subprocess.TimeoutExpired):
                 watchdog.run_comparison(["comparison"])
             self.assertTrue(launch.call_args.kwargs["start_new_session"])
             kill.assert_called_once_with(12345, watchdog.signal.SIGKILL)
 
-    def test_stale_success_is_unavailable(self):
-        (self.root / "status.json").write_text(json.dumps({"sample_time": 1, "condition": "matching"}))
-        with patch.object(watchdog, "run_comparison"):
+    def test_stale_or_malformed_success_is_unavailable(self):
+        for outcome in ({'sample_time': 1, 'condition': 'matching'},
+                        {'sample_time': True, 'condition': 'matching'},
+                        {'sample_time': float('nan'), 'condition': 'matching'},
+                        {'sample_time': 1000, 'condition': 'private diagnostic'}, [], None):
+            with self.subTest(outcome=outcome), patch.object(watchdog, 'run_comparison', return_value=outcome), \
+                    patch.object(watchdog.time, 'time', return_value=1000):
+                self.lane.handle_mac_comparison(self.state, 1000, False)
+            self.assertEqual(self.state['mac_comparison']['mainnet']['condition'], 'unavailable')
+
+    def test_actual_child_mismatch_survives_abnormal_exit(self):
+        import sys
+        # Use a real child while omitting the deployment-only account on developer machines.
+        original = watchdog.subprocess.Popen
+        def launch(*args, **kwargs):
+            kwargs.pop('user')
+            return original(*args, **kwargs)
+        program = "import json; print(json.dumps({'condition':'tree_mismatch','sample_time':1000}), flush=True); raise OSError('fixture')"
+        with patch.object(watchdog.subprocess, 'Popen', side_effect=launch):
+            outcome = watchdog.run_comparison([sys.executable, '-c', program])
+        self.assertEqual(outcome, {'condition': 'tree_mismatch', 'sample_time': 1000})
+        with patch.object(watchdog, 'run_comparison', return_value=outcome), \
+                patch.object(watchdog.time, 'time', return_value=1000):
             self.lane.handle_mac_comparison(self.state, 1000, False)
-        self.assertEqual(self.state["mac_comparison"]["mainnet"]["condition"], "unavailable")
+        self.assertEqual(self.messages, ['Zakura compiler comparison: tree_mismatch'])
+
+    def test_real_comparator_child_alerts_when_mismatch_storage_fails(self):
+        import sys
+        package = Path(__file__).resolve().parents[1] / 'zakura-mac-cranelift'
+        self.args.mac_comparison.write_text(
+            "import sys, time\n"
+            + "sys.path[:0] = " + repr([str(package), str(package / 'tests')]) + "\n"
+            + "import comparison\nfrom pathlib import Path\nfrom common import atomic_json\n"
+            + "from test_comparison_status import Chain, Mac, record, receipt\n"
+            + "from unittest.mock import patch\n"
+            + "linux, mac = Chain(), Mac()\nmac.now = time.time()\nmac.close = lambda: None\n"
+            + "mac.records[11] = record(11)\nmac.records[11]['pools']['ironwood']['root'] = 'cc' * 32\n"
+            + "def fail(path, value, **kwargs):\n"
+            + " if Path(path).name != 'cursor.json': raise OSError('fixture full disk')\n"
+            + " atomic_json(path, value, **kwargs)\n"
+            + "with patch('comparison.Remote', return_value=mac), patch('comparison.RPC', return_value=linux), patch('comparison.atomic_json', side_effect=fail):\n"
+            + " comparison.main()\n")
+        # Keep the test's private receipt and state entirely in its temporary directory.
+        sys.path.insert(0, str(package / 'tests'))
+        self.addCleanup(lambda: sys.path.remove(str(package / 'tests')))
+        sys.path.insert(0, str(package))
+        self.addCleanup(lambda: sys.path.remove(str(package)))
+        from test_comparison_status import receipt
+        self.args.mac_comparison_receipt.write_text(json.dumps(receipt()))
+        original = watchdog.subprocess.Popen
+        def launch(*args, **kwargs):
+            kwargs.pop('user')
+            return original(*args, **kwargs)
+        with patch.object(watchdog.subprocess, 'Popen', side_effect=launch):
+            self.lane.handle_mac_comparison(self.state, watchdog.time.time(), False)
+        self.assertEqual(self.messages, ['Zakura compiler comparison: tree_mismatch'])
+        self.assertFalse((self.root / 'status.json').exists())
+        self.assertFalse((self.root / 'public.json').exists())
+        self.assertFalse((self.root / 'incidents').exists())
+        self.assertEqual(json.loads((self.root / 'cursor.json').read_text())['cursor'], 10)
+
+    def test_child_timeout_preserves_confirmed_mismatch_only(self):
+        for condition in ('tree_mismatch', 'matching'):
+            with self.subTest(condition=condition), patch.object(watchdog.subprocess, 'Popen') as launch, \
+                    patch.object(watchdog.os, 'killpg'):
+                process = launch.return_value.__enter__.return_value
+                process.wait.side_effect = [watchdog.subprocess.TimeoutExpired('comparison', 15), -9]
+                process.stdout.read.return_value = json.dumps({'condition': condition, 'sample_time': 1000}).encode()
+                if condition == 'tree_mismatch':
+                    self.assertEqual(watchdog.run_comparison(['comparison'])['condition'], condition)
+                else:
+                    with self.assertRaises(watchdog.subprocess.TimeoutExpired):
+                        watchdog.run_comparison(['comparison'])
+
+    def test_malformed_or_oversized_child_response_is_unavailable(self):
+        for response in (b'x' * 4097, b'[]', b'bad', b'null'):
+            with self.subTest(response=response[:8]), patch.object(watchdog.subprocess, 'Popen') as launch:
+                process = launch.return_value.__enter__.return_value
+                process.wait.return_value = 0
+                process.stdout.read.return_value = response
+                with self.assertRaises(ValueError):
+                    watchdog.run_comparison(['comparison'])
 
 if __name__ == "__main__":
     unittest.main()

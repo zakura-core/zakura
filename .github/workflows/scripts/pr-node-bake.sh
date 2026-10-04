@@ -18,7 +18,7 @@
 #   TIP_MAINNET_LATEST_JSON  latest.json pointer for the mainnet pruned tip
 #   SANDBLAST_URL            pinned pre-spam-region mainnet archive snapshot
 #   SANDBLAST_SHA256         its sha256
-#   TESTNET_SNAPSHOTS_BASE   testnet snapshots site (serves /snapshots.json)
+#   TIP_TESTNET_LATEST_JSON  latest.json pointer for the standard testnet pruned tip
 set -euo pipefail
 
 : "${BAKE_DOWNLOAD_DEADLINE:?bake workflow must provide the download deadline}"
@@ -186,6 +186,27 @@ fetch_state() {
   echo "Restored $(ls -d "$dest"/state/v*/"$network")"
 }
 
+# Both publishers use latest.json. Check the family and metadata before a large
+# download; read_state_height verifies compatibility with the baked binary.
+fetch_tip_state() {
+  local network="$1" latest_json="$2" dest="$3" metadata fields url sha
+  metadata=$(curl -fsSL --retry 3 --connect-timeout 30 --max-time 120 "$latest_json")
+  if ! fields=$(printf '%s\n' "$metadata" | jq -er --arg network "$network" '
+    select(.network == $network and .snapshot_kind == "pruned")
+    | select(.db_major | type == "number" and . > 0 and . == floor)
+    | select(.db_format_version | type == "string" and test("^[0-9]+\\.[0-9]+\\.[0-9]+$"))
+    | select((.db_format_version | split(".")[0] | tonumber) == .db_major)
+    | select(.url | type == "string" and startswith("https://"))
+    | select(.sha256 | type == "string" and test("^[a-fA-F0-9]{64}$"))
+    | [.url, .sha256] | @tsv'); then
+    echo "invalid $network pruned snapshot manifest: $latest_json" >&2
+    return 1
+  fi
+  IFS=$'\t' read -r url sha <<< "$fields"
+  echo "$network tip: $(printf '%s\n' "$metadata" | jq -r '"\(.filename) height=\(.height) db=\(.db_format_version)"')"
+  fetch_state "$url" "$sha" "$dest" "$network"
+}
+
 read_state_height() {
   # Use the same offline, finalized-state view as the handoff canary. Publisher
   # metadata can describe the live tip, including its non-finalized suffix.
@@ -276,28 +297,12 @@ else
   echo "Keeping the retained approach snapshot; dispatch with rebuild_approach_from_sandblast=true to replace it"
 
   # Mainnet tip: resolve the daily pruned snapshot through its latest.json pointer.
-  TIP_META=$(curl -fsSL --retry 3 "$TIP_MAINNET_LATEST_JSON")
-  TIP_URL=$(echo "$TIP_META" | jq -er '.url')
-  TIP_SHA=$(echo "$TIP_META" | jq -er '.sha256')
-  echo "Mainnet tip: $(echo "$TIP_META" | jq -r '"\(.filename) height=\(.height) db=\(.db_format_version)"')"
-  fetch_state "$TIP_URL" "$TIP_SHA" "$MAINNET_MNT/tip" mainnet
+  fetch_tip_state mainnet "$TIP_MAINNET_LATEST_JSON" "$MAINNET_MNT/tip"
   read_state_height "$MAINNET_MNT/tip" Mainnet > /root/mainnet-state-height
   echo "Verified Mainnet database height: $(cat /root/mainnet-state-height)"
 
-  # Testnet tip: newest enabled pruned entry from the snapshots site metadata.
-  TESTNET_META=$(curl -fsSL --retry 3 "$TESTNET_SNAPSHOTS_BASE/snapshots.json")
-  ENTRY=$(echo "$TESTNET_META" | jq -er \
-    '[.snapshots[] | select(.enabled and .kind == "pruned")] | sort_by(.published) | last')
-  [ "$ENTRY" != "null" ] || { echo "no enabled pruned testnet snapshot found" >&2; exit 1; }
-  TN_FILE=$(echo "$ENTRY" | jq -er '.file')
-  TN_SHA=$(echo "$ENTRY" | jq -er '.sha256')
-  TN_BASE=$(echo "$TESTNET_META" | jq -r '.siteBaseUrl // empty')
-  echo "Testnet tip: $(echo "$ENTRY" | jq -r '"\(.file) height=\(.height) db=\(.dbFormat)"')"
-  if [ -n "$TN_BASE" ] && curl -fsIL --retry 2 "${TN_BASE}/files/${TN_FILE}" >/dev/null 2>&1; then
-    fetch_state "${TN_BASE}/files/${TN_FILE}" "$TN_SHA" "$TESTNET_MNT/tip" testnet
-  else
-    fetch_state "${TESTNET_SNAPSHOTS_BASE}/files/${TN_FILE}" "$TN_SHA" "$TESTNET_MNT/tip" testnet
-  fi
+  # Standard Testnet uses the same manifest contract as Mainnet.
+  fetch_tip_state testnet "$TIP_TESTNET_LATEST_JSON" "$TESTNET_MNT/tip"
   read_state_height "$TESTNET_MNT/tip" Testnet > /root/testnet-state-height
   echo "Verified Testnet database height: $(cat /root/testnet-state-height)"
 fi

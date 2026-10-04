@@ -12,14 +12,15 @@ use std::{
     collections::{HashSet, VecDeque},
     fmt::{self},
     sync::{Arc, Mutex},
+    time::Duration,
 };
 
-use derive_getters::Getters;
 use derive_new::new;
+use getset::{CopyGetters, Getters};
 use jsonrpsee::core::RpcResult;
 use jsonrpsee_types::{ErrorCode, ErrorObject};
 use rand::{rngs::OsRng, RngCore};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, watch, Semaphore};
 use tower::{Service, ServiceExt};
 use zcash_keys::address::Address;
 use zcash_protocol::memo::MemoBytes;
@@ -31,7 +32,10 @@ use zakura_chain::{
     },
     chain_sync_status::ChainSyncStatus,
     chain_tip::ChainTip,
-    parameters::Network,
+    parameters::{
+        subsidy::{is_zip234_active, parent_nsm_value_balance},
+        Network,
+    },
     serialization::{DateTime32, ZcashDeserializeInto},
     transaction::VerifiedUnminedTx,
     work::difficulty::{CompactDifficulty, ExpandedDifficulty},
@@ -41,7 +45,9 @@ use zcash_script::{opcode::PushValue, pv::push_value};
 #[allow(unused_imports)]
 use zakura_chain::serialization::BytesInDisplayOrder;
 
-use zakura_consensus::{router::service_trait::BlockVerifierService, MAX_BLOCK_SIGOPS};
+use zakura_consensus::{
+    error::TransactionError, router::service_trait::BlockVerifierService, MAX_BLOCK_SIGOPS,
+};
 use zakura_node_services::mempool::{self, TransactionDependencies};
 use zakura_state::GetBlockTemplateChainInfo;
 
@@ -53,7 +59,7 @@ use crate::{
     methods::types::{
         default_roots::DefaultRoots, long_poll::LongPollId, transaction::TransactionTemplate,
     },
-    server::error::OkOrError,
+    server::error::{LegacyCode, MapError, OkOrError},
     MinedBlockEvent, PendingBlockRegistry, SubmitBlockChannel,
 };
 
@@ -73,6 +79,11 @@ const MAX_REJECTED_WORK_IDS: usize = 64;
 /// How many validated work IDs one parent retains. The oldest is forgotten first, so a miner
 /// holding very old work loses its withdrawal exemption rather than growing this queue.
 const MAX_PREPARED_WORK_IDS: usize = 64;
+
+/// Proof construction can itself use multiple cores. Admit one build across RPC clones.
+const MAX_TEMPLATE_BUILDS: usize = 1;
+/// Bound admission waits without cancelling an already running proof.
+const TEMPLATE_BUILD_WAIT: Duration = Duration::from_secs(30);
 
 /// Rejections for the current template parent. Overflow fails closed until the tip changes.
 #[derive(Clone, Debug, Default)]
@@ -286,22 +297,24 @@ type InBlockTxDependenciesDepth = usize;
 /// This is the output of the `getblocktemplate` RPC in the default 'template' mode. See
 /// [`BlockProposalResponse`] for the output in 'proposal' mode.
 #[allow(clippy::too_many_arguments)]
-#[derive(Clone, Eq, PartialEq, serde::Serialize, serde::Deserialize, Getters, new)]
+#[derive(Clone, Eq, PartialEq, serde::Serialize, serde::Deserialize, Getters, CopyGetters, new)]
 pub struct BlockTemplateResponse {
     /// The getblocktemplate RPC capabilities supported by Zebra.
     ///
     /// Zakura accepts proposal, long-poll, and work-ID fields without requiring miners to declare
     /// those capabilities. Zakura does not support server lists.
+    #[getset(get = "pub")]
     pub(crate) capabilities: Vec<String>,
 
     /// The version of the block format.
     /// Always 4 for new Zcash blocks.
+    #[getset(get_copy = "pub")]
     pub(crate) version: u32,
 
     /// The hash of the previous block.
     #[serde(rename = "previousblockhash")]
     #[serde(with = "hex")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     pub(crate) previous_block_hash: block::Hash,
 
     /// The block commitment for the new block's header.
@@ -309,7 +322,7 @@ pub struct BlockTemplateResponse {
     /// Same as [`DefaultRoots::block_commitments_hash`], see that field for details.
     #[serde(rename = "blockcommitmentshash")]
     #[serde(with = "hex")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     pub(crate) block_commitments_hash: ChainHistoryBlockTxAuthCommitmentHash,
 
     /// Legacy backwards-compatibility header root field.
@@ -317,7 +330,7 @@ pub struct BlockTemplateResponse {
     /// Same as [`DefaultRoots::block_commitments_hash`], see that field for details.
     #[serde(rename = "lightclientroothash")]
     #[serde(with = "hex")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     pub(crate) light_client_root_hash: ChainHistoryBlockTxAuthCommitmentHash,
 
     /// Legacy backwards-compatibility header root field.
@@ -325,7 +338,7 @@ pub struct BlockTemplateResponse {
     /// Same as [`DefaultRoots::block_commitments_hash`], see that field for details.
     #[serde(rename = "finalsaplingroothash")]
     #[serde(with = "hex")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     pub(crate) final_sapling_root_hash: ChainHistoryBlockTxAuthCommitmentHash,
 
     /// The block header roots for the transactions in the block template.
@@ -333,23 +346,26 @@ pub struct BlockTemplateResponse {
     /// If the transactions in the block template are modified, these roots must be recalculated
     /// [according to the specification](https://zcash.github.io/rpc/getblocktemplate.html).
     #[serde(rename = "defaultroots")]
+    #[getset(get = "pub")]
     pub(crate) default_roots: DefaultRoots,
 
     /// The non-coinbase transactions selected for this block template.
+    #[getset(get = "pub")]
     pub(crate) transactions: Vec<TransactionTemplate<amount::NonNegative>>,
 
     /// The coinbase transaction generated from `transactions` and `height`.
     #[serde(rename = "coinbasetxn")]
+    #[getset(get = "pub")]
     pub(crate) coinbase_txn: TransactionTemplate<amount::NegativeOrZero>,
 
     /// An ID that represents the chain tip and mempool contents for this template.
     #[serde(rename = "longpollid")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     pub(crate) long_poll_id: LongPollId,
 
     /// The expected difficulty for the new block displayed in expanded form.
     #[serde(with = "hex")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     pub(crate) target: ExpandedDifficulty,
 
     /// > For each block other than the genesis block, nTime MUST be strictly greater than
@@ -357,22 +373,26 @@ pub struct BlockTemplateResponse {
     ///
     /// <https://zips.z.cash/protocol/protocol.pdf#blockheader>
     #[serde(rename = "mintime")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     pub(crate) min_time: DateTime32,
 
     /// Hardcoded list of block fields the miner is allowed to change.
+    #[getset(get = "pub")]
     pub(crate) mutable: Vec<String>,
 
     /// A range of valid nonces that goes from `u32::MIN` to `u32::MAX`.
     #[serde(rename = "noncerange")]
+    #[getset(get = "pub")]
     pub(crate) nonce_range: String,
 
     /// Max legacy signature operations in the block.
     #[serde(rename = "sigoplimit")]
+    #[getset(get_copy = "pub")]
     pub(crate) sigop_limit: u32,
 
     /// Max block size in bytes
     #[serde(rename = "sizelimit")]
+    #[getset(get_copy = "pub")]
     pub(crate) size_limit: u64,
 
     /// > the current time as seen by the server (recommended for block time).
@@ -380,24 +400,25 @@ pub struct BlockTemplateResponse {
     ///
     /// <https://en.bitcoin.it/wiki/BIP_0022#Block_Template_Request>
     #[serde(rename = "curtime")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     pub(crate) cur_time: DateTime32,
 
     /// The expected difficulty for the new block displayed in compact form.
     #[serde(with = "hex")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     pub(crate) bits: CompactDifficulty,
 
     /// The height of the next block in the best chain.
     // Optional TODO: use Height type, but check that deserialized heights are within Height::MAX
+    #[getset(get_copy = "pub")]
     pub(crate) height: u32,
 
     /// > the maximum time allowed
     ///
     /// <https://en.bitcoin.it/wiki/BIP_0023#Mutations>
     ///
-    /// Zebra adjusts the minimum and current times for testnet minimum difficulty blocks,
-    /// so we need to tell miners what the maximum valid time is.
+    /// On testnet, the minimum and maximum times are narrowed to the range that matches the
+    /// template's difficulty, so we need to tell miners what the maximum valid time is.
     ///
     /// This field is not in `zcashd` or the Zcash RPC reference yet.
     ///
@@ -406,11 +427,12 @@ pub struct BlockTemplateResponse {
     /// Some miners don't check the maximum time. This can cause invalid blocks after network downtime,
     /// a significant drop in the hash rate, or after the testnet minimum difficulty interval.
     #[serde(rename = "maxtime")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     pub(crate) max_time: DateTime32,
 
     /// Identifies this prepared mining candidate.
     #[serde(rename = "workid")]
+    #[getset(get = "pub")]
     pub(crate) work_id: String,
 
     /// > only relevant for long poll responses:
@@ -427,7 +449,7 @@ pub struct BlockTemplateResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(default)]
     #[serde(rename = "submitold")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     pub(crate) submit_old: Option<bool>,
 }
 
@@ -478,17 +500,20 @@ impl BlockTemplateResponse {
     /// Returns a new [`BlockTemplateResponse`] struct, based on the supplied arguments and defaults.
     ///
     /// The result of this method only depends on the supplied arguments and constants.
-    #[allow(clippy::too_many_arguments)]
+    ///
+    /// Returns an error if the coinbase transaction cannot be built, for example because
+    /// the chain tip's value pools make the ZIP 234 NSM value balance negative. Its `expect`s
+    /// check invariants that the caller already guarantees.
+    #[allow(clippy::too_many_arguments, clippy::unwrap_in_result)]
     pub(crate) fn new_internal(
         net: &Network,
         precomputed_coinbase: Option<TransactionTemplate<amount::NegativeOrZero>>,
         miner_params: &MinerParams,
         chain_info: &GetBlockTemplateChainInfo,
         long_poll_id: LongPollId,
-        #[cfg(not(test))] mempool_txs: Vec<VerifiedUnminedTx>,
-        #[cfg(test)] mempool_txs: Vec<(InBlockTxDependenciesDepth, VerifiedUnminedTx)>,
+        mempool_txs: Vec<zip317::SelectedMempoolTx>,
         submit_old: Option<bool>,
-    ) -> Self {
+    ) -> Result<Self, TransactionError> {
         // Determine the next block height.
         let height = chain_info
             .tip_height
@@ -537,10 +562,24 @@ impl BlockTemplateResponse {
             .sum::<amount::Result<Amount<NonNegative>>>()
             .expect("mempool tx fees must be non-negative");
 
-        let coinbase_txn = precomputed_coinbase.unwrap_or_else(|| {
-            TransactionTemplate::new_coinbase(net, height, miner_params, txs_fee)
-                .expect("valid coinbase tx")
-        });
+        let coinbase_txn = match precomputed_coinbase {
+            Some(coinbase_txn) => coinbase_txn,
+            // ZIP 234 derives the subsidy from the money reserve after the parent, which
+            // is the chain tip this template builds on.
+            None => TransactionTemplate::new_coinbase(
+                net,
+                height,
+                miner_params,
+                txs_fee,
+                if is_zip234_active(net, height) {
+                    Some(parent_nsm_value_balance(
+                        chain_info.value_pools.nsm_value_balance_amount(),
+                    )?)
+                } else {
+                    None
+                },
+            )?,
+        };
 
         let default_roots = DefaultRoots::from_coinbase(
             net,
@@ -568,7 +607,7 @@ impl BlockTemplateResponse {
             "creating template ... "
         );
 
-        BlockTemplateResponse {
+        Ok(BlockTemplateResponse {
             capabilities,
 
             version: ZCASH_BLOCK_VERSION,
@@ -608,7 +647,7 @@ impl BlockTemplateResponse {
             work_id: new_work_id(),
 
             submit_old,
-        }
+        })
     }
 }
 
@@ -793,6 +832,9 @@ where
     /// Coalesces detached template preparation work to the newest template.
     template_preparation_queue: TemplatePreparationQueue<BlockTemplateResponse>,
 
+    /// Shared by foreground construction and long-poll coinbase precomputation.
+    template_build_slots: Arc<Semaphore>,
+
     /// Retains failures so late subscribers cannot miss template withdrawal.
     pub(crate) template_rejections: watch::Sender<TemplateRejections>,
 
@@ -826,6 +868,7 @@ where
             mined_submissions: Default::default(),
             optimistic_block_inventory,
             template_preparation_queue: TemplatePreparationQueue::default(),
+            template_build_slots: Arc::new(Semaphore::new(MAX_TEMPLATE_BUILDS)),
             template_rejections: watch::channel(TemplateRejections::default()).0,
             speculation_breaker: SpeculationBreaker::default(),
         }
@@ -834,6 +877,34 @@ where
     /// Shares one pending-block registry with peer serving.
     pub(crate) fn set_pending_blocks(&mut self, pending_blocks: PendingBlockRegistry) {
         self.pending_blocks = pending_blocks;
+    }
+
+    /// Runs bounded proof work off the async worker, retaining capacity across cancellation.
+    pub(crate) async fn run_template_build<T: Send + 'static>(
+        &self,
+        build: impl FnOnce() -> T + Send + 'static,
+    ) -> RpcResult<T> {
+        let permit = tokio::time::timeout(
+            TEMPLATE_BUILD_WAIT,
+            self.template_build_slots.clone().acquire_owned(),
+        )
+        .await
+        .map_err(|_| {
+            ErrorObject::owned(
+                LegacyCode::Misc.into(),
+                "timed out waiting for mining template construction capacity",
+                None::<()>,
+            )
+        })?
+        .map_misc_error()?;
+
+        tokio::task::spawn_blocking(move || {
+            // Dropping the RPC future cannot release capacity while this job still owns work.
+            let _permit = permit;
+            build()
+        })
+        .await
+        .map_misc_error()
     }
 
     pub(crate) fn reserve_mined_submission(

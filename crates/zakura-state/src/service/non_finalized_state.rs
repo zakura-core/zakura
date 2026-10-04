@@ -13,7 +13,7 @@ use std::{
 use indexmap::IndexMap;
 use tokio::sync::watch;
 use zakura_chain::{
-    block::{self, Block, Hash, Height},
+    block::{self, Hash, Height},
     parameters::Network,
     sprout::{self},
     transparent,
@@ -27,8 +27,10 @@ use crate::{
     SemanticallyVerifiedBlock, ValidateContextError, WatchReceiver,
 };
 
+mod address_transfers;
 mod backup;
 mod chain;
+mod created_utxos;
 
 #[cfg(test)]
 pub(crate) use backup::MIN_DURATION_BETWEEN_BACKUP_UPDATES;
@@ -36,8 +38,10 @@ pub(crate) use backup::MIN_DURATION_BETWEEN_BACKUP_UPDATES;
 #[cfg(test)]
 mod tests;
 
+pub(crate) use address_transfers::AddressTransfers;
 pub(crate) use backup::write_semantically_verified_backup_block;
 pub(crate) use chain::{Chain, SpendingTransactionId};
+pub(crate) use created_utxos::CreatedUtxos;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ContextualMetrics {
@@ -296,13 +300,21 @@ impl NonFinalizedState {
     where
         F: FnOnce(&mut BTreeSet<Arc<Chain>>),
     {
+        let inserted_tip = chain.non_finalized_tip_hash();
         self.chain_set.insert(chain);
 
         chain_filter(&mut self.chain_set);
 
         while self.chain_set.len() > MAX_NON_FINALIZED_CHAIN_FORKS {
-            // The first chain is the chain with the lowest work.
-            self.chain_set.pop_first();
+            // Keep the accepted parent available for a child that could make it best.
+            // Mining still uses the best chain, and the total fork limit is unchanged.
+            let evicted = self
+                .chain_set
+                .iter()
+                .find(|chain| chain.non_finalized_tip_hash() != inserted_tip)
+                .expect("the fork limit leaves room for both the best and inserted chains")
+                .clone();
+            self.chain_set.remove(&evicted);
         }
 
         self.update_metrics_bars();
@@ -311,6 +323,22 @@ impl NonFinalizedState {
     /// Insert `chain` into `self.chain_set`, then limit the number of tracked chains.
     fn insert(&mut self, chain: Arc<Chain>) {
         self.insert_with(chain, |_ignored_chain| { /* no filter */ })
+    }
+
+    /// Blocks removed by a fork eviction, excluding prefixes shared with retained chains.
+    /// Only compare states at the same finalized height.
+    pub(crate) fn evicted_blocks(&self, after: &Self) -> Vec<block::Hash> {
+        let mut evicted = std::collections::HashSet::new();
+        for chain in self.chain_iter() {
+            for block in chain.blocks.values().rev() {
+                if after.any_chain_contains(&block.hash) || !evicted.insert(block.hash) {
+                    break;
+                }
+            }
+        }
+        let mut evicted: Vec<_> = evicted.into_iter().collect();
+        evicted.sort_unstable_by_key(|hash| hash.0);
+        evicted
     }
 
     #[cfg(test)]
@@ -379,7 +407,7 @@ impl NonFinalizedState {
         self.update_metrics_for_chains();
 
         // Add the treestate to the finalized block.
-        FinalizableBlock::new(best_chain_root, root_treestate)
+        FinalizableBlock::new(Arc::unwrap_or_clone(best_chain_root), root_treestate)
     }
 
     /// Commit block to the non-finalized state, on top of:
@@ -445,7 +473,11 @@ impl NonFinalizedState {
         let invalidated_blocks = if chain.non_finalized_root_hash() == block_hash {
             self.chain_set
                 .retain(|chain| !chain.contains_block_hash(block_hash));
-            chain.blocks.values().cloned().collect()
+            chain
+                .blocks
+                .values()
+                .map(|block| block.as_ref().clone())
+                .collect()
         } else {
             let (new_chain, invalidated_blocks) = chain
                 .invalidate_block(block_hash)
@@ -453,7 +485,7 @@ impl NonFinalizedState {
 
             // Add the new chain fork or updated chain to the set of recent chains, and
             // remove the chain containing the hash of the block from chain set
-            self.insert_with(Arc::new(new_chain.clone()), |chain_set| {
+            self.insert_with(Arc::new(new_chain), |chain_set| {
                 chain_set.retain(|c| !c.contains_block_hash(block_hash))
             });
 
@@ -663,21 +695,10 @@ impl NonFinalizedState {
             });
         }
 
-        // Reads from disk
-        //
-        // TODO: if these disk reads show up in profiles, run them in parallel, using std::thread::spawn()
-        let unspent_utxo_snapshot_start = Instant::now();
-        let unspent_utxos = new_chain.unspent_utxos();
-        contextual_metrics.record_duration(
-            "state.contextual.unspent_utxo_snapshot.duration_seconds",
-            "state.contextual.mined.unspent_utxo_snapshot.duration_seconds",
-            unspent_utxo_snapshot_start.elapsed(),
-        );
-
         let transparent_spend_start = Instant::now();
         let spent_utxos = check::utxo::transparent_spend(
             &prepared,
-            &unspent_utxos,
+            &new_chain.created_utxos,
             &new_chain.spent_utxos,
             finalized_state,
         );
@@ -686,8 +707,6 @@ impl NonFinalizedState {
             "state.contextual.mined.transparent_spend.duration_seconds",
             transparent_spend_start.elapsed(),
         );
-        // Free the snapshot before the rest of validation clones and extends the chain.
-        drop(unspent_utxos);
         let spent_utxos = spent_utxos?;
 
         // Reads from disk
@@ -724,16 +743,20 @@ impl NonFinalizedState {
         let block_hash = prepared.hash;
         let transaction_count = prepared.block.transactions.len();
         let spent_utxo_count = spent_utxos.len();
-        let contextual =
-            ContextuallyVerifiedBlock::with_block_and_spent_utxos(prepared, spent_utxos).map_err(
-                |value_balance_error| ValidateContextError::CalculateBlockChainValueChange {
-                    value_balance_error,
-                    height,
-                    block_hash,
-                    transaction_count,
-                    spent_utxo_count,
-                },
-            );
+        let contextual = ContextuallyVerifiedBlock::with_block_and_spent_utxos(
+            &self.network,
+            prepared,
+            spent_utxos,
+        )
+        .map_err(|value_balance_error| {
+            ValidateContextError::CalculateBlockChainValueChange {
+                value_balance_error,
+                height,
+                block_hash,
+                transaction_count,
+                spent_utxo_count,
+            }
+        });
         contextual_metrics.record_duration(
             "state.contextual.block_construction.duration_seconds",
             "state.contextual.mined.block_construction.duration_seconds",
@@ -758,7 +781,10 @@ impl NonFinalizedState {
 
     /// Validate `contextual` and update `new_chain`, doing CPU-intensive work in parallel batches.
     #[allow(clippy::unwrap_in_result)]
-    #[tracing::instrument(skip(new_chain, sprout_final_treestates))]
+    #[tracing::instrument(
+        skip(new_chain, contextual, sprout_final_treestates),
+        fields(height = ?contextual.height, hash = %contextual.hash)
+    )]
     fn validate_and_update_parallel(
         new_chain: Arc<Chain>,
         contextual: ContextuallyVerifiedBlock,
@@ -907,40 +933,6 @@ impl NonFinalizedState {
             .find_map(|chain| chain.created_utxo(outpoint))
     }
 
-    /// Returns the `block` with the given hash in any chain.
-    #[allow(dead_code)]
-    pub fn any_block_by_hash(&self, hash: block::Hash) -> Option<Arc<Block>> {
-        // This performs efficiently because the number of chains is limited to 10.
-        for chain in self.chain_set.iter().rev() {
-            if let Some(prepared) = chain
-                .height_by_hash
-                .get(&hash)
-                .and_then(|height| chain.blocks.get(height))
-            {
-                return Some(prepared.block.clone());
-            }
-        }
-
-        None
-    }
-
-    /// Returns the previous block hash for the given block hash in any chain.
-    #[allow(dead_code)]
-    pub fn any_prev_block_hash_for_hash(&self, hash: block::Hash) -> Option<block::Hash> {
-        // This performs efficiently because the blocks are in memory.
-        self.any_block_by_hash(hash)
-            .map(|block| block.header.previous_block_hash)
-    }
-
-    /// Returns the hash for a given `block::Height` if it is present in the best chain.
-    #[allow(dead_code)]
-    pub fn best_hash(&self, height: block::Height) -> Option<block::Hash> {
-        self.best_chain()?
-            .blocks
-            .get(&height)
-            .map(|prepared| prepared.hash)
-    }
-
     /// Returns the tip of the best chain.
     #[allow(dead_code)]
     pub fn best_tip(&self) -> Option<(block::Height, block::Hash)> {
@@ -957,26 +949,6 @@ impl NonFinalizedState {
         let best_chain = self.best_chain()?;
 
         best_chain.tip_block()
-    }
-
-    /// Returns the height of `hash` in the best chain.
-    #[allow(dead_code)]
-    pub fn best_height_by_hash(&self, hash: block::Hash) -> Option<block::Height> {
-        let best_chain = self.best_chain()?;
-        let height = *best_chain.height_by_hash.get(&hash)?;
-        Some(height)
-    }
-
-    /// Returns the height of `hash` in any chain.
-    #[allow(dead_code)]
-    pub fn any_height_by_hash(&self, hash: block::Hash) -> Option<block::Height> {
-        for chain in self.chain_set.iter().rev() {
-            if let Some(height) = chain.height_by_hash.get(&hash) {
-                return Some(*height);
-            }
-        }
-
-        None
     }
 
     /// Returns `true` if the best chain contains `sprout_nullifier`.

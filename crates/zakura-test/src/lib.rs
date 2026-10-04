@@ -16,6 +16,8 @@ use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 #[allow(missing_docs)]
 pub mod command;
 
+pub mod allocations;
+pub mod execution;
 pub mod log_capture;
 pub mod mock_service;
 pub mod net;
@@ -128,9 +130,8 @@ pub fn init() -> impl Drop {
                     "<std::panic::AssertUnwindSafe",
                     "core::result::Result",
                     "<T as futures_util",
-                    "<tracing_futures::Instrumented",
+                    "<tracing::instrument::Instrumented",
                     "test::assert_test_result",
-                    "spandoc::",
                 ];
 
                 frames.retain(|frame| {

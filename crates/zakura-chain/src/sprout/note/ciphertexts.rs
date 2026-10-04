@@ -3,7 +3,6 @@
 use std::{fmt, io};
 
 use serde::{Deserialize, Serialize};
-use serde_big_array::BigArray;
 
 use crate::serialization::{SerializationError, ZcashDeserialize, ZcashSerialize};
 
@@ -11,7 +10,9 @@ use crate::serialization::{SerializationError, ZcashDeserialize, ZcashSerialize}
 ///
 /// Corresponds to the Sprout 'encCiphertext's
 #[derive(Serialize, Deserialize)]
-pub struct EncryptedNote(#[serde(with = "BigArray")] pub [u8; 601]);
+pub struct EncryptedNote(
+    #[serde(with = "crate::serialization::serde_adapters::bytes")] pub [u8; 601],
+);
 
 impl fmt::Debug for EncryptedNote {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {

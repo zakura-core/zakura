@@ -264,6 +264,7 @@ pub(super) fn initial_view(frontiers: BlockSyncFrontiers) -> SequencerView {
 /// `Misbehavior` on the same action channel the reactor uses.
 pub(super) struct SequencerTask {
     sequencer: Sequencer,
+    retained_body_limit: u64,
     budget: ByteBudget,
     work: Arc<WorkQueue>,
     registry: Arc<PeerRegistry>,
@@ -328,6 +329,8 @@ impl SequencerTask {
     ) -> Self {
         Self {
             sequencer,
+            retained_body_limit: ZakuraBlockSyncConfig::default()
+                .effective_max_reorder_lookahead_bytes(),
             budget,
             work,
             registry,
@@ -353,6 +356,11 @@ impl SequencerTask {
             submission_retry_attempt: 0,
             trace,
         }
+    }
+
+    pub(super) fn with_retained_body_limit(mut self, limit: u64) -> Self {
+        self.retained_body_limit = limit;
+        self
     }
 
     /// Seed the synchronous state-write coordinate from the startup snapshot.
@@ -525,6 +533,37 @@ impl SequencerTask {
         let scope_is_current = scope_is_current || self.current_scope.is_none();
         if !scope_is_current {
             self.trace_body_accepted(body.height, body.received_at.elapsed(), "stale_scope");
+            return;
+        }
+        if !super::admission::retain_received_body(
+            self.retained_body_limit,
+            self.sequencer.verified_tip(),
+            self.sequencer
+                .reorder_buffered_bytes()
+                .saturating_add(self.sequencer.applying_buffered_bytes()),
+            u64::try_from(
+                self.sequencer
+                    .reorder_len()
+                    .saturating_add(self.sequencer.applying_len()),
+            )
+            .unwrap_or(u64::MAX),
+            body.height,
+            body.bytes,
+        ) && !self.sequencer.already_retains(body.height, body.hash)
+        {
+            self.work.defer_received_for_owner(
+                body.owner,
+                body.height,
+                body.hash,
+                body.bytes,
+                self.sequencer.verified_tip(),
+            );
+            metrics::counter!("sync.block.retention.deferred").increment(1);
+            self.trace_body_accepted(
+                body.height,
+                body.received_at.elapsed(),
+                "retention_deferred",
+            );
             return;
         }
         if let Some(current) = self.current_scope {
@@ -1412,6 +1451,159 @@ mod tests {
             input_decoded_attributed_memory_bytes.load(std::sync::atomic::Ordering::Relaxed),
             0
         );
+    }
+
+    fn retention_test_task(limit: u64) -> SequencerTask {
+        let frontiers = BlockSyncFrontiers {
+            finalized_height: block::Height(0),
+            verified_block_tip: block::Height(0),
+            verified_block_hash: block::Hash([0; 32]),
+        };
+        let (_body_tx, body_rx) = mpsc::channel(1);
+        let (_control_tx, control_rx) = mpsc::unbounded_channel();
+        let (actions, _actions_rx) = mpsc::channel(1);
+        let (view_tx, _view_rx) = watch::channel(initial_view(frontiers));
+        SequencerTask::new(
+            Sequencer::new(block::Height(0), 1),
+            ByteBudget::new(1_000_000),
+            Arc::new(WorkQueue::new(block::Height(0))),
+            Arc::new(PeerRegistry::new()),
+            actions,
+            ThroughputMeter::new(Instant::now()),
+            frontiers,
+            Some(super::test_work_scope()),
+            crate::zakura::header_sync::SeededRetryJitter::new([0; 32]),
+            body_rx,
+            control_rx,
+            Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            view_tx,
+            Duration::from_secs(1),
+            ZakuraTrace::noop(),
+        )
+        .with_retained_body_limit(limit)
+    }
+
+    // Use a real serialized block. Only the scheduling height is synthetic.
+    fn received_test_body(task: &mut SequencerTask, height: u32, estimate: u64) -> SequencedBody {
+        use zakura_chain::serialization::ZcashSerialize;
+        let block: Arc<block::Block> = Arc::new(
+            zakura_test::vectors::BLOCK_MAINNET_982681_BYTES
+                .zcash_deserialize_into()
+                .unwrap(),
+        );
+        let raw: Arc<[u8]> = block.zcash_serialize_to_vec().unwrap().into();
+        let bytes = u64::try_from(raw.len()).unwrap();
+        let height = block::Height(height);
+        task.work.extend(
+            super::test_work_scope(),
+            [(
+                height,
+                block.hash(),
+                super::super::request::BlockSizeEstimate::Advertised(
+                    u32::try_from(estimate).unwrap(),
+                ),
+            )],
+        );
+        let taken = task.work.take_for_request(
+            height,
+            height,
+            1,
+            estimate,
+            u64::from(height.0),
+            std::num::NonZeroU64::new(1).unwrap(),
+        );
+        let owner = taken[0].1.owner.unwrap();
+        let reserved = task.work.mark_reserved_for_owner(owner, [height]);
+        task.budget.charge(reserved);
+        assert_eq!(
+            task.work
+                .release_active_reserved_height_for_owner(owner, height),
+            Some(reserved)
+        );
+        task.budget.release(reserved);
+        let mut body = SequencedBody::new_queued(
+            owner,
+            zakura_header_chain::SourceId::from_digest([1; 32]),
+            height,
+            block.hash(),
+            block.header.previous_block_hash,
+            BufferedBlockBody::from_decoded_block(block, Some(raw)),
+            bytes,
+            ZakuraPeerId::new(vec![1; 32]).unwrap(),
+            Instant::now(),
+            task._body_input_bytes.clone(),
+            task.body_input_decoded_attributed_memory_bytes.clone(),
+        );
+        body.leave_queue();
+        body
+    }
+
+    #[test]
+    fn actual_retention_refuses_understated_body_and_defers_exact_attempt() {
+        let mut task = retention_test_task(2_048);
+        let body = received_test_body(&mut task, 500, 1_024);
+        let bytes = body.bytes;
+        assert!(bytes > 2_048);
+        let owner = body.owner;
+        let hash = body.hash;
+        task.handle_accept_body(body);
+        assert_eq!(task.sequencer.reorder_buffered_bytes(), 0);
+        assert_eq!(task.work.reserved_bytes(), 0);
+        assert_eq!(task.budget.reserved(), 0);
+        assert!(task.work.pending_contains(block::Height(500)));
+        assert!(task
+            .work
+            .take_in_range(block::Height(500), block::Height(500), 1)
+            .is_empty());
+        assert!(!task.work.defer_received_for_owner(
+            owner,
+            block::Height(500),
+            hash,
+            bytes,
+            block::Height(0)
+        ));
+        task.work.advance_floor(block::Height(1));
+        let retry = task.work.take_for_request(
+            block::Height(500),
+            block::Height(500),
+            1,
+            bytes,
+            99,
+            std::num::NonZeroU64::new(2).unwrap(),
+        );
+        assert_eq!(retry[0].1.estimated_bytes, bytes);
+        assert!(!task.work.defer_received_for_owner(
+            owner,
+            block::Height(500),
+            hash,
+            bytes,
+            block::Height(1)
+        ));
+    }
+
+    #[test]
+    fn actual_retention_serializes_arrivals_and_preserves_checkpoint_progress() {
+        let mut task = retention_test_task(u64::MAX);
+        let first = received_test_body(&mut task, 500, 1_024);
+        let bytes = first.bytes;
+        task.retained_body_limit = bytes;
+        let second = received_test_body(&mut task, 501, 1_024);
+        // Both replies were issued before the first was retained.
+        task.handle_accept_body(first);
+        task.handle_accept_body(second);
+        assert_eq!(task.sequencer.reorder_buffered_bytes(), bytes);
+        assert_eq!(task.sequencer.reorder_len(), 1);
+        assert!(task.work.pending_contains(block::Height(501)));
+        // A full speculative backlog cannot prevent assembling the checkpoint.
+        let checkpoint = received_test_body(&mut task, 401, 1_024);
+        task.handle_accept_body(checkpoint);
+        assert_eq!(task.sequencer.reorder_buffered_bytes(), 2 * bytes);
+        task.destructive_reset_to(block::Height(0), false);
+        assert_eq!(task.sequencer.reorder_buffered_bytes(), 0);
+        let after_reset = received_test_body(&mut task, 502, 1_024);
+        task.handle_accept_body(after_reset);
+        assert_eq!(task.sequencer.reorder_buffered_bytes(), bytes);
     }
 
     #[tokio::test]

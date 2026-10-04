@@ -28,6 +28,7 @@ jobs:
           manual_heading = "## Remaining manual judgment (before undrafting)"
           required = {
               "changelog",
+              "eos-height",
               "new-crate-versions",
               "release-hold",
           }

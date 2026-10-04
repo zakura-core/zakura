@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import argparse
 import contextlib
 import importlib.util
 import json
+import io
 import os
 import re
+import socket
 import subprocess
 import sys
 import tempfile
@@ -81,6 +84,132 @@ def public_row(
         "last_seen_at": observed_at,
         "rpc_metadata_error": None,
     }
+
+
+class MacCraneliftTests(unittest.TestCase):
+    def read(self, payload):
+        with mock.patch.object(Path, "open", return_value=io.BytesIO(json.dumps(payload).encode())):
+            return status.mac_cranelift_status()
+
+    def test_existing_dashboard_does_not_publish_private_endpoint_or_diagnostics(self):
+        payload = {"verifier_id": "verifier-" + "a" * 32, "sample_time": time.time(),
+                   "host": "192.0.2.10", "error": "private-host.local failed",
+                   "receipt": {"peer_id": "private-peer"}, "compared_through": 100,
+                   "coverage_start": 11, "active_incidents": 0, "qualified": True}
+        result = self.read(payload)
+        self.assertTrue(result["available"])
+        self.assertEqual(result["compared_through"], 100)
+        for private in ("192.0.2.10", "private-host", "private-peer", "receipt", "error"):
+            self.assertNotIn(private, json.dumps(result))
+
+    def test_public_condition_drives_health_without_redundant_flags(self):
+        for condition in ('matching', 'unavailable', 'tree_mismatch', 'chain_disagreement'):
+            result = self.read({'verifier_id': 'verifier-' + 'a' * 32, 'sample_time': time.time(),
+                                'condition': condition, 'comparison_healthy': True,
+                                'ancestor_hashes': {'10': 'b' * 64, 'host': '192.0.2.10'}})
+            self.assertEqual(result['comparison_healthy'], condition == 'matching')
+            self.assertEqual(result['ancestor_hashes'], {'10': 'b' * 64})
+
+    def test_stale_or_malformed_file_never_reports_fresh_status(self):
+        self.assertFalse(self.read({"verifier_id": "verifier-" + "a" * 32,
+                                    "sample_time": time.time() - 1000})["available"])
+        self.assertEqual(self.read({"verifier_id": "192.0.2.10"}), {"available": False})
+        self.assertEqual(self.read(["private-host"]), {"available": False})
+
+    def test_private_mac_is_thirteenth_node_with_detail_and_no_direct_probe(self):
+        collector = status.ClusterCollector([node("node-%02d" % n) for n in range(12)], 10, 300, "mainnet")
+        sample = {"available": True, "verifier_id": "verifier-" + "a" * 32,
+                  "mac_tip": 100, "mac_tip_hash": "b" * 64, "source_sha": "c" * 40,
+                  "comparison_healthy": True,
+                  "compared_through": 90, "pending_alerts": 2, "node_rss_bytes": 1000}
+        with mock.patch.dict(os.environ, {"ZAKURA_MAC_CRANELIFT_STATUS": "1"}), \
+                mock.patch.object(status, "mac_cranelift_status", return_value=sample), \
+                mock.patch.object(status, "probe_node", return_value={}) as probe:
+            collector.poll_once()
+        snapshot = collector.snapshot()
+        self.assertEqual(snapshot["total"], 13)
+        self.assertEqual(probe.call_count, 12)
+        self.assertNotIn("verifiers", snapshot)
+        mac = next(row for row in snapshot["rows"] if row["name"] == "mac-os-cranelift")
+        self.assertEqual(mac["height"], 100)
+        self.assertTrue(mac["healthy"])
+        self.assertEqual(mac["ssh"], "")
+        self.assertEqual(mac["node_id"], sample["verifier_id"])
+        detail = collector.node_snapshot("mac-os-cranelift")
+        self.assertEqual(detail["node"]["host"]["rss_bytes"], 1000)
+        self.assertEqual(len(detail["history"]), 1)
+
+    def test_dashboard_mac_row_reaches_watchdog_fork_and_offline_policies(self):
+        spec = importlib.util.spec_from_file_location(
+            "dashboard_watchdog", SCRIPT_PATH.with_name("zakura-cluster-watchdog.py"))
+        watchdog = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = watchdog
+        spec.loader.exec_module(watchdog)
+        collector = status.ClusterCollector([node()], 10, 300, "mainnet")
+        sample = {"available": True, "mac_tip": 110, "mac_tip_hash": "c" * 64,
+                  "comparison_healthy": True,
+                  "ancestor_hashes": {"10": "a" * 64}}
+        with mock.patch.dict(os.environ, {"ZAKURA_MAC_CRANELIFT_STATUS": "1"}), \
+                mock.patch.object(status, "mac_cranelift_status", return_value=sample), \
+                mock.patch.object(status, "probe_node", return_value={}):
+            collector.poll_once()
+        mac = next(row for row in collector.snapshot()["rows"]
+                   if row["name"] == "mac-os-cranelift")
+        args = argparse.Namespace(down_after=600, dry_run=False)
+        agent = watchdog.Watchdog([], args)
+        sent = []
+        agent.notify = lambda text, args: (sent.append(text), True)[1]
+        others = [dict(mac, name=f"linux-{i}",
+                       ancestor_hashes={"10": "b" * 64}) for i in range(12)]
+        fleet = watchdog.Fleet("mainnet", "http://localhost/data", "https://example.com/")
+        with mock.patch.dict(os.environ, {"ZAKURA_MAC_CRANELIFT_ALERTS_MUTED": "0"}):
+            agent.handle_mac_fork({}, fleet, [mac, *others], time.time(), False)
+        self.assertEqual(len(sent), 1)
+        self.assertIn("mac-os-cranelift", sent[0])
+        self.assertEqual(watchdog.node_condition(dict(mac, health="down"),
+                                               time.time(), 0, args)[2], 180)
+
+    def test_canonical_dashboard_setting_enables_the_node(self):
+        collector = status.ClusterCollector([node()], 10, 300, "mainnet")
+        with mock.patch.dict(os.environ, {"ZAKURA_MAC_CRANELIFT_STATUS": "1"}, clear=True), \
+                mock.patch.object(status, "mac_cranelift_status", return_value={"available": False}), \
+                mock.patch.object(status, "probe_node", return_value={}):
+            collector.poll_once()
+        self.assertEqual(collector.snapshot()["total"], 2)
+
+    def test_private_mac_is_mainnet_only_and_unavailable_sample_is_unhealthy(self):
+        for network, enabled in (("mainnet", True), ("testnet", False)):
+            collector = status.ClusterCollector([node()], 10, 300, network)
+            with mock.patch.dict(os.environ, {"ZAKURA_MAC_CRANELIFT_STATUS": "1"}), \
+                    mock.patch.object(status, "mac_cranelift_status", return_value={"available": False}), \
+                    mock.patch.object(status, "probe_node", return_value={}):
+                collector.poll_once()
+            snapshot = collector.snapshot()
+            self.assertEqual(snapshot["total"], 2 if enabled else 1)
+            if enabled:
+                mac = next(row for row in snapshot["rows"] if row["name"] == "mac-os-cranelift")
+                self.assertFalse(mac["healthy"])
+                self.assertIsNone(mac["height"])
+            self.assertNotIn("verifiers", snapshot)
+
+    def test_advancing_mac_with_failed_comparison_is_not_healthy(self):
+        collector = status.ClusterCollector([node()], 10, 300, "mainnet")
+        sample = {"available": True, "mac_tip": 100, "mac_tip_hash": "b" * 64,
+                  "comparison_healthy": False, "compared_through": 90, "alerts_muted": True}
+        with mock.patch.dict(os.environ, {"ZAKURA_MAC_CRANELIFT_STATUS": "1"}), \
+                mock.patch.object(status, "mac_cranelift_status", return_value=sample), \
+                mock.patch.object(status, "probe_node", return_value={}):
+            collector.poll_once()
+        mac = next(row for row in collector.snapshot()["rows"] if row["name"] == "mac-os-cranelift")
+        self.assertEqual(mac["height"], 100)
+        self.assertFalse(mac["healthy"])
+        self.assertEqual(mac["health"], "verification_error")
+        self.assertIn("Alerts muted", mac["detail"])
+
+    def test_separate_verifier_section_is_removed(self):
+        source = SCRIPT_PATH.read_text()
+        self.assertNotIn('id="verifier-panel"', source)
+        self.assertNotIn("Native macOS consensus verifier</h2>", source)
 
 
 class NodeConfigTests(unittest.TestCase):
@@ -1105,6 +1234,76 @@ class RateLimiterTests(unittest.TestCase):
         self.assertTrue(limiter.allow("client-a", now=11))
 
 
+class AddressPrivacyTests(unittest.TestCase):
+    def test_nested_addresses_and_keys_are_redacted(self):
+        addresses = ["192.0.2.17", "2001:db8::17", "::1", "::ffff:192.0.2.17", "fe80::17%en0"]
+        for address in addresses:
+            with self.subTest(address=address):
+                payload = {address: [{"error": f"connection to [{address}]:8232 failed"}]}
+                encoded = json.dumps(status.redact_private_addresses(payload, {status.address_key(address)}))
+                self.assertNotIn(address, encoded)
+                self.assertIn("[redacted-address]", encoded)
+                self.assertNotIn(address, status.redact_private_addresses(f"peer={address}.", {status.address_key(address)}))
+
+    def test_canonical_mac_address_forms_are_redacted_without_hiding_linux(self):
+        for private, variants in [
+            ("2001:db8::17", ["2001:0db8:0:0:0:0:0:0017", "2001:DB8::17", "2001:db8::17%en0"]),
+            ("192.0.2.17", ["::ffff:192.0.2.17", "::ffff:c000:211", "192.0.2.17"]),
+        ]:
+            for variant in variants:
+                with self.subTest(variant=variant):
+                    value = {variant: [f"peer=[{variant}]:8232; linux=192.0.2.18"]}
+                    result = json.dumps(status.redact_private_addresses(value, {status.address_key(private)}))
+                    self.assertNotIn(variant, result)
+                    self.assertIn("192.0.2.18", result)
+                    self.assertIn("[redacted-address]", result)
+
+    def test_multiple_protected_addresses_in_one_detail_are_removed(self):
+        protected = {status.address_key('2001:db8:1:2:3:4:5:17'), status.address_key('192.0.2.17')}
+        value = 'dead:beef:2001:db8:1:2:3:4:5:17 / peer:::ffff:c000:211 / ::ffff:192.0.2.17:8233'
+        result = status.redact_private_addresses(value, protected)
+        self.assertEqual(result.count('[redacted-address]'), 3)
+        self.assertNotIn('2001:db8:1:2:3:4:5:17', result)
+        self.assertNotIn('192.0.2.17', result)
+
+    def test_private_addresses_in_invalid_outer_tokens_are_redacted(self):
+        for private, variants in [
+            ("192.0.2.17", ["peer:::ffff:192.0.2.17", "::ffff:192.0.2.17:8233",
+                            "peer:::ffff:c000:211", "::ffff:c000:211:8233"]),
+            ("2001:db8::17", ["peer:2001:db8::17", "2001:db8::17:8233",
+                             "face:2001:0db8:0:0:0:0:0:0017"]),
+            ("2001:db8:1:2:3:4:5:17", ["dead:beef:2001:db8:1:2:3:4:5:17",
+                                        "dead:beef:2001:0db8:0001:0002:0003:0004:0005:0017:8233"]),
+        ]:
+            for variant in variants:
+                with self.subTest(variant=variant):
+                    value = {"diagnostic": variant, "linux": "192.0.2.18"}
+                    result = json.dumps(status.redact_private_addresses(value, {status.address_key(private)}))
+                    self.assertNotIn(variant, result)
+                    self.assertIn("[redacted-address]", result)
+                    self.assertIn("192.0.2.18", result)
+
+    def test_missing_or_invalid_config_fails_closed_for_mac_dashboard(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "private.json"
+            with mock.patch.object(status, "PRIVATE_ADDRESS_FILE", path), \
+                    mock.patch.dict(os.environ, {"ZAKURA_MAC_CRANELIFT_STATUS": "1"}):
+                with self.assertRaises(ValueError):
+                    status.private_addresses()
+                for value in [[], {}, ["not an address"], [1]]:
+                    path.write_text(json.dumps(value))
+                    with self.assertRaises(ValueError):
+                        status.private_addresses()
+                path.write_text(json.dumps(["192.0.2.17"]))
+                self.assertEqual(status.private_addresses(), {status.address_key("192.0.2.17")})
+
+    def test_non_address_values_survive(self):
+        payload = {"time": "2026-09-30T11:25:27Z", "version": "1.97.1", "height": 3500000,
+                   "hash": "a" * 64, "bad": "999.999.999.999", "available": True}
+        self.assertEqual(status.redact_private_addresses(payload, {status.address_key("192.0.2.17")}), payload)
+
+
+
 class HttpHandlerTests(unittest.TestCase):
     def setUp(self):
         self.original_collector = status.COLLECTOR
@@ -1130,6 +1329,27 @@ class HttpHandlerTests(unittest.TestCase):
         status.COLLECTOR = self.original_collector
         status.RATE_LIMITER = self.original_limiter
 
+    def test_synthetic_mac_detail_page_and_data_are_available(self):
+        sample = {"available": True, "verifier_id": "verifier-" + "a" * 32,
+                  "mac_tip": 100, "mac_tip_hash": "b" * 64,
+                  "comparison_healthy": True}
+        status.COLLECTOR.network = "mainnet"
+        with mock.patch.dict(os.environ, {"ZAKURA_MAC_CRANELIFT_STATUS": "1"}), \
+                mock.patch.object(status, "mac_cranelift_status", return_value=sample), \
+                mock.patch.object(status, "probe_node", return_value={}):
+            status.COLLECTOR.poll_once()
+        self.assertNotIn("mac-os-cranelift", status.COLLECTOR.nodes_by_name)
+        with urllib.request.urlopen(f"{self.base_url}/node/mac-os-cranelift") as response:
+            self.assertEqual(response.read(), status.PAGE.encode())
+        with urllib.request.urlopen(f"{self.base_url}/data/node/mac-os-cranelift") as response:
+            detail = json.load(response)
+        self.assertEqual(detail["node"]["name"], "mac-os-cranelift")
+        self.assertEqual(detail["node"]["ssh"], "")
+        self.assertTrue(all(value == "" for value in detail["config"].values()))
+        with self.assertRaises(urllib.error.HTTPError) as caught:
+            urllib.request.urlopen(f"{self.base_url}/node/unknown")
+        self.assertEqual(caught.exception.code, 404)
+
     def test_get_status_sets_public_headers(self):
         request = urllib.request.Request(
             f"{self.base_url}/ironwood-status.json",
@@ -1151,6 +1371,86 @@ class HttpHandlerTests(unittest.TestCase):
         self.assertEqual(response.headers["Cache-Control"], "no-store")
         self.assertEqual(response.headers["X-Content-Type-Options"], "nosniff")
         self.assertEqual(payload["network"], "testnet")
+
+    def test_public_response_preserves_linux_but_redacts_mac_in_any_row(self):
+        status.COLLECTOR.rows[0]["ssh"] = "operator@192.0.2.18"
+        status.COLLECTOR.rows[0]["rpc_metadata_error"] = "peer 192.0.2.17 and [2001:db8::17] failed; Linux [2001:db8::18]"
+        protected = {status.address_key(value) for value in ["192.0.2.17", "2001:db8::17"]}
+        with mock.patch.object(status, "private_addresses", return_value=protected):
+            with urllib.request.urlopen(f"{self.base_url}/data") as response:
+                body = response.read().decode()
+        self.assertNotIn("192.0.2.17", body)
+        self.assertNotIn("2001:db8::17", body)
+        self.assertIn("operator@192.0.2.18", body)
+        self.assertIn("2001:db8::18", body)
+        self.assertIn("[redacted-address]", body)
+
+    def test_colon_prefixed_peer_details_do_not_expose_private_addresses(self):
+        status.COLLECTOR.rows[0]["peer_subversions"] = [
+            ["peer:::ffff:192.0.2.17", 1], ["peer:2001:db8::17", 1]]
+        protected = {status.address_key("192.0.2.17"), status.address_key("2001:db8::17")}
+        with mock.patch.object(status, "private_addresses", return_value=protected):
+            with urllib.request.urlopen(f"{self.base_url}/data/node/node-a") as response:
+                body = response.read().decode()
+        self.assertNotIn("192.0.2.17", body)
+        self.assertNotIn("2001:db8::17", body)
+        self.assertIn("[redacted-address]", body)
+
+    def test_private_configuration_failure_never_serves_unfiltered_json(self):
+        status.COLLECTOR.rows[0]["rpc_metadata_error"] = "private 192.0.2.17"
+        with mock.patch.object(status, "private_addresses", side_effect=ValueError("private fixture")):
+            with urllib.request.urlopen(f"{self.base_url}/data") as response:
+                self.assertEqual(response.status, 200)
+                body = response.read().decode()
+            with self.assertRaises(urllib.error.HTTPError) as caught:
+                urllib.request.urlopen(f"{self.base_url}/data/node/node-a")
+        self.assertEqual(caught.exception.code, 503)
+        caught.exception.close()
+        self.assertEqual(json.loads(body)["rows"][0]["height"], 4_201_000)
+        self.assertNotIn("192.0.2.17", body)
+        self.assertNotIn("private fixture", body)
+
+    def test_privacy_failure_keeps_real_http_watchdog_node_alerts_working(self):
+        spec = importlib.util.spec_from_file_location(
+            "degraded_watchdog", SCRIPT_PATH.with_name("zakura-cluster-watchdog.py"))
+        watchdog = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = watchdog
+        spec.loader.exec_module(watchdog)
+        with mock.patch.object(sys, "argv", ["watchdog", "--config", "unused", "--dry-run"]):
+            args = watchdog.parse_args()
+        agent = watchdog.Watchdog([], args)
+        messages = []
+        agent.notify = lambda text, _: (messages.append(text), True)[1]
+        fleet = watchdog.Fleet("mainnet", f"{self.base_url}/data", self.base_url)
+        state = {}
+        status.COLLECTOR.rows[0].update(health="down", detail="private 192.0.2.17")
+        with mock.patch.object(status, "private_addresses", side_effect=OSError("fixture")):
+            for now in (1000, 1600):
+                status.COLLECTOR.last_poll = now
+                agent.observe_fleet(state, fleet, now, False)
+        self.assertEqual(len(messages), 1)
+        self.assertIn("node-a", messages[0])
+        self.assertNotIn("192.0.2.17", messages[0])
+        self.assertTrue(state["nodes"]["mainnet/node-a"]["alerting"])
+        self.assertEqual(state["fleets"]["mainnet"]["condition"], "ok")
+
+    def test_degraded_snapshot_rejects_untyped_and_diagnostic_fields(self):
+        value = {"network": "testnet", "last_poll": 1000, "chain": {"error": "private 192.0.2.17"},
+                 "rows": [{"name": "node-a", "health": "healthy", "height": 100,
+                           "block_hash": "a" * 64, "seconds_since_advanced": 30,
+                           "ancestor_hashes": {"10": "b" * 64, "host": "192.0.2.17"},
+                           "ssh": "192.0.2.17", "detail": "192.0.2.17"},
+                          {"name": "mac-os-cranelift", "health": "private 192.0.2.17",
+                           "height": "192.0.2.17", "block_hash": "192.0.2.17",
+                           "seconds_since_advanced": float("inf")},
+                          {"name": "192.0.2.17", "health": "healthy"}]}
+        result = status.monitoring_snapshot(value, {"node-a", "192.0.2.17"})
+        self.assertNotIn("192.0.2.17", json.dumps(result))
+        self.assertEqual(result["total"], 2)
+        self.assertEqual(result["rows"][0]["ancestor_hashes"], {"10": "b" * 64})
+        self.assertEqual(result["rows"][1]["health"], "down")
+        self.assertNotIn("height", result["rows"][1])
+        self.assertNotIn("seconds_since_advanced", result["rows"][1])
 
     def test_options_returns_204_for_allowed_origin(self):
         request = urllib.request.Request(
@@ -1260,6 +1560,478 @@ class HttpHandlerTests(unittest.TestCase):
 
         self.assertEqual(context.exception.code, 404)
         context.exception.close()
+
+
+# --------------------------------------------------------------------------- #
+# NU7 configured-network status
+# --------------------------------------------------------------------------- #
+
+NU7_SAMPLE = json.loads((Path(__file__).parent / "testdata" / "nu7-status-v1-sample.json")
+                        .read_text())
+NU7_ACTIVATION = 10
+NU7_BRANCH = "77190ad9"
+
+
+def nu7_node(name, **overrides):
+    values = dict(
+        name=name, ssh_string=f"root@{name}", probe_kind="zebra", service_name="zakurad",
+        bin_path="/usr/local/bin/zakurad", log_file="", rpc_listen_addr="",
+        rpc_auth="", rpc_config_path="", rpc_user="", rpc_password="",
+        process_pattern="", container_name="", node_id="",
+    )
+    values.update(overrides)
+    return status.Node(**values)
+
+
+def nu7_validators():
+    return [
+        nu7_node("fork-1", local=True, label="primary", rpc_listen_addr="127.0.0.1:18232",
+                 internal_miner=True),
+        nu7_node("fork-2", local=True, label="local observer",
+                 rpc_listen_addr="127.0.0.1:18242"),
+        nu7_node("us", status_url="http://203.0.113.1:8094/v1/miner", miner_id="us",
+                 region="San Francisco, US", internal_miner=True),
+        nu7_node("eu", status_url="http://203.0.113.2:8094/v1/miner", miner_id="eu",
+                 region="Amsterdam, NL", internal_miner=True),
+        nu7_node("ap", status_url="http://203.0.113.3:8094/v1/miner", miner_id="ap",
+                 region="Singapore, SG", internal_miner=True),
+    ]
+
+
+def chain_hash(number):
+    return f"{number:064x}"
+
+
+def nu7_row(name, height=12, *, block_hash=None, local=True, miner_active=True, **extra):
+    row = {
+        "name": name, "healthy": True, "rpc_ok": True, "active_state": "active",
+        "rpc_chain": "test",
+        "height": height, "block_hash": block_hash or chain_hash(height),
+        "ancestor_hashes": {"1": chain_hash(height - 1), "2": chain_hash(height - 2)},
+        "nu7": {"branch_id": NU7_BRANCH, "activation_height": NU7_ACTIVATION},
+        "peer_count": 5 if local else None, "peer_external": 4 if local else None,
+        "nsm_value_balance_zat": 125, "nsm_reissuance_known": False,
+        "nsm_reissuance_height": None,
+        "miner": None if local else {"active": miner_active, "accepted_blocks_24h": 3,
+                                     "observed_at": 1000.0},
+    }
+    row.update(extra)
+    return row
+
+
+def nu7_rows(**overrides):
+    rows = {name: nu7_row(name, local=name.startswith("fork"))
+            for name in ("fork-1", "fork-2", "us", "eu", "ap")}
+    rows.update(overrides)
+    return list(rows.values())
+
+
+class Nu7StatusTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.config = Path(self.temp.name) / "zakura.toml"
+        self.config.write_text(
+            "[network]\n"
+            'network = { network_name = "Nu7StagingV3", network_magic = [122, 107, 117, 57], '
+            "initial_nsm_value_balance = 55768414957, inherit_activation_heights = true, "
+            f"activation_heights = {{ NU7 = {NU7_ACTIVATION} }} }}\n"
+        )
+        self.view = status.Nu7Status(nu7_validators(), self.config)
+        self.rpc_calls = []
+        self.rpc_patch = mock.patch.object(self.view, "rpc", side_effect=self.fake_rpc)
+        self.rpc_patch.start()
+        self.addCleanup(self.rpc_patch.stop)
+
+    def fake_rpc(self, method, params=None):
+        self.rpc_calls.append((method, params))
+        if method == "getblockhash":
+            return chain_hash(params[0])
+        if method == "getblockheader":
+            number = int(params[0], 16)
+            return {"height": number, "hash": params[0], "time": 1000 + 30 * number,
+                    "difficulty": 3.0}
+        raise AssertionError(method)
+
+    def test_payload_keeps_the_schema_version_1_contract(self):
+        payload = self.view.build(nu7_rows(), 2000)
+
+        def keys(value):
+            return set(value) if isinstance(value, dict) else set()
+
+        self.assertEqual(payload["schemaVersion"], 1)
+        self.assertLessEqual(keys(NU7_SAMPLE), keys(payload))
+        for section in ("network", "chain", "nsm", "observation", "mining"):
+            self.assertLessEqual(keys(NU7_SAMPLE[section]), keys(payload[section]), section)
+        self.assertLessEqual(keys(NU7_SAMPLE["mining"]["remoteMiners"][0]),
+                             keys(payload["mining"]["remoteMiners"][0]))
+        self.assertLessEqual(keys(NU7_SAMPLE["nodes"][0]), keys(payload["nodes"][0]))
+        self.assertEqual(keys(NU7_SAMPLE["recentBlocks"][0]), keys(payload["recentBlocks"][0]))
+        # The fields the website parser requires, with the types it checks.
+        chain = payload["chain"]
+        self.assertTrue(re.fullmatch(r"[0-9a-f]{64}", chain["hash"]))
+        self.assertGreater(chain["height"], 0)
+        self.assertGreater(chain["blockTime"], 0)
+        self.assertGreater(chain["difficulty"], 0)
+        self.assertIsInstance(chain["intervalSampleBlocks"], int)
+        self.assertIsInstance(payload["observation"]["reorgs24h"], int)
+
+    def test_network_identity_and_nsm_balance(self):
+        payload = self.view.build(nu7_rows(), 2000)
+
+        self.assertEqual(payload["network"], {
+            "name": "Nu7StagingV3", "magic": "7a6b7539", "activationHeight": NU7_ACTIVATION,
+            "nsmSeedZat": 55768414957, "targetSpacingSeconds": 25, "daaWindowBlocks": 102,
+            "branchId": NU7_BRANCH, "reissuanceHeight": None, "reissuanceKnown": False,
+        })
+        self.assertEqual(payload["nsm"], {"balanceZat": 125, "available": True,
+                                          "seedZat": 55768414957})
+
+    def test_five_validators_agree_and_remote_miners_are_healthy(self):
+        payload = self.view.build(nu7_rows(), 2000)
+
+        self.assertEqual(payload["status"], "live")
+        self.assertTrue(payload["observation"]["validatorsAgree"])
+        self.assertEqual(payload["observation"]["validatorsAgreeing"], 5)
+        self.assertEqual(payload["observation"]["validatorsConfigured"], 5)
+        self.assertEqual([node["name"] for node in payload["nodes"]],
+                         ["primary", "local observer", "us", "eu", "ap"])
+        self.assertEqual(payload["mining"]["operatorMinersActive"], 4)
+        self.assertEqual(payload["mining"]["operatorMinersConfigured"], 4)
+        self.assertEqual([miner["id"] for miner in payload["mining"]["remoteMiners"]],
+                         ["us", "eu", "ap"])
+        self.assertTrue(all(m["healthy"] for m in payload["mining"]["remoteMiners"]))
+
+    def test_one_remote_validator_on_another_chain_degrades_the_network(self):
+        payload = self.view.build(nu7_rows(eu=nu7_row("eu", local=False,
+                                                      block_hash="f" * 64)), 2000)
+
+        self.assertEqual(payload["status"], "degraded")
+        self.assertTrue(payload["observation"]["localNodesAgree"])
+        self.assertFalse(payload["observation"]["validatorsAgree"])
+        self.assertEqual(payload["observation"]["validatorsAgreeing"], 4)
+        eu = next(m for m in payload["mining"]["remoteMiners"] if m["id"] == "eu")
+        self.assertFalse(eu["healthy"])
+        self.assertEqual(payload["mining"]["operatorMinersActive"], 3)
+
+    def test_lagging_and_leading_validators_are_compared_on_the_common_chain(self):
+        rows = nu7_rows(
+            us=nu7_row("us", 10, local=False),      # two behind, same chain
+            eu=nu7_row("eu", 13, local=False),      # one ahead, extends the tip
+            ap=nu7_row("ap", 9, local=False),       # three behind: too far
+        )
+        payload = self.view.build(rows, 2000)
+
+        lags = {m["id"]: (m["healthy"], m["lagBlocks"]) for m in payload["mining"]["remoteMiners"]}
+        self.assertEqual(lags, {"us": (True, 2), "eu": (True, -1), "ap": (False, 3)})
+
+    def test_an_inactive_remote_miner_is_not_counted(self):
+        payload = self.view.build(nu7_rows(ap=nu7_row("ap", local=False, miner_active=False)),
+                                  2000)
+
+        self.assertEqual(payload["status"], "live")
+        self.assertEqual(payload["mining"]["operatorMinersActive"], 3)
+
+    def test_a_stalled_chain_still_publishes_its_tip(self):
+        # Fleet health also needs recent progress; the public feed must not turn a
+        # stalled but reachable primary into an RPC outage.
+        rows = nu7_rows(**{name: nu7_row(name, local=name.startswith("fork"), healthy=False)
+                           for name in ("fork-1", "fork-2", "us", "eu", "ap")})
+        payload = self.view.build(rows, 9000)
+
+        self.assertEqual(payload["status"], "live")
+        self.assertEqual(payload["chain"]["height"], 12)
+        self.assertEqual(payload["chain"]["tipAgeSeconds"], 9000 - (1000 + 30 * 12))
+
+    def test_a_stopped_or_unreachable_primary_is_unavailable(self):
+        for broken in ({"active_state": "inactive"}, {"rpc_ok": False}):
+            rows = nu7_rows(**{"fork-1": nu7_row("fork-1", **broken)})
+            self.assertEqual(self.view.build(rows, 2000)["status"], "unavailable", broken)
+
+    def test_mismatched_activation_is_unavailable(self):
+        rows = nu7_rows()
+        rows[0]["nu7"] = {"branch_id": NU7_BRANCH, "activation_height": NU7_ACTIVATION + 1}
+        payload = self.view.build(rows, 2000)
+
+        self.assertEqual(payload["status"], "unavailable")
+        self.assertEqual(payload["error"], "Primary node RPC unavailable")
+        self.view.update(rows, 2000)
+        self.assertEqual(self.view.response(2000)[0], 503)
+
+    def test_interval_window_uses_300_intervals_and_caches_headers(self):
+        first = self.view.build(nu7_rows(**{"fork-1": nu7_row("fork-1", 400)}), 2000)
+        fetched = len(self.rpc_calls)
+        self.assertEqual(first["chain"]["intervalSampleBlocks"], 300)
+        self.assertEqual(first["chain"]["medianIntervalSeconds"], 30)
+        self.assertEqual(len(first["recentBlocks"]), 8)
+
+        self.rpc_calls.clear()
+        self.view.build(nu7_rows(**{"fork-1": nu7_row("fork-1", 401)}), 2010)
+        header_calls = [call for call in self.rpc_calls if call[0] == "getblockheader"]
+        self.assertEqual(len(header_calls), 1)
+        self.assertGreater(fetched, 600)
+
+    def test_interval_window_starts_at_nu7_activation(self):
+        payload = self.view.build(nu7_rows(), 2000)
+
+        self.assertEqual(payload["chain"]["intervalSampleBlocks"], 2)
+
+    def test_generation_boundary_counters_exclude_the_previous_network(self):
+        view = status.Nu7Status(nu7_validators(), self.config, generation_start=5000)
+        view.started_at = 3000
+        with mock.patch.object(view, "rpc", side_effect=self.fake_rpc):
+            view.build(nu7_rows(), 4000)
+            payload = view.build(nu7_rows(**{"fork-1": nu7_row("fork-1", 13)}), 4500)
+            self.assertEqual(payload["observation"]["blocks24h"], 0)
+            self.assertEqual(payload["observation"]["since"], 5000)
+            payload = view.build(nu7_rows(**{"fork-1": nu7_row("fork-1", 14)}), 5100)
+        self.assertEqual(payload["observation"]["blocks24h"], 1)
+
+    def test_a_lower_tip_is_a_reorg_that_drops_cached_headers(self):
+        self.view.build(nu7_rows(**{"fork-1": nu7_row("fork-1", 12)}), 2000)
+        payload = self.view.build(nu7_rows(**{"fork-1": nu7_row("fork-1", 11)}), 2010)
+
+        self.assertEqual(payload["observation"]["reorgs24h"], 1)
+
+    def test_failures_are_logged_and_the_public_payload_stays_generic(self):
+        self.rpc_patch.stop()
+        with mock.patch.object(self.view, "rpc", side_effect=OSError("private host 10.0.0.1")), \
+                self.assertLogs(level="ERROR") as logs:
+            self.view.update(nu7_rows(), time.time())
+        self.rpc_patch.start()
+        code, payload = self.view.response()
+        self.assertEqual(code, 503)
+        self.assertNotIn("10.0.0.1", json.dumps(payload))
+        self.assertIn("10.0.0.1", "\n".join(logs.output))
+
+    def test_stale_observations_are_unavailable(self):
+        self.view.update(nu7_rows(), 1000)
+
+        self.assertEqual(self.view.response(1000)[0], 200)
+        self.assertEqual(self.view.response(1000 + status.PUBLIC_STATUS_MAX_AGE + 1)[0], 503)
+
+    def test_the_primary_must_be_local_with_rpc(self):
+        nodes = nu7_validators()
+        nodes[0].local = False
+        with self.assertRaises(SystemExit):
+            status.Nu7Status(nodes, self.config)
+
+
+class Nu7SourceTests(unittest.TestCase):
+    REPORT = {"observedAt": 1000.0, "minerActive": True, "nodeActive": True,
+              "acceptedBlocks24h": 7, "nodeHealthy": True, "height": 12,
+              "hash": chain_hash(12), "branchId": NU7_BRANCH, "activationHeight": 10,
+              "recentHashes": {"10": chain_hash(10), "11": chain_hash(11), "12": chain_hash(12)}}
+
+    def test_public_and_obsolete_network_configs_are_rejected(self):
+        parameters = ('network_name = "Nu7StagingV3", network_magic = [122, 107, 117, 57], '
+                      'initial_nsm_value_balance = 55768414957, activation_heights = { NU7 = 10 }')
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "zakura.toml"
+            for extra in ("", f"testnet_parameters = {{ {parameters} }}\n"):
+                with self.subTest(obsolete=bool(extra)):
+                    path.write_text('[network]\nnetwork = "Testnet"\n' + extra)
+                    with self.assertRaisesRegex(ValueError, "explicit network parameter table"):
+                        status.nu7_network_parameters(path)
+
+    def test_a_remote_report_becomes_probe_fields(self):
+        probe = status.status_report_probe(self.REPORT, 1010)
+
+        self.assertEqual(probe["height"], 12)
+        self.assertEqual(probe["active_state"], "active")
+        self.assertEqual(probe["ancestor_hashes"], {"1": chain_hash(11), "2": chain_hash(10)})
+        self.assertEqual(probe["nu7"], {"branch_id": NU7_BRANCH, "activation_height": 10})
+        self.assertEqual(probe["miner"]["accepted_blocks_24h"], 7)
+
+    def test_stale_or_malformed_reports_are_errors(self):
+        self.assertIn("error", status.status_report_probe(self.REPORT, 1000 + 91))
+        for key, value in (("height", "12"), ("height", -1), ("hash", "x"),
+                           ("recentHashes", [])):
+            with self.subTest(key=key):
+                self.assertIn("error", status.status_report_probe({**self.REPORT, key: value},
+                                                                  1010))
+        self.assertIn("error", status.status_report_probe("not an object", 1010))
+
+    def test_a_node_without_rpc_reports_its_service_state_only(self):
+        probe = status.status_report_probe({**self.REPORT, "nodeHealthy": False}, 1010)
+
+        self.assertIn("rpc_error", probe)
+        self.assertNotIn("height", probe)
+
+    def test_monitor_tables_select_local_and_status_endpoint_sources(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "nodes.toml"
+            path.write_text(
+                "[defaults]\ninternal_miner = false\n"
+                'testnet_parameters = { network_name = "Nu7StagingV3" }\n'
+                '[[nodes]]\nname = "fork-1"\nssh_string = "root@primary"\ncommit = "main"\n'
+                "internal_miner = true\n"
+                'monitor = { local = true, label = "primary" }\n'
+                '[[nodes]]\nname = "eu"\nssh_string = "root@203.0.113.2"\ncommit = "main"\n'
+                'monitor = { status_url = "http://203.0.113.2:8094/v1/miner", id = "eu", '
+                'region = "Amsterdam, NL" }\n'
+            )
+            primary, remote = status.load_nodes(path)
+            path.write_text(path.read_text().replace(
+                'monitor = { local = true, label = "primary" }',
+                'monitor = { local = true, status_url = "http://x/v1/miner" }'))
+            with self.assertRaises(SystemExit):
+                status.load_nodes(path)
+
+        self.assertTrue(primary.local and primary.internal_miner)
+        self.assertEqual(primary.ssh_cmd("bash", "-s"), ["bash", "-s"])
+        self.assertEqual(remote.status_url, "http://203.0.113.2:8094/v1/miner")
+        self.assertEqual((remote.miner_id, remote.region), ("eu", "Amsterdam, NL"))
+        with mock.patch.object(status, "probe_status_endpoint", return_value={"ok": 1}) as probe:
+            self.assertEqual(status.probe_node(remote), {"ok": 1})
+        probe.assert_called_once_with(remote)
+
+    def test_the_probe_reports_nu7_nsm_and_external_peers(self):
+        probe = RemoteProbeTests("run_probe")
+        probe.setUp()
+        self.addCleanup(probe.tearDown)
+        probe.rpc_results = {
+            "getblockchaininfo": {
+                "blocks": 12, "bestblockhash": chain_hash(12), "chain": "test",
+                "nsmValueBalanceZat": 125,
+                "upgrades": {NU7_BRANCH: {"name": "NU7", "activationheight": 10}},
+            },
+            "getpeerinfo": [{"addr": "127.0.0.1:18333"}, {"addr": "203.0.113.1:18233"},
+                            {"addr": "[2001:db8::1]:18233"}],
+        }
+        out = probe.run_probe(rpc_url=f"http://{probe.endpoint}/")
+
+        self.assertEqual(out["nu7"], {"branch_id": NU7_BRANCH, "activation_height": 10})
+        self.assertEqual(out["nsm_value_balance_zat"], 125)
+        self.assertNotIn("nsm_reissuance_height", out)
+        self.assertEqual(out["peer_count"], 3)
+        self.assertEqual(out["peer_external"], 2)
+
+
+class Nu7HttpTests(unittest.TestCase):
+    def setUp(self):
+        self.original_collector = status.COLLECTOR
+        self.original_limiter = status.RATE_LIMITER
+        status.RATE_LIMITER = status.RateLimiter(limit=100, window=60)
+        self.server = status.ThreadingHTTPServer(("127.0.0.1", 0), status.Handler)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.base_url = f"http://127.0.0.1:{self.server.server_port}"
+        self.addCleanup(self.restore)
+
+    def restore(self):
+        self.server.shutdown()
+        self.server.server_close()
+        status.COLLECTOR = self.original_collector
+        status.RATE_LIMITER = self.original_limiter
+
+    def use(self, nu7):
+        status.COLLECTOR = collector()
+        status.COLLECTOR.nu7 = nu7
+
+    def get(self, path, origin="https://zakura.com"):
+        request = urllib.request.Request(self.base_url + path, headers={"Origin": origin})
+        try:
+            with urllib.request.urlopen(request) as response:
+                return response.status, response.headers, json.load(response)
+        except urllib.error.HTTPError as error:
+            body = error.read()
+            try:
+                return error.code, error.headers, json.loads(body)
+            except ValueError:
+                return error.code, error.headers, body
+
+    def test_status_is_served_with_the_zakura_cors_allowlist(self):
+        view = mock.Mock()
+        view.response.return_value = (200, {"schemaVersion": 1, "status": "live"})
+        self.use(view)
+
+        code, headers, payload = self.get("/v1/status")
+        self.assertEqual((code, payload["status"]), (200, "live"))
+        self.assertEqual(headers["Access-Control-Allow-Origin"], "https://zakura.com")
+        self.assertEqual(headers["Access-Control-Allow-Headers"], "Content-Type")
+        self.assertEqual(headers["Cache-Control"], "public, max-age=10")
+        self.assertIsNone(self.get("/v1/status", "https://untrusted.example")[1]
+                          ["Access-Control-Allow-Origin"])
+
+    def test_unavailable_status_is_503_and_not_cached(self):
+        view = mock.Mock()
+        view.response.return_value = (503, {"schemaVersion": 1, "status": "unavailable"})
+        self.use(view)
+
+        code, headers, _ = self.get("/v1/status")
+        self.assertEqual(code, 503)
+        self.assertEqual(headers["Cache-Control"], "no-store")
+        self.assertEqual(headers["Access-Control-Allow-Origin"], "https://zakura.com")
+
+    def test_status_route_is_absent_without_the_nu7_view(self):
+        self.use(None)
+
+        self.assertEqual(self.get("/v1/status")[0], 404)
+
+
+
+class BoundedServerTests(unittest.TestCase):
+    def serve(self, handler, max_concurrent):
+        server = status.BoundedHTTPServer(("127.0.0.1", 0), handler, max_concurrent=max_concurrent)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        return server
+
+    def test_concurrent_requests_are_capped(self):
+        release, lock = threading.Event(), threading.Lock()
+        state = {"active": 0, "peak": 0}
+
+        class Slow(BaseHTTPRequestHandler):
+            def do_GET(self):
+                with lock:
+                    state["active"] += 1
+                    state["peak"] = max(state["peak"], state["active"])
+                release.wait(5)
+                with lock:
+                    state["active"] -= 1
+                self.send_response(204)
+                self.end_headers()
+
+            def log_message(self, *args):
+                pass
+
+        server = self.serve(Slow, 2)
+
+        def request():
+            with socket.create_connection(server.server_address, timeout=10) as conn:
+                conn.sendall(b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+                conn.recv(64)
+
+        threads = [threading.Thread(target=request) for _ in range(6)]
+        for thread in threads:
+            thread.start()
+        time.sleep(0.5)
+        release.set()
+        for thread in threads:
+            thread.join(10)
+        self.assertEqual(state["peak"], 2)
+
+    def test_a_stalled_client_frees_its_slot_after_the_timeout(self):
+        quick = type("Quick", (status.Handler,), {"timeout": 0.3})
+        server = self.serve(quick, 1)
+        original = status.COLLECTOR
+        status.COLLECTOR = collector()
+        self.addCleanup(setattr, status, "COLLECTOR", original)
+
+        with socket.create_connection(server.server_address, timeout=5) as stalled:
+            stalled.sendall(b"GET /healthz HTTP/1.1\r\n")  # never finishes its headers
+            started = time.monotonic()
+            with urllib.request.urlopen(
+                    f"http://127.0.0.1:{server.server_port}/healthz", timeout=5) as response:
+                self.assertEqual(response.status, 200)
+            # The only slot was held until the stalled client timed out.
+            self.assertGreaterEqual(time.monotonic() - started, 0.25)
+
+    def test_the_entry_point_uses_the_bounded_server_and_timeout(self):
+        self.assertEqual(status.Handler.timeout, status.REQUEST_TIMEOUT_SECONDS)
+        self.assertIn("BoundedHTTPServer((args.host, args.port), Handler)",
+                      SCRIPT_PATH.read_text())
 
 
 if __name__ == "__main__":

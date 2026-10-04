@@ -281,6 +281,24 @@ impl RouterError {
         }
     }
 
+    /// See [`zs::ValidateContextError::is_auth_commitment_mismatch`].
+    pub fn is_auth_commitment_mismatch(&self) -> bool {
+        match self {
+            RouterError::Checkpoint { source, .. } => source.is_auth_commitment_mismatch(),
+            RouterError::Block { source, .. } => source.is_auth_commitment_mismatch(),
+        }
+    }
+
+    /// See [`zs::ValidateContextError::is_descendant_of_auth_commitment_mismatch`].
+    pub fn is_descendant_of_auth_commitment_mismatch(&self) -> bool {
+        match self {
+            RouterError::Checkpoint { source, .. } => {
+                source.is_descendant_of_auth_commitment_mismatch()
+            }
+            RouterError::Block { source, .. } => source.is_descendant_of_auth_commitment_mismatch(),
+        }
+    }
+
     /// Returns the state location for duplicate commit requests.
     pub fn duplicate_location(&self) -> Option<&zs::KnownBlock> {
         match self {
@@ -551,7 +569,13 @@ where
     );
 
     let block = SemanticBlockVerifier::new(network, state_service.clone(), transaction.clone());
-    let checkpoint = CheckpointVerifier::from_checkpoint_list(list, network, tip, state_service);
+    let checkpoint = CheckpointVerifier::from_checkpoint_list(
+        list,
+        network,
+        tip,
+        max_checkpoint_height,
+        state_service,
+    );
     let router = BlockVerifierRouter {
         checkpoint,
         max_checkpoint_height,

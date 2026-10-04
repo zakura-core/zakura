@@ -17,7 +17,7 @@ on:
   # - block-sync fuzz must run after every merge to `main`, even when
   #   the merged PR did not touch an obviously Zakura-specific path.
   pull_request:
-    branches: [main, "feat/**", "release/**"]
+    branches: [main, "feat/**", "split/**", "release/**"]
     types: [opened, synchronize, reopened, labeled, unlabeled]
 
   push:
@@ -208,7 +208,7 @@ jobs:
           cache-shared-key: zakura-drb-debug
           cache-on-failure: true
           cache-save-if: false
-      - uses: taiki-e/install-action@c3ec0de9ae7f1019cea21aa96aa0a895b9552063 #v2.87.9
+      - uses: taiki-e/install-action@7623a79cdfecb99d681017af368ca353d9f49bb5 #v2.87.19
         with:
           tool: cargo-nextest
       - uses: ./.github/actions/setup-zakura-build
@@ -250,7 +250,7 @@ jobs:
           cache-shared-key: zakura-drb-debug
           cache-on-failure: true
           cache-save-if: false
-      - uses: taiki-e/install-action@c3ec0de9ae7f1019cea21aa96aa0a895b9552063 #v2.87.9
+      - uses: taiki-e/install-action@7623a79cdfecb99d681017af368ca353d9f49bb5 #v2.87.19
         with:
           tool: cargo-nextest
       - uses: ./.github/actions/setup-zakura-build

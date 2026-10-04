@@ -27,7 +27,8 @@ pub struct HeaderContextFact {
 pub struct ValidationLease {
     /// Exact known parent.
     pub(crate) parent: Frontier,
-    /// Up to 28 facts in reverse height order, beginning with `parent`.
+    /// Up to [`crate::MAX_POW_ADJUSTMENT_BLOCK_SPAN`] facts in reverse height
+    /// order, beginning with `parent`.
     pub(crate) predecessors: Vec<HeaderContextFact>,
     /// Exact network policy used by the issuing engine.
     pub(crate) network: zakura_chain::parameters::Network,
@@ -98,7 +99,7 @@ impl ValidationLease {
         let required = usize::try_from(self.parent.height.0)
             .ok()
             .and_then(|height| height.checked_add(1))
-            .map(|height| height.min(crate::POW_ADJUSTMENT_BLOCK_SPAN));
+            .map(|height| height.min(crate::MAX_POW_ADJUSTMENT_BLOCK_SPAN));
         if self.network != *network
             || self.trust_anchor_digest != trust_anchor_digest
             || required != Some(self.predecessors.len())
@@ -360,7 +361,7 @@ mod tests {
         let required = usize::try_from(height)
             .expect("the fixture height fits in memory")
             .saturating_add(1)
-            .min(crate::POW_ADJUSTMENT_BLOCK_SPAN);
+            .min(crate::MAX_POW_ADJUSTMENT_BLOCK_SPAN);
         ValidationLease::new(
             parent,
             facts.into_iter().rev().take(required).collect(),
@@ -372,7 +373,16 @@ mod tests {
     #[test]
     fn validation_lease_coherence_enforces_context_boundaries() {
         let network = Network::new_regtest(RegtestParameters::default());
-        for (height, expected_len) in [(0, 1), (27, 28), (28, 28), (40, 28)] {
+        // A lease retains every predecessor below the difficulty adjustment
+        // span, and caps at the span above it.
+        let span = crate::MAX_POW_ADJUSTMENT_BLOCK_SPAN;
+        let span_height = u32::try_from(span).expect("the difficulty adjustment span fits in u32");
+        for (height, expected_len) in [
+            (0, 1),
+            (span_height - 1, span),
+            (span_height, span),
+            (span_height + 12, span),
+        ] {
             let lease = lease_at(height);
             assert_eq!(lease.predecessors.len(), expected_len, "height {height}");
             assert!(

@@ -217,7 +217,7 @@ pub enum Response {
         /// will be checked during contextual validation.
         tx_id: UnminedTxId,
 
-        /// The miner fee for this transaction.
+        /// The full transaction fee before the block's aggregate NSM fee split.
         ///
         /// `None` for coinbase transactions.
         ///
@@ -379,7 +379,7 @@ impl Response {
         }
     }
 
-    /// The miner fee for the transaction in this response.
+    /// The full transaction fee before the block's aggregate NSM fee split.
     ///
     /// Coinbase transactions do not have a miner fee,
     /// and they don't need UTXOs to calculate their value balance,
@@ -1026,16 +1026,12 @@ where
         //
         // https://zips.z.cash/zip-2003
         //
-        // The `nu7` feature gates this rule until NU7 has activation heights,
-        // so default builds accept V4 at NU7.
-        //
         // `activation_height` falls back to the next upgrade's height when this
         // network omits NU7. The only later upgrade is `ZFuture`, which exists
         // only under `cfg(zcash_unstable = "zfuture")`.
-        if cfg!(feature = "nu7")
-            && NetworkUpgrade::Nu7
-                .activation_height(network)
-                .is_some_and(|nu7_height| height >= nu7_height)
+        if NetworkUpgrade::Nu7
+            .activation_height(network)
+            .is_some_and(|nu7_height| height >= nu7_height)
         {
             return Err(TransactionError::UnsupportedByNetworkUpgrade(
                 transaction.version(),

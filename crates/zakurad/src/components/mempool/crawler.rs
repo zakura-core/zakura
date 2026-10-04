@@ -79,6 +79,11 @@ const FANOUT: usize = 3;
 /// This should be less than the target block interval,
 /// so that we crawl peer mempools at least once per block.
 ///
+/// After ZIP 218 shortens the target block interval to 25 seconds at NU7,
+/// we crawl about once every 3 blocks. This delay can't drop below 25 seconds,
+/// because it must stay above the 61 second peer address crawl interval.
+/// Transaction gossip still reaches the mempool between crawls.
+///
 /// Using a prime number makes sure that mempool crawler fanouts
 /// don't synchronise with other crawls.
 pub const RATE_LIMIT_DELAY: Duration = Duration::from_secs(73);

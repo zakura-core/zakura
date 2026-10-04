@@ -8,8 +8,7 @@ use std::{
 use thiserror::Error;
 
 use super::{
-    Frame, Peer, Service, SessionDemand, SessionPolicy, SinkReject, Stream, StreamMode,
-    StreamWritePolicy,
+    Frame, LayoutError, Peer, Service, SessionDemand, SessionPolicy, SinkReject, Stream, StreamMode,
 };
 use crate::zakura::{ServicePeerDirection, ZakuraConnId, ZakuraPeerId};
 
@@ -23,6 +22,14 @@ pub enum RegistryError {
         service: &'static str,
         /// Stream with an inconsistent session declaration.
         kind: u16,
+    },
+    /// A service declared a layout whose message tables break a rule.
+    #[error("service {service} declared invalid message tables: {error}")]
+    InvalidMessageTable {
+        /// Service declaring the layout.
+        service: &'static str,
+        /// The broken rule.
+        error: LayoutError,
     },
     /// Two services declared the same stream kind.
     #[error(
@@ -145,12 +152,20 @@ impl ServiceRegistry {
             }
 
             let mut layouts: HashMap<u64, Vec<Stream>> = HashMap::new();
-            for stream in service
-                .streams()
-                .iter()
-                .filter(|s| s.mode == StreamMode::Persistent)
-            {
-                layouts.entry(stream.capability).or_default().push(*stream);
+            for stream in service.streams() {
+                match stream.mode {
+                    StreamMode::Persistent => {
+                        layouts.entry(stream.capability).or_default().push(*stream);
+                    }
+                    StreamMode::RequestResponse => {
+                        Stream::check_layout(&[*stream]).map_err(|error| {
+                            RegistryError::InvalidMessageTable {
+                                service: service.name(),
+                                error,
+                            }
+                        })?
+                    }
+                }
             }
             let mut primary_kind = None;
             for mut streams in layouts.into_values() {
@@ -166,6 +181,12 @@ impl ServiceRegistry {
                         kind: primary.kind,
                     });
                 }
+                Stream::check_layout(&streams).map_err(|error| {
+                    RegistryError::InvalidMessageTable {
+                        service: service.name(),
+                        error,
+                    }
+                })?;
                 primary_kind = Some(primary.kind);
                 let layout = SessionLayout {
                     streams: streams.into(),
@@ -199,22 +220,6 @@ impl ServiceRegistry {
         self.by_kind
             .get(&kind)
             .map(|index| Arc::clone(&self.services[*index]))
-    }
-
-    /// Local message limits supplied by the service that owns this stream.
-    pub(crate) fn message_payload_limits(&self, stream: Stream) -> &'static [(u16, usize)] {
-        self.service_for_kind(stream.kind)
-            .map(|service| service.message_payload_limits(stream))
-            .unwrap_or(&[])
-    }
-
-    pub(crate) fn stream_queue_depths(&self, stream: Stream) -> Option<(usize, usize)> {
-        self.service_for_kind(stream.kind)?
-            .stream_queue_depths(stream)
-    }
-
-    pub(crate) fn message_types(&self, stream: Stream) -> Option<&'static [u16]> {
-        self.service_for_kind(stream.kind)?.message_types(stream)
     }
 
     /// Lookup the declared stream for `kind`.
@@ -297,12 +302,6 @@ impl ServiceRegistry {
             .get(&(stream.kind, stream.version))
             .filter(|layout| layout.streams.contains(&stream))
             .cloned()
-    }
-
-    pub(crate) fn stream_write_policy(&self, stream: Stream) -> StreamWritePolicy {
-        self.service_for_kind(stream.kind)
-            .expect("a registered stream has an owning service")
-            .stream_write_policy(stream)
     }
 
     fn selected_session_streams(&self, service: &dyn Service, negotiated: u64) -> Vec<Stream> {
@@ -711,7 +710,7 @@ mod tests {
             version: 1,
             frame_cap: 1024,
             capability,
-            mode: StreamMode::Persistent,
+            ..Stream::PERSISTENT
         }
     }
 
@@ -764,6 +763,62 @@ mod tests {
         assert_eq!(registry.persistent_streams_for_negotiated(3), older);
         // Per-kind selection would incorrectly choose stream 7 version 4.
         assert_eq!(registry.persistent_streams_for_negotiated(7), newer);
+    }
+
+    #[test]
+    fn registration_rejects_layouts_whose_message_tables_break_a_rule() {
+        use crate::zakura::{LayoutError, MessageRole, MessageRule, PayloadLen};
+
+        const REQUEST: MessageRule = MessageRule {
+            message_type: 2,
+            payload: PayloadLen::exact(8),
+            role: MessageRole::Request {
+                max_in_flight: 1,
+                cadence: None,
+            },
+        };
+        const ENDING: MessageRule = MessageRule {
+            message_type: 3,
+            payload: PayloadLen::exact(8),
+            role: MessageRole::Response {
+                request: REQUEST.message_type,
+                ends_exchange: true,
+            },
+        };
+        let data = Stream {
+            messages: Some(&[ENDING]),
+            ..versioned_stream(6, 1, 1)
+        };
+        let requests = Stream {
+            messages: Some(&[REQUEST]),
+            ..versioned_stream(7, 1, 1)
+        };
+
+        // The pair is valid only as a whole: the ending's request sits on the
+        // request stream.
+        ServiceRegistry::new(vec![TestService::new("pair", vec![data, requests])])
+            .expect("a complete pair registers");
+        for (streams, expected) in [
+            (
+                vec![data],
+                LayoutError::ResponseWithoutRequest { message_type: 3 },
+            ),
+            (
+                vec![Stream {
+                    mode: StreamMode::RequestResponse,
+                    ..requests
+                }],
+                LayoutError::RequestWithoutEnding { message_type: 2 },
+            ),
+        ] {
+            assert!(matches!(
+                ServiceRegistry::new(vec![TestService::new("invalid", streams)]),
+                Err(RegistryError::InvalidMessageTable {
+                    service: "invalid",
+                    error,
+                }) if error == expected
+            ));
+        }
     }
 
     #[test]

@@ -11,35 +11,26 @@
 
 use std::io::{self, Read};
 
-use super::{SerializationError, TrustedPreallocate, ZcashDecoder, ZcashDeserialize};
+use super::{SerializationError, TrustedPreallocate, ZcashDeserialize};
 
 /// Input for a decoder, with the number of bytes still available when known.
 ///
 /// [`Self::from_slice`] starts with bytes already in memory. Reading nested
-/// values or applying a smaller read limit preserves the remaining byte count
-/// and network rules. Use [`ZcashDecoder::reader`] at a live message boundary to
-/// select the node's rules once, without passing a network to each nested call.
+/// values or applying a smaller read limit preserves the remaining byte count.
 #[derive(Debug)]
 pub struct ZcashReader<R> {
     inner: R,
     remaining: Option<usize>,
-    decoder: ZcashDecoder,
 }
 
 impl<'a, 'b> ZcashReader<&'a mut &'b [u8]> {
     /// Read from bytes already in memory and track how many remain.
-    /// The supplied slice advances past each byte consumed. Accepts encodings
-    /// from any network. Use [`ZcashDecoder::reader`] for a configured network.
+    /// The supplied slice advances past each byte consumed.
     pub fn from_slice(bytes: &'a mut &'b [u8]) -> Self {
-        Self::with_decoder(bytes, ZcashDecoder::any_network())
-    }
-
-    pub(super) fn with_decoder(bytes: &'a mut &'b [u8], decoder: ZcashDecoder) -> Self {
         let remaining = Some(bytes.len());
         Self {
             inner: bytes,
             remaining,
-            decoder,
         }
     }
 }
@@ -49,13 +40,7 @@ impl<R: Read> ZcashReader<R> {
         Self {
             inner,
             remaining: None,
-            decoder: ZcashDecoder::any_network(),
         }
-    }
-
-    /// Rules inherited from the decoder that started this payload.
-    pub fn decoder(&self) -> ZcashDecoder {
-        self.decoder
     }
 
     /// Number of bytes still available, or `None` if the input length is unknown.
@@ -74,20 +59,17 @@ impl<R: Read> ZcashReader<R> {
     }
 
     /// Give a nested decoder permission to read at most `limit` bytes.
-    /// It inherits this reader's network rules. Bytes consumed by that decoder
-    /// also advance this reader.
+    /// Bytes consumed by that decoder also advance this reader.
     ///
     /// If 40 bytes remain and the limit is 100, only 40 bytes are available.
     /// If the stream length is unknown, the limit does not prove any bytes exist.
     pub fn with_limit(&mut self, limit: u64) -> ZcashReader<io::Take<&mut Self>> {
-        let decoder = self.decoder;
         let remaining = self
             .remaining
             .map(|remaining| remaining.min(usize::try_from(limit).unwrap_or(usize::MAX)));
         ZcashReader {
             inner: Read::take(self, limit),
             remaining,
-            decoder,
         }
     }
 

@@ -4,8 +4,7 @@ use std::io::Read as _;
 use std::{io, net::Ipv6Addr, sync::Arc};
 
 use super::{
-    AtLeastOne, CompactSizeMessage, SerializationError, ZcashDecoder, ZcashReader,
-    MAX_PROTOCOL_MESSAGE_LEN,
+    AtLeastOne, CompactSizeMessage, SerializationError, ZcashReader, MAX_PROTOCOL_MESSAGE_LEN,
 };
 
 /// Initial-allocation cap for `zcash_deserialize_external_count`.
@@ -33,8 +32,6 @@ pub trait ZcashDeserialize: Sized {
 
     /// Decode from bytes already in memory, checking that collection counts can
     /// fit before reserving memory. Leaves the slice pointing to the unread bytes.
-    /// Accepts encodings from any network. Use [`ZcashDecoder::decode`] for live
-    /// messages so their counts and formats follow the configured network.
     fn zcash_deserialize_from_slice(bytes: &mut &[u8]) -> Result<Self, SerializationError> {
         Self::zcash_deserialize_from(&mut ZcashReader::from_slice(bytes))
     }
@@ -43,7 +40,7 @@ pub trait ZcashDeserialize: Sized {
     ///
     /// Implementations must use the reader's `read_value`, `read_external_count`,
     /// and `read_bytes` methods for nested data, so those decoders keep the same
-    /// network rules and check counts before allocating. The default rejects
+    /// remaining byte count and check counts before allocating. The default rejects
     /// types that only implement the older streaming method.
     fn zcash_deserialize_from<R: io::Read>(
         _reader: &mut ZcashReader<R>,
@@ -141,7 +138,7 @@ pub(super) fn read_external_count<R: io::Read, T: ZcashDeserialize + TrustedPrea
     }
     // Reject a count the known input cannot hold, before allocating anything.
     if let Some(remaining) = reader.remaining_bytes() {
-        let minimum = T::min_serialized_size_for(reader.decoder());
+        let minimum = T::min_serialized_size();
         if external_count != 0
             && (minimum == 0
                 || u64::try_from(external_count).unwrap_or(u64::MAX)
@@ -304,13 +301,6 @@ pub trait TrustedPreallocate {
     fn min_serialized_size() -> u64 {
         0
     }
-
-    /// Minimum bytes under this decoder's rules. Types whose encoding does not
-    /// vary by network keep the default. An override must use the same rules
-    /// as its decoder, so every accepted encoding still fits this minimum.
-    fn min_serialized_size_for(_decoder: ZcashDecoder) -> u64 {
-        Self::min_serialized_size()
-    }
 }
 
 impl<T> TrustedPreallocate for Arc<T>
@@ -323,10 +313,6 @@ where
 
     fn min_serialized_size() -> u64 {
         T::min_serialized_size()
-    }
-
-    fn min_serialized_size_for(decoder: ZcashDecoder) -> u64 {
-        T::min_serialized_size_for(decoder)
     }
 }
 

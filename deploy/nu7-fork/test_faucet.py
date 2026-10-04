@@ -1,0 +1,261 @@
+"""Tests for public claim allocation, without a node or a real key."""
+
+import http.client
+import io
+import json
+import socket
+import threading
+import tempfile
+import time
+import unittest
+from http.server import BaseHTTPRequestHandler
+from pathlib import Path
+from unittest.mock import patch
+
+import faucet
+from faucet import Faucet, PAYOUT_ZAT
+
+
+def max_concurrent_handlers(server_class, limit: int, clients: int) -> int:
+    """Serve `clients` parallel requests through `server_class` and count the peak."""
+    release = threading.Event()
+    lock = threading.Lock()
+    active = peak = 0
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            nonlocal active, peak
+            with lock:
+                active += 1
+                peak = max(peak, active)
+            release.wait(5)
+            with lock:
+                active -= 1
+            self.send_response(204)
+            self.end_headers()
+
+        def log_message(self, *args):
+            pass
+
+    server = server_class(("127.0.0.1", 0), Handler, max_concurrent=limit)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+
+    def request():
+        with socket.create_connection(server.server_address, timeout=10) as conn:
+            conn.sendall(b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+            conn.recv(64)
+
+    threads = [threading.Thread(target=request) for _ in range(clients)]
+    for thread in threads:
+        thread.start()
+    time.sleep(0.5)
+    release.set()
+    for thread in threads:
+        thread.join(10)
+    server.shutdown()
+    server.server_close()
+    return peak
+
+
+class FaucetClaimsTest(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.faucet = Faucet(
+            Path(self.temporary.name) / "claims.sqlite3", 18232, "tmFaucet", Path("sender"), Path("config")
+        )
+        self.address = "utest1" + "a" * 100
+        self.patches = [
+            patch.object(self.faucet, "validate_address"),
+            patch.object(self.faucet, "funding_status", return_value={"ready": True, "maturedOutputs": 5}),
+            patch("faucet.MIN_CLAIM_SPACING_SECONDS", 0),
+        ]
+        for item in self.patches:
+            item.start()
+            self.addCleanup(item.stop)
+
+    def test_one_claim_per_address_and_two_per_ip(self):
+        claim = self.faucet.reserve(self.address, "192.0.2.1")
+        self.assertEqual(self.faucet.claim(claim)["status"], "queued")
+        with self.assertRaisesRegex(PermissionError, "address"):
+            self.faucet.reserve(self.address, "192.0.2.2")
+        self.faucet.reserve(self.address + "b", "192.0.2.1")
+        with self.assertRaisesRegex(PermissionError, "connection"):
+            self.faucet.reserve(self.address + "c", "192.0.2.1")
+
+    def test_daily_cap_counts_reserved_claims(self):
+        with patch("faucet.IP_CLAIMS_PER_DAY", 1000), patch("faucet.MAX_QUEUE", 1000):
+            for index in range(100):
+                self.faucet.reserve(f"{self.address}{index}", f"192.0.2.{index + 1}")
+            with self.assertRaisesRegex(PermissionError, "allocation"):
+                self.faucet.reserve(self.address + "extra", "198.51.100.1")
+        self.assertEqual(PAYOUT_ZAT * 100, 1_000_000_000)
+
+    def test_processing_claim_requires_review_after_restart(self):
+        claim = self.faucet.reserve(self.address, "192.0.2.1")
+        with self.faucet.connect() as connection:
+            connection.execute("UPDATE claims SET status = 'processing' WHERE id = ?", (claim,))
+        restarted = Faucet(self.faucet.db, 18232, "tmFaucet", Path("sender"), Path("config"))
+        self.assertEqual(restarted.claim(claim)["status"], "review")
+
+    def test_invalid_requests_are_throttled_before_rpc_validation(self):
+        with patch.object(self.faucet, "validate_address", side_effect=ValueError("invalid")) as validate:
+            for _ in range(10):
+                with self.assertRaisesRegex(ValueError, "invalid"):
+                    self.faucet.reserve("bad", "192.0.2.1")
+            with self.assertRaisesRegex(PermissionError, "Too many"):
+                self.faucet.reserve("bad", "192.0.2.1")
+            self.assertEqual(validate.call_count, 10)
+
+
+class FaucetCorsTest(unittest.TestCase):
+    def setUp(self):
+        from unittest.mock import Mock
+        self.fake = Mock()
+        self.fake.status.return_value = {"ready": True}
+        self.fake.reserve.return_value = "a" * 24
+        self.fake.claim.return_value = {"status": "sent", "txid": "b" * 64}
+        handler = type("TestHandler", (faucet.Handler,), {"faucet": self.fake,
+                       "log_message": lambda *args: None})
+        self.server = faucet.BoundedHTTPServer(("127.0.0.1", 0), handler)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.addCleanup(self.close)
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+
+    def request(self, method, path, origin=None, body=None):
+        headers = {"Content-Type": "application/json"}
+        if origin is not None:
+            headers["Origin"] = origin
+        connection = http.client.HTTPConnection(*self.server.server_address, timeout=3)
+        try:
+            connection.request(method, path, body, headers)
+            response = connection.getresponse()
+            return response.status, dict(response.getheaders()), response.read()
+        finally:
+            connection.close()
+
+    def test_both_sites_can_preflight_submit_and_read_receipts(self):
+        for origin in faucet.ALLOWED_ORIGINS:
+            for method, path, body, expected in [
+                ("OPTIONS", "/v1/faucet/claim", None, 204),
+                ("GET", "/v1/faucet/status", None, 200),
+                ("POST", "/v1/faucet/claim", json.dumps({"address": "utest1" + "a" * 100}), 202),
+                ("GET", "/v1/faucet/claim/" + "a" * 24, None, 200),
+            ]:
+                with self.subTest(origin=origin, method=method):
+                    status, headers, _ = self.request(method, path, origin, body)
+                    self.assertEqual(status, expected)
+                    self.assertEqual(headers["Access-Control-Allow-Origin"], origin)
+                    self.assertEqual(headers["Vary"], "Origin")
+
+    def test_unknown_origins_cannot_submit_or_read_cors_responses(self):
+        for origin in ["https://zakura.com.evil.test", "http://zakura.com", "null", "http://localhost:8769"]:
+            for method in ["OPTIONS", "POST"]:
+                status, headers, _ = self.request(method, "/v1/faucet/claim", origin, '{}')
+                self.assertEqual(status, 403)
+                self.assertNotIn("Access-Control-Allow-Origin", headers)
+            status, headers, _ = self.request("GET", "/v1/faucet/status", origin)
+            self.assertEqual(status, 200)
+            self.assertNotIn("Access-Control-Allow-Origin", headers)
+        self.fake.reserve.assert_not_called()
+
+    def test_errors_keep_cors_and_command_line_clients_still_work(self):
+        for error, expected in [(ValueError("Bad address"), 400),
+                                (PermissionError("Claim limit"), 429),
+                                (RuntimeError("Not ready"), 503)]:
+            self.fake.reserve.side_effect = error
+            status, headers, _ = self.request("POST", "/v1/faucet/claim", "https://zakura.com",
+                                              json.dumps({"address": "utest1" + "a" * 100}))
+            self.assertEqual(status, expected)
+            self.assertEqual(headers["Access-Control-Allow-Origin"], "https://zakura.com")
+        self.fake.reserve.side_effect = None
+        self.assertEqual(self.request("POST", "/v1/faucet/claim", body='{"address":"address"}')[0], 202)
+
+
+class BoundedServerTest(unittest.TestCase):
+    def test_concurrent_requests_are_capped(self):
+        self.assertEqual(max_concurrent_handlers(faucet.BoundedHTTPServer, 2, 6), 2)
+
+    def test_stalled_clients_time_out(self):
+        self.assertEqual(faucet.Handler.timeout, faucet.REQUEST_TIMEOUT_SECONDS)
+
+
+
+class FaucetKeyIsolationTest(unittest.TestCase):
+    def test_the_sender_signs_with_the_faucet_key_for_the_faucet_address(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            claims = Faucet(Path(tmp) / "claims.sqlite3", 18232, "tmFaucet",
+                            Path("/usr/local/bin/faucet-sender"), Path("/etc/zakura/zakura.toml"))
+            with claims.connect() as connection:
+                connection.execute("INSERT INTO claims (id, address, ip, created_at, status) "
+                                   "VALUES ('c1', 'utest1recipient', '203.0.113.1', 1, 'queued')")
+            done = __import__("subprocess").CompletedProcess([], 0, "FAUCET_TXID=" + "a" * 64, "")
+            with patch.dict("os.environ", {"CREDENTIALS_DIRECTORY": "/run/credentials/faucet"}), \
+                    patch.object(faucet.subprocess, "run", return_value=done) as run:
+                claims.process_next()
+            self.assertEqual(claims.claim("c1")["status"], "sent")
+        command = run.call_args.args[0]
+        self.assertEqual(command[command.index("--address") + 1], "tmFaucet")
+        self.assertEqual(command[command.index("--secret-key-file") + 1],
+                         "/run/credentials/faucet/faucet-key.hex")
+        self.assertNotIn("miner", " ".join(command))
+
+    def test_the_unit_loads_only_the_faucet_credential(self):
+        unit = (Path(__file__).parent / "faucet.service").read_text()
+        credentials = [line for line in unit.splitlines() if line.startswith("LoadCredential=")]
+        self.assertEqual(credentials,
+                         ["LoadCredential=faucet-key.hex:/etc/zakura-nu7-faucet/faucet-key.hex"])
+        self.assertNotIn("miner-key", unit)
+        self.assertNotIn("/root/", unit)
+        self.assertIn("--faucet-address ${FAUCET_ADDRESS}", unit)
+        self.assertIn("--sender ${FAUCET_SENDER}", unit)
+
+
+class FaucetSenderStartupTest(unittest.TestCase):
+    def arguments(self, db, sender):
+        return ["faucet.py", "--db", str(db), "--faucet-address", "tmFaucet",
+                "--sender", str(sender)]
+
+    def test_an_explicit_external_executable_starts_the_faucet(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sender = Path(tmp) / "sender"
+            sender.write_text("#!/bin/sh\nexit 0\n")
+            sender.chmod(0o755)
+            db = Path(tmp) / "claims.sqlite3"
+            with patch("sys.argv", self.arguments(db, sender)), \
+                    patch.object(faucet, "Faucet") as factory, \
+                    patch.object(faucet.threading, "Thread") as worker, \
+                    patch.object(faucet, "BoundedHTTPServer") as server:
+                faucet.main()
+            self.assertEqual(factory.call_args.args[3], sender)
+            worker.return_value.start.assert_called_once()
+            server.return_value.serve_forever.assert_called_once()
+
+    def test_invalid_senders_are_refused_before_opening_claims(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            non_executable = root / "not-executable"
+            non_executable.touch(mode=0o600)
+            db = root / "claims.sqlite3"
+            for sender in (root / "missing", non_executable, root, Path("relative-sender")):
+                with self.subTest(sender=sender), \
+                        patch("sys.argv", self.arguments(db, sender)), \
+                        patch("sys.stderr", new_callable=io.StringIO) as stderr, \
+                        patch.object(faucet, "Faucet") as factory, \
+                        patch.object(faucet.threading, "Thread") as worker:
+                    with self.assertRaises(SystemExit) as error:
+                        faucet.main()
+                    self.assertEqual(error.exception.code, 2)
+                    self.assertIn("installed executable using an absolute path", stderr.getvalue())
+                    factory.assert_not_called()
+                    worker.assert_not_called()
+            self.assertFalse(db.exists())
+
+
+if __name__ == "__main__":
+    unittest.main()

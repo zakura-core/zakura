@@ -1,0 +1,104 @@
+{
+  "schemaVersion": 1,
+  "observedAt": 1790764066.5085304,
+  "status": "live",
+  "network": {
+    "name": "Nu7StagingV3",
+    "magic": "7a6b7539",
+    "activationHeight": 4420652,
+    "nsmSeedZat": 55768414957,
+    "targetSpacingSeconds": 25,
+    "daaWindowBlocks": 102,
+    "branchId": "77190ad9",
+    "reissuanceHeight": null,
+    "reissuanceKnown": false
+  },
+  "chain": {
+    "height": 4420651,
+    "hash": "005830cd23034a433cd214c9ebf8d3f22063e1ad8693c5daad30c85d8e3a7b1b",
+    "blockTime": 1790763821,
+    "tipAgeSeconds": 245,
+    "difficulty": 18.49262967611799,
+    "meanIntervalSeconds": null,
+    "medianIntervalSeconds": null,
+    "intervalSampleBlocks": 0
+  },
+  "nsm": {
+    "balanceZat": 55768414957,
+    "available": true,
+    "seedZat": 55768414957
+  },
+  "observation": {
+    "localNodesAgree": true,
+    "blocks24h": 3,
+    "reorgs24h": 0,
+    "reorgRate24h": 0.0,
+    "since": 1790763712.9055462,
+    "scope": "two nodes on one host; observed tip replacements only"
+  },
+  "mining": {
+    "operatorMinersActive": 4,
+    "operatorMinersConfigured": 4,
+    "remoteMiners": [
+      {
+        "id": "us",
+        "region": "San Francisco, US",
+        "healthy": true,
+        "minerActive": true,
+        "nodeHealthy": true,
+        "acceptedBlocks24h": 0,
+        "observedAt": 1790764066.6216257,
+        "height": 4420651,
+        "lagBlocks": 0
+      },
+      {
+        "id": "eu",
+        "region": "Amsterdam, NL",
+        "healthy": true,
+        "minerActive": true,
+        "nodeHealthy": true,
+        "acceptedBlocks24h": 1,
+        "observedAt": 1790764066.8449256,
+        "height": 4420651,
+        "lagBlocks": 0
+      },
+      {
+        "id": "ap",
+        "region": "Singapore, SG",
+        "healthy": true,
+        "minerActive": true,
+        "nodeHealthy": true,
+        "acceptedBlocks24h": 0,
+        "observedAt": 1790764067.3277986,
+        "height": 4420651,
+        "lagBlocks": 0
+      }
+    ]
+  },
+  "nodes": [
+    {
+      "name": "primary",
+      "healthy": true,
+      "height": 4420651,
+      "hash": "005830cd23034a433cd214c9ebf8d3f22063e1ad8693c5daad30c85d8e3a7b1b",
+      "peers": 5,
+      "externalPeers": 4
+    },
+    {
+      "name": "local observer",
+      "healthy": true,
+      "height": 4420651,
+      "hash": "005830cd23034a433cd214c9ebf8d3f22063e1ad8693c5daad30c85d8e3a7b1b",
+      "peers": 1,
+      "externalPeers": 0
+    }
+  ],
+  "recentBlocks": [
+    {
+      "height": 4420651,
+      "hash": "005830cd23034a433cd214c9ebf8d3f22063e1ad8693c5daad30c85d8e3a7b1b",
+      "time": 1790763821,
+      "difficulty": 18.49262967611799
+    }
+  ]
+}

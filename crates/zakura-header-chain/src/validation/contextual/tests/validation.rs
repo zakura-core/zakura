@@ -119,7 +119,7 @@ fn difficulty_windows_upgrades_testnet_minimum_and_partitions_match() {
                 continue;
             }
             let spacing = NetworkUpgrade::target_spacing_for_height(&network, height);
-            let span = u32::try_from(POW_ADJUSTMENT_BLOCK_SPAN)
+            let span = u32::try_from(pow_adjustment_block_span_for_height(&network, height))
                 .expect("the difficulty adjustment span fits in u32");
             let context_len = usize::try_from(height.0.min(span))
                 .expect("bounded test context length fits in usize");

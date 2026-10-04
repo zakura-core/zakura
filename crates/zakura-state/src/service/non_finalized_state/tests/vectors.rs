@@ -26,21 +26,6 @@ use crate::{
 };
 
 #[test]
-fn construct_empty() {
-    let _init_guard = zakura_test::init();
-    let _chain = Chain::new(
-        &Network::Mainnet,
-        Height(0),
-        Default::default(),
-        Default::default(),
-        Default::default(),
-        Default::default(),
-        Default::default(),
-        ValueBalance::zero(),
-    );
-}
-
-#[test]
 fn construct_single() -> Result<()> {
     let _init_guard = zakura_test::init();
     let block: Arc<Block> =

@@ -11,7 +11,7 @@
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
-    ops::{Bound, RangeBounds},
+    ops::RangeBounds,
     sync::Arc,
 };
 
@@ -139,78 +139,6 @@ impl ZakuraDb {
         self.db.zs_contains(&tx_by_loc, &first_tx)
     }
 
-    /// Returns finalized commitment roots for a contiguous height range.
-    ///
-    /// The result stops before the first missing height.
-    pub fn finalized_commitment_roots_by_height_range(
-        &self,
-        range: impl RangeBounds<block::Height>,
-    ) -> Vec<BlockCommitmentRoots> {
-        let Some(tip_height) = self.finalized_tip_height() else {
-            return Vec::new();
-        };
-        let Some(start_height) = (match range.start_bound() {
-            Bound::Included(height) => Some(*height),
-            Bound::Excluded(height) => height.next().ok(),
-            Bound::Unbounded => Some(block::Height::MIN),
-        }) else {
-            return Vec::new();
-        };
-        let Some(end_height) = (match range.end_bound() {
-            Bound::Included(height) => Some(*height),
-            Bound::Excluded(height) => height.previous().ok(),
-            Bound::Unbounded => Some(tip_height),
-        }) else {
-            return Vec::new();
-        };
-        let end_height = end_height.min(tip_height);
-        if start_height > end_height {
-            return Vec::new();
-        }
-
-        let mut roots = Vec::new();
-
-        // The per-height tree column families are sparse: they only store a row
-        // when that pool's tree changes. Resolve each requested finalized height
-        // through the backwards tree lookup instead of iterating those sparse
-        // rows as if they were a contiguous block-height index.
-        for raw_height in start_height.0..=end_height.0 {
-            let height = block::Height(raw_height);
-            let Some(sapling) = self.sapling_tree_by_height(&height) else {
-                break;
-            };
-            let Some(orchard) = self.orchard_tree_by_height(&height) else {
-                break;
-            };
-            let Some(ironwood) = self.ironwood_tree_by_height(&height) else {
-                break;
-            };
-
-            let Some(block) = self.block(height.into()) else {
-                break;
-            };
-            let (sapling_tx, orchard_tx, ironwood_tx, auth_data_root) = (
-                block.sapling_transactions_count(),
-                block.orchard_transactions_count(),
-                block.ironwood_transactions_count(),
-                block.auth_data_root(),
-            );
-
-            roots.push(BlockCommitmentRoots {
-                height,
-                sapling_root: sapling.root(),
-                orchard_root: orchard.root(),
-                ironwood_root: ironwood.root(),
-                sapling_tx,
-                orchard_tx,
-                ironwood_tx,
-                auth_data_root,
-            });
-        }
-
-        roots
-    }
-
     /// Returns the finalized hash for a given `block::Height` if it is present.
     #[allow(clippy::unwrap_in_result)]
     pub fn hash(&self, height: block::Height) -> Option<block::Hash> {
@@ -236,23 +164,6 @@ impl ZakuraDb {
         self.db.zs_get(&height_by_hash, &hash)
     }
 
-    /// Returns the previous block hash for the given block hash in the finalized state.
-    #[allow(dead_code)]
-    pub fn prev_block_hash_for_hash(&self, hash: block::Hash) -> Option<block::Hash> {
-        let height = self.height(hash)?;
-        let prev_height = height.previous().ok()?;
-
-        self.hash(prev_height)
-    }
-
-    /// Returns the previous block height for the given block hash in the finalized state.
-    #[allow(dead_code)]
-    pub fn prev_block_height_for_hash(&self, hash: block::Hash) -> Option<block::Height> {
-        let height = self.height(hash)?;
-
-        height.previous().ok()
-    }
-
     /// Returns the [`block::Header`] with [`block::Hash`] or
     /// [`Height`], if it exists in the finalized chain.
     //
@@ -266,19 +177,6 @@ impl ZakuraDb {
         let header = self.db.zs_get(&block_header_by_height, &height)?;
 
         Some(header)
-    }
-
-    /// Returns block headers in height order.
-    #[cfg(feature = "indexer")]
-    pub fn block_headers_by_height_range<R>(
-        &self,
-        range: R,
-    ) -> impl Iterator<Item = (Height, Arc<block::Header>)> + '_
-    where
-        R: RangeBounds<Height>,
-    {
-        let block_header_by_height = self.db.cf_handle("block_header_by_height").unwrap();
-        self.db.zs_forward_range_iter(block_header_by_height, range)
     }
 
     /// Returns the raw [`block::Header`] with [`block::Hash`] or [`Height`], if
@@ -659,19 +557,6 @@ impl ZakuraDb {
     pub fn transaction_hash(&self, location: TransactionLocation) -> Option<transaction::Hash> {
         let hash_by_tx_loc = self.db.cf_handle("hash_by_tx_loc").unwrap();
         self.db.zs_get(&hash_by_tx_loc, &location)
-    }
-
-    /// Returns transaction hashes in block and transaction order.
-    #[cfg(feature = "indexer")]
-    pub fn transaction_hashes_by_location_range<R>(
-        &self,
-        range: R,
-    ) -> impl Iterator<Item = (TransactionLocation, transaction::Hash)> + '_
-    where
-        R: RangeBounds<TransactionLocation>,
-    {
-        let hash_by_tx_loc = self.db.cf_handle("hash_by_tx_loc").unwrap();
-        self.db.zs_forward_range_iter(hash_by_tx_loc, range)
     }
 
     /// Returns the [`transaction::Hash`] of the transaction that spent or revealed the given

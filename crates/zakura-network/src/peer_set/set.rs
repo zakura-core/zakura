@@ -826,6 +826,11 @@ where
     /// ban list are untouched, so the peer is free to reconnect.
     fn drain_stall_events(&mut self, cx: &mut Context<'_>) {
         while let Poll::Ready(Some((addr, outcome))) = self.stall_event_rx.poll_recv(cx) {
+            // A late event from a connection that already left the set must not
+            // start a count that a reconnect at the same address would inherit.
+            if !self.has_peer_with_addr(addr) {
+                continue;
+            }
             match outcome {
                 StallOutcome::Stall => {
                     if self.find_response_stalls.record_stall(addr) {
@@ -1690,6 +1695,15 @@ where
         let _poll_pending_or_ready: Poll<()> = self.inventory_registry.poll_inventory(cx)?;
 
         let ready_peers = self.poll_peers(cx)?;
+
+        // Peers leave the set through many paths. Pruning here, instead of at each
+        // path, keeps stall counts bounded by the live peers.
+        if !self.find_response_stalls.is_empty() {
+            let (ready_services, cancel_handles) = (&self.ready_services, &self.cancel_handles);
+            self.find_response_stalls.retain(|addr| {
+                ready_services.contains_key(addr) || cancel_handles.contains_key(addr)
+            });
+        }
 
         // These metrics should run last, to report the most up-to-date information.
         self.log_peer_set_size();

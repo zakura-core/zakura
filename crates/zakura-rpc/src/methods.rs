@@ -17,14 +17,11 @@
 //!   has an appropriate API for accessing any relevant data.
 //!
 //!   This should be achieved, wherever possible, by:
-//!   - Using `derive(Getters, new)` to keep new code succinct and consistent.
-//!     Ensure that fields on response types that implement `Copy` are tagged
-//!     with `#[getter(copy)]` field attributes to avoid unnecessary references.
-//!     This should be easily noticeable in the `serialization_tests` test crate, where
-//!     any fields implementing `Copy` but not tagged with `#[getter(Copy)]` will
-//!     be returned by reference, and will require dereferencing with the dereference
-//!     operator, `*`. If a value returned by a getter method requires dereferencing,
-//!     the associated field in the response type should likely be tagged with `#[getter(Copy)]`.
+//!   - Use [`getset::Getters`] and [`getset::CopyGetters`] with `new` to keep
+//!     response accessors consistent. Select `#[getset(get = "pub")]` for
+//!     borrowed fields and `#[getset(get_copy = "pub")]` for fields returned
+//!     by value. Check the `serialization_tests` test crate for the expected
+//!     return types.
 //!   - If a field is added, use `#[new(...)]` so that it's not added to the
 //!     constructor. If that is unavoidable, then it will require a major
 //!     version bump.
@@ -41,9 +38,9 @@ use std::{
 };
 
 use chrono::Utc;
-use derive_getters::Getters;
 use derive_new::new;
 use futures::{future::OptionFuture, stream::FuturesOrdered, StreamExt, TryFutureExt};
+use getset::{CopyGetters, Getters};
 use hex::{FromHex, ToHex};
 use indexmap::IndexMap;
 use jsonrpsee::core::{async_trait, RpcResult as Result};
@@ -152,6 +149,8 @@ where
 {
     service.oneshot(request).await.map_misc_error()
 }
+
+mod openrpc;
 
 include!("methods/rpc_openrpc.rs");
 
@@ -281,6 +280,8 @@ pub(super) const PARAM_VERBOSITY_DESC: &str = "Whether to include verbose output
 pub(super) const PARAM_N_DESC: &str = "The output index in the transaction.";
 pub(super) const PARAM_INCLUDE_MEMPOOL_DESC: &str =
     "Whether to include mempool transactions in the response.";
+
+mod hex_serde;
 
 #[cfg(test)]
 mod tests;
@@ -941,7 +942,7 @@ pub trait Rpc {
 
     /// Returns an OpenRPC schema as a description of this service.
     #[method(name = "rpc.discover")]
-    fn openrpc(&self) -> openrpsee::openrpc::Response;
+    fn openrpc(&self) -> Result<serde_json::Value>;
     /// Returns details about an unspent transaction output.
     ///
     /// zcashd reference: [`gettxout`](https://zcash.github.io/rpc/gettxout.html)
@@ -3944,25 +3945,8 @@ where
         }
     }
 
-    fn openrpc(&self) -> openrpsee::openrpc::Response {
-        let mut generator = openrpsee::openrpc::Generator::new();
-
-        let methods = METHODS
-            .into_iter()
-            .filter(|(name, _)| self.rpc_surface.exposes(name))
-            .map(|(name, method)| method.generate(&mut generator, name))
-            .collect();
-
-        Ok(openrpsee::openrpc::OpenRpc {
-            openrpc: "1.3.2",
-            info: openrpsee::openrpc::Info {
-                title: env!("CARGO_PKG_NAME"),
-                description: env!("CARGO_PKG_DESCRIPTION"),
-                version: env!("CARGO_PKG_VERSION"),
-            },
-            methods,
-            components: generator.into_components(),
-        })
+    fn openrpc(&self) -> Result<serde_json::Value> {
+        Ok(openrpc::render(self.rpc_surface))
     }
     async fn get_tx_out(
         &self,
@@ -4094,52 +4078,72 @@ where
 ///
 /// See the notes for the [`Rpc::get_info` method].
 #[allow(clippy::too_many_arguments)]
-#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, Getters, new)]
+#[derive(
+    Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, Getters, CopyGetters, new,
+)]
 pub struct GetInfoResponse {
     /// The node version
-    #[getter(rename = "raw_version")]
     version: u64,
 
     /// The node version build number
+    #[getset(get = "pub")]
     build: String,
 
     /// The server sub-version identifier, used as the network protocol user-agent
+    #[getset(get = "pub")]
     subversion: String,
 
     /// The protocol version
     #[serde(rename = "protocolversion")]
+    #[getset(get_copy = "pub")]
     protocol_version: u32,
 
     /// The current number of blocks processed in the server
+    #[getset(get_copy = "pub")]
     blocks: u32,
 
     /// The total (inbound and outbound) number of connections the node has
+    #[getset(get_copy = "pub")]
     connections: usize,
 
     /// The proxy (if any) used by the server. Currently always `None` in Zebra.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[getset(get = "pub")]
     proxy: Option<String>,
 
     /// The current network difficulty
+    #[getset(get_copy = "pub")]
     difficulty: f64,
 
     /// True if the server is running in testnet mode, false otherwise
+    #[getset(get_copy = "pub")]
     testnet: bool,
 
     /// The minimum transaction fee in ZEC/kB
     #[serde(rename = "paytxfee")]
+    #[getset(get_copy = "pub")]
     pay_tx_fee: f64,
 
     /// The minimum relay fee for non-free transactions in ZEC/kB
     #[serde(rename = "relayfee")]
+    #[getset(get_copy = "pub")]
     relay_fee: f64,
 
     /// The last error or warning message, or "no errors" if there are no errors
+    #[getset(get = "pub")]
     errors: String,
 
     /// The time of the last error or warning message, or "no errors timestamp" if there are no errors
     #[serde(rename = "errorstimestamp")]
+    #[getset(get_copy = "pub")]
     errors_timestamp: i64,
+}
+
+impl GetInfoResponse {
+    /// The node version.
+    pub fn raw_version(&self) -> u64 {
+        self.version
+    }
 }
 
 impl Default for GetInfoResponse {
@@ -4265,23 +4269,24 @@ fn target_seconds_between_heights(network: &Network, from: Height, to: Height) -
 pub struct GetDeprecationInfoResponse {
     /// End-of-service information, only present on Mainnet.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[getset(get = "pub")]
     end_of_service: Option<EndOfService>,
 }
 
 /// The `end_of_service` object in a [`GetDeprecationInfoResponse`].
-#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, Getters, new)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, CopyGetters, new)]
 pub struct EndOfService {
     /// The estimated last height this server version supports.
     ///
     /// The node halts when the chain tip goes past this height.
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     block_height: u32,
 
     /// Approximate halt time in seconds since the Unix epoch.
     ///
     /// This is reported 24 hours earlier than the spacing-based estimate, so
     /// consumers are warned early when block times vary.
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     estimated_time: i64,
 }
 
@@ -4339,33 +4344,38 @@ where
 /// Response to a `getblockchaininfo` RPC request.
 ///
 /// See the notes for the [`Rpc::get_blockchain_info` method].
-#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, Getters)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, Getters, CopyGetters)]
 pub struct GetBlockchainInfoResponse {
     /// Current network name as defined in BIP70 (main, test, regtest)
+    #[getset(get = "pub")]
     chain: String,
 
     /// The current number of blocks processed in the server, numeric
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     blocks: Height,
 
     /// The current number of headers we have validated in the best chain, that is,
     /// the height of the best chain.
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     headers: Height,
 
     /// The estimated network solution rate in Sol/s.
+    #[getset(get_copy = "pub")]
     difficulty: f64,
 
     /// The verification progress relative to the estimated network chain tip.
     #[serde(rename = "verificationprogress")]
+    #[getset(get_copy = "pub")]
     verification_progress: f64,
 
     /// The total amount of work in the best chain, hex-encoded.
     #[serde(rename = "chainwork")]
+    #[getset(get_copy = "pub")]
     chain_work: u64,
 
     /// Whether this node's blocks are subject to pruning, that is, whether it
     /// runs in pruned storage mode or has already pruned historical data.
+    #[getset(get_copy = "pub")]
     pruned: bool,
 
     /// The lowest height whose block body this node still stores, omitted when
@@ -4380,34 +4390,38 @@ pub struct GetBlockchainInfoResponse {
         rename = "pruneheight",
         skip_serializing_if = "Option::is_none"
     )]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     prune_height: Option<Height>,
 
     /// The estimated size of the block and undo files on disk
+    #[getset(get_copy = "pub")]
     size_on_disk: u64,
 
     /// The current number of note commitments in the commitment tree
+    #[getset(get_copy = "pub")]
     commitments: u64,
 
     /// The hash of the currently best block, in big-endian order, hex-encoded
     #[serde(rename = "bestblockhash", with = "hex")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     best_block_hash: block::Hash,
 
     /// If syncing, the estimated height of the chain, else the current best height, numeric.
     ///
     /// In Zebra, this is always the height estimate, so it might be a little inaccurate.
     #[serde(rename = "estimatedheight")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     estimated_height: Height,
 
     /// Chain supply balance
     #[serde(rename = "chainSupply")]
+    #[getset(get = "pub")]
     chain_supply: GetBlockchainInfoBalance,
 
     /// Value pool balances
     #[serde(rename = "valuePools")]
     #[serde(deserialize_with = "deserialize_blockchain_value_pool_balances")]
+    #[getset(get = "pub")]
     value_pools: BlockchainValuePoolBalances,
 
     /// The ZIP 234 NSM value balance, in zatoshis.
@@ -4433,87 +4447,102 @@ pub struct GetBlockchainInfoResponse {
         default,
         skip_serializing_if = "Option::is_none"
     )]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     nsm_value_balance_zat: Option<Amount<NegativeAllowed>>,
 
     /// Status of network upgrades
+    #[getset(get = "pub")]
     upgrades: IndexMap<ConsensusBranchIdHex, NetworkUpgradeInfo>,
 
     /// Branch IDs of the current and upcoming consensus rules
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     consensus: TipConsensusBranch,
 
     /// Zakura's authoritative header-chain state after semantic handoff.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[getset(get = "pub")]
     header_chain: Option<HeaderChainInfo>,
 }
 
 /// One hash-qualified frontier in the authoritative header-chain state.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, Getters)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, CopyGetters)]
 pub struct HeaderChainFrontierInfo {
     /// Exact frontier height.
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     height: Height,
     /// Exact frontier hash.
     #[serde(with = "hex")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     hash: block::Hash,
 }
 
 /// Persistent selected-tip body-unavailability alarm details.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, Getters)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, CopyGetters)]
 pub struct HeaderChainBodyUnavailableInfo {
     /// Exact selected header whose body is unavailable.
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     height: Height,
     /// Exact selected header hash.
     #[serde(with = "hex")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     hash: block::Hash,
     /// Current retry episode age in seconds.
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     age_seconds: u64,
     /// Failed deliveries in the current episode.
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     attempts: u32,
     /// Currently known eligible body suppliers.
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     suppliers: u32,
 }
 
 /// Persistent alarms from the authoritative header-chain state.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, Getters)]
+#[derive(
+    Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, Getters, CopyGetters,
+)]
 pub struct HeaderChainAlarmInfo {
     /// Protected paths prevented resource-bound enforcement.
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     resource_stalled: bool,
     /// The selected header exhausted its current body-supplier retry episode.
+    #[getset(get = "pub")]
     header_best_body_unavailable: Option<HeaderChainBodyUnavailableInfo>,
     /// Deterministic body validation refuted an imported headers-only trust pin.
+    #[getset(get = "pub")]
     migrated_pin_refuted: Option<HeaderChainFrontierInfo>,
 }
 
 /// User-facing view of the sole committed header-chain publisher.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, Getters)]
+#[derive(
+    Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, Getters, CopyGetters,
+)]
 pub struct HeaderChainInfo {
     /// `integrated` or `headers-only`.
+    #[getset(get = "pub")]
     mode: String,
     /// Monotonic durable state version.
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     state_version: u64,
     /// Meaning and validity boundary of `header_best`.
+    #[getset(get = "pub")]
     header_best_semantics: String,
     /// Best locally header-valid frontier.
     /// The header frontier does not claim body validity.
+    #[getset(get = "pub")]
     header_best: HeaderChainFrontierInfo,
     /// Best fully body-verified frontier on the selected path.
+    #[getset(get = "pub")]
     verified_best: HeaderChainFrontierInfo,
     /// Irreversible local finality frontier.
+    #[getset(get = "pub")]
     finalized: HeaderChainFrontierInfo,
     /// Headers-only mode's irreversible local trust warning.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[getset(get = "pub")]
     finality_warning: Option<String>,
     /// Persistent engine alarms.
+    #[getset(get = "pub")]
     alarms: HeaderChainAlarmInfo,
 }
 
@@ -4742,27 +4771,40 @@ impl GetAddressBalanceRequest {
     Hash,
     serde::Serialize,
     serde::Deserialize,
-    Getters,
+    CopyGetters,
     new,
 )]
 pub struct GetAddressBalanceResponse {
     /// The total transparent balance.
+    #[getset(get_copy = "pub")]
     balance: u64,
     /// The total received balance, including change.
+    #[getset(get_copy = "pub")]
     pub received: u64,
 }
 
 /// Parameters of [`RpcServer::get_address_utxos`] RPC method.
 #[derive(
-    Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize, Getters, new, JsonSchema,
+    Clone,
+    Debug,
+    Eq,
+    PartialEq,
+    serde::Deserialize,
+    serde::Serialize,
+    Getters,
+    CopyGetters,
+    new,
+    JsonSchema,
 )]
 #[serde(from = "DGetAddressUtxosRequest")]
 pub struct GetAddressUtxosRequest {
     /// A list of addresses to get transactions from.
+    #[getset(get = "pub")]
     addresses: Vec<String>,
     /// The height to start looking for transactions.
     #[serde(default)]
     #[serde(rename = "chainInfo")]
+    #[getset(get_copy = "pub")]
     chain_info: bool,
 }
 
@@ -4975,43 +5017,46 @@ impl Default for GetBlockResponse {
 
 /// A Block object returned by the `getblock` RPC request.
 #[allow(clippy::too_many_arguments)]
-#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, Getters, new)]
+#[derive(
+    Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, Getters, CopyGetters, new,
+)]
 pub struct BlockObject {
     /// The hash of the requested block.
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     #[serde(with = "hex")]
     hash: block::Hash,
 
     /// The number of confirmations of this block in the best chain,
     /// or -1 if it is not in the best chain.
+    #[getset(get_copy = "pub")]
     confirmations: i64,
 
     /// The block size. TODO: fill it
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     size: Option<i64>,
 
     /// The height of the requested block.
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     height: Option<Height>,
 
     /// The version field of the requested block.
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     version: Option<u32>,
 
     /// The merkle root of the requested block.
     #[serde(with = "opthex", rename = "merkleroot")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     merkle_root: Option<block::merkle::Root>,
 
     /// The blockcommitments field of the requested block. Its interpretation changes
     /// depending on the network and height.
     #[serde(with = "opthex", rename = "blockcommitments")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     block_commitments: Option<[u8; 32]>,
 
     // `authdataroot` would be here. Undocumented. TODO: decide if we want to support it
@@ -5019,53 +5064,55 @@ pub struct BlockObject {
     /// The root of the Sapling commitment tree after applying this block.
     #[serde(with = "opthex", rename = "finalsaplingroot")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     final_sapling_root: Option<[u8; 32]>,
 
     /// The root of the Orchard commitment tree after applying this block.
     #[serde(with = "opthex", rename = "finalorchardroot")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     final_orchard_root: Option<[u8; 32]>,
 
     // `chainhistoryroot` would be here. Undocumented. TODO: decide if we want to support it
     //
     /// The number of transactions in this block.
     #[serde(rename = "nTx")]
+    #[getset(get_copy = "pub")]
     n_tx: usize,
 
     /// List of transactions in block order, hex-encoded if verbosity=1 or
     /// as objects if verbosity=2.
+    #[getset(get = "pub")]
     tx: Vec<GetBlockTransaction>,
 
     /// The height of the requested block.
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     time: Option<i64>,
 
     /// The nonce of the requested block header.
     #[serde(with = "opthex")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     nonce: Option<[u8; 32]>,
 
     /// The Equihash solution in the requested block header.
     /// Note: presence of this field in getblock is not documented in zcashd.
     #[serde(with = "opthex")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     solution: Option<Solution>,
 
     /// The difficulty threshold of the requested block header displayed in compact form.
     #[serde(with = "opthex")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     bits: Option<CompactDifficulty>,
 
     /// Floating point number that represents the difficulty limit for this block as a multiple
     /// of the minimum difficulty for the network.
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     difficulty: Option<f64>,
 
     // `chainwork` would be here, but we don't plan on supporting it
@@ -5074,6 +5121,7 @@ pub struct BlockObject {
     /// Chain supply balance
     #[serde(rename = "chainSupply")]
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[getset(get = "pub")]
     chain_supply: Option<GetBlockchainInfoBalance>,
 
     /// Value pool balances
@@ -5083,22 +5131,23 @@ pub struct BlockObject {
         skip_serializing_if = "Option::is_none",
         deserialize_with = "deserialize_optional_blockchain_value_pool_balances"
     )]
+    #[getset(get = "pub")]
     value_pools: Option<BlockchainValuePoolBalances>,
 
     /// Information about the note commitment trees.
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     trees: GetBlockTrees,
 
     /// The previous block hash of the requested block header.
     #[serde(rename = "previousblockhash", skip_serializing_if = "Option::is_none")]
     #[serde(with = "opthex")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     previous_block_hash: Option<block::Hash>,
 
     /// The next block hash after the requested block header.
     #[serde(rename = "nextblockhash", skip_serializing_if = "Option::is_none")]
     #[serde(with = "opthex")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     next_block_hash: Option<block::Hash>,
 }
 
@@ -5127,79 +5176,84 @@ pub enum GetBlockHeaderResponse {
 }
 
 #[allow(clippy::too_many_arguments)]
-#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, Getters, new)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, CopyGetters, new)]
 /// Verbose response to a `getblockheader` RPC request.
 ///
 /// See the notes for the [`RpcServer::get_block_header`] method.
 pub struct BlockHeaderObject {
     /// The hash of the requested block.
     #[serde(with = "hex")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     hash: block::Hash,
 
     /// The number of confirmations of this block in the best chain,
     /// or -1 if it is not in the best chain.
+    #[getset(get_copy = "pub")]
     confirmations: i64,
 
     /// The height of the requested block.
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     height: Height,
 
     /// The version field of the requested block.
+    #[getset(get_copy = "pub")]
     version: u32,
 
     /// The merkle root of the requesteed block.
     #[serde(with = "hex", rename = "merkleroot")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     merkle_root: block::merkle::Root,
 
     /// The blockcommitments field of the requested block. Its interpretation changes
     /// depending on the network and height.
     #[serde(with = "hex", rename = "blockcommitments")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     block_commitments: [u8; 32],
 
     /// The root of the Sapling commitment tree after applying this block.
     #[serde(with = "hex", rename = "finalsaplingroot")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     final_sapling_root: [u8; 32],
 
     /// The number of Sapling notes in the Sapling note commitment tree
     /// after applying this block. Used by the `getblock` RPC method.
     #[serde(skip)]
+    #[getset(get_copy = "pub")]
     sapling_tree_size: u64,
 
     /// The block time of the requested block header in non-leap seconds since Jan 1 1970 GMT.
+    #[getset(get_copy = "pub")]
     time: i64,
 
     /// The nonce of the requested block header.
     #[serde(with = "hex")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     nonce: [u8; 32],
 
     /// The Equihash solution in the requested block header.
     #[serde(with = "hex")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     solution: Solution,
 
     /// The difficulty threshold of the requested block header displayed in compact form.
     #[serde(with = "hex")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     bits: CompactDifficulty,
 
     /// Floating point number that represents the difficulty limit for this block as a multiple
     /// of the minimum difficulty for the network.
+    #[getset(get_copy = "pub")]
     difficulty: f64,
 
     /// The previous block hash of the requested block header.
     #[serde(rename = "previousblockhash")]
     #[serde(with = "hex")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     previous_block_hash: block::Hash,
 
     /// The next block hash after the requested block header.
     #[serde(rename = "nextblockhash", skip_serializing_if = "Option::is_none")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     #[serde(with = "opthex")]
     next_block_hash: Option<block::Hash>,
 }
@@ -5259,13 +5313,15 @@ impl GetBlockHashResponse {
 pub type Hash = GetBlockHashResponse;
 
 /// Response to a `getbestblockheightandhash` RPC request.
-#[derive(Copy, Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize, Getters, new)]
+#[derive(
+    Copy, Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize, CopyGetters, new,
+)]
 pub struct GetBlockHeightAndHashResponse {
     /// The best chain tip block height
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     height: block::Height,
     /// The best chain tip block hash
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     hash: block::Hash,
 }
 
@@ -5313,45 +5369,56 @@ pub enum GetAddressUtxosResponse {
 }
 
 /// Response to a `getaddressutxos` RPC request, when `chainInfo` is true.
-#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize, Getters, new)]
+#[derive(
+    Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize, Getters, CopyGetters, new,
+)]
 pub struct GetAddressUtxosResponseObject {
+    /// The unspent transparent outputs.
+    #[getset(get = "pub")]
     utxos: Vec<Utxo>,
+    /// The best chain tip hash when these outputs were queried.
     #[serde(with = "hex")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     hash: block::Hash,
-    #[getter(copy)]
+    /// The best chain tip height when these outputs were queried.
+    #[getset(get_copy = "pub")]
     height: block::Height,
 }
 
 /// A UTXO returned by the `getaddressutxos` RPC request.
 ///
 /// See the notes for the [`Rpc::get_address_utxos` method].
-#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize, Getters, new)]
+#[derive(
+    Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize, Getters, CopyGetters, new,
+)]
 pub struct Utxo {
     /// The transparent address, base58check encoded
+    #[getset(get = "pub")]
     address: transparent::Address,
 
     /// The output txid, in big-endian order, hex-encoded
     #[serde(with = "hex")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     txid: transaction::Hash,
 
     /// The transparent output index, numeric
     #[serde(rename = "outputIndex")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     output_index: OutputIndex,
 
     /// The transparent output script, hex encoded
     #[serde(with = "hex")]
+    #[getset(get = "pub")]
     script: transparent::Script,
 
     /// The amount of zatoshis in the transparent output
+    #[getset(get_copy = "pub")]
     satoshis: u64,
 
     /// The block height, numeric.
     ///
     /// We put this field last, to match the zcashd order.
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     height: Height,
 }
 
@@ -5404,10 +5471,13 @@ impl Utxo {
 pub struct GetAddressTxIdsRequest {
     /// A list of addresses. The RPC method will get transactions IDs that sent or received
     /// funds to or from these addresses.
+    #[getset(get = "pub")]
     addresses: Vec<String>,
-    // The height to start looking for transactions.
+    /// The height to start looking for transactions.
+    #[getset(get = "pub")]
     start: Option<u32>,
-    // The height to end looking for transactions.
+    /// The height to end looking for transactions.
+    #[getset(get = "pub")]
     end: Option<u32>,
 }
 

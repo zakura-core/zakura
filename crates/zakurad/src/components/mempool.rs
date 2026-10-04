@@ -61,6 +61,12 @@ mod pending_outputs;
 mod queue_checker;
 mod storage;
 
+/// Supplies named, timed storage operations to a benchmark harness.
+#[cfg(feature = "mempool-bench")]
+pub fn mempool_eviction_benchmarks(run: impl FnMut(&str, &mut dyn FnMut() -> std::time::Duration)) {
+    storage::mempool_eviction_benchmarks(run);
+}
+
 #[cfg(test)]
 mod tests;
 

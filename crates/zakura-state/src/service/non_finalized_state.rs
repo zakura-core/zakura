@@ -13,7 +13,7 @@ use std::{
 use indexmap::IndexMap;
 use tokio::sync::watch;
 use zakura_chain::{
-    block::{self, Block, Hash, Height},
+    block::{self, Hash, Height},
     parameters::Network,
     sprout::{self},
     transparent,
@@ -933,40 +933,6 @@ impl NonFinalizedState {
             .find_map(|chain| chain.created_utxo(outpoint))
     }
 
-    /// Returns the `block` with the given hash in any chain.
-    #[allow(dead_code)]
-    pub fn any_block_by_hash(&self, hash: block::Hash) -> Option<Arc<Block>> {
-        // This performs efficiently because the number of chains is limited to 10.
-        for chain in self.chain_set.iter().rev() {
-            if let Some(prepared) = chain
-                .height_by_hash
-                .get(&hash)
-                .and_then(|height| chain.blocks.get(height))
-            {
-                return Some(prepared.block.clone());
-            }
-        }
-
-        None
-    }
-
-    /// Returns the previous block hash for the given block hash in any chain.
-    #[allow(dead_code)]
-    pub fn any_prev_block_hash_for_hash(&self, hash: block::Hash) -> Option<block::Hash> {
-        // This performs efficiently because the blocks are in memory.
-        self.any_block_by_hash(hash)
-            .map(|block| block.header.previous_block_hash)
-    }
-
-    /// Returns the hash for a given `block::Height` if it is present in the best chain.
-    #[allow(dead_code)]
-    pub fn best_hash(&self, height: block::Height) -> Option<block::Hash> {
-        self.best_chain()?
-            .blocks
-            .get(&height)
-            .map(|prepared| prepared.hash)
-    }
-
     /// Returns the tip of the best chain.
     #[allow(dead_code)]
     pub fn best_tip(&self) -> Option<(block::Height, block::Hash)> {
@@ -983,26 +949,6 @@ impl NonFinalizedState {
         let best_chain = self.best_chain()?;
 
         best_chain.tip_block()
-    }
-
-    /// Returns the height of `hash` in the best chain.
-    #[allow(dead_code)]
-    pub fn best_height_by_hash(&self, hash: block::Hash) -> Option<block::Height> {
-        let best_chain = self.best_chain()?;
-        let height = *best_chain.height_by_hash.get(&hash)?;
-        Some(height)
-    }
-
-    /// Returns the height of `hash` in any chain.
-    #[allow(dead_code)]
-    pub fn any_height_by_hash(&self, hash: block::Hash) -> Option<block::Height> {
-        for chain in self.chain_set.iter().rev() {
-            if let Some(height) = chain.height_by_hash.get(&hash) {
-                return Some(*height);
-            }
-        }
-
-        None
     }
 
     /// Returns `true` if the best chain contains `sprout_nullifier`.

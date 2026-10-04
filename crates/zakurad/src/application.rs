@@ -21,11 +21,7 @@ use abscissa_core::{
 use semver::{BuildMetadata, Version};
 
 use tokio::sync::watch;
-use zakura_network::constants::PORT_IN_USE_ERROR;
-use zakura_state::{
-    constants::LOCK_FILE_ERROR, state_database_format_version_in_code,
-    state_database_format_version_on_disk,
-};
+use zakura_state::{state_database_format_version_in_code, state_database_format_version_on_disk};
 
 use crate::{
     commands::EntryPoint,
@@ -263,9 +259,7 @@ impl Application for ZakuradApp {
     #[allow(clippy::print_stderr)]
     #[allow(clippy::unwrap_in_result)]
     fn register_components(&mut self, command: &Self::Cmd) -> Result<(), FrameworkError> {
-        use crate::components::{
-            metrics::MetricsEndpoint, tokio::TokioComponent, tracing::TracingEndpoint,
-        };
+        use crate::components::{metrics::MetricsEndpoint, tokio::TokioComponent};
 
         let mut components = self.framework_components(command)?;
 
@@ -385,11 +379,11 @@ impl Application for ZakuradApp {
                         None => return true,
                     };
                     // listener port conflicts
-                    if PORT_IN_USE_ERROR.is_match(error_str) {
+                    if is_port_in_use_error(error_str) {
                         return false;
                     }
                     // RocksDB lock file conflicts
-                    if LOCK_FILE_ERROR.is_match(error_str) {
+                    if is_lock_file_error(error_str) {
                         return false;
                     }
                     // Don't ask users to report old version panics.
@@ -495,7 +489,14 @@ impl Application for ZakuradApp {
                 info!("No config file provided, using default configuration");
             }
 
-            info!("{config:?}");
+            // Log only selected diagnostics. The full config can contain credentials.
+            info!(
+                network = %config.network.network,
+                p2p_stack = ?config.network.p2p_stack.resolve(&config.network.network),
+                peerset_initial_target_size = config.network.peerset_initial_target_size,
+                ephemeral_state = config.state.ephemeral,
+                "loaded node configuration",
+            );
 
             // Explicitly log the configured miner address so CI can assert env override
             if let Some(miner_address) = &config.mining.miner_address {
@@ -529,7 +530,6 @@ impl Application for ZakuradApp {
         // Launch network and async endpoints only for long-running commands.
         if is_server {
             components.push(Box::new(TokioComponent::new()?));
-            components.push(Box::new(TracingEndpoint::new(&config)?));
             components.push(Box::new(MetricsEndpoint::new(&metrics_config)?));
         }
 
@@ -600,4 +600,106 @@ pub fn boot(app_cell: &'static AppCell<ZakuradApp>) -> ! {
 
     ZakuradApp::run(app_cell, args);
     process::exit(0);
+}
+
+/// Returns whether an error describes a listener port conflict.
+fn is_port_in_use_error(error: &str) -> bool {
+    if cfg!(unix) {
+        error.contains("already in use")
+    } else {
+        error.contains("access a socket in a way forbidden by its access permissions")
+            || error.contains("Only one usage of each socket address")
+    }
+}
+
+/// Returns whether an error describes a database lock conflict.
+fn is_lock_file_error(error: &str) -> bool {
+    error.contains("in use")
+        || error.contains("being used by another process")
+        || error.contains("Database likely already open")
+        || error.contains("database lock")
+        || error.split('\n').any(|line| {
+            line.split_once("lock file")
+                .is_some_and(|(_, rest)| rest.contains("temporarily unavailable"))
+        })
+}
+
+#[cfg(test)]
+mod startup_error_tests {
+    use proptest::prelude::*;
+    use regex::Regex;
+
+    use super::{is_lock_file_error, is_port_in_use_error};
+
+    fn original_port_matcher() -> Regex {
+        Regex::new(if cfg!(unix) {
+            "already in use"
+        } else {
+            "(access a socket in a way forbidden by its access permissions)|(Only one usage of each socket address)"
+        })
+        .expect("the original startup error pattern is valid")
+    }
+
+    fn original_lock_matcher() -> Regex {
+        Regex::new(
+            "(lock file).*(temporarily unavailable)|(in use)|(being used by another process)|(Database likely already open)|(database lock)",
+        )
+        .expect("the original startup error pattern is valid")
+    }
+
+    #[test]
+    fn startup_error_examples_match_original_regexes() {
+        let port = original_port_matcher();
+        let lock = original_lock_matcher();
+        for error in [
+            "",
+            "Address already in use (os error 48)",
+            "An attempt was made to access a socket in a way forbidden by its access permissions",
+            "Only one usage of each socket address is normally permitted",
+            "IO error: lock file: Resource temporarily unavailable",
+            "lock file\rtemporarily unavailable",
+            "lock file\ntemporarily unavailable",
+            "temporarily unavailable: lock file",
+            "lock file\nlock file: temporarily unavailable",
+            "Database likely already open in another process",
+            "The process cannot access the file because it is being used by another process",
+            "database lock failed",
+            "DATABASE LOCK failed",
+            "unrelated failure",
+            "🔒 lock file: temporarily unavailable",
+        ] {
+            assert_eq!(
+                is_port_in_use_error(error),
+                port.is_match(error),
+                "{error:?}"
+            );
+            assert_eq!(is_lock_file_error(error), lock.is_match(error), "{error:?}");
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn startup_error_matchers_preserve_regex_semantics(
+            prefix in ".{0,64}",
+            middle in ".{0,64}",
+            suffix in ".{0,64}",
+            fragment in prop::sample::select(vec![
+                "already in use",
+                "access a socket in a way forbidden by its access permissions",
+                "Only one usage of each socket address",
+                "in use",
+                "being used by another process",
+                "Database likely already open",
+                "database lock",
+                "unrelated failure",
+            ]),
+            separator in prop::sample::select(vec!["", "\n", "\r", "\r\n", "é"]),
+        ) {
+            let port_error = format!("{prefix}{fragment}{suffix}");
+            prop_assert_eq!(is_port_in_use_error(&port_error), original_port_matcher().is_match(&port_error));
+            prop_assert_eq!(is_lock_file_error(&port_error), original_lock_matcher().is_match(&port_error));
+            let lock_error = format!("{prefix}lock file{middle}{separator}temporarily unavailable{suffix}");
+            prop_assert_eq!(is_lock_file_error(&lock_error), original_lock_matcher().is_match(&lock_error));
+        }
+    }
 }

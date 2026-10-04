@@ -1,6 +1,7 @@
 # Common note-encryption dependency migration
 
 Depends on [Common #540](https://github.com/zakura-core/common/pull/540).
+Coordinated wallet draft: [#84](https://github.com/zakura-core/wallet-libraries/pull/84).
 The migration baseline is node main `0a7ecd432` and its resolved
 `zcash_encoding 0.4.0` / `zcash_note_encryption 0.4.2` implementations.
 
@@ -13,11 +14,9 @@ package after its Common dependency family is migrated.
 
 ## Release and API review
 
-At the user's request, release numbers are deferred. The existing `=2.2.0`
-requirements are staging values, not permission to republish 2.2.0 or to mix
-old published Common crates with the new note-encryption package. Select the
-breaking coordinated Common number and rewrite every Common requirement
-before merging. Do not automatically bump the node binary's major version.
+Common 3.0.0 is staged across every Common dependency in this draft.
+The new package shares one note-encryption type family with Sapling,
+Orchard, Ironwood, and primitives. The node binary remains 1.6.1.
 
 There are no new public or `pub(crate)` items, enum variants, constructors,
 features, aliases, or handwritten signatures in this node change.
@@ -25,9 +24,29 @@ features, aliases, or handwritten signatures in this node change.
 signature. The direct fork trait calls are private. Existing Common-facing
 interfaces (for example Sapling output commitments, tree nodes/frontiers,
 conversion trait implementations, and `Transaction::to_librustzcash`'s
-crate-visible adapter) need a separate node library SemVer assessment once
-the final Common version is selected. A library major requirement does not
+crate-visible adapter) were reviewed against the current sparse registry index. A library major requirement does not
 force a binary major release.
+
+The current sparse index was queried before staging versions. Existing
+major bumps cover chain 9.0.0 → 10.0.0, network 9.0.0 → 10.0.0,
+node-services 4.0.0 → 5.0.0, state 10.0.0 → 11.0.0, and RPC
+12.0.0 → 13.0.0. Consensus exposes the prover and verification type
+family, while script/header-chain expose chain types in constructors,
+requests, results, and errors. Their pending patch bumps were raised in
+place: consensus 10.0.0 → 11.0.0, script 4.0.0 → 5.0.0, and
+header-chain 4.0.0 → 5.0.0. `cargo release version` rewrote dependent
+requirements. No second major was stacked on an existing pending major.
+Utils has an empty public library and keeps its pending 2.2.7 patch over
+published 2.2.6. The node binary remains 1.6.1.
+
+Existing public fields, methods, aliases, conversion impls, trait impls,
+and feature-gated interfaces exposing these dependencies change identity
+transitively; no additional visibility or signature edits were made.
+Crate-visible Sapling verifier adapters (`Item::new`, `verify_single`
+inputs) and Halo2 `Item::new_with_wtx_id`/verification-cache types carry
+that same identity change. See Common's complete API inventory for the
+underlying byte-wrapper and trait changes.
+
 
 ## Validation
 
@@ -49,7 +68,7 @@ Using temporary local overrides for every published Common package:
 The local overrides were `[patch.crates-io]` entries in `.cargo/config.toml`
 pointing every published Common package to the isolated migration worktree.
 They and their resulting local lockfile are excluded from this draft. The
-original registry lockfile is retained until the chosen Common release is
+original registry lockfile is retained until Common 3.0.0 is
 published; do not treat that old lockfile as migration validation. After
 Common publishes, regenerate the registry lockfile and repeat locked graph
 and recovery checks without overrides before merging or releasing.

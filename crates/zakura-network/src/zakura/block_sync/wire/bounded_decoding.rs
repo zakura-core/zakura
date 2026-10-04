@@ -7,7 +7,8 @@ fn block_with_many_transactions() -> Arc<block::Block> {
         block::Block::zcash_deserialize(&zakura_test::vectors::BLOCK_MAINNET_1_BYTES[..]).unwrap();
     // Parsing accepts empty V1 transactions. Consensus validation is separate.
     let transaction = Transaction::zcash_deserialize(&[1, 0, 0, 0, 0, 0, 0, 0, 0, 0][..]).unwrap();
-    block.transactions = vec![Arc::new(transaction); 1_025];
+    let transaction = Arc::new(transaction);
+    block.transactions = vec![transaction; 1_025];
     Arc::new(block)
 }
 

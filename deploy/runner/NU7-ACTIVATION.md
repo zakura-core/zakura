@@ -146,3 +146,14 @@ ssh root@167.99.103.111 'runuser -u nu7-activation -- python3 /opt/zakura-nu7-st
 The override applies only to that command's in-memory configuration; it never
 changes the selector or runtime manifest. Retain deployment artifact checksum
 evidence as well: a short build identifier is not a full binary attestation.
+
+Before installing the shared staging dashboard or remote miner health units, create
+the dedicated system account named `zakura-nu7-dashboard` or
+`zakura-nu7-miner-status`, respectively, with `useradd --system --no-create-home
+--shell /usr/sbin/nologin NAME`. Stop an already running DynamicUser unit first
+when that name is not in `/etc/passwd`, because its transient NSS entry otherwise
+blocks user creation. Ubuntu system D-Bus can reject transient UIDs even for
+read-only `systemctl is-active`; the stable unprivileged identity preserves real
+service-state observations. `DynamicUser=yes` reuses the existing identity and
+the remaining service sandbox still applies. Verify actual `/v1/miner`
+`nodeActive`, `minerActive`, and `nodeHealthy` before accepting the cutover.

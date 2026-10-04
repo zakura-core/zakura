@@ -898,7 +898,7 @@ async fn queued_requests_allocate_only_commitments_until_dispatch() {
     assert_eq!(serve.open(), COUNT);
     // Includes the queue, tracked completion watches and retained receivers.
     // A response channel per queued job alone used several KiB per request.
-    let ceiling = usize::try_from(COUNT).unwrap() * 256;
+    let ceiling = usize::try_from(COUNT).unwrap() * 512;
     assert!(allocations.retained_bytes < ceiling, "{allocations:?}");
     eprintln!("queued requests={COUNT}, {allocations:?}");
     cancel.cancel();

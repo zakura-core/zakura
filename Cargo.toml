@@ -76,7 +76,7 @@ color-eyre = { version = "0.6.3", default-features = false }
 console-subscriber = "0.5"
 criterion = "0.5"
 crossbeam-channel = "0.5.14"
-derive-new = "0.5"
+derive-new = "0.7"
 dirs = "6.0"
 ed25519-zebra = "4.2"
 equihash = { version = "=2.2.0", package = "zakura-equihash" }

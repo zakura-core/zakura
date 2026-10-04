@@ -5,7 +5,7 @@ use std::{
     io::Write,
 };
 
-use abscissa_core::{Component, FrameworkError, Shutdown};
+use abscissa_core::{component::Injectable, Component, FrameworkError, Shutdown};
 
 use tokio::sync::watch;
 use tracing::{field::Visit, Level};
@@ -397,7 +397,7 @@ impl std::fmt::Debug for Tracing {
     }
 }
 
-impl<A: abscissa_core::Application> Component<A> for Tracing {
+impl<A: abscissa_core::Application> Injectable<A> for Tracing {
     fn id(&self) -> abscissa_core::component::Id {
         abscissa_core::component::Id::new("zakurad::components::tracing::component::Tracing")
     }
@@ -406,6 +406,9 @@ impl<A: abscissa_core::Application> Component<A> for Tracing {
         build_version()
     }
 
+}
+
+impl<A: abscissa_core::Application> Component<A> for Tracing {
     fn before_shutdown(&self, _kind: Shutdown) -> Result<(), FrameworkError> {
         #[cfg(feature = "flamegraph")]
         if let Some(ref grapher) = self.flamegrapher {

@@ -11,7 +11,7 @@ from unittest.mock import patch
 
 
 class QualifyTests(unittest.TestCase):
-    def receipt(self, adapter):
+    def receipt(self, adapter, build='v7.0.0-rc.0'):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory)
             binary = path / 'grpcurl'
@@ -34,7 +34,7 @@ class QualifyTests(unittest.TestCase):
 
             module = types.ModuleType('nu7_activation')
             module.ActivationFeed = Feed
-            module.rpc = lambda *args: {'build': 'Zebra7', 'protocolversion': 170180}
+            module.rpc = lambda *args: {'build': build, 'protocolversion': 170180}
             source = Path(__file__).with_name('nu7-qualify.py').read_text()
             source = source.replace("Path('/etc/zakura/nu7-activation.json')", f"Path({str(config_file)!r})")
             output = io.StringIO()
@@ -53,8 +53,13 @@ class QualifyTests(unittest.TestCase):
     def test_rpc_reference_has_no_grpc_path_and_verifies_schedule(self):
         receipt = self.receipt('json-rpc')
         self.assertTrue(receipt['activationReferencePrepared'])
-        self.assertEqual(receipt['referenceBuildVersion'], 'Zebra7')
+        self.assertEqual(receipt['referenceBuildVersion'], 'v7.0.0-rc.0')
         self.assertNotIn('grpcurlSha256', receipt)
+
+    def test_old_reference_version_cannot_claim_activation_readiness(self):
+        receipt = self.receipt('json-rpc', 'v6.3.0')
+        self.assertTrue(receipt['preparedChainAgreement'])
+        self.assertFalse(receipt['activationReferencePrepared'])
 
 
 if __name__ == '__main__':

@@ -2,7 +2,8 @@
 
 use std::{
     borrow::Cow,
-    collections::{HashMap, HashSet},
+    cmp::Reverse,
+    collections::{BTreeSet, HashMap, HashSet},
     hash::Hash,
 };
 
@@ -16,7 +17,27 @@ use zakura_node_services::mempool::TransactionDependencies;
 
 use crate::components::mempool::pending_outputs::PendingOutputs;
 
-use super::super::SameEffectsTipRejectionError;
+use super::{super::SameEffectsTipRejectionError, eviction_cost::EvictionCost};
+
+/// The most transactions in a connected group of unconfirmed dependencies.
+///
+/// Counting parents, children, and siblings bounds both package width and depth.
+/// Three transactions have at most three dependency edges, so package scores can
+/// be recomputed directly without cached ancestor totals.
+pub(super) const MAX_MEMPOOL_PACKAGE_TRANSACTIONS: usize = 3;
+
+/// The most ancestors of a transaction in a bounded dependency group.
+pub(super) const MAX_MEMPOOL_ANCESTORS: usize = MAX_MEMPOOL_PACKAGE_TRANSACTIONS - 1;
+
+/// An eviction score, followed by the newest-first insertion time and hash.
+type EvictionCandidate = (
+    EvictionCost,
+    Reverse<Option<chrono::DateTime<chrono::Utc>>>,
+    transaction::Hash,
+);
+
+#[cfg(feature = "mempool-bench")]
+pub(super) mod benchmarks;
 
 // Imports for doc links
 #[allow(unused_imports)]
@@ -38,6 +59,12 @@ use zakura_chain::transaction::MEMPOOL_TRANSACTION_COST_THRESHOLD;
 pub struct VerifiedSet {
     /// The set of verified transactions in the mempool.
     transactions: HashMap<transaction::Hash, VerifiedUnminedTx>,
+
+    /// One current eviction candidate per transaction, ordered cheapest first.
+    eviction_order: BTreeSet<EvictionCandidate>,
+
+    #[cfg(test)]
+    eviction_score_evaluations: std::sync::atomic::AtomicUsize,
 
     /// A map of dependencies between transactions in the mempool that
     /// spend or create outputs of other transactions in the mempool.
@@ -134,6 +161,7 @@ impl VerifiedSet {
     /// Also clears all internal caches.
     pub fn clear(&mut self) {
         self.transactions.clear();
+        self.eviction_order.clear();
         self.transaction_dependencies.clear();
         self.spent_outpoints.clear();
         self.sprout_nullifiers.clear();
@@ -147,10 +175,52 @@ impl VerifiedSet {
         self.report_metrics();
     }
 
+    /// Returns the mempool ancestors of `transaction`, or an error if
+    /// [`VerifiedSet::insert`] would reject it.
+    ///
+    /// Two transactions have a spend conflict if they spend the same UTXO or if they reveal the
+    /// same nullifier.
+    pub fn check_insert(
+        &self,
+        transaction: &UnminedTx,
+        spent_mempool_outpoints: &[transparent::OutPoint],
+    ) -> Result<HashSet<transaction::Hash>, SameEffectsTipRejectionError> {
+        if self.has_spend_conflicts(transaction) {
+            return Err(SameEffectsTipRejectionError::SpendConflict);
+        }
+
+        // This likely only needs to check that the transaction hash of the outpoint is still in the mempool,
+        // but it's likely rare that a transaction spends multiple transparent outputs of
+        // a single transaction in practice.
+        for outpoint in spent_mempool_outpoints {
+            if !self.created_outputs.contains_key(outpoint) {
+                return Err(SameEffectsTipRejectionError::MissingOutput);
+            }
+        }
+
+        let parents: HashSet<_> = spent_mempool_outpoints
+            .iter()
+            .map(|outpoint| outpoint.hash)
+            .collect();
+        let ancestors = self.ancestors(parents);
+        if ancestors.len() > MAX_MEMPOOL_ANCESTORS {
+            return Err(SameEffectsTipRejectionError::TooManyAncestors);
+        }
+
+        if self.dependency_group(ancestors.iter().copied()).len()
+            >= MAX_MEMPOOL_PACKAGE_TRANSACTIONS
+        {
+            return Err(SameEffectsTipRejectionError::TooManyPackageTransactions);
+        }
+
+        Ok(ancestors)
+    }
+
     /// Insert a `transaction` into the set.
     ///
-    /// Returns an error if the `transaction` has spend conflicts with any other transaction
-    /// already in the set.
+    /// Returns an error if `transaction` conflicts with a transaction already in
+    /// the set, has a missing mempool output, or would exceed the ancestor or
+    /// connected dependency group limit.
     ///
     /// Two transactions have a spend conflict if they spend the same UTXO or if they reveal the
     /// same nullifier.
@@ -161,18 +231,9 @@ impl VerifiedSet {
         pending_outputs: &mut PendingOutputs,
         height: Option<Height>,
     ) -> Result<(), SameEffectsTipRejectionError> {
-        if self.has_spend_conflicts(&transaction.transaction) {
-            return Err(SameEffectsTipRejectionError::SpendConflict);
-        }
-
-        // This likely only needs to check that the transaction hash of the outpoint is still in the mempool,
-        // but it's likely rare that a transaction spends multiple transparent outputs of
-        // a single transaction in practice.
-        for outpoint in &spent_mempool_outpoints {
-            if !self.created_outputs.contains_key(outpoint) {
-                return Err(SameEffectsTipRejectionError::MissingOutput);
-            }
-        }
+        let ancestors = self.check_insert(&transaction.transaction, &spent_mempool_outpoints)?;
+        let affected = self.dependency_group(ancestors);
+        self.remove_eviction_candidates(&affected);
 
         let tx_id = transaction.transaction.id().mined_id();
         self.transaction_dependencies
@@ -197,57 +258,288 @@ impl VerifiedSet {
         transaction.height = height;
         self.metrics.add_transaction(&transaction);
         self.transactions.insert(tx_id, transaction);
+        self.insert_eviction_candidates(&self.dependency_group([tx_id]));
 
         self.report_metrics();
 
         Ok(())
     }
 
-    /// Evict one transaction and any transactions that directly or indirectly depend on
-    /// its outputs from the set.
+    /// Selects the packages to evict so that `incoming` fits under `tx_cost_limit`.
     ///
-    /// Removes a transaction with probability in direct proportion to the
-    /// eviction weight, as per [ZIP-401].
+    /// A package is a transaction plus its descendants: the mempool transactions
+    /// that directly or indirectly spend its outputs. Removing a transaction
+    /// removes its descendants, so the mempool evicts whole packages. It evicts
+    /// the package with the lowest [`VerifiedSet::package_score`] first, and
+    /// breaks ties by evicting the newest transaction first, then by hash.
     ///
-    /// [`VerifiedUnminedTx::eviction_weight`] adds a low-fee penalty when a
-    /// transaction pays less than Zakura's conventional fee.
+    /// The mempool never evicts `incoming_ancestors`, because evicting them would
+    /// invalidate `incoming`.
     ///
-    /// # Note
+    /// Both `incoming` on its own and its combined rate with every unconfirmed
+    /// ancestor must outbid each victim by the increment. This prevents protected
+    /// ancestors from diluting the rate of the package retained after admission.
+    /// Selection stops at the first victim that fails either comparison.
+    /// See [`EvictionCost::exceeds_by_increment`].
     ///
-    /// Collecting and calculating weights is O(n). But in practice n is limited
-    /// to 20,000 (mempooltxcostlimit/min(cost)), so the actual cost shouldn't
-    /// be too bad.
+    /// # Performance
     ///
-    /// This function is equivalent to `EvictTransaction` in [ZIP-401].
-    ///
-    /// [ZIP-401]: https://zips.z.cash/zip-0401
-    #[allow(clippy::unwrap_in_result)]
-    pub(super) fn evict_one(&mut self) -> Option<Vec<VerifiedUnminedTx>> {
-        use rand::distributions::{Distribution, WeightedIndex};
-        use rand::prelude::thread_rng;
-
-        let (keys, weights): (Vec<transaction::Hash>, Vec<u64>) = self
-            .transactions
+    /// Selection reads the ordered index without scanning the whole mempool.
+    /// Each selected victim updates at most three local candidates. For `k`
+    /// victims and `n` stored transactions, selection is O(log n + k log k), and
+    /// committing the evictions is O(k log n). The index has one entry per
+    /// transaction.
+    pub(super) fn select_eviction_victims(
+        &self,
+        incoming: &VerifiedUnminedTx,
+        incoming_ancestors: &HashSet<transaction::Hash>,
+        tx_cost_limit: u64,
+    ) -> EvictionVictims {
+        let needed = self
+            .total_cost
+            .saturating_add(incoming.cost())
+            .saturating_sub(tx_cost_limit);
+        let incoming = Self::eviction_cost(incoming);
+        // check_insert has bounded and deduplicated these protected ancestors.
+        let incoming_package = incoming_ancestors
             .iter()
-            .map(|(&tx_id, tx)| (tx_id, tx.eviction_weight()))
-            .unzip();
+            .map(|id| Self::eviction_cost(&self.transactions[id]))
+            .fold(incoming, EvictionCost::combine);
+        let incoming = incoming.min(incoming_package);
 
-        let dist = WeightedIndex::new(weights).expect(
-            "there is at least one weight, all weights are non-negative, and the total is positive",
-        );
+        // Victim planning leaves the persistent index and transactions unchanged.
+        let mut unavailable = incoming_ancestors.clone();
+        let mut changed: HashSet<transaction::Hash> = HashSet::new();
+        let mut updated = BTreeSet::new();
+        let mut candidates = self.eviction_order.iter().peekable();
+        let mut victims = EvictionVictims::default();
+        let mut roots = Vec::new();
+        let mut freed = 0;
 
-        let key_to_remove = keys
-            .get(dist.sample(&mut thread_rng()))
-            .expect("should have a key at every index in the distribution");
+        while freed < needed {
+            // Changed groups use the local index. At most three original entries
+            // are skipped per victim, plus the incoming transaction's ancestors.
+            while candidates
+                .peek()
+                .is_some_and(|(_, _, id)| unavailable.contains(id) || changed.contains(id))
+            {
+                candidates.next();
+            }
 
-        Some(self.remove(key_to_remove))
+            let candidate = match (candidates.peek(), updated.first()) {
+                (Some(original), Some(local)) if *original <= local => candidates.next().copied(),
+                (Some(_), Some(_)) | (None, Some(_)) => updated.pop_first(),
+                (Some(_), None) => candidates.next().copied(),
+                (None, None) => None,
+            };
+            let Some((score, _, root)) = candidate else {
+                return victims;
+            };
+
+            victims.cheapest.get_or_insert(score);
+            if !incoming.exceeds_by_increment(score) {
+                return victims;
+            }
+
+            roots.push(root);
+            freed += self.package(&root, &unavailable).cost();
+            if freed >= needed {
+                break;
+            }
+
+            let group = self.dependency_group([root]);
+            // Remove earlier local scores before changing the simulated graph.
+            for &id in &group {
+                if changed.contains(&id) && !unavailable.contains(&id) {
+                    updated.remove(&self.eviction_candidate(id, &unavailable));
+                }
+            }
+            let mut removed = self.descendants(root, &unavailable);
+            removed.insert(root);
+            unavailable.extend(removed);
+            changed.extend(&group);
+            updated.extend(
+                group
+                    .into_iter()
+                    .filter(|id| !unavailable.contains(id))
+                    .map(|id| self.eviction_candidate(id, &unavailable)),
+            );
+        }
+
+        victims.roots = Some(roots);
+        victims
+    }
+
+    /// Returns the candidate for a transaction in the simulated remaining pool.
+    fn eviction_candidate(
+        &self,
+        id: transaction::Hash,
+        removed: &HashSet<transaction::Hash>,
+    ) -> EvictionCandidate {
+        (
+            self.package_score(&id, removed),
+            Reverse(self.transactions[&id].time),
+            id,
+        )
+    }
+
+    /// Removes a group's candidates before mutating transactions or dependencies.
+    fn remove_eviction_candidates(&mut self, group: &HashSet<transaction::Hash>) {
+        let removed = HashSet::new();
+        for &id in group {
+            let candidate = self.eviction_candidate(id, &removed);
+            assert!(
+                self.eviction_order.remove(&candidate),
+                "every stored transaction has its current eviction candidate"
+            );
+        }
+    }
+
+    /// Restores candidates for the group's survivors after a mutation.
+    fn insert_eviction_candidates(&mut self, group: &HashSet<transaction::Hash>) {
+        let removed = HashSet::new();
+        for &id in group {
+            if self.transactions.contains_key(&id) {
+                let candidate = self.eviction_candidate(id, &removed);
+                assert!(
+                    self.eviction_order.insert(candidate),
+                    "a group's old candidates were removed before its mutation"
+                );
+            }
+        }
+    }
+
+    /// Returns the eviction score of `tx_id`, excluding removed descendants.
+    ///
+    /// The score is the higher of the transaction's own eviction cost and the
+    /// combined eviction cost of its package:
+    ///
+    /// - a high-fee descendant raises the eviction cost of its low-fee ancestor, and
+    /// - a low-fee descendant does not lower the eviction cost of its high-fee ancestor.
+    ///   The descendant is cheaper to evict on its own.
+    fn package_score(
+        &self,
+        tx_id: &transaction::Hash,
+        removed: &HashSet<transaction::Hash>,
+    ) -> EvictionCost {
+        #[cfg(test)]
+        self.eviction_score_evaluations
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+        Self::eviction_cost(&self.transactions[tx_id]).max(self.package(tx_id, removed))
+    }
+
+    /// Returns the combined eviction cost of `tx_id` and its distinct remaining
+    /// descendants.
+    fn package(
+        &self,
+        tx_id: &transaction::Hash,
+        removed: &HashSet<transaction::Hash>,
+    ) -> EvictionCost {
+        self.descendants(*tx_id, removed)
+            .iter()
+            .map(|descendant| Self::eviction_cost(&self.transactions[descendant]))
+            .fold(
+                Self::eviction_cost(&self.transactions[tx_id]),
+                EvictionCost::combine,
+            )
+    }
+
+    /// Returns the eviction cost of `transaction` on its own.
+    pub(super) fn eviction_cost(transaction: &VerifiedUnminedTx) -> EvictionCost {
+        EvictionCost::new(transaction.miner_fee.into(), transaction.cost())
+    }
+
+    /// Returns the transactions connected to `starts` through parents or children.
+    /// Stops at the group limit, which suffices to reject another member.
+    fn dependency_group(
+        &self,
+        starts: impl IntoIterator<Item = transaction::Hash>,
+    ) -> HashSet<transaction::Hash> {
+        let dependencies = self.transaction_dependencies.dependencies();
+        let dependents = self.transaction_dependencies.dependents();
+        let mut group = HashSet::new();
+        let mut pending: Vec<_> = starts.into_iter().collect();
+
+        while let Some(tx_id) = pending.pop() {
+            if !group.insert(tx_id) {
+                continue;
+            }
+            if group.len() >= MAX_MEMPOOL_PACKAGE_TRANSACTIONS {
+                break;
+            }
+            pending.extend(dependencies.get(&tx_id).into_iter().flatten());
+            pending.extend(dependents.get(&tx_id).into_iter().flatten());
+        }
+
+        group
+    }
+
+    /// Returns the transactions in the set that directly or indirectly spend outputs of `tx_id`,
+    /// skipping transactions in `removed`.
+    ///
+    /// Every returned transaction is in the set.
+    fn descendants(
+        &self,
+        tx_id: transaction::Hash,
+        removed: &HashSet<transaction::Hash>,
+    ) -> HashSet<transaction::Hash> {
+        let dependents = self.transaction_dependencies.dependents();
+        let mut descendants = HashSet::new();
+        let mut pending = vec![tx_id];
+
+        while let Some(tx_id) = pending.pop() {
+            for &dependent in dependents.get(&tx_id).into_iter().flatten() {
+                if !removed.contains(&dependent)
+                    && self.transactions.contains_key(&dependent)
+                    && descendants.insert(dependent)
+                {
+                    pending.push(dependent);
+                }
+            }
+        }
+
+        descendants
+    }
+
+    /// Returns `parents` and the transactions in the set that they directly or indirectly
+    /// spend outputs of.
+    ///
+    /// The walk stops after it finds more than [`MAX_MEMPOOL_ANCESTORS`] transactions, so its
+    /// cost stays bounded. Transactions already in the set have at most that many ancestors.
+    fn ancestors(
+        &self,
+        parents: impl IntoIterator<Item = transaction::Hash>,
+    ) -> HashSet<transaction::Hash> {
+        let dependencies = self.transaction_dependencies.dependencies();
+        let mut ancestors = HashSet::new();
+        let mut pending: Vec<_> = parents.into_iter().collect();
+
+        while let Some(tx_id) = pending.pop() {
+            if ancestors.len() > MAX_MEMPOOL_ANCESTORS {
+                break;
+            }
+
+            if ancestors.insert(tx_id) {
+                pending.extend(dependencies.get(&tx_id).into_iter().flatten());
+            }
+        }
+
+        ancestors
     }
 
     /// Clears a list of mined transaction ids from the lists of dependencies for
     /// any other transactions in the mempool and removes their dependents.
     pub fn clear_mined_dependencies(&mut self, mined_ids: &HashSet<transaction::Hash>) {
+        let affected: HashSet<_> = mined_ids
+            .iter()
+            .filter(|id| self.transactions.contains_key(id))
+            .flat_map(|&id| self.dependency_group([id]))
+            .collect();
+        self.remove_eviction_candidates(&affected);
         self.transaction_dependencies
             .clear_mined_dependencies(mined_ids);
+        self.insert_eviction_candidates(&affected);
     }
 
     /// Removes all transactions in the set that match the `predicate`.
@@ -290,7 +582,9 @@ impl VerifiedSet {
     /// as the last item.
     ///
     /// Also removes the outputs of any removed transactions from the internal caches.
-    fn remove(&mut self, key_to_remove: &transaction::Hash) -> Vec<VerifiedUnminedTx> {
+    pub(super) fn remove(&mut self, key_to_remove: &transaction::Hash) -> Vec<VerifiedUnminedTx> {
+        let affected = self.dependency_group([*key_to_remove]);
+        self.remove_eviction_candidates(&affected);
         let removed_transactions: Vec<_> = self
             .transaction_dependencies
             .remove_all(key_to_remove)
@@ -311,8 +605,32 @@ impl VerifiedSet {
             })
             .collect();
 
+        self.insert_eviction_candidates(&affected);
         self.report_metrics();
         removed_transactions
+    }
+
+    /// Panics if any dependency group exceeds the admission limit.
+    #[cfg(test)]
+    pub(super) fn assert_dependency_groups_are_bounded(&self) {
+        let removed = HashSet::new();
+        let expected: BTreeSet<_> = self
+            .transactions
+            .keys()
+            .map(|&id| self.eviction_candidate(id, &removed))
+            .collect();
+        assert_eq!(self.eviction_order, expected);
+        for &start in self.transactions.keys() {
+            let mut group = HashSet::new();
+            let mut pending = vec![start];
+            while let Some(tx_id) = pending.pop() {
+                if group.insert(tx_id) {
+                    pending.extend(self.transaction_dependencies.direct_dependencies(&tx_id));
+                    pending.extend(self.transaction_dependencies.direct_dependents(&tx_id));
+                }
+            }
+            assert!(group.len() <= MAX_MEMPOOL_PACKAGE_TRANSACTIONS);
+        }
     }
 
     /// Returns `true` if the given `transaction` has any spend conflicts with transactions in the
@@ -435,6 +753,22 @@ impl VerifiedSet {
     }
 }
 
+/// The packages that the mempool evicts to make room for an incoming transaction.
+///
+/// See [`VerifiedSet::select_eviction_victims`].
+#[derive(Debug, Default)]
+pub(super) struct EvictionVictims {
+    /// The transactions to evict with their descendants, cheapest first.
+    ///
+    /// `None` if the incoming transaction does not outbid them, or does not fit even after
+    /// evicting every other package.
+    pub roots: Option<Vec<transaction::Hash>>,
+
+    /// The score of the cheapest package that the incoming transaction could evict, or `None`
+    /// if there is no such package.
+    pub cheapest: Option<EvictionCost>,
+}
+
 /// The aggregate values for mempool metrics.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct MempoolMetrics {
@@ -544,6 +878,59 @@ impl MempoolMetrics {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn selection_rescores_only_changed_groups() {
+        use std::sync::atomic::Ordering;
+
+        use super::super::fixtures::TxFactory;
+
+        let mut factory = TxFactory::new();
+        let mut verified = VerifiedSet::default();
+        let mut pending = PendingOutputs::default();
+        for _ in 0..1_000 {
+            let parent = factory.tx_with(10_000, 1, 0);
+            let child = factory.tx_with(20_000, 1, 0);
+            let grandchild = factory.tx(30_000);
+            let output = |tx: &VerifiedUnminedTx| {
+                transparent::OutPoint::from_usize(tx.transaction.id().mined_id(), 0)
+            };
+            verified
+                .insert(parent.clone(), vec![], &mut pending, None)
+                .unwrap();
+            verified
+                .insert(child.clone(), vec![output(&parent)], &mut pending, None)
+                .unwrap();
+            verified
+                .insert(grandchild, vec![output(&child)], &mut pending, None)
+                .unwrap();
+        }
+        let limit = verified.total_cost();
+        let before = verified.eviction_order.clone();
+        verified
+            .eviction_score_evaluations
+            .store(0, Ordering::Relaxed);
+        let rejected =
+            verified.select_eviction_victims(&factory.tx(10_000), &HashSet::new(), limit);
+        assert!(rejected.roots.is_none());
+        assert_eq!(
+            verified.eviction_score_evaluations.load(Ordering::Relaxed),
+            0
+        );
+
+        let incoming = factory.tx_with(1_000_000, 0, 240_000);
+        let victims = verified.select_eviction_victims(&incoming, &HashSet::new(), limit);
+        let roots = victims.roots.expect("high fee selects enough victims");
+        let max_victims = usize::try_from(
+            super::super::super::config::DEFAULT_MAX_TRANSACTION_BYTES
+                .div_ceil(MEMPOOL_TRANSACTION_COST_THRESHOLD),
+        )
+        .expect("default transaction limit fits in usize");
+        assert!(roots.len() <= max_victims);
+        let local_score_budget = 2 * (MAX_MEMPOOL_PACKAGE_TRANSACTIONS - 1) * roots.len();
+        assert!(verified.eviction_score_evaluations.load(Ordering::Relaxed) <= local_score_budget);
+        assert_eq!(verified.eviction_order, before);
+    }
 
     #[test]
     fn clear_removes_ironwood_nullifiers() {

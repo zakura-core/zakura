@@ -16,7 +16,7 @@ use std::{
     ops::RangeInclusive,
 };
 
-use derive_getters::Getters;
+use getset::Getters;
 use zakura_chain::{
     block::{self, Height},
     parameters::Network,
@@ -41,19 +41,17 @@ pub const ADDRESS_HEIGHTS_FULL_RANGE: RangeInclusive<Height> = Height(1)..=Heigh
 #[derive(Clone, Debug, Default, Eq, PartialEq, Getters)]
 pub struct AddressUtxos {
     /// A set of unspent transparent outputs.
-    #[getter(skip)]
     utxos: BTreeMap<OutputLocation, transparent::Output>,
 
     /// The transaction IDs for each [`OutputLocation`] in `utxos`.
-    #[getter(skip)]
     tx_ids: BTreeMap<TransactionLocation, transaction::Hash>,
 
     /// The configured network for this state.
-    #[getter(skip)]
     network: Network,
 
     /// The last height and hash that was queried to produce these UTXOs, if any.
     /// It will be None if the state is empty.
+    #[getset(get = "pub")]
     last_height_and_hash: Option<(block::Height, block::Hash)>,
 }
 

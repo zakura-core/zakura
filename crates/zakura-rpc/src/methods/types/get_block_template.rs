@@ -15,8 +15,8 @@ use std::{
     time::Duration,
 };
 
-use derive_getters::Getters;
 use derive_new::new;
+use getset::{CopyGetters, Getters};
 use jsonrpsee::core::RpcResult;
 use jsonrpsee_types::{ErrorCode, ErrorObject};
 use rand::{rngs::OsRng, RngCore};
@@ -197,22 +197,24 @@ type InBlockTxDependenciesDepth = usize;
 /// This is the output of the `getblocktemplate` RPC in the default 'template' mode. See
 /// [`BlockProposalResponse`] for the output in 'proposal' mode.
 #[allow(clippy::too_many_arguments)]
-#[derive(Clone, Eq, PartialEq, serde::Serialize, serde::Deserialize, Getters, new)]
+#[derive(Clone, Eq, PartialEq, serde::Serialize, serde::Deserialize, Getters, CopyGetters, new)]
 pub struct BlockTemplateResponse {
     /// The getblocktemplate RPC capabilities supported by Zebra.
     ///
     /// Zakura accepts proposal, long-poll, and work-ID fields without requiring miners to declare
     /// those capabilities. Zakura does not support server lists.
+    #[getset(get = "pub")]
     pub(crate) capabilities: Vec<String>,
 
     /// The version of the block format.
     /// Always 4 for new Zcash blocks.
+    #[getset(get_copy = "pub")]
     pub(crate) version: u32,
 
     /// The hash of the previous block.
     #[serde(rename = "previousblockhash")]
     #[serde(with = "hex")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     pub(crate) previous_block_hash: block::Hash,
 
     /// The block commitment for the new block's header.
@@ -220,7 +222,7 @@ pub struct BlockTemplateResponse {
     /// Same as [`DefaultRoots::block_commitments_hash`], see that field for details.
     #[serde(rename = "blockcommitmentshash")]
     #[serde(with = "hex")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     pub(crate) block_commitments_hash: ChainHistoryBlockTxAuthCommitmentHash,
 
     /// Legacy backwards-compatibility header root field.
@@ -228,7 +230,7 @@ pub struct BlockTemplateResponse {
     /// Same as [`DefaultRoots::block_commitments_hash`], see that field for details.
     #[serde(rename = "lightclientroothash")]
     #[serde(with = "hex")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     pub(crate) light_client_root_hash: ChainHistoryBlockTxAuthCommitmentHash,
 
     /// Legacy backwards-compatibility header root field.
@@ -236,7 +238,7 @@ pub struct BlockTemplateResponse {
     /// Same as [`DefaultRoots::block_commitments_hash`], see that field for details.
     #[serde(rename = "finalsaplingroothash")]
     #[serde(with = "hex")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     pub(crate) final_sapling_root_hash: ChainHistoryBlockTxAuthCommitmentHash,
 
     /// The block header roots for the transactions in the block template.
@@ -244,23 +246,26 @@ pub struct BlockTemplateResponse {
     /// If the transactions in the block template are modified, these roots must be recalculated
     /// [according to the specification](https://zcash.github.io/rpc/getblocktemplate.html).
     #[serde(rename = "defaultroots")]
+    #[getset(get = "pub")]
     pub(crate) default_roots: DefaultRoots,
 
     /// The non-coinbase transactions selected for this block template.
+    #[getset(get = "pub")]
     pub(crate) transactions: Vec<TransactionTemplate<amount::NonNegative>>,
 
     /// The coinbase transaction generated from `transactions` and `height`.
     #[serde(rename = "coinbasetxn")]
+    #[getset(get = "pub")]
     pub(crate) coinbase_txn: TransactionTemplate<amount::NegativeOrZero>,
 
     /// An ID that represents the chain tip and mempool contents for this template.
     #[serde(rename = "longpollid")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     pub(crate) long_poll_id: LongPollId,
 
     /// The expected difficulty for the new block displayed in expanded form.
     #[serde(with = "hex")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     pub(crate) target: ExpandedDifficulty,
 
     /// > For each block other than the genesis block, nTime MUST be strictly greater than
@@ -268,22 +273,26 @@ pub struct BlockTemplateResponse {
     ///
     /// <https://zips.z.cash/protocol/protocol.pdf#blockheader>
     #[serde(rename = "mintime")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     pub(crate) min_time: DateTime32,
 
     /// Hardcoded list of block fields the miner is allowed to change.
+    #[getset(get = "pub")]
     pub(crate) mutable: Vec<String>,
 
     /// A range of valid nonces that goes from `u32::MIN` to `u32::MAX`.
     #[serde(rename = "noncerange")]
+    #[getset(get = "pub")]
     pub(crate) nonce_range: String,
 
     /// Max legacy signature operations in the block.
     #[serde(rename = "sigoplimit")]
+    #[getset(get_copy = "pub")]
     pub(crate) sigop_limit: u32,
 
     /// Max block size in bytes
     #[serde(rename = "sizelimit")]
+    #[getset(get_copy = "pub")]
     pub(crate) size_limit: u64,
 
     /// > the current time as seen by the server (recommended for block time).
@@ -291,16 +300,17 @@ pub struct BlockTemplateResponse {
     ///
     /// <https://en.bitcoin.it/wiki/BIP_0022#Block_Template_Request>
     #[serde(rename = "curtime")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     pub(crate) cur_time: DateTime32,
 
     /// The expected difficulty for the new block displayed in compact form.
     #[serde(with = "hex")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     pub(crate) bits: CompactDifficulty,
 
     /// The height of the next block in the best chain.
     // Optional TODO: use Height type, but check that deserialized heights are within Height::MAX
+    #[getset(get_copy = "pub")]
     pub(crate) height: u32,
 
     /// > the maximum time allowed
@@ -317,11 +327,12 @@ pub struct BlockTemplateResponse {
     /// Some miners don't check the maximum time. This can cause invalid blocks after network downtime,
     /// a significant drop in the hash rate, or after the testnet minimum difficulty interval.
     #[serde(rename = "maxtime")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     pub(crate) max_time: DateTime32,
 
     /// Identifies this prepared mining candidate.
     #[serde(rename = "workid")]
+    #[getset(get = "pub")]
     pub(crate) work_id: String,
 
     /// > only relevant for long poll responses:
@@ -338,7 +349,7 @@ pub struct BlockTemplateResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(default)]
     #[serde(rename = "submitold")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     pub(crate) submit_old: Option<bool>,
 }
 

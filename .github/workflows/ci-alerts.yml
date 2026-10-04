@@ -1,0 +1,83 @@
+name: CI alerts
+
+# Posts to #zakura-alerts when a watched workflow fails on `main`, and again when
+# it recovers. A broken push alerts once; every scheduled failure alerts. See
+# `scripts/ci_alert.py` for the rules.
+#
+# Watch every workflow that runs on `main` pushes or schedules, except those that
+# already alert Slack themselves: the PR node bake and reaper, the continuous
+# genesis sync fleet, and the VCT handoff canary. The hourly upstream PR triage
+# pilot is also left out until it passes again. Each entry must match its
+# workflow's `name:`, which `scripts/test_ci_alert.py` checks.
+#
+# Run it manually to post a test message and check the webhook.
+
+on:
+  workflow_run: # zizmor: ignore[dangerous-triggers] -- only reads run metadata through the API and posts to Slack; never checks out or runs code from the triggering run
+    workflows:
+      - Changelog fragments
+      - Coverage
+      - Cross-platform build
+      - Docs Check
+      - Header-chain fuzzing
+      - Lint
+      - Perf bench (ephemeral droplets)
+      - Semver checks
+      - Test Crate Build
+      - Test Docker Config
+      - Unit Tests
+      - Update Mainnet release state
+      - Zakura E2E
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  # One group per watched attempt. A shared group would hold only one pending
+  # alert and cancel the rest; each alert judges the run history on its own.
+  group: ci-alerts-${{ github.event.workflow_run.id || github.run_id }}-${{ github.event.workflow_run.run_attempt }}
+  cancel-in-progress: false
+
+jobs:
+  alert:
+    name: alert
+    # A fork's pull request can come from a branch named `main`, so also require
+    # this repository's push or scheduled run.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.head_repository.full_name == github.repository &&
+      contains(fromJSON('["push", "schedule"]'), github.event.workflow_run.event) &&
+      !contains(fromJSON('["cancelled", "skipped"]'), github.event.workflow_run.conclusion))
+    permissions:
+      actions: read
+      contents: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/workflows/scripts
+
+      - name: Post failure or recovery
+        if: github.event_name == 'workflow_run'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+          SLACK_WEB_HOOK: ${{ secrets.SLACK_WEB_HOOK }}
+        run: >-
+          python3 .github/workflows/scripts/ci_alert.py --repository "$REPOSITORY"
+          --run-id "$RUN_ID" --attempt "$RUN_ATTEMPT"
+
+      - name: Post test message
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          REPOSITORY: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          SLACK_WEB_HOOK: ${{ secrets.SLACK_WEB_HOOK }}
+        run: python3 .github/workflows/scripts/ci_alert.py --repository "$REPOSITORY" --test "$RUN_URL"

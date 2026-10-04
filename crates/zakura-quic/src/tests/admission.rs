@@ -193,3 +193,30 @@ async fn concurrent_sockets_preserve_an_outbound_slot() {
     .await
     .unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn outbound_connections_can_use_entire_budget() {
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        let server = server();
+        let client = QuicEndpoint::bind(
+            NodeSecretKey::generate(),
+            &limited_bind(4, 3),
+            &test_config(),
+        )
+        .unwrap();
+        let mut connections = Vec::new();
+        for _ in 0..4 {
+            connections.push(client.connect(server.addr(), ALPN).await.unwrap());
+        }
+        assert_eq!(open_transports(&client), 4);
+        assert!(matches!(
+            client.connect(server.addr(), ALPN).await,
+            Err(ConnectError::Capacity)
+        ));
+        drop(connections);
+        client.shutdown().await;
+        server.endpoint.shutdown().await;
+    })
+    .await
+    .unwrap();
+}

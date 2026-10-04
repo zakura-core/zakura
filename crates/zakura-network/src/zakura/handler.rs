@@ -437,6 +437,17 @@ pub struct ZakuraLocalLimits {
     pub max_inbound_queue_depth: u16,
 }
 
+/// Reserve one eighth for outbound progress within the existing total.
+/// A single configured slot remains shared in either direction.
+fn inbound_capacity(total: usize) -> usize {
+    let total = total.max(1);
+    if total == 1 {
+        total
+    } else {
+        total - (total / 8).max(1)
+    }
+}
+
 impl ZakuraLocalLimits {
     /// Build local handler limits from network configuration and handshake policy.
     pub fn from_config(config: &Config) -> Self {
@@ -2356,6 +2367,7 @@ impl ZakuraProtocolHandler {
         conn: &ZakuraConnTrace,
     ) -> Result<NativeHandshakeNegotiated, ZakuraHandlerError> {
         let Ok(_inbound) = self.inbound_handshakes.clone().try_acquire_owned() else {
+            metrics::counter!("zakura.p2p.conn.rejected.pending_handshake").increment(1);
             connection.close(
                 VarInt::from_u32(ZAKURA_CLOSE_RESOURCE),
                 b"pending handshake",
@@ -6000,6 +6012,7 @@ impl ZakuraHandlerError {
 
 #[cfg(test)]
 mod tests {
+    mod admission;
     pub(super) mod connection;
     mod quic_progress;
     use super::*;
@@ -11131,16 +11144,5 @@ mod tests {
 
         server_ep.shutdown().await;
         Ok(())
-    }
-}
-
-/// Reserve one eighth for outbound progress within the existing total.
-/// A single configured slot remains shared in either direction.
-fn inbound_capacity(total: usize) -> usize {
-    let total = total.max(1);
-    if total == 1 {
-        total
-    } else {
-        total - (total / 8).max(1)
     }
 }

@@ -23,12 +23,8 @@ pub struct LocalEndpointFactory {
 impl LocalEndpointFactory {
     /// Create a factory with the default transport settings.
     pub fn new() -> Self {
-        Self {
-            quic: QuicConfig::default(),
-            max_bidi_streams: DEFAULT_TEST_MAX_BIDI_STREAMS,
-            max_connections: 256,
-            max_inbound_connections: 224,
-        }
+        Self::with_limits(&ZakuraLocalLimits::from_config(&crate::Config::default()))
+            .max_bidi_streams(DEFAULT_TEST_MAX_BIDI_STREAMS)
     }
 
     /// Create a factory with the transport settings a node with `limits` uses.

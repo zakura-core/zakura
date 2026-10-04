@@ -32,6 +32,7 @@ Keep entries **newest-first**. Each row records:
 
 | Parameter | Location | Old → New | PR | Why |
 | --- | --- | --- | --- | --- |
+| Native connection state and outbound reserve | `crates/zakura-quic/src/admission.rs`, `crates/zakura-network/src/zakura/handler.rs` | Existing 256 application connections → separate ceilings of 256 transport entries and 256 owners, at most 512 retained states. Inbound share is 224 per budget and 28 of 32 control handshakes. | [#1296](https://github.com/zakura-core/zakura/pull/1296) | Bound failed attempts and unread streams using published transport APIs while keeping outbound room. Counts are conservative bounds, not measured byte usage. |
 | `ZAKURA_ALPN_MISMATCH_BACKOFF` | `crates/zakura-network/src/zakura/handler.rs` | new → `10 min` minimum redial backoff for the node after an ALPN mismatch | [#1249](https://github.com/zakura-core/zakura/pull/1249) | Stop a node from redialing a peer on another protocol version in a loop (zakura-quic DIAL-5). |
 | `network.zakura.quic.handshake_timeout_secs` | `crates/zakura-quic/src/config.rs` | none (150 s idle timeout) → `10 s` | [#1249](https://github.com/zakura-core/zakura/pull/1249) | A stalled handshake holds a pre-TLS admission slot, so bound it well below the idle timeout (V12 F-305590). |
 | `network.zakura.quic.retry_threshold` | `crates/zakura-quic/src/config.rs` | never Retry → Retry unvalidated sources once `8` handshakes are pending | [#1249](https://github.com/zakura-core/zakura/pull/1249) | Spoofed Initials can't fill the 32 pending-handshake slots and lock out honest peers (V12 F-305590). |
@@ -129,11 +130,3 @@ Keep entries **newest-first**. Each row records:
 | `DEFAULT_ZAKURA_SEND_WINDOW` | `zebra-network/src/zakura/handler.rs` | `16 MiB` → `32 MiB` | [#376](https://github.com/valargroup/zebra/pull/376) | Keep the native QUIC send window from becoming the bottleneck for larger receive windows. |
 | `OUTBOUND_WINDOW_FLOOR_TIMEOUTS_BEFORE_DISCONNECT` | `zebra-network/src/zakura/block_sync/state.rs` | `3` → `2 * OUTBOUND_WINDOW_REDUCTION_EPOCH_TIMEOUTS` (`32`) | [#303](https://github.com/valargroup/zebra/pull/303) | Tolerate two full reduction epochs (~256s at the 8s request timeout) of floor-pinned timeouts before disconnecting a block-sync peer, instead of ~24s, so briefly-congested peers are not churned. Any successful response resets the streak. |
 | RocksDB `max_total_wal_size` | `zebra-state/src/service/finalized_state/disk_db.rs` | `0` (unbounded) → 4 GiB | [#383](https://github.com/valargroup/zebra/pull/383) | Bound WAL growth during heavy sync so restarts do not spend minutes replaying tens of GiB of logs. |
-
-### Native connection admission
-
-The existing `max_connections` default of 256 now bounds both transport table
-entries and pending or retained owners. Their conservative combined ceiling is
-512 transport states. Inbound traffic can use 224 slots in each budget, leaving
-32 for outbound work. The existing 32 control-handshake slots similarly allow
-28 inbound handshakes. These are count bounds, not measured aggregate byte usage.

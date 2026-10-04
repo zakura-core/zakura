@@ -250,6 +250,13 @@ work. Stage 2 runs after TLS proves the `NodeId` and is today's Zakura logic.
   aggregate owner slot additionally follows the transport state under ADM-11.
   Failed handshakes remain aggregate charged through drain, without requiring
   their source IP to stay charged after the handshake ends.
+- **ADM-9.** After the handshake, `Acceptor::handle` receives a `Conn` whose
+  `remote_id()` is proven. Stage 2 (control hello, per-identity dedup, cohort
+  check) stays in `zakura-network` and doesn't change.
+- **ADM-10.** Retry tokens and stateless-reset tokens MUST use noq's ring-backed
+  defaults: `RetryTokenKey` for tokens and `ring::hmac::Key` for resets
+  (`noq-proto/src/crypto/ring_like.rs`). Each key is random per startup and
+  never persists. Iroh's BLAKE3 keys go away.
 - **ADM-11.** Before constructing an accepted or dialed connection, the endpoint
   MUST reserve an owner slot and check the sum of `open_connections()` across
   every bound socket. Construction and both checks MUST be serialized across
@@ -260,19 +267,12 @@ work. Stage 2 runs after TLS proves the `NodeId` and is today's Zakura logic.
   The two sets overlap, but their union is bounded by twice `max_connections`.
   With the default 256 slots, at most 512 transport states can remain allocated.
   Incoming packet buffers before acceptance remain separately bounded by ADM-5.
-- **ADM-12.** Inbound admission MUST leave one eighth of each connection budget
-  for outbound attempts, rounding the reserve up to at least one slot. With one
+- **ADM-12.** Inbound admission MUST leave `max(total / 8, 1)` slots in each
+  connection budget for outbound attempts, using integer division. With one
   configured slot, either direction may use it. The same rule applies to the
   existing control-handshake budget. Defaults allow 224 of 256 connection slots
   and 28 of 32 control-handshake slots to inbound traffic. Outbound traffic MAY
   use all unused slots. Closing or timing out MUST NOT bypass ADM-11.
-- **ADM-9.** After the handshake, `Acceptor::handle` receives a `Conn` whose
-  `remote_id()` is proven. Stage 2 (control hello, per-identity dedup, cohort
-  check) stays in `zakura-network` and doesn't change.
-- **ADM-10.** Retry tokens and stateless-reset tokens MUST use noq's ring-backed
-  defaults: `RetryTokenKey` for tokens and `ring::hmac::Key` for resets
-  (`noq-proto/src/crypto/ring_like.rs`). Each key is random per startup and
-  never persists. Iroh's BLAKE3 keys go away.
 
 ## 8. Dialing
 

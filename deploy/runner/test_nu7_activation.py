@@ -83,6 +83,24 @@ class ActivationTests(unittest.TestCase):
         self.feed.poll()
         self.now += 10
 
+    def test_public_reorg_observation_is_persisted_and_retained_during_outage(self):
+        for _ in range(3):
+            self.poll()
+        self.assertIsNone(self.feed.response()[1]["status"]["observation"]["reorgs24h"])
+        self.poll()
+        observation = self.feed.response()[1]["status"]["observation"]
+        self.assertEqual(observation["reorgs24h"], 0)
+        self.assertEqual(observation["since"], 1020)
+        self.feed.owner.close()
+        self.feed = ActivationFeed(self.config_path, Staging(), lambda: self.now, self.rpc)
+        self.poll()
+        self.assertEqual(self.feed.response()[1]["status"]["observation"]["since"], 1020)
+        recorded = copy.deepcopy(self.feed.state["publicReorgObservation"])
+        self.rpc.offline = {"0", "1", "2", "reference"}
+        self.poll()
+        self.assertEqual(self.feed.response()[1]["status"]["status"], "unavailable")
+        self.assertEqual(self.feed.state["publicReorgObservation"], recorded)
+
     def test_three_consecutive_passes_select_once(self):
         self.poll()
         self.poll()
@@ -360,6 +378,95 @@ class ReferenceAdapterTests(unittest.TestCase):
                 feed.lightwallet({"grpcurlPath": "/usr/local/bin/grpcurl", "endpoint": "example:443"}, "GetLightdInfo", {})
         process.kill.assert_called_once()
         self.assertEqual(process.wait.call_count, 2)
+
+
+class PublicReorgObservationTests(unittest.TestCase):
+    def setUp(self):
+        self.feed = object.__new__(ActivationFeed)
+        self.feed.state = {}
+        self.ancestor = "a" * 64
+        self.ancestry_failure = None
+        self.tip_override = None
+        def rpc(url, method, params=None):
+            if method == "getblockchaininfo":
+                return self.tip_override or self.tip
+            if self.ancestry_failure:
+                raise self.ancestry_failure
+            return self.ancestor
+        self.feed.rpc = mock.Mock(side_effect=rpc)
+
+    def observe(self, height=102, block_hash="a" * 64, now=1000, url="primary"):
+        self.tip = {"blocks": height, "bestblockhash": block_hash}
+        return self.feed.record_public_reorgs(height, block_hash, url, now)
+
+    def test_first_tip_is_unknown_then_unchanged_tip_is_measured_zero(self):
+        self.assertEqual(self.observe(), {"reorgs24h": None, "since": 1000})
+        self.assertEqual(self.observe(now=1010), {"reorgs24h": 0, "since": 1000})
+        self.assertFalse(any(call.args[1] == "getblockhash" for call in self.feed.rpc.call_args_list))
+
+    def test_extension_and_primary_switch_are_not_reorgs(self):
+        self.observe()
+        self.assertEqual(self.observe(103, "b" * 64, 1010, "other")["reorgs24h"], 0)
+        self.feed.rpc.assert_any_call("other", "getblockhash", [102])
+
+    def test_same_height_and_taller_fork_are_each_one_event(self):
+        self.observe()
+        self.ancestor = "b" * 64
+        self.assertEqual(self.observe(block_hash="b" * 64, now=1010)["reorgs24h"], 1)
+        self.ancestor = "c" * 64
+        self.assertEqual(self.observe(105, "d" * 64, 1020)["reorgs24h"], 2)
+        self.assertEqual(self.observe(105, "d" * 64, 1030)["reorgs24h"], 2)
+
+    def test_height_drop_is_one_event_without_reading_nonexistent_height(self):
+        self.observe()
+        self.assertEqual(self.observe(100, "b" * 64, 1010)["reorgs24h"], 1)
+        self.assertFalse(any(call.args[1] == "getblockhash" for call in self.feed.rpc.call_args_list))
+
+    def test_unavailable_ancestry_preserves_last_verified_observation(self):
+        self.observe()
+        before = copy.deepcopy(self.feed.state)
+        for failure in (OSError("offline"), "not a hash"):
+            self.ancestry_failure = failure if isinstance(failure, Exception) else None
+            self.ancestor = failure
+            with self.assertRaises((OSError, ValueError)):
+                self.observe(103, "b" * 64, 1010)
+            self.assertEqual(self.feed.state, before)
+
+    def test_tip_moving_during_ancestry_check_cannot_count_or_advance(self):
+        self.observe()
+        before = copy.deepcopy(self.feed.state)
+        self.ancestor = "b" * 64
+        self.tip_override = {"blocks": 104, "bestblockhash": "c" * 64}
+        with self.assertRaisesRegex(ValueError, "tip moved"):
+            self.observe(103, "b" * 64, 1010)
+        self.assertEqual(self.feed.state, before)
+
+    def test_restart_retains_events_and_compares_the_persisted_tip(self):
+        self.observe()
+        self.observe(100, "b" * 64, 1010)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.json"
+            atomic_json(path, self.feed.state)
+            self.feed.state = json.loads(path.read_text())
+        self.assertEqual(self.observe(100, "b" * 64, 1020), {"reorgs24h": 1, "since": 1000})
+
+    def test_rolling_window_expires_events_without_resetting_provenance(self):
+        self.observe()
+        self.observe(100, "b" * 64, 1010)
+        self.assertEqual(self.observe(100, "b" * 64, 87410), {"reorgs24h": 1, "since": 1010})
+        self.assertEqual(self.observe(100, "b" * 64, 87411), {"reorgs24h": 0, "since": 1011})
+
+    def test_corrupt_history_and_clock_rollback_fail_without_zero(self):
+        self.observe()
+        for mutate in (lambda s:s.update(events=[999]), lambda s:s.update(events=[1100]),
+                       lambda s:s.update(height=-1), lambda s:s.update(hash="bad")):
+            before = copy.deepcopy(self.feed.state)
+            mutate(self.feed.state["publicReorgObservation"])
+            with self.assertRaises(ValueError):
+                self.observe(now=1010)
+            self.feed.state = before
+        with self.assertRaises(ValueError):
+            self.observe(now=990)
 
 
 if __name__ == "__main__":

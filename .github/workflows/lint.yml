@@ -2,7 +2,7 @@ name: Lint
 
 on:
   pull_request:
-    branches: [main, "feat/**", "split/**", "release/**"]
+    branches: [main, "feat/**", "split/**", "release/**", "codex/nu7-public-activation"]
     paths:
       - "**/*.rs"
       - "**/Cargo.toml"
@@ -247,6 +247,7 @@ jobs:
         run: |
           python3 deploy/runner/test_zakura_cluster_status.py
           python3 deploy/runner/test_zakura_cluster_watchdog.py
+          python3 deploy/runner/test_nu7_activation.py
 
       - name: Release-state coupling
         if: ${{ !cancelled() }}

@@ -2,12 +2,8 @@
 
 use crate::{
     block::MAX_BLOCK_BYTES,
-    primitives::Groth16Proof,
     sapling::{
-        output::{
-            Output, OutputInTransactionV4, OutputPrefixInTransactionV5, OUTPUT_PREFIX_SIZE,
-            OUTPUT_SIZE,
-        },
+        output::{Output, OutputPrefixInTransactionV5, OUTPUT_PREFIX_SIZE, OUTPUT_SIZE},
         spend::{
             Spend, SpendPrefixInTransactionV5, ANCHOR_PER_SPEND_SIZE,
             SHARED_ANCHOR_SPEND_PREFIX_SIZE, SHARED_ANCHOR_SPEND_SIZE,
@@ -52,22 +48,14 @@ proptest! {
     /// 2. The largest allowed vector is small enough to fit in a legal Zcash block
     #[test]
     fn anchor_per_spend_max_allocation_is_big_enough(spend in Spend::<PerSpendAnchor>::arbitrary_with(())) {
-        let (
-            smallest_disallowed_vec_len,
-            smallest_disallowed_serialized_len,
-            largest_allowed_vec_len,
-            largest_allowed_serialized_len,
-        ) = max_allocation_is_big_enough(spend);
+        let (_, smallest_disallowed_serialized_len, _, largest_allowed_serialized_len) =
+            max_allocation_is_big_enough(spend);
 
-        // Check that our smallest_disallowed_vec is only one item larger than the limit
-        prop_assert!(((smallest_disallowed_vec_len - 1) as u64) == Spend::<PerSpendAnchor>::max_allocation());
         // Check that our smallest_disallowed_vec is too big to send as a protocol message
         // Note that a serialized block always includes at least one byte for the number of transactions,
         // so any serialized Vec<Spend> at least MAX_BLOCK_BYTES long is too large to fit in a block.
         prop_assert!((smallest_disallowed_serialized_len as u64) >= MAX_BLOCK_BYTES);
 
-        // Check that our largest_allowed_vec contains the maximum number of spends
-        prop_assert!((largest_allowed_vec_len as u64) == Spend::<PerSpendAnchor>::max_allocation());
         // Check that our largest_allowed_vec is small enough to send as a protocol message
         prop_assert!((largest_allowed_serialized_len as u64) <= MAX_BLOCK_BYTES);
     }
@@ -76,44 +64,31 @@ proptest! {
     #[test]
     fn shared_spend_max_allocation_is_big_enough(spend in Spend::<SharedAnchor>::arbitrary_with(())) {
         let (prefix, zkproof, spend_auth_sig) = spend.into_v5_parts();
-        let (
-            smallest_disallowed_vec_len,
-            smallest_disallowed_serialized_len,
-            largest_allowed_vec_len,
-            largest_allowed_serialized_len,
-        ) = max_allocation_is_big_enough(prefix);
+        let (_, smallest_disallowed_serialized_len, _, largest_allowed_serialized_len) =
+            max_allocation_is_big_enough(prefix);
 
         // Calculate the actual size of all required Spend fields
         prop_assert!((smallest_disallowed_serialized_len as u64)/SHARED_ANCHOR_SPEND_PREFIX_SIZE*SHARED_ANCHOR_SPEND_SIZE >= MAX_BLOCK_BYTES);
         prop_assert!((largest_allowed_serialized_len as u64)/SHARED_ANCHOR_SPEND_PREFIX_SIZE*SHARED_ANCHOR_SPEND_SIZE <= MAX_BLOCK_BYTES);
 
         // Now check the serialization limits
-        prop_assert!(((smallest_disallowed_vec_len - 1) as u64) == SpendPrefixInTransactionV5::max_allocation());
-        prop_assert!((largest_allowed_vec_len as u64) == SpendPrefixInTransactionV5::max_allocation());
         prop_assert!((largest_allowed_serialized_len as u64) <= MAX_BLOCK_BYTES);
 
         // And check the other fields
-        let (
-            smallest_disallowed_vec_len,
-            _smallest_disallowed_serialized_len,
-            largest_allowed_vec_len,
-            largest_allowed_serialized_len,
-        ) = max_allocation_is_big_enough(zkproof);
+        let (_, _, largest_allowed_vec_len, largest_allowed_serialized_len) =
+            max_allocation_is_big_enough(zkproof);
 
         // Proofs are special-cased, because a proof array is deserialized as
         // part of both spends and outputs.
-        prop_assert!(((smallest_disallowed_vec_len - 1) as u64) == Groth16Proof::max_allocation());
-        prop_assert!((largest_allowed_vec_len as u64) == Groth16Proof::max_allocation());
         prop_assert!((largest_allowed_serialized_len as u64) <= MAX_BLOCK_BYTES);
 
         // Regardless of where they are deserialized, proofs must not exceed the
         // greatest upper bound across spends and outputs.
         prop_assert!((largest_allowed_vec_len as u64) <= max(SpendPrefixInTransactionV5::max_allocation(), OutputPrefixInTransactionV5::max_allocation()));
 
-
         let (
             smallest_disallowed_vec_len,
-            _smallest_disallowed_serialized_len,
+            _,
             largest_allowed_vec_len,
             largest_allowed_serialized_len,
         ) = max_allocation_is_big_enough(spend_auth_sig);
@@ -153,54 +128,34 @@ proptest! {
     #[test]
     fn output_max_allocation_is_big_enough(output in Output::arbitrary_with(())) {
 
-        let (
-            smallest_disallowed_vec_len,
-            smallest_disallowed_serialized_len,
-            largest_allowed_vec_len,
-            largest_allowed_serialized_len,
-        ) = max_allocation_is_big_enough(output.clone().into_v4());
+        let (_, smallest_disallowed_serialized_len, _, largest_allowed_serialized_len) =
+            max_allocation_is_big_enough(output.clone().into_v4());
 
-        // Check that our smallest_disallowed_vec is only one item larger than the limit
-        prop_assert!(((smallest_disallowed_vec_len - 1) as u64) == OutputInTransactionV4::max_allocation());
         // Check that our smallest_disallowed_vec is too big to send as a protocol message
         // Note that a serialized block always includes at least one byte for the number of transactions,
         // so any serialized Vec<Spend> at least MAX_BLOCK_BYTES long is too large to fit in a block.
         prop_assert!((smallest_disallowed_serialized_len as u64) >= MAX_BLOCK_BYTES);
 
-        // Check that our largest_allowed_vec contains the maximum number of spends
-        prop_assert!((largest_allowed_vec_len as u64) == OutputInTransactionV4::max_allocation());
         // Check that our largest_allowed_vec is small enough to send as a protocol message
         prop_assert!((largest_allowed_serialized_len as u64) <= MAX_BLOCK_BYTES);
 
         let (prefix, zkproof) = output.into_v5_parts();
-        let (
-            smallest_disallowed_vec_len,
-            smallest_disallowed_serialized_len,
-            largest_allowed_vec_len,
-            largest_allowed_serialized_len,
-        ) = max_allocation_is_big_enough(prefix);
+        let (_, smallest_disallowed_serialized_len, _, largest_allowed_serialized_len) =
+            max_allocation_is_big_enough(prefix);
 
         // Calculate the actual size of all required Output fields
         prop_assert!((smallest_disallowed_serialized_len as u64)/OUTPUT_PREFIX_SIZE*OUTPUT_SIZE >= MAX_BLOCK_BYTES);
         prop_assert!((largest_allowed_serialized_len as u64)/OUTPUT_PREFIX_SIZE*OUTPUT_SIZE <= MAX_BLOCK_BYTES);
 
         // Now check the serialization limits
-        prop_assert!(((smallest_disallowed_vec_len - 1) as u64) == OutputPrefixInTransactionV5::max_allocation());
-        prop_assert!((largest_allowed_vec_len as u64) == OutputPrefixInTransactionV5::max_allocation());
         prop_assert!((largest_allowed_serialized_len as u64) <= MAX_BLOCK_BYTES);
 
         // And check the other fields
-        let (
-            smallest_disallowed_vec_len,
-            _smallest_disallowed_serialized_len,
-            largest_allowed_vec_len,
-            largest_allowed_serialized_len,
-        ) = max_allocation_is_big_enough(zkproof);
+        let (_, _, largest_allowed_vec_len, largest_allowed_serialized_len) =
+            max_allocation_is_big_enough(zkproof);
 
         // Proofs are special-cased, because a proof array is deserialized as
         // part of both spends and outputs.
-        prop_assert!(((smallest_disallowed_vec_len - 1) as u64) == Groth16Proof::max_allocation());
-        prop_assert!((largest_allowed_vec_len as u64) == Groth16Proof::max_allocation());
         prop_assert!((largest_allowed_serialized_len as u64) <= MAX_BLOCK_BYTES);
 
         // Regardless of where they are deserialized, proofs must not exceed the

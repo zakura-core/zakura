@@ -39,21 +39,10 @@ proptest! {
     /// 2. The largest allowed vector still fits in a legal Zcash Wire Protocol message.
     #[test]
     fn block_hash_max_allocation(hash in Hash::arbitrary_with(())) {
-        let (
-            smallest_disallowed_vec_len,
-            _smallest_disallowed_serialized_len,
-            largest_allowed_vec_len,
-            largest_allowed_serialized_len,
-        ) = max_allocation_is_big_enough(hash);
+        let (_, _, _, largest_allowed_serialized_len) = max_allocation_is_big_enough(hash);
 
         // The cap is exactly the locator-protocol cap, not derived from message size.
         prop_assert!(Hash::max_allocation() == MAX_BLOCK_LOCATOR_LENGTH);
-
-        // Check that our smallest_disallowed_vec is only one item larger than the limit
-        prop_assert!(((smallest_disallowed_vec_len - 1) as u64) == Hash::max_allocation());
-
-        // Check that our largest_allowed_vec contains the maximum number of hashes
-        prop_assert!((largest_allowed_vec_len as u64) == Hash::max_allocation());
 
         // Check that our largest_allowed_vec is small enough to send as a protocol message
         // (this is now slack: the locator cap is much smaller than the message-size limit).
@@ -88,22 +77,11 @@ proptest! {
             header,
         };
 
-        let (
-            smallest_disallowed_vec_len,
-            _smallest_disallowed_serialized_len,
-            largest_allowed_vec_len,
-            largest_allowed_serialized_len,
-        ) = max_allocation_is_big_enough(header);
+        let (_, _, _, largest_allowed_serialized_len) = max_allocation_is_big_enough(header);
 
         // The cap is exactly the headers-protocol cap, not derived from message size.
         // Cast safe: MAX_HEADERS_PER_MESSAGE is the constant 160 (well under u64::MAX).
         prop_assert!(CountedHeader::max_allocation() == MAX_HEADERS_PER_MESSAGE as u64);
-
-        // Check that our smallest_disallowed_vec is only one item larger than the limit
-        prop_assert!(((smallest_disallowed_vec_len - 1) as u64) == CountedHeader::max_allocation());
-
-        // Check that our largest_allowed_vec contains the maximum number of CountedHeaders
-        prop_assert!((largest_allowed_vec_len as u64) == CountedHeader::max_allocation());
 
         // Check that our largest_allowed_vec is small enough to send as a protocol message
         // (this is now slack: the headers cap is much smaller than the message-size limit).

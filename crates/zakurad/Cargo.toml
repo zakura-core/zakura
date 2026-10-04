@@ -197,7 +197,6 @@ zakura-utils = { path = "../zakura-utils", version = "2.2.7", optional = true }
 abscissa_core = { workspace = true, default-features = false, features = ["application"] }
 clap = { workspace = true, features = ["cargo"] }
 chrono = { workspace = true, features = ["clock", "std"] }
-humantime-serde = { workspace = true }
 indexmap = { workspace = true }
 lazy_static = { workspace = true }
 semver = { workspace = true }

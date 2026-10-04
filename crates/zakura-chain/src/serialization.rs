@@ -39,6 +39,7 @@ mod zcash_deserialize;
 mod zcash_serialize;
 
 pub mod display_order;
+pub mod serde_adapters;
 pub mod sha256d;
 
 pub(crate) mod serde_helpers;

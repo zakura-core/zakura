@@ -4,7 +4,6 @@ use crate::serialization::ZcashReader;
 use std::{fmt, io};
 
 use hex::{FromHex, FromHexError, ToHex};
-use serde_big_array::BigArray;
 
 use crate::{
     block::Header,
@@ -67,9 +66,11 @@ const REGTEST_K: u32 = 5;
 #[allow(clippy::large_enum_variant)]
 pub enum Solution {
     /// Equihash solution on Mainnet or Testnet
-    Common(#[serde(with = "BigArray")] [u8; SOLUTION_SIZE]),
+    Common(#[serde(with = "crate::serialization::serde_adapters::bytes")] [u8; SOLUTION_SIZE]),
     /// Equihash solution on Regtest
-    Regtest(#[serde(with = "BigArray")] [u8; REGTEST_SOLUTION_SIZE]),
+    Regtest(
+        #[serde(with = "crate::serialization::serde_adapters::bytes")] [u8; REGTEST_SOLUTION_SIZE],
+    ),
 }
 
 impl Solution {

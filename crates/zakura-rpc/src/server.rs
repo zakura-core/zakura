@@ -100,7 +100,7 @@ pub const OPENED_ADMIN_RPC_ENDPOINT_MSG: &str = "Opened admin RPC endpoint at ";
 type ServerTask = JoinHandle<Result<(), tower::BoxError>>;
 
 /// Maximum number of TCP connections waiting for a TLS handshake per listener.
-const MAX_PENDING_TLS_HANDSHAKES: usize = 64;
+const MAX_PENDING_TLS_HANDSHAKES: usize = 128;
 
 /// Time allowed for a TLS handshake, measured from TCP acceptance.
 const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);

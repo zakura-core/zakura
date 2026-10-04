@@ -19,6 +19,10 @@ credentials. `stateFile` should be
 `/var/lib/zakura-nu7-activation/selection.json`. The service's StateDirectory is
 persistent and writable by its DynamicUser. Back it up before service changes;
 never delete it to recover an outage.
+Startup adopts intact existing selection state and writes a durable
+`selection.initialized` marker. If the selection file is missing but that
+marker or the legacy lock file remains, startup requires operator repair;
+it cannot initialize staging again. Preserve the whole state directory.
 
 Required shape:
 
@@ -53,6 +57,10 @@ The public manifest uses standard Testnet joining configuration without staging
 activation overrides and magic `fa1af9bf`. Verify the identity checkpoint comes
 from the public chain **after staging diverged**, before activation. Both joining
 configuration checksums are checked on startup.
+Managed RPC endpoints must be distinct after URL normalization, and the
+reference must have a distinct endpoint and source name. This rejects duplicate
+configured votes; independently verify host provenance because DNS aliases or
+proxies can still reach the same underlying node.
 
 Both profiles' nodes must expose the read-only `getnetworkparameters(height)`
 RPC. The feed reads current tip and next candidate rules from consensus, never
@@ -61,6 +69,10 @@ from separately maintained website constants. Rules include `effectiveHeight`,
 object (`gapMultiplier`, `thresholdSeconds`, `comparison`). All original
 consensus export fields remain available. NSM values absent from a reference
 implementation are unavailable, rather than zero.
+Public selection requires two validators to agree on complete current and
+next-block exports at a common pinned height, as well as reference block hashes.
+Publication separately corroborates the exact displayed heights with a second
+validator, so a higher-tip parameter outlier cannot supply the dashboard rules.
 
 Capability objects are explicit: `faucet` is null or `{apiUrl, claimZat}`;
 `snapshot` is null or verified immutable snapshot metadata. Do not advertise the

@@ -269,8 +269,8 @@ impl DiskWriteBatch {
 
     /// Inserts a raw fixture row unless a committed body owns the height.
     ///
-    /// Test-only: production writes go through the sealed verified-root boundary
-    /// ([`ZakuraDb::write_verified_header_commitment_roots`]) or the body-commit path.
+    /// Test-only: production rows are written by the body-commit path
+    /// ([`Self::insert_body_derived_commitment_roots`]).
     #[cfg(any(test, feature = "proptest-impl"))]
     pub(super) fn insert_unauthenticated_commitment_roots_for_test(
         &mut self,

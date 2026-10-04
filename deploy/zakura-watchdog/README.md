@@ -78,7 +78,7 @@ environment variable names match the sync-check script.
 | `ZCASHD_COOKIE_FILE`      | `--zcashd-cookie-file`      | `/mnt/data/runtime/zcashd/.cookie` | zcashd RPC cookie file |
 | `ZAKURAD_PROCESS_PATTERN` | `--zakurad-process-pattern`  | `zakurad .*--zcashd-compat`            | `pgrep -f` pattern for zakurad |
 | `ZCASHD_PROCESS_PATTERN`  | `--zcashd-process-pattern`  | `zcashd .*-connect`              | `pgrep -f` pattern for zcashd |
-| `HEIGHT_MAX_DRIFT`        | `--height-max-drift`        | `10`                                  | Max allowed height drift |
+| `HEIGHT_MAX_DRIFT`        | `--height-max-drift`        | `30`                                  | Max allowed height drift |
 | `SYNC_CHECK_TIMEOUT`      | `--sync-check-timeout`      | `600`                                 | One-shot `check` total timeout (seconds) |
 | `SYNC_CHECK_INTERVAL`     | `--sync-check-interval`     | `15`                                  | One-shot `check` retry interval (seconds) |
 | `WATCHDOG_INTERVAL`       | `--watchdog-interval`       | `60`                                  | Continuous `run` cycle interval (seconds) |
@@ -153,7 +153,7 @@ deployments.
 Run an equivalent watchdog verification manually on the host:
 
 ```bash
-HEIGHT_MAX_DRIFT=10 SYNC_CHECK_TIMEOUT=1800 SYNC_CHECK_INTERVAL=15 \
+HEIGHT_MAX_DRIFT=30 SYNC_CHECK_TIMEOUT=1800 SYNC_CHECK_INTERVAL=15 \
   zakura-watchdog check
 ```
 

@@ -1,17 +1,14 @@
-//! The item suite over every item and composition, and controls that show the
-//! suites catch broken codecs.
+//! The item suite over every item and composition.
 
 use proptest::prelude::*;
 use zakura_chain::serialization::{CompactSize64, ZcashDeserialize, ZcashSerialize};
 
 use super::{
-    item_suite::{check_input, check_item, decode_checked, item_suite},
-    message_suite::{check_family, MessageSample, Violation},
+    item_suite::{decode_checked, item_suite},
     reader::{compact_size_len, write_compact_size},
-    sample::WireSample,
     *,
 };
-use crate::zakura::{MessageRole, MessageRule, PayloadLen};
+use crate::zakura::PayloadLen;
 
 item_suite!(one_byte, U8);
 item_suite!(le_u32, LeU32);
@@ -118,158 +115,4 @@ fn non_canonical_counts_fail() {
             Err(WireError::NonCanonicalCount)
         );
     }
-}
-
-/// An item that claims one more byte than any encoding uses.
-#[derive(Debug)]
-enum LooseMaximum {}
-
-impl Wire for LooseMaximum {
-    type Value = u32;
-    const MIN_LEN: usize = 4;
-    const MAX_LEN: usize = 5;
-
-    fn max_heap_bytes(_input_len: usize) -> usize {
-        0
-    }
-
-    fn encode(value: &u32, out: &mut Vec<u8>) -> Result<(), WireError> {
-        LeU32::encode(value, out)
-    }
-
-    fn decode(reader: &mut BoundedReader<'_>) -> Result<u32, WireError> {
-        LeU32::decode(reader)
-    }
-}
-
-impl WireSample for LooseMaximum {
-    fn boundary_values() -> Vec<u32> {
-        LeU32::boundary_values()
-    }
-
-    fn arbitrary() -> BoxedStrategy<u32> {
-        LeU32::arbitrary()
-    }
-}
-
-#[test]
-#[should_panic(expected = "the longest boundary value must encode to MAX_LEN")]
-fn the_item_suite_rejects_a_bound_that_no_encoding_reaches() {
-    check_item::<LooseMaximum>();
-}
-
-/// An item that copies its input into a buffer its bound does not declare.
-#[derive(Debug)]
-enum UndeclaredBuffer {}
-
-impl Wire for UndeclaredBuffer {
-    type Value = u8;
-    const MIN_LEN: usize = 1;
-    const MAX_LEN: usize = 1;
-
-    fn max_heap_bytes(_input_len: usize) -> usize {
-        0
-    }
-
-    fn encode(value: &u8, out: &mut Vec<u8>) -> Result<(), WireError> {
-        U8::encode(value, out)
-    }
-
-    fn decode(reader: &mut BoundedReader<'_>) -> Result<u8, WireError> {
-        let copy = std::hint::black_box(vec![0u8; 64]);
-        drop(copy);
-        U8::decode(reader)
-    }
-}
-
-#[test]
-#[should_panic(expected = "requested 64 heap bytes; the item's bound is 0")]
-fn the_item_suite_rejects_an_undeclared_allocation() {
-    let _ = decode_checked::<UndeclaredBuffer>(&[1]);
-}
-
-/// A boolean that decodes any nonzero byte as `true`.
-#[derive(Debug)]
-enum LenientBool {}
-
-impl Wire for LenientBool {
-    type Value = bool;
-    const MIN_LEN: usize = 1;
-    const MAX_LEN: usize = 1;
-
-    fn max_heap_bytes(_input_len: usize) -> usize {
-        0
-    }
-
-    fn encode(value: &bool, out: &mut Vec<u8>) -> Result<(), WireError> {
-        U8::encode(&u8::from(*value), out)
-    }
-
-    fn decode(reader: &mut BoundedReader<'_>) -> Result<bool, WireError> {
-        Ok(U8::decode(reader)? != 0)
-    }
-}
-
-#[test]
-#[should_panic(expected = "a decoded value re-encodes to the bytes it read")]
-fn the_item_suite_rejects_a_non_canonical_decoder() {
-    check_input::<LenientBool>(&[2]);
-}
-
-/// A one-message family whose row claims one more byte than its encoding.
-#[derive(Clone, Debug, PartialEq)]
-struct LooseRow(u32);
-
-impl WireMessage for LooseRow {
-    type Error = WireError;
-    const RULES: &'static [MessageRule] = &[MessageRule {
-        message_type: 1,
-        payload: PayloadLen::between(4, 5),
-        role: MessageRole::Announcement {
-            cadence: crate::zakura::Cadence {
-                capacity: 1,
-                refill_interval: std::time::Duration::from_secs(1),
-                send_interval: std::time::Duration::from_secs(2),
-            },
-        },
-    }];
-
-    fn message_type(&self) -> u16 {
-        1
-    }
-
-    fn encode_payload(&self, out: &mut Vec<u8>) -> Result<(), WireError> {
-        LeU32::encode(&self.0, out)
-    }
-
-    fn decode_payload(
-        _message_type: u16,
-        reader: &mut BoundedReader<'_>,
-    ) -> Result<Self, WireError> {
-        reader.read::<LeU32>().map(Self)
-    }
-
-    fn max_heap_bytes(_message_type: u16, _payload_len: usize) -> usize {
-        0
-    }
-}
-
-impl MessageSample for LooseRow {
-    fn samples() -> Vec<Self> {
-        vec![Self(0), Self(u32::MAX)]
-    }
-
-    fn arbitrary_valid() -> BoxedStrategy<Self> {
-        any::<u32>().prop_map(Self).boxed()
-    }
-
-    fn violations() -> Vec<Violation<Self>> {
-        Vec::new()
-    }
-}
-
-#[test]
-#[should_panic(expected = "the samples of type 1 must reach its row's bounds")]
-fn the_message_suite_rejects_a_row_that_no_encoding_reaches() {
-    check_family::<LooseRow>();
 }

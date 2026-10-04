@@ -1,7 +1,5 @@
 //! Constants that impact state behaviour.
 
-use lazy_static::lazy_static;
-use regex::Regex;
 use semver::Version;
 
 use zakura_chain::parameters::{Network, NetworkKind};
@@ -167,11 +165,3 @@ pub const MAX_HEADER_SYNC_HEIGHT_RANGE: u32 = 4000;
 /// the worst case, to around:
 /// `100 entries * up to 1000 blocks * 2 MB per block = 200 GB`
 pub const MAX_INVALIDATED_BLOCKS: usize = 100;
-
-lazy_static! {
-    /// Regex that matches a direct RocksDB lock error or the state initialization hint that wraps it.
-    pub static ref LOCK_FILE_ERROR: Regex = Regex::new(
-        "(lock file).*(temporarily unavailable)|(in use)|(being used by another process)|(Database likely already open)|(database lock)"
-    )
-    .expect("regex is valid");
-}

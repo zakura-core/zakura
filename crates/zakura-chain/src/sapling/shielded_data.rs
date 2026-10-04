@@ -9,7 +9,7 @@ use std::{
     fmt::{self, Debug},
 };
 
-use derive_getters::Getters;
+use getset::Getters;
 use itertools::Itertools;
 #[cfg(any(test, feature = "proptest-impl"))]
 use proptest_derive::Arbitrary;
@@ -93,6 +93,7 @@ where
 {
     /// The net value of Sapling spend transfers minus output transfers.
     /// Denoted as `valueBalanceSapling` in the spec.
+    #[getset(get = "pub")]
     pub value_balance: Amount,
 
     /// A bundle of spends and outputs, containing at least one spend or
@@ -100,10 +101,12 @@ where
     ///
     /// In V5 transactions, also contains a shared anchor, if there are any
     /// spends.
+    #[getset(get = "pub")]
     pub transfers: TransferData<AnchorV>,
 
     /// A signature on the transaction hash.
     /// Denoted as `bindingSigSapling` in the spec.
+    #[getset(get = "pub")]
     pub binding_sig: Signature<Binding>,
 }
 

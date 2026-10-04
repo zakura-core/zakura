@@ -312,7 +312,7 @@ pub struct Config {
     /// - regularly, every time `crawl_new_peer_interval` elapses, and
     /// - if the peer set is busy, and there aren't any peer addresses for the
     ///   next connection attempt.
-    #[serde(with = "humantime_serde")]
+    #[serde(with = "zakura_chain::serialization::serde_adapters::duration")]
     pub crawl_new_peer_interval: Duration,
 
     /// The maximum number of legacy TCP peer connections Zakura will keep for a given IP address
@@ -961,6 +961,12 @@ struct DTestnetParameters {
     max_block_time_start_height: Option<u32>,
     genesis_hash: Option<String>,
     activation_heights: Option<ConfiguredActivationHeights>,
+    /// If `true`, `activation_heights` overlays the public Testnet activation heights
+    /// instead of replacing them, so a configured Testnet sets only the upgrades it changes.
+    ///
+    /// Off by default: configured activation heights replace every default height above
+    /// genesis. Only configured Testnets accept it.
+    inherit_activation_heights: Option<bool>,
     pre_nu6_funding_streams: Option<ConfiguredFundingStreams>,
     post_nu6_funding_streams: Option<ConfiguredFundingStreams>,
     funding_streams: Option<Vec<ConfiguredFundingStreams>>,
@@ -1032,7 +1038,10 @@ struct DConfig {
     v2_p2p: Option<bool>,
     zakura: ZakuraConfig,
     peerset_initial_target_size: usize,
-    #[serde(alias = "new_peer_interval", with = "humantime_serde")]
+    #[serde(
+        alias = "new_peer_interval",
+        with = "zakura_chain::serialization::serde_adapters::duration"
+    )]
     crawl_new_peer_interval: Duration,
     max_connections_per_ip: Option<usize>,
     expose_peer_addresses: bool,
@@ -1074,6 +1083,7 @@ impl From<Arc<testnet::Parameters>> for DTestnetParameters {
             max_block_time_start_height: Some(params.max_block_time_start_height().0),
             genesis_hash: Some(params.genesis_hash().to_string()),
             activation_heights: Some(params.activation_heights().into()),
+            inherit_activation_heights: None,
             pre_nu6_funding_streams: None,
             post_nu6_funding_streams: None,
             funding_streams: Some(params.funding_streams().iter().map(Into::into).collect()),
@@ -1375,6 +1385,7 @@ where
         max_block_time_start_height,
         genesis_hash,
         activation_heights,
+        inherit_activation_heights,
         pre_nu6_funding_streams,
         post_nu6_funding_streams,
         funding_streams,
@@ -1430,11 +1441,15 @@ where
             .with_max_block_time_start_height(height.try_into().map_err(de::Error::custom)?);
     }
 
-    // Retain default Testnet activation heights unless an empty activation-height map is configured.
+    // Retain default Testnet activation heights unless an activation-height map is
+    // configured. A configured map replaces them, or overlays them when requested.
     if let Some(activation_heights) = activation_heights {
-        params_builder = params_builder
-            .with_activation_heights(activation_heights)
-            .map_err(de::Error::custom)?
+        params_builder = if inherit_activation_heights == Some(true) {
+            params_builder.with_activation_height_overlay(activation_heights)
+        } else {
+            params_builder.with_activation_heights(activation_heights)
+        }
+        .map_err(de::Error::custom)?
     }
 
     if let Some(halving_interval) = pre_blossom_halving_interval {
@@ -1518,6 +1533,7 @@ where
 {
     let DTestnetParameters {
         activation_heights,
+        inherit_activation_heights,
         pre_nu6_funding_streams,
         post_nu6_funding_streams,
         funding_streams,
@@ -1528,6 +1544,13 @@ where
         initial_nsm_value_balance,
         ..
     } = params;
+
+    if inherit_activation_heights.is_some() {
+        return Err(de::Error::custom(
+            "inherit_activation_heights only applies to configured Testnets; \
+             Regtest activation heights have their own defaults",
+        ));
+    }
 
     let mut funding_streams_vec = funding_streams.unwrap_or_default();
 

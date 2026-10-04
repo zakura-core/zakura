@@ -7,7 +7,7 @@ use zakura_chain::{
     block::Height,
     parameters::{
         testnet::{self, ConfiguredActivationHeights, ConfiguredFundingStreams},
-        Network,
+        Network, NetworkUpgrade,
     },
 };
 
@@ -1309,4 +1309,177 @@ fn regtest_accepts_checkpoints_covering_delayed_canopy() {
         config.network.checkpoint_list().max_height(),
         zakura_chain::block::Height(9)
     );
+}
+
+/// The deployer's rendered NU7 fork node config, kept in sync with the renderer by
+/// `deploy/nu7-fork/test_fork.py`. Loading it here proves zakurad accepts the shape
+/// the deployer writes, which a TOML parser alone cannot.
+#[test]
+fn rendered_nu7_fork_config_loads() {
+    let document: toml::Value = toml::from_str(include_str!("data/nu7-fork-node.toml"))
+        .expect("the rendered fork config is TOML");
+    let config: Config = document
+        .get("network")
+        .expect("the rendered fork config has a [network] section")
+        .clone()
+        .try_into()
+        .expect("the rendered [network] section deserializes");
+
+    assert_eq!(config.network.to_string(), "Nu7Fork");
+    assert!(!config.network.is_default_testnet());
+    assert_eq!(
+        NetworkUpgrade::Nu7.activation_height(&config.network),
+        Some(Height(4_400_010)),
+    );
+    // The public Testnet upgrades survive: a partial activation list would
+    // silently drop them.
+    assert_eq!(
+        NetworkUpgrade::Nu6_3.activation_height(&config.network),
+        Some(Height(4_134_000)),
+    );
+}
+
+/// The live `Nu7StagingV3` parameters, with every activation height listed.
+const NU7_STAGING_V3_EXPLICIT: &str = r#"
+    initial_testnet_peers = []
+    network = { network_name = "Nu7StagingV3", network_magic = [122, 107, 117, 57], checkpoints = true, initial_nsm_value_balance = 55768414957, activation_heights = { BeforeOverwinter = 1, Overwinter = 207500, Sapling = 280000, Blossom = 584000, Heartwood = 903800, Canopy = 1028500, NU5 = 1842420, NU6 = 2976000, "NU6.1" = 3536500, "NU6.2" = 4052000, "NU6.3" = 4134000, NU7 = 4420652 } }
+"#;
+
+/// The same network, with only NU7 overlaid on the public Testnet heights.
+const NU7_STAGING_V3_OVERLAY: &str = r#"
+    initial_testnet_peers = []
+    network = { network_name = "Nu7StagingV3", network_magic = [122, 107, 117, 57], checkpoints = true, initial_nsm_value_balance = 55768414957, inherit_activation_heights = true, activation_heights = { NU7 = 4420652 } }
+"#;
+
+fn configured_testnet(activation_heights: &str, inherit: Option<bool>) -> Result<Config, String> {
+    let inherit = inherit.map_or(String::new(), |inherit| {
+        format!("inherit_activation_heights = {inherit}, ")
+    });
+    toml::from_str(&format!(
+        "initial_testnet_peers = []\n\
+         network = {{ network_name = \"Overlay\", checkpoints = true, {inherit}activation_heights = {{ {activation_heights} }} }}"
+    ))
+    .map_err(|error| error.to_string())
+}
+
+#[test]
+fn activation_height_overlay_preserves_public_testnet_history() {
+    let _init_guard = zakura_test::init();
+
+    let explicit: Config = toml::from_str(NU7_STAGING_V3_EXPLICIT).expect("explicit V3 parses");
+    let overlay: Config = toml::from_str(NU7_STAGING_V3_OVERLAY).expect("overlay V3 parses");
+
+    // The same consensus network, so the header-chain policy digest and every
+    // historical upgrade stay unchanged when a node switches config forms.
+    assert_eq!(overlay.network, explicit.network);
+    let public = Network::new_default_testnet();
+    let mut expected = public.activation_list();
+    expected.retain(|_, upgrade| *upgrade != NetworkUpgrade::Nu7);
+    expected.insert(Height(4_420_652), NetworkUpgrade::Nu7);
+    assert_eq!(overlay.network.activation_list(), expected);
+
+    // A serialized config lists every height and round-trips without the flag.
+    let serialized = toml::to_string(&overlay).expect("config serializes");
+    assert!(!serialized.contains("inherit_activation_heights"));
+    let reloaded: Config = toml::from_str(&serialized).expect("serialized config reloads");
+    assert_eq!(reloaded.network, explicit.network);
+}
+
+/// Every public Testnet height except NU6.3, plus a fork's NU7.
+const ALL_BUT_NU6_3: &str = r#"BeforeOverwinter = 1, Overwinter = 207500, Sapling = 280000, Blossom = 584000, Heartwood = 903800, Canopy = 1028500, NU5 = 1842420, NU6 = 2976000, "NU6.1" = 3536500, "NU6.2" = 4052000, NU7 = 4420652"#;
+
+#[test]
+fn activation_heights_still_replace_the_defaults_unless_inherited() {
+    let _init_guard = zakura_test::init();
+
+    for inherit in [None, Some(false)] {
+        let replaced = configured_testnet(ALL_BUT_NU6_3, inherit).expect("partial list parses");
+        assert_eq!(
+            NetworkUpgrade::Nu7.activation_height(&replaced.network),
+            Some(Height(4_420_652))
+        );
+        // Unchanged replacement semantics: an omitted upgrade loses its public height.
+        assert!(!replaced
+            .network
+            .activation_list()
+            .contains_key(&Height(4_134_000)));
+    }
+
+    let inherited = configured_testnet(ALL_BUT_NU6_3, Some(true)).expect("overlay parses");
+    assert_eq!(
+        NetworkUpgrade::Nu6_3.activation_height(&inherited.network),
+        Some(Height(4_134_000))
+    );
+
+    // Without any activation heights, the public Testnet heights are kept either way.
+    let omitted: Config = toml::from_str(
+        "initial_testnet_peers = []\nnetwork = { network_name = \"Overlay\", checkpoints = true, inherit_activation_heights = true }",
+    )
+    .expect("overlay flag without heights parses");
+    assert_eq!(
+        omitted.network.activation_list(),
+        Network::new_default_testnet().activation_list()
+    );
+}
+
+#[test]
+fn activation_height_overlay_changes_only_configured_upgrades() {
+    let _init_guard = zakura_test::init();
+
+    let custom = configured_testnet(r#""NU6.3" = 4200000, NU7 = 4300000"#, Some(true))
+        .expect("custom overlay parses");
+    assert_eq!(
+        NetworkUpgrade::Nu6_3.activation_height(&custom.network),
+        Some(Height(4_200_000))
+    );
+    assert_eq!(
+        NetworkUpgrade::Nu7.activation_height(&custom.network),
+        Some(Height(4_300_000))
+    );
+    assert_eq!(
+        NetworkUpgrade::Nu6_2.activation_height(&custom.network),
+        NetworkUpgrade::Nu6_2.activation_height(&Network::new_default_testnet()),
+    );
+
+    // The overlaid list is validated as a whole: NU7 cannot precede inherited NU6.3.
+    let error = configured_testnet("NU7 = 4000000", Some(true))
+        .expect_err("an overlay below an inherited upgrade is out of order");
+    assert!(error.contains("order"), "unexpected error: {error}");
+
+    // Nor may it share an inherited upgrade's height, which would drop that upgrade.
+    let error = configured_testnet("NU7 = 4134000", Some(true))
+        .expect_err("an overlay at an inherited upgrade's height is ambiguous");
+    assert!(
+        error.contains("activation height must be valid"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn activation_height_overlay_is_only_for_configured_testnets() {
+    let _init_guard = zakura_test::init();
+
+    let regtest = toml::from_str::<Config>(
+        "network = { params = { inherit_activation_heights = true, activation_heights = { NU7 = 10 } } }",
+    )
+    .expect_err("Regtest has its own activation-height defaults")
+    .to_string();
+    assert!(
+        regtest.contains("only applies to configured Testnets"),
+        "unexpected error: {regtest}"
+    );
+
+    // The public networks stay fixed: no parameter table may sit beside them.
+    for network in ["Mainnet", "Testnet"] {
+        let error = toml::from_str::<Config>(&format!(
+            "network = \"{network}\"\n[testnet_parameters]\ninherit_activation_heights = true\n\
+             activation_heights = {{ NU7 = 4420652 }}"
+        ))
+        .expect_err("public network parameters must be fixed")
+        .to_string();
+        assert!(
+            error.contains("Mainnet and public Testnet parameters are fixed"),
+            "unexpected configuration error: {error}"
+        );
+    }
 }

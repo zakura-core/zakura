@@ -40,7 +40,7 @@ fn classified_module() -> RpcModule<()> {
 #[test]
 fn access_policy_matches_the_openrpc_method_set() {
     let classified: BTreeSet<_> = RPC_METHOD_ACCESS.iter().map(|(name, _)| *name).collect();
-    let documented: BTreeSet<_> = METHODS.keys().copied().collect();
+    let documented: BTreeSet<_> = METHODS.iter().map(|(name, _)| *name).collect();
 
     assert_eq!(
         classified.len(),
@@ -178,6 +178,7 @@ async fn segmented_listeners_enforce_methods_and_cookie_auth() {
         .await
         .expect("admin RPC listener should start");
 
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let client = Client::builder()
         .timeout(Duration::from_secs(5))
         .build()

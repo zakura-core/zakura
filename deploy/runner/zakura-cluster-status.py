@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
-"""Zakura fleet dashboard and narrow public Ironwood status API.
+"""Zakura fleet dashboard and narrow public Ironwood and NU7 status APIs.
 
 Reads a deploy/deployer nodes TOML, polls each node over SSH, and serves a small
 HTML dashboard showing the running commit, Zakura node ID, restart time, current
 height, latest block hash, tip agreement across the fleet, per-node reorg
 candidates, and whether the node has advanced recently. It also serves a
 deliberately small public Ironwood status response for zakura.com.
+
+With --nu7-config it also serves the NU7 fork's public `/v1/status` (schema
+version 1) for zakura.com/nu7/. A node's optional `monitor` table selects how it
+is reached: `local = true` probes it on this host without SSH, and `status_url`
+reads a remote node's deploy/nu7-fork/miner/remote-status.py report instead.
 
 Only the Python stdlib is used.
 """
@@ -16,14 +21,19 @@ import argparse
 import concurrent.futures
 import ipaddress
 import json
+import logging
 import math
+import os
+import statistics
 import re
 import shlex
 import subprocess
 import threading
 import time
 import tomllib
+import urllib.error
 import urllib.parse
+import urllib.request
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -45,6 +55,11 @@ PUBLIC_RATE_WINDOW = 60.0
 PUBLIC_RATE_CLIENT_LIMIT = 4_096
 PUBLIC_SCHEMA_VERSION = 1
 PUBLIC_ERROR_MESSAGE = "A fresh Ironwood status is not available."
+# The public routes are reachable from the internet through a reverse proxy, on
+# hosts that also run nodes. Bound the threads they can hold, and how long a client
+# that stalls mid-request keeps one.
+MAX_CONCURRENT_REQUESTS = 16
+REQUEST_TIMEOUT_SECONDS = 10
 PUBLIC_ORIGINS = {
     "mainnet": frozenset({"https://zakura.com"}),
     "testnet": frozenset({
@@ -150,7 +165,11 @@ DEFAULTS = {
     # The probe reads them from inside the node, so they never need exposing.
     "metrics_endpoint": "",
     "health_listen_addr": "",
+    # Monitoring-only metadata, ignored by deploy.py. See the module docstring.
+    "monitor": None,
+    "internal_miner": False,
 }
+MONITOR_KEYS = {"local", "status_url", "label", "id", "region"}
 
 
 @dataclass
@@ -173,8 +192,18 @@ class Node:
     health_listen_addr: str = ""
     state_cache_dir: str = ""
     port: object = None
+    # On the collector's own host: probed without SSH.
+    local: bool = False
+    # A remote node's health report URL, polled instead of SSH.
+    status_url: str = ""
+    label: str = ""
+    miner_id: str = ""
+    region: str = ""
+    internal_miner: bool = False
 
     def ssh_cmd(self, *remote: str) -> list[str]:
+        if self.local:
+            return list(remote)
         cmd = ["ssh", *SSH_COMMON_OPTS]
         if self.port:
             cmd += ["-p", str(self.port)]
@@ -202,6 +231,14 @@ def load_nodes(config_path: Path) -> list[Node]:
 
         merged = dict(defaults)
         merged.update(raw)
+        monitor = merged.get("monitor") or {}
+        if not isinstance(monitor, dict) or set(monitor) - MONITOR_KEYS:
+            raise SystemExit(f"{name}: monitor must be a table of {sorted(MONITOR_KEYS)}")
+        status_url = monitor.get("status_url", "")
+        if status_url and (monitor.get("local")
+                           or not re.fullmatch(r"https?://[A-Za-z0-9.:\[\]-]+/[A-Za-z0-9/._-]*",
+                                               status_url)):
+            raise SystemExit(f"{name}: status_url must be an http(s) URL on a remote node")
         nodes.append(
             Node(
                 name=name,
@@ -222,6 +259,12 @@ def load_nodes(config_path: Path) -> list[Node]:
                 health_listen_addr=merged["health_listen_addr"],
                 state_cache_dir=merged["state_cache_dir"],
                 port=merged["port"],
+                local=monitor.get("local") is True,
+                status_url=status_url,
+                label=str(monitor.get("label") or ""),
+                miner_id=str(monitor.get("id") or ""),
+                region=str(monitor.get("region") or ""),
+                internal_miner=merged["internal_miner"] is True,
             )
         )
 
@@ -273,6 +316,7 @@ def rpc_url_for(listen_addr: str) -> str:
 
 REMOTE_PROBE = r"""
 import base64
+import ipaddress
 import json
 import os
 import re
@@ -301,6 +345,7 @@ import urllib.request
     state_cache_dir,
     want_metrics,
 ) = sys.argv[1:16]
+ancestor_height = int(sys.argv[16]) if len(sys.argv) > 16 and sys.argv[16] else None
 
 out = {
     "service": service,
@@ -850,6 +895,19 @@ if rpc_url:
                     except Exception:
                         pass
         out["ancestor_hashes"] = ancestor_hashes
+        if ancestor_height is not None and tip_height is not None and 0 <= ancestor_height <= tip_height:
+            depth = str(tip_height - ancestor_height)
+            if depth not in ancestor_hashes:
+                try:
+                    ancestor_hashes[depth] = rpc_call("getblockhash", [ancestor_height])
+                except Exception:
+                    pass
+        if tip_height is not None:
+            try:
+                if rpc_call("getblockhash", [tip_height]) != out["block_hash"]:
+                    out["ancestor_hashes"] = {}
+            except Exception:
+                out["ancestor_hashes"] = {}
 
         best_hash = out.get("block_hash")
         if best_hash:
@@ -881,6 +939,19 @@ if rpc_url:
                 out["ironwood_chain_balance_zat"] = str(
                     ironwood_pool["chainValueZat"]
                 )
+
+        # Configured-network observations for the NU7 status view.
+        upgrades = blockchain_info.get("upgrades")
+        for branch_id, upgrade in (upgrades.items() if isinstance(upgrades, dict) else ()):
+            if isinstance(upgrade, dict) and upgrade.get("name") == "NU7":
+                out["nu7"] = {
+                    "branch_id": branch_id,
+                    "activation_height": upgrade.get("activationheight"),
+                }
+        if "nsmValueBalanceZat" in blockchain_info:
+            out["nsm_value_balance_zat"] = blockchain_info.get("nsmValueBalanceZat")
+        if "nsmReissuanceHeight" in blockchain_info:
+            out["nsm_reissuance_height"] = blockchain_info.get("nsmReissuanceHeight")
     except Exception as error:
         out["rpc_error"] = str(error)
 
@@ -914,15 +985,22 @@ if rpc_url:
         # the dashboard only needs counts.
         subversions = {}
         inbound = 0
+        external = 0
         for peer in peers:
             if not isinstance(peer, dict):
                 continue
             if peer.get("inbound"):
                 inbound += 1
+            peer_host = str(peer.get("addr") or "").rsplit(":", 1)[0].strip("[]")
+            try:
+                external += not ipaddress.ip_address(peer_host).is_loopback
+            except ValueError:
+                pass
             key = str(peer.get("subver") or "unknown")[:48]
             subversions[key] = subversions.get(key, 0) + 1
         out["peer_count"] = len(peers)
         out["peer_inbound"] = inbound
+        out["peer_external"] = external
         # Live peer software mix. zakurad omitted subver historically; once the
         # node exposes it, this restores the dashboard panel without metrics
         # labels. Until then the exporter user_agent fallback still applies.
@@ -951,7 +1029,69 @@ def ssh_capture_script(node: Node, script: str) -> subprocess.CompletedProcess:
     return subprocess.run(node.ssh_cmd("bash", "-s"), input=script, text=True, capture_output=True)
 
 
-def probe_node(node: Node, want_metrics: bool = True) -> dict:
+STATUS_REPORT_TIMEOUT = 3
+STATUS_REPORT_LIMIT = 64 * 1024
+STATUS_REPORT_MAX_AGE = 90
+BLOCK_HASH = re.compile(r"[0-9a-f]{64}")
+
+
+def status_report_probe(report: object, now: float) -> dict:
+    """Map a remote-status.py report onto the probe fields the collector reads.
+
+    The report comes from another host, so anything malformed or stale is an error
+    rather than a partial observation.
+    """
+    try:
+        observed_at = report["observedAt"]
+        if (not isinstance(observed_at, (int, float))
+                or not 0 <= now - observed_at <= STATUS_REPORT_MAX_AGE):
+            return {"error": "stale status report"}
+        accepted = report.get("acceptedBlocks24h")
+        probe = {
+            "active_state": "active" if report["nodeActive"] is True else "inactive",
+            "client_name": "zakurad",
+            "miner": {
+                "active": report["minerActive"] is True,
+                "accepted_blocks_24h": accepted if type(accepted) is int else None,
+                "observed_at": observed_at,
+            },
+        }
+        if report["nodeHealthy"] is not True:
+            probe["rpc_error"] = "remote node RPC unavailable"
+            return probe
+        height = report["height"]
+        recent = report["recentHashes"]
+        if (type(height) is not int or height < 0 or not isinstance(recent, dict)
+                or not BLOCK_HASH.fullmatch(str(report["hash"]))):
+            raise ValueError("malformed tip")
+        probe.update({
+            "height": height,
+            "block_hash": report["hash"],
+            "ancestor_hashes": {
+                str(depth): recent[str(height - depth)] for depth in (1, 2)
+                if BLOCK_HASH.fullmatch(str(recent.get(str(height - depth), "")))
+            },
+            "rpc_chain": "test",
+            "nu7": {"branch_id": str(report["branchId"]),
+                    "activation_height": report["activationHeight"]},
+        })
+        return probe
+    except (KeyError, TypeError, ValueError):
+        return {"error": "malformed status report"}
+
+
+def probe_status_endpoint(node: Node) -> dict:
+    try:
+        with urllib.request.urlopen(node.status_url, timeout=STATUS_REPORT_TIMEOUT) as response:
+            report = json.loads(response.read(STATUS_REPORT_LIMIT))
+    except (OSError, ValueError) as error:
+        return {"error": f"status report unavailable: {type(error).__name__}"}
+    return status_report_probe(report, time.time())
+
+
+def probe_node(node: Node, want_metrics: bool = True, ancestor_height: int | None = None) -> dict:
+    if node.status_url:
+        return probe_status_endpoint(node)
     rpc_url = rpc_url_for(node.rpc_listen_addr)
     script = (
         "python3 - "
@@ -969,7 +1109,8 @@ def probe_node(node: Node, want_metrics: bool = True) -> dict:
         f"{shlex.quote(node.metrics_endpoint)} "
         f"{shlex.quote(node.health_listen_addr)} "
         f"{shlex.quote(node.state_cache_dir)} "
-        f"{shlex.quote('1' if want_metrics else '')} <<'PY'\n"
+        f"{shlex.quote('1' if want_metrics else '')} "
+        f"{shlex.quote(str(ancestor_height) if ancestor_height is not None else '')} <<'PY'\n"
         f"{REMOTE_PROBE}\n"
         "PY\n"
     )
@@ -1021,6 +1162,164 @@ class RateLimiter:
             return True
 
 
+PRIVATE_ADDRESS_FILE = Path("/etc/zakura-mainnet-dashboard/private/addresses.json")
+
+
+def address_key(value):
+    address = ipaddress.ip_address(value)
+    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped:
+        address = address.ipv4_mapped
+    return address.version, address.packed
+
+
+def private_addresses():
+    try:
+        with PRIVATE_ADDRESS_FILE.open("rb") as stream:
+            data = json.loads(stream.read(4097))
+    except FileNotFoundError:
+        if os.environ.get("ZAKURA_MAC_CRANELIFT_STATUS") == "1":
+            raise ValueError("private address configuration required") from None
+        return frozenset()
+    if not isinstance(data, list) or not 1 <= len(data) <= 16 or any(not isinstance(item, str) for item in data):
+        raise ValueError("invalid private address configuration")
+    return frozenset(address_key(item) for item in data)
+
+
+def monitoring_snapshot(value, node_names):
+    """Retain typed fleet observations when address redaction cannot be configured.
+
+    Arbitrary strings and nested diagnostic objects never cross this boundary.
+    Detailed endpoints remain unavailable until privacy configuration is repaired.
+    """
+    def number(item):
+        return type(item) in (int, float) and math.isfinite(item) and item >= 0
+
+    def block_hash(item):
+        return isinstance(item, str) and re.fullmatch(r"[0-9a-fA-F]{64}", item) is not None
+
+    names = {name for name in node_names if re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,63}", name)}
+    names.add("mac-os-cranelift")
+    rows = []
+    for row in value.get("rows", []):
+        if not isinstance(row, dict) or row.get("name") not in names:
+            continue
+        health = row.get("health")
+        if health not in {"healthy", "stale", "verification_error", "rpc_error", "down", "starting"}:
+            health = "down"
+        safe = {"name": row["name"], "health": health, "healthy": health == "healthy",
+                "detail": "Limited status: privacy configuration unavailable"}
+        if type(row.get("height")) is int and row["height"] >= 0:
+            safe["height"] = row["height"]
+        for field in ("seconds_since_advanced", "observed_at"):
+            if number(row.get(field)):
+                safe[field] = row[field]
+        for field in ("block_hash", "previous_hash"):
+            if block_hash(row.get(field)):
+                safe[field] = row[field]
+        ancestors = row.get("ancestor_hashes")
+        if isinstance(ancestors, dict):
+            safe["ancestor_hashes"] = {depth: value for depth, value in ancestors.items()
+                if isinstance(depth, str) and depth.isdecimal() and len(depth) <= 10
+                and 0 < int(depth) <= 0xFFFFFFFF and block_hash(value)}
+        rows.append(safe)
+    result = {"rows": rows, "total": len(rows),
+              "healthy": sum(row["healthy"] for row in rows), "chain": {}}
+    for field in ("last_poll", "generated_at", "stale_after"):
+        if number(value.get(field)):
+            result[field] = value[field]
+    if value.get("network") in {"mainnet", "testnet"}:
+        result["network"] = value["network"]
+    return result
+
+
+def redact_private_addresses(value, protected):
+    """Remove only protected Mac addresses, including from Linux peer diagnostics."""
+    if isinstance(value, dict):
+        return {redact_private_addresses(key, protected): redact_private_addresses(item, protected)
+                for key, item in value.items()}
+    if isinstance(value, list):
+        return [redact_private_addresses(item, protected) for item in value]
+    if not isinstance(value, str):
+        return value
+
+    def ipv4(match):
+        literal = match.group()
+        try:
+            if address_key(literal) in protected:
+                return "[redacted-address]"
+        except ValueError:
+            pass
+        return literal
+
+    # An invalid outer IPv6 token must not swallow a protected dotted address.
+    value = re.sub(r"(?:\d{1,3}\.){3}\d{1,3}", ipv4, value)
+
+    # Overlapping bounded windows prevent a long hexadecimal prefix from
+    # consuming the beginning of an expanded protected IPv6 address.
+    pattern = r"(?<![a-fA-F0-9])(?=((?:[a-fA-F0-9]{0,4}:){2,8}[a-fA-F0-9]{0,4}(?:%[\w.-]{1,32})?))"
+    parts, previous = [], 0
+    for match in re.finditer(pattern, value):
+        if match.start() < previous:
+            continue
+        literal = match.group(1)
+        starts = [0] + [i + 1 for i, char in enumerate(literal) if char == ":"]
+        ends = sorted([len(literal)] + [i for i, char in enumerate(literal) if char == ":"], reverse=True)
+        found = None
+        for start in starts:
+            for end in ends:
+                candidate = literal[start:end]
+                if end <= start or candidate.count(":") < 2:
+                    continue
+                try:
+                    if address_key(candidate) in protected:
+                        found = (match.start() + start, match.start() + end)
+                        break
+                except ValueError:
+                    pass
+            if found is not None:
+                break
+        if found is not None:
+            start, end = found
+            parts.extend((value[previous:start], "[redacted-address]"))
+            previous = end
+    parts.append(value[previous:])
+    return "".join(parts)
+
+
+def mac_cranelift_status() -> dict:
+    """Read only the comparator's sanitized file, never the private comparison state."""
+    try:
+        with Path("/var/lib/zakura-mac-cranelift-public/status.json").open("rb") as stream:
+            raw = stream.read(65537)
+        if len(raw) > 65536:
+            raise ValueError("oversized status")
+        data = json.loads(raw)
+        identifier = data.get("verifier_id")
+        if not isinstance(identifier, str) or not re.fullmatch(r"verifier-[a-f0-9]{32}", identifier):
+            raise ValueError("invalid verifier identifier")
+        result = {"verifier_id": identifier, "available": True}
+        for key in ("sample_time", "compared_through", "mac_tip", "node_rss_bytes", "free_disk_bytes"):
+            value = data.get(key)
+            result[key] = value if type(value) in (int, float) and math.isfinite(value) else None
+        for key in ("alerts_muted",):
+            result[key] = data.get(key) is True
+        for key in ("mac_tip_hash", "source_sha"):
+            value = data.get(key)
+            size = 64 if key == "mac_tip_hash" else 40
+            result[key] = value if isinstance(value, str) and re.fullmatch(r"[a-fA-F0-9]{%d}" % size, value) else ""
+        result["comparison_healthy"] = data.get("condition") == "matching"
+        ancestors = data.get("ancestor_hashes") or {}
+        result["ancestor_hashes"] = {depth: value for depth, value in ancestors.items()
+            if isinstance(depth, str) and depth.isdecimal() and len(depth) <= 10
+            and 0 < int(depth) <= 0xFFFFFFFF
+            and isinstance(value, str) and re.fullmatch(r"[a-fA-F0-9]{64}", value)} if isinstance(ancestors, dict) else {}
+        stamp = result["sample_time"]
+        result["available"] = stamp is not None and 0 <= time.time() - stamp <= 90
+        return result
+    except (OSError, ValueError, TypeError, AttributeError):
+        return {"available": False}
+
+
 class ClusterCollector:
     def __init__(
         self,
@@ -1032,8 +1331,10 @@ class ClusterCollector:
         history_window: float = DEFAULT_NODE_HISTORY_WINDOW,
         expose_logs: bool = False,
         metrics_min_interval: float | None = None,
+        nu7: "Nu7Status | None" = None,
     ):
         self.nodes = nodes
+        self.nu7 = nu7
         self.interval = interval
         self.stale_after = stale_after
         self.network = network
@@ -1049,6 +1350,7 @@ class ClusterCollector:
         self.ironwood_activation_height = IRONWOOD_ACTIVATION_HEIGHTS[network]
         self.lock = threading.Lock()
         restored_progress = load_progress(state_file)
+        self.private_mac_progress = restored_progress.get("mac-os-cranelift", {})
         self.last_height: dict[str, int | None] = {
             node.name: restored_progress.get(node.name, {}).get("height") for node in nodes
         }
@@ -1085,9 +1387,13 @@ class ClusterCollector:
     def poll_once(self) -> None:
         rows = []
         started = time.time()
+        private_enabled = self.network == "mainnet" and os.environ.get("ZAKURA_MAC_CRANELIFT_STATUS") == "1"
+        sample = mac_cranelift_status() if private_enabled else {}
+        tip = sample.get("mac_tip") if sample.get("available") else None
+        ancestor_height = max(0, tip - 10) if type(tip) is int else None
         with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(self.nodes))) as pool:
             futures = {
-                pool.submit(probe_node, node, self.should_scrape_metrics(node.name, started)): node
+                pool.submit(probe_node, node, self.should_scrape_metrics(node.name, started), ancestor_height): node
                 for node in self.nodes
             }
             for future in concurrent.futures.as_completed(futures):
@@ -1098,6 +1404,29 @@ class ClusterCollector:
                     probe = {"error": str(error)}
                 rows.append(self.row_for(node, probe, time.time()))
 
+        if private_enabled:
+            self.last_height.setdefault("mac-os-cranelift", self.private_mac_progress.get("height"))
+            self.last_advanced_at.setdefault("mac-os-cranelift", self.private_mac_progress.get("last_advanced_at"))
+            self.history.setdefault("mac-os-cranelift", deque())
+            mac = Node(name="mac-os-cranelift", ssh_string="", node_id=sample.get("verifier_id", ""), probe_kind="private-loopback",
+                       service_name="", bin_path="", log_file="", rpc_listen_addr="", rpc_auth="",
+                       rpc_config_path="", rpc_user="", rpc_password="", process_pattern="", container_name="")
+            probe = {"height": sample.get("mac_tip") if sample.get("available") else None,
+                     "block_hash": sample.get("mac_tip_hash"), "commit": sample.get("source_sha"),
+                     "ancestor_hashes": sample.get("ancestor_hashes") or {},
+                     "previous_hash": (sample.get("ancestor_hashes") or {}).get("1", ""),
+                     "active_state": "active" if sample.get("available") else "unknown",
+                     "client_name": "Zakura macOS ARM64", "rpc_chain": "main", "rpc_testnet": False,
+                     "host": {"disk_free_bytes": sample.get("free_disk_bytes"),
+                              "rss_bytes": sample.get("node_rss_bytes")}}
+            row = self.row_for(mac, probe, time.time())
+            row["comparison_healthy"] = sample.get("comparison_healthy") is True
+            if row["healthy"] and not row["comparison_healthy"]:
+                row.update(healthy=False, health="verification_error", detail="Verification incomplete or inconsistent")
+            row["detail"] += " · Compared through " + str(sample.get("compared_through") or "—")
+            if sample.get("alerts_muted"):
+                row["detail"] += " · Alerts muted"
+            rows.append(row)
         rows.sort(key=lambda row: row["name"])
         now = time.time()
         with self.lock:
@@ -1113,6 +1442,9 @@ class ClusterCollector:
         # survive a restart or every node reports as freshly advanced on the
         # next process start.
         self.persist_state(snapshot)
+        if self.nu7 is not None:
+            # Outside the lock: the NU7 view samples headers from the primary's RPC.
+            self.nu7.update(rows, now)
 
     def progress_snapshot(self) -> dict[str, dict]:
         return {
@@ -1393,6 +1725,12 @@ class ClusterCollector:
             "mempool_bytes": coerce_int(probe.get("mempool_bytes")),
             "node_errors": probe.get("node_errors") or "",
             "node_errors_at": coerce_int(probe.get("node_errors_at")),
+            "peer_external": coerce_int(probe.get("peer_external")),
+            "nu7": probe.get("nu7"),
+            "nsm_value_balance_zat": coerce_int(probe.get("nsm_value_balance_zat")),
+            "nsm_reissuance_known": "nsm_reissuance_height" in probe,
+            "nsm_reissuance_height": coerce_int(probe.get("nsm_reissuance_height")),
+            "miner": probe.get("miner"),
         }
 
     def snapshot(self) -> dict:
@@ -1905,6 +2243,253 @@ def rfc3339_utc(timestamp: float) -> str:
         .isoformat(timespec="seconds")
         .replace("+00:00", "Z")
     )
+
+
+# --------------------------------------------------------------------------- #
+# NU7 configured-network status (/v1/status, schema version 1)
+# --------------------------------------------------------------------------- #
+
+NU7_SCHEMA_VERSION = 1
+NU7_TARGET_SPACING_SECONDS = 25
+NU7_DAA_WINDOW_BLOCKS = 102
+# 300 adjacent post-NU7 block intervals.
+NU7_INTERVAL_HEADERS = 301
+NU7_RECENT_BLOCKS = 8
+# A validator agrees when it is on the primary's chain within this many blocks.
+NU7_MAX_LAG_BLOCKS = 2
+NU7_RPC_TIMEOUT = 5
+
+
+def nu7_network_parameters(config_path: Path) -> dict:
+    """The NU7 fork's public identity, read from the primary node's own config."""
+    with config_path.open("rb") as stream:
+        network = tomllib.load(stream)["network"]
+    parameters = network["network"]
+    if not isinstance(parameters, dict):
+        raise ValueError("--nu7-config requires an explicit network parameter table")
+    return {
+        "name": parameters["network_name"],
+        "magic": "".join(f"{byte:02x}" for byte in parameters["network_magic"]),
+        "activationHeight": parameters["activation_heights"]["NU7"],
+        "nsmSeedZat": parameters["initial_nsm_value_balance"],
+        "targetSpacingSeconds": NU7_TARGET_SPACING_SECONDS,
+        "daaWindowBlocks": NU7_DAA_WINDOW_BLOCKS,
+    }
+
+
+class Nu7Status:
+    """Builds the public NU7 status from the collector's validator rows.
+
+    Validators are the configured nodes, in config order; the first is the
+    primary, whose RPC on this host also supplies block headers. Remote validators
+    report through their status endpoint, so this host needs no SSH keys for them.
+    """
+
+    def __init__(self, nodes: list[Node], config_path: Path, generation_start: float = 0.0):
+        if not nodes or not nodes[0].local or not rpc_url_for(nodes[0].rpc_listen_addr):
+            raise SystemExit("--nu7-config needs a first node with monitor.local and an RPC address")
+        self.network = nu7_network_parameters(config_path)
+        self.nodes = nodes
+        self.primary = nodes[0]
+        self.rpc_url = rpc_url_for(self.primary.rpc_listen_addr)
+        # Counters never include a previous network generation's observations.
+        self.generation_start = generation_start
+        self.started_at = time.time()
+        self.headers: dict[int, dict] = {}
+        self.last_tip: tuple[int, str] | None = None
+        self.observed_blocks: deque[float] = deque()
+        self.observed_reorgs: deque[float] = deque()
+        self.lock = threading.Lock()
+        self.payload: dict | None = None
+
+    def rpc(self, method: str, params: list | None = None):
+        request = urllib.request.Request(
+            self.rpc_url,
+            json.dumps({"jsonrpc": "2.0", "id": 1, "method": method,
+                        "params": params or []}).encode(),
+            {"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(request, timeout=NU7_RPC_TIMEOUT) as response:
+            result = json.load(response)
+        if result.get("error") is not None:
+            raise RuntimeError(f"{method} failed")
+        return result["result"]
+
+    def sample_headers(self, height: int) -> list[dict]:
+        # Post-NU7 blocks only, but always at least the tip: a freshly seeded fork
+        # sits below activation until its first blocks are mined.
+        start = max(min(self.network["activationHeight"], height),
+                    height - NU7_INTERVAL_HEADERS + 1)
+        for number in range(start, height + 1):
+            if number not in self.headers:
+                block_hash = self.rpc("getblockhash", [number])
+                self.headers[number] = self.rpc("getblockheader", [block_hash, True])
+        self.headers = {number: header for number, header in self.headers.items()
+                        if number >= start}
+        return [self.headers[number] for number in range(start, height + 1)]
+
+    def primary_hash_at(self, height: int, tip: tuple[int, str]) -> str | None:
+        if height == tip[0]:
+            return tip[1]
+        cached = self.headers.get(height)
+        return cached["hash"] if cached else self.rpc("getblockhash", [height])
+
+    def valid_validator(self, row: dict) -> bool:
+        """Whether a validator answers on the configured NU7 network.
+
+        Deliberately not the fleet `healthy` flag, which also requires recent tip
+        progress: a stalled chain must still publish its tip and age.
+        """
+        nu7 = row.get("nu7") or {}
+        return (row.get("rpc_ok") is True and row.get("active_state") == "active"
+                and row.get("rpc_chain") == "test"
+                and isinstance(row.get("height"), int) and bool(row.get("block_hash"))
+                and nu7.get("activation_height") == self.network["activationHeight"])
+
+    def agrees(self, row: dict, primary: dict) -> tuple[bool, int | None]:
+        """Whether a validator is on the primary's chain, and how far it lags."""
+        if not self.valid_validator(row):
+            return False, None
+        if (row["nu7"] or {}).get("branch_id") != (primary["nu7"] or {}).get("branch_id"):
+            return False, None
+        tip = (primary["height"], primary["block_hash"])
+        lag = tip[0] - row["height"]
+        if not -NU7_MAX_LAG_BLOCKS <= lag <= NU7_MAX_LAG_BLOCKS:
+            return False, lag
+        if lag >= 0:
+            same = self.primary_hash_at(row["height"], tip) == row["block_hash"]
+        else:
+            # Ahead of the primary: compare its ancestor at the primary's height.
+            same = (row.get("ancestor_hashes") or {}).get(str(-lag)) == tip[1]
+        return same, lag
+
+    def record_tip(self, height: int, block_hash: str, now: float) -> None:
+        if self.last_tip and self.last_tip != (height, block_hash):
+            old_height, old_hash = self.last_tip
+            # A lower tip can only come from a reorganization, and its old height may
+            # no longer exist to compare hashes at.
+            if old_height > height or self.rpc("getblockhash", [old_height]) != old_hash:
+                self.observed_reorgs.append(now)
+                self.headers.clear()
+            if height > old_height:
+                self.observed_blocks.extend([now] * (height - old_height))
+        self.last_tip = (height, block_hash)
+        cutoff = max(now - 86400, self.generation_start)
+        for observed in (self.observed_blocks, self.observed_reorgs):
+            while observed and observed[0] < cutoff:
+                observed.popleft()
+
+    def unavailable(self, now: float, error: str, nodes: list[dict] | None = None) -> dict:
+        payload = {"schemaVersion": NU7_SCHEMA_VERSION, "observedAt": now,
+                   "status": "unavailable", "network": self.network, "error": error}
+        if nodes is not None:
+            payload["nodes"] = nodes
+        return payload
+
+    def build(self, rows: list[dict], now: float) -> dict:
+        by_name = {row["name"]: row for row in rows}
+        validators = [(node, by_name.get(node.name, {})) for node in self.nodes]
+        primary = validators[0][1]
+        if not self.valid_validator(primary):
+            return self.unavailable(now, "Primary node RPC unavailable", [
+                {"name": node.label or node.name, "healthy": self.valid_validator(row)}
+                for node, row in validators])
+
+        height, block_hash = primary["height"], primary["block_hash"]
+        self.record_tip(height, block_hash, now)
+        headers = self.sample_headers(height)
+        intervals = [max(0, right["time"] - left["time"])
+                     for left, right in zip(headers, headers[1:])]
+
+        observed = [(node, row, *self.agrees(row, primary)) for node, row in validators]
+        local_agree = all(agree for node, _, agree, _ in observed if node.local)
+        all_agree = all(agree for _, _, agree, _ in observed)
+        remote_miners = []
+        for node, row, agree, lag in observed:
+            if node.local or not node.internal_miner:
+                continue
+            miner = row.get("miner") or {}
+            entry = {"id": node.miner_id or node.name, "region": node.region,
+                     "healthy": agree and miner.get("active") is True}
+            if miner:
+                entry.update({"minerActive": miner.get("active") is True,
+                              "nodeHealthy": row.get("rpc_ok") is True,
+                              "acceptedBlocks24h": miner.get("accepted_blocks_24h"),
+                              "observedAt": miner.get("observed_at")})
+            if lag is not None:
+                entry.update({"height": row["height"], "lagBlocks": lag})
+            remote_miners.append(entry)
+        local_miners = sum(1 for node, _, agree, _ in observed
+                           if node.local and node.internal_miner and agree)
+
+        balance = primary.get("nsm_value_balance_zat")
+        tip_header = headers[-1]
+        return {
+            "schemaVersion": NU7_SCHEMA_VERSION, "observedAt": now,
+            "status": "live" if all_agree else "degraded",
+            "network": {**self.network, "branchId": primary["nu7"]["branch_id"],
+                        "reissuanceHeight": primary.get("nsm_reissuance_height"),
+                        "reissuanceKnown": primary.get("nsm_reissuance_known") is True},
+            "chain": {
+                "height": height, "hash": block_hash, "blockTime": tip_header["time"],
+                "tipAgeSeconds": max(0, int(now - tip_header["time"])),
+                "difficulty": tip_header.get("difficulty"),
+                "meanIntervalSeconds": round(statistics.mean(intervals), 1) if intervals else None,
+                "medianIntervalSeconds": (round(statistics.median(intervals), 1)
+                                          if intervals else None),
+                "intervalSampleBlocks": len(intervals),
+            },
+            "nsm": {"balanceZat": balance, "available": balance is not None,
+                    "seedZat": self.network["nsmSeedZat"]},
+            "observation": {
+                "localNodesAgree": local_agree,
+                "validatorsAgree": all_agree,
+                "validatorsAgreeing": sum(1 for *_, agree, _ in observed if agree),
+                "validatorsConfigured": len(observed),
+                "blocks24h": len(self.observed_blocks),
+                "reorgs24h": len(self.observed_reorgs),
+                "reorgRate24h": (len(self.observed_reorgs) / len(self.observed_blocks)
+                                 if self.observed_blocks else None),
+                "since": max(self.started_at, self.generation_start),
+                "scope": (f"{len(observed)} validators; tip replacements observed "
+                          "on the primary only"),
+            },
+            "mining": {
+                "operatorMinersActive": local_miners + sum(m["healthy"] for m in remote_miners),
+                "operatorMinersConfigured": sum(node.internal_miner for node, _ in validators),
+                "remoteMiners": remote_miners,
+            },
+            "nodes": [
+                {key: value for key, value in (
+                    ("name", node.label or node.name), ("healthy", agree),
+                    ("height", row.get("height")), ("hash", row.get("block_hash")),
+                    ("peers", row.get("peer_count")), ("externalPeers", row.get("peer_external")),
+                ) if value is not None}
+                for node, row, agree, _ in observed
+            ],
+            "recentBlocks": [{"height": header["height"], "hash": header["hash"],
+                              "time": header["time"], "difficulty": header.get("difficulty")}
+                             for header in reversed(headers[-NU7_RECENT_BLOCKS:])],
+        }
+
+    def update(self, rows: list[dict], now: float) -> None:
+        try:
+            payload = self.build(rows, now)
+        except Exception:
+            # The public payload stays generic; the journal keeps the cause.
+            logging.exception("NU7 status collection failed")
+            payload = self.unavailable(now, "Collector failed to sample node RPC")
+        with self.lock:
+            self.payload = payload
+
+    def response(self, now: float | None = None) -> tuple[int, dict]:
+        now = time.time() if now is None else now
+        with self.lock:
+            payload = self.payload
+        if payload is None or now - payload["observedAt"] > PUBLIC_STATUS_MAX_AGE:
+            payload = {"schemaVersion": NU7_SCHEMA_VERSION, "status": "unavailable",
+                       "error": "No fresh observation", "network": self.network}
+        return (503 if payload["status"] == "unavailable" else 200), payload
 
 
 PAGE = r"""<!doctype html>
@@ -2835,7 +3420,7 @@ function formatRestarted(value) {
 
 /* ---------- tone mapping ---------- */
 const HEALTH_TONE = {
-  healthy: 'ok', stale: 'warn', rpc_error: 'bad', down: 'bad', starting: 'neutral',
+  healthy: 'ok', stale: 'warn', verification_error: 'bad', rpc_error: 'bad', down: 'bad', starting: 'neutral',
 };
 const CHAIN_TONE = {
   majority: 'ok', behind: 'warn', ahead: 'warn', fork: 'bad', unknown: 'neutral',
@@ -2945,7 +3530,7 @@ function renderFleet(data) {
     ? 'every node is active, serving RPC, and advancing'
     : unhealthy + ' node' + (unhealthy === 1 ? '' : 's') + ' need attention';
 
-  const order = ['healthy', 'stale', 'rpc_error', 'down', 'starting'];
+  const order = ['healthy', 'stale', 'verification_error', 'rpc_error', 'down', 'starting'];
   const present = order.filter((key) => counts[key]);
   for (const key of Object.keys(counts)) {
     if (!present.includes(key)) present.push(key);
@@ -3326,7 +3911,7 @@ function renderNodeHeader(data) {
     + (row.tip_event ? badge(tipEventLabel(row.tip_event) || row.tip_event, 'bad') : '');
 
   const pill = el('state-pill');
-  pill.textContent = { healthy: 'Healthy', stale: 'Stale', rpc_error: 'RPC error', down: 'Down' }[row.health]
+  pill.textContent = { healthy: 'Healthy', stale: 'Stale', verification_error: 'Verification error', rpc_error: 'RPC error', down: 'Down' }[row.health]
     || 'Starting';
   pill.className = 'state-pill is-' + (healthTone === 'neutral' ? 'warn' : healthTone);
 }
@@ -3721,7 +4306,39 @@ NO_STORE = {
 }
 
 
+class BoundedHTTPServer(ThreadingHTTPServer):
+    """A threading HTTP server that handles at most `max_concurrent` requests at once.
+
+    ThreadingHTTPServer starts one thread per connection without limit. Here the
+    accept loop waits for a free slot instead, so excess clients queue in the listen
+    backlog rather than exhausting threads.
+    """
+
+    daemon_threads = True
+
+    def __init__(self, address, handler, max_concurrent: int = MAX_CONCURRENT_REQUESTS):
+        super().__init__(address, handler)
+        self.slots = threading.BoundedSemaphore(max_concurrent)
+
+    def process_request(self, request, client_address):
+        self.slots.acquire()
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self.slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self.slots.release()
+
+
 class Handler(BaseHTTPRequestHandler):
+    # Socket timeout, so a client that stalls mid-request frees its slot.
+    timeout = REQUEST_TIMEOUT_SECONDS
+
     def log_message(self, *args) -> None:
         pass
 
@@ -3732,6 +4349,17 @@ class Handler(BaseHTTPRequestHandler):
         content_type: str,
         headers: dict[str, str] | None = None,
     ) -> None:
+        if body and content_type.startswith("application/json"):
+            try:
+                body = json.dumps(redact_private_addresses(json.loads(body), private_addresses()),
+                                  separators=(",", ":")).encode()
+            except (OSError, ValueError, TypeError):
+                if urllib.parse.urlparse(self.path).path == "/data" and COLLECTOR is not None:
+                    body = json.dumps(monitoring_snapshot(json.loads(body), COLLECTOR.nodes_by_name),
+                                      separators=(",", ":")).encode()
+                else:
+                    status = 503
+                    body = b'{"error":"privacy configuration unavailable"}'
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
@@ -3753,6 +4381,7 @@ class Handler(BaseHTTPRequestHandler):
             headers.update({
                 "Access-Control-Allow-Origin": origin,
                 "Access-Control-Allow-Methods": "GET, OPTIONS",
+                "Access-Control-Allow-Headers": "Content-Type",
                 "Access-Control-Max-Age": "600",
             })
         return headers
@@ -3807,7 +4436,7 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path.startswith("/node/"):
             assert COLLECTOR is not None
             name = urllib.parse.unquote(parsed.path[len("/node/"):])
-            if name not in COLLECTOR.nodes_by_name:
+            if name not in COLLECTOR.nodes_by_name and COLLECTOR.node_snapshot(name) is None:
                 return self.send_body(
                     404,
                     b'not found\n\nUnknown node. Return to the fleet: <a href="/">/</a>\n',
@@ -3837,6 +4466,17 @@ class Handler(BaseHTTPRequestHandler):
                 )
             status, payload = COLLECTOR.ironwood_status()
             return self.send_json(status, payload, headers)
+        if parsed.path == "/v1/status" and COLLECTOR.nu7 is not None:
+            headers = self.public_headers()
+            if not RATE_LIMITER.allow(self.rate_limit_client()):
+                headers["Retry-After"] = str(int(PUBLIC_RATE_WINDOW))
+                return self.send_json(429, {"schemaVersion": NU7_SCHEMA_VERSION,
+                                            "status": "unavailable",
+                                            "error": "Request rate limit exceeded"}, headers)
+            code, payload = COLLECTOR.nu7.response()
+            if code == 200:
+                headers["Cache-Control"] = "public, max-age=10"
+            return self.send_json(code, payload, headers)
         if parsed.path == "/healthz":
             return self.send_body(
                 200,
@@ -3863,7 +4503,10 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_OPTIONS(self) -> None:
         parsed = urllib.parse.urlparse(self.path)
-        if parsed.path != "/ironwood-status.json":
+        public_paths = {"/ironwood-status.json"}
+        if COLLECTOR is not None and COLLECTOR.nu7 is not None:
+            public_paths.add("/v1/status")
+        if parsed.path not in public_paths:
             return self.send_body(
                 404,
                 b"not found\n",
@@ -3915,6 +4558,17 @@ def main() -> None:
         help="serve each node's redacted log error tail on the public node page",
     )
     parser.add_argument(
+        "--nu7-config",
+        default="",
+        help="primary NU7 fork node config; serves the NU7 fork's /v1/status",
+    )
+    parser.add_argument(
+        "--nu7-generation-start",
+        type=float,
+        default=0.0,
+        help="Unix time the current NU7 network generation started; older observations are not counted",
+    )
+    parser.add_argument(
         "--metrics-min-interval",
         type=float,
         default=None,
@@ -3924,6 +4578,9 @@ def main() -> None:
 
     nodes = load_nodes(Path(args.config))
     state_file = Path(args.state_file) if args.state_file else None
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+    nu7 = (Nu7Status(nodes, Path(args.nu7_config), args.nu7_generation_start)
+           if args.nu7_config else None)
     COLLECTOR = ClusterCollector(
         nodes,
         args.interval,
@@ -3933,6 +4590,7 @@ def main() -> None:
         history_window=args.history_window,
         expose_logs=args.expose_logs,
         metrics_min_interval=args.metrics_min_interval,
+        nu7=nu7,
     )
     threading.Thread(target=COLLECTOR.loop, daemon=True).start()
 
@@ -3941,7 +4599,7 @@ def main() -> None:
         f"polling {len(nodes)} node(s) every {args.interval}s"
         + (f"; state {state_file}" if state_file else "")
     )
-    ThreadingHTTPServer((args.host, args.port), Handler).serve_forever()
+    BoundedHTTPServer((args.host, args.port), Handler).serve_forever()
 
 
 if __name__ == "__main__":

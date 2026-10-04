@@ -196,24 +196,6 @@ impl HostilePeer {
         Self::read_frame(recv, self.limits.max_frame_bytes).await
     }
 
-    /// Gracefully finish and forget one persistent ordered stream generation.
-    pub async fn finish_ordered_stream(
-        &self,
-        stream_kind: u16,
-        stream_version: u16,
-    ) -> Result<(), BoxError> {
-        let Some((mut send, _recv)) = self
-            .ordered_streams
-            .lock()
-            .await
-            .remove(&(stream_kind, stream_version))
-        else {
-            return Ok(());
-        };
-        send.finish()?;
-        Ok(())
-    }
-
     /// Reset and forget one persistent ordered stream generation.
     pub async fn reset_ordered_stream(
         &self,
@@ -231,37 +213,6 @@ impl HostilePeer {
         let code = VarInt::from_u32(0);
         send.reset(code)?;
         recv.stop(code)?;
-        Ok(())
-    }
-
-    /// Replace one persistent ordered stream with a fresh physical generation.
-    pub async fn reopen_ordered_stream(
-        &self,
-        stream_kind: u16,
-        stream_version: u16,
-    ) -> Result<(), BoxError> {
-        self.reset_ordered_stream(stream_kind, stream_version)
-            .await?;
-        let mut streams = self.ordered_streams.lock().await;
-        let (mut send, recv) = self.connection.open_bi().await?;
-        self.write_prelude_with_version(&mut send, stream_kind, stream_version)
-            .await?;
-        streams.insert((stream_kind, stream_version), (send, recv));
-        Ok(())
-    }
-
-    /// Send a valid frame header with a payload shorter than its declared
-    /// length.
-    pub async fn send_truncated_frame(&self, stream_kind: u16) -> Result<(), BoxError> {
-        let (mut send, _recv) = self.connection.open_bi().await?;
-        self.write_prelude(&mut send, stream_kind).await?;
-        let mut header = Vec::with_capacity(FRAME_HEADER_BYTES);
-        WriteBytesExt::write_u16::<LittleEndian>(&mut header, 1)?;
-        WriteBytesExt::write_u16::<LittleEndian>(&mut header, 0)?;
-        WriteBytesExt::write_u32::<LittleEndian>(&mut header, 8)?;
-        send.write_all(&header).await?;
-        send.write_all(&[1, 2, 3]).await?;
-        let _ = send.finish();
         Ok(())
     }
 
@@ -433,25 +384,6 @@ impl HostilePeer {
         Ok(())
     }
 
-    /// Open a stream and hold it past the victim's prelude timeout.
-    pub async fn open_and_never_send_prelude(&mut self) -> Result<(), BoxError> {
-        let (send, _recv) = self.connection.open_bi().await?;
-        self.held_streams.push(send);
-        tokio::time::sleep(self.limits.prelude_timeout + std::time::Duration::from_millis(20))
-            .await;
-        Ok(())
-    }
-
-    /// Open at most `count` streams quickly, sending valid preludes.
-    pub async fn churn_streams(&mut self, stream_kind: u16, count: usize) -> Result<(), BoxError> {
-        for _ in 0..count.min(4096) {
-            let (mut send, _recv) = self.connection.open_bi().await?;
-            self.write_prelude(&mut send, stream_kind).await?;
-            self.held_streams.push(send);
-        }
-        Ok(())
-    }
-
     /// Close the raw endpoint.
     pub async fn shutdown(self) {
         self.connection.close(VarInt::from_u32(0), b"hostile done");
@@ -487,16 +419,6 @@ impl HostilePeer {
             ZAKURA_STREAM_HEADER_SYNC => ZAKURA_HEADER_SYNC_STREAM_VERSION,
             ZAKURA_STREAM_BLOCK_SYNC => ZAKURA_BLOCK_SYNC_STREAM_VERSION,
             _ => 1,
-        }
-    }
-
-    /// Selected header-sync stream version for an explicit capability mask.
-    pub fn selected_header_sync_version(capabilities: u64) -> Option<u16> {
-        if capabilities & ZAKURA_CAP_HEADER_SYNC != 0 {
-            Some(ZAKURA_HEADER_SYNC_STREAM_VERSION)
-        } else {
-            (capabilities & ZAKURA_CAP_HEADER_SYNC != 0)
-                .then_some(ZAKURA_HEADER_SYNC_STREAM_VERSION)
         }
     }
 

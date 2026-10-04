@@ -4,7 +4,6 @@
 
 use chrono::DateTime;
 use color_eyre::eyre::{eyre, Report};
-use once_cell::sync::Lazy;
 use tower::{buffer::Buffer, service_fn, util::BoxService, Service, ServiceExt};
 
 use zakura_chain::{amount::NegativeAllowed, ironwood};
@@ -32,110 +31,12 @@ use zakura_chain::{
     work::difficulty::{ParameterDifficulty as _, INVALID_COMPACT_DIFFICULTY},
 };
 use zakura_script::Sigops;
-use zakura_test::transcript::{ExpectedTranscriptError, Transcript};
 
 use crate::{block::check::subsidy_is_valid, transaction};
 
 use super::*;
 
 mod nsm_fees;
-
-static VALID_BLOCK_TRANSCRIPT: Lazy<Vec<(Request, Result<block::Hash, ExpectedTranscriptError>)>> =
-    Lazy::new(|| {
-        let block: Arc<_> =
-            Block::zcash_deserialize(&zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES[..])
-                .unwrap()
-                .into();
-        let hash = Ok(block.as_ref().into());
-        vec![(Request::Commit(block), hash)]
-    });
-
-static INVALID_TIME_BLOCK_TRANSCRIPT: Lazy<
-    Vec<(Request, Result<block::Hash, ExpectedTranscriptError>)>,
-> = Lazy::new(|| {
-    let mut block: Block =
-        Block::zcash_deserialize(&zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES[..]).unwrap();
-
-    // Modify the block's time
-    // Changing the block header also invalidates the header hashes, but
-    // those checks should be performed later in validation, because they
-    // are more expensive.
-    let three_hours_in_the_future = Utc::now()
-        .checked_add_signed(chrono::Duration::hours(3))
-        .ok_or_else(|| eyre!("overflow when calculating 3 hours in the future"))
-        .unwrap();
-    Arc::make_mut(&mut block.header).time = three_hours_in_the_future;
-
-    vec![(
-        Request::Commit(Arc::new(block)),
-        Err(ExpectedTranscriptError::Any),
-    )]
-});
-
-static INVALID_HEADER_SOLUTION_TRANSCRIPT: Lazy<
-    Vec<(Request, Result<block::Hash, ExpectedTranscriptError>)>,
-> = Lazy::new(|| {
-    let mut block: Block =
-        Block::zcash_deserialize(&zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES[..]).unwrap();
-
-    // Change nonce to something invalid
-    Arc::make_mut(&mut block.header).nonce = [0; 32].into();
-
-    vec![(
-        Request::Commit(Arc::new(block)),
-        Err(ExpectedTranscriptError::Any),
-    )]
-});
-
-static INVALID_COINBASE_TRANSCRIPT: Lazy<
-    Vec<(Request, Result<block::Hash, ExpectedTranscriptError>)>,
-> = Lazy::new(|| {
-    let header = block::Header::zcash_deserialize(&zakura_test::vectors::DUMMY_HEADER[..]).unwrap();
-
-    // Test 1: Empty transaction
-    let block1 = Block {
-        header: header.into(),
-        transactions: Vec::new(),
-    };
-
-    // Test 2: Transaction at first position is not coinbase
-    let mut transactions = Vec::new();
-    let tx = zakura_test::vectors::DUMMY_TX1
-        .zcash_deserialize_into()
-        .unwrap();
-    transactions.push(tx);
-    let block2 = Block {
-        header: header.into(),
-        transactions,
-    };
-
-    // Test 3: Invalid coinbase position
-    let mut block3 =
-        Block::zcash_deserialize(&zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES[..]).unwrap();
-    assert_eq!(block3.transactions.len(), 1);
-
-    // Extract the coinbase transaction from the block
-    let coinbase_transaction = block3.transactions.first().unwrap().clone();
-
-    // Add another coinbase transaction to block
-    block3.transactions.push(coinbase_transaction);
-    assert_eq!(block3.transactions.len(), 2);
-
-    vec![
-        (
-            Request::Commit(Arc::new(block1)),
-            Err(ExpectedTranscriptError::Any),
-        ),
-        (
-            Request::Commit(Arc::new(block2)),
-            Err(ExpectedTranscriptError::Any),
-        ),
-        (
-            Request::Commit(Arc::new(block3)),
-            Err(ExpectedTranscriptError::Any),
-        ),
-    ]
-});
 
 fn prepared_test_verifier(
     network: &Network,
@@ -624,41 +525,6 @@ async fn proposal_validation_succeeds_when_cache_insertion_conflicts() {
         .await;
     assert!(commit_result.is_ok());
     assert_eq!(transaction_calls.load(Ordering::Relaxed), 2);
-}
-
-// TODO: enable this test after implementing contextual verification
-// #[tokio::test]
-// #[ignore]
-#[allow(dead_code)]
-async fn check_transcripts_test() -> Result<(), Report> {
-    check_transcripts().await
-}
-
-#[allow(dead_code)]
-#[spandoc::spandoc]
-async fn check_transcripts() -> Result<(), Report> {
-    let _init_guard = zakura_test::init();
-
-    let network = Network::Mainnet;
-    let state_service = zakura_state::init_test(&network).await;
-
-    let transaction = transaction::Verifier::new_for_tests(&network, state_service.clone());
-    let transaction = Buffer::new(BoxService::new(transaction), 1);
-    let block_verifier = Buffer::new(
-        SemanticBlockVerifier::new(&network, state_service.clone(), transaction),
-        1,
-    );
-
-    for transcript_data in &[
-        &VALID_BLOCK_TRANSCRIPT,
-        &INVALID_TIME_BLOCK_TRANSCRIPT,
-        &INVALID_HEADER_SOLUTION_TRANSCRIPT,
-        &INVALID_COINBASE_TRANSCRIPT,
-    ] {
-        let transcript = Transcript::from(transcript_data.iter().cloned());
-        transcript.check(block_verifier.clone()).await.unwrap();
-    }
-    Ok(())
 }
 
 #[test]

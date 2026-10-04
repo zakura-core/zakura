@@ -2,7 +2,7 @@ name: Lint
 
 on:
   pull_request:
-    branches: [main, "feat/**", "split/**", "release/**"]
+    branches: [main, "feat/**", "split/**", "release/**", "codex/nu7-public-activation"]
     paths:
       - "**/*.rs"
       - "**/Cargo.toml"

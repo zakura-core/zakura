@@ -1,6 +1,6 @@
 [package]
 name = "zakura-node-services"
-version = "4.0.1"
+version = "5.0.0"
 authors.workspace = true
 description = "The interfaces of some Zakura node services. Internal crate, published to support cargo install zakura"
 license.workspace = true
@@ -28,6 +28,8 @@ rpc-client = [
     "color-eyre",
     "jsonrpsee-types",
     "reqwest",
+    "dep:rustls",
+    "dep:webpki-roots",
     "serde",
     "serde_json",
 ]
@@ -42,14 +44,18 @@ tower = { workspace = true }
 # Tool and test feature rpc-client
 jsonrpsee-types = { workspace = true, optional = true }
 # Security: avoid default dependency on openssl
-reqwest = { workspace = true, features = ["rustls-tls"], optional = true }
+reqwest = { workspace = true, features = ["rustls-no-provider"], optional = true }
+rustls = { version = "0.23.40", default-features = false, features = ["ring", "std", "tls12"], optional = true }
+webpki-roots = { version = "1", optional = true }
 serde = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
 tokio = { workspace = true, features = ["time", "sync"] }
 
 [dev-dependencies]
 
-reqwest = { workspace = true, features = ["rustls-tls"] }
+reqwest = { workspace = true, features = ["rustls-no-provider"] }
+rustls = { version = "0.23.40", default-features = false, features = ["ring", "std", "tls12"] }
+webpki-roots = "1"
 serde = { workspace = true }
 serde_json = { workspace = true }
 jsonrpsee-types = { workspace = true }

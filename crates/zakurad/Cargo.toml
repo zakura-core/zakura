@@ -63,7 +63,6 @@ pre-release-replacements = [
 # <https://docs.rs/about/metadata>
 features = [
     "default-release-binaries",
-    "filter-reload",
     "flamegraph",
     "journald",
     "opentelemetry",
@@ -107,8 +106,7 @@ internal-miner = [
 # Opt in explicitly: the tracing layer has overhead even without a SENTRY_DSN.
 sentry = ["dep:sentry"]
 journald = ["tracing-journald"]
-filter-reload = []
-opentelemetry = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "dep:tracing-opentelemetry", "dep:rustls"]
+opentelemetry = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "dep:tracing-opentelemetry"]
 
 progress-bar = [
     "howudoin",
@@ -157,9 +155,6 @@ zakura-checkpoints = [
     "zakura-utils/zakura-checkpoints",
 ]
 
-# The gRPC tests also need an installed lightwalletd binary
-lightwalletd-grpc-tests = ["tonic-prost-build"]
-
 # tokio-console support
 #
 # To activate this feature, run:
@@ -183,9 +178,9 @@ zakura-consensus = { path = "../zakura-consensus", version = "10.0.1" }
 zakura-header-chain = { path = "../zakura-header-chain", version = "4.0.1" }
 zakura-jsonl-trace = { path = "../zakura-jsonl-trace", version = "1.2.0" }
 zakura-network = { path = "../zakura-network", version = "10.0.0" }
-zakura-node-services = { path = "../zakura-node-services", version = "4.0.1", features = ["rpc-client"] }
+zakura-node-services = { path = "../zakura-node-services", version = "5.0.0", features = ["rpc-client"] }
 zakura-rpc = { path = "../zakura-rpc", version = "13.0.0" }
-zakura-state = { path = "../zakura-state", version = "10.0.1" }
+zakura-state = { path = "../zakura-state", version = "11.0.0" }
 # zakura-script is not used directly, but we list it here to enable the
 # "comparison-interpreter" feature. (Feature unification will take care of
 # enabling it in the other imports of zcash-script.)
@@ -202,7 +197,6 @@ zakura-utils = { path = "../zakura-utils", version = "2.2.7", optional = true }
 abscissa_core = { workspace = true, default-features = false, features = ["application"] }
 clap = { workspace = true, features = ["cargo"] }
 chrono = { workspace = true, features = ["clock", "std"] }
-humantime-serde = { workspace = true }
 indexmap = { workspace = true }
 lazy_static = { workspace = true }
 semver = { workspace = true }
@@ -230,7 +224,7 @@ tracing = { workspace = true }
 metrics = { workspace = true }
 
 dirs = { workspace = true }
-reqwest = { workspace = true, default-features = false, features = ["blocking", "rustls-tls"] }
+reqwest = { workspace = true, default-features = false, features = ["blocking", "rustls-no-provider"] }
 sha2 = { workspace = true }
 tempfile = { workspace = true }
 flate2 = "1.1.9"
@@ -264,9 +258,9 @@ opentelemetry = { workspace = true, optional = true }
 opentelemetry_sdk = { workspace = true, features = ["rt-tokio"], optional = true }
 opentelemetry-otlp = { workspace = true, features = ["http-proto", "reqwest-blocking-client"], optional = true }
 tracing-opentelemetry = { workspace = true, optional = true }
-rustls = { version = "0.23.40", default-features = false, features = ["ring", "std", "tls12"], optional = true }
+rustls = { version = "0.23.40", default-features = false, features = ["ring", "std", "tls12"] }
+webpki-roots = "1"
 
-# prod feature filter-reload
 bytes = { workspace = true }
 
 # prod feature prometheus
@@ -292,14 +286,9 @@ console-subscriber = { workspace = true, optional = true }
 derive-new.workspace = true
 hex.workspace = true
 
-[build-dependencies]
-# test feature lightwalletd-grpc-tests
-tonic-prost-build = { workspace = true, optional = true }
-
 [dev-dependencies]
 criterion = { workspace = true }
 abscissa_core = { workspace = true, default-features = false, features = ["testing"] }
-hex-literal = { workspace = true }
 jsonrpsee-types = { workspace = true }
 rand = { workspace = true }
 regex = { workspace = true }
@@ -308,15 +297,8 @@ insta = { workspace = true, features = ["json"] }
 # zakura-rpc needs the preserve_order feature, it also makes test results more stable
 serde_json = { workspace = true, features = ["preserve_order"] }
 hyper = { workspace = true, features = ["http1", "http2", "server"] }
-tracing-test = { workspace = true, features = ["no-env-filter"] }
 
 tokio = { workspace = true, features = ["full", "tracing", "test-util"] }
-tokio-stream = { workspace = true }
-
-# test feature lightwalletd-grpc-tests
-prost = { workspace = true }
-tonic = { workspace = true }
-tonic-prost = { workspace = true }
 
 proptest = { workspace = true }
 proptest-derive = { workspace = true }
@@ -325,10 +307,10 @@ zakura-chain = { path = "../zakura-chain", version = "10.0.0", features = ["prop
 zakura-consensus = { path = "../zakura-consensus", version = "10.0.1", features = ["proptest-impl"] }
 zakura-header-chain = { path = "../zakura-header-chain", version = "4.0.1", features = ["test-support"] }
 zakura-network = { path = "../zakura-network", version = "10.0.0", features = ["proptest-impl", "zakura-testkit"] }
-zakura-state = { path = "../zakura-state", version = "10.0.1", features = ["proptest-impl"] }
+zakura-state = { path = "../zakura-state", version = "11.0.0", features = ["proptest-impl"] }
 zakura-rpc = { path = "../zakura-rpc", version = "13.0.0", features = ["proptest-impl"] }
 
-zakura-test = { path = "../zakura-test", version = "2.2.0" }
+zakura-test = { path = "../zakura-test", version = "3.0.0" }
 
 # Used by the checkpoint generation tests via the zakura-checkpoints feature
 # (the binaries in this crate won't be built unless their features are enabled).

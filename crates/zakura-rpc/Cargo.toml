@@ -53,7 +53,7 @@ http-body-util = { workspace = true }
 semver = { workspace = true }
 serde_json = { workspace = true, features = ["raw_value"] }
 indexmap = { workspace = true, features = ["serde"] }
-derive-getters = { workspace = true, features = ["auto_copy_getters"] }
+getset = { workspace = true }
 derive-new = { workspace = true }
 thiserror = { workspace = true }
 lazy_static = { workspace = true }
@@ -92,7 +92,6 @@ serde = { workspace = true, features = ["serde_derive"] }
 nix = { workspace = true, features = ["signal"] }
 
 # For openrpc
-phf = { workspace = true, features = ["macros"] }
 schemars = { workspace = true }
 
 orchard = { workspace = true }
@@ -110,11 +109,11 @@ zakura-chain = { path = "../zakura-chain", version = "10.0.0", features = [
 ] }
 zakura-consensus = { path = "../zakura-consensus", version = "10.0.1" }
 zakura-network = { path = "../zakura-network", version = "10.0.0" }
-zakura-node-services = { path = "../zakura-node-services", version = "4.0.1", features = [
+zakura-node-services = { path = "../zakura-node-services", version = "5.0.0", features = [
     "rpc-client",
 ] }
 zakura-script = { path = "../zakura-script", version = "4.0.1" }
-zakura-state = { path = "../zakura-state", version = "10.0.1" }
+zakura-state = { path = "../zakura-state", version = "11.0.0" }
 rustls = { version = "0.23.40", default-features = false, features = ["logging", "ring", "std", "tls12"] }
 tokio-rustls = { version = "0.26.4", default-features = false, features = ["logging", "ring", "tls12"] }
 # Only used to read the validity dates of the configured RPC TLS certificates.
@@ -125,7 +124,7 @@ bytes = { workspace = true }
 http-body = { workspace = true }
 insta = { workspace = true, features = ["redactions", "json", "ron"] }
 anyhow = { workspace = true }
-reqwest = { workspace = true, features = ["rustls-tls"] }
+reqwest = { workspace = true, features = ["rustls-no-provider"] }
 tempfile = { workspace = true }
 toml = { workspace = true }
 
@@ -142,11 +141,11 @@ zakura-consensus = { path = "../zakura-consensus", version = "10.0.1", features 
 zakura-network = { path = "../zakura-network", version = "10.0.0", features = [
     "proptest-impl",
 ] }
-zakura-state = { path = "../zakura-state", version = "10.0.1", features = [
+zakura-state = { path = "../zakura-state", version = "11.0.0", features = [
     "proptest-impl",
 ] }
 
-zakura-test = { path = "../zakura-test", version = "2.2.0" }
+zakura-test = { path = "../zakura-test", version = "3.0.0" }
 
 [lints]
 workspace = true

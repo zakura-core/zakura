@@ -767,6 +767,12 @@ criteria = "safe-to-deploy"
 version = "0.5.0"
 notes = "Reviewed all packaged source, manifest, and tests. The procedural derives validate named-struct and field attributes and generate type-checked borrowed, mutable, copy, and dissolve accessors without unsafe code, a build script, runtime I/O, or ambient capabilities. The full all-feature suite passed, including all 11 trybuild cases."
 
+[[audits.derive-new]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+delta = "0.5.9 -> 0.7.0"
+notes = "Reviewed the complete six-file packaged delta and the constructor expansion, attribute parsing, and tests in context. Changes migrate to Syn 2, add caller-selected constructor visibility and Into/IntoIterator arguments, and use core paths for defaults and PhantomData. Default public visibility, ordinary field arguments, and existing default/value initializers are preserved. Generated expressions come only from caller-authored Rust tokens and use type-checked construction and trait calls. No unsafe code, build script, filesystem/network access, process execution, or ambient capabilities. All 21 unit/integration tests and 10 doctests passed with all features in an isolated package using Zakura's locked proc-macro dependency versions."
+
 [[audits.derive_builder]]
 who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"

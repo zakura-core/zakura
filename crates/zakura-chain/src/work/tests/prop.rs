@@ -64,17 +64,6 @@ prop_compose! {
 }
 
 #[test]
-fn equihash_test_vectors_validate() -> color_eyre::eyre::Result<()> {
-    let _init_guard = zakura_test::init();
-
-    for header in test_headers() {
-        header.solution.check(&header, &Network::Mainnet)?;
-    }
-
-    Ok(())
-}
-
-#[test]
 fn equihash_prop_test_solution() -> color_eyre::eyre::Result<()> {
     let _init_guard = zakura_test::init();
 

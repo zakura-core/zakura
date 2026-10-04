@@ -25,7 +25,7 @@ zakura-chain = { path = "../zakura-chain", version = "10.0.0" }
 criterion = { workspace = true }
 proptest = { workspace = true }
 toml = { workspace = true }
-zakura-test = { path = "../zakura-test/", version = "2.2.0" }
+zakura-test = { path = "../zakura-test/", version = "3.0.0" }
 
 [[bench]]
 name = "retention"

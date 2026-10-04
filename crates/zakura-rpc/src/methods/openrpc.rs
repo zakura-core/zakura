@@ -98,7 +98,7 @@ pub(super) fn render(surface: RpcSurface) -> Value {
             .into_generator(),
     );
     let methods: Vec<_> = METHODS
-        .into_iter()
+        .iter()
         .filter(|(name, _)| surface.exposes(name))
         .map(|(name, method)| {
             let description = method.description.trim();
@@ -150,7 +150,15 @@ mod tests {
         ] {
             let mut expected: serde_json::Value = serde_json::from_str(fixture).unwrap();
             expected["info"]["version"] = env!("CARGO_PKG_VERSION").into();
-            assert_eq!(render(surface), expected);
+            let mut actual = render(surface);
+            // The slice uses declaration order instead of PHF iteration order.
+            for document in [&mut actual, &mut expected] {
+                document["methods"]
+                    .as_array_mut()
+                    .unwrap()
+                    .sort_by(|left, right| left["name"].as_str().cmp(&right["name"].as_str()));
+            }
+            assert_eq!(actual, expected);
         }
     }
 }

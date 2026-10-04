@@ -181,7 +181,7 @@ jobs:
             logs=$(docker logs "$container" 2>&1)
             if grep -Fq "INFO: Using config file at /tmp/custom-conf.toml" <<< "$logs" &&
               grep -Fq "Zcash network: Testnet" <<< "$logs" &&
-              grep -Fq 'extra_coinbase_data: Some(ExtraCoinbaseData("Do you even shield?"))' <<< "$logs" &&
+              grep -Fq 'peerset_initial_target_size=25' <<< "$logs" &&
               grep -Fq "Opened Zakura state cache at /tmp/zakura-cache" <<< "$logs" &&
               grep -Fq "Trying to open metrics endpoint at 0.0.0.0:9999" <<< "$logs" &&
               grep -Fq "RPC auth cookie written to disk" <<< "$logs" &&

@@ -322,6 +322,56 @@ class ActivationFeed:
                 continue
         return None
 
+    def record_public_reorgs(self, height, block_hash, url, now):
+        """Count sampled canonical-chain replacements, never ordinary extensions.
+
+        Persist the previous verified tip and event times in the selection state.
+        A restart or a different primary must compare against that same tip.
+        The first observation establishes a baseline, not a measured zero.
+        These are observed events; forks between successful polls can be missed.
+        """
+        previous = self.state.get("publicReorgObservation")
+        def confirm_tip():
+            info = self.rpc(url, "getblockchaininfo")
+            if info["blocks"] != height or info["bestblockhash"] != block_hash:
+                raise ValueError("tip moved during reorg observation")
+        if previous is None:
+            confirm_tip()
+            self.state["publicReorgObservation"] = {
+                "startedAt": now, "lastObservedAt": now, "height": height,
+                "hash": block_hash, "events": [],
+            }
+            return {"reorgs24h": None, "since": now}
+        times = [previous["startedAt"], previous["lastObservedAt"], *previous["events"]]
+        if (len(previous["events"]) > 10000
+                or any(type(t) not in (int, float) or not 0 < t <= now for t in times)
+                or previous["startedAt"] > previous["lastObservedAt"]
+                or previous["events"] != sorted(previous["events"])
+                or any(t < previous["startedAt"] or t > previous["lastObservedAt"] for t in previous["events"])
+                or type(previous["height"]) is not int or previous["height"] <= 0
+                or not re.fullmatch(r"[0-9a-f]{64}", previous["hash"])):
+            raise ValueError("invalid persisted public reorg observations")
+        cutoff = max(now - 86400, previous["startedAt"])
+        events = [t for t in previous["events"] if t >= cutoff]
+        changed = (height, block_hash) != (previous["height"], previous["hash"])
+        if changed:
+            replaced = height < previous["height"]
+            if not replaced:
+                ancestor = self.rpc(url, "getblockhash", [previous["height"]])
+                if not isinstance(ancestor, str) or not re.fullmatch(r"[0-9a-f]{64}", ancestor):
+                    raise ValueError("previous public tip ancestry unavailable")
+                replaced = ancestor != previous["hash"]
+            if replaced:
+                if len(events) >= 10000:
+                    raise ValueError("public reorg observation capacity exceeded")
+                events.append(now)
+        confirm_tip()
+        self.state["publicReorgObservation"] = {
+            "startedAt": previous["startedAt"], "lastObservedAt": now,
+            "height": height, "hash": block_hash, "events": events,
+        }
+        return {"reorgs24h": len(events), "since": cutoff}
+
     def public_status(self, nodes, agreement, now):
         available = [n for n in nodes if n.get("rules") and n.get("fresh")]
         if not available:
@@ -372,6 +422,8 @@ class ActivationFeed:
         gap = max(0, headers[-1]["time"] - headers[-2]["time"]) if len(headers) > 1 else None
         bits = tip.get("bits")
         limit = primary["rules"]["atTip"].get("powLimitCompact")
+        reorgs = (self.record_public_reorgs(height, primary["hash"], primary["url"], now)
+                  if agreement else {"reorgs24h": None, "since": now})
         status = {
             "schemaVersion": 1, "observedAt": now, "status": "live" if agreement else "degraded",
             "network": {**manifest["network"], "targetSpacingSeconds": primary["rules"]["atTip"]["targetSpacingSeconds"],
@@ -390,8 +442,8 @@ class ActivationFeed:
             "nsm": {"balanceZat": balance, "available": balance is not None, "seedZat": None},
             "observation": {"validatorsConfigured": 3, "validatorsAgree": bool(agreement and len(agreement["nodes"]) == 3),
                             "localNodesAgree": bool(agreement), "validatorsAgreeing": len(agreement["nodes"]) if agreement else 0,
-                            "blocks24h": None, "reorgs24h": None, "reorgRate24h": None,
-                            "since": now, "scope": "Three public-Testnet validators and independent reference"},
+                            "blocks24h": None, "reorgRate24h": None, **reorgs,
+                            "scope": "Three public-Testnet validators and independent reference; reorgs are sampled canonical-chain replacements"},
             "mining": {"operatorMinersActive": 0, "operatorMinersConfigured": 0, "remoteMiners": []},
             "nodes": [{"name": n["name"], "healthy": bool(agreement and n["name"] in agreement["nodes"]),
                        **({"height": n["height"], "hash": n["hash"]} if n.get("height") is not None else {})}

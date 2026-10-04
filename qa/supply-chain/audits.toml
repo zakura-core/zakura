@@ -1956,6 +1956,12 @@ who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 delta = "0.15.3 -> 0.16.0"
 
+[[audits.metrics-exporter-prometheus]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+delta = "0.16.2 -> 0.17.2"
+notes = "Reviewed the complete packaged Rust-source and manifest deltas against the audited 0.16.2 baseline. HTTP and push rendering move to spawn_blocking; the caller-selected listener, allowlist checks, health response and output sanitization remain intact. The JoinHandle unwrap can fail on rendering panic or runtime shutdown, but introduces no unsafe code or additional ambient capability. Push-gateway gains an explicit POST/PUT choice, and ASCII unit suffixes are inserted at validated suffix boundaries; Zakura enables only the HTTP listener and leaves unit suffixing disabled. Examples migrate the rand API. Dependency changes reuse the already-reviewed metrics, hashbrown, rapidhash and thiserror versions in this tree. No build script was added. Source review only; compilation and runtime tests are delegated to PR CI."
+
 [[audits.metrics-util]]
 who = "Claude Opus 5 <noreply@anthropic.com>"
 criteria = "safe-to-deploy"
@@ -1971,6 +1977,12 @@ delta = "0.16.3 -> 0.17.0"
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 delta = "0.17.0 -> 0.18.0"
+
+[[audits.metrics-util]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+delta = "0.19.1 -> 0.20.4"
+notes = "Reviewed the complete packaged Rust-source and manifest deltas against the audited 0.19.1 baseline. The no-op KeyHasher matches metrics 0.24.6 Key::hash, which writes only its precomputed u64; generic DefaultHashable uses the already-reviewed non-cryptographic rapidhash. Registry shard bounds and unchecked indexing are unchanged. Reservoir sums and swaps use atomic operations, retained samples remain bounded by capacity, and no unsafe block or thread-local RNG access changed. New Arc storage forwarding and summary accessors add no capability. Debugging snapshots now reset counters/gauges, with added regression tests, but that feature is disabled in Zakura's exporter dependency. Reservoir sampling remains approximate telemetry under concurrent writers, not security accounting. No build script was added. Source review only; compilation and runtime tests are delegated to PR CI."
 
 [[audits.mime]]
 who = "OpenAI Codex <noreply@openai.com>"

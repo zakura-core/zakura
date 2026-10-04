@@ -3,6 +3,7 @@ import os
 import runpy
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 module = runpy.run_path(str(Path(__file__).parent / 'miner/remote-status.py'))
@@ -122,8 +123,10 @@ class MinedBlockLogTests(LogCase):
         path = self.log(ACCEPTED.format(time=stamp(199_000)))
         counter = MinedBlocks(path)
         counter.count_24h(now=200_000)
+        previous = os.stat(path)
         Path(path).unlink()
-        with self.assertLogs(level='INFO') as logs:
+        # Force inode reuse with the same size, regardless of the host filesystem.
+        with self.assertLogs(level='INFO') as logs, mock.patch.object(os, 'fstat', return_value=previous):
             counter.count_24h(now=200_000)
             counter.count_24h(now=200_000)
             Path(path).write_text(ACCEPTED.format(time=stamp(199_500)))

@@ -120,6 +120,10 @@ class MinedBlocks:
                             if observed is not None:
                                 self.accepted_blocks[line] = observed
             except OSError as error:
+                # A recreated file can reuse the old inode and size. Reread on
+                # recovery; the retained line identities prevent double counts.
+                self.identity = None
+                self.offset = 0
                 report_health("node log", False, f"{self.path}: {error}")
                 return None
             report_health("node log", True)

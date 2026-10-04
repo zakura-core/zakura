@@ -34,6 +34,8 @@ internal-miner = ["equihash/solver"]
 
 # Test-only features
 
+fuzz-impl = []
+
 proptest-impl = [
     "proptest",
     "proptest-derive",
@@ -164,6 +166,10 @@ harness = false
 
 [[bench]]
 name = "note_commitment_hash"
+harness = false
+
+[[bench]]
+name = "orchard_tree_update"
 harness = false
 
 [lints]

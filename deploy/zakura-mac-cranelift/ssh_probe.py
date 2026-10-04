@@ -19,41 +19,30 @@ BASE = Path("/Library/Application Support/ZakuraVerifier")
 
 def resources(base):
     result = {"free_disk_bytes": shutil.disk_usage(base).free,
-              "node_rss_bytes": None, "memory_free_percent": None}
+              "node_rss_bytes": None}
     try:
         pid = int((Path(base) / "run/node.pid").read_text())
         result["node_rss_bytes"] = int(subprocess.check_output(
             ["ps", "-o", "rss=", "-p", str(pid)], timeout=3).strip()) * 1024
-        if platform.system() == "Darwin":
-            output = subprocess.check_output(["/usr/bin/memory_pressure", "-Q"], timeout=3).decode()
-            match = re.search(r"System-wide memory free percentage: (\d+)%", output)
-            if match:
-                result["memory_free_percent"] = int(match.group(1))
     except (OSError, ValueError, subprocess.SubprocessError):
         pass
     return result
 
 
-def fork_anchor(rpc, tip):
-    """Sample eleven-block fork evidence without accepting a racing tip read."""
-    if tip["height"] < 10:
-        return None
-    height = tip["height"] - 10
-    block_hash = hex_bytes(rpc.call("getblockhash", height), 32)
+def ancestors(rpc, tip):
+    """Use the fleet's depth-keyed ancestry format and reject a racing tip."""
+    result = {str(depth): hex_bytes(rpc.call("getblockhash", tip["height"] - depth), 32)
+              for depth in (1, 2, 5, 10, 32) if tip["height"] >= depth}
     if hex_bytes(rpc.call("getblockhash", tip["height"]), 32) != tip["hash"]:
-        raise Unavailable("chain changed during fork sample")
-    return {"height": height, "hash": block_hash}
-
+        raise Unavailable("chain changed during ancestry sample")
+    return result
 
 
 def sample(base, rpc):
     receipt = read_json(base / "receipt.json")
     tip = rpc.tip()
-    active = subprocess.run(
-        ["launchctl", "print", "system/dev.valargroup.zakura-verifier-node"],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2).returncode == 0
     return {"schema_version": 1, "sample_time": time.time(), "receipt": receipt,
-            "tip": tip, "fork_anchor": fork_anchor(rpc, tip), "node_active": active,
+            "tip": tip, "ancestor_hashes": ancestors(rpc, tip),
             "resources": resources(base), "binary_sha256": digest(base / "bin/zakurad"),
             "config_sha256": digest(base / "zakurad.toml"), "architecture": platform.machine()}
 

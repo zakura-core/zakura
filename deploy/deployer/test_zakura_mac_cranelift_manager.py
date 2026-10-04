@@ -34,7 +34,7 @@ class CandidateTests(unittest.TestCase):
 
     def test_renamed_and_historical_candidate_runs_remain_usable(self):
         paths = ['zakura-mac-cranelift.yml', 'build-zakura-mac-cranelift.yml',
-                 'mac-verifier.yml', 'build-mac-verifier.yml', 'deploy-mac-verifier.yml',
+                 'mac-verifier.yml',
                  'zakura-mainnet-deploy.yml']
         for workflow in paths:
             for prefix in ['zakura-mac-cranelift-candidate-', 'mac-verifier-cranelift-']:
@@ -48,6 +48,17 @@ class CandidateTests(unittest.TestCase):
                         patch.object(deploy.subprocess, 'run') as download:
                     deploy.download_candidate('123', Path(tmp))
                     self.assertIn(prefix + 'a' * 40, download.call_args.args[0])
+
+    def test_unused_former_workflow_paths_are_rejected(self):
+        for workflow in ('build-mac-verifier.yml', 'deploy-mac-verifier.yml'):
+            run = dict(head_repository={'full_name': 'zakura-core/zakura'}, head_branch='main',
+                       path='.github/workflows/' + workflow, status='completed', conclusion='success')
+            with self.subTest(workflow=workflow), tempfile.TemporaryDirectory() as tmp, \
+                    patch.object(deploy.subprocess, 'check_output', return_value=json.dumps(run)), \
+                    patch.object(deploy.subprocess, 'run') as download:
+                with self.assertRaises(ValueError):
+                    deploy.download_candidate('123', Path(tmp))
+                download.assert_not_called()
 
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -101,6 +112,54 @@ class CandidateTests(unittest.TestCase):
         for key in ['source_sha', 'cargo_lock_sha256']:
             self.assertEqual(new[key], self.receipt[key])
             self.assertNotEqual(new[key], old[key])
+    def deployment_hosts(self, fail_receipt=False):
+        old = {'bootstrap_height': 10, 'bootstrap_record': {'hash': 'a' * 64},
+               'config_sha256': 'b' * 64, 'binary_sha256': 'c' * 64}
+        class Host:
+            def __init__(host, mac=False):
+                host.mac, host.scripts, host.files, host.samples = mac, [], {}, 0
+            def put(host, data, path):
+                host.files[path] = data
+                if fail_receipt and path == '/etc/zakura-mac-verifier/receipt.json':
+                    raise RuntimeError('fixture receipt transfer failed')
+            def run(host, script, **kwargs):
+                host.scripts.append(script)
+                subprocess.run(['bash', '-n'], input=script, text=True, check=True, capture_output=True)
+                if script.startswith('mktemp'):
+                    return '/var/tmp/zakura-verifier-ci.fixture'
+                if script.startswith('sudo -n cat') and 'status.json' not in script:
+                    return json.dumps(old)
+                if script == 'sudo -n cat /var/lib/zakura-mac-verifier/status.json':
+                    host.samples += 1
+                    new = json.loads(host.files['/etc/zakura-mac-verifier/receipt.json'])
+                    return json.dumps({'sample_time': deploy.time.time(), 'condition': 'matching',
+                        'verifier': {'receipt': new, 'binary_sha256': new['binary_sha256'],
+                                     'tip': {'height': 100 + host.samples}}})
+                return ''
+        return Host(mac=True), Host()
+
+    def test_binary_deploy_accepts_condition_only_progress_and_rebinds_cursor(self):
+        mac, linux = self.deployment_hosts()
+        with patch.object(deploy.time, 'sleep'):
+            deploy.deploy_candidate(mac, linux, self.path, self.receipt)
+        self.assertEqual(linux.samples, 2)
+        commands = '\n'.join(linux.scripts)
+        self.assertEqual(commands.count("state['receipt_digest']"), 1)
+        self.assertNotIn('state["cursor"]', commands)
+        self.assertIn('systemctl stop zakura-fleet-watchdog', commands)
+        self.assertIn('systemctl start zakura-fleet-watchdog', commands)
+        self.assertTrue(mac.scripts[-1].startswith('rm -rf -- '))
+
+    def test_binary_deploy_failure_restores_both_receipts_and_rebinds_cursor(self):
+        mac, linux = self.deployment_hosts(fail_receipt=True)
+        with self.assertRaises(RuntimeError):
+            deploy.deploy_candidate(mac, linux, self.path, self.receipt)
+        self.assertIn('receipt.json.previous', '\n'.join(mac.scripts))
+        commands = '\n'.join(linux.scripts)
+        self.assertIn('receipt.json.previous /etc/zakura-mac-verifier/receipt.json', commands)
+        self.assertEqual(commands.count("state['receipt_digest']"), 1)
+        self.assertTrue(mac.scripts[-1].startswith('rm -rf -- '))
+
 
 
 
@@ -132,26 +191,22 @@ class DashboardTests(unittest.TestCase):
                 return 'true'
             return ''
 
-    def test_bridge_retired_only_after_file_and_dashboard_validation(self):
-        host = self.Host()
-        mac = self.Host()
-        deploy.dashboard(mac, host)
-        commands = "\n".join(host.scripts)
-        self.assertLess(commands.index("with opener.open"), commands.index("disable --now"))
-        self.assertIn('/opt/zakura-fleet-watchdog/mac_cranelift_status.py', host.files)
-        self.assertNotIn('receipt.json', ''.join(host.files))
-        self.assertEqual(json.loads(host.files['/etc/zakura-mainnet-dashboard/private/addresses.json']), ['198.51.100.42'])
-        self.assertIn('install -d -m 700', commands)
-        self.assertIn('chmod 600', commands)
-        self.assertNotIn('198.51.100.42', commands)
-        self.assertNotIn('cursor.json', commands)
+    def test_only_mac_helpers_are_replaced_and_linux_is_read_only(self):
+        linux, mac = self.Host(), self.Host()
+        deploy.dashboard(mac, linux)
+        self.assertEqual(linux.files, {})
+        self.assertEqual(len(linux.scripts), 1)
+        self.assertIn('with opener.open', linux.scripts[0])
+        self.assertNotIn('systemctl', linux.scripts[0])
+        for name in ('ssh_probe.py', 'rotate_logs.py'):
+            self.assertIn('/var/tmp/zakura-tools-ci.fixture/' + name, mac.files)
+        commands = '\n'.join(mac.scripts)
+        self.assertIn('sudo -n mv', commands)
         self.assertNotIn('launchctl', commands)
-        self.assertIn('/opt/zakura-mac-verifier/common.py', host.files)
-        self.assertIn('/var/tmp/zakura-tools-ci.fixture/ssh_probe.py', mac.files)
-        self.assertIn('/var/tmp/zakura-tools-ci.fixture/rotate_logs.py', mac.files)
-        self.assertIn('sudo -n mv', '\n'.join(mac.scripts))
+        self.assertNotIn('cursor.json', commands)
+        self.assertTrue(mac.scripts[-1].startswith('rm -rf -- '))
 
-    def test_failed_mac_update_rolls_back_both_hosts(self):
+    def test_failed_mac_update_restores_helpers_without_linux_mutation(self):
         mac, linux = self.Host(), self.Host()
         original = mac.run
         failed = False
@@ -164,22 +219,26 @@ class DashboardTests(unittest.TestCase):
             return result
         with patch.object(mac, 'run', side_effect=run), self.assertRaises(RuntimeError):
             deploy.dashboard(mac, linux)
-        self.assertIn('else sudo -n cp -p', '\n'.join(mac.scripts))
-        self.assertIn('common.py', '\n'.join(linux.scripts))
-        self.assertIn('systemctl start zakura-fleet-watchdog', linux.scripts[-1])
-        self.assertNotIn('cursor.json', '\n'.join(linux.scripts))
+        self.assertIn('sudo -n cp -p', '\n'.join(mac.scripts))
+        self.assertEqual(linux.scripts, [])
+        self.assertEqual(linux.files, {})
 
-    def test_failed_install_restores_services_without_rewinding_state(self):
-        host = self.Host(fail_install=True)
-        mac = self.Host()
+    def test_failed_transfer_restores_only_backed_up_files(self):
+        mac, linux = self.Host(fail_install=True), self.Host()
         with self.assertRaises(RuntimeError):
-            deploy.dashboard(mac, host)
-        commands = "\n".join(host.scripts)
-        self.assertIn('.previous', commands)
-        self.assertIn('enable --now zakura-mac-verifier-dashboard', commands)
-        self.assertIn('systemctl start zakura-fleet-watchdog', commands)
+            deploy.dashboard(mac, linux)
+        commands = '\n'.join(mac.scripts)
+        self.assertIn('elif sudo -n test -f', commands)
+        self.assertIn('ssh_probe.py.previous', commands)
+        self.assertEqual(linux.scripts, [])
         self.assertNotIn('cursor.json', commands)
-        self.assertIn('ssh_probe.py.previous', '\n'.join(mac.scripts))
+
+    def test_failed_dashboard_health_rolls_back_mac_helpers(self):
+        mac, linux = self.Host(), self.Host()
+        with patch.object(linux, 'run', side_effect=RuntimeError('health check failed')), self.assertRaises(RuntimeError):
+            deploy.dashboard(mac, linux)
+        self.assertIn('sudo -n cp -p', '\n'.join(mac.scripts))
+        self.assertTrue(mac.scripts[-1].startswith('rm -rf -- '))
 
 
 class PublicAuditTests(unittest.TestCase):
@@ -194,44 +253,79 @@ class PublicAuditTests(unittest.TestCase):
                 self.assertNotIn(private, str(caught.exception))
                 self.assertNotIn(leaked, str(caught.exception))
 
+    def test_audit_visits_linux_detail_pages_and_detects_peer_detail_leaks(self):
+        def response(url, **kwargs):
+            if url.endswith('/data'):
+                body = {'rows': [{'name': 'linux-reference'}, {'name': 'mac-os-cranelift'}]}
+            elif url.endswith('/data/node/linux-reference'):
+                body = {'peer_subversions': ['peer:::ffff:198.51.100.42']}
+            else:
+                body = {}
+            return io.BytesIO(json.dumps(body).encode())
+        with patch.dict(os.environ, {'ZAKURA_MAC_CRANELIFT_HOST': '198.51.100.42'}), \
+                patch('urllib.request.urlopen', side_effect=response) as request:
+            with self.assertRaises(ValueError) as raised:
+                deploy.audit_public_privacy()
+            self.assertNotIn('198.51.100.42', str(raised.exception))
+            self.assertIn('https://status.mainnet.zakura.valargroup.dev/node/linux-reference',
+                          [call.args[0] for call in request.call_args_list])
+
     def test_linux_addresses_are_allowed_by_private_audit(self):
         with patch.dict(os.environ, {'ZAKURA_MAC_CRANELIFT_HOST': '198.51.100.42'}), \
                 patch('urllib.request.urlopen', side_effect=lambda *a, **k: io.BytesIO(b'{"linux":"192.0.2.17"}')):
             deploy.audit_public_privacy()
 
 
-class AlertEnablementTests(unittest.TestCase):
-    def test_enablement_uses_watchdog_delivery_and_ephemeral_test_state(self):
-        from unittest.mock import Mock
-        host = Mock()
-        deploy.enable_alerts(host)
-        host.run.assert_called_once()
-        script = host.run.call_args.args[0]
-        subprocess.run(['bash', '-n'], input=script, text=True, check=True, capture_output=True)
-        program = script.split("<<'REMOTE'\n", 1)[1].split("\nREMOTE", 1)[0]
-        compile(program, 'alert-enablement', 'exec')
-        self.assertIn('ZAKURA_MAC_CRANELIFT_COMPARISON_ALERTS=1', program)
-        self.assertIn('ZAKURA_MAC_CRANELIFT_ALERTS_MUTED=0', program)
-        self.assertIn('TEST', program)
-        self.assertEqual(program.count('watchdog.update_alert_state('), 1)
-        self.assertNotIn('state.json', program)
-        self.assertNotIn('cursor.json', program)
-        self.assertNotIn('launchctl', program)
+class RemoteProgramTests(unittest.TestCase):
+    def test_remote_programs_are_checked_in_and_shell_arguments_are_quoted(self):
+        arguments = {
+            'mac_status.py': (deploy.BASE,), 'reference_status.py': ('verifier-' + 'a' * 32,),
+            'check_dashboard.py': (123,), 'binary_digest.py': ("/tmp/a 'quoted' path", 'a' * 64),
+            'rebind_cursor.py': (),
+        }
+        for name, args in arguments.items():
+            with self.subTest(name=name):
+                script = deploy.remote_program(name, *args)
+                subprocess.run(['bash', '-n'], input=script, text=True, check=True, capture_output=True)
+                program = script.split("<<'REMOTE'\n", 1)[1].split('\nREMOTE', 1)[0]
+                compile(program, name, 'exec')
+                if name != 'rebind_cursor.py':
+                    self.assertNotIn('receipt_digest', program)
+
+    def test_cursor_rebinding_preserves_coverage_history_permissions_and_owner(self):
+        spec = importlib.util.spec_from_file_location('rebind_cursor', deploy.PACKAGE / 'remote/rebind_cursor.py')
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cursor, receipt = root / 'cursor.json', root / 'receipt.json'
+            state = {'cursor': 123, 'history': {'122': 'a' * 64}, 'coverage_gap': True,
+                     'bootstrap': 10, 'reorg_search': {'next': 121}, 'receipt_digest': 'old'}
+            cursor.write_text(json.dumps(state)); cursor.chmod(0o640)
+            receipt.write_text('{"binary_sha256":"new"}')
+            before = cursor.stat()
+            module.rebind_cursor(cursor, receipt)
+            result = json.loads(cursor.read_text())
+            expected = module.hashlib.sha256(json.dumps(json.loads(receipt.read_text()), sort_keys=True).encode()).hexdigest()
+            self.assertEqual(result.pop('receipt_digest'), expected)
+            state.pop('receipt_digest')
+            self.assertEqual(result, state)
+            self.assertEqual(cursor.stat().st_mode & 0o777, 0o640)
+            self.assertEqual((cursor.stat().st_uid, cursor.stat().st_gid), (before.st_uid, before.st_gid))
 
 
 class HealthTests(unittest.TestCase):
     def setUp(self):
         self.mac = {name: True for name in ['receipt_present', 'binary_matches_receipt',
-            'full_verification_enabled', 'node_running', 'adapter_listener_closed']}
-        self.mac.update(architecture='arm64', adapter_running=False, tunnel_running=False,
+            'full_verification_enabled', 'node_running']}
+        self.mac.update(architecture='arm64',
                         compiler_acceptance=[{'passed': True}])
         self.reference = {name: True for name in ['private_address_config_private', 'monitoring_config_private', 'monitoring_key_restricted',
-            'reverse_listener_closed', 'dashboard_bridge_closed', 'dashboard_file_present',
+            'dashboard_file_present',
             'dashboard_file_fresh', 'dashboard_file_healthy', 'dashboard_identity_matches',
             'dashboard_row_healthy', 'dashboard_mac_enabled', 'dashboard_supports_mac']}
         self.reference.update({'zakura-fleet-watchdog': 'active', 'zakura-mainnet-dashboard': 'active',
-            'zakura-mac-verifier': 'inactive', 'zakura-mac-verifier-dashboard': 'inactive',
-            'status': {'comparison_healthy': True, 'condition': 'matching', 'sample_time': deploy.time.time()}})
+            'status': {'condition': 'matching', 'sample_time': deploy.time.time()}})
 
     def test_only_healthy_fresh_checks_pass(self):
         deploy.require_healthy(self.mac, self.reference)
@@ -243,7 +337,7 @@ class HealthTests(unittest.TestCase):
                     with self.assertRaises(RuntimeError):
                         deploy.require_healthy(broken if target == 'mac' else self.mac,
                                                broken if target == 'reference' else self.reference)
-        for change in [{'comparison_healthy': False}, {'condition': 'catching_up'},
+        for change in [{'condition': 'catching_up'},
                        {'sample_time': 1}, {'sample_time': float('nan')},
                        {'sample_time': deploy.time.time() + 1000}]:
             with self.subTest(change=change), self.assertRaises(RuntimeError):
@@ -268,6 +362,13 @@ class HealthTests(unittest.TestCase):
             capture_output=True, timeout=5)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(result.stdout), {'error': 'sample unavailable'})
+    def test_installed_rotator_has_no_repo_import_dependency(self):
+        import sys
+        program = deploy.rotate_program().decode()
+        result = subprocess.run([sys.executable, '-I', '-c', program], text=True, capture_output=True, timeout=5)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn('from common import', program)
+
 
 
 if __name__ == '__main__':

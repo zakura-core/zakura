@@ -53,7 +53,7 @@ on:
       mac_operation:
         description: "Operation for the existing zakura-mac-os verifier"
         type: choice
-        options: [deploy, status, dashboard, enable-alerts]
+        options: [deploy, status, dashboard]
         default: deploy
       mac_candidate_run_id:
         description: "Optional accepted candidate run; blank builds the requested ref"
@@ -797,7 +797,13 @@ jobs:
           sudo install -d -m 755 /var/lib/zakura-fleet-watchdog
           sudo install -d -m 755 /etc/zakura-fleet-watchdog
           sudo install -m 755 deploy/runner/zakura-cluster-watchdog.py "$watchdog_dir/zakura-cluster-watchdog.py"
-          sudo install -m 644 deploy/runner/mac_cranelift_status.py "$watchdog_dir/mac_cranelift_status.py"
+          comparison_dir="/opt/zakura-mac-verifier"
+          sudo install -d -m 755 "$comparison_dir"
+          sudo install -m 644 deploy/zakura-mac-cranelift/common.py "$comparison_dir/common.py"
+          sudo install -m 755 deploy/zakura-mac-cranelift/comparison.py "$comparison_dir/comparison.py"
+          if id zakura-mac-verifier >/dev/null 2>&1; then
+            sudo install -d -m 755 -o zakura-mac-verifier -g "$(id -gn zakura-mac-verifier)" /var/lib/zakura-mac-cranelift-public
+          fi
           sudo install -m 644 deploy/runner/fleet-watchdog.toml "$watchdog_dir/fleets.toml"
           sudo install -m 644 deploy/runner/zakura-fleet-watchdog.service /etc/systemd/system/zakura-fleet-watchdog.service
 

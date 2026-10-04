@@ -32,20 +32,6 @@ interval = 1.0
 fleet = true
 
 [[rpc]]
-name = "zakura-testnet-2"
-url = "http://167.99.110.145:18232/"
-kind = "zakura"
-interval = 1.0
-fleet = true
-
-[[rpc]]
-name = "zakura-testnet-3"
-url = "http://138.68.229.254:18232/"
-kind = "zakura"
-interval = 1.0
-fleet = true
-
-[[rpc]]
 name = "tazminer"
 url = "http://lwd.tazminer.com:18232/"
 kind = "zakura"

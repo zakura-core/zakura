@@ -37,16 +37,13 @@ class ExampleConfigTests(unittest.TestCase):
         self.assertEqual(
             (config.chain.backfill_blocks, config.chain.memory_window, config.chain.settle_depth), (20000, 30000, 3)
         )
-        fleet = ["zakura-testnet-1", "zakura-testnet-as", "zakura-testnet-eu", "zakura-testnet-2", "zakura-testnet-3"]
+        fleet = ["zakura-testnet-1", "zakura-testnet-as", "zakura-testnet-eu"]
         self.assertEqual([e.name for e in config.rpc], [*fleet, "tazminer"])
         tazminer = config.rpc[-1]
         self.assertEqual((tazminer.interval, tazminer.fleet, tazminer.backfill), (5.0, False, False))
         self.assertEqual((tazminer.host, tazminer.source), ("lwd.tazminer.com", "rpc:tazminer"))
         self.assertTrue(all(e.backfill and e.fleet and e.interval == 1.0 for e in config.rpc[:-1]))
-        self.assertEqual(
-            config.fleet_hosts,
-            frozenset({"167.99.103.111", "206.189.148.0", "164.92.209.78", "167.99.110.145", "138.68.229.254"}),
-        )
+        self.assertEqual(config.fleet_hosts, frozenset({"167.99.103.111", "206.189.148.0", "164.92.209.78"}))
         self.assertTrue(config.p2p.enabled)
         self.assertEqual((config.p2p.max_peers, config.p2p.connect_rate, config.p2p.poll_interval), (300, 5.0, 15.0))
         self.assertEqual(config.p2p.probe_sample, 0.2)

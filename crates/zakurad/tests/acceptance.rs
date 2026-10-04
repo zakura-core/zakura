@@ -1197,27 +1197,6 @@ fn sync_one_checkpoint_mainnet() -> Result<()> {
     .map(|_tempdir| ())
 }
 
-/// Test if `zakurad` can sync the first checkpoint on testnet.
-///
-/// The first checkpoint contains a single genesis block.
-// TODO: disabled because testnet is not currently reliable
-// #[test]
-#[allow(dead_code)]
-fn sync_one_checkpoint_testnet() -> Result<()> {
-    sync_until(
-        TINY_CHECKPOINT_TEST_HEIGHT,
-        &Network::new_default_testnet(),
-        STOP_AT_HEIGHT_REGEX,
-        TINY_CHECKPOINT_TIMEOUT,
-        None,
-        MempoolBehavior::ShouldNotActivate,
-        // checkpoint sync is irrelevant here - all tested checkpoints are mandatory
-        true,
-        true,
-    )
-    .map(|_tempdir| ())
-}
-
 /// Test if `zakurad` can sync the first checkpoint, restart, and stop on load.
 #[test]
 fn restart_stop_at_height() -> Result<()> {

@@ -245,6 +245,71 @@ class ForkSampleTests(unittest.TestCase):
         rpc.call.side_effect = ["a" * 64] * 3 + ["b" * 64]
         self.assertEqual(set(ancestors(rpc, {"height": 9, "hash": "b" * 64})), {"1", "2", "5"})
 
+    def test_failed_or_malformed_depth_is_omitted_without_losing_other_ancestors(self):
+        for failure in (Unavailable("fixture"), OSError("fixture"), "bad"):
+            with self.subTest(failure=type(failure).__name__):
+                rpc = MagicMock()
+                def call(method, height):
+                    if height == 68:
+                        if isinstance(failure, Exception):
+                            raise failure
+                        return failure
+                    return "b" * 64 if height == 100 else "a" * 64
+                rpc.call.side_effect = call
+                self.assertEqual(ancestors(rpc, {"height": 100, "hash": "b" * 64}),
+                                 {str(depth): "a" * 64 for depth in (1, 2, 5, 10)})
+                # Even with missing ancestry, the final tip check is mandatory.
+                rpc.call.side_effect = lambda method, height: "c" * 64 if height == 100 else call(method, height)
+                with self.assertRaises(Unavailable):
+                    ancestors(rpc, {"height": 100, "hash": "b" * 64})
+
+    def test_missing_ancestry_still_requires_a_valid_tip_lookup(self):
+        rpc = MagicMock()
+        def call(method, height):
+            if height != 100:
+                raise Unavailable("ancestor unavailable")
+            return "b" * 64
+        rpc.call.side_effect = call
+        self.assertEqual(ancestors(rpc, {"height": 100, "hash": "b" * 64}), {})
+        for failure in (Unavailable("tip unavailable"), "bad"):
+            with self.subTest(failure=type(failure).__name__):
+                def failed_call(method, height):
+                    if height != 100 or isinstance(failure, Exception):
+                        raise Unavailable("lookup unavailable")
+                    return failure
+                rpc.call.side_effect = failed_call
+                with self.assertRaises(Unavailable):
+                    ancestors(rpc, {"height": 100, "hash": "b" * 64})
+
+    def test_partial_ancestry_preserves_comparison_progress_and_mismatch_detection(self):
+        for failed_depth in (10, 32):
+            for mismatch in (False, True):
+                with self.subTest(depth=failed_depth, mismatch=mismatch), tempfile.TemporaryDirectory() as directory:
+                    linux, mac = Chain(), Mac()
+                    linux.height = mac.height = 100
+                    mac.now = 1000
+                    if mismatch:
+                        mac.records[97] = record(97)
+                        mac.records[97]["pools"]["ironwood"]["root"] = "cc" * 32
+                    original_status = mac.status
+                    rpc = MagicMock()
+                    def call(method, height):
+                        if height == 100 - failed_depth:
+                            raise Unavailable("one ancestry request failed")
+                        return record(height)["hash"]
+                    rpc.call.side_effect = call
+                    def status():
+                        sample = original_status()
+                        sample["ancestor_hashes"] = ancestors(rpc, sample["tip"])
+                        return sample
+                    mac.status = status
+                    comparison = Comparison(directory, receipt(), linux, mac)
+                    comparison.state.update(cursor=96, history={"96": record(96)["hash"]})
+                    result = comparison.step(1000)
+                    self.assertEqual(result["condition"], "tree_mismatch" if mismatch else "matching")
+                    self.assertEqual(comparison.state["cursor"], 96 if mismatch else 97)
+                    self.assertNotIn(str(failed_depth), result["verifier"]["ancestor_hashes"])
+
     def test_public_status_drops_malformed_ancestors_and_private_fields(self):
         identifier = "verifier-" + "a" * 32
         raw = {"verifier": {"ancestor_hashes": {"10": "b" * 64, "host": "192.0.2.10", "2": "bad"}}}

@@ -38,6 +38,11 @@ elif reference.get('fresh'):
     reference_info = rpc(reference_source['rpcUrl'], 'getinfo')
     receipt['referenceBuildVersion'] = reference_info.get('build', reference_info.get('subversion'))
     receipt['referenceProtocolVersion'] = reference_info.get('protocolversion')
+    receipt['referenceNu7ScheduleVerified'] = bool(
+        receipt['referenceNu7ScheduleVerified']
+        and re.search(r'(?:^v|/Zebra:)7\.', str(receipt['referenceBuildVersion']))
+        and isinstance(receipt['referenceProtocolVersion'], int)
+        and receipt['referenceProtocolVersion'] >= 170180)
 receipt['preparedChainAgreement'] = False
 if reference.get('fresh') and all(n.get('fresh') for n in nodes):
     sources = nodes + [reference]

@@ -35,6 +35,7 @@ class FakeRPC:
 
     def __call__(self, url, method, params=None):
         self.calls.append((url, method, params))
+        url = url.removeprefix("http://")
         if url in self.offline:
             raise OSError("offline")
         if method == "getblockchaininfo":
@@ -66,10 +67,10 @@ class ActivationTests(unittest.TestCase):
         self.now = 1000
         self.rpc = FakeRPC()
         self.config = {"armed": True, "stateFile": str(self.root / "state.json"),
-                       "staging": {"manifest": {**manifest(), "network": {**manifest()["network"], "activationHeight": 80}}, "rpcUrl": "staging"},
+                       "staging": {"manifest": {**manifest(), "network": {**manifest()["network"], "activationHeight": 80}}, "rpcUrl": "http://staging"},
                        "public": {"manifest": manifest(), "identityCheckpoint": {"height": 90, "hash": f"{90:064x}"},
-                                  "nodes": [{"name": str(i), "rpcUrl": str(i)} for i in range(3)],
-                                  "reference": {"name": "reference", "rpcUrl": "reference"}}}
+                                  "nodes": [{"name": str(i), "rpcUrl": "http://" + str(i)} for i in range(3)],
+                                  "reference": {"name": "reference", "rpcUrl": "http://reference"}}}
         self.config_path = self.root / "config.json"
         self.config_path.write_text(json.dumps(self.config))
         self.feed = ActivationFeed(self.config_path, Staging(), lambda: self.now, self.rpc)
@@ -250,7 +251,7 @@ class ActivationTests(unittest.TestCase):
         original = self.rpc
         def outlier(url, method, params=None):
             value = original(url, method, params)
-            if url == "0" and method == "getnetworkparameters":
+            if url == "http://0" and method == "getnetworkparameters":
                 value["targetSpacingSeconds"] = 999
                 value["difficulty"]["averagingWindowBlocks"] = 999
             return value
@@ -267,7 +268,7 @@ class ActivationTests(unittest.TestCase):
         self.rpc.offline.add("2")
         def disagreement(url, method, params=None):
             value = original(url, method, params)
-            if url == "0" and method == "getnetworkparameters":
+            if url == "http://0" and method == "getnetworkparameters":
                 value["difficulty"]["minimumDifficultyStrictlyGreater"] = False
             return value
         self.feed.rpc = disagreement
@@ -279,9 +280,9 @@ class ActivationTests(unittest.TestCase):
         original = self.rpc
         def higher(url, method, params=None):
             value = original(url, method, params)
-            if url == "0" and method == "getblockchaininfo":
-                value.update(blocks=103, bestblockhash=f"{103:064x}")
-            if url == "0" and method == "getnetworkparameters" and params[0] >= 103:
+            if url == "http://0" and method == "getblockchaininfo":
+                value.update(blocks=104, bestblockhash=f"{104:064x}")
+            if url == "http://0" and method == "getnetworkparameters" and params[0] >= 104:
                 value["targetSpacingSeconds"] = 999
             return value
         self.feed.rpc = higher
@@ -291,6 +292,27 @@ class ActivationTests(unittest.TestCase):
         self.assertEqual(payload["selectedProfile"], "public-testnet")
         self.assertEqual(payload["status"]["chain"]["height"], 102)
         self.assertEqual(payload["rules"]["atTip"]["targetSpacingSeconds"], 25)
+
+    def test_duplicate_normalized_rpc_endpoints_are_rejected(self):
+        self.feed.owner.close()
+        for duplicate in ("http://0", "HTTP://0:80/", "http://user:password@0/?token=different"):
+            with self.subTest(endpoint=duplicate):
+                self.config["public"]["nodes"][1]["rpcUrl"] = duplicate
+                self.config_path.write_text(json.dumps(self.config))
+                with self.assertRaisesRegex(ValueError, "distinct RPC"):
+                    ActivationFeed(self.config_path, Staging(), lambda: self.now, self.rpc)
+
+    def test_reference_endpoint_and_name_collisions_are_rejected(self):
+        self.feed.owner.close()
+        self.config["public"]["reference"]["rpcUrl"] = "http://0:80/"
+        self.config_path.write_text(json.dumps(self.config))
+        with self.assertRaisesRegex(ValueError, "independent"):
+            ActivationFeed(self.config_path, Staging(), lambda: self.now, self.rpc)
+        self.config["public"]["reference"]["rpcUrl"] = "http://reference"
+        self.config["public"]["reference"]["name"] = "0"
+        self.config_path.write_text(json.dumps(self.config))
+        with self.assertRaisesRegex(ValueError, "distinct source name"):
+            ActivationFeed(self.config_path, Staging(), lambda: self.now, self.rpc)
 
     def test_next_block_rule_boundary(self):
         self.assertEqual(rules(parameters(99))["daaWindowBlocks"], 17)

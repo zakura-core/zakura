@@ -22,6 +22,7 @@ import subprocess
 import tempfile
 import threading
 import time
+import urllib.parse
 import urllib.request
 
 MAX_JSON_BYTES = 1_048_576
@@ -46,6 +47,19 @@ def rpc(url, method, params=None):
     if result.get("error") is not None:
         raise ValueError(f"RPC {method} failed")
     return result["result"]
+
+
+def rpc_endpoint_identity(url):
+    """Normalize transport endpoints independently of credentials/query tokens.
+
+    This detects repeated configured endpoints, not DNS aliases or independent
+    hosts; source independence also requires operator provenance verification.
+    """
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme.lower() not in ("http", "https") or not parsed.hostname:
+        raise ValueError("RPC endpoint requires HTTP(S) host")
+    port = parsed.port or (443 if parsed.scheme.lower() == "https" else 80)
+    return (parsed.scheme.lower(), parsed.hostname.lower(), port, parsed.path.rstrip("/"))
 
 
 def atomic_json(path, value):
@@ -127,7 +141,13 @@ class ActivationFeed:
         public = self.config["public"]
         if len(public["nodes"]) != 3 or len({n["name"] for n in public["nodes"]}) != 3:
             raise ValueError("exactly three distinct public validators are required")
-        if public["reference"].get("rpcUrl") in {n["rpcUrl"] for n in public["nodes"]}:
+        endpoints = [rpc_endpoint_identity(n["rpcUrl"]) for n in public["nodes"]]
+        if len(set(endpoints)) != 3:
+            raise ValueError("managed validators require distinct RPC endpoints")
+        reference = public["reference"]
+        if reference["name"] in {n["name"] for n in public["nodes"]}:
+            raise ValueError("reference requires a distinct source name")
+        if reference.get("rpcUrl") and rpc_endpoint_identity(reference["rpcUrl"]) in endpoints:
             raise ValueError("reference must be independent of managed validators")
         if public["manifest"]["network"]["magic"] != "fa1af9bf":
             raise ValueError("public Testnet magic mismatch")

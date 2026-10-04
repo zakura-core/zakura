@@ -209,7 +209,9 @@ jobs:
   test-docker-config-success:
     name: Test Docker Config Success
     runs-on: ubuntu-latest
-    if: always()
+    # Skip, rather than fail, when a superseding run cancelled this one.
+    # See "Cancelled runs" in .github/workflows/README.md.
+    if: ${{ !cancelled() || github.event_name == 'pull_request' || github.event_name == 'merge_group' }}
     needs:
       - test-docker-image
     timeout-minutes: 30

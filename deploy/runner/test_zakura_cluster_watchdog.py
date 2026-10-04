@@ -2148,8 +2148,8 @@ class MacForkAlertTests(unittest.TestCase):
         sent = []
         agent.notify = lambda text, args: (sent.append(text), True)[1]
         fleet = watchdog.Fleet("mainnet", "http://localhost/data", "https://example.com/")
-        key = "mainnet/zakura-mac-os"
-        state = {"nodes": {key: {"condition": "down", "alerting": True, "bad_since": 0}}}
+        key = "mainnet/mac-os-cranelift"
+        state = {"nodes": {"mainnet/zakura-mac-os": {"condition": "down", "alerting": True, "bad_since": 0}}}
         row = self.rows()[0]
         observation = watchdog.NodeObservation(row["name"], row, "ok", 1000, 0, 110, "c" * 64)
         with patch.dict(watchdog.os.environ, {"ZAKURA_MAC_CRANELIFT_ALERTS_MUTED": "0"}):
@@ -2162,7 +2162,7 @@ class MacForkAlertTests(unittest.TestCase):
         self.assertFalse(state["nodes"][key]["alerting"])
         self.assertEqual(len(sent), 1)
         self.assertIn("mac-os-cranelift", sent[0])
-        self.assertNotIn("mainnet/mac-os-cranelift", state["nodes"])
+        self.assertNotIn("mainnet/zakura-mac-os", state["nodes"])
 
     def test_existing_canonical_mac_incident_is_reused(self):
         legacy = "mainnet/zakura-mac-os"
@@ -2173,19 +2173,47 @@ class MacForkAlertTests(unittest.TestCase):
                                                     {"nodes": nodes}), canonical)
         self.assertEqual(watchdog.node_state_key("mainnet", "mac-os-cranelift",
                                                 {"nodes": {legacy: {"alerting": True},
-                                                           canonical: {"alerting": False}}}), legacy)
+                                                           canonical: {"alerting": False}}}), canonical)
 
     def test_dashboard_failure_resets_existing_mac_recovery(self):
         agent = watchdog.Watchdog([], make_args())
         agent.notify = lambda *_: True
-        key = "mainnet/zakura-mac-os"
-        state = {"nodes": {key: {"alerting": True, "mac_recovery": {"since": 0}}}}
+        key = "mainnet/mac-os-cranelift"
+        state = {"nodes": {"mainnet/zakura-mac-os": {"alerting": True, "mac_recovery": {"since": 0}}}}
         fleet = watchdog.Fleet("mainnet", "http://localhost/data", "https://example.com/")
         agent.handle_fleet_error(state, fleet, ValueError("unavailable"), 1000, False)
         self.assertNotIn("mac_recovery", state["nodes"][key])
         self.assertTrue(state["nodes"][key]["alerting"])
         self.assertEqual(watchdog.node_state_key("testnet", "mac-os-cranelift", {}),
                          "testnet/mac-os-cranelift")
+
+    def test_duplicate_mac_keys_recover_only_once(self):
+        agent = watchdog.Watchdog([], make_args())
+        sent = []
+        agent.notify = lambda text, args: (sent.append(text), True)[1]
+        fleet = watchdog.Fleet("mainnet", "http://localhost/data", "https://example.com/")
+        state = {"nodes": {name: {"condition": "down", "alerting": True, "bad_since": since}
+                           for name, since in (("mainnet/zakura-mac-os", 0),
+                                               ("mainnet/mac-os-cranelift", 10))}}
+        row = self.rows()[0]
+        observation = watchdog.NodeObservation(row["name"], row, "ok", 1000, 0, 110, "c" * 64)
+        with patch.dict(watchdog.os.environ, {"ZAKURA_MAC_CRANELIFT_ALERTS_MUTED": "0"}):
+            for now in (1000, 1030, 1060, 1100, 1130, 1160):
+                agent.handle_node_observation(state, fleet, observation, now, False)
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(list(state["nodes"]), ["mainnet/mac-os-cranelift"])
+
+    def test_duplicate_keys_preserve_delivered_stall_height(self):
+        canonical = "mainnet/mac-os-cranelift"
+        legacy = "mainnet/zakura-mac-os"
+        state = {"nodes": {canonical: {"condition": "down", "alerting": True, "bad_since": 10},
+                           legacy: {"condition": "stalled", "alerting": True,
+                                    "bad_since": 0, "alert_height": 110}}}
+        self.assertEqual(watchdog.node_state_key("mainnet", "mac-os-cranelift", state), canonical)
+        self.assertFalse(watchdog.stall_cleared(state["nodes"][canonical], 110))
+        self.assertTrue(watchdog.stall_cleared(state["nodes"][canonical], 111))
+        self.assertEqual(state["nodes"][canonical]["bad_since"], 0)
+        self.assertNotIn(legacy, state["nodes"])
 
     def test_mac_offline_uses_three_minutes_without_changing_other_nodes(self):
         self.assertEqual(watchdog.node_condition({"name":"mac-os-cranelift","health":"down"},1000,0,make_args())[2],180)
@@ -2223,6 +2251,67 @@ class MacComparisonLaneTests(unittest.TestCase):
         self.observe("matching", 1120)
         self.assertEqual(len(self.messages), 2)
         self.assertIn("recovered", self.messages[-1])
+
+    def test_status_publication_failure_does_not_mask_mismatch(self):
+        with patch("mac_cranelift_status.publish_status", side_effect=OSError("private fixture")):
+            self.observe("tree_mismatch", 1000)
+        self.assertEqual(self.messages, ["Zakura compiler comparison: tree_mismatch"])
+        self.assertNotIn("private fixture", str(self.state))
+
+    def test_private_status_failure_does_not_mask_mismatch(self):
+        with patch.object(watchdog.os, "chown", side_effect=OSError("fixture")):
+            self.observe("tree_mismatch", 1000)
+        self.assertEqual(self.messages, ["Zakura compiler comparison: tree_mismatch"])
+
+    def test_alternating_failure_reasons_share_one_grace_period(self):
+        for now, reason in ((1000, "unavailable"), (1060, "catching_up"),
+                            (1120, "chain_disagreement"), (1180, "coverage_gap")):
+            self.observe(reason, now)
+        self.assertEqual(self.messages, ["Zakura compiler comparison: coverage_gap"])
+        self.assertEqual(self.state["mac_comparison"]["mainnet"]["bad_since"], 1000)
+        self.observe("unavailable", 1240)
+        self.observe("matching", 1300)
+        self.assertEqual(len(self.messages), 2)
+        self.assertIn("recovered", self.messages[-1])
+
+    def test_mismatch_remains_delivered_across_unavailability(self):
+        self.observe("tree_mismatch", 1000)
+        self.observe("unavailable", 1060)
+        self.observe("matching", 1120)
+        self.assertEqual(len(self.messages), 2)
+        self.assertIn("recovered", self.messages[-1])
+
+    def test_mismatch_escalation_notifies_once(self):
+        self.observe("unavailable", 1000)
+        self.observe("unavailable", 1180)
+        self.observe("tree_mismatch", 1240)
+        self.observe("unavailable", 1300)
+        self.observe("tree_mismatch", 1360)
+        self.observe("matching", 1420)
+        self.assertEqual(len(self.messages), 3)
+        self.assertIn("tree_mismatch", self.messages[1])
+        self.assertIn("recovered", self.messages[2])
+
+    def test_failed_escalation_preserves_owed_recovery(self):
+        self.observe("unavailable", 1000)
+        self.observe("unavailable", 1180)
+        self.lane.notify = lambda *_: False
+        self.observe("tree_mismatch", 1240)
+        self.assertTrue(self.state["mac_comparison"]["mainnet"]["alerting"])
+        self.assertFalse(self.state["mac_comparison"]["mainnet"]["mismatch_notified"])
+        self.lane.notify = lambda text, _: (self.messages.append(text), True)[1]
+        self.observe("matching", 1300)
+        self.assertEqual(len(self.messages), 2)
+        self.assertIn("recovered", self.messages[-1])
+
+    def test_publication_failure_does_not_claim_recovery(self):
+        self.observe("tree_mismatch", 1000)
+        with patch("mac_cranelift_status.publish_status", side_effect=OSError("fixture")):
+            self.observe("matching", 1060)
+        self.assertEqual(len(self.messages), 1)
+        self.assertTrue(self.state["mac_comparison"]["mainnet"]["alerting"])
+        self.observe("matching", 1120)
+        self.assertEqual(len(self.messages), 2)
 
     def test_muting_blocks_both_new_alerts_and_recoveries(self):
         self.observe("tree_mismatch", 1000)

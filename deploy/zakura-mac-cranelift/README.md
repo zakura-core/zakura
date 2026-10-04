@@ -57,9 +57,12 @@ checks run first. Comparison outcomes are matching, catching up, unavailable,
 chain disagreement, confirmed tree mismatch and coverage gap.
 
 The watchdog owns notification delivery, suppression and recovery. Confirmed tree
-mismatches are immediately actionable; other failures have a three-minute grace
-period. Matching results recover through the existing alert lifecycle. Private
-mismatch evidence remains after recovery. There is no separate notification
+mismatches are immediately actionable even if status publication fails. Other
+failures share a three-minute grace period across changes in failure reason.
+Delivered incidents stay latched until matching resumes; a confirmed mismatch
+escalates an existing incident once. Failed status publication cannot claim a
+healthy recovery. Matching results recover through the existing alert lifecycle.
+Private mismatch evidence remains after recovery. There is no separate notification
 queue, alert-enablement script or 24-hour qualification state.
 
 The lane is enabled with `ZAKURA_MAC_CRANELIFT_COMPARISON=1` on the existing watchdog.
@@ -72,7 +75,11 @@ The test uses ephemeral alert state and does not manufacture a real incident.
 
 The watchdog only publishes approved status fields. The dashboard distinguishes
 comparison failure from node availability. Private receipts, diagnostics, host
-addresses and peer identities never enter the public status file.
+addresses and peer identities never enter the public status file. If address
+redaction configuration is unavailable, `/data` retains only validated node
+names, health categories, numeric progress and block hashes for fleet monitoring.
+Free-form diagnostics and detailed JSON endpoints remain unavailable until the
+privacy configuration is repaired.
 
 ## Names and deployment compatibility
 
@@ -80,8 +87,16 @@ The component is named `zakura-mac-cranelift`. Its CI entry points are
 `zakura-mac-cranelift.yml` (tests), `build-zakura-mac-cranelift.yml` (native
 compiler acceptance), and the existing `zakura-mainnet-deploy.yml` (deployment).
 The deployment helper is `deploy/deployer/zakura-mac-cranelift-manager.py`.
+Tooling tests run for monitoring changes. Native acceptance runs for compiler,
+corpus, build configuration or Rust input changes within a triggered run; manual
+runs always build. PRs use their full diff so a monitoring revision cannot bypass
+an earlier failed compiler build. Monitoring-only PRs skip native acceptance;
+PRs that include compiler inputs still require it. Missing history runs native
+acceptance rather than skipping it.
 
-The fleet dashboard names the node `mac-os-cranelift`.
+The fleet dashboard names the node `mac-os-cranelift`. Watchdog state consolidates
+old and new Mac node keys into one incident, retaining delivered alerts and
+requiring sustained recovery before sending one recovery notification.
 The installed node ID `zakura-mac-os`, `/Library/Application Support/ZakuraVerifier`,
 `dev.valargroup.zakura-verifier-*` launchd labels, `zakura-mac-verifier` Linux
 account/services/directories and SSH alias `mac-verifier` remain compatibility

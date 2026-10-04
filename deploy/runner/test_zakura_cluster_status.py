@@ -1355,12 +1355,58 @@ class HttpHandlerTests(unittest.TestCase):
     def test_private_configuration_failure_never_serves_unfiltered_json(self):
         status.COLLECTOR.rows[0]["rpc_metadata_error"] = "private 192.0.2.17"
         with mock.patch.object(status, "private_addresses", side_effect=ValueError("private fixture")):
+            with urllib.request.urlopen(f"{self.base_url}/data") as response:
+                self.assertEqual(response.status, 200)
+                body = response.read().decode()
             with self.assertRaises(urllib.error.HTTPError) as caught:
-                urllib.request.urlopen(f"{self.base_url}/data")
+                urllib.request.urlopen(f"{self.base_url}/data/node/node-a")
         self.assertEqual(caught.exception.code, 503)
-        body = caught.exception.read().decode()
+        caught.exception.close()
+        self.assertEqual(json.loads(body)["rows"][0]["height"], 4_201_000)
         self.assertNotIn("192.0.2.17", body)
         self.assertNotIn("private fixture", body)
+
+    def test_privacy_failure_keeps_real_http_watchdog_node_alerts_working(self):
+        spec = importlib.util.spec_from_file_location(
+            "degraded_watchdog", SCRIPT_PATH.with_name("zakura-cluster-watchdog.py"))
+        watchdog = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = watchdog
+        spec.loader.exec_module(watchdog)
+        with mock.patch.object(sys, "argv", ["watchdog", "--config", "unused", "--dry-run"]):
+            args = watchdog.parse_args()
+        agent = watchdog.Watchdog([], args)
+        messages = []
+        agent.notify = lambda text, _: (messages.append(text), True)[1]
+        fleet = watchdog.Fleet("mainnet", f"{self.base_url}/data", self.base_url)
+        state = {}
+        status.COLLECTOR.rows[0].update(health="down", detail="private 192.0.2.17")
+        with mock.patch.object(status, "private_addresses", side_effect=OSError("fixture")):
+            for now in (1000, 1600):
+                status.COLLECTOR.last_poll = now
+                agent.observe_fleet(state, fleet, now, False)
+        self.assertEqual(len(messages), 1)
+        self.assertIn("node-a", messages[0])
+        self.assertNotIn("192.0.2.17", messages[0])
+        self.assertTrue(state["nodes"]["mainnet/node-a"]["alerting"])
+        self.assertEqual(state["fleets"]["mainnet"]["condition"], "ok")
+
+    def test_degraded_snapshot_rejects_untyped_and_diagnostic_fields(self):
+        value = {"network": "testnet", "last_poll": 1000, "chain": {"error": "private 192.0.2.17"},
+                 "rows": [{"name": "node-a", "health": "healthy", "height": 100,
+                           "block_hash": "a" * 64, "seconds_since_advanced": 30,
+                           "fork_anchor": {"height": 90, "hash": "b" * 64, "host": "192.0.2.17"},
+                           "ssh": "192.0.2.17", "detail": "192.0.2.17"},
+                          {"name": "mac-os-cranelift", "health": "private 192.0.2.17",
+                           "height": "192.0.2.17", "block_hash": "192.0.2.17",
+                           "seconds_since_advanced": float("inf")},
+                          {"name": "192.0.2.17", "health": "healthy"}]}
+        result = status.monitoring_snapshot(value, {"node-a", "192.0.2.17"})
+        self.assertNotIn("192.0.2.17", json.dumps(result))
+        self.assertEqual(result["total"], 2)
+        self.assertEqual(result["rows"][0]["fork_anchor"], {"height": 90, "hash": "b" * 64})
+        self.assertEqual(result["rows"][1]["health"], "down")
+        self.assertNotIn("height", result["rows"][1])
+        self.assertNotIn("seconds_since_advanced", result["rows"][1])
 
     def test_options_returns_204_for_allowed_origin(self):
         request = urllib.request.Request(

@@ -47,7 +47,6 @@ inputs) and Halo2 `Item::new_with_wtx_id`/verification-cache types carry
 that same identity change. See Common's complete API inventory for the
 underlying byte-wrapper and trait changes.
 
-
 ## Validation
 
 Using temporary local overrides for every published Common package:

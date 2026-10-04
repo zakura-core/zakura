@@ -417,8 +417,11 @@ Three properties keep the committer authoritative:
   It does not move the trust boundary.
 - **Failure attribution matches the committer.** The header-chain writer disputes both deliveries
   when the boundary cannot identify the invalid delivery. A replacement can later authenticate the
-  honest delivery and reject the invalid delivery. A failure on a delivery's pre-activation fields
-  rejects only that delivery.
+  honest delivery and reject the invalid delivery. Repair of that dispute requests both headers in
+  one range. Honest suppliers return the same payload for the honest header, so a repair of either
+  header alone could wait forever. State admits the range when it carries at least one new payload,
+  and it drops the repeated payload. A failure on a delivery's pre-activation fields rejects only
+  that delivery.
 - **Authentication pins selection.** `select_vct_auxiliary_delivery` prefers an authenticated
   delivery. Authentication state cannot return to `Unauthenticated`. A later delivery cannot
   displace roots that the running MMR already folded.

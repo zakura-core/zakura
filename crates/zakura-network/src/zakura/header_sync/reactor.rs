@@ -1402,17 +1402,20 @@ impl HeaderSyncReactor {
                 self.report_misbehavior(peer, HeaderSyncMisbehavior::MalformedMessage);
                 return;
             }
-            let input = response.entries[0]
-                .tree_aux
-                .expect("a repair response has schema-1 auxiliary input");
+            let inputs: Vec<_> = response
+                .entries
+                .iter()
+                .map(|entry| {
+                    entry
+                        .tree_aux
+                        .expect("a repair response has schema-1 auxiliary input")
+                })
+                .collect();
             let excluded = self.vct_repair.get(repair_owner).is_some_and(|task| {
                 let RepairPolicyState::Assigned { context } = &task.state else {
                     return false;
                 };
-                context.target == *selected_target
-                    && context.selected_header_count() == 1
-                    && context.episode == episode
-                    && (context.excludes(input) || context.retains_payload(input))
+                context.episode == episode && !context.admits_new_input(&inputs)
             });
             if excluded {
                 metrics::counter!("sync.header.vct.repair.excluded_input.total").increment(1);
@@ -3232,6 +3235,15 @@ impl HeaderSyncReactor {
             } else {
                 peer_supported_count.min(local_capacity)
             };
+            // An ambiguous boundary repair cannot shorten, so its supplier must serve both headers.
+            if supported_count < desired_count
+                && context
+                    .bounded_prefix(usize::try_from(supported_count).unwrap_or(usize::MAX))
+                    .is_none()
+            {
+                rejections.insufficient_capacity += 1;
+                continue;
+            }
             if status.tree_aux_schema_mask & AuxSchema::V1.mask_bit() == 0 {
                 rejections.unsupported_schema += 1;
                 continue;

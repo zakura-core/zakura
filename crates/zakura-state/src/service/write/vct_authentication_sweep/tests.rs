@@ -479,10 +479,49 @@ impl Fixture {
         );
     }
 
+    /// Serve the repair that header sync requests for `height` and require state to commit it.
+    ///
+    /// `corruption` alters the record at `height` only.
     fn redeliver(&mut self, height: Height, corruption: Option<Corruption>, marker: u8) {
+        let result = self.try_redeliver(
+            height,
+            corruption.map(|corruption| (height, corruption)),
+            marker,
+        );
+        assert!(
+            matches!(result, ApplyResult::Committed),
+            "the selected auxiliary replacement commits: {result:?}"
+        );
+    }
+
+    /// Serve the repair that header sync requests for `height`, as a supplier would.
+    ///
+    /// The supplier returns every header in the repair context's selected range with its
+    /// auxiliary record. `corruption` alters the record at one height.
+    fn try_redeliver(
+        &mut self,
+        height: Height,
+        corruption: Option<(Height, Corruption)>,
+        marker: u8,
+    ) -> ApplyResult {
         let snapshot = self.writer.runtime.publisher().snapshot();
-        let parent = self.chain[height.0.saturating_sub(1) as usize].clone();
-        let target = self.chain[height.0 as usize].clone();
+        let repair_owner = zakura_header_chain::BodyWorkAuthority::for_snapshot(&snapshot).bind(
+            u64::from(marker),
+            NonZeroU64::new(1).expect("one is nonzero"),
+        );
+        let context = self
+            .writer
+            .runtime
+            .reader()
+            .vct_repair_context(repair_owner, height)
+            .expect("the replacement repair context is coherent")
+            .expect("the replacement target remains selected");
+        let request_target = context.request_target();
+        let first_height = request_target.height.0 + 1
+            - u32::try_from(context.selected_header_count()).expect("the range fits u32");
+        let parent = self.chain[first_height as usize - 1].clone();
+        let targets = &self.chain[first_height as usize..=request_target.height.0 as usize];
+        let headers: Vec<_> = targets.iter().map(|block| block.header.clone()).collect();
         let lease = self
             .writer
             .runtime
@@ -493,51 +532,48 @@ impl Fixture {
         let rules =
             HeaderRules::for_validation_lease(&lease).expect("the custom network waives PoW");
         let batch = zakura_header_chain::prepare_headers(
-            HeaderBatchInput::new(std::slice::from_ref(&target.header)),
+            HeaderBatchInput::new(&headers),
             lease.parent(),
             &rules,
             &SystemClock,
         )
-        .expect("the replacement header passes production validation");
-        let repair_owner = zakura_header_chain::BodyWorkAuthority::for_snapshot(&snapshot).bind(
-            u64::from(marker),
-            NonZeroU64::new(1).expect("one is nonzero"),
-        );
-        let repair_episode = self
-            .writer
-            .runtime
-            .reader()
-            .vct_repair_context(repair_owner, height)
-            .expect("the replacement repair context is coherent")
-            .expect("the replacement target remains selected")
-            .episode;
+        .expect("the replacement headers pass production validation");
         let owner = repair_owner.into();
         let source = SourceId::from_digest([marker; 32]);
-        let mut record = zakura_header_chain::TreeAuxRecordV1 {
-            height,
-            sapling_root: empty_sapling_root(),
-            orchard_root: empty_orchard_root(),
-            ironwood_root: empty_ironwood_root(),
-            sapling_tx_count: target.sapling_transactions_count(),
-            orchard_tx_count: target.orchard_transactions_count(),
-            ironwood_tx_count: target.ironwood_transactions_count(),
-            auth_data_root: target.auth_data_root(),
-        };
-        if let Some(corruption) = corruption {
-            corruption.apply(&mut record);
-        }
-        let mut delivery_id = [marker; 32];
-        delivery_id[..4].copy_from_slice(&height.0.to_le_bytes());
-        let delivery = AuxDelivery::new(
-            EvidenceId::from_digest(delivery_id),
-            target.hash(),
-            source,
-            owner,
-            BodySizeHint::Unknown,
-            Some(record),
-        );
-        let result = self
-            .writer
+        let aux = targets
+            .iter()
+            .map(|target| {
+                let target_height = target
+                    .coinbase_height()
+                    .expect("every generated block has a coinbase height");
+                let mut record = zakura_header_chain::TreeAuxRecordV1 {
+                    height: target_height,
+                    sapling_root: empty_sapling_root(),
+                    orchard_root: empty_orchard_root(),
+                    ironwood_root: empty_ironwood_root(),
+                    sapling_tx_count: target.sapling_transactions_count(),
+                    orchard_tx_count: target.orchard_transactions_count(),
+                    ironwood_tx_count: target.ironwood_transactions_count(),
+                    auth_data_root: target.auth_data_root(),
+                };
+                if let Some((_, corruption)) =
+                    corruption.filter(|(corrupt_height, _)| *corrupt_height == target_height)
+                {
+                    corruption.apply(&mut record);
+                }
+                let mut delivery_id = [marker; 32];
+                delivery_id[..4].copy_from_slice(&target_height.0.to_le_bytes());
+                AuxDelivery::new(
+                    EvidenceId::from_digest(delivery_id),
+                    target.hash(),
+                    source,
+                    owner,
+                    BodySizeHint::Unknown,
+                    Some(record),
+                )
+            })
+            .collect();
+        self.writer
             .runtime
             .apply(
                 TransitionRequest {
@@ -546,17 +582,14 @@ impl Fixture {
                         owner,
                         source,
                         parent_hash: parent.hash(),
-                        target_tip_hash: target.hash(),
+                        target_tip_hash: request_target.hash,
                         completion: TargetCompletion::SelectedAuxiliaryRepair {
-                            common_ancestor: Frontier::new(
-                                Height(height.0.saturating_sub(1)),
-                                parent.hash(),
-                            ),
-                            selected_target: Frontier::new(height, target.hash()),
-                            episode: repair_episode,
+                            common_ancestor: Frontier::new(Height(first_height - 1), parent.hash()),
+                            selected_target: request_target,
+                            episode: context.episode,
                         },
                         batch,
-                        aux: vec![delivery],
+                        aux,
                     })),
                 },
                 &TransitionContext {
@@ -566,8 +599,7 @@ impl Fixture {
                     retention_references: &[],
                 },
             )
-            .expect("the selected auxiliary replacement commits");
-        assert!(matches!(result, ApplyResult::Committed));
+            .expect("the selected auxiliary replacement applies")
     }
 
     fn authentications(&self, height: Height) -> Vec<TestAuxStatus> {
@@ -885,6 +917,47 @@ fn a_replacement_successor_preserves_and_authenticates_the_honest_predecessor() 
         fixture.authentication(predecessor),
         Some(TestAuxStatus::Authenticated)
     ));
+    let successor_states = fixture.authentications(bad);
+    assert!(successor_states.contains(&TestAuxStatus::Disputed));
+    assert!(successor_states.contains(&TestAuxStatus::Authenticated));
+    assert_eq!(fixture.repair_state(), VctRootRepairState::Idle);
+}
+
+#[test]
+fn a_corrupt_successor_recovers_through_the_requested_ambiguous_repair() {
+    let _init_guard = zakura_test::init();
+    // A wrong authorizing-data root at H + 1 disputes H and H + 1 together, and repair starts at
+    // H. Honest suppliers return the same payload for H, so the repair must also cover H + 1.
+    let bad = Height(BODY_TIP + 4);
+    let predecessor = Height(bad.0 - 1);
+    let mut fixture = Fixture::new();
+    fixture.insert_headers(None, Some((bad, Corruption::AuthDataRoot)));
+    let mut sweeper = VctAuthenticationSweeper::default();
+    fixture.sweep(&mut sweeper);
+    let VctRootRepairState::Unavailable {
+        height: repair_height,
+    } = fixture.repair_state()
+    else {
+        panic!("the ambiguous boundary arms repair");
+    };
+    assert_eq!(repair_height, predecessor);
+
+    assert!(
+        matches!(
+            fixture.try_redeliver(repair_height, Some((bad, Corruption::AuthDataRoot)), 0x74),
+            ApplyResult::Stale(_)
+        ),
+        "a response that repeats both retained payloads cannot change state"
+    );
+    fixture.redeliver(repair_height, None, 0x75);
+    fixture.sweep(&mut sweeper);
+
+    let predecessor_states = fixture.authentications(predecessor);
+    assert_eq!(
+        predecessor_states,
+        vec![TestAuxStatus::Authenticated],
+        "admission drops the repeated honest predecessor payload"
+    );
     let successor_states = fixture.authentications(bad);
     assert!(successor_states.contains(&TestAuxStatus::Disputed));
     assert!(successor_states.contains(&TestAuxStatus::Authenticated));

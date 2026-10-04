@@ -111,6 +111,15 @@ impl AuxiliaryRequirementEpisode {
         Self(hasher.finalize().into())
     }
 
+    /// Derive one episode for an ambiguous boundary from both one-header episodes.
+    fn for_ambiguous_boundary(predecessor: Self, successor: Self) -> Self {
+        let mut hasher = Sha256::new();
+        hasher.update(b"zakura-vct-auxiliary-ambiguous-boundary-episode-v1");
+        hasher.update(predecessor.0);
+        hasher.update(successor.0);
+        Self(hasher.finalize().into())
+    }
+
     pub(crate) const fn digest(self) -> [u8; 32] {
         self.0
     }
@@ -145,7 +154,7 @@ pub struct VctRepairContext {
     excluded_inputs: Box<[AuxiliaryInputFingerprint]>,
     /// Every rooted semantic payload already retained for the target.
     retained_payloads: Box<[[u8; 32]]>,
-    /// Sources that already supplied one retained rooted payload for this target.
+    /// Sources that already supplied one retained rooted payload for every target in the range.
     retained_sources: Box<[SourceId]>,
     /// Private selected-range state keeps the public context and port shapes stable.
     selected_range: Box<SelectedRepairRange>,
@@ -280,6 +289,97 @@ impl VctRepairContext {
         Ok(self)
     }
 
+    /// Extend a one-header claim over its successor when one ambiguous observation disputed both.
+    ///
+    /// A failed boundary check disputes the target's roots and the successor's auth-data root
+    /// together, because either delivery can be wrong. Honest suppliers return the same payload for
+    /// the honest header, and a one-header claim excludes that payload. A claim that names only one
+    /// of the two headers therefore never progresses when that header is the honest one. The
+    /// extended claim covers both headers, so a supplier can replace whichever payload is wrong.
+    ///
+    /// `target_rows` must be the rows that built this claim. The method returns `Ok(None)` unless
+    /// one observation disputed a target row and a successor row at the successor boundary.
+    pub fn extend_ambiguous_boundary(
+        mut self,
+        successor: Frontier,
+        terminal_boundary_hash: Option<block::Hash>,
+        successor_admission_capacity_available: bool,
+        target_rows: &[UntrustedAuxDeliveryRow],
+        successor_rows: &[UntrustedAuxDeliveryRow],
+    ) -> Result<Option<Self>, StoreError> {
+        if self.selected_range.frontiers.as_ref() != [self.target]
+            || self.boundary_hash != Some(successor.hash)
+            || self.target.height.next().ok() != Some(successor.height)
+        {
+            return Err(StoreError::Incoherent(
+                "an ambiguous VCT repair must extend one exact target over its successor",
+            ));
+        }
+        let successor_context = Self::from_durable_rows(
+            successor,
+            self.locator.clone(),
+            self.state_version,
+            terminal_boundary_hash,
+            successor_admission_capacity_available,
+            successor_rows,
+        )?;
+        let boundary_disputes = |rows: &[UntrustedAuxDeliveryRow]| -> Vec<[u8; 32]> {
+            rows.iter()
+                .filter(|row| {
+                    row.outcome_status_code() == 3
+                        && row.outcome_boundary_hash() == Some(successor.hash)
+                })
+                .flat_map(|row| row.observation_digests().into_iter().flatten())
+                .collect()
+        };
+        let target_disputes = boundary_disputes(target_rows);
+        if !boundary_disputes(successor_rows)
+            .iter()
+            .any(|observation| target_disputes.contains(observation))
+        {
+            return Ok(None);
+        }
+
+        let mut excluded_inputs: Vec<_> = self
+            .excluded_inputs
+            .iter()
+            .chain(successor_context.excluded_inputs.iter())
+            .copied()
+            .collect();
+        excluded_inputs.sort_unstable();
+        excluded_inputs.dedup();
+        let mut retained_payloads: Vec<_> = self
+            .retained_payloads
+            .iter()
+            .chain(successor_context.retained_payloads.iter())
+            .copied()
+            .collect();
+        retained_payloads.sort_unstable();
+        retained_payloads.dedup();
+        // A supplier that holds a rooted slot at only one header can still replace the other.
+        let retained_sources: Vec<_> = self
+            .retained_sources
+            .iter()
+            .copied()
+            .filter(|source| successor_context.retains_source(*source))
+            .collect();
+
+        self.episode = AuxiliaryRequirementEpisode::for_ambiguous_boundary(
+            self.episode,
+            successor_context.episode,
+        );
+        self.admission_capacity_available &= successor_admission_capacity_available;
+        self.excluded_inputs = excluded_inputs.into_boxed_slice();
+        self.retained_payloads = retained_payloads.into_boxed_slice();
+        self.retained_sources = retained_sources.into_boxed_slice();
+        self.selected_range = Box::new(SelectedRepairRange {
+            frontiers: Box::new([self.target, successor]),
+            terminal_boundary_hash,
+            has_durable_rows: true,
+        });
+        Ok(Some(self))
+    }
+
     /// Return the number of selected headers covered by this repair context.
     pub fn selected_header_count(&self) -> usize {
         self.selected_range.frontiers.len()
@@ -304,6 +404,9 @@ impl VctRepairContext {
     /// The returned episode binds the selected prefix, its authentication boundaries, the state
     /// version, and the absence of durable auxiliary rows. Exact constrained repairs can only
     /// return their one-header context.
+    ///
+    /// An ambiguous boundary repair binds both of its headers, so it returns `None` for a shorter
+    /// limit.
     pub fn bounded_prefix(&self, max_headers: usize) -> Option<Self> {
         let prefix_len = max_headers.min(self.selected_range.frontiers.len());
         if prefix_len == 0 {
@@ -311,6 +414,9 @@ impl VctRepairContext {
         }
         if prefix_len == self.selected_range.frontiers.len() {
             return Some(self.clone());
+        }
+        if self.selected_range.has_durable_rows {
+            return None;
         }
         let mut prefix = self.clone();
         prefix.selected_range = Box::new(SelectedRepairRange {
@@ -393,7 +499,31 @@ impl VctRepairContext {
         self.retained_payloads.binary_search(&fingerprint).is_ok()
     }
 
-    /// Return whether this source already supplied one retained rooted payload for the target.
+    /// Return whether a response adds a payload that this repair neither retains nor excludes.
+    ///
+    /// `inputs` follow the selected range order. Header admission drops a retained payload, so a
+    /// response without a new payload cannot make progress.
+    pub fn admits_new_input(&self, inputs: &[crate::TreeAuxRecordV1]) -> bool {
+        let frontiers = &self.selected_range.frontiers;
+        inputs.len() == frontiers.len()
+            && frontiers
+                .iter()
+                .zip(inputs)
+                .enumerate()
+                .any(|(index, (frontier, input))| {
+                    let boundary_hash = frontiers
+                        .get(index.saturating_add(1))
+                        .map(|successor| successor.hash)
+                        .or(self.selected_range.terminal_boundary_hash);
+                    let excluded =
+                        AuxiliaryInputFingerprint::new(frontier.hash, *input, boundary_hash);
+                    let payload = semantic_payload_fingerprint(frontier.hash, Some(*input));
+                    self.excluded_inputs.binary_search(&excluded).is_err()
+                        && self.retained_payloads.binary_search(&payload).is_err()
+                })
+    }
+
+    /// Return whether this source already supplied one retained rooted payload for every target.
     pub fn retains_source(&self, source: SourceId) -> bool {
         self.retained_sources.binary_search(&source).is_ok()
     }
@@ -579,6 +709,118 @@ mod tests {
         );
         assert_ne!(build(8).episode, full.episode);
         assert!(full.bounded_prefix(0).is_none());
+    }
+
+    #[test]
+    fn an_ambiguous_boundary_repair_spans_both_disputed_headers() {
+        let predecessor = Frontier::new(block::Height(0), hash_at(block::Height(0)));
+        let target = Frontier::new(block::Height(1), hash_at(block::Height(1)));
+        let successor = Frontier::new(block::Height(2), hash_at(block::Height(2)));
+        let terminal_boundary_hash = Some(hash_at(block::Height(3)));
+        let owner = BodyWorkAuthority::for_snapshot(&snapshot(3, 0))
+            .bind(5, NonZeroU64::new(6).expect("six is nonzero"));
+        let record = |header: Frontier, auth_data_root: u8| TreeAuxRecordV1 {
+            height: header.height,
+            sapling_root: Default::default(),
+            orchard_root: Default::default(),
+            ironwood_root: Default::default(),
+            sapling_tx_count: 1,
+            orchard_tx_count: 2,
+            ironwood_tx_count: 3,
+            auth_data_root: zakura_chain::block::merkle::AuthDataRoot::from([auth_data_root; 32]),
+        };
+        let row = |identity: u8,
+                   header: Frontier,
+                   source: u8,
+                   status: u8,
+                   observation: Option<[u8; 32]>| {
+            UntrustedAuxDeliveryRow::new(
+                AuxDelivery::new(
+                    EvidenceId::from_digest([identity; 32]),
+                    header.hash,
+                    SourceId::from_digest([source; 32]),
+                    owner.into(),
+                    BodySizeHint::Unknown,
+                    Some(record(header, identity)),
+                ),
+                status,
+                [observation, None],
+                observation.map(|_| successor.hash),
+            )
+        };
+        let observation = Some([0x41; 32]);
+        let target_rows = [
+            row(0x10, target, 0x50, 3, observation),
+            row(0x11, target, 0x51, 0, None),
+        ];
+        let successor_rows = [row(0x20, successor, 0x50, 3, observation)];
+        let exact = || {
+            VctRepairContext::from_durable_rows(
+                target,
+                HeaderLocator::for_continuation(predecessor),
+                StateVersion::new(1),
+                Some(successor.hash),
+                true,
+                &target_rows,
+            )
+            .expect("the disputed target rows are coherent")
+        };
+        let extend = |successor_rows: &[UntrustedAuxDeliveryRow]| {
+            exact().extend_ambiguous_boundary(
+                successor,
+                terminal_boundary_hash,
+                true,
+                &target_rows,
+                successor_rows,
+            )
+        };
+
+        let ambiguous = extend(&successor_rows)
+            .expect("the disputed successor rows are coherent")
+            .expect("one observation disputed both headers");
+        assert_eq!(ambiguous.target, target);
+        assert_eq!(ambiguous.selected_header_count(), 2);
+        assert_eq!(ambiguous.request_target(), successor);
+        assert!(ambiguous.matches_selected_range(&[target, successor]));
+        assert_ne!(ambiguous.episode, exact().episode);
+        assert_eq!(ambiguous.bounded_prefix(2), Some(ambiguous.clone()));
+        assert!(
+            ambiguous.bounded_prefix(1).is_none(),
+            "a prefix would drop the header that may hold the wrong payload"
+        );
+        assert!(ambiguous.retains_source(SourceId::from_digest([0x50; 32])));
+        assert!(
+            !ambiguous.retains_source(SourceId::from_digest([0x51; 32])),
+            "a supplier with no successor slot can still replace the successor"
+        );
+
+        let retained_target = record(target, 0x10);
+        let retained_successor = record(successor, 0x20);
+        let new_target = record(target, 0x30);
+        let new_successor = record(successor, 0x31);
+        assert!(!ambiguous.admits_new_input(&[retained_target, retained_successor]));
+        assert!(!ambiguous.admits_new_input(&[record(target, 0x11), retained_successor]));
+        assert!(ambiguous.admits_new_input(&[retained_target, new_successor]));
+        assert!(ambiguous.admits_new_input(&[new_target, retained_successor]));
+        assert!(!ambiguous.admits_new_input(&[new_target]));
+        assert!(!exact().admits_new_input(&[retained_target]));
+        assert!(exact().admits_new_input(&[new_target]));
+
+        assert_eq!(
+            extend(&[row(0x20, successor, 0x50, 3, Some([0x42; 32]))]),
+            Ok(None),
+            "a successor dispute from another observation is not this boundary's ambiguity"
+        );
+        assert_eq!(extend(&[row(0x20, successor, 0x50, 0, None)]), Ok(None));
+        assert!(exact()
+            .extend_ambiguous_boundary(
+                Frontier::new(block::Height(3), hash_at(block::Height(3))),
+                None,
+                true,
+                &target_rows,
+                &[],
+            )
+            .is_err());
     }
 
     #[test]

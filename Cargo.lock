@@ -5942,20 +5942,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8df9b6e13f2d32c91b9bd719c00d1958837bc7dec474d94952798cc8e69eeec3"
 
 [[package]]
-name = "tower-test"
-version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a4546773ffeab9e4ea02b8872faa49bb616a80a7da66afc2f32688943f97efa7"
-dependencies = [
- "futures-util",
- "pin-project",
- "tokio",
- "tokio-test",
- "tower-layer",
- "tower-service",
-]
-
-[[package]]
 name = "tracing"
 version = "0.1.44"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6087,27 +6073,6 @@ dependencies = [
  "tracing",
  "tracing-core",
  "tracing-log 0.2.0",
-]
-
-[[package]]
-name = "tracing-test"
-version = "0.2.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "19a4c448db514d4f24c5ddb9f73f2ee71bfb24c526cf0c570ba142d1119e0051"
-dependencies = [
- "tracing-core",
- "tracing-subscriber",
- "tracing-test-macro",
-]
-
-[[package]]
-name = "tracing-test-macro"
-version = "0.2.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ad06847b7afb65c7866a36664b75c40b895e318cea4f71299f013fb22965329d"
-dependencies = [
- "quote",
- "syn 2.0.118",
 ]
 
 [[package]]
@@ -7010,7 +6975,6 @@ dependencies = [
  "tracing-journald",
  "tracing-opentelemetry",
  "tracing-subscriber",
- "tracing-test",
  "webpki-roots",
  "zakura-chain",
  "zakura-consensus",
@@ -7892,7 +7856,6 @@ dependencies = [
  "tokio-test",
  "tokio-util",
  "tower 0.4.13",
- "tower-test",
  "tracing",
  "zakura-test",
  "zakura-tower-fallback",

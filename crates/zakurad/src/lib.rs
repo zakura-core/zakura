@@ -61,9 +61,6 @@
 //!
 //! ### Metrics
 //!
-//! * configuring a `tracing.progress_bar`: shows key metrics in the terminal using progress bars,
-//!   and automatically configures Zakura to send logs to a file.
-//!   (The `progress-bar` feature is activated by default.)
 //! * `prometheus`: export metrics to prometheus.
 //!
 //! ### Tracing

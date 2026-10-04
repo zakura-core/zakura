@@ -106,20 +106,41 @@ fn config_load_defaults() {
 }
 
 #[test]
-fn tracing_progress_bar_uses_zakura_log_file_by_default() {
+fn legacy_progress_bar_is_accepted_without_redirecting_logs() {
+    let _env = EnvGuard::new();
+    let temp_dir = TempDir::new().expect("create temp dir");
+    let config_path = temp_dir.path().join("legacy_progress.toml");
+
+    for mode in ["summary", "detailed"] {
+        fs::write(
+            &config_path,
+            format!("[tracing]\nprogress_bar = {mode:?}\n"),
+        )
+        .expect("write legacy config");
+
+        let config = ZakuradConfig::load(Some(config_path.clone()))
+            .expect("legacy progress settings remain valid");
+
+        assert!(config.tracing.log_file.is_none());
+        let serialized = toml::to_string(&config).expect("serialize config");
+        assert!(!serialized.contains("progress_bar"));
+    }
+}
+
+#[test]
+fn legacy_progress_bar_preserves_explicit_log_file() {
+    let log_file = PathBuf::from("custom-zakura.log");
     let tracing_config = TracingConfig::from(TracingInnerConfig {
         progress_bar: Some(ProgressConfig::Summary),
+        log_file: Some(log_file.clone()),
         ..TracingInnerConfig::default()
     });
 
-    assert_eq!(
-        tracing_config
-            .log_file
-            .as_ref()
-            .and_then(|path| path.file_name())
-            .and_then(|name| name.to_str()),
-        Some("zakura.log")
-    );
+    assert_eq!(tracing_config.log_file.as_ref(), Some(&log_file));
+    let serialized = toml::to_string(&tracing_config).expect("serialize config");
+    assert!(!serialized.contains("progress_bar"));
+    let reloaded: TracingConfig = toml::from_str(&serialized).expect("reload config");
+    assert_eq!(reloaded.log_file.as_ref(), Some(&log_file));
 }
 
 #[test]

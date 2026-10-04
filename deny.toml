@@ -12,7 +12,6 @@ yanked = "deny"
 # Advisory ignores are for transitive dependencies with no immediate safe upgrade in this branch.
 # Remove each ignore entry as the dependency chain is upgraded.
 ignore = [
-    "RUSTSEC-2025-0119", # number_prefix — transitive via indicatif
     "RUSTSEC-2025-0141", # bincode — direct dependency
     "RUSTSEC-2024-0436", # paste — transitive via netwatch/netlink-packet-core
 ]
@@ -132,10 +131,6 @@ skip-tree = [
     { name = "block-buffer", version = "=0.11.0-rc.3" },
     { name = "crypto-common", version = "=0.2.0-rc.1" },
     { name = "digest", version = "=0.11.0-pre.9" },
-
-    # console 0.15.x is pulled by indicatif (via howudoin); 0.16.x by insta (dev-dep).
-    # remove once indicatif/howudoin update to console 0.16.
-    { name = "console", version = "=0.15.11" },
 
     # hashbrown 0.16.x pulled by ed25519-zebra; 0.17.x by indexmap 2.14 (transitive of librustzcash).
     # remove once ed25519-zebra updates hashbrown.

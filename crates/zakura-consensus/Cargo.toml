@@ -23,11 +23,6 @@ default = []
 
 # Production features that activate extra dependencies, or extra features in dependencies
 
-progress-bar = [
-    "howudoin",
-    "zakura-state/progress-bar",
-]
-
 # Test-only features
 internal-bench = []
 proptest-impl = ["proptest", "proptest-derive", "zakura-chain/proptest-impl", "zakura-state/proptest-impl"]
@@ -74,8 +69,6 @@ zakura-header-chain = { path = "../zakura-header-chain", version = "4.0.1" }
 
 zcash_protocol.workspace = true
 
-# prod feature progress-bar
-howudoin = { workspace = true, optional = true }
 
 # Test-only dependencies
 proptest = { workspace = true, optional = true }

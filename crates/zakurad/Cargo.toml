@@ -72,7 +72,7 @@ features = [
 
 [features]
 # In release builds, don't compile debug logging code, to improve performance.
-default-release-binaries = ["release_max_level_info", "progress-bar", "prometheus", "opentelemetry"]
+default-release-binaries = ["release_max_level_info", "prometheus", "opentelemetry"]
 
 
 # Local builds use the compiler's target features for Pasta arithmetic.
@@ -106,14 +106,6 @@ internal-miner = [
 sentry = ["dep:sentry"]
 journald = ["tracing-journald"]
 opentelemetry = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "dep:tracing-opentelemetry"]
-
-progress-bar = [
-    "howudoin",
-    "indicatif",
-    "zakura-consensus/progress-bar",
-    "zakura-state/progress-bar",
-    "zakura-network/progress-bar",
-]
 
 prometheus = ["metrics-exporter-prometheus"]
 
@@ -265,9 +257,6 @@ metrics-exporter-prometheus = { workspace = true, features = ["http-listener"], 
 # we only use `log` to set and print the static log levels in transitive dependencies
 log = { workspace = true }
 
-# prod feature progress-bar
-howudoin = { workspace = true, features = ["term-line"], optional = true }
-indicatif = { workspace = true, optional = true }
 
 # test feature proptest-impl
 proptest = { workspace = true, optional = true }

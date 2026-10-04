@@ -32,10 +32,6 @@ sync-metrics = []
 
 # Production features that activate extra dependencies, or extra features in dependencies
 
-progress-bar = [
-    "howudoin",
-]
-
 # Testing features that activate extra dependencies
 header-fuzz = []
 proptest-impl = ["proptest", "proptest-derive", "zakura-chain/proptest-impl"]
@@ -75,8 +71,6 @@ metrics = { workspace = true }
 tracing-error = { workspace = true, features = ["traced-error"] }
 tracing = { workspace = true }
 
-# prod feature progress-bar
-howudoin = { workspace = true, optional = true }
 
 # proptest dependencies
 proptest = { workspace = true, optional = true }

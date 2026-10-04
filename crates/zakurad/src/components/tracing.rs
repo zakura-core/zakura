@@ -49,17 +49,13 @@ impl DerefMut for Config {
 }
 
 impl From<InnerConfig> for Config {
-    fn from(mut inner: InnerConfig) -> Self {
-        inner.log_file = runtime_default_log_file(inner.log_file, inner.progress_bar);
-
+    fn from(inner: InnerConfig) -> Self {
         Self { inner }
     }
 }
 
 impl From<Config> for InnerConfig {
-    fn from(mut config: Config) -> Self {
-        config.log_file = disk_default_log_file(config.log_file.clone(), config.progress_bar);
-
+    fn from(config: Config) -> Self {
         config.inner
     }
 }
@@ -121,18 +117,15 @@ pub struct InnerConfig {
     #[serde(skip_serializing)]
     pub flamegraph: Option<PathBuf>,
 
-    /// Shows progress bars for block syncing, and mempool transactions, and peer networking.
-    /// Also sends logs to the default log file path.
+    /// Legacy progress display setting, accepted for configuration compatibility.
     ///
-    /// This config field is ignored unless the `progress-bar` feature is enabled.
+    /// Ignored because the terminal progress display has been removed.
+    #[serde(skip_serializing)]
     pub progress_bar: Option<ProgressConfig>,
 
     /// If set to a path, write the tracing logs to that path.
     ///
     /// By default, logs are sent to the terminal standard output.
-    /// But if the `progress_bar` config is activated, logs are sent to the standard log file path:
-    /// - Linux: `$XDG_STATE_HOME/zakura.log` or `$HOME/.local/state/zakura.log`
-    /// - macOS: `$HOME/Library/Application Support/zakura.log`
     /// - Windows: `%LOCALAPPDATA%\zakura.log` or `C:\Users\%USERNAME%\AppData\Local\zakura.log`
     ///
     /// # Security
@@ -186,16 +179,14 @@ pub struct InnerConfig {
     pub opentelemetry_sample_percent: Option<u8>,
 }
 
-/// The progress bars that Zebra will show while running.
+/// Legacy progress display modes accepted when reading existing configuration.
 #[derive(Copy, Clone, Debug, Default, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ProgressConfig {
-    /// Show a lot of progress bars.
+    /// Legacy detailed display mode, ignored.
     Detailed,
 
-    /// Show a few important progress bars.
-    //
-    // TODO: actually hide some progress bars in this mode.
+    /// Legacy summary display mode, ignored.
     #[default]
     #[serde(other)]
     Summary,
@@ -226,62 +217,18 @@ impl Config {
 
 impl Default for InnerConfig {
     fn default() -> Self {
-        // TODO: enable progress bars by default once they have been tested
-        let progress_bar = None;
-
         Self {
             use_color: true,
             force_use_color: false,
             filter: None,
             buffer_limit: 128_000,
             flamegraph: None,
-            progress_bar,
-            log_file: runtime_default_log_file(None, progress_bar),
+            progress_bar: None,
+            log_file: None,
             use_journald: false,
             opentelemetry_endpoint: None,
             opentelemetry_service_name: None,
             opentelemetry_sample_percent: None,
         }
     }
-}
-
-/// Returns the runtime default log file path based on the `log_file` and `progress_bar` configs.
-fn runtime_default_log_file(
-    log_file: Option<PathBuf>,
-    progress_bar: Option<ProgressConfig>,
-) -> Option<PathBuf> {
-    if let Some(log_file) = log_file {
-        return Some(log_file);
-    }
-
-    // If the progress bar is active, we want to use a log file regardless of the config.
-    // (Logging to a terminal erases parts of the progress bars, making both unreadable.)
-    if progress_bar.is_some() {
-        return default_log_file();
-    }
-
-    None
-}
-
-/// Returns the configured log file path using the runtime `log_file` and `progress_bar` config.
-///
-/// This is the inverse of [`runtime_default_log_file()`].
-fn disk_default_log_file(
-    log_file: Option<PathBuf>,
-    progress_bar: Option<ProgressConfig>,
-) -> Option<PathBuf> {
-    // If the progress bar is active, and we've likely substituted the default log file path,
-    // don't write that substitute to the config on disk.
-    if progress_bar.is_some() && log_file == default_log_file() {
-        return None;
-    }
-
-    log_file
-}
-
-/// Returns the default log file path.
-fn default_log_file() -> Option<PathBuf> {
-    dirs::state_dir()
-        .or_else(dirs::data_local_dir)
-        .map(|dir| dir.join("zakura.log"))
 }

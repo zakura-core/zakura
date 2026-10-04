@@ -1143,7 +1143,7 @@ fn stored_configs_work() -> Result<()> {
             // When logs are sent to the terminal, we see the config loading message and path.
             format!("Using config file at:.*{}", regex::escape(config_file_name)),
             // If they are sent to a file, we see a log file message on stdout,
-            // and a logo, welcome message, and progress bar on stderr.
+            // and a logo and welcome message on stderr.
             "Sending logs to".to_string(),
             // TODO: add expect_stdout_or_stderr_line_matches() and check for this instead:
             //"Thank you for running a mainnet zakurad".to_string(),

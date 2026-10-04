@@ -867,10 +867,10 @@ async fn continuous_blockchain(
             if let Some(restart_height) = restart_height {
                 if height <= restart_height {
                     let mut state_service = state_service.clone();
-                    // Make sure the state service is ready for block
+                    // Make sure the state service is ready for the current block.
                     let ready_state_service = state_service.ready().map_err(|e| eyre!(e)).await?;
 
-                    // Add block directly to the state
+                    // Add the current block directly to the state.
                     ready_state_service
                         .call(zakura_state::Request::CommitCheckpointVerifiedBlock(
                             block.clone().into(),
@@ -883,16 +883,16 @@ async fn continuous_blockchain(
                 }
             }
 
-            // Make sure the verifier service is ready for block
+            // Make sure the verifier service is ready for the current block.
             let ready_verifier_service = checkpoint_verifier.ready().map_err(|e| eyre!(e)).await?;
 
-            // Set up the future for block
+            // Set up the verification future for the current block.
             let verify_future = timeout(
                 Duration::from_secs(VERIFY_TIMEOUT_SECONDS),
                 ready_verifier_service.call(block.clone()),
             );
 
-            // spawn verification future in the background for block
+            // Spawn the verification future in the background.
             let handle = tokio::spawn(verify_future.in_current_span());
             handles.push(handle);
 

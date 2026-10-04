@@ -31,7 +31,7 @@ name: Semver checks
 
 on:
   pull_request:
-    branches: [main, "feat/**", "split/**", "release/**"]
+    branches: [main, "feat/**", "split/**", "adam/**", "release/**"]
     paths:
       - "**/*.rs"
       - "**/Cargo.toml"

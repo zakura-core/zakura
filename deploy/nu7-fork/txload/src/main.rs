@@ -692,7 +692,7 @@ mod tests {
         let authorized = tokio::task::spawn_blocking(|| -> Result<_> {
             let pk = ProvingKey::build(CIRCUIT_VERSION);
             prove_shielding_bundle(&pk, 1, throwaway_recipient()?, None)?
-                .apply_signatures(&mut rand_10::rng(), [0; 32], &[])
+                .apply_signatures(rand_10::rng(), [0; 32], &[])
                 .map_err(|error| eyre!("test bundle signing failed: {error:?}"))
         })
         .await??;

@@ -603,6 +603,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn response_headroom_is_shared_and_held_until_the_write_ends() {
+        let (sender, mut receiver) = worker_framed_channel(2);
+        let clone = sender.clone();
+        sender
+            .reserve_response_guarded()
+            .await
+            .unwrap()
+            .send(frame(1), FrameGuard::new(Arc::new(())));
+        let mut pending = Box::pin(clone.reserve_response_guarded());
+        assert!(futures::poll!(&mut pending).is_pending());
+
+        let queued = receiver.recv().await.unwrap();
+        let mut write = Box::pin(queued.write_with(|_| async {
+            std::future::pending::<Result<(), std::convert::Infallible>>().await
+        }));
+        assert!(futures::poll!(&mut write).is_pending());
+        assert!(futures::poll!(&mut pending).is_pending());
+        sender
+            .try_send(frame(2))
+            .expect("control retains queue capacity");
+
+        drop(write);
+        let slot = pending.await.unwrap();
+        assert_eq!(sender.response_slots.as_ref().unwrap().reserved(), 1);
+        drop(slot);
+        assert_eq!(sender.response_slots.as_ref().unwrap().reserved(), 0);
+        drop(receiver);
+        assert!(matches!(
+            sender.reserve_response_guarded().await,
+            Err(GuardedReserveError::Closed)
+        ));
+        assert_eq!(sender.response_slots.as_ref().unwrap().reserved(), 0);
+    }
+
+    #[tokio::test]
     async fn cancelling_or_closing_a_guarded_queue_wait_keeps_the_callers_reservation() {
         let (sender, mut receiver) = worker_framed_channel(1);
         sender.try_send(frame(1)).expect("filler fits");

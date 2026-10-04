@@ -131,6 +131,14 @@ one response slot per 4 KiB of output budget, rounded up. This ratio is a sizing
 allocator measurement. Adoption must measure throughput for tiny responses. Requests waiting for
 output capacity retain their commitments and remain bounded by the session's commitment limit.
 
+Waiting requests do not allocate response channels. The serving task creates each channel only
+after it takes capacity, and puts its receiver in the ordered output before starting the work.
+This preserves request order without charging every waiting commitment for a channel buffer.
+Serving frames share a queue allowance across sender clones that leaves one slot for requests
+and control messages. The allowance stays held through the write, including while QUIC is blocked.
+This needs a transport queue of at least two slots and does not prioritize control ahead of bytes
+already queued on the ordered stream.
+
 A commitment is released when its ending enters the session's ordered output, before transmission.
 A conformant peer sends its next request only after it receives an ending, so it never exceeds the
 advertised limit on this node's tally. The toolkit still acts only above twice the limit: even if

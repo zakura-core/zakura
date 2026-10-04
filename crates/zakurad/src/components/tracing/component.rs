@@ -405,7 +405,6 @@ impl<A: abscissa_core::Application> Injectable<A> for Tracing {
     fn version(&self) -> abscissa_core::Version {
         build_version()
     }
-
 }
 
 impl<A: abscissa_core::Application> Component<A> for Tracing {

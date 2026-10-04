@@ -75,9 +75,7 @@ impl TestTlsListener {
 
     async fn ping(&self) -> reqwest::Client {
         let client = reqwest::Client::builder()
-            .add_root_certificate(
-                reqwest::Certificate::from_pem(HANDSHAKE_CERT.as_bytes()).unwrap(),
-            )
+            .tls_certs_only([reqwest::Certificate::from_pem(HANDSHAKE_CERT.as_bytes()).unwrap()])
             .resolve("localhost", self.address)
             .no_proxy()
             .timeout(TEST_TIMEOUT)

@@ -17,6 +17,7 @@ import concurrent.futures
 import ipaddress
 import json
 import math
+import os
 import re
 import shlex
 import subprocess
@@ -24,6 +25,7 @@ import threading
 import time
 import tomllib
 import urllib.parse
+import urllib.request
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -301,6 +303,7 @@ import urllib.request
     state_cache_dir,
     want_metrics,
 ) = sys.argv[1:16]
+ancestor_height = int(sys.argv[16]) if len(sys.argv) > 16 and sys.argv[16] else None
 
 out = {
     "service": service,
@@ -850,6 +853,19 @@ if rpc_url:
                     except Exception:
                         pass
         out["ancestor_hashes"] = ancestor_hashes
+        if ancestor_height is not None and tip_height is not None and 0 <= ancestor_height <= tip_height:
+            depth = str(tip_height - ancestor_height)
+            if depth not in ancestor_hashes:
+                try:
+                    ancestor_hashes[depth] = rpc_call("getblockhash", [ancestor_height])
+                except Exception:
+                    pass
+        if tip_height is not None:
+            try:
+                if rpc_call("getblockhash", [tip_height]) != out["block_hash"]:
+                    out["ancestor_hashes"] = {}
+            except Exception:
+                out["ancestor_hashes"] = {}
 
         best_hash = out.get("block_hash")
         if best_hash:
@@ -951,7 +967,7 @@ def ssh_capture_script(node: Node, script: str) -> subprocess.CompletedProcess:
     return subprocess.run(node.ssh_cmd("bash", "-s"), input=script, text=True, capture_output=True)
 
 
-def probe_node(node: Node, want_metrics: bool = True) -> dict:
+def probe_node(node: Node, want_metrics: bool = True, ancestor_height: int | None = None) -> dict:
     rpc_url = rpc_url_for(node.rpc_listen_addr)
     script = (
         "python3 - "
@@ -969,7 +985,8 @@ def probe_node(node: Node, want_metrics: bool = True) -> dict:
         f"{shlex.quote(node.metrics_endpoint)} "
         f"{shlex.quote(node.health_listen_addr)} "
         f"{shlex.quote(node.state_cache_dir)} "
-        f"{shlex.quote('1' if want_metrics else '')} <<'PY'\n"
+        f"{shlex.quote('1' if want_metrics else '')} "
+        f"{shlex.quote(str(ancestor_height) if ancestor_height is not None else '')} <<'PY'\n"
         f"{REMOTE_PROBE}\n"
         "PY\n"
     )
@@ -1021,6 +1038,164 @@ class RateLimiter:
             return True
 
 
+PRIVATE_ADDRESS_FILE = Path("/etc/zakura-mainnet-dashboard/private/addresses.json")
+
+
+def address_key(value):
+    address = ipaddress.ip_address(value)
+    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped:
+        address = address.ipv4_mapped
+    return address.version, address.packed
+
+
+def private_addresses():
+    try:
+        with PRIVATE_ADDRESS_FILE.open("rb") as stream:
+            data = json.loads(stream.read(4097))
+    except FileNotFoundError:
+        if os.environ.get("ZAKURA_MAC_CRANELIFT_STATUS") == "1":
+            raise ValueError("private address configuration required") from None
+        return frozenset()
+    if not isinstance(data, list) or not 1 <= len(data) <= 16 or any(not isinstance(item, str) for item in data):
+        raise ValueError("invalid private address configuration")
+    return frozenset(address_key(item) for item in data)
+
+
+def monitoring_snapshot(value, node_names):
+    """Retain typed fleet observations when address redaction cannot be configured.
+
+    Arbitrary strings and nested diagnostic objects never cross this boundary.
+    Detailed endpoints remain unavailable until privacy configuration is repaired.
+    """
+    def number(item):
+        return type(item) in (int, float) and math.isfinite(item) and item >= 0
+
+    def block_hash(item):
+        return isinstance(item, str) and re.fullmatch(r"[0-9a-fA-F]{64}", item) is not None
+
+    names = {name for name in node_names if re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,63}", name)}
+    names.add("mac-os-cranelift")
+    rows = []
+    for row in value.get("rows", []):
+        if not isinstance(row, dict) or row.get("name") not in names:
+            continue
+        health = row.get("health")
+        if health not in {"healthy", "stale", "verification_error", "rpc_error", "down", "starting"}:
+            health = "down"
+        safe = {"name": row["name"], "health": health, "healthy": health == "healthy",
+                "detail": "Limited status: privacy configuration unavailable"}
+        if type(row.get("height")) is int and row["height"] >= 0:
+            safe["height"] = row["height"]
+        for field in ("seconds_since_advanced", "observed_at"):
+            if number(row.get(field)):
+                safe[field] = row[field]
+        for field in ("block_hash", "previous_hash"):
+            if block_hash(row.get(field)):
+                safe[field] = row[field]
+        ancestors = row.get("ancestor_hashes")
+        if isinstance(ancestors, dict):
+            safe["ancestor_hashes"] = {depth: value for depth, value in ancestors.items()
+                if isinstance(depth, str) and depth.isdecimal() and len(depth) <= 10
+                and 0 < int(depth) <= 0xFFFFFFFF and block_hash(value)}
+        rows.append(safe)
+    result = {"rows": rows, "total": len(rows),
+              "healthy": sum(row["healthy"] for row in rows), "chain": {}}
+    for field in ("last_poll", "generated_at", "stale_after"):
+        if number(value.get(field)):
+            result[field] = value[field]
+    if value.get("network") in {"mainnet", "testnet"}:
+        result["network"] = value["network"]
+    return result
+
+
+def redact_private_addresses(value, protected):
+    """Remove only protected Mac addresses, including from Linux peer diagnostics."""
+    if isinstance(value, dict):
+        return {redact_private_addresses(key, protected): redact_private_addresses(item, protected)
+                for key, item in value.items()}
+    if isinstance(value, list):
+        return [redact_private_addresses(item, protected) for item in value]
+    if not isinstance(value, str):
+        return value
+
+    def ipv4(match):
+        literal = match.group()
+        try:
+            if address_key(literal) in protected:
+                return "[redacted-address]"
+        except ValueError:
+            pass
+        return literal
+
+    # An invalid outer IPv6 token must not swallow a protected dotted address.
+    value = re.sub(r"(?:\d{1,3}\.){3}\d{1,3}", ipv4, value)
+
+    # Overlapping bounded windows prevent a long hexadecimal prefix from
+    # consuming the beginning of an expanded protected IPv6 address.
+    pattern = r"(?<![a-fA-F0-9])(?=((?:[a-fA-F0-9]{0,4}:){2,8}[a-fA-F0-9]{0,4}(?:%[\w.-]{1,32})?))"
+    parts, previous = [], 0
+    for match in re.finditer(pattern, value):
+        if match.start() < previous:
+            continue
+        literal = match.group(1)
+        starts = [0] + [i + 1 for i, char in enumerate(literal) if char == ":"]
+        ends = sorted([len(literal)] + [i for i, char in enumerate(literal) if char == ":"], reverse=True)
+        found = None
+        for start in starts:
+            for end in ends:
+                candidate = literal[start:end]
+                if end <= start or candidate.count(":") < 2:
+                    continue
+                try:
+                    if address_key(candidate) in protected:
+                        found = (match.start() + start, match.start() + end)
+                        break
+                except ValueError:
+                    pass
+            if found is not None:
+                break
+        if found is not None:
+            start, end = found
+            parts.extend((value[previous:start], "[redacted-address]"))
+            previous = end
+    parts.append(value[previous:])
+    return "".join(parts)
+
+
+def mac_cranelift_status() -> dict:
+    """Read only the comparator's sanitized file, never the private comparison state."""
+    try:
+        with Path("/var/lib/zakura-mac-cranelift-public/status.json").open("rb") as stream:
+            raw = stream.read(65537)
+        if len(raw) > 65536:
+            raise ValueError("oversized status")
+        data = json.loads(raw)
+        identifier = data.get("verifier_id")
+        if not isinstance(identifier, str) or not re.fullmatch(r"verifier-[a-f0-9]{32}", identifier):
+            raise ValueError("invalid verifier identifier")
+        result = {"verifier_id": identifier, "available": True}
+        for key in ("sample_time", "compared_through", "mac_tip", "node_rss_bytes", "free_disk_bytes"):
+            value = data.get(key)
+            result[key] = value if type(value) in (int, float) and math.isfinite(value) else None
+        for key in ("alerts_muted",):
+            result[key] = data.get(key) is True
+        for key in ("mac_tip_hash", "source_sha"):
+            value = data.get(key)
+            size = 64 if key == "mac_tip_hash" else 40
+            result[key] = value if isinstance(value, str) and re.fullmatch(r"[a-fA-F0-9]{%d}" % size, value) else ""
+        result["comparison_healthy"] = data.get("condition") == "matching"
+        ancestors = data.get("ancestor_hashes") or {}
+        result["ancestor_hashes"] = {depth: value for depth, value in ancestors.items()
+            if isinstance(depth, str) and depth.isdecimal() and len(depth) <= 10
+            and 0 < int(depth) <= 0xFFFFFFFF
+            and isinstance(value, str) and re.fullmatch(r"[a-fA-F0-9]{64}", value)} if isinstance(ancestors, dict) else {}
+        stamp = result["sample_time"]
+        result["available"] = stamp is not None and 0 <= time.time() - stamp <= 90
+        return result
+    except (OSError, ValueError, TypeError, AttributeError):
+        return {"available": False}
+
+
 class ClusterCollector:
     def __init__(
         self,
@@ -1049,6 +1224,7 @@ class ClusterCollector:
         self.ironwood_activation_height = IRONWOOD_ACTIVATION_HEIGHTS[network]
         self.lock = threading.Lock()
         restored_progress = load_progress(state_file)
+        self.private_mac_progress = restored_progress.get("mac-os-cranelift", {})
         self.last_height: dict[str, int | None] = {
             node.name: restored_progress.get(node.name, {}).get("height") for node in nodes
         }
@@ -1085,9 +1261,13 @@ class ClusterCollector:
     def poll_once(self) -> None:
         rows = []
         started = time.time()
+        private_enabled = self.network == "mainnet" and os.environ.get("ZAKURA_MAC_CRANELIFT_STATUS") == "1"
+        sample = mac_cranelift_status() if private_enabled else {}
+        tip = sample.get("mac_tip") if sample.get("available") else None
+        ancestor_height = max(0, tip - 10) if type(tip) is int else None
         with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(self.nodes))) as pool:
             futures = {
-                pool.submit(probe_node, node, self.should_scrape_metrics(node.name, started)): node
+                pool.submit(probe_node, node, self.should_scrape_metrics(node.name, started), ancestor_height): node
                 for node in self.nodes
             }
             for future in concurrent.futures.as_completed(futures):
@@ -1098,6 +1278,29 @@ class ClusterCollector:
                     probe = {"error": str(error)}
                 rows.append(self.row_for(node, probe, time.time()))
 
+        if private_enabled:
+            self.last_height.setdefault("mac-os-cranelift", self.private_mac_progress.get("height"))
+            self.last_advanced_at.setdefault("mac-os-cranelift", self.private_mac_progress.get("last_advanced_at"))
+            self.history.setdefault("mac-os-cranelift", deque())
+            mac = Node(name="mac-os-cranelift", ssh_string="", node_id=sample.get("verifier_id", ""), probe_kind="private-loopback",
+                       service_name="", bin_path="", log_file="", rpc_listen_addr="", rpc_auth="",
+                       rpc_config_path="", rpc_user="", rpc_password="", process_pattern="", container_name="")
+            probe = {"height": sample.get("mac_tip") if sample.get("available") else None,
+                     "block_hash": sample.get("mac_tip_hash"), "commit": sample.get("source_sha"),
+                     "ancestor_hashes": sample.get("ancestor_hashes") or {},
+                     "previous_hash": (sample.get("ancestor_hashes") or {}).get("1", ""),
+                     "active_state": "active" if sample.get("available") else "unknown",
+                     "client_name": "Zakura macOS ARM64", "rpc_chain": "main", "rpc_testnet": False,
+                     "host": {"disk_free_bytes": sample.get("free_disk_bytes"),
+                              "rss_bytes": sample.get("node_rss_bytes")}}
+            row = self.row_for(mac, probe, time.time())
+            row["comparison_healthy"] = sample.get("comparison_healthy") is True
+            if row["healthy"] and not row["comparison_healthy"]:
+                row.update(healthy=False, health="verification_error", detail="Verification incomplete or inconsistent")
+            row["detail"] += " · Compared through " + str(sample.get("compared_through") or "—")
+            if sample.get("alerts_muted"):
+                row["detail"] += " · Alerts muted"
+            rows.append(row)
         rows.sort(key=lambda row: row["name"])
         now = time.time()
         with self.lock:
@@ -2835,7 +3038,7 @@ function formatRestarted(value) {
 
 /* ---------- tone mapping ---------- */
 const HEALTH_TONE = {
-  healthy: 'ok', stale: 'warn', rpc_error: 'bad', down: 'bad', starting: 'neutral',
+  healthy: 'ok', stale: 'warn', verification_error: 'bad', rpc_error: 'bad', down: 'bad', starting: 'neutral',
 };
 const CHAIN_TONE = {
   majority: 'ok', behind: 'warn', ahead: 'warn', fork: 'bad', unknown: 'neutral',
@@ -2945,7 +3148,7 @@ function renderFleet(data) {
     ? 'every node is active, serving RPC, and advancing'
     : unhealthy + ' node' + (unhealthy === 1 ? '' : 's') + ' need attention';
 
-  const order = ['healthy', 'stale', 'rpc_error', 'down', 'starting'];
+  const order = ['healthy', 'stale', 'verification_error', 'rpc_error', 'down', 'starting'];
   const present = order.filter((key) => counts[key]);
   for (const key of Object.keys(counts)) {
     if (!present.includes(key)) present.push(key);
@@ -3326,7 +3529,7 @@ function renderNodeHeader(data) {
     + (row.tip_event ? badge(tipEventLabel(row.tip_event) || row.tip_event, 'bad') : '');
 
   const pill = el('state-pill');
-  pill.textContent = { healthy: 'Healthy', stale: 'Stale', rpc_error: 'RPC error', down: 'Down' }[row.health]
+  pill.textContent = { healthy: 'Healthy', stale: 'Stale', verification_error: 'Verification error', rpc_error: 'RPC error', down: 'Down' }[row.health]
     || 'Starting';
   pill.className = 'state-pill is-' + (healthTone === 'neutral' ? 'warn' : healthTone);
 }
@@ -3732,6 +3935,17 @@ class Handler(BaseHTTPRequestHandler):
         content_type: str,
         headers: dict[str, str] | None = None,
     ) -> None:
+        if body and content_type.startswith("application/json"):
+            try:
+                body = json.dumps(redact_private_addresses(json.loads(body), private_addresses()),
+                                  separators=(",", ":")).encode()
+            except (OSError, ValueError, TypeError):
+                if urllib.parse.urlparse(self.path).path == "/data" and COLLECTOR is not None:
+                    body = json.dumps(monitoring_snapshot(json.loads(body), COLLECTOR.nodes_by_name),
+                                      separators=(",", ":")).encode()
+                else:
+                    status = 503
+                    body = b'{"error":"privacy configuration unavailable"}'
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
@@ -3807,7 +4021,7 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path.startswith("/node/"):
             assert COLLECTOR is not None
             name = urllib.parse.unquote(parsed.path[len("/node/"):])
-            if name not in COLLECTOR.nodes_by_name:
+            if name not in COLLECTOR.nodes_by_name and COLLECTOR.node_snapshot(name) is None:
                 return self.send_body(
                     404,
                     b'not found\n\nUnknown node. Return to the fleet: <a href="/">/</a>\n',

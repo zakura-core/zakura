@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import argparse
 import contextlib
 import importlib.util
 import json
+import io
 import os
 import re
 import subprocess
@@ -81,6 +83,132 @@ def public_row(
         "last_seen_at": observed_at,
         "rpc_metadata_error": None,
     }
+
+
+class MacCraneliftTests(unittest.TestCase):
+    def read(self, payload):
+        with mock.patch.object(Path, "open", return_value=io.BytesIO(json.dumps(payload).encode())):
+            return status.mac_cranelift_status()
+
+    def test_existing_dashboard_does_not_publish_private_endpoint_or_diagnostics(self):
+        payload = {"verifier_id": "verifier-" + "a" * 32, "sample_time": time.time(),
+                   "host": "192.0.2.10", "error": "private-host.local failed",
+                   "receipt": {"peer_id": "private-peer"}, "compared_through": 100,
+                   "coverage_start": 11, "active_incidents": 0, "qualified": True}
+        result = self.read(payload)
+        self.assertTrue(result["available"])
+        self.assertEqual(result["compared_through"], 100)
+        for private in ("192.0.2.10", "private-host", "private-peer", "receipt", "error"):
+            self.assertNotIn(private, json.dumps(result))
+
+    def test_public_condition_drives_health_without_redundant_flags(self):
+        for condition in ('matching', 'unavailable', 'tree_mismatch', 'chain_disagreement'):
+            result = self.read({'verifier_id': 'verifier-' + 'a' * 32, 'sample_time': time.time(),
+                                'condition': condition, 'comparison_healthy': True,
+                                'ancestor_hashes': {'10': 'b' * 64, 'host': '192.0.2.10'}})
+            self.assertEqual(result['comparison_healthy'], condition == 'matching')
+            self.assertEqual(result['ancestor_hashes'], {'10': 'b' * 64})
+
+    def test_stale_or_malformed_file_never_reports_fresh_status(self):
+        self.assertFalse(self.read({"verifier_id": "verifier-" + "a" * 32,
+                                    "sample_time": time.time() - 1000})["available"])
+        self.assertEqual(self.read({"verifier_id": "192.0.2.10"}), {"available": False})
+        self.assertEqual(self.read(["private-host"]), {"available": False})
+
+    def test_private_mac_is_thirteenth_node_with_detail_and_no_direct_probe(self):
+        collector = status.ClusterCollector([node("node-%02d" % n) for n in range(12)], 10, 300, "mainnet")
+        sample = {"available": True, "verifier_id": "verifier-" + "a" * 32,
+                  "mac_tip": 100, "mac_tip_hash": "b" * 64, "source_sha": "c" * 40,
+                  "comparison_healthy": True,
+                  "compared_through": 90, "pending_alerts": 2, "node_rss_bytes": 1000}
+        with mock.patch.dict(os.environ, {"ZAKURA_MAC_CRANELIFT_STATUS": "1"}), \
+                mock.patch.object(status, "mac_cranelift_status", return_value=sample), \
+                mock.patch.object(status, "probe_node", return_value={}) as probe:
+            collector.poll_once()
+        snapshot = collector.snapshot()
+        self.assertEqual(snapshot["total"], 13)
+        self.assertEqual(probe.call_count, 12)
+        self.assertNotIn("verifiers", snapshot)
+        mac = next(row for row in snapshot["rows"] if row["name"] == "mac-os-cranelift")
+        self.assertEqual(mac["height"], 100)
+        self.assertTrue(mac["healthy"])
+        self.assertEqual(mac["ssh"], "")
+        self.assertEqual(mac["node_id"], sample["verifier_id"])
+        detail = collector.node_snapshot("mac-os-cranelift")
+        self.assertEqual(detail["node"]["host"]["rss_bytes"], 1000)
+        self.assertEqual(len(detail["history"]), 1)
+
+    def test_dashboard_mac_row_reaches_watchdog_fork_and_offline_policies(self):
+        spec = importlib.util.spec_from_file_location(
+            "dashboard_watchdog", SCRIPT_PATH.with_name("zakura-cluster-watchdog.py"))
+        watchdog = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = watchdog
+        spec.loader.exec_module(watchdog)
+        collector = status.ClusterCollector([node()], 10, 300, "mainnet")
+        sample = {"available": True, "mac_tip": 110, "mac_tip_hash": "c" * 64,
+                  "comparison_healthy": True,
+                  "ancestor_hashes": {"10": "a" * 64}}
+        with mock.patch.dict(os.environ, {"ZAKURA_MAC_CRANELIFT_STATUS": "1"}), \
+                mock.patch.object(status, "mac_cranelift_status", return_value=sample), \
+                mock.patch.object(status, "probe_node", return_value={}):
+            collector.poll_once()
+        mac = next(row for row in collector.snapshot()["rows"]
+                   if row["name"] == "mac-os-cranelift")
+        args = argparse.Namespace(down_after=600, dry_run=False)
+        agent = watchdog.Watchdog([], args)
+        sent = []
+        agent.notify = lambda text, args: (sent.append(text), True)[1]
+        others = [dict(mac, name=f"linux-{i}",
+                       ancestor_hashes={"10": "b" * 64}) for i in range(12)]
+        fleet = watchdog.Fleet("mainnet", "http://localhost/data", "https://example.com/")
+        with mock.patch.dict(os.environ, {"ZAKURA_MAC_CRANELIFT_ALERTS_MUTED": "0"}):
+            agent.handle_mac_fork({}, fleet, [mac, *others], time.time(), False)
+        self.assertEqual(len(sent), 1)
+        self.assertIn("mac-os-cranelift", sent[0])
+        self.assertEqual(watchdog.node_condition(dict(mac, health="down"),
+                                               time.time(), 0, args)[2], 180)
+
+    def test_canonical_dashboard_setting_enables_the_node(self):
+        collector = status.ClusterCollector([node()], 10, 300, "mainnet")
+        with mock.patch.dict(os.environ, {"ZAKURA_MAC_CRANELIFT_STATUS": "1"}, clear=True), \
+                mock.patch.object(status, "mac_cranelift_status", return_value={"available": False}), \
+                mock.patch.object(status, "probe_node", return_value={}):
+            collector.poll_once()
+        self.assertEqual(collector.snapshot()["total"], 2)
+
+    def test_private_mac_is_mainnet_only_and_unavailable_sample_is_unhealthy(self):
+        for network, enabled in (("mainnet", True), ("testnet", False)):
+            collector = status.ClusterCollector([node()], 10, 300, network)
+            with mock.patch.dict(os.environ, {"ZAKURA_MAC_CRANELIFT_STATUS": "1"}), \
+                    mock.patch.object(status, "mac_cranelift_status", return_value={"available": False}), \
+                    mock.patch.object(status, "probe_node", return_value={}):
+                collector.poll_once()
+            snapshot = collector.snapshot()
+            self.assertEqual(snapshot["total"], 2 if enabled else 1)
+            if enabled:
+                mac = next(row for row in snapshot["rows"] if row["name"] == "mac-os-cranelift")
+                self.assertFalse(mac["healthy"])
+                self.assertIsNone(mac["height"])
+            self.assertNotIn("verifiers", snapshot)
+
+    def test_advancing_mac_with_failed_comparison_is_not_healthy(self):
+        collector = status.ClusterCollector([node()], 10, 300, "mainnet")
+        sample = {"available": True, "mac_tip": 100, "mac_tip_hash": "b" * 64,
+                  "comparison_healthy": False, "compared_through": 90, "alerts_muted": True}
+        with mock.patch.dict(os.environ, {"ZAKURA_MAC_CRANELIFT_STATUS": "1"}), \
+                mock.patch.object(status, "mac_cranelift_status", return_value=sample), \
+                mock.patch.object(status, "probe_node", return_value={}):
+            collector.poll_once()
+        mac = next(row for row in collector.snapshot()["rows"] if row["name"] == "mac-os-cranelift")
+        self.assertEqual(mac["height"], 100)
+        self.assertFalse(mac["healthy"])
+        self.assertEqual(mac["health"], "verification_error")
+        self.assertIn("Alerts muted", mac["detail"])
+
+    def test_separate_verifier_section_is_removed(self):
+        source = SCRIPT_PATH.read_text()
+        self.assertNotIn('id="verifier-panel"', source)
+        self.assertNotIn("Native macOS consensus verifier</h2>", source)
 
 
 class NodeConfigTests(unittest.TestCase):
@@ -1105,6 +1233,76 @@ class RateLimiterTests(unittest.TestCase):
         self.assertTrue(limiter.allow("client-a", now=11))
 
 
+class AddressPrivacyTests(unittest.TestCase):
+    def test_nested_addresses_and_keys_are_redacted(self):
+        addresses = ["192.0.2.17", "2001:db8::17", "::1", "::ffff:192.0.2.17", "fe80::17%en0"]
+        for address in addresses:
+            with self.subTest(address=address):
+                payload = {address: [{"error": f"connection to [{address}]:8232 failed"}]}
+                encoded = json.dumps(status.redact_private_addresses(payload, {status.address_key(address)}))
+                self.assertNotIn(address, encoded)
+                self.assertIn("[redacted-address]", encoded)
+                self.assertNotIn(address, status.redact_private_addresses(f"peer={address}.", {status.address_key(address)}))
+
+    def test_canonical_mac_address_forms_are_redacted_without_hiding_linux(self):
+        for private, variants in [
+            ("2001:db8::17", ["2001:0db8:0:0:0:0:0:0017", "2001:DB8::17", "2001:db8::17%en0"]),
+            ("192.0.2.17", ["::ffff:192.0.2.17", "::ffff:c000:211", "192.0.2.17"]),
+        ]:
+            for variant in variants:
+                with self.subTest(variant=variant):
+                    value = {variant: [f"peer=[{variant}]:8232; linux=192.0.2.18"]}
+                    result = json.dumps(status.redact_private_addresses(value, {status.address_key(private)}))
+                    self.assertNotIn(variant, result)
+                    self.assertIn("192.0.2.18", result)
+                    self.assertIn("[redacted-address]", result)
+
+    def test_multiple_protected_addresses_in_one_detail_are_removed(self):
+        protected = {status.address_key('2001:db8:1:2:3:4:5:17'), status.address_key('192.0.2.17')}
+        value = 'dead:beef:2001:db8:1:2:3:4:5:17 / peer:::ffff:c000:211 / ::ffff:192.0.2.17:8233'
+        result = status.redact_private_addresses(value, protected)
+        self.assertEqual(result.count('[redacted-address]'), 3)
+        self.assertNotIn('2001:db8:1:2:3:4:5:17', result)
+        self.assertNotIn('192.0.2.17', result)
+
+    def test_private_addresses_in_invalid_outer_tokens_are_redacted(self):
+        for private, variants in [
+            ("192.0.2.17", ["peer:::ffff:192.0.2.17", "::ffff:192.0.2.17:8233",
+                            "peer:::ffff:c000:211", "::ffff:c000:211:8233"]),
+            ("2001:db8::17", ["peer:2001:db8::17", "2001:db8::17:8233",
+                             "face:2001:0db8:0:0:0:0:0:0017"]),
+            ("2001:db8:1:2:3:4:5:17", ["dead:beef:2001:db8:1:2:3:4:5:17",
+                                        "dead:beef:2001:0db8:0001:0002:0003:0004:0005:0017:8233"]),
+        ]:
+            for variant in variants:
+                with self.subTest(variant=variant):
+                    value = {"diagnostic": variant, "linux": "192.0.2.18"}
+                    result = json.dumps(status.redact_private_addresses(value, {status.address_key(private)}))
+                    self.assertNotIn(variant, result)
+                    self.assertIn("[redacted-address]", result)
+                    self.assertIn("192.0.2.18", result)
+
+    def test_missing_or_invalid_config_fails_closed_for_mac_dashboard(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "private.json"
+            with mock.patch.object(status, "PRIVATE_ADDRESS_FILE", path), \
+                    mock.patch.dict(os.environ, {"ZAKURA_MAC_CRANELIFT_STATUS": "1"}):
+                with self.assertRaises(ValueError):
+                    status.private_addresses()
+                for value in [[], {}, ["not an address"], [1]]:
+                    path.write_text(json.dumps(value))
+                    with self.assertRaises(ValueError):
+                        status.private_addresses()
+                path.write_text(json.dumps(["192.0.2.17"]))
+                self.assertEqual(status.private_addresses(), {status.address_key("192.0.2.17")})
+
+    def test_non_address_values_survive(self):
+        payload = {"time": "2026-09-30T11:25:27Z", "version": "1.97.1", "height": 3500000,
+                   "hash": "a" * 64, "bad": "999.999.999.999", "available": True}
+        self.assertEqual(status.redact_private_addresses(payload, {status.address_key("192.0.2.17")}), payload)
+
+
+
 class HttpHandlerTests(unittest.TestCase):
     def setUp(self):
         self.original_collector = status.COLLECTOR
@@ -1130,6 +1328,27 @@ class HttpHandlerTests(unittest.TestCase):
         status.COLLECTOR = self.original_collector
         status.RATE_LIMITER = self.original_limiter
 
+    def test_synthetic_mac_detail_page_and_data_are_available(self):
+        sample = {"available": True, "verifier_id": "verifier-" + "a" * 32,
+                  "mac_tip": 100, "mac_tip_hash": "b" * 64,
+                  "comparison_healthy": True}
+        status.COLLECTOR.network = "mainnet"
+        with mock.patch.dict(os.environ, {"ZAKURA_MAC_CRANELIFT_STATUS": "1"}), \
+                mock.patch.object(status, "mac_cranelift_status", return_value=sample), \
+                mock.patch.object(status, "probe_node", return_value={}):
+            status.COLLECTOR.poll_once()
+        self.assertNotIn("mac-os-cranelift", status.COLLECTOR.nodes_by_name)
+        with urllib.request.urlopen(f"{self.base_url}/node/mac-os-cranelift") as response:
+            self.assertEqual(response.read(), status.PAGE.encode())
+        with urllib.request.urlopen(f"{self.base_url}/data/node/mac-os-cranelift") as response:
+            detail = json.load(response)
+        self.assertEqual(detail["node"]["name"], "mac-os-cranelift")
+        self.assertEqual(detail["node"]["ssh"], "")
+        self.assertTrue(all(value == "" for value in detail["config"].values()))
+        with self.assertRaises(urllib.error.HTTPError) as caught:
+            urllib.request.urlopen(f"{self.base_url}/node/unknown")
+        self.assertEqual(caught.exception.code, 404)
+
     def test_get_status_sets_public_headers(self):
         request = urllib.request.Request(
             f"{self.base_url}/ironwood-status.json",
@@ -1151,6 +1370,86 @@ class HttpHandlerTests(unittest.TestCase):
         self.assertEqual(response.headers["Cache-Control"], "no-store")
         self.assertEqual(response.headers["X-Content-Type-Options"], "nosniff")
         self.assertEqual(payload["network"], "testnet")
+
+    def test_public_response_preserves_linux_but_redacts_mac_in_any_row(self):
+        status.COLLECTOR.rows[0]["ssh"] = "operator@192.0.2.18"
+        status.COLLECTOR.rows[0]["rpc_metadata_error"] = "peer 192.0.2.17 and [2001:db8::17] failed; Linux [2001:db8::18]"
+        protected = {status.address_key(value) for value in ["192.0.2.17", "2001:db8::17"]}
+        with mock.patch.object(status, "private_addresses", return_value=protected):
+            with urllib.request.urlopen(f"{self.base_url}/data") as response:
+                body = response.read().decode()
+        self.assertNotIn("192.0.2.17", body)
+        self.assertNotIn("2001:db8::17", body)
+        self.assertIn("operator@192.0.2.18", body)
+        self.assertIn("2001:db8::18", body)
+        self.assertIn("[redacted-address]", body)
+
+    def test_colon_prefixed_peer_details_do_not_expose_private_addresses(self):
+        status.COLLECTOR.rows[0]["peer_subversions"] = [
+            ["peer:::ffff:192.0.2.17", 1], ["peer:2001:db8::17", 1]]
+        protected = {status.address_key("192.0.2.17"), status.address_key("2001:db8::17")}
+        with mock.patch.object(status, "private_addresses", return_value=protected):
+            with urllib.request.urlopen(f"{self.base_url}/data/node/node-a") as response:
+                body = response.read().decode()
+        self.assertNotIn("192.0.2.17", body)
+        self.assertNotIn("2001:db8::17", body)
+        self.assertIn("[redacted-address]", body)
+
+    def test_private_configuration_failure_never_serves_unfiltered_json(self):
+        status.COLLECTOR.rows[0]["rpc_metadata_error"] = "private 192.0.2.17"
+        with mock.patch.object(status, "private_addresses", side_effect=ValueError("private fixture")):
+            with urllib.request.urlopen(f"{self.base_url}/data") as response:
+                self.assertEqual(response.status, 200)
+                body = response.read().decode()
+            with self.assertRaises(urllib.error.HTTPError) as caught:
+                urllib.request.urlopen(f"{self.base_url}/data/node/node-a")
+        self.assertEqual(caught.exception.code, 503)
+        caught.exception.close()
+        self.assertEqual(json.loads(body)["rows"][0]["height"], 4_201_000)
+        self.assertNotIn("192.0.2.17", body)
+        self.assertNotIn("private fixture", body)
+
+    def test_privacy_failure_keeps_real_http_watchdog_node_alerts_working(self):
+        spec = importlib.util.spec_from_file_location(
+            "degraded_watchdog", SCRIPT_PATH.with_name("zakura-cluster-watchdog.py"))
+        watchdog = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = watchdog
+        spec.loader.exec_module(watchdog)
+        with mock.patch.object(sys, "argv", ["watchdog", "--config", "unused", "--dry-run"]):
+            args = watchdog.parse_args()
+        agent = watchdog.Watchdog([], args)
+        messages = []
+        agent.notify = lambda text, _: (messages.append(text), True)[1]
+        fleet = watchdog.Fleet("mainnet", f"{self.base_url}/data", self.base_url)
+        state = {}
+        status.COLLECTOR.rows[0].update(health="down", detail="private 192.0.2.17")
+        with mock.patch.object(status, "private_addresses", side_effect=OSError("fixture")):
+            for now in (1000, 1600):
+                status.COLLECTOR.last_poll = now
+                agent.observe_fleet(state, fleet, now, False)
+        self.assertEqual(len(messages), 1)
+        self.assertIn("node-a", messages[0])
+        self.assertNotIn("192.0.2.17", messages[0])
+        self.assertTrue(state["nodes"]["mainnet/node-a"]["alerting"])
+        self.assertEqual(state["fleets"]["mainnet"]["condition"], "ok")
+
+    def test_degraded_snapshot_rejects_untyped_and_diagnostic_fields(self):
+        value = {"network": "testnet", "last_poll": 1000, "chain": {"error": "private 192.0.2.17"},
+                 "rows": [{"name": "node-a", "health": "healthy", "height": 100,
+                           "block_hash": "a" * 64, "seconds_since_advanced": 30,
+                           "ancestor_hashes": {"10": "b" * 64, "host": "192.0.2.17"},
+                           "ssh": "192.0.2.17", "detail": "192.0.2.17"},
+                          {"name": "mac-os-cranelift", "health": "private 192.0.2.17",
+                           "height": "192.0.2.17", "block_hash": "192.0.2.17",
+                           "seconds_since_advanced": float("inf")},
+                          {"name": "192.0.2.17", "health": "healthy"}]}
+        result = status.monitoring_snapshot(value, {"node-a", "192.0.2.17"})
+        self.assertNotIn("192.0.2.17", json.dumps(result))
+        self.assertEqual(result["total"], 2)
+        self.assertEqual(result["rows"][0]["ancestor_hashes"], {"10": "b" * 64})
+        self.assertEqual(result["rows"][1]["health"], "down")
+        self.assertNotIn("height", result["rows"][1])
+        self.assertNotIn("seconds_since_advanced", result["rows"][1])
 
     def test_options_returns_204_for_allowed_origin(self):
         request = urllib.request.Request(

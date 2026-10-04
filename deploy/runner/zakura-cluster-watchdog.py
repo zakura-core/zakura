@@ -15,6 +15,8 @@ import json
 import math
 import os
 import sys
+import subprocess
+import signal
 import time
 import tomllib
 import urllib.error
@@ -28,6 +30,7 @@ from typing import Any, Callable
 
 DOWN_HEALTH = {"down", "rpc_error"}
 STATE_VERSION = 1
+MAC_NODE_NAME = "mac-os-cranelift"
 PROPAGATION_GRACE_SECONDS = 120
 MAX_DECISION_HISTORY = 16
 MAX_DECISION_ROWS = 64
@@ -205,6 +208,11 @@ def load_fleets(config_path: Path) -> list[Fleet]:
         raise SystemExit(f"no [[fleets]] defined in {config_path}")
 
     return fleets
+
+
+def node_state_key(fleet_name: str, node_name: str) -> str:
+    """Return the canonical fleet/node incident identity."""
+    return f"{fleet_name}/{node_name}"
 
 
 def load_state(state_path: Path) -> dict[str, Any]:
@@ -475,6 +483,21 @@ def slack_webhook_url() -> str:
     )
 
 
+def mac_recovery_ready(entry, now, good):
+    """Require three distinct fresh good samples spanning a minute."""
+    if not good:
+        entry.pop("mac_recovery", None)
+        return False
+    sample = entry.setdefault("mac_recovery", {"since": now, "last": now, "count": 0})
+    if now - sample["last"] > 90:
+        sample.update(since=now, count=0)
+    if sample["count"] and now <= sample["last"]:
+        return False
+    sample["last"] = now
+    sample["count"] += 1
+    return sample["count"] >= 3 and now - sample["since"] >= 60
+
+
 def post_slack(text: str, args: argparse.Namespace) -> bool:
     text = bounded_slack_message(text)
     webhook = slack_webhook_url()
@@ -533,7 +556,7 @@ def node_condition(
         return ("ok", now, 0)
 
     if health in DOWN_HEALTH:
-        return ("down", now, args.down_after)
+        return ("down", now, 180.0 if row.get("name") == MAC_NODE_NAME else args.down_after)
 
     if (
         seconds_since_advanced is not None
@@ -571,6 +594,21 @@ def tip_is_verifiable(row: dict[str, Any]) -> bool:
         and validated_block_hash(row.get("block_hash")) is not None
         and coerce_float(row.get("seconds_since_advanced")) is not None
     )
+
+
+def ancestor_at(row: dict[str, Any], height: int) -> str | None:
+    """Return a depth-keyed ancestor; None is unsampled, an empty string invalid."""
+    tip = coerce_height(row.get("height"))
+    if tip is None or tip < height:
+        return None
+    distance = tip - height
+    if distance == 0:
+        return validated_block_hash(row.get("block_hash"))
+    ancestors = row.get("ancestor_hashes")
+    value = ancestors.get(str(distance)) if isinstance(ancestors, dict) else None
+    if distance == 1:
+        value = row.get("previous_hash") or value
+    return None if value is None else validated_block_hash(value) or ""
 
 
 def shared_stall_candidate(
@@ -1102,6 +1140,42 @@ def record_decision(
     del history[:-MAX_DECISION_HISTORY]
 
 
+def run_comparison(command):
+    """Bound and reap both the comparison process and its SSH child."""
+    with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                          user="zakura-mac-verifier", start_new_session=True) as process:
+        failure = None
+        try:
+            code = process.wait(timeout=15)
+        except subprocess.TimeoutExpired as error:
+            failure = error
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            code = process.wait()
+        raw = process.stdout.read(4097)
+        try:
+            if len(raw) > 4096:
+                raise ValueError("oversized comparison outcome")
+            outcome = json.loads(raw)
+            if not isinstance(outcome, dict):
+                raise ValueError("malformed comparison outcome")
+        except (ValueError, TypeError):
+            if failure is not None:
+                raise failure
+            raise ValueError("comparison outcome unavailable") from None
+        # A confirmed result emitted before persistence remains actionable even
+        # when a later write fails or the bounded child has to be killed.
+        if outcome.get("condition") == "tree_mismatch":
+            return outcome
+        if failure is not None:
+            raise failure
+        if code:
+            raise subprocess.CalledProcessError(code, command)
+        return outcome
+
+
 class Watchdog:
     def __init__(
         self,
@@ -1147,11 +1221,65 @@ class Watchdog:
         for target in self.release_state:
             self.handle_release_state(state, target, now, suppressed)
 
+        if getattr(self.args, "mac_comparison", None):
+            self.handle_mac_comparison(state, now, suppressed)
+
+    def handle_mac_comparison(self, state, now, suppressed):
+        """One bounded child isolates comparison I/O from the other alert lanes."""
+        started = time.time()
+        condition = "unavailable"
+        muted = not self.args.mac_comparison_alerts
+        command = [sys.executable, str(self.args.mac_comparison),
+                   "--directory", str(self.args.mac_comparison_state),
+                   "--receipt", str(self.args.mac_comparison_receipt),
+                   "--identity", str(self.args.mac_comparison_identity),
+                   "--public-status", str(self.args.mac_comparison_public_status)]
+        if not muted:
+            command.append("--alerts-enabled")
+        try:
+            sample = run_comparison(command)
+            if (not isinstance(sample, dict)
+                    or type(sample.get("sample_time")) not in (int, float)
+                    or not started <= sample["sample_time"] <= time.time() + 10):
+                raise ValueError("stale comparison outcome")
+            if sample.get("condition") in {"matching", "catching_up", "chain_disagreement",
+                                           "tree_mismatch", "coverage_gap", "unavailable"}:
+                condition = sample["condition"]
+        except (OSError, ValueError, TypeError, subprocess.SubprocessError):
+            pass
+        bucket = state.setdefault("mac_comparison", {})
+        entry = bucket.get("mainnet", {})
+        alert_condition = "ok" if condition == "matching" else condition
+        since = entry.get("bad_since", now) if entry.get("condition", "ok") != "ok" else now
+        # All bad reasons belong to one continuous incident. Escalation to a
+        # confirmed mismatch gets its own immediate notification, once accepted.
+        previously_delivered = bool(entry.get("alerting"))
+        mismatch_notified = entry.get("mismatch_notified", entry.get("condition") == "tree_mismatch"
+                                      and entry.get("alerting", False))
+        if alert_condition != "ok":
+            entry["condition"] = alert_condition
+            if condition == "tree_mismatch" and not mismatch_notified:
+                entry["alerting"] = False
+            bucket["mainnet"] = entry
+        update_alert_state(bucket, "mainnet", alert_condition, since,
+                           0 if condition == "tree_mismatch" else 180,
+                           "Zakura compiler comparison: " + condition,
+                           "Zakura compiler comparison recovered: matching blocks and commitment trees",
+                           now, suppressed or muted, self.args,
+                           notify=(lambda *_: False) if suppressed or muted else self.notify)
+        updated = bucket["mainnet"]
+        if updated.get("condition") != "ok":
+            updated["mismatch_notified"] = bool(mismatch_notified or (
+                condition == "tree_mismatch" and updated.get("alerting")))
+            # A failed or muted escalation must retain the earlier delivered
+            # incident so matching still sends the owed recovery.
+            updated["alerting"] = bool(updated.get("alerting") or previously_delivered)
+
     @staticmethod
     def fleet_state(state: dict[str, Any], fleet: Fleet) -> dict[str, Any]:
         """Copy only this fleet's state so delivery cannot overwrite another fleet."""
         result = {}
-        for bucket in ("nodes", "fleets", "shared_stalls", "propagation", "decisions"):
+        for bucket in ("nodes", "fleets", "shared_stalls", "propagation", "decisions", "mac_forks"):
             entries = state.get(bucket, {})
             result[bucket] = copy.deepcopy({
                 key: value for key, value in entries.items()
@@ -1219,6 +1347,9 @@ class Watchdog:
 
         if not self.handle_fleet_recovered(state, fleet, now):
             return
+        if os.environ.get("ZAKURA_MAC_CRANELIFT_ALERTS_MUTED") == "1":
+            node_rows = [row for row in node_rows if row.get("name") != MAC_NODE_NAME]
+        self.handle_mac_fork(state, fleet, node_rows, now, suppressed)
         grace_since = max(
             self.started_at, self.fetch_recovered_at.get(fleet.name, 0)
         )
@@ -1259,6 +1390,64 @@ class Watchdog:
                 and observation.name in (shared_nodes | propagation_nodes),
             )
 
+    def handle_mac_fork(self, state, fleet, rows, now, suppressed):
+        """Alert on proven >10-block divergence against 70% of all other nodes.
+
+        Missing or racing samples cannot prove a fork or clear an existing one.
+        Offline peers remain in the denominator, preventing a reduced quorum.
+        """
+        if os.environ.get("ZAKURA_MAC_CRANELIFT_ALERTS_MUTED") == "1":
+            return
+        if fleet.name != "mainnet":
+            return
+        previous = state.get("mac_forks", {}).get(fleet.name, {})
+        mac = next((row for row in rows if row.get("name") == MAC_NODE_NAME), None)
+        if mac is None or not tip_is_verifiable(mac):
+            mac_recovery_ready(previous, now, False)
+            return
+        tip = coerce_height(mac.get("height"))
+        if tip is None or tip < 10:
+            mac_recovery_ready(previous, now, False)
+            return
+        height = tip - 10
+        block_hash = ancestor_at(mac, height)
+        if not block_hash:
+            mac_recovery_ready(previous, now, False)
+            return
+        others = [row for row in rows if row.get("name") != MAC_NODE_NAME]
+        if not others:
+            mac_recovery_ready(previous, now, False)
+            return
+        groups = {}
+        for row in others:
+            if not tip_is_verifiable(row):
+                continue
+            value = ancestor_at(row, height)
+            if value:
+                groups[value] = groups.get(value, 0) + 1
+        quorum = (7 * len(others) + 9) // 10
+        agreed = next((value for value, count in groups.items() if count >= quorum), None)
+        if agreed is None:
+            previous = state.get("mac_forks", {}).get(fleet.name, {})
+            mac_recovery_ready(previous, now, False)
+            return
+        bucket = state.setdefault("mac_forks", {})
+        previous = bucket.get(fleet.name, {})
+        if previous.get("alerting") and agreed == block_hash:
+            if not mac_recovery_ready(previous, now, True):
+                return
+        elif previous:
+            mac_recovery_ready(previous, now, False)
+        update_alert_state(
+            bucket, fleet.name, "fork" if agreed != block_hash else "ok", now, 0,
+            f":rotating_light: *Zakura mainnet* - `{MAC_NODE_NAME}` forked for more than 10 blocks\n"
+            f"{groups[agreed]}/{len(others)} other nodes agree at height {height}\n"
+            "dashboard: https://status.mainnet.zakura.valargroup.dev/",
+            f":white_check_mark: *Zakura mainnet* - `{MAC_NODE_NAME}` fork recovered\n"
+            "dashboard: https://status.mainnet.zakura.valargroup.dev/",
+            now, suppressed, self.args, tip, notify=self.notify,
+        )
+
     def propagation_grace(
         self, state: dict[str, Any], fleet: Fleet, rows: list[dict[str, Any]], now: float
     ) -> set[str]:
@@ -1295,17 +1484,6 @@ class Watchdog:
             and 0 <= now - last_seen <= PROPAGATION_GRACE_SECONDS
             and height is not None and bool(block_hash)
         )
-
-        def ancestor_at(row: dict[str, Any], ancestor_height: int) -> str | None:
-            distance = coerce_height(row["height"]) - ancestor_height
-            if distance == 0:
-                return validated_block_hash(row["block_hash"])
-            ancestors = row.get("ancestor_hashes")
-            value = ancestors.get(str(distance)) if isinstance(ancestors, dict) else None
-            if distance == 1:
-                value = row.get("previous_hash") or value
-            # Distinguish an unsampled depth from a malformed/conflicting hash.
-            return None if value is None else validated_block_hash(value) or ""
 
         def extension_references(
             anchor_height: int, anchor_hash: str, known: dict[str, Any]
@@ -1369,7 +1547,7 @@ class Watchdog:
         if references is not None:
             for name in previous.get("node_names", []):
                 row = current.get(name)
-                old_alert = state.get("nodes", {}).get(f"{fleet.name}/{name}", {})
+                old_alert = state.get("nodes", {}).get(node_state_key(fleet.name, name), {})
                 if (
                     row and not old_alert.get("alerting")
                     and coerce_height(row["height"]) == height
@@ -1446,6 +1624,9 @@ class Watchdog:
         bad_since: float | None = None,
     ) -> None:
         key = fleet.name
+        if fleet.name == "mainnet":
+            mac_recovery_ready(state.get("nodes", {}).get(node_state_key("mainnet", MAC_NODE_NAME), {}), now, False)
+            mac_recovery_ready(state.get("mac_forks", {}).get("mainnet", {}), now, False)
         bucket = state.setdefault("fleets", {})
         entry = bucket.get(key, {})
         previous_bad_since = coerce_float(entry.get("bad_since"))
@@ -1530,7 +1711,9 @@ class Watchdog:
     ) -> bool:
         bucket = state.setdefault("nodes", {})
         for observation in observations:
-            key = f"{fleet.name}/{observation.name}"
+            if observation.name == MAC_NODE_NAME:
+                continue
+            key = node_state_key(fleet.name, observation.name)
             previous = dict(bucket.get(key, {}))
             if not previous.get("alerting"):
                 continue
@@ -1584,7 +1767,7 @@ class Watchdog:
         bucket = state.setdefault("nodes", {})
         owners = []
         for observation in observations:
-            entry = bucket.get(f"{fleet.name}/{observation.name}", {})
+            entry = bucket.get(node_state_key(fleet.name, observation.name), {})
             alert_height = cls.node_event_height(entry)
             if (
                 entry.get("condition") == "stalled"
@@ -1657,7 +1840,7 @@ class Watchdog:
             )
             if not self.notify(text, self.args):
                 return False
-            bucket[f"{fleet.name}/{duplicate.name}"] = {
+            bucket[node_state_key(fleet.name, duplicate.name)] = {
                 "condition": "ok",
                 "alerting": False,
             }
@@ -1842,9 +2025,17 @@ class Watchdog:
         suppressed: bool,
         coalesced: bool = False,
     ) -> None:
-        key = f"{fleet.name}/{observation.name}"
+        if observation.name == MAC_NODE_NAME and os.environ.get("ZAKURA_MAC_CRANELIFT_ALERTS_MUTED") == "1":
+            return
+        key = node_state_key(fleet.name, observation.name)
         bucket = state.setdefault("nodes", {})
         previous = dict(bucket.get(key, {}))
+        if observation.name == MAC_NODE_NAME and previous.get("alerting"):
+            good = observation.condition == "ok" and tip_is_verifiable(observation.row)
+            ready = mac_recovery_ready(previous, now, good)
+            bucket[key] = previous
+            if observation.condition == "ok" and not ready:
+                return
         previous_height = self.node_event_height(previous)
         same_stall_event = (
             observation.condition == "stalled"
@@ -1954,6 +2145,19 @@ def parse_args() -> argparse.Namespace:
         default=20.0,
         help="Slack webhook request timeout seconds",
     )
+    parser.add_argument("--mac-comparison", type=Path,
+                        default=(Path("/opt/zakura-mac-verifier/comparison.py")
+                                 if os.environ.get("ZAKURA_MAC_CRANELIFT_COMPARISON") == "1" else None))
+    parser.add_argument("--mac-comparison-state", type=Path,
+                        default=Path("/var/lib/zakura-mac-verifier"))
+    parser.add_argument("--mac-comparison-receipt", type=Path,
+                        default=Path("/etc/zakura-mac-verifier/receipt.json"))
+    parser.add_argument("--mac-comparison-identity", type=Path,
+                        default=Path("/etc/zakura-mac-verifier/dashboard.json"))
+    parser.add_argument("--mac-comparison-public-status", type=Path,
+                        default=Path("/var/lib/zakura-mac-cranelift-public/status.json"))
+    parser.add_argument("--mac-comparison-alerts", action="store_true",
+                        default=os.environ.get("ZAKURA_MAC_CRANELIFT_COMPARISON_ALERTS") == "1")
     parser.add_argument("--once", action="store_true", help="poll once, update state, and exit")
     parser.add_argument("--dry-run", action="store_true", help="log Slack messages instead")
     return parser.parse_args()

@@ -62,15 +62,27 @@ impl<C: Constraint> Zec<C> {
 
     /// Converts a `f64` ZEC value to a [`Zec`] amount.
     ///
+    /// This is the exact inverse of [`Zec::lossy_zec`]: every amount that method can produce
+    /// is accepted here and maps back to the amount it came from.
+    ///
     /// This method should not be used for consensus-critical calculations, because it is lossy.
     pub fn from_lossy_zec(lossy_zec: f64) -> Result<Self, BoxError> {
         // This conversion is exact, because f64 has 53 bits of precision, but COIN has <27
         let coin = COIN as f64;
 
-        // After this calculation, we might have lost one bit of precision
+        // Scaling by COIN is inexact in both directions, because COIN is not a power of two:
+        // `lossy_zec` rounds when it divides, and this multiplication rounds again. Demanding
+        // an integral product here would reject values `lossy_zec` itself produced -- a
+        // 14_903_462_499_999 zatoshi balance renders as 149034.62499999, which scales back to
+        // 14903462499998.998.
         let zats = lossy_zec * coin;
 
-        if zats != zats.trunc() {
+        // So round to the nearest zatoshi, then accept only if that amount re-encodes to
+        // exactly the input. Anything else was not the ZEC form of a whole number of
+        // zatoshis, and is still rejected.
+        let zats = zats.round();
+
+        if !zats.is_finite() || zats / coin != lossy_zec {
             return Err(
                 "loss of precision parsing ZEC value: floating point had fractional zatoshis"
                     .into(),
@@ -210,3 +222,114 @@ impl<C1: Constraint, C2: Constraint> PartialEq<Zec<C2>> for Amount<C1> {
 }
 
 impl<C: Constraint> Eq for Zec<C> {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use zakura_chain::amount::{NonNegative, MAX_MONEY};
+
+    /// The lockbox balance that made `getblockchaininfo` unparsable on a NU7 chain.
+    ///
+    /// Before NU7 the lockbox accrues 18_750_000 zatoshi per block, which is 0.1875 ZEC and
+    /// needs only four decimal places, so it always round-tripped. NU7 divides the subsidy by
+    /// three (ZIP 218), making the stream 6_249_999 zatoshi -- 0.06249999 ZEC, eight decimal
+    /// places -- and roughly a third of the resulting balances have no exact `f64` form.
+    const NU7_LOCKBOX_BALANCE: i64 = 14_903_462_499_999;
+
+    #[test]
+    fn lossy_zec_round_trip_accepts_the_value_it_emitted() {
+        let amount = Amount::<NonNegative>::try_from(NU7_LOCKBOX_BALANCE).expect("valid amount");
+        let zec = Zec(amount);
+
+        let encoded = zec.lossy_zec();
+        assert_eq!(encoded, 149_034.624_999_99);
+
+        let decoded = Zec::<NonNegative>::from_lossy_zec(encoded)
+            .expect("a value emitted by lossy_zec must parse back");
+        assert_eq!(decoded.zatoshis(), NU7_LOCKBOX_BALANCE);
+    }
+
+    #[test]
+    fn lossy_zec_round_trips_across_the_money_range() {
+        // Strides chosen to be coprime with powers of ten, so the sweep lands on amounts with
+        // all eight decimal places populated rather than repeatedly hitting round numbers.
+        for stride in [1, 7, 6_249_999, 999_999_937] {
+            for step in 0..10_000 {
+                let zats = (MAX_MONEY / 2).saturating_sub(step * stride);
+                let amount = Amount::<NonNegative>::try_from(zats).expect("valid amount");
+
+                let round_tripped = Zec::<NonNegative>::from_lossy_zec(Zec(amount).lossy_zec())
+                    .expect("every emitted value must parse back")
+                    .zatoshis();
+
+                assert_eq!(round_tripped, zats, "round trip changed {zats} zatoshi");
+            }
+        }
+    }
+
+    #[test]
+    fn lossy_zec_round_trips_at_the_boundaries() {
+        for zats in [0, 1, 2, COIN - 1, COIN, MAX_MONEY - 1, MAX_MONEY] {
+            let amount = Amount::<NonNegative>::try_from(zats).expect("valid amount");
+
+            let round_tripped = Zec::<NonNegative>::from_lossy_zec(Zec(amount).lossy_zec())
+                .expect("every emitted value must parse back")
+                .zatoshis();
+
+            assert_eq!(round_tripped, zats);
+        }
+    }
+
+    #[test]
+    fn rejects_values_that_are_not_whole_zatoshis() {
+        // Half a zatoshi, and a value with more precision than a zatoshi can carry.
+        for lossy in [1.000_000_005_f64, 0.000_000_000_5, 123.456_789_012_3] {
+            assert!(
+                Zec::<NonNegative>::from_lossy_zec(lossy).is_err(),
+                "{lossy} is not a whole number of zatoshis and must be rejected",
+            );
+        }
+    }
+
+    /// Values carrying more precision than a zatoshi are rejected, even when scaling them
+    /// by `COIN` happens to land on an integer.
+    ///
+    /// The previous implementation accepted these, because "the product is integral" is an
+    /// artifact rather than a definition. `13253377.913625069` scales to exactly
+    /// `1325337791362507`, but the canonical rendering of that amount is
+    /// `13253377.91362507`, a different `f64`, so this input was never a whole number of
+    /// zatoshis in the first place.
+    #[test]
+    fn rejects_more_precision_than_a_zatoshi_can_carry() {
+        let over_precise = 13_253_377.913_625_069_f64;
+
+        assert_eq!(over_precise * COIN as f64, 1_325_337_791_362_507.0);
+        assert!(Zec::<NonNegative>::from_lossy_zec(over_precise).is_err());
+
+        // The canonical rendering of that amount is a different f64, and is accepted.
+        let canonical = Zec::<NonNegative>::try_from(1_325_337_791_362_507_i64)
+            .expect("valid amount")
+            .lossy_zec();
+        assert_ne!(canonical, over_precise);
+        assert_eq!(
+            Zec::<NonNegative>::from_lossy_zec(canonical)
+                .expect("canonical renderings parse")
+                .zatoshis(),
+            1_325_337_791_362_507,
+        );
+    }
+
+    #[test]
+    fn rejects_non_finite_values() {
+        for lossy in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(Zec::<NonNegative>::from_lossy_zec(lossy).is_err());
+        }
+    }
+
+    #[test]
+    fn rejects_amounts_outside_the_money_range() {
+        let too_much = (MAX_MONEY as f64 / COIN as f64) * 2.0;
+        assert!(Zec::<NonNegative>::from_lossy_zec(too_much).is_err());
+    }
+}

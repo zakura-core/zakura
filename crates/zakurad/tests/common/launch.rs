@@ -23,10 +23,7 @@ use zakura_test::{
 };
 use zakurad::config::ZakuradConfig;
 
-use crate::common::{
-    config::testdir, lightwalletd::zakura_skip_lightwalletd_tests,
-    sync::FINISH_PARTIAL_SYNC_TIMEOUT, test_type::TestType,
-};
+use crate::common::{config::testdir, test_type::TestType};
 
 /// After we launch `zakurad`, wait this long for the command to start up,
 /// take the actions expected by the tests, and log the expected logs.
@@ -38,24 +35,6 @@ pub const LAUNCH_DELAY: Duration = Duration::from_secs(20);
 /// After we launch `zakurad`, wait this long in extended tests.
 /// See [`LAUNCH_DELAY`] for details.
 pub const EXTENDED_LAUNCH_DELAY: Duration = Duration::from_secs(45);
-
-/// After we launch `lightwalletd`, wait this long for the command to start up,
-/// take the actions expected by the quick tests, and log the expected logs.
-///
-/// `lightwalletd`'s actions also depend on the actions of the `zakurad` instance
-/// it is using for its RPCs.
-pub const LIGHTWALLETD_DELAY: Duration = Duration::from_secs(60);
-
-/// The amount of time we wait for lightwalletd to update to the tip.
-///
-/// `lightwalletd` takes about 60-120 minutes to fully sync,
-/// and `zakurad` can take hours to update to the tip under load.
-pub const LIGHTWALLETD_UPDATE_TIP_DELAY: Duration = FINISH_PARTIAL_SYNC_TIMEOUT;
-
-/// The amount of time we wait for lightwalletd to do a full sync to the tip.
-///
-/// See [`LIGHTWALLETD_UPDATE_TIP_DELAY`] for details.
-pub const LIGHTWALLETD_FULL_SYNC_TIP_DELAY: Duration = FINISH_PARTIAL_SYNC_TIMEOUT;
 
 /// Extension trait for methods on `tempfile::TempDir` for using it as a test
 /// directory for `zakurad`.
@@ -200,7 +179,7 @@ where
     }
 }
 
-/// Spawns a zakurad instance on `network` to test lightwalletd with `test_type`.
+/// Spawns a zakurad instance on `network` for an acceptance test with `test_type`.
 ///
 /// See [`spawn_zakurad_for_rpc_with_opts`] for more details.
 #[tracing::instrument]
@@ -213,7 +192,7 @@ pub fn spawn_zakurad_for_rpc<S: AsRef<str> + Debug>(
     spawn_zakurad_for_rpc_with_opts(network, test_name, test_type, use_internet_connection, true)
 }
 
-/// Spawns a zakurad instance on `network` to test lightwalletd with `test_type`.
+/// Spawns a zakurad instance on `network` for an acceptance test with `test_type`.
 ///
 /// If `use_internet_connection` is `false` then spawn, but without any peers.
 /// This prevents it from downloading blocks. Instead, set `ZAKURA_STATE__CACHE_DIR`
@@ -263,7 +242,7 @@ pub fn spawn_zakurad_for_rpc_with_opts<S: AsRef<str> + Debug>(
     Ok(Some((zakurad, config.rpc.listen_addr)))
 }
 
-/// Spawns a zakurad instance on `network` without RPCs or `lightwalletd`.
+/// Spawns a zakurad instance on `network` without RPCs.
 ///
 /// If `use_cached_state` is `true`, then update the cached state to the tip.
 /// If `ephemeral` is `true`, then use an ephemeral state path.
@@ -303,12 +282,7 @@ where
     let (test_type, replace_cache_dir) = if use_cached_state {
         (UpdateZebraCachedStateNoRpc, None)
     } else if ephemeral {
-        (
-            LaunchWithEmptyState {
-                launches_lightwalletd: false,
-            },
-            None,
-        )
+        (LaunchWithEmptyState, None)
     } else {
         (UseAnyState, Some(testdir.path()))
     };
@@ -350,13 +324,6 @@ pub fn can_spawn_zakurad_for_test_type<S: AsRef<str> + Debug>(
     use_internet_connection: bool,
 ) -> bool {
     if use_internet_connection && zakura_test::net::zebra_skip_network_tests() {
-        return false;
-    }
-
-    // Skip the test unless the user specifically asked for it
-    //
-    // TODO: pass test_type to zakura_skip_lightwalletd_tests() and check for lightwalletd launch in there
-    if test_type.launches_lightwalletd() && zakura_skip_lightwalletd_tests() {
         return false;
     }
 

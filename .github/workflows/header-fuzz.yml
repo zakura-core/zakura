@@ -88,7 +88,8 @@ jobs:
           if [ "${SCHEDULE}" = "13 5 * * 0" ]; then
             seconds="${WEEKLY_SECONDS}"
           fi
-          cargo fuzz run "${TARGET}" -- \
+          # cargo-fuzz otherwise looks for `fuzz/` under the workspace root.
+          cargo fuzz run --fuzz-dir . "${TARGET}" -- \
             -max_total_time="${seconds}" \
             -rss_limit_mb="${RSS_MB}" \
             -max_len="${MAX_LEN}" \

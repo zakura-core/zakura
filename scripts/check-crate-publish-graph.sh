@@ -35,6 +35,13 @@
 # time) or, for a GitHub-only release candidate, by using the override
 # below.
 #
+# It also sizes each workspace version against the index: a version more
+# than one release step (patch/minor/major) above the crate's newest stable
+# release means two bumps stacked in one publish cycle — the semver-checks
+# gate is satisfied by the first bump and cannot see the second, and the
+# skipped number becomes permanent once published. Override a deliberate
+# skip with ZAKURA_ALLOW_OVERSIZED_VERSION_BUMP=1.
+#
 # Requires network access (sparse index queries plus a registry-backed
 # dry-run publish). No crates.io token is needed; nothing is uploaded.
 #
@@ -98,6 +105,51 @@ EOF
   exit 1
 }
 
+allow_oversized="${ZAKURA_ALLOW_OVERSIZED_VERSION_BUMP:-0}"
+oversized=0
+
+# version_le A B — 0 when stable version A <= B (both bare x.y.z).
+version_le() {
+  local a_major a_minor a_patch b_major b_minor b_patch
+  IFS=. read -r a_major a_minor a_patch <<<"$1"
+  IFS=. read -r b_major b_minor b_patch <<<"$2"
+  if [ "$a_major" -ne "$b_major" ]; then [ "$a_major" -lt "$b_major" ]; return; fi
+  if [ "$a_minor" -ne "$b_minor" ]; then [ "$a_minor" -lt "$b_minor" ]; return; fi
+  [ "$a_patch" -le "$b_patch" ]
+}
+
+# check_version_level CRATE VERSION — flag a workspace version more than one
+# release step above the crate's newest stable release (yanked numbers stay
+# taken, so they count). Semver-checks passes once one bump covers a cycle's
+# changes, so nothing else notices a second bump stacked in the same cycle
+# (7.0.0 -> 8.0.0 -> 9.0.0 with no publish in between) until the skipped
+# number is burned by a publish. Versions at or below the newest stable
+# pass: equality is the publish-time skip, and an older release line's
+# hotfix branch legitimately trails the index.
+check_version_level() {
+  local crate="$1" version="$2" base versions latest="" v major minor patch
+  base="${version%%[-+]*}"
+  versions="$(crates_index_versions "$crate")" || {
+    echo "ERROR: could not query the crates.io index for ${crate}." >&2
+    exit 1
+  }
+  while IFS= read -r v; do
+    case "$v" in *-* | '') continue ;; esac
+    v="${v%%+*}"
+    if [ -z "$latest" ] || version_le "$latest" "$v"; then latest="$v"; fi
+  done <<<"$versions"
+  # No stable release yet: nothing to size the bump against.
+  [ -n "$latest" ] || return 0
+  if version_le "$base" "$latest"; then return 0; fi
+  IFS=. read -r major minor patch <<<"$latest"
+  case "$base" in
+    "$((major + 1)).0.0" | "${major}.$((minor + 1)).0" | "${major}.${minor}.$((patch + 1))") return 0 ;;
+  esac
+  printf 'ERROR: %s is at %s, more than one release step above its newest stable release %s; collapse the pending bumps into a single step\n' \
+    "$crate" "$version" "$latest" >&2
+  oversized=1
+}
+
 metadata="$(cargo metadata --format-version 1 --no-deps)"
 
 # `publish` is null for publishable crates and `[]` for `publish = false`.
@@ -132,6 +184,7 @@ unreserved=0
 echo "Crates.io publish set (exact workspace versions absent from the index):"
 while IFS=$'\t' read -r crate version; do
   [ -n "$crate" ] || continue
+  check_version_level "$crate" "$version"
   rc=0
   crates_index_has_version "$crate" "$version" || rc=$?
   case "$rc" in
@@ -180,6 +233,28 @@ while IFS=$'\t' read -r crate version; do
 done <<<"$publishable"
 
 echo
+if [ "$oversized" -ne 0 ]; then
+  cat >&2 <<'EOF'
+ERROR: a workspace crate skips version numbers that were never published.
+
+The Semver checks gate compares against the newest stable release, so once
+one bump covers a cycle's changes, later changes in the same cycle need no
+further bump — raise the pending bump's level instead of stacking another
+one (docs/changelog/guidelines.md). A publish makes the skipped numbers
+permanent, so this fails before they burn.
+
+For a deliberate skip, export ZAKURA_ALLOW_OVERSIZED_VERSION_BUMP=1 and
+say why in the PR.
+EOF
+  if [ "$allow_oversized" = 1 ]; then
+    echo >&2
+    echo "WARNING: ZAKURA_ALLOW_OVERSIZED_VERSION_BUMP=1 — continuing despite oversized version bumps." >&2
+  else
+    exit 1
+  fi
+  echo
+fi
+
 if [ "${#publish_set[@]}" -eq 0 ]; then
   echo "Every publishable crate is already on the index; nothing to publish, graph check passes."
   exit 0

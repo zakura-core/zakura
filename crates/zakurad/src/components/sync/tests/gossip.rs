@@ -9,30 +9,47 @@ use tower::{builder::ServiceBuilder, util::BoxService, Service, ServiceExt};
 use tracing::Instrument;
 
 use zakura_chain::{
-    block::{Block, Height},
+    block::{self, Block, Height},
     fmt::humantime_seconds,
     parameters::Network::Mainnet,
     serialization::ZcashDeserializeInto,
 };
 use zakura_network::{Request, Response};
-use zakura_rpc::{MinedBlockEvent, SubmitBlockChannel};
-use zakura_state::{Config as StateConfig, CHAIN_TIP_UPDATE_WAIT_LIMIT};
+use zakura_rpc::{MinedBlockEvent, MinedBlockSubmission, SubmitBlockChannel};
+use zakura_state::{
+    ChainTipChange, ChainTipSender, CheckpointVerifiedBlock, Config as StateConfig,
+    CHAIN_TIP_UPDATE_WAIT_LIMIT,
+};
 use zakura_test::mock_service::{MockService, PanicAssertion};
 
-use crate::components::sync::{
-    self, BlockGossipError, SyncStatus, PEER_GOSSIP_DELAY, TIPS_RESPONSE_TIMEOUT,
-};
+use crate::components::sync::{self, BlockGossipError, SyncStatus, TIPS_RESPONSE_TIMEOUT};
 
 const MAX_PEER_SET_REQUEST_DELAY: Duration = Duration::from_secs(30);
 
 struct GossipTestSetup {
     peer_set: MockService<Request, Response, PanicAssertion>,
     submitblock_sender: tokio::sync::mpsc::UnboundedSender<MinedBlockEvent>,
-    state_service: BoxService<zakura_state::Request, zakura_state::Response, crate::BoxError>,
     gossip_task_handle: JoinHandle<Result<(), BlockGossipError>>,
 }
 
-async fn setup_gossip_test() -> GossipTestSetup {
+// Paused time must not race the state's OS writer thread. Mocked gossip scenarios
+// publish tips synchronously through the same channel the writer uses.
+async fn setup_gossip_test() -> (ChainTipSender, GossipTestSetup) {
+    let _init_guard = zakura_test::init();
+    let block_one: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
+        .zcash_deserialize_into()
+        .unwrap();
+    let tip = CheckpointVerifiedBlock::from(block_one.clone()).into();
+    let (chain_tip_sender, _latest_chain_tip, chain_tip_change) =
+        ChainTipSender::new(Some(tip), &Mainnet);
+    let setup = start_gossip_test(chain_tip_change, block_one.hash()).await;
+    (chain_tip_sender, setup)
+}
+
+async fn setup_state_gossip_test() -> (
+    BoxService<zakura_state::Request, zakura_state::Response, crate::BoxError>,
+    GossipTestSetup,
+) {
     let _init_guard = zakura_test::init();
 
     let network = Mainnet;
@@ -81,6 +98,14 @@ async fn setup_gossip_test() -> GossipTestSetup {
         .await
         .unwrap();
 
+    let setup = start_gossip_test(chain_tip_change, block_one.hash()).await;
+    (BoxService::new(state_service), setup)
+}
+
+async fn start_gossip_test(
+    chain_tip_change: ChainTipChange,
+    initial_tip_hash: block::Hash,
+) -> GossipTestSetup {
     let (sync_status, mut recent_syncs) = SyncStatus::new();
     SyncStatus::sync_close_to_tip(&mut recent_syncs);
 
@@ -100,17 +125,15 @@ async fn setup_gossip_test() -> GossipTestSetup {
         .in_current_span(),
     );
 
-    // The genesis block gossip is skipped because block 1 is committed before the task starts.
-    tokio::time::sleep(PEER_GOSSIP_DELAY).await;
+    // Block 1 is the initial tip when the task starts.
     peer_set
-        .expect_request(Request::AdvertiseBlock(block_one.hash(), None))
+        .expect_request(Request::AdvertiseBlock(initial_tip_hash, None))
         .await
         .respond(Response::Nil);
 
     GossipTestSetup {
         peer_set,
         submitblock_sender,
-        state_service: BoxService::new(state_service),
         gossip_task_handle,
     }
 }
@@ -119,26 +142,22 @@ async fn setup_gossip_test() -> GossipTestSetup {
 /// send a duplicate committed-tip gossip for the same hash.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn mined_block_marks_tip_after_successful_broadcast() {
-    let GossipTestSetup {
-        mut peer_set,
-        submitblock_sender,
-        mut state_service,
-        gossip_task_handle: _gossip_task_handle,
-    } = setup_gossip_test().await;
+    let (
+        mut chain_tip_sender,
+        GossipTestSetup {
+            mut peer_set,
+            submitblock_sender,
+            gossip_task_handle: _gossip_task_handle,
+        },
+    ) = setup_gossip_test().await;
 
     let block_two: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_2_BYTES
         .zcash_deserialize_into()
         .unwrap();
 
-    state_service
-        .ready()
-        .await
-        .unwrap()
-        .call(zakura_state::Request::CommitCheckpointVerifiedBlock(
-            block_two.clone().into(),
-        ))
-        .await
-        .unwrap();
+    chain_tip_sender.set_finalized_tip(Some(
+        CheckpointVerifiedBlock::from(block_two.clone()).into(),
+    ));
 
     submitblock_sender
         .send(MinedBlockEvent::Committed {
@@ -153,11 +172,7 @@ async fn mined_block_marks_tip_after_successful_broadcast() {
         .await
         .respond(Response::Nil);
 
-    // Allow the spawned broadcast task to send the mark notification.
-    tokio::time::sleep(Duration::from_millis(200)).await;
-
     // The committed tip gossip path should not advertise the same hash again.
-    tokio::time::sleep(PEER_GOSSIP_DELAY).await;
     peer_set.expect_no_requests().await;
 }
 
@@ -165,12 +180,14 @@ async fn mined_block_marks_tip_after_successful_broadcast() {
 /// even when another mined-block notification is already queued.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn mined_block_mark_survives_pending_submit_queue() {
-    let GossipTestSetup {
-        mut peer_set,
-        submitblock_sender,
-        mut state_service,
-        gossip_task_handle: _gossip_task_handle,
-    } = setup_gossip_test().await;
+    let (
+        mut chain_tip_sender,
+        GossipTestSetup {
+            mut peer_set,
+            submitblock_sender,
+            gossip_task_handle: _gossip_task_handle,
+        },
+    ) = setup_gossip_test().await;
 
     let block_two: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_2_BYTES
         .zcash_deserialize_into()
@@ -178,15 +195,9 @@ async fn mined_block_mark_survives_pending_submit_queue() {
     let height = block_two.coinbase_height().unwrap();
     let hash = block_two.hash();
 
-    state_service
-        .ready()
-        .await
-        .unwrap()
-        .call(zakura_state::Request::CommitCheckpointVerifiedBlock(
-            block_two.clone().into(),
-        ))
-        .await
-        .unwrap();
+    chain_tip_sender.set_finalized_tip(Some(
+        CheckpointVerifiedBlock::from(block_two.clone()).into(),
+    ));
 
     // First mined notification — start AdvertiseBlockToAll but hold the response open.
     submitblock_sender
@@ -219,12 +230,8 @@ async fn mined_block_mark_survives_pending_submit_queue() {
         .await
         .respond(Response::Nil);
 
-    // Allow spawned broadcast tasks to deliver marks.
-    tokio::time::sleep(Duration::from_millis(200)).await;
-
     // Without unconditional marking, the first mark would be dropped while the queue was
     // nonempty and the committed-tip path could still AdvertiseBlock(hash).
-    tokio::time::sleep(PEER_GOSSIP_DELAY).await;
     peer_set.expect_no_requests().await;
 }
 
@@ -232,26 +239,22 @@ async fn mined_block_mark_survives_pending_submit_queue() {
 /// hash as a fallback.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn mined_block_broadcast_timeout_uses_committed_tip_fallback() {
-    let GossipTestSetup {
-        mut peer_set,
-        submitblock_sender,
-        mut state_service,
-        gossip_task_handle: _gossip_task_handle,
-    } = setup_gossip_test().await;
+    let (
+        mut chain_tip_sender,
+        GossipTestSetup {
+            mut peer_set,
+            submitblock_sender,
+            gossip_task_handle: _gossip_task_handle,
+        },
+    ) = setup_gossip_test().await;
 
     let block_two: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_2_BYTES
         .zcash_deserialize_into()
         .unwrap();
 
-    state_service
-        .ready()
-        .await
-        .unwrap()
-        .call(zakura_state::Request::CommitCheckpointVerifiedBlock(
-            block_two.clone().into(),
-        ))
-        .await
-        .unwrap();
+    chain_tip_sender.set_finalized_tip(Some(
+        CheckpointVerifiedBlock::from(block_two.clone()).into(),
+    ));
 
     submitblock_sender
         .send(MinedBlockEvent::Committed {
@@ -270,9 +273,205 @@ async fn mined_block_broadcast_timeout_uses_committed_tip_fallback() {
     drop(slow_broadcast);
 
     // The committed tip gossip path should advertise the same hash as a fallback.
-    tokio::time::sleep(PEER_GOSSIP_DELAY).await;
     peer_set
         .expect_request(Request::AdvertiseBlock(block_two.hash(), None))
+        .await
+        .respond(Response::Nil);
+}
+
+/// A successful early broadcast suppresses the committed broadcasts of the same hash.
+///
+/// The RPC registers an admitted block's body before it sends the early event, so peers that
+/// follow the early inventory receive the body while the commit continues. The RPC then reports
+/// `early_advertised: true`, and neither the mined-block path nor the committed-tip path
+/// advertises the hash again.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn successful_early_broadcast_suppresses_committed_broadcasts() {
+    let (
+        mut chain_tip_sender,
+        GossipTestSetup {
+            mut peer_set,
+            submitblock_sender,
+            gossip_task_handle: _gossip_task_handle,
+        },
+    ) = setup_gossip_test().await;
+
+    let block_two: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_2_BYTES
+        .zcash_deserialize_into()
+        .unwrap();
+    let hash = block_two.hash();
+    let height = block_two.coinbase_height().unwrap();
+
+    let (advertised, advertised_receiver) = tokio::sync::oneshot::channel();
+    submitblock_sender
+        .send(MinedBlockEvent::Early {
+            hash,
+            height,
+            submitted_at: tokio::time::Instant::now().into_std(),
+            submission: MinedBlockSubmission::CompactHeader,
+            advertised,
+        })
+        .expect("the early mined block notification is accepted");
+
+    peer_set
+        .expect_request(Request::AdvertiseBlockToAll(hash))
+        .await
+        .respond(Response::Nil);
+    assert!(
+        advertised_receiver
+            .await
+            .expect("the gossip task reports the early broadcast"),
+        "the early broadcast succeeded"
+    );
+
+    chain_tip_sender.set_finalized_tip(Some(
+        CheckpointVerifiedBlock::from(block_two.clone()).into(),
+    ));
+    submitblock_sender
+        .send(MinedBlockEvent::Committed {
+            hash,
+            height,
+            early_advertised: true,
+        })
+        .expect("the committed mined block notification is accepted");
+
+    peer_set.expect_no_requests().await;
+}
+
+/// Consecutive committed blocks are gossiped as soon as they commit, with no delay between them.
+///
+/// This test uses real time: with a paused clock, the state commit auto-advances time by minutes,
+/// which would hide a gossip delay.
+#[tokio::test(flavor = "current_thread")]
+async fn consecutive_committed_blocks_are_gossiped_without_delay() {
+    /// Well below the removed 7 second delay, and far above the expected latency.
+    const MAX_GOSSIP_LATENCY: Duration = Duration::from_secs(3);
+
+    let (
+        mut state_service,
+        GossipTestSetup {
+            mut peer_set,
+            submitblock_sender: _submitblock_sender,
+            gossip_task_handle: _gossip_task_handle,
+        },
+    ) = setup_state_gossip_test().await;
+
+    for block_bytes in [
+        &*zakura_test::vectors::BLOCK_MAINNET_2_BYTES,
+        &*zakura_test::vectors::BLOCK_MAINNET_3_BYTES,
+    ] {
+        let block: Arc<Block> = block_bytes.zcash_deserialize_into().unwrap();
+
+        state_service
+            .ready()
+            .await
+            .unwrap()
+            .call(zakura_state::Request::CommitCheckpointVerifiedBlock(
+                block.clone().into(),
+            ))
+            .await
+            .unwrap();
+        let committed_at = tokio::time::Instant::now();
+
+        peer_set
+            .expect_request(Request::AdvertiseBlock(block.hash(), None))
+            .await
+            .respond(Response::Nil);
+
+        assert!(
+            committed_at.elapsed() < MAX_GOSSIP_LATENCY,
+            "block gossip waited {:?} after the commit",
+            committed_at.elapsed(),
+        );
+    }
+}
+
+/// While a mined block broadcast is in flight, the committed-tip path does not advertise the same
+/// hash.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn in_flight_mined_block_broadcast_suppresses_committed_tip_gossip() {
+    let (
+        mut chain_tip_sender,
+        GossipTestSetup {
+            mut peer_set,
+            submitblock_sender,
+            gossip_task_handle: _gossip_task_handle,
+        },
+    ) = setup_gossip_test().await;
+
+    let block_two: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_2_BYTES
+        .zcash_deserialize_into()
+        .unwrap();
+
+    chain_tip_sender.set_finalized_tip(Some(
+        CheckpointVerifiedBlock::from(block_two.clone()).into(),
+    ));
+
+    submitblock_sender
+        .send(MinedBlockEvent::Committed {
+            hash: block_two.hash(),
+            height: block_two.coinbase_height().unwrap(),
+            early_advertised: false,
+        })
+        .expect("mined block notification should be accepted");
+
+    let in_flight_broadcast = peer_set
+        .expect_request(Request::AdvertiseBlockToAll(block_two.hash()))
+        .await;
+
+    // Hold the broadcast open for less than its timeout, so it is still in flight when the
+    // committed-tip path sees the tip change.
+    tokio::time::sleep(TIPS_RESPONSE_TIMEOUT / 2).await;
+    in_flight_broadcast.respond(Response::Nil);
+
+    peer_set.expect_no_requests().await;
+}
+
+/// Checkpoint commits acknowledge before publishing the tip, unlike non-finalized commits.
+/// A mined broadcast that is still in flight must suppress that later notification.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn in_flight_mined_block_broadcast_handles_delayed_tip_notification() {
+    let (
+        mut chain_tip_sender,
+        GossipTestSetup {
+            mut peer_set,
+            submitblock_sender,
+            gossip_task_handle: _gossip_task_handle,
+        },
+    ) = setup_gossip_test().await;
+
+    let block_two: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_2_BYTES
+        .zcash_deserialize_into()
+        .unwrap();
+    let hash = block_two.hash();
+
+    submitblock_sender
+        .send(MinedBlockEvent::Committed {
+            hash,
+            height: block_two.coinbase_height().unwrap(),
+            early_advertised: false,
+        })
+        .expect("mined block notification should be accepted");
+    let in_flight_broadcast = peer_set
+        .expect_request(Request::AdvertiseBlockToAll(hash))
+        .await;
+
+    // Publish the tip only after the mined notification has started its broadcast.
+    chain_tip_sender.set_finalized_tip(Some(CheckpointVerifiedBlock::from(block_two).into()));
+    tokio::time::sleep(TIPS_RESPONSE_TIMEOUT / 2).await;
+    in_flight_broadcast.respond(Response::Nil);
+
+    peer_set.expect_no_requests().await;
+
+    // A dead gossip task would also send no duplicate. Require it to relay the next tip.
+    let block_three: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_3_BYTES
+        .zcash_deserialize_into()
+        .unwrap();
+    chain_tip_sender.set_finalized_tip(Some(
+        CheckpointVerifiedBlock::from(block_three.clone()).into(),
+    ));
+    peer_set
+        .expect_request(Request::AdvertiseBlock(block_three.hash(), None))
         .await
         .respond(Response::Nil);
 }

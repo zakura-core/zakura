@@ -447,9 +447,15 @@ fn atomic_finality_context_can_use_a_newly_staged_anchor_path() {
         .initialize(metadata, anchor.clone())
         .expect("the empty schema initializes");
 
+    // Stage one node past the retained predecessor span, so the context cap
+    // binds whatever difficulty averaging window this build uses.
+    let predecessor_span = zakura_header_chain::MAX_POW_PREDECESSOR_CONTEXT_SPAN;
+    let staged_len =
+        u32::try_from(predecessor_span + 1).expect("the retained predecessor span fits in u32");
+
     let mut nodes = Vec::new();
     let mut parent = anchor;
-    for height in 1..=28 {
+    for height in 1..=staged_len {
         let mut header = *parent.header;
         header.previous_block_hash = parent.hash;
         header.time += chrono::Duration::seconds(1);
@@ -478,14 +484,14 @@ fn atomic_finality_context_can_use_a_newly_staged_anchor_path() {
     let staged: HashMap<_, _> = nodes.iter().map(|node| (node.hash, node)).collect();
     let contexts = authenticated_context_headers(&store, parent.hash, Some(&staged))
         .expect("the atomic batch can authenticate context from its staged node overlay");
-    assert_eq!(contexts.len(), 27);
+    assert_eq!(contexts.len(), predecessor_span);
     assert_eq!(
         contexts.first().map(|context| context.height),
         Some(block::Height(1))
     );
     assert_eq!(
         contexts.last().map(|context| context.height),
-        Some(block::Height(27))
+        Some(block::Height(staged_len - 1))
     );
     assert_eq!(
         parent.header.previous_block_hash,
@@ -567,6 +573,80 @@ fn body_refill_snapshot_holds_the_complete_transition_barrier() {
 
     assert_eq!(full_state, Frontier::new(anchor.height, anchor.hash));
     assert_eq!(selected_projection, vec![full_state]);
+}
+
+#[test]
+fn body_refill_does_not_attach_committed_sizes_to_another_fork() {
+    use crate::arbitrary::Prepare;
+    use crate::tests::setup::{new_state_with_mainnet_genesis, transaction_v4_from_coinbase};
+    use zakura_chain::serialization::ZcashSerialize;
+
+    let _init_guard = zakura_test::init();
+    let (engine_config, anchor, metadata) = mainnet_fixture();
+    let (finalized, mut full_state, _) = new_state_with_mainnet_genesis();
+    let store = HeaderChainStore::new(finalized.db.header_chain_disk_db());
+    store
+        .initialize(metadata, anchor.clone())
+        .expect("header schema initializes");
+
+    let mut old: block::Block = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
+        .zcash_deserialize_into()
+        .expect("height one parses");
+    let selected_header = old.header.clone();
+    let mut old_header = *old.header;
+    old_header.nonce.0[0] ^= 1;
+    old.header = Arc::new(old_header);
+    // The state fixture requires a modern coinbase transaction version.
+    old.transactions[0] = transaction_v4_from_coinbase(&old.transactions[0]).into();
+    let old = Arc::new(old);
+    full_state
+        .commit_new_chain(old.clone().prepare(), &finalized)
+        .expect("old branch commits");
+
+    let selected_hash = selected_header.hash();
+    let (runtime, _) = store
+        .startup_reconciled(
+            &engine_config,
+            Frontier::new(anchor.height, anchor.hash),
+            Vec::new(),
+            vec![VerifiedHeaderRef {
+                height: block::Height(1),
+                hash: selected_hash,
+                header: selected_header,
+            }],
+        )
+        .expect("selected fork restores");
+
+    let old_size = u32::try_from(
+        old.zcash_serialize_to_vec()
+            .expect("old block serializes")
+            .len(),
+    )
+    .expect("test block size fits u32");
+    assert_eq!(
+        crate::service::read::block_info(
+            full_state.best_chain(),
+            &finalized.db,
+            old.hash().into(),
+        )
+        .map(|info| info.size()),
+        Some(old_size),
+        "the old branch has a confirmed size at the same height",
+    );
+    let metadata = crate::service::missing_block_body_metadata(
+        || full_state.best_chain(),
+        &finalized.db,
+        Some(&runtime.reader()),
+        block::Height(2),
+        10,
+    )
+    .expect("fork refill metadata reads");
+    assert_eq!(metadata.anchor, Frontier::new(anchor.height, anchor.hash));
+    assert_eq!(
+        metadata.blocks,
+        vec![(block::Height(1), selected_hash, None)],
+        "a selected fork must not inherit the other block's confirmed size"
+    );
 }
 
 #[test]
@@ -2077,6 +2157,164 @@ async fn retained_path_serves_a_bounded_finalized_range_below_the_header_frontie
 }
 
 #[test]
+fn body_size_hints_by_hash_read_known_sizes_from_retained_deliveries() {
+    let (runtime, db, _genesis, path) = reconciled_store_with_finalized_prefix(5);
+    let parent = Frontier::new(path[2].height, path[2].hash);
+    let target = Frontier::new(path[3].height, path[3].hash);
+    let successor = Frontier::new(path[4].height, path[4].hash);
+    let snapshot = runtime.publisher().snapshot();
+    let owner = zakura_header_chain::BodyWorkAuthority::for_snapshot(&snapshot)
+        .bind(27, NonZeroU64::new(28).expect("twenty-eight is nonzero"));
+    let range = runtime
+        .reader()
+        .vct_repair_context(owner, target.height)
+        .expect("the range repair context is coherent")
+        .expect("the selected empty range needs repair");
+    let prefix = range
+        .bounded_prefix(1)
+        .expect("the one-header range prefix exists");
+    let lease = runtime
+        .reader()
+        .validation_context(parent.hash)
+        .expect("the repair parent validation context is coherent")
+        .expect("the repair parent remains retained");
+    let rules =
+        HeaderRules::for_validation_lease(&lease).expect("the repair parent produces header rules");
+    let batch = zakura_header_chain::prepare_headers(
+        HeaderBatchInput::new(std::slice::from_ref(&path[3].header)),
+        parent,
+        &rules,
+        &SystemClock,
+    )
+    .expect("the selected prefix passes deterministic preparation");
+    let source = SourceId::from_digest([0xc1; 32]);
+    let known_size = std::num::NonZeroU32::new(123_456).expect("the fixture size is nonzero");
+    let request = TransitionRequest {
+        expected_version: StateVersion::default(),
+        event: TransitionEvent::InsertHeaders(Box::new(InsertHeaders {
+            owner: owner.into(),
+            source,
+            parent_hash: parent.hash,
+            target_tip_hash: target.hash,
+            completion: TargetCompletion::SelectedAuxiliaryRepair {
+                common_ancestor: parent,
+                selected_target: target,
+                episode: prefix.episode,
+            },
+            batch,
+            aux: vec![AuxDelivery::new(
+                EvidenceId::from_digest([0xc2; 32]),
+                target.hash,
+                source,
+                owner.into(),
+                zakura_header_chain::BodySizeHint::Unknown,
+                Some(zakura_header_chain::TreeAuxRecordV1 {
+                    height: target.height,
+                    sapling_root: Default::default(),
+                    orchard_root: Default::default(),
+                    ironwood_root: Default::default(),
+                    sapling_tx_count: 1,
+                    orchard_tx_count: 0,
+                    ironwood_tx_count: 0,
+                    auth_data_root: [0xc3; 32].into(),
+                }),
+            )],
+        })),
+    };
+    let original_request = request.clone();
+    let context = TransitionContext {
+        config: &runtime.config,
+        clock: &SystemClock,
+        full_state_authority: None,
+        retention_references: &[],
+    };
+    assert!(matches!(
+        runtime
+            .apply(request, &context)
+            .expect("the one-header range prefix applies"),
+        ApplyResult::Committed
+    ));
+
+    let hints_by_hash = || {
+        runtime
+            .reader()
+            .body_size_hints_by_hash(&[parent.hash, target.hash, successor.hash])
+            .expect("the delivery hints read")
+    };
+    assert_eq!(hints_by_hash(), vec![None, None, None]);
+    assert!(runtime
+        .store
+        .scan_raw(HEADER_AUX_BODY_SIZE)
+        .unwrap()
+        .is_empty());
+    let replay = |request_id, marker, size| {
+        let view = runtime.publisher().view();
+        let mut replay = original_request.clone();
+        replay.expected_version = view.state_version;
+        let TransitionEvent::InsertHeaders(insert) = &mut replay.event else {
+            unreachable!()
+        };
+        let new_owner = HeaderWorkAuthority::for_target(&view.snapshot, target.hash)
+            .bind(27, NonZeroU64::new(request_id).unwrap());
+        insert.owner = new_owner.into();
+        insert.completion = TargetCompletion::TargetPrefix {
+            common_ancestor: parent,
+        };
+        insert.aux[0].owner = new_owner.into();
+        insert.aux[0].delivery_id = EvidenceId::from_digest([marker; 32]);
+        insert.aux[0].body_size = zakura_header_chain::BodySizeHint::new(size).unwrap();
+        replay
+    };
+    let before = runtime.publisher().view();
+    let filled = runtime
+        .apply(replay(29, 0xc4, known_size.get()), &context)
+        .unwrap();
+    assert!(matches!(filled, ApplyResult::Committed), "{filled:?}");
+    let after = runtime.publisher().view();
+    assert_eq!(after.header_generation, before.header_generation);
+    assert_eq!(after.body_work_epoch, before.body_work_epoch);
+    assert_eq!(
+        after.body_size_hint_revision,
+        before.body_size_hint_revision + 1
+    );
+    assert_eq!(
+        runtime.store.scan_raw(HEADER_AUX_DELIVERY).unwrap().len(),
+        1
+    );
+    assert_eq!(
+        runtime.store.scan_raw(HEADER_AUX_BODY_SIZE).unwrap().len(),
+        1
+    );
+    let persisted = runtime.store.untrusted_aux_deliveries(target.hash).unwrap();
+    assert_eq!(
+        persisted[0].delivery().body_size,
+        zakura_header_chain::BodySizeHint::Unknown
+    );
+    assert_eq!(hints_by_hash(), vec![None, Some(known_size), None]);
+
+    // A differing known hint is false, so it cannot replace the filled size.
+    let conflicting = runtime.apply(replay(30, 0xc5, 3_146), &context).unwrap();
+    assert!(
+        matches!(conflicting, ApplyResult::NoChange(_)),
+        "{conflicting:?}"
+    );
+    assert_eq!(
+        runtime.publisher().view().body_size_hint_revision,
+        after.body_size_hint_revision
+    );
+    let config = runtime.config.clone();
+    drop(runtime);
+    let (reopened, _) = HeaderChainStore::new(db).startup(&config).unwrap();
+    assert_eq!(
+        reopened
+            .reader()
+            .body_size_hints_by_hash(&[target.hash])
+            .unwrap(),
+        vec![Some(known_size)]
+    );
+}
+
+#[test]
 fn retained_path_lookup_stops_at_the_locator_outside_commit_locks() {
     let (runtime, db, _, path) = reconciled_store_with_finalized_prefix(64);
     let reader = runtime.reader();
@@ -2493,4 +2731,156 @@ fn finalize_serving_test_path(
             || {},
         )
         .expect("the authoritative test path finalizes");
+}
+
+fn retained_checkpoint_fixture() -> (HeaderChainRuntime, DiskDb, Vec<VerifiedHeaderRef>) {
+    let (runtime, db, _genesis, path) = reconciled_store_with_finalized_prefix(5);
+    let before = runtime.publisher().snapshot();
+    let evidence = EvidenceId::from_digest([0xc4; 32]);
+    let authority = Authority(evidence);
+    runtime
+        .apply(
+            TransitionRequest {
+                expected_version: before.state_version,
+                event: TransitionEvent::VerifiedChainChanged(VerifiedChainChanged {
+                    full_state_transition_id: evidence,
+                    old_tip: before.frontiers.verified_best,
+                    new_path: Vec::new(),
+                    cause: VerifiedChangeCause::Reset,
+                }),
+            },
+            &TransitionContext {
+                config: &runtime.config,
+                clock: &SystemClock,
+                full_state_authority: Some(&authority),
+                retention_references: &[],
+            },
+        )
+        .expect("the fixture resets the verified tip while retaining its headers");
+    assert_eq!(
+        runtime.publisher().snapshot().frontiers.verified_best,
+        before.frontiers.finalized
+    );
+    (runtime, db, path)
+}
+
+#[test]
+fn retained_checkpoint_omits_context_but_missing_headers_and_other_causes_keep_it() {
+    let (runtime, _db, path) = retained_checkpoint_fixture();
+    let before = runtime.publisher().snapshot();
+    let make_request = |header: VerifiedHeaderRef, cause| TransitionRequest {
+        expected_version: before.state_version,
+        event: TransitionEvent::VerifiedChainChanged(VerifiedChainChanged {
+            full_state_transition_id: zakura_header_chain::checkpoint_finality_evidence(
+                before.state_version,
+                Frontier::new(header.height, header.hash),
+            ),
+            old_tip: before.frontiers.verified_best,
+            new_path: vec![header],
+            cause,
+        }),
+    };
+    let engine = runtime
+        .transition_engine
+        .lock()
+        .expect("the fixture writer is unlocked");
+    let retained = make_request(
+        path[3].clone(),
+        VerifiedChangeCause::CheckpointFinalizedGrow,
+    );
+    let input = runtime
+        .build_transition_input(retained.clone(), &before, runtime.config.network(), &engine)
+        .expect("retained checkpoint input needs no durable context");
+    assert!(input
+        .header_validation_facts()
+        .expect("checkpoint facts exist")
+        .validation_leases
+        .is_empty());
+    let grow = runtime
+        .build_transition_input(
+            make_request(path[3].clone(), VerifiedChangeCause::Grow),
+            &before,
+            runtime.config.network(),
+            &engine,
+        )
+        .expect("ordinary growth keeps its context");
+    assert_eq!(
+        grow.header_validation_facts()
+            .expect("growth facts exist")
+            .validation_leases
+            .len(),
+        1
+    );
+    let mut missing = path[3].clone();
+    Arc::make_mut(&mut missing.header).nonce.0[0] ^= 0x80;
+    missing.hash = missing.header.hash();
+    let input = runtime
+        .build_transition_input(
+            make_request(missing, VerifiedChangeCause::CheckpointFinalizedGrow),
+            &before,
+            runtime.config.network(),
+            &engine,
+        )
+        .expect("a missing header receives durable context");
+    assert_eq!(
+        input
+            .header_validation_facts()
+            .expect("checkpoint facts exist")
+            .validation_leases
+            .len(),
+        1
+    );
+    drop(engine);
+
+    let TransitionEvent::VerifiedChainChanged(event) = &retained.event else {
+        unreachable!()
+    };
+    let authority = Authority(event.full_state_transition_id);
+    let context = TransitionContext {
+        config: &runtime.config,
+        clock: &SystemClock,
+        full_state_authority: Some(&authority),
+        retention_references: &[],
+    };
+    let mut batch = DiskWriteBatch::new();
+    let accepted = Frontier::new(path[3].height, path[3].hash);
+    stage_full_state_canonical_hash(&runtime.store, &mut batch, accepted);
+    assert!(matches!(
+        runtime
+            .apply_combined(retained, &context, batch, || {})
+            .expect("retained checkpoint commits through the full adapter"),
+        ApplyResult::Committed
+    ));
+    assert_eq!(runtime.publisher().snapshot().frontiers.finalized, accepted);
+}
+
+#[test]
+fn retained_checkpoint_still_rejects_mismatched_header_identity() {
+    let (runtime, _db, path) = retained_checkpoint_fixture();
+    let before = runtime.publisher().snapshot();
+    let accepted = Frontier::new(path[3].height, path[3].hash);
+    let evidence =
+        zakura_header_chain::checkpoint_finality_evidence(before.state_version, accepted);
+    let authority = Authority(evidence);
+    let context = TransitionContext {
+        config: &runtime.config,
+        clock: &SystemClock,
+        full_state_authority: Some(&authority),
+        retention_references: &[],
+    };
+    let mut tampered = path[3].clone();
+    Arc::make_mut(&mut tampered.header).nonce.0[0] ^= 0x80;
+    let request = TransitionRequest {
+        expected_version: before.state_version,
+        event: TransitionEvent::VerifiedChainChanged(VerifiedChainChanged {
+            full_state_transition_id: evidence,
+            old_tip: before.frontiers.verified_best,
+            new_path: vec![tampered],
+            cause: VerifiedChangeCause::CheckpointFinalizedGrow,
+        }),
+    };
+    assert!(runtime
+        .apply_combined(request, &context, DiskWriteBatch::new(), || {})
+        .is_err());
+    assert_eq!(runtime.publisher().snapshot(), before);
 }

@@ -2,8 +2,8 @@
 
 use std::collections::{HashMap, HashSet};
 
-use derive_getters::Getters;
 use derive_new::new;
+use getset::{CopyGetters, Getters};
 use hex::ToHex as _;
 
 use zakura_chain::{
@@ -31,31 +31,39 @@ pub enum GetRawMempoolResponse {
 /// A mempool transaction details object as returned by `getrawmempool` in
 /// verbose mode.
 #[allow(clippy::too_many_arguments)]
-#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize, Getters, new)]
+#[derive(
+    Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize, Getters, CopyGetters, new,
+)]
 pub struct MempoolObject {
     /// Transaction size in bytes.
+    #[getset(get_copy = "pub")]
     pub(crate) size: u64,
     /// Transaction fee in zatoshi.
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     pub(crate) fee: Zec<NonNegative>,
     /// Transaction fee with fee deltas used for mining priority.
     #[serde(rename = "modifiedfee")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     pub(crate) modified_fee: Zec<NonNegative>,
     /// Local time transaction entered pool in seconds since 1 Jan 1970 GMT
+    #[getset(get_copy = "pub")]
     pub(crate) time: i64,
     /// Block height when transaction entered pool.
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     pub(crate) height: Height,
     /// Number of in-mempool descendant transactions (including this one).
+    #[getset(get_copy = "pub")]
     pub(crate) descendantcount: u64,
     /// Size of in-mempool descendants (including this one).
+    #[getset(get_copy = "pub")]
     pub(crate) descendantsize: u64,
     /// Modified fees (see "modifiedfee" above) of in-mempool descendants
     /// (including this one).
+    #[getset(get_copy = "pub")]
     pub(crate) descendantfees: u64,
     /// Transaction IDs of unconfirmed transactions used as inputs for this
     /// transaction.
+    #[getset(get = "pub")]
     pub(crate) depends: Vec<String>,
 }
 

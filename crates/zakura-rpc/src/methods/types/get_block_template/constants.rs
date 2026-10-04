@@ -19,6 +19,13 @@ use zakura_chain::{
 /// <https://github.com/zcash/zcash/blob/420f8dfe38fd6b2465a665324366c2ae14aa98f4/src/rpc/mining.cpp#L626>
 pub const MEMPOOL_LONG_POLL_INTERVAL: u64 = 5;
 
+/// The maximum number of times `getblocktemplate` rebuilds a template that was
+/// superseded by a tip, parent selection, or rejection revision change.
+///
+/// Past the bound the RPC returns the transient "template parent changed; retry"
+/// error so the miner can decide what to do.
+pub const MAX_TEMPLATE_REBUILDS: usize = 4;
+
 /// A range of valid block template nonces, that goes from `u32::MIN` to `u32::MAX` as a string.
 pub const NONCE_RANGE_FIELD: &str = "00000000ffffffff";
 

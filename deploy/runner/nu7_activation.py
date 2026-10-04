@@ -158,17 +158,7 @@ class ActivationFeed:
                       "observedAt": now, "fresh": True, "progressAgeSeconds": max(0, now - changed),
                       "active": upgrade["status"] == "active"}
             if parameters:
-                current = self.rpc(url, "getnetworkparameters", [tip[0]])
-                following = self.rpc(url, "getnetworkparameters", [tip[0] + 1])
-                if (current["activationHeight"] != activation
-                        or current["nu7BranchId"] != branch or current["networkMagic"] != "fa1af9bf"
-                        or current["network"] != "Testnet"
-                        or current["effectiveHeight"] != tip[0]
-                        or following["effectiveHeight"] != tip[0] + 1
-                        or following["networkMagic"] != "fa1af9bf"
-                        or following["activationHeight"] != activation
-                        or following["nu7BranchId"] != branch):
-                    raise ValueError("parameter export identity mismatch")
+                parameter_rules = self.parameter_rules(node, tip[0])
                 version = self.rpc(url, "getinfo").get("build")
                 expected = public["manifest"]["nodeRevision"]
                 if not isinstance(version, str) or expected[:9] not in version.lower():
@@ -178,12 +168,34 @@ class ActivationFeed:
                 pinned = self.rpc(url, "getblockchaininfo")
                 if (pinned["blocks"], pinned["bestblockhash"]) != tip:
                     raise ValueError("tip moved during parameter observation")
-                result["rules"] = {"atTip": rules(current), "nextBlock": rules(following)}
+                result["rules"] = parameter_rules
             return result
         except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as exc:
             # Avoid echoing URLs, credentials, or RPC response bodies.
             logging.warning("NU7 source %s unavailable (%s)", node["name"], type(exc).__name__)
             return {"name": node["name"], "fresh": False, "error": "Source unavailable or mismatched"}
+
+    def parameter_rules(self, node, height):
+        """Export complete rules at specified heights with public identity checks."""
+        public = self.config["public"]["manifest"]["network"]
+        exports = []
+        for effective_height in (height, height + 1):
+            value = self.rpc(node["rpcUrl"], "getnetworkparameters", [effective_height])
+            if (value["network"] != "Testnet" or value["networkMagic"] != "fa1af9bf"
+                    or value["activationHeight"] != public["activationHeight"]
+                    or value["nu7BranchId"] != public["branchId"]
+                    or value["effectiveHeight"] != effective_height):
+                raise ValueError("parameter export identity mismatch")
+            exports.append(rules(value))
+        return dict(zip(("atTip", "nextBlock"), exports))
+
+    def pinned_parameter_rules(self, observation, height):
+        """Reject exports if their source moved since its verified observation."""
+        exported = self.parameter_rules(observation["source"], height)
+        info = self.rpc(observation["url"], "getblockchaininfo")
+        if (info["blocks"], info["bestblockhash"]) != (observation["height"], observation["hash"]):
+            raise ValueError("tip moved during parameter agreement")
+        return exported
 
     def lightwallet(self, node, method, request):
         """Read bounded lightwalletd metadata through a pinned grpcurl binary."""
@@ -262,14 +274,17 @@ class ActivationFeed:
             try:
                 activation_hashes = [self.source_hash(n, activation) for n in sources]
                 common_hashes = [self.source_hash(n, common) for n in sources]
-                if (len(set(activation_hashes)) == len(set(common_hashes)) == 1
+                parameter_rules = [self.pinned_parameter_rules(n, common) for n in pair]
+                if (parameter_rules[0] == parameter_rules[1]
+                        and len(set(activation_hashes)) == len(set(common_hashes)) == 1
                         and all(0 <= self.clock() - n["observedAt"] <= 60 for n in sources)):
                     agreeing = [n["name"] for n in pair]
                     for candidate in candidates:
                         if candidate["name"] not in agreeing:
                             try:
                                 if (self.source_hash(candidate, activation) == activation_hashes[0]
-                                        and self.source_hash(candidate, common) == common_hashes[0]):
+                                        and self.source_hash(candidate, common) == common_hashes[0]
+                                        and self.pinned_parameter_rules(candidate, common) == parameter_rules[0]):
                                     agreeing.append(candidate["name"])
                             except (OSError, ValueError, KeyError, TypeError):
                                 pass
@@ -285,7 +300,23 @@ class ActivationFeed:
             raise ValueError("public parameter source unavailable")
         if agreement:
             available = [n for n in available if n["name"] in agreement["nodes"]]
-        primary = max(available, key=lambda n: n["height"])
+        # Corroborate the exact heights we publish, even when validators have
+        # different tips. Common-height agreement alone cannot attest a higher tip.
+        primary = None
+        for candidate in sorted(available, key=lambda n: n["height"], reverse=True):
+            for peer in available:
+                if peer["name"] == candidate["name"]:
+                    continue
+                try:
+                    if self.pinned_parameter_rules(peer, candidate["height"]) == candidate["rules"]:
+                        primary = candidate
+                        break
+                except (OSError, ValueError, KeyError, TypeError):
+                    continue
+            if primary is not None:
+                break
+        if primary is None:
+            raise ValueError("public parameter quorum unavailable")
         height = primary["height"]
         manifest = self.config["public"]["manifest"]
         activation = manifest["network"]["activationHeight"]

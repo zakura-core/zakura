@@ -88,7 +88,7 @@ impl PushPermit {
     pub(crate) async fn send(self, send: &FramedSend, frame: Frame) -> bool {
         let Self { grants, execution } = self;
         drop(execution);
-        match send.reserve_guarded().await {
+        match send.reserve_response_guarded().await {
             Ok(slot) => {
                 slot.send(frame, FrameGuard::new(Arc::new(grants)));
                 true

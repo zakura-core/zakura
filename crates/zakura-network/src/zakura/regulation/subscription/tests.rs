@@ -1197,6 +1197,46 @@ fn retirement_with_a_live_subscription_closes_the_connection() {
 }
 
 #[tokio::test]
+async fn pages_share_the_response_allowance_but_close_can_still_queue() {
+    let capacity = ServeCapacity::new(
+        "test",
+        &RULES[0],
+        ServeLimits {
+            peer_output_responses: 4,
+            node_output_responses: 4,
+            node_execution: 1,
+            peer_execution: 1,
+            peer_output_bytes: 1024,
+            node_output_bytes: 1024,
+        },
+    )
+    .unwrap();
+    let push = capacity.push(&peer());
+    let (send, mut recv) = framed_channel(2);
+    let first = push.acquire(1).await;
+    assert!(first.send(&send, frame(message_type::PAGE)).await);
+    let next = push.acquire(1).await;
+    let mut page = Box::pin(next.send(&send, frame(message_type::PAGE)));
+    assert!(futures::poll!(&mut page).is_pending());
+
+    let mut publications = Publications::<u8, u32>::new(limits(1));
+    publications.open(1, 0, LIMIT, 0).unwrap();
+    publications.close(&1, 1, &0).unwrap();
+    assert_eq!(
+        publications
+            .end(&1)
+            .unwrap()
+            .send(&send, frame(message_type::ENDED))
+            .now_or_never(),
+        Some(true)
+    );
+    // The unsent page is cancelled. Only the already queued page precedes the ending.
+    drop(page);
+    assert_eq!(recv.recv().await, Some(frame(message_type::PAGE)));
+    assert_eq!(recv.recv().await, Some(frame(message_type::ENDED)));
+}
+
+#[tokio::test]
 async fn pushed_pages_keep_response_slots_until_transport_completion() {
     let capacity = capacity();
     let push = capacity.push(&peer());

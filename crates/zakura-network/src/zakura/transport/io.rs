@@ -236,7 +236,8 @@ impl FramedSend {
 
     /// Reserve a response without consuming the last queue slot for control.
     /// The response allowance is shared by all sender clones and held through
-    /// the write. A one-slot test queue cannot provide independent headroom.
+    /// the write. A one-slot queue makes progress as frames drain, but cannot
+    /// provide independent control headroom.
     pub(crate) async fn reserve_response_guarded(
         &self,
     ) -> Result<ResponseFrameSlot<'_>, GuardedReserveError> {
@@ -600,6 +601,32 @@ mod tests {
         assert_eq!(budget.reserved(), 1);
         drop(write);
         assert_eq!(budget.reserved(), 0);
+    }
+
+    #[tokio::test]
+    async fn one_slot_queue_admits_requests_and_control_after_a_response_drains() {
+        let (sender, mut receiver) = worker_framed_channel(1);
+        sender
+            .reserve_response_guarded()
+            .await
+            .unwrap()
+            .send(frame(1), FrameGuard::new(Arc::new(())));
+        assert!(matches!(
+            sender.try_reserve_guarded(),
+            Err(GuardedReserveError::Full)
+        ));
+        let mut control = Box::pin(sender.send(frame(2)));
+        assert!(futures::poll!(&mut control).is_pending());
+        let response = receiver.recv().await.unwrap();
+        control.await.unwrap();
+        assert_eq!(receiver.recv().await.unwrap().into_parts().0, frame(2));
+        sender
+            .try_reserve_guarded()
+            .unwrap()
+            .send(frame(3), FrameGuard::new(Arc::new(())));
+        assert_eq!(receiver.recv().await.unwrap().into_parts().0, frame(3));
+        drop(response);
+        assert!(sender.reserve_response_guarded().await.is_ok());
     }
 
     #[tokio::test]

@@ -115,6 +115,12 @@ pub struct InnerConfig {
     /// Defaults to 128,000 with a minimum of 100.
     pub buffer_limit: usize,
 
+    /// Legacy flamegraph output path, accepted for configuration compatibility.
+    ///
+    /// Ignored because the built-in collector has been removed.
+    #[serde(skip_serializing)]
+    pub flamegraph: Option<PathBuf>,
+
     /// Shows progress bars for block syncing, and mempool transactions, and peer networking.
     /// Also sends logs to the default log file path.
     ///
@@ -228,6 +234,7 @@ impl Default for InnerConfig {
             force_use_color: false,
             filter: None,
             buffer_limit: 128_000,
+            flamegraph: None,
             progress_bar,
             log_file: runtime_default_log_file(None, progress_bar),
             use_journald: false,

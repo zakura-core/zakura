@@ -30,9 +30,16 @@ def resources(base):
 
 
 def ancestors(rpc, tip):
-    """Use the fleet's depth-keyed ancestry format and reject a racing tip."""
-    result = {str(depth): hex_bytes(rpc.call("getblockhash", tip["height"] - depth), 32)
-              for depth in (1, 2, 5, 10, 32) if tip["height"] >= depth}
+    """Collect available fleet ancestry while requiring a stable tip."""
+    result = {}
+    for depth in (1, 2, 5, 10, 32):
+        if tip["height"] < depth:
+            continue
+        try:
+            result[str(depth)] = hex_bytes(rpc.call("getblockhash", tip["height"] - depth), 32)
+        except (Unavailable, OSError):
+            # Ancestry aids quorum attribution; tree comparison is independent.
+            continue
     if hex_bytes(rpc.call("getblockhash", tip["height"]), 32) != tip["hash"]:
         raise Unavailable("chain changed during ancestry sample")
     return result

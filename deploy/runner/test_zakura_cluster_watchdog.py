@@ -2061,6 +2061,16 @@ class MacForkAlertTests(unittest.TestCase):
         self.assertEqual(sent,[])
         self.assertTrue(state["mac_forks"]["mainnet"]["alerting"])
 
+    def test_missing_mac_common_ancestor_cannot_alert_or_recover_a_fork(self):
+        rows = self.rows()
+        rows[0]["ancestor_hashes"] = {"1": "a" * 64, "32": "a" * 64}
+        self.assertEqual(self.check(rows)[1], [])
+        state, _ = self.check(self.rows())
+        for now in (1000, 1030, 1060):
+            state, sent = self.check(rows, state, now=now)
+            self.assertEqual(sent, [])
+            self.assertTrue(state["mac_forks"]["mainnet"]["alerting"])
+
     def test_testnet_ignored_and_lag_on_same_chain_does_not_alert(self):
         self.assertEqual(self.check(self.rows(),fleet="testnet")[1],[])
         rows=self.rows(agreeing=0)

@@ -100,7 +100,9 @@ runs native acceptance rather than skipping it.
 
 The fleet dashboard names the node `mac-os-cranelift`; progress and incident
 state use that canonical name. The Mac probe emits the fleet's existing
-`ancestor_hashes` format. The quorum alert uses the shared ancestor lookup at
+`ancestor_hashes` format. Failed or malformed optional ancestor lookups are
+omitted so independent block and tree comparison can continue. A final tip
+lookup must succeed and match the sampled tip. The quorum alert uses the shared ancestor lookup at
 the Mac tip minus ten blocks and still requires agreement from at least 70% of
 other nodes. Linux probes add that common height to their ancestry sample when
 needed; missing or racing samples cannot establish a fork or clear an existing

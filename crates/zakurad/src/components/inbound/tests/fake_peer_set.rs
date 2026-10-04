@@ -591,7 +591,9 @@ async fn peer_mempool_full_queue_is_refused_without_disconnect() -> Result<(), c
     Ok(())
 }
 
-#[tokio::test(flavor = "current_thread", start_paused = true)]
+// Use real time because the state writer acknowledges commits before publishing tips.
+// A paused clock can reach the gossip timeout before that OS thread publishes the tip.
+#[tokio::test(flavor = "current_thread")]
 async fn mempool_transaction_expiration() -> Result<(), crate::BoxError> {
     // Get a block that has at least one non coinbase transaction
     let block: Block = zakura_test::vectors::BLOCK_MAINNET_982681_BYTES.zcash_deserialize_into()?;

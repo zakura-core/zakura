@@ -874,6 +874,7 @@ fn a_part_the_row_allows_but_the_cap_refuses_queues_nothing() {
 }
 
 #[tokio::test]
+#[allow(clippy::print_stderr)] // Report the retained-byte measurement with --nocapture.
 async fn queued_requests_allocate_only_commitments_until_dispatch() {
     const COUNT: u32 = 64_000;
     // Exercise the production protocol ceiling without starting a producer.

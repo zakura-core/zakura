@@ -304,6 +304,9 @@ pub struct ZakuraConfig {
     pub max_connections: usize,
     /// Maximum established Zakura connections admitted from one source IP.
     ///
+    /// Admission allows one extra pending connection to authenticate a reconnect.
+    /// A different peer still cannot exceed the established limit.
+    ///
     /// Zakura allows a small number of same-IP peers by default so NATed nodes
     /// and co-hosted fleets can connect without hitting the legacy TCP crawler's
     /// stricter per-IP default. Global caps and outbound peer diversity remain
@@ -1289,13 +1292,13 @@ impl ZakuraSupervisorHandle {
         }
     }
 
-    /// Returns whether `remote_ip` has reached the per-IP cap once `pending`
-    /// QUIC handshakes and its control handshakes are counted. Never awaits.
-    fn ip_at_capacity(&self, remote_ip: IpAddr, pending: usize) -> bool {
+    /// Includes one pending reconnect beyond the established per-IP cap.
+    /// Registration still enforces the cap after identifying the peer.
+    fn ip_at_admission_capacity(&self, remote_ip: IpAddr, pending: usize) -> bool {
         self.ip_slots
             .charged(canonical_ip(remote_ip))
             .saturating_add(pending)
-            >= self.max_connections_per_ip
+            >= self.max_connections_per_ip.saturating_add(1)
     }
 
     /// Counts an inbound control handshake against `remote_ip` until the guard
@@ -3586,7 +3589,7 @@ impl Acceptor for ZakuraProtocolHandler {
         }
         if self
             .supervisor
-            .ip_at_capacity(incoming.remote.ip(), incoming.pending_from_ip)
+            .ip_at_admission_capacity(incoming.remote.ip(), incoming.pending_from_ip)
         {
             metrics::counter!("zakura.p2p.conn.rejected.per_ip").increment(1);
             return Admit::Refuse;
@@ -6015,6 +6018,7 @@ mod tests {
     mod admission;
     pub(super) mod connection;
     mod quic_progress;
+    mod reconnect;
     use super::*;
     use crate::{
         protocol::internal::{InventoryResponse, Response},
@@ -10871,11 +10875,20 @@ mod tests {
             let fourth = LocalEndpointFactory::with_limits(&limits)
                 .endpoint(886)
                 .await?;
-            let fourth_conn = fourth.connect(server_addr, P2P_V2_ALPN).await;
+            let fourth_conn = fourth.connect(server_addr, P2P_V2_ALPN).await?;
+            let fourth_peer = ZakuraPeerId::new(fourth.local_id().as_bytes().to_vec())?;
+            let _ = run_native_initiator_handshake_without_trace(
+                &fourth_conn,
+                &limits,
+                &config,
+                &fourth_peer,
+            )
+            .await;
             assert!(
-                matches!(fourth_conn, Err(zakura_quic::ConnectError::Refused)),
-                "a new identity from the same IP must be refused before the handshake at the IP \
-                 cap: {fourth_conn:?}"
+                matches!(fourth_conn.closed().await,
+                    zakura_quic::ConnectionError::ApplicationClosed(close)
+                        if close.reason.as_ref() == b"registration"),
+                "the pending reconnect allowance must not grant another registered IP slot"
             );
             assert_eq!(supervisor.registered_ids().await.len(), 2);
             fourth.shutdown().await;
@@ -10899,15 +10912,15 @@ mod tests {
     // accepts: one source IP could authenticate as many distinct node ids and
     // fill the global connection budget despite `max_connections_per_ip`
     // (default 1). Inbound accepts now pass the admitted source IP into
-    // `register`, and the acceptor refuses a source IP at its cap before any
-    // handshake work (zakura-quic ADM-3).
+    // `register`. Admission allows one pending reconnect beyond the cap, but a
+    // different authenticated identity still cannot register (zakura-quic ADM-3).
     //
     // This guard drives the real production acceptor over loopback QUIC: two
     // distinct authenticated identities dial from the same source IP
     // (127.0.0.1). The per-IP cap is 1 while global admission keeps its default
     // (well above 1), so the second identity can only be turned away by the
-    // per-IP cap, not the global gate. It is refused before its handshake,
-    // leaving exactly one registered peer.
+    // per-IP cap, not the global gate. Its provisional attempt authenticates,
+    // but registration refuses it, leaving exactly one registered peer.
     #[tokio::test]
     async fn inbound_accept_enforces_per_ip_cap() -> Result<(), BoxError> {
         let _guard = zakura_test::init();
@@ -11026,17 +11039,15 @@ mod tests {
              resolved from the endpoint and counted against the per-IP cap)",
         );
 
-        // Second distinct identity from the same source IP: the acceptor refuses
-        // it before the handshake, so it never reaches registration. (Before the
-        // fix the accept passed remote_ip = None, so this identity registered and
-        // one source IP could exhaust the global budget.)
-        let second = connect_native(&server_addr, 882, &limits).await;
+        // The reconnect allowance must not admit a different authenticated peer.
+        let (second_endpoint, second) = connect_native(&server_addr, 882, &limits).await?;
+        // Registration can close the connection before the acknowledgement arrives.
+        let _ = run_handshake(&second_endpoint, &second, &limits).await;
+        let closed = timeout(Duration::from_secs(10), second.closed()).await?;
         let refused = matches!(
-            second
-                .as_ref()
-                .err()
-                .and_then(|error| error.downcast_ref::<zakura_quic::ConnectError>()),
-            Some(zakura_quic::ConnectError::Refused)
+            closed,
+            zakura_quic::ConnectionError::ApplicationClosed(ref close)
+                if close.reason.as_ref() == b"registration"
         );
         let registered = supervisor.registered_ids().await.len();
         assert!(
@@ -11102,9 +11113,9 @@ mod tests {
         server_ep.serve(handler)?;
         let server_addr = LocalEndpointFactory::node_addr(&server_ep).await;
 
-        // Two identities from 127.0.0.1 finish TLS and never send the control hello.
+        // The cap of two permits one extra pending reconnect, including control handshakes.
         let mut stalled = Vec::new();
-        for seed in [891, 892] {
+        for seed in [891, 892, 893] {
             let endpoint = LocalEndpointFactory::with_limits(&limits)
                 .endpoint(seed)
                 .await?;
@@ -11114,23 +11125,23 @@ mod tests {
         let loopback: IpAddr = Ipv4Addr::LOCALHOST.into();
         let control_count = || supervisor.ip_slots.charged(loopback);
         await_until(
-            "two stalled control handshakes",
+            "three stalled control handshakes",
             Duration::from_secs(5),
-            || control_count() == 2,
+            || control_count() == 3,
         )
         .await?;
 
-        // A third identity from the same IP is refused before TLS.
-        let third = LocalEndpointFactory::with_limits(&limits)
-            .endpoint(893)
+        // A fourth attempt cannot borrow another reconnect slot.
+        let fourth = LocalEndpointFactory::with_limits(&limits)
+            .endpoint(894)
             .await?;
         let refused = matches!(
-            third.connect(server_addr.clone(), P2P_V2_ALPN).await,
+            fourth.connect(server_addr.clone(), P2P_V2_ALPN).await,
             Err(zakura_quic::ConnectError::Refused)
         );
         assert!(
             refused,
-            "stalled control handshakes must fill the per-IP cap"
+            "stalled control handshakes must fill the bounded reconnect allowance"
         );
 
         // Closing the stalled connections releases their per-IP slots.

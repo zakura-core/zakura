@@ -215,7 +215,7 @@ work. Stage 2 runs after TLS proves the `NodeId` and is today's Zakura logic.
 - **ADM-3.** Zakura's acceptor MUST return:
   1. `Ignore` for a banned IP;
   2. `Refuse` when the IP's established plus pending connections reach
-     `max_connections_per_ip`;
+     `max_connections_per_ip + 1` (saturating addition);
   3. `Refuse` when `max_pending_per_ip` is set and the IP has that many
      handshakes in progress;
   4. `Refuse` when the endpoint has `max_pending_handshakes` handshakes in progress;
@@ -235,6 +235,11 @@ work. Stage 2 runs after TLS proves the `NodeId` and is today's Zakura logic.
   A control handshake is an inbound connection past TLS that hasn't
   registered yet. The transport stops counting a connection when TLS
   finishes, so Zakura counts it against its IP from then until registration.
+  The extra pending attempt lets a same-IP reconnect authenticate and reach
+  duplicate handling while its incumbent still occupies the IP's slot.
+  Registration MUST keep the established limit at `max_connections_per_ip`:
+  a different identity cannot use the reconnect allowance to exceed it.
+  The global transport and handshake budgets still apply to that attempt.
 - **ADM-4.** `admit` MUST NOT block. It reads in-memory state only.
 - **ADM-5.** The endpoint MUST set:
   - `ServerConfig::max_incoming` to `max_incoming`;

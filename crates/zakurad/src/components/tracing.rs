@@ -10,16 +10,10 @@ use serde::{Deserialize, Serialize};
 
 mod component;
 
-#[cfg(feature = "flamegraph")]
-mod flame;
-
 #[cfg(feature = "opentelemetry")]
 mod otel;
 
 pub use component::Tracing;
-
-#[cfg(feature = "flamegraph")]
-pub use flame::{layer, Grapher};
 
 /// Tracing configuration section: outer config after cross-field defaults are applied.
 ///
@@ -121,38 +115,10 @@ pub struct InnerConfig {
     /// Defaults to 128,000 with a minimum of 100.
     pub buffer_limit: usize,
 
-    /// Controls whether to write a flamegraph of tracing spans.
+    /// Legacy flamegraph output path, accepted for configuration compatibility.
     ///
-    /// Install Zebra using `cargo install --features=flamegraph` to enable this config.
-    ///
-    /// If this is set to None, flamegraphs are disabled. Otherwise, it specifies
-    /// an output file path, as described below.
-    ///
-    /// This path is not used verbatim when writing out the flamegraph. This is
-    /// because the flamegraph is written out as two parts. First the flamegraph
-    /// is constantly persisted to the disk in a "folded" representation that
-    /// records collapsed stack traces of the tracing spans that are active.
-    /// Then, when the application is finished running the destructor will flush
-    /// the flamegraph output to the folded file and then read that file and
-    /// generate the final flamegraph from it as an SVG.
-    ///
-    /// The need to create two files means that we will slightly manipulate the
-    /// path given to us to create the two representations.
-    ///
-    /// # Security
-    ///
-    /// If you are running Zebra with elevated permissions ("root"), create the
-    /// directory for this file before running Zebra, and make sure the Zebra user
-    /// account has exclusive access to that directory, and other users can't modify
-    /// its parent directories.
-    ///
-    /// # Example
-    ///
-    /// Given `flamegraph = "flamegraph"` we will generate a `flamegraph.svg` and
-    /// a `flamegraph.folded` file in the current directory.
-    ///
-    /// If you provide a path with an extension the extension will be ignored and
-    /// replaced with `.folded` and `.svg` for the respective files.
+    /// Ignored because the built-in collector has been removed.
+    #[serde(skip_serializing)]
     pub flamegraph: Option<PathBuf>,
 
     /// Shows progress bars for block syncing, and mempool transactions, and peer networking.

@@ -74,7 +74,6 @@
 //! * `sentry`: enable Sentry reporting and tracing integration. Disabled by default, including
 //!   in release binaries. Build with `cargo build --release -p zakura --features sentry`, then
 //!   set `SENTRY_DSN` at runtime to enable reporting.
-//! * `flamegraph`: generate a flamegraph of tracing spans.
 //!
 //! Changing the traces that are collected:
 //! * `error-debug`: enable extra debugging in release builds.

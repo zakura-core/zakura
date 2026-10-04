@@ -471,7 +471,6 @@ impl Application for ZakuradApp {
         } else {
             // Don't apply the configured filter for short-lived commands.
             tracing_config.filter = Some(default_filter.to_owned());
-            tracing_config.flamegraph = None;
         }
         components.push(Box::new(Tracing::new(
             &config.network.network,

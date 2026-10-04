@@ -63,7 +63,6 @@ pre-release-replacements = [
 # <https://docs.rs/about/metadata>
 features = [
     "default-release-binaries",
-    "flamegraph",
     "journald",
     "opentelemetry",
     "prometheus",
@@ -136,8 +135,6 @@ max_level_info = ["tracing/max_level_info"]
 max_level_debug = ["tracing/max_level_debug", "log/max_level_debug"]
 
 # Testing features that activate extra dependencies
-flamegraph = ["tracing-flame", "inferno"]
-
 proptest-impl = [
     "proptest",
     "proptest-derive",
@@ -245,10 +242,6 @@ thread-priority = { workspace = true, optional = true }
 
 # prod feature sentry
 sentry = { workspace = true, features = ["backtrace", "logs", "rustls", "tracing", "ureq"], optional = true }
-
-# prod feature flamegraph
-tracing-flame = { workspace = true, optional = true }
-inferno = { workspace = true, optional = true }
 
 # prod feature journald
 tracing-journald = { workspace = true, optional = true }

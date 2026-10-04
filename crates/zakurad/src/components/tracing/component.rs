@@ -18,9 +18,6 @@ use zakura_chain::parameters::Network;
 
 use crate::{application::build_version, components::tracing::Config};
 
-#[cfg(feature = "flamegraph")]
-use super::flame;
-
 // Art generated with these two images.
 // Zakura logo: project branding
 // License: MIT or Apache 2.0
@@ -47,10 +44,6 @@ pub type BoxWrite = Box<dyn Write + Send + Sync + 'static>;
 
 /// Abscissa component for initializing the `tracing` subsystem
 pub struct Tracing {
-    /// The installed flame graph collector, if enabled.
-    #[cfg(feature = "flamegraph")]
-    flamegrapher: Option<flame::Grapher>,
-
     /// The OpenTelemetry tracer provider, if enabled.
     #[cfg(feature = "opentelemetry")]
     otel_provider: Option<opentelemetry_sdk::trace::SdkTracerProvider>,
@@ -81,7 +74,6 @@ impl Tracing {
         let use_color_stderr = config.use_color_stderr();
 
         let filter = config.filter.clone().unwrap_or_default();
-        let flame_root = &config.flamegraph;
 
         // Only show the intro for user-focused node server commands like `start`
         // Also skip the intro for regtest, since it pollutes the QA test logs
@@ -200,18 +192,6 @@ impl Tracing {
 
         // Add optional layers based on dynamic and compile-time configs
 
-        // Add a flamegraph
-        #[cfg(feature = "flamegraph")]
-        let (flamelayer, flamegrapher) = if let Some(path) = flame_root {
-            let (flamelayer, flamegrapher) = flame::layer(path);
-
-            (Some(flamelayer), Some(flamegrapher))
-        } else {
-            (None, None)
-        };
-        #[cfg(feature = "flamegraph")]
-        let subscriber = subscriber.with(flamelayer);
-
         #[cfg(feature = "journald")]
         let journaldlayer = if config.use_journald {
             use abscissa_core::FrameworkErrorKind;
@@ -291,18 +271,6 @@ impl Tracing {
             "started tracing component",
         );
 
-        if flame_root.is_some() {
-            if cfg!(feature = "flamegraph") {
-                info!(flamegraph = ?flame_root, "installed flamegraph tracing layer");
-            } else {
-                warn!(
-                    flamegraph = ?flame_root,
-                    "unable to activate configured flamegraph: \
-                     enable the 'flamegraph' feature when compiling zakurad",
-                );
-            }
-        }
-
         if config.use_journald {
             if cfg!(feature = "journald") {
                 info!("installed journald tracing layer");
@@ -366,8 +334,6 @@ impl Tracing {
         }
 
         Ok(Self {
-            #[cfg(feature = "flamegraph")]
-            flamegrapher,
             #[cfg(feature = "opentelemetry")]
             otel_provider,
             _guard: Some(worker_guard),
@@ -377,9 +343,6 @@ impl Tracing {
     /// Drops guard for worker thread of non-blocking logger,
     /// to flush any remaining logs when the program terminates.
     pub fn shutdown(&mut self) {
-        #[cfg(feature = "flamegraph")]
-        self.flamegrapher.take();
-
         #[cfg(feature = "opentelemetry")]
         if let Some(provider) = self.otel_provider.take() {
             if let Err(e) = provider.shutdown() {
@@ -407,17 +370,6 @@ impl<A: abscissa_core::Application> Component<A> for Tracing {
     }
 
     fn before_shutdown(&self, _kind: Shutdown) -> Result<(), FrameworkError> {
-        #[cfg(feature = "flamegraph")]
-        if let Some(ref grapher) = self.flamegrapher {
-            use abscissa_core::FrameworkErrorKind;
-
-            info!("writing flamegraph");
-
-            grapher
-                .write_flamegraph()
-                .map_err(|e| FrameworkErrorKind::ComponentError.context(e))?
-        }
-
         #[cfg(feature = "progress-bar")]
         howudoin::disable();
 

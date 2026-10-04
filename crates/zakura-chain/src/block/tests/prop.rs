@@ -6,8 +6,6 @@ use proptest::{prelude::*, test_runner::Config};
 
 use hex::{FromHex, ToHex};
 
-use zakura_test::prelude::*;
-
 use crate::{
     serialization::{SerializationError, ZcashDeserializeInto, ZcashSerialize},
     transaction::Transaction,

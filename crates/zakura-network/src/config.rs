@@ -313,7 +313,7 @@ pub struct Config {
     /// - regularly, every time `crawl_new_peer_interval` elapses, and
     /// - if the peer set is busy, and there aren't any peer addresses for the
     ///   next connection attempt.
-    #[serde(with = "humantime_serde")]
+    #[serde(with = "zakura_chain::serialization::serde_adapters::duration")]
     pub crawl_new_peer_interval: Duration,
 
     /// The maximum number of legacy TCP peer connections Zakura will keep for a given IP address
@@ -1041,7 +1041,10 @@ struct DConfig {
     v2_p2p: Option<bool>,
     zakura: ZakuraConfig,
     peerset_initial_target_size: usize,
-    #[serde(alias = "new_peer_interval", with = "humantime_serde")]
+    #[serde(
+        alias = "new_peer_interval",
+        with = "zakura_chain::serialization::serde_adapters::duration"
+    )]
     crawl_new_peer_interval: Duration,
     max_connections_per_ip: Option<usize>,
     expose_peer_addresses: bool,

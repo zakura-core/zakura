@@ -191,7 +191,7 @@ pub struct Config {
     /// While Zebra is running, check state validity this often.
     ///
     /// Set to `None` by default: Zebra only checks state format validity on startup and shutdown.
-    #[serde(with = "humantime_serde")]
+    #[serde(with = "zakura_chain::serialization::serde_adapters::optional_duration")]
     pub debug_validity_check_interval: Option<Duration>,
 
     /// If true, skip spawning the non-finalized state backup task and instead write

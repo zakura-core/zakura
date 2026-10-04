@@ -17,9 +17,10 @@ mod fuzz;
 
 pub use config::{
     CheckpointSet, EngineConfig, EngineConfigError, EngineLimits, EngineMode,
-    SettledUpgradeManifest, SettledUpgradePin, TrustedAnchor, MAX_AUX_DELIVERIES_PER_HEADER_V1,
-    MAX_AUX_DELIVERIES_TOTAL_V1, MAX_CANDIDATE_TIPS_V1, MAX_HEADERS_PER_TRANSITION_V1,
-    MAX_NON_FINALIZED_NODES_V1, MAX_STAGED_TARGETS_V1,
+    SettledUpgradeManifest, SettledUpgradePin, TrustedAnchor,
+    BOUNDED_HEADER_RESPONSE_BYTES_PER_HEADER, MAX_AUX_DELIVERIES_PER_HEADER_V1,
+    MAX_AUX_DELIVERIES_TOTAL_V1, MAX_BOUNDED_HEADER_RESPONSE_BYTES, MAX_CANDIDATE_TIPS_V1,
+    MAX_HEADERS_PER_TRANSITION_V1, MAX_NON_FINALIZED_NODES_V1, MAX_STAGED_TARGETS_V1,
 };
 pub use discovery::{
     AuxiliaryRequirementEpisode, HeaderLocator, VctRepairContext, MAX_HEADER_LOCATOR_HASHES,

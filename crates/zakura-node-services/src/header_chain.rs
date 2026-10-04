@@ -87,7 +87,7 @@ pub struct RetainedHeaderPath {
     adapter_id: u64,
     source: SourceId,
     session_id: u64,
-    /// First requester-order locator intersection.
+    /// Nearest locator ancestor on the target’s chain.
     pub common_ancestor: Frontier,
     /// Exact retained target.
     pub target: Frontier,

@@ -32,6 +32,7 @@ Keep entries **newest-first**. Each row records:
 
 | Parameter | Location | Old → New | PR | Why |
 | --- | --- | --- | --- | --- |
+| `MAX_BOUNDED_HEADER_RESPONSE_BYTES` | `crates/zakura-header-chain/src/config.rs` | implicit per-page bounds → 8 MiB encoded ceiling implied by the 4,000-header cap at 2,048 bytes per header | [#931](https://github.com/zakura-core/zakura/pull/931) | Bound reserved responses independently of target storage, including metadata and one-header page framing. |
 | Full-pool admission rate | `crates/zakurad/src/components/mempool/storage/verified_set.rs` | incoming transaction alone → lower of own and ancestor-inclusive rates | [#1253](https://github.com/zakura-core/zakura/pull/1253) | Both rates must outbid every victim by the existing increment. Summing at most two ancestors prevents the fixed-price ancestor-dilution cycle. |
 | `MAX_MEMPOOL_PACKAGE_TRANSACTIONS` | `crates/zakurad/src/components/mempool/storage/verified_set.rs` | unlimited → 3 | [#1233](https://github.com/zakura-core/zakura/pull/1233) | Bounds the entire connected unconfirmed dependency group, including parents, children, and siblings. Each group has at most three dependency edges, so scores can be recomputed directly without cached ancestor totals. |
 | `MAX_MEMPOOL_ANCESTORS` | `crates/zakurad/src/components/mempool/storage/verified_set.rs` | unlimited → 2 | [#1233](https://github.com/zakura-core/zakura/pull/1233) | Derived from the three-member group limit. Permits parent-child-grandchild chains and bounds unconfirmed dependency depth to two edges. |

@@ -57,7 +57,7 @@ zcash_primitives = { version = "=2.2.0", package = "zakura-primitives" }
 zcash_proofs = { version = "=2.2.0", package = "zakura-proofs" }
 zcash_transparent = { version = "=2.2.0", package = "zakura-transparent" }
 zcash_protocol = { version = "=2.2.0", package = "zakura-protocol" }
-abscissa_core = { version = "0.7", default-features = false }
+abscissa_core = { version = "0.9", default-features = false }
 base64 = "0.22.1"
 bech32 = "0.11.0"
 bellman = { version = "=2.2.0", package = "zakura-bellman" }
@@ -77,7 +77,7 @@ color-eyre = { version = "0.6.3", default-features = false }
 console-subscriber = "0.5"
 criterion = "0.5"
 crossbeam-channel = "0.5.14"
-derive-new = "0.5"
+derive-new = "0.7"
 dirs = "6.0"
 ed25519-zebra = "4.2"
 equihash = { version = "=2.2.0", package = "zakura-equihash" }

@@ -220,6 +220,52 @@ class ActivationTests(unittest.TestCase):
         self.assertEqual(request.call_count, 1)
         self.assertTrue(self.feed.state["publicationDispatched"])
 
+    def test_parameter_outlier_is_excluded_from_public_rules(self):
+        original = self.rpc
+        def outlier(url, method, params=None):
+            value = original(url, method, params)
+            if url == "0" and method == "getnetworkparameters":
+                value["targetSpacingSeconds"] = 999
+                value["difficulty"]["averagingWindowBlocks"] = 999
+            return value
+        self.feed.rpc = outlier
+        for _ in range(3):
+            self.poll()
+        payload = self.feed.response()[1]
+        self.assertEqual(payload["selectedProfile"], "public-testnet")
+        self.assertEqual(payload["rules"]["atTip"]["targetSpacingSeconds"], 25)
+        self.assertEqual(self.feed.state["selectionEvidence"]["nodes"], ["1", "2"])
+
+    def test_two_different_parameter_exports_do_not_select(self):
+        original = self.rpc
+        self.rpc.offline.add("2")
+        def disagreement(url, method, params=None):
+            value = original(url, method, params)
+            if url == "0" and method == "getnetworkparameters":
+                value["difficulty"]["minimumDifficultyStrictlyGreater"] = False
+            return value
+        self.feed.rpc = disagreement
+        for _ in range(3):
+            self.poll()
+        self.assertEqual(self.feed.state["selectedProfile"], "staging")
+
+    def test_higher_tip_outlier_cannot_publish_unmatched_rules(self):
+        original = self.rpc
+        def higher(url, method, params=None):
+            value = original(url, method, params)
+            if url == "0" and method == "getblockchaininfo":
+                value.update(blocks=103, bestblockhash=f"{103:064x}")
+            if url == "0" and method == "getnetworkparameters" and params[0] >= 103:
+                value["targetSpacingSeconds"] = 999
+            return value
+        self.feed.rpc = higher
+        for _ in range(3):
+            self.poll()
+        payload = self.feed.response()[1]
+        self.assertEqual(payload["selectedProfile"], "public-testnet")
+        self.assertEqual(payload["status"]["chain"]["height"], 102)
+        self.assertEqual(payload["rules"]["atTip"]["targetSpacingSeconds"], 25)
+
     def test_next_block_rule_boundary(self):
         self.assertEqual(rules(parameters(99))["daaWindowBlocks"], 17)
         self.assertEqual(rules(parameters(100))["daaWindowBlocks"], 102)

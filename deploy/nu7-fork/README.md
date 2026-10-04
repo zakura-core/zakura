@@ -33,9 +33,10 @@ magic and snapshot URL.
 | NU7 consensus branch ID | `77190ad9` |
 | Seed (caught-up public Testnet tip) | 4,420,648, `0002d46ac1fe7f29f6a8f76396eac63895f595f1811b54060e7b46030e6583d0` |
 | NU7 activation | 4,420,652, `000b1414a4fa968bd8e21853d1b9b07aba73ff2d8ad83b929c68850091b8a9e0` |
-| Launch build | `61efe76c62645e22ca7d29a8cacfbfe77e35059a`, rebased on main `af944f5194ef2e9921bc96af017629450375013c` |
-| Participant config digest | `12c94fe866bf4de38e187aba6526b5623559db82b55de1cc6e3960d503835ce1` |
 | Bootstrap snapshot | immutable; see [One-time bootstrap snapshot](#one-time-bootstrap-snapshot) |
+
+Read the [network manifest](https://api.nu7.valargroup.dev/v1/network) for the
+node revision, participant configuration digest, and bootstrap snapshot metadata.
 
 **Compatibility.** Main's PR #1209 requires a gap of more than 450 seconds, from
 the configured NU7 activation, before a Testnet block may use minimum difficulty.
@@ -51,10 +52,9 @@ explicit consensus migration. V3 was launched under the 450-second rule.
 The current seed is served directly by Caddy on `zakura-nu7-fork-1`
 (`api.nu7.valargroup.dev`), from
 `/mnt/snapshots/nu7-public/snapshots/nu7-v3-seed-4420648.tar.zst`.
-It is a fixed, pruned seed at height **4,420,648**, published on
-**2026-09-30 at 09:34:35 UTC**, before fork mining. Its database format is
-**29.1.0** and compressed size is **9,945,546,169 bytes**.
-SHA-256: `b9d92831e7fbd7dee81471f779fde86b77146df6b49a903e26909f0de978db68`. The V2 archive remains unchanged at its distinct URL.
+It is the fixed, pruned seed published before fork mining. Read its checksum,
+size, database version, and original publication time from the manifest's
+`snapshot` object. The V2 archive remains unchanged at its distinct URL.
 There is no daily refresh job. The website presents this artifact separately
 from Mainnet snapshots.
 
@@ -144,8 +144,9 @@ Every mining node runs `zakurad`'s own internal miner: there is no separate
 miner process or unit. `fork.py` renders `build_features = ["internal-miner"]`,
 so the deployer builds one `zakurad --features internal-miner` binary per commit,
 and sets `[mining] internal_miner = true` on the primary. The local observer
-uses the same binary without that setting, so it remains a validator that never
-mines. A stock workspace build does not compile the Equihash solver.
+uses the same binary and remains a pure validator with the default empty
+`peer.miner_address`. Supplying that address enables its internal miner with a
+distinct coinbase tag. A stock workspace build does not compile the Equihash solver.
 
 The internal miner long-polls `getblocktemplate` inside the node. Its solver is
 cancelled when the tip changes, including a same-height reorganization, and when

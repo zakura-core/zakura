@@ -2062,10 +2062,9 @@ def nu7_network_parameters(config_path: Path) -> dict:
     """The NU7 fork's public identity, read from the primary node's own config."""
     with config_path.open("rb") as stream:
         network = tomllib.load(stream)["network"]
-    # A configured testnet is `network = { ... }`. Older fork configs keep the
-    # parameters in [network.testnet_parameters].
-    parameters = (network["network"] if isinstance(network.get("network"), dict)
-                  else network["testnet_parameters"])
+    parameters = network["network"]
+    if not isinstance(parameters, dict):
+        raise ValueError("--nu7-config requires an explicit network parameter table")
     return {
         "name": parameters["network_name"],
         "magic": "".join(f"{byte:02x}" for byte in parameters["network_magic"]),

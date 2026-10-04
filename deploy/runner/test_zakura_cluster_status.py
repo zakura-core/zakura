@@ -1524,6 +1524,17 @@ class Nu7SourceTests(unittest.TestCase):
               "hash": chain_hash(12), "branchId": NU7_BRANCH, "activationHeight": 10,
               "recentHashes": {"10": chain_hash(10), "11": chain_hash(11), "12": chain_hash(12)}}
 
+    def test_public_and_obsolete_network_configs_are_rejected(self):
+        parameters = ('network_name = "Nu7StagingV3", network_magic = [122, 107, 117, 57], '
+                      'initial_nsm_value_balance = 55768414957, activation_heights = { NU7 = 10 }')
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "zakura.toml"
+            for extra in ("", f"testnet_parameters = {{ {parameters} }}\n"):
+                with self.subTest(obsolete=bool(extra)):
+                    path.write_text('[network]\nnetwork = "Testnet"\n' + extra)
+                    with self.assertRaisesRegex(ValueError, "explicit network parameter table"):
+                        status.nu7_network_parameters(path)
+
     def test_a_remote_report_becomes_probe_fields(self):
         probe = status.status_report_probe(self.REPORT, 1010)
 

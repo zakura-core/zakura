@@ -114,7 +114,7 @@ async fn setup_gossip_test() -> GossipTestSetup {
 
 /// After a successful mined block broadcast, the gossip task marks the tip as seen and does not
 /// send a duplicate committed-tip gossip for the same hash.
-#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[tokio::test(flavor = "current_thread")]
 async fn mined_block_marks_tip_after_successful_broadcast() {
     let GossipTestSetup {
         mut peer_set,
@@ -122,6 +122,9 @@ async fn mined_block_marks_tip_after_successful_broadcast() {
         mut state_service,
         gossip_task_handle: _gossip_task_handle,
     } = setup_gossip_test().await;
+
+    // Finish real database setup before controlling gossip timers.
+    tokio::time::pause();
 
     let block_two: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_2_BYTES
         .zcash_deserialize_into()
@@ -155,7 +158,7 @@ async fn mined_block_marks_tip_after_successful_broadcast() {
 
 /// A successful mined-block broadcast still suppresses the committed-tip fallback for that hash
 /// even when another mined-block notification is already queued.
-#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[tokio::test(flavor = "current_thread")]
 async fn mined_block_mark_survives_pending_submit_queue() {
     let GossipTestSetup {
         mut peer_set,
@@ -163,6 +166,9 @@ async fn mined_block_mark_survives_pending_submit_queue() {
         mut state_service,
         gossip_task_handle: _gossip_task_handle,
     } = setup_gossip_test().await;
+
+    // Finish real database setup before controlling gossip timers.
+    tokio::time::pause();
 
     let block_two: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_2_BYTES
         .zcash_deserialize_into()
@@ -210,7 +216,7 @@ async fn mined_block_mark_survives_pending_submit_queue() {
 
 /// If a mined block broadcast times out, the committed tip gossip path should still advertise the
 /// hash as a fallback.
-#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[tokio::test(flavor = "current_thread")]
 async fn mined_block_broadcast_timeout_uses_committed_tip_fallback() {
     let GossipTestSetup {
         mut peer_set,
@@ -218,6 +224,9 @@ async fn mined_block_broadcast_timeout_uses_committed_tip_fallback() {
         mut state_service,
         gossip_task_handle: _gossip_task_handle,
     } = setup_gossip_test().await;
+
+    // Finish real database setup before controlling gossip timers.
+    tokio::time::pause();
 
     let block_two: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_2_BYTES
         .zcash_deserialize_into()
@@ -261,7 +270,7 @@ async fn mined_block_broadcast_timeout_uses_committed_tip_fallback() {
 /// A peer can follow the early inventory, exhaust `PENDING_BLOCK_WAIT` waiting for the body, and
 /// give up. If the later committed broadcast then fails, the committed-tip gossip is the only
 /// thing left that prompts that peer to ask again.
-#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[tokio::test(flavor = "current_thread")]
 async fn early_broadcast_does_not_suppress_the_committed_tip_fallback() {
     let GossipTestSetup {
         mut peer_set,
@@ -269,6 +278,9 @@ async fn early_broadcast_does_not_suppress_the_committed_tip_fallback() {
         mut state_service,
         gossip_task_handle: _gossip_task_handle,
     } = setup_gossip_test().await;
+
+    // Finish real database setup before controlling gossip timers.
+    tokio::time::pause();
 
     let block_two: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_2_BYTES
         .zcash_deserialize_into()
@@ -370,7 +382,7 @@ async fn consecutive_committed_blocks_are_gossiped_without_delay() {
 
 /// While a mined block broadcast is in flight, the committed-tip path does not advertise the same
 /// hash.
-#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[tokio::test(flavor = "current_thread")]
 async fn in_flight_mined_block_broadcast_suppresses_committed_tip_gossip() {
     let GossipTestSetup {
         mut peer_set,
@@ -378,6 +390,9 @@ async fn in_flight_mined_block_broadcast_suppresses_committed_tip_gossip() {
         mut state_service,
         gossip_task_handle: _gossip_task_handle,
     } = setup_gossip_test().await;
+
+    // Finish real database setup before controlling gossip timers.
+    tokio::time::pause();
 
     let block_two: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_2_BYTES
         .zcash_deserialize_into()

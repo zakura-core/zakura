@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import json
 import tempfile
@@ -288,6 +289,7 @@ class SawtoothAndResetTests(unittest.TestCase):
         saw = analysis.sawtooth(self.tree.chain, n=10)
         assert_json(self, saw)
         self.assertEqual((saw["from_height"], saw["to_height"], len(saw["blocks"])), (BASE + 57, BASE + 66, 10))
+        self.assertEqual((saw["target_spacing"], saw["averaging_window"]), (75, 17))
         self.assertEqual(saw["blocks"][0]["dt"], 80)
         by_height = {row["height"]: row for row in saw["blocks"]}
         self.assertEqual(by_height[BASE + 65]["orphans"], 1)
@@ -303,6 +305,19 @@ class SawtoothAndResetTests(unittest.TestCase):
         self.assertEqual(full["tip_phase"]["label"], "slow")
         with self.assertRaises(ValueError):
             analysis.sawtooth(self.tree.chain, n="10")
+
+    def test_sawtooth_reports_the_rules_at_the_tip(self) -> None:
+        """target_spacing and averaging_window switch when the tip reaches NU7; an empty chain has neither."""
+        tree = Tree(dataclasses.replace(TESTNET, nu7_height=BASE + 2))
+        tree.add("g", "pre", dt=0, height=BASE)
+        tree.add("a1", "g")
+        saw = analysis.sawtooth(tree.chain)
+        self.assertEqual((saw["target_spacing"], saw["averaging_window"]), (75, 17))
+        tree.add("a2", "a1")
+        saw = analysis.sawtooth(tree.chain)
+        self.assertEqual((saw["target_spacing"], saw["averaging_window"]), (25, 102))
+        empty = analysis.sawtooth(Chain(TESTNET))
+        self.assertEqual((empty["target_spacing"], empty["averaging_window"], empty["blocks"]), (None, None, []))
 
     def test_resets(self) -> None:
         """Reset rows: gap, forward-dated next block, first-seen forward dating, phase lengths, orphans."""

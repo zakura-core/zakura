@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import math
 import struct
@@ -12,6 +13,10 @@ from zakura_fork_monitor import consensus as c
 
 
 FIXTURES = Path(__file__).with_name("fixtures")
+# `getblockheader` from a Zakura 1.6.0 Testnet node around NU7 activation (A = 4465026): [hash, bits, time]
+# for A - 130 .. A + 96, and the raw headers of A - 1 .. A + 2.
+NU7_HEADERS = FIXTURES / "testnet-nu7-headers-4464896-4465122.json"
+NU7_ACTIVATION_HASH = "000089ba27100beede16d64b34e3d1b626b428cb7ee9fe6dcfdc217ce24e78af"
 FS = "t2HifwjUj9uyxr9bknR8LFuQbc98c3vkXtu"
 FOUNDRY_ADDR = "tmJggjzf2qPBbmUFfr7eYdqFUV15y1MvvVu"
 FOUNDRY_TAG = "Foundry Zcash Pool #PrivacyMatters"
@@ -88,6 +93,12 @@ RPC_BLOCKS = {
 def fixture_block(height: int) -> bytes:
     """Return the raw bytes of a fixture block."""
     return bytes.fromhex((FIXTURES / f"block-test-{height}.hex").read_text().strip())
+
+
+def nu7_headers() -> dict[int, tuple[int, int]]:
+    """Return {height: (bits, time)} from the NU7 activation fixture."""
+    raw = json.loads(NU7_HEADERS.read_text())["headers"]
+    return {int(height): (bits, time) for height, (_, bits, time) in raw.items()}
 
 
 def base58check_decode(address: str) -> bytes:
@@ -409,6 +420,54 @@ class DifficultyTests(unittest.TestCase):
         self.assertFalse(c.is_min_difficulty(c.TESTNET, 299_187, 5000, 1000))
         self.assertTrue(c.is_min_difficulty(c.TESTNET, 299_188, 5000, 1000))
         self.assertFalse(c.is_min_difficulty(c.MAINNET, 3_000_000, 10_000, 1000))
+        nu7 = c.TESTNET.nu7_height
+        self.assertFalse(c.is_min_difficulty(c.TESTNET, nu7, 1450, 1000))  # 18 x 25 s, not 6 x 25 s
+        self.assertTrue(c.is_min_difficulty(c.TESTNET, nu7, 1451, 1000))
+
+    def test_rules_switch_at_nu7(self):
+        """ZIP 218's rules apply from Testnet's NU7 height; Mainnet has no NU7 height."""
+        pre, nu7 = c.PRE_NU7_RULES, c.NU7_RULES
+        self.assertEqual((nu7.target_spacing, nu7.averaging_window), (25, 102))
+        self.assertEqual((nu7.averaging_window_timespan, nu7.min_timespan, nu7.max_timespan), (2550, 2142, 3366))
+        self.assertEqual((pre.min_diff_gap, nu7.min_diff_gap), (450, 450))
+        self.assertEqual((pre.context_len, nu7.context_len), (28, 113))
+        self.assertIs(c.TESTNET.difficulty_rules(4_465_025), pre)
+        self.assertIs(c.TESTNET.difficulty_rules(4_465_026), nu7)
+        self.assertIsNone(c.MAINNET.nu7_height)
+        self.assertIs(c.MAINNET.difficulty_rules(10**8), pre)
+        self.assertEqual((c.TESTNET.max_context_len, c.MAINNET.max_context_len), (113, 28))
+
+    def test_expected_bits_across_nu7_activation(self):
+        """Every fixture height with a full context, A - 102 .. A + 96, gets its real nBits."""
+        chain = nu7_headers()
+        nu7 = c.TESTNET.nu7_height
+        self.assertEqual(json.loads(NU7_HEADERS.read_text())["headers"][str(nu7)][0], NU7_ACTIVATION_HASH)
+        first, last = min(chain), max(chain)
+        checked = []
+        for height in range(first + 1, last + 1):
+            need = c.TESTNET.difficulty_rules(height).context_len
+            if height - need < first:
+                continue
+            prev = [chain[height - i] for i in range(1, need + 1)]
+            bits, time = chain[height]
+            self.assertEqual(c.expected_bits(c.TESTNET, height, time, prev), bits, height)
+            checked.append(height)
+        self.assertEqual((checked[0], checked[-1], len(checked)), (nu7 - 102, nu7 + 96, 199))
+        # The pre-NU7 window and spacing reject the activation block.
+        prev = [chain[nu7 - i] for i in range(1, 114)]
+        bits, time = chain[nu7]
+        self.assertNotEqual(c.expected_bits(dataclasses.replace(c.TESTNET, nu7_height=None), nu7, time, prev), bits)
+
+    def test_nu7_min_difficulty_decision(self):
+        """From NU7 a 450 s gap keeps the standard nBits on the real chain, and 451 s gets the PoW limit."""
+        chain = nu7_headers()
+        nu7 = c.TESTNET.nu7_height
+        for height in (nu7, nu7 + 60):
+            prev = [chain[height - i] for i in range(1, 114)]
+            bits, parent_time = chain[height][0], prev[0][1]
+            for gap, want in ((151, bits), (450, bits), (451, c.TESTNET.pow_limit_bits)):
+                with self.subTest(height=height, gap=gap):
+                    self.assertEqual(c.expected_bits(c.TESTNET, height, parent_time + gap, prev), want)
 
     def test_expected_bits_over_headers_fixture(self):
         raw = json.loads((FIXTURES / "testnet-headers-4413473-4414272.json").read_text())
@@ -425,9 +484,12 @@ class DifficultyTests(unittest.TestCase):
         self.assertEqual(predicted, 772)
         self.assertGreaterEqual(min_diff, 1)
 
-    def test_expected_bits_needs_28_headers(self):
+    def test_expected_bits_needs_the_rules_context(self):
+        """A context shorter than 28 entries before NU7, or 113 from NU7, raises."""
         with self.assertRaises(ValueError):
             c.expected_bits(c.TESTNET, 4410737, 0, [(0x1F765A75, 0)] * 27)
+        with self.assertRaises(ValueError):
+            c.expected_bits(c.TESTNET, c.TESTNET.nu7_height, 0, [(0x1F765A75, 0)] * 112)
 
     def test_expected_bits_clamps_to_pow_limit(self):
         prev = [(0x2007FFFF, 10_000 - 1000 * i) for i in range(28)]  # very slow blocks
@@ -513,9 +575,9 @@ class EncodingTests(unittest.TestCase):
     def test_sha256d_and_network_params(self):
         self.assertEqual(c.sha256d(b"")[:4].hex(), "5df6e0e2")
         self.assertIs(c.NETWORKS["testnet"], c.TESTNET)
-        self.assertEqual(c.TESTNET.averaging_window_timespan, 1275)
-        self.assertEqual(c.TESTNET.min_timespan, 1275 * 84 // 100)
-        self.assertEqual(c.TESTNET.max_timespan, 1275 * 132 // 100)
+        self.assertEqual(c.PRE_NU7_RULES.averaging_window_timespan, 1275)
+        self.assertEqual(c.PRE_NU7_RULES.min_timespan, 1275 * 84 // 100)
+        self.assertEqual(c.PRE_NU7_RULES.max_timespan, 1275 * 132 // 100)
         self.assertEqual(c.MAINNET.magic.hex(), "24e92764")
 
 

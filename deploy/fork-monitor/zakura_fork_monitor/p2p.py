@@ -761,8 +761,8 @@ class P2PObserver:
         self._announces: OrderedDict[str, _Announce] = OrderedDict()
         self._fetches: OrderedDict[str, _Fetch] = OrderedDict()
         self._running = False
-        # (bits, time) entries the expected difficulty needs: the parent and its ancestors.
-        self._context_len = params.averaging_window + params.median_span
+        # (bits, time) entries the expected difficulty needs at any height: the parent and its ancestors.
+        self._context_len = params.max_context_len
 
     @classmethod
     def from_config(cls, params: NetworkParams, monitor: Any, config: Any, **kwargs: Any) -> P2PObserver:
@@ -1093,13 +1093,14 @@ class P2PObserver:
 
         Valid means dated at most 2 h ahead, nBits as `expected_bits` predicts, and
         passing `check_pow`. `context` holds (bits, time) of the parent and its
-        ancestors, newest first (see `_ancestry`); nBits is checked only when it is complete.
+        ancestors, newest first (see `_ancestry`); nBits is checked only when it
+        holds every ancestor the rules at `height` read.
         """
         if header.time > now + MAX_FUTURE_BLOCK_TIME:
             raise PeerError(f"header {header.hash} is dated more than 2 h ahead")
         if (
             height is not None
-            and len(context) >= self._context_len
+            and len(context) >= self.params.difficulty_rules(height).context_len
             and header.bits != expected_bits(self.params, height, header.time, context)
         ):
             raise PeerError(f"header {header.hash} has the wrong difficulty")

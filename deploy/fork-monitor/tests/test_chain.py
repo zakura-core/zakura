@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import json
 import tempfile
@@ -596,6 +597,34 @@ class PhaseTests(unittest.TestCase):
         self.assertEqual((second.gap, second.next_dt, second.cycle_blocks), (451, None, None))
         self.assertAlmostEqual(second.d_pre, difficulty_from_bits(EASY, TESTNET))
         self.assertEqual([r.height for r in b.chain.resets(since_height=BASE + 32)], [second.height])
+
+    def test_nu7_fast_phase_uses_the_nu7_window_and_spacing(self) -> None:
+        """From NU7 the fast phase ends when the 102-block mean reaches 12.5 s, not the 17-block mean 37.5 s."""
+        fast_blocks = []
+        for nu7_height in (None, BASE):
+            b = Builder(Chain(dataclasses.replace(TESTNET, nu7_height=nu7_height)))
+            b.genesis()
+            b.line("p", "g", 1, 110, dt=25)
+            b.add("r", "p110", dt=451, bits=MIN)
+            b.line("f", "r", 1, 120, dt=5, bits=EASY)
+            b.line("s", "f120", 1, 20, dt=100, bits=EASY)
+            fast_blocks.append(b.chain.resets()[0].fast_blocks)
+        # m blocks at 100 s after the burst: 85 + 95m >= 17 * 37.5 at m = 6; 510 + 95m >= 102 * 12.5 at m = 9.
+        self.assertEqual(fast_blocks, [126, 129])
+
+    def test_fast_phase_open_at_nu7_waits_for_the_nu7_window(self) -> None:
+        """A cycle still fast at activation stays fast until the 102-block window has left the reset."""
+        b = Builder(Chain(dataclasses.replace(TESTNET, nu7_height=BASE + 51)))
+        b.genesis()
+        b.line("p", "g", 1, 40, dt=75)
+        b.add("r", "p40", dt=451, bits=MIN)
+        b.line("f", "r", 1, 9, dt=5, bits=EASY)
+        b.line("s", "f9", 1, 100, dt=100, bits=EASY)
+        r = BASE + 41
+        self.assertTrue(b.chain.phase_at(r + 17).fast)  # the pre-NU7 rules would have ended it here
+        self.assertTrue(b.chain.phase_at(r + 101).fast)
+        self.assertFalse(b.chain.phase_at(r + 102).fast)
+        self.assertEqual(b.chain.resets()[0].fast_blocks, 102)
 
     def test_mainnet_has_no_resets(self) -> None:
         """Pow-limit bits are not a reset on a network without the minimum-difficulty rule."""

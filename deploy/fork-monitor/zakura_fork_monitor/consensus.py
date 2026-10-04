@@ -4,9 +4,9 @@ Everything here is side-effect free and safe on untrusted bytes: parsers raise
 `ParseError` (a `ValueError`) instead of reading past their input, and every loop
 is bounded by the input length or an explicit cap.
 
-The difficulty helpers implement the post-Blossom, pre-NU7 rules (75 s spacing,
-17-block window) that Mainnet and Testnet currently run; pre-Blossom heights are
-out of scope.
+The difficulty helpers implement the post-Blossom rules and switch to ZIP 218's
+at each network's NU7 height (`NetworkParams.difficulty_rules`), as Zakura
+v1.6.0 does; pre-Blossom heights are out of scope.
 
 Notes:
 - `TESTNET.funding_stream_addresses` holds only `t2HifwjU...`; `t3cFfPt1...`
@@ -88,6 +88,58 @@ class ParseError(ValueError):
     """Raised when consensus data is truncated, non-canonical or out of range."""
 
 
+# Difficulty-adjustment constants that NU7 keeps: PoWMedianBlockSpan, PoWDampingFactor, and
+# PoWMaxAdjustUp and PoWMaxAdjustDown in percent.
+MEDIAN_SPAN = 11
+DAMPING = 4
+MAX_ADJUST_UP_PERCENT = 16
+MAX_ADJUST_DOWN_PERCENT = 32
+
+
+@dataclass(frozen=True, slots=True)
+class DifficultyRules:
+    """Difficulty-adjustment parameters for a block, selected by the block's own height.
+
+    They govern its whole adjustment, so the first blocks from NU7 average pre-NU7
+    targets and times against the NU7 timespan; nothing is rescaled.
+    """
+
+    target_spacing: int  # PoWTargetSpacing, seconds
+    averaging_window: int  # PoWAveragingWindow, blocks
+    min_diff_gap_multiplier: int  # Testnet minimum-difficulty gap in target spacings (see `min_diff_gap`)
+
+    @property
+    def averaging_window_timespan(self) -> int:
+        """Return the ideal duration of one averaging window in seconds."""
+        return self.averaging_window * self.target_spacing
+
+    @property
+    def min_timespan(self) -> int:
+        """Return the lower bound on the damped timespan (`MinActualTimespan`)."""
+        return self.averaging_window_timespan * (100 - MAX_ADJUST_UP_PERCENT) // 100
+
+    @property
+    def max_timespan(self) -> int:
+        """Return the upper bound on the damped timespan (`MaxActualTimespan`)."""
+        return self.averaging_window_timespan * (100 + MAX_ADJUST_DOWN_PERCENT) // 100
+
+    @property
+    def min_diff_gap(self) -> int:
+        """Return the parent gap in seconds above which a Testnet block must carry the PoW-limit nBits."""
+        return self.min_diff_gap_multiplier * self.target_spacing
+
+    @property
+    def context_len(self) -> int:
+        """Return how many ancestors' (bits, time) `expected_bits` reads."""
+        return self.averaging_window + MEDIAN_SPAN
+
+
+# ZIP 208's post-Blossom rules, then ZIP 218's from NU7: 25 s spacing and a 102-block window,
+# with Testnet's minimum-difficulty gap kept at 450 s.
+PRE_NU7_RULES = DifficultyRules(target_spacing=75, averaging_window=17, min_diff_gap_multiplier=6)
+NU7_RULES = DifficultyRules(target_spacing=25, averaging_window=102, min_diff_gap_multiplier=18)
+
+
 @dataclass(frozen=True, slots=True)
 class NetworkParams:
     """Consensus and P2P constants for one Zcash network."""
@@ -97,24 +149,24 @@ class NetworkParams:
     default_port: int
     pow_limit: int
     pow_limit_bits: int
-    target_spacing: int
-    averaging_window: int
-    median_span: int
-    damping: int
-    min_timespan: int
-    max_timespan: int
+    # NU7 activation height; None while the network has not scheduled NU7.
+    nu7_height: int | None
     # First height where the Testnet minimum-difficulty rule applies; None disables it.
     min_diff_after_height: int | None
-    min_diff_gap_multiplier: int
     genesis_hash: str
     p2pkh_prefix: bytes
     p2sh_prefix: bytes
     funding_stream_addresses: frozenset[str]
 
+    def difficulty_rules(self, height: int) -> DifficultyRules:
+        """Return the difficulty-adjustment rules for a block at `height` (ZIP 218's `IsNU7Activated`)."""
+        return NU7_RULES if self.nu7_height is not None and height >= self.nu7_height else PRE_NU7_RULES
+
     @property
-    def averaging_window_timespan(self) -> int:
-        """Return the ideal duration of one averaging window in seconds."""
-        return self.averaging_window * self.target_spacing
+    def max_context_len(self) -> int:
+        """Return the most ancestors `expected_bits` reads at any height on this network."""
+        rules = (PRE_NU7_RULES,) if self.nu7_height is None else (PRE_NU7_RULES, NU7_RULES)
+        return max(r.context_len for r in rules)
 
 
 TESTNET = NetworkParams(
@@ -123,14 +175,8 @@ TESTNET = NetworkParams(
     default_port=18233,
     pow_limit=(1 << 251) - 1,
     pow_limit_bits=0x2007FFFF,
-    target_spacing=75,
-    averaging_window=17,
-    median_span=11,
-    damping=4,
-    min_timespan=1071,  # 17 * 75 * (100 - 16) / 100
-    max_timespan=1683,  # 17 * 75 * (100 + 32) / 100
+    nu7_height=4_465_026,
     min_diff_after_height=299_188,
-    min_diff_gap_multiplier=6,
     genesis_hash="05a60a92d99d85997cce3b87616c089f6124d7342af37106edc76126334a2c38",
     p2pkh_prefix=b"\x1d\x25",
     p2sh_prefix=b"\x1c\xba",
@@ -143,14 +189,8 @@ MAINNET = NetworkParams(
     default_port=8233,
     pow_limit=(1 << 243) - 1,
     pow_limit_bits=0x1F07FFFF,
-    target_spacing=75,
-    averaging_window=17,
-    median_span=11,
-    damping=4,
-    min_timespan=1071,
-    max_timespan=1683,
+    nu7_height=None,
     min_diff_after_height=None,
-    min_diff_gap_multiplier=6,
     genesis_hash="00040fe8ec8471911baa1db1266ea15dd06b4a8a5c453883c000b031973dce08",
     p2pkh_prefix=b"\x1c\xb8",
     p2sh_prefix=b"\x1c\xbd",
@@ -236,29 +276,31 @@ def difficulty_from_bits(bits: int, params: NetworkParams) -> float:
 
 
 def is_min_difficulty(params: NetworkParams, height: int, time: int, parent_time: int) -> bool:
-    """Return True when the Testnet minimum-difficulty rule applies (gap strictly over 6 spacings)."""
+    """Return True when the Testnet minimum-difficulty rule applies: the parent gap exceeds `min_diff_gap`."""
     start = params.min_diff_after_height
-    gap_limit = params.min_diff_gap_multiplier * params.target_spacing
+    gap_limit = params.difficulty_rules(height).min_diff_gap
     return start is not None and height >= start and time - parent_time > gap_limit
 
 
 def expected_bits(params: NetworkParams, height: int, time: int, prev: list[tuple[int, int]]) -> int:
-    """Predict nBits for a block at `height` with header `time`.
+    """Predict nBits for a block at `height` with header `time`, under `params.difficulty_rules(height)`.
 
     `prev` holds (bits, time) of the previous blocks on the same branch, newest
-    first (prev[0] is the parent); at least averaging_window + median_span (28).
+    first (prev[0] is the parent); at least the rules' `context_len` (28 before
+    NU7, 113 from NU7). Later entries are ignored.
     """
-    window, span = params.averaging_window, params.median_span
-    if len(prev) < window + span:
-        raise ValueError(f"need {window + span} previous headers, got {len(prev)}")
+    rules = params.difficulty_rules(height)
+    window = rules.averaging_window
+    if len(prev) < rules.context_len:
+        raise ValueError(f"need {rules.context_len} previous headers, got {len(prev)}")
     if is_min_difficulty(params, height, time, prev[0][1]):
         return params.pow_limit_bits
     mean_target = sum(bits_to_target(bits) for bits, _ in prev[:window]) // window
-    newer = _median([t for _, t in prev[:span]])
-    older = _median([t for _, t in prev[window : window + span]])
-    ideal = params.averaging_window_timespan
-    damped = ideal + _trunc_div(newer - older - ideal, params.damping)
-    bounded = min(max(damped, params.min_timespan), params.max_timespan)
+    newer = _median([t for _, t in prev[:MEDIAN_SPAN]])
+    older = _median([t for _, t in prev[window : window + MEDIAN_SPAN]])
+    ideal = rules.averaging_window_timespan
+    damped = ideal + _trunc_div(newer - older - ideal, DAMPING)
+    bounded = min(max(damped, rules.min_timespan), rules.max_timespan)
     limit = bits_to_target(params.pow_limit_bits)
     return target_to_bits(min(limit, mean_target // ideal * bounded))
 

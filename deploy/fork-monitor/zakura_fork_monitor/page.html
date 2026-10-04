@@ -1608,13 +1608,14 @@ footer a:hover { color: var(--pink-hi); }
     const phase = data.tip_phase;
     const resets = list(data.resets);
     const last = resets.length ? resets[resets.length - 1] : null;
-    const recent = blocks.slice(-17).map((b) => b.dt).filter(isNum);
+    const span = data.averaging_window;
+    const recent = isNum(span) ? blocks.slice(-span).map((b) => b.dt).filter(isNum) : [];
     const mean = recent.length ? recent.reduce((a, b) => a + b, 0) / recent.length : null;
     $('saw-facts').replaceChildren(
       fact('Phase', phase ? text(phase.label) : DASH, phase ? 'k = ' + num(phase.k) + ' blocks since reset' : 'no reset in the window'),
       fact('Difficulty', phase ? compact(phase.difficulty) : DASH, phase ? 'D/D_pre ' + compact(phase.d_ratio) : null),
       fact('Pre-reset level', phase ? compact(phase.d_pre) : DASH, 'difficulty before the last reset'),
-      fact('Mean interval', mean == null ? DASH : dur(mean), 'last 17 blocks; target ' + dur(data.target_spacing)),
+      fact('Mean interval', mean == null ? DASH : dur(mean), 'last ' + num(span) + ' blocks; target ' + dur(data.target_spacing)),
       fact('Last reset', last ? num(last.height) : DASH, last ? text(last.miner) + ', gap ' + dur(last.gap) + ', next ' + dur(last.next_dt) : 'none in range'),
       fact('Resets shown', num(resets.length), 'within the plotted range'));
   }

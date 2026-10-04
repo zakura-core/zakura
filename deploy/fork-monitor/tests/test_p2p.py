@@ -80,6 +80,9 @@ ALLOWED_COMMANDS = {
     "headers",
 }
 FAST = p2p.Timings(handshake_timeout=2.0, poll_timeout=3.0, fetch_timeout=2.0)
+# Real Testnet headers around NU7 activation; see tests/test_consensus.py for the layout.
+NU7_HEADERS = Path(__file__).resolve().parent / "fixtures" / "testnet-nu7-headers-4464896-4465122.json"
+REAL_EQUIHASH = consensus.check_equihash  # captured before `setUpModule` stubs it
 
 
 def stub_equihash(header: BlockHeader) -> bool:
@@ -1119,6 +1122,27 @@ class ValidationTests(DirectTestCase):
         ):
             with self.assertRaisesRegex(p2p.PeerError, "wrong difficulty"):
                 check([header])
+
+    def test_real_nu7_activation_headers(self) -> None:
+        """Testnet's real headers A - 1 .. A + 2 pass with real Equihash; the pre-NU7 rules reject block A."""
+        data = json.loads(NU7_HEADERS.read_text())
+        nu7 = TESTNET.nu7_height
+        chain = Chain(TESTNET)
+        prev_hash = ROOT
+        for height in range(min(map(int, data["headers"])), nu7 - 1):
+            block_hash, bits, block_time = data["headers"][str(height)]
+            known = BlockHeader(block_hash, prev_hash, 4, "00" * 32, block_time, bits, "00" * 32, b"")
+            chain.add(known, height, first_seen_at=1.0)
+            prev_hash = block_hash
+        headers = [parse_header(bytes.fromhex(data["raw"][str(height)]))[0] for height in range(nu7 - 1, nu7 + 3)]
+        self.assertEqual(headers[0].prev_hash, prev_hash)
+        with mock.patch.object(consensus, "check_equihash", REAL_EQUIHASH):
+            observer = p2p.P2PObserver(TESTNET, FakeMonitor(self.store, chain))
+            self.assertEqual(observer._context_len, 113)
+            observer._check_headers(prev_hash, nu7 - 2, headers)
+            stale = p2p.P2PObserver(dataclasses.replace(TESTNET, nu7_height=None), FakeMonitor(self.store, chain))
+            with self.assertRaisesRegex(p2p.PeerError, f"header {headers[1].hash} has the wrong difficulty"):
+                stale._check_headers(prev_hash, nu7 - 2, headers)
 
     async def test_block_bodies_must_match_their_place_in_the_chain(self) -> None:
         """A body whose coinbase height contradicts the chain, or whose header is forged, ends the session."""

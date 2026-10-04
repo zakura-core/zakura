@@ -528,7 +528,7 @@ class Chain:
         else:
             reset = self._reset_heights[slot]
             cycle = self._cycles[reset]
-            self._scan_fast(cycle, height)
+            self._scan_fast(reset, height)
             phase = Phase(
                 height=height,
                 k=height - reset,
@@ -554,7 +554,7 @@ class Chain:
             parent, following = self._canon_at(reset - 1), self._canon_at(reset + 1)
             next_reset = heights[slot + 1] if slot + 1 < len(heights) else None
             cycle = self._cycles[reset]
-            self._scan_fast(cycle, next_reset - 1 if next_reset is not None else top)
+            self._scan_fast(reset, next_reset - 1 if next_reset is not None else top)
             out.append(
                 Reset(
                     height=reset,
@@ -923,12 +923,11 @@ class Chain:
 
     def _canon_append(self, nodes: Iterable[Node]) -> None:
         """Append blocks to the canonical chain, recording resets."""
-        window = self.params.averaging_window
         canon = self._canon
         for node in nodes:
             if node.is_min_diff:
                 d_pre = self._difficulty(canon[-1].bits) if canon else None
-                self._cycles[node.height] = _Cycle(d_pre=d_pre, scanned=node.height + window - 1)
+                self._cycles[node.height] = _Cycle(d_pre=d_pre, scanned=node.height)
                 self._reset_heights.append(node.height)
             canon.append(node)
             self._phases.append(None)
@@ -943,7 +942,7 @@ class Chain:
         if self._reset_heights:
             reset = self._reset_heights[-1]
             cycle = self._cycles[reset]
-            cycle.scanned = max(min(cycle.scanned, height), reset + self.params.averaging_window - 1)
+            cycle.scanned = min(cycle.scanned, height)
             if cycle.fast_end is not None and cycle.fast_end > height:
                 cycle.fast_end = None
 
@@ -957,12 +956,11 @@ class Chain:
         if not below:
             return
         below.reverse()
-        window = self.params.averaging_window
         self._canon[:0] = below
         self._canon_base = below[0].height
         new_resets = [n.height for n in below if n.is_min_diff]
         for reset in new_resets:
-            self._cycles[reset] = _Cycle(d_pre=None, scanned=reset + window - 1)
+            self._cycles[reset] = _Cycle(d_pre=None, scanned=reset)
         self._reset_heights[:0] = new_resets
         for reset, cycle in self._cycles.items():
             if cycle.d_pre is None and (before := self._canon_at(reset - 1)) is not None:
@@ -985,7 +983,7 @@ class Chain:
                 else self._canon_base + len(self._canon) - 1
             )
             # Finish the fast-phase scan while the blocks it needs are still here.
-            self._scan_fast(self._cycles[reset], end)
+            self._scan_fast(reset, end)
             for old in self._reset_heights[:governing]:
                 del self._cycles[old]
             del self._reset_heights[:governing]
@@ -993,22 +991,31 @@ class Chain:
         del self._phases[:cut]
         self._canon_base = height
 
-    def _scan_fast(self, cycle: _Cycle, upto: int) -> None:
-        """Advance the search for the first height whose trailing-window mean interval reaches target/2."""
+    def _scan_fast(self, reset: int, upto: int) -> None:
+        """Advance the search for the end of `reset`'s fast phase, up to height `upto`.
+
+        It ends at the first height whose trailing averaging window holds only blocks from the
+        reset on and averages at least half the target spacing, both under the rules at that
+        height. So a cycle still fast at NU7 activation cannot end before NU7's wider window has
+        passed its reset.
+        """
+        cycle = self._cycles[reset]
         if cycle.fast_end is not None:
             return
-        window = self.params.averaging_window
-        threshold = window * self.params.target_spacing  # 2 * window * (target / 2), in integers
         canon, base = self._canon, self._canon_base
         upto = min(upto, base + len(canon) - 1)
         height = cycle.scanned + 1
         while height <= upto:
-            start = height - window - base
-            if start < 0:
-                break
-            if 2 * (canon[start + window].time - canon[start].time) >= threshold:
-                cycle.fast_end = cycle.scanned = height
-                return
+            rules = self.params.difficulty_rules(height)
+            window = rules.averaging_window
+            if height - window >= reset:
+                start = height - window - base
+                if start < 0:
+                    break
+                # 2 * window * (target / 2), in integers
+                if 2 * (canon[start + window].time - canon[start].time) >= window * rules.target_spacing:
+                    cycle.fast_end = cycle.scanned = height
+                    return
             height += 1
         cycle.scanned = height - 1
 

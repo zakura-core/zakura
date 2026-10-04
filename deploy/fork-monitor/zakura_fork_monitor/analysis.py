@@ -86,7 +86,8 @@ PERIODS = (("1h", 3_600), ("24h", 86_400), ("7d", 7 * 86_400))
 HOURLY_WINDOW = 72 * 3_600
 DEFAULT_PROPAGATION_WINDOW = 6 * 3_600.0
 DEFAULT_PROBE_WINDOW = 86_400.0
-# Blocks-since-reset buckets of the historical analysis; 17 is the difficulty averaging window.
+# Blocks-since-reset buckets of the historical (pre-NU7) analysis, kept comparable across NU7; 17 was its
+# averaging window.
 K_BUCKETS = ((0, 0, "0"), (1, 17, "1-17"), (18, 50, "18-50"), (51, 100, "51-100"), (101, 200, "101-200"),
              (201, 300, "201-300"), (301, 400, "301-400"), (401, None, ">=401"))
 K_FINE_BUCKETS = ((0, 0, "0"), (1, 1, "1"), (2, 2, "2"), (3, 5, "3-5"), (6, 10, "6-10"), (11, 17, "11-17"),
@@ -666,7 +667,7 @@ def sawtooth(chain: Chain, n: int = 1_500) -> dict[str, Any]:
     """Return the last `n` canonical blocks (clamped to 1..10000) for the sawtooth chart.
 
     Returns:
-        {"from_height", "to_height", "target_spacing",
+        {"from_height", "to_height", "target_spacing", "averaging_window": both in force at to_height,
          "blocks": [{"height", "time", "dt": time - previous canonical time | None, "difficulty",
                      "k", "fast", "min_diff", "orphans": attached non-canonical blocks at the height}],
          "resets": [reset, see `resets`] (oldest first, within the range),
@@ -674,10 +675,11 @@ def sawtooth(chain: Chain, n: int = 1_500) -> dict[str, Any]:
     """
     n = _clamp_int(n, 1, MAX_SAWTOOTH, "n")
     best = chain.best_tip()
-    out: dict[str, Any] = {"from_height": None, "to_height": None, "target_spacing": chain.params.target_spacing,
+    out: dict[str, Any] = {"from_height": None, "to_height": None, "target_spacing": None, "averaging_window": None,
                            "blocks": [], "resets": [], "tip_phase": None}
     if best is None:
         return out
+    rules = chain.params.difficulty_rules(best.height)
     nodes = chain.canonical_nodes(best.height - n + 1)
     previous = chain.get(chain.canonical_hash_at(nodes[0].height - 1) or "")
     previous_time = previous.time if previous is not None else None
@@ -695,6 +697,8 @@ def sawtooth(chain: Chain, n: int = 1_500) -> dict[str, Any]:
     out.update(
         from_height=nodes[0].height,
         to_height=best.height,
+        target_spacing=rules.target_spacing,
+        averaging_window=rules.averaging_window,
         blocks=rows,
         resets=[_reset(reset) for reset in chain.resets(since_height=nodes[0].height)],
         tip_phase=_phase(chain.phase_at(best.height)),

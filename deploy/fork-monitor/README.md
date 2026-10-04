@@ -4,7 +4,7 @@ A standalone observatory for Zcash testnet orphans, reorgs and network splits. I
 
 ## What it measures and why
 
-Testnet runs a permanent difficulty sawtooth. When a block comes more than 6 × 75 s after its parent, the minimum-difficulty rule lets it be mined at the PoW limit. Zakura's `getblocktemplate` switches to such a template 150 s early and dates it `parent + 451`, so these reset blocks are future-dated (see `min_difficulty_min_time` in [`difficulty.rs`](../../crates/zakura-state/src/service/read/difficulty.rs)). After a reset, blocks come every few seconds until the 17-block averaging window catches up. Most orphans happen in this fast phase, and many of them are a miner racing itself.
+Testnet runs a permanent difficulty sawtooth. When a block comes more than 450 s after its parent (6 × 75 s before NU7, 18 × 25 s from NU7 at height 4,465,026), the minimum-difficulty rule lets it be mined at the PoW limit. Zakura's `getblocktemplate` before 1.5.1 switched to such a template 150 s early and dated it `parent + 451`, so those reset blocks were future-dated (see `min_difficulty_min_time` in [`difficulty.rs`](../../crates/zakura-state/src/service/read/difficulty.rs)). After a reset, blocks come every few seconds until the averaging window (17 blocks before NU7, 102 from NU7) catches up. Most orphans happen in this fast phase, and many of them are a miner racing itself. The monitor applies the pre-NU7 or NU7 difficulty rules by height, as Zakura 1.6.0 does.
 
 Equal-work races are resolved differently by the implementations on the network:
 
@@ -158,7 +158,7 @@ Every route answers GET and HEAD. The API routes return JSON with `Cache-Control
 | `/api/forks?limit=&since=` | Fork events with winners, losers, tie-break analysis, probes and which sources adopted which branch |
 | `/api/orphans/stats` | Orphan rate by hour, by day, by `k` bucket, by D/D_pre bucket, and fast vs slow |
 | `/api/miners?since=` | Per-miner canonical, stale, self-orphan, race and reset counts |
-| `/api/sawtooth?n=` | Per canonical block: height, time, dt, difficulty, k, min-difficulty flag and orphans; plus resets |
+| `/api/sawtooth?n=` | Per canonical block: height, time, dt, difficulty, k, min-difficulty flag and orphans; plus resets, and the target spacing and averaging window at the tip |
 | `/api/resets?limit=&since=` | Resets with gap, next dt, fast-phase length and cycle length |
 | `/api/propagation?since=` | First-seen spread per implementation group |
 | `/api/probes?since=` | Availability probe outcomes per implementation and version: announce probes in `by_group`, sampled reprobes in `reprobe_by_group`, body fetches only in `by_reason`. Plus "announced then notfound" incidents. |
@@ -180,7 +180,7 @@ The host needs:
 - HTTPS to CipherScan, and DNS.
 - No inbound port except Caddy's. The observer only dials out.
 
-With about 45 peers, expect 100 to 200 MB RSS and a few percent of one core. At that peer count the database grows by about 29 MB per 1000 blocks. Each connected peer adds one sighting and usually one tip change per block, about 0.65 KB with their indexes, so growth scales with the peer count. Testnet makes about 4,500 to 7,000 blocks a day, so 30 days of retention come to about 4 to 6 GB. Blocks are never pruned and add about 0.66 MB per 1000 blocks on top, 1 to 2 GB a year.
+With about 45 peers, expect 100 to 200 MB RSS and a few percent of one core. At that peer count the database grows by about 29 MB per 1000 blocks. Each connected peer adds one sighting and usually one tip change per block, about 0.65 KB with their indexes, so growth scales with the peer count. Before NU7, Testnet made about 4,500 to 7,000 blocks a day, so 30 days of retention came to about 4 to 6 GB. Blocks are never pruned and add about 0.66 MB per 1000 blocks on top, 1 to 2 GB a year.
 
 ```bash
 sudo useradd --system --home-dir /var/lib/zakura-fork-monitor --shell /usr/sbin/nologin zakura-fork-monitor
@@ -213,6 +213,6 @@ To upgrade, copy the new `zakura_fork_monitor/` directory and run `sudo systemct
 - **Fetched blocks have no arrival time.** Backfilled blocks have no first-seen time, so forward-dating and "seen first" show as unknown until a live sighting, which can itself be late (for example the first RPC tip poll after a restart). Bodies fetched later over P2P or RPC are timed at the fetch.
 - **Side-branch bodies are best effort.** Zebra serves only its best chain, so a side block is fetched from the peer that just showed it to us, or from Zakura nodes, which serve retained side chains (at most 10 per node). Live, some tips the fleet lists as `valid-fork` in `getchaintips` still came back `notfound` over P2P, and some of TazMiner's `valid-fork` tips reached no peer at all. Such blocks stay header-only or unknown, and unattributed.
 - **Forks below the window.** A peer on a fork below the in-memory window is shown as stuck from its version-message height; its fork point is unknown.
-- **Untrusted coinbases.** P2P headers and bodies are checked for their target, the Equihash (200, 9) solution, the expected nBits when the 28 ancestors are in the window, and a time at most 2 h ahead; a body's coinbase height must match its place in the chain. Nothing else ties a body to its header. The merkle root is not checked, and checking it would not help: v5 and later txids leave out the coinbase scriptSig, which holds the tag and the template marker. So a body from a P2P peer outside the fleet counts as untrusted until RPC or a fleet peer serves that block. Side blocks that only other peers served keep their untrusted attribution.
+- **Untrusted coinbases.** P2P headers and bodies are checked for their target, the Equihash (200, 9) solution, the expected nBits when the ancestors it depends on (28 before NU7, 113 from NU7) are in the window, and a time at most 2 h ahead; a body's coinbase height must match its place in the chain. Nothing else ties a body to its header. The merkle root is not checked, and checking it would not help: v5 and later txids leave out the coinbase scriptSig, which holds the tag and the template marker. So a body from a P2P peer outside the fleet counts as untrusted until RPC or a fleet peer serves that block. Side blocks that only other peers served keep their untrusted attribution.
 - **Cheap testnet orphans.** A min-difficulty block costs about 32 Equihash solutions, so anyone can mine consensus-valid side blocks. The monitor counts every such block it is shown as an orphan, even one relayed only to it.
 - **Single process.** One SQLite file with no high availability.

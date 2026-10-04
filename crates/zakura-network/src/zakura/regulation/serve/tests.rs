@@ -877,14 +877,14 @@ fn a_part_the_row_allows_but_the_cap_refuses_queues_nothing() {
 async fn queued_requests_allocate_only_commitments_until_dispatch() {
     const COUNT: u32 = 64_000;
     // Exercise the production protocol ceiling without starting a producer.
-    let request = crate::zakura::MessageRule {
+    const REQUEST: crate::zakura::MessageRule = crate::zakura::MessageRule {
         role: crate::zakura::MessageRole::Request {
             max_in_flight: COUNT / 2,
             cadence: None,
         },
         ..GET
     };
-    let capacity = ServeCapacity::new("queued-memory", &request, LIMITS).unwrap();
+    let capacity = ServeCapacity::new("queued-memory", &REQUEST, LIMITS).unwrap();
     let Session {
         serve,
         output: _output,

@@ -8,9 +8,6 @@ use hex::{FromHex, FromHexError, ToHex};
 
 use crate::serialization::{SerializationError, ZcashDeserialize, ZcashSerialize};
 
-#[cfg(test)]
-mod test_vectors;
-
 /// The randomness used in the Pedersen Hash for note commitment.
 ///
 /// Equivalent to `sapling_crypto::note::CommitmentRandomness`,

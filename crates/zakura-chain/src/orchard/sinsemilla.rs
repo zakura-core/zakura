@@ -6,7 +6,7 @@ use halo2::{
 };
 
 // Only the test-vector hash below rebuilds a `HashDomain` from raw message bits;
-// the production Merkle path uses a cached domain in `crate::orchard::tree`.
+// the production Merkle path delegates to the Orchard library.
 #[cfg(test)]
 use bitvec::prelude::*;
 #[cfg(test)]
@@ -60,7 +60,7 @@ pub fn pallas_group_hash(D: &[u8], M: &[u8]) -> pallas::Point {
 ///
 /// This rebuilds the [`HashDomain`] (and its `Q` generator) on every call, so it
 /// is only used by the test vectors. The production `MerkleCRH^Orchard` path in
-/// [`crate::orchard::tree`] hashes through a cached domain instead.
+/// [`crate::orchard::tree`] delegates to the Orchard library instead.
 #[cfg(test)]
 #[allow(non_snake_case)]
 pub fn sinsemilla_hash(D: &[u8], M: &BitVec<u8, Lsb0>) -> Option<pallas::Base> {

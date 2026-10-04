@@ -17,8 +17,6 @@ use std::{
     io,
 };
 
-#[cfg(test)]
-use bitvec::prelude::*;
 use halo2::pasta::{group::ff::PrimeField, pallas};
 use hex::ToHex;
 use incrementalmerkletree::{
@@ -26,8 +24,6 @@ use incrementalmerkletree::{
     Hashable,
 };
 use lazy_static::lazy_static;
-#[cfg(test)]
-use sinsemilla::{HashDomain, K};
 use thiserror::Error;
 use zcash_primitives::merkle_tree::HashSer;
 
@@ -48,10 +44,6 @@ use legacy::LegacyNoteCommitmentTree;
 pub type NoteCommitmentUpdate = pallas::Base;
 
 pub(super) const MERKLE_DEPTH: u8 = 32;
-
-/// Bits in a canonical Orchard Merkle child encoding.
-#[cfg(test)]
-const L_ORCHARD_MERKLE: usize = 255;
 
 /// MerkleCRH^Orchard Hash Function
 ///
@@ -84,32 +76,6 @@ fn merkle_crh_orchard(layer: u8, left: pallas::Base, right: pallas::Base) -> pal
 
     Option::from(pallas::Base::from_repr(hash.to_bytes()))
         .expect("an Orchard Merkle hash contains a canonical Pallas field element")
-}
-
-#[cfg(test)]
-lazy_static! {
-    static ref ORCHARD_MERKLE_CRH_REFERENCE_DOMAIN: HashDomain =
-        HashDomain::new("z.cash:Orchard-MerkleCRH");
-}
-
-#[cfg(test)]
-fn merkle_crh_orchard_reference(
-    layer: u8,
-    left: pallas::Base,
-    right: pallas::Base,
-) -> pallas::Base {
-    let mut message = bitvec![u8, Lsb0;];
-
-    let level = MERKLE_DEPTH - 1 - layer;
-    message.extend_from_bitslice(&BitArray::<_, Lsb0>::from([level, 0])[0..K]);
-    message.extend_from_bitslice(&BitArray::<_, Lsb0>::from(left.to_repr())[0..L_ORCHARD_MERKLE]);
-    message.extend_from_bitslice(&BitArray::<_, Lsb0>::from(right.to_repr())[0..L_ORCHARD_MERKLE]);
-
-    let hash: Option<pallas::Base> = ORCHARD_MERKLE_CRH_REFERENCE_DOMAIN
-        .hash(message.iter().map(|bit| *bit.as_ref()))
-        .into();
-
-    hash.unwrap_or_else(pallas::Base::zero)
 }
 
 lazy_static! {
@@ -828,6 +794,7 @@ impl From<Vec<pallas::Base>> for NoteCommitmentTree {
 
 #[cfg(test)]
 mod tests {
+    use bitvec::prelude::*;
     use incrementalmerkletree::{frontier::Frontier, Position};
 
     use super::*;
@@ -884,12 +851,34 @@ mod tests {
         assert_eq!(rebuilt.root(), original.root());
     }
 
+    /// Independent from-scratch `MerkleCRH^Orchard`: it builds the message
+    /// bit-by-bit and hashes it with this crate's own variable-length
+    /// Sinsemilla implementation, rebuilding the domain on every call. The
+    /// production [`merkle_crh_orchard`] delegates to the library
+    /// weighted evaluator and must stay byte-identical to this.
+    fn merkle_crh_orchard_uncached(
+        layer: u8,
+        left: pallas::Base,
+        right: pallas::Base,
+    ) -> pallas::Base {
+        let mut s = bitvec![u8, Lsb0;];
+
+        let l = MERKLE_DEPTH - 1 - layer;
+        s.extend_from_bitslice(&BitArray::<_, Lsb0>::from([l, 0])[0..10]);
+        s.extend_from_bitslice(&BitArray::<_, Lsb0>::from(left.to_repr())[0..255]);
+        s.extend_from_bitslice(&BitArray::<_, Lsb0>::from(right.to_repr())[0..255]);
+
+        match crate::orchard::sinsemilla::sinsemilla_hash(b"z.cash:Orchard-MerkleCRH", &s) {
+            Some(h) => h,
+            None => pallas::Base::zero(),
+        }
+    }
+
     /// Field elements that exercise the full 255-bit width of `pallas::Base`,
     /// which the small-integer `node(..)` helper never reaches (it only sets the
     /// low 8 bytes). Real note-commitment x-coordinates are full-width, so the
-    /// library implementation must stay byte-identical on these too.
-    /// [`pallas::Base::from_raw`] reduces mod the field modulus, so every value
-    /// here is canonical.
+    /// cached domain must stay byte-identical on these too. `from_raw` reduces
+    /// mod the field modulus, so every value here is canonical.
     fn full_width_field_elements() -> Vec<pallas::Base> {
         vec![
             // p - 1: the largest canonical field element.
@@ -910,10 +899,13 @@ mod tests {
         ]
     }
 
-    /// The library implementation must produce byte-identical output across all
-    /// layers and a spread of small, edge-case, and full-width field elements.
+    /// The weighted-evaluator `merkle_crh_orchard` must produce byte-identical
+    /// output to the from-scratch bit-level implementation, across all layers
+    /// and a spread of input values — small integers, edge cases, and
+    /// full-width field elements. The full-width values also exercise the word
+    /// packer's cross-child word and every remainder-bit alignment.
     #[test]
-    fn library_merkle_crh_matches_reference() {
+    fn weighted_merkle_crh_matches_fresh_domain() {
         let mut values: Vec<pallas::Base> = [0u64, 1, 2, 7, 65_535, u64::MAX]
             .iter()
             .map(|&v| node(v).0)
@@ -925,8 +917,8 @@ mod tests {
                 for &right in &values {
                     assert_eq!(
                         merkle_crh_orchard(layer, left, right).to_repr(),
-                        merkle_crh_orchard_reference(layer, left, right).to_repr(),
-                        "library hash must match the reference at layer {layer}",
+                        merkle_crh_orchard_uncached(layer, left, right).to_repr(),
+                        "weighted evaluator must match fresh domain at layer {layer}",
                     );
                 }
             }
@@ -935,11 +927,12 @@ mod tests {
 
     proptest::proptest! {
         /// Randomized differential check: across random layers and random
-        /// full-width field elements (raw limbs reduced mod p), the library
-        /// implementation must stay byte-identical to the reference. This covers
-        /// the whole input domain that the fixed table above only samples.
+        /// full-width field elements (raw limbs reduced mod p), the weighted
+        /// evaluator must stay byte-identical to the from-scratch bit-level
+        /// implementation. This covers the whole input domain that the fixed
+        /// table above only samples.
         #[test]
-        fn library_merkle_crh_matches_reference_random(
+        fn weighted_merkle_crh_matches_fresh_domain_random(
             layer in 0u8..MERKLE_DEPTH,
             left_limbs in proptest::prelude::any::<[u64; 4]>(),
             right_limbs in proptest::prelude::any::<[u64; 4]>(),
@@ -949,8 +942,8 @@ mod tests {
 
             proptest::prop_assert_eq!(
                 merkle_crh_orchard(layer, left, right).to_repr(),
-                merkle_crh_orchard_reference(layer, left, right).to_repr(),
-                "library hash must match the reference at layer {}", layer
+                merkle_crh_orchard_uncached(layer, left, right).to_repr(),
+                "weighted evaluator must match fresh domain at layer {}", layer
             );
         }
     }

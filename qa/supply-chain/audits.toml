@@ -120,11 +120,23 @@ criteria = "safe-to-deploy"
 version = "1.17.1"
 notes = "Reviewed the manifest, build script, and the Rust surface. The crate is the safe wrapper over aws-lc-sys; its unsafe is the FFI calls, each passing fixed-size buffers whose lengths match the C declarations and checking the return code before treating the output as valid. Key material is held in zeroizing types and the AEAD nonce types are single-use by construction. The build script selects between the FIPS and non-FIPS backend and rejects enabling both. It builds with the non-fips feature; like ring, the published package excludes its test vector files, so the test target cannot be built."
 
+[[audits.aws-lc-rs]]
+who = "Claude Opus 5.5 <noreply@anthropic.com>"
+criteria = "safe-to-deploy"
+delta = "1.17.1 -> 1.18.1"
+notes = "Reviewed the full delta. build.rs and the features table are unchanged; the manifest only bumps aws-lc-sys to 0.45.0, aws-lc-fips-sys to 0.14.2, and the links key. New unsafe is FFI with buffer lengths matching the C declarations and return codes checked: an out-of-place AEAD seal that rejects mismatched output lengths before calling EVP_AEAD_CTX_seal_scatter, rsa::KeyPair::from_components, which detaches each BIGNUM only after the RSA_set0_* call taking ownership succeeds and then runs RSA_check_key, and a getter for the static OpenSSL_version string. The ML-DSA module is no longer behind the unstable feature; its unsafe is unchanged and was re-reviewed. Other changes harden existing code: seal_combined sizes the C output from the post-extend slice, streaming cipher keys validate the IV context, the key-wrap KEK is zeroized on drop, ECDH secrets are held in Zeroizing, and parsed RSA digest verification now checks the digest algorithm. With aws-lc-sys 0.42.0, streaming CBC decryption wrote up to 16 bytes past the output slice its API documents as sufficient, which the 1.17.1 note missed; aws-lc-sys 0.45.0 stops EVP_DecryptUpdate writing past its reported length, and a scratch harness showed no bytes written past the slice with this version. It builds with the non-fips feature; the test target still cannot be built, so the same harness exercised the other changed paths. The FIPS backend was not reviewed."
+
 [[audits.aws-lc-sys]]
 who = "Claude Opus 5 <noreply@anthropic.com>"
 criteria = "safe-to-deploy"
 version = "0.42.0"
 notes = "Reviewed the manifest and build script. The crate bundles AWS-LC, which identifies itself as version 5.1.0 in its own headers, and compiles it with cc, so building this crate runs a C toolchain over roughly 1758 bundled C and assembly sources; it fetches nothing. Auditing that C is out of scope for this review and is noted here so the record is not read as covering it. The Rust side is generated bindings with no hand-written logic. All 108 tests passed."
+
+[[audits.aws-lc-sys]]
+who = "Claude Opus 5.5 <noreply@anthropic.com>"
+criteria = "safe-to-deploy"
+delta = "0.42.0 -> 0.45.0"
+notes = "Reviewed the diff of the manifest, build script and hand-written Rust. The manifest changes only the version, links key and recorded upstream commit. The crate still bundles AWS-LC, now 5.7.0 per its own headers (was 5.1.0), as roughly 1780 C and assembly sources and compiles it with cc; it still fetches nothing. Auditing that C remains out of scope and is noted here so the record is not read as covering it. The build script changes are build configuration and link metadata, including a size-optimized mode selected by opt-level s or z or AWS_LC_SYS_SMALL, and a GCC memcmp miscompilation probe that now runs only for the affected GCC versions and warns instead of failing when it cannot build or run the probe. The prebuilt Windows NASM objects differ only in symbol prefix and timestamp. Beyond the prefix rename, the bindings only update version constants and add seven extern declarations, one constant and a type alias, and the one hand-written library change is a const fn returning 0. All 100 tests passed, the same count 0.42.0 reports on this host."
 
 [[audits.axum]]
 who = "Claude Opus 5 <noreply@anthropic.com>"
@@ -754,6 +766,12 @@ who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
 version = "0.5.0"
 notes = "Reviewed all packaged source, manifest, and tests. The procedural derives validate named-struct and field attributes and generate type-checked borrowed, mutable, copy, and dissolve accessors without unsafe code, a build script, runtime I/O, or ambient capabilities. The full all-feature suite passed, including all 11 trybuild cases."
+
+[[audits.derive-new]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+delta = "0.5.9 -> 0.7.0"
+notes = "Reviewed the complete six-file packaged delta and the constructor expansion, attribute parsing, and tests in context. Changes migrate to Syn 2, add caller-selected constructor visibility and Into/IntoIterator arguments, and use core paths for defaults and PhantomData. Default public visibility, ordinary field arguments, and existing default/value initializers are preserved. Generated expressions come only from caller-authored Rust tokens and use type-checked construction and trait calls. No unsafe code, build script, filesystem/network access, process execution, or ambient capabilities. All 21 unit/integration tests and 10 doctests passed with all features in an isolated package using Zakura's locked proc-macro dependency versions."
 
 [[audits.derive_builder]]
 who = "OpenAI Codex <noreply@openai.com>"
@@ -2958,6 +2976,12 @@ who = "Claude Opus 5 <noreply@anthropic.com>"
 criteria = "safe-to-deploy"
 version = "0.23.41"
 notes = "Reviewed the manifest, the module-level documentation, and the handshake and record layers. The properties that matter are structural and hold: certificate verification is mandatory unless the caller reaches for the explicitly named dangerous_configuration escape hatch, the client requires a server name and checks it against the presented certificate, protocol versions and cipher suites are restricted to the configured set rather than negotiated downward, and the record layer enforces the per-connection message size and rejects a fragment that would exceed it before buffering. Key material is held in zeroizing types. The published package excludes its test data files, so the test target cannot be built; the library builds cleanly and the crypto provider underneath it, ring, was exercised directly under its own entry."
+
+[[audits.rustls]]
+who = "Claude Opus 5.5 <noreply@anthropic.com>"
+criteria = "safe-to-deploy"
+delta = "0.23.41 -> 0.23.45"
+notes = "The substantive change is the RUSTSEC-2026-0285 fix: the handshake deframer now reports itself unaligned while any handshake message, complete or partial, is still buffered, and the connection refreshes that flag after taking each message, so check_aligned_handshake at a key change rejects a handshake message that shared a record with the key-changing message. The rest tightens peer handling: after a HelloRetryRequest the server requires the same cipher suite, refuses a withdrawn PSK offer, and no longer falls back to TLS 1.2; the client refuses a ServerHello cipher suite it did not offer; QUIC negotiates only TLS 1.3; TLS 1.2 rejects signature schemes that have no TLS 1.2 algorithm; an empty OCSP response is refused; and arithmetic on binder and ticket lengths and on ticket age now saturates or checks instead of wrapping or panicking. It also adds opt-in RFC 9149 ticket requests (off by default on both sides, with the server clamping the client's count to its configured maximum), ML-DSA signing and verification in the aws-lc-rs provider, zeroizing of private key DER after parsing, and owner-only permissions for a newly created SSLKEYLOGFILE on Unix. After an ECH rejection the client authenticates the public name as RFC 9849 requires and still fails the connection at the end of the handshake. No unsafe code or build script changed, and the only manifest changes raise the aws-lc-rs and rustls-webpki minimums. As with 0.23.41, the published package excludes its test data, so the test target cannot be built; the library builds cleanly with the ring provider in this workspace."
 
 [[audits.rustls-native-certs]]
 who = "OpenAI Codex <noreply@openai.com>"

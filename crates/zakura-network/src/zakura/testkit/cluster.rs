@@ -79,23 +79,6 @@ impl ZakuraTestCluster {
         &self.nodes[index]
     }
 
-    /// Connect nodes according to `topology`.
-    pub async fn connect_topology(
-        &self,
-        topology: ClusterTopology,
-        timeout: Duration,
-    ) -> Result<(), BoxError> {
-        match topology {
-            ClusterTopology::FullMesh => self.connect_full_mesh(timeout).await,
-            ClusterTopology::Line => {
-                for pair in self.nodes.windows(2) {
-                    pair[0].connect_native(&pair[1], timeout).await?;
-                }
-                Ok(())
-            }
-        }
-    }
-
     /// Connect every pair in the cluster.
     pub async fn connect_full_mesh(&self, timeout: Duration) -> Result<(), BoxError> {
         for left in 0..self.nodes.len() {

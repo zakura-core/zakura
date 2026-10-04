@@ -388,20 +388,45 @@ impl HeaderChainEngine {
         self.aux_deliveries.keys().copied()
     }
 
-    /// Check whether one header's bucket can take another input.
+    /// Bound the number of new inputs a selected repair can retain.
     ///
-    /// Aggregate pressure evicts lower-priority input, so only a full bucket of authenticated
-    /// input refuses. This read grants no admission authority.
-    pub fn auxiliary_admission_capacity(
+    /// A full target bucket can replace one unauthenticated input. Otherwise, repairs can use
+    /// free slots and evictable input outside the commit window. A repair range stops at the
+    /// first bucket that can neither admit nor replace input. This read grants no admission
+    /// authority.
+    pub fn auxiliary_repair_capacity(
         &self,
         hash: block::Hash,
         limits: crate::EngineLimits,
-    ) -> bool {
+    ) -> usize {
         let deliveries = self.aux_deliveries(hash);
-        deliveries.len() < limits.max_aux_deliveries_per_header.get()
-            || deliveries
-                .iter()
-                .any(|delivery| !delivery.is_authenticated())
+        if deliveries.len() >= limits.max_aux_deliveries_per_header.get() {
+            return usize::from(
+                deliveries
+                    .iter()
+                    .any(|delivery| !delivery.is_authenticated()),
+            );
+        }
+
+        let commit_window = &self.selected_projection[..self.selected_projection.len().min(3)];
+        let protected: usize = self
+            .aux_deliveries
+            .iter()
+            .map(|(hash, deliveries)| {
+                if commit_window.iter().any(|frontier| frontier.hash == *hash) {
+                    deliveries.len()
+                } else {
+                    deliveries
+                        .iter()
+                        .filter(|delivery| delivery.is_authenticated())
+                        .count()
+                }
+            })
+            .sum();
+        limits
+            .max_aux_deliveries_total
+            .get()
+            .saturating_sub(protected)
     }
 
     /// Return the retained auxiliary delivery with the exact global identity.

@@ -336,10 +336,10 @@ impl Sequence {
             batch,
             aux: vec![delivery],
         })));
-        if repair && offset < 3 && context.admission_capacity_available {
+        if repair && context.admission_capacity_available {
             assert!(
                 committed,
-                "a commit-window repair must fit when preflight grants capacity"
+                "a selected repair must fit when preflight grants capacity"
             );
             assert!(self
                 .runtime()
@@ -437,6 +437,44 @@ impl Sequence {
         assert_eq!(self.runtime().publisher().snapshot(), snapshot);
         self.check();
     }
+}
+
+#[test]
+fn saturated_selected_repair_retains_roots_or_reports_no_capacity() {
+    let _guard = zakura_test::init();
+    let mut sequence = Sequence::new(1);
+    sequence.config.limits.max_aux_deliveries_total = NonZeroUsize::new(1).unwrap();
+    sequence
+        .runtime
+        .as_mut()
+        .unwrap()
+        .set_auxiliary_limits_for_test(1, 1);
+    sequence.grow(false);
+    sequence.deliver(3, false);
+    // Ordinary eviction would discard the higher, newly supplied row.
+    sequence.deliver(4, true);
+    let repaired = sequence.selected(4).unwrap();
+    let rows = sequence.runtime().store.load_aux_deliveries().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].delivery().header_hash, repaired.hash);
+    sequence.reopen();
+
+    sequence.deliver(1, true);
+    let snapshot = sequence.runtime().publisher().snapshot();
+    let context = sequence
+        .runtime()
+        .reader()
+        .vct_repair_context(body_owner(&snapshot, 9, 9), repaired.height)
+        .unwrap()
+        .unwrap();
+    assert!(!context.admission_capacity_available);
+    let before = sequence.dump();
+    sequence.deliver(4, true);
+    assert_eq!(
+        sequence.dump(),
+        before,
+        "a refused repair leaves durable state unchanged"
+    );
 }
 
 proptest! {

@@ -25,6 +25,7 @@ pub(super) struct ProjectedTransitionState<'a> {
     graph: GraphOverlay<'a>,
     verified: Cow<'a, [Frontier]>,
     aux_changes: Vec<AuxDelta>,
+    repair_deliveries: HashSet<EvidenceId>,
     verified_selection_dirty: bool,
 }
 
@@ -35,6 +36,7 @@ impl<'a> ProjectedTransitionState<'a> {
             graph: GraphOverlay::new(engine.graph()),
             verified: Cow::Borrowed(engine.verified_projection()),
             aux_changes: Vec::new(),
+            repair_deliveries: HashSet::new(),
             verified_selection_dirty: false,
         }
     }
@@ -119,9 +121,13 @@ impl<'a> ProjectedTransitionState<'a> {
     pub(super) fn record_aux_delivery(
         &mut self,
         delivery: crate::AuxDelivery,
+        selected_repair: bool,
     ) -> Result<usize, TransitionFailure> {
         self.graph
             .edit_record_auxiliary_evidence_delivery(delivery.header_hash, delivery.delivery_id)?;
+        if selected_repair {
+            self.repair_deliveries.insert(delivery.delivery_id);
+        }
         Ok(self.update_aux_delivery(delivery))
     }
 
@@ -159,6 +165,7 @@ impl<'a> ProjectedTransitionState<'a> {
         hash: block::Hash,
         limits: EngineLimits,
         selected_repair: bool,
+        rooted: bool,
     ) -> Result<bool, TransitionFailure> {
         let node = self
             .graph
@@ -178,6 +185,8 @@ impl<'a> ProjectedTransitionState<'a> {
                     || delivery.is_disputed()
                     || (selected_repair && delivery.is_unauthenticated())
             })
+            // A size hint cannot replace a usable root candidate, including disputed roots.
+            .filter(|delivery| rooted || delivery.tree_aux.is_none() || delivery.is_rejected())
             .filter(|delivery| node.aux_delivery_ids.contains(&delivery.delivery_id))
             .min_by_key(|delivery| {
                 (
@@ -383,6 +392,10 @@ impl<'a> ProjectedTransitionState<'a> {
                 .aux_delivery_ids
                 .iter()
                 .filter_map(|delivery_id| {
+                    // A repair must retain its new input before it can report success.
+                    if self.repair_deliveries.contains(delivery_id) {
+                        return None;
+                    }
                     let delivery = staged
                         .get(delivery_id)
                         .or_else(|| engine.aux_delivery(*delivery_id))?;

@@ -2334,6 +2334,11 @@ impl WriteBlockWorkerTask {
             return exit;
         }
 
+        // The last block whose delivered body failed its authorizing data commitment, while
+        // its descendants are still being dropped. Its header is still valid, so those
+        // descendants are failed with a retryable error instead of a closed channel.
+        let mut rejected_body_ancestor: Option<block::Hash> = None;
+
         // Write all the finalized blocks sent by the state,
         // until the state closes the finalized block channel's sender.
         loop {
@@ -2404,9 +2409,21 @@ impl WriteBlockWorkerTask {
                 vct_write_retry_manager.reset(finalized_state);
 
                 // We don't want to send a reset here, because it could overwrite a valid sent hash
-                std::mem::drop(ordered_block);
+                if let Some(ancestor) =
+                    rejected_body_ancestor.filter(|_| ordered_block.0.height > next_valid_height)
+                {
+                    let _ = ordered_block
+                        .1
+                        .send(Err(CommitBlockError::ValidateContextError(Box::new(
+                            ValidateContextError::AncestorBodyRejected(ancestor),
+                        ))
+                        .into()));
+                } else {
+                    std::mem::drop(ordered_block);
+                }
                 continue;
             }
+            rejected_body_ancestor = None;
 
             // Fast VCT commits use the already-validated Zakura header store as their
             // successor witness. A checkpoint-verified body is not sufficient: NU5+
@@ -2737,6 +2754,10 @@ impl WriteBlockWorkerTask {
                         );
                         return BlockWriteTaskExit::Completed;
                     }
+
+                    rejected_body_ancestor = error
+                        .is_auth_commitment_mismatch()
+                        .then_some(ordered_block.0.hash);
 
                     // Publish the reset before reporting failure, so the verifier's
                     // recovery Tip request can drain queued replacements.

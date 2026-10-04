@@ -437,6 +437,19 @@ fn untrusted_aux_row_matches(authoritative: AuxDelivery, row: UntrustedAuxDelive
                 && row.outcome_boundary_hash() == authoritative.outcome_boundary_hash()))
 }
 
+/// Return whether a selected repair can add input to, or replace input in, one header's bucket.
+fn repair_bucket_admits(
+    engine: &HeaderChainEngine,
+    hash: block::Hash,
+    limits: zakura_header_chain::EngineLimits,
+) -> bool {
+    let deliveries = engine.aux_deliveries(hash);
+    deliveries.len() < limits.max_aux_deliveries_per_header.get()
+        || deliveries
+            .iter()
+            .any(|delivery| !delivery.is_authenticated())
+}
+
 fn auxiliary_rows_are_coherent(
     indexed_ids: &[EvidenceId],
     deliveries: &[AuxDelivery],
@@ -1787,10 +1800,8 @@ impl HeaderChainReader {
             .transition_engine
             .lock()
             .map_err(|_| HeaderChainStoreError::WriterPoisoned)?;
-        // Aggregate pressure evicts lower-priority input, so only the target's bucket can refuse.
-        let admission_capacity_available = engine
-            .auxiliary_admission_capacity(target_hash, self.config.limits)
-            && !snapshot.alarms.resource_stalled;
+        let repair_capacity = engine.auxiliary_repair_capacity(target_hash, self.config.limits);
+        let admission_capacity_available = repair_capacity > 0 && !snapshot.alarms.resource_stalled;
         let mut context = zakura_header_chain::VctRepairContext::from_durable_rows(
             selected_target,
             HeaderLocator::for_continuation(parent),
@@ -1805,7 +1816,7 @@ impl HeaderChainReader {
             return Ok(Some(context));
         }
 
-        let range_limit = self.config.limits.max_headers_per_transition.get();
+        let range_limit = repair_capacity.min(self.config.limits.max_headers_per_transition.get());
         if range_limit <= 1 {
             return Ok(Some(context));
         }
@@ -1863,7 +1874,7 @@ impl HeaderChainReader {
                 .into());
             }
             if zakura_header_chain::VctRepairContext::rows_constrain_repair(&candidate_rows)
-                || !engine.auxiliary_admission_capacity(candidate.hash, self.config.limits)
+                || !repair_bucket_admits(&engine, candidate.hash, self.config.limits)
             {
                 break;
             }
@@ -3086,22 +3097,28 @@ impl HeaderChainRuntime {
                     .get(1)
                     .map(|successor| successor.hash)
                     .or(terminal_boundary_hash);
+                let repair_capacity = transition_engine
+                    .auxiliary_repair_capacity(first_target.hash, context.config.limits);
+                if repair_capacity < repair_range.len() {
+                    return Err(TransitionFailure::AuxiliaryLimitExceeded.into());
+                }
                 let mut current = zakura_header_chain::VctRepairContext::from_durable_rows(
                     first_target,
                     HeaderLocator::for_continuation(common_ancestor),
                     before.state_version,
                     first_boundary_hash,
-                    transition_engine
-                        .auxiliary_admission_capacity(first_target.hash, context.config.limits)
-                        && !before.alarms.resource_stalled,
+                    !before.alarms.resource_stalled,
                     &durable_rows_by_target[0],
                 )?;
                 if repair_range.len() > 1 {
                     if durable_rows_by_target.iter().any(|rows| {
                         zakura_header_chain::VctRepairContext::rows_constrain_repair(rows)
                     }) || repair_range.iter().any(|target| {
-                        !transition_engine
-                            .auxiliary_admission_capacity(target.hash, context.config.limits)
+                        !repair_bucket_admits(
+                            &transition_engine,
+                            target.hash,
+                            context.config.limits,
+                        )
                     }) || before.alarms.resource_stalled
                     {
                         return Ok(ApplyResult::Stale(StaleReceipt {

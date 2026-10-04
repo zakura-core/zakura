@@ -6,7 +6,6 @@ mod blocksync_fuzz;
 mod clock;
 mod cluster;
 mod endpoint;
-mod gossip;
 mod hostile;
 mod matrix;
 #[cfg(test)]
@@ -24,7 +23,6 @@ pub use block_sync_peer::{SyntheticBlockSyncPeer, SyntheticBlockSyncPeers};
 pub use clock::{Clock, RealClock, TestClock};
 pub use cluster::{ClusterTopology, ZakuraTestCluster};
 pub use endpoint::LocalEndpointFactory;
-pub use gossip::GossipNode;
 pub use hostile::HostilePeer;
 pub use matrix::{
     default_profiles, default_remote_profiles, expected_outcomes, run_default_matrix,

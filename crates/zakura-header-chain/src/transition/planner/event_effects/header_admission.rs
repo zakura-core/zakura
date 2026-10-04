@@ -317,20 +317,24 @@ pub(super) fn admit_prepared_headers(
         if rooted_source_exists {
             continue;
         }
+        let selected_repair = matches!(
+            event.completion,
+            TargetCompletion::SelectedAuxiliaryRepair { .. }
+        );
         if !projected.make_aux_delivery_room(
             engine,
             delivery.header_hash,
             context.config.limits,
-            matches!(
-                event.completion,
-                TargetCompletion::SelectedAuxiliaryRepair { .. }
-            ),
+            selected_repair,
+            delivery.tree_aux.is_some(),
         )? {
-            // Only authenticated or unchecked input fills this bucket. Drop the new input and
-            // keep its header, because auxiliary input is advisory.
+            if selected_repair {
+                return Err(TransitionFailure::AuxiliaryLimitExceeded);
+            }
+            // Drop ordinary input that cannot replace a retained candidate and keep its header.
             continue;
         }
-        let index = projected.record_aux_delivery(*delivery)?;
+        let index = projected.record_aux_delivery(*delivery, selected_repair)?;
         admitted_semantic_payloads.insert(semantic_key, index);
         if delivery.tree_aux.is_some() {
             admitted_root_sources.insert((delivery.header_hash, delivery.source));

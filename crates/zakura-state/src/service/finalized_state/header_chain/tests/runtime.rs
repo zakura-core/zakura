@@ -802,10 +802,9 @@ fn reconciled_store_with_finalized_prefix(
 }
 
 #[test]
-fn repair_context_range_ignores_aggregate_occupancy() {
+fn repair_context_range_is_bounded_by_reclaimable_capacity() {
     let (mut runtime, _db, _genesis, path) = reconciled_store_with_finalized_prefix(6);
-    // Aggregate pressure evicts lower-priority input, so a one-slot store still grants the
-    // blocking target and its empty selected suffix.
+    // Even an empty store cannot retain a range larger than its aggregate limit.
     runtime.set_auxiliary_limits_for_test(1, 1);
     let snapshot = runtime.publisher().snapshot();
     let owner = zakura_header_chain::BodyWorkAuthority::for_snapshot(&snapshot)
@@ -817,7 +816,7 @@ fn repair_context_range_ignores_aggregate_occupancy() {
             .unwrap()
             .unwrap();
         assert!(context.admission_capacity_available);
-        assert_eq!(context.selected_header_count(), 6 - index);
+        assert_eq!(context.selected_header_count(), 1);
         assert_eq!(
             context.target,
             Frontier::new(path[index].height, path[index].hash)

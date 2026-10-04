@@ -120,7 +120,7 @@ fn finalized_chain_tip(db: &ZakuraDb) -> Option<ChainTipBlock> {
 ///
 /// This service modifies and provides access to:
 /// - the non-finalized state: the most recent blocks, up to
-///   [`MAX_BLOCK_REORG_HEIGHT`](crate::MAX_BLOCK_REORG_HEIGHT) of them.
+///   [`MAX_BLOCK_REORG_HEIGHT`] of them.
 ///   Zebra allows chain forks in the non-finalized state,
 ///   stores it in memory, and re-downloads it when restarted.
 /// - the finalized state: older blocks that have many confirmations.
@@ -264,7 +264,7 @@ pub(crate) struct StateService {
 ///
 /// This service provides read-only access to:
 /// - the non-finalized state: the most recent blocks, up to
-///   [`MAX_BLOCK_REORG_HEIGHT`](crate::MAX_BLOCK_REORG_HEIGHT) of them.
+///   [`MAX_BLOCK_REORG_HEIGHT`] of them.
 /// - the finalized state: older blocks that have many confirmations.
 ///
 /// Requests to this service are processed in parallel,
@@ -1560,6 +1560,11 @@ impl StateService {
 }
 
 impl ReadStateService {
+    /// Return the retained terminal writer failure, including during daemon shutdown.
+    pub fn writer_failure(&self) -> Option<BoxError> {
+        self.block_write_failure.get().cloned().map(Into::into)
+    }
+
     /// Wait for an unrecoverable writer failure, including failures published before this call.
     pub async fn wait_for_writer_failure(&self) -> BoxError {
         self.block_write_failure.wait().await.into()

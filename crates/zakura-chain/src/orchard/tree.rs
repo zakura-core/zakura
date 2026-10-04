@@ -17,7 +17,7 @@ use std::{
     io,
 };
 
-#[cfg(any(test, feature = "fuzz-impl"))]
+#[cfg(test)]
 use bitvec::prelude::*;
 use halo2::pasta::{group::ff::PrimeField, pallas};
 use hex::ToHex;
@@ -26,7 +26,7 @@ use incrementalmerkletree::{
     Hashable,
 };
 use lazy_static::lazy_static;
-#[cfg(any(test, feature = "fuzz-impl"))]
+#[cfg(test)]
 use sinsemilla::{HashDomain, K};
 use thiserror::Error;
 use zcash_primitives::merkle_tree::HashSer;
@@ -50,7 +50,7 @@ pub type NoteCommitmentUpdate = pallas::Base;
 pub(super) const MERKLE_DEPTH: u8 = 32;
 
 /// Bits in a canonical Orchard Merkle child encoding.
-#[cfg(any(test, feature = "fuzz-impl"))]
+#[cfg(test)]
 const L_ORCHARD_MERKLE: usize = 255;
 
 /// MerkleCRH^Orchard Hash Function
@@ -86,13 +86,13 @@ fn merkle_crh_orchard(layer: u8, left: pallas::Base, right: pallas::Base) -> pal
         .expect("an Orchard Merkle hash contains a canonical Pallas field element")
 }
 
-#[cfg(any(test, feature = "fuzz-impl"))]
+#[cfg(test)]
 lazy_static! {
     static ref ORCHARD_MERKLE_CRH_REFERENCE_DOMAIN: HashDomain =
         HashDomain::new("z.cash:Orchard-MerkleCRH");
 }
 
-#[cfg(any(test, feature = "fuzz-impl"))]
+#[cfg(test)]
 fn merkle_crh_orchard_reference(
     layer: u8,
     left: pallas::Base,
@@ -110,25 +110,6 @@ fn merkle_crh_orchard_reference(
         .into();
 
     hash.unwrap_or_else(pallas::Base::zero)
-}
-
-/// Compares the production and reference Orchard Merkle hashes for fuzzing.
-#[cfg(feature = "fuzz-impl")]
-#[doc(hidden)]
-pub fn fuzz_merkle_crh_orchard_equivalence(layer: u8, left_limbs: [u64; 4], right_limbs: [u64; 4]) {
-    assert!(
-        layer < MERKLE_DEPTH,
-        "the Orchard layer must be below {MERKLE_DEPTH}"
-    );
-
-    let left = pallas::Base::from_raw(left_limbs);
-    let right = pallas::Base::from_raw(right_limbs);
-
-    assert_eq!(
-        merkle_crh_orchard(layer, left, right).to_repr(),
-        merkle_crh_orchard_reference(layer, left, right).to_repr(),
-        "weighted Orchard Merkle hash differs from the reference at layer {layer}",
-    );
 }
 
 lazy_static! {

@@ -34,8 +34,6 @@ internal-miner = ["equihash/solver"]
 
 # Test-only features
 
-fuzz-impl = []
-
 proptest-impl = [
     "proptest",
     "proptest-derive",

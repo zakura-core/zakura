@@ -88,7 +88,6 @@ getset = "0.1.7"
 group = "0.14"
 halo2 = { version = "=2.2.0", package = "zakura-halo2-proofs" }
 hex = "0.4.3"
-hex-literal = "0.4"
 howudoin = "0.1"
 http-body = "1.0.1"
 http-body-util = "0.1.3"

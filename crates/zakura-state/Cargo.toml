@@ -48,7 +48,6 @@ chrono = { workspace = true, features = ["clock", "std"] }
 futures = { workspace = true }
 halo2 = { workspace = true, optional = true }
 hex = { workspace = true }
-hex-literal = { workspace = true }
 humantime-serde = { workspace = true }
 indexmap = { workspace = true }
 itertools = { workspace = true }

@@ -48,7 +48,6 @@ chrono = { workspace = true, features = ["clock", "std"] }
 futures = { workspace = true }
 halo2 = { workspace = true, optional = true }
 hex = { workspace = true }
-humantime-serde = { workspace = true }
 indexmap = { workspace = true }
 itertools = { workspace = true }
 lazy_static = { workspace = true }
@@ -57,7 +56,6 @@ rocksdb = { workspace = true, features = ["lz4"] }
 semver = { workspace = true }
 crossbeam-channel = { workspace = true }
 serde = { workspace = true, features = ["serde_derive"] }
-serde-big-array = { workspace = true }
 tempfile = { workspace = true }
 thiserror = { workspace = true }
 

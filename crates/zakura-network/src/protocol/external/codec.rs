@@ -19,8 +19,8 @@ use zakura_chain::{
     parameters::{Magic, Network},
     serialization::{
         sha256d, zcash_deserialize_string_external_count, CompactSizeMessage, FakeWriter,
-        ReadZcashExt, SerializationError as Error, ZcashDecoder, ZcashDeserialize,
-        ZcashDeserializeInto, ZcashSerialize, MAX_HEADERS_PER_MESSAGE, MAX_PROTOCOL_MESSAGE_LEN,
+        ReadZcashExt, SerializationError as Error, ZcashDeserialize, ZcashDeserializeInto,
+        ZcashReader, ZcashSerialize, MAX_HEADERS_PER_MESSAGE, MAX_PROTOCOL_MESSAGE_LEN,
     },
     transaction::Transaction,
 };
@@ -82,7 +82,6 @@ enum BodyDecodePanic {
 /// A codec which produces Bitcoin messages from byte streams and vice versa.
 pub struct Codec {
     builder: Builder,
-    payload_decoder: ZcashDecoder,
     state: DecodeState,
     #[cfg(test)]
     body_decode_panic: Cell<Option<BodyDecodePanic>>,
@@ -126,7 +125,6 @@ impl Builder {
     /// Finalize the builder and return a [`Codec`].
     pub fn finish(self) -> Codec {
         Codec {
-            payload_decoder: ZcashDecoder::for_network(&self.network),
             builder: self,
             state: DecodeState::Head,
             #[cfg(test)]
@@ -137,13 +135,6 @@ impl Builder {
     /// Configure the codec for the given [`Network`].
     pub fn for_network(mut self, network: &Network) -> Self {
         self.network = network.clone();
-        self
-    }
-
-    /// Configure the codec for the given [`Version`].
-    #[allow(dead_code)]
-    pub fn for_version(mut self, version: Version) -> Self {
-        self.version = version;
         self
     }
 
@@ -780,7 +771,7 @@ impl Codec {
     ///
     /// [Zcash block header](https://zips.z.cash/protocol/protocol.pdf#page=84)
     fn read_headers(&self, bytes: &mut &[u8]) -> Result<Message, Error> {
-        let mut reader = self.payload_decoder.reader(bytes);
+        let mut reader = ZcashReader::from_slice(bytes);
         // CompactSizeMessage is bounded to MAX_PROTOCOL_MESSAGE_LEN on deserialization.
         let count: CompactSizeMessage = reader.read_value()?;
         // Infallible: CompactSizeMessage wraps u32, which always fits in usize.
@@ -851,7 +842,6 @@ impl Codec {
     #[allow(clippy::unwrap_in_result)]
     fn deserialize_transaction_spawning(&self, reader: &mut &[u8]) -> Result<Transaction, Error> {
         let mut result = None;
-        let decoder = self.payload_decoder;
 
         // Correctness: Do CPU-intensive work on a dedicated thread, to avoid blocking other futures.
         //
@@ -862,7 +852,9 @@ impl Codec {
         // - The `reader` has a lifetime (but we could replace it with a `Vec` of message data)
         // - There is no way to check the blocking task's future for panics
         tokio::task::block_in_place(|| {
-            rayon::in_place_scope_fifo(|s| s.spawn_fifo(|_s| result = Some(decoder.decode(reader))))
+            rayon::in_place_scope_fifo(|s| {
+                s.spawn_fifo(|_s| result = Some(Transaction::zcash_deserialize_from_slice(reader)))
+            })
         });
 
         result.expect("scope has already finished")
@@ -872,7 +864,6 @@ impl Codec {
     #[allow(clippy::unwrap_in_result)]
     fn deserialize_block_spawning(&self, reader: &mut &[u8]) -> Result<Block, Error> {
         let mut result = None;
-        let decoder = self.payload_decoder;
 
         // Correctness: Do CPU-intensive work on a dedicated thread, to avoid blocking other futures.
         //
@@ -883,7 +874,9 @@ impl Codec {
         // - The `reader` has a lifetime (but we could replace it with a `Vec` of message data)
         // - There is no way to check the blocking task's future for panics
         tokio::task::block_in_place(|| {
-            rayon::in_place_scope_fifo(|s| s.spawn_fifo(|_s| result = Some(decoder.decode(reader))))
+            rayon::in_place_scope_fifo(|s| {
+                s.spawn_fifo(|_s| result = Some(Block::zcash_deserialize_from_slice(reader)))
+            })
         });
 
         result.expect("scope has already finished")

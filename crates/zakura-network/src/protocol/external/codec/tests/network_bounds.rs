@@ -1,5 +1,4 @@
-//! Check network rules at the legacy message boundary, including allocation
-//! checks for header counts that only fit under Regtest's smaller encoding.
+//! Check complete legacy payloads before allocating their nested collections.
 
 use super::*;
 use std::sync::Arc;
@@ -14,7 +13,7 @@ fn network_block(network: &Network) -> Arc<Block> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn block_and_headers_messages_follow_the_codec_network() {
+async fn block_and_headers_messages_round_trip_on_every_network() {
     let _guard = zakura_test::init();
     let networks = [
         Network::Mainnet,
@@ -37,29 +36,23 @@ async fn block_and_headers_messages_follow_the_codec_network() {
                 let mut bytes = BytesMut::new();
                 codec.encode(message.clone(), &mut bytes).unwrap();
                 let result = codec.decode(&mut bytes);
-                if configured_network.is_regtest() == encoded_network.is_regtest() {
-                    assert_eq!(result.unwrap(), Some(message));
-                } else {
-                    assert!(result.is_err());
-                }
+                assert_eq!(result.unwrap(), Some(message));
             }
         }
     }
 }
 
 #[test]
-fn header_counts_use_the_network_minimum_before_allocating() {
+fn header_counts_use_the_smallest_supported_encoding_before_allocating() {
     for network in [
         Network::Mainnet,
         Network::new_default_testnet(),
         Network::new_regtest(Default::default()),
     ] {
         let codec = Codec::builder().for_network(&network).finish();
-        let header = block::CountedHeader {
-            header: network_block(&network).header.clone(),
-        };
-        let mut payload = vec![header; 2].zcash_serialize_to_vec().unwrap();
-        payload.pop();
+        // Two headers need at least two of the smallest supported encodings.
+        let mut payload = vec![2];
+        payload.extend([0; 2 * 178 - 1]);
         let mut bytes = payload.as_slice();
         let (result, allocations) = measure(|| codec.read_headers(&mut bytes));
         assert!(matches!(

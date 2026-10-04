@@ -61,20 +61,12 @@ fn mainnet_blocks_1_to_3() -> Vec<Arc<block::Block>> {
     ]
 }
 
-pub(super) fn raw_block_payload(block: &Arc<block::Block>) -> super::wire::RawBlockPayload {
+fn raw_block_payload(block: &Arc<block::Block>) -> Arc<[u8]> {
     let frame = BlockSyncMessage::Block(block.clone())
         .encode_frame()
         .expect("test block frame encodes");
 
-    BlockSyncMessage::decode_frame_with_raw_block_payload(
-        frame,
-        zakura_chain::serialization::ZcashDecoder::for_network(
-            &zakura_chain::parameters::Network::Mainnet,
-        ),
-    )
-    .expect("test block decodes")
-    .1
-    .expect("block includes raw payload")
+    Arc::from(frame.payload.into_boxed_slice())
 }
 
 fn forked_block(block: &Arc<block::Block>, nonce_tag: u8) -> Arc<block::Block> {
@@ -6396,12 +6388,7 @@ fn block_sync_stream_declares_kind_capability_version_and_frame_cap() {
 
 #[tokio::test]
 async fn service_registry_routes_block_sync_by_exact_capability_and_version() {
-    let service = Arc::new(BlockSyncService::new(
-        ZakuraBlockSyncConfig::default(),
-        zakura_chain::serialization::ZcashDecoder::for_network(
-            &zakura_chain::parameters::Network::Mainnet,
-        ),
-    ));
+    let service = Arc::new(BlockSyncService::new(ZakuraBlockSyncConfig::default()));
     let registry =
         ServiceRegistry::new(vec![service]).expect("block-sync service declares unique kind");
     let peer = peer(1);
@@ -6435,12 +6422,7 @@ async fn service_registry_routes_block_sync_by_exact_capability_and_version() {
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn inert_reactor_parks_after_header_tip_watch_closes() {
-    let _service = BlockSyncService::new(
-        ZakuraBlockSyncConfig::default(),
-        zakura_chain::serialization::ZcashDecoder::for_network(
-            &zakura_chain::parameters::Network::Mainnet,
-        ),
-    );
+    let _service = BlockSyncService::new(ZakuraBlockSyncConfig::default());
 
     let elapsed = tokio::time::timeout(Duration::from_secs(1), future::pending::<()>()).await;
 

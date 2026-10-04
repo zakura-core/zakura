@@ -461,16 +461,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "bitflags-serde-legacy"
-version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5b64e60c28b6d25ad92e8b367801ff9aa12b41d05fc8798055d296bace4a60cc"
-dependencies = [
- "bitflags",
- "serde",
-]
-
-[[package]]
 name = "bitvec"
 version = "1.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1276,13 +1266,13 @@ dependencies = [
 
 [[package]]
 name = "derive-new"
-version = "0.5.9"
+version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3418329ca0ad70234b9735dc4ceed10af4df60eff9c8e7b06cb5e520d92c3535"
+checksum = "2cdc8d50f426189eef89dac62fabfa0abb27d5cc008f25bf4156a0203325becc"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 1.0.109",
+ "syn 2.0.118",
 ]
 
 [[package]]
@@ -2217,16 +2207,6 @@ name = "humantime"
 version = "2.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "15cdd26707701c53297e2fa6afb323d55fbc1d0810c3aec078ae3ef0424c3c15"
-
-[[package]]
-name = "humantime-serde"
-version = "1.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "57a3db5ea5923d99402c94e9feb261dc5ee9b4efa158b0315f788cf549cc200c"
-dependencies = [
- "humantime",
- "serde",
-]
 
 [[package]]
 name = "hybrid-array"
@@ -5059,15 +5039,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "serde-big-array"
-version = "0.5.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "11fc7cc2c76d73e0f27ee52abbd64eec84d46f370c88371120433196934e4b7f"
-dependencies = [
- "serde",
-]
-
-[[package]]
 name = "serde_bytes"
 version = "0.11.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6994,7 +6965,6 @@ dependencies = [
  "hex",
  "howudoin",
  "http-body-util",
- "humantime-serde",
  "hyper",
  "hyper-util",
  "indexmap",
@@ -7112,8 +7082,8 @@ name = "zakura-chain"
 version = "10.0.0"
 dependencies = [
  "bech32",
+ "bincode",
  "bitflags",
- "bitflags-serde-legacy",
  "bitvec",
  "blake2b_simd",
  "blake2s_simd",
@@ -7146,7 +7116,6 @@ dependencies = [
  "schemars",
  "secp256k1",
  "serde",
- "serde-big-array",
  "serde_json",
  "sha2 0.10.9",
  "strum",
@@ -7503,7 +7472,6 @@ dependencies = [
  "futures",
  "hex",
  "howudoin",
- "humantime-serde",
  "indexmap",
  "itertools 0.14.0",
  "lazy_static",
@@ -7851,7 +7819,6 @@ dependencies = [
  "getset",
  "hex",
  "howudoin",
- "humantime-serde",
  "indexmap",
  "insta",
  "itertools 0.14.0",
@@ -7866,7 +7833,6 @@ dependencies = [
  "rocksdb",
  "semver",
  "serde",
- "serde-big-array",
  "serde_json",
  "sha2 0.10.9",
  "tempfile",

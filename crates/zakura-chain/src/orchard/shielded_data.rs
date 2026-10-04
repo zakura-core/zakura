@@ -286,25 +286,71 @@ bitflags! {
     }
 }
 
-// We use the `bitflags 2.x` library to implement [`Flags`]. The
-// `2.x` version of the library uses a different serialization
-// format compared to `1.x`.
-// This manual implementation uses the `bitflags_serde_legacy` crate
-// to serialize `Flags` as `bitflags 1.x` would.
+// Preserve the bitflags 1.x struct representation used by existing data.
+// The field visitors are adapted from bitflags-serde-legacy 0.1.1 by Ashley
+// Mannix, under Apache-2.0 (see the repository's LICENSE-APACHE).
 impl serde::Serialize for Flags {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        bitflags_serde_legacy::serialize(self, "Flags", serializer)
+        use serde::ser::SerializeStruct;
+
+        let mut flags = serializer.serialize_struct("Flags", 1)?;
+        flags.serialize_field("bits", &self.bits())?;
+        flags.end()
     }
 }
 
-// We use the `bitflags 2.x` library to implement [`Flags`]. The
-// `2.x` version of the library uses a different deserialization
-// format compared to `1.x`.
-// This manual implementation uses the `bitflags_serde_legacy` crate
-// to deserialize `Flags` as `bitflags 1.x` would.
 impl<'de> serde::Deserialize<'de> for Flags {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        bitflags_serde_legacy::deserialize("Flags", deserializer)
+        use serde::de::{Error, MapAccess, Visitor};
+
+        struct Field;
+
+        impl<'de> serde::Deserialize<'de> for Field {
+            fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+                struct FieldVisitor;
+
+                impl Visitor<'_> for FieldVisitor {
+                    type Value = Field;
+
+                    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                        formatter.write_str("field identifier")
+                    }
+
+                    fn visit_str<E: Error>(self, value: &str) -> Result<Self::Value, E> {
+                        match value {
+                            "bits" => Ok(Field),
+                            field => Err(E::unknown_field(field, &["bits"])),
+                        }
+                    }
+                }
+
+                deserializer.deserialize_identifier(FieldVisitor)
+            }
+        }
+
+        struct FlagsVisitor;
+
+        impl<'de> Visitor<'de> for FlagsVisitor {
+            type Value = Flags;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a primitive bitflags value wrapped in a struct")
+            }
+
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+                let mut bits = None;
+                while map.next_key::<Field>()?.is_some() {
+                    if bits.is_some() {
+                        return Err(A::Error::duplicate_field("bits"));
+                    }
+                    bits = Some(map.next_value()?);
+                }
+                bits.map(Flags::from_bits_retain)
+                    .ok_or_else(|| A::Error::missing_field("bits"))
+            }
+        }
+
+        deserializer.deserialize_struct("Flags", &["bits"], FlagsVisitor)
     }
 }
 

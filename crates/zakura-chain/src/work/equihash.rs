@@ -4,7 +4,6 @@ use crate::serialization::ZcashReader;
 use std::{fmt, io};
 
 use hex::{FromHex, FromHexError, ToHex};
-use serde_big_array::BigArray;
 
 use crate::{
     block::Header,
@@ -67,9 +66,11 @@ const REGTEST_K: u32 = 5;
 #[allow(clippy::large_enum_variant)]
 pub enum Solution {
     /// Equihash solution on Mainnet or Testnet
-    Common(#[serde(with = "BigArray")] [u8; SOLUTION_SIZE]),
+    Common(#[serde(with = "crate::serialization::serde_adapters::bytes")] [u8; SOLUTION_SIZE]),
     /// Equihash solution on Regtest
-    Regtest(#[serde(with = "BigArray")] [u8; REGTEST_SOLUTION_SIZE]),
+    Regtest(
+        #[serde(with = "crate::serialization::serde_adapters::bytes")] [u8; REGTEST_SOLUTION_SIZE],
+    ),
 }
 
 impl Solution {
@@ -347,15 +348,11 @@ impl ZcashDeserialize for Solution {
         let len: CompactSizeMessage = reader.read_value()?;
         let len: usize = len.into();
 
-        // Match the rules used to bound header collections, before reading or
-        // allocating solution bytes. The peer cannot select Regtest's smaller
-        // encoding when this decoder was configured for Mainnet or Testnet.
-        if !reader.decoder().accepts_equihash_solution_size(len) {
+        if !matches!(len, SOLUTION_SIZE | REGTEST_SOLUTION_SIZE) {
             return Err(SerializationError::Parse(
                 "incorrect equihash solution size",
             ));
         }
-
         let solution = reader.read_bytes(len)?;
         Self::from_bytes(&solution)
     }

@@ -13,6 +13,8 @@ use libc::{getrlimit64 as getrlimit, rlimit64 as Rlimit, setrlimit64 as setrlimi
 /// hard limit and, on Apple and FreeBSD-like systems, `kern.maxfilesperproc`.
 /// System-call errors propagate to the database's existing fallback policy.
 #[cfg(unix)]
+// Resource-limit widths vary across Unix targets.
+#[allow(clippy::useless_conversion)]
 pub(super) fn increase_nofile_limit(requested: u64) -> io::Result<u64> {
     let mut limits = open_file_limits()?;
     // Unix resource-limit types are unsigned integers of at most 64 bits.

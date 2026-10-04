@@ -420,7 +420,7 @@ async fn in_flight_mined_block_broadcast_suppresses_committed_tip_gossip() {
     peer_set.expect_no_requests().await;
 }
 
-/// The state can acknowledge a commit before publishing its tip notification.
+/// Checkpoint commits acknowledge before publishing the tip, unlike non-finalized commits.
 /// A mined broadcast that is still in flight must suppress that later notification.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn in_flight_mined_block_broadcast_handles_delayed_tip_notification() {
@@ -454,4 +454,16 @@ async fn in_flight_mined_block_broadcast_handles_delayed_tip_notification() {
     in_flight_broadcast.respond(Response::Nil);
 
     peer_set.expect_no_requests().await;
+
+    // A dead gossip task would also send no duplicate. Require it to relay the next tip.
+    let block_three: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_3_BYTES
+        .zcash_deserialize_into()
+        .unwrap();
+    chain_tip_sender.set_finalized_tip(Some(
+        CheckpointVerifiedBlock::from(block_three.clone()).into(),
+    ));
+    peer_set
+        .expect_request(Request::AdvertiseBlock(block_three.hash(), None))
+        .await
+        .respond(Response::Nil);
 }

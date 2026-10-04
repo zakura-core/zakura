@@ -1639,17 +1639,19 @@ impl DiskDb {
         (open_file_limit - DiskDb::RESERVED_FILE_COUNT) / 2
     }
 
-    /// Increase the open file limit for this process to `IDEAL_OPEN_FILE_LIMIT`.
-    /// If that fails, try `MIN_OPEN_FILE_LIMIT`, then query the actual limit.
+    /// Increase the process open-file limit to [`Self::IDEAL_OPEN_FILE_LIMIT`].
+    /// If that fails, try [`Self::MIN_OPEN_FILE_LIMIT`], then query the actual
+    /// limit.
     ///
-    /// If the current limit is above `IDEAL_OPEN_FILE_LIMIT`, leaves it
+    /// If the current limit is above [`Self::IDEAL_OPEN_FILE_LIMIT`], leaves it
     /// unchanged.
     ///
     /// Returns the current limit, after any successful increases.
     ///
     /// # Panics
     ///
-    /// If the actual limit is below `MIN_OPEN_FILE_LIMIT` or cannot be queried.
+    /// If the actual limit is below [`Self::MIN_OPEN_FILE_LIMIT`] or cannot be
+    /// queried.
     fn increase_open_file_limit() -> u64 {
         Self::increase_open_file_limit_with(increase_nofile_limit, current_nofile_limit)
     }

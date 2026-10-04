@@ -109,18 +109,15 @@ public-Testnet joining.
 3. Install the collector/module/service, profile manifests, and configuration
    with `armed=false`; keep dispatch disabled. Run the final tests and browser
    rehearsal before switching the website's configured endpoint.
-4. Require one uninterrupted hour of node/reference observations no older than
-   60 seconds, matching common hashes, lag at most two blocks, and advancement
-   by every source using the enabled `nu7-public-readiness.service` on the public
-   primary. Its persistent read-only receipt is
-   `/var/lib/zakura-nu7-readiness/receipt.json`. It stays unqualified during
-   reference catch-up, starts the hour after checkpoint and current-chain
-   checks pass, and resets on source failure, lag over two blocks, a sampling
-   gap over 90 seconds, or a changed public-profile/reference fingerprint.
-   Check `qualified=true`, source revision, reference identity and the latest
-   observation time; neither a stale receipt nor elapsed catch-up time qualifies.
-   Check the coherent response, staging APIs and live/outage builds. Obtain
-   required source/codeowner approvals and deploy the website before arming.
+4. Verify fresh current node/reference observations, expected revisions, trusted
+   checkpoint 4453700, matching current common hashes, the NU7 schedule and
+   consensus exports. Obtain required source/codeowner approvals and deploy the
+   website before arming. There is no mandatory one-hour waiting period.
+   The optional read-only `nu7-public-readiness.service` receipt at
+   `/var/lib/zakura-nu7-readiness/receipt.json` records sustained agreement for
+   diagnostics; its `qualified` field is not an arming prerequisite. Do not
+   rewrite that receipt to manufacture qualification. The selector independently
+   verifies actual activation and chain agreement before selecting public Testnet.
 5. Set `armed=true`, restart and verify `selectionState=armed`. The selector
    polls every ten seconds. Two managed nodes plus the independent reference
    must be at least A+2, agree on activation and subsequent common hashes, and
@@ -179,7 +176,7 @@ It exits nonzero until all three node sources expose the expected public NU7
 schedule/export and agree with the reference at a common height. Inspect
 `preparedChainAgreement`, `referenceNu7ScheduleVerified` and
 `activationReferencePrepared` separately: a zero exit status establishes current
-chain agreement, not the persistent one-hour gate or activation readiness alone.
+chain agreement, not activation readiness alone.
 `activationReferencePrepared` also requires verified reference identity/schedule,
 an actual Zebra 7 runtime and protocol at least 170180. A compatible binary still
 catching up remains unprepared until its trusted checkpoint is verified. The

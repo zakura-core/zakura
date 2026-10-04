@@ -211,13 +211,34 @@ def load_fleets(config_path: Path) -> list[Fleet]:
 
 
 def node_state_key(fleet_name: str, node_name: str, state: dict[str, Any]) -> str:
-    """Reuse an existing Mac incident key, including pre-rename alert state."""
+    """Consolidate pre-rename Mac state into one incident without losing delivery."""
     key = f"{fleet_name}/{node_name}"
     if fleet_name == "mainnet" and node_name == MAC_NODE_NAME:
-        legacy_key = "mainnet/zakura-mac-os"
         nodes = state.get("nodes", {})
-        if legacy_key in nodes and (nodes[legacy_key].get("alerting") or key not in nodes):
-            return legacy_key
+        legacy = nodes.pop("mainnet/zakura-mac-os", None)
+        if legacy is not None:
+            current = nodes.get(key)
+            if current is None:
+                nodes[key] = legacy
+            else:
+                # Prefer a delivered incident over an inactive record. If both
+                # were delivered, require a fresh sustained recovery for the pair.
+                chosen = legacy if legacy.get("alerting") and not current.get("alerting") else current
+                if legacy.get("alerting") and current.get("alerting"):
+                    # A delivered stall still needs height progress to recover.
+                    chosen = legacy if legacy.get("condition") == "stalled" else current
+                merged = dict(chosen)
+                starts = [value for entry in (legacy, current)
+                          if (value := coerce_float(entry.get("bad_since"))) is not None]
+                if starts:
+                    merged["bad_since"] = min(starts)
+                if legacy.get("alerting") and current.get("alerting"):
+                    merged.pop("mac_recovery", None)
+                    anchors = [value for entry in (legacy, current)
+                               if (value := coerce_float(entry.get("alert_height"))) is not None]
+                    if anchors:
+                        merged["alert_height"] = max(anchors)
+                nodes[key] = merged
     return key
 
 
@@ -1239,7 +1260,9 @@ class Watchdog:
                 os.chown(temporary, previous.st_uid, previous.st_gid)
             temporary.replace(status_path)
         except OSError:
-            condition = "unavailable"
+            # Status persistence must not erase a confirmed comparison failure.
+            if condition == "matching":
+                condition = "unavailable"
         sample.update(condition=condition, caught_up=condition == "matching",
                       error=None if condition == "matching" else condition)
         try:
@@ -1247,17 +1270,35 @@ class Watchdog:
             publish_status(sample, self.args.mac_comparison_identity,
                            self.args.mac_comparison_public_status)
         except (OSError, ValueError, TypeError, KeyError):
-            condition = "unavailable"
+            if condition == "matching":
+                condition = "unavailable"
         bucket = state.setdefault("mac_comparison", {})
         entry = bucket.get("mainnet", {})
         alert_condition = "ok" if condition == "matching" else condition
-        since = entry.get("bad_since", now) if entry.get("condition") == alert_condition else now
+        since = entry.get("bad_since", now) if entry.get("condition", "ok") != "ok" else now
+        # All bad reasons belong to one continuous incident. Escalation to a
+        # confirmed mismatch gets its own immediate notification, once accepted.
+        previously_delivered = bool(entry.get("alerting"))
+        mismatch_notified = entry.get("mismatch_notified", entry.get("condition") == "tree_mismatch"
+                                      and entry.get("alerting", False))
+        if alert_condition != "ok":
+            entry["condition"] = alert_condition
+            if condition == "tree_mismatch" and not mismatch_notified:
+                entry["alerting"] = False
+            bucket["mainnet"] = entry
         update_alert_state(bucket, "mainnet", alert_condition, since,
                            0 if condition == "tree_mismatch" else 180,
                            "Zakura compiler comparison: " + condition,
                            "Zakura compiler comparison recovered: matching blocks and commitment trees",
                            now, suppressed or muted, self.args,
                            notify=(lambda *_: False) if suppressed or muted else self.notify)
+        updated = bucket["mainnet"]
+        if updated.get("condition") != "ok":
+            updated["mismatch_notified"] = bool(mismatch_notified or (
+                condition == "tree_mismatch" and updated.get("alerting")))
+            # A failed or muted escalation must retain the earlier delivered
+            # incident so matching still sends the owed recovery.
+            updated["alerting"] = bool(updated.get("alerting") or previously_delivered)
 
     @staticmethod
     def fleet_state(state: dict[str, Any], fleet: Fleet) -> dict[str, Any]:

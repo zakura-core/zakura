@@ -1055,6 +1055,52 @@ def private_addresses():
     return frozenset(address_key(item) for item in data)
 
 
+def monitoring_snapshot(value, node_names):
+    """Retain typed fleet observations when address redaction cannot be configured.
+
+    Arbitrary strings and nested diagnostic objects never cross this boundary.
+    Detailed endpoints remain unavailable until privacy configuration is repaired.
+    """
+    def number(item):
+        return type(item) in (int, float) and math.isfinite(item) and item >= 0
+
+    def block_hash(item):
+        return isinstance(item, str) and re.fullmatch(r"[0-9a-fA-F]{64}", item) is not None
+
+    names = {name for name in node_names if re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,63}", name)}
+    names.add("mac-os-cranelift")
+    rows = []
+    for row in value.get("rows", []):
+        if not isinstance(row, dict) or row.get("name") not in names:
+            continue
+        health = row.get("health")
+        if health not in {"healthy", "stale", "verification_error", "rpc_error", "down", "starting"}:
+            health = "down"
+        safe = {"name": row["name"], "health": health, "healthy": health == "healthy",
+                "detail": "Limited status: privacy configuration unavailable"}
+        if type(row.get("height")) is int and row["height"] >= 0:
+            safe["height"] = row["height"]
+        for field in ("seconds_since_advanced", "observed_at"):
+            if number(row.get(field)):
+                safe[field] = row[field]
+        for field in ("block_hash", "previous_hash"):
+            if block_hash(row.get(field)):
+                safe[field] = row[field]
+        anchor = row.get("fork_anchor")
+        if (isinstance(anchor, dict) and type(anchor.get("height")) is int
+                and anchor["height"] >= 0 and block_hash(anchor.get("hash"))):
+            safe["fork_anchor"] = {"height": anchor["height"], "hash": anchor["hash"]}
+        rows.append(safe)
+    result = {"rows": rows, "total": len(rows),
+              "healthy": sum(row["healthy"] for row in rows), "chain": {}}
+    for field in ("last_poll", "generated_at", "stale_after"):
+        if number(value.get(field)):
+            result[field] = value[field]
+    if value.get("network") in {"mainnet", "testnet"}:
+        result["network"] = value["network"]
+    return result
+
+
 def redact_private_addresses(value, protected):
     """Remove only protected Mac addresses, including from Linux peer diagnostics."""
     if isinstance(value, dict):
@@ -3857,8 +3903,12 @@ class Handler(BaseHTTPRequestHandler):
                 body = json.dumps(redact_private_addresses(json.loads(body), private_addresses()),
                                   separators=(",", ":")).encode()
             except (OSError, ValueError, TypeError):
-                status = 503
-                body = b'{"error":"privacy configuration unavailable"}'
+                if urllib.parse.urlparse(self.path).path == "/data" and COLLECTOR is not None:
+                    body = json.dumps(monitoring_snapshot(json.loads(body), COLLECTOR.nodes_by_name),
+                                      separators=(",", ":")).encode()
+                else:
+                    status = 503
+                    body = b'{"error":"privacy configuration unavailable"}'
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))

@@ -4,7 +4,7 @@ use proptest::prelude::*;
 
 use crate::{
     block::MAX_BLOCK_BYTES,
-    serialization::{arbitrary::max_allocation_is_big_enough, ZcashSerialize},
+    serialization::{arbitrary::serialized_sizes_at_allocation_limit, ZcashSerialize},
     transaction::{
         serialize::{
             MIN_TRANSPARENT_INPUT_SIZE, MIN_TRANSPARENT_OUTPUT_SIZE, MIN_TRANSPARENT_TX_SIZE,
@@ -55,7 +55,7 @@ proptest! {
     /// Verify the smallest disallowed vector of `Transaction`s is too large to fit in a Zcash block
     #[test]
     fn tx_max_allocation_is_big_enough(tx in Transaction::arbitrary()) {
-        let (_, smallest_disallowed_serialized_len, _, _) = max_allocation_is_big_enough(tx);
+        let (smallest_disallowed_serialized_len, _) = serialized_sizes_at_allocation_limit(tx);
 
         // Check that our smallest_disallowed_vec is too big to send in a valid Zcash Block
         prop_assert!(smallest_disallowed_serialized_len as u64 > MAX_BLOCK_BYTES);
@@ -67,7 +67,7 @@ proptest! {
     #[test]
     fn input_max_allocation_is_big_enough(input in Input::arbitrary()) {
 
-        let (_, smallest_disallowed_serialized_len, _, _) = max_allocation_is_big_enough(input);
+        let (smallest_disallowed_serialized_len, _) = serialized_sizes_at_allocation_limit(input);
 
         // Check that our smallest_disallowed_vec is too big to be included in a valid block
         // Note that a serialized block always includes at least one byte for the number of transactions,
@@ -81,7 +81,7 @@ proptest! {
     #[test]
     fn output_max_allocation_is_big_enough(output in Output::arbitrary()) {
 
-        let (_, smallest_disallowed_serialized_len, _, _) = max_allocation_is_big_enough(output);
+        let (smallest_disallowed_serialized_len, _) = serialized_sizes_at_allocation_limit(output);
 
         // Check that our smallest_disallowed_vec is too big to be included in a valid block
         // Note that a serialized block always includes at least one byte for the number of transactions,

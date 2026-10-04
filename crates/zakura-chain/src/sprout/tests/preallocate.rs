@@ -5,7 +5,7 @@ use proptest::{prelude::*, proptest};
 use crate::{
     block::MAX_BLOCK_BYTES,
     primitives::{Bctv14Proof, Groth16Proof},
-    serialization::{arbitrary::max_allocation_is_big_enough, ZcashSerialize},
+    serialization::{arbitrary::serialized_sizes_at_allocation_limit, ZcashSerialize},
     sprout::joinsplit::{JoinSplit, BCTV14_JOINSPLIT_SIZE, GROTH16_JOINSPLIT_SIZE},
 };
 
@@ -39,8 +39,8 @@ proptest! {
     /// 2. The largest allowed vector is small enough to fit in a legal Zcash block
     #[test]
     fn joinsplit_btcv14_max_allocation_is_correct(joinsplit in <JoinSplit<Bctv14Proof>>::arbitrary_with(())) {
-        let (_, smallest_disallowed_serialized_len, _, largest_allowed_serialized_len) =
-            max_allocation_is_big_enough(joinsplit);
+        let (smallest_disallowed_serialized_len, largest_allowed_serialized_len) =
+            serialized_sizes_at_allocation_limit(joinsplit);
 
         // Check that our smallest_disallowed_vec is too big to fit in a valid Zcash Block.
         prop_assert!(smallest_disallowed_serialized_len as u64 > MAX_BLOCK_BYTES);
@@ -55,8 +55,8 @@ proptest! {
     #[test]
     fn joinsplit_groth16_max_allocation_is_correct(joinsplit in <JoinSplit<Groth16Proof>>::arbitrary_with(())) {
 
-        let (_, smallest_disallowed_serialized_len, _, largest_allowed_serialized_len) =
-            max_allocation_is_big_enough(joinsplit);
+        let (smallest_disallowed_serialized_len, largest_allowed_serialized_len) =
+            serialized_sizes_at_allocation_limit(joinsplit);
 
         // Check that our smallest_disallowed_vec is too big to fit in a valid Zcash Block.
         prop_assert!(smallest_disallowed_serialized_len as u64 > MAX_BLOCK_BYTES);

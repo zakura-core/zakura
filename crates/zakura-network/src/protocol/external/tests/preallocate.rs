@@ -7,7 +7,7 @@ use proptest::prelude::*;
 use zakura_chain::{
     parameters::Network::*,
     serialization::{
-        arbitrary::max_allocation_is_big_enough, TrustedPreallocate, ZcashSerialize,
+        arbitrary::serialized_sizes_at_allocation_limit, TrustedPreallocate, ZcashSerialize,
         MAX_PROTOCOL_MESSAGE_LEN,
     },
 };
@@ -129,7 +129,7 @@ proptest! {
 
         let addr: AddrV1 = addr.unwrap().into();
 
-        let (_, _, _, largest_allowed_serialized_len) = max_allocation_is_big_enough(addr);
+        let (_, largest_allowed_serialized_len) = serialized_sizes_at_allocation_limit(addr);
 
         // max_allocation must equal the protocol cap
         prop_assert_eq!(AddrV1::max_allocation(), MAX_ADDRS_IN_MESSAGE as u64);

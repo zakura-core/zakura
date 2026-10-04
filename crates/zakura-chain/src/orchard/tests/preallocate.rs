@@ -6,7 +6,7 @@ use crate::{
         shielded_data::{ACTION_SIZE, AUTHORIZED_ACTION_SIZE},
         AuthorizedAction,
     },
-    serialization::{arbitrary::max_allocation_is_big_enough, ZcashSerialize},
+    serialization::{arbitrary::serialized_sizes_at_allocation_limit, ZcashSerialize},
 };
 
 use proptest::{prelude::*, proptest};
@@ -27,8 +27,8 @@ proptest! {
     fn authorized_action_max_allocation_is_big_enough(authorized_action in <AuthorizedAction>::arbitrary_with(())) {
         let (action, spend_auth_sig) = authorized_action.into_parts();
 
-        let (_, smallest_disallowed_serialized_len, _, largest_allowed_serialized_len) =
-            max_allocation_is_big_enough(action);
+        let (smallest_disallowed_serialized_len, largest_allowed_serialized_len) =
+            serialized_sizes_at_allocation_limit(action);
 
         // Calculate the actual size of all required Action fields
         prop_assert!((smallest_disallowed_serialized_len as u64)/ACTION_SIZE*AUTHORIZED_ACTION_SIZE >= MAX_BLOCK_BYTES);
@@ -37,8 +37,8 @@ proptest! {
         // Check the serialization limits for `Action`
         prop_assert!((largest_allowed_serialized_len as u64) <= MAX_BLOCK_BYTES);
 
-        let (_, _, _, largest_allowed_serialized_len) =
-            max_allocation_is_big_enough(spend_auth_sig);
+        let (_, largest_allowed_serialized_len) =
+            serialized_sizes_at_allocation_limit(spend_auth_sig);
 
         // Check the serialization limits for `Signature::<SpendAuth>`
         prop_assert!((largest_allowed_serialized_len as u64) <= MAX_BLOCK_BYTES);

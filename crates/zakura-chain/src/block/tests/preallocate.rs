@@ -7,7 +7,7 @@ use proptest::prelude::*;
 use crate::{
     block::{CountedHeader, Hash, Header, MAX_BLOCK_LOCATOR_LENGTH},
     serialization::{
-        arbitrary::max_allocation_is_big_enough, TrustedPreallocate, ZcashSerialize,
+        arbitrary::serialized_sizes_at_allocation_limit, TrustedPreallocate, ZcashSerialize,
         MAX_HEADERS_PER_MESSAGE, MAX_PROTOCOL_MESSAGE_LEN,
     },
 };
@@ -39,7 +39,7 @@ proptest! {
     /// 2. The largest allowed vector still fits in a legal Zcash Wire Protocol message.
     #[test]
     fn block_hash_max_allocation(hash in Hash::arbitrary_with(())) {
-        let (_, _, _, largest_allowed_serialized_len) = max_allocation_is_big_enough(hash);
+        let (_, largest_allowed_serialized_len) = serialized_sizes_at_allocation_limit(hash);
 
         // The cap is exactly the locator-protocol cap, not derived from message size.
         prop_assert!(Hash::max_allocation() == MAX_BLOCK_LOCATOR_LENGTH);
@@ -77,7 +77,7 @@ proptest! {
             header,
         };
 
-        let (_, _, _, largest_allowed_serialized_len) = max_allocation_is_big_enough(header);
+        let (_, largest_allowed_serialized_len) = serialized_sizes_at_allocation_limit(header);
 
         // The cap is exactly the headers-protocol cap, not derived from message size.
         // Cast safe: MAX_HEADERS_PER_MESSAGE is the constant 160 (well under u64::MAX).

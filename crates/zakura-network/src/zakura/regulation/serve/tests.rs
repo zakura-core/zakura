@@ -769,7 +769,7 @@ fn sink_and_core(
             _peer_response: SlotBudget::new(1).unwrap().try_reserve().unwrap(),
             _peer_budgets: capacity(LIMITS).peer(&peer(1)),
         }),
-        Commitment(commitments.clone(), None),
+        Commitment(Some(commitments.clone()), None),
     );
     let core = Arc::new(Mutex::new(core));
     (ResponseSink::new(core.clone()), queued, commitments, core)
@@ -777,6 +777,56 @@ fn sink_and_core(
 
 fn open(commitments: &Commitments) -> u32 {
     commitments.open.load(Ordering::Acquire)
+}
+
+#[test]
+fn ending_publication_frees_the_count_before_a_peer_can_replace_its_request() {
+    for tracked in [false, true] {
+        let counts = Arc::new(Commitments {
+            open: AtomicU32::new(1),
+            limit: AtomicU32::new(1),
+        });
+        let (completed, receiver) = watch::channel(false);
+        let mut old = Commitment(Some(counts.clone()), tracked.then_some(completed));
+        let replacement = old
+            .queue_ending(|| {
+                // Publication can wake a writer on another thread before it returns.
+                assert_eq!(counts.open.fetch_add(1, Ordering::AcqRel), 0);
+                Ok::<_, ()>(Commitment(Some(counts.clone()), None))
+            })
+            .unwrap();
+        if tracked {
+            assert!(*receiver.borrow());
+        }
+        drop(old);
+        assert_eq!(
+            open(&counts),
+            1,
+            "the old commitment must not release twice"
+        );
+        drop(replacement);
+        assert_eq!(open(&counts), 0);
+    }
+}
+
+#[test]
+fn failed_ending_publication_releases_its_commitment_once() {
+    let (sink, queued, counts, core) = sink_and_core(ResponseCap {
+        frames: 1,
+        bytes: 64,
+    });
+    drop(queued);
+    assert!(matches!(
+        sink.finish(&Probe::Done(0)),
+        Err(SinkError::Closed)
+    ));
+    assert_eq!(open(&counts), 0);
+    drop(core);
+    assert_eq!(
+        open(&counts),
+        0,
+        "cleanup must not release an ended lease twice"
+    );
 }
 
 #[test]

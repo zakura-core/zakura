@@ -170,12 +170,15 @@ struct Commitments {
 
 /// One open request. Dropping it releases the commitment.
 #[derive(Debug)]
-pub(super) struct Commitment(Arc<Commitments>, Option<watch::Sender<bool>>);
+pub(super) struct Commitment(Option<Arc<Commitments>>, Option<watch::Sender<bool>>);
 
 impl Commitment {
     /// Publish and mark complete under the same lock. A receiver that has seen
     /// the ending must also see completion when it checks for a reused key.
-    fn queue_ending<T, E>(&self, publish: impl FnOnce() -> Result<T, E>) -> Result<T, E> {
+    fn queue_ending<T, E>(&mut self, publish: impl FnOnce() -> Result<T, E>) -> Result<T, E> {
+        // Publishing can wake another thread that transmits the ending and admits
+        // its replacement before send returns. A failed publication also ends this lease.
+        self.release();
         if let Some(completed) = &self.1 {
             let mut result = None;
             completed.send_modify(|done| {
@@ -188,11 +191,17 @@ impl Commitment {
             publish()
         }
     }
+
+    fn release(&mut self) {
+        if let Some(counts) = self.0.take() {
+            counts.open.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
 }
 
 impl Drop for Commitment {
     fn drop(&mut self) {
-        self.0.open.fetch_sub(1, Ordering::AcqRel);
+        self.release();
         if let Some(completed) = &self.1 {
             completed.send_if_modified(|done| !std::mem::replace(done, true));
         }
@@ -312,7 +321,7 @@ impl<P: Produce> Serve<P> {
         completed: Option<watch::Sender<bool>>,
     ) -> Result<(), ServeViolation> {
         let open = self.commitments.open.fetch_add(1, Ordering::AcqRel) + 1;
-        let commitment = Commitment(self.commitments.clone(), completed);
+        let commitment = Commitment(Some(self.commitments.clone()), completed);
         let limit = self.commitments.limit.load(Ordering::Acquire);
         if open > limit.saturating_mul(2) {
             return Err(ServeViolation::OverCommitted { open, limit });

@@ -50,7 +50,7 @@ bitflags = { workspace = true }
 blake2b_simd = { workspace = true }
 byteorder = { workspace = true }
 bytes = { workspace = true }
-chrono = { workspace = true, features = ["clock", "std"] }
+chrono = { workspace = true }
 dirs = { workspace = true }
 hex = { workspace = true }
 indexmap = { workspace = true, features = ["serde"] }

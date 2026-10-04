@@ -90,7 +90,7 @@ zcash_transparent = { workspace = true }
 sinsemilla = { workspace = true }
 
 # Time
-chrono = { workspace = true, features = ["clock", "std", "serde"] }
+chrono = { workspace = true, features = ["serde"] }
 humantime = { workspace = true }
 
 # Error Handling & Formatting

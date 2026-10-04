@@ -70,7 +70,7 @@ bls12_381 = { version = "=2.2.0", package = "zakura-bls12-381" }
 bs58 = "0.5"
 byteorder = "1.5"
 bytes = "1.10"
-chrono = { version = "0.4.40", default-features = false }
+chrono = { version = "0.4.45", default-features = false, features = ["now"] }
 clap = "4.5"
 color-eyre = { version = "0.6.3", default-features = false }
 console-subscriber = "0.5"

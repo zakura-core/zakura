@@ -32,12 +32,11 @@ class CandidateTests(unittest.TestCase):
                 deploy.public_report({'architecture': 'arm64'})
                 self.assertNotIn(address, output.getvalue())
 
-    def test_renamed_and_historical_candidate_runs_remain_usable(self):
+    def test_current_candidate_runs_remain_usable(self):
         paths = ['zakura-mac-cranelift.yml', 'build-zakura-mac-cranelift.yml',
-                 'mac-verifier.yml',
                  'zakura-mainnet-deploy.yml']
         for workflow in paths:
-            for prefix in ['zakura-mac-cranelift-candidate-', 'mac-verifier-cranelift-']:
+            for prefix in ['zakura-mac-cranelift-candidate-']:
                 run = dict(head_repository={'full_name': 'zakura-core/zakura'}, head_branch='main',
                            path='.github/workflows/' + workflow, status='completed', conclusion='success')
                 artifacts = {'artifacts': [dict(name=prefix + 'a' * 40, expired=False),
@@ -50,7 +49,7 @@ class CandidateTests(unittest.TestCase):
                     self.assertIn(prefix + 'a' * 40, download.call_args.args[0])
 
     def test_unused_former_workflow_paths_are_rejected(self):
-        for workflow in ('build-mac-verifier.yml', 'deploy-mac-verifier.yml'):
+        for workflow in ('mac-verifier.yml', 'build-mac-verifier.yml', 'deploy-mac-verifier.yml'):
             run = dict(head_repository={'full_name': 'zakura-core/zakura'}, head_branch='main',
                        path='.github/workflows/' + workflow, status='completed', conclusion='success')
             with self.subTest(workflow=workflow), tempfile.TemporaryDirectory() as tmp, \
@@ -59,6 +58,17 @@ class CandidateTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     deploy.download_candidate('123', Path(tmp))
                 download.assert_not_called()
+
+    def test_retired_artifact_prefix_is_rejected(self):
+        run = dict(head_repository={'full_name': 'zakura-core/zakura'}, head_branch='main',
+                   path='.github/workflows/zakura-mainnet-deploy.yml', status='completed', conclusion='success')
+        artifacts = {'artifacts': [dict(name='mac-verifier-cranelift-' + 'a' * 40, expired=False)]}
+        with tempfile.TemporaryDirectory() as tmp, \
+                patch.object(deploy.subprocess, 'check_output', side_effect=[json.dumps(run), json.dumps(artifacts)]), \
+                patch.object(deploy.subprocess, 'run') as download:
+            with self.assertRaises(ValueError):
+                deploy.download_candidate('123', Path(tmp))
+            download.assert_not_called()
 
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()

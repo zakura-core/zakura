@@ -1,27 +1,73 @@
-//! Reusable resource accounting for native Zakura services.
+#![allow(dead_code, unused_imports)] // activated by the first reactor adoption
+
+//! Shared tools that regulate native Zakura message exchanges.
 //!
-//! This facade provides the ownership mechanics shared by message-specific
-//! policies. It does not decide what a message costs or what should happen
-//! when capacity is unavailable. Those decisions stay with each service.
+//! - [`Serve`] admits requests without waiting, bounds execution and output,
+//!   and ends every admitted request exactly once.
+//! - [`Reservations`] admit a response only if this node requested it.
+//! - [`CadenceBuckets`] and [`CadenceSender`] enforce and obey the rate that
+//!   a row declares.
+//! - [`SessionCapacity`] bounds a service's sessions from reservation through
+//!   the last owner.
+//! - [`SessionTable`] holds each peer's current session, and its
+//!   [`WriterFence`] closes the connection rather than orphan a started
+//!   exchange.
+//! - [`Subscriptions`] and [`Publications`] hold the two sides of a
+//!   subscription: renewable credit, ordered updates, the cursor history,
+//!   and tombstones for crossed updates.
+//! - [`sizing`] derives every capacity default from the throughput target.
+//!
+//! Every tool acts against a peer only on an unambiguous violation: an event
+//! that no conformant peer could cause. Anything a conformant peer could cause
+//! is traced instead. Local capacity limits make this node wait; they never
+//! fault a peer.
+//!
+//! Main's `request` module stays until the block sync adoption replaces it.
 
-#[allow(dead_code)] // used by the first message policy in the stacked PR
-mod outstanding_bytes;
-#[allow(dead_code)] // used by the first message policy in the stacked PR
-mod rate;
-#[allow(dead_code)] // used by the first message policy in the stacked PR
+mod cadence;
+pub(crate) use cadence::{CadenceBuckets, CadenceCharge, CadenceSendError, CadenceSender};
+
+mod request;
+pub(crate) use request::{
+    RequestAdmission, RequestPolicy, RequestSession, ResponsePermit, WorkAttempt,
+};
+
+mod serve;
+pub(crate) use serve::{
+    Produce, Push, PushPermit, Responded, ResponseCap, ResponseSink, Serve, ServeCapacity,
+    ServeConfigError, ServeEnd, ServeLimits, ServeViolation, SinkError, SinkProgress, WorkLease,
+};
+
+mod reservations;
+pub(crate) use reservations::{
+    ClaimRefused, Claimed, Ended, PoolEntry, PrecheckByRequest, PrecheckSlot, ReservationPool,
+    Reservations, ReserveRefused, ResponsePrecheck, SharedReservations,
+};
+
+mod session_capacity;
+pub(crate) use session_capacity::SessionCapacity;
+
+mod session_table;
+pub(crate) use session_table::{Current, Replacement, SessionKey, SessionTable};
+
+pub(crate) mod sizing;
+
+mod subscription;
+pub(crate) use subscription::{
+    within_window, Applied, CreditExceeded, PageStall, Publications, ResponseCredit,
+    SharedSubscriptions, SubscribeRefused, SubscriptionEnded, SubscriptionFault,
+    SubscriptionLimits, Subscriptions, TerminalPermit, Totals, Update,
+};
+
 mod slots;
+pub(crate) use slots::{OutputByteBudget, OutputGrant, SlotBudget, SlotPermit};
 
-#[allow(unused_imports)] // used by the first message policy in the stacked PR
-pub(crate) use outstanding_bytes::{
-    FrameLease, OutstandingByteBudget, OutstandingByteReservation, OutstandingCapacityError,
+mod writer_fence;
+pub(crate) use writer_fence::{
+    Exchange, ExchangeWriter, FencedSendError, WriterFence, UNFINISHED_EXCHANGE,
 };
-#[allow(unused_imports)] // used by the first message policy in the stacked PR
-pub(crate) use rate::{
-    CommittedRateReservation, RateBudget, RateBudgetConfigError, RateReservation,
-    RateReservationError, RateReservationSpendError,
-};
-#[allow(unused_imports)] // used by the first message policy in the stacked PR
-pub(crate) use slots::{SlotBudget, SlotBudgetCapacityError, SlotPermit};
 
+#[cfg(test)]
+pub(crate) mod test_family;
 #[cfg(test)]
 mod tests;

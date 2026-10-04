@@ -11,7 +11,7 @@
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
-    ops::{Bound, RangeBounds},
+    ops::RangeBounds,
     sync::Arc,
 };
 
@@ -60,34 +60,10 @@ pub(in crate::service::finalized_state) const ZAKURA_HEADER_HEIGHT_BY_HASH: &str
     "zakura_header_height_by_hash";
 pub(in crate::service::finalized_state) const ZAKURA_HEADER_BY_HEIGHT: &str =
     "zakura_header_by_height";
+/// Legacy column family kept registered for on-disk format compatibility.
+/// Its writer was removed with the fork-aware header engine; body-size hints now come from
+/// hash-keyed auxiliary deliveries and committed `BlockInfo`. Nothing reads or writes it.
 pub const ZAKURA_HEADER_BODY_SIZE_BY_HEIGHT: &str = "zakura_header_body_size_by_height";
-
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-struct AdvertisedBodySize(u32);
-
-impl AdvertisedBodySize {
-    fn get(self) -> u32 {
-        self.0
-    }
-}
-
-impl IntoDisk for AdvertisedBodySize {
-    type Bytes = [u8; 4];
-
-    fn as_bytes(&self) -> Self::Bytes {
-        self.0.to_be_bytes()
-    }
-}
-
-impl FromDisk for AdvertisedBodySize {
-    fn from_bytes(bytes: impl AsRef<[u8]>) -> Self {
-        let bytes = bytes
-            .as_ref()
-            .try_into()
-            .expect("advertised body sizes are stored as u32");
-        Self(u32::from_be_bytes(bytes))
-    }
-}
 
 impl IntoDisk for BlockCommitmentRoots {
     type Bytes = Vec<u8>;
@@ -163,94 +139,6 @@ impl ZakuraDb {
         self.db.zs_contains(&tx_by_loc, &first_tx)
     }
 
-    /// Returns the advisory body-size hint for a header-only height, if known.
-    ///
-    /// `None` means the peer supplied the `0` unknown sentinel or no hint has been
-    /// stored. This value is not consensus data.
-    #[allow(clippy::unwrap_in_result)]
-    pub fn advertised_body_size(&self, height: block::Height) -> Option<u32> {
-        let body_size_by_height = self
-            .db
-            .cf_handle(ZAKURA_HEADER_BODY_SIZE_BY_HEIGHT)
-            .unwrap();
-
-        self.db
-            .zs_get(&body_size_by_height, &height)
-            .map(AdvertisedBodySize::get)
-    }
-
-    /// Returns finalized commitment roots for a contiguous height range.
-    ///
-    /// The result stops before the first missing height.
-    pub fn finalized_commitment_roots_by_height_range(
-        &self,
-        range: impl RangeBounds<block::Height>,
-    ) -> Vec<BlockCommitmentRoots> {
-        let Some(tip_height) = self.finalized_tip_height() else {
-            return Vec::new();
-        };
-        let Some(start_height) = (match range.start_bound() {
-            Bound::Included(height) => Some(*height),
-            Bound::Excluded(height) => height.next().ok(),
-            Bound::Unbounded => Some(block::Height::MIN),
-        }) else {
-            return Vec::new();
-        };
-        let Some(end_height) = (match range.end_bound() {
-            Bound::Included(height) => Some(*height),
-            Bound::Excluded(height) => height.previous().ok(),
-            Bound::Unbounded => Some(tip_height),
-        }) else {
-            return Vec::new();
-        };
-        let end_height = end_height.min(tip_height);
-        if start_height > end_height {
-            return Vec::new();
-        }
-
-        let mut roots = Vec::new();
-
-        // The per-height tree column families are sparse: they only store a row
-        // when that pool's tree changes. Resolve each requested finalized height
-        // through the backwards tree lookup instead of iterating those sparse
-        // rows as if they were a contiguous block-height index.
-        for raw_height in start_height.0..=end_height.0 {
-            let height = block::Height(raw_height);
-            let Some(sapling) = self.sapling_tree_by_height(&height) else {
-                break;
-            };
-            let Some(orchard) = self.orchard_tree_by_height(&height) else {
-                break;
-            };
-            let Some(ironwood) = self.ironwood_tree_by_height(&height) else {
-                break;
-            };
-
-            let Some(block) = self.block(height.into()) else {
-                break;
-            };
-            let (sapling_tx, orchard_tx, ironwood_tx, auth_data_root) = (
-                block.sapling_transactions_count(),
-                block.orchard_transactions_count(),
-                block.ironwood_transactions_count(),
-                block.auth_data_root(),
-            );
-
-            roots.push(BlockCommitmentRoots {
-                height,
-                sapling_root: sapling.root(),
-                orchard_root: orchard.root(),
-                ironwood_root: ironwood.root(),
-                sapling_tx,
-                orchard_tx,
-                ironwood_tx,
-                auth_data_root,
-            });
-        }
-
-        roots
-    }
-
     /// Returns the finalized hash for a given `block::Height` if it is present.
     #[allow(clippy::unwrap_in_result)]
     pub fn hash(&self, height: block::Height) -> Option<block::Hash> {
@@ -274,23 +162,6 @@ impl ZakuraDb {
     pub fn height(&self, hash: block::Hash) -> Option<block::Height> {
         let height_by_hash = self.db.cf_handle("height_by_hash").unwrap();
         self.db.zs_get(&height_by_hash, &hash)
-    }
-
-    /// Returns the previous block hash for the given block hash in the finalized state.
-    #[allow(dead_code)]
-    pub fn prev_block_hash_for_hash(&self, hash: block::Hash) -> Option<block::Hash> {
-        let height = self.height(hash)?;
-        let prev_height = height.previous().ok()?;
-
-        self.hash(prev_height)
-    }
-
-    /// Returns the previous block height for the given block hash in the finalized state.
-    #[allow(dead_code)]
-    pub fn prev_block_height_for_hash(&self, hash: block::Hash) -> Option<block::Height> {
-        let height = self.height(hash)?;
-
-        height.previous().ok()
     }
 
     /// Returns the [`block::Header`] with [`block::Hash`] or
@@ -753,8 +624,12 @@ impl ZakuraDb {
     /// Returns `None` if the database has never pruned any data (it is
     /// effectively an archive database).
     pub fn lowest_retained_height(&self) -> Option<Height> {
-        let pruning_metadata = self.db.cf_handle(PRUNING_METADATA)?;
-        self.db.zs_get(&pruning_metadata, &())
+        self.db.lowest_retained_height()
+    }
+
+    /// Subscribe to the durable body floor before commit callers publish their new tip.
+    pub(crate) fn subscribe_retained_block_height(&self) -> tokio::sync::watch::Receiver<Height> {
+        self.db.subscribe_retained_block_height()
     }
 
     /// Returns `true` if the database has pruned historical data, and therefore

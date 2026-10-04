@@ -5,7 +5,7 @@
 
 use std::time::Duration;
 
-use iroh::{endpoint, Endpoint, NodeAddr, NodeId, RelayMode, SecretKey};
+use iroh::{endpoint, Endpoint, EndpointAddr, EndpointId, RelayMode, SecretKey};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
@@ -17,6 +17,8 @@ use crate::{
 
 mod block_sync;
 mod discovery;
+#[cfg(test)]
+mod example_reactor;
 mod handler;
 mod handshake;
 mod header_sync;
@@ -27,6 +29,7 @@ mod regulation;
 pub mod testkit;
 mod trace;
 pub mod transport;
+pub mod wire_codec;
 
 pub use block_sync::*;
 pub use discovery::*;
@@ -199,12 +202,12 @@ const ZAKURA_LIVENESS_REFRESH_INTERVAL: Duration = Duration::from_secs(45);
 
 /// Returns an iroh endpoint builder with relays and external address lookup disabled.
 ///
-/// Callers must add direct bind addresses before binding if they do not want the
-/// endpoint to listen on iroh's default unspecified sockets.
+/// Callers must add explicit direct bind addresses before binding.
 pub fn direct_endpoint_builder(secret_key: SecretKey) -> endpoint::Builder {
-    Endpoint::builder()
+    Endpoint::builder(endpoint::presets::Minimal)
         .relay_mode(RelayMode::Disabled)
-        .clear_discovery()
+        .clear_address_lookup()
+        .clear_ip_transports()
         .secret_key(secret_key)
 }
 
@@ -339,35 +342,28 @@ impl ZakuraHandshakeConnector {
             }
         };
         let dial_start = endpoint.start_upgrade_native_dial(node_addr);
-        if dial_start == ZakuraUpgradeDialStart::InvalidPeerId {
-            return ZakuraNativeHandoff::Failed;
-        }
+        // The legacy handshake runs this hand-off inside `HANDSHAKE_TIMEOUT`,
+        // which is shorter than the registration wait, so the timeout can drop
+        // this future before it returns. Cancel the dial we started from a drop
+        // guard, so that path also stops it. Otherwise a malicious legacy
+        // responder could repeat failed upgrades with distinct node ids and
+        // leak a redialing task and its outbound QUIC traffic per upgrade.
+        let cancel_guard = match dial_start {
+            ZakuraUpgradeDialStart::Started => Some(UpgradeDialCancelGuard { endpoint, peer_id }),
+            ZakuraUpgradeDialStart::AlreadyRunning => None,
+            ZakuraUpgradeDialStart::InvalidPeerId => return ZakuraNativeHandoff::Failed,
+        };
         let conn_id = registration_wait.wait(ZAKURA_LIVENESS_APPEAR_TIMEOUT).await;
-        match (dial_start, conn_id) {
-            (ZakuraUpgradeDialStart::Started, Some(conn_id)) => {
-                return ZakuraNativeHandoff::Registered(conn_id);
+        match (cancel_guard, conn_id) {
+            // The peer registered, so the dial now owns a live connection.
+            (Some(cancel_guard), Some(conn_id)) => {
+                cancel_guard.disarm();
+                ZakuraNativeHandoff::Registered(conn_id)
             }
-            (ZakuraUpgradeDialStart::AlreadyRunning, Some(_)) => {
-                return ZakuraNativeHandoff::Duplicate;
-            }
-            (ZakuraUpgradeDialStart::InvalidPeerId, _) => {
-                unreachable!("invalid peer identities return before waiting for registration")
-            }
-            (ZakuraUpgradeDialStart::AlreadyRunning, None) => {
-                return ZakuraNativeHandoff::Failed;
-            }
-            (ZakuraUpgradeDialStart::Started, None) => {}
+            (None, Some(_)) => ZakuraNativeHandoff::Duplicate,
+            // A dropped guard cancels the dial this hand-off started.
+            (_, None) => ZakuraNativeHandoff::Failed,
         }
-
-        // The hand-off did not complete within the wait window. The dial spawned
-        // by `start_upgrade_native_dial` uses `RedialPolicy::maintain`, so it
-        // would keep redialing this peer-supplied address forever and retain its
-        // `upgrade_dials` entry. Cancel the dial and drop the entry so a
-        // malicious legacy responder cannot leak unbounded maintained dials and
-        // outbound QUIC traffic by repeating failed upgrades with distinct node
-        // ids.
-        endpoint.cancel_upgrade_native_dial(peer_id);
-        ZakuraNativeHandoff::Failed
     }
 
     /// Wait until the upgraded peer's inbound native QUIC connection registers
@@ -461,6 +457,27 @@ impl ZakuraHandshakeConnector {
     }
 }
 
+/// Cancels the maintained upgrade dial that a hand-off started, unless the
+/// hand-off disarms it after the peer registers.
+struct UpgradeDialCancelGuard<'a> {
+    endpoint: &'a ZakuraEndpoint,
+    peer_id: &'a ZakuraPeerId,
+}
+
+impl UpgradeDialCancelGuard<'_> {
+    /// Leave the dial running. The guard holds only references, so forgetting
+    /// it leaks nothing.
+    fn disarm(self) {
+        std::mem::forget(self);
+    }
+}
+
+impl Drop for UpgradeDialCancelGuard<'_> {
+    fn drop(&mut self) {
+        self.endpoint.cancel_upgrade_native_dial(self.peer_id);
+    }
+}
+
 /// Builds an iroh dial address from the node id and direct-address hints a peer
 /// advertised in a legacy upgrade prelude.
 ///
@@ -468,9 +485,9 @@ impl ZakuraHandshakeConnector {
 /// by configured bootstrap peers), so each entry is parsed back into a
 /// `SocketAddr`. Returns `None` if the node id is malformed or no direct address
 /// parses, since a peer with no reachable address cannot be dialed.
-fn node_addr_from_hints(node_id: &[u8], direct_addresses: &[Vec<u8>]) -> Option<NodeAddr> {
+fn node_addr_from_hints(node_id: &[u8], direct_addresses: &[Vec<u8>]) -> Option<EndpointAddr> {
     let node_id_bytes: [u8; 32] = node_id.try_into().ok()?;
-    let node_id = NodeId::from_bytes(&node_id_bytes).ok()?;
+    let node_id = EndpointId::from_bytes(&node_id_bytes).ok()?;
 
     let direct: Vec<std::net::SocketAddr> = direct_addresses
         .iter()
@@ -481,7 +498,7 @@ fn node_addr_from_hints(node_id: &[u8], direct_addresses: &[Vec<u8>]) -> Option<
         return None;
     }
 
-    Some(NodeAddr::new(node_id).with_direct_addresses(direct))
+    Some(EndpointAddr::new(node_id).with_addrs((direct).into_iter().map(iroh::TransportAddr::Ip)))
 }
 
 /// Refresh an upgraded peer's legacy `Responded` liveness while its maintained
@@ -527,7 +544,7 @@ mod tests {
     use iroh::{
         endpoint::Connection,
         protocol::{AcceptError, ProtocolHandler, Router},
-        SecretKey, Watcher as _,
+        SecretKey,
     };
 
     use super::*;
@@ -547,7 +564,7 @@ mod tests {
         let secret_key = SecretKey::from_bytes(&[7; 32]);
 
         let endpoint = direct_endpoint_builder(secret_key)
-            .bind_addr_v4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
+            .bind_addr(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))?
             .bind()
             .await?;
 
@@ -555,12 +572,12 @@ mod tests {
             .accept(b"/zakura/smoke/0", SmokeProtocolHandler)
             .spawn();
 
-        let addr = router.endpoint().node_addr().initialized().await;
+        let addr = router.endpoint().addr();
 
-        assert_eq!(addr.node_id, router.endpoint().node_id());
-        assert!(addr.direct_addresses().next().is_some());
-        assert!(addr.relay_url().is_none());
-        assert!(router.endpoint().discovery().is_none());
+        assert_eq!(addr.id, router.endpoint().id());
+        assert!(addr.ip_addrs().next().is_some());
+        assert!(addr.relay_urls().next().is_none());
+        assert!(router.endpoint().address_lookup()?.is_empty());
 
         router.shutdown().await?;
 

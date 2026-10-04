@@ -13,7 +13,7 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     fmt::{Debug, Write},
-    fs,
+    fs, io,
     ops::RangeBounds,
     path::Path,
     sync::{
@@ -23,11 +23,12 @@ use std::{
 };
 
 use itertools::Itertools;
-use rlimit::increase_nofile_limit;
 
 use rocksdb::{ColumnFamilyDescriptor, ErrorKind, Options, ReadOptions};
 use semver::Version;
-use zakura_chain::{parameters::Network, primitives::byte_array::increment_big_endian};
+use zakura_chain::{
+    block::Height, parameters::Network, primitives::byte_array::increment_big_endian,
+};
 
 use crate::{
     database_format_version_on_disk,
@@ -42,6 +43,9 @@ use super::zakura_db::transparent::{
 // Doc-only imports
 #[allow(unused_imports)]
 use super::{TypedColumnFamily, WriteTypedBatch};
+
+mod rlimit;
+use self::rlimit::{current_nofile_limit, increase_nofile_limit};
 
 // These helpers expose the raw RocksDB handle, so they must remain test-only.
 #[cfg(test)]
@@ -138,6 +142,9 @@ pub struct DiskDb {
     //
     /// Database startup and each metrics export update this cached disk size.
     cached_size: Arc<AtomicU64>,
+
+    /// Durable body floor, published before a successful write returns to its caller.
+    retained_block_height: tokio::sync::watch::Sender<Height>,
 
     /// The shared inner RocksDB database.
     ///
@@ -834,7 +841,9 @@ impl DiskDb {
 
     /// When called with a secondary DB instance, tries to catch up with the primary DB instance
     pub fn try_catch_up_with_primary(&self) -> Result<(), rocksdb::Error> {
-        self.db.try_catch_up_with_primary()
+        self.db.try_catch_up_with_primary()?;
+        self.publish_retained_block_height();
+        Ok(())
     }
 
     /// Compact the given key range in `cf`, including `from` and excluding
@@ -1213,8 +1222,10 @@ impl DiskDb {
                     _secondary_dir: secondary_dir,
                     finished_format_upgrades: Arc::new(AtomicBool::new(false)),
                     cached_size: Arc::new(AtomicU64::new(0)),
+                    retained_block_height: tokio::sync::watch::channel(Height::MIN).0,
                 };
 
+                db.publish_retained_block_height();
                 db.assert_default_cf_is_empty();
                 db.refresh_cached_size();
 
@@ -1393,9 +1404,37 @@ impl DiskDb {
     // Write methods
     // Low-level write methods are located in the WriteDisk trait
 
-    /// Writes `batch` to the database.
+    /// Writes `batch` to the database and publishes its retained-body floor.
+    /// Body pruning must use this path so the floor is visible before callers publish a new tip.
     pub(crate) fn write(&self, batch: DiskWriteBatch) -> Result<(), rocksdb::Error> {
-        self.db.write(batch.batch)
+        self.db.write(batch.batch)?;
+        // Header/full-state callers publish their new tip after this returns.
+        // Publishing the floor first prevents a new tip using the previous floor.
+        self.publish_retained_block_height();
+        Ok(())
+    }
+
+    pub(super) fn lowest_retained_height(&self) -> Option<Height> {
+        let metadata = self.cf_handle(super::PRUNING_METADATA)?;
+        self.zs_get(&metadata, &())
+    }
+
+    pub(super) fn subscribe_retained_block_height(&self) -> tokio::sync::watch::Receiver<Height> {
+        self.retained_block_height.subscribe()
+    }
+
+    fn publish_retained_block_height(&self) {
+        // Read under the publication lock so concurrent writers cannot publish
+        // an older observation after a newer one. Offline pruning can also lower
+        // a stale marker when older bodies still exist.
+        self.retained_block_height.send_if_modified(|current| {
+            let retained = self.lowest_retained_height().unwrap_or(Height::MIN);
+            if *current == retained {
+                return false;
+            }
+            *current = retained;
+            true
+        });
     }
 
     /// Flushes pending writes to SST files.
@@ -1600,25 +1639,34 @@ impl DiskDb {
         (open_file_limit - DiskDb::RESERVED_FILE_COUNT) / 2
     }
 
-    /// Increase the open file limit for this process to `IDEAL_OPEN_FILE_LIMIT`.
-    /// If that fails, try `MIN_OPEN_FILE_LIMIT`.
+    /// Increase the process open-file limit to [`Self::IDEAL_OPEN_FILE_LIMIT`].
+    /// If that fails, try [`Self::MIN_OPEN_FILE_LIMIT`], then query the actual
+    /// limit.
     ///
-    /// If the current limit is above `IDEAL_OPEN_FILE_LIMIT`, leaves it
+    /// If the current limit is above [`Self::IDEAL_OPEN_FILE_LIMIT`], leaves it
     /// unchanged.
     ///
     /// Returns the current limit, after any successful increases.
     ///
     /// # Panics
     ///
-    /// If the open file limit can not be increased to `MIN_OPEN_FILE_LIMIT`.
+    /// If the actual limit is below [`Self::MIN_OPEN_FILE_LIMIT`] or cannot be
+    /// queried.
     fn increase_open_file_limit() -> u64 {
+        Self::increase_open_file_limit_with(increase_nofile_limit, current_nofile_limit)
+    }
+
+    fn increase_open_file_limit_with(
+        mut increase: impl FnMut(u64) -> io::Result<u64>,
+        query: impl FnOnce() -> io::Result<u64>,
+    ) -> u64 {
         // Zebra mainly uses TCP sockets (`zakura-network`) and low-level files
         // (`zakura-state` database).
         //
         // On Unix-based platforms, `increase_nofile_limit` changes the limit for
         // both database files and TCP connections.
         //
-        // But it doesn't do anything on Windows in rlimit 0.7.0.
+        // It leaves Windows limits unchanged.
         //
         // On Windows, the default limits are:
         // - 512 high-level stream I/O files (via the C standard functions),
@@ -1631,27 +1679,40 @@ impl DiskDb {
         // `zakura-state`'s `IDEAL_OPEN_FILE_LIMIT` is much less than
         // the Windows low-level I/O file limit.
         //
-        // The [`setmaxstdio` and `getmaxstdio`](https://docs.rs/rlimit/latest/rlimit/#windows)
-        // functions from the `rlimit` crate only change the high-level I/O file limit.
+        // The Windows `_setmaxstdio` and `_getmaxstdio` functions only change
+        // the high-level I/O file limit.
         //
         // `zakura-network`'s default connection limit is much less than
         // the TCP Control Block limit on Windows.
 
         // We try setting the ideal limit, then the minimum limit.
-        let current_limit = match increase_nofile_limit(DiskDb::IDEAL_OPEN_FILE_LIMIT) {
+        let current_limit = match increase(DiskDb::IDEAL_OPEN_FILE_LIMIT) {
             Ok(current_limit) => current_limit,
             Err(limit_error) => {
-                // These errors can happen due to sandboxing or unsupported system calls,
-                // even if the file limit is high enough.
+                // A sandbox can reject an increase even with a usable current
+                // limit. Retry the minimum before querying the actual limit.
                 info!(
                     ?limit_error,
                     min_limit = ?DiskDb::MIN_OPEN_FILE_LIMIT,
                     ideal_limit = ?DiskDb::IDEAL_OPEN_FILE_LIMIT,
-                    "unable to increase the open file limit, \
-                     assuming Zakura can open a minimum number of files"
+                    "unable to increase the open file limit to the ideal, \
+                     trying the minimum"
                 );
 
-                return DiskDb::MIN_OPEN_FILE_LIMIT;
+                increase(DiskDb::MIN_OPEN_FILE_LIMIT).unwrap_or_else(|minimum_error| {
+                    info!(
+                        ?minimum_error,
+                        "unable to increase the open file limit to the minimum, \
+                         querying the current limit"
+                    );
+                    query().unwrap_or_else(|query_error| {
+                        panic!(
+                            "unable to determine the current open file limit: {query_error}. \
+                             Zakura requires at least {} open files",
+                            DiskDb::MIN_OPEN_FILE_LIMIT
+                        )
+                    })
+                })
             }
         };
 

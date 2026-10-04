@@ -161,7 +161,8 @@ pub enum CwndUnit {
 /// Block-sync peer status advertisement.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct BlockSyncStatus {
-    /// Earliest block body this peer can serve.
+    /// Lower bound of the contiguous advertised body range.
+    /// Separately retained genesis may also be served below this bound.
     pub servable_low: block::Height,
     /// Highest contiguous verified block body this peer can serve.
     pub servable_high: block::Height,
@@ -245,20 +246,20 @@ pub struct ZakuraBlockSyncConfig {
     /// `DESERIALIZED_MEM_FACTOR` times their wire size.
     pub max_reorder_lookahead_bytes: u64,
     /// How long to avoid reassigning an expired floor height to the same peer.
-    #[serde(with = "humantime_serde")]
+    #[serde(with = "zakura_chain::serialization::serde_adapters::duration")]
     pub floor_peer_avoid_cooldown: Duration,
     /// Depth for block-sync action/body channels, clamped to at least one full
     /// checkpoint range.
     pub max_submitted_block_applies: usize,
     /// Timeout for an outstanding block-body range request.
-    #[serde(with = "humantime_serde")]
+    #[serde(with = "zakura_chain::serialization::serde_adapters::duration")]
     pub request_timeout: Duration,
     /// Short leash on a floor request before its height is rescued to a faster
     /// carrier. Clamped positive and never above `request_timeout`.
-    #[serde(with = "humantime_serde")]
+    #[serde(with = "zakura_chain::serialization::serde_adapters::duration")]
     pub floor_rescue_timeout: Duration,
     /// How long to withhold a block-sync session after it makes no accepted block progress.
-    #[serde(with = "humantime_serde")]
+    #[serde(with = "zakura_chain::serialization::serde_adapters::duration")]
     pub no_progress_peer_cooldown: Duration,
     /// `GetBlocks` requests an unproven peer may receive before its first accepted body,
     /// so a peer that accepts requests but never serves bodies can't spend a full BBR
@@ -269,7 +270,7 @@ pub struct ZakuraBlockSyncConfig {
     /// deadline parks its block-sync session.
     pub max_requests_without_block_progress: u32,
     /// How often this node sends unsolicited status refreshes after local frontier changes.
-    #[serde(with = "humantime_serde")]
+    #[serde(with = "zakura_chain::serialization::serde_adapters::duration")]
     pub status_refresh_interval: Duration,
     /// Percentage deviation from advertised body-size hints tolerated before soft scoring.
     pub size_deviation_tolerance: u32,
@@ -280,16 +281,16 @@ pub struct ZakuraBlockSyncConfig {
     /// max-filter already adopts higher delivery rates without an explicit up-probe).
     pub bbr_probe_bw_gain_percent: u32,
     /// How often to enter ProbeRTT to refresh the min-RTT estimate.
-    #[serde(with = "humantime_serde")]
+    #[serde(with = "zakura_chain::serialization::serde_adapters::duration")]
     pub bbr_probe_rtt_interval: Duration,
     /// How long to hold the drained cwnd during ProbeRTT.
-    #[serde(with = "humantime_serde")]
+    #[serde(with = "zakura_chain::serialization::serde_adapters::duration")]
     pub bbr_probe_rtt_duration: Duration,
     /// Windowed-min horizon for the RTprop (min-RTT) estimate.
-    #[serde(with = "humantime_serde")]
+    #[serde(with = "zakura_chain::serialization::serde_adapters::duration")]
     pub bbr_rtprop_window: Duration,
     /// Max-filter horizon for the delivery-rate (BtlBw) estimate.
-    #[serde(with = "humantime_serde")]
+    #[serde(with = "zakura_chain::serialization::serde_adapters::duration")]
     pub bbr_delivery_rate_window: Duration,
     /// Per-RTT Startup cwnd growth, percent. Reserved: there is no separate Startup ramp
     /// phase yet, so this knob is currently inert (cold start uses

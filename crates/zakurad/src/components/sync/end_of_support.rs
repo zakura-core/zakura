@@ -7,13 +7,17 @@ use color_eyre::Report;
 use zakura_chain::{
     block::Height,
     chain_tip::ChainTip,
-    parameters::{Network, POST_BLOSSOM_POW_TARGET_SPACING},
+    parameters::{Network, NetworkUpgrade, POST_BLOSSOM_POW_TARGET_SPACING},
 };
 
 use crate::application::release_version;
 
 /// The estimated height that this release will be published.
-pub const ESTIMATED_RELEASE_HEIGHT: u32 = 3_479_387;
+///
+/// Projected to the end of October 1, 2026 UTC from the committed September 22
+/// release-state bundle at the Mainnet target spacing. With the 30-day support
+/// window, the first unsupported block is estimated at November 1, 00:00 UTC.
+pub const ESTIMATED_RELEASE_HEIGHT: u32 = 3_501_907;
 
 /// The estimated number of blocks per day after Blossom.
 ///
@@ -21,19 +25,19 @@ pub const ESTIMATED_RELEASE_HEIGHT: u32 = 3_479_387;
 /// every reachable tip height.
 pub const ESTIMATED_BLOCKS_PER_DAY: u32 = 24 * 60 * 60 / POST_BLOSSOM_POW_TARGET_SPACING;
 
-/// The maximum number of days after `ESTIMATED_RELEASE_HEIGHT` where a Zebra server will run
-/// without halting.
+/// The maximum number of days after [`ESTIMATED_RELEASE_HEIGHT`] that a Zakura
+/// server will run without halting.
 ///
 /// Notes:
 ///
-/// - Zebra will exit with a panic if the current tip height is bigger than the
-///   `ESTIMATED_RELEASE_HEIGHT` plus this number of days.
-/// - Currently set to 22 days
+/// - Zakura will exit with a panic if the current tip height is bigger than
+///   [`ESTIMATED_RELEASE_HEIGHT`] plus this number of days at the target spacing.
+/// - Currently set to 30 days
 ///
-/// Note: v1.4.0-rc1 is estimated to release at height 3,479,387 (~2026-09-11)
-/// and halts 22 days later at height 3,504,731 (~2026-10-03) — the same
-/// halt block and date as v1.4.0-rc0 and v1.3.2.
-pub const EOS_PANIC_AFTER: u32 = 22;
+/// With this release's [`ESTIMATED_RELEASE_HEIGHT`], Mainnet is supported through
+/// height 3,536,467 and halts after it (~2026-11-01 00:00 UTC). Calendar dates
+/// are estimates; enforcement follows the chain tip height.
+pub const EOS_PANIC_AFTER: u32 = 30;
 
 /// The number of days before the end of support where Zebra will display warnings.
 pub const EOS_WARN_AFTER: u32 = EOS_PANIC_AFTER - 3;
@@ -103,9 +107,43 @@ pub async fn start(
 /// The node runs at this height and halts when the tip goes past it. This
 /// matches zcashd's `end_of_service.block_height` threshold semantics.
 pub fn end_of_support_height(network: &Network) -> Option<Height> {
-    (network == &Network::Mainnet).then_some(Height(
-        ESTIMATED_RELEASE_HEIGHT + (EOS_PANIC_AFTER * ESTIMATED_BLOCKS_PER_DAY),
-    ))
+    (network == &Network::Mainnet).then(|| estimated_height_after_release(network, EOS_PANIC_AFTER))
+}
+
+/// Returns the estimated height `days` after [`ESTIMATED_RELEASE_HEIGHT`] on
+/// `network`.
+///
+/// The estimate follows the target spacing at each height, so it remains valid
+/// across target-spacing changes.
+fn estimated_height_after_release(network: &Network, days: u32) -> Height {
+    let mut height = i64::from(ESTIMATED_RELEASE_HEIGHT);
+    let mut remaining_seconds = i64::from(days) * 24 * 60 * 60;
+
+    let target_spacings: Vec<_> = NetworkUpgrade::target_spacings(network).collect();
+    for (index, (_, target_spacing)) in target_spacings.iter().enumerate() {
+        let target_spacing = target_spacing.num_seconds();
+        let remaining_blocks = remaining_seconds / target_spacing;
+
+        // The number of blocks after `height` that still use this target
+        // spacing. The block at the next spacing's start height already uses
+        // the next spacing, so it is not counted here.
+        let blocks_until_next_spacing = target_spacings
+            .get(index + 1)
+            .map(|(next_height, _)| (i64::from(next_height.0) - height - 1).max(0));
+
+        match blocks_until_next_spacing {
+            Some(blocks) if blocks < remaining_blocks => {
+                height += blocks;
+                remaining_seconds -= blocks * target_spacing;
+            }
+            _ => {
+                height += remaining_blocks;
+                break;
+            }
+        }
+    }
+
+    Height(u32::try_from(height).expect("the support window ends below the maximum height"))
 }
 
 /// Returns the number of blocks left before this release halts, or `None` when
@@ -126,8 +164,7 @@ pub fn check(tip_height: Height, network: &Network) {
         info!("Release always valid outside Mainnet");
         return;
     };
-    let warn_height =
-        Height(ESTIMATED_RELEASE_HEIGHT + (EOS_WARN_AFTER * ESTIMATED_BLOCKS_PER_DAY));
+    let warn_height = estimated_height_after_release(network, EOS_WARN_AFTER);
 
     if tip_height > panic_height {
         panic!(
@@ -144,5 +181,92 @@ pub fn check(tip_height: Height, network: &Network) {
         );
     } else {
         info!("Zakura release is supported until block {}, please report bugs at https://github.com/zakura-core/zakura/issues", panic_height.0);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use zakura_chain::parameters::testnet::{
+        ConfiguredActivationHeights, ConfiguredCheckpoints, RegtestParameters,
+    };
+
+    use super::*;
+
+    /// Returns the number of blocks per day at `upgrade`'s target spacing.
+    fn blocks_per_day(upgrade: NetworkUpgrade) -> u32 {
+        let seconds_per_day = 24 * 60 * 60;
+        let spacing = u32::try_from(upgrade.target_spacing().num_seconds())
+            .expect("target spacings are positive and fit in u32");
+
+        seconds_per_day / spacing
+    }
+
+    /// Returns a Regtest network with Blossom at `blossom`.
+    fn regtest_with_blossom(blossom: u32) -> Network {
+        let genesis = Network::new_regtest(Default::default()).genesis_hash();
+        Network::new_regtest(RegtestParameters {
+            activation_heights: ConfiguredActivationHeights {
+                blossom: Some(blossom),
+                ..Default::default()
+            },
+            // Canopy defaults to Blossom, so the checkpoints must cover the block before it.
+            checkpoints: Some(ConfiguredCheckpoints::HeightsAndHashes(vec![
+                (Height(0), genesis),
+                (Height(blossom - 1), zakura_chain::block::Hash([1; 32])),
+            ])),
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn mainnet_end_of_support_height_counts_75_second_blocks() {
+        let _init_guard = zakura_test::init();
+        let post_blossom_blocks_per_day = blocks_per_day(NetworkUpgrade::Blossom);
+
+        assert_eq!(
+            end_of_support_height(&Network::Mainnet),
+            Some(Height(
+                ESTIMATED_RELEASE_HEIGHT + EOS_PANIC_AFTER * post_blossom_blocks_per_day
+            )),
+        );
+        assert_eq!(
+            estimated_height_after_release(&Network::Mainnet, EOS_WARN_AFTER),
+            Height(ESTIMATED_RELEASE_HEIGHT + EOS_WARN_AFTER * post_blossom_blocks_per_day),
+        );
+    }
+
+    #[test]
+    fn end_of_support_height_follows_target_spacing_changes() {
+        let _init_guard = zakura_test::init();
+        let pre_blossom_blocks_per_day = blocks_per_day(NetworkUpgrade::Genesis);
+        let post_blossom_blocks_per_day = blocks_per_day(NetworkUpgrade::Blossom);
+
+        // Blossom activates after the support window.
+        let network = regtest_with_blossom(
+            ESTIMATED_RELEASE_HEIGHT + (EOS_PANIC_AFTER + 1) * pre_blossom_blocks_per_day,
+        );
+        assert_eq!(
+            estimated_height_after_release(&network, EOS_PANIC_AFTER),
+            Height(ESTIMATED_RELEASE_HEIGHT + EOS_PANIC_AFTER * pre_blossom_blocks_per_day),
+        );
+
+        // Blossom activates 7 days into the support window. Blocks up to
+        // `blossom - 1` take 150 seconds, which leaves 150 seconds of the
+        // seventh day for 2 blocks at 75 seconds, starting with the Blossom
+        // activation block.
+        let blossom = ESTIMATED_RELEASE_HEIGHT + 7 * pre_blossom_blocks_per_day;
+        let network = regtest_with_blossom(blossom);
+        assert_eq!(
+            estimated_height_after_release(&network, EOS_PANIC_AFTER),
+            Height(blossom - 1 + 2 + (EOS_PANIC_AFTER - 7) * post_blossom_blocks_per_day),
+        );
+
+        // Blossom activates at the first block after the release, so every
+        // block in the window takes 75 seconds.
+        let network = regtest_with_blossom(ESTIMATED_RELEASE_HEIGHT + 1);
+        assert_eq!(
+            estimated_height_after_release(&network, EOS_PANIC_AFTER),
+            Height(ESTIMATED_RELEASE_HEIGHT + EOS_PANIC_AFTER * post_blossom_blocks_per_day),
+        );
     }
 }

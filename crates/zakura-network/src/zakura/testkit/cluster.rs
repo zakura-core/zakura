@@ -79,23 +79,6 @@ impl ZakuraTestCluster {
         &self.nodes[index]
     }
 
-    /// Connect nodes according to `topology`.
-    pub async fn connect_topology(
-        &self,
-        topology: ClusterTopology,
-        timeout: Duration,
-    ) -> Result<(), BoxError> {
-        match topology {
-            ClusterTopology::FullMesh => self.connect_full_mesh(timeout).await,
-            ClusterTopology::Line => {
-                for pair in self.nodes.windows(2) {
-                    pair[0].connect_native(&pair[1], timeout).await?;
-                }
-                Ok(())
-            }
-        }
-    }
-
     /// Connect every pair in the cluster.
     pub async fn connect_full_mesh(&self, timeout: Duration) -> Result<(), BoxError> {
         for left in 0..self.nodes.len() {
@@ -112,11 +95,11 @@ impl ZakuraTestCluster {
     pub async fn await_all_connected(&self, timeout: Duration) -> Result<(), BoxError> {
         let mut ids = Vec::with_capacity(self.nodes.len());
         for node in &self.nodes {
-            ids.push(node.node_addr().await.node_id.as_bytes().to_vec());
+            ids.push(node.node_addr().await.id.as_bytes().to_vec());
         }
 
         for node in &self.nodes {
-            let own_id = node.node_addr().await.node_id.as_bytes().to_vec();
+            let own_id = node.node_addr().await.id.as_bytes().to_vec();
             let expected_peers: Vec<Vec<u8>> =
                 ids.iter().filter(|id| **id != own_id).cloned().collect();
             let registered = node.supervisor().subscribe();
@@ -154,10 +137,10 @@ mod tests {
             BlockSyncEvent, BlockSyncFrontiers, BlockSyncMessage, BlockSyncStatus,
             DiscoveryMessage, Event, Frame, FramedSend, FullStateFrontiers, HeaderEntry,
             HeaderSyncAction, HeaderSyncMessage, Headers, Peer, Service, ServicePeerLimits, Status,
-            Stream, StreamMode, ZakuraBlockSyncConfig, ZakuraConnId, ZakuraLocalLimits,
-            FRAME_HEADER_BYTES, MAX_BS_RESPONSE_BYTES, ZAKURA_CAP_DISCOVERY,
-            ZAKURA_CAP_HEADER_SYNC, ZAKURA_CAP_LEGACY_GOSSIP, ZAKURA_STREAM_DISCOVERY,
-            ZAKURA_STREAM_GOSSIP, ZAKURA_STREAM_HEADER_SYNC,
+            Stream, ZakuraBlockSyncConfig, ZakuraConnId, ZakuraLocalLimits, FRAME_HEADER_BYTES,
+            MAX_BS_RESPONSE_BYTES, ZAKURA_CAP_DISCOVERY, ZAKURA_CAP_HEADER_SYNC,
+            ZAKURA_CAP_LEGACY_GOSSIP, ZAKURA_STREAM_DISCOVERY, ZAKURA_STREAM_GOSSIP,
+            ZAKURA_STREAM_HEADER_SYNC,
         },
         Config,
     };
@@ -495,7 +478,7 @@ mod tests {
         version: 1,
         frame_cap: CUSTOM_FRAME_CAP_BYTES,
         capability: CUSTOM_FRAME_CAP_CAPABILITY,
-        mode: StreamMode::Ordered,
+        ..Stream::PERSISTENT
     }];
 
     #[derive(Debug, Default)]
@@ -1362,8 +1345,8 @@ mod tests {
             .supported_capabilities(CUSTOM_FRAME_CAP_CAPABILITY)
             .spawn()
             .await?;
-        let peer_a = ZakuraPeerId::new(node_a.node_addr().await.node_id.as_bytes().to_vec())?;
-        let peer_b = ZakuraPeerId::new(node_b.node_addr().await.node_id.as_bytes().to_vec())?;
+        let peer_a = ZakuraPeerId::new(node_a.node_addr().await.id.as_bytes().to_vec())?;
+        let peer_b = ZakuraPeerId::new(node_b.node_addr().await.id.as_bytes().to_vec())?;
 
         node_a
             .connect_native(&node_b, Duration::from_secs(5))
@@ -1616,7 +1599,7 @@ mod tests {
     {
         let _guard = zakura_test::init();
         let victim = ZakuraTestNode::builder(26).spawn().await?;
-        let victim_node_id = victim.node_addr().await.node_id;
+        let victim_node_id = victim.node_addr().await.id;
 
         // A peer that did not negotiate the discovery capability cannot open a
         // discovery stream and receives no service response.
@@ -1724,7 +1707,7 @@ mod tests {
             .discovery_direct_addrs(vec![addr_b])
             .spawn()
             .await?;
-        let b_id = b.node_addr().await.node_id;
+        let b_id = b.node_addr().await.id;
 
         a.connect_native(&b, Duration::from_secs(5)).await?;
 

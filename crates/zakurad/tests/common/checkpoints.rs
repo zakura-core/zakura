@@ -53,7 +53,7 @@ pub const LOG_ZAKURAD_CHECKPOINTS: &str = "LOG_ZAKURAD_CHECKPOINTS";
 pub async fn run(network: Network) -> Result<()> {
     let _init_guard = zakura_test::init();
 
-    // We want a Zakura state dir, but we don't need `lightwalletd`.
+    // We want a Zakura state directory without RPCs.
     let test_type = UpdateZebraCachedStateWithRpc;
     let test_name = "zakura_checkpoints_test";
 

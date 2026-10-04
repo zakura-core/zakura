@@ -13,12 +13,13 @@ use std::{
 
 use indexmap::IndexSet;
 use iroh::SecretKey;
-use rand::rngs::OsRng;
+use rand::{rngs::OsRng, RngCore};
 use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 use tokio::fs;
 
 use tracing::Span;
 use zakura_chain::{
+    amount::Amount,
     common::atomic_write,
     parameters::{
         testnet::{
@@ -312,7 +313,7 @@ pub struct Config {
     /// - regularly, every time `crawl_new_peer_interval` elapses, and
     /// - if the peer set is busy, and there aren't any peer addresses for the
     ///   next connection attempt.
-    #[serde(with = "humantime_serde")]
+    #[serde(with = "zakura_chain::serialization::serde_adapters::duration")]
     pub crawl_new_peer_interval: Duration,
 
     /// The maximum number of legacy TCP peer connections Zakura will keep for a given IP address
@@ -723,7 +724,7 @@ impl Config {
 
     /// Resolves the Zakura native iroh [`SecretKey`] for this node, persisting a
     /// freshly generated key on first use so the node keeps a stable
-    /// [`NodeId`](iroh::NodeId) across restarts.
+    /// [`EndpointId`](iroh::EndpointId) across restarts.
     ///
     /// Resolution order:
     /// 1. If [`zakura_node_secret_key`](Self::zakura_node_secret_key) is configured,
@@ -785,6 +786,10 @@ impl Config {
 
         Config {
             p2p_stack,
+            zakura: ZakuraConfig {
+                listen_addr: Some("127.0.0.1:0".parse().expect("valid test bind address")),
+                ..ZakuraConfig::default()
+            },
             ..Config::default()
         }
     }
@@ -812,7 +817,9 @@ fn load_or_generate_zakura_secret_key(key_file: &Path) -> SecretKey {
         ),
     }
 
-    let secret_key = SecretKey::generate(OsRng);
+    let mut key_bytes = [0; 32];
+    OsRng.fill_bytes(&mut key_bytes);
+    let secret_key = SecretKey::from_bytes(&key_bytes);
     persist_zakura_secret_key(key_file, &secret_key);
     secret_key
 }
@@ -957,6 +964,12 @@ struct DTestnetParameters {
     max_block_time_start_height: Option<u32>,
     genesis_hash: Option<String>,
     activation_heights: Option<ConfiguredActivationHeights>,
+    /// If `true`, `activation_heights` overlays the public Testnet activation heights
+    /// instead of replacing them, so a configured Testnet sets only the upgrades it changes.
+    ///
+    /// Off by default: configured activation heights replace every default height above
+    /// genesis. Only configured Testnets accept it.
+    inherit_activation_heights: Option<bool>,
     pre_nu6_funding_streams: Option<ConfiguredFundingStreams>,
     post_nu6_funding_streams: Option<ConfiguredFundingStreams>,
     funding_streams: Option<Vec<ConfiguredFundingStreams>>,
@@ -972,6 +985,12 @@ struct DTestnetParameters {
     /// If unset, the default activation height for the network is used; the soft fork
     /// cannot be disabled via configuration.
     temporary_orchard_disabling_soft_fork_height: Option<u32>,
+    /// The NSM value balance in zatoshi immediately before NU7 activates.
+    ///
+    /// If unset on a configured network, state derives the balance from its historical
+    /// scheduled issuance and monetary pools. The cumulative schedule through the block
+    /// before NU7 must then fit in `MAX_MONEY`. An explicit value overrides that derivation.
+    initial_nsm_value_balance: Option<u64>,
 }
 
 /// Network configuration used during deserialization.
@@ -1001,7 +1020,7 @@ struct DConfig {
     external_addr: Option<String>,
     network: DNetwork,
 
-    /// Legacy testnet parameters, kept for backwards compatibility.
+    /// Legacy Regtest parameters, kept for backwards compatibility.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     testnet_parameters: Option<DTestnetParameters>,
 
@@ -1022,7 +1041,10 @@ struct DConfig {
     v2_p2p: Option<bool>,
     zakura: ZakuraConfig,
     peerset_initial_target_size: usize,
-    #[serde(alias = "new_peer_interval", with = "humantime_serde")]
+    #[serde(
+        alias = "new_peer_interval",
+        with = "zakura_chain::serialization::serde_adapters::duration"
+    )]
     crawl_new_peer_interval: Duration,
     max_connections_per_ip: Option<usize>,
     expose_peer_addresses: bool,
@@ -1064,6 +1086,7 @@ impl From<Arc<testnet::Parameters>> for DTestnetParameters {
             max_block_time_start_height: Some(params.max_block_time_start_height().0),
             genesis_hash: Some(params.genesis_hash().to_string()),
             activation_heights: Some(params.activation_heights().into()),
+            inherit_activation_heights: None,
             pre_nu6_funding_streams: None,
             post_nu6_funding_streams: None,
             funding_streams: Some(params.funding_streams().iter().map(Into::into).collect()),
@@ -1089,6 +1112,11 @@ impl From<Arc<testnet::Parameters>> for DTestnetParameters {
             temporary_orchard_disabling_soft_fork_height: params
                 .temporary_orchard_disabling_soft_fork_height()
                 .map(|height| height.0),
+            initial_nsm_value_balance: params.configured_initial_nsm_value_balance().map(
+                |balance| {
+                    u64::try_from(i64::from(balance)).expect("configured seeds are nonnegative")
+                },
+            ),
         }
     }
 }
@@ -1183,24 +1211,28 @@ impl<'de> Deserialize<'de> for Config {
         let p2p_stack = p2p_stack_from_config::<D>(p2p_stack, legacy_p2p, v2_p2p)?;
 
         let network = match (dnetwork, testnet_parameters) {
-            (DNetwork::ConfiguredTestnet(params), _) => {
+            (DNetwork::ConfiguredTestnet(params), None) => {
                 build_configured_testnet::<D>(*params, &initial_testnet_peers)?
             }
-            (DNetwork::ConfiguredRegtest { params, .. }, _) => {
-                Network::new_regtest(build_regtest_params(*params))
+            (DNetwork::ConfiguredRegtest { params, .. }, None) => {
+                build_configured_regtest::<D>(*params)?
             }
-            (DNetwork::DefaultForKind(NetworkKind::Mainnet), _) => Network::Mainnet,
-            (DNetwork::DefaultForKind(NetworkKind::Testnet), Some(params)) => {
-                build_configured_testnet::<D>(params, &initial_testnet_peers)?
-            }
+            (DNetwork::DefaultForKind(NetworkKind::Mainnet), None) => Network::Mainnet,
             (DNetwork::DefaultForKind(NetworkKind::Testnet), None) => {
                 Network::new_default_testnet()
             }
             (DNetwork::DefaultForKind(NetworkKind::Regtest), Some(params)) => {
-                Network::new_regtest(build_regtest_params(params))
+                build_configured_regtest::<D>(params)?
             }
             (DNetwork::DefaultForKind(NetworkKind::Regtest), None) => {
                 Network::new_regtest(Default::default())
+            }
+            (_, Some(_)) => {
+                return Err(de::Error::custom(
+                    "testnet_parameters can only be used with `network = \"Regtest\"`; \
+                     Mainnet and public Testnet parameters are fixed, and custom Testnet \
+                     parameters must use the explicit `network = { ... }` form",
+                ));
             }
         };
 
@@ -1350,6 +1382,7 @@ where
         max_block_time_start_height,
         genesis_hash,
         activation_heights,
+        inherit_activation_heights,
         pre_nu6_funding_streams,
         post_nu6_funding_streams,
         funding_streams,
@@ -1358,6 +1391,7 @@ where
         checkpoints,
         extend_funding_stream_addresses_as_required,
         temporary_orchard_disabling_soft_fork_height,
+        initial_nsm_value_balance,
     } = params;
 
     let mut params_builder = testnet::Parameters::build();
@@ -1404,11 +1438,15 @@ where
             .with_max_block_time_start_height(height.try_into().map_err(de::Error::custom)?);
     }
 
-    // Retain default Testnet activation heights unless there's an empty [testnet_parameters.activation_heights] section.
+    // Retain default Testnet activation heights unless an activation-height map is
+    // configured. A configured map replaces them, or overlays them when requested.
     if let Some(activation_heights) = activation_heights {
-        params_builder = params_builder
-            .with_activation_heights(activation_heights)
-            .map_err(de::Error::custom)?
+        params_builder = if inherit_activation_heights == Some(true) {
+            params_builder.with_activation_height_overlay(activation_heights)
+        } else {
+            params_builder.with_activation_heights(activation_heights)
+        }
+        .map_err(de::Error::custom)?
     }
 
     if let Some(halving_interval) = pre_blossom_halving_interval {
@@ -1418,6 +1456,10 @@ where
     }
 
     // Set configured funding streams after setting any parameters that affect the funding stream address period.
+    // An explicit empty `funding_streams` list clears the built-in Testnet streams.
+    let are_funding_streams_configured = funding_streams.is_some()
+        || pre_nu6_funding_streams.is_some()
+        || post_nu6_funding_streams.is_some();
     let mut funding_streams_vec = funding_streams.unwrap_or_default();
 
     if let Some(funding_streams) = post_nu6_funding_streams {
@@ -1428,7 +1470,7 @@ where
         funding_streams_vec.insert(0, funding_streams);
     }
 
-    if !funding_streams_vec.is_empty() {
+    if are_funding_streams_configured {
         params_builder = params_builder.with_funding_streams(funding_streams_vec);
     }
 
@@ -1451,6 +1493,23 @@ where
         );
     }
 
+    if let Some(balance) = initial_nsm_value_balance {
+        let balance = i64::try_from(balance)
+            .map_err(de::Error::custom)
+            .and_then(|balance| Amount::try_from(balance).map_err(de::Error::custom))?;
+
+        params_builder = params_builder.with_initial_nsm_value_balance(balance);
+    }
+
+    // An omitted seed and otherwise default parameters select public Testnet.
+    // An explicit zero seed must remain zero on the configured network.
+    if network_name.is_none()
+        && initial_nsm_value_balance.is_none()
+        && params_builder == testnet::Parameters::build()
+    {
+        return Ok(Network::new_default_testnet());
+    }
+
     // Return an error if the initial testnet peers includes any of the default initial Mainnet or Testnet
     // peers and the configured network parameters are incompatible with the default public Testnet.
     if !params_builder.is_compatible_with_default_parameters()
@@ -1461,17 +1520,17 @@ where
         ));
     };
 
-    // Return the default Testnet if no network name was configured and all parameters match the default Testnet
-    if network_name.is_none() && params_builder == testnet::Parameters::build() {
-        Ok(Network::new_default_testnet())
-    } else {
-        Ok(params_builder.to_network().map_err(de::Error::custom)?)
-    }
+    params_builder.to_network().map_err(de::Error::custom)
 }
 
-fn build_regtest_params(params: DTestnetParameters) -> RegtestParameters {
+/// Builds Regtest parameters while reporting invalid settings as configuration errors.
+fn build_configured_regtest<'de, D>(params: DTestnetParameters) -> Result<Network, D::Error>
+where
+    D: Deserializer<'de>,
+{
     let DTestnetParameters {
         activation_heights,
+        inherit_activation_heights,
         pre_nu6_funding_streams,
         post_nu6_funding_streams,
         funding_streams,
@@ -1479,8 +1538,16 @@ fn build_regtest_params(params: DTestnetParameters) -> RegtestParameters {
         checkpoints,
         extend_funding_stream_addresses_as_required,
         max_block_time_start_height,
+        initial_nsm_value_balance,
         ..
     } = params;
+
+    if inherit_activation_heights.is_some() {
+        return Err(de::Error::custom(
+            "inherit_activation_heights only applies to configured Testnets; \
+             Regtest activation heights have their own defaults",
+        ));
+    }
 
     let mut funding_streams_vec = funding_streams.unwrap_or_default();
 
@@ -1492,12 +1559,31 @@ fn build_regtest_params(params: DTestnetParameters) -> RegtestParameters {
         funding_streams_vec.insert(0, funding_streams);
     }
 
-    RegtestParameters {
+    let initial_nsm_value_balance = initial_nsm_value_balance
+        .map(|balance| {
+            i64::try_from(balance)
+                .map_err(de::Error::custom)
+                .and_then(|balance| Amount::try_from(balance).map_err(de::Error::custom))
+        })
+        .transpose()?;
+
+    // The chain crate can have test-only fields enabled by another workspace crate.
+    #[allow(
+        clippy::needless_update,
+        reason = "test-only fields depend on feature unification"
+    )]
+    let params = RegtestParameters {
         activation_heights: activation_heights.unwrap_or_default(),
         funding_streams: Some(funding_streams_vec),
         lockbox_disbursements,
         checkpoints: Some(checkpoints),
         max_block_time_start_height: max_block_time_start_height.map(zakura_chain::block::Height),
         extend_funding_stream_addresses_as_required,
-    }
+        initial_nsm_value_balance,
+        ..Default::default()
+    };
+
+    testnet::Parameters::new_regtest(params)
+        .map(Network::new_configured_testnet)
+        .map_err(de::Error::custom)
 }

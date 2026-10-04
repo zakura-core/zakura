@@ -57,10 +57,17 @@ legacy long-poll IDs. New parent entries and withdrawal events use the revision 
 A response that replaces an older revision sets `submitold: false`.
 External miners must cooperate with withdrawal.
 
+If the parent or revision changes while a template is being built, the server rebuilds
+from current state instead of returning a transient error. Miners treat that error as lost
+work, and the internal miner backs off for 20 seconds. The server bounds the rebuilds and
+returns the error past the bound.
+
 The server holds the rejection-state guard through the fast publication decision.
 Recovery validates an empty template, then checks the live parent and revision,
 registers the prepared ID, and sets the response revision in one write closure.
-Recovery returns an error if validation fails, times out, or loses its context.
+Recovery rebuilds from current state if it loses its context. Recovery confirms a failed
+or timed-out validation against committed state, and rebuilds if that state has moved on.
+Otherwise it returns an error.
 A later rejection can still withdraw work that was valid at publication.
 
 The background queue retains one running computation and one newest pending template.

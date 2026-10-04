@@ -62,6 +62,149 @@ fn assert_selected_header_matches_full_state(
 }
 
 #[test]
+fn fork_eviction_demotes_only_bodies_missing_from_full_state() {
+    assert_fork_eviction_body_evidence(false);
+}
+
+#[test]
+fn reconsideration_eviction_demotes_only_bodies_missing_from_full_state() {
+    assert_fork_eviction_body_evidence(true);
+}
+
+fn assert_fork_eviction_body_evidence(reconsider: bool) {
+    use zakura_header_chain::{RowLimit, StoreAuditRead, StoreAuditSnapshot};
+
+    let _init_guard = zakura_test::init();
+    let network = Network::new_regtest(Default::default());
+    let mut finalized = FinalizedState::new(&Config::ephemeral(), &network).unwrap();
+    let genesis = regtest_genesis_block();
+    let mut parent = genesis.make_fake_child();
+    Arc::make_mut(&mut Arc::make_mut(&mut parent).header).time += chrono::Duration::seconds(1);
+    for block in [genesis, parent.clone()] {
+        finalized
+            .commit_finalized_direct(
+                CheckpointVerifiedBlock::from(block).into(),
+                None,
+                None,
+                "fork eviction fixture",
+            )
+            .unwrap();
+    }
+    let mut live = NonFinalizedState::new(&network);
+    let writer = HeaderChainWriter::attach_at_semantic_handoff(&finalized, &live).unwrap();
+    let mut template = parent.make_fake_child();
+    let height = template.coinbase_height().unwrap();
+    let transaction = crate::tests::setup::transaction_v4_from_coinbase(&template.transactions[0]);
+    Arc::make_mut(&mut template).transactions[0] = Arc::new(transaction);
+    let merkle_root = template.transactions.iter().cloned().collect();
+    let header = Arc::make_mut(&mut Arc::make_mut(&mut template).header);
+    header.time += chrono::Duration::seconds(1);
+    header.merkle_root = merkle_root;
+    header.commitment_bytes = <[u8; 32]>::from(finalized.db.history_tree().hash().unwrap()).into();
+
+    let siblings = template.make_fake_siblings(crate::constants::MAX_NON_FINALIZED_CHAIN_FORKS + 1);
+    for (order, block) in siblings.iter().enumerate() {
+        let refill_after_invalidation =
+            reconsider && order == crate::constants::MAX_NON_FINALIZED_CHAIN_FORKS;
+        if refill_after_invalidation {
+            let mut staged = live.clone();
+            staged.invalidate_block(siblings[0].hash()).unwrap();
+            commit_operator_change(&writer, &mut live, staged, siblings[0].hash(), true).unwrap();
+        }
+        let prepared = block.clone().prepare();
+        let mut staged = live.clone();
+        staged.commit_new_chain(prepared, &finalized.db).unwrap();
+        commit_verified_change(
+            &writer,
+            &mut live,
+            staged,
+            Frontier::new(height, block.hash()),
+        );
+        assert_eq!(
+            live.best_tip().unwrap().1,
+            siblings[usize::from(refill_after_invalidation)].hash()
+        );
+        assert!(live.any_chain_contains(&siblings[order].hash()));
+    }
+    if reconsider {
+        assert_eq!(
+            live.chain_iter().count(),
+            crate::constants::MAX_NON_FINALIZED_CHAIN_FORKS
+        );
+        let mut staged = live.clone();
+        staged
+            .reconsider_block(siblings[0].hash(), &finalized.db)
+            .unwrap();
+        commit_operator_change(&writer, &mut live, staged, siblings[0].hash(), false).unwrap();
+        assert_eq!(live.best_tip().unwrap().1, siblings[0].hash());
+    }
+    let evicted_index = siblings.len() - if reconsider { 1 } else { 2 };
+    let evicted = siblings[evicted_index].hash();
+    assert!(!live.any_chain_contains(&evicted));
+    assert_eq!(
+        live.chain_iter().count(),
+        crate::constants::MAX_NON_FINALIZED_CHAIN_FORKS
+    );
+    let store = HeaderChainStore::new(finalized.db.db().clone());
+    let mut saw_evicted_header = false;
+    store
+        .audit_snapshot()
+        .unwrap()
+        .visit_header_nodes(RowLimit::new(20), &mut |node| {
+            if node.height > parent.coinbase_height().unwrap() {
+                assert_eq!(
+                    matches!(
+                        node.body_validation_state,
+                        BodyValidationState::Verified { .. }
+                    ),
+                    live.any_chain_contains(&node.hash),
+                    "durable body availability must match retained full state",
+                );
+            }
+            if node.hash == evicted {
+                saw_evicted_header = true;
+                assert!(
+                    node.is_eligible(),
+                    "eviction must not invalidate the header"
+                );
+            }
+            Ok(())
+        })
+        .unwrap();
+    assert!(
+        saw_evicted_header,
+        "the eleventh header fits the independent header limit"
+    );
+
+    // Replaying an evicted body restores its verified marker and demotes the next eviction.
+    let replay = siblings[evicted_index].clone();
+    let mut staged = live.clone();
+    staged
+        .commit_new_chain(replay.prepare(), &finalized.db)
+        .unwrap();
+    commit_verified_change(&writer, &mut live, staged, Frontier::new(height, evicted));
+    assert!(live.any_chain_contains(&evicted));
+
+    // Once every retained body is invalidated, an evicted header must not prevent
+    // the atomic operator transition from falling back to the finalized parent.
+    let tips: Vec<_> = live
+        .chain_iter()
+        .map(|chain| chain.non_finalized_tip_hash())
+        .collect();
+    for hash in tips {
+        let mut staged = live.clone();
+        staged.invalidate_block(hash).unwrap();
+        commit_operator_change(&writer, &mut live, staged, hash, true).unwrap();
+    }
+    assert!(live.is_chain_set_empty());
+    let snapshot = writer.runtime.publisher().snapshot();
+    assert_eq!(
+        snapshot.frontiers.verified_best,
+        snapshot.frontiers.finalized
+    );
+}
+
+#[test]
 // DF-01: real headers at every observable activation boundary exercise the
 // shared rules with production network parameters and historical encoding.
 fn production_activation_headers_pass_shared_rules() {
@@ -546,4 +689,120 @@ fn generated_nu5_graph_matches_full_state_before_finalization() {
         snapshot.frontiers.finalized
     );
     assert_eq!(snapshot.frontiers.header_best, snapshot.frontiers.finalized);
+}
+
+#[test]
+fn fork_eviction_after_restart_keeps_the_restored_full_state_winner() {
+    for replace_winner in [false, true] {
+        assert_fork_eviction_after_restart(replace_winner);
+    }
+}
+
+fn assert_fork_eviction_after_restart(replace_winner: bool) {
+    use zakura_header_chain::{RowLimit, StoreAuditRead, StoreAuditSnapshot};
+    let _init_guard = zakura_test::init();
+    let network = Network::new_regtest(Default::default());
+    let mut finalized = FinalizedState::new(&Config::ephemeral(), &network).unwrap();
+    let genesis = regtest_genesis_block();
+    let mut parent = genesis.make_fake_child();
+    Arc::make_mut(&mut Arc::make_mut(&mut parent).header).time += chrono::Duration::seconds(1);
+    for block in [genesis, parent.clone()] {
+        finalized
+            .commit_finalized_direct(
+                CheckpointVerifiedBlock::from(block).into(),
+                None,
+                None,
+                "fork eviction fixture",
+            )
+            .unwrap();
+    }
+    let mut live = NonFinalizedState::new(&network);
+    let writer = HeaderChainWriter::attach_at_semantic_handoff(&finalized, &live).unwrap();
+    let mut template = parent.make_fake_child();
+    let transaction = crate::tests::setup::transaction_v4_from_coinbase(&template.transactions[0]);
+    Arc::make_mut(&mut template).transactions[0] = Arc::new(transaction);
+    let merkle_root = template.transactions.iter().cloned().collect();
+    let header = Arc::make_mut(&mut Arc::make_mut(&mut template).header);
+    header.time += chrono::Duration::seconds(1);
+    header.merkle_root = merkle_root;
+    header.commitment_bytes = <[u8; 32]>::from(finalized.db.history_tree().hash().unwrap()).into();
+
+    let mut tip = template.clone();
+    for depth in 0..3 {
+        let accepted = Frontier::new(tip.coinbase_height().unwrap(), tip.hash());
+        let mut staged = live.clone();
+        if depth == 0 {
+            staged
+                .commit_new_chain(tip.clone().prepare(), &finalized.db)
+                .unwrap();
+        } else {
+            staged
+                .commit_block(tip.clone().prepare(), &finalized.db)
+                .unwrap();
+        }
+        commit_verified_change(&writer, &mut live, staged, accepted);
+        if depth < 2 {
+            let history_root = live
+                .best_chain()
+                .unwrap()
+                .history_tree(tip.hash().into())
+                .unwrap()
+                .hash()
+                .unwrap();
+            tip = tip.make_fake_child();
+            let merkle_root = tip.transactions.iter().cloned().collect();
+            let header = Arc::make_mut(&mut Arc::make_mut(&mut tip).header);
+            header.time += chrono::Duration::seconds(1);
+            header.merkle_root = merkle_root;
+            header.commitment_bytes = <[u8; 32]>::from(history_root).into();
+        }
+    }
+    let missing_tip = tip.hash();
+    drop(writer);
+
+    // A crash can leave durable header evidence ahead of the asynchronous body backup.
+    live = NonFinalizedState::new(&network);
+    let writer = HeaderChainWriter::attach_at_semantic_handoff(&finalized, &live).unwrap();
+    let snapshot = writer.runtime.publisher().snapshot();
+    assert_eq!(
+        snapshot.frontiers.verified_best,
+        snapshot.frontiers.finalized
+    );
+    assert_eq!(snapshot.frontiers.header_best.hash, missing_tip);
+
+    // Cover side acceptance and winning-path replacement when the eleventh fork arrives.
+    let mut siblings =
+        template.make_fake_siblings(crate::constants::MAX_NON_FINALIZED_CHAIN_FORKS + 1);
+    if replace_winner {
+        siblings.reverse();
+    }
+    let mut saw_eviction = false;
+    for sibling in siblings {
+        let accepted = Frontier::new(sibling.coinbase_height().unwrap(), sibling.hash());
+        let mut staged = live.clone();
+        staged
+            .commit_new_chain(sibling.prepare(), &finalized.db)
+            .unwrap();
+        let evicted = live.evicted_blocks(&staged);
+        saw_eviction |= !evicted.is_empty();
+        commit_verified_change(&writer, &mut live, staged, accepted);
+        let snapshot = writer.runtime.publisher().snapshot();
+        assert_eq!(
+            snapshot.frontiers.verified_best.hash,
+            live.best_tip().unwrap().1
+        );
+        assert_eq!(snapshot.frontiers.header_best.hash, missing_tip);
+        let store = HeaderChainStore::new(finalized.db.db().clone());
+        store
+            .audit_snapshot()
+            .unwrap()
+            .visit_header_nodes(RowLimit::new(32), &mut |node| {
+                if evicted.contains(&node.hash) {
+                    assert_eq!(node.body_validation_state, BodyValidationState::Unknown);
+                }
+                Ok(())
+            })
+            .unwrap();
+    }
+    assert!(saw_eviction, "the fixture must cross the fork limit");
 }

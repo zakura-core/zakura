@@ -3,10 +3,11 @@
 use std::{collections::HashSet, fs, net::SocketAddr, time::Duration};
 
 use zakura_chain::{
+    amount::Amount,
     block::Height,
     parameters::{
-        testnet::{self, ConfiguredFundingStreams},
-        Network,
+        testnet::{self, ConfiguredActivationHeights, ConfiguredFundingStreams},
+        Network, NetworkUpgrade,
     },
 };
 
@@ -126,6 +127,103 @@ async fn empty_peer_cache_update_preserves_existing_cache() {
         cached_peers,
         "an empty peer list must not overwrite the existing peer cache",
     );
+}
+
+#[test]
+fn configured_nsm_seed_is_preserved_and_controls_public_peer_compatibility() {
+    use zakura_chain::parameters::subsidy::ParameterSubsidy;
+
+    let public_seed = i64::from(Network::new_default_testnet().initial_nsm_value_balance());
+    for seed in [None, Some(0), Some(1), Some(public_seed)] {
+        for public_peers in [false, true] {
+            let peers = if public_peers {
+                ""
+            } else {
+                "initial_testnet_peers = []\n"
+            };
+            let seed_field = seed
+                .map(|seed| format!(", initial_nsm_value_balance = {seed}"))
+                .unwrap_or_default();
+            let config = format!("network = {{ checkpoints = true{seed_field} }}\n{peers}");
+            let parsed = toml::from_str::<Config>(&config);
+            if public_peers && seed.is_some_and(|seed| seed != public_seed) {
+                assert!(
+                    parsed.is_err(),
+                    "a different seed changes consensus: {config}"
+                );
+                continue;
+            }
+            let parsed = parsed.unwrap_or_else(|error| panic!("{config}: {error}"));
+            assert_eq!(
+                i64::from(parsed.network.initial_nsm_value_balance()),
+                seed.unwrap_or(public_seed)
+            );
+            let roundtrip: Config = toml::from_str(&toml::to_string(&parsed).unwrap()).unwrap();
+            assert_eq!(parsed.network, roundtrip.network);
+        }
+    }
+}
+
+#[test]
+fn public_network_parameters_are_not_configurable() {
+    let _init_guard = zakura_test::init();
+
+    for network in ["Mainnet", "Testnet"] {
+        let plain_config: Config =
+            toml::from_str(&format!("network = \"{network}\"")).expect("public network parses");
+        assert_eq!(plain_config.network.to_string(), network);
+
+        let config = format!(
+            r#"
+            network = "{network}"
+
+            [testnet_parameters]
+            funding_streams = [
+                {{}},
+                {{}},
+                {{ height_range = {{ start = 3536500, end = 4476000 }} }},
+            ]
+            "#,
+        );
+
+        let error = toml::from_str::<Config>(&config)
+            .expect_err("public network parameters must be fixed")
+            .to_string();
+        assert!(
+            error.contains("Mainnet and public Testnet parameters are fixed"),
+            "unexpected configuration error: {error}",
+        );
+    }
+}
+
+#[test]
+fn old_revision_2_range_is_allowed_only_on_a_configured_testnet() {
+    let _init_guard = zakura_test::init();
+
+    let config: Config = toml::from_str(
+        r#"
+        initial_testnet_peers = []
+        network = {
+            checkpoints = true,
+            funding_streams = [
+                {},
+                {},
+                { height_range = { start = 3536500, end = 4476000 } },
+            ],
+        }
+        "#,
+    )
+    .expect("an explicit configured Testnet can set its own funding stream range");
+
+    assert!(!config.network.is_default_testnet());
+    assert_eq!(
+        config.network.all_funding_streams()[2].height_range(),
+        &(Height(3_536_500)..Height(4_476_000)),
+    );
+
+    let serialized = toml::to_string(&config).expect("configured Testnet serializes");
+    let round_trip: Config = toml::from_str(&serialized).expect("configured Testnet round-trips");
+    assert_eq!(config, round_trip);
 }
 
 #[test]
@@ -509,6 +607,7 @@ fn p2p_v2_old_config_without_zakura_fields_uses_safe_defaults() {
         config.zakura.bootstrap_peers,
         default_testnet_zakura_bootstrap_peers()
     );
+    assert!(!config.zakura.nat_traversal);
     assert!(config.zakura.max_connections > 0);
     assert_eq!(
         config.zakura.max_connections_per_ip,
@@ -585,6 +684,7 @@ fn p2p_v2_config_roundtrip_keeps_dconfig_zakura_fields() {
 
         [zakura]
         bootstrap_peers = ["ae58ff8833241ac82d6ff7611046ed67b5072d142c588d0063e942d9a75502b6@127.0.0.1:8233"]
+        nat_traversal = true
         max_connections = 7
         max_connections_per_ip = 5
         max_pending_handshakes = 3
@@ -608,6 +708,8 @@ fn p2p_v2_config_roundtrip_keeps_dconfig_zakura_fields() {
     assert!(serialized.contains("p2p_stack = \"dual\""));
     assert!(serialized.contains("[zakura]"));
     assert!(serialized.contains("bootstrap_peers"));
+    assert!(config.zakura.nat_traversal);
+    assert!(serialized.contains("nat_traversal = true"));
     assert!(serialized.contains("max_connections = 7"));
     assert!(serialized.contains("max_connections_per_ip = 5"));
     assert!(serialized.contains("trace_dir = \"target/zakura-test-traces\""));
@@ -807,14 +909,115 @@ fn max_block_time_start_height_serialization_roundtrip() {
         .is_max_block_time_enforced(start_height));
 }
 
+/// Checks that a configured Testnet with no funding streams keeps none after a
+/// serialization round-trip, instead of inheriting the built-in Testnet streams.
+#[test]
+fn cleared_funding_streams_serialization_roundtrip() {
+    let _init_guard = zakura_test::init();
+    let mut config = Config {
+        network: testnet::Parameters::build()
+            .clear_funding_streams()
+            .to_network()
+            .expect("failed to build configured network"),
+        initial_testnet_peers: [].into(),
+        ..Config::for_test(P2pStack::Dual)
+    };
+    config.zakura.apply_network_defaults(&config.network);
+
+    let serialized = toml::to_string(&config).expect("the custom network serializes");
+    let deserialized: Config =
+        toml::from_str(&serialized).expect("the custom network deserializes");
+    assert_eq!(config, deserialized);
+    let Network::Testnet(params) = &deserialized.network else {
+        panic!("deserialized network must be a Testnet");
+    };
+    assert!(params.funding_streams().is_empty());
+}
+
+#[test]
+fn nsm_reissuance_height_is_derived_after_config_roundtrip() {
+    use zakura_chain::parameters::{
+        subsidy::{is_zip234_active, nsm_reissuance_height},
+        testnet::{ConfiguredActivationHeights, RegtestParameters},
+    };
+
+    let _init_guard = zakura_test::init();
+    let mut activation_heights: ConfiguredActivationHeights = Network::new_default_testnet()
+        .parameters()
+        .expect("Testnet has parameters")
+        .activation_heights()
+        .into();
+    activation_heights.nu7 = Some(4_200_000);
+    let testnet = testnet::Parameters::build()
+        .with_activation_heights(activation_heights)
+        .expect("valid activation heights")
+        .to_network()
+        .expect("valid Testnet");
+    let regtest = Network::new_regtest(RegtestParameters {
+        activation_heights: ConfiguredActivationHeights {
+            nu7: Some(10),
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+    assert!(nsm_reissuance_height(&testnet).is_some());
+    assert_eq!(nsm_reissuance_height(&regtest), None);
+
+    for network in [testnet, regtest] {
+        let expected = nsm_reissuance_height(&network);
+        let mut config = Config {
+            network,
+            initial_testnet_peers: [].into(),
+            ..Config::for_test(P2pStack::Dual)
+        };
+        config.zakura.apply_network_defaults(&config.network);
+        let serialized = toml::to_string(&config).expect("network serializes");
+        assert!(!serialized.contains("nsm_reissuance_height"));
+        let deserialized: Config = toml::from_str(&serialized).expect("network deserializes");
+        assert_eq!(config, deserialized);
+        assert_eq!(nsm_reissuance_height(&deserialized.network), expected);
+        if let Some(height) = expected {
+            assert!(!is_zip234_active(
+                &deserialized.network,
+                height.previous().expect("positive height")
+            ));
+            assert!(is_zip234_active(&deserialized.network, height));
+        } else {
+            assert!(!is_zip234_active(&deserialized.network, Height::MAX));
+        }
+
+        // Both ordinary Testnet and Regtest configuration reject the removed override.
+        let mut value: toml::Value = toml::from_str(&serialized).expect("valid TOML");
+        let network = value
+            .get_mut("network")
+            .expect("network is serialized")
+            .as_table_mut()
+            .expect("configured network is a table");
+        let params = if network.contains_key("params") {
+            network
+                .get_mut("params")
+                .expect("Regtest has params")
+                .as_table_mut()
+                .expect("params are a table")
+        } else {
+            network
+        };
+        params.insert(
+            "nsm_reissuance_height".to_owned(),
+            toml::Value::Integer(4_200_010),
+        );
+        assert!(toml::from_str::<Config>(&toml::to_string(&value).expect("valid TOML")).is_err());
+    }
+}
+
 /// With no `zakura_node_secret_key` and a writable identity directory, the
 /// generated Zakura iroh identity must be persisted on first use and reused on
-/// every later startup, so the node's `NodeId` is stable across restarts.
+/// every later startup, so the node's `EndpointId` is stable across restarts.
 ///
 /// This is the regression test for `claude-ephemeral-node-secret-on-restart`:
 /// before the fix, `Config::zakura_secret_key` generated a fresh ephemeral key on
 /// every call and never wrote the reserved identity key file, so two startups
-/// produced different `NodeId`s and no key file existed.
+/// produced different `EndpointId`s and no key file existed.
 #[test]
 fn zakura_secret_key_is_persisted_and_stable_across_restarts() {
     let _init_guard = zakura_test::init();
@@ -850,7 +1053,7 @@ fn zakura_secret_key_is_persisted_and_stable_across_restarts() {
     }
 
     // Second startup reading the same key file (simulating a process restart)
-    // must reuse the persisted key, yielding the same `NodeId`.
+    // must reuse the persisted key, yielding the same `EndpointId`.
     let after_restart = load_or_generate_zakura_secret_key(&key_file);
 
     assert_eq!(
@@ -928,4 +1131,274 @@ fn zakura_secret_key_honors_configured_key_and_disabled_cache() {
         Some("mainnet.zakura-iroh-secret-key"),
         "disabled cache dir must still yield a persistent Zakura identity path outside the peer cache",
     );
+}
+
+#[test]
+fn configured_nsm_seed_roundtrip_distinguishes_derived_and_explicit_zero() {
+    for seed in [None, Some(0), Some(123)] {
+        let field = seed
+            .map(|seed| format!("initial_nsm_value_balance = {seed}\n"))
+            .unwrap_or_default();
+        let text = format!("network = 'Regtest'\n[testnet_parameters]\n{field}");
+        let config: Config = toml::from_str(&text).unwrap();
+        let roundtrip: Config = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+        assert_eq!(config.network, roundtrip.network);
+        let Network::Testnet(params) = &roundtrip.network else {
+            panic!("Regtest uses testnet parameters")
+        };
+        assert_eq!(
+            params.configured_initial_nsm_value_balance().map(i64::from),
+            seed
+        );
+    }
+}
+
+#[test]
+fn configured_network_rejects_an_oversized_omitted_nsm_seed() {
+    let network = testnet::Parameters::build()
+        .with_activation_heights(ConfiguredActivationHeights {
+            blossom: Some(1),
+            canopy: Some(2),
+            nu7: Some(20_000_000),
+            ..Default::default()
+        })
+        .unwrap()
+        .with_initial_nsm_value_balance(Amount::zero())
+        .extend_funding_streams()
+        .to_network()
+        .expect("the explicit bounded seed makes the configured network valid");
+    let explicit = Config {
+        network,
+        initial_testnet_peers: Default::default(),
+        ..Config::default()
+    };
+    let explicit = toml::to_string(&explicit).unwrap();
+    toml::from_str::<Config>(&explicit).expect("the explicit bounded seed must round-trip");
+
+    let derived = explicit.replace("initial_nsm_value_balance = 0\n", "");
+    let error = toml::from_str::<Config>(&derived)
+        .expect_err("the oversized omitted seed must be rejected")
+        .to_string();
+    assert!(
+        error.contains("scheduled issuance") && error.contains("exceeds MAX_MONEY"),
+        "unexpected configuration error: {error}",
+    );
+}
+
+#[test]
+fn regtest_missing_mandatory_checkpoints_returns_config_error() {
+    // Exercise both supported forms of the network parameter table.
+    for config in [
+        "network = { params = { activation_heights = { Canopy = 10 } } }",
+        "network = 'Regtest'\n[testnet_parameters.activation_heights]\nCanopy = 10",
+    ] {
+        let error = toml::from_str::<Config>(config).unwrap_err();
+        assert!(
+            error.to_string().contains("mandatory checkpoint height"),
+            "insufficient coverage must be a configuration error: {error}"
+        );
+    }
+
+    let default_config: Config = toml::from_str("network = 'Regtest'").unwrap();
+    assert_eq!(
+        default_config.network.mandatory_checkpoint_height(),
+        zakura_chain::block::Height(0)
+    );
+    assert_eq!(
+        default_config.network.checkpoint_list().max_height(),
+        zakura_chain::block::Height(0)
+    );
+}
+
+#[test]
+fn regtest_accepts_checkpoints_covering_delayed_canopy() {
+    let genesis = Network::new_regtest(Default::default()).genesis_hash();
+    let checkpoint = zakura_chain::block::Hash([7; 32]);
+    let config = format!(
+        "network = {{ params = {{ activation_heights = {{ Canopy = 10 }}, checkpoints = [[0, {:?}], [9, {:?}]] }} }}",
+        genesis.0, checkpoint.0,
+    );
+    let config: Config = toml::from_str(&config).unwrap();
+    assert!(config.network.is_regtest());
+    assert_eq!(
+        config.network.mandatory_checkpoint_height(),
+        zakura_chain::block::Height(9)
+    );
+    assert_eq!(
+        config.network.checkpoint_list().max_height(),
+        zakura_chain::block::Height(9)
+    );
+}
+
+/// The deployer's rendered NU7 fork node config, kept in sync with the renderer by
+/// `deploy/nu7-fork/test_fork.py`. Loading it here proves zakurad accepts the shape
+/// the deployer writes, which a TOML parser alone cannot.
+#[test]
+fn rendered_nu7_fork_config_loads() {
+    let document: toml::Value = toml::from_str(include_str!("data/nu7-fork-node.toml"))
+        .expect("the rendered fork config is TOML");
+    let config: Config = document
+        .get("network")
+        .expect("the rendered fork config has a [network] section")
+        .clone()
+        .try_into()
+        .expect("the rendered [network] section deserializes");
+
+    assert_eq!(config.network.to_string(), "Nu7Fork");
+    assert!(!config.network.is_default_testnet());
+    assert_eq!(
+        NetworkUpgrade::Nu7.activation_height(&config.network),
+        Some(Height(4_400_010)),
+    );
+    // The public Testnet upgrades survive: a partial activation list would
+    // silently drop them.
+    assert_eq!(
+        NetworkUpgrade::Nu6_3.activation_height(&config.network),
+        Some(Height(4_134_000)),
+    );
+}
+
+/// The live `Nu7StagingV3` parameters, with every activation height listed.
+const NU7_STAGING_V3_EXPLICIT: &str = r#"
+    initial_testnet_peers = []
+    network = { network_name = "Nu7StagingV3", network_magic = [122, 107, 117, 57], checkpoints = true, initial_nsm_value_balance = 55768414957, activation_heights = { BeforeOverwinter = 1, Overwinter = 207500, Sapling = 280000, Blossom = 584000, Heartwood = 903800, Canopy = 1028500, NU5 = 1842420, NU6 = 2976000, "NU6.1" = 3536500, "NU6.2" = 4052000, "NU6.3" = 4134000, NU7 = 4420652 } }
+"#;
+
+/// The same network, with only NU7 overlaid on the public Testnet heights.
+const NU7_STAGING_V3_OVERLAY: &str = r#"
+    initial_testnet_peers = []
+    network = { network_name = "Nu7StagingV3", network_magic = [122, 107, 117, 57], checkpoints = true, initial_nsm_value_balance = 55768414957, inherit_activation_heights = true, activation_heights = { NU7 = 4420652 } }
+"#;
+
+fn configured_testnet(activation_heights: &str, inherit: Option<bool>) -> Result<Config, String> {
+    let inherit = inherit.map_or(String::new(), |inherit| {
+        format!("inherit_activation_heights = {inherit}, ")
+    });
+    toml::from_str(&format!(
+        "initial_testnet_peers = []\n\
+         network = {{ network_name = \"Overlay\", checkpoints = true, {inherit}activation_heights = {{ {activation_heights} }} }}"
+    ))
+    .map_err(|error| error.to_string())
+}
+
+#[test]
+fn activation_height_overlay_preserves_public_testnet_history() {
+    let _init_guard = zakura_test::init();
+
+    let explicit: Config = toml::from_str(NU7_STAGING_V3_EXPLICIT).expect("explicit V3 parses");
+    let overlay: Config = toml::from_str(NU7_STAGING_V3_OVERLAY).expect("overlay V3 parses");
+
+    // The same consensus network, so the header-chain policy digest and every
+    // historical upgrade stay unchanged when a node switches config forms.
+    assert_eq!(overlay.network, explicit.network);
+    let public = Network::new_default_testnet();
+    let mut expected = public.activation_list();
+    expected.retain(|_, upgrade| *upgrade != NetworkUpgrade::Nu7);
+    expected.insert(Height(4_420_652), NetworkUpgrade::Nu7);
+    assert_eq!(overlay.network.activation_list(), expected);
+
+    // A serialized config lists every height and round-trips without the flag.
+    let serialized = toml::to_string(&overlay).expect("config serializes");
+    assert!(!serialized.contains("inherit_activation_heights"));
+    let reloaded: Config = toml::from_str(&serialized).expect("serialized config reloads");
+    assert_eq!(reloaded.network, explicit.network);
+}
+
+/// Every public Testnet height except NU6.3, plus a fork's NU7.
+const ALL_BUT_NU6_3: &str = r#"BeforeOverwinter = 1, Overwinter = 207500, Sapling = 280000, Blossom = 584000, Heartwood = 903800, Canopy = 1028500, NU5 = 1842420, NU6 = 2976000, "NU6.1" = 3536500, "NU6.2" = 4052000, NU7 = 4420652"#;
+
+#[test]
+fn activation_heights_still_replace_the_defaults_unless_inherited() {
+    let _init_guard = zakura_test::init();
+
+    for inherit in [None, Some(false)] {
+        let replaced = configured_testnet(ALL_BUT_NU6_3, inherit).expect("partial list parses");
+        assert_eq!(
+            NetworkUpgrade::Nu7.activation_height(&replaced.network),
+            Some(Height(4_420_652))
+        );
+        // Unchanged replacement semantics: an omitted upgrade loses its public height.
+        assert!(!replaced
+            .network
+            .activation_list()
+            .contains_key(&Height(4_134_000)));
+    }
+
+    let inherited = configured_testnet(ALL_BUT_NU6_3, Some(true)).expect("overlay parses");
+    assert_eq!(
+        NetworkUpgrade::Nu6_3.activation_height(&inherited.network),
+        Some(Height(4_134_000))
+    );
+
+    // Without any activation heights, the public Testnet heights are kept either way.
+    let omitted: Config = toml::from_str(
+        "initial_testnet_peers = []\nnetwork = { network_name = \"Overlay\", checkpoints = true, inherit_activation_heights = true }",
+    )
+    .expect("overlay flag without heights parses");
+    assert_eq!(
+        omitted.network.activation_list(),
+        Network::new_default_testnet().activation_list()
+    );
+}
+
+#[test]
+fn activation_height_overlay_changes_only_configured_upgrades() {
+    let _init_guard = zakura_test::init();
+
+    let custom = configured_testnet(r#""NU6.3" = 4200000, NU7 = 4300000"#, Some(true))
+        .expect("custom overlay parses");
+    assert_eq!(
+        NetworkUpgrade::Nu6_3.activation_height(&custom.network),
+        Some(Height(4_200_000))
+    );
+    assert_eq!(
+        NetworkUpgrade::Nu7.activation_height(&custom.network),
+        Some(Height(4_300_000))
+    );
+    assert_eq!(
+        NetworkUpgrade::Nu6_2.activation_height(&custom.network),
+        NetworkUpgrade::Nu6_2.activation_height(&Network::new_default_testnet()),
+    );
+
+    // The overlaid list is validated as a whole: NU7 cannot precede inherited NU6.3.
+    let error = configured_testnet("NU7 = 4000000", Some(true))
+        .expect_err("an overlay below an inherited upgrade is out of order");
+    assert!(error.contains("order"), "unexpected error: {error}");
+
+    // Nor may it share an inherited upgrade's height, which would drop that upgrade.
+    let error = configured_testnet("NU7 = 4134000", Some(true))
+        .expect_err("an overlay at an inherited upgrade's height is ambiguous");
+    assert!(
+        error.contains("activation height must be valid"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn activation_height_overlay_is_only_for_configured_testnets() {
+    let _init_guard = zakura_test::init();
+
+    let regtest = toml::from_str::<Config>(
+        "network = { params = { inherit_activation_heights = true, activation_heights = { NU7 = 10 } } }",
+    )
+    .expect_err("Regtest has its own activation-height defaults")
+    .to_string();
+    assert!(
+        regtest.contains("only applies to configured Testnets"),
+        "unexpected error: {regtest}"
+    );
+
+    // The public networks stay fixed: no parameter table may sit beside them.
+    for network in ["Mainnet", "Testnet"] {
+        let error = toml::from_str::<Config>(&format!(
+            "network = \"{network}\"\n[testnet_parameters]\ninherit_activation_heights = true\n\
+             activation_heights = {{ NU7 = 4420652 }}"
+        ))
+        .expect_err("public network parameters must be fixed")
+        .to_string();
+        assert!(
+            error.contains("Mainnet and public Testnet parameters are fixed"),
+            "unexpected configuration error: {error}"
+        );
+    }
 }

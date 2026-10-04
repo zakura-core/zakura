@@ -2,7 +2,7 @@
 
 use std::{collections::HashMap, net::SocketAddr, str::FromStr};
 
-use iroh::{NodeAddr, NodeId};
+use iroh::{EndpointAddr, EndpointId};
 
 use super::{native_dial_supervised, RedialPolicy};
 use crate::zakura::{
@@ -48,9 +48,9 @@ pub(crate) fn spawn_native_bootstrap_dialer(
 
 fn grouped_remote_bootstrap_peers(
     bootstrap_peers: Vec<String>,
-    local_node_id: NodeId,
-) -> Vec<NodeAddr> {
-    let mut direct_addrs_by_node = HashMap::<NodeId, Vec<SocketAddr>>::new();
+    local_node_id: EndpointId,
+) -> Vec<EndpointAddr> {
+    let mut direct_addrs_by_node = HashMap::<EndpointId, Vec<SocketAddr>>::new();
     for entry in bootstrap_peers {
         let node_addr = match parse_bootstrap_peer(&entry) {
             Ok(node_addr) => node_addr,
@@ -59,14 +59,14 @@ fn grouped_remote_bootstrap_peers(
                 continue;
             }
         };
-        if node_addr.node_id == local_node_id {
+        if node_addr.id == local_node_id {
             tracing::debug!(?entry, "ignoring local Zakura bootstrap peer");
             continue;
         }
         direct_addrs_by_node
-            .entry(node_addr.node_id)
+            .entry(node_addr.id)
             .or_default()
-            .extend(node_addr.direct_addresses().copied());
+            .extend(node_addr.ip_addrs().copied());
     }
 
     direct_addrs_by_node
@@ -74,29 +74,31 @@ fn grouped_remote_bootstrap_peers(
         .map(|(node_id, mut direct_addrs)| {
             direct_addrs.sort_unstable();
             direct_addrs.dedup();
-            NodeAddr::new(node_id).with_direct_addresses(direct_addrs)
+            EndpointAddr::new(node_id)
+                .with_addrs((direct_addrs).into_iter().map(iroh::TransportAddr::Ip))
         })
         .collect()
 }
 
 pub(crate) async fn native_bootstrap_dial(
     endpoint: &ZakuraEndpoint,
-    node_addr: NodeAddr,
+    node_addr: EndpointAddr,
     limits: &ZakuraLocalLimits,
 ) -> Result<(), ZakuraHandlerError> {
     crate::zakura::handler::serve_native_dial_connection(endpoint, node_addr, limits).await
 }
 
-pub(crate) fn parse_bootstrap_peer(entry: &str) -> Result<NodeAddr, ZakuraHandlerError> {
+pub(crate) fn parse_bootstrap_peer(entry: &str) -> Result<EndpointAddr, ZakuraHandlerError> {
     let Some((node_id, direct_addr)) = entry.split_once('@') else {
         return Err(ZakuraHandlerError::InvalidBootstrapPeer);
     };
     let node_id =
-        NodeId::from_str(node_id).map_err(|_| ZakuraHandlerError::InvalidBootstrapPeer)?;
+        EndpointId::from_str(node_id).map_err(|_| ZakuraHandlerError::InvalidBootstrapPeer)?;
     let direct_addr = direct_addr
         .parse::<SocketAddr>()
         .map_err(|_| ZakuraHandlerError::InvalidBootstrapPeer)?;
-    Ok(NodeAddr::new(node_id).with_direct_addresses([direct_addr]))
+    Ok(EndpointAddr::new(node_id)
+        .with_addrs(([direct_addr]).into_iter().map(iroh::TransportAddr::Ip)))
 }
 
 #[cfg(test)]
@@ -138,9 +140,9 @@ mod tests {
         );
 
         assert_eq!(grouped.len(), 1);
-        assert_eq!(grouped[0].node_id, remote_id);
+        assert_eq!(grouped[0].id, remote_id);
         assert_eq!(
-            grouped[0].direct_addresses().copied().collect::<Vec<_>>(),
+            grouped[0].ip_addrs().copied().collect::<Vec<_>>(),
             vec![first_addr, second_addr]
         );
     }

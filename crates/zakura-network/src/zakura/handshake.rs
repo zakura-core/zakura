@@ -21,8 +21,8 @@ pub const P2P_V2_UPGRADE_COMMAND: &str = "p2pv2up";
 /// The padded Zcash command used for Zakura upgrade prelude messages.
 pub const P2P_V2_UPGRADE_COMMAND_BYTES: &[u8; 12] = b"p2pv2up\0\0\0\0\0";
 
-/// The ALPN used by the first Zakura P2P v2 protocol version.
-pub const P2P_V2_ALPN: &[u8] = b"p2p-v2/1";
+/// The ALPN for the Iroh 1.x Zakura transport cohort.
+pub const P2P_V2_ALPN: &[u8] = b"p2p-v2/2";
 
 /// Magic bytes for Zakura legacy upgrade prelude messages.
 pub const PRELUDE_MAGIC: [u8; 8] = *b"ZAKURA1\0";
@@ -44,6 +44,9 @@ pub const CONTROL_VERSION: u16 = 1;
 
 /// The first Zakura wire protocol version.
 pub const ZAKURA_PROTOCOL_VERSION_1: u16 = 1;
+
+/// Iroh 1.x requires a separate cohort from the incompatible Iroh 0.92 transport.
+pub const ZAKURA_PROTOCOL_VERSION_CURRENT: u16 = 2;
 
 /// Hard cap for any legacy TCP upgrade prelude payload.
 pub const MAX_PRELUDE_PAYLOAD_BYTES: usize = 4 * 1024;
@@ -206,8 +209,8 @@ impl ZakuraHandshakeConfig {
     pub fn for_network(network: &Network) -> Self {
         Self {
             prelude_version: PRELUDE_VERSION,
-            zakura_protocol_min: ZAKURA_PROTOCOL_VERSION_1,
-            zakura_protocol_max: ZAKURA_PROTOCOL_VERSION_1,
+            zakura_protocol_min: ZAKURA_PROTOCOL_VERSION_CURRENT,
+            zakura_protocol_max: ZAKURA_PROTOCOL_VERSION_CURRENT,
             network_id: ZakuraNetworkId::from_network(network),
             chain_id: network.genesis_hash().0,
             required_capabilities: 0,
@@ -1873,8 +1876,8 @@ mod tests {
         P2pV2UpgradeInit {
             magic: PRELUDE_MAGIC,
             prelude_version: PRELUDE_VERSION,
-            zakura_protocol_min: 1,
-            zakura_protocol_max: 1,
+            zakura_protocol_min: ZAKURA_PROTOCOL_VERSION_CURRENT,
+            zakura_protocol_max: ZAKURA_PROTOCOL_VERSION_CURRENT,
             network_id: local.network_id,
             chain_id: local.chain_id,
             capabilities: 0,
@@ -1894,7 +1897,7 @@ mod tests {
         P2pV2UpgradeAccept {
             magic: PRELUDE_MAGIC,
             prelude_version: PRELUDE_VERSION,
-            selected_zakura_protocol: 1,
+            selected_zakura_protocol: ZAKURA_PROTOCOL_VERSION_CURRENT,
             network_id: local.network_id,
             chain_id: local.chain_id,
             capabilities: 0,
@@ -1939,11 +1942,14 @@ mod tests {
     #[test]
     fn init_validation_selects_overlap_and_rejects_bad_ranges() {
         let local = local_config();
-        assert_eq!(init().validate(&local, nonces()), Ok(1));
+        assert_eq!(
+            init().validate(&local, nonces()),
+            Ok(ZAKURA_PROTOCOL_VERSION_CURRENT)
+        );
 
         let mut bad = init();
-        bad.zakura_protocol_min = 2;
-        bad.zakura_protocol_max = 3;
+        bad.zakura_protocol_min = ZAKURA_PROTOCOL_VERSION_CURRENT + 1;
+        bad.zakura_protocol_max = ZAKURA_PROTOCOL_VERSION_CURRENT + 2;
         assert_eq!(
             bad.validate(&local, nonces()),
             Err(ZakuraRejectReason::IncompatibleZakuraProtocol)
@@ -2034,7 +2040,7 @@ mod tests {
         // Same cohort: network id and chain id match, so the prelude validates.
         assert_eq!(
             cohort_init("alpha").validate(&cohort_local("alpha"), nonces()),
-            Ok(1)
+            Ok(ZAKURA_PROTOCOL_VERSION_CURRENT)
         );
 
         // Different cohort: both are `Configured`, but the chain id differs.
@@ -2131,7 +2137,7 @@ mod tests {
         let hello = ZakuraControlHello {
             magic: CONTROL_HELLO_MAGIC,
             control_version: CONTROL_VERSION,
-            selected_zakura_protocol: 1,
+            selected_zakura_protocol: ZAKURA_PROTOCOL_VERSION_CURRENT,
             handshake_path: ZakuraHandshakePath::Upgraded,
             role: ZakuraControlRole::Initiator,
             network_id: local.network_id,
@@ -2154,7 +2160,7 @@ mod tests {
         let expected = ZakuraControlValidation {
             local: &local,
             authenticated_remote_id: &[7; 32],
-            selected_zakura_protocol: 1,
+            selected_zakura_protocol: ZAKURA_PROTOCOL_VERSION_CURRENT,
             handshake_path: ZakuraHandshakePath::Upgraded,
             remote_role: ZakuraControlRole::Initiator,
             initiator_upgrade_nonce: [1; 32],
@@ -2216,7 +2222,7 @@ mod tests {
         let ack = ZakuraControlAck {
             magic: CONTROL_ACK_MAGIC,
             control_version: CONTROL_VERSION,
-            selected_zakura_protocol: 1,
+            selected_zakura_protocol: ZAKURA_PROTOCOL_VERSION_CURRENT,
             peer_nonce: [2; 32],
             remote_peer_nonce: [1; 32],
             accepted_capabilities: 0,
@@ -2232,11 +2238,23 @@ mod tests {
         let requested_limits = ack.accepted_limits;
         let local = local_config();
         assert_eq!(
-            ack.validate(1, [1; 32], [2; 32], &requested_limits, &local),
+            ack.validate(
+                ZAKURA_PROTOCOL_VERSION_CURRENT,
+                [1; 32],
+                [2; 32],
+                &requested_limits,
+                &local
+            ),
             Ok(())
         );
         assert_eq!(
-            ack.validate(1, [9; 32], [2; 32], &requested_limits, &local),
+            ack.validate(
+                ZAKURA_PROTOCOL_VERSION_CURRENT,
+                [9; 32],
+                [2; 32],
+                &requested_limits,
+                &local
+            ),
             Err(ZakuraValidationError::ControlNonceMismatch)
         );
 
@@ -2248,7 +2266,13 @@ mod tests {
             ..ack
         };
         assert_eq!(
-            malicious_ack.validate(1, [1; 32], [2; 32], &requested_limits, &local),
+            malicious_ack.validate(
+                ZAKURA_PROTOCOL_VERSION_CURRENT,
+                [1; 32],
+                [2; 32],
+                &requested_limits,
+                &local
+            ),
             Err(ZakuraValidationError::ResourceLimit)
         );
 
@@ -2277,7 +2301,13 @@ mod tests {
                 ..ack.clone()
             };
             assert_eq!(
-                over_cap_ack.validate(1, [1; 32], [2; 32], &requested_limits, &local),
+                over_cap_ack.validate(
+                    ZAKURA_PROTOCOL_VERSION_CURRENT,
+                    [1; 32],
+                    [2; 32],
+                    &requested_limits,
+                    &local
+                ),
                 Err(ZakuraValidationError::ResourceLimit)
             );
         }
@@ -2319,7 +2349,13 @@ mod tests {
                 ..ack.clone()
             };
             assert_eq!(
-                zero_ack.validate(1, [1; 32], [2; 32], &requested, &local),
+                zero_ack.validate(
+                    ZAKURA_PROTOCOL_VERSION_CURRENT,
+                    [1; 32],
+                    [2; 32],
+                    &requested,
+                    &local
+                ),
                 Err(ZakuraValidationError::ResourceLimit)
             );
         }
@@ -2458,7 +2494,7 @@ mod tests {
         ZakuraControlHello {
             magic: CONTROL_HELLO_MAGIC,
             control_version: CONTROL_VERSION,
-            selected_zakura_protocol: 1,
+            selected_zakura_protocol: ZAKURA_PROTOCOL_VERSION_CURRENT,
             handshake_path: ZakuraHandshakePath::Upgraded,
             role: ZakuraControlRole::Initiator,
             network_id: local.network_id,
@@ -2484,7 +2520,7 @@ mod tests {
         ZakuraControlAck {
             magic: CONTROL_ACK_MAGIC,
             control_version: CONTROL_VERSION,
-            selected_zakura_protocol: 1,
+            selected_zakura_protocol: ZAKURA_PROTOCOL_VERSION_CURRENT,
             peer_nonce: [2; 32],
             remote_peer_nonce: [1; 32],
             accepted_capabilities: 0,

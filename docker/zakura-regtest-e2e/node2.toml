@@ -28,6 +28,7 @@ initial_testnet_peers = []
 max_connections_per_ip = 10
 
 [network.zakura]
+listen_addr = "127.0.0.1:18334"
 # Dial node 1's stable Zakura endpoint (its fixed node id @ its fixed QUIC port).
 # This is the only way this node joins the network.
 bootstrap_peers = [

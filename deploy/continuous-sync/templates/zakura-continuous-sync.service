@@ -7,6 +7,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 EnvironmentFile=-/etc/zakura-alerts.env
+EnvironmentFile=-/etc/zakura-traces.env
 Environment=PATH=/root/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 Environment=CARGO_HOME=/root/.cargo
 Environment=RUSTUP_HOME=/root/.rustup

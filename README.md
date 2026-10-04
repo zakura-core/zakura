@@ -115,8 +115,22 @@ cargo install --locked zakura
 Alternatively, you can install it from GitHub:
 
 ```sh
-cargo install --git https://github.com/zakura-core/zakura --tag v1.3.2 zakura
+cargo install --git https://github.com/zakura-core/zakura --tag v1.6.1 zakura
 ```
+
+Native x86-64 builds automatically use Pasta field assembly when the build
+CPU supports BMI2 and ADX. This selection happens at build time, so a local
+binary may not run on an older CPU. To build a binary for redistribution, use:
+
+```sh
+cargo build --locked --release --package zakura --features portable
+```
+
+Official release binaries and Docker runtime images enable `portable` and do
+not require BMI2 or ADX for Pasta arithmetic. This feature does not override
+custom compiler flags such as `-C target-cpu=native`; avoid CPU-specific flags
+when building for other machines. Default local builds keep automatic assembly
+selection, including with `--release`.
 
 You can start Zakura by running
 

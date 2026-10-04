@@ -7,6 +7,7 @@ mod clock;
 mod frame;
 mod guard;
 mod io;
+mod message_rule;
 mod pipe;
 mod registry;
 mod service;
@@ -20,16 +21,28 @@ pub use frame::{Frame, StreamPrelude, ZakuraTrace};
 #[allow(unused_imports)]
 pub(crate) use guard::{Admit, ByteBudget, PeerMeters, SessionGuard};
 pub use io::{framed_channel, FramedRecv, FramedSend};
-#[allow(unused_imports)] // used by the first message policy in the stacked PR
-pub(crate) use io::{worker_framed_channel, FramedWorkerRecv, LeasedSendError, QueuedFrame};
+#[allow(unused_imports)] // guarded producers are activated by the next chunks
+pub(crate) use io::{
+    worker_framed_channel, FrameGuard, FrameWriteClaim, FramedWorkerRecv, GuardedReserveError,
+    OrderedStreamFailure, OrderedStreamFailureCause, QueuedFrame,
+};
+pub(crate) use message_rule::frame_filter::{FrameFilter, InboundReader};
+#[cfg(test)]
+pub(crate) use message_rule::frame_suite::check_frame_filter;
+pub use message_rule::{
+    frame_filter::FrameRejection, layout::LayoutError, Cadence, Credit, MessageRole, MessageRule,
+    PayloadLen,
+};
 pub(crate) use pipe::{
     handle_pipe_exit, spawn_supervised_peer_task, spawn_supervised_pipe, CloseCause, Edge, Flow,
     Node, NodeKind, Pipe, PipeCx, PipeShape,
 };
+pub(crate) use registry::SessionLayout;
 pub use registry::{RegistryError, ServiceRegistry};
 pub(crate) use service::ServiceStream;
 pub use service::{
-    BoxRunFuture, OrderedSessionDemand, OrderedStreamOpening, OrderedStreamPolicy, Peer,
-    RequestResponseService, Service, Sink, SinkReject, Source, Stream, StreamMode,
+    BoxRunFuture, Peer, RequestResponseService, Service, SessionDemand, SessionFull,
+    SessionOpening, SessionPolicy, SessionResources, Sink, SinkReject, Source, Stream, StreamMode,
+    StreamQueueDepths, StreamWritePolicy,
 };
 pub use session::{OrderedSendError, PeerStreamSession};

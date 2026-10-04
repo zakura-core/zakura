@@ -14,6 +14,7 @@ use std::{
     time::Duration,
 };
 
+use indexmap::IndexSet;
 use thiserror::Error;
 use tokio::{
     sync::{mpsc, oneshot, Mutex, OwnedSemaphorePermit, Semaphore},
@@ -40,10 +41,10 @@ use crate::{
 
 use super::trace::BlockBodySource;
 use super::{
-    spawn_supervised_peer_task, BoxRunFuture, Frame, FramedSend, OrderedSendError,
-    OrderedSessionDemand, OrderedStreamOpening, OrderedStreamPolicy, Peer, RequestResponseService,
-    Service as ZakuraService, ServicePeerDirection, SinkReject, Stream, StreamMode, ZakuraConnId,
-    ZakuraPeerHandle, ZakuraPeerId, ZakuraSupervisorHandle, ZakuraTrace, FRAME_HEADER_BYTES,
+    spawn_supervised_peer_task, BoxRunFuture, Frame, FramedSend, OrderedSendError, Peer,
+    RequestResponseService, Service as ZakuraService, ServicePeerDirection, SessionDemand,
+    SessionOpening, SessionPolicy, SinkReject, Stream, ZakuraConnId, ZakuraPeerHandle,
+    ZakuraPeerId, ZakuraSupervisorHandle, ZakuraTrace, FRAME_HEADER_BYTES,
     LOCAL_MAX_CONTROL_FRAME_BYTES, ZAKURA_CAP_LEGACY_GOSSIP,
 };
 
@@ -145,14 +146,14 @@ const LEGACY_GOSSIP_SERVICE_STREAMS: [Stream; 2] = [
         version: LEGACY_GOSSIP_VERSION,
         frame_cap: LOCAL_MAX_CONTROL_FRAME_BYTES,
         capability: ZAKURA_CAP_LEGACY_GOSSIP,
-        mode: StreamMode::Ordered,
+        ..Stream::PERSISTENT
     },
     Stream {
         kind: ZAKURA_STREAM_LEGACY_REQUESTS,
         version: LEGACY_GOSSIP_VERSION,
         frame_cap: LOCAL_MAX_CONTROL_FRAME_BYTES,
         capability: ZAKURA_CAP_LEGACY_GOSSIP,
-        mode: StreamMode::RequestResponse,
+        ..Stream::REQUEST_RESPONSE
     },
 ];
 
@@ -2019,7 +2020,7 @@ fn record_block_response_source(
     trace: &ZakuraTrace,
     response: Response,
     source: BlockBodySource,
-    requested_hashes: Option<&HashSet<block::Hash>>,
+    requested_hashes: Option<&IndexSet<block::Hash>>,
 ) -> Response {
     if let (Response::Blocks(blocks), Some(requested_hashes)) = (&response, requested_hashes) {
         for block in blocks {
@@ -2544,9 +2545,9 @@ impl ZakuraService for LegacyGossipSink {
         legacy_gossip_streams()
     }
 
-    fn ordered_stream_policy(&self, _kind: u16) -> OrderedStreamPolicy {
-        OrderedStreamPolicy {
-            opening: OrderedStreamOpening::InitiatorOnly,
+    fn session_policy(&self) -> SessionPolicy {
+        SessionPolicy {
+            opening: SessionOpening::InitiatorOnly,
             reopen: true,
         }
     }
@@ -2560,17 +2561,17 @@ impl ZakuraService for LegacyGossipSink {
         self.outbound.owns_connection(peer, conn_id)
     }
 
-    fn ordered_session_demand(
+    fn session_demand(
         &self,
         conn_id: ZakuraConnId,
         peer: &ZakuraPeerId,
         _negotiated: u64,
         _direction: ServicePeerDirection,
-    ) -> OrderedSessionDemand {
+    ) -> SessionDemand {
         if self.outbound.is_retired(peer, conn_id) {
-            return OrderedSessionDemand::Retire;
+            return SessionDemand::Retire;
         }
-        OrderedSessionDemand::OpenNow
+        SessionDemand::OpenNow
     }
 
     fn add_peer(&self, mut peer: Peer) {
@@ -3641,7 +3642,7 @@ mod tests {
 
     async fn node_peer_id(node: &ZakuraTestNode) -> Result<ZakuraPeerId, BoxError> {
         Ok(ZakuraPeerId::new(
-            node.node_addr().await.node_id.as_bytes().to_vec(),
+            node.node_addr().await.id.as_bytes().to_vec(),
         )?)
     }
 
@@ -3887,7 +3888,7 @@ mod tests {
         let adapter = LegacyRequestAdapter::new(node_b.supervisor());
         let response = adapter
             .request_from_source(
-                Request::BlocksByHash(HashSet::from([hash])),
+                Request::BlocksByHash(IndexSet::from([hash])),
                 Some(PeerSource::Zakura(a_peer_id)),
             )
             .await?;
@@ -3924,7 +3925,7 @@ mod tests {
         let adapter = LegacyRequestAdapter::new(node_b.supervisor());
         let response = adapter
             .request_from_source(
-                Request::BlocksByHash(HashSet::from([block.hash()])),
+                Request::BlocksByHash(IndexSet::from([block.hash()])),
                 Some(PeerSource::Zakura(a_peer_id)),
             )
             .await?;
@@ -4071,6 +4072,8 @@ mod tests {
         wait_registered_count(&node_c, 2).await?;
 
         let a_peer_id = node_peer_id(&node_a).await?;
+        let b_peer_id = node_peer_id(&node_b).await?;
+        let c_peer_id = node_peer_id(&node_c).await?;
         let mut gossip = LegacyGossipAdapter::new(node_a.supervisor());
         gossip
             .ready()
@@ -4081,13 +4084,15 @@ mod tests {
         match recv_request(&mut rx_b).await? {
             Request::AdvertiseBlock(hash, Some(PeerSource::Zakura(peer_id))) => {
                 assert_eq!(hash, block.hash());
-                assert_eq!(peer_id, a_peer_id);
+                // C may forward the announcement before the direct A-to-B stream arrives.
+                assert!(peer_id == a_peer_id || peer_id == c_peer_id);
             }
             request => panic!("unexpected B request: {request:?}"),
         }
         match recv_request(&mut rx_c).await? {
-            Request::AdvertiseBlock(hash, Some(PeerSource::Zakura(_))) => {
+            Request::AdvertiseBlock(hash, Some(PeerSource::Zakura(peer_id))) => {
                 assert_eq!(hash, block.hash());
+                assert!(peer_id == a_peer_id || peer_id == b_peer_id);
             }
             request => panic!("unexpected C request: {request:?}"),
         }
@@ -4700,8 +4705,8 @@ mod tests {
             "a retired gossip stream must not hold a reopen-gap claim"
         );
         assert!(matches!(
-            sink.ordered_session_demand(conn_id, &peer_id, 0, ServicePeerDirection::Outbound),
-            OrderedSessionDemand::Retire,
+            sink.session_demand(conn_id, &peer_id, 0, ServicePeerDirection::Outbound),
+            SessionDemand::Retire,
         ));
         let (send, _rx) = framed_channel(1);
         assert!(
@@ -4763,8 +4768,8 @@ mod tests {
             "a reset churn counter must keep the reopen-gap claim"
         );
         assert!(matches!(
-            sink.ordered_session_demand(conn_id, &peer_id, 0, ServicePeerDirection::Outbound),
-            OrderedSessionDemand::OpenNow,
+            sink.session_demand(conn_id, &peer_id, 0, ServicePeerDirection::Outbound),
+            SessionDemand::OpenNow,
         ));
     }
 
@@ -4983,6 +4988,20 @@ mod tests {
             LegacyRequestFrame::decode_frame(block_request.encode_frame().expect("frame encodes"))
                 .expect("frame decodes"),
             block_request
+        );
+
+        let requested_hashes = vec![block_hash(2), block_hash(1), block_hash(2)];
+        let peer_id = ZakuraPeerId::new(vec![1; 32]).expect("test peer id is within bounds");
+        let Request::BlocksByHash(hashes) = LegacyRequestFrame::BlocksByHash(requested_hashes)
+            .into_service_request(peer_id)
+            .expect("block request has a service request")
+        else {
+            panic!("block request must produce BlocksByHash");
+        };
+        assert_eq!(
+            hashes.into_iter().collect::<Vec<_>>(),
+            vec![block_hash(2), block_hash(1)],
+            "block request conversion must preserve first-seen hash order",
         );
 
         let tx_request =
@@ -5564,7 +5583,7 @@ mod tests {
     fn unsupported_requests_fail_loudly() {
         let unsupported = [
             (
-                Request::BlocksByHash(HashSet::from([block_hash(1)])),
+                Request::BlocksByHash(IndexSet::from([block_hash(1)])),
                 "BlocksByHash",
             ),
             (
@@ -5745,7 +5764,7 @@ mod tests {
 
         let adapter = LegacyRequestAdapter::new(node.supervisor());
         let request = adapter.request_from_source(
-            Request::BlocksByHash(HashSet::from([block_hash(1)])),
+            Request::BlocksByHash(IndexSet::from([block_hash(1)])),
             Some(PeerSource::Zakura(hostile_id)),
         );
         let responder = hostile.respond_to_next_request(vec![response]);
@@ -5777,7 +5796,7 @@ mod tests {
         let adapter =
             LegacyRequestAdapter::new_with_timeout(node.supervisor(), Duration::from_millis(100));
         let first_request = adapter.request_from_source(
-            Request::BlocksByHash(HashSet::from([block_hash(1)])),
+            Request::BlocksByHash(IndexSet::from([block_hash(1)])),
             Some(PeerSource::Zakura(hostile_id.clone())),
         );
         let hold_first = hostile.accept_next_request_without_response();
@@ -5793,7 +5812,7 @@ mod tests {
 
         let second_hash = block_hash(2);
         let second_request = adapter.request_from_source(
-            Request::BlocksByHash(HashSet::from([second_hash])),
+            Request::BlocksByHash(IndexSet::from([second_hash])),
             Some(PeerSource::Zakura(hostile_id)),
         );
         let second_response = hostile.respond_to_next_request_with(|request_id| {
@@ -5823,7 +5842,7 @@ mod tests {
 
         let adapter = LegacyRequestAdapter::new(node.supervisor());
         let request = adapter.request_from_source(
-            Request::BlocksByHash(HashSet::from([block_hash(1)])),
+            Request::BlocksByHash(IndexSet::from([block_hash(1)])),
             Some(PeerSource::Zakura(hostile_id)),
         );
         let responder = hostile.respond_to_next_request_with(|request_id| {
@@ -5845,9 +5864,13 @@ mod tests {
         responder_result?;
         let error = request_result.expect_err("excessive response frames are rejected");
         assert!(
-            error
-                .to_string()
-                .contains("too many legacy response frames"),
+            matches!(
+                error.downcast_ref::<crate::zakura::handler::ZakuraHandlerError>(),
+                Some(crate::zakura::handler::ZakuraHandlerError::RejectedFrame {
+                    rejection: crate::zakura::FrameRejection::Unsolicited,
+                    ..
+                })
+            ),
             "unexpected error: {error}"
         );
         wait_registered_count(&node, 0).await?;
@@ -5867,7 +5890,7 @@ mod tests {
 
         let adapter = LegacyRequestAdapter::new(node.supervisor());
         let request = adapter.request_from_source(
-            Request::BlocksByHash(HashSet::from([block_hash(1)])),
+            Request::BlocksByHash(IndexSet::from([block_hash(1)])),
             Some(PeerSource::Zakura(hostile_id)),
         );
         let responder = hostile.respond_to_next_request_with(|request_id| {
@@ -6019,7 +6042,7 @@ mod tests {
         let response = composite
             .ready()
             .await?
-            .call(Request::BlocksByHash(HashSet::from([hash])))
+            .call(Request::BlocksByHash(IndexSet::from([hash])))
             .await?;
         assert!(matches!(
             response,
@@ -6059,7 +6082,7 @@ mod tests {
         let response = composite
             .ready()
             .await?
-            .call(Request::BlocksByHash(HashSet::from([hash])))
+            .call(Request::BlocksByHash(IndexSet::from([hash])))
             .await?;
         assert!(matches!(
             response,
@@ -6081,7 +6104,7 @@ mod tests {
             BLOCK_TESTNET_141042_BYTES.as_slice(),
         )?);
         let received_hash = block.hash();
-        let requested_hashes = HashSet::from([block_hash(250)]);
+        let requested_hashes = IndexSet::from([block_hash(250)]);
         assert!(!requested_hashes.contains(&received_hash));
         let trace = ZakuraTrace::noop();
 

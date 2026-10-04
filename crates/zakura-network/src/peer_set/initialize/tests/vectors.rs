@@ -28,7 +28,7 @@ use indexmap::IndexSet;
 use tokio::{
     io::AsyncWriteExt,
     net::{TcpSocket, TcpStream},
-    task::JoinHandle,
+    task::{JoinError, JoinHandle},
 };
 use tower::{service_fn, Layer, Service, ServiceExt};
 
@@ -2142,7 +2142,7 @@ async fn add_initial_peers_deadlock() {
 /// Open a local listener on `listen_addr` for `network`.
 /// Asserts that the local listener address works as expected.
 async fn local_listener_port_with(listen_addr: SocketAddr, network: Network) {
-    let config = Config {
+    let mut config = Config {
         listen_addr,
         network,
 
@@ -2153,6 +2153,7 @@ async fn local_listener_port_with(listen_addr: SocketAddr, network: Network) {
 
         ..Config::default()
     };
+    config.zakura.listen_addr = Some("127.0.0.1:0".parse().expect("valid test bind address"));
     let inbound_service =
         service_fn(|_| async { unreachable!("inbound service should never be called") });
 
@@ -2212,7 +2213,9 @@ where
     // (localhost should be enough).
     let unused_v4 = "0.0.0.0:0".parse().unwrap();
 
-    let default_config = default_config.into().unwrap_or_default();
+    let mut default_config = default_config.into().unwrap_or_default();
+    default_config.zakura.listen_addr =
+        Some("127.0.0.1:0".parse().expect("valid test bind address"));
 
     let config = Config {
         peerset_initial_target_size,
@@ -2304,14 +2307,7 @@ impl ReplenishmentCrawlerTestHarness {
             tokio::task::yield_now().await;
         }
 
-        let crawl_result = self.crawl_task_handle.await;
-        match crawl_result {
-            Ok(Err(error)) => assert!(
-                error.to_string().contains("demand stream closed"),
-                "unexpected peer crawler shutdown error: {error:?}"
-            ),
-            other => panic!("unexpected peer crawler shutdown result: {other:?}"),
-        }
+        assert_demand_closed_shutdown(self.crawl_task_handle.await);
 
         let connection_deadline = Instant::now() + CRAWLER_TEST_TIMEOUT;
         loop {
@@ -2529,6 +2525,25 @@ enum ExpectedCrawlerConnections {
     AtLimit,
     /// Failed or dropped connections must be replaced beyond the limit.
     OverLimit,
+}
+
+/// Assert that the crawler stopped because its demand channel closed.
+///
+/// The crawler observes the closed channel on one of two paths. Its select
+/// loop reads the end of the demand stream, or a spawned crawl fails to queue
+/// demand for newly discovered peers. The crawl runs concurrently with the
+/// test's `close_channel`, so either path can win.
+fn assert_demand_closed_shutdown(crawl_result: Result<Result<(), BoxError>, JoinError>) {
+    match crawl_result {
+        Ok(Err(error)) => assert!(
+            error.to_string().contains("demand stream closed")
+                || error
+                    .downcast_ref::<mpsc::TrySendError<MorePeers>>()
+                    .is_some_and(mpsc::TrySendError::is_disconnected),
+            "unexpected peer crawler shutdown error: {error:?}"
+        ),
+        other => panic!("unexpected peer crawler shutdown result: {other:?}"),
+    }
 }
 
 /// Wait for `event_count` crawler test events while advancing mocked time.
@@ -2763,14 +2778,7 @@ where
             tokio::task::yield_now().await;
         }
 
-        let crawl_result = crawl_task_handle.await;
-        match crawl_result {
-            Ok(Err(error)) => assert!(
-                error.to_string().contains("demand stream closed"),
-                "unexpected peer crawler shutdown error: {error:?}"
-            ),
-            other => panic!("unexpected peer crawler shutdown result: {other:?}"),
-        }
+        assert_demand_closed_shutdown(crawl_task_handle.await);
 
         assert!(
             connection_finished_rx.is_closed(),

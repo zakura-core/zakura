@@ -41,12 +41,14 @@ mod peer_registry;
 mod peer_routine;
 mod pipe;
 mod reactor;
+mod regulated;
 mod reorder;
 mod request;
 mod sequencer;
 mod sequencer_task;
 mod service;
 mod state;
+mod status;
 #[cfg(test)]
 mod tests;
 mod trace;

@@ -280,7 +280,7 @@ async fn start_test_zakura_endpoint_with_registry() -> (crate::zakura::ZakuraEnd
     let key_byte = u8::try_from(key_index).expect("key index is in 1..=255 due to modulo");
     let secret = format!("{key_byte:02x}").repeat(32);
     let config: Config = toml::from_str(&format!(
-        "p2p_stack = 'dual'\nzakura_node_secret_key = '{secret}'"
+        "p2p_stack = 'dual'\nzakura_node_secret_key = '{secret}'\n[zakura]\nlisten_addr = '127.0.0.1:0'"
     ))
     .expect("test Zakura config with explicit identity key must parse");
 
@@ -688,6 +688,85 @@ async fn initiator_upgrade_disconnects_on_malformed_prelude() {
          first-offense disconnect",
     );
     assert!(!error.is_neutral_disconnect());
+}
+
+/// The legacy handshake runs the initiator upgrade inside `HANDSHAKE_TIMEOUT`,
+/// which is shorter than the native registration wait. When that timeout drops
+/// the upgrade, the maintained native dial the upgrade started must stop too.
+/// Otherwise a legacy responder that advertises an unreachable Zakura address
+/// leaks one redialing task per upgrade.
+///
+/// Regression test for V12 #298060.
+#[tokio::test(start_paused = true)]
+async fn timed_out_initiator_upgrade_does_not_leak_upgrade_dial() {
+    let _init_guard = zakura_test::init();
+
+    let initiator_endpoint = start_test_zakura_endpoint().await;
+    let connector = initiator_endpoint.connector();
+    let (local_node_id, local_direct_addresses) = connector
+        .local_iroh_hints()
+        .await
+        .expect("a live Zakura endpoint exposes local upgrade hints");
+
+    let network = test_config(P2pStack::Dual).network;
+    let config = ZakuraHandshakeConfig::for_network(&network);
+    let nonces = ZakuraLegacyNonces {
+        local_zebra_nonce: Nonce(0x5555_5555_5555_5555),
+        remote_zebra_nonce: Nonce(0x6666_6666_6666_6666),
+    };
+    // The responder's nonce labels are the mirror image of the initiator's.
+    let responder_nonces = ZakuraLegacyNonces {
+        local_zebra_nonce: nonces.remote_zebra_nonce,
+        remote_zebra_nonce: nonces.local_zebra_nonce,
+    };
+
+    let (initiator_stream, responder_stream) = duplex(16 * 1024);
+    let mut initiator_conn = Framed::new(
+        initiator_stream,
+        Codec::builder().for_network(&network).finish(),
+    );
+    let mut responder_conn = Framed::new(
+        responder_stream,
+        Codec::builder().for_network(&network).finish(),
+    );
+
+    // The responder accepts with a real iroh node id at an RFC 5737 TEST-NET-1
+    // address, so the initiator's native dial never registers.
+    let responder_connector = crate::zakura::ZakuraHandshakeConnector::unavailable();
+    let responder = run_responder_upgrade(
+        &mut responder_conn,
+        &responder_connector,
+        &config,
+        responder_nonces,
+        iroh::SecretKey::generate().public().as_bytes().to_vec(),
+        vec![b"192.0.2.1:1".to_vec()],
+        ResponderRegistrationWait::Production,
+    );
+    let initiator = tokio::time::timeout(
+        constants::HANDSHAKE_TIMEOUT,
+        run_initiator_upgrade(
+            &mut initiator_conn,
+            &connector,
+            &config,
+            nonces,
+            local_node_id,
+            local_direct_addresses,
+        ),
+    );
+
+    let (initiator, _responder) = tokio::join!(initiator, responder);
+
+    assert!(
+        initiator.is_err(),
+        "the upgrade must outlast the handshake timeout, so the timeout drops it",
+    );
+    assert_eq!(
+        initiator_endpoint.upgrade_dial_count(),
+        0,
+        "a timed-out legacy upgrade leaked its maintained native dial",
+    );
+
+    initiator_endpoint.shutdown().await;
 }
 
 #[tokio::test]

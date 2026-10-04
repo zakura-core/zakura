@@ -406,14 +406,18 @@ async fn inbound_pruned_block_is_not_advertised_and_getdata_logs_error(
     );
 
     let unknown_hash = block::Hash([0x11; 32]);
+    let second_unknown_hash = block::Hash([0x22; 32]);
     let unknown_response = inbound_service
         .clone()
-        .oneshot(Request::BlocksByHash(iter::once(unknown_hash).collect()))
+        .oneshot(Request::BlocksByHash(IndexSet::from([
+            unknown_hash,
+            second_unknown_hash,
+        ])))
         .await?;
     assert_eq!(
         unknown_response,
-        Response::Blocks(vec![Missing(unknown_hash)]),
-        "an unknown hash maps to missing inventory"
+        Response::Blocks(vec![Missing(unknown_hash), Missing(second_unknown_hash)]),
+        "unknown hashes map to missing inventory in request order"
     );
     assert!(
         !captured_logs.contains(super::super::ZCASHD_COMPAT_PRUNED_BLOCK_ERROR),
@@ -969,6 +973,7 @@ async fn setup(
     let state_service = ServiceBuilder::new().buffer(10).service(state_service);
 
     // Network
+    let identity_dir = tempfile::tempdir().expect("temporary network identity directory");
     let network_config = NetworkConfig {
         network: network.clone(),
         listen_addr: config_listen_addr,
@@ -977,10 +982,16 @@ async fn setup(
         initial_mainnet_peers: IndexSet::new(),
         initial_testnet_peers: IndexSet::new(),
         cache_dir: CacheDir::disabled(),
+        identity_dir: identity_dir.path().to_path_buf(),
 
         // Optionally run the Zakura P2P-v2 endpoint alongside the legacy TCP
         // stack so the dual-stack wiring is exercised (coexistence tests).
         p2p_stack,
+        zakura: zakura_network::zakura::ZakuraConfig {
+            listen_addr: Some(config_listen_addr),
+            bootstrap_peers: Vec::new(),
+            ..Default::default()
+        },
 
         ..NetworkConfig::default()
     };
@@ -1056,6 +1067,7 @@ async fn setup(
         mempool: mempool_service.clone(),
         state: state_service.clone(),
         latest_chain_tip,
+        network: network.clone(),
         misbehavior_sender,
     };
     let r = setup_tx.send(setup_data);
@@ -1128,13 +1140,16 @@ async fn setup(
 }
 
 mod submitblock_test {
+    use std::time::Duration;
+
     use tracing::{Instrument, Level};
     use tracing_subscriber::fmt;
     use zakura_rpc::{MinedBlockEvent, SubmitBlockChannel};
 
     use super::*;
 
-    use crate::components::sync::PEER_GOSSIP_DELAY;
+    /// How long the test waits for the mined block broadcast log before failing.
+    const MINED_BLOCK_BROADCAST_DEADLINE: Duration = Duration::from_secs(7);
 
     #[tokio::test]
     async fn submitblock_channel() -> Result<(), crate::BoxError> {
@@ -1216,9 +1231,8 @@ mod submitblock_test {
             .in_current_span(),
         );
 
-        // Wait for the exact event under test. The timeout is only a failure
-        // deadline; the mined-block channel bypasses the periodic gossip delay.
-        tokio::time::timeout(PEER_GOSSIP_DELAY, async {
+        // Wait for the exact event under test. The timeout is only a failure deadline.
+        tokio::time::timeout(MINED_BLOCK_BROADCAST_DEADLINE, async {
             loop {
                 let next_log = log_written.notified();
                 let sent_mined_block = {

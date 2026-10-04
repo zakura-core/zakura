@@ -57,6 +57,16 @@ fn open_file_limits_in_child() {
     assert_eq!(open_file_limits().unwrap().rlim_cur, 64);
     assert_eq!(open_file_limits().unwrap().rlim_max, 256);
 
+    // A kernel cap below or equal to the soft limit must never lower it.
+    for kernel_limit in [32, 64] {
+        assert_eq!(
+            increase_nofile_limit_with(128, || Ok(kernel_limit)).unwrap(),
+            64
+        );
+        assert_eq!(current_nofile_limit().unwrap(), 64);
+        assert_eq!(open_file_limits().unwrap().rlim_max, 256);
+    }
+
     // Raising the soft limit must preserve the hard limit.
     assert_eq!(increase_nofile_limit(128).unwrap(), 128);
     assert_eq!(open_file_limits().unwrap().rlim_cur, 128);

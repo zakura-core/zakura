@@ -13,7 +13,7 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     fmt::{Debug, Write},
-    fs,
+    fs, io,
     ops::RangeBounds,
     path::Path,
     sync::{
@@ -45,7 +45,7 @@ use super::zakura_db::transparent::{
 use super::{TypedColumnFamily, WriteTypedBatch};
 
 mod rlimit;
-use self::rlimit::increase_nofile_limit;
+use self::rlimit::{current_nofile_limit, increase_nofile_limit};
 
 // These helpers expose the raw RocksDB handle, so they must remain test-only.
 #[cfg(test)]
@@ -1640,7 +1640,7 @@ impl DiskDb {
     }
 
     /// Increase the open file limit for this process to `IDEAL_OPEN_FILE_LIMIT`.
-    /// If that fails, try `MIN_OPEN_FILE_LIMIT`.
+    /// If that fails, try `MIN_OPEN_FILE_LIMIT`, then query the actual limit.
     ///
     /// If the current limit is above `IDEAL_OPEN_FILE_LIMIT`, leaves it
     /// unchanged.
@@ -1649,8 +1649,15 @@ impl DiskDb {
     ///
     /// # Panics
     ///
-    /// If the open file limit can not be increased to `MIN_OPEN_FILE_LIMIT`.
+    /// If the actual limit is below `MIN_OPEN_FILE_LIMIT` or cannot be queried.
     fn increase_open_file_limit() -> u64 {
+        Self::increase_open_file_limit_with(increase_nofile_limit, current_nofile_limit)
+    }
+
+    fn increase_open_file_limit_with(
+        mut increase: impl FnMut(u64) -> io::Result<u64>,
+        query: impl FnOnce() -> io::Result<u64>,
+    ) -> u64 {
         // Zebra mainly uses TCP sockets (`zakura-network`) and low-level files
         // (`zakura-state` database).
         //
@@ -1677,20 +1684,33 @@ impl DiskDb {
         // the TCP Control Block limit on Windows.
 
         // We try setting the ideal limit, then the minimum limit.
-        let current_limit = match increase_nofile_limit(DiskDb::IDEAL_OPEN_FILE_LIMIT) {
+        let current_limit = match increase(DiskDb::IDEAL_OPEN_FILE_LIMIT) {
             Ok(current_limit) => current_limit,
             Err(limit_error) => {
-                // These errors can happen due to sandboxing or unsupported system calls,
-                // even if the file limit is high enough.
+                // A sandbox can reject an increase even with a usable current
+                // limit. Retry the minimum before querying the actual limit.
                 info!(
                     ?limit_error,
                     min_limit = ?DiskDb::MIN_OPEN_FILE_LIMIT,
                     ideal_limit = ?DiskDb::IDEAL_OPEN_FILE_LIMIT,
-                    "unable to increase the open file limit, \
-                     assuming Zakura can open a minimum number of files"
+                    "unable to increase the open file limit to the ideal, \
+                     trying the minimum"
                 );
 
-                return DiskDb::MIN_OPEN_FILE_LIMIT;
+                increase(DiskDb::MIN_OPEN_FILE_LIMIT).unwrap_or_else(|minimum_error| {
+                    info!(
+                        ?minimum_error,
+                        "unable to increase the open file limit to the minimum, \
+                         querying the current limit"
+                    );
+                    query().unwrap_or_else(|query_error| {
+                        panic!(
+                            "unable to determine the current open file limit: {query_error}. \
+                             Zakura requires at least {} open files",
+                            DiskDb::MIN_OPEN_FILE_LIMIT
+                        )
+                    })
+                })
             }
         };
 

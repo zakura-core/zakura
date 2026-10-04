@@ -163,6 +163,14 @@ pub const DEFAULT_ZAKURA_SEND_WINDOW: u64 = 32 * 1024 * 1024;
 pub const DEFAULT_ZAKURA_REDIAL_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 /// Maximum backoff between re-dials of a configured Zakura bootstrap peer.
 pub const DEFAULT_ZAKURA_REDIAL_MAX_BACKOFF: Duration = Duration::from_secs(30);
+/// Consecutive failed dials after which a legacy->Zakura upgrade dial gives up.
+///
+/// The upgrade dial targets a peer-supplied address, so it must not redial
+/// forever. Six attempts back off 1 + 2 + 4 + 8 + 16 = 31 s between dials, and
+/// each dial can wait up to [`DEFAULT_ZAKURA_CONTROL_TIMEOUT`] to connect, so
+/// the dial ends within about 90 s after the peer stops answering. The legacy
+/// crawler then re-upgrades the peer if it is still reachable.
+const ZAKURA_UPGRADE_REDIAL_MAX_ATTEMPTS: usize = 6;
 const CONTROL_LENGTH_BYTES: usize = 4;
 const STREAM_PRELUDE_FIXED_BYTES: usize = 4 + 2 + 2 + 1;
 const STREAM_PRELUDE_REQUEST_ID_FLAG_OFFSET: usize = STREAM_PRELUDE_FIXED_BYTES - 1;
@@ -766,7 +774,9 @@ impl ZakuraEndpoint {
     /// The legacy crawler can retry the same peer while a short-lived upgraded
     /// connection is still settling. Deduplicate those retries so repeated
     /// legacy upgrades do not create a swarm of independent maintained QUIC
-    /// dial loops to the same peer.
+    /// dial loops to the same peer. The dial gives up after
+    /// [`ZAKURA_UPGRADE_REDIAL_MAX_ATTEMPTS`] consecutive failures because the
+    /// peer chose the address.
     pub(crate) fn start_upgrade_native_dial(
         &self,
         node_addr: EndpointAddr,
@@ -790,9 +800,10 @@ impl ZakuraEndpoint {
 
         let endpoint = self.clone();
         let limits = self.handler.limits.clone();
-        let policy = RedialPolicy::maintain(
+        let policy = RedialPolicy::maintain_bounded(
             DEFAULT_ZAKURA_REDIAL_INITIAL_BACKOFF,
             DEFAULT_ZAKURA_REDIAL_MAX_BACKOFF,
+            ZAKURA_UPGRADE_REDIAL_MAX_ATTEMPTS,
         );
         let lifetime = CancellationToken::new();
         let task_lifetime = lifetime.clone();
@@ -819,6 +830,15 @@ impl ZakuraEndpoint {
         ZakuraUpgradeDialStart::Started
     }
 
+    /// Returns how many maintained upgrade dials this endpoint owns.
+    #[cfg(test)]
+    pub(crate) fn upgrade_dial_count(&self) -> usize {
+        self.upgrade_dials
+            .lock()
+            .expect("Zakura upgrade dial registry mutex is never poisoned")
+            .len()
+    }
+
     /// Return a token that is canceled when this endpoint stops owning the
     /// maintained native dial for `peer_id`.
     pub(crate) fn upgrade_dial_lifetime(
@@ -835,14 +855,12 @@ impl ZakuraEndpoint {
     /// Cancel and forget the maintained native dial started by the legacy
     /// upgrade hand-off for `peer_id`, if this node still owns one.
     ///
-    /// Called when the upgrade hand-off wait times out without the peer
-    /// registering: the maintained dial uses [`RedialPolicy::maintain`], so it
-    /// would otherwise redial a peer-supplied, possibly unreachable address
-    /// forever and keep its `upgrade_dials` entry. Repeating the failed upgrade
-    /// with distinct node ids would then grow maintained dial tasks and
-    /// outbound QUIC traffic without bound. A no-op if the peer already
-    /// registered (its entry is reclaimed only when the maintained dial ends on
-    /// shutdown) or if another upgrade owns the dedup slot.
+    /// Called when the upgrade hand-off ends without the peer registering,
+    /// including when the outer handshake timeout drops the hand-off. The
+    /// maintained dial would otherwise keep redialing a peer-supplied, possibly
+    /// unreachable address until its attempt limit, and repeating the failed
+    /// upgrade with distinct node ids would grow dial tasks and outbound QUIC
+    /// traffic. A no-op if the dial already ended.
     pub(crate) fn cancel_upgrade_native_dial(&self, peer_id: &ZakuraPeerId) {
         let ownership = self
             .upgrade_dials

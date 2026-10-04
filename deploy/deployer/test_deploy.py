@@ -1,8 +1,11 @@
 import importlib.util
 import os
+import re
 import sys
+import threading
 import tempfile
 import tomllib
+import types
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -95,6 +98,37 @@ class BuildCacheTests(unittest.TestCase):
 
             binary_is_runnable.assert_not_called()
 
+    def test_feature_builds_are_cached_separately_from_the_stock_build(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cache_dir = root / "cache"
+            cache_dir.mkdir()
+            sha = "e" * 40
+            (cache_dir / f"zakurad-{sha}").write_text("stock")
+            calls = []
+
+            def fake_run(cmd, *, cwd=None, capture=False, check=True):
+                calls.append(cmd)
+                if cmd[:3] == ["git", "worktree", "add"]:
+                    Path(cmd[-2]).mkdir(parents=True)
+                if cmd[:2] == ["cargo", "build"]:
+                    built = Path(cwd) / "target" / "release" / "zakurad"
+                    built.parent.mkdir(parents=True)
+                    built.write_text("miner")
+                return mock.Mock(returncode=0, stdout="")
+
+            with mock.patch.dict(os.environ, {deploy.BUILD_CACHE_DIR_ENV: str(cache_dir)}), \
+                    mock.patch.object(deploy, "binary_is_runnable", return_value=True), \
+                    mock.patch.object(deploy, "run", side_effect=fake_run):
+                built = deploy.build_commit(root, sha, features=["internal-miner"])
+
+            # The stock binary for the same commit must not satisfy a miner build.
+            self.assertEqual(built, cache_dir / f"zakurad-{sha}-internal-miner")
+            self.assertEqual(built.read_text(), "miner")
+            self.assertEqual((cache_dir / f"zakurad-{sha}").read_text(), "stock")
+            self.assertIn(["cargo", "build", "--release", "--locked", "-p", "zakura",
+                           "--features", "internal-miner"], calls)
+
     def test_prune_cached_binaries_keeps_current_and_recent(self):
         with tempfile.TemporaryDirectory() as tmp:
             cache_dir = Path(tmp)
@@ -167,16 +201,22 @@ class NodeBuilder:
             "listen_addr": "0.0.0.0:18233",
             "identity_dir": "",
             "network_cache_dir": "",
+            "initial_testnet_peers": None,
             "rpc_listen_addr": "",
             "rpc_enable_cookie_auth": None,
             "storage_mode": "archive",
             "p2p_stack": "dual",
             "metrics_endpoint": "",
             "health_listen_addr": "",
+            "miner_address": "",
+            "internal_miner": False,
+            "extra_coinbase_data": "",
+            "build_features": [],
             "tracing_filter": "",
             "checkpoint_sync": True,
             "vct_fast_sync": True,
             "zakura": None,
+            "testnet_parameters": None,
             "working_dir": "",
             "start_command": "",
             "process_pattern": "",
@@ -221,6 +261,36 @@ class ObservabilityRenderingTests(NodeBuilder, unittest.TestCase):
         self.assertNotIn("metrics", config)
         self.assertNotIn("health", config)
 
+    def test_mining_section_renders_when_a_miner_address_is_set(self):
+        config = tomllib.loads(deploy.render_node_config(self.node(
+            miner_address="tmJymvcUCn1ctbghvTJpXBwHiMEB8P6wxNV",
+        )))
+
+        # getblocktemplate is refused without it, so an external miner on the
+        # fork could never produce a block.
+        self.assertEqual(
+            config["mining"], {"miner_address": "tmJymvcUCn1ctbghvTJpXBwHiMEB8P6wxNV"}
+        )
+
+    def test_internal_miner_renders_with_a_distinct_coinbase_tag(self):
+        config = tomllib.loads(deploy.render_node_config(self.node(
+            miner_address="tmJymvcUCn1ctbghvTJpXBwHiMEB8P6wxNV",
+            internal_miner=True,
+            extra_coinbase_data="nu7-us",
+            build_features=["internal-miner"],
+        )))
+
+        self.assertEqual(config["mining"], {
+            "miner_address": "tmJymvcUCn1ctbghvTJpXBwHiMEB8P6wxNV",
+            "extra_coinbase_data": "nu7-us",
+            "internal_miner": True,
+        })
+
+    def test_mining_section_omitted_when_unset(self):
+        config = tomllib.loads(deploy.render_node_config(self.node()))
+
+        self.assertNotIn("mining", config)
+
     def test_health_renders_independently_of_metrics(self):
         config = tomllib.loads(deploy.render_node_config(self.node(
             health_listen_addr="127.0.0.1:8080",
@@ -228,6 +298,169 @@ class ObservabilityRenderingTests(NodeBuilder, unittest.TestCase):
 
         self.assertNotIn("metrics", config)
         self.assertEqual(config["health"], {"listen_addr": "127.0.0.1:8080"})
+
+
+class TestnetParametersRenderingTests(NodeBuilder, unittest.TestCase):
+    """A configured testnet such as the NU7 fork renders as one `network = { ... }` value."""
+
+    FORK_PARAMS = {
+        "network_name": "Nu7Fork",
+        "network_magic": [0xF0, 0x0D, 0xCA, 0xFE],
+        "checkpoints": True,
+        "initial_nsm_value_balance": 55_768_414_957,
+        "activation_heights": {
+            "BeforeOverwinter": 1,
+            "Overwinter": 207_500,
+            "Sapling": 280_000,
+            "Blossom": 584_000,
+            "Heartwood": 903_800,
+            "Canopy": 1_028_500,
+            "NU5": 1_842_420,
+            "NU6": 2_976_000,
+            "NU6.1": 3_536_500,
+            "NU6.2": 4_052_000,
+            "NU6.3": 4_134_000,
+            "NU7": 4_376_000,
+        },
+    }
+
+    def test_omitted_when_unset(self):
+        config = tomllib.loads(deploy.render_node_config(self.node()))
+
+        self.assertEqual(config["network"]["network"], "Testnet")
+        self.assertNotIn("testnet_parameters", config["network"])
+
+    def test_configured_testnet_replaces_the_public_network_name(self):
+        rendered = deploy.render_node_config(self.node(testnet_parameters=self.FORK_PARAMS))
+        config = tomllib.loads(rendered)
+
+        # zakurad rejects [network.testnet_parameters] beside `network = "Testnet"`,
+        # because the public Testnet's parameters are fixed. The parameters must be
+        # the `network` value itself.
+        self.assertIsInstance(config["network"]["network"], dict)
+        self.assertNotIn("testnet_parameters", config["network"])
+        self.assertNotIn('network = "Testnet"', rendered)
+
+    def test_parameters_on_a_non_testnet_node_are_refused(self):
+        for network in ("Mainnet", "Regtest"):
+            with self.assertRaises(deploy.DeployError, msg=network):
+                deploy.render_node_config(
+                    self.node(network=network, testnet_parameters=self.FORK_PARAMS)
+                )
+
+    def test_fork_parameters_round_trip(self):
+        config = tomllib.loads(deploy.render_node_config(
+            self.node(testnet_parameters=self.FORK_PARAMS)
+        ))
+
+        params = config["network"]["network"]
+        self.assertEqual(params["network_name"], "Nu7Fork")
+        self.assertEqual(params["network_magic"], [240, 13, 202, 254])
+        self.assertEqual(params["initial_nsm_value_balance"], 55_768_414_957)
+        # Genesis-only checkpoints would make the node verify 4M blocks from scratch.
+        self.assertTrue(params["checkpoints"])
+
+    def test_dotted_upgrade_names_are_quoted(self):
+        config = tomllib.loads(deploy.render_node_config(
+            self.node(testnet_parameters=self.FORK_PARAMS)
+        ))
+
+        heights = config["network"]["network"]["activation_heights"]
+        # An unquoted "NU6.1" would parse as a nested table, silently dropping the
+        # height, and a partial list wipes every upgrade above it in the builder.
+        self.assertEqual(heights["NU6.1"], 3_536_500)
+        self.assertEqual(heights["NU7"], 4_376_000)
+        self.assertEqual(len(heights), 12)
+
+    def test_lockbox_disbursements_render_as_an_array_of_tables(self):
+        config = tomllib.loads(deploy.render_node_config(self.node(testnet_parameters={
+            "network_name": "Nu7Fork",
+            "lockbox_disbursements": [{"address": "t2Lockbox", "amount": 0}],
+        })))
+
+        disbursements = config["network"]["network"]["lockbox_disbursements"]
+        self.assertEqual(disbursements, [{"address": "t2Lockbox", "amount": 0}])
+
+    def test_nested_parameters_round_trip_exactly(self):
+        params = {
+            **self.FORK_PARAMS,
+            "lockbox_disbursements": [
+                {"address": "t2Lockbox1", "amount": 78_750_000_000_000},
+                {"address": "t2Lockbox2", "amount": 0},
+            ],
+        }
+        rendered = deploy.render_node_config(self.node(testnet_parameters=params))
+
+        self.assertEqual(tomllib.loads(rendered)["network"]["network"], params)
+        # One inline line: no [network.network] tables that could capture later keys.
+        self.assertNotIn("[network.network", rendered)
+        self.assertIn('"NU6.1" = 3536500', rendered)
+
+    def test_the_fleet_config_round_trips_through_load_nodes(self):
+        params = {**self.FORK_PARAMS,
+                  "lockbox_disbursements": [{"address": "t2Lockbox", "amount": 1}]}
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "nodes.toml"
+            path.write_text(
+                "[defaults]\n"
+                'network = "Testnet"\n'
+                f"testnet_parameters = {deploy.toml_scalar(params)}\n"
+                '[[nodes]]\nname = "node-a"\nssh_string = "root@example"\ncommit = "main"\n'
+            )
+            node = deploy.load_nodes(path, None)[0]
+
+        self.assertEqual(node.testnet_parameters, params)
+        self.assertEqual(
+            tomllib.loads(deploy.render_node_config(node))["network"]["network"], params
+        )
+
+    def test_tables_nested_in_an_array_of_tables_render_inline(self):
+        streams = [{
+            "height_range": {"start": 1, "end": 2},
+            "recipients": [{"receiver": "Deferred", "numerator": 12, "addresses": []}],
+        }]
+        config = tomllib.loads(deploy.render_node_config(self.node(testnet_parameters={
+            "network_name": "Nu7Fork",
+            "funding_streams": streams,
+        })))
+
+        self.assertEqual(config["network"]["network"]["funding_streams"], streams)
+
+    def test_strings_are_escaped(self):
+        name = 'quote " backslash \\ newline \n'
+        config = tomllib.loads(deploy.render_node_config(self.node(testnet_parameters={
+            "network_name": name,
+        })))
+
+        self.assertEqual(config["network"]["network"]["network_name"], name)
+
+    def test_a_null_value_is_refused(self):
+        with self.assertRaises(deploy.DeployError):
+            deploy.render_node_config(self.node(testnet_parameters={"network_name": None}))
+
+    def test_empty_peer_list_renders_for_an_incompatible_testnet(self):
+        config = tomllib.loads(deploy.render_node_config(self.node(
+            testnet_parameters=self.FORK_PARAMS,
+            initial_testnet_peers=[],
+        )))
+
+        # zakurad refuses to load a config that pairs the default public DNS
+        # seeds with parameters incompatible with the public Testnet.
+        self.assertEqual(config["network"]["initial_testnet_peers"], [])
+
+    def test_peer_list_omitted_when_unset(self):
+        config = tomllib.loads(deploy.render_node_config(self.node()))
+
+        self.assertNotIn("initial_testnet_peers", config["network"])
+
+    def test_zakura_block_still_renders_alongside(self):
+        config = tomllib.loads(deploy.render_node_config(self.node(
+            testnet_parameters=self.FORK_PARAMS,
+            zakura={"listen_addr": "0.0.0.0:8234", "bootstrap_peers": ["abc@1.2.3.4:8234"]},
+        )))
+
+        self.assertEqual(config["network"]["zakura"]["listen_addr"], "0.0.0.0:8234")
+        self.assertEqual(config["network"]["network"]["network_name"], "Nu7Fork")
 
 
 class ConfigKeyTests(unittest.TestCase):
@@ -252,6 +485,43 @@ class ConfigKeyTests(unittest.TestCase):
 
             self.assertEqual(nodes[0].health_listen_addr, "127.0.0.1:8080")
 
+    def test_testnet_parameters_is_a_known_key(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self.write_config(tmp, """
+                [defaults.testnet_parameters]
+                network_name = "Nu7Fork"
+
+                [defaults.testnet_parameters.activation_heights]
+                NU7 = 4376000
+
+                [[nodes]]
+                name = "node-a"
+                ssh_string = "root@example"
+                commit = "main"
+            """.replace("                ", ""))
+
+            nodes = deploy.load_nodes(path, None)
+
+            self.assertEqual(
+                nodes[0].testnet_parameters["activation_heights"]["NU7"], 4_376_000
+            )
+
+    def test_internal_miner_requires_an_address_and_the_miner_build(self):
+        for extra in ('build_features = ["internal-miner"]',
+                      'miner_address = "tmJymvcUCn1ctbghvTJpXBwHiMEB8P6wxNV"'):
+            with tempfile.TemporaryDirectory() as tmp:
+                path = self.write_config(tmp, f"""
+                    [[nodes]]
+                    name = "node-a"
+                    ssh_string = "root@example"
+                    commit = "main"
+                    internal_miner = true
+                    {extra}
+                """.replace("                    ", ""))
+
+                with self.assertRaises(deploy.DeployError, msg=extra):
+                    deploy.load_nodes(path, None)
+
     def test_unknown_key_still_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = self.write_config(tmp, """
@@ -266,6 +536,125 @@ class ConfigKeyTests(unittest.TestCase):
 
             with self.assertRaises(deploy.DeployError):
                 deploy.load_nodes(path, None)
+
+
+
+
+class SharedHostStagingTests(unittest.TestCase):
+    """Two nodes on one host, deployed in parallel, must each install their own files."""
+
+    NODES = """
+        [defaults]
+        network = "Testnet"
+        initial_testnet_peers = []
+
+        [[nodes]]
+        name = "fork-1"
+        ssh_string = "root@shared-host"
+        commit = "main"
+        listen_addr = "0.0.0.0:18233"
+
+        [[nodes]]
+        name = "fork-2"
+        ssh_string = "root@shared-host"
+        commit = "main"
+        service_name = "zakurad-fork2"
+        config_path = "/etc/zakura/zakura-fork2.toml"
+        bin_path = "/usr/local/bin/zakurad-fork2"
+        listen_addr = "0.0.0.0:18333"
+    """.replace("        ", "")
+
+    def deploy_in_parallel(self, fail_install_for=None):
+        host_files: dict[str, bytes] = {}
+        installed: dict[str, dict[str, str]] = {}
+        stages: list[str] = []
+        removed: list[str] = []
+        lock = threading.Lock()
+        # Both uploads finish before either install starts, as in the original race.
+        uploaded = threading.Barrier(2, timeout=5)
+
+        def fake_run(cmd, *, cwd=None, capture=False, check=True):
+            if cmd[0] == "ssh" and cmd[-1].startswith("mktemp -d /tmp/zakurad-deploy."):
+                with lock:
+                    stage = f"/tmp/zakurad-deploy.{len(stages):08d}"
+                    stages.append(stage)
+                return mock.Mock(returncode=0, stdout=stage + "\n")
+            if cmd[0] == "ssh" and cmd[-1].startswith("rm -rf -- "):
+                with lock:
+                    removed.append(cmd[-1].removeprefix("rm -rf -- "))
+                    for path in [path for path in host_files
+                                 if path.startswith(removed[-1] + "/")]:
+                        del host_files[path]
+                return mock.Mock(returncode=0, stdout="")
+            if cmd[0] == "scp":
+                local, remote = cmd[-2], cmd[-1].split(":", 1)[1]
+                with lock:
+                    host_files[remote] = Path(local).read_bytes()
+                return mock.Mock(returncode=0, stdout="")
+            raise AssertionError(f"unexpected command: {cmd}")
+
+        def fake_install(node, script):
+            uploaded.wait()
+            stage = re.search(r"^STAGE=(\S+)$", script, re.MULTILINE)[1]
+            config_path = re.search(r"^CONFIG_PATH=(\S+)$", script, re.MULTILINE)[1]
+            with lock:
+                installed[node.name] = {
+                    "config_path": config_path,
+                    "config": host_files[f"{stage}/zakura.toml"].decode(),
+                    "unit": host_files[f"{stage}/zakurad.service"].decode(),
+                    "binary": host_files[f"{stage}/zakurad.new"].decode(),
+                }
+            return mock.Mock(returncode=1 if node.name == fail_install_for else 0)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Path(tmp) / "nodes.toml"
+            config.write_text(self.NODES)
+            binary = Path(tmp) / "zakurad"
+            binary.write_text("binary for main")
+            args = types.SimpleNamespace(config=str(config), node=None, force=False,
+                                         no_restart=False)
+            with mock.patch.dict(os.environ, {deploy.BUILD_CACHE_DIR_ENV: tmp}), \
+                    mock.patch.object(deploy, "build_nodes", side_effect=lambda nodes, force:
+                                      [setattr(n, "sha", "a" * 40) for n in nodes]
+                                      and {"a" * 40: binary}), \
+                    mock.patch.object(deploy, "build_publishers", return_value={}), \
+                    mock.patch.object(deploy, "run", side_effect=fake_run), \
+                    mock.patch.object(deploy, "ssh_with_stdin", side_effect=fake_install):
+                status = deploy.cmd_deploy(args)
+            leftovers = [path.name for path in Path(tmp).iterdir()
+                         if path.name.startswith((".cfg-", ".unit-"))]
+        return status, installed, stages, removed, host_files, leftovers
+
+    def test_each_node_installs_its_own_config_and_unit(self):
+        status, installed, stages, _, _, _ = self.deploy_in_parallel()
+
+        self.assertEqual(status, 0)
+        self.assertEqual(len(set(stages)), 2)
+        self.assertEqual(installed["fork-1"]["config_path"], "/etc/zakura/zakura.toml")
+        self.assertIn('listen_addr = "0.0.0.0:18233"', installed["fork-1"]["config"])
+        self.assertIn("Description=Zakura full node (zakurad)", installed["fork-1"]["unit"])
+        self.assertEqual(installed["fork-2"]["config_path"], "/etc/zakura/zakura-fork2.toml")
+        self.assertIn('listen_addr = "0.0.0.0:18333"', installed["fork-2"]["config"])
+        self.assertIn("Description=Zakura full node (zakurad-fork2)", installed["fork-2"]["unit"])
+
+    def test_staging_is_removed_even_when_an_install_fails(self):
+        status, _, stages, removed, host_files, leftovers = self.deploy_in_parallel(
+            fail_install_for="fork-2")
+
+        self.assertEqual(status, 1)
+        self.assertEqual(sorted(removed), sorted(stages))
+        self.assertEqual(host_files, {})
+        self.assertEqual(leftovers, [])
+
+    def test_install_scripts_read_only_their_staging_directory(self):
+        for script in (deploy.INSTALL_SCRIPT, deploy.PROCESS_INSTALL_SCRIPT,
+                       deploy.BINARY_ONLY_INSTALL_SCRIPT,
+                       deploy.DOCKER_BINARY_ONLY_INSTALL_SCRIPT):
+            self.assertIn("STAGE={stage}", script)
+            host_side = script.replace('"$CONTAINER:/tmp/zakurad-deploy.new"', "")
+            host_side = host_side.split("docker exec --user 0", 1)[0]
+            self.assertNotIn("/tmp/zakurad-deploy.", host_side)
+
 
 
 if __name__ == "__main__":

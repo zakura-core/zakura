@@ -3,7 +3,6 @@
 use std::sync::Arc;
 
 use crossbeam_channel::{Receiver, TryRecvError};
-use hex_literal::hex;
 use itertools::Itertools;
 use tracing::instrument;
 
@@ -96,9 +95,11 @@ fn first_sapling_mainnet_subtree() -> NoteCommitmentSubtree<sapling_crypto::Node
     // ```
     NoteCommitmentSubtree {
         index: 0.into(),
-        root: sapling_crypto::Node::from_bytes(hex!(
-            "754bb593ea42d231a7ddf367640f09bbf59dc00f2c1d2003cc340e0c016b5b13"
-        ))
+        root: sapling_crypto::Node::from_bytes([
+            0x75, 0x4b, 0xb5, 0x93, 0xea, 0x42, 0xd2, 0x31, 0xa7, 0xdd, 0xf3, 0x67, 0x64, 0x0f,
+            0x09, 0xbb, 0xf5, 0x9d, 0xc0, 0x0f, 0x2c, 0x1d, 0x20, 0x03, 0xcc, 0x34, 0x0e, 0x0c,
+            0x01, 0x6b, 0x5b, 0x13,
+        ])
         .expect("test vector is valid"),
         end_height: Height(558822),
     }
@@ -112,10 +113,14 @@ fn first_orchard_mainnet_subtree() -> NoteCommitmentSubtree<orchard::tree::Node>
     // ```
     NoteCommitmentSubtree {
         index: 0.into(),
-        root: hex!("d4e323b3ae0cabfb6be4087fec8c66d9a9bbfc354bf1d9588b6620448182063b")
-            .as_slice()
-            .try_into()
-            .expect("test vector is valid"),
+        root: [
+            0xd4, 0xe3, 0x23, 0xb3, 0xae, 0x0c, 0xab, 0xfb, 0x6b, 0xe4, 0x08, 0x7f, 0xec, 0x8c,
+            0x66, 0xd9, 0xa9, 0xbb, 0xfc, 0x35, 0x4b, 0xf1, 0xd9, 0x58, 0x8b, 0x66, 0x20, 0x44,
+            0x81, 0x82, 0x06, 0x3b,
+        ]
+        .as_slice()
+        .try_into()
+        .expect("test vector is valid"),
         end_height: Height(1707429),
     }
 }

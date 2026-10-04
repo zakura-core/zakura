@@ -101,7 +101,6 @@ skip = [
 # by default infinite
 skip-tree = [
     # wait for criterion and bindgen to update itertools
-    { name = "itertools", version = "0.10" },
     { name = "itertools", version = "0.13" },
 
     # wait for ordered-map to release a dependency fix

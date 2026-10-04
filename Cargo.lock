@@ -5323,28 +5323,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ea06cc588e43c632923a55450401b8f25e628131571d4e1baea1bdfdb2b5ed06"
 
 [[package]]
-name = "spandoc"
-version = "0.2.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "25ed5a886d0234ac48bea41d450e4253cdd0642656249d6454e74c023d0f8821"
-dependencies = [
- "spandoc-attribute",
- "tracing",
- "tracing-futures",
-]
-
-[[package]]
-name = "spandoc-attribute"
-version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5bdfb59103e43a0f99a346b57860d50f2138a7008d08acd964e9ac0fef3ae9a5"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 1.0.109",
-]
-
-[[package]]
 name = "spez"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6086,16 +6064,6 @@ dependencies = [
  "lazy_static",
  "tracing",
  "tracing-subscriber",
-]
-
-[[package]]
-name = "tracing-futures"
-version = "0.2.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "97d095ae15e245a057c8e8451bab9b3ee1e1f68e9ba2b4fbc18d0ac5237835f2"
-dependencies = [
- "pin-project",
- "tracing",
 ]
 
 [[package]]
@@ -7197,7 +7165,6 @@ dependencies = [
  "serde-big-array",
  "serde_json",
  "sha2 0.10.9",
- "spandoc",
  "strum",
  "tempfile",
  "thiserror 2.0.18",
@@ -7246,7 +7213,6 @@ dependencies = [
  "rand 0.8.6",
  "rayon",
  "serde",
- "spandoc",
  "thiserror 2.0.18",
  "tokio",
  "toml 1.1.2+spec-1.1.0",
@@ -7920,7 +7886,6 @@ dependencies = [
  "serde-big-array",
  "serde_json",
  "sha2 0.10.9",
- "spandoc",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
@@ -7939,7 +7904,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-test"
-version = "2.2.0"
+version = "2.2.1"
 dependencies = [
  "color-eyre",
  "futures",
@@ -7954,7 +7919,6 @@ dependencies = [
  "proptest",
  "rand 0.8.6",
  "regex",
- "spandoc",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",

@@ -635,7 +635,6 @@ async fn check_transcripts_test() -> Result<(), Report> {
 }
 
 #[allow(dead_code)]
-#[spandoc::spandoc]
 async fn check_transcripts() -> Result<(), Report> {
     let _init_guard = zakura_test::init();
 

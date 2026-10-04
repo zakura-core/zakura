@@ -488,7 +488,6 @@ impl<T> TestChild<T> {
     ///
     /// On Windows (and possibly macOS), this function can return `Ok` for
     /// processes that have panicked. See #1781.
-    #[spandoc::spandoc]
     pub fn kill(&mut self, ignore_exited: bool) -> Result<()> {
         let child = match self.child.as_mut() {
             Some(child) => child,
@@ -509,13 +508,18 @@ impl<T> TestChild<T> {
             }
         };
 
-        /// SPANDOC: Killing child process
-        let kill_result = child.kill().or_else(|error| {
-            if ignore_exited && error.kind() == ErrorKind::InvalidInput {
-                Ok(())
-            } else {
-                Err(error)
-            }
+        let kill_result = tracing::error_span!(
+            "kill::comment",
+            text = %"Killing child process"
+        )
+        .in_scope(|| {
+            child.kill().or_else(|error| {
+                if ignore_exited && error.kind() == ErrorKind::InvalidInput {
+                    Ok(())
+                } else {
+                    Err(error)
+                }
+            })
         });
 
         kill_result.context_from(self.as_mut())?;
@@ -717,7 +721,6 @@ impl<T> TestChild<T> {
     ///
     /// Returns an error if the child has already been taken.
     /// TODO: return an error if both outputs have already been taken.
-    #[spandoc::spandoc]
     pub fn wait_with_output(mut self) -> Result<TestOutput<T>> {
         let child = match self.child.take() {
             Some(child) => child,
@@ -749,10 +752,15 @@ impl<T> TestChild<T> {
         };
          */
 
-        /// SPANDOC: waiting for command to exit
-        let output = child.wait_with_output().with_section({
-            let cmd = self.cmd.clone();
-            || cmd.header("Command:")
+        let output = tracing::error_span!(
+            "wait_with_output::comment",
+            text = %"waiting for command to exit"
+        )
+        .in_scope(|| {
+            child.wait_with_output().with_section({
+                let cmd = self.cmd.clone();
+                || cmd.header("Command:")
+            })
         })?;
 
         Ok(TestOutput {

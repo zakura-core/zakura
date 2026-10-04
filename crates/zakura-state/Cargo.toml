@@ -90,7 +90,6 @@ zakura-header-chain = { path = "../zakura-header-chain", version = "4.0.1", feat
 color-eyre = { workspace = true }
 
 once_cell = { workspace = true }
-spandoc = { workspace = true }
 toml = { workspace = true }
 
 hex = { workspace = true, features = ["serde"] }

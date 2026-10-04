@@ -135,7 +135,6 @@ criterion = { workspace = true, features = ["html_reports"] }
 
 # Error Handling & Formatting
 color-eyre = { workspace = true }
-spandoc = { workspace = true }
 
 # Make the optional testing dependencies required
 proptest = { workspace = true }

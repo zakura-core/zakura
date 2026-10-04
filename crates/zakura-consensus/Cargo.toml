@@ -87,7 +87,6 @@ color-eyre = { workspace = true }
 hex = { workspace = true }
 proptest = { workspace = true }
 proptest-derive = { workspace = true }
-spandoc = { workspace = true }
 toml = { workspace = true }
 
 tokio = { workspace = true, features = ["full", "tracing", "test-util"] }

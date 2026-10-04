@@ -354,18 +354,6 @@ impl ZakuraDb {
         self.db.zs_forward_range_iter(&sapling_trees, range)
     }
 
-    /// Returns the Sapling note commitment trees in the reversed range, in decreasing height order.
-    pub fn sapling_tree_by_reversed_height_range<R>(
-        &self,
-        range: R,
-    ) -> impl Iterator<Item = (Height, Arc<sapling::tree::NoteCommitmentTree>)> + '_
-    where
-        R: std::ops::RangeBounds<Height>,
-    {
-        let sapling_trees = self.db.cf_handle("sapling_note_commitment_tree").unwrap();
-        self.db.zs_reverse_range_iter(&sapling_trees, range)
-    }
-
     /// Returns the Sapling note commitment subtree at this `index`.
     ///
     /// # Correctness
@@ -507,18 +495,6 @@ impl ZakuraDb {
     {
         let orchard_trees = self.db.cf_handle("orchard_note_commitment_tree").unwrap();
         self.db.zs_forward_range_iter(&orchard_trees, range)
-    }
-
-    /// Returns the Orchard note commitment trees in the reversed range, in decreasing height order.
-    pub fn orchard_tree_by_reversed_height_range<R>(
-        &self,
-        range: R,
-    ) -> impl Iterator<Item = (Height, Arc<orchard::tree::NoteCommitmentTree>)> + '_
-    where
-        R: std::ops::RangeBounds<Height>,
-    {
-        let orchard_trees = self.db.cf_handle("orchard_note_commitment_tree").unwrap();
-        self.db.zs_reverse_range_iter(&orchard_trees, range)
     }
 
     /// Returns the Orchard note commitment subtree at this `index`.

@@ -3382,3 +3382,97 @@ async fn await_block_info_waits_for_a_valid_retry_after_rejection() {
         Response::BlockInfo(Some(_))
     ));
 }
+
+/// A checkpoint body that fails its authorizing data commitment must not strand its
+/// descendants behind a closed channel.
+///
+/// From NU5, a peer can serve a canonical header with altered authorizing data, so the
+/// failure does not make the header or its descendants invalid. The writer fails the dropped
+/// descendants with a retryable error that names the ancestor, so the syncer can request them
+/// again instead of restarting. The next block at the right height clears that state.
+#[tokio::test(flavor = "multi_thread")]
+async fn rejected_checkpoint_body_fails_descendants_with_a_retryable_error() {
+    use crate::tests::FakeChainHelper;
+    use zakura_chain::{
+        block::{ChainHistoryBlockTxAuthCommitmentHash, CHAIN_HISTORY_ACTIVATION_RESERVED},
+        parameters::testnet::{ConfiguredActivationHeights, RegtestParameters},
+    };
+
+    let _init_guard = zakura_test::init();
+    let network = Network::new_regtest(RegtestParameters {
+        activation_heights: ConfiguredActivationHeights {
+            nu5: Some(1),
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+    let (mut state, _, _, _) = StateService::new(Config::ephemeral(), &network, Height(10), 0)
+        .await
+        .expect("the ephemeral state opens");
+    let limit = Duration::from_secs(10);
+
+    let genesis = block::genesis::regtest_genesis_block();
+    let honest = genesis.make_fake_child();
+    let commitment: [u8; 32] = ChainHistoryBlockTxAuthCommitmentHash::from_commitments(
+        &CHAIN_HISTORY_ACTIVATION_RESERVED.into(),
+        &honest.auth_data_root(),
+    )
+    .into();
+    let honest = honest.set_block_commitment(commitment);
+    let forged = genesis.make_fake_child().set_block_commitment([0x42; 32]);
+    let descendant = forged.make_fake_child();
+
+    timeout(
+        limit,
+        (&mut state).oneshot(Request::CommitCheckpointVerifiedBlock(genesis.into())),
+    )
+    .await
+    .expect("the genesis commit completes")
+    .expect("genesis commits");
+
+    let forged_hash = forged.hash();
+    let forged_commit = state
+        .ready()
+        .await
+        .expect("the state is ready")
+        .call(Request::CommitCheckpointVerifiedBlock(forged.into()));
+    let descendant_commit = state
+        .ready()
+        .await
+        .expect("the state is ready")
+        .call(Request::CommitCheckpointVerifiedBlock(descendant.into()));
+
+    let forged_error = timeout(limit, forged_commit)
+        .await
+        .expect("the forged commit completes")
+        .expect_err("the forged body fails its commitment");
+    let forged_error = forged_error
+        .downcast_ref::<crate::CommitCheckpointVerifiedError>()
+        .expect("checkpoint commits fail with the checkpoint error type");
+    assert!(
+        forged_error.is_auth_commitment_mismatch(),
+        "{forged_error:?}"
+    );
+
+    let descendant_error = timeout(limit, descendant_commit)
+        .await
+        .expect("the descendant commit completes")
+        .expect_err("the descendant cannot commit without its parent");
+    let descendant_error = descendant_error
+        .downcast_ref::<crate::CommitCheckpointVerifiedError>()
+        .expect("checkpoint commits fail with the checkpoint error type");
+    assert_eq!(
+        descendant_error.inner(),
+        &CommitBlockError::ValidateContextError(Box::new(
+            ValidateContextError::AncestorBodyRejected(forged_hash)
+        )),
+    );
+
+    timeout(
+        limit,
+        (&mut state).oneshot(Request::CommitCheckpointVerifiedBlock(honest.into())),
+    )
+    .await
+    .expect("the honest commit completes")
+    .expect("the honest body for the same height commits");
+}

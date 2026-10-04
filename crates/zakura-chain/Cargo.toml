@@ -1,6 +1,6 @@
 [package]
 name = "zakura-chain"
-version = "9.0.0"
+version = "10.0.0"
 authors.workspace = true
 description = "Core Zcash data structures for the Zakura node. Internal crate, published to support cargo install zakura"
 license.workspace = true
@@ -47,7 +47,7 @@ bench = ["zakura-test"]
 
 [dependencies]
 
-derive-getters = { workspace = true, features = ["auto_copy_getters"] }
+getset = { workspace = true }
 lazy_static = { workspace = true }
 tempfile = { workspace = true }
 bitvec = { workspace = true }
@@ -101,7 +101,6 @@ tracing = { workspace = true }
 # Serialization
 hex = { workspace = true, features = ["serde"] }
 serde = { workspace = true, features = ["serde_derive", "rc"] }
-serde_with = { workspace = true }
 serde-big-array = { workspace = true }
 
 # Processing
@@ -125,16 +124,17 @@ tokio = { workspace = true, optional = true }
 proptest = { workspace = true, optional = true }
 proptest-derive = { workspace = true, optional = true }
 
-zakura-test = { path = "../zakura-test/", version = "2.2.0", optional = true }
+zakura-test = { path = "../zakura-test/", version = "3.0.0", optional = true }
 bounded-vec = { version = "0.9.0", features = ["serde"] }
 
 [dev-dependencies]
+serde_json = { workspace = true }
+
 # Benchmarks
 criterion = { workspace = true, features = ["html_reports"] }
 
 # Error Handling & Formatting
 color-eyre = { workspace = true }
-spandoc = { workspace = true }
 
 # Make the optional testing dependencies required
 proptest = { workspace = true }
@@ -147,7 +147,7 @@ rand_core_10 = { workspace = true }
 
 tokio = { workspace = true, features = ["full", "tracing", "test-util"] }
 
-zakura-test = { path = "../zakura-test/", version = "2.2.0" }
+zakura-test = { path = "../zakura-test/", version = "3.0.0" }
 
 [[bench]]
 name = "block"

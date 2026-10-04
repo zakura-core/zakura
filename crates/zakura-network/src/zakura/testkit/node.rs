@@ -293,12 +293,6 @@ impl ZakuraTestNodeBuilder {
         self
     }
 
-    /// Advertise an additional service id in this node's discovery self-record.
-    pub fn add_advertised_service(mut self, service: ZakuraServiceId) -> Self {
-        self.extra_advertised_services.push(service);
-        self
-    }
-
     /// Override local limits.
     pub fn limits(mut self, limits: ZakuraLocalLimits) -> Self {
         self.limits = limits;
@@ -367,24 +361,6 @@ impl ZakuraTestNodeBuilder {
             best_header_tip,
             verified_block_tip_hash: anchor.1,
             state_driver: None,
-        });
-        self
-    }
-
-    /// Enable the real header-sync service with direct typed state dispatch.
-    pub fn header_sync_state_driver(
-        mut self,
-        network: Network,
-        anchor: (block::Height, block::Hash),
-        state_driver: ZakuraHeaderSyncDriverStartup,
-    ) -> Self {
-        self.header_sync = Some(TestHeaderSyncStartup {
-            network,
-            anchor,
-            frontiers: state_driver.frontiers,
-            best_header_tip: state_driver.best_header_tip,
-            verified_block_tip_hash: state_driver.verified_block_tip_hash,
-            state_driver: Some(state_driver),
         });
         self
     }

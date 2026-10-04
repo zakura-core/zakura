@@ -55,8 +55,9 @@ pub struct Config {
 
     /// Mine blocks using Zakura's internal miner, without an external mining pool or equihash solver.
     ///
-    /// This experimental feature is only supported on regtest as it uses null solutions and skips checking
-    /// for a valid Proof of Work.
+    /// Requires a `zakurad` built with the experimental `internal-miner` feature, which solves
+    /// Equihash with one low-priority thread. Miners that share a `miner_address` should set
+    /// distinct `extra_coinbase_data`, so they do not search identical work.
     ///
     /// The internal miner is off by default.
     #[serde(default)]

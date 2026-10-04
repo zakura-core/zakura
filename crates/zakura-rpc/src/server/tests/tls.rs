@@ -74,6 +74,7 @@ impl TestTlsListener {
     }
 
     async fn ping(&self) -> reqwest::Client {
+        crate::indexer::server::install_tls_crypto_provider();
         let client = reqwest::Client::builder()
             .tls_certs_only([reqwest::Certificate::from_pem(HANDSHAKE_CERT.as_bytes()).unwrap()])
             .resolve("localhost", self.address)

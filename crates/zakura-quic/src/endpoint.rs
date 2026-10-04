@@ -16,6 +16,7 @@ use noq::{PathId, Runtime, VarInt};
 use tokio::{sync::watch, task::JoinSet};
 
 use crate::{
+    admission::{Admission, ConnectionAttempt},
     config::{QuicBindConfig, QuicConfig},
     conn::{self, BanCheck, Conn, ConnObserver, OpenPaths},
     error::{BindError, ConnectError},
@@ -113,6 +114,7 @@ struct Inner {
     transport: Arc<noq::TransportConfig>,
     sockets: Vec<SocketSlot>,
     pending: PendingTable,
+    admission: Admission,
     shutdown: watch::Sender<bool>,
     serve: Mutex<Option<Arc<dyn Acceptor>>>,
     observer: Mutex<Option<ConnObserver>>,
@@ -159,6 +161,12 @@ impl QuicEndpoint {
         if bind.addrs.is_empty() {
             return Err(BindError::NoAddress);
         }
+        if bind.max_inbound_connections == 0
+            || bind.max_inbound_connections > bind.max_connections
+            || bind.max_connections > tokio::sync::Semaphore::MAX_PERMITS
+        {
+            return Err(BindError::ConnectionLimits);
+        }
         let runtime: Arc<dyn Runtime> = Arc::new(noq::TokioRuntime);
         let (shutdown, _) = watch::channel(false);
         let mut sockets = Vec::with_capacity(bind.addrs.len());
@@ -187,6 +195,7 @@ impl QuicEndpoint {
             transport: Arc::new(config.transport_config(bind.max_bidi_streams)),
             sockets,
             pending: PendingTable::default(),
+            admission: Admission::new(bind.max_connections, bind.max_inbound_connections),
             shutdown,
             serve: Mutex::new(None),
             observer: Mutex::new(None),
@@ -326,7 +335,7 @@ impl QuicEndpoint {
                 }
                 metrics::counter!("zakura.quic.dial.attempts").increment(1);
                 let started = Instant::now();
-                let result = dial_once(&endpoint, client, target, deadline).await;
+                let result = dial_once(self, &endpoint, client, target, deadline).await;
                 record_handshake(&result, started);
                 (target, result)
             });
@@ -382,6 +391,18 @@ impl QuicEndpoint {
                 .unwrap_or_else(PoisonError::into_inner)
                 .take();
         }
+    }
+
+    /// Counts every accepted or dialed transport until noq reports it drained.
+    /// Construction is serialized separately so concurrent sockets cannot each
+    /// spend the same last slot. Counts may only decrease during that check.
+    fn open_connections(&self) -> usize {
+        self.inner
+            .sockets
+            .iter()
+            .filter_map(SocketSlot::endpoint)
+            .map(|socket| socket.open_connections())
+            .fold(0usize, usize::saturating_add)
     }
 
     /// Picks the socket to dial `target` from: same family, and loopback for
@@ -694,6 +715,12 @@ async fn accept_loop(
         // This strong handle lives for one attempt only; the handshake task
         // gets the weak one (API-7).
         let endpoint = QuicEndpoint { inner };
+        let _construction = endpoint
+            .inner
+            .admission
+            .construction
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         let info = IncomingInfo {
             remote: canonical_addr(incoming.remote_address()),
             validated: incoming.remote_address_validated(),
@@ -707,6 +734,15 @@ async fn accept_loop(
         tracing::trace!(target: "zakura_quic", remote = %info.remote, ?decision, "incoming");
         match decision {
             Admit::Accept => {
+                let Ok(reservation) = endpoint
+                    .inner
+                    .admission
+                    .reserve(true, endpoint.open_connections())
+                else {
+                    metrics::counter!("zakura.quic.incoming.refused").increment(1);
+                    incoming.refuse();
+                    continue;
+                };
                 // ADM-7: count the handshake from Accept until it finishes.
                 let pending = endpoint.inner.pending.enter(info.remote.ip());
                 match incoming.accept() {
@@ -715,7 +751,7 @@ async fn accept_loop(
                         tasks.spawn(handshake(
                             weak.clone(),
                             endpoint.inner.config.handshake_timeout(),
-                            connecting,
+                            ConnectionAttempt::new(connecting, reservation),
                             info.remote,
                             pending,
                             acceptor.clone(),
@@ -782,7 +818,7 @@ fn decide(config: &QuicConfig, acceptor: &dyn Acceptor, info: &IncomingInfo) -> 
 async fn handshake(
     weak: Weak<Inner>,
     deadline: Option<Duration>,
-    connecting: noq::Connecting,
+    connecting: ConnectionAttempt,
     remote: SocketAddr,
     pending: PendingGuard,
     acceptor: Arc<dyn Acceptor>,
@@ -820,12 +856,28 @@ async fn handshake(
 }
 
 async fn dial_once(
-    endpoint: &noq::Endpoint,
+    endpoint: &QuicEndpoint,
+    socket: &noq::Endpoint,
     client: noq::ClientConfig,
     target: SocketAddr,
     deadline: Option<Duration>,
 ) -> Result<noq::Connection, ConnectError> {
-    let connecting = endpoint.connect_with(client, target, tls::UNSENT_SERVER_NAME)?;
+    let connecting = {
+        let _construction = endpoint
+            .inner
+            .admission
+            .construction
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let reservation = endpoint
+            .inner
+            .admission
+            .reserve(false, endpoint.open_connections())?;
+        ConnectionAttempt::new(
+            socket.connect_with(client, target, tls::UNSENT_SERVER_NAME)?,
+            reservation,
+        )
+    };
     match deadline {
         Some(deadline) => match tokio::time::timeout(deadline, connecting).await {
             Ok(result) => result.map_err(ConnectError::from_handshake),

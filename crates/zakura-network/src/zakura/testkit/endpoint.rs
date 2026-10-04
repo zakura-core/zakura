@@ -16,6 +16,8 @@ const DEFAULT_TEST_MAX_BIDI_STREAMS: u32 = 100;
 pub struct LocalEndpointFactory {
     quic: QuicConfig,
     max_bidi_streams: u32,
+    max_connections: usize,
+    max_inbound_connections: usize,
 }
 
 impl LocalEndpointFactory {
@@ -24,6 +26,8 @@ impl LocalEndpointFactory {
         Self {
             quic: QuicConfig::default(),
             max_bidi_streams: DEFAULT_TEST_MAX_BIDI_STREAMS,
+            max_connections: 256,
+            max_inbound_connections: 224,
         }
     }
 
@@ -32,6 +36,8 @@ impl LocalEndpointFactory {
         Self {
             quic: limits.quic.clone(),
             max_bidi_streams: u32::from(limits.max_open_streams),
+            max_connections: limits.max_connections,
+            max_inbound_connections: limits.quic_bind_config(Vec::new()).max_inbound_connections,
         }
     }
 
@@ -67,6 +73,8 @@ impl LocalEndpointFactory {
         let bind = QuicBindConfig {
             addrs: vec![SocketAddr::from((Ipv4Addr::LOCALHOST, 0))],
             max_bidi_streams: self.max_bidi_streams,
+            max_connections: self.max_connections,
+            max_inbound_connections: self.max_inbound_connections,
         };
         Ok(QuicEndpoint::bind(
             Self::secret_key(seed),

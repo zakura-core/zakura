@@ -56,6 +56,8 @@ impl QuicNode {
         let bind = QuicBindConfig {
             addrs: addrs.to_vec(),
             max_bidi_streams: 1024,
+            max_connections: 256,
+            max_inbound_connections: 224,
         };
         let endpoint = QuicEndpoint::bind(NodeSecretKey::from_bytes(&secret), &bind, &config)?;
         let (tx, rx) = mpsc::unbounded_channel();

@@ -23,6 +23,9 @@ pub enum ConnectError {
     /// The dialed node ID is this endpoint's own (DIAL-1).
     #[error("refusing to dial this node's own ID")]
     SelfDial,
+    /// Local transport capacity is still occupied, possibly by draining connections.
+    #[error("local QUIC connection capacity is full")]
+    Capacity,
     /// No address shares a family with a bound socket (DIAL-2).
     #[error("no dialable address: none matches a bound socket's address family")]
     NoUsableAddress,
@@ -82,7 +85,7 @@ impl ConnectError {
             Self::Transport(_) => 3,
             Self::HandshakeTimeout => 2,
             Self::Endpoint(_) | Self::Tls(_) => 1,
-            Self::SelfDial | Self::NoUsableAddress => 0,
+            Self::SelfDial | Self::NoUsableAddress | Self::Capacity => 0,
         }
     }
 }
@@ -97,6 +100,9 @@ pub enum BindError {
     /// No bind address was given.
     #[error("no bind address configured")]
     NoAddress,
+    /// Connection limits must be nonzero, with inbound no larger than total.
+    #[error("invalid QUIC connection limits")]
+    ConnectionLimits,
     /// A socket failed to bind or configure.
     #[error("failed to bind {addr}: {source}")]
     Socket {

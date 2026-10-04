@@ -17,6 +17,7 @@ mod tls;
 pub use key::{KeyParsingError, NodeAddr, NodeId, NodeSecretKey, SignatureError, KEY_LENGTH};
 pub use tls::TlsConfigError;
 
+mod admission;
 mod config;
 mod conn;
 mod endpoint;

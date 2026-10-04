@@ -505,6 +505,8 @@ impl ZakuraLocalLimits {
         QuicBindConfig {
             addrs,
             max_bidi_streams: u32::from(self.max_open_streams),
+            max_connections: self.max_connections,
+            max_inbound_connections: inbound_capacity(self.max_connections),
         }
     }
 }
@@ -2127,6 +2129,7 @@ pub struct ZakuraProtocolHandler {
     next_stream_id: Arc<AtomicU64>,
     admission: Arc<Semaphore>,
     pending_handshakes: Arc<Semaphore>,
+    inbound_handshakes: Arc<Semaphore>,
     shutdown: CancellationToken,
     // Bound endpoint identity, used for connection collision handling.
     local_node_id: Option<NodeId>,
@@ -2223,6 +2226,9 @@ impl ZakuraProtocolHandler {
             next_stream_id: Arc::new(AtomicU64::new(random_stream_session_seed())),
             admission: Arc::new(Semaphore::new(limits.max_connections)),
             pending_handshakes: Arc::new(Semaphore::new(limits.max_pending_handshakes)),
+            inbound_handshakes: Arc::new(Semaphore::new(inbound_capacity(
+                limits.max_pending_handshakes,
+            ))),
             shutdown: CancellationToken::new(),
             limits,
             local_node_id: None,
@@ -2349,6 +2355,13 @@ impl ZakuraProtocolHandler {
         remote_peer_id: &ZakuraPeerId,
         conn: &ZakuraConnTrace,
     ) -> Result<NativeHandshakeNegotiated, ZakuraHandlerError> {
+        let Ok(_inbound) = self.inbound_handshakes.clone().try_acquire_owned() else {
+            connection.close(
+                VarInt::from_u32(ZAKURA_CLOSE_RESOURCE),
+                b"pending handshake",
+            );
+            return Err(ZakuraHandlerError::ResourceLimit("pending handshake"));
+        };
         let Ok(_handshake) = self.pending_handshakes.clone().try_acquire_owned() else {
             metrics::counter!("zakura.p2p.conn.rejected.pending_handshake").increment(1);
             conn.trace_connection(
@@ -3564,6 +3577,13 @@ impl Acceptor for ZakuraProtocolHandler {
             .ip_at_capacity(incoming.remote.ip(), incoming.pending_from_ip)
         {
             metrics::counter!("zakura.p2p.conn.rejected.per_ip").increment(1);
+            return Admit::Refuse;
+        }
+        let inbound_limit = inbound_capacity(self.limits.max_pending_handshakes);
+        let inbound_control =
+            inbound_limit.saturating_sub(self.inbound_handshakes.available_permits());
+        if incoming.pending_total.saturating_add(inbound_control) >= inbound_limit {
+            metrics::counter!("zakura.p2p.conn.rejected.pending_handshake").increment(1);
             return Admit::Refuse;
         }
         let control_handshakes = self
@@ -11111,5 +11131,16 @@ mod tests {
 
         server_ep.shutdown().await;
         Ok(())
+    }
+}
+
+/// Reserve one eighth for outbound progress within the existing total.
+/// A single configured slot remains shared in either direction.
+fn inbound_capacity(total: usize) -> usize {
+    let total = total.max(1);
+    if total == 1 {
+        total
+    } else {
+        total - (total / 8).max(1)
     }
 }

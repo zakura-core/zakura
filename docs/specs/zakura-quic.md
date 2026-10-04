@@ -246,9 +246,26 @@ work. Stage 2 runs after TLS proves the `NodeId` and is today's Zakura logic.
 - **ADM-7.** A pending handshake counts against its IP and against the endpoint
   from `Accept` until the handshake completes or fails.
 - **ADM-8.** An established connection counts against its admitted IP until
-  `Conn::closed()` resolves. The slot MUST NOT be released earlier. (Q5: if the
-  noq connection-lifetime hook from #1179 lands, release follows noq's state
-  release instead.)
+  `Conn::closed()` resolves. The IP slot MUST NOT be released earlier. The
+  aggregate owner slot additionally follows the transport state under ADM-11.
+  Failed handshakes remain aggregate charged through drain, without requiring
+  their source IP to stay charged after the handshake ends.
+- **ADM-11.** Before constructing an accepted or dialed connection, the endpoint
+  MUST reserve an owner slot and check the sum of `open_connections()` across
+  every bound socket. Construction and both checks MUST be serialized across
+  sockets and directions. Each budget is bounded by `max_connections`.
+  The transport count includes failed and cancelled attempts through drain.
+  An owner slot follows the connecting future, then the successful connection's
+  weak handle until `is_alive()` is false, including unread streams after drain.
+  The two sets overlap, but their union is bounded by twice `max_connections`.
+  With the default 256 slots, at most 512 transport states can remain allocated.
+  Incoming packet buffers before acceptance remain separately bounded by ADM-5.
+- **ADM-12.** Inbound admission MUST leave one eighth of each connection budget
+  for outbound attempts, rounding the reserve up to at least one slot. With one
+  configured slot, either direction may use it. The same rule applies to the
+  existing control-handshake budget. Defaults allow 224 of 256 connection slots
+  and 28 of 32 control-handshake slots to inbound traffic. Outbound traffic MAY
+  use all unused slots. Closing or timing out MUST NOT bypass ADM-11.
 - **ADM-9.** After the handshake, `Acceptor::handle` receives a `Conn` whose
   `remote_id()` is proven. Stage 2 (control hello, per-identity dedup, cohort
   check) stays in `zakura-network` and doesn't change.

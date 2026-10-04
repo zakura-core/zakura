@@ -381,6 +381,12 @@ pub struct QuicBindConfig {
     pub addrs: Vec<SocketAddr>,
     /// Concurrent bidirectional streams per connection (WIRE-8).
     pub max_bidi_streams: u32,
+    /// Maximum entries across all noq connection tables, and independently the
+    /// maximum pending or retained connection owners. Together they bound live
+    /// transport states by twice this value, including failed attempts.
+    pub max_connections: usize,
+    /// Inbound ceiling for each budget. The remainder stays available to dials.
+    pub max_inbound_connections: usize,
 }
 
 #[cfg(test)]

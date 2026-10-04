@@ -7,9 +7,9 @@ open for public participation.
 The fork is an ordinary configured testnet. `testnet::Parameters::build()`
 already _is_ the public Testnet — genesis hash, magic, every activation height
 through NU6.3, funding streams, the NU6.1 lockbox disbursements, the Orchard
-soft-fork height and the checkpoint list. The fork overrides three things: its
-name, its network magic, and the NU7 activation height. Everything else is
-inherited, which is why the tooling here is small.
+soft-fork height and the checkpoint list. The fork overrides its name, network
+magic, and NU7 activation height, and sets the initial NSM balance from the seed.
+Earlier consensus parameters are inherited.
 
 Its chain state is seeded from a real Testnet cache, so it carries genuine
 pre-NU7 history and the measured NSM value balance rather than starting empty.
@@ -21,7 +21,7 @@ running node's configuration and checked against its RPC upgrade list; these
 values are not maintained separately in the website. V2 balances and
 transactions do not carry over; use a fresh cache.
 
-### `Nu7StagingV3` facts
+## `Nu7StagingV3` facts
 
 The September 30, 2026 reset launched the current network. These facts are its
 identity; a later redeploy must preserve them, and a new fork must change the name,
@@ -37,13 +37,6 @@ magic and snapshot URL.
 | Participant config digest | `12c94fe866bf4de38e187aba6526b5623559db82b55de1cc6e3960d503835ce1` |
 | Bootstrap snapshot | immutable; see [One-time bootstrap snapshot](#one-time-bootstrap-snapshot) |
 
-All five validators and an independently restored participant agreed on that
-activation hash. The validators are the primary and a local observer on
-`167.99.146.155`, and remote miners in San Francisco (`134.199.239.83`), Amsterdam
-(`157.245.69.251`) and Singapore (`165.22.255.181`). Each host keeps
-`/root/nu7-v3-rollback` with the V2 executables, configuration and units; V2 chain
-directories and faucet claims are retained, and V2 claims are never replayed.
-
 **Compatibility.** Main's PR #1209 requires a gap of more than 450 seconds, from
 the configured NU7 activation, before a Testnet block may use minimum difficulty.
 `Nu7StagingV2` activated at 4,398,756 (hash
@@ -52,15 +45,6 @@ minimum-difficulty block 151 seconds after its parent, so its history is invalid
 under current rules. It must not be upgraded in place: use a separately
 identified fork from a preserved pre-NU7 seed, or first design and review an
 explicit consensus migration. V3 was launched under the 450-second rule.
-
-After a reset, publish the manifest with `publish_network.py --help`. Supply the
-built binary's exact revision, explicit public peers, the recorded `seed-tip.json`,
-and snapshot metadata (see the one-time snapshot below). Archive only the
-stopped seed's
-`state` and `non_finalized_state` directories, renaming the Testnet subdirectories
-to the lowercased fork name. Participants extract that archive into `nu7-state`.
-The Caddy configuration exposes `/v1/network`, `/v1/config`, and the snapshot;
-`https://zakura.com` may fetch the manifest and status via CORS.
 
 ## One-time bootstrap snapshot
 
@@ -169,11 +153,10 @@ a template is withdrawn. Testnet long polling hands out minimum-difficulty work
 once the 450-second gap has passed, so no miner waits for the gap deliberately.
 
 The internal miner runs **one solver thread per node**, at the lowest thread
-priority, so validation on the same host takes precedence. Today's fork has four
-mining nodes: the primary and the US, EU and AP nodes. The primary's former second
-miner process is inactive and is not replaced; adding mining capacity means adding
-mining nodes, not threads. Miners that share one miner address must render
-distinct `extra_coinbase_data`. Each solver starts from the same nonce, so only a
+priority, so validation on the same host takes precedence. Adding mining capacity
+means adding mining nodes. The rendered fleet config is the source of truth for
+the participating nodes. Miners sharing an address must render distinct
+`extra_coinbase_data`. Each solver starts from the same nonce, so only a
 different coinbase transaction keeps two nodes from repeating each other's work.
 `fork.py` tags each node with its name.
 
@@ -183,67 +166,34 @@ average; the dashboard's median is a different statistic. Observe at least one
 102-block DAA window before judging whether the miners sustain the target without
 the Testnet minimum-difficulty fallback.
 
-## Geographic miners on the running fork
+## Remote miners
 
-Three additional validating nodes mine in SFO3, AMS3, and SGP1. Each is a
-DigitalOcean `s-1vcpu-2gb` Droplet (1 shared vCPU, 2 GiB RAM, 50 GiB disk;
-$12/month), assigned to the `zakura-testnet` project. The primary on the NYC1
-fork host also mines. The remote nodes use the same pinned source revision,
-network magic, activation heights, and NSM seed, with different P2P peers and
-coinbase tags. Their RPC servers bind only to localhost. Their single solver
-thread runs at the lowest priority, so it yields the shared vCPU to validation.
-Deploy the same revision and network parameters to every participant; changing
-consensus requires a coordinated new run.
+Each `[[remote]]` entry renders another validating node with the internal miner,
+the primary's network parameters and miner address, and distinct P2P peers and
+coinbase tags. `deploy.py` installs the binary and configuration but does not
+copy chain state. A new host must restore a consistent copy of the matching
+fork's `state` and `non_finalized_state` before its first deployment: pruned
+peers cannot supply the inherited history to an empty node.
 
-Each remote miner is a `[[remote]]` entry in the fork config. `fork.py` renders
-it as one more deployer node, so `deploy.py` installs the same binary, its config
-and the deployer's standard `zakurad.service` template, exactly as on the primary.
-The node inherits the primary's paths, ports, fork parameters and miner address
-from the rendered `[defaults]`; only its host, P2P peers and coinbase tag differ.
-`deploy.py` does not copy chain state, so a new remote host needs restored state
-(below) before its first deploy. Mining to a shared address keeps the spending
-key off every remote host. The dashboard attributes **accepted
-submissions**, not canonical blocks, from each node's log; a reorg may
-displace an accepted block. Each remote miner has its own full node and
-`miner/remote-status.py` reports service health, tip, NU7 branch ID, and the
-internal miner's accepted blocks over 24 hours, read from the node's log file.
-The primary's status collector polls those endpoints, using each node's
-`monitor.status_url` from the same rendered fleet config, requires a fresh report
-on the same chain within two blocks of the primary, and exposes the result in
-`/v1/status`. The health service runs as a transient unprivileged user with no
-journal access, serves at most four requests at once, shares one node sample per
-five seconds, and times out stalled clients. Only the primary may reach port 8094:
-the DigitalOcean firewall allows it from the primary host alone, and the unit's
-`IPAddressDeny=any` with the `miner/collector-allowlist.conf` drop-in adds the
-same allowlist on each host. systemd ignores those directives unless it was built
-with `+BPF_FRAMEWORK`, so on hosts without it an nftables rule admitting port
-8094 only from the primary takes their place; a refused request from any other
-host is the check. P2P port 18233 is public. No GitHub SSH key is
-stored on the remote hosts.
+For a replacement host, stop an observer while archiving those directories,
+verify the archive hash after transfer, and restore it before running `fork.py
+render` and `fork.py deploy`. Update the peer lists, collector URL and published
+join config if its address changes. Confirm matching hashes at a common height
+before enabling mining; the spending key stays off the remote host.
 
-For a replacement host, stop a local observer briefly to archive its `state`
-and `non_finalized_state` directories consistently. Verify the archive hash
-after transfer before extraction. Add the host as a `[[remote]]` entry and deploy
-it with `fork.py render` and `fork.py deploy`. Install the
-`zakura-nu7-miner-status.service` unit with its `collector-allowlist.conf` drop-in,
-and apply `miner/99-zakura-nu7.conf` for prompt block propagation. Start the status service, then confirm its reported
-hash agrees with the primary at the same height. Re-render the fleet config if the replacement IP changes; the
-collector reads its status URL from it.
+Install `miner/zakura-nu7-miner-status.service` with the
+`miner/collector-allowlist.conf` drop-in, and apply `miner/99-zakura-nu7.conf` for
+prompt block propagation. The status endpoint reports health, tip, branch ID and
+accepted submissions over 24 hours. A reorganized accepted block still counts;
+this is not a count of canonical blocks. Observations survive log rotation while
+the status process runs and expire after a day or at the generation boundary.
 
-To move an existing remote miner between DigitalOcean regions, stop and
-disable its node and status services before powering it off and taking
-a disk snapshot. Transfer the snapshot image to the destination region, create
-the replacement Droplet with the operator's SSH key in the `zakura-testnet`
-project, and attach the geo-miner firewall. Start the node first; compare its
-tip hash and NU7 branch ID with the primary before setting `internal_miner`. Update
-the other remote nodes' seed lists, the collector URL, and the downloadable
-join config. Remove the old Droplet and temporary snapshot after the new node
-is healthy.
-
-The DigitalOcean Testnet state snapshot is refreshed weekly (Monday 04:00 UTC by
-`zakura-pr-node-bake.yml`), so the seeded tip can lag the live chain by up to a
-week. That is harmless for a fork — the activation height is relative to the
-seed, not to the public chain.
+The health service runs unprivileged without journal access, caps concurrency
+at four requests, caches samples for five seconds, and times out stalled clients.
+Allow port 8094 only from the collector host in both the DigitalOcean firewall
+and the unit's IP allowlist. On systems without systemd `+BPF_FRAMEWORK`, use an
+nftables rule instead and verify that other hosts cannot connect. P2P is public;
+node RPC stays on localhost.
 
 ## The state volume
 
@@ -265,8 +215,10 @@ stalls.
 `fork.py catch-up` fixes that before seeding. It starts a temporary public-Testnet
 node over `host.pristine_cache_dir`, on its own ports (`[catch_up]` in
 `fork.toml`), and waits until the tip block is at most 20 minutes old. Then it
-stops the node, which flushes the finalized database and its non-finalized
-backup, and records the tip it reached over RPC in `seed-tip.json`.
+stops the node and reopens the cache with P2P seeds and peer caching disabled.
+Both runs use synchronous non-finalized backups. Only the tip restored from disk
+is recorded in `seed-tip.json`, and it must still pass the age limit. A failed
+stop, restore or age check leaves no seed record.
 
 `zakurad` keeps the last thousand or so blocks outside the finalized database, and
 `tip-height` reads only the finalized part. After `catch-up`, `seed` also copies
@@ -286,7 +238,7 @@ should claim are both zero. `txload/` creates those fees.
 
 ```sh
 cargo run --release -p zakura-fork-txload -- \
-  --address <the fork's miner address> --secret-key <its key, hex> --fee 10000000
+  --address <miner-address> --secret-key-file <protected-key-file> --fee 10000000
 ```
 
 Each transaction shields one matured coinbase output into the **Ironwood** pool
@@ -367,19 +319,18 @@ zecd. zecd cannot sync a configured network yet, so it cannot follow
 kept deliberately until zecd supports configured networks; that support is a
 separate follow-up, and nothing here depends on it.
 
-## Running multiple miners
-
-Set `peer.miner_address` on the local observer to let it run the internal miner
-too. Leaving it empty keeps that node a pure validator: without a miner address
-a node refuses `getblocktemplate`, so it can only accept blocks another node
-produced.
-
-One node that both mines and validates cannot catch a block it builds wrong and
-accepts wrong in the same way. Two competing miners additionally exercise
-losing a race and re-templating on a tip someone else mined, including across
-the activation boundary.
-
 ## Reconfiguring
+
+`seed`, `up` and `reconfigure` refuse configurations containing remote miners
+before any host command. These commands reseed only the primary and local
+observer; automatic fleet-wide restoration is not implemented. For a coordinated
+reset, stop every node and the faucet, preserve the old generation for audit,
+choose a new network name and magic, restore the same stopped seed on every host,
+and then render and deploy the fleet. Compare hashes at the seed height before
+mining, publish a distinct immutable snapshot and matching manifest, and reopen
+the faucet only after coinbase maturity.
+
+For a local-only fork:
 
 ```sh
 $EDITOR fork.toml              # new network_name and/or activation_offset
@@ -423,41 +374,20 @@ Delete the droplet first: it detaches the volume, and the reaper deletes a
 detached `zakura-pr-*` volume on its own. Deleting the volume explicitly avoids
 waiting for that sweep.
 
-## Why each setting is the way it is
+## Network configuration
 
-**`network = { ... }`, not `network = "Testnet"`.** The public Testnet's
-parameters are fixed: `zakurad` rejects `[network.testnet_parameters]` beside
-`network = "Testnet"`. The deployer writes the fork parameters as the value of
-`network` itself, one inline table: `network = { network_name = ..., activation_heights = { ... } }`. `test_fork.py` keeps
-`crates/zakura-network/src/config/tests/data/nu7-fork-node.toml` equal to the
-deployer's output, and zakura-network's `rendered_nu7_fork_config_loads` test
-loads that file with `zakurad`'s own config type.
+The deployer writes `network` as an inline parameter table rather than
+`"Testnet"`. The rendered fixture at
+`crates/zakura-network/src/config/tests/data/nu7-fork-node.toml` is loaded with
+the node's actual config type in `rendered_nu7_fork_config_loads`.
 
-**Distinct `network_magic`.** Without it the fork dials real Testnet peers,
-rejects their blocks once NU7 activates, and bans them. The magic is what makes
-the fork a separate network from the first block.
-
-**`initial_testnet_peers = []`.** Mandatory, not cosmetic. `zakurad` refuses to
-load a config that pairs the default public DNS seeds with testnet parameters
-incompatible with the public Testnet, and adding NU7 makes them incompatible.
-`fork.py` always emits this.
-
-**`checkpoints = true`.** The serde default is genesis-only checkpoints, and
-`build_configured_testnet` applies it unconditionally. Omitting it would make the
-node fully verify four million blocks it already trusts.
-
-**`inherit_activation_heights = true` with only `NU7`.** A configured
-`activation_heights` list normally replaces every public Testnet height at or
-above `Height(1)`, so a partial list would silently disable Sapling through NU6.3.
-With `inherit_activation_heights`, `zakurad` overlays the configured heights on the
-public Testnet defaults instead, and validates the combined list. The fork
-therefore names only NU7 and cannot drift from the heights in the binary it runs.
-Configs that list every height keep working unchanged; the two forms describe
-the same network.
-
-**`initial_nsm_value_balance`.** Set to the measured Testnet constant
-(`55_768_414_957`). The builder default is zero, which is only correct for a
-chain with no pre-NU7 history; a fork of Testnet has four million blocks of it.
+| Setting | Reason |
+| --- | --- |
+| Distinct name and `network_magic` | Separate the fork's state and wire protocol from public Testnet |
+| `initial_testnet_peers = []` | Prevent dialing incompatible public DNS seeds |
+| `checkpoints = true` | Preserve public Testnet checkpoints for the inherited history |
+| `inherit_activation_heights = true` | Overlay NU7 on the public upgrade list instead of disabling earlier upgrades |
+| `initial_nsm_value_balance = 55_768_414_957` | Carry the measured pre-NU7 Testnet balance instead of the zero default |
 
 ## What happens at activation
 
@@ -480,9 +410,9 @@ path rejects a mismatch outright.
 The public NU7 page reads `/v1/status` from the existing fleet collector,
 `deploy/runner/zakura-cluster-status.py`, run on the primary host with
 `--nu7-config`. It reads the same rendered fleet config `deploy.py` deploys, so
-the five validators are listed once. Nodes with `monitor = { local = true }` (the
+validator membership is listed once. Nodes with `monitor = { local = true }` (the
 primary and the local observer) are probed on the host itself without SSH; the
-three remote miners are read from their `monitor.status_url` health reports, so
+remote miners are read from their `monitor.status_url` health reports, so
 the primary holds no SSH key for them. The collector serves a small JSON response
 on `127.0.0.1:8093/v1/status` with the zakura.com CORS allowlist, and the
 Caddyfile publishes only `/v1/status` and `/healthz` at `api.nu7.valargroup.dev`.
@@ -496,12 +426,20 @@ routes: the website reads only `/v1/status`, `/v1/network`, and `/v1/faucet/*`.
 The response keeps schema version 1: current tip, header timestamps, recent
 intervals, difficulty, external peer count, local node agreement, regional miner
 health, and the live NSM balance when the deployed node reports
-`nsmValueBalanceZat`. `status` is `live` only while all five validators are on
+`nsmValueBalanceZat`. `status` is `live` only while all configured validators are on
 the primary's chain within two blocks; `observation.validatorsAgree`,
 `validatorsAgreeing` and `validatorsConfigured` report that agreement. The reorg
 count includes only tip replacements observed while the collector is running,
 and never observations from before `--nu7-generation-start`. That measurement
 comes from the primary host, so it is not a network-wide orphan rate.
+
+The status feed computes mean and median header-time intervals over the latest
+301 post-NU7 headers (300 intervals). Before that many blocks exist, it uses
+only the available post-activation intervals and reports the actual count in
+`chain.intervalSampleBlocks`. Headers are cached between polls; normal tip
+advancement only fetches newly mined headers. The recent-block list stays at
+eight entries. Existing website clients display the returned sample count
+without a website update.
 
 Install from the repository root on the fork host, with the rendered fleet config:
 
@@ -536,7 +474,7 @@ cover what Rust tests cannot.
 | `deploy/nu7-fork/test_faucet.py` | claim limits, queueing, CORS, and that the sender uses only the faucet key |
 | `deploy/nu7-fork/test_remote_status.py` | mined-block counts, generation boundaries, endpoint bounds, unprivileged units |
 | `deploy/nu7-fork/test_publish_network.py` | the participant manifest, including the published V3 config digest |
-| `deploy/runner/test_zakura_cluster_status.py` | the `/v1/status` schema version 1 contract and five-validator agreement |
+| `deploy/runner/test_zakura_cluster_status.py` | the `/v1/status` schema version 1 contract and configured-validator agreement |
 | `deploy/deployer/test_deploy.py` | nested config round trips and parallel same-host staging |
 
 The Rust side is `cargo test -p zakura-network --lib config::tests` for the
@@ -556,13 +494,3 @@ As the tooling shrinks, so does this CI cost.
 `fork.py` renders a fleet config for `deploy/deployer/deploy.py` rather than
 deploying by itself, so the fork node is built, shipped and supervised by exactly
 the same path as every other managed node.
-
-## Block interval sample
-
-The status feed computes mean and median header-time intervals over the latest
-301 post-NU7 headers (300 intervals). Before that many blocks exist, it uses
-only the available post-activation intervals and reports the actual count in
-`chain.intervalSampleBlocks`. Headers are cached between polls; normal tip
-advancement only fetches newly mined headers. The recent-block list stays at
-eight entries. Existing website clients display the returned sample count
-without a website update.

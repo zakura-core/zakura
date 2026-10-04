@@ -428,6 +428,22 @@ fn shielded_data_from_bundle(
     })
 }
 
+/// Verify the parsed wire bundle once, without blocking the async executor.
+async fn verify_wire_proof<V: Send + 'static>(
+    bundle: Bundle<orchard::bundle::Authorized, V>,
+) -> Result<()> {
+    tokio::task::spawn_blocking(move || {
+        let vk = orchard::circuit::VerifyingKey::build(CIRCUIT_VERSION);
+        bundle
+            .verify_proof(&vk)
+            .map_err(|error| eyre!("wire proof verification failed: {error:?}"))
+    })
+    .await
+    .wrap_err("verifying the wire proof panicked")??;
+    tracing::info!("wire proof verification passed");
+    Ok(())
+}
+
 #[tokio::main]
 #[allow(clippy::print_stdout)]
 async fn main() -> Result<()> {
@@ -596,23 +612,6 @@ async fn main() -> Result<()> {
             .apply_signatures(&mut rng, sighash, &[])
             .map_err(|error| eyre!("signing the shielding bundle failed: {error:?}"))?;
 
-        // Verify the proof here, against the same circuit era the node uses, so a proving
-        // failure is distinguishable from a serialization failure at the node.
-        let verified = {
-            let authorized = authorized.clone();
-            tokio::task::spawn_blocking(move || {
-                authorized.verify_proof(&orchard::circuit::VerifyingKey::build(CIRCUIT_VERSION))
-            })
-            .await
-            .wrap_err("verifying the proof panicked")?
-        };
-        match verified {
-            Ok(()) => tracing::info!("local proof verification passed"),
-            Err(error) => {
-                bail!("local proof verification FAILED: {error:?}");
-            }
-        }
-
         // P2PKH scriptSig: <DER signature || hash type> <compressed public key>.
         let message = secp256k1::Message::from_digest(transparent_sighash);
         let signature = secp256k1::SECP256K1.sign_ecdsa(&message, &secret);
@@ -663,20 +662,7 @@ async fn main() -> Result<()> {
         }
         tracing::info!("sighash is stable across unlock-script insertion");
 
-        let vk = orchard::circuit::VerifyingKey::build(CIRCUIT_VERSION);
-        match reparsed_bundle.verify_proof(&vk) {
-            Ok(()) => tracing::info!("re-parsed proof verification passed"),
-            Err(error) => {
-                bail!(
-                    "re-parsed proof verification FAILED: {error:?}; the bundle changed across \
-                 serialization (flags {:?} -> {:?}, anchor {} -> {})",
-                    authorized.flags(),
-                    reparsed_bundle.flags(),
-                    hex::encode(authorized.anchor().to_bytes()),
-                    hex::encode(reparsed_bundle.anchor().to_bytes()),
-                );
-            }
-        }
+        verify_wire_proof(reparsed_bundle).await?;
 
         let raw = hex::encode(&wire);
         let txid: String = client
@@ -699,6 +685,45 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn wire_proof_verification_accepts_a_round_trip_and_rejects_a_corrupted_proof(
+    ) -> Result<()> {
+        let authorized = tokio::task::spawn_blocking(|| -> Result<_> {
+            let pk = ProvingKey::build(CIRCUIT_VERSION);
+            prove_shielding_bundle(&pk, 1, throwaway_recipient()?, None)?
+                .apply_signatures(&mut rand_10::rng(), [0; 32], &[])
+                .map_err(|error| eyre!("test bundle signing failed: {error:?}"))
+        })
+        .await??;
+        let mut tx = Transaction::V6 {
+            network_upgrade: NetworkUpgrade::Nu7,
+            lock_time: LockTime::unlocked(),
+            expiry_height: Height(4_420_700),
+            inputs: vec![],
+            outputs: vec![],
+            sapling_shielded_data: None,
+            orchard_shielded_data: None,
+            ironwood_shielded_data: Some(shielded_data_from_bundle(&authorized)?),
+        };
+        let wire_bundle = |tx: &Transaction| -> Result<_> {
+            let wire = tx.zcash_serialize_to_vec()?;
+            Transaction::zcash_deserialize(&wire[..])?
+                .sighasher(NetworkUpgrade::Nu7, std::sync::Arc::new(vec![]))?
+                .ironwood_bundle()
+                .ok_or_else(|| eyre!("test transaction has an Ironwood bundle"))
+        };
+        verify_wire_proof(wire_bundle(&tx)?).await?;
+        if let Transaction::V6 {
+            ironwood_shielded_data: Some(data),
+            ..
+        } = &mut tx
+        {
+            data.proof.0[0] ^= 1;
+        }
+        assert!(verify_wire_proof(wire_bundle(&tx)?).await.is_err());
+        Ok(())
+    }
 
     #[test]
     fn printing_the_address_needs_no_address_argument() {

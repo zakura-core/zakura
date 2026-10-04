@@ -14,7 +14,6 @@ import threading
 import time
 import tomllib
 import urllib.request
-from collections import deque
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -94,7 +93,9 @@ class MinedBlocks:
         # The file being read, as (st_dev, st_ino), and how far into it.
         self.identity = None
         self.offset = 0
-        self.times = deque()
+        # Exact log lines identify submissions when rotation or copy-truncation
+        # causes old lines to be read again. Keep observations for the full day.
+        self.accepted_blocks = {}
         self.lock = threading.Lock()
 
     def count_24h(self, now=None):
@@ -111,22 +112,21 @@ class MinedBlocks:
                         # from the start rather than resume at a stale offset.
                         self.identity = identity
                         self.offset = 0
-                        self.times.clear()
                     stream.seek(self.offset)
                     while (line := stream.readline()).endswith(b"\n"):
                         self.offset += len(line)
                         if MINED_BLOCK in line and ACCEPTED in line:
                             observed = log_line_time(line)
                             if observed is not None:
-                                self.times.append(observed)
+                                self.accepted_blocks[line] = observed
             except OSError as error:
                 report_health("node log", False, f"{self.path}: {error}")
                 return None
             report_health("node log", True)
             start = max(now - 86400, self.since)
-            while self.times and self.times[0] < start:
-                self.times.popleft()
-            return len(self.times)
+            self.accepted_blocks = {line: observed for line, observed in self.accepted_blocks.items()
+                                    if observed >= start}
+            return sum(observed <= now for observed in self.accepted_blocks.values())
 
 
 def sample(rpc_port, node_service, miner_enabled, mined_blocks):

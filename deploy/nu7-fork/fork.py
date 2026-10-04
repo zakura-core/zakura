@@ -522,6 +522,9 @@ def cmd_seed(config: dict, args) -> int:
     nodes are pruned, so a node seeded from nothing could not sync the inherited
     history from its peer.
     """
+    if config.get("remote"):
+        raise ForkError("seeding with remote miners requires a coordinated restore on every host; "
+                        "stop the fleet, restore the same seed on each host, then render and deploy")
     host = config["host"]["ssh_string"]
     code_version = db_format_version()
     pristine_root = config["host"]["pristine_cache_dir"]
@@ -606,7 +609,7 @@ def cmd_seed(config: dict, args) -> int:
     return 0
 
 
-def catch_up_config(config: dict, settings: dict) -> str:
+def catch_up_config(config: dict, settings: dict, *, offline: bool = False) -> str:
     """The temporary node's config: the public Testnet, over the pristine cache."""
     pristine = config["host"]["pristine_cache_dir"]
     storage_mode = config["host"].get("storage_mode", "pruned")
@@ -614,12 +617,15 @@ def catch_up_config(config: dict, settings: dict) -> str:
         "# Written by deploy/nu7-fork/fork.py catch-up; removed when it finishes.",
         "[network]",
         'network = "Testnet"',
-        f'listen_addr = "{settings["listen_addr"]}"',
-        f'cache_dir = "{pristine}"',
+        f'listen_addr = "{settings["listen_addr"] if not offline else "127.0.0.1:0"}"',
+        *(('initial_testnet_peers = []', 'cache_dir = false', 'p2p_stack = "legacy"')
+          if offline else (f'cache_dir = "{pristine}"',)),
         "",
         "[state]",
         f'cache_dir = "{pristine}"',
         f'storage_mode = "{storage_mode}"',
+        # A tip visible over RPC must already exist in the copied non-finalized backup.
+        "debug_skip_non_finalized_state_backup_task = true",
         "",
         "[rpc]",
         f'listen_addr = "{settings["rpc_listen_addr"]}"',
@@ -632,42 +638,32 @@ def catch_up_config(config: dict, settings: dict) -> str:
     ])
 
 
-def cmd_catch_up(config: dict, args) -> int:
-    """Sync the pristine Testnet cache to the public tip, and record that tip.
+def read_seed_tip(config: dict, settings: dict, *, offline: bool = False) -> dict:
+    """Start the seed node, wait for its restored tip, and stop it before returning.
 
-    A seed whose tip is hours old cannot be mined on: the fork's first block time is
-    capped at the tip's median time plus 90 minutes. The temporary node syncs the
-    pristine cache from public peers, then stops, flushing the finalized database and
-    its non-finalized backup. The tip it reached is recorded over RPC, because
-    `tip-height` sees only the finalized part.
+    Online mode waits for a fresh public Testnet tip. Offline mode has no seed peers
+    or peer cache and binds P2P to loopback, so it observes only persisted state.
     """
     host = config["host"]["ssh_string"]
-    pristine = config["host"]["pristine_cache_dir"]
     binary = config["host"].get("bin_path", "/usr/local/bin/zakurad")
-    settings = {**CATCH_UP_DEFAULTS, **config.get("catch_up", {})}
     rpc_addr = settings["rpc_listen_addr"]
     unit = shlex.quote(CATCH_UP_UNIT)
-    tip_file = shlex.quote(f"{pristine}/{SEED_TIP_FILE}")
-
-    # The recorded tip describes the cache only until the node writes to it again.
-    ssh(host, f"rm -f {tip_file}")
     ssh(host, f"mkdir -p /etc/zakura $(dirname {shlex.quote(settings['log_file'])}) && "
-              f"cat > {CATCH_UP_CONFIG} <<'EOF'\n{catch_up_config(config, settings)}EOF")
-    ssh(host, f"systemctl reset-failed {unit} 2>/dev/null; "
-              f"systemd-run --unit={unit} --collect --property=TimeoutStopSec=600 "
-              f"{shlex.quote(binary)} -c {CATCH_UP_CONFIG} start")
-    print(f"[catch-up] started {CATCH_UP_UNIT}; syncing {pristine} to the public Testnet tip")
+              f"cat > {CATCH_UP_CONFIG} <<'EOF'\n{catch_up_config(config, settings, offline=offline)}EOF")
 
     deadline = time.monotonic() + settings["timeout_minutes"] * 60
     max_age = settings["max_tip_age_minutes"] * 60
     try:
+        ssh(host, f"systemctl reset-failed {unit} 2>/dev/null; "
+                  f"systemd-run --unit={unit} --collect --property=TimeoutStopSec=600 "
+                  f"{shlex.quote(binary)} -c {CATCH_UP_CONFIG} start")
         while True:
             try:
                 info = rpc(host, rpc_addr, "getblockchaininfo")
                 header = rpc(host, rpc_addr, "getblockheader", [info["bestblockhash"], True])
                 age = time.time() - header["time"]
                 print(f"[catch-up] height {info['blocks']}, tip block {age / 60:.0f} min old")
-                if age <= max_age:
+                if offline or age <= max_age:
                     tip = {"height": info["blocks"], "hash": info["bestblockhash"],
                            "time": header["time"]}
                     break
@@ -678,10 +674,24 @@ def cmd_catch_up(config: dict, args) -> int:
                                 f"{settings['max_tip_age_minutes']} min in time")
             time.sleep(30)
     finally:
-        # Stopping flushes the database and the non-finalized backup the fork seeds from.
-        ssh(host, f"systemctl stop {unit}; rm -f {CATCH_UP_CONFIG}", check=False)
-
+        # A stop failure must not allow publication of a cache that is still being written.
+        ssh(host, f"systemctl stop {unit} && rm -f {CATCH_UP_CONFIG}")
     ssh(host, f"! systemctl is-active --quiet {unit}")
+    return tip
+
+
+def cmd_catch_up(config: dict, args) -> int:
+    """Sync Testnet, stop it, and record only the tip restored without network peers."""
+    host = config["host"]["ssh_string"]
+    pristine = config["host"]["pristine_cache_dir"]
+    settings = {**CATCH_UP_DEFAULTS, **config.get("catch_up", {})}
+    tip_file = shlex.quote(f"{pristine}/{SEED_TIP_FILE}")
+    # A failed catch-up or restore must not leave a previous seed record usable.
+    ssh(host, f"rm -f {tip_file}")
+    read_seed_tip(config, settings)
+    tip = read_seed_tip(config, settings, offline=True)
+    if time.time() - tip["time"] > settings["max_tip_age_minutes"] * 60:
+        raise ForkError("the restored seed tip is too old; re-run `fork.py catch-up`")
     ssh(host, f"cat > {tip_file} <<'EOF'\n{json.dumps(tip)}\nEOF")
     print(f"[catch-up] recorded seed tip {tip['height']} ({tip['hash']})")
     return 0

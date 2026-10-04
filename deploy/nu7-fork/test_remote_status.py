@@ -62,7 +62,7 @@ class MinedBlockLogTests(LogCase):
         counter = MinedBlocks(path)
         self.assertEqual(counter.count_24h(now=200_000), 2)
         Path(path).write_text(ACCEPTED.format(time=stamp(199_500)))
-        self.assertEqual(counter.count_24h(now=200_000), 1)
+        self.assertEqual(counter.count_24h(now=200_000), 3)
 
     def replace(self, path, *lines):
         """Rotate: a new file takes the old name, as logrotate's create mode does."""
@@ -74,10 +74,11 @@ class MinedBlockLogTests(LogCase):
         path = self.log(first)
         counter = MinedBlocks(path)
         self.assertEqual(counter.count_24h(now=200_000), 1)
-        # Same length, different content: an offset check alone would keep the old count.
+        # Same length, different content: retain the earlier observation for its full day.
         self.replace(path, REJECTED.format(time=stamp(199_100))[:len(first) - 1] + "\n")
         self.assertEqual(len(Path(path).read_bytes()), len(first.encode()))
-        self.assertEqual(counter.count_24h(now=200_000), 0)
+        self.assertEqual(counter.count_24h(now=200_000), 1)
+        self.assertEqual(counter.count_24h(now=199_000 + 86_401), 0)
 
     def test_a_rotated_larger_log_is_counted_from_its_start(self):
         path = self.log(ACCEPTED.format(time=stamp(199_000)))
@@ -85,7 +86,7 @@ class MinedBlockLogTests(LogCase):
         self.assertEqual(counter.count_24h(now=200_000), 1)
         self.replace(path, ACCEPTED.format(time=stamp(199_200)), ACCEPTED.format(time=stamp(199_300)),
                      REJECTED.format(time=stamp(199_301)))
-        self.assertEqual(counter.count_24h(now=200_000), 2)
+        self.assertEqual(counter.count_24h(now=200_000), 3)
 
     def test_a_partial_line_in_a_rotated_log_waits_for_its_newline(self):
         path = self.log(ACCEPTED.format(time=stamp(199_000)))
@@ -93,10 +94,26 @@ class MinedBlockLogTests(LogCase):
         counter.count_24h(now=200_000)
         line = ACCEPTED.format(time=stamp(199_400))
         self.replace(path, line[:30])
-        self.assertEqual(counter.count_24h(now=200_000), 0)
+        self.assertEqual(counter.count_24h(now=200_000), 1)
         with open(path, 'a') as stream:
             stream.write(line[30:])
+        self.assertEqual(counter.count_24h(now=200_000), 2)
+
+    def test_reread_lines_are_not_counted_twice(self):
+        first = ACCEPTED.format(time=stamp(199_000))
+        path = self.log(first)
+        counter = MinedBlocks(path)
         self.assertEqual(counter.count_24h(now=200_000), 1)
+        self.replace(path, first, ACCEPTED.format(time=stamp(199_100)))
+        self.assertEqual(counter.count_24h(now=200_000), 2)
+
+    def test_out_of_order_rereads_expire_by_timestamp(self):
+        path = self.log(ACCEPTED.format(time=stamp(199_000)))
+        counter = MinedBlocks(path)
+        counter.count_24h(now=200_000)
+        self.replace(path, ACCEPTED.format(time=stamp(113_000)),
+                     ACCEPTED.format(time=stamp(199_100)))
+        self.assertEqual(counter.count_24h(now=200_000), 2)
 
     def test_an_unreadable_log_is_unknown_not_zero(self):
         self.assertIsNone(MinedBlocks('/nonexistent/zakura.log').count_24h(now=200_000))
@@ -110,7 +127,7 @@ class MinedBlockLogTests(LogCase):
             counter.count_24h(now=200_000)
             counter.count_24h(now=200_000)
             Path(path).write_text(ACCEPTED.format(time=stamp(199_500)))
-            self.assertEqual(counter.count_24h(now=200_000), 1)
+            self.assertEqual(counter.count_24h(now=200_000), 2)
         self.assertEqual(len(logs.output), 2)
         self.assertIn('node log is unavailable', logs.output[0])
         self.assertIn('node log is readable again', logs.output[1])

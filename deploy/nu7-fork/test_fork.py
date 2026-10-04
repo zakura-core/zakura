@@ -362,12 +362,21 @@ class CaughtUpSeed(unittest.TestCase):
         commands = self.seed(FakeHost(None))
         self.assertFalse(any("cp -a" in c and "non_finalized_state" in c for c in commands))
 
+    def test_remote_resets_are_refused_before_any_host_command(self):
+        config = self.config()
+        config["remote"] = [REMOTE]
+        for command in (fork.cmd_seed, fork.cmd_up, fork.cmd_reconfigure):
+            with self.subTest(command=command.__name__), mock.patch.object(fork, "ssh") as ssh:
+                with self.assertRaisesRegex(fork.ForkError, "coordinated restore"):
+                    command(config, types.SimpleNamespace(force=True))
+                ssh.assert_not_called()
+
 
 class CatchUp(unittest.TestCase):
     def run_catch_up(self, tip_times):
         host = FakeHost()
         now = 1_790_000_000
-        answers = iter(tip_times)
+        answers = iter([*tip_times, tip_times[-1]])
 
         def fake_rpc(host_name, addr, method, params=None):
             self.assertEqual(addr, "127.0.0.1:18252")
@@ -390,11 +399,12 @@ class CatchUp(unittest.TestCase):
 
         self.assertTrue(commands[0].startswith("rm -f /var/lib/zakura-pristine/seed-tip.json"))
         started = next(i for i, c in enumerate(commands) if c.startswith("systemctl reset-failed"))
-        stopped = next(i for i, c in enumerate(commands) if c.startswith("systemctl stop"))
+        stopped = [i for i, c in enumerate(commands) if c.startswith("systemctl stop")]
+        self.assertEqual(len(stopped), 2)
         recorded = next(i for i, c in enumerate(commands) if "seed-tip.json <<" in c)
-        self.assertLess(started, stopped)
-        # The tip is only written once the node has stopped and flushed its state.
-        self.assertLess(stopped, recorded)
+        self.assertLess(started, stopped[0])
+        # Both the online node and its offline restore stop before the tip is recorded.
+        self.assertLess(stopped[-1], recorded)
         self.assertIn('"height": 4390000', commands[recorded])
         self.assertIn('"time": 1789999700', commands[recorded])
 
@@ -418,7 +428,62 @@ class CatchUp(unittest.TestCase):
         self.assertNotIn("initial_testnet_peers", config["network"])
         self.assertEqual(config["state"]["cache_dir"], "/var/lib/zakura-pristine")
         self.assertEqual(config["state"]["storage_mode"], "pruned")
+        self.assertTrue(config["state"]["debug_skip_non_finalized_state_backup_task"])
         self.assertEqual(config["rpc"]["listen_addr"], "127.0.0.1:18252")
+
+    def test_offline_restore_cannot_dial_seed_or_cached_peers(self):
+        text = fork.catch_up_config(CaughtUpSeed().config(), fork.CATCH_UP_DEFAULTS, offline=True)
+        config = __import__("tomllib").loads(text)
+        self.assertEqual(config["network"]["listen_addr"], "127.0.0.1:0")
+        self.assertEqual(config["network"]["initial_testnet_peers"], [])
+        self.assertFalse(config["network"]["cache_dir"])
+        self.assertEqual(config["network"]["p2p_stack"], "legacy")
+        self.assertTrue(config["state"]["debug_skip_non_finalized_state_backup_task"])
+
+    def test_record_uses_the_restored_tip_instead_of_the_live_sample(self):
+        now = 1_790_000_000
+        online = {"height": 4_390_000, "hash": "ab" * 32, "time": now - 300}
+        restored = {**online, "height": 4_389_999, "hash": "cd" * 32}
+        host = FakeHost()
+        with mock.patch.object(fork, "ssh", side_effect=host.ssh), \
+                mock.patch.object(fork, "read_seed_tip", side_effect=[online, restored]) as read, \
+                mock.patch.object(fork.time, "time", return_value=now):
+            fork.cmd_catch_up(CaughtUpSeed().config(), types.SimpleNamespace())
+        self.assertTrue(read.call_args_list[-1].kwargs["offline"])
+        recorded = next(c for c in host.commands if "seed-tip.json <<" in c)
+        self.assertIn(json.dumps(restored), recorded)
+        self.assertNotIn(online["hash"], recorded)
+
+    def test_failed_or_stale_restoration_leaves_no_seed_record(self):
+        now = 1_790_000_000
+        for result in (fork.ForkError("restore failed"),
+                       {"height": 1, "hash": "ab" * 32, "time": now - 1201}):
+            host = FakeHost()
+            with self.subTest(result=result), \
+                    mock.patch.object(fork, "ssh", side_effect=host.ssh), \
+                    mock.patch.object(fork, "read_seed_tip", side_effect=[{}, result]), \
+                    mock.patch.object(fork.time, "time", return_value=now):
+                with self.assertRaises(fork.ForkError):
+                    fork.cmd_catch_up(CaughtUpSeed().config(), types.SimpleNamespace())
+            self.assertTrue(host.commands[0].startswith("rm -f "))
+            self.assertFalse(any("seed-tip.json <<" in c for c in host.commands))
+
+    def test_stop_failure_prevents_the_seed_record(self):
+        now = 1_790_000_000
+        host = FakeHost()
+
+        def ssh(*args, **kwargs):
+            if args[1].startswith("systemctl stop"):
+                raise fork.ForkError("stop failed")
+            return host.ssh(*args, **kwargs)
+
+        with mock.patch.object(fork, "ssh", side_effect=ssh), \
+                mock.patch.object(fork, "rpc", return_value={"blocks": 1,
+                    "bestblockhash": "ab" * 32, "time": now}), \
+                mock.patch.object(fork.time, "time", return_value=now):
+            with self.assertRaisesRegex(fork.ForkError, "stop failed"):
+                fork.cmd_catch_up(CaughtUpSeed().config(), types.SimpleNamespace())
+        self.assertFalse(any("seed-tip.json <<" in c for c in host.commands))
 
 
 class RenderedNodeConfig(unittest.TestCase):

@@ -85,26 +85,25 @@ impl Arbitrary for CompactSizeMessage {
     type Strategy = BoxedStrategy<Self>;
 }
 
-/// Calculate the serialized sizes immediately around `item`'s allocation limit.
+/// Calculate serialized vector sizes around [`TrustedPreallocate::max_allocation`].
 ///
-/// Returns the following calculations on `item`:
-///   smallest_disallowed_vec_len
-///   smallest_disallowed_serialized_len
-///   largest_allowed_vec_len
-///   largest_allowed_serialized_len
+/// Returns `(smallest_disallowed_serialized_len, largest_allowed_serialized_len)`
+/// for vectors containing identical copies of `item`, including the CompactSize
+/// count prefix. Calculates the sizes without allocating those vectors or
+/// asserting that they fit a protocol limit.
 ///
-/// For varible-size types, `largest_allowed_serialized_len` might not fit within
-/// `MAX_PROTOCOL_MESSAGE_LEN` or `MAX_BLOCK_SIZE`.
-pub fn max_allocation_is_big_enough<T>(item: T) -> (usize, usize, usize, usize)
+/// For variable-size types, a vector at the largest allowed count might exceed
+/// [`MAX_PROTOCOL_MESSAGE_LEN`] or [`crate::block::MAX_BLOCK_BYTES`] when
+/// serialized.
+pub fn serialized_sizes_at_allocation_limit<T>(item: T) -> (usize, usize)
 where
-    T: TrustedPreallocate + ZcashSerialize + Clone,
+    T: TrustedPreallocate + ZcashSerialize,
 {
     let max_allocation: usize = T::max_allocation().try_into().unwrap();
     let smallest_disallowed_vec_len = max_allocation + 1;
-    let largest_allowed_vec_len = max_allocation;
     let item_len = item.zcash_serialized_size();
 
-    // A vector of identical clones is a CompactSize count followed by the
+    // A vector of identical items is a CompactSize count followed by the
     // identical serialization of each item. Calculate that exact size without
     // allocating and serializing multi-megabyte test vectors.
     let serialized_vec_len = |len: usize| {
@@ -122,9 +121,7 @@ where
     };
 
     (
-        smallest_disallowed_vec_len,
         serialized_vec_len(smallest_disallowed_vec_len),
-        largest_allowed_vec_len,
-        serialized_vec_len(largest_allowed_vec_len),
+        serialized_vec_len(max_allocation),
     )
 }

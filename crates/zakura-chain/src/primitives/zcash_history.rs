@@ -8,7 +8,6 @@ mod tests;
 
 use std::{collections::BTreeMap, io, sync::Arc};
 
-use serde_big_array::BigArray;
 pub use zcash_history::{V1, V2, V3};
 
 use crate::{
@@ -126,7 +125,7 @@ impl From<&zcash_history::NodeData> for NodeData {
 /// Contains the node data and information about its position in the tree.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Entry {
-    #[serde(with = "BigArray")]
+    #[serde(with = "crate::serialization::serde_adapters::bytes")]
     inner: [u8; zcash_history::MAX_ENTRY_SIZE],
 }
 

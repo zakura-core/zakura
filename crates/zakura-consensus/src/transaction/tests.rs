@@ -1214,6 +1214,7 @@ async fn mempool_request_with_missing_input_is_rejected() {
     }
 }
 
+/// A present transparent input with an unlocked lock time is accepted.
 #[tokio::test]
 async fn mempool_request_with_present_input_is_accepted() {
     let mut state: MockService<_, _, _, _> = MockService::build().for_prop_tests();
@@ -1357,73 +1358,6 @@ async fn mempool_request_with_invalid_lock_time_is_rejected() {
         Err(TransactionError::LockedUntilAfterBlockTime(
             Utc.timestamp_opt(u32::MAX.into(), 0).unwrap()
         ))
-    );
-}
-
-#[tokio::test]
-async fn mempool_request_with_unlocked_lock_time_is_accepted() {
-    let mut state: MockService<_, _, _, _> = MockService::build().for_prop_tests();
-    let verifier = Verifier::new_for_tests(&Network::Mainnet, state.clone());
-
-    let height = NetworkUpgrade::Canopy
-        .activation_height(&Network::Mainnet)
-        .expect("Canopy activation height is specified");
-    let fund_height = (height - 1).expect("fake source fund block height is too small");
-    let (input, output, known_utxos) = mock_transparent_transfer(
-        fund_height,
-        true,
-        0,
-        Amount::try_from(10001).expect("invalid value"),
-    );
-
-    // Create a non-coinbase V4 tx with the last valid expiry height.
-    let tx = Transaction::V4 {
-        inputs: vec![input],
-        outputs: vec![output],
-        lock_time: LockTime::unlocked(),
-        expiry_height: height,
-        joinsplit_data: None,
-        sapling_shielded_data: None,
-    };
-
-    let input_outpoint = match tx.inputs()[0] {
-        transparent::Input::PrevOut { outpoint, .. } => outpoint,
-        transparent::Input::Coinbase { .. } => panic!("requires a non-coinbase transaction"),
-    };
-
-    tokio::spawn(async move {
-        state
-            .expect_request(zakura_state::Request::UnspentBestChainUtxo(input_outpoint))
-            .await
-            .expect("verifier should call mock state service with correct request")
-            .respond(zakura_state::Response::UnspentBestChainUtxo(
-                known_utxos
-                    .get(&input_outpoint)
-                    .map(|utxo| utxo.utxo.clone()),
-            ));
-
-        state
-            .expect_request_that(|req| {
-                matches!(
-                    req,
-                    zakura_state::Request::CheckBestChainTipNullifiersAndAnchors(_)
-                )
-            })
-            .await
-            .expect("verifier should call mock state service with correct request")
-            .respond(zakura_state::Response::ValidBestChainTipNullifiersAndAnchors);
-    });
-
-    let verifier_response = verifier
-        .oneshot(Request::Mempool {
-            transaction: tx.into(),
-            height,
-        })
-        .await;
-
-    assert!(
-        verifier_response.is_ok(),
-        "expected successful verification, got: {verifier_response:?}"
     );
 }
 

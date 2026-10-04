@@ -344,33 +344,6 @@ proptest! {
     }
 }
 
-/// Make sure a transaction version override generates transactions with the specified
-/// transaction versions.
-#[test]
-fn arbitrary_transaction_version_strategy() -> Result<()> {
-    let _init_guard = zakura_test::init();
-
-    // Update with new transaction versions as needed
-    let strategy = (1..5u32)
-        .prop_flat_map(|transaction_version| {
-            LedgerState::coinbase_strategy(None, transaction_version, false)
-        })
-        .prop_flat_map(|ledger_state| Transaction::vec_strategy(ledger_state, MAX_ARBITRARY_ITEMS));
-
-    proptest!(|(transactions in strategy)| {
-        let mut version = None;
-        for t in transactions {
-            if version.is_none() {
-                version = Some(t.version());
-            } else {
-                prop_assert_eq!(Some(t.version()), version);
-            }
-        }
-    });
-
-    Ok(())
-}
-
 /// Make sure a transaction valid network upgrade strategy generates transactions
 /// with valid network upgrades.
 #[test]

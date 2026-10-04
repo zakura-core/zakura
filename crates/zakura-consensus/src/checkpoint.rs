@@ -1213,6 +1213,39 @@ impl VerifyCheckpointError {
         }
     }
 
+    /// Returns `true` if the state rejected the delivered body because it does not match its
+    /// header's authorizing data commitment.
+    ///
+    /// Checkpoint verification checks only the block hash and the transaction Merkle root, which
+    /// do not commit to authorizing data from NU5 (ZIP 244). So a peer can serve a canonical
+    /// header with an altered body that fails only at commit. See
+    /// [`zs::ValidateContextError::is_auth_commitment_mismatch`].
+    pub fn is_auth_commitment_mismatch(&self) -> bool {
+        match self {
+            VerifyCheckpointError::CommitCheckpointVerified(source) => source
+                .downcast_ref::<zs::CommitCheckpointVerifiedError>()
+                .is_some_and(zs::CommitCheckpointVerifiedError::is_auth_commitment_mismatch),
+            VerifyCheckpointError::VerifyBlock(error) => error.is_auth_commitment_mismatch(),
+            _ => false,
+        }
+    }
+
+    /// Returns `true` if the state dropped this block because an ancestor's delivered body
+    /// failed its authorizing data commitment.
+    pub fn is_descendant_of_auth_commitment_mismatch(&self) -> bool {
+        match self {
+            VerifyCheckpointError::CommitCheckpointVerified(source) => source
+                .downcast_ref::<zs::CommitCheckpointVerifiedError>()
+                .is_some_and(
+                    zs::CommitCheckpointVerifiedError::is_descendant_of_auth_commitment_mismatch,
+                ),
+            VerifyCheckpointError::VerifyBlock(error) => {
+                error.is_descendant_of_auth_commitment_mismatch()
+            }
+            _ => false,
+        }
+    }
+
     /// Returns the state location for duplicate commit requests.
     pub fn duplicate_location(&self) -> Option<&zs::KnownBlock> {
         match self {
@@ -1235,6 +1268,9 @@ impl VerifyCheckpointError {
             | VerifyCheckpointError::CoinbaseHeight { .. }
             | VerifyCheckpointError::DuplicateTransaction
             | VerifyCheckpointError::AmountError(_) => 100,
+            // Other commit failures stay unscored: they can come from local state, from a root
+            // another peer supplied, or from an ancestor's failure.
+            error if error.is_auth_commitment_mismatch() => 100,
             _other => 0,
         }
     }

@@ -82,7 +82,7 @@ zcash_script.workspace = true
 halo2 = { workspace = true }
 orchard.workspace = true
 zcash_history.workspace = true
-zcash_note_encryption = { workspace = true }
+zcash_note_encryption = { workspace = true, features = ["alloc"] }
 zcash_primitives = { workspace = true, features = ["transparent-inputs"] }
 sapling-crypto.workspace = true
 zcash_protocol.workspace = true

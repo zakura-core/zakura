@@ -1,5 +1,4 @@
-//! Contains code that interfaces with the zcash_note_encryption crate from
-//! librustzcash.
+//! Interfaces with Zakura Common note encryption for shielded coinbase recovery.
 
 use crate::{
     block::Height,

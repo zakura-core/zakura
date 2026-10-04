@@ -177,7 +177,8 @@ opentelemetry_sdk = { version = "0.32.1", default-features = false, features = [
 opentelemetry-otlp = { version = "0.32", default-features = false }
 uint = "0.10"
 x25519-dalek = "2.0.1"
-zcash_note_encryption = "0.4.1"
+# Staging requirement: select Common's breaking release before merging.
+zcash_note_encryption = { version = "=2.2.0", package = "zakura-note-encryption", default-features = false }
 zcash_script = "0.4.5"
 config = { version = "0.15.14", default-features = false, features = ["toml"] }
 

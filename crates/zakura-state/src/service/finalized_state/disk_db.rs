@@ -23,7 +23,6 @@ use std::{
 };
 
 use itertools::Itertools;
-use rlimit::increase_nofile_limit;
 
 use rocksdb::{ColumnFamilyDescriptor, ErrorKind, Options, ReadOptions};
 use semver::Version;
@@ -44,6 +43,9 @@ use super::zakura_db::transparent::{
 // Doc-only imports
 #[allow(unused_imports)]
 use super::{TypedColumnFamily, WriteTypedBatch};
+
+mod rlimit;
+use self::rlimit::increase_nofile_limit;
 
 // These helpers expose the raw RocksDB handle, so they must remain test-only.
 #[cfg(test)]
@@ -1655,7 +1657,7 @@ impl DiskDb {
         // On Unix-based platforms, `increase_nofile_limit` changes the limit for
         // both database files and TCP connections.
         //
-        // But it doesn't do anything on Windows in rlimit 0.7.0.
+        // It leaves Windows limits unchanged.
         //
         // On Windows, the default limits are:
         // - 512 high-level stream I/O files (via the C standard functions),
@@ -1668,8 +1670,8 @@ impl DiskDb {
         // `zakura-state`'s `IDEAL_OPEN_FILE_LIMIT` is much less than
         // the Windows low-level I/O file limit.
         //
-        // The [`setmaxstdio` and `getmaxstdio`](https://docs.rs/rlimit/latest/rlimit/#windows)
-        // functions from the `rlimit` crate only change the high-level I/O file limit.
+        // The Windows `_setmaxstdio` and `_getmaxstdio` functions only change
+        // the high-level I/O file limit.
         //
         // `zakura-network`'s default connection limit is much less than
         // the TCP Control Block limit on Windows.

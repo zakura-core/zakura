@@ -54,7 +54,6 @@ indexmap = { workspace = true }
 itertools = { workspace = true }
 lazy_static = { workspace = true }
 metrics = { workspace = true }
-rlimit = { workspace = true }
 rocksdb = { workspace = true, features = ["lz4"] }
 semver = { workspace = true }
 crossbeam-channel = { workspace = true }
@@ -84,6 +83,9 @@ proptest = { workspace = true, optional = true }
 proptest-derive = { workspace = true, optional = true }
 getset.workspace = true
 derive-new.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
 
 [dev-dependencies]
 zakura-header-chain = { path = "../zakura-header-chain", version = "4.0.1", features = ["test-support"] }

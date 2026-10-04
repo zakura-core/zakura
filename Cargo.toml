@@ -107,6 +107,7 @@ jsonrpsee-proc-macros = "0.24.9"
 jsonrpsee-types = "0.24.9"
 jubjub = { version = "=2.2.0", package = "zakura-jubjub" }
 lazy_static = "1.4"
+libc = "0.2"
 libzcash_script = "0.1"
 log = "0.4.27"
 metrics = "0.24"
@@ -130,7 +131,6 @@ redjubjub = { version = "=2.2.0", package = "zakura-redjubjub" }
 regex = "1.11"
 reqwest = { version = "0.13", default-features = false }
 ripemd = "0.1"
-rlimit = "0.10"
 # `bindgen-runtime` makes librocksdb-sys's bindgen load libclang itself. Without
 # it, a build that resolves a second bindgen version elsewhere (for example the
 # fresh placeholder project cargo-semver-checks generates) unifies clang-sys

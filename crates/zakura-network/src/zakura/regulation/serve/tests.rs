@@ -872,3 +872,37 @@ fn a_part_the_row_allows_but_the_cap_refuses_queues_nothing() {
         assert_eq!(queued.try_recv().is_ok(), result.is_ok());
     }
 }
+
+#[tokio::test]
+async fn queued_requests_allocate_only_commitments_until_dispatch() {
+    const COUNT: u32 = 64_000;
+    // Exercise the production protocol ceiling without starting a producer.
+    let request = crate::zakura::MessageRule {
+        role: crate::zakura::MessageRole::Request {
+            max_in_flight: COUNT / 2,
+            cadence: None,
+        },
+        ..GET
+    };
+    let capacity = ServeCapacity::new("queued-memory", &request, LIMITS).unwrap();
+    let Session {
+        serve,
+        output: _output,
+        cancel,
+    } = session(&capacity, 1, COUNT / 2);
+    let (completions, allocations) = zakura_test::allocations::measure(|| {
+        (0..COUNT)
+            .map(|_| serve.admit_tracked(job()).unwrap())
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(serve.open(), COUNT);
+    // Includes the queue, tracked completion watches and retained receivers.
+    // A response channel per queued job alone used several KiB per request.
+    let ceiling = usize::try_from(COUNT).unwrap() * 256;
+    assert!(allocations.retained_bytes < ceiling, "{allocations:?}");
+    eprintln!("queued requests={COUNT}, {allocations:?}");
+    cancel.cancel();
+    settle().await;
+    assert_eq!(serve.open(), 0, "cancelled jobs release their commitments");
+    assert!(completions.iter().all(|completed| *completed.borrow()));
+}

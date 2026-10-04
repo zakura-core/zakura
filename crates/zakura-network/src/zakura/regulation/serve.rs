@@ -10,7 +10,7 @@
 //! 2. **The serving task waits instead.** For each queued request, in order,
 //!    it takes peer and node response slots, then their output bytes for the
 //!    whole response cap, then a peer execution slot and a node execution
-//!    slot. Then it spawns `produce`.
+//!    slot. Only then does it allocate the response channel and spawn `produce`.
 //! 3. **`produce` never waits for the peer.** Its [`ResponseSink`] queues
 //!    frames against output bytes that are already granted. `produce` gives
 //!    back its execution slots as soon as it returns.
@@ -216,7 +216,6 @@ pub(super) struct ResponseGrants {
 struct Job<R> {
     request: R,
     commitment: Commitment,
-    frames: mpsc::UnboundedSender<ResponseFrame>,
 }
 
 /// Serving for one peer session and one request row.
@@ -227,7 +226,6 @@ pub(crate) struct Serve<P: Produce> {
     commitments: Arc<Commitments>,
     max_in_flight: u32,
     jobs: mpsc::UnboundedSender<Job<P::Request>>,
-    order: mpsc::UnboundedSender<mpsc::UnboundedReceiver<ResponseFrame>>,
     metrics: Arc<ServeMetrics>,
 }
 
@@ -270,7 +268,6 @@ impl ServeCapacity {
             }),
             max_in_flight: self.max_in_flight,
             jobs,
-            order,
             metrics: self.metrics.clone(),
         };
         serve.advertise(advertised);
@@ -278,6 +275,7 @@ impl ServeCapacity {
             produce,
             capacity: self.clone(),
             peer: self.peer(peer),
+            order,
             cancel: cancel.clone(),
         };
         tokio::spawn(dispatch.run(queued));
@@ -323,15 +321,12 @@ impl<P: Produce> Serve<P> {
             self.metrics.over_limit(open, limit);
         }
         self.metrics.admitted();
-        let (frames, response) = mpsc::unbounded_channel();
         // A closed channel means the session is cancelled. Dropping the job
         // releases its commitment.
         let _ = self.jobs.send(Job {
             request,
             commitment,
-            frames,
         });
-        let _ = self.order.send(response);
         Ok(())
     }
 
@@ -358,6 +353,7 @@ struct Dispatch<P> {
     produce: Arc<P>,
     capacity: ServeCapacity,
     peer: PeerBudgets,
+    order: mpsc::UnboundedSender<mpsc::UnboundedReceiver<ResponseFrame>>,
     cancel: CancellationToken,
 }
 
@@ -378,6 +374,13 @@ impl<P: Produce> Dispatch<P> {
                 return;
             };
             drop(waiting);
+            // Dispatch consumes jobs in admission order. Publish the response
+            // slot before spawning its producer, after capacity is reserved.
+            let (frames, response) = mpsc::unbounded_channel();
+            if self.order.send(response).is_err() {
+                self.cancel.cancel();
+                return;
+            }
             let task = Task {
                 produce: self.produce.clone(),
                 metrics: self.capacity.metrics.clone(),
@@ -387,7 +390,7 @@ impl<P: Produce> Dispatch<P> {
                 self.capacity.request,
                 P::Message::RULES,
                 cap,
-                job.frames,
+                frames,
                 Arc::new(grants),
                 job.commitment,
             );

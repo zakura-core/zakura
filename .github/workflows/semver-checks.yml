@@ -23,8 +23,8 @@
 #   a supported library API. Its release version is managed separately.
 # - publish = false members (xtask, zakura-watchdog) are skipped automatically.
 # - A NEW publishable crate that has never been published to crates.io fails
-#   with "no baseline": add `--exclude <crate>` to the check command in the
-#   same PR that introduces the crate, and remove it after its first publish.
+#   with "no baseline": add it to SEMVER_ENFORCEMENT_EXCLUSIONS in the package
+#   selector in the same PR, and remove it after its first publish.
 # - Baseline downloads come from crates.io; an outage fails the job
 #   (deliberately fail-closed — re-run when the registry recovers).
 name: Semver checks

@@ -111,9 +111,6 @@ skip-tree = [
     # wait for abscissa_core to update toml
     { name = "toml", version = "=0.5.11" },
 
-    # wait for halo2_gadgets and primitive-types to update uint
-    { name = "uint", version = "=0.9.5" },
-
     # wait for zebra to update tower
     { name = "tower", version = "=0.4.13" },
 

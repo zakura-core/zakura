@@ -70,6 +70,9 @@ audit-as-crates-io = false
 [policy.zakura-utils]
 audit-as-crates-io = false
 
+[policy.zakura_mmr_tree]
+audit-as-crates-io = false
+
 [[exemptions.addchain]]
 version = "0.3.0"
 criteria = "safe-to-deploy"

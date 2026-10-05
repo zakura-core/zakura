@@ -259,7 +259,7 @@ impl ServeCapacity {
     /// `max_in_flight` caps it. Sessions of one peer share its budgets, so
     /// reconnecting never adds capacity. `cancel` ends the session's serving:
     /// queued requests are dropped and running `produce` steps see their
-    /// lease cancelled.
+    /// lease cancelled. A panic in any serving task also closes `connection`.
     pub(crate) fn session<P: Produce>(
         &self,
         produce: Arc<P>,
@@ -267,6 +267,7 @@ impl ServeCapacity {
         advertised: u32,
         send: FramedSend,
         cancel: CancellationToken,
+        connection: CancellationToken,
     ) -> Serve<P> {
         let (jobs, queued) = mpsc::unbounded_channel();
         let (order, responses) = mpsc::unbounded_channel();
@@ -280,15 +281,21 @@ impl ServeCapacity {
             metrics: self.metrics.clone(),
         };
         serve.advertise(advertised);
+        let tasks = ServingTasks {
+            peer: peer.clone(),
+            cancel: cancel.clone(),
+            connection,
+        };
         let dispatch = Dispatch {
             produce,
             capacity: self.clone(),
             peer: self.peer(peer),
             order,
             cancel: cancel.clone(),
+            tasks: tasks.clone(),
         };
-        tokio::spawn(dispatch.run(queued));
-        tokio::spawn(write_in_order(responses, send, cancel));
+        tasks.spawn(dispatch.run(queued));
+        tasks.spawn(write_in_order(responses, send, cancel));
         serve
     }
 }
@@ -357,6 +364,30 @@ impl<P: Produce> Serve<P> {
     }
 }
 
+/// Supervise each task independently of the session reader and ordered writer.
+#[derive(Clone)]
+struct ServingTasks {
+    peer: ZakuraPeerId,
+    cancel: CancellationToken,
+    connection: CancellationToken,
+}
+
+impl ServingTasks {
+    fn spawn(&self, task: impl Future<Output = ()> + Send + 'static) {
+        let cancel = self.cancel.clone();
+        let connection = self.connection.clone();
+        crate::zakura::transport::spawn_supervised_peer_task(
+            self.peer.clone(),
+            || {},
+            move || {
+                cancel.cancel();
+                connection.cancel();
+            },
+            task,
+        );
+    }
+}
+
 /// The serving task of one session: waits for capacity, then spawns `produce`.
 struct Dispatch<P> {
     produce: Arc<P>,
@@ -364,6 +395,7 @@ struct Dispatch<P> {
     peer: PeerBudgets,
     order: mpsc::UnboundedSender<mpsc::UnboundedReceiver<ResponseFrame>>,
     cancel: CancellationToken,
+    tasks: ServingTasks,
 }
 
 impl<P: Produce> Dispatch<P> {
@@ -403,7 +435,7 @@ impl<P: Produce> Dispatch<P> {
                 Arc::new(grants),
                 job.commitment,
             );
-            tokio::spawn(task.run(job.request, core, slots));
+            self.tasks.spawn(task.run(job.request, core, slots));
         }
     }
 

@@ -43,6 +43,8 @@ pub(super) struct Job {
     /// Return from `produce` after the ending and hold this gate, so the
     /// ending is queued while execution continues.
     pub(super) hold_after: Option<Arc<Semaphore>>,
+    panic_cap: bool,
+    panic_produce: bool,
 }
 
 /// A `Produce` that follows each request's [`Job`].
@@ -54,6 +56,7 @@ impl Produce for Scripted {
     type Message = Probe;
 
     fn response_cap(&self, job: &Job) -> ResponseCap {
+        assert!(!job.panic_cap, "injected dispatch panic");
         ResponseCap {
             frames: job.parts,
             // A part's payload is its bytes plus a one-byte count; the ending
@@ -68,6 +71,7 @@ impl Produce for Scripted {
         lease: WorkLease,
         mut sink: ResponseSink<Probe>,
     ) -> Result<Responded, ServeEnd> {
+        assert!(!job.panic_produce, "injected producer panic");
         if let Some(probe) = job.blocking.clone() {
             let lease = lease.clone();
             let work = tokio::task::spawn_blocking(move || {
@@ -144,6 +148,7 @@ pub(super) fn session(capacity: &ServeCapacity, peer_n: u8, advertised: u32) -> 
             &peer(peer_n),
             advertised,
             send,
+            cancel.clone(),
             cancel.clone(),
         ),
         output,
@@ -488,7 +493,14 @@ async fn a_non_reading_peer_holds_output_bytes_but_no_execution_slot() {
     // A one-frame output queue that nobody reads.
     let (send, _output) = framed_channel(1);
     let cancel = CancellationToken::new();
-    let serve = capacity.session(Arc::new(Scripted), &peer(1), 4, send, cancel.clone());
+    let serve = capacity.session(
+        Arc::new(Scripted),
+        &peer(1),
+        4,
+        send,
+        cancel.clone(),
+        cancel.clone(),
+    );
     for _ in 0..4 {
         serve
             .admit(Job {
@@ -544,7 +556,14 @@ async fn tiny_responses_with_a_blocked_writer_hold_response_slots() {
     let (send, output) = framed_channel(1);
     let cancel = CancellationToken::new();
     let mut session = Session {
-        serve: capacity.session(Arc::new(Scripted), &peer(1), 4, send, cancel.clone()),
+        serve: capacity.session(
+            Arc::new(Scripted),
+            &peer(1),
+            4,
+            send,
+            cancel.clone(),
+            cancel.clone(),
+        ),
         output,
         cancel,
     };
@@ -969,6 +988,7 @@ async fn serving_output_keeps_a_queue_slot_for_control_messages() {
         4,
         send.clone(),
         cancel.clone(),
+        cancel.clone(),
     );
     serve
         .admit(Job {
@@ -988,4 +1008,58 @@ async fn serving_output_keeps_a_queue_slot_for_control_messages() {
     assert!(messages[..4].contains(&Probe::Ping(7)));
     assert_eq!(messages.last(), Some(&Probe::Done(10)));
     cancel.cancel();
+}
+
+#[tokio::test]
+async fn serving_panics_close_the_connection_even_with_a_blocked_writer() {
+    for panic_cap in [true, false] {
+        let capacity = capacity(LIMITS);
+        let (send, output) = framed_channel(1);
+        let cancel = CancellationToken::new();
+        let connection = CancellationToken::new();
+        let serve = capacity.session(
+            Arc::new(Scripted),
+            &peer(1),
+            4,
+            send.clone(),
+            cancel.clone(),
+            connection.clone(),
+        );
+        // The first frame occupies the only queue slot. The writer waits on
+        // the rest of this response and cannot observe dispatch's channel closing.
+        serve
+            .admit(Job {
+                parts: 3,
+                part_len: 8,
+                ..job()
+            })
+            .unwrap();
+        settle().await;
+        assert_eq!(send.capacity(), 0);
+        assert!(!connection.is_cancelled());
+        serve
+            .admit(Job {
+                panic_cap,
+                panic_produce: !panic_cap,
+                ..job()
+            })
+            .unwrap();
+        serve.admit(job()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), connection.cancelled())
+            .await
+            .unwrap();
+        assert!(cancel.is_cancelled());
+        settle().await;
+        assert_eq!(serve.open(), 0);
+        drop(output);
+        settle().await;
+        assert_eq!(capacity.node_execution_held(), 0);
+        assert_eq!(capacity.node_output_held(), 0);
+        assert_eq!(capacity.node_output_responses.reserved(), 0);
+        let mut healthy = session(&capacity, 2, 4);
+        healthy.serve.admit(job()).unwrap();
+        assert!(matches!(next(&mut healthy.output).await, Probe::Done(0)));
+        assert!(!healthy.cancel.is_cancelled());
+        healthy.cancel.cancel();
+    }
 }

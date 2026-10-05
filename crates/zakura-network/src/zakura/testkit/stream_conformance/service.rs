@@ -437,6 +437,7 @@ impl<A: StreamConformance> Service for LayoutService<A> {
                     plan.max_in_flight,
                     sends[plan.response_stream].clone(),
                     cancel.clone(),
+                    peer.cancel_token(),
                 )
             })
             .collect();

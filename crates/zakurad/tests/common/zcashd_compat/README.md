@@ -84,12 +84,11 @@ make compat-test-soak \
 
 The `zcashd_compat_nu7_*` tests run regtest with every upgrade through NU6.3 at
 height 1 and NU7 at 210, a zero-value NU6.1 lockbox disbursement marker, and the
-same initial NSM value balance on both sides. They need a zcashd with NU7
-support, so they are skipped unless `TEST_ZCASHD_COMPAT_NU7=1` and
-`TEST_ZCASHD_PATH` points to such a build:
+same initial NSM value balance on both sides. They run with the rest of the
+regtest suite, and this runs only them:
 
 ```console
-make compat-test-nu7 TEST_ZCASHD_PATH=/path/to/nu7/zcashd
+make compat-test-nu7
 ```
 
 ### External — Mainnet / Testnet (deployment validation)
@@ -156,7 +155,6 @@ error (misconfiguration, not a skip).
 | `TEST_ZCASHD_RPC_PASSWORD` | External (fallback) | zcashd RPC password |
 | `TEST_ZCASHD_COMPAT_REORG_ITERATIONS` | No | Reorg churn cycles; defaults to 30 in tests and 500 in `make compat-test-soak` |
 | `TEST_ZCASHD_COMPAT_RESTART_AFTER_REORG` | No | Set to `1` to run slow restart-after-reorg probes |
-| `TEST_ZCASHD_COMPAT_NU7` | No | Set to `1` to run the NU7 activation tests (needs `TEST_ZCASHD_PATH`) |
 
 ## Test Inventory
 
@@ -188,10 +186,10 @@ error (misconfiguration, not a skip).
 | `zcashd_compat_reorg_zakura_tip_behind_local` | reorg | Recoverable Zakura-tip-behind-local state and required recovery | **Skipped** |
 | `zcashd_compat_reorg_context_zakura_tip_behind_recovers` | reorg | No sticky failure on tip-behind after paused reorg convergence | **Skipped** |
 | `zcashd_compat_reorg_churn` | reorg | Repeated small reorg stress loop | **Skipped** |
-| `zcashd_compat_nu7_activation_follows_zakurad` | nu7 | **Opt-in:** same tip, branch, NSM value balance, supply and subsidy across NU7 | **Skipped** |
-| `zcashd_compat_nu7_fee_burn_and_wallet_transactions` | nu7 | **Opt-in:** ZIP 235 fee burn on both sides; v5 transactions with the NU7 expiry | **Skipped** |
-| `zcashd_compat_nu7_burst_sync_and_restart` | nu7 | **Opt-in:** 300-block burst without reconnecting; NSM value balance after restart | **Skipped** |
-| `zcashd_compat_nu7_sapling_spend_reorg_and_restart` | nu7 | **Opt-in:** pre-NU7 Sapling note spent after activation; Sapling spends after a reorg and a restart | **Skipped** |
+| `zcashd_compat_nu7_activation_follows_zakurad` | nu7 | Same tip, branch, NSM value balance, supply and subsidy across NU7 | **Skipped** |
+| `zcashd_compat_nu7_fee_burn_and_wallet_transactions` | nu7 | ZIP 235 fee burn on both sides; v5 transactions with the NU7 expiry | **Skipped** |
+| `zcashd_compat_nu7_burst_sync_and_restart` | nu7 | 300-block burst without reconnecting; NSM value balance after restart | **Skipped** |
+| `zcashd_compat_nu7_sapling_spend_reorg_and_restart` | nu7 | Pre-NU7 Sapling note spent after activation; Sapling spends after a reorg and a restart | **Skipped** |
 
 ## Prerequisites for External Mode
 

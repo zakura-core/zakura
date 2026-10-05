@@ -205,11 +205,9 @@ compat-test-regtest:
 	TEST_ZCASHD_PATH="$(TEST_ZCASHD_PATH)" \
 	cargo nextest run --profile zcashd-compat-integration --run-ignored=only
 
-# Run the NU7 activation tests against a fresh regtest environment with NU7 at 210.
-# They need a zcashd with NU7 support: set TEST_ZCASHD_PATH until the embedded sidecar has it.
+# Run only the NU7 activation tests against a fresh regtest environment with NU7 at 210.
 compat-test-nu7:
 	TEST_ZCASHD_COMPAT=1 \
-	TEST_ZCASHD_COMPAT_NU7=1 \
 	TEST_ZCASHD_PATH="$(TEST_ZCASHD_PATH)" \
 	cargo nextest run --profile zcashd-compat-nu7 --run-ignored=only
 

@@ -8,12 +8,16 @@ use std::time::Duration;
 use color_eyre::eyre::{ensure, eyre, Result};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
+use zakura_chain::parameters::NetworkKind;
 
 use super::{
-    config::{RegtestProfile, MINER_PRIV_WIF, MINER_T_ADDR, NU7_TEST_INITIAL_NSM_VALUE_BALANCE},
+    config::{
+        read_test_network_kind, RegtestProfile, MINER_PRIV_WIF, MINER_T_ADDR,
+        NU7_TEST_INITIAL_NSM_VALUE_BALANCE,
+    },
     launch::{spawn_zakurad_with_zcashd_compat_profile, wait_for_zcashd_rpc, ZcashdCompatSetup},
     reorg::{force_zakura_reorg, restart_zcashd_and_wait_for_tips, wait_for_tips_match},
-    wait_for_zcashd_height, zakura_skip_zcashd_compat_tests, TEST_ZCASHD_COMPAT_NU7,
+    wait_for_zcashd_height, zakura_skip_zcashd_compat_tests,
 };
 use crate::common::regtest::MiningRpcMethods;
 
@@ -32,17 +36,9 @@ const NU7_BRANCH_ID: &str = "77190ad9";
 const FEE_ZAT: i64 = 10_001;
 
 /// Spawns zakurad and a sidecar with NU7 at [`NU7_HEIGHT`], or returns `None` if the
-/// zcashd-compat tests or the NU7 tests are disabled.
-#[allow(clippy::print_stderr)]
+/// zcashd-compat tests are disabled or run against an external network.
 async fn setup_nu7() -> Result<Option<ZcashdCompatSetup>> {
-    if zakura_skip_zcashd_compat_tests() {
-        return Ok(None);
-    }
-    if std::env::var_os(TEST_ZCASHD_COMPAT_NU7).is_none() {
-        eprintln!(
-            "Skipped NU7 zcashd-compat test; set {TEST_ZCASHD_COMPAT_NU7}=1 and TEST_ZCASHD_PATH \
-             to a zcashd with NU7 support to run"
-        );
+    if zakura_skip_zcashd_compat_tests() || read_test_network_kind()? != NetworkKind::Regtest {
         return Ok(None);
     }
     spawn_zakurad_with_zcashd_compat_profile(RegtestProfile::Nu7At(NU7_HEIGHT), |_| {})

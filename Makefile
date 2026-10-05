@@ -52,7 +52,7 @@ help:
 	@echo "  compat-zcashd-status             Check zcashd liveness and zebra-compat RPC health"
 	@echo "  compat-status-sync               Run both status checks and enforce max drift"
 	@echo "  compat-test-regtest              Run full zcashd-compat test suite (regtest, spawns processes)"
-	@echo "  compat-test-nu7                  Run the NU7 activation tests (regtest, needs TEST_ZCASHD_PATH)"
+	@echo "  compat-test-nu7                  Run only the NU7 activation tests (regtest)"
 	@echo "  compat-test-mainnet              Run read-only zcashd-compat tests against live mainnet"
 	@echo "  compat-test-testnet              Run read-only zcashd-compat tests against live testnet"
 	@echo ""

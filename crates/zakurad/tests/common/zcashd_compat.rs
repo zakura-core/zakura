@@ -63,10 +63,6 @@ pub const TEST_ZCASHD_COMPAT_REORG_ITERATIONS: &str = "TEST_ZCASHD_COMPAT_REORG_
 /// Enable slow zcashd restart-after-reorg integration probes.
 pub const TEST_ZCASHD_COMPAT_RESTART_AFTER_REORG: &str = "TEST_ZCASHD_COMPAT_RESTART_AFTER_REORG";
 
-/// Enable the NU7 activation tests, which need `TEST_ZCASHD_PATH` to point to a zcashd with
-/// NU7 support until the embedded sidecar has it.
-pub const TEST_ZCASHD_COMPAT_NU7: &str = "TEST_ZCASHD_COMPAT_NU7";
-
 // ── Skip guard ────────────────────────────────────────────────────────────────
 
 /// Returns `true` and prints a message if zcashd-compat tests are disabled.

@@ -608,6 +608,24 @@ pub(crate) async fn close_progresses<A: StreamConformance>(
     close_progresses_with_wait::<A>(layout, true).await
 }
 
+/// Hold the response allowance while preserving the transport slot needed by Close.
+async fn hold_response_allowance(
+    send: &crate::zakura::FramedSend,
+) -> Result<Vec<crate::zakura::transport::ResponseFrameSlot<'_>>, BoxError> {
+    ensure(send.max_capacity() >= 2, || {
+        "P9 allowance blocking requires a response slot and an independent control slot".to_owned()
+    })?;
+    let mut slots = Vec::new();
+    for _ in 0..send.max_capacity() - 1 {
+        slots.push(
+            tokio::time::timeout(CONFORMANCE_DEADLINE, send.reserve_response_guarded())
+                .await?
+                .map_err(|error| format!("response slot: {error:?}"))?,
+        );
+    }
+    Ok(slots)
+}
+
 /// Exercise both grant exhaustion and response allowance exhaustion.
 async fn close_progresses_with_wait<A: StreamConformance>(
     layout: &'static [Stream],
@@ -643,11 +661,8 @@ async fn close_progresses_with_wait<A: StreamConformance>(
         objects: credit.objects - one_page.objects,
         bytes: credit.bytes - one_page.bytes,
     });
-    if allowance_only && opening.is_none() {
-        return Ok(()); // This variant needs credit for an earlier and a blocked page.
-    }
     let pages = if allowance_only {
-        1
+        u32::from(opening.is_some())
     } else {
         pages_within::<A>(&subscription, opening.unwrap_or(credit))?
     };
@@ -660,6 +675,11 @@ async fn close_progresses_with_wait<A: StreamConformance>(
     let session = victim.wait_session(&raw.id()).await?;
     let send = &session.sends[subscription.response_stream];
     let mut response_slots = Vec::new();
+    if allowance_only && pages == 0 {
+        // A one-page credit window cannot also leave an earlier page unread.
+        // Block its first page instead of silently skipping allowance coverage.
+        response_slots = hold_response_allowance(send).await?;
+    }
 
     // Open, and read nothing.
     raw.send(
@@ -682,17 +702,10 @@ async fn close_progresses_with_wait<A: StreamConformance>(
     )
     .await?;
 
-    if allowance_only {
-        // Reserve every response slot, leaving one transport slot for the ending.
+    if allowance_only && pages > 0 {
         // An earlier page is already queued on QUIC. The next page must wait
         // without spending credit, so Close can cancel it and follow the first.
-        for _ in 0..send.max_capacity().saturating_sub(1).max(1) {
-            response_slots.push(
-                send.reserve_response_guarded()
-                    .await
-                    .map_err(|error| format!("response slot: {error:?}"))?,
-            );
-        }
+        response_slots = hold_response_allowance(send).await?;
     }
 
     // Hold every execution slot and output byte. A grant makes the next page
@@ -712,6 +725,8 @@ async fn close_progresses_with_wait<A: StreamConformance>(
         )
         .await?;
         sequence += 1;
+    }
+    if opening.is_some() || allowance_only {
         await_until("a page waits for capacity", CONFORMANCE_DEADLINE, || {
             if allowance_only {
                 shared.push_send_waits.load(Ordering::Relaxed) > 0
@@ -784,4 +799,22 @@ async fn close_progresses_with_wait<A: StreamConformance>(
     victim.shutdown().await;
     control.shutdown().await;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A one-slot queue cannot prove independent control headroom, and must fail promptly.
+    #[tokio::test]
+    async fn p9_rejects_a_one_slot_allowance_without_waiting() {
+        let (send, _recv) = crate::zakura::framed_channel(1);
+        let error =
+            tokio::time::timeout(Duration::from_millis(100), hold_response_allowance(&send))
+                .await
+                .expect("an unsupported queue is rejected before reserving it")
+                .unwrap_err();
+        assert!(error.to_string().contains("independent control slot"));
+        assert_eq!(send.capacity(), 1);
+    }
 }

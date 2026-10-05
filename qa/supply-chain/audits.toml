@@ -225,6 +225,12 @@ who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 delta = "0.5.1 -> 0.5.2"
 
+[[audits.bip32]]
+who = "Claude Opus 5.5 <noreply@anthropic.com>"
+criteria = "safe-to-deploy"
+delta = "0.6.0-pre.1 -> 0.6.0"
+notes = "Reviewed the complete packaged Rust-source and manifest deltas against the 0.6.0-pre.1 baseline. The bulk of the change deletes the BIP-39 mnemonic module (`src/mnemonic/*`, the English wordlist and PBKDF2 seed derivation) together with the `bip39`, `mnemonic` and `std` features and the `pbkdf2`, `once_cell` and `rand_core` dependencies. Child-key derivation, hardened/non-hardened handling, `ChildNumber`/`Depth`/`DerivationPath` and extended-key serialization and parsing are unchanged apart from formatting, and the encoded key buffer is still zeroized. `ExtendedPrivateKey::{new, derive_from_path}` now borrow the seed and keep the 16/32/64-byte length check; its `Debug` output still omits private key material. The k256 and secp256k1 0.33 backends are mechanical API migrations (`to_sec1_point`, `GENERATOR`, `from_secret_bytes`/`to_secret_bytes`, context-free `from_secret_key`/`add_exp_tweak`), and tweak scalars are still range- and zero-checked. `#![forbid(unsafe_code)]` is retained, the release introduces no unsafe code or additional ambient capability, and dependency requirements move from exact pre-release pins to the stable hmac 0.13, k256 0.14, ripemd 0.2, sha2 0.11 and secp256k1 0.33 lines. No build script was added. Source review only; compilation and runtime tests are delegated to PR CI."
+
 [[audits.bitflags]]
 who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
@@ -266,6 +272,12 @@ who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
 version = "0.11.0-rc.3"
 notes = "Reviewed all packaged source, manifest, and tests. The sealed eager and lazy buffer kinds maintain checked cursor bounds, the compile-time size assertion excludes zero and sizes above 255, and every MaybeUninit read is limited to the initialized cursor or a completed block. There is no build script, runtime I/O, or ambient authority. All 8 integration tests and 3 doctests passed with all features."
+
+[[audits.block-buffer]]
+who = "Claude Opus 5.5 <noreply@anthropic.com>"
+criteria = "safe-to-deploy"
+delta = "0.11.0-rc.3 -> 0.12.1"
+notes = "Reviewed the complete packaged Rust-source and manifest deltas against the audited 0.11.0-rc.3 baseline. Block sizes are now bounded by a sealed `BlockSizes` trait (`IsLess<U256> + NonZero`), replacing a const assertion that not every constructor reached and statically guaranteeing that the Eager last-byte position slot and the `u8` cursors cannot underflow or truncate. The 0.12.1 exception-safety fix adds `ResetGuard`s around the `compress` callbacks in `digest_blocks` and the rewritten `digest_pad`, so a panicking callback can no longer leave an out-of-range Eager position that would later reach `unreachable_unchecked`; `digest_pad` fully initializes the block (delimiter plus `size - pos - 1` zero bytes) before `assume_init_mut` and checks the suffix length with `checked_sub`. `ReadBuffer` drops its public `Zeroize` impl, which could zero the cursor byte and break the invariant, in favor of zeroize-on-drop; its `set_pos_unchecked` becomes `unsafe fn`, and the new `read_cached`/`write_block` keep the cursor in `1..=BS` with a reset guard on panic. The hand-rolled `from_raw_parts` block splitting is replaced by safe `Array::slice_as_chunks` calls, and the new generic `serialize`/`deserialize` validates the position byte and zero tail before writing buffer data. The `ptr::read`-based `Clone` remains sound because the buffer owns no resources and its new `Drop` only zeroizes inline memory, although its SAFETY comment still says the type has no `Drop`. No dependencies or build script were added, and there is no filesystem, network, environment or process access. Source review only; compilation and runtime tests are delegated to PR CI."
 
 [[audits.bls12_381]]
 who = "Claude Opus 5 <noreply@anthropic.com>"
@@ -671,6 +683,12 @@ criteria = "safe-to-deploy"
 version = "0.1.7"
 notes = "Reviewed all packaged source and manifest. This no_std trait crate defines type-level cryptographic block, output, key, and IV sizes plus checked slice adapters and caller-supplied RNG helpers. It forbids unsafe code and has no build script, runtime I/O, or hidden ambient capabilities; dependencies remain separately policy-checked. All-feature library and documentation targets passed; the package defines no tests."
 
+[[audits.crypto-common]]
+who = "Claude Opus 5.5 <noreply@anthropic.com>"
+criteria = "safe-to-deploy"
+delta = "0.2.0-rc.1 -> 0.2.2"
+notes = "Reviewed the complete packaged Rust-source and manifest deltas against the audited 0.2.0-rc.1 baseline. The crate keeps `#![forbid(unsafe_code)]`. The delta removes the `BlockSizes` trait, leaving `BlockSizeUser::BlockSize` bounded only by `ArraySize` (block-buffer now enforces its own sealed block-size bound); adds the `Generate`, `KeyExport`, `TryKeyInit` and `SetIvState` traits plus `InvalidKey`; deprecates the inherent `generate_*` key and IV helpers in favor of `Generate`; removes the `std` feature; and moves to rand_core 0.10, getrandom 0.4 and hybrid-array 0.4. OS randomness is reachable only through the existing opt-in `getrandom` feature (`Generate::try_generate`/`generate` via `SysRng`), matching the ambient RNG capability the baseline already exposed through `generate_key`. The new `zeroize` feature only forwards to hybrid-array. `hazmat` changes are limited to macro plumbing and `core::error::Error`; the pre-existing `[u128; N]` `SerializableState` impl still uses an 8-byte element size and panics deterministically if used, which is unchanged and not a memory-safety issue. No build script was added, and there is no filesystem, network, environment or process access. Source review only; compilation and runtime tests are delegated to PR CI."
+
 [[audits.crypto_secretbox]]
 who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
@@ -820,6 +838,12 @@ who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
 version = "0.11.0-pre.9"
 notes = "Reviewed all packaged source and manifest content. This no_std facade defines digest traits and checked adapters over caller-supplied buffers; algorithm implementations and block buffering remain in separately policy-checked dependencies. No unsafe code, build script, runtime I/O, or ambient authority. All-feature targets compiled against the exact locked block-buffer release-candidate dependency."
+
+[[audits.digest]]
+who = "Claude Opus 5.5 <noreply@anthropic.com>"
+criteria = "safe-to-deploy"
+delta = "0.11.0-pre.9 -> 0.11.3"
+notes = "Reviewed the complete packaged Rust-source and manifest deltas against the audited 0.11.0-pre.9 baseline. The crate keeps #![forbid(unsafe_code)] and drops its std feature and std::io Read/Write implementations, so it is now no_std with optional alloc. The core_api module becomes block_api, the CoreWrapper/RtVariableCoreWrapper/XofReaderCoreWrapper types are replaced by buffer_fixed!/buffer_ct_variable!/buffer_rt_variable!/buffer_xof! macros, CtVariableCoreWrapper becomes CtOutWrapper with unchanged type-checked truncation, and XofFixedWrapper, CustomizedInit, TryCustomizedInit and CollisionResistance are added; macro-generated Debug output does not expose state, ZeroizeOnDrop is implemented only after asserting that the core and buffer implement it, and state deserialization delegates validation to the core and block-buffer and returns errors rather than panicking. MAC tag verification and CtOutput equality move from subtle to ctutils::CtEq with length checks preserved. The new getrandom feature only forwards to crypto-common. Dependencies move to block-buffer 0.12, crypto-common 0.2, const-oid 0.10 and blobby 0.4, and ctutils 0.4 replaces subtle; no build script was added and there is no filesystem, network, environment, or process access. Source review only; compilation and runtime tests are delegated to PR CI."
 
 [[audits.dirs]]
 who = "OpenAI Codex <noreply@openai.com>"
@@ -1283,6 +1307,12 @@ criteria = "safe-to-deploy"
 version = "0.13.0-pre.4"
 notes = "Reviewed all packaged source, manifest, and tests. The no_std implementation performs standard HMAC key normalization and inner/outer pad separation over fixed block sizes, with constant-time verification supplied by separately policy-checked dependencies. No unsafe code, build script, I/O, or ambient authority. All 23 tests and 2 doctests passed against the exact locked block-buffer release candidate."
 
+[[audits.hmac]]
+who = "Claude Opus 5.5 <noreply@anthropic.com>"
+criteria = "safe-to-deploy"
+delta = "0.13.0-pre.4 -> 0.13.0"
+notes = """Reviewed the complete packaged Rust-source and manifest deltas against the 0.13.0-pre.4 baseline. The block-level and simple implementations are reorganized into `block_api` (`HmacCore`, new `HmacResetCore`), `simple`/`simple_reset` and `utils`, and the `Hmac`/`HmacReset` aliases become `digest::buffer_fixed!` newtypes. The `reset` and `std` features are replaced by distinct reset types and a `zeroize` feature that forwards to `digest/zeroize`. Key derivation (`get_der_key`), ipad/opad construction and inner/outer finalization are unchanged. `SimpleHmac`'s `Debug` no longer prints the keyed inner state. Constant-time tag verification remains `digest`'s `Mac::verify_slice`/`CtOutput`. The two added `unsafe` matches are manifest lints (`unsafe_code = "forbid"`, `undocumented_unsafe_blocks`), the source contains no unsafe code, and the release adds no ambient capability. The digest requirement moves to the stable 0.11.2 line. No build script was added. Source review only; compilation and runtime tests are delegated to PR CI."""
+
 [[audits.hmac-sha1]]
 who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
@@ -1354,6 +1384,12 @@ who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
 version = "0.2.3"
 notes = "Reviewed all packaged source, generated size mappings, manifest, and tests. ArraySize is effectively sealed through typenum::Unsigned and maps each supported type-level size to the exact core array layout used by reference casts; fallible construction tracks and drops only initialized elements, slice conversions validate exact lengths, and split and flatten arithmetic remains bounded. Optional Serde, bytemuck, and zeroize implementations retain their element trait bounds, with no build script, I/O, or ambient capability. Default features passed 17 integration tests and 6 doctests; all features passed 20 tests and the same 6 doctests."
+
+[[audits.hybrid-array]]
+who = "Claude Opus 5.5 <noreply@anthropic.com>"
+criteria = "safe-to-deploy"
+delta = "0.2.3 -> 0.4.15"
+notes = "Reviewed the complete packaged Rust-source and manifest deltas against the audited 0.2.3 baseline, re-deriving the safety of every unsafe block in 0.4.15. All pointer casts, `from_raw_parts` calls and `MaybeUninit` handling still rest on the sealed `unsafe trait ArraySize` invariant that `ArrayType<T>` is `[T; U::USIZE]`. Every one of the 820 `N => UN` mappings in `sizes.rs` and the 267 little-endian `uint!` aliases behind `extra-sizes` was checked mechanically to match its name, and the macro also emits a test asserting each one. New unsafe code covers length-checked `slice_as_array`/`slice_as_mut_array` casts, `slice_as_flattened` with `checked_mul` (replacing the baseline's `unchecked_mul`), `repr(transparent)` core-array/slice casts bounded on `ArrayType<T> = [T; N]`, a rewritten `concat` that fully initializes a `Sum<U, N>` `MaybeUninit` array before `assume_init`, and a new `Flatten`/`Unflatten` module that moves elements through `ManuallyDrop` and `ptr::read` between `[[T; M]; N]` and `[T; M*N]`, with typenum `Rem<M, Output = U0>`/`Quot` bounds guaranteeing exact sizing. The `from_fn` drop guard, `split*`, chunking, `Send`/`Sync` and bytemuck impls are unchanged in substance. New optional dependencies (`arbitrary`, `ctutils`, `subtle`, `zerocopy`) add trait impls only; `subtle` equality folds over all elements without early exit. The crate remains `no_std` with optional `alloc`, has no build script or proc macro of its own, and uses no filesystem, network, environment or process access. Source review only; compilation and runtime tests are delegated to PR CI."
 
 [[audits.hyper]]
 who = "Claude Opus 5 <noreply@anthropic.com>"
@@ -2907,6 +2943,12 @@ criteria = "safe-to-deploy"
 version = "0.2.0-pre.4"
 notes = "Reviewed all packaged source, manifest, and tests. The no_std implementation uses fixed RIPEMD round schedules, constants, and wrapping word operations over exact-size blocks and delegates buffering to separately policy-checked digest traits. No unsafe code, build script, I/O, or ambient authority. All 16 known-answer tests and 1 doctest passed against the exact locked block-buffer release candidate."
 
+[[audits.ripemd]]
+who = "Claude Opus 5.5 <noreply@anthropic.com>"
+criteria = "safe-to-deploy"
+delta = "0.2.0-pre.4 -> 0.2.0"
+notes = "Reviewed the complete packaged Rust-source and manifest deltas against the 0.2.0-pre.4 baseline. The RIPEMD core-state macro moves unchanged from `lib.rs` into a new `block_api` module (update, padding/finalization, reset, feature-gated zeroize-on-drop and `SerializableState`), and the public hashers become `digest::buffer_fixed!` newtypes with the same OIDs. The `c128`/`c160`/`c256`/`c320` compression functions and constants are unchanged apart from narrowing visibility to `pub(super)` and dropping redundant imports. The `std` feature is replaced by `alloc`, and the digest requirement moves from an exact pre-release pin to the stable 0.11 line. `#![forbid(unsafe_code)]` is retained, and the release introduces no unsafe code or additional ambient capability. No build script was added. Source review only; compilation and runtime tests are delegated to PR CI."
+
 [[audits.rlimit]]
 who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
@@ -3263,6 +3305,12 @@ who = "Claude Opus 5 <noreply@anthropic.com>"
 criteria = "safe-to-deploy"
 version = "0.11.0-pre.4"
 notes = "Reviewed all packaged source, manifest, and tests. The crate is no_std with no build script; the x86 SHA-NI and AVX2 backends and the aarch64 SHA2 backend are gated on compile-time target features or cpufeatures runtime detection, with a portable implementation otherwise, and all of them are straight-line compression functions with no data-dependent control flow. Message-length accounting uses checked arithmetic and the padding path handles the block-boundary case explicitly. All 16 tests passed, including the NIST vectors; the package must be built against the workspace lockfile because resolving its prerelease digest and block-buffer dependencies afresh picks incompatible versions."
+
+[[audits.sha2]]
+who = "Claude Opus 5.5 <noreply@anthropic.com>"
+criteria = "safe-to-deploy"
+delta = "0.11.0-pre.4 -> 0.11.0"
+notes = "Reviewed the complete packaged Rust-source and manifest deltas against the audited 0.11.0-pre.4 baseline. Backend selection moves from the force-soft feature to sha2_backend/sha2_256_backend/sha2_512_backend cfgs; runtime dispatch still gates the x86 SHA-NI/AVX2 and aarch64 sha2/sha3 target_feature functions behind cpufeatures detection with a soft fallback, and every forced backend is guarded by compile_error! unless the required target features are enabled at compile time. The aarch64 backends replace their inline-asm polyfills with stable core::arch intrinsics; the x86 backends are unchanged apart from moving dispatch and adding a matching target_feature attribute to the SHA-NI schedule helper. New wasm32 simd128 backends use unaligned v128_load with block and round-constant indices bounded within the 64/128-byte blocks and the 64/80-entry K tables; new soft unrolled backends read round constants through pointer reads at macro-literal indices within bounds; a new nightly-only, cfg-opt-in RISC-V Zknh backend uses alignment-checked loads, assert-guarded constant loads, and readonly inline asm for the partially out-of-block aligned words of unaligned blocks. Padding, finalization, round constants, and zeroize-on-drop of core state are unchanged. The crate remains no_std with no filesystem, network, environment, or process access, and no build script was added. The cpufeatures dependency moves to 0.3. Source review only; compilation and runtime tests are delegated to PR CI."
 
 [[audits.shardtree]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
@@ -4704,6 +4752,12 @@ user-id = 6743
 start = "2021-12-08"
 end = "2025-07-09"
 
+[[trusted.libzcash_script]]
+criteria = "safe-to-deploy"
+user-id = 159631 # Conrado (conradoplg)
+start = "2026-10-01"
+end = "2027-10-05"
+
 [[trusted.orchard]]
 criteria = "safe-to-deploy"
 user-id = 169181 # Kris Nuttycombe (nuttycom)
@@ -4763,3 +4817,9 @@ criteria = "safe-to-deploy"
 user-id = 169181 # Kris Nuttycombe (nuttycom)
 start = "2024-08-20"
 end = "2027-07-10"
+
+[[trusted.zcash_script]]
+criteria = "safe-to-deploy"
+user-id = 169181 # Kris Nuttycombe (nuttycom)
+start = "2026-10-01"
+end = "2027-10-05"

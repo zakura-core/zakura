@@ -22,6 +22,13 @@ user-id = 5946
 user-login = "jrmuizel"
 user-name = "Jeff Muizelaar"
 
+[[publisher.libzcash_script]]
+version = "0.2.0"
+when = "2026-10-01"
+user-id = 159631
+user-login = "conradoplg"
+user-name = "Conrado"
+
 [[publisher.syn]]
 version = "1.0.109"
 when = "2023-02-24"
@@ -84,6 +91,13 @@ trusted-publisher = "github:zakura-core/zakura"
 [[publisher.zcash_history]]
 version = "0.5.0"
 when = "2026-07-09"
+user-id = 169181
+user-login = "nuttycom"
+user-name = "Kris Nuttycombe"
+
+[[publisher.zcash_script]]
+version = "0.6.0"
+when = "2026-10-01"
 user-id = 169181
 user-login = "nuttycom"
 user-name = "Kris Nuttycombe"

@@ -218,11 +218,19 @@ jobs:
           SSH_AUTH_SOCK="$ssh_agent_sock" ssh-add - <<< "$ZAKURA_MAINNET_DEPLOY_SSH_KEY"
           echo "SSH_AUTH_SOCK=$ssh_agent_sock" >> "$GITHUB_ENV"
 
-      - name: Pin the compatibility host key
+      - name: Load the independently verified compatibility host key
+        env:
+          COMPAT_KNOWN_HOSTS: ${{ vars.ZAKURA_COMPAT_SSH_KNOWN_HOSTS }}
         run: |
           set -euo pipefail
-          ssh-keyscan -T 30 -H 159.203.113.196 > "$RUNNER_TEMP/monitoring_known_hosts"
-          test -s "$RUNNER_TEMP/monitoring_known_hosts"
+          if [ -z "$COMPAT_KNOWN_HOSTS" ]; then
+            echo "Set zakura-mainnet environment variable ZAKURA_COMPAT_SSH_KNOWN_HOSTS from an independently verified host key."
+            exit 1
+          fi
+          umask 077
+          printf '%s\n' "$COMPAT_KNOWN_HOSTS" > "$RUNNER_TEMP/monitoring_known_hosts"
+          ssh-keygen -F 159.203.113.196 -f "$RUNNER_TEMP/monitoring_known_hosts" > /dev/null
+          ssh-keygen -l -f "$RUNNER_TEMP/monitoring_known_hosts" > /dev/null
 
       - name: Run monitoring stage
         env:

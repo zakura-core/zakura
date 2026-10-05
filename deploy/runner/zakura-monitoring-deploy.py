@@ -374,6 +374,13 @@ def stage_finalize(ctx: Context) -> None:
     validate_target(ctx)
     if not lane_enabled():
         raise StageError("cut over to the compatibility lane before retiring the Rust watchdog")
+    for label, release in (
+        ("fleet", ctx.local("status", "--root", str(FLEET_ROOT))),
+        ("compat", ctx.remote_install("status", "--root", str(COMPAT_ROOT))),
+    ):
+        ctx.record(f"{label} release", release)
+        if release.get("current") != ctx.sha:
+            raise StageError(f"{label} active release is not the requested commit")
     last = last_probe(ctx)
     if not (last.get("valid") and last.get("status") == "pass"
             and time.time() - last.get("completed_at", 0) <= FRESH_PROBE_SECONDS):

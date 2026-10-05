@@ -323,7 +323,7 @@ def activate(root: Path, sha: str, links: dict[str, str]) -> dict:
 
 
 def rollback(root: Path, links: dict[str, str]) -> dict:
-    """Point ``current`` back at the release recorded before the last activation."""
+    """Restore the pre-activation release; retries keep the same rollback target."""
     try:
         record = json.loads((root / "rollback.json").read_text(encoding="utf-8"))
     except (OSError, ValueError):
@@ -345,12 +345,8 @@ def rollback(root: Path, links: dict[str, str]) -> dict:
         verify_release(root / "releases" / previous, previous)
     atomic_symlink(root / "current", f"releases/{previous}")
     point_links(root, links)
-    atomic_write(
-        root / "rollback.json",
-        (json.dumps({"previous": active, "active": previous, "at": time.time()},
-                    sort_keys=True) + "\n").encode(),
-        0o644,
-    )
+    # Keep the activation record intact, even if a later rollback step fails.
+    # A subsequent activation writes a new record; rollback never swaps targets.
     return {"rolled_back": True, "active": previous, "previous": active}
 
 
@@ -474,12 +470,19 @@ def systemctl(*args: str) -> subprocess.CompletedProcess:
     )
 
 
+def checked_systemctl(*args: str) -> None:
+    """Fail the host operation when systemd rejects it, without exposing logs."""
+    result = systemctl(*args)
+    if result.returncode != 0:
+        raise InstallError(f"systemctl {' '.join(args)} failed ({result.returncode})")
+
+
 def retire_rust(backup_root: Path) -> dict:
     """Stop the Rust watchdog and move its artifacts aside (never delete them)."""
     present = [path for path in RUST_ARTIFACTS if path.exists()]
     if not present:
         return {"retired": False, "reason": "rust watchdog artifacts not present"}
-    systemctl("disable", "--now", RUST_UNIT)
+    checked_systemctl("disable", "--now", RUST_UNIT)
     backup = backup_root / f"rust-watchdog-{utc_stamp()}"
     backup.mkdir(mode=0o700, parents=True)
     moved = {}
@@ -494,12 +497,12 @@ def retire_rust(backup_root: Path) -> dict:
         (json.dumps({"moved": moved, "at": time.time()}, sort_keys=True) + "\n").encode(),
         0o600,
     )
-    systemctl("daemon-reload")
+    checked_systemctl("daemon-reload")
     return {"retired": True, "backup": str(backup), "moved": moved}
 
 
 def restore_rust(backup_root: Path) -> dict:
-    """Move the newest retired Rust watchdog back and start it again."""
+    """Restore and start the latest retired watchdog, safely resuming retries."""
     backups = sorted(backup_root.glob("rust-watchdog-*")) if backup_root.is_dir() else []
     if not backups:
         return {"restored": False, "reason": "no rust watchdog backup"}
@@ -509,16 +512,21 @@ def restore_rust(backup_root: Path) -> dict:
     for original, digest in manifest["moved"].items():
         source = backup / Path(original).relative_to("/")
         if Path(original).exists():
-            raise InstallError(f"refusing to overwrite existing {original}")
+            # A previous attempt may have moved this file before failing later.
+            if source.exists() or sha256_file(Path(original)) != digest:
+                raise InstallError(f"refusing to overwrite existing {original}")
+            restored.append(original)
+            continue
         if sha256_file(source) != digest:
             raise InstallError(f"backup digest mismatch for {original}")
         Path(original).parent.mkdir(parents=True, exist_ok=True)
         shutil.move(str(source), original)
         restored.append(original)
-    systemctl("daemon-reload")
-    started = systemctl("enable", "--now", RUST_UNIT).returncode == 0
-    os.rename(backup, backup.with_name(backup.name + ".restored"))
-    return {"restored": True, "files": restored, "service_started": started}
+    checked_systemctl("daemon-reload")
+    checked_systemctl("enable", "--now", RUST_UNIT)
+    if not backup.name.endswith(".restored"):
+        os.rename(backup, backup.with_name(backup.name + ".restored"))
+    return {"restored": True, "files": restored, "service_started": True}
 
 
 def parse_links(values: list[str]) -> dict[str, str]:

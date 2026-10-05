@@ -309,6 +309,15 @@ and `ref=<full tested SHA>` runs one explicit stage of
 `zakura-monitoring-deploy.py` at a time. No stage builds, installs, stops or
 restarts `zakurad` or `zcashd`, or touches the dashboard or gateway.
 
+Before dispatch, provision the `zakura-mainnet` GitHub environment variable
+`ZAKURA_COMPAT_SSH_KNOWN_HOSTS` with a valid `known_hosts` entry for
+`159.203.113.196`, verified through an independent trusted host console or
+existing operator trust store. This is a public SSH host key, not a private
+credential. The workflow fails before contacting the host if this variable is
+missing, malformed or names another host. It never trusts a fresh network scan.
+The same entry authenticates deployment SSH and is installed for fleet probes;
+rotate it only after independently verifying a host key change.
+
 | Stage | Effect |
 | --- | --- |
 | `status` | Read-only summary of both hosts |
@@ -317,8 +326,15 @@ restarts `zakurad` or `zcashd`, or touches the dashboard or gateway.
 | `cutover` | Back up fleet state, activate the fleet release, enable the lane, restart only `zakura-fleet-watchdog`, wait for a passing live probe |
 | `soak` | 30-minute read-only record of probes, height advancement and service health |
 | `slack-test` | Opt-in: one labeled failure and recovery to `#zakura-alerts` from temporary state |
-| `finalize` | Requires a fresh passing live probe; stops `zakura-watchdog` and moves its unit, binary and env to `/var/backups/zakura-monitoring/` |
+| `finalize` | Requires both active releases to match the requested SHA and a fresh passing live probe; stops `zakura-watchdog` and moves its unit, binary and env to `/var/backups/zakura-monitoring/` |
 | `rollback` | Disables the lane, restores the previous fleet and checker releases, restores the Rust watchdog if finalized; nodes are untouched |
+
+Retirement aborts before moving artifacts if stopping the Rust service fails.
+Service reload or restart failures fail the workflow. Rollback retains its
+original release target across retries, including partial rollback failures.
+Rust restoration also resumes partially moved files after verifying their
+hashes; it records completion only after the service starts successfully.
+Operator edits to restored files are preserved and cause a failed retry.
 
 Each run uploads `monitoring-evidence.json` with the commit, package and
 manifest digests, run URL and per-step results. Record any Slack message links

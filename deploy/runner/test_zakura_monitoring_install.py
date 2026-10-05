@@ -158,6 +158,34 @@ class ReleaseTests(InstallCase):
         self.assertEqual((result["active"], result["previous"]), (SHA_A, SHA_B))
         self.assertEqual(install.current_release(self.root), SHA_A)
 
+    def test_rollback_retries_preserve_the_original_target(self):
+        self.stage(SHA_A)
+        self.stage(SHA_B)
+        install.activate(self.root, SHA_A, LINKS)
+        install.activate(self.root, SHA_B, LINKS)
+        record = (self.root / "rollback.json").read_bytes()
+        for _ in range(3):
+            install.rollback(self.root, LINKS)
+            self.assertEqual(install.current_release(self.root), SHA_A)
+            self.assertEqual((self.root / "rollback.json").read_bytes(), record)
+        install.activate(self.root, SHA_B, LINKS)
+        install.rollback(self.root, LINKS)
+        self.assertEqual(install.current_release(self.root), SHA_A)
+
+    def test_rollback_retries_repair_links_after_partial_failure(self):
+        self.stage(SHA_A)
+        self.stage(SHA_B)
+        install.activate(self.root, SHA_A, LINKS)
+        install.activate(self.root, SHA_B, LINKS)
+        with mock.patch.object(install, "point_links", side_effect=OSError("interrupted")):
+            with self.assertRaises(OSError):
+                install.rollback(self.root, LINKS)
+        for _ in range(2):
+            install.rollback(self.root, LINKS)
+            self.assertEqual(install.current_release(self.root), SHA_A)
+            self.assertEqual(os.readlink(self.root / "fleets.toml"),
+                             "current/fleet-watchdog.toml")
+
     def test_first_activation_preserves_a_legacy_install(self):
         self.root.mkdir()
         (self.root / "zakura-cluster-watchdog.py").write_text("# legacy script\n")
@@ -168,6 +196,8 @@ class ReleaseTests(InstallCase):
         self.assertRegex(legacy, install.LEGACY)
         self.assertTrue((self.root / "zakura-cluster-watchdog.py").is_symlink())
         install.rollback(self.root, LINKS)
+        install.rollback(self.root, LINKS)
+        self.assertEqual(install.current_release(self.root), legacy)
         self.assertEqual((self.root / "zakura-cluster-watchdog.py").read_text(),
                          "# legacy script\n")
         self.assertEqual((self.root / "fleets.toml").read_text(), "# legacy config\n")
@@ -175,6 +205,7 @@ class ReleaseTests(InstallCase):
     def test_rollback_without_previous_release_deactivates(self):
         self.stage(SHA_A)
         install.activate(self.root, SHA_A, {})
+        self.assertIsNone(install.rollback(self.root, {})["active"])
         self.assertIsNone(install.rollback(self.root, {})["active"])
         self.assertFalse((self.root / "current").exists())
 
@@ -288,6 +319,81 @@ class RustWatchdogTests(InstallCase):
         self.assertTrue(all(path.exists() for path in artifacts))
         self.assertIn(("enable", "--now", "zakura-watchdog.service"), calls)
         self.assertNotIn("systemctl", json.dumps(calls).replace("zakura-watchdog", ""))
+
+    def artifacts(self):
+        paths = tuple(self.dir / name for name in ("unit", "binary", "env"))
+        for path in paths:
+            path.write_text(path.name)
+        return paths
+
+    def test_failed_stop_does_not_move_artifacts_or_create_backup(self):
+        artifacts = self.artifacts()
+        backups = self.dir / "backups"
+        with mock.patch.object(install, "RUST_ARTIFACTS", artifacts), \
+                mock.patch.object(install, "systemctl", return_value=
+                                  subprocess.CompletedProcess([], 1, "", "")):
+            with self.assertRaises(install.InstallError):
+                install.retire_rust(backups)
+            with redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(install.main(["retire-rust", "--backup-root", str(backups)]), 1)
+            self.assertIn("InstallError", output.getvalue())
+        self.assertTrue(all(path.exists() for path in artifacts))
+        self.assertFalse(backups.exists())
+
+    def test_failed_restart_is_reported_and_restore_can_be_retried(self):
+        artifacts = self.artifacts()
+        backups = self.dir / "backups"
+        def service(*args):
+            return subprocess.CompletedProcess(args, int(args[0] == "enable"), "", "")
+        with mock.patch.object(install, "RUST_ARTIFACTS", artifacts), \
+                mock.patch.object(install, "systemctl", side_effect=service):
+            install.retire_rust(backups)
+            with self.assertRaises(install.InstallError):
+                install.restore_rust(backups)
+            with redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(install.main(["restore-rust", "--backup-root", str(backups)]), 1)
+            self.assertIn("InstallError", output.getvalue())
+        self.assertTrue(all(path.exists() for path in artifacts))
+        self.assertFalse(list(backups.glob("*.restored")))
+        with mock.patch.object(install, "systemctl", return_value=
+                              subprocess.CompletedProcess([], 0, "", "")):
+            for _ in range(2):
+                self.assertTrue(install.restore_rust(backups)["service_started"])
+
+    def test_partial_restore_can_be_retried_without_overwriting_files(self):
+        artifacts = self.artifacts()
+        backups = self.dir / "backups"
+        with mock.patch.object(install, "RUST_ARTIFACTS", artifacts), \
+                mock.patch.object(install, "systemctl", return_value=
+                                  subprocess.CompletedProcess([], 0, "", "")):
+            install.retire_rust(backups)
+            original_move = install.shutil.move
+            count = 0
+            def interrupted_move(source, destination):
+                nonlocal count
+                count += 1
+                if count == 2:
+                    raise OSError("interrupted")
+                return original_move(source, destination)
+            with mock.patch.object(install.shutil, "move", side_effect=interrupted_move):
+                with self.assertRaises(OSError):
+                    install.restore_rust(backups)
+            self.assertTrue(install.restore_rust(backups)["service_started"])
+            artifacts[0].write_text("operator changed the unit")
+            with self.assertRaises(install.InstallError):
+                install.restore_rust(backups)
+            self.assertEqual(artifacts[0].read_text(), "operator changed the unit")
+
+    def test_daemon_reload_failure_is_not_reported_as_success(self):
+        artifacts = self.artifacts()
+        backups = self.dir / "backups"
+        with mock.patch.object(install, "RUST_ARTIFACTS", artifacts), \
+                mock.patch.object(install, "systemctl", side_effect=lambda *args:
+                    subprocess.CompletedProcess(args, int(args[0] == "daemon-reload"), "", "")):
+            with self.assertRaises(install.InstallError):
+                install.retire_rust(backups)
+            with self.assertRaises(install.InstallError):
+                install.restore_rust(backups)
 
     def test_retire_without_artifacts_is_a_no_op(self):
         with mock.patch.object(install, "RUST_ARTIFACTS", (self.dir / "absent",)):

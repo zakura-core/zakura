@@ -5,6 +5,8 @@
 //! restarting and reconnecting the sidecar.
 
 use std::{
+    collections::BTreeMap,
+    net::IpAddr,
     ops::Bound::{Excluded, Unbounded},
     sync::Mutex,
     time::Instant,
@@ -12,7 +14,10 @@ use std::{
 
 use zakura_chain::{block, parameters::Network};
 
-use crate::{constants::MIN_PEER_SET_LOG_INTERVAL, protocol::external::types::Version};
+use crate::{
+    constants::MIN_PEER_SET_LOG_INTERVAL,
+    protocol::external::{canonical_ip, types::Version},
+};
 
 /// Allows one warning of a kind per [`MIN_PEER_SET_LOG_INTERVAL`].
 pub(crate) struct WarningLimiter(Mutex<Option<Instant>>);
@@ -41,15 +46,40 @@ impl WarningLimiter {
 /// Rate-limits warnings about a sidecar version that is too old for the next network upgrade.
 static UPGRADE_READINESS_WARNINGS: WarningLimiter = WarningLimiter::new();
 
-/// Returns whether a sidecar with `remote_version` supports the next network upgrade that
-/// `network` schedules after `tip_height`, setting `zcashd_compat.sidecar.next_upgrade_ready`
-/// and logging a rate-limited warning if it does not.
+/// Whether each sidecar supports the next network upgrade, by canonical IP.
+pub(crate) struct SidecarReadiness(Mutex<BTreeMap<IpAddr, bool>>);
+
+impl SidecarReadiness {
+    /// Returns a record with no sidecars.
+    pub(crate) const fn new() -> Self {
+        Self(Mutex::new(BTreeMap::new()))
+    }
+
+    /// Records whether the sidecar at `ip` supports the next network upgrade, and returns
+    /// whether every recorded sidecar does.
+    pub(crate) fn record(&self, ip: IpAddr, ready: bool) -> bool {
+        let mut readiness = self
+            .0
+            .lock()
+            .expect("the readiness lock is never poisoned: nothing panics while holding it");
+        readiness.insert(canonical_ip(ip), ready);
+        readiness.values().all(|ready| *ready)
+    }
+}
+
+/// The readiness that `zcashd_compat.sidecar.next_upgrade_ready` reports.
+static SIDECAR_READINESS: SidecarReadiness = SidecarReadiness::new();
+
+/// Returns whether the sidecar at `sidecar_ip` with `remote_version` supports the next network
+/// upgrade that `network` schedules after `tip_height`, recording it for
+/// `zcashd_compat.sidecar.next_upgrade_ready` and logging a rate-limited warning if it does not.
 ///
 /// A sidecar below that upgrade's minimum protocol version is disconnected when the upgrade
 /// activates, so the operator must upgrade it beforehand.
 pub(crate) fn check_upgrade_readiness(
     network: &Network,
     tip_height: Option<block::Height>,
+    sidecar_ip: IpAddr,
     remote_version: Version,
 ) -> bool {
     let tip_height = tip_height.unwrap_or(block::Height(0));
@@ -79,19 +109,30 @@ pub(crate) fn check_upgrade_readiness(
         None => true,
     };
 
-    set_next_upgrade_ready(ready);
+    set_next_upgrade_ready(sidecar_ip, ready);
     ready
 }
 
-/// Sets the `zcashd_compat.sidecar.next_upgrade_ready` gauge.
-pub(crate) fn set_next_upgrade_ready(ready: bool) {
-    metrics::gauge!("zcashd_compat.sidecar.next_upgrade_ready").set(if ready { 1.0 } else { 0.0 });
+/// Records whether the sidecar at `sidecar_ip` supports the next network upgrade, and sets the
+/// `zcashd_compat.sidecar.next_upgrade_ready` gauge to whether every recorded sidecar does.
+pub(crate) fn set_next_upgrade_ready(sidecar_ip: IpAddr, ready: bool) {
+    let all_ready = SIDECAR_READINESS.record(sidecar_ip, ready);
+    metrics::gauge!("zcashd_compat.sidecar.next_upgrade_ready").set(if all_ready {
+        1.0
+    } else {
+        0.0
+    });
 }
 
-/// Warns that the protected sidecar is being disconnected because a network upgrade raised
-/// the minimum protocol version above its `remote_version`, and marks it not ready.
-pub(crate) fn warn_upgrade_eviction(remote_version: Version, minimum_version: Version) {
-    set_next_upgrade_ready(false);
+/// Warns that the protected sidecar at `sidecar_ip` is being disconnected because a network
+/// upgrade raised the minimum protocol version above its `remote_version`, and marks it not
+/// ready.
+pub(crate) fn warn_upgrade_eviction(
+    sidecar_ip: IpAddr,
+    remote_version: Version,
+    minimum_version: Version,
+) {
+    set_next_upgrade_ready(sidecar_ip, false);
     tracing::warn!(
         ?remote_version,
         ?minimum_version,
@@ -114,6 +155,23 @@ mod tests {
         assert!(!limiter.allow());
     }
 
+    /// The sidecar IP these tests check.
+    const SIDECAR: IpAddr = IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+
+    /// Readiness stays false while any recorded sidecar is not ready.
+    #[test]
+    fn readiness_covers_every_sidecar() {
+        let readiness = SidecarReadiness::new();
+        let a = IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1));
+        let b = std::net::Ipv4Addr::new(10, 0, 0, 2);
+        assert!(!readiness.record(a, false));
+        assert!(!readiness.record(IpAddr::V4(b), true));
+        assert!(readiness.record(a, true));
+        // An IPv4-mapped address is the same sidecar.
+        assert!(!readiness.record(IpAddr::V6(b.to_ipv6_mapped()), false));
+        assert!(readiness.record(IpAddr::V4(b), true));
+    }
+
     /// A sidecar needs the next upgrade's minimum version before it activates.
     #[test]
     fn upgrade_readiness_uses_the_next_upgrade_minimum() {
@@ -129,11 +187,26 @@ mod tests {
 
         // NU7 is next: Regtest uses the Testnet NU7 version, 170180.
         let tip = Some(block::Height(200));
-        assert!(!check_upgrade_readiness(&network, tip, Version(170_160)));
-        assert!(check_upgrade_readiness(&network, tip, Version(170_180)));
+        assert!(!check_upgrade_readiness(
+            &network,
+            tip,
+            SIDECAR,
+            Version(170_160)
+        ));
+        assert!(check_upgrade_readiness(
+            &network,
+            tip,
+            SIDECAR,
+            Version(170_180)
+        ));
 
         // After NU7 no upgrade is scheduled.
         let tip = Some(block::Height(210));
-        assert!(check_upgrade_readiness(&network, tip, Version(170_160)));
+        assert!(check_upgrade_readiness(
+            &network,
+            tip,
+            SIDECAR,
+            Version(170_160)
+        ));
     }
 }

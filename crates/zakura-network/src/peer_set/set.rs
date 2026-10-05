@@ -804,12 +804,13 @@ where
             // It is ok to drop ready services, they don't need anything cancelled.
             self.ready_services.retain(|_address, peer| {
                 let outdated = peer.remote_version() < minimum_version;
-                if outdated
-                    && block_gossip_peer_ips
+                if outdated {
+                    if let Some(ip) = block_gossip_peer_ips
                         .iter()
-                        .any(|ip| peer.is_inbound_direct_from_ip(ip))
-                {
-                    sidecar::warn_upgrade_eviction(peer.remote_version(), minimum_version);
+                        .find(|ip| peer.is_inbound_direct_from_ip(ip))
+                    {
+                        sidecar::warn_upgrade_eviction(*ip, peer.remote_version(), minimum_version);
+                    }
                 }
                 !outdated
             });
@@ -817,19 +818,20 @@ where
             // A sidecar that supports the upgrade that just activated may not support the next.
             // Busy sidecars are checked when they become ready again, in `push_ready`.
             for peer in self.ready_services.values() {
-                if self.is_zcashd_compat_peer(peer) {
-                    self.check_sidecar_upgrade_readiness(peer);
+                if let Some(ip) = self.zcashd_compat_peer_ip(peer) {
+                    self.check_sidecar_upgrade_readiness(ip, peer);
                 }
             }
         }
     }
 
-    /// Checks whether the zcashd-compat sidecar `peer` supports the next network upgrade after
-    /// the current tip. See [`sidecar::check_upgrade_readiness`].
-    fn check_sidecar_upgrade_readiness(&self, peer: &D::Service) {
+    /// Checks whether the zcashd-compat sidecar `peer` at `ip` supports the next network upgrade
+    /// after the current tip. See [`sidecar::check_upgrade_readiness`].
+    fn check_sidecar_upgrade_readiness(&self, ip: IpAddr, peer: &D::Service) {
         sidecar::check_upgrade_readiness(
             self.minimum_peer_version.network(),
             self.minimum_peer_version.chain_tip().best_tip_height(),
+            ip,
             peer.remote_version(),
         );
     }
@@ -900,17 +902,17 @@ where
         );
 
         let minimum_version = self.minimum_peer_version.current();
-        let is_sidecar = self.is_zcashd_compat_peer(&svc);
+        let sidecar_ip = self.zcashd_compat_peer_ip(&svc);
         if svc.remote_version() >= minimum_version {
-            if is_sidecar {
+            if let Some(ip) = sidecar_ip {
                 // Keeps the sidecar's readiness current as the tip crosses upgrades.
-                self.check_sidecar_upgrade_readiness(&svc);
+                self.check_sidecar_upgrade_readiness(ip, &svc);
             }
             self.ready_services.insert(key, svc);
         } else {
             // A sidecar that was busy when an upgrade raised the minimum version leaves here.
-            if is_sidecar {
-                sidecar::warn_upgrade_eviction(svc.remote_version(), minimum_version);
+            if let Some(ip) = sidecar_ip {
+                sidecar::warn_upgrade_eviction(ip, svc.remote_version(), minimum_version);
             }
             std::mem::drop(svc);
         }
@@ -1029,6 +1031,15 @@ where
         );
 
         selected_peers
+    }
+
+    /// Returns the configured sidecar IP that `service` connects from, if it is a zcashd sidecar
+    /// peer.
+    fn zcashd_compat_peer_ip(&self, service: &D::Service) -> Option<IpAddr> {
+        self.block_gossip_peer_ips
+            .iter()
+            .copied()
+            .find(|ip| service.is_inbound_direct_from_ip(ip))
     }
 
     /// Returns true if `service` is a configured zcashd sidecar peer.

@@ -931,10 +931,15 @@ where
     //
     // Reject connections to peers on old versions, because they might not know about all
     // network upgrades and could lead to chain forks or slower block propagation.
+    // The protected sidecar's IP, which keys its upgrade readiness.
+    let sidecar_ip = connected_addr
+        .get_transient_addr()
+        .filter(|_| is_protected_peer)
+        .map(|addr| addr.ip());
     let min_version = minimum_peer_version.current();
     if remote.version < min_version {
-        if is_protected_peer {
-            sidecar::set_next_upgrade_ready(false);
+        if let Some(sidecar_ip) = sidecar_ip {
+            sidecar::set_next_upgrade_ready(sidecar_ip, false);
             if OBSOLETE_SIDECAR_WARNINGS.allow() {
                 warn!(
                     remote_ip = %addr_label,
@@ -971,10 +976,11 @@ where
         return Err(HandshakeError::ObsoleteVersion(remote.version));
     }
 
-    if is_protected_peer {
+    if let Some(sidecar_ip) = sidecar_ip {
         sidecar::check_upgrade_readiness(
             &config.network,
             minimum_peer_version.chain_tip().best_tip_height(),
+            sidecar_ip,
             remote.version,
         );
     }

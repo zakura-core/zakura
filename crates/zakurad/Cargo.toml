@@ -66,7 +66,6 @@ features = [
     "journald",
     "opentelemetry",
     "prometheus",
-    "sentry",
     "indexer",
 ]
 
@@ -107,8 +106,6 @@ internal-miner = [
 ]
 
 # Tracing and monitoring
-# Opt in explicitly: the tracing layer has overhead even without a SENTRY_DSN.
-sentry = ["dep:sentry"]
 journald = ["tracing-journald"]
 opentelemetry = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "dep:tracing-opentelemetry"]
 
@@ -235,9 +232,6 @@ nix = { workspace = true, features = ["fs"] }
 
 # prod feature internal-miner
 thread-priority = { workspace = true, optional = true }
-
-# prod feature sentry
-sentry = { workspace = true, features = ["backtrace", "logs", "rustls", "tracing", "ureq"], optional = true }
 
 # prod feature journald
 tracing-journald = { workspace = true, optional = true }

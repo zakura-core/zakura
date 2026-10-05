@@ -202,6 +202,7 @@ def slack_test(args: argparse.Namespace) -> int:
         "zakura_cluster_watchdog_acceptance", HERE / "zakura-cluster-watchdog.py"
     )
     watchdog = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = watchdog
     spec.loader.exec_module(watchdog)
     real_post = watchdog.post_slack
     sent = []

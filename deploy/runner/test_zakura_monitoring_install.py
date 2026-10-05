@@ -15,8 +15,10 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import threading
 import unittest
 from contextlib import redirect_stdout
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest import mock
 
@@ -71,6 +73,48 @@ class PackageTests(InstallCase):
 
 
 class ReleaseTests(InstallCase):
+    def test_installed_slack_acceptance_posts_labeled_failure_and_recovery(self):
+        self.stage(SHA_A)
+        install.activate(self.root, SHA_A, LINKS)
+        received = []
+
+        class Receiver(BaseHTTPRequestHandler):
+            def do_POST(self):
+                size = int(self.headers["Content-Length"])
+                received.append(json.loads(self.rfile.read(size)))
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b"ok")
+
+            def log_message(self, *_args):
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Receiver)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(thread.join, 5)
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        env_file = self.dir / "slack.env"
+        env_file.write_text(f"SLACK_WEB_HOOK=http://127.0.0.1:{server.server_port}/\n")
+        result = subprocess.run(
+            [sys.executable, "-I",
+             str(self.root / "current" / "zakura-monitoring-acceptance.py"),
+             "slack-test", "--env-file", str(env_file), "--confirm-real-slack"],
+            cwd="/", env={"PATH": os.environ.get("PATH", "/usr/bin:/bin")},
+            capture_output=True, text=True, timeout=30,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(result.stdout)
+        self.assertEqual(report["accepted"], [True, True])
+        self.assertTrue(report["temporary_state_only"])
+        self.assertEqual(len(received), 2)
+        for payload in received:
+            self.assertTrue(payload["text"].startswith(report["label"] + "\n"))
+        self.assertIn("zcashd peers: 2", received[0]["text"])
+        self.assertIn("failing", received[0]["text"])
+        self.assertIn("recovered", received[1]["text"])
+
     def test_stage_activate_and_run_outside_the_repository(self):
         self.assertFalse(self.stage(SHA_A)["reused"])
         self.assertTrue(self.stage(SHA_A)["reused"])

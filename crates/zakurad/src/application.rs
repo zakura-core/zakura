@@ -256,7 +256,6 @@ impl Application for ZakuradApp {
     /// If you would like to add additional components to your application
     /// beyond the default ones provided by the framework, this is the place
     /// to do so.
-    #[allow(clippy::print_stderr)]
     #[allow(clippy::unwrap_in_result)]
     fn register_components(&mut self, command: &Self::Cmd) -> Result<(), FrameworkError> {
         use crate::components::{metrics::MetricsEndpoint, tokio::TokioComponent};

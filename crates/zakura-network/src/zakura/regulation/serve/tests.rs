@@ -1110,3 +1110,39 @@ async fn a_writer_panic_records_the_cause_and_cancels_the_connection() {
     assert_eq!(close_cause.get_or("cancelled"), "service_panic");
 }
 
+/// A one-slot legacy queue promises eventual control progress once serving drains.
+#[tokio::test]
+async fn one_slot_serving_drains_before_control_uses_the_slot() {
+    let capacity = capacity(LIMITS);
+    let (send, mut output) = framed_channel(1);
+    let cancel = CancellationToken::new();
+    let serve = capacity.session(
+        Arc::new(Scripted),
+        &peer(1),
+        4,
+        send.clone(),
+        cancel.clone(),
+        cancel.clone(),
+        crate::zakura::CloseCause::default(),
+    );
+    serve
+        .admit(Job {
+            parts: 2,
+            part_len: 8,
+            ..job()
+        })
+        .unwrap();
+    for _ in 0..3 {
+        next(&mut output).await;
+    }
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        send.send(crate::zakura::wire_codec::encode_frame(&Probe::Ping(7)).unwrap()),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(next(&mut output).await, Probe::Ping(7));
+    assert!(!cancel.is_cancelled());
+    cancel.cancel();
+}

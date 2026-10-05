@@ -7,7 +7,6 @@ rust-version.workspace = true
 repository.workspace = true
 license.workspace = true
 description = "Zcash chain history Merkle mountain range tree for Zakura"
-readme = "README.md"
 keywords.workspace = true
 categories = ["cryptography::cryptocurrencies", "data-structures"]
 

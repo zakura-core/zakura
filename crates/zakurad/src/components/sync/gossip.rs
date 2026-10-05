@@ -115,7 +115,7 @@ where
         // Drain local completion notifications from spawned mined-block
         // broadcasts before deciding whether the committed-tip fallback should
         // run. These are not peer acknowledgements: a success appears here only
-        // after our `AdvertiseBlockToAll` future completed successfully.
+        // after our mined-block broadcast future completed successfully.
         //
         // `try_recv()` keeps this non-blocking. `Empty` just means no spawned
         // broadcast has reported back yet, so the gossip loop can keep making
@@ -235,11 +235,7 @@ where
 
         // block broadcasts inform other nodes about new blocks,
         // so our internal Grow or Reset state doesn't matter to them
-        let request = if is_block_submission {
-            zn::Request::AdvertiseBlockToAll(hash)
-        } else {
-            zn::Request::AdvertiseBlock(hash, None)
-        };
+        let request = zn::Request::AdvertiseBlock(hash, None);
 
         info!(?height, ?request, log_msg);
         // Include readiness in the deadline. The event loop must keep consuming lifecycle and tip

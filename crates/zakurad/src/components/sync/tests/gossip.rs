@@ -167,7 +167,7 @@ async fn mined_block_marks_tip_after_successful_broadcast() {
         .expect("mined block notification should be accepted");
 
     peer_set
-        .expect_request(Request::AdvertiseBlockToAll(block_two.hash()))
+        .expect_request(Request::AdvertiseBlock(block_two.hash(), None))
         .await
         .respond(Response::Nil);
 
@@ -198,13 +198,13 @@ async fn mined_block_mark_survives_pending_submit_queue() {
         CheckpointVerifiedBlock::from(block_two.clone()).into(),
     ));
 
-    // First mined notification — start AdvertiseBlockToAll but hold the response open.
+    // Hold the first mined broadcast response open.
     submitblock_sender
         .send(MinedBlockEvent::Committed { hash, height })
         .expect("mined block notification should be accepted");
 
     let first_broadcast = peer_set
-        .expect_request(Request::AdvertiseBlockToAll(hash))
+        .expect_request(Request::AdvertiseBlock(hash, None))
         .await;
 
     // Queue a second notification while the first broadcast is still in flight so the
@@ -215,9 +215,9 @@ async fn mined_block_mark_survives_pending_submit_queue() {
 
     first_broadcast.respond(Response::Nil);
 
-    // Second mined path also fires AdvertiseBlockToAll for the queued notification.
+    // The queued mined notification starts another broadcast.
     peer_set
-        .expect_request(Request::AdvertiseBlockToAll(hash))
+        .expect_request(Request::AdvertiseBlock(hash, None))
         .await
         .respond(Response::Nil);
 
@@ -255,7 +255,7 @@ async fn mined_block_broadcast_timeout_uses_committed_tip_fallback() {
         .expect("mined block notification should be accepted");
 
     let slow_broadcast = peer_set
-        .expect_request(Request::AdvertiseBlockToAll(block_two.hash()))
+        .expect_request(Request::AdvertiseBlock(block_two.hash(), None))
         .await;
 
     // Hold the mined block broadcast open past the gossip timeout so it fails without marking.
@@ -303,7 +303,7 @@ async fn early_broadcast_does_not_suppress_the_committed_tip_fallback() {
         .expect("the early mined block notification is accepted");
 
     peer_set
-        .expect_request(Request::AdvertiseBlockToAll(hash))
+        .expect_request(Request::AdvertiseBlock(hash, None))
         .await
         .respond(Response::Nil);
 
@@ -320,7 +320,7 @@ async fn early_broadcast_does_not_suppress_the_committed_tip_fallback() {
 
     // Hold the committed broadcast open past the gossip timeout so it fails without marking.
     let slow_broadcast = peer_set
-        .expect_request(Request::AdvertiseBlockToAll(hash))
+        .expect_request(Request::AdvertiseBlock(hash, None))
         .await;
     tokio::time::sleep(TIPS_RESPONSE_TIMEOUT + Duration::from_secs(1)).await;
     drop(slow_broadcast);
@@ -409,7 +409,7 @@ async fn in_flight_mined_block_broadcast_suppresses_committed_tip_gossip() {
         .expect("mined block notification should be accepted");
 
     let in_flight_broadcast = peer_set
-        .expect_request(Request::AdvertiseBlockToAll(block_two.hash()))
+        .expect_request(Request::AdvertiseBlock(block_two.hash(), None))
         .await;
 
     // Hold the broadcast open for less than its timeout, so it is still in flight when the
@@ -445,7 +445,7 @@ async fn in_flight_mined_block_broadcast_handles_delayed_tip_notification() {
         })
         .expect("mined block notification should be accepted");
     let in_flight_broadcast = peer_set
-        .expect_request(Request::AdvertiseBlockToAll(hash))
+        .expect_request(Request::AdvertiseBlock(hash, None))
         .await;
 
     // Publish the tip only after the mined notification has started its broadcast.

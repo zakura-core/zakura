@@ -646,3 +646,173 @@ fn config_preserves_legacy_enum_acceptance() {
         assert!(ZakuradConfig::load(Some(path.clone())).is_err());
     }
 }
+
+#[test]
+fn config_env_preserves_os_path_strings() {
+    let env = EnvGuard::new();
+    for value in [
+        "",
+        "C:\\Users\\Alice\\Node",
+        "\\\\server\\share\\zakura",
+        "C:\\数据\\zakura",
+        "/home/alice/résumé/東京",
+        "~/zakura",
+        "$HOME/zakura",
+        "%APPDATA%\\zakura",
+        "\"C:\\Program Files\\zakura\"",
+        " /var/lib/zakura \r\n",
+    ] {
+        env.set_var("ZAKURA_STATE__CACHE_DIR", value);
+        let config = ZakuradConfig::load(None).expect("load literal environment path");
+        assert_eq!(config.state.cache_dir, PathBuf::from(value), "{value:?}");
+    }
+}
+
+#[test]
+fn config_env_preserves_field_casing() {
+    let env = EnvGuard::new();
+    for key in [
+        "ZAKURA_NETWORK__NETWORK",
+        "ZAKURA_network__network",
+        "ZAKURA_NetWork__NetWork",
+        "ZAKURA_NETWORK__NETWORK",
+    ] {
+        env.set_var(key, "Testnet");
+        let config = ZakuradConfig::load(None).expect("lowercase environment field names");
+        assert_eq!(config.network.network.to_string(), "Testnet", "{key}");
+        env::remove_var(key);
+    }
+    // Unix permits distinct names that differ only in case. Windows does not.
+    #[cfg(unix)]
+    for key in ["zakura_NETWORK__NETWORK", "Zakura_NETWORK__NETWORK"] {
+        env.set_var(key, "Testnet");
+        let config = ZakuradConfig::load(None).expect("ignore nonmatching prefix case");
+        env::remove_var(key);
+        assert_eq!(config.network.network.to_string(), "Mainnet", "{key}");
+    }
+}
+
+#[test]
+fn config_env_rejects_shell_quotes_whitespace_and_lists() {
+    let env = EnvGuard::new();
+    for (key, value) in [
+        ("ZAKURA_TRACING__USE_COLOR", ""),
+        ("ZAKURA_TRACING__USE_COLOR", " true"),
+        ("ZAKURA_TRACING__USE_COLOR", "true\r\n"),
+        ("ZAKURA_TRACING__USE_COLOR", "\"true\""),
+        ("ZAKURA_RPC__LISTEN_ADDR", ""),
+        ("ZAKURA_RPC__LISTEN_ADDR", "\"127.0.0.1:8232\""),
+        (
+            "ZAKURA_NETWORK__INITIAL_MAINNET_PEERS",
+            "first.example:8233,second.example:8233",
+        ),
+    ] {
+        env.set_var(key, value);
+        let result = ZakuradConfig::load(None);
+        env::remove_var(key);
+        assert!(result.is_err(), "{key}={value:?}");
+    }
+}
+
+#[test]
+fn config_preserves_directory_path_extension_lookup() {
+    let _env = EnvGuard::new();
+    let dir = TempDir::new().expect("create temp dir");
+    fs::create_dir(dir.path().join("node")).expect("create config-name directory");
+    fs::write(
+        dir.path().join("node.toml"),
+        "[tracing]\nuse_color = false\n",
+    )
+    .expect("write sibling config");
+    for name in ["node", "node/", "node/."] {
+        let config = ZakuradConfig::load(Some(dir.path().join(name)))
+            .expect("infer extension using the path's file name");
+        assert!(!config.tracing.use_color, "{name}");
+    }
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+fn config_env_handles_non_unicode_os_strings() {
+    use std::{
+        ffi::OsString,
+        process::{Command, Stdio},
+        time::Duration,
+    };
+    use zakura_test::command::CommandExt;
+
+    const CHILD_MODE: &str = "CONFIG_OS_STRING_TEST_CHILD";
+    if let Ok(mode) = env::var(CHILD_MODE) {
+        let result = ZakuradConfig::load(None);
+        if mode == "invalid-value" {
+            let error = result.expect_err("reject a non-Unicode config value");
+            let message = error.to_string();
+            assert!(
+                message.contains("ZAKURA_RPC__COOKIE_FILE_NAME"),
+                "{message}"
+            );
+            assert!(message.contains("non-Unicode"), "{message}");
+        } else {
+            result.expect("ignore unrelated or non-Unicode environment names");
+        }
+        return;
+    }
+
+    let _env = EnvGuard::new();
+    // Use a child process so invalid OS strings cannot poison other tests or
+    // the parent's Unicode-only environment guard.
+    #[cfg(unix)]
+    let invalid = {
+        use std::os::unix::ffi::OsStringExt;
+        OsString::from_vec(vec![0xff])
+    };
+    #[cfg(windows)]
+    let invalid = {
+        use std::os::windows::ffi::OsStringExt;
+        OsString::from_wide(&[0xd800])
+    };
+    let mut invalid_key = OsString::from("ZAKURA_");
+    invalid_key.push(&invalid);
+    for (key, value, mode) in [
+        (
+            OsString::from("UNRELATED_OS_STRING_TEST"),
+            invalid.clone(),
+            "unrelated",
+        ),
+        (
+            OsString::from("ZAKURA_RPC__COOKIE_FILE_NAME"),
+            invalid.clone(),
+            "invalid-value",
+        ),
+        (invalid_key, OsString::from("ignored"), "invalid-name"),
+    ] {
+        let mut command = Command::new(env::current_exe().expect("find config test executable"));
+        command.args([
+            "--exact",
+            "config_env_handles_non_unicode_os_strings",
+            "--nocapture",
+        ]);
+        for (existing, _) in env::vars_os() {
+            if existing.to_str().is_some_and(|key| {
+                CONFIG_ENV_PREFIXES
+                    .iter()
+                    .any(|prefix| key.starts_with(prefix))
+            }) {
+                command.env_remove(existing);
+            }
+        }
+        command
+            .env(CHILD_MODE, mode)
+            .env(key, value)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let output = command
+            .spawn2((), "config test")
+            .expect("run isolated config test");
+        output
+            .wait_with_output_or_timeout(Duration::from_secs(30))
+            .expect("isolated config loading completes within its timeout")
+            .assert_success()
+            .expect("isolated config handles the non-Unicode environment");
+    }
+}

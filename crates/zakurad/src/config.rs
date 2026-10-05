@@ -115,6 +115,14 @@ impl ZakuradConfig {
     ///
     /// See [`DENY_CONFIG_KEY_SUFFIX_LIST`] and [`is_sensitive_leaf_key()`] above
     ///
+    /// # Platform behavior
+    ///
+    /// Prefix matching is case-sensitive; field names are lowercased.
+    /// Environment path values are literal: quotes, whitespace and shell
+    /// expressions are not removed or expanded. Non-Unicode names are ignored,
+    /// as are values for unrelated variables. A matching configuration variable
+    /// with a non-Unicode value returns an error.
+    ///
     /// # Examples
     /// - `ZAKURA_NETWORK__NETWORK=Testnet` sets `network.network = "Testnet"`
     /// - `ZAKURA_RPC__LISTEN_ADDR=127.0.0.1:8232` sets `rpc.listen_addr = "127.0.0.1:8232"`

@@ -67,9 +67,19 @@ pub(super) fn load(
     env_prefixes: &[&str],
 ) -> Result<ZakuradConfig, BoxError> {
     let mut values = Value::Table(BTreeMap::new());
-    if let Some(mut path) = path {
+    if let Some(path) = path {
+        let mut path = if path.is_absolute() {
+            path
+        } else {
+            std::env::current_dir()?.join(path)
+        };
         if !path.is_file() {
-            path.as_mut_os_string().push(".toml");
+            // Match legacy extension inference, including trailing separators.
+            // Preserve an existing extension-like part of the file stem.
+            if path.extension().is_some() {
+                path.as_mut_os_string().push(".placeholder");
+            }
+            path.set_extension("toml");
         }
         let bytes = fs::read(&path).map_err(|source| LoadError::Read {
             path: path.clone(),
@@ -87,7 +97,13 @@ pub(super) fn load(
     for prefix in env_prefixes {
         let prefix_pattern = format!("{prefix}_");
         let mut overrides = BTreeMap::new();
-        for (key, value) in std::env::vars() {
+        for (key, value) in std::env::vars_os() {
+            // Such names cannot identify our configuration fields. Inspect
+            // values only after prefix filtering, so unrelated OS strings are
+            // harmless even when they are not Unicode.
+            let Ok(key) = key.into_string() else {
+                continue;
+            };
             if let Some(key) = key.strip_prefix(&prefix_pattern) {
                 let leaf = key.rsplit("__").next().unwrap_or(key);
                 if is_sensitive_leaf_key(leaf) {
@@ -98,6 +114,11 @@ pub(super) fn load(
                     ))
                     .into());
                 }
+                let value = value.into_string().map_err(|_| {
+                    LoadError::Environment(format!(
+                        "Environment variable '{prefix_pattern}{key}' contains non-Unicode data"
+                    ))
+                })?;
                 overrides.insert(
                     key.to_lowercase().replace("__", "."),
                     parse_environment(value),

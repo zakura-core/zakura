@@ -260,6 +260,7 @@ impl ServeCapacity {
     /// reconnecting never adds capacity. `cancel` ends the session's serving:
     /// queued requests are dropped and running `produce` steps see their
     /// lease cancelled. A panic in any serving task also closes `connection`.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn session<P: Produce>(
         &self,
         produce: Arc<P>,
@@ -268,6 +269,7 @@ impl ServeCapacity {
         send: FramedSend,
         cancel: CancellationToken,
         connection: CancellationToken,
+        close_cause: crate::zakura::CloseCause,
     ) -> Serve<P> {
         let (jobs, queued) = mpsc::unbounded_channel();
         let (order, responses) = mpsc::unbounded_channel();
@@ -285,6 +287,7 @@ impl ServeCapacity {
             peer: peer.clone(),
             cancel: cancel.clone(),
             connection,
+            close_cause,
         };
         let dispatch = Dispatch {
             produce,
@@ -370,16 +373,19 @@ struct ServingTasks {
     peer: ZakuraPeerId,
     cancel: CancellationToken,
     connection: CancellationToken,
+    close_cause: crate::zakura::CloseCause,
 }
 
 impl ServingTasks {
     fn spawn(&self, task: impl Future<Output = ()> + Send + 'static) {
         let cancel = self.cancel.clone();
         let connection = self.connection.clone();
+        let close_cause = self.close_cause.clone();
         crate::zakura::transport::spawn_supervised_peer_task(
             self.peer.clone(),
             || {},
             move || {
+                close_cause.record("service_panic");
                 cancel.cancel();
                 connection.cancel();
             },

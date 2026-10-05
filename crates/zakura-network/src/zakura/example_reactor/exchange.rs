@@ -268,6 +268,7 @@ impl ExampleNode {
             sends[response_stream].clone(),
             cancel.clone(),
             cancel.clone(),
+            crate::zakura::CloseCause::default(),
         );
         let limits = SubscriptionLimits::from_rule(&WATCH).expect("WATCH is a subscription row");
         let watches = Arc::new(Mutex::new(Watches {

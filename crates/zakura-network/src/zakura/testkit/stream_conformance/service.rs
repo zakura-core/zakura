@@ -441,6 +441,7 @@ impl<A: StreamConformance> Service for LayoutService<A> {
                     sends[plan.response_stream].clone(),
                     cancel.clone(),
                     peer.cancel_token(),
+                    peer.close_cause(),
                 )
             })
             .collect();

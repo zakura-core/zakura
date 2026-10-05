@@ -150,6 +150,7 @@ pub(super) fn session(capacity: &ServeCapacity, peer_n: u8, advertised: u32) -> 
             send,
             cancel.clone(),
             cancel.clone(),
+            crate::zakura::CloseCause::default(),
         ),
         output,
         cancel,
@@ -500,6 +501,7 @@ async fn a_non_reading_peer_holds_output_bytes_but_no_execution_slot() {
         send,
         cancel.clone(),
         cancel.clone(),
+        crate::zakura::CloseCause::default(),
     );
     for _ in 0..4 {
         serve
@@ -563,6 +565,7 @@ async fn tiny_responses_with_a_blocked_writer_hold_response_slots() {
             send,
             cancel.clone(),
             cancel.clone(),
+            crate::zakura::CloseCause::default(),
         ),
         output,
         cancel,
@@ -989,6 +992,7 @@ async fn serving_output_keeps_a_queue_slot_for_control_messages() {
         send.clone(),
         cancel.clone(),
         cancel.clone(),
+        crate::zakura::CloseCause::default(),
     );
     serve
         .admit(Job {
@@ -1017,6 +1021,7 @@ async fn serving_panics_close_the_connection_even_with_a_blocked_writer() {
         let (send, output) = framed_channel(1);
         let cancel = CancellationToken::new();
         let connection = CancellationToken::new();
+        let close_cause = crate::zakura::CloseCause::default();
         let serve = capacity.session(
             Arc::new(Scripted),
             &peer(1),
@@ -1024,6 +1029,7 @@ async fn serving_panics_close_the_connection_even_with_a_blocked_writer() {
             send.clone(),
             cancel.clone(),
             connection.clone(),
+            close_cause.clone(),
         );
         // The first frame occupies the only queue slot. The writer waits on
         // the rest of this response and cannot observe dispatch's channel closing.
@@ -1049,6 +1055,7 @@ async fn serving_panics_close_the_connection_even_with_a_blocked_writer() {
             .await
             .unwrap();
         assert!(cancel.is_cancelled());
+        assert_eq!(close_cause.get_or("cancelled"), "service_panic");
         settle().await;
         assert_eq!(serve.open(), 0);
         drop(output);
@@ -1063,3 +1070,43 @@ async fn serving_panics_close_the_connection_even_with_a_blocked_writer() {
         healthy.cancel.cancel();
     }
 }
+
+/// A panic during writer cleanup follows the same connection-wide supervision path.
+#[tokio::test]
+async fn a_writer_panic_records_the_cause_and_cancels_the_connection() {
+    #[derive(Debug)]
+    struct PanicOnDrop;
+    impl Drop for PanicOnDrop {
+        fn drop(&mut self) {
+            panic!("injected writer cleanup panic");
+        }
+    }
+    let (send, output) = framed_channel(1);
+    drop(output);
+    let cancel = CancellationToken::new();
+    let connection = CancellationToken::new();
+    let close_cause = crate::zakura::CloseCause::default();
+    let tasks = super::ServingTasks {
+        peer: peer(1),
+        cancel: cancel.clone(),
+        connection: connection.clone(),
+        close_cause: close_cause.clone(),
+    };
+    let (order, responses) = tokio::sync::mpsc::unbounded_channel();
+    let (frames, response) = tokio::sync::mpsc::unbounded_channel();
+    frames
+        .send(super::ResponseFrame {
+            frame: crate::zakura::wire_codec::encode_frame(&Probe::Done(0)).unwrap(),
+            guard: crate::zakura::FrameGuard::new(Arc::new(PanicOnDrop)),
+            ends: true,
+        })
+        .unwrap();
+    order.send(response).unwrap();
+    tasks.spawn(super::write_in_order(responses, send, cancel.clone()));
+    tokio::time::timeout(Duration::from_secs(5), connection.cancelled())
+        .await
+        .unwrap();
+    assert!(cancel.is_cancelled());
+    assert_eq!(close_cause.get_or("cancelled"), "service_panic");
+}
+

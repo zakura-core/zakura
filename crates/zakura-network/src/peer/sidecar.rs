@@ -55,15 +55,22 @@ impl SidecarReadiness {
         Self(Mutex::new(BTreeMap::new()))
     }
 
-    /// Records whether the sidecar at `ip` supports the next network upgrade, and returns
-    /// whether every recorded sidecar does.
+    /// Records whether the sidecar at `ip` supports the next network upgrade, and sets the
+    /// `zcashd_compat.sidecar.next_upgrade_ready` gauge to whether every recorded sidecar does,
+    /// which it returns. The gauge is set under the lock, so concurrent records publish in order.
     pub(crate) fn record(&self, ip: IpAddr, ready: bool) -> bool {
         let mut readiness = self
             .0
             .lock()
             .expect("the readiness lock is never poisoned: nothing panics while holding it");
         readiness.insert(canonical_ip(ip), ready);
-        readiness.values().all(|ready| *ready)
+        let all_ready = readiness.values().all(|ready| *ready);
+        metrics::gauge!("zcashd_compat.sidecar.next_upgrade_ready").set(if all_ready {
+            1.0
+        } else {
+            0.0
+        });
+        all_ready
     }
 }
 
@@ -113,15 +120,10 @@ pub(crate) fn check_upgrade_readiness(
     ready
 }
 
-/// Records whether the sidecar at `sidecar_ip` supports the next network upgrade, and sets the
-/// `zcashd_compat.sidecar.next_upgrade_ready` gauge to whether every recorded sidecar does.
+/// Records whether the sidecar at `sidecar_ip` supports the next network upgrade. See
+/// [`SidecarReadiness::record`].
 pub(crate) fn set_next_upgrade_ready(sidecar_ip: IpAddr, ready: bool) {
-    let all_ready = SIDECAR_READINESS.record(sidecar_ip, ready);
-    metrics::gauge!("zcashd_compat.sidecar.next_upgrade_ready").set(if all_ready {
-        1.0
-    } else {
-        0.0
-    });
+    SIDECAR_READINESS.record(sidecar_ip, ready);
 }
 
 /// Warns that the protected sidecar at `sidecar_ip` is being disconnected because a network

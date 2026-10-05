@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import gzip
 import hashlib
 import io
 import json
@@ -141,6 +142,57 @@ def verify_release(release: Path, sha: str) -> dict:
     return manifest
 
 
+PACKAGE_TOP_FILES = (
+    "zakura-cluster-watchdog.py",
+    "zakura-compat-check",
+    "zakura-monitoring-acceptance.py",
+    "fleet-watchdog.toml",
+    "zakura-fleet-watchdog.service",
+    "test_zakura_monitoring_compat.py",
+    "test_zakura_monitoring_lane.py",
+    "test_zakura_monitoring_install.py",
+)
+
+
+def package_files(source: Path) -> list[str]:
+    """Every file a release contains, relative to ``deploy/runner`` (or a release)."""
+    modules = sorted(
+        path.relative_to(source).as_posix()
+        for path in (source / "zakura_monitoring").glob("*.py")
+    )
+    return [*PACKAGE_TOP_FILES, *modules]
+
+
+def build_package(source: Path, sha: str, out_dir: Path) -> dict:
+    """Build a reproducible release tarball with a per-file digest manifest."""
+    if not SHA.fullmatch(sha):
+        raise InstallError("commit must be a full 40-character SHA")
+    files = package_files(source)
+    contents = {name: (source / name).read_bytes() for name in files}
+    manifest = {
+        "sha": sha,
+        "files": {name: hashlib.sha256(data).hexdigest() for name, data in contents.items()},
+    }
+    contents[MANIFEST] = (json.dumps(manifest, indent=2, sort_keys=True) + "\n").encode()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    tarball = out_dir / f"zakura-monitoring-{sha}.tar.gz"
+    with tarball.open("wb") as raw, gzip.GzipFile(
+        filename="", fileobj=raw, mode="wb", mtime=0
+    ) as compressed, tarfile.open(fileobj=compressed, mode="w", format=tarfile.PAX_FORMAT) as archive:
+        for name in sorted(contents):
+            info = tarfile.TarInfo(name)
+            info.size = len(contents[name])
+            info.mode = 0o755 if Path(name).name in EXECUTABLES else 0o644
+            info.mtime = 0
+            archive.addfile(info, io.BytesIO(contents[name]))
+    return {
+        "tarball": str(tarball),
+        "digest": sha256_file(tarball),
+        "manifest_sha256": hashlib.sha256(contents[MANIFEST]).hexdigest(),
+        "files": len(files),
+    }
+
+
 def safe_extract(tarball: Path, destination: Path) -> None:
     with tarfile.open(tarball, "r:gz") as archive:
         for member in archive.getmembers():
@@ -218,7 +270,10 @@ def preserve_legacy(root: Path, links: dict[str, str]) -> str | None:
     legacy = root / "releases" / name
     legacy.mkdir(parents=True)
     for file_name in legacy_files:
-        shutil.copy2(root / file_name, legacy / file_name)
+        # Store each file where its link will point, so links work unchanged.
+        target = legacy / links[file_name]
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(root / file_name, target)
     os.chmod(legacy, 0o755)
     return name
 
@@ -327,13 +382,13 @@ def parse_env_lines(text: str) -> list[tuple[str | None, str]]:
     return lines
 
 
-def fleet_env(env_file: Path) -> dict:
+def fleet_env(env_file: Path, new_hook: str = "") -> dict:
     """Preserve the fleet env file, replacing only the Slack webhook when one is supplied.
 
-    The new webhook arrives in ``NEW_SLACK_WEB_HOOK`` (never argv). Every other
-    operator setting, for example Mac comparison flags, is kept verbatim.
+    The new webhook arrives on stdin (never argv). Every other operator
+    setting, for example Mac comparison flags, is kept verbatim.
     """
-    new_hook = os.environ.get("NEW_SLACK_WEB_HOOK", "")
+    new_hook = new_hook.strip()
     if "\n" in new_hook or "\r" in new_hook:
         raise InstallError("webhook must be a single line")
     try:
@@ -479,6 +534,10 @@ def parse_links(values: list[str]) -> dict[str, str]:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = parser.add_subparsers(dest="operation", required=True)
+    package = sub.add_parser("build-package")
+    package.add_argument("--source", type=Path, required=True)
+    package.add_argument("--sha", required=True)
+    package.add_argument("--out", type=Path, required=True)
     staged = sub.add_parser("stage")
     staged.add_argument("--root", type=Path, required=True)
     staged.add_argument("--sha", required=True)
@@ -492,6 +551,7 @@ def main(argv: list[str] | None = None) -> int:
             command.add_argument("--sha", required=True)
     env = sub.add_parser("fleet-env")
     env.add_argument("--env-file", type=Path, required=True)
+    env.add_argument("--webhook-stdin", action="store_true")
     unit = sub.add_parser("ensure-unit")
     unit.add_argument("--unit", type=Path, required=True)
     unit.add_argument("--template", type=Path, required=True)
@@ -516,7 +576,9 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         operation = args.operation
-        if operation == "stage":
+        if operation == "build-package":
+            result = build_package(args.source, args.sha, args.out)
+        elif operation == "stage":
             result = stage(args.root, args.sha, args.tarball, args.digest)
         elif operation == "activate":
             result = activate(args.root, args.sha, parse_links(args.link))
@@ -525,7 +587,8 @@ def main(argv: list[str] | None = None) -> int:
         elif operation == "status":
             result = status(args.root)
         elif operation == "fleet-env":
-            result = fleet_env(args.env_file)
+            hook = sys.stdin.read(4096) if args.webhook_stdin else ""
+            result = fleet_env(args.env_file, hook)
         elif operation == "ensure-unit":
             result = ensure_unit(args.unit, args.template)
         elif operation == "compat-env":

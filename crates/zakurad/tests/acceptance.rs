@@ -4220,6 +4220,16 @@ async fn zcashd_compat_nu7_burst_sync_and_restart() -> Result<()> {
     common::zcashd_compat::nu7::burst_sync_and_restart().await
 }
 
+/// The NU7 sidecar's wallet spends a pre-NU7 Sapling note after activation, and keeps
+/// spending Sapling notes after a reorg and a restart.
+///
+/// See [`common::zcashd_compat::nu7::sapling_spend_reorg_and_restart`] for details.
+#[tokio::test]
+#[ignore]
+async fn zcashd_compat_nu7_sapling_spend_reorg_and_restart() -> Result<()> {
+    common::zcashd_compat::nu7::sapling_spend_reorg_and_restart().await
+}
+
 /// Verifies that both zakurad and zcashd start and respond to basic RPC calls.
 ///
 /// See [`common::zcashd_compat::startup::both_processes_start`] for details.

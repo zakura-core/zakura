@@ -191,6 +191,7 @@ error (misconfiguration, not a skip).
 | `zcashd_compat_nu7_activation_follows_zakurad` | nu7 | **Opt-in:** same tip, branch, NSM value balance, supply and subsidy across NU7 | **Skipped** |
 | `zcashd_compat_nu7_fee_burn_and_wallet_transactions` | nu7 | **Opt-in:** ZIP 235 fee burn on both sides; v5 transactions with the NU7 expiry | **Skipped** |
 | `zcashd_compat_nu7_burst_sync_and_restart` | nu7 | **Opt-in:** 300-block burst without reconnecting; NSM value balance after restart | **Skipped** |
+| `zcashd_compat_nu7_sapling_spend_reorg_and_restart` | nu7 | **Opt-in:** pre-NU7 Sapling note spent after activation; Sapling spends after a reorg and a restart | **Skipped** |
 
 ## Prerequisites for External Mode
 
@@ -228,7 +229,8 @@ crates/zakurad/tests/common/
     ├── tx_flow.rs             transparent_tx_in_mempool, transparent_tx_confirms
     ├── resilience.rs          zakurad_clean_shutdown, zcashd_restarts_after_exit
     ├── nu7.rs                 activation_follows_zakurad, fee_burn_and_wallet_transactions,
-    │                          burst_sync_and_restart (NU7 regtest profile)
+    │                          burst_sync_and_restart, sapling_spend_reorg_and_restart
+    │                          (NU7 regtest profile)
     ├── network.rs             peer_connectivity, mempool_info_valid,
     │                          historical_block_consistent
     └── reorg.rs               basic_depth1, equal_work_race,

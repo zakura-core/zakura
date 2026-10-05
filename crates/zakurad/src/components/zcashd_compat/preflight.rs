@@ -12,8 +12,6 @@ use std::{
 #[cfg(target_os = "linux")]
 use color_eyre::eyre::{eyre, Report};
 #[cfg(target_os = "linux")]
-use nix::unistd::{access, AccessFlags};
-#[cfg(target_os = "linux")]
 use std::os::unix::fs::MetadataExt;
 #[cfg(target_os = "linux")]
 use tracing::warn;
@@ -340,7 +338,7 @@ fn check_conf_access(
         return Ok(());
     }
 
-    if access(conf_path, AccessFlags::R_OK).is_err() {
+    if super::unix::check_access(conf_path, libc::R_OK).is_err() {
         summary.errors.push(format!(
             "zcashd config {} exists but is not readable by the current user",
             conf_path.display()
@@ -467,7 +465,7 @@ fn check_write_requirements(
 
 #[cfg(target_os = "linux")]
 fn path_is_writable_dir(path: &Path) -> bool {
-    access(path, AccessFlags::W_OK | AccessFlags::X_OK).is_ok()
+    super::unix::check_access(path, libc::W_OK | libc::X_OK).is_ok()
 }
 
 #[cfg(target_os = "linux")]
@@ -634,16 +632,12 @@ fn nearest_existing_ancestor(path: &Path) -> Result<PathBuf, Report> {
 
 #[cfg(target_os = "linux")]
 fn statvfs_provisioned_bytes(path: &Path) -> Result<u64, Report> {
-    let stats = nix::sys::statvfs::statvfs(path).map_err(|error| {
+    super::unix::filesystem_size(path).map_err(|error| {
         eyre!(
             "failed to get filesystem stats for {}: {error}",
             path.display()
         )
-    })?;
-
-    let fragment_size = stats.fragment_size();
-
-    Ok(stats.blocks().saturating_mul(fragment_size))
+    })
 }
 
 #[cfg(target_os = "linux")]

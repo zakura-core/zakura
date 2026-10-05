@@ -231,10 +231,6 @@ hyper = { workspace = true, features = ["server", "http1"] }
 http-body-util = { workspace = true }
 hyper-util = { workspace = true, features = ["service", "server", "tokio"] }
 
-# Configuration management
-
-nix = { workspace = true, features = ["fs"] }
-
 # prod feature internal-miner
 thread-priority = { workspace = true, optional = true }
 
@@ -340,8 +336,8 @@ feature_missing = "warn"
 enum_variant_added = "warn"
 enum_variant_missing = "warn"
 
-[target.'cfg(all(target_os = "linux", target_env = "gnu"))'.dependencies]
-libc = "0.2.186"
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
 
 [[bench]]
 name = "mempool_eviction"

@@ -283,6 +283,9 @@ pub(super) const PARAM_INCLUDE_MEMPOOL_DESC: &str =
 
 mod hex_serde;
 
+#[cfg(unix)]
+mod unix;
+
 #[cfg(test)]
 mod tests;
 
@@ -2859,7 +2862,7 @@ where
     fn stop(&self) -> Result<String> {
         #[cfg(not(target_os = "windows"))]
         if self.network.is_regtest() {
-            match nix::sys::signal::raise(nix::sys::signal::SIGINT) {
+            match unix::raise_interrupt() {
                 Ok(_) => Ok("Zakura server stopping".to_string()),
                 Err(error) => Err(ErrorObject::owned(
                     ErrorCode::InternalError.code(),

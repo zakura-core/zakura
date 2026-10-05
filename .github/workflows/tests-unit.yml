@@ -25,6 +25,7 @@ on:
       - rust-toolchain.toml
       - .github/actions/setup-zakura-build/**
       - .github/workflows/tests-unit.yml
+      - .github/workflows/zakura-e2e.yml
       - scripts/check-crate-publish-graph.sh
       - scripts/lib/crates-index.sh
       - docs/specs/fork-aware-header-chain-engine.md
@@ -77,6 +78,7 @@ jobs:
       config: ${{ steps.filter.outputs.config }}
       rust: ${{ steps.filter.outputs.rust }}
       publish_graph: ${{ steps.filter.outputs.publish_graph }}
+      cluster: ${{ steps.filter.outputs.cluster }}
     steps:
       - id: filter
         env:
@@ -100,6 +102,7 @@ jobs:
                  (( TOTAL_CHANGED_FILES >= 3000 )); then
                 echo "config=true" >> "$GITHUB_OUTPUT"
                 echo "rust=true" >> "$GITHUB_OUTPUT"
+                echo "cluster=true" >> "$GITHUB_OUTPUT"
                 echo "publish_graph=true" >> "$GITHUB_OUTPUT"
                 exit 0
               fi
@@ -131,18 +134,27 @@ jobs:
             workflow_dispatch)
               echo "config=true" >> "$GITHUB_OUTPUT"
               echo "rust=true" >> "$GITHUB_OUTPUT"
+              echo "cluster=true" >> "$GITHUB_OUTPUT"
               echo "publish_graph=true" >> "$GITHUB_OUTPUT"
               exit 0
               ;;
             schedule)
               echo "config=false" >> "$GITHUB_OUTPUT"
               echo "rust=false" >> "$GITHUB_OUTPUT"
+              echo "cluster=true" >> "$GITHUB_OUTPUT"
               # Nightly re-checks the live index so main cannot silently
               # accumulate a skipped-dependent pin after a crates.io publish.
               echo "publish_graph=true" >> "$GITHUB_OUTPUT"
               exit 0
               ;;
           esac
+
+          # Include the cluster harness, its build inputs, and both workflow owners.
+          if grep -qE '^(crates/zakura-network/|crates/zakurad/src/components/sync/|crates/zakurad/tests/zakura_regtest_e2e\.rs|docker/zakura-regtest-e2e/|docker/docker-compose\.zakura-regtest-e2e\.yml|Cargo\.(toml|lock)$|rust-toolchain\.toml$|\.cargo/config\.toml$|\.config/nextest\.toml$|\.github/actions/setup-zakura-build/|\.github/workflows/(tests-unit|zakura-e2e)\.yml$)' <<< "$changed"; then
+            echo "cluster=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "cluster=false" >> "$GITHUB_OUTPUT"
+          fi
 
           config=false
           while IFS= read -r path; do
@@ -478,9 +490,56 @@ jobs:
       - name: Check crates.io publish graph
         run: ./scripts/check-crate-publish-graph.sh
 
-  # NOTE: the Zakura regtest e2e jobs moved to `zakura-e2e.yml` so they can be
-  # path-gated independently of the broad Rust filter here (they run on
-  # Zakura-relevant PRs, always in the merge queue, and nightly for long modes).
+  # The Docker regtest jobs remain in zakura-e2e.yml. The native cluster job
+  # belongs here so network changes cannot merge without its evidence.
+
+  zakura-testkit:
+    name: Zakura testkit cluster integration
+    needs: [changes]
+    # Required for network changes, optional for unrelated PRs. Keeping the
+    # cluster job here makes its result part of the required test success gate.
+    if: >-
+      needs.changes.result == 'success' &&
+      (github.event_name == 'merge_group' ||
+       (github.event_name == 'push' && needs.changes.outputs.cluster == 'true') ||
+       github.event_name == 'schedule' ||
+       github.event_name == 'workflow_dispatch' ||
+       (github.event_name == 'pull_request' &&
+        (needs.changes.outputs.cluster == 'true' ||
+         contains(github.event.pull_request.labels.*.name, 'run-zakura-e2e'))))
+    permissions:
+      contents: read
+      id-token: write
+      statuses: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f #v1.17.0 # zizmor: ignore[cache-poisoning] -- CI integration job; uploads only diagnostic test traces
+        with:
+          toolchain: stable
+          # Same debug + default-release-binaries workspace build as the unit
+          # acceptance jobs, so it shares their consolidated build cache.
+          cache-shared-key: zakura-drb-debug
+          cache-on-failure: true
+          cache-save-if: false
+      - uses: taiki-e/install-action@7623a79cdfecb99d681017af368ca353d9f49bb5 #v2.87.19
+        with:
+          tool: cargo-nextest
+      - uses: ./.github/actions/setup-zakura-build
+      - name: Run Zakura testkit cluster profile
+        run: cargo nextest run --profile zakura-integration --locked --features default-release-binaries --no-fail-fast
+        env:
+          ZAKURA_TEST_TRACE: keep
+      - name: Upload Zakura testkit traces
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a #v7.0.1
+        with:
+          name: zakura-testkit-traces
+          path: target/zakura-traces
+          if-no-files-found: ignore
 
   test-success:
     name: test success
@@ -498,6 +557,7 @@ jobs:
       - pruned-storage
       - check-no-git-dependencies
       - publish-graph
+      - zakura-testkit
     timeout-minutes: 30
     steps:
       - name: Decide whether the needed jobs succeeded or failed
@@ -511,7 +571,7 @@ jobs:
           # check-no-git-dependencies is A-release-label only, publish-graph
           # skips on PRs that do not touch Cargo manifests or this check.
           # Failed, non-skipped jobs still fail this aggregate status.
-          allowed-skips: check-no-git-dependencies, pruned-storage, zakura-config, build-tests, unit-tests, extended-reissuance-properties, network-dependent, publish-graph
+          allowed-skips: check-no-git-dependencies, pruned-storage, zakura-config, build-tests, unit-tests, extended-reissuance-properties, network-dependent, publish-graph, zakura-testkit
 
   report-nightly-result:
     name: report nightly release test result

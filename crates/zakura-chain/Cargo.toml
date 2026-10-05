@@ -62,7 +62,7 @@ equihash = { workspace = true }
 group = { workspace = true }
 incrementalmerkletree.workspace = true
 jubjub = { workspace = true }
-dirs = { workspace = true }
+dirs-sys = { workspace = true }
 rand_core = { workspace = true, features = ["getrandom"] }
 rand_chacha_10 = { workspace = true, optional = true }
 rand_core_10 = { workspace = true, optional = true }

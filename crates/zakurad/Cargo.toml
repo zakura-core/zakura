@@ -214,7 +214,7 @@ tracing = { workspace = true }
 
 metrics = { workspace = true }
 
-dirs = { workspace = true }
+dirs-sys = { workspace = true }
 reqwest = { workspace = true, default-features = false, features = ["blocking", "rustls-no-provider"] }
 # Resolution constraint for transitive URL/DNS dependencies; no direct API use.
 idna_adapter = { workspace = true }

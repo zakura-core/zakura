@@ -11,9 +11,36 @@ use tempfile::PersistError;
 
 /// Returns Zakura's default cache directory path.
 pub fn default_cache_dir() -> PathBuf {
-    dirs::cache_dir()
+    cache_dir()
         .unwrap_or_else(|| std::env::current_dir().unwrap().join("cache"))
         .join("zakura")
+}
+
+/// Returns the platform cache directory without Zakura's suffix.
+fn cache_dir() -> Option<PathBuf> {
+    #[cfg(target_os = "windows")]
+    {
+        dirs_sys::known_folder_local_app_data()
+    }
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    {
+        dirs_sys::home_dir().map(|home| home.join("Library/Caches"))
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        None
+    }
+    #[cfg(not(any(
+        target_os = "windows",
+        target_os = "macos",
+        target_os = "ios",
+        target_arch = "wasm32"
+    )))]
+    {
+        std::env::var_os("XDG_CACHE_HOME")
+            .and_then(dirs_sys::is_absolute_path)
+            .or_else(|| dirs_sys::home_dir().map(|home| home.join(".cache")))
+    }
 }
 
 /// Accepts a target file path and a byte-slice.

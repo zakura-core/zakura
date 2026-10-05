@@ -1205,15 +1205,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "dirs"
-version = "6.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c3e8aa94d75141228480295a7d0e7feb620b1a5ad9f12bc40be62411e38cce4e"
-dependencies = [
- "dirs-sys",
-]
-
-[[package]]
 name = "dirs-sys"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6157,7 +6148,7 @@ dependencies = [
  "console-subscriber",
  "criterion",
  "derive-new",
- "dirs",
+ "dirs-sys",
  "futures",
  "hex",
  "http-body-util",
@@ -6283,7 +6274,7 @@ dependencies = [
  "chrono",
  "color-eyre",
  "criterion",
- "dirs",
+ "dirs-sys",
  "ed25519-zebra",
  "futures",
  "getset",
@@ -6656,7 +6647,7 @@ dependencies = [
  "bytes",
  "chrono",
  "criterion",
- "dirs",
+ "dirs-sys",
  "futures",
  "hex",
  "indexmap",

@@ -250,7 +250,7 @@ jobs:
 
       - name: Compatibility monitoring tests
         if: ${{ !cancelled() }}
-        run: python3 -m unittest discover -s deploy/runner -p 'test_zakura_monitoring_*.py'
+        run: python3 -m unittest discover -s deploy/runner -p 'test_*monitoring*.py'
 
       - name: Release-state coupling
         if: ${{ !cancelled() }}

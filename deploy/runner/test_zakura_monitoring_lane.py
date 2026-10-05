@@ -504,6 +504,20 @@ class WorkerTests(unittest.TestCase):
         )
 
 
+class OneShotTests(unittest.TestCase):
+    def test_once_mode_applies_the_probe_it_waited_for(self):
+        worker = monitor.ProbeWorker(TARGET, runner=lambda *_: bounded(None, returncode=255))
+        result = worker.wait(5, keep=True)
+        self.assertEqual(result.error_kind, "ssh_failed")
+        posted = []
+        with mock.patch.object(watchdog, "post_slack",
+                               side_effect=lambda text, _args: (posted.append(text), True)[1]):
+            agent = watchdog.Watchdog([], make_args(), compatibility=[worker])
+            agent.run_once(state_module.load_state(Path("/nonexistent/state.json")))
+        self.assertEqual(len(posted), 1)
+        self.assertEqual(worker.starts, 1)
+
+
 class BoundedRunTests(unittest.TestCase):
     def test_timeout_kills_the_process_group(self):
         started = time.monotonic()

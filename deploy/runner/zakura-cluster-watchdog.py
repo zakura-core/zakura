@@ -2092,7 +2092,9 @@ def main() -> int:
         if args.once:
             # A one-shot run waits for its probe so the result is observable.
             for worker in compatibility:
-                worker.wait(worker.target.timeout + monitor.OVERRUN_GRACE_SECONDS)
+                worker.wait(
+                    worker.target.timeout + monitor.OVERRUN_GRACE_SECONDS, keep=True
+                )
         watchdog.run_once(state)
         save_state(args.state_file, state)
 

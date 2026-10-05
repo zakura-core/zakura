@@ -375,15 +375,21 @@ class ProbeWorker:
             self._start()
         return completed
 
-    def wait(self, timeout: float) -> ProbeResult | None:
-        """Block for the in-flight probe; only for one-shot manual runs."""
+    def wait(self, timeout: float, keep: bool = False) -> ProbeResult | None:
+        """Block for the in-flight probe; only for one-shot manual runs.
+
+        With ``keep`` the result stays queued for the next :meth:`poll`.
+        """
         if self._thread is None:
             self.poll()
         try:
             completed = self._results.get(timeout=timeout)
         except queue.Empty:
             return None
-        self._thread = None
+        if keep:
+            self._results.put(completed)
+        else:
+            self._thread = None
         return completed
 
 

@@ -21,7 +21,7 @@
 #   are not semver-checked, mirroring existing release practice.
 # - The `zakura` node binary package is excluded because its Rust types are not
 #   a supported library API. Its release version is managed separately.
-# - publish = false members (xtask, zakura-watchdog) are skipped automatically.
+# - publish = false members (xtask) are skipped automatically.
 # - A NEW publishable crate that has never been published to crates.io fails
 #   with "no baseline": add it to SEMVER_ENFORCEMENT_EXCLUSIONS in the package
 #   selector in the same PR, and remove it after its first publish.

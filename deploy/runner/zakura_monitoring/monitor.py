@@ -190,10 +190,10 @@ def parse_probe_output(
     finished_at: float,
 ) -> ProbeResult:
     """Validate untrusted checker output for the probe identified by ``nonce``."""
-    if result.returncode is None:
-        return unavailable("ssh_failed", finished_at)
     if result.timed_out:
         return unavailable("ssh_timeout", finished_at)
+    if result.returncode is None:
+        return unavailable("ssh_failed", finished_at)
     if result.oversized:
         return unavailable("oversized_outcome", finished_at)
     try:

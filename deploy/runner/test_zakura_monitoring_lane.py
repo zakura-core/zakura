@@ -12,6 +12,7 @@ import argparse
 import importlib.util
 import json
 import os
+import signal
 import shlex
 import socket
 import stat
@@ -327,6 +328,86 @@ class NamespaceTests(LaneCase):
 
 
 class SuppressionTests(LaneCase):
+    def test_pending_failure_stays_suppressed_after_restart_until_expiry(self):
+        self.accept = False
+        self.step(failing())
+        queued = json.loads(json.dumps(self.pending))
+        self.accept = True
+        until = NOW + 600
+        self.step(failing(at=NOW + 60, suppressed_until=until), now=NOW + 60)
+        self.assertEqual(self.posted, [])
+        self.assertEqual(self.pending, queued)
+        self.assertEqual(self.entry, {})
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.json"
+            state_module.save_state(path, self.state)
+            self.worker = FakeWorker()
+            self.agent = self.make_agent()
+            self.state = state_module.load_state(path)
+        self.step(None, now=NOW + 120)
+        self.step(missing_checker(NOW + 180), now=NOW + 180)
+        self.assertEqual(self.posted, [])
+        self.assertEqual(self.pending, queued)
+        self.assertEqual(self.entry, {})
+        self.step(None, now=until)
+        self.assertEqual(len(self.posted), 1)
+        self.assertIsNone(self.pending)
+        self.assertTrue(self.entry["alerting"])
+        self.step(failing(at=until + 60), now=until + 60)
+        self.assertEqual(len(self.posted), 1, "the queued failure must not repeat")
+
+    def test_pending_failure_and_recovery_resume_in_order_after_suppression(self):
+        self.accept = False
+        self.step(failing())
+        self.step(passing(at=NOW + 60), now=NOW + 60)
+        queued = json.loads(json.dumps(self.pending))
+        self.accept = True
+        until = NOW + 600
+        self.step(passing(at=NOW + 120, suppressed_until=until), now=NOW + 120)
+        self.step(None, now=until - 1)
+        self.assertEqual(self.posted, [])
+        self.assertEqual(self.pending, queued)
+        self.assertEqual(self.entry, {})
+        self.step(None, now=until)
+        self.assertEqual(len(self.posted), 1)
+        self.assertIn("failing", self.posted[0])
+        self.assertEqual(len(self.pending["messages"]), 1)
+        self.step(None, now=until + 1)
+        self.assertEqual(len(self.posted), 2)
+        self.assertIn("recovered", self.posted[1])
+        self.assertIsNone(self.pending)
+        self.assertEqual(self.entry, {"condition": "ok", "alerting": False})
+
+    def test_removed_marker_releases_pending_failure_before_previous_expiry(self):
+        self.accept = False
+        self.step(failing())
+        self.accept = True
+        self.step(failing(at=NOW + 60, suppressed_until=NOW + 600), now=NOW + 60)
+        self.assertEqual(self.posted, [])
+        self.step(failing(at=NOW + 120), now=NOW + 120)
+        self.assertEqual(len(self.posted), 1)
+        self.assertIsNone(self.pending)
+        self.assertTrue(self.entry["alerting"])
+
+    def test_pending_recovery_does_not_acknowledge_during_suppression(self):
+        self.step(failing())
+        self.posted.clear()
+        self.accept = False
+        self.step(passing(at=NOW + 60), now=NOW + 60)
+        queued = json.loads(json.dumps(self.pending))
+        self.accept = True
+        self.step(passing(at=NOW + 120, suppressed_until=NOW + 600), now=NOW + 120)
+        self.step(missing_checker(NOW + 180), now=NOW + 180)
+        self.assertEqual(self.posted, [])
+        self.assertEqual(self.pending, queued)
+        self.assertTrue(self.entry["alerting"])
+        self.step(None, now=NOW + 600)
+        self.assertEqual(len(self.posted), 1)
+        self.assertIn("recovered", self.posted[0])
+        self.assertIsNone(self.pending)
+        self.assertFalse(self.entry["alerting"])
+
     def test_active_marker_suppresses_transitions_but_not_post_expiry_failure(self):
         until = NOW + 600
         self.step(failing(suppressed_until=until))
@@ -397,6 +478,9 @@ class ParseTests(unittest.TestCase):
                 self.assertEqual(parsed.error_kind, reason)
         self.assertEqual(self.parse(remote.BoundedResult(None, b"", False, False, 0)).error_kind,
                          "ssh_failed")
+        unreaped = remote.BoundedResult(None, b"", True, False, 120)
+        self.assertEqual(self.parse(unreaped).error_kind, "ssh_timeout")
+        self.assertFalse(self.parse(unreaped).passed)
 
     def test_wrong_nonce_schema_or_exit_code_is_malformed(self):
         for result in (
@@ -552,6 +636,123 @@ class OneShotTests(unittest.TestCase):
 
 
 class BoundedRunTests(unittest.TestCase):
+    def test_worker_can_probe_again_after_a_detached_stdout_holder_timeout(self):
+        raw = []
+        clock = [0.0]
+        parent = (
+            "import subprocess,sys,time; "
+            "child=subprocess.Popen([sys.executable,'-c','import time; time.sleep(8)'], "
+            "start_new_session=True); print(child.pid,flush=True); time.sleep(30)"
+        )
+
+        def runner(*_args):
+            if not raw:
+                raw.append(remote.run_bounded([sys.executable, "-c", parent], 0.5, 100))
+                return raw[0]
+            return bounded(outcome_dict())
+
+        worker = monitor.ProbeWorker(TARGET, runner=runner, clock=lambda: NOW,
+                                     monotonic=lambda: clock[0], nonce_factory=lambda: "n")
+        try:
+            failed = worker.wait(2)
+            self.assertIsNotNone(failed)
+            self.assertEqual(failed.error_kind, "ssh_timeout")
+            self.assertFalse(failed.passed)
+            clock[0] = 60.0
+            worker.poll()
+            self.assertTrue(worker.wait(2).passed)
+            self.assertEqual(worker.starts, 2)
+        finally:
+            if raw and raw[0].stdout.strip().isdigit():
+                try:
+                    os.kill(int(raw[0].stdout), signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+
+    def test_detached_stdout_holder_cannot_extend_timeout(self):
+        for parent_exits in (False, True):
+            with self.subTest(parent_exits=parent_exits):
+                child = "import time; time.sleep(8)"
+                parent = (
+                    "import subprocess,sys,time; "
+                    f"child=subprocess.Popen([sys.executable,'-c',{child!r}], "
+                    "start_new_session=True); print(child.pid,flush=True); "
+                    + ("" if parent_exits else "time.sleep(30)")
+                )
+                result = remote.run_bounded([sys.executable, "-c", parent], 0.5, 100)
+                try:
+                    self.assertTrue(result.timed_out)
+                    self.assertLess(result.elapsed, 2)
+                    self.assertTrue(result.stdout.strip().isdigit())
+                finally:
+                    if result.stdout.strip().isdigit():
+                        try:
+                            os.kill(int(result.stdout), signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+
+    def test_stdout_eof_does_not_skip_process_timeout(self):
+        result = remote.run_bounded(
+            [sys.executable, "-c", "import os,time; os.close(1); time.sleep(30)"],
+            0.2, 100,
+        )
+        self.assertTrue(result.timed_out)
+        self.assertLess(result.elapsed, 2)
+
+    def test_zero_timeout_is_bounded(self):
+        result = remote.run_bounded([sys.executable, "-c", "import time; time.sleep(30)"],
+                                    0, 100)
+        self.assertTrue(result.timed_out)
+        self.assertLess(result.elapsed, 1)
+
+    def test_success_preserves_output_and_exit_code(self):
+        result = remote.run_bounded([sys.executable, "-c", "print('outcome'); exit(7)"],
+                                    5, 100)
+        self.assertEqual(result.returncode, 7)
+        self.assertEqual(result.stdout, b"outcome\n")
+        self.assertFalse(result.timed_out)
+        self.assertFalse(result.oversized)
+
+    def test_reaping_cannot_wait_past_the_same_deadline(self):
+        for kill_error in (ProcessLookupError, PermissionError):
+            with self.subTest(kill_error=kill_error):
+                descriptor, writer = os.pipe()
+                os.close(writer)
+                with os.fdopen(descriptor, "rb") as pipe:
+                    process = mock.Mock(pid=1234, stdout=pipe)
+                    process.poll.return_value = None
+                    process.wait.side_effect = remote.subprocess.TimeoutExpired("fixture", 0.2)
+                    with mock.patch.object(remote.subprocess, "Popen", return_value=process), \
+                            mock.patch.object(remote.os, "killpg", side_effect=kill_error):
+                        result = remote.run_bounded(["fixture"], 0.2, 100)
+                    self.assertTrue(pipe.closed)
+                self.assertTrue(result.timed_out)
+                self.assertIsNone(result.returncode)
+                self.assertLess(result.elapsed, 1)
+                self.assertEqual(process.wait.call_count, 2)
+                for call in process.wait.call_args_list:
+                    self.assertGreaterEqual(call.kwargs["timeout"], 0)
+                    self.assertLessEqual(call.kwargs["timeout"], 0.2)
+
+    def test_transient_nonblocking_read_is_retried(self):
+        read = os.read
+        calls = 0
+
+        def transient_read(*args):
+            nonlocal calls
+            if not os.get_blocking(args[0]):
+                calls += 1
+                if calls == 1:
+                    raise BlockingIOError
+            return read(*args)
+
+        with mock.patch.object(remote.os, "read", side_effect=transient_read):
+            result = remote.run_bounded([sys.executable, "-c", "print('outcome')"], 5, 100)
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, b"outcome\n")
+        self.assertFalse(result.timed_out)
+        self.assertGreater(calls, 1)
+
     def test_timeout_kills_the_process_group(self):
         started = time.monotonic()
         result = remote.run_bounded(["sh", "-c", "sleep 30 & sleep 30"], 0.5, 100)

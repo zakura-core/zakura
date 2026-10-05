@@ -263,7 +263,9 @@ With `ZAKURA_COMPAT_MONITORING=1` (written by cutover as the drop-in
 `zakura-fleet-watchdog.service.d/80-compat-monitoring.conf`) the watchdog probes
 the single `[[compatibility]]` target in `fleet-watchdog.toml` every 60 seconds:
 one worker thread, at most one probe in flight, and a 120-second hard timeout
-covering SSH and RPC. It uses root's SSH identity with `BatchMode=yes` and the
+covering SSH, RPC, output collection and process cleanup. Pipe reads are
+non-blocking, so a detached descendant holding stdout open cannot strand the
+worker. It uses root's SSH identity with `BatchMode=yes` and the
 host key pinned in `/etc/zakura-fleet-watchdog/known_hosts`. Fleet polls never
 wait for a probe; the main thread alone applies results and owns state.
 The lane passes `height_max_drift = 10` from that target explicitly, so a host
@@ -286,7 +288,10 @@ same explicit limit.
   `/run/zakura-watchdog/deployment-suppressed-until` on `zakura-compat`, written
   by deploys that restart `zakurad-compat`, mutes this lane. A marker more than
   1200 seconds ahead, or not a whole Unix timestamp, is ignored. Probes keep
-  running; a failure that outlives the marker alerts on the next probe. The fleet
+  running; queued alerts and recoveries are retained without delivery or
+  acknowledgement until suppression expires or a valid probe clears it. The
+  last bounded window survives restart and missing or unavailable probes.
+  A failure that outlives the marker alerts on the next probe. The fleet
   marker on `us-east-0` does not mute this lane.
 
 ### Deployment

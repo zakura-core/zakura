@@ -1027,6 +1027,8 @@ class Watchdog:
         """Apply a completed compatibility probe through the durable delivery queue.
 
         The probe itself runs on the worker thread; this never waits for it.
+        Suppression pauses queued delivery as well as new transitions. Keep
+        honoring the last bounded window during missing or unavailable probes.
         """
         result = worker.poll()
         name = worker.target.name
@@ -1052,6 +1054,11 @@ class Watchdog:
             state, monitor.COMPAT_QUEUE, name, messages, bucket[name], now,
             title=monitor.COMPAT_BATCH_TITLE,
         )
+        record = state.get(monitor.COMPAT_PROBES, {}).get(name, {})
+        suppressed_until = coerce_float(record.get("suppressed_until"))
+        if suppressed_until is not None and suppressed_until > now:
+            self.checkpoint(state)
+            return
         deliver_pending(
             state,
             monitor.COMPAT_QUEUE,

@@ -9,10 +9,10 @@ killed when the hard timeout expires.
 from __future__ import annotations
 
 import os
+import selectors
 import shlex
 import signal
 import subprocess
-import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -20,12 +20,13 @@ from typing import Sequence
 
 
 READ_CHUNK = 4096
-READER_JOIN_SECONDS = 5.0
+# Reserve a small part of the overall deadline for killing and reaping.
+MAX_REAP_SECONDS = 0.1
 
 
 @dataclass(frozen=True)
 class BoundedResult:
-    """What a bounded command produced. ``returncode`` is None if it never started."""
+    """Command output; returncode is None if startup or bounded reaping failed."""
 
     returncode: int | None
     stdout: bytes
@@ -40,8 +41,18 @@ def run_bounded(
     max_output: int,
     env: dict[str, str] | None = None,
 ) -> BoundedResult:
-    """Run ``command`` for at most ``timeout`` seconds, keeping ``max_output`` bytes."""
+    """Bound execution, output collection and cleanup by one overall deadline.
+
+    Non-blocking pipe reads never wait for a detached descendant to close
+    stdout. Timeout includes waiting for EOF, even if the direct child exited.
+    Keep draining past the output cap so a chatty child cannot fill the pipe.
+    """
     started = time.monotonic()
+    budget = max(0.0, timeout)
+    deadline = started + budget
+    work_deadline = deadline - min(MAX_REAP_SECONDS, budget / 2)
+    if budget == 0:
+        return BoundedResult(None, b"", True, False, time.monotonic() - started)
     try:
         process = subprocess.Popen(
             list(command),
@@ -55,43 +66,50 @@ def run_bounded(
         return BoundedResult(None, b"", False, False, time.monotonic() - started)
 
     captured = bytearray()
-    oversized = threading.Event()
-
-    def drain() -> None:
-        # Keep draining past the cap so a chatty child cannot block on a full pipe.
-        assert process.stdout is not None
-        while True:
-            chunk = process.stdout.read1(READ_CHUNK)
-            if not chunk:
-                return
-            room = max_output - len(captured)
-            if len(chunk) > room:
-                oversized.set()
-            if room > 0:
-                captured.extend(chunk[:room])
-
-    reader = threading.Thread(target=drain, name="bounded-reader", daemon=True)
-    reader.start()
+    oversized = False
     timed_out = False
+    returncode = None
+    assert process.stdout is not None
     try:
-        returncode = process.wait(timeout=max(0.0, timeout))
+        descriptor = process.stdout.fileno()
+        os.set_blocking(descriptor, False)
+        with selectors.DefaultSelector() as selector:
+            selector.register(descriptor, selectors.EVENT_READ)
+            while True:
+                remaining = work_deadline - time.monotonic()
+                if remaining <= 0:
+                    raise subprocess.TimeoutExpired(command, timeout)
+                if not selector.select(remaining):
+                    continue
+                try:
+                    chunk = os.read(descriptor, READ_CHUNK)
+                except BlockingIOError:
+                    continue
+                if not chunk:
+                    break
+                room = max_output - len(captured)
+                oversized = oversized or len(chunk) > room
+                if room > 0:
+                    captured.extend(chunk[:room])
+        # EOF alone does not mean the process finished.
+        returncode = process.wait(timeout=max(0.0, work_deadline - time.monotonic()))
     except subprocess.TimeoutExpired:
         timed_out = True
+    finally:
+        if timed_out or process.poll() is None:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                # The exited parent's group may already be gone or reused.
+                pass
         try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        returncode = process.wait()
-    reader.join(READER_JOIN_SECONDS)
-    if reader.is_alive():
-        # A descendant escaped the process group and still holds the pipe.
-        oversized.set()
-    try:
+            returncode = process.wait(timeout=max(0.0, deadline - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            # A process stuck in the kernel must not strand the probe worker.
+            timed_out = True
         process.stdout.close()
-    except OSError:
-        pass
     return BoundedResult(
-        returncode, bytes(captured), timed_out, oversized.is_set(),
+        returncode, bytes(captured), timed_out, oversized,
         time.monotonic() - started,
     )
 

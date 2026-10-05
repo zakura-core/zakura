@@ -1019,10 +1019,10 @@ class Watchdog:
         # Fleet-wide deploy suppression deliberately does not reach this lane:
         # only a zakurad-compat restart, reported by the probe, mutes it.
         for worker in self.compatibility:
-            self.handle_compatibility(state, worker, time.time())
+            self.handle_compatibility(state, worker)
 
     def handle_compatibility(
-        self, state: dict[str, Any], worker: monitor.ProbeWorker, now: float
+        self, state: dict[str, Any], worker: monitor.ProbeWorker, now: float | None = None
     ) -> None:
         """Apply a completed compatibility probe through the durable delivery queue.
 
@@ -1031,6 +1031,9 @@ class Watchdog:
         honoring the last bounded window during missing or unavailable probes.
         """
         result = worker.poll()
+        # Sample after collection: a result may finish while poll is running.
+        if now is None:
+            now = time.time()
         name = worker.target.name
         pending = state.setdefault(monitor.COMPAT_QUEUE, {})
         if result is None and name not in pending:

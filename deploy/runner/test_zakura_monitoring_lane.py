@@ -133,6 +133,19 @@ class LaneCase(unittest.TestCase):
 
 
 class TransitionTests(LaneCase):
+    def test_live_consumption_samples_clock_after_collecting_result(self):
+        wall = [NOW]
+        def poll():
+            wall[0] += 0.01
+            return passing(at=wall[0])
+        self.worker.poll = poll
+        with mock.patch.object(watchdog.time, "time", side_effect=lambda: wall[0]):
+            self.agent.run_once(self.state)
+        last = self.state[monitor.COMPAT_PROBES][TARGET.name]["last"]
+        self.assertTrue(last["valid"])
+        self.assertEqual(last["completed_at"], NOW + 0.01)
+        self.assertEqual(self.posted, [])
+
     def test_delayed_pass_cannot_recover_or_qualify_as_a_fresh_probe(self):
         self.step(failing())
         self.step(passing(at=NOW + 60), now=NOW + 660)

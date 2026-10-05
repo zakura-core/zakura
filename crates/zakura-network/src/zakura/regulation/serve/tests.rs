@@ -1071,43 +1071,44 @@ async fn serving_panics_close_the_connection_even_with_a_blocked_writer() {
     }
 }
 
-/// A panic during writer cleanup follows the same connection-wide supervision path.
+/// A writer spawned by the production session reports cleanup panics to the connection.
 #[tokio::test]
 async fn a_writer_panic_records_the_cause_and_cancels_the_connection() {
     #[derive(Debug)]
     struct PanicOnDrop;
+    impl crate::zakura::SessionResources for PanicOnDrop {
+        fn admitted(&self) {}
+    }
     impl Drop for PanicOnDrop {
         fn drop(&mut self) {
             panic!("injected writer cleanup panic");
         }
     }
-    let (send, output) = framed_channel(1);
-    drop(output);
+    let capacity = capacity(LIMITS);
+    let (send, mut output) = framed_channel(2);
+    // The ordered writer is the only owner of these session resources.
+    let send = send.with_session_resources(Some(Arc::new(PanicOnDrop)));
     let cancel = CancellationToken::new();
     let connection = CancellationToken::new();
     let close_cause = crate::zakura::CloseCause::default();
-    let tasks = super::ServingTasks {
-        peer: peer(1),
-        cancel: cancel.clone(),
-        connection: connection.clone(),
-        close_cause: close_cause.clone(),
-    };
-    let (order, responses) = tokio::sync::mpsc::unbounded_channel();
-    let (frames, response) = tokio::sync::mpsc::unbounded_channel();
-    frames
-        .send(super::ResponseFrame {
-            frame: crate::zakura::wire_codec::encode_frame(&Probe::Done(0)).unwrap(),
-            guard: crate::zakura::FrameGuard::new(Arc::new(PanicOnDrop)),
-            ends: true,
-        })
-        .unwrap();
-    order.send(response).unwrap();
-    tasks.spawn(super::write_in_order(responses, send, cancel.clone()));
+    let serve = capacity.session(
+        Arc::new(Scripted),
+        &peer(1),
+        4,
+        send,
+        cancel.clone(),
+        connection.clone(),
+        close_cause.clone(),
+    );
+    serve.admit(job()).unwrap();
+    assert_eq!(next(&mut output).await, Probe::Done(0));
+    assert!(!connection.is_cancelled());
+    cancel.cancel();
     tokio::time::timeout(Duration::from_secs(5), connection.cancelled())
         .await
         .unwrap();
-    assert!(cancel.is_cancelled());
     assert_eq!(close_cause.get_or("cancelled"), "service_panic");
+    assert_eq!(serve.open(), 0);
 }
 
 /// A one-slot legacy queue promises eventual control progress once serving drains.

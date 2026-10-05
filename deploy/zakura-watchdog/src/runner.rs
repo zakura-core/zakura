@@ -261,9 +261,10 @@ mod tests {
         let mut config = test_config(5, 1);
         config.deployment_suppression_file = test_suppression_path("excessive");
 
+        // Stay past the limit even if the clock ticks before the check reads it.
         fs::write(
             &config.deployment_suppression_file,
-            (now_epoch_seconds() + config.max_deployment_suppression + 1).to_string(),
+            (now_epoch_seconds() + config.max_deployment_suppression + 60).to_string(),
         )
         .expect("test can write suppression marker");
 

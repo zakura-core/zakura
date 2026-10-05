@@ -13,7 +13,7 @@ use std::{
 use indexmap::IndexMap;
 use tokio::sync::watch;
 use zakura_chain::{
-    block::{self, Block, Hash, Height},
+    block::{self, Hash, Height},
     parameters::Network,
     sprout::{self},
     transparent,
@@ -27,6 +27,7 @@ use crate::{
     SemanticallyVerifiedBlock, ValidateContextError, WatchReceiver,
 };
 
+mod address_transfers;
 mod backup;
 mod chain;
 mod created_utxos;
@@ -37,6 +38,7 @@ pub(crate) use backup::MIN_DURATION_BETWEEN_BACKUP_UPDATES;
 #[cfg(test)]
 mod tests;
 
+pub(crate) use address_transfers::AddressTransfers;
 pub(crate) use backup::write_semantically_verified_backup_block;
 pub(crate) use chain::{Chain, SpendingTransactionId};
 pub(crate) use created_utxos::CreatedUtxos;
@@ -105,22 +107,11 @@ pub struct NonFinalizedState {
     //
     /// Configures the non-finalized state to count metrics.
     ///
-    /// Used for skipping metrics and progress bars when testing block proposals
+    /// Used for skipping metrics when testing block proposals
     /// with a commit to a cloned non-finalized state.
     //
     // TODO: make this field private and set it via an argument to NonFinalizedState::new()
     should_count_metrics: bool,
-
-    /// Number of chain forks transmitter.
-    #[cfg(feature = "progress-bar")]
-    chain_count_bar: Option<howudoin::Tx>,
-
-    /// A chain fork length transmitter for each [`Chain`] in [`chain_set`](Self.chain_set).
-    ///
-    /// Because `chain_set` contains `Arc<Chain>`s, it is difficult to update the metrics state
-    /// on each chain. ([`Arc`]s are read-only, and we don't want to clone them just for metrics.)
-    #[cfg(feature = "progress-bar")]
-    chain_fork_length_bars: Vec<howudoin::Tx>,
 }
 
 impl std::fmt::Debug for NonFinalizedState {
@@ -143,11 +134,6 @@ impl Clone for NonFinalizedState {
             network: self.network.clone(),
             invalidated_blocks: self.invalidated_blocks.clone(),
             should_count_metrics: self.should_count_metrics,
-            // Don't track progress in clones.
-            #[cfg(feature = "progress-bar")]
-            chain_count_bar: None,
-            #[cfg(feature = "progress-bar")]
-            chain_fork_length_bars: Vec::new(),
         }
     }
 }
@@ -160,10 +146,6 @@ impl NonFinalizedState {
             network: network.clone(),
             invalidated_blocks: Default::default(),
             should_count_metrics: true,
-            #[cfg(feature = "progress-bar")]
-            chain_count_bar: None,
-            #[cfg(feature = "progress-bar")]
-            chain_fork_length_bars: Vec::new(),
         }
     }
 
@@ -314,8 +296,6 @@ impl NonFinalizedState {
                 .clone();
             self.chain_set.remove(&evicted);
         }
-
-        self.update_metrics_bars();
     }
 
     /// Insert `chain` into `self.chain_set`, then limit the number of tracked chains.
@@ -405,7 +385,7 @@ impl NonFinalizedState {
         self.update_metrics_for_chains();
 
         // Add the treestate to the finalized block.
-        FinalizableBlock::new(best_chain_root, root_treestate)
+        FinalizableBlock::new(Arc::unwrap_or_clone(best_chain_root), root_treestate)
     }
 
     /// Commit block to the non-finalized state, on top of:
@@ -471,7 +451,11 @@ impl NonFinalizedState {
         let invalidated_blocks = if chain.non_finalized_root_hash() == block_hash {
             self.chain_set
                 .retain(|chain| !chain.contains_block_hash(block_hash));
-            chain.blocks.values().cloned().collect()
+            chain
+                .blocks
+                .values()
+                .map(|block| block.as_ref().clone())
+                .collect()
         } else {
             let (new_chain, invalidated_blocks) = chain
                 .invalidate_block(block_hash)
@@ -501,7 +485,6 @@ impl NonFinalizedState {
         }
 
         self.update_metrics_for_chains();
-        self.update_metrics_bars();
 
         Ok(block_hash)
     }
@@ -934,40 +917,6 @@ impl NonFinalizedState {
             .find_map(|chain| chain.created_utxo(outpoint))
     }
 
-    /// Returns the `block` with the given hash in any chain.
-    #[allow(dead_code)]
-    pub fn any_block_by_hash(&self, hash: block::Hash) -> Option<Arc<Block>> {
-        // This performs efficiently because the number of chains is limited to 10.
-        for chain in self.chain_set.iter().rev() {
-            if let Some(prepared) = chain
-                .height_by_hash
-                .get(&hash)
-                .and_then(|height| chain.blocks.get(height))
-            {
-                return Some(prepared.block.clone());
-            }
-        }
-
-        None
-    }
-
-    /// Returns the previous block hash for the given block hash in any chain.
-    #[allow(dead_code)]
-    pub fn any_prev_block_hash_for_hash(&self, hash: block::Hash) -> Option<block::Hash> {
-        // This performs efficiently because the blocks are in memory.
-        self.any_block_by_hash(hash)
-            .map(|block| block.header.previous_block_hash)
-    }
-
-    /// Returns the hash for a given `block::Height` if it is present in the best chain.
-    #[allow(dead_code)]
-    pub fn best_hash(&self, height: block::Height) -> Option<block::Hash> {
-        self.best_chain()?
-            .blocks
-            .get(&height)
-            .map(|prepared| prepared.hash)
-    }
-
     /// Returns the tip of the best chain.
     #[allow(dead_code)]
     pub fn best_tip(&self) -> Option<(block::Height, block::Hash)> {
@@ -984,26 +933,6 @@ impl NonFinalizedState {
         let best_chain = self.best_chain()?;
 
         best_chain.tip_block()
-    }
-
-    /// Returns the height of `hash` in the best chain.
-    #[allow(dead_code)]
-    pub fn best_height_by_hash(&self, hash: block::Hash) -> Option<block::Height> {
-        let best_chain = self.best_chain()?;
-        let height = *best_chain.height_by_hash.get(&hash)?;
-        Some(height)
-    }
-
-    /// Returns the height of `hash` in any chain.
-    #[allow(dead_code)]
-    pub fn any_height_by_hash(&self, hash: block::Hash) -> Option<block::Height> {
-        for chain in self.chain_set.iter().rev() {
-            if let Some(height) = chain.height_by_hash.get(&hash) {
-                return Some(*height);
-            }
-        }
-
-        None
     }
 
     /// Returns `true` if the best chain contains `sprout_nullifier`.
@@ -1091,7 +1020,7 @@ impl NonFinalizedState {
         }
     }
 
-    /// Should this `NonFinalizedState` instance track metrics and progress bars?
+    /// Should this `NonFinalizedState` instance track metrics?
     fn should_count_metrics(&self) -> bool {
         self.should_count_metrics
     }
@@ -1129,120 +1058,9 @@ impl NonFinalizedState {
             .set(self.best_chain_len().unwrap_or_default() as f64);
     }
 
-    /// Update the progress bars after any chain is modified.
-    /// This includes both chain forks and committed blocks.
-    fn update_metrics_bars(&mut self) {
-        // TODO: make chain_count_bar interior mutable, move to update_metrics_for_committed_block()
-
-        if !self.should_count_metrics() {
-            #[allow(clippy::needless_return)]
-            return;
-        }
-
-        #[cfg(feature = "progress-bar")]
-        {
-            use std::cmp::Ordering::*;
-
-            if matches!(howudoin::cancelled(), Some(true)) {
-                self.disable_metrics();
-                return;
-            }
-
-            // Update the chain count bar
-            if self.chain_count_bar.is_none() {
-                self.chain_count_bar = Some(howudoin::new_root().label("Chain Forks"));
-            }
-
-            let chain_count_bar = self
-                .chain_count_bar
-                .as_ref()
-                .expect("just initialized if missing");
-            let finalized_tip_height = self
-                .best_chain()
-                .map(|chain| chain.non_finalized_root_height().0 - 1);
-
-            chain_count_bar.set_pos(u64::try_from(self.chain_count()).expect("fits in u64"));
-            // .set_len(u64::try_from(MAX_NON_FINALIZED_CHAIN_FORKS).expect("fits in u64"));
-
-            if let Some(finalized_tip_height) = finalized_tip_height {
-                chain_count_bar.desc(format!("Finalized Root {finalized_tip_height}"));
-            }
-
-            // Update each chain length bar, creating or deleting bars as needed
-            let prev_length_bars = self.chain_fork_length_bars.len();
-
-            match self.chain_count().cmp(&prev_length_bars) {
-                Greater => self
-                    .chain_fork_length_bars
-                    .resize_with(self.chain_count(), || {
-                        howudoin::new_with_parent(chain_count_bar.id())
-                    }),
-                Less => {
-                    let redundant_bars = self.chain_fork_length_bars.split_off(self.chain_count());
-                    for bar in redundant_bars {
-                        bar.close();
-                    }
-                }
-                Equal => {}
-            }
-
-            // It doesn't matter what chain the bar was previously used for,
-            // because we update everything based on the latest chain in that position.
-            for (chain_length_bar, chain) in
-                std::iter::zip(self.chain_fork_length_bars.iter(), self.chain_iter())
-            {
-                let fork_height = chain
-                    .last_fork_height
-                    .unwrap_or_else(|| chain.non_finalized_tip_height())
-                    .0;
-
-                // We need to initialize and set all the values of the bar here, because:
-                // - the bar might have been newly created, or
-                // - the chain this bar was previously assigned to might have changed position.
-                chain_length_bar
-                    .label(format!("Fork {fork_height}"))
-                    .set_pos(u64::try_from(chain.len()).expect("fits in u64"));
-                // TODO: should this be MAX_BLOCK_REORG_HEIGHT?
-                // .set_len(u64::from(
-                //     zakura_chain::transparent::MIN_TRANSPARENT_COINBASE_MATURITY,
-                // ));
-
-                // TODO: store work in the finalized state for each height (#7109),
-                //       and show the full chain work here, like `zcashd` (#7110)
-                //
-                // For now, we don't show any work here, see the deleted code in PR #7087.
-                let mut desc = String::new();
-
-                if let Some(recent_fork_height) = chain.recent_fork_height() {
-                    let recent_fork_length = chain
-                        .recent_fork_length()
-                        .expect("just checked recent fork height");
-
-                    let mut plural = "s";
-                    if recent_fork_length == 1 {
-                        plural = "";
-                    }
-
-                    desc.push_str(&format!(
-                        " at {recent_fork_height:?} + {recent_fork_length} block{plural}"
-                    ));
-                }
-
-                chain_length_bar.desc(desc);
-            }
-        }
-    }
-
     /// Stop tracking metrics for this non-finalized state and all its chains.
     pub fn disable_metrics(&mut self) {
         self.should_count_metrics = false;
-
-        #[cfg(feature = "progress-bar")]
-        {
-            let count_bar = self.chain_count_bar.take().into_iter();
-            let fork_bars = self.chain_fork_length_bars.drain(..);
-            count_bar.chain(fork_bars).for_each(howudoin::Tx::close);
-        }
     }
 }
 

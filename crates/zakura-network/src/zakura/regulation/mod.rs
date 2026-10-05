@@ -7,6 +7,14 @@
 //! - [`Reservations`] admit a response only if this node requested it.
 //! - [`CadenceBuckets`] and [`CadenceSender`] enforce and obey the rate that
 //!   a row declares.
+//! - [`SessionCapacity`] bounds a service's sessions from reservation through
+//!   the last owner.
+//! - [`SessionTable`] holds each peer's current session, and its
+//!   [`WriterFence`] closes the connection rather than orphan a started
+//!   exchange.
+//! - [`Subscriptions`] and [`Publications`] hold the two sides of a
+//!   subscription: renewable credit, ordered updates, the cursor history,
+//!   and tombstones for crossed updates.
 //! - [`sizing`] derives every capacity default from the throughput target.
 //!
 //! Every tool acts against a peer only on an unambiguous violation: an event
@@ -26,20 +34,38 @@ pub(crate) use request::{
 
 mod serve;
 pub(crate) use serve::{
-    Produce, Responded, ResponseCap, ResponseSink, Serve, ServeCapacity, ServeConfigError,
-    ServeEnd, ServeLimits, ServeViolation, SinkError, SinkProgress, WorkLease,
+    Produce, Push, PushPermit, Responded, ResponseCap, ResponseSink, Serve, ServeCapacity,
+    ServeConfigError, ServeEnd, ServeLimits, ServeViolation, SinkError, SinkProgress, WorkLease,
 };
 
 mod reservations;
 pub(crate) use reservations::{
-    ClaimRefused, Claimed, Ended, PoolEntry, PrecheckSlot, ReservationPool, Reservations,
-    ReserveRefused, ResponsePrecheck, SharedReservations,
+    ClaimRefused, Claimed, Ended, PoolEntry, PrecheckByRequest, PrecheckSlot, ReservationPool,
+    Reservations, ReserveRefused, ResponsePrecheck, SharedReservations,
 };
+
+mod session_capacity;
+pub(crate) use session_capacity::SessionCapacity;
+
+mod session_table;
+pub(crate) use session_table::{Current, Replacement, SessionKey, SessionTable};
 
 pub(crate) mod sizing;
 
+mod subscription;
+pub(crate) use subscription::{
+    within_window, Applied, CreditExceeded, PageStall, Publications, ResponseCredit,
+    SharedSubscriptions, SubscribeRefused, SubscriptionEnded, SubscriptionFault,
+    SubscriptionLimits, Subscriptions, TerminalPermit, Totals, Update,
+};
+
 mod slots;
 pub(crate) use slots::{OutputByteBudget, OutputGrant, SlotBudget, SlotPermit};
+
+mod writer_fence;
+pub(crate) use writer_fence::{
+    Exchange, ExchangeWriter, FencedSendError, WriterFence, UNFINISHED_EXCHANGE,
+};
 
 #[cfg(test)]
 pub(crate) mod test_family;

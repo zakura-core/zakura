@@ -5,7 +5,7 @@
 //! `zakura-consensus`, where the transaction verifier applies them before script verification;
 //! they are re-exported here and used by the storage-time policy in the parent module.
 
-#[cfg(test)]
+#[cfg(any(test, feature = "mempool-bench"))]
 use zakura_chain::transparent;
 
 // The transparent-input standardness checks (`AreInputsStandard()` and the spent-output
@@ -30,7 +30,7 @@ pub(super) use zakura_script::p2sh_sigop_count;
 // -- Test helper functions shared across test modules --
 
 /// Build a P2PKH lock script: OP_DUP OP_HASH160 <20-byte hash> OP_EQUALVERIFY OP_CHECKSIG
-#[cfg(test)]
+#[cfg(any(test, feature = "mempool-bench"))]
 pub(super) fn p2pkh_lock_script(hash: &[u8; 20]) -> transparent::Script {
     let mut s = vec![0x76, 0xa9, 0x14];
     s.extend_from_slice(hash);

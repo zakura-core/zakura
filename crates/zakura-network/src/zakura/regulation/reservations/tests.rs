@@ -137,6 +137,45 @@ fn an_abandoned_reservation_still_delivers_and_never_refuses() {
     assert!(!map.abandon(&1), "an ended reservation cannot be abandoned");
 }
 
+#[test]
+fn a_fenced_reservation_ends_its_exchange_with_its_ending() {
+    use crate::zakura::{regulation::WriterFence, CloseCause};
+    use tokio_util::sync::CancellationToken;
+
+    for ended in [false, true] {
+        let pool = pool(2);
+        let connection = CancellationToken::new();
+        let fence = WriterFence::new(connection.clone(), CloseCause::new());
+        let mut map = Reservations::new(RULES, 8);
+        for key in [1u32, 2] {
+            let exchange = fence.open().unwrap();
+            let writer = exchange.writer();
+            map.reserve_fenced(
+                key,
+                message_type::GET,
+                CAP,
+                pool.try_entry().unwrap(),
+                exchange,
+            )
+            .unwrap();
+            // Key 1's request reaches its first byte; key 2's never does.
+            if key == 1 {
+                assert!(writer.publish(|| {}));
+                assert!(writer.try_start(|| true));
+            }
+        }
+        if ended {
+            map.claim_end(&1, message_type::DONE, 4).unwrap();
+        }
+        drop(map);
+        assert_eq!(
+            connection.is_cancelled(),
+            !ended,
+            "only a started exchange left without its ending closes the connection"
+        );
+    }
+}
+
 #[tokio::test(start_paused = true)]
 async fn no_time_passing_removes_a_reservation() {
     let pool = pool(4);

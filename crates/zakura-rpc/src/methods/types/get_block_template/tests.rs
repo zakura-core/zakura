@@ -294,6 +294,62 @@ fn coinbase_tag_and_limit() {
     );
 }
 
+/// Internal miners that share a miner address must still search different work.
+///
+/// Each node runs one solver thread starting from the same nonce. Two nodes that build
+/// a template for the same parent in the same second therefore repeat each other's
+/// Equihash attempts unless their headers differ. A distinct `extra_coinbase_data`
+/// changes the coinbase script. A V5 txid excludes scripts, so the merkle root stays
+/// equal; the header still differs through the authorizing-data root that NU5 block
+/// commitments bind.
+#[test]
+fn distinct_coinbase_tags_give_shared_address_miners_distinct_work() {
+    use zcash_address::ZcashAddress;
+
+    use crate::config::mining::{Config, ExtraCoinbaseData};
+
+    let net = Network::new_default_testnet();
+    let addr: ZcashAddress = default_miner_address(net.kind(), &MinerAddressType::Transparent)
+        .parse()
+        .expect("default miner address parses");
+    let height = Height(4_420_700);
+    let coinbase_auth_digest = |tag: Option<&str>| {
+        let params = MinerParams::new(
+            &net,
+            Config {
+                miner_address: Some(addr.clone()),
+                extra_coinbase_data: tag
+                    .map(|tag| ExtraCoinbaseData::try_from(tag.to_string()).expect("short tag")),
+                internal_miner: true,
+                ..Default::default()
+            },
+        )
+        .expect("valid miner config");
+        TransactionTemplate::new_coinbase(&net, height, &params, Amount::zero(), None)
+            .expect("coinbase builds")
+            .data()
+            .as_ref()
+            .zcash_deserialize_into::<Transaction>()
+            .expect("coinbase deserializes")
+            .auth_digest()
+            .expect("a V5 or later coinbase has an authorizing-data digest")
+    };
+
+    assert_eq!(
+        coinbase_auth_digest(None),
+        coinbase_auth_digest(None),
+        "untagged miners sharing an address build identical coinbase transactions",
+    );
+    assert_ne!(
+        coinbase_auth_digest(Some("nu7-us")),
+        coinbase_auth_digest(Some("nu7-eu"))
+    );
+    assert_ne!(
+        coinbase_auth_digest(Some("nu7-us")),
+        coinbase_auth_digest(None)
+    );
+}
+
 /// Tests each distinct shielded coinbase construction and routing path.
 ///
 /// The exhaustive [`transparent_coinbase`] test does not need shielded proofs.

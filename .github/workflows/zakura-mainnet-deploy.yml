@@ -220,11 +220,11 @@ jobs:
 
       - name: Load the independently verified compatibility host key
         env:
-          COMPAT_KNOWN_HOSTS: ${{ vars.ZAKURA_COMPAT_SSH_KNOWN_HOSTS }}
+          COMPAT_KNOWN_HOSTS: ${{ secrets.ZAKURA_COMPAT_SSH_KNOWN_HOSTS }}
         run: |
           set -euo pipefail
           if [ -z "$COMPAT_KNOWN_HOSTS" ]; then
-            echo "Set zakura-mainnet environment variable ZAKURA_COMPAT_SSH_KNOWN_HOSTS from an independently verified host key."
+            echo "Set repository Actions secret ZAKURA_COMPAT_SSH_KNOWN_HOSTS from an independently verified host key."
             exit 1
           fi
           umask 077

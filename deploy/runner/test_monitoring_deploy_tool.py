@@ -101,7 +101,8 @@ class WorkflowHostKeyTests(DeployToolCase):
         workflow = (HERE.parent.parent / ".github/workflows/zakura-mainnet-deploy.yml").read_text()
         step = workflow.split("      - name: Load the independently verified compatibility host key\n", 1)[1]
         step = step.split("      - name:", 1)[0]
-        self.assertIn("vars.ZAKURA_COMPAT_SSH_KNOWN_HOSTS", step)
+        self.assertIn("secrets.ZAKURA_COMPAT_SSH_KNOWN_HOSTS", step)
+        self.assertNotIn("vars.ZAKURA_COMPAT_SSH_KNOWN_HOSTS", step)
         self.assertNotIn("ssh-keyscan", step)
         script = step.split("        run: |\n", 1)[1]
         script = "\n".join(line.removeprefix("          ") for line in script.splitlines())

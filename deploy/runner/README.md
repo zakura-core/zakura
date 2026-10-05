@@ -309,11 +309,13 @@ and `ref=<full tested SHA>` runs one explicit stage of
 `zakura-monitoring-deploy.py` at a time. No stage builds, installs, stops or
 restarts `zakurad` or `zcashd`, or touches the dashboard or gateway.
 
-Before dispatch, provision the `zakura-mainnet` GitHub environment variable
+Before dispatch, provision the repository-level GitHub Actions secret
 `ZAKURA_COMPAT_SSH_KNOWN_HOSTS` with a valid `known_hosts` entry for
 `159.203.113.196`, verified through an independent trusted host console or
-existing operator trust store. This is a public SSH host key, not a private
-credential. The workflow fails before contacting the host if this variable is
+existing operator trust store. Keep the verified entry in Infisical and mirror
+it to the repository secret; no environment-specific host-key setting is needed.
+This is a public SSH host key, not a private credential. The workflow fails
+before contacting the host if this secret is
 missing, malformed or names another host. It never trusts a fresh network scan.
 The same entry authenticates deployment SSH and is installed for fleet probes;
 rotate it only after independently verifying a host key change.

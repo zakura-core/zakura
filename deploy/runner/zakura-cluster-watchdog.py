@@ -1087,10 +1087,11 @@ class Watchdog:
         keep running but no transition is planned, so a failure that outlives
         the marker alerts on the first unsuppressed probe.
         """
+        result = monitor.fresh_result(result, now, target.timeout)
         name = target.name
         probes = state.setdefault(monitor.COMPAT_PROBES, {})
         record = probes.setdefault(name, {})
-        record["last"] = monitor.probe_record(result, now)
+        record["last"] = monitor.probe_record(result)
         record["completed"] = int(record.get("completed", 0)) + 1
         if result.passed:
             record["passed"] = int(record.get("passed", 0)) + 1

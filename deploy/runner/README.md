@@ -278,6 +278,11 @@ same explicit limit.
 - An SSH timeout or failure, a missing checker, or malformed, stale, oversized
   or mismatched output is a monitoring failure. It can open or continue an
   incident but never recovers one.
+- Results retain the worker's actual completion time. Queue consumption checks
+  age again (at most the configured probe timeout, 120 seconds by default),
+  using a monotonic clock as well as local/remote timestamps. Delayed or
+  overrunning passes cannot clear incidents or qualify as fresh acceptance
+  evidence; one-shot reads also preserve queue age.
 - Checker outcomes must echo the requested height-drift limit exactly;
   mismatches are monitoring failures and cannot recover an incident.
 - Messages name the host, explain the problem, and show one short observation

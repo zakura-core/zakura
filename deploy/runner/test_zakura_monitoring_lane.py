@@ -9,6 +9,7 @@ receiver, and all state lives in temporary directories.
 from __future__ import annotations
 
 import argparse
+from dataclasses import replace
 import importlib.util
 import json
 import os
@@ -66,7 +67,7 @@ def details(peers=1, zakura=3_000_000, zcashd=3_000_000, maximum=30):
 def passing(at=NOW, suppressed_until=None, **kwargs):
     return monitor.ProbeResult(
         True, "pass", "in_sync", None, details(**kwargs), at,
-        "active" if suppressed_until else "missing", suppressed_until,
+        "active" if suppressed_until else "missing", suppressed_until, completed_at=at,
     )
 
 
@@ -74,7 +75,7 @@ def failing(predicate="height_drift", at=NOW, suppressed_until=None, **kwargs):
     kwargs.setdefault("zakura", 3_000_100)
     return monitor.ProbeResult(
         True, "fail", predicate, None, details(**kwargs), at,
-        "active" if suppressed_until else "missing", suppressed_until,
+        "active" if suppressed_until else "missing", suppressed_until, completed_at=at,
     )
 
 
@@ -132,6 +133,47 @@ class LaneCase(unittest.TestCase):
 
 
 class TransitionTests(LaneCase):
+    def test_delayed_pass_cannot_recover_or_qualify_as_a_fresh_probe(self):
+        self.step(failing())
+        self.step(passing(at=NOW + 60), now=NOW + 660)
+        self.assertTrue(self.entry["alerting"])
+        self.assertEqual(len(self.posted), 1)
+        record = self.state[monitor.COMPAT_PROBES][TARGET.name]
+        self.assertEqual(record["last"]["error_kind"], "stale_outcome")
+        self.assertFalse(record["last"]["valid"])
+        self.assertEqual(record["last"]["completed_at"], NOW + 60)
+        self.assertEqual(record.get("passed", 0), 0)
+        self.assertNotIn("last_pass", record)
+        self.step(passing(at=NOW + 720), now=NOW + 720)
+        self.assertFalse(self.entry["alerting"])
+        self.assertEqual(len(self.posted), 2)
+
+    def test_delayed_pass_cannot_queue_recovery_behind_undelivered_failure(self):
+        self.accept = False
+        self.step(failing())
+        self.step(passing(at=NOW + 60), now=NOW + 660)
+        self.assertEqual(len(self.pending["messages"]), 1)
+        self.assertTrue(self.pending["state"]["alerting"])
+        self.accept = True
+        self.step(None, now=NOW + 670)
+        self.assertTrue(self.entry["alerting"])
+        self.assertEqual(len(self.posted), 1)
+
+    def test_consumption_freshness_boundary_and_invalid_timestamps(self):
+        for age, accepted in ((120, True), (120.01, False), (-1, False)):
+            result = monitor.fresh_result(passing(), NOW + age, TARGET.timeout)
+            self.assertEqual(result.passed, accepted)
+            self.assertEqual(result.completed_at, NOW)
+        for stamp in (0, float("nan"), float("inf"), None):
+            result = monitor.fresh_result(replace(passing(), completed_at=stamp), NOW, TARGET.timeout)
+            self.assertFalse(result.passed)
+        result = monitor.fresh_result(replace(passing(), observed_at=NOW - 600), NOW, TARGET.timeout)
+        self.assertFalse(result.passed)
+
+    def test_fresh_probe_keeps_actual_completion_time_in_telemetry(self):
+        self.step(passing(), now=NOW + 60)
+        self.assertEqual(self.state[monitor.COMPAT_PROBES][TARGET.name]["last"]["completed_at"], NOW)
+
     def test_first_completed_failure_alerts_immediately(self):
         self.step(failing())
         self.assertEqual(len(self.posted), 1)
@@ -378,7 +420,8 @@ class NamespaceTests(LaneCase):
             for result in (failing(), passing(at=NOW + 60)):
                 state = state_module.load_state(path)
                 self.worker.results.append(result)
-                with mock.patch.object(watchdog, "fetch_json", return_value=snapshot):
+                with mock.patch.object(watchdog, "fetch_json", return_value=snapshot), \
+                        mock.patch.object(watchdog.time, "time", return_value=result.completed_at):
                     self.agent.run_once(state)
                 state_module.save_state(path, state)
             restored = json.loads(path.read_text())
@@ -636,6 +679,44 @@ class ParseTests(unittest.TestCase):
 
 
 class WorkerTests(unittest.TestCase):
+    def test_delayed_queue_is_stale_even_when_wall_clock_has_not_advanced(self):
+        for consume in ("poll", "wait"):
+            mono = [0.0]
+            worker = monitor.ProbeWorker(TARGET, runner=lambda *_: bounded(outcome_dict()),
+                                         clock=lambda: NOW, monotonic=lambda: mono[0],
+                                         nonce_factory=lambda: "n")
+            worker.poll()
+            worker._thread.join(5)
+            worker._next_due = float("inf")
+            mono[0] = 600.0
+            result = worker.poll() if consume == "poll" else worker.wait(1)
+            self.assertFalse(result.passed)
+            self.assertEqual(result.error_kind, "stale_outcome")
+            self.assertEqual(result.completed_at, NOW)
+
+    def test_wait_keep_does_not_refresh_age_before_later_poll(self):
+        mono = [0.0]
+        worker = monitor.ProbeWorker(TARGET, runner=lambda *_: bounded(outcome_dict()),
+                                     clock=lambda: NOW, monotonic=lambda: mono[0],
+                                     nonce_factory=lambda: "n")
+        self.assertTrue(worker.wait(1, keep=True).passed)
+        worker._next_due = float("inf")
+        mono[0] = 600.0
+        self.assertFalse(worker.poll().passed)
+
+    def test_late_passing_completion_cannot_recover_after_overrun(self):
+        mono = [0.0]
+        wall = [NOW]
+        def runner(*_args):
+            mono[0] = 130.0
+            wall[0] = NOW + 130
+            return bounded(outcome_dict(observed_at=wall[0]))
+        worker = monitor.ProbeWorker(TARGET, runner=runner, clock=lambda: wall[0],
+                                     monotonic=lambda: mono[0], nonce_factory=lambda: "n")
+        result = worker.wait(1)
+        self.assertFalse(result.passed)
+        self.assertEqual(result.error_kind, "probe_overrun")
+
     def test_worker_checks_the_configured_limit_in_remote_results(self):
         worker = monitor.ProbeWorker(
             monitor.CompatTarget(name="zakura-compat", ssh_target="root@159.203.113.196",

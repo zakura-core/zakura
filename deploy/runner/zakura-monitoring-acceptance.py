@@ -251,10 +251,10 @@ def slack_test(args: argparse.Namespace) -> int:
             numbers = {"height_max_drift": 10, "zcashd_connections": 1}
             self.results = [
                 monitor.ProbeResult(True, "fail", "peer_pinning", None,
-                                    {**numbers, "zcashd_connections": 2}, now, "missing"),
+                                    {**numbers, "zcashd_connections": 2}, now, "missing", completed_at=now),
                 monitor.ProbeResult(True, "pass", "in_sync", None,
                                     {**numbers, "zakura_height": 1, "zcashd_height": 1,
-                                     "height_drift": 0}, now, "missing"),
+                                     "height_drift": 0}, now, "missing", completed_at=now),
             ]
 
         def poll(self):

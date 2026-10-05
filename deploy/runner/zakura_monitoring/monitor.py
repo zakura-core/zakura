@@ -22,7 +22,7 @@ import secrets
 import threading
 import time
 import tomllib
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable
 
@@ -177,6 +177,8 @@ class ProbeResult:
     suppression_state: str | None = None
     # Local-clock end of an active compatibility suppression window.
     suppressed_until: float | None = None
+    # Local wall clock when the worker actually finished, never queue-consumption time.
+    completed_at: float = 0.0
 
     @property
     def passed(self) -> bool:
@@ -184,7 +186,7 @@ class ProbeResult:
 
 
 def unavailable(reason: str, at: float) -> ProbeResult:
-    return ProbeResult(False, compat.FAIL, UNAVAILABLE, reason, {}, at)
+    return ProbeResult(False, compat.FAIL, UNAVAILABLE, reason, {}, at, completed_at=at)
 
 
 def finite_number(value: object) -> float | None:
@@ -192,6 +194,21 @@ def finite_number(value: object) -> float | None:
         return None
     number = float(value)
     return number if math.isfinite(number) else None
+
+
+def fresh_result(result: ProbeResult, now: float, max_age: float) -> ProbeResult:
+    """Recheck a valid result at consumption, preserving its real completion time.
+
+    Missing/future completion times or stale local/remote observations fail
+    closed. Remote observation time permits the existing host clock skew.
+    """
+    completed = finite_number(result.completed_at)
+    observed = finite_number(result.observed_at)
+    if result.valid and (completed is None or completed <= 0 or observed is None
+            or not 0 <= now - completed <= max_age
+            or not -CLOCK_SKEW_SECONDS <= now - observed <= max_age + CLOCK_SKEW_SECONDS):
+        return replace(unavailable("stale_outcome", now), completed_at=result.completed_at)
+    return result
 
 
 def parse_probe_output(
@@ -307,6 +324,7 @@ def parse_probe_output(
         observed_at,
         state,
         suppressed_until,
+        completed_at=finished_at,
     )
 
 
@@ -327,7 +345,7 @@ class ProbeWorker:
         self.monotonic = monotonic
         self.nonce_factory = nonce_factory
         self.starts = 0
-        self._results: queue.SimpleQueue[ProbeResult] = queue.SimpleQueue()
+        self._results: queue.SimpleQueue[tuple[ProbeResult, float]] = queue.SimpleQueue()
         self._thread: threading.Thread | None = None
         self._started_mono = 0.0
         self._next_due = float("-inf")
@@ -357,9 +375,12 @@ class ProbeWorker:
             result = self.runner(self.command(nonce), self.target.timeout, MAX_OUTCOME_BYTES)
             parsed = parse_probe_output(
                 result, nonce, started_at, self.clock(), self.target.height_max_drift)
-            self._results.put(parsed)
         except Exception:  # A worker failure is a monitoring failure, never a crash.
-            self._results.put(unavailable("probe_failed", self.clock()))
+            parsed = unavailable("probe_failed", self.clock())
+        finished_mono = self.monotonic()
+        if parsed.valid and finished_mono - self._started_mono > self.target.timeout:
+            parsed = unavailable("probe_overrun", self.clock())
+        self._results.put((parsed, finished_mono))
 
     def _start(self) -> None:
         nonce = self.nonce_factory()
@@ -375,6 +396,14 @@ class ProbeWorker:
         )
         self._thread.start()
 
+    def _consume(self, queued: tuple[ProbeResult, float]) -> ProbeResult:
+        result, finished_mono = queued
+        age = self.monotonic() - finished_mono
+        if result.valid and (self._overrun_reported or not 0 <= age <= self.target.timeout):
+            result = replace(unavailable("stale_outcome", self.clock()),
+                             completed_at=result.completed_at)
+        return fresh_result(result, self.clock(), self.target.timeout)
+
     def poll(self) -> ProbeResult | None:
         """Collect a finished probe and start the next one when it is due.
 
@@ -384,7 +413,7 @@ class ProbeWorker:
         """
         completed = None
         try:
-            completed = self._results.get_nowait()
+            completed = self._consume(self._results.get_nowait())
         except queue.Empty:
             pass
         if completed is not None:
@@ -409,11 +438,12 @@ class ProbeWorker:
         if self._thread is None:
             self.poll()
         try:
-            completed = self._results.get(timeout=timeout)
+            queued = self._results.get(timeout=timeout)
         except queue.Empty:
             return None
+        completed = self._consume(queued)
         if keep:
-            self._results.put(completed)
+            self._results.put(queued)
         else:
             self._thread = None
         return completed
@@ -478,10 +508,10 @@ def recovery_text(target: CompatTarget, result: ProbeResult, _previous: dict[str
     )
 
 
-def probe_record(result: ProbeResult, completed_at: float) -> dict[str, Any]:
+def probe_record(result: ProbeResult) -> dict[str, Any]:
     """Credential-free telemetry for the latest completed probe."""
     return {
-        "completed_at": completed_at,
+        "completed_at": result.completed_at,
         "observed_at": result.observed_at,
         "valid": result.valid,
         "status": result.status,

@@ -177,9 +177,42 @@ class MainnetWorkflowSuppressionTests(unittest.TestCase):
             "if ! timeout --signal=TERM --kill-after=5s 60s \\",
             suppression_step,
         )
-        self.assertIn("systemctl restart zakura-watchdog", suppression_step)
+        self.assertNotIn("systemctl", suppression_step)
         self.assertIn("continuing deploy", suppression_step)
         self.assertNotIn("tomllib", suppression_step)
+
+
+class MainnetWorkflowMonitoringTests(unittest.TestCase):
+    def setUp(self):
+        self.workflow = (
+            SCRIPT_DIR.parent.parent / ".github/workflows/zakura-mainnet-deploy.yml"
+        ).read_text()
+        self.job = self.workflow.split("\n  monitoring:\n", 1)[1].split("\n  deploy:\n", 1)[0]
+
+    def test_monitoring_is_an_explicit_operation_for_the_compat_node(self):
+        self.assertIn("if: inputs.operation == 'monitoring'", self.job)
+        self.assertIn('if [ "${NODE}" != "zakura-compat" ]; then', self.job)
+        self.assertIn("^[0-9a-f]{40}$", self.job)
+        self.assertIn(
+            "if: inputs.node != 'zakura-mac-os' && inputs.operation != 'monitoring'",
+            self.workflow,
+        )
+        for stage in ("install", "validate", "cutover", "soak", "finalize", "rollback"):
+            self.assertIn(stage, self.workflow.split("monitoring_stage:", 1)[1].split("\n\n", 1)[0])
+
+    def test_monitoring_never_touches_nodes_dashboard_or_gateway(self):
+        for forbidden in ("python3 deploy.py", "deploy/deployer", "cargo", "zakurad", "dashboard", "broadcast",
+                          "caddy", "systemctl", "SLACK_WEB_HOOK"):
+            self.assertNotIn(forbidden, self.job)
+        self.assertIn("deploy/runner/zakura-monitoring-deploy.py", self.job)
+        self.assertIn("ref: ${{ inputs.ref }}", self.job)
+
+    def test_regular_deploys_share_the_installer(self):
+        step = self.workflow.split("      - name: Install fleet watchdog\n", 1)[1].split(
+            "      - name: Fetch recent logs on failure\n", 1)[0]
+        self.assertIn("zakura-monitoring-deploy.py fleet-deploy", step)
+        self.assertNotIn("zakura-fleet-watchdog.service /etc/systemd/system", step)
+        self.assertNotIn("install -m 600", step)
 
 
 class NodeBuilder:

@@ -420,34 +420,13 @@ impl Application for ZakuradApp {
         // handler is the last one installed
         let (panic_hook, eyre_hook) = builder.into_hooks();
         eyre_hook.install().expect("eyre_hook.install() error");
-
-        // The Sentry default config pulls in the DSN from the `SENTRY_DSN`
-        // environment variable.
-        if env::var_os("SENTRY_DSN").is_some() {
-            #[cfg(feature = "sentry")]
-            let guard = crate::sentry::init();
-
-            std::panic::set_hook(Box::new(move |panic_info| {
-                let panic_report = panic_hook.panic_report(panic_info);
-                eprintln!("{panic_report}");
-
-                #[cfg(feature = "sentry")]
-                {
-                    let event = crate::sentry::panic_event_from(panic_report);
-                    sentry::capture_event(event);
-
-                    if !guard.close(None) {
-                        warn!("unable to flush sentry events during panic");
-                    }
-                }
-            }));
-        }
+        panic_hook.install();
 
         // Apply the configured number of threads to the thread pool.
         //
         // TODO:
         // - set rayon panic handler to a function that takes `Box<dyn Any + Send + 'static>`,
-        //   which forwards to sentry. If possible, use eyre's panic report for formatting.
+        //   which reports through the panic hook. If possible, use eyre's panic report for formatting.
         // - do we also need to call this code in `zakura_consensus::init()`,
         //   when that crate is being used by itself?
         rayon::ThreadPoolBuilder::new()

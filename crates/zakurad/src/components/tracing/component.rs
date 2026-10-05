@@ -214,9 +214,6 @@ impl Tracing {
         #[cfg(feature = "journald")]
         let subscriber = subscriber.with(journaldlayer);
 
-        #[cfg(feature = "sentry")]
-        let subscriber = subscriber.with(crate::sentry::tracing_layer());
-
         // OpenTelemetry layer - zero overhead when config.opentelemetry_endpoint is None
         #[cfg(feature = "opentelemetry")]
         let (otel_layer, otel_provider, otel_resolved_config) = {
@@ -281,9 +278,6 @@ impl Tracing {
                 );
             }
         }
-
-        #[cfg(feature = "sentry")]
-        info!("installed sentry tracing layer");
 
         #[cfg(all(feature = "tokio-console", tokio_unstable))]
         info!(

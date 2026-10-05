@@ -66,7 +66,6 @@ features = [
     "journald",
     "opentelemetry",
     "prometheus",
-    "sentry",
     "indexer",
 ]
 
@@ -107,8 +106,6 @@ internal-miner = [
 ]
 
 # Tracing and monitoring
-# Opt in explicitly: the tracing layer has overhead even without a SENTRY_DSN.
-sentry = ["dep:sentry"]
 journald = ["tracing-journald"]
 opentelemetry = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "dep:tracing-opentelemetry"]
 
@@ -231,15 +228,8 @@ hyper = { workspace = true, features = ["server", "http1"] }
 http-body-util = { workspace = true }
 hyper-util = { workspace = true, features = ["service", "server", "tokio"] }
 
-# Configuration management
-
-nix = { workspace = true, features = ["fs"] }
-
 # prod feature internal-miner
 thread-priority = { workspace = true, optional = true }
-
-# prod feature sentry
-sentry = { workspace = true, features = ["backtrace", "logs", "rustls", "tracing", "ureq"], optional = true }
 
 # prod feature journald
 tracing-journald = { workspace = true, optional = true }
@@ -340,8 +330,8 @@ feature_missing = "warn"
 enum_variant_added = "warn"
 enum_variant_missing = "warn"
 
-[target.'cfg(all(target_os = "linux", target_env = "gnu"))'.dependencies]
-libc = "0.2.186"
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
 
 [[bench]]
 name = "mempool_eviction"

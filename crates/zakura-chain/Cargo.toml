@@ -130,7 +130,7 @@ bincode = { workspace = true }
 serde_json = { workspace = true }
 
 # Benchmarks
-criterion = { workspace = true, features = ["html_reports"] }
+criterion = { workspace = true }
 
 # Error Handling & Formatting
 color-eyre = { workspace = true }

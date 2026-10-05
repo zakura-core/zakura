@@ -605,7 +605,12 @@ pub(crate) async fn close_progresses<A: StreamConformance>(
     layout: &'static [Stream],
 ) -> Result<(), BoxError> {
     close_progresses_with_wait::<A>(layout, false).await?;
-    close_progresses_with_wait::<A>(layout, true).await
+    let send_waits = close_progresses_with_wait::<A>(layout, true).await?;
+    ensure(
+        LayoutPlan::new(layout).subscriptions.is_empty()
+            || send_waits.is_some_and(|waits| waits > 0),
+        || "P9 did not exercise Close while a page waited for send capacity".into(),
+    )
 }
 
 /// Hold the response allowance while preserving the transport slot needed by Close.
@@ -626,14 +631,14 @@ async fn hold_response_allowance(
     Ok(slots)
 }
 
-/// Exercise both grant exhaustion and response allowance exhaustion.
+/// Return the observed send waits after Close completes, or None for no subscriptions.
 async fn close_progresses_with_wait<A: StreamConformance>(
     layout: &'static [Stream],
     allowance_only: bool,
-) -> Result<(), BoxError> {
+) -> Result<Option<u64>, BoxError> {
     let plan = LayoutPlan::new(layout);
     let Some(subscription) = plan.subscriptions.first().copied() else {
-        return Ok(());
+        return Ok(None);
     };
     let MessageRole::Subscription { credit, .. } = subscription.row.role else {
         unreachable!("the plan lists subscription rows");
@@ -795,10 +800,11 @@ async fn close_progresses_with_wait<A: StreamConformance>(
     ensure(victim.connected(&raw.id()), || {
         "the connection closed".into()
     })?;
+    let send_waits = shared.push_send_waits.load(Ordering::Relaxed);
     raw.shutdown().await;
     victim.shutdown().await;
     control.shutdown().await;
-    Ok(())
+    Ok(Some(send_waits))
 }
 
 #[cfg(test)]

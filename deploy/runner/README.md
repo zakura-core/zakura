@@ -344,6 +344,11 @@ The standalone acceptance tool permits shorter observations for diagnostics;
 the deployment stage requires at least 1800 seconds. If the archived Rust
 reference is missing or its digest does not match, parity still fails.
 
+Checker uploads use unique root-owned private temporary directories and
+exclusive file creation; predictable paths under `/var/tmp` are never reused.
+Finalization requires the fleet watchdog service to be active immediately
+before the Rust watchdog is retired.
+
 Monitoring dispatches cannot run the Mac source, build or operation jobs, even
 when an invalid Mac target is selected.
 

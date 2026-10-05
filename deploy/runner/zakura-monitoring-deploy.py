@@ -58,7 +58,7 @@ FLEET_KNOWN_HOSTS = Path(monitor.DEFAULT_KNOWN_HOSTS)
 COMPAT_ENV = Path(monitor.DEFAULT_ENV_FILE)
 RUST_ENV = Path("/etc/zakura-watchdog/env")
 RUST_BACKUPS = Path("/var/backups/zakura-monitoring")
-REMOTE_STAGING = "/var/tmp/zakura-monitoring"
+REMOTE_STAGING = "/var/tmp"
 CUTOVER_WAIT_SECONDS = 300
 FRESH_PROBE_SECONDS = 300
 
@@ -168,13 +168,18 @@ def validate_target(ctx: Context) -> None:
 
 def install_compat(ctx: Context) -> None:
     package = build(ctx)
-    remote_tarball = f"{REMOTE_STAGING}/{ctx.sha}.tar.gz"
     upload = ctx.ssh(
-        f"umask 077 && mkdir -p {REMOTE_STAGING} && cat > {shlex.quote(remote_tarball)}",
+        shlex.join(["python3", "-c", install.UPLOAD_SCRIPT, REMOTE_STAGING,
+                    str(install.MAX_PACKAGE_BYTES)]),
         stdin=Path(package["tarball"]).read_bytes(),
     )
-    if upload.returncode != 0:
-        raise StageError(f"upload to {COMPAT_NAME} failed ({upload.returncode})")
+    report = parse_report(upload, f"upload to {COMPAT_NAME}")
+    remote_tarball = report.get("tarball")
+    if (not isinstance(remote_tarball, str)
+            or Path(remote_tarball).name != "package.tar.gz"
+            or Path(remote_tarball).parent.parent != Path(REMOTE_STAGING)
+            or not Path(remote_tarball).parent.name.startswith("zakura-monitoring-")):
+        raise StageError("upload returned an invalid staging path")
     try:
         ctx.record("compat stage", ctx.remote_install(
             "stage", "--root", str(COMPAT_ROOT), "--sha", ctx.sha,
@@ -185,7 +190,7 @@ def install_compat(ctx: Context) -> None:
             "compat-env", "--release", f"{COMPAT_ROOT}/releases/{ctx.sha}",
             "--source", str(RUST_ENV), "--destination", str(COMPAT_ENV)))
     finally:
-        ctx.ssh(f"rm -f {shlex.quote(remote_tarball)}")
+        ctx.ssh("rm -rf -- " + shlex.quote(str(Path(remote_tarball).parent)))
 
 
 def install_known_hosts(ctx: Context) -> None:
@@ -391,6 +396,10 @@ def stage_finalize(ctx: Context) -> None:
     if not (last.get("valid") and last.get("status") == "pass"
             and time.time() - last.get("completed_at", 0) <= FRESH_PROBE_SECONDS):
         raise StageError("the live lane has no fresh passing probe; not retiring the Rust watchdog")
+    service = ctx.systemctl("is-active", FLEET_UNIT)
+    ctx.record("fleet service", service)
+    if service != "active":
+        raise StageError("fleet watchdog must be active before retiring the Rust watchdog")
     ctx.record("acceptance proof", ctx.local(
         "acceptance", "--root", str(FLEET_ROOT), "--sha", ctx.sha, "--action", "require"))
     ctx.record("retire rust watchdog", ctx.remote_install(

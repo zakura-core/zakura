@@ -7,6 +7,8 @@ import importlib.util
 import json
 import os
 import re
+import shlex
+import stat
 import subprocess
 import sys
 import tempfile
@@ -205,6 +207,7 @@ class GuardTests(DeployToolCase):
             tool.stage_finalize(ctx)
         self.assertEqual(recorder.operations(), [("local", "status"),
                                                ("remote", "status"),
+                                               ("systemctl", "is-active"),
                                                ("local", "acceptance"),
                                                ("remote", "retire-rust")])
 
@@ -260,6 +263,19 @@ class GuardTests(DeployToolCase):
         accepted = [entry for entry in ctx.evidence["steps"] if entry["step"] == "accepted soak"]
         self.assertEqual(len(accepted), 1)
 
+    def test_finalize_rejects_inactive_service_despite_fresh_pass(self):
+        for service in ("inactive", "failed", "activating", ""):
+            with self.subTest(service=service):
+                ctx = self.context("finalize")
+                recorder = Recorder(ctx)
+                ctx.systemctl = lambda *args, **kwargs: service
+                with mock.patch.object(tool, "lane_enabled", return_value=True), \
+                        mock.patch.object(tool, "last_probe", return_value={
+                            "valid": True, "status": "pass", "completed_at": time.time()}):
+                    with self.assertRaises(tool.StageError):
+                        tool.stage_finalize(ctx)
+                self.assertNotIn(("remote", "retire-rust"), recorder.operations())
+
     def test_cutover_requires_the_installed_commit(self):
         ctx = self.context("cutover")
         Recorder(ctx, compat_current="d" * 40)
@@ -314,6 +330,66 @@ class GuardTests(DeployToolCase):
                 tool.stage_rollback(ctx)
             tool.stage_rollback(ctx)
         self.assertEqual([install.current_release(root) for root in roots], ["d" * 40] * 2)
+
+
+class UploadTests(DeployToolCase):
+    def test_upload_ignores_predictable_symlinks_and_uses_private_unique_paths(self):
+        ctx = self.context("install")
+        recorder = Recorder(ctx)
+        root = Path(self.tmp.name)
+        victim = root / "victim"
+        victim.write_bytes(b"operator file")
+        old = root / "zakura-monitoring"
+        old.mkdir()
+        (old / (SHA + ".tar.gz")).symlink_to(victim)
+        paths = []
+        def ssh(command, stdin=None, timeout=300):
+            result = subprocess.run(["bash", "-c", command], input=stdin, capture_output=True,
+                                    timeout=timeout, check=False)
+            if command.startswith("python3") and result.returncode == 0:
+                tarball = Path(json.loads(result.stdout)["tarball"])
+                paths.append(tarball)
+                self.assertEqual(tarball.read_bytes(), stdin)
+                self.assertEqual(stat.S_IMODE(tarball.stat().st_mode), 0o600)
+                self.assertEqual(stat.S_IMODE(tarball.parent.stat().st_mode), 0o700)
+            return result
+        ctx.ssh = ssh
+        with mock.patch.object(tool, "REMOTE_STAGING", str(old)):
+            for _ in range(2):
+                tool.install_compat(ctx)
+        self.assertEqual(victim.read_bytes(), b"operator file")
+        self.assertNotEqual(paths[0], paths[1])
+        self.assertTrue(all(not path.parent.exists() for path in paths))
+        self.assertIn(("remote", "stage"), recorder.operations())
+
+    def test_failed_stage_cleans_up_uploaded_directory(self):
+        ctx = self.context("install")
+        Recorder(ctx)
+        root = Path(self.tmp.name)
+        ctx.ssh = lambda command, stdin=None, timeout=300: subprocess.run(
+            shlex.split(command), input=stdin, capture_output=True, timeout=timeout, check=False)
+        ctx.remote_install = mock.Mock(side_effect=tool.StageError("stage rejected"))
+        with mock.patch.object(tool, "REMOTE_STAGING", str(root)):
+            with self.assertRaisesRegex(tool.StageError, "stage rejected"):
+                tool.install_compat(ctx)
+        self.assertFalse(any(path.is_dir() for path in root.glob("zakura-monitoring-*")))
+
+    def test_oversized_upload_fails_and_removes_its_private_directory(self):
+        ctx = self.context("install")
+        root = Path(self.tmp.name)
+        result = subprocess.run([sys.executable, "-c", tool.install.UPLOAD_SCRIPT, str(root), "4"],
+                                input=b"12345", capture_output=True, timeout=10)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(list(root.glob("zakura-monitoring-*")))
+
+    def test_bad_upload_result_never_runs_remote_installer(self):
+        for output, code in ((b'{"tarball":"/etc/passwd"}', 0), (b'{}', 0), (b'{}', 1)):
+            ctx = self.context("install")
+            recorder = Recorder(ctx)
+            ctx.ssh = lambda *args, **kwargs: subprocess.CompletedProcess([], code, output, b"")
+            with self.assertRaises(tool.StageError):
+                tool.install_compat(ctx)
+            self.assertFalse(any(kind == "remote" for kind, *_ in recorder.calls))
 
 
 class SourceTests(unittest.TestCase):

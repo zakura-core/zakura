@@ -71,6 +71,26 @@ RUST_ARTIFACTS = (
 HOST_KEY_LINE = re.compile(r"[A-Za-z0-9|+/=\[\]:.,_-]+ (ssh-ed25519|ecdsa-sha2-nistp[0-9]+|ssh-rsa) [A-Za-z0-9+/=]+")
 
 
+# Bootstrap upload before this package exists on the remote host. mkdtemp
+# creates a private directory atomically; exclusive creation rejects symlinks.
+UPLOAD_SCRIPT = """import json, os, shutil, sys, tempfile
+os.umask(0o077)
+directory = tempfile.mkdtemp(prefix="zakura-monitoring-", dir=sys.argv[1])
+try:
+    limit = int(sys.argv[2])
+    data = sys.stdin.buffer.read(limit + 1)
+    if len(data) > limit:
+        raise ValueError("monitoring package is oversized")
+    tarball = directory + "/package.tar.gz"
+    with open(tarball, "xb") as target:
+        target.write(data)
+    print(json.dumps({"tarball": tarball}))
+except BaseException:
+    shutil.rmtree(directory)
+    raise
+"""
+
+
 class InstallError(RuntimeError):
     pass
 

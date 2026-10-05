@@ -248,6 +248,10 @@ jobs:
           python3 deploy/runner/test_zakura_cluster_status.py
           python3 deploy/runner/test_zakura_cluster_watchdog.py
 
+      - name: Compatibility monitoring tests
+        if: ${{ !cancelled() }}
+        run: python3 -m unittest discover -s deploy/runner -p 'test_zakura_monitoring_*.py'
+
       - name: Release-state coupling
         if: ${{ !cancelled() }}
         # Cargo-free check that the committed checkpoint list, frontier, subtree roots, and

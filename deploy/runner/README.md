@@ -211,3 +211,120 @@ python3 /opt/zakura-fleet-watchdog/zakura-cluster-watchdog.py \
 During restart deploys, the workflows write a Unix timestamp 20 minutes in the
 future to `/run/zakura-fleet-watchdog/deploy-suppressed-until`. While that marker
 is active, new failure alerts are logged locally but not posted to Slack.
+
+## Compatibility Monitoring
+
+The fleet watchdog also monitors the zcashd-compat pair on `zakura-compat`
+(`root@159.203.113.196`). It replaces the Rust `zakura-watchdog` sidecar and its
+Sentry reporting; failures and recoveries go to `#zakura-alerts` with the other
+fleet alerts.
+
+The stdlib-only package `zakura_monitoring/` is shared by both hosts:
+
+| Module | Role |
+| --- | --- |
+| `compat.py` | Local checker: process, peer-pinning and height-drift predicates |
+| `monitor.py` | Fleet lane: bounded probe worker and untrusted-outcome validation |
+| `remote.py` | Bounded subprocess and SSH execution |
+| `slack.py` | Slack sanitization and webhook transport |
+| `state.py`, `delivery.py` | Durable state and batched, retried delivery |
+| `suppression.py` | Fleet and compatibility deployment markers |
+| `install.py` | Versioned releases, cutover and rollback operations |
+
+### Checker
+
+`zakura-compat-check` (and its thin wrapper `deploy/zcashd-compat/sync-check.sh`)
+checks, in order: a `zakurad .*--zcashd-compat` process, a `zcashd .*-connect`
+process, zcashd `getconnectioncount == 1`, and absolute zakurad/zcashd
+`getblockcount` drift `<= HEIGHT_MAX_DRIFT` (default 30, about 12 minutes at
+NU7's 25-second spacing). It reads the variables of the former shell check:
+`ZAKURA_RPC_URL`, `ZAKURA_COOKIE_FILE`, `ZAKURA_RPC_CONF`, `ZAKURA_RPC_USER`,
+`ZAKURA_RPC_PASSWORD`, the `ZCASHD_*` equivalents, the process patterns,
+`HEIGHT_MAX_DRIFT`, `SYNC_CHECK_TIMEOUT` (600), `SYNC_CHECK_INTERVAL` (15) and
+`WATCHDOG_RPC_TIMEOUT` (30). A cookie file wins over a config file and
+user/password; an explicitly empty cookie path disables cookie auth.
+Command-line flags override the environment, which overrides `--env-file`.
+
+- `zakura-compat-check probe` runs one cycle and always prints one JSON outcome
+  (schema `zakura-compat-outcome/1`): status, predicate, numeric details,
+  observation time and suppression metadata. Health failures exit 0; invalid
+  configuration exits 2.
+- `zakura-compat-check check` retries every 15 seconds within a 600-second
+  deadline that also bounds each RPC. It exits 0 on pass, 1 on failure or
+  deadline, 2 on invalid configuration, and never reads Slack or suppression.
+
+Outcomes and errors contain fixed predicates, error categories and integers
+only: never cookies, passwords, URLs, response bodies or logs.
+
+### Fleet Lane
+
+With `ZAKURA_COMPAT_MONITORING=1` (written by cutover as the drop-in
+`zakura-fleet-watchdog.service.d/80-compat-monitoring.conf`) the watchdog probes
+the single `[[compatibility]]` target in `fleet-watchdog.toml` every 60 seconds:
+one worker thread, at most one probe in flight, and a 120-second hard timeout
+covering SSH and RPC. It uses root's SSH identity with `BatchMode=yes` and the
+host key pinned in `/etc/zakura-fleet-watchdog/known_hosts`. Fleet polls never
+wait for a probe; the main thread alone applies results and owns state.
+
+- The first completed failure alerts immediately, including after a restart
+  with no open incident. A persistent failure, whatever its predicate, is one
+  incident. A complete, valid pass after a reported incident sends one recovery.
+- An SSH timeout or failure, a missing checker, or malformed, stale, oversized
+  or mismatched output is a monitoring failure. It can open or continue an
+  incident but never recovers one.
+- Messages name the host, check, predicate, peer count, heights, drift and
+  observation time.
+- Incidents live in `compatibility`, probe telemetry in `compatibility_probes`
+  and undelivered messages in `compatibility_pending_delivery`, separate from
+  the fleet namespaces. Delivery reuses the fleet lane's batching, checkpointing
+  and retry, so a Slack outage delays but never drops an alert or recovery.
+- Only the compatibility marker
+  `/run/zakura-watchdog/deployment-suppressed-until` on `zakura-compat`, written
+  by deploys that restart `zakurad-compat`, mutes this lane. A marker more than
+  1200 seconds ahead, or not a whole Unix timestamp, is ignored. Probes keep
+  running; a failure that outlives the marker alerts on the next probe. The fleet
+  marker on `us-east-0` does not mute this lane.
+
+### Deployment
+
+Regular mainnet deploys install the fleet watchdog as a versioned release under
+`/opt/zakura-fleet-watchdog/releases/<sha>` with `current`,
+`zakura-cluster-watchdog.py` and `fleets.toml` symlinks. They keep the live unit
+and its drop-ins (including the Mac comparison settings), state and every
+non-Slack env setting, and replace the webhook (env mode 600) only when the
+secret is provided. Once the lane is enabled they also refresh the checker on
+`zakura-compat`. Neither path retires the Rust watchdog.
+
+`zakura-mainnet-deploy.yml` with `operation=monitoring`, `node=zakura-compat`
+and `ref=<full tested SHA>` runs one explicit stage of
+`zakura-monitoring-deploy.py` at a time. No stage builds, installs, stops or
+restarts `zakurad` or `zcashd`, or touches the dashboard or gateway.
+
+| Stage | Effect |
+| --- | --- |
+| `status` | Read-only summary of both hosts |
+| `install` | Checker release on `zakura-compat` (`/opt/zakura-monitoring`, activated, inert), env seeded from the Rust watchdog's checker settings, fleet release staged, host key pinned |
+| `validate` | Service-context probe, Rust/Python parity (`SENTRY_DSN` unset) and the shipped synthetic tests on both hosts |
+| `cutover` | Back up fleet state, activate the fleet release, enable the lane, restart only `zakura-fleet-watchdog`, wait for a passing live probe |
+| `soak` | 30-minute read-only record of probes, height advancement and service health |
+| `slack-test` | Opt-in: one labeled failure and recovery to `#zakura-alerts` from temporary state |
+| `finalize` | Requires a fresh passing live probe; stops `zakura-watchdog` and moves its unit, binary and env to `/var/backups/zakura-monitoring/` |
+| `rollback` | Disables the lane, restores the previous fleet and checker releases, restores the Rust watchdog if finalized; nodes are untouched |
+
+Each run uploads `monitoring-evidence.json` with the commit, package and
+manifest digests, run URL and per-step results. Record any Slack message links
+from the channel by hand; webhooks do not return them. To restore the
+pre-cutover fleet state too, run on `us-east-0`:
+
+```bash
+python3 deploy/runner/zakura-monitoring-deploy.py rollback --sha <sha> \
+  --known-hosts <pinned known_hosts> \
+  --restore-state /var/lib/zakura-fleet-watchdog/backups/state-<stamp>.json
+```
+
+The acceptance tool also runs directly from an installed release, for example:
+
+```bash
+python3 /opt/zakura-fleet-watchdog/current/zakura-monitoring-acceptance.py synthetic
+python3 /opt/zakura-fleet-watchdog/current/zakura-monitoring-acceptance.py soak --duration 1800
+```

@@ -1450,8 +1450,20 @@ notes = "Reviewed all packaged Rust source and manifest. No unsafe, build script
 [[audits.idna_adapter]]
 who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
+version = "1.1.0"
+notes = "Reviewed the complete packaged Rust source and manifests. This no_std adapter delegates Unicode properties, UTS 46 mapping, and NFC normalization to unicode-rs dependencies, with fixed masks over small property enums. No unsafe code, build script, runtime I/O, or ambient authority. An isolated comparison using this exact adapter matched all 6,389 Unicode 16 strict ToASCII expectations; Unicode 17 differences are documented and accepted by Zakura."
+
+[[audits.idna_adapter]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
 version = "1.2.2"
 notes = "Reviewed all packaged source and manifest content. This no_std ICU adapter performs checked constant-mask construction and forwards normalization and property lookups. It contains no unsafe code, build script, runtime I/O, or ambient authority; all-feature library and documentation targets compiled."
+
+[[audits.idna_mapping]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "1.1.0"
+notes = "Reviewed the complete packaged library, manifests, maintenance generator, and generated-data structure. The generated mapping table reproduced byte-for-byte from the bundled Unicode data. Mapping uses safe Rust, immutable table lookups and bounded string slices; no unsafe code, build script, runtime I/O, or ambient authority. The packaged unit test passed, together with an isolated exhaustive check of every Unicode scalar for table and UTF-8 slice bounds and bounded mapping expansion in both modes. Unicode 16 coverage and the accepted Unicode 17 hostname incompatibility are documented by Zakura."
 
 [[audits.igd-next]]
 who = "Claude Opus 5 <noreply@anthropic.com>"
@@ -3992,6 +4004,12 @@ who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
 version = "1.0.24"
 notes = "Reviewed all packaged source, manifests, generated Unicode 17 tables, tests, and benchmark. The dependency-free no_std implementation performs fixed-table XID lookups; the largest generated chunk index makes both unchecked leaf accesses land at or before the final table element. Exhaustive comparison of every Unicode scalar against the bundled independent ucd-trie and FST representations passed, together with 5 size/layout tests and 2 doctests. It has no build script, allocation, runtime I/O, or ambient capabilities. The published unicode-xid 0.2.6 comparison oracle is older and first disagrees at U+088F because Cargo strips the source manifest's Unicode 17 patch; rerunning without only that stale oracle passed."
+
+[[audits.unicode-joining-type]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "1.0.0"
+notes = "Reviewed the complete packaged library, manifests, build script, maintenance Makefile, and generated-data structure. The Unicode 16 input tables consist only of enum declarations and sorted contiguous ranges. The build script reads OUT_DIR and writes two fixed generated lookup files there; it has no network or process execution. Runtime lookup uses safe bounded array indexing, no allocation or I/O, and defaults above the final codepoint. No unsafe code or dependencies. Both packaged unit tests and all three doctests passed; an isolated exhaustive check confirmed generated joining type and group lookups match the source ranges for every Unicode scalar."
 
 [[audits.unit-prefix]]
 who = "OpenAI Codex <noreply@openai.com>"

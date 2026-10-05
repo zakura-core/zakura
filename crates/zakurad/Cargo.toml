@@ -312,9 +312,10 @@ zakura-test = { path = "../zakura-test", version = "3.0.0" }
 zakura-utils = { path = "../zakura-utils", version = "2.2.7" }
 
 [package.metadata.cargo-udeps.ignore]
-# These dependencies are false positives - they are actually used
+# These dependencies are used indirectly or constrain transitive resolution.
 normal = [
     "console-subscriber",  # Used behind the tokio-console feature flag
+    "idna_adapter",        # Selects the unicode-rs backend for URL/DNS dependencies
     "zakura-utils",         # Used for the zakura-checkpoints feature
 ]
 development = [

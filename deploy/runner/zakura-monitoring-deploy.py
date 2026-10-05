@@ -249,6 +249,10 @@ def last_probe(ctx: Context) -> dict:
 def stage_fleet_deploy(ctx: Context) -> None:
     """Regular deploys: install the fleet release in place and restart only the watchdog."""
     stage_fleet(ctx)
+    if lane_enabled():
+        # Do not change the live fleet release until the checker refresh succeeds.
+        validate_target(ctx)
+        install_compat(ctx)
     activate_fleet(ctx)
     webhook = os.environ.get("SLACK_WEB_HOOK", "")
     ctx.record("fleet env", ctx.local(
@@ -258,14 +262,6 @@ def stage_fleet_deploy(ctx: Context) -> None:
     ctx.systemctl("enable", FLEET_UNIT)
     ctx.systemctl("restart", FLEET_UNIT)
     ctx.record("fleet service", ctx.systemctl("is-active", FLEET_UNIT, check=False))
-    if lane_enabled():
-        # Keep the checker on the same commit as the lane that calls it.
-        try:
-            validate_target(ctx)
-            install_compat(ctx)
-        except (StageError, OSError, subprocess.SubprocessError) as error:
-            ctx.record("compat refresh", {"warning": str(error)})
-            print(f"::warning::compatibility checker refresh failed: {error}", flush=True)
 
 
 def stage_install(ctx: Context) -> None:
@@ -328,6 +324,8 @@ def stage_cutover(ctx: Context) -> None:
     ctx.record("state backup", ctx.local(
         "backup-state", "--state", str(FLEET_STATE), "--directory", str(FLEET_BACKUPS)))
     activate_fleet(ctx)
+    ctx.record("acceptance begin", ctx.local(
+        "acceptance", "--root", str(FLEET_ROOT), "--sha", ctx.sha, "--action", "begin"))
     ctx.record("lane", ctx.local("enable-lane"))
     ctx.systemctl("daemon-reload")
     started = time.time()
@@ -347,6 +345,11 @@ def stage_cutover(ctx: Context) -> None:
 
 
 def stage_soak(ctx: Context) -> None:
+    validate_target(ctx)
+    if ctx.args.soak_seconds < install.SOAK_MIN_SECONDS:
+        raise StageError("deployment acceptance requires at least a 30-minute soak")
+    generation = ctx.local("acceptance", "--root", str(FLEET_ROOT),
+                           "--sha", ctx.sha, "--action", "status")["generation"]
     command = [sys.executable, "-I", str(FLEET_ROOT / "current" / "zakura-monitoring-acceptance.py"),
                "soak", "--duration", str(ctx.args.soak_seconds)]
     if os.geteuid() != 0:
@@ -356,6 +359,9 @@ def stage_soak(ctx: Context) -> None:
     ctx.record("soak", json_or_marker(result.stdout))
     if result.returncode != 0:
         raise StageError("soak checks did not all pass")
+    ctx.record("accepted soak", ctx.local(
+        "acceptance", "--root", str(FLEET_ROOT), "--sha", ctx.sha,
+        "--action", "soak", "--generation", generation, stdin=result.stdout))
 
 
 def stage_slack_test(ctx: Context) -> None:
@@ -385,6 +391,8 @@ def stage_finalize(ctx: Context) -> None:
     if not (last.get("valid") and last.get("status") == "pass"
             and time.time() - last.get("completed_at", 0) <= FRESH_PROBE_SECONDS):
         raise StageError("the live lane has no fresh passing probe; not retiring the Rust watchdog")
+    ctx.record("acceptance proof", ctx.local(
+        "acceptance", "--root", str(FLEET_ROOT), "--sha", ctx.sha, "--action", "require"))
     ctx.record("retire rust watchdog", ctx.remote_install(
         "retire-rust", "--backup-root", str(RUST_BACKUPS)))
 

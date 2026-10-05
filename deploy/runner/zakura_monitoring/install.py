@@ -13,6 +13,7 @@ Layout under a package root (``/opt/zakura-monitoring`` on zakura-compat,
     releases/<sha>/      one immutable, manifest-verified release per commit
     current -> releases/<sha>
     rollback.json        the release ``current`` pointed to before activation
+    acceptance.json      soak evidence for the current cutover generation
 
 Output is a single JSON object of paths, digests and states. Credential values
 and env file contents are never printed.
@@ -26,6 +27,7 @@ import gzip
 import hashlib
 import io
 import json
+import math
 import os
 import re
 import shutil
@@ -34,6 +36,7 @@ import sys
 import tarfile
 import tempfile
 import time
+import uuid
 from pathlib import Path
 
 
@@ -464,6 +467,78 @@ def restore_state(backup: Path, state: Path) -> dict:
     return {"state_restored_from": str(backup)}
 
 
+SOAK_MIN_SECONDS = 1800
+SOAK_CHECKS = frozenset({
+    "service_always_active", "probes_completed", "all_new_probes_passed",
+    "no_unavailable_probes", "height_advanced", "no_open_incident",
+})
+
+
+def _finite_number(value: object) -> bool:
+    return type(value) in (int, float) and math.isfinite(value)
+
+
+def acceptance(root: Path, sha: str, action: str, generation: str | None = None,
+               evidence: dict | None = None) -> dict:
+    """Persist soak proof for one release/cutover, rejecting stale or failed runs.
+
+    ``begin`` invalidates older evidence. ``soak`` accepts a passing report only
+    for that generation and after at least 30 minutes. ``require`` fails until
+    that proof exists; ``status`` supplies the generation before observation.
+    These records are separate from fleet incidents and notification queues.
+    """
+    if not SHA.fullmatch(sha) or current_release(root) != sha:
+        raise InstallError("acceptance release is not the active commit")
+    path = root / "acceptance.json"
+    if action == "begin":
+        record = {"sha": sha, "generation": uuid.uuid4().hex,
+                  "started_at": time.time(), "soak": None}
+    else:
+        try:
+            record = json.loads(path.read_text())
+        except (OSError, ValueError) as error:
+            raise InstallError("cutover acceptance record is missing or invalid") from error
+        if (not isinstance(record, dict) or record.get("sha") != sha
+                or not isinstance(record.get("generation"), str)
+                or not _finite_number(record.get("started_at"))):
+            raise InstallError("cutover acceptance record belongs to another release")
+        if generation is not None and generation != record["generation"]:
+            raise InstallError("cutover changed during acceptance")
+        if action == "soak":
+            report = evidence or {}
+            if not isinstance(report, dict) or not isinstance(report.get("release"), dict):
+                raise InstallError("soak report is malformed")
+            checks = report.get("checks")
+            numbers = [report.get(key) for key in
+                       ("duration", "elapsed", "started_at", "finished_at")]
+            if not all(_finite_number(value) for value in numbers):
+                raise InstallError("soak times must be finite numbers")
+            duration, elapsed, started, finished = numbers
+            if (generation is None or report.get("passed") is not True
+                    or not isinstance(checks, dict) or set(checks) != SOAK_CHECKS
+                    or any(value is not True for value in checks.values())
+                    or report.get("release", {}).get("sha") != sha
+                    or duration < SOAK_MIN_SECONDS or elapsed < SOAK_MIN_SECONDS
+                    or started < record["started_at"] or finished < started + SOAK_MIN_SECONDS
+                    or finished > time.time() + 5):
+                raise InstallError("soak must pass for 30 minutes after this cutover")
+            record["soak"] = {"started_at": started, "finished_at": finished, "elapsed": elapsed}
+        elif action == "require":
+            proof = record.get("soak")
+            if (not isinstance(proof, dict)
+                    or not all(_finite_number(proof.get(key)) for key in
+                               ("started_at", "finished_at", "elapsed"))
+                    or proof["elapsed"] < SOAK_MIN_SECONDS
+                    or proof["started_at"] < record["started_at"]
+                    or proof["finished_at"] < proof["started_at"] + SOAK_MIN_SECONDS):
+                raise InstallError("a successful 30-minute soak is required before retirement")
+        elif action != "status":
+            raise InstallError("unknown acceptance operation")
+    if action in ("begin", "soak"):
+        atomic_write(path, (json.dumps(record, sort_keys=True) + "\n").encode(), 0o600)
+    return record
+
+
 def systemctl(*args: str) -> subprocess.CompletedProcess:
     return subprocess.run(
         ["systemctl", *args], capture_output=True, text=True, timeout=120, check=False
@@ -580,6 +655,11 @@ def main(argv: list[str] | None = None) -> int:
     for name in ("retire-rust", "restore-rust"):
         command = sub.add_parser(name)
         command.add_argument("--backup-root", type=Path, required=True)
+    accepted = sub.add_parser("acceptance")
+    accepted.add_argument("--root", type=Path, required=True)
+    accepted.add_argument("--sha", required=True)
+    accepted.add_argument("--action", choices=("begin", "status", "soak", "require"), required=True)
+    accepted.add_argument("--generation")
     args = parser.parse_args(argv)
 
     try:
@@ -609,6 +689,9 @@ def main(argv: list[str] | None = None) -> int:
             result = backup_state(args.state, args.directory)
         elif operation == "restore-state":
             result = restore_state(args.backup, args.state)
+        elif operation == "acceptance":
+            evidence = json.load(sys.stdin) if args.action == "soak" else None
+            result = acceptance(args.root, args.sha, args.action, args.generation, evidence)
         elif operation == "retire-rust":
             result = retire_rust(args.backup_root)
         else:

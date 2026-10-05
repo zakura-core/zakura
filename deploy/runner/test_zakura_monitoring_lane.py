@@ -446,7 +446,7 @@ def bounded(outcome: dict | bytes | None, returncode=0, timed_out=False, oversiz
 def outcome_dict(nonce="n", status="pass", predicate="in_sync", observed_at=NOW, **changes):
     value = {
         "schema": compat.SCHEMA, "check": compat.CHECK_NAME, "status": status,
-        "predicate": predicate, "summary": "x", "details": details(),
+        "predicate": predicate, "summary": "x", "details": details(maximum=10),
         "error_kind": None, "observed_at": observed_at, "nonce": nonce,
         "suppression": {"state": "missing", "active": False, "until": None, "max_seconds": 1200},
     }
@@ -456,11 +456,27 @@ def outcome_dict(nonce="n", status="pass", predicate="in_sync", observed_at=NOW,
 
 class ParseTests(unittest.TestCase):
     def parse(self, result, nonce="n"):
-        return monitor.parse_probe_output(result, nonce, NOW - 5, NOW + 5)
+        return monitor.parse_probe_output(result, nonce, NOW - 5, NOW + 5, 10)
 
     def test_valid_pass(self):
         result = self.parse(bounded(outcome_dict()))
         self.assertTrue(result.passed)
+
+    def test_reported_limit_must_match_the_requested_policy(self):
+        for maximum, drift in ((30, 11), (9, 0), (11, 0)):
+            with self.subTest(maximum=maximum, drift=drift):
+                result = monitor.parse_probe_output(
+                    bounded(outcome_dict(details=details(zakura=100 + drift, zcashd=100,
+                                                        maximum=maximum))),
+                    "n", NOW - 5, NOW + 5, 10)
+                self.assertFalse(result.valid)
+                self.assertFalse(result.passed)
+        for drift in (9, 10):
+            result = monitor.parse_probe_output(
+                bounded(outcome_dict(details=details(zakura=100 + drift, zcashd=100,
+                                                    maximum=10))),
+                "n", NOW - 5, NOW + 5, 10)
+            self.assertTrue(result.passed)
 
     def test_transport_failures_are_unavailable(self):
         cases = {
@@ -532,6 +548,17 @@ class ParseTests(unittest.TestCase):
 
 
 class WorkerTests(unittest.TestCase):
+    def test_worker_checks_the_configured_limit_in_remote_results(self):
+        worker = monitor.ProbeWorker(
+            monitor.CompatTarget(name="zakura-compat", ssh_target="root@159.203.113.196",
+                                 known_hosts=None, height_max_drift=10),
+            runner=lambda *_args: bounded(outcome_dict(details=details(maximum=30))),
+            clock=lambda: NOW, nonce_factory=lambda: "n")
+        result = worker.wait(1)
+        self.assertIsNotNone(result)
+        self.assertFalse(result.valid)
+        self.assertFalse(result.passed)
+
     def test_hung_probe_never_blocks_and_never_starts_a_second_worker(self):
         release = threading.Event()
         calls = []

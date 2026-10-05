@@ -79,7 +79,7 @@ concurrency:
 
 jobs:
   mac-source:
-    if: inputs.node == 'zakura-mac-os' && inputs.mac_operation == 'deploy' && (github.ref == 'refs/heads/main' || github.ref_name == vars.MAC_VERIFIER_DEPLOY_BRANCH)
+    if: inputs.operation == 'deploy' && inputs.node == 'zakura-mac-os' && inputs.mac_operation == 'deploy' && (github.ref == 'refs/heads/main' || github.ref_name == vars.MAC_VERIFIER_DEPLOY_BRANCH)
     runs-on: ubuntu-24.04
     outputs:
       sha: ${{ steps.source.outputs.sha }}
@@ -110,14 +110,14 @@ jobs:
 
   mac-build:
     needs: mac-source
-    if: inputs.mac_candidate_run_id == ''
+    if: inputs.operation == 'deploy' && inputs.mac_candidate_run_id == ''
     uses: ./.github/workflows/build-zakura-mac-cranelift.yml
     with:
       ref: ${{ needs.mac-source.outputs.sha }}
 
   zakura-mac-cranelift:
     needs: [mac-source, mac-build]
-    if: ${{ !cancelled() && inputs.node == 'zakura-mac-os' && (github.ref == 'refs/heads/main' || github.ref_name == vars.MAC_VERIFIER_DEPLOY_BRANCH) && (inputs.mac_operation != 'deploy' || (needs.mac-source.result == 'success' && (needs.mac-build.result == 'success' || (inputs.mac_candidate_run_id != '' && needs.mac-build.result == 'skipped')))) }}
+    if: ${{ !cancelled() && inputs.operation == 'deploy' && inputs.node == 'zakura-mac-os' && (github.ref == 'refs/heads/main' || github.ref_name == vars.MAC_VERIFIER_DEPLOY_BRANCH) && (inputs.mac_operation != 'deploy' || (needs.mac-source.result == 'success' && (needs.mac-build.result == 'success' || (inputs.mac_candidate_run_id != '' && needs.mac-build.result == 'skipped')))) }}
     runs-on: ubuntu-24.04
     # Existing protected environment and encrypted secret IDs are compatibility bindings.
     environment: mac-verifier-private

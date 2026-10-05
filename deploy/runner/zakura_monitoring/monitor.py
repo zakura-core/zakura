@@ -188,8 +188,9 @@ def parse_probe_output(
     nonce: str,
     started_at: float,
     finished_at: float,
+    expected_max_drift: int,
 ) -> ProbeResult:
-    """Validate untrusted checker output for the probe identified by ``nonce``."""
+    """Validate checker output against this probe's nonce and requested drift policy."""
     if result.timed_out:
         return unavailable("ssh_timeout", finished_at)
     if result.returncode is None:
@@ -236,6 +237,9 @@ def parse_probe_output(
             for key, value in details.items()
         )
     ):
+        return malformed()
+
+    if details.get("height_max_drift") != expected_max_drift:
         return malformed()
 
     observed_at = finite_number(outcome.get("observed_at"))
@@ -340,7 +344,9 @@ class ProbeWorker:
     def _probe(self, nonce: str, started_at: float) -> None:
         try:
             result = self.runner(self.command(nonce), self.target.timeout, MAX_OUTCOME_BYTES)
-            self._results.put(parse_probe_output(result, nonce, started_at, self.clock()))
+            parsed = parse_probe_output(
+                result, nonce, started_at, self.clock(), self.target.height_max_drift)
+            self._results.put(parsed)
         except Exception:  # A worker failure is a monitoring failure, never a crash.
             self._results.put(unavailable("probe_failed", self.clock()))
 

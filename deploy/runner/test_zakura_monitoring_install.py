@@ -7,6 +7,8 @@ roots only; systemctl is replaced, so no service is touched.
 
 from __future__ import annotations
 
+import argparse
+import importlib.util
 import io
 import json
 import os
@@ -16,6 +18,7 @@ import sys
 import tarfile
 import tempfile
 import threading
+import time
 import unittest
 from contextlib import redirect_stdout
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -398,6 +401,163 @@ class RustWatchdogTests(InstallCase):
     def test_retire_without_artifacts_is_a_no_op(self):
         with mock.patch.object(install, "RUST_ARTIFACTS", (self.dir / "absent",)):
             self.assertFalse(install.retire_rust(self.dir / "backups")["retired"])
+
+
+class AcceptanceReceiptTests(InstallCase):
+    def setUp(self):
+        super().setUp()
+        self.stage(SHA_A)
+        install.activate(self.root, SHA_A, {})
+        with mock.patch.object(install.time, "time", return_value=1000):
+            self.record = install.acceptance(self.root, SHA_A, "begin")
+        self.report = {"duration": 1800, "elapsed": 1800, "started_at": 1000,
+                       "finished_at": 2800, "release": {"sha": SHA_A}, "passed": True,
+                       "checks": dict.fromkeys(install.SOAK_CHECKS, True)}
+
+    def accept(self, report=None, generation=None):
+        with mock.patch.object(install.time, "time", return_value=4000):
+            return install.acceptance(self.root, SHA_A, "soak",
+                                      generation or self.record["generation"], report or self.report)
+
+    def test_require_rejects_missing_proof_and_accepts_persisted_success(self):
+        with self.assertRaises(install.InstallError):
+            install.acceptance(self.root, SHA_A, "require")
+        self.accept()
+        self.assertTrue(install.acceptance(self.root, SHA_A, "require")["soak"])
+        result = subprocess.run(
+            [sys.executable, "-I", str(self.root / "current/zakura_monitoring/install.py"),
+             "acceptance", "--root", str(self.root), "--sha", SHA_A, "--action", "require"],
+            cwd="/", capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["generation"], self.record["generation"])
+        self.assertEqual(stat.S_IMODE((self.root / "acceptance.json").stat().st_mode), 0o600)
+
+    def test_failed_short_stale_or_wrong_release_soaks_never_qualify(self):
+        changes = [
+            {"passed": False}, {"duration": 1799}, {"elapsed": 1799},
+            {"elapsed": float("nan")}, {"release": None}, {"started_at": 999}, {"finished_at": 2799},
+            {"finished_at": 5000}, {"release": {"sha": SHA_B}},
+            {"checks": {}}, {"checks": {**self.report["checks"], "height_advanced": False}},
+        ]
+        for change in changes:
+            with self.subTest(change=change):
+                with self.assertRaises(install.InstallError):
+                    self.accept({**self.report, **change})
+                with self.assertRaises(install.InstallError):
+                    install.acceptance(self.root, SHA_A, "require")
+
+    def test_new_cutover_invalidates_proof_and_rejects_inflight_old_soak(self):
+        self.accept()
+        new = install.acceptance(self.root, SHA_A, "begin")
+        self.assertNotEqual(new["generation"], self.record["generation"])
+        with self.assertRaises(install.InstallError):
+            self.accept()
+        with self.assertRaises(install.InstallError):
+            install.acceptance(self.root, SHA_A, "require")
+        self.stage(SHA_B)
+        install.activate(self.root, SHA_B, {})
+        with self.assertRaises(install.InstallError):
+            install.acceptance(self.root, SHA_A, "require")
+        with self.assertRaises(install.InstallError):
+            install.acceptance(self.root, SHA_B, "require")
+
+    def test_malformed_persisted_proof_cannot_qualify_retirement(self):
+        for proof in (True, {}, {"started_at": 1000, "finished_at": 2800, "elapsed": 1799},
+                      {"started_at": 999, "finished_at": 2800, "elapsed": 1800}):
+            (self.root / "acceptance.json").write_text(json.dumps({**self.record, "soak": proof}))
+            with self.assertRaises(install.InstallError):
+                install.acceptance(self.root, SHA_A, "require")
+
+    def test_missing_and_malformed_records_are_rejected(self):
+        for data in (None, "not json", "null", '{}'):
+            path = self.root / "acceptance.json"
+            if data is None:
+                path.unlink(missing_ok=True)
+            else:
+                path.write_text(data)
+            with self.assertRaises(install.InstallError):
+                install.acceptance(self.root, SHA_A, "require")
+
+
+class AcceptanceToolTests(InstallCase):
+    def setUp(self):
+        super().setUp()
+        spec = importlib.util.spec_from_file_location(
+            "monitoring_acceptance_tests", HERE / "zakura-monitoring-acceptance.py")
+        self.tool = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.tool)
+        self.args = argparse.Namespace(rust_bin=self.dir / "zakura-watchdog",
+                                       rust_env=self.dir / "missing-env", env_file=None,
+                                       rust_backups=self.dir / "backups", timeout=1,
+                                       height_max_drift=10)
+
+    def parity(self, timed_out=False):
+        from zakura_monitoring import remote
+        result = remote.BoundedResult(0, b'{"status":"pass"}', timed_out, False, 0)
+        with mock.patch.object(self.tool.remote, "run_bounded", return_value=result) as run, \
+                redirect_stdout(io.StringIO()) as output:
+            code = self.tool.parity(self.args)
+        return code, json.loads(output.getvalue()), run
+
+    def test_parity_uses_verified_retired_binary_after_finalization(self):
+        self.args.rust_bin.write_text("reference executable")
+        self.assertEqual(self.parity()[0], 0)
+        with mock.patch.object(install, "RUST_ARTIFACTS", (self.args.rust_bin,)), \
+                mock.patch.object(install, "systemctl", return_value=
+                                  subprocess.CompletedProcess([], 0, "", "")):
+            retired = install.retire_rust(self.args.rust_backups)
+        code, report, run = self.parity()
+        self.assertEqual(code, 0)
+        self.assertEqual(report["rust"]["reference"], "retired")
+        self.assertTrue(str(run.call_args_list[0].args[0][0]).startswith(retired["backup"]))
+        for call in run.call_args_list:
+            self.assertNotIn("SENTRY_DSN", call.kwargs["env"])
+        saved = Path(run.call_args_list[0].args[0][0])
+        saved.write_text("tampered")
+        self.assertEqual(self.parity()[0], 1)
+
+    def test_missing_reference_and_timeout_cannot_pass_parity(self):
+        self.assertEqual(self.parity()[0], 1)
+        self.args.rust_bin.write_text("reference executable")
+        self.assertEqual(self.parity(timed_out=True)[0], 1)
+
+    def test_soak_reports_actual_elapsed_and_release(self):
+        from zakura_monitoring import monitor
+        clock = [0.0]
+        def sleep(seconds):
+            clock[0] += seconds
+        def state(_path):
+            completed = int(clock[0] // 60)
+            return {monitor.COMPAT_PROBES: {"zakura-compat": {
+                "completed": completed, "passed": completed, "unavailable": 0,
+                "last": {"status": "pass", "details": {
+                    "zakura_height": 100 + completed, "zcashd_height": 100 + completed}}}}}
+        self.args = argparse.Namespace(state=self.dir / "state.json", target="zakura-compat",
+                                       unit="fake.service", duration=1800, interval=60, report=None)
+        self.args.state.write_text('{}')
+        self.stage(SHA_A)
+        install.activate(self.root, SHA_A, {})
+        with mock.patch.object(self.tool.time, "monotonic", side_effect=lambda: clock[0]), \
+                mock.patch.object(self.tool.time, "time", side_effect=lambda: 1000 + clock[0]), \
+                mock.patch.object(self.tool.time, "sleep", side_effect=sleep), \
+                mock.patch.object(self.tool.state_module, "load_state", side_effect=state), \
+                mock.patch.object(self.tool, "service_state", return_value="active"), \
+                mock.patch.object(self.tool.compat, "release_info", return_value={"sha": SHA_A}), \
+                redirect_stdout(io.StringIO()) as output:
+            record = install.acceptance(self.root, SHA_A, "begin")
+            self.assertEqual(self.tool.soak(self.args), 0)
+            report = json.loads(output.getvalue())
+            install.acceptance(self.root, SHA_A, "soak", record["generation"], report)
+            self.assertTrue(install.acceptance(self.root, SHA_A, "require")["soak"])
+        report = json.loads(output.getvalue())
+        self.assertTrue(report["passed"])
+        self.assertEqual(report["elapsed"], 1800)
+        self.assertEqual(report["release"]["sha"], SHA_A)
+        self.assertEqual(report["finished_at"] - report["started_at"], 1800)
+        for invalid in (0, -1, float("nan"), float("inf")):
+            self.args.duration = invalid
+            with redirect_stdout(io.StringIO()):
+                self.assertEqual(self.tool.soak(self.args), 2)
 
 
 if __name__ == "__main__":

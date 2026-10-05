@@ -12,6 +12,7 @@ import sys
 import tempfile
 import time
 import unittest
+from types import SimpleNamespace
 from pathlib import Path
 from unittest import mock
 
@@ -160,6 +161,30 @@ class FleetDeployTests(DeployToolCase):
         _recorder, compat = self.run_fleet_deploy(lane_enabled=True)
         compat.assert_called_once()
 
+    def test_checker_refresh_precedes_fleet_activation(self):
+        ctx = self.context("fleet-deploy")
+        recorder = Recorder(ctx)
+        def refreshed(_ctx):
+            recorder.calls.append(("remote", ("refresh-checker",), None))
+        with mock.patch.object(tool, "lane_enabled", return_value=True), \
+                mock.patch.object(tool, "install_compat", side_effect=refreshed):
+            tool.stage_fleet_deploy(ctx)
+        operations = recorder.operations()
+        self.assertLess(operations.index(("remote", "refresh-checker")),
+                        operations.index(("local", "activate")))
+
+    def test_failed_checker_refresh_leaves_fleet_and_service_unchanged(self):
+        for error in (tool.StageError("install failed"), OSError("upload failed"),
+                      subprocess.TimeoutExpired("ssh", 30)):
+            with self.subTest(error=type(error).__name__):
+                ctx = self.context("fleet-deploy")
+                recorder = Recorder(ctx)
+                with mock.patch.object(tool, "lane_enabled", return_value=True), \
+                        mock.patch.object(tool, "install_compat", side_effect=error):
+                    with self.assertRaises(type(error)):
+                        tool.stage_fleet_deploy(ctx)
+                self.assertEqual(recorder.operations(), [("local", "stage")])
+
 
 class GuardTests(DeployToolCase):
     def test_finalize_requires_an_enabled_lane_and_fresh_pass(self):
@@ -180,6 +205,7 @@ class GuardTests(DeployToolCase):
             tool.stage_finalize(ctx)
         self.assertEqual(recorder.operations(), [("local", "status"),
                                                ("remote", "status"),
+                                               ("local", "acceptance"),
                                                ("remote", "retire-rust")])
 
     def test_finalize_rejects_either_wrong_active_release(self):
@@ -193,6 +219,46 @@ class GuardTests(DeployToolCase):
                     with self.assertRaises(tool.StageError):
                         tool.stage_finalize(ctx)
                 self.assertNotIn(("remote", "retire-rust"), recorder.operations())
+
+    def test_finalize_cannot_retire_without_acceptance_proof(self):
+        ctx = self.context("finalize")
+        recorder = Recorder(ctx)
+        def local(*arguments, **kwargs):
+            if arguments[0] == "acceptance":
+                raise tool.StageError("soak has not passed")
+            return recorder.local(*arguments, **kwargs)
+        ctx.local = local
+        with mock.patch.object(tool, "lane_enabled", return_value=True), \
+                mock.patch.object(tool, "last_probe", return_value={
+                    "valid": True, "status": "pass", "completed_at": time.time()}):
+            with self.assertRaisesRegex(tool.StageError, "soak has not passed"):
+                tool.stage_finalize(ctx)
+        self.assertNotIn(("remote", "retire-rust"), recorder.operations())
+
+    def test_soak_rejects_short_runs_and_does_not_record_failed_runs(self):
+        ctx = self.context("soak", soak_seconds=1799)
+        Recorder(ctx)
+        with self.assertRaises(tool.StageError), mock.patch.object(tool.subprocess, "run") as run:
+            tool.stage_soak(ctx)
+        run.assert_not_called()
+        ctx = self.context("soak", soak_seconds=1800)
+        recorder = Recorder(ctx)
+        original = recorder.local
+        def local(*args, **kwargs):
+            if args[0] == "acceptance":
+                return {"generation": "run-1"}
+            return original(*args, **kwargs)
+        ctx.local = local
+        for code in (1, 0):
+            with mock.patch.object(tool.subprocess, "run", return_value=
+                                   subprocess.CompletedProcess([], code, b'{"passed": true}', b"")):
+                if code:
+                    with self.assertRaises(tool.StageError):
+                        tool.stage_soak(ctx)
+                else:
+                    tool.stage_soak(ctx)
+        accepted = [entry for entry in ctx.evidence["steps"] if entry["step"] == "accepted soak"]
+        self.assertEqual(len(accepted), 1)
 
     def test_cutover_requires_the_installed_commit(self):
         ctx = self.context("cutover")
@@ -251,6 +317,37 @@ class GuardTests(DeployToolCase):
 
 
 class SourceTests(unittest.TestCase):
+    def test_monitoring_dispatch_cannot_run_any_mac_job(self):
+        workflow = (HERE.parent.parent / ".github/workflows/zakura-mainnet-deploy.yml").read_text()
+        expressions = {}
+        for job in ("mac-source", "mac-build", "zakura-mac-cranelift"):
+            block = re.split(r"\n  [a-z][a-z-]+:\n", workflow.split(f"  {job}:\n", 1)[1], maxsplit=1)[0]
+            expression = re.search(r"^    if: (.+)$", block, re.M).group(1)
+            expression = expression.removeprefix("${{ ").removesuffix(" }}")
+            expression = expression.replace("&&", " and ").replace("||", " or ")
+            expression = expression.replace("!cancelled()", "not cancelled()")
+            expression = expression.replace("needs.mac-source", "needs.mac_source")
+            expression = expression.replace("needs.mac-build", "needs.mac_build")
+            expressions[job] = expression
+        for operation in ("monitoring", "deploy"):
+            for mac_operation in ("deploy", "status", "dashboard"):
+                values = {"inputs": SimpleNamespace(operation=operation, node="zakura-mac-os",
+                          mac_operation=mac_operation, mac_candidate_run_id=""),
+                          "github": SimpleNamespace(ref="refs/heads/main", ref_name="main"),
+                          "vars": SimpleNamespace(MAC_VERIFIER_DEPLOY_BRANCH="allowed"),
+                          "needs": SimpleNamespace(mac_source=SimpleNamespace(result="success"),
+                                                   mac_build=SimpleNamespace(result="success")),
+                          "cancelled": lambda: False}
+                for job, expression in expressions.items():
+                    with self.subTest(operation=operation, mac_operation=mac_operation, job=job):
+                        allowed = eval(expression, {"__builtins__": {}}, values)
+                        if operation == "monitoring":
+                            self.assertFalse(allowed)
+                        elif mac_operation == "deploy":
+                            self.assertTrue(allowed)
+                        elif job == "zakura-mac-cranelift":
+                            self.assertTrue(allowed)
+
     def test_tooling_never_controls_node_services(self):
         for name in ("zakura-monitoring-deploy.py", "zakura_monitoring/install.py",
                      "zakura-monitoring-acceptance.py"):

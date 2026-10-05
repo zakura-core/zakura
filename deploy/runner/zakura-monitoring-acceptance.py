@@ -6,8 +6,8 @@ digests. Credentials, webhook URLs, cookies, env file contents and raw node or
 checker logs are never printed.
 
 - ``probe``: one service-context SSH probe of the configured target.
-- ``parity``: on zakura-compat, the retired Rust ``zakura-watchdog check`` (with
-  SENTRY_DSN unset) and the Python checker against the same configuration.
+- ``parity``: on zakura-compat, the live or digest-verified archived Rust check
+  (with SENTRY_DSN unset) and the Python checker against the same configuration.
 - ``synthetic``: the shipped lane, checker and installer tests, isolated in
   temporary directories with local fakes for nodes and Slack.
 - ``soak``: a read-only observation of the running fleet watchdog.
@@ -30,7 +30,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
-from zakura_monitoring import compat, monitor, remote, state as state_module  # noqa: E402
+from zakura_monitoring import compat, install, monitor, remote, state as state_module  # noqa: E402
 
 TEST_LABEL = "[ACCEPTANCE TEST - not an incident, no action needed]"
 
@@ -69,7 +69,7 @@ def probe(args: argparse.Namespace) -> int:
 
 
 def parity(args: argparse.Namespace) -> int:
-    """Compare the retired Rust check with the Python checker on the same host."""
+    """Compare a live or verified archived Rust reference with the Python checker."""
     shared = {}
     for path in (args.rust_env, args.env_file):
         if path and path.exists():
@@ -83,10 +83,27 @@ def parity(args: argparse.Namespace) -> int:
     assert "SENTRY_DSN" not in environment
     bound = args.timeout + 60
 
+    reference = args.rust_bin
+    reference_kind = "live"
+    if not reference.exists():
+        reference_kind = "retired"
+        # Finalization preserves the old executable with a digest manifest.
+        # Use that verified reference on later rollouts; absence never skips parity.
+        for backup in sorted(args.rust_backups.glob("rust-watchdog-*"), reverse=True):
+            try:
+                manifest = json.loads((backup / "manifest.json").read_text())
+                saved = backup / args.rust_bin.relative_to("/")
+                digest = manifest["moved"][str(args.rust_bin)]
+                if saved.is_file() and install.sha256_file(saved) == digest:
+                    reference = saved
+                    break
+            except (OSError, ValueError, KeyError, TypeError):
+                continue
     rust = None
-    if args.rust_bin.exists():
-        outcome = remote.run_bounded([str(args.rust_bin), "check"], bound, 0, env=environment)
-        rust = {"exit": outcome.returncode, "timed_out": outcome.timed_out}
+    if reference.exists():
+        outcome = remote.run_bounded([str(reference), "check"], bound, 0, env=environment)
+        rust = {"exit": outcome.returncode, "timed_out": outcome.timed_out,
+                "reference": reference_kind}
     checker = HERE / "zakura-compat-check"
     python = remote.run_bounded(
         [sys.executable, "-I", str(checker), "check"], bound, 0, env=environment
@@ -109,7 +126,8 @@ def parity(args: argparse.Namespace) -> int:
         "probe": probe_summary,
         "release": compat.release_info(),
     }
-    report["agree"] = rust is not None and rust["exit"] == report["python"]["exit"]
+    report["agree"] = (rust is not None and not rust["timed_out"]
+                       and not python.timed_out and rust["exit"] == report["python"]["exit"])
     emit(report)
     return 0 if report["agree"] and python.returncode == 0 else 1
 
@@ -144,8 +162,13 @@ def service_state(unit: str) -> str:
 
 def soak(args: argparse.Namespace) -> int:
     """Observe the live lane read-only and record its probes and service health."""
+    if not (0 < args.duration < float("inf") and 0 < args.interval < float("inf")):
+        emit({"soak": "duration and interval must be positive finite numbers"})
+        return 2
     samples = []
-    deadline = time.monotonic() + args.duration
+    started_at = time.time()
+    started_mono = time.monotonic()
+    deadline = started_mono + args.duration
     while True:
         state = state_module.load_state(args.state) if args.state.exists() else {}
         record = state.get(monitor.COMPAT_PROBES, {}).get(args.target, {})
@@ -182,7 +205,9 @@ def soak(args: argparse.Namespace) -> int:
         "height_advanced": len(heights) >= 2 and heights[-1] > heights[0],
         "no_open_incident": not last["incident"],
     }
-    report = {"duration": args.duration, "samples": samples, "checks": checks,
+    report = {"duration": args.duration, "elapsed": time.monotonic() - started_mono,
+              "started_at": started_at, "finished_at": time.time(),
+              "release": compat.release_info(), "samples": samples, "checks": checks,
               "expected_probes": expected, "passed": all(checks.values())}
     if args.report:
         args.report.write_text(json.dumps(report, sort_keys=True, indent=2) + "\n")
@@ -269,6 +294,8 @@ def main() -> int:
     parity_parser = sub.add_parser("parity")
     parity_parser.add_argument("--rust-bin", type=Path,
                                default=Path("/usr/local/bin/zakura-watchdog"))
+    parity_parser.add_argument("--rust-backups", type=Path,
+                               default=Path("/var/backups/zakura-monitoring"))
     parity_parser.add_argument("--rust-env", type=Path, default=Path("/etc/zakura-watchdog/env"))
     parity_parser.add_argument("--env-file", type=Path,
                                default=Path("/etc/zakura-monitoring/compat.env"))

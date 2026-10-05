@@ -278,6 +278,8 @@ same explicit limit.
 - An SSH timeout or failure, a missing checker, or malformed, stale, oversized
   or mismatched output is a monitoring failure. It can open or continue an
   incident but never recovers one.
+- Checker outcomes must echo the requested height-drift limit exactly;
+  mismatches are monitoring failures and cannot recover an incident.
 - Messages name the host, check, predicate, peer count, heights, drift and
   observation time.
 - Incidents live in `compatibility`, probe telemetry in `compatibility_probes`
@@ -302,7 +304,9 @@ Regular mainnet deploys install the fleet watchdog as a versioned release under
 and its drop-ins (including the Mac comparison settings), state and every
 non-Slack env setting, and replace the webhook (env mode 600) only when the
 secret is provided. Once the lane is enabled they also refresh the checker on
-`zakura-compat`. Neither path retires the Rust watchdog.
+`zakura-compat` before activating the fleet release. A checker refresh failure
+fails deployment and leaves the existing fleet release and service unchanged.
+Neither path retires the Rust watchdog.
 
 `zakura-mainnet-deploy.yml` with `operation=monitoring`, `node=zakura-compat`
 and `ref=<full tested SHA>` runs one explicit stage of
@@ -324,12 +328,24 @@ rotate it only after independently verifying a host key change.
 | --- | --- |
 | `status` | Read-only summary of both hosts |
 | `install` | Checker release on `zakura-compat` (`/opt/zakura-monitoring`, activated, inert), env seeded from the Rust watchdog's checker settings, fleet release staged, host key pinned |
-| `validate` | Service-context probe, Rust/Python parity (`SENTRY_DSN` unset) and the shipped synthetic tests on both hosts |
+| `validate` | Service-context probe, Rust/Python parity (`SENTRY_DSN` unset, using a digest-verified archived Rust binary after retirement) and the shipped synthetic tests on both hosts |
 | `cutover` | Back up fleet state, activate the fleet release, enable the lane, restart only `zakura-fleet-watchdog`, wait for a passing live probe |
-| `soak` | 30-minute read-only record of probes, height advancement and service health |
+| `soak` | Observe probes, height advancement and service health for at least 30 minutes; persist successful evidence for this cutover |
 | `slack-test` | Opt-in: one labeled failure and recovery to `#zakura-alerts` from temporary state |
-| `finalize` | Requires both active releases to match the requested SHA and a fresh passing live probe; stops `zakura-watchdog` and moves its unit, binary and env to `/var/backups/zakura-monitoring/` |
+| `finalize` | Requires matching active release SHAs, a fresh passing live probe and recorded 30-minute soak success for this cutover; stops `zakura-watchdog` and moves its unit, binary and env to `/var/backups/zakura-monitoring/` |
 | `rollback` | Disables the lane, restores the previous fleet and checker releases, restores the Rust watchdog if finalized; nodes are untouched |
+
+Cutover starts a new acceptance generation in
+`/opt/zakura-fleet-watchdog/acceptance.json`, separate from incident state and
+pending deliveries. A successful soak records its release SHA and measured
+elapsed time. Missing, failed, shorter, or earlier-cutover evidence cannot
+qualify finalization. Repeating cutover invalidates previous acceptance proof.
+The standalone acceptance tool permits shorter observations for diagnostics;
+the deployment stage requires at least 1800 seconds. If the archived Rust
+reference is missing or its digest does not match, parity still fails.
+
+Monitoring dispatches cannot run the Mac source, build or operation jobs, even
+when an invalid Mac target is selected.
 
 Retirement aborts before moving artifacts if stopping the Rust service fails.
 Service reload or restart failures fail the workflow. Rollback retains its

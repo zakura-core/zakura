@@ -77,6 +77,7 @@
 //! | Every budget returns after any operation sequence | `cancelling_a_session_frees_every_budget`, `operation_sequences_keep_every_bound` |
 
 mod capacity;
+mod completion;
 mod lease;
 mod push;
 mod sink;
@@ -93,10 +94,11 @@ use std::{
 };
 
 use thiserror::Error;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 pub(crate) use capacity::{ServeCapacity, ServeConfigError, ServeLimits};
+pub(crate) use completion::{Completion, CompletionId, Completions};
 pub(crate) use lease::WorkLease;
 pub(crate) use push::{Push, PushPermit};
 pub(crate) use sink::{Responded, ResponseCap, ResponseSink, SinkError, SinkProgress};
@@ -170,7 +172,7 @@ struct Commitments {
 
 /// One open request. Dropping it releases the commitment.
 #[derive(Debug)]
-pub(super) struct Commitment(Option<Arc<Commitments>>, Option<watch::Sender<bool>>);
+pub(super) struct Commitment(Option<Arc<Commitments>>, Option<Completion>);
 
 impl Commitment {
     /// Publish and mark complete under the same lock. A receiver that has seen
@@ -179,14 +181,8 @@ impl Commitment {
         // Publishing can wake another thread that transmits the ending and admits
         // its replacement before send returns. A failed publication also ends this lease.
         self.release();
-        if let Some(completed) = &self.1 {
-            let mut result = None;
-            completed.send_modify(|done| {
-                let published = publish();
-                *done = published.is_ok();
-                result = Some(published);
-            });
-            result.expect("send_modify runs its closure before returning")
+        if let Some(completed) = &mut self.1 {
+            completed.queue_ending(publish)
         } else {
             publish()
         }
@@ -202,9 +198,6 @@ impl Commitment {
 impl Drop for Commitment {
     fn drop(&mut self) {
         self.release();
-        if let Some(completed) = &self.1 {
-            completed.send_if_modified(|done| !std::mem::replace(done, true));
-        }
     }
 }
 
@@ -313,22 +306,20 @@ impl<P: Produce> Serve<P> {
         self.admit_inner(request, None)
     }
 
-    /// Admit a request and observe when its ending is queued or it is cancelled.
-    /// Reading the watch value is synchronized with ending publication, so a
-    /// reactor can safely reject overlapping requests until completion.
+    /// Admit with a session-local completion lease, released at its ending or cancellation.
+    /// Drain the completion queue before checking whether a request key is still live.
     pub(crate) fn admit_tracked(
         &self,
         request: P::Request,
-    ) -> Result<watch::Receiver<bool>, ServeViolation> {
-        let (completed, receiver) = watch::channel(false);
-        self.admit_inner(request, Some(completed))?;
-        Ok(receiver)
+        completed: Completion,
+    ) -> Result<(), ServeViolation> {
+        self.admit_inner(request, Some(completed))
     }
 
     fn admit_inner(
         &self,
         request: P::Request,
-        completed: Option<watch::Sender<bool>>,
+        completed: Option<Completion>,
     ) -> Result<(), ServeViolation> {
         let open = self.commitments.open.fetch_add(1, Ordering::AcqRel) + 1;
         let commitment = Commitment(Some(self.commitments.clone()), completed);

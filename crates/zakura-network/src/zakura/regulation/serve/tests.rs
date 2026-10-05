@@ -714,17 +714,26 @@ async fn the_ending_frees_the_commitment_before_execution_ends() {
     let capacity = capacity(LIMITS);
     let session = session(&capacity, 1, 1);
     let hold = Arc::new(Semaphore::new(0));
-    let completed = session
+    let completed = Completions::default();
+    let completion = completed.track(1);
+    let id = completion.id();
+    session
         .serve
-        .admit_tracked(Job {
-            hold_after: Some(hold.clone()),
-            ..job()
-        })
+        .admit_tracked(
+            Job {
+                hold_after: Some(hold.clone()),
+                ..job()
+            },
+            completion,
+        )
         .unwrap();
     settle().await;
-    assert!(
-        *completed.borrow(),
-        "ending publication completes the tracked request before the producer exits"
+    let mut records = Vec::new();
+    completed.drain(|id| records.push(id));
+    assert_eq!(
+        records,
+        [id],
+        "the ending completes before the producer exits"
     );
     assert_eq!(session.serve.open(), 0);
     assert_eq!(capacity.node_execution_held(), 1);
@@ -808,8 +817,8 @@ fn ending_publication_frees_the_count_before_a_peer_can_replace_its_request() {
             open: AtomicU32::new(1),
             limit: AtomicU32::new(1),
         });
-        let (completed, receiver) = watch::channel(false);
-        let mut old = Commitment(Some(counts.clone()), tracked.then_some(completed));
+        let completed = Completions::default();
+        let mut old = Commitment(Some(counts.clone()), tracked.then(|| completed.track(1)));
         let replacement = old
             .queue_ending(|| {
                 // Publication can wake a writer on another thread before it returns.
@@ -818,7 +827,9 @@ fn ending_publication_frees_the_count_before_a_peer_can_replace_its_request() {
             })
             .unwrap();
         if tracked {
-            assert!(*receiver.borrow());
+            let mut records = Vec::new();
+            completed.drain(|id| records.push(id));
+            assert_eq!(records.len(), 1);
         }
         drop(old);
         assert_eq!(
@@ -963,21 +974,26 @@ async fn queued_requests_allocate_only_commitments_until_dispatch() {
         output: _output,
         cancel,
     } = session(&capacity, 1, COUNT / 2);
-    let (completions, allocations) = zakura_test::allocations::measure(|| {
-        (0..COUNT)
-            .map(|_| serve.admit_tracked(job()).unwrap())
-            .collect::<Vec<_>>()
+    let completions = Completions::default();
+    let (_, allocations) = zakura_test::allocations::measure(|| {
+        for key in 0..COUNT {
+            serve
+                .admit_tracked(job(), completions.track(u64::from(key)))
+                .unwrap();
+        }
     });
     assert_eq!(serve.open(), COUNT);
-    // Includes the queue, tracked completion watches and retained receivers.
+    // Includes queued jobs and completion leases without per-request channels.
     // A response channel per queued job alone used several KiB per request.
-    let ceiling = usize::try_from(COUNT).unwrap() * 512;
+    let ceiling = usize::try_from(COUNT).unwrap() * 160;
     assert!(allocations.retained_bytes < ceiling, "{allocations:?}");
     eprintln!("queued requests={COUNT}, {allocations:?}");
     cancel.cancel();
     settle().await;
     assert_eq!(serve.open(), 0, "cancelled jobs release their commitments");
-    assert!(completions.iter().all(|completed| *completed.borrow()));
+    let mut completed = 0;
+    completions.drain(|_| completed += 1);
+    assert_eq!(completed, COUNT);
 }
 
 #[tokio::test]

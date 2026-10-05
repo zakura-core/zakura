@@ -17,7 +17,7 @@ categories = ["asynchronous", "caching", "cryptography::cryptocurrencies"]
 [features]
 
 # Legacy flags accepted for build compatibility; the progress display is removed.
-progress-bar = []
+progress-bar = ["howudoin"]
 howudoin = []
 
 # Production features that activate extra dependencies, or extra features in dependencies

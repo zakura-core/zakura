@@ -22,7 +22,7 @@ categories = ["asynchronous", "cryptography::cryptocurrencies"]
 default = []
 
 # Legacy flags accepted for build compatibility; the progress display is removed.
-progress-bar = []
+progress-bar = ["howudoin", "zakura-state/progress-bar"]
 howudoin = []
 
 # Test-only features

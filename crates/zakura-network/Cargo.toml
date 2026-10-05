@@ -28,7 +28,7 @@ categories = ["asynchronous", "cryptography::cryptocurrencies", "encoding", "net
 default = []
 
 # Legacy flags accepted for build compatibility; the progress display is removed.
-progress-bar = []
+progress-bar = ["howudoin"]
 howudoin = []
 
 # Completion-based commit throughput for opt-in sync reports.

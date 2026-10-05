@@ -63,7 +63,7 @@ group = { workspace = true }
 incrementalmerkletree.workspace = true
 jubjub = { workspace = true }
 dirs = { workspace = true }
-rand_core = { workspace = true }
+rand_core = { workspace = true, features = ["getrandom"] }
 rand_chacha_10 = { workspace = true, optional = true }
 rand_core_10 = { workspace = true, optional = true }
 ripemd = { workspace = true }

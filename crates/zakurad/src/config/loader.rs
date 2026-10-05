@@ -1,6 +1,10 @@
 //! Load the node's TOML file and environment overrides.
 
-use std::{collections::BTreeMap, fs, path::PathBuf};
+use std::{
+    collections::{btree_map, BTreeMap},
+    fs,
+    path::PathBuf,
+};
 
 use serde::{
     de::{self, value::Error, IntoDeserializer, Visitor},
@@ -265,14 +269,10 @@ impl<'de> Deserializer<'de> for ConfigValue {
             Value::Float(value) => visitor.visit_f64(value),
             Value::String(value) => visitor.visit_string(value),
             Value::Nil => visitor.visit_unit(),
-            Value::Array(values) => visitor.visit_seq(de::value::SeqDeserializer::new(
-                values.into_iter().map(ConfigValue),
-            )),
-            Value::Table(values) => visitor.visit_map(de::value::MapDeserializer::new(
-                values
-                    .into_iter()
-                    .map(|(key, value)| (key, ConfigValue(value))),
-            )),
+            Value::Array(values) => {
+                visitor.visit_seq(ConfigSequence(values.into_iter().enumerate()))
+            }
+            Value::Table(values) => visitor.visit_map(ConfigMap::new(values)),
         }
     }
 
@@ -316,7 +316,6 @@ impl<'de> Deserializer<'de> for ConfigValue {
             Value::Boolean(value) => value.to_string(),
             Value::Integer(value) => value.to_string(),
             Value::Float(value) => value.to_string(),
-
             _ => return Err(de::Error::custom("expected a string")),
         };
         visitor.visit_string(value)
@@ -351,14 +350,8 @@ impl<'de> Deserializer<'de> for ConfigValue {
             Value::String(value) => value
                 .into_deserializer()
                 .deserialize_enum(name, variants, visitor),
-            Value::Table(values) => {
-                de::value::MapAccessDeserializer::new(de::value::MapDeserializer::new(
-                    values
-                        .into_iter()
-                        .map(|(key, value)| (key, ConfigValue(value))),
-                ))
-                .deserialize_enum(name, variants, visitor)
-            }
+            Value::Table(values) => de::value::MapAccessDeserializer::new(ConfigMap::new(values))
+                .deserialize_enum(name, variants, visitor),
             _ => Err(de::Error::custom("expected an enum string or table")),
         }
     }
@@ -366,5 +359,74 @@ impl<'de> Deserializer<'de> for ConfigValue {
     serde::forward_to_deserialize_any! {
         char bytes byte_buf seq map struct unit identifier ignored_any
         unit_struct tuple_struct tuple i128 u128
+    }
+}
+
+/// Add the field path to deserialization errors without another dependency.
+struct ConfigMap {
+    entries: btree_map::IntoIter<String, Value>,
+    next_value: Option<(String, Value)>,
+}
+
+impl ConfigMap {
+    fn new(values: BTreeMap<String, Value>) -> Self {
+        Self {
+            entries: values.into_iter(),
+            next_value: None,
+        }
+    }
+}
+
+impl<'de> de::MapAccess<'de> for ConfigMap {
+    type Error = Error;
+
+    fn next_key_seed<K: de::DeserializeSeed<'de>>(
+        &mut self,
+        seed: K,
+    ) -> Result<Option<K::Value>, Error> {
+        match self.entries.next() {
+            Some((key, value)) => {
+                let result = seed.deserialize(de::value::StrDeserializer::new(&key))?;
+                self.next_value = Some((key, value));
+                Ok(Some(result))
+            }
+            None => Ok(None),
+        }
+    }
+
+    fn next_value_seed<V: de::DeserializeSeed<'de>>(&mut self, seed: V) -> Result<V::Value, Error> {
+        let (key, value) = self
+            .next_value
+            .take()
+            .expect("a value follows a successfully read key");
+        seed.deserialize(ConfigValue(value))
+            .map_err(|error| de::Error::custom(format!("{key}: {error}")))
+    }
+
+    fn size_hint(&self) -> Option<usize> {
+        Some(self.entries.len())
+    }
+}
+
+struct ConfigSequence(std::iter::Enumerate<std::vec::IntoIter<Value>>);
+
+impl<'de> de::SeqAccess<'de> for ConfigSequence {
+    type Error = Error;
+
+    fn next_element_seed<T: de::DeserializeSeed<'de>>(
+        &mut self,
+        seed: T,
+    ) -> Result<Option<T::Value>, Error> {
+        self.0
+            .next()
+            .map(|(index, value)| {
+                seed.deserialize(ConfigValue(value))
+                    .map_err(|error| <Error as de::Error>::custom(format!("[{index}]: {error}")))
+            })
+            .transpose()
+    }
+
+    fn size_hint(&self) -> Option<usize> {
+        Some(self.0.len())
     }
 }

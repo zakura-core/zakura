@@ -590,3 +590,27 @@ fn config_env_array_index_and_dotted_path_override_file() {
     );
     assert_eq!(config.rpc.cookie_file_name, "dotted-cookie");
 }
+
+#[test]
+fn config_generated_file_roundtrip() {
+    let _env = EnvGuard::new();
+    let dir = TempDir::new().expect("create temp dir");
+    let path = dir.path().join("generated.toml");
+    let expected = ZakuradConfig::default();
+    fs::write(&path, toml::to_string(&expected).expect("serialize config")).expect("write config");
+    assert_eq!(
+        ZakuradConfig::load(Some(path)).expect("reload config"),
+        expected
+    );
+}
+
+#[test]
+fn config_invalid_values_report_the_field_path() {
+    let env = EnvGuard::new();
+    env.set_var("ZAKURA_RPC__LISTEN_ADDR", "invalid-address");
+    let error = ZakuradConfig::load(None)
+        .expect_err("reject invalid address")
+        .to_string();
+    assert!(error.contains("rpc"), "{error}");
+    assert!(error.contains("listen_addr"), "{error}");
+}

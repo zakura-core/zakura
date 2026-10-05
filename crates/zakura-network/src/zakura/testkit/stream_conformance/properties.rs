@@ -643,8 +643,11 @@ async fn close_progresses_with_wait<A: StreamConformance>(
         objects: credit.objects - one_page.objects,
         bytes: credit.bytes - one_page.bytes,
     });
+    if allowance_only && opening.is_none() {
+        return Ok(()); // This variant needs credit for an earlier and a blocked page.
+    }
     let pages = if allowance_only {
-        0
+        1
     } else {
         pages_within::<A>(&subscription, opening.unwrap_or(credit))?
     };
@@ -657,9 +660,32 @@ async fn close_progresses_with_wait<A: StreamConformance>(
     let session = victim.wait_session(&raw.id()).await?;
     let send = &session.sends[subscription.response_stream];
     let mut response_slots = Vec::new();
+
+    // Open, and read nothing.
+    raw.send(
+        subscription.stream,
+        &update(
+            UpdateOp::Open,
+            0,
+            if allowance_only {
+                one_page
+            } else {
+                opening.unwrap_or(credit)
+            },
+        )?,
+    )
+    .await?;
+    await_until(
+        "the victim pushes every page the credit covers",
+        CONFORMANCE_DEADLINE,
+        || u64::from(pages) == shared.pushed.load(Ordering::Relaxed),
+    )
+    .await?;
+
     if allowance_only {
         // Reserve every response slot, leaving one transport slot for the ending.
-        // No page may spend subscription credit while waiting for this allowance.
+        // An earlier page is already queued on QUIC. The next page must wait
+        // without spending credit, so Close can cancel it and follow the first.
         for _ in 0..send.max_capacity().saturating_sub(1).max(1) {
             response_slots.push(
                 send.reserve_response_guarded()
@@ -668,25 +694,6 @@ async fn close_progresses_with_wait<A: StreamConformance>(
             );
         }
     }
-
-    // Open, and read nothing.
-    raw.send(
-        subscription.stream,
-        &update(UpdateOp::Open, 0, opening.unwrap_or(credit))?,
-    )
-    .await?;
-    await_until(
-        "the victim pushes every page the credit covers",
-        CONFORMANCE_DEADLINE,
-        || {
-            if allowance_only {
-                shared.push_send_waits.load(Ordering::Relaxed) > 0
-            } else {
-                u64::from(pages) == shared.pushed.load(Ordering::Relaxed)
-            }
-        },
-    )
-    .await?;
 
     // Hold every execution slot and output byte. A grant makes the next page
     // wait for them.
@@ -698,7 +705,7 @@ async fn close_progresses_with_wait<A: StreamConformance>(
         .map(ServeCapacity::hold_node_for_test)
         .collect();
     let mut sequence = 1;
-    if opening.is_some() && !allowance_only {
+    if opening.is_some() {
         raw.send(
             subscription.stream,
             &update(UpdateOp::Grant, sequence, one_page)?,
@@ -706,7 +713,11 @@ async fn close_progresses_with_wait<A: StreamConformance>(
         .await?;
         sequence += 1;
         await_until("a page waits for capacity", CONFORMANCE_DEADLINE, || {
-            shared.push_waits.load(Ordering::Relaxed) >= 1
+            if allowance_only {
+                shared.push_send_waits.load(Ordering::Relaxed) > 0
+            } else {
+                shared.push_waits.load(Ordering::Relaxed) >= 1
+            }
         })
         .await?;
     }

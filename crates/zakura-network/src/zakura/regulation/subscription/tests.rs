@@ -1076,13 +1076,10 @@ async fn an_idle_subscription_holds_nothing_and_needs_no_outcome() {
 
     // One page, then an idle day with no page and no outcome.
     let permit = push.acquire(10).await;
-    publications.reserve_page(&1, 1, 10, 1).unwrap();
     let (send, mut recv) = framed_channel(4);
-    permit
-        .reserve_send(&send)
-        .await
-        .unwrap()
-        .send(frame(message_type::PAGE));
+    let slot = permit.reserve_send(&send).await.unwrap();
+    publications.reserve_page(&1, 1, 10, 1).unwrap();
+    slot.send(frame(message_type::PAGE));
     subscriptions.claim_page(&1, 1, 10, 1).unwrap();
     assert_eq!(
         subscriptions.claim_page(&1, 1, 1, 2),

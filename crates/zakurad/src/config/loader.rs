@@ -66,24 +66,23 @@ pub(super) fn load(
     path: Option<PathBuf>,
     env_prefixes: &[&str],
 ) -> Result<ZakuradConfig, BoxError> {
-    let mut values = match path {
-        Some(mut path) => {
-            if !path.is_file() {
-                path.as_mut_os_string().push(".toml");
-            }
-            let bytes = fs::read(&path).map_err(|source| LoadError::Read {
-                path: path.clone(),
-                source,
-            })?;
-            // Match the previous loader's BOM handling and UTF-8 replacement.
-            let text =
-                String::from_utf8_lossy(bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(&bytes));
-            let table = toml::from_str::<toml::Table>(&text)
-                .map_err(|source| LoadError::Parse { path, source })?;
-            Value::from(toml::Value::Table(table))
+    let mut values = Value::Table(BTreeMap::new());
+    if let Some(mut path) = path {
+        if !path.is_file() {
+            path.as_mut_os_string().push(".toml");
         }
-        None => Value::Table(BTreeMap::new()),
-    };
+        let bytes = fs::read(&path).map_err(|source| LoadError::Read {
+            path: path.clone(),
+            source,
+        })?;
+        // Match the previous loader's BOM handling and UTF-8 replacement.
+        let text = String::from_utf8_lossy(bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(&bytes));
+        let table = toml::from_str::<toml::Table>(&text)
+            .map_err(|source| LoadError::Parse { path, source })?;
+        for (key, value) in table {
+            insert_override(&mut values, &key, Value::from(value))?;
+        }
+    }
 
     for prefix in env_prefixes {
         let prefix_pattern = format!("{prefix}_");
@@ -117,9 +116,9 @@ pub(super) fn load(
     Ok(ZakuradConfig::deserialize(ConfigValue(values))?)
 }
 
-/// Insert a legacy environment path, including dotted keys and array indexes.
+/// Insert a legacy source path, including dotted keys and array indexes.
 fn insert_override(root: &mut Value, path: &str, value: Value) -> Result<(), BoxError> {
-    let invalid_path = || LoadError::Environment(format!("invalid environment config key: {path}"));
+    let invalid_path = || LoadError::Environment(format!("invalid configuration key: {path}"));
     let mut remaining = path;
     let mut current = root;
     loop {
@@ -141,7 +140,12 @@ fn insert_override(root: &mut Value, path: &str, value: Value) -> Result<(), Box
         remaining = rest;
         while let Some(index_text) = remaining.strip_prefix('[') {
             let (index_text, rest) = index_text.split_once(']').ok_or_else(invalid_path)?;
-            let index: isize = index_text.trim().parse().map_err(|_| invalid_path())?;
+            let index_text = index_text.trim_matches([' ', '\t']);
+            let digits = index_text.strip_prefix('-').unwrap_or(index_text);
+            if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+                return Err(invalid_path().into());
+            }
+            let index: isize = index_text.parse().map_err(|_| invalid_path())?;
             if !matches!(current, Value::Array(_)) {
                 *current = Value::Array(Vec::new());
             }
@@ -167,10 +171,27 @@ fn insert_override(root: &mut Value, path: &str, value: Value) -> Result<(), Box
             remaining = rest;
         }
         if remaining.is_empty() {
-            *current = value;
+            merge_value(current, value);
             return Ok(());
         }
         remaining = remaining.strip_prefix('.').ok_or_else(invalid_path)?;
+    }
+}
+
+/// Deep-merge source tables; scalar values and arrays replace the previous value.
+fn merge_value(current: &mut Value, value: Value) {
+    if let Value::Table(incoming) = value {
+        if !matches!(current, Value::Table(_)) {
+            *current = Value::Table(BTreeMap::new());
+        }
+        let Value::Table(table) = current else {
+            unreachable!()
+        };
+        for (key, value) in incoming {
+            merge_value(table.entry(key).or_insert(Value::Nil), value);
+        }
+    } else {
+        *current = value;
     }
 }
 
@@ -346,19 +367,76 @@ impl<'de> Deserializer<'de> for ConfigValue {
         variants: &'static [&'static str],
         visitor: V,
     ) -> Result<V::Value, Error> {
-        match self.0 {
-            Value::String(value) => value
-                .into_deserializer()
-                .deserialize_enum(name, variants, visitor),
-            Value::Table(values) => de::value::MapAccessDeserializer::new(ConfigMap::new(values))
-                .deserialize_enum(name, variants, visitor),
-            _ => Err(de::Error::custom("expected an enum string or table")),
+        let (variant, payload) = match self.0 {
+            Value::String(value) => (value, None),
+            Value::Table(mut values) if values.len() == 1 => {
+                let (variant, payload) = values.pop_first().expect("checked the single enum key");
+                (variant, Some(payload))
+            }
+            _ => {
+                return Err(de::Error::custom(format!(
+                    "enum {name} requires a string or a table with exactly one key"
+                )))
+            }
+        };
+        if !variants.contains(&variant.as_str()) {
+            return Err(de::Error::unknown_variant(&variant, variants));
         }
+        visitor.visit_enum(ConfigEnum { variant, payload })
     }
 
     serde::forward_to_deserialize_any! {
         char bytes byte_buf seq map struct unit identifier ignored_any
         unit_struct tuple_struct tuple i128 u128
+    }
+}
+
+/// Match config-rs's variant validation and unit-variant payload handling.
+struct ConfigEnum {
+    variant: String,
+    payload: Option<Value>,
+}
+
+impl<'de> de::EnumAccess<'de> for ConfigEnum {
+    type Error = Error;
+    type Variant = Self;
+
+    fn variant_seed<V: de::DeserializeSeed<'de>>(self, seed: V) -> Result<(V::Value, Self), Error> {
+        let variant = seed.deserialize(de::value::StrDeserializer::new(&self.variant))?;
+        Ok((variant, self))
+    }
+}
+
+impl ConfigEnum {
+    fn payload(self) -> Result<ConfigValue, Error> {
+        self.payload
+            .map(ConfigValue)
+            .ok_or_else(|| de::Error::custom("expected an enum payload"))
+    }
+}
+
+impl<'de> de::VariantAccess<'de> for ConfigEnum {
+    type Error = Error;
+
+    fn unit_variant(self) -> Result<(), Error> {
+        // Legacy config-rs accepts unit variants without inspecting the payload.
+        Ok(())
+    }
+
+    fn newtype_variant_seed<T: de::DeserializeSeed<'de>>(self, seed: T) -> Result<T::Value, Error> {
+        seed.deserialize(self.payload()?)
+    }
+
+    fn tuple_variant<V: Visitor<'de>>(self, _len: usize, visitor: V) -> Result<V::Value, Error> {
+        self.payload()?.deserialize_seq(visitor)
+    }
+
+    fn struct_variant<V: Visitor<'de>>(
+        self,
+        _fields: &'static [&'static str],
+        visitor: V,
+    ) -> Result<V::Value, Error> {
+        self.payload()?.deserialize_map(visitor)
     }
 }
 

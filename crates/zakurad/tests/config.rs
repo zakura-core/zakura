@@ -614,3 +614,35 @@ fn config_invalid_values_report_the_field_path() {
     assert!(error.contains("rpc"), "{error}");
     assert!(error.contains("listen_addr"), "{error}");
 }
+
+#[test]
+fn config_preserves_top_level_dotted_file_keys() {
+    let _env = EnvGuard::new();
+    let dir = TempDir::new().expect("create temp dir");
+    let path = dir.path().join("config.toml");
+    fs::write(
+        &path,
+        "\"rpc.listen_addr\" = \"127.0.0.1:8232\"\n[rpc]\ncookie_file_name = \"custom-cookie\"\n",
+    )
+    .expect("write config");
+    let config = ZakuradConfig::load(Some(path)).expect("load dotted file key");
+    assert_eq!(config.rpc.listen_addr.unwrap().port(), 8232);
+    assert_eq!(config.rpc.cookie_file_name, "custom-cookie");
+}
+
+#[test]
+fn config_preserves_legacy_enum_acceptance() {
+    let _env = EnvGuard::new();
+    let dir = TempDir::new().expect("create temp dir");
+    let path = dir.path().join("config.toml");
+    fs::write(&path, "[tracing.progress_bar]\nsummary = 123\n").expect("write config");
+    let config = ZakuradConfig::load(Some(path.clone())).expect("load unit enum table");
+    assert_eq!(config.tracing.progress_bar, Some(ProgressConfig::Summary));
+    for text in [
+        "[tracing]\nprogress_bar = \"typo\"\n",
+        "[tracing.progress_bar]\nsummary = 123\ndetailed = 123\n",
+    ] {
+        fs::write(&path, text).expect("write invalid config");
+        assert!(ZakuradConfig::load(Some(path.clone())).is_err());
+    }
+}

@@ -236,8 +236,9 @@ The stdlib-only package `zakura_monitoring/` is shared by both hosts:
 `zakura-compat-check` (and its thin wrapper `deploy/zcashd-compat/sync-check.sh`)
 checks, in order: a `zakurad .*--zcashd-compat` process, a `zcashd .*-connect`
 process, zcashd `getconnectioncount == 1`, and absolute zakurad/zcashd
-`getblockcount` drift `<= HEIGHT_MAX_DRIFT` (default 30, about 12 minutes at
-NU7's 25-second spacing). It reads the variables of the former shell check:
+`getblockcount` drift `<= HEIGHT_MAX_DRIFT` (default 10, as in the deployed Rust
+watchdog; `HEIGHT_MAX_DRIFT=30` gives the same ~12 minutes at NU7's 25-second
+spacing). It reads the variables of the former shell check:
 `ZAKURA_RPC_URL`, `ZAKURA_COOKIE_FILE`, `ZAKURA_RPC_CONF`, `ZAKURA_RPC_USER`,
 `ZAKURA_RPC_PASSWORD`, the `ZCASHD_*` equivalents, the process patterns,
 `HEIGHT_MAX_DRIFT`, `SYNC_CHECK_TIMEOUT` (600), `SYNC_CHECK_INTERVAL` (15) and
@@ -265,9 +266,9 @@ one worker thread, at most one probe in flight, and a 120-second hard timeout
 covering SSH and RPC. It uses root's SSH identity with `BatchMode=yes` and the
 host key pinned in `/etc/zakura-fleet-watchdog/known_hosts`. Fleet polls never
 wait for a probe; the main thread alone applies results and owns state.
-The lane passes `height_max_drift = 10` from that target, the effective limit of
-the Rust watchdog it replaces, so the checker's deploy-time default of 30 does
-not change monitoring. Validation runs parity with the same explicit limit.
+The lane passes `height_max_drift = 10` from that target explicitly, so a host
+env file cannot loosen monitoring unnoticed. Validation runs parity with the
+same explicit limit.
 
 - The first completed failure alerts immediately, including after a restart
   with no open incident. A persistent failure, whatever its predicate, is one

@@ -43,8 +43,8 @@ DEFAULT_KNOWN_HOSTS = "/etc/zakura-fleet-watchdog/known_hosts"
 DEFAULT_INTERVAL = 60.0
 MAX_PROBE_TIMEOUT = 120.0
 DEFAULT_REMOTE_DEADLINE = 100
-# The live Rust watchdog's effective limit; pinned here so the lane keeps it
-# whatever the checker's deploy-time default is.
+# The checker's default, also the deployed Rust watchdog's. The lane passes it
+# explicitly so a host env file cannot loosen monitoring unnoticed.
 DEFAULT_HEIGHT_MAX_DRIFT = 10
 MAX_OUTCOME_BYTES = 16 * 1024
 CLOCK_SKEW_SECONDS = 60.0

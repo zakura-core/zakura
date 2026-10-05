@@ -142,7 +142,7 @@ class PredicateParityTests(CheckerCase):
         self.assertEqual(outcome.predicate, "in_sync")
         self.assertEqual(
             outcome.details,
-            {"height_max_drift": 30, "zcashd_connections": 1, "zakura_height": 2_000_000,
+            {"height_max_drift": 10, "zcashd_connections": 1, "zakura_height": 2_000_000,
              "zcashd_height": 2_000_000, "height_drift": 0},
         )
 
@@ -178,12 +178,21 @@ class PredicateParityTests(CheckerCase):
                     if not passed:
                         self.assertEqual(outcome.predicate, "height_drift")
 
-    def test_default_drift_limit_is_current_main_value(self):
-        self.assertEqual(self.config().height_max_drift, 30)
+    def test_default_drift_limit_matches_the_deployed_watchdog(self):
+        self.assertEqual(self.config().height_max_drift, 10)
+        for drift, passed in ((9, True), (10, True), (11, False)):
+            for direction in (1, -1):
+                with self.subTest(drift=drift, direction=direction):
+                    self.healthy(zakura=1000 + direction * drift, zcashd=1000)
+                    self.assertEqual(self.cycle().passed, passed)
+
+    def test_explicit_override_of_thirty_is_supported(self):
         self.healthy(zakura=1030, zcashd=1000)
-        self.assertTrue(self.cycle().passed)
+        self.assertTrue(self.cycle(height_max_drift=30).passed)
         self.healthy(zakura=1000, zcashd=1031)
-        self.assertEqual(self.cycle().predicate, "height_drift")
+        self.assertEqual(self.cycle(height_max_drift=30).predicate, "height_drift")
+        values = compat.resolve_settings({}, {"HEIGHT_MAX_DRIFT": "30"}, {})
+        self.assertEqual(compat.build_config(values).height_max_drift, 30)
 
     def test_rpc_order_matches_canonical_check(self):
         self.zcashd.replies["getconnectioncount"] = {"result": None, "error": {"code": -1}}
@@ -333,7 +342,7 @@ class ConfigurationTests(unittest.TestCase):
         values = compat.resolve_settings({}, environ, {})
         self.assertEqual(values["zakura_cookie_file"], "")
         self.assertEqual(values["zakura_rpc_url"], "http://127.0.0.1:8232")
-        self.assertEqual(values["height_max_drift"], "30")
+        self.assertEqual(values["height_max_drift"], "10")
 
     def test_precedence_cli_environment_env_file(self):
         values = compat.resolve_settings(

@@ -119,8 +119,9 @@ SETTINGS: dict[str, Setting] = {
     "zcashd_rpc_password": Setting("ZCASHD_RPC_PASSWORD", "", secret=True),
     "zakurad_process_pattern": Setting("ZAKURAD_PROCESS_PATTERN", "zakurad .*--zcashd-compat"),
     "zcashd_process_pattern": Setting("ZCASHD_PROCESS_PATTERN", "zcashd .*-connect"),
-    # 30 blocks is about 12 minutes at NU7's 25-second spacing, the 10 blocks it was before.
-    "height_max_drift": Setting("HEIGHT_MAX_DRIFT", "30"),
+    # The deployed Rust watchdog's default. Set HEIGHT_MAX_DRIFT=30 for the same
+    # ~12 minutes at NU7's 25-second spacing.
+    "height_max_drift": Setting("HEIGHT_MAX_DRIFT", "10"),
     "sync_check_timeout": Setting("SYNC_CHECK_TIMEOUT", "600"),
     "sync_check_interval": Setting("SYNC_CHECK_INTERVAL", "15"),
     "rpc_timeout": Setting("WATCHDOG_RPC_TIMEOUT", "30"),

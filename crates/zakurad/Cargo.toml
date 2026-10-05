@@ -219,6 +219,8 @@ metrics = { workspace = true }
 
 dirs = { workspace = true }
 reqwest = { workspace = true, default-features = false, features = ["blocking", "rustls-no-provider"] }
+# Resolution constraint for transitive URL/DNS dependencies; no direct API use.
+idna_adapter = { workspace = true }
 sha2 = { workspace = true }
 tempfile = { workspace = true }
 flate2 = "1.1.9"

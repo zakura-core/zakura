@@ -118,10 +118,10 @@ impl ZakuradConfig {
     /// # Platform behavior
     ///
     /// Prefix matching is case-sensitive; field names are lowercased.
-    /// Environment path values are literal: quotes, whitespace and shell
-    /// expressions are not removed or expanded. Non-Unicode names are ignored,
-    /// as are values for unrelated variables. A matching configuration variable
-    /// with a non-Unicode value returns an error.
+    /// Environment values undergo legacy scalar coercions. Quotes and
+    /// whitespace are retained; home and shell variable expressions are not
+    /// expanded. Non-Unicode names and unrelated non-Unicode values are ignored.
+    /// A matching variable with a non-Unicode value returns an error.
     ///
     /// # Examples
     /// - `ZAKURA_NETWORK__NETWORK=Testnet` sets `network.network = "Testnet"`

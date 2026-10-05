@@ -21,7 +21,8 @@ categories = ["asynchronous", "cryptography::cryptocurrencies"]
 [features]
 default = []
 
-# Production features that activate extra dependencies, or extra features in dependencies
+# Legacy flag accepted for build compatibility; the progress display is removed.
+progress-bar = []
 
 # Test-only features
 internal-bench = []

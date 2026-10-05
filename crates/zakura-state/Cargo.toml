@@ -16,6 +16,9 @@ categories = ["asynchronous", "caching", "cryptography::cryptocurrencies"]
 
 [features]
 
+# Legacy flag accepted for build compatibility; the progress display is removed.
+progress-bar = []
+
 # Production features that activate extra dependencies, or extra features in dependencies
 
 # Exposes narrow internal hooks used by benchmarks.

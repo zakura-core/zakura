@@ -27,10 +27,11 @@ categories = ["asynchronous", "cryptography::cryptocurrencies", "encoding", "net
 [features]
 default = []
 
+# Legacy flag accepted for build compatibility; the progress display is removed.
+progress-bar = []
+
 # Completion-based commit throughput for opt-in sync reports.
 sync-metrics = []
-
-# Production features that activate extra dependencies, or extra features in dependencies
 
 # Testing features that activate extra dependencies
 header-fuzz = []

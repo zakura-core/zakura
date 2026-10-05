@@ -78,6 +78,9 @@ default-release-binaries = ["release_max_level_info", "prometheus", "opentelemet
 # Local builds use the compiler's target features for Pasta arithmetic.
 default = ["default-release-binaries"]
 
+# Legacy flag accepted for build compatibility; the progress display is removed.
+progress-bar = []
+
 # Disable x86-64 Pasta assembly for redistributable binaries.
 # Local builds can use BMI2+ADX when enabled by the Rust target.
 portable = ["dep:orchard", "orchard/portable"]

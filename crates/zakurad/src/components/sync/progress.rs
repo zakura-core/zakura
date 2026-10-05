@@ -306,7 +306,7 @@ pub async fn show_block_chain_progress(
             }
         }
 
-        tokio::time::sleep(min(LOG_INTERVAL, PROGRESS_BAR_INTERVAL)).await;
+        tokio::time::sleep(min(LOG_INTERVAL, PROGRESS_CHECK_INTERVAL)).await;
     }
 }
 

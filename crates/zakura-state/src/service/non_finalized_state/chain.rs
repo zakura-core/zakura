@@ -59,8 +59,6 @@ pub struct Chain {
 
     /// The internal state of this chain.
     inner: ChainInner,
-    // Diagnostics
-    //
 }
 
 /// Spending transaction id type when the `indexer` feature is selected.

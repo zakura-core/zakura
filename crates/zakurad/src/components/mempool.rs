@@ -957,8 +957,6 @@ impl Service<Request> for Mempool {
                             .map(|result| result.map_err(BoxError::from))
                             .collect();
 
-                    // We've added transactions to the queue
-
                     async move { Ok(Response::Queued(rsp)) }.boxed()
                 }
 

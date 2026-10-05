@@ -70,6 +70,9 @@ audit-as-crates-io = false
 [policy.zakura-utils]
 audit-as-crates-io = false
 
+[policy.zakura_mmr_tree]
+audit-as-crates-io = false
+
 [[exemptions.addchain]]
 version = "0.3.0"
 criteria = "safe-to-deploy"
@@ -83,6 +86,11 @@ criteria = "safe-to-deploy"
 version = "0.10.3"
 criteria = "safe-to-deploy"
 notes = "Audit hold: the documented plaintext bound of 2^36 bytes exceeds the 2^36 - 32 byte limit of NIST SP 800-38D section 5.2.1.1, and the cipher 0.4.4 counter helper checks remaining blocks with remainder instead of division, so oversized GCM input can wrap the counter. noq-proto uses this crate only for QUIC Retry integrity tags over empty plaintext, which cannot reach that bound. Upstream has corrected the length bound but no 0.10.x patch release exists as of 2026-09-08. Retain the exemption until a fixed release is adopted or the restricted use is certified explicitly."
+
+[[exemptions.alloca]]
+version = "0.4.0"
+criteria = "safe-to-run"
+notes = "Benchmark-only dependency added by Criterion 0.8.2 for stack-layout variation; pending audit."
 
 [[exemptions.async_io_stream]]
 version = "0.3.3"
@@ -106,6 +114,16 @@ criteria = "safe-to-deploy"
 [[exemptions.console-subscriber]]
 version = "0.4.1"
 criteria = "safe-to-deploy"
+
+[[exemptions.criterion]]
+version = "0.8.2"
+criteria = "safe-to-run"
+notes = "Benchmark framework upgrade from 0.5.1; pending audit of the new release."
+
+[[exemptions.criterion-plot]]
+version = "0.8.2"
+criteria = "safe-to-run"
+notes = "Benchmark-only plotting dependency upgraded with Criterion; pending audit."
 
 [[exemptions.crypto-common]]
 version = "0.2.0-rc.1"
@@ -235,6 +253,11 @@ notes = "Audit hold: the generated media_sub_types, media_sub_type_options and s
 [[exemptions.object]]
 version = "0.36.0"
 criteria = "safe-to-deploy"
+
+[[exemptions.page_size]]
+version = "0.6.0"
+criteria = "safe-to-run"
+notes = "Benchmark-only dependency added by Criterion 0.8.2 to bound stack-layout variation; pending audit."
 
 [[exemptions.papaya]]
 version = "0.2.5"

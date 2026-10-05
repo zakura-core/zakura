@@ -197,9 +197,6 @@ mod imp {
 
         zakura_chain::shutdown::set_shutting_down();
 
-        #[cfg(feature = "progress-bar")]
-        howudoin::disable();
-
         info!(
             // use target to remove 'imp' from output
             target: "zakurad::signal",
@@ -220,9 +217,6 @@ mod imp {
             .expect("listening for ctrl-c signal should never fail");
 
         zakura_chain::shutdown::set_shutting_down();
-
-        #[cfg(feature = "progress-bar")]
-        howudoin::disable();
 
         info!(
             // use target to remove 'imp' from output

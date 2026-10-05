@@ -277,7 +277,7 @@ impl Application for ZakuradApp {
                      You can generate a valid config by running \"zakurad generate\", \
                      and diff it against yours to examine any format inconsistencies."
                 );
-                // Convert config::ConfigError to FrameworkError using a generic IO error
+                // Report the configuration error through the framework.
                 let io_error = std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     format!("Configuration error: {}", e),
@@ -471,7 +471,6 @@ impl Application for ZakuradApp {
         } else {
             // Don't apply the configured filter for short-lived commands.
             tracing_config.filter = Some(default_filter.to_owned());
-            tracing_config.flamegraph = None;
         }
         components.push(Box::new(Tracing::new(
             &config.network.network,

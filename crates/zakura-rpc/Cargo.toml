@@ -42,7 +42,7 @@ proptest-impl = [
 
 
 [dependencies]
-chrono = { workspace = true, features = ["clock", "std"] }
+chrono = { workspace = true }
 futures = { workspace = true }
 
 jsonrpsee = { workspace = true, features = ["server"] }

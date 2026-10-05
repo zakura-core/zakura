@@ -61,9 +61,6 @@
 //!
 //! ### Metrics
 //!
-//! * configuring a `tracing.progress_bar`: shows key metrics in the terminal using progress bars,
-//!   and automatically configures Zakura to send logs to a file.
-//!   (The `progress-bar` feature is activated by default.)
 //! * `prometheus`: export metrics to prometheus.
 //!
 //! ### Tracing
@@ -74,7 +71,6 @@
 //! * `sentry`: enable Sentry reporting and tracing integration. Disabled by default, including
 //!   in release binaries. Build with `cargo build --release -p zakura --features sentry`, then
 //!   set `SENTRY_DSN` at runtime to enable reporting.
-//! * `flamegraph`: generate a flamegraph of tracing spans.
 //!
 //! Changing the traces that are collected:
 //! * `error-debug`: enable extra debugging in release builds.

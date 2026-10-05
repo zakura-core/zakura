@@ -604,6 +604,15 @@ fn pages_within<A: StreamConformance>(
 pub(crate) async fn close_progresses<A: StreamConformance>(
     layout: &'static [Stream],
 ) -> Result<(), BoxError> {
+    close_progresses_with_wait::<A>(layout, false).await?;
+    close_progresses_with_wait::<A>(layout, true).await
+}
+
+/// Exercise both grant exhaustion and response allowance exhaustion.
+async fn close_progresses_with_wait<A: StreamConformance>(
+    layout: &'static [Stream],
+    allowance_only: bool,
+) -> Result<(), BoxError> {
     let plan = LayoutPlan::new(layout);
     let Some(subscription) = plan.subscriptions.first().copied() else {
         return Ok(());
@@ -634,13 +643,31 @@ pub(crate) async fn close_progresses<A: StreamConformance>(
         objects: credit.objects - one_page.objects,
         bytes: credit.bytes - one_page.bytes,
     });
-    let pages = pages_within::<A>(&subscription, opening.unwrap_or(credit))?;
+    let pages = if allowance_only {
+        0
+    } else {
+        pages_within::<A>(&subscription, opening.unwrap_or(credit))?
+    };
     let seed = seeds(9, layout);
     let victim = LayoutNode::<A>::spawn(seed, layout).await?;
     let control = LayoutNode::<A>::spawn(seed + 1, layout).await?;
     victim.connect(&control).await?;
     let (mut raw, _) = raw_peer(&victim, layout, seed + 2).await?;
     let shared = victim.shared();
+    let session = victim.wait_session(&raw.id()).await?;
+    let send = &session.sends[subscription.response_stream];
+    let mut response_slots = Vec::new();
+    if allowance_only {
+        // Reserve every response slot, leaving one transport slot for the ending.
+        // No page may spend subscription credit while waiting for this allowance.
+        for _ in 0..send.max_capacity().saturating_sub(1).max(1) {
+            response_slots.push(
+                send.reserve_response_guarded()
+                    .await
+                    .map_err(|error| format!("response slot: {error:?}"))?,
+            );
+        }
+    }
 
     // Open, and read nothing.
     raw.send(
@@ -651,7 +678,13 @@ pub(crate) async fn close_progresses<A: StreamConformance>(
     await_until(
         "the victim pushes every page the credit covers",
         CONFORMANCE_DEADLINE,
-        || u64::from(pages) == shared.pushed.load(Ordering::Relaxed),
+        || {
+            if allowance_only {
+                shared.push_send_waits.load(Ordering::Relaxed) > 0
+            } else {
+                u64::from(pages) == shared.pushed.load(Ordering::Relaxed)
+            }
+        },
     )
     .await?;
 
@@ -661,10 +694,11 @@ pub(crate) async fn close_progresses<A: StreamConformance>(
         .serving
         .iter()
         .chain(&shared.pushing)
+        .filter(|_| !allowance_only)
         .map(ServeCapacity::hold_node_for_test)
         .collect();
     let mut sequence = 1;
-    if opening.is_some() {
+    if opening.is_some() && !allowance_only {
         raw.send(
             subscription.stream,
             &update(UpdateOp::Grant, sequence, one_page)?,
@@ -721,6 +755,7 @@ pub(crate) async fn close_progresses<A: StreamConformance>(
 
     // Serving resumes once capacity returns.
     drop(holds);
+    drop(response_slots);
     if let Some(request) = request {
         let exchange = read_ending::<A>(&mut raw, &request).await?;
         ensure(exchange == 9, || format!("request 9 ended as {exchange}"))?;

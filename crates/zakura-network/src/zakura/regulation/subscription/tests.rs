@@ -1078,7 +1078,11 @@ async fn an_idle_subscription_holds_nothing_and_needs_no_outcome() {
     let permit = push.acquire(10).await;
     publications.reserve_page(&1, 1, 10, 1).unwrap();
     let (send, mut recv) = framed_channel(4);
-    assert!(permit.send(&send, frame(message_type::PAGE)).await);
+    permit
+        .reserve_send(&send)
+        .await
+        .unwrap()
+        .send(frame(message_type::PAGE));
     subscriptions.claim_page(&1, 1, 10, 1).unwrap();
     assert_eq!(
         subscriptions.claim_page(&1, 1, 1, 2),
@@ -1214,9 +1218,13 @@ async fn pages_share_the_response_allowance_but_close_can_still_queue() {
     let push = capacity.push(&peer());
     let (send, mut recv) = framed_channel(2);
     let first = push.acquire(1).await;
-    assert!(first.send(&send, frame(message_type::PAGE)).await);
+    first
+        .reserve_send(&send)
+        .await
+        .unwrap()
+        .send(frame(message_type::PAGE));
     let next = push.acquire(1).await;
-    let mut page = Box::pin(next.send(&send, frame(message_type::PAGE)));
+    let mut page = Box::pin(next.reserve_send(&send));
     assert!(futures::poll!(&mut page).is_pending());
 
     let mut publications = Publications::<u8, u32>::new(limits(1));
@@ -1242,7 +1250,11 @@ async fn pushed_pages_keep_response_slots_until_transport_completion() {
     let push = capacity.push(&peer());
     let (send, mut recv) = framed_channel(4);
     let permit = push.acquire(1).await;
-    assert!(permit.send(&send, frame(message_type::PAGE)).await);
+    permit
+        .reserve_send(&send)
+        .await
+        .unwrap()
+        .send(frame(message_type::PAGE));
     drop(push);
     let replacement = capacity.push(&peer());
     assert_eq!(capacity.node_execution_held(), 0);

@@ -625,14 +625,22 @@ async fn publish(
             () = wake.notified() => continue,
             permit = push.acquire(len) => permit,
         };
+        let slot = tokio::select! {
+            () = cancel.cancelled() => return,
+            () = wake.notified() => continue,
+            slot = permit.reserve_send(&send) => match slot {
+                Ok(slot) => slot,
+                Err(_) => return,
+            },
+        };
         let reserved = watches
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .publications
             .reserve_page(&id, 1, len, height);
         // A stall means the watch changed while this page waited; retry.
-        if reserved.is_ok() && !permit.send(&send, frame).await {
-            return;
+        if reserved.is_ok() {
+            slot.send(frame);
         }
     }
 }

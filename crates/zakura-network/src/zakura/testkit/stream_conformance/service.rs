@@ -223,6 +223,8 @@ pub(crate) struct LayoutShared<A: StreamConformance> {
     pub(crate) pushed: AtomicU64,
     /// Pages that waited for capacity.
     pub(crate) push_waits: AtomicU64,
+    /// Pages waiting on the response allowance or transport queue.
+    pub(crate) push_send_waits: AtomicU64,
     /// Subscriptions this node ended, their outcomes queued.
     pub(crate) published_ended: AtomicU64,
     pub(crate) pool: ReservationPool,
@@ -315,6 +317,7 @@ impl<A: StreamConformance> LayoutService<A> {
                 pushing,
                 pushed: AtomicU64::new(0),
                 push_waits: AtomicU64::new(0),
+                push_send_waits: AtomicU64::new(0),
                 published_ended: AtomicU64::new(0),
                 pool,
                 handled: AtomicU64::new(0),
@@ -575,11 +578,24 @@ async fn publish<A: StreamConformance>(
                 }
             }
         };
-        // A stall means the subscription changed while the page waited.
-        if publisher.lock().reserve_page(&key, 1, len, cursor).is_ok() {
-            if !permit.send(&send, frame).await {
-                return;
+        let reserve_send = permit.reserve_send(&send);
+        tokio::pin!(reserve_send);
+        let slot = match futures::FutureExt::now_or_never(&mut reserve_send) {
+            Some(slot) => slot,
+            None => {
+                shared.push_send_waits.fetch_add(1, Ordering::Relaxed);
+                tokio::select! {
+                    () = cancel.cancelled() => return,
+                    () = publisher.wake.notified() => continue,
+                    slot = reserve_send => slot,
+                }
             }
+        };
+        let Ok(slot) = slot else { return };
+        // Commit credit only after every wait. A close during the wait must
+        // leave both the cursor and credit unchanged.
+        if publisher.lock().reserve_page(&key, 1, len, cursor).is_ok() {
+            slot.send(frame);
             shared.pushed.fetch_add(1, Ordering::Relaxed);
         }
     }

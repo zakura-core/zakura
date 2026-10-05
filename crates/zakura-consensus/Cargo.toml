@@ -21,8 +21,9 @@ categories = ["asynchronous", "cryptography::cryptocurrencies"]
 [features]
 default = []
 
-# Legacy flag accepted for build compatibility; the progress display is removed.
+# Legacy flags accepted for build compatibility; the progress display is removed.
 progress-bar = []
+howudoin = []
 
 # Test-only features
 internal-bench = []

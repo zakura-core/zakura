@@ -126,7 +126,6 @@ pub struct InnerConfig {
     /// If set to a path, write the tracing logs to that path.
     ///
     /// By default, logs are sent to the terminal standard output.
-    /// - Windows: `%LOCALAPPDATA%\zakura.log` or `C:\Users\%USERNAME%\AppData\Local\zakura.log`
     ///
     /// # Security
     ///

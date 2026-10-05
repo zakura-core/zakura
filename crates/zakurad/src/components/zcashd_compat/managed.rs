@@ -513,17 +513,9 @@ fn lock_file_is_older_than(lock_path: &Path, age: Duration) -> Result<bool, Repo
 
 #[cfg(unix)]
 fn process_is_running(pid: u32) -> bool {
-    use nix::{errno::Errno, sys::signal::kill, unistd::Pid};
-
-    let Ok(pid) = i32::try_from(pid) else {
-        return false;
-    };
-
-    match kill(Pid::from_raw(pid), None) {
+    match super::unix::signal_process(pid, 0) {
         Ok(()) => true,
-        Err(Errno::EPERM) => true,
-        Err(Errno::ESRCH) => false,
-        Err(_) => false,
+        Err(error) => error.raw_os_error() == Some(libc::EPERM),
     }
 }
 

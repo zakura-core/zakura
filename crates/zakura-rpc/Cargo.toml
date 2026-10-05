@@ -42,7 +42,7 @@ proptest-impl = [
 
 
 [dependencies]
-chrono = { workspace = true, features = ["clock", "std"] }
+chrono = { workspace = true }
 futures = { workspace = true }
 
 jsonrpsee = { workspace = true, features = ["server"] }
@@ -87,9 +87,6 @@ metrics = { workspace = true }
 
 hex = { workspace = true, features = ["serde"] }
 serde = { workspace = true, features = ["serde_derive"] }
-
-# For the `stop` RPC method.
-nix = { workspace = true, features = ["signal"] }
 
 # For openrpc
 schemars = { workspace = true }
@@ -149,3 +146,7 @@ zakura-test = { path = "../zakura-test", version = "3.0.0" }
 
 [lints]
 workspace = true
+
+# For the `stop` RPC method.
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }

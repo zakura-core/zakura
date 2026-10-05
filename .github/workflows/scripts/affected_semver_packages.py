@@ -12,7 +12,9 @@ import sys
 # Its command and configuration types can change without library SemVer bumps.
 # `zakura-quic` has no crates.io release yet, so it has no baseline to check
 # against. Remove it after its first publish.
-SEMVER_ENFORCEMENT_EXCLUSIONS = {"zakura", "zakura-quic"}
+# `zakura_mmr_tree` has no published baseline yet. Remove this exclusion after
+# its first crates.io release; its dependents remain checked.
+SEMVER_ENFORCEMENT_EXCLUSIONS = {"zakura", "zakura-quic", "zakura_mmr_tree"}
 
 
 def is_publishable(package):

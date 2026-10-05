@@ -5,7 +5,7 @@ use std::{
     io::Write,
 };
 
-use abscissa_core::{Component, FrameworkError, Shutdown};
+use abscissa_core::{Component, FrameworkError};
 
 use tokio::sync::watch;
 use tracing::{field::Visit, Level};
@@ -214,9 +214,6 @@ impl Tracing {
         #[cfg(feature = "journald")]
         let subscriber = subscriber.with(journaldlayer);
 
-        #[cfg(feature = "sentry")]
-        let subscriber = subscriber.with(crate::sentry::tracing_layer());
-
         // OpenTelemetry layer - zero overhead when config.opentelemetry_endpoint is None
         #[cfg(feature = "opentelemetry")]
         let (otel_layer, otel_provider, otel_resolved_config) = {
@@ -282,9 +279,6 @@ impl Tracing {
             }
         }
 
-        #[cfg(feature = "sentry")]
-        info!("installed sentry tracing layer");
-
         #[cfg(all(feature = "tokio-console", tokio_unstable))]
         info!(
             TRACING_STATIC_MAX_LEVEL = ?tracing::level_filters::STATIC_MAX_LEVEL,
@@ -309,27 +303,6 @@ impl Tracing {
             warn!(
                 "unable to activate OpenTelemetry tracing: \
                  enable the 'opentelemetry' feature when compiling zakurad",
-            );
-        }
-
-        // Write any progress reports sent by other tasks to the terminal
-        //
-        // TODO: move this to its own module?
-        #[cfg(feature = "progress-bar")]
-        if let Some(progress_bar_config) = config.progress_bar.as_ref() {
-            use howudoin::consumers::TermLine;
-            use std::time::Duration;
-
-            // Stops flickering during the initial sync.
-            const PROGRESS_BAR_DEBOUNCE: Duration = Duration::from_secs(2);
-
-            let terminal_consumer = TermLine::with_debounce(PROGRESS_BAR_DEBOUNCE);
-            howudoin::init(terminal_consumer);
-
-            info!(?progress_bar_config, "activated progress bars");
-        } else {
-            info!(
-                "set 'tracing.progress_bar =\"summary\"' in zakura.toml to activate progress bars"
             );
         }
 
@@ -367,20 +340,6 @@ impl<A: abscissa_core::Application> Component<A> for Tracing {
 
     fn version(&self) -> abscissa_core::Version {
         build_version()
-    }
-
-    fn before_shutdown(&self, _kind: Shutdown) -> Result<(), FrameworkError> {
-        #[cfg(feature = "progress-bar")]
-        howudoin::disable();
-
-        Ok(())
-    }
-}
-
-impl Drop for Tracing {
-    fn drop(&mut self) {
-        #[cfg(feature = "progress-bar")]
-        howudoin::disable();
     }
 }
 

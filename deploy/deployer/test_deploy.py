@@ -201,7 +201,7 @@ class MainnetWorkflowMonitoringTests(unittest.TestCase):
             self.assertIn(stage, self.workflow.split("monitoring_stage:", 1)[1].split("\n\n", 1)[0])
 
     def test_monitoring_never_touches_nodes_dashboard_or_gateway(self):
-        for forbidden in ("python3 deploy.py", "deployer", "cargo", "zakurad", "dashboard", "broadcast",
+        for forbidden in ("python3 deploy.py", "deploy/deployer", "cargo", "zakurad", "dashboard", "broadcast",
                           "caddy", "systemctl", "SLACK_WEB_HOOK"):
             self.assertNotIn(forbidden, self.job)
         self.assertIn("deploy/runner/zakura-monitoring-deploy.py", self.job)

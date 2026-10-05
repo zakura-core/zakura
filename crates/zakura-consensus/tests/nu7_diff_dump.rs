@@ -8,6 +8,7 @@
 //! ```
 
 use std::{
+    any::Any,
     collections::{BTreeMap, BTreeSet},
     io::Write,
     panic::{catch_unwind, AssertUnwindSafe},
@@ -92,17 +93,17 @@ fn esc(s: &str) -> String {
 
 /// Runs `f`, turning a panic into an `ERR:panic:` value.
 fn guard(f: impl FnOnce() -> String) -> String {
-    match catch_unwind(AssertUnwindSafe(f)) {
-        Ok(v) => v,
-        Err(e) => {
-            let msg = e
-                .downcast_ref::<String>()
-                .cloned()
-                .or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string()))
-                .unwrap_or_default();
-            format!("ERR:panic:{}", msg.chars().take(160).collect::<String>())
-        }
-    }
+    catch_unwind(AssertUnwindSafe(f)).unwrap_or_else(panic_value)
+}
+
+/// Formats a caught panic as an `ERR:panic:` value.
+fn panic_value(e: Box<dyn Any + Send>) -> String {
+    let msg = e
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string()))
+        .unwrap_or_default();
+    format!("ERR:panic:{}", msg.chars().take(160).collect::<String>())
 }
 
 /// Formats an amount in zatoshis.
@@ -255,7 +256,8 @@ fn expensive(net: &Network, h: Height) -> Vec<Rec> {
             key: b.to_string(),
             h: Some(h.0),
             v: guard(|| {
-                let bal = Amount::<NonNegative>::try_from(b).expect("valid balance");
+                let bal = Amount::<NonNegative>::try_from(b)
+                    .expect("NSM_BALANCES entries are between 0 and MAX_MONEY");
                 let with = match block_subsidy(h, net, Some(bal)) {
                     Ok(a) => a,
                     Err(e) => return format!("ERR:{e}"),
@@ -407,6 +409,7 @@ fn run_scenario(sc: &Scenario, net: &Network, out: &mut Vec<Rec>, notes: &mut Ve
     // ---- A. cheap change-point scan, chunked across threads.
     let chunk = 50_000u32;
     let chunks: Vec<(u32, u32)> = (lo..=hi)
+        // A u32 fits in usize on the 32- and 64-bit targets Zakura builds for.
         .step_by(chunk as usize)
         .map(|s| (s, (s + chunk - 1).min(hi)))
         .collect();
@@ -457,18 +460,27 @@ fn run_scenario(sc: &Scenario, net: &Network, out: &mut Vec<Rec>, notes: &mut Ve
     // ---- Address-period boundaries (only where a funding stream is active).
     let t1 = Instant::now();
     // Only inside funding stream height ranges: Regtest has no streams and a 6-block interval.
-    let stream_boundaries = |from: u32, to: u32| -> Vec<u32> {
+    let stream_boundaries = |from: u32, to: u32| -> Result<Vec<u32>, String> {
         let mut v = BTreeSet::new();
         for fs in net.all_funding_streams() {
             let s = fs.height_range().start.0.max(from);
             let e = fs.height_range().end.0.saturating_sub(1).min(to);
             if s < e {
-                v.extend(guard_vec(|| period_boundaries(net, s, e)));
+                v.extend(guard_vec(|| period_boundaries(net, s, e))?);
             }
         }
-        v.into_iter().collect::<Vec<u32>>()
+        Ok(v.into_iter().collect())
     };
-    let fs_boundaries: Vec<u32> = stream_boundaries(lo, hi);
+    // A failed scan is dumped as an error, which the comparison always counts as a difference.
+    let fs_boundaries: Vec<u32> = stream_boundaries(lo, hi).unwrap_or_else(|err| {
+        out.push(Rec {
+            q: "address_period_scan",
+            key: String::new(),
+            h: None,
+            v: err,
+        });
+        Vec::new()
+    });
     let boundaries = fs_boundaries.clone();
 
     // ---- Expensive heights.
@@ -496,6 +508,7 @@ fn run_scenario(sc: &Scenario, net: &Network, out: &mut Vec<Rec>, notes: &mut Ve
     }
     exp_heights.insert(lo);
     // The derived ZIP 234 reissuance start is not a cheap change point, so add it explicitly.
+    // A panic here is dumped by `nsm_reissuance_start_height` below.
     if let Some(s) = guard_opt(|| nsm_reissuance_height(net).map(|h| h.0)) {
         for h in [s.saturating_sub(1), s, s + 1] {
             if h >= lo && h <= hi {
@@ -573,6 +586,10 @@ fn run_scenario(sc: &Scenario, net: &Network, out: &mut Vec<Rec>, notes: &mut Ve
                 if r == FundingStreamReceiver::Deferred {
                     return "none".to_string();
                 }
+                let all_after_a = match &all_after_a {
+                    Ok(boundaries) => boundaries,
+                    Err(err) => return err.clone(),
+                };
                 let v: Vec<String> = all_after_a
                     .iter()
                     .copied()
@@ -598,7 +615,8 @@ fn run_scenario(sc: &Scenario, net: &Network, out: &mut Vec<Rec>, notes: &mut Ve
     // ---- C. Fee split.
     for h in [a - 1, a, a + 1] {
         for f in FEES {
-            let fee = Amount::<NonNegative>::try_from(f).expect("valid fee");
+            let fee = Amount::<NonNegative>::try_from(f)
+                .expect("FEES entries are between 0 and MAX_MONEY");
             let share = guard(|| amt(miner_fee_share(Height(h), net, fee)));
             let burn = match share.parse::<i64>() {
                 Ok(s) => (f - s).to_string(),
@@ -640,6 +658,7 @@ fn run_scenario(sc: &Scenario, net: &Network, out: &mut Vec<Rec>, notes: &mut Ve
             start,
             end,
             start_bits,
+            // `h % 12` is below 12, so these casts are lossless.
             |h| {
                 if h < a {
                     PRE[(h % 12) as usize]
@@ -664,6 +683,7 @@ fn run_scenario(sc: &Scenario, net: &Network, out: &mut Vec<Rec>, notes: &mut Ve
                 start,
                 end,
                 d2_bits,
+                // `h % 12` is below 12, so these casts are lossless.
                 |h| {
                     if h < a {
                         if (a - 100..a - 60).contains(&h) {
@@ -753,6 +773,7 @@ fn difficulty_chain(
                 bits.insert(h, start_bits);
                 continue;
             }
+            // The span is at most `MAX_POW_ADJUSTMENT_BLOCK_SPAN` (113) blocks.
             let span = pow_adjustment_block_span_for_height(net, Height(h)) as u32;
             let ctx: Vec<(CompactDifficulty, DateTime<Utc>)> = (h.saturating_sub(span)..h)
                 .rev()
@@ -816,9 +837,9 @@ fn guard_opt(f: impl FnOnce() -> Option<u32>) -> Option<u32> {
     catch_unwind(AssertUnwindSafe(f)).ok().flatten()
 }
 
-/// Runs `f`, turning a panic into an empty list.
-fn guard_vec(f: impl FnOnce() -> Vec<u32>) -> Vec<u32> {
-    catch_unwind(AssertUnwindSafe(f)).unwrap_or_default()
+/// Runs `f`, turning a panic into an `ERR:panic:` error.
+fn guard_vec(f: impl FnOnce() -> Vec<u32>) -> Result<Vec<u32>, String> {
+    catch_unwind(AssertUnwindSafe(f)).map_err(panic_value)
 }
 
 /// Writes the dump to `NU7_DIFF_OUT` and its timing notes to `NU7_DIFF_OUT.runlog`, limited

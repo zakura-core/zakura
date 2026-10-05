@@ -27,36 +27,41 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
+# Installed releases are reached through symlinks; import the package that
+# shipped with this script.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from zakura_monitoring import monitor, slack  # noqa: E402,F401 - tests patch slack limits
+from zakura_monitoring.delivery import deliver_pending, queue_transitions  # noqa: E402
+from zakura_monitoring.slack import (  # noqa: E402
+    bounded_text,
+    post_slack,
+    slack_dashboard_url,
+    slack_identity,
+    slack_plain_text,
+)
+from zakura_monitoring.state import load_state, save_state  # noqa: E402
+# Re-exported so tests and operators keep using this script as the facade.
+from zakura_monitoring.slack import (  # noqa: E402,F401
+    MAX_SLACK_MESSAGE_CHARS,
+    SLACK_TRUNCATION_MARKER,
+    post_slack_webhook,
+)
+from zakura_monitoring.state import STATE_VERSION  # noqa: E402,F401
+from zakura_monitoring.suppression import suppression_until  # noqa: E402
+
 
 DOWN_HEALTH = {"down", "rpc_error"}
-STATE_VERSION = 1
 MAC_NODE_NAME = "mac-os-cranelift"
 PROPAGATION_GRACE_SECONDS = 120
 MAX_DECISION_HISTORY = 16
 MAX_DECISION_ROWS = 64
-BATCH_SEPARATOR = "\n\n---\n\n"
 MAX_SHARED_DIAGNOSTIC_ROWS = 8
 MAX_NODE_DETAIL_CHARS = 512
 MAX_ALERT_NAME_CHARS = 128
 MAX_ALERT_STATUS_CHARS = 64
 MAX_BLOCK_HASH_CHARS = 64
-MAX_DASHBOARD_URL_CHARS = 2_048
 MAX_ALERT_ERROR_CHARS = 2_048
-MAX_SLACK_MESSAGE_CHARS = 35_000
-SLACK_ESSENTIAL_PREFIX_LINES = 3
-SLACK_TRUNCATION_MARKER = "[alert truncated]"
-SLACK_PLAIN_TEXT_TRANSLATION = str.maketrans(
-    {
-        "&": "＆",
-        "<": "‹",
-        ">": "›",
-        "*": "∗",
-        "_": "＿",
-        "~": "～",
-        "`": "ˋ",
-        "@": "＠",
-    }
-)
 STALL_PIPELINE_METRICS = (
     ("network tip", "sync_estimated_network_tip_height"),
     ("distance", "sync_estimated_distance_to_tip"),
@@ -215,42 +220,6 @@ def node_state_key(fleet_name: str, node_name: str) -> str:
     return f"{fleet_name}/{node_name}"
 
 
-def load_state(state_path: Path) -> dict[str, Any]:
-    if not state_path.exists():
-        return {
-            "version": STATE_VERSION,
-            "nodes": {},
-            "fleets": {},
-            "shared_stalls": {},
-        }
-
-    with state_path.open(encoding="utf-8") as state_file:
-        state = json.load(state_file)
-
-    if not isinstance(state, dict) or state.get("version") != STATE_VERSION:
-        return {
-            "version": STATE_VERSION,
-            "nodes": {},
-            "fleets": {},
-            "shared_stalls": {},
-        }
-
-    state.setdefault("nodes", {})
-    state.setdefault("fleets", {})
-    state.setdefault("shared_stalls", {})
-    state.setdefault("release_state", {})
-    return state
-
-
-def save_state(state_path: Path, state: dict[str, Any]) -> None:
-    state_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = state_path.with_suffix(f"{state_path.suffix}.tmp")
-    with tmp_path.open("w", encoding="utf-8") as state_file:
-        json.dump(state, state_file, indent=2, sort_keys=True)
-        state_file.write("\n")
-    tmp_path.replace(state_path)
-
-
 def fetch_json(url: str, timeout: float) -> dict[str, Any]:
     # A User-Agent is required, not cosmetic: the dashboard on loopback does not care,
     # but the public release-state origin sits behind an edge that answers urllib's
@@ -322,22 +291,6 @@ def named_metrics(
     return " | ".join(values)
 
 
-def bounded_text(value: object, limit: int) -> str:
-    return " ".join(str(value or "").split())[:limit]
-
-
-def slack_plain_text(value: object, limit: int) -> str:
-    return bounded_text(value, limit).translate(SLACK_PLAIN_TEXT_TRANSLATION)
-
-
-def slack_identity(value: object, limit: int, fallback: str) -> str:
-    return slack_plain_text(value or fallback, limit) or fallback
-
-
-def slack_dashboard_url(value: object) -> str:
-    return bounded_text(value, MAX_DASHBOARD_URL_CHARS)
-
-
 def slack_block_hash(value: object) -> str:
     block_hash = validated_block_hash(value)
     if block_hash is not None:
@@ -345,49 +298,6 @@ def slack_block_hash(value: object) -> str:
 
     preview = slack_plain_text(normalized_block_hash(value), MAX_BLOCK_HASH_CHARS)
     return f"invalid ({preview or 'missing'})"
-
-
-def bounded_slack_message(text: str) -> str:
-    if len(text) <= MAX_SLACK_MESSAGE_CHARS:
-        return text
-
-    lines = text.splitlines()
-    if len(lines) < 2:
-        keep = MAX_SLACK_MESSAGE_CHARS - len(SLACK_TRUNCATION_MARKER)
-        return text[:keep] + SLACK_TRUNCATION_MARKER
-
-    prefix_count = min(SLACK_ESSENTIAL_PREFIX_LINES, len(lines) - 1)
-    prefix = lines[:prefix_count]
-    middle = lines[prefix_count:-1]
-    suffix = lines[-1]
-    protected = [*prefix, SLACK_TRUNCATION_MARKER, suffix]
-    protected_length = sum(map(len, protected)) + len(protected) - 1
-    if protected_length > MAX_SLACK_MESSAGE_CHARS:
-        # Alert formatters bound protected fields before they reach this fallback.
-        # Keep both ends for direct callers that do not use an alert formatter.
-        available = MAX_SLACK_MESSAGE_CHARS - len(SLACK_TRUNCATION_MARKER) - 2
-        prefix_budget = max(0, available // 2)
-        suffix_budget = max(0, available - prefix_budget)
-        return "\n".join(
-            (
-                "\n".join(prefix)[:prefix_budget],
-                SLACK_TRUNCATION_MARKER,
-                suffix[:suffix_budget],
-            )
-        )
-
-    remaining = MAX_SLACK_MESSAGE_CHARS - protected_length
-    kept_middle = []
-    for line in middle:
-        added = len(line) + 1
-        if added > remaining:
-            break
-        kept_middle.append(line)
-        remaining -= added
-
-    return "\n".join(
-        (*prefix, *kept_middle, SLACK_TRUNCATION_MARKER, suffix)
-    )
 
 
 def alert_metrics(row: dict[str, Any]) -> tuple[dict[str, Any], bool | None]:
@@ -453,36 +363,6 @@ def node_diagnostic_lines(row: dict[str, Any]) -> list[str]:
     return lines
 
 
-def suppression_until(path: Path) -> float | None:
-    try:
-        raw = path.read_text(encoding="utf-8").strip()
-    except FileNotFoundError:
-        return None
-    except OSError as error:
-        print(f"warning: could not read suppression file {path}: {error}", file=sys.stderr)
-        return None
-
-    try:
-        return float(raw)
-    except ValueError:
-        print(f"warning: invalid suppression timestamp in {path}: {raw}", file=sys.stderr)
-        return None
-
-
-def slack_webhook_url() -> str:
-    """Return the configured incoming webhook URL for #zakura-alerts.
-
-    Bot tokens are intentionally unsupported: a token without channel
-    membership fails with `not_in_channel` and previously masked webhook
-    misconfiguration.
-    """
-    return (
-        os.environ.get("SLACK_WEB_HOOK", "")
-        or os.environ.get("SLACK_WEBHOOK_URL", "")
-        or os.environ.get("SLACK_WEBHOOK", "")
-    )
-
-
 def mac_recovery_ready(entry, now, good):
     """Require three distinct fresh good samples spanning a minute."""
     if not good:
@@ -496,51 +376,6 @@ def mac_recovery_ready(entry, now, good):
     sample["last"] = now
     sample["count"] += 1
     return sample["count"] >= 3 and now - sample["since"] >= 60
-
-
-def post_slack(text: str, args: argparse.Namespace) -> bool:
-    text = bounded_slack_message(text)
-    webhook = slack_webhook_url()
-    if args.dry_run:
-        print(f"dry-run Slack message:\n{text}\n")
-        return True
-
-    if not webhook:
-        print(
-            "SLACK_WEB_HOOK (or SLACK_WEBHOOK_URL / SLACK_WEBHOOK) is not set; "
-            f"cannot post:\n{text}\n",
-            file=sys.stderr,
-        )
-        return False
-
-    return post_slack_webhook(webhook, text, args)
-
-
-def post_slack_webhook(webhook: str, text: str, args: argparse.Namespace) -> bool:
-    text = bounded_slack_message(text)
-    payload = json.dumps({"text": text}).encode("utf-8")
-    request = urllib.request.Request(
-        webhook,
-        data=payload,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-
-    try:
-        with urllib.request.urlopen(request, timeout=args.slack_timeout) as response:
-            body = response.read().decode("utf-8", errors="replace").strip()
-    except (OSError, urllib.error.URLError) as error:
-        print(f"Slack webhook post failed: {error}", file=sys.stderr)
-        return False
-
-    if response.status < 200 or response.status >= 300 or body != "ok":
-        print(
-            f"Slack webhook post failed: status={response.status} body={body}",
-            file=sys.stderr,
-        )
-        return False
-
-    return True
 
 
 def node_condition(
@@ -1044,51 +879,6 @@ def release_state_recovery_text(target: ReleaseState, previous: dict[str, Any]) 
     )
 
 
-def batch_messages(messages: list[str], now: float) -> list[str]:
-    """Pack transitions without dropping incident summaries or exceeding Slack's cap."""
-    if not messages:
-        return []
-    observed_at = datetime.datetime.fromtimestamp(now, datetime.timezone.utc).isoformat()
-    prefix = f"*Fleet status updates* — observed {observed_at}\n\n"
-    # Keep detailed diagnostics for a single incident; a batch shows the essential
-    # lines for every event and links to the dashboard for the full node details.
-    events = []
-    for message in messages:
-        if len(messages) == 1:
-            events.append(message)
-            continue
-        lines = message.splitlines()
-        summary = lines[:SLACK_ESSENTIAL_PREFIX_LINES]
-        link = next(
-            (line for line in reversed(lines) if line.startswith(("dashboard:", "endpoint:"))),
-            "",
-        )
-        if link and link not in summary:
-            summary.append(link)
-        events.append("\n".join(summary))
-    chunks: list[str] = []
-    chunk = prefix
-    for event in events:
-        event = bounded_slack_message(event)
-        # An individual legacy message may already fill the limit. Keep it intact
-        # as a separate payload rather than cutting off another incident.
-        if len(prefix) + len(event) > MAX_SLACK_MESSAGE_CHARS:
-            if chunk != prefix:
-                chunks.append(chunk)
-                chunk = prefix
-            chunks.append(event)
-            continue
-        separator = BATCH_SEPARATOR if chunk != prefix else ""
-        if len(chunk) + len(separator) + len(event) > MAX_SLACK_MESSAGE_CHARS:
-            chunks.append(chunk)
-            chunk = prefix
-            separator = ""
-        chunk += separator + event
-    if chunk != prefix:
-        chunks.append(chunk)
-    return chunks
-
-
 def record_decision(
     state: dict[str, Any], fleet: Fleet, rows: list[dict[str, Any]],
     common: SharedTip | None, grace: set[str], now: float,
@@ -1183,11 +973,13 @@ class Watchdog:
         args: argparse.Namespace,
         release_state: list[ReleaseState] | None = None,
         checkpoint: Callable[[dict[str, Any]], None] | None = None,
+        compatibility: list[monitor.ProbeWorker] | None = None,
     ):
         self.notify = lambda text, args: post_slack(text, args)
         self.checkpoint = checkpoint or (lambda state: None)
         self.fleets = fleets
         self.release_state = release_state or []
+        self.compatibility = compatibility or []
         self.args = args
         self.started_at = time.time()
         self.fetch_recovered_at: dict[str, float] = {}
@@ -1210,9 +1002,9 @@ class Watchdog:
             finally:
                 self.notify = lambda text, args: post_slack(text, args)
             if messages or fleet.name in pending:
-                delivery = pending.setdefault(fleet.name, {"messages": [], "state": {}})
-                delivery["messages"].extend(batch_messages(messages, now))
-                delivery["state"] = candidate
+                queue_transitions(
+                    state, "pending_delivery", fleet.name, messages, candidate, now
+                )
                 if not suppressed:
                     self.deliver_batch(state, fleet)
             else:
@@ -1223,6 +1015,124 @@ class Watchdog:
 
         if getattr(self.args, "mac_comparison", None):
             self.handle_mac_comparison(state, now, suppressed)
+
+        # Fleet-wide deploy suppression deliberately does not reach this lane:
+        # only a zakurad-compat restart, reported by the probe, mutes it.
+        for worker in self.compatibility:
+            self.handle_compatibility(state, worker, time.time())
+
+    def handle_compatibility(
+        self, state: dict[str, Any], worker: monitor.ProbeWorker, now: float
+    ) -> None:
+        """Apply a completed compatibility probe through the durable delivery queue.
+
+        The probe itself runs on the worker thread; this never waits for it.
+        """
+        result = worker.poll()
+        name = worker.target.name
+        pending = state.setdefault(monitor.COMPAT_QUEUE, {})
+        if result is None and name not in pending:
+            return
+        bucket = {
+            name: copy.deepcopy(
+                pending[name]["state"] if name in pending
+                else state.get(monitor.COMPAT_STATE, {}).get(name, {})
+            )
+        }
+        messages: list[str] = []
+        if result is not None:
+            self.observe_compatibility(
+                state, bucket, worker.target, result, now,
+                lambda text, _args: (messages.append(text), True)[1],
+            )
+        if not messages and name not in pending:
+            state.setdefault(monitor.COMPAT_STATE, {})[name] = bucket[name]
+            return
+        queue_transitions(
+            state, monitor.COMPAT_QUEUE, name, messages, bucket[name], now,
+            title=monitor.COMPAT_BATCH_TITLE,
+        )
+        deliver_pending(
+            state,
+            monitor.COMPAT_QUEUE,
+            name,
+            post=lambda text: post_slack(text, self.args),
+            commit=lambda entry: state.setdefault(monitor.COMPAT_STATE, {}).__setitem__(
+                name, entry
+            ),
+            checkpoint=self.checkpoint,
+        )
+
+    def observe_compatibility(
+        self,
+        state: dict[str, Any],
+        bucket: dict[str, Any],
+        target: monitor.CompatTarget,
+        result: monitor.ProbeResult,
+        now: float,
+        notify: Callable[[str, argparse.Namespace], bool],
+    ) -> None:
+        """Advance the compatibility incident from one completed probe.
+
+        The first completed failure alerts at once; a persistent failure,
+        whatever its predicate, stays one incident; only a complete, valid pass
+        recovers it. While the host reports an active deployment marker, probes
+        keep running but no transition is planned, so a failure that outlives
+        the marker alerts on the first unsuppressed probe.
+        """
+        name = target.name
+        probes = state.setdefault(monitor.COMPAT_PROBES, {})
+        record = probes.setdefault(name, {})
+        record["last"] = monitor.probe_record(result, now)
+        record["completed"] = int(record.get("completed", 0)) + 1
+        if result.passed:
+            record["passed"] = int(record.get("passed", 0)) + 1
+            record["last_pass"] = record["last"]
+        if not result.valid:
+            record["unavailable"] = int(record.get("unavailable", 0)) + 1
+        if result.valid:
+            if result.suppressed_until is None:
+                record.pop("suppressed_until", None)
+            else:
+                record["suppressed_until"] = result.suppressed_until
+        # An unavailable probe cannot read the marker; keep honoring the last
+        # bounded window a valid probe reported, never extending it.
+        suppressed_until = coerce_float(record.get("suppressed_until"))
+        if suppressed_until is not None and suppressed_until > now:
+            print(
+                f"suppressed compatibility transition for {name}: "
+                f"{result.status} {result.predicate} until "
+                f"{monitor.iso_time(suppressed_until)}"
+            )
+            return
+        record.pop("suppressed_until", None)
+
+        previous = dict(bucket.get(name, {}))
+        condition = "ok" if result.passed else "failing"
+        bad_since = now
+        if condition == "failing" and previous.get("condition") == "failing":
+            bad_since = coerce_float(previous.get("bad_since")) or now
+        update_alert_state(
+            bucket,
+            name,
+            condition,
+            bad_since,
+            0.0,
+            monitor.alert_text(target, result),
+            monitor.recovery_text(target, result, previous),
+            now,
+            False,
+            self.args,
+            notify=notify,
+        )
+        entry = bucket[name]
+        if condition == "failing":
+            entry["predicate"] = (
+                previous.get("predicate")
+                if previous.get("condition") == "failing" and previous.get("predicate")
+                else result.predicate
+            )
+            entry["last_predicate"] = result.predicate
 
     def handle_mac_comparison(self, state, now, suppressed):
         """One bounded child isolates comparison I/O from the other alert lanes."""
@@ -1299,21 +1209,15 @@ class Watchdog:
             target.update(entries)
 
     def deliver_batch(self, state: dict[str, Any], fleet: Fleet) -> None:
-        """Send at most one payload per fleet per poll; commit after all chunks succeed.
-
-        Checkpoint the pending payload before sending, then checkpoint each
-        acknowledgement. A crash after Slack accepts a message but
-        before that checkpoint can still repeat it (webhooks have no receipt ID).
-        """
-        pending = state["pending_delivery"][fleet.name]
-        self.checkpoint(state)
-        if not post_slack(pending["messages"][0], self.args):
-            return
-        pending["messages"].pop(0)
-        if not pending["messages"]:
-            self.commit_fleet_state(state, fleet, pending["state"])
-            del state["pending_delivery"][fleet.name]
-        self.checkpoint(state)
+        """Send at most one payload per fleet per poll; commit after all chunks succeed."""
+        deliver_pending(
+            state,
+            "pending_delivery",
+            fleet.name,
+            post=lambda text: post_slack(text, self.args),
+            commit=lambda candidate: self.commit_fleet_state(state, fleet, candidate),
+            checkpoint=self.checkpoint,
+        )
 
     def observe_fleet(
         self, state: dict[str, Any], fleet: Fleet, now: float, suppressed: bool
@@ -2158,6 +2062,13 @@ def parse_args() -> argparse.Namespace:
                         default=Path("/var/lib/zakura-mac-cranelift-public/status.json"))
     parser.add_argument("--mac-comparison-alerts", action="store_true",
                         default=os.environ.get("ZAKURA_MAC_CRANELIFT_COMPARISON_ALERTS") == "1")
+    parser.add_argument(
+        "--compat-monitoring",
+        action="store_true",
+        default=os.environ.get(monitor.ENABLE_ENV) == "1",
+        help="probe the [[compatibility]] target over SSH (cutover sets "
+        f"{monitor.ENABLE_ENV}=1 through a systemd drop-in)",
+    )
     parser.add_argument("--once", action="store_true", help="poll once, update state, and exit")
     parser.add_argument("--dry-run", action="store_true", help="log Slack messages instead")
     return parser.parse_args()
@@ -2166,13 +2077,22 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     fleets = load_fleets(args.config)
+    compatibility = [
+        monitor.ProbeWorker(target)
+        for target in monitor.load_compatibility_targets(args.config)
+    ] if args.compat_monitoring else []
     watchdog = Watchdog(
         fleets, args, load_release_state(args.config),
         checkpoint=lambda state: save_state(args.state_file, state),
+        compatibility=compatibility,
     )
 
     while True:
         state = load_state(args.state_file)
+        if args.once:
+            # A one-shot run waits for its probe so the result is observable.
+            for worker in compatibility:
+                worker.wait(worker.target.timeout + monitor.OVERRUN_GRACE_SECONDS)
         watchdog.run_once(state)
         save_state(args.state_file, state)
 

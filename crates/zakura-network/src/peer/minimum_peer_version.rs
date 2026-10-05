@@ -84,6 +84,11 @@ where
     pub fn chain_tip(&self) -> &C {
         &self.chain_tip
     }
+
+    /// Returns the network whose upgrades set the minimum version.
+    pub(crate) fn network(&self) -> &Network {
+        &self.network
+    }
 }
 
 /// A custom [`Clone`] implementation to ensure that the first call to

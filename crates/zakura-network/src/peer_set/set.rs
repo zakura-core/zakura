@@ -127,7 +127,7 @@ use zakura_chain::{chain_tip::ChainTip, parameters::Network};
 use crate::{
     address_book::AddressMetrics,
     constants::MIN_PEER_SET_LOG_INTERVAL,
-    peer::{LoadTrackedClient, MinimumPeerVersion},
+    peer::{sidecar, LoadTrackedClient, MinimumPeerVersion},
     peer_set::{
         legacy_peer_trace::{LegacyPeerTrace, PeerTraceContext},
         stall_tracker::FindResponseStallTracker,
@@ -809,17 +809,29 @@ where
                         .iter()
                         .any(|ip| peer.is_inbound_direct_from_ip(ip))
                 {
-                    warn!(
-                        remote_version = ?peer.remote_version(),
-                        ?minimum_version,
-                        "disconnecting the protected zcashd-compat sidecar: a network upgrade \
-                         raised the minimum protocol version above its version, so its wallet \
-                         stops updating until it is upgraded",
-                    );
+                    sidecar::warn_upgrade_eviction(peer.remote_version(), minimum_version);
                 }
                 !outdated
             });
+
+            // A sidecar that supports the upgrade that just activated may not support the next.
+            // Busy sidecars are checked when they become ready again, in `push_ready`.
+            for peer in self.ready_services.values() {
+                if self.is_zcashd_compat_peer(peer) {
+                    self.check_sidecar_upgrade_readiness(peer);
+                }
+            }
         }
+    }
+
+    /// Checks whether the zcashd-compat sidecar `peer` supports the next network upgrade after
+    /// the current tip. See [`sidecar::check_upgrade_readiness`].
+    fn check_sidecar_upgrade_readiness(&self, peer: &D::Service) {
+        sidecar::check_upgrade_readiness(
+            self.minimum_peer_version.network(),
+            self.minimum_peer_version.chain_tip().best_tip_height(),
+            peer.remote_version(),
+        );
     }
 
     /// Takes a ready service by key.
@@ -887,9 +899,19 @@ where
             "missing or unexpected cancel handle"
         );
 
-        if svc.remote_version() >= self.minimum_peer_version.current() {
+        let minimum_version = self.minimum_peer_version.current();
+        let is_sidecar = self.is_zcashd_compat_peer(&svc);
+        if svc.remote_version() >= minimum_version {
+            if is_sidecar {
+                // Keeps the sidecar's readiness current as the tip crosses upgrades.
+                self.check_sidecar_upgrade_readiness(&svc);
+            }
             self.ready_services.insert(key, svc);
         } else {
+            // A sidecar that was busy when an upgrade raised the minimum version leaves here.
+            if is_sidecar {
+                sidecar::warn_upgrade_eviction(svc.remote_version(), minimum_version);
+            }
             std::mem::drop(svc);
         }
     }

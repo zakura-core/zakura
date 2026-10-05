@@ -934,6 +934,7 @@ where
     let min_version = minimum_peer_version.current();
     if remote.version < min_version {
         if is_protected_peer {
+            sidecar::set_next_upgrade_ready(false);
             if OBSOLETE_SIDECAR_WARNINGS.allow() {
                 warn!(
                     remote_ip = %addr_label,

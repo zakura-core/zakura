@@ -79,8 +79,25 @@ pub(crate) fn check_upgrade_readiness(
         None => true,
     };
 
-    metrics::gauge!("zcashd_compat.sidecar.next_upgrade_ready").set(if ready { 1.0 } else { 0.0 });
+    set_next_upgrade_ready(ready);
     ready
+}
+
+/// Sets the `zcashd_compat.sidecar.next_upgrade_ready` gauge.
+pub(crate) fn set_next_upgrade_ready(ready: bool) {
+    metrics::gauge!("zcashd_compat.sidecar.next_upgrade_ready").set(if ready { 1.0 } else { 0.0 });
+}
+
+/// Warns that the protected sidecar is being disconnected because a network upgrade raised
+/// the minimum protocol version above its `remote_version`, and marks it not ready.
+pub(crate) fn warn_upgrade_eviction(remote_version: Version, minimum_version: Version) {
+    set_next_upgrade_ready(false);
+    tracing::warn!(
+        ?remote_version,
+        ?minimum_version,
+        "disconnecting the protected zcashd-compat sidecar: a network upgrade raised the minimum \
+         protocol version above its version, so its wallet stops updating until it is upgraded",
+    );
 }
 
 #[cfg(test)]

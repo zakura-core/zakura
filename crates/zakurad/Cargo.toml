@@ -220,8 +220,6 @@ reqwest = { workspace = true, default-features = false, features = ["blocking", 
 idna_adapter = { workspace = true }
 sha2 = { workspace = true }
 tempfile = { workspace = true }
-flate2 = "1.1.9"
-tar = "0.4.46"
 
 # Health check server dependencies
 hyper = { workspace = true, features = ["server", "http1"] }

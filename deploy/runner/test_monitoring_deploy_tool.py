@@ -278,7 +278,8 @@ class GuardTests(DeployToolCase):
 
     def test_cutover_requires_the_installed_commit(self):
         ctx = self.context("cutover")
-        Recorder(ctx, compat_current="d" * 40)
+        Recorder(ctx)
+        ctx.remote_install = mock.Mock(side_effect=tool.StageError("validation absent"))
         with self.assertRaises(tool.StageError):
             tool.stage_cutover(ctx)
 
@@ -332,6 +333,81 @@ class GuardTests(DeployToolCase):
         self.assertEqual([install.current_release(root) for root in roots], ["d" * 40] * 2)
 
 
+class ValidationTests(DeployToolCase):
+    def test_install_stages_without_activating_live_checker(self):
+        ctx = self.context("install")
+        recorder = Recorder(ctx)
+        with mock.patch.object(tool, "install_compat") as compat, \
+                mock.patch.object(tool, "install_known_hosts"):
+            tool.stage_install(ctx)
+        compat.assert_called_once_with(ctx, activate=False)
+        self.assertNotIn(("local", "activate"), recorder.operations())
+
+    def test_validation_probes_staged_checker_and_persists_only_success(self):
+        for failed in range(-1, 4):
+            with self.subTest(failed=failed):
+                ctx = self.context("validate")
+                recorder = Recorder(ctx)
+                outcomes = [subprocess.CompletedProcess([], int(i == failed), b'{}', b'')
+                            for i in (0, 2, 3)]
+                ctx.remote_json = mock.Mock(return_value=(int(failed == 1), {}))
+                ctx.ssh = mock.Mock(return_value=outcomes[-1])
+                with mock.patch.object(tool.monitor, "load_compatibility_targets",
+                                       return_value=[tool.monitor.CompatTarget(
+                                           name=tool.COMPAT_NAME, ssh_target=tool.COMPAT_TARGET)]), \
+                        mock.patch.object(tool.subprocess, "run", side_effect=outcomes[:2]) as run:
+                    if failed >= 0:
+                        with self.assertRaises(tool.StageError):
+                            tool.stage_validate(ctx)
+                    else:
+                        tool.stage_validate(ctx)
+                command = run.call_args_list[0].args[0]
+                self.assertIn("--checker", command)
+                self.assertIn(f"{tool.COMPAT_ROOT}/releases/{SHA}/zakura-compat-check", command)
+                validations = [(kind, args) for kind, args, _ in recorder.calls
+                               if args[0] == "validation"]
+                self.assertEqual([args[args.index("--action") + 1] for _, args in validations],
+                                 ["begin", "begin"] + (["pass", "pass"] if failed == -1 else []))
+                self.assertNotIn(("remote", "activate"), recorder.operations())
+
+    def test_cutover_requires_both_receipts_before_mutating_either_host(self):
+        for host in ("local", "remote"):
+            ctx = self.context("cutover")
+            recorder = Recorder(ctx)
+            original = getattr(recorder, "local" if host == "local" else "remote_install")
+            def reject(*args, **kwargs):
+                if args[0] == "validation":
+                    raise tool.StageError("validation missing")
+                return original(*args, **kwargs)
+            setattr(ctx, "local" if host == "local" else "remote_install", reject)
+            with self.assertRaisesRegex(tool.StageError, "validation missing"):
+                tool.stage_cutover(ctx)
+            self.assertFalse(any(args[0] in ("activate", "backup-state", "enable-lane")
+                                 for _, args, _ in recorder.calls))
+
+    def test_validated_cutover_activates_both_releases(self):
+        ctx = self.context("cutover")
+        recorder = Recorder(ctx)
+        with mock.patch.object(tool, "last_probe", return_value={
+                "valid": True, "status": "pass", "completed_at": time.time() + 10}):
+            tool.stage_cutover(ctx)
+        operations = recorder.operations()
+        self.assertEqual(operations[:2], [("local", "validation"), ("remote", "validation")])
+        self.assertLess(operations.index(("remote", "activate")),
+                        operations.index(("local", "activate")))
+
+    def test_rollback_reports_unhealthy_fleet_and_still_restores_remote(self):
+        for state in ("failed", "inactive", "activating", ""):
+            ctx = self.context("rollback")
+            recorder = Recorder(ctx)
+            ctx.systemctl = lambda *args, **kwargs: state if args[0] == "is-active" else ""
+            with self.assertRaisesRegex(tool.StageError, "not active"):
+                tool.stage_rollback(ctx)
+            self.assertIn(("remote", "restore-rust"), recorder.operations())
+            self.assertIn(("remote", "rollback"), recorder.operations())
+
+
+
 class UploadTests(DeployToolCase):
     def test_upload_ignores_predictable_symlinks_and_uses_private_unique_paths(self):
         ctx = self.context("install")
@@ -361,6 +437,10 @@ class UploadTests(DeployToolCase):
         self.assertNotEqual(paths[0], paths[1])
         self.assertTrue(all(not path.parent.exists() for path in paths))
         self.assertIn(("remote", "stage"), recorder.operations())
+        recorder.calls.clear()
+        with mock.patch.object(tool, "REMOTE_STAGING", str(old)):
+            tool.install_compat(ctx, activate=False)
+        self.assertNotIn(("remote", "activate"), recorder.operations())
 
     def test_failed_stage_cleans_up_uploaded_directory(self):
         ctx = self.context("install")

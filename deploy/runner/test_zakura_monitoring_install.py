@@ -403,9 +403,83 @@ class RustWatchdogTests(InstallCase):
             with self.assertRaises(install.InstallError):
                 install.restore_rust(backups)
 
+    def test_partial_retirement_has_manifest_and_can_be_restored(self):
+        for fail_at in (1, 2, 3):
+            with self.subTest(fail_at=fail_at):
+                artifacts = self.artifacts()
+                backups = self.dir / f"backups-{fail_at}"
+                original_move = install.shutil.move
+                count = 0
+                def interrupted(source, destination):
+                    nonlocal count
+                    count += 1
+                    self.assertTrue(list(backups.glob("*/manifest.json")))
+                    if count == fail_at:
+                        raise OSError("interrupted move")
+                    return original_move(source, destination)
+                with mock.patch.object(install, "RUST_ARTIFACTS", artifacts), \
+                        mock.patch.object(install, "systemctl", return_value=
+                                          subprocess.CompletedProcess([], 0, "", "")):
+                    with mock.patch.object(install.shutil, "move", side_effect=interrupted):
+                        with self.assertRaises(OSError):
+                            install.retire_rust(backups)
+                    self.assertTrue(install.restore_rust(backups)["service_started"])
+                self.assertEqual([path.read_text() for path in artifacts], [p.name for p in artifacts])
+
     def test_retire_without_artifacts_is_a_no_op(self):
         with mock.patch.object(install, "RUST_ARTIFACTS", (self.dir / "absent",)):
             self.assertFalse(install.retire_rust(self.dir / "backups")["retired"])
+
+
+class ValidationReceiptTests(InstallCase):
+    def test_receipt_requires_complete_checks_for_the_verified_staged_release(self):
+        self.stage(SHA_A)
+        checks = dict.fromkeys(install.VALIDATION_CHECKS, True)
+        install.validation(self.root, SHA_A, "begin")
+        with self.assertRaises(install.InstallError):
+            install.validation(self.root, SHA_A, "require")
+        for bad in ({}, {**checks, "rust_python_parity": False},
+                    {**checks, "synthetic_fleet": 1}, {**checks, "extra": True}):
+            with self.assertRaises(install.InstallError):
+                install.validation(self.root, SHA_A, "pass", bad)
+        install.validation(self.root, SHA_A, "pass", checks)
+        self.assertEqual(install.validation(self.root, SHA_A, "require")["sha"], SHA_A)
+        self.assertIsNone(install.current_release(self.root))
+        install.validation(self.root, SHA_A, "begin")
+        with self.assertRaises(install.InstallError):
+            install.validation(self.root, SHA_A, "require")
+
+    def test_installed_validation_cli_and_malformed_receipts(self):
+        self.stage(SHA_A)
+        checks = dict.fromkeys(install.VALIDATION_CHECKS, True)
+        command = [sys.executable, "-I", str(self.root / "releases" / SHA_A / "zakura_monitoring/install.py"),
+                   "validation", "--root", str(self.root), "--sha", SHA_A]
+        for action in ("begin", "pass", "require"):
+            result = subprocess.run([*command, "--action", action, "--checks", json.dumps(checks)],
+                                    cwd="/", capture_output=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stdout)
+        path = self.root / "validation" / (SHA_A + ".json")
+        record = json.loads(path.read_text())
+        self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+        for bad in (None, {}, {**record, "sha": SHA_B},
+                    {**record, "manifest_sha256": "wrong"},
+                    {**record, "checks": dict.fromkeys(install.VALIDATION_CHECKS, 1)}):
+            path.write_text(json.dumps(bad))
+            with self.assertRaises(install.InstallError):
+                install.validation(self.root, SHA_A, "require")
+
+    def test_wrong_release_changed_files_and_missing_proof_are_rejected(self):
+        self.stage(SHA_A)
+        self.stage(SHA_B)
+        checks = dict.fromkeys(install.VALIDATION_CHECKS, True)
+        install.validation(self.root, SHA_A, "pass", checks)
+        with self.assertRaises(install.InstallError):
+            install.validation(self.root, SHA_B, "require")
+        release = self.root / "releases" / SHA_A
+        (release / "zakura-compat-check").write_text("changed code")
+        with self.assertRaises(install.InstallError):
+            install.validation(self.root, SHA_A, "require")
+
 
 
 class AcceptanceReceiptTests(InstallCase):
@@ -503,6 +577,20 @@ class AcceptanceToolTests(InstallCase):
                 redirect_stdout(io.StringIO()) as output:
             code = self.tool.parity(self.args)
         return code, json.loads(output.getvalue()), run
+
+    def test_probe_uses_explicit_staged_checker_without_changing_target_policy(self):
+        target = self.tool.monitor.CompatTarget(name="zakura-compat", ssh_target="root@example")
+        args = argparse.Namespace(config=Path("unused"), checker="/opt/releases/new/zakura-compat-check")
+        with mock.patch.object(self.tool.monitor, "load_compatibility_targets", return_value=[target]), \
+                mock.patch.object(self.tool.monitor, "ProbeWorker") as worker, \
+                redirect_stdout(io.StringIO()):
+            worker.return_value.wait.return_value = None
+            self.assertEqual(self.tool.probe(args), 3)
+        observed = worker.call_args.args[0]
+        self.assertEqual(observed.checker, args.checker)
+        self.assertEqual(observed.height_max_drift, target.height_max_drift)
+        self.assertEqual(observed.ssh_target, target.ssh_target)
+        self.assertNotEqual(target.checker, args.checker)
 
     def test_parity_uses_verified_retired_binary_after_finalization(self):
         self.args.rust_bin.write_text("reference executable")

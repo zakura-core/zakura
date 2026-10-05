@@ -487,6 +487,46 @@ def restore_state(backup: Path, state: Path) -> dict:
     return {"state_restored_from": str(backup)}
 
 
+VALIDATION_CHECKS = frozenset({
+    "service_context_probe", "rust_python_parity", "synthetic_fleet", "synthetic_compat",
+})
+
+
+def validation(root: Path, sha: str, action: str, checks: dict | None = None) -> dict:
+    """Bind successful pre-cutover checks to a verified staged release.
+
+    Begin removes earlier success; pass requires all four checks. Require
+    verifies the installed files again and rejects missing or stale evidence.
+    The receipt is outside the release and never changes incident state.
+    """
+    if not SHA.fullmatch(sha):
+        raise InstallError("validation commit must be a full SHA")
+    release = root / "releases" / sha
+    verify_release(release, sha)
+    digest = sha256_file(release / MANIFEST)
+    path = root / "validation" / (sha + ".json")
+    if action == "require":
+        try:
+            record = json.loads(path.read_text())
+        except (OSError, ValueError) as error:
+            raise InstallError("successful installed validation is required before cutover") from error
+        if (not isinstance(record, dict) or record.get("sha") != sha
+                or record.get("manifest_sha256") != digest
+                or not isinstance(record.get("checks"), dict)
+                or set(record["checks"]) != VALIDATION_CHECKS
+                or any(value is not True for value in record["checks"].values())):
+            raise InstallError("validation proof is missing, failed or stale")
+        return record
+    if action not in ("begin", "pass"):
+        raise InstallError("unknown validation operation")
+    if action == "pass" and (not isinstance(checks, dict)
+            or set(checks) != VALIDATION_CHECKS or any(v is not True for v in checks.values())):
+        raise InstallError("all installed validation checks must pass")
+    record = {"sha": sha, "manifest_sha256": digest, "checks": checks if action == "pass" else None}
+    atomic_write(path, (json.dumps(record, sort_keys=True) + "\n").encode(), 0o600)
+    return record
+
+
 SOAK_MIN_SECONDS = 1800
 SOAK_CHECKS = frozenset({
     "service_always_active", "probes_completed", "all_new_probes_passed",
@@ -580,18 +620,18 @@ def retire_rust(backup_root: Path) -> dict:
     checked_systemctl("disable", "--now", RUST_UNIT)
     backup = backup_root / f"rust-watchdog-{utc_stamp()}"
     backup.mkdir(mode=0o700, parents=True)
-    moved = {}
-    for path in present:
-        destination = backup / path.relative_to("/")
-        destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        digest = sha256_file(path)
-        shutil.move(str(path), destination)
-        moved[str(path)] = digest
+    # Journal the complete plan before the first destructive move. Restoration
+    # accepts matching originals for moves that had not happened yet.
+    moved = {str(path): sha256_file(path) for path in present}
     atomic_write(
         backup / "manifest.json",
         (json.dumps({"moved": moved, "at": time.time()}, sort_keys=True) + "\n").encode(),
         0o600,
     )
+    for path in present:
+        destination = backup / path.relative_to("/")
+        destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        shutil.move(str(path), destination)
     checked_systemctl("daemon-reload")
     return {"retired": True, "backup": str(backup), "moved": moved}
 
@@ -675,6 +715,11 @@ def main(argv: list[str] | None = None) -> int:
     for name in ("retire-rust", "restore-rust"):
         command = sub.add_parser(name)
         command.add_argument("--backup-root", type=Path, required=True)
+    validated = sub.add_parser("validation")
+    validated.add_argument("--root", type=Path, required=True)
+    validated.add_argument("--sha", required=True)
+    validated.add_argument("--action", choices=("begin", "pass", "require"), required=True)
+    validated.add_argument("--checks")
     accepted = sub.add_parser("acceptance")
     accepted.add_argument("--root", type=Path, required=True)
     accepted.add_argument("--sha", required=True)
@@ -709,6 +754,9 @@ def main(argv: list[str] | None = None) -> int:
             result = backup_state(args.state, args.directory)
         elif operation == "restore-state":
             result = restore_state(args.backup, args.state)
+        elif operation == "validation":
+            result = validation(args.root, args.sha, args.action,
+                                json.loads(args.checks) if args.checks else None)
         elif operation == "acceptance":
             evidence = json.load(sys.stdin) if args.action == "soak" else None
             result = acceptance(args.root, args.sha, args.action, args.generation, evidence)

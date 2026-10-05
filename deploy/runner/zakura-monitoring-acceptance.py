@@ -18,6 +18,7 @@ checker logs are never printed.
 from __future__ import annotations
 
 import argparse
+from dataclasses import replace
 import importlib.util
 import json
 import os
@@ -59,6 +60,8 @@ def probe(args: argparse.Namespace) -> int:
     if not targets:
         emit({"probe": "no [[compatibility]] target configured"})
         return 3
+    if getattr(args, "checker", None):
+        targets[0] = replace(targets[0], checker=args.checker)
     worker = monitor.ProbeWorker(targets[0])
     result = worker.wait(targets[0].timeout + monitor.OVERRUN_GRACE_SECONDS)
     emit({"target": targets[0].name, "ssh_target": targets[0].ssh_target,
@@ -291,6 +294,7 @@ def main() -> int:
     sub = parser.add_subparsers(dest="command", required=True)
     probe_parser = sub.add_parser("probe")
     probe_parser.add_argument("--config", type=Path, default=HERE / "fleet-watchdog.toml")
+    probe_parser.add_argument("--checker", help="Probe a staged checker without activating it")
     parity_parser = sub.add_parser("parity")
     parity_parser.add_argument("--rust-bin", type=Path,
                                default=Path("/usr/local/bin/zakura-watchdog"))

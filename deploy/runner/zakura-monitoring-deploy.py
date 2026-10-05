@@ -8,8 +8,8 @@ Used by ``.github/workflows/zakura-mainnet-deploy.yml``:
   the lane is enabled it also refreshes the checker on zakura-compat.
 - ``operation=monitoring`` stages, each run explicitly and in order:
 
-  ``install``   checker release on zakura-compat (activated; inert until
-                cutover) and fleet release on us-east-0 (staged only)
+  ``install``   checker release on zakura-compat (staged only until
+                validated cutover) and fleet release on us-east-0 (staged only)
   ``validate``  service-context SSH probe, Rust/Python parity and the shipped
                 synthetic tests from the installed paths on both hosts
   ``cutover``   back up fleet state, activate the fleet release, enable the
@@ -166,7 +166,7 @@ def validate_target(ctx: Context) -> None:
     ctx.record("target", {"name": COMPAT_NAME, "ssh_target": COMPAT_TARGET})
 
 
-def install_compat(ctx: Context) -> None:
+def install_compat(ctx: Context, *, activate: bool = True) -> None:
     package = build(ctx)
     upload = ctx.ssh(
         shlex.join(["python3", "-c", install.UPLOAD_SCRIPT, REMOTE_STAGING,
@@ -184,13 +184,18 @@ def install_compat(ctx: Context) -> None:
         ctx.record("compat stage", ctx.remote_install(
             "stage", "--root", str(COMPAT_ROOT), "--sha", ctx.sha,
             "--tarball", remote_tarball, "--digest", package["digest"]))
-        ctx.record("compat activate", ctx.remote_install(
-            "activate", "--root", str(COMPAT_ROOT), "--sha", ctx.sha))
+        if activate:
+            activate_compat(ctx)
         ctx.record("compat env", ctx.remote_install(
             "compat-env", "--release", f"{COMPAT_ROOT}/releases/{ctx.sha}",
             "--source", str(RUST_ENV), "--destination", str(COMPAT_ENV)))
     finally:
         ctx.ssh("rm -rf -- " + shlex.quote(str(Path(remote_tarball).parent)))
+
+
+def activate_compat(ctx: Context) -> None:
+    ctx.record("compat activate", ctx.remote_install(
+        "activate", "--root", str(COMPAT_ROOT), "--sha", ctx.sha))
 
 
 def install_known_hosts(ctx: Context) -> None:
@@ -271,7 +276,7 @@ def stage_fleet_deploy(ctx: Context) -> None:
 
 def stage_install(ctx: Context) -> None:
     validate_target(ctx)
-    install_compat(ctx)
+    install_compat(ctx, activate=False)
     stage_fleet(ctx)
     install_known_hosts(ctx)
 
@@ -279,16 +284,16 @@ def stage_install(ctx: Context) -> None:
 def stage_validate(ctx: Context) -> None:
     validate_target(ctx)
     failures = []
-    status = ctx.remote_install("status", "--root", str(COMPAT_ROOT))
-    ctx.record("compat release", status)
-    if status.get("current") != ctx.sha:
-        failures.append("compat current release is not the requested commit")
+    # Invalidate earlier success before any checks; both installed layouts must pass.
+    for runner, root in ((ctx.local, FLEET_ROOT), (ctx.remote_install, COMPAT_ROOT)):
+        runner("validation", "--root", str(root), "--sha", ctx.sha, "--action", "begin")
 
     release = FLEET_ROOT / "releases" / ctx.sha
     # The service runs as root with root's SSH identity and no agent.
     probe = ["env", "-u", "SSH_AUTH_SOCK", sys.executable, "-I",
              str(release / "zakura-monitoring-acceptance.py"), "probe",
-             "--config", str(release / "fleet-watchdog.toml")]
+             "--config", str(release / "fleet-watchdog.toml"),
+             "--checker", f"{COMPAT_ROOT}/releases/{ctx.sha}/zakura-compat-check"]
     if os.geteuid() != 0:
         probe = ["sudo", "-n", *probe]
     result = subprocess.run(probe, capture_output=True, timeout=200, check=False)
@@ -318,16 +323,21 @@ def stage_validate(ctx: Context) -> None:
             failures.append(f"{label} failed")
     if failures:
         raise StageError("; ".join(failures))
+    evidence = json.dumps(dict.fromkeys(install.VALIDATION_CHECKS, True))
+    for runner, root in ((ctx.local, FLEET_ROOT), (ctx.remote_install, COMPAT_ROOT)):
+        ctx.record("validated release", runner(
+            "validation", "--root", str(root), "--sha", ctx.sha,
+            "--action", "pass", "--checks", evidence))
 
 
 def stage_cutover(ctx: Context) -> None:
     validate_target(ctx)
-    if ctx.remote_install("status", "--root", str(COMPAT_ROOT)).get("current") != ctx.sha:
-        raise StageError("install and validate this commit on zakura-compat first")
-    if not (FLEET_ROOT / "releases" / ctx.sha).is_dir():
-        raise StageError("install this commit's fleet release first")
+    for runner, root in ((ctx.local, FLEET_ROOT), (ctx.remote_install, COMPAT_ROOT)):
+        ctx.record("validation proof", runner(
+            "validation", "--root", str(root), "--sha", ctx.sha, "--action", "require"))
     ctx.record("state backup", ctx.local(
         "backup-state", "--state", str(FLEET_STATE), "--directory", str(FLEET_BACKUPS)))
+    activate_compat(ctx)
     activate_fleet(ctx)
     ctx.record("acceptance begin", ctx.local(
         "acceptance", "--root", str(FLEET_ROOT), "--sha", ctx.sha, "--action", "begin"))
@@ -426,9 +436,15 @@ def stage_rollback(ctx: Context) -> None:
             ctx.local("restore-state", "--backup", ctx.args.restore_state,
                       "--state", str(FLEET_STATE)),
         )[1])
-    attempt("fleet service", lambda: (
-        ctx.systemctl("daemon-reload"), ctx.systemctl("restart", FLEET_UNIT),
-        ctx.systemctl("is-active", FLEET_UNIT, check=False))[2])
+    def restart_fleet():
+        ctx.systemctl("daemon-reload")
+        ctx.systemctl("restart", FLEET_UNIT)
+        service = ctx.systemctl("is-active", FLEET_UNIT)
+        if service != "active":
+            raise StageError("restored fleet watchdog is not active")
+        return service
+
+    attempt("fleet service", restart_fleet)
     attempt("rust watchdog", lambda: ctx.remote_install(
         "restore-rust", "--backup-root", str(RUST_BACKUPS)))
     attempt("compat release", lambda: ctx.remote_install("rollback", "--root", str(COMPAT_ROOT)))

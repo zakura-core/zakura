@@ -330,13 +330,23 @@ rotate it only after independently verifying a host key change.
 | Stage | Effect |
 | --- | --- |
 | `status` | Read-only summary of both hosts |
-| `install` | Checker release on `zakura-compat` (`/opt/zakura-monitoring`, activated, inert), env seeded from the Rust watchdog's checker settings, fleet release staged, host key pinned |
-| `validate` | Service-context probe, Rust/Python parity (`SENTRY_DSN` unset, using a digest-verified archived Rust binary after retirement) and the shipped synthetic tests on both hosts |
-| `cutover` | Back up fleet state, activate the fleet release, enable the lane, restart only `zakura-fleet-watchdog`, wait for a passing live probe |
+| `install` | Checker release on `zakura-compat` (`/opt/zakura-monitoring`, staged only), env seeded from the Rust watchdog's checker settings, fleet release staged, host key pinned |
+| `validate` | Service-context probe of the staged checker, Rust/Python parity (`SENTRY_DSN` unset, using a digest-verified archived Rust binary after retirement) and the shipped synthetic tests on both hosts; record successful validation |
+| `cutover` | Require validation for both staged releases, back up fleet state, activate both releases, enable the lane, restart only `zakura-fleet-watchdog`, wait for a passing live probe |
 | `soak` | Observe probes, height advancement and service health for at least 30 minutes; persist successful evidence for this cutover |
 | `slack-test` | Opt-in: one labeled failure and recovery to `#zakura-alerts` from temporary state |
 | `finalize` | Requires matching active release SHAs, a fresh passing live probe and recorded 30-minute soak success for this cutover; stops `zakura-watchdog` and moves its unit, binary and env to `/var/backups/zakura-monitoring/` |
 | `rollback` | Disables the lane, restores the previous fleet and checker releases, restores the Rust watchdog if finalized; nodes are untouched |
+
+Installation leaves both live release paths unchanged, including subsequent
+rollouts with the compatibility lane already enabled. Validation uses the staged
+checker path and records the four passing checks under each host's release root
+in `validation/<SHA>.json`, bound to the verified release manifest. Cutover
+rejects absent, failed, wrong-release or changed-file proof before activation.
+Rerunning validation invalidates previous success before checking again.
+Retirement writes the artifact manifest before the first move, so rollback can
+resume after interrupted retirement. Rollback also requires an active fleet
+watchdog and continues remote restoration even if that service check fails.
 
 Cutover starts a new acceptance generation in
 `/opt/zakura-fleet-watchdog/acceptance.json`, separate from incident state and

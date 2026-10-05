@@ -17,7 +17,7 @@ use crate::application::release_version;
 /// Projected to the end of October 1, 2026 UTC from the committed September 22
 /// release-state bundle at the Mainnet target spacing. With the 30-day support
 /// window, the first unsupported block is estimated at November 1, 00:00 UTC.
-pub const ESTIMATED_RELEASE_HEIGHT: u32 = 3_501_907;
+pub const ESTIMATED_RELEASE_HEIGHT: u32 = 3_509_301;
 
 /// The estimated number of blocks per day after Blossom.
 ///

@@ -277,7 +277,7 @@ impl Application for ZakuradApp {
                      You can generate a valid config by running \"zakurad generate\", \
                      and diff it against yours to examine any format inconsistencies."
                 );
-                // Convert config::ConfigError to FrameworkError using a generic IO error
+                // Report the configuration error through the framework.
                 let io_error = std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     format!("Configuration error: {}", e),

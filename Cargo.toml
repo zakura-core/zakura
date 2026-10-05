@@ -170,7 +170,6 @@ uint = "0.10"
 x25519-dalek = "2.0.1"
 zcash_note_encryption = "0.4.1"
 zcash_script = "0.4.5"
-config = { version = "0.15.14", default-features = false, features = ["toml"] }
 
 # All cargo-release configuration lives in this table. Do not add a root
 # release.toml: it would silently shadow every setting here (cargo-release

@@ -230,7 +230,6 @@ http-body-util = { workspace = true }
 hyper-util = { workspace = true, features = ["service", "server", "tokio"] }
 
 # Configuration management
-config = { workspace = true }
 
 nix = { workspace = true, features = ["fs"] }
 

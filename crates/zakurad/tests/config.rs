@@ -1,4 +1,4 @@
-//! Integration tests for config loading via config-rs.
+//! Integration tests for layered configuration loading.
 //!
 //! Verifies layered configuration (defaults, TOML file, env) and
 //! `ZAKURA_`-prefixed environment variable mappings used in Docker or
@@ -482,4 +482,111 @@ fn config_env_unknown_sensitive_key_errors() {
     assert!(result.is_err(), "Sensitive env key should cause an error");
     let msg = result.unwrap_err().to_string();
     assert!(msg.contains("sensitive key"), "error message: {}", msg);
+}
+
+#[test]
+fn config_preserves_legacy_scalar_conversions() {
+    let env = EnvGuard::new();
+    for (value, expected) in [
+        ("TRUE", true),
+        ("yes", true),
+        ("ON", true),
+        ("2.5", true),
+        ("false", false),
+        ("off", false),
+        ("NO", false),
+        ("0", false),
+    ] {
+        env.set_var("ZAKURA_TRACING__USE_COLOR", value);
+        let config = ZakuradConfig::load(None).expect("load legacy boolean");
+        assert_eq!(config.tracing.use_color, expected, "{value}");
+    }
+    for (value, expected) in [("23", 23), ("23.5", 24), ("-2.5", 0), ("yes", 1)] {
+        env.set_var("ZAKURA_TRACING__BUFFER_LIMIT", value);
+        let config = ZakuradConfig::load(None).expect("load legacy integer");
+        assert_eq!(config.tracing.buffer_limit, expected, "{value}");
+    }
+    for (value, expected) in [("123", "123"), ("TRUE", "true"), ("1.0", "1")] {
+        env.set_var("ZAKURA_RPC__COOKIE_FILE_NAME", value);
+        let config = ZakuradConfig::load(None).expect("load legacy string");
+        assert_eq!(config.rpc.cookie_file_name, expected);
+    }
+}
+
+#[test]
+fn config_preserves_file_scalar_conversions_and_bom() {
+    let _env = EnvGuard::new();
+    let dir = TempDir::new().expect("create temp dir");
+    let path = dir.path().join("config.toml");
+    fs::write(&path, "\u{feff}[tracing]\nuse_color = \"yes\"\nbuffer_limit = \"23\"\n[rpc]\ncookie_file_name = 123\n")
+        .expect("write config");
+    let config = ZakuradConfig::load(Some(path)).expect("load legacy file");
+    assert!(config.tracing.use_color);
+    assert_eq!(config.tracing.buffer_limit, 23);
+    assert_eq!(config.rpc.cookie_file_name, "123");
+}
+
+#[test]
+fn config_env_preserves_file_siblings() {
+    let env = EnvGuard::new();
+    let dir = TempDir::new().expect("create temp dir");
+    let path = dir.path().join("config.toml");
+    fs::write(
+        &path,
+        "[rpc]\nlisten_addr = \"127.0.0.1:8232\"\ncookie_file_name = \"custom-cookie\"\n",
+    )
+    .expect("write config");
+    env.set_var("ZAKURA_RPC__ENABLE_COOKIE_AUTH", "false");
+    let config = ZakuradConfig::load(Some(path)).expect("load merged config");
+    assert_eq!(config.rpc.listen_addr.unwrap().port(), 8232);
+    assert_eq!(config.rpc.cookie_file_name, "custom-cookie");
+    assert!(!config.rpc.enable_cookie_auth);
+}
+
+#[test]
+fn config_loads_path_without_extension() {
+    let _env = EnvGuard::new();
+    let dir = TempDir::new().expect("create temp dir");
+    let path = dir.path().join("config.toml");
+    fs::write(&path, "[tracing]\nuse_color = false\n").expect("write config");
+    let config = ZakuradConfig::load(Some(path.with_extension("")))
+        .expect("load config with inferred TOML extension");
+    assert!(!config.tracing.use_color);
+}
+
+#[test]
+fn config_rejects_negative_integer_and_narrow_overflow() {
+    let env = EnvGuard::new();
+    env.set_var("ZAKURA_TRACING__BUFFER_LIMIT", "-1");
+    assert!(ZakuradConfig::load(None).is_err());
+    env.set_var("ZAKURA_TRACING__BUFFER_LIMIT", "23");
+    env.set_var("ZAKURA_TRACING__OPENTELEMETRY_SAMPLE_PERCENT", "256");
+    assert!(ZakuradConfig::load(None).is_err());
+}
+
+#[test]
+fn config_env_array_index_and_dotted_path_override_file() {
+    let env = EnvGuard::new();
+    let dir = TempDir::new().expect("create temp dir");
+    let path = dir.path().join("config.toml");
+    fs::write(
+        &path,
+        "[network]\ninitial_mainnet_peers = [\"first.example:8233\", \"last.example:8233\"]\n",
+    )
+    .expect("write config");
+    env.set_var(
+        "ZAKURA_NETWORK__INITIAL_MAINNET_PEERS[-1]",
+        "changed.example:8233",
+    );
+    env.set_var("ZAKURA_RPC.COOKIE_FILE_NAME", "dotted-cookie");
+    let config = ZakuradConfig::load(Some(path)).expect("load indexed environment override");
+    assert_eq!(
+        config
+            .network
+            .initial_mainnet_peers
+            .into_iter()
+            .collect::<Vec<_>>(),
+        ["first.example:8233", "changed.example:8233"]
+    );
+    assert_eq!(config.rpc.cookie_file_name, "dotted-cookie");
 }

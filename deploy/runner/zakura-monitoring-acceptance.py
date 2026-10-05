@@ -76,6 +76,8 @@ def parity(args: argparse.Namespace) -> int:
             # Only checker settings: SENTRY_* and anything else are dropped.
             shared.update(compat.read_env_file(path))
     shared["SYNC_CHECK_TIMEOUT"] = str(args.timeout)
+    # Both checks get the lane's limit explicitly, so binary defaults cannot differ.
+    shared["HEIGHT_MAX_DRIFT"] = str(args.height_max_drift)
     environment = {"PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
                    "HOME": os.environ.get("HOME", "/root"), **shared}
     assert "SENTRY_DSN" not in environment
@@ -270,6 +272,8 @@ def main() -> int:
     parity_parser.add_argument("--env-file", type=Path,
                                default=Path("/etc/zakura-monitoring/compat.env"))
     parity_parser.add_argument("--timeout", type=int, default=60)
+    parity_parser.add_argument("--height-max-drift", type=int,
+                               default=monitor.DEFAULT_HEIGHT_MAX_DRIFT)
     synthetic_parser = sub.add_parser("synthetic")
     synthetic_parser.add_argument("--timeout", type=int, default=900)
     soak_parser = sub.add_parser("soak")

@@ -43,6 +43,9 @@ DEFAULT_KNOWN_HOSTS = "/etc/zakura-fleet-watchdog/known_hosts"
 DEFAULT_INTERVAL = 60.0
 MAX_PROBE_TIMEOUT = 120.0
 DEFAULT_REMOTE_DEADLINE = 100
+# The live Rust watchdog's effective limit; pinned here so the lane keeps it
+# whatever the checker's deploy-time default is.
+DEFAULT_HEIGHT_MAX_DRIFT = 10
 MAX_OUTCOME_BYTES = 16 * 1024
 CLOCK_SKEW_SECONDS = 60.0
 OVERRUN_GRACE_SECONDS = 15.0
@@ -85,6 +88,7 @@ class CompatTarget:
     interval: float = DEFAULT_INTERVAL
     timeout: float = MAX_PROBE_TIMEOUT
     remote_deadline: int = DEFAULT_REMOTE_DEADLINE
+    height_max_drift: int = DEFAULT_HEIGHT_MAX_DRIFT
 
 
 def load_compatibility_targets(config_path: Path) -> list[CompatTarget]:
@@ -99,7 +103,7 @@ def load_compatibility_targets(config_path: Path) -> list[CompatTarget]:
     raw = raw_targets[0]
     allowed = {
         "name", "ssh_target", "checker", "env_file", "known_hosts", "identity_file",
-        "interval", "timeout", "remote_deadline",
+        "interval", "timeout", "remote_deadline", "height_max_drift",
     }
     unknown = sorted(set(raw) - allowed)
     if unknown:
@@ -125,6 +129,9 @@ def load_compatibility_targets(config_path: Path) -> list[CompatTarget]:
         raise SystemExit("compatibility timeout must be in (0, 120] seconds")
     if not 0 < remote_deadline < timeout:
         raise SystemExit("compatibility remote_deadline must be shorter than timeout")
+    height_max_drift = raw.get("height_max_drift", DEFAULT_HEIGHT_MAX_DRIFT)
+    if type(height_max_drift) is not int or height_max_drift < 0:
+        raise SystemExit("compatibility height_max_drift must be a non-negative integer")
 
     def optional_path(key: str, default: str | None) -> Path | None:
         value = raw.get(key, default)
@@ -141,6 +148,7 @@ def load_compatibility_targets(config_path: Path) -> list[CompatTarget]:
             interval=interval,
             timeout=timeout,
             remote_deadline=remote_deadline,
+            height_max_drift=height_max_drift,
         )
     ]
 
@@ -319,6 +327,7 @@ class ProbeWorker:
             "python3", "-I", self.target.checker, "probe",
             "--env-file", self.target.env_file,
             "--deadline", str(self.target.remote_deadline),
+            "--height-max-drift", str(self.target.height_max_drift),
             "--nonce", nonce,
         ]
         return remote.ssh_command(

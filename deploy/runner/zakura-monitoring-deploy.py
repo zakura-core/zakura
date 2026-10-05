@@ -295,9 +295,10 @@ def stage_validate(ctx: Context) -> None:
     if result.returncode != 0:
         failures.append("service-context probe did not pass")
 
+    lane = monitor.load_compatibility_targets(release / "fleet-watchdog.toml")[0]
     code, parity = ctx.remote_json(
         ["python3", "-I", f"{COMPAT_ROOT}/releases/{ctx.sha}/zakura-monitoring-acceptance.py",
-         "parity"], timeout=400)
+         "parity", "--height-max-drift", str(lane.height_max_drift)], timeout=400)
     ctx.record("rust/python parity", parity)
     if code != 0:
         failures.append("Rust/Python parity did not agree on a healthy check")

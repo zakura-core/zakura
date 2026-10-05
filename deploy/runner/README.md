@@ -265,6 +265,9 @@ one worker thread, at most one probe in flight, and a 120-second hard timeout
 covering SSH and RPC. It uses root's SSH identity with `BatchMode=yes` and the
 host key pinned in `/etc/zakura-fleet-watchdog/known_hosts`. Fleet polls never
 wait for a probe; the main thread alone applies results and owns state.
+The lane passes `height_max_drift = 10` from that target, the effective limit of
+the Rust watchdog it replaces, so the checker's deploy-time default of 30 does
+not change monitoring. Validation runs parity with the same explicit limit.
 
 - The first completed failure alerts immediately, including after a restart
   with no open incident. A persistent failure, whatever its predicate, is one

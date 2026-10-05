@@ -266,6 +266,39 @@ class DeliveryTests(LaneCase):
 
 
 class NamespaceTests(LaneCase):
+    def test_unknown_buckets_such_as_pagerduty_survive_every_lane(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.json"
+            live = {
+                "version": 1, "nodes": {}, "fleets": {}, "shared_stalls": {},
+                "release_state": {}, "decisions": {}, "propagation": {}, "mac_forks": {},
+                "mac_comparison": {"mainnet": {"condition": "ok", "alerting": False}},
+                "pending_delivery": {},
+                "pagerduty": {"incidents": {"mainnet/node-a": {"dedup_key": "k1"}}},
+                "future_bucket": [1, 2, 3],
+            }
+            path.write_text(json.dumps(live))
+            fleet = watchdog.Fleet("mainnet", "http://127.0.0.1:9/data", "http://127.0.0.1:9/")
+            self.agent = self.make_agent(fleets=[fleet])
+            self.agent.args = argparse.Namespace(**{
+                **vars(make_args()), "down_after": 600.0, "stalled_after": 600.0,
+                "shared_stalled_after": 1800.0, "starting_grace": 120.0,
+                "dashboard_down_after": 600.0, "request_timeout": 1.0})
+            snapshot = {"rows": [{"name": "node-a", "health": "healthy", "height": 1,
+                                  "block_hash": "ab", "seconds_since_advanced": 1}]}
+            for result in (failing(), passing(at=NOW + 60)):
+                state = state_module.load_state(path)
+                self.worker.results.append(result)
+                with mock.patch.object(watchdog, "fetch_json", return_value=snapshot):
+                    self.agent.run_once(state)
+                state_module.save_state(path, state)
+            restored = json.loads(path.read_text())
+        self.assertEqual(restored["pagerduty"], live["pagerduty"])
+        self.assertEqual(restored["future_bucket"], [1, 2, 3])
+        self.assertEqual(restored["mac_comparison"], live["mac_comparison"])
+        self.assertEqual(restored["version"], 1)
+        self.assertEqual(len(self.posted), 2)
+
     def test_fleet_and_compatibility_queues_cannot_overwrite_each_other(self):
         fleet = watchdog.Fleet("zakura-compat", "http://127.0.0.1:9/data", "http://127.0.0.1:9/")
         self.state["pending_delivery"] = {
@@ -500,7 +533,7 @@ class WorkerTests(unittest.TestCase):
             shlex.split(command[-1]),
             ["python3", "-I", "/opt/zakura-monitoring/current/zakura-compat-check", "probe",
              "--env-file", "/etc/zakura-monitoring/compat.env", "--deadline", "100",
-             "--nonce", "abc"],
+             "--height-max-drift", "10", "--nonce", "abc"],
         )
 
 
@@ -590,6 +623,8 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual([(t.name, t.ssh_target) for t in targets],
                          [("zakura-compat", "root@159.203.113.196")])
         self.assertEqual((targets[0].interval, targets[0].timeout), (60.0, 120.0))
+        # Production's effective Rust watchdog limit, pinned for the lane.
+        self.assertEqual(targets[0].height_max_drift, 10)
 
     def test_rejects_other_targets_and_unbounded_timeouts(self):
         base = '[[compatibility]]\nname = "zakura-compat"\nssh_target = "root@159.203.113.196"\n'
@@ -601,6 +636,8 @@ class ConfigTests(unittest.TestCase):
             base + "timeout = 300\n",
             base + "interval = 5\n",
             base + "remote_deadline = 150\n",
+            base + "height_max_drift = -1\n",
+            base + 'height_max_drift = "10"\n',
             base + 'checker = "relative"\n',
             base + "unknown = 1\n",
             base + base,

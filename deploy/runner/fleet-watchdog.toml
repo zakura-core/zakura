@@ -31,3 +31,5 @@ known_hosts = "/etc/zakura-fleet-watchdog/known_hosts"
 interval = 60
 timeout = 120
 remote_deadline = 100
+# The live Rust watchdog's effective limit; the deploy-time checker default is 30.
+height_max_drift = 10

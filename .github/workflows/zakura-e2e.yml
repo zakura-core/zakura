@@ -208,7 +208,7 @@ jobs:
           cache-shared-key: zakura-drb-debug
           cache-on-failure: true
           cache-save-if: false
-      - uses: taiki-e/install-action@26e9283f268b880168bdbd2c545dfcd60ec2c6ab #v2.87.13
+      - uses: taiki-e/install-action@7623a79cdfecb99d681017af368ca353d9f49bb5 #v2.87.19
         with:
           tool: cargo-nextest
       - uses: ./.github/actions/setup-zakura-build
@@ -250,7 +250,7 @@ jobs:
           cache-shared-key: zakura-drb-debug
           cache-on-failure: true
           cache-save-if: false
-      - uses: taiki-e/install-action@26e9283f268b880168bdbd2c545dfcd60ec2c6ab #v2.87.13
+      - uses: taiki-e/install-action@7623a79cdfecb99d681017af368ca353d9f49bb5 #v2.87.19
         with:
           tool: cargo-nextest
       - uses: ./.github/actions/setup-zakura-build
@@ -325,7 +325,9 @@ jobs:
   zakura-e2e-success:
     name: zakura e2e success
     runs-on: ubuntu-latest
-    if: always()
+    # Skip, rather than fail, when a superseding run cancelled this one.
+    # See "Cancelled runs" in .github/workflows/README.md.
+    if: ${{ !cancelled() || github.event_name == 'pull_request' || github.event_name == 'merge_group' }}
     needs:
       - changes
       - zakura-regtest-e2e-pr-gate

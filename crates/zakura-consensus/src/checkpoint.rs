@@ -202,14 +202,6 @@ where
     reset_sender: mpsc::Sender<CheckpointReset>,
     /// The generation assigned to new checkpoint commits.
     reset_generation: u64,
-
-    /// Queued block height progress transmitter.
-    #[cfg(feature = "progress-bar")]
-    queued_blocks_bar: howudoin::Tx,
-
-    /// Verified checkpoint progress transmitter.
-    #[cfg(feature = "progress-bar")]
-    verified_checkpoint_bar: howudoin::Tx,
 }
 
 impl<S> std::fmt::Debug for CheckpointVerifier<S>
@@ -333,13 +325,6 @@ where
 
         let (sender, receiver) = mpsc::channel();
 
-        #[cfg(feature = "progress-bar")]
-        let queued_blocks_bar = howudoin::new_root().label("Checkpoint Queue Height");
-
-        #[cfg(feature = "progress-bar")]
-        let verified_checkpoint_bar =
-            howudoin::new_with_parent(queued_blocks_bar.id()).label("Verified Checkpoints");
-
         let verifier = CheckpointVerifier {
             checkpoint_list,
             max_checkpoint_height,
@@ -351,15 +336,9 @@ where
             reset_receiver: receiver,
             reset_sender: sender,
             reset_generation: 0,
-            #[cfg(feature = "progress-bar")]
-            queued_blocks_bar,
-            #[cfg(feature = "progress-bar")]
-            verified_checkpoint_bar,
         };
 
-        if verifier_progress.is_final_checkpoint() {
-            verifier.finish_diagnostics();
-        } else {
+        if !verifier_progress.is_final_checkpoint() {
             verifier.verified_checkpoint_diagnostics(verifier_progress.height());
         }
 
@@ -378,15 +357,6 @@ where
 
         let is_checkpoint = self.checkpoint_list.contains(height);
         tracing::debug!(?height, ?hash, ?is_checkpoint, "queued block");
-
-        #[cfg(feature = "progress-bar")]
-        if matches!(howudoin::cancelled(), Some(true)) {
-            self.finish_diagnostics();
-        } else {
-            self.queued_blocks_bar
-                .set_pos(max_queued_height.0)
-                .set_len(u64::from(self.checkpoint_list.max_height().0));
-        }
     }
 
     /// Update diagnostics for verified checkpoints.
@@ -410,24 +380,6 @@ where
             ?checkpoint_count,
             "verified checkpoint",
         );
-
-        #[cfg(feature = "progress-bar")]
-        if matches!(howudoin::cancelled(), Some(true)) {
-            self.finish_diagnostics();
-        } else {
-            self.verified_checkpoint_bar
-                .set_pos(u64::try_from(checkpoint_index).expect("fits in u64"))
-                .set_len(u64::try_from(checkpoint_count).expect("fits in u64"));
-        }
-    }
-
-    /// Finish checkpoint verifier diagnostics.
-    fn finish_diagnostics(&self) {
-        #[cfg(feature = "progress-bar")]
-        {
-            self.queued_blocks_bar.close();
-            self.verified_checkpoint_bar.close();
-        }
     }
 
     /// Reset the verifier progress back to given tip.
@@ -670,7 +622,6 @@ where
             );
 
             self.verified_checkpoint_diagnostics(verified_height);
-            self.finish_diagnostics();
         } else if self.checkpoint_list.contains(verified_height) {
             self.verifier_progress = PreviousCheckpoint(verified_height);
             // We're done with the initial tip hash now
@@ -1056,8 +1007,6 @@ where
     /// We can't implement `Drop` on QueuedBlock, because `send()` consumes
     /// `tx`. And `tx` doesn't implement `Copy` or `Default` (for `take()`).
     fn drop(&mut self) {
-        self.finish_diagnostics();
-
         let drop_keys: Vec<_> = self.queued.keys().cloned().collect();
         for key in drop_keys {
             let mut qblocks = self
@@ -1213,6 +1162,39 @@ impl VerifyCheckpointError {
         }
     }
 
+    /// Returns `true` if the state rejected the delivered body because it does not match its
+    /// header's authorizing data commitment.
+    ///
+    /// Checkpoint verification checks only the block hash and the transaction Merkle root, which
+    /// do not commit to authorizing data from NU5 (ZIP 244). So a peer can serve a canonical
+    /// header with an altered body that fails only at commit. See
+    /// [`zs::ValidateContextError::is_auth_commitment_mismatch`].
+    pub fn is_auth_commitment_mismatch(&self) -> bool {
+        match self {
+            VerifyCheckpointError::CommitCheckpointVerified(source) => source
+                .downcast_ref::<zs::CommitCheckpointVerifiedError>()
+                .is_some_and(zs::CommitCheckpointVerifiedError::is_auth_commitment_mismatch),
+            VerifyCheckpointError::VerifyBlock(error) => error.is_auth_commitment_mismatch(),
+            _ => false,
+        }
+    }
+
+    /// Returns `true` if the state dropped this block because an ancestor's delivered body
+    /// failed its authorizing data commitment.
+    pub fn is_descendant_of_auth_commitment_mismatch(&self) -> bool {
+        match self {
+            VerifyCheckpointError::CommitCheckpointVerified(source) => source
+                .downcast_ref::<zs::CommitCheckpointVerifiedError>()
+                .is_some_and(
+                    zs::CommitCheckpointVerifiedError::is_descendant_of_auth_commitment_mismatch,
+                ),
+            VerifyCheckpointError::VerifyBlock(error) => {
+                error.is_descendant_of_auth_commitment_mismatch()
+            }
+            _ => false,
+        }
+    }
+
     /// Returns the state location for duplicate commit requests.
     pub fn duplicate_location(&self) -> Option<&zs::KnownBlock> {
         match self {
@@ -1235,6 +1217,9 @@ impl VerifyCheckpointError {
             | VerifyCheckpointError::CoinbaseHeight { .. }
             | VerifyCheckpointError::DuplicateTransaction
             | VerifyCheckpointError::AmountError(_) => 100,
+            // Other commit failures stay unscored: they can come from local state, from a root
+            // another peer supplied, or from an ancestor's failure.
+            error if error.is_auth_commitment_mismatch() => 100,
             _other => 0,
         }
     }

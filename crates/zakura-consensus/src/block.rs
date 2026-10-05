@@ -221,6 +221,17 @@ impl VerifyBlockError {
         }
     }
 
+    /// See [`zs::ValidateContextError::is_auth_commitment_mismatch`].
+    pub fn is_auth_commitment_mismatch(&self) -> bool {
+        matches!(self, VerifyBlockError::Commit(error) if error.is_auth_commitment_mismatch())
+    }
+
+    /// See [`zs::ValidateContextError::is_descendant_of_auth_commitment_mismatch`].
+    pub fn is_descendant_of_auth_commitment_mismatch(&self) -> bool {
+        matches!(self, VerifyBlockError::Commit(error)
+            if error.is_descendant_of_auth_commitment_mismatch())
+    }
+
     /// Returns the state location for duplicate commit requests.
     pub fn duplicate_location(&self) -> Option<&zs::KnownBlock> {
         match self {

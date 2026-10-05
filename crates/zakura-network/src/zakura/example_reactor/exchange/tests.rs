@@ -6,6 +6,7 @@ use super::*;
 use crate::zakura::{
     example_reactor::{PAIRED, SINGLE},
     regulation::{sizing, ReservationPool},
+    Credit,
 };
 
 fn peer(n: u8) -> ZakuraPeerId {
@@ -248,4 +249,184 @@ async fn requests_beyond_twice_the_limit_are_a_violation() {
 
 fn capacity_over_limit(capacity: &ServeCapacity) -> u64 {
     capacity.over_limit_count()
+}
+
+/// Two nodes, A watching B, driven until `done` holds for A.
+struct Pair {
+    a: ExampleNode,
+    b: ExampleNode,
+    a_in: SelectAll<futures::stream::BoxStream<'static, Frame>>,
+    b_in: SelectAll<futures::stream::BoxStream<'static, Frame>>,
+    cancel: CancellationToken,
+}
+
+impl Pair {
+    fn new(layout: &'static [Stream], b_store: (u32, u32)) -> (Self, ServeCapacity) {
+        let capacity = capacity();
+        let (a_link, b_link) = connect(layout);
+        let cancel = CancellationToken::new();
+        let a = ExampleNode::new(
+            layout,
+            &capacity,
+            Arc::new(Store {
+                low: Height(0),
+                high: Height(0),
+            }),
+            &peer(2),
+            a_link.sends,
+            cancel.clone(),
+        );
+        let b = ExampleNode::new(
+            layout,
+            &capacity,
+            Arc::new(Store {
+                low: Height(b_store.0),
+                high: Height(b_store.1),
+            }),
+            &peer(1),
+            b_link.sends,
+            cancel.clone(),
+        );
+        let pair = Self {
+            a,
+            b,
+            a_in: inbound(a_link.recvs),
+            b_in: inbound(b_link.recvs),
+            cancel,
+        };
+        (pair, capacity)
+    }
+
+    async fn run_until(&mut self, done: impl Fn(&ExampleNode) -> bool) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !done(&self.a) {
+                tokio::select! {
+                    Some(frame) = self.a_in.next() => {
+                        self.a.handle(frame).expect("B is conformant");
+                    }
+                    Some(frame) = self.b_in.next() => {
+                        self.b.handle(frame).expect("A is conformant");
+                    }
+                }
+            }
+        })
+        .await
+        .expect("the watch reaches its state");
+    }
+}
+
+impl Drop for Pair {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+    }
+}
+
+fn items(heights: std::ops::RangeInclusive<u32>) -> Vec<(Height, Vec<u8>)> {
+    heights
+        .map(|h| (Height(h), item_bytes(Height(h))))
+        .collect()
+}
+
+async fn watch(layout: &'static [Stream]) {
+    // 86 items: more than five windows, so the watch renews its credit.
+    let (mut pair, _capacity) = Pair::new(layout, (0, 95));
+    let id = pair.a.watch(Height(9)).unwrap();
+    pair.run_until(|a| a.watched.len() == 86).await;
+    assert_eq!(pair.a.watched, items(10..=95));
+    // The watch idles with no item left; nothing ends it but `Close`.
+    pair.a.close_watch(id).unwrap();
+    pair.run_until(|a| !a.watch_ended.is_empty()).await;
+    assert_eq!(pair.a.watch_ended, [EndReason::Closed]);
+    // A second watch opens after the first one's outcome.
+    pair.a.watch(Height(94)).unwrap();
+    pair.run_until(|a| a.watched.len() == 87).await;
+    pair.b.supersede_watches();
+    pair.run_until(|a| a.watch_ended.len() == 2).await;
+    assert_eq!(pair.a.watch_ended[1], EndReason::Superseded);
+}
+
+#[tokio::test]
+async fn a_watch_pushes_every_item_over_one_stream() {
+    watch(&SINGLE).await;
+}
+
+#[tokio::test]
+async fn a_watch_pushes_every_item_over_a_stream_pair() {
+    watch(&PAIRED).await;
+}
+
+#[tokio::test]
+async fn a_watch_below_the_store_ends_unavailable() {
+    let (mut pair, _capacity) = Pair::new(&SINGLE, (96, 191));
+    pair.a.watch(Height(0)).unwrap();
+    pair.run_until(|a| !a.watch_ended.is_empty()).await;
+    assert_eq!(pair.a.watch_ended, [EndReason::Unavailable]);
+    assert!(pair.a.watched.is_empty());
+}
+
+fn pushed(id: u32, height: u32) -> Frame {
+    frame(&ExampleMessage::Pushed {
+        id,
+        height: Height(height),
+        bytes: vec![1],
+    })
+}
+
+#[tokio::test]
+async fn a_pushed_item_out_of_order_breaks_linkage() {
+    let (mut node, _peer, _capacity) = node(&SINGLE);
+    let id = node.watch(Height(4)).unwrap();
+    assert_eq!(node.handle(pushed(id, 5)), Ok(()));
+    assert_eq!(
+        node.handle(pushed(id, 7)),
+        Err(Violation::Linkage {
+            received: Height(5),
+            got: Height(7),
+        })
+    );
+}
+
+#[tokio::test]
+async fn an_outcome_outside_its_window_is_a_violation() {
+    let ended = |id, reason| frame(&ExampleMessage::WatchEnded { id, reason });
+    // `Closed` before this node closed.
+    let (mut watcher, _peer, _capacity) = node(&SINGLE);
+    let id = watcher.watch(Height(4)).unwrap();
+    assert_eq!(
+        watcher.handle(ended(id, EndReason::Closed)),
+        Err(Violation::OutcomeWindow(EndReason::Closed))
+    );
+    // `Unavailable` after an item.
+    let (mut watcher, _peer, _capacity) = node(&SINGLE);
+    let id = watcher.watch(Height(4)).unwrap();
+    watcher.handle(pushed(id, 5)).unwrap();
+    assert_eq!(
+        watcher.handle(ended(id, EndReason::Unavailable)),
+        Err(Violation::OutcomeWindow(EndReason::Unavailable))
+    );
+    // A page or outcome for no watch.
+    let (mut watcher, _peer, _capacity) = node(&SINGLE);
+    assert_eq!(
+        watcher.handle(pushed(0, 1)),
+        Err(Violation::Subscription(SubscriptionFault::Unknown))
+    );
+}
+
+#[tokio::test]
+async fn a_grant_beyond_the_window_disconnects() {
+    let (mut node, _peer, _capacity) = node(&SINGLE);
+    let update = |op, sequence, objects| {
+        frame(&ExampleMessage::Watch(WatchUpdate {
+            op,
+            id: 3,
+            sequence,
+            acknowledged: Height(0),
+            added: Credit { objects, bytes: 1 },
+        }))
+    };
+    assert_eq!(node.handle(update(WatchOp::Open, 0, 16)), Ok(()));
+    assert_eq!(
+        node.handle(update(WatchOp::Grant, 1, 1)),
+        Err(Violation::Subscription(SubscriptionFault::AboveWindow))
+    );
 }

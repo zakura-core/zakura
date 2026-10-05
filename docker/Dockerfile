@@ -122,9 +122,6 @@ RUN [ -n "${SHORT_SHA}" ] && export SHORT_SHA="${SHORT_SHA}" || true; \
     chown -R ${UID}:${GID} ${CARGO_HOME} && \
     chown -R ${UID}:${GID} ${CARGO_TARGET_DIR}
 
-# Copy the lightwalletd binary and source files to be able to run tests
-COPY --link --from=electriccoinco/lightwalletd:v0.4.17 /usr/local/bin/lightwalletd /usr/local/bin/
-
 COPY --link --chown=${UID}:${GID} ./docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 
 ENTRYPOINT [ "entrypoint.sh", "test" ]
@@ -134,11 +131,13 @@ CMD [ "cargo", "test" ]
 #
 # It also adds `cache mounts` as this stage is completely independent from the
 # `test` stage. The resulting binaries are used in the `runtime` stage.
+# Always use portable Pasta arithmetic here, including with custom FEATURES.
+# Release archives and both runtime image variants inherit these binaries.
 FROM deps AS release
 
 ARG SHORT_SHA
 ARG FEATURES
-ENV FEATURES=${FEATURES}
+ENV FEATURES=${FEATURES},portable
 
 # Set the working directory for the build.
 ARG HOME
@@ -152,6 +151,7 @@ RUN --mount=type=bind,source=crates/tower-batch-control,target=crates/tower-batc
     --mount=type=bind,source=deploy/zakura-watchdog,target=deploy/zakura-watchdog \
     --mount=type=bind,source=crates/xtask,target=crates/xtask \
     --mount=type=bind,source=crates/zakura-chain,target=crates/zakura-chain \
+    --mount=type=bind,source=crates/zakura-mmr-tree,target=crates/zakura-mmr-tree \
     --mount=type=bind,source=crates/zakura-header-chain,target=crates/zakura-header-chain \
     --mount=type=bind,source=crates/zakura-consensus,target=crates/zakura-consensus \
     --mount=type=bind,source=crates/zakura-header-chain,target=crates/zakura-header-chain \

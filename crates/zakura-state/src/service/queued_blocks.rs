@@ -359,11 +359,11 @@ impl SentHashes {
     /// Creates a new [`SentHashes`] with the block hashes and UTXOs in the provided non-finalized state.
     pub fn new(non_finalized_state: &NonFinalizedState) -> Self {
         let mut sent_hashes = Self::default();
-        for (_, block) in non_finalized_state
+        for block in non_finalized_state
             .chain_iter()
-            .flat_map(|c| c.blocks.clone())
+            .flat_map(|c| c.blocks.values())
         {
-            sent_hashes.add(&block.into());
+            sent_hashes.add(&block.as_ref().clone().into());
         }
 
         if !sent_hashes.sent.is_empty() {

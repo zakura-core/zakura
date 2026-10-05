@@ -46,10 +46,30 @@ const fn response(message_type: u16, request: u16, ends_exchange: bool) -> Messa
     }
 }
 
+const fn subscription(message_type: u16, credit: Credit, cursor_history: u32) -> MessageRule {
+    MessageRule {
+        message_type,
+        payload: PayloadLen::exact(8),
+        role: MessageRole::Subscription {
+            max_live: 1,
+            credit,
+            cursor_history,
+            cadence: None,
+        },
+    }
+}
+
 const STATUS: MessageRule = announcement(1);
 const GET: MessageRule = request(2);
 const PART: MessageRule = response(3, 2, false);
 const DONE: MessageRule = response(4, 2, true);
+const CREDIT: Credit = Credit {
+    objects: 16,
+    bytes: 4096,
+};
+const WATCH: MessageRule = subscription(5, CREDIT, 16);
+const PAGE: MessageRule = response(6, 5, false);
+const ENDED: MessageRule = response(7, 5, true);
 
 const fn persistent(kind: u16, messages: &'static [MessageRule]) -> Stream {
     Stream {
@@ -75,10 +95,16 @@ const PAIRED: [Stream; 2] = [
     persistent(65, &[GET]),
 ];
 const LOOKUP: [Stream; 1] = [request_response(66, &[GET, PART, DONE])];
+/// A subscription beside a request, on one stream.
+const FEED: [Stream; 1] = [persistent(
+    64,
+    &[STATUS, GET, PART, DONE, WATCH, PAGE, ENDED],
+)];
 
 const _: () = Stream::validate_layout(&SINGLE);
 const _: () = Stream::validate_layout(&PAIRED);
 const _: () = Stream::validate_layout(&LOOKUP);
+const _: () = Stream::validate_layout(&FEED);
 
 /// A table built at runtime. Streams hold `'static` tables.
 fn leak(rows: &[MessageRule]) -> &'static [MessageRule] {
@@ -91,7 +117,7 @@ fn check(layout: &[Stream]) -> Result<(), LayoutError> {
 
 #[test]
 fn valid_layouts_pass_and_their_readers_follow_their_rows() {
-    for layout in [&SINGLE[..], &PAIRED, &LOOKUP] {
+    for layout in [&SINGLE[..], &PAIRED, &LOOKUP, &FEED] {
         assert_eq!(check(layout), Ok(()));
         check_frame_filter(layout);
     }
@@ -324,6 +350,103 @@ fn a_request_has_a_response_that_ends_it() {
         check(&[persistent(64, &[GET, PART])]),
         Err(LayoutError::RequestWithoutEnding { message_type: 2 })
     );
+}
+
+#[test]
+fn a_subscription_sits_on_a_persistent_stream() {
+    assert_eq!(
+        check(&[request_response(66, &[WATCH, PAGE, ENDED])]),
+        Err(LayoutError::SubscriptionOnRequestResponse {
+            kind: 66,
+            message_type: 5,
+        })
+    );
+}
+
+#[test]
+fn a_subscription_allows_one_live() {
+    let mut none_live = WATCH;
+    none_live.role = MessageRole::Subscription {
+        max_live: 0,
+        credit: CREDIT,
+        cursor_history: 16,
+        cadence: None,
+    };
+    assert_eq!(
+        check(&[persistent(64, leak(&[none_live, PAGE, ENDED]))]),
+        Err(LayoutError::NoLiveSubscriptions { message_type: 5 })
+    );
+}
+
+#[test]
+fn a_subscription_grants_nonzero_credit_in_both_units() {
+    for credit in [
+        Credit {
+            objects: 0,
+            bytes: 4096,
+        },
+        Credit {
+            objects: 16,
+            bytes: 0,
+        },
+    ] {
+        assert_eq!(
+            check(&[persistent(
+                64,
+                leak(&[subscription(5, credit, 16), PAGE, ENDED])
+            )]),
+            Err(LayoutError::EmptyCredit { message_type: 5 })
+        );
+    }
+}
+
+#[test]
+fn a_cursor_history_covers_the_object_credit() {
+    assert_eq!(
+        check(&[persistent(
+            64,
+            leak(&[subscription(5, CREDIT, 15), PAGE, ENDED])
+        )]),
+        Err(LayoutError::ShortCursorHistory { message_type: 5 })
+    );
+    assert_eq!(
+        check(&[persistent(
+            64,
+            leak(&[subscription(5, CREDIT, 16), PAGE, ENDED])
+        )]),
+        Ok(())
+    );
+}
+
+#[test]
+fn a_subscription_has_pages_and_an_ending() {
+    assert_eq!(
+        check(&[persistent(64, &[WATCH, ENDED])]),
+        Err(LayoutError::SubscriptionWithoutPages { message_type: 5 })
+    );
+    assert_eq!(
+        check(&[persistent(64, &[WATCH, PAGE])]),
+        Err(LayoutError::RequestWithoutEnding { message_type: 5 })
+    );
+}
+
+#[test]
+fn a_page_fits_its_byte_credit() {
+    let feed = |min| {
+        let page = MessageRule {
+            payload: PayloadLen::exact(min),
+            ..PAGE
+        };
+        [Stream {
+            frame_cap: 8192,
+            ..persistent(64, leak(&[WATCH, page, ENDED]))
+        }]
+    };
+    assert_eq!(
+        check(&feed(4097)),
+        Err(LayoutError::PageAboveCredit { message_type: 6 })
+    );
+    assert_eq!(check(&feed(4096)), Ok(()));
 }
 
 #[test]

@@ -69,8 +69,9 @@ pub struct Config {
     )]
     pub zcashd_process_pattern: String,
 
-    /// Maximum allowed absolute height drift between zakurad and zcashd.
-    #[arg(long, global = true, env = "HEIGHT_MAX_DRIFT", default_value_t = 10)]
+    /// Maximum allowed absolute height drift between zakurad and zcashd. The default of 30
+    /// blocks is about 12 minutes at NU7's 25-second spacing, the 10 blocks it was before.
+    #[arg(long, global = true, env = "HEIGHT_MAX_DRIFT", default_value_t = 30)]
     pub height_max_drift: u64,
 
     /// Seconds to keep retrying before a one-shot `check` fails.
@@ -136,7 +137,7 @@ mod tests {
         assert_eq!(config.zcashd_rpc_url, "http://[::1]:8232");
         assert_eq!(config.zakurad_process_pattern, "zakurad .*--zcashd-compat");
         assert_eq!(config.zcashd_process_pattern, "zcashd .*-connect");
-        assert_eq!(config.height_max_drift, 10);
+        assert_eq!(config.height_max_drift, 30);
         assert_eq!(config.sync_check_timeout, 600);
         assert_eq!(config.sync_check_interval, 15);
         assert_eq!(config.watchdog_interval, 60);

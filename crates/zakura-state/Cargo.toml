@@ -1,6 +1,6 @@
 [package]
 name = "zakura-state"
-version = "10.0.0"
+version = "11.0.0"
 authors.workspace = true
 description = "State contextual verification and storage code for the Zakura node. Internal crate, published to support cargo install zakura"
 license.workspace = true
@@ -16,14 +16,14 @@ categories = ["asynchronous", "caching", "cryptography::cryptocurrencies"]
 
 [features]
 
+# Legacy flags accepted for build compatibility; the progress display is removed.
+progress-bar = ["howudoin"]
+howudoin = []
+
 # Production features that activate extra dependencies, or extra features in dependencies
 
 # Exposes narrow internal hooks used by benchmarks.
 internal-bench = []
-
-progress-bar = [
-    "howudoin",
-]
 
 # Indexes spending transaction ids by spent outpoints and revealed nullifiers
 indexer = []
@@ -44,23 +44,18 @@ proptest-impl = [
 
 [dependencies]
 bincode = { workspace = true }
-chrono = { workspace = true, features = ["clock", "std"] }
+chrono = { workspace = true }
 futures = { workspace = true }
 halo2 = { workspace = true, optional = true }
 hex = { workspace = true }
-hex-literal = { workspace = true }
-humantime-serde = { workspace = true }
 indexmap = { workspace = true }
 itertools = { workspace = true }
 lazy_static = { workspace = true }
 metrics = { workspace = true }
-regex = { workspace = true }
-rlimit = { workspace = true }
 rocksdb = { workspace = true, features = ["lz4"] }
 semver = { workspace = true }
 crossbeam-channel = { workspace = true }
 serde = { workspace = true, features = ["serde_derive"] }
-serde-big-array = { workspace = true }
 tempfile = { workspace = true }
 thiserror = { workspace = true }
 
@@ -73,25 +68,25 @@ tracing = { workspace = true }
 sapling-crypto = { workspace = true }
 
 zakura-assets = { workspace = true }
-zakura-node-services = { path = "../zakura-node-services", version = "4.0.0" }
-zakura-chain = { path = "../zakura-chain", version = "8.0.0", features = ["async-error"] }
-zakura-header-chain = { path = "../zakura-header-chain", version = "4.0.0" }
+zakura-node-services = { path = "../zakura-node-services", version = "5.0.0" }
+zakura-chain = { path = "../zakura-chain", version = "10.0.0", features = ["async-error"] }
+zakura-header-chain = { path = "../zakura-header-chain", version = "4.0.1" }
 
-# prod feature progress-bar
-howudoin = { workspace = true, optional = true }
 
 # test feature proptest-impl
 proptest = { workspace = true, optional = true }
 proptest-derive = { workspace = true, optional = true }
-derive-getters.workspace = true
+getset.workspace = true
 derive-new.workspace = true
 
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
 [dev-dependencies]
-zakura-header-chain = { path = "../zakura-header-chain", version = "4.0.0", features = ["test-support"] }
+zakura-header-chain = { path = "../zakura-header-chain", version = "4.0.1", features = ["test-support"] }
 color-eyre = { workspace = true }
 
 once_cell = { workspace = true }
-spandoc = { workspace = true }
 toml = { workspace = true }
 
 hex = { workspace = true, features = ["serde"] }
@@ -107,8 +102,8 @@ orchard = { workspace = true }
 
 tokio = { workspace = true, features = ["full", "tracing", "test-util"] }
 
-zakura-chain = { path = "../zakura-chain", version = "8.0.0", features = ["proptest-impl"] }
-zakura-test = { path = "../zakura-test/", version = "2.1.0" }
+zakura-chain = { path = "../zakura-chain", version = "10.0.0", features = ["proptest-impl"] }
+zakura-test = { path = "../zakura-test/", version = "3.0.0" }
 
 [lints]
 workspace = true

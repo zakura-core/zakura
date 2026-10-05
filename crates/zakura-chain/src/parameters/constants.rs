@@ -75,6 +75,9 @@ pub mod activation_heights {
         pub const NU6_2: Height = Height(4_052_000);
         /// The block height at which `NU6.3` activates on Testnet.
         pub const NU6_3: Height = Height(4_134_000);
+        /// The block height at which [`NU7`](crate::parameters::NetworkUpgrade::Nu7)
+        /// activates on Testnet.
+        pub(in crate::parameters) const NU7: Height = Height(4_465_026);
     }
 
     /// Network upgrade activation heights for Mainnet.

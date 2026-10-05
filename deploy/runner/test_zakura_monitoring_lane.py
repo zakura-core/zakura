@@ -28,7 +28,7 @@ from unittest import mock
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
-from zakura_monitoring import compat, monitor, remote, state as state_module  # noqa: E402
+from zakura_monitoring import compat, delivery, monitor, remote, slack, state as state_module  # noqa: E402
 
 SPEC = importlib.util.spec_from_file_location(
     "zakura_cluster_watchdog_lane", HERE / "zakura-cluster-watchdog.py"
@@ -153,8 +153,8 @@ class TransitionTests(LaneCase):
         self.step(passing(at=NOW + 60), now=NOW + 60)
         self.step(passing(at=NOW + 120), now=NOW + 120)
         self.assertEqual(len(self.posted), 2)
-        self.assertIn("recovered", self.posted[1])
-        self.assertIn("recovered from: height＿drift", self.posted[1])
+        self.assertIn("restored", self.posted[1])
+        self.assertIn("Zakura and zcashd are back in sync.", self.posted[1])
         self.assertEqual(self.entry, {"condition": "ok", "alerting": False})
 
     def test_healthy_start_is_silent(self):
@@ -165,29 +165,116 @@ class TransitionTests(LaneCase):
     def test_unavailable_probe_alerts_but_never_recovers(self):
         self.step(missing_checker())
         self.assertEqual(len(self.posted), 1)
-        self.assertIn("checker is not installed", self.posted[0])
+        self.assertIn("checker is missing", self.posted[0])
         for reason in ("ssh_timeout", "stale_outcome", "malformed_outcome"):
             self.step(monitor.unavailable(reason, NOW + 60), now=NOW + 60)
         self.assertEqual(len(self.posted), 1)
         self.assertTrue(self.entry["alerting"])
 
-    def test_alert_text_is_complete_and_credential_free(self):
+    def test_alert_includes_relevant_measurements_and_keeps_full_telemetry(self):
         self.step(failing(peers=1, zakura=3_000_041, zcashd=3_000_000))
         text = self.posted[0]
         for expected in (
-            "zakura-compat", "root＠159.203.113.196", "check `zcashd_compat_sync` failing",
-            "height＿drift", "zcashd peers: 1", "zakurad height: 3000041",
-            "zcashd height: 3000000", "drift: 41 (max 30)",
-            "observed 2027-01-15T08:00:00+00:00",
+            "Zakura compatibility problem", "zakura-compat",
+            "Zakura is *41 blocks ahead of* zcashd (limit: 30).",
+            "Heights: Zakura 3,000,041 · zcashd 3,000,000",
+            "_Observed 15 Jan 08:00 UTC_",
         ):
             self.assertIn(expected, text)
-        self.assertNotIn("nonce", text)
+        self.assertEqual(len(text.splitlines()), 4)
+        for omitted in ("root", "159.203.113.196", "zcashd_compat_sync",
+                        "height＿drift", "peers", "2027-01-15T", "nonce"):
+            self.assertNotIn(omitted, text)
+        record = self.state[monitor.COMPAT_PROBES][TARGET.name]["last"]
+        self.assertEqual(record["predicate"], "height_drift")
+        self.assertEqual(record["details"], details(zakura=3_000_041))
+        self.assertEqual(record["observed_at"], NOW)
 
     def test_probe_telemetry_records_heights(self):
         self.step(passing(zakura=10, zcashd=9))
         record = self.state[monitor.COMPAT_PROBES][TARGET.name]
         self.assertEqual((record["completed"], record["passed"]), (1, 1))
         self.assertEqual(record["last"]["details"]["zakura_height"], 10)
+
+
+class FormattingTests(unittest.TestCase):
+    def test_peer_alert_omits_unrelated_heights_and_missing_values(self):
+        for peers in (0, 2):
+            with self.subTest(peers=peers):
+                text = monitor.alert_text(TARGET, failing("peer_pinning", peers=peers, zakura=None))
+                self.assertIn(f"zcashd has *{peers} peers*; expected *1*.", text)
+                self.assertEqual(len(text.splitlines()), 3)
+                for omitted in ("height", "drift", "predicate", "check `", "root@", " - "):
+                    self.assertNotIn(omitted, text)
+
+    def test_drift_alert_describes_both_directions(self):
+        for height, direction in ((3_000_011, "ahead of"), (2_999_989, "behind")):
+            with self.subTest(direction=direction):
+                text = monitor.alert_text(TARGET, failing(zakura=height, maximum=10))
+                self.assertIn(f"Zakura is *11 blocks {direction}* zcashd (limit: 10).", text)
+                self.assertIn(f"Heights: Zakura {height:,} · zcashd 3,000,000", text)
+
+    def test_process_and_rpc_errors_are_explained_without_raw_metadata(self):
+        for predicate, summary in (
+            ("zakurad_process", "Zakura is not running."),
+            ("zcashd_process", "zcashd is not running."),
+        ):
+            with self.subTest(predicate=predicate):
+                text = monitor.alert_text(TARGET, failing(predicate))
+                self.assertIn(summary, text)
+                self.assertNotIn("Heights:", text)
+        for kind in compat.ERROR_KINDS:
+            with self.subTest(kind=kind):
+                result = monitor.ProbeResult(True, "fail", "zcashd_getblockcount", kind,
+                                             {}, NOW, "missing")
+                text = monitor.alert_text(TARGET, result)
+                self.assertIn("Could not read zcashd's block height.", text)
+                self.assertIn(monitor.RPC_ERROR_SUMMARIES[kind], text)
+                self.assertEqual(len(text.splitlines()), 3)
+
+    def test_unavailable_and_incomplete_results_use_safe_plain_explanations(self):
+        for kind, summary in monitor.UNAVAILABLE_REASONS.items():
+            with self.subTest(kind=kind):
+                text = monitor.alert_text(TARGET, monitor.unavailable(kind, NOW))
+                self.assertIn(summary, text)
+                self.assertEqual(len(text.splitlines()), 3)
+        raw = "secret-credential://user:password@host"
+        for valid, predicate in ((False, raw), (True, raw), (True, "height_drift")):
+            with self.subTest(valid=valid, predicate=predicate):
+                result = monitor.ProbeResult(valid, "fail", predicate, raw, {}, NOW, "missing")
+                text = monitor.alert_text(TARGET, result)
+                self.assertNotIn(raw, text)
+                self.assertNotIn(" - ", text)
+
+    def test_recovery_is_short_and_has_one_observation_time(self):
+        text = monitor.recovery_text(TARGET, passing(), {"predicate": "peer_pinning"})
+        self.assertIn("Zakura compatibility restored", text)
+        self.assertIn("Zakura and zcashd are back in sync.", text)
+        self.assertEqual(len(text.splitlines()), 3)
+        self.assertEqual(text.count("Observed"), 1)
+        for omitted in ("peer", "height", "drift", "root", "recovered from"):
+            self.assertNotIn(omitted, text)
+
+    def test_host_name_cannot_inject_slack_formatting_or_mentions(self):
+        target = monitor.CompatTarget(name="<@U123> `injected`\n<!channel>",
+                                      ssh_target=TARGET.ssh_target, known_hosts=None)
+        text = monitor.alert_text(target, failing("zcashd_process"))
+        self.assertNotIn("<@", text)
+        self.assertNotIn("<!channel>", text)
+        self.assertEqual(text.count("`"), 2)
+        self.assertEqual(len(text.splitlines()), 3)
+
+    def test_optional_batch_header_preserves_fleet_default_and_message_bounds(self):
+        failure = monitor.alert_text(TARGET, failing())
+        recovery = monitor.recovery_text(TARGET, passing(), {})
+        fleet = delivery.batch_messages([failure], NOW)
+        self.assertTrue(fleet[0].startswith("*Fleet status updates* — observed 2027-01-15T08:00:00+00:00"))
+        standalone = delivery.batch_messages([failure, recovery], NOW, title=None)
+        self.assertEqual(standalone, [failure + delivery.BATCH_SEPARATOR + recovery])
+        chunks = delivery.batch_messages([failure] * 200, NOW, title=None)
+        self.assertGreater(len(chunks), 1)
+        self.assertEqual(sum(chunk.count("Zakura compatibility problem") for chunk in chunks), 200)
+        self.assertTrue(all(len(chunk) <= slack.MAX_SLACK_MESSAGE_CHARS for chunk in chunks))
 
 
 class DeliveryTests(LaneCase):
@@ -214,8 +301,8 @@ class DeliveryTests(LaneCase):
         self.step(None, now=NOW + 120)
         self.step(None, now=NOW + 180)
         self.assertEqual(len(self.posted), 2)
-        self.assertIn("failing", self.posted[0])
-        self.assertIn("recovered", self.posted[1])
+        self.assertIn("problem", self.posted[0])
+        self.assertIn("restored", self.posted[1])
         self.assertEqual(self.entry, {"condition": "ok", "alerting": False})
 
     def test_restart_keeps_pending_queue_and_incident_state(self):
@@ -254,7 +341,8 @@ class DeliveryTests(LaneCase):
             self.step(None, now=NOW + 60)
         self.assertIsNone(self.pending)
         self.assertEqual(receiver.attempts, 2)
-        self.assertIn("Zakura compatibility updates", receiver.accepted[0])
+        self.assertIn("Zakura compatibility problem", receiver.accepted[0])
+        self.assertNotIn("compatibility updates", receiver.accepted[0])
         mock.patch.stopall()
 
     def test_slack_absent_keeps_the_alert_pending(self):
@@ -371,11 +459,11 @@ class SuppressionTests(LaneCase):
         self.assertEqual(self.entry, {})
         self.step(None, now=until)
         self.assertEqual(len(self.posted), 1)
-        self.assertIn("failing", self.posted[0])
+        self.assertIn("problem", self.posted[0])
         self.assertEqual(len(self.pending["messages"]), 1)
         self.step(None, now=until + 1)
         self.assertEqual(len(self.posted), 2)
-        self.assertIn("recovered", self.posted[1])
+        self.assertIn("restored", self.posted[1])
         self.assertIsNone(self.pending)
         self.assertEqual(self.entry, {"condition": "ok", "alerting": False})
 
@@ -404,7 +492,7 @@ class SuppressionTests(LaneCase):
         self.assertTrue(self.entry["alerting"])
         self.step(None, now=NOW + 600)
         self.assertEqual(len(self.posted), 1)
-        self.assertIn("recovered", self.posted[0])
+        self.assertIn("restored", self.posted[0])
         self.assertIsNone(self.pending)
         self.assertFalse(self.entry["alerting"])
 
@@ -432,7 +520,7 @@ class SuppressionTests(LaneCase):
         self.assertTrue(self.entry["alerting"], "suppression must not commit the recovery")
         self.step(passing(at=NOW + 460), now=NOW + 460)
         self.assertEqual(len(self.posted), 1)
-        self.assertIn("recovered", self.posted[0])
+        self.assertIn("restored", self.posted[0])
         self.assertFalse(self.entry["alerting"])
 
 

@@ -280,8 +280,11 @@ same explicit limit.
   incident but never recovers one.
 - Checker outcomes must echo the requested height-drift limit exactly;
   mismatches are monitoring failures and cannot recover an incident.
-- Messages name the host, check, predicate, peer count, heights, drift and
-  observation time.
+- Messages name the host, explain the problem, and show one short observation
+  time. Peer failures show the actual and expected peer count; drift failures
+  show the height gap, limit and node heights. Recovery says the nodes are back
+  in sync. SSH addresses, internal check names and unrelated measurements stay
+  out of Slack; the full sanitized result remains in local probe telemetry.
 - Incidents live in `compatibility`, probe telemetry in `compatibility_probes`
   and undelivered messages in `compatibility_pending_delivery`, separate from
   the fleet namespaces. Delivery reuses the fleet lane's batching, checkpointing

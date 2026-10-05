@@ -33,7 +33,6 @@ ENABLE_ENV = "ZAKURA_COMPAT_MONITORING"
 COMPAT_STATE = "compatibility"
 COMPAT_PROBES = "compatibility_probes"
 COMPAT_QUEUE = "compatibility_pending_delivery"
-COMPAT_BATCH_TITLE = "Zakura compatibility updates"
 
 # The single supported target. The deploy workflow pins the same host key.
 KNOWN_TARGETS = {"zakura-compat": "root@159.203.113.196"}
@@ -53,27 +52,39 @@ UNAVAILABLE = "monitoring_unavailable"
 SSH_TARGET = re.compile(r"[a-z_][a-z0-9_-]{0,31}@(?:[0-9]{1,3}\.){3}[0-9]{1,3}")
 
 UNAVAILABLE_REASONS = {
-    "ssh_timeout": "SSH probe exceeded its hard timeout",
-    "ssh_failed": "SSH connection or authentication failed",
-    "checker_missing": "checker is not installed on the host",
-    "checker_config_invalid": "checker configuration is invalid",
-    "malformed_outcome": "checker output was malformed",
-    "stale_outcome": "checker outcome was stale",
-    "oversized_outcome": "checker output exceeded its size limit",
-    "probe_overrun": "probe worker overran its hard timeout",
-    "probe_failed": "probe worker failed",
+    "ssh_timeout": "The host did not respond before the monitoring timeout.",
+    "ssh_failed": "Cannot connect to the host over SSH.",
+    "checker_missing": "The compatibility checker is missing from the host.",
+    "checker_config_invalid": "The compatibility checker configuration is invalid.",
+    "malformed_outcome": "The compatibility checker returned an invalid response.",
+    "stale_outcome": "The compatibility check returned an out-of-date result.",
+    "oversized_outcome": "The compatibility checker returned too much data.",
+    "probe_overrun": "The compatibility check did not finish before its timeout.",
+    "probe_failed": "The compatibility check could not complete.",
 }
 SUMMARIES = {
-    "zakurad_process": "zakurad process is not running",
-    "zcashd_process": "zcashd process is not running",
-    "zcashd_getconnectioncount": "zcashd getconnectioncount RPC failed",
-    "peer_pinning": "sidecar zcashd must peer with exactly one Zakura node",
-    "zakura_getblockcount": "zakurad getblockcount RPC failed",
-    "zcashd_getblockcount": "zcashd getblockcount RPC failed",
-    "height_drift": "height drift exceeds the configured maximum",
-    "deadline": "checker deadline expired before the cycle completed",
-    "in_sync": "zakurad and zcashd are in sync",
-    UNAVAILABLE: "compatibility probe produced no valid outcome",
+    "zakurad_process": "Zakura is not running.",
+    "zcashd_process": "zcashd is not running.",
+    "zcashd_getconnectioncount": "Could not read zcashd's peer count.",
+    "peer_pinning": "zcashd must have exactly one peer.",
+    "zakura_getblockcount": "Could not read Zakura's block height.",
+    "zcashd_getblockcount": "Could not read zcashd's block height.",
+    "height_drift": "Zakura and zcashd are too far apart in block height.",
+    "deadline": "The compatibility check did not finish before its timeout.",
+    UNAVAILABLE: "The compatibility check could not complete.",
+}
+RPC_ERROR_SUMMARIES = {
+    "auth_unavailable": "RPC credentials are unavailable.",
+    "auth_malformed": "RPC credentials could not be read.",
+    "connection": "The node did not accept the connection.",
+    "timeout": "The request timed out.",
+    "http_status": "The node rejected the request.",
+    "oversized_response": "The node response was too large.",
+    "malformed_json": "The node returned an invalid response.",
+    "rpc_error": "The node returned an RPC error.",
+    "missing_result": "The node returned an incomplete response.",
+    "invalid_result": "The node returned an invalid result.",
+    "invalid_config": "The compatibility checker configuration is invalid.",
 }
 
 
@@ -414,59 +425,55 @@ def iso_time(at: float) -> str:
     )
 
 
-def number(details: dict[str, Any], key: str) -> str:
-    value = details.get(key)
-    return str(value) if type(value) is int else "-"
-
-
-def predicate_line(result: ProbeResult) -> str:
-    if result.valid:
-        summary = SUMMARIES.get(result.predicate, "check failed")
-        kind = f" ({result.error_kind})" if result.error_kind else ""
-    else:
-        summary = UNAVAILABLE_REASONS.get(result.error_kind or "", SUMMARIES[UNAVAILABLE])
-        kind = ""
-    predicate = slack.slack_plain_text(result.predicate, 64)
-    return f"predicate: {predicate} - {summary}{kind} - observed {iso_time(result.observed_at)}"
-
-
-def numbers_line(result: ProbeResult) -> str:
+def problem_lines(result: ProbeResult) -> list[str]:
+    """Explain the failed check, including only measurements relevant to it."""
+    if not result.valid:
+        return [UNAVAILABLE_REASONS.get(result.error_kind or "", SUMMARIES[UNAVAILABLE])]
     details = result.details
-    return (
-        f"zcashd peers: {number(details, 'zcashd_connections')} - "
-        f"zakurad height: {number(details, 'zakura_height')} - "
-        f"zcashd height: {number(details, 'zcashd_height')} - "
-        f"drift: {number(details, 'height_drift')} "
-        f"(max {number(details, 'height_max_drift')})"
-    )
+    peers = details.get("zcashd_connections")
+    if result.predicate == "peer_pinning" and type(peers) is int:
+        noun = "peer" if peers == 1 else "peers"
+        return [f"zcashd has *{peers} {noun}*; expected *1*."]
+    zakura, zcashd = details.get("zakura_height"), details.get("zcashd_height")
+    if result.predicate == "height_drift" and type(zakura) is int and type(zcashd) is int:
+        direction = "ahead of" if zakura >= zcashd else "behind"
+        maximum = details.get("height_max_drift")
+        limit = f" (limit: {maximum})" if type(maximum) is int else ""
+        return [
+            f"Zakura is *{abs(zakura - zcashd):,} blocks {direction}* zcashd{limit}.",
+            f"Heights: Zakura {zakura:,} · zcashd {zcashd:,}",
+        ]
+    summary = SUMMARIES.get(result.predicate, "The compatibility check failed.")
+    reason = RPC_ERROR_SUMMARIES.get(result.error_kind or "", "")
+    return [f"{summary} {reason}".strip()]
+
+
+def observation_line(result: ProbeResult) -> str:
+    observed = datetime.datetime.fromtimestamp(result.observed_at, datetime.timezone.utc)
+    return f"_Observed {observed.day} {observed:%b %H:%M} UTC_"
 
 
 def heading(target: CompatTarget, icon: str, status: str) -> str:
     name = slack.slack_identity(target.name, 128, "unknown")
-    host = slack.slack_plain_text(target.ssh_target, 128)
-    return (
-        f"{icon} *Zakura compatibility* - `{name}` ({host}) "
-        f"check `{compat.CHECK_NAME}` {status}"
-    )
+    return f"{icon} *Zakura compatibility {status}* — `{name}`"
 
 
 def alert_text(target: CompatTarget, result: ProbeResult) -> str:
     return "\n".join(
         (
-            heading(target, ":rotating_light:", "failing"),
-            predicate_line(result),
-            numbers_line(result),
+            heading(target, ":rotating_light:", "problem"),
+            *problem_lines(result),
+            observation_line(result),
         )
     )
 
 
-def recovery_text(target: CompatTarget, result: ProbeResult, previous: dict[str, Any]) -> str:
-    recovered_from = slack.slack_identity(previous.get("predicate"), 64, "failure")
+def recovery_text(target: CompatTarget, result: ProbeResult, _previous: dict[str, Any]) -> str:
     return "\n".join(
         (
-            heading(target, ":white_check_mark:", "recovered"),
-            f"recovered from: {recovered_from} - observed {iso_time(result.observed_at)}",
-            numbers_line(result),
+            heading(target, ":white_check_mark:", "restored"),
+            "Zakura and zcashd are back in sync.",
+            observation_line(result),
         )
     )
 

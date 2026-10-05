@@ -32,7 +32,7 @@ sys.path.insert(0, str(HERE))
 
 from zakura_monitoring import compat, install, monitor, remote, state as state_module  # noqa: E402
 
-TEST_LABEL = "[ACCEPTANCE TEST - not an incident, no action needed]"
+TEST_LABEL = "[TEST — no action needed]"
 
 
 def emit(report: dict) -> None:
@@ -240,12 +240,12 @@ def slack_test(args: argparse.Namespace) -> int:
     watchdog.post_slack = labeled
 
     class Scripted:
-        target = monitor.CompatTarget(name="ACCEPTANCE-TEST-zakura-compat",
+        target = monitor.CompatTarget(name="zakura-compat",
                                       ssh_target="root@159.203.113.196", known_hosts=None)
 
         def __init__(self):
             now = time.time()
-            numbers = {"height_max_drift": 30, "zcashd_connections": 1}
+            numbers = {"height_max_drift": 10, "zcashd_connections": 1}
             self.results = [
                 monitor.ProbeResult(True, "fail", "peer_pinning", None,
                                     {**numbers, "zcashd_connections": 2}, now, "missing"),

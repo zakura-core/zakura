@@ -20,18 +20,20 @@ FLEET_BATCH_TITLE = "Fleet status updates"
 
 
 def batch_messages(
-    messages: list[str], now: float, title: str = FLEET_BATCH_TITLE
+    messages: list[str], now: float, title: str | None = FLEET_BATCH_TITLE
 ) -> list[str]:
     """Pack transitions without dropping incident summaries or exceeding Slack's cap."""
     if not messages:
         return []
-    observed_at = datetime.datetime.fromtimestamp(now, datetime.timezone.utc).isoformat()
-    prefix = f"*{title}* — observed {observed_at}\n\n"
+    prefix = ""
+    if title is not None:
+        observed_at = datetime.datetime.fromtimestamp(now, datetime.timezone.utc).isoformat()
+        prefix = f"*{title}* — observed {observed_at}\n\n"
     # Keep detailed diagnostics for a single incident; a batch shows the essential
     # lines for every event and links to the dashboard for the full node details.
     events = []
     for message in messages:
-        if len(messages) == 1:
+        if len(messages) == 1 or title is None:
             events.append(message)
             continue
         lines = message.splitlines()
@@ -73,7 +75,7 @@ def queue_transitions(
     messages: list[str],
     candidate: dict[str, Any],
     now: float,
-    title: str = FLEET_BATCH_TITLE,
+    title: str | None = FLEET_BATCH_TITLE,
 ) -> None:
     """Append batched messages and replace the prospective state for one key."""
     pending = state.setdefault(queue, {})

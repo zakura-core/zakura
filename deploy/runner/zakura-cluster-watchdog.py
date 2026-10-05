@@ -1052,7 +1052,7 @@ class Watchdog:
             return
         queue_transitions(
             state, monitor.COMPAT_QUEUE, name, messages, bucket[name], now,
-            title=monitor.COMPAT_BATCH_TITLE,
+            title=None,
         )
         record = state.get(monitor.COMPAT_PROBES, {}).get(name, {})
         suppressed_until = coerce_float(record.get("suppressed_until"))

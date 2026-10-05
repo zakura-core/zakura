@@ -114,9 +114,14 @@ class ReleaseTests(InstallCase):
         self.assertEqual(len(received), 2)
         for payload in received:
             self.assertTrue(payload["text"].startswith(report["label"] + "\n"))
-        self.assertIn("zcashd peers: 2", received[0]["text"])
-        self.assertIn("failing", received[0]["text"])
-        self.assertIn("recovered", received[1]["text"])
+        self.assertIn("zcashd has *2 peers*; expected *1*.", received[0]["text"])
+        self.assertIn("compatibility problem", received[0]["text"])
+        self.assertIn("compatibility restored", received[1]["text"])
+        for payload in received:
+            self.assertEqual(len(payload["text"].splitlines()), 4)
+            self.assertEqual(payload["text"].count("Observed"), 1)
+            for omitted in ("root", "159.203.113.196", "zcashd_compat_sync", "height:", "drift:"):
+                self.assertNotIn(omitted, payload["text"])
 
     def test_stage_activate_and_run_outside_the_repository(self):
         self.assertFalse(self.stage(SHA_A)["reused"])

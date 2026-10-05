@@ -12,6 +12,19 @@ use zakura_chain::{block::Block, serialization::ZcashSerialize};
 
 static NEXT_RECEIPT_ORDER: AtomicU64 = AtomicU64::new(1);
 
+fn next_receipt_order(counter: &AtomicU64) -> u64 {
+    let mut order = counter.load(Ordering::Relaxed);
+    loop {
+        let next = order
+            .checked_add(1)
+            .expect("a process cannot receive u64::MAX blocks");
+        match counter.compare_exchange_weak(order, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return order,
+            Err(current) => order = current,
+        }
+    }
+}
+
 /// Overlapping deliveries of the same complete block share its first receipt.
 /// Entries live only while a verification of that body is active, so a block
 /// delivered again after every attempt finishes or is cancelled gets a new receipt.
@@ -56,11 +69,7 @@ impl ReceiptRegistry {
                 .expect("each active caller owns memory, so its count fits in usize");
             entry.order
         } else {
-            let order = NEXT_RECEIPT_ORDER
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |order| {
-                    order.checked_add(1)
-                })
-                .expect("a process cannot receive u64::MAX blocks");
+            let order = next_receipt_order(&NEXT_RECEIPT_ORDER);
             active.insert(body_digest, Entry { order, callers: 1 });
             order
         };
@@ -92,6 +101,38 @@ impl Drop for ReceiptGuard {
 mod tests {
     use super::*;
     use zakura_chain::serialization::ZcashDeserializeInto;
+
+    #[test]
+    fn receipt_order_never_wraps_on_exhaustion() {
+        let counter = AtomicU64::new(u64::MAX - 1);
+        assert_eq!(next_receipt_order(&counter), u64::MAX - 1);
+        assert!(std::panic::catch_unwind(|| next_receipt_order(&counter)).is_err());
+        assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
+    }
+
+    #[test]
+    fn concurrent_receipt_orders_are_unique() {
+        let counter = AtomicU64::new(1);
+        let orders = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..8)
+                .map(|_| {
+                    scope.spawn(|| {
+                        (0..100)
+                            .map(|_| next_receipt_order(&counter))
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .flat_map(|handle| handle.join().unwrap())
+                .collect::<std::collections::HashSet<_>>()
+        });
+        assert_eq!(orders.len(), 800);
+        assert!(orders.contains(&1));
+        assert!(orders.contains(&800));
+        assert_eq!(counter.load(Ordering::Relaxed), 801);
+    }
 
     #[test]
     fn receipts_retain_identity_without_retaining_full_bodies() {

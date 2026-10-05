@@ -1047,26 +1047,36 @@ async fn serving_panics_close_the_connection_even_with_a_blocked_writer() {
             connection.clone(),
             close_cause.clone(),
         );
+        let completed = Completions::default();
+        let leases = [completed.track(1), completed.track(2), completed.track(3)];
+        let expected = leases.each_ref().map(Completion::id);
+        let [first, panicking, queued] = leases;
         // The first frame occupies the only queue slot. The writer waits on
         // the rest of this response and cannot observe dispatch's channel closing.
         serve
-            .admit(Job {
-                parts: 3,
-                part_len: 8,
-                ..job()
-            })
+            .admit_tracked(
+                Job {
+                    parts: 3,
+                    part_len: 8,
+                    ..job()
+                },
+                first,
+            )
             .unwrap();
         settle().await;
         assert_eq!(send.capacity(), 0);
         assert!(!connection.is_cancelled());
         serve
-            .admit(Job {
-                panic_cap,
-                panic_produce: !panic_cap,
-                ..job()
-            })
+            .admit_tracked(
+                Job {
+                    panic_cap,
+                    panic_produce: !panic_cap,
+                    ..job()
+                },
+                panicking,
+            )
             .unwrap();
-        serve.admit(job()).unwrap();
+        serve.admit_tracked(job(), queued).unwrap();
         tokio::time::timeout(Duration::from_secs(5), connection.cancelled())
             .await
             .unwrap();
@@ -1074,11 +1084,18 @@ async fn serving_panics_close_the_connection_even_with_a_blocked_writer() {
         assert_eq!(close_cause.get_or("cancelled"), "service_panic");
         settle().await;
         assert_eq!(serve.open(), 0);
+        let mut records = Vec::new();
+        completed.drain(|id| records.push(id));
+        assert_eq!(records.len(), expected.len());
+        for id in expected {
+            assert_eq!(records.iter().filter(|record| **record == id).count(), 1);
+        }
         drop(output);
         settle().await;
         assert_eq!(capacity.node_execution_held(), 0);
         assert_eq!(capacity.node_output_held(), 0);
         assert_eq!(capacity.node_output_responses.reserved(), 0);
+        completed.drain(|_| panic!("late task cleanup cannot report completion twice"));
         let mut healthy = session(&capacity, 2, 4);
         healthy.serve.admit(job()).unwrap();
         assert!(matches!(next(&mut healthy.output).await, Probe::Done(0)));

@@ -200,9 +200,15 @@ mod tests {
         let mut old = completed.track(1);
         drop(completed);
         assert!(old.state.upgrade().is_none());
+        let replacement = Completions::default();
+        let current = replacement.track(1);
+        let current_id = current.id();
         old.queue_ending(|| Ok::<_, ()>(())).unwrap();
         drop(old);
-        let replacement = Completions::default();
-        replacement.drain(|_| panic!("a replacement session has its own queue"));
+        replacement.drain(|_| panic!("old cleanup cannot complete an active replacement"));
+        drop(current);
+        let mut records = Vec::new();
+        replacement.drain(|id| records.push(id));
+        assert_eq!(records, [current_id]);
     }
 }

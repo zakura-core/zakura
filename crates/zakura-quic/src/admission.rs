@@ -2,6 +2,7 @@
 
 use std::{
     future::Future,
+    net::IpAddr,
     pin::Pin,
     sync::{Arc, Mutex},
     task::{Context, Poll},
@@ -10,7 +11,7 @@ use std::{
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-use crate::ConnectError;
+use crate::{endpoint::PendingTable, ConnectError};
 
 /// Serializes construction with the socket-table check. Owners also retain a
 /// permit, because a drained connection can still have unread stream handles.
@@ -68,6 +69,7 @@ pub(crate) struct Reservation {
 pub(crate) struct ConnectionAttempt {
     connecting: noq::Connecting,
     reservation: Option<Reservation>,
+    close_charge: Option<(PendingTable, IpAddr)>,
 }
 
 impl ConnectionAttempt {
@@ -75,7 +77,14 @@ impl ConnectionAttempt {
         Self {
             connecting,
             reservation: Some(reservation),
+            close_charge: None,
         }
+    }
+
+    /// Charges `ip` from the connection's close until noq frees its state (ADM-8).
+    pub(crate) fn charge_ip_after_close(mut self, table: PendingTable, ip: IpAddr) -> Self {
+        self.close_charge = Some((table, ip));
+        self
     }
 }
 
@@ -85,15 +94,22 @@ impl Future for ConnectionAttempt {
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let result = std::task::ready!(Pin::new(&mut self.connecting).poll(cx));
         let reservation = self.reservation.take();
+        let close_charge = self.close_charge.take();
         if let Ok(connection) = &result {
             let weak = connection.weak_handle();
+            let closed = connection.on_closed();
             // The task owns no endpoint or strong connection handle. It cannot
             // keep a connection open, and at most `total` such owners can exist.
             tokio::spawn(async move {
+                // State is freed only after close, so polling can wait for it.
+                closed.await;
+                let charge = close_charge.map(|(table, ip)| table.hold(ip));
+                let mut wait = Duration::from_millis(10);
                 while weak.is_alive() {
-                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    tokio::time::sleep(wait).await;
+                    wait = (wait * 2).min(Duration::from_secs(1));
                 }
-                drop(reservation);
+                drop((charge, reservation));
             });
         }
         Poll::Ready(result)

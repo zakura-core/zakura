@@ -66,7 +66,8 @@ async fn capped_source_reconnect_evicts_blackholed_incumbent() -> Result<(), Box
         );
         drop(duplicate);
         wait_for_peer_count(&node, 0).await;
-        let recovered = replacement.connect(address, P2P_V2_ALPN).await?;
+        // The evicted incumbent and the closed duplicate still count against the IP.
+        let recovered = connect_after_close_holds(&replacement, &address).await?;
         complete_control(&replacement, &recovered, &limits).await?;
         wait_for_peer_count(&node, 1).await;
         assert_eq!(

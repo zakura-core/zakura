@@ -12,8 +12,8 @@ DEP-6, SOCK-1, WIRE-9, ADM-1, ADM-3, PATH-3, OBS-3, API-2, API-3, API-6 and
 API-7; §17a lists each change. Version 0.3 answers the V12 audit of that
 implementation. It changes SOCK-11, ADM-3, PATH-2, DIAL-4, DIAL-5, CTRL-17,
 CTRL-22 and API-7; §17b lists each change. Version 0.4 adds SOCK-12; §17c
-explains it. Version 0.5 adds ADM-11 and ADM-12 and changes ADM-3, ADM-8 and
-API-6; §17d lists each change.
+explains it. Version 0.5 adds ADM-11 and ADM-12 and changes ADM-1, ADM-3,
+ADM-7, ADM-8 and API-6; §17d lists each change.
 
 ## 0. Conventions
 
@@ -207,7 +207,9 @@ work. Stage 2 runs after TLS proves the `NodeId` and is today's Zakura logic.
   - `remote`, the canonical source address (SOCK-11);
   - `validated`, which is `Incoming::remote_address_validated()`;
   - `pending_total` and `pending_from_ip`, the handshakes in progress on the
-    endpoint and from `remote`'s IP (ADM-7).
+    endpoint and from `remote`'s IP (ADM-7). `pending_from_ip` also counts the
+    IP's failed attempts and closed inbound connections whose state may remain
+    (ADM-7, ADM-8).
 - **ADM-2.** `admit` returns one of four outcomes, each mapped to a noq call:
   - `Accept` → `Incoming::accept`;
   - `Refuse` → `Incoming::refuse`, which sends `CONNECTION_REFUSED`;
@@ -217,8 +219,8 @@ work. Stage 2 runs after TLS proves the `NodeId` and is today's Zakura logic.
   1. `Ignore` for a banned IP;
   2. `Refuse` when the IP's established plus pending connections reach
      `max_connections_per_ip + 1` (saturating addition);
-  3. `Refuse` when `max_pending_per_ip` is set and the IP has that many
-     handshakes in progress;
+  3. `Refuse` when `max_pending_per_ip` is set and `pending_from_ip` reaches
+     it;
   4. `Refuse` when the endpoint has `max_pending_handshakes` handshakes in progress;
   5. `Retry` when `retry_threshold` is set, `validated` is false, and pending
      handshakes reach `retry_threshold`;
@@ -250,12 +252,19 @@ work. Stage 2 runs after TLS proves the `NodeId` and is today's Zakura logic.
   finish within it. On expiry, the endpoint MUST drop the connecting future, which closes the
   connection, and count `zakura.quic.handshake.timed_out`.
 - **ADM-7.** A pending handshake counts against its IP and against the endpoint
-  from `Accept` until the handshake completes or fails.
+  from `Accept` until the handshake completes or fails. A handshake that fails
+  after `Incoming::accept` returns keeps counting against its IP, but not the
+  endpoint, while noq may still be draining it. noq drains for three PTOs; the
+  endpoint bounds each PTO by
+  `max(3 × initial RTT, 5 × attempt age) + 1 ms + 2^14 ms`, the last term being
+  the largest peer `max_ack_delay`. The endpoint keeps at most 4,096 such
+  charges and expires the earliest first when full.
 - **ADM-8.** An established connection counts against its admitted IP until
   `Conn::closed()` resolves. The IP slot MUST NOT be released earlier. The
   aggregate owner slot additionally follows the transport state under ADM-11.
-  Failed handshakes remain aggregate charged through drain, without requiring
-  their source IP to stay charged after the handshake ends.
+  From close until noq frees its state, an inbound connection counts against
+  its admitted IP in `pending_from_ip`. One IP therefore cannot fill the
+  inbound share with failed attempts (ADM-7) or closed connections.
 - **ADM-9.** After the handshake, `Acceptor::handle` receives a `Conn` whose
   `remote_id()` is proven. Stage 2 (control hello, per-identity dedup, cohort
   check) stays in `zakura-network` and doesn't change.
@@ -611,6 +620,7 @@ and the legacy stack bridges old and new `p2p_stack = "dual"` nodes (COMPAT-7).
 | Admission ordering, refuse, ignore, retry, timeout | ADM-1–ADM-7, SEC-3, SEC-4 |
 | Same-IP reconnect at the per-IP cap evicts its stale incumbent; another identity cannot register | ADM-3 |
 | Unread streams, failed inbound handshakes, and cancelled or timed-out dials stay charged through drain; a dial refused at capacity reports a local limit | ADM-8, ADM-11 |
+| Failed and closed attempts stay charged to their IP while their state may remain; another IP still connects | ADM-1, ADM-7, ADM-8 |
 | Inbound control stalls and registered inbound peers leave outbound room; outbound can use every unused slot | ADM-12 |
 | Happy-eyeballs dial with mixed v4/v6 addresses and one black-holed address | DIAL-1–DIAL-6 |
 | Path ban and admitted-IP invariance | PATH-1–PATH-5, SEC-5 |
@@ -693,11 +703,19 @@ requirements:
 
 ## 17d. Changes in version 0.5
 
+- **ADM-1.** `pending_from_ip` also counts failed attempts and closed inbound
+  connections whose state may remain.
 - **ADM-3.** Rule 2 admits one pending attempt beyond
   `max_connections_per_ip`. Version 0.4 refused a same-IP reconnect before its
   handshake, so it never reached duplicate handling and stayed locked out until
-  the stale incumbent idled out. Registration still enforces the limit.
-- **ADM-8.** The aggregate owner slot follows transport state under ADM-11.
+  the stale incumbent idled out. Registration still enforces the limit. Rule 3
+  now reads `pending_from_ip`.
+- **ADM-7.** A failed attempt stays charged to its IP for a drain bound. A peer
+  can set `max_ack_delay` near 2^14 ms, which stretches noq's drain to 52 s or
+  more. Charged only globally, a few such attempts per second from one IP could
+  fill the inbound share and refuse every other peer.
+- **ADM-8.** The aggregate owner slot follows transport state under ADM-11, and
+  a closed inbound connection keeps its IP charged until that state is freed.
 - **ADM-11.** Added. Version 0.4 released capacity at `Conn::closed()` and
   charged nothing for failed or cancelled attempts, although noq keeps their
   state through drain and while unread streams remain.

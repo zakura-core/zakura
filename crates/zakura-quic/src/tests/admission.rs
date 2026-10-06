@@ -194,6 +194,96 @@ async fn concurrent_sockets_preserve_an_outbound_slot() {
     .unwrap();
 }
 
+/// The failed-handshake charge covers noq's three-PTO drain at the largest
+/// peer `max_ack_delay` (ADM-7).
+#[test]
+fn failed_handshake_drain_covers_the_largest_peer_ack_delay() {
+    // Three PTOs of three initial RTTs, 1 ms granularity and 2^14 ms of delay.
+    assert_eq!(
+        crate::endpoint::failed_handshake_drain(Duration::ZERO),
+        Duration::from_millis(3 * (999 + 1 + 16_384))
+    );
+    // RTT samples up to the attempt's age raise the bound.
+    assert_eq!(
+        crate::endpoint::failed_handshake_drain(Duration::from_secs(1)),
+        Duration::from_millis(3 * (5_000 + 1 + 16_384))
+    );
+}
+
+/// An IP stays charged for its failed and closed attempts while their state may
+/// remain, so it cannot fill the inbound share; another IP still connects
+/// (ADM-7, ADM-8).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_and_closed_attempts_stay_charged_to_their_ip() {
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        let config = QuicConfig {
+            handshake_timeout_secs: Some(2),
+            retry_threshold: None,
+            ..test_config()
+        };
+        let mut bind = limited_bind(4, 3);
+        bind.addrs.push("[::1]:0".parse().unwrap());
+        // Zakura's acceptor applies its per-IP limit to this count (ADM-3 rule 2).
+        let mut server = server_with(&config, &bind, &[ALPN], |info| {
+            if info.pending_from_ip >= 2 {
+                Admit::Refuse
+            } else {
+                Admit::Accept
+            }
+        });
+        let id = server.endpoint.local_id();
+        let addrs = server.endpoint.local_addrs();
+        let v4 = *addrs.iter().find(|addr| addr.is_ipv4()).unwrap();
+        let v6 = *addrs.iter().find(|addr| addr.is_ipv6()).unwrap();
+        // This handshake fails at its deadline, after noq accepted it.
+        let stalled = stalled_handshake(&server).await;
+        wait_for_attempts(&server, 1).await;
+        tokio::time::sleep(Duration::from_millis(2100)).await;
+        while server.endpoint.pending(v4.ip()).0 > 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(server.endpoint.pending(v4.ip()), (0, 1));
+        let attacker = client();
+        let conn = attacker
+            .connect(NodeAddr::with_addrs(id, [v4]), ALPN)
+            .await
+            .unwrap();
+        // The server's retained handle keeps the closed connection's state alive.
+        let retained = server.handled.recv().await.unwrap();
+        conn.close(0u32.into(), b"churn");
+        retained.closed().await;
+        while server.endpoint.pending(v4.ip()).1 < 2 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(matches!(
+            attacker.connect(NodeAddr::with_addrs(id, [v4]), ALPN).await,
+            Err(ConnectError::Refused)
+        ));
+        let seen = *server.seen.lock().unwrap().last().unwrap();
+        assert_eq!((seen.pending_total, seen.pending_from_ip), (0, 2));
+
+        let honest = QuicEndpoint::bind(
+            NodeSecretKey::generate(),
+            &QuicBindConfig {
+                addrs: vec![SocketAddr::new(v6.ip(), 0)],
+                ..loopback()
+            },
+            &test_config(),
+        )
+        .unwrap();
+        let honest_conn = honest
+            .connect(NodeAddr::with_addrs(id, [v6]), ALPN)
+            .await
+            .unwrap();
+        drop((honest_conn, conn, retained, stalled));
+        honest.shutdown().await;
+        attacker.shutdown().await;
+        server.endpoint.shutdown().await;
+    })
+    .await
+    .unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn outbound_connections_can_use_entire_budget() {
     tokio::time::timeout(TEST_TIMEOUT, async {

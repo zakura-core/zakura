@@ -6065,6 +6065,22 @@ mod tests {
     };
     use zakura_test::vectors::{BLOCK_MAINNET_GENESIS_BYTES, BLOCK_TESTNET_141042_BYTES};
 
+    /// Dials `addr`, retrying while closed connections from this IP still count
+    /// against it (zakura-quic ADM-8). Each refused dial also drains locally.
+    async fn connect_after_close_holds(
+        endpoint: &QuicEndpoint,
+        addr: &NodeAddr,
+    ) -> Result<Connection, BoxError> {
+        loop {
+            match endpoint.connect(addr.clone(), P2P_V2_ALPN).await {
+                Err(zakura_quic::ConnectError::Refused | zakura_quic::ConnectError::Capacity) => {
+                    tokio::time::sleep(Duration::from_millis(100)).await
+                }
+                result => return Ok(result?),
+            }
+        }
+    }
+
     /// Regression for the mainnet dual-stack body-sync stall on
     /// `temp-zakura-sync-test-7` during run `20260714T073939Z-cca353fd1287`.
     /// Body sync stopped at height 2,725,606 with available download capacity.
@@ -10879,6 +10895,8 @@ mod tests {
                 1,
                 "closing the duplicate must preserve the incumbent's IP slot"
             );
+            // Let noq free the closed duplicate.
+            drop((first_conn, first_accepted));
 
             // A second identity takes the IP's other slot.
             let third = LocalEndpointFactory::with_limits(&limits)
@@ -10900,7 +10918,7 @@ mod tests {
             let fourth = LocalEndpointFactory::with_limits(&limits)
                 .endpoint(886)
                 .await?;
-            let fourth_conn = fourth.connect(server_addr, P2P_V2_ALPN).await?;
+            let fourth_conn = connect_after_close_holds(&fourth, &server_addr).await?;
             let fourth_peer = ZakuraPeerId::new(fourth.local_id().as_bytes().to_vec())?;
             let _ = run_native_initiator_handshake_without_trace(
                 &fourth_conn,

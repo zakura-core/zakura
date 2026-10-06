@@ -133,6 +133,9 @@ struct SelectedRepairRange {
     terminal_boundary_hash: Option<block::Hash>,
     /// Whether the blocking target has any durable auxiliary row.
     has_durable_rows: bool,
+    /// Sources with a retained rooted payload at each header of an ambiguous boundary, in range
+    /// order. Other ranges leave this empty.
+    header_retained_sources: Box<[Box<[SourceId]>]>,
 }
 
 /// Selected-header request context for one auxiliary VCT repair.
@@ -156,9 +159,6 @@ pub struct VctRepairContext {
     retained_payloads: Box<[[u8; 32]]>,
     /// Sources that already supplied one retained rooted payload for every target in the range.
     retained_sources: Box<[SourceId]>,
-    /// Sources with a retained rooted payload at each header of an ambiguous boundary, in range
-    /// order. Other contexts leave this empty.
-    header_retained_sources: Box<[Box<[SourceId]>]>,
     /// Private selected-range state keeps the public context and port shapes stable.
     selected_range: Box<SelectedRepairRange>,
 }
@@ -180,11 +180,11 @@ impl VctRepairContext {
             excluded_inputs: Box::new([]),
             retained_payloads: Box::new([]),
             retained_sources: Box::new([]),
-            header_retained_sources: Box::new([]),
             selected_range: Box::new(SelectedRepairRange {
                 frontiers: Box::new([target]),
                 terminal_boundary_hash: boundary_hash,
                 has_durable_rows: false,
+                header_retained_sources: Box::new([]),
             }),
         }
     }
@@ -241,11 +241,11 @@ impl VctRepairContext {
             excluded_inputs: excluded_inputs.into_boxed_slice(),
             retained_payloads: retained_payloads.into_boxed_slice(),
             retained_sources: retained_sources.into_boxed_slice(),
-            header_retained_sources: Box::new([]),
             selected_range: Box::new(SelectedRepairRange {
                 frontiers: Box::new([target]),
                 terminal_boundary_hash: boundary_hash,
                 has_durable_rows: !rows.is_empty(),
+                header_retained_sources: Box::new([]),
             }),
         })
     }
@@ -290,6 +290,7 @@ impl VctRepairContext {
             frontiers: selected_range.into_boxed_slice(),
             terminal_boundary_hash,
             has_durable_rows: false,
+            header_retained_sources: Box::new([]),
         });
         Ok(self)
     }
@@ -376,7 +377,7 @@ impl VctRepairContext {
         self.admission_capacity_available &= successor_admission_capacity_available;
         self.excluded_inputs = excluded_inputs.into_boxed_slice();
         self.retained_payloads = retained_payloads.into_boxed_slice();
-        self.header_retained_sources = Box::new([
+        let header_retained_sources = Box::new([
             std::mem::replace(
                 &mut self.retained_sources,
                 retained_sources.into_boxed_slice(),
@@ -387,6 +388,7 @@ impl VctRepairContext {
             frontiers: Box::new([self.target, successor]),
             terminal_boundary_hash,
             has_durable_rows: true,
+            header_retained_sources,
         });
         Ok(Some(self))
     }
@@ -434,6 +436,7 @@ impl VctRepairContext {
             frontiers: self.selected_range.frontiers[..prefix_len].into(),
             terminal_boundary_hash: Some(self.selected_range.frontiers[prefix_len].hash),
             has_durable_rows: false,
+            header_retained_sources: Box::new([]),
         });
         prefix.episode = AuxiliaryRequirementEpisode::for_empty_selected_range(
             prefix.state_version,
@@ -531,6 +534,7 @@ impl VctRepairContext {
                         AuxiliaryInputFingerprint::new(frontier.hash, *input, boundary_hash);
                     let payload = semantic_payload_fingerprint(frontier.hash, Some(*input));
                     let source_retained = self
+                        .selected_range
                         .header_retained_sources
                         .get(index)
                         .is_some_and(|sources| sources.binary_search(&source).is_ok());

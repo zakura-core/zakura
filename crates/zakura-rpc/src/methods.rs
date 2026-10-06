@@ -204,6 +204,7 @@ pub(crate) const RPC_METHOD_ACCESS: &[(&str, RpcAccess)] = &[
     ("getinfo", RpcAccess::Unauthenticated),
     ("getdeprecationinfo", RpcAccess::Unauthenticated),
     ("getblockchaininfo", RpcAccess::Unauthenticated),
+    ("getnetworkparameters", RpcAccess::Unauthenticated),
     ("getaddressbalance", RpcAccess::Unauthenticated),
     ("sendrawtransaction", RpcAccess::Unauthenticated),
     ("getblock", RpcAccess::Unauthenticated),
@@ -352,6 +353,11 @@ pub trait Rpc {
     /// entries, it can be present with a zero balance.
     #[method(name = "getblockchaininfo")]
     async fn get_blockchain_info(&self) -> Result<GetBlockchainInfoResponse>;
+
+    /// Returns the configured consensus rules for a block at `height`.
+    /// This does not require that the block has been mined.
+    #[method(name = "getnetworkparameters")]
+    async fn get_network_parameters(&self, height: u32) -> Result<serde_json::Value>;
 
     /// Returns the total balance of provided `addresses` in a
     /// [`GetAddressBalanceResponse`] instance.
@@ -1602,6 +1608,21 @@ where
             });
 
         Ok(GetDeprecationInfoResponse { end_of_service })
+    }
+
+    async fn get_network_parameters(&self, height: u32) -> Result<serde_json::Value> {
+        let height = Height::try_from(height).map_err(|error| {
+            ErrorObject::owned(
+                ErrorCode::InvalidParams.code(),
+                error.to_string(),
+                None::<()>,
+            )
+        })?;
+        Ok(types::network_parameters::network_parameters(
+            &self.network,
+            height,
+            &self.build_version,
+        ))
     }
 
     #[allow(clippy::unwrap_in_result)]

@@ -1651,7 +1651,25 @@ class Nu7StatusTests(unittest.TestCase):
             number = int(params[0], 16)
             return {"height": number, "hash": params[0], "time": 1000 + 30 * number,
                     "difficulty": 3.0}
+        if method == "getnetworkparameters":
+            return {"effectiveHeight": params[0], "networkMagic": "7a6b7539"}
+        if method == "getblockchaininfo":
+            return {"blocks": 12, "bestblockhash": chain_hash(12)}
         raise AssertionError(method)
+
+    def test_consensus_export_does_not_expose_private_rpc_and_pins_tip(self):
+        self.view.update(nu7_rows(), 2000)
+        payload = self.view.response(2000)[1]
+        self.assertEqual(payload["rules"]["atTip"]["effectiveHeight"], 12)
+        self.assertEqual(payload["rules"]["nextBlock"]["effectiveHeight"], 13)
+        original = self.fake_rpc
+        def changed(method, params=None):
+            if method == "getblockchaininfo":
+                return {"blocks": 13, "bestblockhash": chain_hash(13)}
+            return original(method, params)
+        with mock.patch.object(self.view, "rpc", side_effect=changed):
+            self.view.update(nu7_rows(), 2010)
+        self.assertNotIn("rules", self.view.response(2010)[1])
 
     def test_payload_keeps_the_schema_version_1_contract(self):
         payload = self.view.build(nu7_rows(), 2000)
@@ -1908,6 +1926,23 @@ class Nu7SourceTests(unittest.TestCase):
         self.assertEqual(out["peer_external"], 2)
 
 
+class TrustedProxyTests(unittest.TestCase):
+    def client(self, peer, forwarded):
+        handler = object.__new__(status.Handler)
+        handler.client_address = (peer, 1234)
+        handler.headers = {"X-Forwarded-For": forwarded}
+        return handler.rate_limit_client()
+
+    def test_only_explicit_proxy_or_loopback_can_forward_client_identity(self):
+        import ipaddress
+        with mock.patch.object(status, "TRUSTED_PROXY_IPS", {ipaddress.ip_address("167.99.146.155")}):
+            self.assertEqual(self.client("167.99.146.155", "198.51.100.20"), "198.51.100.20")
+            self.assertEqual(self.client("127.0.0.1", "198.51.100.21"), "198.51.100.21")
+            self.assertEqual(self.client("203.0.113.7", "198.51.100.20"), "203.0.113.7")
+            self.assertEqual(self.client("167.99.146.155", "invalid"), "167.99.146.155")
+            self.assertEqual(self.client("167.99.146.155", "spoofed, 198.51.100.22"), "198.51.100.22")
+
+
 class Nu7HttpTests(unittest.TestCase):
     def setUp(self):
         self.original_collector = status.COLLECTOR
@@ -1952,6 +1987,24 @@ class Nu7HttpTests(unittest.TestCase):
         self.assertEqual(headers["Cache-Control"], "public, max-age=10")
         self.assertIsNone(self.get("/v1/status", "https://untrusted.example")[1]
                           ["Access-Control-Allow-Origin"])
+
+    def test_coherent_dashboard_uses_cached_generation_and_cors(self):
+        view = mock.Mock()
+        view.response.return_value = (200, {"schemaVersion": 1, "generation": "fixed",
+                                           "selectedProfile": "public-testnet"})
+        self.use(None)
+        with mock.patch.object(status, "ACTIVATION_FEED", view):
+            code, headers, payload = self.get("/v1/dashboard")
+            self.assertEqual(code, 200)
+            self.assertEqual(payload["generation"], "fixed")
+            self.assertEqual(headers["Access-Control-Allow-Origin"], "https://zakura.com")
+            self.assertEqual(headers["Cache-Control"], "public, max-age=10")
+            request = urllib.request.Request(self.base_url + "/v1/dashboard", method="OPTIONS",
+                                             headers={"Origin": "https://zakura.com"})
+            with urllib.request.urlopen(request) as response:
+                self.assertEqual(response.status, 204)
+            self.assertIsNone(self.get("/v1/dashboard", "https://untrusted.example")[1]
+                              ["Access-Control-Allow-Origin"])
 
     def test_unavailable_status_is_503_and_not_cached(self):
         view = mock.Mock()

@@ -6948,6 +6948,7 @@ dependencies = [
  "zakura-address",
  "zakura-chain",
  "zakura-consensus",
+ "zakura-header-chain",
  "zakura-keys",
  "zakura-network",
  "zakura-node-services",

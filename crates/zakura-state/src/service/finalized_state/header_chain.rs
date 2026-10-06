@@ -386,21 +386,37 @@ pub use fuzz::{replay_recovery_rows_bytes, RecoveryRowsReplaySummary};
 pub(crate) fn select_vct_auxiliary_delivery(deliveries: Vec<AuxDelivery>) -> Option<AuxDelivery> {
     deliveries
         .into_iter()
-        .filter(|delivery| delivery.tree_aux.is_some() && !delivery.is_rejected())
-        .min_by_key(|delivery| {
-            (
-                if delivery.is_authenticated() {
-                    0
-                } else if delivery.is_unauthenticated() {
-                    1
-                } else if delivery.is_disputed() {
-                    2
-                } else {
-                    3
-                },
-                delivery.delivery_id,
-            )
-        })
+        .filter(vct_auxiliary_delivery_is_usable)
+        .min_by_key(vct_auxiliary_delivery_rank)
+}
+
+/// Returns every usable VCT auxiliary delivery for a retained header in selection order.
+pub(crate) fn ranked_vct_auxiliary_deliveries(deliveries: Vec<AuxDelivery>) -> Vec<AuxDelivery> {
+    let mut usable: Vec<_> = deliveries
+        .into_iter()
+        .filter(vct_auxiliary_delivery_is_usable)
+        .collect();
+    usable.sort_unstable_by_key(vct_auxiliary_delivery_rank);
+    usable
+}
+
+fn vct_auxiliary_delivery_is_usable(delivery: &AuxDelivery) -> bool {
+    delivery.tree_aux.is_some() && !delivery.is_rejected()
+}
+
+fn vct_auxiliary_delivery_rank(delivery: &AuxDelivery) -> (u8, EvidenceId) {
+    (
+        if delivery.is_authenticated() {
+            0
+        } else if delivery.is_unauthenticated() {
+            1
+        } else if delivery.is_disputed() {
+            2
+        } else {
+            3
+        },
+        delivery.delivery_id,
+    )
 }
 
 /// Match durable base data and any outcome that the live engine still treats as authoritative.

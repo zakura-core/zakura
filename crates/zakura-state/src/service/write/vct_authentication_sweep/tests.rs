@@ -968,6 +968,47 @@ fn a_corrupt_successor_recovers_through_the_requested_ambiguous_repair() {
 }
 
 #[test]
+fn crossed_ambiguous_disputes_still_authenticate_the_honest_pair() {
+    let _init_guard = zakura_test::init();
+    // A wrong auth-data root at H + 1 disputes the honest H row with it. A repair supplier then
+    // pairs a wrong H row with the honest H + 1 row, and that pair fails too. Each header now
+    // holds one honest and one wrong disputed row, and each failed pair shares an observation.
+    // Selection takes the lowest delivery ID per header, so most supplier identities pair rows
+    // that already failed together, and no honest supplier can add a new payload.
+    let bad = Height(BODY_TIP + 4);
+    let predecessor = Height(bad.0 - 1);
+    for marker in 0x80..0x88 {
+        let mut fixture = Fixture::new();
+        fixture.insert_headers(None, Some((bad, Corruption::AuthDataRoot)));
+        let mut sweeper = VctAuthenticationSweeper::default();
+        fixture.sweep(&mut sweeper);
+        assert!(matches!(
+            fixture.try_redeliver(
+                predecessor,
+                Some((predecessor, Corruption::SaplingRoot)),
+                marker
+            ),
+            ApplyResult::Committed
+        ));
+        for _ in 0..3 {
+            fixture.sweep(&mut sweeper);
+        }
+
+        let predecessor_states = fixture.authentications(predecessor);
+        assert!(
+            predecessor_states.contains(&TestAuxStatus::Authenticated),
+            "marker {marker:#x}: the honest predecessor row authenticates: {predecessor_states:?}"
+        );
+        let successor_states = fixture.authentications(bad);
+        assert!(
+            successor_states.contains(&TestAuxStatus::Authenticated),
+            "marker {marker:#x}: the honest successor row authenticates: {successor_states:?}"
+        );
+        assert_eq!(fixture.repair_state(), VctRootRepairState::Idle);
+    }
+}
+
+#[test]
 fn an_ambiguous_repair_replaces_input_in_full_buckets() {
     let _init_guard = zakura_test::init();
     // Each disputed header fills a one-row bucket, so each can only replace its own row. The

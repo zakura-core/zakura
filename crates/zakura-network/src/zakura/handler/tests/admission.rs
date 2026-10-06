@@ -191,3 +191,42 @@ async fn outbound_control_handshakes_can_use_entire_budget() -> Result<(), BoxEr
     })
     .await?
 }
+
+/// A dial refused by the local transport budget reports a local resource limit,
+/// which dialers do not count against the peer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn transport_capacity_refusal_is_a_local_resource_limit() -> Result<(), BoxError> {
+    let _guard = zakura_test::init();
+    timeout(WAIT, async {
+        let (_identity, node, limits) = configured_node(1, 4).await?;
+        // A handshake to a silent socket holds the only transport slot until its
+        // deadline, without taking the handler's admission permit.
+        let silent = tokio::net::UdpSocket::bind("127.0.0.1:0").await?;
+        let silent_addr = NodeAddr::with_addrs(
+            zakura_quic::NodeSecretKey::generate().public(),
+            [silent.local_addr()?],
+        );
+        let quic = node.quic.clone();
+        let pending = tokio::spawn(async move { quic.connect(silent_addr, P2P_V2_ALPN).await });
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let peer = ZakuraTestNode::builder(985_300).spawn().await?;
+        let result = serve_native_dial_connection(&node, peer.node_addr().await, &limits).await;
+        assert!(
+            matches!(
+                result,
+                Err(ZakuraHandlerError::ResourceLimit("transport capacity"))
+            ),
+            "{result:?}"
+        );
+        assert_eq!(node.handler.admission.available_permits(), 1);
+
+        pending.abort();
+        let _ = pending.await;
+        drop(silent);
+        peer.shutdown().await;
+        node.shutdown().await;
+        Ok::<_, BoxError>(())
+    })
+    .await?
+}

@@ -4191,7 +4191,14 @@ pub(crate) async fn serve_native_dial_connection(
     );
     let connection = timeout(dial_timeout, endpoint.quic.connect(node_addr, P2P_V2_ALPN))
         .await
-        .map_err(|_| ZakuraHandlerError::Timeout("native dial"))??;
+        .map_err(|_| ZakuraHandlerError::Timeout("native dial"))?
+        .map_err(|error| match error {
+            // Our transport budget refused the dial, so dialers must not blame the peer.
+            zakura_quic::ConnectError::Capacity => {
+                ZakuraHandlerError::ResourceLimit("transport capacity")
+            }
+            error => error.into(),
+        })?;
     let remote_node_id = connection.remote_id();
     let peer_id = ZakuraPeerId::new(remote_node_id.as_bytes().to_vec())?;
     let conn = ZakuraConnTrace::new(&endpoint.handler.trace, conn_id, &peer_id);

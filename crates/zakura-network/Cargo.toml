@@ -49,7 +49,6 @@ blake2b_simd = { workspace = true }
 byteorder = { workspace = true }
 bytes = { workspace = true }
 chrono = { workspace = true }
-dirs-sys = { workspace = true }
 hex = { workspace = true }
 indexmap = { workspace = true, features = ["serde"] }
 iroh = { workspace = true }

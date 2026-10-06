@@ -77,7 +77,6 @@ console-subscriber = "0.5"
 criterion = { version = "0.8.2", default-features = false, features = ["rayon", "cargo_bench_support"] }
 crossbeam-channel = "0.5.14"
 derive-new = "0.7"
-dirs-sys = "0.5"
 ed25519-zebra = "4.2"
 equihash = { version = "=2.2.0", package = "zakura-equihash" }
 futures = "0.3.31"

@@ -12,6 +12,9 @@ use std::num::NonZeroU64;
 
 mod trace;
 
+#[cfg(test)]
+mod tests;
+
 /// Upper bound on how long the Sequencer task will wait to enqueue a verifier
 /// action before abandoning it. Reactor action sends are non-blocking.
 const ACTION_SEND_TIMEOUT: Duration = Duration::from_secs(5);
@@ -84,6 +87,33 @@ struct PendingNeededQuery {
     best_header_tip: block::Height,
     best_header_hash: block::Hash,
     hint_revision: Option<u64>,
+}
+
+#[derive(Copy, Clone, Debug)]
+struct BodyForkRepair {
+    body_work_epoch: zakura_header_chain::BodyWorkEpoch,
+    verified: zakura_header_chain::Frontier,
+    anchor: zakura_header_chain::Frontier,
+    reset_epoch_before: u64,
+}
+
+/// Reuse a fork repair only after the sequencer has acknowledged its reset.
+/// A matching anchor alone can be a stale mirror of a queued fork advance.
+fn body_fork_repair_applied(
+    repair: Option<BodyForkRepair>,
+    body_work_epoch: zakura_header_chain::BodyWorkEpoch,
+    verified: Option<zakura_header_chain::Frontier>,
+    anchor: zakura_header_chain::Frontier,
+    sequencer: SequencerView,
+) -> bool {
+    repair.is_some_and(|repair| {
+        repair.body_work_epoch == body_work_epoch
+            && Some(repair.verified) == verified
+            && repair.anchor == anchor
+            && sequencer.verified_tip == anchor.height
+            && sequencer.verified_hash == anchor.hash
+            && sequencer.reset_epoch > repair.reset_epoch_before
+    })
 }
 
 fn synchronize_persisted_body_alarm(
@@ -270,6 +300,7 @@ pub fn spawn_block_sync_reactor(
         verified_block_tip: startup.frontiers.verified_block_tip,
         request_floor: startup.frontiers.verified_block_tip,
         pending_needed_query: None,
+        body_fork_repair: None,
         verified_tip_on_selected: None,
         verified_probe_from: None,
         hint_refresh: None,
@@ -371,6 +402,9 @@ pub(super) struct BlockSyncReactor {
     request_floor: block::Height,
     /// Identity and scope of the state query awaiting a response.
     pending_needed_query: Option<PendingNeededQuery>,
+    /// Last requested fork repair, reusable only under the same committed fork
+    /// and body-work epoch after the sequencer acknowledges the reset to its anchor.
+    body_fork_repair: Option<BodyForkRepair>,
     /// Committed verified tip whose hash matched selected-branch work when it was observed.
     verified_tip_on_selected: Option<zakura_header_chain::Frontier>,
     /// Start of the next query when it must list the selected hash at an unproven verified tip.
@@ -1069,6 +1103,9 @@ impl BlockSyncReactor {
         // The `frontiers_changed` trace now fires from the view reaction, where the
         // task has reported whether the tip actually moved (a same-tip snapshot is a
         // no-op there, matching the original's `if advance.changed` gating).
+        // Even a finality-only update can queue a move back onto the committed
+        // fork. Do not reuse a repair while that advance is still pending.
+        self.body_fork_repair = None;
         let tip = frontiers.verified_block_tip;
         let capacity = self.sequencer_input.capacity();
         let max_capacity = self.sequencer_input.max_capacity();
@@ -1365,18 +1402,28 @@ impl BlockSyncReactor {
         let repairs_existing_fork = body_anchor.height < completed_query.verified_anchor.height
             || (body_anchor.height == completed_query.verified_anchor.height
                 && body_anchor.hash != completed_query.verified_anchor.hash);
+        let committed_verified = self
+            .committed_view
+            .as_ref()
+            .map(|view| view.frontiers.verified_best);
+        let fork_repair_applied = body_fork_repair_applied(
+            self.body_fork_repair,
+            current_scope.body_work_epoch,
+            committed_verified,
+            body_anchor,
+            self.last_view,
+        );
         // Same-epoch verified growth can extend a retained fork instead of the
         // selected branch. The read anchor then sits at or below the fork point,
         // so it is not an older selected frontier. Keep the read only when the
         // committed verified tip is proven on the selected branch. Reset only
         // when the read proves the fork. Otherwise re-read from the tip height.
+        // Once that fork is repaired, admit refills even if their chunk does
+        // not reach the competing tip, which can remain unchanged in full state.
         let mut read_proves_fork = false;
-        if let Some(verified) = self
-            .committed_view
-            .as_ref()
-            .map(|view| view.frontiers.verified_best)
-            .filter(|verified| compatible_read && verified.height > body_anchor.height)
-        {
+        if let Some(verified) = committed_verified.filter(|verified| {
+            compatible_read && !fork_repair_applied && verified.height > body_anchor.height
+        }) {
             match blocks.iter().find(|block| block.height == verified.height) {
                 Some(selected) => read_proves_fork = selected.hash != verified.hash,
                 None if self.verified_tip_on_selected == Some(verified) => {}
@@ -1394,7 +1441,13 @@ impl BlockSyncReactor {
                 }
             }
         }
-        if compatible_read && (repairs_existing_fork || read_proves_fork) {
+        if compatible_read && !fork_repair_applied && (repairs_existing_fork || read_proves_fork) {
+            self.body_fork_repair = committed_verified.map(|verified| BodyForkRepair {
+                body_work_epoch: current_scope.body_work_epoch,
+                verified,
+                anchor: body_anchor,
+                reset_epoch_before: self.last_reset_epoch,
+            });
             self.handle_chain_tip_reset(
                 BlockSyncFrontiers {
                     finalized_height: self.state.finalized_height,

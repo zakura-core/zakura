@@ -3708,13 +3708,15 @@ async fn compatible_commit_preserves_the_pending_body_query() {
 /// With `listed`, the read lists the selected hash at the fork tip's height,
 /// which proves the fork. Without it, the read cannot tell, so the reactor
 /// discards it and re-reads from the fork tip's height.
+/// The refill must then publish selected bodies without resetting again, even
+/// while the committed verified frontier remains on the competing fork.
 #[tokio::test]
 async fn fork_growth_during_compatible_query_resets_to_the_fork_point() {
-    for listed in [true, false] {
+    for (listed, fork_height, refill_through) in [(true, 2, 100), (false, 2, 100), (true, 80, 20)] {
         let fork_point = block::Hash([1; 32]);
         let fork_child = block::Hash([0xf2; 32]);
-        let selected = |from: u8| -> Vec<BlockSyncBlockMeta> {
-            (from..=100)
+        let selected = |from: u8, through: u8| -> Vec<BlockSyncBlockMeta> {
+            (from..=through)
                 .map(|h| BlockSyncBlockMeta {
                     height: block::Height(u32::from(h)),
                     hash: block::Hash([h; 32]),
@@ -3757,14 +3759,14 @@ async fn fork_growth_during_compatible_query_resets_to_the_fork_point() {
                     1,
                     2,
                     (1, fork_point),
-                    (2, fork_child),
+                    (fork_height, fork_child),
                     (100, block::Hash([100; 32])),
                 ),
                 0,
             )))
             .unwrap();
         tokio::time::timeout(Duration::from_secs(1), async {
-            while view.borrow().verified_tip < block::Height(2) {
+            while view.borrow().verified_tip < block::Height(fork_height) {
                 view.changed().await.unwrap();
             }
         })
@@ -3782,7 +3784,7 @@ async fn fork_growth_during_compatible_query_resets_to_the_fork_point() {
                 query_id,
                 scope,
                 body_anchor: zakura_header_chain::Frontier::new(block::Height(1), fork_point),
-                blocks: selected(if listed { 2 } else { 3 }),
+                blocks: selected(if listed { 2 } else { 3 }, 100),
             })
             .await
             .unwrap();
@@ -3809,7 +3811,7 @@ async fn fork_growth_during_compatible_query_resets_to_the_fork_point() {
                     query_id,
                     scope,
                     body_anchor: zakura_header_chain::Frontier::new(block::Height(1), fork_point),
-                    blocks: selected(2),
+                    blocks: selected(2, 100),
                 })
                 .await
                 .unwrap();
@@ -3827,17 +3829,54 @@ async fn fork_growth_during_compatible_query_resets_to_the_fork_point() {
         // The reset reaction forces a refill from the selected child of A. A
         // reaction to the earlier fork advance can still dispatch a query first;
         // the reset supersedes it.
-        loop {
+        let (query_id, scope) = loop {
             if let BlockSyncAction::QueryNeededBlocks {
+                query_id,
+                scope,
                 from: block::Height(2),
                 ..
             } = next_action(&mut actions).await
             {
-                break;
+                break (query_id, scope);
             }
-        }
+        };
         assert!(!wiring.work.pending_contains(block::Height(3)));
         assert_eq!(view.borrow().verified_tip, block::Height(1));
+        let repaired_reset_epoch = view.borrow().reset_epoch;
+
+        // Resetting the sequencer does not change full state. The same state
+        // read still proves the competing fork, but this frontier is repaired.
+        assert_eq!(
+            snapshots.borrow().as_ref().unwrap().frontiers.verified_best,
+            zakura_header_chain::Frontier::new(block::Height(fork_height), fork_child)
+        );
+        handle
+            .send(BlockSyncEvent::ScopedNeededBlocks {
+                read_authority: Some(scope),
+                query_id,
+                scope,
+                body_anchor: zakura_header_chain::Frontier::new(block::Height(1), fork_point),
+                blocks: selected(2, refill_through),
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !wiring.work.pending_contains(block::Height(2)) {
+                assert_eq!(
+                    view.borrow().reset_epoch,
+                    repaired_reset_epoch,
+                    "the refill must not reset an already repaired frontier (listed={listed})"
+                );
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the refill publishes the selected child of the fork point");
+        assert_eq!(wiring.work.pending_len(), usize::from(refill_through) - 1);
+        assert_eq!(wiring.work.pending_scope(block::Height(2)), Some(scope));
+        assert_eq!(view.borrow().reset_epoch, repaired_reset_epoch);
+        assert_eq!(view.borrow().verified_tip, block::Height(1));
+        assert_eq!(view.borrow().verified_hash, fork_point);
         task.abort();
     }
 }

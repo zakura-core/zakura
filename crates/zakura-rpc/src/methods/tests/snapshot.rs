@@ -14,7 +14,7 @@ use std::{
 
 use futures::FutureExt;
 use hex::FromHex;
-use insta::{dynamic_redaction, Settings};
+use insta::Settings;
 use jsonrpsee::core::RpcResult as Result;
 use tower::{buffer::Buffer, util::BoxService, Service};
 
@@ -718,19 +718,12 @@ async fn test_mocked_rpc_response_data_for_network(network: &Network) {
 
 /// Snapshot `getinfo` response, using `cargo insta` and JSON serialization.
 fn snapshot_rpc_getinfo(info: GetInfoResponse, settings: &insta::Settings) {
-    settings.bind(|| {
-        insta::assert_json_snapshot!("get_info", info, {
-            ".subversion" => dynamic_redaction(|value, _path| {
-                // assert that the subversion value is user agent
-                assert_eq!(value.as_str().unwrap(), "RPC test");
-                // replace with:
-                "[SubVersion]"
-            }),
-            ".errorstimestamp" => dynamic_redaction(|_value, _path| {
-                "[LastErrorTimestamp]"
-            }),
-        });
-    });
+    let mut info = serde_json::to_value(info).expect("RPC response serializes to JSON");
+    assert_eq!(info["subversion"].as_str().unwrap(), "RPC test");
+    info["subversion"] = "[SubVersion]".into();
+    info["errorstimestamp"] = "[LastErrorTimestamp]".into();
+
+    settings.bind(|| insta::assert_json_snapshot!("get_info", info));
 }
 
 /// Snapshot `getblockchaininfo` response, using `cargo insta` and JSON serialization.
@@ -739,21 +732,14 @@ fn snapshot_rpc_getblockchaininfo(
     info: GetBlockchainInfoResponse,
     settings: &insta::Settings,
 ) {
+    let mut info = serde_json::to_value(info).expect("RPC response serializes to JSON");
+    assert!(u32::try_from(info["estimatedheight"].as_u64().unwrap()).unwrap() < Height::MAX_AS_U32);
+    assert!(info["verificationprogress"].as_f64().unwrap() <= 1.0);
+    info["estimatedheight"] = "[Height]".into();
+    info["verificationprogress"] = "[f64]".into();
+
     settings.bind(|| {
-        insta::assert_json_snapshot!(format!("get_blockchain_info{variant_suffix}"), info, {
-            ".estimatedheight" => dynamic_redaction(|value, _path| {
-                // assert that the value looks like a valid height here
-                assert!(u32::try_from(value.as_u64().unwrap()).unwrap() < Height::MAX_AS_U32);
-                // replace with:
-                "[Height]"
-            }),
-            ".verificationprogress" => dynamic_redaction(|value, _path| {
-                // assert that the value looks like a valid verification progress here
-                assert!(value.as_f64().unwrap() <= 1.0);
-                // replace with:
-                "[f64]"
-            }),
-        });
+        insta::assert_json_snapshot!(format!("get_blockchain_info{variant_suffix}"), info);
     });
 }
 
@@ -778,16 +764,11 @@ fn snapshot_rpc_getblock_data(
     settings: &insta::Settings,
 ) {
     let expected_block_data = hex::encode(expected_block_data);
+    let block = serde_json::to_value(block).expect("RPC response serializes to JSON");
+    assert_eq!(block.as_str().unwrap(), expected_block_data);
 
     settings.bind(|| {
-        insta::assert_json_snapshot!(format!("get_block_data_{variant}"), block, {
-            "." => dynamic_redaction(move |value, _path| {
-                // assert that the block data matches, without creating a 1.5 kB snapshot file
-                assert_eq!(value.as_str().unwrap(), expected_block_data);
-                // replace with:
-                "[BlockData]"
-            }),
-        });
+        insta::assert_json_snapshot!(format!("get_block_data_{variant}"), "[BlockData]");
     });
 }
 
@@ -895,15 +876,17 @@ fn snapshot_rpc_getblocktemplate(
     coinbase_tx: Option<Transaction>,
     settings: &insta::Settings,
 ) {
+    let mut block_template =
+        serde_json::to_value(block_template).expect("RPC response serializes to JSON");
+    if let Some(work_id) = block_template.get_mut("workid") {
+        let work_id_string = work_id.as_str().expect("workid must be a string");
+        assert_eq!(work_id_string.len(), 32, "workid must encode 16 bytes");
+        assert!(work_id_string.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        *work_id = "[WorkId]".into();
+    }
+
     settings.bind(|| {
-        insta::assert_json_snapshot!(format!("get_block_template_{variant}"), block_template, {
-            ".workid" => dynamic_redaction(|value, _path| {
-                let work_id = value.as_str().expect("workid must be a string");
-                assert_eq!(work_id.len(), 32, "workid must encode 16 bytes");
-                assert!(work_id.bytes().all(|byte| byte.is_ascii_hexdigit()));
-                "[WorkId]"
-            }),
-        });
+        insta::assert_json_snapshot!(format!("get_block_template_{variant}"), block_template);
     });
 
     if let Some(coinbase_tx) = coinbase_tx {

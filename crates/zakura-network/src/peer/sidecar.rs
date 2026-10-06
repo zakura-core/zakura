@@ -46,6 +46,9 @@ impl WarningLimiter {
 /// Rate-limits warnings about a sidecar version that is too old for the next network upgrade.
 static UPGRADE_READINESS_WARNINGS: WarningLimiter = WarningLimiter::new();
 
+/// Rate-limits warnings about a network upgrade evicting a sidecar.
+static UPGRADE_EVICTION_WARNINGS: WarningLimiter = WarningLimiter::new();
+
 /// Whether each sidecar supports the next network upgrade, by canonical IP.
 pub(crate) struct SidecarReadiness(Mutex<BTreeMap<IpAddr, bool>>);
 
@@ -127,14 +130,17 @@ pub(crate) fn set_next_upgrade_ready(sidecar_ip: IpAddr, ready: bool) {
 }
 
 /// Warns that the protected sidecar at `sidecar_ip` is being disconnected because a network
-/// upgrade raised the minimum protocol version above its `remote_version`, and marks it not
-/// ready.
+/// upgrade raised the minimum protocol version above its `remote_version` (at most once per
+/// [`MIN_PEER_SET_LOG_INTERVAL`]), and marks it not ready.
 pub(crate) fn warn_upgrade_eviction(
     sidecar_ip: IpAddr,
     remote_version: Version,
     minimum_version: Version,
 ) {
     set_next_upgrade_ready(sidecar_ip, false);
+    if !UPGRADE_EVICTION_WARNINGS.allow() {
+        return;
+    }
     tracing::warn!(
         ?remote_version,
         ?minimum_version,

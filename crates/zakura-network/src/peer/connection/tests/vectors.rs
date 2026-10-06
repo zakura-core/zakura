@@ -1173,3 +1173,57 @@ fn new_protected_test_connection() -> (
 ) {
     super::new_protected_test_connection()
 }
+
+/// Inventory completion cannot release a gossip slot before the actual block write.
+#[tokio::test(start_paused = true)]
+async fn block_gossip_slot_tracks_connection_write() {
+    use crate::{peer::block_gossip::BlockGossipPeer, InventoryResponse};
+    use std::sync::Arc;
+    use zakura_chain::serialization::ZcashDeserializeInto;
+
+    let _init_guard = zakura_test::init();
+    let (mut peer_tx, peer_rx) = mpsc::channel(1);
+    let (connection, client_tx, mut inbound, mut outbound, _error) = new_test_connection();
+    let gossip = BlockGossipPeer {
+        sender: client_tx,
+        uploads: connection.block_uploads.clone(),
+        registry: None,
+    };
+    let connection_task = tokio::spawn(connection.run(peer_rx));
+    let block: Arc<block::Block> = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
+        .zcash_deserialize_into()
+        .unwrap();
+    let hash = block.hash();
+    let slots = Arc::new(tokio::sync::Semaphore::new(1));
+    let advertisement = tokio::spawn(gossip.advertise(hash, slots.clone()));
+    assert_eq!(
+        outbound.next().await.unwrap(),
+        Message::Inv(vec![hash.into()])
+    );
+    peer_tx
+        .send(Ok(Message::GetData(vec![hash.into()])))
+        .await
+        .unwrap();
+    inbound
+        .expect_request(Request::BlocksByHash(IndexSet::from([hash])))
+        .await
+        .respond(Response::Blocks(vec![InventoryResponse::Available((
+            block.clone(),
+            None,
+        ))]));
+    tokio::task::yield_now().await;
+    // The zero-capacity sink cannot flush its block until we read it below.
+    tokio::time::advance(Duration::from_secs(4)).await;
+    tokio::task::yield_now().await;
+    assert_eq!(slots.available_permits(), 0);
+    assert!(!advertisement.is_finished());
+    assert_eq!(outbound.next().await.unwrap(), Message::Block(block));
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_millis(749)).await;
+    tokio::task::yield_now().await;
+    assert_eq!(slots.available_permits(), 0);
+    tokio::time::advance(Duration::from_millis(1)).await;
+    assert!(advertisement.await.unwrap());
+    assert_eq!(slots.available_permits(), 1);
+    connection_task.abort();
+}

@@ -302,6 +302,8 @@ where
         });
 
         let client = Client {
+            block_uploads: Default::default(),
+            peer_registry_updater: None,
             connection_info,
             shutdown_tx: Some(shutdown_sender),
             server_tx: client_request_sender,

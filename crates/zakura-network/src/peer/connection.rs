@@ -591,6 +591,9 @@ where
     /// The corresponding peer message receiver is passed to [`Connection::run`].
     pub(super) peer_tx: PeerTx<Tx>,
 
+    /// Reports requested blocks and completed framed writes to gossip schedulers.
+    pub(super) block_uploads: super::block_gossip::BlockUploads,
+
     /// A connection tracker that reduces the open connection count when dropped.
     /// Used to limit the number of open connections in Zebra.
     ///
@@ -660,6 +663,7 @@ where
             client_rx: client_rx.into(),
             error_slot,
             peer_tx: peer_tx.into(),
+            block_uploads: Default::default(),
             connection_tracker,
             addr_label,
             last_metrics_state: None,
@@ -1151,7 +1155,7 @@ where
                          Handler::Finished(Ok(Response::Nil))
                     )
             }
-            (AwaitingRequest, AdvertiseBlock(hash, _) | AdvertiseBlockToAll(hash)) => {
+            (AwaitingRequest, AdvertiseBlock(hash, _) | AdvertiseBlockToAll(hash) | AdvertiseMinedBlock(hash)) => {
                 self
                     .peer_tx
                     .send(Message::Inv(vec![hash.into()]))
@@ -1327,7 +1331,9 @@ where
                         .iter()
                         .any(|item| matches!(item, InventoryHash::Block(_))) =>
                 {
-                    let hashes = block_hashes(items).collect();
+                    let hashes = block_hashes(items)
+                        .inspect(|hash| self.block_uploads.requested(*hash))
+                        .collect();
 
                     if self.connection_info.is_protected_peer {
                         let source = self
@@ -1520,12 +1526,17 @@ where
                 for block in blocks.into_iter() {
                     match block {
                         Available((block, _)) => {
+                            let hash = block.hash();
                             if let Err(e) = self.peer_tx.send(Message::Block(block)).await {
                                 self.fail_with(e).await;
                                 return;
                             }
+                            self.block_uploads.written(hash);
                         }
-                        Missing(hash) => missing_hashes.push(hash.into()),
+                        Missing(hash) => {
+                            self.block_uploads.unavailable(hash);
+                            missing_hashes.push(hash.into());
+                        }
                     }
                 }
 
@@ -1841,6 +1852,7 @@ where
     Tx: Sink<Message, Error = SerializationError> + Unpin,
 {
     fn drop(&mut self) {
+        self.block_uploads.disconnected();
         self.shutdown(PeerError::ConnectionDropped);
 
         self.erase_state_metrics();

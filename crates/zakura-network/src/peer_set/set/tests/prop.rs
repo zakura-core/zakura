@@ -6,7 +6,7 @@ use futures::{stream, FutureExt, StreamExt};
 use proptest::prelude::*;
 use tower::{
     discover::{Change, Discover},
-    BoxError, ServiceExt,
+    BoxError, Service, ServiceExt,
 };
 
 use zakura_chain::{
@@ -295,10 +295,8 @@ proptest! {
     }
 }
 
-/// Production nodes often accept an IPv4 zcashd sidecar through an IPv6 dual-stack
-/// listener, which reports its address as IPv4-mapped IPv6. Fractional
-/// `AdvertiseBlock` gossip can miss an unrecognized sidecar for many blocks in a
-/// row, so canonical address matching must always include it.
+/// Canonical address matching puts an IPv4-mapped sidecar in the capped first wave.
+/// The scheduler advertises to the remaining peers only after slots become available.
 #[test]
 fn sidecar_peer_always_receives_block_gossip() {
     const TOTAL_PEERS: usize = 59;
@@ -311,6 +309,7 @@ fn sidecar_peer_always_receives_block_gossip() {
 
     let (runtime, _init_guard) = zakura_test::init_async();
     let _guard = runtime.enter();
+    tokio::time::pause();
 
     let config = Config::default();
     let block_gossip_peer_ips = vec![IpAddr::V4(Ipv4Addr::LOCALHOST)];
@@ -357,41 +356,55 @@ fn sidecar_peer_always_receives_block_gossip() {
 
         assert_eq!(total_number_of_active_peers, TOTAL_PEERS);
 
-        let number_of_peers_to_broadcast = peer_set.number_of_peers_to_broadcast();
-        assert_eq!(number_of_peers_to_broadcast, 20);
-
-        let response_future =
-            peer_set.route_block_broadcast(Request::AdvertiseBlock(block_hash, None));
-        std::mem::drop(response_future);
-
-        let mut block_gossip_received = 0;
+        let broadcast = tokio::spawn(
+            peer_set
+                .ready()
+                .await
+                .unwrap()
+                .call(Request::AdvertiseMinedBlock(block_hash)),
+        );
+        tokio::task::yield_now().await;
+        let mut received = 0;
         let mut sidecar_received = false;
         for (index, handle) in handles.iter_mut().enumerate() {
-            if let ReceiveRequestAttempt::Request(client_request) =
+            if let ReceiveRequestAttempt::Request(request) =
                 handle.try_to_receive_outbound_client_request()
             {
-                assert_eq!(
-                    client_request.request,
-                    Request::AdvertiseBlock(block_hash, None)
-                );
-                block_gossip_received += 1;
+                assert_eq!(request.request, Request::AdvertiseBlock(block_hash, None));
+                request.tx.send(Ok(crate::Response::Nil)).unwrap();
+                received += 1;
                 sidecar_received |= index == SIDECAR_INDEX;
             }
         }
-
         assert!(
             sidecar_received,
-            "configured sidecar must receive block gossip"
+            "configured sidecar receives the first wave"
         );
         assert_eq!(
-            block_gossip_received,
-            number_of_peers_to_broadcast + 1,
-            "block gossip should include sampled peers plus the sidecar"
+            received,
+            crate::peer::block_gossip::BLOCK_GOSSIP_CONCURRENCY
         );
-        assert!(
-            block_gossip_received < TOTAL_PEERS,
-            "sidecar block gossip must not broadcast to every connected peer"
-        );
+        tokio::task::yield_now().await;
+        // Inventory completion alone cannot start the remaining advertisements.
+        for handle in &mut handles {
+            assert!(handle
+                .try_to_receive_outbound_client_request()
+                .request()
+                .is_none());
+        }
+        // Let the executor drain all first-wave responses before advancing paused time.
+        tokio::time::sleep(std::time::Duration::from_millis(3001)).await;
+        for handle in &mut handles {
+            if let ReceiveRequestAttempt::Request(request) =
+                handle.try_to_receive_outbound_client_request()
+            {
+                assert_eq!(request.request, Request::AdvertiseBlock(block_hash, None));
+                request.tx.send(Ok(crate::Response::Nil)).unwrap();
+                received += 1;
+            }
+        }
+        assert_eq!(received, TOTAL_PEERS);
+        assert!(broadcast.await.unwrap().is_ok());
     });
 }
 

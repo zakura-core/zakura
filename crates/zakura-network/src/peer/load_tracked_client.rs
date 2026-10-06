@@ -28,6 +28,9 @@ static NEXT_PEER_TRACE_ID: AtomicU64 = AtomicU64::new(1);
 /// It also keeps track of the peer's reported protocol version.
 #[derive(Debug)]
 pub struct LoadTrackedClient {
+    /// Queues paced block inventory independently of ordinary request readiness.
+    pub(crate) block_gossip: super::block_gossip::BlockGossipPeer,
+
     /// A service representing a connected peer, wrapped in a load tracker.
     service: PeakEwma<Client>,
 
@@ -42,6 +45,11 @@ pub struct LoadTrackedClient {
 impl From<Client> for LoadTrackedClient {
     fn from(client: Client) -> Self {
         let connection_info = client.connection_info.clone();
+        let block_gossip = super::block_gossip::BlockGossipPeer {
+            sender: client.server_tx.clone(),
+            uploads: client.block_uploads.clone(),
+            registry: client.peer_registry_updater.clone(),
+        };
 
         let service = PeakEwma::new(
             client,
@@ -51,6 +59,7 @@ impl From<Client> for LoadTrackedClient {
         );
 
         LoadTrackedClient {
+            block_gossip,
             service,
             connection_info,
             // Wrap-around is unreachable for a process-local u64 counter.

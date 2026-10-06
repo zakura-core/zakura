@@ -122,7 +122,7 @@ use tower::{
     Service,
 };
 
-use zakura_chain::{chain_tip::ChainTip, parameters::Network};
+use zakura_chain::{block, chain_tip::ChainTip, parameters::Network};
 
 use crate::{
     address_book::AddressMetrics,
@@ -280,6 +280,9 @@ where
     /// height changes and determines the correct minimum version.
     minimum_peer_version: MinimumPeerVersion<C>,
 
+    /// The best tip height at which the ready sidecars' upgrade readiness was last checked.
+    sidecar_readiness_tip: Option<block::Height>,
+
     /// The configured limit for inbound and outbound connections.
     ///
     /// The peer set panics if this size is exceeded.
@@ -400,6 +403,7 @@ where
 
             // Peer validation
             minimum_peer_version,
+            sidecar_readiness_tip: None,
             peerset_total_connection_limit: config.peerset_total_connection_limit(),
 
             // Background tasks
@@ -530,6 +534,7 @@ where
 
         // Only checks the versions of ready peers, so it needs to run after `poll_unready()`.
         self.disconnect_from_outdated_peers();
+        self.check_sidecar_readiness_at_new_tip();
 
         // Check for failures in ready peers, removing newly errored or disconnected peers.
         // So it needs to run after `poll_unready()`.
@@ -814,13 +819,24 @@ where
                 }
                 !outdated
             });
+        }
+    }
 
-            // A sidecar that supports the upgrade that just activated may not support the next.
-            // Busy sidecars are checked when they become ready again, in `push_ready`.
-            for peer in self.ready_services.values() {
-                if let Some(ip) = self.zcashd_compat_peer_ip(peer) {
-                    self.check_sidecar_upgrade_readiness(ip, peer);
-                }
+    /// Checks the upgrade readiness of every ready zcashd-compat sidecar when the best tip
+    /// changes, so that it follows every activation. Busy sidecars are checked when they become
+    /// ready again, in [`Self::push_ready`].
+    fn check_sidecar_readiness_at_new_tip(&mut self) {
+        if self.block_gossip_peer_ips.is_empty() {
+            return;
+        }
+        let tip = self.minimum_peer_version.chain_tip().best_tip_height();
+        if tip == self.sidecar_readiness_tip {
+            return;
+        }
+        self.sidecar_readiness_tip = tip;
+        for peer in self.ready_services.values() {
+            if let Some(ip) = self.zcashd_compat_peer_ip(peer) {
+                self.check_sidecar_upgrade_readiness(ip, peer);
             }
         }
     }

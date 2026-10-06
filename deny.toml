@@ -12,7 +12,6 @@ yanked = "deny"
 # Advisory ignores are for transitive dependencies with no immediate safe upgrade in this branch.
 # Remove each ignore entry as the dependency chain is upgraded.
 ignore = [
-    "RUSTSEC-2025-0119", # number_prefix — transitive via indicatif
     "RUSTSEC-2025-0141", # bincode — direct dependency
 ]
 
@@ -97,7 +96,6 @@ skip = [
 # by default infinite
 skip-tree = [
     # wait for criterion and bindgen to update itertools
-    { name = "itertools", version = "0.10" },
     { name = "itertools", version = "0.13" },
 
     # wait for ordered-map to release a dependency fix
@@ -108,9 +106,6 @@ skip-tree = [
 
     # wait for abscissa_core to update toml
     { name = "toml", version = "=0.5.11" },
-
-    # wait for halo2_gadgets and primitive-types to update uint
-    { name = "uint", version = "=0.9.5" },
 
     # wait for zebra to update tower
     { name = "tower", version = "=0.4.13" },
@@ -128,10 +123,6 @@ skip-tree = [
     { name = "block-buffer", version = "=0.11.0-rc.3" },
     { name = "crypto-common", version = "=0.2.0-rc.1" },
     { name = "digest", version = "=0.11.0-pre.9" },
-
-    # console 0.15.x is pulled by indicatif (via howudoin); 0.16.x by insta (dev-dep).
-    # remove once indicatif/howudoin update to console 0.16.
-    { name = "console", version = "=0.15.11" },
 
     # hashbrown 0.16.x pulled by ed25519-zebra; 0.17.x by indexmap 2.14 (transitive of librustzcash).
     # remove once ed25519-zebra updates hashbrown.
@@ -167,7 +158,7 @@ skip-tree = [
     # wait until `config` updates `convert_case`
     { name = "convert_case", version = "0.6.0" },
 
-    # wait for hashlink/petgraph/metrics-util to update hashbrown and foldhash
+    # Wait for petgraph to update hashbrown and foldhash in xtask's graph.
     { name = "hashbrown", version = "0.15" },
 
     # Existing consumers still use these versions alongside newer ones.

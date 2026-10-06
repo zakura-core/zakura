@@ -32,6 +32,7 @@ Keep entries **newest-first**. Each row records:
 
 | Parameter | Location | Old → New | PR | Why |
 | --- | --- | --- | --- | --- |
+| `tracing.progress_bar` | `crates/zakurad/src/components/tracing.rs` | optional terminal display and implicit log file → accepted but ignored | [#1310](https://github.com/zakura-core/zakura/pull/1310) | Remove the terminal display and its dependencies. Generated configs omit this setting; explicit `tracing.log_file` still selects a log file. |
 | `tracing.flamegraph` | `crates/zakurad/src/components/tracing.rs` | optional output path → accepted but ignored | [#1306](https://github.com/zakura-core/zakura/pull/1306) | Remove the built-in tracing-span collector and use external sampled CPU profiling. Existing configs remain valid; generated configs omit this setting. |
 | `ZAKURA_ALPN_MISMATCH_BACKOFF` | `crates/zakura-network/src/zakura/handler.rs` | new → `10 min` minimum redial backoff for the node after an ALPN mismatch | [#1249](https://github.com/zakura-core/zakura/pull/1249) | Stop a node from redialing a peer on another protocol version in a loop (zakura-quic DIAL-5). |
 | `network.zakura.quic.handshake_timeout_secs` | `crates/zakura-quic/src/config.rs` | none (150 s idle timeout) → `10 s` | [#1249](https://github.com/zakura-core/zakura/pull/1249) | A stalled handshake holds a pre-TLS admission slot, so bound it well below the idle timeout (V12 F-305590). |

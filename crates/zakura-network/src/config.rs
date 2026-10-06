@@ -228,7 +228,7 @@ pub struct Config {
     /// # Defaults
     ///
     /// The default directory is platform dependent, based on
-    /// [`dirs::cache_dir()`](https://docs.rs/dirs/3.0.1/dirs/fn.cache_dir.html):
+    /// [`zakura_chain::common::default_cache_dir`]:
     ///
     /// |Platform | Value                                           | Example                              |
     /// | ------- | ----------------------------------------------- | ------------------------------------ |

@@ -129,17 +129,28 @@ impl BlockGossipPeer {
 
     /// Keep the permit through getdata, the block write, and the drain allowance.
     pub(crate) async fn advertise(mut self, hash: block::Hash, slots: Arc<Semaphore>) -> bool {
-        let (mut progress, claim) = self.uploads.register(hash);
-        let Some(claim) = claim else {
+        let mut retried = false;
+        let (mut progress, claim) = loop {
+            let (mut progress, claim) = self.uploads.register(hash);
+            if let Some(claim) = claim {
+                break (progress, claim);
+            }
             // Early and committed announcements join an existing upload for this peer.
-            loop {
+            let succeeded = loop {
                 if let UploadState::Finished(succeeded) = *progress.borrow_and_update() {
-                    return succeeded;
+                    break succeeded;
                 }
                 if progress.changed().await.is_err() {
-                    return false;
+                    break false;
                 }
+            };
+            if succeeded || retried || self.sender.is_closed() {
+                return succeeded;
             }
+            // The joined upload can fail without reaching this peer, for example when early
+            // inventory ends in `notfound`. Advertise once more after its owner releases the claim.
+            while progress.changed().await.is_ok() {}
+            retried = true;
         };
         let Ok(_permit) = slots.acquire().await else {
             return false;
@@ -315,10 +326,49 @@ mod tests {
         let (peer, mut receiver) = peer();
         let first = tokio::spawn(peer.clone().advertise(hash, slots.clone()));
         accept(&mut receiver, hash).await;
-        let duplicate = tokio::spawn(peer.advertise(hash, slots.clone()));
+        let duplicate = tokio::spawn(peer.clone().advertise(hash, slots.clone()));
         tokio::task::yield_now().await;
         first.abort();
         assert!(first.await.unwrap_err().is_cancelled());
+        // The duplicate takes over the advertisement instead of reporting the cancelled one.
+        accept(&mut receiver, hash).await;
+        peer.uploads.requested(hash);
+        peer.uploads.written(hash);
+        assert!(duplicate.await.unwrap());
+        assert_eq!(slots.available_permits(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn joined_announcement_readvertises_after_unavailable_upload() {
+        let hash = block::Hash([7; 32]);
+        let slots = Arc::new(Semaphore::new(1));
+        let (peer, mut receiver) = peer();
+        let early = tokio::spawn(peer.clone().advertise(hash, slots.clone()));
+        accept(&mut receiver, hash).await;
+        let committed = tokio::spawn(peer.clone().advertise(hash, slots.clone()));
+        tokio::task::yield_now().await;
+        peer.uploads.requested(hash);
+        peer.uploads.unavailable(hash);
+        assert!(!early.await.unwrap());
+        accept(&mut receiver, hash).await;
+        peer.uploads.requested(hash);
+        peer.uploads.written(hash);
+        assert!(committed.await.unwrap());
+        assert_eq!(slots.available_permits(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn joined_announcement_does_not_retry_after_disconnect() {
+        let hash = block::Hash([8; 32]);
+        let slots = Arc::new(Semaphore::new(1));
+        let (peer, mut receiver) = peer();
+        let first = tokio::spawn(peer.clone().advertise(hash, slots.clone()));
+        accept(&mut receiver, hash).await;
+        let duplicate = tokio::spawn(peer.clone().advertise(hash, slots.clone()));
+        tokio::task::yield_now().await;
+        drop(receiver);
+        peer.uploads.disconnected();
+        assert!(!first.await.unwrap());
         assert!(!duplicate.await.unwrap());
         assert_eq!(slots.available_permits(), 1);
     }
@@ -349,7 +399,7 @@ mod tests {
         let slots = Arc::new(Semaphore::new(BLOCK_GOSSIP_CONCURRENCY));
         let mut tasks = Vec::new();
         let mut receivers = Vec::new();
-        for i in 0..BLOCK_GOSSIP_CONCURRENCY + 1 {
+        for i in 0..=BLOCK_GOSSIP_CONCURRENCY {
             let (peer, receiver) = peer();
             tasks.push(tokio::spawn(peer.advertise(
                 block::Hash([u8::try_from(i).unwrap(); 32]),

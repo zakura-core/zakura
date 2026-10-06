@@ -21,6 +21,7 @@ from pathlib import Path
 from unittest import mock
 
 from zakura_fork_monitor import analysis, service, web
+from zakura_fork_monitor.config import parse_config
 from zakura_fork_monitor.consensus import TESTNET
 
 from .test_analysis import BASE, T0, StoreCase, sawtooth_tree, source_rows, split_tree
@@ -107,6 +108,23 @@ class RouteTests(ServerCase):
         self.assertIn("peers", self.monitor.snapshot, "the published snapshot must not be mutated")
         full = self.get_json("/api/snapshot?full=1")
         self.assertEqual(len(full["peers"]), full["peer_count"])
+        self.assertEqual(snap["old_rules"], {"peers": 0, "fork_height": None})
+
+    def test_snapshot_summarizes_old_rules_peers(self) -> None:
+        """`old_rules` counts peers in state "old-rules" and keeps their lowest known fork height."""
+        old = [{"source": f"p2p:10.0.1.{i}:18233", "state": "old-rules", "relation": {"kind": "fork", "fork_height": h}}
+               for i, h in enumerate((4_465_082, 4_465_025, None))]
+        others = [{"state": "synced", "relation": {"fork_height": 7}}, {"state": "old-rules", "relation": None}, "junk"]
+        self.monitor.snapshot = dict(self.monitor.snapshot, peers=old + others)
+        snap = self.get_json("/api/snapshot")
+        self.assertEqual(snap["old_rules"], {"peers": 4, "fork_height": 4_465_025})
+        self.assertEqual(snap["peer_count"], 6)
+        self.assertNotIn("peers", snap)
+
+    def test_summary_leaves_out_retired_sources(self) -> None:
+        """`/api/summary` applies the monitor's config to source health, as the peer views do."""
+        self.monitor.config = parse_config({"rpc": [{"name": "z2", "url": "http://10.0.0.2:18232/"}]})
+        self.assertEqual(self.get_json("/api/summary")["sources"]["rpc"], [])
 
     def test_history_routes(self) -> None:
         """Chain-based routes return the analysis results for the tree."""
@@ -413,19 +431,22 @@ class LoopTests(ServerCase):
         self.assertIn(threading.get_ident(), self.touched)
 
 
-# Runs the page script under node with a minimal DOM whose fetch serves one snapshot, then prints
-# the split pill, the tab title and the classes and text of the split callout and groups table.
+# Runs the page script under node with a minimal DOM. `fetch` answers each route path (query string
+# dropped) from the input's `routes`, `Date.now` is fixed at `now`, and click `actions` run after the
+# first render. Prints the split pill, the tab title, the split callout and groups table classes, and
+# for each element id in `dump` its text, its titles and the text of its descendants by class.
 PAGE_HARNESS = r"""
 'use strict';
 const fs = require('fs');
 const vm = require('vm');
-const [scriptPath, snapPath] = process.argv.slice(2);
-const snap = JSON.parse(fs.readFileSync(snapPath, 'utf8'));
+const [scriptPath, inputPath] = process.argv.slice(2);
+const input = JSON.parse(fs.readFileSync(inputPath, 'utf8'));
 class Node {}
 class El extends Node {
   constructor(tag) {
     super();
     this.tagName = tag; this.kids = []; this.attrs = {}; this.style = {}; this.className = ''; this.title = ''; this.hidden = false;
+    this.handlers = {}; this.queried = {};
     this.classList = {toggle() {}, add() {}, remove() {}, contains() { return false; }};
   }
   get textContent() { return this.kids.map((k) => (typeof k === 'string' ? k : k.textContent)).join(''); }
@@ -434,41 +455,86 @@ class El extends Node {
   replaceChildren(...kids) { this.kids = []; this.append(...kids); }
   setAttribute(k, v) { this.attrs[k] = v; if (k === 'title') this.title = v; }
   getAttribute(k) { return k in this.attrs ? this.attrs[k] : null; }
-  addEventListener() {}
-  querySelector() { return new El('div'); }
+  addEventListener(type, fn) { (this.handlers[type] = this.handlers[type] || []).push(fn); }
+  querySelector(sel) {
+    if (!this.queried[sel]) this.append(this.queried[sel] = new El('div'));
+    return this.queried[sel];
+  }
   querySelectorAll() { return []; }
   closest() { return null; }
 }
-const classes = (el) => (typeof el === 'string' ? [] : [...el.className.split(' ').filter(Boolean), ...el.kids.flatMap(classes)]);
+const walk = (el) => (typeof el === 'string' ? [] : [el, ...el.kids.flatMap(walk)]);
+// SVG elements get their class as an attribute.
+const classOf = (e) => (e.className || e.attrs.class || '').split(' ').filter(Boolean);
+const classes = (el) => walk(el).flatMap(classOf);
 const els = {};
+const byId = (id) => els[id] || (els[id] = new El('div'));
+byId('peers-details').open = Boolean(input.open_peers);
 const errors = [];
 Object.assign(globalThis, {
   Node,
   document: {
     hidden: false, title: '', body: new El('body'), addEventListener() {},
-    getElementById: (id) => els[id] || (els[id] = new El('div')),
+    getElementById: byId,
     createElement: (tag) => new El(tag), createElementNS: (ns, tag) => new El(tag),
   },
   window: {addEventListener() {}},
   setInterval: () => 0,
-  fetch: async (path) => (path === '/api/snapshot'
-    ? {ok: true, status: 200, json: async () => snap}
-    : {ok: false, status: 404, json: async () => ({error: 'not_found'})}),
+  fetch: async (path) => {
+    const route = path.split('?')[0];
+    return route in input.routes
+      ? {ok: true, status: 200, json: async () => input.routes[route]}
+      : {ok: false, status: 404, json: async () => ({error: 'not_found'})};
+  },
 });
+Date.now = () => input.now * 1000;
 console.error = (...args) => errors.push(args.map(String).join(' '));
 vm.runInThisContext(fs.readFileSync(scriptPath, 'utf8'));
+function click(el) {
+  const event = {target: el, currentTarget: el, key: 'Enter', preventDefault() {}, stopPropagation() {}};
+  for (const fn of el.handlers.click || []) fn(event);
+}
 setTimeout(() => {
-  const pill = els['split-pill'];
-  const callout = els['split-callout'];
+  for (const action of input.actions || []) {
+    const root = byId(action.id);
+    click(action.cls ? walk(root).find((e) => classOf(e).includes(action.cls)) : root);
+  }
+  const pill = byId('split-pill');
+  const callout = byId('split-callout');
+  const dump = {};
+  for (const id of input.dump || []) {
+    const nodes = walk(byId(id));
+    const byClass = {};
+    for (const e of nodes) for (const cls of classOf(e)) (byClass[cls] = byClass[cls] || []).push(e.textContent);
+    dump[id] = {text: byId(id).textContent, titles: nodes.map((e) => e.title).filter(Boolean), byClass};
+  }
   process.stdout.write(JSON.stringify({
     title: document.title, errors,
     pill: {className: pill.className, text: pill.textContent, title: pill.title},
     callout: {classes: classes(callout), text: callout.textContent},
-    groups: classes(els['groups-table']),
+    groups: classes(byId('groups-table')),
+    dump,
   }));
   process.exit(0);
 }, 100);
 """
+
+
+def render_page(test: unittest.TestCase, routes: dict, *, now: float, dump=(), actions=(),
+                open_peers: bool = False) -> dict:
+    """Run the page script on `routes` (path -> JSON body) under node and return what the harness saw."""
+    (script,) = re.findall(r"<script>(.*?)</script>", web.PAGE_FILE.read_text(encoding="utf-8"), re.S)
+    data = {"routes": routes, "now": now, "dump": list(dump), "actions": list(actions), "open_peers": open_peers}
+    with tempfile.TemporaryDirectory() as tmp:
+        paths = [Path(tmp) / name for name in ("harness.js", "page.js", "input.json")]
+        for path, content in zip(paths, (PAGE_HARNESS, script, json.dumps(data)), strict=True):
+            path.write_text(content, encoding="utf-8")
+        result = subprocess.run([shutil.which("node"), *map(str, paths)], capture_output=True, text=True,
+                                timeout=60, check=False)
+    test.assertEqual(result.returncode, 0, result.stderr)
+    seen = json.loads(result.stdout)
+    test.assertEqual(seen["errors"], [])
+    return seen
 
 
 @unittest.skipUnless(shutil.which("node"), "node is not installed")
@@ -491,17 +557,7 @@ class PageSplitTests(StoreCase):
     def render(self, event: service._Split | None) -> dict:
         """Render the snapshot with `event` as its `split_event` and return what the harness saw."""
         snap = dict(self.snap, split_event=event.view() if event is not None else None, served_at=self.now)
-        (script,) = re.findall(r"<script>(.*?)</script>", web.PAGE_FILE.read_text(encoding="utf-8"), re.S)
-        with tempfile.TemporaryDirectory() as tmp:
-            paths = [Path(tmp) / name for name in ("harness.js", "page.js", "snap.json")]
-            for path, content in zip(paths, (PAGE_HARNESS, script, json.dumps(snap)), strict=True):
-                path.write_text(content, encoding="utf-8")
-            result = subprocess.run([shutil.which("node"), *map(str, paths)], capture_output=True, text=True,
-                                    timeout=60, check=False)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        seen = json.loads(result.stdout)
-        self.assertEqual(seen["errors"], [])
-        return seen
+        return render_page(self, {"/api/snapshot": snap}, now=self.now)
 
     def split(self, since: float, event_id: int | None) -> service._Split:
         """Return a tracked split over the candidate, opened as `event_id` or still pending."""
@@ -539,6 +595,254 @@ class PageSplitTests(StoreCase):
         self.assertTrue(seen["title"].startswith("SPLIT · 1,000,010"))
         self.assertIn("is-bad", seen["callout"]["classes"])
         self.assertIn("row-bad", seen["groups"])
+
+
+PAGE_NOW = 1_791_300_000.0
+STEADY_PHASE = {"height": 4_471_000, "k": 6_972, "reset_height": 4_464_670, "d_pre": None, "difficulty": 10_000.0,
+                "d_ratio": None, "fast": False, "min_diff": False, "label": "steady", "era": "nu7",
+                "k_bucket": "no reset since NU7", "ratio_bucket": "no reset since NU7"}
+
+
+def page_block(name: str, **fields) -> dict:
+    """Return an API block dict for a block named `name` with a body, overridden by `fields`."""
+    block = {"hash": analysis_hash(name), "height": 4_470_840, "time": int(PAGE_NOW) - 100, "miner": "zkcodexcoder",
+             "template": "zakura", "first_seen_at": PAGE_NOW - 100, "min_diff": False, "body": True}
+    return {**block, **fields}
+
+
+def analysis_hash(name: str) -> str:
+    """Return a 64-hex-digit hash derived from `name`."""
+    return hashlib.sha256(name.encode()).hexdigest()
+
+
+def peer_view(source: str, **fields) -> dict:
+    """Return a peer view (see `analysis.peers`) of a synced, active source, overridden by `fields`."""
+    view = {"source": source, "kind": source.partition(":")[0], "fleet": False, "impl": "zebra", "version": "7.0.0",
+            "group": "zebra 7.0", "user_agent": None, "status": "connected", "active": True, "state": "synced",
+            "stuck": False, "tip_hash": analysis_hash("tip"), "tip_height": 4_471_000, "tip_at": PAGE_NOW - 5,
+            "tip_age_s": 5.0, "behind": 0, "relation": {"kind": "same", "n": 0}, "start_height": 4_470_000,
+            "first_seen_at": PAGE_NOW - 9_000, "last_ok_at": PAGE_NOW - 2, "last_error": None, "last_error_at": None,
+            "previous_error": None, "previous_error_at": None, "live": None}
+    return {**view, **fields}
+
+
+def old_rules_view(source: str, fork_height: int) -> dict:
+    """Return the view of a connected peer rejected for pre-NU7 headers, forked at `fork_height`."""
+    return peer_view(source, group="zebra 6.4", version="6.4.2", status="old-rules", state="old-rules",
+                     tip_hash=None, tip_height=None, tip_at=None, tip_age_s=None, behind=None, start_height=4_467_324,
+                     relation={"kind": "fork", "n": None, "fork_hash": None, "fork_height": fork_height,
+                               "depth_ours": None, "depth_theirs": None, "tip_height": 4_467_324},
+                     last_error="header 0090e649 has the wrong difficulty", last_error_at=PAGE_NOW - 2_900)
+
+
+@unittest.skipUnless(shutil.which("node"), "node is not installed")
+class PageFindingTests(unittest.TestCase):
+    """The page renders the audit's new API values (old-rules peers, steady phase, tie-breaks, ...) in plain words.
+
+    The payloads are hand-built in the documented shapes, so these tests do not depend on the analysis.
+    """
+
+    def test_live_view(self) -> None:
+        """Old-rules peers, tip-less stuck peers, the steady phase pill, fleet hosts and current vs previous errors."""
+        stuck = peer_view("p2p:45.76.52.93:18233", group="zebra 6.0", state="stuck", stuck=True, tip_hash=None,
+                          tip_height=None, tip_at=None, tip_age_s=None, behind=150_622, start_height=4_320_378,
+                          relation={"kind": "unknown"}, live={"tip_note": "no common block in window"})
+        peers = [
+            old_rules_view("p2p:178.105.92.0:18233", 4_465_082),
+            old_rules_view("p2p:69.30.210.162:18233", 4_465_025),
+            peer_view("rpc:tazminer", previous_error="tip: Connection refused", previous_error_at=PAGE_NOW - 180_000),
+            peer_view("p2p:10.0.0.1:18233", last_error="timed out", last_error_at=PAGE_NOW - 10),
+            peer_view("p2p:10.0.0.2:18233", active=False, state="inactive", last_error="connect timeout",
+                      last_error_at=PAGE_NOW - 7_200),
+            stuck,
+            peer_view("p2p:10.0.0.9:18233", group="zebra 6.4", active=False, state="inactive", stale=True,
+                      last_seen_at=PAGE_NOW - 180_000, last_seen_age_s=180_000.0, behind=1_879, tip_age_s=35_280.0,
+                      relation={"kind": "behind", "n": 56_966}, live={"rtt_ms": 143.0}),
+        ]
+        canonical = {"key": "canonical", "tip_hash": analysis_hash("tip"), "tip_height": 4_471_000, "fork_hash": None,
+                     "fork_height": None, "relation": {"kind": "same"}, "members": 6, "sources": []}
+        groups = [
+            {"key": "zakura 1.6", "impl": "zakura", "version": "1.6", "members": 6, "active": 6, "stuck": 0, "fleet": 3,
+             "old_rules": 0, "states": {"synced": 6}, "branch": canonical, "branches": [canonical],
+             "stuck_sources": []},
+            {"key": "zebra 6.4", "impl": "zebra", "version": "6.4", "members": 2, "active": 2, "stuck": 0, "fleet": 0,
+             "stale": 1, "old_rules": 2, "old_rules_relation": peers[0]["relation"], "states": {"old-rules": 2},
+             "branch": None, "branches": [], "stuck_sources": []},
+        ]
+        snap = {"generated_at": PAGE_NOW, "network": "testnet", "phase": STEADY_PHASE,
+                "tip": {**page_block("tip", height=4_471_000), "age_s": 5.0},
+                "chain": {"blocks": 30_000, "from_height": 4_441_000, "to_height": 4_471_000, "settle_depth": 3,
+                          "missing_parents": 0},
+                "peers": peers, "groups": groups, "split_candidate": None, "split_event": None, "stuck": [stuck],
+                "collectors": {"rpc": [], "rpc_error": None,
+                               "p2p": {"enabled": True, "error": None, "peers": 5, "connected": 5,
+                                       "connected_by_group": {}}},
+                "recent_reorgs": []}
+        # The snapshot route goes through web.py, which derives `old_rules` from the peers.
+        app = web.WebApp(types.SimpleNamespace(snapshot=snap), clock=lambda: PAGE_NOW)
+        routes = {"/api/snapshot": strict_json(app.handle("/api/snapshot").body),
+                  "/api/peers": {"generated_at": PAGE_NOW, "peers": peers}}
+        ids = ("network-note", "split-callout", "groups-table", "phase-pill", "stuck-list", "peers-table")
+        seen = render_page(self, routes, now=PAGE_NOW, dump=ids, open_peers=True)
+        dump = seen["dump"]
+        self.assertIn("8 active · 1 more not seen in 24 h · 2 peers on pre-NU7 rules (fork at 4,465,025) · "
+                      "30,000 blocks", dump["network-note"]["text"])
+        self.assertIn("Left out: 2 peers on pre-NU7 rules (fork at 4,465,025).", dump["split-callout"]["text"])
+        groups_seen = dump["groups-table"]
+        self.assertIn("fleet 3", groups_seen["text"])
+        self.assertIn("fleet hosts (RPC + P2P vantage points)", groups_seen["titles"])
+        self.assertIn("2 on pre-NU7 rules", groups_seen["text"])
+        self.assertIn("≈4,467,324", groups_seen["text"])  # an old-rules group's tip and relation come from its peers
+        self.assertIn("fork at 4,465,082", groups_seen["text"])
+        self.assertIn("seg-old", groups_seen["byClass"])
+        self.assertEqual(dump["phase-pill"]["text"], "No reset since NU7 · k 6,972")
+        stuck_text = dump["stuck-list"]["text"]
+        self.assertIn("tip ≈4,320,378 (version height) · no common block in window · 150,622 behind the best tip",
+                      stuck_text)
+        self.assertNotIn("unknown", stuck_text)
+        table = dump["peers-table"]
+        self.assertIn("old rules", table["byClass"]["badge"])
+        self.assertIn("≈4,467,324 (version height)", table["text"])
+        self.assertIn("fork at 4,465,082", table["text"])
+        self.assertNotIn("vs", table["text"])
+        self.assertIn("earlier: tip: Connection refused · 2d 2h ago", table["byClass"]["sub"])
+        self.assertIn("timed out · 10s ago", table["byClass"]["bad-text"])
+        # A source silent for 24 h shows when it was last seen, not its old tip, lag, tip age or RTT.
+        self.assertIn("last seen 2d 2h ago", table["text"])
+        for old in ("1,879", "56,966", "9h 48m", "143 ms"):
+            self.assertNotIn(old, table["text"])
+
+        issues = render_page(self, routes, now=PAGE_NOW, dump=["peers-table"], open_peers=True,
+                             actions=[{"id": "peer-issues"}])["dump"]["peers-table"]["text"]
+        for source in ("p2p:178.105.92.0:18233", "p2p:10.0.0.1:18233", "p2p:45.76.52.93:18233"):
+            self.assertIn(source, issues)
+        for source in ("rpc:tazminer", "p2p:10.0.0.2:18233"):  # a superseded error; an inactive row's error
+            self.assertNotIn(source, issues)
+
+    def test_history_sections(self) -> None:
+        """Tie-break labels, the fork drawer, steady-phase tables, resets, probes and the cross-check facts."""
+        loser = {"block": page_block("loser", miner=None, template=None, body=False, first_seen_at=PAGE_NOW - 99.76),
+                 "tip_hash": analysis_hash("loser"), "length": 1, "work": 1, "blocks": 1, "miners": ["no body"],
+                 "classification": "no_body", "same_job": False, "seen_first": False, "seen_gap_s": 0.24,
+                 "greater_raw_hash": False, "equal_work": True, "winner_len": 1,
+                 "probes": {"block": 0, "notfound": 2}, "adopted_by": {"count": 0, "by_group": {}, "sources": []}}
+        reorg = {"source": "p2p:9.9.9.9:18233", "group": "zebra 7.0", "at": PAGE_NOW - 90, "disconnected": 1,
+                 "connected": 1, "reorgs": 3}
+        forks = [
+            {"fork_hash": analysis_hash(f"fork{i}"), "fork_height": 4_470_839 - i, "fork_time": int(PAGE_NOW) - 200,
+             "height": 4_470_840 - i, "winner": {**page_block(f"w{i}", miner_tag="mined by zkcodexcoder"),
+                                                 "probes": None, "adopted_by": None},
+             "losers": [loser], "loser_count": 1, "depth": 1, "depth_work": 1, "classification": "no_body",
+             "same_job": False, "winner_first_seen": True, "winner_greater_raw_hash": True, "equal_work": True,
+             "tiebreak": tiebreak, "settled": True, "phase": STEADY_PHASE,
+             "reorgs": {"count": 1, "sources": [reorg]}}
+            for i, tiebreak in enumerate(("late", "unresolved", "work", "hash", "first_seen", "both"))
+        ]
+        miner = {"canonical": 0, "share": None, "stale": 0, "stale_rate": None, "self_orphans": 0, "races_lost": 0,
+                 "races_won": 0, "unattributed_losses": 0, "resets": 0, "templates": {}}
+        steady = {"fast": {"canonical": 0, "stale": 0}, "slow": {"canonical": 0, "stale": 0}}
+        miners = {"blocks": 3_000, "stale": 26, "unobserved": 0, "pairs": [
+            {"loser": "no body", "winner": "zkcodexcoder", "kind": "no_body", "n": 5}], "miners": [
+            {**miner, "miner": "zkcodexcoder", "canonical": 2_900, "stale": 20, "tag": "mined by zkcodexcoder",
+             "by_phase": {**steady, "steady": {"canonical": 2_900, "stale": 20}}},
+            {**miner, "miner": "no body", "stale": 5, "templates": {"no body": 5},
+             "by_phase": {**steady, "steady": {"canonical": 0, "stale": 5}}},
+            {**miner, "miner": "shielded:notag", "canonical": 100, "stale": 1,
+             "by_phase": {**steady, "steady": {"canonical": 100, "stale": 1}}},
+        ]}
+        reset = {"hash": analysis_hash("reset"), "time": int(PAGE_NOW) - 160_000, "miner": "shielded:notag",
+                 "template": "zakura", "gap": 451, "next_dt": 3, "forward_dating": 150.0, "d_pre": 9.69,
+                 "orphans": 0, "unobserved": 0}
+        routes = {
+            "/api/summary": {"periods": {"24h": {"resets": 0, "forks": 1, "reorgs": 0}}, "phase": STEADY_PHASE,
+                             "last_reset": {**reset, "height": 4_464_670, "fast_blocks": 356, "cycle_blocks": None,
+                                            "era": "pre-nu7"},
+                             "deepest_reorg_24h": None},
+            "/api/sawtooth": {"blocks": [{"height": 4_471_000 - i, "time": int(PAGE_NOW) - 25 * i, "dt": 25,
+                                          "difficulty": 10_000.0, "k": 6_972 - i, "fast": False, "min_diff": False,
+                                          "orphans": 0} for i in (1, 0)],
+                              "resets": [], "tip_phase": STEADY_PHASE, "averaging_window": 102, "target_spacing": 25},
+            "/api/orphans/stats": {"totals": {}, "by_k": [
+                {"key": ">=401", "blocks": 900, "orphans": 70, "rate": 0.0778, "share": 0.77, "forks": 60,
+                 "forks_per_1000": 66.7},
+                {"key": "no reset since NU7", "blocks": 6_600, "orphans": 21, "rate": 0.0032, "share": 0.23,
+                 "forks": 20, "forks_per_1000": 3.0}], "by_hour": []},
+            "/api/forks": {"forks": forks},
+            "/api/miners": miners,
+            "/api/resets": {"resets": [
+                {**reset, "height": 4_464_670, "fast_blocks": None, "cycle_blocks": None},
+                {**reset, "height": 4_464_635, "fast_blocks": 35, "cycle_blocks": 35, "never_slowed": True},
+                {**reset, "height": 4_464_600, "fast_blocks": 12, "cycle_blocks": 35, "never_slowed": False}]},
+            "/api/probes": {"probes": 10, "since": PAGE_NOW - 86_400, "by_group": [], "reprobe_by_group": [],
+                            "by_reason": [{"reason": "fetch", "probes": 5, "block": 1, "notfound": 4, "timeout": 0}],
+                            "incident_count": 2, "incidents": [
+                                {"at": PAGE_NOW - 60, "source": "p2p:9.9.9.9:18233", "group": "zebra 7.0",
+                                 "hash": analysis_hash(f"incident{i}"), "height": height, "canonical": None,
+                                 "reason": "announce", "peer_tip_hash": None}
+                                for i, height in enumerate((None, 4_400_000))]},
+            "/api/propagation": {"blocks": 1, "sightings": 10, "since": PAGE_NOW - 21_600, "recent": [], "by_group": [
+                {"group": "zebra 7.0", "kind": "p2p", "sources": 3, "sightings": 10, "first": 1, "p50_s": 0.5,
+                 "p90_s": 1.0, "max_s": 2.0, "coverage": 0.33}]},
+            "/api/crosscheck": {"sources": ["cipherscan"], "from_height": 4_441_000, "to_height": 4_470_997,
+                                "totals": {"both": 9, "only_theirs": 0, "only_ours": 10, "theirs_canonical": 1,
+                                           "out_of_window": 852, "unwatched": 0, "seen_unfetched": 4},
+                                "by_day": [{"day": "2026-10-05", "start": 1_791_158_400, "both": 1, "only_theirs": 0,
+                                            "seen_unfetched": 4, "only_ours": 2, "theirs_canonical": 0,
+                                            "unwatched": 0}],
+                                "only_theirs": [{"source": "cipherscan", "hash": analysis_hash("theirs"),
+                                                 "height": 4_470_000, "time": None, "miner_address": "tmMinerAddress"}],
+                                "only_ours": []},
+        }
+        ids = ("tile-resets", "saw-facts", "phase-chart", "forks-table", "miners-table", "miner-pairs",
+               "resets-table", "probes-reasons", "incidents-table", "propagation-table", "crosscheck-facts",
+               "crosscheck-days", "crosscheck-theirs")
+        seen = render_page(self, routes, now=PAGE_NOW, dump=ids, actions=[{"id": "forks-table", "cls": "clickable"}])
+        dump = seen["dump"]
+        self.assertIn("last 4,464,670 · 1d 20h ago (pre-NU7)", dump["tile-resets"]["text"])
+        facts = dump["saw-facts"]["text"]
+        for part in ("no reset since NU7", "k = 6,972 blocks since the last (pre-NU7) reset",
+                     "none: no reset since NU7", "4,464,670before the plotted range (pre-NU7)"):
+            self.assertIn(part, facts)
+        self.assertIn("no reset", dump["phase-chart"]["byClass"]["axis-text"])
+
+        forks_seen = dump["forks-table"]
+        for label in ("work on arrival", "unresolved", "more work", "greater hash", "first seen", "hash + first seen"):
+            self.assertIn(label, forks_seen["byClass"]["badge"])
+        self.assertIn("longest losing branch, in blocks", forks_seen["titles"])
+        self.assertIn("mined by zkcodexcoder", forks_seen["titles"])
+        drawer = forks_seen["byClass"]["drawer-inner"]
+        self.assertEqual(len(drawer), 1)
+        for part in ("Loser 1 · body not served", "(240 ms after the winner)", "not adopted by any vantage point",
+                     "1 out, 1 in · 1m 30s ago · 3 reorgs"):
+            self.assertIn(part, drawer[0])
+        self.assertIn("body not served", forks_seen["byClass"]["cell-main"][1])
+
+        miners_text = dump["miners-table"]["text"]
+        self.assertIn("Steady stale", miners_text)
+        self.assertIn("mined by zkcodexcoder", dump["miners-table"]["titles"])
+        self.assertNotIn("Fast stale", miners_text)
+        self.assertNotIn("Slow stale", miners_text)
+        self.assertIn("body not served", miners_text)
+        self.assertIn("unidentified shielded (Zakura template)", miners_text)
+        self.assertNotIn("shielded:notag", miners_text)
+        self.assertIn("body not served → zkcodexcoder × 5", dump["miner-pairs"]["text"])
+
+        resets_seen = dump["resets-table"]["byClass"]
+        self.assertIn("all 35", resets_seen["col-num"])
+        self.assertIn("12", resets_seen["col-num"])
+        self.assertEqual(resets_seen["warn-text"].count("fast"), 1)  # only the open cycle
+        self.assertIn("body fetch (not availability)", dump["probes-reasons"]["text"])
+        self.assertEqual(dump["incidents-table"]["byClass"]["badge"], ["never received", "unknown"])
+        self.assertIn("1/3 of their peers", " ".join(dump["propagation-table"]["titles"]))
+
+        facts = dump["crosscheck-facts"]["text"]
+        for part in ("Seen, not fetched4", "not seen here at all", "CipherScan’s list"):
+            self.assertIn(part, facts)
+        self.assertNotIn("Out of window", facts)
+        self.assertNotIn("852", facts)
+        self.assertIn("Seen, not fetched", dump["crosscheck-days"]["text"])
+        self.assertNotIn("Miner address", dump["crosscheck-theirs"]["text"])
+        self.assertNotIn("tmMinerAddress", dump["crosscheck-theirs"]["text"])
 
 
 class PolicyTests(unittest.TestCase):

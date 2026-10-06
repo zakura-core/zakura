@@ -281,9 +281,27 @@ class ForkTests(unittest.TestCase):
         losers = {loser.block.hash: loser for loser in b.chain.fork_events()[1].losers}
         self.assertEqual(losers[b.hash("v4")].classification, "self")
         self.assertFalse(losers[b.hash("v4")].same_job)
-        self.assertEqual(losers[b.hash("u4")].classification, "unknown")
-        self.assertEqual(losers[b.hash("u4")].miners, ("unknown",))
+        self.assertEqual(losers[b.hash("u4")].classification, "no_body")
+        self.assertEqual(losers[b.hash("u4")].miners, ("no body",))
         self.assertEqual(b.chain.fork_events()[1].classification, "race")
+
+    def test_unattributed_losers(self) -> None:
+        """A loser whose body never arrived is "no_body"; an untagged shielded coinbase attributes nothing."""
+        b = Builder()
+        b.genesis()
+        b.line("a", "g", 1, 2)
+        b.add("w3", "a2", miner="shielded:notag")
+        b.add("n3", "a2", miner="shielded:notag", dt=21)
+        b.add("w4", "w3")
+        b.add("h4", "w3", miner=None, dt=21)
+        b.add("w5", "w4")
+        notag, headers_only = b.chain.fork_events()
+        self.assertEqual(notag.classification, "unknown")
+        self.assertEqual((headers_only.classification, headers_only.losers[0].miners), ("no_body", ("no body",)))
+        b.add("i4", "w3", miner=None, dt=22, body=True)  # a parsed body whose miner the caller left out
+        self.assertEqual(b.chain.fork_events()[1].classification, "race")
+        node = b.chain.get(b.hash("h4"))
+        self.assertEqual(chain_mod.contest(node, b.chain.get(b.hash("w4"))), "no_body")
 
     def test_three_deep_reorg(self) -> None:
         """A heavier side branch replaces three canonical blocks."""
@@ -595,7 +613,8 @@ class PhaseTests(unittest.TestCase):
         self.assertEqual((first.gap, first.next_dt, first.forward_dating), (451, -120, 140.0))
         self.assertEqual((first.miner, first.template), ("zkcodexcoder", "zakura"))
         self.assertAlmostEqual(first.d_pre, difficulty_from_bits(NORMAL, TESTNET))
-        self.assertEqual((first.cycle_blocks, first.fast_blocks), (26, None))
+        self.assertEqual((first.cycle_blocks, first.fast_blocks, first.never_slowed), (26, 26, True))
+        self.assertEqual((second.fast_blocks, second.never_slowed, second.era), (None, False, "pre-nu7"))
         self.assertEqual((second.gap, second.next_dt, second.cycle_blocks), (451, None, None))
         self.assertAlmostEqual(second.d_pre, difficulty_from_bits(EASY, TESTNET))
         self.assertEqual([r.height for r in b.chain.resets(since_height=BASE + 32)], [second.height])
@@ -623,10 +642,29 @@ class PhaseTests(unittest.TestCase):
         b.line("f", "r", 1, 9, dt=5, bits=EASY)
         b.line("s", "f9", 1, 100, dt=100, bits=EASY)
         r = BASE + 41
-        self.assertTrue(b.chain.phase_at(r + 17).fast)  # the pre-NU7 rules would have ended it here
-        self.assertTrue(b.chain.phase_at(r + 101).fast)
-        self.assertFalse(b.chain.phase_at(r + 102).fast)
+        self.assertTrue(b.chain.phase_at(r + 9).fast)
+        # The pre-NU7 rules would have ended it at r + 17.
         self.assertEqual(b.chain.resets()[0].fast_blocks, 102)
+
+    def test_no_reset_since_nu7_is_steady(self) -> None:
+        """NU7 heights governed by a pre-NU7 reset keep k but have no phase; a NU7 reset starts a sawtooth."""
+        b = Builder(Chain(dataclasses.replace(TESTNET, nu7_height=BASE + 51)))
+        r = build_sawtooth(b)
+        before = b.chain.phase_at(BASE + 50)
+        self.assertEqual((before.era, before.steady, before.fast, before.k), ("pre-nu7", False, True, 9))
+        steady = b.chain.phase_at(BASE + 51)
+        self.assertEqual(
+            (steady.era, steady.steady, steady.k, steady.reset_height, steady.fast, steady.d_pre, steady.d_ratio),
+            ("nu7", True, 10, r, False, None, None),
+        )
+        self.assertAlmostEqual(steady.difficulty, difficulty_from_bits(EASY, TESTNET))
+        self.assertEqual(b.chain.phase_at(BASE + 200).era, "nu7")  # outside the window
+        b.add("r7", "s20", dt=451, bits=MIN)
+        b.line("n", "r7", 1, 3, dt=5, bits=EASY)
+        after = b.chain.phase_at(BASE + 93)
+        self.assertEqual((after.era, after.steady, after.k, after.fast), ("nu7", False, 1, True))
+        self.assertIsNotNone(after.d_ratio)
+        self.assertEqual([reset.era for reset in b.chain.resets()], ["pre-nu7", "nu7"])
 
     def test_mainnet_has_no_resets(self) -> None:
         """Pow-limit bits are not a reset on a network without the minimum-difficulty rule."""
@@ -740,6 +778,38 @@ class BootstrapTests(unittest.TestCase):
             self.assertFalse(Chain.from_store(TESTNET, store).get(bhash("u")).body_trusted)
             self.assertEqual(Chain.from_store(TESTNET, store, min_height=BASE + 5).best_tip().hash, bhash("u"))
             self.assertEqual(len(Chain.from_store(TESTNET, store, min_height=BASE + 5)), 4)
+
+    def test_from_store_seeds_the_reset_below_the_window(self) -> None:
+        """A window starting after its governing reset has the phases of a full load, also once it grows down."""
+        source = Builder()
+        r = build_sawtooth(source)
+        nodes = source.chain.canonical_nodes()
+        with tempfile.TemporaryDirectory() as tmp, Store(Path(tmp) / "m.sqlite3") as store:
+            for node in nodes:
+                store.upsert_block(None, header(node.hash, node.prev_hash, node.time, node.bits), node.height,
+                                   miner="A", is_min_diff=node.is_min_diff, seen_at=node.first_seen_at,
+                                   seen_source="test")
+            store.commit_if_due(force=True)
+            full = Chain.from_store(TESTNET, store)
+            low = r + 9  # the fast phase ends at r + 36, inside the window
+            window = Chain.from_store(TESTNET, store, min_height=low)
+            heights = range(low, r + 51)
+            self.assertEqual([window.phase_at(h) for h in heights], [full.phase_at(h) for h in heights])
+            self.assertEqual(window.resets(), [])
+            for node in reversed(nodes[: low - BASE]):  # walk back below the window, down to the reset's parent
+                window.add(header(node.hash, node.prev_hash, node.time, node.bits), node.height)
+                if node.height == r - 1:
+                    break
+            heights = range(r, r + 51)
+            self.assertEqual([window.phase_at(h) for h in heights], [full.phase_at(h) for h in heights])
+            (grown,), (reset,) = window.resets(), full.resets()
+            self.assertEqual((grown.height, grown.d_pre, grown.fast_blocks), (reset.height, reset.d_pre, 36))
+            with mock.patch.object(chain_mod, "MAX_SEED_SPAN", 5):
+                far = Chain.from_store(TESTNET, store, min_height=low)
+            phase = far.phase_at(low)
+            self.assertEqual((phase.k, phase.fast, phase.d_pre), (9, False, full.phase_at(low).d_pre))
+            with mock.patch.object(chain_mod, "MAX_SEED_WALK", 5):
+                self.assertIsNone(Chain.from_store(TESTNET, store, min_height=low).phase_at(low).k)
 
     def test_load_anchors_on_the_group_that_reaches_highest(self) -> None:
         """A stale block crossing the window bottom cannot capture the anchor, even if loaded first."""

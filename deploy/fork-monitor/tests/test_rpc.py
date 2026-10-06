@@ -23,8 +23,10 @@ from zakura_fork_monitor.chain import Chain
 from zakura_fork_monitor.consensus import (
     TESTNET,
     ZAKURA_MARKER,
+    BlockHeader,
     bits_to_target,
     check_pow,
+    expected_bits,
     parse_block,
     sha256d,
     write_compact_size,
@@ -45,6 +47,8 @@ FIXTURES = Path(__file__).resolve().parent / "fixtures"
 BASE = 100
 T0 = 1_790_000_000
 POW_LIMIT_BITS = 0x2007FFFF
+# P2SH script of Testnet's funding stream t2HifwjUj9uyxr9bknR8LFuQbc98c3vkXtu.
+P2SH_FS = bytes.fromhex("a9147a86d6c7eb12ce0aa309d7391a6f338eba3c242b87")
 
 
 def setUpModule() -> None:
@@ -56,12 +60,13 @@ def setUpModule() -> None:
 
 def make_block(
     prev_hash: str, height: int, time: int, tag: bytes = b"zkcodexcoder", *, bits: int = POW_LIMIT_BITS,
-    grind: bool = True,
+    grind: bool = True, fs_value: int | None = None,
 ) -> str:
     """Build a raw v4 block (hex) with a BIP34 height and a Zakura-marked miner tag in its coinbase.
 
     The nonce is ground until the header meets its target (about 32 tries at the PoW limit)
-    unless `grind` is False, which leaves a block that almost surely fails `check_pow`.
+    unless `grind` is False, which leaves a block that almost surely fails `check_pow`. The
+    coinbase pays a P2PKH miner, or Testnet's funding stream `fs_value` zatoshis when given.
     """
     prefix = (
         struct.pack("<I", 4)
@@ -78,6 +83,10 @@ def make_block(
     height_push = height.to_bytes((height.bit_length() + 8) // 8, "little")
     marker_push = ZAKURA_MARKER + tag
     script_sig = bytes((len(height_push),)) + height_push + bytes((len(marker_push),)) + marker_push
+    if fs_value is None:
+        output = struct.pack("<q", 250_000_000) + b"\x19\x76\xa9\x14" + bytes(20) + b"\x88\xac"
+    else:
+        output = struct.pack("<q", fs_value) + b"\x17" + P2SH_FS
     coinbase = (
         struct.pack("<II", (1 << 31) | 4, 0x892F2085)
         + b"\x01"
@@ -87,10 +96,7 @@ def make_block(
         + script_sig
         + b"\xff\xff\xff\xff"
         + b"\x01"
-        + struct.pack("<q", 250_000_000)
-        + b"\x19\x76\xa9\x14"
-        + bytes(20)
-        + b"\x88\xac"
+        + output
         + bytes(8 + 8)  # lock time, expiry height, value balance
         + b"\x00\x00\x00"  # no spends, outputs or joinsplits
     )
@@ -502,7 +508,7 @@ class CollectorTests(StubTestCase):
         )
         self.assertEqual(self.monitor.tips, [("rpc:n1", self.hashes[4], 104)])
         self.assertEqual(self.monitor.chain.best_tip().hash, self.hashes[4])
-        self.assertEqual(self.store.get_block(self.hashes[4])["miner"], "zkcodexcoder")
+        self.assertEqual(self.store.get_block(self.hashes[4])["miner"], "zkcodexcoder · tm9iML…r7Ma")
         self.assertFalse(await collector.poll_tip())
         self.assertEqual(len(self.monitor.tips), 1)
         self.assertEqual(collector.health()["tip_height"], 104)
@@ -597,6 +603,9 @@ class CollectorTests(StubTestCase):
         self.assertEqual(rows[self.side]["status"], "valid-fork")
         kinds = reader.execute("SELECT kind FROM sightings WHERE hash = ? AND source = 'rpc:n1'", (stale,))
         self.assertEqual([row[0] for row in kinds], ["chaintip"])
+        # The node's own active tip is a timely sighting, like the tip poll's.
+        kinds = reader.execute("SELECT kind FROM sightings WHERE hash = ? AND source = 'rpc:n1'", (self.hashes[4],))
+        self.assertEqual([row[0] for row in kinds], ["rpc_tip"])
         self.assertEqual(await collector.poll_chaintips(), 0)
         last_at = reader.execute("SELECT last_at FROM chaintips WHERE hash = ?", (self.side,)).fetchone()[0]
         self.assertEqual(last_at, rows[self.side]["last_at"])
@@ -708,6 +717,80 @@ class CollectorTests(StubTestCase):
         self.assertEqual([duty.interval for duty in collector._duties], [2.0, 3.0, 60.0])
 
 
+class Nu7RulesTests(StubTestCase):
+    """Blocks at NU7 heights must carry the NU7 difficulty when the chain holds their ancestry."""
+
+    def setUp(self) -> None:
+        """Hold the 113 blocks below NU7 activation (PoW-limit nBits, 25 s apart) in the chain."""
+        super().setUp()
+        self.nu7 = TESTNET.nu7_height
+        context: list[tuple[int, int]] = []
+        prev = "ab" * 32
+        for height in range(self.nu7 - TESTNET.max_context_len, self.nu7):
+            time_ = T0 + 25 * (height - self.nu7)
+            name = sha256d(height.to_bytes(4, "little"))[::-1].hex()
+            header = BlockHeader(hash=name, prev_hash=prev, version=4, merkle_root="00" * 32, time=time_,
+                                 bits=POW_LIMIT_BITS, nonce="00" * 32, raw=b"")
+            self.monitor.chain.add(header, height)
+            context.insert(0, (POW_LIMIT_BITS, time_))
+            prev = name
+        self.anchor = prev
+        self.bits = expected_bits(TESTNET, self.nu7, T0, context)  # just below the PoW limit
+
+    def serve(self, *blocks: tuple[str, int], fs_value: int | None = None) -> list[str]:
+        """Serve a best chain from NU7 on the held blocks, given as (tag, nBits) per block; return the hashes.
+
+        `fs_value` makes every coinbase pay the funding stream that amount (see `make_block`).
+        """
+        raws, prev = [], self.anchor
+        for offset, (tag, bits) in enumerate(blocks):
+            raws.append(make_block(prev, self.nu7 + offset, T0 + 25 * offset, tag.encode(), bits=bits,
+                                   fs_value=fs_value))
+            prev = block_hash(raws[-1])
+        self.server.httpd.node = StubNode(raws, base=self.nu7)
+        return [block_hash(raw) for raw in raws]
+
+    async def test_tip_with_the_nu7_difficulty_is_ingested(self) -> None:
+        """A tip whose nBits matches the prediction from its held ancestors is accepted."""
+        [tip] = self.serve(("ok", self.bits))
+        self.assertTrue(await self.collector().poll_tip())
+        self.assertEqual(self.monitor.chain.best_tip().hash, tip)
+
+    async def test_tip_with_another_difficulty_is_rejected(self) -> None:
+        """A tip from a node still on pre-NU7 rules fails the poll and never reaches the chain or the store."""
+        [tip] = self.serve(("old", 0x2003FFFF))
+        with self.assertRaisesRegex(ValueError, "wrong difficulty under NU7 rules"):
+            await self.collector().poll_tip()
+        self.assertEqual((self.monitor.ingested, self.monitor.tips), ([], []))
+        self.assertIsNone(self.store.get_block(tip))
+
+    async def test_tip_with_a_pre_nu7_coinbase_is_rejected(self) -> None:
+        """A tip with the NU7 difficulty but the pre-NU7 funding-stream amount is an old-rules block."""
+        self.serve(("ok", self.bits), fs_value=TESTNET.pre_nu7_funding_stream_value)
+        with self.assertRaisesRegex(ValueError, "pre-NU7 coinbase"):
+            await self.collector().poll_tip()
+        self.assertEqual((self.monitor.ingested, self.monitor.tips), ([], []))
+        [current] = self.serve(("ok", self.bits), fs_value=TESTNET.pre_nu7_funding_stream_value - 1)
+        self.assertTrue(await self.collector().poll_tip())
+        self.assertEqual(self.monitor.chain.best_tip().hash, current)
+
+    async def test_walk_back_checks_the_block_that_links_to_the_chain(self) -> None:
+        """The walked-back ancestor whose parent the chain holds is checked before it is ingested."""
+        old, tip = self.serve(("old", 0x2003FFFF), ("tip", POW_LIMIT_BITS))
+        with self.assertRaisesRegex(ValueError, "wrong difficulty"):
+            await self.collector().poll_tip()
+        self.assertEqual([entry[0] for entry in self.monitor.ingested], [tip])  # unchecked: no ancestry yet
+        self.assertNotIn(old, self.monitor.chain)
+        self.assertEqual(self.monitor.tips, [])
+
+    async def test_backfill_skips_rejected_blocks_and_their_descendants(self) -> None:
+        """A backfilled block with the wrong difficulty, and every block above it, counts as failed."""
+        good, _, _ = self.serve(("ok", self.bits), ("old", 0x2003FFFF), ("above", POW_LIMIT_BITS))
+        result = await backfill(self.client, self.monitor, 3)
+        self.assertEqual((result.fetched, result.failed), (1, 2))
+        self.assertEqual([entry[0] for entry in self.monitor.ingested], [good])
+
+
 class BackfillTests(StubTestCase):
     """backfill() against the stub node."""
 
@@ -777,7 +860,8 @@ class BackfillTests(StubTestCase):
         result = await backfill(self.client, self.monitor, 3)
         self.assertEqual(result.fetched, 3)
         miners = [self.store.get_block(entry[0])["miner"] for entry in self.monitor.ingested]
-        self.assertEqual(miners, ["Foundry", "Foundry", "tmDDBnPEg12A4GYACyq9KwUEyq5vMiALZQR"])
+        foundry = "Foundry · tmJggj…vvVu"  # the pool's tag family plus its payout address
+        self.assertEqual(miners, [foundry, foundry, "tmDDBnPEg12A4GYACyq9KwUEyq5vMiALZQR"])
         self.assertEqual(self.monitor.chain.best_tip().height, 4410738)
 
 

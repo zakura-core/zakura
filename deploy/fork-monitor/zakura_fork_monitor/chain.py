@@ -34,12 +34,17 @@ Notes:
   not re-checked.
 - `Phase.fast` is causal: a cycle that never slows down stays fast (the
   historical analysis labels such cycles "unknown").
-- Fork and loser classification is "unknown" when either miner is not attributed.
+- A height from NU7 on whose governing reset predates NU7 is `Phase.steady`:
+  there has been no sawtooth since the rules changed, so it has `k` but no
+  fast phase, `d_pre` or `d_ratio`.
+- Fork and loser classification is "no_body" when the loser's body never
+  arrived and "unknown" when either miner is not attributed (see `contest`).
 - `prune_below()` clamps to the best tip height and returns the number of
   blocks removed; blocks below the floor are ignored afterwards.
-- Extra API: `from_store()`, `load()`, `canonical_nodes()`, `nodes_at()`,
-  `missing_parents()`, `__len__`, `TipChange.as_row()`, and extra result fields
-  (`Phase.d_pre/difficulty`, `Reset.d_pre/fast_blocks/cycle_blocks`,
+- Extra API: `from_store()`, `load()`, `canonical_nodes()`, `canonical_bottom()`,
+  `nodes_at()`, `missing_parents()`, `__len__`, `TipChange.as_row()`, `contest()`,
+  and extra result fields (`Phase.d_pre/difficulty/era/steady`,
+  `Reset.d_pre/fast_blocks/cycle_blocks/never_slowed/era`,
   `ForkEvent.depth/depth_work/settled`, `LoserBranch.winner_len`, ...).
 """
 
@@ -48,7 +53,7 @@ from __future__ import annotations
 import dataclasses
 import math
 from bisect import bisect_left, bisect_right
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -76,8 +81,28 @@ MAX_DETACHED_AHEAD = 1_000
 MAX_HEIGHT = (1 << 31) - 1
 MAX_HASH_LEN = 64
 MAX_LABEL_LEN = 256
+# Stored canonical ancestors walked below a loaded window for the reset that governs its bottom, and how
+# many of them are kept to finish that reset's fast-phase scan; a reset further down ended its fast phase
+# long before (a fast phase lasts a few hundred blocks).
+MAX_SEED_WALK = 500_000
+MAX_SEED_SPAN = 5_000
+# (hash, height, time, bits) of a stored block and its stored ancestors, newest first, up to `?` steps down.
+ANCESTORS_SQL = (
+    "WITH RECURSIVE walk(hash, prev_hash, height, time, bits, n) AS ("
+    "SELECT hash, prev_hash, height, time, bits, 0 FROM blocks WHERE hash = ? "
+    "UNION ALL SELECT b.hash, b.prev_hash, b.height, b.time, b.bits, walk.n + 1 FROM blocks b "
+    "JOIN walk ON b.hash = walk.prev_hash WHERE walk.n < ?) "
+    "SELECT hash, height, time, bits FROM walk"
+)
 
-SELF, RACE, UNKNOWN = "self", "race", "unknown"
+SELF, RACE, UNKNOWN, NO_BODY = "self", "race", "unknown", "no_body"
+PRE_NU7, NU7 = "pre-nu7", "nu7"
+# The miner label of a block whose body never arrived.
+NO_BODY_MINER = "no body"
+# `consensus.identify_miner`'s label for a shielded coinbase with neither a tag nor an extranonce. Any
+# Zakura-template miner produces it, so it attributes nothing.
+NOTAG_MINER = "shielded:notag"
+_UNATTRIBUTED = frozenset({None, UNKNOWN, NOTAG_MINER})
 
 
 @dataclass(slots=True, eq=False)
@@ -140,6 +165,8 @@ class BlockRef:
     first_seen_at: float | None
     is_min_diff: bool
     body: bool
+    body_trusted: bool  # see `Node.body_trusted`
+    tag: str = ""  # the coinbase tag in full (`Node.tag`)
 
 
 @dataclass(frozen=True, slots=True)
@@ -151,8 +178,8 @@ class LoserBranch:
     length: int  # blocks from the fork point to tip_hash
     work: int  # work of those blocks
     blocks: int  # every block in the branch subtree
-    miners: tuple[str, ...]  # per block from `block` to tip_hash; "unknown" when unattributed
-    classification: str  # "self" (same miner as the winner) | "race" | "unknown"
+    miners: tuple[str, ...]  # per block from `block` to tip_hash; NO_BODY_MINER, or "unknown" when unattributed
+    classification: str  # see `contest`: "self" (same miner as the winner) | "race" | "no_body" | "unknown"
     same_job: bool  # same miner and header time as the winner (siblings share the parent)
     seen_first: bool | None  # seen strictly before the winner; None if unknown or equal
     greater_raw_hash: bool | None  # raw hash above the winner's
@@ -171,7 +198,8 @@ class ForkEvent:
     losers: tuple[LoserBranch, ...]  # longest first
     depth: int  # longest loser branch, in blocks
     depth_work: int  # heaviest loser branch work
-    classification: str  # "race" if any loser raced, else "self" if all did, else "unknown"
+    # "race" if any loser raced, else "self" or "no_body" if every loser is, else "unknown"
+    classification: str
     same_job: bool  # any loser shares the winner's job
     winner_first_seen: bool | None  # winner seen strictly before every loser
     winner_greater_raw_hash: bool | None  # winner raw hash above every loser's
@@ -191,6 +219,8 @@ class Phase:
     d_ratio: float | None  # difficulty / d_pre
     fast: bool | None  # before the trailing-window mean interval first reached target/2
     min_diff: bool
+    era: str = PRE_NU7  # PRE_NU7 | NU7: the difficulty rules at this height
+    steady: bool = False  # a NU7 height with no reset since NU7 (fast False, d_pre and d_ratio None)
 
 
 @dataclass(frozen=True, slots=True)
@@ -206,8 +236,11 @@ class Reset:
     next_dt: int | None  # next canonical block time - time; negative when forward-dated
     forward_dating: float | None  # time - first_seen_at
     d_pre: float | None
-    fast_blocks: int | None  # blocks until the fast phase ended, None while still fast
+    # Blocks until the fast phase ended; the whole cycle if it closed without slowing, None while open and fast.
+    fast_blocks: int | None
     cycle_blocks: int | None  # blocks until the next reset, None while open
+    never_slowed: bool  # the cycle closed while still fast
+    era: str  # PRE_NU7 | NU7 at the reset height
 
 
 @dataclass(frozen=True, slots=True)
@@ -285,10 +318,17 @@ class Chain:
         min_height: int | None = None,
         settle_depth: int = DEFAULT_SETTLE_DEPTH,
     ) -> Chain:
-        """Build a chain from `store.load_blocks(min_height)`, anchored on the persisted best tip (meta `best_hash`)."""
+        """Build a chain from `store.load_blocks(min_height)`, anchored on the persisted best tip (meta `best_hash`).
+
+        With `min_height`, the reset that governs the window bottom is looked up below it through
+        `store.reader()` (see `_seed_reset`), as a running process keeps it when it prunes.
+        """
         chain = cls(params, settle_depth)
         get_meta = getattr(store, "get_meta", None)
         chain.load(store.load_blocks(min_height), prefer=get_meta("best_hash") if callable(get_meta) else None)
+        reader = getattr(store, "reader", None)
+        if min_height is not None and callable(reader):
+            chain._seed_reset(reader())
         return chain
 
     def load(self, rows: Iterable[Mapping[str, Any]], *, prefer: str | None = None) -> int:
@@ -380,6 +420,10 @@ class Chain:
         """Return canonical nodes from `since_height` (default: the window bottom) to the best tip."""
         start = 0 if since_height is None else max(0, since_height - self._canon_base)
         return self._canon[start:]
+
+    def canonical_bottom(self) -> Node | None:
+        """Return the lowest canonical node (the window bottom), or None while the chain is empty."""
+        return self._canon[0] if self._canon else None
 
     def nodes_at(self, height: int) -> list[Node]:
         """Return every node at `height`, canonical or not."""
@@ -517,18 +561,21 @@ class Chain:
     def phase_at(self, height: int) -> Phase:
         """Return the sawtooth phase of the canonical block at `height` (all None outside the window)."""
         index = height - self._canon_base
+        era = self._era(height)
         if not 0 <= index < len(self._canon):
-            return Phase(height, None, None, None, None, None, None, False)
+            return Phase(height, None, None, None, None, None, None, False, era)
         cached = self._phases[index]
         if cached is not None:
             return cached
         node = self._canon[index]
         difficulty = self._difficulty(node.bits)
         slot = bisect_right(self._reset_heights, height) - 1
-        if slot < 0:
-            phase = Phase(height, None, None, None, difficulty, None, None, node.is_min_diff)
+        reset = self._reset_heights[slot] if slot >= 0 else None
+        if reset is None:
+            phase = Phase(height, None, None, None, difficulty, None, None, node.is_min_diff, era)
+        elif era != self._era(reset):
+            phase = Phase(height, height - reset, reset, None, difficulty, None, False, node.is_min_diff, era, True)
         else:
-            reset = self._reset_heights[slot]
             cycle = self._cycles[reset]
             self._scan_fast(reset, height)
             phase = Phase(
@@ -540,6 +587,7 @@ class Chain:
                 d_ratio=difficulty / cycle.d_pre if cycle.d_pre else None,
                 fast=cycle.fast_end is None or height < cycle.fast_end,
                 min_diff=node.is_min_diff,
+                era=era,
             )
         self._phases[index] = phase
         return phase
@@ -557,6 +605,12 @@ class Chain:
             next_reset = heights[slot + 1] if slot + 1 < len(heights) else None
             cycle = self._cycles[reset]
             self._scan_fast(reset, next_reset - 1 if next_reset is not None else top)
+            cycle_blocks = next_reset - reset if next_reset is not None else None
+            never_slowed = cycle.fast_end is None and cycle_blocks is not None
+            if never_slowed:
+                fast_blocks = cycle_blocks
+            else:
+                fast_blocks = cycle.fast_end - reset if cycle.fast_end is not None else None
             out.append(
                 Reset(
                     height=reset,
@@ -568,8 +622,10 @@ class Chain:
                     next_dt=following.time - node.time if following is not None else None,
                     forward_dating=node.time - node.first_seen_at if node.first_seen_at is not None else None,
                     d_pre=cycle.d_pre,
-                    fast_blocks=cycle.fast_end - reset if cycle.fast_end is not None else None,
-                    cycle_blocks=next_reset - reset if next_reset is not None else None,
+                    fast_blocks=fast_blocks,
+                    cycle_blocks=cycle_blocks,
+                    never_slowed=never_slowed,
+                    era=self._era(reset),
                 )
             )
         return out
@@ -864,6 +920,11 @@ class Chain:
         start = self.params.min_diff_after_height
         return start is not None and height >= start and bits == self.params.pow_limit_bits
 
+    def _era(self, height: int) -> str:
+        """Return NU7 from the network's NU7 activation height on, else PRE_NU7."""
+        nu7 = self.params.nu7_height
+        return NU7 if nu7 is not None and height >= nu7 else PRE_NU7
+
     def _difficulty(self, bits: int) -> float:
         """Return the RPC-style difficulty of valid compact `bits`."""
         return self._limit_target / bits_to_target(bits)
@@ -958,8 +1019,12 @@ class Chain:
         if not below:
             return
         below.reverse()
+        old_base = self._canon_base
         self._canon[:0] = below
         self._canon_base = below[0].height
+        # A reset seeded from the store below the old bottom (`_seed_reset`) is now in the chain itself.
+        while self._reset_heights and self._canon_base <= self._reset_heights[0] < old_base:
+            del self._cycles[self._reset_heights.pop(0)]
         new_resets = [n.height for n in below if n.is_min_diff]
         for reset in new_resets:
             self._cycles[reset] = _Cycle(d_pre=None, scanned=reset)
@@ -994,32 +1059,58 @@ class Chain:
         self._canon_base = height
 
     def _scan_fast(self, reset: int, upto: int) -> None:
-        """Advance the search for the end of `reset`'s fast phase, up to height `upto`.
-
-        It ends at the first height whose trailing averaging window holds only blocks from the
-        reset on and averages at least half the target spacing, both under the rules at that
-        height. So a cycle still fast at NU7 activation cannot end before NU7's wider window has
-        passed its reset.
-        """
+        """Advance the search for the end of `reset`'s fast phase (see `_fast_end`), up to height `upto`."""
         cycle = self._cycles[reset]
         if cycle.fast_end is not None:
             return
-        canon, base = self._canon, self._canon_base
-        upto = min(upto, base + len(canon) - 1)
-        height = cycle.scanned + 1
-        while height <= upto:
-            rules = self.params.difficulty_rules(height)
-            window = rules.averaging_window
-            if height - window >= reset:
-                start = height - window - base
-                if start < 0:
-                    break
-                # 2 * window * (target / 2), in integers
-                if 2 * (canon[start + window].time - canon[start].time) >= window * rules.target_spacing:
-                    cycle.fast_end = cycle.scanned = height
-                    return
-            height += 1
-        cycle.scanned = height - 1
+        upto = min(upto, self._canon_base + len(self._canon) - 1)
+        cycle.fast_end, cycle.scanned = _fast_end(self.params, reset, cycle.scanned + 1, upto, self._canon_time)
+
+    def _canon_time(self, height: int) -> int | None:
+        """Return the header time of the canonical block at `height`, or None outside the window."""
+        node = self._canon_at(height)
+        return node.time if node is not None else None
+
+    def _seed_reset(self, conn: Any) -> None:
+        """Adopt the latest canonical reset below the window bottom from the `blocks` table on `conn`.
+
+        Walks at most MAX_SEED_WALK stored ancestors of the bottom block. The reset's fast phase is
+        finished from their times when it is at most MAX_SEED_SPAN blocks down, else taken as over.
+        """
+        base = self._canon_base
+        if not self._canon or (self._reset_heights and self._reset_heights[0] <= base):
+            return
+        times: dict[int, int] = {}
+        reset: int | None = None
+        d_pre: float | None = None
+        rows = conn.execute(ANCESTORS_SQL, (self._canon[0].prev_hash, MAX_SEED_WALK - 1))
+        for steps, (_, height, block_time, bits) in enumerate(rows):
+            if height != base - 1 - steps or not isinstance(block_time, int) or not isinstance(bits, int):
+                break
+            if reset is not None:  # the reset's parent
+                try:
+                    d_pre = self._difficulty(bits)
+                except ParseError:
+                    pass
+                break
+            if steps < MAX_SEED_SPAN:
+                times[height] = block_time
+            if self._is_min_diff(height, bits):
+                reset = height
+        if reset is None:
+            return
+        cycle = _Cycle(d_pre=d_pre, scanned=base - 1, fast_end=base)
+        if base - reset <= MAX_SEED_SPAN:
+            top = self._reset_heights[0] - 1 if self._reset_heights else base + len(self._canon) - 1
+
+            def time_at(height: int) -> int | None:
+                """Return the canonical header time at `height`, from the walk below the window."""
+                return times.get(height) if height < base else self._canon_time(height)
+
+            cycle.fast_end, cycle.scanned = _fast_end(self.params, reset, reset + 1, top, time_at)
+        self._reset_heights.insert(0, reset)
+        self._cycles[reset] = cycle
+        self._phases = [None] * len(self._canon)
 
     # -- fork events -----------------------------------------------------------------
 
@@ -1033,6 +1124,12 @@ class Chain:
             top = max(top, tip.height)
         losers.sort(key=lambda b: (-b.length, b.block.hash))
         kinds = {b.classification for b in losers}
+        if RACE in kinds:
+            classification = RACE
+        elif kinds in ({SELF}, {NO_BODY}):
+            (classification,) = kinds
+        else:
+            classification = UNKNOWN
         seen = [b.seen_first for b in losers]
         greater = [b.greater_raw_hash for b in losers]
         return ForkEvent(
@@ -1043,7 +1140,7 @@ class Chain:
             losers=tuple(losers),
             depth=max(b.length for b in losers),
             depth_work=max(b.work for b in losers),
-            classification=RACE if RACE in kinds else SELF if kinds == {SELF} else UNKNOWN,
+            classification=classification,
             same_job=any(b.same_job for b in losers),
             winner_first_seen=None if None in seen else not any(seen),
             winner_greater_raw_hash=None if None in greater else not any(greater),
@@ -1067,11 +1164,11 @@ class Chain:
         miners = []
         node: Node | None = tip
         while node is not None and node is not fork:
-            miners.append(node.miner or UNKNOWN)
+            miners.append(node.miner or (UNKNOWN if node.body else NO_BODY_MINER))
             node = self._parent(node)
         miners.reverse()
         work = tip.cumwork - fork.cumwork
-        kind = _classify(first.miner, winner.miner)
+        kind = contest(first, winner)
         branch = LoserBranch(
             block=_ref(first),
             tip_hash=tip.hash,
@@ -1112,14 +1209,48 @@ def _ref(node: Node) -> BlockRef:
         first_seen_at=node.first_seen_at,
         is_min_diff=node.is_min_diff,
         body=node.body,
+        body_trusted=node.body_trusted,
+        tag=node.tag,
     )
 
 
-def _classify(loser: str | None, winner: str | None) -> str:
-    """Return "self" for the same attributed miner on both sides, "race" for different ones."""
-    if loser in (None, UNKNOWN) or winner in (None, UNKNOWN):
+def contest(loser: Any, winner: Any) -> str:
+    """Classify a stale block against the canonical block that beat it (each a Node or BlockRef).
+
+    "no_body" when the loser has no miner because its body never arrived, "self" for the same
+    attributed miner on both sides, "race" for different ones, else "unknown" (NOTAG_MINER
+    attributes nothing).
+    """
+    if loser.miner is None and not loser.body:
+        return NO_BODY
+    if loser.miner in _UNATTRIBUTED or winner.miner in _UNATTRIBUTED:
         return UNKNOWN
-    return SELF if loser == winner else RACE
+    return SELF if loser.miner == winner.miner else RACE
+
+
+def _fast_end(
+    params: NetworkParams, reset: int, start: int, upto: int, time_at: Callable[[int], int | None]
+) -> tuple[int | None, int]:
+    """Search heights `start`..`upto` for the end of `reset`'s fast phase; return (end or None, last height checked).
+
+    It ends at the first height whose trailing averaging window holds only blocks from the reset
+    on and averages at least half the target spacing, both under the rules at that height. So a
+    cycle still fast at NU7 activation cannot end before NU7's wider window has passed its reset.
+    The search stops early where `time_at` (canonical header time by height) has no block.
+    """
+    height = start
+    while height <= upto:
+        rules = params.difficulty_rules(height)
+        window = rules.averaging_window
+        if height - window >= reset:
+            first, last = time_at(height - window), time_at(height)
+            if first is None or last is None:
+                break
+            # 2 * window * (target / 2), in integers
+            if 2 * (last - first) >= window * rules.target_spacing:
+                return height, height
+        height += 1
+    return None, height - 1
 
 
 def _strictly_before(a: float | None, b: float | None) -> bool | None:

@@ -7,12 +7,16 @@ is built against those shapes, so keys are only ever added. Conventions:
   significant digits; times are unix seconds; durations are seconds;
   difficulty is RPC-style (pow-limit target / target);
 - "block" dicts are `{"hash", "height", "time", "miner", "template",
-  "first_seen_at", "min_diff", "body"}`;
+  "first_seen_at", "min_diff", "body", "body_trusted", "miner_tag"}`, where
+  `miner_tag` is the full coinbase tag (a `shielded:` label is cut short);
 - "phase" dicts are `{"height", "k", "reset_height", "d_pre", "difficulty",
-  "d_ratio", "fast", "min_diff", "label", "k_bucket", "ratio_bucket"}` with
-  `label` "fast" | "slow" | "unknown" (see `chain.Phase`);
+  "d_ratio", "fast", "min_diff", "era", "label", "k_bucket", "ratio_bucket"}`
+  with `era` "pre-nu7" | "nu7" and `label` "fast" | "slow" | "steady" |
+  "unknown"; "steady" is a NU7 height with no reset since NU7, whose buckets
+  are NO_RESET_BUCKET (see `chain.Phase`);
 - "relation" dicts are `{"kind", "n", "fork_hash", "fork_height",
-  "depth_ours", "depth_theirs", "tip_height"}` (see `chain.Relation`).
+  "depth_ours", "depth_theirs", "tip_height"}` (see `chain.Relation`); `kind`
+  may also be "below_window" (see `peers`).
 
 Block statistics are bucketed by header time, not first-seen time, because
 backfilled blocks have no first-seen time; header times are
@@ -41,23 +45,41 @@ Notes:
   `detect_split` (the pure half of the service's split state machine).
 - `orphan_stats` reports cycles that never slowed down as "fast" (the chain's
   causal phase); the historical analysis labels those "unknown".
+- A stale block whose body never arrived has miner NO_BODY_MINER and
+  classification "no_body" (see `chain.contest`), never "unknown".
 """
 
 from __future__ import annotations
 
 import dataclasses
+import ipaddress
 import itertools
 import math
 import re
 import time
+import weakref
 from bisect import bisect_left, bisect_right
-from collections import Counter, defaultdict
+from collections import Counter, OrderedDict, defaultdict
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
-from .chain import RACE, SELF, UNKNOWN, Chain, ForkEvent, LoserBranch, Phase, Relation, Reset
+from .chain import (
+    ANCESTORS_SQL,
+    NO_BODY,
+    NO_BODY_MINER,
+    RACE,
+    SELF,
+    UNKNOWN,
+    Chain,
+    ForkEvent,
+    LoserBranch,
+    Phase,
+    Relation,
+    Reset,
+    contest,
+)
 from .store import UNTIMED_KINDS
 
 # Stuck rule: a non-canonical tip whose header time or first sighting is over an hour old is a dead fork ...
@@ -68,6 +90,11 @@ STUCK_BEHIND = 1000
 SYNCED_LAG = 3
 # Sources with no successful contact or tip update for this long are left out of grouping.
 ACTIVE_WINDOW = 900.0
+# A peer on the pre-NU7 rules is retried every 30 min, so its last handshake keeps it active this long.
+OLD_RULES_WINDOW = 86_400.0
+# Sources not heard from for this long are only counted as `stale` in their group.
+STALE_AFTER = 86_400.0
+OLD_RULES = "old-rules"
 # "idle" is a stored row nobody is connected to (e.g. from before a restart); recency decides for it.
 ACTIVE_STATUSES = frozenset({"connected", "ok"})
 # These hold no chain of their own, so their tips never define a branch.
@@ -82,6 +109,17 @@ TIMELY_KINDS = ("inv", "rpc_tip")
 OBSERVED_LAG = 600.0
 # Arrival order needs this gap over the later block's first timely sighting (the 1 s RPC tip poll).
 SEEN_MARGIN = 1.0
+LATE, UNRESOLVED = "late", "unresolved"
+# Missing parents deeper than this are never requested (`service.BODY_SWEEP_DEPTH`), so they are not reported.
+MISSING_PARENT_DEPTH = 500
+# A stored tip outside the chain is placed by walking at most MAX_TIP_WALK of its stored ancestors, and below
+# the window at most MAX_CANON_WALK canonical ones; placements are cached per chain (MAX_PLACEMENTS), and a tip
+# that could not be placed is walked again after PLACE_RETRY.
+MAX_TIP_WALK = 2_000
+MAX_CANON_WALK = 200_000
+MAX_PLACEMENTS = 1_024
+PLACE_RETRY = 600.0
+BELOW_WINDOW = "below_window"
 PERIODS = (("1h", 3_600), ("24h", 86_400), ("7d", 7 * 86_400))
 HOURLY_WINDOW = 72 * 3_600
 DEFAULT_PROPAGATION_WINDOW = 6 * 3_600.0
@@ -95,8 +133,11 @@ K_FINE_BUCKETS = ((0, 0, "0"), (1, 1, "1"), (2, 2, "2"), (3, 5, "3-5"), (6, 10, 
 # Difficulty relative to the pre-reset level, lower bound inclusive (as in the historical analysis).
 RATIO_BUCKETS = ((None, 0.001, "<0.001"), (0.001, 0.01, "0.001-0.01"), (0.01, 0.1, "0.01-0.1"),
                  (0.1, 0.5, "0.1-0.5"), (0.5, 1.0, "0.5-1"), (1.0, None, ">=1"))
-PHASE_LABELS = ("fast", "slow", UNKNOWN)
-STATES = ("synced", "lagging", "fork", "stuck", UNKNOWN, "inactive")
+# The k and ratio bucket of a steady phase (see the module doc).
+STEADY, NO_RESET_BUCKET = "steady", "no reset since NU7"
+PHASE_LABELS = ("fast", "slow", STEADY, UNKNOWN)
+STATES = ("synced", "lagging", "fork", "stuck", OLD_RULES, UNKNOWN, "inactive")
+NO_MARKER = "no marker"
 CANONICAL = "canonical"
 MAX_FORK_LIMIT = 200
 MAX_RESET_LIMIT = 1_000
@@ -148,15 +189,15 @@ def live_snapshot(monitor: Any, now: float | None = None) -> dict[str, Any]:
     Returns:
         {"generated_at": float, "network": str,
          "tip": block + {"age_s"} | None, "phase": phase | None,
-         "chain": {"blocks", "from_height", "to_height", "settle_depth", "missing_parents"},
+         "chain": {"blocks", "from_height", "to_height", "settle_depth",
+                   "missing_parents": those within MISSING_PARENT_DEPTH of the tip},
          "peers": [peer view, see `peers`],
          "groups": [group, see `group_sources`],
          "split_candidate": `detect_split(groups)` result | None,
          "stuck": [peer views with stuck true],
          "collectors": {"rpc": [rpc status dict], "rpc_error": str | None,
                         "p2p": {"enabled", "error", "peers", "connected", "connected_by_group": {group: n}}},
-         "recent_reorgs": [tip change, see `summary`] (newest first, <= 20),
-         "recent_forks": [fork event without DB fields, see `fork_events`] (newest first, <= 10)}
+         "recent_reorgs": [tip change, see `summary`] (newest first, <= 20)}
     """
     now = _now(now)
     chain: Chain = monitor.chain
@@ -170,11 +211,8 @@ def live_snapshot(monitor: Any, now: float | None = None) -> dict[str, Any]:
     connected = [v for v in views if v["kind"] == "p2p" and (v["status"] == "connected" or _live_connected(v["live"]))]
     config = getattr(monitor, "config", None)
     p2p_config = getattr(config, "p2p", None)
-    canonical = chain.canonical_nodes() if best is not None else []
-    recent_forks = []
-    if best is not None:
-        events = chain.fork_events(since_height=best.height - 500)
-        recent_forks = [_fork_dict(chain, event) for event in reversed(events[-10:])]
+    bottom = chain.canonical_bottom()
+    missing = [height for _, height in chain.missing_parents()] if best is not None else []
     return {
         "generated_at": now,
         "network": chain.params.name,
@@ -182,10 +220,10 @@ def live_snapshot(monitor: Any, now: float | None = None) -> dict[str, Any]:
         "phase": _phase(chain.phase_at(best.height)) if best is not None else None,
         "chain": {
             "blocks": len(chain),
-            "from_height": canonical[0].height if canonical else None,
+            "from_height": bottom.height if bottom is not None else None,
             "to_height": best.height if best is not None else None,
             "settle_depth": chain.settle_depth,
-            "missing_parents": len(chain.missing_parents()),
+            "missing_parents": sum(best.height - height <= MISSING_PARENT_DEPTH for height in missing),
         },
         "peers": views,
         "groups": groups,
@@ -203,7 +241,6 @@ def live_snapshot(monitor: Any, now: float | None = None) -> dict[str, Any]:
             },
         },
         "recent_reorgs": _recent_reorgs(conn, 20) if conn is not None else [],
-        "recent_forks": recent_forks,
     }
 
 
@@ -211,19 +248,37 @@ def peers(monitor: Any, now: float | None = None) -> list[dict[str, Any]]:
     """Return every vantage point with its tip's relation to the best tip (loop thread only).
 
     Rows come from the `sources` table, plus configured RPC endpoints and live
-    P2P peers not yet stored. RPC sources come first (by name), then the rest
-    by group and source.
+    P2P peers not yet stored. Stored rows of RPC endpoints no longer configured,
+    and of peers dialed as fleet hosts that no longer are, are left out. RPC
+    sources come first (by name), then the rest by group and source.
 
     Returns a list of peer views:
-        {"source", "kind": "rpc" | "p2p", "fleet": bool, "impl", "version", "group",
-         "user_agent", "status", "active": bool,
-         "state": "synced" | "lagging" | "fork" | "stuck" | "unknown" | "inactive", "stuck": bool,
-         "tip_hash", "tip_height", "tip_at", "tip_age_s", "behind", "relation": relation,
-         "start_height", "first_seen_at", "last_ok_at", "last_error", "last_error_at",
+        {"source", "kind": "rpc" | "p2p", "host": RPC URL host or peer IP | None, "fleet": bool, "impl",
+         "version", "group", "user_agent", "status", "active": bool,
+         "state": "synced" | "lagging" | "fork" | "stuck" | "old-rules" | "unknown" | "inactive", "stuck": bool,
+         "tip_hash", "tip_height", "tip_at", "tip_age_s", "tip_note", "behind", "relation": relation,
+         "start_height", "rules_fork_height", "first_seen_at", "last_ok_at", "last_seen_at", "last_seen_age_s",
+         "stale": bool, "last_error", "last_error_at", "previous_error", "previous_error_at",
          "live": dict from `p2p.snapshot()` | None}
-    `tip_age_s` counts from the earlier of the tip block's first sighting and its
-    header time (else `tip_at`); `behind` is best height minus tip height (minus the version
-    message start height when no tip is known, e.g. a peer on a fork below our window).
+    `tip_age_s` counts from the tip block's first sighting when it was watched
+    live, else from the earlier of that and its header time (else `tip_at`);
+    `behind` is best height minus tip height (minus the version message start
+    height when no tip is known, e.g. a peer on a fork below our window). A tip
+    stored but not in the chain is placed by walking its stored ancestors (at
+    most MAX_TIP_WALK) to the chain, or below the window to the canonical chain;
+    one still unplaced below the window, or a peer with no tip whose version
+    height is below it, has relation kind "below_window".
+    Status "old-rules" (a peer whose headers or blocks broke our consensus rules
+    after a handshake), or a stored `rules_fork_height` (the verdict outlives a
+    reconnect until the peer's headers pass), gives state "old-rules", active
+    for OLD_RULES_WINDOW after its last handshake, and a "fork" relation at
+    `rules_fork_height` whose tip height is `start_height`; the stored tip,
+    confirmed before the rejection, is then left out and `behind` counts from
+    `start_height`. `last_error` is only
+    an error newer than both the last success and the live connection; an older
+    one is `previous_error`. `last_seen_at` is the latest success, tip update or
+    first contact (now while connected); `stale` means it is over STALE_AFTER
+    ago. `tip_note` is the live peer's note on its tip (e.g. why it has none).
     """
     now = _now(now)
     live, _ = _p2p_live(getattr(monitor, "p2p", None))
@@ -233,13 +288,17 @@ def peers(monitor: Any, now: float | None = None) -> list[dict[str, Any]]:
 def group_sources(chain: Chain, sources: Iterable[Mapping[str, Any]], now: float) -> list[dict[str, Any]]:
     """Group vantage points (`sources` table rows) by implementation and version.
 
-    Each active member with a known tip that is not stuck joins a branch
-    cluster: "canonical" when its tip is on the best chain, otherwise the hash of
-    the first block after the canonical fork point. The group's `branch` is the
+    Each active member with a known tip that is not stuck or on the old rules
+    joins a branch cluster (so neither ever forms a `detect_split` side):
+    "canonical" when its tip is on the best chain, otherwise the hash of the
+    first block after the canonical fork point. The group's `branch` is the
     cluster with the most members (the canonical one on ties).
 
     Returns groups sorted by active members, most first:
-        {"key": "zebra 6.4", "impl", "version", "members", "active", "stuck", "fleet",
+        {"key": "zebra 6.4", "impl", "version", "members", "seen_24h": the same as members,
+         "stale": sources not seen for STALE_AFTER (left out of every other count), "active", "stuck",
+         "old_rules", "old_rules_relation": the relation of its old-rules member with the highest tip | None,
+         "fleet": distinct fleet hosts (RPC and P2P vantage points of one host count once),
          "states": {state: n for every state in STATES},
          "branch": branch | None, "branches": [branch, ...], "stuck_sources": [source, ...]}
     where branch = {"key": "canonical" | fork-child hash, "tip_hash", "tip_height",
@@ -320,7 +379,7 @@ def detect_split(groups: Sequence[Mapping[str, Any]], *, min_members: int = 1) -
 # -- history: summaries, forks, orphans, miners, sawtooth -------------------------------------
 
 
-def summary(chain: Chain, conn: Any = None, now: float | None = None) -> dict[str, Any]:
+def summary(chain: Chain, conn: Any = None, now: float | None = None, *, config: Any = None) -> dict[str, Any]:
     """Return the headline numbers for the stat tiles.
 
     Returns:
@@ -333,13 +392,14 @@ def summary(chain: Chain, conn: Any = None, now: float | None = None) -> dict[st
              "forks": fork events (settled or not), "deepest_fork": blocks, "resets",
              "reorgs": tip changes with is_reorg, "reorged_sources", "deepest_reorg": blocks | None}},
          "deepest_reorg_24h": tip change | None,
-         "last_reset": reset (see `resets`) | None,
-         "sources": {"rpc": [{"source", "status", "last_ok_at", "last_error", "last_error_at",
-                              "tip_hash", "tip_height", "behind"}],
+         "last_reset": the newest reset in memory (see `resets`) | None,
+         "sources": {"rpc": [{"source", "status", "last_ok_at", "last_error", "last_error_at", "previous_error",
+                              "previous_error_at", "tip_hash", "tip_height", "behind"}],
                      "p2p": {"total", "by_status": {status: n}, "connected_by_group": {group: n}}}}
-    Tip changes use `at` (wall clock), everything else header time; `tip change`
-    dicts are {"source", "at", "old_hash", "old_height", "new_hash", "new_height",
-    "fork_hash", "fork_height", "disconnected", "connected"}.
+    Tip changes use `at` (wall clock), everything else header time; reorg counts start no earlier than the
+    window's first block, like the block counts. `tip change` dicts are {"source", "at", "old_hash",
+    "old_height", "new_hash", "new_height", "fork_hash", "fork_height", "disconnected", "connected"}.
+    With `config`, sources dropped from it are left out (see `peers`); errors are as in `peers`.
     """
     now = _now(now)
     best = chain.best_tip()
@@ -368,7 +428,7 @@ def summary(chain: Chain, conn: Any = None, now: float | None = None) -> dict[st
             continue
         for period in each(winner.time):
             period["orphans"] += 1
-            period["self_orphans"] += _contest(loser.miner, winner.miner) == SELF
+            period["self_orphans"] += contest(loser, winner) == SELF
     for event in (chain.fork_events() if best is not None else ()):
         if not _observed(event.winner):
             continue
@@ -384,7 +444,7 @@ def summary(chain: Chain, conn: Any = None, now: float | None = None) -> dict[st
             count, sources, depth = conn.execute(
                 "SELECT COUNT(*), COUNT(DISTINCT source), MAX(disconnected) FROM tip_changes "
                 "WHERE is_reorg = 1 AND at >= ?",
-                (cutoff,),
+                (max(cutoff, canonical[0].time) if canonical else cutoff,),
             ).fetchone()
             periods[name].update(reorgs=count, reorged_sources=sources, deepest_reorg=depth)
         rows = _query(
@@ -394,7 +454,7 @@ def summary(chain: Chain, conn: Any = None, now: float | None = None) -> dict[st
             (cutoffs["24h"],),
         )
         deepest = _tip_change(rows[0]) if rows else None
-    reset_list = chain.resets(since_height=best.height - 5_000) if best is not None else []
+    reset_list = chain.resets() if best is not None else []
     return {
         "generated_at": now,
         "network": chain.params.name,
@@ -409,7 +469,7 @@ def summary(chain: Chain, conn: Any = None, now: float | None = None) -> dict[st
         "periods": periods,
         "deepest_reorg_24h": deepest,
         "last_reset": _reset(reset_list[-1]) if reset_list else None,
-        "sources": _source_health(conn, best) if conn is not None else {"rpc": [], "p2p": None},
+        "sources": _source_health(conn, best, config) if conn is not None else {"rpc": [], "p2p": None},
     }
 
 
@@ -424,25 +484,30 @@ def fork_events(
         {"fork_hash", "fork_height", "fork_time", "height": first contested height,
          "winner": block + {"probes", "adopted_by"},
          "losers": [{"block": block, "tip_hash", "length", "work", "blocks", "miners": [label] (<= 50),
-                     "classification": "self" | "race" | "unknown", "same_job", "seen_first",
-                     "greater_raw_hash", "equal_work", "winner_len", "probes", "adopted_by"}] (<= 10),
+                     "classification": "self" | "race" | "no_body" | "unknown", "same_job", "seen_first",
+                     "seen_gap_s", "greater_raw_hash", "equal_work", "winner_len", "probes", "adopted_by"}] (<= 10),
          "loser_count", "depth": blocks, "depth_work", "classification", "same_job",
          "winner_first_seen", "winner_greater_raw_hash", "equal_work",
-         "tiebreak": "work" | "both" | "hash" | "first_seen" | "neither" | "unknown",
+         "tiebreak": "work" | "late" | "both" | "hash" | "first_seen" | "neither" | "unresolved",
          "settled", "phase": phase at the first contested height, "reorgs"}
     `tiebreak` names the rule that predicts the winner: "work" when the first
-    blocks differ in work, else "hash" (greater raw hash: Zakura, Zebra 6.3),
-    "first_seen" (Zebra 6.4), "both", or "neither" (decided by later blocks).
-    DB fields (None without `conn`, so `tiebreak` is then "work", "hash" or "unknown"):
+    blocks differ in work, "late" when every loser was first seen after the
+    winner's child (work decided on arrival), else "hash" (greater raw hash:
+    Zakura, Zebra 6.3), "first_seen" (Zebra 6.4), "both", "neither" (decided by
+    later blocks) or "unresolved" (arrival order unknown).
+    DB fields (None without `conn`, so `tiebreak` is then "work", "hash" or "unresolved"):
         seen_first, winner_first_seen = arrival order from `sightings`: a block was seen first only when
           the other block's first sighting is an `inv` or `rpc_tip` more than SEEN_MARGIN later (fetch and
           poll times such as backfill or getchaintips do not time arrival);
-        probes ={"block", "notfound", "timeout", "error", "other", "notfound_same_announcer"} for that block;
+        seen_gap_s = the loser's first `inv` or `rpc_tip` sighting minus the winner's (None if either has none);
+        probes = {"block", "notfound", "timeout", "error", "other", "notfound_same_announcer"} of the
+          "announce" and "reprobe" availability probes of that block (body fetches are left out);
         adopted_by = {"count", "by_group": {group: n}, "sources": [{"source", "group", "at", "via"}] (<= 20)},
           sources whose tip or best-chain sighting (via "tip" | "inv" | "headers" | "rpc_tip") was on the
           branch (the winner side covers the contested heights only);
-        reorgs = {"count", "sources": [{"source", "group", "at", "disconnected", "connected",
-                                        "old_hash", "new_hash"}] (<= 20)} of tip changes reorging at this fork.
+        reorgs = {"count": sources, "total": tip changes, "sources": [{"source", "group", "at", "disconnected",
+                  "connected", "old_hash", "new_hash", "reorgs"}] (<= 20, each once with its first reorg and
+                  its number of reorgs)} of tip changes reorging at this fork.
     """
     limit = _clamp_int(limit, 1, MAX_FORK_LIMIT, "limit")
     since = _since(since)
@@ -476,25 +541,25 @@ def orphan_stats(
 
     Returns:
         {"generated_at", "from_height", "to_height", "excluded": [[low, high], ...],
-         "totals": {"blocks", "orphans", "rate", "forks", "self", "race", "unknown", "siblings",
+         "totals": {"blocks", "orphans", "rate", "forks", "self", "race", "unknown", "no_body", "siblings",
                     "unobserved": settled canonical blocks left out (not watched live)},
-         "by_phase": rows keyed "fast" | "slow" | "unknown",
-         "by_k": rows keyed "0", "1-17", ..., ">=401", "unknown",
-         "by_k_fine": rows keyed "0", "1", "2", "3-5", "6-10", "11-17", "18-30",
-         "by_ratio": rows keyed "<0.001", ..., ">=1", "unknown",
+         "by_phase": rows keyed "fast" | "slow" | "steady" | "unknown",
+         "by_k": rows keyed "0", "1-17", ..., ">=401", NO_RESET_BUCKET, "unknown",
+         "by_k_fine": rows keyed "0", "1", "2", "3-5", "6-10", "11-17", "18-30" (steady blocks left out),
+         "by_ratio": rows keyed "<0.001", ..., ">=1", NO_RESET_BUCKET, "unknown",
          "by_hour": [{"start", "blocks", "orphans", "rate", "forks", "resets"}] (last 72 h, oldest first),
          "by_day": [{"day": "YYYY-MM-DD", "start", "blocks", "orphans", "rate", "forks", "resets"}]}
     where rows = [{"key", "blocks", "orphans", "rate", "share": of all orphans, "forks", "forks_per_1000"}].
-    `siblings` counts orphans whose parent is canonical; `self`/`race`/`unknown`
-    compare the orphan's miner with the canonical block's at the same height.
+    `siblings` counts orphans whose parent is canonical; `self`/`race`/`no_body`/`unknown`
+    compare the orphan's miner with the canonical block's at the same height (see `chain.contest`).
     A fork is counted at its first contested height.
     """
     now = _now(now)
     ranges = _height_ranges(exclude_heights)
     by_phase = _Tally(PHASE_LABELS)
-    by_k = _Tally([label for *_, label in K_BUCKETS] + [UNKNOWN])
+    by_k = _Tally([label for *_, label in K_BUCKETS] + [NO_RESET_BUCKET, UNKNOWN])
     by_k_fine = _Tally([label for *_, label in K_FINE_BUCKETS], fixed=True)
-    by_ratio = _Tally([label for *_, label in RATIO_BUCKETS] + [UNKNOWN])
+    by_ratio = _Tally([label for *_, label in RATIO_BUCKETS] + [NO_RESET_BUCKET, UNKNOWN])
     last_hour = int(now // 3_600 * 3_600)
     by_hour = _Tally(range(last_hour - HOURLY_WINDOW, last_hour + 1, 3_600), fixed=True)
     by_day = _Tally()
@@ -504,9 +569,9 @@ def orphan_stats(
     def count(phase: Phase, when: int, slot: int) -> None:
         """Add one item to every tally."""
         by_phase.add(_phase_label(phase), slot)
-        by_k.add(_k_bucket(phase.k), slot)
-        by_k_fine.add(_k_fine(phase.k), slot)
-        by_ratio.add(_ratio_bucket(phase.d_ratio), slot)
+        by_k.add(NO_RESET_BUCKET if phase.steady else _k_bucket(phase.k), slot)
+        by_k_fine.add(None if phase.steady else _k_fine(phase.k), slot)
+        by_ratio.add(NO_RESET_BUCKET if phase.steady else _ratio_bucket(phase.d_ratio), slot)
         by_hour.add(min(when // 3_600 * 3_600, last_hour), slot)
         by_day.add(when // 86_400 * 86_400, slot)
 
@@ -531,7 +596,7 @@ def orphan_stats(
             if _excluded(loser.height, ranges) or not _observed(winner):
                 continue
             count(chain.phase_at(loser.height), winner.time, _ORPHANS)
-            totals[_contest(loser.miner, winner.miner)] += 1
+            totals[contest(loser, winner)] += 1
             totals["siblings"] += loser.prev_hash == chain.canonical_hash_at(loser.height - 1)
         for event in chain.fork_events():
             height = event.fork_height + 1
@@ -551,6 +616,7 @@ def orphan_stats(
             "self": totals[SELF],
             "race": totals[RACE],
             "unknown": totals[UNKNOWN],
+            "no_body": totals[NO_BODY],
             "siblings": totals["siblings"],
             "unobserved": totals["unobserved"],
         },
@@ -585,15 +651,19 @@ def miner_stats(
                      "stale_rate": stale / (canonical + stale), "self_orphans",
                      "races_lost", "races_won": stale blocks of other miners it beat,
                      "unattributed_losses": lost where either miner is unknown, "resets",
-                     "templates": {"zakura" | "zebra" | "none" | "unknown": n},
-                     "by_phase": {"fast" | "slow" | "unknown": {"canonical", "stale"}}}],
-         "pairs": [{"loser", "winner", "kind": "self" | "race" | "unknown", "n"}] (top 20)}
-    Template "none" is a parsed coinbase without a marker; "unknown" has no body.
+                     "templates": {"zakura" | "zebra" | "no marker" | "no body": n},
+                     "by_phase": {"fast" | "slow" | "steady" | "unknown": {"canonical", "stale"}},
+                     "tag": the most common coinbase tag of its blocks (in full, unlike a `shielded:` label) | None}],
+         "pairs": [{"loser", "winner", "kind": "self" | "race" | "no_body" | "unknown", "n"}] (top 20)}
+    Template "no marker" is a parsed coinbase without one. Blocks whose body never arrived are the
+    NO_BODY_MINER row, whose `share` and `stale_rate` are None (it is no miner) and whose losses are not
+    unattributed.
     """
     since = _since(since)
     limit = _clamp_int(limit, 1, 10 * MAX_MINERS, "limit")
     ranges = _height_ranges(exclude_heights)
     stats: dict[str, dict[str, Any]] = defaultdict(_miner_row)
+    tags: dict[str, Counter[str]] = defaultdict(Counter)
     pairs: Counter[tuple[str, str, str]] = Counter()
     best = chain.best_tip()
     top = best.height - chain.settle_depth if best is not None else -1
@@ -611,7 +681,10 @@ def miner_stats(
             if first_height is None:
                 first_height = node.height
             blocks += 1
-            row = stats[_miner(node.miner)]
+            label = _miner(node)
+            row = stats[label]
+            if node.tag:
+                tags[label][node.tag] += 1
             row["canonical"] += 1
             row["resets"] += node.is_min_diff
             row["templates"][_template(node)] += 1
@@ -620,19 +693,21 @@ def miner_stats(
             if _excluded(loser.height, ranges) or (since is not None and winner.time < since) or not _observed(winner):
                 continue
             stale += 1
-            loser_label, winner_label = _miner(loser.miner), _miner(winner.miner)
+            loser_label, winner_label = _miner(loser), _miner(winner)
             row = stats[loser_label]
+            if loser.tag:
+                tags[loser_label][loser.tag] += 1
             row["stale"] += 1
             row["templates"][_template(loser)] += 1
             row["by_phase"][_phase_label(chain.phase_at(loser.height))]["stale"] += 1
-            kind = _contest(loser.miner, winner.miner)
+            kind = contest(loser, winner)
             pairs[(loser_label, winner_label, kind)] += 1
             if kind == SELF:
                 row["self_orphans"] += 1
             elif kind == RACE:
                 row["races_lost"] += 1
                 stats[winner_label]["races_won"] += 1
-            else:
+            elif kind == UNKNOWN:
                 row["unattributed_losses"] += 1
     ranked = sorted(stats.items(), key=lambda item: (-(item[1]["canonical"] + item[1]["stale"]), item[0]))
     if len(ranked) > limit:
@@ -643,10 +718,12 @@ def miner_stats(
     miners = []
     for label, row in ranked:
         total = row["canonical"] + row["stale"]
+        miner = label != NO_BODY_MINER
         miners.append(
-            {"miner": label, **row, "share": _rate(row["canonical"], blocks), "stale_rate": _rate(row["stale"], total),
-             "templates": dict(row["templates"]),
-             "by_phase": {phase: dict(counts) for phase, counts in row["by_phase"].items()}}
+            {"miner": label, **row, "share": _rate(row["canonical"], blocks) if miner else None,
+             "stale_rate": _rate(row["stale"], total) if miner else None, "templates": dict(row["templates"]),
+             "by_phase": {phase: dict(counts) for phase, counts in row["by_phase"].items()},
+             "tag": _text(tags[label].most_common(1)[0][0]) if label in tags else None}
         )
     return {
         "since": since,
@@ -669,7 +746,8 @@ def sawtooth(chain: Chain, n: int = 1_500) -> dict[str, Any]:
     Returns:
         {"from_height", "to_height", "target_spacing", "averaging_window": both in force at to_height,
          "blocks": [{"height", "time", "dt": time - previous canonical time | None, "difficulty",
-                     "k", "fast", "min_diff", "orphans": attached non-canonical blocks at the height}],
+                     "k", "fast", "label": phase label (see `_phase`), "min_diff",
+                     "orphans": attached non-canonical blocks at the height}],
          "resets": [reset, see `resets`] (oldest first, within the range),
          "tip_phase": phase | None}
     """
@@ -690,8 +768,8 @@ def sawtooth(chain: Chain, n: int = 1_500) -> dict[str, Any]:
         rows.append(
             {"height": node.height, "time": node.time,
              "dt": node.time - previous_time if previous_time is not None else None,
-             "difficulty": _sig(phase.difficulty), "k": phase.k, "fast": phase.fast, "min_diff": node.is_min_diff,
-             "orphans": rivals}
+             "difficulty": _sig(phase.difficulty), "k": phase.k, "fast": phase.fast, "label": _phase_label(phase),
+             "min_diff": node.is_min_diff, "orphans": rivals}
         )
         previous_time = node.time
     out.update(
@@ -712,8 +790,9 @@ def resets(chain: Chain, limit: int = 100, since: float | None = None) -> list[d
     `since` filters on the reset block's header time. Each reset:
         {"height", "hash", "time", "miner", "template", "gap": time - parent time,
          "next_dt": next canonical time - time, "forward_dating": time - first_seen_at,
-         "d_pre", "fast_blocks": blocks until the fast phase ended (None while fast),
-         "cycle_blocks": blocks until the next reset (None while open),
+         "d_pre", "fast_blocks": blocks until the fast phase ended (the whole cycle if it never slowed,
+         None while open and fast), "cycle_blocks": blocks until the next reset (None while open),
+         "never_slowed": the cycle closed while still fast, "era": "pre-nu7" | "nu7",
          "orphans": settled stale blocks at heights of the cycle watched live (None if none was),
          "unobserved": canonical blocks of the cycle not watched live}
     """
@@ -747,19 +826,25 @@ def external_crosscheck(chain: Chain, conn: Any) -> dict[str, Any]:
 
     External records whose hash is canonical here are tip flip-flops, not orphans;
     unmatched ones at heights not watched live (see the module doc) are "unwatched",
-    not "only_theirs", because this monitor could not have seen them.
+    not "only_theirs", because this monitor could not have seen them. Unmatched
+    ones this monitor did see (in its chain, a sighting or a getchaintips tip) but
+    never got as a settled stale block, because nobody served them, are
+    "seen_unfetched"; "only_theirs" were not seen here at all.
 
     Returns:
         {"from_height", "to_height", "sources": [external source names],
-         "totals": {"both", "only_theirs", "only_ours", "theirs_canonical", "out_of_window", "unwatched"},
-         "by_source": {source: {"both", "only_theirs", "theirs_canonical", "unwatched"}},
-         "by_day": [{"day", "start", "both", "only_theirs", "only_ours", "theirs_canonical", "unwatched"}],
+         "totals": {"both", "only_theirs", "seen_unfetched", "only_ours", "theirs_canonical", "out_of_window",
+                    "unwatched"},
+         "by_source": {source: {"both", "only_theirs", "seen_unfetched", "theirs_canonical", "unwatched"}},
+         "by_day": [{"day", "start", "both", "only_theirs", "seen_unfetched", "only_ours", "theirs_canonical",
+                     "unwatched"}],
          "only_theirs": [{"source", "hash", "height", "time", "miner_address"}] (newest, <= 20),
          "only_ours": [block] (newest, <= 20)}
     Days use the canonical header time at the orphan's height.
     """
     best = chain.best_tip()
-    empty = {"both": 0, "only_theirs": 0, "only_ours": 0, "theirs_canonical": 0, "out_of_window": 0, "unwatched": 0}
+    empty = {"both": 0, "only_theirs": 0, "seen_unfetched": 0, "only_ours": 0, "theirs_canonical": 0,
+             "out_of_window": 0, "unwatched": 0}
     out: dict[str, Any] = {"from_height": None, "to_height": None, "sources": [], "totals": empty, "by_source": {},
                            "by_day": [], "only_theirs": [], "only_ours": []}
     if best is None or conn is None:
@@ -778,12 +863,16 @@ def external_crosscheck(chain: Chain, conn: Any) -> dict[str, Any]:
         "WHERE height IS NOT NULL ORDER BY height DESC LIMIT ?",
         (MAX_PROBE_ROWS,),
     )
-    for row in rows:
+    watched = [row for row in rows if low <= row["height"] <= top]
+    totals["out_of_window"] = len(rows) - len(watched)
+    unmatched = [row["hash"] for row in watched if row["hash"] not in ours and row["hash"] not in chain]
+    seen: set[str] = set()
+    for table in ("sightings", "chaintips"):
+        sql = f"SELECT hash FROM {table} WHERE hash IN ({{marks}})"
+        seen.update(block_hash for (block_hash,) in _in_query(conn, sql, unmatched))
+    for row in watched:
         height, block_hash = row["height"], row["hash"]
         source = _text(row["source"])
-        if not low <= height <= top:
-            totals["out_of_window"] += 1
-            continue
         winner_hash = chain.canonical_hash_at(height)
         winner = chain.get(winner_hash) if winner_hash else None
         day = winner.time // 86_400 * 86_400 if winner is not None else None
@@ -793,6 +882,8 @@ def external_crosscheck(chain: Chain, conn: Any) -> dict[str, Any]:
             kind = "both"
         elif winner is not None and not _observed(winner):
             kind = "unwatched"
+        elif block_hash in chain or block_hash in seen:
+            kind = "seen_unfetched"
         else:
             kind = "only_theirs"
             if len(only_theirs) < MAX_SAMPLE:
@@ -811,14 +902,14 @@ def external_crosscheck(chain: Chain, conn: Any) -> dict[str, Any]:
     for _, winner in only_ours:
         totals["only_ours"] += 1
         days[winner.time // 86_400 * 86_400]["only_ours"] += 1
-    keys = ("both", "only_theirs", "only_ours", "theirs_canonical", "unwatched")
+    keys = ("both", "only_theirs", "seen_unfetched", "only_ours", "theirs_canonical", "unwatched")
     out.update(
         from_height=low,
         to_height=top,
         sources=sorted(by_source),
         totals={**empty, **totals},
         by_source={
-            source: {key: counts[key] for key in ("both", "only_theirs", "theirs_canonical", "unwatched")}
+            source: {key: counts[key] for key in keys if key != "only_ours"}
             for source, counts in sorted(by_source.items())
         },
         by_day=[
@@ -866,7 +957,7 @@ def propagation(conn: Any, since: float | None = None, *, now: float | None = No
     blocks = _query(
         conn,
         "SELECT hash, height, first_seen_at, first_seen_source FROM blocks "
-        "WHERE height BETWEEN ? AND ? AND first_seen_at >= ? ORDER BY height DESC LIMIT ?",
+        "WHERE height BETWEEN ? AND ? AND first_seen_at >= ? AND rules_invalid = 0 ORDER BY height DESC LIMIT ?",
         (top - PROPAGATION_HEIGHT_SPAN, top + PROPAGATION_HEIGHT_SPAN, since, MAX_PROPAGATION_BLOCKS),
     )
     groups = _source_groups(conn)
@@ -931,7 +1022,8 @@ def probe_stats(
     """Return getdata probe outcomes by implementation and the "announced then notfound" incidents.
 
     `since` defaults to the last 24 h. With `chain` (loop thread only), each
-    incident says whether its block is canonical. `by_group` covers the
+    incident says whether its block is canonical. A probe's group uses the peer
+    version recorded with it, else the peer's current version. `by_group` covers the
     "announce" probes (the first announcer of a block unknown here, every
     implementation), so groups compare like with like; `reprobe_by_group`
     covers the sampled "reprobe" probes (Zebra announcers of blocks already
@@ -956,7 +1048,8 @@ def probe_stats(
     rows = _query(
         conn,
         "SELECT p.at, p.source, p.impl, p.hash, p.reason, p.result, p.latency_ms, p.peer_tip_hash, "
-        "p.announced_by_same_peer, s.impl_version FROM probes p LEFT JOIN sources s ON s.source = p.source "
+        "p.announced_by_same_peer, COALESCE(p.impl_version, s.impl_version) AS impl_version "
+        "FROM probes p LEFT JOIN sources s ON s.source = p.source "
         "WHERE p.at >= ? ORDER BY p.at DESC LIMIT ?",
         (since, MAX_PROBE_ROWS),
     )
@@ -1025,10 +1118,12 @@ def probe_stats(
 # -- text report --------------------------------------------------------------------------------
 
 
-def text_report(chain: Chain, conn: Any = None, *, now: float | None = None, forks: int = 10) -> str:
-    """Render a plain-text summary (tip, periods, orphan phases, miners, forks, resets, sources)."""
+def text_report(
+    chain: Chain, conn: Any = None, *, now: float | None = None, forks: int = 10, config: Any = None
+) -> str:
+    """Render a plain-text summary (tip, periods, orphan phases, miners, forks, resets, sources); see `summary`."""
     now = _now(now)
-    head = summary(chain, conn, now)
+    head = summary(chain, conn, now, config=config)
     lines = [f"Zakura fork monitor report ({head['network']}) at {_iso(now)} UTC"]
     tip = head["tip"]
     if tip is None:
@@ -1102,9 +1197,10 @@ def text_report(chain: Chain, conn: Any = None, *, now: float | None = None, for
 
 @dataclass(frozen=True, slots=True)
 class _Context:
-    """Configuration facts that label sources: RPC kinds and fleet membership."""
+    """Configuration facts that label sources: RPC kinds and hosts, and fleet membership."""
 
     rpc_kind: Mapping[str, str] = dataclasses.field(default_factory=dict)
+    rpc_host: Mapping[str, str] = dataclasses.field(default_factory=dict)
     fleet_sources: frozenset[str] = frozenset()
     fleet_hosts: frozenset[str] = frozenset()
 
@@ -1112,11 +1208,13 @@ class _Context:
 def _views(monitor: Any, conn: Any, now: float, live: Mapping[str, Mapping[str, Any]]) -> list[dict[str, Any]]:
     """Build peer views from the sources table, configured RPC endpoints and live P2P peers."""
     chain: Chain = monitor.chain
-    rows = _query(conn, "SELECT * FROM sources ORDER BY source LIMIT ?", (MAX_SOURCES,)) if conn is not None else []
     config = getattr(monitor, "config", None)
+    rows = _query(conn, "SELECT * FROM sources ORDER BY source LIMIT ?", (MAX_SOURCES,)) if conn is not None else []
+    rows = [row for row in rows if not _retired(row, config)]
     endpoints = tuple(getattr(config, "rpc", ()) or ())
     context = _Context(
         rpc_kind={e.source: e.kind for e in endpoints},
+        rpc_host={e.source: getattr(e, "host", "") for e in endpoints},
         fleet_sources=frozenset(e.source for e in endpoints if e.fleet),
         fleet_hosts=frozenset(getattr(config, "fleet_hosts", ()) or ()),
     )
@@ -1126,9 +1224,39 @@ def _views(monitor: Any, conn: Any, now: float, live: Mapping[str, Mapping[str, 
         if source not in known:
             rows.append(_live_row(source, entry))
     best = chain.best_tip()
-    views = [_view(chain, row, now, best, context, live.get(row["source"])) for row in rows[: 2 * MAX_SOURCES]]
+    views = [
+        _view(chain, row, now, best, context, live.get(row["source"]), conn) for row in rows[: 2 * MAX_SOURCES]
+    ]
     views.sort(key=lambda v: (v["kind"] != "rpc", v["group"] if v["kind"] != "rpc" else "", v["source"]))
     return views
+
+
+def _retired(row: Mapping[str, Any], config: Any) -> bool:
+    """Return whether a sources row belongs to a vantage point dropped from `config` (None keeps every row).
+
+    That is an RPC endpoint no longer configured, or a peer dialed as a fleet host that no longer is one.
+    """
+    if config is None:
+        return False
+    source = str(row.get("source") or "")
+    if row.get("kind") == "rpc" or source.startswith("rpc:"):
+        return source not in {e.source for e in getattr(config, "rpc", ()) or ()}
+    if row.get("discovered_via") == "fleet":
+        hosts = getattr(config, "fleet_hosts", ()) or ()
+        # P2P rows are keyed by IP, so a fleet host configured by name cannot be matched: keep the row.
+        if not all(_is_ip(host) for host in hosts):
+            return False
+        return _p2p_host(source) not in hosts
+    return False
+
+
+def _is_ip(host: str) -> bool:
+    """Return whether `host` is an IPv4 or IPv6 literal."""
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return True
 
 
 def _view(
@@ -1138,8 +1266,9 @@ def _view(
     best: Any,
     context: _Context,
     live: Mapping[str, Any] | None = None,
+    conn: Any = None,
 ) -> dict[str, Any]:
-    """Describe one source: identity, tip, relation to the best tip, activity and state."""
+    """Describe one source: identity, tip, relation to the best tip, activity and state (see `peers`)."""
     source = _text(row.get("source")) or "?"
     kind = _text(row.get("kind"), 16) or source.partition(":")[0]
     impl = (_text(row.get("impl"), 32) or context.rpc_kind.get(source) or UNKNOWN).lower()
@@ -1150,38 +1279,59 @@ def _view(
         tip_hash = _hash_or_none(live.get("tip_hash") or live.get("tip"))
         tip_height = _int_or_none(live.get("tip_height"))
     node = chain.get(tip_hash) if tip_hash is not None else None
+    relation = _no_relation(UNKNOWN, tip_height)
+    seen = _float_or_none(row.get("tip_at"))
     if node is not None:
         relation = _relation(chain.relation(node.hash))
         tip_height = node.height
-        # A dead-fork tip met on first contact is first seen now; its header time still shows its age,
-        # and the first sighting still bounds a forward-dated header.
-        seen: float | None = min(float(node.time), node.first_seen_at if node.first_seen_at is not None else math.inf)
-    else:
-        relation = {"kind": UNKNOWN, "n": None, "fork_hash": None, "fork_height": None, "depth_ours": None,
-                    "depth_theirs": None, "tip_height": tip_height}
-        seen = _float_or_none(row.get("tip_at"))
+        seen = _tip_seen(node)
+    elif tip_hash is not None and conn is not None and best is not None:
+        placed = _place(chain, conn, tip_hash, now)
+        if placed is not None:
+            relation = _placed_relation(chain, placed, best)
+            tip_height = placed.height
+            seen = _tip_seen(placed)
     age = now - seen if seen is not None else None
     behind = best.height - tip_height if best is not None and tip_height is not None else None
     start_height = _int_or_none(row.get("start_height"))
     if behind is None and tip_hash is None and best is not None and start_height is not None:
         # No tip learned (e.g. no common block in our window): its version height is the best estimate.
         behind = best.height - start_height
+        bottom = chain.canonical_bottom()
+        if bottom is not None and start_height < bottom.height:
+            relation = _no_relation(BELOW_WINDOW, start_height)
     status = _text(row.get("status"), 32)
     last_ok, tip_at = _float_or_none(row.get("last_ok_at")), _float_or_none(row.get("tip_at"))
+    first_seen = _float_or_none(row.get("first_seen_at"))
+    connected = _live_connected(live)
+    rules_fork_height = _int_or_none(row.get("rules_fork_height"))
+    old_rules = status == OLD_RULES or rules_fork_height is not None
     active = (
         status in ACTIVE_STATUSES
-        or _live_connected(live)
+        or connected
         or any(t is not None and now - t <= ACTIVE_WINDOW for t in (last_ok, tip_at))
+        or (old_rules and last_ok is not None and now - last_ok <= OLD_RULES_WINDOW)
     )
-    state = _state(relation["kind"], relation["n"], behind, age) if tip_hash or behind is not None else UNKNOWN
+    if old_rules:
+        relation = _old_rules_relation(chain, best, relation, rules_fork_height, start_height)
+        state = OLD_RULES
+        if rules_fork_height is not None:  # the stored tip predates the rejection, so it is not theirs now
+            tip_hash = tip_height = age = None
+            behind = best.height - start_height if best is not None and start_height is not None else None
+    else:
+        state = _state(relation["kind"], relation["n"], behind, age) if tip_hash or behind is not None else UNKNOWN
     stuck = active and state == "stuck"
     if not active:
         state = "inactive"
-    host = source[4:].rpartition(":")[0].strip("[]").lower() if kind == "p2p" else ""
+    contacts = [t for t in (last_ok, tip_at, first_seen, now if connected else None) if t is not None]
+    last_seen = max(contacts) if contacts else None
+    connected_at = _float_or_none(live.get("connected_at")) if connected else None
+    host = _p2p_host(source) if kind == "p2p" else context.rpc_host.get(source) or ""
     return {
         "source": source,
         "kind": kind,
-        "fleet": source in context.fleet_sources or (bool(host) and host in context.fleet_hosts),
+        "host": host or None,
+        "fleet": source in context.fleet_sources or (kind == "p2p" and bool(host) and host in context.fleet_hosts),
         "impl": impl,
         "version": version_text,
         "group": _group_key(impl, version_text),
@@ -1194,13 +1344,17 @@ def _view(
         "tip_height": tip_height,
         "tip_at": tip_at,
         "tip_age_s": _sig(age),
+        "tip_note": _text(live.get("tip_note")) if live else None,
         "behind": behind,
         "relation": relation,
-        "start_height": _int_or_none(row.get("start_height")),
-        "first_seen_at": _float_or_none(row.get("first_seen_at")),
+        "start_height": start_height,
+        "rules_fork_height": rules_fork_height,
+        "first_seen_at": first_seen,
         "last_ok_at": last_ok,
-        "last_error": _text(row.get("last_error")),
-        "last_error_at": _float_or_none(row.get("last_error_at")),
+        "last_seen_at": last_seen,
+        "last_seen_age_s": _sig(now - last_seen) if last_seen is not None else None,
+        "stale": last_seen is not None and now - last_seen > STALE_AFTER,
+        **_error_fields(row.get("last_error"), row.get("last_error_at"), last_ok, connected_at),
         "live": _plain(live) if live is not None else None,
     }
 
@@ -1217,11 +1371,149 @@ def _state(kind: str, n: int | None, behind: int | None, age: float | None) -> s
     return "stuck" if far_behind else UNKNOWN
 
 
+def _tip_seen(block: Any) -> float:
+    """Return when a tip block (Node or `_Placement`) appeared, to time its age.
+
+    That is its first sighting when it was watched live (see `_observed`). A dead-fork tip met on first
+    contact is first seen only now, so it takes the earlier of that and its header time.
+    """
+    if _observed(block):
+        return block.first_seen_at
+    return min(float(block.time), block.first_seen_at if block.first_seen_at is not None else math.inf)
+
+
+def _no_relation(kind: str, tip_height: int | None) -> dict[str, Any]:
+    """Return a relation dict that places nothing (kind "unknown" or "below_window")."""
+    return {"kind": kind, "n": None, "fork_hash": None, "fork_height": None, "depth_ours": None,
+            "depth_theirs": None, "tip_height": tip_height}
+
+
+def _old_rules_relation(
+    chain: Chain, best: Any, relation: dict[str, Any], fork_height: int | None, start_height: int | None
+) -> dict[str, Any]:
+    """Return the "fork" relation of a peer rejected for breaking our rules.
+
+    It left our chain at `fork_height` (else where its tip forks off) and sits at its version message's
+    `start_height`, since the tip we learned stops before the headers we rejected.
+    """
+    if fork_height is None and relation["kind"] == "fork":
+        return relation
+    known = fork_height is not None
+    theirs = start_height - fork_height if known and start_height is not None else None
+    return {"kind": "fork", "n": theirs, "fork_hash": chain.canonical_hash_at(fork_height) if known else None,
+            "fork_height": fork_height, "depth_ours": best.height - fork_height if known and best is not None else None,
+            "depth_theirs": theirs, "tip_height": start_height}
+
+
+def _error_fields(error: Any, error_at: Any, *successes: float | None) -> dict[str, Any]:
+    """Return the last/previous error fields: an error no newer than a later success is only `previous_error`."""
+    text, at = _text(error), _float_or_none(error_at)
+    done = [t for t in successes if t is not None]
+    if text is not None and at is not None and done and at <= max(done):
+        return {"last_error": None, "last_error_at": None, "previous_error": text, "previous_error_at": at}
+    return {"last_error": text, "last_error_at": at, "previous_error": None, "previous_error_at": None}
+
+
+def _p2p_host(source: str) -> str:
+    """Return the lowercased IP of a "p2p:ip:port" source."""
+    return source[4:].rpartition(":")[0].strip("[]").lower()
+
+
+@dataclass(frozen=True, slots=True)
+class _Placement:
+    """A stored tip outside the chain: its newest ancestor in the chain (`anchor`), else its fork point with the
+    canonical chain below the window (`fork_hash`, `fork_height`); neither when it could not be placed."""
+
+    height: int
+    time: int
+    first_seen_at: float | None
+    walked_at: float
+    anchor: str | None = None
+    fork_hash: str | None = None
+    fork_height: int | None = None
+
+
+# Tip hash -> placement per chain (a rebuilt chain starts afresh), least recently used first.
+_PLACEMENTS: weakref.WeakKeyDictionary[Chain, OrderedDict[str, _Placement]] = weakref.WeakKeyDictionary()
+
+
+def _place(chain: Chain, conn: Any, tip_hash: str, now: float) -> _Placement | None:
+    """Place a tip that is stored but not in the chain (cached, see MAX_PLACEMENTS); None if it is not stored."""
+    cache = _PLACEMENTS.get(chain)
+    if cache is None:
+        cache = _PLACEMENTS[chain] = OrderedDict()
+    placed = cache.get(tip_hash)
+    if placed is not None and (
+        placed.anchor in chain
+        or placed.fork_hash is not None
+        or (placed.anchor is None and now - placed.walked_at < PLACE_RETRY)
+    ):
+        cache.move_to_end(tip_hash)
+        return placed
+    row = conn.execute("SELECT height, time, first_seen_at FROM blocks WHERE hash = ?", (tip_hash,)).fetchone()
+    if row is None or _int_or_none(row[0]) is None or _int_or_none(row[1]) is None:
+        return None
+    placed = _walk_placement(chain, conn, tip_hash, _Placement(row[0], row[1], _float_or_none(row[2]), now))
+    cache[tip_hash] = placed
+    cache.move_to_end(tip_hash)
+    while len(cache) > MAX_PLACEMENTS:
+        cache.popitem(last=False)
+    return placed
+
+
+def _walk_placement(chain: Chain, conn: Any, tip_hash: str, tip: _Placement) -> _Placement:
+    """Fill in where stored tip `tip` joins the chain, walking its stored ancestors (see `_place`)."""
+    path: list[tuple[str, int]] = []
+    for block_hash, height, *_ in conn.execute(ANCESTORS_SQL, (tip_hash, MAX_TIP_WALK)):
+        if height != tip.height - len(path):  # a gap or crafted rows
+            break
+        if path and block_hash in chain:
+            return dataclasses.replace(tip, anchor=block_hash)
+        path.append((block_hash, height))
+    bottom = chain.canonical_bottom()
+    if not path or bottom is None or path[-1][1] >= bottom.height:
+        return tip
+    low, top = path[-1][1], min(tip.height, bottom.height - 1)
+    canonical: dict[int, str] = {}
+    steps = min(bottom.height - 1 - low, MAX_CANON_WALK)
+    for index, (block_hash, height, *_) in enumerate(conn.execute(ANCESTORS_SQL, (bottom.prev_hash, steps))):
+        if height != bottom.height - 1 - index:
+            break
+        if height <= top:
+            canonical[height] = block_hash
+    for block_hash, height in path:
+        if canonical.get(height) == block_hash:
+            return dataclasses.replace(tip, fork_hash=block_hash, fork_height=height)
+    return tip
+
+
+def _placed_relation(chain: Chain, placed: _Placement, best: Any) -> dict[str, Any]:
+    """Relate a placed stored tip to the best tip as `Chain.relation` does; "below_window" if it is unplaced there."""
+    fork_hash, fork_height = placed.fork_hash, placed.fork_height
+    if placed.anchor is not None:
+        fork = chain.fork_point(placed.anchor, best.hash)
+        fork_hash, fork_height = (fork.hash, fork.height) if fork is not None else (None, None)
+    if fork_height is None:
+        bottom = chain.canonical_bottom()
+        below = bottom is not None and placed.height < bottom.height
+        return _no_relation(BELOW_WINDOW if below else UNKNOWN, placed.height)
+    ours, theirs = best.height - fork_height, placed.height - fork_height
+    if theirs == 0:
+        kind, n = "behind", ours  # the tip is canonical, below the window
+    elif ours == 0:
+        kind, n = "ahead", theirs
+    else:
+        kind, n = "fork", theirs
+    return {"kind": kind, "n": n, "fork_hash": fork_hash, "fork_height": fork_height, "depth_ours": ours,
+            "depth_theirs": theirs, "tip_height": placed.height}
+
+
 def _group_views(chain: Chain, views: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
     """Aggregate peer views into implementation groups with branch clusters (see `group_sources`)."""
     groups: dict[str, dict[str, Any]] = {}
     clusters: dict[str, dict[str, dict[str, Any]]] = defaultdict(dict)
     side_keys: dict[str, str | None] = {}
+    fleet_hosts: dict[str, set[str]] = defaultdict(set)
     for view in views:
         key = view["group"]
         group = groups.get(key)
@@ -1229,12 +1521,23 @@ def _group_views(chain: Chain, views: Iterable[Mapping[str, Any]]) -> list[dict[
             match = _VERSION_RE.match(view["version"] or "")
             group = groups[key] = {
                 "key": key, "impl": view["impl"], "version": f"{match[1]}.{match[2]}" if match else None,
-                "members": 0, "active": 0, "stuck": 0, "fleet": 0, "states": dict.fromkeys(STATES, 0),
-                "branch": None, "branches": [], "stuck_sources": [],
+                "members": 0, "seen_24h": 0, "stale": 0, "active": 0, "stuck": 0, "old_rules": 0,
+                "old_rules_relation": None, "fleet": 0, "states": dict.fromkeys(STATES, 0), "branch": None,
+                "branches": [], "stuck_sources": [],
             }
+        if view["stale"]:
+            group["stale"] += 1
+            continue
         group["members"] += 1
+        group["seen_24h"] += 1
         group["active"] += view["active"]
-        group["fleet"] += view["fleet"]
+        if view["state"] == OLD_RULES:
+            group["old_rules"] += 1
+            highest = group["old_rules_relation"]
+            if highest is None or (view["relation"]["tip_height"] or 0) > (highest["tip_height"] or 0):
+                group["old_rules_relation"] = view["relation"]
+        if view["fleet"]:
+            fleet_hosts[key].add(view["host"] or view["source"])
         group["states"][view["state"]] = group["states"].get(view["state"], 0) + 1
         if view["stuck"]:
             group["stuck"] += 1
@@ -1266,6 +1569,7 @@ def _group_views(chain: Chain, views: Iterable[Mapping[str, Any]]) -> list[dict[
         if cluster["tip_height"] is None or (height is not None and height > cluster["tip_height"]):
             cluster.update(tip_hash=view["tip_hash"], tip_height=height, relation=relation)
     for key, group in groups.items():
+        group["fleet"] = len(fleet_hosts[key])
         branches = sorted(
             clusters[key].values(),
             key=lambda c: (-c["members"], c["key"] != CANONICAL, -(c["tip_height"] or 0), c["key"]),
@@ -1372,9 +1676,13 @@ def _rpc_status(monitor: Any, views: Sequence[Mapping[str, Any]]) -> tuple[list[
     return [{key: view[key] for key in keys} for view in views if view["kind"] == "rpc"], None
 
 
-def _source_health(conn: Any, best: Any) -> dict[str, Any]:
-    """Summarize the sources table: RPC endpoints individually, P2P peers by status and group."""
+def _source_health(conn: Any, best: Any, config: Any = None) -> dict[str, Any]:
+    """Summarize the sources table: RPC endpoints individually, P2P peers by status and group.
+
+    Rows of vantage points dropped from `config` are left out (see `_retired`).
+    """
     rows = _query(conn, "SELECT * FROM sources ORDER BY source LIMIT ?", (MAX_SOURCES,))
+    rows = [row for row in rows if not _retired(row, config)]
     rpc = []
     p2p_status: Counter[str] = Counter()
     connected: Counter[str] = Counter()
@@ -1384,8 +1692,9 @@ def _source_health(conn: Any, best: Any) -> dict[str, Any]:
         if row["kind"] == "rpc":
             rpc.append(
                 {"source": _text(row["source"]), "status": _text(row["status"], 32),
-                 "last_ok_at": row["last_ok_at"], "last_error": _text(row["last_error"]),
-                 "last_error_at": row["last_error_at"], "tip_hash": row["tip_hash"], "tip_height": tip_height,
+                 "last_ok_at": row["last_ok_at"],
+                 **_error_fields(row["last_error"], row["last_error_at"], _float_or_none(row["last_ok_at"])),
+                 "tip_hash": row["tip_hash"], "tip_height": tip_height,
                  "behind": best.height - tip_height if best is not None and tip_height is not None else None}
             )
         else:
@@ -1445,7 +1754,7 @@ def _fork_dict(chain: Chain, event: ForkEvent) -> dict[str, Any]:
         "winner_first_seen": None,  # a DB field, see `_enrich_forks`
         "winner_greater_raw_hash": event.winner_greater_raw_hash,
         "equal_work": event.equal_work,
-        "tiebreak": _tiebreak(event.equal_work, event.winner_greater_raw_hash, None),
+        "tiebreak": _tiebreak(event.equal_work, event.winner_greater_raw_hash, None, False),
         "settled": event.settled,
         "phase": _phase(chain.phase_at(event.fork_height + 1)),
     }
@@ -1462,17 +1771,20 @@ def _loser(branch: LoserBranch) -> dict[str, Any]:
         "miners": [_text(miner) for miner in branch.miners[:MAX_BRANCH_MINERS]],
         "classification": branch.classification,
         "same_job": branch.same_job,
-        "seen_first": None,  # a DB field, see `_enrich_forks`
+        "seen_first": None,  # DB fields, see `_enrich_forks`
+        "seen_gap_s": None,
         "greater_raw_hash": branch.greater_raw_hash,
         "equal_work": branch.equal_work,
         "winner_len": branch.winner_len,
     }
 
 
-def _tiebreak(equal_work: bool, greater_hash: bool | None, first_seen: bool | None) -> str:
-    """Name the tie-break rule that predicts the winner of an equal-work race."""
+def _tiebreak(equal_work: bool, greater_hash: bool | None, first_seen: bool | None, late: bool) -> str:
+    """Name the tie-break rule that predicts the winner of an equal-work race (see `fork_events`)."""
     if not equal_work:
         return "work"
+    if late:
+        return LATE
     by_hash, by_seen = greater_hash is True, first_seen is True
     if by_hash and by_seen:
         return "both"
@@ -1482,21 +1794,24 @@ def _tiebreak(equal_work: bool, greater_hash: bool | None, first_seen: bool | No
         return "first_seen"
     if greater_hash is False and first_seen is False:
         return "neither"
-    return UNKNOWN
+    return UNRESOLVED
 
 
-def _seen_bounds(conn: Any, refs: Mapping[str, Any]) -> dict[str, tuple[float | None, float | None]]:
-    """Return {hash: (first seen, earliest arrival or None)} for BlockRefs keyed by hash.
+def _seen_bounds(conn: Any, refs: Mapping[str, Any]) -> dict[str, tuple[float | None, float | None, float | None]]:
+    """Return {hash: (first seen, earliest arrival or None, first timely sighting or None)} for blocks keyed by hash.
 
     The earliest arrival is known only when the first sighting is timely (`inv`
     or `rpc_tip`); a fetch or poll can come any time after the block arrived.
     """
     earliest: dict[str, tuple[float, str]] = {}
+    timely: dict[str, float] = {}
     sql = "SELECT hash, kind, at FROM sightings WHERE hash IN ({marks})"
     for block_hash, kind, at in _in_query(conn, sql, list(refs)):
         known = earliest.get(block_hash)
         if known is None or at < known[0] or (at == known[0] and kind in TIMELY_KINDS):
             earliest[block_hash] = (at, kind)
+        if kind in TIMELY_KINDS and at < timely.get(block_hash, math.inf):
+            timely[block_hash] = at
     bounds = {}
     for block_hash, ref in refs.items():
         at, kind = earliest.get(block_hash, (None, None))
@@ -1506,11 +1821,11 @@ def _seen_bounds(conn: Any, refs: Mapping[str, Any]) -> dict[str, tuple[float | 
             lower = at - SEEN_MARGIN if kind in TIMELY_KINDS else None
         else:
             lower = None  # the chain's first sighting is not in the table (pruned): its kind is unknown
-        bounds[block_hash] = (first, lower)
+        bounds[block_hash] = (first, lower, timely.get(block_hash))
     return bounds
 
 
-def _seen_before(a: tuple[float | None, float | None], b: tuple[float | None, float | None]) -> bool | None:
+def _seen_before(a: tuple[float | None, ...], b: tuple[float | None, ...]) -> bool | None:
     """Return True if block `a` was seen before `b` could have arrived, False for the reverse, else None."""
     if a[0] is not None and b[1] is not None and a[0] < b[1]:
         return True
@@ -1547,14 +1862,22 @@ class _Adoption:
 def _enrich_forks(chain: Chain, conn: Any, pairs: list[tuple[ForkEvent, dict[str, Any]]]) -> None:
     """Add arrival order, probe results, adopting sources and per-source reorgs to fork event dicts."""
     refs = {ref.hash: ref for event, _ in pairs for ref in (event.winner, *(b.block for b in event.losers))}
+    children = {event.fork_hash: chain.get(chain.canonical_hash_at(event.fork_height + 2) or "") for event, _ in pairs}
+    refs.update((child.hash, child) for child in children.values() if child is not None)
     bounds = _seen_bounds(conn, refs)
     for event, out in pairs:
         winner_bounds = bounds[event.winner.hash]
         seen = [_seen_before(bounds[branch.block.hash], winner_bounds) for branch in event.losers]
-        for loser_out, value in zip(out["losers"], seen, strict=False):  # out lists at most MAX_LOSERS
+        for branch, loser_out, value in zip(event.losers, out["losers"], seen, strict=False):  # out has <= MAX_LOSERS
+            gap = bounds[branch.block.hash][2], winner_bounds[2]
             loser_out["seen_first"] = value
+            loser_out["seen_gap_s"] = _sig(gap[0] - gap[1]) if None not in gap else None
         out["winner_first_seen"] = None if None in seen else not any(seen)
-        out["tiebreak"] = _tiebreak(event.equal_work, event.winner_greater_raw_hash, out["winner_first_seen"])
+        child = children[event.fork_hash]
+        child_seen = bounds[child.hash][0] if child is not None else None
+        firsts = [bounds[branch.block.hash][0] for branch in event.losers]
+        late = child_seen is not None and all(first is not None and first > child_seen for first in firsts)
+        out["tiebreak"] = _tiebreak(event.equal_work, event.winner_greater_raw_hash, out["winner_first_seen"], late)
 
     groups = _source_groups(conn)
     members: dict[str, list[_Adoption]] = defaultdict(list)  # block hash -> branches it belongs to
@@ -1579,7 +1902,7 @@ def _enrich_forks(chain: Chain, conn: Any, pairs: list[tuple[ForkEvent, dict[str
                 nodes = []
             for node in nodes:
                 members[node.hash].append(adoption)
-        out["reorgs"] = reorgs[event.fork_hash] = {"count": 0, "sources": []}
+        out["reorgs"] = reorgs[event.fork_hash] = {"count": 0, "total": 0, "sources": []}
 
     hashes = list(members)
     sql = "SELECT source, new_hash, at FROM tip_changes WHERE new_hash IN ({marks})"
@@ -1596,10 +1919,11 @@ def _enrich_forks(chain: Chain, conn: Any, pairs: list[tuple[ForkEvent, dict[str
 
     probes: dict[str, Counter[str]] = defaultdict(Counter)
     sql = (
-        "SELECT hash, result, announced_by_same_peer, COUNT(*) FROM probes WHERE hash IN ({marks}) "
+        "SELECT hash, result, announced_by_same_peer, COUNT(*) FROM probes "
+        f"WHERE reason IN ({','.join('?' * len(GROUP_REASONS))}) AND hash IN ({{marks}}) "
         "GROUP BY hash, result, announced_by_same_peer"
     )
-    for block_hash, result, same_peer, count in _in_query(conn, sql, list(shown)):
+    for block_hash, result, same_peer, count in _in_query(conn, sql, list(shown), before=GROUP_REASONS):
         result = result if result in PROBE_RESULTS else "other"
         probes[block_hash][result] += count
         if result == "notfound" and same_peer:
@@ -1615,14 +1939,20 @@ def _enrich_forks(chain: Chain, conn: Any, pairs: list[tuple[ForkEvent, dict[str
         "SELECT source, at, disconnected, connected, old_hash, new_hash, fork_hash FROM tip_changes "
         "WHERE is_reorg = 1 AND fork_hash IN ({marks}) ORDER BY +at"
     )
+    reorged: dict[str, dict[str, dict[str, Any] | None]] = defaultdict(dict)  # fork hash -> source -> listed entry
     for source, at, disconnected, connected, old_hash, new_hash, fork_hash in _in_query(conn, sql, list(reorgs)):
-        entry = reorgs[fork_hash]
-        entry["count"] += 1
-        if len(entry["sources"]) < MAX_SAMPLE:
-            entry["sources"].append(
-                {"source": _text(source), "group": _sighting_group(source, groups), "at": at,
-                 "disconnected": disconnected, "connected": connected, "old_hash": old_hash, "new_hash": new_hash}
-            )
+        entry, listed = reorgs[fork_hash], reorged[fork_hash]
+        entry["total"] += 1
+        if source not in listed:
+            entry["count"] += 1
+            listed[source] = None
+            if len(entry["sources"]) < MAX_SAMPLE:
+                listed[source] = {"source": _text(source), "group": _sighting_group(source, groups), "at": at,
+                                  "disconnected": disconnected, "connected": connected, "old_hash": old_hash,
+                                  "new_hash": new_hash, "reorgs": 0}
+                entry["sources"].append(listed[source])
+        if listed[source] is not None:
+            listed[source]["reorgs"] += 1
 
 
 # -- small shared helpers ---------------------------------------------------------------------
@@ -1710,23 +2040,18 @@ def _observed(node: Any) -> bool:
     return node.first_seen_at is not None and node.first_seen_at - node.time <= OBSERVED_LAG
 
 
-def _contest(loser: str | None, winner: str | None) -> str:
-    """Return "self" for the same attributed miner, "race" for different ones, else "unknown"."""
-    if loser in (None, UNKNOWN) or winner in (None, UNKNOWN):
-        return UNKNOWN
-    return SELF if loser == winner else RACE
-
-
-def _miner(label: str | None) -> str:
-    """Return a bounded miner label, "unknown" when unattributed."""
-    return _text(label) or UNKNOWN
+def _miner(node: Any) -> str:
+    """Return the bounded miner label of a block: NO_BODY_MINER if its body never arrived, else "unknown" if unset."""
+    if node.miner is None and not node.body:
+        return NO_BODY_MINER
+    return _text(node.miner) or UNKNOWN
 
 
 def _template(node: Any) -> str:
-    """Return the template marker of a block, "none" without one, "unknown" without a body."""
+    """Return the template marker of a block, NO_MARKER without one, NO_BODY_MINER without a body."""
     if not node.body:
-        return UNKNOWN
-    return _text(node.template, 32) or "none"
+        return NO_BODY_MINER
+    return _text(node.template, 32) or NO_MARKER
 
 
 def _block(node: Any) -> dict[str, Any]:
@@ -1740,6 +2065,8 @@ def _block(node: Any) -> dict[str, Any]:
         "first_seen_at": node.first_seen_at,
         "min_diff": node.is_min_diff,
         "body": node.body,
+        "body_trusted": node.body_trusted,
+        "miner_tag": _text(node.tag) or None,
     }
 
 
@@ -1762,9 +2089,10 @@ def _phase(phase: Phase) -> dict[str, Any]:
         "d_ratio": _sig(phase.d_ratio),
         "fast": phase.fast,
         "min_diff": phase.min_diff,
+        "era": phase.era,
         "label": _phase_label(phase),
-        "k_bucket": _k_bucket(phase.k),
-        "ratio_bucket": _ratio_bucket(phase.d_ratio),
+        "k_bucket": NO_RESET_BUCKET if phase.steady else _k_bucket(phase.k),
+        "ratio_bucket": NO_RESET_BUCKET if phase.steady else _ratio_bucket(phase.d_ratio),
     }
 
 
@@ -1782,6 +2110,8 @@ def _reset(reset: Reset) -> dict[str, Any]:
         "d_pre": _sig(reset.d_pre),
         "fast_blocks": reset.fast_blocks,
         "cycle_blocks": reset.cycle_blocks,
+        "never_slowed": reset.never_slowed,
+        "era": reset.era,
     }
 
 
@@ -1791,7 +2121,9 @@ def _relation(relation: Relation) -> dict[str, Any]:
 
 
 def _phase_label(phase: Phase) -> str:
-    """Return "fast", "slow" or "unknown" for a phase."""
+    """Return "fast", "slow", "steady" or "unknown" for a phase."""
+    if phase.steady:
+        return STEADY
     return UNKNOWN if phase.fast is None else "fast" if phase.fast else "slow"
 
 

@@ -46,8 +46,17 @@ Notes:
   open event is closed on shutdown. The stored summary holds the fork, depth,
   `max_depth`, first/last seen, `closed_by` and the last `detect_split`
   result under "candidate".
-- At startup, sources rows a previous run (or a crash) left "connected" or
-  "ok" become "idle", so only recency keeps them active until they report.
+- At startup, sources rows a previous run (or a crash) left "connected",
+  "ok", "backoff" or "unreachable" become "idle", so only recency keeps them
+  active until they report ("old-rules" describes the peer's chain and stays).
+  Pruning also deletes P2P sources rows not heard from within the retention.
+- Also at startup, before the chain is loaded: stored miner labels are
+  recomputed when `consensus.MINER_LABEL_VERSION` changed (`relabel_miners`),
+  and stored blocks in the load window that break NU7 rules are flagged with
+  their descendants so the chain never loads them (`revalidate_rules`).
+- A split event that clears because its side-branch groups moved to pre-NU7
+  rules or out of view, rather than back to the best chain, closes with
+  `closed_by` "rules split" or "unobservable" instead of "resolved".
 - Backfilled blocks get no first-seen time (the fetch is not their arrival),
   so forward-dating and "seen first" stay unknown until a live sighting.
 """
@@ -57,13 +66,14 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import dataclasses
+import itertools
 import json
 import logging
 import math
 import signal
 import time
 from collections import Counter, OrderedDict
-from collections.abc import Awaitable, Callable, Iterable, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -71,7 +81,19 @@ from . import __version__, analysis, web
 from .chain import Chain, Node, TipChange
 from .cipherscan import CipherscanImporter
 from .config import Config
-from .consensus import NETWORKS, Block, BlockHeader, NetworkParams, ParseError, identify_miner, parse_block
+from .consensus import (
+    MINER_LABEL_VERSION,
+    NETWORKS,
+    Block,
+    BlockHeader,
+    Coinbase,
+    NetworkParams,
+    ParseError,
+    expected_bits,
+    identify_miner,
+    is_pre_nu7_body,
+    parse_block,
+)
 from .p2p import P2PObserver
 from .rpc import RpcClient, RpcCollector, RpcError
 from .rpc import backfill as rpc_backfill
@@ -119,6 +141,8 @@ PROBE_WALK_LIMIT = 500
 MAX_HEIGHT = (1 << 31) - 1
 # Margin below the stored tip when backfill has to bridge downtime (reorged tips).
 BRIDGE_MARGIN = 10
+# Sources statuses that describe a previous run's connections, reset at startup.
+STALE_STATUSES = frozenset({"connected", "ok", "backoff", "unreachable"})
 
 
 def load_chain(store: Store, params: NetworkParams, *, window: int, settle_depth: int, top: int | None = None) -> Chain:
@@ -136,6 +160,108 @@ def stored_top(store: Store) -> int | None:
         return int(value)
     row = store.reader().execute("SELECT MAX(height) FROM blocks WHERE body = 1").fetchone()
     return row[0] if row is not None and isinstance(row[0], int) else None
+
+
+def revalidate_rules(store: Store, params: NetworkParams, min_height: int | None = None) -> int:
+    """Flag stored blocks from max(NU7 activation, `min_height`) up that break NU7 rules; return how many were new.
+
+    A block breaks them when its nBits is not what `expected_bits` predicts from its stored
+    ancestors (checked only when all are stored), when its body pays a funding stream the
+    pre-NU7 amount (`is_pre_nu7_body`), or when it descends from such a block. That catches
+    pre-NU7 nodes' blocks stored before the monitor knew NU7's rules or past an ingest check
+    that lacked their ancestry. Flags are never cleared, so a rerun only adds new ones.
+    """
+    nu7 = params.nu7_height
+    if nu7 is None:
+        return 0
+    low = nu7 if min_height is None else max(nu7, min_height)
+    depth = params.max_context_len
+    store.commit_if_due(force=True)  # the reader sees committed rows only
+    conn = store.reader()
+    columns = "hash, prev_hash, height, time, bits, payout, rules_invalid"
+    rows = itertools.chain(
+        conn.execute(f"SELECT {columns} FROM blocks WHERE height >= ? ORDER BY height", (low - depth,)),
+        conn.execute(f"SELECT {columns} FROM blocks WHERE height IS NULL"),
+    )
+    invalid: set[str] = set()
+    found: list[str] = []
+    # (bits, time) of each block at the last two heights and its ancestors, newest first: `expected_bits` input.
+    level: dict[str, list[tuple[int, int]]] = {}
+    below: dict[str, list[tuple[int, int]]] = {}
+    level_height: int | None = None
+    for row in rows:
+        block_hash, height = row["hash"], row["height"]
+        if height is not None and height != level_height:
+            below = level if level_height is not None and height == level_height + 1 else {}
+            level, level_height = {}, height
+        context = below.get(row["prev_hash"]) if height is not None else None
+        if row["rules_invalid"] or row["prev_hash"] in invalid or (
+            height is not None and height >= low and _breaks_nu7_rules(params, row, context)
+        ):
+            invalid.add(block_hash)
+            if not row["rules_invalid"]:
+                found.append(block_hash)
+        elif height is not None:
+            level[block_hash] = [(row["bits"], row["time"]), *(context or ())[: depth - 1]]
+    return store.mark_rules_invalid(found) if found else 0
+
+
+def _breaks_nu7_rules(params: NetworkParams, row: Mapping[str, Any], context: list[tuple[int, int]] | None) -> bool:
+    """Return True if a stored block at an NU7 height has unexpected nBits or pays the pre-NU7 funding stream."""
+    height = row["height"]
+    if context is not None and len(context) >= params.difficulty_rules(height).context_len:
+        try:
+            if row["bits"] != expected_bits(params, height, row["time"], context):
+                return True
+        except ParseError:  # malformed stored nBits: undecidable here
+            pass
+    payouts = _stored_payouts(row["payout"])
+    return payouts is not None and is_pre_nu7_body(params, height, payouts)
+
+
+def relabel_miners(store: Store, params: NetworkParams) -> int:
+    """Recompute stored miner labels if MINER_LABEL_VERSION is newer than the store's; return rows changed.
+
+    Labels are rebuilt from the stored coinbase fields (the chain reads `blocks.miner` verbatim),
+    so a change to `identify_miner` reaches blocks stored before it. Rows without a parsed
+    coinbase keep their label.
+    """
+    stored = store.get_meta("miner_label_version")
+    if stored is not None and stored.isdigit() and int(stored) >= MINER_LABEL_VERSION:
+        return 0
+    store.commit_if_due(force=True)  # the reader sees committed rows only
+    labels: dict[str, str] = {}
+    for row in store.reader().execute(
+        "SELECT hash, miner, miner_tag, template, payout, extranonce, coinbase_hex FROM blocks "
+        "WHERE body = 1 AND payout IS NOT NULL"
+    ):
+        payouts = _stored_payouts(row["payout"])
+        if payouts is None:
+            continue
+        try:
+            script_sig = bytes.fromhex(row["coinbase_hex"] or "")
+        except ValueError:
+            script_sig = b""
+        coinbase = Coinbase(
+            height=None, script_sig=script_sig, template=row["template"], tag=row["miner_tag"] or "",
+            extranonce=row["extranonce"] or "", payouts=payouts, tx_version=0,
+        )
+        label = identify_miner(coinbase, params)
+        if label != row["miner"]:
+            labels[row["hash"]] = label
+    changed = store.set_miners(labels) if labels else 0
+    store.set_meta("miner_label_version", MINER_LABEL_VERSION)
+    return changed
+
+
+def _stored_payouts(text: str | None) -> tuple[tuple[str, int], ...] | None:
+    """Decode `blocks.payout` JSON into coinbase payouts; None when absent or malformed."""
+    if text is None:
+        return None
+    try:
+        return tuple((str(address), int(value)) for address, value in json.loads(text))
+    except (TypeError, ValueError):
+        return None
 
 
 def _valid_height(value: Any) -> int | None:
@@ -176,6 +302,28 @@ class _Split:
                 "groups": self.candidate.get("groups", {})}
 
 
+def _clear_reason(state: _Split, groups: Sequence[Mapping[str, Any]] | None) -> str:
+    """Return the `closed_by` of a split that cleared, judged by its side-branch groups in `groups` now.
+
+    "rules split" if any has members on pre-NU7 rules, "resolved" if all are back on the best
+    chain (or `groups` is unknown), else "unobservable" (inactive, stuck or gone).
+    """
+    if groups is None:
+        return "resolved"
+    current = {group.get("key"): group for group in groups}
+    losing = [
+        current.get(key) or {}
+        for side in state.candidate.get("sides") or ()
+        if side.get("branch") != analysis.CANONICAL
+        for key in side.get("groups") or ()
+    ]
+    if any(group.get("old_rules") for group in losing):
+        return "rules split"
+    if all((group.get("branch") or {}).get("key") == analysis.CANONICAL for group in losing):
+        return "resolved"
+    return "unobservable"
+
+
 class Monitor:
     """Wires the chain, the store and the collectors together; the single writer (see the module doc)."""
 
@@ -184,9 +332,16 @@ class Monitor:
         self.config = config
         self.store = store
         self.params = params or NETWORKS[config.network]
-        self.chain = load_chain(
-            store, self.params, window=config.chain.memory_window, settle_depth=config.chain.settle_depth
-        )
+        window = config.chain.memory_window
+        relabelled = relabel_miners(store, self.params)
+        if relabelled:
+            log.info("relabelled the miners of %d stored blocks", relabelled)
+        top = stored_top(store)
+        flagged = revalidate_rules(store, self.params, min_height=top - window if top is not None else None)
+        if flagged:
+            log.warning("flagged %d stored blocks that break NU7 rules; they are no longer loaded", flagged)
+        store.commit_if_due(force=True)  # `Chain.from_store` also reads through `store.reader()`
+        self.chain = load_chain(store, self.params, window=window, settle_depth=config.chain.settle_depth, top=top)
         self.snapshot: dict[str, Any] | None = None
         self.loop: asyncio.AbstractEventLoop | None = None
         self.p2p: P2PObserver | None = None
@@ -340,7 +495,7 @@ class Monitor:
         """Build, annotate and publish the live snapshot (loop thread); also track splits and the best tip."""
         now = time.time() if now is None else now
         snap = analysis.live_snapshot(self, now)
-        self.track_split(snap.get("split_candidate"), now)
+        self.track_split(snap.get("split_candidate"), now, snap.get("groups"))
         snap["split_event"] = self._split.view() if self._split is not None else None
         collectors = snap.setdefault("collectors", {})
         collectors["cipherscan"] = self.cipherscan.health() if self.cipherscan is not None else None
@@ -354,8 +509,13 @@ class Monitor:
         self.snapshot = snap
         return snap
 
-    def track_split(self, candidate: dict[str, Any] | None, now: float) -> _Split | None:
-        """Advance the split state machine with this refresh's `detect_split` result; return the tracked split."""
+    def track_split(
+        self, candidate: dict[str, Any] | None, now: float, groups: Sequence[Mapping[str, Any]] | None = None
+    ) -> _Split | None:
+        """Advance the split state machine with this refresh's `detect_split` result; return the tracked split.
+
+        `groups` (the snapshot's) tells how a cleared split ended; see `_clear_reason`.
+        """
         fork = self.split_fork(candidate) if candidate is not None else None
         state = self._split
         if fork is not None:
@@ -380,7 +540,7 @@ class Monitor:
             else:
                 state.cleared_at = state.cleared_at or now
                 if now - state.cleared_at >= SPLIT_CLEAR_AFTER:
-                    self._end_split(state, state.cleared_at, "resolved")
+                    self._end_split(state, state.cleared_at, _clear_reason(state, groups))
                     self._split = None
         return self._split
 
@@ -435,8 +595,8 @@ class Monitor:
         return closed
 
     def reset_stale_statuses(self) -> int:
-        """Mark sources a previous run left "connected" or "ok" as "idle" until a collector reports again."""
-        stale = [row["source"] for row in self.store.get_sources() if row.get("status") in ("connected", "ok")]
+        """Mark sources a previous run left connected, ok or waiting to redial as "idle" until a collector reports."""
+        stale = [row["source"] for row in self.store.get_sources() if row.get("status") in STALE_STATUSES]
         for source in stale:
             self.store.upsert_source(source, status="idle")
         return len(stale)
@@ -473,13 +633,15 @@ class Monitor:
                     continue
                 (canonical if node.hash == canon else side).append(node)
         # Missing parents of detached blocks (e.g. a multi-block fork tip from getchaintips) are
-        # walked back one block per sweep; Zakura peers serve any retained chain.
-        wanted_side = [(node.hash, node.height) for node in side]
-        wanted_side += [
+        # walked back one block per sweep; Zakura peers serve any retained chain. They go first,
+        # and blocks that cannot be requested now leave their slots to others.
+        wanted_side = [
             (missing, height)
             for missing, height in self.chain.missing_parents()
             if best.height - height <= BODY_SWEEP_DEPTH
         ]
+        wanted_side += [(node.hash, node.height) for node in side]
+        wanted_side = [(block_hash, height) for block_hash, height in wanted_side if self._can_attempt(block_hash, now)]
         for block_hash, height in wanted_side[:MAX_SIDE_REQUESTS]:
             self._request_body(block_hash, height, now)
         wanted: list[Node] = []
@@ -547,11 +709,16 @@ class Monitor:
             else:
                 self._body_memo[block_hash] = previous
 
-    def _take_attempt(self, block_hash: str, now: float) -> bool:
-        """Rate-limit body fetches per block (BODY_ATTEMPTS, BODY_RETRY apart)."""
+    def _can_attempt(self, block_hash: str, now: float) -> bool:
+        """Return True if a body fetch of `block_hash` is allowed now (BODY_ATTEMPTS, BODY_RETRY apart)."""
         attempts, last = self._body_memo.get(block_hash, (0, -math.inf))
-        if attempts >= BODY_ATTEMPTS or now - last < BODY_RETRY:
+        return attempts < BODY_ATTEMPTS and now - last >= BODY_RETRY
+
+    def _take_attempt(self, block_hash: str, now: float) -> bool:
+        """Spend one body-fetch attempt on `block_hash` if `_can_attempt` allows it; True if spent."""
+        if not self._can_attempt(block_hash, now):
             return False
+        attempts, _ = self._body_memo.get(block_hash, (0, -math.inf))
         self._body_memo[block_hash] = (attempts + 1, now)
         self._body_memo.move_to_end(block_hash)
         while len(self._body_memo) > MAX_BODY_MEMO:

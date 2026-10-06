@@ -83,6 +83,10 @@ FAST = p2p.Timings(handshake_timeout=2.0, poll_timeout=3.0, fetch_timeout=2.0)
 # Real Testnet headers around NU7 activation; see tests/test_consensus.py for the layout.
 NU7_HEADERS = Path(__file__).resolve().parent / "fixtures" / "testnet-nu7-headers-4464896-4465122.json"
 REAL_EQUIHASH = consensus.check_equihash  # captured before `setUpModule` stubs it
+# P2SH script of Testnet's funding stream t2HifwjUj9uyxr9bknR8LFuQbc98c3vkXtu.
+P2SH_FS = bytes.fromhex("a9147a86d6c7eb12ce0aa309d7391a6f338eba3c242b87")
+# nBits twice as hard as the PoW limit: never what Testnet's minimum-difficulty rule expects here.
+HARD = target_to_bits(bits_to_target(BITS) // 2)
 
 
 def stub_equihash(header: BlockHeader) -> bool:
@@ -142,18 +146,35 @@ def main_chain() -> tuple[BlockHeader, ...]:
     return tuple(build_chain(ROOT, 400, "main"))
 
 
-def make_block(header: BlockHeader, height: int, tag: bytes = b"zkcodexcoder") -> bytes:
-    """Serialize a block: the header plus a v4 coinbase with a BIP34 height, the Zakura marker and a tag."""
+def make_block(
+    header: BlockHeader,
+    height: int,
+    tag: bytes = b"zkcodexcoder",
+    *,
+    fs_value: int | None = None,
+    branch_id: int | None = None,
+) -> bytes:
+    """Serialize a block: the header plus a coinbase with a BIP34 height, the Zakura marker and a tag.
+
+    The coinbase is v4 unless `branch_id` makes it v5; `fs_value` adds a funding-stream output.
+    """
     script = b"\x03" + height.to_bytes(3, "little") + b"\x04" + ZAKURA_MARKER + bytes([len(tag)]) + tag
+    if branch_id is None:
+        head = struct.pack("<II", 0x80000004, 0x892F2085)
+    else:
+        head = struct.pack("<IIIII", 0x80000005, 0x26A7270A, branch_id, 0, height)
+    outputs = b"\x00"
+    if fs_value is not None:
+        outputs = b"\x01" + struct.pack("<q", fs_value) + bytes([len(P2SH_FS)]) + P2SH_FS
     coinbase = (
-        struct.pack("<II", 0x80000004, 0x892F2085)
+        head
         + b"\x01"
         + bytes(32)
         + b"\xff\xff\xff\xff"
         + bytes([len(script)])
         + script
         + b"\xff\xff\xff\xff"
-        + b"\x00"  # no transparent outputs
+        + outputs
         + bytes(8)
     )
     return header.raw + b"\x01" + coinbase
@@ -377,6 +398,21 @@ class BookTests(unittest.TestCase):
         self.assertEqual(delays[-3:], [3600.0, 3600.0, 3600.0])
         self.assertEqual(book.finish(cand, 0.0, ok=True, error=None), 120.0)
         self.assertEqual((cand.failures, cand.state), (0, p2p.BACKOFF))
+
+    def test_old_rules_is_no_failure(self) -> None:
+        """A consensus rejection clears the failures, marks the peer old-rules and rechecks it every 30 min."""
+        book = p2p.CandidateBook(p2p.Timings())
+        cand = book.add("8.8.8.8", 18233, "dns:seed")
+        for _ in range(4):
+            book.finish(cand, 0.0, ok=False, error="timeout")
+        delay = book.finish(cand, 1000.0, ok=False, error="wrong difficulty", rules_fork_height=4_465_025)
+        self.assertEqual(delay, 1800.0)
+        self.assertEqual((cand.state, cand.failures, cand.rules_fork_height), (p2p.OLD_RULES, 0, 4_465_025))
+        self.assertIsNone(book.due(2799.0))
+        self.assertIs(book.due(2800.0), cand)
+        self.assertEqual(book.evict(), 0)
+        book.finish(cand, 3000.0, ok=False, error="timeout")  # the verdict stands until headers pass
+        self.assertEqual((cand.state, cand.failures, cand.rules_fork_height), (p2p.BACKOFF, 1, 4_465_025))
 
     def test_add_filters_and_normalizes(self) -> None:
         """Gossip must be public unicast with a real port; static entries may be private."""
@@ -724,13 +760,21 @@ class HandshakeAndPollTests(ObserverTestCase):
         self.assertEqual(self.chain.best_tip().hash, self.main[379].hash)
 
     async def test_continuations_are_bounded(self) -> None:
-        """At most MAX_CONTINUATIONS extra rounds per poll; the tip is the last header seen."""
+        """At most MAX_CONTINUATIONS extra rounds per poll; a walk cut off there names no tip, and the next resumes."""
         with mock.patch.object(p2p, "MAX_CONTINUATIONS", 1):
-            await self.add_fake("10.0.0.1", self.main[:380])
-            self.start(self.observer("10.0.0.1:18233"))
+            fake = await self.add_fake("10.0.0.1", self.main[:380])
+            observer = self.start(self.observer("10.0.0.1:18233"))
+            cand = await self.candidate(observer, "10.0.0.1")
+            await self.until(lambda: cand.tip_note == "header walk truncated", "the truncated walk")
+            self.assertEqual([len(batch) for batch in self.monitor.batches()], [160, 160])
+            self.assertEqual((self.monitor.tips, cand.tip_hash), ({}, None))
+            observer._peers["10.0.0.1"].enqueue_poll()
             await self.until(lambda: self.monitor.tips, "the tip")
-        self.assertEqual([len(batch) for batch in self.monitor.batches()], [160, 160])
-        self.assertEqual(self.monitor.tips["p2p:10.0.0.1:18233"], (self.main[348].hash, BASE + 348))
+        self.assertEqual(fake.getheaders[-1][1][0], self.main[348].hash)
+        self.assertEqual([len(batch) for batch in self.monitor.batches()], [160, 160, 31])
+        self.assertEqual(self.monitor.tips["p2p:10.0.0.1:18233"], (self.main[379].hash, BASE + 379))
+        self.assertEqual([event[2] for event in self.monitor.events if event[0] == "tip"], [self.main[379].hash])
+        self.assertIsNone(cand.tip_note)
 
     async def test_peer_without_a_common_block_is_polled_rarely(self) -> None:
         """A peer whose chain shares only genesis with our window gets a note, no ingest and no repeat poll."""
@@ -759,6 +803,71 @@ class HandshakeAndPollTests(ObserverTestCase):
         await self.until(lambda: fake.eofs, "the peer to see the close")
 
 
+class OldRulesTests(ObserverTestCase):
+    """Peers whose chain breaks our consensus rules (e.g. pre-NU7 nodes past NU7) are old-rules, not unreachable."""
+
+    async def test_wrong_difficulty_marks_the_peer_old_rules(self) -> None:
+        """Headers with the wrong nBits end the session as old-rules: no failure, a 30 min recheck, the fork height."""
+        fork = self.main[OURS - 1]
+        bad = mine_header(fork.hash, fork.time + SPACING, b"old rules", bits=HARD)
+        fake = await self.add_fake("10.0.0.1", [*self.main[:OURS], bad])
+        observer = self.start(self.observer("10.0.0.1:18233"))
+        cand = await self.candidate(observer, "10.0.0.1")
+        await self.until(lambda: cand.state == p2p.OLD_RULES, "the old-rules verdict")
+        self.assertEqual((cand.failures, cand.rules_fork_height), (0, BASE + OURS - 1))
+        self.assertGreater(cand.next_attempt - time.monotonic(), FAST.old_rules_retry - 60)
+        self.assertEqual(cand.last_error, f"header {bad.hash} has the wrong difficulty")
+        (row,) = self.rows("SELECT status, rules_fork_height, last_error FROM sources")
+        self.assertEqual(
+            row, {"status": "old-rules", "rules_fork_height": BASE + OURS - 1, "last_error": cand.last_error}
+        )
+        self.assertEqual(self.monitor.batches(), [])
+        self.assertEqual(observer.snapshot()["peers"][0]["rules_fork_height"], BASE + OURS - 1)
+        await self.until(lambda: fake.eofs, "the peer to see the close")
+
+    async def test_a_far_ahead_old_rules_peer_gets_no_tip(self) -> None:
+        """A walk cut off on blocks the peer has passed names no tip; its continuation finds the rule break."""
+        fork = self.main[348]  # the last header of the first, truncated walk
+        bad = mine_header(fork.hash, fork.time + SPACING, b"old rules", bits=HARD)
+        with mock.patch.object(p2p, "MAX_CONTINUATIONS", 1):
+            await self.add_fake("10.0.0.1", [*self.main[:349], bad])
+            observer = self.start(self.observer("10.0.0.1:18233"))
+            cand = await self.candidate(observer, "10.0.0.1")
+            await self.until(lambda: cand.tip_note == "header walk truncated", "the truncated walk")
+            observer._peers["10.0.0.1"].enqueue_poll()
+            await self.until(lambda: cand.state == p2p.OLD_RULES, "the old-rules verdict")
+        self.assertEqual((self.monitor.tips, cand.tip_hash, cand.rules_fork_height), ({}, None, BASE + 348))
+
+    async def test_the_verdict_stands_until_headers_pass(self) -> None:
+        """A reconnected old-rules peer keeps that status until a poll's headers pass, which clears it."""
+        fake = await self.add_fake(
+            "10.0.0.1", self.main[:OURS], user_agent=ZAKURA, version=170190, drop_getheaders=True
+        )
+        observer = self.observer("10.0.0.1:18233")
+        await observer._seed()
+        cand = observer.book.get("10.0.0.1")
+        cand.rules_fork_height = BASE + 20
+        self.start(observer)
+        await self.until(lambda: observer.stats["polls_unanswered"], "an unanswered poll")
+        (row,) = self.rows("SELECT status FROM sources")
+        self.assertEqual((cand.state, row["status"]), (p2p.CONNECTED, "old-rules"))
+        fake.drop_getheaders = False
+        observer._peers["10.0.0.1"].enqueue_poll()
+        await self.until(lambda: self.monitor.tips, "the tip")
+        (row,) = self.rows("SELECT status, rules_fork_height FROM sources")
+        self.assertEqual((row["status"], row["rules_fork_height"], cand.rules_fork_height), ("connected", None, None))
+
+
+    async def test_passing_headers_clear_a_stored_verdict(self) -> None:
+        """A verdict stored by an earlier process, which the new book does not hold, ends when headers pass."""
+        await self.add_fake("10.0.0.1", self.main[:OURS])
+        self.store.upsert_source("p2p:10.0.0.1:18233", status="old-rules", rules_fork_height=BASE + 20)
+        self.start(self.observer("10.0.0.1:18233"))
+        await self.until(lambda: self.monitor.tips, "the tip")
+        (row,) = self.rows("SELECT status, rules_fork_height FROM sources")
+        self.assertEqual((row["status"], row["rules_fork_height"]), ("connected", None))
+
+
 class AnnouncementTests(ObserverTestCase):
     """inv handling, announce probes, fallback fetches and sampled reprobes."""
 
@@ -783,10 +892,14 @@ class AnnouncementTests(ObserverTestCase):
         self.assertEqual((sighting["source"], sighting["kind"]), (source, "inv"))
         (probe,) = self.rows("SELECT * FROM probes")
         self.assertEqual(
-            {key: probe[key] for key in ("source", "impl", "hash", "reason", "result", "announced_by_same_peer")},
+            {
+                key: probe[key]
+                for key in ("source", "impl", "impl_version", "hash", "reason", "result", "announced_by_same_peer")
+            },
             {
                 "source": source,
                 "impl": "zebra",
+                "impl_version": "6.4.2",
                 "hash": new.hash,
                 "reason": "announce",
                 "result": "block",
@@ -1123,6 +1236,35 @@ class ValidationTests(DirectTestCase):
             with self.assertRaisesRegex(p2p.PeerError, "wrong difficulty"):
                 check([header])
 
+    def test_a_rules_error_names_the_last_shared_block(self) -> None:
+        """The fork height is the last block of the walk our chain holds, not the rejected header's parent."""
+        tip = self.main[OURS - 1]
+        new = mine_header(tip.hash, tip.time + SPACING, b"min-diff")  # valid under any difficulty rules
+        bad = mine_header(new.hash, new.time + SPACING, b"old rules", bits=HARD)
+        anchor = self.main[OURS - 3]
+        with self.assertRaisesRegex(p2p.RulesError, f"header {bad.hash} has the wrong difficulty") as caught:
+            self.observer._check_headers(anchor.hash, BASE + OURS - 3, [self.main[OURS - 2], tip, new, bad])
+        self.assertEqual(caught.exception.fork_height, BASE + OURS - 1)
+
+    def test_pre_nu7_bodies_break_the_rules(self) -> None:
+        """Past NU7, a coinbase paying the pre-NU7 funding stream or carrying NU6.3's branch id is a RulesError."""
+        nu7 = TESTNET.nu7_height
+        chain = Chain(TESTNET)
+        header = mine_header(ROOT, T0, b"nu7")
+        chain.add(header, nu7, first_seen_at=1.0)
+        observer = p2p.P2PObserver(TESTNET, FakeMonitor(self.store, chain))
+
+        def check(**coinbase) -> None:
+            """Check a body for `header` at the NU7 height."""
+            observer._check_block(consensus.parse_block(make_block(header, nu7, **coinbase), TESTNET))
+
+        check(fs_value=4_166_666)
+        check(fs_value=4_166_666, branch_id=0x77190AD9)
+        for coinbase in ({"fs_value": 12_500_000}, {"branch_id": 0x37A5165B}):
+            with self.subTest(**coinbase), self.assertRaisesRegex(p2p.RulesError, "pre-NU7 coinbase") as caught:
+                check(**coinbase)
+            self.assertEqual(caught.exception.fork_height, nu7 - 1)
+
     def test_real_nu7_activation_headers(self) -> None:
         """Testnet's real headers A - 1 .. A + 2 pass with real Equihash; the pre-NU7 rules reject block A."""
         data = json.loads(NU7_HEADERS.read_text())
@@ -1178,6 +1320,39 @@ class ValidationTests(DirectTestCase):
         self.assertIsNone(self.chain.get(new.hash))
         self.observer._on_block(asked, make_block(new, BASE + OURS))
         self.assertTrue(self.chain.get(new.hash).body)
+
+
+class ProbeRecordTests(DirectTestCase):
+    """Probe rows for getdata attempts that do not end in a reply."""
+
+    async def test_a_getdata_cut_short_is_an_error_probe(self) -> None:
+        """A getdata whose session ends is an "error" probe with the peer's version at the time, then re-raised."""
+        peer = self.peer("10.0.0.1")
+        peer.cand.impl, peer.cand.impl_version = "zebra", "6.4.2"
+        new = self.main[OURS]
+        self.assertTrue(self.observer.request_block(new.hash))  # no Zakura peer yet: it waits
+
+        async def closed(*args, **kwargs):
+            """Fail like `_Peer.exchange` after the connection drops mid-request."""
+            raise p2p.PeerError("connection closed")
+
+        peer.exchange = closed
+        with self.assertRaisesRegex(p2p.PeerError, "connection closed"):
+            await self.observer._getdata(peer, p2p._Request(p2p._GETDATA, hash=new.hash, reason=p2p.FETCH))
+        rows = self.store.reader().execute("SELECT source, impl, impl_version, hash, reason, result FROM probes")
+        self.assertEqual(
+            [dict(row) for row in rows],
+            [
+                {
+                    "source": peer.source,
+                    "impl": "zebra",
+                    "impl_version": "6.4.2",
+                    "hash": new.hash,
+                    "reason": "fetch",
+                    "result": "error",
+                }
+            ],
+        )
 
 
 class BudgetTests(DirectTestCase):
@@ -1251,6 +1426,19 @@ class SweepTests(ObserverTestCase):
             self.assertEqual((cand.state, cand.failures), (p2p.BACKOFF, 0))
         self.assertEqual({row["status"] for row in self.rows("SELECT status FROM sources")}, {"backoff"})
         self.assertEqual(await observer.sweep(limit=10), [])  # everyone is backing off
+
+    async def test_sweep_reports_old_rules_peers(self) -> None:
+        """A swept peer whose headers break our rules is reported and stored as old-rules with its fork height."""
+        fork = self.main[OURS - 1]
+        bad = mine_header(fork.hash, fork.time + SPACING, b"old rules", bits=HARD)
+        await self.add_fake("10.0.0.1", [*self.main[:OURS], bad])
+        (result,) = await self.observer("10.0.0.1:18233").sweep(limit=10)
+        self.assertEqual(
+            (result["status"], result["failures"], result["rules_fork_height"]), (p2p.OLD_RULES, 0, BASE + OURS - 1)
+        )
+        self.assertIn("wrong difficulty", result["error"])
+        (row,) = self.rows("SELECT status, rules_fork_height FROM sources")
+        self.assertEqual(row, {"status": "old-rules", "rules_fork_height": BASE + OURS - 1})
 
 
 if __name__ == "__main__":

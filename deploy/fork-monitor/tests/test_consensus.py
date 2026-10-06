@@ -20,6 +20,13 @@ NU7_ACTIVATION_HASH = "000089ba27100beede16d64b34e3d1b626b428cb7ee9fe6dcfdc217ce
 FS = "t2HifwjUj9uyxr9bknR8LFuQbc98c3vkXtu"
 FOUNDRY_ADDR = "tmJggjzf2qPBbmUFfr7eYdqFUV15y1MvvVu"
 FOUNDRY_TAG = "Foundry Zcash Pool #PrivacyMatters"
+FOUNDRY_LABEL = "Foundry · tmJggj…vvVu"
+# nConsensusBranchId of NU6.3, the epoch before NU7, carried by every pre-NU7 fixture coinbase.
+PRE_NU7_BRANCH_ID = 0x37A5165B
+# Tags of live Testnet blocks 4464627 (behind OP_PUSHDATA1) and 4469665.
+CAPITALISM_TAG = "We live in capitalism. Its power seems inescapable. So did the divine right of kings"
+CKPOOL_TAG = "ckpool-lhr-zec [>>H3L10SP00L<<]"
+CKPOOL_ADDR = "tmKZxm9n1p1YZgtcGWV6N42hzF9JWNa2yy4"
 
 # Captured once from `getblock <hash> 2` on zakura-testnet-1 (167.99.103.111:18232).
 RPC_BLOCKS = {
@@ -37,7 +44,7 @@ RPC_BLOCKS = {
         "tag": FOUNDRY_TAG,
         "extranonce": "cd4124e400",
         "payouts": ((FOUNDRY_ADDR, 125020000), (FS, 12500000)),
-        "miner": "Foundry",
+        "miner": FOUNDRY_LABEL,
     },
     4410737: {
         "hash": "00003e268eb0b585a2d6ade5ef2d1e098c3e35b247dcca07e18cf73033406804",
@@ -53,7 +60,7 @@ RPC_BLOCKS = {
         "tag": FOUNDRY_TAG,
         "extranonce": "fb4752e500",
         "payouts": ((FOUNDRY_ADDR, 125035000), (FS, 12500000)),
-        "miner": "Foundry",
+        "miner": FOUNDRY_LABEL,
     },
     4410738: {
         "hash": "005e7e8ddca530f2601f2207930aefb412c796c304ad991f86fa0a5c055be611",
@@ -121,13 +128,14 @@ def coinbase_tx(
     overwintered: bool = True,
     n_inputs: int = 1,
     prevout: bytes = bytes(32) + b"\xff\xff\xff\xff",
+    branch_id: int = PRE_NU7_BRANCH_ID,
 ) -> bytes:
     """Serialize a minimal coinbase transaction prefix for parser tests."""
     head = struct.pack("<I", (0x8000_0000 if overwintered else 0) | version)
     if overwintered and version in (3, 4):
         head += struct.pack("<I", 0x892F2085)
     elif overwintered and version in (5, 6):
-        head += struct.pack("<IIII", 0xD884B698, 0x37A5165B, 0, 0)
+        head += struct.pack("<IIII", 0xD884B698, branch_id, 0, 0)
     body = c.write_compact_size(n_inputs) + prevout
     body += c.write_compact_size(len(script_sig)) + script_sig + b"\xff\xff\xff\xff"
     body += c.write_compact_size(len(outputs))
@@ -246,6 +254,7 @@ class BlockTests(unittest.TestCase):
                 self.assertIsNotNone(cb)
                 self.assertEqual(cb.height, height)
                 self.assertEqual(cb.tx_version, 6)
+                self.assertEqual(cb.branch_id, PRE_NU7_BRANCH_ID)
                 self.assertEqual(cb.script_sig.hex(), want["coinbase_hex"])
                 self.assertEqual(cb.template, want["template"])
                 self.assertEqual(cb.tag, want["tag"])
@@ -262,6 +271,7 @@ class BlockTests(unittest.TestCase):
                 self.assertEqual(cb.tx_version, version)
                 self.assertEqual(cb.height, 0x030201)
                 self.assertEqual(cb.payouts, ((FOUNDRY_ADDR, 5), (FS, 7)))
+                self.assertEqual(cb.branch_id, PRE_NU7_BRANCH_ID if version == 5 else None)
 
     def test_unknown_transaction_version_has_no_coinbase(self):
         tx = coinbase_tx(b"\x03\x01\x02\x03", [(P2SH_FS, 1)], version=7)
@@ -349,6 +359,17 @@ class CoinbaseScriptTests(unittest.TestCase):
         "empty": ("", (None, None, "", "")),
         "small height opcode": ("5a", (10, None, "", "")),
         "negative height push": ("0180", (None, None, "", "80")),
+        "op_pushdata1": (
+            "03f31f444c5af09fa6933a205765206c69766520696e206361706974616c69736d2e2049747320706f776572207365656d7320"
+            "696e657363617061626c652e20536f206469642074686520646976696e65207269676874206f66206b696e6773",
+            (4464627, "zebra", CAPITALISM_TAG, ""),
+        ),
+        "text starting with L, short length byte": ("030000004c3120726967", (0, None, "L1 rig", "")),
+        "text starting with L, overrunning push": ("030000004c75636b79206d696e6572", (0, None, "Lucky miner", "")),
+        "ckpool": (
+            "03a133440e636b706f6f6c2d6c68722d7a6563105b3e3e48334c3130535030304c3c3c5d045574c46a044ad12d1a",
+            (4469665, None, CKPOOL_TAG, "5574c46a4ad12d1a"),
+        ),
     }
 
     def test_real_shapes(self):
@@ -376,9 +397,19 @@ def coinbase(tag: str = "", payouts=(), extranonce: str = "") -> c.Coinbase:
 
 class IdentifyMinerTests(unittest.TestCase):
     def test_tag_families_are_case_insensitive(self):
-        self.assertEqual(c.identify_miner(coinbase("FOUNDRY USA", [(FOUNDRY_ADDR, 1)]), c.TESTNET), "Foundry")
+        self.assertEqual(c.identify_miner(coinbase("FOUNDRY USA", [(FOUNDRY_ADDR, 1)]), c.TESTNET), FOUNDRY_LABEL)
         self.assertEqual(c.identify_miner(coinbase("MarianaTrench"), c.TESTNET), "MarianaTrench")
         self.assertEqual(c.identify_miner(coinbase("Wolf: W.cash AuxPow"), c.TESTNET), "W.cash")
+
+    def test_tag_families_keep_the_transparent_payee(self):
+        """A pool tag paid to an address names both, so solo hashers stay apart; ckpool and KuPool are families."""
+        ckpool = [(CKPOOL_ADDR, 41250002), ("tmVe7xdkxSDS7ZqxJYLpjzqLmrh1L8dPpez", 416666), (FS, 4166666)]
+        self.assertEqual(c.identify_miner(coinbase(CKPOOL_TAG, ckpool), c.TESTNET), "ckpool-lhr-zec · tmKZxm…2yy4")
+        kupool = [("tm9iMLAuYMzJ6jtFLcA7rzUmfreGuKvr7Ma", 125050000), (FS, 12500000)]
+        self.assertEqual(c.identify_miner(coinbase("mined by KuPool", kupool), c.TESTNET), "KuPool · tm9iML…r7Ma")
+        self.assertEqual(c.identify_miner(coinbase("ckpool-eu", [(FS, 1)]), c.TESTNET), "ckpool-eu")
+        self.assertEqual(c.identify_miner(coinbase("zkcodexcoder", [("script:6a00", 5)]), c.TESTNET), "zkcodexcoder")
+        self.assertGreaterEqual(c.MINER_LABEL_VERSION, 2)
 
     def test_first_paid_non_funding_stream_address(self):
         payouts = [(FS, 12500000), ("script:6a00", 0), ("tmOther", 5), (FOUNDRY_ADDR, 9)]
@@ -392,12 +423,44 @@ class IdentifyMinerTests(unittest.TestCase):
         fs_only = [(FS, 12500000)]
         self.assertEqual(c.identify_miner(coinbase("new pool", fs_only), c.TESTNET), "shielded:new pool")
         long_tag = "x" * 100
-        self.assertEqual(c.identify_miner(coinbase(long_tag, fs_only), c.TESTNET), "shielded:" + "x" * 48)
+        self.assertEqual(c.identify_miner(coinbase(long_tag, fs_only), c.TESTNET), "shielded:" + "x" * 47 + "…")
+        self.assertEqual(
+            c.identify_miner(coinbase(CAPITALISM_TAG, fs_only), c.TESTNET),
+            "shielded:We live in capitalism. Its power seems…",
+        )
         self.assertEqual(
             c.identify_miner(coinbase("", fs_only, extranonce="deadbeefcafe"), c.TESTNET), "shielded:deadbeef"
         )
         self.assertEqual(c.identify_miner(coinbase("", fs_only), c.TESTNET), "shielded:notag")
         self.assertEqual(c.identify_miner(None, c.TESTNET), "unknown")
+
+
+class PreNu7BodyTests(unittest.TestCase):
+    """Live Testnet coinbases on both sides of the NU7 activation split at 4465026."""
+
+    NU7 = c.TESTNET.nu7_height
+
+    def test_pre_nu7_funding_stream_amount(self):
+        """The old-rules roots pay the funding stream 12,500,000; NU7 blocks pay 4,166,666."""
+        old, new = [[FS, 12_500_000]], [[FS, 4_166_666]]  # `blocks.payout` JSON shapes
+        self.assertTrue(c.is_pre_nu7_body(c.TESTNET, self.NU7, old))
+        self.assertTrue(c.is_pre_nu7_body(c.TESTNET, self.NU7 + 56, [("tmOther", 12_500_000), (FS, 12_500_000)]))
+        self.assertFalse(c.is_pre_nu7_body(c.TESTNET, self.NU7, new))
+        self.assertFalse(c.is_pre_nu7_body(c.TESTNET, self.NU7, [("tmOther", 12_500_000), (FS, 4_166_666)]))
+        self.assertFalse(c.is_pre_nu7_body(c.TESTNET, self.NU7 - 1, old))
+        self.assertFalse(c.is_pre_nu7_body(c.TESTNET, None, old))
+        self.assertFalse(c.is_pre_nu7_body(c.MAINNET, 10**8, [("t3cFfPt1Bcvgez9ZbMBFWeZsskxTkPzGCow", 12_500_000)]))
+
+    def test_pre_nu7_branch_id(self):
+        """A parsed v5+ coinbase with NU6.3's branch id is pre-NU7 whatever it pays; NU7's is not."""
+        old = c.parse_block(block_with(coinbase_tx(b"\x51", [(P2SH_FS, 4_166_666)], version=5)), c.TESTNET).coinbase
+        new = c.parse_block(
+            block_with(coinbase_tx(b"\x51", [(P2SH_FS, 4_166_666)], branch_id=0x77190AD9)), c.TESTNET
+        ).coinbase
+        self.assertEqual((old.branch_id, new.branch_id), (PRE_NU7_BRANCH_ID, 0x77190AD9))
+        self.assertTrue(c.is_pre_nu7_body(c.TESTNET, self.NU7, old.payouts, old.branch_id))
+        self.assertFalse(c.is_pre_nu7_body(c.TESTNET, self.NU7, new.payouts, new.branch_id))
+        self.assertFalse(c.is_pre_nu7_body(c.TESTNET, self.NU7 - 1, old.payouts, old.branch_id))
 
 
 class DifficultyTests(unittest.TestCase):

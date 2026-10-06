@@ -23,7 +23,9 @@ from __future__ import annotations
 import hashlib
 import re
 import struct
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
+from typing import Any
 
 
 BLOCK_HEADER_LEN = 1487
@@ -49,8 +51,10 @@ MAX_PAYOUTS = 16
 # Non-standard payout scripts are labelled by at most this many script bytes.
 MAX_SCRIPT_LABEL_BYTES = 32
 MAX_TAG_LEN = 128
-# Tag text inside a `shielded:` miner label is shortened to keep labels readable.
+# Tag text inside a `shielded:` miner label is shortened, at a word boundary, to keep labels readable.
 MAX_LABEL_TAG_LEN = 48
+# A push opcode whose next byte is the length; only a canonical one (length >= 0x4c) counts as a push.
+OP_PUSHDATA1 = 0x4C
 # Pushes this short that carry no template marker are rig/job ids. Foundry's
 # 4-5 byte extranonce is sometimes entirely printable.
 MAX_ID_PUSH_LEN = 8
@@ -77,7 +81,13 @@ MINER_TAG_FAMILIES = (
     ("molepool", "molepool"),
     ("w.cash", "W.cash"),  # "Wolf: W.cash AuxPow" merged miner with a shielded payout
     ("open-krnx", "open-krnx-pool"),
+    ("kupool", "KuPool"),
 )
+# ckpool instances tag their region and coin ("ckpool-lhr-zec"); that name is the family label.
+CKPOOL_TAG = re.compile(r"ckpool-[a-z0-9-]+")
+# Version of the `identify_miner` rules, so stored labels can be recomputed when they change.
+# 2: tag families paid to a transparent address carry the payee; ckpool and KuPool families.
+MINER_LABEL_VERSION = 2
 
 _NULL_PREVOUT = bytes(32) + b"\xff\xff\xff\xff"
 _COMPACT_WIDTHS = {0xFD: (2, 0xFD), 0xFE: (4, 0x1_0000), 0xFF: (8, 0x1_0000_0000)}
@@ -157,6 +167,10 @@ class NetworkParams:
     p2pkh_prefix: bytes
     p2sh_prefix: bytes
     funding_stream_addresses: frozenset[str]
+    # Marks of a coinbase built under the rules NU7 replaced (see `is_pre_nu7_body`): the funding-stream
+    # output value at activation and the previous epoch's nConsensusBranchId. None without NU7.
+    pre_nu7_funding_stream_value: int | None
+    pre_nu7_branch_id: int | None
 
     def difficulty_rules(self, height: int) -> DifficultyRules:
         """Return the difficulty-adjustment rules for a block at `height` (ZIP 218's `IsNU7Activated`)."""
@@ -181,6 +195,9 @@ TESTNET = NetworkParams(
     p2pkh_prefix=b"\x1d\x25",
     p2sh_prefix=b"\x1c\xba",
     funding_stream_addresses=frozenset({"t2HifwjUj9uyxr9bknR8LFuQbc98c3vkXtu"}),
+    # NU7 pays 4,166,666 (a third, for 25 s blocks); NU6.3's branch id is 0x37a5165b.
+    pre_nu7_funding_stream_value=12_500_000,
+    pre_nu7_branch_id=0x37A5165B,
 )
 
 MAINNET = NetworkParams(
@@ -195,6 +212,8 @@ MAINNET = NetworkParams(
     p2pkh_prefix=b"\x1c\xb8",
     p2sh_prefix=b"\x1c\xbd",
     funding_stream_addresses=frozenset({"t3cFfPt1Bcvgez9ZbMBFWeZsskxTkPzGCow"}),
+    pre_nu7_funding_stream_value=None,
+    pre_nu7_branch_id=None,
 )
 
 NETWORKS = {params.name: params for params in (TESTNET, MAINNET)}
@@ -414,6 +433,7 @@ class Coinbase:
     extranonce: str
     payouts: tuple[tuple[str, int], ...]
     tx_version: int
+    branch_id: int | None = None  # nConsensusBranchId; only v5+ transactions carry it
 
 
 @dataclass(frozen=True, slots=True)
@@ -464,7 +484,8 @@ def _parse_coinbase(buf: bytes, off: int, params: NetworkParams) -> Coinbase | N
         skip = 16  # nVersionGroupId, nConsensusBranchId, nLockTime, nExpiryHeight
     else:
         return None
-    _, off = _take(buf, off, skip)
+    fields, off = _take(buf, off, skip)
+    branch_id = int.from_bytes(fields[4:8], "little") if version >= 5 else None
 
     n_inputs, off = read_compact_size(buf, off)
     prevout, off = _take(buf, off, 36)
@@ -498,6 +519,7 @@ def _parse_coinbase(buf: bytes, off: int, params: NetworkParams) -> Coinbase | N
         extranonce=extranonce,
         payouts=tuple(payouts),
         tx_version=version,
+        branch_id=branch_id,
     )
 
 
@@ -528,9 +550,11 @@ def decode_coinbase_script(script_sig: bytes) -> tuple[int | None, str | None, s
     """Split a coinbase scriptSig into (BIP34 height, template, miner tag, extranonce hex).
 
     After the height push, a byte below 0x20 that fits is read as a push length
-    (it cannot start printable text); anything else starts raw miner bytes.
-    Template markers are found in any chunk. Printable ASCII runs become the tag,
-    and the remaining bytes (rig/job ids, merged-mining commitments) the extranonce.
+    (it cannot start printable text), and so is a canonical OP_PUSHDATA1 that fits
+    (an "L" starting raw text is followed by a byte below 0x4c, or overruns the
+    script); anything else starts raw miner bytes. Template markers are found in
+    any chunk. Printable ASCII runs become the tag, and the remaining bytes
+    (rig/job ids, merged-mining commitments) the extranonce.
     """
     height, rest = _split_bip34_height(script_sig)
     template: str | None = None
@@ -538,9 +562,13 @@ def decode_coinbase_script(script_sig: bytes) -> tuple[int | None, str | None, s
     extranonce = bytearray()
     pos = 0
     while pos < len(rest):
-        length = rest[pos]
-        if 1 <= length < 0x20 and pos + 1 + length <= len(rest):
-            chunk, pos = rest[pos + 1 : pos + 1 + length], pos + 1 + length
+        start, length = pos + 1, rest[pos]
+        if length == OP_PUSHDATA1 and start < len(rest) and rest[start] >= OP_PUSHDATA1:
+            start, length = start + 1, rest[start]
+        elif length >= 0x20:
+            length = 0
+        if length and start + length <= len(rest):
+            chunk, pos = rest[start : start + length], start + length
             has_marker = ZAKURA_MARKER in chunk or ZEBRA_MARKER in chunk
             if len(chunk) <= MAX_ID_PUSH_LEN and not has_marker:
                 extranonce += chunk
@@ -579,23 +607,57 @@ def _split_bip34_height(script_sig: bytes) -> tuple[int | None, bytes]:
 
 
 def identify_miner(coinbase: Coinbase | None, params: NetworkParams) -> str:
-    """Return a stable miner label for a coinbase.
+    """Return a stable miner label for a coinbase (rules versioned by `MINER_LABEL_VERSION`).
 
-    Order: a known tag family (`MINER_TAG_FAMILIES`), then the first paid output
-    that is not a funding stream, then "shielded:<tag or extranonce prefix or
-    'notag'>". A missing coinbase is "unknown".
+    Order: a known tag family (`MINER_TAG_FAMILIES`, then `CKPOOL_TAG`), as
+    "<family> · <payee prefix>…<suffix>" when it pays a transparent address
+    (ckpool solo-mines to each hasher's address, so self and race stay per payee);
+    then the first paid output that is not a funding stream; then
+    "shielded:<tag cut at a word boundary, or extranonce prefix, or 'notag'>".
+    A missing coinbase is "unknown".
     """
     if coinbase is None:
         return "unknown"
+    payee = next(
+        (payee for payee, value in coinbase.payouts if value > 0 and payee not in params.funding_stream_addresses),
+        None,
+    )
     lowered = coinbase.tag.lower()
-    for needle, label in MINER_TAG_FAMILIES:
-        if needle in lowered:
-            return label
-    for payee, value in coinbase.payouts:
-        if value > 0 and payee not in params.funding_stream_addresses:
-            return payee
-    fallback = coinbase.tag[:MAX_LABEL_TAG_LEN] or coinbase.extranonce[:8] or "notag"
-    return f"shielded:{fallback}"
+    family = next((label for needle, label in MINER_TAG_FAMILIES if needle in lowered), None)
+    if family is None and (match := CKPOOL_TAG.search(lowered)):
+        family = match.group()
+    if family is not None:
+        if payee is None or payee.startswith("script:"):
+            return family
+        return f"{family} · {payee[:6]}…{payee[-4:]}"
+    if payee is not None:
+        return payee
+    tag = coinbase.tag
+    if len(tag) > MAX_LABEL_TAG_LEN:
+        head = tag[:MAX_LABEL_TAG_LEN]  # one character is left for the ellipsis
+        cut = head.rfind(" ")
+        tag = (head[:cut] if cut > 0 else head[:-1]).rstrip(" .,;:") + "…"
+    return f"shielded:{tag or coinbase.extranonce[:8] or 'notag'}"
+
+
+def is_pre_nu7_body(
+    params: NetworkParams, height: int | None, payouts: Iterable[Sequence[Any]], branch_id: int | None = None
+) -> bool:
+    """Return True when a block at `height`, NU7 or later, has a coinbase built under the pre-NU7 rules.
+
+    That is a funding-stream output of `params.pre_nu7_funding_stream_value` (`payouts` as
+    (address, zatoshis) pairs, so `blocks.payout` JSON works too) or, when known, the pre-NU7
+    `branch_id`. It catches old-rules blocks whose nBits passes `expected_bits` under both rule
+    sets, such as minimum-difficulty ones.
+    """
+    if params.nu7_height is None or height is None or height < params.nu7_height:
+        return False
+    if branch_id is not None and branch_id == params.pre_nu7_branch_id:
+        return True
+    return any(
+        payee in params.funding_stream_addresses and value == params.pre_nu7_funding_stream_value
+        for payee, value in payouts
+    )
 
 
 def raw_hash_key(display_hex: str) -> bytes:

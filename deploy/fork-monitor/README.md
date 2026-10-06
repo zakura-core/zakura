@@ -16,12 +16,12 @@ Together these can leave groups of nodes on different branches. The monitor reco
 
 - **Orphans and fork events:** fork point, winner, losers, depth in blocks and work, miners, and self-race vs race between miners. It also records whether the winner was seen first or had the greater raw hash.
 - **Reorgs per vantage point:** every tip change of every RPC endpoint and P2P peer, with blocks disconnected and connected.
-- **Network splits:** vantage points are grouped by implementation and minor version (`zakura 1.5`, `zebra 6.3`, `zebra 6.4`, ...). A split is two or more groups on conflicting branches, each at least 2 blocks past the fork point, for more than 30 s. In the fast phase peers often sit 30–70 s on a one-block orphan before they reorg; that is lag, not a split. Nodes stuck on dead forks are listed separately: tip off the best chain for over an hour, or more than 1000 blocks behind.
-- **Per-miner attribution:** from the coinbase tag, the template marker (🌸 Zakura, 🦓 Zebra) and the payout address. It gives stale rate, self-orphans, and races won and lost.
-- **Sawtooth correlation:** each block's min-difficulty flag, blocks since reset `k`, difficulty relative to the pre-reset level, and fast or slow phase. Orphan rates are bucketed by these. Each reset is listed with its miner, template, gap and next-block `dt`.
+- **Network splits:** vantage points are grouped by implementation and minor version (`zakura 1.5`, `zebra 6.3`, `zebra 6.4`, ...). A split is two or more groups on conflicting branches, each at least 2 blocks past the fork point, for more than 30 s. In the fast phase peers often sit 30–70 s on a one-block orphan before they reorg; that is lag, not a split. Nodes stuck on dead forks are listed separately: tip off the best chain for over an hour, or more than 1000 blocks behind. Peers whose headers or blocks fail our consensus rules after a handshake (for example nodes still on pre-NU7 rules) are in state `old-rules`, with the fork point where we rejected them, and are left out of split detection. A split that ends because one side went `old-rules` or out of sight closes as `rules split` or `unobservable`, not `resolved`.
+- **Per-miner attribution:** from the coinbase tag, the template marker (🌸 Zakura, 🦓 Zebra) and the payout address; a pool tag with a transparent payee becomes `<pool> · <payee>`. It gives stale rate, self-orphans, and races won and lost. `no body` (no peer served the block's body) and `shielded:notag` (shown as "unidentified shielded", which any Zakura-template miner produces) attribute nothing.
+- **Sawtooth correlation:** each block's min-difficulty flag, blocks since reset `k`, difficulty relative to the pre-reset level, and fast or slow phase. A height from NU7 on with no reset since NU7 is `steady`: it keeps `k`, but has no fast phase or D/D_pre. Orphan rates are bucketed by these. Each reset is listed with its miner, template, gap and next-block `dt`.
 - **Propagation:** first sighting of each block per peer (`inv`) and per RPC endpoint, with p50 and p90 spread per implementation.
 - **Availability:** `getdata` probes after announcements, recording `block`, `notfound` or `timeout` per implementation. An `inv` from a peer followed by `notfound` from the same peer is flagged as an incident.
-- **CipherScan cross-check (optional):** CipherScan's orphan list compared with ours.
+- **CipherScan cross-check (optional):** CipherScan's orphan list compared with ours. An orphan our RPC nodes listed in `getchaintips` but no peer served counts as `seen_unfetched`, not as missing here.
 
 ## Architecture
 
@@ -115,7 +115,7 @@ A TOML file; [`fork-monitor.testnet.toml`](fork-monitor.testnet.toml) is the tes
 | `[cipherscan] base_url` | `https://api.testnet.cipherscan.app` | API origin |
 | `[cipherscan] interval` | `60.0` | Seconds between polls; at most 2 requests per second |
 | `[cipherscan] backfill_pages` | `0` | Pages of 200 orphans fetched at startup |
-| `[retention] days` | `30` | Sightings, probes, tip changes and chaintips older than this are pruned a minute after start, then hourly; blocks are kept |
+| `[retention] days` | `30` | Sightings, probes, tip changes, chaintips and P2P sources not heard from for this long are pruned a minute after start, then hourly; blocks are kept |
 
 ## Data model
 
@@ -123,12 +123,12 @@ All times are unix seconds (UTC) and hashes are display hex. The schema is in [`
 
 | Table | Contents |
 |---|---|
-| `blocks` | Every block seen: header fields, work, min-difficulty flag, height. From a body: size, tx count, miner label, tag, template, payouts, extranonce, and `body_trusted` (0 for a body from a P2P peer outside the fleet). `first_seen_at` and `first_seen_source` hold the earliest timed sighting; they are NULL for a block known only from the backfill. |
+| `blocks` | Every block seen: header fields, work, min-difficulty flag, height. From a body: size, tx count, miner label, tag, template, payouts, extranonce, and `body_trusted` (0 for a body from a P2P peer outside the fleet). `first_seen_at` and `first_seen_source` hold the earliest timed sighting; they are NULL for a block known only from the backfill. `rules_invalid` is 1 for a block that breaks the network's rules (for example a pre-NU7 block after activation, found again at every start) and for its descendants; such rows are kept but never loaded. |
 | `sightings` | First time each source saw each block, with its kind (see below) |
-| `sources` | Vantage points `rpc:<name>` and `p2p:<ip>:<port>`: implementation, version, user agent, start height, tip, status, last error |
+| `sources` | Vantage points `rpc:<name>` and `p2p:<ip>:<port>`: implementation, version, user agent, start height, tip, status, last error, and `rules_fork_height` for a peer on other consensus rules |
 | `tip_changes` | Every tip transition per source: fork point, blocks disconnected and connected, work, and `is_reorg` |
 | `chaintips` | `getchaintips` entries per RPC source, as a union over time |
-| `probes` | `getdata` probes. Reason is `announce`, `fetch` or `reprobe`; result is `block`, `notfound`, `timeout` or `error`. It also records latency and whether the same peer announced the block. |
+| `probes` | `getdata` probes. Reason is `announce`, `fetch` or `reprobe`; result is `block`, `notfound`, `timeout` or `error`. It also records latency, the peer's version at the time, and whether the same peer announced the block. |
 | `split_events` | Network splits: start, end, fork point, and a JSON summary with depth, `max_depth`, `closed_by` and the last split candidate (sides and groups) |
 | `external_orphans` | CipherScan orphan records |
 
@@ -136,7 +136,7 @@ Sighting kinds:
 
 - These time a block's arrival:
   - `inv`: pushed announcement
-  - `rpc_tip`: 1 s tip poll
+  - `rpc_tip`: 1 s tip poll, or the node's own `active` entry in `getchaintips`
 - These say a source holds the block, but not when it arrived:
   - `headers`
   - `chaintip`
@@ -153,7 +153,7 @@ Every route answers GET and HEAD. The API routes return JSON with `Cache-Control
 |---|---|
 | `/` | The dashboard (single page, no external requests) |
 | `/healthz` | `ok`, `starting` or `stale` (503 unless `ok`), plus snapshot age and tip height |
-| `/api/snapshot[?full=1]` | Live view: tip, phase, implementation groups and branches, split candidate and `split_event`, stuck nodes, collector health and recent reorgs. `full=1` adds per-source rows. |
+| `/api/snapshot[?full=1]` | Live view: tip, phase, implementation groups and branches, split candidate and `split_event`, stuck nodes, peers on other consensus rules (`old_rules`), collector health and recent reorgs. `full=1` adds per-source rows. |
 | `/api/summary` | Orphans, forks, reorgs and resets for the last 1 h, 24 h and 7 d, plus source health |
 | `/api/forks?limit=&since=` | Fork events with winners, losers, tie-break analysis, probes and which sources adopted which branch |
 | `/api/orphans/stats` | Orphan rate by hour, by day, by `k` bucket, by D/D_pre bucket, and fast vs slow |
@@ -165,7 +165,7 @@ Every route answers GET and HEAD. The API routes return JSON with `Cache-Control
 | `/api/peers` | Every vantage point with its relation to the best tip |
 | `/api/crosscheck` | CipherScan orphans against ours, per day |
 
-Rates count only heights watched live (see Limitations). `/api/summary` periods, `/api/orphans/stats` totals, `/api/miners` and each `/api/resets` row report the settled canonical blocks left out as `unobserved`; a period with any is `partial`, and a reset cycle never watched has `orphans: null`. `/api/crosscheck` counts CipherScan orphans at such heights as `unwatched` rather than `only_theirs`. In `/api/forks`, a block counts as seen first only when the other block's earliest `inv` or `rpc_tip` sighting came more than 1 s later.
+Rates count only heights watched live (see Limitations). `/api/summary` periods, `/api/orphans/stats` totals, `/api/miners` and each `/api/resets` row report the settled canonical blocks left out as `unobserved`; a period with any is `partial`, and a reset cycle never watched has `orphans: null`. `/api/crosscheck` counts CipherScan orphans at such heights as `unwatched` rather than `only_theirs`. In `/api/forks`, a block counts as seen first only when the other block's earliest `inv` or `rpc_tip` sighting came more than 1 s later. `tiebreak` is `late` when every loser arrived after the winner already had a child (more work on arrival), and `unresolved` when the arrival order is unknown; each loser's `seen_gap_s` is its first timely sighting minus the winner's. Fork probe counts include only `announce` and `reprobe` probes, and `reorgs.count` counts distinct sources. A source's `last_error` is current only when it is newer than its last success; an older one is returned as `previous_error`.
 
 ## Deploying on a new host
 
@@ -212,7 +212,7 @@ To upgrade, copy the new `zakura_fork_monitor/` directory and run `sudo systemct
 - **Statistics start when watching starts.** Orphan, fork and miner rates count only heights whose canonical block was first seen within 600 s of its header time. The backfill fetches only canonical blocks, so the competitors at backfilled heights were never observable, and after a restart the rates cover only the time the monitor has been watching.
 - **Fetched blocks have no arrival time.** Backfilled blocks have no first-seen time, so forward-dating and "seen first" show as unknown until a live sighting, which can itself be late (for example the first RPC tip poll after a restart). Bodies fetched later over P2P or RPC are timed at the fetch.
 - **Side-branch bodies are best effort.** Zebra serves only its best chain, so a side block is fetched from the peer that just showed it to us, or from Zakura nodes, which serve retained side chains (at most 10 per node). Live, some tips the fleet lists as `valid-fork` in `getchaintips` still came back `notfound` over P2P, and some of TazMiner's `valid-fork` tips reached no peer at all. Such blocks stay header-only or unknown, and unattributed.
-- **Forks below the window.** A peer on a fork below the in-memory window is shown as stuck from its version-message height; its fork point is unknown.
+- **Forks below the window.** A peer whose tip is below the in-memory window is placed by walking the stored blocks back to the best chain (up to 2,000 blocks); a tip they cannot place is `below the window`. A peer with no tip at all is shown from its version-message height, which also places it below the window when it is.
 - **Untrusted coinbases.** P2P headers and bodies are checked for their target, the Equihash (200, 9) solution, the expected nBits when the ancestors it depends on (28 before NU7, 113 from NU7) are in the window, and a time at most 2 h ahead; a body's coinbase height must match its place in the chain. Nothing else ties a body to its header. The merkle root is not checked, and checking it would not help: v5 and later txids leave out the coinbase scriptSig, which holds the tag and the template marker. So a body from a P2P peer outside the fleet counts as untrusted until RPC or a fleet peer serves that block. Side blocks that only other peers served keep their untrusted attribution.
 - **Cheap testnet orphans.** A min-difficulty block costs about 32 Equihash solutions, so anyone can mine consensus-valid side blocks. The monitor counts every such block it is shown as an orphan, even one relayed only to it.
 - **Single process.** One SQLite file with no high availability.

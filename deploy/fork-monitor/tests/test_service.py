@@ -21,7 +21,16 @@ from tests.test_rpc import BASE, StubNode, StubServer, block_hash, build_chain, 
 from zakura_fork_monitor import __main__ as cli
 from zakura_fork_monitor import analysis, consensus, service
 from zakura_fork_monitor.config import parse_config
-from zakura_fork_monitor.consensus import TESTNET, Block, BlockHeader, Coinbase, parse_block
+from zakura_fork_monitor.consensus import (
+    MAINNET,
+    TESTNET,
+    Block,
+    BlockHeader,
+    Coinbase,
+    expected_bits,
+    identify_miner,
+    parse_block,
+)
 from zakura_fork_monitor.service import Monitor, stored_top
 from zakura_fork_monitor.store import Store
 
@@ -29,6 +38,8 @@ T0 = 1_790_000_000
 NORMAL = 0x1E0D94E6
 PEER = "p2p:203.0.113.7:18233"
 RPC = "rpc:node"
+NU7 = TESTNET.nu7_height
+FUNDING = next(iter(TESTNET.funding_stream_addresses))
 
 
 def setUpModule() -> None:
@@ -177,7 +188,7 @@ class HookTests(MonitorCase):
             [event] = analysis.fork_events(chain)
             self.assertEqual(event["winner"]["hash"], bhash("b"))
             self.assertIsNone(event["winner_first_seen"])
-            self.assertIn(event["tiebreak"], ("hash", "unknown"))
+            self.assertIn(event["tiebreak"], ("hash", "unresolved"))
         # A live sighting is a real (if late) observation and fills it in.
         monitor.ingest_block(None, header("b", "a", T0 + 60), None, source=PEER, kind="headers", at=T0 + 6_000.0)
         self.assertEqual(monitor.chain.get(bhash("b")).first_seen_at, T0 + 6_000.0)
@@ -287,6 +298,25 @@ class BodySweepTests(MonitorCase):
                                   at=T0 + 71.0)
         asyncio.run(self.monitor.fetch_missing_bodies(T0 + 1_000.0))
         self.assertIn((bhash("gone"), BASE + 1, None), fake.requested)
+
+    def test_missing_parents_go_first_and_spent_blocks_free_their_slots(self) -> None:
+        """Missing parents are requested before side blocks, and blocks out of attempts do not hold the slots."""
+        self.monitor.p2p = fake = FakeP2P()
+        self.line(["a", "b", "c"])
+        self.monitor.ingest_block(None, header("s", "a", T0 + 61), None, source=PEER, kind="headers", at=T0 + 70.0)
+        self.monitor.ingest_block(None, header("t", "gone", T0 + 70), BASE + 2, source=PEER, kind="getdata",
+                                  at=T0 + 71.0)
+        fake.requested.clear()
+        side = (bhash("gone"), bhash("s"))
+        with mock.patch.object(service, "MAX_SIDE_REQUESTS", 1):
+            now = T0 + 1_000.0
+            for _ in range(service.BODY_ATTEMPTS):
+                asyncio.run(self.monitor.fetch_missing_bodies(now))
+                now += service.BODY_RETRY
+            self.assertEqual([h for h, _, _ in fake.requested if h in side], [bhash("gone")] * service.BODY_ATTEMPTS)
+            fake.requested.clear()
+            asyncio.run(self.monitor.fetch_missing_bodies(now))
+        self.assertEqual([h for h, _, _ in fake.requested if h in side], [bhash("s")])
 
     def test_untrusted_bodies_are_fetched_again(self) -> None:
         """Bodies from peers outside the fleet are fetched again, but not from the peer that showed them."""
@@ -404,6 +434,22 @@ class SplitTests(MonitorCase):
         [event] = self.splits()
         self.assertEqual((event["ended_at"], event["summary"]["closed_by"]), (50.0, "superseded"))
 
+    def test_how_a_cleared_split_ended(self) -> None:
+        """A split clears as "resolved" only if its side-branch groups rejoined the best chain."""
+        rejoined = [{"key": key, "branch": {"key": "canonical"}} for key in ("group 0", "group 1")]
+        old_rules = [{"key": "group 1", "branch": None, "old_rules": 2}]
+        gone = [{"key": "group 1", "branch": None, "old_rules": 0}]
+        for groups, closed_by in ((rejoined, "resolved"), (old_rules, "rules split"), (gone, "unobservable"),
+                                  ([], "unobservable"), (None, "resolved")):
+            with self.subTest(closed_by=closed_by, groups=groups):
+                self.monitor._split = None
+                track = self.monitor.track_split
+                track(self.x, 0.0)
+                self.assertIsNotNone(track(self.x, 30.0).event_id)
+                track(None, 40.0, groups)
+                self.assertIsNone(track(None, 70.0, groups))
+                self.assertEqual(self.splits()[-1]["summary"]["closed_by"], closed_by)
+
     def test_leftover_open_events_are_closed(self) -> None:
         """Events left open by a crash are closed with closed_by=restart."""
         self.store.open_split(started_at=5.0, summary={"key": "old"})
@@ -441,15 +487,129 @@ class SnapshotTests(MonitorCase):
 
 
     def test_previous_run_statuses_become_idle(self) -> None:
-        """Rows left "connected"/"ok" by an earlier run are reset, so a vanished peer eventually goes inactive."""
+        """Rows an earlier run left connected or waiting to redial become idle; a vanished peer goes inactive."""
         self.line(["a"])
         self.store.upsert_source(PEER, kind="p2p", impl="zebra", impl_version="6.4.2", status="connected",
                                  last_ok_at=T0, tip_hash=bhash("a"), tip_height=BASE, tip_at=T0)
         self.store.upsert_source(RPC, kind="rpc", status="error")
-        self.assertEqual(self.monitor.reset_stale_statuses(), 1)
+        for index, status in enumerate(("backoff", "unreachable", "old-rules")):
+            self.store.upsert_source(f"p2p:192.0.2.{index}:18233", status=status)
+        self.assertEqual(self.monitor.reset_stale_statuses(), 3)
+        statuses = {row["source"]: row["status"] for row in self.store.get_sources()}
+        self.assertEqual([statuses[f"p2p:192.0.2.{index}:18233"] for index in range(3)], ["idle", "idle", "old-rules"])
+        self.assertEqual(statuses[RPC], "error")
         snap = self.monitor.refresh_snapshot(T0 + analysis.ACTIVE_WINDOW + 1.0)
         [view] = [v for v in snap["peers"] if v["source"] == PEER]
         self.assertEqual((view["status"], view["active"], view["state"]), ("idle", False, "inactive"))
+
+
+class StartupPassTests(unittest.TestCase):
+    """The passes over stored blocks that run before the chain is loaded: NU7 rules and miner labels."""
+
+    def setUp(self) -> None:
+        """Open an empty store."""
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.store = Store(Path(tmp.name) / "monitor.sqlite3", commit_interval=0)
+        self.addCleanup(self.store.close)
+
+    def put(self, name: str, parent: str, height: int | None, time: int, bits: int,
+            coinbase: Coinbase | None = None) -> None:
+        """Store block `name` on `parent`, with a body when `coinbase` is given."""
+        hdr = header(name, parent, time, bits)
+        block = Block(header=hdr, size=1_000, tx_count=1, coinbase=coinbase) if coinbase is not None else None
+        self.store.upsert_block(block, hdr, height, miner="stale", is_min_diff=False, seen_at=None, seen_source=RPC)
+
+    def canonical(self, top: int) -> None:
+        """Store a chain h<height> from below NU7 to `top`, 25 s apart, whose NU7 blocks have the predicted nBits.
+
+        `self.context[height]` is the `expected_bits` input for a block at `height` on this chain.
+        """
+        context: list[tuple[int, int]] = []
+        self.context: dict[int, list[tuple[int, int]]] = {}
+        parent = "pre"
+        for height in range(NU7 - TESTNET.max_context_len, top + 1):
+            self.context[height] = list(context)
+            time_ = T0 + 25 * (height - NU7)
+            bits = expected_bits(TESTNET, height, time_, context) if height >= NU7 else NORMAL
+            body = coinbase("zkcodexcoder", (FUNDING, 4_166_666)) if height >= NU7 else None
+            self.put(f"h{height}", parent, height, time_, bits, body)
+            context.insert(0, (bits, time_))
+            parent = f"h{height}"
+
+    def flagged(self) -> set[str]:
+        """Return the hashes of flagged blocks."""
+        return {row[0] for row in self.store.reader().execute("SELECT hash FROM blocks WHERE rules_invalid = 1")}
+
+    def test_blocks_breaking_nu7_rules_are_flagged_with_their_descendants(self) -> None:
+        """Wrong nBits or a pre-NU7 funding stream flags a block and everything above it; valid blocks stay."""
+        self.canonical(NU7 + 3)
+        before = T0 - 25  # time of the parent of the activation block
+        # A pre-NU7 node's minimum-difficulty block passes the nBits check but pays the old funding stream.
+        self.put("r1", f"h{NU7 - 1}", NU7, before + 451, TESTNET.pow_limit_bits,
+                 coinbase("old", (FUNDING, 12_500_000), ("tmOldRulesMiner", 1)))
+        self.put("r2", "r1", NU7 + 1, before + 476, NORMAL)
+        self.assertNotEqual(expected_bits(TESTNET, NU7 + 1, T0 + 30, self.context[NU7 + 1]), NORMAL)
+        self.put("s1", f"h{NU7}", NU7 + 1, T0 + 30, NORMAL)  # wrong nBits for its (stored) ancestry
+        self.put("s2", "s1", NU7 + 2, T0 + 55, NORMAL)
+        self.put("s3", "s2", None, T0 + 80, NORMAL)  # placed nowhere yet, but on top of s1
+        self.put("u1", "unknown", NU7 + 2, T0 + 55, NORMAL)  # no stored ancestry: undecidable
+        names = ("r1", "r2", "s1", "s2", "s3")
+        self.assertEqual(service.revalidate_rules(self.store, TESTNET), len(names))
+        self.assertEqual(self.flagged(), {bhash(name) for name in names})
+        self.assertEqual(service.revalidate_rules(self.store, TESTNET), 0)
+        self.put("r3", "r2", NU7 + 2, before + 501, NORMAL)  # served again later by an old-rules peer
+        self.assertEqual(service.revalidate_rules(self.store, TESTNET), 1)
+        loaded = {row["hash"] for row in self.store.load_blocks()}
+        self.assertIn(bhash("u1"), loaded)
+        self.assertFalse(loaded & self.flagged())
+        self.assertEqual(service.revalidate_rules(self.store, TESTNET, min_height=NU7 + 100), 0)
+        self.assertEqual(service.revalidate_rules(self.store, MAINNET), 0)
+
+    def test_monitor_startup_loads_no_flagged_block(self) -> None:
+        """A Monitor runs the pass before loading the chain, so the old-rules branch is no stale block."""
+        self.canonical(NU7 + 3)
+        self.put("r1", f"h{NU7 - 1}", NU7, T0 + 426, TESTNET.pow_limit_bits, coinbase("old", (FUNDING, 12_500_000)))
+        self.put("r2", "r1", NU7 + 1, T0 + 451, NORMAL)
+        self.store.set_meta("best_hash", bhash(f"h{NU7 + 3}"))
+        self.store.set_meta("best_height", NU7 + 3)
+        chain = Monitor(make_config(), self.store).chain
+        self.assertEqual(chain.best_tip().hash, bhash(f"h{NU7 + 3}"))
+        self.assertNotIn(bhash("r1"), chain)
+        self.assertEqual((chain.stale_blocks(), chain.fork_events()), ([], []))
+
+    def test_stored_miner_labels_follow_the_label_version(self) -> None:
+        """Labels are rebuilt from stored coinbase fields once per MINER_LABEL_VERSION, also at Monitor startup."""
+        bodies = {
+            "pool": coinbase("ckpool-lhr-zec [>>H3L10SP00L<<]", ("tmUug8EERNmQgEJR2gmQWepiPNqj1Kh6G6K", 100),
+                             (FUNDING, 1)),
+            "solo": coinbase("zkcodexcoder", (FUNDING, 1)),
+            "pay": coinbase("", ("tmDDBnPEg12A4GYACyq9KwUEyq5vMiALZQR", 100)),
+        }
+        for index, (name, body) in enumerate(bodies.items()):
+            self.put(name, "g", BASE + index, T0 + index, NORMAL, body)
+        hdr = header("nocoinbase", "g", T0, NORMAL)
+        self.store.upsert_block(Block(header=hdr, size=1, tx_count=1, coinbase=None), hdr, BASE, miner="unknown",
+                                is_min_diff=False, seen_at=None, seen_source=RPC)
+        self.put("headeronly", "g", BASE, T0, NORMAL)
+        self.store.set_meta("miner_label_version", service.MINER_LABEL_VERSION - 1)
+        chain = Monitor(make_config(), self.store).chain
+        for name, body in bodies.items():
+            self.assertEqual(self.store.get_block(bhash(name))["miner"], identify_miner(body, TESTNET), name)
+            self.assertEqual(chain.get(bhash(name)).miner, identify_miner(body, TESTNET), name)
+        self.assertEqual(self.store.get_block(bhash("nocoinbase"))["miner"], "unknown")
+        self.assertEqual(self.store.get_block(bhash("headeronly"))["miner"], "stale")
+        self.assertEqual(self.store.get_meta("miner_label_version"), str(service.MINER_LABEL_VERSION))
+        self.store.set_miners({bhash("solo"): "stale"})
+        self.assertEqual(service.relabel_miners(self.store, TESTNET), 0)  # done for this version
+        self.store.set_meta("miner_label_version", "garbled")
+        self.assertEqual(service.relabel_miners(self.store, TESTNET), 1)
+
+
+def coinbase(tag: str, *payouts: tuple[str, int]) -> Coinbase:
+    """A parsed v5 coinbase with miner tag `tag` and transparent `payouts`."""
+    return Coinbase(height=None, script_sig=b"\x03abc", template="zakura", tag=tag, extranonce="ab", payouts=payouts,
+                    tx_version=5)
 
 
 class LoopTests(unittest.IsolatedAsyncioTestCase):
@@ -512,13 +672,13 @@ class LoopTests(unittest.IsolatedAsyncioTestCase):
                 mock.patch.object(self.store, "prune_batches", small_batches):
             task = asyncio.create_task(self.monitor._prune_loop())
             for _ in range(200):
-                if len(at_batch) == 9:  # 5 full and 1 short sightings batch, then probes, tip_changes, chaintips
+                if len(at_batch) == 10:  # 5 full and 1 short sightings batch, then the other four tables
                     break
                 await asyncio.sleep(0.01)
             task.cancel()
             beat.cancel()
             await asyncio.gather(task, beat, return_exceptions=True)
-        self.assertEqual(len(at_batch), 9)
+        self.assertEqual(len(at_batch), 10)
         self.assertEqual(len(set(at_batch)), len(at_batch))  # the loop turned between every batch
         self.assertEqual(self.store.reader().execute("SELECT COUNT(*) FROM sightings").fetchone()[0], 0)
 
@@ -670,13 +830,16 @@ class CliTests(unittest.TestCase):
         states = dict.fromkeys(("synced", "lagging", "fork", "stuck", "unknown", "inactive"), 0)
         snap = {"tip": {"height": BASE, "hash": bhash("a")},
                 "groups": [{"key": "zebra 6.4", "active": 2, "states": {**states, "synced": 1, "stuck": 1},
-                            "branch": {"key": "canonical"}}]}
+                            "branch": {"key": "canonical"}},
+                           {"key": "zebra 6.2", "active": 1, "states": {**states, "old-rules": 1}, "branch": None,
+                            "old_rules_relation": {"kind": "fork", "fork_height": BASE - 5}}]}
         results = [{"source": "p2p:198.51.100.2:18233", "impl": None, "error": "connect timeout"},
                    {"source": PEER, "impl": "zebra", "version": "6.4.2", "tip_height": BASE, "error": None,
                     "relation": {"kind": "same"}, "tip_note": "bad\x1b[31m"}]
         text = cli._probe_text(results, snap)
         self.assertIn("1 of 2 peers answered", text)
-        self.assertRegex(text, r"zebra 6.4 +2 +1 +0 +0 +1 +0  canonical")
+        self.assertRegex(text, r"zebra 6.4 +2 +1 +0 +0 +1 +0 +0  canonical")
+        self.assertRegex(text, rf"zebra 6.2 +1 +0 +0 +0 +0 +1 +0  old-rules@{BASE - 5}")
         lines = text.splitlines()
         self.assertLess(lines.index(next(line for line in lines if PEER in line)),
                         lines.index(next(line for line in lines if "connect timeout" in line)))

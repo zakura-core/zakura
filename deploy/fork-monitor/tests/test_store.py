@@ -15,6 +15,23 @@ from zakura_fork_monitor.store import Store
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 MIN_DIFF_BITS = 0x2007FFFF
+# Columns schema version 4 added, as they appear in SCHEMA.
+V4_COLUMNS = (
+    ",\n  rules_invalid INTEGER NOT NULL DEFAULT 0",
+    ",\n  rules_fork_height INTEGER",
+    ",\n  impl_version TEXT",
+)
+
+
+def old_schema(version: int) -> str:
+    """Return SCHEMA as a file at schema `version` (1-3) had it: every table, minus later columns."""
+    schema = store_mod.SCHEMA
+    for column in V4_COLUMNS:
+        assert column in schema, column
+        schema = schema.replace(column, "")
+    if version < 2:
+        schema = schema.replace(",\n  body_trusted INTEGER NOT NULL DEFAULT 1", "")
+    return schema
 
 
 def fake_header(n: int, prev: int | None = None, *, bits: int = 0x1F0AB3C0, time: int = 1_700_000_000):
@@ -97,40 +114,66 @@ class SchemaTests(StoreTestCase):
             Store(self.path)
         self.assertIn("newer", str(caught.exception))
 
-    def test_version_1_databases_are_migrated(self) -> None:
-        """A version 1 file gains `blocks.body_trusted`, with its stored bodies counted as trusted."""
+    def recreate(self, version: int, *statements: tuple[str, tuple]) -> None:
+        """Replace the store with a schema `version` file holding the rows `statements` insert, then reopen it."""
         self.store.close()
-        self.path.unlink()
-        for suffix in ("-wal", "-shm"):
+        for suffix in ("", "-wal", "-shm"):
             Path(str(self.path) + suffix).unlink(missing_ok=True)
-        # Every table a version 1 file had, minus the column version 2 added.
-        v1_schema = store_mod.SCHEMA.replace(",\n  body_trusted INTEGER NOT NULL DEFAULT 1", "")
-        self.assertNotIn("body_trusted", v1_schema)
         with sqlite3.connect(self.path) as conn:
-            conn.executescript(v1_schema)
-            conn.execute("INSERT INTO meta VALUES ('schema_version', '1')")
-            conn.execute("INSERT INTO blocks (hash, prev_hash, time, bits, work, body, created_at) "
-                         "VALUES (?, ?, 1, 1, 1, 1, 1)", (f"{1:064x}", f"{0:064x}"))
+            conn.executescript(old_schema(version))
+            conn.execute("INSERT INTO meta VALUES ('schema_version', ?)", (str(version),))
+            for sql, params in statements:
+                conn.execute(sql, params)
         conn.close()
         self.store = Store(self.path)
         self.assertEqual(self.store.get_meta("schema_version"), str(store_mod.SCHEMA_VERSION))
-        self.assertEqual(self.block_row(1)["body_trusted"], 1)
+
+    def test_version_1_databases_are_migrated(self) -> None:
+        """A version 1 file gains `blocks.body_trusted`, with its stored bodies counted as trusted."""
+        self.assertNotIn("body_trusted", old_schema(1))
+        self.recreate(1, ("INSERT INTO blocks (hash, prev_hash, time, bits, work, body, created_at) "
+                          "VALUES (?, ?, 1, 1, 1, 1, 1)", (f"{1:064x}", f"{0:064x}")))
+        self.assertEqual((self.block_row(1)["body_trusted"], self.block_row(1)["rules_invalid"]), (1, 0))
         self.store.close()
         self.store = Store(self.path)  # reopening does not migrate again
         self.assertEqual(self.block_row(1)["body_trusted"], 1)
 
     def test_version_2_rewinds_are_relabelled(self) -> None:
         """Migrating from version 2 clears `is_reorg` on rows that connected no blocks."""
-        self.store.record_tip_change(source="p2p:a", at=1.0, new_hash="aa" * 32, disconnected=997, connected=0,
-                                     is_reorg=True)
-        self.store.record_tip_change(source="p2p:a", at=2.0, new_hash="bb" * 32, disconnected=1, connected=2,
-                                     is_reorg=True)
-        self.store.set_meta("schema_version", 2)
-        self.store.close()
-        self.store = Store(self.path)
-        self.assertEqual(self.store.get_meta("schema_version"), str(store_mod.SCHEMA_VERSION))
+        insert = ("INSERT INTO tip_changes (source, at, new_hash, disconnected, connected, is_reorg) "
+                  "VALUES (?, ?, ?, ?, ?, 1)")
+        self.recreate(2, (insert, ("p2p:a", 1.0, "aa" * 32, 997, 0)), (insert, ("p2p:a", 2.0, "bb" * 32, 1, 2)))
         rows = self.store.reader().execute("SELECT is_reorg FROM tip_changes ORDER BY at").fetchall()
         self.assertEqual([row[0] for row in rows], [0, 1])
+
+    def test_version_3_gains_rule_columns_and_drops_backfill_first_seen(self) -> None:
+        """Version 3 files gain the version 4 columns, and a first-seen time that was a backfill fetch is cleared."""
+        block = ("INSERT INTO blocks (hash, prev_hash, time, bits, work, created_at, first_seen_at, "
+                 "first_seen_source) VALUES (?, ?, 1, 1, 1, 1, ?, ?)")
+        sighting = "INSERT INTO sightings (hash, source, kind, at) VALUES (?, ?, ?, ?)"
+        self.recreate(
+            3,
+            (block, (f"{1:064x}", f"{0:064x}", 100.0, "rpc:a")),  # first seen = its backfill fetch
+            (sighting, (f"{1:064x}", "rpc:a", "backfill", 100.0)),
+            (block, (f"{2:064x}", f"{1:064x}", 50.0, "p2p:b")),  # announced first, backfilled later
+            (sighting, (f"{2:064x}", "p2p:b", "inv", 50.0)),
+            (sighting, (f"{2:064x}", "rpc:a", "backfill", 90.0)),
+            (block, (f"{3:064x}", f"{2:064x}", 70.0, "rpc:a")),  # a later backfill sighting is not its first seen
+            (sighting, (f"{3:064x}", "rpc:a", "backfill", 80.0)),
+            ("INSERT INTO sources (source, kind, status) VALUES ('p2p:c', 'p2p', 'connected')", ()),
+            ("INSERT INTO probes (at, source, hash, reason, result) VALUES (1, 'p2p:c', ?, 'fetch', 'block')",
+             ("cc" * 32,)),
+        )
+        firsts = [(self.block_row(n)["first_seen_at"], self.block_row(n)["first_seen_source"]) for n in (1, 2, 3)]
+        self.assertEqual(firsts, [(None, None), (50.0, "p2p:b"), (70.0, "rpc:a")])
+        self.assertEqual({self.block_row(n)["rules_invalid"] for n in (1, 2, 3)}, {0})
+        self.assertIsNone(self.store.get_sources()[0]["rules_fork_height"])
+        self.store.upsert_source("p2p:c", status="old-rules", rules_fork_height=4_465_025)
+        self.store.record_probe(at=2.0, source="p2p:c", hash="dd" * 32, reason="announce", result="notfound",
+                                impl_version="6.4.2")
+        self.assertEqual(self.store.get_sources()[0]["rules_fork_height"], 4_465_025)
+        versions = self.store._conn.execute("SELECT impl_version FROM probes ORDER BY id").fetchall()
+        self.assertEqual([row[0] for row in versions], [None, "6.4.2"])
 
     def test_unreadable_schema_version_is_refused(self) -> None:
         """A garbled schema_version refuses to open."""
@@ -328,6 +371,30 @@ class BlockTests(StoreTestCase):
         self.assertEqual([row["height"] for row in self.store.load_blocks()], [1, 2, 3, None])
         self.assertEqual([row["height"] for row in self.store.load_blocks(min_height=2)], [2, 3, None])
         self.assertEqual(self.store.known_hashes(), {f"{n:064x}" for n in (20, 21, 22, 23)})
+
+    def test_rules_invalid_blocks_are_kept_but_not_loaded(self) -> None:
+        """mark_rules_invalid counts only new flags, and load_blocks skips flagged rows of known and unknown height."""
+        for n, height in ((24, 1), (25, 2), (26, None)):
+            self.store.upsert_block(
+                None, fake_header(n), height, miner=None, is_min_diff=False, seen_at=1.0, seen_source="a"
+            )
+        self.assertEqual(self.store.mark_rules_invalid([f"{25:064x}", f"{26:064x}", f"{99:064x}"]), 2)
+        self.assertEqual(self.store.mark_rules_invalid([f"{25:064x}"]), 0)
+        self.assertEqual([row["hash"] for row in self.store.load_blocks()], [f"{24:064x}"])
+        self.assertEqual(self.block_row(25)["rules_invalid"], 1)
+        # A later upsert of a flagged block (a peer serving it again) leaves the flag on.
+        self.store.upsert_block(fake_block(fake_header(25)), fake_header(25), 2, miner="m", is_min_diff=False,
+                                seen_at=0.5, seen_source="b")
+        self.assertEqual((self.block_row(25)["rules_invalid"], self.block_row(25)["body"]), (1, 1))
+
+    def test_set_miners_replaces_labels(self) -> None:
+        """set_miners rewrites the given rows' labels only."""
+        for n in (27, 28):
+            header = fake_header(n)
+            self.store.upsert_block(fake_block(header), header, n, miner="old", is_min_diff=False, seen_at=1.0,
+                                    seen_source="a")
+        self.assertEqual(self.store.set_miners({f"{27:064x}": "new"}), 1)
+        self.assertEqual((self.block_row(27)["miner"], self.block_row(28)["miner"]), ("new", "old"))
 
     @unittest.skipUnless((FIXTURES / "block-test-4410736.hex").exists(), "fixture missing")
     def test_real_fixture_block_when_consensus_available(self) -> None:
@@ -575,7 +642,12 @@ class PruneTests(StoreTestCase):
     """prune() removes only old observation rows."""
 
     def test_prune(self) -> None:
-        """prune deletes old observation rows and chaintips in batches and keeps blocks."""
+        """prune deletes old observation rows, chaintips and silent P2P sources in batches and keeps blocks."""
+        self.store.upsert_source("p2p:1.1.1.1:18233", first_seen_at=1.0, last_ok_at=10.0, last_error_at=20.0)
+        self.store.upsert_source("p2p:2.2.2.2:18233", first_seen_at=1.0, last_ok_at=10.0, last_error_at=60.0)
+        self.store.upsert_source("p2p:3.3.3.3:18233", first_seen_at=1.0, status="idle")
+        self.store.upsert_source("p2p:4.4.4.4:18233", first_seen_at=70.0)
+        self.store.upsert_source("rpc:a", first_seen_at=1.0, last_ok_at=10.0)
         for i in range(12):
             at = float(i * 10)
             self.store.record_sighting(f"{i:064x}", "p2p:1.1.1.1:18233", "inv", at)
@@ -586,13 +658,17 @@ class PruneTests(StoreTestCase):
             self.store.upsert_block(None, fake_header(i + 1), i, miner=None, is_min_diff=False, seen_at=at,
                                     seen_source="a")
         deleted = self.store.prune(55.0, batch=2)
-        self.assertEqual(deleted, {"sightings": 6, "probes": 6, "tip_changes": 6, "chaintips": 6})
+        self.assertEqual(deleted, {"sightings": 6, "probes": 6, "tip_changes": 6, "chaintips": 6, "sources": 2})
+        self.assertEqual([row["source"] for row in self.store.get_sources()],
+                         ["p2p:2.2.2.2:18233", "p2p:4.4.4.4:18233", "rpc:a"])
         conn = self.store.reader()
         for table in ("sightings", "probes", "tip_changes"):
             self.assertEqual(tuple(conn.execute(f"SELECT MIN(at), COUNT(*) FROM {table}").fetchone()), (60.0, 6))
         self.assertEqual(tuple(conn.execute("SELECT MIN(last_at), COUNT(*) FROM chaintips").fetchone()), (60.0, 6))
         self.assertEqual(conn.execute("SELECT COUNT(*) FROM blocks").fetchone()[0], 12)
-        self.assertEqual(self.store.prune(55.0), {"sightings": 0, "probes": 0, "tip_changes": 0, "chaintips": 0})
+        self.assertEqual(
+            self.store.prune(55.0), {"sightings": 0, "probes": 0, "tip_changes": 0, "chaintips": 0, "sources": 0}
+        )
 
     def test_prune_batches_commit_between_steps(self) -> None:
         """prune_batches yields after every committed batch, so readers see progress and the caller can pause."""
@@ -604,7 +680,8 @@ class PruneTests(StoreTestCase):
         self.assertFalse(self.store._conn.in_transaction)
         self.assertEqual(self.store.reader().execute("SELECT COUNT(*) FROM sightings").fetchone()[0], 3)
         self.assertEqual(
-            list(steps), [("sightings", 2), ("sightings", 1), ("probes", 0), ("tip_changes", 0), ("chaintips", 0)]
+            list(steps),
+            [("sightings", 2), ("sightings", 1), ("probes", 0), ("tip_changes", 0), ("chaintips", 0), ("sources", 0)],
         )
 
 

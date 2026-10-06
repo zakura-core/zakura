@@ -452,6 +452,7 @@ tr.is-open .twisty { transform: rotate(90deg); color: var(--pink-hi); }
 .stack { display: flex; flex-direction: column; align-items: flex-start; gap: 2px; min-width: 0; }
 .cell-main { display: inline-flex; align-items: center; gap: 6px; font-weight: 600; color: var(--ink); overflow-wrap: anywhere; }
 .sub { color: var(--dim); font-size: 0.7rem; }
+.sub.bad-text { color: var(--bad); }
 .table-note { margin-top: 8px; color: var(--muted); font-size: 0.76rem; }
 tbody tr.drawer > td { padding: 0; background: var(--surface); }
 tbody tr.drawer:hover > td { background: var(--surface); }
@@ -486,6 +487,7 @@ tbody tr.drawer:hover > td { background: var(--surface); }
 .seg-warn { background: var(--warn); }
 .seg-bad { background: var(--bad); }
 .seg-stuck { background: #b0413b; }
+.seg-old { background: #8a6fd1; }
 .seg-neutral { background: var(--dim); }
 .seg-inactive { background: var(--line-hi); }
 
@@ -975,13 +977,25 @@ footer a:hover { color: var(--pink-hi); }
 
   /* ---------- small components ---------- */
   const TONE_CLASS = {ok: 'tone-ok', warn: 'tone-warn', bad: 'tone-bad', info: 'tone-info'};
-  const STATE_TONE = {synced: 'ok', lagging: 'warn', fork: 'bad', stuck: 'bad'};
-  const STATUS_TONE = {ok: 'ok', connected: 'ok', idle: 'ok', backoff: 'warn', starting: 'warn', error: 'bad', unreachable: 'bad'};
+  const STATE_TONE = {synced: 'ok', lagging: 'warn', fork: 'bad', stuck: 'bad', 'old-rules': 'warn'};
+  const STATE_LABEL = {'old-rules': 'old rules'};
+  const STATUS_TONE = {ok: 'ok', connected: 'ok', idle: 'ok', backoff: 'warn', starting: 'warn', error: 'bad', unreachable: 'bad', 'old-rules': 'warn'};
   const CLASS_TONE = {self: 'info', race: 'warn'};
+  const CLASS_LABEL = {no_body: 'body not served'};
   const TIEBREAK_TONE = {hash: 'info', first_seen: 'info', both: 'ok', neither: 'warn'};
-  const TIEBREAK_LABEL = {work: 'more work', hash: 'greater hash', first_seen: 'first seen', both: 'hash + first seen', neither: 'later blocks'};
+  const TIEBREAK_LABEL = {work: 'more work', hash: 'greater hash', first_seen: 'first seen', both: 'hash + first seen',
+    late: 'work on arrival', unresolved: 'unresolved', neither: 'later blocks'};
   const PHASE_TONE = {fast: 'warn', slow: 'ok'};
-  const STATE_ORDER = [['synced', 'seg-ok'], ['lagging', 'seg-warn'], ['fork', 'seg-bad'], ['stuck', 'seg-stuck'], ['unknown', 'seg-neutral'], ['inactive', 'seg-inactive']];
+  const STATE_ORDER = [['synced', 'seg-ok'], ['lagging', 'seg-warn'], ['fork', 'seg-bad'], ['stuck', 'seg-stuck'], ['old-rules', 'seg-old'], ['unknown', 'seg-neutral'], ['inactive', 'seg-inactive']];
+  const STEADY = 'steady';
+  // Phase bucket keys too long for a chart axis.
+  const BUCKET_LABEL = {'no reset since NU7': 'no reset'};
+  const REASON_LABEL = {fetch: 'body fetch (not availability)'};
+  // Miner labels that read as a parse failure: [shown text, tooltip].
+  const MINER_LABEL = {
+    'no body': ['body not served', 'header-only blocks: no peer served their body, so the miner is unknown'],
+    'shielded:notag': ['unidentified shielded (Zakura template)', 'shielded payout and no coinbase tag; any Zakura-template miner gets this label'],
+  };
 
   function badge(label, tone) { return h('span', {class: 'badge ' + pick(TONE_CLASS, tone, '')}, label); }
   function chip(label, pink) { return h('span', {class: pink ? 'chip is-pink' : 'chip'}, label); }
@@ -1028,7 +1042,9 @@ footer a:hover { color: var(--pink-hi); }
       case 'same': return 'at best tip';
       case 'behind': return num(rel.n) + ' behind';
       case 'ahead': return num(rel.n) + ' ahead';
-      case 'fork': return 'fork at ' + num(rel.fork_height) + ' (' + num(rel.depth_theirs) + ' vs ' + num(rel.depth_ours) + ')';
+      case 'fork': return 'fork at ' + num(rel.fork_height)
+        + (isNum(rel.depth_theirs) || isNum(rel.depth_ours) ? ' (' + num(rel.depth_theirs) + ' vs ' + num(rel.depth_ours) + ')' : '');
+      case 'below_window': return 'below the window';
       default: return 'unknown';
     }
   }
@@ -1037,9 +1053,35 @@ footer a:hover { color: var(--pink-hi); }
     return h('span', {class: 'cluster'}, badge(text(phase.label), pick(PHASE_TONE, phase.label, null)),
       h('span', {class: 'muted'}, 'k ' + (phase.k == null ? DASH : num(phase.k))));
   }
+  /** A miner label as shown: plain-language text for the opaque labels in MINER_LABEL. */
+  function minerText(label) {
+    const known = pick(MINER_LABEL, label, null);
+    return known ? known[0] : text(label);
+  }
+  /** `minerText` in a span whose tooltip explains an opaque label, else shows the coinbase tag (if given). */
+  function minerName(label, tag) {
+    const known = pick(MINER_LABEL, label, null);
+    return h('span', {title: known ? known[1] : tag || null}, minerText(label));
+  }
+  /** The miner of a block dict; a block without a body has no miner to show. */
+  function blockMiner(block) {
+    return block.miner == null && block.body === false ? minerName('no body') : minerName(block.miner, block.miner_tag);
+  }
   function blockCell(block) {
     block = obj(block);
-    return h('div', {class: 'stack'}, h('span', {class: 'cell-main'}, text(block.miner), templateChip(block.template)), hashEl(block.hash));
+    return h('div', {class: 'stack'}, h('span', {class: 'cell-main'}, blockMiner(block), templateChip(block.template)), hashEl(block.hash));
+  }
+  /** The state of a peer view as a badge ("old rules" for a peer whose chain fails our consensus rules). */
+  function stateBadge(state) { return badge(pick(STATE_LABEL, state, text(state)), pick(STATE_TONE, state, null)); }
+  /** A peer's tip height, else its version-message height marked as an estimate. */
+  function tipText(v) {
+    if (isNum(v.tip_height)) return num(v.tip_height);
+    return isNum(v.start_height) ? '≈' + num(v.start_height) + ' (version height)' : DASH;
+  }
+  /** Why the P2P observer has no tip for a peer (e.g. "no common block in window"), or null. */
+  function tipNote(v) {
+    const note = v.tip_note != null ? v.tip_note : obj(v.live).tip_note;
+    return typeof note === 'string' && note ? note : null;
   }
   function statesBar(states) {
     const bar = h('div', {class: 'states', role: 'img'});
@@ -1180,7 +1222,11 @@ footer a:hover { color: var(--pink-hi); }
     }
     const phase = snap.phase;
     const phasePill = $('phase-pill');
-    if (phase && phase.label !== 'unknown') {
+    if (phase && phase.label === STEADY) {
+      phasePill.className = 'state-pill is-ok';
+      phasePill.textContent = 'No reset since NU7 · k ' + num(phase.k);
+      phasePill.title = 'no min-difficulty reset since NU7 activated; k counts from the last one, at ' + num(phase.reset_height);
+    } else if (phase && phase.label !== 'unknown') {
       phasePill.className = 'state-pill ' + (phase.label === 'fast' ? 'is-warn' : 'is-ok');
       phasePill.textContent = (phase.label === 'fast' ? 'Fast' : 'Slow') + ' phase · k ' + num(phase.k);
       phasePill.title = 'D/D_pre ' + compact(phase.d_ratio) + ', last reset at ' + num(phase.reset_height);
@@ -1203,7 +1249,8 @@ footer a:hover { color: var(--pink-hi); }
       splitPill.textContent = 'No split';
       splitPill.title = snap.split_candidate
         ? 'groups on different branches, one side less than 2 blocks past the fork: lag, not a split'
-        : 'every active group is on the best chain or only lagging';
+        : 'every active group is on the best chain or only lagging'
+          + (oldRulesText(snap.old_rules) ? '; left out: ' + oldRulesText(snap.old_rules) : '');
     } else {
       splitPill.className = 'state-pill';
       splitPill.textContent = 'No peers yet';
@@ -1224,7 +1271,7 @@ footer a:hover { color: var(--pink-hi); }
     const tip = snap && snap.tip;
     if (tip) {
       const seen = isNum(tip.first_seen_at) ? tip.first_seen_at : tip.time;
-      const parts = [shortHash(text(tip.hash)), text(tip.miner), ago(seen)];
+      const parts = [shortHash(text(tip.hash)), minerText(tip.miner), ago(seen)];
       $('tip-detail').textContent = parts.join(' · ');
     }
     const fresh = $('freshness');
@@ -1274,25 +1321,39 @@ footer a:hover { color: var(--pink-hi); }
     setTile('tile-peers', num(isNum(p2p.connected) ? p2p.connected : 0), detail, p2p.error ? 'warn' : null);
   }
 
+  /** "N peers on pre-NU7 rules (fork at H)" from the snapshot's `old_rules` summary, or ''. */
+  function oldRulesText(oldRules) {
+    oldRules = obj(oldRules);
+    if (!isNum(oldRules.peers) || !oldRules.peers) return '';
+    return plural(oldRules.peers, 'peer') + ' on pre-NU7 rules' + (isNum(oldRules.fork_height) ? ' (fork at ' + num(oldRules.fork_height) + ')' : '');
+  }
+
   function renderNetwork(snap) {
     const groups = list(snap.groups);
     const split = snap.split_candidate;
     const event = snap.split_event;
     const members = groups.reduce((n, g) => n + (isNum(g.members) ? g.members : 0), 0);
     const active = groups.reduce((n, g) => n + (isNum(g.active) ? g.active : 0), 0);
+    const stale = groups.reduce((n, g) => n + (isNum(g.stale) ? g.stale : 0), 0);
     const chain = obj(snap.chain);
+    const oldRules = oldRulesText(snap.old_rules);
     $('network-note').textContent = num(members) + ' vantage points, ' + num(active) + ' active · '
+      + (stale ? num(stale) + ' more not seen in 24 h · ' : '')
+      + (oldRules ? oldRules + ' · ' : '')
       + num(chain.blocks) + ' blocks in memory (' + num(chain.from_height) + '–' + num(chain.to_height) + ')'
       + (chain.missing_parents ? ' · ' + num(chain.missing_parents) + ' missing parents' : '');
-    renderSplit(event, split, groups, snap.generated_at);
+    renderSplit(event, split, groups, snap.generated_at, oldRules);
     const sideOf = obj(split ? split.groups : event && event.groups);
     const columns = [
-      {key: 'group', label: 'Group', sort: (g) => g.key, cell: (g) => h('span', {class: 'cell-main'}, text(g.key), g.fleet ? chip('fleet ' + g.fleet, true) : null)},
-      {key: 'members', label: 'Active', num: true, desc: true, sort: (g) => g.active, cell: (g) => num(g.active) + ' / ' + num(g.members)},
+      {key: 'group', label: 'Group', sort: (g) => g.key, cell: (g) => h('span', {class: 'cell-main'}, text(g.key),
+        g.fleet ? h('span', {class: 'chip is-pink', title: 'fleet hosts (RPC + P2P vantage points)'}, 'fleet ' + g.fleet) : null)},
+      {key: 'members', label: 'Active', num: true, desc: true, sort: (g) => g.active, title: 'active / seen in the last 24 h',
+        cell: (g) => h('span', {title: g.stale ? num(g.stale) + ' more not seen in 24 h' : null}, num(g.active) + ' / ' + num(g.members))},
       {key: 'states', label: 'States', cell: (g) => statesBar(obj(g.states))},
       {key: 'branch', label: 'Branch', cell: (g) => branchCell(g)},
-      {key: 'tip', label: 'Branch tip', num: true, sort: (g) => g.branch && g.branch.tip_height, cell: (g) => g.branch ? h('div', {class: 'stack'}, num(g.branch.tip_height), hashEl(g.branch.tip_hash)) : dash()},
-      {key: 'relation', label: 'Relation to best tip', cell: (g) => g.branch ? relationText(g.branch.relation) : dash()},
+      {key: 'tip', label: 'Branch tip', num: true, sort: (g) => g.branch && g.branch.tip_height, cell: (g) => g.branch ? h('div', {class: 'stack'}, num(g.branch.tip_height), hashEl(g.branch.tip_hash))
+        : oldRulesTip(g) != null ? h('span', {title: 'highest version-message height of its peers on pre-NU7 rules'}, '≈' + num(oldRulesTip(g))) : dash()},
+      {key: 'relation', label: 'Relation to best tip', cell: (g) => g.branch ? relationText(g.branch.relation) : g.old_rules_relation ? relationText(g.old_rules_relation) : dash()},
       {key: 'stuck', label: 'Stuck', num: true, desc: true, sort: (g) => g.stuck, cell: (g) => g.stuck ? h('span', {class: 'bad-text'}, num(g.stuck)) : '0'},
     ];
     dataTable($('groups-table'), 'groups', columns, groups, {
@@ -1300,7 +1361,7 @@ footer a:hover { color: var(--pink-hi); }
       rowClass: (g) => {
         const side = has(sideOf, g.key) ? sideOf[g.key] : null;
         if (side && side !== 'canonical') return event && event.open ? 'row-bad' : 'row-warn';
-        if (g.stuck) return 'row-warn';
+        if (g.stuck || g.old_rules) return 'row-warn';
         return g.active ? null : 'row-dim';
       },
     });
@@ -1309,8 +1370,17 @@ footer a:hover { color: var(--pink-hi); }
     renderReorgs(list(snap.recent_reorgs));
   }
 
+  /** The estimated tip height of a group whose only chain is on the old rules (see `group.old_rules_relation`), or null. */
+  function oldRulesTip(group) {
+    const height = obj(group.old_rules_relation).tip_height;
+    return isNum(height) ? height : null;
+  }
+
   function branchCell(group) {
     const branch = group.branch;
+    if (!branch && isNum(group.old_rules) && group.old_rules > 0) {
+      return h('div', {class: 'stack'}, badge('old rules', 'warn'), h('span', {class: 'sub'}, num(group.old_rules) + ' on pre-NU7 rules'));
+    }
     if (!branch) return dash();
     const others = list(group.branches).length - 1;
     const main = branch.key === 'canonical'
@@ -1320,11 +1390,12 @@ footer a:hover { color: var(--pink-hi); }
       h('span', {class: 'sub'}, num(branch.members) + ' on it' + (others > 0 ? ' · ' + others + ' other branch' + (others > 1 ? 'es' : '') : '')));
   }
 
-  function renderSplit(event, split, groups, now) {
+  function renderSplit(event, split, groups, now, oldRules) {
     const box = $('split-callout');
     if (!event && !split) {
       box.replaceChildren(groups.some((g) => g.branch)
-        ? h('div', {class: 'callout is-ok'}, h('div', {class: 'callout-title'}, badge('agreed', 'ok'), 'Every active group is on the best chain (or only lagging behind it).'))
+        ? h('div', {class: 'callout is-ok'}, h('div', {class: 'callout-title'}, badge('agreed', 'ok'), 'Every active group is on the best chain (or only lagging behind it).'),
+          oldRules ? h('div', {class: 'item-detail'}, 'Left out: ' + oldRules + '.') : null)
         : '');
       return;
     }
@@ -1365,11 +1436,19 @@ footer a:hover { color: var(--pink-hi); }
       box.replaceChildren(empty('No active source is stuck on a dead fork.'));
       return;
     }
-    box.replaceChildren(h('div', {class: 'list'}, stuck.slice(0, 50).map((v) => h('div', {class: 'item is-bad'},
-      h('div', {class: 'item-top'}, h('b', {class: 'mono'}, text(v.source)), badge(text(v.group), null), badge(text(v.state), 'bad')),
-      h('div', {class: 'item-detail'}, 'tip ' + num(v.tip_height) + ' · ' + relationText(v.relation)
-        + (isNum(v.behind) && obj(v.relation).kind !== 'behind' ? ' · ' + num(v.behind) + ' behind the best tip' : '')
-        + ' · tip age ' + dur(v.tip_age_s))))));
+    box.replaceChildren(h('div', {class: 'list'}, stuck.slice(0, 50).map((v) => {
+      const tipless = !isNum(v.tip_height);
+      const note = tipless ? tipNote(v) : null;
+      const kind = obj(v.relation).kind;
+      // A tip-less peer has no relation to show; its tip note says why.
+      const relation = tipless && (kind === 'unknown' || note) ? '' : ' · ' + relationText(v.relation);
+      return h('div', {class: 'item is-bad'},
+        h('div', {class: 'item-top'}, h('b', {class: 'mono'}, text(v.source)), badge(text(v.group), null), stateBadge(v.state)),
+        h('div', {class: 'item-detail', title: isNum(v.tip_age_s) ? null : 'tip age unknown: no tip block in the in-memory window'},
+          'tip ' + tipText(v) + (note ? ' · ' + note : '') + relation
+          + (isNum(v.behind) && kind !== 'behind' ? ' · ' + num(v.behind) + ' behind the best tip' : '')
+          + ' · tip age ' + dur(v.tip_age_s)));
+    })));
   }
 
   function renderCollectors(collectors) {
@@ -1452,7 +1531,12 @@ footer a:hover { color: var(--pink-hi); }
       setTile('tile-reorg', isNum(day.reorgs) ? '0' : DASH, isNum(day.reorgs) ? 'no vantage point reorged' : 'no store');
     }
     const reset = sum.last_reset;
-    setTile('tile-resets', num(day.resets), reset ? 'last ' + num(reset.height) + ' by ' + text(reset.miner) + ', ' + ago(reset.time) : 'none in the window');
+    const phase = obj(sum.phase);
+    // The last reset is never newer than the tip, so a different era (or a steady tip phase) means pre-NU7.
+    const preNu7 = reset && typeof reset.era === 'string' && typeof phase.era === 'string' ? reset.era !== phase.era : phase.label === STEADY;
+    setTile('tile-resets', num(day.resets), !reset ? 'none in memory'
+      : preNu7 ? 'last ' + num(reset.height) + ' · ' + ago(reset.time) + ' (pre-NU7)'
+        : 'last ' + num(reset.height) + ' by ' + minerText(reset.miner) + ', ' + ago(reset.time));
   }
 
   function renderSawtooth(data) {
@@ -1581,7 +1665,7 @@ footer a:hover { color: var(--pink-hi); }
         row('Interval', b.dt == null ? DASH : dur(b.dt)),
         row('Difficulty', compact(b.difficulty)),
         row('Since reset', b.k == null ? DASH : num(b.k) + ' blocks'),
-        row('Phase', b.fast === true ? 'fast' : b.fast === false ? 'slow' : 'unknown'),
+        row('Phase', typeof b.label === 'string' ? b.label : b.fast === true ? 'fast' : b.fast === false ? 'slow' : 'unknown'),
         row('Orphans here', num(b.orphans)),
         b.min_diff ? h('div', {class: 'tt-flag'}, 'Min-difficulty reset') : null]);
       tip.hidden = false;
@@ -1611,12 +1695,18 @@ footer a:hover { color: var(--pink-hi); }
     const span = data.averaging_window;
     const recent = isNum(span) ? blocks.slice(-span).map((b) => b.dt).filter(isNum) : [];
     const mean = recent.length ? recent.reduce((a, b) => a + b, 0) / recent.length : null;
+    const steady = Boolean(phase) && phase.label === STEADY;
+    // The governing reset can sit below the plotted range (always, after NU7 without a reset).
+    const earlier = !last && phase && isNum(phase.reset_height) ? phase.reset_height : null;
     $('saw-facts').replaceChildren(
-      fact('Phase', phase ? text(phase.label) : DASH, phase ? 'k = ' + num(phase.k) + ' blocks since reset' : 'no reset in the window'),
-      fact('Difficulty', phase ? compact(phase.difficulty) : DASH, phase ? 'D/D_pre ' + compact(phase.d_ratio) : null),
-      fact('Pre-reset level', phase ? compact(phase.d_pre) : DASH, 'difficulty before the last reset'),
+      fact('Phase', phase ? (steady ? 'no reset since NU7' : text(phase.label)) : DASH,
+        phase ? 'k = ' + num(phase.k) + ' blocks since ' + (steady ? 'the last (pre-NU7) reset' : 'reset') : 'no reset in the window'),
+      fact('Difficulty', phase ? compact(phase.difficulty) : DASH, phase && isNum(phase.d_ratio) ? 'D/D_pre ' + compact(phase.d_ratio) : null),
+      fact('Pre-reset level', phase ? compact(phase.d_pre) : DASH, steady ? 'none: no reset since NU7' : 'difficulty before the last reset'),
       fact('Mean interval', mean == null ? DASH : dur(mean), 'last ' + num(span) + ' blocks; target ' + dur(data.target_spacing)),
-      fact('Last reset', last ? num(last.height) : DASH, last ? text(last.miner) + ', gap ' + dur(last.gap) + ', next ' + dur(last.next_dt) : 'none in range'),
+      fact('Last reset', last ? num(last.height) : earlier != null ? num(earlier) : DASH,
+        last ? minerText(last.miner) + ', gap ' + dur(last.gap) + ', next ' + dur(last.next_dt)
+          : earlier != null ? 'before the plotted range' + (steady ? ' (pre-NU7)' : '') : 'none in range'),
       fact('Resets shown', num(resets.length), 'within the plotted range'));
   }
 
@@ -1624,7 +1714,7 @@ footer a:hover { color: var(--pink-hi); }
     by_k: {title: 'By blocks since reset (k)', label: 'k'},
     by_k_fine: {title: 'Near the reset (k ≤ 30)', label: 'k'},
     by_ratio: {title: 'By difficulty relative to the pre-reset level', label: 'D/D_pre'},
-    by_phase: {title: 'Fast vs slow phase', label: 'phase'},
+    by_phase: {title: 'Fast vs slow phase (steady: no reset since NU7)', label: 'phase'},
   };
 
   function renderOrphans(stats) {
@@ -1632,7 +1722,8 @@ footer a:hover { color: var(--pink-hi); }
     $('phase-title').textContent = view.title;
     const totals = obj(stats.totals);
     $('orphans-note').textContent = num(totals.orphans) + ' orphans in ' + num(totals.blocks) + ' settled blocks (' + pct(totals.rate) + ') · '
-      + num(totals.self) + ' self-orphans, ' + num(totals.race) + ' races, ' + num(totals.unknown) + ' unattributed · heights '
+      + num(totals.self) + ' self-orphans, ' + num(totals.race) + ' races, ' + num(totals.unknown) + ' unattributed'
+      + (totals.no_body ? ', ' + num(totals.no_body) + ' without a served body' : '') + ' · heights '
       + num(stats.from_height) + '–' + num(stats.to_height)
       + (totals.unobserved ? ' · ' + num(totals.unobserved) + ' blocks not watched live left out' : '');
     const rows = list(stats[state.phaseView]);
@@ -1640,7 +1731,7 @@ footer a:hover { color: var(--pink-hi); }
       aria: 'Orphan rate by ' + view.label,
       value: (r) => r.rate,
       axis: (v) => pct(v, v < 0.01 ? 2 : 1),
-      label: (r) => text(r.key),
+      label: (r) => pick(BUCKET_LABEL, r.key, text(r.key)),
       showValues: true,
       valueText: (r) => (isNum(r.rate) ? pct(r.rate, 2) : ''),
       muted: (r) => !r.blocks,
@@ -1723,12 +1814,14 @@ footer a:hover { color: var(--pink-hi); }
         cell: (e) => h('span', {class: 'cluster'}, h('span', {class: 'twisty', 'aria-hidden': 'true'}, '▶'), h('b', null, num(e.height)))},
       {key: 'when', label: 'When', cls: 'nowrap', sort: (e) => obj(e.winner).time, desc: true,
         cell: (e) => h('span', {title: clock(obj(e.winner).time)}, ago(obj(e.winner).time))},
-      {key: 'depth', label: 'Depth', num: true, sort: (e) => e.depth, desc: true, title: 'canonical blocks it took to beat the losing branch',
+      {key: 'depth', label: 'Depth', num: true, sort: (e) => e.depth, desc: true, title: 'longest losing branch, in blocks',
         cell: (e) => (e.depth > 1 ? h('b', {class: 'warn-text'}, num(e.depth)) : num(e.depth))},
       {key: 'kind', label: 'Kind', sort: (e) => e.classification,
-        cell: (e) => h('span', {class: 'cluster'}, badge(text(e.classification), pick(CLASS_TONE, e.classification, null)),
+        cell: (e) => h('span', {class: 'cluster'}, badge(pick(CLASS_LABEL, e.classification, text(e.classification)), pick(CLASS_TONE, e.classification, null)),
           e.same_job ? h('span', {class: 'chip', title: 'same parent, time and miner: one job solved twice'}, 'same job') : null)},
       {key: 'tiebreak', label: 'Decided by', sort: (e) => e.tiebreak,
+        title: 'rule that predicts the winner: more work; greater hash (Zakura, Zebra 6.3); first seen (Zebra 6.4); '
+          + 'work on arrival (the winner already had a child when the loser arrived); unresolved (arrival order unknown)',
         cell: (e) => badge(pick(TIEBREAK_LABEL, e.tiebreak, text(e.tiebreak)), pick(TIEBREAK_TONE, e.tiebreak, null))},
       {key: 'winner', label: 'Winner', sort: (e) => obj(e.winner).miner, cell: (e) => blockCell(e.winner)},
       {key: 'loser', label: 'Loser', cell: (e) => loserCell(e)},
@@ -1768,7 +1861,7 @@ footer a:hover { color: var(--pink-hi); }
     const first = obj(losers[0]);
     const block = obj(first.block);
     return h('div', {class: 'stack'},
-      h('span', {class: 'cell-main'}, text(block.miner), templateChip(block.template),
+      h('span', {class: 'cell-main'}, blockMiner(block), templateChip(block.template),
         first.length > 1 ? chip(first.length + ' blocks') : null,
         e.loser_count > 1 ? h('span', {class: 'muted'}, '+' + (e.loser_count - 1)) : null),
       hashEl(block.hash));
@@ -1785,7 +1878,15 @@ footer a:hover { color: var(--pink-hi); }
   function adoptionSummary(a) {
     if (!a) return 'no store';
     const groups = Object.entries(obj(a.by_group)).sort((x, y) => y[1] - x[1]);
-    return groups.length ? groups.map(([g, n]) => g + ' ' + n).join(', ') : 'no sightings';
+    return groups.length ? groups.map(([g, n]) => g + ' ' + n).join(', ') : 'not adopted by any vantage point';
+  }
+
+  /** When a loser was first seen relative to the winner, from `seen_gap_s` (loser minus winner). */
+  function seenGapText(loser) {
+    const gap = loser.seen_gap_s;
+    if (!isNum(gap)) return loser.seen_first ? ' (before the winner)' : '';
+    const size = Math.abs(gap) < 1 ? Math.round(Math.abs(gap) * 1000) + ' ms' : dur(Math.abs(gap));
+    return ' (' + size + (gap < 0 ? ' before' : ' after') + ' the winner)';
   }
 
   function forkDrawer(e) {
@@ -1806,7 +1907,7 @@ footer a:hover { color: var(--pink-hi); }
       ])),
       field('Winner', kv([
         ['block', hashEl(winner.hash)],
-        ['miner', h('span', {class: 'cluster'}, text(winner.miner), templateChip(winner.template))],
+        ['miner', h('span', {class: 'cluster'}, blockMiner(winner), templateChip(winner.template))],
         ['first seen', clock(winner.first_seen_at)],
         ['probes', probeSummary(winner.probes)],
         ['adopted by', adoptionSummary(winner.adopted_by)],
@@ -1815,11 +1916,11 @@ footer a:hover { color: var(--pink-hi); }
     list(e.losers).forEach((raw, index) => {
       const loser = obj(raw);
       const block = obj(loser.block);
-      fields.push(field('Loser ' + (index + 1) + ' · ' + text(loser.classification), kv([
+      fields.push(field('Loser ' + (index + 1) + ' · ' + pick(CLASS_LABEL, loser.classification, text(loser.classification)), kv([
         ['block', hashEl(block.hash)],
         ['branch', plural(loser.length, 'block') + ', work ' + compact(loser.work)],
-        ['miners', list(loser.miners).slice(0, 8).join(', ') || DASH],
-        ['first seen', clock(block.first_seen_at) + (loser.seen_first ? ' (before the winner)' : '')],
+        ['miners', list(loser.miners).slice(0, 8).map(minerText).join(', ') || DASH],
+        ['first seen', clock(block.first_seen_at) + seenGapText(loser)],
         ['greater hash', yesNo(loser.greater_raw_hash)],
         ['beaten after', plural(loser.winner_len, 'canonical block')],
         ['probes', probeSummary(loser.probes)],
@@ -1830,7 +1931,8 @@ footer a:hover { color: var(--pink-hi); }
     const sources = list(reorgs.sources);
     if (sources.length) {
       fields.push(field('Reorged vantage points (' + num(reorgs.count) + ')', h('div', {class: 'kv'}, sources.map((r) => h('div', {class: 'kv-row'},
-        h('span', {class: 'mono'}, text(r.source)), h('b', null, num(r.disconnected) + ' out, ' + num(r.connected) + ' in · ' + ago(r.at)))))));
+        h('span', {class: 'mono'}, text(r.source)), h('b', null, num(r.disconnected) + ' out, ' + num(r.connected) + ' in · ' + ago(r.at)
+          + (isNum(r.reorgs) && r.reorgs > 1 ? ' · ' + num(r.reorgs) + ' reorgs' : '')))))));
     }
     return h('div', {class: 'drawer-inner'}, fields);
   }
@@ -1839,29 +1941,28 @@ footer a:hover { color: var(--pink-hi); }
     const miners = list(data.miners);
     $('miners-note').textContent = num(data.blocks) + ' canonical, ' + num(data.stale) + ' stale'
       + (data.unobserved ? ' · ' + num(data.unobserved) + ' not watched live left out' : '');
-    const fastRate = (m) => {
-      const f = obj(obj(m.by_phase).fast);
+    const phaseRate = (phase) => (m) => {
+      const f = obj(obj(m.by_phase)[phase]);
       const total = (f.canonical || 0) + (f.stale || 0);
       return total ? f.stale / total : null;
     };
-    const slowRate = (m) => {
-      const f = obj(obj(m.by_phase).slow);
-      const total = (f.canonical || 0) + (f.stale || 0);
-      return total ? f.stale / total : null;
-    };
+    // A phase column shows only when some miner has blocks in it (after NU7 without a reset, only "steady").
+    const phaseColumns = [['fast', 'Fast stale', 'stale rate during fast phases'], ['slow', 'Slow stale', 'stale rate during slow phases'],
+      ['steady', 'Steady stale', 'stale rate after NU7 while no reset has happened since']]
+      .filter(([phase]) => miners.some((m) => phaseRate(phase)(m) != null))
+      .map(([phase, label, title]) => ({key: phase, label, num: true, desc: true, sort: phaseRate(phase), title, cell: (m) => pct(phaseRate(phase)(m))}));
     const columns = [
-      {key: 'miner', label: 'Miner', cls: 'col-name', sort: (m) => m.miner, cell: (m) => h('span', {class: 'cell-main'}, text(m.miner))},
+      {key: 'miner', label: 'Miner', cls: 'col-name', sort: (m) => m.miner, cell: (m) => h('span', {class: 'cell-main'}, minerName(m.miner, m.tag))},
       {key: 'canonical', label: 'Canonical', num: true, desc: true, sort: (m) => m.canonical, cell: (m) => num(m.canonical)},
       {key: 'share', label: 'Share', num: true, desc: true, sort: (m) => m.share, cell: (m) => pct(m.share, 1)},
       {key: 'stale', label: 'Stale', num: true, desc: true, sort: (m) => m.stale, cell: (m) => num(m.stale)},
       {key: 'stale_rate', label: 'Stale rate', num: true, desc: true, sort: (m) => m.stale_rate,
         cell: (m) => (isNum(m.stale_rate) && m.stale_rate >= 0.05 ? h('b', {class: 'warn-text'}, pct(m.stale_rate)) : pct(m.stale_rate))},
-      {key: 'fast', label: 'Fast stale', num: true, desc: true, sort: fastRate, title: 'stale rate during fast phases', cell: (m) => pct(fastRate(m))},
-      {key: 'slow', label: 'Slow stale', num: true, desc: true, sort: slowRate, title: 'stale rate during slow phases', cell: (m) => pct(slowRate(m))},
+      ...phaseColumns,
       {key: 'self', label: 'Self', num: true, desc: true, sort: (m) => m.self_orphans, title: 'orphaned by its own block', cell: (m) => num(m.self_orphans)},
       {key: 'lost', label: 'Lost', num: true, desc: true, sort: (m) => m.races_lost, title: 'races lost to another miner', cell: (m) => num(m.races_lost)},
       {key: 'won', label: 'Won', num: true, desc: true, sort: (m) => m.races_won, title: 'races won against another miner', cell: (m) => num(m.races_won)},
-      {key: 'unattributed', label: 'Unattr.', num: true, desc: true, sort: (m) => m.unattributed_losses, title: 'losses where a miner is unknown', cell: (m) => num(m.unattributed_losses)},
+      {key: 'unattributed', label: 'Unattr.', num: true, desc: true, sort: (m) => m.unattributed_losses, title: 'losses where either miner is unidentified', cell: (m) => num(m.unattributed_losses)},
       {key: 'resets', label: 'Resets', num: true, desc: true, sort: (m) => m.resets, cell: (m) => num(m.resets)},
       {key: 'templates', label: 'Templates', cell: (m) => {
         const entries = Object.entries(obj(m.templates)).filter(([, n]) => n).sort((a, b) => b[1] - a[1]);
@@ -1872,7 +1973,7 @@ footer a:hover { color: var(--pink-hi); }
     const pairs = list(data.pairs).slice(0, 12);
     $('miner-pairs').replaceChildren(pairs.length
       ? h('div', {class: 'chips'}, pairs.map((p) => h('span', {class: 'badge pair ' + pick(TONE_CLASS, pick(CLASS_TONE, p.kind, null), '')},
-        text(p.loser) + ' → ' + text(p.winner) + ' × ' + num(p.n))))
+        minerText(p.loser) + ' → ' + minerText(p.winner) + ' × ' + num(p.n))))
       : empty('No settled orphans in this period.'));
   }
 
@@ -1882,14 +1983,15 @@ footer a:hover { color: var(--pink-hi); }
     const columns = [
       {key: 'height', label: 'Height', sort: (r) => r.height, desc: true, cell: (r) => h('div', {class: 'stack'}, h('b', null, num(r.height)), hashEl(r.hash))},
       {key: 'time', label: 'When', cls: 'nowrap', sort: (r) => r.time, desc: true, cell: (r) => h('span', {title: clock(r.time)}, ago(r.time))},
-      {key: 'miner', label: 'Miner', sort: (r) => r.miner, cell: (r) => h('span', {class: 'cluster'}, text(r.miner), templateChip(r.template))},
+      {key: 'miner', label: 'Miner', sort: (r) => r.miner, cell: (r) => h('span', {class: 'cluster'}, minerName(r.miner), templateChip(r.template))},
       {key: 'gap', label: 'Gap', num: true, sort: (r) => r.gap, title: 'header time minus parent time (451 s = future-dated template)',
         cell: (r) => (isNum(r.gap) && r.gap >= 450 ? h('span', {class: 'warn-text'}, dur(r.gap)) : dur(r.gap))},
       {key: 'next', label: 'Next Δt', num: true, sort: (r) => r.next_dt, title: 'next canonical header time minus this one',
         cell: (r) => (isNum(r.next_dt) && r.next_dt < 0 ? h('span', {class: 'bad-text'}, dur(r.next_dt)) : dur(r.next_dt))},
       {key: 'fwd', label: 'Forward-dated', num: true, sort: (r) => r.forward_dating, title: 'header time minus first seen', cell: (r) => dur(r.forward_dating)},
       {key: 'dpre', label: 'D_pre', num: true, sort: (r) => r.d_pre, cell: (r) => compact(r.d_pre)},
-      {key: 'fast', label: 'Fast blocks', num: true, sort: (r) => r.fast_blocks, cell: (r) => (r.fast_blocks == null ? h('span', {class: 'warn-text'}, 'fast') : num(r.fast_blocks))},
+      {key: 'fast', label: 'Fast blocks', num: true, sort: (r) => r.fast_blocks, title: 'blocks until the fast phase ended; "all" = the cycle never slowed, "fast" = still fast',
+        cell: (r) => (r.never_slowed ? 'all ' + num(r.fast_blocks) : r.fast_blocks == null ? h('span', {class: 'warn-text'}, 'fast') : num(r.fast_blocks))},
       {key: 'cycle', label: 'Cycle', num: true, sort: (r) => r.cycle_blocks, cell: (r) => (r.cycle_blocks == null ? h('span', {class: 'muted'}, 'open') : num(r.cycle_blocks))},
       {key: 'orphans', label: 'Orphans', num: true, desc: true, sort: (r) => r.orphans, cell: (r) => num(r.orphans)},
     ];
@@ -1944,7 +2046,7 @@ footer a:hover { color: var(--pink-hi); }
       'No sampled reprobes in the last 24 hours.');
     const reasons = list(data.by_reason);
     dataTable($('probes-reasons'), 'probe-reasons', [
-      {key: 'reason', label: 'Reason', cell: (r) => text(r.reason)},
+      {key: 'reason', label: 'Reason', cell: (r) => pick(REASON_LABEL, r.reason, text(r.reason))},
       {key: 'probes', label: 'Probes', num: true, cell: (r) => num(r.probes)},
       {key: 'block', label: 'Served', num: true, cell: (r) => num(r.block)},
       {key: 'notfound', label: 'Notfound', num: true, cell: (r) => num(r.notfound)},
@@ -1958,7 +2060,8 @@ footer a:hover { color: var(--pink-hi); }
       {key: 'group', label: 'Group', sort: (r) => r.group, cell: (r) => text(r.group)},
       {key: 'hash', label: 'Block', cell: (r) => hashEl(r.hash)},
       {key: 'height', label: 'Height', num: true, sort: (r) => r.height, cell: (r) => num(r.height)},
-      {key: 'canonical', label: 'Block is', cell: (r) => (r.canonical === true ? badge('canonical', 'ok') : r.canonical === false ? badge('stale', 'bad') : badge('unknown', null))},
+      {key: 'canonical', label: 'Block is', cell: (r) => (r.canonical === true ? badge('canonical', 'ok') : r.canonical === false ? badge('stale', 'bad')
+        : r.height == null ? badge('never received', null) : badge('unknown', null))},
       {key: 'reason', label: 'Reason', cell: (r) => text(r.reason)},
       {key: 'peer_tip', label: 'Peer tip', cell: (r) => hashEl(r.peer_tip_hash)},
     ], incidents, {empty: 'No peer announced a block and then answered notfound for it.'});
@@ -1974,7 +2077,7 @@ footer a:hover { color: var(--pink-hi); }
       {key: 'p50', label: 'p50 delay', num: true, sort: (r) => r.p50_s, cell: (r) => dur(r.p50_s)},
       {key: 'p90', label: 'p90 delay', num: true, sort: (r) => r.p90_s, cell: (r) => dur(r.p90_s)},
       {key: 'max', label: 'Max', num: true, sort: (r) => r.max_s, cell: (r) => dur(r.max_s)},
-      {key: 'coverage', label: 'Coverage', num: true, desc: true, sort: (r) => r.coverage, title: 'mean share of blocks each member announced', cell: (r) => pct(r.coverage, 1)},
+      {key: 'coverage', label: 'Coverage', num: true, desc: true, sort: (r) => r.coverage, title: 'mean share of blocks each member announced to us (inv or RPC tip poll); Zebra and Zakura relay each block to about 1/3 of their peers, so about 33% is the P2P ceiling', cell: (r) => pct(r.coverage, 1)},
     ], list(data.by_group), {empty: 'No inv or RPC tip sightings in this period.'});
     dataTable($('propagation-recent'), 'propagation-recent', [
       {key: 'height', label: 'Height', cell: (r) => h('b', null, num(r.height))},
@@ -1996,15 +2099,16 @@ footer a:hover { color: var(--pink-hi); }
       : 'no external records (importer disabled or nothing imported yet)';
     $('crosscheck-facts').replaceChildren(
       fact('Both', num(totals.both), 'orphans recorded by both'),
-      fact('Only external', num(totals.only_theirs), 'missing here at heights watched live: parent unknown or never relayed'),
+      fact('Only external', num(totals.only_theirs), 'not seen here at all, at heights watched live'),
+      fact('Seen, not fetched', num(totals.seen_unfetched), 'listed by getchaintips here, but no peer served the block'),
       fact('Not watched live', num(totals.unwatched), 'external orphans at heights this monitor only backfilled'),
-      fact('Only ours', num(totals.only_ours), 'missing from the external records'),
-      fact('Flip-flops', num(totals.theirs_canonical), 'external "orphans" that are canonical here'),
-      fact('Out of window', num(totals.out_of_window), 'outside the in-memory heights'));
+      fact('Only ours', num(totals.only_ours), 'not in CipherScan’s list, which logs only the reorgs its one indexer node went through, sometimes without the orphaned block'),
+      fact('Flip-flops', num(totals.theirs_canonical), 'external "orphans" that are canonical here'));
     dataTable($('crosscheck-days'), 'crosscheck-days', [
       {key: 'day', label: 'Day (UTC)', sort: (r) => r.start, desc: true, cell: (r) => text(r.day)},
       {key: 'both', label: 'Both', num: true, cell: (r) => num(r.both)},
       {key: 'theirs', label: 'Only external', num: true, cell: (r) => num(r.only_theirs)},
+      {key: 'unfetched', label: 'Seen, not fetched', num: true, cell: (r) => num(r.seen_unfetched)},
       {key: 'ours', label: 'Only ours', num: true, cell: (r) => num(r.only_ours)},
       {key: 'flip', label: 'Flip-flops', num: true, cell: (r) => num(r.theirs_canonical)},
       {key: 'unwatched', label: 'Not watched', num: true, cell: (r) => num(r.unwatched)},
@@ -2013,12 +2117,11 @@ footer a:hover { color: var(--pink-hi); }
       {key: 'height', label: 'Height', cell: (r) => num(r.height)},
       {key: 'hash', label: 'Block', cell: (r) => hashEl(r.hash)},
       {key: 'source', label: 'Source', cell: (r) => text(r.source)},
-      {key: 'miner', label: 'Miner address', cls: 'wrap', cell: (r) => h('span', {class: 'mono sub'}, text(r.miner_address))},
     ], list(data.only_theirs), {tableClass: 't-compact', empty: 'None.'});
     dataTable($('crosscheck-ours'), 'crosscheck-ours', [
       {key: 'height', label: 'Height', cell: (r) => num(r.height)},
       {key: 'hash', label: 'Block', cell: (r) => hashEl(r.hash)},
-      {key: 'miner', label: 'Miner', cell: (r) => h('span', {class: 'cluster'}, text(r.miner), templateChip(r.template))},
+      {key: 'miner', label: 'Miner', cell: (r) => h('span', {class: 'cluster'}, blockMiner(r), templateChip(r.template))},
       {key: 'seen', label: 'First seen', cell: (r) => clock(r.first_seen_at)},
     ], list(data.only_ours), {tableClass: 't-compact', empty: 'None.'});
   }
@@ -2037,7 +2140,17 @@ footer a:hover { color: var(--pink-hi); }
   }
 
   function isIssue(v) {
-    return ['fork', 'stuck', 'lagging', 'unknown'].includes(v.state) || Boolean(v.last_error);
+    return ['fork', 'stuck', 'lagging', 'old-rules'].includes(v.state) || (v.active === true && Boolean(v.last_error));
+  }
+
+  /** The Last error cell: the current error with its age, else a muted error that a later success superseded. */
+  function errorCell(v) {
+    const age = (at) => (isNum(at) ? ' · ' + ago(at) : '');
+    if (v.last_error) return h('span', {class: 'sub bad-text', title: clock(v.last_error_at)}, v.last_error + age(v.last_error_at));
+    if (v.previous_error) {
+      return h('span', {class: 'sub', title: 'a later contact succeeded · ' + clock(v.previous_error_at)}, 'earlier: ' + v.previous_error + age(v.previous_error_at));
+    }
+    return dash();
   }
 
   function renderPeers(peers) {
@@ -2045,29 +2158,37 @@ footer a:hover { color: var(--pink-hi); }
     const rows = peers.filter((v) => {
       if (state.peerIssues && !isIssue(v)) return false;
       if (!needle) return true;
-      return [v.source, v.group, v.state, v.status, v.user_agent].some((x) => typeof x === 'string' && x.toLowerCase().includes(needle));
+      return [v.source, v.group, v.state, pick(STATE_LABEL, v.state, null), v.status, v.user_agent]
+        .some((x) => typeof x === 'string' && x.toLowerCase().includes(needle));
     });
     const active = peers.filter((v) => v.active).length;
-    $('peers-note').textContent = num(peers.length) + ' sources, ' + num(active) + ' active' + (rows.length !== peers.length ? ' · ' + num(rows.length) + ' match' : '');
+    const stale = peers.filter((v) => v.stale).length;
+    $('peers-note').textContent = num(peers.length) + ' sources, ' + num(active) + ' active'
+      + (stale ? ', ' + num(stale) + ' not seen in 24 h' : '') + (rows.length !== peers.length ? ' · ' + num(rows.length) + ' match' : '');
+    // A source silent for 24 h shows when it was last seen instead of its old tip, lag, relation and RTT.
+    const silent = (cell) => (v) => (v.stale ? dash() : cell(v));
     dataTable($('peers-table'), 'peers', [
       {key: 'source', label: 'Source', cls: 'col-name', sort: (v) => v.source,
         cell: (v) => h('div', {class: 'stack'}, h('span', {class: 'cell-main mono'}, text(v.source), v.fleet ? chip('fleet', true) : null),
           v.user_agent ? h('span', {class: 'sub', title: v.user_agent}, v.user_agent.length > 48 ? v.user_agent.slice(0, 47) + '…' : v.user_agent) : null)},
       {key: 'group', label: 'Group', sort: (v) => v.group, cell: (v) => text(v.group)},
-      {key: 'state', label: 'State', sort: (v) => v.state, cell: (v) => badge(text(v.state), pick(STATE_TONE, v.state, null))},
+      {key: 'state', label: 'State', sort: (v) => v.state, cell: (v) => stateBadge(v.state)},
       {key: 'status', label: 'Status', sort: (v) => v.status, cell: (v) => h('span', {class: 'muted'}, text(v.status))},
-      {key: 'tip', label: 'Tip', num: true, desc: true, sort: (v) => v.tip_height, cell: (v) => h('div', {class: 'stack'}, num(v.tip_height), hashEl(v.tip_hash))},
-      {key: 'behind', label: 'Behind', num: true, desc: true, sort: (v) => v.behind, cell: (v) => num(v.behind)},
-      {key: 'relation', label: 'Relation', sort: (v) => obj(v.relation).kind, cell: (v) => relationText(v.relation)},
-      {key: 'age', label: 'Tip age', num: true, sort: (v) => v.tip_age_s, cell: (v) => dur(v.tip_age_s)},
-      {key: 'rtt', label: 'RTT', num: true, sort: (v) => obj(v.live).rtt_ms, cell: (v) => (isNum(obj(v.live).rtt_ms) ? num(obj(v.live).rtt_ms) + ' ms' : DASH)},
+      {key: 'tip', label: 'Tip', num: true, desc: true, sort: (v) => (isNum(v.tip_height) ? v.tip_height : v.start_height),
+        cell: (v) => (v.stale ? h('span', {class: 'muted', title: 'no contact for over 24 h'}, 'last seen ' + ago(v.last_seen_at))
+          : h('div', {class: 'stack'}, tipText(v), isNum(v.tip_height) ? hashEl(v.tip_hash) : tipNote(v) ? h('span', {class: 'sub'}, tipNote(v)) : null))},
+      {key: 'behind', label: 'Behind', num: true, desc: true, sort: (v) => v.behind, cell: silent((v) => num(v.behind))},
+      {key: 'relation', label: 'Relation', sort: (v) => obj(v.relation).kind, cell: silent((v) => relationText(v.relation))},
+      {key: 'age', label: 'Tip age', num: true, sort: (v) => v.tip_age_s,
+        cell: silent((v) => (isNum(v.tip_age_s) ? dur(v.tip_age_s) : h('span', {title: 'no tip block in the in-memory window'}, DASH)))},
+      {key: 'rtt', label: 'RTT', num: true, sort: (v) => obj(v.live).rtt_ms, cell: silent((v) => (isNum(obj(v.live).rtt_ms) ? num(obj(v.live).rtt_ms) + ' ms' : DASH))},
       {key: 'ok', label: 'Last OK', sort: (v) => v.last_ok_at, desc: true, cell: (v) => ago(v.last_ok_at)},
-      {key: 'error', label: 'Last error', cls: 'wrap', cell: (v) => (v.last_error ? h('span', {class: 'sub', title: clock(v.last_error_at)}, v.last_error) : dash())},
+      {key: 'error', label: 'Last error', cls: 'wrap', cell: errorCell},
     ], rows, {
       tableClass: 't-wide',
       limit: MAX_PEER_ROWS,
       empty: peers.length ? 'No source matches the filter.' : 'No vantage points yet.',
-      rowClass: (v) => (v.state === 'fork' || v.state === 'stuck' ? 'row-bad' : v.state === 'lagging' ? 'row-warn' : v.active ? null : 'row-dim'),
+      rowClass: (v) => (v.state === 'fork' || v.state === 'stuck' ? 'row-bad' : v.state === 'lagging' || v.state === 'old-rules' ? 'row-warn' : v.active ? null : 'row-dim'),
     });
   }
 

@@ -40,15 +40,21 @@ Notes:
   its setup, yet still sends the pong.
 - A poll round ends with its pong, which also yields the RTT; a round
   timeout closes the connection. A peer with no block of our window on its
-  chain is re-polled only every `no_common_repoll`.
+  chain is re-polled only every `no_common_repoll`. A header walk cut off at
+  MAX_CONTINUATIONS names no tip; the next poll continues after its last header.
+- A peer whose headers or body break our consensus rules (`RulesError`, e.g. a
+  pre-NU7 node past activation) is "old-rules", not a failure: its sources row
+  keeps that status and `rules_fork_height` until its headers pass again (the
+  height outlives a reconnect or restart), and it is rechecked every
+  `old_rules_retry`.
 - Sampled availability probes cover every Zebra minor version and use reason
   "reprobe"; "announce" is the probe of an unknown block sent to its
   announcer; "fetch" is any other body fetch. The fallback fetch also runs
   after a timeout or error, not only after `notfound`, and goes to non-Zakura
   peers only after `fetch_grace` (Zebra serves only its best chain, so asking
   it for side-branch blocks just records `notfound`).
-- `probes.impl` holds the bare implementation name; the version is on the
-  peer's `sources` row.
+- `probes.impl` and `probes.impl_version` hold the peer's implementation and
+  version at probe time. A getdata that ends the session is an "error" probe.
 - `request_block()` returns a bool. With no suitable peer it keeps the request
   for up to `fetch_ttl` and tries at most MAX_FETCH_ATTEMPTS different peers.
 - `add_candidates()` takes (ip, port[, user_agent[, via]]) tuples; `sweep()` is
@@ -75,7 +81,16 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .config import split_host_port
-from .consensus import Block, BlockHeader, NetworkParams, ParseError, check_pow, expected_bits, parse_block
+from .consensus import (
+    Block,
+    BlockHeader,
+    NetworkParams,
+    ParseError,
+    check_pow,
+    expected_bits,
+    is_pre_nu7_body,
+    parse_block,
+)
 from .wire import (
     HEADER_LEN,
     MAX_HEADERS,
@@ -152,6 +167,7 @@ MAX_HEIGHT = (1 << 31) - 1
 
 # Candidate states, also written to `sources.status` for handshaked peers.
 IDLE, CONNECTING, CONNECTED, BACKOFF, UNREACHABLE = "idle", "connecting", "connected", "backoff", "unreachable"
+OLD_RULES = "old-rules"
 # Probe reasons and results (the `probes` columns).
 ANNOUNCE, FETCH, REPROBE = "announce", "fetch", "reprobe"
 BLOCK, NOTFOUND, TIMEOUT, ERROR = "block", "notfound", "timeout", "error"
@@ -180,6 +196,7 @@ class Timings:
     max_backoff: float = 3_600.0
     unreachable_after: int = 5
     unreachable_retry: float = 6 * 3_600.0
+    old_rules_retry: float = 1_800.0
     # Peers ping about every 60 s and we poll every 15 s: 3 silent minutes is a dead link.
     idle_timeout: float = 180.0
     # A shorter session counts as a failure (e.g. a duplicate-IP drop right after the handshake).
@@ -197,6 +214,18 @@ class Timings:
 
 class PeerError(Exception):
     """A peer broke the protocol or stopped answering; its connection is closed."""
+
+
+class RulesError(PeerError):
+    """The peer's chain breaks our consensus rules, e.g. a pre-NU7 node past NU7 activation.
+
+    `fork_height` is the height of the last block of that chain our chain holds.
+    """
+
+    def __init__(self, message: str, fork_height: int) -> None:
+        """Describe the rejected header or body and where the peer's chain leaves ours."""
+        super().__init__(message)
+        self.fork_height = fork_height
 
 
 @dataclass(slots=True, eq=False)
@@ -226,6 +255,7 @@ class Candidate:
     tip_height: int | None = None
     tip_at: float | None = None
     tip_note: str | None = None
+    rules_fork_height: int | None = None  # set while the peer is OLD_RULES (see `CandidateBook.finish`)
     last_inv_hash: str | None = None
     last_inv_at: float | None = None
     rtt: float | None = None
@@ -356,16 +386,22 @@ class CandidateBook:
         cand.state = CONNECTED
         cand.handshaked = True
 
-    def finish(self, cand: Candidate, now: float, *, ok: bool, error: str | None) -> float:
+    def finish(
+        self, cand: Candidate, now: float, *, ok: bool, error: str | None, rules_fork_height: int | None = None
+    ) -> float:
         """Record the end of an attempt or session and schedule the next one; return the delay.
 
         `ok` (a stable session) resets the failure count and waits `min_backoff`.
         Otherwise the delay doubles per consecutive failure up to `max_backoff`,
         and after `unreachable_after` failures the peer is retried every
-        `unreachable_retry`.
+        `unreachable_retry`. A `rules_fork_height` (see `RulesError`) is no failure,
+        since the peer answered: it is OLD_RULES and retried every `old_rules_retry`.
         """
         t = self.timings
-        if ok:
+        if rules_fork_height is not None:
+            cand.failures, cand.rules_fork_height = 0, rules_fork_height
+            delay, cand.state = t.old_rules_retry, OLD_RULES
+        elif ok:
             cand.failures = 0
             delay, cand.state = t.min_backoff, BACKOFF
         else:
@@ -458,6 +494,7 @@ class _Peer:
         self.poll_queued = False
         self.current: _Request | None = None
         self.announced: str | None = None  # latest inv hash not yet confirmed by a poll
+        self.resume: str | None = None  # last header of a header walk cut off at MAX_CONTINUATIONS
         self.pings: OrderedDict[int, float] = OrderedDict()  # outstanding ping nonce -> monotonic send time
         self.no_common_until = 0.0  # monotonic; see Timings.no_common_repoll
         self.last_ok_write = 0.0
@@ -894,6 +931,7 @@ class P2PObserver:
         """Connect to `cand`, serve the connection until it ends, then schedule the next attempt."""
         peer: _Peer | None = None
         error: str | None = None
+        fork_height: int | None = None
         shutdown = False
         try:
             peer = await self._open_peer(cand, passive=False)
@@ -908,10 +946,11 @@ class P2PObserver:
             raise
         except Exception as exc:
             error = _describe(exc)
+            fork_height = exc.fork_height if isinstance(exc, RulesError) else None
         finally:
             if self._sessions.get(cand.ip) is asyncio.current_task():
                 del self._sessions[cand.ip]
-            await self._end_session(cand, peer, error, shutdown=shutdown)
+            await self._end_session(cand, peer, error, shutdown=shutdown, rules_fork_height=fork_height)
 
     async def _open_peer(self, cand: Candidate, *, passive: bool) -> _Peer:
         """Open a TCP connection, complete the handshake and write the peer's sources row."""
@@ -941,12 +980,24 @@ class P2PObserver:
             discovered_via=cand.via,
             start_height=cand.start_height,
             last_ok_at=now,
-            status=CONNECTED,
+            # An old-rules verdict stands until the peer's headers pass (`_set_tip`).
+            status=CONNECTED if cand.rules_fork_height is None else OLD_RULES,
         )
         return peer
 
-    async def _end_session(self, cand: Candidate, peer: _Peer | None, error: str | None, *, shutdown: bool) -> None:
-        """Close the connection, release its fetches and record the outcome in the book and sources."""
+    async def _end_session(
+        self,
+        cand: Candidate,
+        peer: _Peer | None,
+        error: str | None,
+        *,
+        shutdown: bool,
+        rules_fork_height: int | None = None,
+    ) -> None:
+        """Close the connection, release its fetches and record the outcome in the book and sources.
+
+        `rules_fork_height` comes from the `RulesError` that ended the session, if any.
+        """
         if peer is not None:
             if self._peers.get(cand.ip) is peer:
                 del self._peers[cand.ip]
@@ -965,11 +1016,13 @@ class P2PObserver:
             cand.state = IDLE
         else:
             self.stats["connect_failed" if peer is None else "sessions_ended"] += 1
-            self.book.finish(cand, now, ok=stable, error=error)
+            self.book.finish(cand, now, ok=stable, error=error, rules_fork_height=rules_fork_height)
         if cand.handshaked:
             fields: dict[str, Any] = {"status": cand.state}
             if error:
                 fields.update(last_error=error, last_error_at=time.time())
+            if rules_fork_height is not None:
+                fields["rules_fork_height"] = rules_fork_height
             self._upsert(cand, **fields)
         log.debug("p2p %s ended (%s): %s", cand.source, cand.state, error)
 
@@ -978,6 +1031,7 @@ class P2PObserver:
         started = time.monotonic()
         peer: _Peer | None = None
         error: str | None = None
+        fork_height: int | None = None
         try:
             peer = await self._open_peer(cand, passive=True)
             reader = asyncio.create_task(peer.read_loop())
@@ -993,14 +1047,18 @@ class P2PObserver:
                 await asyncio.gather(reader, return_exceptions=True)
         except Exception as exc:
             error = _describe(exc)
+            fork_height = exc.fork_height if isinstance(exc, RulesError) else None
         finally:
             if peer is not None:
                 await peer.aclose()
-            self.book.finish(cand, time.monotonic(), ok=peer is not None and error is None, error=error)
+            ok = peer is not None and error is None
+            self.book.finish(cand, time.monotonic(), ok=ok, error=error, rules_fork_height=fork_height)
             if cand.handshaked:
                 fields: dict[str, Any] = {"status": cand.state}
                 if error:
                     fields.update(last_error=error, last_error_at=time.time())
+                if fork_height is not None:
+                    fields["rules_fork_height"] = fork_height
                 self._upsert(cand, **fields)
         view = self._peer_view(cand)
         view["error"] = error
@@ -1040,7 +1098,11 @@ class P2PObserver:
         peer.cand.tip_note = "no headers in reply"
 
     async def _accept_headers(self, peer: _Peer, locator: list[tuple[str, int]], headers: list[BlockHeader]) -> None:
-        """Validate and ingest a non-empty headers reply, fetch continuations, then record the peer's tip."""
+        """Validate and ingest a non-empty headers reply, fetch continuations, then record the peer's tip.
+
+        A walk still getting full batches after MAX_CONTINUATIONS names no tip: the peer is
+        past its last header, which the next poll continues from (`_Peer.resume`).
+        """
         known = dict(locator)
         genesis = self.params.genesis_hash
         tip: tuple[str, int] | None = None
@@ -1061,8 +1123,11 @@ class P2PObserver:
             self._call(self.monitor.ingest_headers, headers, source=peer.source, at=at)
             self._backdate(header.hash for header in headers)
             tip = (headers[-1].hash, base + len(headers))
-            if len(headers) < MAX_HEADERS or round_ == MAX_CONTINUATIONS:
+            if len(headers) < MAX_HEADERS:
                 break
+            if round_ == MAX_CONTINUATIONS:
+                peer.resume, peer.cand.tip_note = tip[0], "header walk truncated"
+                return
             known[tip[0]] = tip[1]
             headers = await peer.getheaders([tip, *locator[: MAX_LOCATOR_HASHES - 1]])
             if not headers:
@@ -1074,27 +1139,35 @@ class P2PObserver:
         """Raise PeerError unless the headers chain from `anchor` (at `height`) and each new one is valid."""
         context = self._ancestry(anchor)
         now = time.time()
-        prev = anchor
+        prev, shared = anchor, height
         for header in headers:
             if header.prev_hash != prev:
                 raise PeerError("headers are not a chain")
             height += 1
             # A header the chain holds was checked (or came from a fleet node) when it was added.
-            if header.hash not in self.monitor.chain:
-                self._check_header(header, height, context, now)
+            if header.hash in self.monitor.chain:
+                shared = height
+            else:
+                self._check_header(header, height, context, now, fork_height=shared)
             context.insert(0, (header.bits, header.time))
             del context[self._context_len :]
             prev = header.hash
 
     def _check_header(
-        self, header: BlockHeader, height: int | None, context: list[tuple[int, int]], now: float
+        self,
+        header: BlockHeader,
+        height: int | None,
+        context: list[tuple[int, int]],
+        now: float,
+        fork_height: int | None = None,
     ) -> None:
         """Raise PeerError unless `header`, at `height` on a parent whose ancestry is `context`, is valid.
 
         Valid means dated at most 2 h ahead, nBits as `expected_bits` predicts, and
         passing `check_pow`. `context` holds (bits, time) of the parent and its
         ancestors, newest first (see `_ancestry`); nBits is checked only when it
-        holds every ancestor the rules at `height` read.
+        holds every ancestor the rules at `height` read. A wrong nBits is a
+        `RulesError` at `fork_height`, by default the parent's height.
         """
         if header.time > now + MAX_FUTURE_BLOCK_TIME:
             raise PeerError(f"header {header.hash} is dated more than 2 h ahead")
@@ -1103,7 +1176,8 @@ class P2PObserver:
             and len(context) >= self.params.difficulty_rules(height).context_len
             and header.bits != expected_bits(self.params, height, header.time, context)
         ):
-            raise PeerError(f"header {header.hash} has the wrong difficulty")
+            fork_height = height - 1 if fork_height is None else fork_height
+            raise RulesError(f"header {header.hash} has the wrong difficulty", fork_height)
         if not check_pow(header, self.params):
             raise PeerError(f"header {header.hash} fails proof of work")
 
@@ -1122,16 +1196,17 @@ class P2PObserver:
 
         That parent makes a peer at the expected block answer with that block's
         header (confirming which block it holds at that height) rather than with nothing.
+        A truncated header walk instead continues from its last header.
         """
         chain = self.monitor.chain
         best = chain.best_tip()
         if best is None:
             return []
-        for expected in (peer.announced, peer.cand.tip_hash):
+        for expected, resume in ((peer.announced, False), (peer.resume, True), (peer.cand.tip_hash, False)):
             node = chain.get(expected) if expected else None
-            parent = _parent(chain, node) if node is not None else None
-            if parent is not None:
-                return build_locator(chain, parent, self.params.genesis_hash)
+            head = node if resume or node is None else _parent(chain, node)
+            if head is not None:
+                return build_locator(chain, head, self.params.genesis_hash)
         height = best.height
         start = peer.cand.start_height
         if start and 0 < start < height:
@@ -1141,21 +1216,31 @@ class P2PObserver:
         return build_locator(chain, head or best, self.params.genesis_hash)
 
     def _set_tip(self, peer: _Peer, tip_hash: str, height: int, at: float) -> None:
-        """Record the peer's confirmed tip; report a change to the monitor and the sources row."""
+        """Record the peer's confirmed tip; report a change to the monitor and the sources row.
+
+        Headers that pass our rules also end an old-rules verdict (e.g. the peer upgraded),
+        including one stored by an earlier process, which the book does not hold.
+        """
         cand = peer.cand
         cand.tip_at, cand.tip_note = at, None
+        peer.resume = None
+        ended = cand.rules_fork_height is not None
+        cand.rules_fork_height = None
+        cleared: dict[str, Any] = {"rules_fork_height": None, **({"status": cand.state} if ended else {})}
         if peer.announced == tip_hash:
             peer.announced = None
         if tip_hash == cand.tip_hash:
-            if at - peer.last_ok_write >= 60.0:
+            if ended or at - peer.last_ok_write >= 60.0:
                 peer.last_ok_write = at
-                self._upsert(cand, last_ok_at=at)
+                self._upsert(cand, last_ok_at=at, **cleared)
             return
         cand.tip_hash, cand.tip_height = tip_hash, height
         peer.last_ok_write = at
         self.stats["tip_changes"] += 1
         self._call(self.monitor.observe_tip, peer.source, tip_hash, at, height_hint=height)
-        self._upsert(cand, tip_hash=tip_hash, tip_height=height, tip_at=at, tip_via="p2p:getheaders", last_ok_at=at)
+        self._upsert(
+            cand, tip_hash=tip_hash, tip_height=height, tip_at=at, tip_via="p2p:getheaders", last_ok_at=at, **cleared
+        )
 
     # -- announcements, probes and fetches ----------------------------------------------
 
@@ -1226,6 +1311,7 @@ class P2PObserver:
     def _check_block(self, block: Block) -> None:
         """Raise PeerError unless a new block's header is valid and the coinbase height matches the chain.
 
+        A coinbase built under the pre-NU7 rules (`is_pre_nu7_body`) is a `RulesError`.
         Nothing binds the other coinbase fields to the header; see `chain.Node.body_trusted`.
         """
         header = block.header
@@ -1238,22 +1324,33 @@ class P2PObserver:
             height = parent.height + 1 if parent is not None else None
             self._check_header(header, height, self._ancestry(header.prev_hash), time.time())
         coinbase = block.coinbase
-        if height is not None and coinbase is not None and coinbase.height != height:
+        if height is None or coinbase is None:
+            return
+        if coinbase.height != height:
             raise PeerError(f"block {header.hash} has coinbase height {coinbase.height}, not {height}")
+        if is_pre_nu7_body(self.params, height, coinbase.payouts, coinbase.branch_id):
+            raise RulesError(f"block {header.hash} has a pre-NU7 coinbase", height - 1)
 
     async def _getdata(self, peer: _Peer, req: _Request) -> None:
-        """Ask the peer for one block, record the probe, ingest the body, or retry the fetch elsewhere."""
+        """Ask the peer for one block, record the probe, ingest the body, or retry the fetch elsewhere.
+
+        A PeerError (the session is ending) is recorded as an "error" probe and re-raised;
+        the session's end releases the fetch.
+        """
         fetch = self._fetches.get(req.hash)
         if req.reason != REPROBE and (fetch is None or self._has_body(req.hash, trusted=peer.cand.fleet)):
             self._fetches.pop(req.hash, None)
             return
         at, started = time.time(), time.monotonic()
+        failure: PeerError | None = None
         try:
             outcome, value = await peer.exchange(
                 req, "getdata", encode_getdata_blocks([req.hash]), ping=False, timeout=self.timings.fetch_timeout
             )
         except TimeoutError:
             outcome, value = TIMEOUT, None
+        except PeerError as exc:
+            outcome, value, failure = ERROR, None, exc
         latency_ms = round((time.monotonic() - started) * 1000)
         self.stats[f"probe_{outcome}"] += 1
         self._call(
@@ -1261,6 +1358,7 @@ class P2PObserver:
             at=at,
             source=peer.source,
             impl=peer.cand.impl,
+            impl_version=peer.cand.impl_version,
             hash=req.hash,
             reason=req.reason,
             result=outcome,
@@ -1268,6 +1366,8 @@ class P2PObserver:
             peer_tip_hash=peer.cand.tip_hash,
             announced_by_same_peer=int(req.announced),
         )
+        if failure is not None:
+            raise failure
         if outcome == BLOCK:
             self._accept_block(peer, value, req.reason)
         elif fetch is not None and req.reason != REPROBE:
@@ -1519,6 +1619,7 @@ class P2PObserver:
             "tip_height": cand.tip_height,
             "tip_at": cand.tip_at,
             "tip_note": cand.tip_note,
+            "rules_fork_height": cand.rules_fork_height,
             "last_inv_hash": cand.last_inv_hash,
             "last_inv_at": cand.last_inv_at,
             "rtt_ms": round(cand.rtt * 1000, 1) if cand.rtt is not None else None,

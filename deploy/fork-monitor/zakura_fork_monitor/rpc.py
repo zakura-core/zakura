@@ -8,9 +8,10 @@ batch items without `"jsonrpc": "2.0"`.
 `RpcCollector` polls one endpoint from the asyncio loop (blocking calls run in
 `asyncio.to_thread`) and feeds the Monitor with tips, chain tips and peer
 candidates. `backfill` loads recent canonical blocks at startup. Monitor
-methods may be plain or async. Sighting kinds: "rpc_tip" (the polled tip),
-"rpc_walk" (ancestors fetched behind it, tip first, then downward),
-"chaintip" and "backfill"; the last two do not time the block's arrival.
+methods may be plain or async. Sighting kinds: "rpc_tip" (the polled tip,
+or the node's active `getchaintips` entry), "rpc_walk" (ancestors fetched
+behind it, tip first, then downward), "chaintip" and "backfill"; the last two
+do not time the block's arrival.
 
 Live quirks handled here:
 - `getblock <hash>` fails for side-chain blocks (-8 at verbosity 0), so unknown
@@ -34,7 +35,10 @@ Notes:
   `BackfillResult` is returned; `name`, `batch_size` and `concurrency` are
   keyword options.
 - Every fetched block must pass `consensus.check_pow` (target and Equihash
-  solution), as over P2P.
+  solution), as over P2P. A block from NU7 on must not carry a pre-NU7
+  coinbase and, when the chain holds its parent with enough ancestors, must
+  carry the nBits `expected_bits` predicts (`_check_rules`), so a fleet node
+  left on pre-NU7 rules is an error rather than a source of stale blocks.
 - Peer candidates are passed as (ip, port, subver, via) tuples; loopback,
   unspecified, multicast and link-local addresses and monitor user agents are
   dropped.
@@ -66,7 +70,7 @@ from typing import Any
 
 from . import __version__
 from .config import RpcEndpoint, split_host_port
-from .consensus import Block, NetworkParams, ParseError, check_pow, parse_block
+from .consensus import Block, NetworkParams, ParseError, check_pow, expected_bits, is_pre_nu7_body, parse_block
 from .wire import classify_user_agent
 
 log = logging.getLogger(__name__)
@@ -314,6 +318,31 @@ def _parse_raw(raw: Any, params: NetworkParams, expected: str | None) -> Block:
     return block
 
 
+def _check_rules(chain: Any, params: NetworkParams, block: Block) -> None:
+    """Raise ValueError if `block` breaks NU7 rules: a pre-NU7 coinbase (`is_pre_nu7_body`) or other nBits.
+
+    nBits must be what `expected_bits` predicts, checked only at an NU7 height when the chain holds
+    the parent and every ancestor the rules read; RPC endpoints are trusted otherwise.
+    """
+    header, coinbase = block.header, block.coinbase
+    if coinbase is not None and is_pre_nu7_body(params, coinbase.height, coinbase.payouts, coinbase.branch_id):
+        raise ValueError(f"block {header.hash} has a pre-NU7 coinbase under NU7 rules")
+    parent = chain.get(header.prev_hash)
+    if parent is None or params.nu7_height is None or parent.height + 1 < params.nu7_height:
+        return
+    height = parent.height + 1
+    needed = params.difficulty_rules(height).context_len
+    context: list[tuple[int, int]] = []
+    node = parent
+    while node is not None and len(context) < needed:
+        context.append((node.bits, node.time))
+        child, node = node, chain.get(node.prev_hash)
+        if node is not None and node.height != child.height - 1:  # ends the walk on inconsistent heights
+            node = None
+    if len(context) == needed and header.bits != expected_bits(params, height, header.time, context):
+        raise ValueError(f"block {header.hash} at {height} has the wrong difficulty under NU7 rules")
+
+
 def _skip_detached(chain: Any, want: str, height: int | None) -> tuple[str, int | None]:
     """Follow `want` down through detached blocks the chain holds; return the first other hash and its child's height.
 
@@ -504,6 +533,7 @@ class RpcCollector:
                 log.debug("%s: tip %s vanished before getblock: %s", self.source, best, err)
                 return False
             raise
+        _check_rules(self.monitor.chain, self.monitor.params, block)
         height = _bip34_height(block)
         await _monitor_call(
             self.monitor.ingest_block, block, block.header, height, source=self.source, kind="rpc_tip", at=at
@@ -540,6 +570,7 @@ class RpcCollector:
                     candidate = _parse_raw(reply, self.monitor.params, None)
                     if candidate.header.hash != want:
                         break
+                    _check_rules(chain, self.monitor.params, candidate)
                     height = height - 1
                     await self._ingest_ancestor(candidate, height, at)
                     want, linked = candidate.header.prev_hash, linked + 1
@@ -553,6 +584,7 @@ class RpcCollector:
                         log.debug("%s: walk-back stopped at %s: %s", self.source, want, err)
                         return added
                     raise
+                _check_rules(chain, self.monitor.params, candidate)
                 height = _bip34_height(candidate) if height is None else height - 1
                 await self._ingest_ancestor(candidate, height, at)
                 want, linked = candidate.header.prev_hash, 1
@@ -599,7 +631,9 @@ class RpcCollector:
             if changed or at - previous[3] >= CHAINTIP_WRITE_INTERVAL:
                 store.upsert_chaintip(self.source, block_hash, height, branchlen, status, at)
                 if previous is None:
-                    store.record_sighting(block_hash, self.source, "chaintip", at)
+                    # The node's own best tip is as timely as the tip poll's sighting of it, which this may precede.
+                    kind = "rpc_tip" if status == "active" else "chaintip"
+                    store.record_sighting(block_hash, self.source, kind, at)
                 previous = (height, branchlen, status, at)
             seen[block_hash] = previous
             if status == "valid-fork" and block_hash not in self.monitor.chain and self._should_request(block_hash, at):
@@ -782,11 +816,20 @@ async def backfill(
         """Fetch and parse one chunk of blocks in a worker thread."""
         return await asyncio.to_thread(_fetch_blocks, client, chunk, params)
 
+    rejected: set[str] = set()
     log.info("backfill: %d heights up to %d, %d already held, fetching %d", len(heights), tip, skipped, len(wanted))
     async with contextlib.aclosing(_ordered(block_chunks, fetch_blocks, concurrency)) as batches:
         async for chunk, results in batches:
             at = time.time()
             for (height, block_hash), result in zip(chunk, results, strict=True):
+                if not isinstance(result, Exception):
+                    try:
+                        if result.header.prev_hash in rejected:
+                            raise ValueError(f"block {block_hash} extends a rejected block")
+                        _check_rules(chain, params, result)
+                    except ValueError as err:
+                        rejected.add(block_hash)
+                        result = err
                 if isinstance(result, Exception):
                     failed += 1
                     log.debug("backfill: %s at %d: %s", block_hash, height, result)

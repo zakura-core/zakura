@@ -9,6 +9,7 @@ import tempfile
 import types
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from zakura_fork_monitor import analysis
 from zakura_fork_monitor.chain import Chain
@@ -77,7 +78,7 @@ class Tree:
             parent = f"{prefix}{index}"
 
 
-def sawtooth_tree() -> Tree:
+def sawtooth_tree(params=TESTNET) -> Tree:
     """A chain with one reset, a fast and a slow phase, and five settled orphans.
 
     g..p5 at B..B+5 (before any reset), reset r at B+6 (451 s gap, miner B),
@@ -85,7 +86,7 @@ def sawtooth_tree() -> Tree:
     The fast phase ends at s8 (B+44). Stale: x1 (B+7, self), x20 (B+26, race),
     l1-l2 (B+31..32, race), y (B+46, slow race) and the unsettled z (B+65).
     """
-    tree = Tree()
+    tree = Tree(params)
     tree.add("g", "pre", dt=0, height=BASE)
     tree.line("p", "g", 1, 5)
     tree.add("r", "p5", dt=451, bits=MIN, miner="B", template="zakura", height=BASE + 6, seen=T0 + 551 - 140.0)
@@ -168,13 +169,14 @@ class OrphanStatsTests(unittest.TestCase):
         stats = self.stats
         self.assertEqual((stats["from_height"], stats["to_height"]), (BASE, BASE + 63))
         self.assertEqual(stats["totals"], {"blocks": 64, "orphans": 5, "rate": round(5 / 64, 6), "forks": 4,
-                                           "self": 1, "race": 4, "unknown": 0, "siblings": 4, "unobserved": 0})
+                                           "self": 1, "race": 4, "unknown": 0, "no_body": 0, "siblings": 4,
+                                           "unobserved": 0})
         assert_json(self, stats)
 
     def test_by_phase(self) -> None:
         """The fast phase ends when the trailing 17-block mean interval reaches 37.5 s (at s8)."""
         rows = rows_by_key(self.stats["by_phase"])
-        self.assertEqual([r["key"] for r in self.stats["by_phase"]], ["fast", "slow", "unknown"])
+        self.assertEqual([r["key"] for r in self.stats["by_phase"]], ["fast", "slow", "steady", "unknown"])
         self.assertEqual((rows["fast"]["blocks"], rows["fast"]["orphans"], rows["fast"]["forks"]), (38, 4, 3))
         self.assertEqual((rows["slow"]["blocks"], rows["slow"]["orphans"], rows["slow"]["forks"]), (20, 1, 1))
         self.assertEqual((rows["unknown"]["blocks"], rows["unknown"]["orphans"]), (6, 0))
@@ -187,7 +189,8 @@ class OrphanStatsTests(unittest.TestCase):
         k = rows_by_key(self.stats["by_k"])
         self.assertEqual({key: (r["blocks"], r["orphans"], r["forks"]) for key, r in k.items()}, {
             "0": (1, 0, 0), "1-17": (17, 1, 1), "18-50": (33, 4, 3), "51-100": (7, 0, 0), "101-200": (0, 0, 0),
-            "201-300": (0, 0, 0), "301-400": (0, 0, 0), ">=401": (0, 0, 0), "unknown": (6, 0, 0)})
+            "201-300": (0, 0, 0), "301-400": (0, 0, 0), ">=401": (0, 0, 0), "no reset since NU7": (0, 0, 0),
+            "unknown": (6, 0, 0)})
         fine = rows_by_key(self.stats["by_k_fine"])
         self.assertEqual({key: (r["blocks"], r["orphans"]) for key, r in fine.items()}, {
             "0": (1, 0), "1": (1, 1), "2": (1, 0), "3-5": (3, 0), "6-10": (5, 0), "11-17": (7, 0), "18-30": (13, 3)})
@@ -252,9 +255,10 @@ class MinerStatsTests(unittest.TestCase):
         self.assertAlmostEqual(a["share"], 63 / 64, places=6)
         self.assertAlmostEqual(a["stale_rate"], 1 / 64, places=6)
         self.assertEqual((b["canonical"], b["stale"], b["races_lost"], b["resets"]), (1, 2, 2, 1))
-        self.assertEqual(b["templates"], {"zakura": 1, "unknown": 2})
+        self.assertEqual(b["templates"], {"zakura": 1, "no body": 2})
         self.assertEqual((c["stale"], c["races_lost"], c["stale_rate"]), (2, 2, 1.0))
         self.assertEqual(a["by_phase"], {"fast": {"canonical": 37, "stale": 1}, "slow": {"canonical": 20, "stale": 0},
+                                         "steady": {"canonical": 0, "stale": 0},
                                          "unknown": {"canonical": 6, "stale": 0}})
         self.assertEqual(stats["pairs"], [
             {"loser": "B", "winner": "A", "kind": "race", "n": 2},
@@ -293,7 +297,7 @@ class SawtoothAndResetTests(unittest.TestCase):
         self.assertEqual(saw["blocks"][0]["dt"], 80)
         by_height = {row["height"]: row for row in saw["blocks"]}
         self.assertEqual(by_height[BASE + 65]["orphans"], 1)
-        self.assertEqual(by_height[BASE + 66]["k"], 60)
+        self.assertEqual((by_height[BASE + 66]["k"], by_height[BASE + 66]["label"]), (60, "slow"))
         self.assertEqual(saw["resets"], [])
         full = analysis.sawtooth(self.tree.chain, n=10**9)
         self.assertEqual(len(full["blocks"]), 67)
@@ -328,6 +332,7 @@ class SawtoothAndResetTests(unittest.TestCase):
         self.assertEqual(reset["forward_dating"], 140.0)
         self.assertAlmostEqual(reset["d_pre"], difficulty_from_bits(NORMAL, TESTNET), places=0)
         self.assertEqual((reset["fast_blocks"], reset["cycle_blocks"], reset["orphans"]), (38, None, 5))
+        self.assertEqual((reset["never_slowed"], reset["era"]), (False, "pre-nu7"))
         self.assertEqual(analysis.resets(self.tree.chain, since=reset["time"] + 1), [])
         self.assertEqual(len(analysis.resets(self.tree.chain, limit=0)), 1)
 
@@ -358,7 +363,7 @@ class ForkEventTests(StoreCase):
         tree = self.tiebreak_tree()
         events = analysis.fork_events(tree.chain)
         assert_json(self, events)
-        self.assertEqual([e["tiebreak"] for e in events], ["unknown", "work", "hash", "unknown", "hash"])
+        self.assertEqual([e["tiebreak"] for e in events], ["unresolved", "work", "hash", "unresolved", "hash"])
         self.assertEqual({e["winner_first_seen"] for e in events}, {None})
         first = events[-1]
         self.assertEqual((first["fork_hash"], first["height"], first["depth"]), (tree.hash("a2"), BASE + 3, 1))
@@ -394,7 +399,7 @@ class ForkEventTests(StoreCase):
         # A backfill fetch of W1 is no arrival time, but it still shows W1 existed before L1's inv.
         self.store.record_sighting(tree.hash("W1"), "rpc:node1", "backfill", 1.0)
         events = analysis.fork_events(tree.chain, self.conn())
-        self.assertEqual([e["tiebreak"] for e in events], ["neither", "work", "hash", "unknown", "both"])
+        self.assertEqual([e["tiebreak"] for e in events], ["neither", "work", "hash", "unresolved", "both"])
         self.assertEqual([e["winner_first_seen"] for e in events], [False, False, None, None, True])
         """Self races, multi-block losers and settledness come through from the chain."""
         tree = sawtooth_tree()
@@ -427,6 +432,14 @@ class ForkEventTests(StoreCase):
                            result="notfound", announced_by_same_peer=1)
         store.record_probe(at=102.5, source="p2p:2.2.2.2:18233", impl="zakura", hash=w1, reason="announce",
                            result="block", latency_ms=40)
+        # A body fetch asks a peer that never announced the block: no availability evidence.
+        store.record_probe(at=103.0, source="p2p:2.2.2.2:18233", impl="zakura", hash=l1, reason="fetch",
+                           result="notfound")
+        # A source that flip-flops is one vantage point that reorged twice.
+        store.record_tip_change(source="p2p:1.1.1.1:18233", at=106.0, old_hash=l1, new_hash=w1c,
+                                fork_hash=tree.hash("a2"), is_reorg=1, disconnected=1, connected=2)
+        store.record_tip_change(source="rpc:node1", at=107.0, old_hash=l1, new_hash=w1c, fork_hash=tree.hash("a2"),
+                                is_reorg=1, disconnected=1, connected=2)
         (event,) = [e for e in analysis.fork_events(tree.chain, self.conn()) if e["winner"]["hash"] == w1]
         assert_json(self, event)
         winner, loser = event["winner"], event["losers"][0]
@@ -439,8 +452,30 @@ class ForkEventTests(StoreCase):
         self.assertEqual(loser["adopted_by"]["by_group"], {"rpc:node1": 1, "zebra 6.4": 1})
         self.assertEqual(loser["adopted_by"]["sources"][0], {"source": "rpc:node1", "group": "rpc:node1", "at": 100.0,
                                                              "via": "tip"})
-        self.assertEqual(event["reorgs"]["count"], 1)
+        self.assertEqual((event["reorgs"]["count"], event["reorgs"]["total"]), (2, 3))
+        self.assertEqual([(s["source"], s["at"], s["reorgs"]) for s in event["reorgs"]["sources"]],
+                         [("rpc:node1", 105.0, 2), ("p2p:1.1.1.1:18233", 106.0, 1)])
         self.assertEqual(event["reorgs"]["sources"][0]["disconnected"], 1)
+        self.assertFalse(winner["body_trusted"])
+
+    def test_late_losers_and_seen_gap(self) -> None:
+        """A loser first seen after the winner's child lost on work at arrival; gaps compare timely sightings."""
+        tree = Tree()
+        tree.add("g", "pre", dt=0, height=BASE)
+        tree.add("a1", "g")
+        tree.add("W", "a1", last_byte=0x10, seen=100.0)
+        tree.add("L", "a1", last_byte=0xF0, seen=130.0, miner="B")
+        tree.add("Wc", "W", seen=120.0)
+        tree.line("t", "Wc", 1, 3)
+        for name, at in (("W", 100.0), ("Wc", 120.0), ("L", 130.0)):
+            self.store.record_sighting(tree.hash(name), "p2p:1.1.1.1:18233", "inv", at)
+        (event,) = analysis.fork_events(tree.chain, self.conn())
+        self.assertEqual((event["tiebreak"], event["losers"][0]["seen_gap_s"]), ("late", 30.0))
+        # Announced before the winner's child, so the tie-break rules still apply (first seen beats hash here).
+        self.store.record_sighting(tree.hash("L"), "p2p:2.2.2.2:18233", "inv", 110.0)
+        (event,) = analysis.fork_events(tree.chain, self.conn())
+        self.assertEqual((event["tiebreak"], event["losers"][0]["seen_gap_s"]), ("first_seen", 10.0))
+        self.assertIsNone(analysis.fork_events(tree.chain)[0]["losers"][0]["seen_gap_s"])
 
 
 class SummaryTests(StoreCase):
@@ -466,7 +501,8 @@ class SummaryTests(StoreCase):
         self.assertEqual((hour["blocks"], hour["orphans"], hour["resets"], hour["forks"], hour["deepest_fork"]),
                          (58, 5, 1, 5, 2))
         self.assertEqual((hour["reorgs"], hour["reorged_sources"], hour["deepest_reorg"]), (1, 1, 2))
-        self.assertEqual((day["blocks"], day["reorgs"], day["reorged_sources"]), (64, 2, 2))
+        # The window starts at T0, so the 24 h reorg counts leave out the reorg before it (now - 7,200).
+        self.assertEqual((day["blocks"], day["reorgs"], day["reorged_sources"]), (64, 1, 1))
         self.assertTrue(day["partial"])
         self.assertAlmostEqual(day["orphan_rate"], 5 / 64, places=6)
         self.assertEqual(summary["deepest_reorg_24h"]["source"], "rpc:node1")
@@ -693,7 +729,7 @@ class LiveSnapshotTests(StoreCase):
         snap = analysis.live_snapshot(self.monitor, self.now)
         assert_json(self, snap)
         self.assertEqual(set(snap), {"generated_at", "network", "tip", "phase", "chain", "peers", "groups",
-                                     "split_candidate", "stuck", "collectors", "recent_reorgs", "recent_forks"})
+                                     "split_candidate", "stuck", "collectors", "recent_reorgs"})
         self.assertEqual(snap["tip"]["hash"], self.tree.hash("c10"))
         self.assertEqual(snap["chain"]["from_height"], BASE)
         self.assertEqual(snap["split_candidate"]["fork_hash"], self.tree.hash("c5"))
@@ -704,7 +740,8 @@ class LiveSnapshotTests(StoreCase):
         self.assertEqual(p2p["connected_by_group"], {"zakura 1.5": 1, "zebra 6.4": 3, "zebra 6.3": 1, "zebra 6.2": 1,
                                                      "zebra 6.0": 1, "zcashd 6.2": 1, "zeeder 0.3": 1})
         self.assertEqual(snap["recent_reorgs"][0]["disconnected"], 2)
-        self.assertEqual(len(snap["recent_forks"]), 3)
+        # rpc:z1 and p2p:10.0.0.2 are one fleet host.
+        self.assertEqual({g["key"]: g for g in snap["groups"]}["zakura 1.5"]["fleet"], 1)
 
     def test_peer_views(self) -> None:
         """Configured endpoints and live-only peers appear; fleet hosts and live data are attached."""
@@ -774,6 +811,9 @@ class PropagationTests(StoreCase):
         self.assertEqual((result["recent"][0]["sources"], result["recent"][0]["max_s"]), (2, 1.0))
         only_z = analysis.propagation(self.conn(), since=250.0, now=400.0)
         self.assertEqual(only_z["blocks"], 1)
+        store.mark_rules_invalid([x])  # e.g. a pre-NU7 block: not part of the network's chain
+        self.assertEqual([r["hash"] for r in analysis.propagation(self.conn(), since=0.0, now=400.0)["recent"]],
+                         [z, y])
 
     def test_backfill_sightings_are_no_reference_time(self) -> None:
         """A block backfilled before it was seen live is timed from its first live sighting."""
@@ -850,6 +890,17 @@ class ProbeStatsTests(StoreCase):
         self.assertEqual((everything["probes"], everything["incident_count"]), (7, 2))
         self.assertIsNone(everything["incidents"][0]["canonical"])
 
+    def test_groups_use_the_version_at_probe_time(self) -> None:
+        """A probe stored with the peer's version then is grouped by it, not by the peer's current version."""
+        store = self.store
+        store.upsert_source("p2p:1.1.1.1:18233", impl="zebra", impl_version="6.4.2")
+        for at, name, version in ((100.0, "a", "6.3.0"), (101.0, "b", None)):
+            store.record_probe(at=at, source="p2p:1.1.1.1:18233", impl="zebra", hash=bhash(name), reason="announce",
+                               result="block", impl_version=version)
+        stats = analysis.probe_stats(self.conn(), since=0.0, now=200.0)
+        self.assertEqual({group["group"]: group["probes"] for group in stats["by_group"]},
+                         {"zebra 6.3": 1, "zebra 6.4": 1})
+
 
 class CrosscheckTests(StoreCase):
     """external_crosscheck against the sawtooth tree."""
@@ -868,16 +919,30 @@ class CrosscheckTests(StoreCase):
         store.upsert_external_orphan(source="other", hash=tree.hash("x1"), height=BASE + 7)
         check = analysis.external_crosscheck(tree.chain, self.conn())
         assert_json(self, check)
-        self.assertEqual(check["totals"], {"both": 2, "only_theirs": 1, "only_ours": 3, "theirs_canonical": 1,
-                                           "out_of_window": 2, "unwatched": 0})
+        self.assertEqual(check["totals"], {"both": 2, "only_theirs": 1, "seen_unfetched": 0, "only_ours": 3,
+                                           "theirs_canonical": 1, "out_of_window": 2, "unwatched": 0})
         self.assertEqual(check["sources"], ["cipherscan", "other"])
-        self.assertEqual(check["by_source"]["other"], {"both": 2, "only_theirs": 0, "theirs_canonical": 0,
-                                                       "unwatched": 0})
+        self.assertEqual(check["by_source"]["other"], {"both": 2, "only_theirs": 0, "seen_unfetched": 0,
+                                                       "theirs_canonical": 0, "unwatched": 0})
         self.assertEqual([(d["day"], d["both"], d["only_theirs"], d["only_ours"], d["theirs_canonical"])
                           for d in check["by_day"]], [("2026-09-21", 2, 1, 3, 1)])
         self.assertEqual(check["only_theirs"][0]["miner_address"], "t2abc")
         self.assertEqual([b["hash"] for b in check["only_ours"]], [tree.hash("y"), tree.hash("l2"), tree.hash("l1")])
         self.assertEqual(analysis.external_crosscheck(tree.chain, None)["totals"]["both"], 0)
+
+    def test_seen_but_never_fetched(self) -> None:
+        """External orphans seen here only as a sighting or a getchaintips tip are not "only theirs"."""
+        tree = sawtooth_tree()
+        store = self.store
+        for name in ("tipped", "sighted", "unseen"):
+            store.upsert_external_orphan(source="cipherscan", hash=bhash(name), height=BASE + 10, time=T0)
+        store.upsert_chaintip("rpc:node1", bhash("tipped"), BASE + 10, 1, "valid-fork", 50.0)
+        store.record_sighting(bhash("sighted"), "rpc:node1", "chaintip", 50.0)
+        check = analysis.external_crosscheck(tree.chain, self.conn())
+        self.assertEqual((check["totals"]["seen_unfetched"], check["totals"]["only_theirs"]), (2, 1))
+        self.assertEqual(check["by_source"]["cipherscan"]["seen_unfetched"], 2)
+        self.assertEqual(check["by_day"][0]["seen_unfetched"], 2)
+        self.assertEqual([row["hash"] for row in check["only_theirs"]], [bhash("unseen")])
 
 
 STARTUP = T0 + 5_000.0
@@ -943,10 +1008,257 @@ class CoverageTests(StoreCase):
         store.upsert_external_orphan(source="cipherscan", hash=self.tree.hash("y3"), height=BASE + 13)
         store.upsert_external_orphan(source="cipherscan", hash=bhash("missed"), height=BASE + 14)
         check = analysis.external_crosscheck(self.tree.chain, self.conn())
-        self.assertEqual(check["totals"], {"both": 1, "only_theirs": 1, "only_ours": 1, "theirs_canonical": 0,
-                                           "out_of_window": 0, "unwatched": 1})
+        self.assertEqual(check["totals"], {"both": 1, "only_theirs": 1, "seen_unfetched": 0, "only_ours": 1,
+                                           "theirs_canonical": 0, "out_of_window": 0, "unwatched": 1})
         self.assertEqual([row["hash"] for row in check["only_theirs"]], [bhash("missed")])
         self.assertEqual(check["by_source"]["cipherscan"]["unwatched"], 1)
+
+
+class NoResetSinceNu7Tests(unittest.TestCase):
+    """Heights from NU7 on that no NU7 reset governs are their own "steady" phase."""
+
+    def test_steady_buckets(self) -> None:
+        """Blocks past NU7 leave the slow phase for "steady" and its own k and ratio buckets."""
+        tree = sawtooth_tree(dataclasses.replace(TESTNET, nu7_height=BASE + 50))
+        stats = analysis.orphan_stats(tree.chain, now=T0 + 3_100)
+        phases = rows_by_key(stats["by_phase"])
+        self.assertEqual({key: row["blocks"] for key, row in phases.items()},
+                         {"fast": 38, "slow": 6, "steady": 14, "unknown": 6})
+        self.assertEqual(rows_by_key(stats["by_k"])["no reset since NU7"]["blocks"], 14)
+        self.assertEqual(rows_by_key(stats["by_ratio"])["no reset since NU7"]["blocks"], 14)
+        head = analysis.summary(tree.chain, None, T0 + 3_100)
+        phase = head["phase"]
+        self.assertEqual(
+            (phase["label"], phase["era"], phase["k"], phase["k_bucket"], phase["ratio_bucket"], phase["d_pre"],
+             phase["fast"]),
+            ("steady", "nu7", 60, "no reset since NU7", "no reset since NU7", None, False),
+        )
+        self.assertEqual((head["last_reset"]["height"], head["last_reset"]["era"]), (BASE + 6, "pre-nu7"))
+        miners = {row["miner"]: row for row in analysis.miner_stats(tree.chain)["miners"]}
+        self.assertEqual(miners["A"]["by_phase"]["steady"], {"canonical": 14, "stale": 0})
+        rows = analysis.sawtooth(tree.chain, n=20)["blocks"]
+        self.assertEqual({row["label"] for row in rows if row["height"] >= BASE + 50}, {"steady"})
+
+    def test_last_reset_beyond_5000_blocks(self) -> None:
+        """The newest reset is reported however far below the tip it is."""
+        tree = Tree()
+        tree.add("g", "pre", dt=0, height=BASE)
+        tree.add("r", "g", dt=451, bits=MIN)
+        tree.line("a", "r", 1, 5_010)
+        self.assertEqual(analysis.summary(tree.chain, None, T0)["last_reset"]["height"], BASE + 1)
+
+
+class AttributionTests(unittest.TestCase):
+    """Losers without a body and untagged shielded coinbases."""
+
+    def test_no_body_and_untagged_shielded(self) -> None:
+        """A body-less loser is "no body", not an unattributed miner; "shielded:notag" attributes nothing."""
+        tree = Tree()
+        tree.add("g", "pre", dt=0, height=BASE)
+        tree.line("a", "g", 1, 2)
+        tree.add("w3", "a2", miner="shielded:notag", template="")
+        tree.add("n3", "a2", miner="shielded:notag", dt=21)
+        tree.add("w4", "w3")
+        tree.add("h4", "w3", miner=None, dt=21)
+        tree.line("t", "w4", 1, 4)
+        stats = analysis.miner_stats(tree.chain)
+        miners = {row["miner"]: row for row in stats["miners"]}
+        body_less = miners["no body"]
+        self.assertEqual(
+            (body_less["stale"], body_less["unattributed_losses"], body_less["stale_rate"], body_less["share"],
+             body_less["templates"]),
+            (1, 0, None, None, {"no body": 1}),
+        )
+        self.assertEqual((miners["A"]["tag"], body_less["tag"]), (None, None))  # header-only blocks have no tag
+        notag = miners["shielded:notag"]
+        self.assertEqual((notag["canonical"], notag["stale"], notag["self_orphans"], notag["unattributed_losses"]),
+                         (1, 1, 0, 1))
+        self.assertEqual((notag["templates"], notag["tag"]), ({"no marker": 1, "no body": 1}, "shielded:notag"))
+        self.assertEqual({(pair["loser"], pair["kind"]) for pair in stats["pairs"]},
+                         {("no body", "no_body"), ("shielded:notag", "unknown")})
+        totals = analysis.orphan_stats(tree.chain, now=T0)["totals"]
+        self.assertEqual((totals["no_body"], totals["unknown"], totals["self"]), (1, 1, 0))
+        events = {event["height"]: event for event in analysis.fork_events(tree.chain)}
+        self.assertEqual((events[BASE + 3]["classification"], events[BASE + 4]["classification"]),
+                         ("unknown", "no_body"))
+        self.assertEqual(events[BASE + 4]["losers"][0]["miners"], ["no body"])
+        # Block dicts carry the full coinbase tag of a parsed body, else None.
+        self.assertEqual((events[BASE + 3]["winner"]["miner_tag"], events[BASE + 4]["losers"][0]["block"]["miner_tag"]),
+                         ("shielded:notag", None))
+
+
+class PeerViewTests(StoreCase):
+    """Peer views and groups from stored sources: old rules, errors, staleness, retired and stored tips."""
+
+    def monitor(self, chain: Chain, config=None, live=()):
+        """Commit the store and return a fake monitor over `chain`."""
+        self.store.commit_if_due(force=True)
+        return types.SimpleNamespace(chain=chain, store=self.store, config=config, params=TESTNET,
+                                     p2p=FakeP2P(list(live)))
+
+    def test_old_rules_peers(self) -> None:
+        """Peers rejected under our rules fork at their rules fork height and never stand for a split side."""
+        now = T0 + 1_000.0
+        tree = split_tree(now)
+        store = self.store
+        old = {"impl": "zebra", "impl_version": "6.4.2", "status": "old-rules", "start_height": BASE + 30}
+        store.upsert_source("p2p:10.0.0.2:18233", impl="zakura", impl_version="1.6.0", tip_hash=tree.hash("c10"),
+                            status="connected", last_ok_at=now, first_seen_at=now - 100)
+        store.upsert_source("p2p:10.0.0.40:18233", **old, rules_fork_height=BASE + 5, tip_hash=tree.hash("c4"),
+                            last_ok_at=now - 3_600,
+                            first_seen_at=now - 7_200, last_error="header has the wrong difficulty",
+                            last_error_at=now - 3_590)
+        store.upsert_source("p2p:10.0.0.41:18233", **old, rules_fork_height=BASE + 5, last_ok_at=now - 80_000,
+                            first_seen_at=now - 80_000)
+        store.upsert_source("p2p:10.0.0.42:18233", **old, tip_hash=tree.hash("d7"), last_ok_at=now - 90_000,
+                            first_seen_at=now - 90_000)
+        snap = analysis.live_snapshot(self.monitor(tree.chain), now)
+        assert_json(self, snap)
+        views = {view["source"]: view for view in snap["peers"]}
+        rejected = views["p2p:10.0.0.40:18233"]
+        self.assertEqual((rejected["state"], rejected["active"], rejected["stuck"], rejected["last_error"]),
+                         ("old-rules", True, False, "header has the wrong difficulty"))
+        self.assertEqual(rejected["relation"], {"kind": "fork", "n": 25, "fork_hash": tree.hash("c5"),
+                                                "fork_height": BASE + 5, "depth_ours": 5, "depth_theirs": 25,
+                                                "tip_height": BASE + 30})
+        # Its stored tip predates the rejection: the version height stands for its chain instead.
+        self.assertEqual((rejected["tip_hash"], rejected["tip_height"], rejected["tip_age_s"], rejected["behind"]),
+                         (None, None, None, -20))
+        self.assertEqual(views["p2p:10.0.0.41:18233"]["state"], "old-rules")  # handshake within OLD_RULES_WINDOW
+        # A reconnect writes "connected" before its walk meets the rejected header; the stored height decides.
+        store.upsert_source("p2p:10.0.0.40:18233", status="connected")
+        again = {v["source"]: v for v in analysis.peers(self.monitor(tree.chain), now)}["p2p:10.0.0.40:18233"]
+        self.assertEqual((again["state"], again["stuck"], again["relation"]),
+                         ("old-rules", False, rejected["relation"]))
+        gone = views["p2p:10.0.0.42:18233"]  # no rules fork height: where its tip forks off
+        self.assertEqual((gone["state"], gone["stale"], gone["relation"]["fork_height"]), ("inactive", True, BASE + 5))
+        zebra = {group["key"]: group for group in snap["groups"]}["zebra 6.4"]
+        self.assertEqual((zebra["members"], zebra["old_rules"], zebra["stale"], zebra["states"]["old-rules"]),
+                         (2, 2, 1, 2))
+        self.assertIsNone(zebra["branch"])
+        self.assertEqual(zebra["old_rules_relation"], rejected["relation"])  # the highest of its old-rules members
+        self.assertIsNone(snap["split_candidate"])
+
+    def test_errors_ages_and_notes(self) -> None:
+        """Errors older than a success or the live connection are previous; ages and tip notes come through."""
+        now = T0 + 1_000.0
+        tree = split_tree(now)
+        store = self.store
+        store.upsert_source("rpc:z1", kind="rpc", impl="zakura", impl_version="1.6.0", tip_hash=tree.hash("c10"),
+                            status="ok", last_ok_at=now, last_error="tip: Connection refused", last_error_at=now - 500)
+        store.upsert_source("p2p:10.0.0.3:18233", impl="zebra", impl_version="7.0.0", tip_hash=tree.hash("c10"),
+                            status="connected", last_ok_at=now - 2_000, last_error="too many block announcements",
+                            last_error_at=now - 1_000)
+        config = parse_config({"rpc": [{"name": "z1", "url": "http://10.0.0.2:18232/", "fleet": True}]})
+        live = [{"source": "p2p:10.0.0.3:18233", "connected": True, "connected_at": now - 900,
+                 "tip_note": "no common block in window"}]
+        views = {v["source"]: v for v in analysis.peers(self.monitor(tree.chain, config, live), now)}
+        rpc, peer = views["rpc:z1"], views["p2p:10.0.0.3:18233"]
+        self.assertEqual((rpc["last_error"], rpc["previous_error"], rpc["previous_error_at"]),
+                         (None, "tip: Connection refused", now - 500))
+        self.assertEqual((peer["last_error"], peer["previous_error"]), (None, "too many block announcements"))
+        self.assertEqual(peer["tip_note"], "no common block in window")
+        # A tip watched live ages from its first sighting, as the header's tip does.
+        self.assertEqual(peer["tip_age_s"], now - (tree.node("c10").time + 1))
+        (row,) = analysis.summary(tree.chain, self.conn(), now, config=config)["sources"]["rpc"]
+        self.assertEqual((row["last_error"], row["previous_error"]), (None, "tip: Connection refused"))
+
+    def test_stale_and_retired_sources(self) -> None:
+        """Retired endpoints and fleet peers disappear; silent sources only count as stale; fleet counts hosts."""
+        now = T0 + 300_000.0
+        tree = split_tree(now)
+        store = self.store
+        config = parse_config({"rpc": [{"name": "z1", "url": "http://10.0.0.2:18232/", "fleet": True}]})
+        zakura = {"impl": "zakura", "impl_version": "1.6.0"}
+        old = {"last_ok_at": now - 200_000, "first_seen_at": now - 250_000}
+        store.upsert_source("rpc:z1", kind="rpc", **zakura, tip_hash=tree.hash("c10"), status="ok", last_ok_at=now)
+        store.upsert_source("rpc:gone", kind="rpc", **zakura, status="error", **old)
+        store.upsert_source("p2p:10.0.0.2:18233", **zakura, discovered_via="fleet", tip_hash=tree.hash("c10"),
+                            status="connected", last_ok_at=now)
+        store.upsert_source("p2p:10.0.0.9:18233", **zakura, discovered_via="fleet", status="backoff", **old)
+        store.upsert_source("p2p:10.0.0.5:18233", **zakura, tip_hash=tree.hash("c4"), status="unreachable",
+                            last_ok_at=now - 100_000, first_seen_at=now - 200_000)
+        monitor = self.monitor(tree.chain, config)
+        views = {v["source"]: v for v in analysis.peers(monitor, now)}
+        self.assertEqual(set(views), {"rpc:z1", "p2p:10.0.0.2:18233", "p2p:10.0.0.5:18233"})
+        silent = views["p2p:10.0.0.5:18233"]
+        self.assertEqual((silent["stale"], silent["state"], silent["last_seen_age_s"]), (True, "inactive", 100_000.0))
+        self.assertEqual((views["rpc:z1"]["host"], views["p2p:10.0.0.2:18233"]["host"]), ("10.0.0.2", "10.0.0.2"))
+        group = {g["key"]: g for g in analysis.live_snapshot(monitor, now)["groups"]}["zakura 1.6"]
+        self.assertEqual((group["members"], group["seen_24h"], group["stale"], group["active"], group["fleet"]),
+                         (2, 2, 1, 2, 1))
+        self.assertEqual(sum(group["states"].values()), 2)
+        sources = analysis.summary(tree.chain, self.conn(), now, config=config)["sources"]
+        self.assertEqual(([row["source"] for row in sources["rpc"]], sources["p2p"]["total"]), (["rpc:z1"], 2))
+        self.assertEqual(len(analysis.summary(tree.chain, self.conn(), now)["sources"]["rpc"]), 2)
+        # A fleet configured by hostname cannot be matched to IP-keyed P2P rows, so none are hidden.
+        named = parse_config({"rpc": [{"name": "z1", "url": "http://node1.example.org:18232/", "fleet": True}]})
+        views = {v["source"] for v in analysis.peers(self.monitor(tree.chain, named), now)}
+        self.assertIn("p2p:10.0.0.9:18233", views)
+
+    def test_missing_parents_near_the_tip_only(self) -> None:
+        """Only missing parents the body sweep still requests are reported."""
+        tree = Tree()
+        tree.add("g", "pre", dt=0, height=BASE)
+        tree.line("c", "g", 1, 20)
+        tree.chain.add(header(bhash("near"), bhash("near-parent"), T0 + 500, NORMAL), BASE + 19)
+        tree.chain.add(header(bhash("deep"), bhash("deep-parent"), T0 + 100, NORMAL), BASE + 5)
+        with mock.patch.object(analysis, "MISSING_PARENT_DEPTH", 10):
+            snap = analysis.live_snapshot(self.monitor(tree.chain), T0 + 1_000)
+        self.assertEqual((len(tree.chain.missing_parents()), snap["chain"]["missing_parents"]), (2, 1))
+
+    def test_stored_tips_outside_the_chain_are_placed(self) -> None:
+        """Tips below the window or left out of the chain are related through their stored ancestors."""
+        now = T0 + 10_000.0
+        store = self.store
+
+        def put(name: str, parent: str, height: int, at: int) -> None:
+            """Store a header-only block first seen 1 s after its header time."""
+            store.upsert_block(None, header(bhash(name), bhash(parent), at, NORMAL), height, miner=None,
+                               is_min_diff=False, seen_at=at + 1.0, seen_source="test")
+
+        for index in range(31):
+            put(f"c{index}", f"c{index - 1}" if index else "pre", BASE + index, T0 + 75 * index)
+        for index in (6, 7, 8):
+            put(f"d{index}", f"d{index - 1}" if index > 6 else "c5", BASE + index, T0 + 75 * index + 10)
+        put("x3", "xp", BASE + 3, T0 + 240)  # its parent is not stored
+        store.commit_if_due(force=True)
+        chain = Chain.from_store(TESTNET, store, min_height=BASE + 20)
+        put("z23", "c22", BASE + 23, T0 + 75 * 23 + 10)  # stored, but not in the chain
+        put("z24", "z23", BASE + 24, T0 + 75 * 24 + 10)
+        tips = {"10.0.0.50": "d8", "10.0.0.51": "c10", "10.0.0.52": "x3", "10.0.0.53": "z24"}
+        for ip, name in tips.items():
+            store.upsert_source(f"p2p:{ip}:18233", impl="zebra", impl_version="6.4.2", tip_hash=bhash(name),
+                                tip_height=1, status="connected", last_ok_at=now)
+        for ip, start in (("10.0.0.54", BASE + 4), ("10.0.0.55", BASE + 25)):  # no tip learned
+            store.upsert_source(f"p2p:{ip}:18233", impl="zebra", impl_version="6.4.2", start_height=start,
+                                status="connected", last_ok_at=now)
+
+        def relations(at: float) -> dict:
+            """Return {tip name: peer view} at time `at`."""
+            views = {v["source"]: v for v in analysis.peers(self.monitor(chain), at)}
+            return {name: views[f"p2p:{ip}:18233"] for ip, name in tips.items()}
+
+        views = relations(now)
+        dead = views["d8"]
+        self.assertEqual(dead["relation"], {"kind": "fork", "n": 3, "fork_hash": bhash("c5"), "fork_height": BASE + 5,
+                                            "depth_ours": 25, "depth_theirs": 3, "tip_height": BASE + 8})
+        self.assertEqual((dead["tip_height"], dead["state"], dead["tip_age_s"]),
+                         (BASE + 8, "stuck", now - (T0 + 75 * 8 + 11)))
+        behind = views["c10"]["relation"]
+        self.assertEqual((behind["kind"], behind["n"], behind["fork_height"]), ("behind", 20, BASE + 10))
+        self.assertEqual(views["x3"]["relation"]["kind"], "below_window")
+        tipless = {v["source"]: v["relation"] for v in analysis.peers(self.monitor(chain), now)}
+        # Without a tip, a version height below the window places the peer there; one inside it says nothing.
+        self.assertEqual((tipless["p2p:10.0.0.54:18233"]["kind"], tipless["p2p:10.0.0.54:18233"]["tip_height"]),
+                         ("below_window", BASE + 4))
+        self.assertEqual(tipless["p2p:10.0.0.55:18233"]["kind"], "unknown")
+        side = views["z24"]["relation"]
+        self.assertEqual((side["kind"], side["fork_height"], side["n"], side["depth_ours"]), ("fork", BASE + 22, 2, 8))
+        put("xp", "c1", BASE + 2, T0 + 160)
+        self.assertEqual(relations(now + 1)["x3"]["relation"]["kind"], "below_window")  # cached
+        placed = relations(now + analysis.PLACE_RETRY + 1)["x3"]["relation"]
+        self.assertEqual((placed["kind"], placed["fork_height"], placed["n"]), ("fork", BASE + 1, 2))
 
 
 if __name__ == "__main__":

@@ -131,7 +131,7 @@ def cmd_report(config: Config, forks: int) -> int:
         chain = load_chain(
             store, NETWORKS[config.network], window=config.chain.memory_window, settle_depth=config.chain.settle_depth
         )
-        sys.stdout.write(analysis.text_report(chain, store.reader(), forks=forks))
+        sys.stdout.write(analysis.text_report(chain, store.reader(), forks=forks, config=config))
     return 0
 
 
@@ -153,17 +153,20 @@ def _probe_text(results: Sequence[dict[str, Any]], snap: dict[str, Any]) -> str:
     tip = snap.get("tip") or {}
     answered = sum(1 for r in results if r.get("error") is None)
     lines = [f"best tip {tip.get('height')} {tip.get('hash')}; {answered} of {len(results)} peers answered", ""]
-    lines.append(f"{'group':<16} {'active':>6} {'synced':>6} {'lag':>4} {'fork':>4} {'stuck':>5} {'unk':>4}  branch")
+    lines.append(
+        f"{'group':<16} {'active':>6} {'synced':>6} {'lag':>4} {'fork':>4} {'stuck':>5} {'old':>4} {'unk':>4}  branch"
+    )
     for group in snap.get("groups", ()):
         states = group["states"]
         branch = group.get("branch")
+        old_rules = group.get("old_rules_relation")
         if not branch:
-            where = "-"
+            where = f"old-rules@{old_rules.get('fork_height')}" if old_rules else "-"
         else:
             where = "canonical" if branch["key"] == "canonical" else f"fork@{branch['fork_height']}"
         lines.append(
             f"{_clip(group['key'], 16):<16} {group['active']:>6} {states['synced']:>6} {states['lagging']:>4} "
-            f"{states['fork']:>4} {states['stuck']:>5} {states['unknown']:>4}  {where}"
+            f"{states['fork']:>4} {states['stuck']:>5} {states.get('old-rules', 0):>4} {states['unknown']:>4}  {where}"
         )
     lines += ["", f"{'peer':<28} {'impl':<18} {'tip':>9} {'relation':<10} note"]
     order = sorted(results, key=lambda r: (r.get("error") is not None, r.get("impl") or "", r.get("source") or ""))

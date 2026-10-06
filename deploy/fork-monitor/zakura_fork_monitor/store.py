@@ -34,7 +34,7 @@ from collections.abc import Iterable, Iterator, Mapping
 from pathlib import Path
 from typing import Any, Callable
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 # Batch commits: bounded staleness for web readers without one fsync per sighting.
 DEFAULT_COMMIT_INTERVAL = 1.0
 # Bounds the WAL growth and lost work of a single open batch during backfill.
@@ -69,7 +69,8 @@ CREATE TABLE IF NOT EXISTS blocks (
   body INTEGER NOT NULL DEFAULT 0,
   first_seen_at REAL, first_seen_source TEXT,
   created_at REAL NOT NULL,
-  body_trusted INTEGER NOT NULL DEFAULT 1);
+  body_trusted INTEGER NOT NULL DEFAULT 1,
+  rules_invalid INTEGER NOT NULL DEFAULT 0);
 CREATE INDEX IF NOT EXISTS blocks_height ON blocks(height);
 CREATE INDEX IF NOT EXISTS blocks_prev ON blocks(prev_hash);
 CREATE TABLE IF NOT EXISTS sightings (
@@ -82,7 +83,8 @@ CREATE TABLE IF NOT EXISTS sources (
   impl TEXT, impl_version TEXT, user_agent TEXT, protocol_version INTEGER, services INTEGER,
   discovered_via TEXT, first_seen_at REAL, last_ok_at REAL, last_error TEXT, last_error_at REAL,
   start_height INTEGER, tip_hash TEXT, tip_height INTEGER, tip_at REAL, tip_via TEXT,
-  status TEXT);
+  status TEXT,
+  rules_fork_height INTEGER);
 CREATE TABLE IF NOT EXISTS tip_changes (
   id INTEGER PRIMARY KEY, source TEXT NOT NULL, at REAL NOT NULL,
   old_hash TEXT, old_height INTEGER, new_hash TEXT NOT NULL, new_height INTEGER,
@@ -100,7 +102,8 @@ CREATE TABLE IF NOT EXISTS probes (
   id INTEGER PRIMARY KEY, at REAL NOT NULL, source TEXT NOT NULL, impl TEXT, hash TEXT NOT NULL,
   reason TEXT NOT NULL,
   result TEXT NOT NULL,
-  latency_ms INTEGER, peer_tip_hash TEXT, announced_by_same_peer INTEGER NOT NULL DEFAULT 0);
+  latency_ms INTEGER, peer_tip_hash TEXT, announced_by_same_peer INTEGER NOT NULL DEFAULT 0,
+  impl_version TEXT);
 CREATE INDEX IF NOT EXISTS probes_at ON probes(at);
 CREATE INDEX IF NOT EXISTS probes_hash ON probes(hash);
 CREATE TABLE IF NOT EXISTS split_events (
@@ -121,6 +124,16 @@ _MIGRATIONS = {
     1: ("ALTER TABLE blocks ADD COLUMN body_trusted INTEGER NOT NULL DEFAULT 1",),
     # Rewinds to an ancestor were recorded as reorgs; see `Chain.classify_tip_change`.
     2: ("UPDATE tip_changes SET is_reorg = 0 WHERE is_reorg = 1 AND connected = 0",),
+    # Version 4: blocks that break NU7 rules, a peer's fork point under them, the peer version at probe
+    # time. The first deployment took first-seen times from backfill fetches (see UNTIMED_KINDS).
+    3: (
+        "ALTER TABLE blocks ADD COLUMN rules_invalid INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE sources ADD COLUMN rules_fork_height INTEGER",
+        "ALTER TABLE probes ADD COLUMN impl_version TEXT",
+        "UPDATE blocks SET first_seen_at = NULL, first_seen_source = NULL WHERE first_seen_at IS NOT NULL "
+        "AND EXISTS (SELECT 1 FROM sightings s WHERE s.hash = blocks.hash AND s.source = blocks.first_seen_source "
+        "AND s.kind = 'backfill' AND s.at = blocks.first_seen_at)",
+    ),
 }
 
 # Row-value IN keeps each prune DELETE bounded, including on the WITHOUT ROWID table.
@@ -130,6 +143,9 @@ _PRUNE_DELETES = (
     ("tip_changes", "id IN (SELECT id FROM tip_changes WHERE at < ? LIMIT ?)"),
     # The RPC collector rewrites every tip it still lists at least every `rpc.CHAINTIP_WRITE_INTERVAL`.
     ("chaintips", "(source, hash) IN (SELECT source, hash FROM chaintips WHERE last_at < ? LIMIT ?)"),
+    # P2P peers not heard from since `before`; a live session refreshes `last_ok_at` on every tip poll.
+    ("sources", "source IN (SELECT source FROM sources WHERE kind = 'p2p' AND MAX(COALESCE(last_ok_at, 0), "
+                "COALESCE(last_error_at, 0), COALESCE(first_seen_at, 0)) < ? LIMIT ?)"),
 )
 
 
@@ -206,6 +222,7 @@ _SOURCE_COLUMNS: dict[str, Coerce] = {
     "tip_at": _real,
     "tip_via": _text,
     "status": _text,
+    "rules_fork_height": _int,
 }
 _TIP_CHANGE_COLUMNS: dict[str, Coerce] = {
     "source": _text,
@@ -232,6 +249,7 @@ _PROBE_COLUMNS: dict[str, Coerce] = {
     "latency_ms": _int,
     "peer_tip_hash": _hash,
     "announced_by_same_peer": _int,
+    "impl_version": _text,
 }
 _SPLIT_COLUMNS: dict[str, Coerce] = {
     "started_at": _real,
@@ -724,22 +742,45 @@ class Store:
     def load_blocks(self, min_height: int | None = None) -> Iterable[sqlite3.Row]:
         """Stream block rows for Chain bootstrap, ordered by height (unknown heights last).
 
-        Rows with an unknown height are always included since they may attach later.
+        Rows with an unknown height are always included since they may attach later; rows
+        flagged by `mark_rules_invalid` never are.
         """
         low = INT64_MIN if min_height is None else operator.index(min_height)
         # Two index-ordered queries stream without sorting the whole table.
-        known = self._conn.execute("SELECT * FROM blocks WHERE height >= ? ORDER BY height", (low,))
-        unknown = self._conn.execute("SELECT * FROM blocks WHERE height IS NULL")
+        known = self._conn.execute(
+            "SELECT * FROM blocks WHERE height >= ? AND rules_invalid = 0 ORDER BY height", (low,)
+        )
+        unknown = self._conn.execute("SELECT * FROM blocks WHERE height IS NULL AND rules_invalid = 0")
         return itertools.chain(known, unknown)
+
+    def mark_rules_invalid(self, hashes: Iterable[str]) -> int:
+        """Flag blocks that break the network's consensus rules (kept, but never loaded); return how many were new."""
+        cursor = self._conn.executemany(
+            "UPDATE blocks SET rules_invalid = 1 WHERE hash = ? AND rules_invalid = 0",
+            [(_required(_hash(block_hash), "hash"),) for block_hash in hashes],
+        )
+        self._wrote()
+        return max(cursor.rowcount, 0)
+
+    def set_miners(self, labels: Mapping[str, str]) -> int:
+        """Replace stored miner labels (block hash -> label) after the labelling rules changed; return rows changed."""
+        cursor = self._conn.executemany(
+            "UPDATE blocks SET miner = ? WHERE hash = ?",
+            [(_text(label), _required(_hash(block_hash), "hash")) for block_hash, label in labels.items()],
+        )
+        self._wrote()
+        return max(cursor.rowcount, 0)
 
     def known_hashes(self) -> set[str]:
         """Return the hash of every stored block."""
         return {row[0] for row in self._conn.execute("SELECT hash FROM blocks")}
 
     def prune(self, before: float, *, batch: int = PRUNE_BATCH) -> dict[str, int]:
-        """Delete sightings, probes, tip changes and chaintips older than `before`; return rows deleted per table.
+        """Delete observation rows and P2P sources older than `before`; return rows deleted per table.
 
-        Blocks are kept. Runs `prune_batches` to completion.
+        Sightings, probes, tip changes and chaintips go by time; P2P sources once neither
+        `last_ok_at` nor `last_error_at` is newer. Blocks, RPC and external sources are kept.
+        Runs `prune_batches` to completion.
         """
         deleted = {table: 0 for table, _ in _PRUNE_DELETES}
         for table, count in self.prune_batches(before, batch=batch):

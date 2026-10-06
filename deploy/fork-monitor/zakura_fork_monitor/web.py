@@ -29,7 +29,9 @@ optionally `p2p`, `config` and `rpc_status()` as `analysis.live_snapshot` uses.
 
 Notes:
 - `/api/snapshot` leaves out the per-source `peers` list (served by
-  `/api/peers`) unless `?full=1`, and adds `peer_count` and `served_at`.
+  `/api/peers`) unless `?full=1`, and adds `peer_count`, `served_at` and
+  `old_rules` = {"peers": peers in state "old-rules", "fork_height": the
+  lowest fork height among them | None}.
 - List results are wrapped in objects: `/api/forks` -> `{"forks": [...]}`,
   `/api/resets` -> `{"resets": [...]}`, `/api/peers` -> `{"generated_at", "peers"}`.
 - `since` also takes relative (negative) values; `/api/resets` accepts `since`.
@@ -81,6 +83,8 @@ MAX_TIMESTAMP = 4_102_444_800.0  # 2100-01-01
 DEFAULT_FORKS = 50
 DEFAULT_RESETS = 100
 DEFAULT_SAWTOOTH = 1_500
+# Peer view state of a peer whose headers or blocks fail our consensus rules (e.g. pre-NU7 nodes).
+OLD_RULES_STATE = "old-rules"
 
 JSON_TYPE = "application/json; charset=utf-8"
 HTML_TYPE = "text/html; charset=utf-8"
@@ -389,17 +393,34 @@ def _api_snapshot(app: WebApp, params: dict[str, Any]) -> dict[str, Any]:
         raise HttpError(503, "starting", "the monitor has not published a snapshot yet")
     out = dict(snap)
     peers = out.get("peers")
-    out["peer_count"] = len(peers) if isinstance(peers, list) else 0
+    peers = peers if isinstance(peers, list) else []
+    out["peer_count"] = len(peers)
+    out["old_rules"] = _old_rules(peers)
     if not params["full"]:
         out.pop("peers", None)
     out["served_at"] = app.clock()
     return out
 
 
+def _old_rules(peers: list[Any]) -> dict[str, Any]:
+    """Count peer views in state "old-rules" and return the lowest fork height their relations give."""
+    count, heights = 0, []
+    for view in peers:
+        if not isinstance(view, Mapping) or view.get("state") != OLD_RULES_STATE:
+            continue
+        count += 1
+        relation = view.get("relation")
+        height = relation.get("fork_height") if isinstance(relation, Mapping) else None
+        if isinstance(height, int) and not isinstance(height, bool):
+            heights.append(height)
+    return {"peers": count, "fork_height": min(heights, default=None)}
+
+
 def _api_summary(app: WebApp, params: dict[str, Any]) -> Any:
     """`analysis.summary` (loop)."""
     now = app.clock()
-    return app.on_loop(lambda: analysis.summary(app.chain(), app.conn(), now))
+    config = getattr(app.monitor, "config", None)
+    return app.on_loop(lambda: analysis.summary(app.chain(), app.conn(), now, config=config))
 
 
 def _api_forks(app: WebApp, params: dict[str, Any]) -> dict[str, Any]:

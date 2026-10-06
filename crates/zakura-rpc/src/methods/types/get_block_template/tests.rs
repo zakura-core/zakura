@@ -424,12 +424,12 @@ fn shielded_coinbase_paths() -> anyhow::Result<()> {
     let pre_nu6_2_tx = coinbase_transaction(&net, nu5_height, &unified_params)?;
     assert_coinbase_resource_usage(&net, nu5_height, &unified_params, &pre_nu6_2_tx)?;
     assert!(
-        pre_nu6_2_tx.orchard_shielded_data().is_some(),
-        "an NU5 unified address should prefer its Orchard receiver"
+        pre_nu6_2_tx.sapling_outputs().next().is_some(),
+        "an NU5 unified address should fall back to its Sapling receiver"
     );
     assert!(
-        pre_nu6_2_tx.sapling_outputs().next().is_none(),
-        "an NU5 unified address should prefer Orchard over Sapling"
+        pre_nu6_2_tx.orchard_shielded_data().is_none(),
+        "a pre-NU6.3 coinbase cannot pay the removed Orchard pool"
     );
     assert!(
         pre_nu6_2_tx.ironwood_shielded_data().is_none(),
@@ -439,12 +439,12 @@ fn shielded_coinbase_paths() -> anyhow::Result<()> {
     let nu6_2_tx = coinbase_transaction(&net, nu6_2_height, &unified_params)?;
     assert_coinbase_resource_usage(&net, nu6_2_height, &unified_params, &nu6_2_tx)?;
     assert!(
-        nu6_2_tx.orchard_shielded_data().is_some(),
-        "an NU6.2 unified address should receive an Orchard output"
+        nu6_2_tx.sapling_outputs().next().is_some(),
+        "an NU6.2 unified address should fall back to its Sapling receiver"
     );
     assert!(
-        nu6_2_tx.sapling_outputs().next().is_none(),
-        "an NU6.2 unified address should prefer Orchard over Sapling"
+        nu6_2_tx.orchard_shielded_data().is_none(),
+        "a pre-NU6.3 coinbase cannot pay the removed Orchard pool"
     );
     assert!(
         nu6_2_tx.ironwood_shielded_data().is_none(),

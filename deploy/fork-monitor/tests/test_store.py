@@ -103,12 +103,11 @@ class SchemaTests(StoreTestCase):
         self.path.unlink()
         for suffix in ("-wal", "-shm"):
             Path(str(self.path) + suffix).unlink(missing_ok=True)
-        v1_blocks = store_mod.SCHEMA.split("CREATE INDEX IF NOT EXISTS blocks_height")[0].replace(
-            ",\n  body_trusted INTEGER NOT NULL DEFAULT 1", ""
-        )
-        self.assertNotIn("body_trusted", v1_blocks)
+        # Every table a version 1 file had, minus the column version 2 added.
+        v1_schema = store_mod.SCHEMA.replace(",\n  body_trusted INTEGER NOT NULL DEFAULT 1", "")
+        self.assertNotIn("body_trusted", v1_schema)
         with sqlite3.connect(self.path) as conn:
-            conn.executescript(v1_blocks)
+            conn.executescript(v1_schema)
             conn.execute("INSERT INTO meta VALUES ('schema_version', '1')")
             conn.execute("INSERT INTO blocks (hash, prev_hash, time, bits, work, body, created_at) "
                          "VALUES (?, ?, 1, 1, 1, 1, 1)", (f"{1:064x}", f"{0:064x}"))
@@ -119,6 +118,19 @@ class SchemaTests(StoreTestCase):
         self.store.close()
         self.store = Store(self.path)  # reopening does not migrate again
         self.assertEqual(self.block_row(1)["body_trusted"], 1)
+
+    def test_version_2_rewinds_are_relabelled(self) -> None:
+        """Migrating from version 2 clears `is_reorg` on rows that connected no blocks."""
+        self.store.record_tip_change(source="p2p:a", at=1.0, new_hash="aa" * 32, disconnected=997, connected=0,
+                                     is_reorg=True)
+        self.store.record_tip_change(source="p2p:a", at=2.0, new_hash="bb" * 32, disconnected=1, connected=2,
+                                     is_reorg=True)
+        self.store.set_meta("schema_version", 2)
+        self.store.close()
+        self.store = Store(self.path)
+        self.assertEqual(self.store.get_meta("schema_version"), str(store_mod.SCHEMA_VERSION))
+        rows = self.store.reader().execute("SELECT is_reorg FROM tip_changes ORDER BY at").fetchall()
+        self.assertEqual([row[0] for row in rows], [0, 1])
 
     def test_unreadable_schema_version_is_refused(self) -> None:
         """A garbled schema_version refuses to open."""

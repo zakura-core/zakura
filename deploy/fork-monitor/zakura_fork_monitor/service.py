@@ -308,6 +308,9 @@ class Monitor:
                 level = logging.DEBUG
             log.log(level, "%s reorged at %s: -%d +%d blocks (%s -> %s)", source, change.fork_height,
                     change.disconnected, change.connected, _short(old), _short(tip_hash))
+        elif change.disconnected:
+            log.info("%s rewound %d blocks to %s (restart or resync, not a reorg)", source,
+                     change.disconnected, change.fork_height)
         return change
 
     def add_peer_candidates(self, entries: Iterable[Sequence[Any]]) -> int:

@@ -34,7 +34,7 @@ from collections.abc import Iterable, Iterator, Mapping
 from pathlib import Path
 from typing import Any, Callable
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 # Batch commits: bounded staleness for web readers without one fsync per sighting.
 DEFAULT_COMMIT_INTERVAL = 1.0
 # Bounds the WAL growth and lost work of a single open batch during backfill.
@@ -119,6 +119,8 @@ _BODY_COLUMNS = ("size", "tx_count", "miner_tag", "template", "payout", "extrano
 # indexes). Version 2: `blocks.body_trusted` (bodies stored before it existed count as trusted).
 _MIGRATIONS = {
     1: ("ALTER TABLE blocks ADD COLUMN body_trusted INTEGER NOT NULL DEFAULT 1",),
+    # Rewinds to an ancestor were recorded as reorgs; see `Chain.classify_tip_change`.
+    2: ("UPDATE tip_changes SET is_reorg = 0 WHERE is_reorg = 1 AND connected = 0",),
 }
 
 # Row-value IN keeps each prune DELETE bounded, including on the WITHOUT ROWID table.

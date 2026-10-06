@@ -462,14 +462,16 @@ class TipChangeAndRelationTests(unittest.TestCase):
         self.h = self.b.hash
 
     def test_tip_change_kinds(self) -> None:
-        """Extension, rollback, no change, first observation and unknown tips."""
+        """Extension, rewind, no change, first observation and unknown tips."""
         extend = self.chain.classify_tip_change(self.h("a3"), self.h("a5"))
         self.assertEqual(
             (extend.fork_hash, extend.connected, extend.disconnected, extend.is_reorg), (self.h("a3"), 2, 0, False)
         )
         self.assertEqual((extend.connected_work, extend.disconnected_work), (2 * work_from_bits(NORMAL), 0))
-        rollback = self.chain.classify_tip_change(self.h("a5"), self.h("a3"))
-        self.assertEqual((rollback.disconnected, rollback.connected, rollback.is_reorg), (2, 0, True))
+        # A move to an ancestor (a peer restarting at its finalized height) is a rewind, not a reorg.
+        rewind = self.chain.classify_tip_change(self.h("a5"), self.h("a3"))
+        self.assertEqual((rewind.fork_hash, rewind.disconnected, rewind.connected), (self.h("a3"), 2, 0))
+        self.assertFalse(rewind.is_reorg)
         same = self.chain.classify_tip_change(self.h("a5"), self.h("a5"))
         self.assertEqual((same.disconnected, same.connected, same.is_reorg), (0, 0, False))
         first = self.chain.classify_tip_change(None, self.h("a5"))

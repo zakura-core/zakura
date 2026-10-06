@@ -458,7 +458,9 @@ class Chain:
             fork_height=fork.height,
             disconnected=old_node.height - fork.height,
             connected=new_node.height - fork.height,
-            is_reorg=old_node is not fork,
+            # A move to an ancestor connects nothing: it is a rewind (a node restarting at its
+            # finalized height, or a restored database), not a switch between branches.
+            is_reorg=old_node is not fork and new_node is not fork,
             disconnected_work=self._work_between(fork, old_node),
             connected_work=self._work_between(fork, new_node),
         )

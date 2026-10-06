@@ -7,7 +7,10 @@
 
 mod writer_fallback;
 
-use std::{num::NonZeroU64, sync::Arc};
+use std::{
+    num::{NonZeroU64, NonZeroUsize},
+    sync::Arc,
+};
 
 use proptest::prelude::*;
 use tokio::sync::watch;
@@ -961,6 +964,47 @@ fn a_corrupt_successor_recovers_through_the_requested_ambiguous_repair() {
     let successor_states = fixture.authentications(bad);
     assert!(successor_states.contains(&TestAuxStatus::Disputed));
     assert!(successor_states.contains(&TestAuxStatus::Authenticated));
+    assert_eq!(fixture.repair_state(), VctRootRepairState::Idle);
+}
+
+#[test]
+fn an_ambiguous_repair_replaces_input_in_full_buckets() {
+    let _init_guard = zakura_test::init();
+    // Each disputed header fills a one-row bucket, so each can only replace its own row. The
+    // repair spans two headers but needs one replaceable row per header, not two free slots.
+    let bad = Height(BODY_TIP + 4);
+    let predecessor = Height(bad.0 - 1);
+    let mut fixture = Fixture::new();
+    fixture.insert_headers(None, Some((bad, Corruption::AuthDataRoot)));
+    let mut sweeper = VctAuthenticationSweeper::default();
+    fixture.sweep(&mut sweeper);
+    assert_eq!(
+        fixture.repair_state(),
+        VctRootRepairState::Unavailable {
+            height: predecessor
+        }
+    );
+    // The reader advertises repair capacity, and the writer admits the repair.
+    fixture
+        .writer
+        .runtime
+        .set_auxiliary_limits_for_test(1, 1024);
+    fixture.writer.config.limits.max_aux_deliveries_per_header =
+        NonZeroUsize::new(1).expect("one is nonzero");
+    fixture.writer.config.limits.max_aux_deliveries_total =
+        NonZeroUsize::new(1024).expect("1024 is nonzero");
+
+    fixture.redeliver(predecessor, None, 0x76);
+    fixture.sweep(&mut sweeper);
+
+    assert_eq!(
+        fixture.authentications(predecessor),
+        vec![TestAuxStatus::Authenticated]
+    );
+    assert_eq!(
+        fixture.authentications(bad),
+        vec![TestAuxStatus::Authenticated]
+    );
     assert_eq!(fixture.repair_state(), VctRootRepairState::Idle);
 }
 

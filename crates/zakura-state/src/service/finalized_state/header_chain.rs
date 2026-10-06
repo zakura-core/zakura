@@ -1937,8 +1937,7 @@ impl HeaderChainReader {
             ))
             .map(|index| selected.get(index.saturating_add(1)).map(|next| next.hash))?;
         let successor_capacity_available = context.admission_capacity_available
-            && engine.aux_deliveries(successor_hash).len()
-                < self.config.limits.max_aux_deliveries_per_header.get();
+            && engine.auxiliary_repair_capacity(successor_hash, self.config.limits) > 0;
         Ok(context.clone().extend_ambiguous_boundary(
             successor,
             terminal_boundary_hash,
@@ -3147,11 +3146,6 @@ impl HeaderChainRuntime {
                     .get(1)
                     .map(|successor| successor.hash)
                     .or(terminal_boundary_hash);
-                let repair_capacity = transition_engine
-                    .auxiliary_repair_capacity(first_target.hash, context.config.limits);
-                if repair_capacity < repair_range.len() {
-                    return Err(TransitionFailure::AuxiliaryLimitExceeded.into());
-                }
                 let mut current = zakura_header_chain::VctRepairContext::from_durable_rows(
                     first_target,
                     HeaderLocator::for_continuation(common_ancestor),
@@ -3173,22 +3167,44 @@ impl HeaderChainRuntime {
                 if let Some(ambiguous_context) = ambiguous_context {
                     current = ambiguous_context;
                     ambiguous_repair = true;
-                } else if repair_range.len() > 1 {
-                    if durable_rows_by_target.iter().any(|rows| !rows.is_empty())
-                        || before.alarms.resource_stalled
+                }
+                // Each ambiguous header can replace its own unauthenticated input, while an empty
+                // range shares the aggregate slots.
+                let capacity_suffices = if ambiguous_repair {
+                    repair_range.iter().all(|target| {
+                        transition_engine
+                            .auxiliary_repair_capacity(target.hash, context.config.limits)
+                            > 0
+                    })
+                } else {
+                    transition_engine
+                        .auxiliary_repair_capacity(first_target.hash, context.config.limits)
+                        >= repair_range.len()
+                };
+                if !capacity_suffices {
+                    return Err(TransitionFailure::AuxiliaryLimitExceeded.into());
+                }
+                if !ambiguous_repair {
+                    if repair_range.len() > 1 {
+                        if durable_rows_by_target.iter().any(|rows| !rows.is_empty())
+                            || before.alarms.resource_stalled
+                        {
+                            return Ok(ApplyResult::Stale(StaleReceipt {
+                                current_version: before.state_version,
+                                branch,
+                            }));
+                        }
+                        current = current.extend_empty_selected_range(
+                            &repair_range[1..],
+                            terminal_boundary_hash,
+                        )?;
+                    } else if durable_rows_by_target[0].is_empty()
+                        && current.admission_capacity_available
+                        && current.episode != episode
                     {
-                        return Ok(ApplyResult::Stale(StaleReceipt {
-                            current_version: before.state_version,
-                            branch,
-                        }));
+                        current =
+                            current.extend_empty_selected_range(&[], terminal_boundary_hash)?;
                     }
-                    current = current
-                        .extend_empty_selected_range(&repair_range[1..], terminal_boundary_hash)?;
-                } else if durable_rows_by_target[0].is_empty()
-                    && current.admission_capacity_available
-                    && current.episode != episode
-                {
-                    current = current.extend_empty_selected_range(&[], terminal_boundary_hash)?;
                 }
                 if current.episode != episode {
                     return Ok(ApplyResult::Stale(StaleReceipt {

@@ -27,14 +27,12 @@ categories = ["asynchronous", "cryptography::cryptocurrencies", "encoding", "net
 [features]
 default = []
 
+# Legacy flags accepted for build compatibility; the progress display is removed.
+progress-bar = ["howudoin"]
+howudoin = []
+
 # Completion-based commit throughput for opt-in sync reports.
 sync-metrics = []
-
-# Production features that activate extra dependencies, or extra features in dependencies
-
-progress-bar = [
-    "howudoin",
-]
 
 # Testing features that activate extra dependencies
 header-fuzz = []
@@ -50,8 +48,8 @@ bitflags = { workspace = true }
 blake2b_simd = { workspace = true }
 byteorder = { workspace = true }
 bytes = { workspace = true }
-chrono = { workspace = true, features = ["clock", "std"] }
-dirs = { workspace = true }
+chrono = { workspace = true }
+dirs-sys = { workspace = true }
 hex = { workspace = true }
 indexmap = { workspace = true, features = ["serde"] }
 iroh = { workspace = true }
@@ -75,8 +73,6 @@ metrics = { workspace = true }
 tracing-error = { workspace = true, features = ["traced-error"] }
 tracing = { workspace = true }
 
-# prod feature progress-bar
-howudoin = { workspace = true, optional = true }
 
 # proptest dependencies
 proptest = { workspace = true, optional = true }

@@ -374,7 +374,7 @@ class SlackPayloadTests(unittest.TestCase):
 
     def posted_text(self, text, limit=watchdog.MAX_SLACK_MESSAGE_CHARS):
         with (
-            patch.object(watchdog, "MAX_SLACK_MESSAGE_CHARS", limit),
+            patch.object(watchdog.slack, "MAX_SLACK_MESSAGE_CHARS", limit),
             patch.object(
                 watchdog.urllib.request,
                 "urlopen",

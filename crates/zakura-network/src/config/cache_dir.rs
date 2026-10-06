@@ -94,9 +94,25 @@ impl Default for CacheDir {
 
 /// Returns the default directory for network identity secrets.
 pub(crate) fn default_network_identity_dir() -> PathBuf {
-    dirs::home_dir()
+    home_dir()
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
         .join(DEFAULT_NETWORK_IDENTITY_DIR)
+}
+
+/// Returns the platform home directory.
+fn home_dir() -> Option<PathBuf> {
+    #[cfg(target_os = "windows")]
+    {
+        dirs_sys::known_folder_profile()
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        None
+    }
+    #[cfg(not(any(target_os = "windows", target_arch = "wasm32")))]
+    {
+        dirs_sys::home_dir()
+    }
 }
 
 /// Returns the persistent Zakura iroh secret-key file path for `network` under

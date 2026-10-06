@@ -69,7 +69,6 @@
 //! Zebra also has diagnostic support:
 //! * [metrics](https://github.com/ZcashFoundation/zebra/blob/main/book/src/user/metrics.md)
 //! * [tracing](https://github.com/ZcashFoundation/zebra/blob/main/book/src/user/tracing.md)
-//! * [progress-bar](https://docs.rs/howudoin/0.1.1/howudoin)
 //!
 //! Some of the diagnostic features are optional, and need to be enabled at compile-time.
 

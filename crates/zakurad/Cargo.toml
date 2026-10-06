@@ -63,21 +63,24 @@ pre-release-replacements = [
 # <https://docs.rs/about/metadata>
 features = [
     "default-release-binaries",
-    "flamegraph",
     "journald",
     "opentelemetry",
     "prometheus",
-    "sentry",
     "indexer",
 ]
 
 [features]
 # In release builds, don't compile debug logging code, to improve performance.
-default-release-binaries = ["release_max_level_info", "progress-bar", "prometheus", "opentelemetry"]
+default-release-binaries = ["release_max_level_info", "prometheus", "opentelemetry"]
 
 
 # Local builds use the compiler's target features for Pasta arithmetic.
 default = ["default-release-binaries"]
+
+# Legacy flags accepted for build compatibility; the progress display is removed.
+progress-bar = ["howudoin", "indicatif", "zakura-consensus/progress-bar", "zakura-state/progress-bar", "zakura-network/progress-bar"]
+howudoin = []
+indicatif = []
 
 # Disable x86-64 Pasta assembly for redistributable binaries.
 # Local builds can use BMI2+ADX when enabled by the Rust target.
@@ -103,18 +106,8 @@ internal-miner = [
 ]
 
 # Tracing and monitoring
-# Opt in explicitly: the tracing layer has overhead even without a SENTRY_DSN.
-sentry = ["dep:sentry"]
 journald = ["tracing-journald"]
 opentelemetry = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "dep:tracing-opentelemetry"]
-
-progress-bar = [
-    "howudoin",
-    "indicatif",
-    "zakura-consensus/progress-bar",
-    "zakura-state/progress-bar",
-    "zakura-network/progress-bar",
-]
 
 prometheus = ["metrics-exporter-prometheus"]
 
@@ -136,8 +129,6 @@ max_level_info = ["tracing/max_level_info"]
 max_level_debug = ["tracing/max_level_debug", "log/max_level_debug"]
 
 # Testing features that activate extra dependencies
-flamegraph = ["tracing-flame", "inferno"]
-
 proptest-impl = [
     "proptest",
     "proptest-derive",
@@ -196,7 +187,7 @@ zakura-utils = { path = "../zakura-utils", version = "2.2.7", optional = true }
 
 abscissa_core = { workspace = true, default-features = false, features = ["application"] }
 clap = { workspace = true, features = ["cargo"] }
-chrono = { workspace = true, features = ["clock", "std"] }
+chrono = { workspace = true }
 indexmap = { workspace = true }
 lazy_static = { workspace = true }
 semver = { workspace = true }
@@ -223,32 +214,20 @@ tracing = { workspace = true }
 
 metrics = { workspace = true }
 
-dirs = { workspace = true }
+dirs-sys = { workspace = true }
 reqwest = { workspace = true, default-features = false, features = ["blocking", "rustls-no-provider"] }
+# Resolution constraint for transitive URL/DNS dependencies; no direct API use.
+idna_adapter = { workspace = true }
 sha2 = { workspace = true }
 tempfile = { workspace = true }
-flate2 = "1.1.9"
-tar = "0.4.46"
 
 # Health check server dependencies
 hyper = { workspace = true, features = ["server", "http1"] }
 http-body-util = { workspace = true }
 hyper-util = { workspace = true, features = ["service", "server", "tokio"] }
 
-# Configuration management
-config = { workspace = true }
-
-nix = { workspace = true, features = ["fs"] }
-
 # prod feature internal-miner
 thread-priority = { workspace = true, optional = true }
-
-# prod feature sentry
-sentry = { workspace = true, features = ["backtrace", "logs", "rustls", "tracing", "ureq"], optional = true }
-
-# prod feature flamegraph
-tracing-flame = { workspace = true, optional = true }
-inferno = { workspace = true, optional = true }
 
 # prod feature journald
 tracing-journald = { workspace = true, optional = true }
@@ -272,9 +251,6 @@ metrics-exporter-prometheus = { workspace = true, features = ["http-listener"], 
 # we only use `log` to set and print the static log levels in transitive dependencies
 log = { workspace = true }
 
-# prod feature progress-bar
-howudoin = { workspace = true, features = ["term-line"], optional = true }
-indicatif = { workspace = true, optional = true }
 
 # test feature proptest-impl
 proptest = { workspace = true, optional = true }
@@ -297,7 +273,6 @@ insta = { workspace = true, features = ["json"] }
 # zakura-rpc needs the preserve_order feature, it also makes test results more stable
 serde_json = { workspace = true, features = ["preserve_order"] }
 hyper = { workspace = true, features = ["http1", "http2", "server"] }
-tracing-test = { workspace = true, features = ["no-env-filter"] }
 
 tokio = { workspace = true, features = ["full", "tracing", "test-util"] }
 
@@ -325,9 +300,10 @@ zakura-test = { path = "../zakura-test", version = "3.0.0" }
 zakura-utils = { path = "../zakura-utils", version = "2.2.7" }
 
 [package.metadata.cargo-udeps.ignore]
-# These dependencies are false positives - they are actually used
+# These dependencies are used indirectly or constrain transitive resolution.
 normal = [
     "console-subscriber",  # Used behind the tokio-console feature flag
+    "idna_adapter",        # Selects the unicode-rs backend for URL/DNS dependencies
     "zakura-utils",         # Used for the zakura-checkpoints feature
 ]
 development = [
@@ -352,8 +328,8 @@ feature_missing = "warn"
 enum_variant_added = "warn"
 enum_variant_missing = "warn"
 
-[target.'cfg(all(target_os = "linux", target_env = "gnu"))'.dependencies]
-libc = "0.2.186"
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
 
 [[bench]]
 name = "mempool_eviction"

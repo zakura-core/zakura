@@ -60,6 +60,7 @@ impl ClientTestHarness {
             connection_task: None,
             heartbeat_task: None,
             connected_addr: None,
+            start_height: None,
         }
     }
 
@@ -213,6 +214,7 @@ pub struct ClientTestHarnessBuilder<C = future::Ready<()>, H = future::Ready<()>
     heartbeat_task: Option<H>,
     version: Option<Version>,
     connected_addr: Option<ConnectedAddr>,
+    start_height: Option<Height>,
 }
 
 impl<C, H> ClientTestHarnessBuilder<C, H>
@@ -232,6 +234,12 @@ where
         self
     }
 
+    /// Configure the best chain height the peer advertised in its `version` message.
+    pub fn with_start_height(mut self, start_height: Height) -> Self {
+        self.start_height = Some(start_height);
+        self
+    }
+
     /// Configure the mock connection task future to use.
     pub fn with_connection_task<NewC>(
         self,
@@ -242,6 +250,7 @@ where
             heartbeat_task: self.heartbeat_task,
             version: self.version,
             connected_addr: self.connected_addr,
+            start_height: self.start_height,
         }
     }
 
@@ -255,6 +264,7 @@ where
             heartbeat_task: Some(heartbeat_task),
             version: self.version,
             connected_addr: self.connected_addr,
+            start_height: self.start_height,
         }
     }
 
@@ -289,7 +299,7 @@ where
             ),
             nonce: Nonce::default(),
             user_agent: "client test harness".to_string(),
-            start_height: Height(0),
+            start_height: self.start_height.unwrap_or(Height(0)),
             relay: true,
         };
 

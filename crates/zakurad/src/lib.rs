@@ -61,9 +61,6 @@
 //!
 //! ### Metrics
 //!
-//! * configuring a `tracing.progress_bar`: shows key metrics in the terminal using progress bars,
-//!   and automatically configures Zakura to send logs to a file.
-//!   (The `progress-bar` feature is activated by default.)
 //! * `prometheus`: export metrics to prometheus.
 //!
 //! ### Tracing
@@ -71,10 +68,6 @@
 //! Sending traces to different subscribers:
 //! * configuring a `tracing.log_file`: appends traces to a file on disk.
 //! * `journald`: send tracing spans and events to `systemd-journald`.
-//! * `sentry`: enable Sentry reporting and tracing integration. Disabled by default, including
-//!   in release binaries. Build with `cargo build --release -p zakura --features sentry`, then
-//!   set `SENTRY_DSN` at runtime to enable reporting.
-//! * `flamegraph`: generate a flamegraph of tracing spans.
 //!
 //! Changing the traces that are collected:
 //! * `error-debug`: enable extra debugging in release builds.
@@ -141,6 +134,3 @@ pub mod components;
 pub mod config;
 pub mod node;
 pub mod prelude;
-
-#[cfg(feature = "sentry")]
-pub(crate) mod sentry;

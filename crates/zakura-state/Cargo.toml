@@ -83,6 +83,8 @@ derive-new.workspace = true
 libc = { workspace = true }
 
 [dev-dependencies]
+
+indexmap = { workspace = true, features = ["serde"] }
 zakura-header-chain = { path = "../zakura-header-chain", version = "4.0.1", features = ["test-support"] }
 color-eyre = { workspace = true }
 
@@ -90,7 +92,7 @@ once_cell = { workspace = true }
 toml = { workspace = true }
 
 hex = { workspace = true, features = ["serde"] }
-insta = { workspace = true, features = ["ron", "redactions"] }
+insta = { workspace = true, features = ["ron"] }
 serde_json = { workspace = true }
 
 proptest = { workspace = true }

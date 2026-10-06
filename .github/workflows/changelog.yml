@@ -32,8 +32,8 @@ jobs:
         env:
           # Release-state PRs come from `Update Mainnet release state`. They carry `A-release`
           # for the release CI paths, but they are not the release PR that consumes the pending
-          # fragments, and their only Rust change is the generated end-of-support floor. Treat
-          # them like Dependabot: exempt from the one-fragment rule, and not a release PR.
+          # fragments. Their Cargo.toml change pins the refreshed assets. Treat them like
+          # Dependabot: exempt from the one-fragment rule, and not a release PR.
           ALLOW_MISSING: >-
             ${{ github.event.pull_request.user.login == 'dependabot[bot]'
                 || contains(github.event.pull_request.labels.*.name, 'A-release-state') }}

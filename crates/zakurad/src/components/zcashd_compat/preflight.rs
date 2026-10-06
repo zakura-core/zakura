@@ -841,7 +841,9 @@ mod tests {
     use tempfile::TempDir;
 
     #[cfg(target_os = "linux")]
-    use crate::components::zcashd_compat::{zcashd_target_triple, ConfigZcashdBinarySource};
+    use crate::components::zcashd_compat::{
+        zcashd_target_triple, ConfigZcashdBinarySource, EMBEDDED_ZCASHD_RELEASE_MANIFEST,
+    };
 
     #[cfg(target_os = "linux")]
     #[test]
@@ -1330,7 +1332,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn stale_embedded_cache_checks_cache_dir_writability() {
+    fn corrupted_embedded_cache_checks_cache_dir_writability() {
         if running_as_root() {
             return;
         }
@@ -1349,9 +1351,23 @@ mod tests {
         let cache_dir = binary_path.parent().expect("binary should have parent");
         std_fs::create_dir_all(cache_dir).expect("managed cache dir should be created");
         std_fs::write(&binary_path, "#!/bin/sh\n").expect("cached zcashd should be written");
-        std_fs::write(cache_dir.join("zcashd.sha256"), "stale\n")
-            .expect("stale provenance should be written");
+        // A legacy sidecar that names the pinned digest must not make corrupted
+        // contents look current.
+        let pinned_sha256 = &EMBEDDED_ZCASHD_RELEASE_MANIFEST
+            .artifact_for_target(zcashd_target_triple().expect("checked above"))
+            .expect("supported target is in the embedded manifest")
+            .runtime_binary_sha256;
+        std_fs::write(
+            cache_dir.join("zcashd.sha256"),
+            format!("{pinned_sha256}\n"),
+        )
+        .expect("legacy sidecar should be written");
         set_mode(&binary_path, 0o755);
+        assert_eq!(
+            cached_managed_zcashd_binary_is_current(&config.state.cache_dir)
+                .expect("cached binary should hash"),
+            Some(false)
+        );
 
         set_mode(cache_dir, 0o555);
         let mut summary = PreflightSummary::default();
@@ -1367,7 +1383,7 @@ mod tests {
             summary.errors.iter().any(|error| {
                 error.contains("embedded zcashd cache directory") && error.contains("not writable")
             }),
-            "expected stale embedded cache writability error: {:?}",
+            "expected corrupted embedded cache writability error: {:?}",
             summary.errors
         );
     }

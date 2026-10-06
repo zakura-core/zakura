@@ -1415,7 +1415,7 @@ impl HeaderSyncReactor {
                 let RepairPolicyState::Assigned { context } = &task.state else {
                     return false;
                 };
-                context.episode == episode && !context.admits_new_input(&inputs)
+                context.episode == episode && !context.admits_new_input(active.source, &inputs)
             });
             if excluded {
                 metrics::counter!("sync.header.vct.repair.excluded_input.total").increment(1);
@@ -3236,14 +3236,19 @@ impl HeaderSyncReactor {
                 peer_supported_count.min(local_capacity)
             };
             // An ambiguous boundary repair cannot shorten, so its supplier must serve both headers.
-            if supported_count < desired_count
-                && context
-                    .bounded_prefix(usize::try_from(supported_count).unwrap_or(usize::MAX))
-                    .is_none()
-            {
+            // Missing local capacity only delays the full request.
+            let unshortenable = context
+                .bounded_prefix(usize::try_from(supported_count).unwrap_or(usize::MAX))
+                .is_none();
+            if unshortenable && peer_supported_count < desired_count {
                 rejections.insufficient_capacity += 1;
                 continue;
             }
+            let supported_count = if unshortenable {
+                desired_count
+            } else {
+                supported_count
+            };
             if status.tree_aux_schema_mask & AuxSchema::V1.mask_bit() == 0 {
                 rejections.unsupported_schema += 1;
                 continue;

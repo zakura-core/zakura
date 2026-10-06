@@ -156,6 +156,9 @@ pub struct VctRepairContext {
     retained_payloads: Box<[[u8; 32]]>,
     /// Sources that already supplied one retained rooted payload for every target in the range.
     retained_sources: Box<[SourceId]>,
+    /// Sources with a retained rooted payload at each header of an ambiguous boundary, in range
+    /// order. Other contexts leave this empty.
+    header_retained_sources: Box<[Box<[SourceId]>]>,
     /// Private selected-range state keeps the public context and port shapes stable.
     selected_range: Box<SelectedRepairRange>,
 }
@@ -177,6 +180,7 @@ impl VctRepairContext {
             excluded_inputs: Box::new([]),
             retained_payloads: Box::new([]),
             retained_sources: Box::new([]),
+            header_retained_sources: Box::new([]),
             selected_range: Box::new(SelectedRepairRange {
                 frontiers: Box::new([target]),
                 terminal_boundary_hash: boundary_hash,
@@ -237,6 +241,7 @@ impl VctRepairContext {
             excluded_inputs: excluded_inputs.into_boxed_slice(),
             retained_payloads: retained_payloads.into_boxed_slice(),
             retained_sources: retained_sources.into_boxed_slice(),
+            header_retained_sources: Box::new([]),
             selected_range: Box::new(SelectedRepairRange {
                 frontiers: Box::new([target]),
                 terminal_boundary_hash: boundary_hash,
@@ -371,7 +376,13 @@ impl VctRepairContext {
         self.admission_capacity_available &= successor_admission_capacity_available;
         self.excluded_inputs = excluded_inputs.into_boxed_slice();
         self.retained_payloads = retained_payloads.into_boxed_slice();
-        self.retained_sources = retained_sources.into_boxed_slice();
+        self.header_retained_sources = Box::new([
+            std::mem::replace(
+                &mut self.retained_sources,
+                retained_sources.into_boxed_slice(),
+            ),
+            successor_context.retained_sources,
+        ]);
         self.selected_range = Box::new(SelectedRepairRange {
             frontiers: Box::new([self.target, successor]),
             terminal_boundary_hash,
@@ -502,8 +513,9 @@ impl VctRepairContext {
     /// Return whether a response adds a payload that this repair neither retains nor excludes.
     ///
     /// `inputs` follow the selected range order. Header admission drops a retained payload, so a
-    /// response without a new payload cannot make progress.
-    pub fn admits_new_input(&self, inputs: &[crate::TreeAuxRecordV1]) -> bool {
+    /// response without a new payload cannot make progress. At an ambiguous boundary, a payload
+    /// from a `source` that already holds a rooted slot at that header is not new either.
+    pub fn admits_new_input(&self, source: SourceId, inputs: &[crate::TreeAuxRecordV1]) -> bool {
         let frontiers = &self.selected_range.frontiers;
         inputs.len() == frontiers.len()
             && frontiers
@@ -518,8 +530,13 @@ impl VctRepairContext {
                     let excluded =
                         AuxiliaryInputFingerprint::new(frontier.hash, *input, boundary_hash);
                     let payload = semantic_payload_fingerprint(frontier.hash, Some(*input));
+                    let source_retained = self
+                        .header_retained_sources
+                        .get(index)
+                        .is_some_and(|sources| sources.binary_search(&source).is_ok());
                     self.excluded_inputs.binary_search(&excluded).is_err()
                         && self.retained_payloads.binary_search(&payload).is_err()
+                        && !source_retained
                 })
     }
 
@@ -798,13 +815,20 @@ mod tests {
         let retained_successor = record(successor, 0x20);
         let new_target = record(target, 0x30);
         let new_successor = record(successor, 0x31);
-        assert!(!ambiguous.admits_new_input(&[retained_target, retained_successor]));
-        assert!(!ambiguous.admits_new_input(&[record(target, 0x11), retained_successor]));
-        assert!(ambiguous.admits_new_input(&[retained_target, new_successor]));
-        assert!(ambiguous.admits_new_input(&[new_target, retained_successor]));
-        assert!(!ambiguous.admits_new_input(&[new_target]));
-        assert!(!exact().admits_new_input(&[retained_target]));
-        assert!(exact().admits_new_input(&[new_target]));
+        let fresh = SourceId::from_digest([0x52; 32]);
+        let target_supplier = SourceId::from_digest([0x51; 32]);
+        assert!(!ambiguous.admits_new_input(fresh, &[retained_target, retained_successor]));
+        assert!(!ambiguous.admits_new_input(fresh, &[record(target, 0x11), retained_successor]));
+        assert!(ambiguous.admits_new_input(fresh, &[retained_target, new_successor]));
+        assert!(ambiguous.admits_new_input(fresh, &[new_target, retained_successor]));
+        assert!(!ambiguous.admits_new_input(fresh, &[new_target]));
+        assert!(!exact().admits_new_input(fresh, &[retained_target]));
+        assert!(exact().admits_new_input(fresh, &[new_target]));
+        assert!(
+            !ambiguous.admits_new_input(target_supplier, &[new_target, retained_successor]),
+            "state drops a second rooted payload from one supplier at one header"
+        );
+        assert!(ambiguous.admits_new_input(target_supplier, &[new_target, new_successor]));
 
         assert_eq!(
             extend(&[row(0x20, successor, 0x50, 3, Some([0x42; 32]))]),

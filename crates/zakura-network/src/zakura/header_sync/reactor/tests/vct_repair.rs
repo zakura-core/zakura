@@ -992,7 +992,9 @@ async fn vct_repair_defers_when_no_peer_reaches_the_repair_height() {
 ///
 /// One observation disputed the target and its successor. Every honest supplier returns the same
 /// target payload, so the repair must ask for the successor too. A supplier that cannot serve both
-/// headers gets no request, and a response that repeats both retained payloads stays local.
+/// headers gets no request, and a response that repeats both retained payloads stays local. A
+/// supplier that already holds the successor's rooted slot cannot add a second successor payload,
+/// so its response stays local too.
 #[tokio::test]
 async fn ambiguous_boundary_repair_requests_both_headers_and_forwards_new_successor_input() {
     let shutdown = CancellationToken::new();
@@ -1039,12 +1041,14 @@ async fn ambiguous_boundary_repair_requests_both_headers_and_forwards_new_succes
     let honest_target = record(target, 0x10);
     let corrupt_successor = record(successor, 0x20);
     let honest_successor = record(successor, 0x21);
-    let disputed_row = |identity: u8, header: zakura_header_chain::Frontier, input| {
+    let successor_slot_peer =
+        ZakuraPeerId::new(vec![0x64; 32]).expect("the peer ID length is valid");
+    let disputed_row = |identity: u8, header: zakura_header_chain::Frontier, source, input| {
         zakura_header_chain::UntrustedAuxDeliveryRow::new(
             zakura_header_chain::AuxDelivery::new(
                 zakura_header_chain::EvidenceId::from_digest([identity; 32]),
                 header.hash,
-                zakura_header_chain::SourceId::from_digest([0x5a; 32]),
+                source,
                 owner.into(),
                 zakura_header_chain::BodySizeHint::Unknown,
                 Some(input),
@@ -1054,8 +1058,18 @@ async fn ambiguous_boundary_repair_requests_both_headers_and_forwards_new_succes
             Some(successor.hash),
         )
     };
-    let target_rows = [disputed_row(0x11, target, honest_target)];
-    let successor_rows = [disputed_row(0x22, successor, corrupt_successor)];
+    let target_rows = [disputed_row(
+        0x11,
+        target,
+        zakura_header_chain::SourceId::from_digest([0x5a; 32]),
+        honest_target,
+    )];
+    let successor_rows = [disputed_row(
+        0x22,
+        successor,
+        source_id_from_peer(&successor_slot_peer),
+        corrupt_successor,
+    )];
     let context = zakura_header_chain::VctRepairContext::from_durable_rows(
         target,
         zakura_header_chain::HeaderLocator::for_continuation(anchor),
@@ -1181,6 +1195,25 @@ async fn ambiguous_boundary_repair_requests_both_headers_and_forwards_new_succes
             .await
             .is_err(),
         "a response that repeats both retained payloads cannot reach state"
+    );
+
+    let (slot_peer, mut slot_outbound) = connect(0x64, 2).await;
+    assert_eq!(slot_peer, successor_slot_peer);
+    let request = decode_request(
+        time::timeout(std::time::Duration::from_secs(1), slot_outbound.recv())
+            .await
+            .expect("a supplier with only a successor slot can still replace the target")
+            .expect("the supplier stream stays open"),
+    );
+    handle
+        .send(respond(slot_peer, request.request_id, honest_successor))
+        .await
+        .expect("the second successor payload reaches the reactor");
+    assert!(
+        time::timeout(std::time::Duration::from_millis(20), actions.recv())
+            .await
+            .is_err(),
+        "state drops a second rooted successor payload from the same supplier"
     );
 
     let (replacing_peer, mut replacing_outbound) = connect(0x63, 2).await;

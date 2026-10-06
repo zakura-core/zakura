@@ -214,14 +214,12 @@ tracing = { workspace = true }
 
 metrics = { workspace = true }
 
-dirs = { workspace = true }
+dirs-sys = { workspace = true }
 reqwest = { workspace = true, default-features = false, features = ["blocking", "rustls-no-provider"] }
 # Resolution constraint for transitive URL/DNS dependencies; no direct API use.
 idna_adapter = { workspace = true }
 sha2 = { workspace = true }
 tempfile = { workspace = true }
-flate2 = "1.1.9"
-tar = "0.4.46"
 
 # Health check server dependencies
 hyper = { workspace = true, features = ["server", "http1"] }

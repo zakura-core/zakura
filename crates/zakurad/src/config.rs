@@ -43,14 +43,14 @@ fn is_sensitive_leaf_key(leaf_key: &str) -> bool {
 ///
 /// The path to the configuration file can also be specified with the `--config` flag when running Zakura.
 ///
-/// The default path to the `zakurad` config is platform dependent, based on
-/// [`dirs::preference_dir`](https://docs.rs/dirs/latest/dirs/fn.preference_dir.html):
+/// The default path to the `zakurad` config uses the platform's preferences
+/// directory:
 ///
 /// | Platform | Value                                 | Example                                        |
 /// | -------- | ------------------------------------- | ---------------------------------------------- |
 /// | Linux    | `$XDG_CONFIG_HOME` or `$HOME/.config` | `/home/alice/.config/zakura.toml`              |
 /// | macOS    | `$HOME/Library/Preferences`           | `/Users/Alice/Library/Preferences/zakura.toml` |
-/// | Windows  | `{FOLDERID_RoamingAppData}`           | `C:\Users\Alice\AppData\Local\zakura.toml`     |
+/// | Windows  | `{FOLDERID_LocalAppData}`           | `C:\Users\Alice\AppData\Local\zakura.toml`     |
 #[derive(Clone, Default, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct ZakuradConfig {

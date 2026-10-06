@@ -39,7 +39,6 @@ ed25519-zebra = { workspace = true }
 rand = { workspace = true }
 
 tokio = { workspace = true, features = ["full", "tracing", "test-util"] }
-tokio-test = { workspace = true }
 tower-fallback = { package = "zakura-tower-fallback", path = "../tower-fallback/", version = "1.2.0" }
 
 zakura-test = { path = "../zakura-test/", version = "3.0.0" }

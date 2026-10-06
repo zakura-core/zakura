@@ -723,7 +723,9 @@ fn snapshot_rpc_getinfo(info: GetInfoResponse, settings: &insta::Settings) {
     info["subversion"] = "[SubVersion]".into();
     info["errorstimestamp"] = "[LastErrorTimestamp]".into();
 
-    settings.bind(|| insta::assert_json_snapshot!("get_info", info));
+    settings.bind(|| {
+        insta::assert_json_snapshot!("get_info", info);
+    });
 }
 
 /// Snapshot `getblockchaininfo` response, using `cargo insta` and JSON serialization.

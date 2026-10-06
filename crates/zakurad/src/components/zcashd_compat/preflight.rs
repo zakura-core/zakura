@@ -1357,8 +1357,11 @@ mod tests {
             .artifact_for_target(zcashd_target_triple().expect("checked above"))
             .expect("supported target is in the embedded manifest")
             .runtime_binary_sha256;
-        std_fs::write(cache_dir.join("zcashd.sha256"), format!("{pinned_sha256}\n"))
-            .expect("legacy sidecar should be written");
+        std_fs::write(
+            cache_dir.join("zcashd.sha256"),
+            format!("{pinned_sha256}\n"),
+        )
+        .expect("legacy sidecar should be written");
         set_mode(&binary_path, 0o755);
         assert_eq!(
             cached_managed_zcashd_binary_is_current(&config.state.cache_dir)

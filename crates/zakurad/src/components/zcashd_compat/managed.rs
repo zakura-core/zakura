@@ -305,7 +305,8 @@ fn download_verified_binary(
     })
     .with_no_client_auth();
     let redirect_policy = Policy::custom(|attempt| {
-        if attempt.previous().len() >= MANAGED_DOWNLOAD_MAX_REDIRECTS {
+        // `previous()` includes the initial URL, matching `Policy::limited`.
+        if attempt.previous().len() > MANAGED_DOWNLOAD_MAX_REDIRECTS {
             attempt.error(format!(
                 "more than {MANAGED_DOWNLOAD_MAX_REDIRECTS} redirects"
             ))
@@ -810,7 +811,9 @@ mod tests {
                 TARGET,
                 temp.path(),
             )
-            .unwrap_or_else(|error| panic!("cache with sidecar {sidecar:?} should be reused: {error:#}"));
+            .unwrap_or_else(|error| {
+                panic!("cache with sidecar {sidecar:?} should be reused: {error:#}")
+            });
 
             assert_eq!(resolved, binary_path);
             assert_eq!(
@@ -907,8 +910,7 @@ mod tests {
 
     #[test]
     fn rejects_redirect_to_non_https_url() {
-        let (base_url, requests) =
-            serve(|_| vec![redirect_response("http://example.com/zcashd")]);
+        let (base_url, requests) = serve(|_| vec![redirect_response("http://example.com/zcashd")]);
 
         let error = assert_failed_install_preserves_previous_binary(
             &format!("{base_url}/zcashd"),
@@ -1013,7 +1015,9 @@ mod tests {
 
         let installer = {
             let state_cache_dir = temp.path().to_path_buf();
-            thread::spawn(move || install_managed_zcashd_binary(&manifest, TARGET, &state_cache_dir))
+            thread::spawn(move || {
+                install_managed_zcashd_binary(&manifest, TARGET, &state_cache_dir)
+            })
         };
         // Let the installer find the stale binary and start waiting for the lock,
         // then install the binary as another process would before releasing it.

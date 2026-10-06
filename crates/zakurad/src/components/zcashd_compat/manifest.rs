@@ -59,8 +59,8 @@ impl ZcashdReleaseManifest {
 /// Parses `json` and checks the schema version, unique targets, HTTPS URLs and
 /// SHA-256 digest shape.
 fn parse_manifest(json: &str) -> Result<ZcashdReleaseManifest, Report> {
-    let manifest: ZcashdReleaseManifest = serde_json::from_str(json)
-        .map_err(|err| eyre!("invalid zcashd-compat manifest: {err}"))?;
+    let manifest: ZcashdReleaseManifest =
+        serde_json::from_str(json).map_err(|err| eyre!("invalid zcashd-compat manifest: {err}"))?;
 
     if manifest.schema_version != EMBEDDED_MANIFEST_SCHEMA_VERSION {
         return Err(eyre!(
@@ -106,7 +106,9 @@ fn parse_manifest(json: &str) -> Result<ZcashdReleaseManifest, Report> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_manifest, EMBEDDED_MANIFEST_SCHEMA_VERSION, EMBEDDED_ZCASHD_RELEASE_MANIFEST};
+    use super::{
+        parse_manifest, EMBEDDED_MANIFEST_SCHEMA_VERSION, EMBEDDED_ZCASHD_RELEASE_MANIFEST,
+    };
 
     const SHA256: &str = "fdfc488bd1a6df725b2997e455166e640d8c5ffc985a177f1dabe72020d5b2c3";
 
@@ -187,7 +189,9 @@ mod tests {
         let error = parse_manifest(&manifest_json(2, &artifact))
             .expect_err("archive fields should be rejected");
         assert!(
-            error.to_string().contains("runtime_archive_member_binary_path"),
+            error
+                .to_string()
+                .contains("runtime_archive_member_binary_path"),
             "unexpected error: {error}"
         );
     }

@@ -290,6 +290,11 @@ class WaterfallTests(unittest.TestCase):
         self.assertEqual(spans[2]["outcome"], "failed")
         self.assertEqual(spans[3]["outcome"], "succeeded")
 
+    def test_noncommitting_verifier_does_not_claim_validation_failure(self):
+        rows = [StageTests.stage("block_stage_started", 1, name="verification_and_commit"),
+                StageTests.stage("block_stage_finished", 5, name="verification_and_commit")]
+        self.assertEqual(n.block_timeline(rows)[0]["spans"][0]["outcome"], "not_committed")
+
     def test_repeated_announcements_do_not_stretch_processing_axis(self):
         rows = [event("commit_start", 10_000_000), event("commit_finish", 40_000_000)]
         for timestamp, transport in ((1_000_000, "legacy"), (2_000_000, "zakura"), (9_000_000_000, "legacy")):

@@ -567,7 +567,8 @@ def block_timeline(events):
             elif category == "stage":
                 end = boundaries.get("block_stage_finished")
                 append(identity[2].replace("_", " "), boundaries.get("block_stage_started"), end,
-                       ("succeeded" if end["success"] else "failed") if end else None)
+                       ("succeeded" if end["success"] else
+                        "not_committed" if identity[2] == "verification_and_commit" else "failed") if end else None)
             else:
                 end = boundaries.get("block_relay_finished")
                 append(f"Local relay · call {token}", boundaries.get("block_relay_started"), end,

@@ -584,10 +584,10 @@ function renderWaterfall(timelines) {
   }
   for (const span of spans) {
     const failed = ["failed", "rejected", "timed_out", "unavailable"].includes(span.outcome);
-    const info = `${span.label}: ${span.complete ? ms(span.duration_ms) : "Missing or inconsistent boundary"}${span.outcome ? " · " + span.outcome : ""}`;
+    const info = `${span.label}: ${span.complete ? ms(span.duration_ms) : "Missing or inconsistent boundary"}${span.outcome ? " · " + span.outcome.replaceAll("_", " ") : ""}`;
     rows.push(`<text x="0" y="${y + 4}">${esc(span.label)}<title>${esc(info)}</title></text>`);
     if (span.complete) {
-      rows.push(`<rect x="${x(span.start_ms)}" y="${y - 6}" width="${Math.max(1, x(span.end_ms) - x(span.start_ms))}" height="12" rx="2" class="waterfall-bar${failed ? " failed" : ""}"><title>${esc(info)} · start +${esc(ms(span.start_ms))}</title></rect>`);
+      rows.push(`<rect x="${x(span.start_ms)}" y="${y - 6}" width="${Math.max(1, x(span.end_ms) - x(span.start_ms))}" height="12" rx="2" class="waterfall-bar${failed ? " failed" : span.outcome === "not_committed" ? " uncommitted" : ""}"><title>${esc(info)} · start +${esc(ms(span.start_ms))}</title></rect>`);
     } else {
       const boundary = valid(span.start_ms) ? span.start_ms : span.end_ms;
       if (valid(boundary)) rows.push(`<circle cx="${x(boundary)}" cy="${y}" r="4" class="waterfall-incomplete"><title>${esc(info)}</title></circle>`);
@@ -644,8 +644,8 @@ function renderBlockEvents() {
   const stages = (events.stages || []).slice(-24);
   const stageRows = stages.length ? `<h3>Measured processing stages</h3>
     <table><thead><tr><th>Stage</th><th>Started · UTC</th><th>Duration</th><th>Outcome</th></tr></thead>
-    <tbody>${stages.map((row) => `<tr><td>${esc(row.stage.replaceAll("_", " "))}</td><td>${valid(row.started_at) ? clock(row.started_at, true) : "—"}</td><td>${ms(row.duration_ms)}</td><td>${row.complete ? (row.success ? "Succeeded" : "Failed") : "Incomplete"}</td></tr>`).join("")}</tbody></table>
-    <p>Each row is one stage occurrence. Contextual validation includes the stages beneath it. Do not add overlapping durations. Showing up to 24 retained occurrences, including retries.</p>` : "";
+    <tbody>${stages.map((row) => `<tr><td>${esc(row.stage.replaceAll("_", " "))}</td><td>${valid(row.started_at) ? clock(row.started_at, true) : "—"}</td><td>${ms(row.duration_ms)}</td><td>${row.complete ? (row.success ? "Succeeded" : row.stage === "verification_and_commit" ? "Not committed" : "Failed") : "Incomplete"}</td></tr>`).join("")}</tbody></table>
+    <p>Each row is one stage occurrence. Contextual validation includes the stages beneath it. Do not add overlapping durations. “Not committed” can include a duplicate already in state as well as an error; the event does not identify the reason. Showing up to 24 retained occurrences, including retries.</p>` : "";
   return `${renderWaterfall(events.timeline)}${arrival}${stageRows}${events.attempts.length ? "<h3>Measured processing attempts</h3>" : ""}${events.attempts
     .slice(-3)
     .map(

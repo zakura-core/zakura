@@ -1267,3 +1267,5 @@ dialog p {
 }
 
 #block-dialog { width: min(920px, calc(100vw - 40px)); }
+
+.waterfall-bar.uncommitted { fill: #8096a3; }

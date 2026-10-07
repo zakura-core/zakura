@@ -1270,12 +1270,20 @@ impl StateService {
                         non_finalized_block_write_sender.send(NonFinalizedWriteMessage::Commit {
                             queued: queued_child,
                             queued_at: Instant::now(),
+                            dashboard_stage: zakura_jsonl_trace::dashboard::BlockStage::start(
+                                || hash.to_string(),
+                                "writer_queue",
+                            ),
                             write_slot,
                         });
 
-                    if let Err(SendError(NonFinalizedWriteMessage::Commit { queued, .. })) =
-                        send_result
+                    if let Err(SendError(NonFinalizedWriteMessage::Commit {
+                        queued,
+                        dashboard_stage,
+                        ..
+                    })) = send_result
                     {
+                        dashboard_stage.finish(false);
                         // If Zebra is shutting down, drop blocks and return an error.
                         Self::send_semantically_verified_block_error(
                             queued,

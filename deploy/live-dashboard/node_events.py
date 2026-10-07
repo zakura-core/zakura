@@ -9,7 +9,7 @@ MAX_EVENT_BYTES = 8192
 MAX_ATTEMPTS = 4096
 APPLY_EVENTS = {"block_submit_queued", "commit_start", "commit_finish"}
 STAGE_EVENTS = {"block_stage_started", "block_stage_finished"}
-STAGES = {"verification_and_commit", "contextual_validation", "initial_checks", "transparent_spends", "shielded_anchors", "parallel_state_update"}
+STAGES = {"writer_queue", "finalized_write", "verification_and_commit", "contextual_validation", "initial_checks", "transparent_spends", "shielded_anchors", "parallel_state_update"}
 BLOCK_EVENTS = APPLY_EVENTS | STAGE_EVENTS | {"block_inventory_received", "block_body_received", "block_relay_started", "block_relay_finished"}
 RESULTS = {"committed", "duplicate", "rejected", "unavailable", "timed_out"}
 

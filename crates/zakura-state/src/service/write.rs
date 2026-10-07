@@ -1839,6 +1839,8 @@ pub enum NonFinalizedWriteMessage {
         queued: QueuedSemanticallyVerified,
         /// The instant immediately before the state service attempted the channel send.
         queued_at: Instant,
+        /// Paired observation of this exact writer queue occurrence.
+        dashboard_stage: zakura_jsonl_trace::dashboard::BlockStage,
         /// Bounds queued block bodies and blocks relay against an unpublished transition.
         write_slot: tokio::sync::OwnedSemaphorePermit,
     },
@@ -2922,8 +2924,12 @@ impl WriteBlockWorkerTask {
                 NonFinalizedWriteMessage::Commit {
                     queued,
                     queued_at,
+                    dashboard_stage,
                     write_slot,
-                } => Some((queued, queued_at, write_slot)),
+                } => {
+                    dashboard_stage.finish(true);
+                    Some((queued, queued_at, write_slot))
+                }
                 NonFinalizedWriteMessage::Invalidate {
                     hash,
                     rsp_tx,

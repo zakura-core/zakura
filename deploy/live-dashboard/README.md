@@ -486,3 +486,9 @@ Residence ends at observed mining, expiry, or eviction, with separate outcomes.
 Descendants removed with a mined or expired ancestor count as evicted rather
 than being incorrectly labeled as themselves mined or expired. Clearing storage
 without an observed outcome does not manufacture a residence duration.
+
+The writer queue span is paired across the actual state-service channel send and
+writer dequeue. A failed send finishes with failure, while shutdown before dequeue
+leaves an incomplete span. Finalized RocksDB writes are attached to the hash being
+finalized, which can be older than the current tip. They are not attributed to the
+new tip block merely because they occur during its processing.

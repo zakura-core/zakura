@@ -256,8 +256,11 @@ class StageTests(unittest.TestCase):
         finish["process"] = "2-123"
         self.assertIsNone(n.arrival_summary([body, finish])[0]["body_to_commit_ms"])
         finish["process"] = "1-123"
-        finish["stage"] = "contextual_validation"
-        self.assertIsNone(n.arrival_summary([body, finish])[0]["body_to_commit_ms"])
+        for name in ("contextual_validation", "writer_queue", "finalized_write"):
+            finish = self.stage("block_stage_finished", 5, name=name)
+            self.assertIsNotNone(finish)
+            finish["success"] = True
+            self.assertIsNone(n.arrival_summary([body, finish])[0]["body_to_commit_ms"])
 
     def test_restart_and_wrong_stage_never_join(self):
         rows = n.stage_summary([self.stage("block_stage_started", 2),

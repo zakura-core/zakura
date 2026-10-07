@@ -206,7 +206,8 @@ unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 
 # List of URLs for allowed Git repositories
-allow-git = []
+# Common is pinned to the reviewed merge commit until its next registry release.
+allow-git = ["https://github.com/zakura-core/common"]
 
 [sources.allow-org]
 github = [

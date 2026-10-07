@@ -307,7 +307,7 @@ records, repeated measurements, and concurrent work. Empty data must explain its
 coverage and zero must mean a measured absence. Do not fabricate activity to make
 charts look useful. Keep chart legends, units, and time-window semantics explicit.
 
-The initial transport is opt-in through `ZAKURA_DASHBOARD_SOCKET`: nonblocking
+The initial transport is opt-in through `DASHBOARD_EVENT_SOCKET`: nonblocking
 local Unix datagrams capped at 8 KiB, with process identity, monotonic timestamps,
 wall-clock timestamps, and sequence numbers. A missing or slow dashboard must not
 block node validation. No credentials, peer addresses, raw errors, or transaction
@@ -440,3 +440,11 @@ requires a listening event socket, retains the old release/unit, and rolls back
 if readiness fails. This helper assumes database-format compatibility has been
 checked before activation. The current experiment does not change the database
 version constants relative to the installed v1.6.0 release.
+
+
+The first activation of `d6af0101b` failed before state initialization because
+`ZAKURA_DASHBOARD_SOCKET` was interpreted as a strict node configuration field.
+The opt-in variable is now `DASHBOARD_EVENT_SOCKET`, outside both configuration
+prefixes (`ZAKURA_` and `ZEBRA_`). Activation now also fails fast on an exited
+node process instead of waiting through the full readiness timeout. The old
+binary/unit rollback must complete before retrying with the corrected build.

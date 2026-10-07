@@ -1,6 +1,6 @@
 //! Opt-in local dashboard events. Delivery never waits for the consumer.
 //!
-//! Set `ZAKURA_DASHBOARD_SOCKET` before startup to a Unix datagram socket owned
+//! Set `DASHBOARD_EVENT_SOCKET` before startup to a Unix datagram socket owned
 //! by the dashboard. Events are lossy under pressure. Sequence gaps expose loss
 //! to the consumer, which must never present incomplete spans as complete ones.
 
@@ -40,7 +40,7 @@ pub fn enabled() -> bool {
 
 fn sink() -> Option<&'static DashboardSink> {
     SINK.get_or_init(|| {
-        let path = std::env::var_os("ZAKURA_DASHBOARD_SOCKET")?;
+        let path = std::env::var_os("DASHBOARD_EVENT_SOCKET")?;
         DashboardSink::new(path.into()).ok()
     })
     .as_ref()

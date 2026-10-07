@@ -47,6 +47,7 @@ systemctl start zakura-dashboard-node
 ready=false
 for attempt in {1..90}; do
   if curl --fail --silent --max-time 2 http://127.0.0.1:8080/ready >/dev/null; then ready=true; break; fi
+  [[ "$(systemctl show zakura-dashboard-node -p ExecMainStatus --value)" == 0 ]] || break
   sleep 2
 done
 [[ "$ready" == true ]]

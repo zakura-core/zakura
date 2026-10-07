@@ -318,6 +318,20 @@ function renderNetwork() {
       ]),
     5,
   );
+  const queueRows = new Map();
+  for (const connection of connections) {
+    for (const queue of connection.queues || []) {
+      const key = `${queue.kind}/${queue.direction}`;
+      const row = queueRows.get(key) || { name: queue.kind_name.replaceAll("_", " "), direction: queue.direction, used: 0, capacity: 0, count: 0 };
+      row.used += queue.occupied_slots;
+      row.capacity += queue.capacity;
+      row.count += 1;
+      queueRows.set(key, row);
+    }
+  }
+  $("native-queue-pressure").hidden = !queueRows.size;
+  table("native-queue-rows", [...queueRows.values()].map((row) => [row.name, row.direction, fmt(row.used), fmt(row.capacity), fmt(row.count)]), 5);
+  set("native-queue-coverage", `Current occupied capacity includes queued frames and producer reservations. Sums use only recent observations of active persistent service queues, sampled every five seconds. Brief peaks may be missed.${connections.some((row) => row.queues_limited) ? " Queue coverage is limited." : ""}`);
   rows("native-stats", [
     ["Active sessions now", fmt(value("native_peers"))],
     ["Dials started", fmt(eventCount("dial_started_ps"))],

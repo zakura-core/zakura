@@ -40,6 +40,22 @@ impl OrderedStreamFailureCause {
     }
 }
 
+/// A weak queue observer must not keep a service session alive.
+pub(crate) type CapacityObserver = Box<dyn Fn() -> Option<(usize, usize)> + Send + Sync>;
+
+/// Observe occupied capacity, including outstanding reservations, without ownership.
+pub(crate) fn observe_capacity<T: Send + 'static>(sender: &mpsc::Sender<T>) -> CapacityObserver {
+    let weak = sender.downgrade();
+    Box::new(move || {
+        let sender = weak.upgrade()?;
+        if sender.is_closed() {
+            return None;
+        }
+        let capacity = sender.max_capacity();
+        Some((capacity.saturating_sub(sender.capacity()), capacity))
+    })
+}
+
 /// Receive half for bounded, rate-admitted Zakura frames.
 #[derive(Debug)]
 pub struct FramedRecv {
@@ -227,6 +243,14 @@ impl FramedSend {
             .await
             .map(|permit| GuardedFrameSlot { permit, sender })
             .map_err(|_| GuardedReserveError::Closed)
+    }
+
+    /// Observe queued and reserved capacity without retaining a sender clone.
+    pub(crate) fn capacity_observer(&self) -> CapacityObserver {
+        match &self.sender {
+            FramedSender::Plain(sender) => observe_capacity(sender),
+            FramedSender::Queued(sender) => observe_capacity(sender),
+        }
     }
 
     /// Current free slots in the bounded transport queue.
@@ -436,6 +460,27 @@ mod tests {
             .expect("the worker queue has a slot")
             .send(frame(1), FrameGuard::new(reservation));
         (sender, receiver, budget)
+    }
+
+    #[tokio::test]
+    async fn capacity_observer_tracks_dequeues_and_does_not_retain_sender() {
+        let (sender, mut receiver) = mpsc::channel::<u8>(2);
+        let observe = observe_capacity(&sender);
+        assert_eq!(observe(), Some((0, 2)));
+        let reservation = sender.try_reserve().unwrap();
+        assert_eq!(observe(), Some((1, 2)));
+        sender.try_send(1).unwrap();
+        assert_eq!(observe(), Some((2, 2)));
+        assert_eq!(receiver.recv().await, Some(1));
+        assert_eq!(observe(), Some((1, 2)));
+        drop(reservation);
+        assert_eq!(observe(), Some((0, 2)));
+        drop(sender);
+        assert_eq!(observe(), None);
+        assert_eq!(
+            receiver.try_recv(),
+            Err(mpsc::error::TryRecvError::Disconnected)
+        );
     }
 
     #[tokio::test]

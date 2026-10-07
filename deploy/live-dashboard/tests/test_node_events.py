@@ -301,3 +301,24 @@ class DeliveryCoverageTests(unittest.TestCase):
             self.assertEqual(feed.status()["reporting_runs"], 2)
         finally:
             feed.close()
+
+
+class QueuePressureTests(unittest.TestCase):
+    def test_bounded_private_queue_observations_and_missing_old_fields(self):
+        row = {"version": 1, "process": "1-123", "monotonic_ns": 1,
+               "event": {"event": "native_connection", "connection": 1, "closed": False,
+                         "rx_bytes": 0, "tx_bytes": 0, "lost_packets": 0, "lost_bytes": 0,
+                         "rtt_ms": None, "queues_limited": {"private": "secret"}}}
+        self.assertIsNone(n.parse_network_event(json.dumps(row).encode())["queues_limited"])
+        queue = {"stream": 1, "kind": 2, "kind_name": "gossip", "direction": "inbound",
+                 "occupied_slots": 1, "capacity": 4, "private": "secret"}
+        row["event"].update(queues=[queue], queues_limited=False)
+        parsed = n.parse_network_event(json.dumps(row).encode())
+        self.assertEqual(parsed["queues"][0]["occupied_slots"], 1)
+        self.assertNotIn("secret", json.dumps(parsed))
+        for field, value in (("occupied_slots", 5), ("capacity", 0), ("direction", "unknown"), ("kind_name", "private")):
+            invalid = json.loads(json.dumps(row))
+            invalid["event"]["queues"][0][field] = value
+            self.assertIsNone(n.parse_network_event(json.dumps(invalid).encode()))
+        row["event"]["queues"] = [queue] * 33
+        self.assertIsNone(n.parse_network_event(json.dumps(row).encode()))

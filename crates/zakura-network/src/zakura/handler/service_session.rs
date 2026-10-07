@@ -220,6 +220,22 @@ pub(super) fn spawn_service_session(
             bounded_stream_queue_depths(queue_depth, prepared.context.queue_depths);
         let (inbound_tx, inbound_rx) = mpsc::channel(inbound_depth);
         let (sender, outbound_rx) = worker_framed_channel(outbound_depth);
+        if zakura_jsonl_trace::dashboard::enabled() {
+            super::dashboard::register_queue(
+                prepared.context.conn.id,
+                prepared.context.stream_id,
+                prepared.stream.kind,
+                "inbound",
+                crate::zakura::transport::observe_capacity(&inbound_tx),
+            );
+            super::dashboard::register_queue(
+                prepared.context.conn.id,
+                prepared.context.stream_id,
+                prepared.stream.kind,
+                "outbound",
+                sender.capacity_observer(),
+            );
+        }
         if prepared.context.messages.is_some() {
             prepared.context.precheck.pause();
         }

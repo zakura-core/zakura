@@ -438,6 +438,11 @@
               role="img"
               aria-label="Native QUIC transport bytes per second"
             ></div>
+            <div id="native-queue-pressure" hidden>
+              <div class="panel-heading"><h3>Persistent stream capacity</h3></div>
+              <div class="table-scroll"><table><thead><tr><th>Stream</th><th>Direction</th><th>Occupied slots</th><th>Total slots</th><th>Observed queues</th></tr></thead><tbody id="native-queue-rows"></tbody></table></div>
+              <p id="native-queue-coverage" class="panel-bottom"></p>
+            </div>
             <div class="table-scroll">
               <table>
                 <thead>

@@ -455,3 +455,13 @@ build is running as `zakura-dashboard-build-v3.service` at `431ee608e`; leave it
 checkout unchanged until completion. Dashboard release `431ee608e` is live and
 contains the corrected node unit template for the next activation. The failed
 custom process exited during configuration loading, before database initialization.
+
+Native persistent service queues now have weak capacity observers. Five-second
+connection observations include occupied frame slots (queued plus reserved), total
+capacity, stream kind and direction. Dequeues, released reservations, and receiver
+closure are reflected by the current channel state. Observers do not retain sender
+ownership. Registry capacity is 4,096 queues, responses contain at most 32 queues
+per connection, and truncation is explicitly flagged. The dashboard sums fresh
+observations by stream kind/direction; this is not an instantaneous synchronized
+snapshot or a high-water mark. The new Rust queue test and live validation still
+need the next Linux build after `431ee608e`.

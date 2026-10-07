@@ -103,7 +103,24 @@ def parse_network_event(data):
         rtt = event.get("rtt_ms")
         if rtt is not None and (type(rtt) not in (int, float) or not 0 <= rtt <= 600_000):
             return None
-        return {**{key: event[key] for key in fields}, "closed": event["closed"], "rtt_ms": rtt,
+        queues = event.get("queues")
+        limited = event.get("queues_limited")
+        if queues is not None:
+            if not isinstance(queues, list) or len(queues) > 32 or type(limited) is not bool:
+                return None
+            public_queues = []
+            for queue in queues:
+                if (not isinstance(queue, dict) or not integer(queue.get("stream"))
+                    or not integer(queue.get("kind"), 65535)
+                    or queue.get("kind_name") not in ("control", "request", "gossip", "legacy_request", "discovery", "header_sync", "block_sync", "unknown")
+                    or queue.get("direction") not in ("inbound", "outbound")
+                    or not integer(queue.get("capacity"), 2**32 - 1) or queue["capacity"] == 0
+                    or not integer(queue.get("occupied_slots"), queue["capacity"])):
+                    return None
+                public_queues.append({key: queue[key] for key in ("stream", "kind", "kind_name", "direction", "occupied_slots", "capacity")})
+            queues = public_queues
+        return {"queues": queues, "queues_limited": limited if queues is not None else None,
+                **{key: event[key] for key in fields}, "closed": event["closed"], "rtt_ms": rtt,
                 "process": process, "monotonic_ns": row["monotonic_ns"]}
     except (ValueError, TypeError, RecursionError):
         return None
@@ -325,7 +342,7 @@ class EventFeed:
     def native(self, now):
         with self.lock:
             rows = [row for row in self.network.values() if not row["closed"] and 0 <= now - row["received_at"] <= 15]
-            public = [{key: row[key] for key in ("connection", "rtt_ms", "rx_bytes_ps", "tx_bytes_ps", "lost_packets", "received_at")} for row in rows]
+            public = [{key: row[key] for key in ("connection", "rtt_ms", "rx_bytes_ps", "tx_bytes_ps", "lost_packets", "received_at", "queues", "queues_limited")} for row in rows]
         return {"connections": public, "status": self.status()}
 
     def observe_delivery(self, data, process):

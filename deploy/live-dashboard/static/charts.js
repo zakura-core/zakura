@@ -23,7 +23,7 @@ function chartSeriesLabel(key) {
   if (key.endsWith("_p50_ms")) return "p50";
   if (key.endsWith("_p95_ms")) return "p95";
   const labels = {
-    body_wait_ms: "Queue → body ready", verification_ms: "Verification",
+    duration_ms: "Duration", body_wait_ms: "Queue → body ready", verification_ms: "Verification",
     relay_ms: "Local relay", admission_ms: "Admission checks",
     mined_ms: "Mined", expired_ms: "Expired", evicted_ms: "Evicted",
     execution_ms: "Execution", scheduling_ms: "Scheduling", in_batch_wait_ms: "In-batch wait",
@@ -37,10 +37,32 @@ function chartSeriesLabel(key) {
   return labels[key] || key.replaceAll("_", " ");
 }
 
+function chartPointHits(plot, left, top, radius = 12) {
+  if (left < 0 || top < 0) return [];
+  const points = [];
+  let closest = null, distance = radius * radius;
+  for (let i = 0; i < plot.data[0].length; i++) {
+    const x = plot.valToPos(plot.data[0][i], "x");
+    if (Math.abs(x - left) > radius + 6) continue;
+    for (let series = 1; series < plot.data.length; series++) {
+      const value = plot.data[series][i];
+      if (!Number.isFinite(value)) continue;
+      const y = plot.valToPos(value, "y");
+      const point = { i, series, value, t: plot.data[0][i], x, y };
+      points.push(point);
+      const d = (x - left) ** 2 + (y - top) ** 2;
+      if (d <= distance) { closest = point; distance = d; }
+    }
+  }
+  return closest ? points.filter(p => (p.x - closest.x) ** 2 + (p.y - closest.y) ** 2 <= 36) : [];
+}
+
 class HistoryChart {
   constructor(container, keys, format, points, colors, clock) {
     Object.assign(this, { container, keys, format, points, colors, clock });
     this.plot = null;
+    this.hoverEntries = [];
+    container.addEventListener("click", () => this.showObservations());
   }
 
   update(rows, start, end) {
@@ -91,12 +113,16 @@ class HistoryChart {
         y: false,
         drag: { x: false, y: false, setScale: false },
         points: { size: 7, width: 1, stroke: "#0c1117" },
-        // Keep the guide, markers, and tooltip on the same sample, including nulls.
-        dataIdx: (_plot, _series, index) => index,
-        move: (plot, left, top) =>
-          left < 0
-            ? [left, top]
-            : [plot.valToPos(plot.data[0][plot.posToIdx(left)], "x"), top],
+        dataIdx: (_plot, series, index) => this.points
+          ? (this.hoverEntries.find(p => p.series === series)?.i ?? null) : index,
+        move: (plot, left, top) => {
+          if (this.points) {
+            this.hoverEntries = chartPointHits(plot, left, top);
+            const hit = this.hoverEntries[0];
+            return hit ? [hit.x, hit.y] : [-10, -10];
+          }
+          return left < 0 ? [left, top] : [plot.valToPos(plot.data[0][plot.posToIdx(left)], "x"), top];
+        },
       },
       scales: {
         x: { time: true, range: () => [this.window.min, this.window.max] },
@@ -154,35 +180,74 @@ class HistoryChart {
     };
   }
 
+  eventTime(t) {
+    return new Date(t * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit", fractionalSecondDigits: 3 });
+  }
+
+  showObservations() {
+    if (!this.points || this.hoverEntries.length < 2) return;
+    const dialog = document.createElement("dialog");
+    dialog.className = "event-detail-dialog";
+    const heading = document.createElement("h2");
+    heading.textContent = `${this.hoverEntries.length} overlapping points`;
+    const close = document.createElement("button");
+    close.textContent = "Close observations";
+    close.addEventListener("click", () => dialog.close());
+    const table = document.createElement("table");
+    const head = table.createTHead().insertRow();
+    for (const label of ["Recorded time", "Series", "Value"]) {
+      const cell = document.createElement("th"); cell.textContent = label; head.append(cell);
+    }
+    const body = table.createTBody();
+    for (const entry of [...this.hoverEntries].sort((a, b) => a.t - b.t || a.series - b.series || a.value - b.value)) {
+      const row = body.insertRow();
+      for (const value of [this.eventTime(entry.t), chartSeriesLabel(this.keys[entry.series - 1]), this.format(entry.value)]) row.insertCell().textContent = value;
+    }
+    dialog.append(heading, close, table);
+    dialog.addEventListener("close", () => dialog.remove());
+    document.body.append(dialog);
+    dialog.showModal();
+  }
+
   showTooltip(plot) {
     const { idx, left, top } = plot.cursor;
     if (idx == null || left < 0 || top < 0) {
       this.tooltip.hidden = true;
       return;
     }
+    const entries = this.points ? this.hoverEntries : this.keys.flatMap((_key, index) => {
+      const value = plot.data[index + 1][idx];
+      return Number.isFinite(value) ? [{ series: index + 1, value, t: plot.data[0][idx] }] : [];
+    });
+    if (!entries.length) { this.tooltip.hidden = true; return; }
     this.tooltip.replaceChildren();
     const time = document.createElement("div");
     time.className = "chart-tooltip-time";
-    time.textContent = this.clock(plot.data[0][idx]);
+    time.textContent = entries.length > 1 && this.points ? `${entries.length} points here` : this.eventTime(entries[0].t);
     this.tooltip.append(time);
-    this.keys.forEach((key, index) => {
-      const value = plot.data[index + 1][idx];
-      if (!Number.isFinite(value)) return;
+    const groups = new Map();
+    for (const entry of entries) {
+      const key = `${entry.series}:${entry.value}`;
+      if (!groups.has(key)) groups.set(key, { ...entry, count: 0 });
+      groups.get(key).count++;
+    }
+    for (const entry of [...groups.values()].slice(0, 6)) {
       const row = document.createElement("div");
       row.className = "chart-tooltip-row";
       const swatch = document.createElement("i");
-      swatch.style.backgroundColor = this.colors[index];
+      swatch.style.backgroundColor = this.colors[entry.series - 1];
       const label = document.createElement("span");
-      label.textContent = chartSeriesLabel(key);
+      label.textContent = chartSeriesLabel(this.keys[entry.series - 1]);
       const number = document.createElement("strong");
-      number.textContent = this.format(value);
+      number.textContent = `${this.format(entry.value)}${entry.count > 1 ? ` × ${entry.count}` : ""}`;
       row.append(swatch, label, number);
       this.tooltip.append(row);
-    });
-    if (this.tooltip.childElementCount === 1) {
-      const empty = document.createElement("div");
-      empty.textContent = "No observation";
-      this.tooltip.append(empty);
+    }
+    if (this.points && entries.length > 1) {
+      const hint = document.createElement("div");
+      hint.className = "chart-tooltip-hint";
+      hint.textContent = "Click chart to inspect all points";
+      this.tooltip.append(hint);
     }
     this.tooltip.hidden = false;
     const rect = this.container.getBoundingClientRect(),

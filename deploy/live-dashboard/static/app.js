@@ -23,6 +23,7 @@ let state = null;
 let history = [];
 let cryptoBatches = null;
 let transactionEvents = null;
+let processingEvents = null;
 let range = "15m";
 let paused = false;
 let fetching = false;
@@ -215,7 +216,6 @@ function render() {
     : `The node reported ${fmt(lost)} undelivered events across the observed node runs. ${valid(latestLost) ? `${fmt(latestLost)} are from the newest observed run.` : "Loss reporting for the newest run is unavailable."} These are not selected-period counts. Event-based totals and timings may be incomplete.`);
   renderBlocks(now);
   renderFlow();
-  renderPipeline();
   renderNetwork();
   renderSystem(h);
   renderStatus();
@@ -254,47 +254,6 @@ function renderFlow() {
   applyWidths($("transaction-flow"));
 }
 
-function renderPipeline() {
-  const end = period?.end || state.generated_at;
-  const peak = (key) =>
-    history.reduce(
-      (max, row) =>
-        row.t >= end - WINDOWS[range] && row.t <= end && valid(row[key])
-          ? max === null
-            ? row[key]
-            : Math.max(max, row[key])
-          : max,
-      null,
-    );
-  const bufferActive = ["reserved_bytes", "reorder_bytes", "pipeline_memory_bytes", "header_budget_used"]
-    .some((key) => value(key) > 0 || peak(key) > 0);
-  $("sync-buffer-panel").hidden = !bufferActive && !state.chain?.resource_stalled;
-  table(
-    "sync-buffers",
-    [
-      ["Reserved block budget", "reserved_bytes", bytes],
-      ["Reorder buffer", "reorder_bytes", bytes],
-      ["Attributed pipeline memory", "pipeline_memory_bytes", bytes],
-      ["Header chunks owned", "header_budget_used", fmt],
-    ].map(([name, key, formatValue]) => [
-      name,
-      formatValue(value(key)),
-      formatValue(peak(key)),
-    ]),
-    3,
-  );
-  rows("pipeline-resources", [
-    ["Header chunk capacity", fmt(value("header_budget_capacity"))],
-    [
-      "Resource alarm",
-      sourceFresh("chain")
-        ? state.chain.resource_stalled
-          ? "Stalled"
-          : "Clear"
-        : "—",
-    ],
-  ]);
-}
 function renderNetwork() {
   const nativeNow = paused ? state.generated_at : Date.now() / 1000;
   const connections = (nativeDetails?.connections || []).filter(
@@ -736,13 +695,13 @@ function renderCharts() {
       section.innerHTML = `<div class="panel-heading"><h3>${label}</h3></div><div id="${id}" class="chart short" role="img" aria-label="${label} timing history"></div>`;
       $("stage-history").append(section);
     }
-    const keys = [`stage_${name}_p50_ms`, `stage_${name}_p95_ms`];
-    const end = period?.end || state.generated_at;
-    const available = history.some((row) => row.t >= end - WINDOWS[range] && row.t <= end &&
-      keys.some((key) => valid(row[key])));
-    $(id).parentElement.hidden = !available;
-    if (available) chart(id, keys, ms, true);
+    const stage = name === "rocksdb_write" ? "finalized_write" : name;
+    const samples = (processingEvents?.samples || []).filter((row) => row.stage === stage);
+    $(id).parentElement.hidden = !samples.length;
+    if (samples.length) chart(id, ["duration_ms"], ms, true, samples);
   }
+  set("processing-coverage", `Each point is one measured stage occurrence. Stages overlap and cannot be added. Finalized writes belong to the older block being finalized. Missing boundaries are excluded.${processingEvents?.limited ? " Retained event coverage is limited." : ""}`);
+
   const verifiers = {
     halo2: "Halo 2",
     groth16_sapling: "Sapling / Groth16",
@@ -845,6 +804,7 @@ async function loadHistory() {
     history = data.samples;
     cryptoBatches = data.crypto || null;
     transactionEvents = data.transactions || null;
+    processingEvents = data.processing || null;
     period = data.activity;
     periodBlocks = data.blocks;
     lastHistory = Date.now();

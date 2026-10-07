@@ -1290,3 +1290,11 @@ dialog p {
 @media (max-width: 1000px) {
   #transaction-lifecycle > .grid { grid-template-columns: minmax(0, 1fr); }
 }
+
+#crypto-history { grid-template-columns: minmax(0, 1fr); gap: 20px; }
+#crypto-history .chart { height: 230px; }
+#crypto-history .panel-heading h3 { font-size: 13px; font-weight: 500; }
+.event-detail-dialog { width: min(680px, calc(100vw - 32px)); max-height: 80vh; overflow: auto; }
+.event-detail-dialog table { width: 100%; }
+.event-detail-dialog th, .event-detail-dialog td { text-align: left; padding: 8px; }
+.chart-tooltip-hint { color: var(--muted); margin-top: 7px; }

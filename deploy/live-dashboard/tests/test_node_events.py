@@ -113,6 +113,26 @@ class FeedTests(unittest.TestCase):
                 sender.close()
                 feed.close()
 
+    def test_processing_uses_individual_correlated_completions(self):
+        feed = n.EventFeed(":memory:")
+        def packet(kind, seq, ns, token=1, process="1-123"):
+            return json.dumps({"version": 1, "process": process, "sequence": seq,
+                "monotonic_ns": ns, "unix_ms": 100000,
+                "event": {"event": kind, "hash": "a" * 64, "stage": "writer_queue",
+                          "stage_token": token, "success": True}}).encode()
+        try:
+            feed.ingest([packet("block_stage_started", 1, 1000000)], 90)
+            feed.ingest([packet("block_stage_finished", 2, 4000000)], 110)
+            feed.ingest([packet("block_stage_finished", 2, 4000000)], 111)
+            feed.ingest([packet("block_stage_finished", 3, 5000000, token=2),
+                         packet("block_stage_finished", 4, 6000000, process="2-456")], 112)
+            result = feed.processing(100, 120)
+            self.assertEqual(result["samples"], [{"t": 110, "stage": "writer_queue", "duration_ms": 3, "success": True}])
+            self.assertFalse(result["limited"])
+            self.assertEqual(feed.processing(115, 120)["samples"], [])
+        finally:
+            feed.close()
+
     def test_socket_does_not_replace_existing_file(self):
         import tempfile
         with tempfile.TemporaryDirectory() as directory:

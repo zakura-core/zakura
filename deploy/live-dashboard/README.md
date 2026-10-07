@@ -266,15 +266,19 @@ selected period. These are temporary sync reservations and attributed buffers,
 not total process memory. Observed maxima are not true high-water marks because
 the 15-second sampler can miss short bursts. Missing history remains unavailable.
 
-Processing timings now show per-stage p50/p95 history with independent duration
-scales and the shared selected time range. Like crypto history, these are sampled
-rolling summaries, not per-block spans. Both percentiles are collected from this
-deployment onward without backfilling retained readings into history.
+Processing timings show individual measured stage completions rather than
+percentiles. `/api/history` includes `processing.samples`, paired only by node run,
+block hash, and occurrence ID. It reads at most 16,384 retained events from the
+preceding day, flags limited coverage, and selects completed spans by receipt time.
+Missing boundaries are excluded. Finalized writes refer to the older finalized
+block. Event-chart hover activates only near recorded points. Overlapping points
+show a count and can be clicked to inspect every timestamp, series, and value.
+Crypto plots use the full panel width. The sync buffer panel has been removed.
 
 The header and tab icon use the official Zakura flower from
 https://zakura.com/zakura-flower-v1.svg, served locally as `static/favicon.svg`.
 
-Timing history requires an increase in the matching histogram observation count
+Legacy rolling-summary history requires an increase in the matching histogram observation count
 across scrapes within 45 seconds and the same node activation. Unchanged counts,
 resets, unknown identity, missing counters, and repeated saves leave gaps. Equal
 durations with increasing counts remain distinct observations. Each point is still

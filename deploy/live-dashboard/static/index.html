@@ -295,24 +295,15 @@
               <span>02</span>
               <h2 id="pipeline-title">Processing pipeline</h2>
             </div>
-            <p>Stage timings, cryptographic checks, and sync buffers</p>
+            <p>Stage timings and cryptographic checks</p>
           </div>
           <section class="panel">
             <div class="panel-heading">
               <h2>Processing timings</h2>
               <span class="panel-note" data-period>Observed in 15m</span>
             </div>
-            <div class="chart-legend">
-              <span><i class="dot"></i>p50</span
-              ><span><i class="dot violet"></i>p95</span>
-            </div>
             <div id="stage-history" class="stage-history"></div>
-            <p class="panel-bottom">
-              Each chart has its own duration scale. Hover for p50/p95. Dots
-              sample the node’s rolling summaries only when new observations
-              arrive, not individual blocks. Missing summaries leave gaps.
-              Stages overlap and cannot be added into one block’s duration.
-            </p>
+            <p id="processing-coverage" class="panel-bottom">Each point is one measured stage occurrence.</p>
           </section>
           <div class="grid two">
             <section class="panel crypto-panel">
@@ -335,28 +326,7 @@
                 which can overlap and include scheduling. Missing records leave gaps.
               </p>
             </section>
-            <section class="panel" id="sync-buffer-panel" hidden>
-              <div class="panel-heading"><h2>Sync buffers</h2></div>
-              <div class="table-scroll">
-                <table>
-                  <thead>
-                    <tr>
-                      <th>Buffer</th>
-                      <th>Current</th>
-                      <th>Observed max · <span data-period-short>15m</span></th>
-                    </tr>
-                  </thead>
-                  <tbody id="sync-buffers"></tbody>
-                </table>
-              </div>
-              <p class="panel-bottom">
-                Temporary sync reservations and buffers, not total node memory.
-                Observed maxima use available 15-second samples in the selected
-                period. Brief peaks between samples can be missed. — means no
-                measurement.
-              </p>
-              <dl id="pipeline-resources" class="stat-list"></dl>
-            </section>
+
           </div>
           <div class="grid two">
             <section class="panel">
@@ -825,9 +795,8 @@
         </dd>
         <dt>Processing timings</dt>
         <dd>
-          Stage charts show sampled rolling p50 and p95 summaries over the
-          selected period. Each chart has its own duration scale. These are not
-          individual block timings. Stages can overlap or run in parallel, so
+          Stage charts show individual measured stage durations in the selected
+          period. Each chart has its own duration scale. Stages can overlap or run in parallel, so
           they cannot be added together. Missing observations remain gaps.
         </dd>
         <dt>Networking</dt>

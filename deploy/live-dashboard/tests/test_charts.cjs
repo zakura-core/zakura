@@ -80,3 +80,14 @@ test("isolated samples remain available to the processing scatter chart", () => 
   assert.deepEqual(data([{ t: 10, v: 4 }], ["v"], 0, 20), [[10], [4]]);
   assert.deepEqual(data([{ t: 10 }], ["v"], 0, 20), [[10], [null]]);
 });
+
+const hitTest = runInNewContext(readFileSync(join(__dirname, "../static/charts.js"), "utf8") + "\nchartPointHits;");
+test("point hover ignores empty space and retains every overlapping value", () => {
+  const plot = { data: [[10, 10, 11, 50], [20, 20, 21, null], [null, null, 22, 80]], valToPos: v => v };
+  assert.equal(hitTest(plot, 30, 40).length, 0);
+  assert.equal(hitTest(plot, -1, 20).length, 0);
+  const hits = hitTest(plot, 10, 20);
+  assert.equal(hits.length, 4);
+  assert.equal(hits.filter(p => p.value === 20).length, 2);
+  assert.equal(hits.filter(p => p.series === 2).length, 1);
+});

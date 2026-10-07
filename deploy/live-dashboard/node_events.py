@@ -342,6 +342,34 @@ class EventFeed:
                 self.db.execute("DELETE FROM node_transaction_events WHERE received < ?", (now - 86400,))
                 self.db.execute("DELETE FROM node_transaction_events WHERE rowid IN (SELECT rowid FROM node_transaction_events ORDER BY received DESC, rowid DESC LIMIT -1 OFFSET 65536)")
 
+    def processing(self, start, end):
+        with self.lock:
+            rows = self.db.execute("SELECT body, received FROM node_block_events WHERE received >= ? AND received <= ? ORDER BY received DESC, rowid DESC LIMIT 16385",
+                                   (end - 86400, end)).fetchall()
+        events = [{**json.loads(body), "at": received} for body, received in rows[:16384]]
+        pending, samples = {}, []
+        for row in sorted(events, key=lambda r: (r["process"], r["monotonic_ns"], r["sequence"])):
+            kind = row["kind"]
+            if kind in STAGE_EVENTS:
+                key = (row["process"], row["hash"], "stage", row["stage"], row["stage_token"])
+                stage = row["stage"]
+                begins = kind == "block_stage_started"
+            elif kind in ("block_submit_queued", "commit_start"):
+                key = (row["process"], row["hash"], "driver", row["attempt"])
+                stage = "submit_queue"
+                begins = kind == "block_submit_queued"
+            else:
+                continue
+            if begins:
+                pending.setdefault(key, row)
+                continue
+            first = pending.pop(key, None)
+            if first is not None and start <= row["at"] <= end and row["monotonic_ns"] >= first["monotonic_ns"]:
+                samples.append({"t": row["at"], "stage": stage,
+                                "duration_ms": (row["monotonic_ns"] - first["monotonic_ns"]) / 1e6,
+                                "success": row.get("success", True)})
+        return {"samples": sorted(samples, key=lambda r: r["t"]), "limited": len(rows) > 16384}
+
     def transactions(self, start, end):
         with self.lock:
             rows = self.db.execute("SELECT body, received FROM node_transaction_events WHERE received >= ? AND received <= ? ORDER BY received DESC, rowid DESC LIMIT 8193",

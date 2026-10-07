@@ -316,4 +316,14 @@ concurrent delivery, and expose coverage gaps. Existing debug traces remain sepa
 Implementation status: the bounded sender and driver queue/verify-and-commit
 boundaries are in development. The driver's `commit_start` currently wraps both
 verification and state commit, so it must not be labeled disk-write latency.
-Receiver integration, remaining hooks, dashboards, and live validation are pending.
+`node_events.py` now validates and allowlists datagrams and joins bounded block
+attempts using process/hash/apply-token identity, tested for out-of-order events,
+missing boundaries, retries, restarts, duplicates, and retention. Socket receiver
+integration, persistence, remaining hooks, dashboards, and live validation are pending.
+
+The first Linux build is running on `codex-vast-tide-7164` as
+`zakura-dashboard-build.service` from `/root/workspace/zakura` at `cf102b473`.
+Check the unit and journal before changing that checkout or starting another build.
+It is limited to three build jobs, 300% CPU, 10 GiB memory, and nice 10. Nothing
+from this build has been installed or enabled in the running node. The existing
+node process is still 37210. Do not treat a compiled binary as a completed rollout.

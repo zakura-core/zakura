@@ -432,3 +432,11 @@ The receiver keeps the maximum reported count per observed node run, bounded to
 known loss or a stopped receiver, and does not pretend the lifetime failure count
 belongs to the selected window. Older node builds without the field report unknown,
 not zero. This sender change requires a later build than `d6af0101b`.
+
+The `d6af0101b` incremental node build completed successfully at 21:28 UTC. To
+activate a completed build on this dedicated host, use `deploy-node.sh` with the
+host, full commit, and build unit. It verifies the checkout and binary revision,
+requires a listening event socket, retains the old release/unit, and rolls back
+if readiness fails. This helper assumes database-format compatibility has been
+checked before activation. The current experiment does not change the database
+version constants relative to the installed v1.6.0 release.

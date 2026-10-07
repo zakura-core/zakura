@@ -129,8 +129,17 @@ snapshot, verified against its manifest checksum before extraction. No productio
 node database is read or copied. The snapshot manifest is retained under
 `/opt/zakura-dashboard-node/downloads/snapshot.json`.
 
-For node experiments, build a selected commit in `/root/workspace/zakura` on this
-host, then stop `zakura-dashboard-node`, install the binary in a new immutable
+The host has Rust 1.99 and a checkout at `/root/workspace/zakura`. For node
+experiments, select a commit in that checkout and build with:
+
+```sh
+. /root/.cargo/env
+cd /root/workspace/zakura
+CARGO_BUILD_JOBS=4 cargo build --release --locked -p zakurad
+```
+
+Stop the node while compiling if an experiment needs more memory. Before
+installing the build, stop `zakura-dashboard-node`. Install the binary in a new immutable
 `/opt/zakura-dashboard-node/releases/<commit>/bin/` directory, and change the
 `current` symlink before starting the service. Each release directory needs a
 `zakurad` symlink to `bin/zakurad`. Retain the previous release for rollback and

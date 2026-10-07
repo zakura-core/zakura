@@ -269,3 +269,6 @@ Processing timings now show per-stage p50/p95 history with independent duration
 scales and the shared selected time range. Like crypto history, these are sampled
 rolling summaries, not per-block spans. Both percentiles are collected from this
 deployment onward without backfilling retained readings into history.
+
+The header and tab icon use the official Zakura flower from
+https://zakura.com/zakura-flower-v1.svg, served locally as `static/favicon.svg`.

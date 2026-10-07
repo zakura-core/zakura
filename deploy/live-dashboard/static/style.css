@@ -164,6 +164,8 @@ a:focus-visible {
   margin: 0 3px 9px;
 }
 .block-row {
+  position: relative;
+  overflow: hidden;
   width: 100%;
   text-align: left;
   border: 0;
@@ -173,8 +175,17 @@ a:focus-visible {
   padding: 9px 8px 9px 10px;
   background: #111921;
 }
+.block-fill {
+  position: absolute;
+  inset: 0 auto 0 0;
+  background: #284c3f;
+  pointer-events: none;
+}
+.block-row .row-main,
+.block-row .row-sub {
+  position: relative;
+}
 .block-row.latest {
-  background: #1a302c;
   border-color: var(--mint);
 }
 .block-row.orphan {

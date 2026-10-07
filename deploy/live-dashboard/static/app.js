@@ -16,6 +16,8 @@ const set = (id, value) => {
   $(id).textContent = value;
 };
 const WINDOWS = { "15m": 900, "1h": 3600, "6h": 21600, "24h": 86400 };
+// Consensus limit from zakura-chain/src/block/serialize.rs (bytes, not MiB).
+const MAX_BLOCK_BYTES = 2_000_000;
 const COLORS = ["#bcf6b8", "#c1b6ef", "#f1bf75"];
 let state = null;
 let history = [];
@@ -556,12 +558,18 @@ function renderBlocks(now) {
   const focusHash = document.activeElement?.dataset?.hash;
   $("blocks").innerHTML = blocks.length
     ? blocks
-        .map(
-          (b) =>
-            `<button class="block-row${b.hash === state.chain.hash ? " latest" : ""}${b.canonical === false ? " orphan" : ""}" data-hash="${esc(b.hash)}" aria-label="View block ${fmt(b.height)}"><span class="row-main"><b>${fmt(b.height)}</b><time>${esc(age(now - b.time))}</time></span><span class="row-sub"><span>${fmt(b.transactions)} tx${b.canonical === false ? " · off chain" : ""}</span><span>${bytes(b.size)}</span></span></button>`,
-        )
+        .map((b) => {
+          const fullness = valid(b.size)
+            ? Math.max(0, Math.min(100, (b.size / MAX_BLOCK_BYTES) * 100))
+            : null;
+          const sizeLabel = valid(fullness)
+            ? `${bytes(b.size)} · ${fmt(fullness, 2)}% of 2 MB limit`
+            : "Block size unavailable";
+          return `<button class="block-row${b.hash === state.chain.hash ? " latest" : ""}${b.canonical === false ? " orphan" : ""}" data-hash="${esc(b.hash)}" aria-label="View block ${fmt(b.height)}, ${esc(sizeLabel)}" title="${esc(sizeLabel)}"><span class="block-fill" aria-hidden="true" data-width="${fullness ?? 0}"></span><span class="row-main"><b>${fmt(b.height)}</b><time>${esc(age(now - b.time))}</time></span><span class="row-sub"><span>${fmt(b.transactions)} tx${b.canonical === false ? " · off chain" : ""}</span><span>${bytes(b.size)}</span></span></button>`;
+        })
         .join("")
     : '<p class="empty">Waiting for blocks…</p>';
+  applyWidths($("blocks"));
   if (focusHash)
     $("blocks")
       .querySelector(`[data-hash="${CSS.escape(focusHash)}"]`)

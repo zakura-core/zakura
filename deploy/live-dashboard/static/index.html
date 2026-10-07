@@ -211,7 +211,7 @@
               and timeouts.
             </p>
           </section>
-          <div class="grid three">
+          <div class="grid two">
             <section class="panel">
               <div class="panel-heading">
                 <h2>Shielded verification</h2>
@@ -236,35 +236,6 @@
               <p class="panel-bottom">
                 Cumulative recorded checks. Gaps and missing intervals are
                 excluded.
-              </p>
-            </section>
-            <section class="panel">
-              <div class="panel-heading">
-                <h2>Work in flight</h2>
-                <span class="panel-note">Blocks</span>
-              </div>
-              <div class="metrics-row">
-                <div>
-                  <span class="legend"><i class="dot"></i>Outstanding</span
-                  ><strong data-value="outstanding">—</strong>
-                </div>
-                <div>
-                  <span class="legend"><i class="dot violet"></i>Applying</span
-                  ><strong data-value="applying">—</strong>
-                </div>
-              </div>
-              <div
-                id="queue-chart"
-                class="chart"
-                role="img"
-                aria-label="Block work queues"
-              ></div>
-              <p class="panel-bottom">
-                Outstanding counts requested block bodies still awaiting
-                arrival. Applying counts blocks in the sync pipeline awaiting
-                verification or commit completion. These are current counts, not
-                totals. A caught-up node often shows zero. 15-second samples can
-                miss brief work between blocks.
               </p>
             </section>
             <section class="panel">

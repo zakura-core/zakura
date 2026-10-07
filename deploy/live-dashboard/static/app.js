@@ -655,7 +655,6 @@ function renderCharts() {
   );
   chart("tps-chart", ["tps", "user_tps"], (v) => format("tps", v));
   chart("proof-chart", ["count_halo2_ps", "count_sapling_ps"], fmt);
-  chart("queue-chart", ["outstanding", "applying"], (v) => fmt(v));
   chart("latency-chart", ["peer_p50_ms"], ms);
   chart("processing-chart", ["contextual_ms", "write_ms"], ms, true);
   chart("tx-chart", ["count_tx_verified_ps", "count_tx_failed_ps"], fmt);

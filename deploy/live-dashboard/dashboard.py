@@ -301,6 +301,7 @@ class Store:
         self.lock = threading.Lock()
         self.db.execute("CREATE TABLE IF NOT EXISTS samples (t REAL PRIMARY KEY, body TEXT NOT NULL)")
         self.db.execute("CREATE TABLE IF NOT EXISTS blocks (hash TEXT PRIMARY KEY, height INTEGER, body TEXT NOT NULL)")
+        self.db.execute("CREATE TABLE IF NOT EXISTS latest_processing (id INTEGER PRIMARY KEY CHECK (id = 1), body TEXT NOT NULL)")
         self.db.commit()
 
     def save(self, sample, blocks):
@@ -321,6 +322,16 @@ class Store:
         with self.lock:
             return [json.loads(r[0]) for r in self.db.execute("SELECT body FROM blocks ORDER BY height DESC LIMIT 100")]
 
+    def processing(self):
+        with self.lock:
+            row = self.db.execute("SELECT body FROM latest_processing WHERE id = 1").fetchone()
+        return json.loads(row[0]) if row else {"stages": [], "verifiers": []}
+
+    def save_processing(self, readings):
+        with self.lock, self.db:
+            self.db.execute("INSERT OR REPLACE INTO latest_processing VALUES (1, ?)",
+                            (json.dumps(readings, allow_nan=False),))
+
 
 class Collector:
     def __init__(self, args):
@@ -331,6 +342,7 @@ class Collector:
                       "host_mode": "fleet" if getattr(args, "fleet", None) else "local",
                       "node_service": None,
                       "transaction_flow": [], "stage_timings": [], "messages": [],
+                      "last_processing": self.store.processing(),
                       "streams": [], "peer_details": [], "peer_latency": {},
                       "peers": [], "fleet": {}, "reorgs": [], "rpc_methods": [], "verifiers": [],
                       "version": None, "sources": {}, "blocks": self.store.blocks()}
@@ -402,6 +414,7 @@ class Collector:
         self.state["verifiers"] = [{"name": name, "p50_ms": quantile(metrics, "zakura_consensus_batch_duration_seconds", "0.5", verifier=name, result="success"),
                                     "p95_ms": quantile(metrics, "zakura_consensus_batch_duration_seconds", verifier=name, result="success")}
                                    for name in verifiers[:20]]
+        self.remember_processing(now)
         methods = sorted({tags.get("method") for tags, _ in metrics.get("rpc_request_duration_seconds", []) if tags.get("method")})
         self.state["rpc_methods"] = [{"name": name, "p95_ms": quantile(metrics, "rpc_request_duration_seconds", method=name),
                                      "rps": rate(metric(old, "rpc_requests_total", method=name), metric(metrics, "rpc_requests_total", method=name), seconds)} for name in methods[:60]]
@@ -410,6 +423,21 @@ class Collector:
                 self.state["version"] = metrics[name][0][0].get("version", "")[:80]
         self.previous_metrics, self.previous_metrics_at = metrics, now
         self.source("metrics", True, now)
+
+    def remember_processing(self, now):
+        """Keep historical readings separate from live summaries and chart samples."""
+        saved = self.state["last_processing"]
+        latest = {}
+        for kind, rows in (("stages", self.state["stage_timings"]), ("verifiers", self.state["verifiers"])):
+            retained = {row["name"]: row for row in saved[kind]
+                        if 0 <= now - row["observed_at"] < 86400}
+            for row in rows:
+                if number(row.get("p95_ms")) is not None and row["p95_ms"] >= 0:
+                    retained[row["name"]] = {**row, "observed_at": now}
+            latest[kind] = sorted(retained.values(), key=lambda row: -row["observed_at"])[:20]
+        if latest != saved:
+            self.store.save_processing(latest)
+            self.state["last_processing"] = latest
 
     def update_host(self, result, now):
         host = result["host"]
@@ -577,6 +605,9 @@ class Collector:
         with self.lock:
             state = deepcopy(self.state)
         now = time.time()
+        for kind, readings in state["last_processing"].items():
+            state["last_processing"][kind] = [row for row in readings
+                if 0 <= now - row["observed_at"] < 86400]
         for name, source in state["sources"].items():
             age = now - source["at"] if source.get("at") else None
             source["age"] = age

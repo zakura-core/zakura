@@ -215,6 +215,53 @@ function renderFlow() {
   applyWidths($("transaction-flow"));
 }
 function renderPipeline() {
+  const now = paused ? state.generated_at : Date.now() / 1000;
+  const retained = (kind) =>
+    (state.last_processing?.[kind] || []).filter(
+      (r) =>
+        valid(r.observed_at) &&
+        now >= r.observed_at &&
+        now - r.observed_at < 86400,
+    );
+  const observationAge = (row) =>
+    valid(row?.observed_at)
+      ? `Seen ${age(now - row.observed_at)} ago`
+      : "Not observed yet";
+  const current = sourceFresh("chain") && sourceFresh("metrics");
+  const queues = ["applying", "outstanding", "unsubmitted", "missing"].map(
+    value,
+  );
+  const idle =
+    current &&
+    queues.every((n) => n === 0) &&
+    state.chain.lag === 0 &&
+    !state.chain.resource_stalled &&
+    !state.chain.body_unavailable;
+  const busy = current && queues.some((n) => valid(n) && n > 0);
+  set(
+    "pipeline-status",
+    !current
+      ? "Live telemetry unavailable"
+      : state.chain.resource_stalled
+        ? "Resource pressure"
+        : idle
+          ? "Between blocks · queues empty"
+          : busy
+            ? "Processing blocks"
+            : "Waiting on chain progress",
+  );
+  $("pipeline-state").dataset.mode = !current
+    ? "unavailable"
+    : idle
+      ? "idle"
+      : "active";
+  const tip = state.blocks.find((b) => b.hash === state.chain.hash);
+  set(
+    "pipeline-tip",
+    tip
+      ? `Last observed tip ${fmt(tip.height)}${tip.observed_at ? ` · seen ${age(now - tip.observed_at)} ago` : ""}`
+      : "Waiting for a tip observation",
+  );
   const stages = [
     [
       "01 / Headers",
@@ -238,13 +285,13 @@ function renderPipeline() {
       "04 / Verify",
       "blocks_verified_ps",
       "blocks / second",
-      `${ms(value("contextual_ms"))} contextual p95`,
+      `${format("tx_verified_ps", value("tx_verified_ps"))} mempool tx verified /s`,
     ],
     [
-      "05 / Store",
-      "write_ms",
-      "write latency · p95",
-      `${ms(value("writer_queue_ms"))} queue p95`,
+      "05 / State",
+      "finalized",
+      "finalized storage height",
+      `${fmt(value("compactions"))} compactions running`,
     ],
   ];
   $("block-pipeline").innerHTML = stages
@@ -253,16 +300,25 @@ function renderPipeline() {
         `<div class="pipeline-stage"><h3>${name}</h3><strong>${format(key, value(key))}</strong><small>${unit}</small><p>${esc(detail)}</p></div>`,
     )
     .join("");
-  const timings = sourceFresh("metrics") ? state.stage_timings || [] : [];
+  const savedStages = retained("stages");
+  const stageNames = [
+    ...new Set([
+      ...(state.stage_timings || []).map((r) => r.name),
+      ...savedStages.map((r) => r.name),
+    ]),
+  ];
+  const timings = stageNames.map(
+    (name) => savedStages.find((r) => r.name === name) || { name },
+  );
   const max = Math.max(0.001, ...timings.map((t) => t.p95_ms || 0));
   $("stage-timings").innerHTML = timings.length
     ? timings
         .map(
           (t) =>
-            `<div class="timing-row" title="${esc(t.name)}: p50 ${ms(t.p50_ms)}, p95 ${ms(t.p95_ms)}"><span class="timing-name">${esc(t.name)}</span><div class="timing-track"><span data-width="${Math.min(100, ((t.p95_ms || 0) / max) * 100)}"></span><b data-width="${Math.min(100, ((t.p50_ms || 0) / max) * 100)}"></b></div><span class="timing-value">${ms(t.p95_ms)}</span></div>`,
+            `<div class="timing-row" title="${esc(t.name)}: p50 ${ms(t.p50_ms)}, p95 ${ms(t.p95_ms)}. ${valid(t.observed_at) ? `Observed ${esc(clock(t.observed_at, true))} UTC` : "Not observed yet"}"><span class="timing-name">${esc(t.name)}<small>${observationAge(t)}</small></span><div class="timing-track"><span data-width="${Math.min(100, ((t.p95_ms || 0) / max) * 100)}"></span><b data-width="${Math.min(100, ((t.p50_ms || 0) / max) * 100)}"></b></div><span class="timing-value">${ms(t.p95_ms)}</span></div>`,
         )
         .join("")
-    : '<p class="empty">Timing data unavailable</p>';
+    : '<p class="empty">Waiting for the first processing sample. Readings stay visible between blocks.</p>';
   applyWidths($("stage-timings"));
   const names = {
     halo2: "Halo 2",
@@ -273,14 +329,13 @@ function renderPipeline() {
   };
   table(
     "verifiers",
-    sourceFresh("metrics")
-      ? state.verifiers.map((v) => [
-          names[v.name] || v.name,
-          ms(v.p50_ms),
-          ms(v.p95_ms),
-        ])
-      : [],
-    3,
+    retained("verifiers").map((v) => [
+      names[v.name] || v.name,
+      ms(v.p50_ms),
+      ms(v.p95_ms),
+      observationAge(v),
+    ]),
+    4,
   );
   rows("pipeline-resources", [
     ["Reserved block budget", bytes(value("reserved_bytes"))],
@@ -532,14 +587,14 @@ function renderBlockDetail(hash) {
   $("block-detail").innerHTML =
     `<span class="block-state">${b.canonical === true ? "On the observed best chain" : b.canonical === false ? "Off the observed best chain" : "Chain membership not yet checked"}</span><div class="block-hash">${esc(b.hash)}</div><dl class="stat-list detail-stats">${data.map(([k, v]) => `<div><dt>${esc(k)}</dt><dd>${esc(v)}</dd></div>`).join("")}</dl><p>The observation time is when the dashboard polled this block. It is not its receive time or processing duration.</p>`;
 }
-function chart(id, keys, format) {
+function chart(id, keys, format, points = false) {
   const container = $(id);
   if (!container) return;
   const end = state?.generated_at || Date.now() / 1000;
   const start = end - WINDOWS[range];
   const rows = history.filter((p) => p.t >= start && p.t <= end);
   const values = rows.flatMap((p) => keys.map((k) => p[k]).filter(valid));
-  if (rows.length < 2 || !values.length) {
+  if (rows.length < (points ? 1 : 2) || !values.length) {
     container.innerHTML =
       '<div class="chart-empty">Collecting live samples<br>Charts appear as data arrives</div>';
     return;
@@ -558,6 +613,14 @@ function chart(id, keys, format) {
   const y = (v) => top + plotH * (1 - Math.max(0, v) / max);
   const linePaths = keys
     .map((key, k) => {
+      if (points)
+        return rows
+          .filter((p) => valid(p[key]))
+          .map(
+            (p) =>
+              `<circle cx="${x(p.t).toFixed(1)}" cy="${y(p[key]).toFixed(1)}" r="3" fill="${COLORS[k]}"><title>${esc(clock(p.t))} · ${esc(format(p[key]))}</title></circle>`,
+          )
+          .join("");
       let path = "",
         last = null;
       for (const p of rows) {
@@ -605,6 +668,7 @@ function renderCharts() {
   );
   chart("queue-chart", ["outstanding", "applying"], (v) => fmt(v));
   chart("latency-chart", ["peer_p50_ms"], ms);
+  chart("processing-chart", ["contextual_ms", "write_ms"], ms, true);
   chart("tx-chart", ["tx_verified_ps", "tx_failed_ps"], (v) =>
     format("tx_verified_ps", v),
   );

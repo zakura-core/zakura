@@ -667,6 +667,35 @@ h2 {
   padding: 8px 17px 20px;
   gap: 14px;
 }
+.pipeline-state {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px 16px;
+  padding: 11px 17px;
+  margin-bottom: 13px;
+  background: #101920;
+  border-top: 1px solid var(--line);
+  border-bottom: 1px solid var(--line);
+  color: var(--muted);
+  font-size: 10px;
+}
+.pipeline-state > span:first-child {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.pipeline-state b {
+  color: var(--text);
+  font-weight: 500;
+}
+.pipeline-state[data-mode="idle"] .dot {
+  background: var(--muted);
+}
+.pipeline-state[data-mode="unavailable"] .dot {
+  background: var(--amber);
+}
 .pipeline-stage {
   border-left: 2px solid #3d5c59;
   padding-left: 12px;
@@ -706,6 +735,12 @@ h2 {
 }
 .timing-name {
   color: #b8cbd7;
+}
+.timing-name small {
+  display: block;
+  color: var(--muted);
+  font-size: 8px;
+  margin-top: 3px;
 }
 .timing-track {
   height: 12px;

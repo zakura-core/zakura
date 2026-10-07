@@ -15,8 +15,9 @@ section jump links and one time-range control for every history chart.
 
 - **Activity** shows chain TPS, recent block transaction counts, mempool stage
   activity, proof verification rates, block queues, and peer RTT.
-- **Pipeline** shows outstanding and applying work, independent p50/p95 stage
-  durations, cryptographic batch timings, and memory pressure.
+- **Pipeline** separates current work from saved processing timings. It shows
+  outstanding and applying work, the latest observed p50/p95 stage and verifier
+  summaries, a history of real timing samples, and memory pressure.
 - **Network** separates legacy TCP wire traffic from host interface traffic.
   It includes native QUIC sessions and discovery outcomes, protocol message
   rates, stream opens, first-body source rates, and anonymized RPC peer details.
@@ -76,7 +77,17 @@ range changes activity charts only. Exporter quantiles retain their own rolling
 window and are never summed across labels.
 The exporter emits zeroes for empty rolling summaries. If its maximum duration
 is zero, the dashboard reports unavailable latency rather than a zero-cost
-operation. Support blocks remaining are derived from the supported height and
+operation. The pipeline retains each stage and verifier's last non-empty summary
+for up to 24 hours in the dashboard's SQLite database. Every saved reading has
+its own observation time and survives dashboard restarts. Readings remain visible
+when collection fails, with live source freshness reported separately. Observation
+time means when the dashboard sampled the summary, not when an individual block
+finished. Rows may describe different windows or mempool work. They are not a
+single block's waterfall. Live gauges, rates, and chart history never use these
+saved readings as replacements. The processing history uses individual dots so
+isolated timing samples remain visible without joining gaps.
+
+Support blocks remaining are derived from the supported height and
 the current verified height because the node's remaining-block gauge updates
 on a slower loop.
 

@@ -5,6 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 import threading
 import time
+import tempfile
 import unittest
 from unittest.mock import patch
 import urllib.error
@@ -68,6 +69,74 @@ sync_block_applying 0
 state_block_writer_queue_duration_seconds{quantile="1"} 0
 ''')
         self.assertIsNone(d.quantile(metrics, "state_block_writer_queue_duration_seconds"))
+
+    def test_processing_readings_survive_idle_without_filling_live_samples(self):
+        now = time.time()
+        active = d.metrics_parse('''state_contextual_total_duration_seconds{quantile="0.5"} 0.005
+state_contextual_total_duration_seconds{quantile="0.95"} 0.009
+state_contextual_total_duration_seconds{quantile="1"} 0.010
+zakura_consensus_batch_duration_seconds{verifier="halo2",result="success",quantile="0.5"} 0.012
+zakura_consensus_batch_duration_seconds{verifier="halo2",result="success",quantile="0.95"} 0.015
+zakura_consensus_batch_duration_seconds{verifier="halo2",result="success",quantile="1"} 0.020
+''')
+        idle = d.metrics_parse('''state_contextual_total_duration_seconds{quantile="0.5"} 0
+state_contextual_total_duration_seconds{quantile="0.95"} 0
+state_contextual_total_duration_seconds{quantile="1"} 0
+zakura_consensus_batch_duration_seconds{verifier="halo2",result="success",quantile="0.5"} 0
+zakura_consensus_batch_duration_seconds{verifier="halo2",result="success",quantile="0.95"} 0
+zakura_consensus_batch_duration_seconds{verifier="halo2",result="success",quantile="1"} 0
+sync_block_applying 0
+''')
+        self.c.update_metrics(active, now - 60)
+        self.c.update_metrics(idle, now)
+        saved = self.c.snapshot()["last_processing"]
+        self.assertEqual(saved["stages"], [{"name": "Contextual validation", "p50_ms": 5,
+                                          "p95_ms": 9, "observed_at": now - 60}])
+        self.assertEqual(saved["verifiers"][0]["p95_ms"], 15)
+        self.assertEqual(saved["verifiers"][0]["observed_at"], now - 60)
+        self.assertIsNone(self.c.state["metrics"]["contextual_ms"])
+        self.assertIsNone(self.c.sample(now)["contextual_ms"])
+        self.assertEqual(self.c.sample(now)["applying"], 0)
+        self.c.source("metrics", False)
+        self.assertEqual(self.c.snapshot()["last_processing"], saved)
+        self.assertFalse(self.c.snapshot()["sources"]["metrics"]["fresh"])
+        self.c.update_metrics(active, now)
+        self.assertEqual(self.c.snapshot()["last_processing"]["stages"][0]["observed_at"], now)
+
+    def test_processing_readings_persist_across_dashboard_restarts(self):
+        now = time.time()
+        metrics = d.metrics_parse('''state_contextual_total_duration_seconds{quantile="0.5"} 0.01
+state_contextual_total_duration_seconds{quantile="0.95"} 0.02
+state_contextual_total_duration_seconds{quantile="1"} 0.03
+''')
+        with tempfile.TemporaryDirectory() as directory:
+            args = SimpleNamespace(history=str(Path(directory) / "dashboard.sqlite3"), node="test", build="test")
+            first = d.Collector(args)
+            try:
+                first.update_metrics(metrics, now)
+                expected = first.snapshot()["last_processing"]
+            finally:
+                first.pool.shutdown(wait=True)
+                first.store.db.close()
+            second = d.Collector(args)
+            try:
+                self.assertEqual(second.snapshot()["last_processing"], expected)
+                self.assertEqual(second.state["metrics"], {})
+                self.assertEqual(second.snapshot()["sources"], {})
+            finally:
+                second.pool.shutdown(wait=True)
+                second.store.db.close()
+
+    def test_processing_retention_expires_and_never_initializes_from_empty_summaries(self):
+        now = time.time()
+        self.c.update_metrics({}, now)
+        self.assertEqual(self.c.snapshot()["last_processing"], {"stages": [], "verifiers": []})
+        self.c.state["last_processing"]["stages"] = [
+            {"name": "Expired", "p50_ms": 1, "p95_ms": 2, "observed_at": now - 86401},
+            {"name": "Future", "p50_ms": 1, "p95_ms": 2, "observed_at": now + 100}]
+        self.assertEqual(self.c.snapshot()["last_processing"]["stages"], [])
+        self.c.update_metrics({}, now)
+        self.assertEqual(self.c.store.processing(), {"stages": [], "verifiers": []})
 
     def test_support_countdown_uses_current_height(self):
         self.c.state["chain"] = {"height": 123}

@@ -300,34 +300,44 @@
           <section class="panel">
             <div class="panel-heading">
               <h2>Block pipeline</h2>
-              <span class="panel-note">Live occupancy and rate</span>
+              <span class="panel-note">Current work</span>
+            </div>
+            <div
+              id="pipeline-state"
+              class="pipeline-state"
+              data-mode="unavailable"
+            >
+              <span
+                ><i class="dot"></i
+                ><b id="pipeline-status">Waiting for telemetry</b></span
+              >
+              <span id="pipeline-tip">Waiting for a tip observation</span>
             </div>
             <div id="block-pipeline" class="pipeline"></div>
             <p class="panel-bottom">
-              Queues are instantaneous observations. Commit rate counts verified
-              blocks. Stage latency summaries below overlap and must not be
-              added together.
+              Queue counts and rates are live observations. The saved timing
+              readings below remain visible while this node waits for more work.
             </p>
           </section>
           <div class="grid two">
             <section class="panel">
               <div class="panel-heading">
-                <h2>Processing timings</h2>
+                <h2>Last processing timings</h2>
                 <span class="panel-note"
                   ><i class="dot"></i> p50 <i class="dot violet"></i> p95</span
                 >
               </div>
               <div id="stage-timings" class="timing-list"></div>
               <p class="panel-bottom">
-                Independent rolling durations, all starting at zero. Contextual
-                validation contains several listed substeps. A timed waterfall
-                for one block needs correlated events.
+                Latest non-empty p50/p95 summary for each stage, kept for up to
+                24 hours. “Seen” is when the dashboard read it. Rows can come
+                from different observations and are not one block’s waterfall.
               </p>
             </section>
             <section class="panel">
               <div class="panel-heading">
                 <h2>Cryptographic checks</h2>
-                <span class="panel-note">Batch wall time</span>
+                <span class="panel-note">Last observed batch summaries</span>
               </div>
               <div class="table-scroll">
                 <table>
@@ -336,14 +346,16 @@
                       <th>Verifier</th>
                       <th>p50</th>
                       <th>p95</th>
+                      <th>Observed</th>
                     </tr>
                   </thead>
                   <tbody id="verifiers"></tbody>
                 </table>
               </div>
               <p class="panel-bottom">
-                Includes scheduling time. An empty rolling summary is
-                unavailable, not a zero-cost verification.
+                Saved p50/p95 batch wall times include scheduling and may
+                include mempool work. Readings persist between blocks and across
+                dashboard restarts. They are not live activity indicators.
               </p>
               <div class="panel-heading"><h2>Memory &amp; pressure</h2></div>
               <dl id="pipeline-resources" class="stat-list"></dl>
@@ -368,32 +380,23 @@
             </section>
             <section class="panel">
               <div class="panel-heading">
-                <h2>Processing visibility</h2>
-                <span class="tag">CURRENT COVERAGE</span>
+                <h2>Recent processing</h2>
+                <span class="panel-note">Observed p95 timings</span>
               </div>
-              <ul class="instrumentation">
-                <li>
-                  <b>Block timings</b
-                  ><span
-                    >Available as aggregate stage durations. An individual
-                    block’s end-to-end timeline is not yet reported.</span
-                  >
-                </li>
-                <li>
-                  <b>Mempool admission</b
-                  ><span
-                    >Verification is visible. Admission, eviction, expiration,
-                    and mined outcomes are not yet reported separately.</span
-                  >
-                </li>
-                <li>
-                  <b>Transaction timings</b
-                  ><span
-                    >Stage counts are visible. Queue wait and verification time
-                    for an individual transaction are not yet reported.</span
-                  >
-                </li>
-              </ul>
+              <div class="chart-legend">
+                <span><i class="dot"></i>Contextual checks</span
+                ><span><i class="dot violet"></i>RocksDB write</span>
+              </div>
+              <div
+                id="processing-chart"
+                class="chart"
+                role="img"
+                aria-label="Observed processing latency samples over time"
+              ></div>
+              <p class="panel-bottom">
+                Each dot is a real timing sample. Quiet periods stay blank.
+                Saved readings above are never copied into this history.
+              </p>
             </section>
           </div>
         </div>
@@ -749,9 +752,11 @@
         </dd>
         <dt>Processing timings</dt>
         <dd>
-          Rolling p50 and p95 summaries describe different operations. Some
-          overlap or run in parallel. They are not an end-to-end trace and
-          cannot be added together.
+          Each stage keeps its latest non-empty p50 and p95 summary for up to 24
+          hours, including across dashboard restarts. “Seen” is its scrape time,
+          not a block's finish time. Rows may describe different windows and
+          overlap or run in parallel. They cannot be added together. Live queues
+          and chart history never substitute these saved readings.
         </dd>
         <dt>Networking</dt>
         <dd>

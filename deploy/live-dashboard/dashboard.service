@@ -6,6 +6,8 @@ Wants=network-online.target
 [Service]
 Type=simple
 DynamicUser=yes
+User=zakura-dashboard-web
+Group=zakura-dashboard-web
 StateDirectory=zakura-live-dashboard
 EnvironmentFile=/opt/zakura-live-dashboard/build.env
 ExecStart=/usr/bin/python3 -u /opt/zakura-live-dashboard/current/deploy/live-dashboard/dashboard.py --host 127.0.0.1 --port 8095 --history /var/lib/zakura-live-dashboard/history.sqlite3 --build ${DASHBOARD_BUILD}

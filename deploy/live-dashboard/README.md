@@ -72,6 +72,8 @@ systemctl restart zakura-dashboard-node
 Host data comes from `/proc`, filesystem capacity counters, and a bounded
 read-only systemd query. Automatic restart counts refer to systemd's current
 unit counter. OOM history and tip-switch history are unavailable in local mode.
+The web service uses the persistent `zakura-dashboard-web` identity so D-Bus
+can authenticate its read-only systemd queries, with systemd sandboxing retained.
 A missing process reports unavailable RSS while host observations remain fresh.
 The dashboard starts its own history for this node. Do not import observations
 from a different node.

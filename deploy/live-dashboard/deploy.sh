@@ -30,6 +30,9 @@ if [[ -e "$root/current" ]] && ! cmp -s /etc/caddy/Caddyfile "$root/current/depl
 fi
 caddy validate --config "$candidate" --adapter caddyfile
 python3 -m unittest discover -s "$release/deploy/live-dashboard/tests" -q
+# D-Bus needs a persistent identity for unprivileged systemd property reads.
+id zakura-dashboard-web >/dev/null 2>&1 ||
+  useradd --system --home-dir /var/lib/zakura-live-dashboard --shell /usr/sbin/nologin zakura-dashboard-web
 previous="$(readlink "$root/current" || true)"
 backup="$(mktemp -d "$root/rollback.XXXXXXXX")"
 cp /etc/caddy/Caddyfile "$backup/Caddyfile"

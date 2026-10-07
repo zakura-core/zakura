@@ -153,13 +153,40 @@ impl Runnable for ZakuradCmd {
     }
 }
 
+/// Returns the platform preferences directory used for config discovery.
+fn preference_dir() -> Option<PathBuf> {
+    #[cfg(target_os = "windows")]
+    {
+        dirs_sys::known_folder_local_app_data()
+    }
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    {
+        dirs_sys::home_dir().map(|home| home.join("Library/Preferences"))
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        None
+    }
+    #[cfg(not(any(
+        target_os = "windows",
+        target_os = "macos",
+        target_os = "ios",
+        target_arch = "wasm32"
+    )))]
+    {
+        std::env::var_os("XDG_CONFIG_HOME")
+            .and_then(dirs_sys::is_absolute_path)
+            .or_else(|| dirs_sys::home_dir().map(|home| home.join(".config")))
+    }
+}
+
 /// This trait allows you to define how application configuration is loaded.
 impl Configurable<ZakuradConfig> for ZakuradCmd {
     /// Location of the configuration file
     fn config_path(&self) -> Option<PathBuf> {
         let if_exists = |f: PathBuf| if f.exists() { Some(f) } else { None };
 
-        dirs::preference_dir().and_then(|path| {
+        preference_dir().and_then(|path| {
             let config_path = path.join(CONFIG_FILE);
             if let Some(config_path) = if_exists(config_path) {
                 return Some(config_path);

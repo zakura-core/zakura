@@ -1143,7 +1143,7 @@ fn stored_configs_work() -> Result<()> {
             // When logs are sent to the terminal, we see the config loading message and path.
             format!("Using config file at:.*{}", regex::escape(config_file_name)),
             // If they are sent to a file, we see a log file message on stdout,
-            // and a logo, welcome message, and progress bar on stderr.
+            // and a logo and welcome message on stderr.
             "Sending logs to".to_string(),
             // TODO: add expect_stdout_or_stderr_line_matches() and check for this instead:
             //"Thank you for running a mainnet zakurad".to_string(),
@@ -4191,6 +4191,44 @@ async fn disconnects_from_misbehaving_peers() -> Result<()> {
 //
 //   TEST_ZCASHD_COMPAT=1 TEST_ZCASHD_PATH=/path/to/zcashd \
 //     cargo nextest run --profile zcashd-compat-integration --run-ignored=only
+
+/// The NU7 sidecar follows zakurad across NU7 activation on regtest.
+///
+/// See [`common::zcashd_compat::nu7::activation_follows_zakurad`] for details.
+#[tokio::test]
+#[ignore]
+async fn zcashd_compat_nu7_activation_follows_zakurad() -> Result<()> {
+    common::zcashd_compat::nu7::activation_follows_zakurad().await
+}
+
+/// Both nodes split a post-NU7 block's fees as ZIP 235 requires, and zcashd's wallet
+/// builds v5 transactions with the post-NU7 expiry.
+///
+/// See [`common::zcashd_compat::nu7::fee_burn_and_wallet_transactions`] for details.
+#[tokio::test]
+#[ignore]
+async fn zcashd_compat_nu7_fee_burn_and_wallet_transactions() -> Result<()> {
+    common::zcashd_compat::nu7::fee_burn_and_wallet_transactions().await
+}
+
+/// The NU7 sidecar syncs a burst of blocks across activation and survives a restart.
+///
+/// See [`common::zcashd_compat::nu7::burst_sync_and_restart`] for details.
+#[tokio::test]
+#[ignore]
+async fn zcashd_compat_nu7_burst_sync_and_restart() -> Result<()> {
+    common::zcashd_compat::nu7::burst_sync_and_restart().await
+}
+
+/// The NU7 sidecar's wallet spends a pre-NU7 Sapling note after activation, and keeps
+/// spending Sapling notes after a reorg and a restart.
+///
+/// See [`common::zcashd_compat::nu7::sapling_spend_reorg_and_restart`] for details.
+#[tokio::test]
+#[ignore]
+async fn zcashd_compat_nu7_sapling_spend_reorg_and_restart() -> Result<()> {
+    common::zcashd_compat::nu7::sapling_spend_reorg_and_restart().await
+}
 
 /// Verifies that both zakurad and zcashd start and respond to basic RPC calls.
 ///

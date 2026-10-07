@@ -100,7 +100,9 @@ state_block_writer_queue_duration_seconds{quantile="1"} 0
 
     def test_stopped_local_node_keeps_host_observations_and_hides_private_fields(self):
         files = {"/proc/meminfo": "MemTotal: 8000 kB\nMemAvailable: 3000 kB\n",
-                 "/proc/uptime": "456.75 123.00\n"}
+                 "/proc/uptime": "456.75 123.00\n",
+                 "/proc/stat": "cpu 1 2 3 4 5 6 7 8 9 10\n",
+                 "/proc/net/dev": "header\nheader\nlo: 1 0 0 0 0 0 0 0 1 0 0 0 0 0 0 0\neth0: 50 0 1 2 0 0 0 0 70 0 3 4 0 0 0 0\n"}
         disk = SimpleNamespace(f_blocks=100, f_bavail=30, f_frsize=4096)
         service = SimpleNamespace(stdout="LoadState=loaded\nActiveState=inactive\nMainPID=0\nNRestarts=2\nPrivate=secret\n")
         with patch.object(d.Path, "read_text", lambda path: files[str(path)]), \
@@ -116,6 +118,84 @@ state_block_writer_queue_duration_seconds{quantile="1"} 0
         self.assertIsNone(observation["host"]["oom_kills_24h"])
         self.assertNotIn("secret", json.dumps(observation))
         self.assertEqual(run.call_args.kwargs["timeout"], 3)
+        self.assertEqual(observation["counters"]["cpu"]["total"], 36)
+        self.assertNotIn("lo", observation["counters"]["interfaces"])
+        self.assertEqual(observation["counters"]["interfaces"]["eth0"]["drops"], 6)
+
+    def test_chain_tps_excludes_boundary_block_and_coinbase(self):
+        blocks = [d.block_public(block(i, previous=f"a{i-1:063x}")) for i in range(1, 40)]
+        for b in blocks:
+            b.update(time=b["height"] * 75, canonical=True, transactions=4)
+        activity = d.chain_activity(blocks, blocks[-1]["hash"])
+        self.assertEqual(activity["blocks"], 30)
+        self.assertEqual(activity["transactions"], 120)
+        self.assertEqual(activity["seconds"], 2250)
+        self.assertEqual(activity["tps"], 120 / 2250)
+        self.assertEqual(activity["user_tps"], 90 / 2250)
+        self.assertEqual(activity["from_height"], 9)
+
+    def test_chain_tps_rejects_unlinked_or_nonpositive_intervals(self):
+        blocks = [d.block_public(block(i, previous=f"a{i-1:063x}")) for i in range(1, 4)]
+        for b in blocks:
+            b.update(time=100, canonical=True)
+        self.assertIsNone(d.chain_activity(blocks, blocks[-1]["hash"]))
+        blocks[-1]["time"] = 200
+        blocks[1]["canonical"] = False
+        self.assertIsNone(d.chain_activity(blocks, blocks[-1]["hash"]))
+        blocks[1]["canonical"] = True
+        self.assertEqual(d.chain_activity(blocks, blocks[-1]["hash"])["blocks"], 2)
+        self.assertIsNone(d.chain_activity(blocks, "b" * 64))
+
+    def test_peer_latency_omits_missing_negative_and_private_values(self):
+        peers = [{"addr": "secret", "inbound": True, "pingtime": v, "version": 170160}
+                 for v in (0.1, 0.2, 0.3, None, -1)]
+        self.c.update_peers(peers, time.time())
+        state = self.c.snapshot()
+        self.assertEqual(state["peer_latency"], {"measured": 3, "unknown": 2, "p50_ms": 200, "p95_ms": 300})
+        self.assertEqual(state["peer_details"][0]["ping_ms"], 300)
+        self.assertNotIn("secret", json.dumps(state))
+        self.assertEqual(len(state["peer_details"]), 5)
+
+    def test_new_network_series_preserve_labels_and_hide_error_reasons(self):
+        before = d.metrics_parse('''zcash_net_in_messages{command="ping"} 10
+zcash_net_in_messages{command="block"} 20
+zakura_p2p_queue_depth{stream_kind="block_sync"} 2
+mempool_failed_verify_tasks_total{reason="private-secret"} 3
+''')
+        after = d.metrics_parse('''zcash_net_in_messages{command="ping"} 40
+zcash_net_in_messages{command="block"} 35
+zakura_p2p_queue_depth{stream_kind="block_sync"} 4
+mempool_failed_verify_tasks_total{reason="private-secret"} 6
+''')
+        self.c.update_metrics(before, 100)
+        self.assertIsNone(self.c.state["messages"][0]["in_ps"])
+        self.c.update_metrics(after, 115)
+        messages = {m["name"]: m for m in self.c.state["messages"]}
+        self.assertEqual(messages["ping"]["in_ps"], 2)
+        self.assertEqual(messages["block"]["in_ps"], 1)
+        self.assertIsNone(messages["ping"]["out_ps"])
+        self.assertEqual(self.c.state["streams"][1]["last_depth"], 4)
+        self.assertEqual(self.c.state["transaction_flow"][5]["rate"], 0.2)
+        self.assertIsNone(self.c.state["transaction_flow"][2]["total"])
+        self.assertNotIn("private-secret", json.dumps(self.c.snapshot()))
+
+    def test_host_rates_need_two_samples_and_handle_interface_resets(self):
+        def update(total, idle, rx, when):
+            self.c.update_host({"host": {}, "service": "active", "counters": {
+                "cpu": {"total": total, "idle": idle, "iowait": 10}, "cores": 8,
+                "interfaces": {"eth0": {"rx": rx, "tx": rx, "errors": 0, "drops": 0}}}}, when)
+        update(1000, 500, 100, 100)
+        self.assertIsNone(self.c.state["host"]["cpu_percent"])
+        self.assertIsNone(self.c.state["host"]["host_rx_bps"])
+        update(1200, 650, 400, 130)
+        self.assertEqual(self.c.state["host"]["cpu_percent"], 25)
+        self.assertEqual(self.c.state["host"]["host_rx_bps"], 10)
+        self.assertEqual(self.c.state["host"]["host_errors_ps"], 0)
+        update(1500, 800, 20, 160)
+        self.assertIsNone(self.c.state["host"]["host_rx_bps"])
+        update(1900, 1000, 400, 400)
+        self.assertIsNone(self.c.state["host"]["cpu_percent"])
+        self.assertIsNone(self.c.state["host"]["host_rx_bps"])
 
     def test_local_process_exit_during_collection_does_not_fail_host_health(self):
         def read(path):

@@ -25,6 +25,8 @@ let fetching = false;
 let lastHistory = 0;
 let disconnected = false;
 let selectedBlock = null;
+let view = "overview";
+let flowMode = "rate";
 
 function bytes(v, perSecond = false) {
   if (!valid(v)) return "—";
@@ -75,7 +77,8 @@ function sourceFresh(name) {
   const source = state?.sources?.[name];
   return Boolean(
     source?.fresh &&
-      Date.now() / 1000 - source.at < (name === "chain" ? 25 : 120),
+      (paused ? state.generated_at : Date.now() / 1000) - source.at <
+        (name === "chain" ? 25 : 120),
   );
 }
 function freshLabel(id, name) {
@@ -85,297 +88,454 @@ function metric(key) {
   return sourceFresh("metrics") ? state.metrics[key] : null;
 }
 
+const CHAIN_FIELDS = new Set(["height", "lag", "headers", "finalized"]);
+const ACTIVITY_FIELDS = new Set([
+  "tps",
+  "user_tps",
+  "block_interval",
+  "mean_block_bytes",
+]);
+const HOST_FIELDS = new Set([
+  "cpu_percent",
+  "iowait_percent",
+  "cpu_cores",
+  "rss_bytes",
+  "mem_available_bytes",
+  "disk_free_bytes",
+  "host_rx_bps",
+  "host_tx_bps",
+  "host_drops_ps",
+  "host_errors_ps",
+]);
+function value(key) {
+  if (CHAIN_FIELDS.has(key))
+    return sourceFresh("chain") ? state.chain[key] : null;
+  if (ACTIVITY_FIELDS.has(key))
+    return sourceFresh("chain") && sourceFresh("blocks")
+      ? state.chain_activity?.[key]
+      : null;
+  if (HOST_FIELDS.has(key)) return sourceFresh("host") ? state.host[key] : null;
+  if (key === "peer_total")
+    return sourceFresh("peers") ? state.peer_summary?.total : null;
+  if (key === "peer_p50_ms" || key === "peer_p95_ms")
+    return sourceFresh("peers")
+      ? state.peer_latency?.[key.replace("peer_", "")]
+      : null;
+  return metric(key);
+}
+function format(key, v) {
+  if (!valid(v)) return "—";
+  if (key.endsWith("_bps")) return bytes(v, true);
+  if (key.endsWith("_bytes")) return bytes(v);
+  if (key.endsWith("_ms")) return ms(v);
+  if (key.endsWith("_percent")) return `${fmt(v, 1)}%`;
+  if (key === "block_interval") return `${fmt(v, 1)} s`;
+  if (key.endsWith("_ps") || key.endsWith("tps") || key === "rpc_rps")
+    return fmt(v, v > 0 && v < 0.01 ? 4 : 3);
+  return fmt(v);
+}
+const rows = (id, data) => {
+  $(id).innerHTML = data
+    .map(
+      ([name, val]) => `<div><dt>${esc(name)}</dt><dd>${esc(val)}</dd></div>`,
+    )
+    .join("");
+};
+const cell = (v) => `<td>${esc(v)}</td>`;
+function table(id, data, columns) {
+  $(id).innerHTML = data.length
+    ? data.map((r) => `<tr>${r.map(cell).join("")}</tr>`).join("")
+    : `<tr><td colspan="${columns}" class="empty">No current measurements</td></tr>`;
+}
 function render() {
   if (!state) return;
   const c = state.chain || {},
-    m = state.metrics || {},
-    h = state.host || {};
-  const now = paused ? state.generated_at : Date.now() / 1000;
-  const chainFresh = sourceFresh("chain");
-  const peersFresh = sourceFresh("peers");
-  const metricsFresh = sourceFresh("metrics");
-  const hostFresh = sourceFresh("host");
-  const tip = state.blocks.find((b) => b.hash === c.hash);
-  set("node-name", state.node);
-  set(
-    "node-version",
-    state.version ? `Zakura ${state.version}` : "Version unavailable",
-  );
-  set("upgrade", c.upgrade || "Zcash");
-  set("height", fmt(c.height));
-  set("lag", fmt(c.lag));
-  set("headers", fmt(c.headers));
+    h = sourceFresh("host") ? state.host : {};
+  document.querySelectorAll("[data-value]").forEach((el) => {
+    el.textContent = format(el.dataset.value, value(el.dataset.value));
+  });
+  set("version", state.version ? `v${state.version}` : "Version unavailable");
+  set("chain-badge", sourceFresh("chain") ? "VERIFIED" : "STALE");
   set(
     "chain-status",
-    !chainFresh
-      ? "Chain data is stale"
+    !sourceFresh("chain")
+      ? "Chain data stale"
       : c.resource_stalled
         ? "Resource pressure"
         : c.body_unavailable
-          ? "Waiting for block body"
+          ? "Waiting for body"
           : c.lag
             ? "Catching up"
             : "Following known tip",
   );
+  const tip = state.blocks.find((b) => b.hash === c.hash);
+  const now = paused ? state.generated_at : Date.now() / 1000;
+  set("tip-age", tip ? `${age(now - tip.time)} old` : "—");
+  const activity = state.chain_activity;
   set(
-    "tip-age",
-    tip ? `Block age ${age(now - tip.time)}` : "Loading recent blocks",
+    "tps-window",
+    activity
+      ? `${activity.blocks} block intervals · ${age(activity.seconds)}`
+      : "Collecting linked blocks",
   );
-  set("mempool-count", fmt(metric("mempool_count")));
-  set("mempool-bytes", bytes(metric("mempool_bytes")));
-  set("mempool-queue", `${fmt(metric("mempool_queued"))} queued`);
-  set("peer-count", fmt(peersFresh ? state.peer_summary?.total : null));
-  set("peer-in", `${fmt(peersFresh ? state.peer_summary?.inbound : null)} in`);
-  set(
-    "peer-out",
-    `${fmt(peersFresh ? state.peer_summary?.outbound : null)} out`,
-  );
-  freshLabel("chain-fresh", "chain");
-  freshLabel("metrics-fresh", "metrics");
-  freshLabel("peers-fresh", "peers");
-  freshLabel("host-fresh", "host");
-
-  set("pipe-headers", fmt(c.headers));
-  set("pipe-missing", fmt(metric("missing")));
-  set("pipe-download", fmt(metric("outstanding")));
-  set("pipe-payload", bytes(metric("download_bps"), true));
-  set("pipe-apply", fmt(metric("applying")));
-  set("pipe-waiting", fmt(metric("unsubmitted")));
-  set("pipe-write", ms(metric("write_ms")));
-  set("pipe-writer", ms(metric("writer_queue_ms")));
-  set("pipe-state", bytes(metric("db_bytes")));
-  set("pipe-compactions", fmt(metric("compactions")));
-  set("finalized", fmt(c.finalized));
-  set(
-    "pipeline-note",
-    !metricsFresh
-      ? "Telemetry is stale"
-      : c.resource_stalled
-        ? "Node reports resource pressure"
-        : c.lag === 0 && m.applying === 0 && m.outstanding === 0
-          ? "Caught up · waiting for the next block"
-          : "Live queue and latency observations",
-  );
-  set("traffic-in", bytes(metric("legacy_in_bps"), true));
-  set("traffic-out", bytes(metric("legacy_out_bps"), true));
-  set("halo2-rate", fmt(metric("halo2_ps"), 2));
-  set("sapling-rate", fmt(metric("sapling_ps"), 2));
-  set("accepted-rate", fmt(metric("tx_verified_ps"), 2));
-  set("rejected-rate", fmt(metric("tx_policy_rejected_ps"), 2));
-
-  const verifierNames = {
+  renderBlocks(now);
+  renderFlow();
+  renderPipeline();
+  renderNetwork();
+  renderSystem(h);
+  renderStatus();
+  renderCharts();
+  if (selectedBlock && $("block-dialog").open) renderBlockDetail(selectedBlock);
+  $("source-details").innerHTML =
+    Object.entries(state.sources)
+      .map(
+        ([name, s]) =>
+          `<div>${esc(name)} · ${sourceFresh(name) ? "fresh" : "stale"} · ${esc(clock(s.at, true))} UTC</div>`,
+      )
+      .join("") +
+    `<div>Build ${esc(state.build.slice(0, 12))} · ${esc(state.node)}</div>`;
+}
+function renderFlow() {
+  const stages = sourceFresh("metrics") ? state.transaction_flow || [] : [];
+  const titles = [
+    "Queued",
+    "Downloaded",
+    "Pushed directly",
+    "Verified",
+    "Advertised",
+    "Failed tasks",
+    "Oversize rejection",
+  ];
+  const max = Math.max(1e-9, ...stages.map((s) => s[flowMode] || 0));
+  $("transaction-flow").innerHTML = titles
+    .map((name, i) => {
+      const n = stages.find((s) => s.name === name)?.[flowMode];
+      return `<div class="flow-stage${i >= 5 ? " failure" : ""}"><span class="stage-number">${i >= 5 ? "OUTCOME" : `0${i + 1}`}</span><h3>${name}</h3><strong>${flowMode === "rate" ? format("tx_verified_ps", n) : fmt(n)}</strong><div class="flow-track"><span data-width="${valid(n) ? Math.min(100, (n / max) * 100) : 0}"></span></div></div>`;
+    })
+    .join("");
+  applyWidths($("transaction-flow"));
+}
+function renderPipeline() {
+  const stages = [
+    [
+      "01 / Headers",
+      "headers",
+      "best known height",
+      `${fmt(value("missing"))} bodies missing`,
+    ],
+    [
+      "02 / Download",
+      "outstanding",
+      "outstanding blocks",
+      `${bytes(value("download_bps"), true)} native payload`,
+    ],
+    [
+      "03 / Apply",
+      "applying",
+      "blocks applying",
+      `${fmt(value("unsubmitted"))} not yet submitted`,
+    ],
+    [
+      "04 / Verify",
+      "blocks_verified_ps",
+      "blocks / second",
+      `${ms(value("contextual_ms"))} contextual p95`,
+    ],
+    [
+      "05 / Store",
+      "write_ms",
+      "write latency · p95",
+      `${ms(value("writer_queue_ms"))} queue p95`,
+    ],
+  ];
+  $("block-pipeline").innerHTML = stages
+    .map(
+      ([name, key, unit, detail]) =>
+        `<div class="pipeline-stage"><h3>${name}</h3><strong>${format(key, value(key))}</strong><small>${unit}</small><p>${esc(detail)}</p></div>`,
+    )
+    .join("");
+  const timings = sourceFresh("metrics") ? state.stage_timings || [] : [];
+  const max = Math.max(0.001, ...timings.map((t) => t.p95_ms || 0));
+  $("stage-timings").innerHTML = timings.length
+    ? timings
+        .map(
+          (t) =>
+            `<div class="timing-row" title="${esc(t.name)}: p50 ${ms(t.p50_ms)}, p95 ${ms(t.p95_ms)}"><span class="timing-name">${esc(t.name)}</span><div class="timing-track"><span data-width="${Math.min(100, ((t.p95_ms || 0) / max) * 100)}"></span><b data-width="${Math.min(100, ((t.p50_ms || 0) / max) * 100)}"></b></div><span class="timing-value">${ms(t.p95_ms)}</span></div>`,
+        )
+        .join("")
+    : '<p class="empty">Timing data unavailable</p>';
+  applyWidths($("stage-timings"));
+  const names = {
     halo2: "Halo 2",
-    groth16_sapling: "Sapling · Groth16",
+    groth16_sapling: "Sapling / Groth16",
     ed25519: "Ed25519",
     redpallas: "RedPallas",
     redjubjub: "RedJubjub",
   };
-  $("verifiers").innerHTML =
-    metricsFresh && state.verifiers.length
-      ? state.verifiers
-          .map(
-            (v) =>
-              `<tr><td>${esc(verifierNames[v.name] || v.name)}</td><td>${ms(v.p50_ms)}</td><td>${ms(v.p95_ms)}</td></tr>`,
-          )
-          .join("")
-      : '<tr><td colspan="3" class="empty">Verifier metrics unavailable</td></tr>';
-  set("native-peers", fmt(metric("native_peers")));
-  set("ready-peers", fmt(metric("ready_peers")));
-  const agents = peersFresh ? state.peers.slice(0, 4) : [];
-  $("peer-agents").innerHTML = agents.length
-    ? agents
-        .map(
-          (p) =>
-            `<div class="bar-item"><div class="bar-label"><span title="${esc(p.agent)}">${esc(p.agent.replace(/^\//, "").replace(/\/$/, ""))}</span><b>${fmt(p.count)}</b></div><div class="bar-track"><div class="bar-fill" data-width="${Math.min(100, (p.count / (state.peer_summary?.total || 1)) * 100)}"></div></div></div>`,
-        )
-        .join("")
-    : '<p class="empty">Peer mix unavailable</p>';
-
-  const diskFree = hostFresh ? h.disk_free_bytes : null;
-  const freePercent =
-    hostFresh && h.disk_total_bytes > 0 && valid(diskFree)
-      ? (diskFree / h.disk_total_bytes) * 100
+  table(
+    "verifiers",
+    sourceFresh("metrics")
+      ? state.verifiers.map((v) => [
+          names[v.name] || v.name,
+          ms(v.p50_ms),
+          ms(v.p95_ms),
+        ])
+      : [],
+    3,
+  );
+  rows("pipeline-resources", [
+    ["Reserved block budget", bytes(value("reserved_bytes"))],
+    ["Reorder buffer", bytes(value("reorder_bytes"))],
+    ["Attributed pipeline memory", bytes(value("pipeline_memory_bytes"))],
+    [
+      "Header chunks owned / capacity",
+      `${fmt(value("header_budget_used"))} / ${fmt(value("header_budget_capacity"))}`,
+    ],
+    [
+      "Resource alarm",
+      sourceFresh("chain")
+        ? state.chain.resource_stalled
+          ? "Stalled"
+          : "Clear"
+        : "—",
+    ],
+  ]);
+}
+function renderNetwork() {
+  rows("native-stats", [
+    ["Active sessions", fmt(value("native_peers"))],
+    ["Dials started /s", format("dial_started_ps", value("dial_started_ps"))],
+    [
+      "Dials succeeded /s",
+      format("dial_succeeded_ps", value("dial_succeeded_ps")),
+    ],
+    ["Dials failed /s", format("dial_failed_ps", value("dial_failed_ps"))],
+    [
+      "Sessions accepted /s",
+      format("native_accepted_ps", value("native_accepted_ps")),
+    ],
+    [
+      "Neutral closes /s",
+      format("native_closed_ps", value("native_closed_ps")),
+    ],
+  ]);
+  const peer = sourceFresh("peers") ? state.peer_summary || {} : {};
+  rows("legacy-stats", [
+    [
+      "Ready / unready",
+      `${fmt(value("ready_peers"))} / ${fmt(value("legacy_unready"))}`,
+    ],
+    ["Handshakes in flight", fmt(value("handshakes"))],
+    [
+      "Handshake failures /s",
+      format("legacy_handshake_failed_ps", value("legacy_handshake_failed_ps")),
+    ],
+    ["RPC inbound / outbound", `${fmt(peer.inbound)} / ${fmt(peer.outbound)}`],
+    ["Median RTT", ms(value("peer_p50_ms"))],
+    ["p95 RTT", ms(value("peer_p95_ms"))],
+  ]);
+  table(
+    "messages",
+    sourceFresh("metrics")
+      ? (state.messages || []).map((m) => [
+          m.name,
+          format("messages_in_ps", m.in_ps),
+          format("messages_out_ps", m.out_ps),
+        ])
+      : [],
+    3,
+  );
+  table(
+    "streams",
+    sourceFresh("metrics")
+      ? (state.streams || []).map((s) => [
+          s.name.replaceAll("_", " "),
+          format("stream_ps", s.accepted_ps),
+          fmt(s.last_depth),
+        ])
+      : [],
+    3,
+  );
+  rows("interface-stats", [
+    [
+      "Host interface drops /s",
+      format("host_drops_ps", value("host_drops_ps")),
+    ],
+    [
+      "Host interface errors /s",
+      format("host_errors_ps", value("host_errors_ps")),
+    ],
+  ]);
+  table(
+    "peer-table",
+    sourceFresh("peers")
+      ? (state.peer_details || []).map((p) => [
+          p.agent.replace(/^\//, "").replace(/\/$/, ""),
+          p.inbound ? "Inbound" : "Outbound",
+          fmt(p.version),
+          ms(p.ping_ms),
+          ms(p.ping_wait_ms),
+        ])
+      : [],
+    5,
+  );
+  const lat = state.peer_latency || {};
+  set(
+    "peer-coverage",
+    sourceFresh("peers")
+      ? `${fmt(lat.measured)} RTT measurements · ${fmt(lat.unknown)} unknown · addresses omitted`
+      : "Peer data unavailable",
+  );
+}
+function renderSystem(h) {
+  const c = sourceFresh("chain") ? state.chain : {};
+  const used =
+    h.disk_total_bytes > 0 && valid(h.disk_free_bytes)
+      ? 100 * (1 - h.disk_free_bytes / h.disk_total_bytes)
       : null;
-  const diskLow = valid(freePercent) && freePercent < 10;
-  set("disk-free", bytes(diskFree));
-  set(
-    "disk-percent",
-    valid(freePercent) ? `${fmt(freePercent, 1)}% free` : "Unavailable",
-  );
-  $("disk-meter").style.width = valid(freePercent)
-    ? `${Math.max(0, Math.min(100, 100 - freePercent))}%`
+  $("disk-used").style.width = valid(used)
+    ? `${Math.max(0, Math.min(100, used))}%`
     : "0%";
-  document.querySelector(".host-panel").classList.toggle("warning", diskLow);
-  set(
-    "disk-warning",
-    !hostFresh
-      ? "Host data unavailable"
-      : diskLow
-        ? "Less than 10% free on the node’s data volume"
-        : "Used capacity on the node’s data volume",
+  rows("storage-stats", [
+    ["Volume used", valid(used) ? `${fmt(used, 1)}%` : "—"],
+    ["Database on disk", bytes(value("db_bytes"))],
+    ["Live database data", bytes(value("db_live_bytes"))],
+    ["RocksDB memory", bytes(value("db_memory_bytes"))],
+    ["Block cache", bytes(value("cache_bytes"))],
+    ["Compaction backlog", bytes(value("compaction_pending_bytes"))],
+    ["Running compactions", fmt(value("compactions"))],
+  ]);
+  rows("host-stats", [
+    [
+      "Node service",
+      sourceFresh("host") ? state.node_service || "Unavailable" : "—",
+    ],
+    ["Automatic restarts", fmt(h.restart_count)],
+    ["Host uptime", age(h.uptime_seconds)],
+    [
+      "Load · 1 / 5 / 15 min",
+      [h.load1, h.load5, h.load15].map((n) => fmt(n, 2)).join(" / "),
+    ],
+    ["Host memory total", bytes(h.mem_total_bytes)],
+    ["Host memory available", bytes(h.mem_available_bytes)],
+  ]);
+  rows("chain-stats", [
+    ["Upgrade", c.upgrade || "—"],
+    [
+      "Storage mode",
+      c.pruned === true ? "Pruned" : c.pruned === false ? "Archive" : "—",
+    ],
+    ["Pruned below", fmt(c.prune_height)],
+    ["Finalized storage height", fmt(c.finalized)],
+    ["Support height", fmt(value("support_height"))],
+    ["Blocks until support ends", fmt(value("support_blocks"))],
+  ]);
+  table(
+    "rpc-methods",
+    sourceFresh("metrics")
+      ? [...state.rpc_methods]
+          .sort((a, b) => (b.rps || 0) - (a.rps || 0))
+          .slice(0, 12)
+          .map((m) => [m.name, format("rpc_rps", m.rps), ms(m.p95_ms)])
+      : [],
+    3,
   );
-  set("rss", bytes(hostFresh ? h.rss_bytes : null));
-  set("memory-free", bytes(hostFresh ? h.mem_available_bytes : null));
-  set(
-    "host-load",
-    hostFresh
-      ? [h.load1, h.load5, h.load15].map((v) => fmt(v, 2)).join(" / ")
-      : "—",
-  );
-  set("db-cache", bytes(metric("cache_bytes")));
-  set("uptime", hostFresh ? age(h.uptime_seconds) : "—");
-
-  set("rpc-rate", fmt(metric("rpc_rps"), 2));
-  set("rpc-errors", `${fmt(metric("rpc_errors_ps"), 2)} errors / sec`);
-  const methods = metricsFresh
-    ? [...state.rpc_methods]
-        .filter((v) => valid(v.p95_ms) && v.p95_ms > 0)
-        .sort((a, b) => (b.rps || 0) - (a.rps || 0))
-        .slice(0, 5)
-    : [];
-  $("rpc-methods").innerHTML = methods.length
-    ? methods
-        .map(
-          (v) =>
-            `<tr><td>${esc(v.name)}</td><td>${fmt(v.rps, 2)}</td><td>${ms(v.p95_ms)}</td></tr>`,
-        )
-        .join("")
-    : '<tr><td colspan="3" class="empty">RPC metrics unavailable</td></tr>';
-  const poolOrder = [
-    "transparent",
-    "sprout",
-    "sapling",
-    "orchard",
-    "ironwood",
-    "lockbox",
-  ];
-  const pools = [...(c.pools || [])].sort(
-    (a, b) => poolOrder.indexOf(a.name) - poolOrder.indexOf(b.name),
-  );
-  const maxPool = Math.max(1, ...pools.map((p) => p.zec || 0));
-  $("pools").innerHTML = pools.length
-    ? pools
-        .map(
-          (p) =>
-            `<div class="pool-row"><span class="pool-name">${esc(p.name)}</span><div class="bar-track"><div class="bar-fill" data-width="${Math.min(100, ((p.zec || 0) / maxPool) * 100)}"></div></div><strong>${fmt(p.zec, 0)}</strong></div>`,
-        )
-        .join("")
-    : '<p class="empty">Pool totals unavailable</p>';
-  document.querySelectorAll("[data-width]").forEach((el) => {
+  const pools = c.pools || [],
+    max = Math.max(1, ...pools.map((p) => p.zec || 0));
+  $("pools").innerHTML = pools
+    .map(
+      (p) =>
+        `<div class="pool-row"><span>${esc(p.name)}</span><div class="meter"><div data-width="${Math.max(0, Math.min(100, ((p.zec || 0) / max) * 100))}"></div></div><b>${fmt(p.zec)}</b></div>`,
+    )
+    .join("");
+  applyWidths($("pools"));
+}
+function applyWidths(container) {
+  container.querySelectorAll("[data-width]").forEach((el) => {
     el.style.width = `${el.dataset.width}%`;
   });
-  set("context-upgrade", c.upgrade || "—");
-  set(
-    "pruning",
-    c.pruned === false ? "Full archive" : c.pruned === true ? "Pruned" : "—",
-  );
-  const fleet = state.fleet || {};
-  const localHost = state.host_mode === "local";
-  set("node-status-label", localHost ? "Node service" : "Fleet comparison");
-  set("node-context-note", localHost
-    ? "This dedicated node can restart independently of the dashboard."
-    : "Fleet comparison is a cross-check of other observed nodes.");
-  set(
-    "fleet-status",
-    localHost
-      ? (hostFresh && state.node_service ? state.node_service : "Unavailable")
-      : !hostFresh || !fleet.hash || !chainFresh
-      ? "Unavailable"
-      : fleet.hash === c.hash
-        ? "Tip matches majority"
-        : fleet.height === c.height
-          ? "Different tip at same height"
-          : `${fmt(Math.abs(c.height - fleet.height))} block${Math.abs(c.height - fleet.height) === 1 ? "" : "s"} ${c.height > fleet.height ? "ahead" : "behind"}`,
-  );
-  set("support-height", fmt(metric("support_height")));
-  set("support-blocks", fmt(metric("support_blocks")));
-  $("reorgs").innerHTML = state.reorgs.length
-    ? state.reorgs
-        .slice(0, 2)
-        .map(
-          (r) =>
-            `<div class="reorg-row"><span>${fmt(r.from_height)} → ${fmt(r.to_height)}</span><span>${esc(valid(r.at) ? age(now - r.at) + " ago" : "Observed")}${valid(r.depth) ? ` · depth ${fmt(r.depth)}` : ""}</span></div>`,
-        )
-        .join("")
-    : `<p class="empty">${localHost ? "Tip-switch history unavailable" : "No recent tip switches reported"}</p>`;
-
-  renderBlocks(now);
-  if (selectedBlock && $("block-dialog").open) renderBlockDetail(selectedBlock);
-  renderStatus();
-  renderSourceDetails();
-  renderCharts();
 }
-
 function renderStatus() {
-  const bad = !sourceFresh("chain") || disconnected;
-  $("live-status").classList.toggle("stale", bad || paused);
-  $("live-status").innerHTML =
-    `<i></i>${paused ? "Paused" : disconnected ? "Reconnecting" : bad ? "Stale data" : "Live"}`;
   const stale = ["chain", "metrics", "peers", "host", "blocks"].filter(
-    (key) => !sourceFresh(key),
+    (s) => !sourceFresh(s),
   );
-  const text = paused
-    ? "Your view is paused. Collection continues in the background. Resume to see the latest observations."
+  $("live-status").classList.toggle(
+    "stale",
+    stale.length > 0 || disconnected || paused,
+  );
+  $("live-status").innerHTML =
+    `<i class="dot"></i>${paused ? "Paused" : disconnected ? "Reconnecting" : stale.length ? "Partial data" : "Live"}`;
+  const message = paused
+    ? "View paused. Collection continues. Resume for the latest observations."
     : disconnected
-      ? "Connection lost. Showing the last received data while the dashboard reconnects."
+      ? "Connection lost. Last received observations are shown while reconnecting."
       : stale.length
-        ? `Some data is unavailable or stale: ${stale.join(", ")}. Missing metrics are shown as —.`
+        ? `Unavailable or stale: ${stale.join(", ")}. Missing measurements appear as —.`
         : "";
-  $("notice").hidden = !text;
-  set("notice", text);
+  $("notice").hidden = !message;
+  set("notice", message);
   set(
     "updated",
     state
-      ? `${paused ? "Paused at" : "Snapshot"} ${clock(state.generated_at)} · local time`
-      : "Waiting for first observation",
+      ? `${paused ? "Paused" : "Snapshot"} ${clock(state.generated_at)} · local time`
+      : "Connecting",
   );
 }
-
 function renderBlocks(now) {
   const blocks = state.blocks || [];
-  if (!blocks.length) {
-    $("blocks").innerHTML = '<p class="empty">Waiting for block details…</p>';
-    return;
-  }
   const focusHash = document.activeElement?.dataset?.hash;
-  $("blocks").innerHTML = blocks
-    .map(
-      (b) =>
-        `<button class="block-row${b.hash === state.chain.hash ? " latest" : ""}${b.canonical === false ? " orphan" : ""}" data-hash="${esc(b.hash)}" aria-label="View block ${fmt(b.height)}${b.canonical === false ? ", off the current chain" : ""}"><span class="row-main"><b>${fmt(b.height)}</b><time>${esc(age(now - b.time))}</time></span><span class="row-sub"><span>${fmt(b.transactions)} tx${b.canonical === false ? " · off chain" : ""}</span><span class="tx-ticks" aria-hidden="true">${"▏".repeat(Math.min(12, Math.max(1, b.transactions)))}</span><span>${bytes(b.size)}</span></span></button>`,
-    )
-    .join("");
+  $("blocks").innerHTML = blocks.length
+    ? blocks
+        .map(
+          (b) =>
+            `<button class="block-row${b.hash === state.chain.hash ? " latest" : ""}${b.canonical === false ? " orphan" : ""}" data-hash="${esc(b.hash)}" aria-label="View block ${fmt(b.height)}"><span class="row-main"><b>${fmt(b.height)}</b><time>${esc(age(now - b.time))}</time></span><span class="row-sub"><span>${fmt(b.transactions)} tx${b.canonical === false ? " · off chain" : ""}</span><span>${bytes(b.size)}</span></span></button>`,
+        )
+        .join("")
+    : '<p class="empty">Waiting for blocks…</p>';
   if (focusHash)
     $("blocks")
       .querySelector(`[data-hash="${CSS.escape(focusHash)}"]`)
       ?.focus({ preventScroll: true });
-}
-
-function renderBlockDetail(hash) {
-  const block = state.blocks.find((b) => b.hash === hash);
-  if (!block) return;
-  const status =
-    block.canonical === true
-      ? "On the observed best chain"
-      : block.canonical === false
-        ? "Off the observed best chain"
-        : "Chain membership not yet checked";
-  set("block-title", `Block ${fmt(block.height)}`);
-  const row = (label, value) =>
-    `<div><dt>${esc(label)}</dt><dd>${esc(value)}</dd></div>`;
-  $("block-detail").innerHTML =
-    `<span class="block-state${block.canonical !== true ? " orphan" : ""}">${status}</span><div class="block-hash">${esc(block.hash)}</div><dl class="stat-list detail-stats">${row("Transactions, including coinbase", fmt(block.transactions))}${row("Serialized size", bytes(block.size))}${row("Miner timestamp · UTC", clock(block.time, true))}${row("First seen by dashboard · UTC", block.observed_at ? clock(block.observed_at, true) : "Backfilled block")}${Object.entries(
-      block.trees || {},
+  const linked = blocks
+    .filter((b) => b.canonical === true)
+    .slice(0, 30)
+    .reverse();
+  const max = Math.max(1, ...linked.map((b) => b.transactions));
+  $("block-volume").innerHTML = linked
+    .map(
+      (b) =>
+        `<button class="volume-column" data-hash="${esc(b.hash)}" title="Block ${fmt(b.height)} · ${fmt(b.transactions)} tx · ${bytes(b.size)}" aria-label="Block ${fmt(b.height)}, ${fmt(b.transactions)} transactions"><span data-height="${Math.max(2, (b.transactions / max) * 100)}"></span></button>`,
     )
-      .map(([name, size]) =>
-        row(`${name[0].toUpperCase() + name.slice(1)} tree leaves`, fmt(size)),
-      )
-      .join(
-        "",
-      )}</dl><p class="block-note">Times are not per-block processing durations. First seen is the dashboard’s polling observation. Shielded tree sizes are public commitment counts.</p>`;
+    .join("");
+  $("block-volume")
+    .querySelectorAll("[data-height]")
+    .forEach((el) => {
+      el.style.height = `${el.dataset.height}%`;
+    });
 }
-
+function renderBlockDetail(hash) {
+  const b = state.blocks.find((block) => block.hash === hash);
+  if (!b) return;
+  set("block-title", `Block ${fmt(b.height)}`);
+  const data = [
+    ["Transactions · including coinbase", fmt(b.transactions)],
+    ["Serialized size", bytes(b.size)],
+    ["Miner timestamp · UTC", clock(b.time, true)],
+    [
+      "Dashboard observation · UTC",
+      b.observed_at ? clock(b.observed_at, true) : "Backfilled block",
+    ],
+    ...Object.entries(b.trees || {}).map(([name, n]) => [
+      `${name} tree leaves`,
+      fmt(n),
+    ]),
+  ];
+  $("block-detail").innerHTML =
+    `<span class="block-state">${b.canonical === true ? "On the observed best chain" : b.canonical === false ? "Off the observed best chain" : "Chain membership not yet checked"}</span><div class="block-hash">${esc(b.hash)}</div><dl class="stat-list detail-stats">${data.map(([k, v]) => `<div><dt>${esc(k)}</dt><dd>${esc(v)}</dd></div>`).join("")}</dl><p>The observation time is when the dashboard polled this block. It is not its receive time or processing duration.</p>`;
+}
 function chart(id, keys, format) {
   const container = $(id);
+  if (!container || container.closest("[hidden]")) return;
   const end = state?.generated_at || Date.now() / 1000;
   const start = end - WINDOWS[range];
   const rows = history.filter((p) => p.t >= start && p.t <= end);
@@ -440,48 +600,50 @@ function chart(id, keys, format) {
 }
 
 function renderCharts() {
+  chart("tps-chart", ["tps", "user_tps"], (v) => format("tps", v));
+  chart("proof-chart", ["halo2_ps", "sapling_ps"], (v) =>
+    format("halo2_ps", v),
+  );
+  chart("queue-chart", ["outstanding", "applying"], (v) => fmt(v));
+  chart("latency-chart", ["peer_p50_ms"], ms);
+  chart("tx-chart", ["tx_verified_ps", "tx_failed_ps"], (v) =>
+    format("tx_verified_ps", v),
+  );
   chart("traffic-chart", ["legacy_in_bps", "legacy_out_bps"], (v) =>
     bytes(v, true),
   );
-  chart("proof-chart", ["halo2_ps", "sapling_ps"], (v) =>
-    valid(v) ? `${fmt(v, 2)} /s` : "—",
+  chart("host-network-chart", ["host_rx_bps", "host_tx_bps"], (v) =>
+    bytes(v, true),
   );
-  chart("mempool-chart", ["mempool_count"], (v) => `${fmt(v)} tx`);
+  chart("source-chart", ["zakura_first_ps", "legacy_first_ps"], (v) =>
+    format("zakura_first_ps", v),
+  );
+  chart("cpu-chart", ["cpu_percent", "iowait_percent"], (v) =>
+    format("cpu_percent", v),
+  );
+  chart("memory-chart", ["rss_bytes"], bytes);
   const first = history.find((p) => valid(p.t));
   set(
     "history-note",
     first
-      ? `Observed since ${clock(first.t)} · local time · 15s samples`
-      : "History builds as this dashboard runs",
+      ? `Observed since ${clock(first.t)} · 15s samples · chart range ${range}`
+      : "New series appear as observations arrive · 15s samples",
   );
 }
-
-function renderSourceDetails() {
-  if (!state) return;
-  $("source-details").innerHTML =
-    Object.entries(state.sources)
-      .map(
-        ([name, source]) =>
-          `<div>${esc(name)} · ${sourceFresh(name) ? "fresh" : "stale"} · last success ${esc(clock(source.at, true))} UTC</div>`,
-      )
-      .join("") +
-    `<div>Dashboard build · ${esc(state.build.slice(0, 12))}</div>`;
-}
-
 async function getJSON(path) {
-  const response = await fetch(path, {
+  const r = await fetch(path, {
     cache: "no-store",
     signal: AbortSignal.timeout(8000),
   });
-  if (!response.ok) throw new Error("Data unavailable");
-  return response.json();
+  if (!r.ok) throw new Error("Data unavailable");
+  return r.json();
 }
 async function loadHistory() {
-  const requestedRange = range;
+  const requested = range;
   const data = await getJSON(
-    `api/history?window=${encodeURIComponent(requestedRange)}`,
+    `api/history?window=${encodeURIComponent(requested)}`,
   );
-  if (requestedRange === range) {
+  if (requested === range) {
     history = data.samples;
     lastHistory = Date.now();
     renderCharts();
@@ -491,9 +653,9 @@ async function poll() {
   if (paused || fetching || document.hidden) return;
   fetching = true;
   try {
-    const nextState = await getJSON("api/overview");
+    const next = await getJSON("api/overview");
     if (paused) return;
-    state = nextState;
+    state = next;
     disconnected = false;
     render();
     if (Date.now() - lastHistory > 15000) {
@@ -504,30 +666,49 @@ async function poll() {
       }
     }
   } catch {
-    if (paused) return;
-    disconnected = true;
-    if (state) render();
-    else {
-      $("notice").hidden = false;
-      set(
-        "notice",
-        "The node feed is temporarily unavailable. Retrying automatically.",
-      );
-      $("live-status").innerHTML = "<i></i>Reconnecting";
-      $("live-status").classList.add("stale");
+    if (!paused) {
+      disconnected = true;
+      if (state) render();
+      else {
+        $("notice").hidden = false;
+        set("notice", "Connecting to the node feed. Retrying automatically.");
+      }
     }
   } finally {
     fetching = false;
   }
 }
-
 $("pause").addEventListener("click", () => {
   paused = !paused;
   $("pause").setAttribute("aria-pressed", String(paused));
   set("pause", paused ? "Resume" : "Pause");
-  renderStatus();
+  if (state) render();
   if (!paused) poll();
 });
+document.querySelectorAll("[data-view]").forEach((button) =>
+  button.addEventListener("click", () => {
+    view = button.dataset.view;
+    document.querySelectorAll("[data-view]").forEach((b) => {
+      b.classList.toggle("selected", b === button);
+      if (b === button) b.setAttribute("aria-current", "page");
+      else b.removeAttribute("aria-current");
+    });
+    document.querySelectorAll("[data-page]").forEach((page) => {
+      page.hidden = page.dataset.page !== view;
+    });
+    renderCharts();
+  }),
+);
+document.querySelectorAll("[data-flow]").forEach((button) =>
+  button.addEventListener("click", () => {
+    flowMode = button.dataset.flow;
+    document.querySelectorAll("[data-flow]").forEach((b) => {
+      b.classList.toggle("selected", b === button);
+      b.setAttribute("aria-pressed", String(b === button));
+    });
+    if (state) renderFlow();
+  }),
+);
 document.querySelectorAll("[data-window]").forEach((button) =>
   button.addEventListener("click", async () => {
     range = button.dataset.window;
@@ -543,44 +724,25 @@ document.querySelectorAll("[data-window]").forEach((button) =>
     }
   }),
 );
-$("blocks").addEventListener("click", (event) => {
-  const button = event.target.closest("[data-hash]");
-  if (button) {
-    selectedBlock = button.dataset.hash;
-    renderBlockDetail(selectedBlock);
-    $("block-dialog").showModal();
-  }
-});
-const showAbout = () => {
-  renderSourceDetails();
-  $("about-dialog").showModal();
-};
-$("about-button").addEventListener("click", showAbout);
-$("sources-button").addEventListener("click", showAbout);
+for (const id of ["blocks", "block-volume"])
+  $(id).addEventListener("click", (event) => {
+    const b = event.target.closest("[data-hash]");
+    if (b) {
+      selectedBlock = b.dataset.hash;
+      renderBlockDetail(selectedBlock);
+      $("block-dialog").showModal();
+    }
+  });
+for (const id of ["about", "sources-button"])
+  $(id).addEventListener("click", () => $("about-dialog").showModal());
 document
   .querySelectorAll(".close-dialog")
   .forEach((button) =>
     button.addEventListener("click", () => button.closest("dialog").close()),
   );
-document.querySelectorAll("dialog").forEach((dialog) =>
-  dialog.addEventListener("click", (event) => {
-    if (event.target === dialog) {
-      const r = dialog.getBoundingClientRect();
-      if (
-        event.clientX < r.left ||
-        event.clientX > r.right ||
-        event.clientY < r.top ||
-        event.clientY > r.bottom
-      )
-        dialog.close();
-    }
-  }),
-);
+window.addEventListener("resize", renderCharts);
 document.addEventListener("visibilitychange", () => {
   if (!document.hidden) poll();
 });
-new ResizeObserver(() => {
-  if (state) renderCharts();
-}).observe($("traffic-chart"));
-poll();
 setInterval(poll, 5000);
+poll();

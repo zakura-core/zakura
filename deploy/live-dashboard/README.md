@@ -8,6 +8,53 @@ during DNS setup is <http://146.190.146.239/>.
 The original fleet status page stays at <https://status-mainnet.valargroup.dev/>.
 This dashboard does not replace it or install routes on the production gateway.
 
+## Console views
+
+- **Overview** shows chain TPS, recent block transaction counts, mempool stage
+  activity, proof verification rates, block queues, and peer RTT.
+- **Pipeline** shows outstanding and applying work, independent p50/p95 stage
+  durations, cryptographic batch timings, and memory pressure.
+- **Network** separates legacy TCP wire traffic from host interface traffic.
+  It includes native QUIC sessions and discovery outcomes, protocol message
+  rates, stream opens, first-body source rates, and anonymized RPC peer details.
+- **System** shows CPU utilization, I/O wait, node RSS, storage and compactions,
+  RPC latency, chain support limits, and public value pools.
+
+Chain TPS uses at most 30 consecutive intervals on the observed best chain.
+The transaction count excludes the oldest boundary block and is divided by the
+miner timestamp difference between the two boundary heights. Excluding coinbase
+subtracts one transaction per counted block. Fewer than two linked intervals or
+a nonpositive timestamp difference is unavailable. This window is independent
+of the chart time-range selector. Reorganizations recompute it from the current
+ancestry. TPS measures chain activity, not hardware capacity.
+
+The transaction flow is the useful counterpart to Firedancer's TPU view for a
+Zcash node. Its stages are independent counter rates or totals since node restart,
+not a conserved funnel or a trace of the same transaction. Verification completes
+before mempool admission, and advertisements can repeat. Missing counters remain
+unavailable. Failed tasks include download errors and timeouts. Their raw error
+labels are not published. Oversize policy rejections are a separate counter.
+
+The native queue gauge records the most recent enqueue depth for a stream kind.
+It is not a live sum across connections. Peer RTT percentiles use the measured
+RPC peers and omit missing or negative values. Host network counters include all
+non-loopback interfaces and all applications. They must not be labeled QUIC
+traffic. CPU busy and I/O wait percentages use Linux tick deltas across all CPUs.
+Counter resets, interface changes, and long sampling gaps leave rates unavailable.
+
+### Further node instrumentation
+
+Still needed for a complete processing waterfall: bounded events joining block
+receive, verification, contextual checks, and commit by block hash. Aggregate
+latency summaries overlap and cannot be stacked into an end-to-end duration.
+For transaction flow, add explicit mempool admission, mined, expiration, eviction,
+and bounded rejection reason counters plus correlated queue/verification timings.
+For native networking, add wire bytes, per-peer RTT and loss/retransmission
+statistics, and queue gauges that aggregate every active connection and update on
+dequeue. Keep these experiments on the dedicated node before proposing upstream
+changes. The console omits Solana stake, voting, leader schedule, slots, shreds,
+and program-cache panels because they do not describe a Zcash full node.
+
 ## Data
 
 The collector polls local RPC every 5 seconds, selected Prometheus metrics every

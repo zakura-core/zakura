@@ -46,6 +46,12 @@ GAUGES = {
     "support_blocks": "end_of_support_remaining_blocks",
     "support_height": "end_of_support_last_supported_height",
     "support_enforced": "end_of_support_enforced",
+    "legacy_unready": "pool_num_unready",
+    "handshakes": "crawler_in_flight_handshakes",
+    "compaction_pending_bytes": "zakura_state_rocksdb_compaction_pending_bytes",
+    "pipeline_memory_bytes": "sync_block_active_pipeline_decoded_attributed_memory_bytes",
+    "header_budget_used": "sync_header_chunk_budget_owned",
+    "header_budget_capacity": "sync_header_chunk_budget_capacity",
 }
 COUNTERS = {
     "legacy_in_bps": "zcash_net_in_bytes_total",
@@ -59,15 +65,44 @@ COUNTERS = {
     "tx_relayed_ps": "mempool_gossiped_transactions_total",
     "rpc_rps": "rpc_requests_total",
     "rpc_errors_ps": "rpc_errors_total",
+    "tx_queued_ps": "mempool_queued_transactions_total",
+    "tx_downloaded_ps": "mempool_downloaded_transactions_total",
+    "tx_pushed_ps": "mempool_pushed_transactions_total",
+    "tx_failed_ps": "mempool_failed_verify_tasks_total",
+    "blocks_verified_ps": "zcash_chain_verified_block_total",
+    "native_requests_ps": "sync_block_request_sent",
+    "native_bodies_ps": "sync_block_body_received",
+    "dial_started_ps": "zakura_p2p_discovery_dial_started",
+    "dial_succeeded_ps": "zakura_p2p_discovery_dial_succeeded",
+    "dial_failed_ps": "zakura_p2p_discovery_dial_failed",
+    "native_accepted_ps": "zakura_p2p_conn_accepted",
+    "native_closed_ps": "zakura_p2p_conn_closed_neutral",
+    "native_duplicate_ps": "zakura_p2p_conn_duplicate",
+    "legacy_handshake_failed_ps": "zcash_net_peer_handshake_failures_total",
+    "messages_in_ps": "zcash_net_in_messages",
+    "messages_out_ps": "zcash_net_out_messages",
 }
 TIMINGS = {
     "writer_queue_ms": "state_block_writer_queue_duration_seconds",
     "contextual_ms": "state_contextual_total_duration_seconds",
     "write_ms": "zakura_state_rocksdb_batch_commit_duration_seconds",
+    "submit_queue_ms": "sync_block_submit_queue_wait_seconds",
+}
+STAGE_TIMINGS = {
+    "Submit queue": "sync_block_submit_queue_wait_seconds",
+    "Writer queue": "state_block_writer_queue_duration_seconds",
+    "Contextual validation": "state_contextual_total_duration_seconds",
+    "Initial checks": "state_contextual_initial_checks_duration_seconds",
+    "Transparent spends": "state_contextual_transparent_spend_duration_seconds",
+    "Shielded anchors": "state_contextual_shielded_anchors_duration_seconds",
+    "Parallel state update": "state_contextual_parallel_update_duration_seconds",
+    "RocksDB write": "zakura_state_rocksdb_batch_commit_duration_seconds",
 }
 WANTED = set(GAUGES.values()) | set(COUNTERS.values()) | set(TIMINGS.values())
 WANTED |= {"zakura_build_info", "zakurad_build_info", "sync_block_first_received_count",
-           "zakura_consensus_batch_duration_seconds", "rpc_request_duration_seconds"}
+           "zakura_consensus_batch_duration_seconds", "rpc_request_duration_seconds",
+           "zakura_p2p_queue_depth", "zakura_p2p_stream_accepted"}
+WANTED.update(STAGE_TIMINGS.values())
 
 
 def number(value):
@@ -173,6 +208,56 @@ def block_public(block, observed=None):
                       if k in {"sapling", "orchard", "ironwood"}}}
 
 
+def chain_activity(blocks, tip):
+    """Measure up to 30 linked block intervals, excluding the oldest boundary block."""
+    by_hash = {b["hash"]: b for b in blocks if b.get("canonical") is True}
+    chain = []
+    for _ in range(31):
+        block = by_hash.get(tip)
+        if not block or (chain and block["height"] != chain[-1]["height"] - 1):
+            break
+        chain.append(block)
+        tip = block.get("previous")
+    if len(chain) < 3 or any(number(b.get("time")) is None for b in chain):
+        return None
+    seconds = chain[0]["time"] - chain[-1]["time"]
+    if seconds <= 0:
+        return None
+    measured = chain[:-1]
+    transactions = sum(b["transactions"] for b in measured)
+    user_transactions = sum(max(0, b["transactions"] - 1) for b in measured)
+    return {"tps": transactions / seconds, "user_tps": user_transactions / seconds,
+            "transactions": transactions, "blocks": len(measured), "seconds": seconds,
+            "block_interval": seconds / len(measured), "from_height": chain[-1]["height"],
+            "to_height": chain[0]["height"],
+            "mean_block_bytes": sum(b.get("size") or 0 for b in measured) / len(measured)}
+
+
+def host_counters():
+    """Keep raw CPU and interface counters private until two observations exist."""
+    result = {}
+    try:
+        ticks = [int(v) for v in Path("/proc/stat").read_text().splitlines()[0].split()[1:9]]
+        result["cpu"] = {"total": sum(ticks), "idle": ticks[3] + ticks[4], "iowait": ticks[4]}
+        result["cores"] = os.cpu_count()
+    except (OSError, ValueError, IndexError):
+        pass
+    try:
+        interfaces = {}
+        for line in Path("/proc/net/dev").read_text().splitlines()[2:]:
+            name, data = line.split(":", 1)
+            if name.strip() == "lo":
+                continue
+            fields = [int(v) for v in data.split()]
+            interfaces[name.strip()] = {"rx": fields[0], "tx": fields[8],
+                                       "drops": fields[3] + fields[11],
+                                       "errors": fields[2] + fields[10]}
+        result["interfaces"] = interfaces
+    except (OSError, ValueError, IndexError):
+        pass
+    return result
+
+
 def local_host(disk_path, service):
     """Read Linux host counters without opening the node's database or logs."""
     memory = {}
@@ -207,7 +292,7 @@ def local_host(disk_path, service):
     except (OSError, ValueError, KeyError, subprocess.SubprocessError):
         # Service queries and process reads can race a node restart.
         pass
-    return {"host": host, "service": status}
+    return {"host": host, "service": status, "counters": host_counters()}
 
 
 class Store:
@@ -245,10 +330,14 @@ class Collector:
         self.state = {"node": args.node, "chain": {}, "metrics": {}, "host": {},
                       "host_mode": "fleet" if getattr(args, "fleet", None) else "local",
                       "node_service": None,
+                      "transaction_flow": [], "stage_timings": [], "messages": [],
+                      "streams": [], "peer_details": [], "peer_latency": {},
                       "peers": [], "fleet": {}, "reorgs": [], "rpc_methods": [], "verifiers": [],
                       "version": None, "sources": {}, "blocks": self.store.blocks()}
         self.previous_metrics = None
         self.previous_metrics_at = None
+        self.previous_host = None
+        self.previous_host_at = None
         self.metric_attempt = self.host_attempt = self.peer_attempt = 0
         self.last_save = 0
         self.pool = ThreadPoolExecutor(max_workers=4)
@@ -285,6 +374,29 @@ class Collector:
                 metric(metrics, "sync_block_first_received_count", source=source), seconds)
         for key, name in TIMINGS.items():
             values[key] = quantile(metrics, name)
+        values["tx_timeout_ps"] = rate(metric(old, "mempool_failed_verify_tasks_total", reason="timeout"),
+                                       metric(metrics, "mempool_failed_verify_tasks_total", reason="timeout"), seconds)
+        self.state["transaction_flow"] = [
+            {"name": title, "rate": values[key], "total": metric(metrics, COUNTERS[key])}
+            for title, key in (("Queued", "tx_queued_ps"), ("Downloaded", "tx_downloaded_ps"),
+                               ("Pushed directly", "tx_pushed_ps"), ("Verified", "tx_verified_ps"),
+                               ("Advertised", "tx_relayed_ps"), ("Failed tasks", "tx_failed_ps"),
+                               ("Oversize rejection", "tx_policy_rejected_ps"))]
+        self.state["stage_timings"] = [
+            {"name": title, "p50_ms": quantile(metrics, name, "0.5"), "p95_ms": quantile(metrics, name)}
+            for title, name in STAGE_TIMINGS.items()]
+        # Only protocol command labels leave the collector, never arbitrary error strings.
+        commands = sorted({tags["command"] for name in ("zcash_net_in_messages", "zcash_net_out_messages")
+                           for tags, _ in metrics.get(name, []) if re.fullmatch(r"[a-z0-9_]{1,32}", tags.get("command", ""))})
+        self.state["messages"] = [{"name": command, **{
+            direction: rate(metric(old, name, command=command), metric(metrics, name, command=command), seconds)
+            for direction, name in (("in_ps", "zcash_net_in_messages"), ("out_ps", "zcash_net_out_messages"))}}
+            for command in commands[:40]]
+        self.state["streams"] = [{"name": name,
+            "last_depth": metric(metrics, "zakura_p2p_queue_depth", stream_kind=name),
+            "accepted_ps": rate(metric(old, "zakura_p2p_stream_accepted", stream_kind=name),
+                                metric(metrics, "zakura_p2p_stream_accepted", stream_kind=name), seconds)}
+            for name in ("header_sync", "block_sync", "gossip", "discovery", "legacy_request")]
         self.state["metrics"] = values
         verifiers = sorted({tags.get("verifier") for tags, _ in metrics.get("zakura_consensus_batch_duration_seconds", []) if tags.get("verifier")})
         self.state["verifiers"] = [{"name": name, "p50_ms": quantile(metrics, "zakura_consensus_batch_duration_seconds", "0.5", verifier=name, result="success"),
@@ -298,6 +410,33 @@ class Collector:
                 self.state["version"] = metrics[name][0][0].get("version", "")[:80]
         self.previous_metrics, self.previous_metrics_at = metrics, now
         self.source("metrics", True, now)
+
+    def update_host(self, result, now):
+        host = result["host"]
+        current = result.get("counters", {})
+        old = self.previous_host or {}
+        seconds = now - self.previous_host_at if self.previous_host_at else 0
+        host.update({"cpu_percent": None, "iowait_percent": None,
+                     "host_rx_bps": None, "host_tx_bps": None,
+                     "host_drops_ps": None, "host_errors_ps": None,
+                     "cpu_cores": current.get("cores")})
+        if 0 < seconds <= 120 and "cpu" in old and "cpu" in current:
+            delta = {k: current["cpu"][k] - old["cpu"][k] for k in ("total", "idle", "iowait")}
+            if delta["total"] > 0 and all(v >= 0 for v in delta.values()):
+                host["cpu_percent"] = max(0, min(100, 100 * (1 - delta["idle"] / delta["total"])))
+                host["iowait_percent"] = min(100, 100 * delta["iowait"] / delta["total"])
+        interfaces = current.get("interfaces", {})
+        previous = old.get("interfaces", {})
+        if interfaces and interfaces.keys() == previous.keys():
+            for field, key in (("rx", "host_rx_bps"), ("tx", "host_tx_bps"),
+                               ("drops", "host_drops_ps"), ("errors", "host_errors_ps")):
+                rates = [rate(previous[name][field], data[field], seconds) for name, data in interfaces.items()]
+                if all(v is not None for v in rates):
+                    host[key] = sum(rates)
+        self.previous_host, self.previous_host_at = current, now
+        self.state["host"] = host
+        self.state["node_service"] = result["service"]
+        self.source("host", True, now)
 
     def update_fleet(self, data, now):
         if data.get("network") != "mainnet":
@@ -327,6 +466,16 @@ class Collector:
                 outbound += 1
         self.state["peers"] = [{"agent": k, "count": v} for k, v in sorted(groups.items(), key=lambda x: -x[1])[:30]]
         self.state["peer_summary"] = {"inbound": inbound, "outbound": outbound, "total": len(peers)}
+        details = [{"agent": str(p.get("subver") or "Unknown")[:100],
+                    "inbound": bool(p.get("inbound")), "version": number(p.get("version")),
+                    "ping_ms": number(p.get("pingtime")) * 1000 if number(p.get("pingtime")) is not None and p["pingtime"] >= 0 else None,
+                    "ping_wait_ms": number(p.get("pingwait")) * 1000 if number(p.get("pingwait")) is not None and p["pingwait"] >= 0 else None}
+                   for p in peers]
+        pings = sorted(p["ping_ms"] for p in details if p["ping_ms"] is not None)
+        percentile = lambda q: pings[max(0, math.ceil(len(pings) * q) - 1)] if pings else None
+        self.state["peer_latency"] = {"p50_ms": percentile(0.5), "p95_ms": percentile(0.95),
+                                      "measured": len(pings), "unknown": len(peers) - len(pings)}
+        self.state["peer_details"] = sorted(details, key=lambda p: (p["ping_ms"] is None, -(p["ping_ms"] or 0)))[:200]
         self.source("peers", True, now)
 
     def update_blocks(self, chain, now):
@@ -393,9 +542,7 @@ class Collector:
                         if self.args.fleet:
                             self.update_fleet(result, now)
                         else:
-                            self.state["host"] = result["host"]
-                            self.state["node_service"] = result["service"]
-                            self.source("host", True, now)
+                            self.update_host(result, now)
                     elif key == "peers":
                         self.update_peers(result, now)
                 except Exception:
@@ -421,6 +568,9 @@ class Collector:
                   "lag": state["chain"].get("lag") if fresh("chain") else None}
         sample.update({k: v if fresh("metrics") else None for k, v in state["metrics"].items()})
         sample.update({k: v if fresh("host") else None for k, v in state["host"].items()})
+        activity = state.get("chain_activity") or {}
+        sample.update({key: activity.get(key) for key in ("tps", "user_tps", "block_interval")})
+        sample["peer_p50_ms"] = state.get("peer_latency", {}).get("p50_ms") if fresh("peers") else None
         return sample
 
     def snapshot(self):
@@ -439,6 +589,9 @@ class Collector:
             if state["sources"].get("chain", {}).get("fresh")
             and number(height) is not None and number(supported) is not None else None)
         state["generated_at"] = now
+        state["chain_activity"] = (chain_activity(state["blocks"], state["chain"].get("hash"))
+                                   if state["sources"].get("chain", {}).get("fresh")
+                                   and state["sources"].get("blocks", {}).get("fresh") else None)
         state["sample_interval"] = 15
         state["build"] = self.args.build
         return state

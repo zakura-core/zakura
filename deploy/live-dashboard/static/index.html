@@ -333,7 +333,7 @@
                 which can overlap and include scheduling. Missing records leave gaps.
               </p>
             </section>
-            <section class="panel">
+            <section class="panel" id="sync-buffer-panel" hidden>
               <div class="panel-heading"><h2>Sync buffers</h2></div>
               <div class="table-scroll">
                 <table>
@@ -490,8 +490,8 @@
                 aria-label="Legacy TCP traffic"
               ></div>
               <p class="panel-bottom">
-                Legacy protocol byte counters. Native QUIC wire bytes are not
-                yet exported.
+                Legacy TCP protocol byte counters. Native QUIC transport
+                measurements appear separately when available.
               </p>
             </section>
             <section class="panel">

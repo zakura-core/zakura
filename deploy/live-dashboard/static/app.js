@@ -265,6 +265,9 @@ function renderPipeline() {
           : max,
       null,
     );
+  const bufferActive = ["reserved_bytes", "reorder_bytes", "pipeline_memory_bytes", "header_budget_used"]
+    .some((key) => value(key) > 0 || peak(key) > 0);
+  $("sync-buffer-panel").hidden = !bufferActive && !state.chain?.resource_stalled;
   table(
     "sync-buffers",
     [

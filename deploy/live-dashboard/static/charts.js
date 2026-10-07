@@ -27,7 +27,7 @@ function chartSeriesLabel(key) {
     relay_ms: "Local relay", admission_ms: "Admission checks",
     mined_ms: "Mined", expired_ms: "Expired", evicted_ms: "Evicted",
     execution_ms: "Execution", scheduling_ms: "Scheduling", in_batch_wait_ms: "In-batch wait",
-    items: "Items", work_units: "Work units", contextual_ms: "Contextual checks", write_ms: "RocksDB write",
+    bundles: "Bundles", actions: "Actions", spends_outputs: "Spends + outputs", signatures: "Signatures", contextual_ms: "Contextual checks", write_ms: "RocksDB write",
     tps: "Total TPS", user_tps: "Excluding coinbase", count_halo2_ps: "Halo 2",
     count_sapling_ps: "Sapling", count_tx_verified_ps: "Verified", count_tx_failed_ps: "Failed tasks",
     native_rx_bps: "Received", native_tx_bps: "Sent", legacy_in_bps: "Received", legacy_out_bps: "Sent",
@@ -67,7 +67,8 @@ class HistoryChart {
     this.readout = document.createElement("div");
     this.readout.className = "chart-readout";
     this.readout.setAttribute("aria-label", "Chart inspection");
-    container.before(this.readout);
+    const legend = container.previousElementSibling;
+    (legend?.classList.contains("chart-legend") ? legend : container).before(this.readout);
     // uPlot consumes bubbling clicks. Capture clicks to pin a stable chart snapshot.
     container.addEventListener("click", (event) => {
       if (!this.plot) return;

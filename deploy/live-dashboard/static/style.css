@@ -1312,3 +1312,7 @@ dialog p {
   .chart-readout { height: 88px; align-items: flex-start; padding-top: 10px; }
   .chart-readout-controls { flex-direction: column; }
 }
+
+.crypto-chart-group { margin: 12px 0 20px; padding-top: 14px; border-top: 1px solid var(--border); }
+.crypto-chart-group h4 { margin: 0 17px; font-size: 12px; font-weight: 500; color: var(--muted); }
+.crypto-chart-group .chart-legend { margin-bottom: 4px; }

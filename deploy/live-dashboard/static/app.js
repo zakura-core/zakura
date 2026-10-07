@@ -717,27 +717,30 @@ function renderCharts() {
       keys.some((key) => valid(row[key])),
     );
     const measuredId = `batch-${name}`;
+    const sizeKeys = name === "halo2" ? ["bundles", "actions"]
+      : name === "groth16_sapling" ? ["bundles", "spends_outputs"] : ["signatures"];
     if (measured.length && !$(measuredId)) {
       const section = document.createElement("section");
       section.id = measuredId;
       section.innerHTML = `<div class="panel-heading"><h3>${label} measured batches</h3></div>
         <p id="${measuredId}-summary" class="panel-note"></p>
+        <div class="crypto-chart-group"><h4>Batch timing</h4>
         <div class="chart-legend"><span><i class="dot"></i>Execution</span><span><i class="dot violet"></i>Scheduling</span><span><i class="dot amber"></i>In-batch wait</span></div>
-        <div id="${measuredId}-time" class="chart short" role="img" aria-label="${label} individual batch durations"></div>
-        <div class="chart-legend"><span><i class="dot"></i>Items</span><span><i class="dot violet"></i>Work units</span></div>
-        <div id="${measuredId}-size" class="chart short" role="img" aria-label="${label} batch sizes"></div>`;
+        <div id="${measuredId}-time" class="chart short" role="img" aria-label="${label} individual batch durations"></div></div>
+        <div class="crypto-chart-group"><h4>Batch size</h4>
+        <div class="chart-legend">${sizeKeys.map((key, index) => `<span><i class="dot ${index ? "violet" : ""}"></i>${chartSeriesLabel(key)}</span>`).join("")}</div>
+        <div id="${measuredId}-size" class="chart short" role="img" aria-label="${label} batch sizes"></div></div>`;
       $("crypto-history").append(section);
     }
     if ($(measuredId)) {
       $(measuredId).hidden = !measured.length;
       if (measured.length) {
-        const rows = measured.map((row) => ({ ...row, t: row.at }));
+        const rows = measured.map((row) => ({ ...row, t: row.at, bundles: row.items, actions: row.work_units, spends_outputs: row.work_units, signatures: row.items }));
         const failures = measured.filter((row) => !row.success).length;
         const fallback = measured.filter((row) => row.mode === "fallback").length;
-        const unit = measured[0].unit.replaceAll("_", " ");
-        set(`${measuredId}-summary`, `${fmt(measured.length)} recorded completions · ${fmt(failures)} failed · ${fmt(fallback)} fallback · work units: ${unit}${cryptoBatches.limited ? " · limited history" : ""}`);
+        set(`${measuredId}-summary`, `${fmt(measured.length)} recorded completions · ${fmt(failures)} failed · ${fmt(fallback)} fallback${cryptoBatches.limited ? " · limited history" : ""}`);
         chart(`${measuredId}-time`, ["execution_ms", "scheduling_ms", "in_batch_wait_ms"], ms, true, rows);
-        chart(`${measuredId}-size`, ["items", "work_units"], fmt, true, rows);
+        chart(`${measuredId}-size`, sizeKeys, fmt, true, rows);
       }
     }
     if (!$(id) && available) {

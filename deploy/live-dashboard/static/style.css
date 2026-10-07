@@ -1246,3 +1246,7 @@ dialog p {
     grid-template-columns: 1fr;
   }
 }
+
+.stage-history .chart {
+  height: 240px;
+}

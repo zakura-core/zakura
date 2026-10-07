@@ -51,7 +51,7 @@ tower = { workspace = true, features = ["timeout", "util", "buffer"] }
 tracing = { workspace = true }
 getset = { workspace = true }
 
-sapling-crypto = { workspace = true, features = ["multicore", "bundled-verifying-keys"] }
+sapling-crypto = { workspace = true, features = ["multicore", "pinned-vk-only"] }
 orchard.workspace = true
 
 zcash_transparent = { workspace = true }

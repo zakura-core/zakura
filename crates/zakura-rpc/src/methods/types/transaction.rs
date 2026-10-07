@@ -397,8 +397,9 @@ impl TransactionTemplate<NegativeOrZero> {
             // the derivation in `Builder::build`).
             if let Some(version) = bundle_version_for_branch(branch, ::orchard::ValuePool::Orchard)
             {
-                let prepared =
-                    cached_orchard_proving_key(version.circuit_version()).prepare_proving();
+                let prepared = cached_orchard_proving_key(version.circuit_version())
+                    .expect("Ironwood coinbase rewards use the supported post-NU6.3 circuit")
+                    .prepare_proving();
                 tracing::debug!(
                     ?height,
                     prepared,

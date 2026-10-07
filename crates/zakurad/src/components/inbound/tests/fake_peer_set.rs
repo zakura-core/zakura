@@ -57,8 +57,7 @@ use InventoryResponse::*;
 const MAX_PEER_SET_REQUEST_DELAY: Duration = Duration::from_secs(30);
 
 async fn wait_for_gossip() {
-    // Let background gossip tasks arm their timers before this paused runtime
-    // advances to the next gossip deadline.
+    // Let background gossip tasks run, then wait out the transaction gossip delay.
     tokio::task::yield_now().await;
     tokio::time::sleep(TRANSACTION_GOSSIP_DELAY).await;
 }
@@ -591,8 +590,8 @@ async fn peer_mempool_full_queue_is_refused_without_disconnect() -> Result<(), c
     Ok(())
 }
 
-// The state writer acknowledges checkpoint commits before publishing the tip.
-// Use real time so the mock deadline cannot advance past that writer thread.
+// Use real time until the expected gossip is observed. The state writer acknowledges
+// commits before publishing tips, so a paused clock can reach the gossip timeout first.
 #[tokio::test(flavor = "current_thread")]
 async fn mempool_transaction_expiration() -> Result<(), crate::BoxError> {
     // Get a block that has at least one non coinbase transaction
@@ -893,8 +892,10 @@ async fn mempool_transaction_expiration() -> Result<(), crate::BoxError> {
         };
     }
 
-    // All commits and broadcasts have finished, so skip the idle mock timeout.
+    // All commits and expected gossip are done, so the quiet check can use virtual time.
     tokio::time::pause();
+
+    // check that nothing unexpected happened
     peer_set.expect_no_requests().await;
 
     let sync_gossip_result = sync_gossip_task_handle.now_or_never();

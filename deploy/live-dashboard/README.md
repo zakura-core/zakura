@@ -505,3 +505,7 @@ starts after the receiver service on boot. The initial migration to socket
 activation briefly interrupts collection, but later receiver restarts preserve
 queued datagrams. This does not guarantee delivery during long outages or bursts
 that exceed the kernel queue. The node's failure counter remains authoritative.
+
+The receiver uses the existing static `zakura-dashboard-web` service identity.
+DynamicUser must stay disabled: combined with preserved runtime directories it
+moves the socket path under `/run/private`, which the node cannot traverse.

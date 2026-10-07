@@ -6,7 +6,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-DynamicUser=yes
+DynamicUser=no
 User=zakura-dashboard-web
 Group=zakura-dashboard-web
 RuntimeDirectory=zakura-live-dashboard

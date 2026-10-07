@@ -62,7 +62,13 @@ class HistoryChart {
     Object.assign(this, { container, keys, format, points, colors, clock });
     this.plot = null;
     this.hoverEntries = [];
-    container.addEventListener("click", () => this.showObservations());
+    // uPlot consumes bubbling clicks. Resolve the hit before its drag handler.
+    container.addEventListener("click", (event) => {
+      if (!this.points || !this.plot) return;
+      const rect = this.plot.over.getBoundingClientRect();
+      this.hoverEntries = chartPointHits(this.plot, event.clientX - rect.left, event.clientY - rect.top);
+      this.showObservations();
+    }, true);
   }
 
   update(rows, start, end) {

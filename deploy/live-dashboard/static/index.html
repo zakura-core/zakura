@@ -401,6 +401,56 @@
             </div>
             <p>Connections, traffic, and peer latency</p>
           </div>
+          <section id="native-health" class="panel" hidden>
+            <div class="panel-heading">
+              <h2>Native QUIC health</h2>
+              <span id="native-health-coverage" class="panel-note"></span>
+            </div>
+            <div class="metrics-row">
+              <div>
+                <span class="legend"><i class="dot"></i>Received</span
+                ><strong data-value="native_rx_bps">—</strong>
+              </div>
+              <div>
+                <span class="legend"><i class="dot violet"></i>Sent</span
+                ><strong data-value="native_tx_bps">—</strong>
+              </div>
+              <div>
+                <span class="legend"
+                  >Packets declared lost ·
+                  <span data-period-short>15m</span></span
+                ><strong data-event="native_lost_ps">—</strong>
+              </div>
+            </div>
+            <div
+              id="native-traffic-chart"
+              class="chart"
+              role="img"
+              aria-label="Native QUIC transport bytes per second"
+            ></div>
+            <div class="table-scroll">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Session</th>
+                    <th>Selected-path RTT</th>
+                    <th>Receive</th>
+                    <th>Send</th>
+                    <th>Lost packets · session total</th>
+                  </tr>
+                </thead>
+                <tbody id="native-peer-details"></tbody>
+              </table>
+            </div>
+            <p class="panel-bottom">
+              Established native connections only. Byte counts measure QUIC
+              transport datagrams, not host-wide traffic or application payload
+              alone. RTT is the selected path’s current estimate. Loss counts
+              are transport loss declarations, not retransmission counts. Up to
+              10 slowest measured sessions are shown, without peer addresses.
+              Sessions disappear after 15 seconds without an observation.
+            </p>
+          </section>
           <div class="grid two">
             <section class="panel">
               <div class="panel-heading">

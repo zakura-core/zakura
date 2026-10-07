@@ -1,5 +1,6 @@
 //! Zakura P2P v2 endpoint, protocol handler, and bounded connection serving.
 
+mod dashboard;
 mod service_session;
 mod trace;
 use service_session::{spawn_service_session, PendingSessions, PreparedStream, SetupIo};
@@ -2610,11 +2611,18 @@ impl ZakuraProtocolHandler {
             }
         }
 
+        let mut dashboard_counters = dashboard::ConnectionCounters::default();
+        let dashboard_enabled = zakura_jsonl_trace::dashboard::enabled();
+        let mut dashboard_interval = tokio::time::interval(Duration::from_secs(5));
+        dashboard_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             let session_deadline = pending_sessions.deadline();
             tokio::select! {
                 biased;
                 _ = connection_token.cancelled() => break,
+                _ = dashboard_interval.tick(), if dashboard_enabled => {
+                    dashboard_counters.observe(&connection, conn_id, false);
+                }
                 _ = async {
                     match session_deadline {
                         Some(deadline) => tokio::time::sleep_until(deadline).await,
@@ -2983,6 +2991,9 @@ impl ZakuraProtocolHandler {
             }
         }
 
+        if dashboard_enabled {
+            dashboard_counters.observe(&connection, conn_id, true);
+        }
         connection_token.cancel();
         drop(incoming_setup);
         drop(pending_sessions);

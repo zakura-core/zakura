@@ -28,6 +28,7 @@ let lastHistory = 0;
 let disconnected = false;
 let selectedBlock = null;
 let blockEvents = null;
+let nativeDetails = null;
 let period = null;
 let periodBlocks = [];
 let historyRequest = 0;
@@ -282,6 +283,32 @@ function renderPipeline() {
   ]);
 }
 function renderNetwork() {
+  const nativeNow = paused ? state.generated_at : Date.now() / 1000;
+  const connections = (nativeDetails?.connections || []).filter(
+    (row) =>
+      nativeNow - row.received_at <= 15 && nativeNow - row.received_at >= -5,
+  );
+  $("native-health").hidden =
+    !connections.length && !valid(value("native_rx_bps"));
+  set(
+    "native-health-coverage",
+    `${connections.length} recent session observations / ${fmt(value("native_peers"))} active sessions`,
+  );
+  table(
+    "native-peer-details",
+    connections
+      .slice()
+      .sort((a, b) => (b.rtt_ms ?? -1) - (a.rtt_ms ?? -1))
+      .slice(0, 10)
+      .map((row) => [
+        `Session ${row.connection}`,
+        ms(row.rtt_ms),
+        bytes(row.rx_bytes_ps, true),
+        bytes(row.tx_bytes_ps, true),
+        fmt(row.lost_packets),
+      ]),
+    5,
+  );
   rows("native-stats", [
     ["Active sessions now", fmt(value("native_peers"))],
     ["Dials started", fmt(eventCount("dial_started_ps"))],
@@ -647,6 +674,10 @@ function renderCharts() {
   chart("latency-chart", ["peer_p50_ms"], ms);
   chart("processing-chart", ["contextual_ms", "write_ms"], ms, true);
   chart("tx-chart", ["count_tx_verified_ps", "count_tx_failed_ps"], fmt);
+  if (!$("native-health").hidden)
+    chart("native-traffic-chart", ["native_rx_bps", "native_tx_bps"], (v) =>
+      bytes(v, true),
+    );
   chart("traffic-chart", ["legacy_in_bps", "legacy_out_bps"], (v) =>
     bytes(v, true),
   );
@@ -699,7 +730,13 @@ async function poll() {
   try {
     const next = await getJSON("api/overview");
     if (paused) return;
+    let nextNative = null;
+    try {
+      nextNative = await getJSON("api/native");
+    } catch {}
+    if (paused) return;
     state = next;
+    nativeDetails = nextNative;
     disconnected = false;
     render();
     if (selectedBlock && $("block-dialog").open)

@@ -134,3 +134,30 @@ class ArrivalTests(unittest.TestCase):
                "monotonic_ns": 1, "unix_ms": 1, "event": {"event": "block_relay_finished",
                "hash": "a" * 64, "relay_attempt": 1, "succeeded": "true"}}
         self.assertIsNone(n.parse_block_event(json.dumps(raw).encode()))
+
+
+class NativeTests(unittest.TestCase):
+    def test_rates_require_same_connection_and_fresh_ordered_samples(self):
+        def packet(ns, rx, process="1-123", closed=False):
+            return json.dumps({"version": 1, "process": process, "monotonic_ns": ns,
+                "event": {"event": "native_connection", "connection": 1, "closed": closed,
+                "rx_bytes": rx, "tx_bytes": rx * 2, "lost_packets": 0,
+                "lost_bytes": 0, "rtt_ms": 10, "peer": "secret"}}).encode()
+        feed = n.EventFeed(":memory:")
+        try:
+            feed.ingest([packet(1_000_000_000, 100)], 100)
+            self.assertIsNone(feed.native(100)["connections"][0]["rx_bytes_ps"])
+            feed.ingest([packet(6_000_000_000, 200)], 105)
+            row = feed.native(105)["connections"][0]
+            self.assertEqual(row["rx_bytes_ps"], 20)
+            self.assertEqual(row["tx_bytes_ps"], 40)
+            self.assertNotIn("secret", json.dumps(row))
+            feed.ingest([packet(2_000_000_000, 150)], 106)
+            self.assertEqual(feed.native(106)["connections"][0]["rx_bytes_ps"], 20)
+            self.assertEqual(feed.native(121)["connections"], [])
+            feed.ingest([packet(11_000_000_000, 300, closed=True)], 110)
+            self.assertEqual(feed.native(110)["connections"], [])
+            feed.ingest([packet(1_000_000_000, 500, process="2-124")], 111)
+            self.assertIsNone(feed.native(111)["connections"][0]["rx_bytes_ps"])
+        finally:
+            feed.close()

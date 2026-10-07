@@ -67,6 +67,33 @@ def parse_block_event(data):
         return None
 
 
+def parse_network_event(data):
+    if len(data) > MAX_EVENT_BYTES:
+        return None
+    try:
+        row = json.loads(data)
+        if not isinstance(row, dict) or type(row.get("version")) is not int or row["version"] != 1:
+            return None
+        process = row.get("process")
+        if not isinstance(process, str) or not re.fullmatch(r"[0-9]{1,20}-[0-9]{1,30}", process):
+            return None
+        event = row.get("event")
+        if not isinstance(event, dict) or event.get("event") != "native_connection":
+            return None
+        fields = ("connection", "rx_bytes", "tx_bytes", "lost_packets", "lost_bytes")
+        if not all(integer(event.get(key)) for key in fields) or not integer(row.get("monotonic_ns")):
+            return None
+        if type(event.get("closed")) is not bool:
+            return None
+        rtt = event.get("rtt_ms")
+        if rtt is not None and (type(rtt) not in (int, float) or not 0 <= rtt <= 600_000):
+            return None
+        return {**{key: event[key] for key in fields}, "closed": event["closed"], "rtt_ms": rtt,
+                "process": process, "monotonic_ns": row["monotonic_ns"]}
+    except (ValueError, TypeError, RecursionError):
+        return None
+
+
 class BlockAttempts:
     """Join only boundaries from the same process, hash, and apply token.
 
@@ -126,6 +153,7 @@ class EventFeed:
         self.socket_path = socket_path
         self.socket = None
         self.thread = None
+        self.network = OrderedDict()
         self.received = 0
         self.rejected = 0
         self.last_received = None
@@ -139,10 +167,31 @@ class EventFeed:
         accepted = []
         for data in datagrams[:256]:
             event = parse_block_event(data)
-            if event is None:
-                self.rejected += 1
-            else:
+            if event is not None:
                 accepted.append(event)
+                continue
+            network = parse_network_event(data)
+            if network is None:
+                self.rejected += 1
+                continue
+            with self.lock:
+                key = (network["process"], network["connection"])
+                previous = self.network.get(key)
+                if previous and network["monotonic_ns"] <= previous["monotonic_ns"]:
+                    continue
+                network["received_at"] = now
+                seconds = (network["monotonic_ns"] - previous["monotonic_ns"]) / 1e9 if previous else 0
+                for field in ("rx_bytes", "tx_bytes"):
+                    network[field + "_ps"] = ((network[field] - previous[field]) / seconds
+                        if previous and 0 < seconds <= 15 and network[field] >= previous[field] else None)
+                self.network[key] = network
+                self.network.move_to_end(key)
+                while len(self.network) > 512:
+                    self.network.popitem(last=False)
+                self.received += 1
+                self.last_received = now
+        if not accepted:
+            return 0
         with self.lock, self.db:
             for event in accepted:
                 self.db.execute("INSERT OR IGNORE INTO node_block_events VALUES (?, ?, ?, ?, ?)",
@@ -168,6 +217,12 @@ class EventFeed:
                 attempts.ingest(event, received)
         return {"attempts": attempts.block(block_hash, now), "arrival": arrival_summary(events),
                 "status": self.status(), "limited": len(rows) == 192}
+
+    def native(self, now):
+        with self.lock:
+            rows = [row for row in self.network.values() if not row["closed"] and 0 <= now - row["received_at"] <= 15]
+            public = [{key: row[key] for key in ("connection", "rtt_ms", "rx_bytes_ps", "tx_bytes_ps", "lost_packets", "received_at")} for row in rows]
+        return {"connections": public, "status": self.status()}
 
     def status(self):
         return {"enabled": bool(self.socket_path), "listening": self.socket is not None and self.error is None,

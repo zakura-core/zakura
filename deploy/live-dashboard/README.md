@@ -15,10 +15,11 @@ section jump links and one period control for history charts, event totals, and
 the Recent blocks panel. The live block rail keeps the newest 30 blocks.
 
 - **Activity** shows chain TPS, recent block transaction counts, mempool stage
-  counts, cumulative proof checks, block queues, and peer RTT.
-- **Pipeline** separates current work from saved processing timings. It shows
-  outstanding and applying work, the latest observed p50/p95 stage and verifier
-  summaries, a history of real timing samples, and memory pressure.
+  counts, cumulative proof checks, and peer RTT.
+- **Pipeline** shows per-stage and crypto timing history, with dots gated on new
+  underlying observations. Sync buffers show current and observed maximum values.
+  At-tip operation is the focus; catch-up work-in-flight and block-pipeline panels
+  have been removed.
 - **Network** separates legacy TCP wire traffic from host interface traffic.
   It includes native QUIC sessions and discovery outcomes, protocol message
   counts, stream opens, cumulative first-body arrivals, and anonymized RPC peers.
@@ -340,3 +341,14 @@ and local relay service start/completion. Inventory-to-body includes scheduling
 and fetching, not pure wire transfer. Local relay completion does not establish
 peer receipt. Fine-grained verification/state stages, request boundaries, crypto
 batch contents, QUIC health, and transaction lifecycle remain pending.
+
+Native health instrumentation now samples each established QUIC connection every
+five seconds, with a final sample on close. Aggregate transport byte/loss counters
+are monotonic sums of per-connection deltas and use the existing restart-aware
+collector. Address-free datagrams provide selected-path RTT and connection traffic
+rates. The receiver retains at most 512 session observations, rejects out-of-order
+updates, requires two samples for rates, and excludes sessions older than 15 seconds.
+The native health panel is hidden until actual measurements arrive. Packet loss
+is not labeled retransmission. Actual retransmissions and proper aggregate queue
+occupancy remain pending. These hooks still need the updated Linux build and live
+validation; the running build remains pinned to the initial `cf102b473` snapshot.

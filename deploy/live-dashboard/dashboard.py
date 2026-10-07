@@ -58,6 +58,10 @@ GAUGES = {
     "header_budget_capacity": "sync_header_chunk_budget_capacity",
 }
 COUNTERS = {
+    "native_rx_bps": "zakura_p2p_quic_rx_bytes",
+    "native_tx_bps": "zakura_p2p_quic_tx_bytes",
+    "native_lost_ps": "zakura_p2p_quic_lost_packets",
+    "native_lost_bytes_ps": "zakura_p2p_quic_lost_bytes",
     "legacy_in_bps": "zcash_net_in_bytes_total",
     "legacy_out_bps": "zcash_net_out_bytes_total",
     "download_bps": "sync_block_payload_received_bytes",
@@ -824,6 +828,8 @@ class Handler(BaseHTTPRequestHandler):
             state["blocks"] = state["blocks"][:30]
             state.pop("event_intervals", None)
             self.send(200, state)
+        elif parsed.path == "/api/native":
+            self.send(200, collector.events.native(time.time()))
         elif parsed.path.startswith("/api/block/"):
             block_hash = parsed.path.removeprefix("/api/block/")
             if not HASH.fullmatch(block_hash):

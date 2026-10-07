@@ -102,7 +102,10 @@ when collection fails, with live source freshness reported separately. Observati
 time means when the dashboard sampled the summary, not when an individual block
 finished. Rows may describe different windows or mempool work. They are not a
 single block's waterfall. Live gauges, rates, and chart history never use these
-saved readings as replacements. The processing history uses individual dots so
+saved readings as replacements. Crypto charts sample live rolling p50/p95 summaries every 15 seconds, separately
+for each verifier. These are not individual batch events or percentiles recomputed
+for the selected period. Crypto history begins at deployment and is not backfilled
+from retained readings. The processing history uses individual dots so
 isolated timing samples remain visible without joining gaps.
 
 Support blocks remaining are derived from the supported height and

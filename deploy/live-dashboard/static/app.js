@@ -346,23 +346,6 @@ function renderPipeline() {
         .join("")
     : '<p class="empty">Waiting for the first processing sample. Readings stay visible between blocks.</p>';
   applyWidths($("stage-timings"));
-  const names = {
-    halo2: "Halo 2",
-    groth16_sapling: "Sapling / Groth16",
-    ed25519: "Ed25519",
-    redpallas: "RedPallas",
-    redjubjub: "RedJubjub",
-  };
-  table(
-    "verifiers",
-    retained("verifiers").map((v) => [
-      names[v.name] || v.name,
-      ms(v.p50_ms),
-      ms(v.p95_ms),
-      observationAge(v),
-    ]),
-    4,
-  );
   rows("pipeline-resources", [
     ["Reserved block budget", bytes(value("reserved_bytes"))],
     ["Reorder buffer", bytes(value("reorder_bytes"))],
@@ -628,6 +611,32 @@ function chart(id, keys, format, points = false) {
 }
 
 function renderCharts() {
+  const verifiers = {
+    halo2: "Halo 2",
+    groth16_sapling: "Sapling / Groth16",
+    ed25519: "Ed25519",
+    redpallas: "RedPallas",
+    redjubjub: "RedJubjub",
+  };
+  for (const [name, label] of Object.entries(verifiers)) {
+    const keys = [`crypto_${name}_p50_ms`, `crypto_${name}_p95_ms`];
+    const id = `crypto-${name}-chart`;
+    const available = history.some((row) =>
+      keys.some((key) => valid(row[key])),
+    );
+    if (!$(id) && available) {
+      const section = document.createElement("section");
+      section.innerHTML = `<div class="panel-heading"><h3>${label}</h3></div><div id="${id}" class="chart short" role="img" aria-label="${label} batch timing history"></div>`;
+      $("crypto-history").append(section);
+    }
+    if ($(id)) {
+      $(id).parentElement.hidden = !available;
+      chart(id, keys, ms, true);
+    }
+  }
+  $("crypto-empty").hidden = history.some((row) =>
+    Object.keys(verifiers).some((name) => valid(row[`crypto_${name}_p95_ms`])),
+  );
   chart("tps-chart", ["tps", "user_tps"], (v) => format("tps", v));
   chart("proof-chart", ["count_halo2_ps", "count_sapling_ps"], fmt);
   chart("queue-chart", ["outstanding", "applying"], (v) => fmt(v));

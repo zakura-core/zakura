@@ -684,6 +684,11 @@ class Collector:
         activity = state.get("chain_activity") or {}
         sample.update({key: activity.get(key) for key in ("tps", "user_tps", "block_interval")})
         sample["peer_p50_ms"] = state.get("peer_latency", {}).get("p50_ms") if fresh("peers") else None
+        for verifier in state["verifiers"]:
+            if verifier["name"] in ("halo2", "groth16_sapling", "ed25519", "redpallas", "redjubjub"):
+                for percentile in ("p50_ms", "p95_ms"):
+                    sample[f"crypto_{verifier['name']}_{percentile}"] = (
+                        verifier.get(percentile) if fresh("metrics") else None)
         sample["event_intervals"] = {key: value for key, value in state["event_intervals"].items() if fresh(key)}
         return sample
 

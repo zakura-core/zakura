@@ -337,25 +337,22 @@
             <section class="panel">
               <div class="panel-heading">
                 <h2>Cryptographic checks</h2>
-                <span class="panel-note">Last observed batch summaries</span>
+                <span class="panel-note" data-period>Observed in 15m</span>
               </div>
-              <div class="table-scroll">
-                <table>
-                  <thead>
-                    <tr>
-                      <th>Verifier</th>
-                      <th>p50</th>
-                      <th>p95</th>
-                      <th>Observed</th>
-                    </tr>
-                  </thead>
-                  <tbody id="verifiers"></tbody>
-                </table>
+              <div class="chart-legend">
+                <span><i class="dot"></i>p50</span>
+                <span><i class="dot violet"></i>p95</span>
               </div>
+              <div id="crypto-history"></div>
+              <p id="crypto-empty" class="empty">
+                Collecting crypto timing history. Charts appear after the next
+                observed batch summary.
+              </p>
               <p class="panel-bottom">
-                Saved p50/p95 batch wall times include scheduling and may
-                include mempool work. Readings persist between blocks and across
-                dashboard restarts. They are not live activity indicators.
+                Each dot samples the node’s rolling batch-time summary, not an
+                individual batch. p50 and p95 can overlap. Times include
+                scheduling and may include mempool work. Missing summaries leave
+                gaps.
               </p>
               <div class="panel-heading"><h2>Memory &amp; pressure</h2></div>
               <dl id="pipeline-resources" class="stat-list"></dl>
@@ -530,6 +527,11 @@
                   <tbody id="messages"></tbody>
                 </table>
               </div>
+              <p class="panel-bottom">
+                0 means no increase in recorded intervals. — means no usable
+                count for that direction in this period, including counters the
+                node has not emitted yet. Missing intervals are excluded.
+              </p>
             </section>
             <section class="panel">
               <div class="panel-heading">
@@ -549,10 +551,12 @@
                 </table>
               </div>
               <p class="panel-bottom">
-                Accepted counts and interface errors use the selected period.
-                Depth is the last reported enqueue observation from a stream,
-                not a sum across peers or a continuously sampled queue. Accepted
-                counts stream opens, not messages.
+                0 means no increase in recorded intervals. — means no usable
+                count or depth observation. Some metrics appear only after first
+                use. Accepted counts and interface errors use the selected
+                period. Depth is the last reported enqueue observation from a
+                stream, not a sum across peers or a continuously sampled queue.
+                Accepted counts stream opens, not messages.
               </p>
               <dl id="interface-stats" class="stat-list"></dl>
             </section>

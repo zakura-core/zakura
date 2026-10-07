@@ -88,7 +88,13 @@ zakura_consensus_batch_duration_seconds{verifier="halo2",result="success",quanti
 sync_block_applying 0
 ''')
         self.c.update_metrics(active, now - 60)
+        active_sample = self.c.sample(now - 60)
+        self.assertEqual(active_sample["crypto_halo2_p50_ms"], 12)
+        self.assertEqual(active_sample["crypto_halo2_p95_ms"], 15)
+        self.c.source("metrics", False)
+        self.assertIsNone(self.c.sample(now)["crypto_halo2_p95_ms"])
         self.c.update_metrics(idle, now)
+        self.assertIsNone(self.c.sample(now)["crypto_halo2_p95_ms"])
         saved = self.c.snapshot()["last_processing"]
         self.assertEqual(saved["stages"], [{"name": "Contextual validation", "p50_ms": 5,
                                           "p95_ms": 9, "observed_at": now - 60}])

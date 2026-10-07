@@ -222,3 +222,33 @@ class RequestTimingTests(unittest.TestCase):
         self.assertIsNone(n.arrival_summary([body(1, None), duplicate])[0]["request_queue_to_body_ms"])
         for bad in (-1, True, float("nan"), float("inf")):
             self.assertIsNone(body(1, bad))
+
+
+class StageTests(unittest.TestCase):
+    @staticmethod
+    def stage(kind, timestamp, token=1, process="1-123", name="initial_checks"):
+        return n.parse_block_event(json.dumps({
+            "version": 1, "process": process, "sequence": timestamp,
+            "monotonic_ns": timestamp * 1_000_000, "unix_ms": timestamp,
+            "event": {"event": kind, "hash": "a" * 64, "stage": name,
+                      "stage_token": token, "success": False}}).encode())
+
+    def test_out_of_order_duplicates_and_retries(self):
+        start = self.stage("block_stage_started", 2)
+        finish = self.stage("block_stage_finished", 5)
+        rows = n.stage_summary([finish, start, finish,
+                                self.stage("block_stage_started", 7, token=2)])
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]["duration_ms"], 3)
+        self.assertFalse(rows[0]["success"])
+        self.assertFalse(rows[1]["complete"])
+        self.assertIsNone(rows[1]["duration_ms"])
+
+    def test_restart_and_wrong_stage_never_join(self):
+        rows = n.stage_summary([self.stage("block_stage_started", 2),
+                                self.stage("block_stage_finished", 5, process="2-123"),
+                                self.stage("block_stage_finished", 5, name="shielded_anchors")])
+        self.assertEqual(len(rows), 3)
+        self.assertTrue(all(not row["complete"] for row in rows))
+        self.assertIsNone(self.stage("block_stage_started", 2, name="unknown"))
+        self.assertIsNone(self.stage("block_stage_started", 2, token=True))

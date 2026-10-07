@@ -375,3 +375,12 @@ complete body handling. This includes local send queueing, peer service time,
 transfer, and earlier responses in a range. It is not wire RTT. The block detail
 uses the measurement attached to its first recorded body, never a later duplicate.
 Unmatched bodies and legacy fetches currently report this span as unavailable.
+
+State-stage events now bracket contextual validation, initial checks, transparent
+spends, shielded anchors, and parallel state updates. Each occurrence has its own
+process/hash/stage-token identity. The block detail pairs only matching boundaries
+and preserves missing completions, failures, retries, and node restarts. Nested
+stage times overlap and must not be summed. These are stage occurrence IDs, not
+state admission IDs or driver apply tokens. Fine-grained consensus verification,
+writer queue and storage boundaries, and the full correlated waterfall still need
+implementation and live validation.

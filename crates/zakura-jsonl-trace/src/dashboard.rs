@@ -6,7 +6,9 @@
 
 use serde::Serialize;
 mod batch;
+mod block;
 pub use batch::BatchObservation;
+pub use block::BlockStage;
 
 use std::{
     io::{self, Write},

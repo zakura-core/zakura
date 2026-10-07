@@ -540,7 +540,7 @@ function renderBlockEvents() {
   const events = blockEvents;
   if (!events) return "<p>Loading measured block events…</p>";
   if (events.error) return `<p>${esc(events.error)}</p>`;
-  if (!events.attempts?.length && !events.arrival?.length)
+  if (!events.attempts?.length && !events.arrival?.length && !events.stages?.length)
     return `<p>${
       events.status?.enabled
         ? "No measured events for this block in the retained history. It may predate collection or have missing events."
@@ -578,7 +578,12 @@ function renderBlockEvents() {
         : "";
     })
     .join("");
-  return `${arrival}<h3>Measured processing attempts</h3>${events.attempts
+  const stages = (events.stages || []).slice(-24);
+  const stageRows = stages.length ? `<h3>Measured state stages</h3>
+    <table><thead><tr><th>Stage</th><th>Started · UTC</th><th>Duration</th><th>Outcome</th></tr></thead>
+    <tbody>${stages.map((row) => `<tr><td>${esc(row.stage.replaceAll("_", " "))}</td><td>${valid(row.started_at) ? clock(row.started_at, true) : "—"}</td><td>${ms(row.duration_ms)}</td><td>${row.complete ? (row.success ? "Succeeded" : "Failed") : "Incomplete"}</td></tr>`).join("")}</tbody></table>
+    <p>Each row is one stage occurrence. Contextual validation includes the stages beneath it. Do not add overlapping durations. Showing up to 24 retained occurrences, including retries.</p>` : "";
+  return `${arrival}${stageRows}${events.attempts.length ? "<h3>Measured processing attempts</h3>" : ""}${events.attempts
     .slice(-3)
     .map(
       (attempt) =>

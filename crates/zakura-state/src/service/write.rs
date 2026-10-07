@@ -1488,6 +1488,14 @@ fn validate_and_commit_non_finalized_with_metrics(
     prepared: SemanticallyVerifiedBlock,
     contextual_metrics: ContextualMetrics,
 ) -> Result<(), ValidateContextError> {
+    let total_stage = zakura_jsonl_trace::dashboard::BlockStage::start(
+        || prepared.hash.to_string(),
+        "contextual_validation",
+    );
+    let initial_stage = zakura_jsonl_trace::dashboard::BlockStage::start(
+        || prepared.hash.to_string(),
+        "initial_checks",
+    );
     let total_start = Instant::now();
     let initial_checks_start = Instant::now();
     let initial_checks =
@@ -1497,6 +1505,7 @@ fn validate_and_commit_non_finalized_with_metrics(
         "state.contextual.mined.initial_checks.duration_seconds",
         initial_checks_start.elapsed(),
     );
+    initial_stage.finish(initial_checks.is_ok());
     let result = initial_checks.and_then(|()| {
         let parent_hash = prepared.block.header.previous_block_hash;
 
@@ -1519,6 +1528,7 @@ fn validate_and_commit_non_finalized_with_metrics(
         "state.contextual.mined.total.duration_seconds",
         total_start.elapsed(),
     );
+    total_stage.finish(result.is_ok());
 
     result
 }

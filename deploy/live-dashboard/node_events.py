@@ -7,7 +7,9 @@ import re
 MAX_EVENT_BYTES = 8192
 MAX_ATTEMPTS = 4096
 APPLY_EVENTS = {"block_submit_queued", "commit_start", "commit_finish"}
-BLOCK_EVENTS = APPLY_EVENTS | {"block_inventory_received", "block_body_received", "block_relay_started", "block_relay_finished"}
+STAGE_EVENTS = {"block_stage_started", "block_stage_finished"}
+STAGES = {"contextual_validation", "initial_checks", "transparent_spends", "shielded_anchors", "parallel_state_update"}
+BLOCK_EVENTS = APPLY_EVENTS | STAGE_EVENTS | {"block_inventory_received", "block_body_received", "block_relay_started", "block_relay_finished"}
 RESULTS = {"committed", "duplicate", "rejected", "unavailable", "timed_out"}
 
 
@@ -38,7 +40,15 @@ def parse_block_event(data):
         public = {"process": process, "sequence": row["sequence"],
                   "monotonic_ns": row["monotonic_ns"], "unix_ms": row["unix_ms"],
                   "kind": kind, "hash": block_hash}
-        if kind in APPLY_EVENTS:
+        if kind in STAGE_EVENTS:
+            if not integer(event.get("stage_token")) or event.get("stage") not in STAGES:
+                return None
+            public.update(stage=event["stage"], stage_token=event["stage_token"])
+            if kind == "block_stage_finished":
+                if type(event.get("success")) is not bool:
+                    return None
+                public["success"] = event["success"]
+        elif kind in APPLY_EVENTS:
             if not integer(event.get("apply_token")) or not integer(event.get("height"), 2**32 - 1):
                 return None
             result = event.get("result")
@@ -281,7 +291,7 @@ class EventFeed:
             events.append(event)
             if event["kind"] in APPLY_EVENTS:
                 attempts.ingest(event, received)
-        return {"attempts": attempts.block(block_hash, now), "arrival": arrival_summary(events),
+        return {"attempts": attempts.block(block_hash, now), "arrival": arrival_summary(events), "stages": stage_summary(events),
                 "status": self.status(), "limited": len(rows) == 192}
 
     def native(self, now):
@@ -376,3 +386,23 @@ def arrival_summary(events):
                           "relay_failures": sum(not r["succeeded"] for r in relays),
                           "relay_observed": bool(relays)})
     return summaries
+
+
+def stage_summary(events):
+    """Pair stage occurrences only by process/hash/token, never by nearest time."""
+    occurrences = OrderedDict()
+    for row in sorted(events, key=lambda event: (event["monotonic_ns"], event["sequence"])):
+        if row["kind"] in STAGE_EVENTS:
+            key = (row["process"], row["hash"], row["stage_token"], row["stage"])
+            occurrences.setdefault(key, {}).setdefault(row["kind"], row)
+    stages = []
+    for (_, _, token, name), boundaries in occurrences.items():
+        start = boundaries.get("block_stage_started")
+        end = boundaries.get("block_stage_finished")
+        valid = start is not None and end is not None and end["monotonic_ns"] >= start["monotonic_ns"]
+        stages.append({"stage": name, "occurrence": str(token),
+                       "started_at": start["unix_ms"] / 1000 if start else None,
+                       "duration_ms": (end["monotonic_ns"] - start["monotonic_ns"]) / 1e6 if valid else None,
+                       "success": end["success"] if valid else None,
+                       "complete": valid})
+    return stages

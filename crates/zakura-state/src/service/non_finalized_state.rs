@@ -672,6 +672,10 @@ impl NonFinalizedState {
             });
         }
 
+        let transparent_stage = zakura_jsonl_trace::dashboard::BlockStage::start(
+            || prepared.hash.to_string(),
+            "transparent_spends",
+        );
         let transparent_spend_start = Instant::now();
         let spent_utxos = check::utxo::transparent_spend(
             &prepared,
@@ -684,9 +688,14 @@ impl NonFinalizedState {
             "state.contextual.mined.transparent_spend.duration_seconds",
             transparent_spend_start.elapsed(),
         );
+        transparent_stage.finish(spent_utxos.is_ok());
         let spent_utxos = spent_utxos?;
 
         // Reads from disk
+        let anchor_stage = zakura_jsonl_trace::dashboard::BlockStage::start(
+            || prepared.hash.to_string(),
+            "shielded_anchors",
+        );
         let shielded_anchor_start = Instant::now();
         let shielded_anchors =
             check::anchors::block_sapling_orchard_ironwood_anchors_refer_to_final_treestates(
@@ -699,6 +708,7 @@ impl NonFinalizedState {
             "state.contextual.mined.shielded_anchors.duration_seconds",
             shielded_anchor_start.elapsed(),
         );
+        anchor_stage.finish(shielded_anchors.is_ok());
         shielded_anchors?;
 
         // Reads from disk
@@ -741,6 +751,10 @@ impl NonFinalizedState {
         );
         let contextual = contextual?;
 
+        let parallel_stage = zakura_jsonl_trace::dashboard::BlockStage::start(
+            || block_hash.to_string(),
+            "parallel_state_update",
+        );
         let parallel_update_start = Instant::now();
         let result = Self::validate_and_update_parallel(
             new_chain,
@@ -753,6 +767,7 @@ impl NonFinalizedState {
             "state.contextual.mined.parallel_update.duration_seconds",
             parallel_update_start.elapsed(),
         );
+        parallel_stage.finish(result.is_ok());
         result
     }
 

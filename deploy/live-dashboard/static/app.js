@@ -733,7 +733,12 @@ function renderCharts() {
       section.innerHTML = `<div class="panel-heading"><h3>${label}</h3></div><div id="${id}" class="chart short" role="img" aria-label="${label} timing history"></div>`;
       $("stage-history").append(section);
     }
-    chart(id, [`stage_${name}_p50_ms`, `stage_${name}_p95_ms`], ms, true);
+    const keys = [`stage_${name}_p50_ms`, `stage_${name}_p95_ms`];
+    const end = period?.end || state.generated_at;
+    const available = history.some((row) => row.t >= end - WINDOWS[range] && row.t <= end &&
+      keys.some((key) => valid(row[key])));
+    $(id).parentElement.hidden = !available;
+    if (available) chart(id, keys, ms, true);
   }
   const verifiers = {
     halo2: "Halo 2",

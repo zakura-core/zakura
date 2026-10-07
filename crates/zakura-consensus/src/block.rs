@@ -356,7 +356,9 @@ where
         // We don't include the block hash, because it's likely already in a parent span
         let span = tracing::debug_span!("block", height = ?block.coinbase_height());
 
-        async move {
+        let telemetry_block = block.clone();
+        let record_commit = !request.is_proposal();
+        let verification = async move {
             // Preparing a template costs everything below, not just the contextual check at the
             // end. The bound on speculative preparation is set from this measurement, so it must
             // start where the work does.
@@ -730,6 +732,16 @@ where
             }
 
             commit_prepared_block(state_service, prepared_block, mined).await
+        };
+        async move {
+            let stage = zakura_jsonl_trace::dashboard::BlockStage::start_if(
+                record_commit,
+                || telemetry_block.hash().to_string(),
+                "verification_and_commit",
+            );
+            let result = verification.await;
+            stage.finish(result.is_ok());
+            result
         }
         .instrument(span)
         .boxed()

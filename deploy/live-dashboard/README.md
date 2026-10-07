@@ -465,3 +465,10 @@ per connection, and truncation is explicitly flagged. The dashboard sums fresh
 observations by stream kind/direction; this is not an instantaneous synchronized
 snapshot or a high-water mark. The new Rust queue test and live validation still
 need the next Linux build after `431ee608e`.
+
+Live state-stage events exclude startup reconstruction (`ContextualMetrics::Disabled`).
+The `verification_and_commit` stage covers semantic commit requests over both
+transports, including prepared mined commits. Proposal checks do not emit this
+stage. Only a successful commit completion supplies body-to-commit timing.
+Cancellation leaves the stage incomplete. This span includes verification and
+state service waits, not just database writes.

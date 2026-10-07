@@ -672,7 +672,8 @@ impl NonFinalizedState {
             });
         }
 
-        let transparent_stage = zakura_jsonl_trace::dashboard::BlockStage::start(
+        let transparent_stage = zakura_jsonl_trace::dashboard::BlockStage::start_if(
+            contextual_metrics != ContextualMetrics::Disabled,
             || prepared.hash.to_string(),
             "transparent_spends",
         );
@@ -692,7 +693,8 @@ impl NonFinalizedState {
         let spent_utxos = spent_utxos?;
 
         // Reads from disk
-        let anchor_stage = zakura_jsonl_trace::dashboard::BlockStage::start(
+        let anchor_stage = zakura_jsonl_trace::dashboard::BlockStage::start_if(
+            contextual_metrics != ContextualMetrics::Disabled,
             || prepared.hash.to_string(),
             "shielded_anchors",
         );
@@ -751,7 +753,8 @@ impl NonFinalizedState {
         );
         let contextual = contextual?;
 
-        let parallel_stage = zakura_jsonl_trace::dashboard::BlockStage::start(
+        let parallel_stage = zakura_jsonl_trace::dashboard::BlockStage::start_if(
+            contextual_metrics != ContextualMetrics::Disabled,
             || block_hash.to_string(),
             "parallel_state_update",
         );

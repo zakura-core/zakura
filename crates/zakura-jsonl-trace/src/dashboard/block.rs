@@ -17,7 +17,12 @@ struct Stage {
 impl BlockStage {
     /// Start a stage. The hash formatter is only called when telemetry is enabled.
     pub fn start(hash: impl FnOnce() -> String, name: &'static str) -> Self {
-        if !super::enabled() {
+        Self::start_if(true, hash, name)
+    }
+
+    /// Skip replay or speculative work without formatting a hash or emitting events.
+    pub fn start_if(include: bool, hash: impl FnOnce() -> String, name: &'static str) -> Self {
+        if !include || !super::enabled() {
             return Self(None);
         }
         let stage = Stage {
@@ -44,5 +49,17 @@ impl BlockStage {
                 })
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::BlockStage;
+
+    #[test]
+    fn excluded_stage_never_formats_or_emits() {
+        let stage = BlockStage::start_if(false, || panic!("excluded hash formatter"), "replay");
+        assert!(stage.0.is_none());
+        stage.finish(true);
     }
 }

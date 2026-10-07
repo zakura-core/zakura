@@ -246,6 +246,19 @@ class StageTests(unittest.TestCase):
         self.assertFalse(rows[1]["complete"])
         self.assertIsNone(rows[1]["duration_ms"])
 
+    def test_legacy_body_uses_only_successful_commit_stage_in_same_run(self):
+        body = {"kind": "block_body_received", "process": "1-123", "sequence": 1,
+                "monotonic_ns": 1_000_000, "unix_ms": 1, "transport": "legacy", "first": True}
+        finish = self.stage("block_stage_finished", 5, name="verification_and_commit")
+        self.assertIsNone(n.arrival_summary([body, finish])[0]["body_to_commit_ms"])
+        finish["success"] = True
+        self.assertEqual(n.arrival_summary([body, finish])[0]["body_to_commit_ms"], 4)
+        finish["process"] = "2-123"
+        self.assertIsNone(n.arrival_summary([body, finish])[0]["body_to_commit_ms"])
+        finish["process"] = "1-123"
+        finish["stage"] = "contextual_validation"
+        self.assertIsNone(n.arrival_summary([body, finish])[0]["body_to_commit_ms"])
+
     def test_restart_and_wrong_stage_never_join(self):
         rows = n.stage_summary([self.stage("block_stage_started", 2),
                                 self.stage("block_stage_finished", 5, process="2-123"),

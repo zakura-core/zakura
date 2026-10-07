@@ -9,7 +9,7 @@ MAX_EVENT_BYTES = 8192
 MAX_ATTEMPTS = 4096
 APPLY_EVENTS = {"block_submit_queued", "commit_start", "commit_finish"}
 STAGE_EVENTS = {"block_stage_started", "block_stage_finished"}
-STAGES = {"contextual_validation", "initial_checks", "transparent_spends", "shielded_anchors", "parallel_state_update"}
+STAGES = {"verification_and_commit", "contextual_validation", "initial_checks", "transparent_spends", "shielded_anchors", "parallel_state_update"}
 BLOCK_EVENTS = APPLY_EVENTS | STAGE_EVENTS | {"block_inventory_received", "block_body_received", "block_relay_started", "block_relay_finished"}
 RESULTS = {"committed", "duplicate", "rejected", "unavailable", "timed_out"}
 
@@ -434,7 +434,10 @@ def arrival_summary(events):
         inventory = next((r for r in rows if r["kind"] == "block_inventory_received"), None)
         bodies = [r for r in rows if r["kind"] == "block_body_received"]
         body = bodies[0] if bodies else None
-        commits = [r for r in rows if r["kind"] == "commit_finish" and r.get("result") == "committed"]
+        commits = [r for r in rows if
+                   (r["kind"] == "commit_finish" and r.get("result") == "committed") or
+                   (r["kind"] == "block_stage_finished" and
+                    r.get("stage") == "verification_and_commit" and r.get("success") is True)]
         committed = commits[0] if commits else None
         def elapsed(first, last):
             if first is None or last is None or last["monotonic_ns"] < first["monotonic_ns"]:

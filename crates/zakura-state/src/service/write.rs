@@ -1488,11 +1488,13 @@ fn validate_and_commit_non_finalized_with_metrics(
     prepared: SemanticallyVerifiedBlock,
     contextual_metrics: ContextualMetrics,
 ) -> Result<(), ValidateContextError> {
-    let total_stage = zakura_jsonl_trace::dashboard::BlockStage::start(
+    let total_stage = zakura_jsonl_trace::dashboard::BlockStage::start_if(
+        contextual_metrics != ContextualMetrics::Disabled,
         || prepared.hash.to_string(),
         "contextual_validation",
     );
-    let initial_stage = zakura_jsonl_trace::dashboard::BlockStage::start(
+    let initial_stage = zakura_jsonl_trace::dashboard::BlockStage::start_if(
+        contextual_metrics != ContextualMetrics::Disabled,
         || prepared.hash.to_string(),
         "initial_checks",
     );

@@ -1588,6 +1588,8 @@ impl PeerRoutine {
             {
                 return;
             }
+            self.trace
+                .record_duplicate_block_body_received(hash, BlockBodySource::Zakura);
             if self.ignore_stale_response(height, "body").await {
                 return;
             }
@@ -1607,6 +1609,8 @@ impl PeerRoutine {
         let outstanding = &self.window.outstanding[index];
         let delivery_snapshot = outstanding.delivery_snapshot;
         if outstanding.has_received(height) {
+            self.trace
+                .record_duplicate_block_body_received(hash, BlockBodySource::Zakura);
             tracing::debug!(peer = ?self.peer, ?height, "ignoring duplicate block-sync body frame");
             return;
         }

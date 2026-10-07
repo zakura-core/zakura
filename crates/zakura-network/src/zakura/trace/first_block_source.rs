@@ -77,7 +77,6 @@ impl FirstBlockSourceTracker {
         true
     }
 
-    #[cfg(test)]
     pub(super) fn source(&self, hash: block::Hash) -> Option<BlockBodySource> {
         self.inner
             .lock()

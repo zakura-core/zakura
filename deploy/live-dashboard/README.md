@@ -447,3 +447,10 @@ regression-tested, and unexpected failures now retain diagnostic logs. The loss
 counter stayed unchanged through subsequent receiver deployments. The activated
 node's new run reported zero send failures. Historical incomplete data remains
 explicitly identified rather than being silently treated as complete.
+
+Native body observations include late decoded copies of hashes already seen on
+either transport, even after the corresponding request has been retired. These
+observations preserve the original first-arrival winner and have no request
+duration when the retired request is no longer available. They do not imply
+that a duplicate was accepted for verification. Unknown unsolicited hashes are
+not promoted to first-arrival observations.

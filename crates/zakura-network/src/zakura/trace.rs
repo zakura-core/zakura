@@ -526,6 +526,26 @@ impl ZakuraTrace {
         }
     }
 
+    /// Preserve late decoded copies of an already observed hash, even after
+    /// request retirement. Unknown unsolicited hashes cannot become first arrivals.
+    pub(crate) fn record_duplicate_block_body_received(
+        &self,
+        hash: zakura_chain::block::Hash,
+        source: BlockBodySource,
+    ) {
+        if zakura_jsonl_trace::dashboard::enabled()
+            && self.first_block_source.source(hash).is_some()
+        {
+            zakura_jsonl_trace::dashboard::emit(|| {
+                serde_json::json!({
+                    "event": "block_body_received", "hash": hash.to_string(),
+                    "transport": source.as_str(), "first": false,
+                    "request_queue_to_body_ms": null,
+                })
+            });
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn first_block_body_source(
         &self,
@@ -777,6 +797,21 @@ mod tests {
     use tokio::sync::mpsc;
 
     use super::*;
+
+    #[test]
+    fn late_body_observation_preserves_the_winner_and_ignores_unknown_hashes() {
+        let trace = ZakuraTrace::noop();
+        let known = zakura_chain::block::Hash([21; 32]);
+        let unknown = zakura_chain::block::Hash([22; 32]);
+        trace.record_block_body_received(known, BlockBodySource::Legacy, None);
+        trace.record_duplicate_block_body_received(known, BlockBodySource::Zakura);
+        trace.record_duplicate_block_body_received(unknown, BlockBodySource::Zakura);
+        assert_eq!(
+            trace.first_block_body_source(known),
+            Some(BlockBodySource::Legacy)
+        );
+        assert_eq!(trace.first_block_body_source(unknown), None);
+    }
 
     #[test]
     fn noop_trace_does_not_build_rows() {

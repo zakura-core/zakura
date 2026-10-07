@@ -373,9 +373,41 @@ pub(crate) enum HeaderChainAttachmentError {
 }
 
 #[derive(Clone, Debug, Error)]
-#[error("header-chain attachment failed: {message}")]
+#[error("block writer failed: {message}")]
 pub(crate) struct BlockWriteTaskFailure {
     message: Arc<str>,
+}
+
+/// Retains the first writer failure and wakes daemon supervision independently of state requests.
+#[derive(Debug, Default)]
+pub(crate) struct BlockWriteFailure {
+    failure: OnceLock<BlockWriteTaskFailure>,
+    notify: tokio::sync::Notify,
+}
+
+impl BlockWriteFailure {
+    pub(crate) fn get(&self) -> Option<&BlockWriteTaskFailure> {
+        self.failure.get()
+    }
+
+    pub(crate) fn set(&self, failure: BlockWriteTaskFailure) {
+        if self.failure.set(failure).is_ok() {
+            metrics::counter!("state.block_writer.failure.total").increment(1);
+            self.notify.notify_waiters();
+        }
+    }
+
+    pub(crate) async fn wait(&self) -> BlockWriteTaskFailure {
+        loop {
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if let Some(failure) = self.get() {
+                return failure.clone();
+            }
+            notified.await;
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -1855,7 +1887,7 @@ impl BlockWriteSender {
         tokio::sync::mpsc::UnboundedReceiver<NonFinalizedWriteUpdate>,
         watch::Receiver<VctRootRepairStatus>,
         watch::Sender<BlockWriteNotice>,
-        Arc<OnceLock<BlockWriteTaskFailure>>,
+        Arc<BlockWriteFailure>,
         Option<Arc<std::thread::JoinHandle<BlockWriteTaskExit>>>,
     ) {
         let attach_header_chain_at_handoff = finalized_state
@@ -1892,7 +1924,7 @@ impl BlockWriteSender {
         tokio::sync::mpsc::UnboundedReceiver<NonFinalizedWriteUpdate>,
         watch::Receiver<VctRootRepairStatus>,
         watch::Sender<BlockWriteNotice>,
-        Arc<OnceLock<BlockWriteTaskFailure>>,
+        Arc<BlockWriteFailure>,
         Option<Arc<std::thread::JoinHandle<BlockWriteTaskExit>>>,
     ) {
         // Security: The number of blocks in these channels is limited by
@@ -1909,7 +1941,7 @@ impl BlockWriteSender {
             watch::channel(VctRootRepairStatus::default());
         let (block_commit_sender, _) = watch::channel(BlockWriteNotice::default());
         let admission_sender = block_commit_sender.clone();
-        let task_failure = Arc::new(OnceLock::new());
+        let task_failure = Arc::new(BlockWriteFailure::default());
         let worker_task_failure = task_failure.clone();
 
         let span = Span::current();
@@ -1937,12 +1969,12 @@ impl BlockWriteSender {
                 match result {
                     Ok(result) => {
                         if let Some(failure) = result.failure() {
-                            let _ = worker_task_failure.set(failure);
+                            worker_task_failure.set(failure);
                         }
                         result
                     }
                     Err(panic) => {
-                        let _ = worker_task_failure.set(BlockWriteTaskFailure::panic());
+                        worker_task_failure.set(BlockWriteTaskFailure::panic());
                         resume_unwind(panic)
                     }
                 }

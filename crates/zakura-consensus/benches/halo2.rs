@@ -29,11 +29,9 @@
 
 mod common;
 
-use std::{collections::BTreeMap, sync::Arc};
+use std::{collections::BTreeMap, hint::black_box, sync::Arc};
 
-use criterion::{
-    black_box, criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput,
-};
+use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput};
 use orchard::bundle::{Authorized, Bundle};
 
 use zakura_chain::{

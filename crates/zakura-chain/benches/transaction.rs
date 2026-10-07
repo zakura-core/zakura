@@ -25,9 +25,9 @@
 // Disabled due to warnings in criterion macros
 #![allow(missing_docs)]
 
-use std::{io::Cursor, sync::Arc};
+use std::{hint::black_box, io::Cursor, sync::Arc};
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 
 use zakura_chain::{
     block::{Block, Height},

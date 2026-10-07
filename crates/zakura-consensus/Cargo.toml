@@ -21,12 +21,9 @@ categories = ["asynchronous", "cryptography::cryptocurrencies"]
 [features]
 default = []
 
-# Production features that activate extra dependencies, or extra features in dependencies
-
-progress-bar = [
-    "howudoin",
-    "zakura-state/progress-bar",
-]
+# Legacy flags accepted for build compatibility; the progress display is removed.
+progress-bar = ["howudoin", "zakura-state/progress-bar"]
+howudoin = []
 
 # Test-only features
 internal-bench = []
@@ -41,7 +38,7 @@ rand = { workspace = true }
 rand_10 = { workspace = true }
 rayon = { workspace = true }
 
-chrono = { workspace = true, features = ["clock", "std"] }
+chrono = { workspace = true }
 lazy_static = { workspace = true }
 once_cell = { workspace = true }
 serde = { workspace = true, features = ["serde_derive"] }
@@ -70,12 +67,10 @@ zakura-script = { path = "../zakura-script", version = "4.0.1" }
 zakura-state = { path = "../zakura-state", version = "11.0.0" }
 zakura-node-services = { path = "../zakura-node-services", version = "5.0.0" }
 zakura-chain = { path = "../zakura-chain", version = "10.0.0" }
-zakura-header-chain = { path = "../zakura-header-chain", version = "4.0.1" }
+zakura-header-chain = { path = "../zakura-header-chain", version = "4.1.0" }
 
 zcash_protocol.workspace = true
 
-# prod feature progress-bar
-howudoin = { workspace = true, optional = true }
 
 # Test-only dependencies
 proptest = { workspace = true, optional = true }
@@ -95,7 +90,7 @@ zakura-state = { path = "../zakura-state", version = "11.0.0", features = ["prop
 zakura-chain = { path = "../zakura-chain", version = "10.0.0", features = ["proptest-impl"] }
 zakura-test = { path = "../zakura-test/", version = "3.0.0" }
 
-criterion = { workspace = true, features = ["html_reports"] }
+criterion = { workspace = true }
 
 [[bench]]
 name = "groth16"

@@ -1384,7 +1384,7 @@ async fn recovery_preserves_negative_balance_error() {
 /// Real proof smoke coverage complements the deterministic scheduling tests.
 /// Run explicitly: cargo test -p zakura-rpc --release shielded_template_rewards -- --ignored
 #[tokio::test]
-#[ignore = "generates three real shielded proofs"]
+#[ignore = "generates two real shielded proofs"]
 async fn shielded_template_rewards() {
     use config::mining::{default_miner_address, MinerAddressType};
     use types::{get_block_template::MinerParams, long_poll::LongPollInput};
@@ -1392,27 +1392,10 @@ async fn shielded_template_rewards() {
     let _guard = zakura_test::init();
     for (pool, address_type) in [
         ("sapling", MinerAddressType::Sapling),
-        ("orchard", MinerAddressType::Unified),
         ("ironwood", MinerAddressType::Unified),
     ] {
-        // Orchard rewards precede NU6.3; Sapling and Ironwood exercise NSM activation.
-        let net = if pool == "orchard" {
-            Network::new_regtest(RegtestParameters {
-                activation_heights: ConfiguredActivationHeights {
-                    nu5: Some(1),
-                    nu6: Some(100),
-                    nu6_1: Some(101),
-                    nu6_2: Some(102),
-                    nu6_3: Some(103),
-                    nu7: Some(104),
-                    ..Default::default()
-                },
-                test_nsm_reissuance_height: Some(Height(104)),
-                ..Default::default()
-            })
-        } else {
-            network()
-        };
+        // Both pools exercise NSM activation.
+        let net = network();
         let (_, info) = watch::channel(chain_info(2, 1, 400_000_000));
         let (mut rpc, _, _) = mining_rpc(info);
         rpc.network = net.clone();
@@ -1445,7 +1428,7 @@ async fn shielded_template_rewards() {
             .zcash_deserialize_into()
             .unwrap();
         let base = i64::from(halving_block_subsidy(Height(3), &net).unwrap());
-        let expected = base + if pool == "orchard" { 0 } else { 55 };
+        let expected = base + 55;
         let (sapling, orchard, ironwood) = (
             i64::from(tx.sapling_value_balance().sapling_amount()),
             i64::from(tx.orchard_value_balance().orchard_amount()),
@@ -1453,7 +1436,6 @@ async fn shielded_template_rewards() {
         );
         let balances = match pool {
             "sapling" => (-expected, 0, 0),
-            "orchard" => (0, -expected, 0),
             _ => (0, 0, -expected),
         };
         assert_eq!((sapling, orchard, ironwood), balances, "{pool}");

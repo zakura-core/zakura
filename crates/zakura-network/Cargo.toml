@@ -27,14 +27,12 @@ categories = ["asynchronous", "cryptography::cryptocurrencies", "encoding", "net
 [features]
 default = []
 
+# Legacy flags accepted for build compatibility; the progress display is removed.
+progress-bar = ["howudoin"]
+howudoin = []
+
 # Completion-based commit throughput for opt-in sync reports.
 sync-metrics = []
-
-# Production features that activate extra dependencies, or extra features in dependencies
-
-progress-bar = [
-    "howudoin",
-]
 
 # Testing features that activate extra dependencies
 header-fuzz = []
@@ -50,8 +48,7 @@ bitflags = { workspace = true }
 blake2b_simd = { workspace = true }
 byteorder = { workspace = true }
 bytes = { workspace = true }
-chrono = { workspace = true, features = ["clock", "std"] }
-dirs = { workspace = true }
+chrono = { workspace = true }
 hex = { workspace = true }
 indexmap = { workspace = true, features = ["serde"] }
 iroh = { workspace = true }
@@ -75,15 +72,13 @@ metrics = { workspace = true }
 tracing-error = { workspace = true, features = ["traced-error"] }
 tracing = { workspace = true }
 
-# prod feature progress-bar
-howudoin = { workspace = true, optional = true }
 
 # proptest dependencies
 proptest = { workspace = true, optional = true }
 proptest-derive = { workspace = true, optional = true }
 
 zakura-chain = { path = "../zakura-chain", version = "10.0.0", features = ["async-error"] }
-zakura-header-chain = { path = "../zakura-header-chain", version = "4.0.1" }
+zakura-header-chain = { path = "../zakura-header-chain", version = "4.1.0" }
 zakura-jsonl-trace = { path = "../zakura-jsonl-trace", version = "1.2.0" }
 zakura-node-services = { path = "../zakura-node-services", version = "5.0.0" }
 
@@ -98,7 +93,7 @@ toml = { workspace = true }
 tracing-subscriber = { workspace = true }
 
 zakura-chain = { path = "../zakura-chain", version = "10.0.0", features = ["proptest-impl"] }
-zakura-header-chain = { path = "../zakura-header-chain", version = "4.0.1", features = ["test-support"] }
+zakura-header-chain = { path = "../zakura-header-chain", version = "4.1.0", features = ["test-support"] }
 zakura-test = { path = "../zakura-test/", version = "3.0.0" }
 
 [lints]

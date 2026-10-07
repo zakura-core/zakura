@@ -1265,3 +1265,5 @@ dialog p {
 @media (max-width: 700px) {
   #crypto-history { grid-template-columns: 1fr; }
 }
+
+#block-dialog { width: min(920px, calc(100vw - 40px)); }

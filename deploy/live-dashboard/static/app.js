@@ -244,17 +244,6 @@ function renderFlow() {
 
 function renderPipeline() {
   const now = paused ? state.generated_at : Date.now() / 1000;
-  const retained = (kind) =>
-    (state.last_processing?.[kind] || []).filter(
-      (r) =>
-        valid(r.observed_at) &&
-        now >= r.observed_at &&
-        now - r.observed_at < 86400,
-    );
-  const observationAge = (row) =>
-    valid(row?.observed_at)
-      ? `Seen ${age(now - row.observed_at)} ago`
-      : "Not observed yet";
   const current = sourceFresh("chain") && sourceFresh("metrics");
   const queues = ["applying", "outstanding", "unsubmitted", "missing"].map(
     value,
@@ -328,26 +317,6 @@ function renderPipeline() {
         `<div class="pipeline-stage"><h3>${name}</h3><strong>${key === "blocks_verified_ps" ? fmt(eventCount(key)) : format(key, value(key))}</strong><small>${unit}</small><p>${esc(detail)}</p></div>`,
     )
     .join("");
-  const savedStages = retained("stages");
-  const stageNames = [
-    ...new Set([
-      ...(state.stage_timings || []).map((r) => r.name),
-      ...savedStages.map((r) => r.name),
-    ]),
-  ];
-  const timings = stageNames.map(
-    (name) => savedStages.find((r) => r.name === name) || { name },
-  );
-  const max = Math.max(0.001, ...timings.map((t) => t.p95_ms || 0));
-  $("stage-timings").innerHTML = timings.length
-    ? timings
-        .map(
-          (t) =>
-            `<div class="timing-row" title="${esc(t.name)}: p50 ${ms(t.p50_ms)}, p95 ${ms(t.p95_ms)}. ${valid(t.observed_at) ? `Observed ${esc(clock(t.observed_at, true))} UTC` : "Not observed yet"}"><span class="timing-name">${esc(t.name)}<small>${observationAge(t)}</small></span><div class="timing-track"><span data-width="${Math.min(100, ((t.p95_ms || 0) / max) * 100)}"></span><b data-width="${Math.min(100, ((t.p50_ms || 0) / max) * 100)}"></b></div><span class="timing-value">${ms(t.p95_ms)}</span></div>`,
-        )
-        .join("")
-    : '<p class="empty">Waiting for the first processing sample. Readings stay visible between blocks.</p>';
-  applyWidths($("stage-timings"));
   const end = period?.end || state.generated_at;
   const peak = (key) =>
     history.reduce(
@@ -638,6 +607,26 @@ function chart(id, keys, format, points = false) {
 }
 
 function renderCharts() {
+  const stages = [
+    "Submit queue",
+    "Writer queue",
+    "Contextual validation",
+    "Initial checks",
+    "Transparent spends",
+    "Shielded anchors",
+    "Parallel state update",
+    "RocksDB write",
+  ];
+  for (const label of stages) {
+    const name = label.toLowerCase().replaceAll(" ", "_");
+    const id = `stage-${name}-chart`;
+    if (!$(id)) {
+      const section = document.createElement("section");
+      section.innerHTML = `<div class="panel-heading"><h3>${label}</h3></div><div id="${id}" class="chart short" role="img" aria-label="${label} timing history"></div>`;
+      $("stage-history").append(section);
+    }
+    chart(id, [`stage_${name}_p50_ms`, `stage_${name}_p95_ms`], ms, true);
+  }
   const verifiers = {
     halo2: "Halo 2",
     groth16_sapling: "Sapling / Groth16",

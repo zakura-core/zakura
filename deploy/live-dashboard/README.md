@@ -266,3 +266,8 @@ not total process memory. Observed maxima are not true high-water marks because
 the 15-second sampler can miss short bursts. Missing history remains unavailable.
 Work in flight counts requested bodies awaiting arrival and blocks still in the
 sync applying set, including those awaiting verification or commit completion.
+
+Processing timings now show per-stage p50/p95 history with independent duration
+scales and the shared selected time range. Like crypto history, these are sampled
+rolling summaries, not per-block spans. Both percentiles are collected from this
+deployment onward without backfilling retained readings into history.

@@ -324,24 +324,28 @@
             <div id="block-pipeline" class="pipeline"></div>
             <p class="panel-bottom">
               Queues show current work. Verification totals use the selected
-              period. Saved timings below stay visible between blocks.
+              period. Timing history below preserves observed summaries between
+              blocks.
+            </p>
+          </section>
+          <section class="panel">
+            <div class="panel-heading">
+              <h2>Processing timings</h2>
+              <span class="panel-note" data-period>Observed in 15m</span>
+            </div>
+            <div class="chart-legend">
+              <span><i class="dot"></i>p50</span
+              ><span><i class="dot violet"></i>p95</span>
+            </div>
+            <div id="stage-history" class="stage-history"></div>
+            <p class="panel-bottom">
+              Each chart has its own duration scale. Hover for p50/p95. Dots
+              sample the node’s rolling summaries, not individual blocks.
+              Missing summaries leave gaps. Stages overlap and cannot be added
+              into one block’s duration.
             </p>
           </section>
           <div class="grid two">
-            <section class="panel">
-              <div class="panel-heading">
-                <h2>Last processing timings</h2>
-                <span class="panel-note"
-                  ><i class="dot"></i> p50 <i class="dot violet"></i> p95</span
-                >
-              </div>
-              <div id="stage-timings" class="timing-list"></div>
-              <p class="panel-bottom">
-                Latest non-empty p50/p95 summary for each stage, kept for up to
-                24 hours. “Seen” is when the dashboard read it. Rows can come
-                from different observations and are not one block’s waterfall.
-              </p>
-            </section>
             <section class="panel">
               <div class="panel-heading">
                 <h2>Cryptographic checks</h2>
@@ -362,6 +366,8 @@
                 scheduling and may include mempool work. Missing summaries leave
                 gaps.
               </p>
+            </section>
+            <section class="panel">
               <div class="panel-heading"><h2>Sync buffers</h2></div>
               <div class="table-scroll">
                 <table>

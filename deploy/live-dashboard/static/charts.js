@@ -137,9 +137,11 @@ class HistoryChart {
           stroke: this.colors[index],
           width: 1.7,
           spanGaps: false,
-          ...(!this.points && key.startsWith("count_")
-            ? { paths: uPlot.paths.stepped({ align: 1 }) }
-            : {}),
+          ...(this.points
+            ? { paths: () => null }
+            : key.startsWith("count_")
+              ? { paths: uPlot.paths.stepped({ align: 1 }) }
+              : {}),
           points: {
             show: this.points,
             size: 6,

@@ -714,7 +714,7 @@ function renderLifecycle() {
     $(`lifecycle-${id}`).hidden = !rows.length;
     if (rows.length) chart(`lifecycle-${id}-chart`, keys, ms, true, rows);
   }
-  set("lifecycle-coverage", `Lines connect nearby recorded observations, with gaps preserved. Counts are recorded events in the selected period and include repeated attempts. Durations require both boundaries from the same task. Queue-to-body includes local checks and fetching. Verification includes service queueing. Local relay success does not prove peer receipt.${data.limited ? " History is limited; displayed counts may be incomplete." : ""}`);
+  set("lifecycle-coverage", `Each point is a separate recorded observation. Unrelated events are not connected. Counts are recorded events in the selected period and include repeated attempts. Durations require both boundaries from the same task. Queue-to-body includes local checks and fetching. Verification includes service queueing. Local relay success does not prove peer receipt.${data.limited ? " History is limited; displayed counts may be incomplete." : ""}`);
 }
 
 function renderCharts() {

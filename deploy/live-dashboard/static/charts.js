@@ -96,6 +96,13 @@ class HistoryChart {
           ...axis,
           size: 54,
           space: 40,
+          ...(this.keys.every((key) => key.startsWith("count_"))
+            ? {
+                incrs: Array.from({ length: 10 }, (_, i) =>
+                  [1, 2, 5].map((n) => n * 10 ** i),
+                ).flat(),
+              }
+            : {}),
           grid: { stroke: "#2b3842", dash: [2, 4], width: 1 },
           values: (_plot, ticks) => ticks.map((v) => this.format(v)),
         },
@@ -107,7 +114,11 @@ class HistoryChart {
           stroke: this.colors[index],
           width: 1.7,
           spanGaps: false,
-          ...(this.points ? { paths: () => null } : {}),
+          ...(this.points
+            ? { paths: () => null }
+            : key.startsWith("count_")
+              ? { paths: uPlot.paths.stepped({ align: 1 }) }
+              : {}),
           points: {
             show: this.points,
             size: 5,

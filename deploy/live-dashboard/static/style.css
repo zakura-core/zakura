@@ -561,14 +561,15 @@ h2 {
 }
 .block-volume {
   display: flex;
-  gap: 4px;
+  gap: 2px;
+  overflow-x: auto;
   height: 165px;
   align-items: end;
   padding: 20px 17px 18px;
   position: relative;
 }
 .volume-column {
-  flex: 1;
+  flex: 1 0 4px;
   min-width: 0;
   height: 100%;
   display: flex;
@@ -1213,4 +1214,10 @@ dialog p {
     scroll-behavior: auto !important;
     transition: none !important;
   }
+}
+
+.range-note {
+  color: var(--muted);
+  font-size: 10px;
+  margin: 0 0 18px;
 }

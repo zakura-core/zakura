@@ -61,7 +61,7 @@
             <a href="#network">Network</a>
             <a href="#system">System</a>
           </nav>
-          <div class="ranges" role="group" aria-label="Chart time range">
+          <div class="ranges" role="group" aria-label="Dashboard time period">
             <button data-window="15m" class="selected" aria-pressed="true">
               15m</button
             ><button data-window="1h" aria-pressed="false">1h</button
@@ -69,6 +69,7 @@
             ><button data-window="24h" aria-pressed="false">24h</button>
           </div>
         </div>
+        <p id="event-coverage" class="range-note">Loading selected period…</p>
         <div id="notice" class="notice" role="status" hidden></div>
         <section class="headline-grid" aria-label="Node summary">
           <article class="headline primary">
@@ -162,7 +163,7 @@
             <section class="panel">
               <div class="panel-heading">
                 <h2>Recent blocks</h2>
-                <span class="panel-note">Transactions per block</span>
+                <span class="panel-note" data-period>Observed in 15m</span>
               </div>
               <div
                 id="block-volume"
@@ -170,17 +171,18 @@
                 role="group"
                 aria-label="Recent block transaction counts"
               ></div>
+              <p class="panel-bottom">
+                Available blocks by miner timestamp. Scroll to inspect longer
+                periods.
+              </p>
               <div class="metrics-row compact">
                 <div>
                   <span class="legend">Mean block size</span
-                  ><strong data-value="mean_block_bytes">—</strong>
+                  ><strong id="period-block-size">—</strong>
                 </div>
                 <div>
-                  <span class="legend">Header gap</span
-                  ><strong
-                    ><span data-value="lag">—</span
-                    ><small> blocks</small></strong
-                  >
+                  <span class="legend">Blocks in period</span>
+                  <strong id="period-block-count">—</strong>
                 </div>
                 <div>
                   <span class="legend">Finalized storage</span
@@ -197,48 +199,43 @@
                   >The node’s download, verification, and relay path</span
                 >
               </div>
-              <div
-                class="mode-control"
-                role="group"
-                aria-label="Transaction flow units"
-              >
-                <button data-flow="rate" class="selected" aria-pressed="true">
-                  Rate /s</button
-                ><button data-flow="total" aria-pressed="false">
-                  Since restart
-                </button>
-              </div>
+              <span class="panel-note" data-period>Observed in 15m</span>
             </div>
             <div id="transaction-flow" class="flow"></div>
             <p class="panel-bottom">
-              Stages count independent events, not the same group of
-              transactions. Downloaded and directly pushed transactions join at
-              verification. Advertisements may repeat. Failed tasks include
-              download errors and timeouts.
+              Totals count recorded events in the selected period. Stages count
+              independent events, not the same group of transactions. Downloaded
+              and directly pushed transactions join at verification.
+              Advertisements may repeat. Failed tasks include download errors
+              and timeouts.
             </p>
           </section>
           <div class="grid three">
             <section class="panel">
               <div class="panel-heading">
                 <h2>Shielded verification</h2>
-                <span class="panel-note">Proofs /s</span>
+                <span class="panel-note" data-period>Observed in 15m</span>
               </div>
               <div class="metrics-row">
                 <div>
                   <span class="legend"><i class="dot"></i>Halo 2</span
-                  ><strong data-value="halo2_ps">—</strong>
+                  ><strong data-event="halo2_ps">—</strong>
                 </div>
                 <div>
                   <span class="legend"><i class="dot violet"></i>Sapling</span
-                  ><strong data-value="sapling_ps">—</strong>
+                  ><strong data-event="sapling_ps">—</strong>
                 </div>
               </div>
               <div
                 id="proof-chart"
                 class="chart"
                 role="img"
-                aria-label="Proof verification rate"
+                aria-label="Cumulative proof verifications in the selected period"
               ></div>
+              <p class="panel-bottom">
+                Cumulative recorded checks. Gaps and missing intervals are
+                excluded.
+              </p>
             </section>
             <section class="panel">
               <div class="panel-heading">
@@ -303,7 +300,7 @@
           <section class="panel">
             <div class="panel-heading">
               <h2>Block pipeline</h2>
-              <span class="panel-note">Current work</span>
+              <span class="panel-note">Live queues · recorded totals</span>
             </div>
             <div
               id="pipeline-state"
@@ -318,8 +315,8 @@
             </div>
             <div id="block-pipeline" class="pipeline"></div>
             <p class="panel-bottom">
-              Queue counts and rates are live observations. The saved timing
-              readings below remain visible while this node waits for more work.
+              Queues show current work. Verification totals use the selected
+              period. Saved timings below stay visible between blocks.
             </p>
           </section>
           <div class="grid two">
@@ -368,7 +365,7 @@
             <section class="panel">
               <div class="panel-heading">
                 <h2>Mempool processing</h2>
-                <span class="panel-note">Transactions /s</span>
+                <span class="panel-note" data-period>Observed in 15m</span>
               </div>
               <div class="chart-legend">
                 <span><i class="dot"></i>Verified</span
@@ -378,8 +375,11 @@
                 id="tx-chart"
                 class="chart"
                 role="img"
-                aria-label="Transaction verification and failure rates"
+                aria-label="Cumulative transaction verification and failure counts"
               ></div>
+              <p class="panel-bottom">
+                Cumulative recorded events in the selected period.
+              </p>
             </section>
             <section class="panel">
               <div class="panel-heading">
@@ -475,53 +475,56 @@
             <section class="panel">
               <div class="panel-heading">
                 <h2>Native sessions</h2>
-                <span class="tag">QUIC</span>
+                <span class="panel-note" data-period>Observed in 15m</span>
               </div>
               <dl id="native-stats" class="stat-list"></dl>
             </section>
             <section class="panel">
               <div class="panel-heading">
                 <h2>Legacy peer pool</h2>
-                <span class="tag">TCP</span>
+                <span class="panel-note" data-period>Observed in 15m</span>
               </div>
               <dl id="legacy-stats" class="stat-list"></dl>
             </section>
             <section class="panel">
               <div class="panel-heading">
                 <h2>First block body</h2>
-                <span class="panel-note">Winning source /s</span>
+                <span class="panel-note" data-period>Observed in 15m</span>
               </div>
               <div class="metrics-row">
                 <div>
                   <span class="legend"><i class="dot"></i>Native</span
-                  ><strong data-value="zakura_first_ps">—</strong>
+                  ><strong data-event="zakura_first_ps">—</strong>
                 </div>
                 <div>
                   <span class="legend"><i class="dot violet"></i>Legacy</span
-                  ><strong data-value="legacy_first_ps">—</strong>
+                  ><strong data-event="legacy_first_ps">—</strong>
                 </div>
               </div>
               <div
                 id="source-chart"
                 class="chart short"
                 role="img"
-                aria-label="First block body source rate"
+                aria-label="Cumulative first block body counts by source"
               ></div>
+              <p class="panel-bottom">
+                Cumulative recorded first-body arrivals.
+              </p>
             </section>
           </div>
           <div class="grid two">
             <section class="panel">
               <div class="panel-heading">
                 <h2>Protocol messages</h2>
-                <span class="panel-note">Legacy messages /s</span>
+                <span class="panel-note" data-period>Observed in 15m</span>
               </div>
               <div class="table-scroll">
                 <table>
                   <thead>
                     <tr>
                       <th>Message</th>
-                      <th>Received /s</th>
-                      <th>Sent /s</th>
+                      <th>Received</th>
+                      <th>Sent</th>
                     </tr>
                   </thead>
                   <tbody id="messages"></tbody>
@@ -531,14 +534,14 @@
             <section class="panel">
               <div class="panel-heading">
                 <h2>Native streams</h2>
-                <span class="panel-note">By stream kind</span>
+                <span class="panel-note" data-period>Observed in 15m</span>
               </div>
               <div class="table-scroll">
                 <table>
                   <thead>
                     <tr>
                       <th>Stream</th>
-                      <th>Accepted /s</th>
+                      <th>Accepted</th>
                       <th>Last enqueue depth</th>
                     </tr>
                   </thead>
@@ -546,6 +549,7 @@
                 </table>
               </div>
               <p class="panel-bottom">
+                Accepted counts and interface errors use the selected period.
                 Depth is the last reported enqueue observation from a stream,
                 not a sum across peers or a continuously sampled queue. Accepted
                 counts stream opens, not messages.
@@ -675,7 +679,8 @@
               <div class="panel-heading">
                 <h2>RPC service</h2>
                 <span class="panel-note"
-                  ><span data-value="rpc_rps">—</span> requests /s</span
+                  ><span data-event="rpc_rps">—</span> requests in
+                  <span data-period-short>15m</span></span
                 >
               </div>
               <div class="table-scroll">
@@ -683,8 +688,8 @@
                   <thead>
                     <tr>
                       <th>Method</th>
-                      <th>Requests /s</th>
-                      <th>p95</th>
+                      <th>Requests</th>
+                      <th>Recent p95</th>
                     </tr>
                   </thead>
                   <tbody id="rpc-methods"></tbody>
@@ -736,7 +741,10 @@
       <p>
         This is an independent, pruned Zakura node on Zcash mainnet. Chain data
         is polled every 5 seconds, metrics every 15 seconds, and peers and host
-        counters every 30 seconds. Charts retain 24 hours.
+        counters every 30 seconds. Charts retain 24 hours. The selected period
+        controls event counts, cumulative event charts, and recent blocks.
+        Blocks use miner timestamps and are limited to cached, available
+        history.
       </p>
       <dl class="definitions">
         <dt>TPS</dt>
@@ -748,10 +756,13 @@
         </dd>
         <dt>Pipeline activity</dt>
         <dd>
-          Rates are counter changes between scrapes. Stages are independent
-          event counts. They cannot establish how many of one cohort survived
-          each stage. Missing metrics and counter resets show a dash.
-          Since-restart counts reset with the node process.
+          Event totals sum recorded increases during complete sampling intervals
+          inside the selected period. Cumulative charts show those totals rising
+          over time. Missing data, node restarts, and partial boundary intervals
+          are excluded. Coverage starts when count collection was enabled.
+          Stages count independent events, not one cohort of transactions. TPS
+          and byte throughput stay as rates. Queues, connections, CPU, memory,
+          and latency keep their current units.
         </dd>
         <dt>Processing timings</dt>
         <dd>

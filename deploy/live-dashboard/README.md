@@ -11,16 +11,17 @@ This dashboard does not replace it or install routes on the production gateway.
 ## Console layout
 
 All telemetry is visible on one scrolling page. The sticky toolbar provides
-section jump links and one time-range control for every history chart.
+section jump links and one period control for history charts, event totals, and
+the Recent blocks panel. The live block rail keeps the newest 30 blocks.
 
 - **Activity** shows chain TPS, recent block transaction counts, mempool stage
-  activity, proof verification rates, block queues, and peer RTT.
+  counts, cumulative proof checks, block queues, and peer RTT.
 - **Pipeline** separates current work from saved processing timings. It shows
   outstanding and applying work, the latest observed p50/p95 stage and verifier
   summaries, a history of real timing samples, and memory pressure.
 - **Network** separates legacy TCP wire traffic from host interface traffic.
   It includes native QUIC sessions and discovery outcomes, protocol message
-  rates, stream opens, first-body source rates, and anonymized RPC peer details.
+  counts, stream opens, cumulative first-body arrivals, and anonymized RPC peers.
 - **System** shows CPU utilization, I/O wait, node RSS, storage and compactions,
   RPC latency, chain support limits, and public value pools.
 
@@ -33,7 +34,7 @@ of the chart time-range selector. Reorganizations recompute it from the current
 ancestry. TPS measures chain activity, not hardware capacity.
 
 The transaction flow is the useful counterpart to Firedancer's TPU view for a
-Zcash node. Its stages are independent counter rates or totals since node restart,
+Zcash node. Its stages are independent event totals in the selected period,
 not a conserved funnel or a trace of the same transaction. Verification completes
 before mempool admission, and advertisements can repeat. Missing counters remain
 unavailable. Failed tasks include download errors and timeouts. Their raw error
@@ -73,8 +74,25 @@ series remain unavailable rather than becoming zero. Failed sources immediately
 become stale. Chain observations also expire after 25 seconds, other observations
 after 120 seconds. Counter resets and gaps over 120 seconds do not produce rates.
 History gaps over 45 seconds are not joined by chart lines. Changing the time
-range changes activity charts only. Exporter quantiles retain their own rolling
+range changes charts, event totals, and recent blocks. Exporter quantiles retain their own rolling
 window and are never summed across labels.
+
+Event totals use exact counter increases over successful sampling intervals of
+at most 45 seconds. Only whole intervals inside the requested period count.
+Repeated intervals are deduplicated. Missing counters, counter decreases, and
+long gaps produce no count. Cumulative charts retain these gaps and sum only
+recorded events. Coverage is reported separately, per counter in the API. Old
+rate-only samples are not converted into estimated event counts.
+
+Metrics collection reads the local node's systemd activation ID before and after
+the scrape. Count intervals require the same activation across both scrapes.
+This also detects a restart whose new counters exceed the previous values.
+Host error counts require the same boot and interface set. These identities
+remain private. Event counts require local mode and systemd identity access.
+The optional fleet mode continues to provide rates but no node event counts.
+Dashboard restarts preserve recorded history but start a new counting baseline.
+The history endpoint accepts a bounded period and an optional end timestamp so
+changing periods while paused does not pull in newer events.
 The exporter emits zeroes for empty rolling summaries. If its maximum duration
 is zero, the dashboard reports unavailable latency rather than a zero-cost
 operation. The pipeline retains each stage and verifier's last non-empty summary
@@ -93,8 +111,12 @@ on a slower loop.
 
 The block stream walks the observed best tip's ancestry. Backfill is limited to
 four RPC reads per cycle and stops starting reads after two seconds. Each read
-has a five-second socket timeout and a 16 MiB response limit. Up to 100 blocks
-are cached and the newest 30 are published. An alternate block at an observed
+has a five-second socket timeout and a 16 MiB response limit. Up to 4,096 blocks
+are cached and the newest 30 populate the live rail. Backfill does not request
+bodies below the reported prune height. Recent blocks shows available canonical
+blocks whose miner timestamps are inside the selected period, including the
+period's mean serialized size. Long periods scroll horizontally. Older blocks
+may be unavailable until recorded or backfilled. An alternate block at an observed
 height is marked off-chain. Older unlinked blocks have unknown membership.
 Returning to a previously seen fork recalculates membership. Miner timestamps
 and polling observations are not block processing traces.
@@ -104,9 +126,9 @@ proof-of-work finality. Header height does not establish block validity. Peer
 gauges may overlap. Legacy transport traffic excludes native transport. Host
 load is not CPU percent. Proof batch wall times are not CPU time. Pool totals
 are public aggregates and do not reveal shielded balances or owners.
-Verified transaction rates count completed verification before mempool admission.
-Policy rejection rates cover the oversized-transaction counter, not all failures.
-Neither rate is chain TPS.
+Verified transaction totals count completed verification before mempool admission.
+Policy rejection totals cover the oversized-transaction counter, not all failures.
+These event counts are distinct from chain TPS.
 
 ## Dedicated node
 

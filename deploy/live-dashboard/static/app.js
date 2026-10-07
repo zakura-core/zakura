@@ -25,7 +25,9 @@ let fetching = false;
 let lastHistory = 0;
 let disconnected = false;
 let selectedBlock = null;
-let flowMode = "rate";
+let period = null;
+let periodBlocks = [];
+let historyRequest = 0;
 
 function bytes(v, perSecond = false) {
   if (!valid(v)) return "—";
@@ -177,6 +179,27 @@ function render() {
       ? `${activity.blocks} block intervals · ${age(activity.seconds)}`
       : "Collecting linked blocks",
   );
+  document.querySelectorAll("[data-event]").forEach((el) => {
+    el.textContent = fmt(eventCount(el.dataset.event));
+  });
+  document.querySelectorAll("[data-period]").forEach((el) => {
+    el.textContent = `Observed in ${range}`;
+  });
+  document.querySelectorAll("[data-period-short]").forEach((el) => {
+    el.textContent = range;
+  });
+  const coverage = Math.max(
+    0,
+    ...Object.entries(period?.coverage || {})
+      .filter(([key]) => !key.startsWith("host_"))
+      .map(([, item]) => item.seconds),
+  );
+  set(
+    "event-coverage",
+    period
+      ? `Recorded events: up to ${age(coverage)} of ${range}, through ${clock(period.end)}. Missing intervals are excluded.`
+      : `Loading observations for ${range}…`,
+  );
   renderBlocks(now);
   renderFlow();
   renderPipeline();
@@ -194,26 +217,29 @@ function render() {
       .join("") +
     `<div>Build ${esc(state.build.slice(0, 12))} · ${esc(state.node)}</div>`;
 }
+function eventCount(key) {
+  return period?.totals[key] ?? null;
+}
 function renderFlow() {
-  const stages = sourceFresh("metrics") ? state.transaction_flow || [] : [];
-  const titles = [
-    "Queued",
-    "Downloaded",
-    "Pushed directly",
-    "Verified",
-    "Advertised",
-    "Failed tasks",
-    "Oversize rejection",
+  const stages = [
+    ["Queued", "tx_queued_ps"],
+    ["Downloaded", "tx_downloaded_ps"],
+    ["Pushed directly", "tx_pushed_ps"],
+    ["Verified", "tx_verified_ps"],
+    ["Advertised", "tx_relayed_ps"],
+    ["Failed tasks", "tx_failed_ps"],
+    ["Oversize rejection", "tx_policy_rejected_ps"],
   ];
-  const max = Math.max(1e-9, ...stages.map((s) => s[flowMode] || 0));
-  $("transaction-flow").innerHTML = titles
-    .map((name, i) => {
-      const n = stages.find((s) => s.name === name)?.[flowMode];
-      return `<div class="flow-stage${i >= 5 ? " failure" : ""}"><span class="stage-number">${i >= 5 ? "OUTCOME" : `0${i + 1}`}</span><h3>${name}</h3><strong>${flowMode === "rate" ? format("tx_verified_ps", n) : fmt(n)}</strong><div class="flow-track"><span data-width="${valid(n) ? Math.min(100, (n / max) * 100) : 0}"></span></div></div>`;
+  const max = Math.max(1, ...stages.map(([, key]) => eventCount(key) || 0));
+  $("transaction-flow").innerHTML = stages
+    .map(([name, key], i) => {
+      const n = eventCount(key);
+      return `<div class="flow-stage${i >= 5 ? " failure" : ""}"><span class="stage-number">${i >= 5 ? "OUTCOME" : `0${i + 1}`}</span><h3>${name}</h3><strong>${fmt(n)}</strong><div class="flow-track"><span data-width="${valid(n) ? Math.min(100, (n / max) * 100) : 0}"></span></div></div>`;
     })
     .join("");
   applyWidths($("transaction-flow"));
 }
+
 function renderPipeline() {
   const now = paused ? state.generated_at : Date.now() / 1000;
   const retained = (kind) =>
@@ -284,8 +310,8 @@ function renderPipeline() {
     [
       "04 / Verify",
       "blocks_verified_ps",
-      "blocks / second",
-      `${format("tx_verified_ps", value("tx_verified_ps"))} mempool tx verified /s`,
+      `blocks verified in ${range}`,
+      `${fmt(eventCount("tx_verified_ps"))} mempool tx verified in ${range}`,
     ],
     [
       "05 / State",
@@ -297,7 +323,7 @@ function renderPipeline() {
   $("block-pipeline").innerHTML = stages
     .map(
       ([name, key, unit, detail]) =>
-        `<div class="pipeline-stage"><h3>${name}</h3><strong>${format(key, value(key))}</strong><small>${unit}</small><p>${esc(detail)}</p></div>`,
+        `<div class="pipeline-stage"><h3>${name}</h3><strong>${key === "blocks_verified_ps" ? fmt(eventCount(key)) : format(key, value(key))}</strong><small>${unit}</small><p>${esc(detail)}</p></div>`,
     )
     .join("");
   const savedStages = retained("stages");
@@ -357,68 +383,51 @@ function renderPipeline() {
 }
 function renderNetwork() {
   rows("native-stats", [
-    ["Active sessions", fmt(value("native_peers"))],
-    ["Dials started /s", format("dial_started_ps", value("dial_started_ps"))],
-    [
-      "Dials succeeded /s",
-      format("dial_succeeded_ps", value("dial_succeeded_ps")),
-    ],
-    ["Dials failed /s", format("dial_failed_ps", value("dial_failed_ps"))],
-    [
-      "Sessions accepted /s",
-      format("native_accepted_ps", value("native_accepted_ps")),
-    ],
-    [
-      "Neutral closes /s",
-      format("native_closed_ps", value("native_closed_ps")),
-    ],
+    ["Active sessions now", fmt(value("native_peers"))],
+    ["Dials started", fmt(eventCount("dial_started_ps"))],
+    ["Dials succeeded", fmt(eventCount("dial_succeeded_ps"))],
+    ["Dials failed", fmt(eventCount("dial_failed_ps"))],
+    ["Sessions accepted", fmt(eventCount("native_accepted_ps"))],
+    ["Neutral closes", fmt(eventCount("native_closed_ps"))],
   ]);
   const peer = sourceFresh("peers") ? state.peer_summary || {} : {};
   rows("legacy-stats", [
     [
-      "Ready / unready",
+      "Ready / unready now",
       `${fmt(value("ready_peers"))} / ${fmt(value("legacy_unready"))}`,
     ],
     ["Handshakes in flight", fmt(value("handshakes"))],
-    [
-      "Handshake failures /s",
-      format("legacy_handshake_failed_ps", value("legacy_handshake_failed_ps")),
-    ],
+    ["Handshake failures", fmt(eventCount("legacy_handshake_failed_ps"))],
     ["RPC inbound / outbound", `${fmt(peer.inbound)} / ${fmt(peer.outbound)}`],
     ["Median RTT", ms(value("peer_p50_ms"))],
     ["p95 RTT", ms(value("peer_p95_ms"))],
   ]);
+  const commands = new Set((state.messages || []).map((m) => m.name));
+  for (const key of Object.keys(period?.totals || {}))
+    if (key.startsWith("message.")) commands.add(key.split(".")[2]);
   table(
     "messages",
-    sourceFresh("metrics")
-      ? (state.messages || []).map((m) => [
-          m.name,
-          format("messages_in_ps", m.in_ps),
-          format("messages_out_ps", m.out_ps),
-        ])
-      : [],
+    [...commands]
+      .sort()
+      .map((name) => [
+        name,
+        fmt(eventCount(`message.in.${name}`)),
+        fmt(eventCount(`message.out.${name}`)),
+      ]),
     3,
   );
   table(
     "streams",
-    sourceFresh("metrics")
-      ? (state.streams || []).map((s) => [
-          s.name.replaceAll("_", " "),
-          format("stream_ps", s.accepted_ps),
-          fmt(s.last_depth),
-        ])
-      : [],
+    (state.streams || []).map((s) => [
+      s.name.replaceAll("_", " "),
+      fmt(eventCount(`stream.${s.name}`)),
+      sourceFresh("metrics") ? fmt(s.last_depth) : "—",
+    ]),
     3,
   );
   rows("interface-stats", [
-    [
-      "Host interface drops /s",
-      format("host_drops_ps", value("host_drops_ps")),
-    ],
-    [
-      "Host interface errors /s",
-      format("host_errors_ps", value("host_errors_ps")),
-    ],
+    ["Host interface drops", fmt(eventCount("host_drops"))],
+    ["Host interface errors", fmt(eventCount("host_errors"))],
   ]);
   table(
     "peer-table",
@@ -433,6 +442,7 @@ function renderNetwork() {
       : [],
     5,
   );
+
   const lat = state.peer_latency || {};
   set(
     "peer-coverage",
@@ -488,9 +498,13 @@ function renderSystem(h) {
     "rpc-methods",
     sourceFresh("metrics")
       ? [...state.rpc_methods]
-          .sort((a, b) => (b.rps || 0) - (a.rps || 0))
+          .sort(
+            (a, b) =>
+              (eventCount(`rpc.${b.name}`) || 0) -
+              (eventCount(`rpc.${a.name}`) || 0),
+          )
           .slice(0, 12)
-          .map((m) => [m.name, format("rpc_rps", m.rps), ms(m.p95_ms)])
+          .map((m) => [m.name, fmt(eventCount(`rpc.${m.name}`)), ms(m.p95_ms)])
       : [],
     3,
   );
@@ -550,17 +564,28 @@ function renderBlocks(now) {
     $("blocks")
       .querySelector(`[data-hash="${CSS.escape(focusHash)}"]`)
       ?.focus({ preventScroll: true });
-  const linked = blocks
-    .filter((b) => b.canonical === true)
-    .slice(0, 30)
-    .reverse();
+  const linked = periodBlocks.slice().sort((a, b) => a.height - b.height);
+  const atEnd =
+    $("block-volume").scrollLeft + $("block-volume").clientWidth >=
+    $("block-volume").scrollWidth - 4;
+  set("period-block-count", fmt(linked.length));
+  set(
+    "period-block-size",
+    linked.length
+      ? bytes(linked.reduce((sum, b) => sum + (b.size || 0), 0) / linked.length)
+      : "—",
+  );
+
   const max = Math.max(1, ...linked.map((b) => b.transactions));
-  $("block-volume").innerHTML = linked
-    .map(
-      (b) =>
-        `<button class="volume-column" data-hash="${esc(b.hash)}" title="Block ${fmt(b.height)} · ${fmt(b.transactions)} tx · ${bytes(b.size)}" aria-label="Block ${fmt(b.height)}, ${fmt(b.transactions)} transactions"><span data-height="${Math.max(2, (b.transactions / max) * 100)}"></span></button>`,
-    )
-    .join("");
+  $("block-volume").innerHTML =
+    linked
+      .map(
+        (b) =>
+          `<button class="volume-column" data-hash="${esc(b.hash)}" title="Block ${fmt(b.height)} · ${fmt(b.transactions)} tx · ${bytes(b.size)} · ${esc(clock(b.time))}" aria-label="Block ${fmt(b.height)}, ${fmt(b.transactions)} transactions"><span data-height="${Math.max(2, (b.transactions / max) * 100)}"></span></button>`,
+      )
+      .join("") ||
+    `<p class="empty">${period ? "No available blocks in this period" : "Loading blocks…"}</p>`;
+  if (atEnd) $("block-volume").scrollLeft = $("block-volume").scrollWidth;
   $("block-volume")
     .querySelectorAll("[data-height]")
     .forEach((el) => {
@@ -568,7 +593,9 @@ function renderBlocks(now) {
     });
 }
 function renderBlockDetail(hash) {
-  const b = state.blocks.find((block) => block.hash === hash);
+  const b = [...state.blocks, ...periodBlocks].find(
+    (block) => block.hash === hash,
+  );
   if (!b) return;
   set("block-title", `Block ${fmt(b.height)}`);
   const data = [
@@ -596,29 +623,27 @@ function chart(id, keys, format, points = false) {
       id,
       new HistoryChart(container, keys, format, points, COLORS, clock),
     );
-  const end = state?.generated_at || Date.now() / 1000;
+  const end = period?.end || state?.generated_at || Date.now() / 1000;
   charts.get(id).update(history, end - WINDOWS[range], end);
 }
 
 function renderCharts() {
   chart("tps-chart", ["tps", "user_tps"], (v) => format("tps", v));
-  chart("proof-chart", ["halo2_ps", "sapling_ps"], (v) =>
-    format("halo2_ps", v),
-  );
+  chart("proof-chart", ["count_halo2_ps", "count_sapling_ps"], fmt);
   chart("queue-chart", ["outstanding", "applying"], (v) => fmt(v));
   chart("latency-chart", ["peer_p50_ms"], ms);
   chart("processing-chart", ["contextual_ms", "write_ms"], ms, true);
-  chart("tx-chart", ["tx_verified_ps", "tx_failed_ps"], (v) =>
-    format("tx_verified_ps", v),
-  );
+  chart("tx-chart", ["count_tx_verified_ps", "count_tx_failed_ps"], fmt);
   chart("traffic-chart", ["legacy_in_bps", "legacy_out_bps"], (v) =>
     bytes(v, true),
   );
   chart("host-network-chart", ["host_rx_bps", "host_tx_bps"], (v) =>
     bytes(v, true),
   );
-  chart("source-chart", ["zakura_first_ps", "legacy_first_ps"], (v) =>
-    format("zakura_first_ps", v),
+  chart(
+    "source-chart",
+    ["count_zakura_first_ps", "count_legacy_first_ps"],
+    fmt,
   );
   chart("cpu-chart", ["cpu_percent", "iowait_percent"], (v) =>
     format("cpu_percent", v),
@@ -642,13 +667,17 @@ async function getJSON(path) {
 }
 async function loadHistory() {
   const requested = range;
+  const request = ++historyRequest;
+  const end = state?.generated_at || Date.now() / 1000;
   const data = await getJSON(
-    `api/history?window=${encodeURIComponent(requested)}`,
+    `api/history?window=${encodeURIComponent(requested)}&end=${end}`,
   );
-  if (requested === range) {
+  if (request === historyRequest && requested === range) {
     history = data.samples;
+    period = data.activity;
+    periodBlocks = data.blocks;
     lastHistory = Date.now();
-    renderCharts();
+    if (state) render();
   }
 }
 async function poll() {
@@ -687,16 +716,6 @@ $("pause").addEventListener("click", () => {
   if (state) render();
   if (!paused) poll();
 });
-document.querySelectorAll("[data-flow]").forEach((button) =>
-  button.addEventListener("click", () => {
-    flowMode = button.dataset.flow;
-    document.querySelectorAll("[data-flow]").forEach((b) => {
-      b.classList.toggle("selected", b === button);
-      b.setAttribute("aria-pressed", String(b === button));
-    });
-    if (state) renderFlow();
-  }),
-);
 document.querySelectorAll("[data-window]").forEach((button) =>
   button.addEventListener("click", async () => {
     range = button.dataset.window;
@@ -704,7 +723,10 @@ document.querySelectorAll("[data-window]").forEach((button) =>
       b.classList.toggle("selected", b === button);
       b.setAttribute("aria-pressed", String(b === button));
     });
-    renderCharts();
+    history = [];
+    period = null;
+    periodBlocks = [];
+    if (state) render();
     try {
       await loadHistory();
     } catch {

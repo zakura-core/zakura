@@ -169,6 +169,7 @@ state_contextual_total_duration_seconds{quantile="1"} 0.03
 
     def test_stopped_local_node_keeps_host_observations_and_hides_private_fields(self):
         files = {"/proc/meminfo": "MemTotal: 8000 kB\nMemAvailable: 3000 kB\n",
+                 "/proc/sys/kernel/random/boot_id": "private-boot-id\n",
                  "/proc/uptime": "456.75 123.00\n",
                  "/proc/stat": "cpu 1 2 3 4 5 6 7 8 9 10\n",
                  "/proc/net/dev": "header\nheader\nlo: 1 0 0 0 0 0 0 0 1 0 0 0 0 0 0 0\neth0: 50 0 1 2 0 0 0 0 70 0 3 4 0 0 0 0\n"}
@@ -190,6 +191,8 @@ state_contextual_total_duration_seconds{quantile="1"} 0.03
         self.assertEqual(observation["counters"]["cpu"]["total"], 36)
         self.assertNotIn("lo", observation["counters"]["interfaces"])
         self.assertEqual(observation["counters"]["interfaces"]["eth0"]["drops"], 6)
+        self.c.update_host(observation, time.time())
+        self.assertNotIn("private-boot-id", json.dumps(self.c.snapshot()))
 
     def test_chain_tps_excludes_boundary_block_and_coinbase(self):
         blocks = [d.block_public(block(i, previous=f"a{i-1:063x}")) for i in range(1, 40)]
@@ -318,6 +321,60 @@ mempool_failed_verify_tasks_total{reason="private-secret"} 6
             self.c.store.save({"t": t, "height": v}, [])
         self.assertEqual([s["height"] for s in self.c.store.history(86400)], [2, None])
 
+    def test_event_counts_use_exact_deltas_and_reject_restart_even_when_counters_increase(self):
+        def update(total, at, instance):
+            self.c.update_metrics(d.metrics_parse(f"proofs_halo2_verified {total}\n"), at, instance)
+            return self.c.state["event_intervals"]["metrics"]["counts"]["halo2_ps"]
+        self.assertIsNone(update(100, 100, "first"))
+        self.assertEqual(update(130, 115, "first"), 30)
+        self.assertIsNone(update(200, 130, "second"))
+        self.assertEqual(update(205, 145, "second"), 5)
+        self.assertIsNone(update(204, 160, "second"))
+        self.assertIsNone(update(300, 220, "second"))
+        self.assertNotIn("second", json.dumps(self.c.snapshot()))
+
+    def test_metrics_read_crossing_a_node_restart_has_no_count_identity(self):
+        self.c.args.metrics = "http://127.0.0.1:9999/metrics"
+        with patch.object(d, "node_instance", side_effect=["a", "b"]), \
+                patch.object(d, "fetch", return_value=b"proofs_halo2_verified 10\n"):
+            metrics, identity = self.c.collect_metrics()
+        self.assertIsNone(identity)
+        self.assertEqual(d.metric(metrics, "proofs_halo2_verified"), 10)
+
+    def test_period_counts_exclude_partial_intervals_duplicates_and_old_rate_only_history(self):
+        def sample(t, start, end, count):
+            return {"t": t, "event_intervals": {"metrics": {
+                "start": start, "end": end, "counts": {"halo2_ps": count}}}}
+        samples = [{"t": 11, "halo2_ps": 99}, sample(15, 0, 15, 3),
+                   sample(30, 15, 30, 2), sample(45, 15, 30, 2),
+                   sample(60, 45, 60, None), sample(90, 75, 90, 4), sample(105, 90, 105, 10)]
+        result = d.period_activity(samples, 10, 100)
+        self.assertEqual(result["totals"], {"halo2_ps": 6})
+        self.assertEqual(result["coverage"]["halo2_ps"], {"seconds": 30, "first": 15, "last": 90})
+        self.assertEqual([s["count_halo2_ps"] for s in samples], [None, None, 2, None, None, 6, None])
+        self.assertTrue(all("event_intervals" not in s for s in samples))
+
+    def test_failed_sources_do_not_repeat_event_intervals(self):
+        now = time.time()
+        self.c.update_metrics(d.metrics_parse("proofs_halo2_verified 10\n"), now - 15, "node")
+        self.c.update_metrics(d.metrics_parse("proofs_halo2_verified 12\n"), now, "node")
+        self.assertEqual(self.c.sample(now)["event_intervals"]["metrics"]["counts"]["halo2_ps"], 2)
+        self.c.source("metrics", False)
+        self.assertEqual(self.c.sample(now)["event_intervals"], {})
+
+    def test_block_history_retains_more_than_the_live_rail_and_stops_at_prune_height(self):
+        blocks = [block(i, previous=f"a{i - 1:063x}" if i > 1 else None) for i in range(1, 121)]
+        self.c.store.save({"t": time.time()}, [d.block_public(b) for b in blocks])
+        self.assertEqual(len(self.c.store.blocks()), 120)
+        calls = []
+        def rpc(method, params):
+            calls.append(params[0])
+            return next(b for b in blocks if b["hash"] == params[0])
+        self.c.rpc = rpc
+        self.c.update_blocks({"hash": blocks[-1]["hash"], "height": 120, "prune_height": 118}, time.time())
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(min(b["height"] for b in self.c.state["blocks"]), 118)
+
     def test_http_serves_only_cached_reads(self):
         self.c.rpc = lambda *_: self.fail("browser must not trigger RPC")
         server = d.Server(("127.0.0.1", 0), self.c)
@@ -330,6 +387,7 @@ mempool_failed_verify_tasks_total{reason="private-secret"} 6
                 self.assertIn("frame-ancestors 'none'", response.headers["Content-Security-Policy"])
             for path, code in (("/api/history?window=forever", 400), ("/../../dashboard.py", 404),
                                ("/vendor/uplot/../../dashboard.py", 404), ("/vendor/uplot/LICENSE", 404),
+                               ("/api/history?end=NaN", 400), ("/api/history?end=invalid", 400),
                                ("/healthz", 503)):
                 with self.assertRaises(urllib.error.HTTPError) as error:
                     urllib.request.urlopen(url + path)
@@ -337,6 +395,16 @@ mempool_failed_verify_tasks_total{reason="private-secret"} 6
                 error.exception.close()
             with urllib.request.urlopen(url + "/") as response:
                 self.assertIn(b"Block pipeline", response.read())
+            now = time.time()
+            blocks = [d.block_public(block(i)) for i in range(1, 5)]
+            for item, at, canonical in zip(blocks, (now - 60, now - 901, now + 5, now - 30), (True, True, True, False)):
+                item.update(time=at, canonical=canonical)
+            self.c.store.save({"t": now}, blocks)
+            with urllib.request.urlopen(url + f"/api/history?window=15m&end={now}") as response:
+                history = json.load(response)
+            self.assertEqual([b["height"] for b in history["blocks"]], [1])
+            self.assertEqual(history["activity"]["end"], now)
+            self.assertEqual(history["activity"]["totals"], {})
             for path, kind in (("/charts.js", "text/javascript"),
                                ("/vendor/uplot/uPlot.iife.min.js", "text/javascript"),
                                ("/vendor/uplot/uPlot.min.css", "text/css")):

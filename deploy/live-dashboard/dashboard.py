@@ -20,6 +20,8 @@ import urllib.request
 
 ROOT = Path(__file__).resolve().parent
 MAX_RESPONSE = 16 * 1024 * 1024
+MAX_BLOCKS = 4096
+CUMULATIVE_KEYS = ("halo2_ps", "sapling_ps", "tx_verified_ps", "tx_failed_ps", "zakura_first_ps", "legacy_first_ps")
 HASH = re.compile(r"^[0-9a-f]{64}$")
 SAMPLE = re.compile(r'^([a-zA-Z_:][a-zA-Z0-9_:]*)(?:\{(.*)\})?\s+(\S+)(?:\s+\S+)?$')
 LABEL = re.compile(r'(\w+)="((?:[^"\\]|\\.)*)"')
@@ -166,6 +168,50 @@ def rate(previous, current, seconds):
     return (current - previous) / seconds if current >= previous else None
 
 
+def event_interval(previous, current, start, end, same_instance=True):
+    """Only count observed increases across a bounded, uninterrupted interval."""
+    usable = same_instance and start is not None and 0 < end - start <= 45
+    counts = {key: value - previous[key] if usable and number(value) is not None
+              and number(previous.get(key)) is not None and value >= previous[key] else None
+              for key, value in current.items()}
+    return {"start": start, "end": end, "counts": counts}
+
+
+def period_activity(samples, start, end):
+    """Sum whole observed intervals, without estimating at boundaries or over gaps."""
+    totals, coverage, seen = {}, {}, {}
+    for sample in samples:
+        for key in CUMULATIVE_KEYS:
+            sample["count_" + key] = None
+        for source, interval in sample.pop("event_intervals", {}).items():
+            first, last = interval.get("start"), interval.get("end")
+            if (number(first) is None or number(last) is None or first < start or last > end
+                    or not 0 < last - first <= 45 or first < seen.get(source, start)):
+                continue
+            seen[source] = last
+            for key, count in interval["counts"].items():
+                if number(count) is None or count < 0:
+                    continue
+                totals[key] = totals.get(key, 0) + count
+                item = coverage.setdefault(key, {"seconds": 0, "first": first, "last": last})
+                item["seconds"] += last - first
+                item["last"] = last
+                if key in CUMULATIVE_KEYS:
+                    sample["count_" + key] = totals[key]
+    return {"start": start, "end": end, "totals": totals, "coverage": coverage}
+
+
+def node_instance(service):
+    """Keep systemd's activation identity private; it distinguishes node restarts."""
+    try:
+        result = subprocess.run(["systemctl", "show", "--property=InvocationID", "--value", "--", service],
+                                capture_output=True, text=True, check=True, timeout=1)
+        identity = result.stdout.strip()
+        return identity if re.fullmatch(r"[0-9a-f]{32}", identity) else None
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
 def chain_public(info):
     if info.get("chain") != "main" or not HASH.fullmatch(str(info.get("bestblockhash", ""))):
         raise ValueError("expected mainnet chain with a block hash")
@@ -236,6 +282,10 @@ def chain_activity(blocks, tip):
 def host_counters():
     """Keep raw CPU and interface counters private until two observations exist."""
     result = {}
+    try:
+        result["boot_id"] = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+    except OSError:
+        pass
     try:
         ticks = [int(v) for v in Path("/proc/stat").read_text().splitlines()[0].split()[1:9]]
         result["cpu"] = {"total": sum(ticks), "idle": ticks[3] + ticks[4], "iowait": ticks[4]}
@@ -311,16 +361,17 @@ class Store:
             for block in blocks:
                 self.db.execute("INSERT OR REPLACE INTO blocks VALUES (?, ?, ?)",
                                 (block["hash"], block["height"], json.dumps(block)))
-            self.db.execute("DELETE FROM blocks WHERE hash NOT IN (SELECT hash FROM blocks ORDER BY height DESC LIMIT 100)")
+            self.db.execute("DELETE FROM blocks WHERE hash NOT IN (SELECT hash FROM blocks ORDER BY height DESC LIMIT ?)", (MAX_BLOCKS,))
 
-    def history(self, window):
+    def history(self, window, end=None):
+        end = time.time() if end is None else end
         with self.lock:
-            rows = self.db.execute("SELECT body FROM samples WHERE t >= ? ORDER BY t", (time.time() - window,)).fetchall()
+            rows = self.db.execute("SELECT body FROM samples WHERE t >= ? AND t <= ? ORDER BY t", (end - window, end)).fetchall()
         return [json.loads(r[0]) for r in rows]
 
     def blocks(self):
         with self.lock:
-            return [json.loads(r[0]) for r in self.db.execute("SELECT body FROM blocks ORDER BY height DESC LIMIT 100")]
+            return [json.loads(r[0]) for r in self.db.execute("SELECT body FROM blocks ORDER BY height DESC LIMIT ?", (MAX_BLOCKS,))]
 
     def processing(self):
         with self.lock:
@@ -342,12 +393,15 @@ class Collector:
                       "host_mode": "fleet" if getattr(args, "fleet", None) else "local",
                       "node_service": None,
                       "transaction_flow": [], "stage_timings": [], "messages": [],
+                      "event_intervals": {},
                       "last_processing": self.store.processing(),
                       "streams": [], "peer_details": [], "peer_latency": {},
                       "peers": [], "fleet": {}, "reorgs": [], "rpc_methods": [], "verifiers": [],
                       "version": None, "sources": {}, "blocks": self.store.blocks()}
         self.previous_metrics = None
         self.previous_metrics_at = None
+        self.previous_instance = None
+        self.previous_events = {}
         self.previous_host = None
         self.previous_host_at = None
         self.metric_attempt = self.host_attempt = self.peer_attempt = 0
@@ -367,14 +421,18 @@ class Collector:
                                       "at": observed if ok else old.get("at")}
 
     def collect_metrics(self):
-        return metrics_parse(fetch(self.args.metrics).decode("utf-8", "replace"))
+        service = getattr(self.args, "node_service", "zakura-dashboard-node.service")
+        before = node_instance(service) if not getattr(self.args, "fleet", None) else None
+        metrics = metrics_parse(fetch(self.args.metrics).decode("utf-8", "replace"))
+        after = node_instance(service) if not getattr(self.args, "fleet", None) else None
+        return metrics, before if before == after else None
 
     def collect_host(self):
         if self.args.fleet:
             return json.loads(fetch(self.args.fleet + "/data/node/" + urllib.parse.quote(self.args.node)))
         return local_host(self.args.node_disk, self.args.node_service)
 
-    def update_metrics(self, metrics, now):
+    def update_metrics(self, metrics, now, instance=None):
         values = {key: metric(metrics, name) for key, name in GAUGES.items()}
         seconds = now - self.previous_metrics_at if self.previous_metrics_at else 0
         old = self.previous_metrics or {}
@@ -418,6 +476,20 @@ class Collector:
         methods = sorted({tags.get("method") for tags, _ in metrics.get("rpc_request_duration_seconds", []) if tags.get("method")})
         self.state["rpc_methods"] = [{"name": name, "p95_ms": quantile(metrics, "rpc_request_duration_seconds", method=name),
                                      "rps": rate(metric(old, "rpc_requests_total", method=name), metric(metrics, "rpc_requests_total", method=name), seconds)} for name in methods[:60]]
+        events = {key: metric(metrics, name) for key, name in COUNTERS.items() if not key.endswith("_bps")}
+        events.update({source + "_first_ps": metric(metrics, "sync_block_first_received_count", source=source)
+                       for source in ("zakura", "legacy")})
+        events.update({f"message.{direction}.{command}": metric(metrics, name, command=command)
+                       for command in commands[:40]
+                       for direction, name in (("in", "zcash_net_in_messages"), ("out", "zcash_net_out_messages"))})
+        events.update({"stream." + row["name"]: metric(metrics, "zakura_p2p_stream_accepted", stream_kind=row["name"])
+                       for row in self.state["streams"]})
+        events.update({"rpc." + method: metric(metrics, "rpc_requests_total", method=method)
+                       for method in methods[:60] if re.fullmatch(r"[A-Za-z0-9_]{1,64}", method)})
+        self.state["event_intervals"]["metrics"] = event_interval(
+            self.previous_events, events, self.previous_metrics_at, now,
+            instance is not None and instance == self.previous_instance)
+        self.previous_events, self.previous_instance = events, instance
         for name in ("zakura_build_info", "zakurad_build_info"):
             if metrics.get(name):
                 self.state["version"] = metrics[name][0][0].get("version", "")[:80]
@@ -461,6 +533,15 @@ class Collector:
                 rates = [rate(previous[name][field], data[field], seconds) for name, data in interfaces.items()]
                 if all(v is not None for v in rates):
                     host[key] = sum(rates)
+        events, old_events = {}, {}
+        for field in ("drops", "errors"):
+            key = "host_" + field
+            if interfaces and interfaces.keys() == previous.keys() and all(
+                    data[field] >= previous[name][field] for name, data in interfaces.items()):
+                events[key] = sum(data[field] for data in interfaces.values())
+                old_events[key] = sum(data[field] for data in previous.values())
+        self.state["event_intervals"]["host"] = event_interval(old_events, events, self.previous_host_at, now,
+            bool(current.get("boot_id")) and current.get("boot_id") == old.get("boot_id"))
         self.previous_host, self.previous_host_at = current, now
         self.state["host"] = host
         self.state["node_service"] = result["service"]
@@ -516,10 +597,13 @@ class Collector:
         started = time.monotonic()
         # Walk only the observed tip's ancestry. A browser never triggers RPC work.
         # On deep reorgs or catch-up, older unlinked blocks have unknown membership.
-        for _ in range(100):
+        expected_height = chain["height"]
+        for _ in range(MAX_BLOCKS):
             if not HASH.fullmatch(str(tip)):
                 break
             if tip not in known:
+                if number(chain.get("prune_height")) is not None and expected_height < chain["prune_height"]:
+                    break
                 if fetched >= 4 or time.monotonic() - started >= 2:
                     break
                 block = block_public(self.rpc("getblock", [tip, 1]), now if tip == chain["hash"] else None)
@@ -529,13 +613,14 @@ class Collector:
                 fetched += 1
             block = known[tip]
             ancestry.add(tip)
+            expected_height = block["height"] - 1
             tip = block["previous"]
         heights = {known[h]["height"] for h in ancestry}
         for block in known.values():
             block["canonical"] = (True if block["hash"] in ancestry else
                                   False if block["height"] in heights or block["height"] > chain["height"] else None)
         with self.lock:
-            self.state["blocks"] = sorted(known.values(), key=lambda b: (b["height"], b["canonical"] is True), reverse=True)[:100]
+            self.state["blocks"] = sorted(known.values(), key=lambda b: (b["height"], b["canonical"] is True), reverse=True)[:MAX_BLOCKS]
 
     def tick(self):
         now = time.time()
@@ -565,7 +650,7 @@ class Collector:
                         self.state["chain"] = chain_public(result)
                         self.source("chain", True, now)
                     elif key == "metrics":
-                        self.update_metrics(result, now)
+                        self.update_metrics(result[0], now, result[1])
                     elif key == "host":
                         if self.args.fleet:
                             self.update_fleet(result, now)
@@ -599,6 +684,7 @@ class Collector:
         activity = state.get("chain_activity") or {}
         sample.update({key: activity.get(key) for key in ("tps", "user_tps", "block_interval")})
         sample["peer_p50_ms"] = state.get("peer_latency", {}).get("p50_ms") if fresh("peers") else None
+        sample["event_intervals"] = {key: value for key, value in state["event_intervals"].items() if fresh(key)}
         return sample
 
     def snapshot(self):
@@ -693,13 +779,27 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path == "/api/overview":
             state = collector.snapshot()
             state["blocks"] = state["blocks"][:30]
+            state.pop("event_intervals", None)
             self.send(200, state)
         elif parsed.path == "/api/history":
-            window = urllib.parse.parse_qs(parsed.query).get("window", ["1h"])[0]
+            query = urllib.parse.parse_qs(parsed.query)
+            window = query.get("window", ["1h"])[0]
             if window not in WINDOWS:
                 return self.send(400, {"error": "invalid window"})
-            samples = collector.store.history(WINDOWS[window])
-            self.send(200, {"window": window, "samples": samples})
+            now = time.time()
+            try:
+                end = float(query.get("end", [now])[0])
+                if number(end) is None or end < 0 or end > now + 30:
+                    raise ValueError("invalid end")
+            except (ValueError, TypeError):
+                return self.send(400, {"error": "invalid end"})
+            end = min(end, now)
+            start = end - WINDOWS[window]
+            samples = collector.store.history(WINDOWS[window], end)
+            activity = period_activity(samples, start, end)
+            blocks = [b for b in collector.store.blocks() if b.get("canonical") is True
+                      and number(b.get("time")) is not None and start <= b["time"] <= end]
+            self.send(200, {"window": window, "samples": samples, "activity": activity, "blocks": blocks})
         elif parsed.path == "/healthz":
             state = collector.snapshot()
             fresh = state["sources"].get("chain", {}).get("fresh", False)

@@ -548,15 +548,15 @@ h2 {
 }
 .chart-tooltip {
   position: absolute;
-  left: 16px;
-  right: 16px;
-  bottom: 12px;
+  width: max-content;
+  max-width: calc(100% - 16px);
   padding: 6px 8px;
   border: 1px solid #435a65;
   border-radius: 4px;
   background: #1e2c36;
   font: 9px var(--mono);
   pointer-events: none;
+  z-index: 1;
 }
 .chart-legend {
   display: flex;

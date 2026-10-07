@@ -595,6 +595,7 @@ function chart(id, keys, format, points = false) {
   const rows = history.filter((p) => p.t >= start && p.t <= end);
   const values = rows.flatMap((p) => keys.map((k) => p[k]).filter(valid));
   if (rows.length < (points ? 1 : 2) || !values.length) {
+    container.onpointermove = null;
     container.innerHTML =
       '<div class="chart-empty">Collecting live samples<br>Charts appear as data arrives</div>';
     return;
@@ -656,6 +657,22 @@ function chart(id, keys, format, points = false) {
       container.append(tooltip);
     }
     tooltip.textContent = `${clock(p.t)} · ${keys.map((key) => format(p[key])).join(" / ")}`;
+    const pointerX = event.clientX - rect.left,
+      pointerY = event.clientY - rect.top,
+      gap = 12,
+      inset = 8,
+      width = tooltip.offsetWidth,
+      height = tooltip.offsetHeight;
+    const tooltipX =
+      pointerX + gap + width <= rect.width - inset
+        ? pointerX + gap
+        : pointerX - gap - width;
+    const tooltipY =
+      pointerY - gap - height >= inset
+        ? pointerY - gap - height
+        : pointerY + gap;
+    tooltip.style.left = `${Math.max(inset, Math.min(rect.width - width - inset, tooltipX))}px`;
+    tooltip.style.top = `${Math.max(inset, Math.min(rect.height - height - inset, tooltipY))}px`;
   };
   container.onpointerleave = () =>
     container.querySelector(".chart-tooltip")?.remove();

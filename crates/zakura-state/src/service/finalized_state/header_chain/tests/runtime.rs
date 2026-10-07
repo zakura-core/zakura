@@ -1243,12 +1243,18 @@ fn retain_aux_deliveries_for_test(runtime: &HeaderChainRuntime, deliveries: &[Au
             .expect("the direct durable test fixture refreshes the runtime mirror");
 }
 
-#[test]
-fn repair_range_spans_rootless_near_tip_input() {
-    // Suppliers attach roots only to their finalized prefix, so headers received near the
-    // network tip keep rootless rows. When a later handoff moves above those headers, one repair
-    // must still cover them all instead of one header per round trip.
-    let (runtime, _db, _genesis, path) = reconciled_store_with_finalized_prefix(8);
+/// Repair three headers that hold rootless near-tip rows in one range, below one rooted header.
+///
+/// `aggregate_limit` replaces the aggregate input limit. Returns the durable rows of each
+/// repaired target and the number of durable rows in the store.
+fn repair_rootless_near_tip_range(
+    aggregate_limit: Option<usize>,
+) -> (Vec<Vec<AuxDelivery>>, usize) {
+    let (mut runtime, _db, _genesis, path) = reconciled_store_with_finalized_prefix(8);
+    if let Some(total) = aggregate_limit {
+        let per_header = runtime.config.limits.max_aux_deliveries_per_header.get();
+        runtime.set_auxiliary_limits_for_test(per_header, total);
+    }
     let parent = Frontier::new(path[2].height, path[2].hash);
     let targets: Vec<_> = path[3..6]
         .iter()
@@ -1381,14 +1387,52 @@ fn repair_range_spans_rootless_near_tip_input() {
             .expect("the rootless range repair applies"),
         ApplyResult::Committed
     ));
-    for target in &targets {
-        let rows = runtime
-            .store
-            .aux_deliveries(target.hash)
-            .expect("the repaired target rows are readable");
+    let rows = targets
+        .iter()
+        .map(|target| {
+            runtime
+                .store
+                .aux_deliveries(target.hash)
+                .expect("the repaired target rows are readable")
+        })
+        .collect();
+    let total = runtime
+        .store
+        .load_aux_deliveries()
+        .expect("the durable input rows are readable")
+        .len();
+    (rows, total)
+}
+
+#[test]
+fn repair_range_spans_rootless_near_tip_input() {
+    // Suppliers attach roots only to their finalized prefix, so headers received near the
+    // network tip keep rootless rows. When a later handoff moves above those headers, one repair
+    // must still cover them all instead of one header per round trip.
+    let (rows, _) = repair_rootless_near_tip_range(None);
+    for rows in rows {
         assert_eq!(rows.len(), 2, "the repair adds a rooted row");
         assert!(rows.iter().any(|row| row.tree_aux.is_some()));
     }
+}
+
+#[test]
+fn saturated_rootless_range_repair_retains_every_root() {
+    // The four near-tip rows leave one free aggregate slot. The two lowest targets sit in the
+    // commit window, so their rows are protected, and the range admits three new roots by
+    // reclaiming the two rows above it. Aggregate pressure must evict those older rows, never a
+    // root that the range repair just supplied.
+    let (rows, total) = repair_rootless_near_tip_range(Some(5));
+    assert_eq!(total, 5, "the repair stays within the aggregate limit");
+    let repair_source = SourceId::from_digest([0xca; 32]);
+    for rows in &rows {
+        assert!(
+            rows.iter()
+                .any(|row| row.source == repair_source && row.tree_aux.is_some()),
+            "every target retains its new root"
+        );
+    }
+    assert_eq!(rows[2].len(), 1, "eviction removes the suffix rootless row");
 }
 
 #[test]

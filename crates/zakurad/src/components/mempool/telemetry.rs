@@ -25,12 +25,12 @@ pub(super) fn emit(id: UnminedTxId, phase: &'static str, reason: Option<&'static
     emit_inner(id, None, phase, reason);
 }
 
-/// Allocate an occurrence identity for one download/verification task.
+/// Allocate an occurrence identity for one lifecycle operation.
 pub(super) fn new_attempt() -> u64 {
     NEXT_ATTEMPT.fetch_add(1, Ordering::Relaxed)
 }
 
-/// Emit a boundary tied to a particular download/verification task.
+/// Emit a boundary tied to a particular lifecycle operation.
 pub(super) fn emit_attempt(
     id: UnminedTxId,
     attempt: u64,

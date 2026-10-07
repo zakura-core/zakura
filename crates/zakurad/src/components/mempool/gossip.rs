@@ -229,9 +229,10 @@ where
     );
 
     let ready = broadcast_network.ready().await?;
+    let relay_attempt = super::telemetry::new_attempt();
     if let Some(ids) = &observed {
         for &id in ids {
-            super::telemetry::emit(id, "relay_started", None);
+            super::telemetry::emit_attempt(id, relay_attempt, "relay_started", None);
         }
     }
     let result = ready.call(request).await;
@@ -242,7 +243,7 @@ where
             "relay_failed"
         };
         for id in ids {
-            super::telemetry::emit(id, phase, None);
+            super::telemetry::emit_attempt(id, relay_attempt, phase, None);
         }
     }
 

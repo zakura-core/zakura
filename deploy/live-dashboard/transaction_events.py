@@ -48,7 +48,8 @@ def summarize_transactions(events, start, end):
     pending, samples = {}, []
     spans = {"received": ("queued", "body_wait_ms"),
              "verified": ("verification_started", "verification_ms"),
-}
+             "relay_succeeded": ("relay_started", "relay_ms"),
+             "relay_failed": ("relay_started", "relay_ms")}
     seen = set()
     for event in sorted(events, key=lambda row: (row["process"], row["monotonic_ns"], row["sequence"])):
         identity = (event["process"], event["sequence"])

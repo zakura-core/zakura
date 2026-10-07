@@ -472,3 +472,9 @@ transports, including prepared mined commits. Proposal checks do not emit this
 stage. Only a successful commit completion supplies body-to-commit timing.
 Cancellation leaves the stage incomplete. This span includes verification and
 state service waits, not just database writes.
+
+Transaction local relay boundaries carry a shared occurrence ID for each broadcast
+call. Durations require the same node run, transaction token, and occurrence ID.
+Both success and failure are measured. Older uncorrelated events remain counts
+only. The interval starts after network readiness and ends when the local
+broadcast call returns, so it does not measure peer receipt or readiness wait.

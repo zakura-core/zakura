@@ -58,3 +58,16 @@ class TransactionTests(unittest.TestCase):
         self.assertEqual(summarize_transactions([first, other], 0, 10)["timings"], [])
         other["attempt"] = None
         self.assertEqual(summarize_transactions([first, other], 0, 10)["timings"], [])
+
+    def test_relay_completion_requires_its_own_attempt_and_consumes_start(self):
+        start = event("relay_started", 1)
+        wrong = event("relay_succeeded", 3)
+        wrong["attempt"] = 2
+        failed = event("relay_failed", 5)
+        duplicate_finish = event("relay_succeeded", 6)
+        result = summarize_transactions([duplicate_finish, failed, wrong, start], 0, 10)
+        self.assertEqual([(x["metric"], x["value"], x["outcome"]) for x in result["timings"]],
+                         [("relay_ms", 4, "relay_failed")])
+        start["attempt"] = None
+        failed["attempt"] = None
+        self.assertEqual(summarize_transactions([start, failed], 0, 10)["timings"], [])

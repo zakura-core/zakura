@@ -206,6 +206,7 @@ class EventFeed:
         self.socket = None
         self.thread = None
         self.network = OrderedDict()
+        self.delivery = OrderedDict()
         self.received = 0
         self.rejected = 0
         self.last_received = None
@@ -227,19 +228,23 @@ class EventFeed:
             event = parse_block_event(data)
             if event is not None:
                 accepted.append(event)
+                self.observe_delivery(data, event["process"])
                 continue
             batch = parse_crypto_event(data)
             if batch is not None:
                 crypto.append(batch)
+                self.observe_delivery(data, batch["process"])
                 continue
             transaction = parse_transaction_event(data)
             if transaction is not None:
                 transactions.append(transaction)
+                self.observe_delivery(data, transaction["process"])
                 continue
             network = parse_network_event(data)
             if network is None:
                 self.rejected += 1
                 continue
+            self.observe_delivery(data, network["process"])
             with self.lock:
                 key = (network["process"], network["connection"])
                 previous = self.network.get(key)
@@ -323,10 +328,25 @@ class EventFeed:
             public = [{key: row[key] for key in ("connection", "rtt_ms", "rx_bytes_ps", "tx_bytes_ps", "lost_packets", "received_at")} for row in rows]
         return {"connections": public, "status": self.status()}
 
+    def observe_delivery(self, data, process):
+        # Called only for an already validated event. Concurrent senders can
+        # arrive out of order, so use their cumulative failure counter, not gaps.
+        value = json.loads(data).get("send_failures")
+        if not integer(value):
+            return
+        with self.lock:
+            self.delivery[process] = max(value, self.delivery.get(process, 0))
+            self.delivery.move_to_end(process)
+            while len(self.delivery) > 16:
+                self.delivery.popitem(last=False)
+
     def status(self):
-        return {"enabled": bool(self.socket_path), "listening": self.socket is not None and self.error is None,
-                "received": self.received, "rejected": self.rejected,
-                "last_received": self.last_received, "error": self.error}
+        with self.lock:
+            return {"enabled": bool(self.socket_path), "listening": self.socket is not None and self.error is None,
+                    "received": self.received, "rejected": self.rejected,
+                    "last_received": self.last_received, "error": self.error,
+                    "reported_send_failures": sum(self.delivery.values()) if self.delivery else None,
+                    "reporting_runs": len(self.delivery)}
 
     def start(self):
         import os

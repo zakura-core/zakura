@@ -206,6 +206,12 @@ function render() {
       ? `Recorded events: up to ${age(coverage)} of ${range}, through ${clock(period.end)}. Missing intervals are excluded.`
       : `Loading observations for ${range}…`,
   );
+  const eventStatus = nativeDetails?.status;
+  const lost = eventStatus?.reported_send_failures;
+  $("node-event-coverage").hidden = !eventStatus?.error && !(valid(lost) && lost > 0);
+  set("node-event-coverage", eventStatus?.error
+    ? "The node event receiver is unavailable. Event-based panels may be incomplete."
+    : `The node reported ${fmt(lost)} undelivered events since the observed node runs started. This is not a selected-period count. Event-based totals and timings may be incomplete.`);
   renderBlocks(now);
   renderFlow();
   renderPipeline();

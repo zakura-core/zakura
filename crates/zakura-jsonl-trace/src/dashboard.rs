@@ -52,6 +52,7 @@ struct DashboardSink {
     path: std::path::PathBuf,
     started: Instant,
     sequence: AtomicU64,
+    send_failures: AtomicU64,
 }
 
 #[derive(Serialize)]
@@ -60,6 +61,7 @@ struct Envelope<'a, T> {
     process: &'static str,
     sequence: u64,
     monotonic_ns: u64,
+    send_failures: u64,
     unix_ms: u64,
     event: &'a T,
 }
@@ -74,6 +76,7 @@ impl DashboardSink {
             path,
             started: Instant::now(),
             sequence: AtomicU64::new(0),
+            send_failures: AtomicU64::new(0),
         })
     }
 
@@ -86,10 +89,19 @@ impl DashboardSink {
     }
 
     fn send<T: Serialize>(&self, event: &T) -> io::Result<()> {
+        let result = self.send_inner(event);
+        if result.is_err() {
+            self.send_failures.fetch_add(1, Ordering::Relaxed);
+        }
+        result
+    }
+
+    fn send_inner<T: Serialize>(&self, event: &T) -> io::Result<()> {
         let envelope = Envelope {
             version: 1,
             process: crate::process_trace_id(),
             sequence: self.sequence.fetch_add(1, Ordering::Relaxed),
+            send_failures: self.send_failures.load(Ordering::Relaxed),
             monotonic_ns: u64::try_from(self.started.elapsed().as_nanos()).unwrap_or(u64::MAX),
             unix_ms: u64::try_from(
                 SystemTime::now()
@@ -145,6 +157,7 @@ mod tests {
         let size = receiver.recv(&mut buffer).unwrap();
         let event: serde_json::Value = serde_json::from_slice(&buffer[..size]).unwrap();
         assert_eq!(event["sequence"], 1);
+        assert_eq!(event["send_failures"], 1);
         assert_eq!(event["event"], "received");
         assert_eq!(event["process"], crate::process_trace_id());
         assert!(event["unix_ms"].as_u64().unwrap() > 0);

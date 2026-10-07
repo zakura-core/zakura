@@ -424,3 +424,11 @@ socket is owned by `zakura-dashboard-web`, mode 0660, inside its 0750 runtime
 directory. The old node PID 37210 remained running through this dashboard-only
 rollout. The browser rendered without console errors. Custom node activation and
 new-event panel validation are still pending the v2 build.
+
+
+Sender-side delivery failures are now counted explicitly in subsequent envelopes.
+The receiver keeps the maximum reported count per observed node run, bounded to
+16 runs, so out-of-order datagrams cannot invent additional loss. The UI reports
+known loss or a stopped receiver, and does not pretend the lifetime failure count
+belongs to the selected window. Older node builds without the field report unknown,
+not zero. This sender change requires a later build than `d6af0101b`.

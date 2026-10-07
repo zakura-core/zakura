@@ -281,3 +281,23 @@ class WaterfallTests(unittest.TestCase):
         self.assertEqual(len(runs), 2)
         self.assertTrue(all(not span["complete"] for run in runs for span in run["spans"]))
         self.assertTrue(all(span["duration_ms"] is None for run in runs for span in run["spans"]))
+
+
+class DeliveryCoverageTests(unittest.TestCase):
+    def test_out_of_order_sequences_do_not_invent_loss(self):
+        feed = n.EventFeed(":memory:")
+        try:
+            def packet(sequence, failures=None, process="1-123"):
+                row = json.loads(CryptoTests.packet(sequence, process))
+                if failures is not None:
+                    row["send_failures"] = failures
+                return json.dumps(row).encode()
+            feed.ingest([packet(100), packet(1)], 100)
+            self.assertIsNone(feed.status()["reported_send_failures"])
+            feed.ingest([packet(102, 3), packet(101, 2), packet(103, 3)], 101)
+            self.assertEqual(feed.status()["reported_send_failures"], 3)
+            feed.ingest([packet(1, 1, "2-456")], 102)
+            self.assertEqual(feed.status()["reported_send_failures"], 4)
+            self.assertEqual(feed.status()["reporting_runs"], 2)
+        finally:
+            feed.close()

@@ -358,7 +358,9 @@ individual fallback verification, and pending batches flushed on drop. Events
 record accepted item counts, action or spend/output counts, first-item in-batch
 wait, CPU scheduling delay, validation duration, and success. These counts are
 work performed, not unique transactions. Empty shutdown flushes emit no event.
-Signature verifier instrumentation is still pending.
+Ed25519, RedPallas, and RedJubjub also record batches, fallback checks, and
+shutdown flushes. Their work unit is one signature. The shared wrapper preserves
+the original owned success/error value without converting verification errors.
 
 The receiver stores at most 32,768 sanitized crypto completions for 24 hours,
 deduplicated by node process and event sequence. Selected-window responses contain

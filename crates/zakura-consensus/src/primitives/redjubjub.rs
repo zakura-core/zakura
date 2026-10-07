@@ -93,6 +93,7 @@ pub static VERIFIER: Lazy<
 pub struct Verifier {
     /// A batch verifier for RedJubjub signatures.
     batch: BatchVerifier,
+    observation: zakura_jsonl_trace::dashboard::BatchObservation,
 
     /// A channel for broadcasting the result of a batch to the futures for each batch item.
     ///
@@ -105,7 +106,11 @@ impl Default for Verifier {
     fn default() -> Self {
         let batch = BatchVerifier::default();
         let (tx, _) = watch::channel(None);
-        Self { batch, tx }
+        Self {
+            batch,
+            tx,
+            observation: Default::default(),
+        }
     }
 }
 
@@ -124,8 +129,16 @@ impl Verifier {
 
     /// Synchronously process the batch, and send the result using the channel sender.
     /// This function blocks until the batch is completed.
-    fn verify(batch: BatchVerifier, tx: Sender) {
-        let result = batch.verify(thread_rng());
+    fn verify(
+        batch: BatchVerifier,
+        tx: Sender,
+        observation: zakura_jsonl_trace::dashboard::BatchObservation,
+        submitted: std::time::Instant,
+    ) {
+        let result =
+            observation.verify_result("redjubjub", "signatures", "drop_flush", submitted, || {
+                batch.verify(thread_rng())
+            });
         let _ = tx.send(Some(result));
     }
 
@@ -137,15 +150,28 @@ impl Verifier {
         // Correctness: Do CPU-intensive work on a dedicated thread, to avoid blocking other futures.
         //
         // We don't care about execution order here, because this method is only called on drop.
-        tokio::task::block_in_place(|| rayon::spawn_fifo(|| Self::verify(batch, tx)));
+        let observation = mem::take(&mut self.observation);
+        let submitted = std::time::Instant::now();
+        tokio::task::block_in_place(|| {
+            rayon::spawn_fifo(move || Self::verify(batch, tx, observation, submitted))
+        });
     }
 
     /// Flush the batch using a thread pool, and return the result via the channel.
     /// This function returns a future that becomes ready when the batch is completed.
-    async fn flush_spawning(batch: BatchVerifier, tx: Sender) {
+    async fn flush_spawning(
+        batch: BatchVerifier,
+        tx: Sender,
+        observation: zakura_jsonl_trace::dashboard::BatchObservation,
+    ) {
         // Correctness: Do CPU-intensive work on a dedicated thread, to avoid blocking other futures.
         let start = std::time::Instant::now();
-        let result = spawn_fifo(move || batch.verify(thread_rng())).await;
+        let result = spawn_fifo(move || {
+            observation.verify_result("redjubjub", "signatures", "batch", start, || {
+                batch.verify(thread_rng())
+            })
+        })
+        .await;
         let duration = start.elapsed().as_secs_f64();
 
         let result_label = match &result {
@@ -165,7 +191,15 @@ impl Verifier {
     /// Verify a single item using a thread pool, and return the result.
     async fn verify_single_spawning(item: Item) -> Result<(), BoxError> {
         // Correctness: Do CPU-intensive work on a dedicated thread, to avoid blocking other futures.
-        spawn_fifo_and_convert(move || item.verify_single()).await
+        let mut observation = zakura_jsonl_trace::dashboard::BatchObservation::default();
+        observation.queued(1);
+        let submitted = std::time::Instant::now();
+        spawn_fifo_and_convert(move || {
+            observation.verify_result("redjubjub", "signatures", "fallback", submitted, || {
+                item.verify_single()
+            })
+        })
+        .await
     }
 }
 
@@ -183,6 +217,7 @@ impl Service<BatchControl<Item>> for Verifier {
             BatchControl::Item(item) => {
                 tracing::trace!("got item");
                 self.batch.queue(item.0);
+                self.observation.queued(1);
                 let mut rx = self.tx.subscribe();
 
                 Box::pin(async move {
@@ -213,7 +248,8 @@ impl Service<BatchControl<Item>> for Verifier {
 
                 let (batch, tx) = self.take();
 
-                Box::pin(Self::flush_spawning(batch, tx).map(Ok))
+                let observation = mem::take(&mut self.observation);
+                Box::pin(Self::flush_spawning(batch, tx, observation).map(Ok))
             }
         }
     }

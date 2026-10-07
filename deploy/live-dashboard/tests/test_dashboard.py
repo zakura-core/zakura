@@ -445,6 +445,16 @@ mempool_failed_verify_tasks_total{reason="private-secret"} 6
                     urllib.request.urlopen(url + path)
                 self.assertEqual(error.exception.code, code)
                 error.exception.close()
+            self.c.source("chain", True, time.time())
+            with urllib.request.urlopen(url + "/healthz") as response:
+                self.assertTrue(json.load(response)["ready"])
+            self.c.events.socket_path = "configured-but-not-listening"
+            with self.assertRaises(urllib.error.HTTPError) as error:
+                urllib.request.urlopen(url + "/healthz")
+            self.assertEqual(error.exception.code, 503)
+            self.assertFalse(json.load(error.exception)["event_receiver_ready"])
+            error.exception.close()
+            self.c.events.socket_path = None
             with urllib.request.urlopen(url + "/") as response:
                 self.assertIn(b"Processing timings", response.read())
             now = time.time()

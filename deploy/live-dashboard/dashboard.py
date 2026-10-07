@@ -859,7 +859,11 @@ class Handler(BaseHTTPRequestHandler):
         elif parsed.path == "/healthz":
             state = collector.snapshot()
             fresh = state["sources"].get("chain", {}).get("fresh", False)
-            self.send(200 if fresh else 503, {"ready": fresh, "build": state["build"]})
+            events = collector.events.status()
+            receiver_ready = not events["enabled"] or events["listening"]
+            ready = fresh and receiver_ready
+            self.send(200 if ready else 503, {"ready": ready, "build": state["build"],
+                                            "event_receiver_ready": receiver_ready})
         elif parsed.path in ("/", "/index.html", "/app.js", "/charts.js", "/style.css", "/favicon.svg",
                              "/vendor/uplot/uPlot.iife.min.js", "/vendor/uplot/uPlot.min.css"):
             name = "index.html" if parsed.path == "/" else parsed.path[1:]

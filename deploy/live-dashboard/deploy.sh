@@ -87,7 +87,7 @@ systemctl enable zakura-live-dashboard
 systemctl restart zakura-live-dashboard
 ready=false
 for attempt in {1..15}; do
-  if curl --fail --silent --max-time 2 http://127.0.0.1:8095/api/overview | python3 -c 'import json,sys; assert json.load(sys.stdin)["build"] == sys.argv[1]' "$revision"; then ready=true; break; fi
+  if curl --fail --silent --max-time 2 http://127.0.0.1:8095/healthz | python3 -c 'import json,sys; assert json.load(sys.stdin)["build"] == sys.argv[1]' "$revision"; then ready=true; break; fi
   sleep 2
 done
 [[ "$ready" == true ]]

@@ -328,13 +328,22 @@ mempool_failed_verify_tasks_total{reason="private-secret"} 6
             with urllib.request.urlopen(url + "/api/overview") as response:
                 self.assertIn("sources", json.load(response))
                 self.assertIn("frame-ancestors 'none'", response.headers["Content-Security-Policy"])
-            for path, code in (("/api/history?window=forever", 400), ("/../../dashboard.py", 404), ("/healthz", 503)):
+            for path, code in (("/api/history?window=forever", 400), ("/../../dashboard.py", 404),
+                               ("/vendor/uplot/../../dashboard.py", 404), ("/vendor/uplot/LICENSE", 404),
+                               ("/healthz", 503)):
                 with self.assertRaises(urllib.error.HTTPError) as error:
                     urllib.request.urlopen(url + path)
                 self.assertEqual(error.exception.code, code)
                 error.exception.close()
             with urllib.request.urlopen(url + "/") as response:
                 self.assertIn(b"Block pipeline", response.read())
+            for path, kind in (("/charts.js", "text/javascript"),
+                               ("/vendor/uplot/uPlot.iife.min.js", "text/javascript"),
+                               ("/vendor/uplot/uPlot.min.css", "text/css")):
+                with urllib.request.urlopen(url + path) as response:
+                    self.assertTrue(response.headers["Content-Type"].startswith(kind))
+                    self.assertIn("script-src 'self'", response.headers["Content-Security-Policy"])
+                    self.assertTrue(response.read())
         finally:
             server.shutdown()
             server.server_close()

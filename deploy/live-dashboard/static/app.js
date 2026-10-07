@@ -587,95 +587,17 @@ function renderBlockDetail(hash) {
   $("block-detail").innerHTML =
     `<span class="block-state">${b.canonical === true ? "On the observed best chain" : b.canonical === false ? "Off the observed best chain" : "Chain membership not yet checked"}</span><div class="block-hash">${esc(b.hash)}</div><dl class="stat-list detail-stats">${data.map(([k, v]) => `<div><dt>${esc(k)}</dt><dd>${esc(v)}</dd></div>`).join("")}</dl><p>The observation time is when the dashboard polled this block. It is not its receive time or processing duration.</p>`;
 }
+const charts = new Map();
 function chart(id, keys, format, points = false) {
   const container = $(id);
   if (!container) return;
-  const end = state?.generated_at || Date.now() / 1000;
-  const start = end - WINDOWS[range];
-  const rows = history.filter((p) => p.t >= start && p.t <= end);
-  const values = rows.flatMap((p) => keys.map((k) => p[k]).filter(valid));
-  if (rows.length < (points ? 1 : 2) || !values.length) {
-    container.onpointermove = null;
-    container.innerHTML =
-      '<div class="chart-empty">Collecting live samples<br>Charts appear as data arrives</div>';
-    return;
-  }
-  // Keep real timestamps and missing samples. Never interpolate across an outage.
-  const w = Math.max(160, container.clientWidth - 32),
-    height = Math.max(100, container.clientHeight - 15),
-    left = 3,
-    right = 3,
-    top = 19,
-    bottom = 26;
-  const plotH = height - top - bottom,
-    plotW = w - left - right;
-  const max = (Math.max(...values) || 1) * 1.12;
-  const x = (t) => left + ((t - start) / (end - start)) * plotW;
-  const y = (v) => top + plotH * (1 - Math.max(0, v) / max);
-  const linePaths = keys
-    .map((key, k) => {
-      if (points)
-        return rows
-          .filter((p) => valid(p[key]))
-          .map(
-            (p) =>
-              `<circle cx="${x(p.t).toFixed(1)}" cy="${y(p[key]).toFixed(1)}" r="3" fill="${COLORS[k]}"><title>${esc(clock(p.t))} · ${esc(format(p[key]))}</title></circle>`,
-          )
-          .join("");
-      let path = "",
-        last = null;
-      for (const p of rows) {
-        if (!valid(p[key])) {
-          last = null;
-          continue;
-        }
-        path += `${last !== null && p.t - last <= 45 ? "L" : "M"}${x(p.t).toFixed(1)},${y(p[key]).toFixed(1)} `;
-        last = p.t;
-      }
-      return `<path d="${path}" fill="none" stroke="${COLORS[k]}" stroke-width="1.7" vector-effect="non-scaling-stroke"/>`;
-    })
-    .join("");
-  container.innerHTML = `<svg viewBox="0 0 ${w} ${height}" preserveAspectRatio="none" aria-hidden="true"><line class="grid-line" x1="0" y1="${top}" x2="${w}" y2="${top}"/><line class="grid-line" x1="0" y1="${top + plotH / 2}" x2="${w}" y2="${top + plotH / 2}"/><line class="grid-line" x1="0" y1="${top + plotH}" x2="${w}" y2="${top + plotH}"/><text x="3" y="11">${esc(format(max))}</text><text x="3" y="${height - 4}">${esc(clock(start))}</text><text x="${w / 2}" y="${height - 4}" text-anchor="middle">${esc(clock((start + end) / 2))}</text><text x="${w - 3}" y="${height - 4}" text-anchor="end">${esc(clock(end))}</text>${linePaths}</svg>`;
-  container.onpointermove = (event) => {
-    const rect = container.getBoundingClientRect();
-    const t =
-      start +
-      Math.max(
-        0,
-        Math.min(1, (event.clientX - rect.left - 16) / (rect.width - 32)),
-      ) *
-        (end - start);
-    const p = rows.reduce(
-      (best, point) =>
-        Math.abs(point.t - t) < Math.abs(best.t - t) ? point : best,
-      rows[0],
+  if (!charts.has(id))
+    charts.set(
+      id,
+      new HistoryChart(container, keys, format, points, COLORS, clock),
     );
-    let tooltip = container.querySelector(".chart-tooltip");
-    if (!tooltip) {
-      tooltip = document.createElement("div");
-      tooltip.className = "chart-tooltip";
-      container.append(tooltip);
-    }
-    tooltip.textContent = `${clock(p.t)} · ${keys.map((key) => format(p[key])).join(" / ")}`;
-    const pointerX = event.clientX - rect.left,
-      pointerY = event.clientY - rect.top,
-      gap = 12,
-      inset = 8,
-      width = tooltip.offsetWidth,
-      height = tooltip.offsetHeight;
-    const tooltipX =
-      pointerX + gap + width <= rect.width - inset
-        ? pointerX + gap
-        : pointerX - gap - width;
-    const tooltipY =
-      pointerY - gap - height >= inset
-        ? pointerY - gap - height
-        : pointerY + gap;
-    tooltip.style.left = `${Math.max(inset, Math.min(rect.width - width - inset, tooltipX))}px`;
-    tooltip.style.top = `${Math.max(inset, Math.min(rect.height - height - inset, tooltipY))}px`;
-  };
-  container.onpointerleave = () =>
-    container.querySelector(".chart-tooltip")?.remove();
+  const end = state?.generated_at || Date.now() / 1000;
+  charts.get(id).update(history, end - WINDOWS[range], end);
 }
 
 function renderCharts() {

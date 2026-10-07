@@ -704,7 +704,8 @@ class Handler(BaseHTTPRequestHandler):
             state = collector.snapshot()
             fresh = state["sources"].get("chain", {}).get("fresh", False)
             self.send(200 if fresh else 503, {"ready": fresh, "build": state["build"]})
-        elif parsed.path in ("/", "/index.html", "/app.js", "/style.css", "/favicon.svg"):
+        elif parsed.path in ("/", "/index.html", "/app.js", "/charts.js", "/style.css", "/favicon.svg",
+                             "/vendor/uplot/uPlot.iife.min.js", "/vendor/uplot/uPlot.min.css"):
             name = "index.html" if parsed.path == "/" else parsed.path[1:]
             kind = {"html": "text/html", "js": "text/javascript", "css": "text/css", "svg": "image/svg+xml"}[name.rsplit(".", 1)[1]]
             self.send(200, (ROOT / "static" / name).read_bytes(), kind)

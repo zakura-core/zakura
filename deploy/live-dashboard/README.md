@@ -143,11 +143,21 @@ from a different node.
 
 ## Run and check
 
-Python 3.12 or later is sufficient. There are no third-party dependencies.
+Python 3.12 or later is sufficient for the server, which uses only the standard
+library. Charts use a pinned, locally served uPlot 1.6.32 browser bundle. See
+`static/vendor/uplot/README.md` for its source, integrity, and license. No package
+installation or CDN is needed on the host.
+
+uPlot handles axes, rendering, the vertical cursor, and colored sample markers.
+The cursor and compact tooltip snap to the same timestamp. Missing readings
+have no marker, and gaps remain unconnected. Existing chart instances receive
+live updates so hovering is not reset by every dashboard poll.
 
 ```sh
 python3 -m unittest discover -s deploy/live-dashboard/tests -v
 node --check deploy/live-dashboard/static/app.js
+node --check deploy/live-dashboard/static/charts.js
+node --test deploy/live-dashboard/tests/test_charts.cjs
 python3 deploy/live-dashboard/dashboard.py --history /tmp/zakura-dashboard.sqlite3
 ```
 

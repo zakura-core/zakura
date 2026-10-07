@@ -517,19 +517,8 @@ h2 {
 .chart.short {
   height: 90px;
 }
-.chart svg {
-  display: block;
-  width: 100%;
-  height: 100%;
-  overflow: visible;
-}
-.chart text {
-  font: 8px var(--mono);
-  fill: var(--muted);
-}
-.grid-line {
-  stroke: #2b3842;
-  stroke-dasharray: 2 4;
+.chart .u-cursor-x {
+  border-right: 1px solid #9db0bc;
 }
 .chart-empty {
   position: absolute;

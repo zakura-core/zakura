@@ -2,6 +2,7 @@
 
 from collections import OrderedDict
 import json
+import logging
 import re
 from transaction_events import parse_transaction_event, summarize_transactions
 
@@ -435,6 +436,7 @@ class EventFeed:
             except socket.timeout:
                 pass
             except Exception:
+                logging.exception("Dashboard event receiver failed")
                 self.error = "Event receiver stopped"
                 return
 

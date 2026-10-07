@@ -8,9 +8,12 @@ during DNS setup is <http://146.190.146.239/>.
 The original fleet status page stays at <https://status-mainnet.valargroup.dev/>.
 This dashboard does not replace it or install routes on the production gateway.
 
-## Console views
+## Console layout
 
-- **Overview** shows chain TPS, recent block transaction counts, mempool stage
+All telemetry is visible on one scrolling page. The sticky toolbar provides
+section jump links and one time-range control for every history chart.
+
+- **Activity** shows chain TPS, recent block transaction counts, mempool stage
   activity, proof verification rates, block queues, and peer RTT.
 - **Pipeline** shows outstanding and applying work, independent p50/p95 stage
   durations, cryptographic batch timings, and memory pressure.

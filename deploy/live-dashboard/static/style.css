@@ -259,26 +259,58 @@ h1 {
   border-bottom: 1px solid var(--line);
   margin-bottom: 20px;
   gap: 12px;
+  position: sticky;
+  top: 62px;
+  z-index: 9;
+  background: var(--bg);
+  padding: 10px 0;
 }
 nav {
   display: flex;
   gap: 18px;
+  align-items: center;
 }
-nav button {
-  border: 0;
-  border-bottom: 2px solid transparent;
-  border-radius: 0;
+nav a {
   color: var(--muted);
-  padding: 0 2px 12px;
-  font-size: 12px;
+  padding: 3px 0;
+  font-size: 11px;
+  text-decoration: none;
 }
-nav button.selected {
+nav a:hover {
   color: var(--mint);
-  border-color: var(--mint);
 }
-nav button:hover {
-  background: none;
-  color: #fff;
+.jump-label {
+  font: 8px var(--mono);
+  letter-spacing: 1px;
+  color: #617987;
+}
+.dashboard-section {
+  scroll-margin-top: 130px;
+}
+.section-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 15px;
+  margin: 30px 0 15px;
+  padding-top: 15px;
+  border-top: 1px solid var(--line);
+}
+.section-heading > div {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+}
+.section-heading > div > span {
+  color: var(--mint);
+  font: 10px var(--mono);
+}
+.section-heading h2 {
+  font-size: 17px;
+}
+.section-heading p {
+  color: var(--muted);
+  font-size: 10px;
 }
 .ranges,
 .mode-control {
@@ -290,7 +322,7 @@ nav button:hover {
   border-radius: 5px;
 }
 .ranges {
-  margin-bottom: 8px;
+  margin: 0;
 }
 .ranges button,
 .mode-control button {
@@ -1041,15 +1073,29 @@ dialog p {
     flex-wrap: wrap;
     row-gap: 10px;
     padding-bottom: 9px;
+    top: 56px;
   }
   nav {
-    gap: 22px;
+    gap: 18px;
     width: 100%;
-    border-bottom: 1px solid var(--line);
   }
-  nav button {
+  nav a {
     font-size: 11px;
-    padding-bottom: 10px;
+  }
+  .jump-label {
+    display: none;
+  }
+  .dashboard-section {
+    scroll-margin-top: 155px;
+  }
+  .section-heading {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 5px;
+    margin-top: 23px;
+  }
+  .section-heading p {
+    font-size: 9px;
   }
   .ranges {
     margin: 0 0 0 auto;

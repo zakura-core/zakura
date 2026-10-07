@@ -25,7 +25,6 @@ let fetching = false;
 let lastHistory = 0;
 let disconnected = false;
 let selectedBlock = null;
-let view = "overview";
 let flowMode = "rate";
 
 function bytes(v, perSecond = false) {
@@ -535,7 +534,7 @@ function renderBlockDetail(hash) {
 }
 function chart(id, keys, format) {
   const container = $(id);
-  if (!container || container.closest("[hidden]")) return;
+  if (!container) return;
   const end = state?.generated_at || Date.now() / 1000;
   const start = end - WINDOWS[range];
   const rows = history.filter((p) => p.t >= start && p.t <= end);
@@ -685,20 +684,6 @@ $("pause").addEventListener("click", () => {
   if (state) render();
   if (!paused) poll();
 });
-document.querySelectorAll("[data-view]").forEach((button) =>
-  button.addEventListener("click", () => {
-    view = button.dataset.view;
-    document.querySelectorAll("[data-view]").forEach((b) => {
-      b.classList.toggle("selected", b === button);
-      if (b === button) b.setAttribute("aria-current", "page");
-      else b.removeAttribute("aria-current");
-    });
-    document.querySelectorAll("[data-page]").forEach((page) => {
-      page.hidden = page.dataset.page !== view;
-    });
-    renderCharts();
-  }),
-);
 document.querySelectorAll("[data-flow]").forEach((button) =>
   button.addEventListener("click", () => {
     flowMode = button.dataset.flow;

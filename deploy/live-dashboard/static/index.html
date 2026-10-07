@@ -51,12 +51,12 @@
           </div>
         </div>
         <div class="toolbar">
-          <nav aria-label="Dashboard views">
-            <button data-view="overview" class="selected" aria-current="page">
-              Overview</button
-            ><button data-view="pipeline">Pipeline</button
-            ><button data-view="network">Network</button
-            ><button data-view="system">System</button>
+          <nav aria-label="Jump to dashboard section">
+            <span class="jump-label">JUMP TO</span>
+            <a href="#activity">Activity</a>
+            <a href="#pipeline">Pipeline</a>
+            <a href="#network">Network</a>
+            <a href="#system">System</a>
           </nav>
           <div class="ranges" role="group" aria-label="Chart time range">
             <button data-window="15m" class="selected" aria-pressed="true">
@@ -110,7 +110,19 @@
           </article>
         </section>
 
-        <div data-page="overview" class="view">
+        <div
+          id="activity"
+          class="dashboard-section"
+          role="region"
+          aria-labelledby="activity-title"
+        >
+          <div class="section-heading">
+            <div>
+              <span>01</span>
+              <h2 id="activity-title">Activity</h2>
+            </div>
+            <p>Chain throughput and transaction flow</p>
+          </div>
           <div class="grid two">
             <section class="panel">
               <div class="panel-heading">
@@ -272,7 +284,19 @@
           </div>
         </div>
 
-        <div data-page="pipeline" class="view" hidden>
+        <div
+          id="pipeline"
+          class="dashboard-section"
+          role="region"
+          aria-labelledby="pipeline-title"
+        >
+          <div class="section-heading">
+            <div>
+              <span>02</span>
+              <h2 id="pipeline-title">Processing pipeline</h2>
+            </div>
+            <p>Queues, stage timings, and cryptographic checks</p>
+          </div>
           <section class="panel">
             <div class="panel-heading">
               <h2>Block pipeline</h2>
@@ -374,7 +398,19 @@
           </div>
         </div>
 
-        <div data-page="network" class="view" hidden>
+        <div
+          id="network"
+          class="dashboard-section"
+          role="region"
+          aria-labelledby="network-title"
+        >
+          <div class="section-heading">
+            <div>
+              <span>03</span>
+              <h2 id="network-title">Network</h2>
+            </div>
+            <p>Connections, traffic, and peer latency</p>
+          </div>
           <div class="grid two">
             <section class="panel">
               <div class="panel-heading">
@@ -543,7 +579,19 @@
           </section>
         </div>
 
-        <div data-page="system" class="view" hidden>
+        <div
+          id="system"
+          class="dashboard-section"
+          role="region"
+          aria-labelledby="system-title"
+        >
+          <div class="section-heading">
+            <div>
+              <span>04</span>
+              <h2 id="system-title">System</h2>
+            </div>
+            <p>CPU, memory, storage, and node health</p>
+          </div>
           <div class="grid two">
             <section class="panel">
               <div class="panel-heading">

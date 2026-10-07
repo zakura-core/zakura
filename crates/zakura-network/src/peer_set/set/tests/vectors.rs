@@ -701,6 +701,62 @@ fn mined_block_gossip_reaches_ready_peers() {
     });
 }
 
+/// A minimum version increase leaves busy outdated peers pending until their current work
+/// finishes. Block gossip must not spend slots on them in the meantime.
+#[test]
+fn block_gossip_skips_busy_outdated_peers() {
+    let peer_version = Version::min_specified_for_upgrade(&Network::Mainnet, NetworkUpgrade::Nu6_2);
+    let peer_versions = PeerVersions {
+        peer_versions: vec![peer_version],
+    };
+
+    let (runtime, _init_guard) = zakura_test::init_async();
+    let _guard = runtime.enter();
+    tokio::time::pause();
+
+    let (discovered_peers, mut handles) = peer_versions.mock_peer_discovery();
+    let (minimum_peer_version, _best_tip_height) =
+        MinimumPeerVersion::with_mock_chain_tip(&Network::Mainnet);
+
+    runtime.block_on(async move {
+        let (mut peer_set, _peer_set_guard) = PeerSetBuilder::new()
+            .with_discover(discovered_peers)
+            .with_minimum_peer_version(minimum_peer_version)
+            .build();
+        peer_set.ready().await.expect("peer set is always ready");
+
+        let outdated_addr: PeerSocketAddr = SocketAddr::new([10, 9, 9, 9].into(), 1).into();
+        let (cancel, _cancel_rx) =
+            crate::peer_set::set::oneshot::channel::<crate::peer_set::set::CancelClientWork>();
+        peer_set.cancel_handles.insert(outdated_addr, cancel);
+        let (sender, mut outdated) = futures::channel::mpsc::channel(0);
+        peer_set.block_gossip_peers.insert(
+            outdated_addr,
+            crate::peer::block_gossip::BlockGossipPeer {
+                sender,
+                uploads: Default::default(),
+                registry: None,
+                version: Version(1),
+                sidecar: false,
+            },
+        );
+
+        let hash = block::Hash([6; 32]);
+        let _broadcast =
+            tokio::spawn(peer_set.route_block_broadcast(Request::AdvertiseBlock(hash, None)));
+        tokio::task::yield_now().await;
+        let request = handles[0]
+            .try_to_receive_outbound_client_request()
+            .request()
+            .expect("the supported peer receives the advertisement");
+        assert_eq!(request.request, Request::AdvertiseBlock(hash, None));
+        assert!(
+            outdated.try_recv().is_err(),
+            "outdated peer receives nothing"
+        );
+    });
+}
+
 #[test]
 fn remove_unready_peer_clears_cancel_handle_and_updates_counts() {
     let peer_versions = PeerVersions {

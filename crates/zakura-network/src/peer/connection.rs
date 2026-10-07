@@ -1156,11 +1156,15 @@ where
                     )
             }
             (AwaitingRequest, AdvertiseBlock(hash, _) | AdvertiseBlockToAll(hash) | AdvertiseMinedBlock(hash)) => {
-                self
+                let sent = self
                     .peer_tx
                     .send(Message::Inv(vec![hash.into()]))
-                    .await
-                    .map(|()|
+                    .await;
+                if sent.is_ok() {
+                    // Mark the write before reading the peer's next message, which can be its getdata.
+                    self.block_uploads.advertised(hash);
+                }
+                sent.map(|()|
                          Handler::Finished(Ok(Response::Nil))
                     )
             }
@@ -1387,7 +1391,16 @@ where
         // Handle the request, and return unused messages.
         match req {
             AsRequest(req) => {
+                let requested_blocks = match &req {
+                    Request::BlocksByHash(hashes) | Request::BlocksByHashFrom { hashes, .. } => {
+                        Some(hashes.clone())
+                    }
+                    _ => None,
+                };
                 self.drive_peer_request(req).await;
+                if let Some(hashes) = requested_blocks {
+                    self.block_uploads.request_finished(&hashes);
+                }
                 None
             }
             Consumed => None,

@@ -17,7 +17,8 @@ use tokio::{
 use zakura_chain::block;
 
 use crate::{
-    constants::REQUEST_TIMEOUT, peer::ClientRequest, peer_registry::PeerRegistryUpdater, Request,
+    constants::REQUEST_TIMEOUT, peer::ClientRequest, peer_registry::PeerRegistryUpdater,
+    protocol::external::types::Version, Request,
 };
 
 /// Maximum outstanding legacy block advertisements across broadcasts.
@@ -31,10 +32,22 @@ const BLOCK_UPLOAD_WAIT: Duration = Duration::from_secs(2 * REQUEST_TIMEOUT.as_s
 
 #[derive(Clone, Copy, Debug)]
 enum UploadState {
+    /// Requests before this advertisement's inventory belong to an earlier generation.
+    Queued,
     Waiting,
     Requested(Instant),
     Written(Instant),
     Finished(bool),
+}
+
+impl UploadState {
+    fn start_waiting(&mut self) -> bool {
+        let queued = matches!(self, UploadState::Queued);
+        if queued {
+            *self = UploadState::Waiting;
+        }
+        queued
+    }
 }
 
 /// Observers exist only while local broadcasts await this connection's uploads.
@@ -48,7 +61,7 @@ impl BlockUploads {
         if let Some(upload) = uploads.get(&hash).and_then(Weak::upgrade) {
             return (upload.subscribe(), None);
         }
-        let (sender, receiver) = watch::channel(UploadState::Waiting);
+        let (sender, receiver) = watch::channel(UploadState::Queued);
         let sender = Arc::new(sender);
         uploads.insert(hash, Arc::downgrade(&sender));
         (receiver, Some(UploadClaim(sender)))
@@ -74,6 +87,14 @@ impl BlockUploads {
         }
     }
 
+    /// Start tracking requests once the connection writes this advertisement's inventory.
+    pub(crate) fn advertised(&self, hash: block::Hash) {
+        let uploads = self.0.lock().expect("block upload mutex is never poisoned");
+        if let Some(upload) = uploads.get(&hash).and_then(Weak::upgrade) {
+            upload.send_if_modified(UploadState::start_waiting);
+        }
+    }
+
     pub(crate) fn requested(&self, hash: block::Hash) {
         self.update(hash, UploadState::Requested(Instant::now()));
     }
@@ -84,6 +105,25 @@ impl BlockUploads {
 
     pub(crate) fn unavailable(&self, hash: block::Hash) {
         self.update(hash, UploadState::Finished(false));
+    }
+
+    /// Fail requested hashes that the finished block request did not write.
+    ///
+    /// The inbound service can truncate a request or fail it without naming each hash.
+    pub(crate) fn request_finished<'a>(&self, hashes: impl IntoIterator<Item = &'a block::Hash>) {
+        let uploads = self.0.lock().expect("block upload mutex is never poisoned");
+        for upload in hashes
+            .into_iter()
+            .filter_map(|hash| uploads.get(hash).and_then(Weak::upgrade))
+        {
+            upload.send_if_modified(|state| {
+                let requested = matches!(state, UploadState::Requested(_));
+                if requested {
+                    *state = UploadState::Finished(false);
+                }
+                requested
+            });
+        }
     }
 
     pub(crate) fn disconnected(&self) {
@@ -120,6 +160,9 @@ pub(crate) struct BlockGossipPeer {
     pub(crate) sender: mpsc::Sender<ClientRequest>,
     pub(crate) uploads: BlockUploads,
     pub(crate) registry: Option<PeerRegistryUpdater>,
+    pub(crate) version: Version,
+    /// Configured sidecars may wait for a busy connection to write inventory.
+    pub(crate) sidecar: bool,
 }
 
 impl BlockGossipPeer {
@@ -163,8 +206,14 @@ impl BlockGossipPeer {
             transient_addr: None,
             span: tracing::Span::current(),
         };
-        // A busy connection can finish its current request before writing this inventory.
-        let advertised = timeout(BLOCK_UPLOAD_WAIT, async {
+        // A sidecar learns the tip only from inventory, so it waits for its busy connection.
+        // Other connections that cannot write inventory promptly must not hold the slot.
+        let inventory_wait = if self.sidecar {
+            BLOCK_UPLOAD_WAIT
+        } else {
+            BLOCK_REQUEST_WAIT
+        };
+        let advertised = timeout(inventory_wait, async {
             self.sender.send(request).await.ok()?;
             rx.await.ok()?.ok()
         })
@@ -172,11 +221,14 @@ impl BlockGossipPeer {
         if !matches!(advertised, Ok(Some(_))) {
             return false;
         }
+        // The connection usually marks the write first; senders without a connection rely on this.
+        claim.0.send_if_modified(UploadState::start_waiting);
 
         let request_deadline = Instant::now() + BLOCK_REQUEST_WAIT;
         let succeeded = loop {
             let state = *progress.borrow_and_update();
             let deadline = match state {
+                UploadState::Queued => unreachable!("written inventory leaves the queued state"),
                 UploadState::Waiting => request_deadline,
                 UploadState::Requested(started) => started + BLOCK_UPLOAD_WAIT,
                 UploadState::Written(written) => {
@@ -203,7 +255,7 @@ impl BlockGossipPeer {
 
 /// Randomize relays and equal RTTs; prioritize configured sidecars within the cap.
 pub(crate) fn order_peers(
-    peers: Vec<(bool, BlockGossipPeer)>,
+    peers: Vec<BlockGossipPeer>,
     mined: bool,
     rng: &mut impl rand::Rng,
 ) -> Vec<BlockGossipPeer> {
@@ -211,13 +263,13 @@ pub(crate) fn order_peers(
     // Snapshot RTT once: heartbeat updates must not change comparisons during sorting.
     let mut peers: Vec<_> = peers
         .into_iter()
-        .map(|(sidecar, peer)| {
+        .map(|peer| {
             let rtt = if mined {
                 peer.rtt().unwrap_or(Duration::MAX)
             } else {
                 Duration::ZERO
             };
-            (sidecar, rtt, peer)
+            (peer.sidecar, rtt, peer)
         })
         .collect();
     peers.shuffle(rng);
@@ -239,6 +291,8 @@ mod tests {
                 sender,
                 uploads: BlockUploads::default(),
                 registry: None,
+                version: crate::constants::CURRENT_NETWORK_PROTOCOL_VERSION,
+                sidecar: false,
             },
             receiver,
         )
@@ -445,6 +499,62 @@ mod tests {
         assert_eq!(slots.available_permits(), 1);
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn events_before_inventory_do_not_finish_the_advertisement() {
+        let hash = block::Hash([9; 32]);
+        let slots = Arc::new(Semaphore::new(1));
+        let (peer, mut receiver) = peer();
+        let task = tokio::spawn(peer.clone().advertise(hash, slots.clone()));
+        tokio::task::yield_now().await;
+        // A getdata that follows an earlier inventory resolves before this inventory is written.
+        peer.uploads.requested(hash);
+        peer.uploads.unavailable(hash);
+        accept(&mut receiver, hash).await;
+        tokio::time::advance(BLOCK_REQUEST_WAIT - Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+        assert!(!task.is_finished());
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert!(task.await.unwrap());
+        assert_eq!(slots.available_permits(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unwritten_requested_hash_fails_when_the_request_finishes() {
+        let hash = block::Hash([10; 32]);
+        let slots = Arc::new(Semaphore::new(1));
+        let (peer, mut receiver) = peer();
+        let task = tokio::spawn(peer.clone().advertise(hash, slots.clone()));
+        accept(&mut receiver, hash).await;
+        peer.uploads.requested(hash);
+        // The inbound service truncated the request before reaching this hash.
+        peer.uploads.request_finished(&[hash]);
+        assert!(!task.await.unwrap());
+        assert_eq!(slots.available_permits(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn only_sidecars_wait_for_busy_connections_to_write_inventory() {
+        for sidecar in [false, true] {
+            let hash = block::Hash([11; 32]);
+            let slots = Arc::new(Semaphore::new(1));
+            let (mut peer, mut receiver) = peer();
+            peer.sidecar = sidecar;
+            let task = tokio::spawn(peer.advertise(hash, slots.clone()));
+            tokio::task::yield_now().await;
+            tokio::time::advance(BLOCK_REQUEST_WAIT + Duration::from_millis(1)).await;
+            tokio::task::yield_now().await;
+            assert_eq!(task.is_finished(), !sidecar);
+            if sidecar {
+                accept(&mut receiver, hash).await;
+                tokio::time::advance(BLOCK_REQUEST_WAIT).await;
+                assert!(task.await.unwrap());
+            } else {
+                assert!(!task.await.unwrap());
+            }
+            assert_eq!(slots.available_permits(), 1);
+        }
+    }
+
     #[test]
     fn miners_use_rtt_and_relays_use_random_order() {
         let registry = PeerRegistry::default();
@@ -464,7 +574,7 @@ mod tests {
                 });
                 guards.push(guard);
                 peer.registry = Some(updater);
-                (false, peer)
+                peer
             })
             .collect();
         let mined = order_peers(peers.clone(), true, &mut StdRng::seed_from_u64(9));

@@ -49,6 +49,8 @@ impl From<Client> for LoadTrackedClient {
             sender: client.server_tx.clone(),
             uploads: client.block_uploads.clone(),
             registry: client.peer_registry_updater.clone(),
+            version: connection_info.remote.version,
+            sidecar: false,
         };
 
         let service = PeakEwma::new(

@@ -240,7 +240,7 @@ where
     inventory_registry: InventoryRegistry,
 
     /// Senders for the current ready and busy connection generations.
-    block_gossip_peers: HashMap<D::Key, (bool, BlockGossipPeer)>,
+    block_gossip_peers: HashMap<D::Key, BlockGossipPeer>,
     /// Share the cap across early, committed, and concurrent block broadcasts.
     block_gossip_slots: Arc<tokio::sync::Semaphore>,
 
@@ -865,10 +865,7 @@ where
     ///
     /// If the service is for a connection to an outdated peer, the service is dropped.
     fn push_ready(&mut self, was_unready: bool, key: D::Key, svc: D::Service) {
-        self.block_gossip_peers.insert(
-            key,
-            (self.is_zcashd_compat_peer(&svc), svc.block_gossip.clone()),
-        );
+        self.insert_block_gossip_peer(key, &svc);
         let cancel = self.cancel_handles.remove(&key);
         assert_eq!(
             cancel.is_some(),
@@ -889,10 +886,7 @@ where
     /// If the service is for a connection to an outdated peer, the request is cancelled and the
     /// service is dropped.
     fn push_unready(&mut self, key: D::Key, svc: D::Service) {
-        self.block_gossip_peers.insert(
-            key,
-            (self.is_zcashd_compat_peer(&svc), svc.block_gossip.clone()),
-        );
+        self.insert_block_gossip_peer(key, &svc);
         let peer_version = svc.remote_version();
         let (tx, rx) = oneshot::channel();
 
@@ -977,6 +971,13 @@ where
             .keys()
             .copied()
             .choose_multiple(&mut rand::thread_rng(), max_peers)
+    }
+
+    /// Records the block gossip sender for the current ready or busy connection generation.
+    fn insert_block_gossip_peer(&mut self, key: D::Key, svc: &D::Service) {
+        let mut peer = svc.block_gossip.clone();
+        peer.sidecar = self.is_zcashd_compat_peer(svc);
+        self.block_gossip_peers.insert(key, peer);
     }
 
     /// Returns true if `service` is a configured zcashd sidecar peer.
@@ -1322,8 +1323,14 @@ where
         self.block_gossip_peers.retain(|key, _| {
             self.ready_services.contains_key(key) || self.cancel_handles.contains_key(key)
         });
+        // A minimum version increase cancels busy outdated peers only after their current work.
+        let minimum_version = self.minimum_peer_version.current();
         let peers = crate::peer::block_gossip::order_peers(
-            self.block_gossip_peers.values().cloned().collect(),
+            self.block_gossip_peers
+                .values()
+                .filter(|peer| peer.version >= minimum_version)
+                .cloned()
+                .collect(),
             mined,
             &mut rand::thread_rng(),
         );

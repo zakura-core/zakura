@@ -54,7 +54,6 @@ zcash_address = { version = "=2.2.0", package = "zakura-address" }
 zakura_mmr_tree = { path = "crates/zakura-mmr-tree", version = "1.0.0" }
 zcash_keys = { version = "=2.2.0", package = "zakura-keys" }
 zcash_primitives = { version = "=2.2.0", package = "zakura-primitives" }
-zcash_proofs = { version = "=2.2.0", package = "zakura-proofs" }
 zcash_transparent = { version = "=2.2.0", package = "zakura-transparent" }
 zcash_protocol = { version = "=2.2.0", package = "zakura-protocol" }
 abscissa_core = { version = "0.7", default-features = false }

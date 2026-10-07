@@ -429,10 +429,11 @@ fn coinbase_addresses_without_sapling() -> anyhow::Result<()> {
                 Address::Unified(addr) => addr.transparent().unwrap(),
                 _ => unreachable!(),
             };
+            let script: transparent::Script = receiver.script().into();
             assert!(tx
                 .outputs()
                 .iter()
-                .any(|output| { output.lock_script.as_raw_bytes() == receiver.script().as_ref() }));
+                .any(|output| output.lock_script == script));
         }
     }
     Ok(())

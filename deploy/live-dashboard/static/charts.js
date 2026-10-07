@@ -19,6 +19,24 @@ function chartSeriesData(rows, keys, start, end) {
   return data;
 }
 
+function chartSeriesLabel(key) {
+  if (key.endsWith("_p50_ms")) return "p50";
+  if (key.endsWith("_p95_ms")) return "p95";
+  const labels = {
+    body_wait_ms: "Queue → body ready", verification_ms: "Verification",
+    relay_ms: "Local relay", admission_ms: "Admission checks",
+    mined_ms: "Mined", expired_ms: "Expired", evicted_ms: "Evicted",
+    execution_ms: "Execution", scheduling_ms: "Scheduling", in_batch_wait_ms: "In-batch wait",
+    items: "Items", work_units: "Work units", contextual_ms: "Contextual checks", write_ms: "RocksDB write",
+    tps: "Total TPS", user_tps: "Excluding coinbase", count_halo2_ps: "Halo 2",
+    count_sapling_ps: "Sapling", count_tx_verified_ps: "Verified", count_tx_failed_ps: "Failed tasks",
+    native_rx_bps: "Received", native_tx_bps: "Sent", legacy_in_bps: "Received", legacy_out_bps: "Sent",
+    host_rx_bps: "Received", host_tx_bps: "Sent", cpu_percent: "CPU busy", iowait_percent: "I/O wait",
+    rss_bytes: "Node RSS", outstanding: "Outstanding", applying: "Applying",
+  };
+  return labels[key] || key.replaceAll("_", " ");
+}
+
 class HistoryChart {
   constructor(container, keys, format, points, colors, clock) {
     Object.assign(this, { container, keys, format, points, colors, clock });
@@ -59,7 +77,7 @@ class HistoryChart {
   options(size) {
     const axis = {
       stroke: "#8096a3",
-      font: "8px ui-monospace, monospace",
+      font: "10px ui-monospace, monospace",
       ticks: { show: false },
       border: { show: false },
     };
@@ -115,18 +133,16 @@ class HistoryChart {
       series: [
         {},
         ...this.keys.map((key, index) => ({
-          label: key,
+          label: chartSeriesLabel(key),
           stroke: this.colors[index],
           width: 1.7,
           spanGaps: false,
-          ...(this.points
-            ? { paths: () => null }
-            : key.startsWith("count_")
-              ? { paths: uPlot.paths.stepped({ align: 1 }) }
-              : {}),
+          ...(!this.points && key.startsWith("count_")
+            ? { paths: uPlot.paths.stepped({ align: 1 }) }
+            : {}),
           points: {
             show: this.points,
-            size: 5,
+            size: 6,
             width: 0,
             fill: this.colors[index],
           },
@@ -142,10 +158,30 @@ class HistoryChart {
       this.tooltip.hidden = true;
       return;
     }
-    this.tooltip.textContent = `${this.clock(plot.data[0][idx])} · ${plot.data
-      .slice(1)
-      .map((series) => this.format(series[idx]))
-      .join(" / ")}`;
+    this.tooltip.replaceChildren();
+    const time = document.createElement("div");
+    time.className = "chart-tooltip-time";
+    time.textContent = this.clock(plot.data[0][idx]);
+    this.tooltip.append(time);
+    this.keys.forEach((key, index) => {
+      const value = plot.data[index + 1][idx];
+      if (!Number.isFinite(value)) return;
+      const row = document.createElement("div");
+      row.className = "chart-tooltip-row";
+      const swatch = document.createElement("i");
+      swatch.style.backgroundColor = this.colors[index];
+      const label = document.createElement("span");
+      label.textContent = chartSeriesLabel(key);
+      const number = document.createElement("strong");
+      number.textContent = this.format(value);
+      row.append(swatch, label, number);
+      this.tooltip.append(row);
+    });
+    if (this.tooltip.childElementCount === 1) {
+      const empty = document.createElement("div");
+      empty.textContent = "No observation";
+      this.tooltip.append(empty);
+    }
     this.tooltip.hidden = false;
     const rect = this.container.getBoundingClientRect(),
       over = plot.over.getBoundingClientRect(),

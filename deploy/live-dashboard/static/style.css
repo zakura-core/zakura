@@ -1271,3 +1271,22 @@ dialog p {
 .waterfall-bar.uncommitted { fill: #8096a3; }
 
 #transaction-lifecycle .chart { height: 220px; }
+
+/* Nested half-width panels made event charts and their titles too narrow. */
+#transaction-lifecycle { grid-column: 1 / -1; }
+#transaction-lifecycle > .grid { gap: 20px; }
+#transaction-lifecycle > .grid > section { min-width: 0; }
+#transaction-lifecycle h3 { margin: 0; padding: 16px 17px 12px; font-size: 13px; font-weight: 500; overflow-wrap: anywhere; }
+#lifecycle-reasons .stat-list { margin-bottom: 16px; }
+.panel-heading { flex-wrap: wrap; }
+.panel-heading h2, .panel-heading h3 { min-width: 0; overflow-wrap: anywhere; }
+.chart-legend { flex-wrap: wrap; row-gap: 6px; }
+.chart-tooltip { font-size: 11px; padding: 9px 11px; }
+.chart-tooltip-time { color: var(--muted); margin-bottom: 6px; }
+.chart-tooltip-row { display: grid; grid-template-columns: 7px minmax(0, 1fr) auto; align-items: center; gap: 8px; margin: 4px 0; }
+.chart-tooltip-row i { width: 7px; height: 7px; border-radius: 50%; }
+.chart-tooltip-row span { overflow-wrap: anywhere; }
+.chart-tooltip-row strong { font-weight: 500; white-space: nowrap; }
+@media (max-width: 1000px) {
+  #transaction-lifecycle > .grid { grid-template-columns: minmax(0, 1fr); }
+}

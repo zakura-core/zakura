@@ -23,6 +23,10 @@ use crate::{
 
 /// Maximum outstanding legacy block advertisements across broadcasts.
 pub(crate) const BLOCK_GOSSIP_CONCURRENCY: usize = 32;
+/// Every this many mined-block advertisements, a random peer replaces the next-lowest RTT.
+///
+/// Peers with the lowest RTT could otherwise hold every slot without completing uploads.
+const MINED_RANDOM_INTERVAL: usize = 4;
 /// Allow the kernel send queue to drain after the framed block write completes.
 const BLOCK_WRITE_GRACE: Duration = Duration::from_millis(750);
 /// Peers that already have a block might never request it.
@@ -254,6 +258,9 @@ impl BlockGossipPeer {
 }
 
 /// Randomize relays and equal RTTs; prioritize configured sidecars within the cap.
+///
+/// Mined blocks follow RTT order, except that every [`MINED_RANDOM_INTERVAL`]th non-sidecar
+/// advertisement goes to a random remaining peer.
 pub(crate) fn order_peers(
     peers: Vec<BlockGossipPeer>,
     mined: bool,
@@ -274,7 +281,18 @@ pub(crate) fn order_peers(
         .collect();
     peers.shuffle(rng);
     peers.sort_by_key(|(sidecar, rtt, _)| (!sidecar, *rtt));
-    peers.into_iter().map(|(_, _, peer)| peer).collect()
+    let sidecars = peers.iter().take_while(|(sidecar, ..)| *sidecar).count();
+    let mut remaining = peers.split_off(sidecars);
+    let mut ordered: Vec<_> = peers.into_iter().map(|(_, _, peer)| peer).collect();
+    for position in 1..=remaining.len() {
+        let index = if mined && position % MINED_RANDOM_INTERVAL == 0 {
+            rng.gen_range(0..remaining.len())
+        } else {
+            0
+        };
+        ordered.push(remaining.remove(index).2);
+    }
+    ordered
 }
 
 #[cfg(test)]
@@ -555,12 +573,13 @@ mod tests {
         }
     }
 
-    #[test]
-    fn miners_use_rtt_and_relays_use_random_order() {
-        let registry = PeerRegistry::default();
-        let mut guards = Vec::new();
-        let peers: Vec<_> = [Some(80), Some(10), None, Some(30), Some(10)]
-            .into_iter()
+    /// Builds non-sidecar peers whose registry entries report `rtts` in milliseconds.
+    fn measured_peers(
+        registry: &PeerRegistry,
+        guards: &mut Vec<crate::peer_registry::PeerRegistryGuard>,
+        rtts: impl IntoIterator<Item = Option<u64>>,
+    ) -> Vec<BlockGossipPeer> {
+        rtts.into_iter()
             .enumerate()
             .map(|(i, millis)| {
                 let (mut peer, _receiver) = peer();
@@ -576,18 +595,57 @@ mod tests {
                 peer.registry = Some(updater);
                 peer
             })
-            .collect();
+            .collect()
+    }
+
+    #[test]
+    fn miners_use_rtt_and_relays_use_random_order() {
+        let registry = PeerRegistry::default();
+        let mut guards = Vec::new();
+        let peers = measured_peers(
+            &registry,
+            &mut guards,
+            [Some(80), Some(10), None, Some(30), Some(10)],
+        );
         let mined = order_peers(peers.clone(), true, &mut StdRng::seed_from_u64(9));
         let measured: Vec<_> = mined.iter().map(BlockGossipPeer::rtt).collect();
         assert_eq!(
-            measured,
-            [Some(10), Some(10), Some(30), Some(80), None]
-                .map(|value| value.map(Duration::from_millis))
+            measured[..3],
+            [Some(10), Some(10), Some(30)].map(|value| value.map(Duration::from_millis))
         );
+        // The fourth advertisement goes to a random remaining peer.
+        let mut rest = measured[3..].to_vec();
+        rest.sort();
+        assert_eq!(rest, [None, Some(Duration::from_millis(80))]);
         let relay = order_peers(peers, false, &mut StdRng::seed_from_u64(9));
         assert_ne!(
             relay.iter().map(BlockGossipPeer::rtt).collect::<Vec<_>>(),
             measured
+        );
+    }
+
+    #[test]
+    fn low_rtt_peers_cannot_fill_the_first_mined_wave() {
+        let registry = PeerRegistry::default();
+        let mut guards = Vec::new();
+        let peers = measured_peers(&registry, &mut guards, (1..=100).map(Some));
+        let mined: Vec<_> = order_peers(peers, true, &mut StdRng::seed_from_u64(3))
+            .iter()
+            .map(|peer| peer.rtt().unwrap().as_millis())
+            .collect();
+        for (position, window) in mined.chunks(MINED_RANDOM_INTERVAL).enumerate() {
+            let rtt_ordered = &window[..window.len().min(MINED_RANDOM_INTERVAL - 1)];
+            assert!(
+                rtt_ordered.is_sorted(),
+                "RTT order outside random slots in chunk {position}"
+            );
+        }
+        let first_wave = &mined[..BLOCK_GOSSIP_CONCURRENCY];
+        assert!(
+            first_wave
+                .iter()
+                .any(|rtt| *rtt > BLOCK_GOSSIP_CONCURRENCY as u128),
+            "a random slot reaches beyond the lowest-RTT peers: {first_wave:?}"
         );
     }
 }

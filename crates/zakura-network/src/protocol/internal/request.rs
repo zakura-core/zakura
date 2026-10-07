@@ -268,6 +268,7 @@ pub enum Request {
     AdvertiseBlockToAll(block::Hash),
 
     /// Advertise a locally mined block, prioritizing measured heartbeat RTT.
+    /// Every fourth advertisement goes to a random remaining peer instead.
     /// Legacy gossip holds a bounded number of slots through block uploads.
     /// Native gossip uses its existing broadcast policy.
     AdvertiseMinedBlock(block::Hash),

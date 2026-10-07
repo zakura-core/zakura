@@ -538,6 +538,42 @@ async function loadBlockEvents(hash) {
   }
   if (selectedBlock === hash && $("block-dialog").open) renderBlockDetail(hash);
 }
+function renderWaterfall(timelines) {
+  const run = timelines?.at(-1);
+  if (!run) return "";
+  const spans = run.spans.slice(-24);
+  const points = run.points.slice(0, 8);
+  const width = 760, left = 270, plotWidth = 330;
+  const extent = Math.max(run.extent_ms, 0.001);
+  const x = (value) => left + value / extent * plotWidth;
+  const rows = [];
+  const axisY = 22;
+  for (let i = 0; i <= 4; i++) {
+    const value = extent * i / 4;
+    rows.push(`<text x="${x(value)}" y="${axisY}" text-anchor="middle" class="waterfall-axis">${esc(ms(value))}</text>`);
+  }
+  let y = 50;
+  for (const point of points) {
+    rows.push(`<text x="0" y="${y + 4}">${esc(point.label)}</text><circle cx="${x(point.offset_ms)}" cy="${y}" r="3" class="waterfall-point"><title>${esc(point.label)} · +${esc(ms(point.offset_ms))}</title></circle>`);
+    y += 24;
+  }
+  for (const span of spans) {
+    const failed = ["failed", "rejected", "timed_out", "unavailable"].includes(span.outcome);
+    const info = `${span.label}: ${span.complete ? ms(span.duration_ms) : "Missing or inconsistent boundary"}${span.outcome ? " · " + span.outcome : ""}`;
+    rows.push(`<text x="0" y="${y + 4}">${esc(span.label)}<title>${esc(info)}</title></text>`);
+    if (span.complete) {
+      rows.push(`<rect x="${x(span.start_ms)}" y="${y - 6}" width="${Math.max(1, x(span.end_ms) - x(span.start_ms))}" height="12" rx="2" class="waterfall-bar${failed ? " failed" : ""}"><title>${esc(info)} · start +${esc(ms(span.start_ms))}</title></rect>`);
+    } else {
+      const boundary = valid(span.start_ms) ? span.start_ms : span.end_ms;
+      if (valid(boundary)) rows.push(`<circle cx="${x(boundary)}" cy="${y}" r="4" class="waterfall-incomplete"><title>${esc(info)}</title></circle>`);
+    }
+    rows.push(`<text x="620" y="${y + 4}" class="waterfall-axis">${esc(span.complete ? ms(span.duration_ms) : "Incomplete")}</text>`);
+    y += 24;
+  }
+  return `<h3>Measured block waterfall</h3><div class="waterfall"><svg viewBox="0 0 ${width} ${y}" role="img" aria-label="Measured block stages on a shared elapsed time axis">${rows.join("")}</svg></div>
+    <p>Elapsed time from the first recorded event in the latest node run, ${clock(run.origin_at, true)} UTC. Overlapping rows run within the same interval and must not be added. Open circles mark incomplete spans. Up to 8 arrival markers and 24 spans are shown.</p>`;
+}
+
 function renderBlockEvents() {
   const events = blockEvents;
   if (!events) return "<p>Loading measured block events…</p>";
@@ -585,7 +621,7 @@ function renderBlockEvents() {
     <table><thead><tr><th>Stage</th><th>Started · UTC</th><th>Duration</th><th>Outcome</th></tr></thead>
     <tbody>${stages.map((row) => `<tr><td>${esc(row.stage.replaceAll("_", " "))}</td><td>${valid(row.started_at) ? clock(row.started_at, true) : "—"}</td><td>${ms(row.duration_ms)}</td><td>${row.complete ? (row.success ? "Succeeded" : "Failed") : "Incomplete"}</td></tr>`).join("")}</tbody></table>
     <p>Each row is one stage occurrence. Contextual validation includes the stages beneath it. Do not add overlapping durations. Showing up to 24 retained occurrences, including retries.</p>` : "";
-  return `${arrival}${stageRows}${events.attempts.length ? "<h3>Measured processing attempts</h3>" : ""}${events.attempts
+  return `${renderWaterfall(events.timeline)}${arrival}${stageRows}${events.attempts.length ? "<h3>Measured processing attempts</h3>" : ""}${events.attempts
     .slice(-3)
     .map(
       (attempt) =>

@@ -409,3 +409,11 @@ The incremental node build is running as `zakura-dashboard-build-v2.service` at
 Do not modify the remote checkout until that unit reaches a terminal state.
 The receiver now drains at most 256 ready datagrams per SQLite transaction to
 reduce write pressure during crypto and relay bursts.
+
+Block detail now renders a measured waterfall on one monotonic time axis per node
+run. Arrival markers, driver attempts, state-stage occurrences, and local relay
+calls retain separate identities. Missing or backwards boundaries render as
+incomplete, never as invented spans. Nested rows overlap. The SVG shows at most
+8 arrival markers and 24 spans from the latest retained run. Fine-grained
+consensus, writer queue, storage, and native header announcement hooks remain
+pending, alongside live validation.

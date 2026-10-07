@@ -314,7 +314,7 @@ class EventFeed:
             events.append(event)
             if event["kind"] in APPLY_EVENTS:
                 attempts.ingest(event, received)
-        return {"attempts": attempts.block(block_hash, now), "arrival": arrival_summary(events), "stages": stage_summary(events),
+        return {"attempts": attempts.block(block_hash, now), "arrival": arrival_summary(events), "stages": stage_summary(events), "timeline": block_timeline(events),
                 "status": self.status(), "limited": len(rows) == 192}
 
     def native(self, now):
@@ -436,3 +436,63 @@ def stage_summary(events):
                        "success": end["success"] if valid else None,
                        "complete": valid})
     return stages
+
+
+def block_timeline(events):
+    """Render observed boundaries on one monotonic axis per node run.
+
+    Driver, stage, and relay IDs live in separate namespaces. No nearest-event
+    matching or inferred stage ownership is used, even when attempts overlap.
+    """
+    runs = OrderedDict()
+    for event in events:
+        runs.setdefault(event["process"], []).append(event)
+    output = []
+    for rows in runs.values():
+        rows.sort(key=lambda row: (row["monotonic_ns"], row["sequence"]))
+        origin = rows[0]["monotonic_ns"]
+        identities = {}
+        points = []
+        for row in rows:
+            kind = row["kind"]
+            if kind in APPLY_EVENTS:
+                key = ("driver", row["attempt"])
+            elif kind in STAGE_EVENTS:
+                key = ("stage", row["stage_token"], row["stage"])
+            elif kind in ("block_relay_started", "block_relay_finished"):
+                key = ("relay", row["relay_attempt"])
+            else:
+                if kind in ("block_inventory_received", "block_body_received"):
+                    points.append({"label": ("Inventory" if kind == "block_inventory_received" else "Complete body") + " · " + row["transport"],
+                                   "offset_ms": (row["monotonic_ns"] - origin) / 1e6})
+                continue
+            identities.setdefault(key, {}).setdefault(kind, row)
+        spans = []
+        def append(label, first, last, outcome=None):
+            if first is None and last is None:
+                return
+            complete = first is not None and last is not None and last["monotonic_ns"] >= first["monotonic_ns"]
+            spans.append({"label": label,
+                          "start_ms": (first["monotonic_ns"] - origin) / 1e6 if first else None,
+                          "end_ms": (last["monotonic_ns"] - origin) / 1e6 if last else None,
+                          "duration_ms": (last["monotonic_ns"] - first["monotonic_ns"]) / 1e6 if complete else None,
+                          "complete": complete, "outcome": outcome if complete else "incomplete"})
+        for identity, boundaries in identities.items():
+            category, token, *_ = identity
+            if category == "driver":
+                append(f"Submit queue · attempt {token}", boundaries.get("block_submit_queued"), boundaries.get("commit_start"))
+                end = boundaries.get("commit_finish")
+                append(f"Verify + commit · attempt {token}", boundaries.get("commit_start"), end, end["result"] if end else None)
+            elif category == "stage":
+                end = boundaries.get("block_stage_finished")
+                append(identity[2].replace("_", " "), boundaries.get("block_stage_started"), end,
+                       ("succeeded" if end["success"] else "failed") if end else None)
+            else:
+                end = boundaries.get("block_relay_finished")
+                append(f"Local relay · call {token}", boundaries.get("block_relay_started"), end,
+                       ("succeeded" if end["succeeded"] else "failed") if end else None)
+        spans.sort(key=lambda span: span["start_ms"] if span["start_ms"] is not None else span["end_ms"])
+        output.append({"origin_at": rows[0]["unix_ms"] / 1000,
+                       "extent_ms": (rows[-1]["monotonic_ns"] - origin) / 1e6,
+                       "spans": spans, "points": points})
+    return output

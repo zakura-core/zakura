@@ -254,3 +254,30 @@ class StageTests(unittest.TestCase):
         self.assertTrue(all(not row["complete"] for row in rows))
         self.assertIsNone(self.stage("block_stage_started", 2, name="unknown"))
         self.assertIsNone(self.stage("block_stage_started", 2, token=True))
+
+
+class WaterfallTests(unittest.TestCase):
+    def test_shared_axis_preserves_overlap_and_separate_id_namespaces(self):
+        rows = [event("block_submit_queued", 1_000_000),
+                event("commit_start", 3_000_000), event("commit_finish", 10_000_000),
+                StageTests.stage("block_stage_started", 4),
+                StageTests.stage("block_stage_finished", 8)]
+        for kind, timestamp in (("block_relay_started", 9_000_000), ("block_relay_finished", 12_000_000)):
+            rows.append({"process": "1-123", "hash": "a" * 64, "kind": kind,
+                         "monotonic_ns": timestamp, "unix_ms": 123, "sequence": timestamp,
+                         "relay_attempt": 1, "succeeded": True})
+        run = n.block_timeline(list(reversed(rows)))[0]
+        spans = run["spans"]
+        self.assertEqual(run["extent_ms"], 11)
+        self.assertEqual([(s["start_ms"], s["end_ms"], s["duration_ms"]) for s in spans],
+                         [(0, 2, 2), (2, 9, 7), (3, 7, 4), (8, 11, 3)])
+        self.assertEqual(spans[2]["outcome"], "failed")
+        self.assertEqual(spans[3]["outcome"], "succeeded")
+
+    def test_missing_backwards_and_restart_boundaries_stay_incomplete(self):
+        rows = [event("commit_start", 9), event("commit_finish", 3),
+                event("commit_finish", 20, process="2-456")]
+        runs = n.block_timeline(rows)
+        self.assertEqual(len(runs), 2)
+        self.assertTrue(all(not span["complete"] for run in runs for span in run["spans"]))
+        self.assertTrue(all(span["duration_ms"] is None for run in runs for span in run["spans"]))

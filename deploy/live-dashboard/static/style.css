@@ -1250,3 +1250,11 @@ dialog p {
 .stage-history .chart {
   height: 240px;
 }
+
+.waterfall { overflow-x: auto; margin: 12px 0; }
+.waterfall svg { display: block; width: 100%; min-width: 700px; }
+.waterfall text { fill: #d9e6ed; font: 10px ui-monospace, monospace; }
+.waterfall .waterfall-axis { fill: #8096a3; }
+.waterfall-bar, .waterfall-point { fill: #bcf6b8; }
+.waterfall-bar.failed { fill: #f1bf75; }
+.waterfall-incomplete { fill: none; stroke: #f1bf75; stroke-width: 1.5; }

@@ -637,7 +637,7 @@ function renderBlockEvents() {
           `${fmt(row.relay_successes)} / ${fmt(row.relay_failures)}`,
         ]);
       return entries.length
-        ? `<h3>Arrival and relay · latest observed node run</h3><dl class="stat-list detail-stats">${entries.map(([key, val]) => `<div><dt>${esc(key)}</dt><dd>${esc(val)}</dd></div>`).join("")}</dl><p>Inventory-to-body includes scheduling and fetching. Request timing includes the local send queue and earlier bodies in the same range. It is unavailable for unsolicited bodies or transports without a matching request measurement. Relay success means the local broadcast service completed, not that every peer received it.</p>`
+        ? `<h3>Arrival and relay · latest observed node run</h3><dl class="stat-list detail-stats">${entries.map(([key, val]) => `<div><dt>${esc(key)}</dt><dd>${esc(val)}</dd></div>`).join("")}</dl><p>Inventory-to-body includes scheduling and fetching. Request timing includes local readiness waits, fallback attempts, and other bodies in the same batch or range. It is unavailable for unsolicited bodies or transports without a matching request measurement. Relay success means the local broadcast service completed, not that every peer received it.</p>`
         : "";
     })
     .join("");

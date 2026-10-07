@@ -1934,12 +1934,14 @@ where
         let trace = self.trace.clone();
 
         Box::pin(async move {
+            let request_started = std::time::Instant::now();
             let record_source = |response, source| {
                 record_block_response_source(
                     &trace,
                     response,
                     source,
                     requested_block_hashes.as_ref(),
+                    request_started.elapsed(),
                 )
             };
 
@@ -2021,6 +2023,7 @@ fn record_block_response_source(
     response: Response,
     source: BlockBodySource,
     requested_hashes: Option<&IndexSet<block::Hash>>,
+    request_elapsed: Duration,
 ) -> Response {
     if let (Response::Blocks(blocks), Some(requested_hashes)) = (&response, requested_hashes) {
         for block in blocks {
@@ -2028,7 +2031,7 @@ fn record_block_response_source(
                 InventoryResponse::Available((block, _))
                     if requested_hashes.contains(&block.hash()) =>
                 {
-                    trace.record_block_body_received(block.hash(), source, None);
+                    trace.record_block_body_received(block.hash(), source, Some(request_elapsed));
                 }
                 _ => {}
             }
@@ -6113,6 +6116,7 @@ mod tests {
             Response::Blocks(vec![InventoryResponse::Available((block, None))]),
             BlockBodySource::Legacy,
             Some(&requested_hashes),
+            Duration::from_millis(25),
         );
 
         assert_eq!(trace.first_block_body_source(received_hash), None);

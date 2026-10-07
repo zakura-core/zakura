@@ -514,3 +514,9 @@ Live socket-activation restart verification on 2026-10-07 kept the node failure
 counter unchanged at 653 and received 19 new valid events after restart. Earlier
 migration failures remain visible. Deployment now also checks socket-path access
 under the node service's user and supplementary group before reporting success.
+
+Dual-stack block fetches now measure elapsed time from the outbound request task
+starting until its matching response returns. This includes service readiness,
+any transport fallback, and waiting for other bodies in the response batch. It is
+not a peer RTT or a per-body wire transfer time. Only explicitly requested hashes
+receive this measurement. Unsolicited bodies keep an unknown request duration.

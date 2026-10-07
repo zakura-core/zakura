@@ -20,19 +20,27 @@ struct RecordingWriter {
     flushed: Option<Sender<()>>,
 }
 
+// Test coordination failures must panic: the logger discards output errors.
+#[allow(clippy::unwrap_in_result)]
 impl Write for RecordingWriter {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         if std::mem::take(&mut self.fail_first_write) {
             return Err(io::Error::other("injected write failure"));
         }
-        let mut recorded = self.recorded.lock().unwrap();
+        let mut recorded = self
+            .recorded
+            .lock()
+            .expect("the recording writer only locks state in non-panicking code");
         recorded.bytes.extend_from_slice(bytes);
         recorded.thread = Some(thread::current().id());
         Ok(bytes.len())
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        self.recorded.lock().unwrap().flushes += 1;
+        self.recorded
+            .lock()
+            .expect("the recording writer only locks state in non-panicking code")
+            .flushes += 1;
         if let Some(flushed) = &self.flushed {
             let _ = flushed.try_send(());
         }
@@ -56,10 +64,15 @@ struct BlockedWriter {
     release: Receiver<()>,
 }
 
+#[allow(clippy::unwrap_in_result)]
 impl Write for BlockedWriter {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        self.entered.try_send(()).unwrap();
-        self.release.recv_timeout(TEST_TIMEOUT).unwrap();
+        self.entered
+            .try_send(())
+            .expect("each test makes at most two writes into a two-slot notification queue");
+        self.release
+            .recv_timeout(TEST_TIMEOUT)
+            .expect("the test releases each write before its watchdog timeout");
         self.inner.write(bytes)
     }
 
@@ -111,8 +124,10 @@ fn queued_logs_are_written_in_order_and_flushed_on_shutdown() {
 fn an_idle_worker_flushes_before_shutdown() {
     let (flushed, completion) = bounded(1);
     let output = RecordingWriter {
+        recorded: Default::default(),
+        fail_first_write: false,
+        fail_flush: false,
         flushed: Some(flushed),
-        ..Default::default()
     };
     let recorded = output.recorded.clone();
     let (mut writer, _guard) = non_blocking(output, 1).unwrap();
@@ -159,9 +174,10 @@ fn writes_after_worker_shutdown_are_lossy_and_successful() {
 #[test]
 fn output_errors_do_not_prevent_later_writes_or_shutdown() {
     let output = RecordingWriter {
+        recorded: Default::default(),
         fail_first_write: true,
         fail_flush: true,
-        ..Default::default()
+        flushed: None,
     };
     let recorded = output.recorded.clone();
     let (mut writer, guard) = non_blocking(output, 10).unwrap();

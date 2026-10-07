@@ -390,6 +390,32 @@ pub(crate) fn select_vct_auxiliary_delivery(deliveries: Vec<AuxDelivery>) -> Opt
         .min_by_key(vct_auxiliary_delivery_rank)
 }
 
+/// Returns whether an ambiguous boundary repair can retain a new payload at both headers.
+///
+/// A full bucket replaces one of its own unauthenticated rows. Each other header needs an
+/// aggregate slot, and `auxiliary_repair_capacity` reports the same shared slots for every such
+/// header, so the slots must cover all of them together.
+fn ambiguous_repair_capacity_suffices(
+    engine: &HeaderChainEngine,
+    targets: [block::Hash; 2],
+    limits: zakura_header_chain::EngineLimits,
+) -> bool {
+    let mut needed_slots = 0;
+    let mut shared_slots = usize::MAX;
+    for target in targets {
+        let capacity = engine.auxiliary_repair_capacity(target, limits);
+        if engine.aux_deliveries(target).len() >= limits.max_aux_deliveries_per_header.get() {
+            if capacity == 0 {
+                return false;
+            }
+        } else {
+            needed_slots += 1;
+            shared_slots = capacity;
+        }
+    }
+    shared_slots >= needed_slots
+}
+
 /// Returns every usable VCT auxiliary delivery for a retained header in selection order.
 pub(crate) fn ranked_vct_auxiliary_deliveries(deliveries: Vec<AuxDelivery>) -> Vec<AuxDelivery> {
     let mut usable: Vec<_> = deliveries
@@ -1953,7 +1979,11 @@ impl HeaderChainReader {
             ))
             .map(|index| selected.get(index.saturating_add(1)).map(|next| next.hash))?;
         let successor_capacity_available = context.admission_capacity_available
-            && engine.auxiliary_repair_capacity(successor_hash, self.config.limits) > 0;
+            && ambiguous_repair_capacity_suffices(
+                engine,
+                [context.target.hash, successor_hash],
+                self.config.limits,
+            );
         Ok(context.clone().extend_ambiguous_boundary(
             successor,
             terminal_boundary_hash,
@@ -3184,18 +3214,19 @@ impl HeaderChainRuntime {
                     current = ambiguous_context;
                     ambiguous_repair = true;
                 }
-                // Each ambiguous header can replace its own unauthenticated input, while an empty
-                // range shares the aggregate slots.
-                let capacity_suffices = if ambiguous_repair {
-                    repair_range.iter().all(|target| {
+                // An ambiguous repair may add a new payload at both headers. An empty range shares
+                // the aggregate slots across its headers.
+                let capacity_suffices = match (ambiguous_repair, repair_range.as_slice()) {
+                    (true, [target, successor]) => ambiguous_repair_capacity_suffices(
+                        &transition_engine,
+                        [target.hash, successor.hash],
+                        context.config.limits,
+                    ),
+                    _ => {
                         transition_engine
-                            .auxiliary_repair_capacity(target.hash, context.config.limits)
-                            > 0
-                    })
-                } else {
-                    transition_engine
-                        .auxiliary_repair_capacity(first_target.hash, context.config.limits)
-                        >= repair_range.len()
+                            .auxiliary_repair_capacity(first_target.hash, context.config.limits)
+                            >= repair_range.len()
+                    }
                 };
                 if !capacity_suffices {
                     return Err(TransitionFailure::AuxiliaryLimitExceeded.into());

@@ -1009,6 +1009,49 @@ fn crossed_ambiguous_disputes_still_authenticate_the_honest_pair() {
 }
 
 #[test]
+fn advertised_ambiguous_capacity_retains_a_new_payload_at_both_headers() {
+    let _init_guard = zakura_test::init();
+    // Neither bucket is full, so both headers draw on the same aggregate slots. State must not
+    // advertise the repair until those slots cover a new payload at each header.
+    let bad = Height(BODY_TIP + 4);
+    let predecessor = Height(bad.0 - 1);
+    let mut fixture = Fixture::new();
+    fixture.insert_headers(None, Some((bad, Corruption::AuthDataRoot)));
+    let mut sweeper = VctAuthenticationSweeper::default();
+    fixture.sweep(&mut sweeper);
+    let snapshot = fixture.writer.runtime.publisher().snapshot();
+    let repair_owner = zakura_header_chain::BodyWorkAuthority::for_snapshot(&snapshot)
+        .bind(1, NonZeroU64::new(1).expect("one is nonzero"));
+    let total = (1..=64)
+        .find(|&total| {
+            fixture
+                .writer
+                .runtime
+                .set_auxiliary_limits_for_test(32, total);
+            fixture
+                .writer
+                .runtime
+                .reader()
+                .vct_repair_context(repair_owner, predecessor)
+                .expect("the repair context is coherent")
+                .expect("the repair target remains selected")
+                .admission_capacity_available
+        })
+        .expect("some aggregate limit admits the repair");
+    fixture.writer.config.limits.max_aux_deliveries_total =
+        NonZeroUsize::new(total).expect("the limit is nonzero");
+
+    assert!(matches!(
+        fixture.try_redeliver(
+            predecessor,
+            Some((predecessor, Corruption::SaplingRoot)),
+            0x77
+        ),
+        ApplyResult::Committed
+    ));
+}
+
+#[test]
 fn an_ambiguous_repair_replaces_input_in_full_buckets() {
     let _init_guard = zakura_test::init();
     // Each disputed header fills a one-row bucket, so each can only replace its own row. The

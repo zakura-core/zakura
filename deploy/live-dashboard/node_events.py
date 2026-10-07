@@ -350,13 +350,20 @@ class EventFeed:
         self.thread.start()
 
     def run(self):
+        import select
         import socket
         import time
         while not self.stop.is_set():
             try:
                 # Reading one byte beyond the cap detects truncated oversized packets.
-                data = self.socket.recv(MAX_EVENT_BYTES + 1)
-                self.ingest([data], time.time())
+                datagrams = [self.socket.recv(MAX_EVENT_BYTES + 1)]
+                # Drain a bounded burst into one SQLite transaction. This socket
+                # has a single reader, so readiness cannot be consumed elsewhere.
+                for _ in range(255):
+                    if not select.select([self.socket], [], [], 0)[0]:
+                        break
+                    datagrams.append(self.socket.recv(MAX_EVENT_BYTES + 1))
+                self.ingest(datagrams, time.time())
             except socket.timeout:
                 pass
             except Exception:

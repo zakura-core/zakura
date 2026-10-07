@@ -199,6 +199,16 @@
               </div>
             </section>
           </div>
+          <section id="transaction-lifecycle" class="panel" hidden>
+            <div class="panel-heading"><h2>Observed transaction lifecycle</h2><span data-period class="panel-note">Observed in 15m</span></div>
+            <div id="lifecycle-counts" class="flow"></div>
+            <div id="lifecycle-reasons"></div>
+            <div class="grid two">
+              <section id="lifecycle-body"><h3>Queue → body ready</h3><div id="lifecycle-body-chart" class="chart short" role="img" aria-label="Individual transaction queue to body durations"></div></section>
+              <section id="lifecycle-verify"><h3>Verification</h3><div id="lifecycle-verify-chart" class="chart short" role="img" aria-label="Individual transaction verification durations"></div></section>
+            </div>
+            <p id="lifecycle-coverage" class="panel-bottom"></p>
+          </section>
           <section class="panel flow-panel">
             <div class="panel-heading">
               <div>

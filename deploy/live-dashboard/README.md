@@ -319,15 +319,15 @@ boundaries are in development. The driver's `commit_start` currently wraps both
 verification and state commit, so it must not be labeled disk-write latency.
 `node_events.py` now validates and allowlists datagrams and joins bounded block
 attempts using process/hash/apply-token identity, tested for out-of-order events,
-missing boundaries, retries, restarts, duplicates, and retention. Socket receiver
-integration, persistence, remaining hooks, dashboards, and live validation are pending.
+missing boundaries, retries, restarts, duplicates, and retention. The receiver,
+persistence, and initial panels are implemented. Remaining hooks and live
+validation are pending.
 
-The first Linux build is running on `codex-vast-tide-7164` as
-`zakura-dashboard-build.service` from `/root/workspace/zakura` at `cf102b473`.
-Check the unit and journal before changing that checkout or starting another build.
-It is limited to three build jobs, 300% CPU, 10 GiB memory, and nice 10. Nothing
-from this build has been installed or enabled in the running node. The existing
-node process is still 37210. Do not treat a compiled binary as a completed rollout.
+The first Linux build at `cf102b473` completed successfully. The incremental build
+is `zakura-dashboard-build-v2.service` at `d6af0101b` in `/root/workspace/zakura`.
+Check that unit and journal before changing the checkout or starting another build.
+It is limited to three jobs, 300% CPU, 10 GiB memory, and nice 10. No custom build
+has been installed in the running node yet. Do not treat compilation as rollout.
 
 Receiver integration now adds `/api/block/<hash>` using only sanitized cached
 events in the dashboard SQLite database. It keeps at most 49,152 records for
@@ -395,8 +395,17 @@ before their durations can safely be shown. Counters include repeated attempts.
 
 The receiver retains at most 65,536 transaction events for 24 hours and summarizes
 at most 8,192 recent events per request, exposing limited coverage explicitly.
-Transaction panels and live validation are still pending.
+The transaction panel shows observed stages and bounded rejection reasons. Body
+and verification timing charts require explicit matching task IDs. The panel stays
+hidden until selected-period events exist. Live validation is still pending.
 
 The initial `cf102b473` Linux build completed successfully at 21:14 UTC on October 7.
 Its service is inactive with exit status 0. The remote checkout can now be advanced
 for the incremental build; the running node remains the original binary.
+
+
+The incremental node build is running as `zakura-dashboard-build-v2.service` at
+`d6af0101b`, using the existing release cache and the same CPU/memory limits.
+Do not modify the remote checkout until that unit reaches a terminal state.
+The receiver now drains at most 256 ready datagrams per SQLite transaction to
+reduce write pressure during crypto and relay bursts.

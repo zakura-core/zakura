@@ -22,6 +22,7 @@ const COLORS = ["#bcf6b8", "#c1b6ef", "#f1bf75"];
 let state = null;
 let history = [];
 let cryptoBatches = null;
+let transactionEvents = null;
 let range = "15m";
 let paused = false;
 let fetching = false;
@@ -211,6 +212,7 @@ function render() {
   renderNetwork();
   renderSystem(h);
   renderStatus();
+  renderLifecycle();
   renderCharts();
   if (selectedBlock && $("block-dialog").open) renderBlockDetail(selectedBlock);
   $("source-details").innerHTML =
@@ -629,6 +631,28 @@ function chart(id, keys, format, points = false, rows = history) {
   charts.get(id).update(rows, end - WINDOWS[range], end);
 }
 
+function renderLifecycle() {
+  const data = transactionEvents;
+  const active = data && Object.values(data.counts).some((count) => count > 0);
+  $("transaction-lifecycle").hidden = !active;
+  if (!active) return;
+  const labels = { queued: "Queued", received: "Body ready", verified: "Verified",
+    admitted: "Admitted", relay_succeeded: "Local relay succeeded", relay_failed: "Local relay failed",
+    mined: "Mined", expired: "Expired", evicted: "Evicted", rejected: "Rejected" };
+  $("lifecycle-counts").innerHTML = Object.entries(labels)
+    .filter(([key]) => data.counts[key] > 0)
+    .map(([key, label]) => `<div><span class="legend">${label}</span><strong>${fmt(data.counts[key])}</strong></div>`).join("");
+  $("lifecycle-reasons").innerHTML = Object.keys(data.reasons).length
+    ? `<h3>Recorded rejection and removal reasons</h3><dl class="stat-list">${Object.entries(data.reasons)
+      .sort((a, b) => b[1] - a[1]).map(([reason, count]) => `<div><dt>${esc(reason.replaceAll("_", " "))}</dt><dd>${fmt(count)}</dd></div>`).join("")}</dl>` : "";
+  for (const [id, metric] of [["body", "body_wait_ms"], ["verify", "verification_ms"]]) {
+    const rows = data.timings.filter((row) => row.metric === metric).map((row) => ({t: row.t, [metric]: row.value}));
+    $(`lifecycle-${id}`).hidden = !rows.length;
+    if (rows.length) chart(`lifecycle-${id}-chart`, [metric], ms, true, rows);
+  }
+  set("lifecycle-coverage", `Counts are recorded events in the selected period and include repeated attempts. Durations require both boundaries from the same task. Queue-to-body includes local checks and fetching. Verification includes service queueing. Local relay success does not prove peer receipt.${data.limited ? " History is limited; displayed counts may be incomplete." : ""}`);
+}
+
 function renderCharts() {
   const stages = [
     "Submit queue",
@@ -751,6 +775,7 @@ async function loadHistory() {
   if (request === historyRequest && requested === range) {
     history = data.samples;
     cryptoBatches = data.crypto || null;
+    transactionEvents = data.transactions || null;
     period = data.activity;
     periodBlocks = data.blocks;
     lastHistory = Date.now();

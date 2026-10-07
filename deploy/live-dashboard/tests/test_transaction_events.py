@@ -49,3 +49,12 @@ class TransactionTests(unittest.TestCase):
             self.assertNotIn("secret", json.dumps(summary))
         finally:
             feed.close()
+
+
+    def test_different_attempt_cannot_complete_an_old_boundary(self):
+        first = event("verification_started", 1)
+        other = event("verified", 8)
+        other["attempt"] = 2
+        self.assertEqual(summarize_transactions([first, other], 0, 10)["timings"], [])
+        other["attempt"] = None
+        self.assertEqual(summarize_transactions([first, other], 0, 10)["timings"], [])

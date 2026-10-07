@@ -696,6 +696,7 @@ function renderLifecycle() {
   const data = transactionEvents;
   const active = data && Object.values(data.counts).some((count) => count > 0);
   $("transaction-lifecycle").hidden = !active;
+  $("transaction-flow").closest(".panel").hidden = Boolean(active);
   if (!active) return;
   const labels = { queued: "Queued", received: "Body ready", verified: "Verified",
     admitted: "Admitted", relay_succeeded: "Local relay succeeded", relay_failed: "Local relay failed",

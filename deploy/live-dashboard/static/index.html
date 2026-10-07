@@ -750,11 +750,10 @@
         </dd>
         <dt>Processing timings</dt>
         <dd>
-          Each stage keeps its latest non-empty p50 and p95 summary for up to 24
-          hours, including across dashboard restarts. “Seen” is its scrape time,
-          not a block's finish time. Rows may describe different windows and
-          overlap or run in parallel. They cannot be added together. Live queues
-          and chart history never substitute these saved readings.
+          Stage charts show sampled rolling p50 and p95 summaries over the
+          selected period. Each chart has its own duration scale. These are not
+          individual block timings. Stages can overlap or run in parallel, so
+          they cannot be added together. Missing observations remain gaps.
         </dd>
         <dt>Networking</dt>
         <dd>

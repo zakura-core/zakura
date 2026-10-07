@@ -404,7 +404,7 @@ mempool_failed_verify_tasks_total{reason="private-secret"} 6
                 self.assertEqual(error.exception.code, code)
                 error.exception.close()
             with urllib.request.urlopen(url + "/") as response:
-                self.assertIn(b"Block pipeline", response.read())
+                self.assertIn(b"Processing timings", response.read())
             now = time.time()
             blocks = [d.block_public(block(i)) for i in range(1, 5)]
             for item, at, canonical in zip(blocks, (now - 60, now - 901, now + 5, now - 30), (True, True, True, False)):

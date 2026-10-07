@@ -1111,6 +1111,19 @@ impl HeaderSyncReactor {
             return;
         }
         if let Some(state) = self.peer_state.get_mut(&peer) {
+            if state
+                .last_status
+                .as_ref()
+                .map(|previous| previous.selected_tip_hash)
+                != Some(status.selected_tip_hash)
+            {
+                zakura_jsonl_trace::dashboard::emit(|| {
+                    serde_json::json!({
+                        "event": "block_inventory_received",
+                        "hash": status.selected_tip_hash.to_string(), "transport": "zakura",
+                    })
+                });
+            }
             state.last_status = Some(status.clone());
         }
         if let Some(task) = self.vct_repair.current_mut() {

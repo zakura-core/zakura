@@ -492,3 +492,8 @@ writer dequeue. A failed send finishes with failure, while shutdown before deque
 leaves an incomplete span. Finalized RocksDB writes are attached to the hash being
 finalized, which can be older than the current tip. They are not attributed to the
 new tip block merely because they occur during its processing.
+
+Native header-sync status changes record the advertised selected-tip hash as a
+block announcement. Repeated identical status messages from the same session do
+not create more events. This records a peer's claim, not a verified header or
+block body, and shares the announcement timeline with legacy inventory messages.

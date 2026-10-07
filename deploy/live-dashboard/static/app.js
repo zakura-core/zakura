@@ -704,10 +704,12 @@ function renderLifecycle() {
   $("lifecycle-reasons").innerHTML = Object.keys(data.reasons).length
     ? `<h3>Recorded rejection and removal reasons</h3><dl class="stat-list">${Object.entries(data.reasons)
       .sort((a, b) => b[1] - a[1]).map(([reason, count]) => `<div><dt>${esc(reason.replaceAll("_", " "))}</dt><dd>${fmt(count)}</dd></div>`).join("")}</dl>` : "";
-  for (const [id, metric] of [["body", "body_wait_ms"], ["verify", "verification_ms"], ["relay", "relay_ms"]]) {
-    const rows = data.timings.filter((row) => row.metric === metric).map((row) => ({t: row.t, [metric]: row.value}));
+  for (const [id, metric] of [["body", "body_wait_ms"], ["verify", "verification_ms"], ["relay", "relay_ms"], ["admission", "admission_ms"], ["residence", "residence_ms"]]) {
+    const samples = data.timings.filter((row) => row.metric === metric);
+    const keys = id === "residence" ? ["mined_ms", "expired_ms", "evicted_ms"] : [metric];
+    const rows = samples.map((row) => ({t: row.t, [id === "residence" ? `${row.outcome}_ms` : metric]: row.value}));
     $(`lifecycle-${id}`).hidden = !rows.length;
-    if (rows.length) chart(`lifecycle-${id}-chart`, [metric], ms, true, rows);
+    if (rows.length) chart(`lifecycle-${id}-chart`, keys, ms, true, rows);
   }
   set("lifecycle-coverage", `Counts are recorded events in the selected period and include repeated attempts. Durations require both boundaries from the same task. Queue-to-body includes local checks and fetching. Verification includes service queueing. Local relay success does not prove peer receipt.${data.limited ? " History is limited; displayed counts may be incomplete." : ""}`);
 }

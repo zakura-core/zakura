@@ -478,3 +478,11 @@ call. Durations require the same node run, transaction token, and occurrence ID.
 Both success and failure are measured. Older uncorrelated events remain counts
 only. The interval starts after network readiness and ends when the local
 broadcast call returns, so it does not measure peer receipt or readiness wait.
+
+Admission checks and mempool residence use a storage-owned occurrence ID. The
+storage retains IDs only while the corresponding verified transactions remain
+present and discards them on clear or removal. Re-admission creates a new ID.
+Residence ends at observed mining, expiry, or eviction, with separate outcomes.
+Descendants removed with a mined or expired ancestor count as evicted rather
+than being incorrectly labeled as themselves mined or expired. Clearing storage
+without an observed outcome does not manufacture a residence duration.

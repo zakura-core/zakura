@@ -4,12 +4,12 @@ from collections import Counter
 import json
 import re
 
-PHASES = {"queued", "received", "verification_started", "verified", "admitted",
+PHASES = {"queued", "received", "verification_started", "verified", "admission_started", "admitted",
           "relay_started", "relay_succeeded", "relay_failed", "mined", "expired", "evicted", "rejected"}
 REASONS = {"already_mined", "state_unavailable", "download_failed", "cancelled", "policy",
            "verification", "timeout", "duplicate", "queue_full", "disabled", "capacity",
            "fee_below_capacity_floor", "conflicting_effects", "missing_output", "too_many_ancestors",
-           "package_limit", "expiry_height"}
+           "package_limit", "expiry_height", "ancestor_removed"}
 
 
 def parse_transaction_event(data):
@@ -49,7 +49,11 @@ def summarize_transactions(events, start, end):
     spans = {"received": ("queued", "body_wait_ms"),
              "verified": ("verification_started", "verification_ms"),
              "relay_succeeded": ("relay_started", "relay_ms"),
-             "relay_failed": ("relay_started", "relay_ms")}
+             "relay_failed": ("relay_started", "relay_ms"),
+             "admitted": ("admission_started", "admission_ms"),
+             "mined": ("admitted", "residence_ms"),
+             "expired": ("admitted", "residence_ms"),
+             "evicted": ("admitted", "residence_ms")}
     seen = set()
     for event in sorted(events, key=lambda row: (row["process"], row["monotonic_ns"], row["sequence"])):
         identity = (event["process"], event["sequence"])

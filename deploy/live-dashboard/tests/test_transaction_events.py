@@ -34,7 +34,7 @@ class TransactionTests(unittest.TestCase):
         self.assertEqual(summary["counts"]["verified"], 2)
         self.assertNotIn("received", summary["counts"])
         self.assertEqual([(r["metric"], r["value"]) for r in summary["timings"]],
-                         [("verification_ms", 5)])
+                         [("verification_ms", 5), ("residence_ms", 10)])
 
     def test_persistent_feed_and_rejection_reasons(self):
         feed = EventFeed(":memory:")
@@ -71,3 +71,20 @@ class TransactionTests(unittest.TestCase):
         start["attempt"] = None
         failed["attempt"] = None
         self.assertEqual(summarize_transactions([start, failed], 0, 10)["timings"], [])
+
+    def test_readmission_cannot_finish_previous_residence(self):
+        first = event("admitted", 1)
+        second_start = event("admission_started", 4)
+        second = event("admitted", 6)
+        mined = event("mined", 20)
+        for row in (second_start, second, mined):
+            row["attempt"] = 2
+        result = summarize_transactions([first, second_start, second, mined], 5, 21)
+        self.assertEqual([(x["metric"], x["value"]) for x in result["timings"]],
+                         [("admission_ms", 2), ("residence_ms", 14)])
+        mined["attempt"] = 3
+        result = summarize_transactions([first, mined], 0, 21)
+        self.assertEqual(result["timings"], [])
+        mined["attempt"] = None
+        first["attempt"] = None
+        self.assertEqual(summarize_transactions([first, mined], 0, 21)["timings"], [])

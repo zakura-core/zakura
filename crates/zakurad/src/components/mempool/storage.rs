@@ -217,6 +217,9 @@ pub struct Storage {
     /// The set of verified transactions in the mempool.
     verified: VerifiedSet,
 
+    /// Telemetry occurrence IDs retained only for currently admitted transactions.
+    observed_admissions: HashMap<UnminedTxId, u64>,
+
     /// The set of outpoints with pending requests for their associated transparent::Output.
     pub(super) pending_outputs: PendingOutputs,
 
@@ -290,6 +293,7 @@ impl Storage {
                 .max_datacarrier_bytes
                 .unwrap_or(config::DEFAULT_MAX_DATACARRIER_BYTES),
             verified: Default::default(),
+            observed_admissions: Default::default(),
             pending_outputs: Default::default(),
             tip_rejected_exact: Default::default(),
             tip_rejected_same_effects: Default::default(),
@@ -500,9 +504,16 @@ impl Storage {
         height: Option<Height>,
     ) -> (Result<UnminedTxId, MempoolError>, HashSet<UnminedTxId>) {
         let id = tx.transaction.id();
+        let attempt = super::telemetry::new_attempt();
+        super::telemetry::emit_attempt(id, attempt, "admission_started", None);
         let result = self.insert_with_evicted_ids_inner(tx, spent_mempool_outpoints, height);
         match &result.0 {
-            Ok(_) => super::telemetry::emit(id, "admitted", None),
+            Ok(_) => {
+                if zakura_jsonl_trace::dashboard::enabled() {
+                    self.observed_admissions.insert(id, attempt);
+                }
+                super::telemetry::emit_attempt(id, attempt, "admitted", None);
+            }
             Err(error) => {
                 let reason = match error {
                     MempoolError::InMempool | MempoolError::AlreadyQueued => "duplicate",
@@ -527,7 +538,7 @@ impl Storage {
                         SameEffectsChainRejectionError::Mined => "already_mined",
                     },
                 };
-                super::telemetry::emit(id, "rejected", Some(reason));
+                super::telemetry::emit_attempt(id, attempt, "rejected", Some(reason));
             }
         }
         result
@@ -653,7 +664,7 @@ impl Storage {
             for evicted_tx in self.verified.remove(&root) {
                 let evicted_id = evicted_tx.transaction.id();
                 self.reject(evicted_id, ExactTipRejectionError::Evicted.into());
-                super::telemetry::emit(evicted_id, "evicted", Some("capacity"));
+                self.observe_removal(evicted_id, "evicted", Some("capacity"));
                 evicted_ids.insert(evicted_id);
             }
         }
@@ -695,9 +706,13 @@ impl Storage {
     /// Does not add or remove from the 'rejected' tracking set.
     #[allow(dead_code)]
     pub fn remove_exact(&mut self, exact_wtxids: &HashSet<UnminedTxId>) -> usize {
-        self.verified
-            .remove_all_that(|tx| exact_wtxids.contains(&tx.transaction.id()))
-            .len()
+        let removed = self
+            .verified
+            .remove_all_that(|tx| exact_wtxids.contains(&tx.transaction.id()));
+        for id in &removed {
+            self.observed_admissions.remove(id);
+        }
+        removed.len()
     }
 
     /// Clears a list of mined transaction ids from the verified set's tracked transaction dependencies.
@@ -796,10 +811,14 @@ impl Storage {
         self.pending_outputs.prune();
 
         for &id in &removed_mined {
-            super::telemetry::emit(id, "mined", None);
+            if mined_ids.contains(&id.mined_id()) {
+                self.observe_removal(id, "mined", None);
+            } else {
+                self.observe_removal(id, "evicted", Some("ancestor_removed"));
+            }
         }
         for &id in &removed_duplicate_spend {
-            super::telemetry::emit(id, "evicted", Some("conflicting_effects"));
+            self.observe_removal(id, "evicted", Some("conflicting_effects"));
         }
         RemovedTransactionIds {
             mined: removed_mined,
@@ -807,10 +826,24 @@ impl Storage {
         }
     }
 
+    fn observe_removal(
+        &mut self,
+        id: UnminedTxId,
+        phase: &'static str,
+        reason: Option<&'static str>,
+    ) {
+        if let Some(attempt) = self.observed_admissions.remove(&id) {
+            super::telemetry::emit_attempt(id, attempt, phase, reason);
+        } else {
+            super::telemetry::emit(id, phase, reason);
+        }
+    }
+
     /// Clears the whole mempool storage.
     #[allow(dead_code)]
     pub fn clear(&mut self) {
         self.verified.clear();
+        self.observed_admissions.clear();
         self.tip_rejected_exact.clear();
         self.pending_outputs.clear();
         self.tip_rejected_same_effects.clear();
@@ -1100,7 +1133,7 @@ impl Storage {
             .remove_all_that(|tx| tx_ids.contains(&tx.transaction.id().mined_id()));
 
         // also reject it
-        for id in tx_ids {
+        for &id in &tx_ids {
             self.reject(
                 // It's okay to omit the auth digest here as we know that `reject()` will always
                 // use mined ids for `SameEffectsChainRejectionError`s.
@@ -1110,7 +1143,11 @@ impl Storage {
         }
 
         for &id in &removed_tx_ids {
-            super::telemetry::emit(id, "expired", Some("expiry_height"));
+            if tx_ids.contains(&id.mined_id()) {
+                self.observe_removal(id, "expired", Some("expiry_height"));
+            } else {
+                self.observe_removal(id, "evicted", Some("ancestor_removed"));
+            }
         }
         removed_tx_ids
     }

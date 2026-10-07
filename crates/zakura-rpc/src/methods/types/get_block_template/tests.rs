@@ -7,6 +7,7 @@ use std::iter;
 use zakura_chain::amount::Amount;
 
 use zcash_keys::address::Address;
+use zcash_script::script::Evaluable;
 
 use zakura_chain::parameters::testnet::ConfiguredFundingStreamRecipient;
 
@@ -429,11 +430,11 @@ fn coinbase_addresses_without_sapling() -> anyhow::Result<()> {
                 Address::Unified(addr) => addr.transparent().unwrap(),
                 _ => unreachable!(),
             };
-            let script: transparent::Script = receiver.script().into();
+            let script = receiver.script().to_bytes();
             assert!(tx
                 .outputs()
                 .iter()
-                .any(|output| output.lock_script == script));
+                .any(|output| output.lock_script.as_raw_bytes() == script));
         }
     }
     Ok(())

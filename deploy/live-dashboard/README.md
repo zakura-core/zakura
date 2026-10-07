@@ -384,7 +384,10 @@ The systemd-owned socket is `/run/zakura-live-dashboard/node-events.sock`, mode
 0660, with group access for the dedicated node. Receiver restarts preserve the
 socket and its bounded kernel queue. The receiver validates the inherited socket
 and never unlinks a systemd-owned path. It drains at most 256 datagrams per SQLite
-transaction. Keep `DynamicUser=no` for the existing `zakura-dashboard-web` identity.
+transaction. Transient SQLite write contention retains that bounded batch for
+retry rather than stopping collection. Unexpected receiver exceptions are logged,
+and `/healthz` requires a listening receiver when event collection is configured.
+Keep `DynamicUser=no` for the existing `zakura-dashboard-web` identity.
 DynamicUser with preserved runtime directories moves the socket under
 `/run/private`, which the node cannot traverse. Deployment checks access using the
 node's user and supplementary group.
@@ -406,23 +409,35 @@ committed dashboard tree and checks tests, readiness, and socket access.
 
 ### Validation status
 
-As of 2026-10-07, the dedicated node runs `454431f85` with measured crypto batches,
-transaction body/verification/admission/relay/residence times, native traffic and
-queue observations, and correlated block stages. Actual native and legacy first
-body arrivals were observed. Block 3509931 arrived over legacy and took 30.44 ms
-from body receipt to commit. Finalized-write events were verified on older hashes.
-A later receiver deployment exposed a stopped event thread and renewed delivery
-loss. Diagnosis is in progress. Earlier migration losses and current losses remain
-evidence and must not be erased.
+As of 2026-10-07 at 22:43 UTC, the dedicated node runs
+`b4c93de11302e67df91d49aa006beb2dfedadacb` and passes readiness. The release build
+and focused native queue observer test completed successfully. The compiled
+network harness also passed `block_source_ignores_unrequested_body`.
 
-The dashboard's 56 Python tests pass, including missing boundaries, restarts,
-retries, deduplication, attempt correlation, and queued datagrams across receiver
-replacement. Browser checks verified readable crypto/lifecycle charts, grouped
-waterfall announcements, and hidden idle queue pressure without console errors.
-Rare expiry, eviction, and crypto failure paths are covered by source/fixture
-checks rather than manufactured mainnet activity.
+Block 3509957 provided real observations from both transports. Native won with
+290.72 ms from request queueing to body receipt. The later legacy body measured
+277.00 ms from its own request start and was counted as a duplicate. Public block
+detail preserved the first body's timing, measured 672.28 ms from that body to
+commit, and joined the writer queue and contextual stages. Block 3509931 had
+previously demonstrated a legacy winner and a 30.44 ms body-to-commit span.
+Finalized-write events were verified on the older hashes actually finalized.
 
-The final dual-stack request-duration build and focused native queue test are
-running under `zakura-dashboard-build-v6.service` at
-`b4c93de11302e67df91d49aa006beb2dfedadacb`. Do not change its remote checkout while
-running. Activation and real legacy request-duration validation remain pending.
+Live transaction history contains body, verification, admission, relay, and
+residence durations. Crypto history contains actual Halo 2 and Sapling batches.
+Native traffic, RTT, measured packet loss, and current queue observations are
+present. Idle queue pressure stays hidden. Browser checks verified readable
+crypto/lifecycle charts, grouped waterfall announcements, and period selection.
+
+The dashboard's 57 Python tests pass, covering missing boundaries, restarts,
+retries, deduplication, attempt correlation, datagrams queued across receiver
+replacement, actual SQLite write-lock recovery, and receiver-aware health checks.
+Rare expiry, eviction, and crypto failure paths rely on source/fixture checks
+rather than manufactured mainnet activity.
+
+Earlier socket migration failures and a stopped receiver caused historical event
+loss. The stopped receiver did not originally log its exception, so its exact
+cause is unconfirmed. A reproduced SQLite contention failure is fixed and
+regression-tested, and unexpected failures now retain diagnostic logs. The loss
+counter stayed unchanged through subsequent receiver deployments. The activated
+node's new run reported zero send failures. Historical incomplete data remains
+explicitly identified rather than being silently treated as complete.

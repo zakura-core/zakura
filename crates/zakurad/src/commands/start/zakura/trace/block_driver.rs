@@ -459,17 +459,13 @@ impl BlockDriverTraceExt for ZakuraTrace {
         queue_len: usize,
         in_flight_count: usize,
     ) {
-        self.emit_event(|| DriverEvent {
-            event: event::BLOCK_SUBMIT_QUEUED,
-            source: SOURCE,
-            fields: SubmitQueued {
-                apply_token: token,
-                apply_class: class_label(class),
-                hash: block.hash().to_string(),
-                height: block.coinbase_height().map(|height| height.0.into()),
-                queue_len: saturating_count(queue_len),
-                in_flight_count: saturating_count(in_flight_count),
-            },
+        emit(self, event::BLOCK_SUBMIT_QUEUED, || SubmitQueued {
+            apply_token: token,
+            apply_class: class_label(class),
+            hash: block.hash().to_string(),
+            height: block.coinbase_height().map(|height| height.0.into()),
+            queue_len: saturating_count(queue_len),
+            in_flight_count: saturating_count(in_flight_count),
         });
     }
 
@@ -544,11 +540,26 @@ impl BlockDriverTraceExt for ZakuraTrace {
 }
 
 fn emit<F: Serialize>(trace: &ZakuraTrace, name: &'static str, fields: impl FnOnce() -> F) {
-    trace.emit_event(|| DriverEvent {
-        event: name,
-        source: SOURCE,
-        fields: fields(),
-    });
+    // Only bounded block identities/results go to the dashboard, never peer or error fields.
+    if matches!(
+        name,
+        event::BLOCK_SUBMIT_QUEUED | event::COMMIT_START | event::COMMIT_FINISH
+    ) && zakura_jsonl_trace::dashboard::enabled()
+    {
+        let row = DriverEvent {
+            event: name,
+            source: SOURCE,
+            fields: fields(),
+        };
+        zakura_jsonl_trace::dashboard::emit(|| &row);
+        trace.emit_event(|| row);
+    } else {
+        trace.emit_event(|| DriverEvent {
+            event: name,
+            source: SOURCE,
+            fields: fields(),
+        });
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

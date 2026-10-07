@@ -279,3 +279,41 @@ resets, unknown identity, missing counters, and repeated saves leave gaps. Equal
 durations with increasing counts remain distinct observations. Each point is still
 a rolling summary and can include multiple new events. Historical timing samples
 without observation-count gating are excluded on read, without deleting other data.
+
+## At-tip telemetry work in progress
+
+The dedicated node is the experiment target. No upstream PRs or production-node
+changes are part of this work. The five required outcomes are:
+
+1. Block detail joins announcement, complete-body receipt, verifier submission,
+   verification/state stages, and committed outcome by hash and process identity.
+   Display actual measured spans, parallel work, missing boundaries, and failures.
+2. Block arrival/relay shows winning transport, request-to-body duration where
+   measured, duplicate arrivals, and advertisement timing. Miner timestamps are
+   not propagation latency. Local observations cannot establish network-wide lag.
+3. Crypto shows actual batch duration and item/action counts, scheduling delay,
+   failures, and fallback work. A batch is not necessarily one transaction/proof.
+4. Native network health includes measured QUIC traffic, RTT, loss/retransmissions,
+   connection churn, and queues updated on enqueue and dequeue. Unsupported fields
+   are explained or omitted, never permanently empty placeholder charts.
+5. Transaction lifecycle distinguishes verification from admission and reports
+   relay, mined, expiry, eviction, and bounded rejection reasons. Stage durations
+   require correlated events rather than subtracting unrelated counters.
+
+Each outcome requires targeted tests and real dedicated-node observations before
+being called complete. Verify idle intervals, restart boundaries, missing/lost
+records, repeated measurements, and concurrent work. Empty data must explain its
+coverage and zero must mean a measured absence. Do not fabricate activity to make
+charts look useful. Keep chart legends, units, and time-window semantics explicit.
+
+The initial transport is opt-in through `ZAKURA_DASHBOARD_SOCKET`: nonblocking
+local Unix datagrams capped at 8 KiB, with process identity, monotonic timestamps,
+wall-clock timestamps, and sequence numbers. A missing or slow dashboard must not
+block node validation. No credentials, peer addresses, raw errors, or transaction
+contents belong in the feed. The receiver must bound its memory/history, tolerate
+concurrent delivery, and expose coverage gaps. Existing debug traces remain separate.
+
+Implementation status: the bounded sender and driver queue/verify-and-commit
+boundaries are in development. The driver's `commit_start` currently wraps both
+verification and state commit, so it must not be labeled disk-write latency.
+Receiver integration, remaining hooks, dashboards, and live validation are pending.

@@ -1,5 +1,7 @@
 //! Shared non-blocking JSONL tracing support for Zebra components.
 
+pub mod dashboard;
+
 use std::{
     collections::{HashMap, HashSet},
     fmt,

@@ -564,6 +564,7 @@ function renderBlockEvents() {
           ],
           ["Duplicate bodies observed", fmt(row.duplicate_bodies)],
           ["Inventory → complete body", ms(row.inventory_to_body_ms)],
+          ["Request queue → complete body", ms(row.request_queue_to_body_ms)],
           ["Complete body → committed", ms(row.body_to_commit_ms)],
         );
       }
@@ -573,7 +574,7 @@ function renderBlockEvents() {
           `${fmt(row.relay_successes)} / ${fmt(row.relay_failures)}`,
         ]);
       return entries.length
-        ? `<h3>Arrival and relay · latest observed node run</h3><dl class="stat-list detail-stats">${entries.map(([key, val]) => `<div><dt>${esc(key)}</dt><dd>${esc(val)}</dd></div>`).join("")}</dl><p>Inventory-to-body includes scheduling and fetching, not just network transfer. Relay success means the local broadcast service completed, not that every peer received it.</p>`
+        ? `<h3>Arrival and relay · latest observed node run</h3><dl class="stat-list detail-stats">${entries.map(([key, val]) => `<div><dt>${esc(key)}</dt><dd>${esc(val)}</dd></div>`).join("")}</dl><p>Inventory-to-body includes scheduling and fetching. Request timing includes the local send queue and earlier bodies in the same range. It is unavailable for unsolicited bodies or transports without a matching request measurement. Relay success means the local broadcast service completed, not that every peer received it.</p>`
         : "";
     })
     .join("");

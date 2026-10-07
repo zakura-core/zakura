@@ -369,3 +369,9 @@ selects the window; node wall time is retained separately. Repeated polling neve
 creates new events. Individual-event charts replace rolling summaries only for
 verifiers with measured events in the selected window. These changes still need
 the updated Linux build and real node/browser validation before deployment.
+
+Matched native block bodies now carry the elapsed time from request queueing to
+complete body handling. This includes local send queueing, peer service time,
+transfer, and earlier responses in a range. It is not wire RTT. The block detail
+uses the measurement attached to its first recorded body, never a later duplicate.
+Unmatched bodies and legacy fetches currently report this span as unavailable.

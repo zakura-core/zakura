@@ -2028,7 +2028,7 @@ fn record_block_response_source(
                 InventoryResponse::Available((block, _))
                     if requested_hashes.contains(&block.hash()) =>
                 {
-                    trace.record_block_body_received(block.hash(), source);
+                    trace.record_block_body_received(block.hash(), source, None);
                 }
                 _ => {}
             }

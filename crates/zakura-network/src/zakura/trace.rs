@@ -502,16 +502,19 @@ impl ZakuraTrace {
     }
 
     /// Record a complete block body received from a transport.
+    /// Request elapsed includes local send queueing and earlier bodies in a range.
     pub(crate) fn record_block_body_received(
         &self,
         hash: zakura_chain::block::Hash,
         source: BlockBodySource,
+        request_elapsed: Option<std::time::Duration>,
     ) {
         let first = self.first_block_source.record(hash, source);
         zakura_jsonl_trace::dashboard::emit(|| {
             serde_json::json!({
                 "event": "block_body_received", "hash": hash.to_string(),
                 "transport": source.as_str(), "first": first,
+                "request_queue_to_body_ms": request_elapsed.map(|elapsed| elapsed.as_secs_f64() * 1000.0),
             })
         });
         if first {

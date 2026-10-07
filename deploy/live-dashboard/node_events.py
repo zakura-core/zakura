@@ -54,6 +54,10 @@ def parse_block_event(data):
                 if type(event.get("first")) is not bool:
                     return None
                 public["first"] = event["first"]
+                duration = event.get("request_queue_to_body_ms")
+                if duration is not None and (type(duration) not in (int, float) or not 0 <= duration <= 86_400_000):
+                    return None
+                public["request_queue_to_body_ms"] = duration
         else:
             if not integer(event.get("relay_attempt")):
                 return None
@@ -367,6 +371,7 @@ def arrival_summary(events):
                           "duplicate_bodies": sum(not r["first"] for r in bodies),
                           "inventory_to_body_ms": elapsed(inventory, body),
                           "body_to_commit_ms": elapsed(body, committed),
+                          "request_queue_to_body_ms": body.get("request_queue_to_body_ms") if body else None,
                           "relay_successes": sum(r["succeeded"] for r in relays),
                           "relay_failures": sum(not r["succeeded"] for r in relays),
                           "relay_observed": bool(relays)})

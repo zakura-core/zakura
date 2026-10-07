@@ -206,3 +206,19 @@ class CryptoTests(unittest.TestCase):
                 self.assertEqual(len(feed.crypto(0, 86600)["samples"]), 1)
             finally:
                 feed.close()
+
+
+class RequestTimingTests(unittest.TestCase):
+    def test_duration_belongs_to_first_recorded_body_only(self):
+        def body(sequence, duration):
+            return n.parse_block_event(json.dumps({
+                "version": 1, "process": "1-123", "sequence": sequence,
+                "monotonic_ns": sequence * 1_000_000, "unix_ms": 1000,
+                "event": {"event": "block_body_received", "hash": "a" * 64,
+                          "first": sequence == 1, "transport": "zakura",
+                          "request_queue_to_body_ms": duration}}).encode())
+        first, duplicate = body(1, 12.5), body(2, 99)
+        self.assertEqual(n.arrival_summary([duplicate, first])[0]["request_queue_to_body_ms"], 12.5)
+        self.assertIsNone(n.arrival_summary([body(1, None), duplicate])[0]["request_queue_to_body_ms"])
+        for bad in (-1, True, float("nan"), float("inf")):
+            self.assertIsNone(body(1, bad))

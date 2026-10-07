@@ -7,9 +7,11 @@ from copy import deepcopy
 import json
 import logging
 import math
+import os
 from pathlib import Path
 import re
 import sqlite3
+import subprocess
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import threading
 import time
@@ -52,8 +54,8 @@ COUNTERS = {
     "commit_bps": "sync_block_payload_committed_bytes",
     "halo2_ps": "proofs_halo2_verified",
     "sapling_ps": "proofs_sapling_verified",
-    "tx_accepted_ps": "mempool_verified_transactions_total",
-    "tx_rejected_ps": "mempool_rejected_transactions_total",
+    "tx_verified_ps": "mempool_verified_transactions_total",
+    "tx_policy_rejected_ps": "mempool_rejected_transactions_total",
     "tx_relayed_ps": "mempool_gossiped_transactions_total",
     "rpc_rps": "rpc_requests_total",
     "rpc_errors_ps": "rpc_errors_total",
@@ -171,6 +173,43 @@ def block_public(block, observed=None):
                       if k in {"sapling", "orchard", "ironwood"}}}
 
 
+def local_host(disk_path, service):
+    """Read Linux host counters without opening the node's database or logs."""
+    memory = {}
+    for line in Path("/proc/meminfo").read_text().splitlines():
+        key, value = line.split(":", 1)
+        if key in {"MemTotal", "MemAvailable"}:
+            memory[key] = int(value.split()[0]) * 1024
+    disk = os.statvfs(disk_path)
+    load = os.getloadavg()
+    host = {"mem_total_bytes": memory.get("MemTotal"),
+            "mem_available_bytes": memory.get("MemAvailable"),
+            "disk_total_bytes": disk.f_blocks * disk.f_frsize,
+            "disk_free_bytes": disk.f_bavail * disk.f_frsize,
+            "load1": load[0], "load5": load[1], "load15": load[2],
+            "uptime_seconds": float(Path("/proc/uptime").read_text().split()[0]),
+            "rss_bytes": None, "restart_count": None, "oom_kills_24h": None}
+    status = None
+    try:
+        result = subprocess.run(
+            ["systemctl", "show", "--property=LoadState,ActiveState,MainPID,NRestarts", "--", service],
+            capture_output=True, text=True, check=True, timeout=3)
+        unit = dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line)
+        if unit.get("LoadState") == "loaded":
+            if unit.get("ActiveState") in {"active", "activating", "deactivating", "inactive", "failed", "reloading"}:
+                status = unit["ActiveState"]
+            host["restart_count"] = int(unit["NRestarts"])
+            pid = int(unit["MainPID"])
+            if pid > 0:
+                for line in Path(f"/proc/{pid}/status").read_text().splitlines():
+                    if line.startswith("VmRSS:"):
+                        host["rss_bytes"] = int(line.split()[1]) * 1024
+    except (OSError, ValueError, KeyError, subprocess.SubprocessError):
+        # Service queries and process reads can race a node restart.
+        pass
+    return {"host": host, "service": status}
+
+
 class Store:
     def __init__(self, path):
         self.db = sqlite3.connect(path, check_same_thread=False)
@@ -204,11 +243,13 @@ class Collector:
         self.store = Store(args.history)
         self.lock = threading.Lock()
         self.state = {"node": args.node, "chain": {}, "metrics": {}, "host": {},
+                      "host_mode": "fleet" if getattr(args, "fleet", None) else "local",
+                      "node_service": None,
                       "peers": [], "fleet": {}, "reorgs": [], "rpc_methods": [], "verifiers": [],
                       "version": None, "sources": {}, "blocks": self.store.blocks()}
         self.previous_metrics = None
         self.previous_metrics_at = None
-        self.metric_attempt = self.fleet_attempt = self.peer_attempt = 0
+        self.metric_attempt = self.host_attempt = self.peer_attempt = 0
         self.last_save = 0
         self.pool = ThreadPoolExecutor(max_workers=4)
         self.stop = threading.Event()
@@ -227,8 +268,10 @@ class Collector:
     def collect_metrics(self):
         return metrics_parse(fetch(self.args.metrics).decode("utf-8", "replace"))
 
-    def collect_fleet(self):
-        return json.loads(fetch(self.args.fleet + "/data/node/" + urllib.parse.quote(self.args.node)))
+    def collect_host(self):
+        if self.args.fleet:
+            return json.loads(fetch(self.args.fleet + "/data/node/" + urllib.parse.quote(self.args.node)))
+        return local_host(self.args.node_disk, self.args.node_service)
 
     def update_metrics(self, metrics, now):
         values = {key: metric(metrics, name) for key, name in GAUGES.items()}
@@ -323,9 +366,9 @@ class Collector:
         if now - self.metric_attempt >= 15:
             self.metric_attempt = now
             tasks["metrics"] = self.pool.submit(self.collect_metrics)
-        if now - self.fleet_attempt >= 30:
-            self.fleet_attempt = now
-            tasks["host"] = self.pool.submit(self.collect_fleet)
+        if now - self.host_attempt >= 30:
+            self.host_attempt = now
+            tasks["host"] = self.pool.submit(self.collect_host)
         if now - self.peer_attempt >= 30:
             self.peer_attempt = now
             tasks["peers"] = self.pool.submit(self.rpc, "getpeerinfo")
@@ -347,7 +390,12 @@ class Collector:
                     elif key == "metrics":
                         self.update_metrics(result, now)
                     elif key == "host":
-                        self.update_fleet(result, now)
+                        if self.args.fleet:
+                            self.update_fleet(result, now)
+                        else:
+                            self.state["host"] = result["host"]
+                            self.state["node_service"] = result["service"]
+                            self.source("host", True, now)
                     elif key == "peers":
                         self.update_peers(result, now)
                 except Exception:
@@ -489,8 +537,10 @@ def main():
     parser.add_argument("--port", type=int, default=8095)
     parser.add_argument("--rpc", default="http://127.0.0.1:8232")
     parser.add_argument("--metrics", default="http://127.0.0.1:9999/metrics")
-    parser.add_argument("--fleet", default="https://status-mainnet.valargroup.dev")
-    parser.add_argument("--node", default="us-east-0")
+    parser.add_argument("--fleet", help="Optional fleet host observations instead of local Linux counters")
+    parser.add_argument("--node", default="dashboard-node")
+    parser.add_argument("--node-service", default="zakura-dashboard-node.service")
+    parser.add_argument("--node-disk", default="/", help="Mount containing the node state")
     parser.add_argument("--history", default="dashboard.sqlite3")
     parser.add_argument("--build", default="development")
     args = parser.parse_args()

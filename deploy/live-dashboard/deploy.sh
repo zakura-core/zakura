@@ -1,32 +1,31 @@
 #!/usr/bin/env bash
-# Deploy a committed branch to the existing mainnet gateway, without touching Zakura.
+# Deploy only the dashboard on its dedicated host. The node is not restarted.
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
-dashboard_host="${1:-us-east-0}"
-if [[ ! "$dashboard_host" =~ ^[a-zA-Z0-9._@-]+$ ]]; then
+dashboard_host="${1:?Usage: deploy.sh <dedicated-ssh-host>}"
+if [[ ! "$dashboard_host" =~ ^[a-zA-Z0-9][a-zA-Z0-9._@-]*$ ]]; then
   echo "Invalid SSH host" >&2
   exit 1
 fi
-if [[ -n "$(git status --porcelain -- deploy/live-dashboard deploy/gateway/mainnet/Caddyfile)" ]]; then
-  echo "Commit dashboard and gateway changes before deploying." >&2
+if [[ -n "$(git status --porcelain -- deploy/live-dashboard)" ]]; then
+  echo "Commit dashboard changes before deploying." >&2
   exit 1
 fi
 revision="$(git rev-parse HEAD)"
-base="$(git merge-base HEAD origin/main)"
-base_config_hash="$(git show "$base:deploy/gateway/mainnet/Caddyfile" | shasum -a 256 | awk '{print $1}')"
-git archive --format=tar HEAD deploy/live-dashboard deploy/gateway/mainnet/Caddyfile |
+git archive --format=tar HEAD deploy/live-dashboard |
   ssh -o BatchMode=yes "$dashboard_host" "mkdir -p /opt/zakura-live-dashboard/releases/$revision && tar -xf - -C /opt/zakura-live-dashboard/releases/$revision"
-ssh -o BatchMode=yes "$dashboard_host" bash -s -- "$revision" "$base_config_hash" <<'REMOTE'
+ssh -o BatchMode=yes "$dashboard_host" bash -s -- "$revision" <<'REMOTE'
 set -euo pipefail
 revision="$1"
-base_config_hash="$2"
 root=/opt/zakura-live-dashboard
 release="$root/releases/$revision"
-candidate="$release/deploy/gateway/mainnet/Caddyfile"
-live_config_hash="$(sha256sum /etc/caddy/Caddyfile | awk '{print $1}')"
-candidate_hash="$(sha256sum "$candidate" | awk '{print $1}')"
-if [[ "$live_config_hash" != "$base_config_hash" && "$live_config_hash" != "$candidate_hash" ]]; then
-  echo "Live Caddyfile differs from both base and candidate. Reconcile it before deploying." >&2
+candidate="$release/deploy/live-dashboard/standalone/Caddyfile"
+if [[ ! -f /etc/zakura-dashboard-node/zakurad.toml ]] || systemctl is-active --quiet zakurad; then
+  echo "This deployment requires a dedicated dashboard host, not a fleet node." >&2
+  exit 1
+fi
+if [[ -e "$root/current" ]] && ! cmp -s /etc/caddy/Caddyfile "$root/current/deploy/live-dashboard/standalone/Caddyfile"; then
+  echo "Live Caddyfile has drifted from the previous dashboard release. Reconcile it first." >&2
   exit 1
 fi
 caddy validate --config "$candidate" --adapter caddyfile
@@ -50,6 +49,7 @@ rollback() {
     systemctl restart zakura-live-dashboard
   else
     systemctl disable --now zakura-live-dashboard || true
+    if [[ "$(readlink "$root/current")" == "$release" ]]; then unlink "$root/current"; fi
   fi
 }
 trap rollback ERR
@@ -62,18 +62,17 @@ systemctl enable zakura-live-dashboard
 systemctl restart zakura-live-dashboard
 ready=false
 for attempt in {1..15}; do
-  if curl --fail --silent --max-time 2 http://127.0.0.1:8095/healthz >/dev/null; then ready=true; break; fi
+  if curl --fail --silent --max-time 2 http://127.0.0.1:8095/api/overview | python3 -c 'import json,sys; assert json.load(sys.stdin)["build"] == sys.argv[1]' "$revision"; then ready=true; break; fi
   sleep 2
 done
 [[ "$ready" == true ]]
 install -m 644 "$candidate" /etc/caddy/Caddyfile
 systemctl reload caddy
-curl --fail --silent --max-time 10 https://status-mainnet.valargroup.dev/live/healthz
-curl --fail --silent --max-time 10 https://status-mainnet.valargroup.dev/data >/dev/null
-curl --fail --silent --max-time 10 https://zakura-broadcast.valargroup.dev/healthz >/dev/null
+curl --fail --silent --max-time 10 -H "Host: 146.190.146.239" http://127.0.0.1/api/overview |
+  python3 -c 'import json,sys; assert json.load(sys.stdin)["build"] == sys.argv[1]' "$revision"
 trap - ERR
 echo
-echo "Live: https://status-mainnet.valargroup.dev/live/"
+echo "Dashboard deployed. Public hostname: https://gui.valargroup.dev/ (requires DNS)."
 echo "Build: $revision"
 echo "Rollback files: $backup"
 REMOTE

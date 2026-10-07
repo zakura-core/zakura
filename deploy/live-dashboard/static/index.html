@@ -55,7 +55,7 @@
             <div class="eyebrow">INSIDE THE NODE</div>
             <h1>Mainnet overview</h1>
             <p>
-              <span id="node-name">us-east-0</span
+              <span id="node-name">Connecting</span
               ><span class="separator">/</span
               ><span id="node-version">Connecting</span
               ><span class="separator">/</span><span id="upgrade">Zcash</span>
@@ -238,12 +238,12 @@
             <div class="chart-values">
               <div>
                 <span class="legend"
-                  ><i class="dot mint"></i>Accepted / sec</span
+                  ><i class="dot mint"></i>Verified / sec</span
                 ><strong id="accepted-rate">—</strong>
               </div>
               <div>
                 <span class="legend"
-                  ><i class="dot amber"></i>Rejected / sec</span
+                  ><i class="dot amber"></i>Policy rejections / sec</span
                 ><strong id="rejected-rate">—</strong>
               </div>
             </div>
@@ -395,7 +395,7 @@
                 <dd id="pruning">—</dd>
               </div>
               <div>
-                <dt>Fleet comparison</dt>
+                <dt id="node-status-label">Node service</dt>
                 <dd id="fleet-status">—</dd>
               </div>
               <div>
@@ -409,9 +409,8 @@
             </dl>
             <div class="context-heading">Observed tip switches</div>
             <div id="reorgs" class="reorg-list"></div>
-            <div class="panel-bottom">
-              Fleet comparison is a cross-check, not a network-wide consensus
-              claim.
+            <div id="node-context-note" class="panel-bottom">
+              This dedicated node can restart independently of the dashboard.
             </div>
           </section>
         </div>
@@ -480,6 +479,12 @@
           Traffic covers the legacy transport. Native connections are shown
           separately. RPC peer counts and transport gauges may overlap. These
           are local observations, not a map of every Zcash node.
+        </dd>
+        <dt>Transaction rates</dt>
+        <dd>
+          Verified counts completed mempool verification, before admission.
+          Policy rejections cover the node’s oversized-transaction counter,
+          not all verification failures. These rates are not chain TPS.
         </dd>
         <dt>Privacy</dt>
         <dd>

@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import threading
 import time
 import unittest
+from unittest.mock import patch
 import urllib.error
 import urllib.request
 
@@ -96,6 +97,43 @@ state_block_writer_queue_duration_seconds{quantile="1"} 0
     def test_wrong_network_is_rejected(self):
         with self.assertRaises(ValueError):
             d.chain_public({"chain": "test", "bestblockhash": "a" * 64, "blocks": 1, "headers": 1})
+
+    def test_stopped_local_node_keeps_host_observations_and_hides_private_fields(self):
+        files = {"/proc/meminfo": "MemTotal: 8000 kB\nMemAvailable: 3000 kB\n",
+                 "/proc/uptime": "456.75 123.00\n"}
+        disk = SimpleNamespace(f_blocks=100, f_bavail=30, f_frsize=4096)
+        service = SimpleNamespace(stdout="LoadState=loaded\nActiveState=inactive\nMainPID=0\nNRestarts=2\nPrivate=secret\n")
+        with patch.object(d.Path, "read_text", lambda path: files[str(path)]), \
+                patch.object(d.os, "statvfs", return_value=disk), \
+                patch.object(d.os, "getloadavg", return_value=(0.1, 0.2, 0.3)), \
+                patch.object(d.subprocess, "run", return_value=service) as run:
+            observation = d.local_host("/", "zakura-dashboard-node.service")
+        self.assertEqual(observation["service"], "inactive")
+        self.assertIsNone(observation["host"]["rss_bytes"])
+        self.assertEqual(observation["host"]["restart_count"], 2)
+        self.assertEqual(observation["host"]["mem_available_bytes"], 3000 * 1024)
+        self.assertEqual(observation["host"]["disk_free_bytes"], 30 * 4096)
+        self.assertIsNone(observation["host"]["oom_kills_24h"])
+        self.assertNotIn("secret", json.dumps(observation))
+        self.assertEqual(run.call_args.kwargs["timeout"], 3)
+
+    def test_local_process_exit_during_collection_does_not_fail_host_health(self):
+        def read(path):
+            if str(path) == "/proc/meminfo":
+                return "MemTotal: 8000 kB\nMemAvailable: 3000 kB\n"
+            if str(path) == "/proc/uptime":
+                return "456.75 123.00\n"
+            raise FileNotFoundError()
+        disk = SimpleNamespace(f_blocks=100, f_bavail=30, f_frsize=4096)
+        service = SimpleNamespace(stdout="LoadState=loaded\nActiveState=active\nMainPID=123\nNRestarts=0\n")
+        with patch.object(d.Path, "read_text", read), \
+                patch.object(d.os, "statvfs", return_value=disk), \
+                patch.object(d.os, "getloadavg", return_value=(0.1, 0.2, 0.3)), \
+                patch.object(d.subprocess, "run", return_value=service):
+            observation = d.local_host("/", "zakura-dashboard-node.service")
+        self.assertEqual(observation["service"], "active")
+        self.assertIsNone(observation["host"]["rss_bytes"])
+        self.assertEqual(observation["host"]["uptime_seconds"], 456.75)
 
     def test_reorg_and_return_to_known_tip_recompute_membership(self):
         a1 = block(1)

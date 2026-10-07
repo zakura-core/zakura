@@ -1,0 +1,34 @@
+[Unit]
+Description=Dedicated pruned Zakura dashboard node
+After=network-online.target
+Wants=network-online.target
+AssertPathExists=/opt/zakura-dashboard-node/current/zakurad
+
+[Service]
+Type=simple
+User=zakura-dashboard-node
+Group=zakura-dashboard-node
+StateDirectory=zakura-dashboard-node
+StateDirectoryMode=0700
+WorkingDirectory=/var/lib/zakura-dashboard-node
+ExecStart=/opt/zakura-dashboard-node/current/zakurad --config /etc/zakura-dashboard-node/zakurad.toml start
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=120
+LimitNOFILE=1048576
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,40 @@
+# Dedicated dashboard node. This configuration is not part of fleet deployment.
+[network]
+network = "Mainnet"
+listen_addr = "0.0.0.0:8233"
+external_addr = "146.190.146.239:8233"
+cache_dir = "/var/lib/zakura-dashboard-node"
+identity_dir = "/var/lib/zakura-dashboard-node/identity"
+p2p_stack = "dual"
+
+[network.zakura]
+listen_addr = "0.0.0.0:8234"
+
+[network.zakura.block_sync]
+replace_legacy_syncer = true
+
+[state]
+cache_dir = "/var/lib/zakura-dashboard-node"
+storage_mode = "pruned"
+
+[rpc]
+listen_addr = "127.0.0.1:8232"
+cookie_dir = "/var/lib/zakura-dashboard-node/rpc-cookie"
+enable_cookie_auth = false
+
+[metrics]
+endpoint_addr = "127.0.0.1:9999"
+
+[health]
+listen_addr = "127.0.0.1:8080"
+min_connected_peers = 1
+ready_max_blocks_behind = 2
+ready_max_tip_age = "5m"
+
+[consensus]
+checkpoint_sync = true
+vct_fast_sync = true
+
+[tracing]
+use_color = false
+filter = "info"

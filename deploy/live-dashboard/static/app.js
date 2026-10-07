@@ -160,8 +160,8 @@ function render() {
   set("traffic-out", bytes(metric("legacy_out_bps"), true));
   set("halo2-rate", fmt(metric("halo2_ps"), 2));
   set("sapling-rate", fmt(metric("sapling_ps"), 2));
-  set("accepted-rate", fmt(metric("tx_accepted_ps"), 2));
-  set("rejected-rate", fmt(metric("tx_rejected_ps"), 2));
+  set("accepted-rate", fmt(metric("tx_verified_ps"), 2));
+  set("rejected-rate", fmt(metric("tx_policy_rejected_ps"), 2));
 
   const verifierNames = {
     halo2: "Halo 2",
@@ -270,9 +270,16 @@ function render() {
     c.pruned === false ? "Full archive" : c.pruned === true ? "Pruned" : "—",
   );
   const fleet = state.fleet || {};
+  const localHost = state.host_mode === "local";
+  set("node-status-label", localHost ? "Node service" : "Fleet comparison");
+  set("node-context-note", localHost
+    ? "This dedicated node can restart independently of the dashboard."
+    : "Fleet comparison is a cross-check of other observed nodes.");
   set(
     "fleet-status",
-    !hostFresh || !fleet.hash
+    localHost
+      ? (hostFresh && state.node_service ? state.node_service : "Unavailable")
+      : !hostFresh || !fleet.hash || !chainFresh
       ? "Unavailable"
       : fleet.hash === c.hash
         ? "Tip matches majority"
@@ -290,7 +297,7 @@ function render() {
             `<div class="reorg-row"><span>${fmt(r.from_height)} → ${fmt(r.to_height)}</span><span>${esc(valid(r.at) ? age(now - r.at) + " ago" : "Observed")}${valid(r.depth) ? ` · depth ${fmt(r.depth)}` : ""}</span></div>`,
         )
         .join("")
-    : '<p class="empty">No recent tip switches reported</p>';
+    : `<p class="empty">${localHost ? "Tip-switch history unavailable" : "No recent tip switches reported"}</p>`;
 
   renderBlocks(now);
   if (selectedBlock && $("block-dialog").open) renderBlockDetail(selectedBlock);

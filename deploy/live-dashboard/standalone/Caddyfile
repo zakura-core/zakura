@@ -1,0 +1,24 @@
+# Dedicated dashboard host: codex-vast-tide-7164 (DigitalOcean 607024683).
+# Source: deploy/live-dashboard/standalone/Caddyfile
+{
+	servers {
+		timeouts {
+			read_header 10s
+			read_body 30s
+		}
+	}
+}
+
+(dashboard) {
+	encode zstd gzip
+	reverse_proxy 127.0.0.1:8095
+}
+
+gui.valargroup.dev {
+	import dashboard
+}
+
+# Direct access during DNS setup and node experiments. All data is public.
+http://146.190.146.239 {
+	import dashboard
+}

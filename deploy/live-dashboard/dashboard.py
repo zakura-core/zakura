@@ -854,7 +854,8 @@ class Handler(BaseHTTPRequestHandler):
             blocks = [b for b in collector.store.blocks() if b.get("canonical") is True
                       and number(b.get("time")) is not None and start <= b["time"] <= end]
             self.send(200, {"window": window, "samples": samples, "activity": activity, "blocks": blocks,
-                             "crypto": collector.events.crypto(start, end)})
+                             "crypto": collector.events.crypto(start, end),
+                             "transactions": collector.events.transactions(start, end)})
         elif parsed.path == "/healthz":
             state = collector.snapshot()
             fresh = state["sources"].get("chain", {}).get("fresh", False)

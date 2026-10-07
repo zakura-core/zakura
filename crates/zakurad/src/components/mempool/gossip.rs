@@ -217,6 +217,8 @@ where
         .len()
         .try_into()
         .expect("transaction ID chunk length fits in u64");
+    let observed =
+        zakura_jsonl_trace::dashboard::enabled().then(|| chunk.iter().copied().collect::<Vec<_>>());
     let request = zn::Request::AdvertiseTransactionIds(std::mem::take(chunk), None);
 
     info!(%request, changes = %combined_changes, "sending pending mempool transaction broadcast");
@@ -226,7 +228,23 @@ where
         "full list of pending mempool transactions in broadcast"
     );
 
-    let _ = broadcast_network.ready().await?.call(request).await;
+    let ready = broadcast_network.ready().await?;
+    if let Some(ids) = &observed {
+        for &id in ids {
+            super::telemetry::emit(id, "relay_started", None);
+        }
+    }
+    let result = ready.call(request).await;
+    if let Some(ids) = observed {
+        let phase = if result.is_ok() {
+            "relay_succeeded"
+        } else {
+            "relay_failed"
+        };
+        for id in ids {
+            super::telemetry::emit(id, phase, None);
+        }
+    }
 
     Ok(txs_len)
 }

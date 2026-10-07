@@ -2,6 +2,8 @@ import importlib.util
 import json
 from pathlib import Path
 import unittest
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 spec = importlib.util.spec_from_file_location("node_events", Path(__file__).resolve().parents[1] / "node_events.py")
 n = importlib.util.module_from_spec(spec)

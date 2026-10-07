@@ -443,6 +443,8 @@ where
 
         let gossiped_tx_req = gossiped_tx.clone();
 
+        let observation = super::telemetry::new_attempt();
+        super::telemetry::emit_attempt(txid, observation, "queued", None);
         let fut = async move {
             if let Gossip::Tx(tx) = &gossiped_tx {
                 Self::check_transaction_size(tx, max_transaction_bytes)?;
@@ -516,7 +518,9 @@ where
                 }
             };
 
+            super::telemetry::emit_attempt(txid, observation, "received", None);
             trace!(?txid, "got tx");
+            super::telemetry::emit_attempt(txid, observation, "verification_started", None);
 
             let result = verifier
                 .oneshot(tx::Request::Mempool {
@@ -535,6 +539,9 @@ where
             // Hide the transaction data to avoid filling the logs
             trace!(?txid, result = ?result.as_ref().map(|_tx| ()), "verified transaction for the mempool");
 
+            if result.is_ok() {
+                super::telemetry::emit_attempt(txid, observation, "verified", None);
+            }
             result.map_err(|e| TransactionDownloadVerifyError::Invalid { error: e.into(), advertiser_addr, tip_height } )
         }
         .map_ok(|(tx, spent_mempool_outpoints, tip_height)| {
@@ -596,6 +603,23 @@ where
                 },
             };
 
+            match &result {
+                Ok(Err(error)) => {
+                    let reason = match &error.0 {
+                        TransactionDownloadVerifyError::InState => "already_mined",
+                        TransactionDownloadVerifyError::StateError(_) => "state_unavailable",
+                        TransactionDownloadVerifyError::DownloadFailed(_) => "download_failed",
+                        TransactionDownloadVerifyError::Cancelled => "cancelled",
+                        TransactionDownloadVerifyError::PolicyRejected(_) => "policy",
+                        TransactionDownloadVerifyError::Invalid { .. } => "verification",
+                    };
+                    super::telemetry::emit_attempt(txid, observation, "rejected", Some(reason));
+                }
+                Err(_) => {
+                    super::telemetry::emit_attempt(txid, observation, "rejected", Some("timeout"))
+                }
+                Ok(Ok(_)) => {}
+            }
             result
         });
 

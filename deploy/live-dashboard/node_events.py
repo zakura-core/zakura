@@ -3,6 +3,7 @@
 from collections import OrderedDict
 import json
 import re
+from transaction_events import parse_transaction_event, summarize_transactions
 
 MAX_EVENT_BYTES = 8192
 MAX_ATTEMPTS = 4096
@@ -215,10 +216,13 @@ class EventFeed:
             self.db.execute("CREATE INDEX IF NOT EXISTS node_events_received ON node_block_events(received)")
             self.db.execute("CREATE TABLE IF NOT EXISTS node_crypto_events (process TEXT, sequence TEXT, received REAL, body TEXT, PRIMARY KEY(process, sequence))")
             self.db.execute("CREATE INDEX IF NOT EXISTS node_crypto_received ON node_crypto_events(received)")
+            self.db.execute("CREATE TABLE IF NOT EXISTS node_transaction_events (process TEXT, sequence TEXT, received REAL, body TEXT, PRIMARY KEY(process, sequence))")
+            self.db.execute("CREATE INDEX IF NOT EXISTS node_transaction_received ON node_transaction_events(received)")
 
     def ingest(self, datagrams, now):
         accepted = []
         crypto = []
+        transactions = []
         for data in datagrams[:256]:
             event = parse_block_event(data)
             if event is not None:
@@ -227,6 +231,10 @@ class EventFeed:
             batch = parse_crypto_event(data)
             if batch is not None:
                 crypto.append(batch)
+                continue
+            transaction = parse_transaction_event(data)
+            if transaction is not None:
+                transactions.append(transaction)
                 continue
             network = parse_network_event(data)
             if network is None:
@@ -248,7 +256,7 @@ class EventFeed:
                     self.network.popitem(last=False)
                 self.received += 1
                 self.last_received = now
-        if not accepted and not crypto:
+        if not accepted and not crypto and not transactions:
             return 0
         with self.lock, self.db:
             for event in accepted:
@@ -262,9 +270,24 @@ class EventFeed:
             if crypto:
                 self.db.execute("DELETE FROM node_crypto_events WHERE received < ?", (now - 86400,))
                 self.db.execute("DELETE FROM node_crypto_events WHERE rowid IN (SELECT rowid FROM node_crypto_events ORDER BY received DESC, rowid DESC LIMIT -1 OFFSET 32768)")
-            self.received += len(accepted) + len(crypto)
+            for event in transactions:
+                self.db.execute("INSERT OR IGNORE INTO node_transaction_events VALUES (?, ?, ?, ?)",
+                                (event["process"], str(event["sequence"]), now, json.dumps(event)))
+            if transactions:
+                self.db.execute("DELETE FROM node_transaction_events WHERE received < ?", (now - 86400,))
+                self.db.execute("DELETE FROM node_transaction_events WHERE rowid IN (SELECT rowid FROM node_transaction_events ORDER BY received DESC, rowid DESC LIMIT -1 OFFSET 65536)")
+            self.received += len(accepted) + len(crypto) + len(transactions)
             self.last_received = now
-        return len(accepted) + len(crypto)
+        return len(accepted) + len(crypto) + len(transactions)
+
+    def transactions(self, start, end):
+        with self.lock:
+            rows = self.db.execute("SELECT body, received FROM node_transaction_events WHERE received >= ? AND received <= ? ORDER BY received DESC, rowid DESC LIMIT 8193",
+                                   (end - 86400, end)).fetchall()
+            retained = self.db.execute("SELECT COUNT(*) FROM node_transaction_events").fetchone()[0]
+        events = [{**json.loads(body), "at": received} for body, received in rows[:8192]]
+        return {**summarize_transactions(events, start, end),
+                "limited": len(rows) > 8192 or retained >= 65536, "status": self.status()}
 
     def crypto(self, start, end):
         """Return individual completions, never repeated polling snapshots.

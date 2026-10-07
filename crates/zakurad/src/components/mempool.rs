@@ -60,6 +60,7 @@ pub mod gossip;
 mod pending_outputs;
 mod queue_checker;
 mod storage;
+mod telemetry;
 
 /// Supplies named, timed storage operations to a benchmark harness.
 #[cfg(feature = "mempool-bench")]

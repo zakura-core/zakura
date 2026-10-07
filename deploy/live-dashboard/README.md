@@ -384,3 +384,19 @@ stage times overlap and must not be summed. These are stage occurrence IDs, not
 state admission IDs or driver apply tokens. Fine-grained consensus verification,
 writer queue and storage boundaries, and the full correlated waterfall still need
 implementation and live validation.
+
+Transaction lifecycle hooks now distinguish queued work, body receipt, verification,
+admission, local relay calls, and removal through mining, expiry or eviction.
+Rejections use fixed categories rather than raw errors. Exact witnessed transaction
+IDs are replaced with per-process salted tokens before emission. Download and
+verification tasks carry explicit attempt IDs. Only matching task boundaries yield
+latencies. Admission, relay and mempool residence spans still need occurrence IDs
+before their durations can safely be shown. Counters include repeated attempts.
+
+The receiver retains at most 65,536 transaction events for 24 hours and summarizes
+at most 8,192 recent events per request, exposing limited coverage explicitly.
+Transaction panels and live validation are still pending.
+
+The initial `cf102b473` Linux build completed successfully at 21:14 UTC on October 7.
+Its service is inactive with exit status 0. The remote checkout can now be advanced
+for the incremental build; the running node remains the original binary.

@@ -499,6 +499,46 @@ impl Storage {
         spent_mempool_outpoints: Vec<transparent::OutPoint>,
         height: Option<Height>,
     ) -> (Result<UnminedTxId, MempoolError>, HashSet<UnminedTxId>) {
+        let id = tx.transaction.id();
+        let result = self.insert_with_evicted_ids_inner(tx, spent_mempool_outpoints, height);
+        match &result.0 {
+            Ok(_) => super::telemetry::emit(id, "admitted", None),
+            Err(error) => {
+                let reason = match error {
+                    MempoolError::InMempool | MempoolError::AlreadyQueued => "duplicate",
+                    MempoolError::FullQueue => "queue_full",
+                    MempoolError::Disabled => "disabled",
+                    MempoolError::NonStandardTransaction(_) => "policy",
+                    MempoolError::StorageExactTip(error) => match error {
+                        ExactTipRejectionError::FailedVerification(_) => "verification",
+                        ExactTipRejectionError::FailedStandard(_) => "policy",
+                        ExactTipRejectionError::Evicted => "capacity",
+                        ExactTipRejectionError::BelowEvictionCost => "fee_below_capacity_floor",
+                    },
+                    MempoolError::StorageEffectsTip(error) => match error {
+                        SameEffectsTipRejectionError::SpendConflict => "conflicting_effects",
+                        SameEffectsTipRejectionError::MissingOutput => "missing_output",
+                        SameEffectsTipRejectionError::TooManyAncestors => "too_many_ancestors",
+                        SameEffectsTipRejectionError::TooManyPackageTransactions => "package_limit",
+                    },
+                    MempoolError::StorageEffectsChain(error) => match error {
+                        SameEffectsChainRejectionError::Expired => "expiry_height",
+                        SameEffectsChainRejectionError::DuplicateSpend => "conflicting_effects",
+                        SameEffectsChainRejectionError::Mined => "already_mined",
+                    },
+                };
+                super::telemetry::emit(id, "rejected", Some(reason));
+            }
+        }
+        result
+    }
+
+    fn insert_with_evicted_ids_inner(
+        &mut self,
+        tx: VerifiedUnminedTx,
+        spent_mempool_outpoints: Vec<transparent::OutPoint>,
+        height: Option<Height>,
+    ) -> (Result<UnminedTxId, MempoolError>, HashSet<UnminedTxId>) {
         // # Security
         //
         // This method must call `reject`, rather than modifying the rejection lists directly.
@@ -613,6 +653,7 @@ impl Storage {
             for evicted_tx in self.verified.remove(&root) {
                 let evicted_id = evicted_tx.transaction.id();
                 self.reject(evicted_id, ExactTipRejectionError::Evicted.into());
+                super::telemetry::emit(evicted_id, "evicted", Some("capacity"));
                 evicted_ids.insert(evicted_id);
             }
         }
@@ -754,6 +795,12 @@ impl Storage {
 
         self.pending_outputs.prune();
 
+        for &id in &removed_mined {
+            super::telemetry::emit(id, "mined", None);
+        }
+        for &id in &removed_duplicate_spend {
+            super::telemetry::emit(id, "evicted", Some("conflicting_effects"));
+        }
         RemovedTransactionIds {
             mined: removed_mined,
             invalidated: removed_duplicate_spend,
@@ -1062,6 +1109,9 @@ impl Storage {
             );
         }
 
+        for &id in &removed_tx_ids {
+            super::telemetry::emit(id, "expired", Some("expiry_height"));
+        }
         removed_tx_ids
     }
 

@@ -76,6 +76,43 @@ class FeedTests(unittest.TestCase):
             finally:
                 feed.close()
 
+    def test_receiver_retries_locked_database_without_losing_batch(self):
+        import socket
+        import sqlite3
+        import tempfile
+        import time
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / "events.sqlite3")
+            feed = n.EventFeed(path, str(Path(directory) / "socket"))
+            feed.db.execute("PRAGMA busy_timeout=20")
+            other_writer = sqlite3.connect(path)
+            sender = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+            raw = {"version": 1, "process": "1-123", "sequence": 1,
+                   "monotonic_ns": 10, "unix_ms": 123,
+                   "event": {"event": "commit_start", "hash": "a" * 64,
+                             "height": 123, "apply_token": 1}}
+            try:
+                other_writer.execute("BEGIN IMMEDIATE")
+                feed.start()
+                sender.sendto(json.dumps(raw).encode(), feed.socket_path)
+                deadline = time.monotonic() + 2
+                while feed.status()["error"] is None and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertIn("retrying", feed.status()["error"])
+                self.assertTrue(feed.thread.is_alive())
+                other_writer.rollback()
+                deadline = time.monotonic() + 2
+                while feed.status()["received"] == 0 and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertEqual(feed.status()["received"], 1)
+                self.assertTrue(feed.status()["listening"])
+                self.assertIsNone(feed.status()["error"])
+                self.assertEqual(feed.db.execute("SELECT COUNT(*) FROM node_block_events").fetchone()[0], 1)
+            finally:
+                other_writer.close()
+                sender.close()
+                feed.close()
+
     def test_socket_does_not_replace_existing_file(self):
         import tempfile
         with tempfile.TemporaryDirectory() as directory:

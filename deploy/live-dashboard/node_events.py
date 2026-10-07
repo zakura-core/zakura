@@ -4,6 +4,7 @@ from collections import OrderedDict
 import json
 import logging
 import re
+import sqlite3
 from transaction_events import parse_transaction_event, summarize_transactions
 
 MAX_EVENT_BYTES = 8192
@@ -303,6 +304,25 @@ class EventFeed:
                 self.last_received = now
         if not accepted and not crypto and not transactions:
             return 0
+        # Keep this bounded batch during transient contention with the collector's
+        # SQLite writer. Stopping the receiver would lose all subsequent events.
+        while not self.stop.is_set():
+            try:
+                self.persist(accepted, crypto, transactions, now)
+                with self.lock:
+                    self.error = None
+                    self.received += len(accepted) + len(crypto) + len(transactions)
+                    self.last_received = now
+                return len(accepted) + len(crypto) + len(transactions)
+            except sqlite3.OperationalError as error:
+                if getattr(error, "sqlite_errorcode", 0) & 255 not in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED):
+                    raise
+                with self.lock:
+                    self.error = "Event storage busy; retrying retained batch"
+                self.stop.wait(0.1)
+        return 0
+
+    def persist(self, accepted, crypto, transactions, now):
         with self.lock, self.db:
             for event in accepted:
                 self.db.execute("INSERT OR IGNORE INTO node_block_events VALUES (?, ?, ?, ?, ?)",
@@ -321,9 +341,6 @@ class EventFeed:
             if transactions:
                 self.db.execute("DELETE FROM node_transaction_events WHERE received < ?", (now - 86400,))
                 self.db.execute("DELETE FROM node_transaction_events WHERE rowid IN (SELECT rowid FROM node_transaction_events ORDER BY received DESC, rowid DESC LIMIT -1 OFFSET 65536)")
-            self.received += len(accepted) + len(crypto) + len(transactions)
-            self.last_received = now
-        return len(accepted) + len(crypto) + len(transactions)
 
     def transactions(self, start, end):
         with self.lock:

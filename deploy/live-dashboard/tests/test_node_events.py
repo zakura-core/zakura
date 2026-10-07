@@ -315,6 +315,13 @@ class DeliveryCoverageTests(unittest.TestCase):
             feed.ingest([packet(1, 1, "2-456")], 102)
             self.assertEqual(feed.status()["reported_send_failures"], 4)
             self.assertEqual(feed.status()["reporting_runs"], 2)
+            self.assertEqual(feed.status()["latest_run_send_failures"], 1)
+            feed.ingest([packet(104, 4)], 103)
+            self.assertEqual(feed.status()["latest_run_send_failures"], 1)
+            feed.ingest([packet(1, None, "3-789")], 104)
+            self.assertIsNone(feed.status()["latest_run_send_failures"])
+            feed.ingest([packet(2, 0, "3-789")], 105)
+            self.assertEqual(feed.status()["latest_run_send_failures"], 0)
         finally:
             feed.close()
 

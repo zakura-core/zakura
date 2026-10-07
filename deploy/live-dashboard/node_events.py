@@ -224,6 +224,7 @@ class EventFeed:
         self.thread = None
         self.network = OrderedDict()
         self.delivery = OrderedDict()
+        self.latest_process = None
         self.received = 0
         self.rejected = 0
         self.last_received = None
@@ -349,9 +350,13 @@ class EventFeed:
         # Called only for an already validated event. Concurrent senders can
         # arrive out of order, so use their cumulative failure counter, not gaps.
         value = json.loads(data).get("send_failures")
-        if not integer(value):
-            return
         with self.lock:
+            # The process suffix is its start time, so late packets from a prior
+            # run cannot replace the newest observed run.
+            if self.latest_process is None or int(process.split("-")[1]) > int(self.latest_process.split("-")[1]):
+                self.latest_process = process
+            if not integer(value):
+                return
             self.delivery[process] = max(value, self.delivery.get(process, 0))
             self.delivery.move_to_end(process)
             while len(self.delivery) > 16:
@@ -363,7 +368,8 @@ class EventFeed:
                     "received": self.received, "rejected": self.rejected,
                     "last_received": self.last_received, "error": self.error,
                     "reported_send_failures": sum(self.delivery.values()) if self.delivery else None,
-                    "reporting_runs": len(self.delivery)}
+                    "reporting_runs": len(self.delivery),
+                    "latest_run_send_failures": self.delivery.get(self.latest_process)}
 
     def start(self):
         import os

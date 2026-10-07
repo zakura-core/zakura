@@ -1,0 +1,15 @@
+[Unit]
+Description=Persistent Zakura dashboard event socket
+
+[Socket]
+ListenDatagram=/run/zakura-live-dashboard/node-events.sock
+SocketUser=zakura-dashboard-web
+SocketGroup=zakura-dashboard-web
+SocketMode=0660
+DirectoryMode=0750
+ReceiveBuffer=4M
+RemoveOnStop=yes
+Service=zakura-live-dashboard.service
+
+[Install]
+WantedBy=sockets.target

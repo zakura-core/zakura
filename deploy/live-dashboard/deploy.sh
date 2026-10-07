@@ -40,7 +40,16 @@ if [[ -f "$root/build.env" ]]; then cp "$root/build.env" "$backup/build.env"; fi
 if [[ -f /etc/systemd/system/zakura-live-dashboard.service ]]; then
   cp /etc/systemd/system/zakura-live-dashboard.service "$backup/dashboard.service"
 fi
+if [[ -f /etc/systemd/system/zakura-live-dashboard.socket ]]; then
+  cp /etc/systemd/system/zakura-live-dashboard.socket "$backup/dashboard.socket"
+fi
+socket_was_active=false
+if systemctl is-active --quiet zakura-live-dashboard.socket; then socket_was_active=true; fi
 rollback() {
+  systemctl stop zakura-live-dashboard || true
+  if [[ "$socket_was_active" == false ]]; then
+    systemctl disable --now zakura-live-dashboard.socket || true
+  fi
   echo "Dashboard deployment failed. Restoring previous configuration." >&2
   cp "$backup/Caddyfile" /etc/caddy/Caddyfile
   systemctl reload caddy
@@ -48,6 +57,9 @@ rollback() {
     ln -sfn "$previous" "$root/current"
     cp "$backup/build.env" "$root/build.env"
     cp "$backup/dashboard.service" /etc/systemd/system/zakura-live-dashboard.service
+    if [[ -f "$backup/dashboard.socket" ]]; then
+      cp "$backup/dashboard.socket" /etc/systemd/system/zakura-live-dashboard.socket
+    fi
     systemctl daemon-reload
     systemctl restart zakura-live-dashboard
   else
@@ -60,7 +72,17 @@ ln -sfn "$release" "$root/current"
 printf 'DASHBOARD_BUILD=%s\n' "$revision" > "$root/build.env"
 chmod 644 "$root/build.env"
 install -m 644 "$release/deploy/live-dashboard/dashboard.service" /etc/systemd/system/zakura-live-dashboard.service
+# Keep an existing event socket alive while the receiver is replaced.
+if [[ "$socket_was_active" == false ]]; then
+  systemctl stop zakura-live-dashboard
+  if [[ -S /run/zakura-live-dashboard/node-events.sock ]]; then
+    unlink /run/zakura-live-dashboard/node-events.sock
+  fi
+fi
+install -d -o zakura-dashboard-web -g zakura-dashboard-web -m 750 /run/zakura-live-dashboard
+install -m 644 "$release/deploy/live-dashboard/dashboard.socket" /etc/systemd/system/zakura-live-dashboard.socket
 systemctl daemon-reload
+systemctl enable --now zakura-live-dashboard.socket
 systemctl enable zakura-live-dashboard
 systemctl restart zakura-live-dashboard
 ready=false

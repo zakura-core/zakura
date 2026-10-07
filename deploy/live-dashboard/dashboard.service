@@ -1,6 +1,7 @@
 [Unit]
 Description=Zakura live node dashboard
-After=network-online.target
+After=network-online.target zakura-live-dashboard.socket
+Requires=zakura-live-dashboard.socket
 Wants=network-online.target
 
 [Service]
@@ -10,6 +11,7 @@ User=zakura-dashboard-web
 Group=zakura-dashboard-web
 RuntimeDirectory=zakura-live-dashboard
 RuntimeDirectoryMode=0750
+RuntimeDirectoryPreserve=yes
 StateDirectory=zakura-live-dashboard
 EnvironmentFile=/opt/zakura-live-dashboard/build.env
 ExecStart=/usr/bin/python3 -u /opt/zakura-live-dashboard/current/deploy/live-dashboard/dashboard.py --host 127.0.0.1 --port 8095 --history /var/lib/zakura-live-dashboard/history.sqlite3 --build ${DASHBOARD_BUILD} --event-socket /run/zakura-live-dashboard/node-events.sock

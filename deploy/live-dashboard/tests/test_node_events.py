@@ -299,6 +299,45 @@ class WaterfallTests(unittest.TestCase):
         self.assertTrue(all(span["duration_ms"] is None for run in runs for span in run["spans"]))
 
 
+class SocketActivationTests(unittest.TestCase):
+    def test_socket_retains_datagrams_between_receivers(self):
+        import os
+        import socket
+        import tempfile
+        import time
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / "events.sock")
+            keeper = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+            sender = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+            keeper.bind(path)
+            inherited = n.inherited_event_socket
+            def activate(expected):
+                with patch.dict(os.environ, {"LISTEN_PID": str(os.getpid()), "LISTEN_FDS": "1"}):
+                    return inherited(expected, os.dup(keeper.fileno()))
+            try:
+                with patch.object(n, "inherited_event_socket", side_effect=activate):
+                    first = n.EventFeed(":memory:", path)
+                    first.start()
+                    first.close()
+                    self.assertTrue(Path(path).exists())
+                    sender.sendto(CryptoTests.packet(1), path)
+                    second = n.EventFeed(":memory:", path)
+                    try:
+                        second.start()
+                        deadline = time.monotonic() + 2
+                        while second.status()["received"] < 1 and time.monotonic() < deadline:
+                            time.sleep(.01)
+                        self.assertEqual(second.status()["received"], 1)
+                        self.assertEqual(second.status()["rejected"], 0)
+                    finally:
+                        second.close()
+                    self.assertTrue(Path(path).exists())
+            finally:
+                keeper.close()
+                sender.close()
+
+
 class DeliveryCoverageTests(unittest.TestCase):
     def test_out_of_order_sequences_do_not_invent_loss(self):
         feed = n.EventFeed(":memory:")

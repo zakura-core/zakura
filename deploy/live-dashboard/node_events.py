@@ -211,6 +211,26 @@ class BlockAttempts:
         return result
 
 
+def inherited_event_socket(path, descriptor=3):
+    """Take the single systemd datagram socket without owning its filesystem path."""
+    import os
+    import socket
+    if os.environ.get("LISTEN_PID") != str(os.getpid()):
+        return None
+    if os.environ.get("LISTEN_FDS") != "1":
+        raise OSError("Expected one event socket")
+    inherited = socket.fromfd(descriptor, socket.AF_UNIX, socket.SOCK_DGRAM)
+    try:
+        if (inherited.getsockopt(socket.SOL_SOCKET, socket.SO_TYPE) != socket.SOCK_DGRAM
+                or inherited.getsockname() != path):
+            raise OSError("Unexpected event socket")
+    except Exception:
+        inherited.close()
+        raise
+    os.close(descriptor)
+    return inherited
+
+
 class EventFeed:
     """Local receiver with bounded persistent history and no node RPC access."""
     def __init__(self, database, socket_path=None):
@@ -221,6 +241,7 @@ class EventFeed:
         self.stop = threading.Event()
         self.socket_path = socket_path
         self.socket = None
+        self.owns_socket_path = False
         self.thread = None
         self.network = OrderedDict()
         self.delivery = OrderedDict()
@@ -379,13 +400,17 @@ class EventFeed:
             return
         # The service owns a private runtime directory. Never replace an existing
         # socket or file: a second receiver must fail rather than steal delivery.
-        self.socket = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
         try:
-            self.socket.bind(self.socket_path)
-            os.chmod(self.socket_path, 0o660)
+            self.socket = inherited_event_socket(self.socket_path)
+            if self.socket is None:
+                self.socket = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+                self.socket.bind(self.socket_path)
+                self.owns_socket_path = True
+                os.chmod(self.socket_path, 0o660)
             self.socket.settimeout(0.5)
         except OSError:
-            self.socket.close()
+            if self.socket:
+                self.socket.close()
             self.socket = None
             self.error = "Event socket unavailable"
             return
@@ -421,10 +446,11 @@ class EventFeed:
         if self.socket:
             self.socket.close()
             self.socket = None
-            try:
-                os.unlink(self.socket_path)
-            except FileNotFoundError:
-                pass
+            if self.owns_socket_path:
+                try:
+                    os.unlink(self.socket_path)
+                except FileNotFoundError:
+                    pass
         with self.lock:
             self.db.close()
 

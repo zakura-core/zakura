@@ -1,6 +1,7 @@
 [Unit]
 Description=Dedicated pruned Zakura dashboard node
-After=network-online.target
+After=network-online.target zakura-live-dashboard.service
+Wants=zakura-live-dashboard.service
 Wants=network-online.target
 AssertPathExists=/opt/zakura-dashboard-node/current/zakurad
 

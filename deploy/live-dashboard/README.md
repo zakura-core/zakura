@@ -497,3 +497,11 @@ Native header-sync status changes record the advertised selected-tip hash as a
 block announcement. Repeated identical status messages from the same session do
 not create more events. This records a peer's claim, not a verified header or
 block body, and shares the announcement timeline with legacy inventory messages.
+
+The dashboard uses a systemd-owned datagram socket. Receiver restarts leave the
+socket and its bounded kernel queue intact. The Python receiver validates the
+inherited socket type and path and never unlinks a systemd-owned path. The node
+starts after the receiver service on boot. The initial migration to socket
+activation briefly interrupts collection, but later receiver restarts preserve
+queued datagrams. This does not guarantee delivery during long outages or bursts
+that exceed the kernel queue. The node's failure counter remains authoritative.

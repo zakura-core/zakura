@@ -161,3 +161,48 @@ class NativeTests(unittest.TestCase):
             self.assertIsNone(feed.native(111)["connections"][0]["rx_bytes_ps"])
         finally:
             feed.close()
+
+
+class CryptoTests(unittest.TestCase):
+    @staticmethod
+    def packet(sequence=1, process="1-123", **fields):
+        return json.dumps({"version": 1, "process": process, "sequence": sequence,
+                           "monotonic_ns": sequence * 1000, "unix_ms": 123000,
+                           "event": {"event": "crypto_batch", "verifier": "halo2",
+                                     "unit": "actions", "mode": "batch", "success": True,
+                                     "items": 3, "work_units": 12, "in_batch_wait_ms": 4,
+                                     "scheduling_ms": 2, "execution_ms": 8,
+                                     "private": "secret", **fields}}).encode()
+
+    def test_schema_rejects_bad_units_counts_and_nonfinite_durations(self):
+        parsed = n.parse_crypto_event(self.packet())
+        self.assertEqual((parsed["items"], parsed["work_units"]), (3, 12))
+        self.assertNotIn("secret", json.dumps(parsed))
+        for fields in ({"unit": "proofs"}, {"items": 0}, {"items": True},
+                       {"work_units": -1}, {"success": 1}, {"mode": "unknown"},
+                       {"verifier": []}, {"execution_ms": float("nan")},
+                       {"scheduling_ms": float("inf")}, {"in_batch_wait_ms": -1}):
+            self.assertIsNone(n.parse_crypto_event(self.packet(**fields)), fields)
+
+    def test_completion_deduplication_windows_failures_and_restart(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / "crypto.sqlite3")
+            feed = n.EventFeed(path)
+            feed.ingest([self.packet(), self.packet()], 100)
+            # Equal measured times are legitimate for distinct batches.
+            feed.ingest([self.packet(2), self.packet(process="2-456", mode="fallback", success=False)], 110)
+            self.assertEqual(len(feed.crypto(90, 120)["samples"]), 3)
+            feed.close()
+            feed = n.EventFeed(path)
+            try:
+                selected = feed.crypto(105, 110)
+                self.assertEqual(len(selected["samples"]), 2)
+                self.assertFalse(selected["limited"])
+                self.assertFalse(selected["samples"][-1]["success"])
+                self.assertNotIn("secret", json.dumps(selected))
+                self.assertEqual(feed.crypto(111, 120)["samples"], [])
+                feed.ingest([self.packet(3)], 86600)
+                self.assertEqual(len(feed.crypto(0, 86600)["samples"]), 1)
+            finally:
+                feed.close()

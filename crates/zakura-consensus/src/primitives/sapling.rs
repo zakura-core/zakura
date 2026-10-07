@@ -126,6 +126,7 @@ impl RequestWeight for Item {
 pub struct Verifier {
     /// A batch verifier for Sapling shielded data.
     batch: BatchValidator,
+    observation: zakura_jsonl_trace::dashboard::BatchObservation,
 
     /// A channel for broadcasting the verification result of the batch.
     ///
@@ -152,12 +153,20 @@ impl Drop for Verifier {
         let batch = mem::take(&mut self.batch);
         let tx = mem::take(&mut self.tx);
 
+        let observation = mem::take(&mut self.observation);
+        let submitted = std::time::Instant::now();
         // The validation is CPU-intensive; do it on a dedicated thread so it does not block.
         rayon::spawn_fifo(move || {
             let (spend_vk, output_vk) = SAPLING.verifying_keys();
 
             // Validate the batch and send the result through the channel.
-            let res = batch.validate(&spend_vk, &output_vk, thread_rng());
+            let res = observation.verify(
+                VERIFIER_NAME,
+                "spends_and_outputs",
+                "drop_flush",
+                submitted,
+                || batch.validate(&spend_vk, &output_vk, thread_rng()),
+            );
             let _ = tx.send(Some(res));
         });
     }
@@ -175,6 +184,7 @@ impl Service<BatchControl<Item>> for Verifier {
     fn call(&mut self, req: BatchControl<Item>) -> Self::Future {
         match req {
             BatchControl::Item(item) => {
+                let weight = item.request_weight();
                 let mut rx = self.tx.subscribe();
 
                 let bundle_check = self
@@ -182,6 +192,9 @@ impl Service<BatchControl<Item>> for Verifier {
                     .check_bundle(item.bundle, item.sighash.into())
                     .then_some(())
                     .ok_or(TransactionError::SaplingVerificationFailed);
+                if bundle_check.is_ok() {
+                    self.observation.queued(weight);
+                }
 
                 async move {
                     bundle_check.map_err(BoxError::from)?;
@@ -210,6 +223,7 @@ impl Service<BatchControl<Item>> for Verifier {
             }
 
             BatchControl::Flush => {
+                let observation = mem::take(&mut self.observation);
                 let batch = mem::take(&mut self.batch);
                 let tx = mem::take(&mut self.tx);
 
@@ -217,7 +231,13 @@ impl Service<BatchControl<Item>> for Verifier {
                     let start = std::time::Instant::now();
                     let spawn_result = tokio::task::spawn_blocking(move || {
                         let (spend_vk, output_vk) = SAPLING.verifying_keys();
-                        batch.validate(&spend_vk, &output_vk, thread_rng())
+                        observation.verify(
+                            VERIFIER_NAME,
+                            "spends_and_outputs",
+                            "batch",
+                            start,
+                            || batch.validate(&spend_vk, &output_vk, thread_rng()),
+                        )
                     })
                     .await;
                     let duration = start.elapsed().as_secs_f64();
@@ -250,6 +270,8 @@ pub fn verify_single(
 ) -> Pin<Box<dyn Future<Output = Result<(), Box<dyn std::error::Error + Send + Sync>>> + Send>> {
     async move {
         let mut verifier = Verifier::default();
+        let mut observation = zakura_jsonl_trace::dashboard::BatchObservation::default();
+        observation.queued(item.request_weight());
 
         let check = verifier
             .batch
@@ -258,10 +280,17 @@ pub fn verify_single(
             .ok_or(TransactionError::SaplingVerificationFailed);
         check.map_err(BoxError::from)?;
 
+        let submitted = std::time::Instant::now();
         let is_valid = tokio::task::spawn_blocking(move || {
             let (spend_vk, output_vk) = SAPLING.verifying_keys();
 
-            mem::take(&mut verifier.batch).validate(&spend_vk, &output_vk, thread_rng())
+            observation.verify(
+                VERIFIER_NAME,
+                "spends_and_outputs",
+                "fallback",
+                submitted,
+                || mem::take(&mut verifier.batch).validate(&spend_vk, &output_vk, thread_rng()),
+            )
         })
         .await
         .map_err(|_| BoxError::from("Sapling bundle validation thread panicked"))?;

@@ -94,6 +94,43 @@ def parse_network_event(data):
         return None
 
 
+CRYPTO_UNITS = {"halo2": "actions", "groth16_sapling": "spends_and_outputs",
+                "ed25519": "signatures", "redpallas": "signatures", "redjubjub": "signatures"}
+
+
+def parse_crypto_event(data):
+    """Only completed, nonempty batches with finite measured durations are public."""
+    if len(data) > MAX_EVENT_BYTES:
+        return None
+    try:
+        row = json.loads(data)
+        if not isinstance(row, dict) or type(row.get("version")) is not int or row["version"] != 1:
+            return None
+        process = row.get("process")
+        if not isinstance(process, str) or not re.fullmatch(r"[0-9]{1,20}-[0-9]{1,30}", process):
+            return None
+        if not all(integer(row.get(key)) for key in ("sequence", "monotonic_ns", "unix_ms")):
+            return None
+        event = row.get("event")
+        if not isinstance(event, dict) or event.get("event") != "crypto_batch":
+            return None
+        verifier = event.get("verifier")
+        if not isinstance(verifier, str) or verifier not in CRYPTO_UNITS or event.get("unit") != CRYPTO_UNITS[verifier]:
+            return None
+        if event.get("mode") not in ("batch", "fallback", "drop_flush") or type(event.get("success")) is not bool:
+            return None
+        if not integer(event.get("items")) or event["items"] == 0 or not integer(event.get("work_units")):
+            return None
+        durations = ("in_batch_wait_ms", "scheduling_ms", "execution_ms")
+        # A day is also the history horizon. Reject infinities, NaNs and booleans.
+        if not all(type(event.get(key)) in (int, float) and 0 <= event[key] <= 86_400_000 for key in durations):
+            return None
+        return {**{key: row[key] for key in ("process", "sequence", "monotonic_ns", "unix_ms")},
+                **{key: event[key] for key in ("verifier", "unit", "mode", "success", "items", "work_units", *durations)}}
+    except (ValueError, TypeError, RecursionError):
+        return None
+
+
 class BlockAttempts:
     """Join only boundaries from the same process, hash, and apply token.
 
@@ -162,13 +199,20 @@ class EventFeed:
             self.db.execute("CREATE TABLE IF NOT EXISTS node_block_events (process TEXT, sequence TEXT, hash TEXT, received REAL, body TEXT, PRIMARY KEY(process, sequence))")
             self.db.execute("CREATE INDEX IF NOT EXISTS node_events_hash ON node_block_events(hash, received)")
             self.db.execute("CREATE INDEX IF NOT EXISTS node_events_received ON node_block_events(received)")
+            self.db.execute("CREATE TABLE IF NOT EXISTS node_crypto_events (process TEXT, sequence TEXT, received REAL, body TEXT, PRIMARY KEY(process, sequence))")
+            self.db.execute("CREATE INDEX IF NOT EXISTS node_crypto_received ON node_crypto_events(received)")
 
     def ingest(self, datagrams, now):
         accepted = []
+        crypto = []
         for data in datagrams[:256]:
             event = parse_block_event(data)
             if event is not None:
                 accepted.append(event)
+                continue
+            batch = parse_crypto_event(data)
+            if batch is not None:
+                crypto.append(batch)
                 continue
             network = parse_network_event(data)
             if network is None:
@@ -190,7 +234,7 @@ class EventFeed:
                     self.network.popitem(last=False)
                 self.received += 1
                 self.last_received = now
-        if not accepted:
+        if not accepted and not crypto:
             return 0
         with self.lock, self.db:
             for event in accepted:
@@ -198,10 +242,28 @@ class EventFeed:
                                 (event["process"], str(event["sequence"]), event["hash"], now, json.dumps(event)))
             self.db.execute("DELETE FROM node_block_events WHERE received < ?", (now - 86400,))
             self.db.execute("DELETE FROM node_block_events WHERE rowid IN (SELECT rowid FROM node_block_events ORDER BY received DESC, rowid DESC LIMIT -1 OFFSET 49152)")
-            if accepted:
-                self.received += len(accepted)
-                self.last_received = now
-        return len(accepted)
+            for event in crypto:
+                self.db.execute("INSERT OR IGNORE INTO node_crypto_events VALUES (?, ?, ?, ?)",
+                                (event["process"], str(event["sequence"]), now, json.dumps(event)))
+            if crypto:
+                self.db.execute("DELETE FROM node_crypto_events WHERE received < ?", (now - 86400,))
+                self.db.execute("DELETE FROM node_crypto_events WHERE rowid IN (SELECT rowid FROM node_crypto_events ORDER BY received DESC, rowid DESC LIMIT -1 OFFSET 32768)")
+            self.received += len(accepted) + len(crypto)
+            self.last_received = now
+        return len(accepted) + len(crypto)
+
+    def crypto(self, start, end):
+        """Return individual completions, never repeated polling snapshots.
+
+        Receipt time selects the window consistently with other collected history.
+        Keep node wall time separately, since its clock can jump across restarts.
+        """
+        with self.lock:
+            rows = self.db.execute("SELECT body, received FROM node_crypto_events WHERE received >= ? AND received <= ? ORDER BY received DESC, rowid DESC LIMIT 4097",
+                                   (start, end)).fetchall()
+            retained = self.db.execute("SELECT COUNT(*) FROM node_crypto_events").fetchone()[0]
+        return {"samples": [{**json.loads(body), "at": received} for body, received in reversed(rows[:4096])],
+                "limited": len(rows) > 4096 or retained >= 32768, "status": self.status()}
 
     def block(self, block_hash, now):
         with self.lock:

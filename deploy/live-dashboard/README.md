@@ -352,3 +352,18 @@ The native health panel is hidden until actual measurements arrive. Packet loss
 is not labeled retransmission. Actual retransmissions and proper aggregate queue
 occupancy remain pending. These hooks still need the updated Linux build and live
 validation; the running build remains pinned to the initial `cf102b473` snapshot.
+
+Crypto batch instrumentation now covers Halo 2 and Sapling normal batches,
+individual fallback verification, and pending batches flushed on drop. Events
+record accepted item counts, action or spend/output counts, first-item in-batch
+wait, CPU scheduling delay, validation duration, and success. These counts are
+work performed, not unique transactions. Empty shutdown flushes emit no event.
+Signature verifier instrumentation is still pending.
+
+The receiver stores at most 32,768 sanitized crypto completions for 24 hours,
+deduplicated by node process and event sequence. Selected-window responses contain
+at most 4,096 recent completions and explicitly flag limited history. Receipt time
+selects the window; node wall time is retained separately. Repeated polling never
+creates new events. Individual-event charts replace rolling summaries only for
+verifiers with measured events in the selected window. These changes still need
+the updated Linux build and real node/browser validation before deployment.

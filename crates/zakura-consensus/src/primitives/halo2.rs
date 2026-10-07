@@ -461,6 +461,7 @@ pub struct Verifier {
 
     /// The synchronous Halo2 batch validator.
     batch: BatchValidator<'static>,
+    observation: zakura_jsonl_trace::dashboard::BatchObservation,
 
     /// A channel for broadcasting the result of a batch to the futures for each batch item.
     ///
@@ -476,6 +477,7 @@ impl Verifier {
         Self {
             vk,
             batch: BatchValidator::new(vk),
+            observation: Default::default(),
             tx,
         }
     }
@@ -493,8 +495,15 @@ impl Verifier {
 
     /// Synchronously process the batch using its bound verifying key, and send the result using
     /// the channel sender. This function blocks until the batch is completed.
-    fn verify(batch: BatchValidator<'static>, tx: Sender) {
-        let result = batch.validate(thread_rng());
+    fn verify(
+        batch: BatchValidator<'static>,
+        tx: Sender,
+        observation: zakura_jsonl_trace::dashboard::BatchObservation,
+        submitted: std::time::Instant,
+    ) {
+        let result = observation.verify("halo2", "actions", "drop_flush", submitted, || {
+            batch.validate(thread_rng())
+        });
         let _ = tx.send(Some(result));
     }
 
@@ -506,16 +515,29 @@ impl Verifier {
         // Correctness: Do CPU-intensive work on a dedicated thread, to avoid blocking other futures.
         //
         // We don't care about execution order here, because this method is only called on drop.
-        tokio::task::block_in_place(|| rayon::spawn_fifo(move || Self::verify(batch, tx)));
+        let observation = mem::take(&mut self.observation);
+        let submitted = std::time::Instant::now();
+        tokio::task::block_in_place(|| {
+            rayon::spawn_fifo(move || Self::verify(batch, tx, observation, submitted))
+        });
     }
 
     /// Flush the batch using a thread pool, validating against the batch's bound key and returning
     /// the result via the channel. This function returns a future that becomes ready when the batch
     /// is completed.
-    async fn flush_spawning(batch: BatchValidator<'static>, tx: Sender) {
+    async fn flush_spawning(
+        batch: BatchValidator<'static>,
+        tx: Sender,
+        observation: zakura_jsonl_trace::dashboard::BatchObservation,
+    ) {
         // Correctness: Do CPU-intensive work on a dedicated thread, to avoid blocking other futures.
         let start = std::time::Instant::now();
-        let result = spawn_fifo(move || batch.validate(thread_rng())).await;
+        let result = spawn_fifo(move || {
+            observation.verify("halo2", "actions", "batch", start, || {
+                batch.validate(thread_rng())
+            })
+        })
+        .await;
         let duration = start.elapsed().as_secs_f64();
 
         let result_label = match &result {
@@ -538,7 +560,16 @@ impl Verifier {
         vk: &'static ItemVerifyingKey,
     ) -> Result<(), BoxError> {
         // Correctness: Do CPU-intensive work on a dedicated thread, to avoid blocking other futures.
-        if spawn_fifo(move || item.verify_single(vk)).await? {
+        let mut observation = zakura_jsonl_trace::dashboard::BatchObservation::default();
+        observation.queued(item.request_weight());
+        let submitted = std::time::Instant::now();
+        if spawn_fifo(move || {
+            observation.verify("halo2", "actions", "fallback", submitted, || {
+                item.verify_single(vk)
+            })
+        })
+        .await?
+        {
             Ok(())
         } else {
             Err(TransactionError::Halo2VerificationFailed.into())
@@ -566,9 +597,11 @@ impl Service<BatchControl<Item>> for Verifier {
         match req {
             BatchControl::Item(item) => {
                 tracing::trace!("got item");
+                let weight = item.request_weight();
                 if let Err(err) = self.batch.queue(item) {
                     return Box::pin(async move { Err(BoxError::from(err)) });
                 }
+                self.observation.queued(weight);
                 let mut rx = self.tx.subscribe();
                 Box::pin(async move {
                     match rx.changed().await {
@@ -600,7 +633,8 @@ impl Service<BatchControl<Item>> for Verifier {
 
                 let (batch, tx) = self.take();
 
-                Box::pin(Self::flush_spawning(batch, tx).map(|()| Ok(())))
+                let observation = mem::take(&mut self.observation);
+                Box::pin(Self::flush_spawning(batch, tx, observation).map(|()| Ok(())))
             }
         }
     }

@@ -21,6 +21,7 @@ const MAX_BLOCK_BYTES = 2_000_000;
 const COLORS = ["#bcf6b8", "#c1b6ef", "#f1bf75"];
 let state = null;
 let history = [];
+let cryptoBatches = null;
 let range = "15m";
 let paused = false;
 let fetching = false;
@@ -610,7 +611,7 @@ function renderBlockDetail(hash) {
     `<span class="block-state">${b.canonical === true ? "On the observed best chain" : b.canonical === false ? "Off the observed best chain" : "Chain membership not yet checked"}</span><div class="block-hash">${esc(b.hash)}</div><dl class="stat-list detail-stats">${data.map(([k, v]) => `<div><dt>${esc(k)}</dt><dd>${esc(v)}</dd></div>`).join("")}</dl><p>The observation time is when the dashboard polled this block. It is not its receive time or processing duration.</p>${renderBlockEvents()}`;
 }
 const charts = new Map();
-function chart(id, keys, format, points = false) {
+function chart(id, keys, format, points = false, rows = history) {
   const container = $(id);
   if (!container) return;
   if (!charts.has(id))
@@ -619,7 +620,7 @@ function chart(id, keys, format, points = false) {
       new HistoryChart(container, keys, format, points, COLORS, clock),
     );
   const end = period?.end || state?.generated_at || Date.now() / 1000;
-  charts.get(id).update(history, end - WINDOWS[range], end);
+  charts.get(id).update(rows, end - WINDOWS[range], end);
 }
 
 function renderCharts() {
@@ -653,9 +654,34 @@ function renderCharts() {
   for (const [name, label] of Object.entries(verifiers)) {
     const keys = [`crypto_${name}_p50_ms`, `crypto_${name}_p95_ms`];
     const id = `crypto-${name}-chart`;
-    const available = history.some((row) =>
+    const measured = (cryptoBatches?.samples || []).filter((row) => row.verifier === name);
+    const available = !measured.length && history.some((row) =>
       keys.some((key) => valid(row[key])),
     );
+    const measuredId = `batch-${name}`;
+    if (measured.length && !$(measuredId)) {
+      const section = document.createElement("section");
+      section.id = measuredId;
+      section.innerHTML = `<div class="panel-heading"><h3>${label} measured batches</h3></div>
+        <p id="${measuredId}-summary" class="panel-note"></p>
+        <div class="chart-legend"><span><i class="dot"></i>Execution</span><span><i class="dot violet"></i>Scheduling</span><span><i class="dot amber"></i>In-batch wait</span></div>
+        <div id="${measuredId}-time" class="chart short" role="img" aria-label="${label} individual batch durations"></div>
+        <div class="chart-legend"><span><i class="dot"></i>Items</span><span><i class="dot violet"></i>Work units</span></div>
+        <div id="${measuredId}-size" class="chart short" role="img" aria-label="${label} batch sizes"></div>`;
+      $("crypto-history").append(section);
+    }
+    if ($(measuredId)) {
+      $(measuredId).hidden = !measured.length;
+      if (measured.length) {
+        const rows = measured.map((row) => ({ ...row, t: row.at }));
+        const failures = measured.filter((row) => !row.success).length;
+        const fallback = measured.filter((row) => row.mode === "fallback").length;
+        const unit = measured[0].unit.replaceAll("_", " ");
+        set(`${measuredId}-summary`, `${fmt(measured.length)} recorded completions · ${fmt(failures)} failed · ${fmt(fallback)} fallback · work units: ${unit}${cryptoBatches.limited ? " · limited history" : ""}`);
+        chart(`${measuredId}-time`, ["execution_ms", "scheduling_ms", "in_batch_wait_ms"], ms, true, rows);
+        chart(`${measuredId}-size`, ["items", "work_units"], fmt, true, rows);
+      }
+    }
     if (!$(id) && available) {
       const section = document.createElement("section");
       section.innerHTML = `<div class="panel-heading"><h3>${label}</h3></div><div id="${id}" class="chart short" role="img" aria-label="${label} batch timing history"></div>`;
@@ -666,7 +692,7 @@ function renderCharts() {
       chart(id, keys, ms, true);
     }
   }
-  $("crypto-empty").hidden = history.some((row) =>
+  $("crypto-empty").hidden = Boolean(cryptoBatches?.samples?.length) || history.some((row) =>
     Object.keys(verifiers).some((name) => valid(row[`crypto_${name}_p95_ms`])),
   );
   chart("tps-chart", ["tps", "user_tps"], (v) => format("tps", v));
@@ -718,6 +744,7 @@ async function loadHistory() {
   );
   if (request === historyRequest && requested === range) {
     history = data.samples;
+    cryptoBatches = data.crypto || null;
     period = data.activity;
     periodBlocks = data.blocks;
     lastHistory = Date.now();

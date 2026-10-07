@@ -316,10 +316,13 @@
                 observed batch summary.
               </p>
               <p class="panel-bottom">
-                Each dot samples the node’s rolling batch-time summary when its
-                observation count increases, not an individual batch. p50 and
-                p95 can overlap. Times include scheduling and may include
-                mempool work. Missing summaries leave gaps.
+                Measured batches show each recorded completion once, including
+                fallback and shutdown flushes. Items are bundles or signatures.
+                Work units count actions, spends and outputs, or signatures.
+                In-batch wait begins with the first accepted item and excludes
+                upstream queues. Work may include mempool transactions.
+                Verifiers without individual events show rolling p50/p95 summaries,
+                which can overlap and include scheduling. Missing records leave gaps.
               </p>
             </section>
             <section class="panel">

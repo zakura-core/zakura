@@ -5,6 +5,9 @@
 //! to the consumer, which must never present incomplete spans as complete ones.
 
 use serde::Serialize;
+mod batch;
+pub use batch::BatchObservation;
+
 use std::{
     io::{self, Write},
     sync::{

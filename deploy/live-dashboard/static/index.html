@@ -1,0 +1,495 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#101412" />
+    <meta
+      name="description"
+      content="A live view inside a Zakura Zcash node. Follow blocks, verification, peers, and node health."
+    />
+    <title>Zakura · Live node</title>
+    <link rel="icon" href="favicon.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="style.css" />
+    <script src="app.js" defer></script>
+  </head>
+  <body>
+    <a href="#main" class="skip">Skip to dashboard</a>
+    <header class="topbar">
+      <a class="brand" href="./" aria-label="Zakura live node home"
+        ><img src="favicon.svg" alt="" width="30" height="30" /><strong
+          >ZAKURA</strong
+        ><span>LIVE NODE</span></a
+      >
+      <div class="top-controls">
+        <span class="network"><i></i> Zcash mainnet</span
+        ><button
+          id="about-button"
+          class="icon-button"
+          aria-label="About this dashboard"
+        >
+          i
+        </button>
+      </div>
+    </header>
+    <div class="workspace">
+      <aside class="block-rail" aria-label="Recent blocks">
+        <div class="rail-heading">
+          <h2>Block stream</h2>
+          <span class="muted">Latest 30</span>
+        </div>
+        <div class="rail-caption">
+          <span>HEIGHT / TRANSACTIONS</span><span>AGE</span>
+        </div>
+        <div id="blocks" class="blocks">
+          <p class="empty">Connecting to the node…</p>
+        </div>
+        <p class="rail-note">
+          A view of this node’s chain.<br />Block age uses the miner’s
+          timestamp.
+        </p>
+      </aside>
+      <main id="main">
+        <section class="page-heading">
+          <div>
+            <div class="eyebrow">INSIDE THE NODE</div>
+            <h1>Network in. Verified state out.</h1>
+            <p>
+              <span id="node-name">us-east-0</span
+              ><span class="separator">/</span
+              ><span id="node-version">Connecting</span
+              ><span class="separator">/</span><span id="upgrade">Zcash</span>
+            </p>
+          </div>
+          <div class="live-controls">
+            <span id="live-status" class="status"><i></i> Connecting</span
+            ><button id="pause" class="subtle-button" aria-pressed="false">
+              Pause
+            </button>
+          </div>
+        </section>
+        <div id="notice" class="notice" role="status" hidden></div>
+        <section class="headline-grid" aria-label="Chain overview">
+          <article class="headline primary">
+            <div class="label">
+              Verified chain height
+              <span id="chain-fresh" class="source-state"></span>
+            </div>
+            <div id="height" class="hero-number">—</div>
+            <div class="headline-foot">
+              <span id="chain-status" class="accent"
+                >Waiting for chain data</span
+              ><span id="tip-age">—</span>
+            </div>
+          </article>
+          <article class="headline">
+            <div class="label">Header gap</div>
+            <div class="big-number">
+              <span id="lag">—</span><small>blocks</small>
+            </div>
+            <div class="headline-foot">
+              Best known header <span id="headers">—</span>
+            </div>
+          </article>
+          <article class="headline">
+            <div class="label">Mempool</div>
+            <div class="big-number">
+              <span id="mempool-count">—</span><small>transactions</small>
+            </div>
+            <div class="headline-foot">
+              <span id="mempool-bytes">—</span><span id="mempool-queue">—</span>
+            </div>
+          </article>
+          <article class="headline">
+            <div class="label">
+              Connected peers <span class="tiny-tag">RPC</span>
+            </div>
+            <div class="big-number">
+              <span id="peer-count">—</span><small>peers</small>
+            </div>
+            <div class="headline-foot">
+              <span id="peer-in">—</span><span id="peer-out">—</span>
+            </div>
+          </article>
+        </section>
+        <section class="panel pipeline-panel" aria-labelledby="pipeline-title">
+          <div class="panel-heading">
+            <h2 id="pipeline-title">Block pipeline</h2>
+            <span class="panel-note"
+              >Current work in flight
+              <span id="metrics-fresh" class="source-state"></span
+            ></span>
+          </div>
+          <div class="pipeline">
+            <div class="stage">
+              <span class="stage-index">01</span>
+              <h3>Headers</h3>
+              <strong id="pipe-headers">—</strong
+              ><span class="stage-unit">best known height</span>
+              <div class="stage-bottom">
+                Body gap <b id="pipe-missing">—</b>
+              </div>
+            </div>
+            <div class="stage">
+              <span class="stage-index">02</span>
+              <h3>Download</h3>
+              <strong id="pipe-download">—</strong
+              ><span class="stage-unit">outstanding blocks</span>
+              <div class="stage-bottom">Payload <b id="pipe-payload">—</b></div>
+            </div>
+            <div class="stage">
+              <span class="stage-index">03</span>
+              <h3>Verify &amp; apply</h3>
+              <strong id="pipe-apply">—</strong
+              ><span class="stage-unit">blocks applying</span>
+              <div class="stage-bottom">
+                Awaiting submission <b id="pipe-waiting">—</b>
+              </div>
+            </div>
+            <div class="stage">
+              <span class="stage-index">04</span>
+              <h3>Commit</h3>
+              <strong id="pipe-write">—</strong
+              ><span class="stage-unit">write latency · p95</span>
+              <div class="stage-bottom">
+                Writer queue <b id="pipe-writer">—</b>
+              </div>
+            </div>
+            <div class="stage">
+              <span class="stage-index">05</span>
+              <h3>State</h3>
+              <strong id="pipe-state">—</strong
+              ><span class="stage-unit">database on disk</span>
+              <div class="stage-bottom">
+                Compactions <b id="pipe-compactions">—</b>
+              </div>
+            </div>
+          </div>
+          <div class="pipeline-footer">
+            <span
+              ><i class="dot mint"></i
+              ><span id="pipeline-note">Waiting for telemetry</span></span
+            ><span>Finalized storage height <b id="finalized">—</b></span>
+          </div>
+        </section>
+        <div class="section-toolbar">
+          <div>
+            <h2>Activity</h2>
+            <span id="history-note">History builds as this dashboard runs</span>
+          </div>
+          <div class="range-control" role="group" aria-label="Chart time range">
+            <button data-window="15m">15m</button
+            ><button data-window="1h" aria-pressed="true" class="selected">
+              1h</button
+            ><button data-window="6h">6h</button
+            ><button data-window="24h">24h</button>
+          </div>
+        </div>
+        <div class="activity-grid">
+          <section class="panel chart-panel">
+            <div class="panel-heading">
+              <h2>Block traffic</h2>
+              <span class="panel-note">Legacy transport</span>
+            </div>
+            <div class="chart-values">
+              <div>
+                <span class="legend"><i class="dot mint"></i>Received</span
+                ><strong id="traffic-in">—</strong>
+              </div>
+              <div>
+                <span class="legend"><i class="dot violet"></i>Sent</span
+                ><strong id="traffic-out">—</strong>
+              </div>
+            </div>
+            <div
+              id="traffic-chart"
+              class="chart"
+              role="img"
+              aria-label="Legacy transport bytes per second over time"
+            ></div>
+          </section>
+          <section class="panel chart-panel">
+            <div class="panel-heading">
+              <h2>Shielded proof checks</h2>
+              <span class="panel-note">Proofs / second</span>
+            </div>
+            <div class="chart-values">
+              <div>
+                <span class="legend"><i class="dot mint"></i>Halo 2</span
+                ><strong id="halo2-rate">—</strong>
+              </div>
+              <div>
+                <span class="legend"><i class="dot violet"></i>Sapling</span
+                ><strong id="sapling-rate">—</strong>
+              </div>
+            </div>
+            <div
+              id="proof-chart"
+              class="chart"
+              role="img"
+              aria-label="Shielded proof verification rate over time"
+            ></div>
+          </section>
+          <section class="panel chart-panel">
+            <div class="panel-heading">
+              <h2>Pending transactions</h2>
+              <span class="panel-note">Mempool</span>
+            </div>
+            <div class="chart-values">
+              <div>
+                <span class="legend"
+                  ><i class="dot mint"></i>Accepted / sec</span
+                ><strong id="accepted-rate">—</strong>
+              </div>
+              <div>
+                <span class="legend"
+                  ><i class="dot amber"></i>Rejected / sec</span
+                ><strong id="rejected-rate">—</strong>
+              </div>
+            </div>
+            <div
+              id="mempool-chart"
+              class="chart"
+              role="img"
+              aria-label="Mempool transaction count over time"
+            ></div>
+          </section>
+        </div>
+        <div class="detail-grid">
+          <section class="panel">
+            <div class="panel-heading">
+              <h2>Verification</h2>
+              <span class="panel-note">Rolling batch latency</span>
+            </div>
+            <div class="table-scroll">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Verifier</th>
+                    <th>p50</th>
+                    <th>p95</th>
+                  </tr>
+                </thead>
+                <tbody id="verifiers">
+                  <tr>
+                    <td colspan="3" class="empty">Waiting for telemetry</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+            <div class="panel-bottom">
+              Batch wall time, including scheduling. Empty verifier series are
+              omitted.
+            </div>
+          </section>
+          <section class="panel">
+            <div class="panel-heading">
+              <h2>Peer connections</h2>
+              <span id="peers-fresh" class="source-state"></span>
+            </div>
+            <div class="peer-summary">
+              <div>
+                <strong id="native-peers">—</strong
+                ><span>Native connections</span>
+              </div>
+              <div>
+                <strong id="ready-peers">—</strong
+                ><span>Legacy ready peers</span>
+              </div>
+            </div>
+            <div id="peer-agents" class="bar-list"></div>
+            <div class="panel-bottom">
+              Client mix from RPC. Transport counts are separate views and
+              should not be added together.
+            </div>
+          </section>
+          <section class="panel host-panel">
+            <div class="panel-heading">
+              <h2>Host &amp; storage</h2>
+              <span id="host-fresh" class="source-state"></span>
+            </div>
+            <div class="storage-head">
+              <strong id="disk-free">—</strong><span>disk free</span
+              ><span id="disk-percent" class="storage-pill">—</span>
+            </div>
+            <div class="meter"><div id="disk-meter"></div></div>
+            <div id="disk-warning" class="inline-note">
+              Checking storage capacity
+            </div>
+            <dl class="stat-list">
+              <div>
+                <dt>Node memory</dt>
+                <dd id="rss">—</dd>
+              </div>
+              <div>
+                <dt>Host memory available</dt>
+                <dd id="memory-free">—</dd>
+              </div>
+              <div>
+                <dt>Host load · 1 / 5 / 15 min</dt>
+                <dd id="host-load">—</dd>
+              </div>
+              <div>
+                <dt>RocksDB cache</dt>
+                <dd id="db-cache">—</dd>
+              </div>
+              <div>
+                <dt>Host uptime</dt>
+                <dd id="uptime">—</dd>
+              </div>
+            </dl>
+          </section>
+          <section class="panel">
+            <div class="panel-heading">
+              <h2>RPC service</h2>
+              <span class="panel-note">Rolling p95</span>
+            </div>
+            <div class="rpc-summary">
+              <strong id="rpc-rate">—</strong><span>requests / second</span
+              ><span id="rpc-errors">—</span>
+            </div>
+            <div class="table-scroll">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Method</th>
+                    <th>Req / sec</th>
+                    <th>Latency</th>
+                  </tr>
+                </thead>
+                <tbody id="rpc-methods">
+                  <tr>
+                    <td colspan="3" class="empty">Waiting for telemetry</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+            <div class="panel-bottom">
+              Includes this dashboard’s read requests. No RPC access is exposed
+              here.
+            </div>
+          </section>
+          <section class="panel">
+            <div class="panel-heading">
+              <h2>Public value pools</h2>
+              <span class="panel-note">ZEC</span>
+            </div>
+            <div id="pools" class="pool-list"></div>
+            <div class="panel-bottom">
+              Public chain totals. Shielded owners, balances, and transaction
+              amounts stay private.
+            </div>
+          </section>
+          <section class="panel">
+            <div class="panel-heading">
+              <h2>Chain context</h2>
+              <span class="panel-note">This node’s view</span>
+            </div>
+            <dl class="stat-list context-list">
+              <div>
+                <dt>Network upgrade</dt>
+                <dd id="context-upgrade">—</dd>
+              </div>
+              <div>
+                <dt>Storage mode</dt>
+                <dd id="pruning">—</dd>
+              </div>
+              <div>
+                <dt>Fleet comparison</dt>
+                <dd id="fleet-status">—</dd>
+              </div>
+              <div>
+                <dt>Support height</dt>
+                <dd id="support-height">—</dd>
+              </div>
+              <div>
+                <dt>Blocks until support ends</dt>
+                <dd id="support-blocks">—</dd>
+              </div>
+            </dl>
+            <div class="context-heading">Observed tip switches</div>
+            <div id="reorgs" class="reorg-list"></div>
+            <div class="panel-bottom">
+              Fleet comparison is a cross-check, not a network-wide consensus
+              claim.
+            </div>
+          </section>
+        </div>
+        <footer>
+          <span><i class="dot mint"></i> Built for observing Zakura</span
+          ><span id="updated">Waiting for first observation</span
+          ><button id="sources-button">Data &amp; definitions ↗</button>
+        </footer>
+      </main>
+    </div>
+    <dialog id="block-dialog" aria-labelledby="block-title">
+      <div class="dialog-top">
+        <span class="eyebrow">BLOCK DETAILS</span
+        ><button class="close-dialog" aria-label="Close block details">
+          ×
+        </button>
+      </div>
+      <h2 id="block-title">Block</h2>
+      <div id="block-detail"></div>
+    </dialog>
+    <dialog id="about-dialog" aria-labelledby="about-title">
+      <div class="dialog-top">
+        <span class="eyebrow">DATA &amp; DEFINITIONS</span
+        ><button class="close-dialog" aria-label="Close data definitions">
+          ×
+        </button>
+      </div>
+      <h2 id="about-title">One node. A live view.</h2>
+      <p>
+        This dashboard observes a Zakura node on Zcash mainnet. It is a separate
+        service with its own history. It does not depend on the block processing
+        profiler.
+      </p>
+      <dl class="definitions">
+        <dt>Freshness</dt>
+        <dd>
+          Chain data is collected every 5 seconds, metrics every 15 seconds, and
+          peers and host data every 30 seconds. Failed or overdue sources are
+          marked stale. Pausing only freezes your view.
+        </dd>
+        <dt>History</dt>
+        <dd>
+          Up to 24 hours of real samples are retained. Time ranges apply to the
+          three activity charts. Gaps mean missing samples. History starts when
+          this service starts collecting.
+        </dd>
+        <dt>Block pipeline</dt>
+        <dd>
+          These are current queue counts and exporter latency summaries. They
+          are not a trace of any individual block. Zero work in flight is normal
+          while a synced node waits for a block.
+        </dd>
+        <dt>Headers and finalized storage</dt>
+        <dd>
+          Headers are the best eligible header chain, not a promise that the
+          blocks are valid. Finalized storage is Zakura’s storage boundary, not
+          irreversible proof-of-work finality.
+        </dd>
+        <dt>Latency</dt>
+        <dd>
+          p50 is the median. p95 is the value below which 95% of observations
+          fall. Latencies use the exporter’s rolling window, independent of the
+          chart range. Missing values are shown as —.
+        </dd>
+        <dt>Traffic and peers</dt>
+        <dd>
+          Traffic covers the legacy transport. Native connections are shown
+          separately. RPC peer counts and transport gauges may overlap. These
+          are local observations, not a map of every Zcash node.
+        </dd>
+        <dt>Privacy</dt>
+        <dd>
+          Only selected aggregate metrics and public chain fields are served.
+          Peer addresses, node logs, credentials, and wallet data are not
+          published.
+        </dd>
+      </dl>
+      <div id="source-details" class="source-details"></div>
+    </dialog>
+  </body>
+</html>

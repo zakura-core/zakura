@@ -1,0 +1,30 @@
+[Unit]
+Description=Zakura live node dashboard
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+DynamicUser=yes
+StateDirectory=zakura-live-dashboard
+EnvironmentFile=/opt/zakura-live-dashboard/build.env
+ExecStart=/usr/bin/python3 -u /opt/zakura-live-dashboard/current/deploy/live-dashboard/dashboard.py --host 127.0.0.1 --port 8095 --fleet http://127.0.0.1:8090 --history /var/lib/zakura-live-dashboard/history.sqlite3 --build ${DASHBOARD_BUILD}
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+UMask=0077
+MemoryMax=256M
+CPUQuota=25%
+TasksMax=64
+
+[Install]
+WantedBy=multi-user.target

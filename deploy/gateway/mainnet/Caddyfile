@@ -14,11 +14,25 @@
 }
 
 status.mainnet.zakura.valargroup.dev {
-	reverse_proxy 127.0.0.1:8090
+	redir /live /live/ 308
+	handle_path /live/* {
+		encode zstd gzip
+		reverse_proxy 127.0.0.1:8095
+	}
+	handle {
+		reverse_proxy 127.0.0.1:8090
+	}
 }
 
 status-mainnet.valargroup.dev {
-	reverse_proxy 127.0.0.1:8090
+	redir /live /live/ 308
+	handle_path /live/* {
+		encode zstd gzip
+		reverse_proxy 127.0.0.1:8095
+	}
+	handle {
+		reverse_proxy 127.0.0.1:8090
+	}
 }
 
 # HTTPS-only public submit endpoint. Explicit HTTP block avoids an

@@ -886,7 +886,11 @@ fn snapshot_rpc_getblocktemplate(
             .split_once(':')
             .expect("workid includes its parent namespace");
         for component in [namespace, template] {
-            assert_eq!(component.len(), 32, "each workid component encodes 16 bytes");
+            assert_eq!(
+                component.len(),
+                32,
+                "each workid component encodes 16 bytes"
+            );
             assert!(component.bytes().all(|byte| byte.is_ascii_hexdigit()));
         }
         *work_id = "[WorkId]".into();

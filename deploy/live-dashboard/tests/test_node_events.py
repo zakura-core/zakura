@@ -290,6 +290,17 @@ class WaterfallTests(unittest.TestCase):
         self.assertEqual(spans[2]["outcome"], "failed")
         self.assertEqual(spans[3]["outcome"], "succeeded")
 
+    def test_repeated_announcements_do_not_stretch_processing_axis(self):
+        rows = [event("commit_start", 10_000_000), event("commit_finish", 40_000_000)]
+        for timestamp, transport in ((1_000_000, "legacy"), (2_000_000, "zakura"), (9_000_000_000, "legacy")):
+            rows.append({"process": "1-123", "hash": "a" * 64,
+                         "kind": "block_inventory_received", "transport": transport,
+                         "monotonic_ns": timestamp, "unix_ms": 123, "sequence": timestamp})
+        run = n.block_timeline(rows)[0]
+        self.assertEqual(run["extent_ms"], 39)
+        self.assertEqual([p["count"] for p in run["points"]], [2, 1])
+        self.assertEqual([p["offset_ms"] for p in run["points"]], [0, 1])
+
     def test_missing_backwards_and_restart_boundaries_stay_incomplete(self):
         rows = [event("commit_start", 9), event("commit_finish", 3),
                 event("commit_finish", 20, process="2-456")]

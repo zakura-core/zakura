@@ -525,6 +525,7 @@ def block_timeline(events):
         origin = rows[0]["monotonic_ns"]
         identities = {}
         points = []
+        announcements = {}
         for row in rows:
             kind = row["kind"]
             if kind in APPLY_EVENTS:
@@ -534,8 +535,16 @@ def block_timeline(events):
             elif kind in ("block_relay_started", "block_relay_finished"):
                 key = ("relay", row["relay_attempt"])
             else:
-                if kind in ("block_inventory_received", "block_body_received"):
-                    points.append({"label": ("Inventory" if kind == "block_inventory_received" else "Complete body") + " · " + row["transport"],
+                if kind == "block_inventory_received":
+                    point = announcements.get(row["transport"])
+                    if point is None:
+                        point = {"label": "First announcement · " + row["transport"],
+                                 "offset_ms": (row["monotonic_ns"] - origin) / 1e6, "count": 0}
+                        announcements[row["transport"]] = point
+                        points.append(point)
+                    point["count"] += 1
+                elif kind == "block_body_received":
+                    points.append({"label": "Complete body · " + row["transport"],
                                    "offset_ms": (row["monotonic_ns"] - origin) / 1e6})
                 continue
             identities.setdefault(key, {}).setdefault(kind, row)
@@ -565,6 +574,7 @@ def block_timeline(events):
                        ("succeeded" if end["succeeded"] else "failed") if end else None)
         spans.sort(key=lambda span: span["start_ms"] if span["start_ms"] is not None else span["end_ms"])
         output.append({"origin_at": rows[0]["unix_ms"] / 1000,
-                       "extent_ms": (rows[-1]["monotonic_ns"] - origin) / 1e6,
+                       "extent_ms": max([0] + [p["offset_ms"] for p in points] +
+                                        [s[key] for s in spans for key in ("start_ms", "end_ms") if s[key] is not None]),
                        "spans": spans, "points": points})
     return output

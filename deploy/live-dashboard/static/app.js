@@ -568,7 +568,8 @@ function renderWaterfall(timelines) {
   const spans = run.spans.slice(-24);
   const points = run.points.slice(0, 8);
   const width = 760, left = 270, plotWidth = 330;
-  const extent = Math.max(run.extent_ms, 0.001);
+  const extent = Math.max(0.001, ...points.map((point) => point.offset_ms),
+    ...spans.flatMap((span) => [span.start_ms, span.end_ms].filter(valid)));
   const x = (value) => left + value / extent * plotWidth;
   const rows = [];
   const axisY = 22;
@@ -578,7 +579,7 @@ function renderWaterfall(timelines) {
   }
   let y = 50;
   for (const point of points) {
-    rows.push(`<text x="0" y="${y + 4}">${esc(point.label)}</text><circle cx="${x(point.offset_ms)}" cy="${y}" r="3" class="waterfall-point"><title>${esc(point.label)} · +${esc(ms(point.offset_ms))}</title></circle>`);
+    rows.push(`<text x="0" y="${y + 4}">${esc(point.label)}</text><circle cx="${x(point.offset_ms)}" cy="${y}" r="3" class="waterfall-point"><title>${esc(point.label)} · +${esc(ms(point.offset_ms))}${point.count ? ` · ${fmt(point.count)} announcements observed` : ""}</title></circle>`);
     y += 24;
   }
   for (const span of spans) {
@@ -595,7 +596,7 @@ function renderWaterfall(timelines) {
     y += 24;
   }
   return `<h3>Measured block waterfall</h3><div class="waterfall"><svg viewBox="0 0 ${width} ${y}" role="img" aria-label="Measured block stages on a shared elapsed time axis">${rows.join("")}</svg></div>
-    <p>Elapsed time from the first recorded event in the latest node run, ${clock(run.origin_at, true)} UTC. Overlapping rows run within the same interval and must not be added. Open circles mark incomplete spans. Up to 8 arrival markers and 24 spans are shown.</p>`;
+    <p>Elapsed time from the first recorded event in the latest node run, ${clock(run.origin_at, true)} UTC. Overlapping rows run within the same interval and must not be added. Open circles mark incomplete spans. Repeated announcements are grouped at the first observation per transport. Hover for their counts. Up to 8 arrival markers and 24 spans are shown.</p>`;
 }
 
 function renderBlockEvents() {

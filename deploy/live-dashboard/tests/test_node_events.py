@@ -50,3 +50,87 @@ class EventTests(unittest.TestCase):
         store.ingest(event("commit_start", 10, attempt=3), 100)
         self.assertEqual(len(store.attempts), 2)
         self.assertEqual(store.block("a" * 64, 86601), [])
+
+
+class FeedTests(unittest.TestCase):
+    def test_persists_sanitized_events_across_restart(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / "events.sqlite3")
+            raw = {"version": 1, "process": "1-123", "sequence": 1, "monotonic_ns": 10,
+                   "unix_ms": 123, "event": {"event": "commit_start", "hash": "a" * 64,
+                   "height": 123, "apply_token": 1, "peer": "secret"}}
+            feed = n.EventFeed(path)
+            self.assertEqual(feed.ingest([json.dumps(raw).encode(), b"bad"], 100), 1)
+            self.assertEqual(feed.status()["rejected"], 1)
+            feed.close()
+            feed = n.EventFeed(path)
+            try:
+                detail = feed.block("a" * 64, 101)
+                self.assertEqual(detail["attempts"][0]["result"], "incomplete")
+                self.assertNotIn("secret", json.dumps(detail))
+                self.assertNotIn("secret", feed.db.execute("SELECT body FROM node_block_events").fetchone()[0])
+                self.assertEqual(feed.block("a" * 64, 86501)["attempts"], [])
+            finally:
+                feed.close()
+
+    def test_socket_does_not_replace_existing_file(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "socket"
+            path.write_text("keep")
+            feed = n.EventFeed(":memory:", str(path))
+            try:
+                feed.start()
+                self.assertEqual(path.read_text(), "keep")
+                self.assertFalse(feed.status()["listening"])
+            finally:
+                feed.close()
+
+    def test_real_datagram_receipt_and_shutdown(self):
+        import socket
+        import tempfile
+        import time
+        with tempfile.TemporaryDirectory() as directory:
+            feed = n.EventFeed(":memory:", str(Path(directory) / "socket"))
+            sender = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+            try:
+                feed.start()
+                sender.sendto(b"{}", feed.socket_path)
+                deadline = time.monotonic() + 2
+                while feed.status()["rejected"] == 0 and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertEqual(feed.status()["rejected"], 1)
+                self.assertTrue(feed.status()["listening"])
+            finally:
+                sender.close()
+                feed.close()
+            self.assertFalse(Path(feed.socket_path).exists())
+
+
+class ArrivalTests(unittest.TestCase):
+    def test_transport_and_local_durations_with_duplicates(self):
+        def observation(kind, timestamp, **fields):
+            return n.parse_block_event(json.dumps({"version": 1, "process": "1-123",
+                "sequence": timestamp, "monotonic_ns": timestamp * 1_000_000, "unix_ms": timestamp,
+                "event": {"event": kind, "hash": "a" * 64, **fields}}).encode())
+        records = [observation("block_inventory_received", 1, transport="legacy"),
+                   observation("block_body_received", 8, transport="zakura", first=True),
+                   observation("block_body_received", 9, transport="legacy", first=False),
+                   observation("commit_finish", 20, apply_token=1, height=123, result="committed"),
+                   observation("block_relay_finished", 21, relay_attempt=1, succeeded=True)]
+        self.assertTrue(all(records))
+        result = n.arrival_summary(list(reversed(records)))[0]
+        self.assertEqual(result["body_transport"], "zakura")
+        self.assertEqual(result["inventory_to_body_ms"], 7)
+        self.assertEqual(result["body_to_commit_ms"], 12)
+        self.assertEqual(result["duplicate_bodies"], 1)
+        self.assertEqual(result["relay_successes"], 1)
+        records[3]["process"] = "2-124"
+        self.assertIsNone(n.arrival_summary(records)[0]["body_to_commit_ms"])
+
+    def test_relay_does_not_accept_non_boolean_success(self):
+        raw = {"version": 1, "process": "1-123", "sequence": 1,
+               "monotonic_ns": 1, "unix_ms": 1, "event": {"event": "block_relay_finished",
+               "hash": "a" * 64, "relay_attempt": 1, "succeeded": "true"}}
+        self.assertIsNone(n.parse_block_event(json.dumps(raw).encode()))

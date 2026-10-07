@@ -507,7 +507,14 @@ impl ZakuraTrace {
         hash: zakura_chain::block::Hash,
         source: BlockBodySource,
     ) {
-        if self.first_block_source.record(hash, source) {
+        let first = self.first_block_source.record(hash, source);
+        zakura_jsonl_trace::dashboard::emit(|| {
+            serde_json::json!({
+                "event": "block_body_received", "hash": hash.to_string(),
+                "transport": source.as_str(), "first": first,
+            })
+        });
+        if first {
             metrics::counter!(
                 "sync.block.first_received.count",
                 "source" => source.as_str()

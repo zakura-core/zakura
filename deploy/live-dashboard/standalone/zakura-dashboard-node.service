@@ -8,6 +8,8 @@ AssertPathExists=/opt/zakura-dashboard-node/current/zakurad
 Type=simple
 User=zakura-dashboard-node
 Group=zakura-dashboard-node
+SupplementaryGroups=zakura-dashboard-web
+Environment=ZAKURA_DASHBOARD_SOCKET=/run/zakura-live-dashboard/node-events.sock
 StateDirectory=zakura-dashboard-node
 StateDirectoryMode=0700
 WorkingDirectory=/var/lib/zakura-dashboard-node

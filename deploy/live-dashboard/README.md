@@ -327,3 +327,16 @@ Check the unit and journal before changing that checkout or starting another bui
 It is limited to three build jobs, 300% CPU, 10 GiB memory, and nice 10. Nothing
 from this build has been installed or enabled in the running node. The existing
 node process is still 37210. Do not treat a compiled binary as a completed rollout.
+
+Receiver integration now adds `/api/block/<hash>` using only sanitized cached
+events in the dashboard SQLite database. It keeps at most 49,152 records for
+24 hours, limits per-block reads to 192 records, and separates restarts/attempts.
+The optional socket is `/run/zakura-live-dashboard/node-events.sock`, owned by the
+dashboard service with group access for the dedicated node only. Service templates
+are prepared but are not live until the instrumented binary is validated.
+
+New hooks capture native/legacy inventory observations, complete-body receipts,
+and local relay service start/completion. Inventory-to-body includes scheduling
+and fetching, not pure wire transfer. Local relay completion does not establish
+peer receipt. Fine-grained verification/state stages, request boundaries, crypto
+batch contents, QUIC health, and transaction lifecycle remain pending.

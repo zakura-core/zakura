@@ -7,6 +7,8 @@ import threading
 import time
 import tempfile
 import unittest
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from unittest.mock import patch
 import urllib.error
 import urllib.request
@@ -29,6 +31,7 @@ class CollectorTests(unittest.TestCase):
     def tearDown(self):
         self.c.pool.shutdown(wait=True)
         self.c.store.db.close()
+        self.c.events.close()
 
     def test_rates_require_two_observations_and_survive_reset(self):
         self.assertIsNone(d.rate(None, 10, 15))
@@ -165,6 +168,7 @@ state_contextual_total_duration_seconds{quantile="1"} 0.03
             finally:
                 first.pool.shutdown(wait=True)
                 first.store.db.close()
+                first.events.close()
             second = d.Collector(args)
             try:
                 self.assertEqual(second.snapshot()["last_processing"], expected)
@@ -173,6 +177,7 @@ state_contextual_total_duration_seconds{quantile="1"} 0.03
             finally:
                 second.pool.shutdown(wait=True)
                 second.store.db.close()
+                second.events.close()
 
     def test_processing_retention_expires_and_never_initializes_from_empty_summaries(self):
         now = time.time()

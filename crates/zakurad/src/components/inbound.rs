@@ -853,6 +853,9 @@ impl Service<zn::Request> for Inbound {
                     .boxed()
             }
             zn::Request::AdvertiseBlock(hash, Some(zn::PeerSource::Zakura(peer_id))) => {
+                zakura_jsonl_trace::dashboard::emit(|| serde_json::json!({
+                    "event": "block_inventory_received", "hash": hash.to_string(), "transport": "zakura",
+                }));
                 debug!(
                     ?hash,
                     ?peer_id,
@@ -862,6 +865,10 @@ impl Service<zn::Request> for Inbound {
                 async { Ok(zn::Response::Nil) }.boxed()
             }
             zn::Request::AdvertiseBlock(hash, advertiser) => {
+                zakura_jsonl_trace::dashboard::emit(|| serde_json::json!({
+                    "event": "block_inventory_received", "hash": hash.to_string(),
+                    "transport": if advertiser.is_some() { "legacy" } else { "unknown" },
+                }));
                 block_downloads.download_and_verify(hash, advertiser);
                 async { Ok(zn::Response::Nil) }.boxed()
             }

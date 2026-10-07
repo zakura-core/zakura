@@ -27,6 +27,7 @@ let fetching = false;
 let lastHistory = 0;
 let disconnected = false;
 let selectedBlock = null;
+let blockEvents = null;
 let period = null;
 let periodBlocks = [];
 let historyRequest = 0;
@@ -497,6 +498,68 @@ function renderBlocks(now) {
       el.style.height = `${el.dataset.height}%`;
     });
 }
+async function loadBlockEvents(hash) {
+  try {
+    const events = await getJSON(`api/block/${encodeURIComponent(hash)}`);
+    if (selectedBlock === hash) blockEvents = events;
+  } catch {
+    if (selectedBlock === hash)
+      blockEvents = { error: "Event history unavailable" };
+  }
+  if (selectedBlock === hash && $("block-dialog").open) renderBlockDetail(hash);
+}
+function renderBlockEvents() {
+  const events = blockEvents;
+  if (!events) return "<p>Loading measured block events…</p>";
+  if (events.error) return `<p>${esc(events.error)}</p>`;
+  if (!events.attempts?.length && !events.arrival?.length)
+    return `<p>${
+      events.status?.enabled
+        ? "No measured events for this block in the retained history. It may predate collection or have missing events."
+        : "Per-block event collection is not enabled on this node yet."
+    }</p>`;
+  const arrival = (events.arrival || [])
+    .slice(-1)
+    .map((row) => {
+      const entries = [];
+      if (valid(row.inventory_at))
+        entries.push([
+          "First recorded inventory · UTC",
+          clock(row.inventory_at, true),
+        ]);
+      if (valid(row.body_at)) {
+        entries.push(
+          ["First recorded complete body · UTC", clock(row.body_at, true)],
+          [
+            "Body transport",
+            row.body_transport === "zakura" ? "Native" : row.body_transport,
+          ],
+          ["Duplicate bodies observed", fmt(row.duplicate_bodies)],
+          ["Inventory → complete body", ms(row.inventory_to_body_ms)],
+          ["Complete body → committed", ms(row.body_to_commit_ms)],
+        );
+      }
+      if (row.relay_observed)
+        entries.push([
+          "Relay calls succeeded / failed",
+          `${fmt(row.relay_successes)} / ${fmt(row.relay_failures)}`,
+        ]);
+      return entries.length
+        ? `<h3>Arrival and relay · latest observed node run</h3><dl class="stat-list detail-stats">${entries.map(([key, val]) => `<div><dt>${esc(key)}</dt><dd>${esc(val)}</dd></div>`).join("")}</dl><p>Inventory-to-body includes scheduling and fetching, not just network transfer. Relay success means the local broadcast service completed, not that every peer received it.</p>`
+        : "";
+    })
+    .join("");
+  return `${arrival}<h3>Measured processing attempts</h3>${events.attempts
+    .slice(-3)
+    .map(
+      (attempt) =>
+        `<dl class="stat-list detail-stats"><div><dt>Outcome</dt><dd>${esc(attempt.result.replaceAll("_", " "))}</dd></div>
+    <div><dt>Submission queue</dt><dd>${ms(attempt.queue_ms)}</dd></div>
+    <div><dt>Verification + state commit</dt><dd>${ms(attempt.verify_and_commit_ms)}</dd></div></dl>`,
+    )
+    .join("")}
+    <p>Durations join events from the same node run and processing attempt. — means a boundary is missing. Verification + state commit includes both operations, not just disk writing.${events.limited || events.attempts.length > 3 ? " Showing the latest retained attempts." : ""}</p>`;
+}
 function renderBlockDetail(hash) {
   const b = [...state.blocks, ...periodBlocks].find(
     (block) => block.hash === hash,
@@ -517,7 +580,7 @@ function renderBlockDetail(hash) {
     ]),
   ];
   $("block-detail").innerHTML =
-    `<span class="block-state">${b.canonical === true ? "On the observed best chain" : b.canonical === false ? "Off the observed best chain" : "Chain membership not yet checked"}</span><div class="block-hash">${esc(b.hash)}</div><dl class="stat-list detail-stats">${data.map(([k, v]) => `<div><dt>${esc(k)}</dt><dd>${esc(v)}</dd></div>`).join("")}</dl><p>The observation time is when the dashboard polled this block. It is not its receive time or processing duration.</p>`;
+    `<span class="block-state">${b.canonical === true ? "On the observed best chain" : b.canonical === false ? "Off the observed best chain" : "Chain membership not yet checked"}</span><div class="block-hash">${esc(b.hash)}</div><dl class="stat-list detail-stats">${data.map(([k, v]) => `<div><dt>${esc(k)}</dt><dd>${esc(v)}</dd></div>`).join("")}</dl><p>The observation time is when the dashboard polled this block. It is not its receive time or processing duration.</p>${renderBlockEvents()}`;
 }
 const charts = new Map();
 function chart(id, keys, format, points = false) {
@@ -639,6 +702,8 @@ async function poll() {
     state = next;
     disconnected = false;
     render();
+    if (selectedBlock && $("block-dialog").open)
+      await loadBlockEvents(selectedBlock);
     if (Date.now() - lastHistory > 15000) {
       try {
         await loadHistory();
@@ -689,6 +754,8 @@ for (const id of ["blocks", "block-volume"])
     const b = event.target.closest("[data-hash]");
     if (b) {
       selectedBlock = b.dataset.hash;
+      blockEvents = null;
+      loadBlockEvents(selectedBlock);
       renderBlockDetail(selectedBlock);
       $("block-dialog").showModal();
     }

@@ -18,6 +18,8 @@ import time
 import urllib.parse
 import urllib.request
 
+from node_events import EventFeed
+
 ROOT = Path(__file__).resolve().parent
 MAX_RESPONSE = 16 * 1024 * 1024
 MAX_BLOCKS = 4096
@@ -397,6 +399,7 @@ class Collector:
     def __init__(self, args):
         self.args = args
         self.store = Store(args.history)
+        self.events = EventFeed(args.history, getattr(args, "event_socket", None))
         self.lock = threading.Lock()
         self.state = {"node": args.node, "chain": {}, "metrics": {}, "host": {},
                       "host_mode": "fleet" if getattr(args, "fleet", None) else "local",
@@ -821,6 +824,11 @@ class Handler(BaseHTTPRequestHandler):
             state["blocks"] = state["blocks"][:30]
             state.pop("event_intervals", None)
             self.send(200, state)
+        elif parsed.path.startswith("/api/block/"):
+            block_hash = parsed.path.removeprefix("/api/block/")
+            if not HASH.fullmatch(block_hash):
+                return self.send(400, {"error": "invalid block hash"})
+            self.send(200, collector.events.block(block_hash, time.time()))
         elif parsed.path == "/api/history":
             query = urllib.parse.parse_qs(parsed.query)
             window = query.get("window", ["1h"])[0]
@@ -867,15 +875,18 @@ def main():
     parser.add_argument("--node-service", default="zakura-dashboard-node.service")
     parser.add_argument("--node-disk", default="/", help="Mount containing the node state")
     parser.add_argument("--history", default="dashboard.sqlite3")
+    parser.add_argument("--event-socket", help="Private Unix datagram path for node events")
     parser.add_argument("--build", default="development")
     args = parser.parse_args()
     collector = Collector(args)
+    collector.events.start()
     threading.Thread(target=collector.run, daemon=True).start()
     server = Server((args.host, args.port), collector)
     try:
         server.serve_forever()
     finally:
         collector.stop.set()
+        collector.events.close()
         server.server_close()
 
 

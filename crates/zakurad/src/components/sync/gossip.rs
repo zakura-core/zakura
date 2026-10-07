@@ -291,9 +291,33 @@ async fn broadcast_with_timeout<ZN>(network: ZN, request: zn::Request) -> bool
 where
     ZN: Service<zn::Request, Response = zn::Response, Error = BoxError>,
 {
-    tokio::time::timeout(TIPS_RESPONSE_TIMEOUT, network.oneshot(request))
+    static NEXT_RELAY_ATTEMPT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let relay_attempt = NEXT_RELAY_ATTEMPT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let block_hash = match &request {
+        zn::Request::AdvertiseBlock(hash, _) | zn::Request::AdvertiseBlockToAll(hash) => {
+            Some(*hash)
+        }
+        _ => None,
+    };
+    if let Some(hash) = block_hash {
+        zakura_jsonl_trace::dashboard::emit(|| {
+            serde_json::json!({
+                "event": "block_relay_started", "hash": hash.to_string(), "relay_attempt": relay_attempt,
+            })
+        });
+    }
+    let succeeded = tokio::time::timeout(TIPS_RESPONSE_TIMEOUT, network.oneshot(request))
         .await
-        .is_ok_and(|result| result.is_ok())
+        .is_ok_and(|result| result.is_ok());
+    if let Some(hash) = block_hash {
+        zakura_jsonl_trace::dashboard::emit(|| {
+            serde_json::json!({
+                "event": "block_relay_finished", "hash": hash.to_string(), "succeeded": succeeded,
+            "relay_attempt": relay_attempt,
+            })
+        });
+    }
+    succeeded
 }
 
 /// Records a completed mined-block broadcast, and advertises the hash through the committed-tip

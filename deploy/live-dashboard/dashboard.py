@@ -111,6 +111,12 @@ def metric(metrics, name, **labels):
 
 def quantile(metrics, name, q="0.95", **labels):
     # Never sum quantiles across method/verifier labels. Each row is one series.
+    # metrics-exporter-prometheus renders an empty rolling summary as all zeroes.
+    maxima = [v for tags, v in metrics.get(name, [])
+              if tags.get("quantile") == "1"
+              and all(tags.get(k) == str(w) for k, w in labels.items())]
+    if maxima == [0]:
+        return None
     values = [v for tags, v in metrics.get(name, [])
               if tags.get("quantile") == q
               and all(tags.get(k) == str(w) for k, w in labels.items())]
@@ -377,6 +383,13 @@ class Collector:
             age = now - source["at"] if source.get("at") else None
             source["age"] = age
             source["fresh"] = bool(source["ok"] and age is not None and 0 <= age < (25 if name == "chain" else 120))
+        # The node refreshes its remaining-block gauge on a slower support-check loop.
+        # Derive this display from the supported height and the current verified tip.
+        height = state["chain"].get("height")
+        supported = state["metrics"].get("support_height")
+        state["metrics"]["support_blocks"] = (supported - height
+            if state["sources"].get("chain", {}).get("fresh")
+            and number(height) is not None and number(supported) is not None else None)
         state["generated_at"] = now
         state["sample_interval"] = 15
         state["build"] = self.args.build

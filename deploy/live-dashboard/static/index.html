@@ -53,7 +53,7 @@
         <section class="page-heading">
           <div>
             <div class="eyebrow">INSIDE THE NODE</div>
-            <h1>Network in. Verified state out.</h1>
+            <h1>Mainnet overview</h1>
             <p>
               <span id="node-name">us-east-0</span
               ><span class="separator">/</span
@@ -178,9 +178,9 @@
             <span id="history-note">History builds as this dashboard runs</span>
           </div>
           <div class="range-control" role="group" aria-label="Chart time range">
-            <button data-window="15m">15m</button
-            ><button data-window="1h" aria-pressed="true" class="selected">
-              1h</button
+            <button data-window="15m" aria-pressed="true" class="selected">
+              15m</button
+            ><button data-window="1h" aria-pressed="false">1h</button
             ><button data-window="6h">6h</button
             ><button data-window="24h">24h</button>
           </div>
@@ -278,8 +278,8 @@
               </table>
             </div>
             <div class="panel-bottom">
-              Batch wall time, including scheduling. Empty verifier series are
-              omitted.
+              Batch wall time, including scheduling. A dash means no recent
+              duration sample or an unavailable series.
             </div>
           </section>
           <section class="panel">

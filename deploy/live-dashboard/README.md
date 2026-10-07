@@ -21,6 +21,11 @@ after 120 seconds. Counter resets and gaps over 120 seconds do not produce rates
 History gaps over 45 seconds are not joined by chart lines. Changing the time
 range changes activity charts only. Exporter quantiles retain their own rolling
 window and are never summed across labels.
+The exporter emits zeroes for empty rolling summaries. If its maximum duration
+is zero, the dashboard reports unavailable latency rather than a zero-cost
+operation. Support blocks remaining are derived from the supported height and
+the current verified height because the node's remaining-block gauge updates
+on a slower loop.
 
 The block stream walks the observed best tip's ancestry. Backfill is limited to
 four RPC reads per cycle and stops starting reads after two seconds. Each read

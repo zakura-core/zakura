@@ -19,7 +19,7 @@ const WINDOWS = { "15m": 900, "1h": 3600, "6h": 21600, "24h": 86400 };
 const COLORS = ["#bcf6b8", "#c1b6ef", "#f1bf75"];
 let state = null;
 let history = [];
-let range = "1h";
+let range = "15m";
 let paused = false;
 let fetching = false;
 let lastHistory = 0;
@@ -379,15 +379,15 @@ function chart(id, keys, format) {
     return;
   }
   // Keep real timestamps and missing samples. Never interpolate across an outage.
-  const w = 500,
-    height = 144,
+  const w = Math.max(160, container.clientWidth - 32),
+    height = Math.max(100, container.clientHeight - 15),
     left = 3,
     right = 3,
     top = 19,
     bottom = 26;
   const plotH = height - top - bottom,
     plotW = w - left - right;
-  const max = Math.max(...values, 1) * 1.12;
+  const max = (Math.max(...values) || 1) * 1.12;
   const x = (t) => left + ((t - start) / (end - start)) * plotW;
   const y = (v) => top + plotH * (1 - Math.max(0, v) / max);
   const linePaths = keys
@@ -405,7 +405,7 @@ function chart(id, keys, format) {
       return `<path d="${path}" fill="none" stroke="${COLORS[k]}" stroke-width="1.7" vector-effect="non-scaling-stroke"/>`;
     })
     .join("");
-  container.innerHTML = `<svg viewBox="0 0 ${w} ${height}" preserveAspectRatio="none" aria-hidden="true"><line class="grid-line" x1="0" y1="${top}" x2="${w}" y2="${top}"/><line class="grid-line" x1="0" y1="${top + plotH / 2}" x2="${w}" y2="${top + plotH / 2}"/><line class="grid-line" x1="0" y1="${top + plotH}" x2="${w}" y2="${top + plotH}"/><text x="3" y="11">${esc(format(max / 1.12))}</text><text x="3" y="140">${esc(clock(start))}</text><text x="250" y="140" text-anchor="middle">${esc(clock((start + end) / 2))}</text><text x="497" y="140" text-anchor="end">${esc(clock(end))}</text>${linePaths}</svg>`;
+  container.innerHTML = `<svg viewBox="0 0 ${w} ${height}" preserveAspectRatio="none" aria-hidden="true"><line class="grid-line" x1="0" y1="${top}" x2="${w}" y2="${top}"/><line class="grid-line" x1="0" y1="${top + plotH / 2}" x2="${w}" y2="${top + plotH / 2}"/><line class="grid-line" x1="0" y1="${top + plotH}" x2="${w}" y2="${top + plotH}"/><text x="3" y="11">${esc(format(max))}</text><text x="3" y="${height - 4}">${esc(clock(start))}</text><text x="${w / 2}" y="${height - 4}" text-anchor="middle">${esc(clock((start + end) / 2))}</text><text x="${w - 3}" y="${height - 4}" text-anchor="end">${esc(clock(end))}</text>${linePaths}</svg>`;
   container.onpointermove = (event) => {
     const rect = container.getBoundingClientRect();
     const t =
@@ -484,7 +484,9 @@ async function poll() {
   if (paused || fetching || document.hidden) return;
   fetching = true;
   try {
-    state = await getJSON("api/overview");
+    const nextState = await getJSON("api/overview");
+    if (paused) return;
+    state = nextState;
     disconnected = false;
     render();
     if (Date.now() - lastHistory > 15000) {
@@ -495,6 +497,7 @@ async function poll() {
       }
     }
   } catch {
+    if (paused) return;
     disconnected = true;
     if (state) render();
     else {
@@ -569,5 +572,8 @@ document.querySelectorAll("dialog").forEach((dialog) =>
 document.addEventListener("visibilitychange", () => {
   if (!document.hidden) poll();
 });
+new ResizeObserver(() => {
+  if (state) renderCharts();
+}).observe($("traffic-chart"));
 poll();
 setInterval(poll, 5000);

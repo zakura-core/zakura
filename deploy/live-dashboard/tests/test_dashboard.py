@@ -62,6 +62,20 @@ sync_block_applying 0
             self.c.source("metrics", False)
         self.assertIsNone(self.c.sample(now)["applying"])
 
+    def test_empty_summary_is_not_zero_latency(self):
+        metrics = d.metrics_parse('''state_block_writer_queue_duration_seconds{quantile="0.95"} 0
+state_block_writer_queue_duration_seconds{quantile="1"} 0
+''')
+        self.assertIsNone(d.quantile(metrics, "state_block_writer_queue_duration_seconds"))
+
+    def test_support_countdown_uses_current_height(self):
+        self.c.state["chain"] = {"height": 123}
+        self.c.state["metrics"] = {"support_height": 150, "support_blocks": 40}
+        self.c.source("chain", True, time.time())
+        self.assertEqual(self.c.snapshot()["metrics"]["support_blocks"], 27)
+        self.c.source("chain", False)
+        self.assertIsNone(self.c.snapshot()["metrics"]["support_blocks"])
+
     def test_fleet_and_peers_only_publish_allowlisted_fields(self):
         now = time.time()
         fleet = {"network": "mainnet", "majority_height": 100, "majority_hash": "a" * 64,

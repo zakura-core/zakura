@@ -509,3 +509,8 @@ that exceed the kernel queue. The node's failure counter remains authoritative.
 The receiver uses the existing static `zakura-dashboard-web` service identity.
 DynamicUser must stay disabled: combined with preserved runtime directories it
 moves the socket path under `/run/private`, which the node cannot traverse.
+
+Live socket-activation restart verification on 2026-10-07 kept the node failure
+counter unchanged at 653 and received 19 new valid events after restart. Earlier
+migration failures remain visible. Deployment now also checks socket-path access
+under the node service's user and supplementary group before reporting success.

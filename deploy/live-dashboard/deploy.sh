@@ -91,6 +91,8 @@ for attempt in {1..15}; do
   sleep 2
 done
 [[ "$ready" == true ]]
+# Match the node unit's identity and supplementary group without sending fake data.
+runuser -u zakura-dashboard-node -g zakura-dashboard-node -G zakura-dashboard-web --   test -w /run/zakura-live-dashboard/node-events.sock
 install -m 644 "$candidate" /etc/caddy/Caddyfile
 systemctl reload caddy
 curl --fail --silent --max-time 10 -H "Host: 146.190.146.239" http://127.0.0.1/api/overview |

@@ -96,7 +96,12 @@ class HistoryChart {
           ...axis,
           size: 54,
           space: 40,
-          ...(this.keys.every((key) => key.startsWith("count_"))
+          ...(this.keys.every(
+            (key) =>
+              key.startsWith("count_") ||
+              key === "outstanding" ||
+              key === "applying",
+          )
             ? {
                 incrs: Array.from({ length: 10 }, (_, i) =>
                   [1, 2, 5].map((n) => n * 10 ** i),

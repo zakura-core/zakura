@@ -9,7 +9,6 @@ use abscissa_core::{Component, FrameworkError};
 
 use tokio::sync::watch;
 use tracing::{field::Visit, Level};
-use tracing_appender::non_blocking::{NonBlockingBuilder, WorkerGuard};
 use tracing_error::ErrorLayer;
 #[cfg(all(feature = "tokio-console", tokio_unstable))]
 use tracing_subscriber::EnvFilter;
@@ -17,6 +16,8 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, Layer};
 use zakura_chain::parameters::Network;
 
 use crate::{application::build_version, components::tracing::Config};
+
+use super::non_blocking::{non_blocking, WorkerGuard};
 
 // Art generated with these two images.
 // Zakura logo: project branding
@@ -136,12 +137,8 @@ impl Tracing {
             Box::new(stdout) as BoxWrite
         };
 
-        // Builds a lossy NonBlocking logger with a default line limit of 128_000 or an explicit buffer_limit.
-        // The write method queues lines down a bounded channel with this capacity to a worker thread that writes to stdout.
-        // Increments error_counter and drops lines when the buffer is full.
-        let (non_blocking, worker_guard) = NonBlockingBuilder::default()
-            .buffered_lines_limit(config.buffer_limit.max(100))
-            .finish(writer);
+        // Queue logs for the background writer, dropping new logs when full.
+        let (non_blocking, worker_guard) = non_blocking(writer, config.buffer_limit.max(100))?;
 
         // Construct a format subscriber with the supplied global logging filter.
         //

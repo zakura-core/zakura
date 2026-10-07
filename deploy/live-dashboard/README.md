@@ -234,7 +234,7 @@ experiments, select a commit in that checkout and build with:
 ```sh
 . /root/.cargo/env
 cd /root/workspace/zakura
-CARGO_BUILD_JOBS=4 cargo build --release --locked -p zakurad
+CARGO_BUILD_JOBS=3 cargo build --release --locked -p zakura --bin zakurad
 ```
 
 Stop the node while compiling if an experiment needs more memory. Before
@@ -417,3 +417,10 @@ incomplete, never as invented spans. Nested rows overlap. The SVG shows at most
 8 arrival markers and 24 spans from the latest retained run. Fine-grained
 consensus, writer queue, storage, and native header announcement hooks remain
 pending, alongside live validation.
+
+
+Dashboard receiver/UI release `8f3b8e69b` is live on the dedicated host. The event
+socket is owned by `zakura-dashboard-web`, mode 0660, inside its 0750 runtime
+directory. The old node PID 37210 remained running through this dashboard-only
+rollout. The browser rendered without console errors. Custom node activation and
+new-event panel validation are still pending the v2 build.

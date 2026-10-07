@@ -750,7 +750,7 @@ function renderCharts() {
     }
     if (!$(id) && available) {
       const section = document.createElement("section");
-      section.innerHTML = `<div class="panel-heading"><h3>${label}</h3></div><div id="${id}" class="chart short" role="img" aria-label="${label} batch timing history"></div>`;
+      section.innerHTML = `<div class="panel-heading"><h3>${label} rolling summary</h3></div><div class="chart-legend"><span><i class="dot"></i>p50</span><span><i class="dot violet"></i>p95</span></div><div id="${id}" class="chart short" role="img" aria-label="${label} batch timing history"></div>`;
       $("crypto-history").append(section);
     }
     if ($(id)) {

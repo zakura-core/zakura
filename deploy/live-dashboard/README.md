@@ -314,213 +314,115 @@ block node validation. No credentials, peer addresses, raw errors, or transactio
 contents belong in the feed. The receiver must bound its memory/history, tolerate
 concurrent delivery, and expose coverage gaps. Existing debug traces remain separate.
 
-Implementation status: the bounded sender and driver queue/verify-and-commit
-boundaries are in development. The driver's `commit_start` currently wraps both
-verification and state commit, so it must not be labeled disk-write latency.
-`node_events.py` now validates and allowlists datagrams and joins bounded block
-attempts using process/hash/apply-token identity, tested for out-of-order events,
-missing boundaries, retries, restarts, duplicates, and retention. The receiver,
-persistence, and initial panels are implemented. Remaining hooks and live
-validation are pending.
+### Measurement contracts
 
-The first Linux build at `cf102b473` completed successfully. The incremental build
-is `zakura-dashboard-build-v2.service` at `d6af0101b` in `/root/workspace/zakura`.
-Check that unit and journal before changing the checkout or starting another build.
-It is limited to three jobs, 300% CPU, 10 GiB memory, and nice 10. No custom build
-has been installed in the running node yet. Do not treat compilation as rollout.
+Block detail is available at `/api/block/<hash>` from sanitized cached events.
+It retains at most 49,152 records for 24 hours and reads at most 192 per hash.
+Boundaries join only within the same node process, block hash, and occurrence ID.
+Driver, state-stage, and relay IDs have separate namespaces. Missing completions
+remain incomplete. Repeated announcements collapse to the first per transport,
+with repetition counts. The waterfall renders at most eight arrival markers and
+24 spans from the latest retained run. Nested stages overlap and cannot be added.
 
-Receiver integration now adds `/api/block/<hash>` using only sanitized cached
-events in the dashboard SQLite database. It keeps at most 49,152 records for
-24 hours, limits per-block reads to 192 records, and separates restarts/attempts.
-The optional socket is `/run/zakura-live-dashboard/node-events.sock`, owned by the
-dashboard service with group access for the dedicated node only. Service templates
-are prepared but are not live until the instrumented binary is validated.
+The semantic verification span covers commit requests over both transports,
+including prepared mined commits. Proposal checks and startup reconstruction do
+not emit live processing spans. Only a successful commit supplies body-to-commit
+timing. A noncommitting attempt can be a duplicate or an error. Its boolean result
+does not establish the cause. Writer queue time ends at the actual dequeue.
+Finalized RocksDB write time belongs to the older hash being finalized, not the
+new tip. Cancellation leaves incomplete spans rather than fabricated failures.
 
-New hooks capture native/legacy inventory observations, complete-body receipts,
-and local relay service start/completion. Inventory-to-body includes scheduling
-and fetching, not pure wire transfer. Local relay completion does not establish
-peer receipt. Fine-grained verification/state stages, request boundaries, crypto
-batch contents, QUIC health, and transaction lifecycle remain pending.
+Native header status changes and native/legacy inventory provide announcements.
+These record peer claims, not verified headers. Complete-body events identify the
+first observed transport and later duplicates. Native matched request duration
+starts at request queueing. Dual-stack request duration starts with the outbound
+request task. Both include local waits, peer service, and earlier bodies in a
+batch. Neither is wire RTT. Unrequested bodies have no request duration. Local
+relay spans measure advertisement service completion, not peer receipt.
 
-Native health instrumentation now samples each established QUIC connection every
-five seconds, with a final sample on close. Aggregate transport byte/loss counters
-are monotonic sums of per-connection deltas and use the existing restart-aware
-collector. Address-free datagrams provide selected-path RTT and connection traffic
-rates. The receiver retains at most 512 session observations, rejects out-of-order
-updates, requires two samples for rates, and excludes sessions older than 15 seconds.
-The native health panel is hidden until actual measurements arrive. Packet loss
-is not labeled retransmission. Actual retransmissions and proper aggregate queue
-occupancy remain pending. These hooks still need the updated Linux build and live
-validation; the running build remains pinned to the initial `cf102b473` snapshot.
+Crypto completions cover Halo 2, Sapling, Ed25519, RedPallas, and RedJubjub batches,
+fallback checks, and pending shutdown flushes. They record accepted items, work
+units, first-item batch wait, CPU scheduling, execution duration, and success.
+Halo 2 work units are actions, Sapling units are spends plus outputs, and signature
+verifiers count signatures. Work can repeat and can include mempool transactions.
+Empty flushes emit nothing. The receiver retains at most 32,768 completions for
+24 hours and returns at most 4,096 per selected window, with a coverage flag.
+Individual-event charts appear only for verifiers with measured events. Other
+verifiers can use explicitly labeled rolling summaries.
 
-Crypto batch instrumentation now covers Halo 2 and Sapling normal batches,
-individual fallback verification, and pending batches flushed on drop. Events
-record accepted item counts, action or spend/output counts, first-item in-batch
-wait, CPU scheduling delay, validation duration, and success. These counts are
-work performed, not unique transactions. Empty shutdown flushes emit no event.
-Ed25519, RedPallas, and RedJubjub also record batches, fallback checks, and
-shutdown flushes. Their work unit is one signature. The shared wrapper preserves
-the original owned success/error value without converting verification errors.
-
-The receiver stores at most 32,768 sanitized crypto completions for 24 hours,
-deduplicated by node process and event sequence. Selected-window responses contain
-at most 4,096 recent completions and explicitly flag limited history. Receipt time
-selects the window; node wall time is retained separately. Repeated polling never
-creates new events. Individual-event charts replace rolling summaries only for
-verifiers with measured events in the selected window. These changes still need
-the updated Linux build and real node/browser validation before deployment.
-
-Matched native block bodies now carry the elapsed time from request queueing to
-complete body handling. This includes local send queueing, peer service time,
-transfer, and earlier responses in a range. It is not wire RTT. The block detail
-uses the measurement attached to its first recorded body, never a later duplicate.
-Unmatched bodies and legacy fetches currently report this span as unavailable.
-
-State-stage events now bracket contextual validation, initial checks, transparent
-spends, shielded anchors, and parallel state updates. Each occurrence has its own
-process/hash/stage-token identity. The block detail pairs only matching boundaries
-and preserves missing completions, failures, retries, and node restarts. Nested
-stage times overlap and must not be summed. These are stage occurrence IDs, not
-state admission IDs or driver apply tokens. Fine-grained consensus verification,
-writer queue and storage boundaries, and the full correlated waterfall still need
-implementation and live validation.
-
-Transaction lifecycle hooks now distinguish queued work, body receipt, verification,
-admission, local relay calls, and removal through mining, expiry or eviction.
-Rejections use fixed categories rather than raw errors. Exact witnessed transaction
-IDs are replaced with per-process salted tokens before emission. Download and
-verification tasks carry explicit attempt IDs. Only matching task boundaries yield
-latencies. Admission, relay and mempool residence spans still need occurrence IDs
-before their durations can safely be shown. Counters include repeated attempts.
-
+Transaction lifecycle distinguishes queueing, body receipt, verification,
+admission, local relay, mining, expiry, eviction, and bounded rejection reasons.
+Per-process salted tokens replace witnessed transaction IDs. Durations require
+matching process, token, and occurrence IDs. Re-admission creates a new storage
+occurrence. Residence ends at mining, expiry, or eviction. Removed descendants
+count as evicted rather than mined or expired with their ancestor. Clearing
+storage without an observed outcome does not invent a residence duration. Relay
+starts after network readiness and includes successful and failed calls.
 The receiver retains at most 65,536 transaction events for 24 hours and summarizes
-at most 8,192 recent events per request, exposing limited coverage explicitly.
-The transaction panel shows observed stages and bounded rejection reasons. Body
-and verification timing charts require explicit matching task IDs. The panel stays
-hidden until selected-period events exist. Live validation is still pending.
+at most 8,192 per request. Counts describe events, including repeated attempts,
+not a single cohort of transactions. Lifecycle panels replace older counter flow
+panels when measured events exist.
 
-The initial `cf102b473` Linux build completed successfully at 21:14 UTC on October 7.
-Its service is inactive with exit status 0. The remote checkout can now be advanced
-for the incremental build; the running node remains the original binary.
+Native QUIC connections are sampled every five seconds and once on close.
+Transport bytes and packet loss are cumulative counter deltas. Address-free
+session observations expose selected-path RTT and traffic rates. The receiver
+retains at most 512 sessions, rejects out-of-order updates, requires two samples
+for rates, and excludes observations older than 15 seconds. Weak queue observers
+report current occupied frame slots, including producer reservations. They reflect
+dequeues without retaining sender ownership. The registry holds at most 4,096
+queues and each connection reports at most 32, with truncation flagged. Aggregates
+are sampled observations, not synchronized snapshots or peak occupancy. Brief
+peaks may be missed. Queue pressure is hidden when all observed queues are idle.
 
+Actual QUIC retransmission counts are deferred by the user's 2026-10-07 decision.
+The pinned transport does not expose them. Measured packet loss remains in scope
+and must never be labeled retransmissions. No dependency fork is required.
 
-The incremental node build is running as `zakura-dashboard-build-v2.service` at
-`d6af0101b`, using the existing release cache and the same CPU/memory limits.
-Do not modify the remote checkout until that unit reaches a terminal state.
-The receiver now drains at most 256 ready datagrams per SQLite transaction to
-reduce write pressure during crypto and relay bursts.
+### Delivery and deployment
 
-Block detail now renders a measured waterfall on one monotonic time axis per node
-run. Arrival markers, driver attempts, state-stage occurrences, and local relay
-calls retain separate identities. Missing or backwards boundaries render as
-incomplete, never as invented spans. Nested rows overlap. The SVG shows at most
-8 arrival markers and 24 spans from the latest retained run. Fine-grained
-consensus, writer queue, storage, and native header announcement hooks remain
-pending, alongside live validation.
+The systemd-owned socket is `/run/zakura-live-dashboard/node-events.sock`, mode
+0660, with group access for the dedicated node. Receiver restarts preserve the
+socket and its bounded kernel queue. The receiver validates the inherited socket
+and never unlinks a systemd-owned path. It drains at most 256 datagrams per SQLite
+transaction. Keep `DynamicUser=no` for the existing `zakura-dashboard-web` identity.
+DynamicUser with preserved runtime directories moves the socket under
+`/run/private`, which the node cannot traverse. Deployment checks access using the
+node's user and supplementary group.
 
+The node reports cumulative actual send failures. The receiver retains the maximum
+for each of at most 16 runs, so concurrent sequence reordering does not invent
+loss. The UI distinguishes the latest run from historical failures and does not
+present lifetime loss as a selected-window count. Older builds without this field
+report unknown. A persistent socket handles brief receiver restarts, not arbitrary
+outages or bursts exceeding its kernel queue.
 
-Dashboard receiver/UI release `8f3b8e69b` is live on the dedicated host. The event
-socket is owned by `zakura-dashboard-web`, mode 0660, inside its 0750 runtime
-directory. The old node PID 37210 remained running through this dashboard-only
-rollout. The browser rendered without console errors. Custom node activation and
-new-event panel validation are still pending the v2 build.
+Use `deploy-node.sh HOST FULL_COMMIT BUILD_UNIT` only after the build unit exits
+successfully and the remote checkout still matches that commit. It verifies the
+binary revision, requires a listening receiver, retains the old release and unit,
+and rolls back if readiness fails. Database-format compatibility must be checked
+before activation. This experiment does not change database version constants
+relative to the original installed v1.6.0 release. `deploy.sh HOST` publishes the
+committed dashboard tree and checks tests, readiness, and socket access.
 
+### Validation status
 
-Sender-side delivery failures are now counted explicitly in subsequent envelopes.
-The receiver keeps the maximum reported count per observed node run, bounded to
-16 runs, so out-of-order datagrams cannot invent additional loss. The UI reports
-known loss or a stopped receiver, and does not pretend the lifetime failure count
-belongs to the selected window. Older node builds without the field report unknown,
-not zero. This sender change requires a later build than `d6af0101b`.
+As of 2026-10-07, the dedicated node runs `454431f85` with measured crypto batches,
+transaction body/verification/admission/relay/residence times, native traffic and
+queue observations, and correlated block stages. Actual native and legacy first
+body arrivals were observed. Block 3509931 arrived over legacy and took 30.44 ms
+from body receipt to commit. Finalized-write events were verified on older hashes.
+A later receiver deployment exposed a stopped event thread and renewed delivery
+loss. Diagnosis is in progress. Earlier migration losses and current losses remain
+evidence and must not be erased.
 
-The `d6af0101b` incremental node build completed successfully at 21:28 UTC. To
-activate a completed build on this dedicated host, use `deploy-node.sh` with the
-host, full commit, and build unit. It verifies the checkout and binary revision,
-requires a listening event socket, retains the old release/unit, and rolls back
-if readiness fails. This helper assumes database-format compatibility has been
-checked before activation. The current experiment does not change the database
-version constants relative to the installed v1.6.0 release.
+The dashboard's 56 Python tests pass, including missing boundaries, restarts,
+retries, deduplication, attempt correlation, and queued datagrams across receiver
+replacement. Browser checks verified readable crypto/lifecycle charts, grouped
+waterfall announcements, and hidden idle queue pressure without console errors.
+Rare expiry, eviction, and crypto failure paths are covered by source/fixture
+checks rather than manufactured mainnet activity.
 
-
-The first activation of `d6af0101b` failed before state initialization because
-`ZAKURA_DASHBOARD_SOCKET` was interpreted as a strict node configuration field.
-The opt-in variable is now `DASHBOARD_EVENT_SOCKET`, outside both configuration
-prefixes (`ZAKURA_` and `ZEBRA_`). Activation now also fails fast on an exited
-node process instead of waiting through the full readiness timeout. The old
-binary/unit rollback must complete before retrying with the corrected build.
-
-The failed activation rolled back to `/opt/zakura-dashboard-node/releases/v1.6.0`.
-The restarted node PID was 67676, initially reporting `syncing`. The corrected
-build is running as `zakura-dashboard-build-v3.service` at `431ee608e`; leave its
-checkout unchanged until completion. Dashboard release `431ee608e` is live and
-contains the corrected node unit template for the next activation. The failed
-custom process exited during configuration loading, before database initialization.
-
-Native persistent service queues now have weak capacity observers. Five-second
-connection observations include occupied frame slots (queued plus reserved), total
-capacity, stream kind and direction. Dequeues, released reservations, and receiver
-closure are reflected by the current channel state. Observers do not retain sender
-ownership. Registry capacity is 4,096 queues, responses contain at most 32 queues
-per connection, and truncation is explicitly flagged. The dashboard sums fresh
-observations by stream kind/direction; this is not an instantaneous synchronized
-snapshot or a high-water mark. The new Rust queue test and live validation still
-need the next Linux build after `431ee608e`.
-
-Live state-stage events exclude startup reconstruction (`ContextualMetrics::Disabled`).
-The `verification_and_commit` stage covers semantic commit requests over both
-transports, including prepared mined commits. Proposal checks do not emit this
-stage. Only a successful commit completion supplies body-to-commit timing.
-Cancellation leaves the stage incomplete. This span includes verification and
-state service waits, not just database writes.
-
-Transaction local relay boundaries carry a shared occurrence ID for each broadcast
-call. Durations require the same node run, transaction token, and occurrence ID.
-Both success and failure are measured. Older uncorrelated events remain counts
-only. The interval starts after network readiness and ends when the local
-broadcast call returns, so it does not measure peer receipt or readiness wait.
-
-Admission checks and mempool residence use a storage-owned occurrence ID. The
-storage retains IDs only while the corresponding verified transactions remain
-present and discards them on clear or removal. Re-admission creates a new ID.
-Residence ends at observed mining, expiry, or eviction, with separate outcomes.
-Descendants removed with a mined or expired ancestor count as evicted rather
-than being incorrectly labeled as themselves mined or expired. Clearing storage
-without an observed outcome does not manufacture a residence duration.
-
-The writer queue span is paired across the actual state-service channel send and
-writer dequeue. A failed send finishes with failure, while shutdown before dequeue
-leaves an incomplete span. Finalized RocksDB writes are attached to the hash being
-finalized, which can be older than the current tip. They are not attributed to the
-new tip block merely because they occur during its processing.
-
-Native header-sync status changes record the advertised selected-tip hash as a
-block announcement. Repeated identical status messages from the same session do
-not create more events. This records a peer's claim, not a verified header or
-block body, and shares the announcement timeline with legacy inventory messages.
-
-The dashboard uses a systemd-owned datagram socket. Receiver restarts leave the
-socket and its bounded kernel queue intact. The Python receiver validates the
-inherited socket type and path and never unlinks a systemd-owned path. The node
-starts after the receiver service on boot. The initial migration to socket
-activation briefly interrupts collection, but later receiver restarts preserve
-queued datagrams. This does not guarantee delivery during long outages or bursts
-that exceed the kernel queue. The node's failure counter remains authoritative.
-
-The receiver uses the existing static `zakura-dashboard-web` service identity.
-DynamicUser must stay disabled: combined with preserved runtime directories it
-moves the socket path under `/run/private`, which the node cannot traverse.
-
-Live socket-activation restart verification on 2026-10-07 kept the node failure
-counter unchanged at 653 and received 19 new valid events after restart. Earlier
-migration failures remain visible. Deployment now also checks socket-path access
-under the node service's user and supplementary group before reporting success.
-
-Dual-stack block fetches now measure elapsed time from the outbound request task
-starting until its matching response returns. This includes service readiness,
-any transport fallback, and waiting for other bodies in the response batch. It is
-not a peer RTT or a per-body wire transfer time. Only explicitly requested hashes
-receive this measurement. Unsolicited bodies keep an unknown request duration.
-
-On 2026-10-07 the user chose to defer actual QUIC retransmission counts rather than
-carry a patched transport dependency. Measured packet loss remains in scope and
-must never be labeled retransmissions. No dependency fork is needed for this work.
+The final dual-stack request-duration build and focused native queue test are
+running under `zakura-dashboard-build-v6.service` at
+`b4c93de11302e67df91d49aa006beb2dfedadacb`. Do not change its remote checkout while
+running. Activation and real legacy request-duration validation remain pending.

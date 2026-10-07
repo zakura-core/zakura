@@ -14,7 +14,9 @@ pub(super) fn lower_current_thread_priority() -> io::Result<()> {
     // SAFETY: `pthread_self` has no preconditions and identifies this live thread.
     let thread = unsafe { libc::pthread_self() };
     let mut policy = 0;
-    let mut parameters = libc::sched_param { sched_priority: 0 };
+    // SAFETY: `sched_param` contains only integers, including Apple's private
+    // reserved storage; all-zero bytes are valid before the OS fills it in.
+    let mut parameters: libc::sched_param = unsafe { std::mem::zeroed() };
     // SAFETY: the thread is live and both output pointers are writable for the
     // duration of this synchronous call; the API retains neither pointer.
     let error = unsafe { libc::pthread_getschedparam(thread, &mut policy, &mut parameters) };

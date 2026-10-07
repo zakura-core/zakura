@@ -6,6 +6,8 @@ use std::path::PathBuf;
 
 use abscissa_core::{config::Override, Command, Configurable, FrameworkError, Runnable};
 
+use zakura_chain::common::preference_dir;
+
 use crate::config::ZakuradConfig;
 
 pub use self::{entry_point::EntryPoint, start::StartCmd};
@@ -150,33 +152,6 @@ impl Runnable for ZakuradCmd {
             TipHeight(cmd) => cmd.run(),
             VerifyHistoricalTreestates(cmd) => cmd.run(),
         }
-    }
-}
-
-/// Returns the platform preferences directory used for config discovery.
-fn preference_dir() -> Option<PathBuf> {
-    #[cfg(target_os = "windows")]
-    {
-        dirs_sys::known_folder_local_app_data()
-    }
-    #[cfg(any(target_os = "macos", target_os = "ios"))]
-    {
-        dirs_sys::home_dir().map(|home| home.join("Library/Preferences"))
-    }
-    #[cfg(target_arch = "wasm32")]
-    {
-        None
-    }
-    #[cfg(not(any(
-        target_os = "windows",
-        target_os = "macos",
-        target_os = "ios",
-        target_arch = "wasm32"
-    )))]
-    {
-        std::env::var_os("XDG_CONFIG_HOME")
-            .and_then(dirs_sys::is_absolute_path)
-            .or_else(|| dirs_sys::home_dir().map(|home| home.join(".config")))
     }
 }
 

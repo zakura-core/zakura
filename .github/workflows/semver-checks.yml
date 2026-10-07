@@ -63,8 +63,8 @@ permissions:
 
 concurrency:
   # PR numbers are repository-wide, unlike same-named head branches from forks.
-  # Other events use their full ref (including each merge-queue ref).
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  # Other events use their run ID, so pushes to `main` never cancel each other.
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
   cancel-in-progress: true
 
 jobs:

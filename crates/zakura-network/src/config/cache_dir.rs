@@ -2,7 +2,10 @@
 
 use std::path::{Path, PathBuf};
 
-use zakura_chain::{common::default_cache_dir, parameters::Network};
+use zakura_chain::{
+    common::{default_cache_dir, home_dir},
+    parameters::Network,
+};
 
 /// The directory, relative to the user's home directory, where Zebra stores
 /// long-term network identity secrets.
@@ -97,22 +100,6 @@ pub(crate) fn default_network_identity_dir() -> PathBuf {
     home_dir()
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
         .join(DEFAULT_NETWORK_IDENTITY_DIR)
-}
-
-/// Returns the platform home directory.
-fn home_dir() -> Option<PathBuf> {
-    #[cfg(target_os = "windows")]
-    {
-        dirs_sys::known_folder_profile()
-    }
-    #[cfg(target_arch = "wasm32")]
-    {
-        None
-    }
-    #[cfg(not(any(target_os = "windows", target_arch = "wasm32")))]
-    {
-        dirs_sys::home_dir()
-    }
 }
 
 /// Returns the persistent Zakura iroh secret-key file path for `network` under

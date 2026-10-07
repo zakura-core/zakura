@@ -23,9 +23,6 @@
 
 mod common;
 
-#[path = "../src/primitives/sapling/params.rs"]
-mod params;
-
 use std::sync::Arc;
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
@@ -39,7 +36,7 @@ use zakura_chain::{
     transparent,
 };
 
-use sapling_crypto::{bundle::Authorized, BatchValidator, Bundle};
+use sapling_crypto::{bundle::Authorized, circuit::bundled_verifying_keys, BatchValidator, Bundle};
 use zcash_protocol::value::ZatBalance;
 
 /// A Sapling bundle paired with its transaction sighash, ready for verification.
@@ -100,7 +97,7 @@ fn extract_sapling_items_from_blocks() -> Vec<SaplingItem> {
 }
 
 fn bench_sapling_verify(c: &mut Criterion) {
-    let (spend_vk, output_vk) = params::verifying_keys();
+    let (spend_vk, output_vk) = bundled_verifying_keys();
     let source_items = extract_sapling_items_from_blocks();
 
     let mut group = c.benchmark_group("groth16_sapling");

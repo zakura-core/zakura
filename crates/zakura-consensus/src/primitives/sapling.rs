@@ -33,9 +33,7 @@ mod tests;
 /// one verifier is named the same way everywhere.
 pub(super) const VERIFIER_NAME: &str = "groth16_sapling";
 
-mod params;
-
-use params::verifying_keys;
+use sapling_crypto::circuit::bundled_verifying_keys as verifying_keys;
 
 /// A Sapling verification item, used as the request type of the service.
 ///

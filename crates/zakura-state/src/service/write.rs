@@ -39,8 +39,9 @@ use crate::{
         finalized_state::{
             header_chain::{
                 migration::{initialize_header_chain_reconciled, HeaderChainInitializationError},
-                select_vct_auxiliary_delivery, HeaderChainReader, HeaderChainRuntime,
-                HeaderChainStore, HeaderChainStoreError, SelectedAuxiliaryWindow,
+                ranked_vct_auxiliary_deliveries, select_vct_auxiliary_delivery, HeaderChainReader,
+                HeaderChainRuntime, HeaderChainStore, HeaderChainStoreError,
+                SelectedAuxiliaryWindow,
             },
             DiskWriteBatch, FinalizedState, VctAuthenticationProof, VctAuxiliaryFailureAttribution,
             VctAuxiliaryWindow, VctSuccessorWitness, ZakuraDb,
@@ -492,6 +493,73 @@ impl HeaderChainWriter {
             .runtime
             .selected_auxiliary_window_at_projection_index(projection_index, expected_frontier)?;
         Self::prepare_vct_auxiliary_window(expected_frontier.height, selected_window)
+    }
+
+    /// Reads the untried delivery pairs at a selected VCT boundary, grouped by current delivery.
+    ///
+    /// Selection pairs the best row of each header. Once both headers hold disputed rows, that
+    /// pairing can hide the pair that verifies, so the sweep tries these pairs before it requests
+    /// repair. Rows that share an observation already failed together, so the read skips them.
+    pub(crate) fn vct_boundary_alternatives_at_projection_index(
+        &self,
+        projection_index: usize,
+        expected_frontier: Frontier,
+    ) -> Result<Vec<VctAuxiliaryWindow>, HeaderChainStoreError> {
+        let Some(SelectedAuxiliaryWindow {
+            engine_snapshot,
+            delivery_header,
+            successor_header: Some(successor_header),
+        }) = self
+            .runtime
+            .selected_auxiliary_window_at_projection_index(projection_index, expected_frontier)?
+        else {
+            return Ok(Vec::new());
+        };
+        let current_node = delivery_header.header_node;
+        let successor_node = successor_header.header_node;
+        let successors = ranked_vct_auxiliary_deliveries(successor_header.auxiliary_deliveries);
+        let mut windows = Vec::new();
+        for delivery in ranked_vct_auxiliary_deliveries(delivery_header.auxiliary_deliveries) {
+            if delivery.header_hash != current_node.hash
+                || delivery.tree_aux.map(|aux| aux.height) != Some(current_node.height)
+            {
+                return Err(zakura_header_chain::StoreError::Incoherent(
+                    "selected VCT delivery disagrees with its retained header",
+                )
+                .into());
+            }
+            for successor_delivery in &successors {
+                let failed_together =
+                    delivery
+                        .observation_ids()
+                        .into_iter()
+                        .flatten()
+                        .any(|observation| {
+                            successor_delivery
+                                .observation_ids()
+                                .contains(&Some(observation))
+                        });
+                if failed_together {
+                    continue;
+                }
+                let successor = VctSuccessorWitness::from_delivery(
+                    successor_node.header.clone(),
+                    successor_node.height,
+                    *successor_delivery,
+                )
+                .ok_or(zakura_header_chain::StoreError::Incoherent(
+                    "selected VCT successor delivery disagrees with its retained header",
+                ))?;
+                windows.push(VctAuxiliaryWindow {
+                    engine_snapshot: engine_snapshot.clone(),
+                    delivery_header: current_node.header.clone(),
+                    delivery,
+                    successor_height: Some(successor_node.height),
+                    successor: Some(successor),
+                });
+            }
+        }
+        Ok(windows)
     }
 
     fn prepare_vct_auxiliary_window(

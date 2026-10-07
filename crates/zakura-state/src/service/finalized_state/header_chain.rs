@@ -386,21 +386,63 @@ pub use fuzz::{replay_recovery_rows_bytes, RecoveryRowsReplaySummary};
 pub(crate) fn select_vct_auxiliary_delivery(deliveries: Vec<AuxDelivery>) -> Option<AuxDelivery> {
     deliveries
         .into_iter()
-        .filter(|delivery| delivery.tree_aux.is_some() && !delivery.is_rejected())
-        .min_by_key(|delivery| {
-            (
-                if delivery.is_authenticated() {
-                    0
-                } else if delivery.is_unauthenticated() {
-                    1
-                } else if delivery.is_disputed() {
-                    2
-                } else {
-                    3
-                },
-                delivery.delivery_id,
-            )
-        })
+        .filter(vct_auxiliary_delivery_is_usable)
+        .min_by_key(vct_auxiliary_delivery_rank)
+}
+
+/// Returns whether an ambiguous boundary repair can retain a new payload at both headers.
+///
+/// A full bucket replaces one of its own unauthenticated rows. Each other header needs an
+/// aggregate slot, and `auxiliary_repair_capacity` reports the same shared slots for every such
+/// header, so the slots must cover all of them together.
+fn ambiguous_repair_capacity_suffices(
+    engine: &HeaderChainEngine,
+    targets: [block::Hash; 2],
+    limits: zakura_header_chain::EngineLimits,
+) -> bool {
+    let mut needed_slots = 0;
+    let mut shared_slots = usize::MAX;
+    for target in targets {
+        let capacity = engine.auxiliary_repair_capacity(target, limits);
+        if engine.aux_deliveries(target).len() >= limits.max_aux_deliveries_per_header.get() {
+            if capacity == 0 {
+                return false;
+            }
+        } else {
+            needed_slots += 1;
+            shared_slots = capacity;
+        }
+    }
+    shared_slots >= needed_slots
+}
+
+/// Returns every usable VCT auxiliary delivery for a retained header in selection order.
+pub(crate) fn ranked_vct_auxiliary_deliveries(deliveries: Vec<AuxDelivery>) -> Vec<AuxDelivery> {
+    let mut usable: Vec<_> = deliveries
+        .into_iter()
+        .filter(vct_auxiliary_delivery_is_usable)
+        .collect();
+    usable.sort_unstable_by_key(vct_auxiliary_delivery_rank);
+    usable
+}
+
+fn vct_auxiliary_delivery_is_usable(delivery: &AuxDelivery) -> bool {
+    delivery.tree_aux.is_some() && !delivery.is_rejected()
+}
+
+fn vct_auxiliary_delivery_rank(delivery: &AuxDelivery) -> (u8, EvidenceId) {
+    (
+        if delivery.is_authenticated() {
+            0
+        } else if delivery.is_unauthenticated() {
+            1
+        } else if delivery.is_disputed() {
+            2
+        } else {
+            3
+        },
+        delivery.delivery_id,
+    )
 }
 
 /// Match durable base data and any outcome that the live engine still treats as authoritative.
@@ -1797,6 +1839,14 @@ impl HeaderChainReader {
             admission_capacity_available,
             &durable_rows,
         )?;
+        if let Some(ambiguous) = self.ambiguous_vct_repair_context(
+            &engine,
+            &context,
+            &durable_rows,
+            boundary_hash.filter(|_| height < checkpoint_ceiling),
+        )? {
+            return Ok(Some(ambiguous));
+        }
         if !durable_rows.is_empty() || !admission_capacity_available {
             return Ok(Some(context));
         }
@@ -1880,6 +1930,67 @@ impl HeaderChainReader {
         drop(engine);
         context = context.extend_empty_selected_range(&suffix, terminal_boundary_hash)?;
         Ok(Some(context))
+    }
+
+    /// Extend a one-header VCT repair over its successor when one observation disputed both.
+    ///
+    /// Returns `Ok(None)` when the successor is absent or its rows show no ambiguous dispute.
+    fn ambiguous_vct_repair_context(
+        &self,
+        engine: &HeaderChainEngine,
+        context: &zakura_header_chain::VctRepairContext,
+        durable_rows: &[UntrustedAuxDeliveryRow],
+        successor_hash: Option<block::Hash>,
+    ) -> Result<Option<zakura_header_chain::VctRepairContext>, HeaderChainStoreError> {
+        let Some(successor_hash) = successor_hash else {
+            return Ok(None);
+        };
+        let successor_height = context
+            .target
+            .height
+            .next()
+            .map_err(|_| StoreError::Incoherent("VCT repair successor height overflowed"))?;
+        let successor = Frontier::new(successor_height, successor_hash);
+        let successor_node =
+            engine
+                .graph()
+                .header_node(successor_hash)
+                .ok_or(StoreError::Incoherent(
+                    "VCT repair successor references a missing node",
+                ))?;
+        let successor_rows = self.store.untrusted_aux_deliveries(successor_hash)?;
+        if !auxiliary_rows_are_coherent(
+            &successor_node.aux_delivery_ids,
+            engine.aux_deliveries(successor_hash),
+            &successor_rows,
+        ) {
+            return Err(StoreError::Incoherent(
+                "retained node and auxiliary delivery index disagree",
+            )
+            .into());
+        }
+        let selected = engine.selected_projection();
+        let terminal_boundary_hash = selected
+            .binary_search_by_key(&successor_height, |frontier| frontier.height)
+            .ok()
+            .filter(|index| selected[*index] == successor)
+            .ok_or(StoreError::Incoherent(
+                "VCT repair successor disagrees with the selected projection",
+            ))
+            .map(|index| selected.get(index.saturating_add(1)).map(|next| next.hash))?;
+        let successor_capacity_available = context.admission_capacity_available
+            && ambiguous_repair_capacity_suffices(
+                engine,
+                [context.target.hash, successor_hash],
+                self.config.limits,
+            );
+        Ok(context.clone().extend_ambiguous_boundary(
+            successor,
+            terminal_boundary_hash,
+            successor_capacity_available,
+            durable_rows,
+            &successor_rows,
+        )?)
     }
 
     /// Install the cursor only while its exact target is still available.
@@ -2984,6 +3095,7 @@ impl HeaderChainRuntime {
             .map(|authority| authority.branch)
             .or_else(|| request.event.body_owner().map(|owner| owner.branch));
         if let TransitionEvent::InsertHeaders(insert) = &request.event {
+            let mut ambiguous_repair = false;
             if let zakura_header_chain::TargetCompletion::SelectedAuxiliaryRepair {
                 common_ancestor,
                 selected_target,
@@ -3080,11 +3192,6 @@ impl HeaderChainRuntime {
                     .get(1)
                     .map(|successor| successor.hash)
                     .or(terminal_boundary_hash);
-                let repair_capacity = transition_engine
-                    .auxiliary_repair_capacity(first_target.hash, context.config.limits);
-                if repair_capacity < repair_range.len() {
-                    return Err(TransitionFailure::AuxiliaryLimitExceeded.into());
-                }
                 let mut current = zakura_header_chain::VctRepairContext::from_durable_rows(
                     first_target,
                     HeaderLocator::for_continuation(common_ancestor),
@@ -3093,22 +3200,58 @@ impl HeaderChainRuntime {
                     !before.alarms.resource_stalled,
                     &durable_rows_by_target[0],
                 )?;
-                if repair_range.len() > 1 {
-                    if durable_rows_by_target.iter().any(|rows| !rows.is_empty())
-                        || before.alarms.resource_stalled
-                    {
-                        return Ok(ApplyResult::Stale(StaleReceipt {
-                            current_version: before.state_version,
-                            branch,
-                        }));
+                let ambiguous_context = match repair_range.as_slice() {
+                    [_, successor] => current.clone().extend_ambiguous_boundary(
+                        *successor,
+                        terminal_boundary_hash,
+                        current.admission_capacity_available,
+                        &durable_rows_by_target[0],
+                        &durable_rows_by_target[1],
+                    )?,
+                    _ => None,
+                };
+                if let Some(ambiguous_context) = ambiguous_context {
+                    current = ambiguous_context;
+                    ambiguous_repair = true;
+                }
+                // An ambiguous repair may add a new payload at both headers. An empty range shares
+                // the aggregate slots across its headers.
+                let capacity_suffices = match (ambiguous_repair, repair_range.as_slice()) {
+                    (true, [target, successor]) => ambiguous_repair_capacity_suffices(
+                        &transition_engine,
+                        [target.hash, successor.hash],
+                        context.config.limits,
+                    ),
+                    _ => {
+                        transition_engine
+                            .auxiliary_repair_capacity(first_target.hash, context.config.limits)
+                            >= repair_range.len()
                     }
-                    current = current
-                        .extend_empty_selected_range(&repair_range[1..], terminal_boundary_hash)?;
-                } else if durable_rows_by_target[0].is_empty()
-                    && current.admission_capacity_available
-                    && current.episode != episode
-                {
-                    current = current.extend_empty_selected_range(&[], terminal_boundary_hash)?;
+                };
+                if !capacity_suffices {
+                    return Err(TransitionFailure::AuxiliaryLimitExceeded.into());
+                }
+                if !ambiguous_repair {
+                    if repair_range.len() > 1 {
+                        if durable_rows_by_target.iter().any(|rows| !rows.is_empty())
+                            || before.alarms.resource_stalled
+                        {
+                            return Ok(ApplyResult::Stale(StaleReceipt {
+                                current_version: before.state_version,
+                                branch,
+                            }));
+                        }
+                        current = current.extend_empty_selected_range(
+                            &repair_range[1..],
+                            terminal_boundary_hash,
+                        )?;
+                    } else if durable_rows_by_target[0].is_empty()
+                        && current.admission_capacity_available
+                        && current.episode != episode
+                    {
+                        current =
+                            current.extend_empty_selected_range(&[], terminal_boundary_hash)?;
+                    }
                 }
                 if current.episode != episode {
                     return Ok(ApplyResult::Stale(StaleReceipt {
@@ -3116,6 +3259,8 @@ impl HeaderChainRuntime {
                         branch,
                     }));
                 }
+                // An ambiguous boundary repair needs one new payload. Admission drops the other.
+                let mut admits_new_input = false;
                 for delivery in &insert.aux {
                     let live_deliveries = transition_engine.aux_deliveries(delivery.header_hash);
                     let repeats_retained_payload = live_deliveries.iter().any(|retained| {
@@ -3124,12 +3269,19 @@ impl HeaderChainRuntime {
                     let retained_source = live_deliveries.iter().any(|retained| {
                         retained.tree_aux.is_some() && retained.source == delivery.source
                     });
-                    if repeats_retained_payload || retained_source {
+                    admits_new_input |= !repeats_retained_payload && !retained_source;
+                    if (repeats_retained_payload || retained_source) && !ambiguous_repair {
                         return Ok(ApplyResult::Stale(StaleReceipt {
                             current_version: before.state_version,
                             branch,
                         }));
                     }
+                }
+                if !admits_new_input {
+                    return Ok(ApplyResult::Stale(StaleReceipt {
+                        current_version: before.state_version,
+                        branch,
+                    }));
                 }
             }
 
@@ -3169,6 +3321,18 @@ impl HeaderChainRuntime {
                 else {
                     continue;
                 };
+                // Header admission drops a retained payload, so its old outcome cannot block the
+                // new payload of an ambiguous boundary repair.
+                if ambiguous_repair
+                    && transition_engine
+                        .aux_deliveries(delivery.header_hash)
+                        .iter()
+                        .any(|retained| {
+                            retained.semantic_fingerprint() == delivery.semantic_fingerprint()
+                        })
+                {
+                    continue;
+                }
                 let durable_rows = self.store.untrusted_aux_deliveries(target.hash)?;
                 if let Some(target_node) = transition_engine.graph().header_node(target.hash) {
                     if !auxiliary_rows_are_coherent(

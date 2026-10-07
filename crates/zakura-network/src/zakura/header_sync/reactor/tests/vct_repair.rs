@@ -987,3 +987,276 @@ async fn vct_repair_defers_when_no_peer_reaches_the_repair_height() {
     );
     let _ = capture.finish().await.expect("trace capture finishes");
 }
+
+/// An ambiguous boundary repair fetches both headers and forwards only a response with new input.
+///
+/// One observation disputed the target and its successor. Every honest supplier returns the same
+/// target payload, so the repair must ask for the successor too. A supplier that cannot serve both
+/// headers gets no request, and a response that repeats both retained payloads stays local. A
+/// supplier that already holds the successor's rooted slot cannot add a second successor payload,
+/// so its response stays local too.
+#[tokio::test]
+async fn ambiguous_boundary_repair_requests_both_headers_and_forwards_new_successor_input() {
+    let shutdown = CancellationToken::new();
+    let mut startup = startup(shutdown.clone());
+    let anchor = zakura_header_chain::Frontier::new(startup.anchor.0, startup.anchor.1);
+    let mut target_header = *regtest_genesis_block().header;
+    target_header.previous_block_hash = anchor.hash;
+    target_header.time += chrono::Duration::seconds(1);
+    let target_header = Arc::new(target_header);
+    let mut successor_header = *target_header;
+    successor_header.previous_block_hash = target_header.hash();
+    successor_header.time += chrono::Duration::seconds(1);
+    let successor_header = Arc::new(successor_header);
+    let target = zakura_header_chain::Frontier::new(block::Height(1), target_header.hash());
+    let successor = zakura_header_chain::Frontier::new(block::Height(2), successor_header.hash());
+    let mut snapshot = committed_snapshot(anchor);
+    snapshot.frontiers.header_best = successor;
+    let (_snapshots_tx, snapshots_rx) = watch::channel(Some(snapshot.clone()));
+    startup.committed_snapshots = Some(snapshots_rx);
+    let (_repairs_tx, repairs_rx) = watch::channel(zakura_header_chain::VctRootRepairStatus {
+        state: zakura_header_chain::VctRootRepairState::Unavailable {
+            height: target.height,
+        },
+        generation: 7,
+    });
+    startup.vct_root_repairs = Some(repairs_rx);
+    let (handle, mut actions, reactor) =
+        spawn_header_sync_reactor(startup).expect("the ambiguous repair fixture starts");
+    let HeaderPortOperation::QueryVctRepairContext { owner, .. } = next_action(&mut actions).await
+    else {
+        panic!("the ambiguous repair requests its context");
+    };
+
+    let record = |header: zakura_header_chain::Frontier, auth_data_root: u8| TreeAuxRecordV1 {
+        height: header.height,
+        sapling_root: zakura_chain::sapling::tree::Root::default(),
+        orchard_root: zakura_chain::orchard::tree::Root::default(),
+        ironwood_root: zakura_chain::ironwood::tree::Root::default(),
+        sapling_tx_count: 0,
+        orchard_tx_count: 0,
+        ironwood_tx_count: 0,
+        auth_data_root: zakura_chain::block::merkle::AuthDataRoot::from([auth_data_root; 32]),
+    };
+    let honest_target = record(target, 0x10);
+    let corrupt_successor = record(successor, 0x20);
+    let honest_successor = record(successor, 0x21);
+    let successor_slot_peer =
+        ZakuraPeerId::new(vec![0x64; 32]).expect("the peer ID length is valid");
+    let disputed_row = |identity: u8, header: zakura_header_chain::Frontier, source, input| {
+        zakura_header_chain::UntrustedAuxDeliveryRow::new(
+            zakura_header_chain::AuxDelivery::new(
+                zakura_header_chain::EvidenceId::from_digest([identity; 32]),
+                header.hash,
+                source,
+                owner.into(),
+                zakura_header_chain::BodySizeHint::Unknown,
+                Some(input),
+            ),
+            3,
+            [Some([0x5b; 32]), None],
+            Some(successor.hash),
+        )
+    };
+    let target_rows = [disputed_row(
+        0x11,
+        target,
+        zakura_header_chain::SourceId::from_digest([0x5a; 32]),
+        honest_target,
+    )];
+    let successor_rows = [disputed_row(
+        0x22,
+        successor,
+        source_id_from_peer(&successor_slot_peer),
+        corrupt_successor,
+    )];
+    let context = zakura_header_chain::VctRepairContext::from_durable_rows(
+        target,
+        zakura_header_chain::HeaderLocator::for_continuation(anchor),
+        snapshot.state_version,
+        Some(successor.hash),
+        true,
+        &target_rows,
+    )
+    .expect("the disputed target row is coherent")
+    .extend_ambiguous_boundary(successor, None, true, &target_rows, &successor_rows)
+    .expect("the disputed successor row is coherent")
+    .expect("one observation disputed both headers");
+    let episode = context.episode;
+
+    let supplier_status = |max_headers_per_response| Status {
+        work_anchor_height: anchor.height,
+        work_anchor_hash: anchor.hash,
+        selected_tip_height: successor.height,
+        selected_tip_hash: successor.hash,
+        suffix_cumulative_work: zakura_chain::work::difficulty::U256::from(2_u8),
+        oldest_retained_height: anchor.height,
+        max_headers_per_response,
+        max_inflight_requests: 1,
+        max_message_bytes: 2_000_000,
+        tree_aux_schema_mask: AuxSchema::V1.mask_bit(),
+    };
+    let connect = |identity: u8, max_headers_per_response: u32| {
+        let handle = handle.clone();
+        async move {
+            let peer = ZakuraPeerId::new(vec![identity; 32]).expect("the peer ID length is valid");
+            let (send, mut outbound) = framed_channel(8);
+            handle
+                .send(Event::PeerConnected(PeerSession::from_parts(
+                    peer.clone(),
+                    send,
+                    CancellationToken::new(),
+                )))
+                .await
+                .expect("the repair supplier connects");
+            let _ = outbound.recv().await.expect("the local status is sent");
+            handle
+                .send(Event::WireMessage {
+                    peer: peer.clone(),
+                    session_id: 0,
+                    msg: HeaderSyncMessage::Status(supplier_status(max_headers_per_response)),
+                })
+                .await
+                .expect("the repair supplier status reaches the reactor");
+            (peer, outbound)
+        }
+    };
+    let decode_request = |frame| {
+        let HeaderSyncMessage::GetHeaders(request) = handle
+            .codec()
+            .decode_frame(frame, None)
+            .expect("the repair request decodes")
+        else {
+            panic!("the repair uses GetHeaders");
+        };
+        request
+    };
+    let respond = |peer: ZakuraPeerId, request_id, successor_input| Event::SessionResponse {
+        peer,
+        session_id: 0,
+        scope: owner.header_authority(),
+        msg: HeaderSyncMessage::Headers(Headers {
+            request_id,
+            target_tip_hash: successor.hash,
+            common_ancestor_height: anchor.height,
+            common_ancestor_hash: anchor.hash,
+            complete: true,
+            tree_aux_schema: AuxSchema::V1,
+            entries: vec![
+                HeaderEntry {
+                    header: target_header.clone(),
+                    body_size: 0,
+                    tree_aux: Some(honest_target),
+                },
+                HeaderEntry {
+                    header: successor_header.clone(),
+                    body_size: 0,
+                    tree_aux: Some(successor_input),
+                },
+            ],
+        }),
+    };
+
+    let (_short_peer, mut short_outbound) = connect(0x61, 1).await;
+    let (repeating_peer, mut repeating_outbound) = connect(0x62, 2).await;
+    handle
+        .send(Event::VctRepairContextReady {
+            owner,
+            result: VctRepairContextResult::Resolved(context),
+        })
+        .await
+        .expect("the ambiguous repair context reaches the reactor");
+    let request = decode_request(
+        time::timeout(std::time::Duration::from_secs(1), repeating_outbound.recv())
+            .await
+            .expect("the supplier that serves both headers receives the request")
+            .expect("the supplier stream stays open"),
+    );
+    assert!(
+        time::timeout(std::time::Duration::from_millis(20), short_outbound.recv())
+            .await
+            .is_err(),
+        "a supplier limited to one header cannot serve the ambiguous boundary"
+    );
+    assert_eq!(request.target_tip_hash, successor.hash);
+    assert_eq!(request.locator_hashes, vec![anchor.hash]);
+    assert_eq!(request.max_header_count, 2);
+
+    handle
+        .send(respond(
+            repeating_peer,
+            request.request_id,
+            corrupt_successor,
+        ))
+        .await
+        .expect("the repeated response reaches the reactor");
+    assert!(
+        time::timeout(std::time::Duration::from_millis(20), actions.recv())
+            .await
+            .is_err(),
+        "a response that repeats both retained payloads cannot reach state"
+    );
+
+    let (slot_peer, mut slot_outbound) = connect(0x64, 2).await;
+    assert_eq!(slot_peer, successor_slot_peer);
+    let request = decode_request(
+        time::timeout(std::time::Duration::from_secs(1), slot_outbound.recv())
+            .await
+            .expect("a supplier with only a successor slot can still replace the target")
+            .expect("the supplier stream stays open"),
+    );
+    handle
+        .send(respond(slot_peer, request.request_id, honest_successor))
+        .await
+        .expect("the second successor payload reaches the reactor");
+    assert!(
+        time::timeout(std::time::Duration::from_millis(20), actions.recv())
+            .await
+            .is_err(),
+        "state drops a second rooted successor payload from the same supplier"
+    );
+
+    let (replacing_peer, mut replacing_outbound) = connect(0x63, 2).await;
+    let request = decode_request(
+        time::timeout(std::time::Duration::from_secs(1), replacing_outbound.recv())
+            .await
+            .expect("the next supplier receives the ambiguous repair request")
+            .expect("the supplier stream stays open"),
+    );
+    handle
+        .send(respond(
+            replacing_peer,
+            request.request_id,
+            honest_successor,
+        ))
+        .await
+        .expect("the replacement response reaches the reactor");
+    let HeaderPortOperation::PrepareHeaderTarget {
+        target: prepared_target,
+        completion,
+        entries,
+        ..
+    } = next_action(&mut actions).await
+    else {
+        panic!("a response with a new successor payload is prepared for state");
+    };
+    assert_eq!(prepared_target, successor);
+    assert_eq!(
+        completion,
+        zakura_header_chain::TargetCompletion::SelectedAuxiliaryRepair {
+            common_ancestor: anchor,
+            selected_target: successor,
+            episode,
+        }
+    );
+    assert_eq!(
+        entries
+            .iter()
+            .map(|entry| entry.tree_aux)
+            .collect::<Vec<_>>(),
+        vec![Some(honest_target), Some(honest_successor)]
+    );
+
+    shutdown.cancel();
+    reactor.await.expect("the reactor task joins");
+}

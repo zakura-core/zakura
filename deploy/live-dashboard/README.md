@@ -5,6 +5,8 @@ dependency on the block processing profiler. It runs on the dedicated
 `codex-vast-tide-7164` host in San Francisco, separate from the production fleet.
 The intended public hostname is <https://gui.valargroup.dev/>. Direct access
 during DNS setup is <http://146.190.146.239/>.
+The original fleet status page stays at <https://status-mainnet.valargroup.dev/>.
+This dashboard does not replace it or install routes on the production gateway.
 
 ## Data
 

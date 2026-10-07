@@ -754,6 +754,14 @@ tests = ["IN-06::auxiliary_capacity_survives_generated_fork_and_reopen_sequences
 networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
+id = "LC-AUX-08"
+name = "Auxiliary input eviction"
+status = "implemented"
+owner = "zakura_header_chain::HeaderChainEngine::plan_transition"
+tests = ["IN-06::auxiliary_capacity_survives_generated_fork_and_reopen_sequences", "IN-06::saturated_store_admits_commit_window_repairs_after_reopen", "IN-06::commit_window_repairs_evict_speculative_input_at_saturation", "IN-06::aggregate_pressure_levels_the_fullest_bucket_before_single_rows", "IN-06::fork_selection_keeps_displaced_headers_and_evicts_their_input", "IN-06::aggregate_auxiliary_saturation_evicts_displaced_input", "IN-06::protected_commit_window_input_beyond_the_aggregate_limit_is_refused", "IN-06::saturated_repair_preflight_matches_retained_input", "IN-06::saturated_selected_repair_retains_roots_or_reports_no_capacity", "IN-06::rootless_input_cannot_replace_disputed_commit_window_roots", "IN-06::full_auxiliary_bucket_replaces_only_checked_negative_input", "IN-06::repair_context_range_is_bounded_by_reclaimable_capacity", "DG-06::commit_window_input_is_deleted_only_for_a_replacement"]
+networks = ["mainnet", "testnet", "custom"]
+
+[[rule]]
 id = "LC-WIRE-01"
 name = "Bounded decoding"
 status = "implemented"

@@ -258,6 +258,13 @@
                 role="img"
                 aria-label="Block work queues"
               ></div>
+              <p class="panel-bottom">
+                Outstanding counts requested block bodies still awaiting
+                arrival. Applying counts blocks in the sync pipeline awaiting
+                verification or commit completion. These are current counts, not
+                totals. A caught-up node often shows zero. 15-second samples can
+                miss brief work between blocks.
+              </p>
             </section>
             <section class="panel">
               <div class="panel-heading">
@@ -354,7 +361,25 @@
                 scheduling and may include mempool work. Missing summaries leave
                 gaps.
               </p>
-              <div class="panel-heading"><h2>Memory &amp; pressure</h2></div>
+              <div class="panel-heading"><h2>Sync buffers</h2></div>
+              <div class="table-scroll">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Buffer</th>
+                      <th>Current</th>
+                      <th>Observed max · <span data-period-short>15m</span></th>
+                    </tr>
+                  </thead>
+                  <tbody id="sync-buffers"></tbody>
+                </table>
+              </div>
+              <p class="panel-bottom">
+                Temporary sync reservations and buffers, not total node memory.
+                Observed maxima use available 15-second samples in the selected
+                period. Brief peaks between samples can be missed. — means no
+                measurement.
+              </p>
               <dl id="pipeline-resources" class="stat-list"></dl>
             </section>
           </div>

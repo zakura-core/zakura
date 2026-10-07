@@ -259,3 +259,10 @@ The public surface consists of static files, `/api/overview`,
 Caddy. Requests are bounded to 24 concurrent server threads. History retention,
 block cache size, and upstream response limits bound memory and disk growth.
 Readiness requires fresh chain data. Other sources degrade independently.
+
+Sync buffers show current values and the maximum available observation within the
+selected period. These are temporary sync reservations and attributed buffers,
+not total process memory. Observed maxima are not true high-water marks because
+the 15-second sampler can miss short bursts. Missing history remains unavailable.
+Work in flight counts requested bodies awaiting arrival and blocks still in the
+sync applying set, including those awaiting verification or commit completion.

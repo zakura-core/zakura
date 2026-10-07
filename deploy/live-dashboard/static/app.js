@@ -346,14 +346,33 @@ function renderPipeline() {
         .join("")
     : '<p class="empty">Waiting for the first processing sample. Readings stay visible between blocks.</p>';
   applyWidths($("stage-timings"));
-  rows("pipeline-resources", [
-    ["Reserved block budget", bytes(value("reserved_bytes"))],
-    ["Reorder buffer", bytes(value("reorder_bytes"))],
-    ["Attributed pipeline memory", bytes(value("pipeline_memory_bytes"))],
+  const end = period?.end || state.generated_at;
+  const peak = (key) =>
+    history.reduce(
+      (max, row) =>
+        row.t >= end - WINDOWS[range] && row.t <= end && valid(row[key])
+          ? max === null
+            ? row[key]
+            : Math.max(max, row[key])
+          : max,
+      null,
+    );
+  table(
+    "sync-buffers",
     [
-      "Header chunks owned / capacity",
-      `${fmt(value("header_budget_used"))} / ${fmt(value("header_budget_capacity"))}`,
-    ],
+      ["Reserved block budget", "reserved_bytes", bytes],
+      ["Reorder buffer", "reorder_bytes", bytes],
+      ["Attributed pipeline memory", "pipeline_memory_bytes", bytes],
+      ["Header chunks owned", "header_budget_used", fmt],
+    ].map(([name, key, formatValue]) => [
+      name,
+      formatValue(value(key)),
+      formatValue(peak(key)),
+    ]),
+    3,
+  );
+  rows("pipeline-resources", [
+    ["Header chunk capacity", fmt(value("header_budget_capacity"))],
     [
       "Resource alarm",
       sourceFresh("chain")

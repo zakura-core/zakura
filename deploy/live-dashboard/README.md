@@ -175,7 +175,8 @@ library. Charts use a pinned, locally served uPlot 1.6.32 browser bundle. See
 installation or CDN is needed on the host.
 
 uPlot handles axes, rendering, the vertical cursor, and colored sample markers.
-The cursor and compact tooltip snap to the same timestamp. Missing readings
+The cursor and fixed readout above each chart snap to the same timestamp. Click to
+pin a selection and pause that chart while inspecting it. Unpin resumes live data. Missing readings
 have no marker, and gaps remain unconnected. Existing chart instances receive
 live updates so hovering is not reset by every dashboard poll.
 
@@ -272,7 +273,8 @@ block hash, and occurrence ID. It reads at most 16,384 retained events from the
 preceding day, flags limited coverage, and selects completed spans by receipt time.
 Missing boundaries are excluded. Finalized writes refer to the older finalized
 block. Event-chart hover activates only near recorded points. Overlapping points
-show a count and can be clicked to inspect every timestamp, series, and value.
+show a count. Click to pin the group, then use Inspect points to see every
+timestamp, series, and value without chasing a moving tooltip.
 Crypto plots use the full panel width. The sync buffer panel has been removed.
 
 The header and tab icon use the official Zakura flower from

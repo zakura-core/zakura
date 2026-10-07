@@ -37,7 +37,7 @@ function chartSeriesLabel(key) {
   return labels[key] || key.replaceAll("_", " ");
 }
 
-function chartPointHits(plot, left, top, radius = 12) {
+function chartPointHits(plot, left, top, radius = 18) {
   if (left < 0 || top < 0) return [];
   const points = [];
   let closest = null, distance = radius * radius;
@@ -54,7 +54,8 @@ function chartPointHits(plot, left, top, radius = 12) {
       if (d <= distance) { closest = point; distance = d; }
     }
   }
-  return closest ? points.filter(p => (p.x - closest.x) ** 2 + (p.y - closest.y) ** 2 <= 36) : [];
+  return closest ? points.filter(p => (p.x - closest.x) ** 2 + (p.y - closest.y) ** 2 <= 36)
+    .sort((a, b) => ((a.x - left) ** 2 + (a.y - top) ** 2) - ((b.x - left) ** 2 + (b.y - top) ** 2)) : [];
 }
 
 class HistoryChart {
@@ -62,20 +63,58 @@ class HistoryChart {
     Object.assign(this, { container, keys, format, points, colors, clock });
     this.plot = null;
     this.hoverEntries = [];
-    // uPlot consumes bubbling clicks. Resolve the hit before its drag handler.
+    this.pinnedEntries = null;
+    this.readout = document.createElement("div");
+    this.readout.className = "chart-readout";
+    this.readout.setAttribute("aria-label", "Chart inspection");
+    container.before(this.readout);
+    // uPlot consumes bubbling clicks. Capture clicks to pin a stable chart snapshot.
     container.addEventListener("click", (event) => {
-      if (!this.points || !this.plot) return;
+      if (!this.plot) return;
       const rect = this.plot.over.getBoundingClientRect();
-      this.hoverEntries = chartPointHits(this.plot, event.clientX - rect.left, event.clientY - rect.top);
-      this.showObservations();
+      const entries = this.entriesAt(this.plot, event.clientX - rect.left, event.clientY - rect.top);
+      if (!entries.length) { this.unpin(); return; }
+      this.pinnedEntries = entries;
+      this.hoverEntries = entries;
+      this.renderReadout(entries, true);
+      this.plot.setCursor({ left: entries[0].x, top: entries[0].y });
     }, true);
+    this.readout.addEventListener("keydown", event => {
+      if (event.key === "Escape") this.unpin();
+    });
+  }
+
+  entriesAt(plot, left, top) {
+    if (left < 0 || top < 0 || left > plot.over.clientWidth || top > plot.over.clientHeight) return [];
+    if (this.points) return chartPointHits(plot, left, top);
+    const i = plot.posToIdx(left);
+    return this.keys.flatMap((_key, index) => {
+      const value = plot.data[index + 1][i], t = plot.data[0][i];
+      return Number.isFinite(value) ? [{ i, series: index + 1, value, t,
+        x: plot.valToPos(t, "x"), y: plot.valToPos(value, "y") }] : [];
+    });
+  }
+
+  unpin() {
+    this.pinnedEntries = null;
+    this.hoverEntries = [];
+    this.readout.replaceChildren();
+    this.plot?.setCursor({ left: -10, top: -10 });
+    if (this.pendingUpdate) {
+      const pending = this.pendingUpdate;
+      this.pendingUpdate = null;
+      this.update(...pending);
+    }
   }
 
   update(rows, start, end) {
+    // Keep the selected points still while the user reads or opens their details.
+    if (this.pinnedEntries) { this.pendingUpdate = [rows, start, end]; return; }
     const data = chartSeriesData(rows, this.keys, start, end);
     if (!data.slice(1).some((series) => series.some(Number.isFinite))) {
       this.plot?.destroy();
       this.plot = null;
+      this.readout.replaceChildren();
       this.container.innerHTML =
         '<div class="chart-empty">Collecting live samples<br>Charts appear as data arrives</div>';
       return;
@@ -87,10 +126,6 @@ class HistoryChart {
     };
     if (!this.plot) {
       this.container.replaceChildren();
-      this.tooltip = document.createElement("div");
-      this.tooltip.className = "chart-tooltip";
-      this.tooltip.hidden = true;
-      this.container.append(this.tooltip);
       this.plot = new uPlot(this.options(size), data, this.container);
     } else {
       this.plot.batch(() => {
@@ -119,9 +154,10 @@ class HistoryChart {
         y: false,
         drag: { x: false, y: false, setScale: false },
         points: { size: 7, width: 1, stroke: "#0c1117" },
-        dataIdx: (_plot, series, index) => this.points
-          ? (this.hoverEntries.find(p => p.series === series)?.i ?? null) : index,
+        dataIdx: (_plot, series, index) => this.pinnedEntries || this.points
+          ? ((this.pinnedEntries || this.hoverEntries).find(p => p.series === series)?.i ?? null) : index,
         move: (plot, left, top) => {
+          if (this.pinnedEntries) return [this.pinnedEntries[0].x, this.pinnedEntries[0].y];
           if (this.points) {
             this.hoverEntries = chartPointHits(plot, left, top);
             const hit = this.hoverEntries[0];
@@ -216,63 +252,58 @@ class HistoryChart {
   }
 
   showTooltip(plot) {
+    if (this.pinnedEntries) return;
     const { idx, left, top } = plot.cursor;
-    if (idx == null || left < 0 || top < 0) {
-      this.tooltip.hidden = true;
-      return;
-    }
-    const entries = this.points ? this.hoverEntries : this.keys.flatMap((_key, index) => {
-      const value = plot.data[index + 1][idx];
-      return Number.isFinite(value) ? [{ series: index + 1, value, t: plot.data[0][idx] }] : [];
-    });
-    if (!entries.length) { this.tooltip.hidden = true; return; }
-    this.tooltip.replaceChildren();
+    if (idx == null || left < 0 || top < 0) { this.readout.replaceChildren(); return; }
+    const entries = this.points ? this.hoverEntries : this.entriesAt(plot, left, top);
+    if (!entries.length) { this.readout.replaceChildren(); return; }
+    this.renderReadout(entries, false);
+  }
+
+  renderReadout(entries, pinned) {
+    this.readout.replaceChildren();
+    const main = document.createElement("div");
+    main.className = "chart-readout-main";
     const time = document.createElement("div");
-    time.className = "chart-tooltip-time";
-    time.textContent = entries.length > 1 && this.points ? `${entries.length} points here` : this.eventTime(entries[0].t);
-    this.tooltip.append(time);
-    const groups = new Map();
-    for (const entry of entries) {
-      const key = `${entry.series}:${entry.value}`;
-      if (!groups.has(key)) groups.set(key, { ...entry, count: 0 });
-      groups.get(key).count++;
-    }
-    for (const entry of [...groups.values()].slice(0, 6)) {
-      const row = document.createElement("div");
-      row.className = "chart-tooltip-row";
+    time.className = "chart-readout-time";
+    time.textContent = `${pinned ? "Pinned · " : ""}${this.eventTime(entries[0].t)}${this.points && entries.length > 1 ? ` · ${entries.length} points` : ""}`;
+    const values = document.createElement("div");
+    values.className = "chart-readout-values";
+    for (let series = 1; series <= this.keys.length; series++) {
+      const group = entries.filter(entry => entry.series === series);
+      if (!group.length) continue;
+      const row = document.createElement("span");
+      row.className = "chart-readout-value";
       const swatch = document.createElement("i");
-      swatch.style.backgroundColor = this.colors[entry.series - 1];
+      swatch.style.backgroundColor = this.colors[series - 1];
       const label = document.createElement("span");
-      label.textContent = chartSeriesLabel(this.keys[entry.series - 1]);
-      const number = document.createElement("strong");
-      number.textContent = `${this.format(entry.value)}${entry.count > 1 ? ` × ${entry.count}` : ""}`;
-      row.append(swatch, label, number);
-      this.tooltip.append(row);
+      label.textContent = chartSeriesLabel(this.keys[series - 1]);
+      const value = document.createElement("strong");
+      const min = Math.min(...group.map(p => p.value)), max = Math.max(...group.map(p => p.value));
+      value.textContent = min === max ? this.format(min) : `${this.format(min)} – ${this.format(max)}`;
+      row.append(swatch, label, value);
+      values.append(row);
     }
-    if (this.points && entries.length > 1) {
-      const hint = document.createElement("div");
-      hint.className = "chart-tooltip-hint";
-      hint.textContent = "Click chart to inspect all points";
-      this.tooltip.append(hint);
+    main.append(time, values);
+    this.readout.append(main);
+    const controls = document.createElement("div");
+    controls.className = "chart-readout-controls";
+    if (pinned) {
+      if (this.points && entries.length > 1) {
+        const inspect = document.createElement("button");
+        inspect.textContent = `Inspect ${entries.length} points`;
+        inspect.addEventListener("click", () => { this.hoverEntries = this.pinnedEntries; this.showObservations(); });
+        controls.append(inspect);
+      }
+      const clear = document.createElement("button");
+      clear.textContent = "Unpin";
+      clear.addEventListener("click", () => this.unpin());
+      controls.append(clear);
+    } else {
+      const hint = document.createElement("span");
+      hint.textContent = this.points ? "Click point to pin" : "Click to pin";
+      controls.append(hint);
     }
-    this.tooltip.hidden = false;
-    const rect = this.container.getBoundingClientRect(),
-      over = plot.over.getBoundingClientRect(),
-      pointerX = over.left - rect.left + left,
-      pointerY = over.top - rect.top + top,
-      gap = 12,
-      inset = 8,
-      width = this.tooltip.offsetWidth,
-      height = this.tooltip.offsetHeight;
-    const x =
-      pointerX + gap + width <= rect.width - inset
-        ? pointerX + gap
-        : pointerX - gap - width;
-    const y =
-      pointerY - gap - height >= inset
-        ? pointerY - gap - height
-        : pointerY + gap;
-    this.tooltip.style.left = `${Math.max(inset, Math.min(rect.width - width - inset, x))}px`;
-    this.tooltip.style.top = `${Math.max(inset, Math.min(rect.height - height - inset, y))}px`;
+    this.readout.append(controls);
   }
 }

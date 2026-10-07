@@ -1298,3 +1298,17 @@ dialog p {
 .event-detail-dialog table { width: 100%; }
 .event-detail-dialog th, .event-detail-dialog td { text-align: left; padding: 8px; }
 .chart-tooltip-hint { color: var(--muted); margin-top: 7px; }
+
+.chart-readout { height: 64px; margin: 0 17px; display: flex; align-items: center; gap: 10px; font: 11px var(--mono); }
+.chart-readout-main { flex: 1; min-width: 0; }
+.chart-readout-time { font-size: 10px; color: var(--muted); margin-bottom: 7px; }
+.chart-readout-values { display: flex; flex-wrap: wrap; gap: 5px 18px; }
+.chart-readout-value { display: flex; align-items: center; gap: 6px; }
+.chart-readout-value i { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; }
+.chart-readout-value strong { font-weight: 500; }
+.chart-readout-controls { display: flex; align-items: center; gap: 6px; font-size: 9px; color: var(--muted); }
+.chart-readout-controls button { padding: 6px 8px; font: inherit; white-space: nowrap; }
+@media (max-width: 700px) {
+  .chart-readout { height: 88px; align-items: flex-start; padding-top: 10px; }
+  .chart-readout-controls { flex-direction: column; }
+}

@@ -90,4 +90,5 @@ test("point hover ignores empty space and retains every overlapping value", () =
   assert.equal(hits.length, 4);
   assert.equal(hits.filter(p => p.value === 20).length, 2);
   assert.equal(hits.filter(p => p.series === 2).length, 1);
+  assert.equal(hitTest(plot, 11, 22)[0].value, 22);
 });

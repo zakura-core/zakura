@@ -272,3 +272,10 @@ deployment onward without backfilling retained readings into history.
 
 The header and tab icon use the official Zakura flower from
 https://zakura.com/zakura-flower-v1.svg, served locally as `static/favicon.svg`.
+
+Timing history requires an increase in the matching histogram observation count
+across scrapes within 45 seconds and the same node activation. Unchanged counts,
+resets, unknown identity, missing counters, and repeated saves leave gaps. Equal
+durations with increasing counts remain distinct observations. Each point is still
+a rolling summary and can include multiple new events. Historical timing samples
+without observation-count gating are excluded on read, without deleting other data.

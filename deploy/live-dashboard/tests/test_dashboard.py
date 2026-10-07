@@ -87,7 +87,12 @@ zakura_consensus_batch_duration_seconds{verifier="halo2",result="success",quanti
 zakura_consensus_batch_duration_seconds{verifier="halo2",result="success",quantile="1"} 0
 sync_block_applying 0
 ''')
-        self.c.update_metrics(active, now - 60)
+        active["state_contextual_total_duration_seconds_count"] = [({}, 1)]
+        active["zakura_consensus_batch_duration_seconds_count"] = [({"verifier": "halo2", "result": "success"}, 1)]
+        self.c.update_metrics(d.deepcopy(active), now - 75, "node-a")
+        active["state_contextual_total_duration_seconds_count"] = [({}, 2)]
+        active["zakura_consensus_batch_duration_seconds_count"] = [({"verifier": "halo2", "result": "success"}, 2)]
+        self.c.update_metrics(active, now - 60, "node-a")
         active_sample = self.c.sample(now - 60)
         self.assertEqual(active_sample["stage_contextual_validation_p50_ms"], 5)
         self.assertEqual(active_sample["stage_contextual_validation_p95_ms"], 9)
@@ -112,6 +117,38 @@ sync_block_applying 0
         self.assertFalse(self.c.snapshot()["sources"]["metrics"]["fresh"])
         self.c.update_metrics(active, now)
         self.assertEqual(self.c.snapshot()["last_processing"]["stages"][0]["observed_at"], now)
+
+    def test_timing_points_require_new_counts_and_only_emit_once(self):
+        now = time.time()
+        def metrics(count):
+            return d.metrics_parse(f"""state_contextual_total_duration_seconds{{quantile="0.5"}} 0.005
+state_contextual_total_duration_seconds{{quantile="0.95"}} 0.009
+state_contextual_total_duration_seconds{{quantile="1"}} 0.010
+state_contextual_total_duration_seconds_count {count}
+zakura_consensus_batch_duration_seconds{{verifier="halo2",result="success",quantile="0.5"}} 0.005
+zakura_consensus_batch_duration_seconds{{verifier="halo2",result="success",quantile="0.95"}} 0.009
+zakura_consensus_batch_duration_seconds{{verifier="halo2",result="success",quantile="1"}} 0.010
+zakura_consensus_batch_duration_seconds_count{{verifier="halo2",result="success"}} {count}
+""")
+        keys = ("stage_contextual_validation_p95_ms", "crypto_halo2_p95_ms", "contextual_ms")
+        for offset, count, instance, expected in (
+            (0, 10, "a", None), (15, 11, "a", 9), (30, 11, "a", None),
+            (45, 12, "a", 9), (60, 20, "b", None), (75, 21, "b", 9),
+            (90, 1, "b", None), (150, 2, "b", None), (165, 3, "b", 9),
+        ):
+            self.c.update_metrics(metrics(count), now + offset, instance)
+            # Use the real clock so future fixture timestamps remain fresh.
+            with patch.object(d.time, "time", return_value=now + offset):
+                sample = self.c.sample(now + offset)
+                for key in keys:
+                    self.assertEqual(sample[key], expected, (offset, key))
+                    self.assertIsNone(self.c.sample(now + offset)[key])
+        self.c.store.save({"t": now, "stage_contextual_validation_p95_ms": 9,
+                           "crypto_halo2_p95_ms": 9, "contextual_ms": 9, "height": 123}, [])
+        old = self.c.store.history(900, now + 1)[0]
+        for key in keys:
+            self.assertIsNone(old[key])
+        self.assertEqual(old["height"], 123)
 
     def test_processing_readings_persist_across_dashboard_restarts(self):
         now = time.time()

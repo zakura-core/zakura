@@ -105,6 +105,8 @@ WANTED |= {"zakura_build_info", "zakurad_build_info", "sync_block_first_received
            "zakura_consensus_batch_duration_seconds", "rpc_request_duration_seconds",
            "zakura_p2p_queue_depth", "zakura_p2p_stream_accepted"}
 WANTED.update(STAGE_TIMINGS.values())
+WANTED.update(name + "_count" for name in set(STAGE_TIMINGS.values()) | set(TIMINGS.values()))
+WANTED.add("zakura_consensus_batch_duration_seconds_count")
 
 
 def number(value):
@@ -367,7 +369,14 @@ class Store:
         end = time.time() if end is None else end
         with self.lock:
             rows = self.db.execute("SELECT body FROM samples WHERE t >= ? AND t <= ? ORDER BY t", (end - window, end)).fetchall()
-        return [json.loads(r[0]) for r in rows]
+        samples = [json.loads(r[0]) for r in rows]
+        # Older samples did not record counts, so their duplicate status is unknowable.
+        for sample in samples:
+            if sample.get("timing_observations_version") != 2:
+                for key in list(sample):
+                    if key.startswith(("stage_", "crypto_")) or key in TIMINGS:
+                        sample[key] = None
+        return samples
 
     def blocks(self):
         with self.lock:
@@ -406,6 +415,8 @@ class Collector:
         self.previous_host_at = None
         self.metric_attempt = self.host_attempt = self.peer_attempt = 0
         self.last_save = 0
+        self.last_timing_sample_at = None
+        self.new_timing_series = set()
         self.pool = ThreadPoolExecutor(max_workers=4)
         self.stop = threading.Event()
 
@@ -472,6 +483,17 @@ class Collector:
         self.state["verifiers"] = [{"name": name, "p50_ms": quantile(metrics, "zakura_consensus_batch_duration_seconds", "0.5", verifier=name, result="success"),
                                     "p95_ms": quantile(metrics, "zakura_consensus_batch_duration_seconds", verifier=name, result="success")}
                                    for name in verifiers[:20]]
+        # Counter increases distinguish new work from repeated rolling summaries.
+        self.new_timing_series = set()
+        if instance is not None and instance == self.previous_instance and 0 < seconds <= 45:
+            series = [(name, {}) for name in set(STAGE_TIMINGS.values()) | set(TIMINGS.values())]
+            series += [("zakura_consensus_batch_duration_seconds", {"verifier": name, "result": "success"})
+                       for name in verifiers[:20]]
+            for name, labels in series:
+                before = metric(old, name + "_count", **labels)
+                after = metric(metrics, name + "_count", **labels)
+                if before is not None and after is not None and after > before:
+                    self.new_timing_series.add((name, labels.get("verifier")))
         self.remember_processing(now)
         methods = sorted({tags.get("method") for tags, _ in metrics.get("rpc_request_duration_seconds", []) if tags.get("method")})
         self.state["rpc_methods"] = [{"name": name, "p95_ms": quantile(metrics, "rpc_request_duration_seconds", method=name),
@@ -684,17 +706,24 @@ class Collector:
         activity = state.get("chain_activity") or {}
         sample.update({key: activity.get(key) for key in ("tps", "user_tps", "block_interval")})
         sample["peer_p50_ms"] = state.get("peer_latency", {}).get("p50_ms") if fresh("peers") else None
+        new_scrape = fresh("metrics") and self.previous_metrics_at != self.last_timing_sample_at
+        self.last_timing_sample_at = self.previous_metrics_at
+        timing_observed = lambda name, verifier=None: new_scrape and (name, verifier) in self.new_timing_series
+        sample["timing_observations_version"] = 2
+        for key, name in TIMINGS.items():
+            if not timing_observed(name):
+                sample[key] = None
         for stage in state["stage_timings"]:
             if stage["name"] in STAGE_TIMINGS:
                 key = stage["name"].lower().replace(" ", "_")
                 for percentile in ("p50_ms", "p95_ms"):
                     sample[f"stage_{key}_{percentile}"] = (
-                        stage.get(percentile) if fresh("metrics") else None)
+                        stage.get(percentile) if timing_observed(STAGE_TIMINGS[stage["name"]]) else None)
         for verifier in state["verifiers"]:
             if verifier["name"] in ("halo2", "groth16_sapling", "ed25519", "redpallas", "redjubjub"):
                 for percentile in ("p50_ms", "p95_ms"):
                     sample[f"crypto_{verifier['name']}_{percentile}"] = (
-                        verifier.get(percentile) if fresh("metrics") else None)
+                        verifier.get(percentile) if timing_observed("zakura_consensus_batch_duration_seconds", verifier["name"]) else None)
         sample["event_intervals"] = {key: value for key, value in state["event_intervals"].items() if fresh(key)}
         return sample
 

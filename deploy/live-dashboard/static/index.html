@@ -9,7 +9,11 @@
       content="Inside a live Zakura node. Zcash mainnet throughput, transaction processing, networking, and system telemetry."
     />
     <title>Zakura · Node console</title>
-    <link rel="icon" href="favicon.svg?v=zakura-flower-1" type="image/svg+xml" />
+    <link
+      rel="icon"
+      href="favicon.svg?v=zakura-flower-1"
+      type="image/svg+xml"
+    />
     <link rel="stylesheet" href="vendor/uplot/uPlot.min.css" />
     <link rel="stylesheet" href="style.css" />
     <script src="vendor/uplot/uPlot.iife.min.js" defer></script>
@@ -20,9 +24,12 @@
     <a href="#main" class="skip">Skip to dashboard</a>
     <header class="topbar">
       <a class="brand" href="./"
-        ><img src="favicon.svg?v=zakura-flower-1" width="28" height="28" alt="" /><strong
-          >ZAKURA</strong
-        ><span>NODE CONSOLE</span></a
+        ><img
+          src="favicon.svg?v=zakura-flower-1"
+          width="28"
+          height="28"
+          alt=""
+        /><strong>ZAKURA</strong><span>NODE CONSOLE</span></a
       >
       <div class="top-meta">
         <span class="network"><i class="dot"></i> MAINNET</span
@@ -288,9 +295,9 @@
             <div id="stage-history" class="stage-history"></div>
             <p class="panel-bottom">
               Each chart has its own duration scale. Hover for p50/p95. Dots
-              sample the node’s rolling summaries, not individual blocks.
-              Missing summaries leave gaps. Stages overlap and cannot be added
-              into one block’s duration.
+              sample the node’s rolling summaries only when new observations
+              arrive, not individual blocks. Missing summaries leave gaps.
+              Stages overlap and cannot be added into one block’s duration.
             </p>
           </section>
           <div class="grid two">
@@ -309,10 +316,10 @@
                 observed batch summary.
               </p>
               <p class="panel-bottom">
-                Each dot samples the node’s rolling batch-time summary, not an
-                individual batch. p50 and p95 can overlap. Times include
-                scheduling and may include mempool work. Missing summaries leave
-                gaps.
+                Each dot samples the node’s rolling batch-time summary when its
+                observation count increases, not an individual batch. p50 and
+                p95 can overlap. Times include scheduling and may include
+                mempool work. Missing summaries leave gaps.
               </p>
             </section>
             <section class="panel">

@@ -333,7 +333,7 @@ function renderNetwork() {
       queueRows.set(key, row);
     }
   }
-  $("native-queue-pressure").hidden = !queueRows.size;
+  $("native-queue-pressure").hidden = ![...queueRows.values()].some((row) => row.used > 0);
   table("native-queue-rows", [...queueRows.values()].map((row) => [row.name, row.direction, fmt(row.used), fmt(row.capacity), fmt(row.count)]), 5);
   set("native-queue-coverage", `Current occupied capacity includes queued frames and producer reservations. Sums use only recent observations of active persistent service queues, sampled every five seconds. Brief peaks may be missed.${connections.some((row) => row.queues_limited) ? " Queue coverage is limited." : ""}`);
   rows("native-stats", [

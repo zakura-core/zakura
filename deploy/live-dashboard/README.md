@@ -294,7 +294,7 @@ changes are part of this work. The five required outcomes are:
    not propagation latency. Local observations cannot establish network-wide lag.
 3. Crypto shows actual batch duration and item/action counts, scheduling delay,
    failures, and fallback work. A batch is not necessarily one transaction/proof.
-4. Native network health includes measured QUIC traffic, RTT, loss/retransmissions,
+4. Native network health includes measured QUIC traffic, RTT, packet loss,
    connection churn, and queues updated on enqueue and dequeue. Unsupported fields
    are explained or omitted, never permanently empty placeholder charts.
 5. Transaction lifecycle distinguishes verification from admission and reports
@@ -520,3 +520,7 @@ starting until its matching response returns. This includes service readiness,
 any transport fallback, and waiting for other bodies in the response batch. It is
 not a peer RTT or a per-body wire transfer time. Only explicitly requested hashes
 receive this measurement. Unsolicited bodies keep an unknown request duration.
+
+On 2026-10-07 the user chose to defer actual QUIC retransmission counts rather than
+carry a patched transport dependency. Measured packet loss remains in scope and
+must never be labeled retransmissions. No dependency fork is needed for this work.

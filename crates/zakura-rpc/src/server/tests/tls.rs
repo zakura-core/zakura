@@ -1,10 +1,323 @@
-//! Tests for TLS PEM parsing.
+//! Tests for TLS PEM parsing and listener connection lifetimes.
 
-use rustls::pki_types::{pem::PemObject, CertificateDer};
+use std::{io::ErrorKind, net::SocketAddr, sync::Arc, time::Duration};
+
+use jsonrpsee::{
+    server::{stop_channel, Server, ServerHandle},
+    RpcModule,
+};
+use rustls::pki_types::{pem::PemObject, CertificateDer, ServerName};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::{TcpListener, TcpStream},
+    task::JoinHandle,
+    time::{sleep, timeout},
+};
+use tokio_rustls::{client::TlsStream, TlsAcceptor, TlsConnector};
 
 use super::super::{
-    certificate_validity, parse_tls_cert_chain, parse_tls_private_key, CertificateValidity,
+    certificate_validity, parse_tls_cert_chain, parse_tls_private_key, run_tls_listener,
+    serve_tls_connection, CertificateValidity, MAX_PENDING_TLS_HANDSHAKES, MAX_TLS_CONNECTIONS,
+    TLS_HANDSHAKE_TIMEOUT, TLS_HEADER_READ_TIMEOUT,
 };
+
+// This self-signed localhost certificate and key are exclusively test fixtures.
+const HANDSHAKE_CERT: &str = include_str!("handshake-cert.pem");
+const HANDSHAKE_KEY: &str = include_str!("handshake-key.pem");
+const TEST_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long the `slow` test method takes to respond.
+const SLOW_METHOD_DELAY: Duration = Duration::from_secs(2);
+
+struct TestTlsListener {
+    address: SocketAddr,
+    handle: ServerHandle,
+    task: JoinHandle<Result<(), std::io::Error>>,
+}
+
+impl TestTlsListener {
+    async fn start(max_pending: usize, handshake_timeout: Duration) -> Self {
+        Self::start_with(
+            max_pending,
+            handshake_timeout,
+            MAX_TLS_CONNECTIONS,
+            TLS_HEADER_READ_TIMEOUT,
+        )
+        .await
+    }
+
+    async fn start_with(
+        max_pending: usize,
+        handshake_timeout: Duration,
+        max_connections: usize,
+        header_read_timeout: Duration,
+    ) -> Self {
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let config = rustls::ServerConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(
+                parse_tls_cert_chain(HANDSHAKE_CERT.as_bytes()).unwrap(),
+                parse_tls_private_key(HANDSHAKE_KEY.as_bytes())
+                    .unwrap()
+                    .unwrap(),
+            )
+            .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (stop_handle, handle) = stop_channel();
+        let mut methods = RpcModule::new(());
+        methods.register_method("ping", |_, _, _| "pong").unwrap();
+        methods
+            .register_async_method("slow", |_, _, _| async {
+                sleep(SLOW_METHOD_DELAY).await;
+                "done"
+            })
+            .unwrap();
+        let services = Server::builder().http_only().to_service_builder();
+        let task = tokio::spawn(run_tls_listener(
+            listener,
+            TlsAcceptor::from(Arc::new(config)),
+            stop_handle,
+            handle.clone(),
+            max_pending,
+            handshake_timeout,
+            max_connections,
+            move |stream, _, stop_handle| {
+                let service = services.clone().build(methods.clone(), stop_handle.clone());
+                async move {
+                    let _ = serve_tls_connection(
+                        stream,
+                        service,
+                        stop_handle.shutdown(),
+                        header_read_timeout,
+                    )
+                    .await;
+                }
+            },
+        ));
+        Self {
+            address,
+            handle,
+            task,
+        }
+    }
+
+    async fn ping(&self) -> reqwest::Client {
+        let (client, result) = self.call("ping").await.unwrap();
+        assert_eq!(result, "pong");
+        client
+    }
+
+    /// Pings until the listener frees the capacity of a closed connection.
+    async fn ping_eventually(&self) {
+        timeout(TEST_TIMEOUT, async {
+            while self.call("ping").await.is_err() {
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    async fn call(&self, method: &str) -> reqwest::Result<(reqwest::Client, serde_json::Value)> {
+        crate::indexer::server::install_tls_crypto_provider();
+        let client = reqwest::Client::builder()
+            .tls_certs_only([reqwest::Certificate::from_pem(HANDSHAKE_CERT.as_bytes()).unwrap()])
+            .resolve("localhost", self.address)
+            .no_proxy()
+            .timeout(TEST_TIMEOUT)
+            .build()
+            .unwrap();
+        let response = client
+            .post(format!("https://localhost:{}/", self.address.port()))
+            .header("content-type", "application/json")
+            .body(format!(r#"{{"jsonrpc":"2.0","method":"{method}","id":1}}"#))
+            .send()
+            .await?;
+        assert!(response.status().is_success());
+        let mut body: serde_json::Value = serde_json::from_str(&response.text().await?).unwrap();
+        Ok((client, body["result"].take()))
+    }
+
+    /// Completes a TLS handshake without sending an HTTP request.
+    async fn connect_tls(&self) -> TlsStream<TcpStream> {
+        let mut roots = rustls::RootCertStore::empty();
+        for certificate in parse_tls_cert_chain(HANDSHAKE_CERT.as_bytes()).unwrap() {
+            roots.add(certificate).unwrap();
+        }
+        let config = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+        let socket = TcpStream::connect(self.address).await.unwrap();
+        TlsConnector::from(Arc::new(config))
+            .connect(ServerName::try_from("localhost").unwrap(), socket)
+            .await
+            .unwrap()
+    }
+
+    async fn stop(self) {
+        self.handle.stop().unwrap();
+        timeout(TEST_TIMEOUT, self.task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+}
+
+async fn assert_socket_closed(socket: &mut TcpStream) {
+    let result = timeout(TEST_TIMEOUT, socket.read(&mut [0])).await.unwrap();
+    match result {
+        Ok(bytes) => assert_eq!(bytes, 0),
+        Err(error) => assert!(matches!(
+            error.kind(),
+            ErrorKind::ConnectionReset | ErrorKind::ConnectionAborted
+        )),
+    }
+}
+
+/// Asserts that the server closes a TLS connection, with or without a TLS
+/// `close_notify` alert.
+async fn assert_tls_closed(stream: &mut TlsStream<TcpStream>) {
+    let result = timeout(TEST_TIMEOUT, stream.read(&mut [0])).await.unwrap();
+    match result {
+        Ok(bytes) => assert_eq!(bytes, 0),
+        Err(error) => assert!(matches!(
+            error.kind(),
+            ErrorKind::UnexpectedEof | ErrorKind::ConnectionReset | ErrorKind::ConnectionAborted
+        )),
+    }
+}
+
+#[tokio::test]
+async fn silent_tls_handshake_times_out_and_releases_capacity() {
+    // Shorten only the deadline; exercise the same listener as production.
+    let listener = TestTlsListener::start(1, Duration::from_secs(1)).await;
+    let mut silent = TcpStream::connect(listener.address).await.unwrap();
+    assert_socket_closed(&mut silent).await;
+    listener.ping().await;
+    listener.stop().await;
+}
+
+#[tokio::test]
+async fn tls_handshake_admission_is_bounded_and_recovers_after_failure() {
+    let listener = TestTlsListener::start(MAX_PENDING_TLS_HANDSHAKES, TLS_HANDSHAKE_TIMEOUT).await;
+    let mut pending = Vec::new();
+    for _ in 0..MAX_PENDING_TLS_HANDSHAKES {
+        pending.push(TcpStream::connect(listener.address).await.unwrap());
+    }
+    let mut excess = TcpStream::connect(listener.address).await.unwrap();
+    assert_socket_closed(&mut excess).await;
+
+    // The first admitted socket is still pending, rather than being rejected.
+    assert!(
+        timeout(Duration::from_millis(20), pending[0].read(&mut [0]))
+            .await
+            .is_err()
+    );
+    pending[0].shutdown().await.unwrap();
+    assert_socket_closed(&mut pending[0]).await;
+    listener.ping().await;
+    listener.stop().await;
+    for socket in &mut pending {
+        assert_socket_closed(socket).await;
+    }
+}
+
+#[tokio::test]
+async fn completed_tls_handshake_releases_capacity_with_http_connection_open() {
+    let listener = TestTlsListener::start(1, TLS_HANDSHAKE_TIMEOUT).await;
+    // Keep the first client's HTTP connection pooled while another handshakes.
+    let client = listener.ping().await;
+    listener.ping().await;
+    listener.stop().await;
+    drop(client);
+}
+
+#[tokio::test]
+async fn silent_tls_connection_times_out_and_releases_capacity() {
+    // Shorten only the header deadline, and allow a single open connection.
+    let listener = TestTlsListener::start_with(
+        MAX_PENDING_TLS_HANDSHAKES,
+        TLS_HANDSHAKE_TIMEOUT,
+        1,
+        Duration::from_secs(1),
+    )
+    .await;
+    let mut silent = listener.connect_tls().await;
+    assert_tls_closed(&mut silent).await;
+    listener.ping_eventually().await;
+    listener.stop().await;
+}
+
+#[tokio::test]
+async fn open_tls_connections_are_bounded_and_recover_after_close() {
+    let listener = TestTlsListener::start_with(
+        MAX_PENDING_TLS_HANDSHAKES,
+        TLS_HANDSHAKE_TIMEOUT,
+        2,
+        TLS_HEADER_READ_TIMEOUT,
+    )
+    .await;
+    // Completed handshakes keep their connection slots after releasing their
+    // handshake permits.
+    let first = listener.connect_tls().await;
+    let mut second = listener.connect_tls().await;
+    let mut excess = TcpStream::connect(listener.address).await.unwrap();
+    assert_socket_closed(&mut excess).await;
+    assert!(timeout(Duration::from_millis(20), second.read(&mut [0]))
+        .await
+        .is_err());
+
+    drop(first);
+    listener.ping_eventually().await;
+    listener.stop().await;
+    assert_tls_closed(&mut second).await;
+}
+
+#[tokio::test]
+async fn in_flight_request_outlives_header_read_timeout() {
+    let listener = TestTlsListener::start_with(
+        MAX_PENDING_TLS_HANDSHAKES,
+        TLS_HANDSHAKE_TIMEOUT,
+        MAX_TLS_CONNECTIONS,
+        SLOW_METHOD_DELAY / 2,
+    )
+    .await;
+    let (_, result) = listener.call("slow").await.unwrap();
+    assert_eq!(result, "done");
+    listener.stop().await;
+}
+
+#[tokio::test]
+async fn tls_listener_shutdown_cancels_silent_handshakes() {
+    let listener = TestTlsListener::start(MAX_PENDING_TLS_HANDSHAKES, TLS_HANDSHAKE_TIMEOUT).await;
+    let mut silent = TcpStream::connect(listener.address).await.unwrap();
+    let client = listener.ping().await;
+    listener.stop().await;
+    assert_socket_closed(&mut silent).await;
+    drop(client);
+}
+
+#[tokio::test]
+async fn aborting_tls_listener_cancels_owned_connections() {
+    let listener = TestTlsListener::start(MAX_PENDING_TLS_HANDSHAKES, TLS_HANDSHAKE_TIMEOUT).await;
+    let mut silent = TcpStream::connect(listener.address).await.unwrap();
+    // Ensure the listener accepted the socket before aborting its parent task.
+    listener.ping().await;
+    listener.task.abort();
+    let error = timeout(TEST_TIMEOUT, listener.task)
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert!(error.is_cancelled());
+    assert_socket_closed(&mut silent).await;
+}
 
 /// A self-signed test certificate whose `notBefore` and `notAfter` are both before 2050, so
 /// both are encoded as `UTCTime`: 2025-01-01 00:00:00 UTC to 2025-02-01 00:00:00 UTC.

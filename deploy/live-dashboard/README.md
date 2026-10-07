@@ -448,3 +448,10 @@ The opt-in variable is now `DASHBOARD_EVENT_SOCKET`, outside both configuration
 prefixes (`ZAKURA_` and `ZEBRA_`). Activation now also fails fast on an exited
 node process instead of waiting through the full readiness timeout. The old
 binary/unit rollback must complete before retrying with the corrected build.
+
+The failed activation rolled back to `/opt/zakura-dashboard-node/releases/v1.6.0`.
+The restarted node PID was 67676, initially reporting `syncing`. The corrected
+build is running as `zakura-dashboard-build-v3.service` at `431ee608e`; leave its
+checkout unchanged until completion. Dashboard release `431ee608e` is live and
+contains the corrected node unit template for the next activation. The failed
+custom process exited during configuration loading, before database initialization.

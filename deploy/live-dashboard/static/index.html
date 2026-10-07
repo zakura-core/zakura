@@ -344,29 +344,29 @@
             </section>
             <section class="panel">
               <div class="panel-heading">
-                <h2>Instrumentation to add</h2>
-                <span class="tag">NOT YET EXPOSED</span>
+                <h2>Processing visibility</h2>
+                <span class="tag">CURRENT COVERAGE</span>
               </div>
               <ul class="instrumentation">
                 <li>
-                  <b>Per-block timeline</b
+                  <b>Block timings</b
                   ><span
-                    >Receive → verify → contextual checks → commit, joined by
-                    block hash.</span
+                    >Available as aggregate stage durations. An individual
+                    block’s end-to-end timeline is not yet reported.</span
                   >
                 </li>
                 <li>
                   <b>Mempool admission</b
                   ><span
-                    >Accepted, evicted, expired, mined, and rejected counts with
-                    bounded reason labels.</span
+                    >Verification is visible. Admission, eviction, expiration,
+                    and mined outcomes are not yet reported separately.</span
                   >
                 </li>
                 <li>
                   <b>Transaction timings</b
                   ><span
-                    >Queue wait and verification duration for the same
-                    transaction.</span
+                    >Stage counts are visible. Queue wait and verification time
+                    for an individual transaction are not yet reported.</span
                   >
                 </li>
               </ul>

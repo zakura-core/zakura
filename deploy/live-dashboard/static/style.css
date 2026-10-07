@@ -934,6 +934,27 @@ dialog p {
   main {
     padding: 22px 18px 0;
   }
+  .metrics-row {
+    gap: 12px 20px;
+  }
+  .metrics-row strong {
+    font-size: 21px;
+  }
+  .headline > strong {
+    font-size: 27px;
+  }
+  .timing-row {
+    grid-template-columns: 105px minmax(35px, 1fr) 62px;
+    gap: 7px;
+  }
+  .pipeline {
+    gap: 8px;
+  }
+  .pipeline-stage strong {
+    font-size: 21px;
+  }
+}
+@media (max-width: 1000px) {
   .headline-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
@@ -950,22 +971,6 @@ dialog p {
   .flow-stage:nth-child(5) {
     padding-left: 0;
     border: 0;
-  }
-  .metrics-row {
-    gap: 12px 20px;
-  }
-  .metrics-row strong {
-    font-size: 21px;
-  }
-  .timing-row {
-    grid-template-columns: 105px minmax(35px, 1fr) 62px;
-    gap: 7px;
-  }
-  .pipeline {
-    gap: 8px;
-  }
-  .pipeline-stage strong {
-    font-size: 21px;
   }
 }
 @media (max-width: 850px) {

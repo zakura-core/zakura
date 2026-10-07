@@ -15,9 +15,17 @@ use std::{
 use chrono::{TimeZone, Utc};
 use cookie::Cookie;
 use der::{asn1::GeneralizedTime, Decode, Header, Reader, SliceReader, Tag};
+use hyper::{
+    body::{Body, Bytes, Incoming},
+    server::conn::http1,
+    Request, Response,
+};
+use hyper_util::{
+    rt::{TokioIo, TokioTimer},
+    service::TowerToHyperService,
+};
 use jsonrpsee::server::{
-    middleware::rpc::RpcServiceBuilder, serve_with_graceful_shutdown, stop_channel, Server,
-    ServerHandle, StopHandle,
+    middleware::rpc::RpcServiceBuilder, stop_channel, Server, ServerHandle, StopHandle,
 };
 use rustls::pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
 use tokio::{
@@ -107,6 +115,17 @@ const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Time allowed for established TLS connections to finish during shutdown.
 const TLS_CONNECTION_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Maximum number of open TLS connections per listener, including pending
+/// handshakes.
+const MAX_TLS_CONNECTIONS: usize = 256;
+
+/// Time allowed for a TLS client to send each request's HTTP headers, measured
+/// from when the connection starts waiting for them.
+///
+/// This closes connections that are silent after the handshake or idle between
+/// keep-alive requests. It does not limit time spent handling a request.
+const TLS_HEADER_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 impl RpcServer {
     /// Starts the primary RPC server.
@@ -269,15 +288,17 @@ impl RpcServer {
                     server_handle,
                     MAX_PENDING_TLS_HANDSHAKES,
                     TLS_HANDSHAKE_TIMEOUT,
+                    MAX_TLS_CONNECTIONS,
                     move |stream, remote_addr, stop_handle| {
                         let service = service_builder
                             .clone()
                             .build(methods.clone(), stop_handle.clone());
                         async move {
-                            if let Err(error) = serve_with_graceful_shutdown(
+                            if let Err(error) = serve_tls_connection(
                                 stream,
                                 service,
                                 stop_handle.shutdown(),
+                                TLS_HEADER_READ_TIMEOUT,
                             )
                             .await
                             {
@@ -372,11 +393,13 @@ impl RpcServer {
     }
 }
 
-/// Accepts TLS connections with bounded handshake work and owned tasks.
+/// Accepts TLS connections with bounded handshake work, a bounded number of
+/// open connections, and owned tasks.
 ///
 /// Keeping the [`JoinSet`] inside this future also cancels connections if the
 /// listener task is aborted. Established connections get a bounded grace period
 /// on normal shutdown or an accept error.
+#[allow(clippy::too_many_arguments)]
 async fn run_tls_listener<F, Fut>(
     listener: TcpListener,
     acceptor: TlsAcceptor,
@@ -384,6 +407,7 @@ async fn run_tls_listener<F, Fut>(
     server_handle: ServerHandle,
     max_pending_handshakes: usize,
     handshake_timeout: Duration,
+    max_connections: usize,
     serve_connection: F,
 ) -> Result<(), std::io::Error>
 where
@@ -391,6 +415,7 @@ where
     Fut: Future<Output = ()> + Send + 'static,
 {
     let permits = Arc::new(Semaphore::new(max_pending_handshakes));
+    let connection_permits = Arc::new(Semaphore::new(max_connections));
     let mut connections = JoinSet::new();
     let stopped = stop_handle.clone().shutdown();
     tokio::pin!(stopped);
@@ -413,7 +438,12 @@ where
         let deadline = Instant::now() + handshake_timeout;
 
         // Reject excess sockets before spawning, rather than accumulating tasks
-        // waiting for capacity. The permit is held only during the handshake.
+        // waiting for capacity. The handshake permit is held only during the
+        // handshake; the connection permit is held until the task finishes.
+        let Ok(connection_permit) = connection_permits.clone().try_acquire_owned() else {
+            drop(socket);
+            continue;
+        };
         let Ok(permit) = permits.clone().try_acquire_owned() else {
             drop(socket);
             continue;
@@ -439,6 +469,7 @@ where
                     warn!(%remote_addr, "TLS RPC handshake timed out");
                 }
             }
+            drop(connection_permit);
         });
     };
 
@@ -459,6 +490,38 @@ where
     }
 
     result
+}
+
+/// Serves HTTP/1 requests on an established TLS connection until the client
+/// closes it, it exceeds `header_read_timeout`, or `stopped` resolves.
+///
+/// This replaces jsonrpsee's `serve_with_graceful_shutdown`, which configures
+/// no timer, so hyper's header read timeout never applies.
+async fn serve_tls_connection<S, B>(
+    stream: TlsStream<TcpStream>,
+    service: S,
+    stopped: impl Future<Output = ()>,
+    header_read_timeout: Duration,
+) -> Result<(), tower::BoxError>
+where
+    S: tower::Service<Request<Incoming>, Response = Response<B>> + Clone + Send + 'static,
+    S::Future: Send,
+    S::Error: Into<tower::BoxError>,
+    B: Body<Data = Bytes> + Send + 'static,
+    B::Error: Into<tower::BoxError>,
+{
+    let connection = http1::Builder::new()
+        .timer(TokioTimer::new())
+        .header_read_timeout(header_read_timeout)
+        .serve_connection(TokioIo::new(stream), TowerToHyperService::new(service));
+    tokio::pin!(connection, stopped);
+
+    tokio::select! {
+        result = &mut connection => return result.map_err(Into::into),
+        _ = &mut stopped => {}
+    }
+    connection.as_mut().graceful_shutdown();
+    connection.await.map_err(Into::into)
 }
 
 /// Validates the RPC method classification and removes methods that are not

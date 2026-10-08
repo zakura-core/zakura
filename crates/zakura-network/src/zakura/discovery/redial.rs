@@ -6,7 +6,8 @@ use tokio::time::Instant;
 use zakura_quic::NodeAddr;
 
 use crate::zakura::{
-    ZakuraEndpoint, ZakuraLocalLimits, ZakuraPeerId, ZAKURA_ALPN_MISMATCH_BACKOFF,
+    ZakuraEndpoint, ZakuraHandlerError, ZakuraLocalLimits, ZakuraPeerId,
+    ZAKURA_ALPN_MISMATCH_BACKOFF,
 };
 
 /// A connection that served at least this long is treated as healthy, so the
@@ -97,6 +98,10 @@ enum DialResult {
     /// The peer speaks another ALPN; wait at least
     /// [`ZAKURA_ALPN_MISMATCH_BACKOFF`] before the next dial.
     AlpnMismatch,
+    /// A local resource limit refused the dial, so the peer did not fail.
+    /// Retry after the initial backoff without counting an attempt
+    /// (zakura-quic ADM-11).
+    LocalLimit,
 }
 
 /// Maintain a Zakura connection to `node_addr`, re-dialing with bounded backoff.
@@ -131,6 +136,10 @@ pub(crate) async fn native_dial_supervised(
                     DialResult::Healthy
                 }
                 Ok(()) => DialResult::Failed,
+                Err(ZakuraHandlerError::ResourceLimit(limit)) => {
+                    tracing::debug!(limit, "Zakura native dial hit a local limit; will retry");
+                    DialResult::LocalLimit
+                }
                 Err(error) if error.is_alpn_mismatch() => {
                     tracing::debug!(
                         ?error,
@@ -260,22 +269,24 @@ async fn run_dial_supervisor<F>(
                 failures = 0;
                 continue;
             }
-            DialResult::Failed | DialResult::AlpnMismatch => {}
+            DialResult::Failed | DialResult::AlpnMismatch | DialResult::LocalLimit => {}
         }
 
-        failures += 1;
-        if policy.max_attempts.is_some_and(|max| failures >= max) {
-            return;
+        if attempt != DialResult::LocalLimit {
+            failures += 1;
+            if policy.max_attempts.is_some_and(|max| failures >= max) {
+                return;
+            }
         }
 
         // Back off, but wake early only if the peer appears in the supervisor
         // from another connection. Ignore unrelated peer-set changes,
         // including the deregistration from the failed attempt we just
         // observed.
-        let wait = if attempt == DialResult::AlpnMismatch {
-            backoff.max(ZAKURA_ALPN_MISMATCH_BACKOFF)
-        } else {
-            backoff
+        let wait = match attempt {
+            DialResult::AlpnMismatch => backoff.max(ZAKURA_ALPN_MISMATCH_BACKOFF),
+            DialResult::LocalLimit => policy.initial_backoff,
+            _ => backoff,
         };
         let sleep = tokio::time::sleep(wait);
         tokio::pin!(sleep);
@@ -292,7 +303,9 @@ async fn run_dial_supervisor<F>(
                 _ = &mut sleep => break,
             }
         }
-        backoff = backoff.saturating_mul(2).min(policy.max_backoff);
+        if attempt != DialResult::LocalLimit {
+            backoff = backoff.saturating_mul(2).min(policy.max_backoff);
+        }
     }
 }
 
@@ -644,6 +657,32 @@ mod tests {
             6,
             "a peer that closes every connection must use one backoff step per dial",
         );
+    }
+
+    /// A dial refused by a local limit neither uses up a bounded dial's attempts
+    /// nor grows its backoff (zakura-quic ADM-11).
+    #[tokio::test(start_paused = true)]
+    async fn dial_supervisor_local_limit_does_not_count_as_failure() {
+        let (_tx, registered) = tokio::sync::watch::channel(Vec::<ZakuraPeerId>::new());
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let supervisor = tokio::spawn(run_dial_supervisor(
+            redial_test_peer_id(),
+            registered,
+            RedialPolicy::maintain_bounded(Duration::from_secs(1), Duration::from_secs(30), 6),
+            count_dial(&calls, DialResult::LocalLimit),
+        ));
+
+        tokio::time::sleep(Duration::from_millis(10_500)).await;
+        assert_eq!(
+            dial_count(&calls),
+            11,
+            "a local limit retries every initial backoff"
+        );
+        assert!(
+            !supervisor.is_finished(),
+            "a local limit must not use up the dial's attempts"
+        );
+        supervisor.abort();
     }
 
     /// A peer on another ALPN is redialed no sooner than

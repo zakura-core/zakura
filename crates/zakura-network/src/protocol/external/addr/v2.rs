@@ -14,8 +14,8 @@ use byteorder::{BigEndian, ReadBytesExt};
 use thiserror::Error;
 
 use zakura_chain::serialization::{
-    zcash_deserialize_bytes_external_count, CompactSize64, CompactSizeMessage, DateTime32,
-    SerializationError, TrustedPreallocate, ZcashDeserialize, ZcashDeserializeInto,
+    CompactSize64, CompactSizeMessage, DateTime32, SerializationError, TrustedPreallocate,
+    ZcashDeserialize, ZcashReader,
 };
 
 use crate::{meta_addr::MetaAddr, protocol::external::types::PeerServices, PeerSocketAddr};
@@ -262,12 +262,14 @@ impl ZcashSerialize for AddrV2 {
 /// Unimplemented and unrecognised addresses are deserialized as [`AddrV2::Unsupported`].
 /// (Deserialization consumes the correct number of bytes for unsupported addresses.)
 impl ZcashDeserialize for AddrV2 {
-    fn zcash_deserialize<R: Read>(mut reader: R) -> Result<Self, SerializationError> {
+    fn zcash_deserialize_from<R: Read>(
+        reader: &mut ZcashReader<R>,
+    ) -> Result<Self, SerializationError> {
         // > uint32  Time that this node was last seen as connected to the network.
-        let untrusted_last_seen = (&mut reader).zcash_deserialize_into()?;
+        let untrusted_last_seen = reader.read_value()?;
 
         // > Service bits. A CompactSize-encoded bit field that is 64 bits wide.
-        let untrusted_services: CompactSize64 = (&mut reader).zcash_deserialize_into()?;
+        let untrusted_services: CompactSize64 = reader.read_value()?;
         let untrusted_services = PeerServices::from_bits_truncate(untrusted_services.into());
 
         // > Network identifier. An 8-bit value that specifies which network is addressed.
@@ -276,7 +278,7 @@ impl ZcashDeserialize for AddrV2 {
         let network_id = reader.read_u8()?;
 
         // > CompactSize  The length in bytes of addr.
-        let addr_len: CompactSizeMessage = (&mut reader).zcash_deserialize_into()?;
+        let addr_len: CompactSizeMessage = reader.read_value()?;
         let addr_len: usize = addr_len.into();
         if addr_len > MAX_ADDR_V2_ADDR_SIZE {
             return Err(SerializationError::Parse(
@@ -285,7 +287,7 @@ impl ZcashDeserialize for AddrV2 {
         }
 
         // > uint8[sizeAddr]  Network address. The interpretation depends on networkID.
-        let addr: Vec<u8> = zcash_deserialize_bytes_external_count(addr_len, &mut reader)?;
+        let addr: Vec<u8> = reader.read_bytes(addr_len)?;
 
         // > uint16  Network port. If not relevant for the network this MUST be 0.
         let port = reader.read_u16::<BigEndian>()?;
@@ -313,6 +315,13 @@ impl ZcashDeserialize for AddrV2 {
 }
 
 impl TrustedPreallocate for AddrV2 {
+    fn min_serialized_size() -> u64 {
+        // Time, one-byte services and network ID, a zero address length, and port.
+        // Unknown network IDs accept an empty address.
+        const ADDR_V2_MIN_BYTES: u64 = 4 + 1 + 1 + 1 + 2;
+        ADDR_V2_MIN_BYTES
+    }
+
     fn max_allocation() -> u64 {
         // The protocol caps addrv2 messages at 1,000 entries.
         // <https://zips.z.cash/zip-0155#specification>

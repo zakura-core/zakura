@@ -13,7 +13,7 @@ use std::{
 use byteorder::{BigEndian, LittleEndian, ReadBytesExt, WriteBytesExt};
 
 use zakura_chain::serialization::{
-    DateTime32, SerializationError, TrustedPreallocate, ZcashDeserialize, ZcashDeserializeInto,
+    DateTime32, SerializationError, TrustedPreallocate, ZcashDeserialize, ZcashReader,
     ZcashSerialize,
 };
 
@@ -108,12 +108,14 @@ impl ZcashSerialize for AddrV1 {
 }
 
 impl ZcashDeserialize for AddrV1 {
-    fn zcash_deserialize<R: Read>(mut reader: R) -> Result<Self, SerializationError> {
-        let untrusted_last_seen = (&mut reader).zcash_deserialize_into()?;
+    fn zcash_deserialize_from<R: Read>(
+        reader: &mut ZcashReader<R>,
+    ) -> Result<Self, SerializationError> {
+        let untrusted_last_seen = reader.read_value()?;
         let untrusted_services =
             PeerServices::from_bits_truncate(reader.read_u64::<LittleEndian>()?);
 
-        let ipv6_addr = (&mut reader).zcash_deserialize_into()?;
+        let ipv6_addr = reader.read_value()?;
         let port = reader.read_u16::<BigEndian>()?;
 
         // `0` is the default unspecified value for these fields.
@@ -128,6 +130,12 @@ impl ZcashDeserialize for AddrV1 {
 }
 
 impl TrustedPreallocate for AddrV1 {
+    fn min_serialized_size() -> u64 {
+        // Time, services, IPv6 address, and port.
+        const ADDR_V1_BYTES: u64 = 4 + 8 + 16 + 2;
+        ADDR_V1_BYTES
+    }
+
     fn max_allocation() -> u64 {
         // The protocol caps addr messages at 1,000 entries.
         // <https://zips.z.cash/zip-0155#specification>

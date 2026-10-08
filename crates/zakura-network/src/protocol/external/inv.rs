@@ -10,8 +10,8 @@ use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use zakura_chain::{
     block,
     serialization::{
-        ReadZcashExt, SerializationError, TrustedPreallocate, ZcashDeserialize,
-        ZcashDeserializeInto, ZcashSerialize,
+        ReadZcashExt, SerializationError, TrustedPreallocate, ZcashDeserialize, ZcashReader,
+        ZcashSerialize,
     },
     transaction::{
         self,
@@ -155,7 +155,9 @@ impl ZcashSerialize for InventoryHash {
 }
 
 impl ZcashDeserialize for InventoryHash {
-    fn zcash_deserialize<R: Read>(mut reader: R) -> Result<Self, SerializationError> {
+    fn zcash_deserialize_from<R: Read>(
+        reader: &mut ZcashReader<R>,
+    ) -> Result<Self, SerializationError> {
         let code = reader.read_u32::<LittleEndian>()?;
         match code {
             0 => {
@@ -164,19 +166,18 @@ impl ZcashDeserialize for InventoryHash {
                 Ok(InventoryHash::Error)
             }
 
-            1 => Ok(InventoryHash::Tx(reader.zcash_deserialize_into()?)),
-            2 => Ok(InventoryHash::Block(reader.zcash_deserialize_into()?)),
-            3 => Ok(InventoryHash::FilteredBlock(
-                reader.zcash_deserialize_into()?,
-            )),
-            5 => Ok(InventoryHash::Wtx(reader.zcash_deserialize_into()?)),
+            1 => Ok(InventoryHash::Tx(reader.read_value()?)),
+            2 => Ok(InventoryHash::Block(reader.read_value()?)),
+            3 => Ok(InventoryHash::FilteredBlock(reader.read_value()?)),
+            5 => Ok(InventoryHash::Wtx(reader.read_value()?)),
 
             _ => Err(SerializationError::Parse("invalid inventory code")),
         }
     }
 }
 
-/// The minimum serialized size of an [`InventoryHash`].
+/// The minimum serialized size of an [`InventoryHash`]: a 4-byte code and a
+/// 32-byte hash. `MSG_WTX` entries are 32 bytes longer.
 pub(crate) const MIN_INV_HASH_SIZE: usize = 36;
 
 /// The maximum number of inventory items in a network message received from a peer.
@@ -201,6 +202,10 @@ pub const MAX_INV_IN_RECEIVED_MESSAGE: u64 = 50_000;
 pub const MAX_TX_INV_IN_SENT_MESSAGE: u64 = 25_000;
 
 impl TrustedPreallocate for InventoryHash {
+    fn min_serialized_size() -> u64 {
+        MIN_INV_HASH_SIZE as u64
+    }
+
     fn max_allocation() -> u64 {
         // An Inventory hash takes at least 36 bytes, and we reserve at least one byte for the
         // Vector length so we can never receive more than ((MAX_PROTOCOL_MESSAGE_LEN - 1) / 36) in

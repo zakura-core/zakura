@@ -15,7 +15,8 @@ use crate::{endpoint::PendingTable, ConnectError};
 
 /// Serializes construction with the socket-table check (ADM-11). Live owners
 /// are pending or established connections; failed and closed ones move to the
-/// draining budget, so they cannot fill the live inbound share (ADM-13).
+/// draining budget, so while it has room they stay out of the live inbound
+/// share (ADM-13).
 pub(crate) struct Admission {
     pub(crate) construction: Mutex<()>,
     total: usize,
@@ -203,7 +204,8 @@ impl Future for ConnectionAttempt {
             let weak = connection.weak_handle();
             let closed = connection.on_closed();
             // The task owns no endpoint or strong connection handle. It cannot
-            // keep a connection open, and at most `total` such owners can exist.
+            // keep a connection open, and at most `total + draining` such owners
+            // can exist.
             tokio::spawn(async move {
                 // State is freed only after close, so polling can wait for it.
                 closed.await;

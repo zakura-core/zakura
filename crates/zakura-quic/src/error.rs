@@ -77,15 +77,19 @@ impl ConnectError {
     }
 
     /// Ranks errors so a multi-address dial reports the most informative one.
+    ///
+    /// `Capacity` outranks remote failures: an address skipped locally was never
+    /// tried, so the dial must not blame the peer (ADM-11).
     pub(crate) fn rank(&self) -> u8 {
         match self {
-            Self::AlpnMismatch => 6,
-            Self::WrongIdentity => 5,
+            Self::AlpnMismatch => 7,
+            Self::WrongIdentity => 6,
+            Self::Capacity => 5,
             Self::Refused => 4,
             Self::Transport(_) => 3,
             Self::HandshakeTimeout => 2,
             Self::Endpoint(_) | Self::Tls(_) => 1,
-            Self::SelfDial | Self::NoUsableAddress | Self::Capacity => 0,
+            Self::SelfDial | Self::NoUsableAddress => 0,
         }
     }
 }

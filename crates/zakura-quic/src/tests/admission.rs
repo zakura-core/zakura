@@ -404,3 +404,35 @@ fn full_draining_budget_falls_back_to_live_permits() {
     drop(second);
     assert!(admission.has_dial_room(1));
 }
+
+/// A dial whose fallback address hit local capacity reports `Capacity`, not
+/// the other address's remote failure, so callers don't blame the peer (ADM-11).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn partly_refused_dial_reports_local_capacity() {
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        let config = QuicConfig {
+            handshake_timeout_secs: Some(2),
+            dial_stagger_ms: 0,
+            ..test_config()
+        };
+        let client =
+            QuicEndpoint::bind(NodeSecretKey::generate(), &limited_bind(1, 1), &config).unwrap();
+        let blackholes = [
+            tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap(),
+            tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap(),
+        ];
+        let target = NodeAddr::with_addrs(
+            NodeSecretKey::generate().public(),
+            blackholes.iter().map(|s| s.local_addr().unwrap()),
+        );
+        // One address takes the only slot and times out; the other is refused locally.
+        assert!(matches!(
+            client.connect(target, ALPN).await,
+            Err(ConnectError::Capacity)
+        ));
+        drop(blackholes);
+        client.shutdown().await;
+    })
+    .await
+    .unwrap();
+}

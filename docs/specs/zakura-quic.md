@@ -284,7 +284,9 @@ work. Stage 2 runs after TLS proves the `NodeId` and is today's Zakura logic.
   Incoming packet buffers before acceptance remain separately bounded by ADM-5.
   At a limit, the endpoint refuses an inbound attempt and fails a dial with
   `ConnectError::Capacity`. Callers MUST treat `Capacity` as a local limit, not
-  a peer failure. `QuicEndpoint::has_dial_capacity` reports whether a dial would
+  a peer failure. A multi-address dial MUST report `Capacity` over every error
+  except `AlpnMismatch` and `WrongIdentity`, because an address skipped
+  locally was never tried. `QuicEndpoint::has_dial_capacity` reports whether a dial would
   currently pass these checks, so callers can wait instead of dialing.
 - **ADM-12.** Inbound admission MUST leave `max(total / 8, 1)` slots in each
   connection budget for outbound attempts, using integer division. With one

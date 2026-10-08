@@ -416,9 +416,11 @@ impl LegacyRequestFrame {
                 Ok(Self::Ping)
             }
             MSG_REQUEST_PUSH_TRANSACTION => {
-                let mut reader = Cursor::new(frame.payload.as_slice());
-                let transaction = Transaction::zcash_deserialize(&mut reader)?;
-                reject_trailing(&reader)?;
+                let mut bytes = frame.payload.as_slice();
+                let transaction = Transaction::zcash_deserialize_from_slice(&mut bytes)?;
+                if !bytes.is_empty() {
+                    return Err(LegacyGossipError::TrailingBytes);
+                }
                 Ok(Self::PushTransaction(UnminedTx::from(transaction)))
             }
             message_type => Err(LegacyGossipError::UnknownMessageType(message_type)),
@@ -633,9 +635,8 @@ impl LegacyResponseCodec {
                         return Err(LegacyGossipError::UnexpectedResponse("Blocks"));
                     }
                     if let Some(bytes) = reassembler.accept(&frame.payload)? {
-                        let block = Arc::new(Block::zcash_deserialize(&mut Cursor::new(
-                            bytes.as_slice(),
-                        ))?);
+                        let block =
+                            Arc::new(Block::zcash_deserialize_from_slice(&mut bytes.as_slice())?);
                         // Bind the delivered block to a hash we actually requested.
                         // Without this, a peer can substitute any other valid block
                         // for the one requested, corrupting downstream hash/source
@@ -656,7 +657,7 @@ impl LegacyResponseCodec {
                     }
                     if let Some(bytes) = reassembler.accept(&frame.payload)? {
                         let transaction =
-                            Transaction::zcash_deserialize(&mut Cursor::new(bytes.as_slice()))?;
+                            Transaction::zcash_deserialize_from_slice(&mut bytes.as_slice())?;
                         transactions.push(InventoryResponse::Available((
                             UnminedTx::from(transaction),
                             None,
@@ -3156,6 +3157,9 @@ impl fmt::Display for LegacyRequestFrame {
         }
     }
 }
+
+#[cfg(test)]
+pub(super) mod bounded_decoding;
 
 #[cfg(test)]
 mod tests {

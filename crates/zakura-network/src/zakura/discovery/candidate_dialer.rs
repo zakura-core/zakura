@@ -128,6 +128,9 @@ pub(crate) async fn run_native_discovery_dialer(
     let mut dial_backoff_by_node_ip = HashMap::new();
     let dial_backoff = discovery.dial_backoff().await;
     let mut workers = JoinSet::new();
+    // A local limit gives no per-peer backoff, so pause new dials for one tick
+    // rather than respawning the candidate at once.
+    let mut paused_until = None;
 
     loop {
         if shutdown.is_cancelled() {
@@ -135,17 +138,19 @@ pub(crate) async fn run_native_discovery_dialer(
         }
         prune_discovery_ip_backoff(&mut dial_backoff_by_node_ip, dial_backoff.1, Instant::now());
 
-        spawn_discovery_dial_candidates(
-            &endpoint,
-            &discovery,
-            &limits,
-            &mut in_flight,
-            &mut in_flight_by_ip,
-            &dial_backoff_by_node_ip,
-            &mut workers,
-            &sought_services,
-        )
-        .await;
+        if paused_until.is_none_or(|until| Instant::now() >= until) {
+            spawn_discovery_dial_candidates(
+                &endpoint,
+                &discovery,
+                &limits,
+                &mut in_flight,
+                &mut in_flight_by_ip,
+                &dial_backoff_by_node_ip,
+                &mut workers,
+                &sought_services,
+            )
+            .await;
+        }
 
         tokio::select! {
             biased;
@@ -156,6 +161,9 @@ pub(crate) async fn run_native_discovery_dialer(
             joined = workers.join_next(), if !workers.is_empty() => {
                 match joined {
                     Some(Ok(worker_result)) => {
+                        if worker_result.result == DiscoveryDialResult::LocalResourceLimit {
+                            paused_until = Some(Instant::now() + ZAKURA_DISCOVERY_DIAL_INTERVAL);
+                        }
                         in_flight.remove(&worker_result.node_id);
                         release_discovery_in_flight_ips(
                             &mut in_flight_by_ip,

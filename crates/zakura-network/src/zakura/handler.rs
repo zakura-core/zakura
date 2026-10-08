@@ -889,7 +889,9 @@ impl ZakuraEndpoint {
     /// Used by the discovery dialer to avoid starting candidate dials that would
     /// immediately bounce off the admission cap.
     pub(crate) fn has_native_admission_capacity(&self) -> bool {
-        self.handler.admission.available_permits() > 0
+        // The transport budgets are separate, so a free handler permit alone
+        // does not mean a dial can start (zakura-quic ADM-11).
+        self.handler.admission.available_permits() > 0 && self.quic.has_dial_capacity()
     }
 
     /// Stop accepting, close every native connection and drain background tasks.

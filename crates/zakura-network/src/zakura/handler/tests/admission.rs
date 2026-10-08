@@ -209,6 +209,8 @@ async fn transport_capacity_refusal_is_a_local_resource_limit() -> Result<(), Bo
         let quic = node.quic.clone();
         let pending = tokio::spawn(async move { quic.connect(silent_addr, P2P_V2_ALPN).await });
         tokio::time::sleep(Duration::from_millis(500)).await;
+        // Discovery must not start a dial the transport would refuse.
+        assert!(!node.has_native_admission_capacity());
 
         let peer = ZakuraTestNode::builder(985_300).spawn().await?;
         let result = serve_native_dial_connection(&node, peer.node_addr().await, &limits).await;

@@ -33,7 +33,7 @@ use zakura_chain::{
 
 use crate::{
     protocol::{
-        external::InventoryHash,
+        external::{InventoryHash, MIN_INV_HASH_SIZE},
         internal::{InventoryResponse, PeerSource, Request, Response},
     },
     BoxError, MAX_TX_INV_IN_SENT_MESSAGE,
@@ -820,7 +820,7 @@ fn write_hash_list(out: &mut Vec<u8>, hashes: &[block::Hash]) -> Result<(), Lega
 
 fn read_hash_list(reader: &mut Cursor<&[u8]>) -> Result<Vec<block::Hash>, LegacyGossipError> {
     let count = bounded_inventory_count(reader)?;
-    let mut hashes = Vec::with_capacity(count);
+    let mut hashes = Vec::with_capacity(fitting_capacity(reader, count, HASH_LEN));
     for _ in 0..count {
         hashes.push(block::Hash::zcash_deserialize(&mut *reader)?);
     }
@@ -845,7 +845,7 @@ fn read_block_locator(
     reader: &mut Cursor<&[u8]>,
 ) -> Result<(Vec<block::Hash>, Option<block::Hash>), LegacyGossipError> {
     let count = bounded_block_locator_count(reader)?;
-    let mut known_blocks = Vec::with_capacity(count);
+    let mut known_blocks = Vec::with_capacity(fitting_capacity(reader, count, HASH_LEN));
     for _ in 0..count {
         known_blocks.push(block::Hash::zcash_deserialize(&mut *reader)?);
     }
@@ -866,7 +866,7 @@ fn write_tx_id_list(out: &mut Vec<u8>, ids: &[UnminedTxId]) -> Result<(), Legacy
 
 fn read_tx_id_list(reader: &mut Cursor<&[u8]>) -> Result<Vec<UnminedTxId>, LegacyGossipError> {
     let count = bounded_inventory_count(reader)?;
-    let mut ids = Vec::with_capacity(count);
+    let mut ids = Vec::with_capacity(fitting_capacity(reader, count, MIN_INV_HASH_SIZE));
     for _ in 0..count {
         let inv = InventoryHash::zcash_deserialize(&mut *reader)?;
         let Some(id) = inv.unmined_tx_id() else {
@@ -875,6 +875,16 @@ fn read_tx_id_list(reader: &mut Cursor<&[u8]>) -> Result<Vec<UnminedTxId>, Legac
         ids.push(id);
     }
     Ok(ids)
+}
+
+/// Byte length of an encoded block hash.
+const HASH_LEN: usize = 32;
+
+/// Limits a declared `count` to the `item_len`-byte items the unread payload
+/// can hold, so a short frame cannot reserve its full declared capacity.
+fn fitting_capacity(reader: &Cursor<&[u8]>, count: usize, item_len: usize) -> usize {
+    let read = usize::try_from(reader.position()).unwrap_or(usize::MAX);
+    count.min(reader.get_ref().len().saturating_sub(read) / item_len)
 }
 
 fn bounded_inventory_count(reader: &mut Cursor<&[u8]>) -> Result<usize, LegacyGossipError> {

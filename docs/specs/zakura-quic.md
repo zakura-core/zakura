@@ -12,7 +12,7 @@ DEP-6, SOCK-1, WIRE-9, ADM-1, ADM-3, PATH-3, OBS-3, API-2, API-3, API-6 and
 API-7; §17a lists each change. Version 0.3 answers the V12 audit of that
 implementation. It changes SOCK-11, ADM-3, PATH-2, DIAL-4, DIAL-5, CTRL-17,
 CTRL-22 and API-7; §17b lists each change. Version 0.4 adds SOCK-12; §17c
-explains it. Version 0.5 adds ADM-11 and ADM-12 and changes ADM-1, ADM-3,
+explains it. Version 0.5 adds ADM-11, ADM-12 and ADM-13 and changes ADM-1, ADM-3,
 ADM-7, ADM-8 and API-6; §17d lists each change.
 
 ## 0. Conventions
@@ -271,18 +271,21 @@ work. Stage 2 runs after TLS proves the `NodeId` and is today's Zakura logic.
   (`noq-proto/src/crypto/ring_like.rs`). Each key is random per startup and
   never persists. Iroh's BLAKE3 keys go away.
 - **ADM-11.** Before constructing an accepted or dialed connection, the endpoint
-  MUST reserve an owner slot and check the sum of `open_connections()` across
-  every bound socket. Construction and both checks MUST be serialized across
-  sockets and directions. Each budget is bounded by `max_connections`.
-  The transport count includes failed and cancelled attempts through drain.
-  An owner slot follows the connecting future, then the successful connection's
-  weak handle until `is_alive()` is false, including unread streams after drain.
-  The two sets overlap, but their union is bounded by twice `max_connections`.
-  With the default 256 slots, at most 512 transport states can remain allocated.
+  MUST reserve a live owner slot and check the sum of `open_connections()`
+  across every bound socket. Construction and both checks MUST be serialized
+  across sockets and directions. `QuicBindConfig::max_connections` sets the
+  live budget. The transport count is capped at `max_connections +
+  max_draining_connections` and includes failed and cancelled dials, which hold
+  no owner slot, through drain. An owner slot follows the connecting future,
+  then the connection's weak handle until `is_alive()` is false, including
+  unread streams after drain; ADM-13 moves it to the draining budget at failure
+  or close. With the defaults, the transport count and the owner slots are each
+  at most 768, so at most 1,536 transport states can remain allocated.
   Incoming packet buffers before acceptance remain separately bounded by ADM-5.
-  `QuicBindConfig::max_connections` sets the total. At a limit, the endpoint
-  refuses an inbound attempt and fails a dial with `ConnectError::Capacity`.
-  Callers MUST treat `Capacity` as a local limit, not a peer failure.
+  At a limit, the endpoint refuses an inbound attempt and fails a dial with
+  `ConnectError::Capacity`. Callers MUST treat `Capacity` as a local limit, not
+  a peer failure. `QuicEndpoint::has_dial_capacity` reports whether a dial would
+  currently pass these checks, so callers can wait instead of dialing.
 - **ADM-12.** Inbound admission MUST leave `max(total / 8, 1)` slots in each
   connection budget for outbound attempts, using integer division. With one
   configured slot, either direction may use it. The same rule applies to the
@@ -290,9 +293,19 @@ work. Stage 2 runs after TLS proves the `NodeId` and is today's Zakura logic.
   and 28 of 32 control-handshake slots to inbound traffic. Outbound traffic MAY
   use all unused slots. Closing or timing out MUST NOT bypass ADM-11.
   `QuicBindConfig::max_inbound_connections` sets the inbound share. Owner and
-  control-handshake slots are partitioned. For the transport count, the share
-  is headroom: inbound attempts are admitted only while all transport states,
-  including outbound and draining ones, number fewer than the share.
+  control-handshake slots are partitioned. The transport count needs no
+  separate share: every inbound state holds a live or draining owner slot, so
+  inbound states leave the outbound live share free in the table.
+- **ADM-13.** When a connection fails or closes, its owner slot MUST move from
+  the live budgets to a separate draining budget of
+  `QuicBindConfig::max_draining_connections` slots until noq frees the state.
+  If the draining budget is full, the connection keeps its live slot instead.
+  Inbound admission therefore counts only pending and established connections,
+  and failed attempts cannot fill the inbound share until they exhaust the
+  draining budget. Zakura sets that budget to twice `max_connections`, 512 by
+  default, so at a 52 s drain (ADM-7) an attacker needs about 10 failed
+  attempts per second, spread over at least 31 source IPs (ADM-3), to reach
+  the live share.
 
 ## 8. Dialing
 
@@ -366,7 +379,8 @@ These keys stay in `[network.zakura]`: `listen_addr`, `max_connections`
 (256), `max_connections_per_ip` (16), `max_pending_handshakes` (32),
 `stream_open_rate_per_second`, `message_rate_per_second` and the handshake's
 `max_open_streams`. Three now carry transport admission rules:
-`max_connections` also sizes each ADM-11 budget, `max_connections_per_ip`
+`max_connections` also sizes the ADM-11 live budget and, doubled, the ADM-13
+draining budget, `max_connections_per_ip`
 admits one extra pending reconnect (ADM-3), and inbound traffic gets only its
 ADM-12 share of `max_connections` and `max_pending_handshakes`.
 
@@ -620,6 +634,7 @@ and the legacy stack bridges old and new `p2p_stack = "dual"` nodes (COMPAT-7).
 | Unread streams, failed inbound handshakes, and cancelled or timed-out dials stay charged through drain; a dial refused at capacity reports a local limit | ADM-8, ADM-11 |
 | Failed and closed attempts stay charged to their IP while their state may remain; another IP still connects | ADM-1, ADM-7, ADM-8 |
 | Inbound control stalls and registered inbound peers leave outbound room; outbound can use every unused slot | ADM-12 |
+| A failed handshake moves to the draining budget so a new inbound peer is admitted; with that budget full it keeps its live slot | ADM-13 |
 | Happy-eyeballs dial with mixed v4/v6 addresses and one black-holed address | DIAL-1–DIAL-6 |
 | Path ban and admitted-IP invariance | PATH-1–PATH-5, SEC-5 |
 | Config round trip, defaults, range errors, `nat_traversal` error | CTRL-0–CTRL-25 |
@@ -719,4 +734,7 @@ requirements:
   state through drain and while unread streams remain.
 - **ADM-12.** Added. Inbound attempts and control handshakes could otherwise
   take every slot and block outbound dials.
+- **ADM-13.** Added. With failed states charged to the live inbound share,
+  about 14 source addresses sending 4.3 failed handshakes per second could keep
+  every honest inbound peer out.
 - **API-6.** Adds `ConnectError::Capacity`.

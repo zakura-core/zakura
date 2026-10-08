@@ -2,10 +2,17 @@
 
 use super::*;
 
+/// Live budgets with no draining budget, so failed and closed connections keep
+/// their live permits (the ADM-13 fallback).
 fn limited_bind(total: usize, inbound: usize) -> QuicBindConfig {
+    draining_bind(total, inbound, 0)
+}
+
+fn draining_bind(total: usize, inbound: usize, draining: usize) -> QuicBindConfig {
     QuicBindConfig {
         max_connections: total,
         max_inbound_connections: inbound,
+        max_draining_connections: draining,
         ..loopback()
     }
 }
@@ -91,7 +98,7 @@ async fn failed_inbound_handshake_stays_charged_through_drain() {
         assert_eq!(server.seen.lock().unwrap().last().unwrap().pending_total, 0);
         wait_for_transports(&server.endpoint, 0).await;
         // The owner permit follows once the handshake task sees the state freed.
-        while server.endpoint.held_owners() > 0 {
+        while server.endpoint.held_owners() != (0, 0) {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         let conn = client.connect(server.addr(), ALPN).await.unwrap();
@@ -198,8 +205,9 @@ async fn concurrent_sockets_preserve_an_outbound_slot() {
     .unwrap();
 }
 
-/// A failed handshake keeps its IP charge and owner permit until noq frees the
-/// attempt, and no longer: well before the 52 s worst-case drain (ADM-7).
+/// A failed handshake keeps its IP charge and a draining permit until noq frees
+/// the attempt, and no longer: well before the 52 s worst-case drain (ADM-7,
+/// ADM-13).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn failed_handshake_charge_ends_when_noq_frees_it() {
     tokio::time::timeout(TEST_TIMEOUT, async {
@@ -212,7 +220,7 @@ async fn failed_handshake_charge_ends_when_noq_frees_it() {
         let ip = server.endpoint.local_addrs()[0].ip();
         let stalled = stalled_handshake(&server).await;
         // The admission callback runs before the attempt is charged.
-        while server.endpoint.pending(ip) != (1, 1) || server.endpoint.held_owners() != 1 {
+        while server.endpoint.pending(ip) != (1, 1) || server.endpoint.held_owners() != (1, 0) {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         while server.endpoint.pending(ip).0 > 0 {
@@ -225,13 +233,17 @@ async fn failed_handshake_charge_ends_when_noq_frees_it() {
             if server.endpoint.pending(ip).1 == 0 {
                 break;
             }
-            assert_eq!(owners, 1, "a charged failed attempt keeps its owner permit");
+            assert_eq!(
+                owners,
+                (0, 1),
+                "a charged failed attempt holds a draining permit, not a live one"
+            );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         assert!(failed.elapsed() < Duration::from_secs(15));
         // noq removes the table entry asynchronously after the state is freed.
         wait_for_transports(&server.endpoint, 0).await;
-        while server.endpoint.held_owners() > 0 {
+        while server.endpoint.held_owners() != (0, 0) {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         drop(stalled);
@@ -340,4 +352,55 @@ async fn outbound_connections_can_use_entire_budget() {
     })
     .await
     .unwrap();
+}
+
+/// A failed handshake moves to the draining budget, so a new inbound peer is
+/// admitted while noq still holds the failed state (ADM-13).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_handshakes_leave_the_live_inbound_share() {
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        let config = QuicConfig {
+            handshake_timeout_secs: Some(2),
+            retry_threshold: None,
+            ..test_config()
+        };
+        let server = server_with(&config, &draining_bind(1, 1, 2), &[ALPN], |_| Admit::Accept);
+        let stalled = stalled_handshake(&server).await;
+        wait_for_attempts(&server, 1).await;
+        while server.endpoint.held_owners() != (0, 1) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let client = client();
+        let conn = client.connect(server.addr(), ALPN).await.unwrap();
+        // The failed state still occupied the table while the peer was admitted.
+        assert_eq!(server.endpoint.held_owners().1, 1);
+        drop((conn, stalled));
+        client.shutdown().await;
+        server.endpoint.shutdown().await;
+    })
+    .await
+    .unwrap();
+}
+
+/// With the draining budget full, a failed or closed connection keeps its live
+/// permits, and the table cap still bounds every state (ADM-11, ADM-13).
+#[test]
+fn full_draining_budget_falls_back_to_live_permits() {
+    let admission = crate::admission::Admission::new(1, 1, 1);
+    let first = admission.reserve(true, 0).unwrap().into_draining();
+    assert_eq!(admission.held(), (0, 1));
+    let second = admission.reserve(true, 1).unwrap().into_draining();
+    assert_eq!(admission.held(), (1, 1));
+    assert!(matches!(
+        admission.reserve(true, 0),
+        Err(ConnectError::Capacity)
+    ));
+    drop(first);
+    assert!(matches!(
+        admission.reserve(false, 2),
+        Err(ConnectError::Capacity)
+    ));
+    assert!(!admission.has_dial_room(1));
+    drop(second);
+    assert!(admission.has_dial_room(1));
 }

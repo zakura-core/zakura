@@ -16,7 +16,7 @@ use noq::{PathId, Runtime, VarInt};
 use tokio::{sync::watch, task::JoinSet};
 
 use crate::{
-    admission::{self, Admission, ConnectionAttempt},
+    admission::{self, Admission, ConnectionAttempt, Reservation},
     config::{QuicBindConfig, QuicConfig},
     conn::{self, BanCheck, Conn, ConnObserver, OpenPaths},
     error::{BindError, ConnectError},
@@ -165,6 +165,7 @@ impl QuicEndpoint {
         if bind.max_inbound_connections == 0
             || bind.max_inbound_connections > bind.max_connections
             || bind.max_connections > tokio::sync::Semaphore::MAX_PERMITS
+            || bind.max_draining_connections > tokio::sync::Semaphore::MAX_PERMITS
         {
             return Err(BindError::ConnectionLimits);
         }
@@ -196,7 +197,11 @@ impl QuicEndpoint {
             transport: Arc::new(config.transport_config(bind.max_bidi_streams)),
             sockets,
             pending: PendingTable::default(),
-            admission: Admission::new(bind.max_connections, bind.max_inbound_connections),
+            admission: Admission::new(
+                bind.max_connections,
+                bind.max_inbound_connections,
+                bind.max_draining_connections,
+            ),
             shutdown,
             serve: Mutex::new(None),
             observer: Mutex::new(None),
@@ -406,6 +411,14 @@ impl QuicEndpoint {
             .fold(0usize, usize::saturating_add)
     }
 
+    /// Whether a dial would now pass the ADM-11 checks rather than fail with
+    /// [`ConnectError::Capacity`]. Callers can skip a dial instead of
+    /// retrying one that would fail locally. Another dial may still take the
+    /// last slot first.
+    pub fn has_dial_capacity(&self) -> bool {
+        self.inner.admission.has_dial_room(self.open_connections())
+    }
+
     /// Picks the socket to dial `target` from: same family, and loopback for
     /// loopback targets when one exists.
     fn socket_for(&self, target: SocketAddr) -> Option<noq::Endpoint> {
@@ -488,10 +501,10 @@ impl QuicEndpoint {
         (self.inner.pending.total(), self.inner.pending.for_ip(ip))
     }
 
-    /// Owner permits held across both directions, for tests.
+    /// Live and draining owner permits held, for tests.
     #[cfg(test)]
-    pub(crate) fn held_owners(&self) -> usize {
-        self.inner.admission.held_owners()
+    pub(crate) fn held_owners(&self) -> (usize, usize) {
+        self.inner.admission.held()
     }
 
     fn ban_check(&self) -> Option<BanCheck> {
@@ -860,7 +873,7 @@ async fn handshake(
         // ADM-7: noq keeps a failed attempt's state while it drains, so its IP
         // charge and owner permit last until the state is freed.
         // ADM-6: dropping the attempt closes a timed-out connection.
-        let _reservation = connecting.abandon();
+        let _reservation = connecting.abandon().map(Reservation::into_draining);
         let _charge = pending.into_hold();
         admission::until_freed(&attempt).await;
         return;

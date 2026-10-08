@@ -381,12 +381,15 @@ pub struct QuicBindConfig {
     pub addrs: Vec<SocketAddr>,
     /// Concurrent bidirectional streams per connection (WIRE-8).
     pub max_bidi_streams: u32,
-    /// Maximum entries across all noq connection tables, and independently the
-    /// maximum pending or retained connection owners. Together they bound live
-    /// transport states by twice this value, including failed attempts.
+    /// Maximum live (pending or established) connection owners (ADM-11).
     pub max_connections: usize,
-    /// Inbound ceiling for each budget. The remainder stays available to dials.
+    /// Inbound share of `max_connections`. The remainder stays available to
+    /// dials (ADM-12).
     pub max_inbound_connections: usize,
+    /// Owners for failed and closed connections whose state noq still holds,
+    /// kept apart from the live budgets (ADM-13). The noq connection tables
+    /// hold at most `max_connections + max_draining_connections` entries.
+    pub max_draining_connections: usize,
 }
 
 #[cfg(test)]

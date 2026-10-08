@@ -18,6 +18,7 @@ pub struct LocalEndpointFactory {
     max_bidi_streams: u32,
     max_connections: usize,
     max_inbound_connections: usize,
+    max_draining_connections: usize,
 }
 
 impl LocalEndpointFactory {
@@ -29,11 +30,13 @@ impl LocalEndpointFactory {
 
     /// Create a factory with the transport settings a node with `limits` uses.
     pub fn with_limits(limits: &ZakuraLocalLimits) -> Self {
+        let bind = limits.quic_bind_config(Vec::new());
         Self {
             quic: limits.quic.clone(),
             max_bidi_streams: u32::from(limits.max_open_streams),
             max_connections: limits.max_connections,
-            max_inbound_connections: limits.quic_bind_config(Vec::new()).max_inbound_connections,
+            max_inbound_connections: bind.max_inbound_connections,
+            max_draining_connections: bind.max_draining_connections,
         }
     }
 
@@ -71,6 +74,7 @@ impl LocalEndpointFactory {
             max_bidi_streams: self.max_bidi_streams,
             max_connections: self.max_connections,
             max_inbound_connections: self.max_inbound_connections,
+            max_draining_connections: self.max_draining_connections,
         };
         Ok(QuicEndpoint::bind(
             Self::secret_key(seed),

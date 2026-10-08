@@ -13,33 +13,47 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::{endpoint::PendingTable, ConnectError};
 
-/// Serializes construction with the socket-table check. Owners also retain a
-/// permit, because a drained connection can still have unread stream handles.
+/// Serializes construction with the socket-table check (ADM-11). Live owners
+/// are pending or established connections; failed and closed ones move to the
+/// draining budget, so they cannot fill the live inbound share (ADM-13).
 pub(crate) struct Admission {
     pub(crate) construction: Mutex<()>,
     total: usize,
-    inbound: usize,
+    draining: usize,
     owners: Arc<Semaphore>,
     inbound_owners: Arc<Semaphore>,
+    draining_owners: Arc<Semaphore>,
 }
 
 impl Admission {
-    pub(crate) fn new(total: usize, inbound: usize) -> Self {
+    /// Builds the live budgets of `total` and `inbound` owners and a separate
+    /// budget of `draining` owners.
+    pub(crate) fn new(total: usize, inbound: usize, draining: usize) -> Self {
         Self {
             construction: Mutex::new(()),
             total,
-            inbound,
+            draining,
             owners: Arc::new(Semaphore::new(total)),
             inbound_owners: Arc::new(Semaphore::new(inbound)),
+            draining_owners: Arc::new(Semaphore::new(draining)),
         }
     }
 
+    /// The table cap covers failed dials, which hold no permit until drain.
+    fn table_full(&self, open: usize) -> bool {
+        open >= self.total.saturating_add(self.draining)
+    }
+
+    /// Whether a dial would now get past [`Self::reserve`].
+    pub(crate) fn has_dial_room(&self, open: usize) -> bool {
+        !self.table_full(open) && self.owners.available_permits() > 0
+    }
+
     /// The caller must hold `construction` through creating the noq attempt.
-    /// Socket counts cover failed attempts until drain. Permits cover pending
-    /// futures and established connections through their final handle's drop.
+    /// Permits cover pending futures and established connections through their
+    /// final handle's drop, moving to the draining budget at failure or close.
     pub(crate) fn reserve(&self, inbound: bool, open: usize) -> Result<Reservation, ConnectError> {
-        let limit = if inbound { self.inbound } else { self.total };
-        if open >= limit {
+        if self.table_full(open) {
             return Err(ConnectError::Capacity);
         }
         // Reserve the inbound share first so rejection cannot borrow outbound room.
@@ -53,23 +67,48 @@ impl Admission {
             .try_acquire_owned()
             .map_err(|_| ConnectError::Capacity)?;
         Ok(Reservation {
-            _inbound: inbound,
-            _global: global,
+            live: Some(LivePermits {
+                _inbound: inbound,
+                _global: global,
+            }),
+            draining: None,
+            draining_owners: self.draining_owners.clone(),
         })
     }
-}
 
-impl Admission {
-    /// Owner permits held across both directions, for tests.
+    /// Live and draining owner permits held, for tests.
     #[cfg(test)]
-    pub(crate) fn held_owners(&self) -> usize {
-        self.total - self.owners.available_permits()
+    pub(crate) fn held(&self) -> (usize, usize) {
+        (
+            self.total - self.owners.available_permits(),
+            self.draining - self.draining_owners.available_permits(),
+        )
     }
 }
 
 pub(crate) struct Reservation {
+    live: Option<LivePermits>,
+    draining: Option<OwnedSemaphorePermit>,
+    draining_owners: Arc<Semaphore>,
+}
+
+struct LivePermits {
     _inbound: Option<OwnedSemaphorePermit>,
     _global: OwnedSemaphorePermit,
+}
+
+impl Reservation {
+    /// Moves a failed or closed connection to the draining budget. With that
+    /// budget full, it keeps its live permits instead (ADM-13).
+    pub(crate) fn into_draining(mut self) -> Self {
+        if self.draining.is_none() {
+            if let Ok(permit) = self.draining_owners.clone().try_acquire_owned() {
+                self.draining = Some(permit);
+                self.live = None;
+            }
+        }
+        self
+    }
 }
 
 /// Field order drops a cancelled handshake before returning its reservation.
@@ -168,6 +207,7 @@ impl Future for ConnectionAttempt {
             tokio::spawn(async move {
                 // State is freed only after close, so polling can wait for it.
                 closed.await;
+                let reservation = reservation.map(Reservation::into_draining);
                 let charge = close_charge.map(|(table, ip)| table.hold(ip));
                 until_freed(&weak).await;
                 drop((charge, reservation));

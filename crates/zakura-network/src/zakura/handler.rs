@@ -535,6 +535,8 @@ impl ZakuraLocalLimits {
             max_bidi_streams: u32::from(self.max_open_streams),
             max_connections: self.max_connections,
             max_inbound_connections: inbound_capacity(self.max_connections),
+            // Failed and closed states are cheap; see zakura-quic ADM-13.
+            max_draining_connections: self.max_connections.saturating_mul(2),
         }
     }
 }

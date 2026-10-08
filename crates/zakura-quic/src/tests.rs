@@ -82,6 +82,7 @@ fn loopback() -> QuicBindConfig {
         max_bidi_streams: 64,
         max_connections: 256,
         max_inbound_connections: 224,
+        max_draining_connections: 512,
     }
 }
 
@@ -241,6 +242,7 @@ async fn interface_change_notifies_noq_and_keeps_connections() {
                 max_bidi_streams: 64,
                 max_connections: 256,
                 max_inbound_connections: 224,
+                max_draining_connections: 512,
             },
             &test_config(),
         )
@@ -515,6 +517,7 @@ async fn happy_eyeballs_skips_a_black_hole() {
                 max_bidi_streams: 64,
                 max_connections: 256,
                 max_inbound_connections: 224,
+                max_draining_connections: 512,
             },
             &config,
         )
@@ -550,6 +553,7 @@ async fn peer_opened_path_from_a_banned_ip_closes() {
                 max_bidi_streams: 64,
                 max_connections: 256,
                 max_inbound_connections: 224,
+                max_draining_connections: 512,
             },
             &test_config(),
         )
@@ -613,6 +617,7 @@ async fn lagged_path_events_resync_the_open_paths() {
                 max_bidi_streams: 64,
                 max_connections: 256,
                 max_inbound_connections: 224,
+                max_draining_connections: 512,
             },
             &test_config(),
         )

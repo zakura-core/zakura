@@ -30,7 +30,7 @@ const fn response(message_type: u8, ends_exchange: bool, payload: PayloadLen) ->
     }
 }
 
-pub(super) const RULES: &[MessageRule] = &[
+pub(in crate::zakura::block_sync) const RULES: &[MessageRule] = &[
     MessageRule {
         message_type: 1,
         payload: PayloadLen::exact(53),

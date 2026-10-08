@@ -18,6 +18,7 @@ use crate::zakura::{
     Frame, ZakuraPeerId,
 };
 
+#[derive(Debug)]
 struct Store {
     blocks: Vec<(block::Height, Arc<block::Block>)>,
     started: Arc<Semaphore>,

@@ -211,7 +211,10 @@ async fn failed_handshake_charge_ends_when_noq_frees_it() {
         let server = server_with(&config, &loopback(), &[ALPN], |_| Admit::Accept);
         let ip = server.endpoint.local_addrs()[0].ip();
         let stalled = stalled_handshake(&server).await;
-        wait_for_attempts(&server, 1).await;
+        // The admission callback runs before the attempt is charged.
+        while server.endpoint.pending(ip) != (1, 1) || server.endpoint.held_owners() != 1 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         while server.endpoint.pending(ip).0 > 0 {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -225,8 +228,9 @@ async fn failed_handshake_charge_ends_when_noq_frees_it() {
             assert_eq!(owners, 1, "a charged failed attempt keeps its owner permit");
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        assert_eq!(open_transports(&server.endpoint), 0);
         assert!(failed.elapsed() < Duration::from_secs(15));
+        // noq removes the table entry asynchronously after the state is freed.
+        wait_for_transports(&server.endpoint, 0).await;
         while server.endpoint.held_owners() > 0 {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }

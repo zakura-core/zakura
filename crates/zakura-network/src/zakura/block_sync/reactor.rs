@@ -2043,9 +2043,11 @@ impl BlockSyncReactor {
         let Some(peer_state) = self.state.peers.get_mut(peer) else {
             return false;
         };
-        let msg = BlockSyncMessage::Status(status);
-        let started = Instant::now();
         let session = peer_state.session.clone();
+        // Delivery tracks the local status; traces show what the wire carries.
+        let sent = session.wire_status(status);
+        let msg = BlockSyncMessage::Status(sent);
+        let started = Instant::now();
         let result = session.try_send_status(status);
         match &result {
             Ok(()) => peer_state.status_delivery.queued(status, now),
@@ -2060,7 +2062,7 @@ impl BlockSyncReactor {
         match result {
             Ok(()) => {
                 self.trace_message_sent(peer, &msg, "queued", started.elapsed());
-                self.trace_status_sent(peer, reason, status);
+                self.trace_status_sent(peer, reason, sent);
                 true
             }
             Err(OrderedSendError::Full) => {

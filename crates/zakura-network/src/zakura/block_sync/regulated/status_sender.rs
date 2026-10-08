@@ -15,18 +15,28 @@ use std::{
 pub(crate) struct StatusSender {
     sender: Mutex<CadenceSender<Message>>,
     received: Mutex<Option<BlockSyncStatus>>,
-}
-
-impl Default for StatusSender {
-    fn default() -> Self {
-        Self {
-            sender: Mutex::new(CadenceSender::new()),
-            received: Mutex::new(None),
-        }
-    }
+    max_inflight_requests: u32,
 }
 
 impl StatusSender {
+    /// A connection's sender, advertising at most `max_inflight_requests`; see
+    /// [`super::session::serving_max_inflight_requests`].
+    pub(crate) fn new(max_inflight_requests: u32) -> Self {
+        Self {
+            sender: Mutex::new(CadenceSender::new()),
+            received: Mutex::new(None),
+            max_inflight_requests,
+        }
+    }
+
+    /// `status` as this connection sends it, with the serving in-flight limit applied.
+    pub(crate) fn advertised(&self, status: BlockSyncStatus) -> BlockSyncStatus {
+        BlockSyncStatus {
+            max_inflight_requests: status.max_inflight_requests.min(self.max_inflight_requests),
+            ..status
+        }
+    }
+
     pub(crate) fn record_received(&self, status: BlockSyncStatus) {
         *self.received.lock().unwrap_or_else(PoisonError::into_inner) = Some(status);
     }
@@ -42,7 +52,7 @@ impl StatusSender {
     ) -> Result<(), OrderedSendError> {
         let mut sender = self.sender.lock().unwrap_or_else(PoisonError::into_inner);
         sender
-            .update(Message::Status(status))
+            .update(Message::Status(self.advertised(status)))
             .map_err(|error| OrderedSendError::Encode(error.into()))?;
         match sender.send_due(send) {
             Ok(0) => Err(OrderedSendError::Full),
@@ -70,7 +80,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn replacements_and_range_corrections_share_the_connection_cadence() {
-        let sender = Arc::new(StatusSender::default());
+        let sender = Arc::new(StatusSender::new(u32::MAX));
         let (old_send, mut old_recv) = framed_channel(4);
         let original = BlockSyncStatus {
             servable_high: block::Height(10),
@@ -104,7 +114,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_stalled_status_writer_retains_only_one_frame_and_the_latest_update() {
-        let sender = StatusSender::default();
+        let sender = StatusSender::new(u32::MAX);
         let (send, mut recv) = framed_channel(8);
         sender.try_send(BlockSyncStatus::default(), &send).unwrap();
         for height in 1..=50 {
@@ -135,5 +145,29 @@ mod tests {
             BlockSyncMessage::decode_frame(recv.recv().await.unwrap()).unwrap(),
             BlockSyncMessage::Status(latest)
         );
+    }
+
+    /// Regulated Status carries the serving limit without lowering smaller advertisements.
+    #[tokio::test]
+    async fn status_advertises_at_most_the_serving_limit() {
+        let sender = StatusSender::new(2816);
+        let (send, mut recv) = framed_channel(4);
+        let status = BlockSyncStatus {
+            max_inflight_requests: 32_000,
+            ..BlockSyncStatus::default()
+        };
+        sender.try_send(status, &send).unwrap();
+        assert_eq!(
+            BlockSyncMessage::decode_frame(recv.recv().await.unwrap()).unwrap(),
+            BlockSyncMessage::Status(BlockSyncStatus {
+                max_inflight_requests: 2816,
+                ..status
+            })
+        );
+        let small = BlockSyncStatus {
+            max_inflight_requests: 100,
+            ..status
+        };
+        assert_eq!(sender.advertised(small), small);
     }
 }

@@ -14,7 +14,7 @@ struct LifecycleSamples {
     cleaned: AllocationStats,
 }
 
-/// Check production ownership transitions with all 64,000 default commitments in one session.
+/// Check production ownership transitions with every default commitment in one session.
 /// Isolation excludes unrelated tests, while the observer includes blocking encoding workers.
 #[test]
 #[allow(clippy::print_stderr)]
@@ -36,7 +36,8 @@ fn compact_session_lifecycle_peak() {
             });
             let serving = Serving::new(source, &ZakuraBlockSyncConfig::default());
             let peer = ZakuraPeerId::new(vec![63; 32]).unwrap();
-            let count = ZakuraBlockSyncConfig::default().advertised_max_inflight_requests() * 2;
+            let count =
+                super::super::serving_max_inflight_requests(&ZakuraBlockSyncConfig::default()) * 2;
             let measurement = ProcessMeasurement::start();
             let (fixed, admitted, idle, cancelled, replacement) = runtime.block_on(async {
                 tokio::time::timeout(Duration::from_secs(90), async {

@@ -737,7 +737,7 @@ fn measure_waiting_getblocks_sessions(peers: usize) {
 fn measure_waiting_getblocks_capacity(peers: usize, config: &super::super::ZakuraBlockSyncConfig) {
     let serving = super::session::Serving::new(store(&[], false), config);
     let cancel = CancellationToken::new();
-    let count = config.advertised_max_inflight_requests() * 2;
+    let count = super::session::serving_max_inflight_requests(config) * 2;
     let started = std::time::Instant::now();
     // No await: all requests remain queued before any worker can run. Output
     // receivers stay alive so closed queues cannot hide the retained cost.

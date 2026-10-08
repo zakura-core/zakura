@@ -178,3 +178,68 @@ async fn cancelled_sessions_do_not_complete_replacement_ranges() {
 }
 
 mod lifecycle;
+
+/// Default peer limits budget 2816 requests, so 512 sessions fill exactly 512 MiB.
+#[test]
+fn the_default_serving_limit_fits_the_bookkeeping_budget() {
+    let config = ZakuraBlockSyncConfig::default();
+    let limit = serving_max_inflight_requests(&config);
+    assert_eq!(serving_sessions(&config), 512);
+    assert_eq!(limit, 2816);
+    let sessions = u64::try_from(serving_sessions(&config)).unwrap();
+    let envelope = sessions * (SESSION_ALLOWANCE_BYTES + 2 * u64::from(limit) * BYTES_PER_REQUEST);
+    assert!(envelope <= BOOKKEEPING_BUDGET_BYTES);
+    let one_more =
+        sessions * (SESSION_ALLOWANCE_BYTES + 2 * u64::from(limit + 1) * BYTES_PER_REQUEST);
+    assert!(one_more > BOOKKEEPING_BUDGET_BYTES);
+    // Local download sizing keeps the configured advertisement.
+    assert_eq!(config.advertised_max_inflight_requests(), 32_000);
+}
+
+/// Fewer sessions keep the configured limit; more sessions shrink it to at least one.
+#[test]
+fn the_serving_limit_follows_session_slots_and_configuration() {
+    let with = |inbound, outbound, configured| {
+        let mut config = ZakuraBlockSyncConfig {
+            max_inflight_requests: configured,
+            ..Default::default()
+        };
+        config.peer_limits.max_inbound_peers = inbound;
+        config.peer_limits.max_outbound_peers = outbound;
+        serving_max_inflight_requests(&config)
+    };
+    assert_eq!(with(8, 8, 32_000), 32_000);
+    assert_eq!(with(256, 256, 100), 100);
+    assert_eq!(with(0, 0, 32_000), 32_000);
+    assert_eq!(budgeted_inflight_requests(0), None);
+    assert_eq!(budgeted_inflight_requests(3633), Some(1));
+    assert_eq!(budgeted_inflight_requests(3634), Some(0));
+    assert_eq!(with(3634, 0, 32_000), 1);
+    assert_eq!(with(usize::MAX, usize::MAX, 32_000), 1);
+}
+
+/// Serving enforces the advertised limit: `2 × limit` open requests are served, one more faults.
+#[tokio::test]
+async fn serving_enforces_the_budgeted_limit() {
+    let source = Arc::new(ControlledSource {
+        default_gate: Some(Arc::new(Semaphore::new(0))),
+        ..Default::default()
+    });
+    let config = ZakuraBlockSyncConfig::default();
+    let limit = serving_max_inflight_requests(&config);
+    let serving = Serving::new(source, &config);
+    let cancel = CancellationToken::new();
+    let (send, _output) = framed_channel(4);
+    let mut session = serving.session(
+        &ZakuraPeerId::new(vec![62; 32]).unwrap(),
+        send,
+        cancel.clone(),
+        CancellationToken::new(),
+        Default::default(),
+    );
+    for height in 1..=2 * limit {
+        session.admit(Height(height), 1).unwrap();
+    }
+    assert!(session.admit(Height(2 * limit + 1), 1).is_err());
+    cancel.cancel();
+}

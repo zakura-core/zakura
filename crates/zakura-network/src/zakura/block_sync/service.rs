@@ -89,7 +89,7 @@ impl BlockSyncPeerSession {
 
     #[cfg(test)]
     pub(super) fn with_status_for_test(mut self, status: BlockSyncStatus) -> Self {
-        let state = Arc::new(super::regulated::status_sender::StatusSender::default());
+        let state = Arc::new(super::regulated::status_sender::StatusSender::new(u32::MAX));
         state.record_received(status);
         self.status_sender = Some(state);
         self
@@ -121,6 +121,13 @@ impl BlockSyncPeerSession {
     /// Total slots in this peer's bounded outbound stream queue.
     pub fn outbound_max_capacity(&self) -> usize {
         self.send.max_capacity()
+    }
+
+    /// `status` as this session sends it: regulated sessions apply their serving limit.
+    pub(super) fn wire_status(&self, status: BlockSyncStatus) -> BlockSyncStatus {
+        self.status_sender
+            .as_ref()
+            .map_or(status, |sender| sender.advertised(status))
     }
 
     /// Send a typed status advertisement.
@@ -856,7 +863,13 @@ impl Service for BlockSyncService {
                         .lock()
                         .expect("status sender map is not poisoned")
                         .entry((peer_id.clone(), conn_id))
-                        .or_default()
+                        .or_insert_with(|| {
+                            Arc::new(super::regulated::status_sender::StatusSender::new(
+                                super::regulated::session::serving_max_inflight_requests(
+                                    &self.inner.config,
+                                ),
+                            ))
+                        })
                         .clone(),
                 );
             }
@@ -1255,6 +1268,15 @@ mod regulated_frame_tests {
         let replacement = attach(1);
         assert_eq!(replacement.received(), Some(received));
         assert!(Arc::ptr_eq(&first, &replacement));
+        // Regulated connections advertise the budgeted serving limit, not the local one.
+        let local = ZakuraBlockSyncConfig::default().initial_status();
+        assert_eq!(
+            replacement.advertised(local).max_inflight_requests,
+            super::super::regulated::session::serving_max_inflight_requests(
+                &ZakuraBlockSyncConfig::default()
+            )
+        );
+        assert!(replacement.advertised(local).max_inflight_requests < local.max_inflight_requests);
         let new_connection = attach(2);
         assert!(!Arc::ptr_eq(&first, &new_connection));
         assert_eq!(new_connection.received(), None);

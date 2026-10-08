@@ -15,6 +15,7 @@ use std::{
 
 use color_eyre::Report;
 use futures::{Future, FutureExt, StreamExt};
+use indexmap::IndexSet;
 use tower::{timeout::Timeout, Service};
 
 use zakura_chain::{
@@ -116,7 +117,8 @@ fn oversized_find_blocks_response_is_rejected() {
     assert!(sync::has_valid_tips_response_hash_count(stripped));
 }
 
-/// Test that the syncer downloads genesis, blocks 1-2 using obtain_tips, and blocks 3-4 using extend_tips.
+/// Test that the syncer downloads genesis, blocks 1-2 using obtain_tips, and
+/// blocks 3-4 using extend_tips, discarding each response's trailing hash.
 ///
 /// This test also makes sure that the syncer downloads blocks in order.
 #[tokio::test(start_paused = true)]
@@ -931,264 +933,6 @@ async fn incomplete_checkpoint_range_retries_refresh_timeout_without_verifier_ti
         "legacy sync should continue after the checkpoint range completes"
     );
     sync_task.abort();
-
-    Ok(())
-}
-
-/// Test that the syncer downloads genesis, blocks 1-2 using obtain_tips, and blocks 3-4 using extend_tips,
-/// with unrelated trailing hashes that are discarded.
-///
-/// This test also makes sure that the syncer downloads blocks in order.
-#[tokio::test(start_paused = true)]
-async fn sync_blocks_trailing_hashes_ok() -> Result<(), crate::BoxError> {
-    // Get services
-    let (
-        chain_sync_future,
-        _sync_status,
-        mut block_verifier_router,
-        mut peer_set,
-        mut state_service,
-        _mock_chain_tip_sender,
-    ) = setup();
-
-    // Get blocks
-    let block0: Arc<Block> =
-        zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES.zcash_deserialize_into()?;
-    let block0_hash = block0.hash();
-
-    let block1: Arc<Block> =
-        zakura_test::vectors::BLOCK_MAINNET_1_BYTES.zcash_deserialize_into()?;
-    let block1_hash = block1.hash();
-
-    let block2: Arc<Block> =
-        zakura_test::vectors::BLOCK_MAINNET_2_BYTES.zcash_deserialize_into()?;
-    let block2_hash = block2.hash();
-
-    let block3: Arc<Block> =
-        zakura_test::vectors::BLOCK_MAINNET_3_BYTES.zcash_deserialize_into()?;
-    let block3_hash = block3.hash();
-
-    let block4: Arc<Block> =
-        zakura_test::vectors::BLOCK_MAINNET_4_BYTES.zcash_deserialize_into()?;
-    let block4_hash = block4.hash();
-
-    let block5: Arc<Block> =
-        zakura_test::vectors::BLOCK_MAINNET_5_BYTES.zcash_deserialize_into()?;
-    let block5_hash = block5.hash();
-
-    // Start the syncer
-    let chain_sync_task_handle = tokio::spawn(chain_sync_future);
-
-    // ChainSync::request_genesis
-
-    // State is checked for genesis
-    state_service
-        .expect_request(zs::Request::KnownBlock(block0_hash))
-        .await
-        .respond(zs::Response::KnownBlock(None));
-
-    // Block 0 is fetched and committed to the state
-    peer_set
-        .expect_request(zn::Request::BlocksByHash(iter::once(block0_hash).collect()))
-        .await
-        .respond(zn::Response::Blocks(vec![Available((
-            block0.clone(),
-            None,
-        ))]));
-
-    block_verifier_router
-        .expect_request(zakura_consensus::Request::Commit(block0))
-        .await
-        .respond(block0_hash);
-
-    // Check that nothing unexpected happened.
-    // We expect more requests to the state service, because the syncer keeps on running.
-    peer_set.expect_no_requests().await;
-    block_verifier_router.expect_no_requests().await;
-
-    // State is checked for genesis again
-    state_service
-        .expect_request(zs::Request::KnownBlock(block0_hash))
-        .await
-        .respond(zs::Response::KnownBlock(Some(zs::KnownBlock::BestChain)));
-
-    // ChainSync::obtain_tips
-
-    // State is asked for a block locator.
-    state_service
-        .expect_request(zs::Request::BlockLocator)
-        .await
-        .respond(zs::Response::BlockLocator(vec![block0_hash]));
-
-    // Network is sent the block locator
-    peer_set
-        .expect_request(zn::Request::FindBlocks {
-            known_blocks: vec![block0_hash],
-            stop: None,
-        })
-        .await
-        .respond(zn::Response::BlockHashes(vec![
-            block1_hash, // tip
-            block2_hash, // expected_next
-            block3_hash, // (discarded - last hash, possibly incorrect)
-        ]));
-
-    // State is checked for each candidate hash before it is queued.
-    state_service
-        .expect_request(zs::Request::KnownBlock(block1_hash))
-        .await
-        .respond(zs::Response::KnownBlock(None));
-    state_service
-        .expect_request(zs::Request::KnownBlock(block2_hash))
-        .await
-        .respond(zs::Response::KnownBlock(None));
-
-    // Clear remaining block locator requests
-    for _ in 0..(sync::FANOUT - 1) {
-        peer_set
-            .expect_request(zn::Request::FindBlocks {
-                known_blocks: vec![block0_hash],
-                stop: None,
-            })
-            .await
-            .respond(Err(zn::BoxError::from("synthetic test obtain tips error")));
-    }
-
-    // Check that nothing unexpected happened.
-    peer_set.expect_no_requests().await;
-    block_verifier_router.expect_no_requests().await;
-
-    // State is checked for all non-tip blocks (blocks 1 & 2) in response order
-    state_service
-        .expect_request(zs::Request::KnownBlock(block1_hash))
-        .await
-        .respond(zs::Response::KnownBlock(None));
-    state_service
-        .expect_request(zs::Request::KnownBlock(block2_hash))
-        .await
-        .respond(zs::Response::KnownBlock(None));
-
-    // Blocks 1 & 2 are fetched in order, then verified concurrently
-    peer_set
-        .expect_request(zn::Request::BlocksByHash(iter::once(block1_hash).collect()))
-        .await
-        .respond(zn::Response::Blocks(vec![Available((
-            block1.clone(),
-            None,
-        ))]));
-    peer_set
-        .expect_request(zn::Request::BlocksByHash(iter::once(block2_hash).collect()))
-        .await
-        .respond(zn::Response::Blocks(vec![Available((
-            block2.clone(),
-            None,
-        ))]));
-
-    // We can't guarantee the verification request order
-    let mut remaining_blocks: HashMap<block::Hash, Arc<Block>> =
-        [(block1_hash, block1), (block2_hash, block2)]
-            .iter()
-            .cloned()
-            .collect();
-
-    for _ in 1..=2 {
-        block_verifier_router
-            .expect_request_that(|req| remaining_blocks.remove(&req.block().hash()).is_some())
-            .await
-            .respond_with(|req| req.block().hash());
-    }
-    assert_eq!(
-        remaining_blocks,
-        HashMap::new(),
-        "expected all non-tip blocks to be verified by obtain tips"
-    );
-
-    // Check that nothing unexpected happened.
-    block_verifier_router.expect_no_requests().await;
-    state_service.expect_no_requests().await;
-
-    // ChainSync::extend_tips
-
-    // Network is sent a block locator based on the tip
-    peer_set
-        .expect_request(zn::Request::FindBlocks {
-            known_blocks: vec![block1_hash],
-            stop: None,
-        })
-        .await
-        .respond(zn::Response::BlockHashes(vec![
-            block2_hash, // tip (discarded - already fetched)
-            block3_hash, // expected_next
-            block4_hash,
-            block5_hash, // (discarded - last hash, possibly incorrect)
-        ]));
-
-    for hash in [block3_hash, block4_hash] {
-        state_service
-            .expect_request(zs::Request::KnownBlock(hash))
-            .await
-            .respond(zs::Response::KnownBlock(None));
-    }
-
-    // Clear remaining block locator requests
-    for _ in 0..(sync::FANOUT - 1) {
-        peer_set
-            .expect_request(zn::Request::FindBlocks {
-                known_blocks: vec![block1_hash],
-                stop: None,
-            })
-            .await
-            .respond(Err(zn::BoxError::from("synthetic test extend tips error")));
-    }
-
-    // Check that nothing unexpected happened.
-    block_verifier_router.expect_no_requests().await;
-    state_service.expect_no_requests().await;
-
-    // Blocks 3 & 4 are fetched in order, then verified concurrently
-    peer_set
-        .expect_request(zn::Request::BlocksByHash(iter::once(block3_hash).collect()))
-        .await
-        .respond(zn::Response::Blocks(vec![Available((
-            block3.clone(),
-            None,
-        ))]));
-    peer_set
-        .expect_request(zn::Request::BlocksByHash(iter::once(block4_hash).collect()))
-        .await
-        .respond(zn::Response::Blocks(vec![Available((
-            block4.clone(),
-            None,
-        ))]));
-
-    // We can't guarantee the verification request order
-    let mut remaining_blocks: HashMap<block::Hash, Arc<Block>> =
-        [(block3_hash, block3), (block4_hash, block4)]
-            .iter()
-            .cloned()
-            .collect();
-
-    for _ in 3..=4 {
-        block_verifier_router
-            .expect_request_that(|req| remaining_blocks.remove(&req.block().hash()).is_some())
-            .await
-            .respond_with(|req| req.block().hash());
-    }
-    assert_eq!(
-        remaining_blocks,
-        HashMap::new(),
-        "expected all non-tip blocks to be verified by extend tips"
-    );
-
-    // Check that nothing unexpected happened.
-    block_verifier_router.expect_no_requests().await;
-    state_service.expect_no_requests().await;
-
-    let chain_sync_result = chain_sync_task_handle.now_or_never();
-    assert!(
-        chain_sync_result.is_none(),
-        "unexpected error or panic in chain sync task: {chain_sync_result:?}",
-    );
 
     Ok(())
 }
@@ -2381,8 +2125,8 @@ async fn transient_download_failure_preserves_sync_round() -> Result<(), crate::
             let response = peer_set
                 .expect_request_that(|request| match request {
                     zn::Request::BlocksByHash(hashes) => {
-                        hashes == &HashSet::from([retried_hash])
-                            || hashes == &HashSet::from([unrelated_hash])
+                        hashes == &IndexSet::from([retried_hash])
+                            || hashes == &IndexSet::from([unrelated_hash])
                     }
                     _ => false,
                 })
@@ -4210,7 +3954,7 @@ async fn non_tip_child_keeps_the_behind_tip_policy() {
 /// leaving the newest block for the next discovery round.
 #[tokio::test]
 async fn poisoned_body_requeues_and_scores_its_supplier() -> Result<(), crate::BoxError> {
-    for error_kind in 0..3 {
+    for error_kind in 0..4 {
         let (
             mut chain_sync,
             _sync_status,
@@ -4247,7 +3991,7 @@ async fn poisoned_body_requeues_and_scores_its_supplier() -> Result<(), crate::B
                 hash: block_hash,
                 advertiser_addr: Some(addr),
             },
-            _ => BlockDownloadVerifyError::Invalid {
+            2 => BlockDownloadVerifyError::Invalid {
                 error: RouterError::Checkpoint {
                     source: Box::new(zakura_consensus::VerifyCheckpointError::VerifyBlock(
                         VerifyBlockError::Block {
@@ -4262,6 +4006,16 @@ async fn poisoned_body_requeues_and_scores_its_supplier() -> Result<(), crate::B
                 hash: block_hash,
                 advertiser_addr: Some(addr),
             },
+            _ => checkpoint_commit_error(
+                zs::ValidateContextError::InvalidBlockCommitment(
+                    block::CommitmentError::InvalidChainHistoryBlockTxAuthCommitment {
+                        expected: [0; 32],
+                        actual: [1; 32],
+                    },
+                ),
+                block_hash,
+                addr,
+            ),
         };
 
         let requeue = tokio::spawn(async move {
@@ -4292,6 +4046,80 @@ async fn poisoned_body_requeues_and_scores_its_supplier() -> Result<(), crate::B
 
         block_verifier_router.expect_no_requests().await;
     }
+    Ok(())
+}
+
+/// Wraps a contextual error the way a failed checkpoint commit reports it to the syncer.
+fn checkpoint_commit_error(
+    error: zs::ValidateContextError,
+    hash: block::Hash,
+    addr: PeerSocketAddr,
+) -> BlockDownloadVerifyError {
+    let source: crate::BoxError = Box::new(zs::CommitCheckpointVerifiedError::from(
+        zs::CommitBlockError::ValidateContextError(Box::new(error)),
+    ));
+    BlockDownloadVerifyError::Invalid {
+        error: RouterError::Checkpoint {
+            source: Box::new(
+                zakura_consensus::VerifyCheckpointError::CommitCheckpointVerified(source),
+            ),
+        },
+        height: Height(1_687_106),
+        hash,
+        advertiser_addr: Some(addr),
+    }
+}
+
+/// A block the state dropped behind a forged ancestor body is requeued without restarting the
+/// round, and its supplier is not scored.
+#[tokio::test]
+async fn rejected_body_descendant_requeues_without_scoring() -> Result<(), crate::BoxError> {
+    let (
+        mut chain_sync,
+        _sync_status,
+        mut block_verifier_router,
+        mut peer_set,
+        _state_service,
+        _mock_chain_tip_sender,
+    ) = setup_chain_sync();
+
+    let (misbehavior_tx, mut misbehavior_rx) = tokio::sync::mpsc::channel(1);
+    chain_sync.misbehavior_sender = misbehavior_tx;
+
+    let block_hash = block::Hash::from([0xAC; 32]);
+    let addr: PeerSocketAddr = "127.0.0.1:8233".parse().expect("valid peer address");
+    let error = checkpoint_commit_error(
+        zs::ValidateContextError::AncestorBodyRejected(block::Hash::from([0xAB; 32])),
+        block_hash,
+        addr,
+    );
+
+    let requeue = tokio::spawn(async move {
+        let result = chain_sync
+            .handle_block_response_with_missing_retry(Err(error))
+            .await;
+        (result, chain_sync)
+    });
+
+    peer_set
+        .expect_request(zn::Request::BlocksByHash(iter::once(block_hash).collect()))
+        .await
+        .respond(Err(not_found_block_error(block_hash)));
+
+    let (result, chain_sync) = requeue.await.expect("the retry task should not panic");
+    result?;
+
+    assert!(
+        misbehavior_rx.try_recv().is_err(),
+        "the supplier of a descendant did not cause its ancestor's failure"
+    );
+    assert_eq!(
+        chain_sync.poisoned_block_retry_counts.get(&block_hash),
+        Some(&1),
+        "the requeue must be counted against the retry budget"
+    );
+
+    block_verifier_router.expect_no_requests().await;
     Ok(())
 }
 

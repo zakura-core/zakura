@@ -2,7 +2,7 @@ name: Lint
 
 on:
   pull_request:
-    branches: [main, "feat/**", "split/**", "release/**"]
+    branches: [main, "feat/**", "split/**", "adam/**", "release/**"]
     paths:
       - "**/*.rs"
       - "**/Cargo.toml"
@@ -14,10 +14,13 @@ on:
       - deny.toml
       - rust-toolchain.toml
       - .github/workflows/lint.yml
+      - .github/workflows/zakura-mainnet-deploy.yml
       - .github/workflows/cross-platform.yml
+      - .github/workflows/ci-alerts.yml
       - docs/specs/fork-aware-header-chain-engine.md
       - qa/supply-chain/**
       - "scripts/**.sh"
+      - scripts/make/zcashd-compat.mk
       - crates/zakura-header-chain/conformance.toml
       - ".github/workflows/scripts/**"
       - ".github/actions/**"
@@ -38,10 +41,13 @@ on:
       - deny.toml
       - rust-toolchain.toml
       - .github/workflows/lint.yml
+      - .github/workflows/zakura-mainnet-deploy.yml
       - .github/workflows/cross-platform.yml
+      - .github/workflows/ci-alerts.yml
       - docs/specs/fork-aware-header-chain-engine.md
       - qa/supply-chain/**
       - "scripts/**.sh"
+      - scripts/make/zcashd-compat.mk
       - crates/zakura-header-chain/conformance.toml
       - ".github/workflows/scripts/**"
       - ".github/actions/**"
@@ -151,7 +157,9 @@ jobs:
           persist-credentials: false
       - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f #v1.17.0 # zizmor: ignore[cache-poisoning] -- CI docs job; builds rustdoc only, nothing published/released
         with:
-          toolchain: nightly
+          # Later nightlies hit the rustdoc ICE described at `PUBLIC_API_NIGHTLY` in
+          # semver-checks.yml. Keep the two pins in step.
+          toolchain: nightly-2026-09-06
           cache-on-failure: true
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: ./.github/actions/setup-zakura-build
@@ -189,7 +197,10 @@ jobs:
         if: ${{ !cancelled() }}
         # .github/workflows/scripts/*.sh included: those run on provisioned
         # droplets, where a shell bug costs a full provisioning cycle to find.
-        run: shellcheck scripts/*.sh scripts/lib/*.sh .github/workflows/scripts/*.sh
+        run: shellcheck scripts/*.sh scripts/lib/*.sh .github/workflows/scripts/*.sh deploy/release-state/deploy-archive-pair.sh scripts/tests/test_resolve_zcashd_compat_manifest.sh
+      - name: zcashd compat manifest resolver tests
+        if: ${{ !cancelled() }}
+        run: bash scripts/tests/test_resolve_zcashd_compat_manifest.sh
       # Stdlib-only, so there is nothing to install.
       - name: Mempool load harness tests
         if: ${{ !cancelled() }}
@@ -215,9 +226,19 @@ jobs:
         if: ${{ !cancelled() }}
         run: python3 .github/workflows/scripts/test_affected_semver_packages.py
 
+      - name: CI alert tests
+        if: ${{ !cancelled() }}
+        run: python3 .github/workflows/scripts/test_ci_alert.py
+
       - name: Deployer tests
         if: ${{ !cancelled() }}
-        run: python3 deploy/deployer/test_deploy.py
+        run: python3 -m unittest discover -s deploy/deployer -p 'test_*.py'
+
+      # Kept deliberately while the NU7 fork tooling exists: these stdlib tests run
+      # in seconds and guard the fork renderer, faucet and health endpoint.
+      - name: NU7 fork tooling tests
+        if: ${{ !cancelled() }}
+        run: python3 -m unittest discover -s deploy/nu7-fork -p 'test_*.py'
 
       - name: Continuous-sync tests
         if: ${{ !cancelled() }}
@@ -231,6 +252,10 @@ jobs:
         run: |
           python3 deploy/runner/test_zakura_cluster_status.py
           python3 deploy/runner/test_zakura_cluster_watchdog.py
+
+      - name: Compatibility monitoring tests
+        if: ${{ !cancelled() }}
+        run: python3 -m unittest discover -s deploy/runner -p 'test_*monitoring*.py'
 
       - name: Release-state coupling
         if: ${{ !cancelled() }}
@@ -284,7 +309,7 @@ jobs:
           toolchain: nightly
           cache-on-failure: true
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
-      - uses: taiki-e/install-action@c3ec0de9ae7f1019cea21aa96aa0a895b9552063 #v2.87.9
+      - uses: taiki-e/install-action@7623a79cdfecb99d681017af368ca353d9f49bb5 #v2.87.19
         with:
           tool: cargo-udeps
       - uses: ./.github/actions/setup-zakura-build
@@ -312,14 +337,14 @@ jobs:
       # Install cargo-deny from a prebuilt binary instead of the EmbarkStudios
       # Docker action: that action rebuilds a container from a Docker Hub base
       # image on every run, which intermittently fails with registry timeouts.
-      - uses: taiki-e/install-action@c3ec0de9ae7f1019cea21aa96aa0a895b9552063 #v2.87.9
+      - uses: taiki-e/install-action@7623a79cdfecb99d681017af368ca353d9f49bb5 #v2.87.19
         with:
           tool: cargo-deny@0.19.5
 
       - name: Install cargo-vet
         # v2.84.1 resolves `latest` to cargo-vet 0.10.0, which cannot read
         # trusted-publisher entries generated by cargo-vet 0.10.2.
-        uses: taiki-e/install-action@c3ec0de9ae7f1019cea21aa96aa0a895b9552063 #v2.87.9
+        uses: taiki-e/install-action@7623a79cdfecb99d681017af368ca353d9f49bb5 #v2.87.19
         with:
           tool: cargo-vet@0.10.2
 
@@ -360,7 +385,9 @@ jobs:
   lint-success:
     name: lint success
     runs-on: ubuntu-latest
-    if: always()
+    # Skip, rather than fail, when a superseding run cancelled this one.
+    # See "Cancelled runs" in .github/workflows/README.md.
+    if: ${{ !cancelled() || github.event_name == 'pull_request' || github.event_name == 'merge_group' }}
     needs:
       - rust-checks
       - msrv

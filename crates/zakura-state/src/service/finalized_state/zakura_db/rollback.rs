@@ -45,11 +45,11 @@ use crate::{
                 transparent::{BALANCE_BY_TRANSPARENT_ADDR, TX_LOC_BY_SPENT_OUT_LOC},
                 ZakuraDb,
             },
-            HEADER_AUX_DELIVERY, HEADER_BODY_EVIDENCE_AUTHORITY, HEADER_CHILD,
-            HEADER_CONSENSUS_INVALID_BODY_TOMBSTONE, HEADER_DEFERRED, HEADER_ELIGIBILITY_ROOT,
-            HEADER_ENGINE_META, HEADER_FINALITY_HISTORY, HEADER_FINALITY_WITNESS,
-            HEADER_NODE_BY_HASH, HEADER_SELECTED, HEADER_VALIDATION_CONTEXT, HEADER_VERIFIED,
-            STATE_COLUMN_FAMILIES_IN_CODE,
+            HEADER_AUX_BODY_SIZE, HEADER_AUX_DELIVERY, HEADER_BODY_EVIDENCE_AUTHORITY,
+            HEADER_CHILD, HEADER_CONSENSUS_INVALID_BODY_TOMBSTONE, HEADER_DEFERRED,
+            HEADER_ELIGIBILITY_ROOT, HEADER_ENGINE_META, HEADER_FINALITY_HISTORY,
+            HEADER_FINALITY_WITNESS, HEADER_NODE_BY_HASH, HEADER_SELECTED,
+            HEADER_VALIDATION_CONTEXT, HEADER_VERIFIED, STATE_COLUMN_FAMILIES_IN_CODE,
         },
         non_finalized_state::write_semantically_verified_backup_block,
     },
@@ -287,7 +287,16 @@ pub fn rollback_finalized_state(
     check_format_version(&config, network)?;
 
     let db = open_rollback_db(&config, network, false);
-    let prepared = prepare_rollback(&db, network, &options)?;
+    rollback_open_db(&db, network, options)
+}
+
+fn rollback_open_db(
+    db: &ZakuraDb,
+    network: &Network,
+    options: RollbackFinalizedStateOptions,
+) -> Result<RollbackFinalizedStateSummary, RollbackFinalizedStateError> {
+    let config = db.config();
+    let prepared = prepare_rollback(db, network, &options)?;
 
     let backup = if options.keep_rolled_back_blocks {
         let backup_dir = config
@@ -317,6 +326,19 @@ pub fn rollback_finalized_state(
     db.write_batch(prepared.batch)?;
 
     Ok(summary)
+}
+
+#[cfg(test)]
+impl ZakuraDb {
+    /// Run the rollback implementation without reopening a test-owned database.
+    pub(in crate::service::finalized_state) fn rollback_for_test(
+        &self,
+        network: &Network,
+        options: RollbackFinalizedStateOptions,
+    ) -> Result<RollbackFinalizedStateSummary, RollbackFinalizedStateError> {
+        check_format_version(self.config(), network)?;
+        rollback_open_db(self, network, options)
+    }
 }
 
 fn check_format_version(
@@ -530,6 +552,7 @@ fn clear_header_chain_engine(
         HEADER_SELECTED,
         HEADER_VERIFIED,
         HEADER_ELIGIBILITY_ROOT,
+        HEADER_AUX_BODY_SIZE,
         HEADER_AUX_DELIVERY,
         HEADER_DEFERRED,
         HEADER_FINALITY_HISTORY,
@@ -1227,6 +1250,7 @@ mod tests {
             HEADER_SELECTED,
             HEADER_VERIFIED,
             HEADER_ELIGIBILITY_ROOT,
+            HEADER_AUX_BODY_SIZE,
             HEADER_AUX_DELIVERY,
             HEADER_DEFERRED,
             HEADER_FINALITY_HISTORY,

@@ -5,6 +5,7 @@
 use std::{
     borrow::Cow,
     collections::{BTreeSet, HashMap, HashSet},
+    num::NonZeroU32,
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -51,10 +52,11 @@ use super::{
         FallibleDiskValue, FromDisk, IntoDisk, RawBytes,
     },
     zakura_db::block::ZAKURA_HEADER_HASH_BY_HEIGHT,
-    DiskDb, DiskWriteBatch, WriteDisk, HEADER_AUX_DELIVERY, HEADER_BODY_EVIDENCE_AUTHORITY,
-    HEADER_CHILD, HEADER_CONSENSUS_INVALID_BODY_TOMBSTONE, HEADER_DEFERRED,
-    HEADER_ELIGIBILITY_ROOT, HEADER_ENGINE_META, HEADER_FINALITY_HISTORY, HEADER_FINALITY_WITNESS,
-    HEADER_NODE_BY_HASH, HEADER_SELECTED, HEADER_VALIDATION_CONTEXT, HEADER_VERIFIED,
+    DiskDb, DiskWriteBatch, WriteDisk, HEADER_AUX_BODY_SIZE, HEADER_AUX_DELIVERY,
+    HEADER_BODY_EVIDENCE_AUTHORITY, HEADER_CHILD, HEADER_CONSENSUS_INVALID_BODY_TOMBSTONE,
+    HEADER_DEFERRED, HEADER_ELIGIBILITY_ROOT, HEADER_ENGINE_META, HEADER_FINALITY_HISTORY,
+    HEADER_FINALITY_WITNESS, HEADER_NODE_BY_HASH, HEADER_SELECTED, HEADER_VALIDATION_CONTEXT,
+    HEADER_VERIFIED,
 };
 
 const METADATA_KEY: &[u8] = b"";
@@ -428,12 +430,25 @@ fn untrusted_aux_row_matches(authoritative: AuxDelivery, row: UntrustedAuxDelive
     let authoritative_observations = authoritative
         .observation_ids()
         .map(|observation| observation.map(|observation| observation.digest()));
-    row.delivery() == expected_base
+    row.delivery().without_scheduling_body_size() == expected_base
         && row.has_valid_outcome()
         && (authoritative.is_unauthenticated()
             || (row.outcome_status_code() == authoritative_status
                 && row.observation_digests() == authoritative_observations
                 && row.outcome_boundary_hash() == authoritative.outcome_boundary_hash()))
+}
+
+/// Return whether a selected repair can add input to, or replace input in, one header's bucket.
+fn repair_bucket_admits(
+    engine: &HeaderChainEngine,
+    hash: block::Hash,
+    limits: zakura_header_chain::EngineLimits,
+) -> bool {
+    let deliveries = engine.aux_deliveries(hash);
+    deliveries.len() < limits.max_aux_deliveries_per_header.get()
+        || deliveries
+            .iter()
+            .any(|delivery| !delivery.is_authenticated())
 }
 
 fn auxiliary_rows_are_coherent(
@@ -622,6 +637,20 @@ impl Publisher {
     }
 
     fn publish(&self, snapshot: EngineSnapshot, effect: TransitionEffect) {
+        self.publish_with_hint_changes(snapshot, effect, Vec::new());
+    }
+
+    fn publish_with_hint_changes(
+        &self,
+        snapshot: EngineSnapshot,
+        effect: TransitionEffect,
+        updates: Vec<(
+            block::Height,
+            block::Hash,
+            zakura_header_chain::BodySizeHint,
+        )>,
+    ) {
+        let previous_hint_revision = self.views.borrow().body_size_hint_revision;
         let previous_epoch = self.views.borrow().body_work_epoch;
         let body_work_epoch = if effect.invalidates_body_work() {
             previous_epoch
@@ -630,7 +659,32 @@ impl Publisher {
         } else {
             previous_epoch
         };
-        let view = CommittedHeaderChainView::new(snapshot.clone(), body_work_epoch);
+        let mut view = CommittedHeaderChainView::new(snapshot.clone(), body_work_epoch);
+        view.body_size_hint_batches = self.views.borrow().body_size_hint_batches.clone();
+        view.body_size_hint_revision = if !updates.is_empty() {
+            previous_hint_revision
+                .checked_add(1)
+                .expect("a process cannot commit u64::MAX hint corrections")
+        } else {
+            previous_hint_revision
+        };
+        if !updates.is_empty() {
+            // A lagging watch subscriber can recover by querying its bounded work window.
+            const RETAINED_HINT_BATCHES: usize = 16;
+            let mut batches = view
+                .body_size_hint_batches
+                .as_deref()
+                .unwrap_or_default()
+                .to_vec();
+            if batches.len() == RETAINED_HINT_BATCHES {
+                batches.remove(0);
+            }
+            batches.push(zakura_header_chain::BodySizeHintBatch {
+                revision: view.body_size_hint_revision,
+                updates: updates.into(),
+            });
+            view.body_size_hint_batches = Some(batches.into());
+        }
         record_published_snapshot(&snapshot);
         self.sender.send_replace(snapshot.clone());
         self.views.send_replace(view.clone());
@@ -1618,6 +1672,24 @@ impl HeaderChainReader {
         self.store.projection_range(HEADER_SELECTED, start, end)
     }
 
+    /// Advisory body sizes for `hashes` from the retained auxiliary deliveries, parallel to
+    /// `hashes` (`None` when no non-rejected delivery knows the size). Reads the in-memory
+    /// engine only, so it is cheap for a whole needed-body window; see
+    /// [`AuxDelivery::advertised_body_size`] for the selection rule.
+    pub(crate) fn body_size_hints_by_hash(
+        &self,
+        hashes: &[block::Hash],
+    ) -> Result<Vec<Option<NonZeroU32>>, HeaderChainStoreError> {
+        let engine = self
+            .transition_engine
+            .lock()
+            .map_err(|_| HeaderChainStoreError::WriterPoisoned)?;
+        Ok(hashes
+            .iter()
+            .map(|hash| AuxDelivery::advertised_body_size(engine.aux_deliveries(*hash)))
+            .collect())
+    }
+
     pub(crate) fn selected_successor(
         &self,
         height: block::Height,
@@ -1822,17 +1894,14 @@ impl HeaderChainReader {
             } else {
                 None
             };
-        let deliveries = self.coherent_aux_deliveries(&target)?;
+        self.coherent_aux_deliveries(&target)?;
         let durable_rows = self.store.untrusted_aux_deliveries(target_hash)?;
         let engine = self
             .transition_engine
             .lock()
             .map_err(|_| HeaderChainStoreError::WriterPoisoned)?;
-        let total_delivery_count = engine.aux_delivery_count();
-        let admission_capacity_available = deliveries.len()
-            < self.config.limits.max_aux_deliveries_per_header.get()
-            && total_delivery_count < self.config.limits.max_aux_deliveries_total.get()
-            && !snapshot.alarms.resource_stalled;
+        let repair_capacity = engine.auxiliary_repair_capacity(target_hash, self.config.limits);
+        let admission_capacity_available = repair_capacity > 0 && !snapshot.alarms.resource_stalled;
         let mut context = zakura_header_chain::VctRepairContext::from_durable_rows(
             selected_target,
             HeaderLocator::for_continuation(parent),
@@ -1841,18 +1910,13 @@ impl HeaderChainReader {
             admission_capacity_available,
             &durable_rows,
         )?;
-        if !durable_rows.is_empty() || !admission_capacity_available {
+        if zakura_header_chain::VctRepairContext::rows_constrain_repair(&durable_rows)
+            || !admission_capacity_available
+        {
             return Ok(Some(context));
         }
 
-        let available_aggregate_capacity = self
-            .config
-            .limits
-            .max_aux_deliveries_total
-            .get()
-            .saturating_sub(total_delivery_count);
-        let range_limit =
-            available_aggregate_capacity.min(self.config.limits.max_headers_per_transition.get());
+        let range_limit = repair_capacity.min(self.config.limits.max_headers_per_transition.get());
         if range_limit <= 1 {
             return Ok(Some(context));
         }
@@ -1909,7 +1973,9 @@ impl HeaderChainReader {
                 )
                 .into());
             }
-            if !candidate_rows.is_empty() {
+            if zakura_header_chain::VctRepairContext::rows_constrain_repair(&candidate_rows)
+                || !repair_bucket_admits(&engine, candidate.hash, self.config.limits)
+            {
                 break;
             }
             suffix.push(candidate);
@@ -2492,6 +2558,13 @@ impl HeaderChainRuntime {
     /// Return the sole committed-snapshot publisher.
     pub fn publisher(&self) -> &Publisher {
         &self.publisher
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_auxiliary_limits_for_test(&mut self, per_header: usize, total: usize) {
+        self.config.limits.max_aux_deliveries_per_header =
+            std::num::NonZeroUsize::new(per_header).unwrap();
+        self.config.limits.max_aux_deliveries_total = std::num::NonZeroUsize::new(total).unwrap();
     }
 
     /// Return a read-only handle whose compound reads share the transition lock.
@@ -3125,27 +3198,29 @@ impl HeaderChainRuntime {
                     .get(1)
                     .map(|successor| successor.hash)
                     .or(terminal_boundary_hash);
-                let aggregate_capacity_available = transition_engine
-                    .aux_delivery_count()
-                    .checked_add(repair_range.len())
-                    .is_some_and(|count| {
-                        count <= context.config.limits.max_aux_deliveries_total.get()
-                    });
+                let repair_capacity = transition_engine
+                    .auxiliary_repair_capacity(first_target.hash, context.config.limits);
+                if repair_capacity < repair_range.len() {
+                    return Err(TransitionFailure::AuxiliaryLimitExceeded.into());
+                }
                 let mut current = zakura_header_chain::VctRepairContext::from_durable_rows(
                     first_target,
                     HeaderLocator::for_continuation(common_ancestor),
                     before.state_version,
                     first_boundary_hash,
-                    aggregate_capacity_available
-                        && transition_engine.aux_deliveries(first_target.hash).len()
-                            < context.config.limits.max_aux_deliveries_per_header.get()
-                        && !before.alarms.resource_stalled,
+                    !before.alarms.resource_stalled,
                     &durable_rows_by_target[0],
                 )?;
                 if repair_range.len() > 1 {
-                    if durable_rows_by_target.iter().any(|rows| !rows.is_empty())
-                        || !aggregate_capacity_available
-                        || before.alarms.resource_stalled
+                    if durable_rows_by_target.iter().any(|rows| {
+                        zakura_header_chain::VctRepairContext::rows_constrain_repair(rows)
+                    }) || repair_range.iter().any(|target| {
+                        !repair_bucket_admits(
+                            &transition_engine,
+                            target.hash,
+                            context.config.limits,
+                        )
+                    }) || before.alarms.resource_stalled
                     {
                         return Ok(ApplyResult::Stale(StaleReceipt {
                             current_version: before.state_version,
@@ -3154,8 +3229,9 @@ impl HeaderChainRuntime {
                     }
                     current = current
                         .extend_empty_selected_range(&repair_range[1..], terminal_boundary_hash)?;
-                } else if durable_rows_by_target[0].is_empty()
-                    && current.admission_capacity_available
+                } else if !zakura_header_chain::VctRepairContext::rows_constrain_repair(
+                    &durable_rows_by_target[0],
+                ) && current.admission_capacity_available
                     && current.episode != episode
                 {
                     current = current.extend_empty_selected_range(&[], terminal_boundary_hash)?;
@@ -3381,6 +3457,25 @@ impl HeaderChainRuntime {
         }
 
         let current = transition.snapshot_after_commit();
+        let hint_hashes: std::collections::HashSet<_> = transition
+            .change_set()
+            .aux_changes
+            .iter()
+            .filter_map(|change| {
+                let AuxDelta::Put(delivery) = change else {
+                    return None;
+                };
+                (delivery.scheduling_body_size().is_some()
+                    && transition_engine
+                        .aux_deliveries(delivery.header_hash)
+                        .iter()
+                        .find(|old| old.delivery_id == delivery.delivery_id)
+                        .is_none_or(|old| {
+                            old.effective_body_size() != delivery.effective_body_size()
+                        }))
+                .then_some(delivery.header_hash)
+            })
+            .collect();
         let migrated_pin_refuted = transition.change_set().metadata.alarms.migrated_pin_refuted;
         let batch = self
             .store
@@ -3402,7 +3497,21 @@ impl HeaderChainRuntime {
         memory_swap();
         #[cfg(test)]
         fault(FaultPoint::AfterMemorySwap)?;
-        self.publisher.publish(current, transition_effect);
+        let updates = hint_hashes
+            .into_iter()
+            .filter_map(|hash| {
+                let node = transition_engine.graph().header_node(hash)?;
+                let size =
+                    AuxDelivery::advertised_body_size(transition_engine.aux_deliveries(hash))?;
+                Some((
+                    node.height,
+                    hash,
+                    zakura_header_chain::BodySizeHint::Known(size),
+                ))
+            })
+            .collect();
+        self.publisher
+            .publish_with_hint_changes(current, transition_effect, updates);
         #[cfg(test)]
         fault(FaultPoint::AfterPublish)?;
         Ok(ApplyResult::Committed)
@@ -4785,28 +4894,34 @@ impl HeaderChainStore {
 
         for delta in &changes.aux_changes {
             match delta {
-                AuxDelta::Put(delivery) => self.put_value(
-                    &mut batch,
-                    HEADER_AUX_DELIVERY,
-                    HeaderAuxDeliveryKey {
+                AuxDelta::Put(delivery) => {
+                    let key = HeaderAuxDeliveryKey {
                         header: delivery.header_hash,
                         delivery: delivery.delivery_id,
                     }
-                    .as_bytes(),
-                    delivery.as_ref(),
-                )?,
+                    .as_bytes();
+                    self.put_value(&mut batch, HEADER_AUX_DELIVERY, key, delivery.as_ref())?;
+                    if let Some(size) = delivery.scheduling_body_size() {
+                        self.put_value(
+                            &mut batch,
+                            HEADER_AUX_BODY_SIZE,
+                            key,
+                            &zakura_header_chain::BodySizeHint::Known(size),
+                        )?;
+                    }
+                }
                 AuxDelta::Delete {
                     header_hash,
                     delivery_id,
-                } => self.delete_raw(
-                    &mut batch,
-                    HEADER_AUX_DELIVERY,
-                    HeaderAuxDeliveryKey {
+                } => {
+                    let key = HeaderAuxDeliveryKey {
                         header: *header_hash,
                         delivery: *delivery_id,
                     }
-                    .as_bytes(),
-                )?,
+                    .as_bytes();
+                    self.delete_raw(&mut batch, HEADER_AUX_DELIVERY, key)?;
+                    self.delete_raw(&mut batch, HEADER_AUX_BODY_SIZE, key)?;
+                }
             }
         }
 

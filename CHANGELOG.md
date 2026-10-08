@@ -11,6 +11,151 @@ independently.
 
 ## [Unreleased]
 
+## [1.6.0] - 2026-10-01
+
+### Changed
+
+- Disabled Sentry in default node builds and release binaries. To enable Sentry
+  reporting, build with `--features sentry` and set `SENTRY_DSN` at runtime
+  ([#1216](https://github.com/zakura-core/zakura/pull/1216)).
+- Reduced the work spent detecting duplicate inputs and nullifiers during
+  transaction verification
+  ([#1217](https://github.com/zakura-core/zakura/pull/1217)).
+- Lowered Zakura's conventional fee to 400 zatoshis per logical action for
+  mempool admission, block template selection, and mempool eviction
+  ([#1218](https://github.com/zakura-core/zakura/pull/1218)).
+- Raised the block template fee weight ratio cap from 10 to 13
+  ([#1218](https://github.com/zakura-core/zakura/pull/1218)).
+- Scheduled NU7 on Testnet at block height 4,465,026 and updated the Zakura Common
+  libraries to v2.2.0. The existing NSM calculation schedules reissuance at
+  height 7,305,222
+  ([#1235](https://github.com/zakura-core/zakura/pull/1235)).
+
+### Fixed
+
+- Aligned Mainnet end of support for the October 1 release with approximately
+  November 1, 2026 at 00:00 UTC, supporting through height 3,536,467. Guarded
+  against extending estimated support to November 2 unless Mainnet NU7 has an
+  activation height ([#1234](https://github.com/zakura-core/zakura/pull/1234)).
+
+## [1.5.1] - 2026-09-29
+
+### Added
+
+- Streams can declare message tables. A reader checks each frame's type, flags,
+  and length against its stream's table before reading the payload, and
+  `Stream::validate_layout` checks a layout's tables when the crate builds
+  ([#1116](https://github.com/zakura-core/zakura/pull/1116)).
+- Rows with a cadence declare the sender's interval, and `Stream::validate_layout`
+  checks receiver bucket sizing. Readers with a message table observe cadence
+  exhaustion without disconnecting peers because transport stalls can buffer
+  conformant messages. Readers run a service's response precheck before reading
+  the payload ([#1139](https://github.com/zakura-core/zakura/pull/1139)).
+
+### Changed
+
+<!-- release-readiness: allow-patch; reason: Maintainer-approved patch maintenance
+release for accumulated fixes, performance improvements, NU7 preparation, and the
+support-height adjustment. Published library crates are versioned independently. -->
+- Reduced checkpoint sync commit work for headers already retained by the header
+  chain
+  ([#1017](https://github.com/zakura-core/zakura/pull/1017)).
+- `Stream::messages` replaces `payload_limits` and `message_types`, and
+  `ZakuraHandlerError::RejectedFrame` replaces `InvalidMessageType`
+  ([#1116](https://github.com/zakura-core/zakura/pull/1116)).
+- `Cadence` gains `send_interval`. This public API change moves `zakura-network` to 9.0.0
+  and `zakura-rpc` to 12.0.0. `zakura-consensus` moves to 10.0.0 so packaged
+  dependents use the workspace's state and header types
+  ([#1139](https://github.com/zakura-core/zakura/pull/1139)).
+- From NU7 activation, funding stream recipient addresses rotate once every three
+  address-change intervals, following ZIP 218's longer halving interval. No public
+  network sets an NU7 height yet, so behavior does not change today
+  ([#1145](https://github.com/zakura-core/zakura/pull/1145)).
+- Gossiped committed blocks to peers as soon as they reach the best chain, instead of waiting up
+  to 7 seconds after the previous block gossip, and reduced the delay between transaction gossip
+  batches from 7 seconds to 2 seconds
+  ([#1177](https://github.com/zakura-core/zakura/pull/1177)).
+- Use zakura-common for Equihash proof verification and optional CPU mining,
+  replacing the miner's C backend with a pure Rust solver
+  ([#1191](https://github.com/zakura-core/zakura/pull/1191)).
+- Updated the estimated release height to 3,498,435, moving Mainnet's last
+  supported height from 3,528,681 to 3,532,995 (about 3.74 days later) while
+  retaining the 30-day support window and three-day warning lead
+  ([#1197](https://github.com/zakura-core/zakura/pull/1197),
+  [#1198](https://github.com/zakura-core/zakura/pull/1198)).
+- Prepare the ZIP 2008 mainnet FPF/ZCG address rotation for NU7. Deployment requires final confirmation
+  ([#1201](https://github.com/zakura-core/zakura/pull/1201)).
+- Updated Zakura Common from 2.1.0-rc.0 to 2.1.0. Local x86-64 builds now
+  select Pasta assembly from Rust target features; use `-C target-cpu=native`
+  on a supported CPU to enable BMI2 and ADX automatically
+  ([#1206](https://github.com/zakura-core/zakura/pull/1206)).
+- Keep Testnet's minimum-difficulty waiting period at 7.5 minutes after NU7 by
+  requiring a gap of more than 18 target spacings
+  ([#1209](https://github.com/zakura-core/zakura/pull/1209)).
+
+### Fixed
+
+- Refill the bounded header window before the body backlog drains, publish completed checkpoint-sized prefixes promptly, and resume header work when verified progress returns capacity
+  ([#1136](https://github.com/zakura-core/zakura/pull/1136)).
+- Let header continuation requests grow when shared credits return instead of keeping the first request's temporary limit
+  ([#1136](https://github.com/zakura-core/zakura/pull/1136)).
+- Keep header validation charged to its capacity budget after a supplier disconnects, observe committed headers before reusing released credits, and limit refill wakeups to targets whose capacity reopened
+  ([#1136](https://github.com/zakura-core/zakura/pull/1136)).
+- Legacy request/response readers enforce each request's remaining response
+  budget before allocating payloads. Persistent readers with message tables
+  wait for the service's precheck choice before reading frames
+  ([#1139](https://github.com/zakura-core/zakura/pull/1139)).
+
+- Serving bounds unsent response counts per peer and across the node. Response
+  slots stay held until the final transport write completes, so tiny responses
+  cannot accumulate bookkeeping up to the encoded-byte limit alone
+  ([#1139](https://github.com/zakura-core/zakura/pull/1139)).
+- After NU7, the ZIP 214 Revision 2 funding streams (Zcash Community Grants and the
+  lockbox) now end at the third halving as moved by ZIP 218, not the pre-ZIP-218 height.
+  No public network sets an NU7 height yet, so behavior does not change today
+  ([#1143](https://github.com/zakura-core/zakura/pull/1143)).
+- A configured Testnet with `funding_streams = []` now has no funding streams. Before, the
+  empty list was ignored and the built-in Testnet streams applied, so a configuration written
+  from a network without funding streams did not load back unchanged
+  ([#1143](https://github.com/zakura-core/zakura/pull/1143)).
+- Public Mainnet and Testnet now reject legacy `testnet_parameters` overrides instead
+  of ignoring them or silently selecting different consensus rules. Custom Testnets
+  remain configurable through the explicit `network = { ... }` form
+  ([#1147](https://github.com/zakura-core/zakura/pull/1147)).
+- Configured Testnets now reject overlapping funding stream ranges after applying the
+  NU7 Revision 2 end-height adjustment, instead of silently ignoring later streams
+  whose ranges overlap the adjusted stream ([#1147](https://github.com/zakura-core/zakura/pull/1147)).
+- Reduced memory use when cloning or rolling back non-finalized chains
+  containing large transparent output scripts
+  ([#1150](https://github.com/zakura-core/zakura/pull/1150)).
+- Avoided formatting full blocks and UTXO maps in state tracing spans, reducing
+  logging overhead during block processing while retaining block height and hash
+  ([#1151](https://github.com/zakura-core/zakura/pull/1151)).
+- Reduced copying during block state updates by sharing unchanged output-index
+  partitions across chain snapshots
+  ([#1153](https://github.com/zakura-core/zakura/pull/1153)).
+- Preserved requested block order when serving block data so response limits
+  consider earlier hashes first
+  ([#1182](https://github.com/zakura-core/zakura/pull/1182)).
+- Built published x86-64 binaries and Docker images with portable Pasta field
+  arithmetic so they run on CPUs without BMI2 and ADX
+  ([#1189](https://github.com/zakura-core/zakura/pull/1189)).
+- Reduced copying during block state updates by sharing unchanged transparent
+  address index partitions across chain snapshots
+  ([#1193](https://github.com/zakura-core/zakura/pull/1193)).
+- Reduced copying during block state updates by sharing retained block records
+  across chain snapshots
+  ([#1194](https://github.com/zakura-core/zakura/pull/1194)).
+- Zakura block sync now reserves each body's advertised or committed size instead of the 2 MB worst case: suppliers publish committed sizes when serving headers from finalized state, and requesters read the size hints carried by retained header deliveries again. A later known size can fill a missing hint once, updating queued estimates without replacing verification evidence. Fills are stored in a new state column family, so the database format moves to 29.1.0 without a migration ([#982](https://github.com/zakura-core/zakura/pull/982)).
+- A block body matching its requested header hash can exceed its advertised size hint when actual retention capacity is available. Speculative bodies that do not fit are retried after commit progress with their measured size, while the checkpoint window stays fundable ([#982](https://github.com/zakura-core/zakura/pull/982)).
+- Validate required coinbase payments against the configured address and amount
+  without a P2SH-only assertion, supporting the ZIP 2008 recipient
+  ([#1201](https://github.com/zakura-core/zakura/pull/1201)).
+- Testnet `getblocktemplate` no longer offers minimum-difficulty work early by
+  moving the template timestamp into the future. It offers that work only once
+  it is valid, and long polling returns it one second after `maxtime`. Mainnet
+  is unchanged ([#1203](https://github.com/zakura-core/zakura/pull/1203)).
+
 ## [1.5.0] - 2026-09-24
 
 ### Added

@@ -15,8 +15,8 @@ use std::{
     time::Duration,
 };
 
-use derive_getters::Getters;
 use derive_new::new;
+use getset::{CopyGetters, Getters};
 use jsonrpsee::core::RpcResult;
 use jsonrpsee_types::{ErrorCode, ErrorObject};
 use rand::{rngs::OsRng, RngCore};
@@ -72,6 +72,14 @@ pub use parameters::{
 };
 pub use proposal::{BlockProposalResponse, BlockTemplateTimeSource};
 
+/// How many rejected work IDs one parent retains before the server stops trusting any of its
+/// templates and falls back for the rest of that parent.
+const MAX_REJECTED_WORK_IDS: usize = 64;
+
+/// How many validated work IDs one parent retains. The oldest is forgotten first, so a miner
+/// holding very old work loses its withdrawal exemption rather than growing this queue.
+const MAX_PREPARED_WORK_IDS: usize = 64;
+
 /// Proof construction can itself use multiple cores. Admit one build across RPC clones.
 const MAX_TEMPLATE_BUILDS: usize = 1;
 /// Bound admission waits without cancelling an already running proof.
@@ -101,7 +109,7 @@ impl TemplateRejections {
         if self.parent != Some(parent) || self.contains(work_id) {
             return false;
         }
-        if self.rejected.len() == 64 {
+        if self.rejected.len() == MAX_REJECTED_WORK_IDS {
             self.saturated = true;
         } else {
             self.rejected.insert(work_id.to_owned());
@@ -121,13 +129,22 @@ impl TemplateRejections {
         self.saturated || !self.rejected.is_empty()
     }
 
-    pub(crate) fn mark_prepared(&mut self, parent: block::Hash, work_id: &str) {
-        if self.parent == Some(parent) && !self.prepared.iter().any(|id| id == work_id) {
-            if self.prepared.len() == 64 {
-                self.prepared.pop_front();
-            }
-            self.prepared.push_back(work_id.to_owned());
+    /// Records that `work_id` passed validation on `parent`.
+    ///
+    /// Returns whether this withdrew any other work: the oldest prepared ID is forgotten when the
+    /// queue is full, and during fallback losing that exemption withdraws it. Waiters observe
+    /// withdrawal through the watch channel, so the caller must publish that change.
+    pub(crate) fn mark_prepared(&mut self, parent: block::Hash, work_id: &str) -> bool {
+        if self.parent != Some(parent) || self.prepared.iter().any(|id| id == work_id) {
+            return false;
         }
+        let evicted = if self.prepared.len() == MAX_PREPARED_WORK_IDS {
+            self.prepared.pop_front().is_some()
+        } else {
+            false
+        };
+        self.prepared.push_back(work_id.to_owned());
+        evicted && self.needs_fallback()
     }
 
     pub(crate) fn is_prepared(&self, work_id: &str) -> bool {
@@ -139,6 +156,12 @@ impl TemplateRejections {
     }
 }
 
+/// Coalesces speculative template preparation onto one worker with one pending template.
+///
+/// `running` admits exactly one preparation loop, and that loop does not take its next template
+/// until the previous template's verification has actually finished, so at most one speculative
+/// verification is ever in flight. Templates that arrive meanwhile replace `pending` rather than
+/// queueing behind it: only the newest is worth preparing.
 #[derive(Clone, Debug)]
 struct TemplatePreparationQueue<T>(Arc<Mutex<TemplatePreparationState<T>>>);
 
@@ -158,7 +181,8 @@ impl<T> Default for TemplatePreparationQueue<T> {
 }
 
 impl<T> TemplatePreparationQueue<T> {
-    fn enqueue(&self, template: T) -> Option<T> {
+    /// Queues `template`, and returns it with the worker slot when no loop is running.
+    fn enqueue(&self, template: T) -> Option<(T, PreparationWorker<T>)> {
         let mut state = self
             .0
             .lock()
@@ -168,7 +192,14 @@ impl<T> TemplatePreparationQueue<T> {
             None
         } else {
             state.running = true;
-            Some(template)
+            drop(state);
+            Some((
+                template,
+                PreparationWorker {
+                    queue: TemplatePreparationQueue(Arc::clone(&self.0)),
+                    released: false,
+                },
+            ))
         }
     }
 
@@ -185,6 +216,75 @@ impl<T> TemplatePreparationQueue<T> {
     }
 }
 
+/// Holds the one speculative preparation slot for as long as its loop runs.
+///
+/// The loop must release the slot however it ends, including a `break` or a panic. Leaving
+/// `running` set would stop every later template from ever being prepared, so the release is a
+/// `Drop` rather than something each exit has to remember.
+pub(crate) struct PreparationWorker<T> {
+    queue: TemplatePreparationQueue<T>,
+    released: bool,
+}
+
+impl<T> PreparationWorker<T> {
+    /// Returns the newest queued template, releasing the slot when there is none.
+    pub(crate) fn next(&mut self) -> Option<T> {
+        let next = self.queue.next_or_finish();
+        self.released = next.is_none();
+        next
+    }
+}
+
+impl<T> Drop for PreparationWorker<T> {
+    fn drop(&mut self) {
+        if self.released {
+            return;
+        }
+        let mut state = self
+            .queue
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.pending = None;
+        state.running = false;
+    }
+}
+
+/// Whether speculative template preparation may start, and for which parent.
+///
+/// Speculative preparation runs full semantic verification on a template nobody submitted. The
+/// task that waits for it can give up, but giving up does not stop the verification: dropping a
+/// tower future leaves the work its request already dispatched running to completion. Starting
+/// another preparation on the same parent would repeat the cost that just failed to finish within
+/// its deadline, so one missed deadline stops speculation until the template parent changes.
+///
+/// This gates speculation only. Foreground template recovery and ordinary block submission still
+/// validate normally while it is tripped.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct SpeculationBreaker(Arc<Mutex<Option<block::Hash>>>);
+
+impl SpeculationBreaker {
+    /// Stops speculative preparation for `parent`, after one of its templates missed its deadline.
+    pub(crate) fn trip(&self, parent: block::Hash) {
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(parent);
+    }
+
+    /// Whether speculative preparation may start for `parent`.
+    ///
+    /// A new parent is the recovery condition: the chain moved on, so the templates that timed
+    /// out are gone and their cost says nothing about this one.
+    pub(crate) fn allows(&self, parent: block::Hash) -> bool {
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            != Some(parent)
+    }
+}
+
 /// An alias to indicate that a usize value represents the depth of in-block dependencies of a
 /// transaction.
 ///
@@ -197,22 +297,24 @@ type InBlockTxDependenciesDepth = usize;
 /// This is the output of the `getblocktemplate` RPC in the default 'template' mode. See
 /// [`BlockProposalResponse`] for the output in 'proposal' mode.
 #[allow(clippy::too_many_arguments)]
-#[derive(Clone, Eq, PartialEq, serde::Serialize, serde::Deserialize, Getters, new)]
+#[derive(Clone, Eq, PartialEq, serde::Serialize, serde::Deserialize, Getters, CopyGetters, new)]
 pub struct BlockTemplateResponse {
     /// The getblocktemplate RPC capabilities supported by Zebra.
     ///
     /// Zakura accepts proposal, long-poll, and work-ID fields without requiring miners to declare
     /// those capabilities. Zakura does not support server lists.
+    #[getset(get = "pub")]
     pub(crate) capabilities: Vec<String>,
 
     /// The version of the block format.
     /// Always 4 for new Zcash blocks.
+    #[getset(get_copy = "pub")]
     pub(crate) version: u32,
 
     /// The hash of the previous block.
     #[serde(rename = "previousblockhash")]
     #[serde(with = "hex")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     pub(crate) previous_block_hash: block::Hash,
 
     /// The block commitment for the new block's header.
@@ -220,7 +322,7 @@ pub struct BlockTemplateResponse {
     /// Same as [`DefaultRoots::block_commitments_hash`], see that field for details.
     #[serde(rename = "blockcommitmentshash")]
     #[serde(with = "hex")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     pub(crate) block_commitments_hash: ChainHistoryBlockTxAuthCommitmentHash,
 
     /// Legacy backwards-compatibility header root field.
@@ -228,7 +330,7 @@ pub struct BlockTemplateResponse {
     /// Same as [`DefaultRoots::block_commitments_hash`], see that field for details.
     #[serde(rename = "lightclientroothash")]
     #[serde(with = "hex")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     pub(crate) light_client_root_hash: ChainHistoryBlockTxAuthCommitmentHash,
 
     /// Legacy backwards-compatibility header root field.
@@ -236,7 +338,7 @@ pub struct BlockTemplateResponse {
     /// Same as [`DefaultRoots::block_commitments_hash`], see that field for details.
     #[serde(rename = "finalsaplingroothash")]
     #[serde(with = "hex")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     pub(crate) final_sapling_root_hash: ChainHistoryBlockTxAuthCommitmentHash,
 
     /// The block header roots for the transactions in the block template.
@@ -244,23 +346,26 @@ pub struct BlockTemplateResponse {
     /// If the transactions in the block template are modified, these roots must be recalculated
     /// [according to the specification](https://zcash.github.io/rpc/getblocktemplate.html).
     #[serde(rename = "defaultroots")]
+    #[getset(get = "pub")]
     pub(crate) default_roots: DefaultRoots,
 
     /// The non-coinbase transactions selected for this block template.
+    #[getset(get = "pub")]
     pub(crate) transactions: Vec<TransactionTemplate<amount::NonNegative>>,
 
     /// The coinbase transaction generated from `transactions` and `height`.
     #[serde(rename = "coinbasetxn")]
+    #[getset(get = "pub")]
     pub(crate) coinbase_txn: TransactionTemplate<amount::NegativeOrZero>,
 
     /// An ID that represents the chain tip and mempool contents for this template.
     #[serde(rename = "longpollid")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     pub(crate) long_poll_id: LongPollId,
 
     /// The expected difficulty for the new block displayed in expanded form.
     #[serde(with = "hex")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     pub(crate) target: ExpandedDifficulty,
 
     /// > For each block other than the genesis block, nTime MUST be strictly greater than
@@ -268,22 +373,26 @@ pub struct BlockTemplateResponse {
     ///
     /// <https://zips.z.cash/protocol/protocol.pdf#blockheader>
     #[serde(rename = "mintime")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     pub(crate) min_time: DateTime32,
 
     /// Hardcoded list of block fields the miner is allowed to change.
+    #[getset(get = "pub")]
     pub(crate) mutable: Vec<String>,
 
     /// A range of valid nonces that goes from `u32::MIN` to `u32::MAX`.
     #[serde(rename = "noncerange")]
+    #[getset(get = "pub")]
     pub(crate) nonce_range: String,
 
     /// Max legacy signature operations in the block.
     #[serde(rename = "sigoplimit")]
+    #[getset(get_copy = "pub")]
     pub(crate) sigop_limit: u32,
 
     /// Max block size in bytes
     #[serde(rename = "sizelimit")]
+    #[getset(get_copy = "pub")]
     pub(crate) size_limit: u64,
 
     /// > the current time as seen by the server (recommended for block time).
@@ -291,24 +400,25 @@ pub struct BlockTemplateResponse {
     ///
     /// <https://en.bitcoin.it/wiki/BIP_0022#Block_Template_Request>
     #[serde(rename = "curtime")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     pub(crate) cur_time: DateTime32,
 
     /// The expected difficulty for the new block displayed in compact form.
     #[serde(with = "hex")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     pub(crate) bits: CompactDifficulty,
 
     /// The height of the next block in the best chain.
     // Optional TODO: use Height type, but check that deserialized heights are within Height::MAX
+    #[getset(get_copy = "pub")]
     pub(crate) height: u32,
 
     /// > the maximum time allowed
     ///
     /// <https://en.bitcoin.it/wiki/BIP_0023#Mutations>
     ///
-    /// Zebra adjusts the minimum and current times for testnet minimum difficulty blocks,
-    /// so we need to tell miners what the maximum valid time is.
+    /// On testnet, the minimum and maximum times are narrowed to the range that matches the
+    /// template's difficulty, so we need to tell miners what the maximum valid time is.
     ///
     /// This field is not in `zcashd` or the Zcash RPC reference yet.
     ///
@@ -317,11 +427,12 @@ pub struct BlockTemplateResponse {
     /// Some miners don't check the maximum time. This can cause invalid blocks after network downtime,
     /// a significant drop in the hash rate, or after the testnet minimum difficulty interval.
     #[serde(rename = "maxtime")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     pub(crate) max_time: DateTime32,
 
     /// Identifies this prepared mining candidate.
     #[serde(rename = "workid")]
+    #[getset(get = "pub")]
     pub(crate) work_id: String,
 
     /// > only relevant for long poll responses:
@@ -338,7 +449,7 @@ pub struct BlockTemplateResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(default)]
     #[serde(rename = "submitold")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     pub(crate) submit_old: Option<bool>,
 }
 
@@ -726,6 +837,9 @@ where
 
     /// Retains failures so late subscribers cannot miss template withdrawal.
     pub(crate) template_rejections: watch::Sender<TemplateRejections>,
+
+    /// Stops speculative preparation for a parent whose template missed its deadline.
+    pub(crate) speculation_breaker: SpeculationBreaker,
 }
 
 impl<BlockVerifierRouter, SyncStatus> GetBlockTemplateHandler<BlockVerifierRouter, SyncStatus>
@@ -733,14 +847,15 @@ where
     BlockVerifierRouter: BlockVerifierService,
     SyncStatus: ChainSyncStatus + Clone + Send + Sync + 'static,
 {
-    /// Creates a handler with a registry shared by RPC and peer serving.
-    pub fn new_with_pending_blocks(
+    /// Creates a handler with its own pending-block registry.
+    ///
+    /// Use [`Self::set_pending_blocks`] to share one registry with peer serving.
+    pub fn new(
         net: &Network,
         conf: config::mining::Config,
         block_verifier_router: BlockVerifierRouter,
         sync_status: SyncStatus,
         mined_block_sender: Option<mpsc::UnboundedSender<MinedBlockEvent>>,
-        pending_blocks: PendingBlockRegistry,
     ) -> Self {
         let optimistic_block_inventory = conf.optimistic_block_inventory;
         Self {
@@ -749,13 +864,19 @@ where
             sync_status,
             mined_block_sender: mined_block_sender
                 .unwrap_or(SubmitBlockChannel::default().sender()),
-            pending_blocks,
+            pending_blocks: PendingBlockRegistry::default(),
             mined_submissions: Default::default(),
             optimistic_block_inventory,
             template_preparation_queue: TemplatePreparationQueue::default(),
             template_build_slots: Arc::new(Semaphore::new(MAX_TEMPLATE_BUILDS)),
             template_rejections: watch::channel(TemplateRejections::default()).0,
+            speculation_breaker: SpeculationBreaker::default(),
         }
+    }
+
+    /// Shares one pending-block registry with peer serving.
+    pub(crate) fn set_pending_blocks(&mut self, pending_blocks: PendingBlockRegistry) {
+        self.pending_blocks = pending_blocks;
     }
 
     /// Runs bounded proof work off the async worker, retaining capacity across cancellation.
@@ -824,17 +945,15 @@ where
         self.optimistic_block_inventory
     }
 
-    /// Queues a server template and returns the first item for a new worker.
+    /// Queues a server template, and returns it with the worker slot for a new loop.
     pub(crate) fn queue_template_preparation(
         &self,
         template: BlockTemplateResponse,
-    ) -> Option<BlockTemplateResponse> {
+    ) -> Option<(
+        BlockTemplateResponse,
+        PreparationWorker<BlockTemplateResponse>,
+    )> {
         self.template_preparation_queue.enqueue(template)
-    }
-
-    /// Returns the newest queued template or marks the worker idle.
-    pub(crate) fn next_template_preparation(&self) -> Option<BlockTemplateResponse> {
-        self.template_preparation_queue.next_or_finish()
     }
 
     /// Randomizes the coinbase data, if miner parameters are set.
@@ -916,7 +1035,6 @@ pub async fn validate_block_proposal<BlockVerifierRouter, Tip, SyncStatus>(
     net: &Network,
     latest_chain_tip: Tip,
     sync_status: SyncStatus,
-    work_id: Option<String>,
 ) -> RpcResult<GetBlockTemplateResponse>
 where
     BlockVerifierRouter: Service<
@@ -954,7 +1072,6 @@ where
         .map_err(|error| ErrorObject::owned(0, error.to_string(), None::<()>))?
         .call(zakura_consensus::Request::Prepare {
             block: Arc::new(block),
-            work_id,
             source: zakura_consensus::PreparedCandidateSource::ClientProposal,
         })
         .await;

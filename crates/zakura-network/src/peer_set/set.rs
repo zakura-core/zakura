@@ -122,7 +122,7 @@ use tower::{
     Service,
 };
 
-use zakura_chain::{chain_tip::ChainTip, parameters::Network};
+use zakura_chain::{block, chain_tip::ChainTip, parameters::Network};
 
 use crate::{
     address_book::AddressMetrics,
@@ -826,6 +826,11 @@ where
     /// ban list are untouched, so the peer is free to reconnect.
     fn drain_stall_events(&mut self, cx: &mut Context<'_>) {
         while let Poll::Ready(Some((addr, outcome))) = self.stall_event_rx.poll_recv(cx) {
+            // A late event from a connection that already left the set must not
+            // start a count that a reconnect at the same address would inherit.
+            if !self.has_peer_with_addr(addr) {
+                continue;
+            }
             match outcome {
                 StallOutcome::Stall => {
                     if self.find_response_stalls.record_stall(addr) {
@@ -904,8 +909,33 @@ where
     }
 
     /// Performs P2C on `self.ready_services` to randomly select a less-loaded ready service.
-    fn select_ready_p2c_peer(&self) -> Option<D::Key> {
-        self.select_p2c_peer_from_list(&self.ready_services.keys().copied().collect())
+    ///
+    /// For a `FindBlocks` or `FindHeaders` request (`is_find_request`), skips zcashd-compat
+    /// sidecar peers whose handshake advertised no more blocks than this node has. A sidecar
+    /// follows only this node, so it can only extend this node's chain if it started ahead, for
+    /// example from restored chain state. Otherwise zcashd leaves a `getblocks` with nothing newer
+    /// unanswered (and any `getheaders` during its initial block download), so the request would
+    /// hold the sidecar's only connection until it times out, and the block `inv`s the sidecar
+    /// follows would queue behind it.
+    fn select_ready_p2c_peer(&self, is_find_request: bool) -> Option<D::Key> {
+        let tip_height = self
+            .minimum_peer_version
+            .chain_tip()
+            .best_tip_height()
+            .unwrap_or(block::Height(0));
+
+        self.select_p2c_peer_from_list(
+            &self
+                .ready_services
+                .iter()
+                .filter(|(_, service)| {
+                    !(is_find_request
+                        && self.is_zcashd_compat_peer(service)
+                        && service.remote_start_height() <= tip_height)
+                })
+                .map(|(key, _)| *key)
+                .collect(),
+        )
     }
 
     /// Performs P2C on `ready_service_list` to randomly select a less-loaded ready service.
@@ -1024,7 +1054,12 @@ where
 
     /// Routes a request using P2C load-balancing.
     fn route_p2c(&mut self, req: Request) -> <Self as tower::Service<Request>>::Future {
-        if let Some(p2c_key) = self.select_ready_p2c_peer() {
+        let is_find_request = matches!(
+            &req,
+            Request::FindBlocks { .. } | Request::FindHeaders { .. }
+        );
+
+        if let Some(p2c_key) = self.select_ready_p2c_peer(is_find_request) {
             tracing::trace!(
                 peer = %p2c_key.addr_label(self.expose_peer_addresses),
                 "routing based on p2c"
@@ -1045,10 +1080,6 @@ where
                 _ => None,
             };
 
-            let is_find_request = matches!(
-                &req,
-                Request::FindBlocks { .. } | Request::FindHeaders { .. }
-            );
             let track_stalls = is_find_request
                 && !self.is_zcashd_compat_peer(&svc)
                 && !self
@@ -1690,6 +1721,15 @@ where
         let _poll_pending_or_ready: Poll<()> = self.inventory_registry.poll_inventory(cx)?;
 
         let ready_peers = self.poll_peers(cx)?;
+
+        // Peers leave the set through many paths. Pruning here, instead of at each
+        // path, keeps stall counts bounded by the live peers.
+        if !self.find_response_stalls.is_empty() {
+            let (ready_services, cancel_handles) = (&self.ready_services, &self.cancel_handles);
+            self.find_response_stalls.retain(|addr| {
+                ready_services.contains_key(addr) || cancel_handles.contains_key(addr)
+            });
+        }
 
         // These metrics should run last, to report the most up-to-date information.
         self.log_peer_set_size();

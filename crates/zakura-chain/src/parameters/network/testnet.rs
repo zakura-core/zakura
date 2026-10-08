@@ -20,6 +20,7 @@ use crate::{
             constants::{
                 BLOSSOM_POW_TARGET_SPACING_RATIO, FUNDING_STREAM_RECEIVER_DENOMINATOR,
                 MAX_BLOCK_SUBSIDY, POST_BLOSSOM_HALVING_INTERVAL, PRE_BLOSSOM_HALVING_INTERVAL,
+                REVISION_2_FUNDING_STREAMS_INDEX,
             },
             funding_stream_address_period, scheduled_issuance_zatoshis, FundingStreamReceiver,
             FundingStreamRecipient, FundingStreams, ParameterSubsidy,
@@ -361,6 +362,30 @@ fn check_funding_stream_address_period(funding_streams: &FundingStreams, network
     }
 }
 
+/// Rejects overlapping funding stream ranges, because [`Network::funding_streams`] returns only
+/// the first matching stream and would silently ignore every later match.
+fn check_funding_stream_ranges_do_not_overlap(
+    funding_streams: &[FundingStreams],
+) -> Result<(), ParametersBuilderError> {
+    for (first_index, first) in funding_streams.iter().enumerate() {
+        for (second_index, second) in funding_streams.iter().enumerate().skip(first_index + 1) {
+            let first_range = first.height_range();
+            let second_range = second.height_range();
+
+            if first_range.start < second_range.end && second_range.start < first_range.end {
+                return Err(ParametersBuilderError::OverlappingFundingStreams {
+                    first_index,
+                    first_range: first_range.clone(),
+                    second_index,
+                    second_range: second_range.clone(),
+                });
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// Checks that every funding stream recipient address in the provided [`FundingStreams`]
 /// is a P2SH address.
 ///
@@ -602,6 +627,49 @@ impl ConfiguredActivationHeights {
             zfuture,
         }
     }
+
+    /// Returns every configured activation height, in upgrade order.
+    fn heights(&self) -> Vec<u32> {
+        [
+            self.before_overwinter,
+            self.overwinter,
+            self.sapling,
+            self.blossom,
+            self.heartwood,
+            self.canopy,
+            self.nu5,
+            self.nu6,
+            self.nu6_1,
+            self.nu6_2,
+            self.nu6_3,
+            self.nu7,
+            #[cfg(zcash_unstable = "zfuture")]
+            self.zfuture,
+        ]
+        .into_iter()
+        .flatten()
+        .collect()
+    }
+
+    /// Returns these activation heights, with any upgrade they omit taken from `base`.
+    fn or(self, base: Self) -> Self {
+        Self {
+            before_overwinter: self.before_overwinter.or(base.before_overwinter),
+            overwinter: self.overwinter.or(base.overwinter),
+            sapling: self.sapling.or(base.sapling),
+            blossom: self.blossom.or(base.blossom),
+            heartwood: self.heartwood.or(base.heartwood),
+            canopy: self.canopy.or(base.canopy),
+            nu5: self.nu5.or(base.nu5),
+            nu6: self.nu6.or(base.nu6),
+            nu6_1: self.nu6_1.or(base.nu6_1),
+            nu6_2: self.nu6_2.or(base.nu6_2),
+            nu6_3: self.nu6_3.or(base.nu6_3),
+            nu7: self.nu7.or(base.nu7),
+            #[cfg(zcash_unstable = "zfuture")]
+            zfuture: self.zfuture.or(base.zfuture),
+        }
+    }
 }
 
 /// Configurable checkpoints, either a path to a checkpoints file, a "default" keyword to indicate
@@ -650,6 +718,10 @@ pub struct ParametersBuilder {
     slow_start_interval: Height,
     /// Funding streams for this network
     funding_streams: Vec<FundingStreams>,
+    /// Whether each funding stream in `funding_streams` inherited its height range from the
+    /// built-in Testnet funding streams. Only an inherited Revision 2 range moves with NU7,
+    /// see [`FundingStreams::with_nu7_adjusted_end_height`].
+    inherited_funding_stream_ranges: Vec<bool>,
     /// A flag indicating whether to allow changes to fields that affect
     /// the funding stream address period.
     should_lock_funding_stream_address_period: bool,
@@ -706,6 +778,7 @@ impl Default for ParametersBuilder {
             disable_pow: false,
             max_block_time_start_height: None,
             funding_streams: testnet::FUNDING_STREAMS.clone(),
+            inherited_funding_stream_ranges: vec![true; testnet::FUNDING_STREAMS.len()],
             should_lock_funding_stream_address_period: false,
             pre_blossom_halving_interval: PRE_BLOSSOM_HALVING_INTERVAL,
             post_blossom_halving_interval: POST_BLOSSOM_HALVING_INTERVAL,
@@ -876,6 +949,28 @@ impl ParametersBuilder {
         Ok(self)
     }
 
+    /// Overlays `overlay` on the activation heights already being built, then checks and
+    /// sets the result like [`Self::with_activation_heights`].
+    ///
+    /// Upgrades that `overlay` omits keep their current heights. Starting from
+    /// [`Parameters::build()`], a configured Testnet can therefore set only `NU7` and
+    /// inherit every public Testnet upgrade below it.
+    ///
+    /// Returns [`ParametersBuilderError::InvalidActivationHeight`] if an overlaid height
+    /// equals another upgrade's height, which would silently drop that upgrade.
+    pub fn with_activation_height_overlay(
+        self,
+        overlay: ConfiguredActivationHeights,
+    ) -> Result<Self, ParametersBuilderError> {
+        let current = ConfiguredActivationHeights::from(&self.activation_heights);
+        let combined = overlay.or(current);
+        let heights = combined.heights();
+        if heights.iter().collect::<HashSet<_>>().len() != heights.len() {
+            return Err(ParametersBuilderError::InvalidActivationHeight);
+        }
+        self.with_activation_heights(combined)
+    }
+
     /// Sets the slow start interval to be used in the [`Parameters`] being built.
     pub fn with_slow_start_interval(mut self, slow_start_interval: Height) -> Self {
         self.slow_start_interval = slow_start_interval;
@@ -889,14 +984,18 @@ impl ParametersBuilder {
     /// If `funding_streams` is longer than `testnet::FUNDING_STREAMS`, and one
     /// of the extra streams requires a default value.
     pub fn with_funding_streams(mut self, funding_streams: Vec<ConfiguredFundingStreams>) -> Self {
-        self.funding_streams = funding_streams
+        (self.funding_streams, self.inherited_funding_stream_ranges) = funding_streams
             .into_iter()
             .enumerate()
             .map(|(idx, streams)| {
+                let is_range_inherited = streams.height_range.is_none();
                 let default_streams = testnet::FUNDING_STREAMS.get(idx).cloned();
-                streams.convert_with_default(default_streams)
+                (
+                    streams.convert_with_default(default_streams),
+                    is_range_inherited,
+                )
             })
-            .collect();
+            .unzip();
         self.should_lock_funding_stream_address_period = true;
         self
     }
@@ -904,6 +1003,7 @@ impl ParametersBuilder {
     /// Clears funding streams from the [`Parameters`] being built.
     pub fn clear_funding_streams(mut self) -> Self {
         self.funding_streams = vec![];
+        self.inherited_funding_stream_ranges = vec![];
         self
     }
 
@@ -914,10 +1014,15 @@ impl ParametersBuilder {
     pub fn extend_funding_streams(mut self) -> Self {
         let network = self.to_network_unchecked();
 
-        for funding_streams in &mut self.funding_streams {
+        // The network holds the height ranges after NU7 moves the inherited ones.
+        for (funding_streams, network_funding_streams) in self
+            .funding_streams
+            .iter_mut()
+            .zip(network.all_funding_streams())
+        {
             funding_streams.extend_recipient_addresses(
                 num_funding_stream_addresses_required_for_height_range(
-                    funding_streams.height_range(),
+                    network_funding_streams.height_range(),
                     &network,
                 ),
             );
@@ -1086,6 +1191,7 @@ impl ParametersBuilder {
             activation_heights,
             slow_start_interval,
             funding_streams,
+            inherited_funding_stream_ranges,
             should_lock_funding_stream_address_period: _,
             target_difficulty_limit,
             disable_pow,
@@ -1100,7 +1206,7 @@ impl ParametersBuilder {
             test_nsm_reissuance_height,
             initial_nsm_value_balance,
         } = self;
-        Parameters {
+        let mut parameters = Parameters {
             network_name,
             network_magic,
             genesis_hash,
@@ -1121,7 +1227,27 @@ impl ParametersBuilder {
             test_nsm_reissuance_height,
             nsm_reissuance_crossing_height: DerivedHeight::default(),
             initial_nsm_value_balance,
+        };
+
+        // ZIP 218 moves the third halving, and ZIP 214 Revision 3 moves the end of the
+        // Revision 2 streams there. Explicitly configured height ranges stay as configured.
+        let nu7_activation = NetworkUpgrade::Nu7
+            .activation_height(&Network::new_configured_testnet(parameters.clone()));
+        if let Some(funding_streams) = parameters
+            .funding_streams
+            .get_mut(REVISION_2_FUNDING_STREAMS_INDEX)
+            .filter(|_| {
+                inherited_funding_stream_ranges
+                    .get(REVISION_2_FUNDING_STREAMS_INDEX)
+                    .is_some_and(|is_range_inherited| *is_range_inherited)
+            })
+        {
+            *funding_streams = funding_streams
+                .clone()
+                .with_nu7_adjusted_end_height(nu7_activation);
         }
+
+        parameters
     }
 
     /// Converts the builder to a configured [`Network::Testnet`]
@@ -1129,12 +1255,15 @@ impl ParametersBuilder {
         Network::new_configured_testnet(self.clone().finish())
     }
 
-    /// Checks funding streams and converts the builder to a configured [`Network::Testnet`]
+    /// Checks that funding stream ranges do not overlap, validates each stream, and converts the
+    /// builder to a configured [`Network::Testnet`].
     pub fn to_network(self) -> Result<Network, ParametersBuilderError> {
         let network = self.to_network_unchecked();
 
         // Final check that the configured funding streams will be valid for these Testnet parameters.
-        for fs in &self.funding_streams {
+        // The network holds the height ranges after NU7 moves the inherited ones.
+        check_funding_stream_ranges_do_not_overlap(network.all_funding_streams())?;
+        for fs in network.all_funding_streams() {
             // Check that the funding streams are valid for the configured Testnet parameters.
             check_funding_stream_address_period(fs, &network);
             check_funding_stream_address_types(fs)?;
@@ -1165,7 +1294,8 @@ impl ParametersBuilder {
             genesis_hash,
             activation_heights,
             slow_start_interval,
-            funding_streams,
+            funding_streams: _,
+            inherited_funding_stream_ranges: _,
             should_lock_funding_stream_address_period: _,
             target_difficulty_limit,
             disable_pow,
@@ -1182,11 +1312,13 @@ impl ParametersBuilder {
             initial_nsm_value_balance: _,
         } = Self::default();
 
+        // Compare the height ranges after NU7 moves the inherited ones, so an explicit copy
+        // of the built-in ranges is compatible exactly when it matches them.
         self.activation_heights == activation_heights
             && self.network_magic == network_magic
             && self.genesis_hash == genesis_hash
             && self.slow_start_interval == slow_start_interval
-            && self.funding_streams == funding_streams
+            && self.clone().finish().funding_streams == Self::default().finish().funding_streams
             && self.target_difficulty_limit == target_difficulty_limit
             && self.disable_pow == disable_pow
             && max_block_time_start_height == TESTNET_MAX_TIME_START_HEIGHT

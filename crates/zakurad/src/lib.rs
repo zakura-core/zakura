@@ -61,9 +61,6 @@
 //!
 //! ### Metrics
 //!
-//! * configuring a `tracing.progress_bar`: shows key metrics in the terminal using progress bars,
-//!   and automatically configures Zakura to send logs to a file.
-//!   (The `progress-bar` feature is activated by default.)
 //! * `prometheus`: export metrics to prometheus.
 //!
 //! ### Tracing
@@ -71,11 +68,8 @@
 //! Sending traces to different subscribers:
 //! * configuring a `tracing.log_file`: appends traces to a file on disk.
 //! * `journald`: send tracing spans and events to `systemd-journald`.
-//! * `sentry`: send crash and panic events to sentry.io.
-//! * `flamegraph`: generate a flamegraph of tracing spans.
 //!
 //! Changing the traces that are collected:
-//! * `filter-reload`: dynamically reload tracing filters at runtime.
 //! * `error-debug`: enable extra debugging in release builds.
 //! * `tokio-console`: enable tokio's `console-subscriber` (needs [specific compiler flags])
 //! * A set of features that [skip verbose tracing].
@@ -87,7 +81,6 @@
 //! ### Testing
 //!
 //! * `proptest-impl`: enable randomised test data generation.
-//! * `lightwalletd-grpc-tests`: enable Zakura JSON-RPC tests that query `lightwalletd` using gRPC.
 //!
 //! ### Experimental
 //!
@@ -141,6 +134,3 @@ pub mod components;
 pub mod config;
 pub mod node;
 pub mod prelude;
-
-#[cfg(feature = "sentry")]
-pub(crate) mod sentry;

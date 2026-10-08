@@ -204,6 +204,10 @@ lazy_static! {
     /// - [ZIP-1015](https://zips.z.cash/zip-1015)
     /// - [ZIP-214#funding-streams](https://zips.z.cash/zip-0214#funding-streams)
     ///
+    /// ZIP 218 moves the third halving, so the heights listed here are the heights
+    /// before ZIP 218. The Testnet parameters builder moves the end of the Revision 2
+    /// streams there, see [`FundingStreams::with_nu7_adjusted_end_height`].
+    ///
     /// [7.10.1]: https://zips.z.cash/protocol/protocol.pdf#zip214fundingstreams
     pub(crate) static ref FUNDING_STREAMS: Vec<FundingStreams> = vec![
         FundingStreams {

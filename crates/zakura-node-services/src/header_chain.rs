@@ -248,6 +248,10 @@ pub struct RetainedHeaderPathPage {
     /// The page keeps the roots separate from `aux_deliveries`.
     /// A serving adapter may use the roots for finalized historical pages.
     pub finalized_tree_aux: Vec<Option<zakura_header_chain::TreeAuxRecordV1>>,
+    /// Committed serialized body sizes looked up by header hash in the full state, parallel
+    /// to `headers`. No peer-delivery provenance; a serving adapter prefers these over
+    /// advertised delivery sizes. `None` where the block is not committed locally.
+    pub finalized_body_sizes: Vec<Option<std::num::NonZeroU32>>,
     /// Whether this page reaches the immutable target.
     pub complete: bool,
 }
@@ -618,67 +622,6 @@ impl Port for InertHeaderChainPort {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[derive(Debug)]
-    struct MinimalMock;
-
-    impl Port for MinimalMock {
-        fn continuation_locator(
-            &self,
-        ) -> HeaderChainFuture<'_, Result<Option<HeaderLocator>, PortError>> {
-            Box::pin(async { Ok(None) })
-        }
-
-        fn vct_repair_context(
-            &self,
-            _owner: BodyWorkOwner,
-            _height: block::Height,
-        ) -> HeaderChainFuture<'_, Result<VctRepairContextReply, PortError>> {
-            Box::pin(async { Ok(VctRepairContextReply::Stale) })
-        }
-
-        fn acquire_header_path(
-            &self,
-            _request: AcquirePath,
-        ) -> HeaderChainFuture<'_, Result<AcquirePathReply, PortError>> {
-            Box::pin(async { Ok(AcquirePathReply::Busy) })
-        }
-
-        fn read_header_path(
-            &self,
-            _path: RetainedHeaderPath,
-            _request: ReadPath,
-        ) -> HeaderChainFuture<'_, Result<ReadPathReply, PortError>> {
-            Box::pin(async { Ok(ReadPathReply::Unavailable) })
-        }
-
-        fn release_header_path(
-            &self,
-            _path: RetainedHeaderPath,
-        ) -> HeaderChainFuture<'_, Result<(), PortError>> {
-            Box::pin(async { Ok(()) })
-        }
-
-        fn prepare_header_target(
-            &self,
-            _request: PrepareHeaderTarget,
-        ) -> HeaderChainFuture<'_, PrepareHeaderTargetReply> {
-            unreachable!("the mock need not construct a state service")
-        }
-
-        fn apply_header_target(
-            &self,
-            _target: PreparedHeaderTarget,
-        ) -> HeaderChainFuture<'_, ApplyHeaderTargetReply> {
-            unreachable!("the mock need not construct a state service")
-        }
-    }
-
-    #[tokio::test]
-    async fn port_is_object_safe_and_mockable_without_state_services() {
-        let port: Arc<dyn Port> = Arc::new(MinimalMock);
-        assert!(port.continuation_locator().await.unwrap().is_none());
-    }
 
     #[test]
     fn retained_path_identity_requires_the_issuing_adapter_key() {

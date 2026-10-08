@@ -1236,28 +1236,61 @@ fn find_blocks_stall_not_tracked_at_near_tip_boundary() {
     });
 }
 
-/// Check that the sync stall detector does not disconnect the configured zcashd-compat sidecar.
-#[test]
-fn find_blocks_stall_not_tracked_for_zcashd_compat() {
-    let (runtime, _init_guard) = zakura_test::init_async();
-    let _guard = runtime.enter();
-
-    let sidecar_ip = Ipv4Addr::LOCALHOST;
+/// Returns a discovery stream with one inbound zcashd-compat sidecar at `sidecar_ip`, connected
+/// from its IPv4-mapped address and advertising `start_height`, and the sidecar's mock handle.
+fn sidecar_discovery(
+    sidecar_ip: Ipv4Addr,
+    start_height: block::Height,
+) -> (
+    impl futures::Stream<Item = Result<Change<PeerSocketAddr, LoadTrackedClient>, BoxError>>,
+    ClientTestHarness,
+) {
     let sidecar_addr: PeerSocketAddr =
         SocketAddr::new(IpAddr::V6(sidecar_ip.to_ipv6_mapped()), 1).into();
-    let (sidecar, mut sidecar_handle) = ClientTestHarness::build()
+    let (sidecar, sidecar_handle) = ClientTestHarness::build()
         .with_version(CURRENT_NETWORK_PROTOCOL_VERSION)
         .with_connected_addr(ConnectedAddr::new_inbound_direct(sidecar_addr))
+        .with_start_height(start_height)
         .finish();
     let discovered_peers = stream::iter([Ok::<_, BoxError>(Change::Insert(
         sidecar_addr,
         sidecar.into(),
     ))])
     .chain(stream::pending());
+
+    (discovered_peers, sidecar_handle)
+}
+
+/// Requests that look for blocks beyond this node's chain.
+fn find_requests() -> [Request; 2] {
+    [
+        Request::FindBlocks {
+            known_blocks: vec![],
+            stop: None,
+        },
+        Request::FindHeaders {
+            known_blocks: vec![],
+            stop: None,
+        },
+    ]
+}
+
+/// Check that the sync stall detector does not disconnect the configured zcashd-compat sidecar.
+///
+/// The sidecar advertised more blocks than this node has, so find requests still reach it.
+#[test]
+fn find_blocks_stall_not_tracked_for_zcashd_compat() {
+    let (runtime, _init_guard) = zakura_test::init_async();
+    let _guard = runtime.enter();
+
+    let sidecar_ip = Ipv4Addr::LOCALHOST;
+    let (discovered_peers, mut sidecar_handle) =
+        sidecar_discovery(sidecar_ip, block::Height(2_500_000));
     let (minimum_peer_version, best_tip) =
         MinimumPeerVersion::with_mock_chain_tip(&Network::Mainnet);
 
-    // Simulate Zebra syncing ahead of its zcashd-compat sidecar.
+    // Simulate Zebra syncing behind its zcashd-compat sidecar, for example after the sidecar
+    // started from restored chain state.
     best_tip.send_best_tip_height(Some(block::Height(2_490_000)));
     best_tip.send_estimated_distance_to_network_chain_tip(Some(10_000));
 
@@ -1289,6 +1322,85 @@ fn find_blocks_stall_not_tracked_for_zcashd_compat() {
         assert!(
             sidecar_handle.wants_connection_heartbeats(),
             "zcashd-compat sidecar should not be disconnected by the sync stall detector"
+        );
+    });
+}
+
+/// Check that find requests skip a zcashd-compat sidecar that advertised no more blocks than this
+/// node has, even when it is the only ready peer, while other requests still reach it.
+#[test]
+fn find_requests_skip_a_sidecar_that_is_not_ahead() {
+    let (runtime, _init_guard) = zakura_test::init_async();
+    let _guard = runtime.enter();
+
+    // The sidecar follows this node, so it connected at this node's tip.
+    let sidecar_ip = Ipv4Addr::LOCALHOST;
+    let (discovered_peers, mut sidecar_handle) =
+        sidecar_discovery(sidecar_ip, block::Height(2_490_000));
+    let (minimum_peer_version, best_tip) =
+        MinimumPeerVersion::with_mock_chain_tip(&Network::Mainnet);
+    best_tip.send_best_tip_height(Some(block::Height(2_490_000)));
+
+    runtime.block_on(async move {
+        let (mut peer_set, _peer_set_guard) = PeerSetBuilder::new()
+            .with_block_gossip_peer_ips(vec![sidecar_ip.into()])
+            .with_discover(discovered_peers)
+            .with_minimum_peer_version(minimum_peer_version)
+            .build();
+
+        for request in find_requests() {
+            let response_fut = peer_set
+                .ready()
+                .await
+                .expect("peer set is ready")
+                .call(request.clone());
+
+            assert!(
+                sidecar_handle
+                    .try_to_receive_outbound_client_request()
+                    .request()
+                    .is_none(),
+                "{request:?} should not be sent to the sidecar",
+            );
+
+            let response = timeout(Duration::from_secs(5), response_fut)
+                .await
+                .expect("the request should fail without waiting for a peer");
+            assert_eq!(
+                response
+                    .expect_err("no ready peer can serve the request")
+                    .downcast_ref::<SharedPeerError>()
+                    .expect("peer set should return a boxed SharedPeerError")
+                    .inner_debug(),
+                "NoReadyPeers",
+                "{request:?} should fail without another peer",
+            );
+        }
+
+        let block_request =
+            Request::BlocksByHash([block::Hash([1; 32]), block::Hash([2; 32])].into());
+        for request in [
+            Request::MempoolTransactionIds,
+            Request::Peers,
+            block_request,
+        ] {
+            let response_fut = peer_set
+                .ready()
+                .await
+                .expect("peer set is ready")
+                .call(request.clone());
+            let client_request = sidecar_handle
+                .try_to_receive_outbound_client_request()
+                .request()
+                .unwrap_or_else(|| panic!("{request:?} should be sent to the sidecar"));
+            assert_eq!(client_request.request, request);
+            let _ = client_request.tx.send(Ok(Response::Nil));
+            response_fut.await.expect("response received");
+        }
+
+        assert!(
+            sidecar_handle.wants_connection_heartbeats(),
+            "zcashd-compat sidecar should stay connected"
         );
     });
 }
@@ -1490,6 +1602,88 @@ fn find_blocks_stall_count_preserved_across_tip_transition() {
             !handle.wants_connection_heartbeats(),
             "peer should be disconnected because its syncing stall count was preserved"
         );
+    });
+}
+
+/// Check that a peer that fails after a stall leaves no stall count behind, so a
+/// reconnect at the same address starts fresh.
+#[test]
+fn find_blocks_stall_count_dropped_when_peer_fails() {
+    let peer_version = Version::min_specified_for_upgrade(&Network::Mainnet, NetworkUpgrade::Nu6_2);
+    let peer_versions = PeerVersions {
+        peer_versions: vec![peer_version],
+    };
+
+    let (runtime, _init_guard) = zakura_test::init_async();
+    let _guard = runtime.enter();
+
+    let (discovered_peers, handles) = peer_versions.mock_peer_discovery();
+    let (minimum_peer_version, _best_tip) =
+        MinimumPeerVersion::with_mock_chain_tip(&Network::Mainnet);
+
+    let mut handle = handles.into_iter().next().expect("there is one peer");
+
+    runtime.block_on(async move {
+        let (mut peer_set, _peer_set_guard) = PeerSetBuilder::new()
+            .with_discover(discovered_peers)
+            .with_minimum_peer_version(minimum_peer_version)
+            .build();
+
+        let peer_ready = peer_set.ready().await.expect("peer set is ready");
+        let response_fut = peer_ready.call(Request::FindBlocks {
+            known_blocks: vec![],
+            stop: None,
+        });
+        let client_request = handle
+            .try_to_receive_outbound_client_request()
+            .request()
+            .expect("peer received the request");
+        let _ = client_request.tx.send(Ok(Response::BlockHashes(vec![])));
+        response_fut.await.expect("response received");
+
+        let _ = peer_set.ready().now_or_never();
+        assert_eq!(peer_set.find_response_stalls.len(), 1);
+
+        handle.set_error(crate::PeerError::ConnectionClosed);
+        let _ = peer_set.ready().now_or_never();
+
+        assert!(peer_set.ready_services.is_empty());
+        assert_eq!(
+            peer_set.find_response_stalls.len(),
+            0,
+            "a departed peer's stall count must not outlive its connection"
+        );
+    });
+}
+
+/// Check that a stall event for an address that is no longer in the peer set is
+/// ignored instead of starting a count that a reconnect would inherit.
+#[test]
+fn find_blocks_stall_event_for_departed_peer_is_ignored() {
+    let (runtime, _init_guard) = zakura_test::init_async();
+    let _guard = runtime.enter();
+
+    let (discovered_peers, _handles) = PeerVersions {
+        peer_versions: vec![],
+    }
+    .mock_peer_discovery();
+    let (minimum_peer_version, _best_tip) =
+        MinimumPeerVersion::with_mock_chain_tip(&Network::Mainnet);
+
+    runtime.block_on(async move {
+        let (mut peer_set, _peer_set_guard) = PeerSetBuilder::new()
+            .with_discover(discovered_peers)
+            .with_minimum_peer_version(minimum_peer_version)
+            .build();
+
+        let departed: PeerSocketAddr = "127.0.0.1:8233".parse().expect("valid address");
+        peer_set
+            .stall_event_tx
+            .send((departed, super::super::StallOutcome::Stall))
+            .expect("the peer set holds the receiver");
+        let _ = peer_set.ready().now_or_never();
+
+        assert_eq!(peer_set.find_response_stalls.len(), 0);
     });
 }
 

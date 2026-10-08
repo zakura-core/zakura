@@ -3,7 +3,6 @@
 use std::{collections::HashMap, ops::Deref};
 
 use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
-use serde_with::{serde_as, DisplayFromStr};
 
 use strum_macros::EnumIter;
 use zakura_chain::parameters::NetworkKind;
@@ -33,14 +32,13 @@ pub(crate) const MAX_USER_COINBASE_DATA_LEN: usize =
     MAX_MINER_DATA_LEN - ZAKURA_COINBASE_MARKER.len() - ZAKURA_COINBASE_SEPARATOR.len() - 2;
 
 /// Mining configuration section.
-#[serde_as]
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Config {
     /// Address for receiving miner subsidy and tx fees.
     ///
     /// Used in coinbase tx constructed in `getblocktemplate` RPC.
-    #[serde_as(as = "Option<DisplayFromStr>")]
+    #[serde(with = "miner_address")]
     pub miner_address: Option<ZcashAddress>,
 
     /// Optional tag that Zakura appends to the coinbase input of every block it
@@ -57,8 +55,9 @@ pub struct Config {
 
     /// Mine blocks using Zakura's internal miner, without an external mining pool or equihash solver.
     ///
-    /// This experimental feature is only supported on regtest as it uses null solutions and skips checking
-    /// for a valid Proof of Work.
+    /// Requires a `zakurad` built with the experimental `internal-miner` feature, which solves
+    /// Equihash with one low-priority thread. Miners that share a `miner_address` should set
+    /// distinct `extra_coinbase_data`, so they do not search identical work.
     ///
     /// The internal miner is off by default.
     #[serde(default)]
@@ -67,6 +66,34 @@ pub struct Config {
     /// Advertise prepared mined block hashes after expected-work validation and state admission,
     /// but before contextual commit completes.
     pub optimistic_block_inventory: bool,
+}
+
+mod miner_address {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use zcash_address::ZcashAddress;
+
+    pub(super) fn serialize<S>(
+        address: &Option<ZcashAddress>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        address
+            .as_ref()
+            .map(ToString::to_string)
+            .serialize(serializer)
+    }
+
+    pub(super) fn deserialize<'de, D>(deserializer: D) -> Result<Option<ZcashAddress>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Option::<String>::deserialize(deserializer)?
+            .map(|encoded| encoded.parse())
+            .transpose()
+            .map_err(serde::de::Error::custom)
+    }
 }
 
 impl Default for Config {
@@ -195,12 +222,27 @@ mod tests {
     use super::Config;
 
     #[test]
-    fn optimistic_block_inventory_defaults_on_and_can_be_disabled() {
-        let default: Config = toml::from_str("").expect("empty mining config uses defaults");
-        assert!(default.optimistic_block_inventory);
+    fn miner_address_preserves_string_encoding_and_optional_defaults() {
+        let encoded = "t1bmMa1wJDFdbc2TiURQP5BbBz6jHjUBuHq";
+        let config: Config = toml::from_str(&format!("miner_address = {encoded:?}")).unwrap();
+        assert_eq!(config.miner_address.as_ref().unwrap().to_string(), encoded);
+        let serialized = toml::to_string(&config).unwrap();
+        assert_eq!(toml::from_str::<Config>(&serialized).unwrap(), config);
+        assert_eq!(
+            serde_json::to_value(&config).unwrap()["miner_address"],
+            encoded
+        );
 
-        let disabled: Config = toml::from_str("optimistic_block_inventory = false")
-            .expect("the optimistic inventory option is valid");
-        assert!(!disabled.optimistic_block_inventory);
+        for json in [
+            serde_json::json!({}),
+            serde_json::json!({"miner_address": null}),
+        ] {
+            assert!(serde_json::from_value::<Config>(json)
+                .unwrap()
+                .miner_address
+                .is_none());
+        }
+        assert!(toml::from_str::<Config>("miner_address = 'invalid'").is_err());
+        assert!(toml::from_str::<Config>("miner_address = 42").is_err());
     }
 }

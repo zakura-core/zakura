@@ -301,8 +301,13 @@ impl NonFinalizedBlocksListener {
                 // Take blocks from the chain in reverse height order until we
                 // reach a block the listener already has, then restore
                 // ascending height order.
-                let mut blocks: Vec<_> =
-                    chain.blocks.values().rev().take_while(take_cond).collect();
+                let mut blocks: Vec<_> = chain
+                    .blocks
+                    .values()
+                    .rev()
+                    .map(Arc::as_ref)
+                    .take_while(take_cond)
+                    .collect();
                 blocks.reverse();
                 blocks
             })
@@ -454,6 +459,10 @@ pub enum ReadResponse {
     /// Response to [`ReadRequest::BlockRoots`] with the per-block commitment roots
     /// this node holds for the requested range, in ascending height order.
     BlockRoots(Vec<zakura_chain::parallel::commitment_aux::BlockCommitmentRoots>),
+
+    /// Response to [`ReadRequest::BlockSizesByHash`]: committed serialized sizes parallel to
+    /// the requested hashes, `None` for hashes that are not committed.
+    BlockSizesByHash(Vec<Option<u32>>),
 
     /// Response to [`ReadRequest::Tip`] with the current best chain tip.
     Tip(Option<(block::Height, block::Hash)>),
@@ -763,6 +772,7 @@ impl TryFrom<ReadResponse> for Response {
             ReadResponse::UsageInfo(_)
             | ReadResponse::PruningInfo { .. }
             | ReadResponse::BlockRoots(_)
+            | ReadResponse::BlockSizesByHash(_)
             | ReadResponse::TipPoolValues { .. }
             | ReadResponse::TransactionIdsForBlock(_)
             | ReadResponse::AnyChainTransactionIdsForBlock(_)

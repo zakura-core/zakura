@@ -624,13 +624,13 @@ fn body_refill_does_not_attach_committed_sizes_to_another_fork() {
     )
     .expect("test block size fits u32");
     assert_eq!(
-        crate::service::read::block_size_hints(
+        crate::service::read::block_info(
             full_state.best_chain(),
             &finalized.db,
-            block::Height(1),
-            1
-        ),
-        vec![(block::Height(1), Some(old_size))],
+            old.hash().into(),
+        )
+        .map(|info| info.size()),
+        Some(old_size),
         "the old branch has a confirmed size at the same height",
     );
     let metadata = crate::service::missing_block_body_metadata(
@@ -802,8 +802,32 @@ fn reconciled_store_with_finalized_prefix(
 }
 
 #[test]
+fn repair_context_range_is_bounded_by_reclaimable_capacity() {
+    let (mut runtime, _db, _genesis, path) = reconciled_store_with_finalized_prefix(6);
+    // Even an empty store cannot retain a range larger than its aggregate limit.
+    runtime.set_auxiliary_limits_for_test(1, 1);
+    let snapshot = runtime.publisher().snapshot();
+    let owner = zakura_header_chain::BodyWorkAuthority::for_snapshot(&snapshot)
+        .bind(7, NonZeroU64::new(8).unwrap());
+    for index in [3, 4, 5] {
+        let context = runtime
+            .reader()
+            .vct_repair_context(owner, path[index].height)
+            .unwrap()
+            .unwrap();
+        assert!(context.admission_capacity_available);
+        assert_eq!(context.selected_header_count(), 1);
+        assert_eq!(
+            context.target,
+            Frontier::new(path[index].height, path[index].hash)
+        );
+    }
+}
+
+#[test]
 fn repair_context_reconstructs_rejected_input_after_engine_hydration() {
-    let (runtime, db, _genesis, path) = reconciled_store_with_finalized_prefix(5);
+    let (mut runtime, db, _genesis, path) = reconciled_store_with_finalized_prefix(5);
+    runtime.set_auxiliary_limits_for_test(1, 3);
     let target = Frontier::new(path[3].height, path[3].hash);
     let snapshot = runtime.publisher().snapshot();
     let owner = zakura_header_chain::BodyWorkAuthority::for_snapshot(&snapshot)
@@ -880,6 +904,10 @@ fn repair_context_reconstructs_rejected_input_after_engine_hydration() {
         .expect("the recovered selected target still needs repair");
 
     assert_ne!(recovered.episode, before.episode);
+    assert!(
+        recovered.admission_capacity_available,
+        "a full recovered input bucket permits a selected replacement"
+    );
     assert!(recovered.excludes(input));
     assert!(recovered.retains_payload(input));
     assert!(recovered.retains_source(rejected.source));
@@ -1165,6 +1193,246 @@ fn selected_range_repair_rejects_atomically_then_commits_every_delivery() {
             1
         );
     }
+}
+
+/// Store each delivery as durable input on its retained header and refresh the runtime mirror.
+///
+/// Each delivery must name a distinct header.
+fn retain_aux_deliveries_for_test(runtime: &HeaderChainRuntime, deliveries: &[AuxDelivery]) {
+    let mut batch = DiskWriteBatch::new();
+    for delivery in deliveries {
+        let mut node = runtime
+            .store
+            .header_node(delivery.header_hash)
+            .expect("the retained header row decodes")
+            .expect("the delivery header is retained");
+        node.aux_delivery_ids.push(delivery.delivery_id);
+        runtime
+            .store
+            .put_value(
+                &mut batch,
+                HEADER_NODE_BY_HASH,
+                delivery.header_hash.0,
+                &HeaderNodeDisk::from_domain(&node),
+            )
+            .expect("the header with auxiliary input encodes");
+        runtime
+            .store
+            .put_value(
+                &mut batch,
+                HEADER_AUX_DELIVERY,
+                HeaderAuxDeliveryKey {
+                    header: delivery.header_hash,
+                    delivery: delivery.delivery_id,
+                }
+                .as_bytes(),
+                delivery,
+            )
+            .expect("the auxiliary delivery encodes");
+    }
+    runtime
+        .store
+        .db
+        .write(batch)
+        .expect("the auxiliary input fixture commits");
+    *runtime
+        .transition_engine
+        .lock()
+        .expect("the transition engine mutex is not poisoned") =
+        load_transition_engine(&runtime.store)
+            .expect("the direct durable test fixture refreshes the runtime mirror");
+}
+
+/// Repair three headers that hold rootless near-tip rows in one range, below one rooted header.
+///
+/// `aggregate_limit` replaces the aggregate input limit. Returns the durable rows of each
+/// repaired target and the number of durable rows in the store.
+fn repair_rootless_near_tip_range(
+    aggregate_limit: Option<usize>,
+) -> (Vec<Vec<AuxDelivery>>, usize) {
+    let (mut runtime, _db, _genesis, path) = reconciled_store_with_finalized_prefix(8);
+    if let Some(total) = aggregate_limit {
+        let per_header = runtime.config.limits.max_aux_deliveries_per_header.get();
+        runtime.set_auxiliary_limits_for_test(per_header, total);
+    }
+    let parent = Frontier::new(path[2].height, path[2].hash);
+    let targets: Vec<_> = path[3..6]
+        .iter()
+        .map(|header| Frontier::new(header.height, header.hash))
+        .collect();
+    let rooted_header = Frontier::new(path[6].height, path[6].hash);
+    let snapshot = runtime.publisher().snapshot();
+    let owner = zakura_header_chain::BodyWorkAuthority::for_snapshot(&snapshot)
+        .bind(37, NonZeroU64::new(38).expect("thirty-eight is nonzero"));
+    let near_tip_owner =
+        zakura_header_chain::HeaderWorkAuthority::for_target(&snapshot, path[7].hash)
+            .bind(39, NonZeroU64::new(40).expect("forty is nonzero"));
+    let near_tip_source = SourceId::from_digest([0xc1; 32]);
+    let record = |height: block::Height, marker: u8| zakura_header_chain::TreeAuxRecordV1 {
+        height,
+        sapling_root: Default::default(),
+        orchard_root: Default::default(),
+        ironwood_root: Default::default(),
+        sapling_tx_count: u64::from(marker),
+        orchard_tx_count: 0,
+        ironwood_tx_count: 0,
+        auth_data_root: zakura_chain::block::merkle::AuthDataRoot::from([marker; 32]),
+    };
+    let mut near_tip_input: Vec<_> = targets
+        .iter()
+        .zip(0xc2_u8..)
+        .map(|(target, marker)| {
+            AuxDelivery::new(
+                EvidenceId::from_digest([marker; 32]),
+                target.hash,
+                near_tip_source,
+                near_tip_owner.into(),
+                zakura_header_chain::BodySizeHint::Unknown,
+                None,
+            )
+        })
+        .collect();
+    near_tip_input.push(AuxDelivery::new(
+        EvidenceId::from_digest([0xc8; 32]),
+        rooted_header.hash,
+        near_tip_source,
+        near_tip_owner.into(),
+        zakura_header_chain::BodySizeHint::Unknown,
+        Some(record(rooted_header.height, 0xc9)),
+    ));
+    retain_aux_deliveries_for_test(&runtime, &near_tip_input);
+
+    let repair = runtime
+        .reader()
+        .vct_repair_context(owner, targets[0].height)
+        .expect("the rootless range repair context is coherent")
+        .expect("the rootless selected range needs repair");
+    assert_eq!(
+        repair.selected_header_count(),
+        targets.len(),
+        "the range stops before the first rooted row"
+    );
+    assert_eq!(repair.request_target(), targets[2]);
+    assert_eq!(
+        runtime
+            .reader()
+            .vct_repair_context(owner, rooted_header.height)
+            .expect("the rooted repair context is coherent")
+            .expect("the rooted target remains repairable")
+            .selected_header_count(),
+        1,
+        "rooted input still constrains its replacement to one target"
+    );
+
+    let lease = runtime
+        .reader()
+        .validation_context(parent.hash)
+        .expect("the repair parent validation context is coherent")
+        .expect("the repair parent remains retained");
+    let rules =
+        HeaderRules::for_validation_lease(&lease).expect("the repair parent produces header rules");
+    let headers: Vec<_> = path[3..6]
+        .iter()
+        .map(|header| header.header.clone())
+        .collect();
+    let batch = zakura_header_chain::prepare_headers(
+        HeaderBatchInput::new(&headers),
+        parent,
+        &rules,
+        &SystemClock,
+    )
+    .expect("the selected range passes deterministic preparation");
+    let source = SourceId::from_digest([0xca; 32]);
+    let replacements = targets
+        .iter()
+        .zip(0xcb_u8..)
+        .map(|(target, marker)| {
+            AuxDelivery::new(
+                EvidenceId::from_digest([marker; 32]),
+                target.hash,
+                source,
+                owner.into(),
+                zakura_header_chain::BodySizeHint::Unknown,
+                Some(record(target.height, marker)),
+            )
+        })
+        .collect();
+    let context = TransitionContext {
+        config: &runtime.config,
+        clock: &SystemClock,
+        full_state_authority: None,
+        retention_references: &[],
+    };
+    assert!(matches!(
+        runtime
+            .apply(
+                TransitionRequest {
+                    expected_version: StateVersion::default(),
+                    event: TransitionEvent::InsertHeaders(Box::new(InsertHeaders {
+                        owner: owner.into(),
+                        source,
+                        parent_hash: parent.hash,
+                        target_tip_hash: targets[2].hash,
+                        completion: TargetCompletion::SelectedAuxiliaryRepair {
+                            common_ancestor: parent,
+                            selected_target: targets[2],
+                            episode: repair.episode,
+                        },
+                        batch,
+                        aux: replacements,
+                    })),
+                },
+                &context,
+            )
+            .expect("the rootless range repair applies"),
+        ApplyResult::Committed
+    ));
+    let rows = targets
+        .iter()
+        .map(|target| {
+            runtime
+                .store
+                .aux_deliveries(target.hash)
+                .expect("the repaired target rows are readable")
+        })
+        .collect();
+    let total = runtime
+        .store
+        .load_aux_deliveries()
+        .expect("the durable input rows are readable")
+        .len();
+    (rows, total)
+}
+
+#[test]
+fn repair_range_spans_rootless_near_tip_input() {
+    // Suppliers attach roots only to their finalized prefix, so headers received near the
+    // network tip keep rootless rows. When a later handoff moves above those headers, one repair
+    // must still cover them all instead of one header per round trip.
+    let (rows, _) = repair_rootless_near_tip_range(None);
+    for rows in rows {
+        assert_eq!(rows.len(), 2, "the repair adds a rooted row");
+        assert!(rows.iter().any(|row| row.tree_aux.is_some()));
+    }
+}
+
+#[test]
+fn saturated_rootless_range_repair_retains_every_root() {
+    // The four near-tip rows leave one free aggregate slot. The two lowest targets sit in the
+    // commit window, so their rows are protected, and the range admits three new roots by
+    // reclaiming the two rows above it. Aggregate pressure must evict those older rows, never a
+    // root that the range repair just supplied.
+    let (rows, total) = repair_rootless_near_tip_range(Some(5));
+    assert_eq!(total, 5, "the repair stays within the aggregate limit");
+    let repair_source = SourceId::from_digest([0xca; 32]);
+    for rows in &rows {
+        assert!(
+            rows.iter()
+                .any(|row| row.source == repair_source && row.tree_aux.is_some()),
+            "every target retains its new root"
+        );
+    }
+    assert_eq!(rows[2].len(), 1, "eviction removes the suffix rootless row");
 }
 
 #[test]
@@ -2153,6 +2421,164 @@ async fn retained_path_serves_a_bounded_finalized_range_below_the_header_frontie
             .expect("the unknown target lookup is coherent"),
         RetainedPathLeaseOutcome::TargetNotRetained
     ));
+}
+
+#[test]
+fn body_size_hints_by_hash_read_known_sizes_from_retained_deliveries() {
+    let (runtime, db, _genesis, path) = reconciled_store_with_finalized_prefix(5);
+    let parent = Frontier::new(path[2].height, path[2].hash);
+    let target = Frontier::new(path[3].height, path[3].hash);
+    let successor = Frontier::new(path[4].height, path[4].hash);
+    let snapshot = runtime.publisher().snapshot();
+    let owner = zakura_header_chain::BodyWorkAuthority::for_snapshot(&snapshot)
+        .bind(27, NonZeroU64::new(28).expect("twenty-eight is nonzero"));
+    let range = runtime
+        .reader()
+        .vct_repair_context(owner, target.height)
+        .expect("the range repair context is coherent")
+        .expect("the selected empty range needs repair");
+    let prefix = range
+        .bounded_prefix(1)
+        .expect("the one-header range prefix exists");
+    let lease = runtime
+        .reader()
+        .validation_context(parent.hash)
+        .expect("the repair parent validation context is coherent")
+        .expect("the repair parent remains retained");
+    let rules =
+        HeaderRules::for_validation_lease(&lease).expect("the repair parent produces header rules");
+    let batch = zakura_header_chain::prepare_headers(
+        HeaderBatchInput::new(std::slice::from_ref(&path[3].header)),
+        parent,
+        &rules,
+        &SystemClock,
+    )
+    .expect("the selected prefix passes deterministic preparation");
+    let source = SourceId::from_digest([0xc1; 32]);
+    let known_size = std::num::NonZeroU32::new(123_456).expect("the fixture size is nonzero");
+    let request = TransitionRequest {
+        expected_version: StateVersion::default(),
+        event: TransitionEvent::InsertHeaders(Box::new(InsertHeaders {
+            owner: owner.into(),
+            source,
+            parent_hash: parent.hash,
+            target_tip_hash: target.hash,
+            completion: TargetCompletion::SelectedAuxiliaryRepair {
+                common_ancestor: parent,
+                selected_target: target,
+                episode: prefix.episode,
+            },
+            batch,
+            aux: vec![AuxDelivery::new(
+                EvidenceId::from_digest([0xc2; 32]),
+                target.hash,
+                source,
+                owner.into(),
+                zakura_header_chain::BodySizeHint::Unknown,
+                Some(zakura_header_chain::TreeAuxRecordV1 {
+                    height: target.height,
+                    sapling_root: Default::default(),
+                    orchard_root: Default::default(),
+                    ironwood_root: Default::default(),
+                    sapling_tx_count: 1,
+                    orchard_tx_count: 0,
+                    ironwood_tx_count: 0,
+                    auth_data_root: [0xc3; 32].into(),
+                }),
+            )],
+        })),
+    };
+    let original_request = request.clone();
+    let context = TransitionContext {
+        config: &runtime.config,
+        clock: &SystemClock,
+        full_state_authority: None,
+        retention_references: &[],
+    };
+    assert!(matches!(
+        runtime
+            .apply(request, &context)
+            .expect("the one-header range prefix applies"),
+        ApplyResult::Committed
+    ));
+
+    let hints_by_hash = || {
+        runtime
+            .reader()
+            .body_size_hints_by_hash(&[parent.hash, target.hash, successor.hash])
+            .expect("the delivery hints read")
+    };
+    assert_eq!(hints_by_hash(), vec![None, None, None]);
+    assert!(runtime
+        .store
+        .scan_raw(HEADER_AUX_BODY_SIZE)
+        .unwrap()
+        .is_empty());
+    let replay = |request_id, marker, size| {
+        let view = runtime.publisher().view();
+        let mut replay = original_request.clone();
+        replay.expected_version = view.state_version;
+        let TransitionEvent::InsertHeaders(insert) = &mut replay.event else {
+            unreachable!()
+        };
+        let new_owner = HeaderWorkAuthority::for_target(&view.snapshot, target.hash)
+            .bind(27, NonZeroU64::new(request_id).unwrap());
+        insert.owner = new_owner.into();
+        insert.completion = TargetCompletion::TargetPrefix {
+            common_ancestor: parent,
+        };
+        insert.aux[0].owner = new_owner.into();
+        insert.aux[0].delivery_id = EvidenceId::from_digest([marker; 32]);
+        insert.aux[0].body_size = zakura_header_chain::BodySizeHint::new(size).unwrap();
+        replay
+    };
+    let before = runtime.publisher().view();
+    let filled = runtime
+        .apply(replay(29, 0xc4, known_size.get()), &context)
+        .unwrap();
+    assert!(matches!(filled, ApplyResult::Committed), "{filled:?}");
+    let after = runtime.publisher().view();
+    assert_eq!(after.header_generation, before.header_generation);
+    assert_eq!(after.body_work_epoch, before.body_work_epoch);
+    assert_eq!(
+        after.body_size_hint_revision,
+        before.body_size_hint_revision + 1
+    );
+    assert_eq!(
+        runtime.store.scan_raw(HEADER_AUX_DELIVERY).unwrap().len(),
+        1
+    );
+    assert_eq!(
+        runtime.store.scan_raw(HEADER_AUX_BODY_SIZE).unwrap().len(),
+        1
+    );
+    let persisted = runtime.store.untrusted_aux_deliveries(target.hash).unwrap();
+    assert_eq!(
+        persisted[0].delivery().body_size,
+        zakura_header_chain::BodySizeHint::Unknown
+    );
+    assert_eq!(hints_by_hash(), vec![None, Some(known_size), None]);
+
+    // A differing known hint is false, so it cannot replace the filled size.
+    let conflicting = runtime.apply(replay(30, 0xc5, 3_146), &context).unwrap();
+    assert!(
+        matches!(conflicting, ApplyResult::NoChange(_)),
+        "{conflicting:?}"
+    );
+    assert_eq!(
+        runtime.publisher().view().body_size_hint_revision,
+        after.body_size_hint_revision
+    );
+    let config = runtime.config.clone();
+    drop(runtime);
+    let (reopened, _) = HeaderChainStore::new(db).startup(&config).unwrap();
+    assert_eq!(
+        reopened
+            .reader()
+            .body_size_hints_by_hash(&[target.hash])
+            .unwrap(),
+        vec![Some(known_size)]
+    );
 }
 
 #[test]

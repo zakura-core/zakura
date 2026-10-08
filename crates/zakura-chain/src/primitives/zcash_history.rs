@@ -1,5 +1,4 @@
-//! Contains code that interfaces with the zcash_history crate from
-//! librustzcash.
+//! Adapts [`zakura_mmr_tree`] to Zakura chain types.
 
 // TODO: remove after this module gets to be used
 #![allow(missing_docs)]
@@ -8,8 +7,7 @@ mod tests;
 
 use std::{collections::BTreeMap, io, sync::Arc};
 
-use serde_big_array::BigArray;
-pub use zcash_history::{V1, V2, V3};
+pub use zakura_mmr_tree::{V1, V2, V3};
 
 use crate::{
     block::{Block, ChainHistoryMmrRootHash, Header, Height},
@@ -65,7 +63,7 @@ impl<'a> HistoryTreeBlockParts<'a> {
 }
 
 /// A trait to represent a version of `Tree`.
-pub trait Version: zcash_history::Version {
+pub trait Version: zakura_mmr_tree::Version {
     /// Convert a block into the NodeData for this version.
     ///
     /// # Panics
@@ -93,26 +91,26 @@ pub trait Version: zcash_history::Version {
         -> Self::NodeData;
 }
 
-/// A MMR Tree using zcash_history::Tree.
+/// An MMR tree using [`zakura_mmr_tree::Tree`].
 ///
 /// Currently it should not be used as a long-term data structure because it
 /// may grow without limits.
-pub struct Tree<V: zcash_history::Version> {
+pub struct Tree<V: zakura_mmr_tree::Version> {
     network: Network,
     network_upgrade: NetworkUpgrade,
-    inner: zcash_history::Tree<V>,
+    inner: zakura_mmr_tree::Tree<V>,
 }
 
 /// An encoded tree node data.
 pub struct NodeData {
-    inner: [u8; zcash_history::MAX_NODE_DATA_SIZE],
+    inner: [u8; zakura_mmr_tree::MAX_NODE_DATA_SIZE],
 }
 
-impl From<&zcash_history::NodeData> for NodeData {
+impl From<&zakura_mmr_tree::NodeData> for NodeData {
     /// Convert from librustzcash.
-    fn from(inner_node: &zcash_history::NodeData) -> Self {
+    fn from(inner_node: &zakura_mmr_tree::NodeData) -> Self {
         let mut node = NodeData {
-            inner: [0; zcash_history::MAX_NODE_DATA_SIZE],
+            inner: [0; zakura_mmr_tree::MAX_NODE_DATA_SIZE],
         };
         inner_node
             .write(&mut &mut node.inner[..])
@@ -126,15 +124,15 @@ impl From<&zcash_history::NodeData> for NodeData {
 /// Contains the node data and information about its position in the tree.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Entry {
-    #[serde(with = "BigArray")]
-    inner: [u8; zcash_history::MAX_ENTRY_SIZE],
+    #[serde(with = "crate::serialization::serde_adapters::bytes")]
+    inner: [u8; zakura_mmr_tree::MAX_ENTRY_SIZE],
 }
 
 impl Entry {
     /// Reconstructs an [`Entry`] from raw serialized bytes written by an earlier database format,
-    /// zero-padding or truncating to the current [`zcash_history::MAX_ENTRY_SIZE`].
+    /// zero-padding or truncating to the current [`zakura_mmr_tree::MAX_ENTRY_SIZE`].
     pub fn from_raw_bytes_padded(bytes: &[u8]) -> Self {
-        let mut inner = [0; zcash_history::MAX_ENTRY_SIZE];
+        let mut inner = [0; zakura_mmr_tree::MAX_ENTRY_SIZE];
         let len = bytes.len().min(inner.len());
         inner[..len].copy_from_slice(&bytes[..len]);
         Entry { inner }
@@ -168,9 +166,9 @@ impl Entry {
 
     /// Encode a version's `NodeData` leaf into an [`Entry`].
     fn from_node_data<V: Version>(node_data: V::NodeData) -> Self {
-        let inner_entry = zcash_history::Entry::<V>::new_leaf(node_data);
+        let inner_entry = zakura_mmr_tree::Entry::<V>::new_leaf(node_data);
         let mut entry = Entry {
-            inner: [0; zcash_history::MAX_ENTRY_SIZE],
+            inner: [0; zakura_mmr_tree::MAX_ENTRY_SIZE],
         };
         inner_entry
             .write(&mut &mut entry.inner[..])
@@ -207,15 +205,15 @@ impl<V: Version> Tree<V> {
         })?;
         let mut peaks_vec = Vec::new();
         for (idx, entry) in peaks {
-            let inner_entry = zcash_history::Entry::from_bytes(branch_id.into(), entry.inner)?;
+            let inner_entry = zakura_mmr_tree::Entry::from_bytes(branch_id.into(), entry.inner)?;
             peaks_vec.push((*idx, inner_entry));
         }
         let mut extra_vec = Vec::new();
         for (idx, entry) in extra {
-            let inner_entry = zcash_history::Entry::from_bytes(branch_id.into(), entry.inner)?;
+            let inner_entry = zakura_mmr_tree::Entry::from_bytes(branch_id.into(), entry.inner)?;
             extra_vec.push((*idx, inner_entry));
         }
-        let inner = zcash_history::Tree::new(length, peaks_vec, extra_vec);
+        let inner = zakura_mmr_tree::Tree::new(length, peaks_vec, extra_vec);
         Ok(Tree {
             network: network.clone(),
             network_upgrade,
@@ -305,7 +303,7 @@ impl<V: Version> Tree<V> {
         sapling_root: &sapling::tree::Root,
         orchard_root: &orchard::tree::Root,
         ironwood_root: &ironwood::tree::Root,
-    ) -> Result<Vec<Entry>, zcash_history::Error> {
+    ) -> Result<Vec<Entry>, zakura_mmr_tree::Error> {
         let height = block
             .coinbase_height()
             .expect("block must have coinbase height during contextual verification");
@@ -330,7 +328,7 @@ impl<V: Version> Tree<V> {
         let mut new_nodes = Vec::new();
         for entry_link in appended {
             let mut entry = Entry {
-                inner: [0; zcash_history::MAX_ENTRY_SIZE],
+                inner: [0; zakura_mmr_tree::MAX_ENTRY_SIZE],
             };
             self.inner
                 .resolve_link(entry_link)
@@ -352,7 +350,7 @@ impl<V: Version> Tree<V> {
     pub(crate) fn append_leaf_parts(
         &mut self,
         parts: HistoryTreeBlockParts<'_>,
-    ) -> Result<Vec<Entry>, zcash_history::Error> {
+    ) -> Result<Vec<Entry>, zakura_mmr_tree::Error> {
         let network_upgrade = NetworkUpgrade::current(&self.network, parts.height);
 
         assert!(
@@ -368,7 +366,7 @@ impl<V: Version> Tree<V> {
         let mut new_nodes = Vec::new();
         for entry_link in appended {
             let mut entry = Entry {
-                inner: [0; zcash_history::MAX_ENTRY_SIZE],
+                inner: [0; zakura_mmr_tree::MAX_ENTRY_SIZE],
             };
             self.inner
                 .resolve_link(entry_link)
@@ -389,7 +387,7 @@ impl<V: Version> Tree<V> {
     }
 }
 
-impl<V: zcash_history::Version> std::fmt::Debug for Tree<V> {
+impl<V: zakura_mmr_tree::Version> std::fmt::Debug for Tree<V> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Tree")
             .field("network", &self.network)
@@ -398,7 +396,7 @@ impl<V: zcash_history::Version> std::fmt::Debug for Tree<V> {
     }
 }
 
-impl Version for zcash_history::V1 {
+impl Version for zakura_mmr_tree::V1 {
     /// Build a V1::NodeData leaf from block parts.
     ///
     /// `sapling_root` is the root of the Sapling note commitment tree of the block.
@@ -425,7 +423,7 @@ impl Version for zcash_history::V1 {
             .difficulty_threshold
             .to_work()
             .expect("work must be valid during contextual verification");
-        let work = primitive_types::U256::from_big_endian(&work.as_u256().to_big_endian());
+        let work = zakura_mmr_tree::U256::from_big_endian(&work.as_u256().to_big_endian());
 
         match network_upgrade {
             NetworkUpgrade::Genesis
@@ -449,7 +447,7 @@ impl Version for zcash_history::V1 {
             NetworkUpgrade::ZFuture => {}
         };
 
-        zcash_history::NodeData {
+        zakura_mmr_tree::NodeData {
             consensus_branch_id: branch_id.into(),
             subtree_commitment: block_hash,
             start_time: time,

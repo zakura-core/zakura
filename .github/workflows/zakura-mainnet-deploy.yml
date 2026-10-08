@@ -14,7 +14,8 @@ name: Deploy Zakura mainnet fleet
 # state DB at /root/.cache/zebra. To avoid changing node identities or resyncing,
 # this deploy sets manage_config = false: it only swaps /usr/local/bin/zakurad and
 # restarts the existing `zakurad` service, leaving the config, unit, and cache
-# untouched. Rebuilding those configs into the deployer's managed model is
+# untouched. The archive publisher also installs its matching exporter and
+# verifies publication. Rebuilding configs into the deployer's managed model is
 # separate future work.
 #
 # After PR #21, hand configs should use network.p2p_stack (legacy|zakura|dual|
@@ -49,19 +50,217 @@ on:
         required: false
         type: boolean
         default: false
+      mac_operation:
+        description: "Operation for the existing zakura-mac-os verifier"
+        type: choice
+        options: [deploy, status, dashboard]
+        default: deploy
+      mac_candidate_run_id:
+        description: "Optional accepted candidate run; blank builds the requested ref"
+        type: string
+        default: ""
+      operation:
+        description: "deploy builds and deploys nodes; monitoring only stages compatibility monitoring (node=zakura-compat, ref=full tested SHA)"
+        type: choice
+        options: [deploy, monitoring]
+        default: deploy
+      monitoring_stage:
+        description: "Stage for operation=monitoring; run install, validate, cutover, soak, finalize in order"
+        type: choice
+        options: [status, install, validate, cutover, soak, slack-test, finalize, rollback]
+        default: status
 
 permissions:
   contents: read
 
 concurrency:
-  group: zakura-mainnet-deploy
+  group: ${{ inputs.node == 'zakura-mac-os' && inputs.mac_operation == 'status' && format('zakura-mac-status-{0}', github.run_id) || 'zakura-mainnet-deploy' }}
   cancel-in-progress: false
 
 jobs:
+  mac-source:
+    if: inputs.operation == 'deploy' && inputs.node == 'zakura-mac-os' && inputs.mac_operation == 'deploy' && (github.ref == 'refs/heads/main' || github.ref_name == vars.MAC_VERIFIER_DEPLOY_BRANCH)
+    runs-on: ubuntu-24.04
+    outputs:
+      sha: ${{ steps.source.outputs.sha }}
+      lock_sha256: ${{ steps.source.outputs.lock_sha256 }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Resolve requested Mac source
+        id: source
+        env:
+          REF: ${{ inputs.ref }}
+          NO_RESTART: ${{ inputs.no_restart }}
+          FORCE_REBUILD: ${{ inputs.force_rebuild }}
+          CANDIDATE_RUN: ${{ inputs.mac_candidate_run_id }}
+        run: |
+          set -euo pipefail
+          [[ "$REF" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*$ ]]
+          if [[ "$NO_RESTART" == true || ( "$FORCE_REBUILD" == true && -n "$CANDIDATE_RUN" ) ]]; then
+            echo "Mac deployment requires a restart; force_rebuild cannot reuse a candidate." >&2
+            exit 1
+          fi
+          git fetch --no-tags origin "$REF"
+          commit=$(git rev-parse 'FETCH_HEAD^{commit}')
+          echo "sha=$commit" >> "$GITHUB_OUTPUT"
+          git show "$commit:Cargo.lock" > "$RUNNER_TEMP/source.Cargo.lock"
+          echo "lock_sha256=$(sha256sum "$RUNNER_TEMP/source.Cargo.lock" | cut -d ' ' -f 1)" >> "$GITHUB_OUTPUT"
+
+  mac-build:
+    needs: mac-source
+    if: inputs.operation == 'deploy' && inputs.mac_candidate_run_id == ''
+    uses: ./.github/workflows/build-zakura-mac-cranelift.yml
+    with:
+      ref: ${{ needs.mac-source.outputs.sha }}
+
+  zakura-mac-cranelift:
+    needs: [mac-source, mac-build]
+    if: ${{ !cancelled() && inputs.operation == 'deploy' && inputs.node == 'zakura-mac-os' && (github.ref == 'refs/heads/main' || github.ref_name == vars.MAC_VERIFIER_DEPLOY_BRANCH) && (inputs.mac_operation != 'deploy' || (needs.mac-source.result == 'success' && (needs.mac-build.result == 'success' || (inputs.mac_candidate_run_id != '' && needs.mac-build.result == 'skipped')))) }}
+    runs-on: ubuntu-24.04
+    # Existing protected environment and encrypted secret IDs are compatibility bindings.
+    environment: mac-verifier-private
+    timeout-minutes: 180
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Download candidate built for this deployment
+        if: inputs.mac_operation == 'deploy' && inputs.mac_candidate_run_id == ''
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: zakura-mac-cranelift-candidate-${{ github.sha }}
+          path: ${{ runner.temp }}/mac-candidate
+      - name: Operate private zakura-mac-cranelift
+        env:
+          MAC_OPERATION: ${{ inputs.mac_operation }}
+          MAC_SOURCE_SHA: ${{ needs.mac-source.outputs.sha }}
+          MAC_SOURCE_LOCK_SHA256: ${{ needs.mac-source.outputs.lock_sha256 }}
+          MAC_CANDIDATE_DIR: ${{ runner.temp }}/mac-candidate
+          MAC_CANDIDATE_RUN_ID: ${{ inputs.mac_candidate_run_id }}
+          ZAKURA_MAC_CRANELIFT_DEPLOY_BRANCH: ${{ vars.MAC_VERIFIER_DEPLOY_BRANCH }}
+          GH_TOKEN: ${{ github.token }}
+          NO_RESTART: ${{ inputs.no_restart }}
+          FORCE_REBUILD: ${{ inputs.force_rebuild }}
+          ZAKURA_MAC_CRANELIFT_HOST: ${{ secrets.MAC_VERIFIER_HOST }}
+          ZAKURA_MAC_CRANELIFT_USER: ${{ secrets.MAC_VERIFIER_USER }}
+          ZAKURA_MAC_CRANELIFT_SSH_PORT: ${{ secrets.MAC_VERIFIER_SSH_PORT }}
+          ZAKURA_MAC_CRANELIFT_SSH_KEY: ${{ secrets.MAC_VERIFIER_SSH_KEY }}
+          ZAKURA_MAC_CRANELIFT_KNOWN_HOSTS: ${{ secrets.MAC_VERIFIER_KNOWN_HOSTS }}
+          ZAKURA_MAC_CRANELIFT_REFERENCE_HOST: ${{ secrets.MAC_VERIFIER_REFERENCE_HOST }}
+          ZAKURA_MAC_CRANELIFT_REFERENCE_USER: ${{ secrets.MAC_VERIFIER_REFERENCE_USER }}
+          ZAKURA_MAC_CRANELIFT_REFERENCE_SSH_KEY: ${{ secrets.MAC_VERIFIER_REFERENCE_SSH_KEY }}
+          ZAKURA_MAC_CRANELIFT_REFERENCE_KNOWN_HOSTS: ${{ secrets.MAC_VERIFIER_REFERENCE_KNOWN_HOSTS }}
+          ZAKURA_MAC_CRANELIFT_ID: ${{ secrets.MAC_VERIFIER_ID }}
+        run: python3 deploy/deployer/zakura-mac-cranelift-manager.py "$MAC_OPERATION"
+
+  # Compatibility monitoring only: installs the same commit's monitoring package on
+  # zakura-compat and us-east-0 and drives its staged cutover. It never builds,
+  # installs or restarts zakurad/zcashd, and never touches the dashboard or gateway.
+  monitoring:
+    if: inputs.operation == 'monitoring'
+    name: "Zakura monitoring ${{ inputs.monitoring_stage }} ${{ inputs.ref }}"
+    runs-on: [self-hosted, "${{ vars.ZAKURA_MAINNET_RUNNER_LABEL || 'zakura-mainnet-deployer' }}"]
+    timeout-minutes: 90
+    environment: zakura-mainnet
+    steps:
+      - name: Validate monitoring inputs
+        env:
+          REF: ${{ inputs.ref }}
+          NODE: ${{ inputs.node }}
+          NO_RESTART: ${{ inputs.no_restart }}
+          FORCE_REBUILD: ${{ inputs.force_rebuild }}
+          VALIDATE_START: ${{ inputs.validate_start }}
+        run: |
+          set -euo pipefail
+          if [ "${NODE}" != "zakura-compat" ]; then
+            echo "operation=monitoring requires node=zakura-compat." >&2
+            exit 1
+          fi
+          if ! [[ "${REF}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "operation=monitoring requires ref to be the full tested commit SHA." >&2
+            exit 1
+          fi
+          if [ "${NO_RESTART}" = "true" ] || [ "${FORCE_REBUILD}" = "true" ] || [ "${VALIDATE_START}" = "true" ]; then
+            echo "Node deploy options do not apply to operation=monitoring." >&2
+            exit 1
+          fi
+
+      - name: Checkout the tested commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.ref }}
+
+      - name: Confirm the checked-out commit
+        env:
+          REF: ${{ inputs.ref }}
+        run: test "$(git rev-parse HEAD)" = "${REF}"
+
+      - name: Start SSH agent when deploy key is configured
+        env:
+          ZAKURA_MAINNET_DEPLOY_SSH_KEY: ${{ secrets.ZAKURA_MAINNET_DEPLOY_SSH_KEY }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${ZAKURA_MAINNET_DEPLOY_SSH_KEY}" ]; then
+            echo "ZAKURA_MAINNET_DEPLOY_SSH_KEY is not set; using the runner's existing SSH identity."
+            exit 0
+          fi
+
+          ssh_agent_sock="$RUNNER_TEMP/ssh-agent.sock"
+          ssh-agent -a "$ssh_agent_sock" > "$RUNNER_TEMP/ssh-agent.env"
+          SSH_AUTH_SOCK="$ssh_agent_sock" ssh-add - <<< "$ZAKURA_MAINNET_DEPLOY_SSH_KEY"
+          echo "SSH_AUTH_SOCK=$ssh_agent_sock" >> "$GITHUB_ENV"
+
+      - name: Load the independently verified compatibility host key
+        env:
+          COMPAT_KNOWN_HOSTS: ${{ secrets.ZAKURA_COMPAT_SSH_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          if [ -z "$COMPAT_KNOWN_HOSTS" ]; then
+            echo "Set repository Actions secret ZAKURA_COMPAT_SSH_KNOWN_HOSTS from an independently verified host key."
+            exit 1
+          fi
+          umask 077
+          printf '%s\n' "$COMPAT_KNOWN_HOSTS" > "$RUNNER_TEMP/monitoring_known_hosts"
+          ssh-keygen -F 159.203.113.196 -f "$RUNNER_TEMP/monitoring_known_hosts" > /dev/null
+          ssh-keygen -l -f "$RUNNER_TEMP/monitoring_known_hosts" > /dev/null
+
+      - name: Run monitoring stage
+        env:
+          REF: ${{ inputs.ref }}
+          STAGE: ${{ inputs.monitoring_stage }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/monitoring"
+          python3 deploy/runner/zakura-monitoring-deploy.py "${STAGE}" \
+            --sha "${REF}" \
+            --known-hosts "$RUNNER_TEMP/monitoring_known_hosts" \
+            --work "$RUNNER_TEMP/monitoring" \
+            --evidence "$RUNNER_TEMP/monitoring-evidence.json" \
+            --run-url "${RUN_URL}"
+
+      - name: Upload monitoring evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a #v7.0.1
+        with:
+          name: zakura-monitoring-${{ inputs.monitoring_stage }}-${{ github.run_id }}
+          path: ${{ runner.temp }}/monitoring-evidence.json
+          if-no-files-found: ignore
+          retention-days: 90
+
   deploy:
+    if: inputs.node != 'zakura-mac-os' && inputs.operation != 'monitoring'
     name: "Deploy Zakura mainnet ${{ inputs.ref }}"
     runs-on: [self-hosted, "${{ vars.ZAKURA_MAINNET_RUNNER_LABEL || 'zakura-mainnet-deployer' }}"]
-    timeout-minutes: 180
+    timeout-minutes: 600
     environment: zakura-mainnet
 
     # Persist Cargo build artifacts across runs, outside the checked-out workspace
@@ -99,27 +298,28 @@ jobs:
             exit 1
           fi
 
-      - name: Checkout deploy ref
+      - name: Checkout deployment tooling
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
         with:
           persist-credentials: false
-          ref: ${{ inputs.ref }}
+          ref: ${{ github.sha }}
+          fetch-depth: 0
 
-      - name: Verify deployer supports binary-only mode
-        # The checked-out deploy.py comes from `inputs.ref`; this fleet's config
-        # sets `manage_config = false`. If the checked-out deploy.py predates that
-        # support it would silently run a destructive config-managed deploy, so
-        # fail fast instead. deploy.py also now rejects unknown config keys.
+      # Keep orchestration from this workflow revision even when deploying an old
+      # release. Only the binaries come from the requested ref.
+      - name: Resolve deployment commit
         env:
           REF: ${{ inputs.ref }}
+          NODE: ${{ inputs.node }}
+          NO_RESTART: ${{ inputs.no_restart }}
         run: |
           set -euo pipefail
-          if ! grep -q 'manage_config' deploy/deployer/deploy.py ||
-             ! grep -q 'container_name' deploy/deployer/deploy.py; then
-            echo "::error::deploy.py at ref '${REF}' lacks binary-only Docker support." \
-                 "Deploy from a ref whose deploy.py supports manage_config and container_name."
+          if [ "$NO_RESTART" = true ] && { [ -z "$NODE" ] || [ "$NODE" = archive-vct-off ]; }; then
+            echo "Archive publisher deployments require restarting the matched node/exporter pair." >&2
             exit 1
           fi
+          git fetch --no-tags origin "$REF"
+          echo "DEPLOY_COMMIT=$(git rev-parse 'FETCH_HEAD^{commit}')" >> "$GITHUB_ENV"
 
       - name: Set up Rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
@@ -187,6 +387,7 @@ jobs:
         run: |
           set -euo pipefail
 
+          REF="$DEPLOY_COMMIT"
           cat > nodes.ci.toml <<EOF
           [defaults]
           # Binary-only: swap the binary and restart the existing service; leave
@@ -285,6 +486,7 @@ jobs:
           # rewritten by a deploy; that setting is the whole point of the node.
           [[nodes]]
           name       = "archive-vct-off"
+          release_state_publisher = true
           ssh_string = "root@104.131.174.28"
           commit     = "${REF}"
           rpc_listen_addr = "127.0.0.1:8232"
@@ -327,7 +529,9 @@ jobs:
 
       - name: Suppress compatibility watchdog alerts during deploy
         # This stays in workflow-owned code so rollback refs whose deployer
-        # predates suppression are still covered.
+        # predates suppression are still covered. The compatibility checker reports
+        # this marker with every probe and the fleet watchdog's compatibility lane
+        # honors it for at most 20 minutes; no service restart is needed.
         if: ${{ !inputs.no_restart && (inputs.node == '' || inputs.node == 'zakura-compat') }}
         run: |
           set -euo pipefail
@@ -353,9 +557,6 @@ jobs:
           chmod 644 "$marker_tmp"
           mv -f "$marker_tmp" "$marker"
           trap - EXIT
-          if systemctl is-active --quiet zakura-watchdog; then
-            systemctl restart zakura-watchdog
-          fi
           REMOTE
             echo "::warning::failed to suppress compatibility watchdog alerts; continuing deploy" >&2
           fi
@@ -398,7 +599,7 @@ jobs:
           python3 deploy.py status "${args[@]}"
 
       - name: Validate deployed node startup
-        if: ${{ inputs.validate_start && inputs.node != '' && !inputs.no_restart }}
+        if: ${{ inputs.validate_start && inputs.node != '' && inputs.node != 'archive-vct-off' && !inputs.no_restart }}
         env:
           NODE: ${{ inputs.node }}
         run: |
@@ -441,7 +642,7 @@ jobs:
           PY
           )"
 
-          expected_commit="$(git rev-parse HEAD)"
+          expected_commit="$DEPLOY_COMMIT"
           ssh -o BatchMode=yes -o ConnectTimeout=20 -- "$SSH_TARGET" \
             "SERVICE_NAME='$SERVICE_NAME' BIN_PATH='$BIN_PATH' \
              RPC_LISTEN_ADDR='$RPC_LISTEN_ADDR' RPC_AUTH='$RPC_AUTH' \
@@ -613,7 +814,9 @@ jobs:
             }
           ' "$RUNNER_TEMP/dashboard.nodes.toml" > "$RUNNER_TEMP/dashboard.nodes.toml.tmp"
           mv "$RUNNER_TEMP/dashboard.nodes.toml.tmp" "$RUNNER_TEMP/dashboard.nodes.toml"
-          cat >> "$RUNNER_TEMP/dashboard.nodes.toml" <<'EOF'
+          # The managed install caches each sidecar release under its tag.
+          zcashd_compat_tag="$(python3 -c 'import json; print(json.load(open("crates/zakurad/zcashd-compat-manifest.json"))["release_tag"])')"
+          cat >> "$RUNNER_TEMP/dashboard.nodes.toml" <<EOF
 
           [[nodes]]
           name       = "zcashd-compat"
@@ -621,8 +824,8 @@ jobs:
           probe_kind = "zcashd"
           service_name = ""
           metrics_endpoint = ""
-          # Managed/path install from zcashd-compat-manifest.json (v1.0.0-compat-rc0).
-          bin_path = "/mnt/data/import-zebra/zcashd-compat/bin/v1.0.0-compat-rc0/x86_64-pc-linux-gnu/zcashd"
+          # Managed install of the release zcashd-compat-manifest.json pins.
+          bin_path = "/mnt/data/import-zebra/zcashd-compat/bin/${zcashd_compat_tag}/x86_64-pc-linux-gnu/zcashd"
           log_file = ""
           rpc_listen_addr = "[::1]:8232"
           rpc_auth = "cookie"
@@ -692,37 +895,35 @@ jobs:
         if: always()
         env:
           SLACK_WEB_HOOK: ${{ secrets.SLACK_WEB_HOOK }}
+          SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
 
-          watchdog_dir="/opt/zakura-fleet-watchdog"
-          sudo install -d -m 755 "$watchdog_dir"
           sudo install -d -m 755 /var/lib/zakura-fleet-watchdog
           sudo install -d -m 755 /etc/zakura-fleet-watchdog
-          sudo install -m 755 deploy/runner/zakura-cluster-watchdog.py "$watchdog_dir/zakura-cluster-watchdog.py"
-          sudo install -m 644 deploy/runner/fleet-watchdog.toml "$watchdog_dir/fleets.toml"
-          sudo install -m 644 deploy/runner/zakura-fleet-watchdog.service /etc/systemd/system/zakura-fleet-watchdog.service
-
-          # Incoming webhook for #zakura-alerts.
-          tmp_env="$(mktemp)"
-          if [ -n "${SLACK_WEB_HOOK}" ]; then
-            printf 'SLACK_WEB_HOOK=%s\n' "${SLACK_WEB_HOOK}" > "$tmp_env"
-          elif sudo test -f /etc/zakura-fleet-watchdog/env; then
-            # Keep an existing webhook env across deploys that omit the secret.
-            sudo grep -E '^(SLACK_WEB_HOOK|SLACK_WEBHOOK_URL|SLACK_WEBHOOK)=' \
-              /etc/zakura-fleet-watchdog/env | tee "$tmp_env" >/dev/null || : > "$tmp_env"
-          else
-            : > "$tmp_env"
+          comparison_dir="/opt/zakura-mac-verifier"
+          sudo install -d -m 755 "$comparison_dir"
+          sudo install -m 644 deploy/zakura-mac-cranelift/common.py "$comparison_dir/common.py"
+          sudo install -m 755 deploy/zakura-mac-cranelift/comparison.py "$comparison_dir/comparison.py"
+          if id zakura-mac-verifier >/dev/null 2>&1; then
+            sudo install -d -m 755 -o zakura-mac-verifier -g "$(id -gn zakura-mac-verifier)" /var/lib/zakura-mac-cranelift-public
           fi
-          if ! grep -qE '^(SLACK_WEB_HOOK|SLACK_WEBHOOK_URL|SLACK_WEBHOOK)=' "$tmp_env"; then
+
+          # Same installer as operation=monitoring: a versioned release of the watchdog
+          # and its zakura_monitoring package, activated through symlinks. The live
+          # unit and its drop-ins, the state file and every non-Slack env setting are
+          # preserved; the webhook (env mode 600) is replaced only when the secret is set.
+          # Once compatibility monitoring is enabled this also refreshes the checker on
+          # zakura-compat. Only zakura-fleet-watchdog restarts.
+          mkdir -p "$RUNNER_TEMP/monitoring"
+          python3 deploy/runner/zakura-monitoring-deploy.py fleet-deploy \
+            --sha "${SHA}" \
+            --known-hosts "$HOME/.ssh/known_hosts" \
+            --deploy-config deploy/deployer/nodes.ci.toml \
+            --work "$RUNNER_TEMP/monitoring"
+          if ! sudo grep -qE '^(SLACK_WEB_HOOK|SLACK_WEBHOOK_URL|SLACK_WEBHOOK)=' /etc/zakura-fleet-watchdog/env; then
             echo "::warning::SLACK_WEB_HOOK is not set; fleet watchdog cannot post to Slack"
           fi
-          sudo install -m 600 "$tmp_env" /etc/zakura-fleet-watchdog/env
-          rm -f "$tmp_env"
-
-          sudo systemctl daemon-reload
-          sudo systemctl enable zakura-fleet-watchdog.service
-          sudo systemctl restart zakura-fleet-watchdog.service
           sudo systemctl --no-pager --full status zakura-fleet-watchdog.service || true
 
       - name: Fetch recent logs on failure

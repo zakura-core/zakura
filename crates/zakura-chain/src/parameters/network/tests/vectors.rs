@@ -165,9 +165,7 @@ fn nu6_3_public_consensus_boundary_matches_librustzcash() {
     }
 }
 
-/// Pins the NU7 consensus branch ID to ZIP 259 and librustzcash's consensus parameters.
-///
-/// NU7 has a consensus branch ID but no activation height on the public networks.
+/// Pins the NU7 consensus branch ID to ZIP 259 and Zakura Common's parameters.
 #[test]
 fn nu7_branch_id_matches_zip_259_and_librustzcash() {
     assert_eq!(
@@ -191,23 +189,87 @@ fn nu7_branch_id_matches_zip_259_and_librustzcash() {
             .expect("Zakura's NU7 branch ID is known to librustzcash"),
         zp_consensus::BranchId::Nu7,
     );
+}
 
-    for (network, zp_network) in [
-        (Network::Mainnet, zp_consensus::Network::MainNetwork),
-        (
-            Network::new_default_testnet(),
-            zp_consensus::Network::TestNetwork,
-        ),
+/// Mainnet and default Regtest keep NU7 unscheduled.
+#[test]
+fn nu7_remains_unscheduled_on_mainnet_and_regtest() {
+    assert_eq!(
+        zp_consensus::MAIN_NETWORK.activation_height(zp_consensus::NetworkUpgrade::Nu7),
+        None,
+    );
+    for network in [
+        Network::Mainnet,
+        Network::new_regtest(RegtestParameters::default()),
+    ] {
+        assert_eq!(NetworkUpgrade::Nu7.activation_height(&network), None);
+        assert!(!NetworkUpgrade::is_nu7_active(&network, Height::MAX));
+    }
+}
+
+/// Default Testnet selects NU7 and its timing rules at Common's activation height.
+#[test]
+fn nu7_default_testnet_activation_matches_common() {
+    let activation_height = zp_consensus::TEST_NETWORK
+        .activation_height(zp_consensus::NetworkUpgrade::Nu7)
+        .expect("Common schedules NU7 on Testnet");
+    let activation_height = Height(u32::from(activation_height));
+    assert_eq!(activation_height, Height(4_465_026));
+
+    for network in [
+        Network::new_default_testnet(),
+        testnet::Parameters::build()
+            .to_network()
+            .expect("default Testnet parameters are valid"),
     ] {
         assert_eq!(
             NetworkUpgrade::Nu7.activation_height(&network),
-            None,
-            "NU7 is unscheduled on the public networks",
+            Some(activation_height),
         );
+        assert!(NetworkUpgrade::is_activation_height(
+            &network,
+            activation_height
+        ));
+        for (height, upgrade) in [
+            (
+                activation_height.previous().expect("NU7 is not genesis"),
+                NetworkUpgrade::Nu6_3,
+            ),
+            (activation_height, NetworkUpgrade::Nu7),
+            (
+                activation_height
+                    .next()
+                    .expect("NU7 is below the maximum height"),
+                NetworkUpgrade::Nu7,
+            ),
+        ] {
+            assert_eq!(NetworkUpgrade::current(&network, height), upgrade);
+            assert_eq!(
+                ConsensusBranchId::current(&network, height),
+                upgrade.branch_id()
+            );
+            assert_eq!(
+                NetworkUpgrade::is_nu7_active(&network, height),
+                upgrade == NetworkUpgrade::Nu7,
+            );
+            assert_eq!(
+                NetworkUpgrade::target_spacing_for_height(&network, height),
+                upgrade.target_spacing()
+            );
+            assert_eq!(
+                zp_consensus::BranchId::for_height(&network, height.0.into()),
+                zp_consensus::BranchId::for_height(&zp_consensus::TEST_NETWORK, height.0.into()),
+            );
+            assert_eq!(
+                NetworkUpgrade::minimum_difficulty_spacing_for_height(&network, height)
+                    .expect("the Testnet minimum-difficulty rule is active by NU7")
+                    .num_seconds(),
+                450,
+            );
+        }
         assert_eq!(
-            zp_network.activation_height(zp_consensus::NetworkUpgrade::Nu7),
-            None,
-            "librustzcash leaves NU7 unscheduled on the public networks",
+            NetworkUpgrade::target_spacing_for_height(&network, activation_height).num_seconds(),
+            25,
         );
     }
 }
@@ -251,6 +313,46 @@ fn nu6_3_keeps_post_blossom_timing_rules() {
         .num_seconds(),
         6 * 75,
     );
+}
+
+/// Testnet keeps the historical gap until its configured NU7 activation, then
+/// requires 18 target spacings before minimum difficulty applies.
+#[test]
+fn nu7_testnet_minimum_difficulty_gap_starts_at_activation() {
+    const NU7: u32 = 400_000;
+    let network = Network::new_regtest(
+        ConfiguredActivationHeights {
+            nu7: Some(NU7),
+            ..Default::default()
+        }
+        .into(),
+    );
+    let previous_time =
+        chrono::DateTime::from_timestamp(2_000_000_000, 0).expect("the test timestamp is in range");
+
+    for (height, expected_gap) in [(NU7 - 1, 6 * 75), (NU7, 18 * 25), (NU7 + 1, 18 * 25)] {
+        let height = Height(height);
+        assert_eq!(
+            NetworkUpgrade::minimum_difficulty_spacing_for_height(&network, height)
+                .expect("the testnet rule is active at the test height")
+                .num_seconds(),
+            expected_gap,
+        );
+        for (seconds, expected_minimum_difficulty) in
+            [(expected_gap, false), (expected_gap + 1, true)]
+        {
+            assert_eq!(
+                NetworkUpgrade::is_testnet_min_difficulty_block(
+                    &network,
+                    height,
+                    previous_time + chrono::Duration::seconds(seconds),
+                    previous_time,
+                ),
+                expected_minimum_difficulty,
+                "unexpected minimum difficulty at height {height:?} and gap {seconds}",
+            );
+        }
+    }
 }
 
 /// Pins the BIP-70 network names, which appear in payment URIs and RPC
@@ -666,7 +768,7 @@ fn check_configured_funding_stream_constraints() {
     let configured_funding_streams = [
         Default::default(),
         ConfiguredFundingStreams {
-            height_range: Some(Height(2_000_000)..Height(2_200_000)),
+            height_range: Some(Height(4_000_000)..Height(4_200_000)),
             ..Default::default()
         },
         ConfiguredFundingStreams {

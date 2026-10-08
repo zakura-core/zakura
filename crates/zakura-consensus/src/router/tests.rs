@@ -367,7 +367,6 @@ async fn verify_checkpoint_test() -> Result<(), Report> {
 /// Test that checkpoint verifies work.
 ///
 /// Also tests the `chain::init` function.
-#[spandoc::spandoc]
 async fn verify_checkpoint(config: Config) -> Result<(), Report> {
     let _init_guard = zakura_test::init();
 
@@ -403,7 +402,6 @@ async fn verify_fail_no_coinbase_test() -> Result<(), Report> {
 ///
 /// BlockVerifierRouter uses the block height to decide between the CheckpointVerifier
 /// and SemanticBlockVerifier. This is the error case, where there is no height.
-#[spandoc::spandoc]
 async fn verify_fail_no_coinbase() -> Result<(), Report> {
     let _init_guard = zakura_test::init();
 
@@ -428,7 +426,6 @@ async fn round_trip_checkpoint_test() -> Result<(), Report> {
 }
 
 /// Test that state updates work
-#[spandoc::spandoc]
 async fn round_trip_checkpoint() -> Result<(), Report> {
     let _init_guard = zakura_test::init();
 
@@ -453,7 +450,6 @@ async fn verify_fail_add_block_checkpoint_test() -> Result<(), Report> {
 }
 
 /// Test that the state rejects duplicate block adds
-#[spandoc::spandoc]
 async fn verify_fail_add_block_checkpoint() -> Result<(), Report> {
     let _init_guard = zakura_test::init();
 
@@ -582,7 +578,6 @@ async fn semantic_child_cannot_end_checkpoint_sync_early() {
         let request = if mined {
             Request::CommitMined {
                 block: candidate,
-                work_id: None,
                 admission: zs::BlockAdmission::pending(),
             }
         } else {

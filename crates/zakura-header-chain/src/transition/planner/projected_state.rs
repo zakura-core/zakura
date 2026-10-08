@@ -3,7 +3,12 @@
 use super::{
     InvalidTransitionEvidence, PlannerCoherenceViolation, ProjectionKind, TransitionFailure,
 };
-use std::{borrow::Cow, collections::HashSet, sync::Arc};
+use std::{
+    borrow::Cow,
+    cmp::Reverse,
+    collections::{BTreeSet, HashMap, HashSet},
+    sync::Arc,
+};
 
 use zakura_chain::block;
 
@@ -20,6 +25,7 @@ pub(super) struct ProjectedTransitionState<'a> {
     graph: GraphOverlay<'a>,
     verified: Cow<'a, [Frontier]>,
     aux_changes: Vec<AuxDelta>,
+    repair_deliveries: HashSet<EvidenceId>,
     verified_selection_dirty: bool,
 }
 
@@ -30,6 +36,7 @@ impl<'a> ProjectedTransitionState<'a> {
             graph: GraphOverlay::new(engine.graph()),
             verified: Cow::Borrowed(engine.verified_projection()),
             aux_changes: Vec::new(),
+            repair_deliveries: HashSet::new(),
             verified_selection_dirty: false,
         }
     }
@@ -114,16 +121,90 @@ impl<'a> ProjectedTransitionState<'a> {
     pub(super) fn record_aux_delivery(
         &mut self,
         delivery: crate::AuxDelivery,
-    ) -> Result<(), TransitionFailure> {
+        selected_repair: bool,
+    ) -> Result<usize, TransitionFailure> {
         self.graph
             .edit_record_auxiliary_evidence_delivery(delivery.header_hash, delivery.delivery_id)?;
-        self.aux_changes.push(AuxDelta::Put(Box::new(delivery)));
-        Ok(())
+        if selected_repair {
+            self.repair_deliveries.insert(delivery.delivery_id);
+        }
+        Ok(self.update_aux_delivery(delivery))
     }
 
-    /// Stage an updated auxiliary delivery row.
-    pub(super) fn update_aux_delivery(&mut self, delivery: crate::AuxDelivery) {
+    /// Stage an updated auxiliary delivery row and return its batch-local index.
+    pub(super) fn update_aux_delivery(&mut self, delivery: crate::AuxDelivery) -> usize {
+        let index = self.aux_changes.len();
         self.aux_changes.push(AuxDelta::Put(Box::new(delivery)));
+        index
+    }
+
+    /// Read a staged row while header admission coalesces semantic duplicates.
+    pub(super) fn staged_aux_delivery(&self, index: usize) -> crate::AuxDelivery {
+        let AuxDelta::Put(delivery) = &self.aux_changes[index] else {
+            unreachable!("admission indices refer to staged delivery puts");
+        };
+        **delivery
+    }
+
+    /// Replace a staged correction without adding a second write for its evidence ID.
+    pub(super) fn replace_staged_aux_delivery(
+        &mut self,
+        index: usize,
+        delivery: crate::AuxDelivery,
+    ) {
+        self.aux_changes[index] = AuxDelta::Put(Box::new(delivery));
+    }
+
+    /// Replace non-authoritative input when its retained header's bucket is full.
+    ///
+    /// Returns false when the bucket stays full. The caller then drops the new input and still
+    /// admits its header, because auxiliary input is advisory.
+    pub(super) fn make_aux_delivery_room(
+        &mut self,
+        engine: &HeaderChainEngine,
+        hash: block::Hash,
+        limits: EngineLimits,
+        selected_repair: bool,
+        rooted: bool,
+    ) -> Result<bool, TransitionFailure> {
+        let node = self
+            .graph
+            .view_header_node(hash)
+            .ok_or(GraphError::UnknownHeaderNode(hash))?;
+        if node.aux_delivery_ids.len() < limits.max_aux_deliveries_per_header.get() {
+            return Ok(true);
+        }
+        // Input retention grants no header or root authority. A selected repair may
+        // replace an unchecked candidate, including recovered rows whose outcome claims
+        // recovery discarded. Ordinary delivery cannot displace unchecked candidates.
+        let Some(replaceable) = engine
+            .aux_deliveries(hash)
+            .iter()
+            .filter(|delivery| {
+                delivery.is_rejected()
+                    || delivery.is_disputed()
+                    || (selected_repair && delivery.is_unauthenticated())
+            })
+            // A size hint cannot replace a usable root candidate, including disputed roots.
+            .filter(|delivery| rooted || delivery.tree_aux.is_none() || delivery.is_rejected())
+            .filter(|delivery| node.aux_delivery_ids.contains(&delivery.delivery_id))
+            .min_by_key(|delivery| {
+                (
+                    delivery.is_unauthenticated(),
+                    !delivery.is_rejected(),
+                    delivery.delivery_id,
+                )
+            })
+        else {
+            return Ok(false);
+        };
+        self.graph
+            .remove_auxiliary_evidence_delivery(hash, replaceable.delivery_id)?;
+        self.aux_changes.push(AuxDelta::Delete {
+            header_hash: hash,
+            delivery_id: replaceable.delivery_id,
+        });
+        Ok(true)
     }
 
     /// Add an operator invalidation and dirty verified selection when it changes state.
@@ -185,9 +266,10 @@ impl<'a> ProjectedTransitionState<'a> {
         self.verified = Cow::Owned(vec![self.graph.view_finalized_frontier()]);
     }
 
-    /// Enforce retention against the projected graph.
+    /// Enforce retention against the projected graph, then the aggregate auxiliary limit.
     pub(super) fn enforce_retention(
         &mut self,
+        engine: &HeaderChainEngine,
         header_best: Frontier,
         retention_references: impl IntoIterator<Item = zakura_chain::block::Hash>,
         limits: EngineLimits,
@@ -197,13 +279,182 @@ impl<'a> ProjectedTransitionState<'a> {
             .last()
             .copied()
             .unwrap_or_else(|| self.graph.view_finalized_frontier());
-        Ok(super::retention::enforce_retention(
+        let plan = super::retention::enforce_retention(
             &mut self.graph,
             header_best,
             verified_best,
             retention_references,
             limits,
-        )?)
+        )?;
+        if !plan.admission_refused {
+            self.evict_auxiliary_input(engine, header_best, limits)?;
+        }
+        Ok(plan)
+    }
+
+    /// Count auxiliary rows indexed by retained headers after this transition's edits.
+    fn retained_aux_delivery_count(&self, engine: &HeaderChainEngine) -> usize {
+        let delta = self.graph.delta();
+        let removed_with_headers = delta
+            .deleted_header_hashes()
+            .iter()
+            .map(|hash| engine.aux_deliveries(*hash).len())
+            .sum::<usize>();
+        let mut retained = engine
+            .aux_delivery_count()
+            .saturating_sub(removed_with_headers);
+        for change in &self.aux_changes {
+            match change {
+                AuxDelta::Put(delivery)
+                    if engine.aux_delivery(delivery.delivery_id).is_none()
+                        && self
+                            .graph
+                            .view_header_node(delivery.header_hash)
+                            .is_some_and(|node| {
+                                node.aux_delivery_ids.contains(&delivery.delivery_id)
+                            }) =>
+                {
+                    retained = retained.saturating_add(1);
+                }
+                AuxDelta::Delete { header_hash, .. }
+                    if self.graph.view_header_node(*header_hash).is_some() =>
+                {
+                    retained = retained.saturating_sub(1);
+                }
+                _ => {}
+            }
+        }
+        retained
+    }
+
+    /// Evict the lowest-priority auxiliary input until the aggregate limit holds.
+    ///
+    /// Auxiliary input is advisory, so aggregate pressure removes input rows and never headers.
+    /// Eviction never removes authenticated input or input for the finalized header and its two
+    /// selected successors, which the next commit needs. Among the remaining rows, it removes
+    /// input off the selected path first. It then takes one row at a time from the fullest
+    /// bucket, so many suppliers flooding a few headers cannot displace single honest rows.
+    /// Ties go to the highest header, which the committer needs last. Within a bucket, rejected
+    /// input goes first, then disputed, then input without roots, then unchecked roots.
+    /// Rows admitted by this transition compete on the same terms, so low-priority new input is
+    /// dropped rather than refusing the transition.
+    fn evict_auxiliary_input(
+        &mut self,
+        engine: &HeaderChainEngine,
+        header_best: Frontier,
+        limits: EngineLimits,
+    ) -> Result<(), TransitionFailure> {
+        let mut retained = self.retained_aux_delivery_count(engine);
+        if retained <= limits.max_aux_deliveries_total.get() {
+            return Ok(());
+        }
+
+        let finalized = self.graph.view_finalized_frontier();
+        let mut selected = HashSet::new();
+        let mut commit_window = HashSet::new();
+        let mut cursor = Some(header_best.hash);
+        while let Some(hash) = cursor {
+            let node = self
+                .graph
+                .view_header_node(hash)
+                .ok_or(GraphError::UnknownHeaderNode(hash))?;
+            selected.insert(hash);
+            if node.height.0.saturating_sub(finalized.height.0) < 3 {
+                commit_window.insert(hash);
+            }
+            cursor = (hash != finalized.hash).then_some(node.parent_hash);
+        }
+
+        let staged: HashMap<EvidenceId, crate::AuxDelivery> = self
+            .aux_changes
+            .iter()
+            .filter_map(|change| match change {
+                AuxDelta::Put(delivery) => Some((delivery.delivery_id, **delivery)),
+                AuxDelta::Delete { .. } => None,
+            })
+            .collect();
+        let mut holders: Vec<block::Hash> = engine.aux_delivery_header_hashes().collect();
+        holders.extend(staged.values().map(|delivery| delivery.header_hash));
+        holders.sort_unstable_by_key(|hash| hash.0);
+        holders.dedup();
+
+        // Each bucket lists its evictable rows in eviction order, last first for `pop`.
+        let mut buckets: HashMap<block::Hash, (usize, Vec<(u8, EvidenceId)>)> = HashMap::new();
+        let mut queue = BTreeSet::new();
+        for hash in holders {
+            if commit_window.contains(&hash) {
+                continue;
+            }
+            let Some(node) = self.graph.view_header_node(hash) else {
+                continue;
+            };
+            let mut evictable: Vec<(u8, EvidenceId)> = node
+                .aux_delivery_ids
+                .iter()
+                .filter_map(|delivery_id| {
+                    // A repair must retain its new input before it can report success.
+                    if self.repair_deliveries.contains(delivery_id) {
+                        return None;
+                    }
+                    let delivery = staged
+                        .get(delivery_id)
+                        .or_else(|| engine.aux_delivery(*delivery_id))?;
+                    let rank = if delivery.is_authenticated() {
+                        return None;
+                    } else if delivery.is_rejected() {
+                        0
+                    } else if delivery.is_disputed() {
+                        1
+                    } else if delivery.tree_aux.is_none() {
+                        2
+                    } else {
+                        3
+                    };
+                    Some((rank, *delivery_id))
+                })
+                .collect();
+            if evictable.is_empty() {
+                continue;
+            }
+            evictable.sort_unstable_by(|left, right| right.cmp(left));
+            let occupancy = node.aux_delivery_ids.len();
+            let key = (
+                selected.contains(&hash),
+                Reverse(occupancy),
+                Reverse(node.height),
+                hash.0,
+            );
+            queue.insert(key);
+            buckets.insert(hash, (occupancy, evictable));
+        }
+
+        while retained > limits.max_aux_deliveries_total.get() {
+            let Some((on_selected, _, height, raw_hash)) = queue.pop_first() else {
+                // Protected input alone exceeds the limit; the final limit check refuses.
+                return Ok(());
+            };
+            let hash = block::Hash(raw_hash);
+            let (occupancy, evictable) = buckets
+                .get_mut(&hash)
+                .expect("every queued header has an evictable bucket");
+            let (_, delivery_id) = evictable
+                .pop()
+                .expect("queued buckets hold at least one evictable row");
+            self.graph
+                .remove_auxiliary_evidence_delivery(hash, delivery_id)?;
+            if engine.aux_delivery(delivery_id).is_some() {
+                self.aux_changes.push(AuxDelta::Delete {
+                    header_hash: hash,
+                    delivery_id,
+                });
+            }
+            retained = retained.saturating_sub(1);
+            *occupancy = occupancy.saturating_sub(1);
+            if !evictable.is_empty() {
+                queue.insert((on_selected, Reverse(*occupancy), height, raw_hash));
+            }
+        }
+        Ok(())
     }
 
     /// Trim the verified projection against the retained graph and reconcile auxiliary rows.
@@ -219,8 +470,12 @@ impl<'a> ProjectedTransitionState<'a> {
             .copied()
             .collect();
         self.aux_changes.retain(|change| match change {
-            AuxDelta::Put(delivery) => self.graph.view_header_node(delivery.header_hash).is_some(),
-            AuxDelta::Delete { .. } => true,
+            // A later delivery can replace a row whose size hint this batch updated.
+            AuxDelta::Put(delivery) => self
+                .graph
+                .view_header_node(delivery.header_hash)
+                .is_some_and(|node| node.aux_delivery_ids.contains(&delivery.delivery_id)),
+            AuxDelta::Delete { header_hash, .. } => !evicted.contains(header_hash),
         });
         let mut aux_deletes: Vec<_> = evicted
             .iter()

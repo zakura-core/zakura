@@ -1,0 +1,70 @@
+name: zakura-mac-cranelift
+
+on:
+  pull_request:
+    paths:
+      - 'deploy/zakura-mac-cranelift/**'
+      - 'deploy/deployer/zakura-mac-cranelift-manager.py'
+      - 'deploy/deployer/test_zakura_mac_cranelift_manager.py'
+      - '.github/workflows/zakura-mainnet-deploy.yml'
+      - 'deploy/runner/zakura-cluster-status.py'
+      - 'deploy/runner/zakura-cluster-watchdog.py'
+      - 'deploy/runner/zakura_monitoring/**'
+      - 'deploy/runner/test_zakura_cluster_watchdog.py'
+      - 'deploy/runner/test_zakura_cluster_status.py'
+      - '.github/workflows/zakura-mac-cranelift.yml'
+      - '.github/workflows/build-zakura-mac-cranelift.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'deploy/zakura-mac-cranelift/**'
+      - 'deploy/deployer/zakura-mac-cranelift-manager.py'
+      - 'deploy/deployer/test_zakura_mac_cranelift_manager.py'
+      - '.github/workflows/zakura-mainnet-deploy.yml'
+      - 'deploy/runner/zakura-cluster-status.py'
+      - 'deploy/runner/zakura-cluster-watchdog.py'
+      - 'deploy/runner/zakura_monitoring/**'
+      - 'deploy/runner/test_zakura_cluster_watchdog.py'
+      - 'deploy/runner/test_zakura_cluster_status.py'
+      - '.github/workflows/zakura-mac-cranelift.yml'
+      - '.github/workflows/build-zakura-mac-cranelift.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  inputs:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      native: ${{ steps.inputs.outputs.native }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - id: inputs
+        run: python3 deploy/zakura-mac-cranelift/build_inputs.py
+
+  cranelift-candidate:
+    needs: inputs
+    if: needs.inputs.outputs.native == 'true'
+    uses: ./.github/workflows/build-zakura-mac-cranelift.yml
+
+  tooling:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: python3 -m unittest discover -s deploy/zakura-mac-cranelift/tests -v
+      - run: python3 -m unittest discover -s deploy/zakura-mac-cranelift/cranelift -p 'test_*.py' -v
+      - run: python3 deploy/runner/test_zakura_cluster_status.py
+      - run: python3 deploy/runner/test_zakura_cluster_watchdog.py
+      - run: python3 deploy/deployer/test_zakura_mac_cranelift_manager.py

@@ -9,7 +9,8 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  # One group per run, so a manual run never cancels a scheduled one on `main`.
+  group: ${{ github.workflow }}-${{ github.run_id }}
   cancel-in-progress: true
 
 permissions:
@@ -88,7 +89,8 @@ jobs:
           if [ "${SCHEDULE}" = "13 5 * * 0" ]; then
             seconds="${WEEKLY_SECONDS}"
           fi
-          cargo fuzz run "${TARGET}" -- \
+          # cargo-fuzz otherwise looks for `fuzz/` under the workspace root.
+          cargo fuzz run --fuzz-dir . "${TARGET}" -- \
             -max_total_time="${seconds}" \
             -rss_limit_mb="${RSS_MB}" \
             -max_len="${MAX_LEN}" \

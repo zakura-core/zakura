@@ -2,6 +2,8 @@
 
 mod prop;
 mod vectors;
+mod zip218_funding_streams;
+mod zip218_rounding;
 
 use color_eyre::Report;
 
@@ -51,6 +53,43 @@ fn funding_stream_period_uses_floor_division_for_negative_periods() {
     assert_eq!(0, funding_stream_address_period(Height(50), &parameters));
     assert_eq!(-1, funding_stream_address_period(Height(49), &parameters));
     assert_eq!(-2, funding_stream_address_period(Height(39), &parameters));
+
+    // With NU7 at 40, heights from 40 on use ZIP 218's case:
+    // floor((3 · (40 + 50 − 100) + (height − 40)) / 30).
+    struct Nu7TestParameters;
+
+    impl ParameterSubsidy for Nu7TestParameters {
+        fn height_for_first_halving(&self) -> Height {
+            TestParameters.height_for_first_halving()
+        }
+
+        fn post_blossom_halving_interval(&self) -> HeightDiff {
+            TestParameters.post_blossom_halving_interval()
+        }
+
+        fn pre_blossom_halving_interval(&self) -> HeightDiff {
+            TestParameters.pre_blossom_halving_interval()
+        }
+
+        fn funding_stream_address_change_interval(&self) -> HeightDiff {
+            TestParameters.funding_stream_address_change_interval()
+        }
+
+        fn nu7_activation_height(&self) -> Option<Height> {
+            Some(Height(40))
+        }
+
+        fn initial_nsm_value_balance(&self) -> Amount<NonNegative> {
+            Amount::zero()
+        }
+    }
+
+    let parameters = Nu7TestParameters;
+
+    assert_eq!(-2, funding_stream_address_period(Height(39), &parameters));
+    assert_eq!(-1, funding_stream_address_period(Height(40), &parameters));
+    assert_eq!(-1, funding_stream_address_period(Height(69), &parameters));
+    assert_eq!(0, funding_stream_address_period(Height(70), &parameters));
 }
 
 /// Regtest derives its first halving, so NU7's 25 second spacing moves it.
@@ -76,25 +115,34 @@ fn regtest_first_halving_follows_the_target_spacing() {
         "the first halving matches the subsidy schedule"
     );
 
-    // Funding stream recipients rotate on period boundaries aligned to the
-    // derived first halving, which starts period 48.
+    // NU7 activates before the derived first halving, so every block uses ZIP 218's
+    // post-NU7 address period, `floor((3 · (A + I − F) + (h − A)) / (3 · C))` with
+    // A = 1, I = 288, F = 859, and C = 6. That is `-95 + floor((h − 1) / 18)`: it
+    // rotates once every 18 blocks, counted from NU7 activation.
     let period = |height: Height| funding_stream_address_period(height, &nu7_regtest);
-    let interval = nu7_regtest.funding_stream_address_change_interval();
-    assert_eq!(period(first_halving), 48);
+    assert_eq!(nu7_regtest.funding_stream_address_change_interval(), 6);
+    assert_eq!(period(Height(1)), -95);
+    assert_eq!(period(Height(18)), -95);
+    assert_eq!(period(Height(19)), -94);
     assert_eq!(
         period((first_halving - 1).expect("the test height is valid")),
-        47
+        -48
     );
-    assert_eq!(
-        period((first_halving + interval).expect("the test height is valid")),
-        49
-    );
+    assert_eq!(period(first_halving), -48);
+    assert_eq!(period(Height(864)), -48);
+    assert_eq!(period(Height(865)), -47);
 }
 
 #[test]
 fn halving_test() -> Result<(), Report> {
     let _init_guard = zakura_test::init();
-    for network in Network::iter() {
+    // Exercise the historical two-era schedule; NU7 is covered separately.
+    for network in [
+        Network::Mainnet,
+        testnet_with_nu7(None)
+            .to_network()
+            .expect("the historical Testnet schedule is valid"),
+    ] {
         halving_for_network(&network)?;
     }
 
@@ -221,7 +269,13 @@ fn halving_for_network(network: &Network) -> Result<(), Report> {
 fn block_subsidy_test() -> Result<(), Report> {
     let _init_guard = zakura_test::init();
 
-    for network in Network::iter() {
+    // Exercise the historical two-era schedule; NU7 is covered separately.
+    for network in [
+        Network::Mainnet,
+        testnet_with_nu7(None)
+            .to_network()
+            .expect("the historical Testnet schedule is valid"),
+    ] {
         block_subsidy_for_network(&network)?;
     }
 
@@ -378,7 +432,7 @@ fn block_subsidy_for_network(network: &Network) -> Result<(), Report> {
 #[test]
 fn check_height_for_num_halvings() {
     for network in Network::iter() {
-        for h in 1..1000 {
+        for h in 1..=halving(Height::MAX, &network) {
             let Some(height_for_halving) = height_for_halving(h, &network) else {
                 panic!("could not find height for halving {h}");
             };
@@ -710,14 +764,60 @@ fn nsm_reissuance_requires_nu7_and_a_crossing() {
         ..Default::default()
     });
 
-    for network in [
-        Network::Mainnet,
-        Network::new_default_testnet(),
-        configured,
-        regtest,
-    ] {
+    for network in [Network::Mainnet, configured, regtest] {
         assert_eq!(nsm_reissuance_height(&network), None, "{network:?}");
         assert!(!is_zip234_active(&network, Height::MAX), "{network:?}");
+    }
+}
+
+/// Default Testnet derives NSM reissuance from its real NU7 schedule.
+#[test]
+fn default_testnet_nsm_reissuance_boundary() {
+    use crate::parameters::subsidy::{
+        block_subsidy, halving_block_subsidy, height_for_halving, is_zip234_active,
+        nsm_reissuance_height, reissuance_bonus, scheduled_issuance_zatoshis, SubsidyError,
+    };
+
+    let network = Network::new_default_testnet();
+    // Pinned by summing issuance over each spacing/halving era, then scanning
+    // for the first strict reference-bonus crossing using integer arithmetic.
+    let crossing = Height(7_305_222);
+    assert_eq!(nsm_reissuance_height(&network), Some(crossing));
+    assert_eq!(height_for_halving(3, &network), Some(Height(4_497_948)));
+
+    let previous = crossing.previous().expect("the crossing is above genesis");
+    assert!(!is_zip234_active(&network, previous));
+    assert_eq!(
+        block_subsidy(previous, &network, None),
+        halving_block_subsidy(previous, &network),
+    );
+    for height in [
+        crossing,
+        crossing.next().expect("the crossing is below the maximum"),
+    ] {
+        assert!(is_zip234_active(&network, height));
+        assert_eq!(
+            block_subsidy(height, &network, None),
+            Err(SubsidyError::MissingNsmValueBalance),
+        );
+        let balance = Amount::<NonNegative>::try_from(1).expect("one zatoshi is valid");
+        let scheduled = halving_block_subsidy(height, &network).expect("valid subsidy");
+        assert_eq!(
+            block_subsidy(height, &network, Some(balance)),
+            Ok((scheduled + balance).expect("the subsidy and bonus fit")),
+        );
+    }
+    for (height, is_crossing) in [(previous, false), (crossing, true)] {
+        let parent = height.previous().expect("the crossing has a parent");
+        let supply = scheduled_issuance_zatoshis(parent, &network).expect("valid issuance");
+        let reserve = u128::try_from(MAX_MONEY).expect("MAX_MONEY is positive") - supply;
+        let reserve = Amount::<NonNegative>::try_from(
+            i64::try_from(reserve).expect("the reference reserve fits the amount range"),
+        )
+        .expect("the reference reserve is non-negative");
+        let bonus = reissuance_bonus(reserve).expect("the reference bonus is valid");
+        let scheduled = halving_block_subsidy(height, &network).expect("valid subsidy");
+        assert_eq!(bonus < scheduled, is_crossing);
     }
 }
 
@@ -1498,7 +1598,7 @@ fn scheduled_issuance_boundary_differences_match_block_subsidy() {
                 .unwrap();
                 assert_eq!(current - previous, block, "network {network:?}, height {h}");
                 assert_eq!(
-                    block_subsidy(Height(h), &network, None).unwrap(),
+                    block_subsidy(Height(h), &network, Some(Amount::zero())).unwrap(),
                     halving_block_subsidy(Height(h), &network).unwrap()
                 );
             }
@@ -1629,7 +1729,12 @@ fn scheduled_issuance_stops_at_a_halving_overflow_inside_slow_start() {
 fn spacing_schedule_preserves_existing_halving_and_subsidy() {
     use crate::parameters::{subsidy::constants::MAX_BLOCK_SUBSIDY, testnet};
     let _init_guard = zakura_test::init();
-    let mut networks: Vec<_> = Network::iter().collect();
+    let mut networks = vec![
+        Network::Mainnet,
+        testnet_with_nu7(None)
+            .to_network()
+            .expect("the historical Testnet schedule is valid"),
+    ];
     for blossom in [4, 1_000] {
         networks.push(
             testnet::Parameters::build()

@@ -4,7 +4,7 @@
 
 use std::io;
 
-use derive_getters::Getters;
+use getset::Getters;
 
 use crate::{
     block::MAX_BLOCK_BYTES,
@@ -27,17 +27,23 @@ use super::{commitment, keys, note};
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Getters)]
 pub struct Output {
     /// A value commitment to the value of the input note.
+    #[getset(get = "pub")]
     pub cv: commitment::ValueCommitment,
     /// The u-coordinate of the note commitment for the output note.
     #[serde(with = "serde_helpers::SaplingExtractedNoteCommitment")]
+    #[getset(get = "pub")]
     pub cm_u: sapling_crypto::note::ExtractedNoteCommitment,
     /// An encoding of an ephemeral Jubjub public key.
+    #[getset(get = "pub")]
     pub ephemeral_key: keys::EphemeralPublicKey,
     /// A ciphertext component for the encrypted output note.
+    #[getset(get = "pub")]
     pub enc_ciphertext: note::EncryptedNote,
     /// A ciphertext component for the encrypted output note.
+    #[getset(get = "pub")]
     pub out_ciphertext: note::WrappedNoteKey,
     /// The ZK output proof.
+    #[getset(get = "pub")]
     pub zkproof: Groth16Proof,
 }
 

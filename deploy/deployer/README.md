@@ -322,9 +322,12 @@ refreshes it on `us-east-0` over SSH on a best-effort basis. While the marker is
 in the future, new failure alerts are logged but not posted to Slack.
 
 Restart deploys that include `zakura-compat` also refresh that host's node-local
-watchdog marker and restart the active watchdog before `zakurad-compat`. This
-suppresses expected Sentry transitions and stays in the workflow so rollback
-refs whose deployer predates the marker remain covered.
+compatibility marker (`/run/zakura-watchdog/deployment-suppressed-until`) before
+`zakurad-compat` restarts. The compatibility checker reports it with every probe,
+and only the fleet watchdog's compatibility lane honors it, for at most 20
+minutes. It stays in the workflow so rollback refs whose deployer predates the
+marker remain covered. See `deploy/runner/README.md` for compatibility
+monitoring and its `operation=monitoring` stages.
 
 Manual dry run from `us-east-0`:
 
@@ -406,3 +409,13 @@ for new hosts.
 
 The deterministic `log_file` is the single source of truth shared by the running
 node (writer) and `logs fetch`/`logs follow` (reader).
+
+### Release-state publisher
+
+The mainnet archive publisher uses `release_state_publisher = true` on its node
+entry. This requires a binary-only systemd Mainnet archive node and an existing
+archive publisher installation on `roman-zakura-archive-vct-off`. It builds the
+node and offline exporter at the same commit and verifies publication after the
+restart. `--no-restart` is rejected for selections containing this node. See
+[the publisher runbook](../release-state/README.md#updating-the-archive-publisher)
+for locking, validation, and failure recovery.

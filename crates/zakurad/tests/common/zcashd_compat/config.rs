@@ -3,7 +3,13 @@
 use std::{net::SocketAddr, path::PathBuf, time::Duration};
 
 use color_eyre::eyre::Result;
-use zakura_chain::parameters::{testnet::ConfiguredActivationHeights, Network, NetworkKind};
+use zakura_chain::{
+    amount::Amount,
+    parameters::{
+        testnet::{ConfiguredActivationHeights, ConfiguredLockboxDisbursement, RegtestParameters},
+        Network, NetworkKind,
+    },
+};
 use zakura_rpc::config::mining::MinerAddressType;
 use zakura_test::net::random_known_port;
 use zakurad::{
@@ -14,9 +20,29 @@ use zakurad::{
 use super::TEST_ZCASHD_PATH;
 use crate::common::config::default_test_config;
 
+/// The regtest network upgrade schedule of a zcashd-compat test.
+#[derive(Clone, Copy, Debug)]
+pub enum RegtestProfile {
+    /// Every upgrade through NU5 at height 1, which any sidecar supports.
+    Nu5AtOne,
+    /// Every upgrade through NU6.3 at height 1 and NU7 at the given height, which needs a
+    /// sidecar with NU7 support.
+    Nu7At(u32),
+}
+
+/// The NSM value balance before NU7 in the [`RegtestProfile::Nu7At`] profile, configured on
+/// both sides so that neither derives it.
+pub const NU7_TEST_INITIAL_NSM_VALUE_BALANCE: i64 = 1_000_000_000;
+
+/// The address of the zero-value one-time lockbox disbursement that both sides expect in
+/// the NU6.1 activation block of the [`RegtestProfile::Nu7At`] profile.
+const NU6_1_LOCKBOX_MARKER_ADDRESS: &str = "t2RnBRiqrN1nW4ecZs1Fj3WWjNdnSs4kiX8";
+
 /// Configuration produced by [`build_zcashd_compat_config`].
 pub struct ZcashdCompatConfig {
     pub zakurad_config: ZakuradConfig,
+    /// The regtest network both processes use.
+    pub network: Network,
     /// Zcashd datadir prepared for managed regtest mode.
     pub zcashd_datadir: PathBuf,
     /// Zakurad's main (unauthenticated) RPC listen address.
@@ -42,13 +68,46 @@ pub const MINER_PRIV_WIF: &str = "cMahea7zqjxrtgAbB7LSGbcQUr1uX1ojuat9jZodMN87Jc
 /// datadir. In managed-spawn mode this is the testdir (kept alive by the
 /// `TestChild`).
 pub fn build_zcashd_compat_config(work_dir: PathBuf) -> Result<ZcashdCompatConfig> {
-    let net = Network::new_regtest(
-        ConfiguredActivationHeights {
-            nu5: Some(1),
+    build_zcashd_compat_config_for(work_dir, RegtestProfile::Nu5AtOne)
+}
+
+/// Builds a regtest zakurad config wired for zcashd-compat testing, with the network upgrade
+/// schedule of `profile` on both sides. See [`build_zcashd_compat_config`].
+pub fn build_zcashd_compat_config_for(
+    work_dir: PathBuf,
+    profile: RegtestProfile,
+) -> Result<ZcashdCompatConfig> {
+    let net = match profile {
+        RegtestProfile::Nu5AtOne => Network::new_regtest(
+            ConfiguredActivationHeights {
+                nu5: Some(1),
+                ..Default::default()
+            }
+            .into(),
+        ),
+        RegtestProfile::Nu7At(nu7_height) => Network::new_regtest(RegtestParameters {
+            activation_heights: ConfiguredActivationHeights {
+                overwinter: Some(1),
+                sapling: Some(1),
+                blossom: Some(1),
+                heartwood: Some(1),
+                canopy: Some(1),
+                nu5: Some(1),
+                nu6: Some(1),
+                nu6_1: Some(1),
+                nu6_2: Some(1),
+                nu6_3: Some(1),
+                nu7: Some(nu7_height),
+                ..Default::default()
+            },
+            lockbox_disbursements: Some(vec![ConfiguredLockboxDisbursement {
+                address: NU6_1_LOCKBOX_MARKER_ADDRESS.to_string(),
+                amount: Amount::zero(),
+            }]),
+            initial_nsm_value_balance: Some(NU7_TEST_INITIAL_NSM_VALUE_BALANCE.try_into()?),
             ..Default::default()
-        }
-        .into(),
-    );
+        }),
+    };
 
     let zakura_rpc_port = random_known_port();
     let zcashd_own_rpc_port = random_known_port();
@@ -116,9 +175,21 @@ pub fn build_zcashd_compat_config(work_dir: PathBuf) -> Result<ZcashdCompatConfi
         // block download forever and disable its wallet RPCs. 100 years.
         "-maxtipage=3153600000".to_string(),
     ];
+    if let RegtestProfile::Nu7At(nu7_height) = profile {
+        config.zcashd_compat.zcashd_extra_args.extend([
+            "-nuparams=c8e71055:1".to_string(),         // NU6
+            "-nuparams=4dec4df0:1".to_string(),         // NU6.1
+            "-nuparams=5437f330:1".to_string(),         // NU6.2
+            "-nuparams=37a5165b:1".to_string(),         // NU6.3
+            format!("-nuparams=77190ad9:{nu7_height}"), // NU7
+            format!("-onetimelockboxdisbursement=0:4dec4df0:0:{NU6_1_LOCKBOX_MARKER_ADDRESS}"),
+            format!("-regtestnsminitialbalance={NU7_TEST_INITIAL_NSM_VALUE_BALANCE}"),
+        ]);
+    }
 
     Ok(ZcashdCompatConfig {
         zakurad_config: config,
+        network: net,
         zcashd_datadir,
         zakura_rpc_addr,
         zcashd_own_rpc_addr,

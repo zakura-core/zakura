@@ -59,6 +59,14 @@ impl Admission {
     }
 }
 
+impl Admission {
+    /// Owner permits held across both directions, for tests.
+    #[cfg(test)]
+    pub(crate) fn held_owners(&self) -> usize {
+        self.total - self.owners.available_permits()
+    }
+}
+
 pub(crate) struct Reservation {
     _inbound: Option<OwnedSemaphorePermit>,
     _global: OwnedSemaphorePermit,
@@ -108,6 +116,12 @@ impl ConnectionAttempt {
         }
     }
 
+    /// Drops a failed or timed-out handshake, closing it, but keeps its
+    /// reservation for the caller to hold until noq frees the state (ADM-7).
+    pub(crate) fn abandon(mut self) -> Option<Reservation> {
+        self.reservation.take()
+    }
+
     /// Tracks an incoming attempt's transport state, whatever its outcome.
     pub(crate) fn weak_handle(&self) -> Option<noq::WeakConnectionHandle> {
         match &self.handshake {
@@ -144,9 +158,9 @@ impl Future for ConnectionAttempt {
                 }
             }
         };
-        let reservation = self.reservation.take();
-        let close_charge = self.close_charge.take();
         if let Ok(connection) = &result {
+            let reservation = self.reservation.take();
+            let close_charge = self.close_charge.take();
             let weak = connection.weak_handle();
             let closed = connection.on_closed();
             // The task owns no endpoint or strong connection handle. It cannot

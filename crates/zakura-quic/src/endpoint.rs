@@ -488,6 +488,12 @@ impl QuicEndpoint {
         (self.inner.pending.total(), self.inner.pending.for_ip(ip))
     }
 
+    /// Owner permits held across both directions, for tests.
+    #[cfg(test)]
+    pub(crate) fn held_owners(&self) -> usize {
+        self.inner.admission.held_owners()
+    }
+
     fn ban_check(&self) -> Option<BanCheck> {
         let acceptor = self
             .inner
@@ -831,7 +837,7 @@ fn decide(config: &QuicConfig, acceptor: &dyn Acceptor, info: &IncomingInfo) -> 
 async fn handshake(
     weak: Weak<Inner>,
     deadline: Option<Duration>,
-    connecting: ConnectionAttempt,
+    mut connecting: ConnectionAttempt,
     remote: SocketAddr,
     pending: PendingGuard,
     acceptor: Arc<dyn Acceptor>,
@@ -841,16 +847,20 @@ async fn handshake(
         .weak_handle()
         .expect("inbound attempts expose their transport state");
     let result = match deadline {
-        Some(deadline) => match tokio::time::timeout(deadline, connecting).await {
+        Some(deadline) => match tokio::time::timeout(deadline, &mut connecting).await {
             Ok(result) => result.map_err(ConnectError::from_handshake),
-            // ADM-6: dropping `connecting` closes the connection.
             Err(_) => Err(ConnectError::HandshakeTimeout),
         },
-        None => connecting.await.map_err(ConnectError::from_handshake),
+        None => (&mut connecting)
+            .await
+            .map_err(ConnectError::from_handshake),
     };
     record_handshake(&result, started);
     let Ok(connection) = result else {
-        // ADM-7: noq keeps a failed attempt's state while it drains.
+        // ADM-7: noq keeps a failed attempt's state while it drains, so its IP
+        // charge and owner permit last until the state is freed.
+        // ADM-6: dropping the attempt closes a timed-out connection.
+        let _reservation = connecting.abandon();
         let _charge = pending.into_hold();
         admission::until_freed(&attempt).await;
         return;

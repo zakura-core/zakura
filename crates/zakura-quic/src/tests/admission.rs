@@ -90,6 +90,10 @@ async fn failed_inbound_handshake_stays_charged_through_drain() {
         // The pending handshake ended, but its transport table entry still blocks reuse.
         assert_eq!(server.seen.lock().unwrap().last().unwrap().pending_total, 0);
         wait_for_transports(&server.endpoint, 0).await;
+        // The owner permit follows once the handshake task sees the state freed.
+        while server.endpoint.held_owners() > 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         let conn = client.connect(server.addr(), ALPN).await.unwrap();
         drop((conn, stalled));
         client.shutdown().await;
@@ -194,8 +198,8 @@ async fn concurrent_sockets_preserve_an_outbound_slot() {
     .unwrap();
 }
 
-/// A failed handshake's IP charge ends when noq frees the attempt, well before
-/// the 52 s worst-case drain a peer could force (ADM-7).
+/// A failed handshake keeps its IP charge and owner permit until noq frees the
+/// attempt, and no longer: well before the 52 s worst-case drain (ADM-7).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn failed_handshake_charge_ends_when_noq_frees_it() {
     tokio::time::timeout(TEST_TIMEOUT, async {
@@ -208,15 +212,24 @@ async fn failed_handshake_charge_ends_when_noq_frees_it() {
         let ip = server.endpoint.local_addrs()[0].ip();
         let stalled = stalled_handshake(&server).await;
         wait_for_attempts(&server, 1).await;
-        while server.endpoint.pending(ip) != (0, 1) {
+        while server.endpoint.pending(ip).0 > 0 {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         let failed = std::time::Instant::now();
-        while server.endpoint.pending(ip).1 > 0 {
+        loop {
+            // The owner permit drops after the IP charge, so read it first.
+            let owners = server.endpoint.held_owners();
+            if server.endpoint.pending(ip).1 == 0 {
+                break;
+            }
+            assert_eq!(owners, 1, "a charged failed attempt keeps its owner permit");
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         assert_eq!(open_transports(&server.endpoint), 0);
         assert!(failed.elapsed() < Duration::from_secs(15));
+        while server.endpoint.held_owners() > 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         drop(stalled);
         server.endpoint.shutdown().await;
     })

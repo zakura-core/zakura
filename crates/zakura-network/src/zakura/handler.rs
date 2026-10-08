@@ -2389,6 +2389,12 @@ impl ZakuraProtocolHandler {
     ) -> Result<NativeHandshakeNegotiated, ZakuraHandlerError> {
         let Ok(_inbound) = self.inbound_handshakes.clone().try_acquire_owned() else {
             metrics::counter!("zakura.p2p.conn.rejected.pending_handshake").increment(1);
+            conn.trace_connection(
+                "rejected.admission",
+                None,
+                Some("inbound"),
+                Some("pending_handshake"),
+            );
             connection.close(
                 VarInt::from_u32(ZAKURA_CLOSE_RESOURCE),
                 b"pending handshake",

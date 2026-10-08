@@ -621,11 +621,24 @@ that the publisher changed its selected chain between `Status` and `Open`. `Subs
 reports that the publisher's selected chain stopped extending the subscription cursor. Neither is
 a peer violation.
 
-### Block sync — stream 6, version 2
+### Block sync — stream 6, regulated version 3
+
+The regulated contract uses capability bit 8 and stream version 3. It retains version 2's
+five messages and byte encodings. Version 3 changes admission and lifetime rules, not request
+identity. Peers MUST negotiate version 3 before applying the following regulation rules.
+Negotiation MUST select the complete behavior together: the frame table and cadence, serving
+commitments, response reservations, ending checks, and Status handling. The selected stream
+MUST have at least two outbound queue slots after the negotiated connection budget is split.
+
+Implementations MUST retain version 2 under capability bit 3 for peers without the new capability.
+That compatibility path MUST retain the old message-rate bucket and retry/ending behavior, without
+installing the regulated frame table or reservations. Replacing a version 2 session MUST send a fresh
+Status. Version 3 carries received Status across replacement on the same connection.
+Embedders without a bounded range source MUST advertise only version 2.
 
 Version 2 requests bodies by height range. The requester still reserves the expected header hash for
 each height, but the wire request does not identify that hash. Competing branches can occupy the
-same height, so version 2 cannot safely overlap live ranges on one connection. A future version must
+same height, so regulated version 3 forbids overlapping live ranges on one connection. A future version must
 make request and body correlation explicit.
 
 Block sync MUST allow discriminators `1..=5` in the frame header. Version 2 also carries the same
@@ -724,8 +737,14 @@ and terminal response match exactly one range despite version 2's missing reques
 
 The receiver matches a `Block` by hashing its header and comparing that hash with the committed
 header hashes expected by live ranges. A block that does not match the next expected hash of exactly
-one live range MUST return `Disconnect`. The publisher MUST send the blocks of a range in ascending
-height order. The reservation identity commits to a header that header sync already validated, so
+one live range MUST retire the connection as a local incompatibility, without a peer-fault
+report or penalty. Height-only requests do not commit the publisher to the requester's chain.
+The receiver MUST retain the exchange fences until connection cleanup and requeue unreceived work.
+Local waits for decode or sequencer capacity MUST pause the ending deadline. Crediting local waits
+MUST NOT release reservations or excuse a withheld ending while the reader remains active.
+It SHOULD briefly avoid this supplier for the still-wanted unreceived bodies in every live exchange, including across reconnects,
+without delaying other suppliers. Invalid framing, excess response bytes, and invalid endings remain
+protocol violations. The publisher MUST send the blocks of a range in ascending height order. The reservation identity commits to a header that header sync already validated, so
 Verify re-checks Equihash and the target only as defense in depth. An implementation MAY skip both
 checks when the header bytes hash to the expected identity. Block sync takes that option today: it
 matches the hash at [`peer_routine`][bs-expected-hash] and leaves
@@ -777,12 +796,13 @@ immediate retry.
 
 A successor version should identify each request with a receiver-chosen nonzero request ID and name
 each requested body by header hash. Every body and terminal response must echo the request ID. Those
-fields would remove version 2's overlap restriction and bind each body to the header chain that the
+fields would remove the regulated height-range overlap restriction and bind each body to the header chain that the
 requester selected.
 
 This section is non-normative. The successor message set, encoding, caps, reservation rules, and
-work bounds remain unspecified. Implementations MUST support only version 2 until a separate change
-defines that complete wire contract.
+work bounds remain unspecified. Version 3 above only negotiates regulation of the existing
+height-range encoding. A later successor with request IDs and hash-addressed bodies MUST NOT be
+advertised until a separate change defines its complete wire contract.
 
 ## Parameters to validate
 

@@ -20,6 +20,7 @@ on:
       - docs/specs/fork-aware-header-chain-engine.md
       - qa/supply-chain/**
       - "scripts/**.sh"
+      - scripts/make/zcashd-compat.mk
       - crates/zakura-header-chain/conformance.toml
       - ".github/workflows/scripts/**"
       - ".github/actions/**"
@@ -46,6 +47,7 @@ on:
       - docs/specs/fork-aware-header-chain-engine.md
       - qa/supply-chain/**
       - "scripts/**.sh"
+      - scripts/make/zcashd-compat.mk
       - crates/zakura-header-chain/conformance.toml
       - ".github/workflows/scripts/**"
       - ".github/actions/**"
@@ -195,7 +197,10 @@ jobs:
         if: ${{ !cancelled() }}
         # .github/workflows/scripts/*.sh included: those run on provisioned
         # droplets, where a shell bug costs a full provisioning cycle to find.
-        run: shellcheck scripts/*.sh scripts/lib/*.sh .github/workflows/scripts/*.sh deploy/release-state/deploy-archive-pair.sh
+        run: shellcheck scripts/*.sh scripts/lib/*.sh .github/workflows/scripts/*.sh deploy/release-state/deploy-archive-pair.sh scripts/tests/test_resolve_zcashd_compat_manifest.sh
+      - name: zcashd compat manifest resolver tests
+        if: ${{ !cancelled() }}
+        run: bash scripts/tests/test_resolve_zcashd_compat_manifest.sh
       # Stdlib-only, so there is nothing to install.
       - name: Mempool load harness tests
         if: ${{ !cancelled() }}
@@ -247,6 +252,10 @@ jobs:
         run: |
           python3 deploy/runner/test_zakura_cluster_status.py
           python3 deploy/runner/test_zakura_cluster_watchdog.py
+
+      - name: Compatibility monitoring tests
+        if: ${{ !cancelled() }}
+        run: python3 -m unittest discover -s deploy/runner -p 'test_*monitoring*.py'
 
       - name: Release-state coupling
         if: ${{ !cancelled() }}
@@ -376,7 +385,9 @@ jobs:
   lint-success:
     name: lint success
     runs-on: ubuntu-latest
-    if: always()
+    # Skip, rather than fail, when a superseding run cancelled this one.
+    # See "Cancelled runs" in .github/workflows/README.md.
+    if: ${{ !cancelled() || github.event_name == 'pull_request' || github.event_name == 'merge_group' }}
     needs:
       - rust-checks
       - msrv

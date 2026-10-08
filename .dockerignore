@@ -19,8 +19,6 @@
 !*.toml
 !*.lock
 !deploy
-!deploy/zakura-watchdog
-!deploy/zakura-watchdog/**
 !crates
 !crates/**
 !docker/entrypoint.sh

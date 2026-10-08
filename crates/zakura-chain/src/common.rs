@@ -9,9 +9,14 @@ use std::{
 
 use tempfile::PersistError;
 
+mod directories;
+
+use directories::cache_dir;
+pub use directories::{home_dir, preference_dir};
+
 /// Returns Zakura's default cache directory path.
 pub fn default_cache_dir() -> PathBuf {
-    dirs::cache_dir()
+    cache_dir()
         .unwrap_or_else(|| std::env::current_dir().unwrap().join("cache"))
         .join("zakura")
 }

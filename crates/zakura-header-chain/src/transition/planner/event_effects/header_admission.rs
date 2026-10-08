@@ -279,6 +279,14 @@ pub(super) fn admit_prepared_headers(
                     .iter()
                     .copied()
                     .find(|existing| existing.semantic_fingerprint() == semantic_fingerprint)
+            })
+            .filter(|existing| {
+                projected
+                    .graph()
+                    .view_header_node(delivery.header_hash)
+                    .expect("the auxiliary header was checked above")
+                    .aux_delivery_ids
+                    .contains(&existing.delivery_id)
             });
         if let Some(existing) = existing {
             // A header hash fixes its body size, so honest known hints always agree. Only fill a
@@ -309,7 +317,24 @@ pub(super) fn admit_prepared_headers(
         if rooted_source_exists {
             continue;
         }
-        let index = projected.record_aux_delivery(*delivery)?;
+        let selected_repair = matches!(
+            event.completion,
+            TargetCompletion::SelectedAuxiliaryRepair { .. }
+        );
+        if !projected.make_aux_delivery_room(
+            engine,
+            delivery.header_hash,
+            context.config.limits,
+            selected_repair,
+            delivery.tree_aux.is_some(),
+        )? {
+            if selected_repair {
+                return Err(TransitionFailure::AuxiliaryLimitExceeded);
+            }
+            // Drop ordinary input that cannot replace a retained candidate and keep its header.
+            continue;
+        }
+        let index = projected.record_aux_delivery(*delivery, selected_repair)?;
         admitted_semantic_payloads.insert(semantic_key, index);
         if delivery.tree_aux.is_some() {
             admitted_root_sources.insert((delivery.header_hash, delivery.source));

@@ -45,6 +45,7 @@ pub trait ZcashDeserialize: Sized {
     fn zcash_deserialize_from<R: io::Read>(
         _reader: &mut ZcashReader<R>,
     ) -> Result<Self, SerializationError> {
+        // Implementers must override this method (or `zcash_deserialize` for stream-only types).
         Err(SerializationError::Parse("type has no bounded decoder"))
     }
 }

@@ -1,0 +1,49 @@
+name: Zakura Cluster
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+  id-token: write
+  statuses: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  RUST_LIB_BACKTRACE: 1
+  RUST_LOG: info
+  COLORBT_SHOW_HIDDEN: 1
+
+jobs:
+  zakura-testkit:
+    name: Zakura testkit cluster integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f #v1.17.0 # zizmor: ignore[cache-poisoning] -- CI integration job; uploads only diagnostic test traces
+        with:
+          toolchain: stable
+          # Same debug + default-release-binaries workspace build as the unit
+          # acceptance jobs, so it shares their consolidated build cache.
+          cache-shared-key: zakura-drb-debug
+          cache-on-failure: true
+          cache-save-if: false
+      - uses: taiki-e/install-action@7623a79cdfecb99d681017af368ca353d9f49bb5 #v2.87.19
+        with:
+          tool: cargo-nextest
+      - uses: ./.github/actions/setup-zakura-build
+      - name: Run Zakura testkit cluster profile
+        run: cargo nextest run --profile zakura-integration --locked --features default-release-binaries --no-fail-fast
+        env:
+          ZAKURA_TEST_TRACE: keep
+      - name: Upload Zakura testkit traces
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a #v7.0.1
+        with:
+          name: zakura-testkit-traces
+          path: target/zakura-traces
+          if-no-files-found: ignore

@@ -150,7 +150,7 @@ impl<U> SendResponse<U> {
 
 #[cfg(test)]
 mod tests {
-    use tokio_test::{assert_pending, assert_ready, task};
+    use crate::polling::{ready, Task};
     use tower::ServiceExt;
 
     use super::*;
@@ -159,38 +159,38 @@ mod tests {
     fn permitting_requests_wakes_readiness_and_call_consumes_the_permit() {
         let (mut service, mut handle) = pair::<(), ()>();
         handle.allow(0);
-        let mut readiness = task::spawn(async { service.ready().await.map(|_| ()) });
-        assert_pending!(readiness.poll());
+        let mut readiness = Task::new(async { service.ready().await.map(|_| ()) });
+        assert!(readiness.poll().is_pending());
         handle.allow(1);
         assert!(readiness.is_woken());
-        assert_ready!(readiness.poll()).expect("one request is permitted");
+        ready(readiness.poll()).expect("one request is permitted");
         drop(readiness);
 
         // Repeated readiness polls must not consume the request's permit.
-        let mut context_task = task::spawn(());
+        let mut context_task = Task::new(());
         context_task.enter(|cx, _| {
-            assert_ready!(service.poll_ready(cx)).expect("the permit is still available");
+            ready(service.poll_ready(cx)).expect("the permit is still available");
         });
         let _response = service.call(());
-        context_task.enter(|cx, _| assert_pending!(service.poll_ready(cx)));
+        context_task.enter(|cx, _| assert!(service.poll_ready(cx).is_pending()));
     }
 
     #[test]
     fn dropping_handle_wakes_readiness_and_fails_queued_responses() {
         let (mut service, mut handle) = pair::<(), ()>();
         handle.allow(1);
-        let mut readiness = task::spawn(async { service.ready().await.map(|_| ()) });
-        assert_ready!(readiness.poll()).expect("one request is permitted");
+        let mut readiness = Task::new(async { service.ready().await.map(|_| ()) });
+        ready(readiness.poll()).expect("one request is permitted");
         drop(readiness);
-        let mut response = task::spawn(service.call(()));
-        assert_pending!(response.poll());
+        let mut response = Task::new(service.call(()));
+        assert!(response.poll().is_pending());
 
-        let mut readiness = task::spawn(async { service.ready().await.map(|_| ()) });
-        assert_pending!(readiness.poll());
+        let mut readiness = Task::new(async { service.ready().await.map(|_| ()) });
+        assert!(readiness.poll().is_pending());
         drop(handle);
         assert!(readiness.is_woken());
         assert!(response.is_woken());
-        assert!(assert_ready!(readiness.poll()).is_err());
-        assert!(assert_ready!(response.poll()).is_err());
+        assert!(ready(readiness.poll()).is_err());
+        assert!(ready(response.poll()).is_err());
     }
 }

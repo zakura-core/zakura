@@ -571,9 +571,12 @@ queue**. The writer continues to process header-chain control messages while it 
 An `ApplyHeaderChainInsert` completion retries the parked block immediately. The writer defers
 unrelated block-write messages in their original order. The write loop also publishes a bounded
 repair request (`VctRootRepairRequested`) back to header sync. Header sync fetches a contiguous
-selected prefix through the root-authentication lane. Durable evidence at the blocking height
-keeps the existing one-height repair. An empty gap can use one atomic range up to the selected
-tip, checkpoint handoff, 4,000-header transition limit, aggregate capacity, or first durable row.
+selected prefix through the root-authentication lane. A rooted or judged row at the blocking
+height keeps the existing one-height repair. Otherwise one atomic range covers the gap up to the
+selected tip, checkpoint handoff, 4,000-header transition limit, or first rooted or judged row.
+Rootless rows do not end the range. Suppliers attach roots only to their finalized prefix, so
+every header a node received near the network tip holds one. A handoff that later rises above
+those headers therefore repairs them in one request, not one request per block.
 The retry is satisfied once a verifiable row is stored.
 If no repair delivery fills the hole, the node stays parked
 fail-closed at that height (§8.1). A peer-supplied root that has no buffered successor to
@@ -940,9 +943,9 @@ cover the bundle's own checkpoint, replaces all four artifacts, and writes
 `vct/mainnet-vct-manifest.json` provenance (source `release-state-bundle`, heights, digests,
 entry count, bundle binding).
 
-The standalone update workflow also floors `ESTIMATED_RELEASE_HEIGHT`, validates everything
+The standalone update workflow leaves `ESTIMATED_RELEASE_HEIGHT` unchanged, validates everything
 — including proving the candidate subtree roots against its frontier — restricts the diff to
-exactly those six files, and opens a signed **draft PR** for human review. The grid is the one
+release-state artifacts and Cargo pins, and opens a signed **draft PR** for human review. The grid is the one
 committed artifact large enough to matter to `history-growth.yml`, which raises its packed-growth
 allowance only for a change that touches nothing outside the release-state files. During release
 preparation, the importer leaves that constant unchanged so `prepare-release.sh` remains the

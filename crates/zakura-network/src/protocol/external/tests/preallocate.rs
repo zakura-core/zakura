@@ -35,8 +35,8 @@ const ADDR_V2_MIN_SIZE: usize = 4 + 1 + 1 + 1 + 0 + 2;
 #[test]
 fn every_decodable_preallocate_type_has_a_nonzero_minimum() {
     assert_eq!(InventoryHash::min_serialized_size(), 4 + 32);
-    assert_eq!(AddrV1::min_serialized_size(), ADDR_V1_SIZE as u64);
-    assert_eq!(AddrV2::min_serialized_size(), ADDR_V2_MIN_SIZE as u64);
+    assert_eq!(AddrV1::min_serialized_size(), u64::try_from(ADDR_V1_SIZE).unwrap());
+    assert_eq!(AddrV2::min_serialized_size(), u64::try_from(ADDR_V2_MIN_SIZE).unwrap());
 }
 
 /// The number of test cases to use for expensive proptests.

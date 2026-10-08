@@ -203,6 +203,7 @@ pub const MAX_TX_INV_IN_SENT_MESSAGE: u64 = 25_000;
 
 impl TrustedPreallocate for InventoryHash {
     fn min_serialized_size() -> u64 {
+        // Lossless: the constant is 36, and usize is at most 64 bits.
         MIN_INV_HASH_SIZE as u64
     }
 

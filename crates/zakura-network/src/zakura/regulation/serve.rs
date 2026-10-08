@@ -23,7 +23,7 @@
 //! 5. **Every admitted request ends exactly once.** If `produce` returns
 //!    without an ending, Serve queues [`Produce::local_failure`]'s ending. The
 //!    connection stays open. Only an ending that cannot be queued retires the
-//!    session.
+//!    session. A panic in any serving task closes the connection.
 //!
 //! # Commitments and the margin
 //!
@@ -75,6 +75,10 @@
 //! | The ending frees the commitment before execution ends | `the_ending_frees_the_commitment_before_execution_ends` |
 //! | The sink checks rows, frames, bytes, and the ending reserve | the `the_sink_*` and `a_*cap*` tests |
 //! | Every budget returns after any operation sequence | `cancelling_a_session_frees_every_budget`, `operation_sequences_keep_every_bound` |
+//! | Waiting requests allocate no response channel | `queued_requests_allocate_only_commitments_until_dispatch` |
+//! | Serving output leaves a queue slot for control | `serving_output_keeps_a_queue_slot_for_control_messages` |
+//! | The ending frees the count before the peer can replace the request | `ending_publication_frees_the_count_before_a_peer_can_replace_its_request` |
+//! | A serving panic closes only its own connection | `serving_panics_close_the_connection_even_with_a_blocked_writer`, `a_writer_panic_records_the_cause_and_cancels_the_connection` |
 
 mod capacity;
 mod completion;

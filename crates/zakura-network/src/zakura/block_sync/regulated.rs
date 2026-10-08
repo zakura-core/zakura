@@ -12,6 +12,8 @@ pub(super) mod session;
 pub(super) mod status_sender;
 pub(super) mod wire;
 
+#[cfg(all(test, feature = "zakura-testkit"))]
+mod conformance_tests;
 #[cfg(test)]
 mod requester_tests;
 #[cfg(test)]

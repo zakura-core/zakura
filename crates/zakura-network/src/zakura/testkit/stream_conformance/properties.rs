@@ -149,13 +149,15 @@ pub(crate) async fn request_margin<A: StreamConformance>(
         let limit = plan.max_in_flight;
         let serving = &victim.shared().serving[index];
 
-        // Exactly `limit` open, each re-sent at its ending, for many rounds.
+        // Refill at every ending for at least one complete window. Small
+        // windows exercise more rounds without turning large limits into load tests.
+        let exchanges = (limit * 2).max(256).min(limit * 32);
         let (mut raw, _) = raw_peer(&victim, layout, seed + 1).await?;
         for exchange in 0..limit {
             raw.send(plan.stream, &encode::<A>(plan.row, exchange)?)
                 .await?;
         }
-        for exchange in limit..limit * 32 {
+        for exchange in limit..exchanges {
             read_ending::<A>(&mut raw, plan).await?;
             raw.send(plan.stream, &encode::<A>(plan.row, exchange)?)
                 .await?;

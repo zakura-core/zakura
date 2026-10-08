@@ -1,13 +1,15 @@
 # Fork-aware headers-only chain engine specification
 
 Status: normative design oracle for the replacement of PR #229<br>
-Version: 1.5<br>
-Date: 2026-09-21<br>
+Version: 1.6<br>
+Date: 2026-10-07<br>
 Scope: Zakura native (v2 P2P) header sync and its integration with Zakura full state
 
 Version 1.4 removes every backward-compatibility surface from this engine. There is exactly one header-sync message set, one codec, one status message, and one supported stream version. The previous native stream version 7, its dual-version negotiation, and the legacy Zcash `getheaders` fallback are not implemented, not served, and not tested. The legacy Zcash P2P stack is out of scope entirely: this engine neither reads, writes, nor changes it.
 
 Version 1.5 makes full-state fork eviction recoverable. Newly accepted branches remain available for extension within the existing full-state fork limit. Atomic block acceptance and reconsideration clear verification markers for evicted bodies while leaving their headers eligible. This adds no wire or disk fields.
+
+Version 1.6 excludes targets advertised at or below local finality from ordinary discovery scheduling. Explicitly selected historical auxiliary repair remains separate. This adds no wire or disk fields.
 
 ## Document overview
 
@@ -537,7 +539,7 @@ Each schema-1 height must equal its parallel header’s inferred height. Root de
 
 **LC-WIRE-11 [ZW] — Peer-attributable violations.** Unsolicited/mismatched request IDs, a common ancestor not in the sent locator, broken returned ancestry, a completed sequence with the wrong target hash, malformed bounds, or an invalid header MUST be peer-attributable evidence.
 
-**LC-WIRE-12 [ZW] — Unknown-fork discovery.** A same-height/different-hash status, a shorter tip claiming more work, or any unknown target hash MUST be eligible for discovery scheduling. Locally validated complete suffixes, never advertised heights or work, determine whether selection changes. Advertised suffix work is commensurable with local work only when both snapshots name the same work anchor or one anchor is a retained ancestor of the other, in which case the requester MAY rebase the claim across the locally known per-block work between the anchors. When the anchors are not comparable, an unknown target remains discovery-eligible on hash evidence alone, and the incomparable work claim MUST NOT be used to suppress or deprioritize discovery below its normal scheduling.
+**LC-WIRE-12 [ZW] — Unknown-fork discovery.** For targets advertised above the local finalized height, a same-height/different-hash status, a shorter tip claiming more work, or any unknown target hash MUST be eligible for discovery scheduling. Ordinary discovery MUST skip targets advertised at or below the local finalized height. This scheduling restriction MUST NOT apply to explicitly selected historical auxiliary repair. Locally validated complete suffixes, never advertised heights or work, determine whether selection changes. Advertised suffix work is commensurable with local work only when both snapshots name the same work anchor or one anchor is a retained ancestor of the other, in which case the requester MAY rebase the claim across the locally known per-block work between the anchors. When the anchors are not comparable, an unknown target advertised above local finality remains discovery-eligible on hash evidence alone, and the incomparable work claim MUST NOT be used to suppress or deprioritize discovery below its normal scheduling.
 
 ### 5.5 Peers without this protocol
 
@@ -734,7 +736,7 @@ The “architecture dependency check” asserts that wallet scanning, FlyClient 
 
 **LC-ACCEPT-04 [LS] — Terminating body-failure handling.** Body-invalid and body-unavailable cases MUST terminate each retry episode in either deterministic reselection or an explicit persistent alarm; neither may produce an infinite silent retry.
 
-**LC-ACCEPT-05 [LS] — Explained parity differences.** The full-state/header differential suite MUST enumerate and explain every intentional difference. Version 1.5 acceptance MUST contain no unresolved design placeholders.
+**LC-ACCEPT-05 [LS] — Explained parity differences.** The full-state/header differential suite MUST enumerate and explain every intentional difference. Version 1.6 acceptance MUST contain no unresolved design placeholders.
 
 ## 8. Implementation oracle and source authority
 

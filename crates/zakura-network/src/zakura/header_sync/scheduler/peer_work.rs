@@ -1042,7 +1042,7 @@ mod tests {
     }
 
     #[test]
-    fn unknown_status_targets_remain_eligible_regardless_of_advisory_shape() {
+    fn unknown_targets_above_finality_remain_eligible_regardless_of_work_claims() {
         let local = snapshot();
 
         let mut same_height_fork = advertisement(1);
@@ -1071,10 +1071,12 @@ mod tests {
         assert_eq!(incomparable.claimed_work_order(&local), None);
 
         let mut known = advertisement(4);
+        known.status.selected_tip_height = local.frontiers.header_best.height;
         known.status.selected_tip_hash = local.frontiers.header_best.hash;
         assert!(!known.is_discovery_eligible(&local));
 
         let mut pure_requester = advertisement(5);
+        pure_requester.status.selected_tip_height = local.frontiers.header_best.height;
         pure_requester.status.max_headers_per_response = 0;
         assert!(!pure_requester.is_discovery_eligible(&local));
     }

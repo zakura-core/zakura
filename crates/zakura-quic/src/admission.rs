@@ -190,7 +190,7 @@ impl Future for ConnectionAttempt {
                 std::task::ready!(Pin::new(accepted).poll(cx));
                 let connection = connection
                     .take()
-                    .expect("polled again after the handshake finished");
+                    .expect("the connection is present because a future is never polled after it returns Ready");
                 // `accepted` also resolves when the handshake fails.
                 match connection.close_reason() {
                     Some(error) => Err(error),

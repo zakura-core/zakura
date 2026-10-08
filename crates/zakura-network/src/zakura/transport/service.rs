@@ -476,6 +476,16 @@ pub trait Service: fmt::Debug + Send + Sync + 'static {
         Ok(None)
     }
 
+    /// Reserve capacity for the negotiated layout, identified by its primary stream.
+    /// Services with one capacity policy can keep overriding [`Self::reserve_session`].
+    fn reserve_session_for_stream(
+        &self,
+        _stream: Stream,
+        direction: ServicePeerDirection,
+    ) -> Result<Option<std::sync::Arc<dyn SessionResources>>, SessionFull> {
+        self.reserve_session(direction)
+    }
+
     /// Return the opening and re-admission policy for the whole service session.
     ///
     /// The default preserves the legacy one-shot initiator-opens behavior.

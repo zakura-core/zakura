@@ -601,6 +601,8 @@ struct HeaderSyncBackgroundTasks {
 /// Durable state facts required before attaching the production header-sync driver.
 #[derive(Clone, Debug)]
 pub struct ZakuraHeaderSyncDriverStartup {
+    /// State-backed source for bounded native GetBlocks serving.
+    pub block_range_source: Arc<dyn super::BlockRangeSource>,
     /// Durable state frontiers loaded at node startup.
     pub frontiers: FullStateFrontiers,
     /// Durable best header tip loaded from state.
@@ -2488,7 +2490,8 @@ impl ZakuraProtocolHandler {
             close_cause.record("resource_ordered_streams");
             connection_token.cancel();
         } else if !negotiated_ordered_streams.is_empty()
-            && usize::from(limits.max_inbound_queue_depth) < negotiated_ordered_streams.len()
+            && usize::from(limits.max_inbound_queue_depth)
+                < minimum_ordered_queue_capacity(&negotiated_ordered_streams)
         {
             debug!(
                 max_inbound_queue_depth = limits.max_inbound_queue_depth,
@@ -3036,7 +3039,7 @@ impl ZakuraProtocolHandler {
             .registry
             .service_for_kind(stream.kind)
             .expect("a selected stream has an owning service")
-            .reserve_session(direction)
+            .reserve_session_for_stream(stream, direction)
             .map_err(|_| ZakuraHandlerError::SessionFull)?;
         let wire_id = layout.is_multi_stream().then(random_stream_session_seed);
         let mut prepared = Vec::with_capacity(layout.streams.len());
@@ -3387,8 +3390,12 @@ impl ZakuraProtocolHandler {
             connection.close(VarInt::from_u32(ZAKURA_CLOSE_RESOURCE), b"ordered streams");
             return Ok(());
         }
-        if ordered_stream_count > 0
-            && usize::from(context.limits.max_inbound_queue_depth) < ordered_stream_count
+        if usize::from(context.limits.max_inbound_queue_depth)
+            < minimum_ordered_queue_capacity(
+                &self
+                    .registry
+                    .persistent_streams_for_negotiated(context.accepted_capabilities),
+            )
         {
             debug!(
                 max_inbound_queue_depth = context.limits.max_inbound_queue_depth,
@@ -3797,7 +3804,8 @@ async fn spawn_zakura_endpoint_inner(
                 best_header_tip,
                 driver_startup.committed_views.clone(),
                 config.zakura.block_sync.clone(),
-            );
+            )
+            .with_range_source(driver_startup.block_range_source.clone());
             startup.shutdown = header_sync_shutdown.clone();
             startup.trace = trace.clone();
             let (handle, actions, task) = spawn_block_sync_reactor(startup.with_retention(
@@ -5559,6 +5567,20 @@ fn inbound_frame_cap_for_stream(limits: &ZakuraConnectionLimits, stream: Stream)
         u32::try_from(FRAME_HEADER_BYTES).expect("frame header byte count fits in u32");
     application_frame_cap(limits, stream)
         .min(limits.max_message_bytes.saturating_add(frame_header_bytes))
+}
+
+fn minimum_ordered_queue_capacity(streams: &[Stream]) -> usize {
+    // Regulation needs independent room for a response and requests/control.
+    // Legacy layouts retain their existing one-slot compatibility.
+    let slots = if streams.iter().any(|stream| {
+        stream.kind == crate::zakura::ZAKURA_STREAM_BLOCK_SYNC
+            && stream.version == crate::zakura::ZAKURA_REGULATED_BLOCK_SYNC_STREAM_VERSION
+    }) {
+        2
+    } else {
+        1
+    };
+    streams.len().saturating_mul(slots)
 }
 
 fn per_stream_inbound_queue_depth(
@@ -9961,6 +9983,45 @@ mod tests {
                 .is_err(),
             "a frame one byte over the declared custom cap must be rejected"
         );
+    }
+
+    #[test]
+    fn regulated_block_sync_needs_two_slots_without_changing_legacy_depths() {
+        let regulated = crate::zakura::block_sync_streams()[0];
+        let legacy = Stream {
+            version: crate::zakura::ZAKURA_BLOCK_SYNC_STREAM_VERSION,
+            capability: crate::zakura::ZAKURA_CAP_BLOCK_SYNC,
+            messages: None,
+            ..regulated
+        };
+        assert_eq!(minimum_ordered_queue_capacity(&[legacy]), 1);
+        assert_eq!(minimum_ordered_queue_capacity(&[regulated]), 2);
+        assert_eq!(
+            minimum_ordered_queue_capacity(&[regulated, Stream { kind: 5, ..legacy }]),
+            4
+        );
+    }
+
+    #[test]
+    fn legacy_block_sync_keeps_its_message_bucket_when_regulation_is_not_negotiated() {
+        let regulated = crate::zakura::block_sync_streams()[0];
+        let legacy = tabled_context(None, 1);
+        let regulated = tabled_context(regulated.messages, 1);
+        let request = probe_frame(2, 9);
+        assert_eq!(
+            admit_inbound_message(&request, &legacy, 6),
+            InboundMessageAdmission::Admit
+        );
+        assert_ne!(
+            admit_inbound_message(&request, &legacy, 6),
+            InboundMessageAdmission::Admit
+        );
+        for _ in 0..4 {
+            assert_eq!(
+                admit_inbound_message(&request, &regulated, 6),
+                InboundMessageAdmission::Admit
+            );
+        }
     }
 
     #[test]

@@ -201,6 +201,7 @@ pub fn spawn_block_sync_reactor(
     let (sequencer_view_tx, sequencer_view_rx) = watch::channel(initial_view(startup.frontiers));
     // Shared peer facts are also the exact per-supplier body-retry admission gate.
     let registry = Arc::new(PeerRegistry::new());
+    registry.retain_body_retry_scope(initial_body_scope);
     synchronize_persisted_body_alarm(&registry, committed_view.as_ref());
     let mut retry_jitter_seed = [0u8; 32];
     OsRng.fill_bytes(&mut retry_jitter_seed);
@@ -238,6 +239,18 @@ pub fn spawn_block_sync_reactor(
     // The shared download primitives every pipe-routine is wired with at spawn
     // (`service::add_peer`), carried through the handle.
     let routine_wiring = RoutineWiring {
+        // Preserve one full protocol window while bounding authorization state
+        // across every active and draining session. The count fits usize.
+        request_pool: crate::zakura::regulation::ReservationPool::new(
+            MAX_BS_INFLIGHT_REQUESTS as usize,
+        )
+        .expect("the protocol request ceiling is positive and representable"),
+        serving: startup.range_source.clone().map(|source| {
+            Arc::new(super::regulated::session::Serving::new(
+                source,
+                &startup.config,
+            ))
+        }),
         config: startup.config.clone(),
         budget: state.budget.clone(),
         work: state.work_queue.clone(),
@@ -2036,7 +2049,12 @@ impl BlockSyncReactor {
         let result = session.try_send_status(status);
         match &result {
             Ok(()) => peer_state.status_delivery.queued(status, now),
-            Err(OrderedSendError::Full) => peer_state.status_delivery.queue_full(now),
+            Err(OrderedSendError::Full) => {
+                peer_state.status_delivery.queue_full(now);
+                if let Some(deadline) = session.status_next_due() {
+                    peer_state.status_delivery.defer_until(deadline);
+                }
+            }
             Err(_) => {}
         }
         match result {

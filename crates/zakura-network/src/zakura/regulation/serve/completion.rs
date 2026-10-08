@@ -19,6 +19,9 @@ impl CompletionId {
     }
 }
 
+/// Records kept after a drain regardless of load, so steady traffic does not reallocate.
+const MIN_RETAINED_RECORDS: usize = 64;
+
 #[derive(Debug, Default)]
 struct State {
     sequence: u64,
@@ -62,6 +65,12 @@ impl Completions {
         let mut state = self.0.lock().unwrap_or_else(PoisonError::into_inner);
         for id in state.completed.drain(..) {
             consume(id);
+        }
+        // Return a burst's reservation. The retained capacity still covers every
+        // pending record, so completion never allocates on a producer thread.
+        let target = state.pending.max(MIN_RETAINED_RECORDS);
+        if state.completed.capacity() > 4 * target {
+            state.completed.shrink_to(2 * target);
         }
     }
 }
@@ -191,6 +200,24 @@ mod tests {
         let mut records = Vec::new();
         completed.drain(|id| records.push(id));
         assert_eq!(records, expected);
+    }
+
+    /// A burst's reservation is released once its records drain.
+    #[test]
+    fn draining_after_a_burst_releases_its_reservation() {
+        let completed = Completions::default();
+        let burst: Vec<_> = (0..10_000).map(|key| completed.track(key)).collect();
+        let still_pending = completed.track(u64::MAX);
+        drop(burst);
+        completed.drain(|_| {});
+        let capacity = completed.0.lock().unwrap().completed.capacity();
+        assert!(capacity >= 1, "the pending record keeps its reservation");
+        assert!(
+            capacity <= 4 * MIN_RETAINED_RECORDS,
+            "retained {capacity} records"
+        );
+        let (_, allocations) = zakura_test::allocations::measure(|| drop(still_pending));
+        assert_eq!(allocations.requests, 0);
     }
 
     /// Old jobs neither retain retired state nor notify a replacement session.

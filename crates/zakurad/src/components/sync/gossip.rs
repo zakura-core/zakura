@@ -22,16 +22,11 @@ use crate::{
 
 use BlockGossipError::*;
 
-/// A spawned mined-block broadcast finished.
+/// A spawned committed mined-block broadcast finished.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct MinedBlockBroadcastCompleted {
     hash: block::Hash,
     succeeded: bool,
-    /// Whether this was the early broadcast of an admitted block.
-    ///
-    /// A failed early broadcast needs no committed-tip fallback: the RPC reports it, and the
-    /// `Committed` event that follows sends the committed broadcast.
-    early: bool,
 }
 
 #[derive(Debug)]
@@ -199,7 +194,7 @@ where
                     height,
                     submitted_at,
                     submission,
-                    advertised,
+                    pending,
                 }) => (
                     (
                         (hash, height),
@@ -207,23 +202,9 @@ where
                         chain_state,
                     ),
                     true,
-                    Some((advertised, submitted_at, submission)),
+                    Some((pending, submitted_at, submission)),
                 ),
-                // The early broadcast already reached peers, and the pending registry served the
-                // body until the commit finished.
-                GossipEvent::MinedBlock(MinedBlockEvent::Committed {
-                    hash,
-                    height: _,
-                    early_advertised: true,
-                }) => {
-                    chain_state.mark_last_change_hash(hash);
-                    continue;
-                }
-                GossipEvent::MinedBlock(MinedBlockEvent::Committed {
-                    hash,
-                    height,
-                    early_advertised: false,
-                }) => (
+                GossipEvent::MinedBlock(MinedBlockEvent::Committed { hash, height }) => (
                     (
                         (hash, height),
                         "sending committed mined block broadcast",
@@ -232,19 +213,6 @@ where
                     true,
                     None,
                 ),
-                GossipEvent::MinedBlock(MinedBlockEvent::Failed {
-                    hash,
-                    height,
-                    early_advertised,
-                }) => {
-                    debug!(
-                        ?hash,
-                        ?height,
-                        early_advertised,
-                        "mined block lifecycle failed"
-                    );
-                    continue;
-                }
                 GossipEvent::CommittedTip(tip_change_close_to_network_tip) => {
                     (tip_change_close_to_network_tip?, false, None)
                 }
@@ -278,34 +246,38 @@ where
         // Include readiness in the deadline. The event loop must keep consuming lifecycle and tip
         // events when the peer set has no ready service.
         let network = broadcast_network.clone();
-        // The RPC registers an admitted block's body before it sends the early event, so peers
-        // that follow an early inventory receive the body while the commit continues. A successful
-        // early broadcast therefore suppresses the committed-tip broadcast, like a committed one.
-        let completion_tx = is_block_submission.then(|| {
+        // Keep the committed-tip fallback until the committed broadcast succeeds. An admitted
+        // body can be served immediately, but contextual failure still cancels early inventory.
+        let completion_tx = (is_block_submission && early.is_none()).then(|| {
             mined_block_broadcasts.start(hash);
             mined_block_completion_sender.clone()
         });
         tokio::spawn(async move {
-            let succeeded = broadcast_with_timeout(network, request).await;
-            let is_early = early.is_some();
-            if let Some((advertised, submitted_at, submission)) = early {
-                if succeeded {
-                    metrics::counter!("mining.optimistic_inventory.early_inventories").increment(1);
-                    metrics::histogram!(
-                        "mining.submit_to_inventory.duration_seconds",
-                        "method" => submission.rpc_method()
-                    )
-                    .record(submitted_at.elapsed().as_secs_f64());
+            let broadcast = broadcast_with_timeout(network, request);
+            let succeeded = match early {
+                Some((mut pending, submitted_at, submission)) => {
+                    if !pending.is_valid() {
+                        false
+                    } else {
+                        let succeeded = tokio::select! {
+                            biased;
+                            _ = pending.wait_for_failure() => false,
+                            succeeded = broadcast => succeeded,
+                        };
+                        if succeeded {
+                            metrics::counter!("mining.optimistic_inventory.early_inventories")
+                                .increment(1);
+                            metrics::histogram!("mining.submit_to_inventory.duration_seconds", "method" => submission.rpc_method())
+                                .record(submitted_at.elapsed().as_secs_f64());
+                        }
+                        succeeded
+                    }
                 }
-                let _ = advertised.send(succeeded);
-            }
+                None => broadcast.await,
+            };
 
             if let Some(completion_tx) = completion_tx {
-                let _ = completion_tx.send(MinedBlockBroadcastCompleted {
-                    hash,
-                    succeeded,
-                    early: is_early,
-                });
+                let _ = completion_tx.send(MinedBlockBroadcastCompleted { hash, succeeded });
             }
         });
     }
@@ -341,10 +313,7 @@ fn finish_mined_block_broadcast<ZN>(
     }
 
     // A newer tip gets its own committed-tip broadcast.
-    if completed.early
-        || !needs_fallback
-        || chain_state.latest_chain_tip().best_tip_hash() != Some(hash)
-    {
+    if !needs_fallback || chain_state.latest_chain_tip().best_tip_hash() != Some(hash) {
         return;
     }
 
@@ -384,9 +353,7 @@ impl MinedBlockBroadcasts {
     /// Returns `true` if the hash now needs the committed-tip fallback: this broadcast failed, no
     /// other broadcast of the hash is in flight, and none has succeeded.
     fn finish(&mut self, completed: MinedBlockBroadcastCompleted) -> bool {
-        let MinedBlockBroadcastCompleted {
-            hash, succeeded, ..
-        } = completed;
+        let MinedBlockBroadcastCompleted { hash, succeeded } = completed;
 
         if let Some(count) = self.in_flight.get_mut(&hash) {
             *count = count.saturating_sub(1);
@@ -432,13 +399,11 @@ mod tests {
                 .send(MinedBlockEvent::Committed {
                     hash: submitted_hash,
                     height: block::Height(1),
-                    early_advertised: false,
                 })
                 .unwrap();
             let completed = MinedBlockBroadcastCompleted {
                 hash: submitted_hash,
                 succeeded: true,
-                early: false,
             };
             mark_sender.send(completed).unwrap();
 
@@ -466,7 +431,6 @@ mod tests {
                 GossipEvent::MinedBlock(MinedBlockEvent::Committed {
                     hash,
                     height: block::Height(1),
-                    early_advertised: false,
                 }) if hash == submitted_hash
             ));
 
@@ -487,7 +451,6 @@ mod tests {
         let failed = MinedBlockBroadcastCompleted {
             hash,
             succeeded: false,
-            early: false,
         };
         let mut broadcasts = MinedBlockBroadcasts::default();
 
@@ -516,12 +479,10 @@ mod tests {
         assert!(!broadcasts.finish(MinedBlockBroadcastCompleted {
             hash,
             succeeded: true,
-            early: false,
         }));
         assert!(!broadcasts.finish(MinedBlockBroadcastCompleted {
             hash,
             succeeded: false,
-            early: false,
         }));
         assert!(!broadcasts.is_in_flight(&hash));
     }

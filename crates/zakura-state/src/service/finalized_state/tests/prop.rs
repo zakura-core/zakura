@@ -5,7 +5,7 @@ use std::{
     env,
     error::Error,
     fs,
-    sync::{Arc, Mutex, OnceLock},
+    sync::{Arc, Mutex},
 };
 
 use tempfile::TempDir;
@@ -2971,7 +2971,7 @@ fn read_service_over(finalized_state: &FinalizedState) -> crate::ReadStateServic
     ReadStateService::new(
         finalized_state,
         None,
-        Arc::new(OnceLock::new()),
+        Arc::new(crate::service::write::BlockWriteFailure::default()),
         WatchReceiver::new(non_finalized_receiver),
         repair_receiver,
         HeaderChainSubscriptions {

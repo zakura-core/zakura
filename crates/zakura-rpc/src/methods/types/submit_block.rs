@@ -1,11 +1,14 @@
-//! Parameter, response, and lifecycle types for mined-block RPCs.
+//! Parameter and response types for the `submitblock` RPC.
 
 use std::{
     collections::{HashMap, HashSet},
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    },
 };
 
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, watch};
 
 use zakura_chain::block;
 
@@ -32,6 +35,10 @@ pub struct SubmitBlockParameters {
     /// > Therefore, using a "workid" is a very cheap solution to enable more mutations.
     ///
     /// <https://en.bitcoin.it/wiki/BIP_0022#Rationale>
+    ///
+    /// Zakura accepts this field but does not read it. The verifier identifies a prepared
+    /// candidate by its content, so a submission reuses the prepared work whether or not the
+    /// miner echoes the work ID back.
     #[serde(rename = "workid")]
     pub work_id: Option<String>,
 }
@@ -127,8 +134,8 @@ pub enum MinedBlockEvent {
         submitted_at: std::time::Instant,
         /// The RPC method that accepted the submission.
         submission: MinedBlockSubmission,
-        /// Reports whether the early network advertisement completed.
-        advertised: oneshot::Sender<bool>,
+        /// Cancels the advertisement if contextual verification rejects the block.
+        pending: PendingBlockSignal,
     },
     /// The contextual commit completed.
     Committed {
@@ -136,74 +143,182 @@ pub enum MinedBlockEvent {
         hash: block::Hash,
         /// The block height.
         height: block::Height,
-        /// Whether the early advertisement completed successfully.
-        early_advertised: bool,
-    },
-    /// The contextual commit failed after state admission.
-    Failed {
-        /// The block hash.
-        hash: block::Hash,
-        /// The block height.
-        height: block::Height,
-        /// Whether peers received an early inventory.
-        early_advertised: bool,
     },
 }
 
-/// Holds admitted block bodies until their contextual commits finish.
-#[derive(Clone, Debug, Default)]
-pub struct PendingBlockRegistry(Arc<Mutex<HashMap<block::Hash, Arc<block::Block>>>>);
+#[derive(Clone, Debug)]
+enum PendingStatus {
+    Waiting,
+    Committed,
+    Failed,
+}
+
+#[derive(Debug)]
+struct PendingBlock {
+    owner_id: u64,
+    block: Arc<block::Block>,
+    status: watch::Sender<PendingStatus>,
+}
+
+/// Stores admitted block bodies with their registration owners.
+#[derive(Debug)]
+struct PendingBlockRegistryInner {
+    entries: Mutex<HashMap<block::Hash, PendingBlock>>,
+    next_owner_id: AtomicU64,
+}
+
+/// Holds early-advertised block bodies until their contextual commits finish.
+#[derive(Clone, Debug)]
+pub struct PendingBlockRegistry(Arc<PendingBlockRegistryInner>);
+
+impl Default for PendingBlockRegistry {
+    fn default() -> Self {
+        Self(Arc::new(PendingBlockRegistryInner {
+            entries: Mutex::new(HashMap::new()),
+            next_owner_id: AtomicU64::new(1),
+        }))
+    }
+}
+
+/// Reports whether an early-advertised block remains valid.
+#[derive(Debug)]
+pub struct PendingBlockSignal(watch::Receiver<PendingStatus>);
+
+impl PendingBlockSignal {
+    /// Returns true unless contextual verification has rejected the block.
+    pub fn is_valid(&self) -> bool {
+        !matches!(*self.0.borrow(), PendingStatus::Failed)
+    }
+
+    /// Returns a signal for a block that never fails, so tests in other crates can build an
+    /// early mined-block event without owning a registry entry.
+    #[cfg(feature = "proptest-impl")]
+    pub fn valid_for_tests() -> Self {
+        // Dropping the sender leaves the signal reading `Waiting`, so it stays valid and its
+        // failure future never resolves.
+        Self(watch::channel(PendingStatus::Waiting).1)
+    }
+
+    /// Resolves when contextual verification rejects the block.
+    pub async fn wait_for_failure(&mut self) {
+        loop {
+            let status = self.0.borrow_and_update().clone();
+            match status {
+                PendingStatus::Failed => return,
+                PendingStatus::Committed => std::future::pending::<()>().await,
+                PendingStatus::Waiting => {}
+            }
+
+            if self.0.changed().await.is_err() {
+                std::future::pending::<()>().await;
+            }
+        }
+    }
+}
+
+/// Owns one pending-block registry entry.
+#[derive(Debug)]
+pub struct PendingBlockRegistration {
+    registry: PendingBlockRegistry,
+    hash: block::Hash,
+    owner_id: u64,
+    /// A receiver for this registration's own entry, kept so `signal` needs no lookup.
+    receiver: watch::Receiver<PendingStatus>,
+    resolved: bool,
+}
+
+impl PendingBlockRegistration {
+    /// Returns a signal that cancels stale early inventory after commit failure.
+    pub(crate) fn signal(&self) -> PendingBlockSignal {
+        PendingBlockSignal(self.receiver.clone())
+    }
+
+    /// Resolves this registration and invalidates failed early advertisements.
+    pub fn resolve(mut self, result: Result<Arc<block::Block>, ()>) {
+        self.registry.resolve(self.hash, self.owner_id, result);
+        self.resolved = true;
+    }
+}
+
+impl Drop for PendingBlockRegistration {
+    fn drop(&mut self) {
+        if !self.resolved {
+            self.registry.resolve(self.hash, self.owner_id, Err(()));
+        }
+    }
+}
 
 impl PendingBlockRegistry {
     /// Inserts a block before its early inventory is sent.
     ///
-    /// Returns false when the bounded registry is full.
-    pub fn insert(&self, block: Arc<block::Block>) -> bool {
+    /// Returns no registration when the hash already has an owner or the registry is full.
+    pub fn insert(&self, block: Arc<block::Block>) -> Option<PendingBlockRegistration> {
         let hash = block.hash();
         let mut entries = self
             .0
+            .entries
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if entries.contains_key(&hash) {
-            return false;
+            return None;
         }
         if entries.len() >= MAX_PENDING_BLOCKS {
             metrics::counter!("mining.pending_registry.saturated").increment(1);
-            return false;
+            return None;
         }
 
-        entries.insert(hash, block);
-        true
+        let owner_id = self.0.next_owner_id.fetch_add(1, Ordering::Relaxed);
+        let (status, receiver) = watch::channel(PendingStatus::Waiting);
+        entries.insert(
+            hash,
+            PendingBlock {
+                owner_id,
+                block,
+                status,
+            },
+        );
+        Some(PendingBlockRegistration {
+            registry: self.clone(),
+            hash,
+            owner_id,
+            receiver,
+            resolved: false,
+        })
     }
 
-    /// Removes a block after its contextual commit settles.
-    ///
-    /// A distinct submission with the same hash cannot remove the registered block.
-    pub fn remove(&self, block: &Arc<block::Block>, committed: bool) {
-        let hash = block.hash();
+    fn resolve(&self, hash: block::Hash, owner_id: u64, result: Result<Arc<block::Block>, ()>) {
         let mut entries = self
             .0
+            .entries
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let owns_entry = entries
+        if entries
             .get(&hash)
-            .is_some_and(|registered| Arc::ptr_eq(registered, block));
-        let removed = owns_entry && entries.remove(&hash).is_some();
-
-        if removed && !committed {
-            metrics::counter!("mining.pending_registry.uncommitted").increment(1);
+            .is_none_or(|entry| entry.owner_id != owner_id)
+        {
+            return;
         }
+        let entry = entries
+            .remove(&hash)
+            .expect("entry exists because its owner matched under the same lock");
+        drop(entries);
+
+        let status = match result {
+            Ok(_) => PendingStatus::Committed,
+            Err(()) => PendingStatus::Failed,
+        };
+        entry.status.send_replace(status);
     }
 
-    /// Returns an admitted block body before contextual commit finishes.
+    /// Returns an admitted body immediately while its contextual commit is pending.
     pub fn get(&self, hash: block::Hash) -> Option<Arc<block::Block>> {
         let block = self
             .0
+            .entries
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(&hash)
-            .cloned();
-
+            .map(|entry| Arc::clone(&entry.block));
         if block.is_some() {
             metrics::counter!("mining.pending_registry.served").increment(1);
         }
@@ -312,6 +427,9 @@ pub struct SubmitBlockChannel {
 impl SubmitBlockChannel {
     /// Creates a new submit block channel
     pub fn new() -> Self {
+        // Only admitted early events and successful commit events enter this channel. Invalid and
+        // duplicate submissions cannot fill it, and the gossip task does not wait for peer
+        // readiness while consuming it.
         let (sender, receiver) = mpsc::unbounded_channel();
         Self { sender, receiver }
     }
@@ -370,88 +488,58 @@ mod tests {
     }
 
     #[test]
-    fn pending_block_is_served_before_commit() {
+    fn pending_block_is_served_until_commit() {
         let registry = PendingBlockRegistry::default();
         let block = test_block();
         let hash = block.hash();
-        assert!(registry.insert(block.clone()));
-
-        assert_eq!(registry.get(hash), Some(block));
-    }
-
-    #[test]
-    fn committed_block_leaves_the_registry() {
-        let registry = PendingBlockRegistry::default();
-        let block = test_block();
-        let hash = block.hash();
-        assert!(registry.insert(block.clone()));
-
-        registry.remove(&block, true);
-
+        let registration = registry
+            .insert(block.clone())
+            .expect("the registry accepts the block");
+        assert!(
+            registry.insert(block.clone()).is_none(),
+            "one hash has one owner"
+        );
+        assert_eq!(registry.get(hash), Some(block.clone()));
+        registration.resolve(Ok(block));
         assert_eq!(registry.get(hash), None);
     }
 
-    #[test]
-    fn uncommitted_block_leaves_the_registry() {
+    #[tokio::test]
+    async fn pending_block_failure_removes_body_and_cancels_stale_inventory() {
         let registry = PendingBlockRegistry::default();
         let block = test_block();
         let hash = block.hash();
-        assert!(registry.insert(block.clone()));
-
-        registry.remove(&block, false);
-
-        assert_eq!(registry.get(hash), None);
-    }
-
-    #[test]
-    fn duplicate_submission_cannot_remove_registered_block() {
-        let registry = PendingBlockRegistry::default();
-        let block = test_block();
-        let duplicate = Arc::new((*block).clone());
-        let hash = block.hash();
-        assert!(registry.insert(block.clone()));
-        assert!(!registry.insert(duplicate.clone()));
-
-        registry.remove(&duplicate, false);
-
+        let registration = registry
+            .insert(block.clone())
+            .expect("the registry accepts the block");
+        let mut signal = registration.signal();
+        assert!(signal.is_valid());
         assert_eq!(registry.get(hash), Some(block));
-    }
-
-    #[test]
-    fn unknown_hash_is_not_served() {
-        let registry = PendingBlockRegistry::default();
-        assert_eq!(registry.get(test_block().hash()), None);
-    }
-
-    #[test]
-    fn submit_solution_responses_match_mining_rpc_conventions() {
-        assert_eq!(
-            serde_json::to_value(SubmitSolutionResponse::Accepted)
-                .expect("accepted response serialization succeeds"),
-            serde_json::Value::Null
-        );
-        assert_eq!(
-            serde_json::to_value(SubmitSolutionResponse::from(
-                SubmitSolutionErrorResponse::StaleWork
-            ))
-            .expect("rejection response serialization succeeds"),
-            serde_json::Value::String("stale-work".to_owned())
-        );
+        registration.resolve(Err(()));
+        assert_eq!(registry.get(hash), None);
+        signal.wait_for_failure().await;
+        assert!(!signal.is_valid());
     }
 
     #[test]
     fn pending_registry_is_bounded() {
         let registry = PendingBlockRegistry::default();
         let original = test_block();
+        let mut registrations = Vec::new();
         for nonce in 0..MAX_PENDING_BLOCKS {
             let mut block = (*original).clone();
             let nonce = u8::try_from(nonce).expect("the registry bound fits in u8");
             Arc::make_mut(&mut block.header).nonce = [nonce; 32].into();
-            assert!(registry.insert(Arc::new(block)));
+            registrations.push(
+                registry
+                    .insert(Arc::new(block))
+                    .expect("the registry has capacity"),
+            );
         }
 
         let mut overflow = (*original).clone();
         Arc::make_mut(&mut overflow.header).nonce = [u8::MAX; 32].into();
-        assert!(!registry.insert(Arc::new(overflow)));
+        assert!(registry.insert(Arc::new(overflow)).is_none());
+        drop(registrations);
     }
 }

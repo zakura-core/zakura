@@ -2,7 +2,7 @@ name: Test Docker Config
 
 on:
   pull_request:
-    branches: [main, "feat/**", "split/**", "release/**"]
+    branches: [main, "feat/**", "split/**", "adam/**", "release/**"]
     types: [opened, synchronize, reopened]
     paths:
       - "crates/zakurad/src/**"
@@ -48,11 +48,10 @@ on:
       - .github/workflows/release-binaries.yml
       - .github/workflows/test-docker.yml
 
-# Ensures that only one workflow task will run at a time. Previous builds, if
-# already in process, will get cancelled. Only the latest commit will be allowed
-# to run, cancelling any workflows in between
+# A new push to a pull request cancels the run for its previous commit. Other
+# events use their run ID, so pushes to `main` never cancel each other.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
   cancel-in-progress: true
 
 permissions:
@@ -209,7 +208,9 @@ jobs:
   test-docker-config-success:
     name: Test Docker Config Success
     runs-on: ubuntu-latest
-    if: always()
+    # Skip, rather than fail, when a superseding run cancelled this one.
+    # See "Cancelled runs" in .github/workflows/README.md.
+    if: ${{ !cancelled() || github.event_name == 'pull_request' || github.event_name == 'merge_group' }}
     needs:
       - test-docker-image
     timeout-minutes: 30

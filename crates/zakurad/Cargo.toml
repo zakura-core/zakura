@@ -63,21 +63,24 @@ pre-release-replacements = [
 # <https://docs.rs/about/metadata>
 features = [
     "default-release-binaries",
-    "flamegraph",
     "journald",
     "opentelemetry",
     "prometheus",
-    "sentry",
     "indexer",
 ]
 
 [features]
 # In release builds, don't compile debug logging code, to improve performance.
-default-release-binaries = ["release_max_level_info", "progress-bar", "prometheus", "opentelemetry"]
+default-release-binaries = ["release_max_level_info", "prometheus", "opentelemetry"]
 
 
 # Local builds use the compiler's target features for Pasta arithmetic.
 default = ["default-release-binaries"]
+
+# Legacy flags accepted for build compatibility; the progress display is removed.
+progress-bar = ["howudoin", "indicatif", "zakura-consensus/progress-bar", "zakura-state/progress-bar", "zakura-network/progress-bar"]
+howudoin = []
+indicatif = []
 
 # Disable x86-64 Pasta assembly for redistributable binaries.
 # Local builds can use BMI2+ADX when enabled by the Rust target.
@@ -96,25 +99,15 @@ sync-metrics = ["zakura-network/sync-metrics"]
 
 # Experimental internal miner support
 internal-miner = [
-    "thread-priority",
+    "dep:windows-sys",
     "zakura-chain/internal-miner",
     # TODO: move common code into zakura-chain or zakura-node-services and remove the RPC dependency
     "zakura-rpc/internal-miner",
 ]
 
 # Tracing and monitoring
-# Opt in explicitly: the tracing layer has overhead even without a SENTRY_DSN.
-sentry = ["dep:sentry"]
 journald = ["tracing-journald"]
 opentelemetry = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "dep:tracing-opentelemetry"]
-
-progress-bar = [
-    "howudoin",
-    "indicatif",
-    "zakura-consensus/progress-bar",
-    "zakura-state/progress-bar",
-    "zakura-network/progress-bar",
-]
 
 prometheus = ["metrics-exporter-prometheus"]
 
@@ -136,8 +129,6 @@ max_level_info = ["tracing/max_level_info"]
 max_level_debug = ["tracing/max_level_debug", "log/max_level_debug"]
 
 # Testing features that activate extra dependencies
-flamegraph = ["tracing-flame", "inferno"]
-
 proptest-impl = [
     "proptest",
     "proptest-derive",
@@ -174,8 +165,8 @@ comparison-interpreter = ["zakura-script/comparison-interpreter"]
 
 [dependencies]
 zakura-chain = { path = "../zakura-chain", version = "10.0.0" }
-zakura-consensus = { path = "../zakura-consensus", version = "10.1.0" }
-zakura-header-chain = { path = "../zakura-header-chain", version = "4.0.1" }
+zakura-consensus = { path = "../zakura-consensus", version = "11.0.0" }
+zakura-header-chain = { path = "../zakura-header-chain", version = "4.1.0" }
 zakura-jsonl-trace = { path = "../zakura-jsonl-trace", version = "1.2.0" }
 zakura-network = { path = "../zakura-network", version = "10.0.0" }
 zakura-node-services = { path = "../zakura-node-services", version = "5.0.0", features = ["rpc-client"] }
@@ -196,7 +187,7 @@ zakura-utils = { path = "../zakura-utils", version = "2.2.7", optional = true }
 
 abscissa_core = { workspace = true, default-features = false, features = ["application"] }
 clap = { workspace = true, features = ["cargo"] }
-chrono = { workspace = true, features = ["clock", "std"] }
+chrono = { workspace = true }
 indexmap = { workspace = true }
 lazy_static = { workspace = true }
 semver = { workspace = true }
@@ -217,38 +208,22 @@ color-eyre = { workspace = true, features = ["issue-url"] }
 thiserror = { workspace = true }
 
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
-tracing-appender = { workspace = true }
+crossbeam-channel = { workspace = true }
 tracing-error = { workspace = true }
 tracing = { workspace = true }
 
 metrics = { workspace = true }
 
-dirs = { workspace = true }
 reqwest = { workspace = true, default-features = false, features = ["blocking", "rustls-no-provider"] }
+# Resolution constraint for transitive URL/DNS dependencies; no direct API use.
+idna_adapter = { workspace = true }
 sha2 = { workspace = true }
 tempfile = { workspace = true }
-flate2 = "1.1.9"
-tar = "0.4.46"
 
 # Health check server dependencies
 hyper = { workspace = true, features = ["server", "http1"] }
 http-body-util = { workspace = true }
 hyper-util = { workspace = true, features = ["service", "server", "tokio"] }
-
-# Configuration management
-config = { workspace = true }
-
-nix = { workspace = true, features = ["fs"] }
-
-# prod feature internal-miner
-thread-priority = { workspace = true, optional = true }
-
-# prod feature sentry
-sentry = { workspace = true, features = ["backtrace", "logs", "rustls", "tracing", "ureq"], optional = true }
-
-# prod feature flamegraph
-tracing-flame = { workspace = true, optional = true }
-inferno = { workspace = true, optional = true }
 
 # prod feature journald
 tracing-journald = { workspace = true, optional = true }
@@ -272,9 +247,6 @@ metrics-exporter-prometheus = { workspace = true, features = ["http-listener"], 
 # we only use `log` to set and print the static log levels in transitive dependencies
 log = { workspace = true }
 
-# prod feature progress-bar
-howudoin = { workspace = true, features = ["term-line"], optional = true }
-indicatif = { workspace = true, optional = true }
 
 # test feature proptest-impl
 proptest = { workspace = true, optional = true }
@@ -304,8 +276,8 @@ proptest = { workspace = true }
 proptest-derive = { workspace = true }
 
 zakura-chain = { path = "../zakura-chain", version = "10.0.0", features = ["proptest-impl"] }
-zakura-consensus = { path = "../zakura-consensus", version = "10.1.0", features = ["proptest-impl"] }
-zakura-header-chain = { path = "../zakura-header-chain", version = "4.0.1", features = ["test-support"] }
+zakura-consensus = { path = "../zakura-consensus", version = "11.0.0", features = ["proptest-impl"] }
+zakura-header-chain = { path = "../zakura-header-chain", version = "4.1.0", features = ["test-support"] }
 zakura-network = { path = "../zakura-network", version = "10.0.0", features = ["proptest-impl", "zakura-testkit"] }
 zakura-state = { path = "../zakura-state", version = "11.0.0", features = ["proptest-impl"] }
 zakura-rpc = { path = "../zakura-rpc", version = "13.0.0", features = ["proptest-impl"] }
@@ -324,9 +296,10 @@ zakura-test = { path = "../zakura-test", version = "3.0.0" }
 zakura-utils = { path = "../zakura-utils", version = "2.2.7" }
 
 [package.metadata.cargo-udeps.ignore]
-# These dependencies are false positives - they are actually used
+# These dependencies are used indirectly or constrain transitive resolution.
 normal = [
     "console-subscriber",  # Used behind the tokio-console feature flag
+    "idna_adapter",        # Selects the unicode-rs backend for URL/DNS dependencies
     "zakura-utils",         # Used for the zakura-checkpoints feature
 ]
 development = [
@@ -351,8 +324,11 @@ feature_missing = "warn"
 enum_variant_added = "warn"
 enum_variant_missing = "warn"
 
-[target.'cfg(all(target_os = "linux", target_env = "gnu"))'.dependencies]
-libc = "0.2.186"
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_System_Threading"], optional = true }
 
 [[bench]]
 name = "mempool_eviction"

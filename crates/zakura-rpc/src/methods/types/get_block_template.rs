@@ -8,6 +8,9 @@ pub mod zip317;
 #[cfg(test)]
 mod tests;
 
+pub(crate) mod prepared_candidates;
+use prepared_candidates::PreparedCandidateResolver;
+
 use std::{
     collections::{HashSet, VecDeque},
     fmt::{self},
@@ -46,8 +49,7 @@ use zcash_script::{opcode::PushValue, pv::push_value};
 use zakura_chain::serialization::BytesInDisplayOrder;
 
 use zakura_consensus::{
-    error::TransactionError, router::service_trait::BlockVerifierService,
-    PreparedCandidateResolver, MAX_BLOCK_SIGOPS,
+    error::TransactionError, router::service_trait::BlockVerifierService, MAX_BLOCK_SIGOPS,
 };
 use zakura_node_services::mempool::{self, TransactionDependencies};
 use zakura_state::GetBlockTemplateChainInfo;
@@ -72,6 +74,14 @@ pub use parameters::{
     GetBlockTemplateCapability, GetBlockTemplateParameters, GetBlockTemplateRequestMode,
 };
 pub use proposal::{BlockProposalResponse, BlockTemplateTimeSource};
+
+/// How many rejected work IDs one parent retains before the server stops trusting any of its
+/// templates and falls back for the rest of that parent.
+const MAX_REJECTED_WORK_IDS: usize = 64;
+
+/// How many validated work IDs one parent retains. The oldest is forgotten first, so a miner
+/// holding very old work loses its withdrawal exemption rather than growing this queue.
+const MAX_PREPARED_WORK_IDS: usize = 64;
 
 /// Proof construction can itself use multiple cores. Admit one build across RPC clones.
 const MAX_TEMPLATE_BUILDS: usize = 1;
@@ -102,7 +112,7 @@ impl TemplateRejections {
         if self.parent != Some(parent) || self.contains(work_id) {
             return false;
         }
-        if self.rejected.len() == 64 {
+        if self.rejected.len() == MAX_REJECTED_WORK_IDS {
             self.saturated = true;
         } else {
             self.rejected.insert(work_id.to_owned());
@@ -122,13 +132,22 @@ impl TemplateRejections {
         self.saturated || !self.rejected.is_empty()
     }
 
-    pub(crate) fn mark_prepared(&mut self, parent: block::Hash, work_id: &str) {
-        if self.parent == Some(parent) && !self.prepared.iter().any(|id| id == work_id) {
-            if self.prepared.len() == 64 {
-                self.prepared.pop_front();
-            }
-            self.prepared.push_back(work_id.to_owned());
+    /// Records that `work_id` passed validation on `parent`.
+    ///
+    /// Returns whether this withdrew any other work: the oldest prepared ID is forgotten when the
+    /// queue is full, and during fallback losing that exemption withdraws it. Waiters observe
+    /// withdrawal through the watch channel, so the caller must publish that change.
+    pub(crate) fn mark_prepared(&mut self, parent: block::Hash, work_id: &str) -> bool {
+        if self.parent != Some(parent) || self.prepared.iter().any(|id| id == work_id) {
+            return false;
         }
+        let evicted = if self.prepared.len() == MAX_PREPARED_WORK_IDS {
+            self.prepared.pop_front().is_some()
+        } else {
+            false
+        };
+        self.prepared.push_back(work_id.to_owned());
+        evicted && self.needs_fallback()
     }
 
     pub(crate) fn is_prepared(&self, work_id: &str) -> bool {
@@ -140,6 +159,12 @@ impl TemplateRejections {
     }
 }
 
+/// Coalesces speculative template preparation onto one worker with one pending template.
+///
+/// `running` admits exactly one preparation loop, and that loop does not take its next template
+/// until the previous template's verification has actually finished, so at most one speculative
+/// verification is ever in flight. Templates that arrive meanwhile replace `pending` rather than
+/// queueing behind it: only the newest is worth preparing.
 #[derive(Clone, Debug)]
 struct TemplatePreparationQueue<T>(Arc<Mutex<TemplatePreparationState<T>>>);
 
@@ -159,7 +184,8 @@ impl<T> Default for TemplatePreparationQueue<T> {
 }
 
 impl<T> TemplatePreparationQueue<T> {
-    fn enqueue(&self, template: T) -> Option<T> {
+    /// Queues `template`, and returns it with the worker slot when no loop is running.
+    fn enqueue(&self, template: T) -> Option<(T, PreparationWorker<T>)> {
         let mut state = self
             .0
             .lock()
@@ -169,7 +195,14 @@ impl<T> TemplatePreparationQueue<T> {
             None
         } else {
             state.running = true;
-            Some(template)
+            drop(state);
+            Some((
+                template,
+                PreparationWorker {
+                    queue: TemplatePreparationQueue(Arc::clone(&self.0)),
+                    released: false,
+                },
+            ))
         }
     }
 
@@ -183,6 +216,75 @@ impl<T> TemplatePreparationQueue<T> {
             state.running = false;
         }
         next
+    }
+}
+
+/// Holds the one speculative preparation slot for as long as its loop runs.
+///
+/// The loop must release the slot however it ends, including a `break` or a panic. Leaving
+/// `running` set would stop every later template from ever being prepared, so the release is a
+/// `Drop` rather than something each exit has to remember.
+pub(crate) struct PreparationWorker<T> {
+    queue: TemplatePreparationQueue<T>,
+    released: bool,
+}
+
+impl<T> PreparationWorker<T> {
+    /// Returns the newest queued template, releasing the slot when there is none.
+    pub(crate) fn next(&mut self) -> Option<T> {
+        let next = self.queue.next_or_finish();
+        self.released = next.is_none();
+        next
+    }
+}
+
+impl<T> Drop for PreparationWorker<T> {
+    fn drop(&mut self) {
+        if self.released {
+            return;
+        }
+        let mut state = self
+            .queue
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.pending = None;
+        state.running = false;
+    }
+}
+
+/// Whether speculative template preparation may start, and for which parent.
+///
+/// Speculative preparation runs full semantic verification on a template nobody submitted. The
+/// task that waits for it can give up, but giving up does not stop the verification: dropping a
+/// tower future leaves the work its request already dispatched running to completion. Starting
+/// another preparation on the same parent would repeat the cost that just failed to finish within
+/// its deadline, so one missed deadline stops speculation until the template parent changes.
+///
+/// This gates speculation only. Foreground template recovery and ordinary block submission still
+/// validate normally while it is tripped.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct SpeculationBreaker(Arc<Mutex<Option<block::Hash>>>);
+
+impl SpeculationBreaker {
+    /// Stops speculative preparation for `parent`, after one of its templates missed its deadline.
+    pub(crate) fn trip(&self, parent: block::Hash) {
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(parent);
+    }
+
+    /// Whether speculative preparation may start for `parent`.
+    ///
+    /// A new parent is the recovery condition: the chain moved on, so the templates that timed
+    /// out are gone and their cost says nothing about this one.
+    pub(crate) fn allows(&self, parent: block::Hash) -> bool {
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            != Some(parent)
     }
 }
 
@@ -714,7 +816,7 @@ where
     /// The chain verifier, used for submitting blocks.
     block_verifier_router: BlockVerifierRouter,
 
-    /// Resolves compact submissions from the verifier's prepared candidates.
+    /// Reconstructs compact submissions from bounded RPC work-ID aliases.
     prepared_candidates: PreparedCandidateResolver,
 
     /// The chain sync status, used for checking if Zebra is likely close to the network chain tip.
@@ -741,6 +843,9 @@ where
 
     /// Retains failures so late subscribers cannot miss template withdrawal.
     pub(crate) template_rejections: watch::Sender<TemplateRejections>,
+
+    /// Stops speculative preparation for a parent whose template missed its deadline.
+    pub(crate) speculation_breaker: SpeculationBreaker,
 }
 
 impl<BlockVerifierRouter, SyncStatus> GetBlockTemplateHandler<BlockVerifierRouter, SyncStatus>
@@ -748,32 +853,37 @@ where
     BlockVerifierRouter: BlockVerifierService,
     SyncStatus: ChainSyncStatus + Clone + Send + Sync + 'static,
 {
-    /// Creates a mining handler with shared pending and prepared candidates.
-    #[allow(clippy::too_many_arguments)]
-    pub fn new_with_prepared_candidates(
+    /// Creates a handler with its own pending-block registry.
+    ///
+    /// Use [`Self::set_pending_blocks`] to share one registry with peer serving.
+    pub fn new(
         net: &Network,
         conf: config::mining::Config,
         block_verifier_router: BlockVerifierRouter,
         sync_status: SyncStatus,
         mined_block_sender: Option<mpsc::UnboundedSender<MinedBlockEvent>>,
-        pending_blocks: PendingBlockRegistry,
-        prepared_candidates: PreparedCandidateResolver,
     ) -> Self {
         let optimistic_block_inventory = conf.optimistic_block_inventory;
         Self {
             miner_params: MinerParams::new(net, conf).ok(),
             block_verifier_router,
-            prepared_candidates,
+            prepared_candidates: PreparedCandidateResolver::default(),
             sync_status,
             mined_block_sender: mined_block_sender
                 .unwrap_or(SubmitBlockChannel::default().sender()),
-            pending_blocks,
+            pending_blocks: PendingBlockRegistry::default(),
             mined_submissions: Default::default(),
             optimistic_block_inventory,
             template_preparation_queue: TemplatePreparationQueue::default(),
             template_build_slots: Arc::new(Semaphore::new(MAX_TEMPLATE_BUILDS)),
             template_rejections: watch::channel(TemplateRejections::default()).0,
+            speculation_breaker: SpeculationBreaker::default(),
         }
+    }
+
+    /// Shares one pending-block registry with peer serving.
+    pub(crate) fn set_pending_blocks(&mut self, pending_blocks: PendingBlockRegistry) {
+        self.pending_blocks = pending_blocks;
     }
 
     /// Runs bounded proof work off the async worker, retaining capacity across cancellation.
@@ -828,7 +938,7 @@ where
     }
 
     /// Returns the prepared-candidate resolver.
-    pub fn prepared_candidates(&self) -> PreparedCandidateResolver {
+    pub(crate) fn prepared_candidates(&self) -> PreparedCandidateResolver {
         self.prepared_candidates.clone()
     }
 
@@ -847,17 +957,15 @@ where
         self.optimistic_block_inventory
     }
 
-    /// Queues a server template and returns the first item for a new worker.
+    /// Queues a server template, and returns it with the worker slot for a new loop.
     pub(crate) fn queue_template_preparation(
         &self,
         template: BlockTemplateResponse,
-    ) -> Option<BlockTemplateResponse> {
+    ) -> Option<(
+        BlockTemplateResponse,
+        PreparationWorker<BlockTemplateResponse>,
+    )> {
         self.template_preparation_queue.enqueue(template)
-    }
-
-    /// Returns the newest queued template or marks the worker idle.
-    pub(crate) fn next_template_preparation(&self) -> Option<BlockTemplateResponse> {
-        self.template_preparation_queue.next_or_finish()
     }
 
     /// Randomizes the coinbase data, if miner parameters are set.
@@ -929,17 +1037,14 @@ pub fn check_parameters(parameters: &Option<GetBlockTemplateParameters>) -> RpcR
     }
 }
 
-/// Attempts to validate block proposal against all of the server's
-/// usual acceptance rules (except proof-of-work).
-///
-/// Returns a [`GetBlockTemplateResponse`].
-pub async fn validate_block_proposal<BlockVerifierRouter, Tip, SyncStatus>(
+/// Validates a proposal, registering its work ID only after successful verification.
+pub(crate) async fn validate_block_proposal<BlockVerifierRouter, Tip, SyncStatus>(
     mut block_verifier_router: BlockVerifierRouter,
     block_proposal_bytes: Vec<u8>,
     net: &Network,
     latest_chain_tip: Tip,
     sync_status: SyncStatus,
-    work_id: Option<String>,
+    prepared_work: Option<(PreparedCandidateResolver, &str)>,
 ) -> RpcResult<GetBlockTemplateResponse>
 where
     BlockVerifierRouter: Service<
@@ -971,16 +1076,27 @@ where
         }
     };
 
+    let block = Arc::new(block);
     let block_verifier_router_response = block_verifier_router
         .ready()
         .await
         .map_err(|error| ErrorObject::owned(0, error.to_string(), None::<()>))?
         .call(zakura_consensus::Request::Prepare {
-            block: Arc::new(block),
-            work_id,
+            block: block.clone(),
             source: zakura_consensus::PreparedCandidateSource::ClientProposal,
         })
         .await;
+
+    if block_verifier_router_response.is_ok() {
+        if let Some((prepared_candidates, work_id)) = prepared_work {
+            prepared_candidates.insert(
+                block,
+                work_id,
+                zakura_consensus::PreparedCandidateSource::ClientProposal,
+                net,
+            );
+        }
+    }
 
     Ok(block_verifier_router_response
         .map(|_hash| BlockProposalResponse::Valid)

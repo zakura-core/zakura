@@ -62,7 +62,9 @@ async fn peer_block_lookup_serves_admitted_block_before_state() {
     });
     let state = Buffer::new(BoxService::new(state), 1);
     let pending_blocks = PendingBlockRegistry::default();
-    assert!(pending_blocks.insert(block.clone()));
+    let _registration = pending_blocks
+        .insert(block.clone())
+        .expect("the registry accepts the admitted block");
 
     assert_eq!(
         block_by_hash_or_pending(state, pending_blocks, hash)

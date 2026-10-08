@@ -436,3 +436,39 @@ async fn partly_refused_dial_reports_local_capacity() {
     .await
     .unwrap();
 }
+
+/// Closing a connection with an unread stream moves it to the draining budget:
+/// a new dial gets the live slot while the closed state is still owned (ADM-13).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn closed_connection_with_unread_stream_moves_to_draining() {
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        let server = server();
+        let client = QuicEndpoint::bind(
+            NodeSecretKey::generate(),
+            &draining_bind(1, 1, 1),
+            &test_config(),
+        )
+        .unwrap();
+        let conn = client.connect(server.addr(), ALPN).await.unwrap();
+        let weak = conn.noq().weak_handle();
+        let (mut send, mut recv) = conn.open_bi().await.unwrap();
+        send.write_all(&vec![9; 16 * 1024]).await.unwrap();
+        send.finish().unwrap();
+        recv.read_exact(&mut [0u8; 1]).await.unwrap();
+        conn.close(0u32.into(), b"retain unread response");
+        drop((conn, send));
+        while client.held_owners() != (0, 1) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let next = client.connect(server.addr(), ALPN).await.unwrap();
+        assert!(
+            weak.is_alive(),
+            "the unread stream still owns the closed state"
+        );
+        drop((next, recv));
+        client.shutdown().await;
+        server.endpoint.shutdown().await;
+    })
+    .await
+    .unwrap();
+}

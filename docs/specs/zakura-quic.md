@@ -296,18 +296,19 @@ work. Stage 2 runs after TLS proves the `NodeId` and is today's Zakura logic.
   use all unused slots. Closing or timing out MUST NOT bypass ADM-11.
   `QuicBindConfig::max_inbound_connections` sets the inbound share. Owner and
   control-handshake slots are partitioned. The transport count needs no
-  separate share: every inbound state holds a live or draining owner slot, so
-  inbound states leave the outbound live share free in the table.
+  separate share: every inbound state holds a live or draining owner slot
+  until noq frees it, so inbound states leave room for the outbound live share
+  in the table, apart from entries noq has not yet removed after drain.
 - **ADM-13.** When a connection fails or closes, its owner slot MUST move from
   the live budgets to a separate draining budget of
   `QuicBindConfig::max_draining_connections` slots until noq frees the state.
   If the draining budget is full, the connection keeps its live slot instead.
-  Inbound admission therefore counts only pending and established connections,
-  and failed attempts cannot fill the inbound share until they exhaust the
-  draining budget. Zakura sets that budget to twice `max_connections`, 512 by
-  default, so at a 52 s drain (ADM-7) an attacker needs about 10 failed
-  attempts per second, spread over at least 31 source IPs (ADM-3), to reach
-  the live share.
+  Inbound admission therefore counts only pending and established connections
+  while draining slots remain; once they run out, failed attempts again take
+  live slots. Zakura sets that budget to twice `max_connections`, 512 by
+  default. As an illustration, at a 52 s drain (ADM-7) failed attempts start
+  taking live slots at about 10 per second from at least 31 source IPs
+  (ADM-3), and fill the inbound share at about 14 per second from 44.
 
 ## 8. Dialing
 
@@ -738,5 +739,6 @@ requirements:
   take every slot and block outbound dials.
 - **ADM-13.** Added. With failed states charged to the live inbound share,
   about 14 source addresses sending 4.3 failed handshakes per second could keep
-  every honest inbound peer out.
+  every honest inbound peer out. The draining budget raises that cost; it does
+  not remove it.
 - **API-6.** Adds `ConnectError::Capacity`.

@@ -194,20 +194,34 @@ async fn concurrent_sockets_preserve_an_outbound_slot() {
     .unwrap();
 }
 
-/// The failed-handshake charge covers noq's three-PTO drain at the largest
-/// peer `max_ack_delay` (ADM-7).
-#[test]
-fn failed_handshake_drain_covers_the_largest_peer_ack_delay() {
-    // Three PTOs of three initial RTTs, 1 ms granularity and 2^14 ms of delay.
-    assert_eq!(
-        crate::endpoint::failed_handshake_drain(Duration::ZERO),
-        Duration::from_millis(3 * (999 + 1 + 16_384))
-    );
-    // RTT samples up to the attempt's age raise the bound.
-    assert_eq!(
-        crate::endpoint::failed_handshake_drain(Duration::from_secs(1)),
-        Duration::from_millis(3 * (5_000 + 1 + 16_384))
-    );
+/// A failed handshake's IP charge ends when noq frees the attempt, well before
+/// the 52 s worst-case drain a peer could force (ADM-7).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_handshake_charge_ends_when_noq_frees_it() {
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        let config = QuicConfig {
+            handshake_timeout_secs: Some(2),
+            retry_threshold: None,
+            ..test_config()
+        };
+        let server = server_with(&config, &loopback(), &[ALPN], |_| Admit::Accept);
+        let ip = server.endpoint.local_addrs()[0].ip();
+        let stalled = stalled_handshake(&server).await;
+        wait_for_attempts(&server, 1).await;
+        while server.endpoint.pending(ip) != (0, 1) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let failed = std::time::Instant::now();
+        while server.endpoint.pending(ip).1 > 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(open_transports(&server.endpoint), 0);
+        assert!(failed.elapsed() < Duration::from_secs(15));
+        drop(stalled);
+        server.endpoint.shutdown().await;
+    })
+    .await
+    .unwrap();
 }
 
 /// An IP stays charged for its failed and closed attempts while their state may

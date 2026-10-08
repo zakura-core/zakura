@@ -1,8 +1,7 @@
 //! The endpoint: bind, serve, dial and shut down (API-2, SPEC §6 to §8).
 
 use std::{
-    cmp::{self, Reverse},
-    collections::{BinaryHeap, HashMap},
+    collections::HashMap,
     fmt, io,
     net::{IpAddr, SocketAddr},
     sync::{
@@ -17,7 +16,7 @@ use noq::{PathId, Runtime, VarInt};
 use tokio::{sync::watch, task::JoinSet};
 
 use crate::{
-    admission::{Admission, ConnectionAttempt},
+    admission::{self, Admission, ConnectionAttempt},
     config::{QuicBindConfig, QuicConfig},
     conn::{self, BanCheck, Conn, ConnObserver, OpenPaths},
     error::{BindError, ConnectError},
@@ -31,12 +30,6 @@ use crate::{
 const SHUTDOWN_DRAIN: Duration = Duration::from_secs(3);
 /// A second socket failure within this window stops the endpoint (SOCK-9).
 const REBIND_WINDOW: Duration = Duration::from_secs(60);
-/// noq's default `TransportConfig::initial_rtt`, which this crate keeps.
-const NOQ_INITIAL_RTT: Duration = Duration::from_millis(333);
-/// noq rejects a peer `max_ack_delay` of 2^14 ms or more (RFC 9000 §18.2).
-const MAX_PEER_ACK_DELAY: Duration = Duration::from_millis(1 << 14);
-/// Failed-handshake IP charges kept at once; beyond this the earliest expires.
-const MAX_FAILED_HANDSHAKE_CHARGES: usize = 4096;
 /// How often a wildcard-bound endpoint lists the host's interface addresses to
 /// notice a network change (SOCK-12).
 const INTERFACE_POLL: Duration = Duration::from_secs(5);
@@ -760,20 +753,19 @@ async fn accept_loop(
                 };
                 // ADM-7: count the handshake from Accept until it finishes.
                 let pending = endpoint.inner.pending.enter(info.remote.ip());
-                let accepted_at = Instant::now();
                 match incoming.accept() {
                     Ok(connecting) => {
                         metrics::counter!("zakura.quic.incoming.accepted").increment(1);
                         tasks.spawn(handshake(
                             weak.clone(),
                             endpoint.inner.config.handshake_timeout(),
-                            ConnectionAttempt::new(connecting, reservation).charge_ip_after_close(
-                                endpoint.inner.pending.clone(),
-                                info.remote.ip(),
-                            ),
+                            ConnectionAttempt::incoming(connecting, reservation)
+                                .charge_ip_after_close(
+                                    endpoint.inner.pending.clone(),
+                                    info.remote.ip(),
+                                ),
                             info.remote,
                             pending,
-                            accepted_at,
                             acceptor.clone(),
                         ));
                     }
@@ -842,10 +834,12 @@ async fn handshake(
     connecting: ConnectionAttempt,
     remote: SocketAddr,
     pending: PendingGuard,
-    accepted_at: Instant,
     acceptor: Arc<dyn Acceptor>,
 ) {
     let started = Instant::now();
+    let attempt = connecting
+        .weak_handle()
+        .expect("inbound attempts expose their transport state");
     let result = match deadline {
         Some(deadline) => match tokio::time::timeout(deadline, connecting).await {
             Ok(result) => result.map_err(ConnectError::from_handshake),
@@ -854,15 +848,14 @@ async fn handshake(
         },
         None => connecting.await.map_err(ConnectError::from_handshake),
     };
-    match &result {
-        Ok(_) => drop(pending),
-        // ADM-7: noq keeps a failed attempt's state while it drains.
-        Err(_) => pending.fail(Instant::now() + failed_handshake_drain(accepted_at.elapsed())),
-    }
     record_handshake(&result, started);
     let Ok(connection) = result else {
+        // ADM-7: noq keeps a failed attempt's state while it drains.
+        let _charge = pending.into_hold();
+        admission::until_freed(&attempt).await;
         return;
     };
+    drop(pending);
     let (Some(remote_id), Some(alpn)) = (
         tls::remote_node_id(&connection),
         tls::negotiated_alpn(&connection),
@@ -913,19 +906,6 @@ async fn dial_once(
     }
 }
 
-/// Upper bound on how long noq keeps a failed handshake's state (ADM-7).
-///
-/// noq drains for three PTOs. Each is the smoothed RTT, four RTT variances
-/// (at least 1 ms) and the peer's `max_ack_delay`. Without an RTT sample the
-/// first two terms total three initial RTTs. With samples they total at most
-/// five times the largest sample, which cannot exceed the attempt's age.
-pub(crate) fn failed_handshake_drain(age: Duration) -> Duration {
-    cmp::max(NOQ_INITIAL_RTT.saturating_mul(3), age.saturating_mul(5))
-        .saturating_add(Duration::from_millis(1))
-        .saturating_add(MAX_PEER_ACK_DELAY)
-        .saturating_mul(3)
-}
-
 fn record_handshake<T>(result: &Result<T, ConnectError>, started: Instant) {
     match result {
         Ok(_) => {
@@ -950,21 +930,6 @@ struct PendingCounts {
     total: usize,
     by_ip: HashMap<IpAddr, usize>,
     draining: HashMap<IpAddr, usize>,
-    /// When each failed handshake's charge in `draining` ends, earliest first.
-    failed: BinaryHeap<Reverse<(Instant, IpAddr)>>,
-}
-
-impl PendingCounts {
-    /// Ends failed-handshake charges whose drain bound has passed.
-    fn expire(&mut self, now: Instant) {
-        while let Some(&Reverse((until, ip))) = self.failed.peek() {
-            if until > now {
-                break;
-            }
-            self.failed.pop();
-            release(&mut self.draining, ip);
-        }
-    }
 }
 
 /// Removes one count for `ip`, dropping the entry at zero.
@@ -984,8 +949,7 @@ impl PendingTable {
 
     /// Handshakes in progress from `ip` plus its draining charges.
     fn for_ip(&self, ip: IpAddr) -> usize {
-        let mut counts = self.0.lock().unwrap_or_else(PoisonError::into_inner);
-        counts.expire(Instant::now());
+        let counts = self.0.lock().unwrap_or_else(PoisonError::into_inner);
         counts.by_ip.get(&ip).copied().unwrap_or(0) + counts.draining.get(&ip).copied().unwrap_or(0)
     }
 
@@ -996,7 +960,6 @@ impl PendingTable {
         PendingGuard {
             table: self.clone(),
             ip,
-            failed: false,
         }
     }
 
@@ -1015,32 +978,18 @@ impl PendingTable {
 struct PendingGuard {
     table: PendingTable,
     ip: IpAddr,
-    failed: bool,
 }
 
 impl PendingGuard {
-    /// Ends the handshake but keeps charging its IP until `until` (ADM-7).
-    fn fail(mut self, until: Instant) {
-        let mut counts = self.table.0.lock().unwrap_or_else(PoisonError::into_inner);
-        counts.total = counts.total.saturating_sub(1);
-        release(&mut counts.by_ip, self.ip);
-        counts.expire(Instant::now());
-        if counts.failed.len() >= MAX_FAILED_HANDSHAKE_CHARGES {
-            if let Some(Reverse((_, ip))) = counts.failed.pop() {
-                release(&mut counts.draining, ip);
-            }
-        }
-        *counts.draining.entry(self.ip).or_default() += 1;
-        counts.failed.push(Reverse((until, self.ip)));
-        self.failed = true;
+    /// Ends the handshake but keeps charging its IP until the hold drops (ADM-7).
+    fn into_hold(self) -> DrainingGuard {
+        // Charge before releasing, so the IP is never briefly undercounted.
+        self.table.hold(self.ip)
     }
 }
 
 impl Drop for PendingGuard {
     fn drop(&mut self) {
-        if self.failed {
-            return;
-        }
         let mut counts = self.table.0.lock().unwrap_or_else(PoisonError::into_inner);
         counts.total = counts.total.saturating_sub(1);
         release(&mut counts.by_ip, self.ip);

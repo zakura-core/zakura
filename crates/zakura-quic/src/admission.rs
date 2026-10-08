@@ -64,20 +64,55 @@ pub(crate) struct Reservation {
     _global: OwnedSemaphorePermit,
 }
 
-/// Field order drops a cancelled Connecting before returning its reservation.
+/// Field order drops a cancelled handshake before returning its reservation.
 /// Once it succeeds, the reservation follows all noq owners, including streams.
 pub(crate) struct ConnectionAttempt {
-    connecting: noq::Connecting,
+    handshake: Handshake,
     reservation: Option<Reservation>,
     close_charge: Option<(PendingTable, IpAddr)>,
 }
 
+enum Handshake {
+    Outgoing(noq::Connecting),
+    /// A server attempt converted to 0.5-RTT, so a failure can be tracked
+    /// through its weak handle until noq frees it (ADM-7). Nothing reads or
+    /// writes the connection before `accepted` resolves.
+    Incoming {
+        connection: Option<noq::Connection>,
+        accepted: noq::ZeroRttAccepted,
+    },
+}
+
 impl ConnectionAttempt {
+    /// Wraps an outgoing handshake and its reservation.
     pub(crate) fn new(connecting: noq::Connecting, reservation: Reservation) -> Self {
         Self {
-            connecting,
+            handshake: Handshake::Outgoing(connecting),
             reservation: Some(reservation),
             close_charge: None,
+        }
+    }
+
+    /// Wraps an incoming handshake and its reservation.
+    pub(crate) fn incoming(connecting: noq::Connecting, reservation: Reservation) -> Self {
+        let (connection, accepted) = connecting
+            .into_0rtt()
+            .unwrap_or_else(|_| unreachable!("noq converts every incoming attempt to 0.5-RTT"));
+        Self {
+            handshake: Handshake::Incoming {
+                connection: Some(connection),
+                accepted,
+            },
+            reservation: Some(reservation),
+            close_charge: None,
+        }
+    }
+
+    /// Tracks an incoming attempt's transport state, whatever its outcome.
+    pub(crate) fn weak_handle(&self) -> Option<noq::WeakConnectionHandle> {
+        match &self.handshake {
+            Handshake::Outgoing(_) => None,
+            Handshake::Incoming { connection, .. } => connection.as_ref().map(|c| c.weak_handle()),
         }
     }
 
@@ -92,7 +127,23 @@ impl Future for ConnectionAttempt {
     type Output = Result<noq::Connection, noq::ConnectionError>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let result = std::task::ready!(Pin::new(&mut self.connecting).poll(cx));
+        let result = match &mut self.handshake {
+            Handshake::Outgoing(connecting) => std::task::ready!(Pin::new(connecting).poll(cx)),
+            Handshake::Incoming {
+                connection,
+                accepted,
+            } => {
+                std::task::ready!(Pin::new(accepted).poll(cx));
+                let connection = connection
+                    .take()
+                    .expect("polled again after the handshake finished");
+                // `accepted` also resolves when the handshake fails.
+                match connection.close_reason() {
+                    Some(error) => Err(error),
+                    None => Ok(connection),
+                }
+            }
+        };
         let reservation = self.reservation.take();
         let close_charge = self.close_charge.take();
         if let Ok(connection) = &result {
@@ -104,14 +155,19 @@ impl Future for ConnectionAttempt {
                 // State is freed only after close, so polling can wait for it.
                 closed.await;
                 let charge = close_charge.map(|(table, ip)| table.hold(ip));
-                let mut wait = Duration::from_millis(10);
-                while weak.is_alive() {
-                    tokio::time::sleep(wait).await;
-                    wait = (wait * 2).min(Duration::from_secs(1));
-                }
+                until_freed(&weak).await;
                 drop((charge, reservation));
             });
         }
         Poll::Ready(result)
+    }
+}
+
+/// Resolves once noq has freed the connection's state.
+pub(crate) async fn until_freed(weak: &noq::WeakConnectionHandle) {
+    let mut wait = Duration::from_millis(10);
+    while weak.is_alive() {
+        tokio::time::sleep(wait).await;
+        wait = (wait * 2).min(Duration::from_secs(1));
     }
 }

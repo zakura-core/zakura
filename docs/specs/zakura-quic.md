@@ -254,11 +254,9 @@ work. Stage 2 runs after TLS proves the `NodeId` and is today's Zakura logic.
 - **ADM-7.** A pending handshake counts against its IP and against the endpoint
   from `Accept` until the handshake completes or fails. A handshake that fails
   after `Incoming::accept` returns keeps counting against its IP, but not the
-  endpoint, while noq may still be draining it. noq drains for three PTOs; the
-  endpoint bounds each PTO by
-  `max(3 × initial RTT, 5 × attempt age) + 1 ms + 2^14 ms`, the last term being
-  the largest peer `max_ack_delay`. The endpoint keeps at most 4,096 such
-  charges and expires the earliest first when full.
+  endpoint, until noq frees its state. The endpoint converts each accepted
+  attempt to 0.5-RTT to hold a weak handle to that state, and sends no
+  application data before the handshake completes.
 - **ADM-8.** An established connection counts against its admitted IP until
   `Conn::closed()` resolves. The IP slot MUST NOT be released earlier. The
   aggregate owner slot additionally follows the transport state under ADM-11.
@@ -710,10 +708,10 @@ requirements:
   handshake, so it never reached duplicate handling and stayed locked out until
   the stale incumbent idled out. Registration still enforces the limit. Rule 3
   now reads `pending_from_ip`.
-- **ADM-7.** A failed attempt stays charged to its IP for a drain bound. A peer
-  can set `max_ack_delay` near 2^14 ms, which stretches noq's drain to 52 s or
-  more. Charged only globally, a few such attempts per second from one IP could
-  fill the inbound share and refuse every other peer.
+- **ADM-7.** A failed attempt stays charged to its IP until noq frees its
+  state. A peer can set `max_ack_delay` near 2^14 ms, which stretches noq's
+  drain to 52 s or more. Charged only globally, a few such attempts per second
+  from one IP could fill the inbound share and refuse every other peer.
 - **ADM-8.** The aggregate owner slot follows transport state under ADM-11, and
   a closed inbound connection keeps its IP charged until that state is freed.
 - **ADM-11.** Added. Version 0.4 released capacity at `Conn::closed()` and

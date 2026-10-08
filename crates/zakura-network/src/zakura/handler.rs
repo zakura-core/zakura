@@ -309,6 +309,9 @@ pub struct ZakuraConfig {
     /// `docs/specs/zakura-quic.md` section 9 for every key and its range.
     pub quic: QuicConfig,
     /// Total concurrent Zakura connections, inbound plus outbound.
+    ///
+    /// Inbound connections get 7/8 of this (224 of the default 256), so
+    /// outbound dials always keep room.
     pub max_connections: usize,
     /// Maximum established Zakura connections admitted from one source IP.
     ///
@@ -321,6 +324,9 @@ pub struct ZakuraConfig {
     /// the primary eclipse-resistance controls.
     pub max_connections_per_ip: usize,
     /// Connections concurrently running the control handshake.
+    ///
+    /// Inbound handshakes get 7/8 of this (28 of the default 32), as for
+    /// `max_connections`.
     pub max_pending_handshakes: usize,
     /// New streams per second admitted per connection after a valid prelude.
     pub stream_open_rate_per_second: u32,

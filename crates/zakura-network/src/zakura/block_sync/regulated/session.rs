@@ -29,8 +29,10 @@ const BYTES_PER_REQUEST: u64 = 160;
 /// session slots bound every session that can hold bookkeeping, including
 /// replacements still cleaning up. Each may hold `2 × limit` commitments (see
 /// `Serve`'s margin), so the limit is the configured advertisement capped at
-/// what fits [`BOOKKEEPING_BUDGET_BYTES`] across those sessions. Local outbound
-/// sizing and older peers keep the configured value.
+/// what fits [`BOOKKEEPING_BUDGET_BYTES`] across those sessions. Above 3,633
+/// sessions even one request exceeds the budget; the limit stays at one and
+/// [`Serving::new`] warns. Local outbound sizing and older peers keep the
+/// configured value.
 pub(crate) fn serving_max_inflight_requests(config: &ZakuraBlockSyncConfig) -> u32 {
     let configured = config.advertised_max_inflight_requests();
     budgeted_inflight_requests(serving_sessions(config))

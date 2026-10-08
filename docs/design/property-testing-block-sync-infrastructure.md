@@ -147,21 +147,22 @@ container excluded lifecycle handling and has been replaced by these production-
 
 The automatic `compact_session_lifecycle_peak` regression runs the production serving session
 in an isolated test process. One allocation observation follows ownership across the reader and
-encoding workers, without resetting between transitions. It queues 64,000 requests, completes
-all of them, leaves the session idle, reuses all the heights, then cancels and queues a full
-replacement before the old dispatch cleans up. An allocator test separately verifies that storage
-allocated on one thread and freed on another leaves the observation.
+encoding workers, without resetting between transitions. It queues twice the regulated serving
+limit, completes all of them, leaves the session idle, reuses all the heights, then cancels and
+queues a full replacement before the old dispatch cleans up. An allocator test separately verifies
+that storage allocated on one thread and freed on another leaves the observation.
 
-| Lifecycle checkpoint | Retained bookkeeping bytes |
-| --- | --- |
-| Fixed session setup | 10,540 |
-| 64,000 admitted requests | 7,240,780 |
-| All endings sent, no further admission | 4,625,793 |
-| Session dropped, old dispatch has not cleaned up | 2,639,617 |
-| Full replacement queued before old cleanup | 9,879,833 |
-| Both sessions and runtime dropped | 40 |
+| Lifecycle checkpoint | 64,000 requests (October 5) | 5,632 requests (current default) |
+| --- | --- | --- |
+| Fixed session setup | 10,540 | 10,540 |
+| All requests admitted | 7,240,780 | 684,300 |
+| All endings sent, no further admission | 4,625,793 | 462,401 |
+| Session dropped, old dispatch has not cleaned up | 2,639,617 | 246,529 |
+| Full replacement queued before old cleanup | 9,879,833 | 930,265 |
+| Both sessions and runtime dropped | 40 | 40 |
 
-The measured lifecycle peak was 9,881,145 bytes. Small runtime allocations are included here,
+The measured lifecycle peak was 9,881,145 bytes at 64,000 requests and 931,577 bytes at the
+current 5,632. Small runtime allocations are included here,
 so fixed setup differs slightly from the synchronous admission probe. Allocator bookkeeping,
 fragmentation and reserved virtual memory are excluded. This workload uses empty storage results
 and an in-memory framed transport. It does not establish live-storage or QUIC buffer peaks.
@@ -216,7 +217,18 @@ Nineteen concurrent reads at that latency permit at most 38 responses per second
 advertisement from 32 to 32,000 therefore did not improve this workload. This is a controlled
 latency experiment, not a measurement of production storage latency.
 
-These measurements do not validate the 32,000 advertised default. A single small-block response
+### Serving bookkeeping budget
+
+Version 3 peers are now advertised and held to a limit derived from a 512 MiB budget for queued
+serving bookkeeping. Session reservations outlive queued jobs, so the inbound plus outbound
+session slots bound every session that can hold this state, including replacements that are
+still cleaning up. Each slot is charged 144 KiB plus 160 bytes for each of twice the limit. The
+default 512 slots give 2,816 requests per peer and fill the budget exactly. Fewer slots keep the
+configured 32,000, and more slots shrink the limit. Above 3,633 slots even one request per
+session exceeds the budget, so the node warns at startup and advertises one. Version 2 peers and
+local download sizing keep the configured value.
+
+These measurements do not validate the 32,000 local default or the 2,816 serving limit. A single small-block response
 in this fixture averages about 1,644 wire bytes. At that size, the design's twice-bandwidth-delay
 allowance at 10 Gbps and 500 ms needs about 760,341 commitments, exceeding the protocol's 32,768
 ceiling. The existing 32 MiB QUIC send window also limits transport to about 537 Mbps at that RTT,

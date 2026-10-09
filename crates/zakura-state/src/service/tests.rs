@@ -3618,6 +3618,11 @@ async fn assert_evicted_precious_block_redelivery(header_runtime: bool) {
         .unwrap()
         .unwrap();
     assert_eq!(read.best_tip().unwrap().1, loser.hash());
+    assert!(read
+        .latest_non_finalized_state()
+        .precious_preferences()
+        .1
+        .contains_key(&loser.hash()));
 
     let child_of = |state: &StateService, parent: &Arc<Block>| {
         let history_root = state
@@ -3654,9 +3659,10 @@ async fn assert_evicted_precious_block_redelivery(header_runtime: bool) {
     for fork in &forks {
         commit(&mut state, fork).await;
     }
-    assert!(!read
-        .latest_non_finalized_state()
-        .any_chain_contains(&loser.hash()));
+    let evicted = read.latest_non_finalized_state();
+    assert!(!evicted.any_chain_contains(&loser.hash()));
+    // The commit that evicted the tip forgets its preference, before any invalidation runs.
+    assert!(!evicted.precious_preferences().1.contains_key(&loser.hash()));
     let known = timeout(limit, state.call(Request::KnownBlock(loser.hash())))
         .await
         .unwrap()

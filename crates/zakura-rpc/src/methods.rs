@@ -915,9 +915,16 @@ pub trait Rpc {
 
     /// Treats a block as if it were received before other chain tips with the same work.
     ///
-    /// A later call overrides an earlier one. A chain with more work still wins, so this does
-    /// nothing for a block with less work than the best tip. The preference is not kept across
-    /// restarts. See Bitcoin Core's
+    /// It applies to a current non-finalized chain tip with at least as much work as the best tip.
+    /// A later call overrides an earlier one. A chain with more work still wins. For any other
+    /// known block, such as a block that is not a chain tip, a finalized block, an invalidated
+    /// block, or a tip with less work than the best tip, the call succeeds and changes nothing. An
+    /// unknown hash returns error code -5, and a malformed hash returns error code -8.
+    ///
+    /// The preference is local to this node. It is kept only while the block is in a
+    /// non-finalized chain or an invalidation record, so it is forgotten when a fork-limit
+    /// eviction removes the block or its invalidation record is discarded, and a block downloaded
+    /// again is not preferred. It is not kept across restarts. See Bitcoin Core's
     /// [`preciousblock`](https://developer.bitcoin.org/reference/rpc/preciousblock.html).
     ///
     /// # Parameters

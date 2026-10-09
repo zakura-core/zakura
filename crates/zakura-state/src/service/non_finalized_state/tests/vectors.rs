@@ -1416,6 +1416,7 @@ fn precious_block_preference_is_dropped_with_an_evicted_tip() {
     state.precious_block(low.hash(), &finalized.db).unwrap();
     let high_child = high.make_fake_child().set_work(1);
     commit_test_block(&mut state, &finalized, &high_child);
+    assert!(state.precious_blocks.contains_key(&low.hash()));
 
     // Fill the fork limit with a branch whose tips all have more work than `low`, so `low` is
     // the lowest chain when the last fork arrives. Their shared parent stays in the state.
@@ -1437,6 +1438,8 @@ fn precious_block_preference_is_dropped_with_an_evicted_tip() {
     assert_eq!(state.chain_count(), MAX_NON_FINALIZED_CHAIN_FORKS);
     assert!(!state.any_chain_contains(&low.hash()));
     assert!(state.any_chain_contains(&root_hash));
+    // The commit that evicted the tip forgets its preference, before any invalidation runs.
+    assert!(!state.precious_blocks.contains_key(&low.hash()));
 
     // Remove every tip with more work, then download the evicted body again.
     state.invalidate_block(branch.hash()).unwrap();

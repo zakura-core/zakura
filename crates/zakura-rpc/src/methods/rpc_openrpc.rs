@@ -281,7 +281,7 @@ pub(crate) static METHODS: &[(&str, openrpc::RpcMethod)] = &[
     params: |_g| vec![
         _g.param::<String>("block_hash", crate::methods::PARAM_BLOCK_HASH_DESC, true),
     ],
-    result: |g| g.result("preciousblock_result"),
+    result: |g| g.typed_result::<()>("preciousblock_result", crate::methods::RESULT_PRECIOUSBLOCK_DESC),
     deprecated: false,
 }),
 ("generate", openrpc::RpcMethod {

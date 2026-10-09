@@ -281,6 +281,8 @@ pub(super) const PARAM_VERBOSITY_DESC: &str = "Whether to include verbose output
 pub(super) const PARAM_N_DESC: &str = "The output index in the transaction.";
 pub(super) const PARAM_INCLUDE_MEMPOOL_DESC: &str =
     "Whether to include mempool transactions in the response.";
+pub(super) const RESULT_PRECIOUSBLOCK_DESC: &str =
+    "Always null. Errors are returned as JSON-RPC errors.";
 
 mod hex_serde;
 

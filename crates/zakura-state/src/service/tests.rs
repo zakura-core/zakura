@@ -3373,42 +3373,8 @@ async fn assert_precious_block_request(header_runtime: bool) {
     let (mut state, _, _, _) = StateService::new(config, &network, Height::MAX, 0)
         .await
         .unwrap();
-    let genesis = block::genesis::regtest_genesis_block();
-    let genesis_hash = genesis.hash();
-    let mut parent = genesis.make_fake_child();
-    Arc::make_mut(&mut Arc::make_mut(&mut parent).header).time += chrono::Duration::seconds(1);
-    for block in [genesis, parent.clone()] {
-        timeout(
-            limit,
-            state.queue_and_commit_to_finalized_state(CheckpointVerifiedBlock::from(block)),
-        )
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
-    }
-    let mut template = parent.make_fake_child();
-    let transaction = transaction_v4_from_coinbase(&template.transactions[0]);
-    Arc::make_mut(&mut template).transactions[0] = Arc::new(transaction);
-    let merkle_root = template.transactions.iter().cloned().collect();
-    let header = Arc::make_mut(&mut Arc::make_mut(&mut template).header);
-    header.time += chrono::Duration::seconds(1);
-    header.merkle_root = merkle_root;
-    header.commitment_bytes =
-        <[u8; 32]>::from(state.read_service.db.history_tree().hash().unwrap()).into();
-
-    let mut siblings = template.make_fake_siblings(2);
-    siblings.sort_by_key(|block| std::cmp::Reverse(block.hash().0));
-    for block in &siblings {
-        timeout(
-            limit,
-            state.queue_and_commit_to_non_finalized_state(block.clone().prepare(), None),
-        )
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
-    }
+    let genesis_hash = network.genesis_hash();
+    let siblings = commit_precious_siblings(&mut state, limit).await;
     let best_tip = |state: &StateService| {
         state
             .read_service
@@ -3465,6 +3431,251 @@ async fn assert_precious_block_request(header_runtime: bool) {
         .unwrap();
     assert_eq!(best_tip(&state), siblings[0].hash());
     wait_for_idle_writer(&state, limit).await;
+}
+
+/// Commits a regtest genesis block and its child to the finalized state, then two equal-work
+/// children of that child to the non-finalized state.
+///
+/// Returns the non-finalized blocks by descending raw hash, so the first is the normal
+/// equal-work winner and the second is the hash loser.
+async fn commit_precious_siblings(state: &mut StateService, limit: Duration) -> Vec<Arc<Block>> {
+    let genesis = block::genesis::regtest_genesis_block();
+    let mut parent = genesis.make_fake_child();
+    Arc::make_mut(&mut Arc::make_mut(&mut parent).header).time += chrono::Duration::seconds(1);
+    for block in [genesis, parent.clone()] {
+        timeout(
+            limit,
+            state.queue_and_commit_to_finalized_state(CheckpointVerifiedBlock::from(block)),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    }
+    let mut template = parent.make_fake_child();
+    let transaction = transaction_v4_from_coinbase(&template.transactions[0]);
+    Arc::make_mut(&mut template).transactions[0] = Arc::new(transaction);
+    let merkle_root = template.transactions.iter().cloned().collect();
+    let header = Arc::make_mut(&mut Arc::make_mut(&mut template).header);
+    header.time += chrono::Duration::seconds(1);
+    header.merkle_root = merkle_root;
+    header.commitment_bytes =
+        <[u8; 32]>::from(state.read_service.db.history_tree().hash().unwrap()).into();
+
+    let mut siblings = template.make_fake_siblings(2);
+    siblings.sort_by_key(|block| std::cmp::Reverse(block.hash().0));
+    for block in &siblings {
+        timeout(
+            limit,
+            state.queue_and_commit_to_non_finalized_state(block.clone().prepare(), None),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    }
+    siblings
+}
+
+/// Waits until the header chain publishes `verified_best` as its verified best tip.
+async fn wait_for_verified_best(
+    snapshots: &mut tokio::sync::watch::Receiver<Option<zakura_header_chain::EngineSnapshot>>,
+    verified_best: block::Hash,
+    limit: Duration,
+) -> zakura_header_chain::EngineSnapshot {
+    timeout(
+        limit,
+        snapshots.wait_for(|snapshot| {
+            snapshot
+                .as_ref()
+                .is_some_and(|snapshot| snapshot.frontiers.verified_best.hash == verified_best)
+        }),
+    )
+    .await
+    .expect("the header chain publishes the expected verified tip")
+    .expect("the header snapshot channel stays open")
+    .clone()
+    .expect("the waited-for snapshot is present")
+}
+
+/// The preference is local. A restart from the same database and non-finalized backup clears
+/// it, so full state and the header chain both select the normal equal-work winner again.
+#[test]
+fn precious_block_preference_is_cleared_by_a_restart() {
+    let _init_guard = zakura_test::init();
+    let limit = Duration::from_secs(10);
+    let network = Network::new_regtest(Default::default());
+    let cache_dir = tempfile::tempdir().expect("the state cache directory is created");
+    let config = Config {
+        cache_dir: cache_dir.path().to_owned(),
+        ephemeral: false,
+        // Write the non-finalized backup synchronously before each publication.
+        debug_skip_non_finalized_state_backup_task: true,
+        enable_zakura_header_seed_from_committed_blocks: true,
+        ..Config::default()
+    };
+    assert!(config.non_finalized_state_backup_dir(&network).is_some());
+    // The finalized tip is at the last checkpoint, so the restart restores the backup.
+    let max_checkpoint_height = Height(1);
+    // Each node run has its own runtime. Shutting a runtime down stops the state's background
+    // tasks, which release the database lock, like a process exit.
+    let node_run = || {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("the node runtime starts")
+    };
+
+    let (winner, loser) = node_run().block_on(async {
+        let (mut state, read, latest_chain_tip, _) =
+            StateService::new(config.clone(), &network, max_checkpoint_height, 0)
+                .await
+                .unwrap();
+        let siblings = commit_precious_siblings(&mut state, limit).await;
+        let (winner, loser) = (siblings[0].hash(), siblings[1].hash());
+        let mut snapshots = read.subscribe_header_chain_snapshots();
+        wait_for_verified_best(&mut snapshots, winner, limit).await;
+
+        timeout(limit, state.send_precious_block(loser))
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(read.best_tip().unwrap().1, loser);
+        assert_eq!(latest_chain_tip.best_tip_hash(), Some(loser));
+        let preferred = wait_for_verified_best(&mut snapshots, loser, limit).await;
+        // Header-only selection keeps the raw-hash order.
+        assert_eq!(preferred.frontiers.header_best.hash, winner);
+        wait_for_idle_writer(&state, limit).await;
+        (winner, loser)
+    });
+
+    node_run().block_on(async {
+        let (mut state, read, latest_chain_tip, _) =
+            StateService::new(config, &network, max_checkpoint_height, 0)
+                .await
+                .unwrap();
+        let restored = read.latest_non_finalized_state();
+        assert_eq!(
+            restored.chain_count(),
+            2,
+            "the backup restores both siblings"
+        );
+        assert_eq!(restored.best_tip().unwrap().1, winner);
+        assert_eq!(latest_chain_tip.best_tip_hash(), Some(winner));
+        let mut snapshots = read.subscribe_header_chain_snapshots();
+        let reopened = wait_for_verified_best(&mut snapshots, winner, limit).await;
+        assert_eq!(reopened.frontiers.header_best.hash, winner);
+
+        // The restored loser can still be preferred again.
+        timeout(limit, state.send_precious_block(loser))
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(read.best_tip().unwrap().1, loser);
+        wait_for_verified_best(&mut snapshots, loser, limit).await;
+        wait_for_idle_writer(&state, limit).await;
+    });
+}
+
+/// Dropping the caller's response does not cancel an accepted preference. The writer commits and
+/// publishes it, and keeps the request's write slot, which blocks optimistic relay, until the new
+/// tip is published.
+#[tokio::test(flavor = "multi_thread")]
+async fn dropped_precious_block_response_still_publishes_before_releasing_its_slot() {
+    let _init_guard = zakura_test::init();
+    let limit = Duration::from_secs(10);
+    let all_slots = super::queued_blocks::MAX_QUEUED_BLOCKS;
+    let network = Network::new_regtest(Default::default());
+    let config = Config {
+        enable_zakura_header_seed_from_committed_blocks: true,
+        ..Config::ephemeral()
+    };
+    let (mut state, read, latest_chain_tip, _) =
+        StateService::new(config, &network, Height::MAX, 0)
+            .await
+            .unwrap();
+    let siblings = commit_precious_siblings(&mut state, limit).await;
+    let (winner, loser) = (siblings[0].hash(), siblings[1].hash());
+    let mut snapshots = read.subscribe_header_chain_snapshots();
+    wait_for_verified_best(&mut snapshots, winner, limit).await;
+    wait_for_idle_writer(&state, limit).await;
+    timeout(limit, state.ready()).await.unwrap().unwrap();
+
+    // Gate: while a reader borrows the published non-finalized state, the writer cannot
+    // publish a new one.
+    let (held_tx, held_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let published = read.non_finalized_state_receiver.clone();
+    let gate = std::thread::spawn(move || {
+        published.borrow_mapped(|_published| {
+            held_tx.send(()).expect("the test waits for the gate");
+            release_rx
+                .recv_timeout(Duration::from_secs(30))
+                .expect("the test releases the gate");
+        })
+    });
+    held_rx
+        .recv_timeout(limit)
+        .expect("the gate holds the published state");
+
+    // The state accepts the request when it is called, so dropping the response future does not
+    // withdraw it.
+    drop(state.call(Request::PreciousBlock(loser)));
+    assert_eq!(
+        state.non_finalized_write_slots.available_permits(),
+        all_slots - 1
+    );
+
+    // The header commit precedes publication, so the writer is now blocked on the gate.
+    wait_for_verified_best(&mut snapshots, loser, limit).await;
+    assert_eq!(
+        state.non_finalized_write_slots.available_permits(),
+        all_slots - 1,
+        "the unpublished preference keeps its write slot"
+    );
+    assert_eq!(latest_chain_tip.best_tip_hash(), Some(winner));
+    let relay_authorized = |state: &StateService, parent| {
+        let _candidate_slot = state
+            .non_finalized_write_slots
+            .clone()
+            .try_acquire_owned()
+            .expect("the writer has free slots");
+        let admission = BlockAdmission::pending();
+        admission.authorize_optimistic_relay();
+        state.optimistic_relay_still_authorized(Some(&admission), parent)
+    };
+    assert!(
+        !relay_authorized(&state, winner),
+        "an unpublished preference blocks optimistic relay"
+    );
+
+    release_tx.send(()).expect("the gate is waiting");
+    gate.join().expect("the gate thread does not panic");
+    let capacity = timeout(
+        limit,
+        state.non_finalized_write_slots.clone().acquire_many_owned(
+            u32::try_from(all_slots).expect("the queued block limit fits in a permit count"),
+        ),
+    )
+    .await
+    .expect("the writer releases the slot after publishing")
+    .expect("the slot semaphore stays open");
+    drop(capacity);
+    assert_eq!(read.best_tip().unwrap().1, loser);
+    assert_eq!(latest_chain_tip.best_tip_hash(), Some(loser));
+    assert_eq!(
+        snapshots
+            .borrow()
+            .as_ref()
+            .unwrap()
+            .frontiers
+            .verified_best
+            .hash,
+        loser
+    );
+    assert!(relay_authorized(&state, loser));
 }
 
 /// Waits until the block writer releases every write slot. A request's response is sent

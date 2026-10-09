@@ -807,53 +807,85 @@ fn assert_fork_eviction_after_restart(replace_winner: bool) {
     assert!(saw_eviction, "the fixture must cross the fork limit");
 }
 
+/// Equal-work siblings of one parent, with the full state and the header chain agreeing on the
+/// first `committed` of them, sorted by descending raw hash, so the first sibling is the hash
+/// winner.
+struct PreciousFixture {
+    finalized: FinalizedState,
+    live: NonFinalizedState,
+    writer: HeaderChainWriter,
+    height: block::Height,
+    siblings: Vec<Arc<Block>>,
+}
+
+impl PreciousFixture {
+    fn new(count: usize, committed: usize) -> Self {
+        let network = Network::new_regtest(Default::default());
+        let mut finalized = FinalizedState::new(&Config::ephemeral(), &network).unwrap();
+        let genesis = regtest_genesis_block();
+        let mut parent = genesis.make_fake_child();
+        Arc::make_mut(&mut Arc::make_mut(&mut parent).header).time += chrono::Duration::seconds(1);
+        for block in [genesis, parent.clone()] {
+            finalized
+                .commit_finalized_direct(
+                    CheckpointVerifiedBlock::from(block).into(),
+                    None,
+                    None,
+                    "precious block fixture",
+                )
+                .unwrap();
+        }
+        let mut live = NonFinalizedState::new(&network);
+        let writer = HeaderChainWriter::attach_at_semantic_handoff(&finalized, &live).unwrap();
+        let mut template = parent.make_fake_child();
+        let height = template.coinbase_height().unwrap();
+        let transaction =
+            crate::tests::setup::transaction_v4_from_coinbase(&template.transactions[0]);
+        Arc::make_mut(&mut template).transactions[0] = Arc::new(transaction);
+        let merkle_root = template.transactions.iter().cloned().collect();
+        let header = Arc::make_mut(&mut Arc::make_mut(&mut template).header);
+        header.time += chrono::Duration::seconds(1);
+        header.merkle_root = merkle_root;
+        header.commitment_bytes =
+            <[u8; 32]>::from(finalized.db.history_tree().hash().unwrap()).into();
+
+        let mut siblings = template.make_fake_siblings(count);
+        siblings.sort_by_key(|block| std::cmp::Reverse(block.hash().0));
+        for block in &siblings[..committed] {
+            let mut staged = live.clone();
+            staged
+                .commit_new_chain(block.clone().prepare(), &finalized.db)
+                .unwrap();
+            commit_verified_change(
+                &writer,
+                &mut live,
+                staged,
+                Frontier::new(height, block.hash()),
+            );
+        }
+        assert_eq!(live.best_tip().unwrap().1, siblings[0].hash());
+        Self {
+            finalized,
+            live,
+            writer,
+            height,
+            siblings,
+        }
+    }
+}
+
 /// A `preciousblock` change publishes the preferred tip as the verified best tip, and operator
 /// invalidation and reconsideration of another fork keep it.
 #[test]
 fn precious_block_publishes_and_keeps_the_preferred_verified_tip() {
     let _init_guard = zakura_test::init();
-    let network = Network::new_regtest(Default::default());
-    let mut finalized = FinalizedState::new(&Config::ephemeral(), &network).unwrap();
-    let genesis = regtest_genesis_block();
-    let mut parent = genesis.make_fake_child();
-    Arc::make_mut(&mut Arc::make_mut(&mut parent).header).time += chrono::Duration::seconds(1);
-    for block in [genesis, parent.clone()] {
-        finalized
-            .commit_finalized_direct(
-                CheckpointVerifiedBlock::from(block).into(),
-                None,
-                None,
-                "precious block fixture",
-            )
-            .unwrap();
-    }
-    let mut live = NonFinalizedState::new(&network);
-    let writer = HeaderChainWriter::attach_at_semantic_handoff(&finalized, &live).unwrap();
-    let mut template = parent.make_fake_child();
-    let height = template.coinbase_height().unwrap();
-    let transaction = crate::tests::setup::transaction_v4_from_coinbase(&template.transactions[0]);
-    Arc::make_mut(&mut template).transactions[0] = Arc::new(transaction);
-    let merkle_root = template.transactions.iter().cloned().collect();
-    let header = Arc::make_mut(&mut Arc::make_mut(&mut template).header);
-    header.time += chrono::Duration::seconds(1);
-    header.merkle_root = merkle_root;
-    header.commitment_bytes = <[u8; 32]>::from(finalized.db.history_tree().hash().unwrap()).into();
-
-    let mut siblings = template.make_fake_siblings(3);
-    siblings.sort_by_key(|block| std::cmp::Reverse(block.hash().0));
-    for block in &siblings {
-        let mut staged = live.clone();
-        staged
-            .commit_new_chain(block.clone().prepare(), &finalized.db)
-            .unwrap();
-        commit_verified_change(
-            &writer,
-            &mut live,
-            staged,
-            Frontier::new(height, block.hash()),
-        );
-    }
-    assert_eq!(live.best_tip().unwrap().1, siblings[0].hash());
+    let PreciousFixture {
+        finalized,
+        mut live,
+        writer,
+        height,
+        siblings,
+    } = PreciousFixture::new(3, 3);
 
     let preferred = siblings[1].hash();
     let mut staged = live.clone();
@@ -891,4 +923,123 @@ fn precious_block_publishes_and_keeps_the_preferred_verified_tip() {
             Frontier::new(height, preferred)
         );
     }
+}
+
+/// A `preciousblock` request whose durable header commit fails, sent through the block write
+/// task, leaves the live state, the header chain, and every published channel unchanged, and
+/// returns its write slot.
+#[tokio::test(flavor = "multi_thread")]
+async fn failed_precious_header_commit_changes_nothing_and_returns_the_write_slot() {
+    use tokio::time::timeout;
+    use zakura_chain::chain_tip::ChainTip;
+
+    let _init_guard = zakura_test::init();
+    let limit = Duration::from_secs(10);
+    let PreciousFixture {
+        finalized,
+        mut live,
+        writer,
+        siblings,
+        ..
+    } = PreciousFixture::new(3, 2);
+    let network = finalized.db.network();
+    let (winner, loser, unrecorded) = (siblings[0].hash(), siblings[1].hash(), siblings[2].hash());
+
+    // Fault: full state holds a side tip that the header chain never recorded, so the header
+    // store refuses every combined transition whose staged state contains it. The block has the
+    // lowest hash, so the best tip and the header chain's verified tip still agree.
+    live.commit_new_chain(siblings[2].clone().prepare(), &finalized.db)
+        .unwrap();
+    assert_eq!(live.best_tip().unwrap().1, winner);
+
+    let header_before = writer.runtime.publisher().snapshot();
+    assert_eq!(header_before.frontiers.verified_best.hash, winner);
+    let (chain_tip_sender, latest_chain_tip, mut chain_tip_change) = ChainTipSender::new(
+        live.best_tip_block().cloned().map(ChainTipBlock::from),
+        &network,
+    );
+    let _ = chain_tip_change.last_tip_change();
+    let (non_finalized_state_sender, mut non_finalized_state_receiver) =
+        watch::channel(live.clone());
+    let (snapshots, _) = watch::channel(None);
+    let (views, _) = watch::channel(None);
+    let (readers, _) = watch::channel(None);
+    let (statuses, _) = watch::channel(
+        zakura_node_services::sync_lifecycle::HeaderRuntimeStatus::Detached {
+            epoch: zakura_node_services::sync_lifecycle::LifecycleEpoch::INITIAL,
+            reason:
+                zakura_node_services::sync_lifecycle::HeaderRuntimeDetachedReason::AttachmentPending,
+        },
+    );
+    let (senders, _invalid_resets, _, _, _, _, _task) = BlockWriteSender::spawn_with_header_chain(
+        finalized,
+        live,
+        chain_tip_sender,
+        non_finalized_state_sender,
+        false,
+        None,
+        Some(HeaderChainWriter::new(
+            writer.runtime.clone(),
+            writer.config.clone(),
+        )),
+        false,
+        HeaderChainObservers::new(snapshots, views, readers, statuses),
+    );
+    let sender = senders
+        .non_finalized
+        .as_ref()
+        .expect("the writer accepts non-finalized messages");
+    let slots = Arc::new(tokio::sync::Semaphore::new(1));
+    let precious = |hash| {
+        let (rsp_tx, rsp_rx) = oneshot::channel();
+        sender
+            .send(NonFinalizedWriteMessage::Precious {
+                hash,
+                rsp_tx,
+                write_slot: slots
+                    .clone()
+                    .try_acquire_owned()
+                    .expect("the previous request returned its slot"),
+            })
+            .expect("the writer is running");
+        rsp_rx
+    };
+
+    let error = timeout(limit, precious(loser))
+        .await
+        .expect("the writer answers the failed request")
+        .expect("the writer sends a response")
+        .expect_err("the header store refuses the incoherent staged state");
+    assert!(
+        matches!(error, crate::PreciousError::HeaderChain { .. }),
+        "{error:?}"
+    );
+    let _slot = timeout(limit, slots.acquire())
+        .await
+        .expect("the writer drops the failed request's write slot")
+        .expect("the slot semaphore stays open");
+    assert_eq!(writer.runtime.publisher().snapshot(), header_before);
+    assert!(!non_finalized_state_receiver.has_changed().unwrap());
+    assert_eq!(chain_tip_change.last_tip_change(), None);
+    assert_eq!(latest_chain_tip.best_tip_hash(), Some(winner));
+    drop(_slot);
+
+    // A finalized block is a known no-op, so the writer publishes its live state unchanged.
+    timeout(limit, precious(network.genesis_hash()))
+        .await
+        .expect("the writer answers the no-op request")
+        .expect("the writer sends a response")
+        .expect("a finalized block is known");
+    timeout(limit, non_finalized_state_receiver.changed())
+        .await
+        .expect("the no-op request publishes the live state")
+        .unwrap();
+    let published = non_finalized_state_receiver.borrow_and_update().clone();
+    assert_eq!(published.best_tip().unwrap().1, winner);
+    assert_eq!(published.chain_count(), 3);
+    assert_eq!(writer.runtime.publisher().snapshot(), header_before);
+    assert_eq!(chain_tip_change.last_tip_change(), None);
+    assert!(published
+        .chain_iter()
+        .any(|chain| chain.non_finalized_tip_hash() == unrecorded));
 }

@@ -1878,6 +1878,8 @@ pub enum NonFinalizedWriteMessage {
     Precious {
         hash: block::Hash,
         rsp_tx: oneshot::Sender<Result<(), PreciousError>>,
+        /// Blocks relay against an unpublished transition, like [`Self::Invalidate`].
+        write_slot: tokio::sync::OwnedSemaphorePermit,
     },
     /// The hash of a block that was previously invalidated but should be
     /// reconsidered and reinserted into the non-finalized state.
@@ -2983,7 +2985,11 @@ impl WriteBlockWorkerTask {
                     let _ = rsp_tx.send(result);
                     None
                 }
-                NonFinalizedWriteMessage::Precious { hash, rsp_tx } => {
+                NonFinalizedWriteMessage::Precious {
+                    hash,
+                    rsp_tx,
+                    write_slot: _write_slot,
+                } => {
                     tracing::info!(?hash, "preferring a block in the non-finalized state");
                     let old_tip = non_finalized_state.best_tip();
                     let mut staged = non_finalized_state.clone();

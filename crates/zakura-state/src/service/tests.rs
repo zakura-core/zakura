@@ -3438,6 +3438,40 @@ async fn assert_precious_block_request(header_runtime: bool) {
         .unwrap_err();
     assert!(matches!(error, crate::PreciousError::BlockNotFound(hash) if hash == unknown));
     assert_eq!(best_tip(&state), siblings[1].hash());
+
+    // A full writer rejects the request instead of queueing it, and frees no slot it never held.
+    let all_slots = state
+        .non_finalized_write_slots
+        .clone()
+        .try_acquire_many_owned(
+            u32::try_from(super::queued_blocks::MAX_QUEUED_BLOCKS)
+                .expect("the queued block limit fits in a semaphore permit count"),
+        )
+        .expect("no write is in flight");
+    let error = timeout(limit, state.send_precious_block(siblings[0].hash()))
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    assert!(matches!(error, crate::PreciousError::WriterFull));
+    assert_eq!(best_tip(&state), siblings[1].hash());
+    drop(all_slots);
+
+    timeout(limit, state.send_precious_block(siblings[0].hash()))
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(best_tip(&state), siblings[0].hash());
+    timeout(limit, async {
+        while state.non_finalized_write_slots.available_permits()
+            < super::queued_blocks::MAX_QUEUED_BLOCKS
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the writer releases the request's slot after publishing");
 }
 
 /// During checkpoint sync the writer defers non-finalized messages, so precious requests fail

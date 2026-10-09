@@ -598,6 +598,10 @@ pub enum PreciousError {
     #[error("cannot prefer blocks while still committing checkpointed blocks")]
     ProcessingCheckpointedBlocks,
 
+    /// Every block write slot is held by an in-flight commit or operator change.
+    #[error("the block write task is at capacity, retry the precious block request")]
+    WriterFull,
+
     /// Sending the precious request to the block write task failed.
     #[error("failed to send precious block request to block write task")]
     SendPreciousRequestFailed,

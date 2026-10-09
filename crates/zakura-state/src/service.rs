@@ -1196,9 +1196,9 @@ impl StateService {
     /// Whether a candidate admitted right now may be advertised before its contextual commit.
     ///
     /// Called after this candidate's own write slot is acquired, so "one permit taken" means no
-    /// other commit, reconsideration, or invalidation is still unpublished. Every earlier
-    /// transition has already reached `update_latest_chain_channels`, so the published best tip
-    /// is the tip this candidate extends.
+    /// other commit, reconsideration, invalidation, or tip preference is still unpublished.
+    /// Every earlier transition has already reached `update_latest_chain_channels`, so the
+    /// published best tip is the tip this candidate extends.
     fn optimistic_relay_still_authorized(
         &self,
         admission: Option<&BlockAdmission>,
@@ -1434,8 +1434,18 @@ impl StateService {
             }
         };
 
+        // A preferred tip can change the best tip, so it holds a write slot like invalidation.
+        let Ok(write_slot) = self.non_finalized_write_slots.clone().try_acquire_owned() else {
+            let _ = rsp_tx.send(Err(PreciousError::WriterFull));
+            return rsp_rx;
+        };
+
         if let Err(tokio::sync::mpsc::error::SendError(error)) =
-            sender.send(NonFinalizedWriteMessage::Precious { hash, rsp_tx })
+            sender.send(NonFinalizedWriteMessage::Precious {
+                hash,
+                rsp_tx,
+                write_slot,
+            })
         {
             let NonFinalizedWriteMessage::Precious { rsp_tx, .. } = error else {
                 unreachable!("should return the same Precious message could not be sent");

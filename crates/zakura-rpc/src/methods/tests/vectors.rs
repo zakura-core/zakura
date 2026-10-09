@@ -5357,17 +5357,21 @@ async fn rpc_preciousblock_unknown_hash_is_block_not_found() {
     let (module, mut state, mut read_state, mut mempool) = precious_block_rpc();
 
     let hash = Hash([0x5b; 32]);
-    let (response, ()) = tokio::join!(
-        module.call::<_, serde_json::Value>("preciousblock", [hash.to_string()]),
-        async {
-            state
-                .expect_request(zakura_state::Request::PreciousBlock(hash))
-                .await
-                .respond(Err::<zakura_state::Response, BoxError>(
-                    zakura_state::PreciousError::BlockNotFound(hash).into(),
-                ));
-        },
-    );
+    let (response, ()) = tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::join!(
+            module.call::<_, serde_json::Value>("preciousblock", [hash.to_string()]),
+            async {
+                state
+                    .expect_request(zakura_state::Request::PreciousBlock(hash))
+                    .await
+                    .respond(Err::<zakura_state::Response, BoxError>(
+                        zakura_state::PreciousError::BlockNotFound(hash).into(),
+                    ));
+            },
+        )
+    })
+    .await
+    .expect("the state answers the dispatched request");
     let error = precious_block_error(response);
     assert_eq!(error.code(), -5);
     assert_eq!(error.message(), "Block not found");

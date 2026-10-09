@@ -921,10 +921,12 @@ pub trait Rpc {
     /// block, or a tip with less work than the best tip, the call succeeds and changes nothing. An
     /// unknown hash returns error code -5, and a malformed hash returns error code -8.
     ///
-    /// The preference is local to this node. It is kept only while the block is in a
-    /// non-finalized chain or an invalidation record, so it is forgotten when a fork-limit
-    /// eviction removes the block or its invalidation record is discarded, and a block downloaded
-    /// again is not preferred. It is not kept across restarts. See Bitcoin Core's
+    /// The preference is local to this node. It is kept while the block is in any non-finalized
+    /// chain or any retained invalidation record. It is forgotten once the block is in neither,
+    /// for example when a fork-limit eviction removes it from its last chain, or when its
+    /// invalidation record is discarded while it is in no chain. A block downloaded again after
+    /// that is not preferred. It is not kept across restarts.
+    /// See Bitcoin Core's
     /// [`preciousblock`](https://developer.bitcoin.org/reference/rpc/preciousblock.html).
     ///
     /// # Parameters

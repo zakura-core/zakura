@@ -10,24 +10,20 @@ async fn bidirectional_transfers_exceed_flow_control_windows() -> Result<(), Box
     // must receive acknowledgements and new flow-control credit to finish.
     const BYTES: usize = 64 * 1024 * 1024;
     let limits = ZakuraLocalLimits::from_config(&Config::default());
-    let server = LocalEndpointFactory::with_transport_config(limits.transport_config())
+    let server = LocalEndpointFactory::with_limits(&limits)
         .endpoint(92341)
         .await?;
-    let client = LocalEndpointFactory::with_transport_config(limits.transport_config())
+    let client = LocalEndpointFactory::with_limits(&limits)
         .endpoint(92342)
         .await?;
     let (connection_tx, mut connection_rx) = mpsc::channel(1);
     let (stream_tx, mut stream_rx) = mpsc::channel(1);
-    let router = Router::builder(server)
-        .accept(
-            ALPN,
-            CaptureConnection {
-                connection_tx,
-                stream_tx,
-            },
-        )
-        .spawn();
-    let address = LocalEndpointFactory::node_addr(router.endpoint()).await;
+    server.serve(CaptureConnection {
+        alpn: ALPN,
+        connection_tx,
+        stream_tx,
+    })?;
+    let address = LocalEndpointFactory::node_addr(&server).await;
     let connection = timeout(Duration::from_secs(10), client.connect(address, ALPN)).await??;
     let remote = timeout(Duration::from_secs(5), connection_rx.recv())
         .await?
@@ -66,8 +62,8 @@ async fn bidirectional_transfers_exceed_flow_control_windows() -> Result<(), Box
             )
         })?;
     connection.close(0u32.into(), b"done");
-    client.close().await;
-    router.shutdown().await?;
+    client.shutdown().await;
+    server.shutdown().await;
     Ok(())
 }
 

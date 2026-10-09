@@ -1,0 +1,22 @@
+# The newest released upstream Iroh 1.x node for COMPAT-2.
+#
+# A separate workspace with its own Cargo.lock: iroh 1.3 needs noq ^1.3, and
+# zakura-quic pins noq =1.2.0, so the two can't share one resolution.
+[workspace]
+
+[package]
+name = "iroh-interop-upstream"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "iroh-latest-node"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+futures = "0.3.31"
+iroh = { version = "1", default-features = false, features = ["tls-ring", "qlog"] }
+tokio = { version = "1.44", features = ["full"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

@@ -5,6 +5,7 @@ members = [
         "crates/zakura-mmr-tree",
         "crates/zakura-header-chain",
         "crates/zakura-network",
+        "crates/zakura-quic",
         "crates/zakura-state",
         "crates/zakura-script",
         "crates/zakura-consensus",
@@ -21,7 +22,7 @@ members = [
 # The asset packaging crate publishes on the release-state cadence rather than with the
 # workspace, and its payload is generated rather than committed, so it is deliberately not a
 # member. Zakura consumes the published crate from crates.io like any other dependency.
-exclude = ["crates/zakura-assets"]
+exclude = ["crates/zakura-assets", "tools/iroh-interop"]
 
 # Use the edition 2021 dependency resolver in the workspace, to match the crates
 resolver = "2"
@@ -78,6 +79,7 @@ criterion = { version = "0.8.2", default-features = false, features = ["rayon", 
 crossbeam-channel = "0.5.14"
 derive-new = "0.7"
 ed25519-zebra = "4.2"
+ed25519-dalek = { version = "2.2", default-features = false, features = ["std", "zeroize"] }
 equihash = { version = "=2.2.0", package = "zakura-equihash" }
 futures = "0.3.31"
 futures-core = "0.3.31"
@@ -94,7 +96,6 @@ hyper-util = "0.1.11"
 # Select the unicode-rs IDNA backend. The 1.2.x line selects ICU4X instead.
 # See docs/decisions/zakura/0002-idna-unicode-backend.md for the tradeoff.
 idna_adapter = "~1.1.0"
-iroh = { package = "zakura-iroh", version = "=1.1.0-rc.1", default-features = false, features = ["tls-ring"] }
 indexmap = "2.8"
 insta = "1.42"
 itertools = "0.14"
@@ -108,6 +109,10 @@ libzcash_script = "0.1"
 log = "0.4.27"
 metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.17.2", default-features = false }
+nix = "0.31"
+# Zakura's noq fork (SPEC §15). SPEC DEP-4 pins an exact fork release; until the fork
+# publishes one, the draft pins the fork's git revision.
+noq = { version = "=1.2.0", default-features = false, features = ["rustls", "ring", "runtime-tokio"] }
 once_cell = "1.21"
 owo-colors = "4.2.0"
 pin-project = "1.1.10"
@@ -126,6 +131,9 @@ redjubjub = { version = "=2.2.0", package = "zakura-redjubjub" }
 regex = "1.11"
 reqwest = { version = "0.13", default-features = false }
 ripemd = "0.1"
+ring = "0.17.14"
+rustls = { version = "0.23.45", default-features = false, features = ["ring", "std"] }
+rustls-pki-types = "1.12"
 # `bindgen-runtime` makes librocksdb-sys's bindgen load libclang itself. Without
 # it, a build that resolves a second bindgen version elsewhere (for example the
 # fresh placeholder project cargo-semver-checks generates) unifies clang-sys
@@ -139,6 +147,7 @@ serde = "1.0.219"
 serde_json = "1.0.140"
 sha2 = "0.10"
 schemars = "1"
+socket2 = "0.6"
 sinsemilla = { version = "=2.2.0", package = "zakura-sinsemilla" }
 anyhow = "1.0"
 strum = "0.28"
@@ -167,6 +176,7 @@ uint = "0.10"
 x25519-dalek = "2.0.1"
 zcash_note_encryption = "0.4.1"
 zcash_script = "0.4.5"
+zeroize = "1.8"
 
 # All cargo-release configuration lives in this table. Do not add a root
 # release.toml: it would silently shadow every setting here (cargo-release

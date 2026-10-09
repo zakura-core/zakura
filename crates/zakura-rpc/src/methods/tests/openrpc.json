@@ -31,6 +31,20 @@
       }
     },
     {
+      "name": "getstandardfee",
+      "summary": "Returns the recommended standard fee per logical action, in zatoshis.",
+      "description": "Returns the recommended standard fee per logical action, in zatoshis.\n\nCurrently returns Zakura's ZIP 317 marginal fee of 400 zatoshis, with `version` 0.\nA dynamic estimate can replace this value without changing the parameters or\nresult shape.\n\nmethod: post\ntags: wallet",
+      "params": [],
+      "result": {
+        "name": "getstandardfee_result",
+        "summary": "An OpenRPC document.",
+        "description": "An OpenRPC document.",
+        "schema": {
+          "$ref": "#/components/schemas/OpenRPC%20Schema"
+        }
+      }
+    },
+    {
       "name": "getnetworkinfo",
       "summary": "Returns an object containing various state info regarding P2P networking.",
       "description": "Returns an object containing various state info regarding P2P networking.\n\nzcashd reference: [`getnetworkinfo`](https://zcash.github.io/rpc/getnetworkinfo.html)\nmethod: post\ntags: network",

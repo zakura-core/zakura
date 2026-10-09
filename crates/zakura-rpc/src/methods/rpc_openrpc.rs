@@ -237,6 +237,13 @@ pub(crate) static METHODS: &[(&str, openrpc::RpcMethod)] = &[
     result: |g| g.result("z_validateaddress_result"),
     deprecated: false,
 }),
+("getstandardfee", openrpc::RpcMethod {
+    description: "Returns the recommended standard fee per logical action, in zatoshis.\n\nCurrently returns Zakura's ZIP 317 marginal fee of 400 zatoshis, with `version` 0.\nA dynamic estimate can replace this value without changing the parameters or\nresult shape.\n\nmethod: post\ntags: wallet\n",
+    params: |_g| vec![
+    ],
+    result: |g| g.result("getstandardfee_result"),
+    deprecated: false,
+}),
 ("getblocksubsidy", openrpc::RpcMethod {
     description: "Returns the block subsidy reward of the block at `height`, taking into account the mining slow start.\nReturns an error if `height` is less than the height of the first halving for the current network.\n\nzcashd reference: [`getblocksubsidy`](https://zcash.github.io/rpc/getblocksubsidy.html)\nmethod: post\ntags: mining\n\n# Parameters\n\n- `height`: (numeric, optional, example=1) Can be any valid current or future height.\n\n# Notes\n\nIf `height` is not supplied, uses the tip height.\n\nFrom the ZIP 234 reissuance start height, the subsidy depends on the parent block's\nchain value pools, so `height` must be at most one block above the best chain tip.\n",
     params: |_g| vec![

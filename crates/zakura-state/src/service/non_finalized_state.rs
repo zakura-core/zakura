@@ -107,7 +107,8 @@ pub struct NonFinalizedState {
     /// The latest `preciousblock` sequence of each preferred block, so chains reverted to that
     /// block get its preference back, and chains with the same tip compare equal.
     ///
-    /// Only blocks in a chain or in `invalidated_blocks` are kept.
+    /// Each call and each finalization drop blocks that are in no chain and not in
+    /// `invalidated_blocks`, so the map stays bounded by the non-finalized state.
     precious_blocks: HashMap<block::Hash, NonZeroU64>,
 
     // Configuration

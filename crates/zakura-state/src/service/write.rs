@@ -3005,14 +3005,15 @@ impl WriteBlockWorkerTask {
                                     non_finalized_state_sender.send(non_finalized_state.clone());
                                 return Ok(());
                             }
-                            let (height, _) =
-                                new_tip.expect("the best tip changed to a preferred chain tip");
+                            let (height, tip_hash) = new_tip.expect(
+                                "the preferred tip is in the chain set, so a best tip exists",
+                            );
                             if let Some(writer) = header_chain.as_ref() {
                                 commit_precious_change(
                                     writer,
                                     non_finalized_state,
                                     staged,
-                                    Frontier::new(height, hash),
+                                    Frontier::new(height, tip_hash),
                                 )
                                 .map_err(|error| {
                                     PreciousError::HeaderChain {

@@ -925,6 +925,101 @@ fn precious_block_publishes_and_keeps_the_preferred_verified_tip() {
     }
 }
 
+/// A staged block commit whose fork-limit eviction drops a preference changes no live preference
+/// when the header store refuses it.
+#[test]
+fn rejected_eviction_keeps_the_live_preferences() {
+    let _init_guard = zakura_test::init();
+    let forks = crate::constants::MAX_NON_FINALIZED_CHAIN_FORKS;
+    let PreciousFixture {
+        finalized,
+        mut live,
+        writer,
+        height,
+        siblings,
+    } = PreciousFixture::new(forks + 1, forks - 1);
+
+    // Prefer every recorded tip, oldest first from `siblings[1]`, then the hash winner.
+    for sibling in siblings[1..forks - 1].iter().chain(&siblings[..1]) {
+        let mut staged = live.clone();
+        staged
+            .precious_block(sibling.hash(), &finalized.db)
+            .unwrap();
+        commit_precious_change(
+            &writer,
+            &mut live,
+            staged,
+            Frontier::new(height, sibling.hash()),
+        )
+        .unwrap();
+    }
+
+    // Fault: full state holds a preferred side tip that the header chain never recorded, so the
+    // header store refuses every combined transition whose staged state contains it. Preferring
+    // the hash winner again keeps the header chain's verified tip in agreement.
+    let unrecorded = siblings[forks - 1].hash();
+    live.commit_new_chain(siblings[forks - 1].clone().prepare(), &finalized.db)
+        .unwrap();
+    for hash in [unrecorded, siblings[0].hash()] {
+        live.precious_block(hash, &finalized.db).unwrap();
+    }
+    assert_eq!(live.chain_count(), forks);
+    assert_eq!(live.best_tip().unwrap().1, siblings[0].hash());
+    let header_before = writer.runtime.publisher().snapshot();
+    assert_eq!(
+        header_before.frontiers.verified_best.hash,
+        siblings[0].hash()
+    );
+
+    // The new fork evicts the tip with the oldest preference, and forgets that preference.
+    let oldest = siblings[1].hash();
+    let (live_sequence, live_preferences) = live.precious_preferences();
+    let live_preferences = live_preferences.clone();
+    assert!(live_preferences.contains_key(&oldest));
+    let mut staged = live.clone();
+    staged
+        .commit_new_chain(siblings[forks].clone().prepare(), &finalized.db)
+        .unwrap();
+    assert!(!staged.any_chain_contains(&oldest));
+    assert!(staged.any_chain_contains(&unrecorded));
+    let mut expected = live_preferences.clone();
+    expected.remove(&oldest);
+    assert_eq!(staged.precious_preferences(), (live_sequence, &expected));
+
+    let (evidence, event_path, request) = verified_request(
+        &writer,
+        &live,
+        &staged,
+        Frontier::new(height, siblings[forks].hash()),
+    )
+    .unwrap();
+    let error = PreparedFullStateTransition::new(
+        evidence,
+        header_before.frontiers.verified_best,
+        event_path,
+        staged,
+        None,
+        request,
+    )
+    .unwrap()
+    .commit(&writer.runtime, &mut live, &writer.context())
+    .expect_err("the header store refuses the incoherent staged state");
+    assert!(
+        error
+            .to_string()
+            .contains("absent or incoherent in the projected header DAG"),
+        "{error:?}"
+    );
+
+    assert_eq!(writer.runtime.publisher().snapshot(), header_before);
+    assert_eq!(live.chain_count(), forks);
+    assert!(live.any_chain_contains(&oldest));
+    assert_eq!(
+        live.precious_preferences(),
+        (live_sequence, &live_preferences)
+    );
+}
+
 /// A `preciousblock` request whose durable header commit is rejected, sent through the block
 /// write task, leaves the live state, the header chain, and every published channel unchanged, and
 /// returns its write slot.

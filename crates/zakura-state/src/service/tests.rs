@@ -3580,6 +3580,116 @@ fn precious_block_preference_is_cleared_by_a_restart() {
     });
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn evicted_precious_block_is_downloaded_again_without_its_preference_legacy() {
+    assert_evicted_precious_block_redelivery(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn evicted_precious_block_is_downloaded_again_without_its_preference_header_integrated() {
+    assert_evicted_precious_block_redelivery(true).await;
+}
+
+/// A fork-limit eviction forgets the evicted tip's preference. When the evicted body is
+/// downloaded again, full state and the header chain select the normal equal-work winner.
+async fn assert_evicted_precious_block_redelivery(header_runtime: bool) {
+    let _init_guard = zakura_test::init();
+    let limit = Duration::from_secs(10);
+    let network = Network::new_regtest(Default::default());
+    let config = Config {
+        enable_zakura_header_seed_from_committed_blocks: header_runtime,
+        ..Config::ephemeral()
+    };
+    let (mut state, read, latest_chain_tip, _) =
+        StateService::new(config, &network, Height::MAX, 0)
+            .await
+            .unwrap();
+    let siblings = commit_precious_siblings(&mut state, limit).await;
+    let (winner, loser) = (siblings[0].clone(), siblings[1].clone());
+    // Renumbering a sibling's nonce gives another child of the same parent.
+    let branch = winner
+        .make_fake_siblings(3)
+        .into_iter()
+        .find(|block| !siblings.contains(block))
+        .unwrap();
+    timeout(limit, state.send_precious_block(loser.hash()))
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(read.best_tip().unwrap().1, loser.hash());
+
+    let child_of = |state: &StateService, parent: &Arc<Block>| {
+        let history_root = state
+            .read_service
+            .latest_non_finalized_state()
+            .find_chain(|chain| chain.contains_block_hash(parent.hash()))
+            .unwrap()
+            .history_tree(crate::HashOrHeight::Hash(parent.hash()))
+            .unwrap()
+            .hash()
+            .unwrap();
+        let mut child = parent.make_fake_child();
+        let merkle_root = child.transactions.iter().cloned().collect();
+        let header = Arc::make_mut(&mut Arc::make_mut(&mut child).header);
+        header.time += chrono::Duration::seconds(1);
+        header.merkle_root = merkle_root;
+        header.commitment_bytes = <[u8; 32]>::from(history_root).into();
+        child
+    };
+    let commit = |state: &mut StateService, block: &Arc<Block>| {
+        let response = state.queue_and_commit_to_non_finalized_state(block.clone().prepare(), None);
+        async move {
+            timeout(limit, response).await.unwrap().unwrap().unwrap();
+        }
+    };
+
+    // Give every other tip more work than `loser`, so it is the lowest chain when the last fork
+    // arrives. Its parent is the finalized tip, so it can be downloaded again.
+    let winner_child = child_of(&state, &winner);
+    commit(&mut state, &winner_child).await;
+    commit(&mut state, &branch).await;
+    let forks = child_of(&state, &branch)
+        .make_fake_siblings(crate::constants::MAX_NON_FINALIZED_CHAIN_FORKS - 1);
+    for fork in &forks {
+        commit(&mut state, fork).await;
+    }
+    assert!(!read
+        .latest_non_finalized_state()
+        .any_chain_contains(&loser.hash()));
+    let known = timeout(limit, state.call(Request::KnownBlock(loser.hash())))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(known, Response::KnownBlock(None)),
+        "an evicted body must be downloadable again: {known:?}"
+    );
+
+    // Remove every tip with more work, then download the evicted body again.
+    for hash in [branch.hash(), winner_child.hash()] {
+        timeout(limit, state.send_invalidate_block(hash))
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+    commit(&mut state, &loser).await;
+
+    assert_eq!(
+        read.best_tip().unwrap().1,
+        winner.hash(),
+        "an evicted tip must not keep its operator preference"
+    );
+    assert_eq!(latest_chain_tip.best_tip_hash(), Some(winner.hash()));
+    if header_runtime {
+        let mut snapshots = read.subscribe_header_chain_snapshots();
+        let snapshot = wait_for_verified_best(&mut snapshots, winner.hash(), limit).await;
+        assert_eq!(snapshot.frontiers.header_best.hash, winner.hash());
+    }
+    wait_for_idle_writer(&state, limit).await;
+}
+
 /// Dropping the caller's response does not cancel an accepted preference. The writer commits and
 /// publishes it, and keeps the request's write slot, which blocks optimistic relay, until the new
 /// tip is published.

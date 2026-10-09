@@ -260,9 +260,13 @@ work. Stage 2 runs after TLS proves the `NodeId` and is today's Zakura logic.
 - **ADM-8.** An established connection counts against its admitted IP until
   `Conn::closed()` resolves. The IP slot MUST NOT be released earlier. The
   aggregate owner slot additionally follows the transport state under ADM-11.
-  From close until noq frees its state, an inbound connection counts against
-  its admitted IP in `pending_from_ip`. One IP therefore cannot fill the
-  inbound share with failed attempts (ADM-7) or closed connections.
+  From when the endpoint's cleanup task observes the close until noq frees
+  the state, an inbound connection counts against its admitted IP in
+  `pending_from_ip`. One IP therefore cannot fill the inbound share with
+  failed attempts (ADM-7) or closed connections. The charge is not atomic
+  with the application releasing its own per-IP slot: in between, a same-IP
+  attempt can briefly pass the ADM-3 allowance. Global budgets and
+  registration still bound it.
 - **ADM-9.** After the handshake, `Acceptor::handle` receives a `Conn` whose
   `remote_id()` is proven. Stage 2 (control hello, per-identity dedup, cohort
   check) stays in `zakura-network` and doesn't change.

@@ -1,0 +1,234 @@
+//! Production admission under inbound control-handshake pressure.
+
+use super::*;
+
+const WAIT: Duration = Duration::from_secs(20);
+
+async fn configured_node(
+    total: usize,
+    handshakes: usize,
+) -> Result<(tempfile::TempDir, ZakuraEndpoint, ZakuraLocalLimits), BoxError> {
+    let identity = tempfile::tempdir()?;
+    let mut config = Config::for_test(P2pStack::Dual);
+    config.identity_dir = identity.path().to_owned();
+    config.zakura.bootstrap_peers.clear();
+    config.zakura.listen_addr = None;
+    config.zakura.max_connections = total;
+    config.zakura.max_connections_per_ip = 16;
+    config.zakura.max_pending_handshakes = handshakes;
+    let limits = ZakuraLocalLimits::from_config(&config);
+    let node = spawn_zakura_endpoint(&config, |_, _| Arc::new(NoopService))
+        .await?
+        .ok_or("native endpoint disabled")?;
+    Ok((identity, node, limits))
+}
+
+async fn wait_permits(budget: &Semaphore, expected: usize) {
+    while budget.available_permits() != expected {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+async fn wait_peers(node: &ZakuraEndpoint, count: usize) {
+    let mut peers = node.supervisor().subscribe();
+    while peers.borrow().len() != count {
+        peers.changed().await.unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn inbound_control_stalls_leave_outbound_capacity() -> Result<(), BoxError> {
+    let _guard = zakura_test::init();
+    timeout(WAIT, async {
+        let (_identity, node, limits) = configured_node(8, 4).await?;
+        let mut clients = Vec::new();
+        let mut stalled = Vec::new();
+        for seed in 985_000..985_003 {
+            let client = LocalEndpointFactory::with_limits(&limits)
+                .endpoint(seed)
+                .await?;
+            stalled.push(client.connect(node.node_addr().await, P2P_V2_ALPN).await?);
+            clients.push(client);
+        }
+        wait_permits(&node.handler.inbound_handshakes, 0).await;
+        assert_eq!(node.handler.pending_handshakes.available_permits(), 1);
+        let denied = LocalEndpointFactory::with_limits(&limits)
+            .endpoint(985_003)
+            .await?;
+        assert!(denied
+            .connect(node.node_addr().await, P2P_V2_ALPN)
+            .await
+            .is_err());
+        let peer = ZakuraTestNode::builder(985_004).spawn().await?;
+        let dial = node.spawn_native_dial(peer.node_addr().await);
+        wait_peers(&node, 1).await;
+        assert_eq!(node.handler.pending_handshakes.available_permits(), 1);
+        for connection in &stalled {
+            connection.close(0u32.into(), b"release control capacity");
+        }
+        drop(stalled);
+        wait_permits(&node.handler.pending_handshakes, 4).await;
+        assert_eq!(node.handler.inbound_handshakes.available_permits(), 3);
+        dial.abort();
+        let _ = dial.await;
+        for client in clients {
+            client.shutdown().await;
+        }
+        denied.shutdown().await;
+        peer.shutdown().await;
+        node.shutdown().await;
+        Ok::<_, BoxError>(())
+    })
+    .await?
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn registered_inbound_share_leaves_outbound_capacity() -> Result<(), BoxError> {
+    let _guard = zakura_test::init();
+    timeout(WAIT, async {
+        let (_identity, node, limits) = configured_node(4, 32).await?;
+        let mut clients = Vec::new();
+        let mut inbound = Vec::new();
+        for seed in 985_100..985_103 {
+            let client = LocalEndpointFactory::with_limits(&limits)
+                .endpoint(seed)
+                .await?;
+            let connection = client.connect(node.node_addr().await, P2P_V2_ALPN).await?;
+            run_native_initiator_handshake(
+                &connection,
+                &limits,
+                &node.handler.current_handshake_config(),
+                &ZakuraPeerId::new(client.local_id().as_bytes().to_vec())?,
+                &ZakuraTrace::noop(),
+                &ZakuraConnTrace::without_peer(seed),
+            )
+            .await?;
+            inbound.push(connection);
+            clients.push(client);
+        }
+        wait_peers(&node, 3).await;
+        let denied = LocalEndpointFactory::with_limits(&limits)
+            .endpoint(985_103)
+            .await?;
+        assert!(denied
+            .connect(node.node_addr().await, P2P_V2_ALPN)
+            .await
+            .is_err());
+        let peer = ZakuraTestNode::builder(985_104).spawn().await?;
+        let dial = node.spawn_native_dial(peer.node_addr().await);
+        wait_peers(&node, 4).await;
+        assert_eq!(node.handler.admission.available_permits(), 0);
+        dial.abort();
+        let _ = dial.await;
+        drop(inbound);
+        for client in clients {
+            client.shutdown().await;
+        }
+        denied.shutdown().await;
+        peer.shutdown().await;
+        node.shutdown().await;
+        Ok::<_, BoxError>(())
+    })
+    .await?
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn outbound_control_handshakes_can_use_entire_budget() -> Result<(), BoxError> {
+    let _guard = zakura_test::init();
+    timeout(WAIT, async {
+        let (_identity, node, limits) = configured_node(8, 4).await?;
+        let mut servers = Vec::new();
+        let mut dials = Vec::new();
+        let mut connections = Vec::new();
+        let mut streams = Vec::new();
+        for seed in 985_200..985_204 {
+            let server = LocalEndpointFactory::with_limits(&limits)
+                .endpoint(seed)
+                .await?;
+            let (connection_tx, mut connection_rx) = mpsc::channel(1);
+            let (stream_tx, stream_rx) = mpsc::channel(2);
+            server.serve(CaptureConnection {
+                alpn: P2P_V2_ALPN,
+                connection_tx,
+                stream_tx,
+            })?;
+            dials.push(node.spawn_native_dial(LocalEndpointFactory::node_addr(&server).await));
+            connections.push(
+                connection_rx
+                    .recv()
+                    .await
+                    .ok_or("missing outbound connection")?,
+            );
+            streams.push(stream_rx);
+            servers.push(server);
+        }
+        // No server answers the control hello. Outbound uses all four slots,
+        // not just the one slot kept aside from inbound traffic.
+        wait_permits(&node.handler.pending_handshakes, 0).await;
+        assert_eq!(node.handler.inbound_handshakes.available_permits(), 3);
+        let inbound = LocalEndpointFactory::with_limits(&limits)
+            .endpoint(985_204)
+            .await?;
+        assert!(matches!(
+            inbound.connect(node.node_addr().await, P2P_V2_ALPN).await,
+            Err(zakura_quic::ConnectError::Refused)
+        ));
+        assert_eq!(node.handler.inbound_handshakes.available_permits(), 3);
+
+        for dial in dials {
+            dial.abort();
+            let _ = dial.await;
+        }
+        wait_permits(&node.handler.pending_handshakes, 4).await;
+        assert_eq!(node.handler.inbound_handshakes.available_permits(), 3);
+        drop((connections, streams));
+        inbound.shutdown().await;
+        for server in servers {
+            server.shutdown().await;
+        }
+        node.shutdown().await;
+        Ok::<_, BoxError>(())
+    })
+    .await?
+}
+
+/// A dial refused by the local transport budget reports a local resource limit,
+/// which dialers do not count against the peer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn transport_capacity_refusal_is_a_local_resource_limit() -> Result<(), BoxError> {
+    let _guard = zakura_test::init();
+    timeout(WAIT, async {
+        let (_identity, node, limits) = configured_node(1, 4).await?;
+        // A handshake to a silent socket holds the only transport slot until its
+        // deadline, without taking the handler's admission permit.
+        let silent = tokio::net::UdpSocket::bind("127.0.0.1:0").await?;
+        let silent_addr = NodeAddr::with_addrs(
+            zakura_quic::NodeSecretKey::generate().public(),
+            [silent.local_addr()?],
+        );
+        let quic = node.quic.clone();
+        let pending = tokio::spawn(async move { quic.connect(silent_addr, P2P_V2_ALPN).await });
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        // Discovery must not start a dial the transport would refuse.
+        assert!(!node.has_native_admission_capacity());
+
+        let peer = ZakuraTestNode::builder(985_300).spawn().await?;
+        let result = serve_native_dial_connection(&node, peer.node_addr().await, &limits).await;
+        assert!(
+            matches!(
+                result,
+                Err(ZakuraHandlerError::ResourceLimit("transport capacity"))
+            ),
+            "{result:?}"
+        );
+        assert_eq!(node.handler.admission.available_permits(), 1);
+
+        pending.abort();
+        let _ = pending.await;
+        drop(silent);
+        peer.shutdown().await;
+        node.shutdown().await;
+        Ok::<_, BoxError>(())
+    })
+    .await?
+}

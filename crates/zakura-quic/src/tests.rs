@@ -1,5 +1,7 @@
 //! Endpoint conformance tests (SPEC §16).
 
+mod admission;
+
 use std::{
     collections::HashSet,
     net::{IpAddr, Ipv4Addr, SocketAddr},
@@ -78,6 +80,9 @@ fn loopback() -> QuicBindConfig {
     QuicBindConfig {
         addrs: vec![SocketAddr::from((Ipv4Addr::LOCALHOST, 0))],
         max_bidi_streams: 64,
+        max_connections: 256,
+        max_inbound_connections: 224,
+        max_draining_connections: 512,
     }
 }
 
@@ -235,6 +240,9 @@ async fn interface_change_notifies_noq_and_keeps_connections() {
             &QuicBindConfig {
                 addrs: vec![SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))],
                 max_bidi_streams: 64,
+                max_connections: 256,
+                max_inbound_connections: 224,
+                max_draining_connections: 512,
             },
             &test_config(),
         )
@@ -507,6 +515,9 @@ async fn happy_eyeballs_skips_a_black_hole() {
             &QuicBindConfig {
                 addrs: vec!["0.0.0.0:0".parse().unwrap()],
                 max_bidi_streams: 64,
+                max_connections: 256,
+                max_inbound_connections: 224,
+                max_draining_connections: 512,
             },
             &config,
         )
@@ -540,6 +551,9 @@ async fn peer_opened_path_from_a_banned_ip_closes() {
             &QuicBindConfig {
                 addrs: vec!["0.0.0.0:0".parse().unwrap()],
                 max_bidi_streams: 64,
+                max_connections: 256,
+                max_inbound_connections: 224,
+                max_draining_connections: 512,
             },
             &test_config(),
         )
@@ -601,6 +615,9 @@ async fn lagged_path_events_resync_the_open_paths() {
             &QuicBindConfig {
                 addrs: vec!["0.0.0.0:0".parse().unwrap()],
                 max_bidi_streams: 64,
+                max_connections: 256,
+                max_inbound_connections: 224,
+                max_draining_connections: 512,
             },
             &test_config(),
         )

@@ -23,6 +23,9 @@ pub enum ConnectError {
     /// The dialed node ID is this endpoint's own (DIAL-1).
     #[error("refusing to dial this node's own ID")]
     SelfDial,
+    /// Local transport capacity is still occupied, possibly by draining connections.
+    #[error("local QUIC connection capacity is full")]
+    Capacity,
     /// No address shares a family with a bound socket (DIAL-2).
     #[error("no dialable address: none matches a bound socket's address family")]
     NoUsableAddress,
@@ -74,10 +77,15 @@ impl ConnectError {
     }
 
     /// Ranks errors so a multi-address dial reports the most informative one.
+    ///
+    /// `Capacity` outranks remote failures other than `AlpnMismatch` and
+    /// `WrongIdentity`: an address skipped locally was never tried, so the dial
+    /// must not blame the peer (ADM-11).
     pub(crate) fn rank(&self) -> u8 {
         match self {
-            Self::AlpnMismatch => 6,
-            Self::WrongIdentity => 5,
+            Self::AlpnMismatch => 7,
+            Self::WrongIdentity => 6,
+            Self::Capacity => 5,
             Self::Refused => 4,
             Self::Transport(_) => 3,
             Self::HandshakeTimeout => 2,
@@ -97,6 +105,9 @@ pub enum BindError {
     /// No bind address was given.
     #[error("no bind address configured")]
     NoAddress,
+    /// Connection limits must be nonzero, with inbound no larger than total.
+    #[error("invalid QUIC connection limits")]
+    ConnectionLimits,
     /// A socket failed to bind or configure.
     #[error("failed to bind {addr}: {source}")]
     Socket {

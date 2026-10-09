@@ -16,6 +16,7 @@ use noq::{PathId, Runtime, VarInt};
 use tokio::{sync::watch, task::JoinSet};
 
 use crate::{
+    admission::{self, Admission, ConnectionAttempt, Reservation},
     config::{QuicBindConfig, QuicConfig},
     conn::{self, BanCheck, Conn, ConnObserver, OpenPaths},
     error::{BindError, ConnectError},
@@ -55,7 +56,8 @@ pub struct IncomingInfo {
     pub validated: bool,
     /// QUIC handshakes in progress on this endpoint (ADM-7).
     pub pending_total: usize,
-    /// QUIC handshakes in progress from `remote`'s IP (ADM-7).
+    /// QUIC handshakes in progress from `remote`'s IP, plus its failed attempts
+    /// and closed inbound connections whose state may remain (ADM-7, ADM-8).
     pub pending_from_ip: usize,
 }
 
@@ -113,6 +115,7 @@ struct Inner {
     transport: Arc<noq::TransportConfig>,
     sockets: Vec<SocketSlot>,
     pending: PendingTable,
+    admission: Admission,
     shutdown: watch::Sender<bool>,
     serve: Mutex<Option<Arc<dyn Acceptor>>>,
     observer: Mutex<Option<ConnObserver>>,
@@ -159,6 +162,13 @@ impl QuicEndpoint {
         if bind.addrs.is_empty() {
             return Err(BindError::NoAddress);
         }
+        if bind.max_inbound_connections == 0
+            || bind.max_inbound_connections > bind.max_connections
+            || bind.max_connections > tokio::sync::Semaphore::MAX_PERMITS
+            || bind.max_draining_connections > tokio::sync::Semaphore::MAX_PERMITS
+        {
+            return Err(BindError::ConnectionLimits);
+        }
         let runtime: Arc<dyn Runtime> = Arc::new(noq::TokioRuntime);
         let (shutdown, _) = watch::channel(false);
         let mut sockets = Vec::with_capacity(bind.addrs.len());
@@ -187,6 +197,11 @@ impl QuicEndpoint {
             transport: Arc::new(config.transport_config(bind.max_bidi_streams)),
             sockets,
             pending: PendingTable::default(),
+            admission: Admission::new(
+                bind.max_connections,
+                bind.max_inbound_connections,
+                bind.max_draining_connections,
+            ),
             shutdown,
             serve: Mutex::new(None),
             observer: Mutex::new(None),
@@ -326,7 +341,7 @@ impl QuicEndpoint {
                 }
                 metrics::counter!("zakura.quic.dial.attempts").increment(1);
                 let started = Instant::now();
-                let result = dial_once(&endpoint, client, target, deadline).await;
+                let result = dial_once(self, &endpoint, client, target, deadline).await;
                 record_handshake(&result, started);
                 (target, result)
             });
@@ -382,6 +397,26 @@ impl QuicEndpoint {
                 .unwrap_or_else(PoisonError::into_inner)
                 .take();
         }
+    }
+
+    /// Counts every accepted or dialed transport until noq reports it drained.
+    /// Construction is serialized separately so concurrent sockets cannot each
+    /// spend the same last slot. Counts may only decrease during that check.
+    fn open_connections(&self) -> usize {
+        self.inner
+            .sockets
+            .iter()
+            .filter_map(SocketSlot::endpoint)
+            .map(|socket| socket.open_connections())
+            .fold(0usize, usize::saturating_add)
+    }
+
+    /// Whether a dial would now pass the ADM-11 checks rather than fail with
+    /// [`ConnectError::Capacity`]. Callers can skip a dial instead of
+    /// retrying one that would fail locally. Another dial may still take the
+    /// last slot first.
+    pub fn has_dial_capacity(&self) -> bool {
+        self.inner.admission.has_dial_room(self.open_connections())
     }
 
     /// Picks the socket to dial `target` from: same family, and loopback for
@@ -457,6 +492,19 @@ impl QuicEndpoint {
             .iter()
             .filter_map(SocketSlot::endpoint)
             .collect()
+    }
+
+    /// The `pending_total` and `pending_from_ip` an attempt from `ip` would see
+    /// now, for tests.
+    #[cfg(test)]
+    pub(crate) fn pending(&self, ip: IpAddr) -> (usize, usize) {
+        (self.inner.pending.total(), self.inner.pending.for_ip(ip))
+    }
+
+    /// Live and draining owner permits held, for tests.
+    #[cfg(test)]
+    pub(crate) fn held_owners(&self) -> (usize, usize) {
+        self.inner.admission.held()
     }
 
     fn ban_check(&self) -> Option<BanCheck> {
@@ -694,6 +742,12 @@ async fn accept_loop(
         // This strong handle lives for one attempt only; the handshake task
         // gets the weak one (API-7).
         let endpoint = QuicEndpoint { inner };
+        let _construction = endpoint
+            .inner
+            .admission
+            .construction
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         let info = IncomingInfo {
             remote: canonical_addr(incoming.remote_address()),
             validated: incoming.remote_address_validated(),
@@ -707,6 +761,15 @@ async fn accept_loop(
         tracing::trace!(target: "zakura_quic", remote = %info.remote, ?decision, "incoming");
         match decision {
             Admit::Accept => {
+                let Ok(reservation) = endpoint
+                    .inner
+                    .admission
+                    .reserve(true, endpoint.open_connections())
+                else {
+                    metrics::counter!("zakura.quic.incoming.refused").increment(1);
+                    incoming.refuse();
+                    continue;
+                };
                 // ADM-7: count the handshake from Accept until it finishes.
                 let pending = endpoint.inner.pending.enter(info.remote.ip());
                 match incoming.accept() {
@@ -715,12 +778,17 @@ async fn accept_loop(
                         tasks.spawn(handshake(
                             weak.clone(),
                             endpoint.inner.config.handshake_timeout(),
-                            connecting,
+                            ConnectionAttempt::incoming(connecting, reservation)
+                                .charge_ip_after_close(
+                                    endpoint.inner.pending.clone(),
+                                    info.remote.ip(),
+                                ),
                             info.remote,
                             pending,
                             acceptor.clone(),
                         ));
                     }
+                    // noq frees this attempt's state inside `accept`, so its IP stays uncharged.
                     Err(error) => {
                         metrics::counter!("zakura.quic.handshake.failed").increment(1);
                         tracing::trace!(target: "zakura_quic", %error, "accept failed");
@@ -782,25 +850,35 @@ fn decide(config: &QuicConfig, acceptor: &dyn Acceptor, info: &IncomingInfo) -> 
 async fn handshake(
     weak: Weak<Inner>,
     deadline: Option<Duration>,
-    connecting: noq::Connecting,
+    mut connecting: ConnectionAttempt,
     remote: SocketAddr,
     pending: PendingGuard,
     acceptor: Arc<dyn Acceptor>,
 ) {
     let started = Instant::now();
+    let attempt = connecting
+        .weak_handle()
+        .expect("inbound attempts expose their transport state");
     let result = match deadline {
-        Some(deadline) => match tokio::time::timeout(deadline, connecting).await {
+        Some(deadline) => match tokio::time::timeout(deadline, &mut connecting).await {
             Ok(result) => result.map_err(ConnectError::from_handshake),
-            // ADM-6: dropping `connecting` closes the connection.
             Err(_) => Err(ConnectError::HandshakeTimeout),
         },
-        None => connecting.await.map_err(ConnectError::from_handshake),
+        None => (&mut connecting)
+            .await
+            .map_err(ConnectError::from_handshake),
     };
-    drop(pending);
     record_handshake(&result, started);
     let Ok(connection) = result else {
+        // ADM-7: noq keeps a failed attempt's state while it drains, so its IP
+        // charge and owner permit last until the state is freed.
+        // ADM-6: dropping the attempt closes a timed-out connection.
+        let _reservation = connecting.abandon().map(Reservation::into_draining);
+        let _charge = pending.into_hold();
+        admission::until_freed(&attempt).await;
         return;
     };
+    drop(pending);
     let (Some(remote_id), Some(alpn)) = (
         tls::remote_node_id(&connection),
         tls::negotiated_alpn(&connection),
@@ -820,12 +898,28 @@ async fn handshake(
 }
 
 async fn dial_once(
-    endpoint: &noq::Endpoint,
+    endpoint: &QuicEndpoint,
+    socket: &noq::Endpoint,
     client: noq::ClientConfig,
     target: SocketAddr,
     deadline: Option<Duration>,
 ) -> Result<noq::Connection, ConnectError> {
-    let connecting = endpoint.connect_with(client, target, tls::UNSENT_SERVER_NAME)?;
+    let connecting = {
+        let _construction = endpoint
+            .inner
+            .admission
+            .construction
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let reservation = endpoint
+            .inner
+            .admission
+            .reserve(false, endpoint.open_connections())?;
+        ConnectionAttempt::new(
+            socket.connect_with(client, target, tls::UNSENT_SERVER_NAME)?,
+            reservation,
+        )
+    };
     match deadline {
         Some(deadline) => match tokio::time::timeout(deadline, connecting).await {
             Ok(result) => result.map_err(ConnectError::from_handshake),
@@ -849,14 +943,26 @@ fn record_handshake<T>(result: &Result<T, ConnectError>, started: Instant) {
     }
 }
 
-/// Handshakes in progress, in total and per source IP (ADM-7).
+/// Handshakes in progress, in total and per source IP (ADM-7), plus per-IP
+/// charges for attempts whose transport state may remain (ADM-7, ADM-8).
 #[derive(Clone, Default)]
-struct PendingTable(Arc<Mutex<PendingCounts>>);
+pub(crate) struct PendingTable(Arc<Mutex<PendingCounts>>);
 
 #[derive(Default)]
 struct PendingCounts {
     total: usize,
     by_ip: HashMap<IpAddr, usize>,
+    draining: HashMap<IpAddr, usize>,
+}
+
+/// Removes one count for `ip`, dropping the entry at zero.
+fn release(counts: &mut HashMap<IpAddr, usize>, ip: IpAddr) {
+    if let Some(count) = counts.get_mut(&ip) {
+        *count -= 1;
+        if *count == 0 {
+            counts.remove(&ip);
+        }
+    }
 }
 
 impl PendingTable {
@@ -864,14 +970,10 @@ impl PendingTable {
         self.0.lock().unwrap_or_else(PoisonError::into_inner).total
     }
 
+    /// Handshakes in progress from `ip` plus its draining charges.
     fn for_ip(&self, ip: IpAddr) -> usize {
-        self.0
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .by_ip
-            .get(&ip)
-            .copied()
-            .unwrap_or(0)
+        let counts = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        counts.by_ip.get(&ip).copied().unwrap_or(0) + counts.draining.get(&ip).copied().unwrap_or(0)
     }
 
     fn enter(&self, ip: IpAddr) -> PendingGuard {
@@ -879,6 +981,16 @@ impl PendingTable {
         counts.total += 1;
         *counts.by_ip.entry(ip).or_default() += 1;
         PendingGuard {
+            table: self.clone(),
+            ip,
+        }
+    }
+
+    /// Charges `ip` until the guard drops, without counting a handshake (ADM-8).
+    pub(crate) fn hold(&self, ip: IpAddr) -> DrainingGuard {
+        let mut counts = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        *counts.draining.entry(ip).or_default() += 1;
+        DrainingGuard {
             table: self.clone(),
             ip,
         }
@@ -891,15 +1003,31 @@ struct PendingGuard {
     ip: IpAddr,
 }
 
+impl PendingGuard {
+    /// Ends the handshake but keeps charging its IP until the hold drops (ADM-7).
+    fn into_hold(self) -> DrainingGuard {
+        // Charge before releasing, so the IP is never briefly undercounted.
+        self.table.hold(self.ip)
+    }
+}
+
 impl Drop for PendingGuard {
     fn drop(&mut self) {
         let mut counts = self.table.0.lock().unwrap_or_else(PoisonError::into_inner);
         counts.total = counts.total.saturating_sub(1);
-        if let Some(count) = counts.by_ip.get_mut(&self.ip) {
-            *count -= 1;
-            if *count == 0 {
-                counts.by_ip.remove(&self.ip);
-            }
-        }
+        release(&mut counts.by_ip, self.ip);
+    }
+}
+
+/// Keeps one closed connection's IP charged until dropped (ADM-8).
+pub(crate) struct DrainingGuard {
+    table: PendingTable,
+    ip: IpAddr,
+}
+
+impl Drop for DrainingGuard {
+    fn drop(&mut self) {
+        let mut counts = self.table.0.lock().unwrap_or_else(PoisonError::into_inner);
+        release(&mut counts.draining, self.ip);
     }
 }

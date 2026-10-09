@@ -1,6 +1,6 @@
 # Spec: `zakura-quic` transport
 
-Status: draft for review, 2026-10-03. Version 0.4.
+Status: draft for review, 2026-10-05. Version 0.5.
 This document is authoritative for the `zakura-quic` crate, its configuration,
 its wire behavior and the Zakura noq fork.
 [Decision 0003](../decisions/zakura/0003-zakura-quic-transport.md) records the
@@ -12,7 +12,8 @@ DEP-6, SOCK-1, WIRE-9, ADM-1, ADM-3, PATH-3, OBS-3, API-2, API-3, API-6 and
 API-7; §17a lists each change. Version 0.3 answers the V12 audit of that
 implementation. It changes SOCK-11, ADM-3, PATH-2, DIAL-4, DIAL-5, CTRL-17,
 CTRL-22 and API-7; §17b lists each change. Version 0.4 adds SOCK-12; §17c
-explains it.
+explains it. Version 0.5 adds ADM-11, ADM-12 and ADM-13 and changes ADM-1, ADM-3,
+ADM-7, ADM-8 and API-6; §17d lists each change.
 
 ## 0. Conventions
 
@@ -206,7 +207,9 @@ work. Stage 2 runs after TLS proves the `NodeId` and is today's Zakura logic.
   - `remote`, the canonical source address (SOCK-11);
   - `validated`, which is `Incoming::remote_address_validated()`;
   - `pending_total` and `pending_from_ip`, the handshakes in progress on the
-    endpoint and from `remote`'s IP (ADM-7).
+    endpoint and from `remote`'s IP (ADM-7). `pending_from_ip` also counts the
+    IP's failed attempts and closed inbound connections whose state may remain
+    (ADM-7, ADM-8).
 - **ADM-2.** `admit` returns one of four outcomes, each mapped to a noq call:
   - `Accept` → `Incoming::accept`;
   - `Refuse` → `Incoming::refuse`, which sends `CONNECTION_REFUSED`;
@@ -215,9 +218,9 @@ work. Stage 2 runs after TLS proves the `NodeId` and is today's Zakura logic.
 - **ADM-3.** Zakura's acceptor MUST return:
   1. `Ignore` for a banned IP;
   2. `Refuse` when the IP's established plus pending connections reach
-     `max_connections_per_ip`;
-  3. `Refuse` when `max_pending_per_ip` is set and the IP has that many
-     handshakes in progress;
+     `max_connections_per_ip + 1` (saturating addition);
+  3. `Refuse` when `max_pending_per_ip` is set and `pending_from_ip` reaches
+     it;
   4. `Refuse` when the endpoint has `max_pending_handshakes` handshakes in progress;
   5. `Retry` when `retry_threshold` is set, `validated` is false, and pending
      handshakes reach `retry_threshold`;
@@ -235,6 +238,11 @@ work. Stage 2 runs after TLS proves the `NodeId` and is today's Zakura logic.
   A control handshake is an inbound connection past TLS that hasn't
   registered yet. The transport stops counting a connection when TLS
   finishes, so Zakura counts it against its IP from then until registration.
+  The extra pending attempt lets a same-IP reconnect authenticate and reach
+  duplicate handling while its incumbent still occupies the IP's slot.
+  Registration MUST keep the established limit at `max_connections_per_ip`:
+  a different identity cannot use the reconnect allowance to exceed it.
+  The global transport and handshake budgets still apply to that attempt.
 - **ADM-4.** `admit` MUST NOT block. It reads in-memory state only.
 - **ADM-5.** The endpoint MUST set:
   - `ServerConfig::max_incoming` to `max_incoming`;
@@ -244,11 +252,21 @@ work. Stage 2 runs after TLS proves the `NodeId` and is today's Zakura logic.
   finish within it. On expiry, the endpoint MUST drop the connecting future, which closes the
   connection, and count `zakura.quic.handshake.timed_out`.
 - **ADM-7.** A pending handshake counts against its IP and against the endpoint
-  from `Accept` until the handshake completes or fails.
+  from `Accept` until the handshake completes or fails. A handshake that fails
+  after `Incoming::accept` returns keeps counting against its IP, but not the
+  endpoint, until noq frees its state. The endpoint converts each accepted
+  attempt to 0.5-RTT to hold a weak handle to that state, and sends no
+  application data before the handshake completes.
 - **ADM-8.** An established connection counts against its admitted IP until
-  `Conn::closed()` resolves. The slot MUST NOT be released earlier. (Q5: if the
-  noq connection-lifetime hook from #1179 lands, release follows noq's state
-  release instead.)
+  `Conn::closed()` resolves. The IP slot MUST NOT be released earlier. The
+  aggregate owner slot additionally follows the transport state under ADM-11.
+  From when the endpoint's cleanup task observes the close until noq frees
+  the state, an inbound connection counts against its admitted IP in
+  `pending_from_ip`. One IP therefore cannot fill the inbound share with
+  failed attempts (ADM-7) or closed connections. The charge is not atomic
+  with the application releasing its own per-IP slot: in between, a same-IP
+  attempt can briefly pass the ADM-3 allowance. Global budgets and
+  registration still bound it.
 - **ADM-9.** After the handshake, `Acceptor::handle` receives a `Conn` whose
   `remote_id()` is proven. Stage 2 (control hello, per-identity dedup, cohort
   check) stays in `zakura-network` and doesn't change.
@@ -256,6 +274,45 @@ work. Stage 2 runs after TLS proves the `NodeId` and is today's Zakura logic.
   defaults: `RetryTokenKey` for tokens and `ring::hmac::Key` for resets
   (`noq-proto/src/crypto/ring_like.rs`). Each key is random per startup and
   never persists. Iroh's BLAKE3 keys go away.
+- **ADM-11.** Before constructing an accepted or dialed connection, the endpoint
+  MUST reserve a live owner slot and check the sum of `open_connections()`
+  across every bound socket. Construction and both checks MUST be serialized
+  across sockets and directions. `QuicBindConfig::max_connections` sets the
+  live budget. The transport count is capped at `max_connections +
+  max_draining_connections` and includes failed and cancelled dials, which hold
+  no owner slot, through drain. An owner slot follows the connecting future,
+  then the connection's weak handle until `is_alive()` is false, including
+  unread streams after drain; ADM-13 moves it to the draining budget at failure
+  or close. With the defaults, the transport count and the owner slots are each
+  at most 768, so at most 1,536 transport states can remain allocated.
+  Incoming packet buffers before acceptance remain separately bounded by ADM-5.
+  At a limit, the endpoint refuses an inbound attempt and fails a dial with
+  `ConnectError::Capacity`. Callers MUST treat `Capacity` as a local limit, not
+  a peer failure. A multi-address dial MUST report `Capacity` over every error
+  except `AlpnMismatch` and `WrongIdentity`, because an address skipped
+  locally was never tried. `QuicEndpoint::has_dial_capacity` reports whether a dial would
+  currently pass these checks, so callers can wait instead of dialing.
+- **ADM-12.** Inbound admission MUST leave `max(total / 8, 1)` slots in each
+  connection budget for outbound attempts, using integer division. With one
+  configured slot, either direction may use it. The same rule applies to the
+  existing control-handshake budget. Defaults allow 224 of 256 connection slots
+  and 28 of 32 control-handshake slots to inbound traffic. Outbound traffic MAY
+  use all unused slots. Closing or timing out MUST NOT bypass ADM-11.
+  `QuicBindConfig::max_inbound_connections` sets the inbound share. Owner and
+  control-handshake slots are partitioned. The transport count needs no
+  separate share: every inbound state holds a live or draining owner slot
+  until noq frees it, so inbound states leave room for the outbound live share
+  in the table, apart from entries noq has not yet removed after drain.
+- **ADM-13.** When a connection fails or closes, its owner slot MUST move from
+  the live budgets to a separate draining budget of
+  `QuicBindConfig::max_draining_connections` slots until noq frees the state.
+  If the draining budget is full, the connection keeps its live slot instead.
+  Inbound admission therefore counts only pending and established connections
+  while draining slots remain; once they run out, failed attempts again take
+  live slots. Zakura sets that budget to twice `max_connections`, 512 by
+  default. As an illustration, at a 52 s drain (ADM-7) failed attempts start
+  taking live slots at about 10 per second from at least 31 source IPs
+  (ADM-3), and fill the inbound share at about 14 per second from 44.
 
 ## 8. Dialing
 
@@ -325,10 +382,14 @@ Rules for every key:
 | CTRL-24 | `kernel_drop_poll_secs` | u32 | 10 | 1 – 300 | SOCK-7 | **New**, Linux only |
 | CTRL-25 | `qlog_dir` | optional path | unset | — | `qlog_from_path` | Only with the `qlog` cargo feature; startup MUST fail if set without it |
 
-These keys stay in `[network.zakura]` and keep their meaning:
-`listen_addr`, `max_connections` (256), `max_connections_per_ip` (16),
-`max_pending_handshakes` (32), `stream_open_rate_per_second`,
-`message_rate_per_second` and the handshake's `max_open_streams`.
+These keys stay in `[network.zakura]`: `listen_addr`, `max_connections`
+(256), `max_connections_per_ip` (16), `max_pending_handshakes` (32),
+`stream_open_rate_per_second`, `message_rate_per_second` and the handshake's
+`max_open_streams`. Three now carry transport admission rules:
+`max_connections` also sizes the ADM-11 live budget and, doubled, the ADM-13
+draining budget, `max_connections_per_ip`
+admits one extra pending reconnect (ADM-3), and inbound traffic gets only its
+ADM-12 share of `max_connections` and `max_pending_handshakes`.
 
 No release compiles both backends. There is no `transport` switch: the release
 that adds the direct backend deletes the Iroh backend (PLAN step 10).
@@ -450,7 +511,8 @@ The public surface of `zakura-quic`. Changing it is a semver change of the crate
   with `VarInt`, `ReadError`, `WriteError` and `ClosedStream`.
 - **API-6.** Errors: `ConnectError` has the variants `SelfDial`,
   `NoUsableAddress`, `AlpnMismatch`, `HandshakeTimeout`, `Refused`, `WrongIdentity`,
-  `Endpoint(noq::ConnectError)`, `Tls` and `Transport(noq::ConnectionError)`.
+  `Capacity`, `Endpoint(noq::ConnectError)`, `Tls` and
+  `Transport(noq::ConnectionError)`. `Capacity` is the ADM-11 local limit;
   `Endpoint` covers local endpoint failures such as a stopping endpoint; `Tls`
   covers other TLS alerts. `BindError` and `ConfigError` name the failing key
   or address.
@@ -575,6 +637,11 @@ and the legacy stack bridges old and new `p2p_stack = "dual"` nodes (COMPAT-7).
 | `/proc/net/udp` drop counter with a deliberately slow receiver | SOCK-7 |
 | A changed interface list notifies noq once, and an open connection keeps working | SOCK-12 |
 | Admission ordering, refuse, ignore, retry, timeout | ADM-1–ADM-7, SEC-3, SEC-4 |
+| Same-IP reconnect at the per-IP cap evicts its stale incumbent; another identity cannot register | ADM-3 |
+| Unread streams, failed inbound handshakes, and cancelled or timed-out dials stay charged through drain; a dial refused at capacity reports a local limit | ADM-8, ADM-11 |
+| Failed and closed attempts stay charged to their IP while their state may remain; another IP still connects | ADM-1, ADM-7, ADM-8 |
+| Inbound control stalls and registered inbound peers leave outbound room; outbound can use every unused slot | ADM-12 |
+| A failed handshake moves to the draining budget so a new inbound peer is admitted; with that budget full it keeps its live slot | ADM-13 |
 | Happy-eyeballs dial with mixed v4/v6 addresses and one black-holed address | DIAL-1–DIAL-6 |
 | Path ban and admitted-IP invariance | PATH-1–PATH-5, SEC-5 |
 | Config round trip, defaults, range errors, `nat_traversal` error | CTRL-0–CTRL-25 |
@@ -653,3 +720,29 @@ requirements:
   connections idled out and it redialed. Iroh learned of changes from OS
   events; polling every 5 s needs no new dependency, because SOCK-10 already
   lists interfaces.
+
+## 17d. Changes in version 0.5
+
+- **ADM-1.** `pending_from_ip` also counts failed attempts and closed inbound
+  connections whose state may remain.
+- **ADM-3.** Rule 2 admits one pending attempt beyond
+  `max_connections_per_ip`. Version 0.4 refused a same-IP reconnect before its
+  handshake, so it never reached duplicate handling and stayed locked out until
+  the stale incumbent idled out. Registration still enforces the limit. Rule 3
+  now reads `pending_from_ip`.
+- **ADM-7.** A failed attempt stays charged to its IP until noq frees its
+  state. A peer can set `max_ack_delay` near 2^14 ms, which stretches noq's
+  drain to 52 s or more. Charged only globally, a few such attempts per second
+  from one IP could fill the inbound share and refuse every other peer.
+- **ADM-8.** The aggregate owner slot follows transport state under ADM-11, and
+  a closed inbound connection keeps its IP charged until that state is freed.
+- **ADM-11.** Added. Version 0.4 released capacity at `Conn::closed()` and
+  charged nothing for failed or cancelled attempts, although noq keeps their
+  state through drain and while unread streams remain.
+- **ADM-12.** Added. Inbound attempts and control handshakes could otherwise
+  take every slot and block outbound dials.
+- **ADM-13.** Added. With failed states charged to the live inbound share,
+  about 14 source addresses sending 4.3 failed handshakes per second could keep
+  every honest inbound peer out. The draining budget raises that cost; it does
+  not remove it.
+- **API-6.** Adds `ConnectError::Capacity`.

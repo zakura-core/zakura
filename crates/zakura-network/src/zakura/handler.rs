@@ -309,8 +309,14 @@ pub struct ZakuraConfig {
     /// `docs/specs/zakura-quic.md` section 9 for every key and its range.
     pub quic: QuicConfig,
     /// Total concurrent Zakura connections, inbound plus outbound.
+    ///
+    /// Inbound connections get this limit less one eighth, rounded down but at
+    /// least one slot (224 of the default 256). A limit of 1 is shared.
     pub max_connections: usize,
     /// Maximum established Zakura connections admitted from one source IP.
+    ///
+    /// Admission allows one extra pending connection to authenticate a reconnect.
+    /// A different peer still cannot exceed the established limit.
     ///
     /// Zakura allows a small number of same-IP peers by default so NATed nodes
     /// and co-hosted fleets can connect without hitting the legacy TCP crawler's
@@ -318,6 +324,9 @@ pub struct ZakuraConfig {
     /// the primary eclipse-resistance controls.
     pub max_connections_per_ip: usize,
     /// Connections concurrently running the control handshake.
+    ///
+    /// Inbound handshakes get the same share as for `max_connections` (28 of
+    /// the default 32).
     pub max_pending_handshakes: usize,
     /// New streams per second admitted per connection after a valid prelude.
     pub stream_open_rate_per_second: u32,
@@ -445,6 +454,17 @@ pub struct ZakuraLocalLimits {
     pub max_inbound_queue_depth: u16,
 }
 
+/// Reserve one eighth for outbound progress within the existing total.
+/// A single configured slot remains shared in either direction.
+fn inbound_capacity(total: usize) -> usize {
+    let total = total.max(1);
+    if total == 1 {
+        total
+    } else {
+        total - (total / 8).max(1)
+    }
+}
+
 impl ZakuraLocalLimits {
     /// Build local handler limits from network configuration and handshake policy.
     pub fn from_config(config: &Config) -> Self {
@@ -513,6 +533,10 @@ impl ZakuraLocalLimits {
         QuicBindConfig {
             addrs,
             max_bidi_streams: u32::from(self.max_open_streams),
+            max_connections: self.max_connections,
+            max_inbound_connections: inbound_capacity(self.max_connections),
+            // Failed and closed states are cheap; see zakura-quic ADM-13.
+            max_draining_connections: self.max_connections.saturating_mul(2),
         }
     }
 }
@@ -865,7 +889,9 @@ impl ZakuraEndpoint {
     /// Used by the discovery dialer to avoid starting candidate dials that would
     /// immediately bounce off the admission cap.
     pub(crate) fn has_native_admission_capacity(&self) -> bool {
-        self.handler.admission.available_permits() > 0
+        // The transport budgets are separate, so a free handler permit alone
+        // does not mean a dial can start (zakura-quic ADM-11).
+        self.handler.admission.available_permits() > 0 && self.quic.has_dial_capacity()
     }
 
     /// Stop accepting, close every native connection and drain background tasks.
@@ -1294,13 +1320,13 @@ impl ZakuraSupervisorHandle {
         }
     }
 
-    /// Returns whether `remote_ip` has reached the per-IP cap once `pending`
-    /// QUIC handshakes and its control handshakes are counted. Never awaits.
-    fn ip_at_capacity(&self, remote_ip: IpAddr, pending: usize) -> bool {
+    /// Includes one pending reconnect beyond the established per-IP cap.
+    /// Registration still enforces the cap after identifying the peer.
+    fn ip_at_admission_capacity(&self, remote_ip: IpAddr, pending: usize) -> bool {
         self.ip_slots
             .charged(canonical_ip(remote_ip))
             .saturating_add(pending)
-            >= self.max_connections_per_ip
+            >= self.max_connections_per_ip.saturating_add(1)
     }
 
     /// Counts an inbound control handshake against `remote_ip` until the guard
@@ -2145,6 +2171,7 @@ pub struct ZakuraProtocolHandler {
     next_stream_id: Arc<AtomicU64>,
     admission: Arc<Semaphore>,
     pending_handshakes: Arc<Semaphore>,
+    inbound_handshakes: Arc<Semaphore>,
     shutdown: CancellationToken,
     // Bound endpoint identity, used for connection collision handling.
     local_node_id: Option<NodeId>,
@@ -2241,6 +2268,9 @@ impl ZakuraProtocolHandler {
             next_stream_id: Arc::new(AtomicU64::new(random_stream_session_seed())),
             admission: Arc::new(Semaphore::new(limits.max_connections)),
             pending_handshakes: Arc::new(Semaphore::new(limits.max_pending_handshakes)),
+            inbound_handshakes: Arc::new(Semaphore::new(inbound_capacity(
+                limits.max_pending_handshakes,
+            ))),
             shutdown: CancellationToken::new(),
             limits,
             local_node_id: None,
@@ -2367,6 +2397,20 @@ impl ZakuraProtocolHandler {
         remote_peer_id: &ZakuraPeerId,
         conn: &ZakuraConnTrace,
     ) -> Result<NativeHandshakeNegotiated, ZakuraHandlerError> {
+        let Ok(_inbound) = self.inbound_handshakes.clone().try_acquire_owned() else {
+            metrics::counter!("zakura.p2p.conn.rejected.pending_handshake").increment(1);
+            conn.trace_connection(
+                "rejected.admission",
+                None,
+                Some("inbound"),
+                Some("pending_handshake"),
+            );
+            connection.close(
+                VarInt::from_u32(ZAKURA_CLOSE_RESOURCE),
+                b"pending handshake",
+            );
+            return Err(ZakuraHandlerError::ResourceLimit("pending handshake"));
+        };
         let Ok(_handshake) = self.pending_handshakes.clone().try_acquire_owned() else {
             metrics::counter!("zakura.p2p.conn.rejected.pending_handshake").increment(1);
             conn.trace_connection(
@@ -3579,9 +3623,16 @@ impl Acceptor for ZakuraProtocolHandler {
         }
         if self
             .supervisor
-            .ip_at_capacity(incoming.remote.ip(), incoming.pending_from_ip)
+            .ip_at_admission_capacity(incoming.remote.ip(), incoming.pending_from_ip)
         {
             metrics::counter!("zakura.p2p.conn.rejected.per_ip").increment(1);
+            return Admit::Refuse;
+        }
+        let inbound_limit = inbound_capacity(self.limits.max_pending_handshakes);
+        let inbound_control =
+            inbound_limit.saturating_sub(self.inbound_handshakes.available_permits());
+        if incoming.pending_total.saturating_add(inbound_control) >= inbound_limit {
+            metrics::counter!("zakura.p2p.conn.rejected.pending_handshake").increment(1);
             return Admit::Refuse;
         }
         let control_handshakes = self
@@ -4156,7 +4207,14 @@ pub(crate) async fn serve_native_dial_connection(
     );
     let connection = timeout(dial_timeout, endpoint.quic.connect(node_addr, P2P_V2_ALPN))
         .await
-        .map_err(|_| ZakuraHandlerError::Timeout("native dial"))??;
+        .map_err(|_| ZakuraHandlerError::Timeout("native dial"))?
+        .map_err(|error| match error {
+            // Our transport budget refused the dial, so dialers must not blame the peer.
+            zakura_quic::ConnectError::Capacity => {
+                ZakuraHandlerError::ResourceLimit("transport capacity")
+            }
+            error => error.into(),
+        })?;
     let remote_node_id = connection.remote_id();
     let peer_id = ZakuraPeerId::new(remote_node_id.as_bytes().to_vec())?;
     let conn = ZakuraConnTrace::new(&endpoint.handler.trace, conn_id, &peer_id);
@@ -5998,8 +6056,10 @@ impl ZakuraHandlerError {
 
 #[cfg(test)]
 mod tests {
+    mod admission;
     pub(super) mod connection;
     mod quic_progress;
+    mod reconnect;
     use super::*;
     use crate::{
         protocol::internal::{InventoryResponse, Response},
@@ -6020,6 +6080,22 @@ mod tests {
         transaction::{self, UnminedTxId},
     };
     use zakura_test::vectors::{BLOCK_MAINNET_GENESIS_BYTES, BLOCK_TESTNET_141042_BYTES};
+
+    /// Dials `addr`, retrying while closed connections from this IP still count
+    /// against it (zakura-quic ADM-8). Each refused dial also drains locally.
+    async fn connect_after_close_holds(
+        endpoint: &QuicEndpoint,
+        addr: &NodeAddr,
+    ) -> Result<Connection, BoxError> {
+        loop {
+            match endpoint.connect(addr.clone(), P2P_V2_ALPN).await {
+                Err(zakura_quic::ConnectError::Refused | zakura_quic::ConnectError::Capacity) => {
+                    tokio::time::sleep(Duration::from_millis(100)).await
+                }
+                result => return Ok(result?),
+            }
+        }
+    }
 
     /// Regression for the mainnet dual-stack body-sync stall on
     /// `temp-zakura-sync-test-7` during run `20260714T073939Z-cca353fd1287`.
@@ -10835,6 +10911,8 @@ mod tests {
                 1,
                 "closing the duplicate must preserve the incumbent's IP slot"
             );
+            // Let noq free the closed duplicate.
+            drop((first_conn, first_accepted));
 
             // A second identity takes the IP's other slot.
             let third = LocalEndpointFactory::with_limits(&limits)
@@ -10856,11 +10934,20 @@ mod tests {
             let fourth = LocalEndpointFactory::with_limits(&limits)
                 .endpoint(886)
                 .await?;
-            let fourth_conn = fourth.connect(server_addr, P2P_V2_ALPN).await;
+            let fourth_conn = connect_after_close_holds(&fourth, &server_addr).await?;
+            let fourth_peer = ZakuraPeerId::new(fourth.local_id().as_bytes().to_vec())?;
+            let _ = run_native_initiator_handshake_without_trace(
+                &fourth_conn,
+                &limits,
+                &config,
+                &fourth_peer,
+            )
+            .await;
             assert!(
-                matches!(fourth_conn, Err(zakura_quic::ConnectError::Refused)),
-                "a new identity from the same IP must be refused before the handshake at the IP \
-                 cap: {fourth_conn:?}"
+                matches!(fourth_conn.closed().await,
+                    zakura_quic::ConnectionError::ApplicationClosed(close)
+                        if close.reason.as_ref() == b"registration"),
+                "the pending reconnect allowance must not grant another registered IP slot"
             );
             assert_eq!(supervisor.registered_ids().await.len(), 2);
             fourth.shutdown().await;
@@ -10884,15 +10971,15 @@ mod tests {
     // accepts: one source IP could authenticate as many distinct node ids and
     // fill the global connection budget despite `max_connections_per_ip`
     // (default 1). Inbound accepts now pass the admitted source IP into
-    // `register`, and the acceptor refuses a source IP at its cap before any
-    // handshake work (zakura-quic ADM-3).
+    // `register`. Admission allows one pending reconnect beyond the cap, but a
+    // different authenticated identity still cannot register (zakura-quic ADM-3).
     //
     // This guard drives the real production acceptor over loopback QUIC: two
     // distinct authenticated identities dial from the same source IP
     // (127.0.0.1). The per-IP cap is 1 while global admission keeps its default
     // (well above 1), so the second identity can only be turned away by the
-    // per-IP cap, not the global gate. It is refused before its handshake,
-    // leaving exactly one registered peer.
+    // per-IP cap, not the global gate. Its provisional attempt authenticates,
+    // but registration refuses it, leaving exactly one registered peer.
     #[tokio::test]
     async fn inbound_accept_enforces_per_ip_cap() -> Result<(), BoxError> {
         let _guard = zakura_test::init();
@@ -11011,17 +11098,15 @@ mod tests {
              resolved from the endpoint and counted against the per-IP cap)",
         );
 
-        // Second distinct identity from the same source IP: the acceptor refuses
-        // it before the handshake, so it never reaches registration. (Before the
-        // fix the accept passed remote_ip = None, so this identity registered and
-        // one source IP could exhaust the global budget.)
-        let second = connect_native(&server_addr, 882, &limits).await;
+        // The reconnect allowance must not admit a different authenticated peer.
+        let (second_endpoint, second) = connect_native(&server_addr, 882, &limits).await?;
+        // Registration can close the connection before the acknowledgement arrives.
+        let _ = run_handshake(&second_endpoint, &second, &limits).await;
+        let closed = timeout(Duration::from_secs(10), second.closed()).await?;
         let refused = matches!(
-            second
-                .as_ref()
-                .err()
-                .and_then(|error| error.downcast_ref::<zakura_quic::ConnectError>()),
-            Some(zakura_quic::ConnectError::Refused)
+            closed,
+            zakura_quic::ConnectionError::ApplicationClosed(ref close)
+                if close.reason.as_ref() == b"registration"
         );
         let registered = supervisor.registered_ids().await.len();
         assert!(
@@ -11087,9 +11172,9 @@ mod tests {
         server_ep.serve(handler)?;
         let server_addr = LocalEndpointFactory::node_addr(&server_ep).await;
 
-        // Two identities from 127.0.0.1 finish TLS and never send the control hello.
+        // The cap of two permits one extra pending reconnect, including control handshakes.
         let mut stalled = Vec::new();
-        for seed in [891, 892] {
+        for seed in [891, 892, 893] {
             let endpoint = LocalEndpointFactory::with_limits(&limits)
                 .endpoint(seed)
                 .await?;
@@ -11099,23 +11184,23 @@ mod tests {
         let loopback: IpAddr = Ipv4Addr::LOCALHOST.into();
         let control_count = || supervisor.ip_slots.charged(loopback);
         await_until(
-            "two stalled control handshakes",
+            "three stalled control handshakes",
             Duration::from_secs(5),
-            || control_count() == 2,
+            || control_count() == 3,
         )
         .await?;
 
-        // A third identity from the same IP is refused before TLS.
-        let third = LocalEndpointFactory::with_limits(&limits)
-            .endpoint(893)
+        // A fourth attempt cannot borrow another reconnect slot.
+        let fourth = LocalEndpointFactory::with_limits(&limits)
+            .endpoint(894)
             .await?;
         let refused = matches!(
-            third.connect(server_addr.clone(), P2P_V2_ALPN).await,
+            fourth.connect(server_addr.clone(), P2P_V2_ALPN).await,
             Err(zakura_quic::ConnectError::Refused)
         );
         assert!(
             refused,
-            "stalled control handshakes must fill the per-IP cap"
+            "stalled control handshakes must fill the bounded reconnect allowance"
         );
 
         // Closing the stalled connections releases their per-IP slots.

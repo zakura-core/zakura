@@ -33,7 +33,7 @@
     {
       "name": "getstandardfee",
       "summary": "Returns the recommended standard fee per logical action, in zatoshis.",
-      "description": "Returns the recommended standard fee per logical action, in zatoshis.\n\nCurrently returns Zakura's ZIP 317 marginal fee of 400 zatoshis, with `version` 0.\nA dynamic estimate can replace this value without changing the parameters or\nresult shape.\n\nmethod: post\ntags: wallet",
+      "description": "Returns the recommended standard fee per logical action, in zatoshis.\n\nCurrently returns Zakura's ZIP 317 marginal fee (`zip317::MARGINAL_FEE`), with `version` 0.\nA dynamic estimate can replace this value without changing the parameters or\nresult shape.\n\nmethod: post\ntags: wallet",
       "params": [],
       "result": {
         "name": "getstandardfee_result",

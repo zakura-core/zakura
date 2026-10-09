@@ -849,7 +849,7 @@ pub trait Rpc {
 
     /// Returns the recommended standard fee per logical action, in zatoshis.
     ///
-    /// Currently returns Zakura's ZIP 317 marginal fee of 400 zatoshis, with `version` 0.
+    /// Currently returns Zakura's ZIP 317 marginal fee (`zip317::MARGINAL_FEE`), with `version` 0.
     /// A dynamic estimate can replace this value without changing the parameters or
     /// result shape.
     ///

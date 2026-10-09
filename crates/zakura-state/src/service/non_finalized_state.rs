@@ -104,6 +104,12 @@ pub struct NonFinalizedState {
     /// Operator preferences are local and are not restored from the backup after a restart.
     precious_sequence: u64,
 
+    /// The latest `preciousblock` sequence of each preferred block, so chains reverted to that
+    /// block get its preference back, and chains with the same tip compare equal.
+    ///
+    /// Only blocks in a chain or in `invalidated_blocks` are kept.
+    precious_blocks: HashMap<block::Hash, NonZeroU64>,
+
     // Configuration
     //
     /// The configured Zcash network.
@@ -140,6 +146,7 @@ impl Clone for NonFinalizedState {
             network: self.network.clone(),
             invalidated_blocks: self.invalidated_blocks.clone(),
             precious_sequence: self.precious_sequence,
+            precious_blocks: self.precious_blocks.clone(),
             should_count_metrics: self.should_count_metrics,
         }
     }
@@ -153,6 +160,7 @@ impl NonFinalizedState {
             network: network.clone(),
             invalidated_blocks: Default::default(),
             precious_sequence: 0,
+            precious_blocks: HashMap::new(),
             should_count_metrics: true,
         }
     }
@@ -289,7 +297,7 @@ impl NonFinalizedState {
         F: FnOnce(&mut BTreeSet<Arc<Chain>>),
     {
         let inserted_tip = chain.non_finalized_tip_hash();
-        self.chain_set.insert(chain);
+        self.chain_set.insert(self.with_tip_preference(chain));
 
         chain_filter(&mut self.chain_set);
 
@@ -304,6 +312,41 @@ impl NonFinalizedState {
                 .clone();
             self.chain_set.remove(&evicted);
         }
+    }
+
+    /// Returns `chain` with the `preciousblock` preference of its current tip.
+    ///
+    /// Chain::cmp reads the preference, so call this only while the chain is outside the set.
+    fn with_tip_preference(&self, mut chain: Arc<Chain>) -> Arc<Chain> {
+        let tip = chain.non_finalized_tip_hash();
+        let precious = self
+            .precious_blocks
+            .get(&tip)
+            .map(|&sequence| (tip, sequence));
+        if chain.precious() != precious {
+            Arc::make_mut(&mut chain).set_precious(precious);
+        }
+        chain
+    }
+
+    /// Forget preferences for blocks that are no longer in a chain or invalidated.
+    fn retain_precious_blocks(&mut self) {
+        let stale: Vec<block::Hash> = self
+            .precious_blocks
+            .keys()
+            .copied()
+            .filter(|hash| !self.any_chain_contains(hash) && !self.is_invalidated(hash))
+            .collect();
+        for hash in stale {
+            self.precious_blocks.remove(&hash);
+        }
+    }
+
+    /// Returns true if `hash` is in `invalidated_blocks`.
+    fn is_invalidated(&self, hash: &block::Hash) -> bool {
+        self.invalidated_blocks
+            .values()
+            .any(|blocks| blocks.iter().any(|block| block.hash == *hash))
     }
 
     /// Insert `chain` into `self.chain_set`, then limit the number of tracked chains.
@@ -389,6 +432,7 @@ impl NonFinalizedState {
         // Remove all invalidated_blocks at or below the finalized height
         self.invalidated_blocks
             .retain(|height, _blocks| *height >= best_chain_root.height);
+        self.retain_precious_blocks();
 
         self.update_metrics_for_chains();
 
@@ -517,13 +561,8 @@ impl NonFinalizedState {
             .find(|chain| chain.non_finalized_tip_hash() == block_hash)
             .cloned()
         else {
-            let is_invalidated = || {
-                self.invalidated_blocks
-                    .values()
-                    .any(|blocks| blocks.iter().any(|block| block.hash == block_hash))
-            };
             if self.any_chain_contains(&block_hash)
-                || is_invalidated()
+                || self.is_invalidated(&block_hash)
                 || finalized_state.height(block_hash).is_some()
             {
                 return Ok(());
@@ -541,12 +580,14 @@ impl NonFinalizedState {
 
         self.precious_sequence = self.precious_sequence.saturating_add(1);
         let sequence = NonZeroU64::new(self.precious_sequence)
-            .expect("the sequence was just incremented from a non-negative value");
+            .expect("a saturating increment from zero is at least one");
+        self.precious_blocks.insert(block_hash, sequence);
+        self.retain_precious_blocks();
 
         // Chain::cmp reads the preference, so change it only while the chain is outside the set.
+        // Chains with the same tip compare equal, so the set holds one chain for this tip.
         self.chain_set.remove(&chain);
-        let mut chain = chain;
-        Arc::make_mut(&mut chain).set_precious(sequence);
+        let chain = self.with_tip_preference(chain);
         self.chain_set.insert(chain);
 
         Ok(())

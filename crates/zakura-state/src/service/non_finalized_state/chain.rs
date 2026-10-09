@@ -64,9 +64,9 @@ pub struct Chain {
     /// The operator's `preciousblock` preference for this chain's tip, with its call sequence.
     ///
     /// Local policy, not chain state, so it is not checked by [`Chain::eq_internal_state`].
-    /// Only [`NonFinalizedState`](super::NonFinalizedState) sets it, while the chain is outside
-    /// the `chain_set`. Growing or forking the chain keeps the stored hash, which stops matching
-    /// the tip until the chain is reverted to that block.
+    /// Only [`NonFinalizedState`](super::NonFinalizedState) sets it, from its per-block
+    /// preferences, whenever it inserts the chain into the `chain_set`. Growing or forking the
+    /// chain keeps the stored hash, which stops matching the tip, so a stale value never applies.
     precious: Option<(block::Hash, NonZeroU64)>,
 }
 
@@ -434,9 +434,14 @@ impl Chain {
         Some(forked)
     }
 
-    /// Marks the current tip as the operator's preferred block, ahead of any earlier call.
-    pub(super) fn set_precious(&mut self, sequence: NonZeroU64) {
-        self.precious = Some((self.non_finalized_tip_hash(), sequence));
+    /// Returns the operator's `preciousblock` preference stored on this chain.
+    pub(super) fn precious(&self) -> Option<(block::Hash, NonZeroU64)> {
+        self.precious
+    }
+
+    /// Stores the operator's `preciousblock` preference for this chain's tip.
+    pub(super) fn set_precious(&mut self, precious: Option<(block::Hash, NonZeroU64)>) {
+        self.precious = precious;
     }
 
     /// Returns the `preciousblock` sequence if it applies to the current tip, or zero.
@@ -2616,7 +2621,8 @@ impl Ord for Chain {
     /// interior mutability.
     ///
     /// `cmp` returns [`Ordering::Equal`] only when both the cumulative work and
-    /// the tip hash match. The [`NonFinalizedState::chain_set`][2] is a
+    /// the tip hash match, because the non-finalized state derives the
+    /// `preciousblock` preference from the tip hash on every insert. The [`NonFinalizedState::chain_set`][2] is a
     /// `BTreeSet<Arc<Chain>>`, so an attempt to insert a chain that compares
     /// equal to an existing entry is a no-op rather than a process-fatal panic.
     /// Callers that need to replace such a chain must remove the existing entry

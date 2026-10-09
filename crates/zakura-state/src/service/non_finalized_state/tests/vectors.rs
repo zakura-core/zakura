@@ -1351,3 +1351,69 @@ fn precious_block_changes_only_the_cloned_state() {
     assert_eq!(staged.best_tip().unwrap().1, low.hash());
     assert_eq!(state.best_tip().unwrap().1, high.hash());
 }
+
+/// A preference belongs to its block, so preferring a descendant does not erase it, and
+/// reverting to the block restores it.
+#[test]
+fn precious_block_survives_a_later_call_on_a_descendant() {
+    let _init_guard = zakura_test::init();
+    let network = Network::Mainnet;
+    let (mut state, finalized, low, high) = precious_test_state(&network);
+    state.precious_block(low.hash(), &finalized.db).unwrap();
+    let low_child = low.make_fake_child().set_work(1);
+    commit_test_block(&mut state, &finalized, &low_child);
+    state
+        .precious_block(low_child.hash(), &finalized.db)
+        .unwrap();
+    assert_eq!(state.best_tip().unwrap().1, low_child.hash());
+
+    state.invalidate_block(low_child.hash()).unwrap();
+    assert_eq!(state.best_tip().unwrap().1, low.hash());
+    assert!(state
+        .chain_iter()
+        .any(|chain| chain.non_finalized_tip_hash() == high.hash()));
+
+    // Invalidation keeps the preference for reconsideration, like Bitcoin Core's block index.
+    state.invalidate_block(low.hash()).unwrap();
+    assert_eq!(state.best_tip().unwrap().1, high.hash());
+    state.reconsider_block(low.hash(), &finalized.db).unwrap();
+    assert_eq!(state.best_tip().unwrap().1, low.hash());
+
+    // Finalizing the shared root keeps preferences only for retained or invalidated blocks.
+    state.finalize();
+    assert!(state
+        .precious_blocks
+        .keys()
+        .all(|hash| state.any_chain_contains(hash) || state.is_invalidated(hash)));
+    assert_eq!(state.best_tip().unwrap().1, low.hash());
+}
+
+/// Chains reverted to the same tip compare equal, so the chain set keeps one chain per tip.
+#[test]
+fn precious_block_keeps_one_chain_per_tip() {
+    let _init_guard = zakura_test::init();
+    let network = Network::Mainnet;
+    let (mut state, finalized, low, high) = precious_test_state(&network);
+    state.precious_block(low.hash(), &finalized.db).unwrap();
+
+    // Extend the preferred tip, then fork from it, so both chains carry the old preference.
+    let extension = low.make_fake_child().set_work(1);
+    let fork = low
+        .make_fake_child()
+        .set_work(1)
+        .set_block_commitment([9; 32]);
+    commit_test_block(&mut state, &finalized, &extension);
+    commit_test_block(&mut state, &finalized, &fork);
+    assert_eq!(state.chain_count(), 3);
+
+    // Revert one chain, prefer the tip again, then revert the other chain to the same tip.
+    state.invalidate_block(extension.hash()).unwrap();
+    state.precious_block(low.hash(), &finalized.db).unwrap();
+    state.invalidate_block(fork.hash()).unwrap();
+
+    let tips: Vec<_> = state
+        .chain_iter()
+        .map(|chain| chain.non_finalized_tip_hash())
+        .collect();
+    assert_eq!(tips, vec![low.hash(), high.hash()]);
+}

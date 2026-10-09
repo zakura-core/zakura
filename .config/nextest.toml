@@ -196,6 +196,13 @@ slow-timeout = { period = "15m", terminate-after = 2 }
 failure-output = "immediate"
 default-filter = 'package(zakura) and test(~zcashd_compat)'
 
+[profile.zcashd-compat-nu7]
+# Only the NU7 activation tests, on regtest.
+test-threads = 1
+slow-timeout = { period = "15m", terminate-after = 2 }
+failure-output = "immediate"
+default-filter = 'package(zakura) and test(~zcashd_compat_nu7)'
+
 [profile.zcashd-compat-soak]
 # Long-running local soak for the reorg churn stress test.
 test-threads = 1

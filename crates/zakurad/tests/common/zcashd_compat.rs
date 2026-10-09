@@ -16,6 +16,7 @@ pub mod chain;
 pub mod config;
 pub mod launch;
 pub mod network;
+pub mod nu7;
 pub mod reorg;
 pub mod resilience;
 pub mod startup;

@@ -5,11 +5,10 @@ use std::{
     io::Write,
 };
 
-use abscissa_core::{Component, FrameworkError, Shutdown};
+use abscissa_core::{Component, FrameworkError};
 
 use tokio::sync::watch;
 use tracing::{field::Visit, Level};
-use tracing_appender::non_blocking::{NonBlockingBuilder, WorkerGuard};
 use tracing_error::ErrorLayer;
 #[cfg(all(feature = "tokio-console", tokio_unstable))]
 use tracing_subscriber::EnvFilter;
@@ -18,8 +17,7 @@ use zakura_chain::parameters::Network;
 
 use crate::{application::build_version, components::tracing::Config};
 
-#[cfg(feature = "flamegraph")]
-use super::flame;
+use super::non_blocking::{non_blocking, WorkerGuard};
 
 // Art generated with these two images.
 // Zakura logo: project branding
@@ -47,10 +45,6 @@ pub type BoxWrite = Box<dyn Write + Send + Sync + 'static>;
 
 /// Abscissa component for initializing the `tracing` subsystem
 pub struct Tracing {
-    /// The installed flame graph collector, if enabled.
-    #[cfg(feature = "flamegraph")]
-    flamegrapher: Option<flame::Grapher>,
-
     /// The OpenTelemetry tracer provider, if enabled.
     #[cfg(feature = "opentelemetry")]
     otel_provider: Option<opentelemetry_sdk::trace::SdkTracerProvider>,
@@ -81,7 +75,6 @@ impl Tracing {
         let use_color_stderr = config.use_color_stderr();
 
         let filter = config.filter.clone().unwrap_or_default();
-        let flame_root = &config.flamegraph;
 
         // Only show the intro for user-focused node server commands like `start`
         // Also skip the intro for regtest, since it pollutes the QA test logs
@@ -144,12 +137,8 @@ impl Tracing {
             Box::new(stdout) as BoxWrite
         };
 
-        // Builds a lossy NonBlocking logger with a default line limit of 128_000 or an explicit buffer_limit.
-        // The write method queues lines down a bounded channel with this capacity to a worker thread that writes to stdout.
-        // Increments error_counter and drops lines when the buffer is full.
-        let (non_blocking, worker_guard) = NonBlockingBuilder::default()
-            .buffered_lines_limit(config.buffer_limit.max(100))
-            .finish(writer);
+        // Queue logs for the background writer, dropping new logs when full.
+        let (non_blocking, worker_guard) = non_blocking(writer, config.buffer_limit.max(100))?;
 
         // Construct a format subscriber with the supplied global logging filter.
         //
@@ -200,18 +189,6 @@ impl Tracing {
 
         // Add optional layers based on dynamic and compile-time configs
 
-        // Add a flamegraph
-        #[cfg(feature = "flamegraph")]
-        let (flamelayer, flamegrapher) = if let Some(path) = flame_root {
-            let (flamelayer, flamegrapher) = flame::layer(path);
-
-            (Some(flamelayer), Some(flamegrapher))
-        } else {
-            (None, None)
-        };
-        #[cfg(feature = "flamegraph")]
-        let subscriber = subscriber.with(flamelayer);
-
         #[cfg(feature = "journald")]
         let journaldlayer = if config.use_journald {
             use abscissa_core::FrameworkErrorKind;
@@ -233,9 +210,6 @@ impl Tracing {
         };
         #[cfg(feature = "journald")]
         let subscriber = subscriber.with(journaldlayer);
-
-        #[cfg(feature = "sentry")]
-        let subscriber = subscriber.with(crate::sentry::tracing_layer());
 
         // OpenTelemetry layer - zero overhead when config.opentelemetry_endpoint is None
         #[cfg(feature = "opentelemetry")]
@@ -291,18 +265,6 @@ impl Tracing {
             "started tracing component",
         );
 
-        if flame_root.is_some() {
-            if cfg!(feature = "flamegraph") {
-                info!(flamegraph = ?flame_root, "installed flamegraph tracing layer");
-            } else {
-                warn!(
-                    flamegraph = ?flame_root,
-                    "unable to activate configured flamegraph: \
-                     enable the 'flamegraph' feature when compiling zakurad",
-                );
-            }
-        }
-
         if config.use_journald {
             if cfg!(feature = "journald") {
                 info!("installed journald tracing layer");
@@ -313,9 +275,6 @@ impl Tracing {
                 );
             }
         }
-
-        #[cfg(feature = "sentry")]
-        info!("installed sentry tracing layer");
 
         #[cfg(all(feature = "tokio-console", tokio_unstable))]
         info!(
@@ -344,30 +303,7 @@ impl Tracing {
             );
         }
 
-        // Write any progress reports sent by other tasks to the terminal
-        //
-        // TODO: move this to its own module?
-        #[cfg(feature = "progress-bar")]
-        if let Some(progress_bar_config) = config.progress_bar.as_ref() {
-            use howudoin::consumers::TermLine;
-            use std::time::Duration;
-
-            // Stops flickering during the initial sync.
-            const PROGRESS_BAR_DEBOUNCE: Duration = Duration::from_secs(2);
-
-            let terminal_consumer = TermLine::with_debounce(PROGRESS_BAR_DEBOUNCE);
-            howudoin::init(terminal_consumer);
-
-            info!(?progress_bar_config, "activated progress bars");
-        } else {
-            info!(
-                "set 'tracing.progress_bar =\"summary\"' in zakura.toml to activate progress bars"
-            );
-        }
-
         Ok(Self {
-            #[cfg(feature = "flamegraph")]
-            flamegrapher,
             #[cfg(feature = "opentelemetry")]
             otel_provider,
             _guard: Some(worker_guard),
@@ -377,9 +313,6 @@ impl Tracing {
     /// Drops guard for worker thread of non-blocking logger,
     /// to flush any remaining logs when the program terminates.
     pub fn shutdown(&mut self) {
-        #[cfg(feature = "flamegraph")]
-        self.flamegrapher.take();
-
         #[cfg(feature = "opentelemetry")]
         if let Some(provider) = self.otel_provider.take() {
             if let Err(e) = provider.shutdown() {
@@ -404,31 +337,6 @@ impl<A: abscissa_core::Application> Component<A> for Tracing {
 
     fn version(&self) -> abscissa_core::Version {
         build_version()
-    }
-
-    fn before_shutdown(&self, _kind: Shutdown) -> Result<(), FrameworkError> {
-        #[cfg(feature = "flamegraph")]
-        if let Some(ref grapher) = self.flamegrapher {
-            use abscissa_core::FrameworkErrorKind;
-
-            info!("writing flamegraph");
-
-            grapher
-                .write_flamegraph()
-                .map_err(|e| FrameworkErrorKind::ComponentError.context(e))?
-        }
-
-        #[cfg(feature = "progress-bar")]
-        howudoin::disable();
-
-        Ok(())
-    }
-}
-
-impl Drop for Tracing {
-    fn drop(&mut self) {
-        #[cfg(feature = "progress-bar")]
-        howudoin::disable();
     }
 }
 

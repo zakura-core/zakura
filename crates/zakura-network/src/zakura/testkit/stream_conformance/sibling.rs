@@ -20,7 +20,7 @@ use super::CONFORMANCE_DEADLINE;
 use crate::{
     zakura::{
         Frame, FramedSend, Peer, Service, SessionOpening, SessionPolicy, Stream, StreamQueueDepths,
-        ZakuraConnId, ZakuraPeerId,
+        StreamWritePolicy, ZakuraConnId, ZakuraPeerId,
     },
     BoxError,
 };
@@ -39,6 +39,9 @@ const SIBLING: Stream = Stream {
     // A frame header and one fill frame.
     frame_cap: 2 * 1024 * 1024,
     capability: 1 << 49,
+    // These test streams intentionally hold credit throughout a layout load run.
+    // Property waits bound the run. A write timeout would release credit early.
+    write_policy: StreamWritePolicy::UntilCancelled,
     queue_depths: Some(StreamQueueDepths {
         inbound: 1,
         outbound: 1,

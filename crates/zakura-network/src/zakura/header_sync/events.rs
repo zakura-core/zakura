@@ -373,6 +373,8 @@ pub enum HeaderPathLeaseResult {
     Acquired(HeaderPathLease),
     /// State mapped the request to one explicit non-data protocol outcome.
     Outcome(HeadersOutcomeCode),
+    /// State registered a notification for the occupied serving resource.
+    CapacityBusy(zakura_node_services::header_chain::ServingCapacitySignal),
 }
 
 /// Minimum immutable lease facts needed by the serving reactor.

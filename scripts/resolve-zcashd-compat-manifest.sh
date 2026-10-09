@@ -1,9 +1,14 @@
 #!/usr/bin/env bash
-# Resolve hash-pinned zcashd compat artifacts from crates/zakurad/zcashd-compat-manifest.json.
+# Resolve the hash-pinned zcashd compat executable from crates/zakurad/zcashd-compat-manifest.json.
 set -euo pipefail
 
 DEFAULT_MANIFEST="crates/zakurad/zcashd-compat-manifest.json"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+MANIFEST_SCHEMA_VERSION=2
+# Download limits: the pinned executable is about 70 MiB.
+MAX_DOWNLOAD_BYTES=$((512 * 1024 * 1024))
+MAX_DOWNLOAD_SECONDS=600
+MAX_REDIRECTS=5
 
 MANIFEST_PATH=""
 TARGET_TRIPLE=""
@@ -11,6 +16,8 @@ DOCKER_PLATFORM=""
 CONTEXT_DIR=""
 WRITE_GITHUB_OUTPUT=0
 REQUIRE_TARGETS=""
+BINARY_URL=""
+BINARY_SHA256=""
 
 usage() {
   cat <<'EOF'
@@ -24,9 +31,12 @@ Options:
   --target-triple TRIPLE     Rust-style target triple
   --platform PLATFORM        Docker platform (linux/amd64)
   --require-targets LIST     Comma-separated target triples that must be present
-  --write-github-output      Write release_tag/url_amd64/sha256_amd64
+  --write-github-output      Write release_tag/manifest_path/url_amd64/sha256_amd64
   --prepare-build-context DIR
-                             Download, verify, and install zcashd into DIR/bin/zcashd
+                             Download and verify the standalone zcashd executable,
+                             then replace DIR with a context holding it at bin/zcashd
+  --binary-url URL           Override the manifest executable URL (HTTPS only)
+  --binary-sha256 SHA256     Override the manifest executable SHA-256
   -h, --help                 Show this help
 EOF
 }
@@ -71,22 +81,26 @@ validate_manifest() {
     exit 1
   fi
 
-  jq -e '
-    .schema_version
+  if ! jq -e --argjson version "$MANIFEST_SCHEMA_VERSION" '.schema_version == $version' "$manifest" >/dev/null; then
+    echo "unsupported zcashd compat manifest schema_version in $manifest (expected $MANIFEST_SCHEMA_VERSION)" >&2
+    exit 1
+  fi
+
+  if ! jq -e '
+    (keys == ["artifacts", "release_tag", "schema_version"])
     and (.release_tag | type == "string" and length > 0)
     and (.artifacts | type == "array" and length > 0)
-  ' "$manifest" >/dev/null
-
-  local target
-  while IFS= read -r target; do
-    jq -e --arg target "$target" '
-      .artifacts[]
-      | select(.target_triple == $target)
-      | .runtime_archive_url
-      and .runtime_archive_sha256
-      and .runtime_archive_member_binary_path
-    ' "$manifest" >/dev/null
-  done < <(jq -r '.artifacts[].target_triple' "$manifest")
+    and all(.artifacts[];
+      type == "object"
+      and (keys == ["runtime_binary_sha256", "runtime_binary_url", "target_triple"])
+      and (.target_triple | type == "string" and length > 0)
+      and (.runtime_binary_url | type == "string" and startswith("https://"))
+      and (.runtime_binary_sha256 | type == "string" and test("^[0-9a-f]{64}$")))
+  ' "$manifest" >/dev/null; then
+    echo "malformed zcashd compat manifest: $manifest" >&2
+    echo "each artifact needs only target_triple, an https runtime_binary_url and a lowercase hex runtime_binary_sha256" >&2
+    exit 1
+  fi
 
   local unique_targets
   unique_targets="$(jq -r '.artifacts[].target_triple' "$manifest" | sort -u | wc -l | tr -d ' ')"
@@ -154,8 +168,8 @@ write_github_output() {
     [.artifacts[] | select(.target_triple == $target)] | length == 1
   ' "$manifest" >/dev/null; then
     prefix="$(target_to_github_prefix "$triple")"
-    url="$(artifact_field "$manifest" "$triple" "runtime_archive_url")"
-    sha256="$(artifact_field "$manifest" "$triple" "runtime_archive_sha256")"
+    url="$(artifact_field "$manifest" "$triple" "runtime_binary_url")"
+    sha256="$(artifact_field "$manifest" "$triple" "runtime_binary_sha256")"
     {
       echo "url_${prefix}=$url"
       echo "sha256_${prefix}=$sha256"
@@ -163,38 +177,65 @@ write_github_output() {
   fi
 }
 
+# Downloads URL to DEST over HTTPS only, including redirects, and checks its
+# SHA-256 before making it executable.
+download_verified_binary() {
+  local url="$1"
+  local sha256="$2"
+  local dest="$3"
+  local actual
+
+  if [[ "$url" != https://* ]]; then
+    echo "zcashd compat executable URL must use https: $url" >&2
+    exit 1
+  fi
+  if [[ ! "$sha256" =~ ^[0-9a-f]{64}$ ]]; then
+    echo "zcashd compat executable SHA-256 must be 64 lowercase hex characters: $sha256" >&2
+    exit 1
+  fi
+
+  curl --fail --silent --show-error --location \
+    --proto '=https' --proto-redir '=https' --max-redirs "$MAX_REDIRECTS" \
+    --max-filesize "$MAX_DOWNLOAD_BYTES" --max-time "$MAX_DOWNLOAD_SECONDS" \
+    --output "$dest" "$url"
+
+  actual="$(sha256sum "$dest" | awk '{print $1}')"
+  if [[ "$actual" != "$sha256" ]]; then
+    echo "zcashd compat executable SHA-256 mismatch for $url: expected $sha256, got $actual" >&2
+    exit 1
+  fi
+  chmod 0755 "$dest"
+}
+
 prepare_build_context() {
   local manifest="$1"
   local target_triple="$2"
   local context_dir="$3"
-  local url sha256 member_path archive_path extract_dir work_dir binary_source binary_dest
+  local url sha256 parent_dir staged_context
 
-  url="$(artifact_field "$manifest" "$target_triple" "runtime_archive_url")"
-  sha256="$(artifact_field "$manifest" "$target_triple" "runtime_archive_sha256")"
-  member_path="$(artifact_field "$manifest" "$target_triple" "runtime_archive_member_binary_path")"
+  url="${BINARY_URL:-$(artifact_field "$manifest" "$target_triple" "runtime_binary_url")}"
+  sha256="${BINARY_SHA256:-$(artifact_field "$manifest" "$target_triple" "runtime_binary_sha256")}"
 
-  work_dir="$(mktemp -d)"
-  trap 'rm -rf "$work_dir"' RETURN
+  # Stage the new context next to DIR, so a failed download or check leaves an
+  # existing DIR untouched and the final rename stays on one filesystem.
+  context_dir="${context_dir%/}"
+  parent_dir="$(dirname "$context_dir")"
+  mkdir -p "$parent_dir"
+  STAGING_DIR="$(mktemp -d "$parent_dir/.zcashd-compat-context.XXXXXX")"
+  trap 'rm -rf "$STAGING_DIR"' EXIT
+  staged_context="$STAGING_DIR/context"
+  mkdir -p "$staged_context/bin"
 
-  archive_path="$work_dir/archive.tar.gz"
-  extract_dir="$work_dir/extracted"
+  download_verified_binary "$url" "$sha256" "$staged_context/bin/zcashd"
 
-  curl -fsSL "$url" -o "$archive_path"
-  echo "$sha256  $archive_path" | sha256sum -c -
-  mkdir -p "$extract_dir"
-  tar -xzf "$archive_path" -C "$extract_dir"
-
-  binary_source="$extract_dir/${member_path#./}"
-  if [[ ! -x "$binary_source" ]]; then
-    echo "expected executable missing from zcashd compat archive: $member_path" >&2
-    exit 1
+  # The executable only runs on its own platform; other hosts may still prepare
+  # a Docker context for it.
+  if [[ "$target_triple" == "x86_64-pc-linux-gnu" && "$(uname -sm)" == "Linux x86_64" ]]; then
+    "$staged_context/bin/zcashd" --version
   fi
 
   rm -rf "$context_dir"
-  binary_dest="$context_dir/bin/zcashd"
-  mkdir -p "$(dirname "$binary_dest")"
-  install -D -m 0755 "$binary_source" "$binary_dest"
-  "$binary_dest" --version
+  mv "$staged_context" "$context_dir"
 }
 
 while [[ $# -gt 0 ]]; do
@@ -221,6 +262,14 @@ while [[ $# -gt 0 ]]; do
       ;;
     --prepare-build-context)
       CONTEXT_DIR="$2"
+      shift 2
+      ;;
+    --binary-url)
+      BINARY_URL="$2"
+      shift 2
+      ;;
+    --binary-sha256)
+      BINARY_SHA256="$2"
       shift 2
       ;;
     -h | --help)

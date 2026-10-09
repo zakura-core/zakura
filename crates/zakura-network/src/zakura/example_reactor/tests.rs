@@ -362,3 +362,37 @@ impl StreamConformance for ExampleConformance {
 
 stream_conformance_suite!(single_stream_conformance, SINGLE, ExampleConformance);
 stream_conformance_suite!(paired_stream_conformance, PAIRED, ExampleConformance);
+
+/// A one-page credit window still exercises Close while its page waits on send capacity.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn p9_close_progresses_with_credit_for_only_one_page() -> Result<(), crate::BoxError> {
+    const ONE_PAGE: [Stream; 1] = [Stream {
+        messages: Some(&[
+            STATUS,
+            GET_ITEMS,
+            ITEM,
+            ITEMS_DONE,
+            RANGE_UNAVAILABLE,
+            MessageRule {
+                role: MessageRole::Subscription {
+                    max_live: 1,
+                    credit: Credit {
+                        objects: 1,
+                        // This fixed payload is below the u32 wire length limit.
+                        bytes: PushedPayload::MAX_LEN as u32,
+                    },
+                    cursor_history: 1,
+                    cadence: None,
+                },
+                ..WATCH
+            },
+            PUSHED,
+            WATCH_ENDED,
+        ]),
+        ..SINGLE[0]
+    }];
+    crate::zakura::testkit::stream_conformance::properties::close_progresses::<ExampleConformance>(
+        &ONE_PAGE,
+    )
+    .await
+}

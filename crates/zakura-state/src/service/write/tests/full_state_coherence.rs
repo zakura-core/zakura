@@ -946,8 +946,9 @@ async fn failed_precious_header_commit_changes_nothing_and_returns_the_write_slo
     let (winner, loser, unrecorded) = (siblings[0].hash(), siblings[1].hash(), siblings[2].hash());
 
     // Fault: full state holds a side tip that the header chain never recorded, so the header
-    // store refuses every combined transition whose staged state contains it. The block has the
-    // lowest hash, so the best tip and the header chain's verified tip still agree.
+    // store refuses, before its durable write, every combined transition whose staged state
+    // contains it. The block has the lowest hash, so the best tip and the header chain's
+    // verified tip still agree.
     live.commit_new_chain(siblings[2].clone().prepare(), &finalized.db)
         .unwrap();
     assert_eq!(live.best_tip().unwrap().1, winner);
@@ -1011,7 +1012,11 @@ async fn failed_precious_header_commit_changes_nothing_and_returns_the_write_slo
         .expect("the writer sends a response")
         .expect_err("the header store refuses the incoherent staged state");
     assert!(
-        matches!(error, crate::PreciousError::HeaderChain { .. }),
+        matches!(
+            &error,
+            crate::PreciousError::HeaderChain { error }
+                if error.contains("absent or incoherent in the projected header DAG")
+        ),
         "{error:?}"
     );
     let _slot = timeout(limit, slots.acquire())

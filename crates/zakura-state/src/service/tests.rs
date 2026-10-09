@@ -3551,7 +3551,7 @@ fn precious_block_preference_is_cleared_by_a_restart() {
     });
 
     node_run().block_on(async {
-        let (mut state, read, latest_chain_tip, _) =
+        let (state, read, latest_chain_tip, _) =
             StateService::new(config, &network, max_checkpoint_height, 0)
                 .await
                 .unwrap();

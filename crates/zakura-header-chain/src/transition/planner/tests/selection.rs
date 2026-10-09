@@ -118,7 +118,7 @@ fn projection_delta_and_verified_selection_cover_fork_boundaries() {
         .set_body_validation_state(first.hash, BodyValidationState::Unknown)
         .expect("the intermediate body becomes unverified");
     assert_eq!(
-        select_fully_verified_path(&store.graph)
+        select_fully_verified_path(&store.graph, None)
             .expect("verified selection remains finalized-rooted"),
         vec![anchor],
         "a verified descendant cannot jump over an unverified parent"

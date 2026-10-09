@@ -1843,6 +1843,9 @@ where
                 alternate_addrs.collect(),
             );
 
+            let block_uploads = server.block_uploads.clone();
+            let client_peer_registry_updater = peer_registry_updater.clone();
+
             let connection_task = tokio::spawn(
                 async move {
                     let _peer_registry_guard = peer_registry_guard;
@@ -1865,6 +1868,8 @@ where
             );
 
             let client = Client {
+                block_uploads,
+                peer_registry_updater: client_peer_registry_updater,
                 connection_info,
                 shutdown_tx: Some(shutdown_tx),
                 server_tx,

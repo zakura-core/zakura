@@ -179,9 +179,9 @@ impl LegacyGossipFrame {
     /// Convert a legacy network request into a gossip frame.
     pub fn from_request(request: Request) -> Result<Self, LegacyGossipError> {
         match request {
-            Request::AdvertiseBlock(hash, _) | Request::AdvertiseBlockToAll(hash) => {
-                Ok(Self::AdvertiseBlock(hash))
-            }
+            Request::AdvertiseBlock(hash, _)
+            | Request::AdvertiseBlockToAll(hash)
+            | Request::AdvertiseMinedBlock(hash) => Ok(Self::AdvertiseBlock(hash)),
             Request::AdvertiseTransactionIds(ids, _) => Self::advertise_transaction_ids(ids),
             request => Err(LegacyGossipError::UnsupportedRequest(request.command())),
         }
@@ -1909,6 +1909,7 @@ where
         let route = match &request {
             Request::AdvertiseBlock(..)
             | Request::AdvertiseBlockToAll(..)
+            | Request::AdvertiseMinedBlock(..)
             | Request::AdvertiseTransactionIds(..) => DualStackRoute::Advertise,
             Request::BlocksByHash(..)
             | Request::BlocksByHashFrom { .. }
@@ -5985,25 +5986,25 @@ mod tests {
             true,
         );
 
-        let hash = block_hash(9);
-        composite
-            .ready()
-            .await?
-            .call(Request::AdvertiseBlockToAll(hash))
-            .await?;
-
-        // Legacy peer set received the advertisement verbatim.
-        match recv_request(&mut rx_legacy).await? {
-            Request::AdvertiseBlockToAll(received) => assert_eq!(received, hash),
-            request => panic!("unexpected legacy request: {request:?}"),
-        }
-        // Zakura delivered it to node_b, attributed to node_a.
-        match recv_request(&mut rx_b).await? {
-            Request::AdvertiseBlock(received, Some(PeerSource::Zakura(peer_id))) => {
-                assert_eq!(received, hash);
-                assert_eq!(peer_id, a_peer_id);
+        for request in [
+            Request::AdvertiseBlockToAll(block_hash(9)),
+            Request::AdvertiseMinedBlock(block_hash(10)),
+        ] {
+            let hash = match &request {
+                Request::AdvertiseBlockToAll(hash) | Request::AdvertiseMinedBlock(hash) => *hash,
+                _ => unreachable!(),
+            };
+            composite.ready().await?.call(request.clone()).await?;
+            // The legacy peer set retains the local mining classification.
+            assert_eq!(recv_request(&mut rx_legacy).await?, request);
+            // The native wire frame remains ordinary block inventory.
+            match recv_request(&mut rx_b).await? {
+                Request::AdvertiseBlock(received, Some(PeerSource::Zakura(peer_id))) => {
+                    assert_eq!(received, hash);
+                    assert_eq!(peer_id, a_peer_id);
+                }
+                request => panic!("unexpected zakura request: {request:?}"),
             }
-            request => panic!("unexpected zakura request: {request:?}"),
         }
 
         node_a.shutdown().await;

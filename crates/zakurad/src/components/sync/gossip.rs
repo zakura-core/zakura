@@ -15,12 +15,12 @@ use zakura_network as zn;
 use zakura_rpc::MinedBlockEvent;
 use zakura_state::ChainTipChange;
 
-use crate::{
-    components::sync::{SyncStatus, TIPS_RESPONSE_TIMEOUT},
-    BoxError,
-};
+use crate::{components::sync::SyncStatus, BoxError};
 
 use BlockGossipError::*;
+
+/// Bounds a full paced broadcast, including several upload waves.
+pub(super) const BLOCK_GOSSIP_TIMEOUT: Duration = Duration::from_secs(90);
 
 /// A spawned committed mined-block broadcast finished.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -115,7 +115,7 @@ where
         // Drain local completion notifications from spawned mined-block
         // broadcasts before deciding whether the committed-tip fallback should
         // run. These are not peer acknowledgements: a success appears here only
-        // after our `AdvertiseBlockToAll` future completed successfully.
+        // after our mined-block broadcast future completed successfully.
         //
         // `try_recv()` keeps this non-blocking. `Empty` just means no spawned
         // broadcast has reported back yet, so the gossip loop can keep making
@@ -236,7 +236,7 @@ where
         // block broadcasts inform other nodes about new blocks,
         // so our internal Grow or Reset state doesn't matter to them
         let request = if is_block_submission {
-            zn::Request::AdvertiseBlockToAll(hash)
+            zn::Request::AdvertiseMinedBlock(hash)
         } else {
             zn::Request::AdvertiseBlock(hash, None)
         };
@@ -286,12 +286,12 @@ where
     }
 }
 
-/// Sends a block broadcast, returning `true` if it succeeded within [`TIPS_RESPONSE_TIMEOUT`].
+/// Sends a block broadcast, returning `true` if it succeeded within [`BLOCK_GOSSIP_TIMEOUT`].
 async fn broadcast_with_timeout<ZN>(network: ZN, request: zn::Request) -> bool
 where
     ZN: Service<zn::Request, Response = zn::Response, Error = BoxError>,
 {
-    tokio::time::timeout(TIPS_RESPONSE_TIMEOUT, network.oneshot(request))
+    tokio::time::timeout(BLOCK_GOSSIP_TIMEOUT, network.oneshot(request))
         .await
         .is_ok_and(|result| result.is_ok())
 }
@@ -320,7 +320,7 @@ fn finish_mined_block_broadcast<ZN>(
         return;
     }
 
-    let request = zn::Request::AdvertiseBlock(hash, None);
+    let request = zn::Request::AdvertiseMinedBlock(hash);
     info!(
         ?request,
         "sending committed block broadcast after the mined block broadcast failed",
@@ -334,7 +334,7 @@ fn finish_mined_block_broadcast<ZN>(
 struct MinedBlockBroadcasts {
     /// Broadcasts that have not reported completion, counted per hash.
     ///
-    /// Every spawned broadcast reports completion within [`TIPS_RESPONSE_TIMEOUT`], so entries
+    /// Every spawned broadcast reports completion within [`BLOCK_GOSSIP_TIMEOUT`], so entries
     /// do not accumulate.
     in_flight: HashMap<block::Hash, usize>,
 

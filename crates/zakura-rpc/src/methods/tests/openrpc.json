@@ -612,6 +612,30 @@
       }
     },
     {
+      "name": "preciousblock",
+      "summary": "Treats a block as if it were received before other chain tips with the same work.",
+      "description": "Treats a block as if it were received before other chain tips with the same work.\n\nA later call overrides an earlier one. A chain with more work still wins, so this does\nnothing for a block with less work than the best tip. The preference is not kept across\nrestarts. See Bitcoin Core's\n[`preciousblock`](https://developer.bitcoin.org/reference/rpc/preciousblock.html).\n\n# Parameters\n\n- `block_hash`: (hex-encoded block hash, required) The hash of the block to prefer.",
+      "params": [
+        {
+          "name": "block_hash",
+          "summary": "The hash of the block to return.",
+          "description": "The hash of the block to return.",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "result": {
+        "name": "preciousblock_result",
+        "summary": "An OpenRPC document.",
+        "description": "An OpenRPC document.",
+        "schema": {
+          "$ref": "#/components/schemas/OpenRPC%20Schema"
+        }
+      }
+    },
+    {
       "name": "getrawtransaction",
       "summary": "Returns the raw transaction data, as a [`GetRawTransactionResponse`]",
       "description": "Returns the raw transaction data, as a [`GetRawTransactionResponse`]\nJSON string or structure.\n\nzcashd reference: [`getrawtransaction`](https://zcash.github.io/rpc/getrawtransaction.html)\nmethod: post\ntags: transaction\n\n# Parameters\n\n- `txid`: (string, required, example=\"mytxid\") The transaction ID of the transaction to be returned.\n- `verbose`: (number, optional, default=0, example=1) If 0, return a string of hex-encoded data, otherwise return a JSON object.\n- `blockhash` (string, optional) The block in which to look for the transaction\n\n# Notes\n\nVerbose transaction output includes `ironwood` only when the transaction\ncontains Ironwood shielded data.",

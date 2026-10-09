@@ -3440,6 +3440,7 @@ async fn assert_precious_block_request(header_runtime: bool) {
     assert_eq!(best_tip(&state), siblings[1].hash());
 
     // A full writer rejects the request instead of queueing it, and frees no slot it never held.
+    wait_for_idle_writer(&state, limit).await;
     let all_slots = state
         .non_finalized_write_slots
         .clone()
@@ -3463,6 +3464,12 @@ async fn assert_precious_block_request(header_runtime: bool) {
         .unwrap()
         .unwrap();
     assert_eq!(best_tip(&state), siblings[0].hash());
+    wait_for_idle_writer(&state, limit).await;
+}
+
+/// Waits until the block writer releases every write slot. A request's response is sent
+/// before the writer drops that request's slot.
+async fn wait_for_idle_writer(state: &StateService, limit: Duration) {
     timeout(limit, async {
         while state.non_finalized_write_slots.available_permits()
             < super::queued_blocks::MAX_QUEUED_BLOCKS
@@ -3471,7 +3478,7 @@ async fn assert_precious_block_request(header_runtime: bool) {
         }
     })
     .await
-    .expect("the writer releases the request's slot after publishing");
+    .expect("the writer releases each request's slot after publishing");
 }
 
 /// During checkpoint sync the writer defers non-finalized messages, so precious requests fail

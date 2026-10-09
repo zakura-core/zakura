@@ -3517,8 +3517,9 @@ fn precious_block_preference_is_cleared_by_a_restart() {
     assert!(config.non_finalized_state_backup_dir(&network).is_some());
     // The finalized tip is at the last checkpoint, so the restart restores the backup.
     let max_checkpoint_height = Height(1);
-    // Each node run has its own runtime. Shutting a runtime down stops the state's background
-    // tasks, which release the database lock, like a process exit.
+    // Each node run has its own runtime. Shutting a runtime down drops the state's background
+    // tasks, such as its metrics exporter, which hold database handles, so the next run can take
+    // the database lock, like after a process exit.
     let node_run = || {
         tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -3636,6 +3637,8 @@ async fn dropped_precious_block_response_still_publishes_before_releasing_its_sl
         "the unpublished preference keeps its write slot"
     );
     assert_eq!(latest_chain_tip.best_tip_hash(), Some(winner));
+    // The held slot makes the writer busy, so this check returns before it reads the published
+    // state, which the gate blocks.
     let relay_authorized = |state: &StateService, parent| {
         let _candidate_slot = state
             .non_finalized_write_slots

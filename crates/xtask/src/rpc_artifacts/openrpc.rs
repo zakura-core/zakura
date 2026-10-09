@@ -122,6 +122,12 @@ pub(super) fn generate(source: &Path, output_dir: &Path) -> Result<(), BoxError>
         writeln!(output, "}}),")?;
     }
 
+    for name in TYPED_RESULT_METHODS {
+        if !output.contains(&format!("({name:?}, openrpc::RpcMethod {{")) {
+            return Err(format!("typed-result RPC method {name} is not in the Rpc trait").into());
+        }
+    }
+
     output.push_str("];");
     fs::write(output_dir.join("rpc_openrpc.rs"), output)?;
     Ok(())

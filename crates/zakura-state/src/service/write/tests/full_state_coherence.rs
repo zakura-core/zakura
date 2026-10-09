@@ -925,11 +925,11 @@ fn precious_block_publishes_and_keeps_the_preferred_verified_tip() {
     }
 }
 
-/// A `preciousblock` request whose durable header commit fails, sent through the block write
-/// task, leaves the live state, the header chain, and every published channel unchanged, and
+/// A `preciousblock` request whose durable header commit is rejected, sent through the block
+/// write task, leaves the live state, the header chain, and every published channel unchanged, and
 /// returns its write slot.
 #[tokio::test(flavor = "multi_thread")]
-async fn failed_precious_header_commit_changes_nothing_and_returns_the_write_slot() {
+async fn rejected_precious_header_commit_changes_nothing_and_returns_the_write_slot() {
     use tokio::time::timeout;
     use zakura_chain::chain_tip::ChainTip;
 

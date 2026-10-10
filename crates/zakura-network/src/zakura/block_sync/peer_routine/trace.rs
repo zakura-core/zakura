@@ -27,7 +27,9 @@ impl PeerRoutine {
             row.bbr_cwnd = Some(saturating_usize(self.window.bbr_effective_cwnd()));
             row.available_slots = Some(saturating_usize(self.window.available_slots()));
             if let Some(last_block_at) = self.window.last_block_at {
-                row.last_block_age_ms = Some(elapsed_ms_u64(last_block_at.elapsed()));
+                row.last_block_age_ms = Some(elapsed_ms_u64(
+                    time::Instant::from_std(last_block_at).elapsed(),
+                ));
             }
         });
     }

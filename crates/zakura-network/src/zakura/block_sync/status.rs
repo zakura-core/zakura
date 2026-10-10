@@ -2,8 +2,7 @@
 
 use super::{state::RateMeter, BlockSyncStatus, Duration, Instant};
 
-/// Bound prompt range corrections independently of ordinary tip-growth updates.
-pub(super) const RANGE_CORRECTION_INTERVAL: Duration = Duration::from_secs(1);
+const RANGE_CORRECTION_INTERVAL: Duration = Duration::from_secs(1);
 const QUEUE_RETRY_INTERVAL: Duration = Duration::from_millis(100);
 
 /// A queued frame is the delivery boundary of the ordered, reliable stream.
@@ -12,27 +11,35 @@ const QUEUE_RETRY_INTERVAL: Duration = Duration::from_millis(100);
 #[derive(Debug)]
 pub(super) struct StatusDelivery {
     last_queued: Option<BlockSyncStatus>,
-    growth: RateMeter,
-    contraction: RateMeter,
-    handshake_at: Instant,
+    updates: RateMeter,
+    legacy: Option<LegacyStatusDelivery>,
     queue_retry_at: Option<Instant>,
     queue_retry_interval: Duration,
 }
 
+/// Version 2 keeps prompt corrections separate from ordinary growth updates.
+#[derive(Debug)]
+struct LegacyStatusDelivery {
+    contraction: RateMeter,
+    handshake_at: Instant,
+}
+
 impl StatusDelivery {
-    pub(super) fn new(interval: Duration, now: Instant) -> Self {
+    pub(super) fn new(interval: Duration, now: Instant, regulated: bool) -> Self {
         let interval = interval.max(Duration::from_millis(1));
         Self {
             last_queued: None,
-            growth: RateMeter {
+            updates: RateMeter {
                 next_allowed: now,
                 interval,
             },
-            contraction: RateMeter {
-                next_allowed: now,
-                interval: interval.min(RANGE_CORRECTION_INTERVAL),
-            },
-            handshake_at: now,
+            legacy: (!regulated).then_some(LegacyStatusDelivery {
+                contraction: RateMeter {
+                    next_allowed: now,
+                    interval: interval.min(RANGE_CORRECTION_INTERVAL),
+                },
+                handshake_at: now,
+            }),
             queue_retry_at: None,
             queue_retry_interval: interval.min(QUEUE_RETRY_INTERVAL),
         }
@@ -44,12 +51,19 @@ impl StatusDelivery {
         latest: BlockSyncStatus,
         received_status: bool,
     ) -> Option<Instant> {
-        let deadline = match self.last_queued {
-            None => self.handshake_at,
-            Some(previous) if contracts(previous, latest) => self.contraction.next_allowed,
-            Some(previous) if previous != latest => self.growth.next_allowed,
-            Some(_) if !received_status => self.handshake_at,
-            Some(_) => return None,
+        let deadline = if let Some(legacy) = &self.legacy {
+            match self.last_queued {
+                None => legacy.handshake_at,
+                Some(previous) if contracts(previous, latest) => legacy.contraction.next_allowed,
+                Some(previous) if previous != latest => self.updates.next_allowed,
+                Some(_) if !received_status => legacy.handshake_at,
+                Some(_) => return None,
+            }
+        } else {
+            if self.last_queued == Some(latest) && received_status {
+                return None;
+            }
+            self.updates.next_allowed
         };
         Some(
             self.queue_retry_at
@@ -57,18 +71,29 @@ impl StatusDelivery {
         )
     }
 
-    /// Advance only the allowance for the change that actually entered the stream.
+    /// Advance the update allowance only after a frame enters the stream.
     pub(super) fn queued(&mut self, status: BlockSyncStatus, now: Instant) {
-        if let Some(previous) = self.last_queued.filter(|previous| *previous != status) {
-            if contracts(previous, status) {
-                self.contraction.mark_taken(now);
-            } else {
-                self.growth.mark_taken(now);
+        if let Some(legacy) = &mut self.legacy {
+            if let Some(previous) = self.last_queued.filter(|previous| *previous != status) {
+                if contracts(previous, status) {
+                    legacy.contraction.mark_taken(now);
+                } else {
+                    self.updates.mark_taken(now);
+                }
             }
+            legacy.handshake_at = now + self.updates.interval;
+        } else {
+            self.updates.mark_taken(now);
         }
         self.last_queued = Some(status);
-        self.handshake_at = now + self.growth.interval;
         self.queue_retry_at = None;
+    }
+
+    pub(super) fn defer_until(&mut self, deadline: Instant) {
+        self.queue_retry_at = Some(
+            self.queue_retry_at
+                .map_or(deadline, |retry| retry.max(deadline)),
+        );
     }
 
     /// Back off failed queue attempts without spending the range-change allowance.
@@ -98,35 +123,61 @@ mod tests {
     }
 
     #[test]
-    fn pruning_corrects_growth_advertisements_without_an_unbounded_bypass() {
+    fn legacy_pruning_and_replacement_keep_their_prompt_status_deadlines() {
         let now = Instant::now();
-        let mut delivery = StatusDelivery::new(Duration::from_secs(30), now);
+        let mut delivery = StatusDelivery::new(Duration::from_secs(30), now, false);
         delivery.queued(status(1_000, 6_000), now);
-        let growth_at = now + Duration::from_millis(500);
-        delivery.queued(status(1_000, 6_001), growth_at);
-        let prune_at = growth_at + Duration::from_millis(1);
+        delivery.queued(status(1_000, 6_001), now + Duration::from_millis(500));
+        let prune_at = now + Duration::from_millis(501);
         let first_prune = status(1_001, 6_001);
         assert!(delivery.next_deadline(first_prune, true).unwrap() <= prune_at);
         delivery.queued(first_prune, prune_at);
-
-        // Further pruning coalesces into the latest range for this same deadline.
         for low in 1_002..2_000 {
             assert_eq!(
                 delivery.next_deadline(status(low, 6_002), true),
                 Some(prune_at + RANGE_CORRECTION_INTERVAL)
             );
         }
-        delivery.queued(status(1_999, 6_002), prune_at + RANGE_CORRECTION_INTERVAL);
-        assert_eq!(delivery.next_deadline(status(1_999, 6_002), true), None);
+        delivery.queue_full(prune_at);
+        assert_eq!(
+            delivery.next_deadline(status(0, 0), true),
+            Some(prune_at + RANGE_CORRECTION_INTERVAL)
+        );
+
+        let replacement = StatusDelivery::new(Duration::from_secs(30), prune_at, false);
+        assert_eq!(
+            replacement.next_deadline(status(0, 0), false),
+            Some(prune_at)
+        );
+    }
+
+    #[test]
+    fn growth_and_corrections_share_the_update_deadline() {
+        let now = Instant::now();
+        let interval = Duration::from_secs(30);
+        let mut delivery = StatusDelivery::new(interval, now, true);
+        let initial = status(1_000, 6_000);
+        assert_eq!(delivery.next_deadline(initial, true), Some(now));
+        delivery.queued(initial, now);
+        for latest in [status(1_000, 6_001), status(1_001, 6_001), status(0, 0)] {
+            assert_eq!(delivery.next_deadline(latest, true), Some(now + interval));
+        }
+        let latest = status(1_999, 6_002);
+        delivery.queued(latest, now + interval);
+        assert_eq!(delivery.next_deadline(latest, true), None);
+        assert_eq!(
+            delivery.next_deadline(status(2_000, 6_003), true),
+            Some(now + interval * 2)
+        );
     }
 
     #[test]
     fn queue_pressure_retries_the_latest_range_at_its_own_deadline() {
         let now = Instant::now();
-        let mut delivery = StatusDelivery::new(Duration::from_secs(30), now);
+        let mut delivery = StatusDelivery::new(Duration::from_secs(30), now, true);
         let initial = status(1_000, 6_000);
         delivery.queued(initial, now);
-        let full_at = now + Duration::from_millis(500);
+        let full_at = now + Duration::from_secs(30);
         delivery.queue_full(full_at);
         let latest = status(1_002, 6_002);
         let deadline = full_at + QUEUE_RETRY_INTERVAL;
@@ -146,7 +197,7 @@ mod tests {
     fn unchanged_status_retries_only_until_the_peer_supplies_its_status() {
         let now = Instant::now();
         let interval = Duration::from_secs(30);
-        let mut delivery = StatusDelivery::new(interval, now);
+        let mut delivery = StatusDelivery::new(interval, now, true);
         let latest = status(1_000, 6_000);
         assert_eq!(delivery.next_deadline(latest, false), Some(now));
         delivery.queued(latest, now);
@@ -157,7 +208,7 @@ mod tests {
     #[test]
     fn returning_to_the_queued_range_cancels_a_failed_correction() {
         let now = Instant::now();
-        let mut delivery = StatusDelivery::new(Duration::from_secs(30), now);
+        let mut delivery = StatusDelivery::new(Duration::from_secs(30), now, true);
         let initial = status(1_000, 6_000);
         delivery.queued(initial, now);
         delivery.queue_full(now);
@@ -166,11 +217,14 @@ mod tests {
     }
 
     #[test]
-    fn genesis_only_corrections_use_the_prompt_deadline() {
+    fn a_connection_deadline_defers_updates_without_spending_the_allowance() {
         let now = Instant::now();
-        let mut delivery = StatusDelivery::new(Duration::from_secs(30), now);
-        delivery.queued(status(1_000, 6_000), now);
-        delivery.queued(status(1_000, 6_001), now);
-        assert_eq!(delivery.next_deadline(status(0, 0), true), Some(now));
+        let mut delivery = StatusDelivery::new(Duration::from_secs(1), now, true);
+        let latest = status(1_000, 6_000);
+        let deadline = now + Duration::from_secs(30);
+        delivery.queue_full(now);
+        delivery.defer_until(deadline);
+        assert_eq!(delivery.next_deadline(latest, false), Some(deadline));
+        assert_eq!(delivery.last_queued, None);
     }
 }

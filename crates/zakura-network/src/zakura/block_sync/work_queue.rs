@@ -86,6 +86,8 @@ pub(super) struct WorkReturnOutcome {
 
 #[derive(Debug)]
 struct WorkQueueInner {
+    #[cfg(test)]
+    taken_items: usize,
     pending: std::collections::BTreeMap<block::Height, WorkItem>,
     in_flight: std::collections::BTreeMap<block::Height, WorkItem>,
     floor: block::Height,
@@ -142,6 +144,8 @@ impl WorkQueue {
     pub(super) fn new(floor: block::Height) -> Self {
         Self {
             inner: StdMutex::new(WorkQueueInner {
+                #[cfg(test)]
+                taken_items: 0,
                 pending: std::collections::BTreeMap::new(),
                 in_flight: std::collections::BTreeMap::new(),
                 floor,
@@ -444,6 +448,10 @@ impl WorkQueue {
         for (height, item) in &taken {
             inner.pending.remove(height);
             inner.in_flight.insert(*height, *item);
+        }
+        #[cfg(test)]
+        {
+            inner.taken_items += taken.len();
         }
         taken
     }
@@ -1129,12 +1137,17 @@ impl WorkQueue {
     /// Expected hash for a height in `pending` or `in_flight` (late-response
     /// recovery).
     pub(super) fn hash_for_height(&self, height: block::Height) -> Option<block::Hash> {
+        self.item_for_height(height).map(|item| item.hash)
+    }
+
+    /// Current authority and identity, including work returned by a timed-out request.
+    pub(super) fn item_for_height(&self, height: block::Height) -> Option<WorkItem> {
         let inner = self.lock();
         inner
             .pending
             .get(&height)
             .or_else(|| inner.in_flight.get(&height))
-            .map(|item| item.hash)
+            .copied()
     }
 
     /// Active request owner for a height, if it is currently reserved.
@@ -1170,5 +1183,17 @@ impl WorkQueue {
 
     pub(super) fn in_flight_contains(&self, height: block::Height) -> bool {
         self.lock().in_flight.contains_key(&height)
+    }
+}
+
+#[cfg(test)]
+mod test_metrics {
+    use super::WorkQueue;
+
+    impl WorkQueue {
+        /// Count actual provisional item takes, including work immediately returned by filtering.
+        pub(crate) fn taken_items_for_test(&self) -> usize {
+            self.lock().taken_items
+        }
     }
 }

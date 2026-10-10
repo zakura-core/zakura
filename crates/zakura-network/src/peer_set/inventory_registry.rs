@@ -138,16 +138,16 @@ impl InventoryChange {
         hashes: impl IntoIterator<Item = &'a InventoryHash>,
         peer: PeerSocketAddr,
     ) -> Option<Self> {
-        let mut hashes: Vec<InventoryHash> = hashes.into_iter().copied().collect();
-
         // # Security
         //
         // Don't send more hashes than we're going to store.
         // It doesn't matter which hashes we choose, because this is an efficiency optimisation.
+        // Cap before collecting: truncating afterwards keeps the whole allocation alive.
         //
         //  This limits known memory denial of service attacks to:
         // `1000 hashes * 200 peers/channel capacity * 32-64 bytes = up to 12 MB`
-        hashes.truncate(MAX_INV_PER_MAP);
+        let hashes: Vec<InventoryHash> =
+            hashes.into_iter().take(MAX_INV_PER_MAP).copied().collect();
 
         let hashes = hashes.try_into().ok();
 
@@ -159,13 +159,12 @@ impl InventoryChange {
         hashes: impl IntoIterator<Item = &'a InventoryHash>,
         peer: PeerSocketAddr,
     ) -> Option<Self> {
-        let mut hashes: Vec<InventoryHash> = hashes.into_iter().copied().collect();
-
         // # Security
         //
         // Don't send more hashes than we're going to store.
         // It doesn't matter which hashes we choose, because this is an efficiency optimisation.
-        hashes.truncate(MAX_INV_PER_MAP);
+        let hashes: Vec<InventoryHash> =
+            hashes.into_iter().take(MAX_INV_PER_MAP).copied().collect();
 
         let hashes = hashes.try_into().ok();
 

@@ -810,7 +810,9 @@ impl Service<zn::Request> for Inbound {
             zn::Request::FindHeaders { known_blocks, stop } => {
                 let request = zs::Request::FindBlockHeaders { known_blocks, stop };
                 state.clone().oneshot(request).map_ok(|resp| match resp {
-                    zs::Response::BlockHeaders(headers) if headers.is_empty() => zn::Response::Nil,
+                    // Always reply, even with no headers: `getheaders` requires a
+                    // `headers` message, and `Nil` (which sends nothing) leaves a
+                    // zcashd-compat sidecar's request pending so it never syncs (#198).
                     zs::Response::BlockHeaders(headers) => zn::Response::BlockHeaders(headers),
                     _ => unreachable!("zakura-state should always respond to a `FindBlockHeaders` request with a `BlockHeaders` response"),
                 })

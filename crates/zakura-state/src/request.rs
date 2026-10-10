@@ -5,13 +5,13 @@ use std::{
     ops::{Add, Deref, RangeInclusive},
     pin::Pin,
     sync::{
-        atomic::{AtomicBool, AtomicU8, Ordering},
+        atomic::{AtomicBool, Ordering},
         Arc,
     },
     time::Instant,
 };
 
-use tokio::sync::Notify;
+use tokio::sync::watch;
 
 use tower::{BoxError, Service, ServiceExt};
 use zakura_chain::{
@@ -44,80 +44,77 @@ use crate::{
 };
 
 /// Notifies a mined-block submitter when state admits its block to the active write queue.
-#[derive(Clone)]
-pub struct BlockAdmission(Arc<BlockAdmissionInner>);
+#[derive(Clone, Debug)]
+pub struct BlockAdmission(watch::Sender<Admission>);
 
-#[derive(Debug)]
-struct BlockAdmissionInner {
-    state: AtomicU8,
-    optimistic_relay_authorized: AtomicBool,
-    changed: Notify,
+/// The admission decision state observers wait on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Admission {
+    /// State has not decided yet.
+    Pending {
+        /// Whether consensus authorized optimistic relay for this candidate.
+        relay: bool,
+    },
+    /// State admitted the block to the active non-finalized write queue.
+    Admitted {
+        /// Whether optimistic relay was still authorized at admission.
+        relay: bool,
+    },
+    /// State rejected the block before admission.
+    Rejected,
 }
 
 impl BlockAdmission {
-    const PENDING: u8 = 0;
-    const ADMITTED: u8 = 1;
-    const REJECTED: u8 = 2;
-
     /// Creates a pending admission notification.
     pub fn pending() -> Self {
-        Self(Arc::new(BlockAdmissionInner {
-            state: AtomicU8::new(Self::PENDING),
-            optimistic_relay_authorized: AtomicBool::new(false),
-            changed: Notify::new(),
-        }))
+        Self(watch::Sender::new(Admission::Pending { relay: false }))
     }
 
     /// Authorizes optimistic relay if state later admits the prepared mined block.
+    ///
+    /// Consensus only calls this before the block reaches the write queue, so an admission that
+    /// already reached a terminal state ignores it.
     #[doc(hidden)]
     pub fn authorize_optimistic_relay(&self) {
-        self.0
-            .optimistic_relay_authorized
-            .store(true, Ordering::Release);
+        self.0.send_if_modified(|admission| match admission {
+            Admission::Pending { relay: false } => {
+                *admission = Admission::Pending { relay: true };
+                true
+            }
+            _ => false,
+        });
     }
 
     /// Returns true when consensus authorized optimistic relay for this admission.
     pub fn optimistic_relay_authorized(&self) -> bool {
-        self.0.optimistic_relay_authorized.load(Ordering::Acquire)
+        matches!(
+            *self.0.borrow(),
+            Admission::Pending { relay: true } | Admission::Admitted { relay: true }
+        )
     }
 
     /// Marks the block as admitted to the active non-finalized write queue.
     pub(crate) fn admit(&self, optimistic_relay_still_authorized: bool) {
-        if !optimistic_relay_still_authorized {
-            self.0
-                .optimistic_relay_authorized
-                .store(false, Ordering::Release);
-        }
-        if self
-            .0
-            .state
-            .compare_exchange(
-                Self::PENDING,
-                Self::ADMITTED,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .is_ok()
-        {
-            self.0.changed.notify_waiters();
-        }
+        self.0.send_if_modified(|admission| match *admission {
+            Admission::Pending { relay } => {
+                *admission = Admission::Admitted {
+                    relay: relay && optimistic_relay_still_authorized,
+                };
+                true
+            }
+            _ => false,
+        });
     }
 
     /// Marks the block as rejected before admission.
     pub(crate) fn reject(&self) {
-        if self
-            .0
-            .state
-            .compare_exchange(
-                Self::PENDING,
-                Self::REJECTED,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .is_ok()
-        {
-            self.0.changed.notify_waiters();
-        }
+        self.0.send_if_modified(|admission| match *admission {
+            Admission::Pending { .. } => {
+                *admission = Admission::Rejected;
+                true
+            }
+            _ => false,
+        });
     }
 
     /// Waits until state admits or rejects the block.
@@ -129,37 +126,28 @@ impl BlockAdmission {
     /// receives the block leaves the admission pending. Callers must await this future under a
     /// cancellation path, such as a `select!` arm that also awaits verification.
     pub async fn wait(&self) -> bool {
-        loop {
-            let notified = self.0.changed.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-            match self.0.state.load(Ordering::Acquire) {
-                Self::ADMITTED => return true,
-                Self::REJECTED => return false,
-                Self::PENDING => notified.as_mut().await,
-                _ => unreachable!("block admission state only uses declared constants"),
-            }
-        }
-    }
-}
+        let mut receiver = self.0.subscribe();
+        let admission = receiver
+            .wait_for(|admission| !matches!(admission, Admission::Pending { .. }))
+            .await
+            .expect("the admission holds its own sender");
 
-impl std::fmt::Debug for BlockAdmission {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_tuple("BlockAdmission")
-            .field(&self.0.state.load(Ordering::Acquire))
-            .finish()
+        matches!(*admission, Admission::Admitted { .. })
     }
 }
 
 impl PartialEq for BlockAdmission {
     fn eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.0, &other.0)
+        self.0.same_channel(&other.0)
     }
 }
 
 impl Eq for BlockAdmission {}
 use crate::{
-    error::{CommitCheckpointVerifiedError, InvalidateError, LayeredStateError, ReconsiderError},
+    error::{
+        CommitCheckpointVerifiedError, InvalidateError, LayeredStateError, PreciousError,
+        ReconsiderError,
+    },
     CommitSemanticallyVerifiedError,
 };
 
@@ -1078,6 +1066,28 @@ impl MappedRequest for InvalidateBlockRequest {
     }
 }
 
+/// Request to prefer a block over other chain tips with the same work.
+///
+/// See the [`crate`] documentation and [`Request::PreciousBlock`] for details.
+#[allow(dead_code)]
+pub struct PreciousBlockRequest(pub block::Hash);
+
+impl MappedRequest for PreciousBlockRequest {
+    type MappedResponse = ();
+    type Error = PreciousError;
+
+    fn map_request(self) -> Request {
+        Request::PreciousBlock(self.0)
+    }
+
+    fn map_response(response: Response) -> Self::MappedResponse {
+        match response {
+            Response::Precious => (),
+            _ => unreachable!("wrong response variant for request"),
+        }
+    }
+}
+
 /// Request to reconsider a previously invalidated block and re-commit it to the state.
 ///
 /// See the [`crate`] documentation and [`Request::ReconsiderBlock`] for details.
@@ -1619,6 +1629,17 @@ pub enum Request {
     /// [0]: (crate::error::ReconsiderError)
     ReconsiderBlock(block::Hash),
 
+    /// Prefers the block with the provided hash over other chain tips with the same work, as if
+    /// it had been received first. A later request overrides an earlier one, and greater work
+    /// still wins. The preference is local and is not kept across restarts.
+    ///
+    /// Returns [`Response::Precious`] if the state contains the block, even when it has less
+    /// work than the best tip and the request changes nothing. Otherwise returns a
+    /// [`PreciousError`][0].
+    ///
+    /// [0]: (crate::error::PreciousError)
+    PreciousBlock(block::Hash),
+
     /// Performs contextual validation of the given block, but does not commit it to the state.
     ///
     /// Returns [`Response::ValidBlockProposal`] when successful.
@@ -1671,6 +1692,7 @@ impl Request {
             Request::BestChainBlockHash(_) => "best_chain_block_hash",
             Request::KnownBlock(_) => "known_block",
             Request::InvalidateBlock(_) => "invalidate_block",
+            Request::PreciousBlock(_) => "precious_block",
             Request::ReconsiderBlock(_) => "reconsider_block",
             Request::CheckBlockProposalValidity(_) => "check_block_proposal_validity",
         }
@@ -2343,7 +2365,8 @@ impl TryFrom<Request> for ReadRequest {
             | Request::CommitCheckpointVerifiedBlock(_)
             | Request::CheckCheckpointHandoff
             | Request::InvalidateBlock(_)
-            | Request::ReconsiderBlock(_) => Err("ReadService does not write blocks"),
+            | Request::ReconsiderBlock(_)
+            | Request::PreciousBlock(_) => Err("ReadService does not write blocks"),
 
             Request::AwaitUtxo(_) => Err("ReadService does not track pending UTXOs. \
                      Manually convert the request to ReadRequest::AnyChainUtxo, \

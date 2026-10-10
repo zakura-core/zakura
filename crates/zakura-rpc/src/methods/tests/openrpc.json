@@ -612,6 +612,30 @@
       }
     },
     {
+      "name": "preciousblock",
+      "summary": "Treats a block as if it were received before other chain tips with the same work.",
+      "description": "Treats a block as if it were received before other chain tips with the same work.\n\nIt applies to a current non-finalized chain tip with at least as much work as the best tip.\nA later call overrides an earlier one. A chain with more work still wins. For any other\nknown block, such as a block that is not a chain tip, a finalized block, an invalidated\nblock, or a tip with less work than the best tip, the call succeeds and changes nothing. An\nunknown hash returns error code -5, and a malformed hash returns error code -8.\n\nThe preference is local to this node. It is kept while the block is in any non-finalized\nchain or any retained invalidation record. It is forgotten once the block is in neither,\nfor example when a fork-limit eviction removes it from its last chain, or when its\ninvalidation record is discarded while it is in no chain. A block downloaded again after\nthat is not preferred. It is not kept across restarts.\nSee Bitcoin Core's\n[`preciousblock`](https://developer.bitcoin.org/reference/rpc/preciousblock.html).\n\n# Parameters\n\n- `block_hash`: (hex-encoded block hash, required) The hash of the block to prefer.",
+      "params": [
+        {
+          "name": "block_hash",
+          "summary": "The hash of the block to return.",
+          "description": "The hash of the block to return.",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "result": {
+        "name": "preciousblock_result",
+        "summary": "Always null. Errors are returned as JSON-RPC errors.",
+        "description": "Always null. Errors are returned as JSON-RPC errors.",
+        "schema": {
+          "type": "null"
+        }
+      }
+    },
+    {
       "name": "getrawtransaction",
       "summary": "Returns the raw transaction data, as a [`GetRawTransactionResponse`]",
       "description": "Returns the raw transaction data, as a [`GetRawTransactionResponse`]\nJSON string or structure.\n\nzcashd reference: [`getrawtransaction`](https://zcash.github.io/rpc/getrawtransaction.html)\nmethod: post\ntags: transaction\n\n# Parameters\n\n- `txid`: (string, required, example=\"mytxid\") The transaction ID of the transaction to be returned.\n- `verbose`: (number, optional, default=0, example=1) If 0, return a string of hex-encoded data, otherwise return a JSON object.\n- `blockhash` (string, optional) The block in which to look for the transaction\n\n# Notes\n\nVerbose transaction output includes `ironwood` only when the transaction\ncontains Ironwood shielded data.",
@@ -1154,7 +1178,7 @@
         "description": "Optional argument `jsonparametersobject` for `submitblock` RPC request\n\nSee the notes for the [`submit_block`](crate::methods::RpcServer::submit_block) RPC.",
         "properties": {
           "workid": {
-            "description": "The workid for the block template.\n\n> If the server provided a workid, it MUST be included with submissions,\n\nRationale:\n\n> If servers allow all mutations, it may be hard to identify which job it is based on.\n> While it may be possible to verify the submission by its content, it is much easier\n> to compare it to the job issued. It is very easy for the miner to keep track of this.\n> Therefore, using a \"workid\" is a very cheap solution to enable more mutations.\n\n<https://en.bitcoin.it/wiki/BIP_0022#Rationale>",
+            "description": "The workid for the block template.\n\n> If the server provided a workid, it MUST be included with submissions,\n\nRationale:\n\n> If servers allow all mutations, it may be hard to identify which job it is based on.\n> While it may be possible to verify the submission by its content, it is much easier\n> to compare it to the job issued. It is very easy for the miner to keep track of this.\n> Therefore, using a \"workid\" is a very cheap solution to enable more mutations.\n\n<https://en.bitcoin.it/wiki/BIP_0022#Rationale>\n\nZakura accepts this field but does not read it. The verifier identifies a prepared\ncandidate by its content, so a submission reuses the prepared work whether or not the\nminer echoes the work ID back.",
             "type": [
               "string",
               "null"

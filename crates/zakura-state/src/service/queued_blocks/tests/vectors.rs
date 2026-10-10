@@ -128,6 +128,10 @@ fn identical_queued_retries_preserve_receipts_and_complete_the_old_waiter() -> R
     Ok(())
 }
 
+/// The orphan queue holds a fixed number of entries.
+///
+/// `MAX_QUEUED_BLOCKS` also sizes the non-finalized write slots, and optimistic relay reads an
+/// idle writer off that count, so this bound is load-bearing beyond the queue itself.
 #[test]
 fn queued_body_variants_are_bounded_and_cleaned_up_together() -> Result<()> {
     use super::super::MAX_QUEUED_BODY_VARIANTS;

@@ -43,7 +43,9 @@ pub trait FullStateEvidenceAuthority: Send + Sync {
     fn authorizes_full_state(&self, event: &TransitionEvent) -> bool;
 
     /// Return the full state's selected tip for this exact staged event.
-    /// The planner still checks eligibility, verified ancestry, and greatest work.
+    ///
+    /// Full state can prefer an operator-chosen tip on equal work. The planner uses it in place
+    /// of the hash tie-break, and still checks eligibility, verified ancestry, and greatest work.
     fn verified_tip(&self, _event: &TransitionEvent) -> Option<crate::Frontier> {
         None
     }

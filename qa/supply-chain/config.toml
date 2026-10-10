@@ -160,12 +160,6 @@ version = "0.5.7"
 criteria = "safe-to-deploy"
 notes = "Audit hold: the safe grow_and_insert(usize::MAX) path adds one without checked arithmetic. In release builds the length wraps to zero, grow does not allocate, and the method then performs an unchecked out-of-bounds write through get_unchecked_mut. Retain the exemption pending checked overflow handling before the raw write."
 
-[[exemptions.fs_extra]]
-version = "1.3.0"
-criteria = "safe-to-deploy"
-suggest = false
-notes = "Audit hold: recursive directory enumeration follows directory symlinks, and move_dir then moves and deletes files reached through them. A local reproduction with source/link pointing outside the source tree returned success, removed the external sentinel, and copied it under the destination. Retain the exemption until traversal uses symlink_metadata or otherwise confines moves to the requested tree."
-
 [[exemptions.group]]
 version = "0.14.0"
 criteria = "safe-to-deploy"
@@ -328,24 +322,6 @@ notes = "Sentry 0.47 upgrade. Audit held: on Unix, IntoRawFd for a standard-stre
 version = "0.5.1"
 criteria = "safe-to-deploy"
 notes = "Audit hold: ThreadGuard::drop returns the global thread ID without knowing whether a LocalGuard for that thread is still alive in another thread-local destructor (src/raw/tls/thread_id.rs); when a user thread-local holder is initialized before Collector::enter, the destructor order frees the ID first, a new thread can reuse it, and ThreadLocal::load_or returns the same reservation while the old guard remains live (src/raw/tls/mod.rs, src/guard.rs), so two threads can touch one reservation without a lock and reclaim early. A targeted probe observed the shared reservation in 101 of 101 executions. The race needs a guard held inside a thread-local destructor during thread teardown, a pattern absent from iroh's reviewed papaya call sites (src/socket/concurrent_read_map.rs). Barrier, reservation and reclaimer contracts were traced and 28 tests pass with and without all features; Linux membarrier and Windows paths were source-reviewed only. Retain the exemption until upstream ties thread-ID release to the last live guard."
-
-[[exemptions.sentry]]
-version = "0.47.0"
-criteria = "safe-to-deploy"
-suggest = false
-notes = "Audit hold: the Retry-After and X-Sentry-Rate-Limits parsers accept unbounded floating-point seconds, cast values such as 1e300 to u64::MAX, and add that duration to SystemTime with panicking arithmetic. Both remote-header paths were reproduced panicking the transport code. Retain the exemption pending finite bounded parsing and checked time addition."
-
-[[exemptions.sentry-core]]
-version = "0.47.0"
-criteria = "safe-to-deploy"
-suggest = false
-notes = "Audit hold: on non-main threads, safe Hub::with exposes &Arc<Hub> from a thread-local UnsafeCell while safe HubSwitchGuard::new can mutably swap that same Arc before the callback borrow ends. This permits overlapping shared and mutable access to the Arc storage. Retain the exemption pending a cloned callback value or another design that prevents mutation during the shared borrow."
-
-[[exemptions.sentry-types]]
-version = "0.47.0"
-criteria = "safe-to-deploy"
-suggest = false
-notes = "Audit hold: Attachment::to_writer interpolates caller-controlled filename, custom attachment type, and content type directly into a JSON envelope header without escaping. A safe filename containing a quote was reproduced producing invalid JSON, and newline-bearing values can alter envelope framing. Retain the exemption pending serde-based header serialization or validated field characters."
 
 [[exemptions.tar]]
 version = "0.4.45"

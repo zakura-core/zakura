@@ -4,6 +4,7 @@
 use std::{
     cmp::Ordering,
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    num::NonZeroU64,
     ops::{Deref, DerefMut, RangeInclusive},
     sync::Arc,
 };
@@ -58,6 +59,14 @@ pub struct Chain {
 
     /// The internal state of this chain.
     inner: ChainInner,
+
+    /// The operator's `preciousblock` preference for this chain's tip, with its call sequence.
+    ///
+    /// Local policy, not chain state, so it is not checked by [`Chain::eq_internal_state`].
+    /// Only [`NonFinalizedState`](super::NonFinalizedState) sets it, from its per-block
+    /// preferences, whenever it inserts the chain into the `chain_set`. Growing or forking the
+    /// chain keeps the stored hash, which stops matching the tip, so a stale value never applies.
+    precious: Option<(block::Hash, NonZeroU64)>,
 }
 
 /// Spending transaction id type when the `indexer` feature is selected.
@@ -299,6 +308,7 @@ impl Chain {
         let mut chain = Self {
             network: network.clone(),
             inner,
+            precious: None,
         };
 
         chain.add_sprout_tree_and_anchor(finalized_tip_height, sprout_note_commitment_tree);
@@ -421,6 +431,25 @@ impl Chain {
         }
 
         Some(forked)
+    }
+
+    /// Returns the operator's `preciousblock` preference stored on this chain.
+    pub(super) fn precious(&self) -> Option<(block::Hash, NonZeroU64)> {
+        self.precious
+    }
+
+    /// Stores the operator's `preciousblock` preference for this chain's tip.
+    pub(super) fn set_precious(&mut self, precious: Option<(block::Hash, NonZeroU64)>) {
+        self.precious = precious;
+    }
+
+    /// Returns the `preciousblock` sequence if it applies to the current tip, or zero.
+    ///
+    /// A later call has a higher sequence and wins equal-work ties against earlier ones.
+    fn active_precedence(&self) -> u64 {
+        self.precious
+            .filter(|(hash, _)| *hash == self.non_finalized_tip_hash())
+            .map_or(0, |(_, sequence)| sequence.get())
     }
 
     /// Returns the [`Network`] for this chain.
@@ -2552,7 +2581,8 @@ impl UpdateWith<(ValueBalance<NegativeAllowed>, Height, usize)> for Chain {
 impl Ord for Chain {
     /// Chain order for the [`NonFinalizedState`][1]'s `chain_set`.
     ///
-    /// Greater work wins, then the earlier tip receipt, then the raw tip hash.
+    /// Greater work wins, then the latest operator `preciousblock` preference,
+    /// then the earlier tip receipt, then the raw tip hash.
     /// Missing receipt orders precede live receipts and tie by hash, so backup
     /// replay order cannot decide the best chain after restart.
     ///
@@ -2568,6 +2598,7 @@ impl Ord for Chain {
     fn cmp(&self, other: &Self) -> Ordering {
         self.partial_cumulative_work
             .cmp(&other.partial_cumulative_work)
+            .then_with(|| self.active_precedence().cmp(&other.active_precedence()))
             .then_with(|| {
                 let self_tip = self
                     .tip_block()
@@ -2591,7 +2622,7 @@ impl PartialOrd for Chain {
 
 impl PartialEq for Chain {
     /// Chain equality for [`NonFinalizedState::chain_set`][1], using proof of
-    /// work, then the tip receipt order, then its hash.
+    /// work, operator preference, tip receipt order, then its hash.
     ///
     /// Retained copies of a tip keep the same receipt order, so equal work and
     /// tip hashes compare equal and the `chain_set` keeps tip hashes unique.

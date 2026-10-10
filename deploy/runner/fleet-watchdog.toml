@@ -17,3 +17,19 @@ dashboard_url = "http://159.65.183.89:8090/"
 [[release_state]]
 name = "mainnet"
 url = "https://zakura-release.valargroup.dev/release-state/latest.json"
+
+# zcashd-compat health on the dedicated compatibility host, probed over SSH with
+# the zakura-compat-check installed there (deploy/runner/zakura_monitoring). The
+# lane only runs once monitoring cutover sets ZAKURA_COMPAT_MONITORING=1 in a
+# systemd drop-in. Every probe, SSH included, is bounded by `timeout`.
+[[compatibility]]
+name = "zakura-compat"
+ssh_target = "root@159.203.113.196"
+checker = "/opt/zakura-monitoring/current/zakura-compat-check"
+env_file = "/etc/zakura-monitoring/compat.env"
+known_hosts = "/etc/zakura-fleet-watchdog/known_hosts"
+interval = 60
+timeout = 120
+remote_deadline = 100
+# Same as the checker default and the deployed Rust watchdog.
+height_max_drift = 10

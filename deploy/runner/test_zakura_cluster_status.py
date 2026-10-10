@@ -1045,6 +1045,10 @@ class NodeDetailTests(unittest.TestCase):
         metrics = {
             "checkpoint_verified_height": 4_199_999.0,
             "sync_block_applying": 0.0,
+            "sync_zakura_apply_operations": 5.0,
+            "sync_zakura_apply_in_flight": 5.0,
+            "sync_zakura_apply_oldest_seconds": 630.0,
+            "sync_zakura_apply_phase": 2.0,
             "sync_block_outstanding": 0.0,
             "sync_block_missing_bodies": 4_000.0,
             "sync_block_fill_stop": float("nan"),
@@ -1068,6 +1072,10 @@ class NodeDetailTests(unittest.TestCase):
             {
                 "checkpoint_verified_height": 4_199_999.0,
                 "sync_block_applying": 0.0,
+                "sync_zakura_apply_operations": 5.0,
+                "sync_zakura_apply_in_flight": 5.0,
+                "sync_zakura_apply_oldest_seconds": 630.0,
+                "sync_zakura_apply_phase": 2.0,
                 "sync_block_outstanding": 0.0,
                 "sync_block_missing_bodies": 4_000.0,
             },

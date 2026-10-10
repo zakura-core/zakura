@@ -13511,13 +13511,25 @@ async fn selected_body_fork_reanchors_before_scheduling_successors() {
         .await
         .expect("fork-aware metadata completion queues");
 
-    assert!(matches!(
-        next_action(&mut actions).await,
-        BlockSyncAction::QueryNeededBlocks {
-            from: block::Height(2),
-            ..
+    // The reactor can retry its old query before the sequencer acknowledges the reset.
+    // It must then query from the new anchor before requesting any successor bodies.
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            match next_action(&mut actions).await {
+                BlockSyncAction::QueryNeededBlocks {
+                    from: block::Height(3),
+                    ..
+                } => continue,
+                BlockSyncAction::QueryNeededBlocks {
+                    from: block::Height(2),
+                    ..
+                } => break,
+                action => panic!("expected a query above the new anchor, got {action:?}"),
+            }
         }
-    ));
+    })
+    .await
+    .expect("the sequencer reset must reanchor the refill query");
 
     reactor_task.abort();
 }

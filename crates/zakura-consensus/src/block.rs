@@ -35,6 +35,7 @@ use crate::{error::*, primitives, transaction as tx, BoxError};
 
 pub mod check;
 mod prepared;
+mod receipt;
 pub mod request;
 pub mod subsidy;
 
@@ -46,8 +47,7 @@ mod tests;
 /// Bounds the optional read that can prove an input missing at the block's parent.
 const PARENT_INPUT_CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// Bounds the wait for another request's pending commit of the same block.
-/// After this limit, the verifier reports the pending duplicate to the caller.
+/// Bounds waiting for another request's pending commit of the same block.
 const PENDING_COMMIT_WAIT_LIMIT: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// Asynchronous semantic block verification.
@@ -58,6 +58,7 @@ pub struct SemanticBlockVerifier<S, V> {
     state_service: S,
     transaction_verifier: V,
     prepared_candidates: prepared::PreparedCandidateCache,
+    receipt_orders: receipt::ReceiptRegistry,
 }
 
 /// Block verification errors.
@@ -322,6 +323,7 @@ where
             state_service,
             transaction_verifier,
             prepared_candidates: Default::default(),
+            receipt_orders: Default::default(),
         }
     }
 }
@@ -346,23 +348,28 @@ where
     }
 
     fn call(&mut self, request: Request) -> Self::Future {
+        let block = request.block();
+        let hash = match zakura_header_chain::validate_encoding_version_hash(&block.header) {
+            Ok(hash) => hash,
+            Err(error) => return async move { Err(BlockError::from(error).into()) }.boxed(),
+        };
+        let receipt = (!request.is_proposal()).then(|| self.receipt_orders.register(block.clone()));
         let mut state_service = self.state_service.clone();
         let mut transaction_verifier = self.transaction_verifier.clone();
         let network = self.network.clone();
         let prepared_candidates = self.prepared_candidates.clone();
 
-        let block = request.block();
-
         // We don't include the block hash, because it's likely already in a parent span
         let span = tracing::debug_span!("block", height = ?block.coinbase_height());
 
+        let receipt_order = receipt.as_ref().map(|receipt| receipt.order);
         async move {
+            // Keep this receipt registered until verification finishes or is cancelled.
+            let _receipt = receipt;
             // Preparing a template costs everything below, not just the contextual check at the
             // end. The bound on speculative preparation is set from this measurement, so it must
             // start where the work does.
             let preparation_start = std::time::Instant::now();
-            let hash = zakura_header_chain::validate_encoding_version_hash(&block.header)
-                .map_err(BlockError::from)?;
             let (mined, prepared_source) = match &request {
                 Request::CommitMined { admission, .. } => (Some(admission.clone()), None),
                 Request::Prepare { source, .. } => (None, Some(*source)),
@@ -448,7 +455,7 @@ where
                     &network,
                     block.clone(),
                     hash,
-                    height,
+                    (height, receipt_order),
                     admission,
                 )
                 .await?
@@ -712,7 +719,7 @@ where
                 transaction_hashes,
                 deferred_pool_balance_change: Some(deferred_pool_balance_change),
                 auth_data_root: None,
-                receipt_order: None,
+                receipt_order,
             };
 
             // Return early for proposal requests.
@@ -747,7 +754,7 @@ async fn try_prepared_fast_path<S>(
     network: &Network,
     block: Arc<block::Block>,
     hash: block::Hash,
-    height: block::Height,
+    (height, receipt_order): (block::Height, Option<u64>),
     admission: &zs::BlockAdmission,
 ) -> Result<Option<block::Hash>, VerifyBlockError>
 where
@@ -779,6 +786,7 @@ where
     prepared_block.block = block;
     prepared_block.hash = hash;
     prepared_block.height = height;
+    prepared_block.receipt_order = receipt_order;
 
     if source == PreparedCandidateSource::ServerTemplate
         && check_prepared_mined_relay_eligibility(state_service, (&prepared_block).into()).await?

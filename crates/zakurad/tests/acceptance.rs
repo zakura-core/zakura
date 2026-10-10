@@ -3763,6 +3763,12 @@ async fn precious_block_prefers_equal_work_siblings() -> Result<()> {
     let first = proposal_block_from_template(&template, BlockTemplateTimeSource::MinTime, &net)?;
     let second = proposal_block_from_template(&template, BlockTemplateTimeSource::MaxTime, &net)?;
     assert_ne!(first.hash(), second.hash());
+    // Submit the lower hash first so receipt order deliberately opposes hash order.
+    let (first, second) = if first.hash().0 < second.hash().0 {
+        (first, second)
+    } else {
+        (second, first)
+    };
     rpc_client.submit_block(first.clone()).await?;
     rpc_client.submit_block(second.clone()).await?;
 
@@ -3772,14 +3778,9 @@ async fn precious_block_prefers_equal_work_siblings() -> Result<()> {
             .await
             .map_err(|err| eyre!(err))
     };
-    let (hash_loser, hash_winner) = if first.hash().0 < second.hash().0 {
-        (&first, &second)
-    } else {
-        (&second, &first)
-    };
-    assert_eq!(best_block_hash().await?, hash_winner.hash().to_string());
+    assert_eq!(best_block_hash().await?, first.hash().to_string());
 
-    for preferred in [hash_loser, hash_winner] {
+    for preferred in [&second, &first] {
         let params = serde_json::to_string(&[preferred.hash().to_string()])?;
         let _: () = rpc_client
             .json_result_from_call("preciousblock", &params)

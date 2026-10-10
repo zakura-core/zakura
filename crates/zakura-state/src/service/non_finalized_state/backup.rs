@@ -373,3 +373,6 @@ fn process_backup_dir_entry(entry: DirEntry) -> Option<(block::Hash, PathBuf)> {
 
     Some((block_hash, entry.path()))
 }
+
+#[cfg(test)]
+mod tests;

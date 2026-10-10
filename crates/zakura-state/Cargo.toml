@@ -79,6 +79,9 @@ proptest-derive = { workspace = true, optional = true }
 getset.workspace = true
 derive-new.workspace = true
 
+[target.'cfg(zcash_unstable = "nutachyon")'.dependencies]
+zcash_tachyon = { workspace = true }
+
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
 

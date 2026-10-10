@@ -8,6 +8,71 @@
 
 mod vectors;
 
+#[cfg(zcash_unstable = "nutachyon")]
+#[test]
+fn tachyon_sync_response_is_public_and_uses_canonical_hex() {
+    use zakura_rpc::client::{GetTachyonBlockResponse, TachyonStampData};
+
+    // Decode identifiers as an independent wallet client does, not through
+    // Zakura's hash types: a same-type round trip also accepts byte arrays.
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct WalletBlockIds {
+        hash: String,
+        previous_block_hash: String,
+        stamps: Vec<WalletStampId>,
+    }
+    #[derive(serde::Deserialize)]
+    struct WalletStampId {
+        txid: String,
+    }
+
+    // Distinct bytes make an accidental wire-order encoding observable.
+    let bytes = std::array::from_fn(|index| u8::try_from(index).unwrap());
+    let reply = GetTachyonBlockResponse {
+        hash: zakura_chain::block::Hash(bytes),
+        previous_block_hash: zakura_chain::block::Hash(bytes.map(|byte| byte + 32)),
+        height: zakura_chain::block::Height(12),
+        activation_height: zakura_chain::block::Height(10),
+        pool_height: 2,
+        epoch: 0,
+        epoch_length: 4096,
+        finalized: false,
+        anchor_before: bytes,
+        epoch_start_anchor: None,
+        anchor_after: [4; 32],
+        stamps: vec![TachyonStampData {
+            transaction_index: 1,
+            txid: zakura_chain::transaction::Hash(bytes.map(|byte| byte + 64)),
+            tachygram_set: bytes,
+            tachygrams: vec![hex::encode(bytes)],
+        }],
+    };
+    let json = serde_json::to_value(&reply).unwrap();
+    let wallet: WalletBlockIds = serde_json::from_value(json.clone()).unwrap();
+    assert_eq!(
+        wallet.hash,
+        "1f1e1d1c1b1a191817161514131211100f0e0d0c0b0a09080706050403020100"
+    );
+    assert_eq!(
+        wallet.previous_block_hash,
+        "3f3e3d3c3b3a393837363534333231302f2e2d2c2b2a29282726252423222120"
+    );
+    assert_eq!(wallet.stamps.len(), 1);
+    assert_eq!(
+        wallet.stamps[0].txid,
+        "5f5e5d5c5b5a595857565554535251504f4e4d4c4b4a49484746454443424140"
+    );
+    assert_eq!(json["anchorBefore"], hex::encode(bytes));
+    assert_eq!(json["epochStartAnchor"], serde_json::Value::Null);
+    assert_eq!(json["stamps"][0]["tachygramSet"], hex::encode(bytes));
+    assert_eq!(json["stamps"][0]["tachygrams"][0], hex::encode(bytes));
+    assert_eq!(
+        serde_json::from_value::<GetTachyonBlockResponse>(json).unwrap(),
+        reply
+    );
+}
+
 use std::{io::Cursor, ops::Deref};
 
 use vectors::{
@@ -237,12 +302,22 @@ fn test_get_blockchain_info_accepts_legacy_value_pools() -> Result<(), Box<dyn s
     let obj: GetBlockchainInfoResponse = serde_json::from_value(json)?;
     let value_pools = obj.value_pools();
 
+    #[cfg(not(zcash_unstable = "nutachyon"))]
     assert_eq!(value_pools.len(), 6);
+    #[cfg(zcash_unstable = "nutachyon")]
+    assert_eq!(value_pools.len(), 7);
     assert_eq!(value_pools[4].id().as_str(), "deferred");
     assert_eq!(value_pools[5].id().as_str(), "ironwood");
     assert_eq!(value_pools[5].chain_value_zat().zatoshis(), 0);
     assert!(value_pools[5].value_delta().is_none());
     assert!(value_pools[5].value_delta_zat().is_none());
+    #[cfg(zcash_unstable = "nutachyon")]
+    {
+        assert_eq!(value_pools[6].id().as_str(), "tachyon");
+        assert_eq!(value_pools[6].chain_value_zat().zatoshis(), 0);
+        assert!(value_pools[6].value_delta().is_none());
+        assert!(value_pools[6].value_delta_zat().is_none());
+    }
 
     Ok(())
 }
@@ -475,7 +550,10 @@ fn test_get_block_accepts_legacy_value_pools() -> Result<(), Box<dyn std::error:
         .as_ref()
         .expect("verbose block has valuePools");
 
+    #[cfg(not(zcash_unstable = "nutachyon"))]
     assert_eq!(value_pools.len(), 6);
+    #[cfg(zcash_unstable = "nutachyon")]
+    assert_eq!(value_pools.len(), 7);
     assert_eq!(value_pools[4].id().as_str(), "lockbox");
     assert_eq!(value_pools[5].id().as_str(), "ironwood");
     assert_eq!(value_pools[5].chain_value_zat().zatoshis(), 0);
@@ -486,6 +564,18 @@ fn test_get_block_accepts_legacy_value_pools() -> Result<(), Box<dyn std::error:
             .map(|amount| amount.zatoshis()),
         Some(0)
     );
+    #[cfg(zcash_unstable = "nutachyon")]
+    {
+        assert_eq!(value_pools[6].id().as_str(), "tachyon");
+        assert_eq!(value_pools[6].chain_value_zat().zatoshis(), 0);
+        assert!(value_pools[6].value_delta().is_some());
+        assert_eq!(
+            value_pools[6]
+                .value_delta_zat()
+                .map(|amount| amount.zatoshis()),
+            Some(0)
+        );
+    }
 
     Ok(())
 }

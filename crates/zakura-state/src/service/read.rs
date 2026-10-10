@@ -22,6 +22,9 @@ pub mod find;
 pub mod historical_tree;
 pub mod tree;
 
+#[cfg(zcash_unstable = "nutachyon")]
+pub(crate) mod tachyon;
+
 #[cfg(test)]
 mod tests;
 

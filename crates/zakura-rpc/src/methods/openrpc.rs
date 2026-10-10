@@ -167,6 +167,19 @@ mod tests {
             let mut expected: serde_json::Value = serde_json::from_str(fixture).unwrap();
             expected["info"]["version"] = env!("CARGO_PKG_VERSION").into();
             let mut actual = render(surface);
+            // The fixtures describe the stable API. Check the experimental
+            // method separately, while preserving the stable document comparison.
+            #[cfg(zcash_unstable = "nutachyon")]
+            {
+                let methods = actual["methods"].as_array_mut().unwrap();
+                let method = methods
+                    .iter()
+                    .find(|method| method["name"] == "gettachyonblock")
+                    .expect("both RPC surfaces expose the public Tachyon data feed");
+                assert_eq!(method["params"][0]["name"], "hash_or_height");
+                assert_eq!(method["params"][0]["required"], true);
+                methods.retain(|method| method["name"] != "gettachyonblock");
+            }
             // The slice uses declaration order instead of PHF iteration order.
             for document in [&mut actual, &mut expected] {
                 document["methods"]

@@ -806,6 +806,8 @@ impl Arbitrary for Transaction {
             ]
             .boxed(),
             NetworkUpgrade::Nu7 => Self::v5_strategy(ledger_state),
+            #[cfg(zcash_unstable = "nutachyon")]
+            NetworkUpgrade::NuTachyon => Self::v5_strategy(ledger_state),
 
             #[cfg(zcash_unstable = "zfuture")]
             NetworkUpgrade::ZFuture => Self::v5_strategy(ledger_state),
@@ -955,6 +957,8 @@ pub fn transaction_to_fake_v5(
         },
         v5 @ V5 { .. } => v5.clone(),
         v6 @ V6 { .. } => v6.clone(),
+        #[cfg(zcash_unstable = "nutachyon")]
+        v7 @ V7 { .. } => v7.clone(),
     }
 }
 
@@ -1040,6 +1044,8 @@ pub fn v5_transactions<'b>(
         | Transaction::V4 { .. } => None,
         ref tx @ Transaction::V5 { .. } => Some(tx.clone()),
         ref tx @ Transaction::V6 { .. } => Some(tx.clone()),
+        #[cfg(zcash_unstable = "nutachyon")]
+        ref tx @ Transaction::V7 { .. } => Some(tx.clone()),
     })
 }
 

@@ -218,6 +218,8 @@ pub fn proposal_block_from_template(
         | NetworkUpgrade::Nu6_2
         | NetworkUpgrade::Nu6_3
         | NetworkUpgrade::Nu7 => block_commitments_hash.bytes_in_serialized_order(),
+        #[cfg(zcash_unstable = "nutachyon")]
+        NetworkUpgrade::NuTachyon => block_commitments_hash.bytes_in_serialized_order(),
         _ => Err(SerializationError::Parse(
             "Zakura does not support generating pre-Canopy block templates",
         ))?,

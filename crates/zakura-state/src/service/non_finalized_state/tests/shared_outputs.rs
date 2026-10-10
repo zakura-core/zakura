@@ -35,6 +35,8 @@ fn funded_chain() -> (Chain, Arc<Block>, transparent::OutPoint) {
         Height(0),
         Default::default(),
         Default::default(),
+        #[cfg(zcash_unstable = "nutachyon")]
+        Default::default(),
         Default::default(),
         Default::default(),
         Default::default(),

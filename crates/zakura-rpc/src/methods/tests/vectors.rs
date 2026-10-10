@@ -52,6 +52,9 @@ use super::super::*;
 use config::mining;
 use types::long_poll::LONG_POLL_ID_LENGTH;
 
+#[cfg(zcash_unstable = "nutachyon")]
+mod tachyon_sync;
+
 type MockRpc<Mempool, State, ReadState, Tip> = RpcImpl<
     Mempool,
     State,

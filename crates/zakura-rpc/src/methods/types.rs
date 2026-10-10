@@ -17,3 +17,6 @@ pub mod unified_address;
 pub mod validate_address;
 pub mod z_validate_address;
 pub mod zec;
+
+#[cfg(zcash_unstable = "nutachyon")]
+pub mod tachyon;

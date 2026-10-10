@@ -366,6 +366,10 @@ fn read_block_info(db: &ZakuraDb, height: Height) -> Result<BlockInfo, FormatCha
     let pool_len = match bytes.0.len() {
         44 => 40,
         52 => 48,
+        // Match Tachyon before the pre-Tachyon layout, or its balance is lost and
+        // its first four bytes are mistaken for the block size.
+        #[cfg(zcash_unstable = "nutachyon")]
+        68.. => 64,
         // Later formats may append fields, as `BlockInfo::from_bytes` allows.
         60.. => 56,
         length => {
@@ -640,7 +644,7 @@ mod database_tests {
         for h in 0..rows {
             let info = read_block_info(db, Height(h)).unwrap();
             assert_eq!(info.size(), 100 + h);
-            assert_eq!(i64::from(info.value_pools().issued_supply()), i64::from(h));
+            assert_eq!(i64::from(info.value_pools().total().unwrap()), i64::from(h));
             let expected = if h < 2 {
                 0
             } else {
@@ -655,6 +659,95 @@ mod database_tests {
         }
         let (_tx, rx) = crossbeam_channel::bounded(1);
         assert!(Upgrade.validate(db, &rx).unwrap().is_ok());
+    }
+
+    #[cfg(zcash_unstable = "nutachyon")]
+    #[test]
+    fn read_block_info_preserves_tachyon_balance_and_size() {
+        use crate::service::finalized_state::disk_format::IntoDisk;
+
+        let db = legacy_db(0, 64);
+        let height = Height(2);
+        for balance in [0, 123_456_789] {
+            let pools = ValueBalance::from_tachyon_amount(Amount::try_from(balance).unwrap());
+            let info = BlockInfo::new(pools, 987_654);
+            for trailing in [vec![], vec![0xab; 8]] {
+                let mut bytes = info.as_bytes();
+                bytes.extend(trailing);
+                let mut batch = DiskWriteBatch::new();
+                let _ = db
+                    .raw_block_info_cf()
+                    .with_batch_for_writing(&mut batch)
+                    .zs_insert(&height, &RawBytes(bytes));
+                db.write_batch(batch).unwrap();
+
+                assert_eq!(read_block_info(&db, height).unwrap(), info);
+            }
+        }
+    }
+
+    #[cfg(zcash_unstable = "nutachyon")]
+    #[test]
+    fn migration_preserves_tachyon_balances_and_block_sizes() {
+        let network = Network::new_regtest(RegtestParameters {
+            activation_heights: ConfiguredActivationHeights {
+                nu7: Some(2),
+                nu_tachyon: Some(2),
+                ..Default::default()
+            },
+            test_nsm_reissuance_height: Some(Height(20_000)),
+            initial_nsm_value_balance: Some(Amount::zero()),
+            ..Default::default()
+        });
+        let db = legacy_db_on(network, 4, 64);
+        let mut batch = DiskWriteBatch::new();
+        // Move the fixture's issued value into Tachyon after activation. Total issuance
+        // stays unchanged, so the existing NSM seed and schedule remain applicable.
+        for height in 2..4 {
+            let pools = ValueBalance::from_tachyon_amount(Amount::try_from(height).unwrap());
+            let height = Height(u32::try_from(height).unwrap());
+            let _ = db
+                .block_info_cf()
+                .with_batch_for_writing(&mut batch)
+                .zs_insert(&height, &BlockInfo::new(pools, 100 + height.0));
+        }
+        let tip_pools = ValueBalance::from_tachyon_amount(Amount::try_from(3).unwrap());
+        let _ = db
+            .chain_value_pools_cf()
+            .with_batch_for_writing(&mut batch)
+            .zs_insert(&(), &tip_pools);
+        db.write_batch(batch).unwrap();
+
+        let (_tx, rx) = crossbeam_channel::bounded(1);
+        for _ in 0..2 {
+            Upgrade.run(Some(Height(3)), &db, &rx).unwrap();
+            assert_upgraded(&db, 4);
+            for height in 2..4 {
+                assert_eq!(
+                    read_block_info(&db, Height(height))
+                        .unwrap()
+                        .value_pools()
+                        .tachyon_amount(),
+                    Amount::<NonNegative>::try_from(i64::from(height)).unwrap(),
+                );
+            }
+        }
+
+        // A real discrepancy must still fail validation; do not just skip Tachyon.
+        let mut pools = read_tip_pools(&db).unwrap();
+        pools.set_tachyon_value_balance(ValueBalance::from_tachyon_amount(
+            Amount::try_from(4).unwrap(),
+        ));
+        let mut batch = DiskWriteBatch::new();
+        let _ = db
+            .chain_value_pools_cf()
+            .with_batch_for_writing(&mut batch)
+            .zs_insert(&(), &pools);
+        db.write_batch(batch).unwrap();
+        assert_eq!(
+            Upgrade.validate(&db, &rx).unwrap(),
+            Err("tip pools disagree with BlockInfo at Height(3)".to_owned()),
+        );
     }
 
     #[test]
@@ -917,12 +1010,12 @@ mod database_tests {
                 for h in 1..rows {
                     assert_eq!(
                         db.raw_block_info_cf().zs_get(&Height(h)).unwrap().0.len(),
-                        60
+                        ValueBalance::<NonNegative>::zero().to_bytes().len() + 4
                     );
                 }
                 assert_eq!(
                     db.raw_chain_value_pools_cf().zs_get(&()).unwrap().0.len(),
-                    56
+                    ValueBalance::<NonNegative>::zero().to_bytes().len()
                 );
             }
         }
@@ -1412,7 +1505,13 @@ mod database_tests {
         };
         let db = legacy_db_with_config(slow_start_deferred_network(Some(4)), 5, 48, &config);
         populate_deferred_balances(&db, 5);
-        let old_version = Version::new(28, 1, 5);
+        // Start immediately before NSM so unrelated earlier upgrades cannot advance
+        // the marker, including the extra history-tree upgrade in Tachyon builds.
+        let old_version = super::super::format_upgrades(None)
+            .map(|upgrade| upgrade.version())
+            .filter(|version| version < &Upgrade.version())
+            .max()
+            .unwrap();
         let running_version = state_database_format_version_in_code();
         db.update_format_version_on_disk(&old_version).unwrap();
         let baseline = db.raw_block_info_cf().zs_get(&Height(3)).unwrap();

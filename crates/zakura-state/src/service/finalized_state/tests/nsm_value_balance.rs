@@ -254,6 +254,62 @@ fn derived_seed_network() -> Network {
     })
 }
 
+/// Startup and shutdown must decode the same Tachyon pool and block-size fields as live reads.
+#[cfg(zcash_unstable = "nutachyon")]
+#[test]
+fn finalized_state_reopens_with_a_nonzero_tachyon_balance() {
+    use crate::service::finalized_state::DiskWriteBatch;
+    use zakura_chain::{block_info::BlockInfo, value_balance::ValueBalance};
+
+    let _init_guard = zakura_test::init();
+    let network = Network::new_regtest(RegtestParameters {
+        activation_heights: ConfiguredActivationHeights {
+            nu7: Some(2),
+            nu_tachyon: Some(2),
+            ..Default::default()
+        },
+        initial_nsm_value_balance: Some(Amount::zero()),
+        ..Default::default()
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let config = Config {
+        cache_dir: dir.path().to_owned(),
+        ephemeral: false,
+        ..Config::default()
+    };
+    let (state, parent) = state_below_start_with_config(&network, &config);
+    let height = parent.coinbase_height().unwrap();
+    let info = state.db.block_info(height.into()).unwrap();
+    let mut pools = *info.value_pools();
+
+    // This is a storage-format fixture, not a proof-verification test. Model a one-zatoshi
+    // transfer between pools without changing the issued supply or the NSM balance.
+    let one = Amount::try_from(1).unwrap();
+    pools.set_transparent_value_balance(ValueBalance::from_transparent_amount(
+        (pools.transparent_amount() - one).unwrap(),
+    ));
+    pools.set_tachyon_value_balance(ValueBalance::from_tachyon_amount(one));
+    let expected = BlockInfo::new(pools, info.size());
+    let mut batch = DiskWriteBatch::new();
+    let _ = state
+        .db
+        .block_info_cf()
+        .with_batch_for_writing(&mut batch)
+        .zs_insert(&height, &expected);
+    let _ = state
+        .db
+        .chain_value_pools_cf()
+        .with_batch_for_writing(&mut batch)
+        .zs_insert(&(), &pools);
+    state.db.write_batch(batch).unwrap();
+    drop(state);
+
+    // Use the normal open path: all startup format checks remain enabled.
+    let reopened = FinalizedState::new(&config, &network).unwrap();
+    assert_eq!(reopened.db.finalized_value_pool(), pools);
+    assert_eq!(reopened.db.block_info(height.into()).unwrap(), expected);
+}
+
 fn rollback_seed_history(network: Network) {
     use crate::{rollback_finalized_state, RollbackFinalizedStateOptions};
 

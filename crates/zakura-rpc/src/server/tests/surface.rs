@@ -221,6 +221,30 @@ async fn segmented_listeners_enforce_methods_and_cookie_auth() {
     assert!(!restricted_methods.contains("reconsiderblock"));
     assert!(!restricted_methods.contains("preciousblock"));
 
+    let tachyon_enabled = cfg!(zcash_unstable = "nutachyon");
+    assert_eq!(
+        restricted_methods.contains("gettachyonblock"),
+        tachyon_enabled
+    );
+    // An invalid identifier needs no state request: this checks actual method
+    // registration, not just the generated discovery document.
+    let tachyon_call = client
+        .post(format!("http://{restricted_addr}"))
+        .header("content-type", "application/json")
+        .body(r#"{"jsonrpc":"2.0","method":"gettachyonblock","params":["invalid"],"id":8}"#)
+        .send()
+        .await
+        .expect("Tachyon availability request should complete")
+        .text()
+        .await
+        .expect("Tachyon availability response body should be readable");
+    let tachyon_call: serde_json::Value =
+        serde_json::from_str(&tachyon_call).expect("Tachyon availability response should be JSON");
+    assert_eq!(
+        tachyon_call["error"]["code"],
+        if tachyon_enabled { -8 } else { -32601 }
+    );
+
     let blocked_call = client
         .post(format!("http://{restricted_addr}"))
         .header("content-type", "application/json")

@@ -5219,16 +5219,13 @@ impl LegacyResponseReadState {
         &self,
         kind: LegacyResponseKind,
     ) -> Result<(), OutboundRequestError> {
+        let mut remaining = self.active_chunk.as_slice();
         match kind {
             LegacyResponseKind::Blocks => {
-                Block::zcash_deserialize_from_slice(&mut self.active_chunk.as_slice())
-                    .map(|_| ())
-                    .map_err(|error| OutboundRequestError::Fatal(Box::new(error)))
+                Block::zcash_deserialize_from_slice(&mut remaining).map(|_| ())
             }
             LegacyResponseKind::Transactions => {
-                Transaction::zcash_deserialize_from_slice(&mut self.active_chunk.as_slice())
-                    .map(|_| ())
-                    .map_err(|error| OutboundRequestError::Fatal(Box::new(error)))
+                Transaction::zcash_deserialize_from_slice(&mut remaining).map(|_| ())
             }
             LegacyResponseKind::BlockHashes
             | LegacyResponseKind::BlockHeaders
@@ -5236,6 +5233,14 @@ impl LegacyResponseReadState {
             | LegacyResponseKind::Pong
             | LegacyResponseKind::Nil => unreachable!("non-chunk legacy response kind"),
         }
+        .map_err(|error| OutboundRequestError::Fatal(Box::new(error)))?;
+        // A valid item padded with junk must not pass as a completed item.
+        if !remaining.is_empty() {
+            return Err(OutboundRequestError::Fatal(
+                "legacy response item has trailing bytes".into(),
+            ));
+        }
+        Ok(())
     }
 
     fn validate_missing(
@@ -10201,6 +10206,46 @@ mod tests {
                 state.validate_frame(1, &frame).unwrap();
             }
         }
+    }
+
+    /// F-37: the transport-level check rejects a valid transaction padded with
+    /// junk bytes as a fatal peer fault.
+    #[test]
+    fn legacy_completed_item_rejects_trailing_bytes() -> Result<(), BoxError> {
+        let limits = test_connection_limits();
+        let request_id = 99;
+        let transaction = transaction::UnminedTx::from(empty_v5_transaction(24));
+        let request_frame =
+            LegacyRequestFrame::TransactionsById(vec![transaction.id()]).encode_frame()?;
+        let budget = LegacyResponseBudget::from_request(
+            request_frame.message_type,
+            &request_frame.payload,
+            limits,
+        )
+        .map_err(|error| -> BoxError { format!("{error:?}").into() })?;
+        let mut frames = LegacyResponseCodec::encode_response(
+            request_id,
+            Response::Transactions(vec![InventoryResponse::Available((transaction, None))]),
+            limits.max_frame_bytes,
+            limits.max_message_bytes,
+        )?;
+        let [frame] = frames.as_mut_slice() else {
+            panic!("a small transaction encodes as one frame");
+        };
+
+        let mut state = LegacyResponseReadState::new(budget);
+        state
+            .validate_frame(request_id, frame)
+            .map_err(|error| -> BoxError { format!("{error:?}").into() })?;
+
+        frame.payload.extend_from_slice(&[0; 16]);
+        let mut state = LegacyResponseReadState::new(budget);
+        assert!(matches!(
+            state.validate_frame(request_id, frame),
+            Err(OutboundRequestError::Fatal(_)),
+        ));
+
+        Ok(())
     }
 
     fn assert_codec_frames_validate_at_transport(

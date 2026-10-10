@@ -1232,11 +1232,15 @@ impl ZakuraSupervisorHandle {
     }
 
     /// Returns queue-backed handles for peers currently able to accept outbound work.
+    ///
+    /// A peer whose disconnect has been requested stays in `active_by_peer`
+    /// until its connection task deregisters it, so it is skipped here.
     pub async fn outbound_peer_handles(&self) -> Vec<ZakuraPeerHandle> {
         let state = self.inner.lock().await;
         state
             .active_by_peer
             .values()
+            .filter(|entry| !entry.disconnect_token.is_cancelled())
             .map(|entry| &entry.outbound_handle)
             .filter(|handle| handle.has_outbound_capacity())
             .cloned()
@@ -6423,6 +6427,33 @@ mod tests {
             supervisor_b.register_authenticated(peer, losing_key),
             AuthenticatedPeerRegistration::Duplicate
         ));
+    }
+
+    /// A disconnected peer leaves request selection at once, before its
+    /// connection task deregisters it.
+    #[tokio::test]
+    async fn disconnected_peer_leaves_outbound_selection_before_cleanup() {
+        let supervisor = ZakuraSupervisorHandle::new(1);
+        let peer = test_peer(12);
+        let (outbound_tx, _outbound_rx) = mpsc::channel(1);
+        registered_conn_id(
+            supervisor
+                .register(
+                    test_conn_id(),
+                    peer.clone(),
+                    Some("203.0.113.12".parse().expect("test ip parses")),
+                    [0; TRANSCRIPT_HASH_BYTES],
+                    ZakuraPeerHandle::new_for_tests(peer.clone(), outbound_tx),
+                    CancellationToken::new(),
+                    ZAKURA_CAP_LEGACY_GOSSIP,
+                )
+                .await,
+        );
+        assert_eq!(supervisor.outbound_peer_handles().await.len(), 1);
+
+        assert!(supervisor.disconnect_peer(&peer).await);
+        assert_eq!(supervisor.registered_ids().await, vec![peer]);
+        assert!(supervisor.outbound_peer_handles().await.is_empty());
     }
 
     #[tokio::test]

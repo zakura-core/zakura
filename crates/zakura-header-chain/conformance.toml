@@ -1,4 +1,4 @@
-spec_version = "1.6"
+spec_version = "1.7"
 
 # Phase 0 registers the complete rule catalog without implementation claims.
 # Later checkpoints change a status after the manifest can name its owner and tests.
@@ -16,7 +16,7 @@ id = "LC-SCOPE-02"
 name = "Correctness assumptions"
 status = "implemented"
 owner = "zakura_header_chain::EngineConfig"
-tests = ["architecture::engine_config_binds_and_validates_every_trust_anchor", "architecture::production_config_always_installs_the_release_manifest", "PW-05::unknown_status_targets_remain_eligible_regardless_of_advisory_shape"]
+tests = ["architecture::engine_config_binds_and_validates_every_trust_anchor", "architecture::production_config_always_installs_the_release_manifest", "PW-05::unknown_targets_above_finality_remain_eligible_regardless_of_work_claims"]
 networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
@@ -790,7 +790,7 @@ id = "LC-WIRE-04"
 name = "Advertised-target scheduling"
 status = "implemented"
 owner = "zakura_network::ActiveHeaderRequest"
-tests = ["PW-05::unknown_status_targets_remain_eligible_regardless_of_advisory_shape", "PW-05::peer_work_queue_caps_targets_and_only_supersedes_unstarted_work"]
+tests = ["PW-05::unknown_targets_above_finality_remain_eligible_regardless_of_work_claims", "PW-05::peer_work_queue_caps_targets_and_only_supersedes_unstarted_work"]
 networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
@@ -886,7 +886,7 @@ id = "LC-WIRE-12"
 name = "Unknown-fork discovery"
 status = "implemented"
 owner = "zakura_network::zakura::header_sync::AdvertisedHeaderTarget::is_discovery_eligible"
-tests = ["PW-05::unknown_status_targets_remain_eligible_regardless_of_advisory_shape", "PW-05::corrupted_advisory_fields_never_change_local_authority"]
+tests = ["PW-05::unknown_targets_above_finality_remain_eligible_regardless_of_work_claims", "PW-05::discovery_skips_targets_at_or_below_finality_but_keeps_shorter_forks", "PW-05::corrupted_advisory_fields_never_change_local_authority"]
 networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]

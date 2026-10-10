@@ -2176,7 +2176,11 @@ impl ZakuraRequestClient {
         }
 
         match (missing_response, last_error, candidates.as_slice()) {
-            (Some(response), _, [only]) if retry_source_missing && preferred.is_some() => {
+            // Only retry the advertising peer itself, not an unrelated peer
+            // that happened to be the sole candidate.
+            (Some(response), _, [only])
+                if retry_source_missing && preferred.as_ref() == Some(only.peer_id()) =>
+            {
                 self.retry_source_missing(only.clone(), frame, request_kind, response)
                     .await
             }
@@ -4656,6 +4660,45 @@ mod tests {
         for responder in responders {
             responder.shutdown().await;
         }
+        requester.shutdown().await;
+        Ok(())
+    }
+
+    /// When the advertising peer is not ready and an unrelated peer is the only
+    /// candidate, a missing answer is not retried against that unrelated peer.
+    #[tokio::test]
+    async fn source_missing_retries_skip_an_unrelated_sole_peer() -> Result<(), BoxError> {
+        let _guard = zakura_test::init();
+        let txid = UnminedTx::from(empty_v5_transaction(4)).id();
+        let (unrelated, mut unrelated_rx) = recording_inventory_node(78, None).await?;
+        let requester = ZakuraTestNode::builder(79).spawn().await?;
+        requester
+            .connect_native(&unrelated, TEST_NET_TIMEOUT)
+            .await?;
+        wait_registered_count(&requester, 1).await?;
+        let absent_source = ZakuraPeerId::new(vec![0xab; 32])?;
+
+        let mut adapter = LegacyRequestAdapter::new(requester.supervisor());
+        let response = adapter
+            .ready()
+            .await?
+            .call(Request::TransactionsByIdFrom {
+                ids: HashSet::from([txid]),
+                source: PeerSource::Zakura(absent_source),
+            })
+            .await?;
+        assert!(all_inventory_missing(&response), "got {response:?}");
+
+        match recv_request(&mut unrelated_rx).await? {
+            Request::TransactionsById(ids) => assert_eq!(ids, HashSet::from([txid])),
+            request => panic!("unexpected request: {request:?}"),
+        }
+        assert!(
+            unrelated_rx.try_recv().is_err(),
+            "the unrelated peer must not receive source-missing retries"
+        );
+
+        unrelated.shutdown().await;
         requester.shutdown().await;
         Ok(())
     }

@@ -5298,33 +5298,20 @@ impl LegacyResponseReadState {
 
     /// Validate a `MSG_RESPONSE_NIL` empty-result sentinel against the request kind.
     ///
-    /// NIL is the empty-result sentinel only for chain-discovery and mempool
-    /// queries: the inbound service answers an empty `FindBlocks`/`FindHeaders`/
-    /// `MempoolTransactionIds` (and a queued `PushTransaction`) with
-    /// `Response::Nil`. Inventory fetches (`BlocksByHash`/`TransactionsById`) and
-    /// `Ping` must never receive a bare NIL, so reject it as `Fatal` for those
-    /// kinds — fail closed and let the request stream worker disconnect the peer,
-    /// matching `LegacyResponseCodec::decode_response`, which rejects NIL for the
-    /// same kinds. The kind-specific empty `Response` is produced later by
-    /// `decode_response`.
+    /// NIL is the empty result for chain-discovery and mempool queries (and the
+    /// acknowledgement of a queued `PushTransaction`); `decode_response` turns it
+    /// into that kind's empty `Response`. A malformed NIL, or NIL to a `Ping`
+    /// (always answered locally), is `Fatal`.
+    ///
+    /// NIL to `BlocksByHash` / `TransactionsById` is `Local`: an honest inbound
+    /// service still in setup answers every request with NIL. Failing closed
+    /// would disconnect it and buys nothing, since a peer can already decline
+    /// with an empty response.
     fn validate_nil(
         &mut self,
         request_id: u64,
         payload: &[u8],
     ) -> Result<(), OutboundRequestError> {
-        match self.budget.kind {
-            LegacyResponseKind::BlockHashes
-            | LegacyResponseKind::BlockHeaders
-            | LegacyResponseKind::TransactionIds
-            | LegacyResponseKind::Nil => {}
-            LegacyResponseKind::Blocks
-            | LegacyResponseKind::Transactions
-            | LegacyResponseKind::Pong => {
-                return Err(OutboundRequestError::Fatal(
-                    "unexpected legacy nil response for inventory or ping request".into(),
-                ));
-            }
-        }
         if self.active_chunk_type.is_some() {
             return Err(OutboundRequestError::Fatal(
                 "legacy nil response interleaved with response chunk".into(),
@@ -5343,6 +5330,22 @@ impl LegacyResponseReadState {
             return Err(OutboundRequestError::Fatal(
                 "legacy nil response has trailing bytes".into(),
             ));
+        }
+        match self.budget.kind {
+            LegacyResponseKind::BlockHashes
+            | LegacyResponseKind::BlockHeaders
+            | LegacyResponseKind::TransactionIds
+            | LegacyResponseKind::Nil => {}
+            LegacyResponseKind::Blocks | LegacyResponseKind::Transactions => {
+                return Err(OutboundRequestError::Local(
+                    "legacy nil response to inventory request".into(),
+                ));
+            }
+            LegacyResponseKind::Pong => {
+                return Err(OutboundRequestError::Fatal(
+                    "unexpected legacy nil response for ping request".into(),
+                ));
+            }
         }
         self.add_items(1)
     }
@@ -10511,88 +10514,64 @@ mod tests {
         );
     }
 
-    // SECURITY AUDIT (candidate claude-legacy-nil-response-nonfatal /
-    // subset-response-correlation-gossip-nil-response-nonfatal): SR-7 fail-closed.
-    //
-    // The outbound request stream worker decides connection-fatality from
-    // `LegacyResponseReadState::validate_frame`: `Fatal` => connection.close() +
-    // connection_token.cancel() (the peer is disconnected); `Ok`/`Local` => the
-    // peer stays connected and the request just returns an error. `validate_nil`
-    // accepts a `MSG_RESPONSE_NIL` sentinel for *every* request kind, so a peer
-    // that answers an inventory fetch (BlocksByHash / TransactionsById) or a Ping
-    // with a correct-id NIL passes the transport budget layer (worker returns
-    // Ok(frames)) and is NOT disconnected. Only the later `decode_response` layer
-    // rejects NIL for these kinds -- as an ordinary request-local error. The two
-    // layers disagree, so an unexpected/unsolicited response is tolerated instead
-    // of failing closed.
-    //
-    // This test asserts the SAFE behavior (the transport budget layer must reject
-    // NIL for inventory/Ping kinds as `Fatal`, so the worker disconnects). It
-    // currently FAILS, which is the reproduction. Do not weaken it to pass.
+    /// A well-formed NIL answer to an inventory fetch is request-local, so the
+    /// peer stays connected and the caller falls back; NIL to a Ping and a NIL
+    /// with the wrong request id stay connection-fatal.
     #[test]
-    fn nil_response_to_inventory_or_ping_request_is_not_fail_closed() {
+    fn nil_response_is_local_for_inventory_and_fatal_for_ping() {
         let limits = test_connection_limits();
         let request_id = 99;
 
-        let cases: [(LegacyRequestFrame, LegacyRequestKind); 3] = [
-            (
-                LegacyRequestFrame::BlocksByHash(vec![block_hash(1)]),
-                LegacyRequestKind::Blocks,
-            ),
+        let cases = [
+            (LegacyRequestFrame::BlocksByHash(vec![block_hash(1)]), false),
             (
                 LegacyRequestFrame::TransactionsById(vec![legacy_tx_id(2)]),
-                LegacyRequestKind::Transactions,
+                false,
             ),
-            (LegacyRequestFrame::Ping, LegacyRequestKind::Ping),
+            (LegacyRequestFrame::Ping, true),
         ];
 
-        for (request, request_kind) in cases {
+        for (request, fatal) in cases {
             let request_frame = request.encode_frame().expect("request frame encodes");
-            let budget = LegacyResponseBudget::from_request(
-                request_frame.message_type,
-                &request_frame.payload,
-                limits,
-            )
-            .expect("budget derives from request");
+            let budget = || {
+                LegacyResponseBudget::from_request(
+                    request_frame.message_type,
+                    &request_frame.payload,
+                    limits,
+                )
+                .expect("budget derives from request")
+            };
+            let nil = |id| {
+                LegacyResponseCodec::encode_response(
+                    id,
+                    Response::Nil,
+                    limits.max_frame_bytes,
+                    limits.max_message_bytes,
+                )
+                .expect("nil response encodes")
+                .pop()
+                .expect("nil encodes to one frame")
+            };
 
-            // A hostile/buggy responder serializes Response::Nil with the real
-            // codec, addressed to our request id.
-            let nil_frames = LegacyResponseCodec::encode_response(
-                request_id,
-                Response::Nil,
-                limits.max_frame_bytes,
-                limits.max_message_bytes,
-            )
-            .expect("nil response encodes");
-
-            // The higher decode layer DOES reject NIL for these kinds...
-            let decoded = LegacyResponseCodec::decode_response(
-                request_id,
-                request_kind,
-                nil_frames.clone(),
-                None,
-            );
-            assert!(
-                decoded.is_err(),
-                "decode_response must reject a bare NIL for {request_kind:?}",
-            );
-
-            // ...but the transport budget layer -- the one that drives the
-            // fail-closed disconnect in the request stream worker -- must ALSO
-            // reject it as Fatal. It currently accepts it.
-            let mut state = LegacyResponseReadState::new(budget);
-            let mut validate = Ok(());
-            for frame in &nil_frames {
-                validate = state.validate_frame(request_id, frame);
-                if validate.is_err() {
-                    break;
-                }
+            let result =
+                LegacyResponseReadState::new(budget()).validate_frame(request_id, &nil(request_id));
+            if fatal {
+                assert!(
+                    matches!(result, Err(OutboundRequestError::Fatal(_))),
+                    "NIL to {request:?} must be Fatal; got {result:?}",
+                );
+            } else {
+                assert!(
+                    matches!(result, Err(OutboundRequestError::Local(_))),
+                    "NIL to {request:?} must be Local; got {result:?}",
+                );
             }
-            let validate = validate.and_then(|()| state.finish());
+
+            let wrong_id = LegacyResponseReadState::new(budget())
+                .validate_frame(request_id, &nil(request_id + 1));
             assert!(
-                matches!(validate, Err(OutboundRequestError::Fatal(_))),
-                "transport must fail closed (Fatal) on a NIL answer to {request_kind:?} so the \
-                 request stream worker disconnects the peer; got {validate:?}",
+                matches!(wrong_id, Err(OutboundRequestError::Fatal(_))),
+                "a wrong-id NIL to {request:?} must stay Fatal; got {wrong_id:?}",
             );
         }
     }

@@ -3473,6 +3473,34 @@ mod tests {
         }
     }
 
+    /// Answers the first request with `Nil`, like an inbound service still in
+    /// setup, then answers block requests with its block.
+    #[derive(Clone, Debug)]
+    struct NilThenBlockResponder {
+        block: Arc<Block>,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl Service<Request> for NilThenBlockResponder {
+        type Response = Response;
+        type Error = BoxError;
+        type Future = std::future::Ready<Result<Response, BoxError>>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, _request: Request) -> Self::Future {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                return std::future::ready(Ok(Response::Nil));
+            }
+            std::future::ready(Ok(Response::Blocks(vec![InventoryResponse::Available((
+                self.block.clone(),
+                None,
+            ))])))
+        }
+    }
+
     #[derive(Clone, Debug)]
     struct SlowRequestThenRecorder {
         release: tokio::sync::watch::Receiver<bool>,
@@ -4097,6 +4125,68 @@ mod tests {
 
         assert!(result.is_err(), "an unsolicited block must not be returned");
         wait_registered_count(&node_b, 0).await?;
+
+        node_a.shutdown().await;
+        node_b.shutdown().await;
+        Ok(())
+    }
+
+    /// A peer still in inbound setup answers a block request with NIL. That
+    /// fails the request without disconnecting the peer, so it serves the block
+    /// once setup completes.
+    #[tokio::test]
+    async fn request_adapter_keeps_peer_after_nil_inventory_response() -> Result<(), BoxError> {
+        let _guard = zakura_test::init();
+        let block = Arc::new(Block::zcash_deserialize(
+            BLOCK_TESTNET_141042_BYTES.as_slice(),
+        )?);
+        let hash = block.hash();
+        let node_a = ZakuraTestNode::builder(72)
+            .service_from_supervisor(move |supervisor| {
+                Arc::new(LegacyGossipSink::spawn(
+                    NilThenBlockResponder {
+                        block,
+                        calls: Arc::new(AtomicUsize::new(0)),
+                    },
+                    supervisor,
+                ))
+            })
+            .spawn()
+            .await?;
+        let node_b = ZakuraTestNode::builder(73).spawn().await?;
+        node_b.connect_native(&node_a, TEST_NET_TIMEOUT).await?;
+        wait_registered_count(&node_b, 1).await?;
+        let a_peer_id = node_peer_id(&node_a).await?;
+
+        // Any disconnect, including one followed by a quick re-registration,
+        // changes the registered peer set.
+        let mut peer_set = node_b.supervisor().subscribe();
+        peer_set.borrow_and_update();
+
+        let adapter = LegacyRequestAdapter::new(node_b.supervisor());
+        let request = || Request::BlocksByHash(IndexSet::from([hash]));
+        let source = Some(PeerSource::Zakura(a_peer_id));
+        assert!(
+            adapter
+                .request_from_source(request(), source.clone())
+                .await
+                .is_err(),
+            "a NIL answer to a block request must not return blocks"
+        );
+
+        let response = adapter.request_from_source(request(), source).await?;
+        assert!(
+            matches!(
+                &response,
+                Response::Blocks(blocks)
+                    if matches!(blocks.as_slice(), [InventoryResponse::Available((received, _))] if received.hash() == hash)
+            ),
+            "the same peer must still serve the block; got {response:?}"
+        );
+        assert!(
+            !peer_set.has_changed()?,
+            "the NIL answer must not disconnect the peer"
+        );
 
         node_a.shutdown().await;
         node_b.shutdown().await;

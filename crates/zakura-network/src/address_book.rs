@@ -15,7 +15,10 @@ use tracing::Span;
 use zakura_chain::{parameters::Network, serialization::DateTime32};
 
 use crate::{
-    constants::{self, ADDR_RESPONSE_LIMIT_DENOMINATOR, MAX_ADDRS_IN_MESSAGE},
+    constants::{
+        self, ADDR_RESPONSE_LIMIT_DENOMINATOR, MAX_ADDRS_IN_MESSAGE,
+        PRUNED_ADDR_RESPONSE_SHARE_DENOMINATOR,
+    },
     meta_addr::MetaAddrChange,
     peer_registry::PeerRegistry,
     protocol::external::{canonical_ip, canonical_peer_addr, canonical_socket_addr},
@@ -502,11 +505,26 @@ impl AddressBook {
     /// including our local listener address.
     ///
     /// Limited to the number of peer addresses Zebra should give out per `GetAddr` request.
+    ///
+    /// At most `1 / PRUNED_ADDR_RESPONSE_SHARE_DENOMINATOR` of the response is
+    /// addresses of peers that do not advertise `NODE_NETWORK`.
     pub fn fresh_get_addr_response(&self) -> Vec<MetaAddr> {
         let now = Utc::now();
         let mut peers = self.sanitized(now);
-        let address_limit = peers.len().div_ceil(ADDR_RESPONSE_LIMIT_DENOMINATOR);
-        peers.truncate(MAX_ADDRS_IN_MESSAGE.min(address_limit));
+        let address_limit =
+            MAX_ADDRS_IN_MESSAGE.min(peers.len().div_ceil(ADDR_RESPONSE_LIMIT_DENOMINATOR));
+        let pruned_limit = address_limit.div_ceil(PRUNED_ADDR_RESPONSE_SHARE_DENOMINATOR);
+
+        // `sanitized` shuffles the peers, so this keeps a random subset of pruned peers.
+        let mut pruned_count = 0;
+        peers.retain(|peer| {
+            if peer.is_full_node() {
+                return true;
+            }
+            pruned_count += 1;
+            pruned_count <= pruned_limit
+        });
+        peers.truncate(address_limit);
 
         peers
     }
@@ -565,6 +583,9 @@ impl AddressBook {
             // This prevents Zebra from caching nodes that are likely unreachable,
             // which improves startup time and reliability.
             .filter(|addr| addr.is_active_for_gossip(now))
+            // Cached peers are dialed at startup without a services check,
+            // so only cache peers that serve full block history.
+            .filter(|addr| addr.is_full_node())
             .cloned()
             .collect()
     }
@@ -716,16 +737,10 @@ impl AddressBook {
                 return None;
             }
 
-            // Ignore invalid outbound services and other info,
-            // but only if the peer has never been attempted.
-            //
-            // Otherwise, if we got the info directly from the peer,
-            // store it in the address book, so we know not to reconnect.
-            if !updated.last_known_info_is_valid_for_outbound(&self.network)
-                && updated.last_connection_state.is_never_attempted()
-            {
-                return None;
-            }
+            // Keep peers that do not advertise `NODE_NETWORK`, such as pruned
+            // nodes. Their recorded services keep them out of outbound
+            // connection attempts and the peer cache, but they can still be
+            // gossiped so nodes near the chain tip can find them.
 
             self.peers.insert(updated);
             self.address_metrics_dirty = true;

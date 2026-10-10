@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 86da47076ca83bc674aa0dc83cd577d85d0c9f6011e14a85ce223561be965991 # shrinks to (addr, changes) = (MetaAddr { addr: v4redacted:45304, services: None, untrusted_last_seen: None, last_response: None, rtt: Some(11015722500610891940.256464554s), ping_sent_at: Some(Instant { tv_sec: 912245, tv_nsec: 363620750 }), last_attempt: None, last_failure: None, misbehavior_score: 0, last_connection_state: Failed, is_inbound: false }, [NewGossiped { addr: v4redacted:45304, untrusted_services: PeerServices(0x0), untrusted_last_seen: DateTime32 { timestamp: 1099179517, calendar: 2004-10-30T23:38:37Z } }])

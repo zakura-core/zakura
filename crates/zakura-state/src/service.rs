@@ -52,7 +52,7 @@ use crate::{
     },
     error::{
         AwaitBlockInfoError, CommitBlockError, CommitCheckpointVerifiedError, InvalidateError,
-        ReconsiderError,
+        PreciousError, ReconsiderError,
     },
     request::TimedSpan,
     response::NonFinalizedBlocksListener,
@@ -1196,9 +1196,9 @@ impl StateService {
     /// Whether a candidate admitted right now may be advertised before its contextual commit.
     ///
     /// Called after this candidate's own write slot is acquired, so "one permit taken" means no
-    /// other commit, reconsideration, or invalidation is still unpublished. Every earlier
-    /// transition has already reached `update_latest_chain_channels`, so the published best tip
-    /// is the tip this candidate extends.
+    /// other commit, reconsideration, invalidation, or tip preference is still unpublished.
+    /// Every earlier transition has already reached `update_latest_chain_channels`, so the
+    /// published best tip is the tip this candidate extends.
     fn optimistic_relay_still_authorized(
         &self,
         admission: Option<&BlockAdmission>,
@@ -1410,6 +1410,48 @@ impl StateService {
             };
 
             let _ = rsp_tx.send(Err(InvalidateError::SendInvalidateRequestFailed));
+        }
+
+        rsp_rx
+    }
+
+    fn send_precious_block(
+        &self,
+        hash: block::Hash,
+    ) -> oneshot::Receiver<Result<(), PreciousError>> {
+        let (rsp_tx, rsp_rx) = oneshot::channel();
+
+        // The writer defers non-finalized messages until checkpoint sync ends, so fail fast
+        // instead of queueing requests that could wait for the whole checkpoint phase.
+        let sender = match &self.block_write_sender {
+            write::BlockWriteSender {
+                finalized: None,
+                non_finalized: Some(sender),
+            } => sender,
+            _ => {
+                let _ = rsp_tx.send(Err(PreciousError::ProcessingCheckpointedBlocks));
+                return rsp_rx;
+            }
+        };
+
+        // A preferred tip can change the best tip, so it holds a write slot like invalidation.
+        let Ok(write_slot) = self.non_finalized_write_slots.clone().try_acquire_owned() else {
+            let _ = rsp_tx.send(Err(PreciousError::WriterFull));
+            return rsp_rx;
+        };
+
+        if let Err(tokio::sync::mpsc::error::SendError(error)) =
+            sender.send(NonFinalizedWriteMessage::Precious {
+                hash,
+                rsp_tx,
+                write_slot,
+            })
+        {
+            let NonFinalizedWriteMessage::Precious { rsp_tx, .. } = error else {
+                unreachable!("should return the same Precious message could not be sent");
+            };
+
+            let _ = rsp_tx.send(Err(PreciousError::SendPreciousRequestFailed));
         }
 
         rsp_rx
@@ -2087,6 +2129,25 @@ impl Service<Request> for StateService {
                         .and_then(|result| result)
                         .map_err(BoxError::from)
                         .map(Response::Invalidated)
+                }
+                .instrument(span)
+                .boxed()
+            }
+
+            // The expected error type for this request is `PreciousError`
+            Request::PreciousBlock(block_hash) => {
+                let rsp_rx = tokio::task::block_in_place(move || {
+                    span.in_scope(|| self.send_precious_block(block_hash))
+                });
+
+                let span = Span::current();
+                async move {
+                    rsp_rx
+                        .await
+                        .map_err(|_recv_error| PreciousError::PreciousRequestDropped)
+                        .and_then(|result| result)
+                        .map_err(BoxError::from)
+                        .map(|()| Response::Precious)
                 }
                 .instrument(span)
                 .boxed()

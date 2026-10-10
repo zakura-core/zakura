@@ -1,13 +1,15 @@
 # Fork-aware headers-only chain engine specification
 
 Status: normative design oracle for the replacement of PR #229<br>
-Version: 1.5<br>
-Date: 2026-09-21<br>
+Version: 1.6<br>
+Date: 2026-10-09<br>
 Scope: Zakura native (v2 P2P) header sync and its integration with Zakura full state
 
 Version 1.4 removes every backward-compatibility surface from this engine. There is exactly one header-sync message set, one codec, one status message, and one supported stream version. The previous native stream version 7, its dual-version negotiation, and the legacy Zcash `getheaders` fallback are not implemented, not served, and not tested. The legacy Zcash P2P stack is out of scope entirely: this engine neither reads, writes, nor changes it.
 
 Version 1.5 makes full-state fork eviction recoverable. Newly accepted branches remain available for extension within the existing full-state fork limit. Atomic block acceptance and reconsideration clear verification markers for evicted bodies while leaving their headers eligible. This adds no wire or disk fields.
+
+Version 1.6 lets the admin `preciousblock` RPC break full-state equal-work ties. Headers keep the raw-hash order. Full state supplies its selected tip through the authenticated atomic transition, so operator invalidation and reconsideration keep the operator-preferred verified tip. This adds no wire or disk fields, and the preference is not persisted.
 
 ## Document overview
 
@@ -274,7 +276,7 @@ Eligibility reasons are a set, not a single overwritable flag. Permanent reasons
 
 **LC-SELECT-02 [ZC] — Greatest-work selection.** The primary comparison MUST be cumulative work over complete suffixes from the shared work anchor. Greater cumulative work wins. Only locally validated targets and LC-WORKCALC-01 sums are inputs to this comparison.
 
-**LC-SELECT-03 [ZF] — Raw-hash tie-breaker.** If cumulative work is equal, the engine MUST compare the tips’ raw internal `block::Hash.0` byte arrays lexicographically and select the greater array, exactly as `zakura-state::service::non_finalized_state::Chain::cmp`. Display-order hex, first-seen time, arrival order, peer identity, response range, and response partitioning MUST NOT break the tie.
+**LC-SELECT-03 [ZF] — Raw-hash tie-breaker.** If cumulative work is equal, the engine MUST compare the tips’ raw internal `block::Hash.0` byte arrays lexicographically and select the greater array, exactly as `zakura-state::service::non_finalized_state::Chain::cmp` does for tips without an operator `preciousblock` preference. Full state ranks the operator's latest preferred tip above the raw-hash order for `verified_best`. Display-order hex, first-seen time, arrival order, peer identity, response range, and response partitioning MUST NOT break the tie.
 
 <a id="lc-select-04"></a>
 **LC-SELECT-04 [LS] — Deterministic selection.** For a fixed finalized anchor, selection MUST be a pure deterministic function of the admitted DAG, eligibility set, and the comparator in LC-SELECT-02/03. Replaying any permutation of equivalent insertions and completions before the same durable finalization event MUST yield the same `header_best`. A headers-only finality event deliberately makes its chosen ancestor a new trust pin under LC-FINAL-03; discovery after that event cannot revise history at or below the pin.
@@ -325,7 +327,7 @@ Protected-path retention pressure that cannot admit work without evicting `heade
 
 **LC-INT-03 [ZW] — Full-block integration.** A full-block commit MUST ensure its exact header node exists in the DAG with correct parent linkage, update body-validation state, update `verified_best` from full state, apply any body-derived eligibility evidence, and then independently reevaluate `header_best`.
 
-**LC-INT-04 [ZW] — Atomic invalidate and reconsider.** Invalidate or reconsider MUST complete its durable eligibility and both-frontier transition before returning externally complete or publishing watches. If full state has no non-finalized chain, `verified_best` MUST become `finalized`; the header DAG remains independently selected subject to its eligibility set.
+**LC-INT-04 [ZW] — Atomic invalidate and reconsider.** Invalidate or reconsider MUST complete its durable eligibility and both-frontier transition before returning externally complete or publishing watches. If full state has no non-finalized chain, `verified_best` MUST become `finalized`; the header DAG remains independently selected subject to its eligibility set. When the full-state writer supplies an authenticated verified tip, the planner MUST check that it is connected, eligible, verified, and has the greatest cumulative work, then keep it on equal work instead of the raw-hash tie-breaker.
 
 **LC-INT-05 [LS] — Owner-qualified freshness.** Header-range insertion and auxiliary-evidence events that carry a typed work owner MUST admit or reject based on that owner's generation, branch identity, and ownership checks. They MUST NOT treat a mismatched `state_version` alone as authorization failure when the owner remains current.
 
@@ -624,7 +626,7 @@ Each named test below is a deterministic test target or parameterized suite. Mod
 - **PW-06 `aux_schema_and_body_hints`:** schema mask/selector negotiation, exact schema-1 156-byte golden vectors, every field and root encoding, height mismatch, preactivation defaults, NU5/NU6.3/NU7 boundaries, all-or-none parallel counts, unavailable metadata fallback, unknown/future schemas, `0`/`1`/`2,000,000`/`2,000,001` body hints, and proof that hints cannot drive allocation or admission credit.
 - **PW-07 `status_propagation`:** initial status immediately after the stream opens, change-driven updates for tip/anchor/retention/cap changes, burst coalescing with the two-second freshness and one-per-second floor, configured periodic refresh, snapshot atomicity against concurrent selection changes, and non-punitive handling of silent or stale-status peers.
 - **PW-08 `single_protocol_surface`:** a peer without stream version 8 is given no header-sync stream and no score; no compatibility, predecessor, or legacy `getheaders` code path exists in the header-sync module tree or its public API; and the legacy Zcash P2P message handlers are byte-identical to their pre-engine behavior.
-- **DF-01 `header_full_state_parity`:** body-valid generated fork graphs fed to the integrated header engine and full state from the same finalized anchor; require identical observable-header acceptance, work, raw-hash tie order, and selected tip before a full-state finalization event.
+- **DF-01 `header_full_state_parity`:** body-valid generated fork graphs fed to the integrated header engine and full state from the same finalized anchor; require identical observable-header acceptance, work, raw-hash tie order, and selected tip before a full-state finalization event, when no operator `preciousblock` preference applies.
 - **DF-02 `intentional_difference_vectors`:** coinbase height, Merkle/body mismatch, transaction/proof/script failure, nullifier/anchor/value-pool/state-transition failure, local future time, and header-valid/body-invalid outcomes, each with an asserted typed explanation.
 
 ### 7.3 Audit closure and incident scenarios

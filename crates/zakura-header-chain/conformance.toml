@@ -1,4 +1,4 @@
-spec_version = "1.5"
+spec_version = "1.6"
 
 # Phase 0 registers the complete rule catalog without implementation claims.
 # Later checkpoints change a status after the manifest can name its owner and tests.
@@ -542,7 +542,7 @@ id = "LC-INT-04"
 name = "Atomic invalidate and reconsider"
 status = "implemented"
 owner = "zakura_state::service::write::commit_operator_change"
-tests = ["IN-01::generated_nu5_graph_matches_full_state_before_finalization", "AUD-10::operator_invalidation_promotes_alternate_and_preserves_nested_reasons", "AUD-11::invalidating_verified_path_preserves_independent_header_best", "AUD-12::operator_reconsider_restores_shorter_higher_work_verified_branch", "AUD-14::every_crash_boundary_reopens_to_complete_transition"]
+tests = ["IN-01::generated_nu5_graph_matches_full_state_before_finalization", "AUD-10::operator_invalidation_promotes_alternate_and_preserves_nested_reasons", "AUD-11::invalidating_verified_path_preserves_independent_header_best", "AUD-12::operator_reconsider_restores_shorter_higher_work_verified_branch", "AUD-14::every_crash_boundary_reopens_to_complete_transition", "IN-01::operator_changes_keep_the_full_state_verified_preference", "IN-01::precious_block_publishes_and_keeps_the_preferred_verified_tip"]
 networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
@@ -909,8 +909,8 @@ networks = ["mainnet", "testnet", "custom"]
 id = "LC-PARITY-03"
 name = "Tie-break policy isolation"
 status = "implemented"
-owner = "zakura_header_chain::ChainScore::cmp"
-tests = ["DF-01::chain_score_breaks_equal_work_ties_using_raw_hash_bytes"]
+owner = "zakura_header_chain::ChainScore::cmp + zakura_state::Chain::cmp"
+tests = ["DF-01::chain_score_breaks_equal_work_ties_using_raw_hash_bytes", "DF-02::precious_block_overrides_hash_order_and_later_calls_win"]
 networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]

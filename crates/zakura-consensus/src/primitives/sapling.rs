@@ -18,7 +18,6 @@ use tower_fallback::Fallback;
 
 use sapling_crypto::{bundle::Authorized, BatchValidator, Bundle};
 use zakura_chain::transaction::{SigHash, UnminedTxId};
-use zcash_proofs::prover::LocalTxProver;
 use zcash_protocol::value::ZatBalance;
 
 use crate::{error::TransactionError, BoxError};
@@ -34,22 +33,7 @@ mod tests;
 /// one verifier is named the same way everywhere.
 pub(super) const VERIFIER_NAME: &str = "groth16_sapling";
 
-/// Sapling prover containing spend and output params for the Sapling circuit.
-///
-/// Used to:
-///
-/// - construct Sapling outputs in coinbase txs, and
-/// - verify Sapling shielded data in the tx verifier.
-static SAPLING: Lazy<LocalTxProver> = Lazy::new(LocalTxProver::bundled);
-
-/// Returns the process-wide Sapling prover for constructing Sapling proofs, initializing it on
-/// first use.
-///
-/// The bundled Sapling spend and output proving parameters are parsed once, then the same prover is
-/// reused for proof construction and verification for the lifetime of the process.
-pub fn sapling_prover() -> &'static LocalTxProver {
-    Lazy::force(&SAPLING)
-}
+use sapling_crypto::circuit::pinned_verifying_keys as verifying_keys;
 
 /// A Sapling verification item, used as the request type of the service.
 ///
@@ -154,10 +138,10 @@ impl Drop for Verifier {
 
         // The validation is CPU-intensive; do it on a dedicated thread so it does not block.
         rayon::spawn_fifo(move || {
-            let (spend_vk, output_vk) = SAPLING.verifying_keys();
+            let (spend_vk, output_vk) = verifying_keys();
 
             // Validate the batch and send the result through the channel.
-            let res = batch.validate(&spend_vk, &output_vk, thread_rng());
+            let res = batch.validate(spend_vk, output_vk, thread_rng());
             let _ = tx.send(Some(res));
         });
     }
@@ -216,8 +200,8 @@ impl Service<BatchControl<Item>> for Verifier {
                 async move {
                     let start = std::time::Instant::now();
                     let spawn_result = tokio::task::spawn_blocking(move || {
-                        let (spend_vk, output_vk) = SAPLING.verifying_keys();
-                        batch.validate(&spend_vk, &output_vk, thread_rng())
+                        let (spend_vk, output_vk) = verifying_keys();
+                        batch.validate(spend_vk, output_vk, thread_rng())
                     })
                     .await;
                     let duration = start.elapsed().as_secs_f64();
@@ -259,9 +243,9 @@ pub fn verify_single(
         check.map_err(BoxError::from)?;
 
         let is_valid = tokio::task::spawn_blocking(move || {
-            let (spend_vk, output_vk) = SAPLING.verifying_keys();
+            let (spend_vk, output_vk) = verifying_keys();
 
-            mem::take(&mut verifier.batch).validate(&spend_vk, &output_vk, thread_rng())
+            mem::take(&mut verifier.batch).validate(spend_vk, output_vk, thread_rng())
         })
         .await
         .map_err(|_| BoxError::from("Sapling bundle validation thread panicked"))?;

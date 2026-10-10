@@ -84,8 +84,8 @@ when = "2026-04-17"
 trusted-publisher = "github:bytecodealliance/wit-bindgen"
 
 [[publisher.zakura-assets]]
-version = "0.3499045.0"
-when = "2026-09-29"
+version = "0.3505845.0"
+when = "2026-10-05"
 trusted-publisher = "github:zakura-core/zakura"
 
 [[publisher.zcash_history]]

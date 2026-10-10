@@ -7,7 +7,7 @@ use std::{
     io::Cursor,
     pin::Pin,
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
         Arc, Mutex as StdMutex, OnceLock,
     },
     task::{Context, Poll},
@@ -115,6 +115,8 @@ const LEGACY_GOSSIP_DUPLICATE_COOLDOWN: Duration = Duration::from_secs(30);
 const LEGACY_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const SOURCE_INVENTORY_MISSING_RETRIES: usize = 8;
 const SOURCE_INVENTORY_MISSING_RETRY_DELAY: Duration = Duration::from_millis(500);
+/// Distinct peers one request tries: the primary and up to two fallbacks.
+const MAX_LEGACY_REQUEST_ATTEMPTS: usize = 3;
 const LEGACY_REQUEST_READY_TIMEOUT: Duration = Duration::from_secs(10);
 /// Reserve half of each connection's stream-open budget for native ordered
 /// streams, reconnects, and other request clients.
@@ -2091,6 +2093,8 @@ pub struct ZakuraRequestClient {
     trace: ZakuraTrace,
     request_interval: Duration,
     next_request_at: Arc<Mutex<Instant>>,
+    /// Where the next request starts in the ready-peer list.
+    next_rotation: Arc<AtomicUsize>,
 }
 
 impl ZakuraRequestClient {
@@ -2124,6 +2128,7 @@ impl ZakuraRequestClient {
             trace,
             request_interval: Duration::from_nanos(interval_nanos),
             next_request_at: Arc::new(Mutex::new(Instant::now())),
+            next_rotation: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -2156,35 +2161,31 @@ impl ZakuraRequestClient {
         };
 
         let handles = self.ready_handles().await?;
-        let Some(primary) = select_handle(&handles, preferred.as_ref()) else {
-            return Err("no ready Zakura peer for legacy inventory request".into());
-        };
+        let rotation = self.next_rotation.fetch_add(1, Ordering::Relaxed);
+        let candidates = request_candidates(&handles, preferred.as_ref(), rotation);
 
         let request_kind = frame.kind();
-        let first_result = self
-            .request_one(primary.clone(), frame.clone(), request_kind)
-            .await;
-        match first_result {
-            Ok(response) if !all_inventory_missing(&response) => Ok(response),
-            Ok(response) => {
-                let Some(fallback) = select_fallback_handle(&handles, primary.peer_id()) else {
-                    if retry_source_missing && preferred.is_some() {
-                        return self
-                            .retry_source_missing(primary, frame, request_kind, response)
-                            .await;
-                    }
-                    return Ok(response);
-                };
-                self.request_one(fallback, frame, request_kind)
+        let mut missing_response = None;
+        let mut last_error = None;
+        for handle in &candidates {
+            match self
+                .request_one(handle.clone(), frame.clone(), request_kind)
+                .await
+            {
+                Ok(response) if !all_inventory_missing(&response) => return Ok(response),
+                Ok(response) => missing_response = Some(response),
+                Err(error) => last_error = Some(error),
+            }
+        }
+
+        match (missing_response, last_error, candidates.as_slice()) {
+            (Some(response), _, [only]) if retry_source_missing && preferred.is_some() => {
+                self.retry_source_missing(only.clone(), frame, request_kind, response)
                     .await
-                    .or(Ok(response))
             }
-            Err(error) => {
-                let Some(fallback) = select_fallback_handle(&handles, primary.peer_id()) else {
-                    return Err(error);
-                };
-                self.request_one(fallback, frame, request_kind).await
-            }
+            (Some(response), _, _) => Ok(response),
+            (None, Some(error), _) => Err(error),
+            (None, None, _) => Err("no ready Zakura peer for legacy inventory request".into()),
         }
     }
 
@@ -2350,31 +2351,26 @@ fn legacy_request_stream_rate(stream_open_rate_per_second: u32) -> u32 {
         .div_ceil(LEGACY_REQUEST_STREAM_RATE_DIVISOR)
 }
 
-fn select_handle(
+/// Orders the ready peers for one request: the preferred peer first, then the
+/// others starting at `rotation`, capped at [`MAX_LEGACY_REQUEST_ATTEMPTS`].
+///
+/// Rotating the start keeps a few unhelpful peers from always being tried
+/// first and crowding out the rest.
+fn request_candidates(
     handles: &[ZakuraPeerHandle],
     preferred: Option<&ZakuraPeerId>,
-) -> Option<ZakuraPeerHandle> {
-    // v1 controlled-network routing: source-less chain-sync requests use the
-    // first ready Zakura peer. Production spreading/rotation belongs with the
-    // future zakurad wiring milestone.
-    preferred
-        .and_then(|peer_id| {
-            handles
-                .iter()
-                .find(|handle| handle.peer_id() == peer_id)
-                .cloned()
-        })
-        .or_else(|| handles.first().cloned())
-}
-
-fn select_fallback_handle(
-    handles: &[ZakuraPeerHandle],
-    primary: &ZakuraPeerId,
-) -> Option<ZakuraPeerHandle> {
-    handles
+    rotation: usize,
+) -> Vec<ZakuraPeerHandle> {
+    let (mut candidates, others): (Vec<_>, Vec<_>) = handles
         .iter()
-        .find(|handle| handle.peer_id() != primary)
         .cloned()
+        .partition(|handle| Some(handle.peer_id()) == preferred);
+    if !others.is_empty() {
+        let start = rotation % others.len();
+        candidates.extend(others[start..].iter().chain(&others[..start]).cloned());
+    }
+    candidates.truncate(MAX_LEGACY_REQUEST_ATTEMPTS);
+    candidates
 }
 
 fn all_inventory_missing(response: &Response) -> bool {
@@ -3473,6 +3469,25 @@ mod tests {
         }
     }
 
+    /// Declines every request, so the sink resets the stream and the requester
+    /// sees a response with no frames.
+    #[derive(Clone, Debug)]
+    struct DecliningResponder;
+
+    impl Service<Request> for DecliningResponder {
+        type Response = Response;
+        type Error = BoxError;
+        type Future = std::future::Ready<Result<Response, BoxError>>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, _request: Request) -> Self::Future {
+            std::future::ready(Err("declined".into()))
+        }
+    }
+
     #[derive(Clone, Debug)]
     struct SlowRequestThenRecorder {
         release: tokio::sync::watch::Receiver<bool>,
@@ -4520,6 +4535,125 @@ mod tests {
 
         advertiser.shutdown().await;
         fallback.shutdown().await;
+        requester.shutdown().await;
+        Ok(())
+    }
+
+    /// The preferred peer goes first, the rest rotate with `rotation`, and the
+    /// list is capped at the attempt limit.
+    #[test]
+    fn request_candidates_prefer_source_and_rotate_the_rest() {
+        let handles: Vec<_> = (1..=5)
+            .map(|byte| {
+                let peer = ZakuraPeerId::new(vec![byte; 32]).expect("32-byte node id is valid");
+                let (sender, _receiver) = tokio::sync::mpsc::channel(1);
+                ZakuraPeerHandle::new_for_tests(peer, sender)
+            })
+            .collect();
+        let ids = |candidates: Vec<ZakuraPeerHandle>| -> Vec<ZakuraPeerId> {
+            candidates
+                .iter()
+                .map(|handle| handle.peer_id().clone())
+                .collect()
+        };
+        let peer = |index: usize| handles[index].peer_id().clone();
+
+        assert_eq!(
+            ids(request_candidates(&handles, None, 0)),
+            vec![peer(0), peer(1), peer(2)]
+        );
+        assert_eq!(
+            ids(request_candidates(&handles, None, 4)),
+            vec![peer(4), peer(0), peer(1)]
+        );
+        assert_eq!(
+            ids(request_candidates(&handles, Some(&peer(2)), 1)),
+            vec![peer(2), peer(1), peer(3)]
+        );
+
+        let unknown = ZakuraPeerId::new(vec![9; 32]).expect("32-byte node id is valid");
+        assert_eq!(
+            ids(request_candidates(&handles, Some(&unknown), 2)),
+            vec![peer(2), peer(3), peer(4)]
+        );
+        assert_eq!(
+            ids(request_candidates(&handles[..1], Some(&peer(0)), 3)),
+            vec![peer(0)]
+        );
+    }
+
+    /// F-46: two peers that answer with no frames cannot keep a request from
+    /// reaching an honest peer, and they stay connected.
+    #[tokio::test]
+    async fn request_adapter_routes_around_peers_that_return_no_frames() -> Result<(), BoxError> {
+        let _guard = zakura_test::init();
+        let block = Arc::new(Block::zcash_deserialize(
+            BLOCK_TESTNET_141042_BYTES.as_slice(),
+        )?);
+        let hash = block.hash();
+        let mut responders = Vec::new();
+        for seed in [74, 75] {
+            responders.push(
+                ZakuraTestNode::builder(seed)
+                    .service_from_supervisor(|supervisor| {
+                        Arc::new(LegacyGossipSink::spawn(DecliningResponder, supervisor))
+                    })
+                    .spawn()
+                    .await?,
+            );
+        }
+        responders.push(
+            ZakuraTestNode::builder(76)
+                .service_from_supervisor(move |supervisor| {
+                    Arc::new(LegacyGossipSink::spawn(
+                        SubstitutingBlockResponder { block },
+                        supervisor,
+                    ))
+                })
+                .spawn()
+                .await?,
+        );
+        let requester = ZakuraTestNode::builder(77)
+            .max_connections_per_ip(8)
+            .spawn()
+            .await?;
+        for responder in &responders {
+            requester
+                .connect_native(responder, TEST_NET_TIMEOUT)
+                .await?;
+        }
+        wait_registered_count(&requester, 3).await?;
+        let declining = node_peer_id(&responders[0]).await?;
+
+        let mut peer_set = requester.supervisor().subscribe();
+        peer_set.borrow_and_update();
+        let adapter = LegacyRequestAdapter::new(requester.supervisor());
+        for source in [None, Some(PeerSource::Zakura(declining))] {
+            for _ in 0..3 {
+                let response = adapter
+                    .request_from_source(
+                        Request::BlocksByHash(IndexSet::from([hash])),
+                        source.clone(),
+                    )
+                    .await?;
+                assert!(
+                    matches!(
+                        &response,
+                        Response::Blocks(blocks)
+                            if matches!(blocks.as_slice(), [InventoryResponse::Available((received, _))] if received.hash() == hash)
+                    ),
+                    "the honest peer must serve the block; got {response:?}"
+                );
+            }
+        }
+        assert!(
+            !peer_set.has_changed()?,
+            "declining peers are routed around, not disconnected"
+        );
+
+        for responder in responders {
+            responder.shutdown().await;
+        }
         requester.shutdown().await;
         Ok(())
     }

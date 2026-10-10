@@ -5067,6 +5067,8 @@ struct LegacyResponseReadState {
     items: usize,
     active_chunk_type: Option<u16>,
     active_chunk: Vec<u8>,
+    /// A NIL answered an inventory request; see `validate_nil`.
+    inventory_nil: bool,
 }
 
 impl super::regulation::ResponsePrecheck for LegacyResponseReadState {
@@ -5094,6 +5096,7 @@ impl LegacyResponseReadState {
             items: 0,
             active_chunk_type: None,
             active_chunk: Vec::new(),
+            inventory_nil: false,
         }
     }
 
@@ -5105,6 +5108,11 @@ impl LegacyResponseReadState {
         if frame.flags != 0 {
             return Err(OutboundRequestError::Fatal(
                 format!("unsupported legacy response flags: {}", frame.flags).into(),
+            ));
+        }
+        if self.inventory_nil {
+            return Err(OutboundRequestError::Fatal(
+                "legacy response frame after inventory nil".into(),
             ));
         }
 
@@ -5163,6 +5171,11 @@ impl LegacyResponseReadState {
     /// peer that stops early. A peer can already decline with an empty
     /// response, so failing closed here would only disconnect slow honest peers.
     fn finish(self) -> Result<(), OutboundRequestError> {
+        if self.inventory_nil {
+            return Err(OutboundRequestError::Local(
+                "legacy nil response to inventory request".into(),
+            ));
+        }
         if self.active_chunk_type.is_some() {
             return Err(OutboundRequestError::Local(
                 "incomplete legacy response chunk".into(),
@@ -5312,8 +5325,9 @@ impl LegacyResponseReadState {
     /// A lone NIL to `BlocksByHash` / `TransactionsById` is `Local`: an honest
     /// inbound service still in setup answers every request with NIL. Failing
     /// closed would disconnect it and buys nothing, since a peer can already
-    /// decline with an empty response. NIL after inventory frames cannot come
-    /// from the encoder, so it stays `Fatal`.
+    /// decline with an empty response. The encoder never mixes NIL with
+    /// inventory frames, so NIL is recorded here, any later frame is `Fatal`,
+    /// and `finish` reports the `Local` error only once the stream ends.
     fn validate_nil(
         &mut self,
         request_id: u64,
@@ -5345,9 +5359,8 @@ impl LegacyResponseReadState {
             | LegacyResponseKind::Nil => {}
             // `validate_frame` has already counted this frame.
             LegacyResponseKind::Blocks | LegacyResponseKind::Transactions if self.frames == 1 => {
-                return Err(OutboundRequestError::Local(
-                    "legacy nil response to inventory request".into(),
-                ));
+                self.inventory_nil = true;
+                return Ok(());
             }
             LegacyResponseKind::Blocks | LegacyResponseKind::Transactions => {
                 return Err(OutboundRequestError::Fatal(
@@ -10580,8 +10593,8 @@ mod tests {
 
     /// A lone, well-formed NIL answer to an inventory fetch is request-local, so
     /// the peer stays connected and the caller falls back; NIL to a Ping, NIL
-    /// with the wrong request id, and NIL after inventory frames stay
-    /// connection-fatal.
+    /// with the wrong request id, and NIL mixed with other frames in either
+    /// order stay connection-fatal.
     #[test]
     fn nil_response_is_local_for_inventory_and_fatal_for_ping() {
         let limits = test_connection_limits();
@@ -10618,8 +10631,10 @@ mod tests {
                 .expect("nil encodes to one frame")
             };
 
-            let result =
-                LegacyResponseReadState::new(budget()).validate_frame(request_id, &nil(request_id));
+            let mut lone = LegacyResponseReadState::new(budget());
+            let result = lone
+                .validate_frame(request_id, &nil(request_id))
+                .and_then(|()| lone.finish());
             if fatal {
                 assert!(
                     matches!(result, Err(OutboundRequestError::Fatal(_))),
@@ -10628,7 +10643,7 @@ mod tests {
             } else {
                 assert!(
                     matches!(result, Err(OutboundRequestError::Local(_))),
-                    "NIL to {request:?} must be Local; got {result:?}",
+                    "a lone NIL to {request:?} must be Local; got {result:?}",
                 );
             }
 
@@ -10640,23 +10655,36 @@ mod tests {
             );
 
             if let LegacyRequestFrame::BlocksByHash(hashes) = &request {
+                let missing = || {
+                    LegacyResponseCodec::encode_response(
+                        request_id,
+                        Response::Blocks(vec![InventoryResponse::Missing(hashes[0])]),
+                        limits.max_frame_bytes,
+                        limits.max_message_bytes,
+                    )
+                    .expect("missing response encodes")
+                    .pop()
+                    .expect("a missing entry encodes to one frame")
+                };
+
                 let mut after_items = LegacyResponseReadState::new(budget());
-                for frame in LegacyResponseCodec::encode_response(
-                    request_id,
-                    Response::Blocks(vec![InventoryResponse::Missing(hashes[0])]),
-                    limits.max_frame_bytes,
-                    limits.max_message_bytes,
-                )
-                .expect("missing response encodes")
-                {
-                    after_items
-                        .validate_frame(request_id, &frame)
-                        .expect("a missing entry is accepted");
-                }
+                after_items
+                    .validate_frame(request_id, &missing())
+                    .expect("a missing entry is accepted");
                 let result = after_items.validate_frame(request_id, &nil(request_id));
                 assert!(
                     matches!(result, Err(OutboundRequestError::Fatal(_))),
                     "NIL after inventory frames must stay Fatal; got {result:?}",
+                );
+
+                let mut before_items = LegacyResponseReadState::new(budget());
+                before_items
+                    .validate_frame(request_id, &nil(request_id))
+                    .expect("a first NIL is held until the stream ends");
+                let result = before_items.validate_frame(request_id, &missing());
+                assert!(
+                    matches!(result, Err(OutboundRequestError::Fatal(_))),
+                    "inventory frames after NIL must stay Fatal; got {result:?}",
                 );
             }
         }

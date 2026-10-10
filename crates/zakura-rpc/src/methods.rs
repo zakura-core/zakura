@@ -126,6 +126,7 @@ use types::{
     get_mempool_info::GetMempoolInfoResponse,
     get_mining_info::GetMiningInfoResponse,
     get_raw_mempool::{self, GetRawMempoolResponse},
+    get_standard_fee::GetStandardFeeResponse,
     long_poll::LongPollInput,
     network_info::{GetNetworkInfoResponse, NetworkInfo},
     peer_info::PeerInfo,
@@ -231,6 +232,7 @@ pub(crate) const RPC_METHOD_ACCESS: &[(&str, RpcAccess)] = &[
     ("ping", RpcAccess::Unauthenticated),
     ("validateaddress", RpcAccess::Unauthenticated),
     ("z_validateaddress", RpcAccess::Unauthenticated),
+    ("getstandardfee", RpcAccess::Unauthenticated),
     ("getblocksubsidy", RpcAccess::Unauthenticated),
     ("getdifficulty", RpcAccess::Unauthenticated),
     ("z_listunifiedreceivers", RpcAccess::Unauthenticated),
@@ -847,6 +849,17 @@ pub trait Rpc {
     /// - No notes
     #[method(name = "z_validateaddress")]
     async fn z_validate_address(&self, address: String) -> Result<ZValidateAddressResponse>;
+
+    /// Returns the recommended standard fee per logical action, in zatoshis.
+    ///
+    /// Currently returns Zakura's ZIP 317 marginal fee (`zip317::MARGINAL_FEE`), with `version` 0.
+    /// A dynamic estimate can replace this value without changing the parameters or
+    /// result shape.
+    ///
+    /// method: post
+    /// tags: wallet
+    #[method(name = "getstandardfee")]
+    async fn get_standard_fee(&self) -> Result<GetStandardFeeResponse>;
 
     /// Returns the block subsidy reward of the block at `height`, taking into account the mining slow start.
     /// Returns an error if `height` is less than the height of the first halving for the current network.
@@ -3939,6 +3952,13 @@ where
         let network = self.network.clone();
 
         z_validate_address(network, raw_address)
+    }
+
+    async fn get_standard_fee(&self) -> Result<GetStandardFeeResponse> {
+        Ok(GetStandardFeeResponse {
+            standard_fee: transaction::zip317::MARGINAL_FEE,
+            version: 0,
+        })
     }
 
     async fn get_block_subsidy(&self, height: Option<u32>) -> Result<GetBlockSubsidyResponse> {

@@ -33,7 +33,7 @@ use zakura_chain::{
 
 use crate::{
     protocol::{
-        external::InventoryHash,
+        external::{InventoryHash, MIN_INV_HASH_SIZE},
         internal::{InventoryResponse, PeerSource, Request, Response},
     },
     BoxError, MAX_TX_INV_IN_SENT_MESSAGE,
@@ -259,6 +259,16 @@ impl LegacyGossipFrame {
     }
 }
 
+/// The inventory IDs an outbound legacy request asked for, used by
+/// `LegacyResponseCodec::decode_response` to reject unsolicited items.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) enum RequestedInventory {
+    /// Requested block hashes.
+    Blocks(HashSet<block::Hash>),
+    /// Requested transaction IDs, in the same form as the request encoding.
+    Transactions(HashSet<UnminedTxId>),
+}
+
 /// A typed legacy inventory request carried by Zakura stream kind 3.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum LegacyRequestFrame {
@@ -416,9 +426,11 @@ impl LegacyRequestFrame {
                 Ok(Self::Ping)
             }
             MSG_REQUEST_PUSH_TRANSACTION => {
-                let mut reader = Cursor::new(frame.payload.as_slice());
-                let transaction = Transaction::zcash_deserialize(&mut reader)?;
-                reject_trailing(&reader)?;
+                let mut bytes = frame.payload.as_slice();
+                let transaction = Transaction::zcash_deserialize_from_slice(&mut bytes)?;
+                if !bytes.is_empty() {
+                    return Err(LegacyGossipError::TrailingBytes);
+                }
                 Ok(Self::PushTransaction(UnminedTx::from(transaction)))
             }
             message_type => Err(LegacyGossipError::UnknownMessageType(message_type)),
@@ -611,8 +623,13 @@ impl LegacyResponseCodec {
         request_id: u64,
         request_kind: LegacyRequestKind,
         frames: Vec<Frame>,
-        requested_block_hashes: Option<&HashSet<block::Hash>>,
+        requested: Option<&RequestedInventory>,
     ) -> Result<Response, LegacyGossipError> {
+        let (requested_block_hashes, requested_transaction_ids) = match requested {
+            Some(RequestedInventory::Blocks(hashes)) => (Some(hashes), None),
+            Some(RequestedInventory::Transactions(ids)) => (None, Some(ids)),
+            None => (None, None),
+        };
         let mut blocks = Vec::new();
         let mut transactions = Vec::new();
         let mut block_hashes = Vec::new();
@@ -633,9 +650,11 @@ impl LegacyResponseCodec {
                         return Err(LegacyGossipError::UnexpectedResponse("Blocks"));
                     }
                     if let Some(bytes) = reassembler.accept(&frame.payload)? {
-                        let block = Arc::new(Block::zcash_deserialize(&mut Cursor::new(
-                            bytes.as_slice(),
-                        ))?);
+                        let mut remaining = bytes.as_slice();
+                        let block = Arc::new(Block::zcash_deserialize_from_slice(&mut remaining)?);
+                        if !remaining.is_empty() {
+                            return Err(LegacyGossipError::TrailingBytes);
+                        }
                         // Bind the delivered block to a hash we actually requested.
                         // Without this, a peer can substitute any other valid block
                         // for the one requested, corrupting downstream hash/source
@@ -655,12 +674,23 @@ impl LegacyResponseCodec {
                         return Err(LegacyGossipError::UnexpectedResponse("Transactions"));
                     }
                     if let Some(bytes) = reassembler.accept(&frame.payload)? {
+                        let mut remaining = bytes.as_slice();
                         let transaction =
-                            Transaction::zcash_deserialize(&mut Cursor::new(bytes.as_slice()))?;
-                        transactions.push(InventoryResponse::Available((
-                            UnminedTx::from(transaction),
-                            None,
-                        )));
+                            Transaction::zcash_deserialize_from_slice(&mut remaining)?;
+                        if !remaining.is_empty() {
+                            return Err(LegacyGossipError::TrailingBytes);
+                        }
+                        let transaction = UnminedTx::from(transaction);
+                        // Bind the delivered transaction to an ID we requested, as
+                        // for blocks above.
+                        if let Some(requested) = requested_transaction_ids {
+                            if !requested.contains(&transaction.id()) {
+                                return Err(LegacyGossipError::UnsolicitedTransaction(
+                                    transaction.id(),
+                                ));
+                            }
+                        }
+                        transactions.push(InventoryResponse::Available((transaction, None)));
                     }
                 }
                 MSG_RESPONSE_MISSING_BLOCKS => {
@@ -684,6 +714,11 @@ impl LegacyResponseCodec {
                     }
                     reassembler.reject_if_active()?;
                     for id in decode_tx_ids_response(request_id, frame.payload)? {
+                        if let Some(requested) = requested_transaction_ids {
+                            if !requested.contains(&id) {
+                                return Err(LegacyGossipError::UnsolicitedTransaction(id));
+                            }
+                        }
                         transactions.push(InventoryResponse::Missing(id));
                     }
                 }
@@ -819,7 +854,7 @@ fn write_hash_list(out: &mut Vec<u8>, hashes: &[block::Hash]) -> Result<(), Lega
 
 fn read_hash_list(reader: &mut Cursor<&[u8]>) -> Result<Vec<block::Hash>, LegacyGossipError> {
     let count = bounded_inventory_count(reader)?;
-    let mut hashes = Vec::with_capacity(count);
+    let mut hashes = Vec::with_capacity(fitting_capacity(reader, count, HASH_LEN));
     for _ in 0..count {
         hashes.push(block::Hash::zcash_deserialize(&mut *reader)?);
     }
@@ -844,7 +879,7 @@ fn read_block_locator(
     reader: &mut Cursor<&[u8]>,
 ) -> Result<(Vec<block::Hash>, Option<block::Hash>), LegacyGossipError> {
     let count = bounded_block_locator_count(reader)?;
-    let mut known_blocks = Vec::with_capacity(count);
+    let mut known_blocks = Vec::with_capacity(fitting_capacity(reader, count, HASH_LEN));
     for _ in 0..count {
         known_blocks.push(block::Hash::zcash_deserialize(&mut *reader)?);
     }
@@ -865,7 +900,7 @@ fn write_tx_id_list(out: &mut Vec<u8>, ids: &[UnminedTxId]) -> Result<(), Legacy
 
 fn read_tx_id_list(reader: &mut Cursor<&[u8]>) -> Result<Vec<UnminedTxId>, LegacyGossipError> {
     let count = bounded_inventory_count(reader)?;
-    let mut ids = Vec::with_capacity(count);
+    let mut ids = Vec::with_capacity(fitting_capacity(reader, count, MIN_INV_HASH_SIZE));
     for _ in 0..count {
         let inv = InventoryHash::zcash_deserialize(&mut *reader)?;
         let Some(id) = inv.unmined_tx_id() else {
@@ -874,6 +909,16 @@ fn read_tx_id_list(reader: &mut Cursor<&[u8]>) -> Result<Vec<UnminedTxId>, Legac
         ids.push(id);
     }
     Ok(ids)
+}
+
+/// Byte length of an encoded block hash.
+const HASH_LEN: usize = 32;
+
+/// Limits a declared `count` to the `item_len`-byte items the unread payload
+/// can hold, so a short frame cannot reserve its full declared capacity.
+fn fitting_capacity(reader: &Cursor<&[u8]>, count: usize, item_len: usize) -> usize {
+    let read = usize::try_from(reader.position()).unwrap_or(usize::MAX);
+    count.min(reader.get_ref().len().saturating_sub(read) / item_len)
 }
 
 fn bounded_inventory_count(reader: &mut Cursor<&[u8]>) -> Result<usize, LegacyGossipError> {
@@ -2192,10 +2237,15 @@ impl ZakuraRequestClient {
     ) -> Result<Response, BoxError> {
         self.wait_for_request_slot().await;
         let request_id = NEXT_LEGACY_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
-        // Capture the requested block hashes (if any) before consuming the frame,
-        // so the response can be bound to a hash we actually asked for.
-        let requested_block_hashes: Option<HashSet<block::Hash>> = match &frame {
-            LegacyRequestFrame::BlocksByHash(hashes) => Some(hashes.iter().copied().collect()),
+        // Capture the requested inventory (if any) before consuming the frame,
+        // so the response can be bound to IDs we actually asked for.
+        let requested = match &frame {
+            LegacyRequestFrame::BlocksByHash(hashes) => {
+                Some(RequestedInventory::Blocks(hashes.iter().copied().collect()))
+            }
+            LegacyRequestFrame::TransactionsById(ids) => Some(RequestedInventory::Transactions(
+                ids.iter().copied().collect(),
+            )),
             _ => None,
         };
         let frame = frame.encode_frame()?;
@@ -2256,7 +2306,7 @@ impl ZakuraRequestClient {
             request_id,
             request_kind,
             response,
-            requested_block_hashes.as_ref(),
+            requested.as_ref(),
         ) {
             Ok(response) => response,
             Err(error) => {
@@ -2269,6 +2319,11 @@ impl ZakuraRequestClient {
                         error.to_string(),
                     )
                 });
+                // Match the transport's `Fatal` handling, so source-attributed
+                // retries cannot pick the same misbehaving peer again.
+                if error.is_peer_fault() {
+                    self.supervisor.disconnect_peer(handle.peer_id()).await;
+                }
                 return Err(error.into());
             }
         };
@@ -3111,6 +3166,10 @@ pub enum LegacyGossipError {
     /// to the requested hash. Treated as a peer fault.
     #[error("legacy block response contained an unrequested block: {0:?}")]
     UnsolicitedBlock(block::Hash),
+    /// The peer returned an available or missing transaction ID we did not
+    /// request. Treated as a peer fault.
+    #[error("legacy transaction response contained an unrequested transaction: {0:?}")]
+    UnsolicitedTransaction(UnminedTxId),
     /// Zcash serialization failed.
     #[error(transparent)]
     Serialization(#[from] SerializationError),
@@ -3120,6 +3179,42 @@ pub enum LegacyGossipError {
     /// Integer conversion failed while checking a peer-controlled bound.
     #[error(transparent)]
     Integer(#[from] std::num::TryFromIntError),
+}
+
+impl LegacyGossipError {
+    /// Returns true if this error, from decoding a peer's response, proves the
+    /// peer violated the protocol, so its connection should be closed.
+    ///
+    /// The transport already rejects the structural variants as `Fatal` before
+    /// decoding; the live addition here is requested-item binding
+    /// (`UnsolicitedBlock`, `UnsolicitedTransaction`). Missing or unexpected
+    /// responses are not faults on their own: the caller falls back to another
+    /// peer.
+    pub(crate) fn is_peer_fault(&self) -> bool {
+        match self {
+            Self::UnsupportedFlags(_)
+            | Self::UnknownMessageType(_)
+            | Self::EmptyTransactionAdvertisement
+            | Self::TooManyInventoryItems(_)
+            | Self::TooManyBlockLocatorHashes(_)
+            | Self::TooManyHeaders(_)
+            | Self::NonTransactionInventory
+            | Self::TrailingBytes
+            | Self::WrongRequestId { .. }
+            | Self::IncompleteResponseChunk
+            | Self::TruncatedResponse
+            | Self::OversizedResponse(_)
+            | Self::UnsolicitedBlock(_)
+            | Self::UnsolicitedTransaction(_)
+            | Self::Serialization(_) => true,
+            Self::UnsupportedRequest(_)
+            | Self::ResponseAggregateBudget(_)
+            | Self::UnexpectedResponse(_)
+            | Self::MissingResponse(_)
+            | Self::Io(_)
+            | Self::Integer(_) => false,
+        }
+    }
 }
 
 impl fmt::Display for LegacyGossipFrame {
@@ -3156,6 +3251,9 @@ impl fmt::Display for LegacyRequestFrame {
         }
     }
 }
+
+#[cfg(test)]
+pub(super) mod bounded_decoding;
 
 #[cfg(test)]
 mod tests {
@@ -3349,6 +3447,29 @@ mod tests {
                 }
             };
             std::future::ready(Ok(response))
+        }
+    }
+
+    /// Answers every block request with its block, whatever hash was requested.
+    #[derive(Clone, Debug)]
+    struct SubstitutingBlockResponder {
+        block: Arc<Block>,
+    }
+
+    impl Service<Request> for SubstitutingBlockResponder {
+        type Response = Response;
+        type Error = BoxError;
+        type Future = std::future::Ready<Result<Response, BoxError>>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, _request: Request) -> Self::Future {
+            std::future::ready(Ok(Response::Blocks(vec![InventoryResponse::Available((
+                self.block.clone(),
+                None,
+            ))])))
         }
     }
 
@@ -3937,6 +4058,45 @@ mod tests {
             blocks.as_slice(),
             [InventoryResponse::Available((received, None))] if received.hash() == block.hash()
         ));
+
+        node_a.shutdown().await;
+        node_b.shutdown().await;
+        Ok(())
+    }
+
+    /// F-38: an unsolicited block response is a peer fault, so the requester
+    /// disconnects the peer instead of leaving it eligible for source-attributed
+    /// retries.
+    #[tokio::test]
+    async fn request_adapter_disconnects_peer_on_unsolicited_block() -> Result<(), BoxError> {
+        let _guard = zakura_test::init();
+        let block = Arc::new(Block::zcash_deserialize(
+            BLOCK_TESTNET_141042_BYTES.as_slice(),
+        )?);
+        let node_a = ZakuraTestNode::builder(70)
+            .service_from_supervisor(move |supervisor| {
+                Arc::new(LegacyGossipSink::spawn(
+                    SubstitutingBlockResponder { block },
+                    supervisor,
+                ))
+            })
+            .spawn()
+            .await?;
+        let node_b = ZakuraTestNode::builder(71).spawn().await?;
+        node_b.connect_native(&node_a, TEST_NET_TIMEOUT).await?;
+        wait_registered_count(&node_b, 1).await?;
+        let a_peer_id = node_peer_id(&node_a).await?;
+
+        let adapter = LegacyRequestAdapter::new(node_b.supervisor());
+        let result = adapter
+            .request_from_source(
+                Request::BlocksByHash(IndexSet::from([block_hash(90)])),
+                Some(PeerSource::Zakura(a_peer_id)),
+            )
+            .await;
+
+        assert!(result.is_err(), "an unsolicited block must not be returned");
+        wait_registered_count(&node_b, 0).await?;
 
         node_a.shutdown().await;
         node_b.shutdown().await;
@@ -5338,7 +5498,7 @@ mod tests {
         // A peer substitutes a real block we never asked for. Bound against a
         // requested-hash set that does not contain it, the codec rejects it
         // instead of correlating the response by request id and kind alone.
-        let unrelated: HashSet<block::Hash> = std::iter::once(block_hash(99)).collect();
+        let unrelated = RequestedInventory::Blocks(HashSet::from([block_hash(99)]));
         assert!(
             matches!(
                 LegacyResponseCodec::decode_response(
@@ -5353,7 +5513,7 @@ mod tests {
         );
 
         // The same response is accepted when its hash is among those requested.
-        let requested: HashSet<block::Hash> = std::iter::once(block.hash()).collect();
+        let requested = RequestedInventory::Blocks(HashSet::from([block.hash()]));
         let response = LegacyResponseCodec::decode_response(
             7,
             LegacyRequestKind::Blocks,
@@ -5368,6 +5528,94 @@ mod tests {
                     [InventoryResponse::Available((received, None))]
                         if received.hash() == block.hash()
                 )
+        ));
+
+        Ok(())
+    }
+
+    /// F-36: transaction responses, available or missing, must be bound to the
+    /// requested IDs, as block responses are.
+    #[test]
+    fn decode_response_binds_transactions_to_requested_ids() -> Result<(), BoxError> {
+        let transaction = UnminedTx::from(empty_v5_transaction(21));
+        let missing_id = witnessed_tx_id(22);
+        let frame_cap = u32::try_from(MAX_PROTOCOL_MESSAGE_LEN)?;
+        let frames = LegacyResponseCodec::encode_response(
+            7,
+            Response::Transactions(vec![
+                InventoryResponse::Available((transaction.clone(), None)),
+                InventoryResponse::Missing(missing_id),
+            ]),
+            frame_cap,
+            frame_cap,
+        )?;
+
+        // Each delivered ID is rejected when it is the one we did not request.
+        for unrequested in [transaction.id(), missing_id] {
+            let partial = RequestedInventory::Transactions(
+                [transaction.id(), missing_id]
+                    .into_iter()
+                    .filter(|id| *id != unrequested)
+                    .collect(),
+            );
+            assert!(
+                matches!(
+                    LegacyResponseCodec::decode_response(
+                        7,
+                        LegacyRequestKind::Transactions,
+                        frames.clone(),
+                        Some(&partial),
+                    ),
+                    Err(LegacyGossipError::UnsolicitedTransaction(id)) if id == unrequested,
+                ),
+                "an unrequested transaction ID must be rejected",
+            );
+        }
+
+        let requested =
+            RequestedInventory::Transactions(HashSet::from([transaction.id(), missing_id]));
+        let response = LegacyResponseCodec::decode_response(
+            7,
+            LegacyRequestKind::Transactions,
+            frames,
+            Some(&requested),
+        )?;
+        assert!(matches!(
+            response,
+            Response::Transactions(transactions)
+                if matches!(
+                    transactions.as_slice(),
+                    [
+                        InventoryResponse::Available((received, None)),
+                        InventoryResponse::Missing(missing),
+                    ] if received.id() == transaction.id() && *missing == missing_id
+                )
+        ));
+
+        Ok(())
+    }
+
+    /// F-37: a valid transaction padded with junk bytes is rejected.
+    #[test]
+    fn decode_response_rejects_padded_transaction() -> Result<(), BoxError> {
+        let frame_cap = u32::try_from(MAX_PROTOCOL_MESSAGE_LEN)?;
+        let mut frames = LegacyResponseCodec::encode_response(
+            7,
+            Response::Transactions(vec![InventoryResponse::Available((
+                UnminedTx::from(empty_v5_transaction(23)),
+                None,
+            ))]),
+            frame_cap,
+            frame_cap,
+        )?;
+        let [frame] = frames.as_mut_slice() else {
+            panic!("a small transaction encodes as one frame");
+        };
+        frame.payload.extend_from_slice(&[0; 16]);
+
+        assert!(matches!(
+            LegacyResponseCodec::decode_response(7, LegacyRequestKind::Transactions, frames, None),
+            Err(LegacyGossipError::TrailingBytes),
         ));
 
         Ok(())

@@ -264,10 +264,11 @@ def stage_fleet_deploy(ctx: Context) -> None:
         validate_target(ctx)
         install_compat(ctx)
     activate_fleet(ctx)
-    webhook = os.environ.get("SLACK_WEB_HOOK", "")
+    secrets = {key: os.environ.get(key, "") for key in
+               ("SLACK_WEB_HOOK", "PAGERDUTY_ROUTING_KEY")}
     ctx.record("fleet env", ctx.local(
-        "fleet-env", "--env-file", str(FLEET_ENV), "--webhook-stdin",
-        stdin=webhook.encode()))
+        "fleet-env", "--env-file", str(FLEET_ENV), "--secrets-stdin",
+        stdin=json.dumps(secrets).encode()))
     ctx.systemctl("daemon-reload")
     ctx.systemctl("enable", FLEET_UNIT)
     ctx.systemctl("restart", FLEET_UNIT)

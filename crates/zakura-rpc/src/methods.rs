@@ -236,6 +236,7 @@ pub(crate) const RPC_METHOD_ACCESS: &[(&str, RpcAccess)] = &[
     ("z_listunifiedreceivers", RpcAccess::Unauthenticated),
     ("invalidateblock", RpcAccess::Admin),
     ("reconsiderblock", RpcAccess::Admin),
+    ("preciousblock", RpcAccess::Admin),
     ("generate", RpcAccess::Test),
     ("addnode", RpcAccess::Test),
     ("rpc.discover", RpcAccess::Unauthenticated),
@@ -280,6 +281,8 @@ pub(super) const PARAM_VERBOSITY_DESC: &str = "Whether to include verbose output
 pub(super) const PARAM_N_DESC: &str = "The output index in the transaction.";
 pub(super) const PARAM_INCLUDE_MEMPOOL_DESC: &str =
     "Whether to include mempool transactions in the response.";
+pub(super) const RESULT_PRECIOUSBLOCK_DESC: &str =
+    "Always null. Errors are returned as JSON-RPC errors.";
 
 mod hex_serde;
 
@@ -909,6 +912,28 @@ pub trait Rpc {
     /// - `block_hash`: (hex-encoded block hash, required) The block hash to reconsider.
     #[method(name = "reconsiderblock")]
     async fn reconsider_block(&self, block_hash: String) -> Result<Vec<block::Hash>>;
+
+    /// Treats a block as if it were received before other chain tips with the same work.
+    ///
+    /// It applies to a current non-finalized chain tip with at least as much work as the best tip.
+    /// A later call overrides an earlier one. A chain with more work still wins. For any other
+    /// known block, such as a block that is not a chain tip, a finalized block, an invalidated
+    /// block, or a tip with less work than the best tip, the call succeeds and changes nothing. An
+    /// unknown hash returns error code -5, and a malformed hash returns error code -8.
+    ///
+    /// The preference is local to this node. It is kept while the block is in any non-finalized
+    /// chain or any retained invalidation record. It is forgotten once the block is in neither,
+    /// for example when a fork-limit eviction removes it from its last chain, or when its
+    /// invalidation record is discarded while it is in no chain. A block downloaded again after
+    /// that is not preferred. It is not kept across restarts.
+    /// See Bitcoin Core's
+    /// [`preciousblock`](https://developer.bitcoin.org/reference/rpc/preciousblock.html).
+    ///
+    /// # Parameters
+    ///
+    /// - `block_hash`: (hex-encoded block hash, required) The hash of the block to prefer.
+    #[method(name = "preciousblock")]
+    async fn precious_block(&self, block_hash: String) -> Result<()>;
 
     #[method(name = "generate")]
     /// Mine blocks immediately. Returns the block hashes of the generated blocks.
@@ -4096,6 +4121,30 @@ where
             zakura_state::Response::Reconsidered(block_hashes) => block_hashes,
             _ => unreachable!("unmatched response to a reconsider block request"),
         })
+    }
+
+    async fn precious_block(&self, block_hash: String) -> Result<()> {
+        let block_hash = block_hash
+            .parse()
+            .map_error(server::error::LegacyCode::InvalidParameter)?;
+
+        match self
+            .state
+            .clone()
+            .oneshot(zakura_state::Request::PreciousBlock(block_hash))
+            .await
+        {
+            Ok(zakura_state::Response::Precious) => Ok(()),
+            Ok(_) => unreachable!("unmatched response to a precious block request"),
+            Err(error) => match error.downcast_ref::<zakura_state::PreciousError>() {
+                Some(zakura_state::PreciousError::BlockNotFound(_)) => Err(ErrorObject::owned(
+                    server::error::LegacyCode::InvalidAddressOrKey.into(),
+                    "Block not found",
+                    None::<()>,
+                )),
+                _ => Err(error).map_misc_error(),
+            },
+        }
     }
 
     async fn generate(&self, num_blocks: u32) -> Result<Vec<Hash>> {

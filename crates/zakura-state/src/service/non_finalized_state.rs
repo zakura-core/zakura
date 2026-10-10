@@ -5,6 +5,7 @@
 use std::{
     collections::{BTreeSet, HashMap},
     mem,
+    num::NonZeroU64,
     path::{Path, PathBuf},
     sync::Arc,
     time::Instant,
@@ -23,7 +24,7 @@ use crate::{
     constants::{MAX_INVALIDATED_BLOCKS, MAX_NON_FINALIZED_CHAIN_FORKS},
     error::ReconsiderError,
     request::{ContextuallyVerifiedBlock, FinalizableBlock},
-    service::{check, finalized_state::ZakuraDb, InvalidateError},
+    service::{check, finalized_state::ZakuraDb, InvalidateError, PreciousError},
     SemanticallyVerifiedBlock, ValidateContextError, WatchReceiver,
 };
 
@@ -98,6 +99,19 @@ pub struct NonFinalizedState {
     /// state.
     invalidated_blocks: IndexMap<Height, Arc<Vec<ContextuallyVerifiedBlock>>>,
 
+    /// The sequence of the latest `preciousblock` call, so later calls win equal-work ties.
+    ///
+    /// Operator preferences are local and are not restored from the backup after a restart.
+    precious_sequence: u64,
+
+    /// The latest `preciousblock` sequence of each preferred block, so chains reverted to that
+    /// block get its preference back, and chains with the same tip compare equal.
+    ///
+    /// Every operation that can remove blocks drops, once it finishes, the preferences of blocks
+    /// that are in no chain and not in `invalidated_blocks`. So the map stays bounded by the
+    /// non-finalized state, and an evicted or discarded block downloaded again has no preference.
+    precious_blocks: HashMap<block::Hash, NonZeroU64>,
+
     // Configuration
     //
     /// The configured Zcash network.
@@ -133,6 +147,8 @@ impl Clone for NonFinalizedState {
             chain_set: self.chain_set.clone(),
             network: self.network.clone(),
             invalidated_blocks: self.invalidated_blocks.clone(),
+            precious_sequence: self.precious_sequence,
+            precious_blocks: self.precious_blocks.clone(),
             should_count_metrics: self.should_count_metrics,
         }
     }
@@ -145,6 +161,8 @@ impl NonFinalizedState {
             chain_set: Default::default(),
             network: network.clone(),
             invalidated_blocks: Default::default(),
+            precious_sequence: 0,
+            precious_blocks: HashMap::new(),
             should_count_metrics: true,
         }
     }
@@ -281,7 +299,7 @@ impl NonFinalizedState {
         F: FnOnce(&mut BTreeSet<Arc<Chain>>),
     {
         let inserted_tip = chain.non_finalized_tip_hash();
-        self.chain_set.insert(chain);
+        self.chain_set.insert(self.with_tip_preference(chain));
 
         chain_filter(&mut self.chain_set);
 
@@ -296,6 +314,44 @@ impl NonFinalizedState {
                 .clone();
             self.chain_set.remove(&evicted);
         }
+    }
+
+    /// Returns `chain` with the `preciousblock` preference of its current tip.
+    ///
+    /// Chain::cmp reads the preference, so call this only while the chain is outside the set.
+    fn with_tip_preference(&self, mut chain: Arc<Chain>) -> Arc<Chain> {
+        let tip = chain.non_finalized_tip_hash();
+        let precious = self
+            .precious_blocks
+            .get(&tip)
+            .map(|&sequence| (tip, sequence));
+        if chain.precious() != precious {
+            Arc::make_mut(&mut chain).set_precious(precious);
+        }
+        chain
+    }
+
+    /// Forget preferences for blocks that are no longer in a chain or invalidated.
+    ///
+    /// Call this only once an operation has finished changing the chains and
+    /// `invalidated_blocks`, because blocks can be briefly in neither while it runs.
+    fn retain_precious_blocks(&mut self) {
+        let stale: Vec<block::Hash> = self
+            .precious_blocks
+            .keys()
+            .copied()
+            .filter(|hash| !self.any_chain_contains(hash) && !self.is_invalidated(hash))
+            .collect();
+        for hash in stale {
+            self.precious_blocks.remove(&hash);
+        }
+    }
+
+    /// Returns true if `hash` is in `invalidated_blocks`.
+    fn is_invalidated(&self, hash: &block::Hash) -> bool {
+        self.invalidated_blocks
+            .values()
+            .any(|blocks| blocks.iter().any(|block| block.hash == *hash))
     }
 
     /// Insert `chain` into `self.chain_set`, then limit the number of tracked chains.
@@ -317,6 +373,12 @@ impl NonFinalizedState {
         let mut evicted: Vec<_> = evicted.into_iter().collect();
         evicted.sort_unstable_by_key(|hash| hash.0);
         evicted
+    }
+
+    /// Returns the latest `preciousblock` sequence, and the sequence of each preferred block.
+    #[cfg(test)]
+    pub(crate) fn precious_preferences(&self) -> (u64, &HashMap<block::Hash, NonZeroU64>) {
+        (self.precious_sequence, &self.precious_blocks)
     }
 
     #[cfg(test)]
@@ -381,6 +443,7 @@ impl NonFinalizedState {
         // Remove all invalidated_blocks at or below the finalized height
         self.invalidated_blocks
             .retain(|height, _blocks| *height >= best_chain_root.height);
+        self.retain_precious_blocks();
 
         self.update_metrics_for_chains();
 
@@ -434,6 +497,8 @@ impl NonFinalizedState {
         self.insert_with(modified_chain, |chain_set| {
             chain_set.retain(|chain| chain.non_finalized_tip_hash() != parent_hash)
         });
+        // The fork limit can evict a chain.
+        self.retain_precious_blocks();
 
         self.update_metrics_for_committed_block(height, hash);
 
@@ -483,10 +548,68 @@ impl NonFinalizedState {
         while self.invalidated_blocks.len() > MAX_INVALIDATED_BLOCKS {
             self.invalidated_blocks.shift_remove_index(0);
         }
+        // The new record keeps the removed blocks' preferences, but a replaced or dropped
+        // record, or a fork-limit eviction, can discard blocks.
+        self.retain_precious_blocks();
 
         self.update_metrics_for_chains();
 
         Ok(block_hash)
+    }
+
+    /// Prefers the chain tip with hash `block_hash` over every other tip with the same work, as if
+    /// it had been received first.
+    ///
+    /// A later call overrides an earlier one. Greater work still wins, so a block with less work
+    /// than the best tip, including a block below another chain tip, an invalidated block, or a
+    /// finalized block, leaves the state unchanged.
+    ///
+    /// The preference lasts while the block is in a chain or an invalidation record, so a block
+    /// that is evicted or discarded and then downloaded again is not preferred.
+    ///
+    /// Returns [`PreciousError::BlockNotFound`] if the block is not known to either state.
+    /// Invalidated blocks are known, like Bitcoin Core's block index.
+    pub fn precious_block(
+        &mut self,
+        block_hash: block::Hash,
+        finalized_state: &ZakuraDb,
+    ) -> Result<(), PreciousError> {
+        let Some(chain) = self
+            .chain_set
+            .iter()
+            .find(|chain| chain.non_finalized_tip_hash() == block_hash)
+            .cloned()
+        else {
+            if self.any_chain_contains(&block_hash)
+                || self.is_invalidated(&block_hash)
+                || finalized_state.height(block_hash).is_some()
+            {
+                return Ok(());
+            }
+            return Err(PreciousError::BlockNotFound(block_hash));
+        };
+
+        let best_work = self
+            .best_chain()
+            .expect("the chain set contains the chain found above")
+            .partial_cumulative_work;
+        if chain.partial_cumulative_work < best_work {
+            return Ok(());
+        }
+
+        self.precious_sequence = self.precious_sequence.saturating_add(1);
+        let sequence = NonZeroU64::new(self.precious_sequence)
+            .expect("a saturating increment from zero is at least one");
+        self.precious_blocks.insert(block_hash, sequence);
+        self.retain_precious_blocks();
+
+        // Chain::cmp reads the preference, so change it only while the chain is outside the set.
+        // Chains with the same tip compare equal, so the set holds one chain for this tip.
+        self.chain_set.remove(&chain);
+        let chain = self.with_tip_preference(chain);
+        self.chain_set.insert(chain);
+
+        Ok(())
     }
 
     /// Reconsiders a previously invalidated block and its descendants into the non-finalized state
@@ -573,6 +696,8 @@ impl NonFinalizedState {
         self.insert_with(Arc::new(modified_chain), |chain_set| {
             chain_set.retain(|chain| chain.non_finalized_tip_hash() != root_parent_hash)
         });
+        // The fork limit can evict a chain, and finalized records were dropped above.
+        self.retain_precious_blocks();
 
         self.update_metrics_for_committed_block(tip_height, tip_hash);
 
@@ -644,6 +769,8 @@ impl NonFinalizedState {
 
         // If the block is valid, add the new chain fork to the set of recent chains.
         self.insert(chain);
+        // The fork limit can evict a chain.
+        self.retain_precious_blocks();
         self.update_metrics_for_committed_block(height, hash);
 
         Ok(())

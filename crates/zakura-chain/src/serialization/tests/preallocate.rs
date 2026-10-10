@@ -11,7 +11,84 @@ use crate::serialization::{
     MAX_PROTOCOL_MESSAGE_LEN,
 };
 
+/// A declared count that the input could hold is still only credible, not proven:
+/// an element can cost several times its minimum encoding once decoded. Reserving
+/// it in full would make the bound proportional to the message instead of constant,
+/// which is the deserializer-level case of GHSA-xr93-pcq3-pxf8.
+#[test]
+fn a_fitting_count_still_reserves_within_the_initial_cap() {
+    use crate::{serialization::ZcashReader, transparent};
+
+    /// Enough outputs that an eager reservation would dwarf the cap.
+    const COUNT: usize = 100_000;
+
+    let minimum = usize::try_from(transparent::Output::min_serialized_size()).unwrap();
+    // Exactly enough bytes for the declared count, so the input-size check passes.
+    let mut payload = vec![0u8; COUNT * minimum];
+    // An amount above the money supply, so element zero fails after eight bytes
+    // and the rest of the input is never read.
+    payload[..8].copy_from_slice(&u64::MAX.to_le_bytes());
+
+    let (result, allocations) = zakura_test::allocations::measure(|| {
+        ZcashReader::from_slice(&mut payload.as_slice())
+            .read_external_count::<transparent::Output>(COUNT)
+    });
+
+    assert!(result.is_err(), "the first amount is not a valid value");
+    let capped = MAX_INITIAL_ALLOCATION * std::mem::size_of::<transparent::Output>();
+    assert!(
+        allocations.peak_live_bytes <= capped,
+        "reserved {} bytes for a declared {COUNT} elements; the cap allows {capped}",
+        allocations.peak_live_bytes,
+    );
+}
+
+/// Counted slice decoding rejects any nonempty collection whose element minimum is
+/// zero, so every decodable `TrustedPreallocate` type must supply one. Rust cannot
+/// enumerate trait impls, so new types must be added here; `zakura-network` checks
+/// its own types in `protocol::external::tests::preallocate`.
+#[test]
+fn every_decodable_preallocate_type_has_a_nonzero_minimum() {
+    use crate::{
+        block, orchard,
+        primitives::{reddsa, redjubjub, Bctv14Proof, Groth16Proof},
+        sapling, sprout, transaction, transparent,
+    };
+
+    macro_rules! assert_nonzero_minimum {
+        ($($ty:ty),+ $(,)?) => {$(
+            assert_ne!(
+                <$ty as TrustedPreallocate>::min_serialized_size(),
+                0,
+                concat!(stringify!($ty), " has no minimum encoded size"),
+            );
+        )+};
+    }
+
+    assert_nonzero_minimum!(
+        block::Hash,
+        block::CountedHeader,
+        transaction::Transaction,
+        transparent::Input,
+        transparent::Output,
+        sprout::JoinSplit<Bctv14Proof>,
+        sprout::JoinSplit<Groth16Proof>,
+        Groth16Proof,
+        sapling::Spend<sapling::PerSpendAnchor>,
+        sapling::SpendPrefixInTransactionV5,
+        sapling::OutputInTransactionV4,
+        sapling::OutputPrefixInTransactionV5,
+        redjubjub::Signature<redjubjub::SpendAuth>,
+        orchard::Action,
+        reddsa::Signature<reddsa::orchard::SpendAuth>,
+    );
+}
+
 impl TrustedPreallocate for u8 {
+    fn min_serialized_size() -> u64 {
+        1
+    }
+
     fn max_allocation() -> u64 {
         // MAX_PROTOCOL_MESSAGE_LEN takes up 5 bytes when encoded as a CompactSize.
         (MAX_PROTOCOL_MESSAGE_LEN - 5)
@@ -127,9 +204,10 @@ impl std::io::Read for TruncatedReader {
 /// This proxy has one blind spot: it can not see a `Vec::with_capacity(external_count)`
 /// that is followed by chunked reads, because that reserves the full length while still
 /// handing the reader small buffers. Safe Rust can not observe the capacity from the
-/// reader side, and a counting global allocator needs `unsafe`, which this workspace
-/// denies. So the deserializer carries a matching comment telling the reader never to
-/// pre-reserve the declared length.
+/// reader side. Counted collections cap that reservation at `MAX_INITIAL_ALLOCATION`
+/// whether or not the length is known, and bounded slice decoding additionally rejects
+/// counts the input cannot hold; `a_fitting_count_still_reserves_within_the_initial_cap`
+/// measures the reservation directly.
 fn u8_deser_does_not_preallocate_declared_length() {
     /// The number of body bytes the peer actually sends.
     const SUPPLIED_LEN: usize = 512;

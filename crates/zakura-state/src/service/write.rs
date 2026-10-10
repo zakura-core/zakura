@@ -47,7 +47,7 @@ use crate::{
         },
         non_finalized_state::{ContextualMetrics, NonFinalizedState},
         queued_blocks::{QueuedCheckpointVerified, QueuedSemanticallyVerified},
-        ChainTipBlock, ChainTipSender, InvalidateError, ReconsiderError,
+        ChainTipBlock, ChainTipSender, InvalidateError, PreciousError, ReconsiderError,
     },
     CheckpointVerifiedBlock, CommitBlockError, CommitCheckpointVerifiedError,
     SemanticallyVerifiedBlock, ValidateContextError,
@@ -146,6 +146,8 @@ pub struct PreparedFullStateTransition {
 struct PreparedAuthority {
     transition: zakura_header_chain::TransitionFingerprint,
     retention_references: Vec<block::Hash>,
+    /// Full state's selected tip, which can differ from the hash tie-break on equal work.
+    verified_tip: Option<Frontier>,
     evicted_bodies: Vec<block::Hash>,
 }
 
@@ -156,6 +158,7 @@ impl PreparedAuthority {
             .map(|transition| Self {
                 transition,
                 retention_references: Vec::new(),
+                verified_tip: None,
                 evicted_bodies: Vec::new(),
             })
             .ok_or(HeaderChainStoreError::Incoherent(
@@ -176,6 +179,12 @@ impl PreparedAuthority {
 impl FullStateEvidenceAuthority for PreparedAuthority {
     fn authorizes_full_state(&self, event: &TransitionEvent) -> bool {
         event.fingerprint() == Some(self.transition)
+    }
+
+    fn verified_tip(&self, event: &TransitionEvent) -> Option<Frontier> {
+        self.authorizes_full_state(event)
+            .then_some(self.verified_tip)
+            .flatten()
     }
 
     fn evicted_bodies(&self, event: &TransitionEvent) -> &[block::Hash] {
@@ -280,6 +289,7 @@ impl PreparedFullStateTransition {
             &header_request.event,
             staged_tips.clone(),
         )?;
+        authority.verified_tip = Some(expected_verified);
         if matches!(
             &header_request.event,
             TransitionEvent::VerifiedBlockAccepted(_)
@@ -1375,6 +1385,32 @@ fn commit_operator_change(
     .commit(&writer.runtime, live, &writer.context())
 }
 
+/// Publish an operator-preferred best tip as a verified chain reset, like a block commit that
+/// changes the best chain.
+fn commit_precious_change(
+    writer: &HeaderChainWriter,
+    live: &mut NonFinalizedState,
+    staged: NonFinalizedState,
+    preferred: Frontier,
+) -> Result<ApplyResult, HeaderChainStoreError> {
+    let (evidence, event_path, request) = verified_request(writer, live, &staged, preferred)?;
+    PreparedFullStateTransition::new(
+        evidence,
+        writer
+            .runtime
+            .publisher()
+            .snapshot()
+            .frontiers
+            .verified_best,
+        event_path,
+        staged,
+        None,
+        request,
+    )
+    .map_err(|_| HeaderChainStoreError::Incoherent("staged precious transition disagrees"))?
+    .commit(&writer.runtime, live, &writer.context())
+}
+
 /// The maximum size of the rejected ancestor map.
 ///
 /// We allow enough space for multiple concurrent chain forks with errors.
@@ -1836,6 +1872,13 @@ pub enum NonFinalizedWriteMessage {
         hash: block::Hash,
         rsp_tx: oneshot::Sender<Result<block::Hash, InvalidateError>>,
         /// Blocks relay against an unpublished transition, like [`Self::Reconsider`].
+        write_slot: tokio::sync::OwnedSemaphorePermit,
+    },
+    /// The hash of a chain tip that the operator prefers over other tips with the same work.
+    Precious {
+        hash: block::Hash,
+        rsp_tx: oneshot::Sender<Result<(), PreciousError>>,
+        /// Blocks relay against an unpublished transition, like [`Self::Invalidate`].
         write_slot: tokio::sync::OwnedSemaphorePermit,
     },
     /// The hash of a block that was previously invalidated but should be
@@ -2939,6 +2982,56 @@ impl WriteBlockWorkerTask {
                             backup_dir_path.as_deref(),
                         );
                     }
+                    let _ = rsp_tx.send(result);
+                    None
+                }
+                NonFinalizedWriteMessage::Precious {
+                    hash,
+                    rsp_tx,
+                    write_slot: _write_slot,
+                } => {
+                    tracing::info!(?hash, "preferring a block in the non-finalized state");
+                    let old_tip = non_finalized_state.best_tip();
+                    let mut staged = non_finalized_state.clone();
+                    let result = staged
+                        .precious_block(hash, &finalized_state.db)
+                        .and_then(|()| {
+                            let new_tip = staged.best_tip();
+                            if new_tip == old_tip {
+                                // Only the order of other tips changed, so the header chain's
+                                // verified path and the chain tip channel stay the same.
+                                *non_finalized_state = staged;
+                                let _ =
+                                    non_finalized_state_sender.send(non_finalized_state.clone());
+                                return Ok(());
+                            }
+                            let (height, tip_hash) = new_tip.expect(
+                                "the preferred tip is in the chain set, so a best tip exists",
+                            );
+                            if let Some(writer) = header_chain.as_ref() {
+                                commit_precious_change(
+                                    writer,
+                                    non_finalized_state,
+                                    staged,
+                                    Frontier::new(height, tip_hash),
+                                )
+                                .map_err(|error| {
+                                    PreciousError::HeaderChain {
+                                        error: error.to_string(),
+                                    }
+                                })?;
+                            } else {
+                                *non_finalized_state = staged;
+                            }
+                            update_channels_after_operator_change(
+                                non_finalized_state,
+                                finalized_state,
+                                chain_tip_sender,
+                                non_finalized_state_sender,
+                                backup_dir_path.as_deref(),
+                            );
+                            Ok(())
+                        });
                     let _ = rsp_tx.send(result);
                     None
                 }

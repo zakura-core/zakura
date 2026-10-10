@@ -34,8 +34,9 @@ pub(crate) use request::{
 
 mod serve;
 pub(crate) use serve::{
-    Produce, Push, PushPermit, Responded, ResponseCap, ResponseSink, Serve, ServeCapacity,
-    ServeConfigError, ServeEnd, ServeLimits, ServeViolation, SinkError, SinkProgress, WorkLease,
+    Completion, CompletionId, Completions, Produce, Push, PushPermit, Responded, ResponseCap,
+    ResponseSink, Serve, ServeCapacity, ServeConfigError, ServeEnd, ServeLimits, ServeViolation,
+    SinkError, SinkProgress, WorkLease,
 };
 
 mod reservations;

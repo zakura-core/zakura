@@ -604,9 +604,41 @@ fn pages_within<A: StreamConformance>(
 pub(crate) async fn close_progresses<A: StreamConformance>(
     layout: &'static [Stream],
 ) -> Result<(), BoxError> {
+    close_progresses_with_wait::<A>(layout, false).await?;
+    let send_waits = close_progresses_with_wait::<A>(layout, true).await?;
+    ensure(
+        LayoutPlan::new(layout).subscriptions.is_empty()
+            || send_waits.is_some_and(|waits| waits > 0),
+        || "P9 did not exercise Close while a page waited for send capacity".into(),
+    )
+}
+
+/// Hold the response allowance while preserving the transport slot needed by Close.
+async fn hold_response_allowance(
+    send: &crate::zakura::FramedSend,
+) -> Result<Vec<crate::zakura::transport::ResponseFrameSlot<'_>>, BoxError> {
+    ensure(send.max_capacity() >= 2, || {
+        "P9 allowance blocking requires a response slot and an independent control slot".to_owned()
+    })?;
+    let mut slots = Vec::new();
+    for _ in 0..send.max_capacity() - 1 {
+        slots.push(
+            tokio::time::timeout(CONFORMANCE_DEADLINE, send.reserve_response_guarded())
+                .await?
+                .map_err(|error| format!("response slot: {error:?}"))?,
+        );
+    }
+    Ok(slots)
+}
+
+/// Return the observed send waits after Close completes, or None for no subscriptions.
+async fn close_progresses_with_wait<A: StreamConformance>(
+    layout: &'static [Stream],
+    allowance_only: bool,
+) -> Result<Option<u64>, BoxError> {
     let plan = LayoutPlan::new(layout);
     let Some(subscription) = plan.subscriptions.first().copied() else {
-        return Ok(());
+        return Ok(None);
     };
     let MessageRole::Subscription { credit, .. } = subscription.row.role else {
         unreachable!("the plan lists subscription rows");
@@ -634,18 +666,38 @@ pub(crate) async fn close_progresses<A: StreamConformance>(
         objects: credit.objects - one_page.objects,
         bytes: credit.bytes - one_page.bytes,
     });
-    let pages = pages_within::<A>(&subscription, opening.unwrap_or(credit))?;
+    let pages = if allowance_only {
+        u32::from(opening.is_some())
+    } else {
+        pages_within::<A>(&subscription, opening.unwrap_or(credit))?
+    };
     let seed = seeds(9, layout);
     let victim = LayoutNode::<A>::spawn(seed, layout).await?;
     let control = LayoutNode::<A>::spawn(seed + 1, layout).await?;
     victim.connect(&control).await?;
     let (mut raw, _) = raw_peer(&victim, layout, seed + 2).await?;
     let shared = victim.shared();
+    let session = victim.wait_session(&raw.id()).await?;
+    let send = &session.sends[subscription.response_stream];
+    let mut response_slots = Vec::new();
+    if allowance_only && pages == 0 {
+        // A one-page credit window cannot also leave an earlier page unread.
+        // Block its first page instead of silently skipping allowance coverage.
+        response_slots = hold_response_allowance(send).await?;
+    }
 
     // Open, and read nothing.
     raw.send(
         subscription.stream,
-        &update(UpdateOp::Open, 0, opening.unwrap_or(credit))?,
+        &update(
+            UpdateOp::Open,
+            0,
+            if allowance_only {
+                one_page
+            } else {
+                opening.unwrap_or(credit)
+            },
+        )?,
     )
     .await?;
     await_until(
@@ -655,12 +707,19 @@ pub(crate) async fn close_progresses<A: StreamConformance>(
     )
     .await?;
 
+    if allowance_only && pages > 0 {
+        // An earlier page is already queued on QUIC. The next page must wait
+        // without spending credit, so Close can cancel it and follow the first.
+        response_slots = hold_response_allowance(send).await?;
+    }
+
     // Hold every execution slot and output byte. A grant makes the next page
     // wait for them.
     let holds: Vec<_> = shared
         .serving
         .iter()
         .chain(&shared.pushing)
+        .filter(|_| !allowance_only)
         .map(ServeCapacity::hold_node_for_test)
         .collect();
     let mut sequence = 1;
@@ -671,8 +730,14 @@ pub(crate) async fn close_progresses<A: StreamConformance>(
         )
         .await?;
         sequence += 1;
+    }
+    if opening.is_some() || allowance_only {
         await_until("a page waits for capacity", CONFORMANCE_DEADLINE, || {
-            shared.push_waits.load(Ordering::Relaxed) >= 1
+            if allowance_only {
+                shared.push_send_waits.load(Ordering::Relaxed) > 0
+            } else {
+                shared.push_waits.load(Ordering::Relaxed) >= 1
+            }
         })
         .await?;
     }
@@ -721,6 +786,7 @@ pub(crate) async fn close_progresses<A: StreamConformance>(
 
     // Serving resumes once capacity returns.
     drop(holds);
+    drop(response_slots);
     if let Some(request) = request {
         let exchange = read_ending::<A>(&mut raw, &request).await?;
         ensure(exchange == 9, || format!("request 9 ended as {exchange}"))?;
@@ -734,8 +800,27 @@ pub(crate) async fn close_progresses<A: StreamConformance>(
     ensure(victim.connected(&raw.id()), || {
         "the connection closed".into()
     })?;
+    let send_waits = shared.push_send_waits.load(Ordering::Relaxed);
     raw.shutdown().await;
     victim.shutdown().await;
     control.shutdown().await;
-    Ok(())
+    Ok(Some(send_waits))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A one-slot queue cannot prove independent control headroom, and must fail promptly.
+    #[tokio::test]
+    async fn p9_rejects_a_one_slot_allowance_without_waiting() {
+        let (send, _recv) = crate::zakura::framed_channel(1);
+        let error =
+            tokio::time::timeout(Duration::from_millis(100), hold_response_allowance(&send))
+                .await
+                .expect("an unsupported queue is rejected before reserving it")
+                .unwrap_err();
+        assert!(error.to_string().contains("independent control slot"));
+        assert_eq!(send.capacity(), 1);
+    }
 }

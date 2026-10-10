@@ -80,7 +80,7 @@ fn idle_continuation_indexes_are_bounded_and_cannot_block_new_readers() {
             RetainedPathLeaseOutcome::Acquired(_)
         ));
     }
-    assert_eq!(
+    assert!(matches!(
         reader
             .acquire_retained_path(
                 SourceId::from_digest([0xff; 32]),
@@ -90,8 +90,8 @@ fn idle_continuation_indexes_are_bounded_and_cannot_block_new_readers() {
                 scope
             )
             .unwrap(),
-        RetainedPathLeaseOutcome::Busy
-    );
+        RetainedPathLeaseOutcome::CapacityBusy(_)
+    ));
 }
 
 #[test]
@@ -1195,6 +1195,246 @@ fn selected_range_repair_rejects_atomically_then_commits_every_delivery() {
     }
 }
 
+/// Store each delivery as durable input on its retained header and refresh the runtime mirror.
+///
+/// Each delivery must name a distinct header.
+fn retain_aux_deliveries_for_test(runtime: &HeaderChainRuntime, deliveries: &[AuxDelivery]) {
+    let mut batch = DiskWriteBatch::new();
+    for delivery in deliveries {
+        let mut node = runtime
+            .store
+            .header_node(delivery.header_hash)
+            .expect("the retained header row decodes")
+            .expect("the delivery header is retained");
+        node.aux_delivery_ids.push(delivery.delivery_id);
+        runtime
+            .store
+            .put_value(
+                &mut batch,
+                HEADER_NODE_BY_HASH,
+                delivery.header_hash.0,
+                &HeaderNodeDisk::from_domain(&node),
+            )
+            .expect("the header with auxiliary input encodes");
+        runtime
+            .store
+            .put_value(
+                &mut batch,
+                HEADER_AUX_DELIVERY,
+                HeaderAuxDeliveryKey {
+                    header: delivery.header_hash,
+                    delivery: delivery.delivery_id,
+                }
+                .as_bytes(),
+                delivery,
+            )
+            .expect("the auxiliary delivery encodes");
+    }
+    runtime
+        .store
+        .db
+        .write(batch)
+        .expect("the auxiliary input fixture commits");
+    *runtime
+        .transition_engine
+        .lock()
+        .expect("the transition engine mutex is not poisoned") =
+        load_transition_engine(&runtime.store)
+            .expect("the direct durable test fixture refreshes the runtime mirror");
+}
+
+/// Repair three headers that hold rootless near-tip rows in one range, below one rooted header.
+///
+/// `aggregate_limit` replaces the aggregate input limit. Returns the durable rows of each
+/// repaired target and the number of durable rows in the store.
+fn repair_rootless_near_tip_range(
+    aggregate_limit: Option<usize>,
+) -> (Vec<Vec<AuxDelivery>>, usize) {
+    let (mut runtime, _db, _genesis, path) = reconciled_store_with_finalized_prefix(8);
+    if let Some(total) = aggregate_limit {
+        let per_header = runtime.config.limits.max_aux_deliveries_per_header.get();
+        runtime.set_auxiliary_limits_for_test(per_header, total);
+    }
+    let parent = Frontier::new(path[2].height, path[2].hash);
+    let targets: Vec<_> = path[3..6]
+        .iter()
+        .map(|header| Frontier::new(header.height, header.hash))
+        .collect();
+    let rooted_header = Frontier::new(path[6].height, path[6].hash);
+    let snapshot = runtime.publisher().snapshot();
+    let owner = zakura_header_chain::BodyWorkAuthority::for_snapshot(&snapshot)
+        .bind(37, NonZeroU64::new(38).expect("thirty-eight is nonzero"));
+    let near_tip_owner =
+        zakura_header_chain::HeaderWorkAuthority::for_target(&snapshot, path[7].hash)
+            .bind(39, NonZeroU64::new(40).expect("forty is nonzero"));
+    let near_tip_source = SourceId::from_digest([0xc1; 32]);
+    let record = |height: block::Height, marker: u8| zakura_header_chain::TreeAuxRecordV1 {
+        height,
+        sapling_root: Default::default(),
+        orchard_root: Default::default(),
+        ironwood_root: Default::default(),
+        sapling_tx_count: u64::from(marker),
+        orchard_tx_count: 0,
+        ironwood_tx_count: 0,
+        auth_data_root: zakura_chain::block::merkle::AuthDataRoot::from([marker; 32]),
+    };
+    let mut near_tip_input: Vec<_> = targets
+        .iter()
+        .zip(0xc2_u8..)
+        .map(|(target, marker)| {
+            AuxDelivery::new(
+                EvidenceId::from_digest([marker; 32]),
+                target.hash,
+                near_tip_source,
+                near_tip_owner.into(),
+                zakura_header_chain::BodySizeHint::Unknown,
+                None,
+            )
+        })
+        .collect();
+    near_tip_input.push(AuxDelivery::new(
+        EvidenceId::from_digest([0xc8; 32]),
+        rooted_header.hash,
+        near_tip_source,
+        near_tip_owner.into(),
+        zakura_header_chain::BodySizeHint::Unknown,
+        Some(record(rooted_header.height, 0xc9)),
+    ));
+    retain_aux_deliveries_for_test(&runtime, &near_tip_input);
+
+    let repair = runtime
+        .reader()
+        .vct_repair_context(owner, targets[0].height)
+        .expect("the rootless range repair context is coherent")
+        .expect("the rootless selected range needs repair");
+    assert_eq!(
+        repair.selected_header_count(),
+        targets.len(),
+        "the range stops before the first rooted row"
+    );
+    assert_eq!(repair.request_target(), targets[2]);
+    assert_eq!(
+        runtime
+            .reader()
+            .vct_repair_context(owner, rooted_header.height)
+            .expect("the rooted repair context is coherent")
+            .expect("the rooted target remains repairable")
+            .selected_header_count(),
+        1,
+        "rooted input still constrains its replacement to one target"
+    );
+
+    let lease = runtime
+        .reader()
+        .validation_context(parent.hash)
+        .expect("the repair parent validation context is coherent")
+        .expect("the repair parent remains retained");
+    let rules =
+        HeaderRules::for_validation_lease(&lease).expect("the repair parent produces header rules");
+    let headers: Vec<_> = path[3..6]
+        .iter()
+        .map(|header| header.header.clone())
+        .collect();
+    let batch = zakura_header_chain::prepare_headers(
+        HeaderBatchInput::new(&headers),
+        parent,
+        &rules,
+        &SystemClock,
+    )
+    .expect("the selected range passes deterministic preparation");
+    let source = SourceId::from_digest([0xca; 32]);
+    let replacements = targets
+        .iter()
+        .zip(0xcb_u8..)
+        .map(|(target, marker)| {
+            AuxDelivery::new(
+                EvidenceId::from_digest([marker; 32]),
+                target.hash,
+                source,
+                owner.into(),
+                zakura_header_chain::BodySizeHint::Unknown,
+                Some(record(target.height, marker)),
+            )
+        })
+        .collect();
+    let context = TransitionContext {
+        config: &runtime.config,
+        clock: &SystemClock,
+        full_state_authority: None,
+        retention_references: &[],
+    };
+    assert!(matches!(
+        runtime
+            .apply(
+                TransitionRequest {
+                    expected_version: StateVersion::default(),
+                    event: TransitionEvent::InsertHeaders(Box::new(InsertHeaders {
+                        owner: owner.into(),
+                        source,
+                        parent_hash: parent.hash,
+                        target_tip_hash: targets[2].hash,
+                        completion: TargetCompletion::SelectedAuxiliaryRepair {
+                            common_ancestor: parent,
+                            selected_target: targets[2],
+                            episode: repair.episode,
+                        },
+                        batch,
+                        aux: replacements,
+                    })),
+                },
+                &context,
+            )
+            .expect("the rootless range repair applies"),
+        ApplyResult::Committed
+    ));
+    let rows = targets
+        .iter()
+        .map(|target| {
+            runtime
+                .store
+                .aux_deliveries(target.hash)
+                .expect("the repaired target rows are readable")
+        })
+        .collect();
+    let total = runtime
+        .store
+        .load_aux_deliveries()
+        .expect("the durable input rows are readable")
+        .len();
+    (rows, total)
+}
+
+#[test]
+fn repair_range_spans_rootless_near_tip_input() {
+    // Suppliers attach roots only to their finalized prefix, so headers received near the
+    // network tip keep rootless rows. When a later handoff moves above those headers, one repair
+    // must still cover them all instead of one header per round trip.
+    let (rows, _) = repair_rootless_near_tip_range(None);
+    for rows in rows {
+        assert_eq!(rows.len(), 2, "the repair adds a rooted row");
+        assert!(rows.iter().any(|row| row.tree_aux.is_some()));
+    }
+}
+
+#[test]
+fn saturated_rootless_range_repair_retains_every_root() {
+    // The four near-tip rows leave one free aggregate slot. The two lowest targets sit in the
+    // commit window, so their rows are protected, and the range admits three new roots by
+    // reclaiming the two rows above it. Aggregate pressure must evict those older rows, never a
+    // root that the range repair just supplied.
+    let (rows, total) = repair_rootless_near_tip_range(Some(5));
+    assert_eq!(total, 5, "the repair stays within the aggregate limit");
+    let repair_source = SourceId::from_digest([0xca; 32]);
+    for rows in &rows {
+        assert!(
+            rows.iter()
+                .any(|row| row.source == repair_source && row.tree_aux.is_some()),
+            "every target retains its new root"
+        );
+    }
+    assert_eq!(rows[2].len(), 1, "eviction removes the suffix rootless row");
+}
+
 #[test]
 fn one_header_range_prefix_keeps_its_state_bound_episode() {
     let (runtime, _db, _genesis, path) = reconciled_store_with_finalized_prefix(5);
@@ -1735,19 +1975,18 @@ async fn retained_path_leases_are_exact_bounded_session_scoped_and_expiring() {
             .expect("a stale acquisition scope is a normal refusal"),
         RetainedPathLeaseOutcome::Busy
     );
-    assert_eq!(
+    assert!(matches!(
         reader
             .acquire_retained_path(owner, 7, grandchild.hash, &[anchor.hash], lease_scope,)
             .expect("the lease bound is a normal outcome"),
-        RetainedPathLeaseOutcome::Busy
-    );
-    assert_eq!(
+        RetainedPathLeaseOutcome::CapacityBusy(_)
+    ));
+    assert!(matches!(
         reader
             .acquire_retained_path(owner, 8, grandchild.hash, &[anchor.hash], lease_scope)
             .expect("a new session cannot replace a live lease"),
-        RetainedPathLeaseOutcome::Busy,
-        "same-peer replacement requires exact release or expiry"
-    );
+        RetainedPathLeaseOutcome::CapacityBusy(_)
+    ));
     assert_eq!(
         reader
             .read_retained_path(owner, 8, lease.lease_id, lease_scope, anchor.hash, 1)
@@ -1971,7 +2210,7 @@ async fn retained_path_leases_are_exact_bounded_session_scoped_and_expiring() {
             RetainedPathLeaseOutcome::Acquired(_)
         ));
     }
-    assert_eq!(
+    assert!(matches!(
         reader
             .acquire_retained_path(
                 SourceId::from_digest([0xff; 32]),
@@ -1984,8 +2223,8 @@ async fn retained_path_leases_are_exact_bounded_session_scoped_and_expiring() {
                 ),
             )
             .expect("capacity refusal is a normal outcome"),
-        RetainedPathLeaseOutcome::Busy
-    );
+        RetainedPathLeaseOutcome::CapacityBusy(_)
+    ));
     tokio::time::advance(RETAINED_PATH_LEASE_IDLE + Duration::from_secs(1)).await;
     assert!(matches!(
         reader
@@ -2759,6 +2998,236 @@ fn finalize_serving_test_path(
             || {},
         )
         .expect("the authoritative test path finalizes");
+}
+
+#[test]
+fn capacity_signals_follow_reservations_and_capacity_classes() {
+    let mut leases = RetainedPathLeaseRegistry::default();
+    let now = Instant::now();
+    let first = SourceId::from_digest([0; 32]);
+    let first_id = leases
+        .reserve(first, now, RetainedPathCapacity::General)
+        .unwrap();
+    let Err(RetainedPathLeaseOutcome::CapacityBusy(peer_wait)) =
+        leases.reserve(first, now, RetainedPathCapacity::General)
+    else {
+        panic!("the reservation occupies this peer's slot")
+    };
+    for marker in 1..MAX_RETAINED_PATH_LEASES - 1 {
+        leases
+            .reserve(
+                SourceId::from_digest([u8::try_from(marker).unwrap(); 32]),
+                now,
+                RetainedPathCapacity::General,
+            )
+            .unwrap();
+    }
+    let waiting = SourceId::from_digest([0xfe; 32]);
+    let Err(RetainedPathLeaseOutcome::CapacityBusy(general_wait)) =
+        leases.reserve(waiting, now, RetainedPathCapacity::General)
+    else {
+        panic!("general capacity is full")
+    };
+    let Err(RetainedPathLeaseOutcome::CapacityBusy(other_wait)) = leases.reserve(
+        SourceId::from_digest([0xfd; 32]),
+        now,
+        RetainedPathCapacity::General,
+    ) else {
+        panic!("another peer shares the same full capacity class")
+    };
+    assert_eq!(general_wait, other_wait);
+    let fallback = SourceId::from_digest([0xff; 32]);
+    let fallback_id = leases
+        .reserve(fallback, now, RetainedPathCapacity::FinalizedFallback)
+        .unwrap();
+    let Err(RetainedPathLeaseOutcome::CapacityBusy(fallback_wait)) =
+        leases.reserve(waiting, now, RetainedPathCapacity::FinalizedFallback)
+    else {
+        panic!("fallback capacity is full")
+    };
+    leases.release_reservation(fallback, fallback_id + 1);
+    assert!(!fallback_wait.is_released());
+    leases.release_reservation(fallback, fallback_id);
+    assert!(fallback_wait.is_released());
+    assert!(!general_wait.is_released());
+    assert!(!peer_wait.is_released());
+    leases.release_reservation(first, first_id);
+    assert!(general_wait.is_released());
+    assert!(other_wait.is_released());
+    assert!(peer_wait.is_released());
+    let replacement = leases
+        .reserve(first, now, RetainedPathCapacity::General)
+        .unwrap();
+    let Err(RetainedPathLeaseOutcome::CapacityBusy(next_general_wait)) =
+        leases.reserve(waiting, now, RetainedPathCapacity::General)
+    else {
+        panic!("another peer acquired the available general slot")
+    };
+    assert_ne!(general_wait, next_general_wait);
+    let Err(RetainedPathLeaseOutcome::CapacityBusy(next_wait)) =
+        leases.reserve(first, now, RetainedPathCapacity::General)
+    else {
+        panic!("the replacement occupies this peer's slot")
+    };
+    leases.release_reservation(first, first_id);
+    assert!(!next_wait.is_released());
+    assert!(!next_general_wait.is_released());
+    leases.release_reservation(first, replacement);
+    assert!(next_wait.is_released());
+    assert!(next_general_wait.is_released());
+}
+
+#[test]
+fn capacity_signal_survives_reservation_commit_and_page_release() {
+    let (runtime, _db, _, path) = reconciled_store_with_finalized_prefix(6);
+    let reader = runtime.reader();
+    let source = SourceId::from_digest([0xd8; 32]);
+    let target = path[5].hash;
+    let scope = HeaderWorkAuthority::for_target(&runtime.publisher().snapshot(), target);
+    let RetainedPathLeaseOutcome::Acquired(lease) = reader
+        .acquire_retained_path(source, 7, target, &[path[2].hash], scope)
+        .unwrap()
+    else {
+        panic!("the target is retained")
+    };
+    let RetainedPathLeaseOutcome::CapacityBusy(signal) = reader
+        .acquire_retained_path(source, 8, target, &[path[2].hash], scope)
+        .unwrap()
+    else {
+        panic!("the first session holds this peer's slot")
+    };
+    assert!(!reader
+        .release_retained_path(source, 8, lease.lease_id, scope)
+        .unwrap());
+    assert!(!signal.is_released());
+    assert!(matches!(
+        reader
+            .read_retained_path(source, 7, lease.lease_id, scope, path[2].hash, 1)
+            .unwrap(),
+        RetainedPathReadOutcome::Page(_)
+    ));
+    assert!(signal.is_released());
+    assert!(!reader
+        .release_retained_path(source, 7, lease.lease_id, scope)
+        .unwrap());
+}
+
+#[test]
+fn dropped_reservation_notifies_waiters() {
+    let leases = Arc::new(Mutex::new(RetainedPathLeaseRegistry::default()));
+    let peer = SourceId::from_digest([0xd9; 32]);
+    let id = leases
+        .lock()
+        .unwrap()
+        .reserve(peer, Instant::now(), RetainedPathCapacity::General)
+        .unwrap();
+    let reservation = RetainedPathReservation {
+        leases: leases.clone(),
+        peer,
+        reservation_id: id,
+        active: true,
+    };
+    let Err(RetainedPathLeaseOutcome::CapacityBusy(signal)) =
+        leases
+            .lock()
+            .unwrap()
+            .reserve(peer, Instant::now(), RetainedPathCapacity::General)
+    else {
+        panic!("the reservation occupies this peer's slot")
+    };
+    assert!(!signal.is_released());
+    drop(reservation);
+    assert!(signal.is_released());
+}
+
+#[test]
+fn reservation_commit_keeps_the_waiter_until_exact_release_or_expiry() {
+    for expire in [false, true] {
+        let mut leases = RetainedPathLeaseRegistry::default();
+        let peer = SourceId::from_digest([0xda; 32]);
+        let now = Instant::now();
+        let reservation = leases
+            .reserve(peer, now, RetainedPathCapacity::General)
+            .unwrap();
+        let Err(RetainedPathLeaseOutcome::CapacityBusy(signal)) =
+            leases.reserve(peer, now, RetainedPathCapacity::General)
+        else {
+            panic!("the reservation occupies this peer's slot")
+        };
+        let frontier = Frontier::new(block::Height(0), block::Hash([0; 32]));
+        let scope = HeaderWorkAuthority {
+            header_generation: zakura_header_chain::HeaderGeneration::new(1),
+            branch: zakura_header_chain::BranchId::new(frontier.hash, frontier.hash),
+        };
+        let RetainedPathLeaseOutcome::Acquired(lease) = leases.commit_reservation(
+            peer,
+            reservation,
+            RetainedPathLeaseSpec {
+                peer,
+                session_id: 7,
+                target: frontier,
+                common_ancestor: frontier,
+                scope,
+                position: CanonicalHeaderPathPosition::Complete,
+                retained_ancestor: None,
+                retained_path: Arc::from([]),
+            },
+            now,
+        ) else {
+            panic!("the reservation commits its lease")
+        };
+        assert!(!signal.is_released());
+        assert!(!leases.release(peer, 8, lease.lease_id, scope));
+        assert!(!signal.is_released());
+        if expire {
+            leases.expire(now + RETAINED_PATH_LEASE_IDLE);
+        } else {
+            assert!(leases.release(peer, 7, lease.lease_id, scope));
+        }
+        assert!(signal.is_released());
+    }
+}
+
+#[tokio::test]
+async fn abandoned_blocking_acquisition_releases_its_lease_and_notifies_waiters() {
+    let (runtime, _db, _, path) = reconciled_store_with_finalized_prefix(7);
+    let reader = runtime.reader();
+    let source = SourceId::from_digest([0xe5; 32]);
+    let target = path[5].hash;
+    let scope = HeaderWorkAuthority::for_target(&runtime.publisher().snapshot(), target);
+    let outcome = reader
+        .acquire_retained_path(source, 7, target, &[path[2].hash], scope)
+        .unwrap();
+    assert!(matches!(outcome, RetainedPathLeaseOutcome::Acquired(_)));
+    let RetainedPathLeaseOutcome::CapacityBusy(signal) = reader
+        .acquire_retained_path(source, 7, target, &[path[2].hash], scope)
+        .unwrap()
+    else {
+        panic!("the first acquisition owns the peer slot");
+    };
+    let (resume, blocked) = std::sync::mpsc::channel();
+    let task_reader = reader.clone();
+    let task = tokio::task::spawn_blocking(move || {
+        blocked.recv().unwrap();
+        PendingRetainedPathAcquisition::new(task_reader, outcome)
+    });
+    drop(task);
+    assert!(!signal.is_released());
+    resume.send(()).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), signal.released())
+        .await
+        .unwrap();
+    let outcome = reader
+        .acquire_retained_path(source, 7, target, &[path[2].hash], scope)
+        .unwrap();
+    let pending = PendingRetainedPathAcquisition::new(reader.clone(), outcome);
+    let RetainedPathLeaseOutcome::Acquired(lease) = pending.into_outcome() else {
+        panic!("abandonment must return the peer slot");
+    };
+    // Receiving the result transfers ownership to the caller.
+    assert!(reader
+        .release_retained_path(source, 7, lease.lease_id, scope)
+        .unwrap());
 }
 
 fn retained_checkpoint_fixture() -> (HeaderChainRuntime, DiskDb, Vec<VerifiedHeaderRef>) {

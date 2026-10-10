@@ -65,6 +65,22 @@ impl Generator {
             deprecated: false,
         }
     }
+
+    /// Describes a result with the schema of its declared Rust result type.
+    pub(super) fn typed_result<T: JsonSchema>(
+        &mut self,
+        name: &'static str,
+        description: &'static str,
+    ) -> ContentDescriptor {
+        ContentDescriptor {
+            name,
+            summary: summary(description),
+            description,
+            required: false,
+            schema: self.0.subschema_for::<T>(),
+            deprecated: false,
+        }
+    }
 }
 
 #[derive(Serialize)]

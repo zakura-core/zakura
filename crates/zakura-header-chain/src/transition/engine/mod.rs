@@ -391,8 +391,9 @@ impl HeaderChainEngine {
     /// Bound the number of new inputs a selected repair can retain.
     ///
     /// A full target bucket can replace one unauthenticated input. Otherwise, repairs can use
-    /// free slots and evictable input outside the commit window. Only empty buckets can extend
-    /// a repair range. This read grants no admission authority.
+    /// free slots and evictable input outside the commit window. A repair range stops at the
+    /// first bucket that can neither admit nor replace input. This read grants no admission
+    /// authority.
     pub fn auxiliary_repair_capacity(
         &self,
         hash: block::Hash,

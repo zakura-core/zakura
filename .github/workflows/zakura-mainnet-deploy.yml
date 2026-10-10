@@ -65,9 +65,9 @@ on:
         options: [deploy, monitoring]
         default: deploy
       monitoring_stage:
-        description: "Stage for operation=monitoring; run install, validate, cutover, soak, finalize in order"
+        description: "fleet-deploy refreshes active monitoring; initial cutover uses install, validate, cutover, soak, finalize"
         type: choice
-        options: [status, install, validate, cutover, soak, slack-test, finalize, rollback]
+        options: [status, fleet-deploy, install, validate, cutover, soak, slack-test, finalize, rollback]
         default: status
 
 permissions:
@@ -896,6 +896,7 @@ jobs:
         env:
           SLACK_WEB_HOOK: ${{ secrets.SLACK_WEB_HOOK }}
           SHA: ${{ github.sha }}
+          PAGERDUTY_ROUTING_KEY: ${{ secrets.PAGERDUTY_ROUTING_KEY }}
         run: |
           set -euo pipefail
 

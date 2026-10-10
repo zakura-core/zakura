@@ -260,6 +260,35 @@ class HostSettingsTests(InstallCase):
         self.assertIn(f"SLACK_WEB_HOOK={WEBHOOK}", env.read_text())
         self.assertEqual(install.fleet_env(self.dir / "new")["slack_webhook"], "missing")
 
+    def test_pagerduty_env_update_preserves_every_other_setting(self):
+        env = self.dir / "env"
+        original = "SLACK_WEB_HOOK=old\nCUSTOM_FLAG=1\n# operator note\n"
+        env.write_text(original + "PAGERDUTY_ROUTING_KEY=old-key\n")
+        result = install.fleet_env(env, new_pagerduty_key="fixture-key")
+        self.assertEqual(env.read_text(), original + "PAGERDUTY_ROUTING_KEY=fixture-key\n")
+        self.assertNotIn("fixture-key", json.dumps(result))
+        self.assertEqual(stat.S_IMODE(env.stat().st_mode), 0o600)
+        install.fleet_env(env, WEBHOOK)
+        self.assertIn("PAGERDUTY_ROUTING_KEY=fixture-key", env.read_text())
+        saved = env.read_text()
+        install.fleet_env(env)
+        self.assertEqual(env.read_text(), saved)
+        with self.assertRaises(install.InstallError):
+            install.fleet_env(env, new_pagerduty_key="invalid\nINJECT=1")
+        self.assertEqual(env.read_text(), saved)
+
+    def test_fleet_env_cli_reads_secrets_from_stdin_without_echoing_them(self):
+        env = self.dir / "env"
+        output = io.StringIO()
+        secrets = {"SLACK_WEB_HOOK": WEBHOOK, "PAGERDUTY_ROUTING_KEY": "fixture-pd-key"}
+        with mock.patch("sys.stdin", io.StringIO(json.dumps(secrets))), redirect_stdout(output):
+            result = install.main(["fleet-env", "--env-file", str(env), "--secrets-stdin"])
+        self.assertEqual(result, 0)
+        self.assertIn("PAGERDUTY_ROUTING_KEY=fixture-pd-key", env.read_text())
+        self.assertIn(f"SLACK_WEB_HOOK={WEBHOOK}", env.read_text())
+        self.assertNotIn("fixture-pd-key", output.getvalue())
+        self.assertNotIn("s3cr3t", output.getvalue())
+
     def test_existing_unit_is_never_replaced(self):
         unit = self.dir / "unit.service"
         template = HERE / "zakura-fleet-watchdog.service"

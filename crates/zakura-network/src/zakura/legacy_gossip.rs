@@ -3148,13 +3148,13 @@ impl LegacyGossipError {
             | Self::TruncatedResponse
             | Self::OversizedResponse(_)
             | Self::UnsolicitedBlock(_)
-            | Self::Serialization(_)
-            | Self::Io(_)
-            | Self::Integer(_) => true,
+            | Self::Serialization(_) => true,
             Self::UnsupportedRequest(_)
             | Self::ResponseAggregateBudget(_)
             | Self::UnexpectedResponse(_)
-            | Self::MissingResponse(_) => false,
+            | Self::MissingResponse(_)
+            | Self::Io(_)
+            | Self::Integer(_) => false,
         }
     }
 }

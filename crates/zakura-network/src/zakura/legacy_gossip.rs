@@ -2269,6 +2269,11 @@ impl ZakuraRequestClient {
                         error.to_string(),
                     )
                 });
+                // Match the transport's `Fatal` handling, so source-attributed
+                // retries cannot pick the same misbehaving peer again.
+                if error.is_peer_fault() {
+                    self.supervisor.disconnect_peer(handle.peer_id()).await;
+                }
                 return Err(error.into());
             }
         };
@@ -3122,6 +3127,40 @@ pub enum LegacyGossipError {
     Integer(#[from] std::num::TryFromIntError),
 }
 
+impl LegacyGossipError {
+    /// Returns true if this error, from decoding a peer's response, proves the
+    /// peer violated the protocol, so its connection should be closed.
+    ///
+    /// The transport already rejects the structural variants as `Fatal` before
+    /// decoding; the live addition here is requested-item binding
+    /// (`UnsolicitedBlock`). Missing or unexpected responses are not faults on
+    /// their own: the caller falls back to another peer.
+    pub(crate) fn is_peer_fault(&self) -> bool {
+        match self {
+            Self::UnsupportedFlags(_)
+            | Self::UnknownMessageType(_)
+            | Self::EmptyTransactionAdvertisement
+            | Self::TooManyInventoryItems(_)
+            | Self::TooManyBlockLocatorHashes(_)
+            | Self::TooManyHeaders(_)
+            | Self::NonTransactionInventory
+            | Self::TrailingBytes
+            | Self::WrongRequestId { .. }
+            | Self::IncompleteResponseChunk
+            | Self::TruncatedResponse
+            | Self::OversizedResponse(_)
+            | Self::UnsolicitedBlock(_)
+            | Self::Serialization(_) => true,
+            Self::UnsupportedRequest(_)
+            | Self::ResponseAggregateBudget(_)
+            | Self::UnexpectedResponse(_)
+            | Self::MissingResponse(_)
+            | Self::Io(_)
+            | Self::Integer(_) => false,
+        }
+    }
+}
+
 impl fmt::Display for LegacyGossipFrame {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -3349,6 +3388,29 @@ mod tests {
                 }
             };
             std::future::ready(Ok(response))
+        }
+    }
+
+    /// Answers every block request with its block, whatever hash was requested.
+    #[derive(Clone, Debug)]
+    struct SubstitutingBlockResponder {
+        block: Arc<Block>,
+    }
+
+    impl Service<Request> for SubstitutingBlockResponder {
+        type Response = Response;
+        type Error = BoxError;
+        type Future = std::future::Ready<Result<Response, BoxError>>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, _request: Request) -> Self::Future {
+            std::future::ready(Ok(Response::Blocks(vec![InventoryResponse::Available((
+                self.block.clone(),
+                None,
+            ))])))
         }
     }
 
@@ -3937,6 +3999,45 @@ mod tests {
             blocks.as_slice(),
             [InventoryResponse::Available((received, None))] if received.hash() == block.hash()
         ));
+
+        node_a.shutdown().await;
+        node_b.shutdown().await;
+        Ok(())
+    }
+
+    /// F-38: an unsolicited block response is a peer fault, so the requester
+    /// disconnects the peer instead of leaving it eligible for source-attributed
+    /// retries.
+    #[tokio::test]
+    async fn request_adapter_disconnects_peer_on_unsolicited_block() -> Result<(), BoxError> {
+        let _guard = zakura_test::init();
+        let block = Arc::new(Block::zcash_deserialize(
+            BLOCK_TESTNET_141042_BYTES.as_slice(),
+        )?);
+        let node_a = ZakuraTestNode::builder(70)
+            .service_from_supervisor(move |supervisor| {
+                Arc::new(LegacyGossipSink::spawn(
+                    SubstitutingBlockResponder { block },
+                    supervisor,
+                ))
+            })
+            .spawn()
+            .await?;
+        let node_b = ZakuraTestNode::builder(71).spawn().await?;
+        node_b.connect_native(&node_a, TEST_NET_TIMEOUT).await?;
+        wait_registered_count(&node_b, 1).await?;
+        let a_peer_id = node_peer_id(&node_a).await?;
+
+        let adapter = LegacyRequestAdapter::new(node_b.supervisor());
+        let result = adapter
+            .request_from_source(
+                Request::BlocksByHash(IndexSet::from([block_hash(90)])),
+                Some(PeerSource::Zakura(a_peer_id)),
+            )
+            .await;
+
+        assert!(result.is_err(), "an unsolicited block must not be returned");
+        wait_registered_count(&node_b, 0).await?;
 
         node_a.shutdown().await;
         node_b.shutdown().await;

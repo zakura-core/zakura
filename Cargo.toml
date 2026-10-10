@@ -5,6 +5,7 @@ members = [
         "crates/zakura-mmr-tree",
         "crates/zakura-header-chain",
         "crates/zakura-network",
+        "crates/zakura-quic",
         "crates/zakura-state",
         "crates/zakura-script",
         "crates/zakura-consensus",
@@ -76,6 +77,7 @@ color-eyre = { version = "0.6.3", default-features = false }
 console-subscriber = "0.5"
 criterion = { version = "0.8.2", default-features = false, features = ["rayon", "cargo_bench_support"] }
 crossbeam-channel = "0.5.14"
+curve25519-dalek = "4.1"
 derive-new = "0.7"
 ed25519-zebra = "4.2"
 equihash = { version = "=2.2.0", package = "zakura-equihash" }
@@ -94,7 +96,6 @@ hyper-util = "0.1.11"
 # Select the unicode-rs IDNA backend. The 1.2.x line selects ICU4X instead.
 # See docs/decisions/zakura/0002-idna-unicode-backend.md for the tradeoff.
 idna_adapter = "~1.1.0"
-iroh = { package = "zakura-iroh", version = "=1.1.0-rc.1", default-features = false, features = ["tls-ring"] }
 indexmap = "2.8"
 insta = "1.42"
 itertools = "0.14"
@@ -125,7 +126,13 @@ reddsa = { version = "=2.2.0", package = "zakura-reddsa" }
 redjubjub = { version = "=2.2.0", package = "zakura-redjubjub" }
 regex = "1.11"
 reqwest = { version = "0.13", default-features = false }
+# SPEC DEP-4: the sans-I/O QUIC state machine only. zakura-quic owns the socket
+# layer and the async driver, so neither `quinn` nor `quinn-udp` is a dependency.
+quinn-proto = { version = "0.11.19", default-features = false, features = ["rustls-ring"] }
 ripemd = "0.1"
+ring = "0.17.14"
+rustls = { version = "0.23.45", default-features = false, features = ["ring", "std"] }
+rustls-pki-types = "1.12"
 # `bindgen-runtime` makes librocksdb-sys's bindgen load libclang itself. Without
 # it, a build that resolves a second bindgen version elsewhere (for example the
 # fresh placeholder project cargo-semver-checks generates) unifies clang-sys
@@ -139,6 +146,7 @@ serde = "1.0.219"
 serde_json = "1.0.140"
 sha2 = "0.10"
 schemars = "1"
+socket2 = "0.6"
 sinsemilla = { version = "=2.2.0", package = "zakura-sinsemilla" }
 anyhow = "1.0"
 strum = "0.28"
@@ -167,6 +175,7 @@ uint = "0.10"
 x25519-dalek = "2.0.1"
 zcash_note_encryption = "0.4.1"
 zcash_script = "0.4.5"
+zeroize = "1.8"
 
 # All cargo-release configuration lives in this table. Do not add a root
 # release.toml: it would silently shadow every setting here (cargo-release

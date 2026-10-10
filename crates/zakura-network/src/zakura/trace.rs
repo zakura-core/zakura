@@ -130,6 +130,10 @@ pub const BLOCK_SYNC_TABLE: ZakuraTraceTable =
 pub const COMMIT_STATE_TABLE: ZakuraTraceTable =
     ZakuraTraceTable::new("commit_state", "commit_state.jsonl");
 
+/// Per-connection QUIC transport samples, every 10 s and on close
+/// (zakura-quic OBS-3).
+pub const QUIC_CONN_TABLE: ZakuraTraceTable = ZakuraTraceTable::new("quic_conn", "quic_conn.jsonl");
+
 /// Failed non-blocking outbound queue sends for Zakura wire messages.
 pub const QUEUE_SEND_TABLE: ZakuraTraceTable =
     ZakuraTraceTable::new("queue_send", "queue_send.jsonl");
@@ -488,6 +492,52 @@ pub struct ZakuraTrace {
 }
 
 impl ZakuraTrace {
+    /// Emit one `quic_conn` row for a transport sample (zakura-quic OBS-3).
+    ///
+    /// The peer column uses the same label as the other tables, and
+    /// `admitted_ip` is redacted unless `expose_peer_addresses` is set.
+    pub(crate) fn emit_quic_conn(
+        &self,
+        sample: &zakura_quic::ConnSample,
+        expose_peer_addresses: bool,
+    ) {
+        self.emit_with(QUIC_CONN_TABLE, |row| {
+            let event = if sample.close_reason.is_some() {
+                "closed"
+            } else {
+                "sample"
+            };
+            let peer = ZakuraPeerId::new(sample.remote_id.as_bytes().to_vec())
+                .map(|peer_id| peer_label(&peer_id))
+                .ok();
+            let admitted_ip = if expose_peer_addresses {
+                sample.admitted_ip.to_string()
+            } else if sample.admitted_ip.is_ipv4() {
+                "v4redacted".to_string()
+            } else {
+                "v6redacted".to_string()
+            };
+            let rtt_micros = u64::try_from(sample.rtt.as_micros()).unwrap_or(u64::MAX);
+            row.insert("event".to_string(), Value::String(event.to_string()));
+            insert_optional_str(row, "peer", peer.as_deref());
+            row.insert("admitted_ip".to_string(), Value::String(admitted_ip));
+            insert_optional_u64(row, "rtt_micros", Some(rtt_micros));
+            insert_optional_u64(row, "cwnd", Some(sample.cwnd));
+            insert_optional_u64(row, "lost_packets", Some(sample.lost_packets));
+            insert_optional_u64(row, "congestion_events", Some(sample.congestion_events));
+            insert_optional_u64(row, "bytes_sent", Some(sample.bytes_sent));
+            insert_optional_u64(row, "bytes_received", Some(sample.bytes_received));
+            insert_optional_u64(row, "current_mtu", Some(u64::from(sample.current_mtu)));
+            insert_optional_u64(row, "bytes_in_flight", Some(sample.bytes_in_flight));
+            insert_optional_u64(
+                row,
+                "send_blocked_micros",
+                Some(u64::try_from(sample.send_blocked.as_micros()).unwrap_or(u64::MAX)),
+            );
+            insert_optional_str(row, "close_reason", sample.close_reason.as_deref());
+        });
+    }
+
     /// Create a no-op trace emitter.
     pub fn noop() -> Self {
         Self::new(JsonlTracer::noop(), zakura_jsonl_trace::node_id())
@@ -824,5 +874,44 @@ mod tests {
             !trace.is_enabled(),
             "trace must report disabled once the receiver is dropped"
         );
+    }
+
+    #[test]
+    fn quic_conn_rows_redact_the_admitted_ip_unless_exposed() {
+        let sample = zakura_quic::ConnSample {
+            remote_id: zakura_quic::NodeSecretKey::from_bytes(&[5; 32]).public(),
+            admitted_ip: "203.0.113.9".parse().expect("test address parses"),
+            rtt: std::time::Duration::from_millis(42),
+            cwnd: 12_000,
+            lost_packets: 3,
+            congestion_events: 1,
+            bytes_sent: 1_000,
+            bytes_received: 2_000,
+            current_mtu: 1_452,
+            bytes_in_flight: 4_800,
+            send_blocked: std::time::Duration::from_millis(7),
+            close_reason: Some("closed by peer".to_string()),
+        };
+        let row = |expose_peer_addresses| {
+            let (tx, mut rx) = mpsc::channel(1);
+            let trace = ZakuraTrace::new(JsonlTracer::new(tx), "node-quic");
+            trace.emit_quic_conn(&sample, expose_peer_addresses);
+            let event = rx.try_recv().expect("one row is queued");
+            assert_eq!(event.table, "quic_conn");
+            serde_json::from_slice::<Value>(&event.line).expect("the row is JSON")
+        };
+
+        let redacted = row(false);
+        assert_eq!(redacted["event"], "closed");
+        assert_eq!(redacted["admitted_ip"], "v4redacted");
+        assert_eq!(redacted["rtt_micros"], 42_000);
+        assert_eq!(redacted["bytes_in_flight"], 4_800);
+        assert_eq!(redacted["send_blocked_micros"], 7_000);
+        assert_eq!(redacted["close_reason"], "closed by peer");
+        assert!(redacted["peer"]
+            .as_str()
+            .is_some_and(|peer| peer.starts_with("peer:")));
+
+        assert_eq!(row(true)["admitted_ip"], "203.0.113.9");
     }
 }

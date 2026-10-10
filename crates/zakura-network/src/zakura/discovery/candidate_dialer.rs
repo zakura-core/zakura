@@ -14,9 +14,9 @@ use std::{
 };
 
 use futures::FutureExt;
-use iroh::{EndpointAddr, EndpointId};
 use tokio::{task::JoinSet, time::Instant};
 use tracing::debug;
+use zakura_quic::{NodeAddr, NodeId};
 
 use super::dialer::native_bootstrap_dial;
 use super::protocol::{ZakuraDiscoveryDialCandidate, ZakuraDiscoveryHandle};
@@ -36,6 +36,7 @@ pub(super) enum DiscoveryDialResult {
     ConnectedElsewhere,
     ShortLivedRegistered,
     Failed,
+    AlpnMismatch,
     LocalResourceLimit,
 }
 
@@ -46,6 +47,7 @@ impl DiscoveryDialResult {
             Self::ConnectedElsewhere => "connected_elsewhere",
             Self::ShortLivedRegistered => "short_lived_registered",
             Self::Failed => "failed",
+            Self::AlpnMismatch => "alpn_mismatch",
             Self::LocalResourceLimit => "local_resource_limit",
         }
     }
@@ -53,14 +55,14 @@ impl DiscoveryDialResult {
 
 #[derive(Debug)]
 struct DiscoveryDialWorkerResult {
-    node_id: EndpointId,
+    node_id: NodeId,
     reserved_ips: Vec<IpAddr>,
     result: DiscoveryDialResult,
 }
 
 /// Exponential dial backoff for a single `(node_id, ip)` pair.
 ///
-/// Backoff is keyed by `(EndpointId, IpAddr)`, not `IpAddr` alone: a signature on a
+/// Backoff is keyed by `(NodeId, IpAddr)`, not `IpAddr` alone: a signature on a
 /// gossip record proves control of the node key, not ownership of the addresses
 /// it advertises. Keying failure backoff by IP alone would let an attacker sign
 /// throwaway node ids that all advertise an honest peer's IP and, by failing
@@ -196,9 +198,9 @@ async fn spawn_discovery_dial_candidates(
     endpoint: &ZakuraEndpoint,
     discovery: &ZakuraDiscoveryHandle,
     limits: &ZakuraLocalLimits,
-    in_flight: &mut HashSet<EndpointId>,
+    in_flight: &mut HashSet<NodeId>,
     in_flight_by_ip: &mut HashMap<IpAddr, usize>,
-    dial_backoff_by_node_ip: &HashMap<(EndpointId, IpAddr), DiscoveryIpBackoff>,
+    dial_backoff_by_node_ip: &HashMap<(NodeId, IpAddr), DiscoveryIpBackoff>,
     workers: &mut JoinSet<DiscoveryDialWorkerResult>,
     sought_services: &[ZakuraServiceId],
 ) {
@@ -252,7 +254,7 @@ async fn spawn_discovery_dial_candidates(
 }
 
 fn recover_discovery_dial_worker_panic(
-    node_id: EndpointId,
+    node_id: NodeId,
     reserved_ips: Vec<IpAddr>,
     result: std::thread::Result<DiscoveryDialWorkerResult>,
 ) -> DiscoveryDialWorkerResult {
@@ -271,9 +273,9 @@ async fn discovery_node_addr_with_reserved_ip_capacity(
     endpoint: &ZakuraEndpoint,
     candidate: &ZakuraDiscoveryDialCandidate,
     in_flight_by_ip: &HashMap<IpAddr, usize>,
-    dial_backoff_by_node_ip: &HashMap<(EndpointId, IpAddr), DiscoveryIpBackoff>,
+    dial_backoff_by_node_ip: &HashMap<(NodeId, IpAddr), DiscoveryIpBackoff>,
     now: Instant,
-) -> Option<(EndpointAddr, Vec<IpAddr>)> {
+) -> Option<(NodeAddr, Vec<IpAddr>)> {
     let mut direct_addrs = Vec::new();
     let mut reserved_ips = Vec::new();
     for addr in &candidate.direct_addrs {
@@ -290,8 +292,7 @@ async fn discovery_node_addr_with_reserved_ip_capacity(
 
     (!direct_addrs.is_empty()).then(|| {
         (
-            EndpointAddr::new(candidate.node_id)
-                .with_addrs((direct_addrs).into_iter().map(iroh::TransportAddr::Ip)),
+            NodeAddr::with_addrs(candidate.node_id, direct_addrs),
             reserved_ips,
         )
     })
@@ -328,8 +329,8 @@ fn release_discovery_in_flight_ips(in_flight_by_ip: &mut HashMap<IpAddr, usize>,
 }
 
 fn discovery_ip_is_in_backoff(
-    dial_backoff_by_node_ip: &HashMap<(EndpointId, IpAddr), DiscoveryIpBackoff>,
-    node_id: EndpointId,
+    dial_backoff_by_node_ip: &HashMap<(NodeId, IpAddr), DiscoveryIpBackoff>,
+    node_id: NodeId,
     ip: IpAddr,
     now: Instant,
 ) -> bool {
@@ -339,7 +340,7 @@ fn discovery_ip_is_in_backoff(
 }
 
 fn prune_discovery_ip_backoff(
-    dial_backoff_by_node_ip: &mut HashMap<(EndpointId, IpAddr), DiscoveryIpBackoff>,
+    dial_backoff_by_node_ip: &mut HashMap<(NodeId, IpAddr), DiscoveryIpBackoff>,
     retention: Duration,
     now: Instant,
 ) {
@@ -348,8 +349,8 @@ fn prune_discovery_ip_backoff(
 }
 
 fn apply_discovery_ip_dial_result(
-    dial_backoff_by_node_ip: &mut HashMap<(EndpointId, IpAddr), DiscoveryIpBackoff>,
-    node_id: EndpointId,
+    dial_backoff_by_node_ip: &mut HashMap<(NodeId, IpAddr), DiscoveryIpBackoff>,
+    node_id: NodeId,
     ips: &[IpAddr],
     result: DiscoveryDialResult,
     dial_backoff: (Duration, Duration),
@@ -363,21 +364,19 @@ fn apply_discovery_ip_dial_result(
                 dial_backoff_by_node_ip.remove(&(node_id, *ip));
             }
         }
-        DiscoveryDialResult::Failed => {
+        // The ALPN mismatch floor applies to the node, not to each address: an
+        // aggregate dial error doesn't say which address mismatched (DIAL-5).
+        DiscoveryDialResult::Failed | DiscoveryDialResult::AlpnMismatch => {
             for ip in ips {
                 let failure_count = dial_backoff_by_node_ip
                     .get(&(node_id, *ip))
                     .map_or(1, |backoff| backoff.failure_count.saturating_add(1));
+                let wait = discovery_ip_dial_backoff(failure_count, dial_backoff.0, dial_backoff.1);
                 dial_backoff_by_node_ip.insert(
                     (node_id, *ip),
                     DiscoveryIpBackoff {
                         failure_count,
-                        retry_at: now
-                            + discovery_ip_dial_backoff(
-                                failure_count,
-                                dial_backoff.0,
-                                dial_backoff.1,
-                            ),
+                        retry_at: now + wait,
                     },
                 );
             }
@@ -399,9 +398,9 @@ fn discovery_ip_dial_backoff(
 
 async fn run_discovery_dial_once(
     endpoint: ZakuraEndpoint,
-    node_addr: EndpointAddr,
+    node_addr: NodeAddr,
     limits: ZakuraLocalLimits,
-    node_id: EndpointId,
+    node_id: NodeId,
     reserved_ips: Vec<IpAddr>,
 ) -> DiscoveryDialWorkerResult {
     let Ok(peer_id) = ZakuraPeerId::new(node_id.as_bytes().to_vec()) else {
@@ -454,6 +453,10 @@ async fn run_discovery_dial_once(
                     }
                     Ok(Err(ZakuraHandlerError::ResourceLimit(_))) => {
                         DiscoveryDialResult::LocalResourceLimit
+                    }
+                    Ok(Err(error)) if error.is_alpn_mismatch() => {
+                        debug!(?error, "Zakura discovery peer speaks another protocol version");
+                        DiscoveryDialResult::AlpnMismatch
                     }
                     Ok(Err(error)) => {
                         debug!(?error, "Zakura discovery dial failed");
@@ -523,7 +526,7 @@ async fn wait_for_discovery_registration_to_settle(
 
 async fn apply_discovery_dial_result(
     discovery: &ZakuraDiscoveryHandle,
-    node_id: &EndpointId,
+    node_id: &NodeId,
     result: DiscoveryDialResult,
     trace: &crate::zakura::ZakuraTrace,
 ) {
@@ -546,6 +549,10 @@ async fn apply_discovery_dial_result(
             discovery.mark_dial_failure(node_id).await;
             metrics::counter!("zakura.p2p.discovery.dial.failed").increment(1);
         }
+        DiscoveryDialResult::AlpnMismatch => {
+            discovery.mark_alpn_mismatch(node_id).await;
+            metrics::counter!("zakura.p2p.discovery.dial.alpn_mismatch").increment(1);
+        }
         DiscoveryDialResult::LocalResourceLimit => {
             metrics::counter!("zakura.p2p.discovery.dial.local_resource_limit").increment(1);
         }
@@ -560,13 +567,13 @@ mod tests {
         ZakuraPeerId::new(vec![byte; 32]).expect("32-byte test peer id is valid")
     }
 
-    fn node_id(byte: u8) -> EndpointId {
-        iroh::SecretKey::from_bytes(&[byte; 32]).public()
+    fn node_id(byte: u8) -> NodeId {
+        zakura_quic::NodeSecretKey::from_bytes(&[byte; 32]).public()
     }
 
     #[test]
     fn panicked_worker_returns_metadata_needed_to_release_reservations() {
-        let node_id = iroh::SecretKey::from_bytes(&[3; 32]).public();
+        let node_id = zakura_quic::NodeSecretKey::from_bytes(&[3; 32]).public();
         let ip = IpAddr::from([93, 184, 216, 34]);
         let mut in_flight = HashSet::from([node_id]);
         let mut in_flight_by_ip = HashMap::new();
@@ -713,5 +720,43 @@ mod tests {
                 .await,
             DiscoveryDialResult::ConnectedElsewhere
         );
+    }
+
+    // V12 F-305587: an ALPN mismatch from one stale address used to put every
+    // address of the record into the ten-minute floor. The floor now lives on
+    // the node in the discovery book, and each address gets the ordinary backoff.
+    #[test]
+    fn alpn_mismatch_gives_each_address_the_ordinary_backoff() {
+        let node = node_id(1);
+        let ips = [
+            IpAddr::from([93, 184, 216, 34]),
+            IpAddr::from([198, 51, 100, 7]),
+        ];
+        let now = Instant::now();
+        let mut backoff_by_node_ip = HashMap::new();
+
+        apply_discovery_ip_dial_result(
+            &mut backoff_by_node_ip,
+            node,
+            &ips,
+            DiscoveryDialResult::AlpnMismatch,
+            (Duration::from_secs(60), Duration::from_secs(3_600)),
+            now,
+        );
+
+        for ip in ips {
+            assert!(discovery_ip_is_in_backoff(
+                &backoff_by_node_ip,
+                node,
+                ip,
+                now + Duration::from_secs(59)
+            ));
+            assert!(!discovery_ip_is_in_backoff(
+                &backoff_by_node_ip,
+                node,
+                ip,
+                now + Duration::from_secs(60)
+            ));
+        }
     }
 }

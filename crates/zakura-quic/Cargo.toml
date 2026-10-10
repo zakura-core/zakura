@@ -1,0 +1,46 @@
+[package]
+name = "zakura-quic"
+version = "0.1.0"
+authors.workspace = true
+description = "Direct QUIC transport for Zakura's native P2P stack, built on quinn-proto. Internal crate, published to support cargo install zakura"
+license.workspace = true
+repository.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+keywords.workspace = true
+categories = ["cryptography::cryptocurrencies", "network-programming"]
+
+[features]
+default = []
+
+# Per-connection qlog output (SPEC CTRL-25). Release builds leave it off.
+qlog = ["quinn-proto/qlog"]
+
+[dependencies]
+# SPEC DEP-2 lists every allowed direct dependency. Adding one needs a spec change.
+bytes = { workspace = true }
+curve25519-dalek = { workspace = true }
+ed25519-zebra = { workspace = true }
+futures = { workspace = true }
+hex = { workspace = true }
+libc = { workspace = true }
+metrics = { workspace = true }
+quinn-proto = { workspace = true }
+ring = { workspace = true }
+rustls = { workspace = true }
+rustls-pki-types = { workspace = true }
+serde = { workspace = true, features = ["serde_derive"] }
+socket2 = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["net", "rt", "sync", "time", "macros"] }
+tracing = { workspace = true }
+zeroize = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full", "test-util"] }
+sha2 = { workspace = true }
+tempfile = { workspace = true }
+toml = { workspace = true }
+
+[lints]
+workspace = true

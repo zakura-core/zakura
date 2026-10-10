@@ -23,6 +23,8 @@ pub fn test_transaction_serialization() {
         value_balance_zat: None,
         orchard: None,
         ironwood: None,
+        #[cfg(zcash_unstable = "nutachyon")]
+        tachyon: None,
         binding_sig: None,
         joinsplit_pub_key: None,
         joinsplit_sig: None,
@@ -59,6 +61,8 @@ pub fn test_transaction_serialization() {
         value_balance_zat: None,
         orchard: None,
         ironwood: None,
+        #[cfg(zcash_unstable = "nutachyon")]
+        tachyon: None,
         binding_sig: None,
         joinsplit_pub_key: None,
         joinsplit_sig: None,

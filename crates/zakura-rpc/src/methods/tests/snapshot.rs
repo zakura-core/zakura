@@ -724,7 +724,7 @@ fn snapshot_rpc_getinfo(info: GetInfoResponse, settings: &insta::Settings) {
     info["errorstimestamp"] = "[LastErrorTimestamp]".into();
 
     settings.bind(|| {
-        insta::assert_json_snapshot!("get_info", info);
+        insta::assert_json_snapshot!(build_snapshot_name("get_info"), info);
     });
 }
 
@@ -741,7 +741,10 @@ fn snapshot_rpc_getblockchaininfo(
     info["verificationprogress"] = "[f64]".into();
 
     settings.bind(|| {
-        insta::assert_json_snapshot!(format!("get_blockchain_info{variant_suffix}"), info);
+        insta::assert_json_snapshot!(
+            build_snapshot_name(&format!("get_blockchain_info{variant_suffix}")),
+            info
+        );
     });
 }
 
@@ -781,7 +784,10 @@ fn snapshot_rpc_getblock_verbose(
     settings: &insta::Settings,
 ) {
     settings.bind(|| {
-        insta::assert_json_snapshot!(format!("get_block_verbose_{variant}"), block);
+        insta::assert_json_snapshot!(
+            build_snapshot_name(&format!("get_block_verbose_{variant}")),
+            block
+        )
     });
 }
 
@@ -935,7 +941,7 @@ fn snapshot_rpc_getnetworkinfo(
     settings: &insta::Settings,
 ) {
     settings.bind(|| {
-        insta::assert_json_snapshot!("get_network_info", get_network_info);
+        insta::assert_json_snapshot!(build_snapshot_name("get_network_info"), get_network_info)
     });
 }
 
@@ -1049,6 +1055,8 @@ pub async fn test_mining_rpcs<State, ReadState>(
         miner_memo: None,
         // TODO: Use default field values when optional features are enabled in tests #8183
         internal_miner: true,
+        #[cfg(zcash_unstable = "nutachyon")]
+        tachyon_workload: false,
         optimistic_block_inventory: true,
     };
 
@@ -1513,4 +1521,12 @@ pub async fn test_mining_rpcs<State, ReadState>(
         .expect("unexpected error in z_list_unified_receivers RPC call");
 
     snapshot_rpc_z_listunifiedreceivers("ua2", z_list_unified_receivers, &settings);
+}
+
+fn build_snapshot_name(name: &str) -> String {
+    if cfg!(zcash_unstable = "nutachyon") {
+        format!("{name}_tachyon")
+    } else {
+        name.to_owned()
+    }
 }

@@ -52,6 +52,9 @@ use super::super::*;
 use config::mining;
 use types::long_poll::LONG_POLL_ID_LENGTH;
 
+#[cfg(zcash_unstable = "nutachyon")]
+mod tachyon_sync;
+
 type MockRpc<Mempool, State, ReadState, Tip> = RpcImpl<
     Mempool,
     State,
@@ -3182,6 +3185,8 @@ async fn zip234_mining_rpcs_include_the_reissuance_bonus() {
                     extra_coinbase_data: None,
                     miner_memo: None,
                     internal_miner: true,
+                    #[cfg(zcash_unstable = "nutachyon")]
+                    tachyon_workload: false,
                     optimistic_block_inventory: true,
                 },
                 Default::default(),
@@ -3465,6 +3470,8 @@ async fn gbt_with(net: Network, addr: ZcashAddress) {
         extra_coinbase_data: None,
         miner_memo: None,
         internal_miner: true,
+        #[cfg(zcash_unstable = "nutachyon")]
+        tachyon_workload: false,
         optimistic_block_inventory: true,
     };
 
@@ -4197,6 +4204,8 @@ async fn rpc_getdifficulty() {
         extra_coinbase_data: None,
         miner_memo: None,
         internal_miner: true,
+        #[cfg(zcash_unstable = "nutachyon")]
+        tachyon_workload: false,
         optimistic_block_inventory: true,
     };
 

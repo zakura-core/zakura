@@ -344,6 +344,8 @@ fn build_testnet(a: u32) -> Result<Network, String> {
             NetworkUpgrade::Nu6_2 => h.nu6_2 = v,
             NetworkUpgrade::Nu6_3 => h.nu6_3 = v,
             NetworkUpgrade::Nu7 => h.nu7 = v,
+            #[cfg(zcash_unstable = "nutachyon")]
+            NetworkUpgrade::NuTachyon => h.nu_tachyon = v,
         }
     }
     h.nu7 = Some(a);
@@ -370,6 +372,8 @@ fn build_regtest() -> Result<Network, String> {
         nu6_2: one,
         nu6_3: one,
         nu7: Some(300),
+        #[cfg(zcash_unstable = "nutachyon")]
+        nu_tachyon: None,
     };
     testnet::Parameters::new_regtest(RegtestParameters {
         activation_heights: heights,

@@ -63,6 +63,15 @@ pub struct Config {
     #[serde(default)]
     pub internal_miner: bool,
 
+    /// Generate a deterministic Tachyon transaction workload for internally mined blocks.
+    ///
+    /// This test-only workload replaces mempool transactions. Miner rewards use
+    /// anyone-can-spend outputs, which are shielded to generated Tachyon recipients
+    /// when they mature. Requires `internal_miner` on a proof-of-work-disabled test network.
+    #[cfg(zcash_unstable = "nutachyon")]
+    #[serde(default)]
+    pub tachyon_workload: bool,
+
     /// Advertise prepared mined block hashes after expected-work validation and state admission,
     /// but before contextual commit completes.
     pub optimistic_block_inventory: bool,
@@ -103,6 +112,8 @@ impl Default for Config {
             extra_coinbase_data: None,
             miner_memo: None,
             internal_miner: false,
+            #[cfg(zcash_unstable = "nutachyon")]
+            tachyon_workload: false,
             optimistic_block_inventory: true,
         }
     }

@@ -143,6 +143,8 @@ fn transparent_coinbase() -> anyhow::Result<()> {
             nu6: Some(7),
             nu6_1: Some(8),
             nu6_3: Some(9),
+            #[cfg(zcash_unstable = "nutachyon")]
+            nu_tachyon: Some(10),
             ..Default::default()
         })?
         .with_funding_streams(vec![
@@ -224,6 +226,186 @@ fn local_genesis_activation_coinbase_includes_lockbox_marker() -> anyhow::Result
     let lockbox_output = transparent::Output::new(*lockbox_amount, lockbox_address.script());
 
     assert!(transaction.outputs().contains(&lockbox_output));
+
+    Ok(())
+}
+
+/// The Tachyon workload is limited to internal mining on proof-of-work-disabled test networks and
+/// splits the miner reward into independently spendable outputs.
+#[cfg(zcash_unstable = "nutachyon")]
+#[test]
+fn tachyon_workload_coinbase_outputs() {
+    use crate::{
+        config::mining::Config,
+        methods::types::get_block_template::{REDEEM_SCRIPT_HASH, TRANSACTIONS_PER_BLOCK},
+    };
+
+    let network = Network::new_regtest(testnet::RegtestParameters {
+        activation_heights: ConfiguredActivationHeights {
+            nu5: Some(2),
+            nu6: Some(3),
+            nu6_1: Some(4),
+            nu6_2: Some(5),
+            nu6_3: Some(6),
+            nu_tachyon: Some(8),
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+    let config = Config {
+        internal_miner: true,
+        tachyon_workload: true,
+        ..Default::default()
+    };
+    let miner_params = MinerParams::new(&network, config.clone())
+        .expect("proof-of-work-disabled test networks support the Tachyon workload");
+    let height = Height(20);
+    let template =
+        TransactionTemplate::new_coinbase(&network, height, &miner_params, Amount::zero(), None)
+            .expect("workload coinbase can be built");
+    let coinbase: Transaction = template
+        .data()
+        .as_ref()
+        .zcash_deserialize_into()
+        .expect("workload coinbase deserializes");
+    let workload_script =
+        transparent::Address::from_script_hash(network.t_addr_kind(), REDEEM_SCRIPT_HASH).script();
+
+    let reserved =
+        TransactionTemplate::coinbase_resource_usage(&network, height, &miner_params, None)
+            .expect("workload coinbase resources are known");
+    let ordinary_params = MinerParams::from(miner_params.addr().clone());
+    let ordinary =
+        TransactionTemplate::coinbase_resource_usage(&network, height, &ordinary_params, None)
+            .expect("ordinary coinbase resources are known");
+    let output_size = coinbase
+        .outputs()
+        .iter()
+        .find(|output| output.lock_script == workload_script)
+        .expect("the workload pays a transparent reward")
+        .zcash_serialized_size();
+    assert_eq!(
+        reserved.max_serialized_size,
+        ordinary.max_serialized_size + (TRANSACTIONS_PER_BLOCK - 1) * output_size
+    );
+    assert_eq!(coinbase.version(), 7);
+    assert_coinbase_resource_usage(&network, height, &miner_params, &coinbase)
+        .expect("V7 workload resource usage matches the serialized coinbase");
+
+    assert_eq!(
+        coinbase
+            .outputs()
+            .iter()
+            .filter(|output| output.lock_script == workload_script)
+            .count(),
+        TRANSACTIONS_PER_BLOCK,
+    );
+
+    let mut missing_internal_miner = config;
+    missing_internal_miner.internal_miner = false;
+    assert!(MinerParams::new(&network, missing_internal_miner).is_err());
+    assert!(MinerParams::new(
+        &Network::Mainnet,
+        Config {
+            internal_miner: true,
+            tachyon_workload: true,
+            ..Default::default()
+        }
+    )
+    .is_err());
+}
+
+/// Transaction selection and proposal construction must work across NuTachyon activation.
+#[cfg(zcash_unstable = "nutachyon")]
+#[test]
+fn nu_tachyon_template_converts_to_proposal_block() -> anyhow::Result<()> {
+    use crate::methods::types::{
+        get_block_template::proposal::proposal_block_from_template, long_poll::LongPollInput,
+    };
+    use zakura_chain::{
+        block::ChainHistoryMmrRootHash,
+        serialization::{BytesInDisplayOrder, DateTime32},
+        work::difficulty::{CompactDifficulty, ExpandedDifficulty, U256},
+    };
+
+    let net = testnet::Parameters::build()
+        .with_activation_heights(ConfiguredActivationHeights {
+            canopy: Some(1),
+            nu5: Some(2),
+            nu6: Some(3),
+            nu6_1: Some(4),
+            nu6_2: Some(5),
+            nu6_3: Some(6),
+            nu_tachyon: Some(8),
+            ..Default::default()
+        })?
+        .clear_funding_streams()
+        .to_network()?;
+    let activation_height = NetworkUpgrade::NuTachyon
+        .activation_height(&net)
+        .ok_or(anyhow!("NuTachyon activation height must be configured"))?;
+    for height in [
+        activation_height.previous()?,
+        activation_height,
+        activation_height.next()?,
+    ] {
+        let tip_height = height.previous()?;
+        let miner_params = MinerParams::from(
+            Address::decode(
+                &net,
+                default_miner_address(net.kind(), &MinerAddressType::Transparent),
+            )
+            .ok_or(anyhow!("hard-coded transparent address must be valid"))?,
+        );
+        let now = DateTime32::now();
+        let chain_info = zakura_state::GetBlockTemplateChainInfo {
+            tip_hash: net.genesis_hash(),
+            tip_height,
+            chain_history_root: Some(ChainHistoryMmrRootHash::default()),
+            expected_difficulty: CompactDifficulty::from(ExpandedDifficulty::from(U256::one())),
+            cur_time: now,
+            min_time: now,
+            max_time: now,
+            value_pools: Default::default(),
+        };
+        let long_poll_id =
+            LongPollInput::new(tip_height, chain_info.tip_hash, now, []).generate_id();
+        // Mining reserves coinbase resources even with an empty mempool. Calling
+        // new_internal directly would miss unsupported-version errors in this path.
+        let selected = super::zip317::select_mempool_transactions(
+            &net,
+            height,
+            &miner_params,
+            None,
+            vec![],
+            Default::default(),
+        )?;
+        let template = super::BlockTemplateResponse::new_internal(
+            &net,
+            None,
+            &miner_params,
+            &chain_info,
+            long_poll_id,
+            selected,
+            None,
+        )?;
+
+        let block = proposal_block_from_template(&template, None, &net)?;
+        let coinbase = &block.transactions[0];
+        assert_eq!(
+            coinbase.version(),
+            if height < activation_height { 6 } else { 7 }
+        );
+        assert_coinbase_resource_usage(&net, height, &miner_params, coinbase)?;
+
+        assert_eq!(
+            block.header.commitment_bytes.0,
+            template
+                .default_roots
+                .block_commitments_hash
+                .bytes_in_serialized_order(),
+        );
+    }
 
     Ok(())
 }

@@ -18,10 +18,9 @@ use zakura_chain::{
     block::{self, Block},
     parameters::{Magic, Network},
     serialization::{
-        sha256d, zcash_deserialize_external_count, zcash_deserialize_string_external_count,
-        CompactSizeMessage, FakeWriter, ReadZcashExt, SerializationError as Error,
-        ZcashDeserialize, ZcashDeserializeInto, ZcashSerialize, MAX_HEADERS_PER_MESSAGE,
-        MAX_PROTOCOL_MESSAGE_LEN,
+        sha256d, zcash_deserialize_string_external_count, CompactSizeMessage, FakeWriter,
+        ReadZcashExt, SerializationError as Error, ZcashDeserialize, ZcashDeserializeInto,
+        ZcashReader, ZcashSerialize, MAX_HEADERS_PER_MESSAGE, MAX_PROTOCOL_MESSAGE_LEN,
     },
     transaction::Transaction,
 };
@@ -470,7 +469,7 @@ impl Decoder for Codec {
                         continue 'messages;
                     }
 
-                    let mut body_reader = Cursor::new(&body);
+                    let mut body_reader = &body[..];
 
                     // The body bytes are owned locally and the decoder state was
                     // reset above, before entering this unwind boundary. Body
@@ -526,7 +525,7 @@ impl Decoder for Codec {
 
                         // Bitcoin allows extra data at the end of most messages,
                         // so old nodes can read newer formats and ignore extra fields.
-                        let extra_bytes = body.len() as u64 - body_reader.position();
+                        let extra_bytes = body_reader.len();
                         if extra_bytes == 0 {
                             trace!(?extra_bytes, %msg, "finished message decoding");
                         } else {
@@ -741,8 +740,8 @@ impl Codec {
         Ok(Message::GetAddr)
     }
 
-    fn read_block<R: Read + std::marker::Send>(&self, reader: R) -> Result<Message, Error> {
-        let result = Self::deserialize_block_spawning(reader);
+    fn read_block(&self, reader: &mut &[u8]) -> Result<Message, Error> {
+        let result = self.deserialize_block_spawning(reader);
         let block = result?.into();
 
         #[cfg(test)]
@@ -771,9 +770,10 @@ impl Codec {
     /// See [Zcash block header] for the enumeration of these fields.
     ///
     /// [Zcash block header](https://zips.z.cash/protocol/protocol.pdf#page=84)
-    fn read_headers<R: Read>(&self, mut reader: R) -> Result<Message, Error> {
+    fn read_headers(&self, bytes: &mut &[u8]) -> Result<Message, Error> {
+        let mut reader = ZcashReader::from_slice(bytes);
         // CompactSizeMessage is bounded to MAX_PROTOCOL_MESSAGE_LEN on deserialization.
-        let count: CompactSizeMessage = (&mut reader).zcash_deserialize_into()?;
+        let count: CompactSizeMessage = reader.read_value()?;
         // Infallible: CompactSizeMessage wraps u32, which always fits in usize.
         let count: usize = count.into();
         if count > MAX_HEADERS_PER_MESSAGE {
@@ -781,10 +781,7 @@ impl Codec {
                 "headers message exceeds the protocol limit of 160 entries",
             ));
         }
-        Ok(Message::Headers(zcash_deserialize_external_count(
-            count,
-            &mut reader,
-        )?))
+        Ok(Message::Headers(reader.read_external_count(count)?))
     }
 
     fn read_getheaders<R: Read>(&self, mut reader: R) -> Result<Message, Error> {
@@ -814,8 +811,8 @@ impl Codec {
         Ok(Message::NotFound(Vec::zcash_deserialize(reader)?))
     }
 
-    fn read_tx<R: Read + std::marker::Send>(&self, reader: R) -> Result<Message, Error> {
-        let result = Self::deserialize_transaction_spawning(reader);
+    fn read_tx(&self, reader: &mut &[u8]) -> Result<Message, Error> {
+        let result = self.deserialize_transaction_spawning(reader);
         let transaction = result?.into();
 
         #[cfg(test)]
@@ -843,9 +840,7 @@ impl Codec {
 
     /// Given the reader, deserialize the transaction in the rayon thread pool.
     #[allow(clippy::unwrap_in_result)]
-    fn deserialize_transaction_spawning<R: Read + std::marker::Send>(
-        reader: R,
-    ) -> Result<Transaction, Error> {
+    fn deserialize_transaction_spawning(&self, reader: &mut &[u8]) -> Result<Transaction, Error> {
         let mut result = None;
 
         // Correctness: Do CPU-intensive work on a dedicated thread, to avoid blocking other futures.
@@ -858,7 +853,7 @@ impl Codec {
         // - There is no way to check the blocking task's future for panics
         tokio::task::block_in_place(|| {
             rayon::in_place_scope_fifo(|s| {
-                s.spawn_fifo(|_s| result = Some(Transaction::zcash_deserialize(reader)))
+                s.spawn_fifo(|_s| result = Some(Transaction::zcash_deserialize_from_slice(reader)))
             })
         });
 
@@ -867,7 +862,7 @@ impl Codec {
 
     /// Given the reader, deserialize the block in the rayon thread pool.
     #[allow(clippy::unwrap_in_result)]
-    fn deserialize_block_spawning<R: Read + std::marker::Send>(reader: R) -> Result<Block, Error> {
+    fn deserialize_block_spawning(&self, reader: &mut &[u8]) -> Result<Block, Error> {
         let mut result = None;
 
         // Correctness: Do CPU-intensive work on a dedicated thread, to avoid blocking other futures.
@@ -880,7 +875,7 @@ impl Codec {
         // - There is no way to check the blocking task's future for panics
         tokio::task::block_in_place(|| {
             rayon::in_place_scope_fifo(|s| {
-                s.spawn_fifo(|_s| result = Some(Block::zcash_deserialize(reader)))
+                s.spawn_fifo(|_s| result = Some(Block::zcash_deserialize_from_slice(reader)))
             })
         });
 

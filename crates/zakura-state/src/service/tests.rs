@@ -21,6 +21,8 @@ use zakura_chain::{
 
 use zakura_test::{prelude::*, transcript::Transcript};
 
+use crate::tests::FakeChainHelper;
+
 use crate::{
     arbitrary::Prepare,
     init_test,
@@ -425,214 +427,194 @@ fn mined_orphans_finish_without_entering_the_sync_queue() {
         .is_some());
 }
 
-fn prepared_relay_test_state() -> (
-    Network,
-    super::finalized_state::FinalizedState,
-    super::non_finalized_state::NonFinalizedState,
-    Arc<Block>,
-) {
-    use crate::tests::FakeChainHelper;
-
-    let network = Network::Mainnet;
-    let heartwood_height = NetworkUpgrade::Heartwood
-        .activation_height(&network)
-        .expect("Heartwood activates")
-        .0;
-    let root = Arc::new(
-        network.block_map()[&(heartwood_height - 1)]
-            .zcash_deserialize_into::<Block>()
-            .expect("pre-Heartwood test block is valid"),
-    );
-    let finalized = super::finalized_state::FinalizedState::new(&Config::ephemeral(), &network)
-        .expect("ephemeral finalized state opens");
-    let mut non_finalized = super::non_finalized_state::NonFinalizedState::new(&network);
-    non_finalized
-        .commit_new_chain(root.clone().prepare(), &finalized)
-        .expect("root commits");
-    let activation = root.make_fake_child().set_block_commitment([0; 32]);
-    non_finalized
-        .commit_block(activation.clone().prepare(), &finalized)
-        .expect("Heartwood activation commits");
-    let sibling_commitment: [u8; 32] = non_finalized
-        .best_chain()
-        .expect("activation chain exists")
-        .history_block_commitment_tree()
-        .hash()
-        .expect("activation creates a history root")
-        .into();
-    let best = activation
-        .make_fake_child()
-        .set_block_commitment(sibling_commitment)
-        .set_work(100);
-    let side = activation
-        .make_fake_child()
-        .set_block_commitment(sibling_commitment)
-        .set_work(50);
-    non_finalized
-        .commit_block(best.prepare(), &finalized)
-        .expect("best child commits");
-    non_finalized
-        .commit_block(side.clone().prepare(), &finalized)
-        .expect("side child commits");
-
-    (network, finalized, non_finalized, side)
+/// A Heartwood-activation state the relay preflight tests share.
+struct Fixture {
+    network: Network,
+    finalized: super::finalized_state::FinalizedState,
+    non_finalized: super::non_finalized_state::NonFinalizedState,
+    /// The block the test builds its candidate on.
+    parent: Arc<Block>,
 }
 
-fn prepared_relay_difficulty_context() -> (
-    Network,
-    super::finalized_state::FinalizedState,
-    super::non_finalized_state::NonFinalizedState,
-    Arc<Block>,
-) {
-    use crate::tests::FakeChainHelper;
-    use zakura_header_chain::POW_ADJUSTMENT_BLOCK_SPAN;
-
-    let network = Network::Mainnet;
-    let heartwood_height = NetworkUpgrade::Heartwood
-        .activation_height(&network)
-        .expect("Heartwood activates")
-        .0;
-    let root = Arc::new(
-        network.block_map()[&(heartwood_height - 1)]
-            .zcash_deserialize_into::<Block>()
-            .expect("pre-Heartwood test block is valid"),
-    );
-    let finalized = super::finalized_state::FinalizedState::new(&Config::ephemeral(), &network)
-        .expect("ephemeral finalized state opens");
-    let mut non_finalized = super::non_finalized_state::NonFinalizedState::new(&network);
-    non_finalized
-        .commit_new_chain(root.clone().prepare(), &finalized)
-        .expect("root commits");
-    let mut tip = root;
-    for context_index in 0..POW_ADJUSTMENT_BLOCK_SPAN {
-        let commitment = if context_index == 0 {
-            [0; 32]
-        } else {
-            non_finalized
-                .best_chain()
-                .expect("the context chain exists")
-                .history_block_commitment_tree()
-                .hash()
-                .expect("the context chain has a history root")
-                .into()
-        };
-        let mut child = tip.make_fake_child().set_block_commitment(commitment);
-        let child_height = child.coinbase_height().expect("the child has a height");
-        Arc::make_mut(&mut Arc::make_mut(&mut child).header).time =
-            tip.header.time + NetworkUpgrade::target_spacing_for_height(&network, child_height);
+impl Fixture {
+    /// A state whose best chain ends just after the Heartwood activation block.
+    fn heartwood() -> Self {
+        let network = Network::Mainnet;
+        let heartwood_height = NetworkUpgrade::Heartwood
+            .activation_height(&network)
+            .expect("Heartwood activates")
+            .0;
+        let root = Arc::new(
+            network.block_map()[&(heartwood_height - 1)]
+                .zcash_deserialize_into::<Block>()
+                .expect("pre-Heartwood test block is valid"),
+        );
+        let finalized = super::finalized_state::FinalizedState::new(&Config::ephemeral(), &network)
+            .expect("ephemeral finalized state opens");
+        let mut non_finalized = super::non_finalized_state::NonFinalizedState::new(&network);
         non_finalized
-            .commit_block(child.clone().prepare(), &finalized)
-            .expect("difficulty context block commits");
-        tip = child;
+            .commit_new_chain(root.clone().prepare(), &finalized)
+            .expect("root commits");
+        let activation = root.make_fake_child().set_block_commitment([0; 32]);
+        non_finalized
+            .commit_block(activation.clone().prepare(), &finalized)
+            .expect("Heartwood activation commits");
+
+        Self {
+            network,
+            finalized,
+            non_finalized,
+            parent: activation,
+        }
     }
 
-    (network, finalized, non_finalized, tip)
+    /// The Heartwood state, plus a heavier best child and the lighter side child it returns.
+    fn with_side_chain() -> Self {
+        let mut fixture = Self::heartwood();
+        let activation = fixture.parent.clone();
+        let sibling_commitment = fixture.best_chain_commitment();
+        let best = activation
+            .make_fake_child()
+            .set_block_commitment(sibling_commitment)
+            .set_work(100);
+        let side = activation
+            .make_fake_child()
+            .set_block_commitment(sibling_commitment)
+            .set_work(50);
+        fixture
+            .non_finalized
+            .commit_block(best.prepare(), &fixture.finalized)
+            .expect("best child commits");
+        fixture
+            .non_finalized
+            .commit_block(side.clone().prepare(), &fixture.finalized)
+            .expect("side child commits");
+        fixture.parent = side;
+
+        fixture
+    }
+
+    /// The Heartwood state extended by one full difficulty-adjustment window.
+    fn with_difficulty_context() -> Self {
+        use zakura_header_chain::POW_ADJUSTMENT_BLOCK_SPAN;
+
+        let mut fixture = Self::heartwood();
+        // The activation block is the first block of the window.
+        for _ in 1..POW_ADJUSTMENT_BLOCK_SPAN {
+            let commitment = fixture.best_chain_commitment();
+            let mut child = fixture
+                .parent
+                .make_fake_child()
+                .set_block_commitment(commitment);
+            let child_height = child.coinbase_height().expect("the child has a height");
+            Arc::make_mut(&mut Arc::make_mut(&mut child).header).time = fixture.parent.header.time
+                + NetworkUpgrade::target_spacing_for_height(&fixture.network, child_height);
+            fixture
+                .non_finalized
+                .commit_block(child.clone().prepare(), &fixture.finalized)
+                .expect("difficulty context block commits");
+            fixture.parent = child;
+        }
+
+        fixture
+    }
+
+    /// The history root the best chain commits to.
+    fn best_chain_commitment(&self) -> [u8; 32] {
+        self.non_finalized
+            .best_chain()
+            .expect("the best chain exists")
+            .history_block_commitment_tree()
+            .hash()
+            .expect("the best chain has a history root")
+            .into()
+    }
+
+    /// Runs the relay preflight for a candidate built on this fixture.
+    fn preflight(
+        &self,
+        child: Arc<Block>,
+    ) -> Result<crate::PreparedMinedRelayEligibility, BoxError> {
+        super::check_prepared_mined_relay_eligibility_for_state(
+            &self.network,
+            &self.non_finalized,
+            &self.finalized.db,
+            crate::BlockCommitmentData {
+                block: child,
+                auth_data_root: None,
+            },
+        )
+    }
 }
 
 #[test]
 fn prepared_relay_preflight_authorizes_a_selected_tip_child() {
-    use crate::tests::FakeChainHelper;
-
     let _init_guard = zakura_test::init();
-    let (network, finalized, non_finalized, _) = prepared_relay_test_state();
-    let best = non_finalized
+    let fixture = Fixture::with_side_chain();
+    let best = fixture
+        .non_finalized
         .best_tip_block()
         .expect("the test state has a best tip")
         .block
         .clone();
-    let commitment: [u8; 32] = non_finalized
-        .best_chain()
-        .expect("the best chain exists")
-        .history_block_commitment_tree()
-        .hash()
-        .expect("the best chain has a history root")
-        .into();
-    let child = best.make_fake_child().set_block_commitment(commitment);
-
-    let eligibility = super::check_prepared_mined_relay_eligibility_for_state(
-        &network,
-        &non_finalized,
-        &finalized.db,
-        crate::BlockCommitmentData {
-            block: child,
-            auth_data_root: None,
-        },
-    )
-    .expect("the selected tip child passes the relay preflight");
+    let child = best
+        .make_fake_child()
+        .set_block_commitment(fixture.best_chain_commitment());
 
     assert_eq!(
-        eligibility,
+        fixture
+            .preflight(child)
+            .expect("the selected tip child passes the relay preflight"),
         crate::PreparedMinedRelayEligibility::Authorized
     );
 }
 
 #[test]
 fn prepared_relay_preflight_uses_commit_first_for_a_side_chain() {
-    use crate::tests::FakeChainHelper;
-
     let _init_guard = zakura_test::init();
-    let (network, finalized, non_finalized, side) = prepared_relay_test_state();
+    let fixture = Fixture::with_side_chain();
+    let side = fixture.parent.clone();
     let parent_hash = side.hash();
-    let parent_chain = non_finalized
+    let parent_chain = fixture
+        .non_finalized
         .find_chain(|chain| chain.contains_block_hash(parent_hash))
         .expect("side parent chain exists");
-    let history_tree =
-        super::read::tree::history_tree(Some(parent_chain), &finalized.db, parent_hash.into())
-            .expect("side parent has a history tree");
+    let history_tree = super::read::tree::history_tree(
+        Some(parent_chain),
+        &fixture.finalized.db,
+        parent_hash.into(),
+    )
+    .expect("side parent has a history tree");
     let commitment: [u8; 32] = history_tree
         .hash()
         .expect("the side chain has a history root")
         .into();
     let child = side.make_fake_child().set_block_commitment(commitment);
 
-    let eligibility = super::check_prepared_mined_relay_eligibility_for_state(
-        &network,
-        &non_finalized,
-        &finalized.db,
-        crate::BlockCommitmentData {
-            block: child,
-            auth_data_root: None,
-        },
-    )
-    .expect("the side-chain child proves its expected work");
-
     assert_eq!(
-        eligibility,
+        fixture
+            .preflight(child)
+            .expect("the side-chain child proves its expected work"),
         crate::PreparedMinedRelayEligibility::CommitFirst
     );
 }
 
 #[test]
 fn prepared_relay_preflight_rejects_an_easier_claimed_target() {
-    use crate::tests::FakeChainHelper;
-
     let _init_guard = zakura_test::init();
-    let (network, finalized, non_finalized, tip) = prepared_relay_difficulty_context();
-    let commitment: [u8; 32] = non_finalized
-        .best_chain()
-        .expect("the best chain exists")
-        .history_block_commitment_tree()
-        .hash()
-        .expect("the best chain has a history root")
-        .into();
+    let fixture = Fixture::with_difficulty_context();
+    let tip = fixture.parent.clone();
     let mut child = tip
         .make_fake_child()
-        .set_block_commitment(commitment)
+        .set_block_commitment(fixture.best_chain_commitment())
         .set_work(1);
     let child_height = child.coinbase_height().expect("the child has a height");
     Arc::make_mut(&mut Arc::make_mut(&mut child).header).time =
-        tip.header.time + NetworkUpgrade::target_spacing_for_height(&network, child_height);
+        tip.header.time + NetworkUpgrade::target_spacing_for_height(&fixture.network, child_height);
 
-    let error = super::check_prepared_mined_relay_eligibility_for_state(
-        &network,
-        &non_finalized,
-        &finalized.db,
-        crate::BlockCommitmentData {
-            block: child,
-            auth_data_root: None,
-        },
-    )
-    .expect_err("an easier claimed target fails the relay preflight");
+    let error = fixture
+        .preflight(child)
+        .expect_err("an easier claimed target fails the relay preflight");
 
     assert!(matches!(
         error.downcast_ref::<ValidateContextError>(),
@@ -642,45 +624,36 @@ fn prepared_relay_preflight_rejects_an_easier_claimed_target() {
 
 #[test]
 fn prepared_relay_preflight_rejects_time_at_or_below_median() {
-    use crate::tests::FakeChainHelper;
     use zakura_header_chain::{AdjustedDifficulty, POW_ADJUSTMENT_BLOCK_SPAN};
 
     let _init_guard = zakura_test::init();
-    let (network, finalized, non_finalized, tip) = prepared_relay_difficulty_context();
-    let commitment: [u8; 32] = non_finalized
-        .best_chain()
-        .expect("the best chain exists")
-        .history_block_commitment_tree()
-        .hash()
-        .expect("the best chain has a history root")
-        .into();
+    let fixture = Fixture::with_difficulty_context();
+    let tip = fixture.parent.clone();
     let parent_hash = tip.hash();
-    let mut child = tip.make_fake_child().set_block_commitment(commitment);
-    let too_early = super::any_ancestor_blocks(&non_finalized, &finalized.db, parent_hash)
-        .take(11)
-        .last()
-        .expect("the context has a median-time window")
-        .header
-        .time;
+    let mut child = tip
+        .make_fake_child()
+        .set_block_commitment(fixture.best_chain_commitment());
+    let too_early =
+        super::any_ancestor_blocks(&fixture.non_finalized, &fixture.finalized.db, parent_hash)
+            .take(11)
+            .last()
+            .expect("the context has a median-time window")
+            .header
+            .time;
     Arc::make_mut(&mut Arc::make_mut(&mut child).header).time = too_early;
-    let relevant_data = super::any_ancestor_blocks(&non_finalized, &finalized.db, parent_hash)
-        .take(POW_ADJUSTMENT_BLOCK_SPAN)
-        .map(|block| (block.header.difficulty_threshold, block.header.time));
-    let expected_target = AdjustedDifficulty::new_from_block(&child, &network, relevant_data)
-        .expect("the context derives an expected target")
-        .expected_difficulty_threshold();
+    let relevant_data =
+        super::any_ancestor_blocks(&fixture.non_finalized, &fixture.finalized.db, parent_hash)
+            .take(POW_ADJUSTMENT_BLOCK_SPAN)
+            .map(|block| (block.header.difficulty_threshold, block.header.time));
+    let expected_target =
+        AdjustedDifficulty::new_from_block(&child, &fixture.network, relevant_data)
+            .expect("the context derives an expected target")
+            .expected_difficulty_threshold();
     Arc::make_mut(&mut Arc::make_mut(&mut child).header).difficulty_threshold = expected_target;
 
-    let error = super::check_prepared_mined_relay_eligibility_for_state(
-        &network,
-        &non_finalized,
-        &finalized.db,
-        crate::BlockCommitmentData {
-            block: child,
-            auth_data_root: None,
-        },
-    )
-    .expect_err("a time at or below median-time-past fails the relay preflight");
+    let error = fixture
+        .preflight(child)
+        .expect_err("a time at or below median-time-past fails the relay preflight");
 
     assert!(matches!(
         error.downcast_ref::<ValidateContextError>(),
@@ -690,22 +663,16 @@ fn prepared_relay_preflight_rejects_time_at_or_below_median() {
 
 #[test]
 fn prepared_relay_preflight_rejects_a_forged_commitment() {
-    use crate::tests::FakeChainHelper;
-
     let _init_guard = zakura_test::init();
-    let (network, finalized, non_finalized, side) = prepared_relay_test_state();
-    let child = side.make_fake_child().set_block_commitment([0x42; 32]);
+    let fixture = Fixture::with_side_chain();
+    let child = fixture
+        .parent
+        .make_fake_child()
+        .set_block_commitment([0x42; 32]);
 
-    let error = super::check_prepared_mined_relay_eligibility_for_state(
-        &network,
-        &non_finalized,
-        &finalized.db,
-        crate::BlockCommitmentData {
-            block: child,
-            auth_data_root: None,
-        },
-    )
-    .expect_err("a forged commitment fails the relay preflight");
+    let error = fixture
+        .preflight(child)
+        .expect_err("a forged commitment fails the relay preflight");
 
     assert!(matches!(
         error.downcast_ref::<ValidateContextError>(),
@@ -1452,8 +1419,6 @@ fn frontier_grid_coverage_is_incomparable_until_both_sides_exist() {
 
 #[test]
 fn historical_frontier_coverage_is_rechecked_once_the_vct_marker_exists() {
-    use std::sync::OnceLock;
-
     use zakura_node_services::sync_lifecycle::{
         HeaderRuntimeDetachedReason, HeaderRuntimeStatus, LifecycleEpoch,
     };
@@ -1507,7 +1472,7 @@ fn historical_frontier_coverage_is_rechecked_once_the_vct_marker_exists() {
     let read_state = ReadStateService::new(
         &finalized_state,
         None,
-        Arc::new(OnceLock::new()),
+        Arc::new(crate::service::write::BlockWriteFailure::default()),
         WatchReceiver::new(non_finalized_receiver),
         repair_receiver,
         HeaderChainSubscriptions {
@@ -2652,108 +2617,6 @@ fn read_only_open_with_malformed_version_returns_typed_error() {
     }
 }
 
-/// Optimistic relay reservations must not accumulate for the lifetime of the process.
-///
-/// Every optimistically relayed block reserves its parent's slot. A reservation is only read
-/// while its parent is the best tip, so once the reserving candidate is finalized the entry is
-/// unreachable and has to go.
-#[tokio::test(flavor = "multi_thread")]
-async fn finalized_optimistic_relay_reservations_are_pruned() {
-    let network = Network::Mainnet;
-    let (mut state, _read, _tip, _height) =
-        StateService::new(Config::ephemeral(), &network, Height::MAX, 0)
-            .await
-            .expect("an ephemeral state service is created");
-
-    let buried = block::Hash([1; 32]);
-    let at_the_tip = block::Hash([2; 32]);
-    let above_the_tip = block::Hash([3; 32]);
-
-    state
-        .optimistic_relay_reserved_parents
-        .insert(buried, Height(9));
-    state
-        .optimistic_relay_reserved_parents
-        .insert(at_the_tip, Height(10));
-    state
-        .optimistic_relay_reserved_parents
-        .insert(above_the_tip, Height(11));
-
-    state.prune_optimistic_relay_reservations(Height(10));
-
-    assert_eq!(
-        state
-            .optimistic_relay_reserved_parents
-            .keys()
-            .copied()
-            .collect::<Vec<_>>(),
-        vec![above_the_tip],
-        "only a reservation above the finalized tip can still be consulted",
-    );
-}
-
-/// An invalidated parent stays ineligible for optimistic relay until the writer confirms that
-/// the same invalidation was reconsidered.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_reconsidered_parent_becomes_eligible_for_optimistic_relay_again() {
-    let network = Network::Mainnet;
-    let (state, _read, _tip, _height) =
-        StateService::new(Config::ephemeral(), &network, Height::MAX, 0)
-            .await
-            .expect("an ephemeral state service is created");
-
-    let parent = block::Hash([7; 32]);
-    let invalidated = state.optimistic_relay_invalidated_parents.clone();
-
-    assert!(
-        !state.optimistic_relay_is_blocked_by_invalidation(),
-        "a parent nobody invalidated can authorize optimistic relay",
-    );
-
-    *invalidated
-        .lock()
-        .expect("the invalidation map is not poisoned")
-        .entry(parent)
-        .or_default() += 1;
-    assert!(
-        state.optimistic_relay_is_blocked_by_invalidation(),
-        "an invalidated parent cannot authorize optimistic relay",
-    );
-
-    StateService::release_optimistic_relay_invalidation(&invalidated, parent);
-    assert!(
-        !state.optimistic_relay_is_blocked_by_invalidation(),
-        "a confirmed reconsideration releases the parent",
-    );
-    assert!(
-        invalidated
-            .lock()
-            .expect("the invalidation map is not poisoned")
-            .is_empty(),
-        "a released parent leaves no entry behind",
-    );
-
-    // A reconsideration that the writer never confirmed, or one for a hash this service never
-    // invalidated, must not underflow or resurrect an entry.
-    StateService::release_optimistic_relay_invalidation(&invalidated, parent);
-    assert!(!state.optimistic_relay_is_blocked_by_invalidation());
-
-    // An invalidation issued while a reconsideration is in flight stays in force when that
-    // reconsideration is confirmed.
-    let mut invalidated_parents = invalidated
-        .lock()
-        .expect("the invalidation map is not poisoned");
-    *invalidated_parents.entry(parent).or_default() += 1;
-    *invalidated_parents.entry(parent).or_default() += 1;
-    drop(invalidated_parents);
-
-    StateService::release_optimistic_relay_invalidation(&invalidated, parent);
-    assert!(
-        state.optimistic_relay_is_blocked_by_invalidation(),
-        "the later invalidation outlives the reconsideration it raced",
-    );
-}
-
 /// While checkpoint writes are in flight the queue bound is hard, even for a block that names
 /// the durable finalized tip.
 ///
@@ -2864,23 +2727,32 @@ async fn unpublished_writer_transitions_block_optimistic_relay_and_bound_bodies(
     drop(reconsider);
     drop(writer.try_recv().unwrap());
 
-    state
-        .optimistic_relay_invalidated_parents
-        .lock()
-        .unwrap()
-        .insert(block::Hash([99; 32]), 1);
+    let (sibling, _response) = queue(&mut state, 8, true);
+    assert!(sibling.wait().await);
+    assert!(
+        sibling.optimistic_relay_authorized(),
+        "a published reconsideration releases its write slot, so relay is authorized again"
+    );
+    drop(writer.try_recv().unwrap());
+
+    let _invalidate_response = state.send_invalidate_block(block::Hash([99; 32]));
+    let invalidate = writer.try_recv().unwrap();
     let (sibling, _response) = queue(&mut state, 4, true);
     assert!(sibling.wait().await);
     assert!(
         !sibling.optimistic_relay_authorized(),
         "invalidation need not name the immediate parent"
     );
+    drop(invalidate);
     drop(writer.try_recv().unwrap());
-    state
-        .optimistic_relay_invalidated_parents
-        .lock()
-        .unwrap()
-        .clear();
+
+    let (sibling, _response) = queue(&mut state, 7, true);
+    assert!(sibling.wait().await);
+    assert!(
+        sibling.optimistic_relay_authorized(),
+        "a published invalidation releases its write slot, so relay is authorized again"
+    );
+    drop(writer.try_recv().unwrap());
 
     let capacity = state
         .non_finalized_write_slots
@@ -3483,4 +3355,491 @@ async fn rejected_checkpoint_body_fails_descendants_with_a_retryable_error() {
     .await
     .expect("the honest commit completes")
     .expect("the honest body for the same height commits");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn precious_block_request_selects_the_preferred_tip_legacy() {
+    assert_precious_block_request(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn precious_block_request_selects_the_preferred_tip_header_integrated() {
+    assert_precious_block_request(true).await;
+}
+
+/// `Request::PreciousBlock` changes the published best tip through the block write task.
+async fn assert_precious_block_request(header_runtime: bool) {
+    use crate::tests::FakeChainHelper;
+
+    let _init_guard = zakura_test::init();
+    let limit = Duration::from_secs(10);
+    let network = Network::new_regtest(Default::default());
+    let config = Config {
+        enable_zakura_header_seed_from_committed_blocks: header_runtime,
+        ..Config::ephemeral()
+    };
+    let (mut state, _, _, _) = StateService::new(config, &network, Height::MAX, 0)
+        .await
+        .unwrap();
+    let genesis_hash = network.genesis_hash();
+    let siblings = commit_precious_siblings(&mut state, limit).await;
+    let best_tip = |state: &StateService| {
+        state
+            .read_service
+            .latest_non_finalized_state()
+            .best_tip()
+            .unwrap()
+            .1
+    };
+    assert_eq!(best_tip(&state), siblings[0].hash());
+
+    // A finalized block is known, so its request succeeds without changing the tip.
+    // The hash loser then becomes best when preferred.
+    for hash in [genesis_hash, siblings[1].hash()] {
+        timeout(limit, state.send_precious_block(hash))
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+    assert_eq!(best_tip(&state), siblings[1].hash());
+
+    let unknown = siblings[1].make_fake_child().hash();
+    let error = timeout(limit, state.send_precious_block(unknown))
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    assert!(matches!(error, crate::PreciousError::BlockNotFound(hash) if hash == unknown));
+    assert_eq!(best_tip(&state), siblings[1].hash());
+
+    // A full writer rejects the request instead of queueing it, and frees no slot it never held.
+    wait_for_idle_writer(&state, limit).await;
+    let all_slots = state
+        .non_finalized_write_slots
+        .clone()
+        .try_acquire_many_owned(
+            u32::try_from(super::queued_blocks::MAX_QUEUED_BLOCKS)
+                .expect("the queued block limit fits in a semaphore permit count"),
+        )
+        .expect("no write is in flight");
+    let error = timeout(limit, state.send_precious_block(siblings[0].hash()))
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    assert!(matches!(error, crate::PreciousError::WriterFull));
+    assert_eq!(best_tip(&state), siblings[1].hash());
+    drop(all_slots);
+
+    timeout(limit, state.send_precious_block(siblings[0].hash()))
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(best_tip(&state), siblings[0].hash());
+    wait_for_idle_writer(&state, limit).await;
+}
+
+/// Commits a regtest genesis block and its child to the finalized state, then two equal-work
+/// children of that child to the non-finalized state.
+///
+/// Returns the non-finalized blocks by descending raw hash, so the first is the normal
+/// equal-work winner and the second is the hash loser.
+async fn commit_precious_siblings(state: &mut StateService, limit: Duration) -> Vec<Arc<Block>> {
+    let genesis = block::genesis::regtest_genesis_block();
+    let mut parent = genesis.make_fake_child();
+    Arc::make_mut(&mut Arc::make_mut(&mut parent).header).time += chrono::Duration::seconds(1);
+    for block in [genesis, parent.clone()] {
+        timeout(
+            limit,
+            state.queue_and_commit_to_finalized_state(CheckpointVerifiedBlock::from(block)),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    }
+    let mut template = parent.make_fake_child();
+    let transaction = transaction_v4_from_coinbase(&template.transactions[0]);
+    Arc::make_mut(&mut template).transactions[0] = Arc::new(transaction);
+    let merkle_root = template.transactions.iter().cloned().collect();
+    let header = Arc::make_mut(&mut Arc::make_mut(&mut template).header);
+    header.time += chrono::Duration::seconds(1);
+    header.merkle_root = merkle_root;
+    header.commitment_bytes =
+        <[u8; 32]>::from(state.read_service.db.history_tree().hash().unwrap()).into();
+
+    let mut siblings = template.make_fake_siblings(2);
+    siblings.sort_by_key(|block| std::cmp::Reverse(block.hash().0));
+    for block in &siblings {
+        timeout(
+            limit,
+            state.queue_and_commit_to_non_finalized_state(block.clone().prepare(), None),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    }
+    siblings
+}
+
+/// Waits until the header chain publishes `verified_best` as its verified best tip.
+async fn wait_for_verified_best(
+    snapshots: &mut tokio::sync::watch::Receiver<Option<zakura_header_chain::EngineSnapshot>>,
+    verified_best: block::Hash,
+    limit: Duration,
+) -> zakura_header_chain::EngineSnapshot {
+    timeout(
+        limit,
+        snapshots.wait_for(|snapshot| {
+            snapshot
+                .as_ref()
+                .is_some_and(|snapshot| snapshot.frontiers.verified_best.hash == verified_best)
+        }),
+    )
+    .await
+    .expect("the header chain publishes the expected verified tip")
+    .expect("the header snapshot channel stays open")
+    .clone()
+    .expect("the waited-for snapshot is present")
+}
+
+/// The preference is local. A restart from the same database and non-finalized backup clears
+/// it, so full state and the header chain both select the normal equal-work winner again.
+#[test]
+fn precious_block_preference_is_cleared_by_a_restart() {
+    let _init_guard = zakura_test::init();
+    let limit = Duration::from_secs(10);
+    let network = Network::new_regtest(Default::default());
+    let cache_dir = tempfile::tempdir().expect("the state cache directory is created");
+    let config = Config {
+        cache_dir: cache_dir.path().to_owned(),
+        ephemeral: false,
+        // Write the non-finalized backup synchronously before each publication.
+        debug_skip_non_finalized_state_backup_task: true,
+        enable_zakura_header_seed_from_committed_blocks: true,
+        ..Config::default()
+    };
+    assert!(config.non_finalized_state_backup_dir(&network).is_some());
+    // The finalized tip is at the last checkpoint, so the restart restores the backup.
+    let max_checkpoint_height = Height(1);
+    // Each node run has its own runtime. Shutting a runtime down drops the state's background
+    // tasks, such as its metrics exporter, which hold database handles, so the next run can take
+    // the database lock, like after a process exit.
+    let node_run = || {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("the node runtime starts")
+    };
+
+    let (winner, loser) = node_run().block_on(async {
+        let (mut state, read, latest_chain_tip, _) =
+            StateService::new(config.clone(), &network, max_checkpoint_height, 0)
+                .await
+                .unwrap();
+        let siblings = commit_precious_siblings(&mut state, limit).await;
+        let (winner, loser) = (siblings[0].hash(), siblings[1].hash());
+        let mut snapshots = read.subscribe_header_chain_snapshots();
+        wait_for_verified_best(&mut snapshots, winner, limit).await;
+
+        timeout(limit, state.send_precious_block(loser))
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(read.best_tip().unwrap().1, loser);
+        assert_eq!(latest_chain_tip.best_tip_hash(), Some(loser));
+        let preferred = wait_for_verified_best(&mut snapshots, loser, limit).await;
+        // Header-only selection keeps the raw-hash order.
+        assert_eq!(preferred.frontiers.header_best.hash, winner);
+        wait_for_idle_writer(&state, limit).await;
+        (winner, loser)
+    });
+
+    node_run().block_on(async {
+        let (state, read, latest_chain_tip, _) =
+            StateService::new(config, &network, max_checkpoint_height, 0)
+                .await
+                .unwrap();
+        let restored = read.latest_non_finalized_state();
+        assert_eq!(
+            restored.chain_count(),
+            2,
+            "the backup restores both siblings"
+        );
+        assert_eq!(restored.best_tip().unwrap().1, winner);
+        assert_eq!(latest_chain_tip.best_tip_hash(), Some(winner));
+        let mut snapshots = read.subscribe_header_chain_snapshots();
+        let reopened = wait_for_verified_best(&mut snapshots, winner, limit).await;
+        assert_eq!(reopened.frontiers.header_best.hash, winner);
+
+        // The restored loser can still be preferred again.
+        timeout(limit, state.send_precious_block(loser))
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(read.best_tip().unwrap().1, loser);
+        wait_for_verified_best(&mut snapshots, loser, limit).await;
+        wait_for_idle_writer(&state, limit).await;
+    });
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn evicted_precious_block_is_downloaded_again_without_its_preference_legacy() {
+    assert_evicted_precious_block_redelivery(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn evicted_precious_block_is_downloaded_again_without_its_preference_header_integrated() {
+    assert_evicted_precious_block_redelivery(true).await;
+}
+
+/// A fork-limit eviction forgets the evicted tip's preference. When the evicted body is
+/// downloaded again, full state and the header chain select the normal equal-work winner.
+async fn assert_evicted_precious_block_redelivery(header_runtime: bool) {
+    let _init_guard = zakura_test::init();
+    let limit = Duration::from_secs(10);
+    let network = Network::new_regtest(Default::default());
+    let config = Config {
+        enable_zakura_header_seed_from_committed_blocks: header_runtime,
+        ..Config::ephemeral()
+    };
+    let (mut state, read, latest_chain_tip, _) =
+        StateService::new(config, &network, Height::MAX, 0)
+            .await
+            .unwrap();
+    let siblings = commit_precious_siblings(&mut state, limit).await;
+    let (winner, loser) = (siblings[0].clone(), siblings[1].clone());
+    // Renumbering a sibling's nonce gives another child of the same parent.
+    let branch = winner
+        .make_fake_siblings(3)
+        .into_iter()
+        .find(|block| !siblings.contains(block))
+        .unwrap();
+    timeout(limit, state.send_precious_block(loser.hash()))
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(read.best_tip().unwrap().1, loser.hash());
+    assert!(read
+        .latest_non_finalized_state()
+        .precious_preferences()
+        .1
+        .contains_key(&loser.hash()));
+
+    let child_of = |state: &StateService, parent: &Arc<Block>| {
+        let history_root = state
+            .read_service
+            .latest_non_finalized_state()
+            .find_chain(|chain| chain.contains_block_hash(parent.hash()))
+            .unwrap()
+            .history_tree(crate::HashOrHeight::Hash(parent.hash()))
+            .unwrap()
+            .hash()
+            .unwrap();
+        let mut child = parent.make_fake_child();
+        let merkle_root = child.transactions.iter().cloned().collect();
+        let header = Arc::make_mut(&mut Arc::make_mut(&mut child).header);
+        header.time += chrono::Duration::seconds(1);
+        header.merkle_root = merkle_root;
+        header.commitment_bytes = <[u8; 32]>::from(history_root).into();
+        child
+    };
+    let commit = |state: &mut StateService, block: &Arc<Block>| {
+        let response = state.queue_and_commit_to_non_finalized_state(block.clone().prepare(), None);
+        async move {
+            timeout(limit, response).await.unwrap().unwrap().unwrap();
+        }
+    };
+
+    // Give every other tip more work than `loser`, so it is the lowest chain when the last fork
+    // arrives. Its parent is the finalized tip, so it can be downloaded again.
+    let winner_child = child_of(&state, &winner);
+    commit(&mut state, &winner_child).await;
+    commit(&mut state, &branch).await;
+    let forks = child_of(&state, &branch)
+        .make_fake_siblings(crate::constants::MAX_NON_FINALIZED_CHAIN_FORKS - 1);
+    for fork in &forks {
+        commit(&mut state, fork).await;
+    }
+    let evicted = read.latest_non_finalized_state();
+    assert!(!evicted.any_chain_contains(&loser.hash()));
+    // The commit that evicted the tip forgets its preference, before any invalidation runs.
+    assert!(!evicted.precious_preferences().1.contains_key(&loser.hash()));
+    let known = timeout(limit, state.call(Request::KnownBlock(loser.hash())))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(known, Response::KnownBlock(None)),
+        "an evicted body must be downloadable again: {known:?}"
+    );
+
+    // Remove every tip with more work, then download the evicted body again.
+    for hash in [branch.hash(), winner_child.hash()] {
+        timeout(limit, state.send_invalidate_block(hash))
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+    commit(&mut state, &loser).await;
+
+    assert_eq!(
+        read.best_tip().unwrap().1,
+        winner.hash(),
+        "an evicted tip must not keep its operator preference"
+    );
+    assert_eq!(latest_chain_tip.best_tip_hash(), Some(winner.hash()));
+    if header_runtime {
+        let mut snapshots = read.subscribe_header_chain_snapshots();
+        let snapshot = wait_for_verified_best(&mut snapshots, winner.hash(), limit).await;
+        assert_eq!(snapshot.frontiers.header_best.hash, winner.hash());
+    }
+    wait_for_idle_writer(&state, limit).await;
+}
+
+/// Dropping the caller's response does not cancel an accepted preference. The writer commits and
+/// publishes it, and keeps the request's write slot, which blocks optimistic relay, until the new
+/// tip is published.
+#[tokio::test(flavor = "multi_thread")]
+async fn dropped_precious_block_response_still_publishes_before_releasing_its_slot() {
+    let _init_guard = zakura_test::init();
+    let limit = Duration::from_secs(10);
+    let all_slots = super::queued_blocks::MAX_QUEUED_BLOCKS;
+    let network = Network::new_regtest(Default::default());
+    let config = Config {
+        enable_zakura_header_seed_from_committed_blocks: true,
+        ..Config::ephemeral()
+    };
+    let (mut state, read, latest_chain_tip, _) =
+        StateService::new(config, &network, Height::MAX, 0)
+            .await
+            .unwrap();
+    let siblings = commit_precious_siblings(&mut state, limit).await;
+    let (winner, loser) = (siblings[0].hash(), siblings[1].hash());
+    let mut snapshots = read.subscribe_header_chain_snapshots();
+    wait_for_verified_best(&mut snapshots, winner, limit).await;
+    wait_for_idle_writer(&state, limit).await;
+    timeout(limit, state.ready()).await.unwrap().unwrap();
+
+    // Gate: while a reader borrows the published non-finalized state, the writer cannot
+    // publish a new one.
+    let (held_tx, held_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let published = read.non_finalized_state_receiver.clone();
+    let gate = std::thread::spawn(move || {
+        published.borrow_mapped(|_published| {
+            held_tx.send(()).expect("the test waits for the gate");
+            release_rx
+                .recv_timeout(Duration::from_secs(30))
+                .expect("the test releases the gate");
+        })
+    });
+    held_rx
+        .recv_timeout(limit)
+        .expect("the gate holds the published state");
+
+    // The state accepts the request when it is called, so dropping the response future does not
+    // withdraw it.
+    drop(state.call(Request::PreciousBlock(loser)));
+    assert_eq!(
+        state.non_finalized_write_slots.available_permits(),
+        all_slots - 1
+    );
+
+    // The header commit precedes publication, so the writer is now blocked on the gate.
+    wait_for_verified_best(&mut snapshots, loser, limit).await;
+    assert_eq!(
+        state.non_finalized_write_slots.available_permits(),
+        all_slots - 1,
+        "the unpublished preference keeps its write slot"
+    );
+    assert_eq!(latest_chain_tip.best_tip_hash(), Some(winner));
+    // The held slot makes the writer busy, so this check returns before it reads the published
+    // state, which the gate blocks.
+    let relay_authorized = |state: &StateService, parent| {
+        let _candidate_slot = state
+            .non_finalized_write_slots
+            .clone()
+            .try_acquire_owned()
+            .expect("the writer has free slots");
+        let admission = BlockAdmission::pending();
+        admission.authorize_optimistic_relay();
+        state.optimistic_relay_still_authorized(Some(&admission), parent)
+    };
+    assert!(
+        !relay_authorized(&state, winner),
+        "an unpublished preference blocks optimistic relay"
+    );
+
+    release_tx.send(()).expect("the gate is waiting");
+    gate.join().expect("the gate thread does not panic");
+    let capacity = timeout(
+        limit,
+        state.non_finalized_write_slots.clone().acquire_many_owned(
+            u32::try_from(all_slots).expect("the queued block limit fits in a permit count"),
+        ),
+    )
+    .await
+    .expect("the writer releases the slot after publishing")
+    .expect("the slot semaphore stays open");
+    drop(capacity);
+    assert_eq!(read.best_tip().unwrap().1, loser);
+    assert_eq!(latest_chain_tip.best_tip_hash(), Some(loser));
+    assert_eq!(
+        snapshots
+            .borrow()
+            .as_ref()
+            .unwrap()
+            .frontiers
+            .verified_best
+            .hash,
+        loser
+    );
+    assert!(relay_authorized(&state, loser));
+}
+
+/// Waits until the block writer releases every write slot. A request's response is sent
+/// before the writer drops that request's slot.
+async fn wait_for_idle_writer(state: &StateService, limit: Duration) {
+    timeout(limit, async {
+        while state.non_finalized_write_slots.available_permits()
+            < super::queued_blocks::MAX_QUEUED_BLOCKS
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the writer releases each request's slot after publishing");
+}
+
+/// During checkpoint sync the writer defers non-finalized messages, so precious requests fail
+/// immediately instead of waiting for the checkpoint phase to end.
+#[tokio::test(flavor = "multi_thread")]
+async fn precious_block_request_fails_fast_during_checkpoint_sync() {
+    let _init_guard = zakura_test::init();
+    let network = Network::new_regtest(Default::default());
+    let (state, _, _, _) = StateService::new(Config::ephemeral(), &network, Height::MAX, 0)
+        .await
+        .unwrap();
+    assert!(state.block_write_sender.finalized.is_some());
+
+    let error = timeout(
+        Duration::from_secs(1),
+        state.send_precious_block(network.genesis_hash()),
+    )
+    .await
+    .expect("the request is answered without waiting for checkpoint sync")
+    .unwrap()
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        crate::PreciousError::ProcessingCheckpointedBlocks
+    ));
 }

@@ -3,7 +3,8 @@
 ## Selection
 
 The fully verified chain with greatest cumulative work is the mining chain.
-On equal work, the tip received first by the full-block verifier wins. Receipt
+On equal work, an explicit `preciousblock` preference wins. Otherwise, the tip
+received first by the full-block verifier wins. Receipt
 order is assigned before asynchronous verification, so a later block cannot gain
 priority by finishing validation faster. Only valid blocks enter chain selection.
 A greater-work chain still replaces an earlier equal-work winner.
@@ -89,6 +90,3 @@ Older servers omit receipt metadata and retain their hash-based policy. Older
 clients can decode block messages but cannot reproduce the new tie preference,
 so upgrade trusted secondaries alongside the primary. The stream remains
 incremental. Complete fork snapshots and broader mirror recovery are separate work.
-
-The header-chain operator-error enum gains a variant. This public API change must
-be accounted for when selecting crate versions for the next release.

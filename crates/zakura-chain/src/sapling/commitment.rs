@@ -1,6 +1,8 @@
 //! Note and value commitments.
 
+use crate::serialization::ZcashReader;
 use std::io;
+use std::io::Read as _;
 
 use hex::{FromHex, FromHexError, ToHex};
 
@@ -120,7 +122,9 @@ impl From<jubjub::ExtendedPoint> for ValueCommitment {
 }
 
 impl ZcashDeserialize for sapling_crypto::value::ValueCommitment {
-    fn zcash_deserialize<R: io::Read>(mut reader: R) -> Result<Self, SerializationError> {
+    fn zcash_deserialize_from<R: io::Read>(
+        reader: &mut ZcashReader<R>,
+    ) -> Result<Self, SerializationError> {
         let mut buf = [0u8; 32];
         reader.read_exact(&mut buf)?;
 
@@ -132,7 +136,9 @@ impl ZcashDeserialize for sapling_crypto::value::ValueCommitment {
 }
 
 impl ZcashDeserialize for ValueCommitment {
-    fn zcash_deserialize<R: io::Read>(mut reader: R) -> Result<Self, SerializationError> {
+    fn zcash_deserialize_from<R: io::Read>(
+        reader: &mut ZcashReader<R>,
+    ) -> Result<Self, SerializationError> {
         // Store the raw bytes without decompressing the Jubjub point; the point
         // and its not-small-order check are recovered lazily in
         // `ValueCommitment::commitment`.
@@ -150,7 +156,9 @@ impl ZcashSerialize for ValueCommitment {
 }
 
 impl ZcashDeserialize for sapling_crypto::note::ExtractedNoteCommitment {
-    fn zcash_deserialize<R: io::Read>(mut reader: R) -> Result<Self, SerializationError> {
+    fn zcash_deserialize_from<R: io::Read>(
+        reader: &mut ZcashReader<R>,
+    ) -> Result<Self, SerializationError> {
         let mut buf = [0u8; 32];
         reader.read_exact(&mut buf)?;
 

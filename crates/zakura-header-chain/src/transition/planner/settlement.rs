@@ -245,6 +245,7 @@ pub(super) fn derive_finality_and_retention<'engine, 'ctx>(
     }
 
     let retention = projected.enforce_retention(
+        engine,
         selected_tip,
         context.retention_references.iter().copied(),
         context.config.limits,

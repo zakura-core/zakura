@@ -11,7 +11,8 @@ permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  # One group per run, so pushes to `main` never cancel each other.
+  group: ${{ github.workflow }}-${{ github.run_id }}
   cancel-in-progress: true
 
 env:

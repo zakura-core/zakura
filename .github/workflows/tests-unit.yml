@@ -6,7 +6,7 @@ on:
   # that touch no test-relevant files. This keeps the `test success` required
   # check reporting on every PR instead of sitting in "Expected" forever.
   pull_request:
-    branches: [main, "feat/**", "split/**", "release/**"]
+    branches: [main, "feat/**", "split/**", "adam/**", "release/**"]
     types: [opened, synchronize, reopened, labeled, unlabeled]
 
   push:
@@ -25,6 +25,7 @@ on:
       - rust-toolchain.toml
       - .github/actions/setup-zakura-build/**
       - .github/workflows/tests-unit.yml
+      - .github/workflows/zakura-e2e.yml
       - scripts/check-crate-publish-graph.sh
       - scripts/lib/crates-index.sh
       - docs/specs/fork-aware-header-chain-engine.md
@@ -77,6 +78,7 @@ jobs:
       config: ${{ steps.filter.outputs.config }}
       rust: ${{ steps.filter.outputs.rust }}
       publish_graph: ${{ steps.filter.outputs.publish_graph }}
+      cluster: ${{ steps.filter.outputs.cluster }}
     steps:
       - id: filter
         env:
@@ -100,6 +102,7 @@ jobs:
                  (( TOTAL_CHANGED_FILES >= 3000 )); then
                 echo "config=true" >> "$GITHUB_OUTPUT"
                 echo "rust=true" >> "$GITHUB_OUTPUT"
+                echo "cluster=true" >> "$GITHUB_OUTPUT"
                 echo "publish_graph=true" >> "$GITHUB_OUTPUT"
                 exit 0
               fi
@@ -131,18 +134,27 @@ jobs:
             workflow_dispatch)
               echo "config=true" >> "$GITHUB_OUTPUT"
               echo "rust=true" >> "$GITHUB_OUTPUT"
+              echo "cluster=true" >> "$GITHUB_OUTPUT"
               echo "publish_graph=true" >> "$GITHUB_OUTPUT"
               exit 0
               ;;
             schedule)
               echo "config=false" >> "$GITHUB_OUTPUT"
               echo "rust=false" >> "$GITHUB_OUTPUT"
+              echo "cluster=true" >> "$GITHUB_OUTPUT"
               # Nightly re-checks the live index so main cannot silently
               # accumulate a skipped-dependent pin after a crates.io publish.
               echo "publish_graph=true" >> "$GITHUB_OUTPUT"
               exit 0
               ;;
           esac
+
+          # Include the cluster harness, its build inputs, and its workflows.
+          if grep -qE '^(crates/zakura-network/|crates/zakurad/src/components/sync/|crates/zakurad/tests/zakura_regtest_e2e\.rs|docker/zakura-regtest-e2e/|docker/docker-compose\.zakura-regtest-e2e\.yml|Cargo\.(toml|lock)$|rust-toolchain\.toml$|\.cargo/config\.toml$|\.config/nextest\.toml$|\.github/actions/setup-zakura-build/|\.github/workflows/(tests-unit|zakura-e2e|zakura-cluster)\.yml$)' <<< "$changed"; then
+            echo "cluster=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "cluster=false" >> "$GITHUB_OUTPUT"
+          fi
 
           config=false
           while IFS= read -r path; do
@@ -478,9 +490,27 @@ jobs:
       - name: Check crates.io publish graph
         run: ./scripts/check-crate-publish-graph.sh
 
-  # NOTE: the Zakura regtest e2e jobs moved to `zakura-e2e.yml` so they can be
-  # path-gated independently of the broad Rust filter here (they run on
-  # Zakura-relevant PRs, always in the merge queue, and nightly for long modes).
+  # PR cluster results feed the required test success gate. Push coverage stays
+  # in zakura-e2e.yml, whose triggers include feature/release and harness changes.
+
+  zakura-testkit:
+    name: Zakura testkit cluster integration
+    needs: [changes]
+    # Required for network changes, optional for unrelated PRs. Keeping the
+    # cluster job here makes its result part of the required test success gate.
+    if: >-
+      needs.changes.result == 'success' &&
+      (github.event_name == 'merge_group' ||
+       github.event_name == 'schedule' ||
+       github.event_name == 'workflow_dispatch' ||
+       (github.event_name == 'pull_request' &&
+        (needs.changes.outputs.cluster == 'true' ||
+         contains(github.event.pull_request.labels.*.name, 'run-zakura-e2e'))))
+    permissions:
+      contents: read
+      id-token: write
+      statuses: write
+    uses: ./.github/workflows/zakura-cluster.yml
 
   test-success:
     name: test success
@@ -498,6 +528,7 @@ jobs:
       - pruned-storage
       - check-no-git-dependencies
       - publish-graph
+      - zakura-testkit
     timeout-minutes: 30
     steps:
       - name: Decide whether the needed jobs succeeded or failed
@@ -511,7 +542,7 @@ jobs:
           # check-no-git-dependencies is A-release-label only, publish-graph
           # skips on PRs that do not touch Cargo manifests or this check.
           # Failed, non-skipped jobs still fail this aggregate status.
-          allowed-skips: check-no-git-dependencies, pruned-storage, zakura-config, build-tests, unit-tests, extended-reissuance-properties, network-dependent, publish-graph
+          allowed-skips: check-no-git-dependencies, pruned-storage, zakura-config, build-tests, unit-tests, extended-reissuance-properties, network-dependent, publish-graph, zakura-testkit
 
   report-nightly-result:
     name: report nightly release test result

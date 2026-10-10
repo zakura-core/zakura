@@ -8,7 +8,7 @@ use thiserror::Error;
 use crate::{
     fmt::HexDebug,
     parameters::Network,
-    serialization::{TrustedPreallocate, MAX_HEADERS_PER_MESSAGE},
+    serialization::{CompactSize64, TrustedPreallocate, ZcashSerialize, MAX_HEADERS_PER_MESSAGE},
     work::{difficulty::CompactDifficulty, equihash::Solution},
 };
 
@@ -158,6 +158,27 @@ pub struct CountedHeader {
 pub const ZCASH_BLOCK_VERSION: u32 = 4;
 
 impl TrustedPreallocate for CountedHeader {
+    fn min_serialized_size() -> u64 {
+        // The Equihash input contains the version, hashes, timestamp, and difficulty.
+        const HEADER_FIELDS_BEFORE_NONCE_BYTES: usize = Solution::INPUT_LENGTH;
+        const NONCE_BYTES: usize = 32;
+        const ZERO_TRANSACTION_COUNT_BYTES: usize = 1;
+
+        // Regtest's 36-byte solution needs a one-byte length prefix. Mainnet
+        // and Testnet require 1,344 solution bytes and a three-byte prefix.
+        // Use the smallest supported encoding so no valid network is excluded.
+        let solution_bytes = crate::work::equihash::REGTEST_SOLUTION_SIZE;
+        let solution_length = CompactSize64::from(
+            u64::try_from(solution_bytes).expect("fixed Equihash solution sizes fit in u64"),
+        );
+        let minimum_bytes = HEADER_FIELDS_BEFORE_NONCE_BYTES
+            + NONCE_BYTES
+            + solution_length.zcash_serialized_size()
+            + solution_bytes
+            + ZERO_TRANSACTION_COUNT_BYTES;
+        u64::try_from(minimum_bytes).expect("the fixed counted header size fits in u64")
+    }
+
     /// Cap `CountedHeader` preallocation at the existing protocol-level
     /// constant `MAX_HEADERS_PER_MESSAGE = 160`. The previous return value was
     /// derived from `MAX_PROTOCOL_MESSAGE_LEN`, allowing peer-controlled

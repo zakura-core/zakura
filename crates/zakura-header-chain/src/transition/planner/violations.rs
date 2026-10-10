@@ -239,9 +239,6 @@ pub enum AuxiliaryViolation {
 /// Operator invalidation violations.
 #[derive(Copy, Clone, Debug, Eq, Error, PartialEq)]
 pub enum OperatorViolation {
-    /// Full state's proposed operator tip is not an eligible greatest-work verified path.
-    #[error("full-state selected tip is not an eligible greatest-work verified path")]
-    InvalidVerifiedPreference,
     /// Invalidation identity is not bound to its target.
     #[error("operator invalidation identity is not bound to its target")]
     BindingMismatch,

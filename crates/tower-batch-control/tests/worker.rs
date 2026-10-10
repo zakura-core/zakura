@@ -8,12 +8,16 @@ use std::{
 };
 
 use tokio::sync::oneshot;
-use tokio_test::{assert_pending, assert_ready, assert_ready_err, task};
 use tower::{Service, ServiceExt};
 use tower_batch_control::{error, Batch, BatchControl, RequestWeight};
 
 #[path = "worker/mock.rs"]
 mod mock;
+
+#[path = "worker/polling.rs"]
+mod polling;
+
+use polling::{ready, ready_err, Task};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
@@ -54,29 +58,29 @@ async fn wakes_pending_waiters_on_close() {
     let (service, mut handle) = mock::pair::<_, ()>();
 
     let (mut service, worker) = Batch::pair(service, 1, 1, Duration::from_secs(1));
-    let mut worker = task::spawn(worker.run());
+    let mut worker = Task::new(worker.run());
 
     // // keep the request in the worker
     handle.allow(0);
     let service1 = service.ready().await.unwrap();
     let poll = worker.poll();
-    assert_pending!(poll);
-    let mut response = task::spawn(service1.call(()));
+    assert!(poll.is_pending());
+    let mut response = Task::new(service1.call(()));
 
     let mut service1 = service.clone();
-    let mut ready1 = task::spawn(service1.ready());
-    assert_pending!(worker.poll());
-    assert_pending!(ready1.poll(), "no capacity");
+    let mut ready1 = Task::new(service1.ready());
+    assert!(worker.poll().is_pending());
+    assert!(ready1.poll().is_pending(), "no capacity");
 
     let mut service1 = service.clone();
-    let mut ready2 = task::spawn(service1.ready());
-    assert_pending!(worker.poll());
-    assert_pending!(ready2.poll(), "no capacity");
+    let mut ready2 = Task::new(service1.ready());
+    assert!(worker.poll().is_pending());
+    assert!(ready2.poll().is_pending(), "no capacity");
 
     // kill the worker task
     drop(worker);
 
-    let err = assert_ready_err!(response.poll(), "worker close should fail the response");
+    let err = ready_err(response.poll(), "worker close should fail the response");
     assert!(
         err.is::<error::Closed>(),
         "response should fail with a Closed, got: {err:?}",
@@ -86,7 +90,7 @@ async fn wakes_pending_waiters_on_close() {
         ready1.is_woken(),
         "dropping worker should wake ready task 1",
     );
-    let err = assert_ready_err!(ready1.poll(), "worker close should fail ready task 1");
+    let err = ready_err(ready1.poll(), "worker close should fail ready task 1");
     assert!(
         err.is::<error::ServiceError>(),
         "ready 1 should fail with a ServiceError {{ Closed }}, got: {err:?}",
@@ -96,7 +100,7 @@ async fn wakes_pending_waiters_on_close() {
         ready2.is_woken(),
         "dropping worker should wake ready task 2",
     );
-    let err = assert_ready_err!(ready2.poll(), "worker close should fail ready task 2");
+    let err = ready_err(ready2.poll(), "worker close should fail ready task 2");
     assert!(
         err.is::<error::ServiceError>(),
         "ready 2 should fail with a ServiceError {{ Closed }}, got: {err:?}",
@@ -110,30 +114,30 @@ async fn wakes_pending_waiters_on_failure() {
     let (service, mut handle) = mock::pair::<_, ()>();
 
     let (mut service, worker) = Batch::pair(service, 1, 1, Duration::from_secs(1));
-    let mut worker = task::spawn(worker.run());
+    let mut worker = Task::new(worker.run());
 
     // keep the request in the worker
     handle.allow(0);
     let service1 = service.ready().await.unwrap();
-    assert_pending!(worker.poll());
-    let mut response = task::spawn(service1.call("hello"));
+    assert!(worker.poll().is_pending());
+    let mut response = Task::new(service1.call("hello"));
 
     let mut service1 = service.clone();
-    let mut ready1 = task::spawn(service1.ready());
-    assert_pending!(worker.poll());
-    assert_pending!(ready1.poll(), "no capacity");
+    let mut ready1 = Task::new(service1.ready());
+    assert!(worker.poll().is_pending());
+    assert!(ready1.poll().is_pending(), "no capacity");
 
     let mut service1 = service.clone();
-    let mut ready2 = task::spawn(service1.ready());
-    assert_pending!(worker.poll());
-    assert_pending!(ready2.poll(), "no capacity");
+    let mut ready2 = Task::new(service1.ready());
+    assert!(worker.poll().is_pending());
+    assert!(ready2.poll().is_pending(), "no capacity");
 
     // fail the inner service
     handle.send_error("foobar");
     // worker task terminates
-    assert_ready!(worker.poll());
+    ready(worker.poll());
 
-    let err = assert_ready_err!(response.poll(), "worker failure should fail the response");
+    let err = ready_err(response.poll(), "worker failure should fail the response");
     assert!(
         err.is::<error::ServiceError>(),
         "response should fail with a ServiceError, got: {err:?}"
@@ -143,7 +147,7 @@ async fn wakes_pending_waiters_on_failure() {
         ready1.is_woken(),
         "dropping worker should wake ready task 1"
     );
-    let err = assert_ready_err!(ready1.poll(), "worker failure should fail ready task 1");
+    let err = ready_err(ready1.poll(), "worker failure should fail ready task 1");
     assert!(
         err.is::<error::ServiceError>(),
         "ready 1 should fail with a ServiceError, got: {err:?}"
@@ -153,7 +157,7 @@ async fn wakes_pending_waiters_on_failure() {
         ready2.is_woken(),
         "dropping worker should wake ready task 2"
     );
-    let err = assert_ready_err!(ready2.poll(), "worker failure should fail ready task 2");
+    let err = ready_err(ready2.poll(), "worker failure should fail ready task 2");
     assert!(
         err.is::<error::ServiceError>(),
         "ready 2 should fail with a ServiceError, got: {err:?}"
@@ -166,7 +170,7 @@ async fn try_flush_skips_when_queue_saturated() {
 
     let (service, mut handle) = mock::pair::<_, ()>();
     let (mut service, worker) = Batch::pair(service, 1, 1, Duration::from_secs(1000));
-    let mut worker = task::spawn(worker.run());
+    let mut worker = Task::new(worker.run());
 
     handle.allow(2);
     service.ready().await.unwrap();
@@ -177,7 +181,7 @@ async fn try_flush_skips_when_queue_saturated() {
     assert!(matches!(flush_service.try_flush(), Ok(false)));
 
     // Once the worker drains the queue, the permit frees and try_flush queues.
-    assert_pending!(worker.poll());
+    assert!(worker.poll().is_pending());
     assert!(matches!(flush_service.try_flush(), Ok(true)));
 }
 
@@ -309,7 +313,7 @@ async fn poll_ready_after_worker_panic_does_not_poison_the_handle_mutex() {
     worker_exited_rx.await.expect("worker task should panic");
 
     // The first check resumes the worker panic.
-    let mut context_task = task::spawn(());
+    let mut context_task = Task::new(());
     let panic_payload = std::panic::catch_unwind(AssertUnwindSafe(|| {
         context_task.enter(|cx, _| service.poll_ready(cx))
     }))

@@ -693,6 +693,100 @@ fn operator_body_retry_rejects_stale_or_malformed_requests() {
 }
 
 #[test]
+fn operator_changes_keep_the_full_state_verified_preference() {
+    struct PreferredTipAuthority {
+        tip: Frontier,
+    }
+    impl crate::FullStateEvidenceAuthority for PreferredTipAuthority {
+        fn authorizes_full_state(&self, _event: &TransitionEvent) -> bool {
+            true
+        }
+        fn verified_tip(&self, _event: &TransitionEvent) -> Option<Frontier> {
+            Some(self.tip)
+        }
+    }
+    let (mut store, config) = TestStore::new(EngineMode::Integrated);
+    let clock = ManualClock(Utc::now());
+    let anchor = store.graph.finalized_frontier();
+    let difficulty = store
+        .graph
+        .header_node(anchor.hash)
+        .unwrap()
+        .header
+        .difficulty_threshold;
+    let mut siblings = [0x11, 0x22, 0x33]
+        .map(|seed| insert_verified_branch(&mut store.graph, anchor, 1, difficulty, seed));
+    siblings.sort_unstable_by_key(|frontier| frontier.hash.0);
+    let [preferred, other, hash_winner] = siblings;
+    synchronize_fixture(&mut store, preferred);
+    fn preferring<'a>(
+        config: &'a EngineConfig,
+        clock: &'a ManualClock,
+        authority: &'a PreferredTipAuthority,
+    ) -> TransitionContext<'a> {
+        TransitionContext {
+            config,
+            clock,
+            full_state_authority: Some(authority),
+            retention_references: &[],
+        }
+    }
+    let keeps_preferred = PreferredTipAuthority { tip: preferred };
+    let id = crate::OperatorInvalidationId::new([0x71; 16]);
+
+    // Without full state's tip, the planner falls back to the hash tie-break.
+    let invalidation = operator_invalidate(&store, other.hash, id, 0x72);
+    let plan = apply_transition(
+        &store,
+        invalidation.clone(),
+        &context(&config, &clock, Some(&Authority)),
+    )
+    .unwrap();
+    assert_eq!(
+        plan.change_set.metadata.frontiers.verified_best,
+        hash_winner
+    );
+
+    // Full state's preferred tip must be an eligible verified tip with the greatest work.
+    for tip in [anchor, other, Frontier::new(anchor.height, preferred.hash)] {
+        let rejected = PreferredTipAuthority { tip };
+        let error = apply_transition(
+            &store,
+            invalidation.clone(),
+            &preferring(&config, &clock, &rejected),
+        )
+        .expect_err("full state cannot prefer an ineligible or lower-work tip");
+        assert_eq!(
+            error,
+            TransitionFailure::InvalidEvidence(InvalidTransitionEvidence::header_path(
+                crate::HeaderPathKind::Verified,
+                crate::HeaderPathProblem::TipMismatch,
+            ))
+        );
+    }
+
+    // Invalidation and reconsideration keep full state's equal-work preference.
+    let plan = apply_transition(
+        &store,
+        invalidation,
+        &preferring(&config, &clock, &keeps_preferred),
+    )
+    .unwrap();
+    assert_eq!(plan.change_set.metadata.frontiers.header_best, hash_winner);
+    assert_eq!(plan.change_set.metadata.frontiers.verified_best, preferred);
+    store.commit(&plan);
+    let reconsideration = operator_reconsider(&store, other.hash, id, 0x73);
+    let plan = apply_transition(
+        &store,
+        reconsideration,
+        &preferring(&config, &clock, &keeps_preferred),
+    )
+    .unwrap();
+    assert_eq!(plan.change_set.metadata.frontiers.header_best, hash_winner);
+    assert_eq!(plan.change_set.metadata.frontiers.verified_best, preferred);
+}
+
+#[test]
 fn operator_reconsider_respects_full_state_receipt_preference() {
     struct PreferredTipAuthority {
         event: TransitionEvent,
@@ -753,10 +847,11 @@ fn operator_reconsider_respects_full_state_receipt_preference() {
         full_state_authority: Some(&weaker),
         ..ctx
     };
-    assert!(matches!(
-        apply_transition(&store, request, &ctx),
-        Err(TransitionFailure::InvalidEvidence(
-            InvalidTransitionEvidence::Operator(OperatorViolation::InvalidVerifiedPreference)
+    assert_eq!(
+        apply_transition(&store, request, &ctx).unwrap_err(),
+        TransitionFailure::InvalidEvidence(InvalidTransitionEvidence::header_path(
+            crate::HeaderPathKind::Verified,
+            crate::HeaderPathProblem::TipMismatch,
         ))
-    ));
+    );
 }

@@ -52,6 +52,19 @@ impl fmt::Display for Error {
     }
 }
 
+impl Error {
+    /// Returns true when the script failed verification.
+    ///
+    /// Returns false when the verifier could not run the script, for example
+    /// because the C++ verifier threw an exception.
+    pub fn is_script_failure(&self) -> bool {
+        matches!(
+            self,
+            Error::ScriptInvalid | Error::Unknown(libzcash_script::Error::Script(_))
+        )
+    }
+}
+
 impl From<libzcash_script::Error> for Error {
     #[allow(non_upper_case_globals)]
     fn from(err_code: libzcash_script::Error) -> Error {

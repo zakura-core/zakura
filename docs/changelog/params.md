@@ -32,6 +32,7 @@ Keep entries **newest-first**. Each row records:
 
 | Parameter | Location | Old → New | PR | Why |
 | --- | --- | --- | --- | --- |
+| `DEFAULT_MAX_TRANSACTION_BYTES` | `crates/zakurad/src/components/mempool/config.rs` | `250,000` → `400,000` | [#1333](https://github.com/zakura-core/zakura/pull/1333) | Valid multi-input transactions of about 300 KB were rejected from default mempools, including when relayed by peers. |
 | `tracing.progress_bar` | `crates/zakurad/src/components/tracing.rs` | optional terminal display and implicit log file → accepted but ignored | [#1310](https://github.com/zakura-core/zakura/pull/1310) | Remove the terminal display and its dependencies. Generated configs omit this setting; explicit `tracing.log_file` still selects a log file. |
 | `tracing.flamegraph` | `crates/zakurad/src/components/tracing.rs` | optional output path → accepted but ignored | [#1306](https://github.com/zakura-core/zakura/pull/1306) | Remove the built-in tracing-span collector and use external sampled CPU profiling. Existing configs remain valid; generated configs omit this setting. |
 | Full-pool admission rate | `crates/zakurad/src/components/mempool/storage/verified_set.rs` | incoming transaction alone → lower of own and ancestor-inclusive rates | [#1253](https://github.com/zakura-core/zakura/pull/1253) | Both rates must outbid every victim by the existing increment. Summing at most two ancestors prevents the fixed-price ancestor-dilution cycle. |

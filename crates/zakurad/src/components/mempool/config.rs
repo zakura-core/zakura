@@ -78,7 +78,7 @@ impl Default for Config {
 }
 
 /// Default maximum serialized size of an individual mempool transaction, in bytes.
-pub const DEFAULT_MAX_TRANSACTION_BYTES: u64 = 250_000;
+pub const DEFAULT_MAX_TRANSACTION_BYTES: u64 = 400_000;
 
 /// Default maximum size of data carrier scripts (OP_RETURN), in bytes.
 ///

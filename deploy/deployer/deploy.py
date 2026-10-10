@@ -58,7 +58,7 @@ DEFAULTS = {
     "state_cache_dir": "/var/lib/zakura",
     "network": "Mainnet",
     "listen_addr": "[::]:8233",
-    "identity_dir": "",     # e.g. "/root/.zakura" -> pins the iroh node_id; "" uses zakurad default
+    "identity_dir": "",     # e.g. "/root/.zakura" -> pins the Zakura node_id; "" uses zakurad default
     "network_cache_dir": "",
     # Optional explicit peer seeds -> rendered `initial_testnet_peers`.
     # None omits the key so zakurad keeps its default DNS seeds. A configured

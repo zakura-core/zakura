@@ -13,7 +13,6 @@ yanked = "deny"
 # Remove each ignore entry as the dependency chain is upgraded.
 ignore = [
     "RUSTSEC-2025-0141", # bincode — direct dependency
-    "RUSTSEC-2024-0436", # paste — transitive via netwatch/netlink-packet-core
 ]
 
 # This section is considered when running `cargo deny check licenses`.
@@ -73,9 +72,6 @@ highlight = "all"
 
 # List of crates that can never become Zebra dependencies.
 deny = [
-    # retain can free a node without removing its map entry. Keep the reviewed
-    # 0.18.3 lockfile selection until a later release has been checked.
-    { name = "lru", version = "=0.18.4" },
     # Often has memory safety vulnerabilities.
     # Enabled by --all-features, use the `cargo hack` script in the deny.toml CI job instead.
     { name = "openssl" },
@@ -165,25 +161,13 @@ skip-tree = [
     # Wait for petgraph to update hashbrown and foldhash in xtask's graph.
     { name = "hashbrown", version = "0.15" },
 
-    # Existing consumers still use these versions alongside Iroh's newer graph.
+    # Existing consumers still use these versions alongside newer ones.
     { name = "convert_case", version = "=0.8.0" },
     { name = "rand_core", version = "=0.9.5" },
     { name = "reqwest", version = "=0.12.28" },
     { name = "shlex", version = "=1.3.0" },
-    { name = "spin", version = "=0.10.1" },
 
-    # Iroh's netwatch uses two netdev releases for platform support. Remove
-    # these exceptions when its OS dependency families converge.
-    { name = "netdev", version = "=0.45.1" },
-    { name = "netlink-packet-core", version = "=0.8.2" },
-    { name = "netlink-packet-route", version = "=0.31.0" },
-    { name = "jni", version = "=0.21.1" },
-    { name = "jni-sys", version = "=0.3.1" },
-    # Hickory's system configuration and reqwest's platform verifier differ.
-    { name = "core-foundation", version = "=0.9.4" },
-    # Iroh's derive_more and netdev have moved ahead of the rest of the workspace.
-    { name = "derive_more", version = "=1.0.0" },
-    { name = "derive_more-impl", version = "=1.0.0" },
+    # documented-macros has moved ahead of the rest of the workspace.
     { name = "strum", version = "=0.27.2" },
     { name = "strum_macros", version = "=0.27.2" },
 

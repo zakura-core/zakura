@@ -21,8 +21,11 @@ pub const P2P_V2_UPGRADE_COMMAND: &str = "p2pv2up";
 /// The padded Zcash command used for Zakura upgrade prelude messages.
 pub const P2P_V2_UPGRADE_COMMAND_BYTES: &[u8; 12] = b"p2pv2up\0\0\0\0\0";
 
-/// The ALPN for the Iroh 1.x Zakura transport cohort.
-pub const P2P_V2_ALPN: &[u8] = b"p2p-v2/2";
+/// The ALPN for the zakura-quic transport (SPEC WIRE-2).
+///
+/// Version 3 replaced the Iroh 1.x wire profile of `p2p-v2/2`, so nodes on
+/// different versions reach each other only over the legacy protocol.
+pub const P2P_V2_ALPN: &[u8] = b"p2p-v2/3";
 
 /// Magic bytes for Zakura legacy upgrade prelude messages.
 pub const PRELUDE_MAGIC: [u8; 8] = *b"ZAKURA1\0";

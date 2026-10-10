@@ -94,7 +94,7 @@ the first QUIC packet. The node reads it there with `Incoming::decrypt()`,
 before any handshake work. For the wallet ALPN, the node checks `W` and the
 per-source share. It then accepts with a small transport profile through
 `Incoming::accept_with`: a receive window of one in-flight budget plus control
-overhead, and `K + 2` streams. Full peers keep `p2p-v2/2` and their current
+overhead, and `K + 2` streams. Full peers keep `p2p-v2/3` and their current
 profile. Wallet sessions never take one of the 256 peer connection slots.
 
 Two alternatives were rejected:
@@ -102,8 +102,8 @@ Two alternatives were rejected:
 - A second listener also works, but adds a port that operators must open and
   advertise.
 - Starting every connection with small credit and raising it after the
-  handshake fails for full peers. noq can raise a connection's window and stream
-  count, but not its per-stream window, which block sync needs.
+  handshake fails for full peers. quinn-proto can raise a connection's window
+  and stream count, but not its per-stream window, which block sync needs.
 
 ## 4. Results
 

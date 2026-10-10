@@ -10,9 +10,10 @@ import sys
 
 # `zakura` is the node binary package, rather than a supported Rust library API.
 # Its command and configuration types can change without library SemVer bumps.
-# `zakura_mmr_tree` has no published baseline yet. Remove this exclusion after
-# its first crates.io release; its dependents remain checked.
-SEMVER_ENFORCEMENT_EXCLUSIONS = {"zakura", "zakura_mmr_tree"}
+# `zakura-quic` and `zakura_mmr_tree` have no crates.io release yet, so they have
+# no baseline to check against. Remove each after its first publish; their
+# dependents remain checked.
+SEMVER_ENFORCEMENT_EXCLUSIONS = {"zakura", "zakura-quic", "zakura_mmr_tree"}
 
 
 def is_publishable(package):

@@ -52,6 +52,7 @@ PUBLISH_ORDER=(
   zakura-test
   zakura-tower-fallback
   zakura-jsonl-trace
+  zakura-quic
   zakura_mmr_tree
   zakura-chain
   zakura-header-chain

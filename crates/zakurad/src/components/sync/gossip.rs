@@ -193,6 +193,7 @@ where
                     hash,
                     height,
                     submitted_at,
+                    submission,
                     pending,
                 }) => (
                     (
@@ -201,7 +202,7 @@ where
                         chain_state,
                     ),
                     true,
-                    Some((pending, submitted_at)),
+                    Some((pending, submitted_at, submission)),
                 ),
                 GossipEvent::MinedBlock(MinedBlockEvent::Committed { hash, height }) => (
                     (
@@ -245,12 +246,8 @@ where
         // Include readiness in the deadline. The event loop must keep consuming lifecycle and tip
         // events when the peer set has no ready service.
         let network = broadcast_network.clone();
-        // Only a committed broadcast may suppress the committed-tip fallback. Early inventory
-        // advertises a hash whose body this node cannot serve yet, so a peer that follows it can
-        // exhaust `PENDING_BLOCK_WAIT` and receive `notfound`. The fallback is what re-advertises
-        // the hash to that peer when the later committed broadcast also fails, so marking on an
-        // early broadcast would remove the last prompt. Marking here is also redundant: a block
-        // that commits always sends `Committed`, and that broadcast marks the same hash.
+        // Keep the committed-tip fallback until the committed broadcast succeeds. An admitted
+        // body can be served immediately, but contextual failure still cancels early inventory.
         let completion_tx = (is_block_submission && early.is_none()).then(|| {
             mined_block_broadcasts.start(hash);
             mined_block_completion_sender.clone()
@@ -258,7 +255,7 @@ where
         tokio::spawn(async move {
             let broadcast = broadcast_with_timeout(network, request);
             let succeeded = match early {
-                Some((mut pending, submitted_at)) => {
+                Some((mut pending, submitted_at, submission)) => {
                     if !pending.is_valid() {
                         false
                     } else {
@@ -270,7 +267,7 @@ where
                         if succeeded {
                             metrics::counter!("mining.optimistic_inventory.early_inventories")
                                 .increment(1);
-                            metrics::histogram!("mining.submit_to_inventory.duration_seconds")
+                            metrics::histogram!("mining.submit_to_inventory.duration_seconds", "method" => submission.rpc_method())
                                 .record(submitted_at.elapsed().as_secs_f64());
                         }
                         succeeded

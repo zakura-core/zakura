@@ -57,7 +57,7 @@ use tracing::Instrument;
 
 use zakura_chain::{
     amount::{Amount, NegativeAllowed},
-    block::{self, Block, Commitment, Height, SerializedBlock, TryIntoHeight},
+    block::{self, Block, Commitment, Header, Height, SerializedBlock, TryIntoHeight},
     chain_sync_status::ChainSyncStatus,
     chain_tip::{ChainTip, NetworkChainTipHeightEstimator},
     parameters::{
@@ -111,6 +111,8 @@ pub(crate) mod types;
 
 use hex_data::HexData;
 use trees::{GetSubtreesByIndexResponse, GetTreestateResponse, SubtreeRpcData};
+use types::get_block_template::prepared_candidates::ResolvePreparedCandidateError;
+
 use types::{
     chain_tips::{self, GetChainTipsResponse},
     get_block_template::{
@@ -130,8 +132,9 @@ use types::{
     network_info::{GetNetworkInfoResponse, NetworkInfo},
     peer_info::PeerInfo,
     submit_block::{
-        MinedBlockEvent, PendingBlockRegistry, SubmitBlockErrorResponse, SubmitBlockParameters,
-        SubmitBlockResponse,
+        MinedBlockEvent, MinedBlockSubmission, PendingBlockRegistry, SubmitBlockErrorResponse,
+        SubmitBlockParameters, SubmitBlockResponse, SubmitSolutionErrorResponse,
+        SubmitSolutionParameters, SubmitSolutionResponse,
     },
     subsidy::GetBlockSubsidyResponse,
     transaction::TransactionObject,
@@ -223,6 +226,7 @@ pub(crate) const RPC_METHOD_ACCESS: &[(&str, RpcAccess)] = &[
     ("getblockhash", RpcAccess::Unauthenticated),
     ("getblocktemplate", RpcAccess::Unauthenticated),
     ("submitblock", RpcAccess::Unauthenticated),
+    ("submitsolution", RpcAccess::Unauthenticated),
     ("getmininginfo", RpcAccess::Unauthenticated),
     ("getnetworksolps", RpcAccess::Unauthenticated),
     ("getnetworkhashps", RpcAccess::Unauthenticated),
@@ -748,6 +752,16 @@ pub trait Rpc {
         _parameters: Option<SubmitBlockParameters>,
     ) -> Result<SubmitBlockResponse>;
 
+    /// Submits a solved header for a prepared mining candidate.
+    ///
+    /// The miner must retry with `submitblock` when this method returns `stale-work` or
+    /// `candidate-mismatch`.
+    #[method(name = "submitsolution")]
+    async fn submit_solution(
+        &self,
+        parameters: SubmitSolutionParameters,
+    ) -> Result<SubmitSolutionResponse>;
+
     /// Returns mining-related information.
     ///
     /// zcashd reference: [`getmininginfo`](https://zcash.github.io/rpc/getmininginfo.html)
@@ -1038,7 +1052,7 @@ const TEMPLATE_PREPARATION_TIMEOUT: Duration = Duration::from_secs(30);
 /// The outcome of validating one server mining template.
 enum Preparation {
     /// The template passed proposal validation.
-    Prepared,
+    Prepared(Arc<Block>),
     /// Validation condemned the template itself, so the server must withdraw it.
     Rejected,
     /// The chain moved off the template's parent before validation finished.
@@ -1074,13 +1088,14 @@ where
     }
 
     let parent = block.header.previous_block_hash;
+    let block = Arc::new(block);
     let request = zakura_consensus::Request::Prepare {
-        block: Arc::new(block),
+        block: block.clone(),
         source: zakura_consensus::PreparedCandidateSource::ServerTemplate,
     };
 
     match verifier.oneshot(request).await {
-        Ok(_hash) => Preparation::Prepared,
+        Ok(_hash) => Preparation::Prepared(block),
         Err(error) => {
             let rejects_template = rejects_template(&error);
             tracing::debug!(
@@ -1226,7 +1241,13 @@ async fn prepare_one_server_template<BlockVerifierRouter, Tip, SyncStatus>(
     }
 
     match outcome {
-        Ok(Preparation::Prepared) => {
+        Ok(Preparation::Prepared(block)) => {
+            gbt.prepared_candidates().insert(
+                block,
+                &work_id,
+                zakura_consensus::PreparedCandidateSource::ServerTemplate,
+                network,
+            );
             gbt.template_rejections
                 .send_if_modified(|state| state.mark_prepared(parent, &work_id));
         }
@@ -1604,7 +1625,7 @@ where
         // A fallback must still belong to the context it was validated against. Check that and
         // record success under one write lock, so a rejection cannot land between the two and
         // leave this work marked prepared for a stale parent.
-        let prepared = matches!(preparation, Preparation::Prepared);
+        let prepared = matches!(preparation, Preparation::Prepared(_));
         let mut current_context = false;
         self.gbt.template_rejections.send_if_modified(|current| {
             if self.recovery_context_changed(current, state, &template, chain_info.tip_hash) {
@@ -1618,7 +1639,15 @@ where
         }
 
         let error = match preparation {
-            Preparation::Prepared => return Ok(Some(template.into())),
+            Preparation::Prepared(block) => {
+                self.gbt.prepared_candidates().insert(
+                    block,
+                    template.work_id(),
+                    zakura_consensus::PreparedCandidateSource::ServerTemplate,
+                    &self.network,
+                );
+                return Ok(Some(template.into()));
+            }
             Preparation::Rejected => {
                 "empty template recovery was rejected; wait for a new tip".to_string()
             }
@@ -1722,6 +1751,190 @@ where
             }
             .in_current_span(),
         );
+    }
+
+    async fn run_mined_block_lifecycle(
+        &self,
+        block: Arc<Block>,
+        submitted_at: std::time::Instant,
+        submission: MinedBlockSubmission,
+    ) -> Result<SubmitBlockResponse> {
+        let mut block_verifier_router = self.gbt.block_verifier_router();
+        let height = block
+            .coinbase_height()
+            .ok_or_error(0, "coinbase height not found")?;
+        let block_hash = block.hash();
+        let submission_guard = match self.gbt.reserve_mined_submission(block_hash) {
+            Ok(submission) => submission,
+            Err(response) => return Ok(response.into()),
+        };
+        let admission = zakura_state::BlockAdmission::pending();
+        let request = zakura_consensus::Request::CommitMined {
+            block: block.clone(),
+            admission: admission.clone(),
+        };
+        let pending_blocks = self.gbt.pending_blocks();
+        let mined_block_sender = self.gbt.mined_block_sender();
+        let optimistic_block_inventory = self.gbt.optimistic_block_inventory();
+
+        // This task owns the commit and registry lifecycle. RPC cancellation only detaches it.
+        let lifecycle = tokio::spawn(async move {
+            let _submission_guard = submission_guard;
+            let verification =
+                async move { block_verifier_router.ready().await?.call(request).await };
+            tokio::pin!(verification);
+
+            let admission_start = std::time::Instant::now();
+            let mut pending_registration = None;
+            let mut early_sent = false;
+            let verification_result = tokio::select! {
+                biased;
+
+                // Observe a completed commit before advertising its pending body.
+                result = &mut verification => result,
+                admitted = admission.wait() => {
+                    metrics::histogram!("mining.state_admission.duration_seconds")
+                        .record(admission_start.elapsed().as_secs_f64());
+                    if admitted
+                        && admission.optimistic_relay_authorized()
+                        && optimistic_block_inventory
+                    {
+                        if let Some(registration) = pending_blocks.insert(block.clone()) {
+                            let event = MinedBlockEvent::Early {
+                                hash: block_hash,
+                                height,
+                                submitted_at,
+                                submission,
+                                pending: registration.signal(),
+                            };
+                            if mined_block_sender.send(event).is_ok() {
+                                early_sent = true;
+                                pending_registration = Some(registration);
+                            }
+                        }
+                    }
+                    verification.await
+                },
+            };
+
+            if let Some(registration) = pending_registration {
+                registration.resolve(
+                    verification_result
+                        .as_ref()
+                        .map(|_| block.clone())
+                        .map_err(|_| ()),
+                );
+            }
+
+            if verification_result.is_ok() {
+                if mined_block_sender
+                    .send(MinedBlockEvent::Committed {
+                        hash: block_hash,
+                        height,
+                    })
+                    .is_err()
+                {
+                    metrics::counter!("mining.optimistic_inventory.final_send_failures")
+                        .increment(1);
+                    tracing::warn!(
+                        ?block_hash,
+                        ?height,
+                        "could not send the final mined-block event"
+                    );
+                }
+            } else if early_sent {
+                metrics::counter!("mining.optimistic_inventory.post_admission_failures")
+                    .increment(1);
+                tracing::warn!(
+                    ?block_hash,
+                    ?height,
+                    "mined block failed contextual commit after state admission"
+                );
+            }
+            verification_result
+        });
+
+        let block_verifier_router_response = lifecycle.await.map_err(|error| {
+            ErrorObject::owned(
+                ErrorCode::InternalError.code(),
+                format!("mined block lifecycle task failed: {error}"),
+                None::<()>,
+            )
+        })?;
+
+        let chain_error = match block_verifier_router_response {
+            // Currently, this match arm returns `null` (Accepted) for blocks committed
+            // to any chain, but Accepted is only for blocks in the best chain.
+            //
+            // TODO (#5487):
+            // - Inconclusive: check if the block is on a side-chain
+            // The difference is important to miners, because they want to mine on the best chain.
+            Ok(hash) => {
+                tracing::info!(
+                    ?hash,
+                    ?height,
+                    method = submission.rpc_method(),
+                    "mined block accepted"
+                );
+                return Ok(SubmitBlockResponse::Accepted);
+            }
+
+            // Turns BoxError into Result<VerifyChainError, BoxError>,
+            // by downcasting from Any to VerifyChainError.
+            Err(box_error) => {
+                let error = box_error
+                    .downcast::<RouterError>()
+                    .map(|boxed_chain_error| *boxed_chain_error);
+
+                tracing::info!(
+                    ?error,
+                    ?block_hash,
+                    ?height,
+                    method = submission.rpc_method(),
+                    "mined block failed verification"
+                );
+
+                error
+            }
+        };
+
+        let response = match chain_error {
+            Ok(source) if source.is_duplicate_request() => SubmitBlockErrorResponse::Duplicate,
+            Ok(RouterError::Block { source })
+                if matches!(
+                    source.as_ref(),
+                    zakura_consensus::VerifyBlockError::Commit(
+                        zakura_state::CommitBlockError::MissingMinedParent
+                            | zakura_state::CommitBlockError::QueueFull
+                    )
+                ) =>
+            {
+                SubmitBlockErrorResponse::Inconclusive
+            }
+
+            // Currently, these match arms return Reject for the older duplicate in a queue,
+            // but queued duplicates should be DuplicateInconclusive.
+            //
+            // Optional TODO (#5487):
+            // - DuplicateInconclusive: turn these non-finalized state duplicate block errors
+            //   into BlockError enum variants, and handle them as DuplicateInconclusive:
+            //   - "block already sent to be committed to the state"
+            //   - "replaced by newer request"
+            // - keep the older request in the queue,
+            //   and return a duplicate error for the newer request immediately.
+            //   This improves the speed of the RPC response.
+            //
+            // Checking the download queues and BlockVerifierRouter buffer for duplicates
+            // might require architectural changes to Zebra, so we should only do it
+            // if mining pools really need it.
+            Ok(_verify_chain_error) => SubmitBlockErrorResponse::Rejected,
+
+            // This match arm is currently unreachable, but if future changes add extra error types,
+            // we want to turn them into `Rejected`.
+            Err(_unknown_error_type) => SubmitBlockErrorResponse::Rejected,
+        };
+
+        Ok(response.into())
     }
 
     /// Shares one pending-block registry with peer serving.
@@ -3174,6 +3387,10 @@ where
                 &self.network,
                 latest_chain_tip,
                 sync_status,
+                parameters
+                    .as_ref()
+                    .and_then(|params| params.work_id.as_deref())
+                    .map(|work_id| (self.gbt.prepared_candidates(), work_id)),
             )
             .await;
         }
@@ -3564,11 +3781,9 @@ where
         // looks a prepared candidate up by its content.
         _parameters: Option<SubmitBlockParameters>,
     ) -> Result<SubmitBlockResponse> {
-        let mut block_verifier_router = self.gbt.block_verifier_router();
         let submitted_at = std::time::Instant::now();
-
         let block: Block = match block_bytes.zcash_deserialize_into() {
-            Ok(block_bytes) => block_bytes,
+            Ok(block) => block,
             Err(error) => {
                 tracing::info!(
                     ?error,
@@ -3578,175 +3793,54 @@ where
                 return Ok(SubmitBlockErrorResponse::Rejected.into());
             }
         };
+        self.run_mined_block_lifecycle(
+            Arc::new(block),
+            submitted_at,
+            MinedBlockSubmission::FullBlock,
+        )
+        .await
+    }
 
-        let height = block
-            .coinbase_height()
-            .ok_or_error(0, "coinbase height not found")?;
-        let block_hash = block.hash();
-        let submission = match self.gbt.reserve_mined_submission(block_hash) {
-            Ok(submission) => submission,
-            Err(response) => return Ok(response.into()),
-        };
-        let block = Arc::new(block);
-        let admission = zakura_state::BlockAdmission::pending();
-        let request = zakura_consensus::Request::CommitMined {
-            block: block.clone(),
-            admission: admission.clone(),
-        };
-        let pending_blocks = self.gbt.pending_blocks();
-        let mined_block_sender = self.gbt.mined_block_sender();
-        let optimistic_block_inventory = self.gbt.optimistic_block_inventory();
-
-        // This task owns the commit and registry lifecycle. RPC cancellation only detaches it.
-        let lifecycle = tokio::spawn(async move {
-            let _submission = submission;
-            let verification =
-                async move { block_verifier_router.ready().await?.call(request).await };
-            tokio::pin!(verification);
-
-            let admission_start = std::time::Instant::now();
-            let mut pending_registration = None;
-            let mut early_sent = false;
-            let verification_result = tokio::select! {
-                biased;
-
-                // Observe a completed commit before advertising its pending body.
-                result = &mut verification => result,
-                admitted = admission.wait() => {
-                    metrics::histogram!("mining.state_admission.duration_seconds")
-                        .record(admission_start.elapsed().as_secs_f64());
-                    if admitted
-                        && admission.optimistic_relay_authorized()
-                        && optimistic_block_inventory
-                    {
-                        if let Some(registration) = pending_blocks.insert(block.clone()) {
-                            let event = MinedBlockEvent::Early {
-                                hash: block_hash,
-                                height,
-                                submitted_at,
-                                pending: registration.signal(),
-                            };
-                            if mined_block_sender.send(event).is_ok() {
-                                early_sent = true;
-                                pending_registration = Some(registration);
-                            }
-                        }
-                    }
-                    verification.await
-                },
-            };
-
-            if let Some(registration) = pending_registration {
-                registration.resolve(
-                    verification_result
-                        .as_ref()
-                        .map(|_| block.clone())
-                        .map_err(|_| ()),
-                );
-            }
-
-            if verification_result.is_ok() {
-                if mined_block_sender
-                    .send(MinedBlockEvent::Committed {
-                        hash: block_hash,
-                        height,
-                    })
-                    .is_err()
-                {
-                    metrics::counter!("mining.optimistic_inventory.final_send_failures")
-                        .increment(1);
-                    tracing::warn!(
-                        ?block_hash,
-                        ?height,
-                        "could not send the final mined-block event"
-                    );
-                }
-            } else if early_sent {
-                metrics::counter!("mining.optimistic_inventory.post_admission_failures")
-                    .increment(1);
-                tracing::warn!(
-                    ?block_hash,
-                    ?height,
-                    "mined block failed contextual commit after state admission"
-                );
-            }
-            verification_result
-        });
-
-        let block_verifier_router_response = lifecycle.await.map_err(|error| {
-            ErrorObject::owned(
-                ErrorCode::InternalError.code(),
-                format!("mined block lifecycle task failed: {error}"),
-                None::<()>,
-            )
-        })?;
-
-        let chain_error = match block_verifier_router_response {
-            // Currently, this match arm returns `null` (Accepted) for blocks committed
-            // to any chain, but Accepted is only for blocks in the best chain.
-            //
-            // TODO (#5487):
-            // - Inconclusive: check if the block is on a side-chain
-            // The difference is important to miners, because they want to mine on the best chain.
-            Ok(hash) => {
-                tracing::info!(?hash, ?height, "submit block accepted");
-                return Ok(SubmitBlockResponse::Accepted);
-            }
-
-            // Turns BoxError into Result<VerifyChainError, BoxError>,
-            // by downcasting from Any to VerifyChainError.
-            Err(box_error) => {
-                let error = box_error
-                    .downcast::<RouterError>()
-                    .map(|boxed_chain_error| *boxed_chain_error);
-
-                tracing::info!(
-                    ?error,
-                    ?block_hash,
-                    ?height,
-                    "submit block failed verification"
-                );
-
-                error
+    async fn submit_solution(
+        &self,
+        SubmitSolutionParameters { work_id, header }: SubmitSolutionParameters,
+    ) -> Result<SubmitSolutionResponse> {
+        let submitted_at = std::time::Instant::now();
+        let HexData(header_bytes) = header;
+        let mut remaining_header_bytes = header_bytes.as_slice();
+        let header: Header = match Header::zcash_deserialize(&mut remaining_header_bytes) {
+            Ok(header) => header,
+            Err(error) => {
+                tracing::info!(?error, "submit solution rejected a malformed block header");
+                return Ok(SubmitSolutionErrorResponse::Rejected.into());
             }
         };
+        if !remaining_header_bytes.is_empty() {
+            tracing::info!("submit solution rejected trailing block header bytes");
+            return Ok(SubmitSolutionErrorResponse::Rejected.into());
+        }
 
-        let response = match chain_error {
-            Ok(source) if source.is_duplicate_request() => SubmitBlockErrorResponse::Duplicate,
-            Ok(RouterError::Block { source })
-                if matches!(
-                    source.as_ref(),
-                    zakura_consensus::VerifyBlockError::Commit(
-                        zakura_state::CommitBlockError::MissingMinedParent
-                            | zakura_state::CommitBlockError::QueueFull
-                    )
-                ) =>
-            {
-                SubmitBlockErrorResponse::Inconclusive
+        let reconstruction_start = std::time::Instant::now();
+        let block = match self.gbt.prepared_candidates().resolve(&work_id, header) {
+            Ok(block) => block,
+            Err(ResolvePreparedCandidateError::StaleWork) => {
+                metrics::counter!("mining.compact_submission.stale_work").increment(1);
+                return Ok(SubmitSolutionErrorResponse::StaleWork.into());
             }
-
-            // Currently, these match arms return Reject for the older duplicate in a queue,
-            // but queued duplicates should be DuplicateInconclusive.
-            //
-            // Optional TODO (#5487):
-            // - DuplicateInconclusive: turn these non-finalized state duplicate block errors
-            //   into BlockError enum variants, and handle them as DuplicateInconclusive:
-            //   - "block already sent to be committed to the state"
-            //   - "replaced by newer request"
-            // - keep the older request in the queue,
-            //   and return a duplicate error for the newer request immediately.
-            //   This improves the speed of the RPC response.
-            //
-            // Checking the download queues and BlockVerifierRouter buffer for duplicates
-            // might require architectural changes to Zebra, so we should only do it
-            // if mining pools really need it.
-            Ok(_verify_chain_error) => SubmitBlockErrorResponse::Rejected,
-
-            // This match arm is currently unreachable, but if future changes add extra error types,
-            // we want to turn them into `Rejected`.
-            Err(_unknown_error_type) => SubmitBlockErrorResponse::Rejected,
+            Err(ResolvePreparedCandidateError::CandidateMismatch) => {
+                metrics::counter!("mining.compact_submission.candidate_mismatches").increment(1);
+                return Ok(SubmitSolutionErrorResponse::CandidateMismatch.into());
+            }
         };
+        metrics::histogram!("mining.compact_submission.reconstruction.duration_seconds")
+            .record(reconstruction_start.elapsed().as_secs_f64());
 
+        let response = self
+            .run_mined_block_lifecycle(block, submitted_at, MinedBlockSubmission::CompactHeader)
+            .await?;
+        if response == SubmitBlockResponse::Accepted {
+            metrics::counter!("mining.compact_submission.accepted").increment(1);
+        }
         Ok(response.into())
     }
 

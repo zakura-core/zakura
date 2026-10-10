@@ -457,6 +457,15 @@ where
                 }
             }
 
+            // Reuse server candidates by content; RPC work IDs stay outside consensus.
+            // Client proposals still receive a fresh validity verdict, and solved blocks run
+            // all time, proof-of-work, and contextual checks on the CommitMined path.
+            if prepared_source == Some(PreparedCandidateSource::ServerTemplate)
+                && prepared_candidates.reuse_server_candidate(&block, &network)
+            {
+                return Ok(hash);
+            }
+
             // Next, check the Merkle root validity, to ensure that
             // the header binds to the transactions in the blocks.
 

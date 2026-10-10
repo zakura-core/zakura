@@ -6,9 +6,74 @@ use std::{
 };
 
 use super::{
-    block_misbehavior, canonical_ip, PrunedBlockNotFoundLogger,
+    block_by_hash_or_pending, block_misbehavior, canonical_ip, PrunedBlockNotFoundLogger,
     ZCASHD_COMPAT_PRUNED_BLOCK_LOG_INTERVAL,
 };
+
+#[tokio::test]
+async fn peer_block_lookup_queries_all_active_chains() {
+    use std::sync::Arc;
+
+    use tower::{buffer::Buffer, util::BoxService};
+    use zakura_chain::{block::Block, serialization::ZcashDeserializeInto};
+    use zakura_rpc::PendingBlockRegistry;
+    let block: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
+        .zcash_deserialize_into()
+        .expect("the genesis block is valid");
+    let hash = block.hash();
+    let expected_block = block.clone();
+    let state = tower::service_fn(move |request| {
+        let expected_block = expected_block.clone();
+        async move {
+            assert_eq!(request, zakura_state::Request::AnyChainBlock(hash.into()));
+            Ok::<_, zakura_state::BoxError>(zakura_state::Response::Block(Some(expected_block)))
+        }
+    });
+    let state = Buffer::new(BoxService::new(state), 1);
+
+    assert_eq!(
+        block_by_hash_or_pending(state, PendingBlockRegistry::default(), hash)
+            .await
+            .expect("the state lookup succeeds"),
+        Some(block),
+    );
+}
+
+#[tokio::test]
+async fn peer_block_lookup_serves_admitted_block_before_state() {
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+
+    use tower::{buffer::Buffer, util::BoxService};
+    use zakura_chain::{block::Block, serialization::ZcashDeserializeInto};
+    use zakura_rpc::PendingBlockRegistry;
+
+    let block: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
+        .zcash_deserialize_into()
+        .expect("the genesis block is valid");
+    let hash = block.hash();
+    let state_called = Arc::new(AtomicBool::new(false));
+    let state_called_for_service = state_called.clone();
+    let state = tower::service_fn(move |_request: zakura_state::Request| {
+        state_called_for_service.store(true, Ordering::SeqCst);
+        async { Ok::<_, zakura_state::BoxError>(zakura_state::Response::Block(None)) }
+    });
+    let state = Buffer::new(BoxService::new(state), 1);
+    let pending_blocks = PendingBlockRegistry::default();
+    let _registration = pending_blocks
+        .insert(block.clone())
+        .expect("the registry accepts the admitted block");
+
+    assert_eq!(
+        block_by_hash_or_pending(state, pending_blocks, hash)
+            .await
+            .expect("the pending lookup succeeds"),
+        Some(block),
+    );
+    assert!(!state_called.load(Ordering::SeqCst));
+}
 
 /// Checks that a zcashd-compat sidecar gets every block it requests, while other peers'
 /// responses stop once they pass [`GETDATA_SENT_BYTES_LIMIT`](super::GETDATA_SENT_BYTES_LIMIT).

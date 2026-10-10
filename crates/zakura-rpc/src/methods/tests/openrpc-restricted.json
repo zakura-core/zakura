@@ -406,6 +406,30 @@
       }
     },
     {
+      "description": "Submits a solved header for a prepared mining candidate.\n\nThe miner must retry with `submitblock` when this method returns `stale-work` or\n`candidate-mismatch`.",
+      "name": "submitsolution",
+      "params": [
+        {
+          "description": "The parameters for the command.",
+          "name": "parameters",
+          "required": true,
+          "schema": {
+            "$ref": "#/components/schemas/SubmitSolutionParameters"
+          },
+          "summary": "The parameters for the command."
+        }
+      ],
+      "result": {
+        "description": "An OpenRPC document.",
+        "name": "submitsolution_result",
+        "schema": {
+          "$ref": "#/components/schemas/OpenRPC%20Schema"
+        },
+        "summary": "An OpenRPC document."
+      },
+      "summary": "Submits a solved header for a prepared mining candidate."
+    },
+    {
       "name": "getblockhash",
       "summary": "Returns the hash of the block of a given height iff the index argument correspond",
       "description": "Returns the hash of the block of a given height iff the index argument correspond\nto a block in the best chain.\n\nzcashd reference: [`getblockhash`](https://zcash-rpc.github.io/getblockhash.html)\nmethod: post\ntags: blockchain\n\n# Parameters\n\n- `index`: (numeric, required, example=1) The block index.\n\n# Notes\n\n- If `index` is positive then index = block height.\n- If `index` is negative then -1 is the last known valid block.",
@@ -1026,6 +1050,24 @@
             ]
           }
         },
+        "type": "object"
+      },
+      "SubmitSolutionParameters": {
+        "description": "A compact mined-block submission.",
+        "properties": {
+          "header": {
+            "$ref": "#/components/schemas/HexData",
+            "description": "The complete hex-encoded solved block header."
+          },
+          "workid": {
+            "description": "The prepared candidate identifier returned by `getblocktemplate`.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "workid",
+          "header"
+        ],
         "type": "object"
       }
     }

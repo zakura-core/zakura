@@ -155,6 +155,28 @@ impl PreparedCandidateCache {
         hit
     }
 
+    /// Reuses and refreshes a server candidate with identical immutable content.
+    pub(super) fn reuse_server_candidate(&self, block: &Block, network: &Network) -> bool {
+        if self.lock()[PreparedCandidateSource::ServerTemplate.index()].is_empty() {
+            return false;
+        }
+        let id = CandidateId::of(block, network);
+        let mut cache = self.lock();
+        let partition = &mut cache[PreparedCandidateSource::ServerTemplate.index()];
+        partition.prune_expired();
+        let Some(index) = partition.entries.iter().position(|entry| entry.id == id) else {
+            return false;
+        };
+        let mut entry = partition
+            .entries
+            .remove(index)
+            .expect("the matching entry exists under the same cache lock");
+        entry.expires_at = Instant::now() + ENTRY_TTL;
+        partition.entries.push_back(entry);
+        metrics::counter!("mining.prepared_cache.reuses").increment(1);
+        true
+    }
+
     /// Stores `prepared` under `id` in `source`'s partition.
     pub(super) fn insert(
         &self,

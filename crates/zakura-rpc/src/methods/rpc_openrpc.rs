@@ -175,6 +175,14 @@ pub(crate) static METHODS: &[(&str, openrpc::RpcMethod)] = &[
     result: |g| g.result("submitblock_result"),
     deprecated: false,
 }),
+("submitsolution", openrpc::RpcMethod {
+    description: "Submits a solved header for a prepared mining candidate.\n\nThe miner must retry with `submitblock` when this method returns `stale-work` or\n`candidate-mismatch`.\n",
+    params: |_g| vec![
+        _g.param::<SubmitSolutionParameters>("parameters", crate::methods::PARAM_PARAMETERS_DESC, true),
+    ],
+    result: |g| g.result("submitsolution_result"),
+    deprecated: false,
+}),
 ("getmininginfo", openrpc::RpcMethod {
     description: "Returns mining-related information.\n\nzcashd reference: [`getmininginfo`](https://zcash.github.io/rpc/getmininginfo.html)\nmethod: post\ntags: mining\n",
     params: |_g| vec![

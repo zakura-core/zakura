@@ -29,6 +29,22 @@ const ADDR_V1_SIZE: usize = 4 + 8 + 16 + 2;
 #[allow(clippy::identity_op)]
 const ADDR_V2_MIN_SIZE: usize = 4 + 1 + 1 + 1 + 0 + 2;
 
+/// Counted slice decoding needs a nonzero minimum for every element type; see the
+/// matching `zakura-chain` test. These are also the smallest encodings the decoders
+/// accept, so a larger value would reject valid messages.
+#[test]
+fn every_decodable_preallocate_type_has_a_nonzero_minimum() {
+    assert_eq!(InventoryHash::min_serialized_size(), 4 + 32);
+    assert_eq!(
+        AddrV1::min_serialized_size(),
+        u64::try_from(ADDR_V1_SIZE).unwrap()
+    );
+    assert_eq!(
+        AddrV2::min_serialized_size(),
+        u64::try_from(ADDR_V2_MIN_SIZE).unwrap()
+    );
+}
+
 /// The number of test cases to use for expensive proptests.
 const DEFAULT_PROPTEST_CASES: u32 = 8;
 

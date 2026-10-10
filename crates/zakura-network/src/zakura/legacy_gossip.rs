@@ -3131,8 +3131,10 @@ impl LegacyGossipError {
     /// Returns true if this error, from decoding a peer's response, proves the
     /// peer violated the protocol, so its connection should be closed.
     ///
-    /// Missing or unexpected responses are not faults on their own: the caller
-    /// falls back to another peer.
+    /// The transport already rejects the structural variants as `Fatal` before
+    /// decoding; the live addition here is requested-item binding
+    /// (`UnsolicitedBlock`). Missing or unexpected responses are not faults on
+    /// their own: the caller falls back to another peer.
     pub(crate) fn is_peer_fault(&self) -> bool {
         match self {
             Self::UnsupportedFlags(_)

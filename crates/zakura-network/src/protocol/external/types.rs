@@ -129,6 +129,14 @@ impl Version {
             // Regtest uses the Testnet version.
             (Testnet(params), Nu7) if params.is_default_testnet() || params.is_regtest() => 170_180,
             (Mainnet, Nu7) => 170_190,
+            // NuTachyon provisionally follows the same assignment pattern. Update these values
+            // if its deployment ZIP assigns different protocol versions.
+            #[cfg(zcash_unstable = "nutachyon")]
+            (Testnet(params), NuTachyon) if params.is_default_testnet() || params.is_regtest() => {
+                170_200
+            }
+            #[cfg(zcash_unstable = "nutachyon")]
+            (Mainnet, NuTachyon) => 170_210,
 
             // It should be fine to reject peers with earlier network protocol versions on custom testnets for now.
             (Testnet(_), _) => CURRENT_NETWORK_PROTOCOL_VERSION.0,
@@ -220,8 +228,18 @@ mod test {
         let _init_guard = zakura_test::init();
 
         let highest_network_upgrade = NetworkUpgrade::current(network, block::Height::MAX);
+        #[cfg(not(zcash_unstable = "nutachyon"))]
         assert!(
             matches!(highest_network_upgrade, Nu6 | Nu6_1 | Nu6_2 | Nu6_3 | Nu7),
+            "expected coverage of all network upgrades: \
+            add the new network upgrade to the list in this test"
+        );
+        #[cfg(zcash_unstable = "nutachyon")]
+        assert!(
+            matches!(
+                highest_network_upgrade,
+                Nu6 | Nu6_1 | Nu6_2 | Nu6_3 | Nu7 | NuTachyon
+            ),
             "expected coverage of all network upgrades: \
             add the new network upgrade to the list in this test"
         );
@@ -239,6 +257,8 @@ mod test {
             Nu6_2,
             Nu6_3,
             Nu7,
+            #[cfg(zcash_unstable = "nutachyon")]
+            NuTachyon,
         ] {
             let height = network_upgrade.activation_height(network);
             if let Some(height) = height {
@@ -250,9 +270,32 @@ mod test {
         }
     }
 
-    /// Checks that Zakura advertises the Mainnet NU7 version, which meets the NU7
-    /// minimum on every network.
+    /// Checks that Zakura advertises the Mainnet NuTachyon version, which meets the
+    /// NuTachyon minimum on every network.
     #[test]
+    #[cfg(zcash_unstable = "nutachyon")]
+    fn nu_tachyon_protocol_versions_match_current_version() {
+        let _init_guard = zakura_test::init();
+
+        assert_eq!(
+            Version::min_specified_for_upgrade(&Mainnet, NuTachyon),
+            CURRENT_NETWORK_PROTOCOL_VERSION
+        );
+        for network in [
+            Network::new_default_testnet(),
+            Network::new_regtest(Default::default()),
+        ] {
+            assert!(
+                Version::min_specified_for_upgrade(&network, NuTachyon)
+                    <= CURRENT_NETWORK_PROTOCOL_VERSION
+            );
+        }
+    }
+
+    /// Checks that a non-NuTachyon build advertises the Mainnet NU7 version, which
+    /// meets the NU7 minimum on every network.
+    #[test]
+    #[cfg(not(zcash_unstable = "nutachyon"))]
     fn nu7_protocol_versions_match_current_version() {
         let _init_guard = zakura_test::init();
 

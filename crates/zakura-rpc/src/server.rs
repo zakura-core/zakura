@@ -237,7 +237,11 @@ impl RpcServer {
             .expect("caller should make sure listen_addr is set");
 
         let rpc = rpc.with_rpc_surface(surface);
+        #[cfg(zcash_unstable = "nutachyon")]
+        let tachyon_methods = crate::methods::TachyonRpcServer::into_rpc(rpc.clone());
         let mut methods = rpc.into_rpc();
+        #[cfg(zcash_unstable = "nutachyon")]
+        methods.merge(tachyon_methods)?;
         configure_rpc_methods(&mut methods, surface)?;
 
         // The largest RPC request is submitblock, which sends a full block

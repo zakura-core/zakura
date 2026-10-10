@@ -111,6 +111,8 @@ pub(crate) mod types;
 
 use hex_data::HexData;
 use trees::{GetSubtreesByIndexResponse, GetTreestateResponse, SubtreeRpcData};
+#[cfg(zcash_unstable = "nutachyon")]
+pub use types::tachyon::{GetTachyonBlockResponse, TachyonStampData};
 use types::{
     chain_tips::{self, GetChainTipsResponse},
     get_block_template::{
@@ -139,6 +141,14 @@ use types::{
     validate_address::ValidateAddressResponse,
     z_validate_address::ZValidateAddressResponse,
 };
+
+/// Value pool balances returned by the blockchain RPCs.
+#[cfg(not(zcash_unstable = "nutachyon"))]
+pub type BlockchainValuePoolBalances = [GetBlockchainInfoBalance; 6];
+
+/// Value pool balances returned by the blockchain RPCs.
+#[cfg(zcash_unstable = "nutachyon")]
+pub type BlockchainValuePoolBalances = [GetBlockchainInfoBalance; 7];
 
 /// Calls a Tower service and maps readiness or call errors to
 /// [`server::error::LegacyCode::Misc`].
@@ -207,6 +217,8 @@ pub(crate) const RPC_METHOD_ACCESS: &[(&str, RpcAccess)] = &[
     ("getaddressbalance", RpcAccess::Unauthenticated),
     ("sendrawtransaction", RpcAccess::Unauthenticated),
     ("getblock", RpcAccess::Unauthenticated),
+    #[cfg(zcash_unstable = "nutachyon")]
+    ("gettachyonblock", RpcAccess::Unauthenticated),
     ("getblockheader", RpcAccess::Unauthenticated),
     ("getbestblockhash", RpcAccess::Unauthenticated),
     ("getbestblockheightandhash", RpcAccess::Unauthenticated),
@@ -291,6 +303,29 @@ mod unix;
 
 #[cfg(test)]
 mod tests;
+
+// jsonrpsee does not preserve method-level cfg attributes; gate the whole trait.
+#[cfg(zcash_unstable = "nutachyon")]
+#[rpc(server)]
+/// Experimental Tachyon synchronization methods.
+pub trait TachyonRpc {
+    /// Returns one best-chain block's public Tachyon proof-update inputs.
+    ///
+    /// Includes ordered proof-stamp commitments and tachygrams, anchors before
+    /// and after the block, and any epoch-entry anchor. Empty blocks return an
+    /// empty stamp list. Missing or pruned data returns an error.
+    ///
+    /// Clients must check block-hash continuity and roll back after a reorg.
+    /// This method is available only in NuTachyon builds and performs no proving.
+    /// method: post
+    /// tags: blockchain
+    ///
+    /// # Parameters
+    ///
+    /// - `hash_or_height`: (string, required) Best-chain block hash or height.
+    #[method(name = "gettachyonblock")]
+    async fn get_tachyon_block(&self, hash_or_height: String) -> Result<GetTachyonBlockResponse>;
+}
 
 #[rpc(server)]
 /// RPC method signatures.
@@ -1767,6 +1802,49 @@ where
     pub(crate) fn with_rpc_surface(mut self, rpc_surface: RpcSurface) -> Self {
         self.rpc_surface = rpc_surface;
         self
+    }
+}
+
+#[cfg(zcash_unstable = "nutachyon")]
+#[async_trait]
+impl<Mempool, State, ReadState, Tip, AddressBook, BlockVerifierRouter, SyncStatus> TachyonRpcServer
+    for RpcImpl<Mempool, State, ReadState, Tip, AddressBook, BlockVerifierRouter, SyncStatus>
+where
+    Mempool: MempoolService,
+    State: StateService,
+    ReadState: ReadStateService,
+    Tip: ChainTip + Clone + Send + Sync + 'static,
+    AddressBook: AddressBookPeers + Clone + Send + Sync + 'static,
+    BlockVerifierRouter: BlockVerifierService,
+    SyncStatus: ChainSyncStatus + Clone + Send + Sync + 'static,
+{
+    async fn get_tachyon_block(&self, hash_or_height: String) -> Result<GetTachyonBlockResponse> {
+        let hash_or_height =
+            HashOrHeight::new(&hash_or_height, self.latest_chain_tip.best_tip_height())
+                .map_error(server::error::LegacyCode::InvalidParameter)?;
+
+        tokio::time::timeout(Duration::from_secs(30), async {
+            let response = call_service(
+                self.read_state.clone(),
+                zakura_state::ReadRequest::TachyonBlock(hash_or_height),
+            )
+            .await?;
+            let zakura_state::ReadResponse::TachyonBlock(data) = response else {
+                unreachable!("state responds to TachyonBlock with TachyonBlock");
+            };
+            let data = data.ok_or_error(
+                server::error::LegacyCode::InvalidParameter,
+                "the requested block is not in the best chain",
+            )?;
+
+            // Transaction hashing and anchor reconstruction must not occupy an async worker.
+            tokio::task::spawn_blocking(move || GetTachyonBlockResponse::from_state(data))
+                .await
+                .map_misc_error()?
+                .map_misc_error()
+        })
+        .await
+        .map_misc_error()?
     }
 }
 
@@ -3547,6 +3625,27 @@ where
             )
             .map_misc_error()?;
 
+            #[cfg(all(test, zcash_unstable = "nutachyon"))]
+            let (dependency_depths, selected_txs): (Vec<_>, Vec<_>) =
+                mempool_txs.into_iter().unzip();
+            #[cfg(all(not(test), zcash_unstable = "nutachyon"))]
+            let selected_txs = mempool_txs;
+
+            #[cfg(zcash_unstable = "nutachyon")]
+            let selected_txs = types::get_block_template::tachyon::aggregate_transactions(
+                self.network.clone(),
+                height,
+                chain_info.tip_hash,
+                read_state.clone(),
+                selected_txs,
+            )
+            .await;
+
+            #[cfg(all(test, zcash_unstable = "nutachyon"))]
+            let mempool_txs: Vec<_> = dependency_depths.into_iter().zip(selected_txs).collect();
+            #[cfg(all(not(test), zcash_unstable = "nutachyon"))]
+            let mempool_txs = selected_txs;
+
             tracing::debug!(
                 selected_mempool_tx_hashes = ?mempool_txs
                     .iter()
@@ -4581,9 +4680,6 @@ pub struct EndOfService {
     estimated_time: i64,
 }
 
-/// Type alias for the array of `GetBlockchainInfoBalance` objects
-pub type BlockchainValuePoolBalances = [GetBlockchainInfoBalance; 6];
-
 fn deserialize_blockchain_value_pool_balances<'de, D>(
     deserializer: D,
 ) -> std::result::Result<BlockchainValuePoolBalances, D::Error>
@@ -4611,20 +4707,40 @@ fn blockchain_value_pool_balances_from_vec<E>(
 where
     E: serde::de::Error,
 {
+    let missing_pool_delta = value_pools
+        .iter()
+        .any(|pool| pool.value_delta().is_some() || pool.value_delta_zat().is_some())
+        .then(Amount::zero);
+
     match value_pools.len() {
         5 => {
-            let ironwood_delta = value_pools
-                .iter()
-                .any(|pool| pool.value_delta().is_some() || pool.value_delta_zat().is_some())
-                .then(Amount::zero);
-
             value_pools.push(GetBlockchainInfoBalance::ironwood(
                 Amount::zero(),
-                ironwood_delta,
+                missing_pool_delta,
+            ));
+            #[cfg(zcash_unstable = "nutachyon")]
+            value_pools.push(GetBlockchainInfoBalance::tachyon(
+                Amount::zero(),
+                missing_pool_delta,
             ));
         }
-        6 => {}
-        len => return Err(E::invalid_length(len, &"five or six value pool balances")),
+        6 => {
+            #[cfg(zcash_unstable = "nutachyon")]
+            value_pools.push(GetBlockchainInfoBalance::tachyon(
+                Amount::zero(),
+                missing_pool_delta,
+            ));
+        }
+        #[cfg(zcash_unstable = "nutachyon")]
+        7 => {}
+        len => {
+            #[cfg(not(zcash_unstable = "nutachyon"))]
+            let expected = &"five or six value pool balances";
+            #[cfg(zcash_unstable = "nutachyon")]
+            let expected = &"five, six, or seven value pool balances";
+
+            return Err(E::invalid_length(len, expected));
+        }
     }
 
     value_pools

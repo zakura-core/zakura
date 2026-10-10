@@ -7,6 +7,10 @@ use std::{
 
 use chrono::{DateTime, Utc};
 
+#[cfg(zcash_unstable = "nutachyon")]
+use std::collections::HashMap;
+#[cfg(zcash_unstable = "nutachyon")]
+use zakura_chain::tachyon;
 use zakura_chain::{
     amount::{Amount, NonNegative},
     block::{self, Block, ChainHistoryMmrRootHash},
@@ -34,6 +38,42 @@ use crate::{
 
 #[cfg(test)]
 mod tests;
+
+/// One block's public inputs for constructing Tachyon synchronization proofs.
+#[cfg(zcash_unstable = "nutachyon")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TachyonBlock {
+    /// The complete block, from the selected best chain.
+    pub block: Arc<Block>,
+    /// The block's chain height.
+    pub height: block::Height,
+    /// NuTachyon activation height; epoch numbering starts here.
+    pub activation_height: block::Height,
+    /// Whether this block was finalized when read.
+    pub finalized: bool,
+    /// Anchor before this block's epoch transition and stamps. At activation this is
+    /// Tachyon's epoch-zero entry anchor, not the inactive pool's zero sentinel.
+    pub anchor_before: tachyon::Anchor,
+    /// Consensus-computed anchor after the block.
+    pub anchor_after: tachyon::Anchor,
+}
+
+/// Best-chain data used to aggregate selected autonome Tachyon transactions.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg(zcash_unstable = "nutachyon")]
+pub struct TachyonMiningData {
+    /// The Tachyon anchor at the current best-chain tip.
+    pub tip_anchor: tachyon::Anchor,
+
+    /// Heights that created the requested anchors. Unknown anchors are omitted.
+    pub anchor_heights: HashMap<tachyon::Anchor, block::Height>,
+
+    /// Blocks needed to advance from each epoch's earliest requested anchor to its latest one.
+    pub blocks: BTreeMap<block::Height, Arc<Block>>,
+
+    /// Requested tachygrams already revealed in the candidate block's two-epoch window.
+    pub revealed_tachygrams: HashSet<tachyon::Tachygram>,
+}
 
 /// State's decision for a prepared mined block's optimistic relay.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -485,6 +525,16 @@ pub enum ReadResponse {
         value_balance: ValueBalance<NonNegative>,
     },
 
+    /// Response to [`ReadRequest::TachyonMiningData`], or `None` when the requested chain tip is
+    /// no longer current.
+    #[cfg(zcash_unstable = "nutachyon")]
+    TachyonMiningData(Option<TachyonMiningData>),
+
+    /// Response to [`ReadRequest::TachyonBlock`]. `None` means the block is not in
+    /// the selected best chain; missing historical data is an error instead.
+    #[cfg(zcash_unstable = "nutachyon")]
+    TachyonBlock(Option<TachyonBlock>),
+
     /// Response to [`ReadRequest::BlockInfo`] with
     /// the block info after the specified block.
     BlockInfo(Option<BlockInfo>),
@@ -802,6 +852,11 @@ impl TryFrom<ReadResponse> for Response {
             | ReadResponse::Blocks(_)
             | ReadResponse::NonFinalizedBlocksListener(_)
             | ReadResponse::IsTransparentOutputSpent(_) => {
+                Err("there is no corresponding Response for this ReadResponse")
+            }
+
+            #[cfg(zcash_unstable = "nutachyon")]
+            ReadResponse::TachyonMiningData(_) | ReadResponse::TachyonBlock(_) => {
                 Err("there is no corresponding Response for this ReadResponse")
             }
 

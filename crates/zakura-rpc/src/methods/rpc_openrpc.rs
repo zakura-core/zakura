@@ -1,5 +1,14 @@
 /// JSON-RPC methods in declaration order.
 pub(crate) static METHODS: &[(&str, openrpc::RpcMethod)] = &[
+# [cfg (zcash_unstable = "nutachyon")]
+("gettachyonblock", openrpc::RpcMethod {
+    description: "Returns one best-chain block's public Tachyon proof-update inputs.\n\nIncludes ordered proof-stamp commitments and tachygrams, anchors before\nand after the block, and any epoch-entry anchor. Empty blocks return an\nempty stamp list. Missing or pruned data returns an error.\n\nClients must check block-hash continuity and roll back after a reorg.\nThis method is available only in NuTachyon builds and performs no proving.\nmethod: post\ntags: blockchain\n\n# Parameters\n\n- `hash_or_height`: (string, required) Best-chain block hash or height.\n",
+    params: |_g| vec![
+        _g.param::<String>("hash_or_height", crate::methods::PARAM_HASH_OR_HEIGHT_DESC, true),
+    ],
+    result: |g| g.result("gettachyonblock_result"),
+    deprecated: false,
+}),
 ("getinfo", openrpc::RpcMethod {
     description: "Returns software information from the RPC server, as a\n[`GetInfoResponse`] JSON struct.\n\nzcashd reference: [`getinfo`](https://zcash.github.io/rpc/getinfo.html)\nmethod: post\ntags: control\n\n# Notes\n\n[The zcashd reference](https://zcash.github.io/rpc/getinfo.html) might not show some fields\nin Zebra's [`GetInfoResponse`]. Zebra uses the field names and formats\nfrom the [zcashd\ncode](https://github.com/zcash/zcash/blob/v4.6.0-1/src/rpc/misc.cpp#L86-L87).\n\nSome fields from the zcashd reference are missing from Zebra's\n[`GetInfoResponse`]. It only contains the fields\n[required for lightwalletd support.](https://github.com/zcash/lightwalletd/blob/v0.4.9/common/common.go#L91-L95)\n",
     params: |_g| vec![

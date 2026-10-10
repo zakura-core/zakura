@@ -14,20 +14,28 @@ const TYPED_RESULT_METHODS: &[&str] = &["preciousblock"];
 
 pub(super) fn generate(source: &Path, output_dir: &Path) -> Result<(), BoxError> {
     let source = syn::parse_file(&fs::read_to_string(source)?)?;
-    let rpc = source
+    let rpc_traits: Vec<_> = source
         .items
         .iter()
-        .find_map(|item| match item {
-            syn::Item::Trait(item) if item.ident == "Rpc" => Some(item),
+        .filter_map(|item| match item {
+            syn::Item::Trait(item) if item.attrs.iter().any(|attr| attr.path().is_ident("rpc")) => {
+                Some(item)
+            }
             _ => None,
         })
-        .ok_or("RPC methods source must contain the Rpc trait")?;
+        .collect();
+    if !rpc_traits.iter().any(|item| item.ident == "Rpc") {
+        return Err("RPC methods source must contain the Rpc trait".into());
+    }
     let mut output = String::from(
         "/// JSON-RPC methods in declaration order.\n\
          pub(crate) static METHODS: &[(&str, openrpc::RpcMethod)] = &[\n",
     );
 
-    for item in &rpc.items {
+    for (rpc, item) in rpc_traits
+        .iter()
+        .flat_map(|rpc| rpc.items.iter().map(move |item| (rpc, item)))
+    {
         let TraitItem::Fn(method) = item else {
             continue;
         };
@@ -64,6 +72,10 @@ pub(super) fn generate(source: &Path, output_dir: &Path) -> Result<(), BoxError>
             }
         }
 
+        // Discovery must expose exactly the methods compiled into the server.
+        for attr in rpc.attrs.iter().filter(|attr| attr.path().is_ident("cfg")) {
+            writeln!(output, "{}", attr.to_token_stream())?;
+        }
         writeln!(output, "({name:?}, openrpc::RpcMethod {{")?;
         writeln!(output, "    description: {description:?},")?;
         writeln!(output, "    params: |_g| vec![")?;

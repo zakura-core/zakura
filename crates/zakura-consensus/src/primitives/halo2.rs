@@ -404,6 +404,9 @@ fn lazy_verifier_for(network_upgrade: NetworkUpgrade) -> &'static Lazy<VerifierS
         // reject honest NU6.3 proofs and fail to enforce this constraint.
         Nu6_3 | Nu7 => &VERIFIER_NU6_3_ONWARD,
 
+        #[cfg(zcash_unstable = "nutachyon")]
+        NuTachyon => &VERIFIER_NU6_3_ONWARD,
+
         // `ZFuture` is post-NU6.3 and inherits the NU6.3 circuit. Keep the
         // cfg-gated arm explicit so a future upgrade cannot silently fall back
         // to an older or insecure verifier.

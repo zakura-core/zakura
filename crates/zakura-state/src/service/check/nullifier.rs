@@ -62,6 +62,29 @@ pub(crate) fn no_duplicates_in_finalized_chain(
         }
     }
 
+    #[cfg(zcash_unstable = "nutachyon")]
+    let network = finalized_state.network();
+    #[cfg(zcash_unstable = "nutachyon")]
+    for transaction in &semantically_verified.block.transactions {
+        for tachygram in transaction.tachyon_tachygrams() {
+            if finalized_state
+                .tachyon_tachygram_revealed_height(&tachygram)
+                .is_some_and(|revealed_height| {
+                    zakura_chain::tachyon::within_scan_window(
+                        &network,
+                        revealed_height,
+                        semantically_verified.height,
+                    )
+                })
+            {
+                return Err(ValidateContextError::DuplicateTachyonTachygram {
+                    tachygram,
+                    in_finalized_state: true,
+                });
+            }
+        }
+    }
+
     Ok(())
 }
 

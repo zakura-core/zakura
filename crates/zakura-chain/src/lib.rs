@@ -50,6 +50,8 @@ pub mod shutdown;
 pub mod sprout;
 pub mod subtree;
 pub mod subtree_verify;
+#[cfg(zcash_unstable = "nutachyon")]
+pub mod tachyon;
 pub mod transaction;
 pub mod transparent;
 pub mod value_balance;

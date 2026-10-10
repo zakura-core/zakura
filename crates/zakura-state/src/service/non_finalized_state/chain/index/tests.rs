@@ -28,6 +28,8 @@ fn cloned_chain_keeps_transparent_address_history_isolated() {
         Height(0),
         Default::default(),
         Default::default(),
+        #[cfg(zcash_unstable = "nutachyon")]
+        Default::default(),
         Default::default(),
         Default::default(),
         Default::default(),
@@ -106,6 +108,8 @@ fn compare_address_index_clone() {
         &Network::Mainnet,
         Height(0),
         Default::default(),
+        Default::default(),
+        #[cfg(zcash_unstable = "nutachyon")]
         Default::default(),
         Default::default(),
         Default::default(),

@@ -439,6 +439,8 @@ fn configured_activation_heights(
         nu6_2: (latest_network_upgrade >= Nu6_2).then_some(activation_height),
         nu6_3: (latest_network_upgrade >= Nu6_3).then_some(activation_height),
         nu7: (latest_network_upgrade >= Nu7).then_some(activation_height),
+        #[cfg(zcash_unstable = "nutachyon")]
+        nu_tachyon: (latest_network_upgrade >= NuTachyon).then_some(activation_height),
     })
 }
 

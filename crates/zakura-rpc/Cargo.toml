@@ -117,7 +117,14 @@ tokio-rustls = { version = "0.26.4", default-features = false, features = ["logg
 # Only used to read the validity dates of the configured RPC TLS certificates.
 der = "0.7.10"
 
+[target.'cfg(zcash_unstable = "nutachyon")'.dependencies]
+zcash_tachyon = { workspace = true }
+
+[target.'cfg(zcash_unstable = "nutachyon")'.dev-dependencies]
+ragu = { workspace = true }
+
 [dev-dependencies]
+blake2b_simd = { workspace = true }
 
 # Preserve response field order when normalizing snapshot JSON.
 serde_json = { workspace = true, features = ["preserve_order"] }

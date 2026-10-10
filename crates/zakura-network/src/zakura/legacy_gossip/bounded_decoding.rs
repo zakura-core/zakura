@@ -1,5 +1,4 @@
 use super::*;
-use zakura_chain::{primitives::Bctv14Proof, sprout::JoinSplit};
 use zakura_test::vectors::{BLOCK_MAINNET_1_BYTES, GENERIC_TESTNET_TX};
 
 /// A 13-byte V2 transaction: version, no transparent inputs or outputs, lock
@@ -34,8 +33,8 @@ fn empty_max_inventory_list() -> Vec<u8> {
         .unwrap()
 }
 
-/// Asserts that decoding reserved none of the list's declared capacity.
-fn assert_small(allocations: zakura_test::allocations::AllocationStats) {
+/// Asserts that decoding reserved none of the payload's declared capacity.
+pub(crate) fn assert_small(allocations: zakura_test::allocations::AllocationStats) {
     assert!(allocations.largest_request < 4_096, "{allocations:?}");
 }
 
@@ -76,10 +75,7 @@ fn push_transaction_bounds_allocation_by_payload_length() {
     let (result, allocations) =
         zakura_test::allocations::measure(|| LegacyRequestFrame::decode_frame(frame));
     assert!(result.is_err());
-    assert!(
-        allocations.largest_request < 1_024 * std::mem::size_of::<JoinSplit<Bctv14Proof>>(),
-        "{allocations:?}"
-    );
+    assert_small(allocations);
 }
 
 #[test]
@@ -103,10 +99,7 @@ fn transaction_response_bounds_allocation_by_payload_length() {
         LegacyResponseCodec::decode_response(7, LegacyRequestKind::Transactions, vec![frame], None)
     });
     assert!(result.is_err());
-    assert!(
-        allocations.largest_request < 1_024 * std::mem::size_of::<JoinSplit<Bctv14Proof>>(),
-        "{allocations:?}"
-    );
+    assert_small(allocations);
 }
 
 #[test]
@@ -129,10 +122,7 @@ fn block_response_bounds_allocation_by_payload_length() {
         LegacyResponseCodec::decode_response(7, LegacyRequestKind::Blocks, vec![frame], None)
     });
     assert!(result.is_err());
-    assert!(
-        allocations.largest_request < 1_024 * std::mem::size_of::<JoinSplit<Bctv14Proof>>(),
-        "{allocations:?}"
-    );
+    assert_small(allocations);
 }
 
 #[test]

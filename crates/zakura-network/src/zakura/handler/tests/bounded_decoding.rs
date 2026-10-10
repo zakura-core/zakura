@@ -1,6 +1,7 @@
 use super::*;
-use crate::zakura::legacy_gossip::bounded_decoding::{truncated_block, truncated_transaction};
-use zakura_chain::{primitives::Bctv14Proof, sprout::JoinSplit};
+use crate::zakura::legacy_gossip::bounded_decoding::{
+    assert_small, truncated_block, truncated_transaction,
+};
 use zakura_test::vectors::{BLOCK_MAINNET_1_BYTES, GENERIC_TESTNET_TX};
 
 /// Validate `item` as a single final response chunk for request 7.
@@ -37,10 +38,7 @@ fn completed_transaction_bounds_allocation_by_item_length() {
         validate_item(kind, LEGACY_RESPONSE_TRANSACTION, &item)
     });
     assert!(result.is_err());
-    assert!(
-        allocations.largest_request < 1_024 * std::mem::size_of::<JoinSplit<Bctv14Proof>>(),
-        "{allocations:?}"
-    );
+    assert_small(allocations);
 }
 
 #[test]
@@ -52,8 +50,5 @@ fn completed_block_bounds_allocation_by_item_length() {
     let (result, allocations) =
         zakura_test::allocations::measure(|| validate_item(kind, LEGACY_RESPONSE_BLOCK, &item));
     assert!(result.is_err());
-    assert!(
-        allocations.largest_request < 1_024 * std::mem::size_of::<JoinSplit<Bctv14Proof>>(),
-        "{allocations:?}"
-    );
+    assert_small(allocations);
 }

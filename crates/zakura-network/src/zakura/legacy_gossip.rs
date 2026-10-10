@@ -7,7 +7,7 @@ use std::{
     io::Cursor,
     pin::Pin,
     sync::{
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicU64, Ordering},
         Arc, Mutex as StdMutex, OnceLock,
     },
     task::{Context, Poll},
@@ -15,6 +15,7 @@ use std::{
 };
 
 use indexmap::IndexSet;
+use rand::{rngs::OsRng, seq::SliceRandom, Rng};
 use thiserror::Error;
 use tokio::{
     sync::{mpsc, oneshot, Mutex, OwnedSemaphorePermit, Semaphore},
@@ -2093,8 +2094,6 @@ pub struct ZakuraRequestClient {
     trace: ZakuraTrace,
     request_interval: Duration,
     next_request_at: Arc<Mutex<Instant>>,
-    /// Where the next request starts in the ready-peer list.
-    next_rotation: Arc<AtomicUsize>,
 }
 
 impl ZakuraRequestClient {
@@ -2128,7 +2127,6 @@ impl ZakuraRequestClient {
             trace,
             request_interval: Duration::from_nanos(interval_nanos),
             next_request_at: Arc::new(Mutex::new(Instant::now())),
-            next_rotation: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -2161,8 +2159,7 @@ impl ZakuraRequestClient {
         };
 
         let handles = self.ready_handles().await?;
-        let rotation = self.next_rotation.fetch_add(1, Ordering::Relaxed);
-        let candidates = request_candidates(&handles, preferred.as_ref(), rotation);
+        let candidates = request_candidates(&handles, preferred.as_ref(), &mut OsRng);
 
         let request_kind = frame.kind();
         let mut missing_response = None;
@@ -2352,23 +2349,21 @@ fn legacy_request_stream_rate(stream_open_rate_per_second: u32) -> u32 {
 }
 
 /// Orders the ready peers for one request: the preferred peer first, then the
-/// others starting at `rotation`, capped at [`MAX_LEGACY_REQUEST_ATTEMPTS`].
+/// others in random order, capped at [`MAX_LEGACY_REQUEST_ATTEMPTS`].
 ///
-/// Rotating the start keeps a few unhelpful peers from always being tried
-/// first and crowding out the rest.
-fn request_candidates(
+/// A fresh random order keeps a few unhelpful peers from always being tried
+/// first, and unlike a shared rotation counter, other traffic cannot steer it.
+fn request_candidates<R: Rng + ?Sized>(
     handles: &[ZakuraPeerHandle],
     preferred: Option<&ZakuraPeerId>,
-    rotation: usize,
+    rng: &mut R,
 ) -> Vec<ZakuraPeerHandle> {
-    let (mut candidates, others): (Vec<_>, Vec<_>) = handles
+    let (mut candidates, mut others): (Vec<_>, Vec<_>) = handles
         .iter()
         .cloned()
         .partition(|handle| Some(handle.peer_id()) == preferred);
-    if !others.is_empty() {
-        let start = rotation % others.len();
-        candidates.extend(others[start..].iter().chain(&others[..start]).cloned());
-    }
+    others.shuffle(rng);
+    candidates.extend(others);
     candidates.truncate(MAX_LEGACY_REQUEST_ATTEMPTS);
     candidates
 }
@@ -4539,10 +4534,12 @@ mod tests {
         Ok(())
     }
 
-    /// The preferred peer goes first, the rest rotate with `rotation`, and the
-    /// list is capped at the attempt limit.
+    /// The preferred peer goes first, the rest come in random order, the list is
+    /// capped at the attempt limit, and every peer gets a turn across requests.
     #[test]
-    fn request_candidates_prefer_source_and_rotate_the_rest() {
+    fn request_candidates_prefer_source_and_randomize_the_rest() {
+        use rand::{rngs::StdRng, SeedableRng};
+
         let handles: Vec<_> = (1..=5)
             .map(|byte| {
                 let peer = ZakuraPeerId::new(vec![byte; 32]).expect("32-byte node id is valid");
@@ -4557,27 +4554,32 @@ mod tests {
                 .collect()
         };
         let peer = |index: usize| handles[index].peer_id().clone();
-
-        assert_eq!(
-            ids(request_candidates(&handles, None, 0)),
-            vec![peer(0), peer(1), peer(2)]
-        );
-        assert_eq!(
-            ids(request_candidates(&handles, None, 4)),
-            vec![peer(4), peer(0), peer(1)]
-        );
-        assert_eq!(
-            ids(request_candidates(&handles, Some(&peer(2)), 1)),
-            vec![peer(2), peer(1), peer(3)]
-        );
-
         let unknown = ZakuraPeerId::new(vec![9; 32]).expect("32-byte node id is valid");
+        let mut rng = StdRng::seed_from_u64(1350);
+
+        let mut first_seen = HashSet::new();
+        for _ in 0..64 {
+            let candidates = ids(request_candidates(&handles, Some(&peer(2)), &mut rng));
+            assert_eq!(candidates.len(), MAX_LEGACY_REQUEST_ATTEMPTS);
+            assert_eq!(candidates[0], peer(2), "the preferred peer goes first");
+            assert_eq!(
+                candidates.iter().collect::<HashSet<_>>().len(),
+                candidates.len(),
+                "candidates are distinct"
+            );
+
+            let candidates = ids(request_candidates(&handles, Some(&unknown), &mut rng));
+            assert_eq!(candidates.len(), MAX_LEGACY_REQUEST_ATTEMPTS);
+            first_seen.insert(candidates[0].clone());
+        }
         assert_eq!(
-            ids(request_candidates(&handles, Some(&unknown), 2)),
-            vec![peer(2), peer(3), peer(4)]
+            first_seen.len(),
+            handles.len(),
+            "every peer is tried first on some request"
         );
+
         assert_eq!(
-            ids(request_candidates(&handles[..1], Some(&peer(0)), 3)),
+            ids(request_candidates(&handles[..1], Some(&peer(0)), &mut rng)),
             vec![peer(0)]
         );
     }

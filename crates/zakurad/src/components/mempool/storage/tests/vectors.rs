@@ -155,6 +155,46 @@ fn mempool_storage_crud_exact_mainnet() {
     assert!(!storage.contains_transaction_exact(&unmined_tx.transaction.id().mined_id()));
 }
 
+/// `transactions_exact` must not return a same-effects variant whose authorizing
+/// data differs from the requested ID.
+#[test]
+fn transactions_exact_ignores_different_authorizing_data() {
+    let _init_guard = zakura_test::init();
+
+    let mut storage: Storage = Storage::new(&config::Config {
+        tx_cost_limit: u64::MAX,
+        eviction_memory_time: EVICTION_MEMORY_TIME,
+        ..Default::default()
+    });
+    let unmined_tx = Network::Mainnet
+        .unmined_transactions_in_blocks(..)
+        .find(|transaction| transaction.transaction.id().auth_digest().is_some())
+        .expect("mainnet test vectors contain a witnessed transaction");
+    let tx_id = unmined_tx.transaction.id();
+    storage
+        .insert(unmined_tx, Vec::new(), None)
+        .expect("test transaction fits in the mempool");
+
+    let mut different_authorizing_data = tx_id;
+    different_authorizing_data
+        .auth_digest_mut()
+        .expect("test selected a witnessed transaction")
+        .0[0] ^= 1;
+    assert_eq!(different_authorizing_data.mined_id(), tx_id.mined_id());
+
+    let exact: Vec<_> = storage
+        .transactions_exact(HashSet::from([tx_id]))
+        .map(UnminedTx::id)
+        .collect();
+    assert_eq!(exact, vec![tx_id]);
+    assert_eq!(
+        storage
+            .transactions_exact(HashSet::from([different_authorizing_data]))
+            .count(),
+        0
+    );
+}
+
 #[test]
 fn mempool_storage_basic() -> Result<()> {
     let _init_guard = zakura_test::init();

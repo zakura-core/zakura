@@ -5221,12 +5221,12 @@ impl LegacyResponseReadState {
     ) -> Result<(), OutboundRequestError> {
         match kind {
             LegacyResponseKind::Blocks => {
-                Block::zcash_deserialize(&mut Cursor::new(self.active_chunk.as_slice()))
+                Block::zcash_deserialize_from_slice(&mut self.active_chunk.as_slice())
                     .map(|_| ())
                     .map_err(|error| OutboundRequestError::Fatal(Box::new(error)))
             }
             LegacyResponseKind::Transactions => {
-                Transaction::zcash_deserialize(&mut Cursor::new(self.active_chunk.as_slice()))
+                Transaction::zcash_deserialize_from_slice(&mut self.active_chunk.as_slice())
                     .map(|_| ())
                     .map_err(|error| OutboundRequestError::Fatal(Box::new(error)))
             }
@@ -5832,6 +5832,7 @@ impl ZakuraHandlerError {
 
 #[cfg(test)]
 mod tests {
+    mod bounded_decoding;
     pub(super) mod connection;
     mod quic_progress;
     use super::*;

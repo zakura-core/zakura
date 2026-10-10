@@ -404,7 +404,7 @@ mod linux {
     ///
     /// # Safety
     ///
-    /// Implementors must be plain C structs or integers without invalid bit
+    /// Implementers must be plain C structs or integers without invalid bit
     /// patterns. Raw pointers count: any address is a valid raw pointer.
     unsafe trait Pod: Copy {}
     // SAFETY: integers and C structs of integers, arrays and raw pointers.

@@ -239,9 +239,15 @@ impl<'a> ProjectedTransitionState<'a> {
     }
 
     /// Reselect after operator policy changes, with evicted bodies already removed.
-    pub(super) fn refresh_verified_selection(&mut self) -> Result<(), TransitionFailure> {
+    ///
+    /// `preferred_tip` is full state's selected tip for this event. It replaces the hash
+    /// tie-break only among eligible greatest-work verified tips.
+    pub(super) fn refresh_verified_selection(
+        &mut self,
+        preferred_tip: Option<Frontier>,
+    ) -> Result<(), TransitionFailure> {
         if self.verified_selection_dirty {
-            self.verified = Cow::Owned(select_fully_verified_path(&self.graph)?);
+            self.verified = Cow::Owned(select_fully_verified_path(&self.graph, preferred_tip)?);
             self.verified_selection_dirty = false;
         }
         Ok(())
@@ -609,8 +615,13 @@ pub(super) fn path<G: HeaderGraphView>(
 }
 
 /// Select the strongest fully verified eligible path.
+///
+/// A `preferred_tip` must be a connected, eligible, verified tip with the greatest work. It then
+/// wins the equal-work tie instead of the greatest raw hash. Any other preference is invalid
+/// verified-path evidence.
 pub(super) fn select_fully_verified_path<G: HeaderGraphView>(
     graph: &G,
+    preferred_tip: Option<Frontier>,
 ) -> Result<Vec<Frontier>, TransitionFailure> {
     let finalized = graph.view_finalized_frontier();
     let mut connected = HashSet::from([finalized.hash]);
@@ -629,7 +640,8 @@ pub(super) fn select_fully_verified_path<G: HeaderGraphView>(
         }
     }
     let tip = connected
-        .into_iter()
+        .iter()
+        .copied()
         .map(|hash| {
             let node = graph
                 .view_header_node(hash)
@@ -643,6 +655,25 @@ pub(super) fn select_fully_verified_path<G: HeaderGraphView>(
         .max_by_key(|(score, _)| *score)
         .map(|(_, frontier)| frontier)
         .ok_or(GraphError::UnknownHeaderNode(finalized.hash))?;
+    let tip = match preferred_tip {
+        Some(preferred) => {
+            if !connected.contains(&preferred.hash)
+                || graph
+                    .view_header_node(preferred.hash)
+                    .is_none_or(|node| node.height != preferred.height)
+                || graph.view_header_chain_score(preferred.hash)?.suffix_work
+                    != graph.view_header_chain_score(tip.hash)?.suffix_work
+            {
+                return Err(InvalidTransitionEvidence::header_path(
+                    super::HeaderPathKind::Verified,
+                    super::HeaderPathProblem::TipMismatch,
+                )
+                .into());
+            }
+            preferred
+        }
+        None => tip,
+    };
     path(graph, tip)
 }
 

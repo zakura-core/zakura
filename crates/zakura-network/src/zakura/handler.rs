@@ -5219,11 +5219,13 @@ impl LegacyResponseReadState {
         &self,
         kind: LegacyResponseKind,
     ) -> Result<(), OutboundRequestError> {
-        let mut reader = Cursor::new(self.active_chunk.as_slice());
+        let mut remaining = self.active_chunk.as_slice();
         match kind {
-            LegacyResponseKind::Blocks => Block::zcash_deserialize(&mut reader).map(|_| ()),
+            LegacyResponseKind::Blocks => {
+                Block::zcash_deserialize_from_slice(&mut remaining).map(|_| ())
+            }
             LegacyResponseKind::Transactions => {
-                Transaction::zcash_deserialize(&mut reader).map(|_| ())
+                Transaction::zcash_deserialize_from_slice(&mut remaining).map(|_| ())
             }
             LegacyResponseKind::BlockHashes
             | LegacyResponseKind::BlockHeaders
@@ -5233,10 +5235,7 @@ impl LegacyResponseReadState {
         }
         .map_err(|error| OutboundRequestError::Fatal(Box::new(error)))?;
         // A valid item padded with junk must not pass as a completed item.
-        if usize::try_from(reader.position())
-            .map_err(|error| OutboundRequestError::Fatal(Box::new(error)))?
-            != self.active_chunk.len()
-        {
+        if !remaining.is_empty() {
             return Err(OutboundRequestError::Fatal(
                 "legacy response item has trailing bytes".into(),
             ));
@@ -5838,6 +5837,7 @@ impl ZakuraHandlerError {
 
 #[cfg(test)]
 mod tests {
+    mod bounded_decoding;
     pub(super) mod connection;
     mod quic_progress;
     use super::*;

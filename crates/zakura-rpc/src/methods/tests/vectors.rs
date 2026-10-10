@@ -5269,3 +5269,137 @@ async fn an_already_stale_template_dispatches_no_verification() {
         "the verifier is never called for an already-stale template",
     );
 }
+
+/// `preciousblock` answers JSON null, which is the result schema that discovery advertises.
+#[tokio::test(flavor = "multi_thread")]
+async fn rpc_preciousblock_null_result_matches_discovery() {
+    let _init_guard = zakura_test::init();
+
+    let mempool: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let mut state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let read_state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let (_tx, rx) = tokio::sync::watch::channel(None);
+    let (rpc, _rpc_tx_queue) = mock_rpc(
+        Mainnet,
+        Buffer::new(mempool, 1),
+        Buffer::new(state.clone(), 1),
+        Buffer::new(read_state, 1),
+        NoChainTip,
+        rx,
+    );
+
+    let hash = Hash([0x7a; 32]);
+    let module = rpc.clone().into_rpc();
+    let (response, ()) = tokio::join!(
+        module.call::<_, serde_json::Value>("preciousblock", [hash.to_string()]),
+        async {
+            state
+                .expect_request(zakura_state::Request::PreciousBlock(hash))
+                .await
+                .respond(zakura_state::Response::Precious);
+        },
+    );
+    let response = response.expect("a known block succeeds");
+    assert_eq!(response, serde_json::Value::Null);
+
+    let discovery = rpc.openrpc().expect("discovery renders");
+    let result = &discovery["methods"]
+        .as_array()
+        .expect("discovery lists methods")
+        .iter()
+        .find(|method| method["name"] == "preciousblock")
+        .expect("the full surface documents preciousblock")["result"];
+    assert_eq!(result["schema"], serde_json::json!({ "type": "null" }));
+}
+
+/// The `preciousblock` JSON-RPC module, with mocks for its services.
+fn precious_block_rpc() -> (
+    jsonrpsee::RpcModule<()>,
+    MockService<zakura_state::Request, zakura_state::Response, PanicAssertion, BoxError>,
+    MockService<ReadRequest, ReadResponse, PanicAssertion, BoxError>,
+    MockService<
+        zakura_node_services::mempool::Request,
+        zakura_node_services::mempool::Response,
+        PanicAssertion,
+        BoxError,
+    >,
+) {
+    let mempool: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let read_state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let (_tx, rx) = tokio::sync::watch::channel(None);
+    let (rpc, _rpc_tx_queue) = mock_rpc(
+        Mainnet,
+        Buffer::new(mempool.clone(), 1),
+        Buffer::new(state.clone(), 1),
+        Buffer::new(read_state.clone(), 1),
+        NoChainTip,
+        rx,
+    );
+    (rpc.into_rpc().remove_context(), state, read_state, mempool)
+}
+
+/// Returns the JSON-RPC error object of a failed `preciousblock` call.
+fn precious_block_error(
+    response: std::result::Result<serde_json::Value, jsonrpsee::core::server::MethodsError>,
+) -> jsonrpsee_types::ErrorObjectOwned {
+    match response {
+        Err(jsonrpsee::core::server::MethodsError::JsonRpc(error)) => error,
+        other => panic!("preciousblock must fail with a JSON-RPC error: {other:?}"),
+    }
+}
+
+/// A well-formed hash that neither state knows reaches the state, and its `BlockNotFound`
+/// answer maps to zcashd's "Block not found" error.
+#[tokio::test(flavor = "multi_thread")]
+async fn rpc_preciousblock_unknown_hash_is_block_not_found() {
+    let _init_guard = zakura_test::init();
+    let (module, mut state, mut read_state, mut mempool) = precious_block_rpc();
+
+    let hash = Hash([0x5b; 32]);
+    let (response, ()) = tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::join!(
+            module.call::<_, serde_json::Value>("preciousblock", [hash.to_string()]),
+            async {
+                state
+                    .expect_request(zakura_state::Request::PreciousBlock(hash))
+                    .await
+                    .respond(Err::<zakura_state::Response, BoxError>(
+                        zakura_state::PreciousError::BlockNotFound(hash).into(),
+                    ));
+            },
+        )
+    })
+    .await
+    .expect("the state answers the dispatched request");
+    let error = precious_block_error(response);
+    assert_eq!(error.code(), -5);
+    assert_eq!(error.message(), "Block not found");
+    assert!(error.data().is_none());
+
+    state.expect_no_requests().await;
+    read_state.expect_no_requests().await;
+    mempool.expect_no_requests().await;
+}
+
+/// A malformed hash is rejected as an invalid parameter before the state is asked.
+#[tokio::test(flavor = "multi_thread")]
+async fn rpc_preciousblock_malformed_hash_is_an_invalid_parameter() {
+    let _init_guard = zakura_test::init();
+    let (module, mut state, mut read_state, mut mempool) = precious_block_rpc();
+
+    for malformed in ["", "not a hash", "00", &"g".repeat(64), &"0".repeat(66)] {
+        let response = tokio::time::timeout(
+            Duration::from_secs(10),
+            module.call::<_, serde_json::Value>("preciousblock", [malformed]),
+        )
+        .await
+        .expect("a malformed hash is rejected without waiting for a service");
+        let error = precious_block_error(response);
+        assert_eq!(error.code(), -8, "{malformed:?} is an invalid parameter");
+    }
+
+    state.expect_no_requests().await;
+    read_state.expect_no_requests().await;
+    mempool.expect_no_requests().await;
+}

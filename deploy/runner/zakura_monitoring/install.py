@@ -401,10 +401,10 @@ def parse_env_lines(text: str) -> list[tuple[str | None, str]]:
     return lines
 
 
-def fleet_env(env_file: Path, new_hook: str = "") -> dict:
-    """Preserve the fleet env file, replacing only the Slack webhook when one is supplied.
+def fleet_env(env_file: Path, new_hook: str = "", new_pagerduty_key: str = "") -> dict:
+    """Preserve operator settings; replace each supplied Slack or PagerDuty secret.
 
-    The new webhook arrives on stdin (never argv). Every other operator
+    New secrets arrive on stdin (never argv). Every other operator
     setting, for example Mac comparison flags, is kept verbatim.
     """
     new_hook = new_hook.strip()
@@ -422,6 +422,13 @@ def fleet_env(env_file: Path, new_hook: str = "") -> dict:
     else:
         kept = [raw for _key, raw in lines]
         outcome = "preserved" if any(key in SLACK_KEYS for key, _ in lines) else "missing"
+    new_pagerduty_key = new_pagerduty_key.strip()
+    if "\n" in new_pagerduty_key or "\r" in new_pagerduty_key:
+        raise InstallError("PagerDuty key must be a single line")
+    if new_pagerduty_key:
+        kept = [raw for key, raw in parse_env_lines("\n".join(kept))
+                if key != "PAGERDUTY_ROUTING_KEY"]
+        kept.append(f"PAGERDUTY_ROUTING_KEY={new_pagerduty_key}")
     atomic_write(env_file, ("\n".join(kept) + "\n").encode() if kept else b"", 0o600)
     return {"env_file": str(env_file), "mode": "600", "slack_webhook": outcome}
 
@@ -694,7 +701,9 @@ def main(argv: list[str] | None = None) -> int:
             command.add_argument("--sha", required=True)
     env = sub.add_parser("fleet-env")
     env.add_argument("--env-file", type=Path, required=True)
-    env.add_argument("--webhook-stdin", action="store_true")
+    secret_input = env.add_mutually_exclusive_group()
+    secret_input.add_argument("--webhook-stdin", action="store_true")
+    secret_input.add_argument("--secrets-stdin", action="store_true")
     unit = sub.add_parser("ensure-unit")
     unit.add_argument("--unit", type=Path, required=True)
     unit.add_argument("--template", type=Path, required=True)
@@ -741,7 +750,9 @@ def main(argv: list[str] | None = None) -> int:
             result = status(args.root)
         elif operation == "fleet-env":
             hook = sys.stdin.read(4096) if args.webhook_stdin else ""
-            result = fleet_env(args.env_file, hook)
+            secrets = json.loads(sys.stdin.read(8192)) if args.secrets_stdin else {}
+            result = fleet_env(args.env_file, secrets.get("SLACK_WEB_HOOK", hook),
+                               secrets.get("PAGERDUTY_ROUTING_KEY", ""))
         elif operation == "ensure-unit":
             result = ensure_unit(args.unit, args.template)
         elif operation == "compat-env":

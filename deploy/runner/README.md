@@ -191,6 +191,25 @@ Do not commit real Slack credentials. Install them on the runner in
 `SLACK_WEB_HOOK` GitHub Actions environment secret so the deploy workflow
 writes the env file.
 
+### Escalation
+
+A few critical mainnet incidents also page through PagerDuty, which
+re-notifies until the page resolves:
+
+- Mac/Linux comparison `tree_mismatch` or `chain_disagreement`
+- `mac-os-cranelift` fork
+- mainnet fleet-wide (shared) stall
+
+Pages follow the same incident thresholds and recovery rules as Slack, even
+when Slack delivery fails. Mac comparison paging keeps its own persistent
+latch; fleet paging reads the pending Slack batch. Deploy suppression and
+comparison mutes pause paging transitions. A divergence that later reports `unavailable` or
+`coverage_gap` keeps its page open until the comparison matches again. Failed
+PagerDuty requests are retried each poll; the dedup key makes retries safe.
+Set `PAGERDUTY_ROUTING_KEY` (an Events API v2 integration key) in the same env
+file, or provide the `PAGERDUTY_ROUTING_KEY` GitHub Actions environment secret.
+Without it, the watchdog logs once and does not page.
+
 Manual checks on `us-east-0`:
 
 ```bash

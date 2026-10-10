@@ -276,6 +276,14 @@ pub(crate) static METHODS: &[(&str, openrpc::RpcMethod)] = &[
     result: |g| g.result("reconsiderblock_result"),
     deprecated: false,
 }),
+("preciousblock", openrpc::RpcMethod {
+    description: "Treats a block as if it were received before other chain tips with the same work.\n\nIt applies to a current non-finalized chain tip with at least as much work as the best tip.\nA later call overrides an earlier one. A chain with more work still wins. For any other\nknown block, such as a block that is not a chain tip, a finalized block, an invalidated\nblock, or a tip with less work than the best tip, the call succeeds and changes nothing. An\nunknown hash returns error code -5, and a malformed hash returns error code -8.\n\nThe preference is local to this node. It is kept while the block is in any non-finalized\nchain or any retained invalidation record. It is forgotten once the block is in neither,\nfor example when a fork-limit eviction removes it from its last chain, or when its\ninvalidation record is discarded while it is in no chain. A block downloaded again after\nthat is not preferred. It is not kept across restarts.\nSee Bitcoin Core's\n[`preciousblock`](https://developer.bitcoin.org/reference/rpc/preciousblock.html).\n\n# Parameters\n\n- `block_hash`: (hex-encoded block hash, required) The hash of the block to prefer.\n",
+    params: |_g| vec![
+        _g.param::<String>("block_hash", crate::methods::PARAM_BLOCK_HASH_DESC, true),
+    ],
+    result: |g| g.typed_result::<()>("preciousblock_result", crate::methods::RESULT_PRECIOUSBLOCK_DESC),
+    deprecated: false,
+}),
 ("generate", openrpc::RpcMethod {
     description: "Mine blocks immediately. Returns the block hashes of the generated blocks.\n\n# Parameters\n\n- `num_blocks`: (numeric, required, example=1) Number of blocks to be generated.\n\n# Notes\n\nOnly works if the network of the running zakurad process is `Regtest`.\n\nzcashd reference: [`generate`](https://zcash.github.io/rpc/generate.html)\nmethod: post\ntags: generating\n",
     params: |_g| vec![

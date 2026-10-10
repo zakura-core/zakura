@@ -454,7 +454,7 @@ fn template_build_paths_retain_capacity_when_cancelled() {
                 "normal" => rpc.get_block_template(None).boxed(),
                 "recovery" => {
                     rpc.gbt.template_rejections.send_modify(|state| {
-                        state.reject(chain.tip_hash, "rejected-work");
+                        state.reject(chain.tip_hash, &state.scope_work_id("rejected-work"));
                     });
                     rpc.finish_mining_template(initial, &chain, rpc.gbt.miner_params().unwrap())
                         .map(|result| {
@@ -548,6 +548,13 @@ fn template_id(info: &GetBlockTemplateChainInfo) -> types::long_poll::LongPollId
         .generate_id()
 }
 
+/// Returns the long-poll ID a miner holds for an empty template at the parent's `revision`.
+fn template_id_at(info: &GetBlockTemplateChainInfo, revision: u64) -> types::long_poll::LongPollId {
+    let mut id = template_id(info);
+    id.revision = revision;
+    id
+}
+
 #[tokio::test]
 async fn template_worker_panic_is_an_rpc_error() {
     let (_, info) = watch::channel(chain_info(2, 1, 0));
@@ -580,7 +587,7 @@ async fn template_worker_panic_is_an_rpc_error() {
 fn tip_change_during_construction_rebuilds_on_new_parent() {
     mining_runtime(async {
         let (info_tx, info) = watch::channel(chain_info(2, 1, 0));
-        let (rpc, tip, _) = mining_rpc(info);
+        let (rpc, tip, mut verifier) = mining_rpc(info);
         let gate = BlockingPoolGate::new().await;
         let request = rpc.get_block_template(None);
         tokio::pin!(request);
@@ -591,7 +598,19 @@ fn tip_change_during_construction_rebuilds_on_new_parent() {
         tip.send_best_tip_hash(next.tip_hash);
         gate.release().await;
 
-        let template = bounded(request).await.unwrap().try_into_template().unwrap();
+        // A new parent at an already tracked height requires foreground recovery.
+        let (response, ()) = bounded(async {
+            tokio::join!(request, async {
+                verifier
+                    .expect_request_that(|req| {
+                        matches!(req, zakura_consensus::Request::Prepare { .. })
+                    })
+                    .await
+                    .respond(Hash([9; 32]));
+            })
+        })
+        .await;
+        let template = response.unwrap().try_into_template().unwrap();
         assert_eq!(template.previous_block_hash, next.tip_hash);
         assert_eq!(template.height, 3);
         assert_eq!(
@@ -684,7 +703,7 @@ fn concurrent_caller_selecting_new_parent_makes_slow_caller_rebuild() {
             "the fast caller selects the new parent before building"
         );
         rpc.gbt.template_rejections.send_modify(|state| {
-            assert!(state.reject(next.tip_hash, "rejected-work"));
+            assert!(state.reject(next.tip_hash, &state.scope_work_id("rejected-work")));
         });
 
         gate.release().await;
@@ -711,10 +730,12 @@ fn concurrent_caller_selecting_new_parent_makes_slow_caller_rebuild() {
             "the slow caller's rebuild must not reset the parent"
         );
         assert!(
-            rpc.gbt
-                .template_rejections
-                .borrow()
-                .contains("rejected-work"),
+            rpc.gbt.template_rejections.borrow().contains(
+                &rpc.gbt
+                    .template_rejections
+                    .borrow()
+                    .scope_work_id("rejected-work")
+            ),
             "the slow caller must not clear the new parent's rejection records"
         );
     });
@@ -727,11 +748,19 @@ async fn stale_parent_selection_is_refused() {
     let (_, info) = watch::channel(chain_info(2, 1, 0));
     let (rpc, tip, _) = mining_rpc(info);
     assert!(rpc
-        .track_template_parent(Hash([1; 32]), &mut rpc.gbt.template_rejections.subscribe())
+        .track_template_parent(
+            Hash([1; 32]),
+            Height(2),
+            &mut rpc.gbt.template_rejections.subscribe()
+        )
         .is_some());
     tip.send_best_tip_hash(Hash([2; 32]));
     assert!(!rpc
-        .track_template_parent(Hash([1; 32]), &mut rpc.gbt.template_rejections.subscribe())
+        .track_template_parent(
+            Hash([1; 32]),
+            Height(2),
+            &mut rpc.gbt.template_rejections.subscribe()
+        )
         .is_some());
     assert_eq!(
         rpc.gbt.template_rejections.borrow().parent,
@@ -739,7 +768,11 @@ async fn stale_parent_selection_is_refused() {
         "a refused selection leaves the state untouched"
     );
     assert!(rpc
-        .track_template_parent(Hash([2; 32]), &mut rpc.gbt.template_rejections.subscribe())
+        .track_template_parent(
+            Hash([2; 32]),
+            Height(3),
+            &mut rpc.gbt.template_rejections.subscribe()
+        )
         .is_some());
 }
 
@@ -780,7 +813,7 @@ fn long_poll_builds_on_new_parent_without_blocking_runtime() {
     mining_runtime(async {
         for (old_height, new_height) in [(0, 1), (0, 2), (2, 3), (1, 2), (2, 5), (4, 2)] {
             let (info_tx, info) = watch::channel(chain_info(old_height, 1, 0));
-            let (rpc, tip, _) = mining_rpc(info);
+            let (rpc, tip, mut verifier) = mining_rpc(info);
             let initial = bounded(rpc.get_block_template(None))
                 .await
                 .unwrap()
@@ -808,6 +841,21 @@ fn long_poll_builds_on_new_parent_without_blocking_runtime() {
             gate.release().await;
             let response = match response {
                 Some(response) => response,
+                // A new parent at or below a tracked height requires foreground recovery.
+                // Answer the old parent's speculative preparation too.
+                None if new_height <= old_height => {
+                    bounded(async {
+                        loop {
+                            tokio::select! {
+                                response = &mut request => break response,
+                                prepare = verifier.expect_request_that(|req| {
+                                    matches!(req, zakura_consensus::Request::Prepare { .. })
+                                }) => prepare.respond(Hash([9; 32])),
+                            }
+                        }
+                    })
+                    .await
+                }
                 None => bounded(request).await,
             };
             let template = response.unwrap().try_into_template().unwrap();
@@ -837,7 +885,10 @@ fn long_poll_refreshes_testnet_difficulty_after_time_limit() {
         info_tx.send_replace(expired.clone());
         {
             let request = rpc.get_block_template(Some(GetBlockTemplateParameters {
-                long_poll_id: Some(template_id(&expired)),
+                long_poll_id: Some(template_id_at(
+                    &expired,
+                    rpc.gbt.template_rejections.borrow().current_revision(),
+                )),
                 ..Default::default()
             }));
             tokio::pin!(request);
@@ -875,7 +926,10 @@ fn long_poll_refreshes_testnet_difficulty_after_time_limit() {
             .checked_add(Duration32::from_seconds(1))
             .unwrap();
         standard.expected_difficulty = (network().target_difficulty_limit() / 4_u32).to_compact();
-        let old_id = template_id(&standard);
+        let old_id = template_id_at(
+            &standard,
+            rpc.gbt.template_rejections.borrow().current_revision(),
+        );
         info_tx.send_replace(standard.clone());
         let request = rpc.get_block_template(Some(GetBlockTemplateParameters {
             long_poll_id: Some(old_id),
@@ -935,7 +989,10 @@ fn long_poll_refresh_deadline_survives_slow_mempool_fetch() {
         let mut standard = chain_info(300_000, 1, 0);
         standard.cur_time = clock;
         standard.max_time = clock.checked_add(Duration32::from_seconds(3)).unwrap();
-        let old_id = template_id(&standard);
+        let old_id = template_id_at(
+            &standard,
+            rpc.gbt.template_rejections.borrow().current_revision(),
+        );
         info_tx.send_replace(standard.clone());
         let mut minimum = standard.clone();
         minimum.cur_time = standard
@@ -1100,7 +1157,11 @@ fn superseded_deadline_build_does_not_resume_long_polling() {
         info_tx.send_replace(other.clone());
         tip.send_best_tip_hash(other.tip_hash);
         assert!(rpc
-            .track_template_parent(other.tip_hash, &mut rpc.gbt.template_rejections.subscribe())
+            .track_template_parent(
+                other.tip_hash,
+                other.tip_height,
+                &mut rpc.gbt.template_rejections.subscribe()
+            )
             .is_some());
 
         let mut restored = original;
@@ -1193,7 +1254,7 @@ fn rejection_during_construction_rebuilds_template() {
         tokio::pin!(request);
         assert!(futures::poll!(&mut request).is_pending());
         rpc.gbt.template_rejections.send_modify(|state| {
-            assert!(state.reject(Hash([1; 32]), "rejected-work"));
+            assert!(state.reject(Hash([1; 32]), &state.scope_work_id("rejected-work")));
         });
         let (response, (), ()) = bounded(async {
             tokio::join!(
@@ -1217,7 +1278,8 @@ fn rejection_during_construction_rebuilds_template() {
         })
         .await;
         let template = response.unwrap().try_into_template().unwrap();
-        assert_eq!(template.long_poll_id.revision, 1);
+        // Tracking the parent opens revision 1, and the rejection advances it to 2.
+        assert_eq!(template.long_poll_id.revision, 2);
         assert_eq!(template.submit_old, Some(false));
         assert_reward(&template, 400_000_000);
         assert!(rpc
@@ -1247,8 +1309,8 @@ fn recovery_construction_yields_and_rebuilds_on_parent_change() {
             .await
             .unwrap();
             rpc.gbt.template_rejections.send_modify(|state| {
-                state.set_parent(chain.tip_hash);
-                state.reject(chain.tip_hash, "rejected-work");
+                state.track_parent(chain.tip_hash, chain.tip_height);
+                state.reject(chain.tip_hash, &state.scope_work_id("rejected-work"));
             });
             let gate = BlockingPoolGate::new().await;
             let request = rpc.finish_mining_template(template, &chain, params);
@@ -1322,8 +1384,8 @@ fn failed_recovery_validation_rebuilds_when_committed_state_moved_on() {
         .await
         .unwrap();
         rpc.gbt.template_rejections.send_modify(|state| {
-            state.set_parent(chain.tip_hash);
-            state.reject(chain.tip_hash, "rejected-work");
+            state.track_parent(chain.tip_hash, chain.tip_height);
+            state.reject(chain.tip_hash, &state.scope_work_id("rejected-work"));
         });
 
         // Committed state moves on while both watches still name the old parent, so
@@ -1368,7 +1430,7 @@ async fn recovery_preserves_negative_balance_error() {
         .try_into_template()
         .unwrap();
     rpc.gbt.template_rejections.send_modify(|state| {
-        state.reject(Hash([1; 32]), "rejected-work");
+        state.reject(Hash([1; 32]), &state.scope_work_id("rejected-work"));
     });
     let error = bounded(rpc.finish_mining_template(
         template,

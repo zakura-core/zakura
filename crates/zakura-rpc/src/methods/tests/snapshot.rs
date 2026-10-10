@@ -882,8 +882,17 @@ fn snapshot_rpc_getblocktemplate(
         serde_json::to_value(block_template).expect("RPC response serializes to JSON");
     if let Some(work_id) = block_template.get_mut("workid") {
         let work_id_string = work_id.as_str().expect("workid must be a string");
-        assert_eq!(work_id_string.len(), 32, "workid must encode 16 bytes");
-        assert!(work_id_string.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        let (namespace, template) = work_id_string
+            .split_once(':')
+            .expect("workid includes its parent namespace");
+        for component in [namespace, template] {
+            assert_eq!(
+                component.len(),
+                32,
+                "each workid component encodes 16 bytes"
+            );
+            assert!(component.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        }
         *work_id = "[WorkId]".into();
     }
 
@@ -1383,6 +1392,12 @@ pub async fn test_mining_rpcs<State, ReadState>(
     );
 
     let mut server_preparation_verifier = mock_block_verifier_router.clone();
+    let mut server_template = server_template;
+    let mut rejections = rpc_mock_state_verifier.gbt.template_rejections.subscribe();
+    let tracked = rpc_mock_state_verifier
+        .track_template_parent(fake_tip_hash, fake_tip_height, &mut rejections)
+        .expect("the snapshot fixture tracks its template parent");
+    server_template.work_id = tracked.scope_work_id(&hex::encode([0; 16]));
     rpc_mock_state_verifier.prepare_template_in_background(&server_template);
     server_preparation_verifier
         .expect_request_that(|request| {

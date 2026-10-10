@@ -5162,6 +5162,19 @@ impl LegacyResponseReadState {
                 "incomplete legacy response chunk".into(),
             ));
         }
+        if self.frames == 0
+            && matches!(
+                self.budget.kind,
+                LegacyResponseKind::Blocks
+                    | LegacyResponseKind::Transactions
+                    | LegacyResponseKind::Pong
+                    | LegacyResponseKind::Nil
+            )
+        {
+            return Err(OutboundRequestError::Fatal(
+                "legacy request stream finished without a required response".into(),
+            ));
+        }
         Ok(())
     }
 
@@ -10164,6 +10177,138 @@ mod tests {
             Response::Nil,
         )?;
 
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_transport_rejects_empty_mandatory_responses() -> Result<(), BoxError> {
+        let limits = test_connection_limits();
+
+        for request in [
+            LegacyRequestFrame::BlocksByHash(vec![block_hash(1)]),
+            LegacyRequestFrame::TransactionsById(vec![legacy_tx_id(2)]),
+            LegacyRequestFrame::Ping,
+            LegacyRequestFrame::PushTransaction(empty_v5_transaction(3).into()),
+        ] {
+            let request = request.encode_frame()?;
+            let state = LegacyResponseReadState::new(
+                LegacyResponseBudget::from_request(request.message_type, &request.payload, limits)
+                    .expect("budget derives from mandatory-response request"),
+            );
+
+            assert!(
+                matches!(state.finish(), Err(OutboundRequestError::Fatal(_))),
+                "a mandatory legacy response must contain at least one frame"
+            );
+        }
+
+        for request in [
+            LegacyRequestFrame::FindBlocks {
+                known_blocks: vec![block_hash(1)],
+                stop: None,
+            },
+            LegacyRequestFrame::FindHeaders {
+                known_blocks: vec![block_hash(1)],
+                stop: None,
+            },
+            LegacyRequestFrame::MempoolTransactionIds,
+        ] {
+            let request = request.encode_frame()?;
+            let state = LegacyResponseReadState::new(
+                LegacyResponseBudget::from_request(request.message_type, &request.payload, limits)
+                    .expect("budget derives from optional-response request"),
+            );
+
+            assert!(
+                state.finish().is_ok(),
+                "an empty discovery or mempool-list response remains valid"
+            );
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn empty_mandatory_response_disconnects_peer() -> Result<(), BoxError> {
+        let _guard = zakura_test::init();
+        const ALPN: &[u8] = b"/zakura/testkit/empty-mandatory-response/0";
+
+        let server = LocalEndpointFactory::new().endpoint(888).await?;
+        let (connection_tx, mut connection_rx) = mpsc::channel(1);
+        let (stream_tx, _stream_rx) = mpsc::channel(1);
+        let router = Router::builder(server)
+            .accept(
+                ALPN,
+                CaptureConnection {
+                    connection_tx,
+                    stream_tx,
+                },
+            )
+            .spawn();
+        let client = LocalEndpointFactory::new().endpoint(889).await?;
+        let connection = client.connect(router.endpoint().addr(), ALPN).await?;
+        let server_connection = timeout(Duration::from_secs(5), connection_rx.recv())
+            .await
+            .expect("server accepts the test connection")
+            .expect("capture handler forwards the test connection");
+        let stream = Stream {
+            kind: LEGACY_REQUEST_STREAM_KIND,
+            version: ZAKURA_STREAM_VERSION_1,
+            frame_cap: LOCAL_MAX_CONTROL_FRAME_BYTES,
+            capability: ZAKURA_CAP_LEGACY_GOSSIP,
+            ..Stream::REQUEST_RESPONSE
+        };
+        let request_id = 42;
+        let request = LegacyRequestFrame::Ping.encode_frame()?;
+        let requester = write_outbound_request_frame(
+            &server_connection,
+            test_connection_limits(),
+            stream,
+            request_id,
+            request.message_type,
+            request.flags,
+            request.payload,
+        );
+        let empty_responder = async {
+            let (mut send, mut recv) = connection.accept_bi().await?;
+            let response_timeout = Duration::from_secs(5);
+            let prelude = read_stream_prelude(&mut recv, response_timeout).await?;
+            assert_eq!(prelude.stream_kind, LEGACY_REQUEST_STREAM_KIND);
+            assert_eq!(prelude.request_id, Some(request_id));
+            let request = read_frame(
+                &mut recv,
+                LOCAL_MAX_CONTROL_FRAME_BYTES,
+                FrameFilter::new(None, InboundReader::Responder),
+                response_timeout,
+                Some(response_timeout),
+            )
+            .await?;
+            assert_eq!(request.message_type, LEGACY_REQUEST_PING);
+            send.finish()?;
+            Ok::<_, BoxError>(())
+        };
+
+        let (response, responder) = tokio::join!(requester, empty_responder);
+        responder?;
+        assert!(
+            matches!(response, Err(OutboundRequestError::Fatal(_))),
+            "a zero-frame mandatory response must be connection-fatal; got {response:?}"
+        );
+
+        server_connection.close(
+            VarInt::from_u32(ZAKURA_CLOSE_BAD_PRELUDE),
+            b"malformed response",
+        );
+        assert!(
+            matches!(connection.closed().await,
+                iroh::endpoint::ConnectionError::ApplicationClosed(close)
+                    if close.error_code == VarInt::from_u32(ZAKURA_CLOSE_BAD_PRELUDE)
+                        && close.reason.as_ref() == b"malformed response"),
+            "the fatal zero-frame response must disconnect the peer as malformed"
+        );
+
+        client.close().await;
+        router.shutdown().await?;
         Ok(())
     }
 

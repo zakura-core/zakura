@@ -5156,9 +5156,15 @@ impl LegacyResponseReadState {
         }
     }
 
+    /// Checks the response once its stream has ended.
+    ///
+    /// Ending mid-item is `Local`: an honest responder resets the stream when a
+    /// frame write times out, and the requester sees that the same way as a
+    /// peer that stops early. A peer can already decline with an empty
+    /// response, so failing closed here would only disconnect slow honest peers.
     fn finish(self) -> Result<(), OutboundRequestError> {
         if self.active_chunk_type.is_some() {
-            return Err(OutboundRequestError::Fatal(
+            return Err(OutboundRequestError::Local(
                 "incomplete legacy response chunk".into(),
             ));
         }
@@ -10174,6 +10180,57 @@ mod tests {
         )?;
 
         Ok(())
+    }
+
+    /// A block response whose stream ends mid-item is request-local, but a list
+    /// frame interleaved into the unfinished item stays connection-fatal.
+    #[test]
+    fn stream_ending_mid_item_is_local_and_interleaving_is_fatal() {
+        let request_id: u64 = 7;
+        let state = || {
+            LegacyResponseReadState::new(LegacyResponseBudget {
+                kind: LegacyResponseKind::Blocks,
+                max_items: 1,
+                max_frames: 4,
+                max_bytes: MAX_PROTOCOL_MESSAGE_LEN,
+                max_message_bytes: MAX_PROTOCOL_MESSAGE_LEN,
+            })
+        };
+        let mut payload = request_id.to_le_bytes().to_vec();
+        payload.push(0);
+        payload.extend_from_slice(&[0; 16]);
+        let first_chunk = Frame {
+            message_type: LEGACY_RESPONSE_BLOCK,
+            flags: 0,
+            payload,
+        };
+
+        let mut ended = state();
+        ended
+            .validate_frame(request_id, &first_chunk)
+            .expect("a non-final chunk is accepted");
+        let finished = ended.finish();
+        assert!(
+            matches!(finished, Err(OutboundRequestError::Local(_))),
+            "a stream ending mid-item must be Local; got {finished:?}"
+        );
+
+        let mut interleaved = state();
+        interleaved
+            .validate_frame(request_id, &first_chunk)
+            .expect("a non-final chunk is accepted");
+        let mut missing = request_id.to_le_bytes().to_vec();
+        missing.push(0);
+        let missing = Frame {
+            message_type: LEGACY_RESPONSE_MISSING_BLOCKS,
+            flags: 0,
+            payload: missing,
+        };
+        let result = interleaved.validate_frame(request_id, &missing);
+        assert!(
+            matches!(result, Err(OutboundRequestError::Fatal(_))),
+            "a frame interleaved into an unfinished item must stay Fatal; got {result:?}"
+        );
     }
 
     #[test]

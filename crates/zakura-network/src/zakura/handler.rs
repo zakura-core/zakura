@@ -5309,10 +5309,11 @@ impl LegacyResponseReadState {
     /// into that kind's empty `Response`. A malformed NIL, or NIL to a `Ping`
     /// (always answered locally), is `Fatal`.
     ///
-    /// NIL to `BlocksByHash` / `TransactionsById` is `Local`: an honest inbound
-    /// service still in setup answers every request with NIL. Failing closed
-    /// would disconnect it and buys nothing, since a peer can already decline
-    /// with an empty response.
+    /// A lone NIL to `BlocksByHash` / `TransactionsById` is `Local`: an honest
+    /// inbound service still in setup answers every request with NIL. Failing
+    /// closed would disconnect it and buys nothing, since a peer can already
+    /// decline with an empty response. NIL after inventory frames cannot come
+    /// from the encoder, so it stays `Fatal`.
     fn validate_nil(
         &mut self,
         request_id: u64,
@@ -5342,9 +5343,15 @@ impl LegacyResponseReadState {
             | LegacyResponseKind::BlockHeaders
             | LegacyResponseKind::TransactionIds
             | LegacyResponseKind::Nil => {}
-            LegacyResponseKind::Blocks | LegacyResponseKind::Transactions => {
+            // `validate_frame` has already counted this frame.
+            LegacyResponseKind::Blocks | LegacyResponseKind::Transactions if self.frames == 1 => {
                 return Err(OutboundRequestError::Local(
                     "legacy nil response to inventory request".into(),
+                ));
+            }
+            LegacyResponseKind::Blocks | LegacyResponseKind::Transactions => {
+                return Err(OutboundRequestError::Fatal(
+                    "legacy nil response after inventory frames".into(),
                 ));
             }
             LegacyResponseKind::Pong => {
@@ -10571,9 +10578,10 @@ mod tests {
         );
     }
 
-    /// A well-formed NIL answer to an inventory fetch is request-local, so the
-    /// peer stays connected and the caller falls back; NIL to a Ping and a NIL
-    /// with the wrong request id stay connection-fatal.
+    /// A lone, well-formed NIL answer to an inventory fetch is request-local, so
+    /// the peer stays connected and the caller falls back; NIL to a Ping, NIL
+    /// with the wrong request id, and NIL after inventory frames stay
+    /// connection-fatal.
     #[test]
     fn nil_response_is_local_for_inventory_and_fatal_for_ping() {
         let limits = test_connection_limits();
@@ -10630,6 +10638,27 @@ mod tests {
                 matches!(wrong_id, Err(OutboundRequestError::Fatal(_))),
                 "a wrong-id NIL to {request:?} must stay Fatal; got {wrong_id:?}",
             );
+
+            if let LegacyRequestFrame::BlocksByHash(hashes) = &request {
+                let mut after_items = LegacyResponseReadState::new(budget());
+                for frame in LegacyResponseCodec::encode_response(
+                    request_id,
+                    Response::Blocks(vec![InventoryResponse::Missing(hashes[0])]),
+                    limits.max_frame_bytes,
+                    limits.max_message_bytes,
+                )
+                .expect("missing response encodes")
+                {
+                    after_items
+                        .validate_frame(request_id, &frame)
+                        .expect("a missing entry is accepted");
+                }
+                let result = after_items.validate_frame(request_id, &nil(request_id));
+                assert!(
+                    matches!(result, Err(OutboundRequestError::Fatal(_))),
+                    "NIL after inventory frames must stay Fatal; got {result:?}",
+                );
+            }
         }
     }
 

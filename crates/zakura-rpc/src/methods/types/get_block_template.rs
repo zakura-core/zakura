@@ -8,6 +8,9 @@ pub mod zip317;
 #[cfg(test)]
 mod tests;
 
+pub(crate) mod prepared_candidates;
+use prepared_candidates::PreparedCandidateResolver;
+
 use std::{
     collections::{HashSet, VecDeque},
     fmt::{self},
@@ -813,6 +816,9 @@ where
     /// The chain verifier, used for submitting blocks.
     block_verifier_router: BlockVerifierRouter,
 
+    /// Reconstructs compact submissions from bounded RPC work-ID aliases.
+    prepared_candidates: PreparedCandidateResolver,
+
     /// The chain sync status, used for checking if Zebra is likely close to the network chain tip.
     sync_status: SyncStatus,
 
@@ -861,6 +867,7 @@ where
         Self {
             miner_params: MinerParams::new(net, conf).ok(),
             block_verifier_router,
+            prepared_candidates: PreparedCandidateResolver::default(),
             sync_status,
             mined_block_sender: mined_block_sender
                 .unwrap_or(SubmitBlockChannel::default().sender()),
@@ -928,6 +935,11 @@ where
     /// Returns the block verifier router.
     pub fn block_verifier_router(&self) -> BlockVerifierRouter {
         self.block_verifier_router.clone()
+    }
+
+    /// Returns the prepared-candidate resolver.
+    pub(crate) fn prepared_candidates(&self) -> PreparedCandidateResolver {
+        self.prepared_candidates.clone()
     }
 
     /// Returns a sender for the owned mined-block lifecycle task.
@@ -1025,16 +1037,14 @@ pub fn check_parameters(parameters: &Option<GetBlockTemplateParameters>) -> RpcR
     }
 }
 
-/// Attempts to validate block proposal against all of the server's
-/// usual acceptance rules (except proof-of-work).
-///
-/// Returns a [`GetBlockTemplateResponse`].
-pub async fn validate_block_proposal<BlockVerifierRouter, Tip, SyncStatus>(
+/// Validates a proposal, registering its work ID only after successful verification.
+pub(crate) async fn validate_block_proposal<BlockVerifierRouter, Tip, SyncStatus>(
     mut block_verifier_router: BlockVerifierRouter,
     block_proposal_bytes: Vec<u8>,
     net: &Network,
     latest_chain_tip: Tip,
     sync_status: SyncStatus,
+    prepared_work: Option<(PreparedCandidateResolver, &str)>,
 ) -> RpcResult<GetBlockTemplateResponse>
 where
     BlockVerifierRouter: Service<
@@ -1066,15 +1076,27 @@ where
         }
     };
 
+    let block = Arc::new(block);
     let block_verifier_router_response = block_verifier_router
         .ready()
         .await
         .map_err(|error| ErrorObject::owned(0, error.to_string(), None::<()>))?
         .call(zakura_consensus::Request::Prepare {
-            block: Arc::new(block),
+            block: block.clone(),
             source: zakura_consensus::PreparedCandidateSource::ClientProposal,
         })
         .await;
+
+    if block_verifier_router_response.is_ok() {
+        if let Some((prepared_candidates, work_id)) = prepared_work {
+            prepared_candidates.insert(
+                block,
+                work_id,
+                zakura_consensus::PreparedCandidateSource::ClientProposal,
+                net,
+            );
+        }
+    }
 
     Ok(block_verifier_router_response
         .map(|_hash| BlockProposalResponse::Valid)

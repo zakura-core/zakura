@@ -134,6 +134,13 @@ impl BlockAdmission {
 
         matches!(*admission, Admission::Admitted { .. })
     }
+
+    /// Marks the block as admitted in cross-crate lifecycle tests.
+    #[cfg(any(test, feature = "proptest-impl"))]
+    #[doc(hidden)]
+    pub fn admit_for_test(&self) {
+        self.admit(true);
+    }
 }
 
 impl PartialEq for BlockAdmission {

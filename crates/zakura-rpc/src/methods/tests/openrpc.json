@@ -31,6 +31,20 @@
       }
     },
     {
+      "name": "getstandardfee",
+      "summary": "Returns the recommended standard fee per logical action, in zatoshis.",
+      "description": "Returns the recommended standard fee per logical action, in zatoshis.\n\nCurrently returns Zakura's ZIP 317 marginal fee (`zip317::MARGINAL_FEE`), with `version` 0.\nA dynamic estimate can replace this value without changing the parameters or\nresult shape.\n\nmethod: post\ntags: wallet",
+      "params": [],
+      "result": {
+        "name": "getstandardfee_result",
+        "summary": "An OpenRPC document.",
+        "description": "An OpenRPC document.",
+        "schema": {
+          "$ref": "#/components/schemas/OpenRPC%20Schema"
+        }
+      }
+    },
+    {
       "name": "getnetworkinfo",
       "summary": "Returns an object containing various state info regarding P2P networking.",
       "description": "Returns an object containing various state info regarding P2P networking.\n\nzcashd reference: [`getnetworkinfo`](https://zcash.github.io/rpc/getnetworkinfo.html)\nmethod: post\ntags: network",
@@ -418,6 +432,30 @@
           "$ref": "#/components/schemas/OpenRPC%20Schema"
         }
       }
+    },
+    {
+      "description": "Submits a solved header for a prepared mining candidate.\n\nThe miner must retry with `submitblock` when this method returns `stale-work` or\n`candidate-mismatch`.",
+      "name": "submitsolution",
+      "params": [
+        {
+          "description": "The parameters for the command.",
+          "name": "parameters",
+          "required": true,
+          "schema": {
+            "$ref": "#/components/schemas/SubmitSolutionParameters"
+          },
+          "summary": "The parameters for the command."
+        }
+      ],
+      "result": {
+        "description": "An OpenRPC document.",
+        "name": "submitsolution_result",
+        "schema": {
+          "$ref": "#/components/schemas/OpenRPC%20Schema"
+        },
+        "summary": "An OpenRPC document."
+      },
+      "summary": "Submits a solved header for a prepared mining candidate."
     },
     {
       "name": "getblockhash",
@@ -1185,6 +1223,24 @@
             ]
           }
         },
+        "type": "object"
+      },
+      "SubmitSolutionParameters": {
+        "description": "A compact mined-block submission.",
+        "properties": {
+          "header": {
+            "$ref": "#/components/schemas/HexData",
+            "description": "The complete hex-encoded solved block header."
+          },
+          "workid": {
+            "description": "The prepared candidate identifier returned by `getblocktemplate`.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "workid",
+          "header"
+        ],
         "type": "object"
       }
     }

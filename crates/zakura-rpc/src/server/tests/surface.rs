@@ -211,6 +211,7 @@ async fn segmented_listeners_enforce_methods_and_cookie_auth() {
         "sendrawtransaction",
         "getblocktemplate",
         "submitblock",
+        "submitsolution",
     ] {
         assert!(
             restricted_methods.contains(method),

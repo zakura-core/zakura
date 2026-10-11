@@ -1478,6 +1478,15 @@ pub async fn test_mining_rpcs<State, ReadState>(
         .expect("We should have a z_validate_address::Response");
     snapshot_rpc_z_validateaddress("invalid", z_validate_address, &settings);
 
+    // `getstandardfee`
+    let get_standard_fee = rpc
+        .get_standard_fee()
+        .await
+        .expect("getstandardfee does not query any service, so it cannot fail");
+    settings.bind(|| {
+        insta::assert_json_snapshot!("get_standard_fee", get_standard_fee);
+    });
+
     // `getdifficulty`
     // This RPC snapshot uses both the mock and populated states
 

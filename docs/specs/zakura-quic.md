@@ -513,13 +513,15 @@ These are not configurable. Changing one needs a spec change.
   `quic_conn` JSONL row per connection every 10 s and on close. The endpoint
   delivers each sample to a `ConnObserver` callback, because `zakura-quic`
   doesn't depend on Zakura's trace crate. Each row holds `event` (`sample` or
-  `closed`), `peer`, `admitted_ip`, `rtt_micros`, `cwnd`, `lost_packets`,
+  `closed`), `conn`, `direction` (`inbound` or `outbound`), `peer`,
+  `admitted_ip`, `rtt_micros`, `cwnd`, `lost_packets`,
   `congestion_events`, `bytes_sent`, `bytes_received`, `current_mtu`,
   `bytes_in_flight`, `send_blocked_micros` and `close_reason`. For a close this
   node made, `close_reason` names the cause: the application's code and
   reason, `banned path`, `endpoint shutdown`, `all handles dropped` or
-  `handshake abandoned`. `peer` is the
-  hashed peer label the other tables use, so rows join with `conn.jsonl`.
+  `handshake abandoned`. `conn` is `Conn::stable_id`, which Zakura also uses
+  as the `conn` column of its other tables, so rows join with `conn.jsonl` on
+  `conn`. `peer` is the hashed peer label the other tables use.
   `admitted_ip` follows `expose_peer_addresses`: it is `v4redacted` or
   `v6redacted` unless that is set.
 - **OBS-4.** `Conn::stats()` MUST return a `ConnStats` with three parts:

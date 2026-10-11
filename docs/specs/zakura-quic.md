@@ -280,6 +280,11 @@ The driver follows the P2P stack's routine and reactor pattern. No lock guards a
   - A `SendStream` pipelines writes. A write returns once at most 64 KiB
     (`WRITE_AHEAD_BYTES`) of that stream's data waits at the connection task
     for `quinn-proto`. An earlier write's failure surfaces on a later write.
+    The bound decides when the caller resumes, not how much one call hands
+    over: a blocked call's whole chunk waits at the task until the peer's
+    flow control takes it. A peer that stops reading therefore pins each
+    blocked writer's chunk plus 64 KiB per stream, so the application bounds
+    chunk size and concurrent writers (V12 F-70).
     Without write-ahead, each write cost a round trip to the
     connection task and its own packet.
 - **DRV-5.** Cancelling a read or write future MUST NOT lose or reorder stream
@@ -296,7 +301,10 @@ The driver follows the P2P stack's routine and reactor pattern. No lock guards a
   shutdown, timers, the sampler) before the datagram queue. Local inputs are
   bounded (DRV-4) and wait on network progress, while a peer can keep the
   queue full; serving datagrams first would let a flood starve `close`,
-  `set_limits` and PATH-3.
+  `set_limits` and PATH-3. The endpoint task likewise MUST serve its events,
+  commands, task reaping, close deadline and counter flush before the socket.
+  Both tasks MUST yield to the runtime between input or transmit batches, so
+  a busy peer can't hold a worker thread.
 - **DRV-9.** When the peer sends STOP_SENDING, the connection task MUST fail
   the stream's pending writes and send RESET_STREAM with the peer's code
   (RFC 9000 §3.5). `quinn-proto` leaves the reset to the application. Without
@@ -357,7 +365,12 @@ work. Stage 2 runs after TLS proves the `NodeId` and is today's Zakura logic.
   finish within it. On expiry, the endpoint MUST drop the connecting attempt,
   which closes the connection, and count `zakura.quic.handshake.timed_out`.
 - **ADM-7.** A pending handshake counts against its IP and against the endpoint
-  from `Accept` until the handshake completes or fails.
+  from `Accept` until the handshake completes or fails. A failed or timed-out
+  handshake keeps counting until its connection task has closed the
+  connection, for at most 3 s. On success, the endpoint calls
+  `Acceptor::handle` before the count drops, so an acceptor that claims its
+  own accounting inside `handle` leaves no moment in which the IP counts
+  nowhere.
 - **ADM-8.** An established connection counts against its admitted IP until
   `Conn::closed()` resolves. The slot MUST NOT be released earlier.
 - **ADM-9.** After the handshake, `Acceptor::handle` receives a `Conn` whose
@@ -580,7 +593,8 @@ The public surface of `zakura-quic`. Changing it is a semver change of the crate
   - `fn admit(&self, incoming: &IncomingInfo) -> Admit`;
   - `fn alpns(&self) -> Vec<Vec<u8>>`, in preference order;
   - `fn handle(&self, conn: Conn) -> BoxFuture<'static, ()>`; `Conn::alpn()`
-    carries the negotiated ALPN;
+    carries the negotiated ALPN. Work done in `handle` before it returns the
+    future runs while the handshake still counts as pending (ADM-7);
   - `fn is_banned(&self, ip: IpAddr) -> bool`, default `false`, for PATH-3.
 - **API-4.** `Conn`:
   - `remote_id()`, `admitted_ip()`, `admitted_addr()`, `alpn()` and `stable_id()`;
@@ -613,6 +627,10 @@ The public surface of `zakura-quic`. Changing it is a semver change of the crate
   2. close every connection with application code 0;
   3. wait for every connection to drain, for at most 3 s;
   4. drop the sockets.
+
+  An endpoint task that hasn't stopped 1 s after the drain bound is aborted,
+  and dropping the task closes its socket, so `shutdown` never returns with a
+  socket still bound.
 
   Dropping the last `QuicEndpoint` handle without `shutdown` MUST still stop
   accepting, close every connection with code 0 and free the sockets.
@@ -753,11 +771,11 @@ this release tolerates, and keep each hard change explicit.
 | `unsafe` appears only in the DEP-7 items | DEP-7 |
 | Identity known-answer and key-file round trip | ID-1–ID-7, SEC-1 |
 | TLS refusal matrix | TLS-1–TLS-8, SEC-2 |
-| Transport-parameter snapshot: decode the client and server parameters and compare each value with the WIRE profile, ignoring connection IDs, the stateless reset token and the parameter order | WIRE-5–WIRE-10, WIRE-14 |
+| Transport-profile snapshot: the transport, endpoint and server configs match a field-by-field snapshot; the congestion controller follows the config; the TLS configs refuse early data, tickets and SNI | WIRE-5–WIRE-10, WIRE-14, ADM-5, CTRL-3, TLS-10, TLS-11 |
 | Buffer read-back and clamp warning: bind under a lowered `rmem_max` in a user namespace | SOCK-3–SOCK-5 |
 | Busy-socket loopback run: zero `lost_packets` caused by the sender, bidirectional, 64 MiB | SOCK-6, G7 |
 | `/proc/net/udp` drop counter with a deliberately slow receiver | SOCK-7 |
-| A changed interface list notifies connections once, and an open connection keeps working | SOCK-12 |
+| A changed interface list notifies connections once, each connection moves to a fresh remote connection ID, and an open connection keeps working | SOCK-12 |
 | Control-message round trip, and every truncated or lying control message parses to nothing | SOCK-13 |
 | Loopback transfer through the SOCK-13 fast path beats the plain path on the same host | SOCK-13 |
 | Cancelled reads lose no data; cancelled writes keep their order; concurrent streams keep their data apart; a transfer larger than the receive window completes | DRV-4–DRV-6 |
@@ -766,6 +784,7 @@ this release tolerates, and keep each hard change explicit.
 | A stopped stream returns its credit; a cancelled `accept_bi` hands its stream to the next call | DRV-9, DRV-10 |
 | Raising the stream limit admits a blocked opener; the load snapshot reports delivered bytes, open streams and the path; the final sample names the local close cause | API-9, OBS-3 |
 | Admission ordering, refuse, ignore, retry, timeout | ADM-1–ADM-7, SEC-3, SEC-4 |
+| `Acceptor::handle` runs while the attempt still counts as pending | ADM-7 |
 | Happy-eyeballs dial with mixed v4/v6 addresses and one black-holed address | DIAL-1–DIAL-6 |
 | A relay that rebinds like a NAT: migration to a banned IP closes the connection at once, a ban that lands after the move closes it at the next sample, and migration to another IP keeps it with the admitted IP unchanged | PATH-3, PATH-4 |
 | Config round trip, defaults, range errors, removed keys, `nat_traversal` error | CTRL-0–CTRL-25 |
@@ -923,6 +942,11 @@ Changed:
   path at each sample.
 - **OBS-1.** Drops `zakura.quic.paths.peer_opened` and adds the socket, GSO,
   GRO and queue counters.
+- **DRV-8, ADM-7, API-3, API-7.** The endpoint task serves housekeeping
+  before the socket and both tasks yield between batches (V12 F-60). A failed
+  handshake keeps its pending slot until its connection closes (F-62).
+  `handle` runs before the pending count drops (F-42). `shutdown` aborts an
+  endpoint task that misses the bound (F-63).
 - **OBS-3.** Replaces `paths_open` with `bytes_in_flight` and
   `send_blocked_micros`, and adds the `conn` and `direction` join columns.
 - **OBS-4.** `ConnStats` holds connection, congestion and driver stats.

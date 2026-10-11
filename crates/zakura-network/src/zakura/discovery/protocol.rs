@@ -131,7 +131,12 @@ const NODE_ID_BYTES: usize = 32;
 const SOCKET_ADDR_V4: u8 = 4;
 const SOCKET_ADDR_V6: u8 = 6;
 const ZAKURA_NODE_RECORD_SIG_DOMAIN: &[u8] = b"zakura-node-record-v1";
-const ZAKURA_NODE_RECORD_FORMAT_VERSION: u16 = ZAKURA_DISCOVERY_STREAM_VERSION;
+/// Node record encoding version, bound into the signature pre-image.
+///
+/// Records are relayed third-party data, so this version is not negotiated per hop.
+/// Version 2 added [`ZakuraNodeRecordBody::extensions`]. Future soft changes go in that
+/// extension area and keep this version; only a change to the fixed fields bumps it.
+const ZAKURA_NODE_RECORD_FORMAT_VERSION: u16 = 2;
 
 /// A bounded ASCII Zakura service identifier.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -238,6 +243,18 @@ pub struct ZakuraNodeRecordBody {
     pub sequence: u64,
     /// Unix timestamp when this record expires.
     pub expires_at_unix_secs: u64,
+    /// Opaque signed extension area: every body byte after the fixed fields.
+    ///
+    /// Future record fields go here as TLVs (`u16` type, `u16` length, value bytes), so a
+    /// release can add record contents, such as a new address kind, without a hard break.
+    /// A reader ignores TLVs it does not know. This release does not parse the area: it
+    /// keeps the bytes verbatim, so the signature still verifies and a relayed record
+    /// reaches the next hop unchanged. [`MAX_NODE_RECORD_BODY_BYTES`] bounds the whole
+    /// body, extension area included.
+    ///
+    /// A new address kind MUST NOT appear as a new family byte in `direct_addrs`: a release
+    /// that does not know the family skips the whole record.
+    pub extensions: Vec<u8>,
 }
 
 impl ZakuraNodeRecordBody {
@@ -248,10 +265,13 @@ impl ZakuraNodeRecordBody {
         let mut bytes = Vec::new();
         bytes.write_all(ZAKURA_NODE_RECORD_SIG_DOMAIN)?;
         bytes.write_u16::<LittleEndian>(ZAKURA_NODE_RECORD_FORMAT_VERSION)?;
+        let body_start = bytes.len();
         encode_record_body_to(self, &mut bytes)?;
-        if bytes.len() > MAX_NODE_RECORD_BODY_BYTES {
+        // Bound the body, not the pre-image, so every body that decodes also verifies.
+        let body_len = bytes.len() - body_start;
+        if body_len > MAX_NODE_RECORD_BODY_BYTES {
             return Err(DiscoveryWireError::OversizedPayload {
-                actual: bytes.len(),
+                actual: body_len,
                 max: MAX_NODE_RECORD_BODY_BYTES,
             });
         }
@@ -2641,6 +2661,7 @@ impl ZakuraLocalDiscoveryState {
                 chain_id: self.chain_id,
                 sequence,
                 expires_at_unix_secs: now_unix_secs.saturating_add(record_ttl.as_secs()),
+                extensions: Vec::new(),
             },
             &self.secret_key,
         )
@@ -2878,12 +2899,25 @@ impl ZakuraDiscoveryBook {
         }
         ranked.sort_unstable_by_key(rank_sort_key);
 
+        // A record's extension area can make it large, so the sample also has to fit one
+        // `Peers` message. Skip a record that would overflow it, so one large record
+        // cannot make every response fail to encode.
+        let mut remaining_bytes =
+            MAX_DISCOVERY_MESSAGE_BYTES.saturating_sub(PEERS_MESSAGE_HEADER_BYTES);
         ranked
             .into_iter()
             .map(|(_, entry)| entry)
             .filter(|entry| {
                 !exclude_node_ids.contains(&entry.record.body.node_id)
                     && advertises_all_services(&entry.record, wanted_services)
+            })
+            .filter(|entry| {
+                let record_len = encoded_record_len(&entry.record);
+                if record_len > remaining_bytes {
+                    return false;
+                }
+                remaining_bytes -= record_len;
+                true
             })
             .take(limit)
             .map(|entry| entry.record.clone())
@@ -4122,7 +4156,45 @@ fn encode_record(
     Ok(())
 }
 
-fn decode_record(reader: &mut impl Read) -> Result<ZakuraNodeRecord, DiscoveryWireError> {
+/// Encoded bytes of a `Peers` message before its records: the type and the record count.
+const PEERS_MESSAGE_HEADER_BYTES: usize = 1 + 2;
+
+/// Returns the length [`encode_record`] writes for `record`, without encoding it.
+fn encoded_record_len(record: &ZakuraNodeRecord) -> usize {
+    let body = &record.body;
+    let addrs_len: usize = body
+        .direct_addrs
+        .iter()
+        .map(|addr| match addr {
+            SocketAddr::V4(_) => 1 + 4 + 2,
+            SocketAddr::V6(_) => 1 + 16 + 2 + 4 + 4,
+        })
+        .sum();
+    let services_len: usize = body
+        .services
+        .iter()
+        .map(|service| 2 + service.as_str().len())
+        .sum();
+    let body_len = NODE_ID_BYTES
+        + 2
+        + addrs_len
+        + 2
+        + services_len
+        + 2
+        + 2
+        + 4
+        + 32
+        + 8
+        + 8
+        + body.extensions.len();
+    4 + body_len + SIGNATURE_BYTES
+}
+
+/// Reads one record's framing: the length-prefixed body bytes and the signature.
+///
+/// A framing error leaves the reader at an unknown offset, so callers MUST treat it as a
+/// message-level error.
+fn read_record_frame(reader: &mut impl Read) -> Result<(Vec<u8>, Signature), DiscoveryWireError> {
     let body_len = usize_from_u32(reader.read_u32::<LittleEndian>()?, "record body length")?;
     if body_len > MAX_NODE_RECORD_BODY_BYTES {
         return Err(DiscoveryWireError::OversizedPayload {
@@ -4132,12 +4204,15 @@ fn decode_record(reader: &mut impl Read) -> Result<ZakuraNodeRecord, DiscoveryWi
     }
 
     let body_bytes = read_exact_vec(reader, body_len)?;
-    let body = decode_record_body(&body_bytes)?;
 
     let mut signature_bytes = [0u8; SIGNATURE_BYTES];
     reader.read_exact(&mut signature_bytes)?;
-    let signature = Signature::from(signature_bytes);
+    Ok((body_bytes, Signature::from(signature_bytes)))
+}
 
+fn decode_record(reader: &mut impl Read) -> Result<ZakuraNodeRecord, DiscoveryWireError> {
+    let (body_bytes, signature) = read_record_frame(reader)?;
+    let body = decode_record_body(&body_bytes)?;
     Ok(ZakuraNodeRecord { body, signature })
 }
 
@@ -4174,7 +4249,21 @@ fn decode_record_list(
     }
     let mut records = Vec::with_capacity(count);
     for _ in 0..count {
-        records.push(decode_record(reader)?);
+        // Relayed records are third-party data that this hop cannot version-negotiate.
+        // A body this release cannot decode is skipped, so the relaying peer is not
+        // punished for forwarding a newer record. Framing errors stay fatal.
+        let (body_bytes, signature) = read_record_frame(reader)?;
+        match decode_record_body(&body_bytes) {
+            Ok(body) => records.push(ZakuraNodeRecord { body, signature }),
+            Err(error) => {
+                metrics::counter!("zakura.p2p.discovery.records.undecodable").increment(1);
+                tracing::debug!(
+                    ?error,
+                    body_len = body_bytes.len(),
+                    "skipping undecodable Zakura discovery record body"
+                );
+            }
+        }
     }
     Ok(records)
 }
@@ -4303,6 +4392,7 @@ fn encode_record_body_to(
     writer.write_all(&body.chain_id)?;
     writer.write_u64::<LittleEndian>(body.sequence)?;
     writer.write_u64::<LittleEndian>(body.expires_at_unix_secs)?;
+    writer.write_all(&body.extensions)?;
     Ok(())
 }
 
@@ -4327,7 +4417,10 @@ fn decode_record_body(bytes: &[u8]) -> Result<ZakuraNodeRecordBody, DiscoveryWir
     reader.read_exact(&mut chain_id)?;
     let sequence = reader.read_u64::<LittleEndian>()?;
     let expires_at_unix_secs = reader.read_u64::<LittleEndian>()?;
-    reject_trailing(bytes, &reader)?;
+    // Every byte after the fixed fields is the signed extension area.
+    let fixed_len = usize::try_from(reader.position())
+        .map_err(|_| DiscoveryWireError::NumericOverflow("record body position"))?;
+    let extensions = bytes.get(fixed_len..).unwrap_or_default().to_vec();
 
     let body = ZakuraNodeRecordBody {
         node_id,
@@ -4339,6 +4432,7 @@ fn decode_record_body(bytes: &[u8]) -> Result<ZakuraNodeRecordBody, DiscoveryWir
         chain_id,
         sequence,
         expires_at_unix_secs,
+        extensions,
     };
     validate_record_body_bounds(&body)?;
     Ok(body)
@@ -4809,6 +4903,7 @@ mod tests {
             chain_id: CHAIN_ID,
             sequence: 42,
             expires_at_unix_secs: NOW + 60,
+            extensions: Vec::new(),
         }
     }
 
@@ -5924,6 +6019,144 @@ mod tests {
         just_expired
             .verify(&context())
             .expect("just expired within skew is accepted");
+    }
+
+    /// The signed extension area is relayed verbatim: it survives decode and re-encode,
+    /// the signature still verifies, and the extension bytes are covered by it.
+    #[test]
+    fn node_record_extensions_round_trip_and_verify() {
+        let secret_key = secret_key();
+        let mut body = body(&secret_key);
+        // An unknown TLV: type 0x7001, length 3.
+        body.extensions = vec![0x01, 0x70, 0x03, 0x00, 0xaa, 0xbb, 0xcc];
+        let record = ZakuraNodeRecord::sign(body, &secret_key).expect("record signs");
+
+        let encoded = DiscoveryMessage::Hello {
+            record: record.clone(),
+        }
+        .encode()
+        .expect("message encodes");
+        let DiscoveryMessage::Hello { record: decoded } =
+            DiscoveryMessage::decode(&encoded).expect("message decodes")
+        else {
+            panic!("expected a hello message");
+        };
+        assert_eq!(decoded, record);
+        decoded
+            .verify(&context())
+            .expect("extended record verifies");
+        assert_eq!(
+            DiscoveryMessage::Hello {
+                record: decoded.clone()
+            }
+            .encode()
+            .expect("message re-encodes"),
+            encoded,
+            "a relayed record is byte-identical"
+        );
+
+        let mut framed = Vec::new();
+        encode_record(&record, &mut framed).expect("record encodes");
+        assert_eq!(encoded_record_len(&record), framed.len());
+
+        let mut mutated = decoded;
+        mutated.body.extensions[4] ^= 1;
+        assert!(matches!(
+            mutated.verify(&context()),
+            Err(DiscoveryRecordError::InvalidSignature)
+        ));
+    }
+
+    /// A relayed record whose body this release cannot decode is skipped, and the other
+    /// records in the same `Peers` message still decode. Framing errors stay fatal.
+    #[test]
+    fn peers_message_skips_undecodable_record_bodies() {
+        let first = signed_record_with(1, service(1), test_addr(1));
+        let last = signed_record_with(2, service(2), test_addr(2));
+
+        // A record with an address family this release does not know.
+        let unknown_family = signed_record_with(3, service(3), test_addr(3));
+        let mut unknown_body = Vec::new();
+        encode_record_body_to(&unknown_family.body, &mut unknown_body).expect("body encodes");
+        let family_offset = NODE_ID_BYTES + 2;
+        assert_eq!(unknown_body[family_offset], SOCKET_ADDR_V4);
+        unknown_body[family_offset] = 9;
+
+        let mut encoded = vec![MSG_DISCOVERY_PEERS];
+        encoded.write_u16::<LittleEndian>(3).unwrap();
+        encode_record(&first, &mut encoded).unwrap();
+        encoded
+            .write_u32::<LittleEndian>(u32::try_from(unknown_body.len()).unwrap())
+            .unwrap();
+        encoded.write_all(&unknown_body).unwrap();
+        encoded
+            .write_all(&unknown_family.signature.to_bytes())
+            .unwrap();
+        encode_record(&last, &mut encoded).unwrap();
+
+        assert_eq!(
+            DiscoveryMessage::decode(&encoded).expect("message decodes"),
+            DiscoveryMessage::Peers {
+                records: vec![first.clone(), last],
+            }
+        );
+
+        // A message whose only record is undecodable is an empty sample, not an error.
+        let mut only_unknown = vec![MSG_DISCOVERY_PEERS];
+        only_unknown.write_u16::<LittleEndian>(1).unwrap();
+        only_unknown
+            .write_u32::<LittleEndian>(u32::try_from(unknown_body.len()).unwrap())
+            .unwrap();
+        only_unknown.write_all(&unknown_body).unwrap();
+        only_unknown
+            .write_all(&unknown_family.signature.to_bytes())
+            .unwrap();
+        assert_eq!(
+            DiscoveryMessage::decode(&only_unknown).expect("message decodes"),
+            DiscoveryMessage::Peers {
+                records: Vec::new()
+            }
+        );
+
+        // A truncated signature is a framing error and fails the whole message.
+        let mut truncated = vec![MSG_DISCOVERY_PEERS];
+        truncated.write_u16::<LittleEndian>(1).unwrap();
+        encode_record(&first, &mut truncated).unwrap();
+        truncated.pop();
+        assert!(DiscoveryMessage::decode(&truncated).is_err());
+
+        // An oversize body length is a framing error too.
+        let mut oversize = vec![MSG_DISCOVERY_PEERS];
+        oversize.write_u16::<LittleEndian>(1).unwrap();
+        oversize
+            .write_u32::<LittleEndian>(u32::try_from(MAX_NODE_RECORD_BODY_BYTES + 1).unwrap())
+            .unwrap();
+        assert!(matches!(
+            DiscoveryMessage::decode(&oversize),
+            Err(DiscoveryWireError::OversizedPayload { .. })
+        ));
+    }
+
+    /// Records with large extension areas cannot push a peer sample past one `Peers`
+    /// message: the book skips a record that would not fit.
+    #[test]
+    fn sample_peers_fits_one_peers_message() {
+        let mut book = ZakuraDiscoveryBook::default();
+        for index in 1..=4u8 {
+            let secret_key = secret_key();
+            let mut body = body(&secret_key);
+            body.direct_addrs = vec![test_addr(index)];
+            body.extensions = vec![index; 6 * 1024];
+            let record = ZakuraNodeRecord::sign(body, &secret_key).expect("record signs");
+            book.import_record(record, Some(secret_key.public()), NOW, &context())
+                .expect("first-party record imports");
+        }
+
+        let sample = book.sample_peers(10, &[], &[], NOW, test_requester());
+        assert_eq!(sample.len(), 2, "only two 6 KiB records fit in 16 KiB");
+        DiscoveryMessage::Peers { records: sample }
+            .encode()
+            .expect("the sample fits one Peers message");
     }
 
     #[test]

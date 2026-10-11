@@ -1153,6 +1153,7 @@ mod tests {
             chain_id: handshake.chain_id,
             sequence: 1,
             expires_at_unix_secs: current_test_unix_secs().saturating_add(60),
+            extensions: Vec::new(),
         };
         Ok(ZakuraNodeRecord::sign(body, secret_key)?)
     }

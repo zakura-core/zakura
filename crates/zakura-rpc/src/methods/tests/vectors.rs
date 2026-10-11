@@ -5153,10 +5153,9 @@ async fn prepared_server_template_registers_its_rpc_work_id() {
         MockSyncStatus::default(),
         None,
     );
-    gbt.template_rejections
-        .send_modify(|state| {
-            state.track_parent(parent, Height(1));
-        });
+    gbt.template_rejections.send_modify(|state| {
+        state.track_parent(parent, Height(1));
+    });
     let cache = gbt.prepared_candidates();
     assert_eq!(
         cache.resolve(template.work_id(), *candidate.header),

@@ -391,7 +391,7 @@ impl BlockTemplateLimits {
     /// sigop count is the full block-level count (legacy + P2SH), so template
     /// selection cannot produce blocks the block verifier would reject for
     /// exceeding `MAX_BLOCK_SIGOPS`. The shielded counts come from the same
-    /// [`ShieldedActionCounts`](zakura_chain::transaction::ShieldedActionCounts)
+    /// [`ShieldedActionCounts`]
     /// the block verifier sums, so a template cannot exceed the ZIP 218 limits
     /// either.
     fn try_add(&mut self, tx: &VerifiedUnminedTx) -> bool {

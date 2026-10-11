@@ -2,6 +2,8 @@ use std::{fs, path::Path};
 
 use crate::BoxError;
 
+mod openrpc;
+
 const INDEXER_PROTO: &str = "crates/zakura-rpc/proto/indexer.proto";
 const RPC_CRATE: &str = "crates/zakura-rpc";
 const METHODS_SOURCE: &str = "crates/zakura-rpc/src/methods.rs";
@@ -73,11 +75,7 @@ fn generate(repo_root: &Path, output_dir: &Path) -> Result<(), BoxError> {
         .file_descriptor_set_path(output_dir.join("indexer_descriptor.bin"))
         .compile_protos(&[proto_file], &[rpc_crate])?;
 
-    let methods_source = repo_root.join(METHODS_SOURCE);
-    let methods_source = methods_source
-        .to_str()
-        .ok_or("RPC methods source path should be valid UTF-8")?;
-    openrpsee::generate_openrpc(methods_source, &["Rpc"], false, output_dir)?;
+    openrpc::generate(&repo_root.join(METHODS_SOURCE), output_dir)?;
 
     verify_generated_files(output_dir)
 }

@@ -12,7 +12,7 @@ use std::{
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
-use super::{CloseCause, FramedRecv, FramedSend};
+use super::{CloseCause, FramedRecv, FramedSend, MessageRule};
 use crate::{
     zakura::{ServicePeerDirection, ZakuraConnId, ZakuraPeerId},
     BoxError,
@@ -111,17 +111,13 @@ pub struct Stream {
     pub capability: u64,
     /// Stream lifetime and opening semantics.
     pub mode: StreamMode,
-    /// Payload size limits, as `(message_type, maximum_bytes)` pairs.
+    /// The messages this stream carries, or `None` for any message.
     ///
-    /// The reader checks these limits before allocating a payload. Limits
-    /// exclude the frame header and may only tighten `frame_cap`. Unlisted
-    /// message types keep that cap; the codec checks message validity.
-    pub payload_limits: &'static [(u16, usize)],
-    /// Message types accepted on this stream, or `None` for any type.
-    ///
-    /// The reader rejects an unlisted type from its header, before allocating
-    /// or reading its payload.
-    pub message_types: Option<&'static [u16]>,
+    /// The reader checks each frame's type, flags, and payload length against
+    /// this table before it reads the payload. Without a table, the reader
+    /// admits any type and any flags up to `frame_cap`. Check a layout's tables
+    /// with [`Stream::validate_layout`].
+    pub messages: Option<&'static [MessageRule]>,
     /// Application queue limits, or `None` for the transport's defaults.
     ///
     /// The transport also applies its connection-wide inbound queue allowance.
@@ -142,8 +138,7 @@ impl Stream {
         frame_cap: 0,
         capability: 0,
         mode: StreamMode::Persistent,
-        payload_limits: &[],
-        message_types: None,
+        messages: None,
         queue_depths: None,
         write_policy: StreamWritePolicy::Timeout(Duration::from_secs(10)),
     };

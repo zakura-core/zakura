@@ -115,9 +115,9 @@ on:
         description: "Branch, tag, or SHA to test (exactly one of pr_number / ref)"
         required: false
       snapshot_mode:
-        description: "Chain state to start from (pre-checkpoint: newest retained tip snapshot below the last checkpoint)"
+        description: "State fixture (vct-handoff: dedicated approach; pre-checkpoint: any verified snapshot below C)"
         type: choice
-        options: [tip, pre-checkpoint, sandblast, genesis]
+        options: [tip, pre-checkpoint, vct-handoff, sandblast, genesis]
         default: tip
       network:
         description: "Network (sandblast is mainnet-only)"
@@ -178,6 +178,14 @@ jobs:
           NETWORK: ${{ inputs.network }}
         run: |
           set -euo pipefail
+          case "${MODE}" in
+            tip|pre-checkpoint|vct-handoff|sandblast|genesis) ;;
+            *) echo "unknown snapshot mode: ${MODE}" >&2; exit 1 ;;
+          esac
+          if [ "${MODE}" = "vct-handoff" ] && [ "${NETWORK}" != "mainnet" ]; then
+            echo "snapshot_mode=vct-handoff is mainnet-only" >&2
+            exit 1
+          fi
           if [ "${MODE}" = "sandblast" ] && [ "${NETWORK}" != "mainnet" ]; then
             echo "snapshot_mode=sandblast is mainnet-only (the spam region is a mainnet range)" >&2
             exit 1
@@ -207,7 +215,7 @@ jobs:
           # pre-checkpoint needs the target tree's max checkpoint to pick a
           # state snapshot below it.
           MAX_CKPT=""
-          if [ "${MODE}" = "pre-checkpoint" ]; then
+          if [ "${MODE}" = "pre-checkpoint" ] || [ "${MODE}" = "vct-handoff" ]; then
             case "${NETWORK}" in
               mainnet) CKPT_PATH=crates/zakura-chain/src/parameters/checkpoint/main-checkpoints.txt ;;
               testnet) CKPT_PATH=crates/zakura-chain/src/parameters/checkpoint/test-checkpoints.txt ;;

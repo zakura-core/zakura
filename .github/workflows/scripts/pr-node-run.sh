@@ -7,7 +7,7 @@
 #
 # Config via /root/run.env (sourced by the caller before exec):
 #   GH_REPO / GH_CLONE_TOKEN  repo slug + per-run token for the PR-ref fetch
-#   MODE                      tip | pre-checkpoint | sandblast | genesis
+#   MODE                      tip | pre-checkpoint | vct-handoff | sandblast | genesis
 #   NETWORK                   mainnet | testnet
 #   SHA / REFSPEC             commit to test + refspec that reaches it
 #   DURATION_MINUTES          how long to monitor the running node
@@ -47,7 +47,7 @@ else
   # syncs through the last checkpoint handoff instead of starting above it.
   case "$MODE" in
     tip)            STATE_SUBDIR=tip;       STORAGE_MODE=pruned ;;
-    pre-checkpoint) STATE_SUBDIR=tip;       STORAGE_MODE=pruned ;;
+    pre-checkpoint|vct-handoff) STATE_SUBDIR=tip; STORAGE_MODE=pruned ;;
     sandblast)      STATE_SUBDIR=sandblast; STORAGE_MODE=archive ;;
     *)              echo "unknown snapshot mode: $MODE" >&2; exit 1 ;;
   esac
@@ -140,7 +140,7 @@ note "Incremental build took $(( $(date +%s) - BUILD_START ))s (warm baked cache
 # Read the restored DB directly before networking starts. Snapshot names are a
 # picker optimization, not trusted proof of the handoff start height.
 MONITOR_CROSSING_ARGS=()
-if [ "$MODE" = "pre-checkpoint" ]; then
+if [ "$MODE" = "pre-checkpoint" ] || [ "$MODE" = "vct-handoff" ]; then
   [[ "$MAX_CKPT" =~ ^[0-9]+$ ]] || {
     note "**FAILED:** pre-checkpoint mode requires a numeric max checkpoint."
     exit 1
@@ -186,6 +186,13 @@ TOML
     fi
   fi
   note "pre-checkpoint: verified database height ${VERIFIED_START_HEIGHT} is $((MAX_CKPT - VERIFIED_START_HEIGHT)) blocks below max checkpoint ${MAX_CKPT}."
+  # The trace option is supported by the same binary whose handoff is tested.
+  # Keep traces on the disposable state volume, away from the warm build cache.
+  cat >> /root/fleet.toml <<TOML
+
+[defaults.zakura]
+trace_dir = "/mnt/snapshots/handoff-traces"
+TOML
 fi
 
 python3 deploy/deployer/deploy.py deploy --config /root/fleet.toml
@@ -210,5 +217,8 @@ python3 /root/pr-node-monitor.py \
 
 tail -n 2000 /var/log/zakura/zakura.log > "$OUT_DIR/zakura-tail.log" 2>/dev/null || true
 zstd -T0 -q -f /var/log/zakura/zakura.log -o "$OUT_DIR/zakura-full.log.zst" 2>/dev/null || true
+if [ -d /mnt/snapshots/handoff-traces ]; then
+  tar -C /mnt/snapshots/handoff-traces -cf - . | zstd -T0 -q -f -o "$OUT_DIR/handoff-traces.tar.zst" || true
+fi
 
 exit "$MONITOR_RC"

@@ -10,6 +10,7 @@
 //!
 //! A root of a note commitment tree is associated with each treestate.
 
+use crate::serialization::ZcashReader;
 use std::{
     default::Default,
     fmt,
@@ -254,7 +255,9 @@ impl ZcashSerialize for Root {
 }
 
 impl ZcashDeserialize for Root {
-    fn zcash_deserialize<R: io::Read>(mut reader: R) -> Result<Self, SerializationError> {
+    fn zcash_deserialize_from<R: io::Read>(
+        reader: &mut ZcashReader<R>,
+    ) -> Result<Self, SerializationError> {
         Self::try_from(reader.read_32_bytes()?)
     }
 }
@@ -706,7 +709,7 @@ impl NoteCommitmentTree {
     /// Checks `roots`, the completed subtree roots in index order, against this tree's frontier.
     ///
     /// Returns how many roots were checked. See
-    /// [`subtree_verify`](crate::subtree_verify) for what this proves.
+    /// [`subtree_verify`] for what this proves.
     ///
     /// Ironwood re-exports this module, so this also serves Ironwood trees.
     pub fn verify_completed_subtree_roots(

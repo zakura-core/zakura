@@ -20,7 +20,7 @@ pub struct ZakuraHeaderSyncConfig {
     /// Maximum headers this node advertises per `GetHeaders` response.
     pub max_headers_per_response: u32,
     /// How often this node sends unsolicited status refreshes after local frontier changes.
-    #[serde(with = "humantime_serde")]
+    #[serde(with = "zakura_chain::serialization::serde_adapters::duration")]
     pub status_refresh_interval: Duration,
     /// Header-sync peer caps and queue limits owned by this reactor.
     pub peer_limits: ServicePeerLimits,
@@ -35,7 +35,7 @@ pub struct ZakuraHeaderSyncConfig {
     /// Discovery applies dial backoff only after a failed dial.
     /// The cooldown prevents an immediate redial after a successful dial ends in eviction.
     /// Set this value to zero to allow immediate readmission.
-    #[serde(with = "humantime_serde")]
+    #[serde(with = "zakura_chain::serialization::serde_adapters::duration")]
     pub unproductive_peer_cooldown: Duration,
     /// Optional trusted header-sync anchor height.
     ///

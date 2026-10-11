@@ -18,7 +18,7 @@ use tokio::{task::JoinSet, time::Instant};
 use tracing::debug;
 use zakura_quic::{NodeAddr, NodeId};
 
-use super::dialer::native_bootstrap_dial;
+use super::dialer::native_discovery_dial;
 use super::protocol::{ZakuraDiscoveryDialCandidate, ZakuraDiscoveryHandle};
 use super::redial::ZAKURA_REDIAL_HEALTHY_CONNECTION;
 use super::trace::DiscoveryDialResultEvent;
@@ -57,6 +57,8 @@ impl DiscoveryDialResult {
 struct DiscoveryDialWorkerResult {
     node_id: NodeId,
     reserved_ips: Vec<IpAddr>,
+    /// The IP whose handshake TLS authenticated, if this worker's dial got that far.
+    admitted_ip: Option<IpAddr>,
     result: DiscoveryDialResult,
 }
 
@@ -165,6 +167,7 @@ pub(crate) async fn run_native_discovery_dialer(
                             &mut dial_backoff_by_node_ip,
                             worker_result.node_id,
                             &worker_result.reserved_ips,
+                            worker_result.admitted_ip,
                             worker_result.result,
                             dial_backoff,
                             Instant::now(),
@@ -264,6 +267,7 @@ fn recover_discovery_dial_worker_panic(
         DiscoveryDialWorkerResult {
             node_id,
             reserved_ips,
+            admitted_ip: None,
             result: DiscoveryDialResult::Failed,
         }
     })
@@ -352,16 +356,20 @@ fn apply_discovery_ip_dial_result(
     dial_backoff_by_node_ip: &mut HashMap<(NodeId, IpAddr), DiscoveryIpBackoff>,
     node_id: NodeId,
     ips: &[IpAddr],
+    admitted_ip: Option<IpAddr>,
     result: DiscoveryDialResult,
     dial_backoff: (Duration, Duration),
     now: Instant,
 ) {
     match result {
+        // A signed record proves control of the node id, not of every address it
+        // advertises. Only the address that TLS authenticated earns a reset, so a
+        // record can't pair one live endpoint with decoys to clear their backoff.
         DiscoveryDialResult::Registered
         | DiscoveryDialResult::ConnectedElsewhere
         | DiscoveryDialResult::ShortLivedRegistered => {
-            for ip in ips {
-                dial_backoff_by_node_ip.remove(&(node_id, *ip));
+            if let Some(admitted_ip) = admitted_ip {
+                dial_backoff_by_node_ip.remove(&(node_id, canonical_ip(admitted_ip)));
             }
         }
         // The ALPN mismatch floor applies to the node, not to each address: an
@@ -407,6 +415,7 @@ async fn run_discovery_dial_once(
         return DiscoveryDialWorkerResult {
             node_id,
             reserved_ips,
+            admitted_ip: None,
             result: DiscoveryDialResult::Failed,
         };
     };
@@ -419,13 +428,15 @@ async fn run_discovery_dial_once(
         return DiscoveryDialWorkerResult {
             node_id,
             reserved_ips,
+            admitted_ip: None,
             result: DiscoveryDialResult::ConnectedElsewhere,
         };
     }
 
+    let (admitted_ip_tx, mut admitted_ip_rx) = tokio::sync::oneshot::channel();
     let dial = tokio::spawn({
         let endpoint = endpoint.clone();
-        async move { native_bootstrap_dial(&endpoint, node_addr, &limits).await }
+        async move { native_discovery_dial(&endpoint, node_addr, &limits, admitted_ip_tx).await }
     });
     tokio::pin!(dial);
 
@@ -479,6 +490,9 @@ async fn run_discovery_dial_once(
     DiscoveryDialWorkerResult {
         node_id,
         reserved_ips,
+        // The dial task sends the admitted IP before it registers the peer. An
+        // empty channel means this dial never authenticated the peer itself.
+        admitted_ip: admitted_ip_rx.try_recv().ok(),
         result,
     }
 }
@@ -619,6 +633,7 @@ mod tests {
             &mut backoff_by_node_ip,
             failing_node,
             &[ip],
+            None,
             DiscoveryDialResult::Failed,
             dial_backoff,
             now,
@@ -657,6 +672,7 @@ mod tests {
             &mut backoff_by_node_ip,
             failing_node,
             &[ip],
+            None,
             DiscoveryDialResult::Failed,
             dial_backoff,
             second_attempt,
@@ -678,6 +694,7 @@ mod tests {
             &mut backoff_by_node_ip,
             failing_node,
             &[ip],
+            Some(ip),
             DiscoveryDialResult::Registered,
             dial_backoff,
             second_attempt,
@@ -739,6 +756,7 @@ mod tests {
             &mut backoff_by_node_ip,
             node,
             &ips,
+            None,
             DiscoveryDialResult::AlpnMismatch,
             (Duration::from_secs(60), Duration::from_secs(3_600)),
             now,
@@ -758,5 +776,75 @@ mod tests {
                 now + Duration::from_secs(60)
             ));
         }
+    }
+
+    // V12 F-58: a record can pair one live endpoint with decoy addresses. A
+    // success through the live endpoint must not reset the decoys' backoff.
+    #[test]
+    fn success_clears_backoff_only_for_the_admitted_ip() {
+        let node = node_id(1);
+        let admitted = IpAddr::from([93, 184, 216, 34]);
+        let decoy = IpAddr::from([198, 51, 100, 7]);
+        let mapped_admitted: IpAddr = "::ffff:93.184.216.34"
+            .parse()
+            .expect("mapped test address parses");
+        let now = Instant::now();
+        let dial_backoff = (Duration::from_secs(60), Duration::from_secs(3_600));
+        let mut backoff_by_node_ip = HashMap::new();
+
+        apply_discovery_ip_dial_result(
+            &mut backoff_by_node_ip,
+            node,
+            &[admitted, decoy],
+            None,
+            DiscoveryDialResult::Failed,
+            dial_backoff,
+            now,
+        );
+        for result in [
+            DiscoveryDialResult::Registered,
+            DiscoveryDialResult::ConnectedElsewhere,
+            DiscoveryDialResult::ShortLivedRegistered,
+        ] {
+            apply_discovery_ip_dial_result(
+                &mut backoff_by_node_ip,
+                node,
+                &[admitted, decoy],
+                Some(mapped_admitted),
+                result,
+                dial_backoff,
+                now,
+            );
+            assert!(!discovery_ip_is_in_backoff(
+                &backoff_by_node_ip,
+                node,
+                admitted,
+                now
+            ));
+            assert_eq!(
+                backoff_by_node_ip
+                    .get(&(node, decoy))
+                    .map(|backoff| backoff.failure_count),
+                Some(1),
+                "{result:?} must keep the decoy's failure metadata"
+            );
+        }
+
+        // A success this dial didn't authenticate itself resets nothing.
+        apply_discovery_ip_dial_result(
+            &mut backoff_by_node_ip,
+            node,
+            &[decoy],
+            None,
+            DiscoveryDialResult::ConnectedElsewhere,
+            dial_backoff,
+            now,
+        );
+        assert!(discovery_ip_is_in_backoff(
+            &backoff_by_node_ip,
+            node,
+            decoy,
+            now
+        ));
     }
 }

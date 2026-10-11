@@ -732,4 +732,73 @@ mod tests {
         node.shutdown().await;
         peer1.shutdown().await;
     }
+
+    // V12 F-58: the discovery dialer clears backoff only for the address whose
+    // handshake won. The dial must report that address, not the decoy, in
+    // either address order, and must report it before the peer registers.
+    #[tokio::test]
+    async fn outbound_dial_reports_the_admitted_ip_before_registration() {
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+        use crate::zakura::handler::serve_native_dial_connection_reporting_admitted_ip;
+
+        let peer = ZakuraTestNode::builder(9205)
+            .spawn()
+            .await
+            .expect("peer spawns");
+        let peer_loopback = ipv4_loopback_addr(&peer.node_addr().await);
+        let peer_id = peer_loopback.id.as_bytes().to_vec();
+        // RFC 6598 shared address space is not routable.
+        let decoy = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 1)), 1);
+        let decoy_first = NodeAddr::with_addrs(
+            peer_loopback.id,
+            std::iter::once(decoy).chain(peer_loopback.direct.iter().copied()),
+        );
+        let decoy_last = NodeAddr::with_addrs(
+            peer_loopback.id,
+            peer_loopback
+                .direct
+                .iter()
+                .copied()
+                .chain(std::iter::once(decoy)),
+        );
+
+        // Each order uses its own dialer, because the peer stays registered.
+        for (seed, peer_addr) in [(9207, decoy_first), (9209, decoy_last)] {
+            let node = ZakuraTestNode::builder(seed)
+                .spawn()
+                .await
+                .expect("dialer spawns");
+            let mut peer_set_rx = node.supervisor().subscribe();
+            let (admitted_ip_tx, mut admitted_ip_rx) = tokio::sync::oneshot::channel();
+            let endpoint = node.endpoint();
+            let limits = node.limits().clone();
+            let dial = tokio::spawn(async move {
+                serve_native_dial_connection_reporting_admitted_ip(
+                    &endpoint,
+                    peer_addr,
+                    &limits,
+                    Some(admitted_ip_tx),
+                )
+                .await
+            });
+
+            tokio::time::timeout(
+                TEST_NET_TIMEOUT,
+                wait_for_peer_registration(&mut peer_set_rx, peer_id.as_slice()),
+            )
+            .await
+            .expect("peer registers before the timeout")
+            .expect("peer-set watcher stays open");
+            assert_eq!(
+                admitted_ip_rx.try_recv().ok(),
+                Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+                "dialer {seed} reports the loopback path its handshake won, before registration",
+            );
+
+            dial.abort();
+            node.shutdown().await;
+        }
+        peer.shutdown().await;
+    }
 }

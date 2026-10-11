@@ -4232,6 +4232,19 @@ pub(crate) async fn serve_native_dial_connection(
     node_addr: NodeAddr,
     limits: &ZakuraLocalLimits,
 ) -> Result<(), ZakuraHandlerError> {
+    serve_native_dial_connection_reporting_admitted_ip(endpoint, node_addr, limits, None).await
+}
+
+/// Dials `node_addr` and serves the connection, like [`serve_native_dial_connection`].
+///
+/// Sends the admitted IP on `admitted_ip` once TLS authenticates the remote node at
+/// one of the dialed addresses, before the control handshake starts.
+pub(crate) async fn serve_native_dial_connection_reporting_admitted_ip(
+    endpoint: &ZakuraEndpoint,
+    node_addr: NodeAddr,
+    limits: &ZakuraLocalLimits,
+    admitted_ip: Option<oneshot::Sender<IpAddr>>,
+) -> Result<(), ZakuraHandlerError> {
     let _admission = endpoint
         .handler
         .admission
@@ -4248,6 +4261,10 @@ pub(crate) async fn serve_native_dial_connection(
     let connection = timeout(dial_timeout, endpoint.quic.connect(node_addr, &offered))
         .await
         .map_err(|_| ZakuraHandlerError::Timeout("native dial"))??;
+    if let Some(admitted_ip) = admitted_ip {
+        // The receiver is gone when the caller stopped waiting for the result.
+        let _ = admitted_ip.send(connection.admitted_ip());
+    }
     let remote_node_id = connection.remote_id();
     let peer_id = ZakuraPeerId::new(remote_node_id.as_bytes().to_vec())?;
     let conn = ZakuraConnTrace::new(

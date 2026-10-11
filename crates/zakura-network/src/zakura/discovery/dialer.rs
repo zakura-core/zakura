@@ -87,6 +87,22 @@ pub(crate) async fn native_bootstrap_dial(
     crate::zakura::handler::serve_native_dial_connection(endpoint, node_addr, limits).await
 }
 
+/// Dials a discovery candidate and reports the IP whose handshake TLS authenticated.
+pub(crate) async fn native_discovery_dial(
+    endpoint: &ZakuraEndpoint,
+    node_addr: NodeAddr,
+    limits: &ZakuraLocalLimits,
+    admitted_ip: tokio::sync::oneshot::Sender<std::net::IpAddr>,
+) -> Result<(), ZakuraHandlerError> {
+    crate::zakura::handler::serve_native_dial_connection_reporting_admitted_ip(
+        endpoint,
+        node_addr,
+        limits,
+        Some(admitted_ip),
+    )
+    .await
+}
+
 pub(crate) fn parse_bootstrap_peer(entry: &str) -> Result<NodeAddr, ZakuraHandlerError> {
     let Some((node_id, direct_addr)) = entry.split_once('@') else {
         return Err(ZakuraHandlerError::InvalidBootstrapPeer);

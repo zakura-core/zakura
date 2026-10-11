@@ -366,6 +366,10 @@ work. Stage 2 runs after TLS proves the `NodeId` and is today's Zakura logic.
   - `ServerConfig::max_incoming` to `max_incoming`;
   - `incoming_buffer_size` to `incoming_buffer_bytes`;
   - `incoming_buffer_size_total` to `incoming_buffer_total_bytes`.
+  Each bound socket has its own `quinn-proto` endpoint, so these three limits
+  apply per socket, and a node bound to IPv4 and IPv6 gets twice the
+  allowance (V12 F-59). The pending-handshake, per-IP and connection caps
+  stay global across sockets.
 - **ADM-6.** When `handshake_timeout_secs` is set, every accepted handshake MUST
   finish within it. On expiry, the endpoint MUST drop the connecting attempt,
   which closes the connection, and count `zakura.quic.handshake.timed_out`.
@@ -453,7 +457,7 @@ Rules for every key:
 | CTRL-22 | `retry_threshold` | optional u32 | 8 | 0 – CTRL-18 | endpoint (ADM-3); 0 = always Retry unvalidated sources; CTRL-18 = never | **New**. Iroh never sent Retry. With 8, spoofed sources hold at most 8 of the `max_pending_handshakes` slots, and honest peers pay one extra round trip only while 8 handshakes are pending. |
 | CTRL-23 | `dial_stagger_ms` | u32 | 250 | 0 – 5,000 | dialer (DIAL-3) | **New** |
 | CTRL-24 | `kernel_drop_poll_secs` | u32 | 10 | 1 – 300 | SOCK-7 | **New**, Linux only |
-| CTRL-25 | `qlog_dir` | optional path | unset | — | `qlog_stream`, one file per connection | Only with the `qlog` cargo feature; startup MUST fail if set without it |
+| CTRL-25 | `qlog_dir` | optional path | unset | — | `qlog_stream`, one file per connection | Only with the `qlog` cargo feature; startup MUST fail if set without it. Every admitted attempt gets a file, including one that fails before TLS, and the node never deletes them, so set it only while debugging (V12 F-64) |
 
 These keys stay in `[network.zakura]` and keep their meaning:
 `listen_addr`, `max_connections` (256), `max_connections_per_ip` (16),

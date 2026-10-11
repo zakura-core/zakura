@@ -2267,6 +2267,10 @@ impl ZakuraRequestClient {
             )),
             _ => None,
         };
+        let requested_block_hashes = match &requested {
+            Some(RequestedInventory::Blocks(hashes)) => Some(hashes),
+            _ => None,
+        };
         let frame = frame.encode_frame()?;
         self.trace.emit_event(|| {
             LegacyRequestStart::new(

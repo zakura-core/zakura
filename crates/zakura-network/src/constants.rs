@@ -8,7 +8,6 @@
 use std::{collections::HashMap, time::Duration};
 
 use lazy_static::lazy_static;
-use regex::Regex;
 
 // TODO: should these constants be split into protocol also?
 use crate::protocol::external::types::*;
@@ -438,14 +437,6 @@ lazy_static! {
 
         hash_map
     };
-
-    /// OS-specific error when the port attempting to be opened is already in use.
-    pub static ref PORT_IN_USE_ERROR: Regex = if cfg!(unix) {
-        #[allow(clippy::trivial_regex)]
-        Regex::new(&regex::escape("already in use"))
-    } else {
-        Regex::new("(access a socket in a way forbidden by its access permissions)|(Only one usage of each socket address)")
-    }.expect("regex is valid");
 }
 
 /// The timeout for DNS lookups.

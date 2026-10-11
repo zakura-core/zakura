@@ -2255,6 +2255,17 @@ impl ZakuraRequestClient {
         request_kind: LegacyRequestKind,
     ) -> Result<Response, BoxError> {
         self.wait_for_request_slot().await;
+        // Fallbacks and source-missing retries retain handles across waits. A concurrent
+        // download may have rejected this supplier since the initial ready-peer snapshot.
+        if let LegacyRequestFrame::BlocksByHash(hashes) = &frame {
+            let source = PeerSource::Zakura(handle.peer_id().clone());
+            if hashes
+                .iter()
+                .any(|hash| self.block_suppliers.rejected(*hash, &source))
+            {
+                return Err("Zakura block supplier was rejected before request dispatch".into());
+            }
+        }
         let request_id = NEXT_LEGACY_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
         // Capture the requested inventory (if any) before consuming the frame,
         // so the response can be bound to IDs we actually asked for.
@@ -4105,6 +4116,70 @@ mod tests {
         victim.shutdown().await;
         node_a.shutdown().await;
         node_b.shutdown().await;
+        Ok(())
+    }
+
+    /// F-281613: a saved handle must observe rejection published while its send is delayed.
+    #[tokio::test]
+    async fn saved_supplier_is_rechecked_after_request_waits() -> Result<(), BoxError> {
+        let _guard = zakura_test::init();
+        let (supplier, mut requests) = recording_inventory_node(171, None).await?;
+        let victim = ZakuraTestNode::builder(172).spawn().await?;
+        victim.connect_native(&supplier, TEST_NET_TIMEOUT).await?;
+        let source = PeerSource::Zakura(node_peer_id(&supplier).await?);
+        let client = ZakuraRequestClient::new(victim.supervisor());
+        let handle = client.ready_handles().await?.remove(0);
+
+        for (hash, retry_missing) in [(block_hash(91), false), (block_hash(92), true)] {
+            let mut slot = client.next_request_at.lock().await;
+            *slot = Instant::now() + Duration::from_millis(25);
+            let frame = LegacyRequestFrame::BlocksByHash(vec![hash]);
+            let request = if retry_missing {
+                client
+                    .retry_source_missing(
+                        handle.clone(),
+                        frame,
+                        LegacyRequestKind::Blocks,
+                        Response::Blocks(vec![InventoryResponse::Missing(hash)]),
+                    )
+                    .boxed()
+            } else {
+                client
+                    .request_one(handle.clone(), frame, LegacyRequestKind::Blocks)
+                    .boxed()
+            };
+            tokio::pin!(request);
+            assert!(futures::poll!(&mut request).is_pending());
+            client
+                .block_suppliers
+                .feedback(hash, source.clone())
+                .reject();
+            drop(slot);
+            let error = timeout(TEST_NET_TIMEOUT, request)
+                .await?
+                .expect_err("a rejected saved supplier cannot receive another request");
+            assert!(error.to_string().contains("rejected"), "{error}");
+            assert!(
+                requests.try_recv().is_err(),
+                "no inventory request was dispatched"
+            );
+        }
+
+        // Rejection is scoped to the requested hash, not a peer-wide ban.
+        let response = client
+            .request_one(
+                handle,
+                LegacyRequestFrame::BlocksByHash(vec![block_hash(93)]),
+                LegacyRequestKind::Blocks,
+            )
+            .await?;
+        assert!(all_inventory_missing(&response));
+        assert!(matches!(
+            recv_request(&mut requests).await?,
+            Request::BlocksByHash(_)
+        ));
+        victim.shutdown().await;
+        supplier.shutdown().await;
         Ok(())
     }
 

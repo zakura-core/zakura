@@ -17,6 +17,7 @@ use std::{
 
 use futures::{
     future::{FutureExt, TryFutureExt},
+    task::AtomicWaker,
     Stream,
 };
 use tokio::sync::oneshot::{self, error::TryRecvError};
@@ -102,6 +103,80 @@ type SemanticBlockVerifier = Buffer<
 >;
 type GossipedBlockDownloads =
     BlockDownloads<Timeout<BlockDownloadPeerSet>, Timeout<SemanticBlockVerifier>, State>;
+
+/// Drives bounded gossip downloads even when the inbound service has no requests.
+pub struct GossipedBlockDownloadDriver {
+    downloads: Arc<Mutex<Pin<Box<GossipedBlockDownloads>>>>,
+    admission_waker: Arc<AtomicWaker>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl GossipedBlockDownloadDriver {
+    fn new(
+        downloads: Pin<Box<GossipedBlockDownloads>>,
+        misbehavior_sender: tokio::sync::mpsc::Sender<(PeerSocketAddr, u32)>,
+    ) -> Self {
+        let downloads = Arc::new(Mutex::new(downloads));
+        let admission_waker = Arc::new(AtomicWaker::new());
+        let task_downloads = downloads.clone();
+        let task_waker = admission_waker.clone();
+        let task = tokio::spawn(futures::future::poll_fn(move |cx| {
+            // Register before inspecting the queue so admission cannot lose a wakeup.
+            task_waker.register(cx.waker());
+            let mut downloads = task_downloads
+                .lock()
+                .expect("download driver holds no lock across asynchronous work");
+            // Bound work per poll even when replacement downloads finish immediately.
+            for _ in 0..downloads::MAX_INBOUND_CONCURRENCY {
+                let Poll::Ready(Some(result)) = downloads.as_mut().poll_next(cx) else {
+                    return Poll::<()>::Pending;
+                };
+                let Err((err, advertiser_addr)) = result else {
+                    continue;
+                };
+
+                // The rejected body occupied the dedupe slot while honest advertisements
+                // were ignored. Preserve scoring and bounded recovery together.
+                if let Some(mismatch) = err.downcast_ref::<GossipedUnboundHeight>() {
+                    if let Some(advertiser_addr) = advertiser_addr {
+                        let _ = misbehavior_sender
+                            .try_send((advertiser_addr, zn::constants::MAX_PEER_MISBEHAVIOR_SCORE));
+                    }
+
+                    // The outcome, including a replacement refused by the queue bounds, is
+                    // logged by `retry_poisoned` itself.
+                    let _ = downloads.retry_poisoned(mismatch.hash);
+                    continue;
+                }
+
+                if let Some(update) = block_misbehavior(err, advertiser_addr) {
+                    let _ = misbehavior_sender.try_send(update);
+                }
+            }
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        }));
+        Self {
+            downloads,
+            admission_waker,
+            task,
+        }
+    }
+
+    fn download_and_verify(&self, hash: block::Hash, source: Option<zn::PeerSource>) {
+        self.downloads
+            .lock()
+            .expect("download admission holds no lock across asynchronous work")
+            .download_and_verify(hash, source);
+        self.admission_waker.wake();
+    }
+}
+
+impl Drop for GossipedBlockDownloadDriver {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
 
 /// Returns the misbehavior update for a failed gossiped block download, if the advertising peer
 /// is known and the error is worth scoring.
@@ -303,8 +378,8 @@ pub enum Setup {
         /// after [`CACHED_ADDRS_REFRESH_INTERVAL`](cached_peer_addr_response::CACHED_ADDRS_REFRESH_INTERVAL).
         cached_peer_addr_response: CachedPeerAddrResponse,
 
-        /// A `futures::Stream` that downloads and verifies gossiped blocks.
-        block_downloads: Pin<Box<GossipedBlockDownloads>>,
+        /// An owned task that downloads, verifies, and retries gossiped blocks.
+        block_downloads: GossipedBlockDownloadDriver,
 
         /// A service that manages transactions in the memory pool.
         mempool: Mempool,
@@ -476,6 +551,10 @@ impl Service<zn::Request> for Inbound {
                         network,
                     ));
 
+                    let block_downloads = GossipedBlockDownloadDriver::new(
+                        block_downloads,
+                        misbehavior_sender.clone(),
+                    );
                     result = Ok(());
                     Setup::Initialized {
                         cached_peer_addr_response,
@@ -520,45 +599,10 @@ impl Service<zn::Request> for Inbound {
                 state,
                 misbehavior_sender,
             } => {
-                // # Correctness
-                //
-                // Clear the stream but ignore the final Pending return value.
-                // If we returned Pending here, and there were no waiting block downloads,
-                // then inbound requests would wait for the next block download, and hang forever.
-                while let Poll::Ready(Some(result)) = block_downloads.as_mut().poll_next(cx) {
-                    let Err((err, advertiser_addr)) = result else {
-                        continue;
-                    };
-
-                    // A rewritten coinbase height on a tip child is rejected before the block
-                    // reaches the verifier, so it is never a `RouterError` or a
-                    // `VerifyBlockError` and `block_misbehavior` cannot classify it. It is also
-                    // the one rejection that must re-request the block: the poisoned response
-                    // held the per-hash dedupe slot while it was outstanding, so honest peers'
-                    // `inv`s for the same hash were already dropped as `AlreadyQueued`. Without
-                    // the re-request the block waits for the syncer's next round, which is the
-                    // delay the attack is trying to cause.
-                    //
-                    // Scoring and re-requesting are kept together here rather than split across
-                    // `block_misbehavior`, because the re-request needs `block_downloads` and
-                    // the two decisions are the same decision.
-                    if let Some(mismatch) = err.downcast_ref::<GossipedUnboundHeight>() {
-                        if let Some(advertiser_addr) = advertiser_addr {
-                            let _ = misbehavior_sender.try_send((
-                                advertiser_addr,
-                                zn::constants::MAX_PEER_MISBEHAVIOR_SCORE,
-                            ));
-                        }
-
-                        // The outcome, including a replacement refused by the queue bounds, is
-                        // logged by `retry_poisoned` itself.
-                        let _ = block_downloads.retry_poisoned(mismatch.hash);
-                        continue;
-                    }
-
-                    if let Some(update) = block_misbehavior(err, advertiser_addr) {
-                        let _ = misbehavior_sender.try_send(update);
-                    }
+                // The owned task drains completions independently of readiness requests.
+                if let Poll::Ready(result) = Pin::new(&mut block_downloads.task).poll(cx) {
+                    result.expect("gossip completion task must not panic");
+                    unreachable!("gossip completion task runs until its owner is dropped");
                 }
 
                 result = Ok(());

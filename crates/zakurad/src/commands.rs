@@ -6,6 +6,8 @@ use std::path::PathBuf;
 
 use abscissa_core::{config::Override, Command, Configurable, FrameworkError, Runnable};
 
+use zakura_chain::common::preference_dir;
+
 use crate::config::ZakuradConfig;
 
 pub use self::{entry_point::EntryPoint, start::StartCmd};
@@ -159,7 +161,7 @@ impl Configurable<ZakuradConfig> for ZakuradCmd {
     fn config_path(&self) -> Option<PathBuf> {
         let if_exists = |f: PathBuf| if f.exists() { Some(f) } else { None };
 
-        dirs::preference_dir().and_then(|path| {
+        preference_dir().and_then(|path| {
             let config_path = path.join(CONFIG_FILE);
             if let Some(config_path) = if_exists(config_path) {
                 return Some(config_path);

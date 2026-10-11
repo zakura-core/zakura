@@ -90,11 +90,13 @@ See `install-zakura.sh --help` for the full list, including `--dry-run`.
 ## The sidecar zcashd build
 
 Use the sidecar `zcashd` build from
-[valargroup/zcashd](https://github.com/valargroup/zcashd). The installer and
-Zakura's embedded download both pin its release archives by SHA256. The
+[valargroup/zcashd](https://github.com/valargroup/zcashd). Zakura's embedded
+download pins the [v1.2.0 release](https://github.com/valargroup/zcashd/releases/tag/v1.2.0)'s
+standalone `zcashd` executable by SHA256. The
 split-container mode uses the
-[zakuracore/zcashd v1.1.0 image](https://hub.docker.com/r/zakuracore/zcashd/tags).
-It differs from stock `zcash/zcash` in three ways:
+[zakuracore/zcashd v1.2.0 image](https://hub.docker.com/r/zakuracore/zcashd/tags).
+Sidecars before v1.2.0 do not support NU7, so they stop following the chain
+when NU7 activates. The build differs from stock `zcash/zcash` in three ways:
 
 1. **P2P sidecar mode is hard-locked.** The binary refuses to start unless
    exactly one `-connect=<zakura-address>` peer is configured. It never opens a
@@ -159,6 +161,16 @@ zcashd_extra_args = ["-rpcbind=127.0.0.1", "-rpcallowip=127.0.0.1"]
 (`zcashd_source = "embedded"` downloads the SHA256-pinned sidecar build from
 Zakura's embedded release manifest; use `zcashd_source = "path"` plus
 `zcashd_path` to run a binary you provide.)
+
+The embedded download is available on Linux x86_64 only. Zakura caches the
+executable at
+`<state.cache_dir>/zcashd-compat/bin/<release tag>/x86_64-pc-linux-gnu/zcashd`
+and hashes it on every start. It reuses a cached executable whose contents
+match the pinned SHA256 without network access. It downloads the executable
+again if the cached one is missing or has different contents, so the cache
+directory must be writable to repair it. A download replaces the cached
+executable only after its SHA256 matches. Zakura ignores `zcashd.sha256` files
+left by older versions.
 
 On start, Zakura:
 

@@ -1,6 +1,6 @@
 use super::*;
 use crate::zakura::testkit::LocalEndpointFactory;
-use crate::zakura::{MessageRole, PayloadLen, StreamQueueDepths};
+use crate::zakura::{MessageRole, PayloadLen, StreamQueueDepths, P2P_V2_ALPN};
 use tokio_util::task::AbortOnDropHandle;
 
 const DATA: Stream = Stream {
@@ -539,7 +539,7 @@ async fn raw_connection() -> Result<(QuicEndpoint, QuicEndpoint, Connection, Con
     server.serve(RawConnection(accepted))?;
     let connection = timeout(
         TEST_TIMEOUT,
-        client.connect(LocalEndpointFactory::node_addr(&server).await, ALPN),
+        client.connect(LocalEndpointFactory::node_addr(&server).await, &[ALPN]),
     )
     .await??;
     let remote = timeout(TEST_TIMEOUT, connections.recv())

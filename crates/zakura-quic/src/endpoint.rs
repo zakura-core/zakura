@@ -371,9 +371,15 @@ impl QuicEndpoint {
         Ok(())
     }
 
-    /// Dials `addr` and negotiates `alpn` (SPEC §8).
-    pub async fn connect(&self, addr: NodeAddr, alpn: &[u8]) -> Result<Conn, ConnectError> {
+    /// Dials `addr`, offering `alpns` in preference order (SPEC §8). The
+    /// server picks one; [`Conn::alpn`] returns it. Offering several versions
+    /// of a protocol lets a node reach peers on older versions in one
+    /// handshake. An empty list fails with [`ConnectError::AlpnMismatch`].
+    pub async fn connect(&self, addr: NodeAddr, alpns: &[&[u8]]) -> Result<Conn, ConnectError> {
         let shared = &self.inner.shared;
+        if alpns.is_empty() {
+            return Err(ConnectError::AlpnMismatch);
+        }
         // DIAL-1.
         if addr.id == shared.id {
             return Err(ConnectError::SelfDial);
@@ -399,7 +405,7 @@ impl QuicEndpoint {
             return Err(ConnectError::NoUsableAddress);
         }
 
-        let crypto = Arc::new(shared.tls.client_config(addr.id, alpn)?);
+        let crypto = Arc::new(shared.tls.client_config(addr.id, alpns)?);
 
         // DIAL-3: one handshake per address, `dial_stagger` apart.
         let stagger = shared.config.dial_stagger();

@@ -147,7 +147,7 @@ fn stalled_handshake(server: &Server) -> StalledHandshake {
         None,
     );
     let tls = crate::tls::TlsConfig::new(&NodeSecretKey::generate())
-        .client_config(server.endpoint.local_id(), ALPN)
+        .client_config(server.endpoint.local_id(), &[ALPN])
         .unwrap();
     let now = std::time::Instant::now();
     let (_, mut conn) = endpoint
@@ -190,7 +190,7 @@ async fn dial_authenticates_both_sides_and_echoes() {
     tokio::time::timeout(TEST_TIMEOUT, async {
         let mut server = server();
         let client = client();
-        let conn = client.connect(server.addr(), ALPN).await.unwrap();
+        let conn = client.connect(server.addr(), &[ALPN]).await.unwrap();
         assert_eq!(conn.remote_id(), server.endpoint.local_id());
         assert_eq!(conn.alpn(), ALPN);
         assert_eq!(conn.admitted_ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
@@ -217,7 +217,7 @@ async fn many_concurrent_streams_keep_their_data_apart() {
     tokio::time::timeout(TEST_TIMEOUT, async {
         let server = server();
         let client = client();
-        let conn = client.connect(server.addr(), ALPN).await.unwrap();
+        let conn = client.connect(server.addr(), &[ALPN]).await.unwrap();
         let echoes = (0..32u8).map(|i| {
             let conn = conn.clone();
             async move {
@@ -238,7 +238,7 @@ async fn cancelled_reads_lose_no_data() {
     tokio::time::timeout(TEST_TIMEOUT, async {
         let server = server();
         let client = client();
-        let conn = client.connect(server.addr(), ALPN).await.unwrap();
+        let conn = client.connect(server.addr(), &[ALPN]).await.unwrap();
         let (mut send, mut recv) = conn.open_bi().await.unwrap();
         send.write_all(b"hello").await.unwrap();
         // The echo replies only after the stream finishes, so this read
@@ -263,7 +263,7 @@ async fn cancelled_writes_keep_their_order() {
     tokio::time::timeout(TEST_TIMEOUT, async {
         let server = server();
         let client = client();
-        let conn = client.connect(server.addr(), ALPN).await.unwrap();
+        let conn = client.connect(server.addr(), &[ALPN]).await.unwrap();
         let (mut send, mut recv) = conn.open_bi().await.unwrap();
         // Far more than the flow-control windows, so the write blocks until
         // the echo reads.
@@ -285,7 +285,7 @@ async fn stream_errors_carry_the_peer_code() {
     tokio::time::timeout(TEST_TIMEOUT, async {
         let mut server = server();
         let client = client();
-        let conn = client.connect(server.addr(), ALPN).await.unwrap();
+        let conn = client.connect(server.addr(), &[ALPN]).await.unwrap();
         let (mut send, mut recv) = conn.open_bi().await.unwrap();
         send.write_all(b"x").await.unwrap();
         let inbound = server.handled.recv().await.unwrap();
@@ -308,7 +308,7 @@ async fn interface_change_notifies_connections_and_keeps_them() {
         let server = server();
         let client =
             QuicEndpoint::bind(NodeSecretKey::generate(), &wildcard(), &test_config()).unwrap();
-        let conn = client.connect(server.addr(), ALPN).await.unwrap();
+        let conn = client.connect(server.addr(), &[ALPN]).await.unwrap();
         assert_eq!(echo(&conn, b"before").await, b"before");
 
         let ips = Arc::new(Mutex::new(vec![IpAddr::from([192, 0, 2, 1])]));
@@ -344,7 +344,7 @@ async fn self_dial_is_refused_before_any_packet() {
     let client = client();
     let own = NodeAddr::with_addrs(client.local_id(), client.local_addrs());
     assert!(matches!(
-        client.connect(own, ALPN).await,
+        client.connect(own, &[ALPN]).await,
         Err(ConnectError::SelfDial)
     ));
 }
@@ -355,7 +355,7 @@ async fn dial_without_a_matching_family_fails_fast() {
     let client = client();
     let v6_only = NodeAddr::with_addrs(server.endpoint.local_id(), ["[::1]:8234".parse().unwrap()]);
     assert!(matches!(
-        client.connect(v6_only, ALPN).await,
+        client.connect(v6_only, &[ALPN]).await,
         Err(ConnectError::NoUsableAddress)
     ));
 }
@@ -370,7 +370,7 @@ async fn wrong_identity_is_refused() {
             server.endpoint.local_addrs(),
         );
         assert!(matches!(
-            client.connect(impostor, ALPN).await,
+            client.connect(impostor, &[ALPN]).await,
             Err(ConnectError::WrongIdentity)
         ));
     })
@@ -384,7 +384,7 @@ async fn alpn_mismatch_is_classified() {
         let server = server();
         let client = client();
         assert!(matches!(
-            client.connect(server.addr(), b"p2p-v2/2").await,
+            client.connect(server.addr(), &[b"p2p-v2/2"]).await,
             Err(ConnectError::AlpnMismatch)
         ));
     })
@@ -399,8 +399,30 @@ async fn server_prefers_its_own_alpn_order() {
             Admit::Accept
         });
         let client = client();
-        let conn = client.connect(server.addr(), b"a").await.unwrap();
-        assert_eq!(conn.alpn(), b"a");
+        // The client prefers `a`; the server's order wins.
+        let conn = client.connect(server.addr(), &[b"a", b"b"]).await.unwrap();
+        assert_eq!(conn.alpn(), b"b");
+    })
+    .await
+    .unwrap();
+}
+
+/// A node that offers a newer and an older protocol version reaches a peer
+/// that knows only the older one, in one handshake.
+#[tokio::test]
+async fn offering_several_alpns_reaches_an_older_peer() {
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        let server = server();
+        let client = client();
+        let conn = client
+            .connect(server.addr(), &[b"p2p-v2/4", ALPN])
+            .await
+            .unwrap();
+        assert_eq!(conn.alpn(), ALPN);
+        assert!(matches!(
+            client.connect(server.addr(), &[]).await,
+            Err(ConnectError::AlpnMismatch)
+        ));
     })
     .await
     .unwrap();
@@ -412,7 +434,7 @@ async fn refused_attempt_creates_no_connection() {
         let mut server = server_with(&test_config(), &loopback(), &[ALPN], |_| Admit::Refuse);
         let client = client();
         assert!(matches!(
-            client.connect(server.addr(), ALPN).await,
+            client.connect(server.addr(), &[ALPN]).await,
             Err(ConnectError::Refused)
         ));
         // SEC-3: the acceptor never saw a connection.
@@ -429,7 +451,7 @@ async fn ignored_attempt_times_out_on_the_dialer() {
         let mut server = server_with(&test_config(), &loopback(), &[ALPN], |_| Admit::Ignore);
         let client = client();
         assert!(matches!(
-            client.connect(server.addr(), ALPN).await,
+            client.connect(server.addr(), &[ALPN]).await,
             Err(ConnectError::HandshakeTimeout)
         ));
         assert!(server.handled.try_recv().is_err());
@@ -447,7 +469,7 @@ async fn retry_threshold_validates_before_accepting() {
         };
         let mut server = server_with(&config, &loopback(), &[ALPN], |_| Admit::Accept);
         let client = client();
-        client.connect(server.addr(), ALPN).await.unwrap();
+        client.connect(server.addr(), &[ALPN]).await.unwrap();
         server.handled.recv().await.unwrap();
         let seen = server.seen.lock().unwrap().clone();
         assert_eq!(seen.len(), 2, "one Retry, then the validated attempt");
@@ -484,7 +506,7 @@ async fn spoofed_handshakes_cannot_fill_the_pending_budget() {
         assert_eq!(most_pending, Some(8));
 
         let client = client();
-        client.connect(server.addr(), ALPN).await.unwrap();
+        client.connect(server.addr(), &[ALPN]).await.unwrap();
         server.handled.recv().await.unwrap();
         assert!(server.seen.lock().unwrap().last().unwrap().validated);
         drop(stalled);
@@ -505,8 +527,8 @@ async fn max_pending_per_ip_refuses_concurrent_handshakes() {
         // succeeds, and any refusal is a clean `Refused`.
         let (a, b) = (client(), client());
         let (first, second) = tokio::join!(
-            a.connect(server.addr(), ALPN),
-            b.connect(server.addr(), ALPN)
+            a.connect(server.addr(), &[ALPN]),
+            b.connect(server.addr(), &[ALPN])
         );
         assert!(first.is_ok() || second.is_ok());
         for result in [first, second] {
@@ -530,7 +552,7 @@ async fn stalled_handshake_releases_its_pending_slot() {
         // ADM-6/ADM-7: the 3 s deadline frees the slot. A later attempt sees none pending.
         tokio::time::sleep(Duration::from_secs(4)).await;
         let client = client();
-        client.connect(server.addr(), ALPN).await.unwrap();
+        client.connect(server.addr(), &[ALPN]).await.unwrap();
         let seen = server.seen.lock().unwrap().clone();
         assert_eq!(seen.last().unwrap().pending_total, 0);
     })
@@ -556,7 +578,7 @@ async fn happy_eyeballs_skips_a_black_hole() {
         let conn = client
             .connect(
                 NodeAddr::with_addrs(server.endpoint.local_id(), direct),
-                ALPN,
+                &[ALPN],
             )
             .await
             .unwrap();
@@ -623,7 +645,7 @@ async fn migration_to_a_banned_ip_closes_the_connection() {
         let conn = client
             .connect(
                 NodeAddr::with_addrs(server.endpoint.local_id(), [relay.addr]),
-                ALPN,
+                &[ALPN],
             )
             .await
             .unwrap();
@@ -669,7 +691,7 @@ async fn ban_after_migration_closes_at_the_next_sample() {
         let conn = client
             .connect(
                 NodeAddr::with_addrs(server.endpoint.local_id(), [relay.addr]),
-                ALPN,
+                &[ALPN],
             )
             .await
             .unwrap();
@@ -707,7 +729,7 @@ async fn migration_to_an_allowed_ip_keeps_the_connection() {
         let conn = client
             .connect(
                 NodeAddr::with_addrs(server.endpoint.local_id(), [relay.addr]),
-                ALPN,
+                &[ALPN],
             )
             .await
             .unwrap();
@@ -730,7 +752,7 @@ async fn shutdown_closes_connections_within_the_bound() {
     tokio::time::timeout(TEST_TIMEOUT, async {
         let mut server = server();
         let client = client();
-        let conn = client.connect(server.addr(), ALPN).await.unwrap();
+        let conn = client.connect(server.addr(), &[ALPN]).await.unwrap();
         let _inbound = server.handled.recv().await.unwrap();
         let started = std::time::Instant::now();
         server.endpoint.shutdown().await;
@@ -743,7 +765,7 @@ async fn shutdown_closes_connections_within_the_bound() {
         // A shut-down endpoint dials nothing.
         assert!(server
             .endpoint
-            .connect(NodeAddr::with_addrs(client.local_id(), client.local_addrs()), ALPN)
+            .connect(NodeAddr::with_addrs(client.local_id(), client.local_addrs()), &[ALPN])
             .await
             .is_err());
     })
@@ -759,7 +781,7 @@ async fn shutdown_releases_the_socket_while_handles_live() {
         let mut server = server();
         let port = server.endpoint.local_addrs()[0];
         let client = client();
-        let conn = client.connect(server.addr(), ALPN).await.unwrap();
+        let conn = client.connect(server.addr(), &[ALPN]).await.unwrap();
         let inbound = server.handled.recv().await.unwrap();
         let handle = server.endpoint.clone();
 
@@ -771,7 +793,7 @@ async fn shutdown_releases_the_socket_while_handles_live() {
         assert!(handle
             .connect(
                 NodeAddr::with_addrs(client.local_id(), client.local_addrs()),
-                ALPN
+                &[ALPN]
             )
             .await
             .is_err());
@@ -810,7 +832,7 @@ async fn dropping_the_last_handle_closes_connections_and_frees_the_port() {
         let mut server = server();
         let port = server.endpoint.local_addrs()[0];
         let client = client();
-        let conn = client.connect(server.addr(), ALPN).await.unwrap();
+        let conn = client.connect(server.addr(), &[ALPN]).await.unwrap();
         let inbound = server.handled.recv().await.unwrap();
 
         drop(server);
@@ -837,7 +859,7 @@ async fn dropping_the_last_conn_closes_the_connection() {
     tokio::time::timeout(TEST_TIMEOUT, async {
         let mut server = server();
         let client = client();
-        let conn = client.connect(server.addr(), ALPN).await.unwrap();
+        let conn = client.connect(server.addr(), &[ALPN]).await.unwrap();
         let inbound = server.handled.recv().await.unwrap();
         drop(conn);
         let reason = inbound.closed().await;
@@ -856,7 +878,7 @@ async fn stats_report_congestion_and_driver_counters() {
     tokio::time::timeout(TEST_TIMEOUT, async {
         let server = server();
         let client = client();
-        let conn = client.connect(server.addr(), ALPN).await.unwrap();
+        let conn = client.connect(server.addr(), &[ALPN]).await.unwrap();
         let payload = vec![3u8; 2 * 1024 * 1024];
         assert_eq!(echo(&conn, &payload).await, payload);
         let stats = conn.stats().await.expect("the connection is open");
@@ -986,7 +1008,7 @@ async fn socket_counters_track_received_datagrams() {
     tokio::time::timeout(Duration::from_secs(30), async {
         let server = server();
         let client = client();
-        let conn = client.connect(server.addr(), ALPN).await.unwrap();
+        let conn = client.connect(server.addr(), &[ALPN]).await.unwrap();
         assert_eq!(echo(&conn, &[5u8; 64 * 1024]).await, vec![5u8; 64 * 1024]);
         // The endpoint task flushes its counters every 10 s.
         loop {
@@ -1062,7 +1084,7 @@ async fn held_pair(max_bidi_streams: u32) -> (QuicEndpoint, QuicEndpoint, Conn, 
     server.serve(HoldAcceptor { handled }).unwrap();
     let client = client();
     let addr = NodeAddr::with_addrs(server.local_id(), server.local_addrs());
-    let conn = client.connect(addr, ALPN).await.unwrap();
+    let conn = client.connect(addr, &[ALPN]).await.unwrap();
     let inbound = inbound.recv().await.unwrap();
     (server, client, conn, inbound)
 }

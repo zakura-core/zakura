@@ -53,7 +53,7 @@ impl HostilePeer {
             .await?;
         let victim_addr = victim.node_addr().await;
 
-        let connection = endpoint.connect(victim_addr, P2P_V2_ALPN).await?;
+        let connection = endpoint.connect(victim_addr, &[P2P_V2_ALPN]).await?;
         let mut config = ZakuraHandshakeConfig::for_network(&Config::default().network);
         config.supported_capabilities = capabilities;
         let local_peer_id = ZakuraPeerId::new(endpoint.local_id().as_bytes().to_vec())?;
@@ -534,7 +534,7 @@ mod tests {
 
         let client = LocalEndpointFactory::new().endpoint(4041).await?;
 
-        let connection = client.connect(server_addr, TEST_ALPN).await?;
+        let connection = client.connect(server_addr, &[TEST_ALPN]).await?;
 
         let (_send, mut recv) = connection.accept_bi().await?;
 

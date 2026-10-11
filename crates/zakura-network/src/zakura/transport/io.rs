@@ -775,7 +775,7 @@ mod tests {
         let (accepted, mut incoming) = mpsc::channel(1);
         server.serve(AcceptConnection(accepted)).unwrap();
         let address = LocalEndpointFactory::node_addr(&server).await;
-        let connection = client.connect(address, ALPN).await.unwrap();
+        let connection = client.connect(address, &[ALPN]).await.unwrap();
         let remote = tokio::time::timeout(Duration::from_secs(5), incoming.recv())
             .await
             .unwrap()

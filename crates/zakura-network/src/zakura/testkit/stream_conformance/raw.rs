@@ -53,7 +53,7 @@ impl RawLayoutPeer {
             .endpoint(seed)
             .await?;
         let connection = within("connect", async {
-            Ok(endpoint.connect(victim, P2P_V2_ALPN).await?)
+            Ok(endpoint.connect(victim, &[P2P_V2_ALPN]).await?)
         })
         .await?;
         let mut config = ZakuraHandshakeConfig::for_network(&Network::Mainnet);

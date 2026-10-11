@@ -24,7 +24,7 @@ async fn bidirectional_transfers_exceed_flow_control_windows() -> Result<(), Box
         stream_tx,
     })?;
     let address = LocalEndpointFactory::node_addr(&server).await;
-    let connection = timeout(Duration::from_secs(10), client.connect(address, ALPN)).await??;
+    let connection = timeout(Duration::from_secs(10), client.connect(address, &[ALPN])).await??;
     let remote = timeout(Duration::from_secs(5), connection_rx.recv())
         .await?
         .unwrap();

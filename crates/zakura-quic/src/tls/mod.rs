@@ -72,11 +72,12 @@ impl TlsConfig {
         Ok(QuicServerConfig::try_from(crypto)?)
     }
 
-    /// Builds a client config that accepts only `expected` as the server (TLS-7).
+    /// Builds a client config that accepts only `expected` as the server
+    /// (TLS-7) and offers `alpns` in preference order.
     pub(crate) fn client_config(
         &self,
         expected: NodeId,
-        alpn: &[u8],
+        alpns: &[&[u8]],
     ) -> Result<QuicClientConfig, TlsConfigError> {
         let mut crypto = rustls::ClientConfig::builder_with_provider(self.provider.clone())
             .with_protocol_versions(verifier::PROTOCOL_VERSIONS)?
@@ -85,7 +86,7 @@ impl TlsConfig {
                 expected,
             )))
             .with_client_cert_resolver(self.cert_resolver.clone());
-        crypto.alpn_protocols = vec![alpn.to_vec()];
+        crypto.alpn_protocols = alpns.iter().map(|alpn| alpn.to_vec()).collect();
         crypto.enable_sni = false;
         crypto.enable_early_data = false;
         crypto.resumption = rustls::client::Resumption::disabled();

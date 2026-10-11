@@ -55,22 +55,22 @@ use crate::{peer_registry::PeerRegistry, BoxError, Config, MAX_TX_INV_IN_SENT_ME
 use crate::{
     protocol::external::InventoryHash,
     zakura::{
-        canonical_ip, spawn_block_sync_reactor, spawn_header_sync_reactor,
-        AuthenticatedPeerRegistration, BlockSyncAction, BlockSyncFrontiers, BlockSyncHandle,
-        BlockSyncService, BlockSyncStartup, BoxRunFuture, Clock, CloseCause, Frame, FrameFilter,
-        FrameRejection, FramedRecv, FramedSend, FullStateFrontiers, HeaderSyncPassthroughService,
-        HeaderSyncService, HeaderSyncStartup, InboundReader, MessageRule, Peer, RealClock, Service,
-        ServicePeerDirection, ServiceRegistry, ServiceStream, SessionDemand, SessionOpening,
-        SessionPolicy, SinkReject, Stream, StreamMode, StreamPrelude, StreamQueueDepths,
-        StreamWritePolicy, ZakuraAcceptedLimits, ZakuraBlockSyncConfig, ZakuraConnId,
-        ZakuraControlAck, ZakuraControlHello, ZakuraControlRole, ZakuraControlValidation,
-        ZakuraHandshakeConfig, ZakuraHandshakePath, ZakuraHeaderSyncConfig, ZakuraInitialLimits,
-        ZakuraLimits, ZakuraPeerId, ZakuraPeerSupervisor, ZakuraProtocolError, ZakuraRejectReason,
-        ZakuraServiceId, ZakuraUpgradeDialStart, CONTROL_ACK_MAGIC, CONTROL_HELLO_MAGIC,
-        CONTROL_VERSION, FRAME_HEADER_BYTES, MAX_CONTROL_PAYLOAD_BYTES, P2P_V2_ALPN,
+        canonical_ip, spawn_block_sync_reactor, spawn_header_sync_reactor, supported_p2p_v2_alpns,
+        zakura_protocol_for_alpn, AuthenticatedPeerRegistration, BlockSyncAction,
+        BlockSyncFrontiers, BlockSyncHandle, BlockSyncService, BlockSyncStartup, BoxRunFuture,
+        Clock, CloseCause, Frame, FrameFilter, FrameRejection, FramedRecv, FramedSend,
+        FullStateFrontiers, HeaderSyncPassthroughService, HeaderSyncService, HeaderSyncStartup,
+        InboundReader, MessageRule, Peer, RealClock, Service, ServicePeerDirection,
+        ServiceRegistry, ServiceStream, SessionDemand, SessionOpening, SessionPolicy, SinkReject,
+        Stream, StreamMode, StreamPrelude, StreamQueueDepths, StreamWritePolicy,
+        ZakuraAcceptedLimits, ZakuraBlockSyncConfig, ZakuraConnId, ZakuraControlAck,
+        ZakuraControlHello, ZakuraControlRole, ZakuraControlValidation, ZakuraHandshakeConfig,
+        ZakuraHandshakePath, ZakuraHeaderSyncConfig, ZakuraInitialLimits, ZakuraLimits,
+        ZakuraPeerId, ZakuraPeerSupervisor, ZakuraProtocolError, ZakuraRejectReason,
+        ZakuraServiceId, ZakuraUpgradeDialStart, ZakuraValidationError, CONTROL_ACK_MAGIC,
+        CONTROL_HELLO_MAGIC, CONTROL_VERSION, FRAME_HEADER_BYTES, MAX_CONTROL_PAYLOAD_BYTES,
         STREAM_PRELUDE_MAGIC, TRANSCRIPT_HASH_BYTES, ZAKURA_CAP_HEADER_SYNC,
-        ZAKURA_HEADER_SYNC_STREAM_VERSION, ZAKURA_PROTOCOL_VERSION_CURRENT,
-        ZAKURA_STREAM_BLOCK_SYNC, ZAKURA_STREAM_HEADER_SYNC,
+        ZAKURA_HEADER_SYNC_STREAM_VERSION, ZAKURA_STREAM_BLOCK_SYNC, ZAKURA_STREAM_HEADER_SYNC,
     },
 };
 
@@ -2443,7 +2443,7 @@ impl ZakuraProtocolHandler {
         let expected = ZakuraControlValidation {
             local: &handshake_config,
             authenticated_remote_id: remote_peer_id.as_bytes(),
-            selected_zakura_protocol: ZAKURA_PROTOCOL_VERSION_CURRENT,
+            selected_zakura_protocol: negotiated_zakura_protocol(connection)?,
             handshake_path: ZakuraHandshakePath::Native,
             remote_role: ZakuraControlRole::Initiator,
             initiator_upgrade_nonce: [0; 32],
@@ -3655,7 +3655,7 @@ impl Acceptor for ZakuraProtocolHandler {
     }
 
     fn alpns(&self) -> Vec<Vec<u8>> {
-        vec![P2P_V2_ALPN.to_vec()]
+        supported_p2p_v2_alpns()
     }
 
     fn handle(&self, connection: Connection) -> BoxFuture<'static, ()> {
@@ -4207,7 +4207,9 @@ pub(crate) async fn serve_native_dial_connection(
         node_addr.direct.len(),
         limits.control_timeout,
     );
-    let connection = timeout(dial_timeout, endpoint.quic.connect(node_addr, P2P_V2_ALPN))
+    let alpns = supported_p2p_v2_alpns();
+    let offered: Vec<&[u8]> = alpns.iter().map(Vec::as_slice).collect();
+    let connection = timeout(dial_timeout, endpoint.quic.connect(node_addr, &offered))
         .await
         .map_err(|_| ZakuraHandlerError::Timeout("native dial"))??;
     let remote_node_id = connection.remote_id();
@@ -4264,6 +4266,13 @@ pub(crate) async fn serve_native_dial_connection(
         .await
 }
 
+/// The protocol version the connection's ALPN selected (COMPAT-8). Both
+/// control hellos must name it.
+fn negotiated_zakura_protocol(connection: &Connection) -> Result<u16, ZakuraHandlerError> {
+    zakura_protocol_for_alpn(connection.alpn())
+        .ok_or(ZakuraValidationError::UnsupportedVersion("zakura protocol").into())
+}
+
 #[cfg(any(test, feature = "zakura-testkit"))]
 pub(crate) async fn run_native_initiator_handshake_without_trace(
     connection: &Connection,
@@ -4296,6 +4305,7 @@ async fn run_native_initiator_handshake(
         None,
         handshake_config.network_label(),
     );
+    let protocol = negotiated_zakura_protocol(connection)?;
     let (mut send, mut recv) = timeout(limits.control_timeout, connection.open_bi())
         .await
         .map_err(|_| ZakuraHandlerError::Timeout("open control stream"))??;
@@ -4305,7 +4315,7 @@ async fn run_native_initiator_handshake(
     let hello = ZakuraControlHello {
         magic: CONTROL_HELLO_MAGIC,
         control_version: CONTROL_VERSION,
-        selected_zakura_protocol: ZAKURA_PROTOCOL_VERSION_CURRENT,
+        selected_zakura_protocol: protocol,
         handshake_path: ZakuraHandshakePath::Native,
         role: ZakuraControlRole::Initiator,
         network_id: handshake_config.network_id,
@@ -4329,7 +4339,7 @@ async fn run_native_initiator_handshake(
     .await?;
     let ack = ZakuraControlAck::decode(&ack_bytes)?;
     ack.validate(
-        ZAKURA_PROTOCOL_VERSION_CURRENT,
+        protocol,
         local_nonce,
         ack.peer_nonce,
         &limits.initial_limits(),
@@ -6054,6 +6064,7 @@ mod tests {
     pub(super) mod connection;
     mod quic_progress;
     use super::*;
+    use crate::zakura::P2P_V2_ALPN;
     use crate::{
         protocol::internal::{InventoryResponse, Response},
         zakura::{
@@ -8526,7 +8537,8 @@ mod tests {
             .endpoint(53)
             .await?;
         let address = LocalEndpointFactory::node_addr(&server).await;
-        let connection = timeout(Duration::from_secs(10), client.connect(address, ALPN)).await??;
+        let connection =
+            timeout(Duration::from_secs(10), client.connect(address, &[ALPN])).await??;
         let (mut sender, mut receiver) = connection.open_bi().await?;
         let frame = Frame {
             message_type: 3,
@@ -8711,9 +8723,12 @@ mod tests {
             .await?;
         let server_addr = LocalEndpointFactory::node_addr(&server).await;
 
-        let client_conn = timeout(Duration::from_secs(10), client.connect(server_addr, ALPN))
-            .await
-            .expect("client connects to loopback capture endpoint")?;
+        let client_conn = timeout(
+            Duration::from_secs(10),
+            client.connect(server_addr, &[ALPN]),
+        )
+        .await
+        .expect("client connects to loopback capture endpoint")?;
         let server_conn = timeout(Duration::from_secs(10), conn_rx.recv())
             .await
             .expect("server connection is captured")
@@ -8894,9 +8909,12 @@ mod tests {
         let client = LocalEndpointFactory::new().endpoint(81).await?;
         let server_addr = LocalEndpointFactory::node_addr(&server).await;
 
-        let client_conn = timeout(Duration::from_secs(10), client.connect(server_addr, ALPN))
-            .await
-            .expect("client connects to loopback capture endpoint")?;
+        let client_conn = timeout(
+            Duration::from_secs(10),
+            client.connect(server_addr, &[ALPN]),
+        )
+        .await
+        .expect("client connects to loopback capture endpoint")?;
 
         let frame = Frame {
             message_type: 1,
@@ -9079,9 +9097,12 @@ mod tests {
         let client = LocalEndpointFactory::new().endpoint(75).await?;
         let server_addr = LocalEndpointFactory::node_addr(&server).await;
 
-        let client_conn = timeout(Duration::from_secs(10), client.connect(server_addr, ALPN))
-            .await
-            .expect("client connects to the ordered-message-cap endpoint")?;
+        let client_conn = timeout(
+            Duration::from_secs(10),
+            client.connect(server_addr, &[ALPN]),
+        )
+        .await
+        .expect("client connects to the ordered-message-cap endpoint")?;
         let (mut send, _recv) = timeout(Duration::from_secs(1), client_conn.open_bi())
             .await
             .expect("client opens an ordered stream")?;
@@ -9157,9 +9178,12 @@ mod tests {
         let client = LocalEndpointFactory::new().endpoint(71).await?;
         let server_addr = LocalEndpointFactory::node_addr(&server).await;
 
-        let client_conn = timeout(Duration::from_secs(10), client.connect(server_addr, ALPN))
-            .await
-            .expect("client connects to the control-hard-cap endpoint")?;
+        let client_conn = timeout(
+            Duration::from_secs(10),
+            client.connect(server_addr, &[ALPN]),
+        )
+        .await
+        .expect("client connects to the control-hard-cap endpoint")?;
 
         // A control length above the 16 KiB hard cap but below the 1 MiB frame
         // cap the production responder/initiator pass. The body is never sent: a
@@ -9387,7 +9411,7 @@ mod tests {
         for count in [22u32, 23, 64] {
             let connection = timeout(
                 Duration::from_secs(5),
-                client.connect(LocalEndpointFactory::node_addr(&server).await, ALPN),
+                client.connect(LocalEndpointFactory::node_addr(&server).await, &[ALPN]),
             )
             .await??;
             let (mut sender, _receiver) =
@@ -9480,7 +9504,7 @@ mod tests {
             let (client, server_addr) = (client.clone(), server_addr.clone());
             async move {
                 let connection =
-                    timeout(Duration::from_secs(5), client.connect(server_addr, ALPN)).await??;
+                    timeout(Duration::from_secs(5), client.connect(server_addr, &[ALPN])).await??;
                 let (mut send, _recv) =
                     timeout(Duration::from_secs(2), connection.open_bi()).await??;
                 let mut header = Vec::with_capacity(FRAME_HEADER_BYTES);
@@ -9731,7 +9755,7 @@ mod tests {
         for (message_type, flags, payload_len, frame_cap, expected) in cases {
             let connection = timeout(
                 Duration::from_secs(5),
-                client.connect(server_addr.clone(), ALPN),
+                client.connect(server_addr.clone(), &[ALPN]),
             )
             .await??;
             let (mut send, _recv) = timeout(Duration::from_secs(2), connection.open_bi()).await??;
@@ -9763,7 +9787,7 @@ mod tests {
 
         // Frames within their rows read normally, at both bounds.
         let connection =
-            timeout(Duration::from_secs(5), client.connect(server_addr, ALPN)).await??;
+            timeout(Duration::from_secs(5), client.connect(server_addr, &[ALPN])).await??;
         let (mut send, _recv) = timeout(Duration::from_secs(2), connection.open_bi()).await??;
         let frames = [
             Frame {
@@ -9880,7 +9904,7 @@ mod tests {
         // another.
         let conn_a = timeout(
             Duration::from_secs(10),
-            client.connect(server_addr.clone(), ALPN),
+            client.connect(server_addr.clone(), &[ALPN]),
         )
         .await
         .expect("client connects for the oversized streams")?;
@@ -9957,9 +9981,12 @@ mod tests {
 
         // Stream 3 (fresh connection): a frame within the message cap must still
         // round-trip with the inbound cap, so the clamp rejects nothing legitimate.
-        let conn_b = timeout(Duration::from_secs(10), client.connect(server_addr, ALPN))
-            .await
-            .expect("client connects for the in-cap stream")?;
+        let conn_b = timeout(
+            Duration::from_secs(10),
+            client.connect(server_addr, &[ALPN]),
+        )
+        .await
+        .expect("client connects for the in-cap stream")?;
         let valid_payload = vec![0x5au8; (MAX_MESSAGE_BYTES / 2) as usize];
         let mut valid_bytes =
             frame_header(u32::try_from(valid_payload.len()).expect("in-cap payload len fits u32"));
@@ -10020,9 +10047,12 @@ mod tests {
         let client = LocalEndpointFactory::new().endpoint(91).await?;
         let server_addr = LocalEndpointFactory::node_addr(&server).await;
 
-        let client_conn = timeout(Duration::from_secs(10), client.connect(server_addr, ALPN))
-            .await
-            .expect("client connects to the open-rate-churn endpoint")?;
+        let client_conn = timeout(
+            Duration::from_secs(10),
+            client.connect(server_addr, &[ALPN]),
+        )
+        .await
+        .expect("client connects to the open-rate-churn endpoint")?;
 
         // A well-formed prelude that names an unregistered stream kind. It parses
         // cleanly, so admission reaches the unknown-kind reject (a stream-only
@@ -10854,9 +10884,9 @@ mod tests {
             let second = LocalEndpointFactory::with_limits(&limits)
                 .endpoint(884)
                 .await?;
-            let first_conn = first.connect(server_addr.clone(), P2P_V2_ALPN).await?;
+            let first_conn = first.connect(server_addr.clone(), &[P2P_V2_ALPN]).await?;
             let first_accepted = accepted_rx.recv().await.expect("first accept is captured");
-            let second_conn = second.connect(server_addr.clone(), P2P_V2_ALPN).await?;
+            let second_conn = second.connect(server_addr.clone(), &[P2P_V2_ALPN]).await?;
             let second_accepted = accepted_rx.recv().await.expect("second accept is captured");
             let ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
             assert_eq!(first_accepted.admitted_ip(), ip);
@@ -10893,7 +10923,7 @@ mod tests {
             let third = LocalEndpointFactory::with_limits(&limits)
                 .endpoint(885)
                 .await?;
-            let third_conn = third.connect(server_addr.clone(), P2P_V2_ALPN).await?;
+            let third_conn = third.connect(server_addr.clone(), &[P2P_V2_ALPN]).await?;
             let third_peer = ZakuraPeerId::new(third.local_id().as_bytes().to_vec())?;
             run_native_initiator_handshake_without_trace(
                 &third_conn,
@@ -10909,11 +10939,24 @@ mod tests {
             let fourth = LocalEndpointFactory::with_limits(&limits)
                 .endpoint(886)
                 .await?;
-            let fourth_conn = fourth.connect(server_addr, P2P_V2_ALPN).await;
+            // A full IP with no handshake in flight still gets one QUIC
+            // handshake, in case it is a registered node redialing.
+            // Registration then rejects the new identity.
+            let fourth_peer = ZakuraPeerId::new(fourth.local_id().as_bytes().to_vec())?;
+            let rejected = match fourth.connect(server_addr, &[P2P_V2_ALPN]).await {
+                Ok(fourth_conn) => run_native_initiator_handshake_without_trace(
+                    &fourth_conn,
+                    &limits,
+                    &config,
+                    &fourth_peer,
+                )
+                .await
+                .is_err(),
+                Err(error) => matches!(error, zakura_quic::ConnectError::Refused),
+            };
             assert!(
-                matches!(fourth_conn, Err(zakura_quic::ConnectError::Refused)),
-                "a new identity from the same IP must be refused before the handshake at the IP \
-                 cap: {fourth_conn:?}"
+                rejected,
+                "a new identity from the same IP must be turned away at the IP cap"
             );
             assert_eq!(supervisor.registered_ids().await.len(), 2);
             fourth.shutdown().await;
@@ -11026,7 +11069,9 @@ mod tests {
                 .endpoint(seed)
                 .await?;
 
-            let connection = endpoint.connect(server_addr.clone(), P2P_V2_ALPN).await?;
+            let connection = endpoint
+                .connect(server_addr.clone(), &[P2P_V2_ALPN])
+                .await?;
             Ok((endpoint, connection))
         }
         async fn run_handshake(
@@ -11210,7 +11255,9 @@ mod tests {
             let endpoint = LocalEndpointFactory::with_limits(&limits)
                 .endpoint(seed)
                 .await?;
-            let connection = endpoint.connect(server_addr.clone(), P2P_V2_ALPN).await?;
+            let connection = endpoint
+                .connect(server_addr.clone(), &[P2P_V2_ALPN])
+                .await?;
             stalled.push((endpoint, connection));
         }
         let loopback: IpAddr = Ipv4Addr::LOCALHOST.into();
@@ -11227,7 +11274,7 @@ mod tests {
             .endpoint(893)
             .await?;
         let refused = matches!(
-            third.connect(server_addr.clone(), P2P_V2_ALPN).await,
+            third.connect(server_addr.clone(), &[P2P_V2_ALPN]).await,
             Err(zakura_quic::ConnectError::Refused)
         );
         assert!(

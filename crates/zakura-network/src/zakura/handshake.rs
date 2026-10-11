@@ -55,6 +55,40 @@ pub const CONTROL_VERSION: u16 = 1;
 /// The first Zakura wire protocol version.
 pub const ZAKURA_PROTOCOL_VERSION_1: u16 = 1;
 
+/// The oldest Zakura wire protocol version the native transport speaks.
+///
+/// A node offers one ALPN per version from [`ZAKURA_PROTOCOL_VERSION_CURRENT`]
+/// down to this one, and the negotiated ALPN selects the version. A release
+/// that adds version N+1 while it still speaks N keeps this at N, so the two
+/// cohorts keep connecting natively; a hard break raises it.
+pub const ZAKURA_PROTOCOL_VERSION_MIN_NATIVE: u16 = 3;
+
+/// Returns the ALPN that selects a native Zakura protocol version.
+pub fn p2p_v2_alpn(version: u16) -> Vec<u8> {
+    format!("p2p-v2/{version}").into_bytes()
+}
+
+/// Returns the native ALPNs this node speaks, newest first.
+pub fn supported_p2p_v2_alpns() -> Vec<Vec<u8>> {
+    (ZAKURA_PROTOCOL_VERSION_MIN_NATIVE..=ZAKURA_PROTOCOL_VERSION_CURRENT)
+        .rev()
+        .map(p2p_v2_alpn)
+        .collect()
+}
+
+/// Returns the protocol version a negotiated ALPN selects, if this node
+/// speaks it.
+pub fn zakura_protocol_for_alpn(alpn: &[u8]) -> Option<u16> {
+    let version = std::str::from_utf8(alpn.strip_prefix(b"p2p-v2/")?)
+        .ok()?
+        .parse()
+        .ok()?;
+    (p2p_v2_alpn(version) == alpn
+        && (ZAKURA_PROTOCOL_VERSION_MIN_NATIVE..=ZAKURA_PROTOCOL_VERSION_CURRENT)
+            .contains(&version))
+    .then_some(version)
+}
+
 /// The current Zakura wire protocol version, which [`P2P_V2_ALPN`] carries.
 ///
 /// The legacy upgrade prelude advertises it, so a node on another native
@@ -223,7 +257,7 @@ impl ZakuraHandshakeConfig {
     pub fn for_network(network: &Network) -> Self {
         Self {
             prelude_version: PRELUDE_VERSION,
-            zakura_protocol_min: ZAKURA_PROTOCOL_VERSION_CURRENT,
+            zakura_protocol_min: ZAKURA_PROTOCOL_VERSION_MIN_NATIVE,
             zakura_protocol_max: ZAKURA_PROTOCOL_VERSION_CURRENT,
             network_id: ZakuraNetworkId::from_network(network),
             chain_id: network.genesis_hash().0,
@@ -1959,8 +1993,21 @@ mod tests {
 
     #[test]
     fn alpn_carries_the_current_protocol_version() {
-        let expected = format!("p2p-v2/{ZAKURA_PROTOCOL_VERSION_CURRENT}");
-        assert_eq!(P2P_V2_ALPN, expected.as_bytes());
+        assert_eq!(P2P_V2_ALPN, p2p_v2_alpn(ZAKURA_PROTOCOL_VERSION_CURRENT));
+        assert_eq!(supported_p2p_v2_alpns()[0], P2P_V2_ALPN);
+        assert_eq!(
+            zakura_protocol_for_alpn(P2P_V2_ALPN),
+            Some(ZAKURA_PROTOCOL_VERSION_CURRENT)
+        );
+        for unsupported in [
+            &b"p2p-v2/2"[..],
+            b"p2p-v2/03",
+            b"p2p-v2/",
+            b"p2p-v2/99999999",
+            b"zakura-wallet/1",
+        ] {
+            assert_eq!(zakura_protocol_for_alpn(unsupported), None);
+        }
     }
 
     #[test]

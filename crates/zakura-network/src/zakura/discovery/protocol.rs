@@ -15,7 +15,7 @@ use thiserror::Error;
 use tokio::sync::{watch, Mutex};
 use zakura_chain::{
     block,
-    primitives::ed25519::{Signature, SigningKey, VerificationKey},
+    primitives::ed25519::{Signature, SigningKey},
 };
 use zakura_quic::{NodeAddr, NodeId, NodeSecretKey};
 
@@ -309,14 +309,16 @@ impl ZakuraNodeRecord {
     ) -> Result<(), DiscoveryRecordError> {
         validate_record_body_for_import(&self.body, context)?;
 
-        let verification_key = VerificationKey::try_from(&self.body.node_id.as_bytes()[..])
-            .map_err(|_| DiscoveryRecordError::MalformedNodeId)?;
         let body_bytes = self
             .body
             .encode_for_signature()
             .map_err(DiscoveryRecordError::Wire)?;
-        verification_key
-            .verify(&self.signature, &body_bytes)
+        // The TLS handshake verifies with the same strict policy. A key with a
+        // torsion component passes the cofactored equation alone, but it can
+        // never authenticate a dial, so its record is useless to the book.
+        self.body
+            .node_id
+            .verify_strict(&body_bytes, &self.signature.to_bytes())
             .map_err(|_| DiscoveryRecordError::InvalidSignature)
     }
 }
@@ -5516,6 +5518,82 @@ mod tests {
             mutated.verify(&context()),
             Err(DiscoveryRecordError::InvalidSignature)
         ));
+    }
+
+    /// F-61: a node id with a torsion component signs a record that the
+    /// cofactored equation accepts, but TLS can never authenticate that node id.
+    #[test]
+    fn record_from_mixed_order_node_id_is_rejected() {
+        use curve25519_dalek::{
+            constants::ED25519_BASEPOINT_POINT, edwards::CompressedEdwardsY, Scalar,
+        };
+        use sha2::{Digest as _, Sha512};
+        use zakura_chain::primitives::ed25519::VerificationKey;
+
+        /// A point of order 8.
+        const ORDER_8: [u8; 32] = [
+            0xc7, 0x17, 0x6a, 0x70, 0x3d, 0x4d, 0xd8, 0x4f, 0xba, 0x3c, 0x0b, 0x76, 0x0d, 0x10,
+            0x67, 0x0f, 0x2a, 0x20, 0x53, 0xfa, 0x2c, 0x39, 0xcc, 0xc6, 0x4e, 0xc7, 0xfd, 0x77,
+            0x92, 0xac, 0x03, 0x7a,
+        ];
+
+        // Derive the honest secret scalar `a` as RFC 8032 does.
+        let secret_key = NodeSecretKey::from_bytes(&[61; 32]);
+        let expanded = Sha512::digest(secret_key.to_bytes());
+        let mut a_bytes = [0u8; 32];
+        a_bytes.copy_from_slice(&expanded[..32]);
+        a_bytes[0] &= 248;
+        a_bytes[31] &= 127;
+        a_bytes[31] |= 64;
+        let a = Scalar::from_bytes_mod_order(a_bytes);
+
+        // The mixed-order key is A' = aB + T for a point T of order 8.
+        let torsion = CompressedEdwardsY(ORDER_8)
+            .decompress()
+            .expect("the order-8 constant is a curve point");
+        let mixed_bytes = (a * ED25519_BASEPOINT_POINT + torsion)
+            .compress()
+            .to_bytes();
+        let mixed = NodeId::from_bytes(&mixed_bytes).expect("a mixed-order key parses");
+
+        let honest =
+            ZakuraNodeRecord::sign(body(&secret_key), &secret_key).expect("test record signs");
+        let mut body = body(&secret_key);
+        body.node_id = mixed;
+        let message = body
+            .encode_for_signature()
+            .expect("test record body encodes");
+
+        // Sign with challenge H(R || A' || M). The cofactored equation
+        // multiplies T away, so the signature verifies under A'.
+        let r = Scalar::from_bytes_mod_order([3; 32]);
+        let r_point = (r * ED25519_BASEPOINT_POINT).compress().to_bytes();
+        let challenge: [u8; 64] = Sha512::new()
+            .chain_update(r_point)
+            .chain_update(mixed_bytes)
+            .chain_update(&message)
+            .finalize()
+            .into();
+        let s = r + Scalar::from_bytes_mod_order_wide(&challenge) * a;
+        let mut signature_bytes = [0u8; 64];
+        signature_bytes[..32].copy_from_slice(&r_point);
+        signature_bytes[32..].copy_from_slice(s.as_bytes());
+        let signature = Signature::from_bytes(&signature_bytes);
+
+        VerificationKey::try_from(mixed_bytes)
+            .expect("a mixed-order key is a valid cofactored verification key")
+            .verify(&signature, &message)
+            .expect("the cofactored equation accepts the mixed-order signature");
+
+        let record = ZakuraNodeRecord { body, signature };
+        assert!(matches!(
+            record.verify(&context()),
+            Err(DiscoveryRecordError::InvalidSignature)
+        ));
+
+        // Control: the same secret key signs a record for its honest node id,
+        // and that record verifies.
+        assert!(honest.verify(&context()).is_ok());
     }
 
     #[test]

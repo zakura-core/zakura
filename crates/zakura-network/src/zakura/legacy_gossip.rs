@@ -5511,7 +5511,7 @@ mod tests {
     fn response_codec_rejects_a_repeated_requested_hash() {
         let request_id: u64 = 7;
         let hash = block::Hash([9; 32]);
-        let requested: HashSet<block::Hash> = std::iter::once(hash).collect();
+        let requested = RequestedInventory::Blocks(std::iter::once(hash).collect());
 
         let missing_blocks = |repeats: usize| {
             let mut payload = request_id.to_le_bytes().to_vec();

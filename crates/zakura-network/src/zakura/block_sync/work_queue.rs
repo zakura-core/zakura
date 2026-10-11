@@ -6,12 +6,11 @@
 //! API the caller drives from its own per-peer state (see the ):
 //!
 //! - a height is in **exactly one** of `{below-floor (gone), pending, in_flight}`;
-//! - [`take_in_range`](WorkQueue::take_in_range) moves a contiguous-ascending run
+//! - [`take_for_request`](WorkQueue::take_for_request) claims a contiguous-ascending run
 //!   `pending → in_flight` (so one taken chunk maps to one `BlockRangeRequest`),
-//!   bounded only by the caller's servable range and a count cap — never by how
-//!   far above the download floor the heights already are;
-//! - only `return_items` (timeout/disconnect retry) and
-//!   [`reset_above`](WorkQueue::reset_above) move `in_flight → pending`;
+//!   within the caller's servable range and request admission limits;
+//! - `return_items` moves `in_flight → pending` for timeout/disconnect retry;
+//! - [`reset_above`](WorkQueue::reset_above) retires all old work;
 //! - [`advance_floor`](WorkQueue::advance_floor) is garbage collection only — the
 //!   download floor never throttles the fetch decision.
 //!

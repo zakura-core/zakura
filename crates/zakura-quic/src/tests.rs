@@ -1075,14 +1075,22 @@ impl Acceptor for HoldAcceptor {
 /// A connected pair whose server allows `max_bidi_streams` client streams and
 /// accepts none on its own.
 async fn held_pair(max_bidi_streams: u32) -> (QuicEndpoint, QuicEndpoint, Conn, Conn) {
+    held_pair_with(&test_config(), max_bidi_streams).await
+}
+
+/// [`held_pair`] with `config` on both endpoints.
+async fn held_pair_with(
+    config: &QuicConfig,
+    max_bidi_streams: u32,
+) -> (QuicEndpoint, QuicEndpoint, Conn, Conn) {
     let bind = QuicBindConfig {
         max_bidi_streams,
         ..loopback()
     };
-    let server = QuicEndpoint::bind(NodeSecretKey::generate(), &bind, &test_config()).unwrap();
+    let server = QuicEndpoint::bind(NodeSecretKey::generate(), &bind, config).unwrap();
     let (handled, mut inbound) = mpsc::unbounded_channel();
     server.serve(HoldAcceptor { handled }).unwrap();
-    let client = client();
+    let client = QuicEndpoint::bind(NodeSecretKey::generate(), &loopback(), config).unwrap();
     let addr = NodeAddr::with_addrs(server.local_id(), server.local_addrs());
     let conn = client.connect(addr, &[ALPN]).await.unwrap();
     let inbound = inbound.recv().await.unwrap();
@@ -1246,6 +1254,452 @@ async fn final_sample_names_the_local_close_cause() {
         assert_eq!(sample.stable_id, inbound_id);
         assert!(!sample.outbound, "the server accepted this connection");
         drop(conn);
+    })
+    .await
+    .unwrap();
+}
+
+/// The smallest windows `QuicConfig` accepts, so a few writes reach flow control.
+fn small_windows() -> QuicConfig {
+    QuicConfig {
+        stream_receive_window_bytes: 64 * 1024,
+        receive_window_bytes: 128 * 1024,
+        send_window_bytes: 64 * 1024,
+        ..test_config()
+    }
+}
+
+/// DRV-5: a read cancelled after its request left keeps the reply, even when
+/// the reply already carries data.
+#[tokio::test]
+async fn cancelled_read_keeps_a_reply_that_carries_data() {
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        let (_server, _client, conn, inbound) = held_pair(64).await;
+        let (mut send, mut recv) = conn.open_bi().await.unwrap();
+        send.write_all(b"x").await.unwrap();
+        let (mut peer_send, _peer_recv) = inbound.accept_bi().await.unwrap();
+        peer_send.write_all(b"hello").await.unwrap();
+        peer_send.finish().unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let mut buf = [0u8; 16];
+        // One poll sends the request; dropping the future cancels the wait.
+        assert!(futures::FutureExt::now_or_never(recv.read(&mut buf)).is_none());
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(recv.read_to_end(16).await.unwrap(), b"hello");
+    })
+    .await
+    .unwrap();
+}
+
+/// DRV-4 and OBS-12: a write waits once more than 64 KiB is queued, and the
+/// driver reports the queued bytes and the time spent blocked.
+#[tokio::test]
+async fn write_ahead_is_bounded_and_reported() {
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        let (_server, _client, conn, _inbound) = held_pair_with(&small_windows(), 64).await;
+        let (mut send, _recv) = conn.open_bi().await.unwrap();
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(500),
+                send.write_all(&vec![0; 1 << 20])
+            )
+            .await
+            .is_err(),
+            "1 MiB can't pass a 64 KiB window plus 64 KiB of write-ahead"
+        );
+        let stats = conn.stats().await.unwrap();
+        assert!(stats.driver.queued_send_bytes >= 512 * 1024, "{stats:?}");
+        assert!(stats.driver.send_blocked > Duration::ZERO, "{stats:?}");
+    })
+    .await
+    .unwrap();
+}
+
+/// DRV-4: an earlier write's failure surfaces on the next write, even if the
+/// call that waited for it was cancelled.
+#[tokio::test]
+async fn earlier_write_error_surfaces_after_a_cancelled_wait() {
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        let (_server, _client, conn, inbound) = held_pair_with(&small_windows(), 64).await;
+        let (mut send, _recv) = conn.open_bi().await.unwrap();
+        send.write_all(b"x").await.unwrap();
+        let (_peer_send, mut peer_recv) = inbound.accept_bi().await.unwrap();
+        assert!(tokio::time::timeout(
+            Duration::from_millis(300),
+            send.write_all(&vec![0; 1 << 20])
+        )
+        .await
+        .is_err());
+        peer_recv.stop(VarInt::from_u32(9)).unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            send.write_all(b"y").await,
+            Err(crate::WriteError::Stopped(VarInt::from_u32(9)))
+        );
+    })
+    .await
+    .unwrap();
+}
+
+/// A write blocked on flow control fails with the peer's code when the peer
+/// stops the stream; it doesn't wait forever.
+#[tokio::test]
+async fn blocked_write_fails_when_the_peer_stops() {
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        let (_server, _client, conn, inbound) = held_pair_with(&small_windows(), 64).await;
+        let (mut send, _recv) = conn.open_bi().await.unwrap();
+        send.write_all(b"x").await.unwrap();
+        let (_peer_send, mut peer_recv) = inbound.accept_bi().await.unwrap();
+        let writer = tokio::spawn(async move { send.write_all(&vec![0; 1 << 20]).await });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        peer_recv.stop(VarInt::from_u32(9)).unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), writer)
+                .await
+                .expect("a stopped stream fails its blocked write")
+                .unwrap(),
+            Err(crate::WriteError::Stopped(VarInt::from_u32(9)))
+        );
+    })
+    .await
+    .unwrap();
+}
+
+/// `finish` after writes that wait on flow control finishes after them.
+#[tokio::test]
+async fn finish_waits_for_writes_queued_behind_flow_control() {
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        let (_server, _client, conn, inbound) = held_pair_with(&small_windows(), 64).await;
+        let (mut send, _recv) = conn.open_bi().await.unwrap();
+        send.write_all(&vec![1; 64 * 1024]).await.unwrap();
+        send.write_all(b"tail").await.unwrap();
+        send.finish().unwrap();
+        let (_peer_send, mut peer_recv) = inbound.accept_bi().await.unwrap();
+        let data = tokio::time::timeout(Duration::from_secs(5), peer_recv.read_to_end(1 << 20))
+            .await
+            .expect("the stream finishes")
+            .unwrap();
+        assert_eq!(data.len(), 64 * 1024 + 4);
+        assert!(data.ends_with(b"tail"));
+    })
+    .await
+    .unwrap();
+}
+
+/// Dropping a `SendStream` finishes it; dropping a `RecvStream` stops it.
+#[tokio::test]
+async fn dropped_stream_halves_finish_and_stop() {
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        let (_server, _client, conn, inbound) = held_pair(64).await;
+        let (mut send, recv) = conn.open_bi().await.unwrap();
+        send.write_all(b"bye").await.unwrap();
+        drop(send);
+        drop(recv);
+        let (mut peer_send, mut peer_recv) = inbound.accept_bi().await.unwrap();
+        let data = tokio::time::timeout(Duration::from_secs(5), peer_recv.read_to_end(16))
+            .await
+            .expect("dropping the send half finishes the stream")
+            .unwrap();
+        assert_eq!(data, b"bye");
+        let stopped =
+            tokio::time::timeout(Duration::from_secs(5), write_until_error(&mut peer_send))
+                .await
+                .expect("dropping the receive half stops the stream");
+        assert_eq!(stopped, crate::WriteError::Stopped(VarInt::from_u32(0)));
+    })
+    .await
+    .unwrap();
+}
+
+/// `reset` and `stop` reach the peer with their codes.
+#[tokio::test]
+async fn reset_and_stop_carry_their_codes_to_the_peer() {
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        let (_server, _client, conn, inbound) = held_pair(64).await;
+        let (mut send, mut recv) = conn.open_bi().await.unwrap();
+        send.write_all(b"x").await.unwrap();
+        let (mut peer_send, mut peer_recv) = inbound.accept_bi().await.unwrap();
+        send.reset(VarInt::from_u32(7)).unwrap();
+        assert_eq!(
+            peer_recv.read_to_end(16).await,
+            Err(crate::ReadToEndError::Read(crate::ReadError::Reset(
+                VarInt::from_u32(7)
+            )))
+        );
+        recv.stop(VarInt::from_u32(9)).unwrap();
+        let stopped = write_until_error(&mut peer_send).await;
+        assert_eq!(stopped, crate::WriteError::Stopped(VarInt::from_u32(9)));
+    })
+    .await
+    .unwrap();
+}
+
+/// ADM-3 rule 3, deterministic: one stalled handshake from 127.0.0.1 fills
+/// `max_pending_per_ip = 1`, so the next attempt from that IP is refused.
+#[tokio::test]
+async fn max_pending_per_ip_refuses_the_second_handshake() {
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        let config = QuicConfig {
+            max_pending_per_ip: Some(1),
+            ..test_config()
+        };
+        let server = server_with(&config, &loopback(), &[ALPN], |_| Admit::Accept);
+        let _stalled = stalled_handshake(&server);
+        wait_for_attempts(&server, 1).await;
+        let client = client();
+        assert!(matches!(
+            client.connect(server.addr(), &[ALPN]).await,
+            Err(ConnectError::Refused)
+        ));
+        assert_eq!(server.seen.lock().unwrap()[1].pending_from_ip, 1);
+    })
+    .await
+    .unwrap();
+}
+
+/// ADM-11: once every connection drained, shutdown doesn't wait out the
+/// 3 s drain bound.
+#[tokio::test]
+async fn drained_connections_leave_the_table() {
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        let mut server = server();
+        let client = client();
+        let conn = client.connect(server.addr(), &[ALPN]).await.unwrap();
+        let inbound = server.handled.recv().await.unwrap();
+        conn.close(VarInt::from_u32(0), b"done");
+        inbound.closed().await;
+        drop(inbound);
+        // Draining lasts three PTOs, a few milliseconds on loopback.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let started = std::time::Instant::now();
+        server.endpoint.shutdown().await;
+        assert!(
+            started.elapsed() < Duration::from_millis(1500),
+            "{:?}",
+            started.elapsed()
+        );
+    })
+    .await
+    .unwrap();
+}
+
+/// DIAL-3: a later attempt starts only after the stagger, so a fast first
+/// address keeps the second from seeing any packet.
+#[tokio::test]
+async fn staggered_dial_skips_later_addresses_after_a_fast_win() {
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        let config = QuicConfig {
+            dial_stagger_ms: 1_000,
+            ..test_config()
+        };
+        let server = server_with(&config, &loopback(), &[ALPN], |_| Admit::Accept);
+        let decoy = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        decoy.set_nonblocking(true).unwrap();
+        let client = QuicEndpoint::bind(NodeSecretKey::generate(), &loopback(), &config).unwrap();
+        let mut direct = server.endpoint.local_addrs();
+        direct.push(decoy.local_addr().unwrap());
+        client
+            .connect(
+                NodeAddr::with_addrs(server.endpoint.local_id(), direct),
+                &[ALPN],
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            decoy.recv_from(&mut [0u8; 2048]).is_err(),
+            "no Initial reached the decoy"
+        );
+    })
+    .await
+    .unwrap();
+}
+
+/// OBS-12: the driver's counters agree with quinn-proto's UDP stats.
+#[tokio::test]
+async fn driver_send_counters_match_quinn_proto() {
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        let server = server();
+        let client = client();
+        let conn = client.connect(server.addr(), &[ALPN]).await.unwrap();
+        let payload = vec![3u8; 2 * 1024 * 1024];
+        assert_eq!(echo(&conn, &payload).await, payload);
+        let stats = conn.stats().await.unwrap();
+        assert_eq!(
+            stats.driver.transmits, stats.connection.udp_tx.ios,
+            "{stats:?}"
+        );
+        assert_eq!(
+            stats.driver.datagrams_sent, stats.connection.udp_tx.datagrams,
+            "{stats:?}"
+        );
+    })
+    .await
+    .unwrap();
+}
+
+/// A key that presents a victim's public key but signs with another key.
+#[derive(Debug)]
+struct Impostor(NodeSecretKey);
+
+impl rustls::sign::SigningKey for Impostor {
+    fn choose_scheme(
+        &self,
+        offered: &[rustls::SignatureScheme],
+    ) -> Option<Box<dyn rustls::sign::Signer>> {
+        offered
+            .contains(&rustls::SignatureScheme::ED25519)
+            .then(|| Box::new(ImpostorSigner(self.0.clone())) as Box<dyn rustls::sign::Signer>)
+    }
+
+    fn algorithm(&self) -> rustls::SignatureAlgorithm {
+        rustls::SignatureAlgorithm::ED25519
+    }
+}
+
+#[derive(Debug)]
+struct ImpostorSigner(NodeSecretKey);
+
+impl rustls::sign::Signer for ImpostorSigner {
+    fn sign(&self, message: &[u8]) -> Result<Vec<u8>, rustls::Error> {
+        Ok(self.0.sign(message).to_vec())
+    }
+
+    fn scheme(&self) -> rustls::SignatureScheme {
+        rustls::SignatureScheme::ED25519
+    }
+}
+
+#[derive(Debug)]
+struct ImpostorResolver(Arc<rustls::sign::CertifiedKey>);
+
+impl rustls::client::ResolvesClientCert for ImpostorResolver {
+    fn resolve(
+        &self,
+        _root_hint_subjects: &[&[u8]],
+        _sigschemes: &[rustls::SignatureScheme],
+    ) -> Option<Arc<rustls::sign::CertifiedKey>> {
+        Some(self.0.clone())
+    }
+
+    fn only_raw_public_keys(&self) -> bool {
+        true
+    }
+
+    fn has_certs(&self) -> bool {
+        true
+    }
+}
+
+/// TLS-8, SEC-2: a client that presents another node's key without its
+/// secret is refused, so `remote_id()` can't name the victim.
+#[tokio::test]
+async fn client_presenting_a_key_it_cannot_sign_for_is_refused() {
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        let mut server = server();
+        let victim = NodeSecretKey::generate().public();
+        let cert =
+            rustls_pki_types::CertificateDer::from(crate::tls::ed25519_spki(&victim).to_vec());
+        let key = Arc::new(rustls::sign::CertifiedKey::new(
+            vec![cert],
+            Arc::new(Impostor(NodeSecretKey::generate())),
+        ));
+        let mut crypto =
+            raw_client_builder(&server).with_client_cert_resolver(Arc::new(ImpostorResolver(key)));
+        crypto.alpn_protocols = vec![ALPN.to_vec()];
+        assert!(dial_raw(&server, crypto).await.is_err());
+        assert!(server.handled.try_recv().is_err());
+    })
+    .await
+    .unwrap();
+}
+
+/// Writes 1 KiB chunks until a write fails, and returns that error.
+///
+/// Gives up after 16 MiB, so a driver that never blocks or fails a write
+/// fails the test instead of growing without bound.
+async fn write_until_error(send: &mut crate::SendStream) -> crate::WriteError {
+    for _ in 0..16 * 1024 {
+        if let Err(error) = send.write_all(&[0; 1024]).await {
+            return error;
+        }
+    }
+    panic!("16 MiB of writes never failed");
+}
+
+/// SOCK-6, G7: a send that hits `WouldBlock` is kept and sent later, so the
+/// sender loses no packet. The hook only touches the client's socket.
+#[tokio::test]
+async fn hooktest_would_block_sends_are_kept() {
+    use std::sync::atomic::Ordering;
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        let mut server = server();
+        let client = client();
+        let conn = client.connect(server.addr(), &[ALPN]).await.unwrap();
+        let inbound = server.handled.recv().await.unwrap();
+        crate::socket::test_hooks::SEND_WOULD_BLOCK.store(200, Ordering::Relaxed);
+        crate::socket::test_hooks::SEND_WOULD_BLOCK_PORT
+            .store(client.local_addrs()[0].port(), Ordering::Relaxed);
+        let payload = vec![7u8; 1 << 20];
+        assert_eq!(echo(&conn, &payload).await, payload);
+        assert_eq!(
+            crate::socket::test_hooks::SEND_WOULD_BLOCK.load(Ordering::Relaxed),
+            0
+        );
+        // The driver counts a transmit once the socket takes it, and
+        // quinn-proto counts it when it builds it. A dropped blocked transmit
+        // would leave the driver behind for good. (Packet loss can't show
+        // this: loopback drops packets on a loaded host.)
+        let caught_up = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let stats = conn.stats().await.unwrap();
+                if stats.driver.transmits == stats.connection.udp_tx.ios {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(caught_up.is_ok(), "{:?}", conn.stats().await.unwrap());
+        drop(inbound);
+    })
+    .await
+    .unwrap();
+}
+
+/// SOCK-9: the first fatal receive error rebinds the socket on the same port
+/// and connections keep working; a second within 60 s stops the endpoint.
+#[tokio::test]
+async fn hooktest_socket_failure_rebinds_once_then_stops() {
+    use std::sync::atomic::Ordering;
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        let mut server = server();
+        let port = server.endpoint.local_addrs()[0].port();
+        let client = client();
+        let conn = client.connect(server.addr(), &[ALPN]).await.unwrap();
+        let _inbound = server.handled.recv().await.unwrap();
+        crate::socket::test_hooks::RECV_FAIL_PORT.store(port, Ordering::Relaxed);
+        assert_eq!(echo(&conn, b"one").await, b"one");
+        while server.endpoint.socket_stats()[0].rebinds == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(server.endpoint.local_addrs()[0].port(), port);
+        assert_eq!(echo(&conn, b"two").await, b"two");
+
+        crate::socket::test_hooks::RECV_FAIL_PORT.store(port, Ordering::Relaxed);
+        // Traffic makes the server read and hit the second failure.
+        if let Ok((mut send, _recv)) = conn.open_bi().await {
+            let _ = send.write_all(b"three").await;
+            let _ = send.finish();
+        }
+        let reason = tokio::time::timeout(Duration::from_secs(10), conn.closed())
+            .await
+            .expect("a second failure within 60 s stops the endpoint");
+        assert!(
+            matches!(&reason, ConnectionError::ApplicationClosed(close) if close.error_code == VarInt::from_u32(0)),
+            "{reason:?}"
+        );
+        assert_eq!(server.endpoint.socket_stats()[0].rebinds, 1);
     })
     .await
     .unwrap();

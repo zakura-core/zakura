@@ -143,6 +143,10 @@ struct ConnTask {
     acceptors: VecDeque<oneshot::Sender<Result<StreamId, ConnectionError>>>,
     accepted_spare: VecDeque<StreamId>,
     sends: HashMap<StreamId, SendState>,
+    /// The peer's STOP_SENDING code for each stream this node reset in
+    /// answer, until the handle finishes, resets or drops it. A later write
+    /// gets `Stopped(code)` instead of the reset stream's `ClosedStream`.
+    stopped: HashMap<StreamId, VarInt>,
     reads: HashMap<StreamId, oneshot::Sender<ReadReply>>,
     recv_ends: HashMap<StreamId, RecvEnd>,
 
@@ -197,6 +201,7 @@ pub(crate) async fn run(params: ConnTaskParams) {
         acceptors: VecDeque::new(),
         accepted_spare: VecDeque::new(),
         sends: HashMap::new(),
+        stopped: HashMap::new(),
         reads: HashMap::new(),
         recv_ends: HashMap::new(),
         send_buf: Vec::new(),
@@ -521,6 +526,7 @@ impl ConnTask {
                 Event::Stream(StreamEvent::Finished { .. }) => {}
                 Event::Stream(StreamEvent::Stopped { id, error_code }) => {
                     self.fail_writes(id, WriteError::Stopped(error_code));
+                    self.stopped.insert(id, error_code);
                     // RFC 9000 §3.5: answer STOP_SENDING with RESET_STREAM.
                     // quinn-proto leaves this to the application, and without
                     // it the peer never learns the final size, so it never
@@ -617,6 +623,10 @@ impl ConnTask {
                 self.serve_acceptors();
             }
             ConnCmd::Write { id, data, reply } => {
+                if let Some(&code) = self.stopped.get(&id) {
+                    let _ = reply.send(Err(WriteError::Stopped(code)));
+                    return;
+                }
                 self.sends
                     .entry(id)
                     .or_default()
@@ -627,6 +637,8 @@ impl ConnTask {
                     });
                 self.serve_writer(id);
             }
+            ConnCmd::Finish { id } | ConnCmd::DropSend { id }
+                if self.stopped.remove(&id).is_some() => {}
             ConnCmd::Finish { id } | ConnCmd::DropSend { id } => match self.sends.get_mut(&id) {
                 Some(state) if !state.writes.is_empty() => state.finish_after = true,
                 _ => {
@@ -634,6 +646,7 @@ impl ConnTask {
                 }
             },
             ConnCmd::Reset { id, code } => {
+                self.stopped.remove(&id);
                 self.fail_writes(id, WriteError::ClosedStream);
                 let _ = self.conn.send_stream(id).reset(code);
             }

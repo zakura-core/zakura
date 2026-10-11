@@ -204,6 +204,18 @@ impl UdpIo {
     /// Returns `Ok(None)` for a datagram the socket dropped as malformed, and
     /// `WouldBlock` once the queue is empty.
     pub(crate) fn try_recv(&self, buf: &mut [u8]) -> io::Result<Option<RecvMeta>> {
+        #[cfg(test)]
+        {
+            let port = test_hooks::RECV_FAIL_PORT.load(Ordering::Relaxed);
+            if port != 0
+                && self.socket.local_addr().map(|a| a.port()).ok() == Some(port)
+                && test_hooks::RECV_FAIL_PORT
+                    .compare_exchange(port, 0, Ordering::Relaxed, Ordering::Relaxed)
+                    .is_ok()
+            {
+                return Err(io::Error::other("injected socket failure"));
+            }
+        }
         #[cfg(target_os = "linux")]
         {
             self.socket.try_io(tokio::io::Interest::READABLE, || {
@@ -225,6 +237,18 @@ impl UdpIo {
     /// Sends one transmit. A datagram the network can't take is dropped
     /// rather than reported, because QUIC recovers from loss.
     pub(crate) fn try_send(&self, transmit: &Transmit, contents: &[u8]) -> io::Result<()> {
+        #[cfg(test)]
+        {
+            let port = test_hooks::SEND_WOULD_BLOCK_PORT.load(Ordering::Relaxed);
+            if port != 0
+                && self.socket.local_addr().map(|a| a.port()).ok() == Some(port)
+                && test_hooks::SEND_WOULD_BLOCK
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
+                    .is_ok()
+            {
+                return Err(io::ErrorKind::WouldBlock.into());
+            }
+        }
         #[cfg(target_os = "linux")]
         {
             let src_ip = transmit.src_ip.filter(|_| self.pktinfo);
@@ -755,4 +779,15 @@ mod linux {
             );
         }
     }
+}
+
+#[cfg(test)]
+pub(crate) mod test_hooks {
+    use std::sync::atomic::{AtomicU16, AtomicUsize};
+    /// The local port whose sends fail with `WouldBlock` (0: none).
+    pub(crate) static SEND_WOULD_BLOCK_PORT: AtomicU16 = AtomicU16::new(0);
+    /// How many of that port's sends fail before the socket is tried.
+    pub(crate) static SEND_WOULD_BLOCK: AtomicUsize = AtomicUsize::new(0);
+    /// The local port whose next receive fails fatally (0: none).
+    pub(crate) static RECV_FAIL_PORT: AtomicU16 = AtomicU16::new(0);
 }

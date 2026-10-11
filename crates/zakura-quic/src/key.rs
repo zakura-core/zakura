@@ -552,4 +552,66 @@ mod tests {
         assert!(!debug.contains(&RFC8032_SEED[..8]));
         assert_eq!(secret.to_hex(), RFC8032_SEED);
     }
+
+    /// ID-6: a mixed-order key A' = aB + T with a signature whose challenge
+    /// is over A'. ZIP 215's cofactored equation ignores T, so
+    /// `ed25519-zebra` alone accepts it; only the torsion check on A refuses.
+    #[test]
+    fn mixed_order_key_with_a_cofactored_valid_signature_is_refused() {
+        use curve25519_dalek::{constants::ED25519_BASEPOINT_POINT, Scalar};
+        use sha2::{Digest as _, Sha512};
+
+        let secret: NodeSecretKey = RFC8032_SEED.parse().unwrap();
+        let expanded = Sha512::digest(secret.to_bytes());
+        let mut a_bytes = [0u8; 32];
+        a_bytes.copy_from_slice(&expanded[..32]);
+        a_bytes[0] &= 248;
+        a_bytes[31] &= 127;
+        a_bytes[31] |= 64;
+        let a = Scalar::from_bytes_mod_order(a_bytes);
+        let mixed = add_point(secret.public().as_bytes(), &ORDER_8);
+        let r = Scalar::from_bytes_mod_order([5; 32]);
+        let r_point = (r * ED25519_BASEPOINT_POINT).compress().to_bytes();
+        let challenge: [u8; 64] = Sha512::new()
+            .chain_update(r_point)
+            .chain_update(mixed)
+            .chain_update(b"msg")
+            .finalize()
+            .into();
+        let s = r + Scalar::from_bytes_mod_order_wide(&challenge) * a;
+        let mut sig = [0u8; 64];
+        sig[..32].copy_from_slice(&r_point);
+        sig[32..].copy_from_slice(s.as_bytes());
+
+        let zebra = VerificationKey::try_from(mixed).unwrap();
+        zebra.verify(&Signature::from_bytes(&sig), b"msg").unwrap();
+        let mixed = NodeId::from_bytes(&mixed).expect("a mixed-order key parses");
+        assert_eq!(mixed.verify_strict(b"msg", &sig), Err(SignatureError));
+    }
+
+    /// ID-1: y = p + k encodes the same point as y = k. Some of those points
+    /// aren't small order, so only the canonical-encoding check refuses them.
+    #[test]
+    fn non_canonical_encodings_of_large_order_points_are_refused() {
+        let mut checked = 0;
+        for k in 0u8..19 {
+            // p = 2^255 - 19 = 0x7fff..ffed, little-endian; p + k < 2^255.
+            let mut bytes = [0xff; 32];
+            bytes[0] = 0xed + k;
+            bytes[31] = 0x7f;
+            let Some(point) = CompressedEdwardsY(bytes).decompress() else {
+                continue;
+            };
+            if point.is_small_order() {
+                continue;
+            }
+            assert_eq!(
+                NodeId::from_bytes(&bytes),
+                Err(KeyParsingError::InvalidKeyData),
+                "y = p + {k}"
+            );
+            checked += 1;
+        }
+        assert!(checked > 0, "some y = p + k encodes a large-order point");
+    }
 }

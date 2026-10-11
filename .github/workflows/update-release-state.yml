@@ -13,11 +13,6 @@ name: Update Mainnet release state
 
 on:
   workflow_dispatch:
-    inputs:
-      max_age_hours:
-        description: "Maximum bundle age in hours"
-        required: false
-        default: "48"
   schedule:
     # Weekly refresh; the publisher exports daily on its own timer.
     - cron: "0 6 * * 1"
@@ -57,7 +52,6 @@ jobs:
       - name: Fetch one immutable bundle
         env:
           LATEST_URL: ${{ vars.MAINNET_RELEASE_STATE_LATEST_URL }}
-          MAX_AGE_HOURS: ${{ inputs.max_age_hours || '48' }}
         run: |
           if [ -z "$LATEST_URL" ]; then
             echo "Set the MAINNET_RELEASE_STATE_LATEST_URL repository variable." >&2
@@ -66,8 +60,7 @@ jobs:
           python3 .github/scripts/fetch-release-state.py \
             --latest-url "$LATEST_URL" \
             --output-dir "$RUNNER_TEMP/release-state-bundle" \
-            --metadata-out "$RUNNER_TEMP/release-state-resolution.json" \
-            --max-age-hours "$MAX_AGE_HOURS"
+            --metadata-out "$RUNNER_TEMP/release-state-resolution.json"
 
       # A cheap advance check so a no-op run neither publishes a crate version nor spends a build.
       # The importer enforces the real invariant, byte-for-byte, in the open-pr job.
@@ -263,6 +256,7 @@ jobs:
           fi
           echo "path=$(dirname "$MANIFEST")/src/mainnet-frontier-grid.bin" >> "$GITHUB_OUTPUT"
 
+      # Release preparation owns end-of-support changes.
       - name: Import checkpoints, frontier, subtrees, and provenance
         id: import
         env:
@@ -279,7 +273,8 @@ jobs:
             --bundle "$BUNDLE" \
             --resolution "$RESOLUTION" \
             ${PREVIOUS_ARGS[@]+"${PREVIOUS_ARGS[@]}"} \
-            --result-out "$RUNNER_TEMP/release-state-import.json"
+            --result-out "$RUNNER_TEMP/release-state-import.json" \
+            --no-eos-floor
           jq -r '
             "has_changes=\(.has_changes)",
             "height=\(.height)",
@@ -341,7 +336,6 @@ jobs:
           crates/zakura-state/src/service/finalized_state/vct/mainnet-frontier.bin
           crates/zakura-state/src/service/finalized_state/vct/mainnet-vct-manifest.json
           crates/zakura-state/src/service/finalized_state/vct/mainnet-subtrees.bin
-          crates/zakurad/src/components/sync/end_of_support.rs
           EOF
           UNEXPECTED=$(comm -23 "$RUNNER_TEMP/actual-files" "$RUNNER_TEMP/allowed-files")
           if [ -n "$UNEXPECTED" ]; then
@@ -394,7 +388,7 @@ jobs:
           base: main
           title: "chore(chain): update Mainnet release state"
           body: |
-            Updates the embedded Mainnet checkpoint list, matching VCT frontier, subtree roots, and provenance record from one immutable release-state bundle, and repins the published historical frontier grid. It also floors the end-of-support estimate.
+            Updates the embedded Mainnet checkpoint list, matching VCT frontier, subtree roots, and provenance record from one immutable release-state bundle, and repins the published historical frontier grid. End-of-support changes belong to release preparation.
 
             - Finalized height: `${{ steps.import.outputs.height }}`
             - Finalized hash: `${{ steps.import.outputs.block_hash }}`

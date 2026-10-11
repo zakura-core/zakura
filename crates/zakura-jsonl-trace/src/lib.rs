@@ -1781,9 +1781,31 @@ mod tests {
         let Value::Object(fields) = serde_json::to_value(&row).expect("row serializes") else {
             panic!("row is an object");
         };
+        let direct = encode::encode_csv_row(HEADER, &row).expect("row encodes");
+        let reference = render_csv_row(HEADER, fields);
+        let decode = |bytes: &[u8]| {
+            csv::ReaderBuilder::new()
+                .has_headers(false)
+                .from_reader(bytes)
+                .records()
+                .next()
+                .expect("one CSV row")
+                .expect("valid CSV row")
+        };
+        let direct = decode(&direct);
+        let reference = decode(&reference);
+        let extra_index = direct.len() - 1;
+        assert_eq!(direct.len(), reference.len());
+        assert!(direct
+            .iter()
+            .take(extra_index)
+            .eq(reference.iter().take(extra_index)));
+        // Workspace feature unification can enable serde_json's preserve_order.
+        // Removing declared fields then changes the reference map's key order,
+        // but JSON object ordering is not part of the trace evidence contract.
         assert_eq!(
-            String::from_utf8(encode::encode_csv_row(HEADER, &row).expect("row encodes")),
-            String::from_utf8(render_csv_row(HEADER, fields))
+            serde_json::from_str::<Value>(&direct[extra_index]).expect("extra is JSON"),
+            serde_json::from_str::<Value>(&reference[extra_index]).expect("extra is JSON")
         );
 
         let mut map = Map::new();

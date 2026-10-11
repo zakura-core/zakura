@@ -1,3 +1,4 @@
+use crate::serialization::ZcashReader;
 use std::io;
 
 use halo2::pasta::pallas;
@@ -56,7 +57,9 @@ impl ZcashSerialize for Action {
 }
 
 impl ZcashDeserialize for Action {
-    fn zcash_deserialize<R: io::Read>(mut reader: R) -> Result<Self, SerializationError> {
+    fn zcash_deserialize_from<R: io::Read>(
+        reader: &mut ZcashReader<R>,
+    ) -> Result<Self, SerializationError> {
         // # Consensus
         //
         // > Elements of an Action description MUST be canonical encodings of the types given above.
@@ -72,7 +75,7 @@ impl ZcashDeserialize for Action {
             // Type is ValueCommit^{Orchard}.Output, i.e. ℙ.
             // https://zips.z.cash/protocol/protocol.pdf#abstractcommit
             // See [`ValueCommitment::zcash_deserialize`].
-            cv: ValueCommitment::zcash_deserialize(&mut reader)?,
+            cv: reader.read_value::<ValueCommitment>()?,
             // Type is `{0 .. 𝑞_ℙ − 1}`. See [`Nullifier::try_from`].
             nullifier: Nullifier::try_from(reader.read_32_bytes()?)?,
             // Type is SpendAuthSig^{Orchard}.Public, i.e. ℙ.
@@ -92,21 +95,21 @@ impl ZcashDeserialize for Action {
             // Type is `{0 .. 𝑞_ℙ − 1}`. Note that the second rule quoted above
             // is also enforced here and it is technically redundant with the first.
             // See [`pallas::Base::zcash_deserialize`].
-            cm_x: pallas::Base::zcash_deserialize(&mut reader)?,
+            cm_x: reader.read_value::<pallas::Base>()?,
             // Denoted by `epk` in the spec. Type is KA^{Orchard}.Public, i.e. ℙ^*.
             // https://zips.z.cash/protocol/protocol.pdf#concreteorchardkeyagreement
             // See [`keys::EphemeralPublicKey::zcash_deserialize`].
-            ephemeral_key: keys::EphemeralPublicKey::zcash_deserialize(&mut reader)?,
+            ephemeral_key: reader.read_value::<keys::EphemeralPublicKey>()?,
             // Type is `Sym.C`, i.e. `𝔹^Y^{\[N\]}`, i.e. arbitrary-sized byte arrays
             // https://zips.z.cash/protocol/protocol.pdf#concretesym but fixed to
             // 580 bytes in https://zips.z.cash/protocol/protocol.pdf#outputencodingandconsensus
             // See [`note::EncryptedNote::zcash_deserialize`].
-            enc_ciphertext: note::EncryptedNote::zcash_deserialize(&mut reader)?,
+            enc_ciphertext: reader.read_value::<note::EncryptedNote>()?,
             // Type is `Sym.C`, i.e. `𝔹^Y^{\[N\]}`, i.e. arbitrary-sized byte arrays
             // https://zips.z.cash/protocol/protocol.pdf#concretesym but fixed to
             // 80 bytes in https://zips.z.cash/protocol/protocol.pdf#outputencodingandconsensus
             // See [`note::WrappedNoteKey::zcash_deserialize`].
-            out_ciphertext: note::WrappedNoteKey::zcash_deserialize(&mut reader)?,
+            out_ciphertext: reader.read_value::<note::WrappedNoteKey>()?,
         })
     }
 }

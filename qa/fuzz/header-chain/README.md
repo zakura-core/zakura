@@ -2,10 +2,12 @@
 
 This isolated `cargo-fuzz` package is intentionally not a workspace member.
 
-Run a target from this directory with a pinned nightly toolchain:
+Run a target from this directory with a pinned nightly toolchain. Pass
+`--fuzz-dir .`, because `cargo-fuzz` otherwise looks for `fuzz/` under the
+workspace root:
 
 ```console
-cargo +nightly-2026-07-15 fuzz run header_codec -- -dict=fuzz_dicts/header_sync.dict
+cargo +nightly-2026-07-15 fuzz run --fuzz-dir . header_codec -- -dict=fuzz_dicts/header_sync.dict
 ```
 
 The available targets are `header_codec`, `fork_transitions`, `header_pursuit`,
@@ -19,7 +21,7 @@ actionable. AddressSanitizer remains enabled for the target.
 When libFuzzer reports a failure, reproduce and minimize the artifact:
 
 ```console
-cargo +nightly-2026-07-15 fuzz run header_codec path/to/crash-artifact
+cargo +nightly-2026-07-15 fuzz run --fuzz-dir . header_codec path/to/crash-artifact
 cargo xtask minimize-header-fuzz qa/fuzz/header-chain/artifacts/<target>/crash-…
 ```
 

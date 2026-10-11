@@ -8,9 +8,10 @@ use std::time::Duration;
 use super::{frame_filter::*, layout::LayoutError, *};
 use crate::zakura::{check_frame_filter, Stream, StreamMode, FRAME_HEADER_BYTES};
 
-const EVERY_15_SECONDS: Cadence = Cadence {
-    capacity: 4,
+const EVERY_30_SECONDS: Cadence = Cadence {
+    capacity: 22,
     refill_interval: Duration::from_secs(15),
+    send_interval: Duration::from_secs(30),
 };
 
 const fn announcement(message_type: u16) -> MessageRule {
@@ -18,7 +19,7 @@ const fn announcement(message_type: u16) -> MessageRule {
         message_type,
         payload: PayloadLen::exact(8),
         role: MessageRole::Announcement {
-            cadence: EVERY_15_SECONDS,
+            cadence: EVERY_30_SECONDS,
         },
     }
 }
@@ -45,10 +46,30 @@ const fn response(message_type: u16, request: u16, ends_exchange: bool) -> Messa
     }
 }
 
+const fn subscription(message_type: u16, credit: Credit, cursor_history: u32) -> MessageRule {
+    MessageRule {
+        message_type,
+        payload: PayloadLen::exact(8),
+        role: MessageRole::Subscription {
+            max_live: 1,
+            credit,
+            cursor_history,
+            cadence: None,
+        },
+    }
+}
+
 const STATUS: MessageRule = announcement(1);
 const GET: MessageRule = request(2);
 const PART: MessageRule = response(3, 2, false);
 const DONE: MessageRule = response(4, 2, true);
+const CREDIT: Credit = Credit {
+    objects: 16,
+    bytes: 4096,
+};
+const WATCH: MessageRule = subscription(5, CREDIT, 16);
+const PAGE: MessageRule = response(6, 5, false);
+const ENDED: MessageRule = response(7, 5, true);
 
 const fn persistent(kind: u16, messages: &'static [MessageRule]) -> Stream {
     Stream {
@@ -74,10 +95,16 @@ const PAIRED: [Stream; 2] = [
     persistent(65, &[GET]),
 ];
 const LOOKUP: [Stream; 1] = [request_response(66, &[GET, PART, DONE])];
+/// A subscription beside a request, on one stream.
+const FEED: [Stream; 1] = [persistent(
+    64,
+    &[STATUS, GET, PART, DONE, WATCH, PAGE, ENDED],
+)];
 
 const _: () = Stream::validate_layout(&SINGLE);
 const _: () = Stream::validate_layout(&PAIRED);
 const _: () = Stream::validate_layout(&LOOKUP);
+const _: () = Stream::validate_layout(&FEED);
 
 /// A table built at runtime. Streams hold `'static` tables.
 fn leak(rows: &[MessageRule]) -> &'static [MessageRule] {
@@ -90,7 +117,7 @@ fn check(layout: &[Stream]) -> Result<(), LayoutError> {
 
 #[test]
 fn valid_layouts_pass_and_their_readers_follow_their_rows() {
-    for layout in [&SINGLE[..], &PAIRED, &LOOKUP] {
+    for layout in [&SINGLE[..], &PAIRED, &LOOKUP, &FEED] {
         assert_eq!(check(layout), Ok(()));
         check_frame_filter(layout);
     }
@@ -229,11 +256,11 @@ fn a_request_allows_an_exchange_in_flight() {
 fn a_cadence_admits_a_message_and_refills() {
     let empty = Cadence {
         capacity: 0,
-        ..EVERY_15_SECONDS
+        ..EVERY_30_SECONDS
     };
     let frozen = Cadence {
         refill_interval: Duration::ZERO,
-        ..EVERY_15_SECONDS
+        ..EVERY_30_SECONDS
     };
     for cadence in [empty, frozen] {
         let announcement = MessageRule {
@@ -259,6 +286,48 @@ fn a_cadence_admits_a_message_and_refills() {
 }
 
 #[test]
+fn a_cadence_refills_faster_than_its_sender_sends() {
+    for refill_interval in [EVERY_30_SECONDS.send_interval, Duration::from_secs(31)] {
+        let announcement = MessageRule {
+            role: MessageRole::Announcement {
+                cadence: Cadence {
+                    refill_interval,
+                    ..EVERY_30_SECONDS
+                },
+            },
+            ..STATUS
+        };
+        assert_eq!(
+            check(&[persistent(64, leak(&[announcement]))]),
+            Err(LayoutError::RefillNotFasterThanSender { message_type: 1 })
+        );
+    }
+}
+
+#[test]
+fn a_cadence_holds_the_burst_after_the_longest_outage() {
+    // Ten minutes of 30-second sends, the initial send, and one of jitter.
+    assert_eq!(Cadence::min_capacity(Duration::from_secs(30)), 22);
+    assert_eq!(Cadence::min_capacity(Duration::from_secs(7 * 60)), 3);
+    assert_eq!(Cadence::min_capacity(Duration::from_nanos(1)), u32::MAX);
+
+    let short = MessageRule {
+        role: MessageRole::Request {
+            max_in_flight: 1,
+            cadence: Some(Cadence {
+                capacity: 21,
+                ..EVERY_30_SECONDS
+            }),
+        },
+        ..GET
+    };
+    assert_eq!(
+        check(&[persistent(64, leak(&[short, DONE]))]),
+        Err(LayoutError::CapacityBelowStall { message_type: 2 })
+    );
+}
+
+#[test]
 fn a_response_answers_a_request_row_of_its_layout() {
     // The request sits on the other stream of the pair, outside this layout.
     let missing = [PAIRED[0]];
@@ -281,6 +350,103 @@ fn a_request_has_a_response_that_ends_it() {
         check(&[persistent(64, &[GET, PART])]),
         Err(LayoutError::RequestWithoutEnding { message_type: 2 })
     );
+}
+
+#[test]
+fn a_subscription_sits_on_a_persistent_stream() {
+    assert_eq!(
+        check(&[request_response(66, &[WATCH, PAGE, ENDED])]),
+        Err(LayoutError::SubscriptionOnRequestResponse {
+            kind: 66,
+            message_type: 5,
+        })
+    );
+}
+
+#[test]
+fn a_subscription_allows_one_live() {
+    let mut none_live = WATCH;
+    none_live.role = MessageRole::Subscription {
+        max_live: 0,
+        credit: CREDIT,
+        cursor_history: 16,
+        cadence: None,
+    };
+    assert_eq!(
+        check(&[persistent(64, leak(&[none_live, PAGE, ENDED]))]),
+        Err(LayoutError::NoLiveSubscriptions { message_type: 5 })
+    );
+}
+
+#[test]
+fn a_subscription_grants_nonzero_credit_in_both_units() {
+    for credit in [
+        Credit {
+            objects: 0,
+            bytes: 4096,
+        },
+        Credit {
+            objects: 16,
+            bytes: 0,
+        },
+    ] {
+        assert_eq!(
+            check(&[persistent(
+                64,
+                leak(&[subscription(5, credit, 16), PAGE, ENDED])
+            )]),
+            Err(LayoutError::EmptyCredit { message_type: 5 })
+        );
+    }
+}
+
+#[test]
+fn a_cursor_history_covers_the_object_credit() {
+    assert_eq!(
+        check(&[persistent(
+            64,
+            leak(&[subscription(5, CREDIT, 15), PAGE, ENDED])
+        )]),
+        Err(LayoutError::ShortCursorHistory { message_type: 5 })
+    );
+    assert_eq!(
+        check(&[persistent(
+            64,
+            leak(&[subscription(5, CREDIT, 16), PAGE, ENDED])
+        )]),
+        Ok(())
+    );
+}
+
+#[test]
+fn a_subscription_has_pages_and_an_ending() {
+    assert_eq!(
+        check(&[persistent(64, &[WATCH, ENDED])]),
+        Err(LayoutError::SubscriptionWithoutPages { message_type: 5 })
+    );
+    assert_eq!(
+        check(&[persistent(64, &[WATCH, PAGE])]),
+        Err(LayoutError::RequestWithoutEnding { message_type: 5 })
+    );
+}
+
+#[test]
+fn a_page_fits_its_byte_credit() {
+    let feed = |min| {
+        let page = MessageRule {
+            payload: PayloadLen::exact(min),
+            ..PAGE
+        };
+        [Stream {
+            frame_cap: 8192,
+            ..persistent(64, leak(&[WATCH, page, ENDED]))
+        }]
+    };
+    assert_eq!(
+        check(&feed(4097)),
+        Err(LayoutError::PageAboveCredit { message_type: 6 })
+    );
+    assert_eq!(check(&feed(4096)), Ok(()));
 }
 
 #[test]

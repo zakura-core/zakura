@@ -1,7 +1,9 @@
 //! Zakura frame codec micro-benchmarks.
 #![allow(missing_docs)]
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
+use std::hint::black_box;
+
+use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 use zakura_network::zakura::Frame;
 
 fn frame_codec(c: &mut Criterion) {

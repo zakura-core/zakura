@@ -1,0 +1,42 @@
+api.nu7.valargroup.dev {
+    encode zstd gzip
+
+    @network_manifest path /v1/network /v1/config
+    handle @network_manifest {
+        header Access-Control-Allow-Origin https://zakura.com
+        header Cache-Control "no-store"
+        root * /var/lib/zakura-nu7-public
+        @manifest path /v1/network
+        rewrite @manifest /network.json
+        @config path /v1/config
+        rewrite @config /nu7-zakura.toml
+        file_server
+    }
+
+    handle /snapshots/* {
+        root * /mnt/snapshots/nu7-public
+        file_server
+    }
+
+    @faucet path /v1/faucet/*
+    handle @faucet {
+        reverse_proxy 127.0.0.1:8094 {
+            header_up X-Real-IP {remote_host}
+        }
+    }
+
+    # zakura-cluster-status answers CORS for its own zakura.com allowlist, including
+    # preflight. Only these two paths are public; its fleet page and /data are not.
+    @status path /v1/status /healthz
+    handle @status {
+        reverse_proxy 127.0.0.1:8093
+    }
+
+    respond 404
+}
+
+nu7.valargroup.dev {
+    # The NU7 page lives at zakura.com. Keep this older public hostname, and links
+    # to any path on it, useful by sending visitors to the canonical page.
+    redir https://zakura.com/nu7/ 302
+}

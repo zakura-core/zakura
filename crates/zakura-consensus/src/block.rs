@@ -448,6 +448,26 @@ where
                 check::equihash_solution_is_valid(&block.header, &network)?;
             }
 
+            if mined.is_some() {
+                let parent = block.header.previous_block_hash;
+                match state_service
+                    .ready()
+                    .await
+                    .map_err(|source| VerifyBlockError::Depth { source, hash })?
+                    .call(zs::Request::KnownBlock(parent))
+                    .await
+                    .map_err(|source| VerifyBlockError::Depth { source, hash })?
+                {
+                    zs::Response::KnownBlock(Some(_)) => {}
+                    zs::Response::KnownBlock(None) => {
+                        return Err(VerifyBlockError::Commit(
+                            zs::CommitBlockError::MissingMinedParent,
+                        ));
+                    }
+                    _ => unreachable!("wrong response to Request::KnownBlock"),
+                }
+            }
+
             // V4 transaction IDs bind their authorizing data. A V5+ body also needs
             // its ZIP-244 commitment before transaction verification.
             let context = if block.transactions.iter().any(|tx| tx.version() >= 5) {
@@ -497,24 +517,6 @@ where
             };
 
             if let Some(admission) = &mined {
-                let parent = block.header.previous_block_hash;
-                match state_service
-                    .ready()
-                    .await
-                    .map_err(|source| VerifyBlockError::Depth { source, hash })?
-                    .call(zs::Request::KnownBlock(parent))
-                    .await
-                    .map_err(|source| VerifyBlockError::Depth { source, hash })?
-                {
-                    zs::Response::KnownBlock(Some(_)) => {}
-                    zs::Response::KnownBlock(None) => {
-                        return Err(VerifyBlockError::Commit(
-                            zs::CommitBlockError::MissingMinedParent,
-                        ));
-                    }
-                    _ => unreachable!("wrong response to Request::KnownBlock"),
-                }
-
                 if let Some(committed) = try_prepared_fast_path(
                     &prepared_candidates,
                     &mut state_service,

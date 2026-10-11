@@ -23,6 +23,11 @@ use crate::{
 /// round trip to the connection task and its own packet.
 pub(crate) const WRITE_AHEAD_BYTES: usize = 64 * 1024;
 
+/// The least `read` and `read_exact` ask the connection task for (DRV-4).
+/// A small frame then costs one request, and a stream pins at most this much
+/// data its application hasn't asked for.
+pub(crate) const READ_AHEAD_BYTES: usize = 4 * 1024;
+
 type WriteReply = oneshot::Receiver<Result<(), WriteError>>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -198,7 +203,11 @@ impl RecvStream {
     }
 
     /// Waits until data is buffered; returns `false` at the end of the stream.
-    async fn fill(&mut self) -> Result<bool, ReadError> {
+    ///
+    /// A new request asks the connection task for at most `max` bytes, so
+    /// the rest stays in quinn-proto and keeps counting against the peer's
+    /// flow-control credit (DRV-4).
+    async fn fill(&mut self, max: usize) -> Result<bool, ReadError> {
         if !self.buffered.is_empty() {
             return Ok(true);
         }
@@ -213,7 +222,11 @@ impl RecvStream {
             None => {
                 let (reply, result) = oneshot::channel();
                 self.conn
-                    .send(ConnCmd::Read { id: self.id, reply })
+                    .send(ConnCmd::Read {
+                        id: self.id,
+                        max,
+                        reply,
+                    })
                     .map_err(ReadError::ConnectionLost)?;
                 self.pending.insert(result)
             }
@@ -242,7 +255,9 @@ impl RecvStream {
             return Ok(Some(0));
         }
         loop {
-            if !self.fill().await? {
+            // A little read-ahead keeps a small frame to one request, while
+            // a header read still leaves a large body in quinn-proto.
+            if !self.fill(buf.len().max(READ_AHEAD_BYTES)).await? {
                 return Ok(None);
             }
             if let Some(read) = self.copy_out(buf) {
@@ -252,10 +267,11 @@ impl RecvStream {
     }
 
     /// Reads the next chunk of at most `max` bytes, or `None` at the end of
-    /// the stream.
+    /// the stream. A new request takes at most `max` bytes out of quinn-proto,
+    /// so unread data keeps counting against the peer's flow control.
     pub async fn read_chunk(&mut self, max: usize) -> Result<Option<Bytes>, ReadError> {
         loop {
-            if !self.fill().await? {
+            if !self.fill(max).await? {
                 return Ok(None);
             }
             if let Some(front) = self.buffered.front_mut() {
@@ -300,7 +316,7 @@ impl RecvStream {
     /// Reads to the end of the stream, refusing more than `size_limit` bytes.
     pub async fn read_to_end(&mut self, size_limit: usize) -> Result<Vec<u8>, ReadToEndError> {
         let mut out = Vec::new();
-        while self.fill().await? {
+        while self.fill(usize::MAX).await? {
             while let Some(chunk) = self.buffered.pop_front() {
                 if out.len().saturating_add(chunk.len()) > size_limit {
                     return Err(ReadToEndError::TooLong);

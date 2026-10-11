@@ -1896,3 +1896,32 @@ async fn stopped_send_resets_when_dropped() {
     .await
     .expect("dropping a stopped sender must send RESET_STREAM");
 }
+
+/// DRV-4: a read takes at most what it asked for out of quinn-proto, so a
+/// header read leaves the body under the peer's flow control.
+#[tokio::test]
+async fn a_header_read_takes_only_the_header_from_quinn() {
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        let (_server, _client, conn, inbound) = held_pair(8).await;
+        let (mut send, _recv) = conn.open_bi().await.unwrap();
+        send.write_all(&[5; 100_000]).await.unwrap();
+        send.finish().unwrap();
+        let (_send, mut recv) = inbound.accept_bi().await.unwrap();
+        // Wait until the whole body sits in quinn-proto.
+        while inbound.stats().await.unwrap().connection.udp_rx.bytes < 100_000 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let mut header = [0; 8];
+        recv.read_exact(&mut header).await.unwrap();
+        tokio::time::sleep(crate::LOAD_INTERVAL * 4).await;
+        let delivered = inbound.load().delivered_bytes;
+        // usize fits in u64 on supported targets.
+        assert!(
+            (8..=crate::stream::READ_AHEAD_BYTES as u64).contains(&delivered),
+            "{delivered}"
+        );
+        assert!(recv.read_chunk(usize::MAX).await.unwrap().is_some());
+    })
+    .await
+    .unwrap();
+}

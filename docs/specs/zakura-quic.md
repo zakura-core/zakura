@@ -294,6 +294,11 @@ The driver follows the P2P stack's routine and reactor pattern. No lock guards a
   the application asks for data. Flow-control credit therefore follows what
   the application consumes, and Zakura's stream queue limits reach the peer as
   flow control.
+  A read takes at most the bytes it asked for, capped at 256 KiB
+  (`READ_BATCH_BYTES`). `read` and `read_exact` ask for at least 4 KiB
+  (`READ_AHEAD_BYTES`), so a small frame costs one request. A frame-header
+  read therefore leaves a large body in `quinn-proto`, under the peer's flow
+  control, until the application asks for it.
 - **DRV-7.** Dropping the last `Conn` handle closes the connection with code 0.
   Stream handles hold the connection open. Dropping the last `QuicEndpoint`
   handle closes the endpoint (API-7).

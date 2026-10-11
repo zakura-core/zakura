@@ -147,7 +147,8 @@ struct ConnTask {
     /// answer, until the handle finishes, resets or drops it. A later write
     /// gets `Stopped(code)` instead of the reset stream's `ClosedStream`.
     stopped: HashMap<StreamId, VarInt>,
-    reads: HashMap<StreamId, oneshot::Sender<ReadReply>>,
+    /// Each stream's waiting read and the most bytes it asked for.
+    reads: HashMap<StreamId, (oneshot::Sender<ReadReply>, usize)>,
     recv_ends: HashMap<StreamId, RecvEnd>,
 
     send_buf: Vec<u8>,
@@ -568,7 +569,7 @@ impl ConnTask {
         for reply in self.openers.drain(..).chain(self.acceptors.drain(..)) {
             let _ = reply.send(Err(reason.clone()));
         }
-        for (_, reply) in self.reads.drain() {
+        for (_, (reply, _)) in self.reads.drain() {
             let _ = reply.send(Err(ReadError::ConnectionLost(reason.clone())));
         }
         for (_, state) in self.sends.drain() {
@@ -666,8 +667,8 @@ impl ConnTask {
                     self.serve_openers();
                 }
             }
-            ConnCmd::Read { id, reply } => {
-                self.reads.insert(id, reply);
+            ConnCmd::Read { id, max, reply } => {
+                self.reads.insert(id, (reply, max));
                 self.serve_reader(id);
             }
             ConnCmd::Stop { id, code } => self.stop(id, code),
@@ -806,7 +807,7 @@ impl ConnTask {
     }
 
     fn serve_reader(&mut self, id: StreamId) {
-        let Some(reply) = self.reads.remove(&id) else {
+        let Some((reply, max)) = self.reads.remove(&id) else {
             return;
         };
         if reply.is_closed() {
@@ -825,7 +826,7 @@ impl ConnTask {
             }
         };
         let mut data = Vec::new();
-        let mut budget = READ_BATCH_BYTES;
+        let mut budget = max.clamp(1, READ_BATCH_BYTES);
         let mut end = None;
         while budget > 0 {
             match chunks.next(budget) {
@@ -861,7 +862,7 @@ impl ConnTask {
             // Nothing to read yet: park until Readable (backpressure: no
             // read, no new credit for the peer).
             (true, None) => {
-                self.reads.insert(id, reply);
+                self.reads.insert(id, (reply, max));
             }
         }
     }

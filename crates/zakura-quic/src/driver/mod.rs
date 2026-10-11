@@ -78,6 +78,9 @@ pub(crate) enum ConnCmd {
     },
     Read {
         id: StreamId,
+        /// The most bytes to take from quinn-proto, capped at
+        /// [`READ_BATCH_BYTES`].
+        max: usize,
         reply: oneshot::Sender<ReadReply>,
     },
     Stop {

@@ -18,6 +18,7 @@ use std::{
 };
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
+use bytes::Bytes;
 use futures::{future::BoxFuture, StreamExt as _};
 use rand::{rngs::OsRng, RngCore};
 use thiserror::Error;
@@ -5044,9 +5045,9 @@ async fn write_ordered_frame_with_policy(
     }
     let frame = frame.encode(max_frame_bytes)?;
     match write_policy {
-        StreamWritePolicy::UntilCancelled => send.write_all(&frame).await?,
+        StreamWritePolicy::UntilCancelled => send.write_chunk(Bytes::from(frame)).await?,
         StreamWritePolicy::Timeout(duration) => {
-            timeout(duration, send.write_all(&frame))
+            timeout(duration, send.write_chunk(Bytes::from(frame)))
                 .await
                 .map_err(|_| -> BoxError { Box::new(OrderedFrameWriteTimeout) })??
         }
@@ -5126,11 +5127,14 @@ async fn write_outbound_request_frame_inner(
         .map_err(|_| -> BoxError { "Zakura outbound request prelude write timed out".into() })
         .map_err(OutboundRequestError::Local)?
         .map_err(|error| OutboundRequestError::Local(Box::new(error)))?;
-    timeout(OUTBOUND_STREAM_WRITE_TIMEOUT, send.write_all(&frame))
-        .await
-        .map_err(|_| -> BoxError { "Zakura outbound request frame write timed out".into() })
-        .map_err(OutboundRequestError::Local)?
-        .map_err(|error| OutboundRequestError::Local(Box::new(error)))?;
+    timeout(
+        OUTBOUND_STREAM_WRITE_TIMEOUT,
+        send.write_chunk(Bytes::from(frame)),
+    )
+    .await
+    .map_err(|_| -> BoxError { "Zakura outbound request frame write timed out".into() })
+    .map_err(OutboundRequestError::Local)?
+    .map_err(|error| OutboundRequestError::Local(Box::new(error)))?;
     let _ = send.finish();
 
     let mut frames = Vec::new();
@@ -5721,9 +5725,12 @@ async fn write_response_frame(
         return Err(ZakuraHandlerError::Oversize);
     }
     let frame = frame.encode(max_frame_bytes)?;
-    timeout(OUTBOUND_STREAM_WRITE_TIMEOUT, send.write_all(&frame))
-        .await
-        .map_err(|_| ZakuraHandlerError::Timeout("frame write"))??;
+    timeout(
+        OUTBOUND_STREAM_WRITE_TIMEOUT,
+        send.write_chunk(Bytes::from(frame)),
+    )
+    .await
+    .map_err(|_| ZakuraHandlerError::Timeout("frame write"))??;
     Ok(())
 }
 

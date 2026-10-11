@@ -430,34 +430,22 @@ where
     /// Exhaustion is sticky for as long as the entry lives: a peer cannot buy a fresh set of
     /// re-requests by poisoning the same hash again.
     ///
-    /// Budgets are scoped to the tip they were recorded against, and dropped on the first
-    /// rejection after the tip moves — the clear is lazy, so if the attack simply stops, one
-    /// tip's worth of entries stays resident until the next rejection or process exit. That is
-    /// the natural lifetime: this check only ever fires for children of the *current* tip, so an
-    /// entry from an older tip could never be consulted again. It also bounds the map without
-    /// relying on the gossip path resolving the block, which it usually does not — the syncer
-    /// commonly downloads it instead, which is what exhaustion explicitly asks for, and the
-    /// syncer's downloads never reach the release point in this stream's `poll_next`.
+    /// Budgets are scoped to the best tip observed when retrying, and are cleared lazily
+    /// when that tip changes. Stateless height authentication can reject a body at any
+    /// height: this is not evidence that the hash is a child of the current tip. Rejected
+    /// historical or unknown hashes can therefore occupy the bounded table until a
+    /// successful verification releases their entry or a tip change clears it. A tip
+    /// change can also rearm a previously exhausted hash.
     ///
-    /// Clearing on a tip change is not a way to re-arm an exhausted budget. Once the tip moves,
-    /// the exhausted hash is no longer a child of it, so it can never produce a mismatch again
-    /// and its fresh budget is unreachable. The one exception is a reorg back to the original
-    /// tip, which costs the attacker further bannable addresses to exploit.
-    ///
-    /// The tip is read here, not when the body was rejected, so the two can disagree — most often
-    /// because the syncer committed that very block in between. The consequences are contained:
-    /// the entry is filed under a tip the hash is not a child of, where it is dead weight until
-    /// the next clear, and the replacement download is dispatched for a block that may already be
-    /// committed. The latter is benign only because `download_and_verify` queries the state for
-    /// the block before issuing any network request, so it short-circuits without touching a
-    /// peer. That ordering is a real dependency of this design.
+    /// The unbound body's claimed height is not trusted, so it cannot safely decide
+    /// whether to skip recovery. Restricting retries to live recovery candidates requires
+    /// authenticated eligibility evidence or a separate budget-retention policy.
     ///
     /// Returns the [`DownloadAction`] otherwise. The queue bounds can refuse the replacement, in
     /// which case the budget is spent without dispatching anything; that case is logged here, so
     /// callers do not need to inspect the result.
     pub fn retry_poisoned(&mut self, hash: block::Hash) -> Option<DownloadAction> {
-        // The tip is read here, later than the rejection read it, so the two can disagree —
-        // usually because the syncer committed the block in between. See the method docs.
+        // Scope accounting to the current tip; this does not authenticate the body's height.
         let tip_hash = self.latest_chain_tip.best_tip_hash();
 
         let Some(retry_attempt) = self.poisoned_retries.consume(hash, tip_hash) else {

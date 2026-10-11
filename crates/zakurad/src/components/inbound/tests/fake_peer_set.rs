@@ -916,7 +916,7 @@ async fn mempool_transaction_expiration() -> Result<(), crate::BoxError> {
 /// Test that a gossiped block with a rewritten coinbase height scores its supplying peer, and
 /// that the block is re-requested instead of being left for the syncer.
 ///
-/// This pins the *consumer* side of the check. `Inbound::poll_ready` identifies the rejection by
+/// This pins the *consumer* side of the check. The inbound completion task identifies rejection by
 /// downcasting the boxed error to [`GossipedUnboundHeight`], so it depends on the inbound
 /// downloader passing that error through unwrapped. If it were ever wrapped in context — the way
 /// the syncer wraps its errors into `BlockDownloadVerifyError` — the downcast would silently stop
@@ -972,22 +972,10 @@ async fn inbound_poisoned_coinbase_height_scores_and_requeues() -> Result<(), cr
             Some(advertiser_addr),
         ))]));
 
-    // The score is sent from `Inbound::poll_ready`, which drains the finished download tasks.
-    // The buffered service only polls its inner service when it has work, so drive it with a
-    // cheap request until the report lands.
-    let mut report = None;
-    for _ in 0..50 {
-        let _ = inbound_service
-            .clone()
-            .oneshot(Request::MempoolTransactionIds)
-            .await;
-
-        if let Ok(received) = timeout(Duration::from_millis(100), misbehavior_rx.recv()).await {
-            report = Some(received);
-            break;
-        }
-    }
-    let report = report.expect("a poisoned gossip block must score its advertiser");
+    // No subsequent inbound request should be needed to score the supplier or retry.
+    let report = timeout(Duration::from_secs(5), misbehavior_rx.recv())
+        .await
+        .expect("idle inbound must process the poisoned download");
 
     assert_eq!(
         report,

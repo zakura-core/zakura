@@ -83,12 +83,6 @@ pub(crate) fn new_tip_timeout(
     }
 }
 
-/// The number of target spacings before the standard-difficulty `max_time` at which the state
-/// switches a fresh Testnet template to minimum difficulty.
-///
-/// Matches `EXTRA_SPACINGS_TO_MINE_A_BLOCK` in `zakura_state::service::read::difficulty`.
-const EXTRA_SPACINGS_TO_MINE_A_BLOCK: i32 = 2;
-
 /// How long [`run()`] waits before retrying, when Zebra isn't synced to the chain tip, or the state
 /// and the mempool disagree about the tip.
 const RETRY_DELAY: Duration = Duration::from_secs(1);
@@ -171,17 +165,10 @@ impl TemplateCache {
         // At the full 90-minute median-time cap, even a fresh build clamps to the same max_time.
         // Regtest deliberately uses historical chain time rather than the wall clock.
         //
-        // The state builds a minimum-difficulty template once fewer than
-        // `EXTRA_SPACINGS_TO_MINE_A_BLOCK` target spacings remain before the standard-difficulty
-        // max_time, so stop serving the cached template at that point too. The consensus rule
-        // applies at the candidate block's height.
+        // State switches to minimum difficulty one second after the last valid standard-
+        // difficulty timestamp. The consensus rule applies at the candidate block's height.
         let height = Height(template.height);
-        let extra_time_to_mine_a_block = Duration32::try_from(
-            NetworkUpgrade::target_spacing_for_height(network, height)
-                * EXTRA_SPACINGS_TO_MINE_A_BLOCK,
-        )
-        .unwrap_or(Duration32::MAX);
-        if now > template.max_time.saturating_sub(extra_time_to_mine_a_block)
+        if now > template.max_time
             && !network.is_regtest()
             && NetworkUpgrade::minimum_difficulty_spacing_for_height(network, height).is_some()
             && template.bits != network.target_difficulty_limit().to_compact()

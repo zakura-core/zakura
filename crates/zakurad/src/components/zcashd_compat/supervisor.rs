@@ -570,18 +570,13 @@ async fn terminate_child(
 
     #[cfg(unix)]
     {
-        use nix::{
-            sys::signal::{kill, Signal::SIGTERM},
-            unistd::Pid,
-        };
-
         if let Some(id) = pid {
             info!(
                 pid = id,
                 grace_period = ?shutdown_grace_period,
                 "sending SIGTERM to zcashd-compat zcashd child"
             );
-            if let Err(error) = kill(Pid::from_raw(id as i32), SIGTERM) {
+            if let Err(error) = super::unix::signal_process(id, libc::SIGTERM) {
                 warn!(
                     pid = id,
                     ?error,

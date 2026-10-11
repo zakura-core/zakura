@@ -1,5 +1,6 @@
 //! Authorizing digests for Zcash transactions.
 
+use crate::serialization::ZcashReader;
 use std::{array::TryFromSliceError, fmt, sync::Arc};
 
 use hex::{FromHex, ToHex};
@@ -163,7 +164,9 @@ impl ZcashSerialize for AuthDigest {
 }
 
 impl ZcashDeserialize for AuthDigest {
-    fn zcash_deserialize<R: std::io::Read>(mut reader: R) -> Result<Self, SerializationError> {
+    fn zcash_deserialize_from<R: std::io::Read>(
+        reader: &mut ZcashReader<R>,
+    ) -> Result<Self, SerializationError> {
         Ok(reader.read_32_bytes()?.into())
     }
 }

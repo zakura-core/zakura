@@ -80,15 +80,7 @@ fn only_current_work_is_served() {
     let cache = TemplateCache::default();
     let current = template_with_max_time(&network, max_time);
     let tip_hash = current.previous_block_hash;
-    // The state switches to minimum difficulty two target spacings before this abbreviated
-    // time range ends.
-    let switchover = max_time.saturating_sub(
-        Duration32::try_from(
-            NetworkUpgrade::target_spacing_for_height(&network, Height(current.height))
-                * EXTRA_SPACINGS_TO_MINE_A_BLOCK,
-        )
-        .expect("two target spacings fit in a Duration32"),
-    );
+    let switchover = max_time;
 
     assert!(cache
         .template_for_tip(tip_hash, &network, switchover)
@@ -460,8 +452,8 @@ fn cached_testnet_work_expires_at_the_first_minimum_difficulty_height() {
     );
 }
 
-/// The state switches a fresh Testnet template to minimum difficulty two target spacings before
-/// the standard-difficulty `max_time`. The cache must stop serving the harder work then too.
+/// The state switches to minimum difficulty one second after the last standard-difficulty
+/// timestamp. The cache must retain work through that inclusive boundary.
 #[test]
 fn cached_testnet_work_follows_the_minimum_difficulty_switchover() {
     let _init_guard = zakura_test::init();
@@ -473,11 +465,7 @@ fn cached_testnet_work_follows_the_minimum_difficulty_switchover() {
     let tip_hash = template.previous_block_hash;
     cache.publish(abbreviated_testnet_template(&net, height, max_time));
 
-    let extra_time = Duration32::try_from(
-        NetworkUpgrade::target_spacing_for_height(&net, height) * EXTRA_SPACINGS_TO_MINE_A_BLOCK,
-    )
-    .expect("two target spacings fit in a Duration32");
-    let switchover = max_time.saturating_sub(extra_time);
+    let switchover = max_time;
 
     assert!(
         cache.template_for_tip(tip_hash, &net, switchover).is_some(),

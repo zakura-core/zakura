@@ -179,7 +179,6 @@ def resolve_bundle(
     latest_url: str,
     output_dir: Path,
     metadata_out: Path,
-    max_age_hours: int,
     *,
     fetch: Callable[[str, int], bytes] = _download,
     now: datetime | None = None,
@@ -189,8 +188,6 @@ def resolve_bundle(
     latest_parts = _validate_url(latest_url, "latest URL")
     if not latest_parts.path.endswith("/latest.json"):
         raise BundleError("latest URL path must end with /latest.json")
-    if max_age_hours <= 0 or max_age_hours > 30 * 24:
-        raise BundleError("maximum bundle age must be between 1 and 720 hours")
     if output_dir.exists():
         raise BundleError(f"output directory already exists: {output_dir}")
 
@@ -220,7 +217,6 @@ def resolve_bundle(
         metadata_out,
         fetch=fetch,
         now=now,
-        max_age_hours=max_age_hours,
         expected={
             "height": height,
             "block_hash": block_hash,
@@ -256,7 +252,6 @@ def resolve_pinned_bundle(
         metadata_out,
         fetch=fetch,
         now=now,
-        max_age_hours=None,
         expected=None,
     )
 
@@ -269,7 +264,6 @@ def _resolve_from_meta(
     *,
     fetch: Callable[[str, int], bytes],
     now: datetime | None,
-    max_age_hours: int | None,
     expected: dict[str, Any] | None,
 ) -> dict[str, Any]:
     """Download and verify one immutable bundle from its digest-pinned meta URL."""
@@ -301,10 +295,6 @@ def _resolve_from_meta(
     now = now or datetime.now(timezone.utc)
     if generated_at > now + FUTURE_SKEW:
         raise BundleError("meta.generated_at is unexpectedly in the future")
-    # A caller that pinned a digest chose this bundle deliberately, and reproducing a published
-    # artifact means fetching an old one, so staleness is only an error on the pointer path.
-    if max_age_hours is not None and now - generated_at > timedelta(hours=max_age_hours):
-        raise BundleError(f"release-state bundle is older than {max_age_hours} hours")
 
     files = _object(meta["files"], "meta.files")
     _check_keys(files, set(FILE_LIMITS), set(), "meta.files")
@@ -430,7 +420,6 @@ def _self_test() -> int:
                     url,
                     Path(scratch) / "bundle",
                     Path(scratch) / "resolution.json",
-                    kwargs.pop("max_age_hours", 48),
                     fetch=fake_fetch,
                     now=now,
                     **kwargs,
@@ -488,8 +477,6 @@ def _self_test() -> int:
             def age(meta: dict[str, Any]) -> None:
                 meta["generated_at"] = "2025-01-01T00:00:00Z"
 
-            # Reproducing a published artifact means fetching an old bundle on purpose, so the
-            # freshness rule that guards the pointer path must not apply here.
             resolution = self.resolve_pinned(build(meta_mutate=age))
             self.assertEqual(resolution["generated_at"], "2025-01-01T00:00:00Z")
 
@@ -573,8 +560,8 @@ def _self_test() -> int:
             with self.assertRaisesRegex(BundleError, "immutable bundle path"):
                 self.resolve(responses)
 
-        def test_stale_bundle_rejected(self):
-            stamp = "2026-07-01T00:00:00Z"
+        def test_old_bundle_is_accepted(self):
+            stamp = "2025-01-01T00:00:00Z"
 
             def make_stale(meta: dict[str, Any]) -> None:
                 meta["generated_at"] = stamp
@@ -583,7 +570,21 @@ def _self_test() -> int:
                 meta_mutate=make_stale,
                 latest_mutate=lambda latest: latest.update(generated_at=stamp),
             )
-            with self.assertRaisesRegex(BundleError, "older than"):
+            resolution = self.resolve(responses)
+            self.assertEqual(resolution["generated_at"], stamp)
+            self.assertEqual(resolution["height"], 3415600)
+
+        def test_old_bundle_digest_mismatch_rejected(self):
+            responses = build(
+                meta_mutate=lambda meta: meta.update(
+                    generated_at="2025-01-01T00:00:00Z"
+                ),
+                file_overrides={
+                    f"https://{host}/release-state/v1/3415600/mainnet-frontier.bin":
+                    b"\x00" * len(frontier)
+                },
+            )
+            with self.assertRaisesRegex(BundleError, "digest does not match"):
                 self.resolve(responses)
 
         def test_future_bundle_rejected(self):
@@ -637,7 +638,6 @@ def main() -> int:
     parser.add_argument("--meta-sha256", help="expected digest of --meta-url")
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--metadata-out", type=Path)
-    parser.add_argument("--max-age-hours", type=int, default=48)
     args = parser.parse_args()
 
     if args.self_test:
@@ -662,7 +662,6 @@ def main() -> int:
                 args.latest_url,
                 args.output_dir,
                 args.metadata_out,
-                args.max_age_hours,
             )
     except BundleError as error:
         print(f"release-state fetch failed: {error}", file=sys.stderr)

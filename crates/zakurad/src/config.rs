@@ -4,12 +4,14 @@
 //! application's configuration file and/or command-line options
 //! for specifying it.
 
-use std::{collections::HashMap, path::PathBuf};
+use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 use zakura_rpc::config::mining::{default_miner_address, MinerAddressType};
 
-use crate::components::With;
+use crate::{components::With, BoxError};
+
+mod loader;
 
 /// Centralized, case-insensitive suffix-based deny-list to ban setting config fields with
 /// environment variables if those config field names end with any of these suffixes.
@@ -41,14 +43,14 @@ fn is_sensitive_leaf_key(leaf_key: &str) -> bool {
 ///
 /// The path to the configuration file can also be specified with the `--config` flag when running Zakura.
 ///
-/// The default path to the `zakurad` config is platform dependent, based on
-/// [`dirs::preference_dir`](https://docs.rs/dirs/latest/dirs/fn.preference_dir.html):
+/// The default path to the `zakurad` config uses the platform's preferences
+/// directory:
 ///
 /// | Platform | Value                                 | Example                                        |
 /// | -------- | ------------------------------------- | ---------------------------------------------- |
 /// | Linux    | `$XDG_CONFIG_HOME` or `$HOME/.config` | `/home/alice/.config/zakura.toml`              |
 /// | macOS    | `$HOME/Library/Preferences`           | `/Users/Alice/Library/Preferences/zakura.toml` |
-/// | Windows  | `{FOLDERID_RoamingAppData}`           | `C:\Users\Alice\AppData\Local\zakura.toml`     |
+/// | Windows  | `{FOLDERID_LocalAppData}`           | `C:\Users\Alice\AppData\Local\zakura.toml`     |
 #[derive(Clone, Default, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct ZakuradConfig {
@@ -113,10 +115,18 @@ impl ZakuradConfig {
     ///
     /// See [`DENY_CONFIG_KEY_SUFFIX_LIST`] and [`is_sensitive_leaf_key()`] above
     ///
+    /// # Platform behavior
+    ///
+    /// Prefix matching is case-sensitive; field names are lowercased.
+    /// Environment values undergo legacy scalar coercions. Quotes and
+    /// whitespace are retained; home and shell variable expressions are not
+    /// expanded. Non-Unicode names and unrelated non-Unicode values are ignored.
+    /// A matching variable with a non-Unicode value returns an error.
+    ///
     /// # Examples
     /// - `ZAKURA_NETWORK__NETWORK=Testnet` sets `network.network = "Testnet"`
     /// - `ZAKURA_RPC__LISTEN_ADDR=127.0.0.1:8232` sets `rpc.listen_addr = "127.0.0.1:8232"`
-    pub fn load(config_path: Option<PathBuf>) -> Result<Self, config::ConfigError> {
+    pub fn load(config_path: Option<PathBuf>) -> Result<Self, BoxError> {
         Self::load_with_env_prefixes(config_path, &["ZEBRA", "ZAKURA"])
     }
 
@@ -126,75 +136,9 @@ impl ZakuradConfig {
     pub(crate) fn load_with_env_prefixes(
         config_path: Option<PathBuf>,
         env_prefixes: &[&str],
-    ) -> Result<Self, config::ConfigError> {
-        // 1. Start with an empty `config::Config` builder (no pre-populated values).
-        // We merge sources, then deserialize into `ZakuradConfig`, which uses
-        // `ZakuradConfig::default()` wherever keys are missing.
-        let mut builder = config::Config::builder();
-
-        // 2. Add TOML configuration file as a source if provided
-        if let Some(path) = config_path {
-            builder = builder.add_source(
-                config::File::from(path)
-                    .format(config::FileFormat::Toml)
-                    .required(true),
-            );
-        }
-
-        // 3. Load from environment variables (with a sensitive-leaf deny-list).
-        // Later prefixes override earlier prefixes.
-        for env_prefix in env_prefixes {
-            let filtered_env = filtered_env_vars(env_prefix)?;
-
-            if env_prefix.starts_with("ZEBRA") && !filtered_env.is_empty() {
-                tracing::warn!(
-                    "ZEBRA_* config environment variables are deprecated; use ZAKURA_* instead"
-                );
-            }
-
-            // When using `source`, we provide a map of already-filtered and processed
-            // keys, so we use a default `Environment` without a prefix.
-            builder = builder.add_source(
-                config::Environment::default()
-                    .separator("__")
-                    .try_parsing(true)
-                    .source(Some(filtered_env)),
-            );
-        }
-
-        // Build the configuration
-        let config = builder.build()?;
-        // Deserialize into our struct, which will use defaults for any missing fields
-        config.try_deserialize()
+    ) -> Result<Self, BoxError> {
+        loader::load(config_path, env_prefixes)
     }
-}
-
-/// Returns environment variables matching `env_prefix`, stripped of that prefix.
-fn filtered_env_vars(env_prefix: &str) -> Result<HashMap<String, String>, config::ConfigError> {
-    // We filter the raw environment first, then let config-rs parse types via try_parsing(true).
-    let mut filtered_env: HashMap<String, String> = HashMap::new();
-    let required_prefix = format!("{env_prefix}_");
-
-    for (key, value) in std::env::vars() {
-        if let Some(without_prefix) = key.strip_prefix(&required_prefix) {
-            // Check for sensitive keys on the stripped key.
-            let parts: Vec<&str> = without_prefix.split("__").collect();
-            if let Some(leaf) = parts.last() {
-                if is_sensitive_leaf_key(leaf) {
-                    return Err(config::ConfigError::Message(format!(
-                        "Environment variable '{}' contains sensitive key '{}' which cannot be overridden via environment variables. \
-                         Use the configuration file instead to prevent process table exposure.",
-                        key, leaf
-                    )));
-                }
-            }
-
-            // When providing a `source` map, the keys should not have the prefix.
-            filtered_env.insert(without_prefix.to_string(), value);
-        }
-    }
-
-    Ok(filtered_env)
 }
 
 impl With<MinerAddressType> for ZakuradConfig {

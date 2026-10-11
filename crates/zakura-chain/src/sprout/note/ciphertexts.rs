@@ -1,9 +1,10 @@
 //! Encrypted parts of Sprout notes.
 
+use crate::serialization::ZcashReader;
+use std::io::Read as _;
 use std::{fmt, io};
 
 use serde::{Deserialize, Serialize};
-use serde_big_array::BigArray;
 
 use crate::serialization::{SerializationError, ZcashDeserialize, ZcashSerialize};
 
@@ -11,7 +12,9 @@ use crate::serialization::{SerializationError, ZcashDeserialize, ZcashSerialize}
 ///
 /// Corresponds to the Sprout 'encCiphertext's
 #[derive(Serialize, Deserialize)]
-pub struct EncryptedNote(#[serde(with = "BigArray")] pub [u8; 601]);
+pub struct EncryptedNote(
+    #[serde(with = "crate::serialization::serde_adapters::bytes")] pub [u8; 601],
+);
 
 impl fmt::Debug for EncryptedNote {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
@@ -47,7 +50,9 @@ impl ZcashSerialize for EncryptedNote {
 }
 
 impl ZcashDeserialize for EncryptedNote {
-    fn zcash_deserialize<R: io::Read>(mut reader: R) -> Result<Self, SerializationError> {
+    fn zcash_deserialize_from<R: io::Read>(
+        reader: &mut ZcashReader<R>,
+    ) -> Result<Self, SerializationError> {
         let mut bytes = [0; 601];
         reader.read_exact(&mut bytes[..])?;
         Ok(Self(bytes))

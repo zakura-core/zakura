@@ -1214,6 +1214,7 @@ async fn mempool_request_with_missing_input_is_rejected() {
     }
 }
 
+/// A present transparent input with an unlocked lock time is accepted.
 #[tokio::test]
 async fn mempool_request_with_present_input_is_accepted() {
     let mut state: MockService<_, _, _, _> = MockService::build().for_prop_tests();
@@ -1357,73 +1358,6 @@ async fn mempool_request_with_invalid_lock_time_is_rejected() {
         Err(TransactionError::LockedUntilAfterBlockTime(
             Utc.timestamp_opt(u32::MAX.into(), 0).unwrap()
         ))
-    );
-}
-
-#[tokio::test]
-async fn mempool_request_with_unlocked_lock_time_is_accepted() {
-    let mut state: MockService<_, _, _, _> = MockService::build().for_prop_tests();
-    let verifier = Verifier::new_for_tests(&Network::Mainnet, state.clone());
-
-    let height = NetworkUpgrade::Canopy
-        .activation_height(&Network::Mainnet)
-        .expect("Canopy activation height is specified");
-    let fund_height = (height - 1).expect("fake source fund block height is too small");
-    let (input, output, known_utxos) = mock_transparent_transfer(
-        fund_height,
-        true,
-        0,
-        Amount::try_from(10001).expect("invalid value"),
-    );
-
-    // Create a non-coinbase V4 tx with the last valid expiry height.
-    let tx = Transaction::V4 {
-        inputs: vec![input],
-        outputs: vec![output],
-        lock_time: LockTime::unlocked(),
-        expiry_height: height,
-        joinsplit_data: None,
-        sapling_shielded_data: None,
-    };
-
-    let input_outpoint = match tx.inputs()[0] {
-        transparent::Input::PrevOut { outpoint, .. } => outpoint,
-        transparent::Input::Coinbase { .. } => panic!("requires a non-coinbase transaction"),
-    };
-
-    tokio::spawn(async move {
-        state
-            .expect_request(zakura_state::Request::UnspentBestChainUtxo(input_outpoint))
-            .await
-            .expect("verifier should call mock state service with correct request")
-            .respond(zakura_state::Response::UnspentBestChainUtxo(
-                known_utxos
-                    .get(&input_outpoint)
-                    .map(|utxo| utxo.utxo.clone()),
-            ));
-
-        state
-            .expect_request_that(|req| {
-                matches!(
-                    req,
-                    zakura_state::Request::CheckBestChainTipNullifiersAndAnchors(_)
-                )
-            })
-            .await
-            .expect("verifier should call mock state service with correct request")
-            .respond(zakura_state::Response::ValidBestChainTipNullifiersAndAnchors);
-    });
-
-    let verifier_response = verifier
-        .oneshot(Request::Mempool {
-            transaction: tx.into(),
-            height,
-        })
-        .await;
-
-    assert!(
-        verifier_response.is_ok(),
-        "expected successful verification, got: {verifier_response:?}"
     );
 }
 
@@ -4543,47 +4477,49 @@ async fn mempool_applies_the_zip218_limits_to_ironwood_actions() {
 fn v4_deprecation_boundary() {
     let _init_guard = zakura_test::init();
 
-    let nu7 = Height(2_000_000);
     let transaction = test_transactions(&Network::Mainnet)
         .map(|(_, transaction)| transaction)
         .find(|transaction| matches!(**transaction, Transaction::V4 { .. }))
         .expect("the test vectors contain a V4 transaction");
-    let network = configured_network_with_nu7(Some(nu7));
-
-    assert!(
-        verify_v4_at(
-            &network,
-            &transaction,
-            nu7.previous().expect("NU7 is above the minimum height"),
-        )
-        .is_ok(),
-        "a V4 transaction must be valid below the NU7 activation height",
-    );
-
-    let expected = Err(TransactionError::UnsupportedByNetworkUpgrade(
-        transaction.version(),
-        NetworkUpgrade::Nu7,
-    ));
-    assert_eq!(
-        verify_v4_at(&network, &transaction, nu7),
-        expected,
-        "a V4 transaction must be invalid at the NU7 activation height",
-    );
-    assert_eq!(
-        verify_v4_at(
-            &network,
-            &transaction,
-            nu7.next().expect("NU7 is below the maximum height"),
-        ),
-        expected,
-        "a V4 transaction must be invalid after the NU7 activation height",
-    );
 
     for network in [
-        Network::Mainnet,
+        configured_network_with_nu7(Some(Height(2_000_000))),
         Network::new_default_testnet(),
-        configured_network_with_nu7(None),
     ] {
+        let nu7 = NetworkUpgrade::Nu7
+            .activation_height(&network)
+            .expect("NU7 is scheduled on configured and default Testnet");
+        assert!(
+            verify_v4_at(
+                &network,
+                &transaction,
+                nu7.previous().expect("NU7 is above the minimum height"),
+            )
+            .is_ok(),
+            "a V4 transaction must be valid below the NU7 activation height",
+        );
+
+        let expected = Err(TransactionError::UnsupportedByNetworkUpgrade(
+            transaction.version(),
+            NetworkUpgrade::Nu7,
+        ));
+        assert_eq!(
+            verify_v4_at(&network, &transaction, nu7),
+            expected,
+            "a V4 transaction must be invalid at the NU7 activation height",
+        );
+        assert_eq!(
+            verify_v4_at(
+                &network,
+                &transaction,
+                nu7.next().expect("NU7 is below the maximum height"),
+            ),
+            expected,
+            "a V4 transaction must be invalid after the NU7 activation height",
+        );
+    }
+
+    for network in [Network::Mainnet, configured_network_with_nu7(None)] {
         assert_eq!(NetworkUpgrade::Nu7.activation_height(&network), None);
         assert!(!NetworkUpgrade::is_nu7_active(&network, Height::MAX));
         assert!(

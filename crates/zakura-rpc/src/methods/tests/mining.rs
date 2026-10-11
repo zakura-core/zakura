@@ -903,14 +903,21 @@ fn long_poll_refreshes_testnet_difficulty_after_time_limit() {
         minimum.expected_difficulty = network().target_difficulty_limit().to_compact();
         info_tx.send_replace(minimum.clone());
         tokio::time::advance(Duration::from_secs(3) + Duration::from_millis(1)).await;
-        assert!(futures::poll!(&mut request).is_pending());
+        // A cached coinbase can complete the refreshed template without a blocking worker.
+        let response = futures::poll!(&mut request);
         assert!(
             read_count.load(Ordering::SeqCst) > reads_before_expiry,
             "the time-limit timer must fetch fresh state before the mempool timer"
         );
         tokio::time::resume();
         gate.release().await;
-        let template = bounded(request).await.unwrap().try_into_template().unwrap();
+        let template = match response {
+            Poll::Ready(result) => result,
+            Poll::Pending => bounded(request).await,
+        }
+        .unwrap()
+        .try_into_template()
+        .unwrap();
         assert_eq!(template.previous_block_hash, standard.tip_hash);
         assert_eq!(template.cur_time, minimum.cur_time);
         assert!(template.cur_time > standard.max_time);
@@ -965,7 +972,8 @@ fn long_poll_refresh_deadline_survives_slow_mempool_fetch() {
             Duration::from_secs(MEMPOOL_LONG_POLL_INTERVAL) + Duration::from_millis(1),
         )
         .await;
-        assert!(futures::poll!(&mut request).is_pending());
+        // A cached coinbase can complete the refreshed template without a blocking worker.
+        let response = futures::poll!(&mut request);
         assert!(
             read_count.load(Ordering::SeqCst) > reads_before_expiry,
             "a deadline that passed during the mempool fetch must refresh right away"
@@ -973,7 +981,13 @@ fn long_poll_refresh_deadline_survives_slow_mempool_fetch() {
 
         tokio::time::resume();
         gate.release().await;
-        let template = bounded(request).await.unwrap().try_into_template().unwrap();
+        let template = match response {
+            Poll::Ready(result) => result,
+            Poll::Pending => bounded(request).await,
+        }
+        .unwrap()
+        .try_into_template()
+        .unwrap();
         assert_eq!(template.cur_time, minimum.cur_time);
         assert_eq!(template.bits, minimum.expected_difficulty);
         assert_ne!(template.long_poll_id, old_id);
@@ -1054,11 +1068,18 @@ fn long_poll_mainnet_deadline_survives_slow_state_fetch() {
         sampled.cur_time = sampled.max_time;
         info_tx.send_replace(sampled);
         tokio::time::advance(Duration::from_secs(1) + Duration::from_millis(1)).await;
-        assert!(futures::poll!(&mut request).is_pending());
+        // A cached coinbase can complete the refreshed template without a blocking worker.
+        let response = futures::poll!(&mut request);
         assert!(read_count.load(Ordering::SeqCst) > reads_before_deadline);
         tokio::time::resume();
         gate.release().await;
-        let template = bounded(request).await.unwrap().try_into_template().unwrap();
+        let template = match response {
+            Poll::Ready(result) => result,
+            Poll::Pending => bounded(request).await,
+        }
+        .unwrap()
+        .try_into_template()
+        .unwrap();
         assert_eq!(template.long_poll_id, initial.long_poll_id);
         assert_eq!(template.cur_time, initial.max_time);
         assert_eq!(template.submit_old, Some(false));

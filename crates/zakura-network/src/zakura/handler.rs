@@ -2171,7 +2171,6 @@ pub struct ZakuraProtocolHandler {
     limits: ZakuraLocalLimits,
     registry: Arc<ServiceRegistry>,
     trace: ZakuraTrace,
-    next_conn_id: Arc<AtomicU64>,
     next_stream_id: Arc<AtomicU64>,
     admission: Arc<Semaphore>,
     pending_handshakes: Arc<Semaphore>,
@@ -2264,7 +2263,6 @@ impl ZakuraProtocolHandler {
             supported_capabilities,
             registry,
             trace,
-            next_conn_id: Arc::new(AtomicU64::new(1)),
             // Stream session IDs are local correlation generations, not wire
             // sequence numbers. A random process seed prevents preserved traces
             // and late completions from colliding after a node restart.
@@ -2314,7 +2312,7 @@ impl ZakuraProtocolHandler {
     }
 
     async fn accept_connection(&self, connection: Connection) {
-        let conn_id = self.next_conn_id.fetch_add(1, Ordering::Relaxed);
+        let conn_id = trace_conn_id(&connection);
         let Ok(_admission) = self.admission.clone().try_acquire_owned() else {
             metrics::counter!("zakura.p2p.conn.rejected.admission").increment(1);
             let conn = ZakuraConnTrace::without_peer_on(&self.trace, conn_id);
@@ -4187,15 +4185,17 @@ fn native_dial_timeout(config: &QuicConfig, addrs: usize, control_timeout: Durat
     control_timeout.max(last_start.saturating_add(attempt))
 }
 
+/// The trace ID of a native connection, shared with the `quic_conn` table.
+fn trace_conn_id(connection: &Connection) -> u64 {
+    // usize is at most 64 bits on every supported target.
+    connection.stable_id() as u64
+}
+
 pub(crate) async fn serve_native_dial_connection(
     endpoint: &ZakuraEndpoint,
     node_addr: NodeAddr,
     limits: &ZakuraLocalLimits,
 ) -> Result<(), ZakuraHandlerError> {
-    let conn_id = endpoint
-        .handler
-        .next_conn_id
-        .fetch_add(1, Ordering::Relaxed);
     let _admission = endpoint
         .handler
         .admission
@@ -4214,7 +4214,11 @@ pub(crate) async fn serve_native_dial_connection(
         .map_err(|_| ZakuraHandlerError::Timeout("native dial"))??;
     let remote_node_id = connection.remote_id();
     let peer_id = ZakuraPeerId::new(remote_node_id.as_bytes().to_vec())?;
-    let conn = ZakuraConnTrace::new(&endpoint.handler.trace, conn_id, &peer_id);
+    let conn = ZakuraConnTrace::new(
+        &endpoint.handler.trace,
+        trace_conn_id(&connection),
+        &peer_id,
+    );
     let local_node_id = endpoint.local_node_id();
     let local_peer_id = ZakuraPeerId::new(local_node_id.as_bytes().to_vec())?;
     let negotiated = {

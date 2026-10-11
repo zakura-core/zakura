@@ -519,6 +519,14 @@ impl ZakuraTrace {
             };
             let rtt_micros = u64::try_from(sample.rtt.as_micros()).unwrap_or(u64::MAX);
             row.insert("event".to_string(), Value::String(event.to_string()));
+            // usize is at most 64 bits on every supported target.
+            insert_optional_u64(row, "conn", Some(sample.stable_id as u64));
+            let direction = if sample.outbound {
+                "outbound"
+            } else {
+                "inbound"
+            };
+            insert_optional_str(row, "direction", Some(direction));
             insert_optional_str(row, "peer", peer.as_deref());
             row.insert("admitted_ip".to_string(), Value::String(admitted_ip));
             insert_optional_u64(row, "rtt_micros", Some(rtt_micros));
@@ -879,6 +887,8 @@ mod tests {
     #[test]
     fn quic_conn_rows_redact_the_admitted_ip_unless_exposed() {
         let sample = zakura_quic::ConnSample {
+            stable_id: 17,
+            outbound: true,
             remote_id: zakura_quic::NodeSecretKey::from_bytes(&[5; 32]).public(),
             admitted_ip: "203.0.113.9".parse().expect("test address parses"),
             rtt: std::time::Duration::from_millis(42),
@@ -903,6 +913,8 @@ mod tests {
 
         let redacted = row(false);
         assert_eq!(redacted["event"], "closed");
+        assert_eq!(redacted["conn"], 17);
+        assert_eq!(redacted["direction"], "outbound");
         assert_eq!(redacted["admitted_ip"], "v4redacted");
         assert_eq!(redacted["rtt_micros"], 42_000);
         assert_eq!(redacted["bytes_in_flight"], 4_800);

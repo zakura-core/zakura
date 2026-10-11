@@ -897,6 +897,8 @@ impl ConnTask {
         // Precision loss above 2^53 bytes doesn't matter for a histogram.
         metrics::histogram!("zakura.quic.path.cwnd_bytes").record(path.cwnd as f64);
         ConnSample {
+            stable_id: self.shared.stable_id,
+            outbound: self.conn.side().is_client(),
             remote_id: self.remote_id.unwrap_or_else(|| {
                 unreachable!("samples run only after the handshake set remote_id")
             }),

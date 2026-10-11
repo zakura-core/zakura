@@ -28,6 +28,10 @@ pub type BanCheck = Arc<dyn Fn(IpAddr) -> bool + Send + Sync>;
 /// One per-connection sample, for the `quic_conn` trace table (OBS-3).
 #[derive(Clone, Debug)]
 pub struct ConnSample {
+    /// The connection's process-unique ID, as [`Conn::stable_id`] returns.
+    pub stable_id: usize,
+    /// Whether this node dialed the connection.
+    pub outbound: bool,
     /// The TLS-proven remote node ID.
     pub remote_id: NodeId,
     /// The admitted IP (PATH-4).

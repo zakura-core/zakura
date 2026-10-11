@@ -1227,18 +1227,24 @@ async fn final_sample_names_the_local_close_cause() {
         let (server, _client, conn, inbound) = held_pair(8).await;
         let (samples, mut sampled) = mpsc::unbounded_channel();
         server.set_conn_observer(Arc::new(move |sample: &crate::ConnSample| {
-            let _ = samples.send(sample.close_reason.clone());
+            let _ = samples.send(sample.clone());
         }));
+        let inbound_id = inbound.stable_id();
         inbound.close(VarInt::from_u32(3), b"too slow");
-        let reason = loop {
-            if let Some(reason) = sampled.recv().await.unwrap() {
-                break reason;
+        let sample = loop {
+            let sample = sampled.recv().await.unwrap();
+            if sample.close_reason.is_some() {
+                break sample;
             }
         };
+        let reason = sample.close_reason.unwrap();
         assert!(
             reason.contains("code 3") && reason.contains("too slow"),
             "{reason}"
         );
+        // The sample joins to the handle that owns the connection.
+        assert_eq!(sample.stable_id, inbound_id);
+        assert!(!sample.outbound, "the server accepted this connection");
         drop(conn);
     })
     .await

@@ -16172,6 +16172,38 @@ fn observed_size_estimates_preserve_reservations_and_memory_exposure() {
 }
 
 #[test]
+fn stale_body_after_forward_reset_does_not_retrain_size_estimate() {
+    let queue = work_queue_with(0, [needed(1, BlockSizeEstimate::Unknown)]);
+    let owner = test_work_scope().bind(7, std::num::NonZeroU64::new(1).unwrap());
+    queue.take_for_request(
+        block::Height(1),
+        block::Height(1),
+        1,
+        u64::MAX,
+        7,
+        owner.request_id,
+    );
+    queue.mark_reserved_for_owner(owner, [block::Height(1)]);
+
+    // A forward reset leaves the old reservation until its routine settles it.
+    queue.reset_above(block::Height(1));
+    assert_eq!(
+        queue.receive_body_for_owner(owner, block::Height(1), 1024),
+        Some(block::MAX_BLOCK_BYTES)
+    );
+    queue.extend(test_work_scope(), [needed(2, BlockSizeEstimate::Unknown)]);
+    assert_eq!(
+        queue
+            .pending_item(block::Height(2))
+            .unwrap()
+            .estimated_bytes,
+        block::MAX_BLOCK_BYTES,
+        "a body below the reset floor must not train the new estimate"
+    );
+    assert_eq!(queue.reserved_bytes(), 0);
+}
+
+#[test]
 fn observed_size_estimates_keep_the_measured_size_of_a_deferred_body() {
     let queue = work_queue_with(0, (2..=100).map(|h| needed(h, BlockSizeEstimate::Unknown)));
     let deferred = test_work_scope().bind(7, std::num::NonZeroU64::new(1).unwrap());

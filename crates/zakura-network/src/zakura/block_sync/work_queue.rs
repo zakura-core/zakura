@@ -669,7 +669,9 @@ impl WorkQueue {
                 }
                 (item.budget.release_reserved(), item.owner, observation)
             };
-            if let Some(bytes) = observation {
+            // A forward reset can retain an old reservation below the new floor.
+            // Settle it normally, but do not train the reset estimator from it.
+            if let Some(bytes) = observation.filter(|_| height > inner.floor) {
                 let previous = inner.unknown_estimate();
                 let sample = bytes.clamp(inner.floor_estimate_bytes, block::MAX_BLOCK_BYTES);
                 inner.observed_estimate_bytes = (previous.saturating_mul(7).saturating_add(sample)

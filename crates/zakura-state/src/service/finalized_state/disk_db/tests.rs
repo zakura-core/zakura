@@ -14,6 +14,24 @@ use crate::{
 };
 
 #[test]
+fn preserving_reused_source_format_does_not_recreate_a_moved_directory() {
+    let cache = tempfile::tempdir().expect("temporary directory exists");
+    let source = cache.path().join("source");
+    let destination = cache.path().join("destination");
+    std::fs::create_dir(&source).expect("source directory is created");
+    let version = Version::new(1, 2, 3);
+    DiskDb::preserve_source_format(&source.join("version"), &version)
+        .expect("existing source version is preserved");
+    std::fs::rename(&source, &destination).expect("competing startup moves the source");
+    assert!(DiskDb::preserve_source_format(&source.join("version"), &version).is_err());
+    assert!(!source.exists(), "the moved source must not be recreated");
+    assert_eq!(
+        std::fs::read_to_string(destination.join("version")).unwrap(),
+        "1.2.3"
+    );
+}
+
+#[test]
 fn automatic_major_database_reuse_validates_source_and_preserves_data() {
     let _init_guard = zakura_test::init();
     for version_file in [Some("1.0.0"), Some("0.0"), None] {

@@ -14,6 +14,7 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet},
     fmt::{Debug, Write},
     fs,
+    io::{self, Write as _},
     ops::RangeBounds,
     path::Path,
     sync::{
@@ -34,7 +35,7 @@ use zakura_chain::{
 use crate::{
     database_format_version_on_disk,
     service::finalized_state::disk_format::{FromDisk, IntoDisk},
-    write_database_format_version_to_disk, Config, StateInitError,
+    Config, StateInitError,
 };
 
 use super::zakura_db::transparent::{
@@ -1442,6 +1443,23 @@ impl DiskDb {
 
     // Private methods
 
+    /// Preserve the version only while the source directory still exists.
+    /// A competing startup can move it at any point; never recreate that path.
+    fn preserve_source_format(path: &Path, version: &Version) -> io::Result<()> {
+        let parent = path
+            .parent()
+            .expect("version file has a database directory");
+        let mut temporary = tempfile::Builder::new()
+            .prefix(".tmp.version")
+            .tempfile_in(parent)?;
+        temporary.write_all(version.to_string().as_bytes())?;
+        temporary.as_file().sync_all()?;
+        temporary.persist(path).map_err(|error| error.error)?;
+        #[cfg(unix)]
+        fs::File::open(parent)?.sync_all()?;
+        Ok(())
+    }
+
     /// Tries to reuse an existing db after a major upgrade.
     ///
     /// If the current db version belongs to `restorable_db_versions`, the function moves a previous
@@ -1550,12 +1568,9 @@ impl DiskDb {
 
                 // Preserve the source major before moving legacy or missing version markers.
                 // A destination opener must never infer the new major for unmigrated data.
-                if let Err(error) = write_database_format_version_to_disk(
-                    config,
-                    db_kind,
-                    old_major_db_ver,
+                if let Err(error) = Self::preserve_source_format(
+                    &config.version_file_path(db_kind, old_major_db_ver, network),
                     &disk_version,
-                    network,
                 ) {
                     warn!(
                         ?error,

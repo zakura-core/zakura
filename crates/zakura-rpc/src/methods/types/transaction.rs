@@ -152,7 +152,6 @@ pub(super) struct CoinbaseResourceUsage {
 
 #[derive(Clone, Copy)]
 enum MinerRewardAddress {
-    Orchard(::orchard::Address),
     Ironwood(::orchard::Address),
     Sapling(sapling_crypto::PaymentAddress),
     Transparent(TransparentAddress),
@@ -182,15 +181,13 @@ impl CoinbasePlan {
                                 .map(|addr| MinerRewardAddress::Transparent(*addr))
                         })
                 };
-                let reward_address = if upgrade >= NetworkUpgrade::Nu5 {
+                // An Orchard receiver is only payable as an Ironwood output:
+                // Orchard-pool coinbase payouts were removed along with
+                // pre-NU6.3 Orchard proving. Before NU6.3 a unified address
+                // falls back to its Sapling or transparent receiver.
+                let reward_address = if upgrade >= NetworkUpgrade::Nu6_3 {
                     addr.orchard()
-                        .map(|addr| {
-                            if upgrade < NetworkUpgrade::Nu6_3 {
-                                MinerRewardAddress::Orchard(*addr)
-                            } else {
-                                MinerRewardAddress::Ironwood(*addr)
-                            }
-                        })
+                        .map(|addr| MinerRewardAddress::Ironwood(*addr))
                         .or_else(fallback)
                 } else {
                     fallback()
@@ -315,10 +312,7 @@ impl CoinbasePlan {
                     MinerRewardAddress::Sapling(_) => sapling_bundle_bytes,
                     _ => compact_size_bytes(0) + compact_size_bytes(0),
                 };
-                let orchard = match self.miner_reward_address {
-                    MinerRewardAddress::Orchard(_) => orchard_bundle_bytes,
-                    _ => compact_size_bytes(0),
-                };
+                let orchard = compact_size_bytes(0);
 
                 (V5_AND_V6_FIXED_FIELDS_BYTES, sapling + orchard)
             }
@@ -352,10 +346,6 @@ impl CoinbasePlan {
             .try_into()
             .expect("coinbase transparent output count fits in u32");
         let shielded_action_counts = match self.miner_reward_address {
-            MinerRewardAddress::Orchard(_) => ShieldedActionCounts {
-                orchard_actions: 1,
-                ..Default::default()
-            },
             MinerRewardAddress::Ironwood(_) => ShieldedActionCounts {
                 ironwood_actions: 1,
                 ..Default::default()
@@ -445,21 +435,6 @@ impl TransactionTemplate<NegativeOrZero> {
         };
 
         match plan.miner_reward_address {
-            MinerRewardAddress::Orchard(addr) => {
-                builder
-                    .add_orchard_output::<String>(
-                        Some(::orchard::keys::OutgoingViewingKey::from([0u8; 32])),
-                        addr,
-                        miner_reward,
-                        memo.clone(),
-                    )
-                    .map_err(|error| {
-                        TransactionError::CoinbaseConstruction(format!(
-                            "Failed to add Orchard output: {error}"
-                        ))
-                    })?;
-                arm_shielded_reward_proving_key();
-            }
             MinerRewardAddress::Ironwood(addr) => {
                 builder
                     .add_ironwood_output::<String>(

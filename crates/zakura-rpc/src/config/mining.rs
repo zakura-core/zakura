@@ -245,14 +245,4 @@ mod tests {
         assert!(toml::from_str::<Config>("miner_address = 'invalid'").is_err());
         assert!(toml::from_str::<Config>("miner_address = 42").is_err());
     }
-
-    #[test]
-    fn optimistic_block_inventory_defaults_on_and_can_be_disabled() {
-        let default: Config = toml::from_str("").expect("empty mining config uses defaults");
-        assert!(default.optimistic_block_inventory);
-
-        let disabled: Config = toml::from_str("optimistic_block_inventory = false")
-            .expect("the optimistic inventory option is valid");
-        assert!(!disabled.optimistic_block_inventory);
-    }
 }

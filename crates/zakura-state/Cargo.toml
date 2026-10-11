@@ -16,14 +16,14 @@ categories = ["asynchronous", "caching", "cryptography::cryptocurrencies"]
 
 [features]
 
+# Legacy flags accepted for build compatibility; the progress display is removed.
+progress-bar = ["howudoin"]
+howudoin = []
+
 # Production features that activate extra dependencies, or extra features in dependencies
 
 # Exposes narrow internal hooks used by benchmarks.
 internal-bench = []
-
-progress-bar = [
-    "howudoin",
-]
 
 # Indexes spending transaction ids by spent outpoints and revealed nullifiers
 indexer = []
@@ -44,7 +44,7 @@ proptest-impl = [
 
 [dependencies]
 bincode = { workspace = true }
-chrono = { workspace = true, features = ["clock", "std"] }
+chrono = { workspace = true }
 futures = { workspace = true }
 halo2 = { workspace = true, optional = true }
 hex = { workspace = true }
@@ -72,8 +72,6 @@ zakura-node-services = { path = "../zakura-node-services", version = "5.0.0" }
 zakura-chain = { path = "../zakura-chain", version = "10.0.0", features = ["async-error"] }
 zakura-header-chain = { path = "../zakura-header-chain", version = "4.1.0" }
 
-# prod feature progress-bar
-howudoin = { workspace = true, optional = true }
 
 # test feature proptest-impl
 proptest = { workspace = true, optional = true }
@@ -85,6 +83,7 @@ derive-new.workspace = true
 libc = { workspace = true }
 
 [dev-dependencies]
+indexmap = { workspace = true, features = ["serde"] }
 zakura-header-chain = { path = "../zakura-header-chain", version = "4.1.0", features = ["test-support"] }
 color-eyre = { workspace = true }
 
@@ -92,7 +91,7 @@ once_cell = { workspace = true }
 toml = { workspace = true }
 
 hex = { workspace = true, features = ["serde"] }
-insta = { workspace = true, features = ["ron", "redactions"] }
+insta = { workspace = true, features = ["ron"] }
 serde_json = { workspace = true }
 
 proptest = { workspace = true }

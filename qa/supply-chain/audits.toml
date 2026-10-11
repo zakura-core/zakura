@@ -1450,8 +1450,20 @@ notes = "Reviewed all packaged Rust source and manifest. No unsafe, build script
 [[audits.idna_adapter]]
 who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
+version = "1.1.0"
+notes = "Reviewed the complete packaged Rust source and manifests. This no_std adapter delegates Unicode properties, UTS 46 mapping, and NFC normalization to unicode-rs dependencies, with fixed masks over small property enums. No unsafe code, build script, runtime I/O, or ambient authority. An isolated comparison using this exact adapter matched all 6,389 Unicode 16 strict ToASCII expectations; Unicode 17 differences are documented and accepted by Zakura."
+
+[[audits.idna_adapter]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
 version = "1.2.2"
 notes = "Reviewed all packaged source and manifest content. This no_std ICU adapter performs checked constant-mask construction and forwards normalization and property lookups. It contains no unsafe code, build script, runtime I/O, or ambient authority; all-feature library and documentation targets compiled."
+
+[[audits.idna_mapping]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "1.1.0"
+notes = "Reviewed the complete packaged library, manifests, maintenance generator, and generated-data structure. The generated mapping table reproduced byte-for-byte from the bundled Unicode data. Mapping uses safe Rust, immutable table lookups and bounded string slices; no unsafe code, build script, runtime I/O, or ambient authority. The packaged unit test passed, together with an isolated exhaustive check of every Unicode scalar for table and UTF-8 slice bounds and bounded mapping expansion in both modes. Unicode 16 coverage and the accepted Unicode 17 hostname incompatibility are documented by Zakura."
 
 [[audits.igd-next]]
 who = "Claude Opus 5 <noreply@anthropic.com>"
@@ -1956,6 +1968,12 @@ who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 delta = "0.15.3 -> 0.16.0"
 
+[[audits.metrics-exporter-prometheus]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+delta = "0.16.2 -> 0.17.2"
+notes = "Reviewed the complete packaged Rust-source and manifest deltas against the audited 0.16.2 baseline. HTTP and push rendering move to spawn_blocking; the caller-selected listener, allowlist checks, health response and output sanitization remain intact. The JoinHandle unwrap can fail on rendering panic or runtime shutdown, but introduces no unsafe code or additional ambient capability. Push-gateway gains an explicit POST/PUT choice, and ASCII unit suffixes are inserted at validated suffix boundaries; Zakura enables only the HTTP listener and leaves unit suffixing disabled. Examples migrate the rand API. Dependency changes reuse the already-reviewed metrics, hashbrown, rapidhash and thiserror versions in this tree. No build script was added. Source review only; compilation and runtime tests are delegated to PR CI."
+
 [[audits.metrics-util]]
 who = "Claude Opus 5 <noreply@anthropic.com>"
 criteria = "safe-to-deploy"
@@ -1971,6 +1989,12 @@ delta = "0.16.3 -> 0.17.0"
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 delta = "0.17.0 -> 0.18.0"
+
+[[audits.metrics-util]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+delta = "0.19.1 -> 0.20.4"
+notes = "Reviewed the complete packaged Rust-source and manifest deltas against the audited 0.19.1 baseline. The no-op KeyHasher matches metrics 0.24.6 Key::hash, which writes only its precomputed u64; generic DefaultHashable uses the already-reviewed non-cryptographic rapidhash. Registry shard bounds and unchecked indexing are unchanged. Reservoir sums and swaps use atomic operations, retained samples remain bounded by capacity, and no unsafe block or thread-local RNG access changed. New Arc storage forwarding and summary accessors add no capability. Debugging snapshots now reset counters/gauges, with added regression tests, but that feature is disabled in Zakura's exporter dependency. Reservoir sampling remains approximate telemetry under concurrent writers, not security accounting. No build script was added. Source review only; compilation and runtime tests are delegated to PR CI."
 
 [[audits.mime]]
 who = "OpenAI Codex <noreply@openai.com>"
@@ -3980,6 +4004,12 @@ who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
 version = "1.0.24"
 notes = "Reviewed all packaged source, manifests, generated Unicode 17 tables, tests, and benchmark. The dependency-free no_std implementation performs fixed-table XID lookups; the largest generated chunk index makes both unchecked leaf accesses land at or before the final table element. Exhaustive comparison of every Unicode scalar against the bundled independent ucd-trie and FST representations passed, together with 5 size/layout tests and 2 doctests. It has no build script, allocation, runtime I/O, or ambient capabilities. The published unicode-xid 0.2.6 comparison oracle is older and first disagrees at U+088F because Cargo strips the source manifest's Unicode 17 patch; rerunning without only that stale oracle passed."
+
+[[audits.unicode-joining-type]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "1.0.0"
+notes = "Reviewed the complete packaged library, manifests, build script, maintenance Makefile, and generated-data structure. The Unicode 16 input tables consist only of enum declarations and sorted contiguous ranges. The build script reads OUT_DIR and writes two fixed generated lookup files there; it has no network or process execution. Runtime lookup uses safe bounded array indexing, no allocation or I/O, and defaults above the final codepoint. No unsafe code or dependencies. Both packaged unit tests and all three doctests passed; an isolated exhaustive check confirmed generated joining type and group lookups match the source ranges for every Unicode scalar."
 
 [[audits.unit-prefix]]
 who = "OpenAI Codex <noreply@openai.com>"

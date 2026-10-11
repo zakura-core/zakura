@@ -578,7 +578,6 @@ async fn semantic_child_cannot_end_checkpoint_sync_early() {
         let request = if mined {
             Request::CommitMined {
                 block: candidate,
-                work_id: None,
                 admission: zs::BlockAdmission::pending(),
             }
         } else {

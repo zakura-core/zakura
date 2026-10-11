@@ -21,17 +21,17 @@
 #   are not semver-checked, mirroring existing release practice.
 # - The `zakura` node binary package is excluded because its Rust types are not
 #   a supported library API. Its release version is managed separately.
-# - publish = false members (xtask, zakura-watchdog) are skipped automatically.
+# - publish = false members (xtask) are skipped automatically.
 # - A NEW publishable crate that has never been published to crates.io fails
-#   with "no baseline": add `--exclude <crate>` to the check command in the
-#   same PR that introduces the crate, and remove it after its first publish.
+#   with "no baseline": add it to SEMVER_ENFORCEMENT_EXCLUSIONS in the package
+#   selector in the same PR, and remove it after its first publish.
 # - Baseline downloads come from crates.io; an outage fails the job
 #   (deliberately fail-closed — re-run when the registry recovers).
 name: Semver checks
 
 on:
   pull_request:
-    branches: [main, "feat/**", "split/**", "release/**"]
+    branches: [main, "feat/**", "split/**", "adam/**", "release/**"]
     paths:
       - "**/*.rs"
       - "**/Cargo.toml"
@@ -63,8 +63,8 @@ permissions:
 
 concurrency:
   # PR numbers are repository-wide, unlike same-named head branches from forks.
-  # Other events use their full ref (including each merge-queue ref).
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  # Other events use their run ID, so pushes to `main` never cancel each other.
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
   cancel-in-progress: true
 
 jobs:
@@ -395,7 +395,9 @@ jobs:
 
   semver-checks:
     name: semver-checks
-    if: always()
+    # Skip, rather than fail, when a superseding run cancelled this one.
+    # See "Cancelled runs" in .github/workflows/README.md.
+    if: ${{ !cancelled() || github.event_name == 'pull_request' || github.event_name == 'merge_group' }}
     needs: [select-packages, check-package, public-api-diff, warm-baselines]
     runs-on: ubuntu-latest
     timeout-minutes: 5

@@ -175,6 +175,14 @@ pub(crate) static METHODS: &[(&str, openrpc::RpcMethod)] = &[
     result: |g| g.result("submitblock_result"),
     deprecated: false,
 }),
+("submitsolution", openrpc::RpcMethod {
+    description: "Submits a solved header for a prepared mining candidate.\n\nThe miner must retry with `submitblock` when this method returns `stale-work` or\n`candidate-mismatch`.\n",
+    params: |_g| vec![
+        _g.param::<SubmitSolutionParameters>("parameters", crate::methods::PARAM_PARAMETERS_DESC, true),
+    ],
+    result: |g| g.result("submitsolution_result"),
+    deprecated: false,
+}),
 ("getmininginfo", openrpc::RpcMethod {
     description: "Returns mining-related information.\n\nzcashd reference: [`getmininginfo`](https://zcash.github.io/rpc/getmininginfo.html)\nmethod: post\ntags: mining\n",
     params: |_g| vec![
@@ -237,6 +245,13 @@ pub(crate) static METHODS: &[(&str, openrpc::RpcMethod)] = &[
     result: |g| g.result("z_validateaddress_result"),
     deprecated: false,
 }),
+("getstandardfee", openrpc::RpcMethod {
+    description: "Returns the recommended standard fee per logical action, in zatoshis.\n\nCurrently returns Zakura's ZIP 317 marginal fee (`zip317::MARGINAL_FEE`), with `version` 0.\nA dynamic estimate can replace this value without changing the parameters or\nresult shape.\n\nmethod: post\ntags: wallet\n",
+    params: |_g| vec![
+    ],
+    result: |g| g.result("getstandardfee_result"),
+    deprecated: false,
+}),
 ("getblocksubsidy", openrpc::RpcMethod {
     description: "Returns the block subsidy reward of the block at `height`, taking into account the mining slow start.\nReturns an error if `height` is less than the height of the first halving for the current network.\n\nzcashd reference: [`getblocksubsidy`](https://zcash.github.io/rpc/getblocksubsidy.html)\nmethod: post\ntags: mining\n\n# Parameters\n\n- `height`: (numeric, optional, example=1) Can be any valid current or future height.\n\n# Notes\n\nIf `height` is not supplied, uses the tip height.\n\nFrom the ZIP 234 reissuance start height, the subsidy depends on the parent block's\nchain value pools, so `height` must be at most one block above the best chain tip.\n",
     params: |_g| vec![
@@ -274,6 +289,14 @@ pub(crate) static METHODS: &[(&str, openrpc::RpcMethod)] = &[
         _g.param::<String>("block_hash", crate::methods::PARAM_BLOCK_HASH_DESC, true),
     ],
     result: |g| g.result("reconsiderblock_result"),
+    deprecated: false,
+}),
+("preciousblock", openrpc::RpcMethod {
+    description: "Treats a block as if it were received before other chain tips with the same work.\n\nIt applies to a current non-finalized chain tip with at least as much work as the best tip.\nA later call overrides an earlier one. A chain with more work still wins. For any other\nknown block, such as a block that is not a chain tip, a finalized block, an invalidated\nblock, or a tip with less work than the best tip, the call succeeds and changes nothing. An\nunknown hash returns error code -5, and a malformed hash returns error code -8.\n\nThe preference is local to this node. It is kept while the block is in any non-finalized\nchain or any retained invalidation record. It is forgotten once the block is in neither,\nfor example when a fork-limit eviction removes it from its last chain, or when its\ninvalidation record is discarded while it is in no chain. A block downloaded again after\nthat is not preferred. It is not kept across restarts.\nSee Bitcoin Core's\n[`preciousblock`](https://developer.bitcoin.org/reference/rpc/preciousblock.html).\n\n# Parameters\n\n- `block_hash`: (hex-encoded block hash, required) The hash of the block to prefer.\n",
+    params: |_g| vec![
+        _g.param::<String>("block_hash", crate::methods::PARAM_BLOCK_HASH_DESC, true),
+    ],
+    result: |g| g.typed_result::<()>("preciousblock_result", crate::methods::RESULT_PRECIOUSBLOCK_DESC),
     deprecated: false,
 }),
 ("generate", openrpc::RpcMethod {

@@ -4,6 +4,7 @@
 use std::{
     cmp::Ordering,
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    num::NonZeroU64,
     ops::{Deref, DerefMut, RangeInclusive},
     sync::Arc,
 };
@@ -60,22 +61,13 @@ pub struct Chain {
     /// The internal state of this chain.
     inner: ChainInner,
 
-    // Diagnostics
-    //
-    /// The last height this chain forked at. Diagnostics only.
+    /// The operator's `preciousblock` preference for this chain's tip, with its call sequence.
     ///
-    /// This field is only used for metrics. It is not consensus-critical, and it is not checked for
-    /// equality.
-    ///
-    /// We keep the same last fork height in both sides of a clone, because every new block clones a
-    /// chain, even if it's just growing that chain.
-    ///
-    /// # Note
-    ///
-    /// Most diagnostics are implemented on the `NonFinalizedState`, rather than each chain. Some
-    /// diagnostics only use the best chain, and others need to modify the Chain state, but that's
-    /// difficult with `Arc<Chain>`s.
-    pub(super) last_fork_height: Option<Height>,
+    /// Local policy, not chain state, so it is not checked by [`Chain::eq_internal_state`].
+    /// Only [`NonFinalizedState`](super::NonFinalizedState) sets it, from its per-block
+    /// preferences, whenever it inserts the chain into the `chain_set`. Growing or forking the
+    /// chain keeps the stored hash, which stops matching the tip, so a stale value never applies.
+    precious: Option<(block::Hash, NonZeroU64)>,
 }
 
 /// Spending transaction id type when the `indexer` feature is selected.
@@ -317,7 +309,7 @@ impl Chain {
         let mut chain = Self {
             network: network.clone(),
             inner,
-            last_fork_height: None,
+            precious: None,
         };
 
         chain.add_sprout_tree_and_anchor(finalized_tip_height, sprout_note_commitment_tree);
@@ -342,25 +334,6 @@ impl Chain {
     #[cfg(any(test, feature = "proptest-impl"))]
     pub fn eq_internal_state(&self, other: &Chain) -> bool {
         self.inner == other.inner
-    }
-
-    /// Returns the last fork height if that height is still in the non-finalized state.
-    /// Otherwise, if that fork has been finalized, returns `None`.
-    #[allow(dead_code)]
-    pub fn recent_fork_height(&self) -> Option<Height> {
-        self.last_fork_height
-            .filter(|last| last >= &self.non_finalized_root_height())
-    }
-
-    /// Returns this chain fork's length, if its fork is still in the non-finalized state.
-    /// Otherwise, if the fork has been finalized, returns `None`.
-    #[allow(dead_code)]
-    pub fn recent_fork_length(&self) -> Option<u32> {
-        let fork_length = self.non_finalized_tip_height() - self.recent_fork_height()?;
-
-        // If the fork is above the tip, it is invalid, so just return `None`
-        // (Ignoring invalid data is ok because this is metrics-only code.)
-        fork_length.try_into().ok()
     }
 
     /// Push a contextually valid non-finalized block into this chain as the new tip.
@@ -432,7 +405,6 @@ impl Chain {
         let block_height = self.height_by_hash(block_hash)?;
         let mut new_chain = self.fork(block_hash)?;
         new_chain.pop_tip();
-        new_chain.last_fork_height = self.last_fork_height.min(Some(block_height));
         Some((new_chain, self.child_blocks(&block_height)))
     }
 
@@ -457,11 +429,28 @@ impl Chain {
         // Revert blocks above the fork
         while forked.non_finalized_tip_hash() != fork_tip {
             forked.pop_tip();
-
-            forked.last_fork_height = Some(forked.non_finalized_tip_height());
         }
 
         Some(forked)
+    }
+
+    /// Returns the operator's `preciousblock` preference stored on this chain.
+    pub(super) fn precious(&self) -> Option<(block::Hash, NonZeroU64)> {
+        self.precious
+    }
+
+    /// Stores the operator's `preciousblock` preference for this chain's tip.
+    pub(super) fn set_precious(&mut self, precious: Option<(block::Hash, NonZeroU64)>) {
+        self.precious = precious;
+    }
+
+    /// Returns the `preciousblock` sequence if it applies to the current tip, or zero.
+    ///
+    /// A later call has a higher sequence and wins equal-work ties against earlier ones.
+    fn active_precedence(&self) -> u64 {
+        self.precious
+            .filter(|(hash, _)| *hash == self.non_finalized_tip_hash())
+            .map_or(0, |(_, sequence)| sequence.get())
     }
 
     /// Returns the [`Network`] for this chain.
@@ -2593,8 +2582,9 @@ impl UpdateWith<(ValueBalance<NegativeAllowed>, Height, usize)> for Chain {
 impl Ord for Chain {
     /// Chain order for the [`NonFinalizedState`][1]'s `chain_set`.
     ///
-    /// Chains with higher cumulative Proof of Work are [`Ordering::Greater`],
-    /// breaking ties using the tip block hash.
+    /// Chains with higher cumulative Proof of Work are [`Ordering::Greater`].
+    /// Equal-work ties prefer the operator's latest `preciousblock` tip, then
+    /// break using the tip block hash.
     ///
     /// Despite the consensus rules, Zebra uses the tip block hash as a
     /// tie-breaker. Zebra blocks are downloaded in parallel, so download
@@ -2631,7 +2621,8 @@ impl Ord for Chain {
     /// interior mutability.
     ///
     /// `cmp` returns [`Ordering::Equal`] only when both the cumulative work and
-    /// the tip hash match. The [`NonFinalizedState::chain_set`][2] is a
+    /// the tip hash match, because the non-finalized state derives the
+    /// `preciousblock` preference from the tip hash on every insert. The [`NonFinalizedState::chain_set`][2] is a
     /// `BTreeSet<Arc<Chain>>`, so an attempt to insert a chain that compares
     /// equal to an existing entry is a no-op rather than a process-fatal panic.
     /// Callers that need to replace such a chain must remove the existing entry
@@ -2652,7 +2643,12 @@ impl Ord for Chain {
                 tip,
             )
         };
-        score(self).cmp(&score(other))
+        let (self_score, other_score) = (score(self), score(other));
+        self_score
+            .suffix_work
+            .cmp(&other_score.suffix_work)
+            .then_with(|| self.active_precedence().cmp(&other.active_precedence()))
+            .then_with(|| self_score.cmp(&other_score))
     }
 }
 

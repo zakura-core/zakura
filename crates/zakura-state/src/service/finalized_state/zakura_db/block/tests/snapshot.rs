@@ -32,6 +32,7 @@
 
 use std::sync::Arc;
 
+use indexmap::IndexMap;
 use serde::Serialize;
 
 use zakura_chain::{
@@ -442,13 +443,11 @@ fn snapshot_block_and_transaction_data(state: &FinalizedState) {
         // But we expect them to always have cached roots,
         // because those roots are used to populate the anchor column families.
         insta::assert_ron_snapshot!("sprout_tree_at_tip", sprout_tree_at_tip);
-        insta::assert_ron_snapshot!(
-            "sprout_trees",
-            stored_sprout_trees,
-            {
-                "." => insta::sorted_redaction()
-            }
-        );
+        // Match the old redaction's ordering of serialized root bytes.
+        let mut sprout_tree_entries: Vec<_> = stored_sprout_trees.iter().collect();
+        sprout_tree_entries.sort_unstable_by_key(|(root, _)| <[u8; 32]>::from(*root));
+        let sorted_sprout_trees: IndexMap<_, _> = sprout_tree_entries.into_iter().collect();
+        insta::assert_ron_snapshot!("sprout_trees", sorted_sprout_trees);
         insta::assert_ron_snapshot!("sapling_trees", stored_sapling_trees);
         insta::assert_ron_snapshot!("orchard_trees", stored_orchard_trees);
 

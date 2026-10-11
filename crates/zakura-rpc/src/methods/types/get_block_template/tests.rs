@@ -101,11 +101,30 @@ async fn template_rejection_retains_notifications_for_late_subscribers() {
 fn template_preparation_queue_keeps_the_latest_pending_template() {
     let queue = TemplatePreparationQueue::<u8>::default();
 
-    assert_eq!(queue.enqueue(1), Some(1));
-    assert_eq!(queue.enqueue(2), None);
-    assert_eq!(queue.enqueue(3), None);
-    assert_eq!(queue.next_or_finish(), Some(3));
-    assert_eq!(queue.next_or_finish(), None);
+    let (first, mut worker) = queue.enqueue(1).expect("an idle queue admits a worker");
+    assert_eq!(first, 1);
+    assert!(queue.enqueue(2).is_none());
+    assert!(queue.enqueue(3).is_none());
+    assert_eq!(worker.next(), Some(3));
+    assert_eq!(worker.next(), None);
+}
+
+/// A loop that ends without taking its next template still releases the worker slot.
+///
+/// Every exit releases it, including a `break` or a panic: `running` staying set would stop the
+/// node ever preparing another template.
+#[test]
+fn a_dropped_preparation_worker_releases_the_queue() {
+    let queue = TemplatePreparationQueue::<u8>::default();
+
+    let (_first, worker) = queue.enqueue(1).expect("an idle queue admits a worker");
+    assert!(queue.enqueue(2).is_none());
+    drop(worker);
+
+    let (next, _worker) = queue
+        .enqueue(3)
+        .expect("a released queue admits the next worker");
+    assert_eq!(next, 3, "the discarded loop's pending template is not run");
 }
 
 /// Tests transparent coinbase generation at every configured Sapling-and-later
@@ -424,12 +443,12 @@ fn shielded_coinbase_paths() -> anyhow::Result<()> {
     let pre_nu6_2_tx = coinbase_transaction(&net, nu5_height, &unified_params)?;
     assert_coinbase_resource_usage(&net, nu5_height, &unified_params, &pre_nu6_2_tx)?;
     assert!(
-        pre_nu6_2_tx.orchard_shielded_data().is_some(),
-        "an NU5 unified address should prefer its Orchard receiver"
+        pre_nu6_2_tx.sapling_outputs().next().is_some(),
+        "an NU5 unified address should fall back to its Sapling receiver"
     );
     assert!(
-        pre_nu6_2_tx.sapling_outputs().next().is_none(),
-        "an NU5 unified address should prefer Orchard over Sapling"
+        pre_nu6_2_tx.orchard_shielded_data().is_none(),
+        "a pre-NU6.3 coinbase cannot pay the removed Orchard pool"
     );
     assert!(
         pre_nu6_2_tx.ironwood_shielded_data().is_none(),
@@ -439,12 +458,12 @@ fn shielded_coinbase_paths() -> anyhow::Result<()> {
     let nu6_2_tx = coinbase_transaction(&net, nu6_2_height, &unified_params)?;
     assert_coinbase_resource_usage(&net, nu6_2_height, &unified_params, &nu6_2_tx)?;
     assert!(
-        nu6_2_tx.orchard_shielded_data().is_some(),
-        "an NU6.2 unified address should receive an Orchard output"
+        nu6_2_tx.sapling_outputs().next().is_some(),
+        "an NU6.2 unified address should fall back to its Sapling receiver"
     );
     assert!(
-        nu6_2_tx.sapling_outputs().next().is_none(),
-        "an NU6.2 unified address should prefer Orchard over Sapling"
+        nu6_2_tx.orchard_shielded_data().is_none(),
+        "a pre-NU6.3 coinbase cannot pay the removed Orchard pool"
     );
     assert!(
         nu6_2_tx.ironwood_shielded_data().is_none(),

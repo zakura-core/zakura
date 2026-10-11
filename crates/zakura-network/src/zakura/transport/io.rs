@@ -16,7 +16,7 @@
 use tokio::sync::mpsc;
 
 use super::Frame;
-use crate::zakura::regulation::{PrecheckSlot, ResponsePrecheck};
+use crate::zakura::regulation::{PrecheckSlot, ResponsePrecheck, SlotBudget, SlotPermit};
 use std::sync::{Arc, OnceLock};
 
 /// Why a persistent stream ended before local cancellation.
@@ -146,6 +146,7 @@ impl FramedRecv {
 #[derive(Clone, Debug)]
 pub struct FramedSend {
     sender: FramedSender,
+    response_slots: Option<SlotBudget>,
     session_resources: Option<Arc<dyn super::service::SessionResources>>,
 }
 
@@ -160,12 +161,16 @@ impl FramedSend {
     pub fn new(sender: mpsc::Sender<Frame>) -> Self {
         Self {
             sender: FramedSender::Plain(sender),
+            response_slots: None,
             session_resources: None,
         }
     }
 
     fn queued(sender: mpsc::Sender<QueuedFrame>) -> Self {
+        let response_slots = SlotBudget::new(sender.max_capacity().saturating_sub(1).max(1))
+            .expect("a transport queue has a positive semaphore-bounded capacity");
         Self {
+            response_slots: Some(response_slots),
             sender: FramedSender::Queued(sender),
             session_resources: None,
         }
@@ -229,6 +234,22 @@ impl FramedSend {
             .map_err(|_| GuardedReserveError::Closed)
     }
 
+    /// Reserve a response without consuming the last queue slot for control.
+    /// The response allowance is shared by all sender clones and held through
+    /// the write. A one-slot queue makes progress as frames drain, but cannot
+    /// provide independent control headroom.
+    pub(crate) async fn reserve_response_guarded(
+        &self,
+    ) -> Result<ResponseFrameSlot<'_>, GuardedReserveError> {
+        let budget = self
+            .response_slots
+            .as_ref()
+            .ok_or(GuardedReserveError::Unsupported)?;
+        let response = budget.reserve().await;
+        let slot = self.reserve_guarded().await?;
+        Ok(ResponseFrameSlot { slot, response })
+    }
+
     /// Current free slots in the bounded transport queue.
     pub fn capacity(&self) -> usize {
         match &self.sender {
@@ -272,6 +293,20 @@ impl GuardedFrameSlot<'_> {
             claim: Some(claim),
         });
         !self.sender.is_closed()
+    }
+}
+
+/// A response queue slot that leaves space for independent control traffic.
+#[derive(Debug)]
+pub(crate) struct ResponseFrameSlot<'a> {
+    slot: GuardedFrameSlot<'a>,
+    response: SlotPermit,
+}
+
+impl ResponseFrameSlot<'_> {
+    pub(crate) fn send(self, frame: Frame, guard: FrameGuard) {
+        self.slot
+            .send(frame, FrameGuard::new(Arc::new((guard, self.response))));
     }
 }
 
@@ -566,6 +601,67 @@ mod tests {
         assert_eq!(budget.reserved(), 1);
         drop(write);
         assert_eq!(budget.reserved(), 0);
+    }
+
+    #[tokio::test]
+    async fn one_slot_queue_admits_requests_and_control_after_a_response_drains() {
+        let (sender, mut receiver) = worker_framed_channel(1);
+        sender
+            .reserve_response_guarded()
+            .await
+            .unwrap()
+            .send(frame(1), FrameGuard::new(Arc::new(())));
+        assert!(matches!(
+            sender.try_reserve_guarded(),
+            Err(GuardedReserveError::Full)
+        ));
+        let mut control = Box::pin(sender.send(frame(2)));
+        assert!(futures::poll!(&mut control).is_pending());
+        let response = receiver.recv().await.unwrap();
+        control.await.unwrap();
+        assert_eq!(receiver.recv().await.unwrap().into_parts().0, frame(2));
+        sender
+            .try_reserve_guarded()
+            .unwrap()
+            .send(frame(3), FrameGuard::new(Arc::new(())));
+        assert_eq!(receiver.recv().await.unwrap().into_parts().0, frame(3));
+        drop(response);
+        assert!(sender.reserve_response_guarded().await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn response_headroom_is_shared_and_held_until_the_write_ends() {
+        let (sender, mut receiver) = worker_framed_channel(2);
+        let clone = sender.clone();
+        sender
+            .reserve_response_guarded()
+            .await
+            .unwrap()
+            .send(frame(1), FrameGuard::new(Arc::new(())));
+        let mut pending = Box::pin(clone.reserve_response_guarded());
+        assert!(futures::poll!(&mut pending).is_pending());
+
+        let queued = receiver.recv().await.unwrap();
+        let mut write = Box::pin(queued.write_with(|_| async {
+            std::future::pending::<Result<(), std::convert::Infallible>>().await
+        }));
+        assert!(futures::poll!(&mut write).is_pending());
+        assert!(futures::poll!(&mut pending).is_pending());
+        sender
+            .try_send(frame(2))
+            .expect("control retains queue capacity");
+
+        drop(write);
+        let slot = pending.await.unwrap();
+        assert_eq!(sender.response_slots.as_ref().unwrap().reserved(), 1);
+        drop(slot);
+        assert_eq!(sender.response_slots.as_ref().unwrap().reserved(), 0);
+        drop(receiver);
+        assert!(matches!(
+            sender.reserve_response_guarded().await,
+            Err(GuardedReserveError::Closed)
+        ));
+        assert_eq!(sender.response_slots.as_ref().unwrap().reserved(), 0);
     }
 
     #[tokio::test]

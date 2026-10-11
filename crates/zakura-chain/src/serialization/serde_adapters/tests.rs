@@ -35,7 +35,7 @@ fn byte_array_json_and_binary_formats_are_unchanged() {
     check_byte_array::<601>();
     check_byte_array::<{ crate::work::equihash::SOLUTION_SIZE }>();
     check_byte_array::<{ crate::work::equihash::REGTEST_SOLUTION_SIZE }>();
-    check_byte_array::<{ zcash_history::MAX_ENTRY_SIZE }>();
+    check_byte_array::<{ zakura_mmr_tree::MAX_ENTRY_SIZE }>();
 }
 
 #[test]

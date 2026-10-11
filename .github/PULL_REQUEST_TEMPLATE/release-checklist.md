@@ -355,7 +355,7 @@ so only crates whose workspace version is absent are uploaded. See
 
 - [ ] Confirm the pinned zcashd compat manifest is ready before publishing:
   - [ ] Update [`crates/zakurad/zcashd-compat-manifest.json`](https://github.com/zakura-core/zakura/blob/main/crates/zakurad/zcashd-compat-manifest.json) to the intended `zcashd` compat release (it is the single source of truth: zakurad embeds it at compile time and CI/Docker builds read it directly).
-  - [ ] Confirm the manifest contains only the `x86_64-pc-linux-gnu` artifact before publishing zcashd-compat Docker images.
+  - [ ] Confirm the manifest contains only the `x86_64-pc-linux-gnu` artifact, pinning that release's standalone `zcashd-zebra-compat-<tag>-linux-x86_64` executable and its SHA-256, before publishing zcashd-compat Docker images.
   - [ ] Confirm the workflow logs show the expected `/usr/local/bin/zcashd --version` for the zcashd-compat linux/amd64 image variant.
 - [ ] Wait for the [the Docker images to be published successfully](https://github.com/zakura-core/zakura/actions/workflows/release-binaries.yml?query=event%3Apush).
 - [ ] Confirm `release-binaries.yml` published `zakurad-<tag>-linux-x86_64.tar.gz`, `zakurad-<tag>-linux-aarch64.tar.gz`, `zakurad-manifest-<tag>.json`, and `SHA256SUMS.txt` to the GitHub release.

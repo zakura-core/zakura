@@ -380,7 +380,52 @@ impl HeaderChainEngine {
 
     /// Return the total number of retained auxiliary deliveries.
     pub fn aux_delivery_count(&self) -> usize {
-        self.aux_deliveries.values().map(Vec::len).sum()
+        self.aux_delivery_index.len()
+    }
+
+    /// Return every header that holds retained auxiliary input, in unspecified order.
+    pub(crate) fn aux_delivery_header_hashes(&self) -> impl Iterator<Item = block::Hash> + '_ {
+        self.aux_deliveries.keys().copied()
+    }
+
+    /// Bound the number of new inputs a selected repair can retain.
+    ///
+    /// A full target bucket can replace one unauthenticated input. Otherwise, repairs can use
+    /// free slots and evictable input outside the commit window. Only empty buckets can extend
+    /// a repair range. This read grants no admission authority.
+    pub fn auxiliary_repair_capacity(
+        &self,
+        hash: block::Hash,
+        limits: crate::EngineLimits,
+    ) -> usize {
+        let deliveries = self.aux_deliveries(hash);
+        if deliveries.len() >= limits.max_aux_deliveries_per_header.get() {
+            return usize::from(
+                deliveries
+                    .iter()
+                    .any(|delivery| !delivery.is_authenticated()),
+            );
+        }
+
+        let commit_window = &self.selected_projection[..self.selected_projection.len().min(3)];
+        let protected: usize = self
+            .aux_deliveries
+            .iter()
+            .map(|(hash, deliveries)| {
+                if commit_window.iter().any(|frontier| frontier.hash == *hash) {
+                    deliveries.len()
+                } else {
+                    deliveries
+                        .iter()
+                        .filter(|delivery| delivery.is_authenticated())
+                        .count()
+                }
+            })
+            .sum();
+        limits
+            .max_aux_deliveries_total
+            .get()
+            .saturating_sub(protected)
     }
 
     /// Return the retained auxiliary delivery with the exact global identity.

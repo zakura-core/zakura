@@ -324,6 +324,18 @@ impl CommitBlockError {
         }
     }
 
+    /// See [`ValidateContextError::is_auth_commitment_mismatch`].
+    pub fn is_auth_commitment_mismatch(&self) -> bool {
+        matches!(self, CommitBlockError::ValidateContextError(error)
+            if error.is_auth_commitment_mismatch())
+    }
+
+    /// See [`ValidateContextError::is_descendant_of_auth_commitment_mismatch`].
+    pub fn is_descendant_of_auth_commitment_mismatch(&self) -> bool {
+        matches!(self, CommitBlockError::ValidateContextError(error)
+            if error.is_descendant_of_auth_commitment_mismatch())
+    }
+
     /// Returns the missing VCT supplied-root height for retryable root-fetch stalls.
     pub fn vct_supplied_root_unavailable_height(&self) -> Option<block::Height> {
         match self {
@@ -461,6 +473,19 @@ impl CommitCheckpointVerifiedError {
         self.inner.vct_retryable_height()
     }
 
+    /// Returns `true` if the delivered body does not match its header's authorizing data
+    /// commitment, and no supplied auxiliary root is implicated.
+    ///
+    /// See [`ValidateContextError::is_auth_commitment_mismatch`].
+    pub fn is_auth_commitment_mismatch(&self) -> bool {
+        self.vct_failure.is_none() && self.inner.is_auth_commitment_mismatch()
+    }
+
+    /// See [`ValidateContextError::is_descendant_of_auth_commitment_mismatch`].
+    pub fn is_descendant_of_auth_commitment_mismatch(&self) -> bool {
+        self.inner.is_descendant_of_auth_commitment_mismatch()
+    }
+
     pub(crate) fn with_vct_failure(mut self, failure: VctCommitFailure) -> Self {
         self.vct_failure = Some(failure);
         self
@@ -497,6 +522,10 @@ pub enum InvalidateError {
     /// Sending the invalidate request to the block write task failed.
     #[error("failed to send invalidate block request to block write task")]
     SendInvalidateRequestFailed,
+
+    /// Every block write slot is held by an in-flight commit, reconsideration, or invalidation.
+    #[error("the block write task is at capacity, retry the invalidation")]
+    WriterFull,
 
     /// The invalidate request was dropped before processing.
     #[error("invalidate block request was unexpectedly dropped")]
@@ -579,6 +608,16 @@ pub enum ValidateContextError {
 
     #[error("block descends from invalid ancestor {0}")]
     InvalidAncestorBlock(block::Hash),
+
+    /// The block descends from an ancestor whose delivered body failed its authorizing data
+    /// commitment.
+    ///
+    /// The ancestor's header is still valid, so this block and the ancestor are still wanted.
+    /// The peer that served this block did not cause the failure.
+    #[error(
+        "block descends from {0}, whose delivered body failed its authorizing data commitment"
+    )]
+    AncestorBodyRejected(block::Hash),
 
     #[error(
         "verified-commitment-trees fast path has no valid supplied root for height \
@@ -882,6 +921,7 @@ impl ValidateContextError {
             }
             Self::BlockPreviouslyInvalidated { .. }
             | Self::InvalidAncestorBlock(_)
+            | Self::AncestorBodyRejected(_)
             | Self::OrphanedBlock { .. } => {
                 BodyVerificationClass::Retryable(TransientBodyFailureKind::Canceled)
             }
@@ -1040,6 +1080,7 @@ impl ValidateContextError {
             | ValidateContextError::BlockPreviouslyInvalidated { .. }
             | ValidateContextError::NotReadyToBeCommitted
             | ValidateContextError::InvalidAncestorBlock(_)
+            | ValidateContextError::AncestorBodyRejected(_)
             | ValidateContextError::VctSuppliedRootUnavailable { .. }
             | ValidateContextError::VctSuppliedRootAwaitingSuccessor { .. }
             | ValidateContextError::VctBlockAuthDataRootMismatch { .. }
@@ -1049,6 +1090,32 @@ impl ValidateContextError {
             | ValidateContextError::NoteCommitmentTreeError(_)
             | ValidateContextError::HistoryTreeError(_) => 0,
         }
+    }
+
+    /// Returns `true` if the delivered body does not match its header's authorizing data
+    /// commitment.
+    ///
+    /// From NU5, block hashes do not commit to authorizing data (ZIP 244), so a peer can serve a
+    /// canonical header with altered signatures, proofs, or scripts. Both variants compare the
+    /// body's own auth data root against a root the header authenticates: the parent history
+    /// tree for `InvalidChainHistoryBlockTxAuthCommitment`, and the successor look-ahead for
+    /// `VctBlockAuthDataRootMismatch`. Supplied-root failures are rewritten to
+    /// `VctSuppliedRootUnavailable` before they reach a caller. So only the body's supplier
+    /// can cause a mismatch, and the block hash is still wanted.
+    pub fn is_auth_commitment_mismatch(&self) -> bool {
+        matches!(
+            self,
+            ValidateContextError::InvalidBlockCommitment(
+                zakura_chain::block::CommitmentError::InvalidChainHistoryBlockTxAuthCommitment { .. }
+            ) | ValidateContextError::VctBlockAuthDataRootMismatch { .. }
+        )
+    }
+
+    /// Returns `true` if an ancestor's delivered body failed its authorizing data commitment.
+    ///
+    /// See [`Self::is_auth_commitment_mismatch`].
+    pub fn is_descendant_of_auth_commitment_mismatch(&self) -> bool {
+        matches!(self, ValidateContextError::AncestorBodyRejected(_))
     }
 
     /// Returns the missing VCT supplied-root height for retryable root stalls.
@@ -1124,6 +1191,69 @@ mod tests {
     use zakura_header_chain::{
         BodyCommitmentKind, BodyVerificationClass, TransientBodyFailureKind,
     };
+
+    #[test]
+    fn auth_commitment_mismatches_are_attributable_only_without_supplied_roots() {
+        use zakura_chain::block::CommitmentError;
+
+        let auth_commitment = ValidateContextError::InvalidBlockCommitment(
+            CommitmentError::InvalidChainHistoryBlockTxAuthCommitment {
+                expected: [0; 32],
+                actual: [1; 32],
+            },
+        );
+        let prevalidated_root = ValidateContextError::VctBlockAuthDataRootMismatch {
+            height: Height(7),
+            expected: block::merkle::AuthDataRoot::from([1; 32]),
+            actual: block::merkle::AuthDataRoot::from([2; 32]),
+        };
+        for error in [auth_commitment.clone(), prevalidated_root] {
+            assert!(error.is_auth_commitment_mismatch());
+            let commit = CommitCheckpointVerifiedError::from(
+                CommitBlockError::ValidateContextError(Box::new(error)),
+            );
+            assert!(commit.is_auth_commitment_mismatch());
+            assert!(!commit
+                .with_vct_failure(VctCommitFailure::CurrentRoots)
+                .is_auth_commitment_mismatch());
+        }
+
+        // A same-hash body cannot change the header's history root or pre-NU5 roots.
+        for error in [
+            ValidateContextError::InvalidBlockCommitment(
+                CommitmentError::InvalidChainHistoryRoot {
+                    expected: [0; 32],
+                    actual: [1; 32],
+                },
+            ),
+            ValidateContextError::InvalidBlockCommitment(
+                CommitmentError::InvalidPreNu5OrchardRoot {
+                    expected: [0; 32],
+                    actual: [1; 32],
+                },
+            ),
+            ValidateContextError::AncestorBodyRejected(block::Hash([9; 32])),
+        ] {
+            assert!(!error.is_auth_commitment_mismatch());
+        }
+    }
+
+    #[test]
+    fn rejected_body_descendants_are_retryable_and_unscored() {
+        let error = ValidateContextError::AncestorBodyRejected(block::Hash([9; 32]));
+        assert!(error.is_descendant_of_auth_commitment_mismatch());
+        assert_eq!(error.misbehavior_score(), 0);
+        assert_eq!(
+            error.body_verification_class(),
+            BodyVerificationClass::Retryable(TransientBodyFailureKind::Canceled)
+        );
+        assert!(
+            CommitCheckpointVerifiedError::from(CommitBlockError::ValidateContextError(Box::new(
+                error
+            )))
+            .is_descendant_of_auth_commitment_mismatch()
+        );
+    }
 
     #[test]
     fn body_verification_classes_preserve_attribution_boundaries() {

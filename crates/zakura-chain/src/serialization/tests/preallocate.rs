@@ -5,7 +5,7 @@ use proptest::{collection::size_range, prelude::*};
 use std::matches;
 
 use crate::serialization::{
-    arbitrary::max_allocation_is_big_enough,
+    arbitrary::serialized_sizes_at_allocation_limit,
     zcash_deserialize::{MAX_INITIAL_ALLOCATION, MAX_U8_ALLOCATION},
     CompactSizeMessage, SerializationError, TrustedPreallocate, ZcashDeserialize, ZcashSerialize,
     MAX_PROTOCOL_MESSAGE_LEN,
@@ -78,20 +78,16 @@ fn u8_size_is_correct() {
 /// 1. The smallest disallowed `Vec<u8>` is too big to include in a Zcash Wire Protocol message
 /// 2. The largest allowed `Vec<u8>`is exactly the size of a maximal Zcash Wire Protocol message
 fn u8_max_allocation_is_correct() {
-    let (
-        smallest_disallowed_vec_len,
-        smallest_disallowed_serialized_len,
-        largest_allowed_vec_len,
-        largest_allowed_serialized_len,
-    ) = max_allocation_is_big_enough(0u8);
+    let (smallest_disallowed_serialized_len, largest_allowed_serialized_len) =
+        serialized_sizes_at_allocation_limit(0u8);
 
-    // Confirm that shortest_disallowed_vec is only one item larger than the limit
-    assert_eq!((smallest_disallowed_vec_len - 1), MAX_U8_ALLOCATION);
+    assert_eq!(
+        usize::try_from(u8::max_allocation()).unwrap(),
+        MAX_U8_ALLOCATION
+    );
     // Confirm that shortest_disallowed_vec is too large to be included in a valid zcash message
     assert!(smallest_disallowed_serialized_len > MAX_PROTOCOL_MESSAGE_LEN);
 
-    // Check that our largest_allowed_vec contains the maximum number of items
-    assert_eq!(largest_allowed_vec_len, MAX_U8_ALLOCATION);
     // Check that our largest_allowed_vec is the size of a maximal protocol message
     assert_eq!(largest_allowed_serialized_len, MAX_PROTOCOL_MESSAGE_LEN);
 }

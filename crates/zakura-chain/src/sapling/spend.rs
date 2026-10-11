@@ -5,7 +5,7 @@
 
 use std::{fmt, io};
 
-use derive_getters::Getters;
+use getset::Getters;
 
 use crate::{
     block::MAX_BLOCK_BYTES,
@@ -36,6 +36,7 @@ use super::{
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Getters)]
 pub struct Spend<AnchorV: AnchorVariant> {
     /// A value commitment to the value of the input note.
+    #[getset(get = "pub")]
     pub cv: commitment::ValueCommitment,
     /// An anchor for this spend.
     ///
@@ -46,14 +47,19 @@ pub struct Spend<AnchorV: AnchorVariant> {
     ///
     /// Some transaction versions have a shared anchor, rather than a per-spend
     /// anchor.
+    #[getset(get = "pub")]
     pub per_spend_anchor: AnchorV::PerSpend,
     /// The nullifier of the input note.
+    #[getset(get = "pub")]
     pub nullifier: note::Nullifier,
     /// The randomized public key for `spend_auth_sig`.
+    #[getset(get = "pub")]
     pub rk: ValidatingKey,
     /// The ZK spend proof.
+    #[getset(get = "pub")]
     pub zkproof: Groth16Proof,
     /// A signature authorizing this spend.
+    #[getset(get = "pub")]
     pub spend_auth_sig: redjubjub::Signature<SpendAuth>,
 }
 

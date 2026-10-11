@@ -1,18 +1,26 @@
 //! Types for unified addresses
 
-use derive_getters::Getters;
 use derive_new::new;
+use getset::Getters;
 
 /// `z_listunifiedreceivers` response
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize, Getters, new)]
 pub struct ZListUnifiedReceiversResponse {
+    /// The Orchard receiver address, if present.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[getset(get = "pub")]
     orchard: Option<String>,
+    /// The Sapling receiver address, if present.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[getset(get = "pub")]
     sapling: Option<String>,
+    /// The transparent P2PKH receiver address, if present.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[getset(get = "pub")]
     p2pkh: Option<String>,
+    /// The transparent P2SH receiver address, if present.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[getset(get = "pub")]
     p2sh: Option<String>,
 }
 

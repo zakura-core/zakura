@@ -60,6 +60,12 @@ DEFAULTS = {
     "listen_addr": "[::]:8233",
     "identity_dir": "",     # e.g. "/root/.zakura" -> pins the iroh node_id; "" uses zakurad default
     "network_cache_dir": "",
+    # Optional explicit peer seeds -> rendered `initial_testnet_peers`.
+    # None omits the key so zakurad keeps its default DNS seeds. A configured
+    # testnet incompatible with the public one MUST set this (an empty list is
+    # fine): zakurad refuses to load such a config while the default seeds are
+    # present. See build_configured_testnet in crates/zakura-network/src/config.rs.
+    "initial_testnet_peers": None,
     "rpc_listen_addr": "",  # empty -> RPC stays disabled
     "rpc_enable_cookie_auth": None,
     "port": None,           # ssh port; None -> ssh default
@@ -71,6 +77,19 @@ DEFAULTS = {
     # e.g. "127.0.0.1:8080" -> renders [health] (/healthy, /ready); "" omits it.
     # Both endpoints are unauthenticated, so keep them on loopback.
     "health_listen_addr": "",
+    # Transparent address receiving coinbase output, rendered as [mining].
+    # Required before the node will serve getblocktemplate or run its internal
+    # miner. "" omits it.
+    "miner_address": "",
+    # Renders `internal_miner = true`, so the node mines its own templates. The
+    # binary must be built with `build_features = ["internal-miner"]`.
+    "internal_miner": False,
+    # Optional coinbase tag after Zakura's marker. Distinct tags give miners that
+    # share a miner address different coinbase transactions, and so different work.
+    "extra_coinbase_data": "",
+    # Extra cargo features for this node's zakurad build, e.g. ["internal-miner"].
+    # Each distinct (commit, features) pair is built and cached separately.
+    "build_features": [],
     "tracing_filter": "",    # e.g. "info,zakura_network::zakura=debug"; "" uses zakurad default
     "checkpoint_sync": True,
     # Setting this false keeps checkpoint sync on while selecting the legacy non-VCT path.
@@ -78,6 +97,10 @@ DEFAULTS = {
     # Optional fleet-wide [defaults.zakura] table -> rendered [network.zakura].
     # Keys: dev_network, listen_addr, bootstrap_peers. Absent -> no section.
     "zakura": None,
+    # Optional [defaults.testnet_parameters] table -> rendered as the inline
+    # `network = { ... }` value, for configured testnets such as the NU7 fork.
+    # Absent -> no section, so the node runs the default public network.
+    "testnet_parameters": None,
     # Process deploys are for manually supervised nodes, like the testnet
     # zcashd-compat Zakura sidecar, where systemd would fight the local runbook.
     "working_dir": "",
@@ -88,6 +111,9 @@ DEFAULTS = {
     "container_name": "",
     # Couple the offline exporter to a binary-only archive node deployment.
     "release_state_publisher": False,
+    # Monitoring metadata read by deploy/runner/zakura-cluster-status.py, such as
+    # `{ local = true }` or a remote node's `status_url`. Ignored by deploy.py.
+    "monitor": None,
 }
 
 
@@ -111,16 +137,22 @@ class Node:
     listen_addr: str
     identity_dir: str
     network_cache_dir: str
+    initial_testnet_peers: object  # list | None: explicit peer seeds
     rpc_listen_addr: str
     rpc_enable_cookie_auth: object
     storage_mode: str
     p2p_stack: str
     metrics_endpoint: str
     health_listen_addr: str
+    miner_address: str
+    internal_miner: bool
+    extra_coinbase_data: str
+    build_features: list
     tracing_filter: str
     checkpoint_sync: bool
     vct_fast_sync: bool
     zakura: object  # dict | None: fleet-wide [network.zakura] settings
+    testnet_parameters: object  # dict | None: configured testnet `network = { ... }` settings
     working_dir: str
     start_command: str
     process_pattern: str
@@ -223,6 +255,20 @@ def load_nodes(config_path: Path, only: list[str] | None) -> list[Node]:
         merged = dict(defaults)
         merged.update(raw)
         publisher = merged["release_state_publisher"]
+        build_features = merged["build_features"]
+        if (not isinstance(build_features, list)
+                or not all(isinstance(f, str) and re.fullmatch(r"[a-z0-9-]+", f)
+                           for f in build_features)):
+            raise DeployError(f"{name}: build_features must be a list of cargo feature names")
+        build_features = sorted(set(build_features))
+        if not isinstance(merged["internal_miner"], bool):
+            raise DeployError(f"{name}: internal_miner must be a boolean")
+        if merged["internal_miner"] and (not merged["miner_address"]
+                                         or "internal-miner" not in build_features):
+            raise DeployError(
+                f"{name}: internal_miner needs a miner_address and "
+                f'build_features = ["internal-miner"]'
+            )
         if not isinstance(publisher, bool):
             raise DeployError(f"{name}: release_state_publisher must be a boolean")
         if publisher and (merged["deploy_kind"] != "systemd" or merged["manage_config"]
@@ -243,6 +289,7 @@ def load_nodes(config_path: Path, only: list[str] | None) -> list[Node]:
             listen_addr=merged["listen_addr"],
             identity_dir=merged["identity_dir"],
             network_cache_dir=merged["network_cache_dir"],
+            initial_testnet_peers=merged.get("initial_testnet_peers"),
             rpc_listen_addr=merged["rpc_listen_addr"],
             rpc_enable_cookie_auth=merged["rpc_enable_cookie_auth"],
             storage_mode=merged["storage_mode"],
@@ -251,10 +298,15 @@ def load_nodes(config_path: Path, only: list[str] | None) -> list[Node]:
             ),
             metrics_endpoint=merged["metrics_endpoint"],
             health_listen_addr=merged["health_listen_addr"],
+            miner_address=merged["miner_address"],
+            internal_miner=merged["internal_miner"],
+            extra_coinbase_data=merged["extra_coinbase_data"],
+            build_features=build_features,
             tracing_filter=merged["tracing_filter"],
             checkpoint_sync=merged["checkpoint_sync"],
             vct_fast_sync=merged["vct_fast_sync"],
             zakura=merged.get("zakura"),
+            testnet_parameters=merged.get("testnet_parameters"),
             working_dir=merged["working_dir"],
             start_command=merged["start_command"],
             process_pattern=merged["process_pattern"],
@@ -376,13 +428,20 @@ def binary_is_runnable(binary: Path) -> bool:
         return False
 
 
-def build_commit(root: Path, sha: str, *, force: bool = False, exporter: bool = False) -> Path:
+def build_key(sha: str, features: list[str] | tuple[str, ...] = ()) -> str:
+    """The cache key for a zakurad build: its commit, plus any extra cargo features."""
+    return "-".join([sha, *sorted(features)])
+
+
+def build_commit(root: Path, sha: str, *, force: bool = False, exporter: bool = False,
+                 features: list[str] | tuple[str, ...] = ()) -> Path:
     """Build one binary at an exact commit, with a separate cache for the exporter."""
     binary = "zakura-checkpoints" if exporter else "zakurad"
     cache_dir = build_cache_dir()
     ensure_data_mount_for_path(cache_dir, purpose="build cache")
     cache_dir.mkdir(parents=True, exist_ok=True)
-    target = cached_binary(sha, binary)
+    key = build_key(sha, features)
+    target = cached_binary(key, binary)
     if target.exists() and not force:
         if binary_is_runnable(target):
             print(f"[build] reusing cached binary for {sha[:9]} -> {target.name}")
@@ -400,6 +459,8 @@ def build_commit(root: Path, sha: str, *, force: bool = False, exporter: bool = 
     try:
         package_args = (["-p", "zakura-utils", "--features", "zakura-checkpoints-offline",
                          "--bin", "zakura-checkpoints"] if exporter else ["-p", "zakura"])
+        if features:
+            package_args += ["--features", ",".join(sorted(features))]
         print(f"[build] {binary} ({sha[:9]}) ...")
         run(["cargo", "build", "--release", "--locked", *package_args], cwd=work)
         # Respect CARGO_TARGET_DIR (set per-worktree or shared) when locating the
@@ -413,7 +474,7 @@ def build_commit(root: Path, sha: str, *, force: bool = False, exporter: bool = 
         os.chmod(tmp, 0o755)
         tmp.replace(target)
         print(f"[build] cached -> {target}")
-        prune_cached_binaries(cache_dir, sha, binary)
+        prune_cached_binaries(cache_dir, key, binary)
     finally:
         run(["git", "worktree", "remove", "--force", str(work)], cwd=root, check=False)
         shutil.rmtree(work, ignore_errors=True)
@@ -421,14 +482,19 @@ def build_commit(root: Path, sha: str, *, force: bool = False, exporter: bool = 
 
 
 def build_nodes(nodes: list[Node], *, force: bool = False) -> dict[str, Path]:
-    """Resolve + build every distinct commit once. Returns sha -> binary path."""
+    """Resolve + build every distinct commit and feature set once.
+
+    Returns build_key(sha, features) -> binary path; a featureless build's key is its sha.
+    """
     root = repo_root()
-    by_sha: dict[str, Path] = {}
+    builds: dict[str, Path] = {}
     for node in nodes:
         node.sha = resolve_sha(root, node.commit)
-    for sha in dict.fromkeys(n.sha for n in nodes):  # unique, order-preserving
-        by_sha[sha] = build_commit(root, sha, force=force)
-    return by_sha
+    for node in nodes:
+        key = build_key(node.sha, node.build_features)
+        if key not in builds:
+            builds[key] = build_commit(root, node.sha, force=force, features=node.build_features)
+    return builds
 
 
 # --------------------------------------------------------------------------- #
@@ -442,6 +508,47 @@ def render_template(name: str, subst: dict[str, str]) -> str:
     return text
 
 
+def toml_scalar(value: object) -> str:
+    """Render one TOML value. Booleans must be checked before ints.
+
+    Strings use JSON escaping, which is also a valid TOML basic string. Tables
+    render as inline tables, which nest, including inside arrays.
+    """
+    if value is None:
+        raise DeployError("TOML has no null value; omit the key instead")
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return str(value)
+    if isinstance(value, dict):
+        items = ", ".join(f"{toml_key(k)} = {toml_scalar(v)}" for k, v in value.items())
+        return f"{{ {items} }}" if items else "{}"
+    if isinstance(value, list):
+        return "[" + ", ".join(toml_scalar(item) for item in value) + "]"
+    return json.dumps(str(value), ensure_ascii=False)
+
+
+def toml_key(key: str) -> str:
+    """Quote a bare key only when TOML requires it, e.g. the "NU6.1" upgrade names."""
+    bare = key.isascii() and key.replace("_", "").replace("-", "").isalnum()
+    return key if bare else json.dumps(key, ensure_ascii=False)
+
+
+def render_toml_pair(key: str, value: object) -> str:
+    """Render one `key = value` line, choosing an inline or multi-line array."""
+    if isinstance(value, list):
+        if not value:
+            return f"{toml_key(key)} = []"
+        # Strings (peer lists, addresses) read better one per line; numeric
+        # arrays such as network_magic stay inline.
+        if any(isinstance(item, str) for item in value):
+            items = "".join(f"    {toml_scalar(item)},\n" for item in value)
+            return f"{toml_key(key)} = [\n{items}]"
+        inline = ", ".join(toml_scalar(item) for item in value)
+        return f"{toml_key(key)} = [{inline}]"
+    return f"{toml_key(key)} = {toml_scalar(value)}"
+
+
 def render_zakura_block(zakura: object) -> str:
     """Render a fleet-wide [network.zakura] section from a dict, or "" if unset.
 
@@ -453,20 +560,28 @@ def render_zakura_block(zakura: object) -> str:
         return ""
     lines = ["[network.zakura]"]
     for key, value in zakura.items():
-        if isinstance(value, bool):
-            lines.append(f"{key} = {'true' if value else 'false'}")
-        elif isinstance(value, (int, float)):
-            lines.append(f"{key} = {value}")
-        elif isinstance(value, list):
-            if value:
-                items = "".join(f'    "{v}",\n' for v in value)
-                lines.append(f"{key} = [\n{items}]")
-            else:
-                lines.append(f"{key} = []")
-        else:
-            lines.append(f'{key} = "{value}"')
+        lines.append(render_toml_pair(key, value))
     # Leading/trailing blank lines so the section reads cleanly between [network] and [state].
     return "\n" + "\n".join(lines) + "\n"
+
+
+def render_network_line(node: Node) -> str:
+    """Render the `network` key: a public network name, or a configured testnet's table.
+
+    A configured testnet is `network = { ... }` itself. zakurad rejects
+    `[network.testnet_parameters]` beside `network = "Testnet"`, because the
+    public Testnet's parameters are fixed. Keys pass through verbatim, so the
+    deployer does not need to learn every field of `DTestnetParameters` in
+    crates/zakura-network/src/config.rs; nested tables such as
+    `activation_heights` and `lockbox_disbursements` render inline.
+    """
+    if not node.testnet_parameters:
+        return f'network = "{node.network}"'
+    if node.network != "Testnet":
+        raise DeployError(
+            f"{node.name}: testnet_parameters configure a Testnet, but network = {node.network!r}"
+        )
+    return f"network = {toml_scalar(dict(node.testnet_parameters))}"
 
 
 def render_node_config(node: Node) -> str:
@@ -484,6 +599,14 @@ def render_node_config(node: Node) -> str:
     health_block = (
         f'[health]\nlisten_addr = "{node.health_listen_addr}"\n' if node.health_listen_addr else ""
     )
+    mining_lines = []
+    if node.miner_address:
+        mining_lines.append(f'miner_address = "{node.miner_address}"')
+    if node.extra_coinbase_data:
+        mining_lines.append(f"extra_coinbase_data = {toml_scalar(node.extra_coinbase_data)}")
+    if node.internal_miner:
+        mining_lines.append("internal_miner = true")
+    mining_block = "[mining]\n" + "\n".join(mining_lines) + "\n" if mining_lines else ""
     filter_line = f'filter = "{node.tracing_filter}"' if node.tracing_filter else "# filter unset (zakurad default)"
     network_cache_line = (
         f'cache_dir = "{node.network_cache_dir}"' if node.network_cache_dir else "# cache_dir unset (zakurad default)"
@@ -491,17 +614,24 @@ def render_node_config(node: Node) -> str:
     identity_dir_line = (
         f'identity_dir = "{node.identity_dir}"' if node.identity_dir else "# identity_dir unset (zakurad default)"
     )
+    initial_peers_line = (
+        render_toml_pair("initial_testnet_peers", node.initial_testnet_peers)
+        if node.initial_testnet_peers is not None
+        else "# initial_testnet_peers unset (zakurad default DNS seeds)"
+    )
     return render_template("zakura.toml", {
-        "NETWORK": node.network,
+        "NETWORK_LINE": render_network_line(node),
         "LISTEN_ADDR": node.listen_addr,
         "IDENTITY_DIR": identity_dir_line,
         "NETWORK_CACHE_DIR": network_cache_line,
+        "INITIAL_TESTNET_PEERS": initial_peers_line,
         "STATE_CACHE_DIR": node.state_cache_dir,
         "STORAGE_MODE": node.storage_mode,
         "P2P_STACK": node.p2p_stack,
         "ZAKURA_BLOCK": render_zakura_block(node.zakura),
         "METRICS_BLOCK": metrics_block,
         "HEALTH_BLOCK": health_block,
+        "MINING_BLOCK": mining_block,
         "TRACING_FILTER": filter_line,
         "LOG_FILE": node.log_file,
         "RPC_BLOCK": rpc_block,
@@ -537,6 +667,7 @@ def render_service(node: Node) -> str:
 INSTALL_SCRIPT = r"""
 set -euo pipefail
 
+STAGE={stage}
 BIN_PATH={bin_path}
 CONFIG_PATH={config_path}
 SERVICE={service}
@@ -561,16 +692,15 @@ require_data_mount_for "$(dirname "$LOG_FILE")"
 
 mkdir -p "$(dirname "$BIN_PATH")" "$(dirname "$CONFIG_PATH")" "$(dirname "$LOG_FILE")"
 
-# Stage uploaded artifacts (uploaded to /tmp by the deploy step).
-install -m 644 /tmp/zakurad-deploy.service "/etc/systemd/system/${{SERVICE}}.service"
-install -m 644 /tmp/zakurad-deploy.toml "$CONFIG_PATH"
+# Install the artifacts this deploy uploaded to its own staging directory.
+install -m 644 "$STAGE/zakurad.service" "/etc/systemd/system/${{SERVICE}}.service"
+install -m 644 "$STAGE/zakura.toml" "$CONFIG_PATH"
 
 # Back up the currently installed binary before replacing it.
 if [ -x "$BIN_PATH" ]; then
     cp -a "$BIN_PATH" "${{BIN_PATH}}.bak"
 fi
-install -m 755 /tmp/zakurad-deploy.new "$BIN_PATH"
-rm -f /tmp/zakurad-deploy.new /tmp/zakurad-deploy.service /tmp/zakurad-deploy.toml
+install -m 755 "$STAGE/zakurad.new" "$BIN_PATH"
 
 systemctl daemon-reload
 
@@ -628,6 +758,7 @@ systemctl is-active "$SERVICE"
 PROCESS_INSTALL_SCRIPT = r"""
 set -euo pipefail
 
+STAGE={stage}
 BIN_PATH={bin_path}
 CONFIG_PATH={config_path}
 LOG_FILE={log_file}
@@ -661,13 +792,12 @@ if [ -n "$WORKING_DIR" ]; then
     mkdir -p "$WORKING_DIR"
 fi
 
-install -m 644 /tmp/zakurad-deploy.toml "$CONFIG_PATH"
+install -m 644 "$STAGE/zakura.toml" "$CONFIG_PATH"
 
 if [ -x "$BIN_PATH" ]; then
     cp -a "$BIN_PATH" "${{BIN_PATH}}.bak"
 fi
-install -m 755 /tmp/zakurad-deploy.new "$BIN_PATH"
-rm -f /tmp/zakurad-deploy.new /tmp/zakurad-deploy.toml
+install -m 755 "$STAGE/zakurad.new" "$BIN_PATH"
 
 if [ "$NO_RESTART" = "1" ]; then
     mkdir -p "$STATE_DIR"
@@ -721,6 +851,7 @@ fi
 BINARY_ONLY_INSTALL_SCRIPT = r"""
 set -euo pipefail
 
+STAGE={stage}
 BIN_PATH={bin_path}
 SERVICE={service}
 NO_RESTART={no_restart}
@@ -730,8 +861,7 @@ mkdir -p "$(dirname "$BIN_PATH")"
 if [ -x "$BIN_PATH" ]; then
     cp -a "$BIN_PATH" "${{BIN_PATH}}.bak"
 fi
-install -m 755 /tmp/zakurad-deploy.new "$BIN_PATH"
-rm -f /tmp/zakurad-deploy.new
+install -m 755 "$STAGE/zakurad.new" "$BIN_PATH"
 
 if [ "$NO_RESTART" = "1" ]; then
     echo "installed binary (restart skipped)"
@@ -770,13 +900,13 @@ systemctl is-active "$SERVICE"
 DOCKER_BINARY_ONLY_INSTALL_SCRIPT = r"""
 set -euo pipefail
 
+STAGE={stage}
 CONTAINER={container}
 BIN_PATH={bin_path}
 NO_RESTART={no_restart}
 
 docker inspect "$CONTAINER" >/dev/null
-docker cp /tmp/zakurad-deploy.new "$CONTAINER:/tmp/zakurad-deploy.new"
-rm -f /tmp/zakurad-deploy.new
+docker cp "$STAGE/zakurad.new" "$CONTAINER:/tmp/zakurad-deploy.new"
 
 docker exec --user 0 "$CONTAINER" sh -c \
     'if [ -x "$1" ]; then cp -a "$1" "$1.bak"; fi
@@ -800,9 +930,8 @@ if [ "$restart_failed" = "1" ] ||
    ! docker inspect --format '{{{{.State.Running}}}}' "$CONTAINER" | grep -qx true; then
     echo "container unhealthy after deploy; rolling back to $BIN_PATH.bak" >&2
     docker stop "$CONTAINER" >/dev/null || true
-    if docker cp "$CONTAINER:$BIN_PATH.bak" /tmp/zakurad-deploy.rollback; then
-        docker cp /tmp/zakurad-deploy.rollback "$CONTAINER:$BIN_PATH"
-        rm -f /tmp/zakurad-deploy.rollback
+    if docker cp "$CONTAINER:$BIN_PATH.bak" "$STAGE/zakurad.rollback"; then
+        docker cp "$STAGE/zakurad.rollback" "$CONTAINER:$BIN_PATH"
     fi
     docker start "$CONTAINER" >/dev/null || true
     exit 1
@@ -810,6 +939,26 @@ fi
 
 docker exec "$CONTAINER" "$BIN_PATH" --version || true
 """
+
+
+REMOTE_STAGE = re.compile(r"/tmp/zakurad-deploy\.[A-Za-z0-9]+")
+
+
+def make_remote_stage(node: Node) -> str:
+    """Create this deploy's own remote staging directory.
+
+    Nodes that share a host, or overlapping deploy runs, must never install each
+    other's binary, config or unit, so nothing is staged at a fixed /tmp path.
+    """
+    stage = run(node.ssh_cmd("mktemp -d /tmp/zakurad-deploy.XXXXXXXX"),
+                capture=True).stdout.strip()
+    if not REMOTE_STAGE.fullmatch(stage):
+        raise DeployError(f"unexpected remote staging directory: {stage!r}")
+    return stage
+
+
+def remove_remote_stage(node: Node, stage: str) -> None:
+    run(node.ssh_cmd(f"rm -rf -- {shlex.quote(stage)}"), capture=True, check=False)
 
 
 def ssh_with_stdin(node: Node, script: str) -> subprocess.CompletedProcess:
@@ -881,6 +1030,92 @@ def deploy_publisher(node: Node, binary: Path, exporter: Path) -> None:
         run(node.ssh_cmd(f"rm -rf -- {shlex.quote(stage)}"), capture=True, check=False)
 
 
+def local_stage_file(prefix: str, suffix: str, content: str) -> Path:
+    """Write a rendered file to a unique local path, so concurrent deploys never share one."""
+    cache = build_cache_dir()
+    cache.mkdir(parents=True, exist_ok=True)
+    fd, name = tempfile.mkstemp(prefix=prefix, suffix=suffix, dir=cache)
+    with os.fdopen(fd, "w") as stream:
+        stream.write(content)
+    return Path(name)
+
+
+def install_node(node: Node, binary: Path, stage: str, *, no_restart: bool) -> tuple[str, bool, str]:
+    """Upload one node's artifacts into `stage` on its host, then install and restart."""
+    # Binary-only: don't render or ship a config/unit; just swap the
+    # binary and restart the existing service or container.
+    if not node.manage_config:
+        if node.deploy_kind not in ("systemd", "docker"):
+            return (
+                node.name,
+                False,
+                "manage_config=false requires deploy_kind=systemd or docker",
+            )
+        if node.deploy_kind == "docker" and not node.container_name:
+            return (node.name, False, "docker deploy requires container_name")
+        run(node.scp_to(str(binary), f"{stage}/zakurad.new"), capture=True)
+        if node.deploy_kind == "docker":
+            script = DOCKER_BINARY_ONLY_INSTALL_SCRIPT.format(
+                stage=shlex.quote(stage),
+                container=shlex.quote(node.container_name),
+                bin_path=shlex.quote(node.bin_path),
+                no_restart="1" if no_restart else "0",
+            )
+        else:
+            script = BINARY_ONLY_INSTALL_SCRIPT.format(
+                stage=shlex.quote(stage),
+                bin_path=shlex.quote(node.bin_path),
+                service=shlex.quote(node.service_name),
+                no_restart="1" if no_restart else "0",
+            )
+        proc = ssh_with_stdin(node, script)
+        if proc.returncode != 0:
+            return (node.name, False, f"install/restart failed (rc={proc.returncode})")
+        return (node.name, True, f"deployed {node.sha[:9]} (binary-only)")
+
+    cfg = render_node_config(node)
+    cfg_tmp = local_stage_file(f".cfg-{node.name}-", ".toml", cfg)
+    try:
+        run(node.scp_to(str(binary), f"{stage}/zakurad.new"), capture=True)
+        run(node.scp_to(str(cfg_tmp), f"{stage}/zakura.toml"), capture=True)
+        if node.deploy_kind == "systemd":
+            unit = render_service(node)
+            unit_tmp = local_stage_file(f".unit-{node.name}-", ".service", unit)
+            try:
+                run(node.scp_to(str(unit_tmp), f"{stage}/zakurad.service"), capture=True)
+            finally:
+                unit_tmp.unlink(missing_ok=True)
+    finally:
+        cfg_tmp.unlink(missing_ok=True)
+
+    if node.deploy_kind == "systemd":
+        script = INSTALL_SCRIPT.format(
+            stage=shlex.quote(stage),
+            bin_path=shlex.quote(node.bin_path),
+            config_path=shlex.quote(node.config_path),
+            service=shlex.quote(node.service_name),
+            log_file=shlex.quote(node.log_file),
+            state_dir=shlex.quote(node.state_cache_dir),
+            no_restart="1" if no_restart else "0",
+        )
+    else:
+        script = PROCESS_INSTALL_SCRIPT.format(
+            stage=shlex.quote(stage),
+            bin_path=shlex.quote(node.bin_path),
+            config_path=shlex.quote(node.config_path),
+            log_file=shlex.quote(node.log_file),
+            state_dir=shlex.quote(node.state_cache_dir),
+            working_dir=shlex.quote(node.working_dir),
+            start_command=shlex.quote(node.start_command),
+            process_pattern=shlex.quote(node.process_pattern),
+            no_restart="1" if no_restart else "0",
+        )
+    proc = ssh_with_stdin(node, script)
+    if proc.returncode != 0:
+        return (node.name, False, f"install/restart failed (rc={proc.returncode})")
+    return (node.name, True, f"deployed {node.sha[:9]}")
+
+
 def cmd_build(args) -> int:
     nodes = load_nodes(Path(args.config), args.node)
     build_nodes(nodes, force=args.force)
@@ -898,84 +1133,18 @@ def cmd_deploy(args) -> int:
     results: list[tuple[str, bool, str]] = []
 
     def work(node: Node) -> tuple[str, bool, str]:
-        binary = by_sha[node.sha]
+        binary = by_sha[build_key(node.sha, node.build_features)]
         try:
             if node.release_state_publisher:
                 deploy_publisher(node, binary, exporters[node.sha])
                 return (node.name, True, f"deployed node and exporter {node.sha[:9]}, publication verified")
             if node.deploy_kind not in ("systemd", "process", "docker"):
                 return (node.name, False, f"unknown deploy_kind: {node.deploy_kind}")
-
-            # Binary-only: don't render or ship a config/unit; just swap the
-            # binary and restart the existing service or container.
-            if not node.manage_config:
-                if node.deploy_kind not in ("systemd", "docker"):
-                    return (
-                        node.name,
-                        False,
-                        "manage_config=false requires deploy_kind=systemd or docker",
-                    )
-                if node.deploy_kind == "docker" and not node.container_name:
-                    return (node.name, False, "docker deploy requires container_name")
-                run(node.scp_to(str(binary), "/tmp/zakurad-deploy.new"), capture=True)
-                if node.deploy_kind == "docker":
-                    script = DOCKER_BINARY_ONLY_INSTALL_SCRIPT.format(
-                        container=shlex.quote(node.container_name),
-                        bin_path=shlex.quote(node.bin_path),
-                        no_restart="1" if args.no_restart else "0",
-                    )
-                else:
-                    script = BINARY_ONLY_INSTALL_SCRIPT.format(
-                        bin_path=shlex.quote(node.bin_path),
-                        service=shlex.quote(node.service_name),
-                        no_restart="1" if args.no_restart else "0",
-                    )
-                proc = ssh_with_stdin(node, script)
-                if proc.returncode != 0:
-                    return (node.name, False, f"install/restart failed (rc={proc.returncode})")
-                return (node.name, True, f"deployed {node.sha[:9]} (binary-only)")
-
-            cfg = render_node_config(node)
-            cfg_tmp = build_cache_dir() / f".cfg-{node.name}.toml"
-            cfg_tmp.write_text(cfg)
+            stage = make_remote_stage(node)
             try:
-                run(node.scp_to(str(binary), "/tmp/zakurad-deploy.new"), capture=True)
-                run(node.scp_to(str(cfg_tmp), "/tmp/zakurad-deploy.toml"), capture=True)
-                if node.deploy_kind == "systemd":
-                    unit = render_service(node)
-                    unit_tmp = build_cache_dir() / f".unit-{node.name}.service"
-                    unit_tmp.write_text(unit)
-                    try:
-                        run(node.scp_to(str(unit_tmp), "/tmp/zakurad-deploy.service"), capture=True)
-                    finally:
-                        unit_tmp.unlink(missing_ok=True)
+                return install_node(node, binary, stage, no_restart=args.no_restart)
             finally:
-                cfg_tmp.unlink(missing_ok=True)
-
-            if node.deploy_kind == "systemd":
-                script = INSTALL_SCRIPT.format(
-                    bin_path=shlex.quote(node.bin_path),
-                    config_path=shlex.quote(node.config_path),
-                    service=shlex.quote(node.service_name),
-                    log_file=shlex.quote(node.log_file),
-                    state_dir=shlex.quote(node.state_cache_dir),
-                    no_restart="1" if args.no_restart else "0",
-                )
-            else:
-                script = PROCESS_INSTALL_SCRIPT.format(
-                    bin_path=shlex.quote(node.bin_path),
-                    config_path=shlex.quote(node.config_path),
-                    log_file=shlex.quote(node.log_file),
-                    state_dir=shlex.quote(node.state_cache_dir),
-                    working_dir=shlex.quote(node.working_dir),
-                    start_command=shlex.quote(node.start_command),
-                    process_pattern=shlex.quote(node.process_pattern),
-                    no_restart="1" if args.no_restart else "0",
-                )
-            proc = ssh_with_stdin(node, script)
-            if proc.returncode != 0:
-                return (node.name, False, f"install/restart failed (rc={proc.returncode})")
-            return (node.name, True, f"deployed {node.sha[:9]}")
+                remove_remote_stage(node, stage)
         except DeployError as exc:
             return (node.name, False, str(exc))
 

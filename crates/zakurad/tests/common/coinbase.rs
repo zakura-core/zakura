@@ -43,9 +43,9 @@ pub(crate) async fn regtest_coinbase() -> eyre::Result<()> {
 
         let net = Network::new_regtest(RegtestParameters {
             activation_heights: ConfiguredActivationHeights {
-                // Current coinbase construction can create Orchard outputs for
-                // unified miner addresses, so use the fixed Orchard circuit.
-                nu6_2: Some(1),
+                // Coinbase construction pays unified miner addresses through
+                // the Ironwood pool, which activates at NU6.3.
+                nu6_3: Some(1),
                 ..Default::default()
             },
             funding_streams: Some(vec![ConfiguredFundingStreams {

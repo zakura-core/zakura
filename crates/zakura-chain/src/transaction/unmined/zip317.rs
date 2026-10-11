@@ -22,7 +22,7 @@ mod tests;
 /// Zakura's marginal fee in zatoshis per logical action.
 //
 // TODO: allow Amount<NonNegative> in constants
-const MARGINAL_FEE: u64 = 400;
+pub const MARGINAL_FEE: u64 = 400;
 
 /// The number of grace logical actions allowed by the ZIP-317 fee calculation.
 const GRACE_ACTIONS: u32 = 2;

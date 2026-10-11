@@ -59,23 +59,6 @@ pub struct Chain {
 
     /// The internal state of this chain.
     inner: ChainInner,
-
-    // Diagnostics
-    //
-    /// The last height this chain forked at. Diagnostics only.
-    ///
-    /// This field is only used for metrics. It is not consensus-critical, and it is not checked for
-    /// equality.
-    ///
-    /// We keep the same last fork height in both sides of a clone, because every new block clones a
-    /// chain, even if it's just growing that chain.
-    ///
-    /// # Note
-    ///
-    /// Most diagnostics are implemented on the `NonFinalizedState`, rather than each chain. Some
-    /// diagnostics only use the best chain, and others need to modify the Chain state, but that's
-    /// difficult with `Arc<Chain>`s.
-    pub(super) last_fork_height: Option<Height>,
 }
 
 /// Spending transaction id type when the `indexer` feature is selected.
@@ -317,7 +300,6 @@ impl Chain {
         let mut chain = Self {
             network: network.clone(),
             inner,
-            last_fork_height: None,
         };
 
         chain.add_sprout_tree_and_anchor(finalized_tip_height, sprout_note_commitment_tree);
@@ -342,25 +324,6 @@ impl Chain {
     #[cfg(any(test, feature = "proptest-impl"))]
     pub fn eq_internal_state(&self, other: &Chain) -> bool {
         self.inner == other.inner
-    }
-
-    /// Returns the last fork height if that height is still in the non-finalized state.
-    /// Otherwise, if that fork has been finalized, returns `None`.
-    #[allow(dead_code)]
-    pub fn recent_fork_height(&self) -> Option<Height> {
-        self.last_fork_height
-            .filter(|last| last >= &self.non_finalized_root_height())
-    }
-
-    /// Returns this chain fork's length, if its fork is still in the non-finalized state.
-    /// Otherwise, if the fork has been finalized, returns `None`.
-    #[allow(dead_code)]
-    pub fn recent_fork_length(&self) -> Option<u32> {
-        let fork_length = self.non_finalized_tip_height() - self.recent_fork_height()?;
-
-        // If the fork is above the tip, it is invalid, so just return `None`
-        // (Ignoring invalid data is ok because this is metrics-only code.)
-        fork_length.try_into().ok()
     }
 
     /// Push a contextually valid non-finalized block into this chain as the new tip.
@@ -432,7 +395,6 @@ impl Chain {
         let block_height = self.height_by_hash(block_hash)?;
         let mut new_chain = self.fork(block_hash)?;
         new_chain.pop_tip();
-        new_chain.last_fork_height = self.last_fork_height.min(Some(block_height));
         Some((new_chain, self.child_blocks(&block_height)))
     }
 
@@ -457,8 +419,6 @@ impl Chain {
         // Revert blocks above the fork
         while forked.non_finalized_tip_hash() != fork_tip {
             forked.pop_tip();
-
-            forked.last_fork_height = Some(forked.non_finalized_tip_height());
         }
 
         Some(forked)
@@ -490,29 +450,6 @@ impl Chain {
                 self.blocks[&tx_loc.height].block.header.time,
             )
         })
-    }
-
-    /// Returns the [`Transaction`] at [`TransactionLocation`], if it exists in this chain.
-    #[allow(dead_code)]
-    pub fn transaction_by_loc(&self, tx_loc: TransactionLocation) -> Option<&Arc<Transaction>> {
-        self.blocks
-            .get(&tx_loc.height)?
-            .block
-            .transactions
-            .get(tx_loc.index.as_usize())
-    }
-
-    /// Returns the [`transaction::Hash`] for the transaction at [`TransactionLocation`],
-    /// if it exists in this chain.
-    #[allow(dead_code)]
-    pub fn transaction_hash_by_loc(
-        &self,
-        tx_loc: TransactionLocation,
-    ) -> Option<&transaction::Hash> {
-        self.blocks
-            .get(&tx_loc.height)?
-            .transaction_hashes
-            .get(tx_loc.index.as_usize())
     }
 
     /// Returns the [`transaction::Hash`]es in the block with `hash_or_height`,
@@ -552,20 +489,6 @@ impl Chain {
     /// Returns false otherwise.
     pub fn contains_block_height(&self, height: Height) -> bool {
         self.blocks.contains_key(&height)
-    }
-
-    /// Returns true is the chain contains the given block hash or height.
-    /// Returns false otherwise.
-    #[allow(dead_code)]
-    pub fn contains_hash_or_height(&self, hash_or_height: impl Into<HashOrHeight>) -> bool {
-        use HashOrHeight::*;
-
-        let hash_or_height = hash_or_height.into();
-
-        match hash_or_height {
-            Hash(hash) => self.contains_block_hash(hash),
-            Height(height) => self.contains_block_height(height),
-        }
     }
 
     /// Returns the non-finalized tip block height and hash.

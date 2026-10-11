@@ -940,9 +940,9 @@ cover the bundle's own checkpoint, replaces all four artifacts, and writes
 `vct/mainnet-vct-manifest.json` provenance (source `release-state-bundle`, heights, digests,
 entry count, bundle binding).
 
-The standalone update workflow also floors `ESTIMATED_RELEASE_HEIGHT`, validates everything
+The standalone update workflow leaves `ESTIMATED_RELEASE_HEIGHT` unchanged, validates everything
 — including proving the candidate subtree roots against its frontier — restricts the diff to
-exactly those six files, and opens a signed **draft PR** for human review. The grid is the one
+release-state artifacts and Cargo pins, and opens a signed **draft PR** for human review. The grid is the one
 committed artifact large enough to matter to `history-growth.yml`, which raises its packed-growth
 allowance only for a change that touches nothing outside the release-state files. During release
 preparation, the importer leaves that constant unchanged so `prepare-release.sh` remains the

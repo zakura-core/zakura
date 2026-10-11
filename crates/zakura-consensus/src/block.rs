@@ -141,6 +141,11 @@ impl VerifyBlockError {
 
         match self {
             Self::Time(_) => true,
+            Self::BodyCommitment(zs::ValidateContextError::InvalidBlockCommitment(
+                block::CommitmentError::InvalidSapingRootBytes
+                | block::CommitmentError::InvalidChainHistoryActivationReserved { .. }
+                | block::CommitmentError::InvalidChainHistoryRoot { .. },
+            )) => true,
             Self::Block {
                 source:
                     BlockError::InvalidHeaderEncoding(_)
@@ -159,7 +164,14 @@ impl VerifyBlockError {
                         zs::ValidateContextError::NonSequentialBlock { .. }
                         | zs::ValidateContextError::TimeTooEarly { .. }
                         | zs::ValidateContextError::TimeTooLate { .. }
-                        | zs::ValidateContextError::InvalidDifficultyThreshold { .. },
+                        | zs::ValidateContextError::InvalidDifficultyThreshold { .. }
+                        | zs::ValidateContextError::InvalidBlockCommitment(
+                            block::CommitmentError::InvalidSapingRootBytes
+                            | block::CommitmentError::InvalidChainHistoryActivationReserved {
+                                ..
+                            }
+                            | block::CommitmentError::InvalidChainHistoryRoot { .. },
+                        ),
                     ) => true,
                     Some(error) => terminal(error.body_verification_class()),
                 }
@@ -179,9 +191,7 @@ impl VerifyBlockError {
             Self::MissingParentContext(_) | Self::Depth { .. } => {
                 BodyVerificationClass::Retryable(TransientBodyFailureKind::MissingContext)
             }
-            Self::BodyCommitment(_) => {
-                BodyVerificationClass::PayloadMismatch(BodyCommitmentKind::AuthDataRoot)
-            }
+            Self::BodyCommitment(error) => error.body_verification_class(),
             Self::ParentHeightMismatch { .. } => {
                 BodyVerificationClass::PayloadMismatch(BodyCommitmentKind::Other("coinbase_height"))
             }

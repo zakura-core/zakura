@@ -3163,3 +3163,50 @@ mod zip218_shielded_action_limits {
         })
     }
 }
+
+#[test]
+fn header_only_commitment_errors_do_not_blame_replaceable_bodies() {
+    use zakura_chain::block::CommitmentError;
+    use zakura_header_chain::{BodyVerificationClass, TransientBodyFailureKind};
+
+    for commitment in [
+        CommitmentError::InvalidSapingRootBytes,
+        CommitmentError::InvalidChainHistoryActivationReserved { actual: [1; 32] },
+        CommitmentError::InvalidChainHistoryRoot {
+            expected: [0; 32],
+            actual: [1; 32],
+        },
+    ] {
+        let contextual = zs::ValidateContextError::InvalidBlockCommitment(commitment);
+        let expected =
+            BodyVerificationClass::Retryable(TransientBodyFailureKind::VerifierUnavailable);
+        assert_eq!(
+            contextual.body_verification_class(),
+            expected,
+            "a body replacement cannot change these header bytes or the committed parent history"
+        );
+        assert!(VerifyBlockError::BodyCommitment(contextual.clone()).rejects_template());
+        assert!(
+            VerifyBlockError::ValidateProposal(Box::new(contextual.clone())).rejects_template()
+        );
+        assert_eq!(
+            VerifyBlockError::BodyCommitment(contextual).body_verification_class(),
+            expected,
+            "the early commitment wrapper must preserve contextual attribution"
+        );
+    }
+
+    let auth_mismatch = zs::ValidateContextError::InvalidBlockCommitment(
+        CommitmentError::InvalidChainHistoryBlockTxAuthCommitment {
+            expected: [0; 32],
+            actual: [1; 32],
+        },
+    );
+    assert!(
+        matches!(
+            VerifyBlockError::BodyCommitment(auth_mismatch).body_verification_class(),
+            BodyVerificationClass::PayloadMismatch(_)
+        ),
+        "authorizing data remains replaceable"
+    );
+}

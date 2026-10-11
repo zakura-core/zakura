@@ -977,11 +977,14 @@ impl ValidateContextError {
                     CommitmentError::InvalidFinalSaplingRoot { .. } => {
                         BodyCommitmentKind::Other("final_sapling_root")
                     }
-                    CommitmentError::InvalidChainHistoryActivationReserved { .. } => {
-                        BodyCommitmentKind::Other("chain_history_activation_reserved")
-                    }
-                    CommitmentError::InvalidChainHistoryRoot { .. } => {
-                        BodyCommitmentKind::Other("chain_history_root")
+                    // These compare immutable header bytes with encoding rules or
+                    // committed parent history, so replacing the body cannot fix them.
+                    CommitmentError::InvalidChainHistoryActivationReserved { .. }
+                    | CommitmentError::InvalidChainHistoryRoot { .. }
+                    | CommitmentError::InvalidSapingRootBytes => {
+                        return BodyVerificationClass::Retryable(
+                            TransientBodyFailureKind::VerifierUnavailable,
+                        );
                     }
                     CommitmentError::InvalidChainHistoryBlockTxAuthCommitment { .. } => {
                         BodyCommitmentKind::Other("chain_history_block_tx_auth_commitment")
@@ -1003,9 +1006,6 @@ impl ValidateContextError {
                     }
                     CommitmentError::MissingBlockHeight { .. } => {
                         BodyCommitmentKind::Other("missing_block_height")
-                    }
-                    CommitmentError::InvalidSapingRootBytes => {
-                        BodyCommitmentKind::Other("invalid_sapling_root_bytes")
                     }
                 };
                 BodyVerificationClass::PayloadMismatch(kind)

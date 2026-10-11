@@ -3593,19 +3593,19 @@ async fn retained_path_reserves_bounded_repair_capacity_for_every_storage_band()
             runtime.leases.lock().unwrap().by_peer[&owner].capacity,
             RetainedPathCapacity::Bounded
         );
-        assert_eq!(
-            reader
-                .acquire_retained_path(
-                    SourceId::from_digest([0xc3; 32]),
-                    1,
-                    target.hash,
-                    &[ancestor.hash],
-                    scope
-                )
-                .unwrap(),
-            RetainedPathLeaseOutcome::Busy,
-            "one bounded lease fills the reserve"
-        );
+        let RetainedPathLeaseOutcome::CapacityBusy(capacity_signal) = reader
+            .acquire_retained_path(
+                SourceId::from_digest([0xc3; 32]),
+                1,
+                target.hash,
+                &[ancestor.hash],
+                scope,
+            )
+            .unwrap()
+        else {
+            panic!("one bounded lease fills the reserve and reports its release signal");
+        };
+        assert!(!capacity_signal.is_released());
         let RetainedPathReadOutcome::Page(page) = reader
             .read_retained_path(
                 owner,
@@ -3622,6 +3622,7 @@ async fn retained_path_reserves_bounded_repair_capacity_for_every_storage_band()
         assert_eq!(page.headers.len(), 2);
         assert_eq!(page.headers.last().unwrap().hash(), target.hash);
         assert!(page.complete);
+        assert!(capacity_signal.is_released());
     }
 
     let target = &path[3];

@@ -423,7 +423,7 @@ proptest::proptest! {
         reissuance in proptest::bool::ANY,
     ) {
         use zakura_chain::parameters::subsidy::halving_block_subsidy;
-        use crate::{rollback_finalized_state, RollbackFinalizedStateOptions};
+        use crate::RollbackFinalizedStateOptions;
         let _guard = zakura_test::init();
         let network = accounting_network(reissuance);
         let dir = tempfile::tempdir().unwrap();
@@ -455,22 +455,25 @@ proptest::proptest! {
         }
         let target = target_offset % claims.len();
         let target_height = Height(START.0 - 1 + u32::try_from(target).unwrap());
-        drop(state);
-        rollback_finalized_state(config.clone(), &network, RollbackFinalizedStateOptions {
+        // Keep this history's database open for rollback and replay. Offline
+        // reopen/lock handling is covered by the rollback tests; both modes use
+        // the same rollback implementation here.
+        state.db.rollback_for_test(&network, RollbackFinalizedStateOptions {
             target_height, keep_rolled_back_blocks: true, max_checkpoint_height: Some(Height(0)),
         }).unwrap();
-        let mut state = FinalizedState::new(&config, &network).unwrap();
         proptest::prop_assert_eq!(state.db.finalized_value_pool(), snapshots[target]);
         for (index, block) in blocks.iter().enumerate().skip(target + 1) {
             commit(&mut state, block).unwrap();
             proptest::prop_assert_eq!(state.db.finalized_value_pool(), snapshots[index]);
             proptest::prop_assert_eq!(*state.db.block_info(block.coinbase_height().unwrap().into()).unwrap().value_pools(), snapshots[index]);
         }
-        drop(state);
-        rollback_finalized_state(config.clone(), &network, RollbackFinalizedStateOptions {
+        state.db.rollback_for_test(&network, RollbackFinalizedStateOptions {
             target_height, keep_rolled_back_blocks: false, max_checkpoint_height: Some(Height(0)),
         }).unwrap();
+        // Retain a reopen check for persisted rollback state and format validity.
+        drop(state);
         let mut state = FinalizedState::new(&config, &network).unwrap();
+        proptest::prop_assert_eq!(state.db.finalized_value_pool(), snapshots[target]);
         let height = target_height.next().unwrap();
         let deficit = i128::from(i64::from(snapshots[target].nsm_value_balance_amount()));
         let bonus = reissuance_bonus(&network, height, deficit);

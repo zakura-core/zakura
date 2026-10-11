@@ -17,14 +17,11 @@
 //!   has an appropriate API for accessing any relevant data.
 //!
 //!   This should be achieved, wherever possible, by:
-//!   - Using `derive(Getters, new)` to keep new code succinct and consistent.
-//!     Ensure that fields on response types that implement `Copy` are tagged
-//!     with `#[getter(copy)]` field attributes to avoid unnecessary references.
-//!     This should be easily noticeable in the `serialization_tests` test crate, where
-//!     any fields implementing `Copy` but not tagged with `#[getter(Copy)]` will
-//!     be returned by reference, and will require dereferencing with the dereference
-//!     operator, `*`. If a value returned by a getter method requires dereferencing,
-//!     the associated field in the response type should likely be tagged with `#[getter(Copy)]`.
+//!   - Use [`getset::Getters`] and [`getset::CopyGetters`] with `new` to keep
+//!     response accessors consistent. Select `#[getset(get = "pub")]` for
+//!     borrowed fields and `#[getset(get_copy = "pub")]` for fields returned
+//!     by value. Check the `serialization_tests` test crate for the expected
+//!     return types.
 //!   - If a field is added, use `#[new(...)]` so that it's not added to the
 //!     constructor. If that is unavoidable, then it will require a major
 //!     version bump.
@@ -41,9 +38,9 @@ use std::{
 };
 
 use chrono::Utc;
-use derive_getters::Getters;
 use derive_new::new;
 use futures::{future::OptionFuture, stream::FuturesOrdered, StreamExt, TryFutureExt};
+use getset::{CopyGetters, Getters};
 use hex::{FromHex, ToHex};
 use indexmap::IndexMap;
 use jsonrpsee::core::{async_trait, RpcResult as Result};
@@ -60,7 +57,7 @@ use tracing::Instrument;
 
 use zakura_chain::{
     amount::{Amount, NegativeAllowed},
-    block::{self, Block, Commitment, Height, SerializedBlock, TryIntoHeight},
+    block::{self, Block, Commitment, Header, Height, SerializedBlock, TryIntoHeight},
     chain_sync_status::ChainSyncStatus,
     chain_tip::{ChainTip, NetworkChainTipHeightEstimator},
     parameters::{
@@ -114,6 +111,8 @@ pub(crate) mod types;
 
 use hex_data::HexData;
 use trees::{GetSubtreesByIndexResponse, GetTreestateResponse, SubtreeRpcData};
+use types::get_block_template::prepared_candidates::ResolvePreparedCandidateError;
+
 use types::{
     chain_tips::{self, GetChainTipsResponse},
     get_block_template::{
@@ -129,12 +128,14 @@ use types::{
     get_mempool_info::GetMempoolInfoResponse,
     get_mining_info::GetMiningInfoResponse,
     get_raw_mempool::{self, GetRawMempoolResponse},
+    get_standard_fee::GetStandardFeeResponse,
     long_poll::LongPollInput,
     network_info::{GetNetworkInfoResponse, NetworkInfo},
     peer_info::PeerInfo,
     submit_block::{
-        MinedBlockEvent, PendingBlockRegistry, SubmitBlockErrorResponse, SubmitBlockParameters,
-        SubmitBlockResponse,
+        MinedBlockEvent, MinedBlockSubmission, PendingBlockRegistry, SubmitBlockErrorResponse,
+        SubmitBlockParameters, SubmitBlockResponse, SubmitSolutionErrorResponse,
+        SubmitSolutionParameters, SubmitSolutionResponse,
     },
     subsidy::GetBlockSubsidyResponse,
     transaction::TransactionObject,
@@ -152,6 +153,8 @@ where
 {
     service.oneshot(request).await.map_misc_error()
 }
+
+mod openrpc;
 
 include!("methods/rpc_openrpc.rs");
 
@@ -224,6 +227,7 @@ pub(crate) const RPC_METHOD_ACCESS: &[(&str, RpcAccess)] = &[
     ("getblockhash", RpcAccess::Unauthenticated),
     ("getblocktemplate", RpcAccess::Unauthenticated),
     ("submitblock", RpcAccess::Unauthenticated),
+    ("submitsolution", RpcAccess::Unauthenticated),
     ("getmininginfo", RpcAccess::Unauthenticated),
     ("getnetworksolps", RpcAccess::Unauthenticated),
     ("getnetworkhashps", RpcAccess::Unauthenticated),
@@ -232,11 +236,13 @@ pub(crate) const RPC_METHOD_ACCESS: &[(&str, RpcAccess)] = &[
     ("ping", RpcAccess::Unauthenticated),
     ("validateaddress", RpcAccess::Unauthenticated),
     ("z_validateaddress", RpcAccess::Unauthenticated),
+    ("getstandardfee", RpcAccess::Unauthenticated),
     ("getblocksubsidy", RpcAccess::Unauthenticated),
     ("getdifficulty", RpcAccess::Unauthenticated),
     ("z_listunifiedreceivers", RpcAccess::Unauthenticated),
     ("invalidateblock", RpcAccess::Admin),
     ("reconsiderblock", RpcAccess::Admin),
+    ("preciousblock", RpcAccess::Admin),
     ("generate", RpcAccess::Test),
     ("addnode", RpcAccess::Test),
     ("rpc.discover", RpcAccess::Unauthenticated),
@@ -281,6 +287,13 @@ pub(super) const PARAM_VERBOSITY_DESC: &str = "Whether to include verbose output
 pub(super) const PARAM_N_DESC: &str = "The output index in the transaction.";
 pub(super) const PARAM_INCLUDE_MEMPOOL_DESC: &str =
     "Whether to include mempool transactions in the response.";
+pub(super) const RESULT_PRECIOUSBLOCK_DESC: &str =
+    "Always null. Errors are returned as JSON-RPC errors.";
+
+mod hex_serde;
+
+#[cfg(unix)]
+mod unix;
 
 #[cfg(test)]
 mod tests;
@@ -744,6 +757,16 @@ pub trait Rpc {
         _parameters: Option<SubmitBlockParameters>,
     ) -> Result<SubmitBlockResponse>;
 
+    /// Submits a solved header for a prepared mining candidate.
+    ///
+    /// The miner must retry with `submitblock` when this method returns `stale-work` or
+    /// `candidate-mismatch`.
+    #[method(name = "submitsolution")]
+    async fn submit_solution(
+        &self,
+        parameters: SubmitSolutionParameters,
+    ) -> Result<SubmitSolutionResponse>;
+
     /// Returns mining-related information.
     ///
     /// zcashd reference: [`getmininginfo`](https://zcash.github.io/rpc/getmininginfo.html)
@@ -841,6 +864,17 @@ pub trait Rpc {
     #[method(name = "z_validateaddress")]
     async fn z_validate_address(&self, address: String) -> Result<ZValidateAddressResponse>;
 
+    /// Returns the recommended standard fee per logical action, in zatoshis.
+    ///
+    /// Currently returns Zakura's ZIP 317 marginal fee (`zip317::MARGINAL_FEE`), with `version` 0.
+    /// A dynamic estimate can replace this value without changing the parameters or
+    /// result shape.
+    ///
+    /// method: post
+    /// tags: wallet
+    #[method(name = "getstandardfee")]
+    async fn get_standard_fee(&self) -> Result<GetStandardFeeResponse>;
+
     /// Returns the block subsidy reward of the block at `height`, taking into account the mining slow start.
     /// Returns an error if `height` is less than the height of the first halving for the current network.
     ///
@@ -906,6 +940,28 @@ pub trait Rpc {
     #[method(name = "reconsiderblock")]
     async fn reconsider_block(&self, block_hash: String) -> Result<Vec<block::Hash>>;
 
+    /// Treats a block as if it were received before other chain tips with the same work.
+    ///
+    /// It applies to a current non-finalized chain tip with at least as much work as the best tip.
+    /// A later call overrides an earlier one. A chain with more work still wins. For any other
+    /// known block, such as a block that is not a chain tip, a finalized block, an invalidated
+    /// block, or a tip with less work than the best tip, the call succeeds and changes nothing. An
+    /// unknown hash returns error code -5, and a malformed hash returns error code -8.
+    ///
+    /// The preference is local to this node. It is kept while the block is in any non-finalized
+    /// chain or any retained invalidation record. It is forgotten once the block is in neither,
+    /// for example when a fork-limit eviction removes it from its last chain, or when its
+    /// invalidation record is discarded while it is in no chain. A block downloaded again after
+    /// that is not preferred. It is not kept across restarts.
+    /// See Bitcoin Core's
+    /// [`preciousblock`](https://developer.bitcoin.org/reference/rpc/preciousblock.html).
+    ///
+    /// # Parameters
+    ///
+    /// - `block_hash`: (hex-encoded block hash, required) The hash of the block to prefer.
+    #[method(name = "preciousblock")]
+    async fn precious_block(&self, block_hash: String) -> Result<()>;
+
     #[method(name = "generate")]
     /// Mine blocks immediately. Returns the block hashes of the generated blocks.
     ///
@@ -941,7 +997,7 @@ pub trait Rpc {
 
     /// Returns an OpenRPC schema as a description of this service.
     #[method(name = "rpc.discover")]
-    fn openrpc(&self) -> openrpsee::openrpc::Response;
+    fn openrpc(&self) -> Result<serde_json::Value>;
     /// Returns details about an unspent transaction output.
     ///
     /// zcashd reference: [`gettxout`](https://zcash.github.io/rpc/gettxout.html)
@@ -1024,6 +1080,260 @@ where
     gbt: GetBlockTemplateHandler<BlockVerifierRouter, SyncStatus>,
 }
 
+/// How long one mining template may take to pass proposal validation.
+///
+/// Foreground recovery stops waiting at this deadline, because a miner is waiting on it.
+/// Speculative preparation cannot stop the work it dispatched, so it reads the same deadline as
+/// the point past which a parent's templates cost more than they are worth.
+const TEMPLATE_PREPARATION_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The outcome of validating one server mining template.
+enum Preparation {
+    /// The template passed proposal validation.
+    Prepared(Arc<Block>),
+    /// Validation condemned the template itself, so the server must withdraw it.
+    Rejected,
+    /// The chain moved off the template's parent before validation finished.
+    Stale,
+    /// Validation did not finish within [`TEMPLATE_PREPARATION_TIMEOUT`].
+    TimedOut,
+    /// Validation failed for a local reason that does not condemn the template.
+    Failed(zakura_consensus::BoxError),
+}
+
+/// Runs one template's proposal validation to completion.
+///
+/// This is the whole cost of preparing a template: building the proposal block, then semantically
+/// verifying every transaction in it. Nothing here is cancellable. A caller that stops waiting
+/// leaves this running, which is why callers must account for it rather than assume it stopped.
+async fn verify_server_template<BlockVerifierRouter>(
+    verifier: BlockVerifierRouter,
+    template: &BlockTemplateResponse,
+    network: &Network,
+) -> Preparation
+where
+    BlockVerifierRouter: BlockVerifierService,
+{
+    let Ok(block) = proposal_block_from_template(template, None, network) else {
+        tracing::warn!(work_id = %template.work_id(), "server mining template cannot form a proposal");
+        return Preparation::Rejected;
+    };
+
+    // Building the block is itself CPU work, so re-check for shutdown rather than start a
+    // verification whose answer nobody will use.
+    if zakura_chain::shutdown::is_shutting_down() {
+        return Preparation::Stale;
+    }
+
+    let parent = block.header.previous_block_hash;
+    let block = Arc::new(block);
+    let request = zakura_consensus::Request::Prepare {
+        block: block.clone(),
+        source: zakura_consensus::PreparedCandidateSource::ServerTemplate,
+    };
+
+    match verifier.oneshot(request).await {
+        Ok(_hash) => Preparation::Prepared(block),
+        Err(error) => {
+            let rejects_template = rejects_template(&error);
+            tracing::debug!(
+                ?error,
+                work_id = %template.work_id(),
+                ?parent,
+                rejects_template,
+                "mining candidate preparation failed"
+            );
+            if rejects_template {
+                Preparation::Rejected
+            } else {
+                Preparation::Failed(error)
+            }
+        }
+    }
+}
+
+/// Dispatches one speculative preparation onto a detached task.
+///
+/// The verification runs in its own task, so nothing the caller does stops it: dropping a tower
+/// future leaves the work its request already dispatched running. The join handle is therefore
+/// the only honest signal that the computation is over, and the caller must not start another
+/// preparation until it resolves.
+///
+/// Returns `None`, having dispatched nothing, when the chain has already left this template's
+/// parent. A template can go stale while it waits its turn, and preparing it then would hold the
+/// one speculative worker away from a template a miner could still use.
+fn start_speculative_preparation<BlockVerifierRouter, Tip>(
+    verifier: BlockVerifierRouter,
+    template: &BlockTemplateResponse,
+    latest_chain_tip: Tip,
+    network: &Network,
+) -> Option<tokio::task::JoinHandle<Preparation>>
+where
+    BlockVerifierRouter: BlockVerifierService,
+    Tip: ChainTip + Clone + Send + Sync + 'static,
+{
+    if latest_chain_tip.best_tip_hash() != Some(template.previous_block_hash) {
+        return None;
+    }
+
+    Some(tokio::spawn({
+        let template = template.clone();
+        let network = network.clone();
+        async move { verify_server_template(verifier, &template, &network).await }.in_current_span()
+    }))
+}
+
+/// Validates one template in the foreground, for a caller that needs the answer now.
+///
+/// Unlike speculative preparation this is ordinary validation: a miner is waiting on it, so it
+/// runs whatever the speculation breaker says.
+async fn prepare_server_template<BlockVerifierRouter, Tip>(
+    verifier: BlockVerifierRouter,
+    template: &BlockTemplateResponse,
+    latest_chain_tip: Tip,
+    network: &Network,
+) -> Preparation
+where
+    BlockVerifierRouter: BlockVerifierService,
+    Tip: ChainTip + Clone + Send + Sync + 'static,
+{
+    let parent = template.previous_block_hash;
+    let mut tip = latest_chain_tip;
+    let stale = async {
+        loop {
+            tip.mark_best_tip_seen();
+            if tip.best_tip_hash() != Some(parent) {
+                break;
+            }
+            if tip.best_tip_changed().await.is_err() {
+                break;
+            }
+        }
+    };
+
+    tokio::select! {
+        biased;
+        _ = stale => Preparation::Stale,
+        result = tokio::time::timeout(
+            TEMPLATE_PREPARATION_TIMEOUT,
+            verify_server_template(verifier, template, network),
+        ) => result.unwrap_or(Preparation::TimedOut),
+    }
+}
+
+/// Prepares one queued server template, and returns once its computation is over.
+///
+/// Returning is the signal that the speculative worker is free again, so this must not return
+/// while work it dispatched is still running. See [`RpcImpl::prepare_template_in_background`].
+async fn prepare_one_server_template<BlockVerifierRouter, Tip, SyncStatus>(
+    gbt: &GetBlockTemplateHandler<BlockVerifierRouter, SyncStatus>,
+    verifier: BlockVerifierRouter,
+    template: &BlockTemplateResponse,
+    latest_chain_tip: &Tip,
+    network: &Network,
+) where
+    BlockVerifierRouter: BlockVerifierService,
+    Tip: ChainTip + Clone + Send + Sync + 'static,
+    SyncStatus: ChainSyncStatus + Clone + Send + Sync + 'static,
+{
+    let parent = template.previous_block_hash;
+    let work_id = template.work_id().clone();
+
+    // Once a parent needs recovery, only foreground-validated fallback work may be published.
+    // Discard its queued speculative preparations.
+    if gbt.template_rejections.borrow().needs_fallback() {
+        return;
+    }
+    if !gbt.speculation_breaker.allows(parent) {
+        metrics::counter!("mining.template_preparation.declined").increment(1);
+        return;
+    }
+
+    let Some(computation) =
+        start_speculative_preparation(verifier, template, latest_chain_tip.clone(), network)
+    else {
+        // The chain left this template's parent while it waited its turn.
+        metrics::counter!("mining.template_preparation.stale_before_dispatch").increment(1);
+        return;
+    };
+
+    let started = tokio::time::Instant::now();
+    let outcome = computation.await;
+    let elapsed = started.elapsed();
+
+    // The deadline classifies the cost; it does not stop the work, so it is read once the
+    // computation is actually over. An answer that arrives late still counts: withdrawing an
+    // invalid template late is better than never withdrawing it.
+    if elapsed >= TEMPLATE_PREPARATION_TIMEOUT {
+        // This parent's templates cost more than the deadline allows. Stop speculating on it
+        // until the chain moves on, instead of paying that cost again for every template built
+        // on it.
+        gbt.speculation_breaker.trip(parent);
+        metrics::counter!("mining.template_preparation.timed_out").increment(1);
+        tracing::debug!(
+            ?elapsed,
+            %work_id,
+            ?parent,
+            "a server mining template overran its preparation deadline"
+        );
+    }
+
+    match outcome {
+        Ok(Preparation::Prepared(block)) => {
+            gbt.prepared_candidates().insert(
+                block,
+                &work_id,
+                zakura_consensus::PreparedCandidateSource::ServerTemplate,
+                network,
+            );
+            gbt.template_rejections
+                .send_if_modified(|state| state.mark_prepared(parent, &work_id));
+        }
+        Ok(Preparation::Rejected) => {
+            gbt.template_rejections.send_if_modified(|state| {
+                // A reorg away from this parent and back leaves the rejection state naming
+                // another parent while this validation finishes. Re-point it when the chain is
+                // back here, so the rejection is recorded rather than silently dropped.
+                if state.parent != Some(parent) && latest_chain_tip.best_tip_hash() == Some(parent)
+                {
+                    state.set_parent(parent);
+                }
+                state.reject(parent, &work_id)
+            });
+            metrics::counter!("mining.template_preparation.rejected").increment(1);
+        }
+        // The background path has no inner deadline, so `TimedOut` cannot reach here: both
+        // remaining outcomes mean the node gave up before it had an answer.
+        Ok(Preparation::Stale | Preparation::TimedOut) => {
+            metrics::counter!("mining.template_preparation.cancelled").increment(1);
+        }
+        Ok(Preparation::Failed(error)) => {
+            tracing::debug!(
+                ?error,
+                %work_id,
+                ?parent,
+                "background mining candidate preparation failed"
+            );
+        }
+        Err(error) => {
+            tracing::warn!(?error, "template preparation task did not finish");
+        }
+    }
+}
+
+/// Whether a preparation error condemns the template rather than the node's local state.
+fn rejects_template(error: &zakura_consensus::BoxError) -> bool {
+    error
+        .downcast_ref::<zakura_consensus::VerifyBlockError>()
+        .or_else(
+            || match error.downcast_ref::<zakura_consensus::RouterError>() {
+                Some(zakura_consensus::RouterError::Block { source }) => Some(source.as_ref()),
+                _ => None,
+            },
+        )
+        .is_some_and(zakura_consensus::VerifyBlockError::rejects_template)
+}
+
 /// A type alias for the last event logged by the server.
 pub type LoggedLastEvent = watch::Receiver<Option<(String, tracing::Level, chrono::DateTime<Utc>)>>;
 
@@ -1086,48 +1396,6 @@ where
         VersionString: ToString + Clone + Send + 'static,
         UserAgentString: ToString + Clone + Send + 'static,
     {
-        Self::new_with_pending_blocks(
-            network,
-            mining_config,
-            debug_force_finished_sync,
-            build_version,
-            user_agent,
-            mempool,
-            state,
-            read_state,
-            block_verifier_router,
-            sync_status,
-            latest_chain_tip,
-            address_book,
-            last_warn_error_log_rx,
-            mined_block_sender,
-            PendingBlockRegistry::default(),
-        )
-    }
-
-    /// Creates an RPC handler with a pending-block registry shared with peer serving.
-    #[allow(clippy::too_many_arguments)]
-    pub fn new_with_pending_blocks<VersionString, UserAgentString>(
-        network: Network,
-        mining_config: config::mining::Config,
-        debug_force_finished_sync: bool,
-        build_version: VersionString,
-        user_agent: UserAgentString,
-        mempool: Mempool,
-        state: State,
-        read_state: ReadState,
-        block_verifier_router: BlockVerifierRouter,
-        sync_status: SyncStatus,
-        latest_chain_tip: Tip,
-        address_book: AddressBook,
-        last_warn_error_log_rx: LoggedLastEvent,
-        mined_block_sender: Option<mpsc::UnboundedSender<MinedBlockEvent>>,
-        pending_blocks: PendingBlockRegistry,
-    ) -> (Self, JoinHandle<()>)
-    where
-        VersionString: ToString + Clone + Send + 'static,
-        UserAgentString: ToString + Clone + Send + 'static,
-    {
         let (runner, queue_sender) = Queue::start();
 
         let mut build_version = build_version.to_string();
@@ -1138,13 +1406,12 @@ where
             build_version.insert(0, 'v');
         }
 
-        let gbt = GetBlockTemplateHandler::new_with_pending_blocks(
+        let gbt = GetBlockTemplateHandler::new(
             &network,
             mining_config.clone(),
             block_verifier_router,
             sync_status,
             mined_block_sender,
-            pending_blocks,
         );
 
         let rpc_impl = RpcImpl {
@@ -1180,6 +1447,7 @@ where
     }
 
     /// Returns whether background validation rejected this server work ID.
+    #[cfg(test)]
     pub fn mining_template_rejected(&self, work_id: &str) -> bool {
         self.gbt.template_rejections.borrow().contains(work_id)
     }
@@ -1194,11 +1462,24 @@ where
         self.gbt.template_rejections.borrow().withdrawn(work_id)
     }
 
-    /// Waits for withdrawal, including a rejection that preceded subscription.
-    pub async fn wait_for_mining_template_rejection(&self, work_id: &str) {
+    /// Waits for withdrawal of `work_id`, including a rejection that preceded subscription.
+    ///
+    /// Never resolves without active work, so a caller can select on it unconditionally.
+    pub async fn wait_for_mining_template_withdrawal(&self, work_id: Option<&str>) {
+        let Some(work_id) = work_id else {
+            return std::future::pending().await;
+        };
         let mut rejections = self.gbt.template_rejections.subscribe();
+        let revision = rejections.borrow().revision;
         loop {
-            if rejections.borrow_and_update().withdrawn(work_id) {
+            let withdrawn = {
+                let state = rejections.borrow_and_update();
+                // A parent change can clear a rejection before this waiter observes it.
+                // Keep the revision so clearing the work sets cannot erase that notification.
+                state.withdrawn(work_id)
+                    || (state.revision != revision && !state.is_prepared(work_id))
+            };
+            if withdrawn {
                 return;
             }
             if rejections.changed().await.is_err() {
@@ -1251,40 +1532,57 @@ where
             .map_misc_error()
     }
 
-    /// Selects `parent` for new templates, but only while it is still the best tip.
+    /// Points the rejection state at `tip_hash` and returns it, unless the chain moved on.
     ///
-    /// The tip check and the parent update happen under the rejection-state write lock,
-    /// so a caller that fetched its chain info before a tip change cannot overwrite the
-    /// parent (and clear the rejection records) that a faster caller already selected.
-    fn select_mining_template_parent(&self, parent: block::Hash) -> bool {
-        let mut selected = false;
+    /// Returns `None` when `latest_chain_tip` no longer agrees with the tip a template is being
+    /// built on, so the caller must fetch the chain state again.
+    ///
+    /// The tip is checked while the rejection state is locked, because `set_parent` clears every
+    /// rejection recorded for the parent it replaces. Holding the lock across the check stops two
+    /// concurrent requests interleaving their checks and writes, so a request that already lost
+    /// the tip cannot erase the withdrawals of the parent that replaced it. `rejections` is both
+    /// the snapshot the caller works from and the marker of what it has seen, taken together so a
+    /// rejection published in between cannot be acknowledged unread.
+    fn track_template_parent(
+        &self,
+        tip_hash: block::Hash,
+        rejections: &mut watch::Receiver<types::get_block_template::TemplateRejections>,
+    ) -> Option<types::get_block_template::TemplateRejections> {
+        let mut tip_is_current = true;
         self.gbt.template_rejections.send_if_modified(|state| {
             if self
                 .latest_chain_tip
                 .best_tip_hash()
-                .is_some_and(|tip| tip != parent)
+                .is_some_and(|tip| tip != tip_hash)
             {
+                tip_is_current = false;
                 return false;
             }
-            selected = true;
-            let changed = state.parent != Some(parent);
-            state.set_parent(parent);
+
+            let changed = state.parent != Some(tip_hash);
+            state.set_parent(tip_hash);
             changed
         });
-        selected
+
+        tip_is_current.then(|| rejections.borrow_and_update().clone())
     }
 
-    /// Returns `Ok(None)` when the template was superseded while it was being built:
-    /// the tip moved, a concurrent caller selected a newer parent, or the rejection
-    /// revision changed outside fallback mode. The caller must rebuild from fresh state
-    /// rather than surface a transient error to the miner.
+    /// Returns the template to publish, recovering an empty one when this parent needs a fallback.
+    ///
+    /// Returns `Ok(None)` when the template was superseded while it was being built: the tip
+    /// moved, a concurrent caller selected a newer parent, or the rejection revision changed
+    /// outside fallback mode. The caller must rebuild from fresh state rather than surface a
+    /// transient error to the miner.
     async fn finish_mining_template(
         &self,
-        mut template: BlockTemplateResponse,
+        template: BlockTemplateResponse,
         chain_info: &zakura_state::GetBlockTemplateChainInfo,
         miner_params: &types::get_block_template::MinerParams,
     ) -> Result<Option<GetBlockTemplateResponse>> {
-        let state = self.gbt.template_rejections.borrow().clone();
+        let mut state = self.gbt.template_rejections.borrow().clone();
+
+        // Transaction selection ran after the chain state was fetched, so re-check both the
+        // rejection state's parent and the chain tip itself: neither request retargets the other.
         if state.parent != Some(chain_info.tip_hash)
             || self
                 .latest_chain_tip
@@ -1294,100 +1592,169 @@ where
         {
             return Ok(None);
         }
-        if state.needs_fallback() {
-            if state.saturated {
-                return Err(ErrorObject::owned(
-                    0,
-                    "template rejection limit reached; wait for a new tip",
-                    None::<()>,
-                ));
-            }
-            let mut long_poll_id = template.long_poll_id;
-            let submit_old = if long_poll_id.revision != state.revision {
-                Some(false)
-            } else {
-                template.submit_old
-            };
-            long_poll_id.revision = state.revision;
-            template = self
-                .build_mining_template(
-                    None,
-                    miner_params,
-                    chain_info,
-                    long_poll_id,
-                    vec![],
-                    submit_old,
-                )
-                .await?;
-            let block =
-                proposal_block_from_template(&template, None, &self.network).map_misc_error()?;
-            // One deadline covers validation and the committed-tip check that follows it,
-            // so a slow validation cannot hand the tip read an already-expired budget.
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-            let validation = tokio::time::timeout_at(
-                deadline,
-                self.gbt
-                    .block_verifier_router()
-                    .oneshot(zakura_consensus::Request::Prepare {
-                        block: Arc::new(block),
-                        work_id: Some(template.work_id().clone()),
-                        source: zakura_consensus::PreparedCandidateSource::ServerTemplate,
-                    }),
-            )
-            .await;
-            // A fallback must still belong to the context it was validated against.
-            // Check that and record success under one write lock, so a rejection cannot
-            // land between the two and leave this work marked prepared for a stale parent.
-            let mut current_context = false;
-            self.gbt.template_rejections.send_if_modified(|current| {
-                if current.parent != state.parent
-                    || current.revision != state.revision
-                    || current.contains(template.work_id())
-                    || self
-                        .latest_chain_tip
-                        .best_tip_hash()
-                        .is_some_and(|tip| tip != chain_info.tip_hash)
-                {
-                    return false;
-                }
-                current_context = true;
-                if matches!(validation, Ok(Ok(_))) {
-                    current.mark_prepared(chain_info.tip_hash, template.work_id());
-                }
-                false
-            });
-            if !current_context {
-                return Ok(None);
-            }
-            if !matches!(validation, Ok(Ok(_))) {
-                // State commits precede tip notifications, so a proposal can fail against
-                // a parent that both watches still name. Confirm against committed state
-                // before surfacing a verifier error the caller can do nothing about.
-                let response = tokio::time::timeout_at(
-                    deadline,
-                    call_service(self.read_state.clone(), zakura_state::ReadRequest::Tip),
-                )
-                .await
-                .map_misc_error()??;
-                match response {
-                    zakura_state::ReadResponse::Tip(Some((_, tip)))
-                        if tip != chain_info.tip_hash =>
-                    {
-                        return Ok(None);
-                    }
-                    zakura_state::ReadResponse::Tip(_) => {}
-                    _ => unreachable!("unmatched response to a tip request"),
-                }
-            }
-            validation.map_misc_error()?.map_misc_error()?;
-        } else {
+
+        if !state.needs_fallback() {
             self.prepare_template_in_background(&template);
+            // A rejection can land between the snapshot above and this point, which would leave
+            // this brand-new work withdrawn the moment it reaches the miner. Recover instead.
+            state = self.gbt.template_rejections.borrow().clone();
+            if !state.needs_fallback() {
+                return Ok(Some(template.into()));
+            }
         }
-        Ok(Some(template.into()))
+
+        if state.saturated {
+            return Err(ErrorObject::owned(
+                0,
+                "template rejection limit reached; wait for a new tip",
+                None::<()>,
+            ));
+        }
+
+        self.recover_template(template, chain_info, miner_params, &state)
+            .await
     }
 
+    /// Validates an empty replacement template in the foreground and publishes it.
+    ///
+    /// A recovered template is the only work this parent may still hand out, so it is validated
+    /// before it is returned, and only published if the context it was validated against still
+    /// holds.
+    async fn recover_template(
+        &self,
+        template: BlockTemplateResponse,
+        chain_info: &zakura_state::GetBlockTemplateChainInfo,
+        miner_params: &types::get_block_template::MinerParams,
+        state: &types::get_block_template::TemplateRejections,
+    ) -> Result<Option<GetBlockTemplateResponse>> {
+        let mut long_poll_id = template.long_poll_id;
+        // A miner holding work from an earlier revision must not resubmit it.
+        let submit_old = if long_poll_id.revision != state.revision {
+            Some(false)
+        } else {
+            template.submit_old
+        };
+        long_poll_id.revision = state.revision;
+        let template = self
+            .build_mining_template(
+                None,
+                miner_params,
+                chain_info,
+                long_poll_id,
+                vec![],
+                submit_old,
+            )
+            .await?;
+
+        // One deadline covers validation and the committed-tip check that follows it, so a slow
+        // validation cannot hand the tip read an already-expired budget.
+        let deadline = tokio::time::Instant::now() + TEMPLATE_PREPARATION_TIMEOUT;
+        let preparation = prepare_server_template(
+            self.gbt.block_verifier_router(),
+            &template,
+            self.latest_chain_tip.clone(),
+            &self.network,
+        )
+        .await;
+        if matches!(preparation, Preparation::Stale) {
+            return Ok(None);
+        }
+
+        // A fallback must still belong to the context it was validated against. Check that and
+        // record success under one write lock, so a rejection cannot land between the two and
+        // leave this work marked prepared for a stale parent.
+        let prepared = matches!(preparation, Preparation::Prepared(_));
+        let mut current_context = false;
+        self.gbt.template_rejections.send_if_modified(|current| {
+            if self.recovery_context_changed(current, state, &template, chain_info.tip_hash) {
+                return false;
+            }
+            current_context = true;
+            prepared && current.mark_prepared(chain_info.tip_hash, template.work_id())
+        });
+        if !current_context {
+            return Ok(None);
+        }
+
+        let error = match preparation {
+            Preparation::Prepared(block) => {
+                self.gbt.prepared_candidates().insert(
+                    block,
+                    template.work_id(),
+                    zakura_consensus::PreparedCandidateSource::ServerTemplate,
+                    &self.network,
+                );
+                return Ok(Some(template.into()));
+            }
+            Preparation::Rejected => {
+                "empty template recovery was rejected; wait for a new tip".to_string()
+            }
+            Preparation::TimedOut => "empty template recovery timed out; retry".to_string(),
+            Preparation::Failed(error) => error.to_string(),
+            Preparation::Stale => unreachable!("a stale recovery returns before this point"),
+        };
+
+        // State commits precede tip notifications, so a proposal can fail against a parent that
+        // both watches still name. Confirm against committed state before surfacing an error the
+        // miner can do nothing about. A failed or late tip read reports the validation error.
+        let committed_tip = tokio::time::timeout_at(
+            deadline,
+            call_service(self.read_state.clone(), zakura_state::ReadRequest::Tip),
+        )
+        .await;
+        match committed_tip {
+            Ok(Ok(zakura_state::ReadResponse::Tip(Some((_, tip)))))
+                if tip != chain_info.tip_hash =>
+            {
+                Ok(None)
+            }
+            Ok(Ok(zakura_state::ReadResponse::Tip(_))) | Ok(Err(_)) | Err(_) => {
+                Err(ErrorObject::owned(0, error, None::<()>))
+            }
+            Ok(Ok(_)) => unreachable!("unmatched response to a tip request"),
+        }
+    }
+
+    /// Whether anything a recovered template was validated against has moved on since.
+    fn recovery_context_changed(
+        &self,
+        current: &types::get_block_template::TemplateRejections,
+        state: &types::get_block_template::TemplateRejections,
+        template: &BlockTemplateResponse,
+        tip_hash: block::Hash,
+    ) -> bool {
+        // Another rejection landed on this parent, or withdrew this very work.
+        current.parent != state.parent
+            || current.revision != state.revision
+            || current.contains(template.work_id())
+            // The chain moved off the parent this template was built on.
+            || self
+                .latest_chain_tip
+                .best_tip_hash()
+                .is_some_and(|tip| tip != tip_hash)
+    }
+
+    /// Validates queued server templates in the background, newest first.
+    ///
+    /// # Compute bound
+    ///
+    /// Speculative preparation is work nobody asked for, so it must never be able to accumulate.
+    /// Two properties bound it, and both are load-bearing:
+    ///
+    /// - `TemplatePreparationQueue` admits one loop and holds one pending template. The loop's
+    ///   `PreparationWorker` releases that slot however the loop ends.
+    /// - [`prepare_one_server_template`] waits for each preparation's *computation* to finish,
+    ///   not merely for an answer the node can still use. A deadline or a tip change does not
+    ///   stop the verification that was dispatched, so taking the next template then would leave
+    ///   two verifications in flight. Repeating that is how a stream of tip changes turns
+    ///   speculation into unbounded work.
+    ///
+    /// Together they hold speculative preparation to one verification in flight at any moment.
+    /// A preparation that never returns therefore stops speculation entirely, which is the safe
+    /// direction: ordinary submission and foreground recovery do not go through here.
     fn prepare_template_in_background(&self, template: &BlockTemplateResponse) {
-        let Some(template) = self.gbt.queue_template_preparation(template.clone()) else {
+        let Some((template, mut worker)) = self.gbt.queue_template_preparation(template.clone())
+        else {
             metrics::counter!("mining.template_preparation.coalesced").increment(1);
             return;
         };
@@ -1399,87 +1766,22 @@ where
             async move {
                 let mut template = template;
                 loop {
-                    // Once a parent needs recovery, only foreground-validated fallback work
-                    // may be published. Discard its queued speculative preparations.
-                    if gbt.template_rejections.borrow().needs_fallback() {
-                        let Some(next) = gbt.next_template_preparation() else {
-                            break;
-                        };
-                        template = next;
-                        continue;
-                    }
-                    if let Ok(block) = proposal_block_from_template(&template, None, &network) {
-                        let parent = block.header.previous_block_hash;
-                        let request = zakura_consensus::Request::Prepare {
-                            block: Arc::new(block),
-                            work_id: Some(template.work_id().clone()),
-                            source: zakura_consensus::PreparedCandidateSource::ServerTemplate,
-                        };
-                        let mut tip = latest_chain_tip.clone();
-                        let stale = async {
-                            loop {
-                                tip.mark_best_tip_seen();
-                                if tip.best_tip_hash() != Some(parent) {
-                                    break;
-                                }
-                                if tip.best_tip_changed().await.is_err() {
-                                    break;
-                                }
-                            }
-                        };
-                        let result = tokio::select! {
-                            biased;
-                            _ = stale => {
-                                metrics::counter!("mining.template_preparation.cancelled").increment(1);
-                                None
-                            }
-                            result = tokio::time::timeout(Duration::from_secs(30), verifier.clone().oneshot(request)) => {
-                                match result {
-                                    Ok(result) => Some(result),
-                                    Err(_) => {
-                                        metrics::counter!("mining.template_preparation.timed_out").increment(1);
-                                        None
-                                    }
-                                }
-                            }
-                        };
-                        if let Some(Ok(_)) = &result {
-                            gbt.template_rejections.send_if_modified(|state| {
-                                state.mark_prepared(parent, template.work_id());
-                                false
-                            });
-                        }
-                        if let Some(Err(error)) = result {
-                            let rejects_template = error
-                                .downcast_ref::<zakura_consensus::VerifyBlockError>()
-                                .or_else(|| match error.downcast_ref::<zakura_consensus::RouterError>() {
-                                    Some(zakura_consensus::RouterError::Block { source }) => Some(source.as_ref()),
-                                    _ => None,
-                                })
-                                .is_some_and(zakura_consensus::VerifyBlockError::rejects_template);
-                            if rejects_template {
-                                gbt.template_rejections.send_if_modified(|state| {
-                                    state.reject(parent, template.work_id())
-                                });
-                                metrics::counter!("mining.template_preparation.rejected")
-                                    .increment(1);
-                            }
-                            tracing::debug!(
-                                ?error,
-                                work_id = %template.work_id(),
-                                ?parent,
-                                rejects_template,
-                                "background mining candidate preparation failed"
-                            );
-                        }
-                    } else {
-                        gbt.template_rejections.send_if_modified(|state| {
-                            state.reject(template.previous_block_hash, template.work_id())
-                        });
-                        tracing::warn!(work_id = %template.work_id(), "server mining template cannot form a proposal");
+                    // Recheck everything that may have changed while the previous template was
+                    // being prepared, before spending anything on this one.
+                    if zakura_chain::shutdown::is_shutting_down() {
+                        break;
                     }
 
-                    let Some(next) = gbt.next_template_preparation() else {
+                    prepare_one_server_template(
+                        &gbt,
+                        verifier.clone(),
+                        &template,
+                        &latest_chain_tip,
+                        &network,
+                    )
+                    .await;
+
+                    let Some(next) = worker.next() else {
                         break;
                     };
                     template = next;
@@ -1487,6 +1789,196 @@ where
             }
             .in_current_span(),
         );
+    }
+
+    async fn run_mined_block_lifecycle(
+        &self,
+        block: Arc<Block>,
+        submitted_at: std::time::Instant,
+        submission: MinedBlockSubmission,
+    ) -> Result<SubmitBlockResponse> {
+        let mut block_verifier_router = self.gbt.block_verifier_router();
+        let height = block
+            .coinbase_height()
+            .ok_or_error(0, "coinbase height not found")?;
+        let block_hash = block.hash();
+        let submission_guard = match self.gbt.reserve_mined_submission(block_hash) {
+            Ok(submission) => submission,
+            Err(response) => return Ok(response.into()),
+        };
+        let admission = zakura_state::BlockAdmission::pending();
+        let request = zakura_consensus::Request::CommitMined {
+            block: block.clone(),
+            admission: admission.clone(),
+        };
+        let pending_blocks = self.gbt.pending_blocks();
+        let mined_block_sender = self.gbt.mined_block_sender();
+        let optimistic_block_inventory = self.gbt.optimistic_block_inventory();
+
+        // This task owns the commit and registry lifecycle. RPC cancellation only detaches it.
+        let lifecycle = tokio::spawn(async move {
+            let _submission_guard = submission_guard;
+            let verification =
+                async move { block_verifier_router.ready().await?.call(request).await };
+            tokio::pin!(verification);
+
+            let admission_start = std::time::Instant::now();
+            let mut pending_registration = None;
+            let mut early_sent = false;
+            let verification_result = tokio::select! {
+                biased;
+
+                // Observe a completed commit before advertising its pending body.
+                result = &mut verification => result,
+                admitted = admission.wait() => {
+                    metrics::histogram!("mining.state_admission.duration_seconds")
+                        .record(admission_start.elapsed().as_secs_f64());
+                    if admitted
+                        && admission.optimistic_relay_authorized()
+                        && optimistic_block_inventory
+                    {
+                        if let Some(registration) = pending_blocks.insert(block.clone()) {
+                            let event = MinedBlockEvent::Early {
+                                hash: block_hash,
+                                height,
+                                submitted_at,
+                                submission,
+                                pending: registration.signal(),
+                            };
+                            if mined_block_sender.send(event).is_ok() {
+                                early_sent = true;
+                                pending_registration = Some(registration);
+                            }
+                        }
+                    }
+                    verification.await
+                },
+            };
+
+            if let Some(registration) = pending_registration {
+                registration.resolve(
+                    verification_result
+                        .as_ref()
+                        .map(|_| block.clone())
+                        .map_err(|_| ()),
+                );
+            }
+
+            if verification_result.is_ok() {
+                if mined_block_sender
+                    .send(MinedBlockEvent::Committed {
+                        hash: block_hash,
+                        height,
+                    })
+                    .is_err()
+                {
+                    metrics::counter!("mining.optimistic_inventory.final_send_failures")
+                        .increment(1);
+                    tracing::warn!(
+                        ?block_hash,
+                        ?height,
+                        "could not send the final mined-block event"
+                    );
+                }
+            } else if early_sent {
+                metrics::counter!("mining.optimistic_inventory.post_admission_failures")
+                    .increment(1);
+                tracing::warn!(
+                    ?block_hash,
+                    ?height,
+                    "mined block failed contextual commit after state admission"
+                );
+            }
+            verification_result
+        });
+
+        let block_verifier_router_response = lifecycle.await.map_err(|error| {
+            ErrorObject::owned(
+                ErrorCode::InternalError.code(),
+                format!("mined block lifecycle task failed: {error}"),
+                None::<()>,
+            )
+        })?;
+
+        let chain_error = match block_verifier_router_response {
+            // Currently, this match arm returns `null` (Accepted) for blocks committed
+            // to any chain, but Accepted is only for blocks in the best chain.
+            //
+            // TODO (#5487):
+            // - Inconclusive: check if the block is on a side-chain
+            // The difference is important to miners, because they want to mine on the best chain.
+            Ok(hash) => {
+                tracing::info!(
+                    ?hash,
+                    ?height,
+                    method = submission.rpc_method(),
+                    "mined block accepted"
+                );
+                return Ok(SubmitBlockResponse::Accepted);
+            }
+
+            // Turns BoxError into Result<VerifyChainError, BoxError>,
+            // by downcasting from Any to VerifyChainError.
+            Err(box_error) => {
+                let error = box_error
+                    .downcast::<RouterError>()
+                    .map(|boxed_chain_error| *boxed_chain_error);
+
+                tracing::info!(
+                    ?error,
+                    ?block_hash,
+                    ?height,
+                    method = submission.rpc_method(),
+                    "mined block failed verification"
+                );
+
+                error
+            }
+        };
+
+        let response = match chain_error {
+            Ok(source) if source.is_duplicate_request() => SubmitBlockErrorResponse::Duplicate,
+            Ok(RouterError::Block { source })
+                if matches!(
+                    source.as_ref(),
+                    zakura_consensus::VerifyBlockError::Commit(
+                        zakura_state::CommitBlockError::MissingMinedParent
+                            | zakura_state::CommitBlockError::QueueFull
+                    )
+                ) =>
+            {
+                SubmitBlockErrorResponse::Inconclusive
+            }
+
+            // Currently, these match arms return Reject for the older duplicate in a queue,
+            // but queued duplicates should be DuplicateInconclusive.
+            //
+            // Optional TODO (#5487):
+            // - DuplicateInconclusive: turn these non-finalized state duplicate block errors
+            //   into BlockError enum variants, and handle them as DuplicateInconclusive:
+            //   - "block already sent to be committed to the state"
+            //   - "replaced by newer request"
+            // - keep the older request in the queue,
+            //   and return a duplicate error for the newer request immediately.
+            //   This improves the speed of the RPC response.
+            //
+            // Checking the download queues and BlockVerifierRouter buffer for duplicates
+            // might require architectural changes to Zebra, so we should only do it
+            // if mining pools really need it.
+            Ok(_verify_chain_error) => SubmitBlockErrorResponse::Rejected,
+
+            // This match arm is currently unreachable, but if future changes add extra error types,
+            // we want to turn them into `Rejected`.
+            Err(_unknown_error_type) => SubmitBlockErrorResponse::Rejected,
+        };
+
+        Ok(response.into())
+    }
+
+    /// Shares one pending-block registry with peer serving.
+    pub fn with_pending_blocks(mut self, pending_blocks: PendingBlockRegistry) -> Self {
+        self.gbt.set_pending_blocks(pending_blocks);
+        self
     }
 
     /// Sets the end-of-support height reported by `getdeprecationinfo`.
@@ -2858,7 +3350,7 @@ where
     fn stop(&self) -> Result<String> {
         #[cfg(not(target_os = "windows"))]
         if self.network.is_regtest() {
-            match nix::sys::signal::raise(nix::sys::signal::SIGINT) {
+            match unix::raise_interrupt() {
                 Ok(_) => Ok("Zakura server stopping".to_string()),
                 Err(error) => Err(ErrorObject::owned(
                     ErrorCode::InternalError.code(),
@@ -2927,16 +3419,16 @@ where
             .as_ref()
             .and_then(GetBlockTemplateParameters::block_proposal_data)
         {
-            let work_id = parameters
-                .as_ref()
-                .and_then(|parameters| parameters.work_id.clone());
             return validate_block_proposal(
                 self.gbt.block_verifier_router(),
                 block_proposal_bytes,
                 &self.network,
                 latest_chain_tip,
                 sync_status,
-                work_id,
+                parameters
+                    .as_ref()
+                    .and_then(|params| params.work_id.as_deref())
+                    .map(|work_id| (self.gbt.prepared_candidates(), work_id)),
             )
             .await;
         }
@@ -3003,10 +3495,13 @@ where
                     cur_time,
                     ..
                 } = fetch_chain_info(read_state.clone()).await?;
-                if !self.select_mining_template_parent(tip_hash) {
+                // Tracking this iteration's parent marks the rejection state it snapshots as seen:
+                // this iteration's own parent update is not a reason to wake long polling again.
+                let Some(rejection_state) =
+                    self.track_template_parent(tip_hash, &mut template_rejections)
+                else {
                     continue;
-                }
-                let rejection_state = template_rejections.borrow_and_update().clone();
+                };
 
                 // Fetch the mempool data for the block template:
                 // - if the mempool transactions change, we might return from long polling.
@@ -3187,9 +3682,11 @@ where
                     precomputed_coinbase = wait_for_new_tip => {
                         let precomputed_coinbase = precomputed_coinbase?;
                         let chain_info = fetch_chain_info(read_state.clone()).await?;
-                        if !self.select_mining_template_parent(chain_info.tip_hash) {
+                        let Some(rejection_state) =
+                            self.track_template_parent(chain_info.tip_hash, &mut template_rejections)
+                        else {
                             continue;
-                        }
+                        };
                         let mut server_long_poll_id = LongPollInput::new(
                             chain_info.tip_height,
                             chain_info.tip_hash,
@@ -3197,7 +3694,7 @@ where
                             vec![]
                         )
                         .generate_id();
-                        server_long_poll_id.revision = self.gbt.template_rejections.borrow().revision;
+                        server_long_poll_id.revision = rejection_state.revision;
 
                         let submit_old = client_long_poll_id
                             .as_ref()
@@ -3318,13 +3815,13 @@ where
     async fn submit_block(
         &self,
         HexData(block_bytes): HexData,
-        parameters: Option<SubmitBlockParameters>,
+        // The work ID is accepted for BIP 22 compatibility and identifies nothing: the verifier
+        // looks a prepared candidate up by its content.
+        _parameters: Option<SubmitBlockParameters>,
     ) -> Result<SubmitBlockResponse> {
-        let mut block_verifier_router = self.gbt.block_verifier_router();
         let submitted_at = std::time::Instant::now();
-
         let block: Block = match block_bytes.zcash_deserialize_into() {
-            Ok(block_bytes) => block_bytes,
+            Ok(block) => block,
             Err(error) => {
                 tracing::info!(
                     ?error,
@@ -3334,176 +3831,54 @@ where
                 return Ok(SubmitBlockErrorResponse::Rejected.into());
             }
         };
+        self.run_mined_block_lifecycle(
+            Arc::new(block),
+            submitted_at,
+            MinedBlockSubmission::FullBlock,
+        )
+        .await
+    }
 
-        let height = block
-            .coinbase_height()
-            .ok_or_error(0, "coinbase height not found")?;
-        let block_hash = block.hash();
-        let submission = match self.gbt.reserve_mined_submission(block_hash) {
-            Ok(submission) => submission,
-            Err(response) => return Ok(response.into()),
-        };
-        let block = Arc::new(block);
-        let work_id = parameters.and_then(|parameters| parameters.work_id);
-        let admission = zakura_state::BlockAdmission::pending();
-        let request = zakura_consensus::Request::CommitMined {
-            block: block.clone(),
-            work_id,
-            admission: admission.clone(),
-        };
-        let pending_blocks = self.gbt.pending_blocks();
-        let mined_block_sender = self.gbt.mined_block_sender();
-        let optimistic_block_inventory = self.gbt.optimistic_block_inventory();
-
-        // This task owns the commit and registry lifecycle. RPC cancellation only detaches it.
-        let lifecycle = tokio::spawn(async move {
-            let _submission = submission;
-            let verification =
-                async move { block_verifier_router.ready().await?.call(request).await };
-            tokio::pin!(verification);
-
-            let admission_start = std::time::Instant::now();
-            let mut pending_registration = None;
-            let mut early_sent = false;
-            let verification_result = tokio::select! {
-                biased;
-
-                admitted = admission.wait() => {
-                    metrics::histogram!("mining.state_admission.duration_seconds")
-                        .record(admission_start.elapsed().as_secs_f64());
-                    if admitted
-                        && admission.optimistic_relay_authorized()
-                        && optimistic_block_inventory
-                    {
-                        if let Some(registration) = pending_blocks.insert(block.clone()) {
-                            let event = MinedBlockEvent::Early {
-                                hash: block_hash,
-                                height,
-                                submitted_at,
-                                pending: registration.signal(),
-                            };
-                            if mined_block_sender.send(event).is_ok() {
-                                early_sent = true;
-                                pending_registration = Some(registration);
-                            }
-                        }
-                    }
-                    verification.await
-                },
-                result = &mut verification => result,
-            };
-
-            if let Some(registration) = pending_registration {
-                registration.resolve(
-                    verification_result
-                        .as_ref()
-                        .map(|_| block.clone())
-                        .map_err(|_| ()),
-                );
-            }
-
-            if verification_result.is_ok() {
-                if mined_block_sender
-                    .send(MinedBlockEvent::Committed {
-                        hash: block_hash,
-                        height,
-                    })
-                    .is_err()
-                {
-                    metrics::counter!("mining.optimistic_inventory.final_send_failures")
-                        .increment(1);
-                    tracing::warn!(
-                        ?block_hash,
-                        ?height,
-                        "could not send the final mined-block event"
-                    );
-                }
-            } else if early_sent {
-                metrics::counter!("mining.optimistic_inventory.post_admission_failures")
-                    .increment(1);
-                tracing::warn!(
-                    ?block_hash,
-                    ?height,
-                    "mined block failed contextual commit after state admission"
-                );
-            }
-            verification_result
-        });
-
-        let block_verifier_router_response = lifecycle.await.map_err(|error| {
-            ErrorObject::owned(
-                ErrorCode::InternalError.code(),
-                format!("mined block lifecycle task failed: {error}"),
-                None::<()>,
-            )
-        })?;
-
-        let chain_error = match block_verifier_router_response {
-            // Currently, this match arm returns `null` (Accepted) for blocks committed
-            // to any chain, but Accepted is only for blocks in the best chain.
-            //
-            // TODO (#5487):
-            // - Inconclusive: check if the block is on a side-chain
-            // The difference is important to miners, because they want to mine on the best chain.
-            Ok(hash) => {
-                tracing::info!(?hash, ?height, "submit block accepted");
-                return Ok(SubmitBlockResponse::Accepted);
-            }
-
-            // Turns BoxError into Result<VerifyChainError, BoxError>,
-            // by downcasting from Any to VerifyChainError.
-            Err(box_error) => {
-                let error = box_error
-                    .downcast::<RouterError>()
-                    .map(|boxed_chain_error| *boxed_chain_error);
-
-                tracing::info!(
-                    ?error,
-                    ?block_hash,
-                    ?height,
-                    "submit block failed verification"
-                );
-
-                error
+    async fn submit_solution(
+        &self,
+        SubmitSolutionParameters { work_id, header }: SubmitSolutionParameters,
+    ) -> Result<SubmitSolutionResponse> {
+        let submitted_at = std::time::Instant::now();
+        let HexData(header_bytes) = header;
+        let mut remaining_header_bytes = header_bytes.as_slice();
+        let header: Header = match Header::zcash_deserialize(&mut remaining_header_bytes) {
+            Ok(header) => header,
+            Err(error) => {
+                tracing::info!(?error, "submit solution rejected a malformed block header");
+                return Ok(SubmitSolutionErrorResponse::Rejected.into());
             }
         };
+        if !remaining_header_bytes.is_empty() {
+            tracing::info!("submit solution rejected trailing block header bytes");
+            return Ok(SubmitSolutionErrorResponse::Rejected.into());
+        }
 
-        let response = match chain_error {
-            Ok(source) if source.is_duplicate_request() => SubmitBlockErrorResponse::Duplicate,
-            Ok(RouterError::Block { source })
-                if matches!(
-                    source.as_ref(),
-                    zakura_consensus::VerifyBlockError::Commit(
-                        zakura_state::CommitBlockError::MissingMinedParent
-                            | zakura_state::CommitBlockError::QueueFull
-                    )
-                ) =>
-            {
-                SubmitBlockErrorResponse::Inconclusive
+        let reconstruction_start = std::time::Instant::now();
+        let block = match self.gbt.prepared_candidates().resolve(&work_id, header) {
+            Ok(block) => block,
+            Err(ResolvePreparedCandidateError::StaleWork) => {
+                metrics::counter!("mining.compact_submission.stale_work").increment(1);
+                return Ok(SubmitSolutionErrorResponse::StaleWork.into());
             }
-
-            // Currently, these match arms return Reject for the older duplicate in a queue,
-            // but queued duplicates should be DuplicateInconclusive.
-            //
-            // Optional TODO (#5487):
-            // - DuplicateInconclusive: turn these non-finalized state duplicate block errors
-            //   into BlockError enum variants, and handle them as DuplicateInconclusive:
-            //   - "block already sent to be committed to the state"
-            //   - "replaced by newer request"
-            // - keep the older request in the queue,
-            //   and return a duplicate error for the newer request immediately.
-            //   This improves the speed of the RPC response.
-            //
-            // Checking the download queues and BlockVerifierRouter buffer for duplicates
-            // might require architectural changes to Zebra, so we should only do it
-            // if mining pools really need it.
-            Ok(_verify_chain_error) => SubmitBlockErrorResponse::Rejected,
-
-            // This match arm is currently unreachable, but if future changes add extra error types,
-            // we want to turn them into `Rejected`.
-            Err(_unknown_error_type) => SubmitBlockErrorResponse::Rejected,
+            Err(ResolvePreparedCandidateError::CandidateMismatch) => {
+                metrics::counter!("mining.compact_submission.candidate_mismatches").increment(1);
+                return Ok(SubmitSolutionErrorResponse::CandidateMismatch.into());
+            }
         };
+        metrics::histogram!("mining.compact_submission.reconstruction.duration_seconds")
+            .record(reconstruction_start.elapsed().as_secs_f64());
 
+        let response = self
+            .run_mined_block_lifecycle(block, submitted_at, MinedBlockSubmission::CompactHeader)
+            .await?;
+        if response == SubmitBlockResponse::Accepted {
+            metrics::counter!("mining.compact_submission.accepted").increment(1);
+        }
         Ok(response.into())
     }
 
@@ -3671,6 +4046,13 @@ where
         let network = self.network.clone();
 
         z_validate_address(network, raw_address)
+    }
+
+    async fn get_standard_fee(&self) -> Result<GetStandardFeeResponse> {
+        Ok(GetStandardFeeResponse {
+            standard_fee: transaction::zip317::MARGINAL_FEE,
+            version: 0,
+        })
     }
 
     async fn get_block_subsidy(&self, height: Option<u32>) -> Result<GetBlockSubsidyResponse> {
@@ -3855,6 +4237,30 @@ where
         })
     }
 
+    async fn precious_block(&self, block_hash: String) -> Result<()> {
+        let block_hash = block_hash
+            .parse()
+            .map_error(server::error::LegacyCode::InvalidParameter)?;
+
+        match self
+            .state
+            .clone()
+            .oneshot(zakura_state::Request::PreciousBlock(block_hash))
+            .await
+        {
+            Ok(zakura_state::Response::Precious) => Ok(()),
+            Ok(_) => unreachable!("unmatched response to a precious block request"),
+            Err(error) => match error.downcast_ref::<zakura_state::PreciousError>() {
+                Some(zakura_state::PreciousError::BlockNotFound(_)) => Err(ErrorObject::owned(
+                    server::error::LegacyCode::InvalidAddressOrKey.into(),
+                    "Block not found",
+                    None::<()>,
+                )),
+                _ => Err(error).map_misc_error(),
+            },
+        }
+    }
+
     async fn generate(&self, num_blocks: u32) -> Result<Vec<Hash>> {
         let mut rpc = self.clone();
         let network = self.network.clone();
@@ -3944,25 +4350,8 @@ where
         }
     }
 
-    fn openrpc(&self) -> openrpsee::openrpc::Response {
-        let mut generator = openrpsee::openrpc::Generator::new();
-
-        let methods = METHODS
-            .into_iter()
-            .filter(|(name, _)| self.rpc_surface.exposes(name))
-            .map(|(name, method)| method.generate(&mut generator, name))
-            .collect();
-
-        Ok(openrpsee::openrpc::OpenRpc {
-            openrpc: "1.3.2",
-            info: openrpsee::openrpc::Info {
-                title: env!("CARGO_PKG_NAME"),
-                description: env!("CARGO_PKG_DESCRIPTION"),
-                version: env!("CARGO_PKG_VERSION"),
-            },
-            methods,
-            components: generator.into_components(),
-        })
+    fn openrpc(&self) -> Result<serde_json::Value> {
+        Ok(openrpc::render(self.rpc_surface))
     }
     async fn get_tx_out(
         &self,
@@ -4094,52 +4483,72 @@ where
 ///
 /// See the notes for the [`Rpc::get_info` method].
 #[allow(clippy::too_many_arguments)]
-#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, Getters, new)]
+#[derive(
+    Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, Getters, CopyGetters, new,
+)]
 pub struct GetInfoResponse {
     /// The node version
-    #[getter(rename = "raw_version")]
     version: u64,
 
     /// The node version build number
+    #[getset(get = "pub")]
     build: String,
 
     /// The server sub-version identifier, used as the network protocol user-agent
+    #[getset(get = "pub")]
     subversion: String,
 
     /// The protocol version
     #[serde(rename = "protocolversion")]
+    #[getset(get_copy = "pub")]
     protocol_version: u32,
 
     /// The current number of blocks processed in the server
+    #[getset(get_copy = "pub")]
     blocks: u32,
 
     /// The total (inbound and outbound) number of connections the node has
+    #[getset(get_copy = "pub")]
     connections: usize,
 
     /// The proxy (if any) used by the server. Currently always `None` in Zebra.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[getset(get = "pub")]
     proxy: Option<String>,
 
     /// The current network difficulty
+    #[getset(get_copy = "pub")]
     difficulty: f64,
 
     /// True if the server is running in testnet mode, false otherwise
+    #[getset(get_copy = "pub")]
     testnet: bool,
 
     /// The minimum transaction fee in ZEC/kB
     #[serde(rename = "paytxfee")]
+    #[getset(get_copy = "pub")]
     pay_tx_fee: f64,
 
     /// The minimum relay fee for non-free transactions in ZEC/kB
     #[serde(rename = "relayfee")]
+    #[getset(get_copy = "pub")]
     relay_fee: f64,
 
     /// The last error or warning message, or "no errors" if there are no errors
+    #[getset(get = "pub")]
     errors: String,
 
     /// The time of the last error or warning message, or "no errors timestamp" if there are no errors
     #[serde(rename = "errorstimestamp")]
+    #[getset(get_copy = "pub")]
     errors_timestamp: i64,
+}
+
+impl GetInfoResponse {
+    /// The node version.
+    pub fn raw_version(&self) -> u64 {
+        self.version
+    }
 }
 
 impl Default for GetInfoResponse {
@@ -4265,23 +4674,24 @@ fn target_seconds_between_heights(network: &Network, from: Height, to: Height) -
 pub struct GetDeprecationInfoResponse {
     /// End-of-service information, only present on Mainnet.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[getset(get = "pub")]
     end_of_service: Option<EndOfService>,
 }
 
 /// The `end_of_service` object in a [`GetDeprecationInfoResponse`].
-#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, Getters, new)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, CopyGetters, new)]
 pub struct EndOfService {
     /// The estimated last height this server version supports.
     ///
     /// The node halts when the chain tip goes past this height.
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     block_height: u32,
 
     /// Approximate halt time in seconds since the Unix epoch.
     ///
     /// This is reported 24 hours earlier than the spacing-based estimate, so
     /// consumers are warned early when block times vary.
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     estimated_time: i64,
 }
 
@@ -4339,33 +4749,38 @@ where
 /// Response to a `getblockchaininfo` RPC request.
 ///
 /// See the notes for the [`Rpc::get_blockchain_info` method].
-#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, Getters)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, Getters, CopyGetters)]
 pub struct GetBlockchainInfoResponse {
     /// Current network name as defined in BIP70 (main, test, regtest)
+    #[getset(get = "pub")]
     chain: String,
 
     /// The current number of blocks processed in the server, numeric
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     blocks: Height,
 
     /// The current number of headers we have validated in the best chain, that is,
     /// the height of the best chain.
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     headers: Height,
 
     /// The estimated network solution rate in Sol/s.
+    #[getset(get_copy = "pub")]
     difficulty: f64,
 
     /// The verification progress relative to the estimated network chain tip.
     #[serde(rename = "verificationprogress")]
+    #[getset(get_copy = "pub")]
     verification_progress: f64,
 
     /// The total amount of work in the best chain, hex-encoded.
     #[serde(rename = "chainwork")]
+    #[getset(get_copy = "pub")]
     chain_work: u64,
 
     /// Whether this node's blocks are subject to pruning, that is, whether it
     /// runs in pruned storage mode or has already pruned historical data.
+    #[getset(get_copy = "pub")]
     pruned: bool,
 
     /// The lowest height whose block body this node still stores, omitted when
@@ -4380,34 +4795,38 @@ pub struct GetBlockchainInfoResponse {
         rename = "pruneheight",
         skip_serializing_if = "Option::is_none"
     )]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     prune_height: Option<Height>,
 
     /// The estimated size of the block and undo files on disk
+    #[getset(get_copy = "pub")]
     size_on_disk: u64,
 
     /// The current number of note commitments in the commitment tree
+    #[getset(get_copy = "pub")]
     commitments: u64,
 
     /// The hash of the currently best block, in big-endian order, hex-encoded
     #[serde(rename = "bestblockhash", with = "hex")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     best_block_hash: block::Hash,
 
     /// If syncing, the estimated height of the chain, else the current best height, numeric.
     ///
     /// In Zebra, this is always the height estimate, so it might be a little inaccurate.
     #[serde(rename = "estimatedheight")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     estimated_height: Height,
 
     /// Chain supply balance
     #[serde(rename = "chainSupply")]
+    #[getset(get = "pub")]
     chain_supply: GetBlockchainInfoBalance,
 
     /// Value pool balances
     #[serde(rename = "valuePools")]
     #[serde(deserialize_with = "deserialize_blockchain_value_pool_balances")]
+    #[getset(get = "pub")]
     value_pools: BlockchainValuePoolBalances,
 
     /// The ZIP 234 NSM value balance, in zatoshis.
@@ -4433,87 +4852,102 @@ pub struct GetBlockchainInfoResponse {
         default,
         skip_serializing_if = "Option::is_none"
     )]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     nsm_value_balance_zat: Option<Amount<NegativeAllowed>>,
 
     /// Status of network upgrades
+    #[getset(get = "pub")]
     upgrades: IndexMap<ConsensusBranchIdHex, NetworkUpgradeInfo>,
 
     /// Branch IDs of the current and upcoming consensus rules
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     consensus: TipConsensusBranch,
 
     /// Zakura's authoritative header-chain state after semantic handoff.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[getset(get = "pub")]
     header_chain: Option<HeaderChainInfo>,
 }
 
 /// One hash-qualified frontier in the authoritative header-chain state.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, Getters)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, CopyGetters)]
 pub struct HeaderChainFrontierInfo {
     /// Exact frontier height.
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     height: Height,
     /// Exact frontier hash.
     #[serde(with = "hex")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     hash: block::Hash,
 }
 
 /// Persistent selected-tip body-unavailability alarm details.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, Getters)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, CopyGetters)]
 pub struct HeaderChainBodyUnavailableInfo {
     /// Exact selected header whose body is unavailable.
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     height: Height,
     /// Exact selected header hash.
     #[serde(with = "hex")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     hash: block::Hash,
     /// Current retry episode age in seconds.
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     age_seconds: u64,
     /// Failed deliveries in the current episode.
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     attempts: u32,
     /// Currently known eligible body suppliers.
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     suppliers: u32,
 }
 
 /// Persistent alarms from the authoritative header-chain state.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, Getters)]
+#[derive(
+    Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, Getters, CopyGetters,
+)]
 pub struct HeaderChainAlarmInfo {
     /// Protected paths prevented resource-bound enforcement.
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     resource_stalled: bool,
     /// The selected header exhausted its current body-supplier retry episode.
+    #[getset(get = "pub")]
     header_best_body_unavailable: Option<HeaderChainBodyUnavailableInfo>,
     /// Deterministic body validation refuted an imported headers-only trust pin.
+    #[getset(get = "pub")]
     migrated_pin_refuted: Option<HeaderChainFrontierInfo>,
 }
 
 /// User-facing view of the sole committed header-chain publisher.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, Getters)]
+#[derive(
+    Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, Getters, CopyGetters,
+)]
 pub struct HeaderChainInfo {
     /// `integrated` or `headers-only`.
+    #[getset(get = "pub")]
     mode: String,
     /// Monotonic durable state version.
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     state_version: u64,
     /// Meaning and validity boundary of `header_best`.
+    #[getset(get = "pub")]
     header_best_semantics: String,
     /// Best locally header-valid frontier.
     /// The header frontier does not claim body validity.
+    #[getset(get = "pub")]
     header_best: HeaderChainFrontierInfo,
     /// Best fully body-verified frontier on the selected path.
+    #[getset(get = "pub")]
     verified_best: HeaderChainFrontierInfo,
     /// Irreversible local finality frontier.
+    #[getset(get = "pub")]
     finalized: HeaderChainFrontierInfo,
     /// Headers-only mode's irreversible local trust warning.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[getset(get = "pub")]
     finality_warning: Option<String>,
     /// Persistent engine alarms.
+    #[getset(get = "pub")]
     alarms: HeaderChainAlarmInfo,
 }
 
@@ -4742,27 +5176,40 @@ impl GetAddressBalanceRequest {
     Hash,
     serde::Serialize,
     serde::Deserialize,
-    Getters,
+    CopyGetters,
     new,
 )]
 pub struct GetAddressBalanceResponse {
     /// The total transparent balance.
+    #[getset(get_copy = "pub")]
     balance: u64,
     /// The total received balance, including change.
+    #[getset(get_copy = "pub")]
     pub received: u64,
 }
 
 /// Parameters of [`RpcServer::get_address_utxos`] RPC method.
 #[derive(
-    Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize, Getters, new, JsonSchema,
+    Clone,
+    Debug,
+    Eq,
+    PartialEq,
+    serde::Deserialize,
+    serde::Serialize,
+    Getters,
+    CopyGetters,
+    new,
+    JsonSchema,
 )]
 #[serde(from = "DGetAddressUtxosRequest")]
 pub struct GetAddressUtxosRequest {
     /// A list of addresses to get transactions from.
+    #[getset(get = "pub")]
     addresses: Vec<String>,
     /// The height to start looking for transactions.
     #[serde(default)]
     #[serde(rename = "chainInfo")]
+    #[getset(get_copy = "pub")]
     chain_info: bool,
 }
 
@@ -4975,43 +5422,46 @@ impl Default for GetBlockResponse {
 
 /// A Block object returned by the `getblock` RPC request.
 #[allow(clippy::too_many_arguments)]
-#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, Getters, new)]
+#[derive(
+    Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, Getters, CopyGetters, new,
+)]
 pub struct BlockObject {
     /// The hash of the requested block.
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     #[serde(with = "hex")]
     hash: block::Hash,
 
     /// The number of confirmations of this block in the best chain,
     /// or -1 if it is not in the best chain.
+    #[getset(get_copy = "pub")]
     confirmations: i64,
 
     /// The block size. TODO: fill it
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     size: Option<i64>,
 
     /// The height of the requested block.
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     height: Option<Height>,
 
     /// The version field of the requested block.
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     version: Option<u32>,
 
     /// The merkle root of the requested block.
     #[serde(with = "opthex", rename = "merkleroot")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     merkle_root: Option<block::merkle::Root>,
 
     /// The blockcommitments field of the requested block. Its interpretation changes
     /// depending on the network and height.
     #[serde(with = "opthex", rename = "blockcommitments")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     block_commitments: Option<[u8; 32]>,
 
     // `authdataroot` would be here. Undocumented. TODO: decide if we want to support it
@@ -5019,53 +5469,55 @@ pub struct BlockObject {
     /// The root of the Sapling commitment tree after applying this block.
     #[serde(with = "opthex", rename = "finalsaplingroot")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     final_sapling_root: Option<[u8; 32]>,
 
     /// The root of the Orchard commitment tree after applying this block.
     #[serde(with = "opthex", rename = "finalorchardroot")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     final_orchard_root: Option<[u8; 32]>,
 
     // `chainhistoryroot` would be here. Undocumented. TODO: decide if we want to support it
     //
     /// The number of transactions in this block.
     #[serde(rename = "nTx")]
+    #[getset(get_copy = "pub")]
     n_tx: usize,
 
     /// List of transactions in block order, hex-encoded if verbosity=1 or
     /// as objects if verbosity=2.
+    #[getset(get = "pub")]
     tx: Vec<GetBlockTransaction>,
 
     /// The height of the requested block.
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     time: Option<i64>,
 
     /// The nonce of the requested block header.
     #[serde(with = "opthex")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     nonce: Option<[u8; 32]>,
 
     /// The Equihash solution in the requested block header.
     /// Note: presence of this field in getblock is not documented in zcashd.
     #[serde(with = "opthex")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     solution: Option<Solution>,
 
     /// The difficulty threshold of the requested block header displayed in compact form.
     #[serde(with = "opthex")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     bits: Option<CompactDifficulty>,
 
     /// Floating point number that represents the difficulty limit for this block as a multiple
     /// of the minimum difficulty for the network.
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     difficulty: Option<f64>,
 
     // `chainwork` would be here, but we don't plan on supporting it
@@ -5074,6 +5526,7 @@ pub struct BlockObject {
     /// Chain supply balance
     #[serde(rename = "chainSupply")]
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[getset(get = "pub")]
     chain_supply: Option<GetBlockchainInfoBalance>,
 
     /// Value pool balances
@@ -5083,22 +5536,23 @@ pub struct BlockObject {
         skip_serializing_if = "Option::is_none",
         deserialize_with = "deserialize_optional_blockchain_value_pool_balances"
     )]
+    #[getset(get = "pub")]
     value_pools: Option<BlockchainValuePoolBalances>,
 
     /// Information about the note commitment trees.
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     trees: GetBlockTrees,
 
     /// The previous block hash of the requested block header.
     #[serde(rename = "previousblockhash", skip_serializing_if = "Option::is_none")]
     #[serde(with = "opthex")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     previous_block_hash: Option<block::Hash>,
 
     /// The next block hash after the requested block header.
     #[serde(rename = "nextblockhash", skip_serializing_if = "Option::is_none")]
     #[serde(with = "opthex")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     next_block_hash: Option<block::Hash>,
 }
 
@@ -5127,79 +5581,84 @@ pub enum GetBlockHeaderResponse {
 }
 
 #[allow(clippy::too_many_arguments)]
-#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, Getters, new)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, CopyGetters, new)]
 /// Verbose response to a `getblockheader` RPC request.
 ///
 /// See the notes for the [`RpcServer::get_block_header`] method.
 pub struct BlockHeaderObject {
     /// The hash of the requested block.
     #[serde(with = "hex")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     hash: block::Hash,
 
     /// The number of confirmations of this block in the best chain,
     /// or -1 if it is not in the best chain.
+    #[getset(get_copy = "pub")]
     confirmations: i64,
 
     /// The height of the requested block.
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     height: Height,
 
     /// The version field of the requested block.
+    #[getset(get_copy = "pub")]
     version: u32,
 
     /// The merkle root of the requesteed block.
     #[serde(with = "hex", rename = "merkleroot")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     merkle_root: block::merkle::Root,
 
     /// The blockcommitments field of the requested block. Its interpretation changes
     /// depending on the network and height.
     #[serde(with = "hex", rename = "blockcommitments")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     block_commitments: [u8; 32],
 
     /// The root of the Sapling commitment tree after applying this block.
     #[serde(with = "hex", rename = "finalsaplingroot")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     final_sapling_root: [u8; 32],
 
     /// The number of Sapling notes in the Sapling note commitment tree
     /// after applying this block. Used by the `getblock` RPC method.
     #[serde(skip)]
+    #[getset(get_copy = "pub")]
     sapling_tree_size: u64,
 
     /// The block time of the requested block header in non-leap seconds since Jan 1 1970 GMT.
+    #[getset(get_copy = "pub")]
     time: i64,
 
     /// The nonce of the requested block header.
     #[serde(with = "hex")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     nonce: [u8; 32],
 
     /// The Equihash solution in the requested block header.
     #[serde(with = "hex")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     solution: Solution,
 
     /// The difficulty threshold of the requested block header displayed in compact form.
     #[serde(with = "hex")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     bits: CompactDifficulty,
 
     /// Floating point number that represents the difficulty limit for this block as a multiple
     /// of the minimum difficulty for the network.
+    #[getset(get_copy = "pub")]
     difficulty: f64,
 
     /// The previous block hash of the requested block header.
     #[serde(rename = "previousblockhash")]
     #[serde(with = "hex")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     previous_block_hash: block::Hash,
 
     /// The next block hash after the requested block header.
     #[serde(rename = "nextblockhash", skip_serializing_if = "Option::is_none")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     #[serde(with = "opthex")]
     next_block_hash: Option<block::Hash>,
 }
@@ -5259,13 +5718,15 @@ impl GetBlockHashResponse {
 pub type Hash = GetBlockHashResponse;
 
 /// Response to a `getbestblockheightandhash` RPC request.
-#[derive(Copy, Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize, Getters, new)]
+#[derive(
+    Copy, Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize, CopyGetters, new,
+)]
 pub struct GetBlockHeightAndHashResponse {
     /// The best chain tip block height
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     height: block::Height,
     /// The best chain tip block hash
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     hash: block::Hash,
 }
 
@@ -5313,45 +5774,56 @@ pub enum GetAddressUtxosResponse {
 }
 
 /// Response to a `getaddressutxos` RPC request, when `chainInfo` is true.
-#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize, Getters, new)]
+#[derive(
+    Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize, Getters, CopyGetters, new,
+)]
 pub struct GetAddressUtxosResponseObject {
+    /// The unspent transparent outputs.
+    #[getset(get = "pub")]
     utxos: Vec<Utxo>,
+    /// The best chain tip hash when these outputs were queried.
     #[serde(with = "hex")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     hash: block::Hash,
-    #[getter(copy)]
+    /// The best chain tip height when these outputs were queried.
+    #[getset(get_copy = "pub")]
     height: block::Height,
 }
 
 /// A UTXO returned by the `getaddressutxos` RPC request.
 ///
 /// See the notes for the [`Rpc::get_address_utxos` method].
-#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize, Getters, new)]
+#[derive(
+    Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize, Getters, CopyGetters, new,
+)]
 pub struct Utxo {
     /// The transparent address, base58check encoded
+    #[getset(get = "pub")]
     address: transparent::Address,
 
     /// The output txid, in big-endian order, hex-encoded
     #[serde(with = "hex")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     txid: transaction::Hash,
 
     /// The transparent output index, numeric
     #[serde(rename = "outputIndex")]
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     output_index: OutputIndex,
 
     /// The transparent output script, hex encoded
     #[serde(with = "hex")]
+    #[getset(get = "pub")]
     script: transparent::Script,
 
     /// The amount of zatoshis in the transparent output
+    #[getset(get_copy = "pub")]
     satoshis: u64,
 
     /// The block height, numeric.
     ///
     /// We put this field last, to match the zcashd order.
-    #[getter(copy)]
+    #[getset(get_copy = "pub")]
     height: Height,
 }
 
@@ -5404,10 +5876,13 @@ impl Utxo {
 pub struct GetAddressTxIdsRequest {
     /// A list of addresses. The RPC method will get transactions IDs that sent or received
     /// funds to or from these addresses.
+    #[getset(get = "pub")]
     addresses: Vec<String>,
-    // The height to start looking for transactions.
+    /// The height to start looking for transactions.
+    #[getset(get = "pub")]
     start: Option<u32>,
-    // The height to end looking for transactions.
+    /// The height to end looking for transactions.
+    #[getset(get = "pub")]
     end: Option<u32>,
 }
 

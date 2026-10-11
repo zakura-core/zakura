@@ -5,20 +5,6 @@ use proptest::prelude::*;
 use super::{Network, NetworkUpgrade};
 
 impl NetworkUpgrade {
-    /// Generates network upgrades.
-    pub fn branch_id_strategy() -> BoxedStrategy<NetworkUpgrade> {
-        prop_oneof![
-            Just(NetworkUpgrade::Overwinter),
-            Just(NetworkUpgrade::Sapling),
-            Just(NetworkUpgrade::Blossom),
-            Just(NetworkUpgrade::Heartwood),
-            Just(NetworkUpgrade::Canopy),
-            Just(NetworkUpgrade::Nu5),
-            // TODO: add future network upgrades (#1974)
-        ]
-        .boxed()
-    }
-
     /// Generates network upgrades that are valid for V5+ transactions (Nu5 onward).
     pub fn nu5_branch_id_strategy() -> BoxedStrategy<NetworkUpgrade> {
         prop_oneof![

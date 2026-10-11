@@ -958,3 +958,25 @@ async fn socket_counters_track_received_datagrams() {
     .await
     .unwrap();
 }
+
+#[test]
+fn gro_segments_do_not_share_an_allocation() {
+    let batch = vec![7u8; 1200 * 3 + 500];
+    let mut segments: Vec<bytes::Bytes> = crate::driver::endpoint::split_segments(&batch, 1200)
+        .map(bytes::BytesMut::freeze)
+        .collect();
+    assert_eq!(
+        segments.iter().map(bytes::Bytes::len).collect::<Vec<_>>(),
+        [1200, 1200, 1200, 500]
+    );
+    // quinn-proto buffers stream data as a slice of its datagram. Keeping one
+    // slice must not keep the other datagrams' memory alive.
+    // The other datagrams stay alive, as other connections' buffered chunks
+    // would.
+    let kept = segments.remove(0).slice(10..20);
+    assert!(
+        kept.is_unique(),
+        "a datagram shares its allocation with others"
+    );
+    drop(segments);
+}

@@ -315,9 +315,8 @@ impl EndpointTask {
             match result {
                 Ok(Some(meta)) => {
                     self.counters.calls += 1;
-                    let data = BytesMut::from(&buf[..meta.len]);
+                    self.on_datagrams(meta.remote, meta.dst_ip, meta.stride, &buf[..meta.len], &io);
                     self.recv_buf = buf;
-                    self.on_datagrams(meta.remote, meta.dst_ip, meta.stride, data, &io);
                     continue;
                 }
                 Ok(None) => {}
@@ -353,12 +352,11 @@ impl EndpointTask {
         remote: SocketAddr,
         dst_ip: Option<std::net::IpAddr>,
         stride: usize,
-        mut data: BytesMut,
+        data: &[u8],
         io: &UdpIo,
     ) {
         let now = now();
-        while !data.is_empty() {
-            let datagram = data.split_to(stride.min(data.len()));
+        for datagram in split_segments(data, stride) {
             self.counters.datagrams += 1;
             self.response_buf.clear();
             match self
@@ -525,4 +523,14 @@ impl EndpointTask {
             .datagrams_received
             .fetch_add(counters.datagrams, Ordering::Relaxed);
     }
+}
+
+/// Splits a received batch into datagrams, each in its own allocation.
+///
+/// quinn-proto keeps received stream data as slices of the datagram it arrived
+/// in. If the datagrams of a GRO batch shared one allocation, one buffered
+/// chunk would pin the whole batch (up to 64 KiB), and the receive window would
+/// no longer bound a peer's memory.
+pub(crate) fn split_segments(data: &[u8], stride: usize) -> impl Iterator<Item = BytesMut> + '_ {
+    data.chunks(stride.max(1)).map(BytesMut::from)
 }

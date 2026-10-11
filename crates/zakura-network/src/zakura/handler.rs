@@ -2312,6 +2312,7 @@ impl ZakuraProtocolHandler {
         self
     }
 
+    #[cfg(test)]
     async fn accept_connection(&self, connection: Connection) {
         let claim = self.claim_inbound(&connection);
         self.serve_inbound(connection, claim).await;

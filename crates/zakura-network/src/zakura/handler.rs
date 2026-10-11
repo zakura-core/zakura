@@ -2313,8 +2313,33 @@ impl ZakuraProtocolHandler {
     }
 
     async fn accept_connection(&self, connection: Connection) {
+        let claim = self.claim_inbound(&connection);
+        self.serve_inbound(connection, claim).await;
+    }
+
+    /// Moves an inbound connection from the transport's pending count into
+    /// this handler's own accounting (zakura-quic ADM-7).
+    ///
+    /// `Acceptor::handle` calls this synchronously, before the transport
+    /// releases the connection's pending count, so no admission decision sees
+    /// the IP uncounted.
+    fn claim_inbound(&self, connection: &Connection) -> Option<InboundClaim> {
+        let admission = self.admission.clone().try_acquire_owned().ok()?;
+        Some(InboundClaim {
+            _admission: admission,
+            control_handshake: self
+                .supervisor
+                .enter_control_handshake(connection.admitted_ip()),
+        })
+    }
+
+    async fn serve_inbound(&self, connection: Connection, claim: Option<InboundClaim>) {
         let conn_id = trace_conn_id(&connection);
-        let Ok(_admission) = self.admission.clone().try_acquire_owned() else {
+        let Some(InboundClaim {
+            _admission,
+            control_handshake,
+        }) = claim
+        else {
             metrics::counter!("zakura.p2p.conn.rejected.admission").increment(1);
             let conn = ZakuraConnTrace::without_peer_on(&self.trace, conn_id);
             conn.trace_connection(
@@ -2326,10 +2351,6 @@ impl ZakuraProtocolHandler {
             connection.close(VarInt::from_u32(ZAKURA_CLOSE_RESOURCE), b"admission");
             return;
         };
-        // The transport stopped counting this connection when TLS finished.
-        let control_handshake = self
-            .supervisor
-            .enter_control_handshake(connection.admitted_ip());
 
         let remote_node_id = connection.remote_id();
         let remote_peer_id = match ZakuraPeerId::new(remote_node_id.as_bytes().to_vec()) {
@@ -3643,6 +3664,12 @@ impl Acceptor for ZakuraProtocolHandler {
         if incoming.pending_total.saturating_add(control_handshakes)
             >= self.limits.max_pending_handshakes
         {
+            // As above: spoofed Initials could fill the budget, so an
+            // unvalidated source gets a Retry instead of a refusal.
+            if !incoming.validated {
+                metrics::counter!("zakura.p2p.conn.retried.pending_handshake").increment(1);
+                return Admit::Retry;
+            }
             metrics::counter!("zakura.p2p.conn.rejected.pending_handshake").increment(1);
             return Admit::Refuse;
         }
@@ -3659,8 +3686,16 @@ impl Acceptor for ZakuraProtocolHandler {
 
     fn handle(&self, connection: Connection) -> BoxFuture<'static, ()> {
         let handler = self.clone();
-        Box::pin(async move { handler.accept_connection(connection).await })
+        let claim = handler.claim_inbound(&connection);
+        Box::pin(async move { handler.serve_inbound(connection, claim).await })
     }
+}
+
+/// An inbound connection's share of the connection cap and its per-IP control
+/// handshake slot, held from `Acceptor::handle` on.
+struct InboundClaim {
+    _admission: OwnedSemaphorePermit,
+    control_handshake: ControlHandshakeGuard,
 }
 
 /// Loopback IPv4 address the native Zakura endpoint binds to when no
@@ -11235,6 +11270,29 @@ mod tests {
         assert_eq!(handler.admit(&busy(share - 1)), Admit::Accept);
         assert_eq!(handler.admit(&busy(share)), Admit::Refuse);
         Ok(())
+    }
+
+    // V12 F-67: the handler refused every attempt at the global pending cap,
+    // before the transport's Retry threshold could apply, so a valid config
+    // with `retry_threshold >= max_pending_handshakes` never sent a Retry.
+    #[test]
+    fn full_pending_budget_retries_unvalidated_attempts() {
+        let limits = ZakuraLocalLimits::from_config(&Config::default());
+        let handler = ZakuraProtocolHandler::new(
+            ZakuraSupervisorHandle::new(64),
+            Network::Mainnet,
+            ZakuraHandshakeConfig::for_network(&Network::Mainnet),
+            limits.clone(),
+        );
+        // Spread the pending total over other IPs so the per-IP share stays open.
+        let attempt = |validated: bool| IncomingInfo {
+            remote: SocketAddr::new("203.0.113.9".parse().expect("test ip parses"), 8234),
+            validated,
+            pending_total: limits.max_pending_handshakes,
+            pending_from_ip: 0,
+        };
+        assert_eq!(handler.admit(&attempt(false)), Admit::Retry);
+        assert_eq!(handler.admit(&attempt(true)), Admit::Refuse);
     }
 
     // V12 F-305585: the transport stops counting an inbound connection when TLS

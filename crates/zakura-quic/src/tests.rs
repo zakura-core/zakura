@@ -1045,11 +1045,46 @@ async fn socket_counters_track_received_datagrams() {
 }
 
 #[test]
+fn oversized_datagrams_are_dropped_before_any_copy() {
+    // One GRO batch of two 1,472-byte datagrams, then a lone 65,000-byte one.
+    let batch = vec![7u8; 1472 * 2];
+    let kept: Vec<_> = crate::driver::endpoint::split_segments(&batch, 1472, 1472).collect();
+    assert!(kept.iter().all(Option::is_some));
+    let jumbo = vec![7u8; 65_000];
+    let dropped: Vec<_> = crate::driver::endpoint::split_segments(&jumbo, 65_000, 1472).collect();
+    assert_eq!(dropped.len(), 1);
+    assert!(
+        dropped[0].is_none(),
+        "a datagram above the advertised limit is dropped"
+    );
+}
+
+/// SPEC §6a: the endpoint drops a datagram above its advertised
+/// `max_udp_payload_size` before quinn-proto routes it.
+#[tokio::test]
+async fn the_endpoint_counts_oversized_datagrams_as_dropped() {
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        let server = server();
+        let sender = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        sender
+            .send_to(&vec![0x40; 65_000], server.endpoint.local_addrs()[0])
+            .unwrap();
+        while server.endpoint.socket_stats()[0].oversize_drops == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(server.endpoint.socket_stats()[0].oversize_drops, 1);
+    })
+    .await
+    .unwrap();
+}
+
+#[test]
 fn gro_segments_do_not_share_an_allocation() {
     let batch = vec![7u8; 1200 * 3 + 500];
-    let mut segments: Vec<bytes::Bytes> = crate::driver::endpoint::split_segments(&batch, 1200)
-        .map(bytes::BytesMut::freeze)
-        .collect();
+    let mut segments: Vec<bytes::Bytes> =
+        crate::driver::endpoint::split_segments(&batch, 1200, 1472)
+            .map(|segment| segment.unwrap().freeze())
+            .collect();
     assert_eq!(
         segments.iter().map(bytes::Bytes::len).collect::<Vec<_>>(),
         [1200, 1200, 1200, 500]
@@ -1768,4 +1803,96 @@ async fn handle_runs_before_the_pending_count_drops() {
     })
     .await
     .unwrap();
+}
+
+// The three stream-lifecycle regressions from the PR 1354 audit
+// (art/inbox/iroh-deps/quinn-re-write), with a one-stream limit so a lost
+// stream shows up as a stall.
+
+/// DRV-10: an `open_bi` cancelled after its reply was sent hands the stream
+/// to the next call.
+#[tokio::test]
+async fn cancel_after_open_reply_preserves_stream_capacity() {
+    let (_server, _client, outbound, _inbound) = held_pair(1).await;
+    let mut opening = Box::pin(outbound.open_bi());
+    assert!(futures::poll!(&mut opening).is_pending());
+    // Stats follows OpenBi in the command queue, so its reply was sent.
+    outbound.stats().await.unwrap();
+    drop(opening);
+    tokio::time::timeout(Duration::from_secs(2), outbound.open_bi())
+        .await
+        .expect("cancelling an undelivered stream must preserve its capacity")
+        .unwrap();
+}
+
+/// DRV-10: an `accept_bi` cancelled after its reply was sent hands the
+/// stream, with its data, to the next call.
+#[tokio::test]
+async fn cancel_after_accept_reply_preserves_incoming_stream() {
+    let (_server, _client, outbound, inbound) = held_pair(1).await;
+    let mut accepting = Box::pin(inbound.accept_bi());
+    assert!(futures::poll!(&mut accepting).is_pending());
+    let (mut send, _recv) = outbound.open_bi().await.unwrap();
+    send.write_all(b"x").await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while inbound.stats().await.unwrap().connection.frame_rx.stream == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    // The driver handles stream events before it answers the next Stats.
+    inbound.stats().await.unwrap();
+    drop(accepting);
+    let (_send, mut recv) = tokio::time::timeout(Duration::from_secs(2), inbound.accept_bi())
+        .await
+        .expect("cancelling an undelivered accept must preserve the stream")
+        .unwrap();
+    let data = tokio::time::timeout(Duration::from_secs(2), recv.read_chunk(1))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(data.as_deref(), Some(&b"x"[..]));
+}
+
+/// DRV-9: dropping a sender after the peer stopped it sends RESET_STREAM.
+#[tokio::test]
+async fn stopped_send_resets_when_dropped() {
+    let (_server, _client, outbound, inbound) = held_pair(1).await;
+    let (mut send, _recv) = outbound.open_bi().await.unwrap();
+    send.write_all(b"x").await.unwrap();
+    let (_reply, mut received) = inbound.accept_bi().await.unwrap();
+    received.stop(VarInt::from_u32(7)).unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while outbound
+            .stats()
+            .await
+            .unwrap()
+            .connection
+            .frame_rx
+            .stop_sending
+            == 0
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    drop(send);
+    outbound.stats().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while inbound
+            .stats()
+            .await
+            .unwrap()
+            .connection
+            .frame_rx
+            .reset_stream
+            == 0
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("dropping a stopped sender must send RESET_STREAM");
 }

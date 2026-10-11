@@ -45,6 +45,11 @@ pub(crate) const READ_BATCH_BYTES: usize = 256 * 1024;
 /// datagrams also bounds memory when a peer sends 64 KiB datagrams.
 pub(crate) const CONNECTION_QUEUE_BYTES: usize = 16 * 1024 * 1024;
 
+/// The datagram bytes one socket may queue across all its connections
+/// (SPEC §6a), so many lagging connection tasks can't add up to
+/// `CONNECTION_QUEUE_BYTES` each.
+pub(crate) const SOCKET_QUEUE_BYTES: usize = 256 * 1024 * 1024;
+
 /// A request from a handle to its connection task.
 #[derive(Debug)]
 pub(crate) enum ConnCmd {
@@ -118,10 +123,12 @@ pub(crate) struct ConnShared {
     pub(crate) queued_datagram_bytes: AtomicUsize,
     /// Datagrams the endpoint dropped because the queue was full.
     pub(crate) queue_drops: AtomicU64,
+    /// The queued datagram bytes of every connection on this socket.
+    pub(crate) socket_queued_bytes: Arc<AtomicUsize>,
 }
 
 impl ConnShared {
-    fn new(remote: SocketAddr) -> Arc<Self> {
+    fn new(remote: SocketAddr, socket_queued_bytes: Arc<AtomicUsize>) -> Arc<Self> {
         static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
         Arc::new(Self {
             closed: watch::Sender::new(None),
@@ -129,6 +136,7 @@ impl ConnShared {
             load: watch::Sender::new(crate::conn::ConnLoad::new(remote)),
             queued_datagram_bytes: AtomicUsize::new(0),
             queue_drops: AtomicU64::new(0),
+            socket_queued_bytes,
         })
     }
 

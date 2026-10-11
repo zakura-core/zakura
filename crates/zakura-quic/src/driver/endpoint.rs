@@ -5,7 +5,10 @@ use std::{
     collections::HashMap,
     io,
     net::SocketAddr,
-    sync::{atomic::Ordering, Arc},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
     time::{Duration, Instant},
 };
 
@@ -21,7 +24,7 @@ use tokio::{
 use super::{
     connection::CurrentLimits,
     connection::{self, now, ConnTaskParams},
-    ConnRef, ConnShared, Connecting, CONNECTION_QUEUE_BYTES,
+    ConnRef, ConnShared, Connecting, CONNECTION_QUEUE_BYTES, SOCKET_QUEUE_BYTES,
 };
 use crate::{
     congestion::CongestionProbe,
@@ -75,6 +78,7 @@ struct RecvCounters {
     calls: u64,
     datagrams: u64,
     queue_drops: u64,
+    oversize_drops: u64,
 }
 
 pub(crate) struct EndpointTask {
@@ -98,6 +102,8 @@ pub(crate) struct EndpointTask {
     recv_buf: Vec<u8>,
     response_buf: Vec<u8>,
     counters: RecvCounters,
+    /// The queued datagram bytes across this socket's connections.
+    queued_total: Arc<AtomicUsize>,
 }
 
 impl Drop for EndpointTask {
@@ -143,6 +149,7 @@ impl EndpointTask {
             recv_buf: vec![0; RECV_BUFFER_BYTES],
             response_buf: Vec::new(),
             counters: RecvCounters::default(),
+            queued_total: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -264,7 +271,7 @@ impl EndpointTask {
         let (datagrams_tx, datagrams) = mpsc::unbounded_channel();
         let (control_tx, control) = mpsc::unbounded_channel();
         let (handshake_tx, handshake) = oneshot::channel();
-        let shared = ConnShared::new(canonical_addr(admitted));
+        let shared = ConnShared::new(canonical_addr(admitted), self.queued_total.clone());
         self.conns.insert(
             handle,
             ConnEntry {
@@ -378,9 +385,15 @@ impl EndpointTask {
         io: &UdpIo,
     ) {
         let now = now();
-        for datagram in split_segments(data, stride) {
-            let bytes = datagram.len();
+        // The advertised limit fits in a u16, so the cast can't truncate.
+        let max_len = self.endpoint.config().get_max_udp_payload_size() as usize;
+        for datagram in split_segments(data, stride, max_len) {
             self.counters.datagrams += 1;
+            let Some(datagram) = datagram else {
+                self.counters.oversize_drops += 1;
+                continue;
+            };
+            let bytes = datagram.len();
             self.response_buf.clear();
             match self
                 .endpoint
@@ -390,15 +403,20 @@ impl EndpointTask {
                 Some(DatagramEvent::ConnectionEvent(handle, event)) => {
                     if let Some(entry) = self.conns.get(&handle) {
                         let queued = &entry.shared.queued_datagram_bytes;
-                        if queued.load(Ordering::Relaxed) + bytes > CONNECTION_QUEUE_BYTES {
-                            // SPEC §6a: the queue is full; the peer retransmits.
+                        if queued.load(Ordering::Relaxed) + bytes > CONNECTION_QUEUE_BYTES
+                            || self.queued_total.load(Ordering::Relaxed) + bytes
+                                > SOCKET_QUEUE_BYTES
+                        {
+                            // SPEC §6a: a queue is full; the peer retransmits.
                             self.counters.queue_drops += 1;
                             entry.shared.queue_drops.fetch_add(1, Ordering::Relaxed);
                         } else {
                             queued.fetch_add(bytes, Ordering::Relaxed);
+                            self.queued_total.fetch_add(bytes, Ordering::Relaxed);
                             if entry.datagrams.send((event, bytes)).is_err() {
                                 // The connection task has ended.
                                 queued.fetch_sub(bytes, Ordering::Relaxed);
+                                self.queued_total.fetch_sub(bytes, Ordering::Relaxed);
                             }
                         }
                     }
@@ -551,6 +569,10 @@ impl EndpointTask {
         metrics::counter!("zakura.quic.socket.recv_calls").increment(counters.calls);
         metrics::counter!("zakura.quic.socket.datagrams_received").increment(counters.datagrams);
         metrics::counter!("zakura.quic.endpoint.queue_drops").increment(counters.queue_drops);
+        metrics::counter!("zakura.quic.endpoint.oversize_drops").increment(counters.oversize_drops);
+        self.slot
+            .oversize_drops
+            .fetch_add(counters.oversize_drops, Ordering::Relaxed);
         self.slot
             .queue_drops
             .fetch_add(counters.queue_drops, Ordering::Relaxed);
@@ -569,6 +591,16 @@ impl EndpointTask {
 /// in. If the datagrams of a GRO batch shared one allocation, one buffered
 /// chunk would pin the whole batch (up to 64 KiB), and the receive window would
 /// no longer bound a peer's memory.
-pub(crate) fn split_segments(data: &[u8], stride: usize) -> impl Iterator<Item = BytesMut> + '_ {
-    data.chunks(stride.max(1)).map(BytesMut::from)
+///
+/// A datagram longer than `max_len`, the `max_udp_payload_size` this endpoint
+/// advertises, yields `None` without being copied (SPEC §6a). quinn-proto
+/// routes a known connection ID before it authenticates the packet, so
+/// without this check a peer could queue 64 KiB per datagram.
+pub(crate) fn split_segments(
+    data: &[u8],
+    stride: usize,
+    max_len: usize,
+) -> impl Iterator<Item = Option<BytesMut>> + '_ {
+    data.chunks(stride.max(1))
+        .map(move |segment| (segment.len() <= max_len).then(|| BytesMut::from(segment)))
 }

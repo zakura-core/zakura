@@ -329,6 +329,9 @@ impl ConnTask {
         self.shared
             .queued_datagram_bytes
             .fetch_sub(bytes, Ordering::Relaxed);
+        self.shared
+            .socket_queued_bytes
+            .fetch_sub(bytes, Ordering::Relaxed);
         self.conn.handle_event(event);
         self.counters.datagrams_received += 1;
     }

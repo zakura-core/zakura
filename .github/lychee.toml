@@ -32,6 +32,8 @@ exclude = [
     # Zcash-hosted sites intermittently return Cloudflare 521 responses to CI
     "^https://tachyon\\.z\\.cash/",
     "^https://zips\\.z\\.cash/",
+    # man7.org intermittently stops responding, so requests time out
+    "^https://man7\\.org/",
 
     # These routes will become available when the Zakura website launches.
     "^https://zakura\\.com/",

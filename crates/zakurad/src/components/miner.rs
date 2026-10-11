@@ -6,11 +6,15 @@
 //!   <https://github.com/zcash/zcash/blob/6fdd9f1b81d3b228326c9826fa10696fc516444b/src/miner.cpp#L865-L880>
 //! - move common code into zakura-chain or zakura-node-services and remove the RPC dependency.
 
-use std::{cmp::min, sync::Arc, thread::available_parallelism, time::Duration};
+use std::{
+    cmp::min,
+    sync::Arc,
+    thread::{self, available_parallelism},
+    time::Duration,
+};
 
 use color_eyre::Report;
 use futures::{stream::FuturesUnordered, StreamExt};
-use thread_priority::{ThreadBuilder, ThreadPriority};
 use tokio::{select, sync::watch, task::JoinHandle, time::sleep};
 use tracing::{Instrument, Span};
 
@@ -40,6 +44,8 @@ use zakura_rpc::{
 use zakura_state::{ReadState as ReadStateService, State as StateService, WatchReceiver};
 
 use crate::components::metrics::Config;
+
+mod priority;
 
 /// The amount of time we wait between block template retries.
 pub const BLOCK_TEMPLATE_WAIT_TIME: Duration = Duration::from_secs(20);
@@ -556,8 +562,8 @@ where
     let span = Span::current();
     let solved_headers =
         tokio::task::spawn_blocking(move || span.in_scope(move || {
-            let miner_thread_handle = ThreadBuilder::default().name("zakura-miner").priority(ThreadPriority::Min).spawn(move |priority_result| {
-                if let Err(error) = priority_result {
+            let miner_thread_handle = thread::Builder::new().name("zakura-miner".to_owned()).spawn(move || {
+                if let Err(error) = priority::lower_current_thread_priority() {
                     info!(?error, "could not set miner to run at a low priority: running at default priority");
                 }
 

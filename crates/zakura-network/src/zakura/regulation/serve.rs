@@ -10,7 +10,7 @@
 //! 2. **The serving task waits instead.** For each queued request, in order,
 //!    it takes peer and node response slots, then their output bytes for the
 //!    whole response cap, then a peer execution slot and a node execution
-//!    slot. Then it spawns `produce`.
+//!    slot. Only then does it allocate the response channel and spawn `produce`.
 //! 3. **`produce` never waits for the peer.** Its [`ResponseSink`] queues
 //!    frames against output bytes that are already granted. `produce` gives
 //!    back its execution slots as soon as it returns.
@@ -23,7 +23,7 @@
 //! 5. **Every admitted request ends exactly once.** If `produce` returns
 //!    without an ending, Serve queues [`Produce::local_failure`]'s ending. The
 //!    connection stays open. Only an ending that cannot be queued retires the
-//!    session.
+//!    session. A panic in any serving task closes the connection.
 //!
 //! # Commitments and the margin
 //!
@@ -75,8 +75,13 @@
 //! | The ending frees the commitment before execution ends | `the_ending_frees_the_commitment_before_execution_ends` |
 //! | The sink checks rows, frames, bytes, and the ending reserve | the `the_sink_*` and `a_*cap*` tests |
 //! | Every budget returns after any operation sequence | `cancelling_a_session_frees_every_budget`, `operation_sequences_keep_every_bound` |
+//! | Waiting requests allocate no response channel | `queued_requests_allocate_only_commitments_until_dispatch` |
+//! | Serving output leaves a queue slot for control | `serving_output_keeps_a_queue_slot_for_control_messages` |
+//! | The ending frees the count before the peer can replace the request | `ending_publication_frees_the_count_before_a_peer_can_replace_its_request` |
+//! | A serving panic closes only its own connection | `serving_panics_close_the_connection_even_with_a_blocked_writer`, `a_writer_panic_records_the_cause_and_cancels_the_connection` |
 
 mod capacity;
+mod completion;
 mod lease;
 mod push;
 mod sink;
@@ -93,10 +98,11 @@ use std::{
 };
 
 use thiserror::Error;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 pub(crate) use capacity::{ServeCapacity, ServeConfigError, ServeLimits};
+pub(crate) use completion::{Completion, CompletionId, Completions};
 pub(crate) use lease::WorkLease;
 pub(crate) use push::{Push, PushPermit};
 pub(crate) use sink::{Responded, ResponseCap, ResponseSink, SinkError, SinkProgress};
@@ -170,32 +176,32 @@ struct Commitments {
 
 /// One open request. Dropping it releases the commitment.
 #[derive(Debug)]
-pub(super) struct Commitment(Arc<Commitments>, Option<watch::Sender<bool>>);
+pub(super) struct Commitment(Option<Arc<Commitments>>, Option<Completion>);
 
 impl Commitment {
     /// Publish and mark complete under the same lock. A receiver that has seen
     /// the ending must also see completion when it checks for a reused key.
-    fn queue_ending<T, E>(&self, publish: impl FnOnce() -> Result<T, E>) -> Result<T, E> {
-        if let Some(completed) = &self.1 {
-            let mut result = None;
-            completed.send_modify(|done| {
-                let published = publish();
-                *done = published.is_ok();
-                result = Some(published);
-            });
-            result.expect("send_modify runs its closure before returning")
+    fn queue_ending<T, E>(&mut self, publish: impl FnOnce() -> Result<T, E>) -> Result<T, E> {
+        // Publishing can wake another thread that transmits the ending and admits
+        // its replacement before send returns. A failed publication also ends this lease.
+        self.release();
+        if let Some(completed) = &mut self.1 {
+            completed.queue_ending(publish)
         } else {
             publish()
+        }
+    }
+
+    fn release(&mut self) {
+        if let Some(counts) = self.0.take() {
+            counts.open.fetch_sub(1, Ordering::AcqRel);
         }
     }
 }
 
 impl Drop for Commitment {
     fn drop(&mut self) {
-        self.0.open.fetch_sub(1, Ordering::AcqRel);
-        if let Some(completed) = &self.1 {
-            completed.send_if_modified(|done| !std::mem::replace(done, true));
-        }
+        self.release();
     }
 }
 
@@ -216,7 +222,6 @@ pub(super) struct ResponseGrants {
 struct Job<R> {
     request: R,
     commitment: Commitment,
-    frames: mpsc::UnboundedSender<ResponseFrame>,
 }
 
 /// Serving for one peer session and one request row.
@@ -227,7 +232,6 @@ pub(crate) struct Serve<P: Produce> {
     commitments: Arc<Commitments>,
     max_in_flight: u32,
     jobs: mpsc::UnboundedSender<Job<P::Request>>,
-    order: mpsc::UnboundedSender<mpsc::UnboundedReceiver<ResponseFrame>>,
     metrics: Arc<ServeMetrics>,
 }
 
@@ -252,7 +256,8 @@ impl ServeCapacity {
     /// `max_in_flight` caps it. Sessions of one peer share its budgets, so
     /// reconnecting never adds capacity. `cancel` ends the session's serving:
     /// queued requests are dropped and running `produce` steps see their
-    /// lease cancelled.
+    /// lease cancelled. A panic in any serving task also closes `connection`.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn session<P: Produce>(
         &self,
         produce: Arc<P>,
@@ -260,6 +265,8 @@ impl ServeCapacity {
         advertised: u32,
         send: FramedSend,
         cancel: CancellationToken,
+        connection: CancellationToken,
+        close_cause: crate::zakura::CloseCause,
     ) -> Serve<P> {
         let (jobs, queued) = mpsc::unbounded_channel();
         let (order, responses) = mpsc::unbounded_channel();
@@ -270,18 +277,25 @@ impl ServeCapacity {
             }),
             max_in_flight: self.max_in_flight,
             jobs,
-            order,
             metrics: self.metrics.clone(),
         };
         serve.advertise(advertised);
+        let tasks = ServingTasks {
+            peer: peer.clone(),
+            cancel: cancel.clone(),
+            connection,
+            close_cause,
+        };
         let dispatch = Dispatch {
             produce,
             capacity: self.clone(),
             peer: self.peer(peer),
+            order,
             cancel: cancel.clone(),
+            tasks: tasks.clone(),
         };
-        tokio::spawn(dispatch.run(queued));
-        tokio::spawn(write_in_order(responses, send, cancel));
+        tasks.spawn(dispatch.run(queued));
+        tasks.spawn(write_in_order(responses, send, cancel));
         serve
     }
 }
@@ -296,25 +310,23 @@ impl<P: Produce> Serve<P> {
         self.admit_inner(request, None)
     }
 
-    /// Admit a request and observe when its ending is queued or it is cancelled.
-    /// Reading the watch value is synchronized with ending publication, so a
-    /// reactor can safely reject overlapping requests until completion.
+    /// Admit with a session-local completion lease, released at its ending or cancellation.
+    /// Drain the completion queue before checking whether a request key is still live.
     pub(crate) fn admit_tracked(
         &self,
         request: P::Request,
-    ) -> Result<watch::Receiver<bool>, ServeViolation> {
-        let (completed, receiver) = watch::channel(false);
-        self.admit_inner(request, Some(completed))?;
-        Ok(receiver)
+        completed: Completion,
+    ) -> Result<(), ServeViolation> {
+        self.admit_inner(request, Some(completed))
     }
 
     fn admit_inner(
         &self,
         request: P::Request,
-        completed: Option<watch::Sender<bool>>,
+        completed: Option<Completion>,
     ) -> Result<(), ServeViolation> {
         let open = self.commitments.open.fetch_add(1, Ordering::AcqRel) + 1;
-        let commitment = Commitment(self.commitments.clone(), completed);
+        let commitment = Commitment(Some(self.commitments.clone()), completed);
         let limit = self.commitments.limit.load(Ordering::Acquire);
         if open > limit.saturating_mul(2) {
             return Err(ServeViolation::OverCommitted { open, limit });
@@ -323,15 +335,12 @@ impl<P: Produce> Serve<P> {
             self.metrics.over_limit(open, limit);
         }
         self.metrics.admitted();
-        let (frames, response) = mpsc::unbounded_channel();
         // A closed channel means the session is cancelled. Dropping the job
         // releases its commitment.
         let _ = self.jobs.send(Job {
             request,
             commitment,
-            frames,
         });
-        let _ = self.order.send(response);
         Ok(())
     }
 
@@ -353,12 +362,41 @@ impl<P: Produce> Serve<P> {
     }
 }
 
+/// Supervise each task independently of the session reader and ordered writer.
+#[derive(Clone)]
+struct ServingTasks {
+    peer: ZakuraPeerId,
+    cancel: CancellationToken,
+    connection: CancellationToken,
+    close_cause: crate::zakura::CloseCause,
+}
+
+impl ServingTasks {
+    fn spawn(&self, task: impl Future<Output = ()> + Send + 'static) {
+        let cancel = self.cancel.clone();
+        let connection = self.connection.clone();
+        let close_cause = self.close_cause.clone();
+        crate::zakura::transport::spawn_supervised_peer_task(
+            self.peer.clone(),
+            || {},
+            move || {
+                close_cause.record("service_panic");
+                cancel.cancel();
+                connection.cancel();
+            },
+            task,
+        );
+    }
+}
+
 /// The serving task of one session: waits for capacity, then spawns `produce`.
 struct Dispatch<P> {
     produce: Arc<P>,
     capacity: ServeCapacity,
     peer: PeerBudgets,
+    order: mpsc::UnboundedSender<mpsc::UnboundedReceiver<ResponseFrame>>,
     cancel: CancellationToken,
+    tasks: ServingTasks,
 }
 
 impl<P: Produce> Dispatch<P> {
@@ -378,6 +416,13 @@ impl<P: Produce> Dispatch<P> {
                 return;
             };
             drop(waiting);
+            // Dispatch consumes jobs in admission order. Publish the response
+            // slot before spawning its producer, after capacity is reserved.
+            let (frames, response) = mpsc::unbounded_channel();
+            if self.order.send(response).is_err() {
+                self.cancel.cancel();
+                return;
+            }
             let task = Task {
                 produce: self.produce.clone(),
                 metrics: self.capacity.metrics.clone(),
@@ -387,11 +432,11 @@ impl<P: Produce> Dispatch<P> {
                 self.capacity.request,
                 P::Message::RULES,
                 cap,
-                job.frames,
+                frames,
                 Arc::new(grants),
                 job.commitment,
             );
-            tokio::spawn(task.run(job.request, core, slots));
+            self.tasks.spawn(task.run(job.request, core, slots));
         }
     }
 
@@ -531,7 +576,7 @@ async fn write_in_order(
             let slot = tokio::select! {
                 biased;
                 () = cancel.cancelled() => return,
-                slot = send.reserve_guarded() => slot,
+                slot = send.reserve_response_guarded() => slot,
             };
             match slot {
                 Ok(slot) => slot.send(frame, guard),

@@ -99,7 +99,7 @@ sync-metrics = ["zakura-network/sync-metrics"]
 
 # Experimental internal miner support
 internal-miner = [
-    "thread-priority",
+    "dep:windows-sys",
     "zakura-chain/internal-miner",
     # TODO: move common code into zakura-chain or zakura-node-services and remove the RPC dependency
     "zakura-rpc/internal-miner",
@@ -225,9 +225,6 @@ hyper = { workspace = true, features = ["server", "http1"] }
 http-body-util = { workspace = true }
 hyper-util = { workspace = true, features = ["service", "server", "tokio"] }
 
-# prod feature internal-miner
-thread-priority = { workspace = true, optional = true }
-
 # prod feature journald
 tracing-journald = { workspace = true, optional = true }
 
@@ -329,6 +326,9 @@ enum_variant_missing = "warn"
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_System_Threading"], optional = true }
 
 [[bench]]
 name = "mempool_eviction"

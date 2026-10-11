@@ -29,6 +29,7 @@ use zakura_header_chain::{
     TransitionInput, TransitionRequest, UntrustedAuxDeliveryRow, ValidationContextRecord,
     ValidationLease, VerifiedChainChanged, VerifiedChangeCause, VerifiedHeaderRef,
 };
+use zakura_node_services::header_chain::ServingCapacitySignal;
 
 use crate::{
     RetainedPathLease, RetainedPathLeaseOutcome, RetainedPathPage, RetainedPathReadOutcome,
@@ -277,6 +278,10 @@ impl FullStateEvidenceAuthority for TestHeaderCompletionAuthority<'_> {
         self.0.map_or(&[], |inner| inner.evicted_bodies(event))
     }
 
+    fn verified_tip(&self, event: &TransitionEvent) -> Option<Frontier> {
+        self.0.and_then(|inner| inner.verified_tip(event))
+    }
+
     fn authorizes_full_state(&self, event: &TransitionEvent) -> bool {
         self.0
             .is_some_and(|inner| inner.authorizes_full_state(event))
@@ -312,6 +317,10 @@ struct StateIssuedAuthority<'a> {
 impl FullStateEvidenceAuthority for StateIssuedAuthority<'_> {
     fn evicted_bodies(&self, event: &TransitionEvent) -> &[block::Hash] {
         self.inner.map_or(&[], |inner| inner.evicted_bodies(event))
+    }
+
+    fn verified_tip(&self, event: &TransitionEvent) -> Option<Frontier> {
+        self.inner.and_then(|inner| inner.verified_tip(event))
     }
 
     fn authorizes_full_state(&self, event: &TransitionEvent) -> bool {
@@ -435,6 +444,19 @@ fn untrusted_aux_row_matches(authoritative: AuxDelivery, row: UntrustedAuxDelive
             || (row.outcome_status_code() == authoritative_status
                 && row.observation_digests() == authoritative_observations
                 && row.outcome_boundary_hash() == authoritative.outcome_boundary_hash()))
+}
+
+/// Return whether a selected repair can add input to, or replace input in, one header's bucket.
+fn repair_bucket_admits(
+    engine: &HeaderChainEngine,
+    hash: block::Hash,
+    limits: zakura_header_chain::EngineLimits,
+) -> bool {
+    let deliveries = engine.aux_deliveries(hash);
+    deliveries.len() < limits.max_aux_deliveries_per_header.get()
+        || deliveries
+            .iter()
+            .any(|delivery| !delivery.is_authenticated())
 }
 
 fn auxiliary_rows_are_coherent(
@@ -913,7 +935,9 @@ struct RetainedPathLeaseRegistry {
     next_lease_id: u64,
     next_reservation_id: u64,
     by_peer: HashMap<SourceId, CanonicalHeaderPathCursor>,
-    reservations: HashMap<SourceId, u64>,
+    reservations: HashMap<SourceId, (u64, Option<ServingCapacitySignal>)>,
+    general_capacity: Option<ServingCapacitySignal>,
+    fallback_capacity: Option<ServingCapacitySignal>,
     // Idle hash indexes hold no serving capacity, retention roots, or disk snapshots.
     continuations: HashMap<SourceId, CanonicalHeaderPathCursor>,
 }
@@ -947,6 +971,7 @@ enum CanonicalHeaderPathPosition {
 
 #[derive(Clone, Debug)]
 struct CanonicalHeaderPathCursor {
+    capacity: Option<ServingCapacitySignal>,
     lease_id: u64,
     peer: SourceId,
     session_id: u64,
@@ -992,6 +1017,45 @@ struct CanonicalHeaderPathAdvance {
     position: CanonicalHeaderPathPosition,
     last_frontier: Frontier,
     now: Instant,
+}
+
+/// Owns a blocking acquisition until the state-service caller receives its result.
+pub(crate) struct PendingRetainedPathAcquisition {
+    reader: HeaderChainReader,
+    outcome: Option<RetainedPathLeaseOutcome>,
+}
+
+impl PendingRetainedPathAcquisition {
+    pub(crate) fn new(reader: HeaderChainReader, outcome: RetainedPathLeaseOutcome) -> Self {
+        Self {
+            reader,
+            outcome: Some(outcome),
+        }
+    }
+
+    pub(crate) fn into_outcome(mut self) -> RetainedPathLeaseOutcome {
+        self.outcome
+            .take()
+            .expect("pending acquisition owns its outcome")
+    }
+}
+
+impl Drop for PendingRetainedPathAcquisition {
+    fn drop(&mut self) {
+        if let Some(RetainedPathLeaseOutcome::Acquired(lease)) = self.outcome.take() {
+            if let Err(error) = self.reader.release_retained_path(
+                lease.peer,
+                lease.session_id,
+                lease.lease_id,
+                lease.scope,
+            ) {
+                tracing::error!(
+                    ?error,
+                    "failed to release an abandoned header path acquisition"
+                );
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -1041,7 +1105,26 @@ impl RetainedPathLeaseRegistry {
     }
 
     fn remove_peer(&mut self, peer: SourceId) -> Option<CanonicalHeaderPathCursor> {
-        self.by_peer.remove(&peer)
+        let mut cursor = self.by_peer.remove(&peer)?;
+        if let Some(signal) = cursor.capacity.take() {
+            signal.release();
+        }
+        self.notify_capacity();
+        Some(cursor)
+    }
+
+    fn notify_capacity(&mut self) {
+        let occupied = self.by_peer.len().saturating_add(self.reservations.len());
+        if occupied < RetainedPathCapacity::General.limit() {
+            if let Some(signal) = self.general_capacity.take() {
+                signal.release();
+            }
+        }
+        if occupied < RetainedPathCapacity::FinalizedFallback.limit() {
+            if let Some(signal) = self.fallback_capacity.take() {
+                signal.release();
+            }
+        }
     }
 
     fn reserve(
@@ -1049,23 +1132,50 @@ impl RetainedPathLeaseRegistry {
         peer: SourceId,
         now: Instant,
         capacity: RetainedPathCapacity,
-    ) -> Option<u64> {
+    ) -> Result<u64, RetainedPathLeaseOutcome> {
         self.expire(now);
-        if self.by_peer.contains_key(&peer)
-            || self.reservations.contains_key(&peer)
-            || self.by_peer.len().saturating_add(self.reservations.len()) >= capacity.limit()
-        {
-            return None;
+        if let Some(cursor) = self.by_peer.get_mut(&peer) {
+            return Err(RetainedPathLeaseOutcome::CapacityBusy(
+                cursor.capacity.get_or_insert_default().clone(),
+            ));
         }
-        let reservation_id = self.next_reservation_id.checked_add(1)?;
+        if let Some((_, signal)) = self.reservations.get_mut(&peer) {
+            return Err(RetainedPathLeaseOutcome::CapacityBusy(
+                signal.get_or_insert_default().clone(),
+            ));
+        }
+        if self.by_peer.len().saturating_add(self.reservations.len()) >= capacity.limit() {
+            let signal = match capacity {
+                RetainedPathCapacity::General => &mut self.general_capacity,
+                RetainedPathCapacity::FinalizedFallback => &mut self.fallback_capacity,
+            };
+            return Err(RetainedPathLeaseOutcome::CapacityBusy(
+                signal.get_or_insert_default().clone(),
+            ));
+        }
+        let reservation_id = self
+            .next_reservation_id
+            .checked_add(1)
+            .ok_or(RetainedPathLeaseOutcome::Busy)?;
         self.next_reservation_id = reservation_id;
-        self.reservations.insert(peer, reservation_id);
-        Some(reservation_id)
+        self.reservations.insert(peer, (reservation_id, None));
+        Ok(reservation_id)
     }
 
     fn release_reservation(&mut self, peer: SourceId, reservation_id: u64) {
-        if self.reservations.get(&peer) == Some(&reservation_id) {
-            self.reservations.remove(&peer);
+        if self
+            .reservations
+            .get(&peer)
+            .is_some_and(|(id, _)| *id == reservation_id)
+        {
+            let (_, signal) = self
+                .reservations
+                .remove(&peer)
+                .expect("the reservation matches");
+            if let Some(signal) = signal {
+                signal.release();
+            }
+            self.notify_capacity();
         }
     }
 
@@ -1076,18 +1186,29 @@ impl RetainedPathLeaseRegistry {
         spec: RetainedPathLeaseSpec,
         now: Instant,
     ) -> RetainedPathLeaseOutcome {
-        if peer != spec.peer || self.reservations.get(&peer) != Some(&reservation_id) {
+        if peer != spec.peer
+            || !self
+                .reservations
+                .get(&peer)
+                .is_some_and(|(id, _)| *id == reservation_id)
+        {
             return RetainedPathLeaseOutcome::Busy;
         }
-        self.reservations.remove(&peer);
         if self.by_peer.contains_key(&peer) {
+            self.release_reservation(peer, reservation_id);
             return RetainedPathLeaseOutcome::Busy;
         }
         let Some(lease_id) = self.next_lease_id.checked_add(1) else {
+            self.release_reservation(peer, reservation_id);
             return RetainedPathLeaseOutcome::Busy;
         };
         self.next_lease_id = lease_id;
+        let (_, capacity) = self
+            .reservations
+            .remove(&peer)
+            .expect("the reservation matches");
         let cursor = CanonicalHeaderPathCursor {
+            capacity,
             lease_id,
             peer: spec.peer,
             session_id: spec.session_id,
@@ -1797,7 +1918,9 @@ impl HeaderChainReader {
             admission_capacity_available,
             &durable_rows,
         )?;
-        if !durable_rows.is_empty() || !admission_capacity_available {
+        if zakura_header_chain::VctRepairContext::rows_constrain_repair(&durable_rows)
+            || !admission_capacity_available
+        {
             return Ok(Some(context));
         }
 
@@ -1858,7 +1981,9 @@ impl HeaderChainReader {
                 )
                 .into());
             }
-            if !candidate_rows.is_empty() {
+            if zakura_header_chain::VctRepairContext::rows_constrain_repair(&candidate_rows)
+                || !repair_bucket_admits(&engine, candidate.hash, self.config.limits)
+            {
                 break;
             }
             suffix.push(candidate);
@@ -2033,8 +2158,9 @@ impl HeaderChainReader {
             .lock()
             .map_err(|_| HeaderChainStoreError::WriterPoisoned)?
             .reserve(peer, Instant::now(), capacity);
-        let Some(reservation_id) = reservation_id else {
-            return Ok(RetainedPathLeaseOutcome::Busy);
+        let reservation_id = match reservation_id {
+            Ok(id) => id,
+            Err(outcome) => return Ok(outcome),
         };
         let reservation = RetainedPathReservation {
             leases: self.leases.clone(),
@@ -3094,8 +3220,15 @@ impl HeaderChainRuntime {
                     &durable_rows_by_target[0],
                 )?;
                 if repair_range.len() > 1 {
-                    if durable_rows_by_target.iter().any(|rows| !rows.is_empty())
-                        || before.alarms.resource_stalled
+                    if durable_rows_by_target.iter().any(|rows| {
+                        zakura_header_chain::VctRepairContext::rows_constrain_repair(rows)
+                    }) || repair_range.iter().any(|target| {
+                        !repair_bucket_admits(
+                            &transition_engine,
+                            target.hash,
+                            context.config.limits,
+                        )
+                    }) || before.alarms.resource_stalled
                     {
                         return Ok(ApplyResult::Stale(StaleReceipt {
                             current_version: before.state_version,
@@ -3104,8 +3237,9 @@ impl HeaderChainRuntime {
                     }
                     current = current
                         .extend_empty_selected_range(&repair_range[1..], terminal_boundary_hash)?;
-                } else if durable_rows_by_target[0].is_empty()
-                    && current.admission_capacity_available
+                } else if !zakura_header_chain::VctRepairContext::rows_constrain_repair(
+                    &durable_rows_by_target[0],
+                ) && current.admission_capacity_available
                     && current.episode != episode
                 {
                     current = current.extend_empty_selected_range(&[], terminal_boundary_hash)?;

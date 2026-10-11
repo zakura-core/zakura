@@ -11,7 +11,34 @@ independently.
 
 ## [Unreleased]
 
-## [1.5.1-rc0] - 2026-09-29
+## [1.6.0] - 2026-10-01
+
+### Changed
+
+- Disabled Sentry in default node builds and release binaries. To enable Sentry
+  reporting, build with `--features sentry` and set `SENTRY_DSN` at runtime
+  ([#1216](https://github.com/zakura-core/zakura/pull/1216)).
+- Reduced the work spent detecting duplicate inputs and nullifiers during
+  transaction verification
+  ([#1217](https://github.com/zakura-core/zakura/pull/1217)).
+- Lowered Zakura's conventional fee to 400 zatoshis per logical action for
+  mempool admission, block template selection, and mempool eviction
+  ([#1218](https://github.com/zakura-core/zakura/pull/1218)).
+- Raised the block template fee weight ratio cap from 10 to 13
+  ([#1218](https://github.com/zakura-core/zakura/pull/1218)).
+- Scheduled NU7 on Testnet at block height 4,465,026 and updated the Zakura Common
+  libraries to v2.2.0. The existing NSM calculation schedules reissuance at
+  height 7,305,222
+  ([#1235](https://github.com/zakura-core/zakura/pull/1235)).
+
+### Fixed
+
+- Aligned Mainnet end of support for the October 1 release with approximately
+  November 1, 2026 at 00:00 UTC, supporting through height 3,536,467. Guarded
+  against extending estimated support to November 2 unless Mainnet NU7 has an
+  activation height ([#1234](https://github.com/zakura-core/zakura/pull/1234)).
+
+## [1.5.1] - 2026-09-29
 
 ### Added
 
@@ -56,6 +83,15 @@ support-height adjustment. Published library crates are versioned independently.
   retaining the 30-day support window and three-day warning lead
   ([#1197](https://github.com/zakura-core/zakura/pull/1197),
   [#1198](https://github.com/zakura-core/zakura/pull/1198)).
+- Prepare the ZIP 2008 mainnet FPF/ZCG address rotation for NU7. Deployment requires final confirmation
+  ([#1201](https://github.com/zakura-core/zakura/pull/1201)).
+- Updated Zakura Common from 2.1.0-rc.0 to 2.1.0. Local x86-64 builds now
+  select Pasta assembly from Rust target features; use `-C target-cpu=native`
+  on a supported CPU to enable BMI2 and ADX automatically
+  ([#1206](https://github.com/zakura-core/zakura/pull/1206)).
+- Keep Testnet's minimum-difficulty waiting period at 7.5 minutes after NU7 by
+  requiring a gap of more than 18 target spacings
+  ([#1209](https://github.com/zakura-core/zakura/pull/1209)).
 
 ### Fixed
 
@@ -112,6 +148,13 @@ support-height adjustment. Published library crates are versioned independently.
   ([#1194](https://github.com/zakura-core/zakura/pull/1194)).
 - Zakura block sync now reserves each body's advertised or committed size instead of the 2 MB worst case: suppliers publish committed sizes when serving headers from finalized state, and requesters read the size hints carried by retained header deliveries again. A later known size can fill a missing hint once, updating queued estimates without replacing verification evidence. Fills are stored in a new state column family, so the database format moves to 29.1.0 without a migration ([#982](https://github.com/zakura-core/zakura/pull/982)).
 - A block body matching its requested header hash can exceed its advertised size hint when actual retention capacity is available. Speculative bodies that do not fit are retried after commit progress with their measured size, while the checkpoint window stays fundable ([#982](https://github.com/zakura-core/zakura/pull/982)).
+- Validate required coinbase payments against the configured address and amount
+  without a P2SH-only assertion, supporting the ZIP 2008 recipient
+  ([#1201](https://github.com/zakura-core/zakura/pull/1201)).
+- Testnet `getblocktemplate` no longer offers minimum-difficulty work early by
+  moving the template timestamp into the future. It offers that work only once
+  it is valid, and long polling returns it one second after `maxtime`. Mainnet
+  is unchanged ([#1203](https://github.com/zakura-core/zakura/pull/1203)).
 
 ## [1.5.0] - 2026-09-24
 

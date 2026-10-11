@@ -1,5 +1,7 @@
 //! Transparent Address types.
 
+use crate::serialization::ZcashReader;
+use std::io::Read as _;
 use std::{fmt, io};
 
 use crate::{
@@ -25,9 +27,7 @@ use zcash_transparent::address::TransparentAddress;
 ///
 /// <https://zips.z.cash/protocol/protocol.pdf#transparentaddrencoding>
 // TODO Remove this type and move to `TransparentAddress` in `zcash-transparent`.
-#[derive(
-    Clone, Copy, Eq, PartialEq, Hash, serde_with::SerializeDisplay, serde_with::DeserializeFromStr,
-)]
+#[derive(Clone, Copy, Eq, PartialEq, Hash)]
 pub enum Address {
     /// P2SH (Pay to Script Hash) addresses
     PayToScriptHash {
@@ -55,6 +55,25 @@ pub enum Address {
         /// 20 bytes specifying the validating key hash.
         validating_key_hash: [u8; 20],
     },
+}
+
+impl serde::Serialize for Address {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for Address {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let encoded = <String as serde::Deserialize>::deserialize(deserializer)?;
+        encoded.parse().map_err(serde::de::Error::custom)
+    }
 }
 
 impl From<Address> for ZcashAddress {
@@ -203,7 +222,9 @@ impl ZcashSerialize for Address {
 }
 
 impl ZcashDeserialize for Address {
-    fn zcash_deserialize<R: io::Read>(mut reader: R) -> Result<Self, SerializationError> {
+    fn zcash_deserialize_from<R: io::Read>(
+        reader: &mut ZcashReader<R>,
+    ) -> Result<Self, SerializationError> {
         let mut version_bytes = [0; 2];
         reader.read_exact(&mut version_bytes)?;
 
@@ -332,6 +353,28 @@ mod tests {
     use sha2::Sha256;
 
     use super::*;
+
+    #[test]
+    fn serde_address_preserves_display_and_from_str() {
+        for encoded in [
+            "t3Vz22vK5z2LcKEdg16Yv4FFneEL1zg9ojd",
+            "t1bmMa1wJDFdbc2TiURQP5BbBz6jHjUBuHq",
+            "tmTc6trRhbv96kGfA99i7vrFwb5p7BVFwc3",
+        ] {
+            let address: Address = encoded.parse().unwrap();
+            let json = serde_json::Value::String(encoded.into());
+            assert_eq!(serde_json::to_value(address).unwrap(), json);
+            assert_eq!(serde_json::from_value::<Address>(json).unwrap(), address);
+        }
+
+        for invalid in [
+            serde_json::json!("invalid"),
+            serde_json::json!(42),
+            serde_json::json!(null),
+        ] {
+            assert!(serde_json::from_value::<Address>(invalid).is_err());
+        }
+    }
 
     trait ToAddressWithNetwork {
         /// Convert `self` to an `Address`, given the current `network`.

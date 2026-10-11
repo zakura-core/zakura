@@ -668,13 +668,17 @@ there.
   - `max_response_bytes` = 1..=33,554,432
   - exact consumption
 - **Cadence**
-  - capacity = 4
+  - capacity = 22
   - refill = 1 message / 15 seconds
-  - on_empty = `Disconnect`
+  - on_empty = record and forward (exhaustion is not a violation)
 
-The sender MUST send at most one `Status` every 30 seconds. It MAY send one immediate `Status` when
-the connection opens. The handler MUST retain bounded latest-status state and SHOULD suppress
-redundant candidate-selection work without requiring a separate relevance snapshot.
+The sender MUST send at most one `Status` every 30 seconds, including range corrections. It MAY
+send one immediate `Status` when the connection opens. The handler MUST retain bounded latest-status
+state and SHOULD suppress redundant candidate-selection work without requiring a separate relevance
+snapshot.
+
+The receiver capacity allows 20 messages buffered over the maximum ten-minute transport outage,
+plus the initial message and one message of jitter. The sender interval remains 30 seconds.
 
 #### `GetBlocks` — Request, discriminator 2
 
@@ -759,12 +763,15 @@ peer that serves no blocks for heights inside its advertised servable range.
   - count = 1..=128
   - exact consumption
 - **Reservation**
-  - live `GetBlocks` range with this `start_height` and requested count
+  - live `GetBlocks` range with this `start_height`
   - no block has been consumed from the range
-  - `count` equals the requested count
+  - `count` does not exceed the requested count
   - consumes the terminal part and closes the reservation
 
-The handler MUST requeue the range. A retry policy MAY avoid this peer for the immediate retry.
+Version 2 senders can report a smaller count after clamping a request to their available heights.
+The ending closes the entire original range. The handler MUST requeue every unreceived height in
+that original range, not just the reported count. A retry policy MAY avoid this peer for the
+immediate retry.
 
 ### Block sync successor (planned)
 

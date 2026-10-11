@@ -5,25 +5,19 @@ use std::{
     io::Write,
 };
 
-use abscissa_core::{Component, FrameworkError, Shutdown};
+use abscissa_core::{Component, FrameworkError};
 
 use tokio::sync::watch;
 use tracing::{field::Visit, Level};
-use tracing_appender::non_blocking::{NonBlocking, NonBlockingBuilder, WorkerGuard};
 use tracing_error::ErrorLayer;
-use tracing_subscriber::{
-    fmt::{format, Formatter},
-    layer::SubscriberExt,
-    reload::Handle,
-    util::SubscriberInitExt,
-    EnvFilter, Layer,
-};
+#[cfg(all(feature = "tokio-console", tokio_unstable))]
+use tracing_subscriber::EnvFilter;
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, Layer};
 use zakura_chain::parameters::Network;
 
 use crate::{application::build_version, components::tracing::Config};
 
-#[cfg(feature = "flamegraph")]
-use super::flame;
+use super::non_blocking::{non_blocking, WorkerGuard};
 
 // Art generated with these two images.
 // Zakura logo: project branding
@@ -51,23 +45,6 @@ pub type BoxWrite = Box<dyn Write + Send + Sync + 'static>;
 
 /// Abscissa component for initializing the `tracing` subsystem
 pub struct Tracing {
-    /// The installed filter reloading handle, if enabled.
-    //
-    // TODO: when fmt::Subscriber supports per-layer filtering, remove the Option
-    filter_handle: Option<
-        Handle<
-            EnvFilter,
-            Formatter<format::DefaultFields, format::Format<format::Full>, NonBlocking>,
-        >,
-    >,
-
-    /// The originally configured filter.
-    initial_filter: String,
-
-    /// The installed flame graph collector, if enabled.
-    #[cfg(feature = "flamegraph")]
-    flamegrapher: Option<flame::Grapher>,
-
     /// The OpenTelemetry tracer provider, if enabled.
     #[cfg(feature = "opentelemetry")]
     otel_provider: Option<opentelemetry_sdk::trace::SdkTracerProvider>,
@@ -98,7 +75,6 @@ impl Tracing {
         let use_color_stderr = config.use_color_stderr();
 
         let filter = config.filter.clone().unwrap_or_default();
-        let flame_root = &config.flamegraph;
 
         // Only show the intro for user-focused node server commands like `start`
         // Also skip the intro for regtest, since it pollutes the QA test logs
@@ -161,19 +137,14 @@ impl Tracing {
             Box::new(stdout) as BoxWrite
         };
 
-        // Builds a lossy NonBlocking logger with a default line limit of 128_000 or an explicit buffer_limit.
-        // The write method queues lines down a bounded channel with this capacity to a worker thread that writes to stdout.
-        // Increments error_counter and drops lines when the buffer is full.
-        let (non_blocking, worker_guard) = NonBlockingBuilder::default()
-            .buffered_lines_limit(config.buffer_limit.max(100))
-            .finish(writer);
+        // Queue logs for the background writer, dropping new logs when full.
+        let (non_blocking, worker_guard) = non_blocking(writer, config.buffer_limit.max(100))?;
 
-        // Construct a format subscriber with the supplied global logging filter,
-        // and optionally enable reloading.
+        // Construct a format subscriber with the supplied global logging filter.
         //
         // TODO: when fmt::Subscriber supports per-layer filtering, always enable this code
         #[cfg(not(all(feature = "tokio-console", tokio_unstable)))]
-        let (subscriber, filter_handle) = {
+        let subscriber = {
             use tracing_subscriber::FmtSubscriber;
 
             let logger = FmtSubscriber::builder()
@@ -181,35 +152,21 @@ impl Tracing {
                 .with_writer(non_blocking)
                 .with_env_filter(&filter);
 
-            // Enable reloading if that feature is selected.
-            #[cfg(feature = "filter-reload")]
-            let (filter_handle, logger) = {
-                let logger = logger.with_filter_reloading();
-
-                (Some(logger.reload_handle()), logger)
-            };
-
-            #[cfg(not(feature = "filter-reload"))]
-            let filter_handle = None;
-
             let warn_error_layer = LastWarnErrorLayer {
                 last_warn_error_sender: crate::application::LAST_WARN_ERROR_LOG_SENDER.clone(),
             };
-            let subscriber = logger
+            logger
                 .finish()
                 .with(warn_error_layer)
-                .with(ErrorLayer::default());
-
-            (subscriber, filter_handle)
+                .with(ErrorLayer::default())
         };
 
-        // Construct a tracing registry with the supplied per-layer logging filter,
-        // and disable filter reloading.
+        // Construct a tracing registry with the supplied per-layer logging filter.
         //
         // TODO: when fmt::Subscriber supports per-layer filtering,
         //       remove this registry code, and layer tokio-console on top of fmt::Subscriber
         #[cfg(all(feature = "tokio-console", tokio_unstable))]
-        let (subscriber, filter_handle) = {
+        let subscriber = {
             use tracing_subscriber::{fmt, Layer};
 
             let subscriber = tracing_subscriber::registry();
@@ -227,24 +184,10 @@ impl Tracing {
             let subscriber = subscriber.with(logger);
 
             let span_logger = ErrorLayer::default().with_filter(EnvFilter::from(&filter));
-            let subscriber = subscriber.with(span_logger);
-
-            (subscriber, None)
+            subscriber.with(span_logger)
         };
 
         // Add optional layers based on dynamic and compile-time configs
-
-        // Add a flamegraph
-        #[cfg(feature = "flamegraph")]
-        let (flamelayer, flamegrapher) = if let Some(path) = flame_root {
-            let (flamelayer, flamegrapher) = flame::layer(path);
-
-            (Some(flamelayer), Some(flamegrapher))
-        } else {
-            (None, None)
-        };
-        #[cfg(feature = "flamegraph")]
-        let subscriber = subscriber.with(flamelayer);
 
         #[cfg(feature = "journald")]
         let journaldlayer = if config.use_journald {
@@ -268,9 +211,6 @@ impl Tracing {
         #[cfg(feature = "journald")]
         let subscriber = subscriber.with(journaldlayer);
 
-        #[cfg(feature = "sentry")]
-        let subscriber = subscriber.with(crate::sentry::tracing_layer());
-
         // OpenTelemetry layer - zero overhead when config.opentelemetry_endpoint is None
         #[cfg(feature = "opentelemetry")]
         let (otel_layer, otel_provider, otel_resolved_config) = {
@@ -289,9 +229,8 @@ impl Tracing {
                     .and_then(|s| s.parse().ok())
             });
 
-            // Capture resolved values for logging
+            // Keep only non-endpoint values for status logging. URLs can contain credentials.
             let resolved_config = (
-                endpoint.clone(),
                 service_name.clone().unwrap_or_else(|| "zakura".to_string()),
                 sample_percent.unwrap_or(100),
             );
@@ -326,18 +265,6 @@ impl Tracing {
             "started tracing component",
         );
 
-        if flame_root.is_some() {
-            if cfg!(feature = "flamegraph") {
-                info!(flamegraph = ?flame_root, "installed flamegraph tracing layer");
-            } else {
-                warn!(
-                    flamegraph = ?flame_root,
-                    "unable to activate configured flamegraph: \
-                     enable the 'flamegraph' feature when compiling zakurad",
-                );
-            }
-        }
-
         if config.use_journald {
             if cfg!(feature = "journald") {
                 info!("installed journald tracing layer");
@@ -349,9 +276,6 @@ impl Tracing {
             }
         }
 
-        #[cfg(feature = "sentry")]
-        info!("installed sentry tracing layer");
-
         #[cfg(all(feature = "tokio-console", tokio_unstable))]
         info!(
             TRACING_STATIC_MAX_LEVEL = ?tracing::level_filters::STATIC_MAX_LEVEL,
@@ -362,9 +286,8 @@ impl Tracing {
         // Log OpenTelemetry status
         #[cfg(feature = "opentelemetry")]
         if otel_provider.is_some() {
-            let (ref endpoint, ref service_name, sample_percent) = otel_resolved_config;
+            let (ref service_name, sample_percent) = otel_resolved_config;
             info!(
-                ?endpoint,
                 %service_name,
                 sample_percent,
                 "installed OpenTelemetry tracing layer",
@@ -375,38 +298,12 @@ impl Tracing {
         #[cfg(not(feature = "opentelemetry"))]
         if config.opentelemetry_endpoint.is_some() {
             warn!(
-                endpoint = ?config.opentelemetry_endpoint,
                 "unable to activate OpenTelemetry tracing: \
                  enable the 'opentelemetry' feature when compiling zakurad",
             );
         }
 
-        // Write any progress reports sent by other tasks to the terminal
-        //
-        // TODO: move this to its own module?
-        #[cfg(feature = "progress-bar")]
-        if let Some(progress_bar_config) = config.progress_bar.as_ref() {
-            use howudoin::consumers::TermLine;
-            use std::time::Duration;
-
-            // Stops flickering during the initial sync.
-            const PROGRESS_BAR_DEBOUNCE: Duration = Duration::from_secs(2);
-
-            let terminal_consumer = TermLine::with_debounce(PROGRESS_BAR_DEBOUNCE);
-            howudoin::init(terminal_consumer);
-
-            info!(?progress_bar_config, "activated progress bars");
-        } else {
-            info!(
-                "set 'tracing.progress_bar =\"summary\"' in zakura.toml to activate progress bars"
-            );
-        }
-
         Ok(Self {
-            filter_handle,
-            initial_filter: filter,
-            #[cfg(feature = "flamegraph")]
-            flamegrapher,
             #[cfg(feature = "opentelemetry")]
             otel_provider,
             _guard: Some(worker_guard),
@@ -416,11 +313,6 @@ impl Tracing {
     /// Drops guard for worker thread of non-blocking logger,
     /// to flush any remaining logs when the program terminates.
     pub fn shutdown(&mut self) {
-        self.filter_handle.take();
-
-        #[cfg(feature = "flamegraph")]
-        self.flamegrapher.take();
-
         #[cfg(feature = "opentelemetry")]
         if let Some(provider) = self.otel_provider.take() {
             if let Err(e) = provider.shutdown() {
@@ -429,44 +321,6 @@ impl Tracing {
         }
 
         self._guard.take();
-    }
-
-    /// Return the currently-active tracing filter.
-    pub fn filter(&self) -> String {
-        if let Some(filter_handle) = self.filter_handle.as_ref() {
-            filter_handle
-                .with_current(|filter| filter.to_string())
-                .expect("the subscriber is not dropped before the component is")
-        } else {
-            self.initial_filter.clone()
-        }
-    }
-
-    /// Reload the currently-active filter with the supplied value.
-    ///
-    /// This can be used to provide a dynamic tracing filter endpoint.
-    pub fn reload_filter(&self, filter: impl Into<EnvFilter>) {
-        let filter = filter.into();
-
-        if let Some(filter_handle) = self.filter_handle.as_ref() {
-            tracing::info!(
-                ?filter,
-                TRACING_STATIC_MAX_LEVEL = ?tracing::level_filters::STATIC_MAX_LEVEL,
-                LOG_STATIC_MAX_LEVEL = ?log::STATIC_MAX_LEVEL,
-                "reloading tracing filter",
-            );
-
-            filter_handle
-                .reload(filter)
-                .expect("the subscriber is not dropped before the component is");
-        } else {
-            tracing::warn!(
-                ?filter,
-                TRACING_STATIC_MAX_LEVEL = ?tracing::level_filters::STATIC_MAX_LEVEL,
-                LOG_STATIC_MAX_LEVEL = ?log::STATIC_MAX_LEVEL,
-                "attempted to reload tracing filter, but filter reloading is disabled",
-            );
-        }
     }
 }
 
@@ -483,31 +337,6 @@ impl<A: abscissa_core::Application> Component<A> for Tracing {
 
     fn version(&self) -> abscissa_core::Version {
         build_version()
-    }
-
-    fn before_shutdown(&self, _kind: Shutdown) -> Result<(), FrameworkError> {
-        #[cfg(feature = "flamegraph")]
-        if let Some(ref grapher) = self.flamegrapher {
-            use abscissa_core::FrameworkErrorKind;
-
-            info!("writing flamegraph");
-
-            grapher
-                .write_flamegraph()
-                .map_err(|e| FrameworkErrorKind::ComponentError.context(e))?
-        }
-
-        #[cfg(feature = "progress-bar")]
-        howudoin::disable();
-
-        Ok(())
-    }
-}
-
-impl Drop for Tracing {
-    fn drop(&mut self) {
-        #[cfg(feature = "progress-bar")]
-        howudoin::disable();
     }
 }
 

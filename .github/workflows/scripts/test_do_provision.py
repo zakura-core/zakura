@@ -60,6 +60,53 @@ def args(*extra):
 
 
 class Selection(unittest.TestCase):
+    def test_vct_handoff_never_substitutes_a_closer_ordinary_snapshot(self):
+        ordinary = snapshot(height=99, prefix="zakura-pr-state-mainnet-", id="ordinary")
+        ordinary["name"] = ordinary["name"].replace("-h", "-finalized-h")
+        approach = snapshot(height=90)
+        self.assertEqual(
+            p.select_state([ordinary, approach], "nyc1", "mainnet", "vct-handoff", 100),
+            approach,
+        )
+        self.assertIsNone(
+            p.select_state([ordinary], "nyc1", "mainnet", "vct-handoff", 100)
+        )
+        self.assertIsNone(
+            p.select_state([ordinary, approach], "nyc1", "mainnet", "vct-handoff", 100, "ordinary")
+        )
+
+    def test_vct_handoff_requires_eligible_regional_approach(self):
+        for state in (snapshot(height=100), snapshot(region="sfo3")):
+            for selected_id in ("", "state"):
+                with self.subTest(state=state, selected_id=selected_id):
+                    self.assertIsNone(
+                        p.select_state([state], "nyc1", "mainnet", "vct-handoff", 100, selected_id)
+                    )
+        for network, checkpoint in (("testnet", 100), ("mainnet", None), ("mainnet", 0)):
+            with self.assertRaises(ValueError):
+                p.select_state([snapshot()], "nyc1", network, "vct-handoff", checkpoint)
+
+    def test_vct_validation_fixture_requires_exact_id(self):
+        validation = snapshot(prefix="zakura-pr-validation-approach-mainnet-")
+        self.assertIsNone(
+            p.select_state([validation], "nyc1", "mainnet", "vct-handoff", 100)
+        )
+        self.assertEqual(
+            p.select_state([validation], "nyc1", "mainnet", "vct-handoff", 100, "state"),
+            validation,
+        )
+
+    def test_vct_handoff_uses_fallback_region_with_dedicated_fixture(self):
+        request = args("--network", "mainnet", "--mode", "vct-handoff", "--checkpoint", "100")
+        ordinary = snapshot(prefix="zakura-pr-state-mainnet-", id="ordinary")
+        plans = p.plans(
+            request,
+            [image("nyc1"), image("sfo3")],
+            [ordinary, snapshot("sfo3")],
+            [size("c-8", ["nyc1", "sfo3"])],
+        )
+        self.assertEqual([plan["region"] for plan in plans], ["sfo3"])
+
     def test_nyc3_incident_uses_shared_cpu_only_with_explicit_policy(self):
         sizes = [
             size("c-8"),

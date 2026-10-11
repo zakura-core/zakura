@@ -116,8 +116,12 @@ const LEGACY_GOSSIP_DUPLICATE_COOLDOWN: Duration = Duration::from_secs(30);
 const LEGACY_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const SOURCE_INVENTORY_MISSING_RETRIES: usize = 8;
 const SOURCE_INVENTORY_MISSING_RETRY_DELAY: Duration = Duration::from_millis(500);
-/// Distinct peers one request tries: the primary and up to two fallbacks.
-const MAX_LEGACY_REQUEST_ATTEMPTS: usize = 3;
+/// Distinct peers a block or transaction request tries: the primary and up to
+/// two fallbacks, since a missing answer is a reason to look elsewhere.
+const LEGACY_INVENTORY_REQUEST_ATTEMPTS: usize = 3;
+/// Distinct peers any other request tries. Empty discovery and mempool answers
+/// are normal at the tip, so these keep a single fallback.
+const LEGACY_REQUEST_ATTEMPTS: usize = 2;
 const LEGACY_REQUEST_READY_TIMEOUT: Duration = Duration::from_secs(10);
 /// Reserve half of each connection's stream-open budget for native ordered
 /// streams, reconnects, and other request clients.
@@ -486,6 +490,18 @@ pub(super) enum LegacyRequestKind {
 }
 
 impl LegacyRequestKind {
+    /// Distinct peers one request of this kind tries before giving up.
+    fn max_attempts(self) -> usize {
+        match self {
+            Self::Blocks | Self::Transactions => LEGACY_INVENTORY_REQUEST_ATTEMPTS,
+            Self::FindBlocks
+            | Self::FindHeaders
+            | Self::MempoolTransactionIds
+            | Self::Ping
+            | Self::PushTransaction => LEGACY_REQUEST_ATTEMPTS,
+        }
+    }
+
     fn command(self) -> &'static str {
         match self {
             LegacyRequestKind::Blocks => "BlocksByHash",
@@ -2159,9 +2175,14 @@ impl ZakuraRequestClient {
         };
 
         let handles = self.ready_handles().await?;
-        let candidates = request_candidates(&handles, preferred.as_ref(), &mut OsRng);
-
         let request_kind = frame.kind();
+        let candidates = request_candidates(
+            &handles,
+            preferred.as_ref(),
+            request_kind.max_attempts(),
+            &mut OsRng,
+        );
+
         let mut missing_response = None;
         let mut last_error = None;
         for handle in &candidates {
@@ -2353,13 +2374,14 @@ fn legacy_request_stream_rate(stream_open_rate_per_second: u32) -> u32 {
 }
 
 /// Orders the ready peers for one request: the preferred peer first, then the
-/// others in random order, capped at [`MAX_LEGACY_REQUEST_ATTEMPTS`].
+/// others in random order, capped at `attempts`.
 ///
 /// A fresh random order keeps a few unhelpful peers from always being tried
 /// first, and unlike a shared rotation counter, other traffic cannot steer it.
 fn request_candidates<R: Rng + ?Sized>(
     handles: &[ZakuraPeerHandle],
     preferred: Option<&ZakuraPeerId>,
+    attempts: usize,
     rng: &mut R,
 ) -> Vec<ZakuraPeerHandle> {
     let (mut candidates, mut others): (Vec<_>, Vec<_>) = handles
@@ -2368,7 +2390,7 @@ fn request_candidates<R: Rng + ?Sized>(
         .partition(|handle| Some(handle.peer_id()) == preferred);
     others.shuffle(rng);
     candidates.extend(others);
-    candidates.truncate(MAX_LEGACY_REQUEST_ATTEMPTS);
+    candidates.truncate(attempts);
     candidates
 }
 
@@ -3487,6 +3509,27 @@ mod tests {
         }
     }
 
+    /// Answers every request with `Nil` and counts the requests it served.
+    #[derive(Clone, Debug)]
+    struct CountingNilResponder {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl Service<Request> for CountingNilResponder {
+        type Response = Response;
+        type Error = BoxError;
+        type Future = std::future::Ready<Result<Response, BoxError>>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, _request: Request) -> Self::Future {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            std::future::ready(Ok(Response::Nil))
+        }
+    }
+
     #[derive(Clone, Debug)]
     struct SlowRequestThenRecorder {
         release: tokio::sync::watch::Receiver<bool>,
@@ -4563,8 +4606,13 @@ mod tests {
 
         let mut first_seen = HashSet::new();
         for _ in 0..64 {
-            let candidates = ids(request_candidates(&handles, Some(&peer(2)), &mut rng));
-            assert_eq!(candidates.len(), MAX_LEGACY_REQUEST_ATTEMPTS);
+            let candidates = ids(request_candidates(
+                &handles,
+                Some(&peer(2)),
+                LEGACY_INVENTORY_REQUEST_ATTEMPTS,
+                &mut rng,
+            ));
+            assert_eq!(candidates.len(), LEGACY_INVENTORY_REQUEST_ATTEMPTS);
             assert_eq!(candidates[0], peer(2), "the preferred peer goes first");
             assert_eq!(
                 candidates.iter().collect::<HashSet<_>>().len(),
@@ -4572,8 +4620,13 @@ mod tests {
                 "candidates are distinct"
             );
 
-            let candidates = ids(request_candidates(&handles, Some(&unknown), &mut rng));
-            assert_eq!(candidates.len(), MAX_LEGACY_REQUEST_ATTEMPTS);
+            let candidates = ids(request_candidates(
+                &handles,
+                Some(&unknown),
+                LEGACY_INVENTORY_REQUEST_ATTEMPTS,
+                &mut rng,
+            ));
+            assert_eq!(candidates.len(), LEGACY_INVENTORY_REQUEST_ATTEMPTS);
             first_seen.insert(candidates[0].clone());
         }
         assert_eq!(
@@ -4583,7 +4636,12 @@ mod tests {
         );
 
         assert_eq!(
-            ids(request_candidates(&handles[..1], Some(&peer(0)), &mut rng)),
+            ids(request_candidates(
+                &handles[..1],
+                Some(&peer(0)),
+                LEGACY_INVENTORY_REQUEST_ATTEMPTS,
+                &mut rng
+            )),
             vec![peer(0)]
         );
     }
@@ -4655,6 +4713,67 @@ mod tests {
         assert!(
             !peer_set.has_changed()?,
             "declining peers are routed around, not disconnected"
+        );
+
+        for responder in responders {
+            responder.shutdown().await;
+        }
+        requester.shutdown().await;
+        Ok(())
+    }
+
+    /// An empty discovery answer is normal at the tip, so it keeps a single
+    /// fallback, while a block request that finds nothing tries three peers.
+    #[tokio::test]
+    async fn empty_discovery_answers_keep_one_fallback() -> Result<(), BoxError> {
+        let _guard = zakura_test::init();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut responders = Vec::new();
+        for seed in [80, 81, 82] {
+            let calls = calls.clone();
+            responders.push(
+                ZakuraTestNode::builder(seed)
+                    .service_from_supervisor(move |supervisor| {
+                        Arc::new(LegacyGossipSink::spawn(
+                            CountingNilResponder { calls },
+                            supervisor,
+                        ))
+                    })
+                    .spawn()
+                    .await?,
+            );
+        }
+        let requester = ZakuraTestNode::builder(83)
+            .max_connections_per_ip(8)
+            .spawn()
+            .await?;
+        for responder in &responders {
+            requester
+                .connect_native(responder, TEST_NET_TIMEOUT)
+                .await?;
+        }
+        wait_registered_count(&requester, 3).await?;
+        let adapter = LegacyRequestAdapter::new(requester.supervisor());
+
+        let response = adapter
+            .request_from_source(
+                Request::FindBlocks {
+                    known_blocks: vec![block_hash(1)],
+                    stop: None,
+                },
+                None,
+            )
+            .await?;
+        assert!(all_inventory_missing(&response), "got {response:?}");
+        assert_eq!(calls.swap(0, Ordering::SeqCst), LEGACY_REQUEST_ATTEMPTS);
+
+        assert!(adapter
+            .request_from_source(Request::BlocksByHash(IndexSet::from([block_hash(2)])), None)
+            .await
+            .is_err());
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            LEGACY_INVENTORY_REQUEST_ATTEMPTS
         );
 
         for responder in responders {

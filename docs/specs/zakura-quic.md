@@ -155,9 +155,15 @@ at fork tag `zakura-iroh-v1.1.0-rc.1`, and it keeps their MIT/Apache-2.0 notices
 ## 5. QUIC wire profile
 
 - **WIRE-1.** QUIC version 1 (`0x00000001`), using `quinn-proto`'s version list.
-- **WIRE-2.** Production ALPN is `p2p-v2/3`. The server MUST offer ALPNs in the
-  order the acceptor lists them, not sorted. A handshake that negotiates no
-  shared ALPN MUST fail with TLS alert `no_application_protocol`.
+- **WIRE-2.** Production ALPNs are `p2p-v2/N`, one for each Zakura protocol
+  version N this release speaks natively, from
+  `ZAKURA_PROTOCOL_VERSION_MIN_NATIVE` to `ZAKURA_PROTOCOL_VERSION_CURRENT`
+  (both 3 in this release). A dialer MUST offer every supported ALPN, newest
+  first. The server MUST offer ALPNs in the order the acceptor lists them, not
+  sorted, and rustls picks the server's first ALPN that the client also
+  offered. The negotiated ALPN fixes the connection's Zakura protocol version.
+  A handshake that negotiates no shared ALPN MUST fail with TLS alert
+  `no_application_protocol`.
 - **WIRE-5.** `grease_quic_bit` MUST be `false`.
 - **WIRE-6.** Datagrams MUST be off: `datagram_receive_buffer_size(None)` and
   `datagram_send_buffer_size(0)`. No `max_datagram_frame_size` parameter is sent.
@@ -368,7 +374,7 @@ work. Stage 2 runs after TLS proves the `NodeId` and is today's Zakura logic.
 
 ## 8. Dialing
 
-- **DIAL-1.** `connect(NodeAddr, alpn)` MUST refuse a `NodeId` equal to the
+- **DIAL-1.** `connect(NodeAddr, alpns)` MUST refuse a `NodeId` equal to the
   local one, before sending any packet.
 - **DIAL-2.** `connect` MUST canonicalize, deduplicate and filter the addresses.
   It keeps only addresses whose family has a bound socket. If none remain, it
@@ -564,7 +570,9 @@ The public surface of `zakura-quic`. Changing it is a semver change of the crate
   - `bind(secret, &QuicBindConfig, &QuicConfig) -> Result<QuicEndpoint, BindError>`;
   - `local_id()`, `local_addrs()`, `socket_stats()`, `network_changes()` and `config()`;
   - `set_conn_observer(ConnObserver)` for OBS-3;
-  - `connect(NodeAddr, alpn: &[u8]) -> Result<Conn, ConnectError>`;
+  - `connect(NodeAddr, alpns: &[&[u8]]) -> Result<Conn, ConnectError>`, which
+    offers `alpns` in order; an empty list fails with
+    `ConnectFailed(AlpnMismatch)`;
   - `serve(impl Acceptor) -> Result<(), BindError>`, which starts admission on
     every endpoint task;
   - `shutdown(&self)`. `QuicEndpoint` is a cheap clone.
@@ -684,6 +692,11 @@ this release tolerates, and keep each hard change explicit.
   `control_version`. This release accepts a `control_version` at or above its
   own, parses its known prefix and ignores the rest, up to the control payload
   cap. The legacy TCP upgrade prelude stays strict.
+- **COMPAT-12.** A release that makes a hard break SHOULD keep the previous
+  protocol version in its supported range (WIRE-2) while it can still speak
+  it. Releases with overlapping ranges then negotiate the newest shared
+  version, and an upgrade doesn't split the native network. Only peers with
+  no shared version fall back under COMPAT-7.
 
 ## 14. Security
 
@@ -877,10 +890,10 @@ Added:
   drained event.
 - **OBS-12.** Controller, driver and socket stats.
 - **QP-1 to QP-4.** The `quinn-proto` dependency policy.
-- **COMPAT-8 to COMPAT-11.** The extensibility rules (§13.1): hard breaks
+- **COMPAT-8 to COMPAT-12.** The extensibility rules (§13.1): hard breaks
   bump the ALPN, stream versions are negotiated, node records carry a signed
-  extension area and skip undecodable bodies, and control fields are
-  append-only.
+  extension area and skip undecodable bodies, control fields are
+  append-only, and releases overlap their supported protocol versions.
 
 Changed:
 
@@ -894,6 +907,8 @@ Changed:
   and R.
 - **WIRE-1, WIRE-9, TLS-11.** Name `quinn-proto`.
 - **WIRE-2.** The ALPN moves to `p2p-v2/3`, a wire break under COMPAT-4.
+  Dialers offer every supported `p2p-v2/N`, and the negotiated ALPN selects
+  the Zakura protocol version.
 - **WIRE-13.** Lists the surviving wire rules.
 - **SOCK-1, SOCK-3, SOCK-6, SOCK-8, SOCK-9, SOCK-10, SOCK-12.** Describe the
   owned socket layer and driver. SOCK-12 calls `local_address_changed` on each
@@ -909,9 +924,10 @@ Changed:
 - **OBS-1.** Drops `zakura.quic.paths.peer_opened` and adds the socket, GSO,
   GRO and queue counters.
 - **OBS-3.** Replaces `paths_open` with `bytes_in_flight` and
-  `send_blocked_micros`.
+  `send_blocked_micros`, and adds the `conn` and `direction` join columns.
 - **OBS-4.** `ConnStats` holds connection, congestion and driver stats.
-- **API-2, API-4, API-5, API-6, API-7.** `network_changes()`; an async
+- **API-2, API-4, API-5, API-6, API-7.** `connect` takes a list of ALPNs;
+  `network_changes()`; an async
   `stats()`; the crate's own stream and error types; `quinn-proto` error types;
   shutdown waits for drain instead of `wait_idle`.
 - **COMPAT-4.** Names `quinn-proto` codepoints.

@@ -220,3 +220,138 @@ fn status_refused_at_capacity_is_replayed_when_a_slot_frees() {
     reactor.retire_peer_work(&fillers[0], HeaderRequestTerminal::Busy);
     expect_locator_query(&mut actions, &refused, target);
 }
+
+#[test]
+fn applied_target_is_suppressed_before_replaying_alternates() {
+    let (mut reactor, mut actions, snapshot) = replay_reactor();
+    let (owner, _outbound) = connect(&mut reactor, 0x71);
+    let (alternate, _alternate_outbound) = connect(&mut reactor, 0x72);
+    let (source, owner_scope, _) = seed_applying_request(&mut reactor, &snapshot, owner.clone(), 0);
+    let status = reactor
+        .peer_work_queue
+        .active(&owner)
+        .unwrap()
+        .target
+        .status
+        .clone();
+    reactor.handle_wire_message(alternate, 0, HeaderSyncMessage::Status(status));
+    reactor.handle_event(Event::HeaderTargetAdmissionReady {
+        peer: owner,
+        source,
+        owner: owner_scope,
+        result: HeaderTargetAdmissionResult::Applied,
+    });
+    assert!(
+        actions.try_recv().is_err(),
+        "a completed target must never dispatch an alternate locator"
+    );
+}
+
+#[test]
+fn resource_stall_waits_before_replaying_an_alternate() {
+    let (mut reactor, mut actions, snapshot) = replay_reactor();
+    let (owner, _outbound) = connect(&mut reactor, 0x71);
+    let (alternate, _alternate_outbound) = connect(&mut reactor, 0x72);
+    let (source, owner_scope, branch) =
+        seed_applying_request(&mut reactor, &snapshot, owner.clone(), 0);
+    let status = reactor
+        .peer_work_queue
+        .active(&owner)
+        .unwrap()
+        .target
+        .status
+        .clone();
+    reactor.handle_wire_message(
+        alternate.clone(),
+        0,
+        HeaderSyncMessage::Status(status.clone()),
+    );
+    reactor.handle_event(Event::HeaderTargetAdmissionReady {
+        peer: owner,
+        source,
+        owner: owner_scope,
+        result: HeaderTargetAdmissionResult::ResourceStalled(
+            zakura_header_chain::CommittedStallReceipt {
+                state_version: snapshot.state_version,
+                alarm_changed: true,
+                attempted_branch: Some(branch),
+            },
+        ),
+    });
+    reactor.handle_wire_message(
+        alternate.clone(),
+        0,
+        HeaderSyncMessage::Status(status.clone()),
+    );
+    assert!(
+        actions.try_recv().is_err(),
+        "an unchanged local resource stall must not cascade to another supplier"
+    );
+    let mut newer = snapshot;
+    newer.state_version = newer.state_version.checked_next().unwrap();
+    reactor.observe_latest_committed_snapshot(newer);
+    expect_locator_query(&mut actions, &alternate, status.selected_tip_hash);
+}
+
+#[test]
+fn local_retirement_does_not_permanently_suppress_cached_status() {
+    let (mut reactor, mut actions, snapshot) = replay_reactor();
+    let (first, _first_outbound) = connect(&mut reactor, 0x71);
+    let (second, _second_outbound) = connect(&mut reactor, 0x72);
+    let target = block::Hash([0x42; 32]);
+    let status = status_for(&snapshot, target);
+    reactor.handle_wire_message(first.clone(), 0, HeaderSyncMessage::Status(status.clone()));
+    expect_locator_query(&mut actions, &first, target);
+    reactor.handle_wire_message(second.clone(), 0, HeaderSyncMessage::Status(status));
+    reactor.retire_peer_work(&first, HeaderRequestTerminal::LocalError);
+    expect_locator_query(&mut actions, &second, target);
+    reactor.retire_peer_work(&second, HeaderRequestTerminal::Busy);
+    expect_locator_query(&mut actions, &first, target);
+}
+
+#[test]
+fn direct_completion_release_replays_cached_alternate() {
+    let (mut reactor, mut actions, snapshot) = replay_reactor();
+    let (owner, _outbound) = connect(&mut reactor, 0x71);
+    let (alternate, _alternate_outbound) = connect(&mut reactor, 0x72);
+    seed_applying_request(&mut reactor, &snapshot, owner.clone(), 0);
+    let status = reactor
+        .peer_work_queue
+        .active(&owner)
+        .unwrap()
+        .target
+        .status
+        .clone();
+    let target = status.selected_tip_hash;
+    reactor.handle_wire_message(alternate.clone(), 0, HeaderSyncMessage::Status(status));
+    reactor.handle_port_completion(PortOperationResult::Completed(Box::new(move |reactor| {
+        reactor.retire_peer_work_without_replay(&owner, HeaderRequestTerminal::LocalError);
+    })));
+    expect_locator_query(&mut actions, &alternate, target);
+}
+
+#[test]
+fn replay_accounts_for_pending_locator_headroom() {
+    let (mut reactor, mut actions, snapshot) = replay_reactor();
+    let (owner, _outbound) = connect(&mut reactor, 0x71);
+    seed_applying_request(&mut reactor, &snapshot, owner.clone(), 0);
+    reactor
+        .peer_work_queue
+        .set_capacity_for_test(&owner, 3999, 0);
+    let mut outbound = Vec::new();
+    for byte in [0x72, 0x73] {
+        let (peer, receiver) = connect(&mut reactor, byte);
+        outbound.push(receiver);
+        reactor.peer_state.get_mut(&peer).unwrap().last_status =
+            Some(status_for(&snapshot, block::Hash([byte; 32])));
+    }
+    reactor.replay_retained_statuses(&HashSet::from([owner]));
+    assert!(matches!(
+        actions.try_recv(),
+        Ok(HeaderPortOperation::QueryHeaderLocator { .. })
+    ));
+    assert!(
+        actions.try_recv().is_err(),
+        "one remaining header slot must not launch two locator reads"
+    );
+}

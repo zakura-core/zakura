@@ -1,6 +1,6 @@
 use std::{
     cmp::Ordering,
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{
         atomic::{AtomicUsize, Ordering as AtomicOrdering},
         Arc, Mutex,
@@ -440,6 +440,7 @@ pub(in crate::zakura::header_sync) enum QueueWorkResult {
 #[derive(Clone, Debug, Default)]
 pub(in crate::zakura::header_sync) struct PeerWorkQueue {
     work_by_peer: HashMap<ZakuraPeerId, PeerWorkState>,
+    released_peers: HashSet<ZakuraPeerId>,
     repair_episodes: HashMap<HeaderSyncWorkOwner, zakura_header_chain::AuxiliaryRequirementEpisode>,
     budget: HeaderChunkBudget,
     request_reservations: HashMap<ZakuraPeerId, HeaderCountReservation>,
@@ -447,9 +448,28 @@ pub(in crate::zakura::header_sync) struct PeerWorkQueue {
 }
 
 impl PeerWorkQueue {
-    #[cfg(any(test, feature = "header-fuzz"))]
     pub(in crate::zakura::header_sync) fn len(&self) -> usize {
         self.work_by_peer.len()
+    }
+
+    /// Drain peer slots released since the last scheduler pass.
+    pub(in crate::zakura::header_sync) fn take_released_peers(&mut self) -> HashSet<ZakuraPeerId> {
+        std::mem::take(&mut self.released_peers)
+    }
+
+    /// Header budget provisionally needed by outstanding locator work.
+    pub(in crate::zakura::header_sync) fn pending_locator_header_count(&self) -> usize {
+        self.work_by_peer
+            .values()
+            .filter_map(|work| match work {
+                PeerWorkState::AwaitingLocator { target, .. } => Some(
+                    usize::try_from(target.status.max_headers_per_response)
+                        .unwrap_or(usize::MAX)
+                        .min(MAX_HEADER_CHUNK_RESERVATION_V1),
+                ),
+                PeerWorkState::Active(_) => None,
+            })
+            .fold(0usize, usize::saturating_add)
     }
 
     /// Retire locator work captured from an obsolete committed snapshot.
@@ -693,7 +713,11 @@ impl PeerWorkQueue {
     ) -> Option<ActiveHeaderRequest> {
         self.request_reservations.remove(peer);
         self.staged_capacity.remove(peer);
-        match self.work_by_peer.remove(peer) {
+        let removed = self.work_by_peer.remove(peer);
+        if removed.is_some() {
+            self.released_peers.insert(peer.clone());
+        }
+        match removed {
             Some(PeerWorkState::Active(request)) => {
                 self.repair_episodes.remove(&request.owner);
                 Some(*request)
@@ -759,7 +783,11 @@ impl PeerWorkQueue {
     fn remove_all(&mut self, peer: &ZakuraPeerId) {
         self.request_reservations.remove(peer);
         self.staged_capacity.remove(peer);
-        if let Some(PeerWorkState::Active(request)) = self.work_by_peer.remove(peer) {
+        let removed = self.work_by_peer.remove(peer);
+        if removed.is_some() {
+            self.released_peers.insert(peer.clone());
+        }
+        if let Some(PeerWorkState::Active(request)) = removed {
             self.repair_episodes.remove(&request.owner);
         }
     }

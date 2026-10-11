@@ -83,27 +83,27 @@ pub struct Config {
     pub block_gossip_peer_ips: Vec<IpAddr>,
 
     /// Delay before the first `zcashd` spawn attempt.
-    #[serde(with = "humantime_serde")]
+    #[serde(with = "zakura_chain::serialization::serde_adapters::duration")]
     pub startup_delay: Duration,
 
     /// Delay between supervisor restart attempts.
     ///
     /// This is the base delay for exponential restart backoff.
-    #[serde(with = "humantime_serde")]
+    #[serde(with = "zakura_chain::serialization::serde_adapters::duration")]
     pub restart_backoff: Duration,
 
     /// Maximum delay between supervisor restart attempts.
     ///
     /// This caps exponential restart backoff while retries continue indefinitely.
-    #[serde(with = "humantime_serde")]
+    #[serde(with = "zakura_chain::serialization::serde_adapters::duration")]
     pub restart_backoff_max: Duration,
 
     /// Child uptime that resets the supervisor's consecutive restart count.
-    #[serde(with = "humantime_serde")]
+    #[serde(with = "zakura_chain::serialization::serde_adapters::duration")]
     pub restart_reset_after: Duration,
 
     /// Grace period for a clean shutdown after sending SIGTERM.
-    #[serde(with = "humantime_serde")]
+    #[serde(with = "zakura_chain::serialization::serde_adapters::duration")]
     pub shutdown_grace_period: Duration,
 }
 

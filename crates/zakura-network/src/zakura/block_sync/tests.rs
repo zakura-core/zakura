@@ -791,6 +791,88 @@ async fn operator_body_retry_is_exact_deduplicated_and_requires_a_supplier() {
 }
 
 #[tokio::test]
+async fn availability_regression_supplier_discovery_retries_after_backpressure() {
+    let mut capture =
+        TraceCapture::for_test("supplier_discovery_retries_after_action_backpressure")
+            .expect("trace capture initializes");
+    let header = zakura_header_chain::Frontier::new(block::Height(10), block::Hash([0x55; 32]));
+    let snapshot = alarmed_committed_snapshot(header);
+    let previous = snapshot.alarms.header_best_body_unavailable.unwrap();
+    let (_snapshot_tx, snapshot_rx) = watch::channel(Some(committed_view(snapshot, 0)));
+    let config = ZakuraBlockSyncConfig {
+        request_timeout: Duration::from_millis(50),
+        ..ZakuraBlockSyncConfig::default()
+    };
+    let mut startup = BlockSyncStartup::inert(config.clone());
+    startup.frontiers = BlockSyncFrontiers {
+        finalized_height: block::Height(9),
+        verified_block_tip: block::Height(9),
+        verified_block_hash: block::Hash([0x50; 32]),
+    };
+    startup.best_header_tip = (header.height, header.hash);
+    startup.committed_views = Some(snapshot_rx);
+    startup.trace = ZakuraTrace::new(capture.tracer(), "01");
+    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let wiring = handle.routine_wiring.as_ref().unwrap();
+    while wiring.actions.capacity() > 0 {
+        wiring
+            .actions
+            .try_send(BlockSyncAction::Misbehavior {
+                peer: peer(0xfe),
+                reason: BlockSyncMisbehavior::InvalidBlock,
+            })
+            .unwrap();
+    }
+    let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
+    let (_supplier, _inbound, _outbound) = connect_peer_with_status(
+        &service,
+        &mut actions,
+        0x56,
+        header.height,
+        header.hash,
+        1,
+        MAX_BS_RESPONSE_BYTES,
+    )
+    .await;
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if capture.reader().is_ok_and(|reader| {
+                reader.table("block_sync").rows().iter().any(|row| {
+                    row.get("kind").and_then(|kind| kind.as_str())
+                        == Some("restart_body_availability")
+                })
+            }) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the supplier-discovery action is attempted while the queue is full");
+    capture.flush().await;
+    assert_eq!(wiring.actions.capacity(), 0);
+
+    let discovery = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            match actions.recv().await.unwrap() {
+                BlockSyncAction::RestartBodyAvailability { discovery, .. } => break discovery,
+                BlockSyncAction::Misbehavior { .. } | BlockSyncAction::QueryNeededBlocks { .. } => {
+                }
+                action => panic!("unexpected action while draining backpressure: {action:?}"),
+            }
+        }
+    })
+    .await
+    .expect("discovery retries after capacity returns without a second status");
+    assert_eq!(discovery.hash, header.hash);
+    assert_eq!(discovery.availability.started_at, previous.started_at);
+    assert_eq!(discovery.availability.attempts, previous.attempts);
+    assert!(discovery.availability.alarmed);
+    reactor_task.abort();
+}
+
+#[tokio::test]
 async fn newly_eligible_supplier_preserves_persistent_body_alarm_once() {
     let header = zakura_header_chain::Frontier::new(block::Height(10), block::Hash([0x55; 32]));
     let snapshot = alarmed_committed_snapshot(header);
@@ -1097,6 +1179,12 @@ async fn drain_parent_first_actions(
                 ..
             } => {}
             BlockSyncAction::QueryNeededBlocks { .. } => {}
+            BlockSyncAction::RecordBodyUnavailable { failure, .. } => {
+                assert_eq!(
+                    failure.kind,
+                    zakura_header_chain::TransientBodyFailureKind::NoBindingBody
+                );
+            }
             action => panic!("unexpected action while draining body responses: {action:?}"),
         }
     }
@@ -11194,6 +11282,37 @@ async fn reactor_fuzzes_arrival_order_across_fork_parent_first() {
                 .expect("fork body queues");
             drain_parent_first_actions(&mut actions, &mut submitted_tip, Some(&new_blocks)).await;
         }
+        // A wrong-header delivery retires that exact attempt into retry accounting.
+        // A later valid frame is accepted only after a fresh request owns its height.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while submitted_tip < block::Height(3) {
+                let frame = outbound_rx
+                    .recv()
+                    .await
+                    .expect("the peer stream stays open");
+                if let BlockSyncMessage::GetBlocks {
+                    start_height,
+                    count,
+                } = BlockSyncMessage::decode_frame(frame).expect("retry frame decodes")
+                {
+                    for height in start_height.0..start_height.0 + count {
+                        let index = usize::try_from(height - 1).expect("test height fits usize");
+                        inbound_tx
+                            .send(
+                                BlockSyncMessage::Block(new_blocks[index].clone())
+                                    .encode_frame()
+                                    .expect("retried fork body encodes"),
+                            )
+                            .await
+                            .expect("retried fork body queues");
+                    }
+                    drain_parent_first_actions(&mut actions, &mut submitted_tip, Some(&new_blocks))
+                        .await;
+                }
+            }
+        })
+        .await
+        .expect("bounded retry preserves parent-first fork progress");
         assert_eq!(
             submitted_tip,
             block::Height(3),
@@ -11370,6 +11489,12 @@ async fn reactor_competing_fork_download_switches_to_current_header_hashes() {
                 break;
             }
             BlockSyncAction::QueryNeededBlocks { .. } => {}
+            BlockSyncAction::RecordBodyUnavailable { failure, .. } => {
+                assert_eq!(
+                    failure.kind,
+                    zakura_header_chain::TransientBodyFailureKind::NoBindingBody
+                );
+            }
             action => panic!("unexpected action before stale body rejection: {action:?}"),
         }
     }
@@ -11808,6 +11933,12 @@ async fn reactor_rejects_block_hash_mismatch_without_hard_drop_for_size_mismatch
                 break;
             }
             BlockSyncAction::QueryNeededBlocks { .. } => {}
+            BlockSyncAction::RecordBodyUnavailable { failure, .. } => {
+                assert_eq!(
+                    failure.kind,
+                    zakura_header_chain::TransientBodyFailureKind::NoBindingBody
+                );
+            }
             action => panic!("unexpected action before invalid-block report: {action:?}"),
         }
     }

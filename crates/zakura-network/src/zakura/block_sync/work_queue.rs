@@ -747,6 +747,40 @@ impl WorkQueue {
         outcome
     }
 
+    /// Return a rejected received attempt after the sequencer installed its retry gate.
+    /// Receipt already released the reservation; neither replacement owners nor credits change.
+    pub(super) fn return_rejected_received_for_owner(
+        &self,
+        owner: zakura_header_chain::BodyWorkOwner,
+        height: block::Height,
+        hash: block::Hash,
+    ) -> bool {
+        let mut inner = self.lock();
+        let Some(item) = inner.in_flight.get(&height) else {
+            return false;
+        };
+        if height <= inner.floor
+            || item.owner != Some(owner)
+            || item.hash != hash
+            || item.budget != BlockBudgetLedger::Released
+            || item.provisional
+        {
+            return false;
+        }
+        let mut item = inner
+            .in_flight
+            .remove(&height)
+            .expect("the exact received owner was checked under this lock");
+        item.owner = None;
+        if let Some(estimate) = item.retry_estimated_bytes.take() {
+            item.estimated_bytes = estimate.max(item.observed_bytes);
+        }
+        inner.pending.insert(height, item);
+        drop(inner);
+        self.available.notify_waiters();
+        true
+    }
+
     /// Return an exact received attempt without releasing its request credit twice.
     /// Waiting for verified progress prevents repeated downloads under memory pressure.
     pub(super) fn defer_received_for_owner(

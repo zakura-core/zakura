@@ -223,6 +223,7 @@ pub fn spawn_block_sync_reactor(
         ACTION_SEND_TIMEOUT,
         startup.trace.clone(),
     )
+    .with_committed_views(startup.committed_views.clone())
     .with_initial_state_version(initial_state_version)
     .with_retained_body_limit(startup.config.effective_max_reorder_lookahead_bytes());
     tokio::spawn(sequencer_task.run());
@@ -540,6 +541,7 @@ impl BlockSyncReactor {
                     }
                 }
                 _ = metrics_ticks.tick() => {
+                    self.restart_body_alarm_for_new_supplier();
                     self.query_needed_blocks().await;
                     self.publish_metrics();
                     self.refresh_throughput();

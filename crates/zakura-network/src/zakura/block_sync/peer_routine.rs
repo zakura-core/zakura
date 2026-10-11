@@ -844,6 +844,8 @@ impl PeerRoutine {
         // routine again.
         let now = Instant::now();
         self.retry_avoid.retain(|_, until| *until > now);
+        self.registry
+            .publish_retry_avoid(&self.peer, self.generation, &self.retry_avoid);
         let mut retry_filter_deadline = None;
         // Count requests issued this pass and capture *why* the fill loop stops, so a
         // trace can attribute carrier idle ("bubble") time to a cause. The loop yields a
@@ -881,7 +883,8 @@ impl PeerRoutine {
             let slot = match request_sender.try_reserve_guarded() {
                 Ok(slot) => slot,
                 Err(crate::zakura::transport::GuardedReserveError::Full) => {
-                    break FillStop::OutboundFull
+                    self.publish_outstanding();
+                    break FillStop::OutboundFull;
                 }
                 Err(error) => {
                     tracing::debug!(
@@ -894,10 +897,6 @@ impl PeerRoutine {
                     break FillStop::SendError;
                 }
             };
-            let Some(request_id) = self.next_request_id else {
-                break FillStop::Internal;
-            };
-            self.next_request_id = request_id.get().checked_add(1).and_then(NonZeroU64::new);
             let in_bypass = normal_slots == 0;
             let (servable_low, servable_high) = (self.servable_low, self.servable_high);
 
@@ -918,6 +917,19 @@ impl PeerRoutine {
             let floor_work = self
                 .work
                 .first_pending_work_in_range(servable_low, servable_high.min(floor_high));
+            // Leave excluded floor work continuously available to other peers.
+            if floor_work.is_some_and(|(height, item)| {
+                self.retry_avoid.contains_key(&height)
+                    || self
+                        .registry
+                        .is_floor_height_avoided(&self.peer, height, now)
+                    || self
+                        .registry
+                        .is_body_retry_avoided(&self.peer, item.scope, item.hash, now)
+            }) {
+                retry_filter_deadline = Some(self.retry_filter_wake_deadline(now));
+                break FillStop::RetryAvoid;
+            }
             // A faster peer must also be eligible to retry this exact body.
             // Otherwise its preference would keep honest suppliers from taking it.
             let floor_arm_allowed = !self.registry.floor_has_preferred_unsaturated_server(
@@ -933,6 +945,10 @@ impl PeerRoutine {
                     })
                 },
             );
+            let Some(request_id) = self.next_request_id else {
+                break FillStop::Internal;
+            };
+            self.next_request_id = request_id.get().checked_add(1).and_then(NonZeroU64::new);
             let mut items = Vec::new();
             if floor_arm_allowed && servable_low <= floor_high {
                 if let Some((floor_start, _)) = floor_work {
@@ -1615,27 +1631,6 @@ impl PeerRoutine {
             tracing::debug!(peer = ?self.peer, ?height, "ignoring duplicate block-sync body frame");
             return;
         }
-        match outstanding.request.expected_hash(height) {
-            Some(requested) if requested != hash => {
-                let mismatch = header_hash_payload_mismatch(
-                    outstanding.request.owner,
-                    self.source,
-                    requested,
-                    hash,
-                );
-                self.report_misbehavior(BlockSyncMisbehavior::BodyPayloadMismatch(mismatch))
-                    .await;
-                return;
-            }
-            Some(_) => {}
-            None => {
-                self.report_misbehavior(BlockSyncMisbehavior::InvalidBlock)
-                    .await;
-                return;
-            }
-        }
-        self.trace
-            .record_block_body_received(hash, BlockBodySource::Zakura);
         let outstanding_owner = outstanding.request.owner;
         if self.work.owner_for_height(height) != Some(outstanding_owner) {
             metrics::counter!("sync.block.stale_completion.total", "kind" => "body_range")
@@ -1655,6 +1650,32 @@ impl PeerRoutine {
             self.finish_outstanding_at(index, Disposition::RetryMissing);
             return;
         }
+        match self.window.outstanding[index].request.expected_hash(height) {
+            Some(requested) if requested != hash => {
+                let mismatch =
+                    header_hash_payload_mismatch(outstanding_owner, self.source, requested, hash);
+                self.forward_rejected_delivery(
+                    index,
+                    height,
+                    block,
+                    mismatch,
+                    body_wire_bytes,
+                    body_permit,
+                    raw_block_payload,
+                )
+                .await;
+                return;
+            }
+            Some(_) => {}
+            None => {
+                self.report_misbehavior(BlockSyncMisbehavior::InvalidBlock)
+                    .await;
+                return;
+            }
+        }
+        self.trace
+            .record_block_body_received(hash, BlockBodySource::Zakura);
+        let outstanding = &self.window.outstanding[index];
         let estimated_bytes = outstanding.estimated_bytes_for_height(height).unwrap_or(0);
         let request_start_height = outstanding.request.start_height;
         let request_range_count = outstanding.request.count;
@@ -1769,6 +1790,66 @@ impl PeerRoutine {
         self.budget.release(reserved_estimate);
         // This body opened only this peer's slots; the want-work loop runs at the
         // top of the next iteration.
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn forward_rejected_delivery(
+        &mut self,
+        index: usize,
+        height: block::Height,
+        block: Arc<block::Block>,
+        mismatch: zakura_header_chain::BodyPayloadMismatch,
+        wire_bytes: Option<u64>,
+        permit: Option<mpsc::OwnedPermit<SequencedBody>>,
+        raw: Option<Arc<[u8]>>,
+    ) {
+        let owner = self.window.outstanding[index].request.owner;
+        let bytes = match wire_bytes {
+            Some(bytes) => bytes,
+            None => match block.zcash_serialize_to_vec() {
+                Ok(bytes) => {
+                    u64::try_from(bytes.len()).expect("a serialized block length fits in u64")
+                }
+                Err(error) => {
+                    tracing::debug!(?error, "failed to measure rejected block-sync delivery");
+                    return;
+                }
+            },
+        };
+        let Some(reserved) = self
+            .work
+            .release_active_reserved_height_for_owner(owner, height)
+        else {
+            return;
+        };
+        let decoded_bytes = record_decoded_memory_size(&block, wire_bytes);
+        let previous = block.header.previous_block_hash;
+        let mut delivery = SequencedBody::new_queued(
+            owner,
+            self.source,
+            height,
+            mismatch.requested,
+            previous,
+            BufferedBlockBody::from_measured_decoded_block(block, raw, decoded_bytes),
+            bytes,
+            self.peer.clone(),
+            Instant::now(),
+            self.sequencer_input_bytes.clone(),
+            self.sequencer_input_decoded_attributed_memory_bytes.clone(),
+        );
+        delivery.rejected_delivery = Some(mismatch);
+        // Transfer the local obligation without crediting invalid data as progress.
+        self.window.outstanding[index].mark_received(height);
+        if self.window.outstanding[index].is_complete() {
+            self.window.outstanding.remove(index);
+        }
+        self.publish_outstanding();
+        if let Some(permit) = permit {
+            permit.send(delivery);
+        } else {
+            let _ = self.sequencer_input.send(delivery).await;
+        }
+        self.budget.release(reserved);
     }
 
     // ===================== unmatched fallthroughs (ported) ==================
@@ -2271,6 +2352,8 @@ impl PeerRoutine {
             self.registry
                 .set_outstanding(&self.peer, self.generation, map);
         }
+        self.registry
+            .publish_retry_avoid(&self.peer, self.generation, &self.retry_avoid);
         // Publish the window diagnostics for the reactor's periodic trace row and
         // for other routines' cross-peer floor-bias decisions.
         let hard_capacity = hard_outbound_capacity(self.window.max_inflight_requests);
@@ -2280,7 +2363,15 @@ impl PeerRoutine {
             super::peer_registry::SlotDiagnostics {
                 hard_capacity,
                 effective_window: self.window.bbr_effective_cwnd().min(hard_capacity),
-                available_slots: self.window.available_slots(),
+                available_slots: if self.window.requests_without_block_progress
+                    >= self.window.no_progress_request_cap()
+                {
+                    0
+                } else {
+                    self.window
+                        .available_slots()
+                        .min(self.session.outbound_capacity())
+                },
                 outstanding_requests: self.window.outstanding.len(),
                 // Filter the published RTprop by now so a peer that stopped completing
                 // requests stops advertising a stale-low RTprop to the cross-peer
@@ -2882,7 +2973,12 @@ mod tests {
         routine.servable_low = block::Height(1);
         routine.servable_high = block::Height(10);
 
+        let next_request_id = routine.next_request_id;
         assert_eq!(routine.try_fill().await, Some(until));
+        assert_eq!(
+            routine.next_request_id, next_request_id,
+            "a deferred floor must not allocate a request or temporarily claim work"
+        );
         assert!(work.pending_contains(block::Height(1)));
         assert!(!work.in_flight_contains(block::Height(1)));
         assert!(
@@ -2891,6 +2987,147 @@ mod tests {
                 .is_err(),
             "filtered work must not be sent"
         );
+    }
+
+    #[derive(Clone, Copy)]
+    enum UnavailableFloorSupplier {
+        NoProgress,
+        RetryAvoid,
+        TransportFull,
+    }
+
+    #[tokio::test]
+    async fn no_progress_peer_does_not_suppress_an_alternate_floor_supplier() {
+        assert_unavailable_peer_does_not_suppress_alternate(UnavailableFloorSupplier::NoProgress)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn retry_avoided_peer_does_not_suppress_an_alternate_floor_supplier() {
+        assert_unavailable_peer_does_not_suppress_alternate(UnavailableFloorSupplier::RetryAvoid)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn transport_full_peer_does_not_suppress_an_alternate_floor_supplier() {
+        assert_unavailable_peer_does_not_suppress_alternate(
+            UnavailableFloorSupplier::TransportFull,
+        )
+        .await;
+    }
+
+    async fn assert_unavailable_peer_does_not_suppress_alternate(reason: UnavailableFloorSupplier) {
+        let config = ZakuraBlockSyncConfig::default();
+        let budget = ByteBudget::new(1_000_000);
+        let work = Arc::new(WorkQueue::new(block::Height(0)));
+        let scope = super::super::test_work_scope();
+        let hash = block::Hash([1; 32]);
+        work.extend(
+            scope,
+            [(block::Height(1), hash, BlockSizeEstimate::Advertised(1_000))],
+        );
+
+        let cancel = CancellationToken::new();
+        let (out_send, mut out_recv) = framed_channel(16);
+        let (_in_send, in_recv) = framed_channel(16);
+        let peer = ZakuraPeerId::new(vec![7u8; 32]).expect("test peer id is within bounds");
+        let session = BlockSyncPeerSession::for_test(peer.clone(), out_send, cancel.clone());
+        let registry = Arc::new(PeerRegistry::new());
+        let generation = registry
+            .admit_session(
+                &peer,
+                crate::zakura::ServicePeerDirection::Outbound,
+                &config,
+                0,
+                Instant::now(),
+            )
+            .generation();
+        let (sequencer_input_tx, _sequencer_input_rx) = mpsc::channel(16);
+        let (routine_to_reactor_tx, _routine_to_reactor_rx) = mpsc::channel(16);
+        let (_view_tx, view_rx) = watch::channel(initial_view(BlockSyncFrontiers {
+            finalized_height: block::Height(0),
+            verified_block_tip: block::Height(0),
+            verified_block_hash: block::Hash([0; 32]),
+        }));
+        let mut routine = PeerRoutine::new(
+            peer.clone(),
+            0,
+            session,
+            in_recv,
+            config,
+            true,
+            generation,
+            budget,
+            Arc::clone(&work),
+            registry.clone(),
+            Arc::new(Mutex::new(ThroughputMeter::new(Instant::now()))),
+            sequencer_input_tx,
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+            routine_to_reactor_tx,
+            view_rx,
+            cancel,
+            ZakuraTrace::noop(),
+        );
+        routine.handle_status(super::BlockSyncStatus {
+            servable_low: block::Height(1),
+            servable_high: block::Height(10),
+            ..super::BlockSyncStatus::default()
+        });
+        routine.publish_outstanding();
+        let alternate = ZakuraPeerId::new(vec![8u8; 32]).unwrap();
+        let preferred = || {
+            registry.floor_has_preferred_unsaturated_server(
+                block::Height(1),
+                &alternate,
+                None,
+                true,
+                |_| true,
+            )
+        };
+        assert!(preferred(), "an eligible unsaturated peer is preferred");
+        match reason {
+            UnavailableFloorSupplier::NoProgress => {
+                routine.window.requests_without_block_progress =
+                    routine.window.no_progress_request_cap();
+                routine.publish_outstanding();
+                assert!(
+                    !preferred(),
+                    "a peer at its no-progress cap cannot take the floor"
+                );
+            }
+            UnavailableFloorSupplier::RetryAvoid => {
+                routine.note_retry_avoid([block::Height(1)]);
+                routine.publish_outstanding();
+                assert!(
+                    !preferred(),
+                    "a peer avoiding this height cannot take the floor"
+                );
+                routine.retry_avoid.clear();
+                routine.publish_outstanding();
+                assert!(
+                    preferred(),
+                    "clearing the retry restriction restores eligibility"
+                );
+            }
+            UnavailableFloorSupplier::TransportFull => {
+                let sender = routine.session.request_sender();
+                let mut permits = Vec::new();
+                while let Ok(permit) = sender.try_reserve_guarded() {
+                    permits.push(permit);
+                }
+                routine.try_fill().await;
+                assert!(
+                    !preferred(),
+                    "a full outbound transport cannot take the floor"
+                );
+                drop(permits);
+            }
+        }
+        assert!(work.pending_contains(block::Height(1)));
+        assert!(timeout(Duration::from_millis(1), out_recv.recv())
+            .await
+            .is_err());
     }
 
     #[test]
@@ -4063,6 +4300,62 @@ mod tests {
         assert_eq!(work.in_flight_contains(block::Height(1)), received);
         assert_eq!(sequencer_recv.try_recv().is_ok(), received);
         assert!(sequencer_recv.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn requested_wrong_header_requires_retry_accounting_before_requeue() {
+        use zakura_chain::serialization::ZcashDeserializeInto;
+
+        let body: Arc<block::Block> = Arc::new(
+            zakura_test::vectors::BLOCK_MAINNET_1_BYTES
+                .zcash_deserialize_into()
+                .unwrap(),
+        );
+        let (mut routine, mut outbound, mut events) = status_test_routine();
+        let (deliveries, mut delivery_rx) = mpsc::channel(1);
+        routine.sequencer_input = deliveries;
+        let requested = block::Hash([0xab; 32]);
+        routine.work.extend(
+            super::super::test_work_scope(),
+            [(
+                block::Height(1),
+                requested,
+                BlockSizeEstimate::Advertised(5000),
+            )],
+        );
+        routine.handle_status(BlockSyncStatus {
+            servable_low: block::Height(1),
+            servable_high: block::Height(1),
+            max_blocks_per_response: 1,
+            ..BlockSyncStatus::default()
+        });
+        while events.try_recv().is_ok() {}
+        routine.try_fill().await;
+        outbound.try_recv().expect("the request is sent");
+        while events.try_recv().is_ok() {}
+        let owner = routine
+            .work
+            .owner_for_height(block::Height(1))
+            .expect("the request owns the height");
+        while routine
+            .routine_to_reactor
+            .try_send(RoutineToReactor::RequeryNeeded)
+            .is_ok()
+        {}
+        routine.handle_body(body, None, None, None).await;
+        let delivery = delivery_rx
+            .try_recv()
+            .expect("a requested mismatch must reach reliable retry accounting");
+        assert_eq!(delivery.owner, owner);
+        assert_eq!(delivery.hash, requested);
+        let _ = routine
+            .handle_deadlines(Instant::now() + Duration::from_secs(3600))
+            .await;
+        assert_eq!(
+            routine.work.owner_for_height(block::Height(1)),
+            Some(owner),
+            "the claim must remain owned until retry deferral is installed"
+        );
     }
 
     #[tokio::test]
